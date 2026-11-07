@@ -2913,7 +2913,9 @@ fn a_base_that_disagrees_with_itself_is_a_host_fault_with_its_own_count() {
     assert!(refused(&|record| {
         record.as_object_mut().expect("object").remove("scenario");
     }));
-    assert!(refused(&|record| record["scenario"] = json!("011.sh | 102.sh")));
+    assert!(refused(
+        &|record| record["scenario"] = json!("011.sh | 102.sh")
+    ));
     assert!(refused(&|record| record["scenario"] = json!("011 bash.sh")));
     assert!(refused(&|record| record["exits"] = json!([2, 0])));
     assert!(refused(&|record| record["exits"] = json!([1])));
@@ -2986,7 +2988,10 @@ fn a_base_that_disagrees_with_itself_is_a_host_fault_with_its_own_count() {
     verdict(task, 0, "stale");
     let row = mission_row(&mut client);
     assert_eq!(
-        (row["gate_host_faults"].clone(), row["gate_base_disagrees"].clone()),
+        (
+            row["gate_host_faults"].clone(),
+            row["gate_base_disagrees"].clone()
+        ),
         (json!(1), json!(1))
     );
     store
@@ -3081,7 +3086,10 @@ fn a_base_that_disagrees_with_itself_is_a_host_fault_with_its_own_count() {
         .expect("landed");
     let row = mission_row(&mut client);
     assert_eq!(
-        (row["gate_host_faults"].clone(), row["gate_base_disagrees"].clone()),
+        (
+            row["gate_host_faults"].clone(),
+            row["gate_base_disagrees"].clone()
+        ),
         (json!(0), json!(0)),
         "a landing ends both runs"
     );
@@ -3097,7 +3105,10 @@ fn a_base_that_disagrees_with_itself_is_a_host_fault_with_its_own_count() {
     store.mission_resume(mission).expect("resume");
     let row = mission_row(&mut client);
     assert_eq!(
-        (row["gate_host_faults"].clone(), row["gate_base_disagrees"].clone()),
+        (
+            row["gate_host_faults"].clone(),
+            row["gate_base_disagrees"].clone()
+        ),
         (json!(0), json!(0)),
         "a resume ends both runs"
     );

@@ -8924,7 +8924,10 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         let (record, event, at) = last_verdict(&db);
         assert_eq!(record["verdict"], "host_fault", "{record}");
         assert_eq!(record["evidence"], "base_disagrees");
-        assert_eq!(record["scenario"], "011.sh", "the gate's own line, not 102.sh");
+        assert_eq!(
+            record["scenario"], "011.sh",
+            "the gate's own line, not 102.sh"
+        );
         assert_eq!(record["exits"], json!([1, 0]));
         assert_eq!(record["setup_s"], 244);
         assert_eq!(record["host_faults"], 1);
@@ -8944,15 +8947,13 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
             "{record}"
         );
         assert!(record["reason"].as_str().is_some_and(|reason| {
-            reason.starts_with("host fault: the base disagrees with itself: 011.sh exited 1, then 0")
+            reason
+                .starts_with("host fault: the base disagrees with itself: 011.sh exited 1, then 0")
                 && reason.contains("244 s")
                 && reason.ends_with("not a verdict, judged again later")
         }));
         let after = gated(&db, mission);
-        assert_eq!(
-            (after.gate_host_faults, after.gate_base_disagrees),
-            (1, 1)
-        );
+        assert_eq!((after.gate_host_faults, after.gate_base_disagrees), (1, 1));
         assert_eq!((after.gate_rejections, after.gate_aborts), (0, 0));
         assert_eq!(
             state(&db),
@@ -9028,7 +9029,11 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         assert_eq!(record["verdict"], "aborted", "{record}");
         let after = gated(&db, mission);
         assert_eq!(
-            (after.gate_aborts, after.gate_host_faults, after.gate_base_disagrees),
+            (
+                after.gate_aborts,
+                after.gate_host_faults,
+                after.gate_base_disagrees
+            ),
             (1, 0, 0),
             "a base run that exited 2 is an abort and resets both runs"
         );
@@ -9045,7 +9050,11 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
         let after = gated(&db, mission);
         assert_eq!(
-            (after.gate_host_faults, after.gate_base_disagrees, after.gate_aborts),
+            (
+                after.gate_host_faults,
+                after.gate_base_disagrees,
+                after.gate_aborts
+            ),
             (0, 0, 0)
         );
         assert!(after.halted.is_none());
