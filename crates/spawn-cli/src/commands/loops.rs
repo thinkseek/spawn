@@ -203,6 +203,20 @@ impl Schedule {
         }
     }
 
+    /// Whether one of the steps waits for no time still to come: its due
+    /// time has been reached, and it is the step's to act on now.
+    fn due(&self, now_ms: i64) -> bool {
+        [
+            &self.bridge,
+            &self.observer,
+            &self.dispatch,
+            &self.residents,
+            &self.alive,
+        ]
+        .into_iter()
+        .any(|step| step.due.is_some_and(|due| due <= now_ms))
+    }
+
     /// The earliest due time among the steps; `None` when none waits on a
     /// clock.
     fn earliest(&self) -> Option<i64> {
@@ -340,9 +354,13 @@ impl Fleet {
             },
             None => None,
         };
-        let due = self
-            .steps_at
-            .is_none_or(|at| at.elapsed() >= self.interval);
+        // A time the records named runs its step now, never behind the pass
+        // interval; a change of the log may wait for that interval, so a
+        // burst of appends inside one interval is one pass's work.
+        let due = self.schedule.due(now)
+            || self
+                .steps_at
+                .is_none_or(|at| at.elapsed() >= self.interval);
         if let (Some(open), Some(watermark)) = (self.store.clone(), watermark) {
             self.bridge_work(&open, watermark, now, &mut warnings, &mut failed);
             if due {
