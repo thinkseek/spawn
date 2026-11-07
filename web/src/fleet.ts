@@ -3,7 +3,7 @@
 // so a server that omits one renders an empty value instead of crashing.
 
 import type { SessionState } from "./api";
-import { apiError, apiHeaders } from "./api";
+import { readApi } from "./api";
 import type { GateRoom, Memory } from "./resources";
 import { normalizeGateRoom, normalizeMemory } from "./resources";
 import type { RsiPane } from "./rsi";
@@ -41,15 +41,29 @@ export interface Judgement {
   stuck: number | null;
   latency_ms: number | null;
   /** The judge's own opinion that someone should look, and why. Not who
-   * needs a human: that is the dispatcher's view (attention.ts). */
+   * is escalated: that is the dispatcher's view (attention.ts). */
   attention: boolean | null;
   attention_reason: string | null;
   evidence: Evidence | null;
   fingerprint: string | null;
 }
 
+/** A background job the agent's live execution started and that has not
+ * ended (a Bash in the background, a Monitor, a background Agent), from its
+ * transcript. */
+export interface BackgroundJob {
+  id: string;
+  /** `bash`, `monitor` or `agent`. */
+  kind: string;
+  started_at_ms: number | null;
+  /** Its age when the board was read, on the database's clock. */
+  age_ms: number | null;
+}
+
 export interface Activity {
   current_tool: string | null;
+  /** Open background jobs of the live execution, oldest first. */
+  jobs: BackgroundJob[];
   last_event_name: string | null;
   last_event_at_ms: number | null;
   event_count: number | null;
@@ -69,7 +83,7 @@ export interface FleetAgent {
   ended_at_ms: number | null;
   state: FleetState;
   state_since_ms: number | null;
-  /** Needs a human, by the dispatcher's view (`/api/attention`, set by
+  /** Escalated, by the dispatcher's view (`/api/attention`, set by
    * attention.ts `markNeedsHuman`); false until that view is read. Never
    * the judge's flag, which is `judgement.attention`. */
   attention: boolean;
@@ -148,6 +162,9 @@ export interface CommandRecord {
   error: string | null;
   created_at_ms: number | null;
   finished_at_ms: number | null;
+  /** The Bridge holds it for the agent's turn (an input that waits); false
+   * from an older server, which does not say. */
+  waiting: boolean;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -286,6 +303,22 @@ export function normalizeJudgement(value: unknown): Judgement | null {
   };
 }
 
+function normalizeJobs(value: unknown): BackgroundJob[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    const raw = object(entry);
+    const id = optionalText(raw.id);
+    return id
+      ? [{
+          id,
+          kind: text(raw.kind) || "job",
+          started_at_ms: optionalNumber(raw.started_at_ms),
+          age_ms: optionalNumber(raw.age_ms),
+        }]
+      : [];
+  });
+}
+
 function normalizeAgent(value: unknown): FleetAgent | null {
   const raw = object(value);
   const sessionId = text(raw.session_id);
@@ -305,13 +338,14 @@ function normalizeAgent(value: unknown): FleetAgent | null {
     ended_at_ms: optionalNumber(raw.ended_at_ms),
     state: fleetState(raw.state ?? judgement?.state),
     state_since_ms: optionalNumber(raw.state_since_ms),
-    // The server's `attention` is the judge's flag; who needs a human comes
+    // The server's `attention` is the judge's flag; what is escalated comes
     // from /api/attention (attention.ts `markNeedsHuman`).
     attention: false,
     judged_at_ms: optionalNumber(raw.judged_at_ms),
     task: optionalText(raw.task),
     activity: {
       current_tool: optionalText(activity.current_tool),
+      jobs: normalizeJobs(activity.jobs),
       last_event_name: optionalText(activity.last_event_name),
       last_event_at_ms: optionalNumber(activity.last_event_at_ms),
       event_count: optionalNumber(activity.event_count),
@@ -438,32 +472,15 @@ export function normalizeCommands(value: unknown): CommandRecord[] {
       error: optionalText(raw.error),
       created_at_ms: optionalNumber(raw.created_at_ms),
       finished_at_ms: optionalNumber(raw.finished_at_ms),
+      waiting: raw.waiting === true,
     };
   });
-}
-
-async function getJson(url: string, signal: AbortSignal): Promise<unknown> {
-  const response = await fetch(url, {
-    signal,
-    cache: "no-store",
-    headers: apiHeaders(),
-  });
-  if (!response.ok) {
-    let detail = "";
-    try {
-      detail = text(object(await response.json()).error);
-    } catch {
-      // Not JSON; the status is enough.
-    }
-    throw apiError(response.status, detail);
-  }
-  return response.json();
 }
 
 const sessionPath = (id: string) => encodeURIComponent(id);
 
 export async function fetchFleet(signal: AbortSignal): Promise<Fleet> {
-  return normalizeFleet(await getJson("/api/fleet", signal));
+  return readApi("/api/fleet", signal, normalizeFleet);
 }
 
 export async function fetchJudgements(
@@ -471,11 +488,10 @@ export async function fetchJudgements(
   signal: AbortSignal,
   limit = 60,
 ): Promise<JudgementRecord[]> {
-  return normalizeJudgements(
-    await getJson(
-      `/api/fleet/${sessionPath(sessionId)}/judgements?limit=${limit}`,
-      signal,
-    ),
+  return readApi(
+    `/api/fleet/${sessionPath(sessionId)}/judgements?limit=${limit}`,
+    signal,
+    normalizeJudgements,
   );
 }
 
@@ -484,11 +500,10 @@ export async function fetchCommands(
   signal: AbortSignal,
   limit = 40,
 ): Promise<CommandRecord[]> {
-  return normalizeCommands(
-    await getJson(
-      `/api/fleet/${sessionPath(sessionId)}/commands?limit=${limit}`,
-      signal,
-    ),
+  return readApi(
+    `/api/fleet/${sessionPath(sessionId)}/commands?limit=${limit}`,
+    signal,
+    normalizeCommands,
   );
 }
 
@@ -496,9 +511,7 @@ export async function fetchAgentPane(
   sessionId: string,
   signal: AbortSignal,
 ): Promise<RsiPane> {
-  return normalizePane(
-    await getJson(`/api/pane/${sessionPath(sessionId)}`, signal),
-  );
+  return readApi(`/api/pane/${sessionPath(sessionId)}`, signal, normalizePane);
 }
 
 // ---------------------------------------------------------------------------
@@ -551,7 +564,35 @@ export function ambiguityQuestion(ambiguity: string | null): string | null {
 const REASON_TEXT: Record<string, string> = {
   JUDGE_UNAVAILABLE: "No judge answered (Jev unreachable or not configured), showing the rules' guess",
   WAITING_FOR_USER_INPUT: "Waiting for user input",
+  WAITING_FOR_BACKGROUND_JOB:
+    "Working on its own background job: its turn ended while a job it started still runs, and the engine wakes it when the job reports",
 };
+
+/** Whether the rules judged the agent at its prompt waiting on a background
+ * job of its own: working, not idle (no Jev call, nothing escalated). */
+export function onOwnJob(agent: FleetAgent): boolean {
+  return agent.live && agent.judgement?.reason === "WAITING_FOR_BACKGROUND_JOB";
+}
+
+/** A job's age as a short duration (`12m`, `2h 05m`), from the server's
+ * reading, else from its start by this clock. */
+export function jobAge(job: BackgroundJob, now = Date.now()): string {
+  const ms = job.age_ms ?? (job.started_at_ms === null ? null : now - job.started_at_ms);
+  if (ms === null || !Number.isFinite(ms)) return "—";
+  const minutes = Math.floor(Math.max(0, ms) / 60_000);
+  if (minutes < 1) return `${Math.floor(Math.max(0, ms) / 1_000)}s`;
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+/** One line for the agent's open background jobs: the oldest, its age, and
+ * how many more. Null when none is open. */
+export function jobsText(jobs: BackgroundJob[]): string | null {
+  const [oldest, ...rest] = jobs;
+  if (!oldest) return null;
+  const more = rest.length > 0 ? ` (+${rest.length} more)` : "";
+  return `${oldest.kind} ${oldest.id} · ${jobAge(oldest)}${more}`;
+}
 
 export function reasonText(reason: string | null): string | null {
   if (!reason) return null;

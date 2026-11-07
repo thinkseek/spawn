@@ -42,7 +42,9 @@ import {
 import { Fact, SectionLabel } from "../fleet/bits";
 import { VerdictBadge, useNow } from "../rsi/Phase";
 import { Ago, Card, CardHeader, EmptyState, FOCUS_RING, GroupHeader, LiveStatus, PageHeader, cx } from "../ui";
+import { HeldSources } from "./HeldSources";
 import { Markdown } from "./Markdown";
+import { TaskText, useTaskTexts } from "./TaskTexts";
 import { AgentLink, Collapsible } from "./parts";
 import { ViewToggle, useStoredChoice } from "../ViewToggle";
 import type { ViewOption } from "../ViewToggle";
@@ -119,6 +121,11 @@ export function MissionsBody({ data }: { data: Missions }) {
             <ApprovalQueue residents={data.residents} />
           </div>
         )}
+        {data.holds.length > 0 && (
+          <div className="shrink-0 px-3 pt-3 sm:px-4 sm:pt-4">
+            <SourceHolds data={data} />
+          </div>
+        )}
         {data.missions.length === 0 ? (
           <div className="flex flex-col">
             <div className="px-4 pt-2 sm:px-5">{toggle}</div>
@@ -141,6 +148,7 @@ export function MissionsBody({ data }: { data: Missions }) {
       <div className="mx-auto flex max-w-[1600px] flex-col gap-3 p-3 sm:p-4">
         <div>{toggle}</div>
         <ApprovalQueue residents={data.residents} />
+        <SourceHolds data={data} />
         <div className="grid min-w-0 gap-3 xl:grid-cols-[minmax(0,1fr)_340px]">
           <div className="flex min-w-0 flex-col gap-3">
             {data.missions.length === 0 ? (
@@ -169,6 +177,17 @@ export function MissionsBody({ data }: { data: Missions }) {
 
 // ---------------------------------------------------------------------------
 // Residents
+
+/** The owner's holds on mission sources: landings there wait. */
+function SourceHolds({ data }: { data: Missions }) {
+  return (
+    <HeldSources
+      holds={data.holds}
+      title="Sources held by the owner"
+      hint="no task lands there until the hold is released or expires; gates, assignment and other sources go on"
+    />
+  );
+}
 
 /** Proposed residents block on a human; they lead the page. */
 function ApprovalQueue({ residents }: { residents: Resident[] }) {
@@ -437,6 +456,20 @@ function MissionCard({ mission }: { mission: Mission }) {
           </div>
         )}
 
+        {mission.hold !== null && (
+          <div className="flex items-start gap-2 rounded-md border border-border bg-surface/60 px-3 py-2">
+            <Hourglass size={14} className="mt-0.5 shrink-0 text-muted-foreground" />
+            <div className="min-w-0 text-label">
+              <span className="font-medium text-foreground">Landings held</span>
+              <span className="text-foreground/85">
+                {" "}
+                — the owner holds its source (hold #{mission.hold}): its gates still run and an
+                accepted task waits to land until the hold is released or expires
+              </span>
+            </div>
+          </div>
+        )}
+
         {mission.gate && (
           <div className="grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4">
             <Fact label="Gate">
@@ -622,6 +655,9 @@ function TaskRow({
   group: TaskGroup<MissionTask>;
 }) {
   const title = taskTitle(task, { missionName });
+  // The board sends the texts' first lines; the whole is read when asked
+  // (the brief opened, a "show the whole" pressed), one GET for the three.
+  const texts = useTaskTexts(task, false);
   return (
     <li
       className={cx(
@@ -735,7 +771,14 @@ function TaskRow({
             </span>
           </div>
           {task.review_note ? (
-            <Markdown source={task.review_note} className="mt-1" />
+            <TaskText
+              what="note"
+              excerpt={task.review_note}
+              bytes={task.review_note_bytes}
+              full={texts.texts?.review_note}
+              read={texts}
+                className="mt-1"
+            />
           ) : (
             <p className="mt-1 text-caption text-faint-foreground">
               No review note.
@@ -746,21 +789,40 @@ function TaskRow({
       {task.review_note && task.state !== "revise" && task.revisions === 0 && (
         <div className="rounded-md border border-surface-border px-3 py-2">
           <SectionLabel>Review note</SectionLabel>
-          <Markdown source={task.review_note} className="mt-1" />
+          <TaskText
+            what="note"
+            excerpt={task.review_note}
+            bytes={task.review_note_bytes}
+            full={texts.texts?.review_note}
+            read={texts}
+            className="mt-1"
+          />
         </div>
       )}
 
       <EarlierAttempts group={group} missionName={missionName} />
 
       {task.brief && (
-        <Collapsible label="Brief">
-          <Markdown source={task.brief} />
+        <Collapsible label="Brief" onToggle={(open) => open && texts.want()}>
+          <TaskText
+            what="brief"
+            excerpt={task.brief}
+            bytes={task.brief_bytes}
+            full={texts.texts?.brief}
+            read={texts}
+          />
         </Collapsible>
       )}
 
-      {task.report ? (
+      {task.report !== null || (task.report_bytes ?? 0) > 0 ? (
         <Collapsible label="Report" defaultOpen>
-          <Markdown source={task.report} />
+          <TaskText
+            what="report"
+            excerpt={task.report}
+            bytes={task.report_bytes}
+            full={texts.texts?.report}
+            read={texts}
+          />
         </Collapsible>
       ) : (
         <p className="text-caption text-faint-foreground">No report yet.</p>

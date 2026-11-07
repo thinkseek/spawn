@@ -86,7 +86,7 @@ impl Drop for World {
 }
 
 fn git(directory: &Path, arguments: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = spawn_host::test_git_command()
         .arg("-C")
         .arg(directory)
         .args([
@@ -349,6 +349,7 @@ fn the_bridge_reads_the_turn_of_an_engine_under_a_symlinked_root() {
             parent_session_id: None,
             from: None,
             model: None,
+            charter: None,
         },
     );
     bridge.tick().expect("start");

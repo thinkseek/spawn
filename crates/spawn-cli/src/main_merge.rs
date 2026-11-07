@@ -490,7 +490,7 @@ fn shown(files: &[String]) -> String {
 mod tests {
     use super::{Merge, conflict_note, delivery_note, into_workspace, into_workspace_when};
     use crate::push::{Pushed, Pusher, push_branch};
-    use crate::sources::{ensure_mirror, fetch_pushed_into, git};
+    use crate::sources::{ensure_mirror, fetch_pushed_into, test_git as git};
     use spawn_core::id::{BranchName, WorkspaceId};
     use spawn_core::port::{Commit, WorkspaceStore};
     use spawn_host::GitWorkspace;

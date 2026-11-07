@@ -86,7 +86,16 @@ fn live_execution(input: &JudgeInput) -> RulesVerdict {
             guess: SemanticState::Working,
         };
     }
-    if input.turn == Some(TurnFact::Stopped) || input.screen == Some(ScreenState::Ready) {
+    // At its prompt while a job it started runs in the background: the
+    // engine wakes it when the job reports, so it works on that job. A fact
+    // of the transcript, never of the screen ("N shells still running"
+    // there is evidence for the judge only).
+    if waits_on_own_job(input) {
+        return Certain {
+            state: SemanticState::Working,
+        };
+    }
+    if at_prompt(input) {
         return Ambiguous {
             ambiguity: Ambiguity::TurnStoppedIdle,
             guess: SemanticState::Waiting,
@@ -102,6 +111,19 @@ fn live_execution(input: &JudgeInput) -> RulesVerdict {
     Certain {
         state: SemanticState::Working,
     }
+}
+
+/// The turn stopped, or the pane waits at its prompt.
+fn at_prompt(input: &JudgeInput) -> bool {
+    input.turn == Some(TurnFact::Stopped) || input.screen == Some(ScreenState::Ready)
+}
+
+/// The running execution stopped its turn at its prompt with at least one
+/// background job of its own still open (`job.started`, no `job.ended`):
+/// it waits on its own job, which is work, not idleness. However long the
+/// job runs: its bound is the control layer's (`SPAWN_JOB_BOUND_SECS`).
+pub(super) fn waits_on_own_job(input: &JudgeInput) -> bool {
+    input.execution_active && input.open_jobs > 0 && at_prompt(input)
 }
 
 /// Rules for a session with no running execution.
@@ -142,6 +164,9 @@ pub(super) fn wait_reason(state: SemanticState, input: &JudgeInput) -> Option<Wa
             Some(WaitReason::WaitingForUserPermission)
         }
         SemanticState::Waiting => Some(WaitReason::WaitingForUserInput),
+        SemanticState::Working if waits_on_own_job(input) => {
+            Some(WaitReason::WaitingForBackgroundJob)
+        }
         _ => None,
     }
 }

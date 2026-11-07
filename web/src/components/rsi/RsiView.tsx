@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 
 import { usePoll } from "../../api";
 import { clockTime, formatDuration, relativeTime } from "../../format";
+import { freshAt } from "../../validated";
 import type { RsiDashboard, RsiMission, RsiObjective, RsiTask } from "../../rsi";
 import {
   chartObjective,
@@ -14,6 +15,7 @@ import {
 } from "../../rsi";
 import { Button, Card, CardHeader, Eyebrow, LiveStatus, PageHeader, cx } from "../ui";
 import { AgentPane } from "./AgentPane";
+import { ObjectiveName } from "./ObjectiveName";
 import { ChartLegend, MetricChart } from "./MetricChart";
 import { PhaseBadge, VerdictBadge, formatMetric, formatNumber, phaseStyle, useNow } from "./Phase";
 import { GateVerdicts } from "./GateVerdicts";
@@ -34,7 +36,7 @@ interface RsiViewProps {
 /** The RSI objective mission(s): objectives from the backlog, the task in
  * flight, what the gate said, and the resident's terminal. */
 export function RsiView({ onOpenSession }: RsiViewProps) {
-  const dashboard = usePoll<RsiDashboard>("rsi", fetchDashboard, 2_000);
+  const dashboard = usePoll<RsiDashboard>("rsi", fetchDashboard, 2_000, { checked: true });
   const [chosenMission, setChosenMission] = useState<number | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
   const [chosenObjective, setChosenObjective] = useState<number | null>(null);
@@ -82,7 +84,11 @@ export function RsiView({ onOpenSession }: RsiViewProps) {
         )}
         <LiveStatus
           error={dashboard.error}
-          label={data ? `Updated ${relativeTime(data.generated_at_ms)}` : "Connecting"}
+          label={
+            data
+              ? `Updated ${relativeTime(freshAt(data.generated_at_ms, dashboard.checkedAt))}`
+              : "Connecting"
+          }
         />
         {residentSession && (
           <Button onClick={() => onOpenSession(residentSession)}>
@@ -209,12 +215,12 @@ function ObjectiveCard({ mission }: { mission: RsiMission }) {
                   : "open"
                 : objective.status}
           </Eyebrow>
-          <h2
+          <ObjectiveName
+            heading
+            mission={mission.id}
+            objective={objective}
             className="mt-0.5 truncate text-title-sm font-semibold text-foreground"
-            title={objective.prompt}
-          >
-            {objective.title}
-          </h2>
+          />
         </div>
         <StatusPill status={objective.status} />
       </div>
@@ -578,12 +584,11 @@ function ObjectivesCard({
               <span className="tnum w-6 font-mono text-caption text-faint-foreground">
                 {objective.id}
               </span>
-              <span
+              <ObjectiveName
+                mission={mission.id}
+                objective={objective}
                 className="min-w-0 flex-1 truncate text-label text-foreground/90"
-                title={objective.prompt}
-              >
-                {objective.title}
-              </span>
+              />
               {objective.metric && (
                 <button
                   type="button"

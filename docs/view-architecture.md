@@ -74,6 +74,7 @@
 | --- | --- | --- |
 | `agent_state` | 带 `event_id`，与 `based_on_seq` 并列 | 同一 session 的 `event_id` 等于其 observation 事件 id |
 | `agent_open_tools` | `tool.started` 按 `(session_id, tool_use_id)` 左连 `tool.completed`、`tool.failed`，取未闭合，排除执行已有 Bridge 结束事件的行 | 两个 started 一个 completed，结果恰一行；执行结束后结果为空 |
+| `agent_open_jobs` | 每个 `job.started`，同一 `(session_id, job_id)` 之后既无 `job.started` 也无 `job.ended`（只取最近一次开始；恢复的 Agent 再次开始即重新打开），排除执行已有 Bridge 结束事件的行（执行结束即关闭它的后台任务；恢复是新执行） | 两个 started 一个 ended，结果恰一行；执行结束后结果为空；后一个执行看不到前一个执行的任务；Agent 结束后再开始，结果是新开始那一行 |
 | `agent_freshness` | 每 `session_id` 取 `max(session_seq)`、`max(id)`、`max(recorded_at_ms)`、事件数 | 空会话不出现 |
 | `agent_executions` | 结束行只取 `source = 'bridge'` 的 `execution.ended`；`exit_reported` 表示存在其他来源的结束事件（只在旧日志里有） | 旧日志里已报告退出、Bridge 未结束时 `ended_at_ms` 为空且 `exit_reported` 为真 |
 | `agent_timeline` / `agent_judgements` | 时间线排除 `source = 'observer'`，判定走 `agent_judgements` | 时间线不含 observation，判定视图只含 observation |
@@ -115,6 +116,16 @@
 覆盖：全部视图与六个读方法、列集快照、投影与日志折叠逐行相等（含守卫与回填）、`spawn_finish` 四态、`agent_commands` 无授权被拒与有授权写入、非 owner 直查视图报 `42501`、读函数无授权为空与按 agent 过滤。
 
 计划检查结果（PG 16，20 会话共 2 万事件，状态类视图读投影表）：`agent_state` 读投影 0.05 ms；`agent_status` 1.1 ms；单会话 `agent_timeline` 分页 0.1 ms、`agent_judgements` 0.1 ms、`agent_executions` 0.2 ms、`agent_open_tools` 0.4 ms、`agent_task_events` 1.3 ms，都走已有索引；`spawn_append` 含投影更新 2.2 ms。这个规模下不需要部分索引。
+
+仪表盘（`spawn serve`）的读另做过计划检查：2026-11-07 线上最新备份恢复到测试服务器的临时库（82 会话、4 万事件，其中判定 1.07 万），`now` 钉在备份中最新事件的时间，`explain analyze` 取三次最好：
+
+| 查询 | 之前 | 之后 | 原因与改法 |
+| --- | --- | --- | --- |
+| `FLEET_BOARD`（`/api/fleet` 的会话行） | 470 ms | 28 ms | “当前状态始于”“需要人始于”要找该会话最近一条别的状态的判定，原来对其全部判定求 `max`，改为按时间倒序取第一条（部分索引 `spawn_events_observation_time`）；当前工具查“已结束”走表达式索引 `spawn_events_tool_done`；会话的最近命令走 `spawn_commands_session`；行里去掉页面不显示的 `last_input` |
+| `FLEET_HEALTH`（健康条） | 122 ms | 87 ms | 一天、一小时的窗口按时间读（`spawn_events_name_time`），一天的判定只取判定者 |
+| `scorecard.rs` 的 `FACTS` | 443 ms | 81 ms | lateral 里的 `offset 0` 让记录只从 `kind` 取出一次；被内联时三十处 `x.r` 各取一次（gate 日志、brief 这样的大文本） |
+
+`spawn-postgres/tests/dashboard.rs` 锁住这些改写的口径（状态始于、当前工具、健康条计数、任务全文）。计分卡剩下的时间主要在 `spawn serve` 读转录（约 0.23 s，读 211 MB），不在 SQL。
 
 ## 9. 投影
 

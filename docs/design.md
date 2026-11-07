@@ -71,6 +71,8 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | `tool.failed` | 会话记录 | tool_use_id、error |
 | `turn.stopped` | 会话记录（`turn_duration`、中断） | input_tokens、output_tokens |
 | `turn.failed` | 会话记录（API 错误行） | error |
+| `job.started` | 会话记录：启动后台任务的工具结果（Bash 的 `toolUseResult.backgroundTaskId`，含超时或为送达消息被移到后台的命令；Monitor 的 `taskId`；后台 Agent 的 `agentId`，`isAsync` 且 `status` 为 `async_launched`，或派生到后台的 Skill，`status` 为 `forked`、`background`）；`SendMessage` 恢复已结束的 Agent（结果带 `resumedAgentId`）是同一 id 的又一次运行；键 `job:<id>:started:<tool_use_id>`，每次运行一条 | job_id、kind（`bash`、`monitor`、`agent`）；开始时间即记录时间 |
+| `job.ended` | 会话记录：引擎的 `<task-notification>`（头部带 `<status>`，或 Monitor 的 `[Monitor expired …]` 事件），以引擎交给代理的那份为准：`queued_command` 附件或用户行（`queue-operation` 不读：它也排着子代理任务的通知，并可能早于启动该任务的工具结果写下）；Agent 的通知若说 `is waiting on its own background work`（暂停，自己的后台工作还在跑，会再通知）不算结束；成功的 `TaskStop` 结果；键 `job:<id>:ended:<通知摘要>`（两处副本字节相同，记一条；同一 Agent 下一次运行的通知不同，另记一条），`TaskStop` 为 `job:<id>:stopped:<tool_use_id>` | job_id、how（`completed`、`failed`、`killed`、`stopped`、`expired`，不认识的状态为 `ended`） |
 | `execution.started` | Bridge | engine、workspace、command_id（终端总是 `spawn-<execution>`，由执行推出，不记录；旧记录里的 terminal 照常读入）；本次启动新建了分支时另有 fork（from：`main` 或启动的 `from`，跨主机删除之前的旧记录里还可能是 `spawn/<agent>`；commit：分支起点） |
 | `execution.ended` | Bridge | cause、exit_code；Bridge 结束一个已无自己的 runner 在跑的执行时另带 evidence（主机看到了什么、哪条命令发现的） |
 | `execution.unmounting` | Bridge（结束流程过了最后一次 checkpoint 与 terminate、卸载之前；键 `<exec>:unmounting`） | — |
@@ -123,7 +125,7 @@ Bridge 做四件事：领取命令、启动与恢复执行、投递文本、提�
 
 | 命令 | 行为 |
 | --- | --- |
-| `Start{engine,prompt,parent_session_id,from,model}` | 检查会话是否已有执行 → 开分支（`ensure_branch(branch, from)`；分支已存在时 `from` 被忽略并在 tick 报告里警告，`from` 解析不到 commit 时命令失败）→ 干净时把 `main` 合入分支（`merge_main_clean`，冲突时分支不动并记 `merge.conflicted`）→ mount，写 `command.step{mounted}` → 写 `execution.started`（新分支带 fork；这之前的追加失败时卸载并记 `mount_released`）→ 启动终端 → Claude 走屏尾等待投递。终端启动失败走结束流程，原因记为 `Lost` |
+| `Start{engine,prompt,parent_session_id,from,model,charter}`（`charter` 是 supervisor 新原生会话所给章程的哈希，只供控制层记录，Bridge 不读） | 检查会话是否已有执行 → 开分支（`ensure_branch(branch, from)`；分支已存在时 `from` 被忽略并在 tick 报告里警告，`from` 解析不到 commit 时命令失败）→ 干净时把 `main` 合入分支（`merge_main_clean`，冲突时分支不动并记 `merge.conflicted`）→ mount，写 `command.step{mounted}` → 写 `execution.started`（新分支带 fork；这之前的追加失败时卸载并记 `mount_released`）→ 启动终端 → Claude 走屏尾等待投递。终端启动失败走结束流程，原因记为 `Lost` |
 | `Input{text}` | Ready 才 `send-keys`；键入前写 `command.step{typing}`，成功后写 `{typed}`。屏尾非 Ready（或终端还活着、抓屏一直失败）时：人和 supervisor 的输入等轮次——写一次 `command.step{waiting}`（键 `<command>:waiting`），命令不结束，等下一次 Ready 读数再键入；循环自己的输入（principal 为 `spawn-dispatch`、`spawn-integrate`、`spawn-liveness`）照旧立即拒绝（`pane state <state> does not accept input`），排在等待中的输入之后的也立即拒绝。会话没有执行时立即失败 |
 | `Stop` | 走结束流程，原因记为 `Stopped`；最后一次 checkpoint 失败时工作区不卸载 |
 | `Discard` | 同 `Stop`，但最后一次 checkpoint 失败也卸载工作区，未提交的内容丢失；只由人或 supervisor 在 `execution.end_stalled` 之后发出 |
@@ -196,7 +198,7 @@ Claude 以 `--ax-screen-reader` 运行，屏幕是唯一可靠的完成信号来
 
 `Observation { state, reason, based_on_seq, confidence, judge }`。`SemanticState` 取值 `Working`、`Waiting`、`Blocked`、`Completed`、`Unknown`，序列化为 `SCREAMING_SNAKE_CASE`，`ALL` 数组即声明顺序。
 
-`JudgeInput` 字段：`agent_id`、`session_id`、`engine`、`execution_active`、`stalled_end`、`last_end`、`open_tools`、`last_tool`、`permission_pending`、`screen`、`turn`、`last_error`、`evidence_seq`。`stalled_end` 来自当前执行的 `execution.end_stalled`（到 `execution.ended` 为止）：规则直接判 BLOCKED，attention 原因 `end_stalled`，不问判定器。
+`JudgeInput` 字段：`agent_id`、`session_id`、`engine`、`execution_active`、`stalled_end`、`last_end`、`open_tools`、`open_jobs`、`oldest_job_ms`、`last_tool`、`permission_pending`、`screen`、`turn`、`last_error`、`evidence_seq`。`stalled_end` 来自当前执行的 `execution.end_stalled`（到 `execution.ended` 为止）：规则直接判 BLOCKED，attention 原因 `end_stalled`，不问判定器。`open_jobs` 是当前执行里最近一次 `job.started` 之后没有 `job.ended` 的后台任务数（执行结束或新执行开始时清零；没有时不写进证据）：回合停在提示符（`turn.stopped` 或 Ready 屏）而 `open_jobs > 0` 时规则直接判 WORKING，原因 `WAITING_FOR_BACKGROUND_JOB`，不问判定器（[fleet-architecture.md](fleet-architecture.md) §2.2）；任务开了多久不改变这个结论，上限由调度器管（`SPAWN_STALL_JOB_SECS`）。
 
 Observer 每次 tick：
 
@@ -377,6 +379,10 @@ Bridge、Observer、调度器（`deliver.rs`、`dispatch.rs`）、集成器（`i
 用尽的投递也按这条规则处理（objective 19，`deliver.rs`）：首次投递的重试用尽、且没有一次尝试可能打进去（错误里没有 `MAY_HAVE_TYPED`）时，调度器在最后一次尝试结束 `SPAWN_REISSUE_AFTER_SECS` 之后（数据库时钟）重发它，依据是记下的每次尝试及其结果，而不是“一直没送到”或单纯的时间；重发本身是记录：同一事务里的 `task.cancelled`（`by`、`reissued_as`、`attempts`）与 `task.assigned`（`reissue_of`）互相指名。重发的任务不再重发，它的投递也用尽时才升级给 supervisor。部署后的那次补试依据一条记下的 `source.moved`（`spawn mission moved` 每次部署都记，哪怕没有任务组的基线移动），它是一条有自己键（`deliver-<task>-<revision>-moved-<事件 id>`）的命令，结果照常检查；失败就保持原状，等下一条 `source.moved`。
 
 所有者的改动同样受它约束：线上的门禁脚本、场景、objective backlog 与维护脚本都来自控制器 `~/.local/share/spawn-rsi/controllers/<name>`（部署的那个提交的树，部署时原子切换，`deploy/controller.sh`），从不来自所有者的工作检出。否则检出里每次保存都立即生效，门禁还没评判过（曾经：改 gate.sh 改变了一个正在运行的门禁；提交到 `rsi/backlog` 的 objective 在部署前几秒内就被分派）。运行的东西必须是被评判过的东西的记录：**所有者的改动部署后才生效**。
+
+后台任务同样守这条规则（[fleet-architecture.md](fleet-architecture.md) §2.2）：工人是否在等自己的后台任务，只依据 Bridge 从会话记录读出的 `job.started` 与 `job.ended`（以及结束它所在执行的 `execution.ended`），从不依据屏幕上的 “N shells still running” 或 “N monitors still running”：屏尾只作为 Jev 看到的证据。停止任务要看 `TaskStop` 的结果说它停了，不看发出的调用（打算不等于做了）；任务开了多久用数据库的时钟（`spawn_now_ms()` 对 `job.started` 的 `recorded_at_ms`）。
+
+所有者部署时暂停落地，同样是记录，它的结束也是（objective 34，[fleet-architecture.md](fleet-architecture.md) §10.3 “Landing: the owner's hold”）。`spawn mission hold --source <源>` 在集成器的落地锁下读源的 `main`（已开始推送的落地先记下结果），记 `source.held`（`main`、`by`、`bound_s`、`reason`，存储写入 `expires_ms` = 记录自己的时间 + `bound_s` × 1000）；结束它的只有一条记录：所有者的 `source.released`，或集成器在数据库时钟（`spawn_now_ms()`）到达 `expires_ms` 之后、每一轮开始时记下的 `source.hold_expired`（存储在此之前、或对已不是当前的暂停一律拒绝，先记下的释放或续期胜出）。集成器的 `land()` 在落地锁下、推送之前从存储读暂停，从不凭内存或时间：被暂停的源上不推送，每个任务每个暂停记一次 `task.held`，任务仍是 `landing`；它的门禁照跑并记下结论，它所在任务组的这一步照常做完基线检查与目标分派，这个源不算“动过”；别的源、停机、预算与 `mission moved` 照常。过了 `expires_ms` 而还没有过期记录时什么也不落地：结束暂停的是记录，不是时钟。没有哪一步依赖哪个循环先跑。所有者的门禁前先暂停 Spawn 源（`deploy/hold.sh`），`deploy/deploy.sh` 在每条退出路径上释放（没有暂停时释放什么也不记），不再为整个门禁停掉 `spawn-integrate`。
 
 停滞的升级（`dispatch/stall.rs`，[fleet-architecture.md](fleet-architecture.md) §3 “Stalls”）同样守这条规则：每个未结任务所处的一步都从开始它的那条记录量起（控制记录的 id，或会话事实的 `session_seq`），年龄只用数据库的时钟（`spawn_now_ms()` 对 `recorded_at_ms`），从不凭“集成器最近没跑”之类的缺席推断；条目写明它量自哪条记录，标签里带着这条记录，所以每次停滞只升级一次，重启的 loop 算出同样的结果。
 

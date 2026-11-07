@@ -6,7 +6,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use spawn_core::id::{BranchName, WorkspaceId};
 use spawn_core::port::{BaseMerge, Commit, SetAside, WorkspaceStore};
@@ -14,7 +13,7 @@ use spawn_host::GitWorkspace;
 
 /// Output of git in `directory`, which must succeed.
 fn git(directory: &Path, arguments: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = spawn_host::test_git_command()
         .arg("-C")
         .arg(directory)
         .args(["-c", "user.name=spawn-test"])
@@ -303,7 +302,7 @@ fn a_runtime_file_main_removes_during_a_pending_merge_stays_removed() {
 
 /// git with the store's work tree and index, as the Bridge runs it.
 fn git_in(checkout: &Path, directory: &Path, index: &Path, arguments: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = spawn_host::test_git_command()
         .arg(format!("--git-dir={}", checkout.join(".git").display()))
         .arg(format!("--work-tree={}", directory.display()))
         .env("GIT_INDEX_FILE", index)
@@ -415,7 +414,7 @@ fn a_runtime_file_the_owner_removes_from_main_leaves_the_branch_and_lands_clean(
     assert!(files.contains(&"work.txt".to_string()), "{files:?}");
     assert!(directory.join(LOCK).is_file(), "the engine keeps its lock");
     // The landing: `main` first, as the integrator merges.
-    let landed = Command::new("git")
+    let landed = spawn_host::test_git_command()
         .arg("-C")
         .arg(&checkout)
         .args(["merge-tree", "--write-tree", "main", &reference])

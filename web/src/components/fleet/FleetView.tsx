@@ -12,11 +12,12 @@ import { AgentDetail } from "./AgentDetail";
 import { AlwaysOnAgents, uptimeMs } from "./AlwaysOnAgents";
 import { AttentionQueue } from "./AttentionQueue";
 import { FleetBoard } from "./FleetBoard";
+import { InputBox } from "./InputBox";
 import { HealthStrip } from "./HealthStrip";
 import type { Liveness } from "./HealthStrip";
 
 interface FleetViewProps {
-  /** Its agents marked by who needs a human (App, attention.ts). */
+  /** Its agents marked by what is escalated (App, attention.ts). */
   fleet: PollResult<Fleet>;
   /** The dispatcher's view, `/api/attention` (App polls it). */
   attention: PollResult<Attention>;
@@ -28,10 +29,11 @@ interface FleetViewProps {
 }
 
 /**
- * The landing page, in the order an observer asks: who needs a human, are
- * the always-on agents alive and moving, are resources fine, then how the
- * rest of the fleet works (on a task, idle, ended). The fleet and attention
- * polls live in App so the sidebar can show who needs a human from any view.
+ * The landing page, in the order an observer asks: what is escalated (and,
+ * always at the top, a box to type to the supervisor), are the always-on
+ * agents alive and moving, are resources fine, then how the rest of the
+ * fleet works (on a task, idle, ended). The fleet and attention polls live
+ * in App so the sidebar can show the escalations' count from any view.
  */
 export function FleetView({
   fleet,
@@ -49,6 +51,14 @@ export function FleetView({
   const updated = data?.health.generated_at_ms ?? null;
   const agents = data?.agents;
   const groups = useMemo(() => groupAgents(agents ?? [], context), [agents, context]);
+  // Who the box at the top types to: the dispatcher's supervisor, else the
+  // board's, else the one Spawn starts.
+  const onBoard = agents?.find((agent) => agent.role === "supervisor") ?? null;
+  const supervisor = {
+    session:
+      attention.data?.supervisor?.session_id ?? onBoard?.session_id ?? "session_supervisor",
+    live: attention.data?.supervisor?.live ?? onBoard?.live ?? true,
+  };
   const engine = useMemo(() => usualEngine(agents ?? []), [agents]);
   const alwaysOn = groups[0].agents;
   const missing = useMemo(() => missingAlwaysOn(agents ?? [], context), [agents, context]);
@@ -96,7 +106,19 @@ export function FleetView({
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="mx-auto flex max-w-[1600px] flex-col gap-3 p-3 sm:p-4">
-            <AttentionQueue view={attention} agents={data.agents} onSelect={onSelect} />
+            <AttentionQueue
+              view={attention}
+              agents={data.agents}
+              onSelect={onSelect}
+              talk={
+                <InputBox
+                  key={supervisor.session}
+                  sessionId={supervisor.session}
+                  to="the supervisor"
+                  stopped={!supervisor.live}
+                />
+              }
+            />
             <AlwaysOnAgents
               agents={alwaysOn}
               missing={missing}

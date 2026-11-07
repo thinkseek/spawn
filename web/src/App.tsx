@@ -79,7 +79,7 @@ function presenting(): boolean {
 
 export default function App() {
   const overview = usePoll("overview", fetchOverview);
-  // Both polled in every view: the sidebar shows who needs a human, which is
+  // Both polled in every view: the sidebar shows what is escalated, which is
   // the dispatcher's view (/api/attention), never a judge's flag.
   const fleetPoll = usePoll("fleet", fetchFleet, 3_000);
   const attention = usePoll("attention", fetchAttention, 3_000);
