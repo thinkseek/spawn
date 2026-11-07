@@ -430,17 +430,18 @@ pub(super) fn slim_board(board: &mut Value) {
     }
 }
 
-/// Lines of an objective's prompt the RSI page shows (its card's four
-/// lines, and the title a pointer shows, which browsers cut near 1 KB).
+/// Lines of an objective's prompt `/api/rsi` sends: more than the four its
+/// card shows. Pointed at, the page reads the whole prompt
+/// (`/api/rsi/objective/<mission>/<id>`) for its title.
 const PROMPT_LINES: usize = 10;
 
-/// Bytes of an objective's prompt the RSI page shows.
+/// Bytes of an objective's prompt `/api/rsi` sends.
 const PROMPT_BYTES: usize = 1024;
 
 /// `/api/rsi`'s missions as the page shows them: each objective's prompt
-/// cut to its first lines, and each task's brief and review note as their
-/// lengths alone (no list of the page shows them; the task in full is
-/// `/api/rsi/task/<id>`).
+/// cut to its first lines (whole at `/api/rsi/objective/<mission>/<id>`),
+/// and each task's brief and review note as their lengths alone (no list
+/// of the page shows them; the task in full is `/api/rsi/task/<id>`).
 pub(super) fn slim_rsi(missions: &mut [Value]) {
     for mission in missions {
         if let Some(objectives) = mission.get_mut("objectives").and_then(Value::as_array_mut) {
