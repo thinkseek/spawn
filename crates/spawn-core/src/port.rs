@@ -505,6 +505,22 @@ pub trait TerminalHost: Send + Sync {
         })
     }
 
+    /// [`Self::runner`] for a whole fleet in one call, in the order given: a
+    /// host that can ask its terminal server once for every pane does, so a
+    /// pass over a fleet costs one call and not one per terminal. Each
+    /// terminal not there is [`Runner::Gone`]; an error says nothing about
+    /// any of them. The default asks [`Self::runner`] for each.
+    fn runners(
+        &self,
+        terminals: &[(TerminalName, WorkspaceId)],
+    ) -> Result<Vec<(TerminalName, Runner)>, TerminalError> {
+        let mut states = Vec::with_capacity(terminals.len());
+        for (terminal, workspace) in terminals {
+            states.push((terminal.clone(), self.runner(terminal, workspace)?));
+        }
+        Ok(states)
+    }
+
     /// Last `lines` lines of the terminal screen, newest last.
     fn capture_tail(
         &self,
