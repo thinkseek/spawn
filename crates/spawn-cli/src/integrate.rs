@@ -368,8 +368,14 @@ const HOST_FAULT_BACKOFF: Duration = Duration::from_mins(5);
 const HOST_FAULT_BACKOFF_MAX: Duration = Duration::from_hours(1);
 
 /// The host fault in a row that is escalated to the supervisor (once per
-/// run: the later ones are not).
+/// run: the later ones are not). Only 020's evidence escalates: a base that
+/// disagrees with itself raises an alert at [`BASE_DISAGREES_ALERT_AT`].
 const HOST_FAULT_ESCALATE_AT: u32 = 2;
+
+/// The base disagreement in a row that raises the mission's alert (once per
+/// run, carried by that record): the owner's ruling of 2026-11-06, where
+/// 020's evidence escalates at two.
+const BASE_DISAGREES_ALERT_AT: u32 = 3;
 
 /// The test database server's log (`log_line_prefix` `%m [%p] `), read for
 /// a crash in a gate's window. Optional.
