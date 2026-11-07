@@ -1361,12 +1361,15 @@ struct Judge {
 }
 
 /// The settings of host faults: the test database's log
-/// ([`TEST_DATABASE_LOG`], none when unset) and the first backoff
-/// (`SPAWN_GATE_HOST_FAULT_BACKOFF_SECS`, [`host_fault_base`]).
+/// ([`TEST_DATABASE_LOG`], none when unset), the first backoff
+/// (`SPAWN_GATE_HOST_FAULT_BACKOFF_SECS`, [`host_fault_base`]) and how many
+/// host faults one report revision of a task may have before the next counts
+/// as an abort (`SPAWN_GATE_HOST_FAULT_CAP`, [`host_fault_cap`]).
 #[derive(Clone, Debug)]
 struct HostSettings {
     server_log: Option<PathBuf>,
     backoff: Duration,
+    cap: u32,
 }
 
 impl HostSettings {
@@ -1376,8 +1379,52 @@ impl HostSettings {
             backoff: host_fault_base(
                 crate::config::env_value("SPAWN_GATE_HOST_FAULT_BACKOFF_SECS").as_deref(),
             ),
+            cap: host_fault_cap(crate::config::env_value("SPAWN_GATE_HOST_FAULT_CAP").as_deref()),
         }
     }
+}
+
+/// How many `host_fault` verdicts one report revision of a task may have; the
+/// next one is recorded as `aborted` instead, so it counts toward the abort
+/// halt. A host fault is never a verdict on the work, but one that recurs on
+/// the same work may be the work's own doing (a candidate that leaves the
+/// shared test server broken for the base run after it), and an uncounted
+/// fault would hold that task for ever. 3 by default, like the halts.
+const HOST_FAULT_CAP: u32 = 3;
+
+/// [`HOST_FAULT_CAP`] from `SPAWN_GATE_HOST_FAULT_CAP`'s text: a whole number
+/// from 1 up; anything else is the default.
+pub(crate) fn host_fault_cap(text: Option<&str>) -> u32 {
+    text.and_then(|text| text.trim().parse::<u32>().ok())
+        .filter(|cap| *cap > 0)
+        .unwrap_or(HOST_FAULT_CAP)
+}
+
+/// The `aborted` record of a host fault past the cap: `faults` host faults
+/// already at this revision, `cap` allowed; the fault's own record kept under
+/// `host_fault` (its log at the top, as an abort's).
+fn capped_host_fault(task: &Task, faults: i64, cap: u32, mut fault: Value) -> Value {
+    let log = fault
+        .as_object_mut()
+        .and_then(|fields| fields.remove("log"))
+        .unwrap_or(Value::Null);
+    // The fault as it was said, without its promise to judge again.
+    let said = fault["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .split("; not a verdict on the work")
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    json!({
+        "reason": format!(
+            "a host fault again: task {} has had {faults} at report revision {}, the most \
+             SPAWN_GATE_HOST_FAULT_CAP allows is {cap}, so this one counts as an abort ({said})",
+            task.id, task.revisions
+        ),
+        "log": log,
+        "host_fault": fault,
+    })
 }
 
 /// Whether the integrator said it has no log evidence: said once.
@@ -2096,12 +2143,36 @@ impl Judge {
         let scenarios = Path::new(&mission.gate);
         // Read only: the integrator never commits a workspace.
         let repo = GitWorkspace::new(mirror, &self.root);
+        // The checks the candidate's gate run saw fail once and pass again
+        // (its verdict's `flakes`), carried on whichever record this judging
+        // writes: set once the run has a verdict.
+        let flakes: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
         let gated = |verdict: &str, extra: Value| -> Result<(), String> {
+            // A host fault past the cap for this revision counts as an abort
+            // ([`HOST_FAULT_CAP`]).
+            let (verdict, extra) = if verdict == "host_fault" {
+                let faults = store
+                    .task_host_faults(task.id, i64::from(task.revisions))
+                    .map_err(|error| error.to_string())?;
+                if faults >= i64::from(self.host.cap) {
+                    (
+                        "aborted",
+                        capped_host_fault(task, faults, self.host.cap, extra),
+                    )
+                } else {
+                    (verdict, extra)
+                }
+            } else {
+                (verdict, extra)
+            };
             let mut record_value = json!({"type": "task.gated", "id": task.id, "verdict": verdict,
                                           "revision": task.revisions, "base": main,
                                           "scenarios": count});
             if let (Some(target), Some(extra)) = (record_value.as_object_mut(), extra.as_object()) {
                 target.extend(extra.clone());
+            }
+            if !flakes.borrow().is_empty() {
+                record_value["flakes"] = json!(*flakes.borrow());
             }
             record(store, &record_value)?;
             println!("integrate: task {} gated: {verdict}", task.id);
@@ -2227,6 +2298,9 @@ impl Judge {
         let started = now_ms();
         let judged = run_gate(main, &candidate);
         let ended = now_ms();
+        if let Ok(verdict) = &judged {
+            flakes.replace(verdict.flakes.clone());
+        }
         match judged {
             Ok(verdict) if verdict.accepted => {
                 // The verdict is stored before git moves, so a crash lands
@@ -8916,6 +8990,7 @@ mod database_tests {
         integrator.judge.host = super::HostSettings {
             server_log: Some(server_log.clone()),
             backoff: std::time::Duration::from_secs(2),
+            cap: super::HOST_FAULT_CAP,
         };
         let db = Db::new("host_fault_pass");
         let mission = db.gated_mission(&source, &scenarios);
@@ -9077,6 +9152,7 @@ mod database_tests {
         integrator.judge.host = super::HostSettings {
             server_log: None,
             backoff: std::time::Duration::from_secs(2),
+            cap: super::HOST_FAULT_CAP,
         };
         let db = Db::new("gate_host_fault");
         let mission = db.gated_mission(&source, &scenarios);
@@ -9184,6 +9260,113 @@ mod database_tests {
         assert_eq!(gated(&db, mission).gate_aborts, 0);
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The host-fault cap (rev-e on gate-check-flakes): one report revision
+    /// of a task has at most `SPAWN_GATE_HOST_FAULT_CAP` uncounted host
+    /// faults. With the cap at 2, a gate that reports the same host fault on
+    /// every run is `host_fault` twice (no count), and the third run is
+    /// recorded `aborted` with a reason that says why, the fault kept under
+    /// `host_fault`: it counts toward the abort halt, as the next one does.
+    #[test]
+    fn host_faults_past_the_cap_on_one_revision_count_as_aborts() {
+        let gate = "echo '| == regression: check-e2e.sh must still pass'\n\
+                    printf '{\"host_fault\":true,\"scenario\":\"check-e2e.sh\",\"on\":\"candidate and base\",\"runs\":\"1, then 1 on the candidate; 1 on the base\",\"reason\":\"check-e2e.sh failed twice on the candidate and on the base\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+                    exit 6\n";
+        let (base, source, scenarios, mut integrator) = world("gate-fault-cap", gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_secs(1),
+            cap: 2,
+        };
+        let db = Db::new("gate_host_fault_cap");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        // One judging: a pass, its gate settled, after the last record's
+        // due time (a host fault's backoff) has come.
+        let judge_once = |due: Option<i64>| {
+            if let Some(due) = due {
+                let left = due - super::now_ms();
+                if left > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        u64::try_from(left).unwrap_or(0) + 50,
+                    ));
+                }
+            }
+            integrator.pass_on(&db.store).expect("a pass");
+            integrator.settle();
+            last_verdict(&db).0
+        };
+
+        let first = judge_once(None);
+        assert_eq!(first["verdict"], "host_fault", "{first}");
+        let second = judge_once(first["due_ms"].as_i64());
+        assert_eq!(second["verdict"], "host_fault", "the cap is 2: {second}");
+        assert_eq!(gated(&db, mission).gate_aborts, 0, "no count yet");
+
+        let third = judge_once(second["due_ms"].as_i64());
+        assert_eq!(third["verdict"], "aborted", "past the cap: {third}");
+        let reason = third["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains(&format!("task {task} has had 2 at report revision 0"))
+                && reason.contains("SPAWN_GATE_HOST_FAULT_CAP allows is 2")
+                && reason.contains("counts as an abort")
+                && reason.contains("check-e2e.sh failed on the candidate and on the base")
+                && !reason.contains("judged again"),
+            "{reason}"
+        );
+        assert_eq!(third["host_fault"]["evidence"], "gate", "{third}");
+        assert_eq!(third["host_fault"]["fact"]["scenario"], "check-e2e.sh");
+        assert!(third["log"].is_string(), "{third}");
+        let after = gated(&db, mission);
+        assert_eq!(
+            (after.gate_aborts, after.gate_host_faults),
+            (1, 0),
+            "an abort, which ends the run of host faults"
+        );
+        assert_eq!(
+            after.tasks[0].state,
+            spawn_core::mission::TaskState::Reported
+        );
+
+        // The same revision's next host fault counts too.
+        let fourth = judge_once(None);
+        assert_eq!(fourth["verdict"], "aborted", "{fourth}");
+        assert_eq!(gated(&db, mission).gate_aborts, 2);
+        assert_eq!(db.store.task_host_faults(task, 0).expect("count"), 2);
+
+        assert_eq!(super::host_fault_cap(None), 3);
+        assert_eq!(super::host_fault_cap(Some(" 5 ")), 5);
+        assert_eq!(super::host_fault_cap(Some("0")), 3);
+        assert_eq!(super::host_fault_cap(Some("x")), 3);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A gate verdict's `flakes` (checks that failed once and passed again)
+    /// are on the task's `task.gated` record; a verdict without them leaves
+    /// the record without the key, as every record before it.
+    #[test]
+    fn a_verdicts_flakes_are_on_its_record() {
+        let gate = "printf '{\"verdict\":\"rejected\",\"reason\":\"regression: check-tests.sh fails on the candidate\",\"flakes\":[\"check-e2e.sh\"]}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+        let (base, source, scenarios, integrator) = world("gate-flakes", gate);
+        let db = Db::new("gate_flakes");
+        let mission = db.gated_mission(&source, &scenarios);
+        let _task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["flakes"], json!(["check-e2e.sh"]), "{record}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Objective 20 beside main's `no-test-database`: a mission whose gate

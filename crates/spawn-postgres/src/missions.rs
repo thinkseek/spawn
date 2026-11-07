@@ -612,6 +612,17 @@ select coalesce(jsonb_agg(jsonb_build_object(
 /// the merge of main on top of it for its next delivery, hold none of the
 /// work: rev-e on a114a9e, objective 55's task 149). spawn-cli checks in
 /// git that the commit holds changes of its own. `$1` the task.
+/// [`PostgresStore::task_host_faults`]: a task's `host_fault` verdicts at
+/// one report revision.
+pub(crate) const TASK_HOST_FAULTS: &str = r"
+select count(*)
+  from spawn_events e
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'id' = $1
+   and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+   and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
+   and e.kind -> 'detail' -> 'record' ->> 'revision' = $2";
+
 pub(crate) const OBJECTIVE_FORK: &str = r"
 select coalesce((
   select jsonb_build_object('task', p.id, 'commit', c.commit)
@@ -1754,6 +1765,18 @@ impl PostgresStore {
             .query_one(
                 "select spawn_task_fork_failed($1, $2, $3, $4)",
                 &[&task, &from, &commit, &error],
+            )?
+            .get(0))
+    }
+
+    /// How many `host_fault` gate verdicts task `task` has at its report
+    /// revision `revision`: read from its control records by the record-id
+    /// index. The integrator counts the next one past its cap as an abort.
+    pub fn task_host_faults(&self, task: i64, revision: i64) -> Result<i64, StoreError> {
+        Ok(self
+            .query_one(
+                TASK_HOST_FAULTS,
+                &[&task.to_string(), &revision.to_string()],
             )?
             .get(0))
     }

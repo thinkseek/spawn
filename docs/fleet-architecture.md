@@ -1144,7 +1144,9 @@ the tree's own:
   so its failure stops the rest early);
 - a check that fails on the candidate is run again there, as an
   objective's "unsolved" needs two runs that agree: passing the second
-  time, it is a flake (said in the log) and the gate goes on; failing
+  time, it is a flake (said in the log, and named in the verdict's and the
+  `task.gated` record's `flakes`, so a check that keeps flaking on one
+  candidate or mission shows) and the gate goes on; failing
   twice, it is run on the base (built for it when every base result came
   from the cache): passing there, it is a regression; failing there too, it
   is a host or harness fault, no verdict (exit 6, a `host_fault`, §10.3:
@@ -1530,6 +1532,18 @@ record of what was judged (§14 of design.md).
      pair for it (`base_disagrees`), so the two never describe one run; a
      base-only fault of either evidence never counts toward
      `SPAWN_GATE_HOST_FAULT_CAP` and is never capped (§10.3).
+     A task's report revision has at most `SPAWN_GATE_HOST_FAULT_CAP` (3 by
+     default) host faults judged after the candidate ran (either kind: the
+     test database's, or the gate's own with `on` `candidate and base`),
+     counted from its `task.gated` records: the next one at that revision
+     is recorded `aborted` instead, its reason saying so and the fault kept
+     under `host_fault`, so it counts toward the abort halt. A host fault is
+     no verdict on the work, but one that keeps recurring on the same work
+     may be the work's doing (a check's base run follows candidate code on
+     the shared test server), and an uncounted one would hold the task for
+     ever. A base-only fault (the gate's fact `on` `base`, or the base's own
+     disagreement) comes before any candidate code and counts toward no
+     halt, so it neither counts toward the cap nor is ever capped.
   6. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate
