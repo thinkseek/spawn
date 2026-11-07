@@ -182,6 +182,94 @@ impl Step {
     }
 }
 
+/// The steps of one loop, each with what decides whether a pass runs it.
+#[derive(Debug, Default)]
+struct Schedule {
+    bridge: Step,
+    observer: Step,
+    dispatch: Step,
+    residents: Step,
+    alive: Step,
+}
+
+impl Schedule {
+    fn new() -> Self {
+        Self {
+            bridge: Step::new(),
+            observer: Step::new(),
+            dispatch: Step::new(),
+            residents: Step::new(),
+            alive: Step::new(),
+        }
+    }
+
+    /// The earliest due time among the steps; `None` when none waits on a
+    /// clock.
+    fn earliest(&self) -> Option<i64> {
+        [
+            &self.bridge,
+            &self.observer,
+            &self.dispatch,
+            &self.residents,
+            &self.alive,
+        ]
+        .into_iter()
+        .filter_map(|step| step.due)
+        .min()
+    }
+}
+
+/// This host's clock in epoch milliseconds.
+fn now_ms() -> i64 {
+    spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
+}
+
+/// Consecutive failed passes after which the loop exits, so its unit
+/// restarts it with fresh connections (the store does not reconnect).
+const MAX_FAILURES: u32 = 10;
+
+/// One step of the loop, and what decides whether this pass runs it: the
+/// watermark it last acted on, and the earliest time it waits for.
+///
+/// A step runs when the log's watermark has moved since it last ran (a
+/// record it decides from may be new), or when its own due time has come (a
+/// retry, a bound, a lease, a backoff the records it read named). A pass
+/// where neither holds reads the watermark and runs no step: on an idle
+/// fleet that is the only statement it makes.
+#[derive(Debug, Default)]
+struct Step {
+    /// The watermark (`max(spawn_events.id)`) the step last acted on, read
+    /// before it ran: every event at or below it was in the records the step
+    /// read, and one above it may not have been. A step that has never run
+    /// has no mark and runs at once.
+    mark: Option<i64>,
+    /// When this step is due even if the watermark does not move, on this
+    /// host's clock; `None` while no clock is waited for.
+    due: Option<i64>,
+}
+
+impl Step {
+    /// A step that has not run yet.
+    fn new() -> Self {
+        Self {
+            mark: None,
+            due: Some(0),
+        }
+    }
+
+    /// Whether this pass runs the step.
+    fn runs(&self, watermark: i64, now_ms: i64) -> bool {
+        self.mark != Some(watermark) || self.due.is_some_and(|due| due <= now_ms)
+    }
+
+    /// Record that the step ran having acted on `watermark`, and when it is
+    /// next due (`None`: no clock).
+    fn ran(&mut self, watermark: i64, due: Option<i64>) {
+        self.mark = Some(watermark);
+        self.due = due;
+    }
+}
+
 /// The earliest due time among the steps; `None` when none waits on a clock.
 fn earliest(steps: &[&Step]) -> Option<i64> {
     steps.iter().filter_map(|step| step.due).min()
