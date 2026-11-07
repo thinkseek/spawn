@@ -3469,7 +3469,7 @@ mod tests {
         WorkspaceId,
     };
     use crate::memory::{MemoryStore, MemoryWatch};
-    use crate::port::{EventLog, Launch, TerminalError, TerminalHost};
+    use crate::port::{CommandQueue, EventLog, Launch, TerminalError, TerminalHost};
     use crate::screen::ScreenState;
     use crate::time::{ManualClock, Timestamp};
     use std::time::Duration;
