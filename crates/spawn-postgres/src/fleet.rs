@@ -478,6 +478,17 @@ impl PostgresStore {
         self.query_json_prepared(DISPATCH_FACTS, &[&spawn_core::bridge::MAY_HAVE_TYPED])
     }
 
+    /// The plan the dispatcher's facts read, as `EXPLAIN (FORMAT JSON)` gives
+    /// it, without running it: the per-session reads of `spawn_commands` are
+    /// index scans of `(session_id, id)` and `(session_id, principal, id)`,
+    /// never a scan of the table (tests/wake.rs states it over 20,000 rows).
+    pub fn dispatch_facts_plan(&self) -> Result<Value, StoreError> {
+        let sql = format!(
+            "explain (format json, costs off) {DISPATCH_FACTS}"
+        );
+        self.query_json(&sql, &[&spawn_core::bridge::MAY_HAVE_TYPED])
+    }
+
     /// Every session with its judgement, task and activity, supervisor first.
     pub fn fleet_board(&self) -> Result<Value, StoreError> {
         self.query_json(FLEET_BOARD, &[])
