@@ -870,6 +870,71 @@ pub(crate) fn host_fault_fields(
     fields
 }
 
+/// The record of a gate whose base disagreed with itself (objective 033):
+/// the scenario the gate named, both of its exits, the gate's setup seconds
+/// when it printed its timing, the `faults`-th host fault in a row on the
+/// mission (020's run, which this evidence shares) and the
+/// `disagreements`-th base disagreement in a row, with its `backoff`.
+///
+/// A base that disagrees with itself never escalates (`escalate` false, for
+/// every one of the run): the record that makes the run
+/// [`BASE_DISAGREES_ALERT_AT`] carries `alert` true, and every other one
+/// false. That record is the alert until objective 030 exists, and the
+/// dispatcher's digest takes it to the supervisor once
+/// ([`crate::dispatch::digest::base_disagrees_alerts`]).
+pub(crate) fn base_disagrees_fields(
+    scenario: &str,
+    exits: [u8; 2],
+    setup_s: Option<u64>,
+    faults: u32,
+    disagreements: u32,
+    backoff: Duration,
+    log: &str,
+) -> Value {
+    let setup = setup_s.map_or_else(String::new, |seconds| {
+        format!(", after a setup of {seconds} s")
+    });
+    json!({
+        "reason": format!(
+            "host fault: the base disagrees with itself: {scenario} exited {}, then {} on the base\
+             {setup}; not a verdict, judged again later",
+            exits[0], exits[1]
+        ),
+        "log": log,
+        "evidence": BASE_DISAGREES,
+        "scenario": scenario,
+        "exits": exits,
+        "host_faults": faults,
+        "backoff_ms": u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+        "escalate": false,
+        "base_disagrees": disagreements,
+        "alert": disagreements == BASE_DISAGREES_ALERT_AT,
+    })
+    .tap_setup(setup_s)
+}
+
+/// The evidence a `host_fault` record names when the base disagreed with
+/// itself (its own scenario failing and then passing, before any candidate
+/// code ran): objective 020's verdict with this objective's evidence.
+pub(crate) const BASE_DISAGREES: &str = "base_disagrees";
+
+/// Keep `setup_s` out of a record whose gate printed no timing line: the
+/// field is left out, not null.
+trait TapSetup {
+    fn tap_setup(self, setup_s: Option<u64>) -> Self;
+}
+
+impl TapSetup for Value {
+    fn tap_setup(mut self, setup_s: Option<u64>) -> Self {
+        if setup_s.is_none()
+            && let Some(fields) = self.as_object_mut()
+        {
+            fields.remove("setup_s");
+        }
+        self
+    }
+}
+
 /// The record of a gate that had no room to judge `task`, at `now_ms`: the
 /// reason with the free space and TMPDIR, the facts themselves, and
 /// `escalate` when the run of them on this task began more than
