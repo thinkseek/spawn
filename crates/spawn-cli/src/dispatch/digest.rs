@@ -227,6 +227,66 @@ pub(crate) fn objective_yields(records: &[Value]) -> Vec<Escalation> {
         .collect()
 }
 
+/// The digest items for `records` (`PostgresStore::over_budget_escalations`):
+/// a task that continued an overrun task of its objective went over the
+/// budget too, so no third task is issued for it and the objective waits
+/// for the mission to be configured again. The item names both tasks, the
+/// objective, the branch and the work it holds (`git diff --stat main`),
+/// the budget and the tool calls, and what can be done. Told once: the
+/// record carries no window, a digest that reached the supervisor with the
+/// tag `host over-budget-<event id>` means it was told.
+pub(crate) fn over_budget_escalations(records: &[Value]) -> Vec<Escalation> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let id = record["event_id"].as_i64()?;
+            let task = record["id"].as_i64()?;
+            let continues = record["continues"].as_i64()?;
+            let mission = record["mission"]
+                .as_i64()
+                .map_or_else(|| "its mission".to_string(), |id| format!("mission {id}"));
+            let objective = record["objective"]
+                .as_u64()
+                .map_or_else(|| "an objective".to_string(), |id| format!("objective {id}"));
+            let branch = record["branch"].as_str().unwrap_or("its branch");
+            let commit = record["commit"].as_str().map_or_else(
+                || "none (its push failed)".to_string(),
+                |commit| commit.to_string(),
+            );
+            let diff = record["diff"]
+                .as_str()
+                .map(str::trim)
+                .filter(|diff| !diff.is_empty())
+                .map_or_else(
+                    || ":the work it holds: none recorded".to_string(),
+                    |diff| format!(":\n{diff}"),
+                );
+            let budget = record["budget"].to_string();
+            let calls = record["tool_calls"]
+                .as_i64()
+                .map_or_else(|| "its".to_string(), |calls| calls.to_string());
+            let reason = record["reason"].as_str().map_or_else(
+                || format!("task #{task} went over its budget too"),
+                |reason| one_line(reason, 300),
+            );
+            Some(Escalation {
+                session_id: "host".to_string(),
+                id: format!("over-budget-{id}"),
+                why: Why::OverBudget,
+                line: format!(
+                    "{mission}: task #{task} (a continuation of task #{continues}) went over \
+                     {objective}'s budget too: {reason}; it made {calls} tool calls, the budget \
+                     {budget}. Its branch {branch} at {commit}{diff}. Split the objective, raise \
+                     the budget with `spawn mission configure`, or take it over: no task is \
+                     issued for it until the mission is configured again, and its other \
+                     objectives go on."
+                ),
+                since_ms: record["at_ms"].as_i64(),
+            })
+        })
+        .collect()
+}
+
 /// The digest items for `missions` (`PostgresStore::objective_backlogs`):
 /// one per open objective mission whose backlog names an order that cannot
 /// be met ([`crate::objectives::order_problems`]), of session `missions`,

@@ -408,6 +408,10 @@ pub(crate) enum Why {
     /// An objective ran out of attempts and its task yielded the slot to
     /// the next objective ([`digest::objective_yields`]).
     ObjectiveYielded,
+    /// A task that continued an overrun task went over its budget too
+    /// ([`digest::over_budget_escalations`]): its objective is held until
+    /// the mission is configured again.
+    OverBudget,
     /// An objective mission's backlog names an order that cannot be met
     /// ([`digest::objective_order`]): a condition until the backlog changes.
     ObjectiveOrder,
@@ -675,6 +679,13 @@ pub(crate) fn read_plan(
         store
             .gate_host_fault_escalations()
             .map_err(|error| format!("gate host fault records: {error}"))?
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+    ));
+    host.extend(digest::over_budget_escalations(
+        store
+            .over_budget_escalations()
+            .map_err(|error| format!("over budget records: {error}"))?
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
