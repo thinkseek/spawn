@@ -343,9 +343,11 @@ impl Fleet {
         let due = self
             .steps_at
             .is_none_or(|at| at.elapsed() >= self.interval);
-        if due && let (Some(open), Some(watermark)) = (self.store.clone(), watermark) {
-            self.steps_at = Some(std::time::Instant::now());
-            let ran = self.steps(&open, watermark, now, &mut lines, &mut warnings, &mut failed);
+        if let (Some(open), Some(watermark)) = (self.store.clone(), watermark) {
+            self.bridge_work(&open, watermark, now, &mut warnings, &mut failed);
+            if due {
+                self.steps_at = Some(std::time::Instant::now());
+                let ran = self.steps(&open, watermark, now, &mut lines, &mut warnings, &mut failed);
             if std::env::var_os("SPAWN_LOOP_TRACE").is_some() {
                 eprintln!("trace: wm={watermark} ran={ran:?} lines={}", lines.len());
             }
@@ -373,6 +375,44 @@ impl Fleet {
         }
     }
 
+
+    /// The Bridge's reading of the log and its claims of the queue: a few
+    /// reads, and the one step that turns a submitted command into work, so
+    /// it runs whenever the watermark moved or its lease says so, never
+    /// behind the pass interval the heavier steps keep to.
+    fn bridge_work(
+        &mut self,
+        open: &std::sync::Arc<PostgresStore>,
+        watermark: i64,
+        now: i64,
+        warnings: &mut Vec<String>,
+        failed: &mut bool,
+    ) {
+        if !self.schedule.bridge.runs(watermark, now) {
+            return;
+        }
+        if self.schedule.bridge.runs(watermark, now) {
+            match self.bridge.work() {
+                Ok((report, more)) => {
+                    warnings.extend(report.warnings);
+                    // Its own wait is the earliest lease still running, or
+                    // the next pass when the claim stopped at its per-tick
+                    // limit and a command may still be waiting for one.
+                    let due = if more {
+                        Some(now)
+                    } else {
+                        open.next_lease_ms().unwrap_or_else(|error| {
+                            Fleet::fail(failed, "bridge", &error.to_string());
+                            None
+                        })
+                    };
+                    self.schedule.bridge.ran(watermark, due);
+                }
+                Err(error) => Fleet::fail(failed, "bridge", &error.to_string()),
+            }
+        }
+    }
+
     /// The steps whose input is the store: the Bridge's reads of the log and
     /// its claims of the queue, the Observer's judgements, the dispatcher,
     /// the liveness rule. Each runs when the watermark moved or its own time
@@ -397,27 +437,6 @@ impl Fleet {
                     at = now_at;
                 }
             };
-        }
-        if self.schedule.bridge.runs(watermark, now) {
-            ran.push("bridge");
-            match self.bridge.work() {
-                Ok((report, more)) => {
-                    warnings.extend(report.warnings);
-                    // Its own wait is the earliest lease still running, or
-                    // the next pass when the claim stopped at its per-tick
-                    // limit and a command may still be waiting for one.
-                    let due = if more {
-                        Some(now)
-                    } else {
-                        open.next_lease_ms().unwrap_or_else(|error| {
-                            Fleet::fail(failed, "bridge", &error.to_string());
-                            None
-                        })
-                    };
-                    self.schedule.bridge.ran(watermark, due);
-                }
-                Err(error) => Fleet::fail(failed, "bridge", &error.to_string()),
-            }
         }
         mark!("bridge");
         if self.schedule.observer.runs(watermark, now) {
