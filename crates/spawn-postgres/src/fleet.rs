@@ -208,7 +208,17 @@ select jsonb_build_object(
 /// the dispatcher sent into the session after that start that files a
 /// `charter <hash>` tag, oldest first, with its outcome, however long ago.
 pub(crate) const DISPATCH_FACTS: &str = concat!(
+    // The executions of every session once (`agent_executions`, a scan of the
+    // log with a lateral read of each execution's end): the facts ask about
+    // the latest one, the resumes, the failures and the stops, and answering
+    // each of those from `execs` reads the log once for the whole pass
+    // instead of once per question.
     r"
+with execs as materialized (
+  select e.session_id, e.execution_id, e.started_at_ms, e.ended_at_ms, e.cause,
+         e.exit_code, e.duration_ms, e.command_id
+    from agent_executions e
+)
 select coalesce(jsonb_agg(row_to_json(w) order by w.session_id), '[]'::jsonb)
 from (
   select
@@ -216,8 +226,7 @@ from (
     s.agent_id,
     s.live,
     s.execution_id,
-    (select x.cause from agent_executions x where x.session_id = s.session_id
-      order by x.started_at_ms desc, x.execution_id desc limit 1) as end_cause,
+    s.end_cause,
     p.observation,
     p.observation_event_id,
     p.observation_at_ms,
@@ -275,7 +284,7 @@ from (
        from spawn_commands c
       where s.live and c.session_id = s.session_id
         and c.action ->> 'type' in ('stop', 'discard')
-        and c.id > (select x.command_id from agent_executions x
+        and c.id > (select x.command_id from execs x
                      where x.session_id = s.session_id
                        and x.execution_id = s.execution_id)) as stops,
     -- Only the supervisor's told set is read (the tags its digests filed):
@@ -291,12 +300,12 @@ from (
         and c.idempotency_key like 'deliver-%'
         and (c.succeeded is distinct from false or position($1 in coalesce(c.error, '')) > 0)
       order by c.id desc limit 1) as last_delivery,
-    (select count(*) from agent_executions x
+    (select count(*) from execs x
        join spawn_commands c on c.id = x.command_id
       where x.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and c.idempotency_key like 'dispatch-resume-%' and c.succeeded
         and x.started_at_ms > (select coalesce(max(h.started_at_ms), 0)
-                                 from agent_executions h
+                                 from execs h
                                 where h.session_id = s.session_id and not ",
     died_young!("h"),
     r")
@@ -334,7 +343,7 @@ from (
                               and e.event_name = 'execution.ended' and e.source = 'bridge'
                             order by e.id limit 1),
               'error', c.error)
-       from agent_executions x
+       from execs x
        join spawn_commands c on c.id = x.command_id
       where x.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and c.idempotency_key like 'dispatch-resume-%'
@@ -342,15 +351,28 @@ from (
     lost_before_ready!("x"),
     r"
         and x.started_at_ms > (select coalesce(max(h.started_at_ms), 0)
-                                 from agent_executions h
+                                 from execs h
                                 where h.session_id = s.session_id and not ",
     died_young!("h"),
     r" and not ",
     lost_before_ready!("h"),
     r")
       order by x.started_at_ms desc, x.execution_id desc limit 1) as failed_resume
-  from agent_status s
-  join spawn_session_state p using (session_id)
+  -- `agent_status`'s columns, from one read of the session's latest
+  -- execution in `execs` (the same row the view's lateral takes).
+  from (
+    select p.session_id, p.agent_id, p.observation, p.observation_event_id, p.observation_at_ms,
+           x.execution_id,
+           coalesce(x.execution_id is not null and x.ended_at_ms is null, false) as live,
+           x.cause as end_cause
+      from spawn_session_state p
+      left join lateral (
+        select e.execution_id, e.ended_at_ms, e.cause
+          from execs e
+         where e.session_id = p.session_id
+         order by e.started_at_ms desc, e.execution_id desc
+         limit 1) x on true
+  ) s
   -- The supervisor's current native session (the one its latest
   -- `session.native_started` names, which a resume resumes) and the start
   -- that began it: the command of the execution that named it first.
