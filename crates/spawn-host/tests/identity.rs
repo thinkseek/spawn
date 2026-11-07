@@ -86,7 +86,7 @@ impl Drop for World {
 }
 
 fn git(directory: &Path, arguments: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = spawn_host::test_git_command()
         .arg("-C")
         .arg(directory)
         .args([

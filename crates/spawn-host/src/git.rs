@@ -206,7 +206,7 @@ pub fn git_command(program: impl AsRef<OsStr>) -> Command {
 ///
 /// Never Spawn's own git: what Spawn runs must hold under the host's
 /// configuration, and a test runs it that way (`spawn-cli`'s
-/// `spawn_s_own_commits_ignore_forced_signing`).
+/// `spawns_own_commits_ignore_forced_signing`).
 #[cfg(any(test, feature = "testing"))]
 pub fn test_git_command() -> Command {
     let mut command = git_command("git");
@@ -2465,7 +2465,7 @@ mod tests {
     use super::GitWorkspace;
 
     fn git(directory: &Path, arguments: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = super::test_git_command()
             .arg("-C")
             .arg(directory)
             .args([
@@ -2524,7 +2524,7 @@ mod tests {
         assert_eq!(held, expected);
 
         let staged = |index: &Path| {
-            let listed = Command::new("git")
+            let listed = super::test_git_command()
                 .arg("-C")
                 .arg(&checkout)
                 .arg("ls-files")
@@ -2545,7 +2545,7 @@ mod tests {
         );
         // An index that holds two of them loses both.
         let full = base.join("full-index");
-        let added = Command::new("git")
+        let added = super::test_git_command()
             .arg("-C")
             .arg(&checkout)
             .args(["add", "-A"])
@@ -2593,7 +2593,7 @@ mod tests {
     fn other_writers_commit(checkout: &Path) -> String {
         let index = checkout.join(".git").join("other-writer-index");
         let with_index = |arguments: &[&str]| {
-            let output = Command::new("git")
+            let output = super::test_git_command()
                 .arg("-C")
                 .arg(checkout)
                 .args(arguments)

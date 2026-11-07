@@ -13,7 +13,7 @@ use spawn_host::{GitWorkspace, has_conflict_block, has_conflict_block_sized};
 
 /// Output of git in `directory`, which must succeed.
 fn git(directory: &Path, arguments: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = spawn_host::test_git_command()
         .arg("-C")
         .arg(directory)
         .args(["-c", "user.name=spawn-test"])
@@ -737,7 +737,7 @@ fn a_conflict_nested_in_a_merge_base_is_one_on_its_own() {
     commit("1\nc\n2\n");
     for (name, from, other) in [("m1", "a", "c"), ("m2", "c", "a")] {
         git(checkout, &["checkout", "-qb", name, from]);
-        let _ = Command::new("git")
+        let _ = spawn_host::test_git_command()
             .arg("-C")
             .arg(checkout)
             .args([
@@ -753,7 +753,7 @@ fn a_conflict_nested_in_a_merge_base_is_one_on_its_own() {
         fs::write(checkout.join("f.txt"), format!("1\n{name}\n2\n")).expect("resolve");
         git(checkout, &["commit", "-qam", name]);
     }
-    let output = Command::new("git")
+    let output = spawn_host::test_git_command()
         .arg("-C")
         .arg(checkout)
         .args(["-c", "merge.conflictStyle=diff3"])
