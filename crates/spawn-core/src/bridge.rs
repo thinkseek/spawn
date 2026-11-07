@@ -3773,9 +3773,10 @@ mod tests {
         );
         world.advance(500);
         assert_eq!(world.pass(), 1, "quiet for the bound: one reading");
-        assert_eq!(
-            Vec::<ScreenState>::new(),
-            "one reading is not a fact"
+        assert!(
+            world.screens().is_empty(),
+            "one reading is not a fact: {:?}",
+            world.screens()
         );
         world.advance(500);
         assert_eq!(world.pass(), 1, "the second reading, which agrees");
@@ -3815,7 +3816,7 @@ mod tests {
         world.pass();
         assert_eq!(
             world.screens(),
-            vec!["busy", "busy"],
+            vec![ScreenState::Busy, ScreenState::Busy],
             "a long turn keeps a current fact"
         );
     }
