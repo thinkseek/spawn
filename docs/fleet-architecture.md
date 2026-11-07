@@ -8,7 +8,7 @@ The north-star metric is human interventions per agent-hour, at a given
 throughput (tasks completed, scenarios passed). Every part below exists to
 push that number down, and to do it with the system itself as the improver.
 
-Three ideas carry the design:
+Four ideas carry the design:
 
 1. **A decision ladder.** Every judgement and every action goes to the
    cheapest tier that can decide it with confidence:
@@ -25,6 +25,8 @@ Three ideas carry the design:
 3. **RSI consumes the experience.** The system improves its own code through
    gated missions (§10.4). The objectives that would move decisions down the
    ladder by replaying recorded episodes are not built (§9).
+4. **Synchronization points.** Work runs in parallel and joins only at
+   named points, where a record says exactly what it covers (§1.1).
 
 ## 1. Layers
 
@@ -61,6 +63,53 @@ No layer calls another layer's process directly; they meet in the log.
 | 3 Observation | Observer: rules first, then the model judge (Jev) on ambiguity; without a Jev URL, the rules alone |
 | 4 Control | dispatcher and liveness rule (in `spawn loop`), supervisor session, integrator (`spawn integrate`) |
 | 5 Interface | `spawn serve` (API and web UI: reads, and one write, a person's input to a session), the `spawn` CLI |
+
+### 1.1 Synchronization points
+
+Work runs in parallel between synchronization points and joins only at
+them. A synchronization point is the one place where work changes hands:
+from whoever asks to the worker, from the worker to a reviewer, from a
+branch to `main`, from `main` to the live host, from `main` to the outside.
+Between two points no one waits on anyone. At a point nothing moves on until
+a record names exactly what it covers (the task, the commit, the criteria)
+and who checked it. A loop that moves on from inferred progress (a quiet
+pane, a file that exists, a status that looks done) instead of such a record
+is a defect, wherever it is.
+
+| Point | Joins | Moves on when | Record | Decided by |
+| --- | --- | --- | --- | --- |
+| Brief | asker → worker | the brief names the goal, inputs, done criteria and the base commit | `task.assigned` | supervisor |
+| Review | worker → reviewer | a verdict names the task, the report's revision and the commit it read, with completion quality and efficiency | review verdict | a review session that did not write the work |
+| Accept | reviewer → supervisor | accept or reject cites a review verdict on the same revision | `task.reviewed` (§10.2) | supervisor |
+| Gate | branch → `main` | the gate's verdict names the candidate; the baseline moves only to that commit | `task.gated`, `task.landed` (§10.2, §10.3) | integrator, or the owner's gate |
+| Deploy | `main` → live | the deployed build is the verdict's commit: HEAD equals the candidate and the tree is clean | the deploy's log line | `deploy/deploy.sh` |
+| Publish | `main` → outside | the pushed commit is a verified one and passed a secret scan; for a product mission, the next contract is already published | the push and its contract | owner |
+
+**The review.** Every report gets a review before it is accepted. The
+reviewer is a separate Claude Code session, run interactively with
+`claude --dangerously-skip-permissions` (a *ccd*; never print mode). It did
+not write the work, and it starts from the brief, the diff and the report,
+never from the author's conversation. It checks two things:
+
+- *Completion quality.* Every done criterion in the brief is met and shown
+  (a test, a command and its output), not only claimed. The diff touches
+  only what the brief needs. Changed behaviour has tests. Nothing is left
+  half done: no TODO, no skipped or weakened test, no disabled check. The
+  report matches the diff.
+- *Efficiency.* What the work cost (elapsed time, turns, deliveries, restarts,
+  rejected attempts, model spend) against the size of the change. It also
+  looks for loops (the same failing command again and again), wandering
+  outside the brief, and work redone that already existed. An efficiency
+  finding never rejects correct work: it goes into experience, and into the
+  briefs and routing rules that caused it.
+
+The verdict is `pass`, `fix` (concrete defects, each with `file:line` and how
+it fails) or `reject`. It holds for the revision and commit it names and no
+other: a report sent back and revised needs a new review. Several review
+sessions may run at once. The lead (the supervisor, or the owner's
+supervising session) works with them as peers, one subject per session. The
+lead's own commits pass the same point: a session other than the lead
+reviews them.
 
 ## 2. Observation: rules first, Jev on ambiguity
 
@@ -885,6 +934,9 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
 - **Ladder health over long periods.** The UI's figures cover the last 24 h.
 - **The backlog, scenarios and gate versioned with the source**
   (docs/storage.md).
+- **The review verdict in the control stream** (§1.1). Review sessions are
+  run by the lead and their verdicts are kept outside the log; `spawn task
+  accept` does not yet require a verdict on the report's commit.
 
 ## 10. One log, one landing path
 
