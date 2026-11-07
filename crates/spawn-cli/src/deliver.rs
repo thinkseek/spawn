@@ -978,7 +978,8 @@ pub(crate) fn task_prompt(task: &TaskRow) -> String {
 fn typed(task: &TaskRow) -> String {
     if task.is_revision() {
         format!(
-            "{}\nTask #{} was sent back by the supervisor: {}\nFix it, then rewrite `{REPORT}`.",
+            "{}\nTask #{} was sent back by the supervisor: {}\nFix it, then rewrite `{REPORT}` \
+             once, when everything is done (draft anywhere else).",
             revision_header(task.id),
             task.id,
             task.review_note.as_deref().unwrap_or("see the review")
