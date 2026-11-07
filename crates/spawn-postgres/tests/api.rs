@@ -2488,6 +2488,168 @@ fn dispatch_facts_count_resumes_lost_again_at_once() {
     );
 }
 
+/// The dispatcher's facts name its latest resume whose execution ended lost
+/// before its engine became ready (`failed_resume`), whatever the command's
+/// outcome and however long the execution took to end, with the evidence;
+/// a resume whose engine became ready (by its ready wait's record or by a
+/// later reading) is not one, nor is anyone else's resume; an execution
+/// that stayed up starts over (task 132).
+#[test]
+fn dispatch_facts_name_the_resume_lost_before_its_engine_became_ready() {
+    let (store, schema) = store("facts_failed_resume");
+    let worker = AgentId::new("agent_worker_a").expect("valid agent");
+    let session = SessionId::new("session_worker_a").expect("valid session");
+    let append = |execution: &ExecutionId, key: Option<String>, kind: EventKind| {
+        store
+            .append(NewEvent {
+                agent_id: worker.clone(),
+                session_id: session.clone(),
+                execution_id: Some(execution.clone()),
+                source: Source::Bridge,
+                source_event_id: key,
+                kind,
+            })
+            .expect("append");
+    };
+    let ready = || EventKind::ScreenObserved {
+        state: spawn_core::screen::ScreenState::Ready,
+        evidence: "❯".to_string(),
+    };
+    #[derive(Clone, Copy)]
+    enum Ready {
+        Never,
+        /// The ready wait's own record, before the prompt was typed.
+        Waited,
+        /// A later reading of the Bridge's (a resume with no prompt).
+        Read,
+    }
+    let start = |number: u64, command: CommandId, became: Ready| {
+        let execution = ExecutionId::new(format!("exec_{number}")).expect("valid execution");
+        append(
+            &execution,
+            Some(format!("exec_{number}:started")),
+            EventKind::ExecutionStarted {
+                engine: ENGINE.to_string(),
+                workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+                command_id: command,
+                fork: None,
+                model: ModelProfile::Default,
+                transcript_from: None,
+            },
+        );
+        match became {
+            Ready::Never => {}
+            Ready::Waited => append(&execution, Some(format!("exec_{number}:screen:ready")), ready()),
+            Ready::Read => append(&execution, None, ready()),
+        }
+    };
+    let lose = |number: u64, evidence: &str| {
+        let execution = ExecutionId::new(format!("exec_{number}")).expect("valid execution");
+        append(
+            &execution,
+            Some(format!("exec_{number}:ended")),
+            EventKind::ExecutionEnded {
+                cause: EndCause::Lost,
+                exit_code: None,
+                evidence: Some(evidence.to_string()),
+            },
+        );
+    };
+    let age = |ms: i64| {
+        admin(&schema)
+            .execute(
+                "update spawn_events set recorded_at_ms = recorded_at_ms - $1",
+                &[&ms],
+            )
+            .expect("age the log");
+    };
+    let send = |principal: &str, key: &str, outcome: Outcome| {
+        let command = store
+            .submit(
+                &Principal::new(principal).expect("valid principal"),
+                &Submission {
+                    agent_id: worker.clone(),
+                    action: CommandAction::Resume {
+                        prompt: Some("go on".to_string()),
+                        model: None,
+                    },
+                    ..start_of(session.clone(), key)
+                },
+            )
+            .expect("submit");
+        let claimed = store
+            .claim("bridge", Duration::from_mins(1))
+            .expect("claim")
+            .expect("the command");
+        (command, claimed, outcome)
+    };
+    let finish = |(_, claimed, outcome): &(CommandId, spawn_core::command::Claimed, Outcome)| {
+        store.finish(claimed, outcome).expect("finish");
+    };
+    let row = || store.dispatch_facts().expect("facts")[0].clone();
+    let never_ready = || Outcome::Failed("pane never became ready, last state Unknown".to_string());
+    let abandoned = "its start failed: pane never became ready, last state Unknown";
+
+    // A task that ran half an hour, then was lost.
+    let first = send("human", "first", Outcome::Succeeded);
+    start(1, first.0, Ready::Waited);
+    finish(&first);
+    age(1_800_000);
+    lose(1, "the engine's terminal is gone");
+    assert_eq!(row()["failed_resume"], serde_json::Value::Null, "no resume yet");
+
+    // The dispatcher's resume: started, its pane never ready, abandoned.
+    let resume = send("spawn-dispatch", "dispatch-resume-exec_1", never_ready());
+    start(2, resume.0, Ready::Never);
+    lose(2, abandoned);
+    finish(&resume);
+    let failed = row()["failed_resume"].clone();
+    assert_eq!(failed["execution_id"], "exec_2", "{failed}");
+    assert_eq!(failed["command_id"], serde_json::json!(resume.0.0));
+    assert_eq!(failed["evidence"], abandoned);
+    assert_eq!(
+        failed["error"],
+        "pane never became ready, last state Unknown"
+    );
+    assert_eq!(row()["resumed_young"], serde_json::json!(0), "its command failed");
+
+    // A person's resume ends the same way: the dispatcher's is still the one.
+    let again = send("human", "again", never_ready());
+    start(3, again.0, Ready::Never);
+    lose(3, abandoned);
+    finish(&again);
+    assert_eq!(row()["failed_resume"]["execution_id"], "exec_2");
+
+    // One whose engine became ready and stayed up two minutes starts over.
+    let fixed = send("human", "fixed", Outcome::Succeeded);
+    start(4, fixed.0, Ready::Waited);
+    finish(&fixed);
+    age(120_000);
+    lose(4, "the engine's terminal is gone");
+    assert_eq!(
+        row()["failed_resume"],
+        serde_json::Value::Null,
+        "an engine that stayed up starts over"
+    );
+
+    // A resume whose engine became ready, read by the Bridge's follow, and
+    // was lost at once: the young-death count's, not a failed resume.
+    let resume = send("spawn-dispatch", "dispatch-resume-exec_4", Outcome::Succeeded);
+    start(5, resume.0, Ready::Read);
+    finish(&resume);
+    lose(5, "the engine's terminal is gone");
+    assert_eq!(row()["failed_resume"], serde_json::Value::Null, "it became ready");
+    assert_eq!(row()["resumed_young"], serde_json::json!(1));
+
+    // A resume lost before ready whose end took two minutes still counts.
+    let slow = send("spawn-dispatch", "dispatch-resume-exec_5", never_ready());
+    start(6, slow.0, Ready::Never);
+    age(120_000);
+    lose(6, abandoned);
+    finish(&slow);
+    assert_eq!(row()["failed_resume"]["execution_id"], "exec_6");
+}
+
 #[test]
 fn the_reader_reads_the_whole_log_from_a_time_without_screen_text() {
     let (store, schema) = store("log_after");
