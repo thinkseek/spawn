@@ -80,21 +80,25 @@ record is a defect, wherever it is. A file becomes a record only through
 the one who reads it: a worker's `.spawn/report.md` counts once the
 dispatcher has stored it as `task.reported`.
 
+Two terms used below. The *lead* is the session that decides for a
+mission's owner: Spawn's supervisor, or the owner's own supervising
+session. A *ccd* is a Claude Code session run interactively with
+`claude --dangerously-skip-permissions` (never print mode).
+
 | Point | Joins | Moves on when | Record | Decided by | Enforced today |
 | --- | --- | --- | --- | --- | --- |
-| Brief | asker → worker | the task names its goal, inputs and done criteria | `task.assigned` | supervisor, the integrator for objective tasks (§10.4), or the owner | the record; its base is the agent's branch at delivery, with `main` merged in ([storage.md](storage.md), "Main into a workspace"), not a field of the record |
+| Brief | asker → worker | the task names its goal, inputs and done criteria, and reaches its worker in the worker's turn (§3.2) | `task.assigned`, then `task.delivered` | supervisor, the integrator for objective tasks (§10.4), or the owner | yes; the base the work starts from is recorded with the work (`artifact.committed` `base_merged`, `execution.started` `fork.commit`), not in `task.assigned` |
 | Review | worker → reviewer | a verdict names the task, the report's revision and the commit it read | review verdict | a ccd session that did not write the work | not in code: the lead runs it, outside the log (§9) |
-| Accept | report → mission | in a review-mode mission, the verdict names the revision it judged | `task.reviewed` (§10.3) | supervisor, or the owner | the revision check, when `--revision` is given; citing a review verdict is not checked (§9) |
-| Gate | branch → `main` | the gate's verdict names the candidate; the baseline moves only to that commit, by compare-and-swap | `task.gated`, `task.landed` (§10.2, §10.3) | integrator; the owner's gate for owner work | yes |
-| Deploy | `main` → live | HEAD is the candidate of a passing verdict and the tree is clean | the deploy's log line | `deploy/deploy.sh` | yes, by `deploy/deploy.sh` |
+| Accept | report → mission | in a review-mode mission, the accept or reject names the revision it judged | `task.reviewed` (§10.3) | supervisor, or the owner | the revision check when `--revision` is given, a note on every send-back, and a refusal in a gate-mode mission; citing a review verdict is not checked (§9) |
+| Gate, fleet | branch → `main` | the gate's verdict names the candidate; the baseline moves only to that commit, by compare-and-swap | `task.gated`, `task.landed` (§10.2, §10.3) | integrator | yes |
+| Gate, owner work | owner's checkout → candidate | the owner's gate names the candidate and the base it judged against (the missions' `main`) | the gate's verdict file | the owner's gate | only at Deploy: accepted owner work reaches the owner's checkout before any gate |
+| Deploy | candidate → `main` and live | the verdict is `accepted`, its candidate is HEAD, its base is the missions' `main`, and the tree is clean | `source.moved` (`spawn mission moved`, §10.3) | `deploy/deploy.sh` | yes, by `deploy/deploy.sh` |
 | Publish | owner's checkout → remote | the pushed commit passed its gate and a secret scan | the push | owner | by the owner's procedure, not by code |
 
 **The review.** A report gets a review before it moves on: in a
 review-mode mission before it is accepted, in a gate-mode mission before
 its gate runs (the cheap check first, the gate after). The reviewer is a
-separate Claude Code session, run interactively with
-`claude --dangerously-skip-permissions` (a *ccd*; never print mode). It did
-not write the work, and it starts from the brief, the diff and the report,
+ccd that did not write the work, and it starts from the brief, the diff and the report,
 never from the author's conversation. It checks two things:
 
 - *Completion quality.* Every done criterion in the brief is met and shown
@@ -112,8 +116,7 @@ never from the author's conversation. It checks two things:
 The verdict is `pass`, `fix` (concrete defects, each with `file:line` and how
 it fails) or `reject`. It holds for the revision and commit it names and no
 other: a report sent back and revised needs a new review. Several review
-sessions may run at once. The lead (the supervisor, or the owner's
-supervising session) works with them as peers, one subject per session. The
+sessions may run at once. The lead works with them as peers, one subject per session. The
 lead's own commits pass the same point: a session other than the lead
 reviews them. Today the lead runs reviews for owner work (missions 7 and 8)
 and for everything it merges, gates or deploys; for the fleet's other
@@ -961,9 +964,10 @@ controller. Missions, tasks, residents and landings are events in
   `control.recorded`, whose detail is `{type, ...}`. A new record type adds
   no `EventKind` variant.
 - **Record types:** `mission.added`, `mission.configured`, `mission.closed`,
-  `mission.halted`, `mission.resumed`, `source.moved`, `task.assigned`,
+  `mission.halted`, `mission.resumed`, `source.moved`, `source.held`,
+  `source.released`, `source.hold_expired`, `task.assigned`,
   `task.delivered`, `task.report_unfinished`, `task.reported`,
-  `task.reviewed`, `task.cancelled`, `task.gated`, `task.landed`,
+  `task.reviewed`, `task.cancelled`, `task.gated`, `task.held`, `task.landed`,
   `task.aborted`, `resident.proposed`, `resident.approved`,
   `resident.retired`, `legacy.imported`, `host.disk`.
   `task.report_unfinished` is a delivered task's report the dispatcher read
@@ -1079,9 +1083,9 @@ record of what was judged (§14 of design.md).
   and an optional budget:
   - `review`: the supervisor accepts, then the gate runs;
   - `gate`: the gate alone decides. The supervisor is not told of its
-    reports (`mission_news`) and `spawn_task_review` refuses them: a review
-    could send back the revision the gate is judging (until the Review
-    point is built, §1.1 and §9);
+    reports (`mission_news`) and `spawn_task_review` refuses them, because
+    a review could send back the revision the gate is judging. Both stand
+    until the Review point is built (§1.1, §9);
   - budget: `--minutes` and `--tool-calls`. A delivered task over budget is
     aborted (`task.aborted`) and its worker stopped (the Stop is submitted
     before the record, so a failed record is retried with it; a Stop that
@@ -1462,7 +1466,8 @@ record of what was judged (§14 of design.md).
     `session_worker_objective_<task>`). It needs no approval, starts from
     the source's main as it is then, keeps no context, and is stopped by the
     dispatcher once its task lands or is cancelled (`retire-task-<id>`). Its
-    report reaches the supervisor's digest like any report. With N = 1 this
+    report reaches the supervisor's digest only in a review-mode mission;
+    a gate-mode mission's reports do not (§10.3). With N = 1 this
     is one task at a time on the resident, as before.
   - Landing stays one at a time per mission: one candidate judged at a
     time, the lowest ready task first, main moved by compare-and-swap.
