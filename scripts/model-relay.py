@@ -249,6 +249,9 @@ def handler(settings):
             # An error's first bytes, logged: the upstream's reason, never a
             # request's content.
             self._error_head = b""
+            # Why a response stopped partway, if it did: the client sees only
+            # a connection lost.
+            cut = ""
             try:
                 try:
                     response = opener().open(request, timeout=TIMEOUT)
@@ -256,14 +259,16 @@ def handler(settings):
                     response = error
                 status = response.status if hasattr(response, "status") else response.code
                 sent = self._pass(response, status)
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError) as error:
                 # The client went away; the upstream stream is dropped with it.
                 self.close_connection = True
+                cut = f"client gone: {error!r}"
             except Exception as error:  # network, TLS, timeout
                 if not self._started:
                     self._reply(502, error_body(f"{route}: {error}"), close=True)
                 else:
                     self.close_connection = True
+                    cut = f"{route} cut: {error!r}"
             elapsed = (time.monotonic() - started) * 1000
             sys.stderr.write(
                 f"model-relay: {self.command} {self.path.split('?')[0]} "
@@ -275,6 +280,7 @@ def handler(settings):
                     if self._error_head
                     else ""
                 )
+                + (f" CUT {cut}" if cut else "")
                 + "\n"
             )
 
