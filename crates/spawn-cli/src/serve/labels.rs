@@ -228,11 +228,7 @@ impl Context {
                         .unwrap_or_default();
                     format!("{idle}{JOIN}task {id} cancelled{what}")
                 }
-                (None, Some(last)) => format!(
-                    "{idle}{JOIN}last: {} ({})",
-                    self.task_phrase(last),
-                    state_phrase(last.state.as_str(), self.gated(last))
-                ),
+                (None, Some(last)) => format!("{idle}{JOIN}last: {}", self.task_phrase(last)),
                 (None, None) => idle,
             };
             let last = mine.first();
@@ -271,11 +267,19 @@ impl Context {
         self.mission(task.mission).is_some_and(|m| m.gated)
     }
 
-    /// A task as a label names it: its mission and title.
+    /// A task as a label names it where its row shows the agent's state,
+    /// not the task's (the fleet, attention, a resident, the supervisor's
+    /// reference): its mission and title, and its state unless it is being
+    /// worked (`· cancelled`, `· landed`, `· reported`, `· gating`), so a
+    /// finished task never reads as current work.
     fn task_phrase(&self, task: &Task) -> String {
-        match self.mission(task.mission) {
+        let phrase = match self.mission(task.mission) {
             Some(mission) => task_label(mission, task),
             None => task_words(task),
+        };
+        match state_phrase(&task.state, self.gated(task)) {
+            "working" => phrase,
+            state => format!("{phrase}{JOIN}{state}"),
         }
     }
 
@@ -370,7 +374,8 @@ impl Context {
             None if session == "host" || session == "missions" => session.clone(),
             None => humanized(&session),
         };
-        let kind = kind.to_lowercase();
+        // One line, its heading: up to the first ':' outside parentheses.
+        let kind = heading(kind.lines().next().unwrap_or("")).to_lowercase();
         let doing = if kind.starts_with("completed") {
             format!("reviewing the report of {reference}")
         } else if kind.starts_with("idle") {
@@ -378,15 +383,9 @@ impl Context {
         } else if kind.starts_with("human message") {
             format!("following up a human's message to {reference}")
         } else if kind.starts_with("attention") || kind.starts_with("stalled") {
-            format!(
-                "checking {reference} ({})",
-                kind.split([':', ',']).next().unwrap_or("").trim()
-            )
+            format!("checking {reference} ({})", kind.trim())
         } else {
-            format!(
-                "handling {reference}: {}",
-                kind.split([':', ',']).next().unwrap_or("").trim()
-            )
+            format!("handling {reference}: {}", kind.trim())
         };
         match updates(text) {
             Some(count) if count > 1 => format!("{doing} (+{} more)", count - 1),
@@ -410,6 +409,22 @@ fn first_update(text: &str) -> Option<(String, String)> {
         return None;
     }
     Some((session.to_string(), kind.trim().to_string()))
+}
+
+/// A digest update's heading: its text up to the first `:` outside
+/// parentheses (`host faults at the gate (the host's, two runs): ...` keeps
+/// its parenthesis whole).
+fn heading(kind: &str) -> &str {
+    let mut depth = 0usize;
+    for (at, c) in kind.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 => return kind[..at].trim(),
+            _ => {}
+        }
+    }
+    kind.trim()
 }
 
 /// The count of a digest's `Spawn dispatcher: <n> update(s) for you.`
@@ -448,19 +463,19 @@ fn sources(mission: &Value) -> Vec<String> {
 }
 
 /// A task state as a label says it: `working` for delivered, `revising`
-/// for revise, `awaiting gate` for accepted work a gate still has to take.
+/// for revise, `gating` for accepted work a gate still has to take.
 fn state_phrase(state: &str, gated: bool) -> &str {
     match state {
         "delivered" => "working",
         "revise" => "revising",
-        "accepted" if gated => "awaiting gate",
+        "accepted" if gated => "gating",
         other => other,
     }
 }
 
 /// `<mission> · <title>`, `· objective <n>` after it for an objective
-/// task: the whole title, never cut (the task's id and state are beside the
-/// label on its row).
+/// task: the whole title, never cut. A mission's task card shows the task's
+/// id and state beside it; elsewhere [`Context::task_phrase`] adds the state.
 fn task_label(mission: &Mission, task: &Task) -> String {
     let title = without_place(&task.title, &mission.name);
     let mut parts = vec![mission.name.clone()];
@@ -1201,7 +1216,7 @@ mod tests {
     }
 
     #[test]
-    fn a_label_carries_the_whole_title_and_leaves_out_the_id_and_state() {
+    fn a_label_carries_the_whole_title_and_leaves_out_the_id() {
         let context = Context::from_board(&board(), &Titles::new());
         assert_eq!(
             label_of(
@@ -1210,7 +1225,7 @@ mod tests {
                 None,
                 Some("COMPLETED")
             ),
-            "Supply PA · owner work · Write the slice 12 owner contract the same way slice 11 was written"
+            "Supply PA · owner work · Write the slice 12 owner contract the same way slice 11 was written · cancelled"
         );
         assert_eq!(
             label_of(
@@ -1225,7 +1240,7 @@ mod tests {
         assert_eq!(fields["mission_name"], "Spawn · owner work");
         assert_eq!(
             fields["label"],
-            "Spawn · owner work · A report that is still a draft is not taken as the task's report"
+            "Spawn · owner work · A report that is still a draft is not taken as the task's report · reported"
         );
         assert_eq!(
             label_of(
@@ -1258,7 +1273,7 @@ mod tests {
         // Its latest task is accepted, waiting on the gate: idle, its last.
         assert_eq!(
             label_of(&context, "session_resident_rsi", None, Some("COMPLETED")),
-            "resident rsi · idle · last: Spawn RSI · Budget overrun keeps the work it did · objective 58 (awaiting gate)"
+            "resident rsi · idle · last: Spawn RSI · Budget overrun keeps the work it did · objective 58 · gating"
         );
         // Its latest input is a cancellation.
         assert_eq!(
@@ -1295,7 +1310,7 @@ mod tests {
         let context = Context::from_board(&noted, &Titles::new());
         assert_eq!(
             label_of(&context, SUPERVISOR_SESSION, None, None),
-            "supervisor · next step for task 157 · Supply PA · owner work · Make 048's restart test deterministic"
+            "supervisor · next step for task 157 · Supply PA · owner work · Make 048's restart test deterministic · reported"
         );
         // No input: the reports waiting in its review missions.
         let mut quiet = board();
@@ -1351,7 +1366,7 @@ mod tests {
         label_fleet(&mut agents, &context);
         assert_eq!(
             agents[0]["label"],
-            "Supply PA · owner work · Make 048's restart test deterministic"
+            "Supply PA · owner work · Make 048's restart test deterministic · reported"
         );
         assert_eq!(agents[1]["label"], "cli · idle");
         assert_eq!(agents[1]["mission_name"], json!(null));
@@ -1368,7 +1383,7 @@ mod tests {
         label_attention(&mut answer, &context);
         assert_eq!(
             answer["pending"][0]["label"],
-            "Spawn · owner work · A report that is still a draft is not taken as the task's report"
+            "Spawn · owner work · A report that is still a draft is not taken as the task's report · reported"
         );
         assert_eq!(answer["pending"][1]["label"], "host");
         assert_eq!(answer["told"][0]["label"], "missions");
@@ -1401,6 +1416,84 @@ mod tests {
         }
         assert_eq!(whole_clause("short", 10), "short");
         assert_eq!(whole_clause("nocommas in this long text", 12), "nocommas…");
+    }
+
+    /// rev-b: objective_113 (cancelled) and objective_160 (working) on one
+    /// objective read the same once the state was dropped.
+    #[test]
+    fn a_cancelled_and_a_working_task_of_one_objective_read_differently() {
+        let board = json!({
+            "missions": [{"id": 4, "text": "RSI: improve Spawn.", "sources": [SPAWN],
+                          "gate": "/g", "accept": "gate",
+                          "tasks": [
+                {"id": 113, "session_id": "session_worker_objective_113", "state": "cancelled",
+                 "objective": 23, "brief": "Objective 23: An idle fleet costs the database one watermark read per pass\n\nRead"},
+                {"id": 160, "session_id": "session_worker_objective_160", "state": "delivered",
+                 "objective": 23, "brief": "Objective 23: An idle fleet costs the database one watermark read per pass\n\nRead"},
+                {"id": 115, "session_id": "session_worker_objective_115", "state": "landed",
+                 "objective": 44, "brief": "Objective 44: Keep it\n\nRead"},
+                {"id": 116, "session_id": "session_worker_objective_116", "state": "accepted",
+                 "objective": 45, "brief": "Objective 45: Gate it\n\nRead"}
+            ]}],
+            "residents": []
+        });
+        let context = Context::from_board(&board, &Titles::new());
+        let cancelled = label_of(
+            &context,
+            "session_worker_objective_113",
+            None,
+            Some("COMPLETED"),
+        );
+        let working = label_of(
+            &context,
+            "session_worker_objective_160",
+            None,
+            Some("WORKING"),
+        );
+        assert_ne!(cancelled, working);
+        assert_eq!(
+            cancelled,
+            "Spawn RSI · An idle fleet costs the database one watermark read per pass · objective 23 · cancelled"
+        );
+        assert_eq!(
+            working,
+            "Spawn RSI · An idle fleet costs the database one watermark read per pass · objective 23"
+        );
+        assert_eq!(
+            label_of(&context, "session_worker_objective_115", None, None),
+            "Spawn RSI · Keep it · objective 44 · landed"
+        );
+        assert_eq!(
+            label_of(&context, "session_worker_objective_116", None, None),
+            "Spawn RSI · Gate it · objective 45 · gating"
+        );
+        // A mission's task card shows the state itself: its label stays without.
+        let mut cards = board.clone();
+        label_board(&mut cards);
+        assert_eq!(
+            cards["missions"][0]["tasks"][0]["label"],
+            "Spawn RSI · An idle fleet costs the database one watermark read per pass · objective 23"
+        );
+    }
+
+    #[test]
+    fn a_digest_heading_is_one_line_and_keeps_its_parenthesis() {
+        assert_eq!(
+            heading("host faults at the gate (the host's, two runs): retried"),
+            "host faults at the gate (the host's, two runs)"
+        );
+        assert_eq!(heading("attention: WAITING by jev"), "attention");
+        assert_eq!(heading("no colon here"), "no colon here");
+        let context =
+            Context::from_board(&json!({"missions": [], "residents": []}), &Titles::new());
+        let phrase = context.digest_phrase(
+            "Spawn dispatcher: 1 update for you. - host — host faults at the gate (the host's, two runs)\nmore lines\nand more",
+        );
+        assert_eq!(
+            phrase,
+            "handling host: host faults at the gate (the host's, two runs)"
+        );
+        assert!(!phrase.contains('\n'));
     }
 
     #[test]
