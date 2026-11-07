@@ -22,14 +22,15 @@
 --   - it holds no privilege and owns nothing anywhere on the server
 --     (pg_shdepend): a live database's login holds CONNECT on it;
 --   - it is in no role membership, and no session is logged in as it.
--- And only while it holds the server's migration lock (the advisory lock
--- PostgresStore::migrate takes in this database, key 1399957400), so no
--- init-db is midway: a migration makes a database's logins and their grants
--- in one transaction, after the database exists, so the sweep sees either
--- nothing of it or a login its database owns. When the lock is not free
--- within 10 s, it skips. DROP ROLE also refuses a login that still holds
--- anything. It never drops a database, and never touches a server whose
--- port is 15433 (the live server's, over TCP and over its socket).
+-- No init-db can be midway: a migration makes a database's logins and their
+-- grants in one transaction, after the database exists, so a sweep sees
+-- either nothing of them or logins their database owns. A sweep also holds
+-- the server's migration lock (the advisory lock PostgresStore::migrate
+-- takes in this database, key 1399957400) while it runs, and skips when
+-- the lock is not free within 10 s. DROP ROLE also refuses a login that
+-- still holds anything. It never drops a database, and never touches a
+-- server whose port is 15433 (the live server's, over TCP and over its
+-- socket).
 do $drop_logins$
 declare
     v_database text := coalesce(current_setting('spawn_logins.database', true), '');
@@ -49,14 +50,19 @@ begin
                            'skipped: run in the postgres database, where the migration lock is', false);
         return;
     end if;
-    perform set_config('lock_timeout', '10s', true);
-    begin
-        perform pg_advisory_xact_lock(1399957400);
-    exception when lock_not_available then
-        perform set_config('spawn_logins.result', 'skipped: a migration holds the lock', false);
-        return;
-    end;
-    perform set_config('lock_timeout', v_lock_timeout, true);
+    -- A sweep waits for the migrations under way. One database's logins,
+    -- dropped after the database, need no lock: no init-db can be making
+    -- the logins of a database that is gone.
+    if v_database = '' then
+        perform set_config('lock_timeout', '10s', true);
+        begin
+            perform pg_advisory_xact_lock(1399957400);
+        exception when lock_not_available then
+            perform set_config('spawn_logins.result', 'skipped: a migration holds the lock', false);
+            return;
+        end;
+        perform set_config('lock_timeout', v_lock_timeout, true);
+    end if;
 
     for v_login in
         with bases(base) as (values ('spawn_supervisor'), ('spawn_reader'), ('spawn_human')),
