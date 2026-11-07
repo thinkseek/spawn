@@ -373,7 +373,6 @@ impl Fleet {
         }
     }
 
-
     /// The Bridge's reading of the log and its claims of the queue: a few
     /// reads, and the one step that turns a submitted command into work, so
     /// it runs whenever the watermark moved or its lease says so, never
@@ -386,9 +385,6 @@ impl Fleet {
         warnings: &mut Vec<String>,
         failed: &mut bool,
     ) {
-        if !self.schedule.bridge.runs(watermark, now) {
-            return;
-        }
         if self.schedule.bridge.runs(watermark, now) {
             match self.bridge.work() {
                 Ok((report, more)) => {
