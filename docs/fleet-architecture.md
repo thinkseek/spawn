@@ -295,7 +295,6 @@ it, on the same ladder.
   that failed is reported as failed) is news until it was told, however
   long that takes.
 
-<<<<<<< 479b4ec0fd644f46f90fba276c69c87c984a04cd
   **The one-resume rule.** A lost worker execution is resumed once
   (`dispatch-resume-<execution>`); once that resume has failed, the session
   is escalated (`resume failed`) and never resumed again by rule, until one
@@ -327,7 +326,7 @@ it, on the same ladder.
   every 20 s for ten minutes.) The facts are `failed_resume` and
   `resumed_young` in `dispatch_facts`; the rule is `resume_lost` in
   `dispatch/worker.rs`.
-=======
+
   **Deliveries that never reached their worker.** A delivery whose retries
   are spent on a host fault typed nothing (every attempt was refused before
   typing), so assigning the task again is safe and needs no judgement; a
@@ -371,7 +370,6 @@ it, on the same ladder.
   attempt on a recorded `source.moved`; and each is itself recorded (the
   cancellation and the assignment name each other, the attempt is a command
   under its own key).
->>>>>>> 83c68eea2b7cc405677b80d6d87fdd20e7ca6fe0
 
   **Stalls: no task waits silently.** A stall is the absence of an event,
   so the dispatcher also measures, for every open task, the step it waits
@@ -399,10 +397,10 @@ it, on the same ladder.
   (`stall-mission-<mission>-halted-<record>`), with the reason and the open
   tasks. A failed command (a delivery attempt, a model switch's or a
   retirement's Stop, a resume) is the evidence of the step it blocks, not a
-<<<<<<< 479b4ec0fd644f46f90fba276c69c87c984a04cd
-  step of its own. A delivery whose retries are spent was escalated as
-  `delivery failed`, which is its stall's escalation; one that may have
-  typed the task is not retried, and its stall is escalated at its bound.
+  step of its own. A delivery whose retries are spent is re-issued or was
+  escalated as `delivery failed`, which is its stall's escalation; one that
+  may have typed the task is not retried, and its stall is escalated at its
+  bound.
   A worker waiting on a background job of its own is active (§2.2): while
   its live execution has a job open (`job.started` without its `job.ended`)
   and its latest turn has ended, its `activity` step is not escalated, since
@@ -410,17 +408,6 @@ it, on the same ladder.
   `SPAWN_STALL_JOB_SECS` (7200) is escalated once on its own, and that is the
   task's only item while the job runs. The screen's "N shells still running"
   is no rule.
-=======
-  step of its own. A delivery whose retries are spent is re-issued or was
-  escalated as `delivery failed`, which is its stall's escalation; one that
-  may have typed the task is not retried, and its stall is escalated at its
-  bound.
-  A worker at its prompt whose screen says background shells still run
-  (Claude Code's `· done … N shells still running`, read from the line the
-  engine draws right above its prompt) is treated as active: its `activity`
-  step is not escalated while that is its latest screen reading, since the
-  engine resumes the agent when the shells finish.
->>>>>>> 83c68eea2b7cc405677b80d6d87fdd20e7ca6fe0
 
   The item, heading `stalled`, is one line naming `task #<id>`, the step,
   how long it stood still, the evidence (the record it is measured from and
