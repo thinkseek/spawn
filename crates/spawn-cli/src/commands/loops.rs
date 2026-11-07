@@ -406,7 +406,84 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
-    use super::{backoff, pause_unless_stopped, stop_on_signal};
+    use super::{Step, backoff, earliest, pause_unless_stopped, stop_on_signal};
+
+    /// A step runs on a record or on a time, never on the clock: a pass
+    /// whose watermark is unchanged and whose due times are in the future
+    /// runs nothing, one whose watermark moved runs it, and one whose due
+    /// time has come runs it with the watermark where it was.
+    #[test]
+    fn a_step_runs_when_the_watermark_moves_or_when_its_time_comes() {
+        let mut step = Step::new();
+        assert!(step.runs(7, 1_000), "a step that has not run runs at once");
+        step.ran(7, None);
+        assert!(!step.runs(7, 1_000), "nothing moved, nothing waits on it");
+        step.ran(7, Some(2_000));
+        assert!(!step.runs(7, 1_999), "its due time has not come");
+        assert!(step.runs(8, 1_999), "the watermark moved: it runs");
+        assert!(
+            step.runs(7, 2_000),
+            "its due time came with the watermark unmoved"
+        );
+        assert!(
+            step.runs(7, 9_000),
+            "a due time already reached is due now, never skipped"
+        );
+    }
+
+    /// The pass is what its steps say: with nothing moved and nothing due,
+    /// no step runs and the pass reads the watermark only; with the
+    /// watermark moved every step runs exactly once; and a pass that runs
+    /// the same watermark twice never runs a step twice for it.
+    #[test]
+    fn a_pass_runs_each_step_once_per_moved_watermark() {
+        let mut steps = [Step::new(), Step::new(), Step::new()];
+        let mut runs = [0_u32; 3];
+        let mut pass = |steps: &mut [Step], runs: &mut [u32; 3], watermark: i64, now: i64| {
+            for (step, count) in steps.iter_mut().zip(runs.iter_mut()) {
+                if step.runs(watermark, now) {
+                    *count += 1;
+                    step.ran(watermark, None);
+                }
+            }
+        };
+        pass(&mut steps, &mut runs, 10, 1_000);
+        assert_eq!(runs, [1, 1, 1], "the first pass runs every step");
+        pass(&mut steps, &mut runs, 10, 1_500);
+        assert_eq!(runs, [1, 1, 1], "an idle pass runs no step");
+        pass(&mut steps, &mut runs, 11, 2_000);
+        assert_eq!(runs, [2, 2, 2], "a moved watermark runs each step once");
+        pass(&mut steps, &mut runs, 11, 2_500);
+        assert_eq!(runs, [2, 2, 2], "a pass with nothing new runs nothing");
+    }
+
+    /// A pass where the watermark does not move still runs the step whose
+    /// own time came, and only that one.
+    #[test]
+    fn a_due_time_reached_runs_its_step_with_the_watermark_unmoved() {
+        let mut steps = [Step::new(), Step::new()];
+        steps[0].ran(5, Some(9_000));
+        steps[1].ran(5, Some(3_000));
+        let now = 5_000;
+        assert!(
+            !steps[0].runs(5, now),
+            "the first waits for a time not come"
+        );
+        assert!(steps[1].runs(5, now), "the second's time has come");
+        assert_eq!(earliest(&[&steps[0], &steps[1]]), Some(3_000));
+    }
+
+    /// The wait is never longer than the next due time, and the loop has no
+    /// due time when no step waits on a clock.
+    #[test]
+    fn the_earliest_due_time_is_the_loops_wait() {
+        let mut steps = [Step::new(), Step::new()];
+        steps[0].ran(1, Some(4_000));
+        steps[1].ran(1, None);
+        assert_eq!(earliest(&[&steps[0], &steps[1]]), Some(4_000));
+        steps[0].ran(1, None);
+        assert_eq!(earliest(&[&steps[0], &steps[1]]), None);
+    }
 
     /// A deploy's SIGTERM ends the loop's pause instead of the process, so
     /// the loop returns and its pending pushes are made.
