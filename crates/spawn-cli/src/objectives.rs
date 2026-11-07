@@ -451,6 +451,7 @@ pub(crate) fn choose<'a>(
     landings: &[Landing],
     in_flight: &BTreeSet<u32>,
     attempts: &BTreeMap<u32, Attempts>,
+    held: &BTreeSet<u32>,
     free: usize,
 ) -> Vec<&'a Task> {
     let mut open: Vec<&Task> = backlog
@@ -458,6 +459,7 @@ pub(crate) fn choose<'a>(
         .filter(|task| {
             is_open(task, landings)
                 && !in_flight.contains(&task.id)
+                && !held.contains(&task.id)
                 && ordered(task, backlog, landings)
         })
         .collect();
@@ -690,6 +692,7 @@ pub(crate) fn yields(
 /// yield the slot. Without this the objective kept no yield and its
 /// failures, sorted ahead, and the next task for it yielded at once (rev-b
 /// on 226fa4a: objective 023, task 113 aborted with its fifth failure).
+#[cfg(test)]
 pub(crate) fn abort_yields(
     attempts: &BTreeMap<u32, Attempts>,
     task: i64,
@@ -711,6 +714,7 @@ pub(crate) fn abort_yields(
 /// The yield an abort of `task` over budget makes, read from the store:
 /// the fields its `task.aborted` record adds (`yielded`, `objective`,
 /// `failures`, `limit`, `yield_reason`), or none.
+#[cfg(test)]
 pub(crate) fn abort_yield(
     store: &PostgresStore,
     mission: &Mission,
@@ -754,6 +758,7 @@ pub(crate) fn brief(
     current: Option<f64>,
     prior: &[PriorWork],
     history: &[GateRecord],
+    continues: Option<&Overrun>,
 ) -> String {
     let mut brief = format!("Objective {}: {}\n\n{}\n", task.id, task.title, task.prompt);
     brief.push_str(
@@ -784,6 +789,52 @@ pub(crate) fn brief(
             let _ = write!(brief, " Target: {target} {}.", task.unit);
         }
         brief.push('\n');
+    }
+    if let Some(over) = continues {
+        let _ = write!(
+            brief,
+            "\nYour task continues task #{} of this objective, which went over its budget: {}. \
+             It made {} tool calls. Its work is safe on branch {}",
+            over.task,
+            cut(&over.reason, REASON_CHARS),
+            over.tool_calls,
+            over.branch
+        );
+        match (&over.commit, &over.diff) {
+            (Some(commit), diff) => {
+                let _ = write!(brief, ", at commit {commit}");
+                match diff.as_deref().filter(|diff| !diff.trim().is_empty()) {
+                    Some(diff) => {
+                        let _ = writeln!(
+                            brief,
+                            "; against main it holds:\n{}\nThat work is in your workspace: \
+                             continue it, do not redo it.",
+                            diff.trim_end()
+                        );
+                    }
+                    None => {
+                        let _ = writeln!(
+                            brief,
+                            ".\nThat work is in your workspace: continue it, do not redo it."
+                        );
+                    }
+                }
+            }
+            _ => {
+                let _ = writeln!(
+                    brief,
+                    ", but its push failed: the log says so, and your workspace may not hold \
+                     all of it. The report of the task it continues says what it did."
+                );
+            }
+        }
+        if let Some(budget) = &over.budget {
+            let _ = writeln!(
+                brief,
+                "Your budget is the mission's ({budget}); it may be raised once, for this task \
+                 only, to at most twice that, by the owner's `spawn mission configure`."
+            );
+        }
     }
     if !prior.is_empty() {
         brief.push_str(
@@ -874,6 +925,7 @@ pub(crate) fn assign_next(
     )
     .map_err(|error| format!("objective outcomes: {error}"))?;
     let mut attempts = attempts(&outcomes);
+    let overruns = overruns(&outcomes);
     let limit = attempt_limit(crate::config::env_value("SPAWN_OBJECTIVE_ATTEMPTS").as_deref());
     let mut yielded = BTreeSet::new();
     for slot in yields(mission, &attempts, limit, settled) {
@@ -917,9 +969,26 @@ pub(crate) fn assign_next(
     )
     .map_err(|error| format!("objective landings: {error}"))?;
     let in_flight: BTreeSet<u32> = flying.iter().filter_map(|task| task.objective).collect();
+    // An overrun chain whose second overrun is not yet answered by a
+    // configure holds its objective: no task is issued for it, and the
+    // freed slot goes to the next open objective (the dispatcher tells the
+    // supervisor once; this only reads the records).
+    let held: BTreeSet<u32> = overruns
+        .iter()
+        .filter(|(_, overrun)| holds(overrun, mission.configured_ms))
+        .map(|(objective, _)| *objective)
+        .collect();
+    if !held.is_empty() {
+        println!(
+            "integrate: mission {}: objectives {:?} held after a second overrun, until the \
+             mission is configured again",
+            mission.id,
+            held.iter().collect::<Vec<_>>()
+        );
+    }
     let mut assigned = Vec::new();
-    for task in choose(&objectives, &landings, &in_flight, &attempts, free) {
-        match assign(store, mission, task, &landings) {
+    for task in choose(&objectives, &landings, &in_flight, &attempts, &held, free) {
+        match assign(store, mission, task, &landings, overruns.get(&task.id)) {
             Ok(id) => assigned.push(id),
             Err(error) if assigned.is_empty() => return Err(error),
             Err(error) => {
@@ -940,6 +1009,7 @@ fn assign(
     mission: &Mission,
     task: &Task,
     landings: &[Landing],
+    continues: Option<&Overrun>,
 ) -> Result<i64, String> {
     let id = i32::try_from(task.id).map_err(|_| format!("objective {} is too large", task.id))?;
     let history: Vec<GateRecord> = serde_json::from_value(
@@ -956,14 +1026,31 @@ fn assign(
     .map_err(|error| format!("objective prior work: {error}"))?;
     let scenario = Path::new(&mission.gate).join(format!("{:03}.sh", task.id));
     let scenario = scenario.is_file().then(|| scenario.display().to_string());
-    let text = brief(task, landed_value(task, landings), &prior, &history);
+    let text = brief(task, landed_value(task, landings), &prior, &history, continues);
     let assigned = store
-        .objective_assign(mission.id, id, scenario.as_deref(), &text)
+        .objective_assign(
+            mission.id,
+            id,
+            scenario.as_deref(),
+            &text,
+            continues.map(|overrun| overrun.task),
+        )
         .map_err(|error| error.to_string())?;
-    println!(
-        "integrate: mission {} objective {} -> task {assigned}",
-        mission.id, task.id
-    );
+    match continues {
+        Some(overrun) => println!(
+            "integrate: mission {} objective {} -> task {assigned}, continuing task #{} on {} \
+             at {}",
+            mission.id,
+            task.id,
+            overrun.task,
+            overrun.branch,
+            overrun.commit.as_deref().unwrap_or("no commit (the push failed)")
+        ),
+        None => println!(
+            "integrate: mission {} objective {} -> task {assigned}",
+            mission.id, task.id
+        ),
+    }
     Ok(assigned)
 }
 
