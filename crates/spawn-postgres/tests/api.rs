@@ -2496,6 +2496,15 @@ fn dispatch_facts_count_resumes_lost_again_at_once() {
 /// that stayed up starts over (task 132).
 #[test]
 fn dispatch_facts_name_the_resume_lost_before_its_engine_became_ready() {
+    /// How an execution's engine became ready, if it did.
+    #[derive(Clone, Copy)]
+    enum Ready {
+        Never,
+        /// The ready wait's own record, before the prompt was typed.
+        Waited,
+        /// A later reading of the Bridge's (a resume with no prompt).
+        Read,
+    }
     let (store, schema) = store("facts_failed_resume");
     let worker = AgentId::new("agent_worker_a").expect("valid agent");
     let session = SessionId::new("session_worker_a").expect("valid session");
@@ -2515,15 +2524,7 @@ fn dispatch_facts_name_the_resume_lost_before_its_engine_became_ready() {
         state: spawn_core::screen::ScreenState::Ready,
         evidence: "❯".to_string(),
     };
-    #[derive(Clone, Copy)]
-    enum Ready {
-        Never,
-        /// The ready wait's own record, before the prompt was typed.
-        Waited,
-        /// A later reading of the Bridge's (a resume with no prompt).
-        Read,
-    }
-    let start = |number: u64, command: CommandId, became: Ready| {
+    let begin = |number: u64, command: CommandId, became: Ready| {
         let execution = ExecutionId::new(format!("exec_{number}")).expect("valid execution");
         append(
             &execution,
@@ -2539,7 +2540,11 @@ fn dispatch_facts_name_the_resume_lost_before_its_engine_became_ready() {
         );
         match became {
             Ready::Never => {}
-            Ready::Waited => append(&execution, Some(format!("exec_{number}:screen:ready")), ready()),
+            Ready::Waited => append(
+                &execution,
+                Some(format!("exec_{number}:screen:ready")),
+                ready(),
+            ),
             Ready::Read => append(&execution, None, ready()),
         }
     };
@@ -2573,7 +2578,7 @@ fn dispatch_facts_name_the_resume_lost_before_its_engine_became_ready() {
                         prompt: Some("go on".to_string()),
                         model: None,
                     },
-                    ..start_of(session.clone(), key)
+                    ..start(session.clone(), key)
                 },
             )
             .expect("submit");
@@ -2592,15 +2597,19 @@ fn dispatch_facts_name_the_resume_lost_before_its_engine_became_ready() {
 
     // A task that ran half an hour, then was lost.
     let first = send("human", "first", Outcome::Succeeded);
-    start(1, first.0, Ready::Waited);
+    begin(1, first.0, Ready::Waited);
     finish(&first);
     age(1_800_000);
     lose(1, "the engine's terminal is gone");
-    assert_eq!(row()["failed_resume"], serde_json::Value::Null, "no resume yet");
+    assert_eq!(
+        row()["failed_resume"],
+        serde_json::Value::Null,
+        "no resume yet"
+    );
 
     // The dispatcher's resume: started, its pane never ready, abandoned.
     let resume = send("spawn-dispatch", "dispatch-resume-exec_1", never_ready());
-    start(2, resume.0, Ready::Never);
+    begin(2, resume.0, Ready::Never);
     lose(2, abandoned);
     finish(&resume);
     let failed = row()["failed_resume"].clone();
@@ -2611,18 +2620,22 @@ fn dispatch_facts_name_the_resume_lost_before_its_engine_became_ready() {
         failed["error"],
         "pane never became ready, last state Unknown"
     );
-    assert_eq!(row()["resumed_young"], serde_json::json!(0), "its command failed");
+    assert_eq!(
+        row()["resumed_young"],
+        serde_json::json!(0),
+        "its command failed"
+    );
 
     // A person's resume ends the same way: the dispatcher's is still the one.
     let again = send("human", "again", never_ready());
-    start(3, again.0, Ready::Never);
+    begin(3, again.0, Ready::Never);
     lose(3, abandoned);
     finish(&again);
     assert_eq!(row()["failed_resume"]["execution_id"], "exec_2");
 
     // One whose engine became ready and stayed up two minutes starts over.
     let fixed = send("human", "fixed", Outcome::Succeeded);
-    start(4, fixed.0, Ready::Waited);
+    begin(4, fixed.0, Ready::Waited);
     finish(&fixed);
     age(120_000);
     lose(4, "the engine's terminal is gone");
@@ -2634,16 +2647,24 @@ fn dispatch_facts_name_the_resume_lost_before_its_engine_became_ready() {
 
     // A resume whose engine became ready, read by the Bridge's follow, and
     // was lost at once: the young-death count's, not a failed resume.
-    let resume = send("spawn-dispatch", "dispatch-resume-exec_4", Outcome::Succeeded);
-    start(5, resume.0, Ready::Read);
+    let resume = send(
+        "spawn-dispatch",
+        "dispatch-resume-exec_4",
+        Outcome::Succeeded,
+    );
+    begin(5, resume.0, Ready::Read);
     finish(&resume);
     lose(5, "the engine's terminal is gone");
-    assert_eq!(row()["failed_resume"], serde_json::Value::Null, "it became ready");
+    assert_eq!(
+        row()["failed_resume"],
+        serde_json::Value::Null,
+        "it became ready"
+    );
     assert_eq!(row()["resumed_young"], serde_json::json!(1));
 
     // A resume lost before ready whose end took two minutes still counts.
     let slow = send("spawn-dispatch", "dispatch-resume-exec_5", never_ready());
-    start(6, slow.0, Ready::Never);
+    begin(6, slow.0, Ready::Never);
     age(120_000);
     lose(6, abandoned);
     finish(&slow);
