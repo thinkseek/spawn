@@ -310,6 +310,7 @@ q() { scalar "$1"; }
 
 integrate_once() {
     capture env -u SPAWN_TEST_DATABASE_URL SPAWN_GATE="$WORK/fake-gate.sh" \
+        SPAWN_GATE_MIN_FREE_GB=0 SPAWN_GATE_MIN_FREE_MEMORY_MB=1 \
         "$SPAWN_BIN" integrate --once --root "$WORK/integrator"
     cat "$WORK/out.txt" "$WORK/err.txt" >>"$WORK/integrate.log"
     [ "$status" -eq 0 ] || fail "integrate exited $status: $(err)"

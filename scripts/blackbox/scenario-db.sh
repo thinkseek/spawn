@@ -9,17 +9,22 @@
 #        belong to the whole server, so dropping the database leaves them.
 #        Every scenario's cleanup (rsi/scenarios) and the black-box runner
 #        (scripts/blackbox/run-scenarios.sh) drop their database this way.
-# sweep  drops the logins of databases whose name starts with <prefix> and
-#        that no longer exist: what a run killed before its cleanup (a
-#        timeout, SIGKILL, a gate abort) left. Every scenario sweeps its own
-#        prefix (`bb_011_covered_`) when it starts, before it makes its
-#        database. An empty prefix sweeps every database's logins (by hand,
+# sweep  drops the databases and the logins of databases whose name starts
+#        with <prefix> and that no longer exist: what a run killed before its
+#        cleanup (a timeout, SIGKILL, a gate abort) left. Every scenario
+#        sweeps its own prefix (`bb_011_covered_`) when it starts, before it
+#        makes its database. A leftover database goes only when nothing is
+#        connected to it (a connected one is a live run, possibly a parallel
+#        gate's, and is left alone); then its logins go. An empty prefix
+#        sweeps every database's logins only, never a database (by hand,
 #        once).
 #
-# The rule, and why a sweep cannot take a live run's logins, is in
-# scripts/blackbox/drop-logins.sql: never a database, never a login a
-# database on the server still has, holds anything or is logged in as, and
-# never on a server whose port is 15433 (the live server). It prints one
+# The rule, and why a sweep cannot take a live run's database or logins, is
+# in scripts/blackbox/drop-logins.sql: it never drops a database (the sweep
+# drops a leftover database itself, above, only one nothing is connected to),
+# never a login a database on the server still has, holds anything or is
+# logged in as, and never on a server whose port is 15433 (the live server).
+# It prints one
 # line, `<what>: dropped <n> of <m>`
 # or `<what>: skipped: <why>`, and exits 0 when the statement ran, 1 when it
 # could not (no server, no psql), 2 on bad usage.
@@ -70,6 +75,28 @@ if [ "$action" = drop ]; then
 else
     database=""
     prefix=$name
+    if [ -n "$prefix" ]; then
+        # Leftover databases of this prefix, dropped before their logins: a
+        # database nothing is connected to is a run killed before its
+        # cleanup. One that has a connection is a live run (possibly a
+        # parallel gate's), left alone. `starts_with`, not `like`: a prefix
+        # is a plain name, and `_` is a wildcard under `like`. No
+        # `with (force)`: a connection that appears between the check and the
+        # drop fails the drop, it is not cut. The server's own databases are
+        # never in scope. An empty prefix sweeps logins only (below).
+        # shellcheck disable=SC2086 # the command is a prefix, split on purpose
+        for left in $($psql_command -X -d postgres -tA -c \
+            "select d.datname from pg_database d
+              where starts_with(d.datname, '$prefix')
+                and d.datname not in ('postgres', 'template0', 'template1', 'spawn_test')
+                and not exists (select 1 from pg_stat_activity a where a.datname = d.datname)" 2>/dev/null); do
+            case "$left" in
+            *[!A-Za-z0-9_]*) ;;
+            *) $psql_command -X -d postgres -tA -c "drop database if exists $left" >/dev/null 2>&1 ||
+                echo "scenario-db: could not drop database $left" >&2 ;;
+            esac
+        done
+    fi
 fi
 # One session: the settings, the statement, its result.
 # shellcheck disable=SC2086

@@ -280,6 +280,7 @@ with_git "$WORK/git-2.42" env SPAWN_WORKSPACE_ROOT="$host" "$SPAWN_BIN" tick
 [ "$status" -ne 0 ] || fail "(a) spawn tick ran with git 2.42"
 assert_contains "$(err)$(out)" "2.43" "(a) spawn tick's refusal of git 2.42"
 with_git "$WORK/git-2.42" env -u SPAWN_TEST_DATABASE_URL SPAWN_GATE="$WORK/fake-gate.sh" \
+    SPAWN_GATE_MIN_FREE_GB=0 SPAWN_GATE_MIN_FREE_MEMORY_MB=1 \
     "$SPAWN_BIN" integrate --once --root "$integrator"
 [ "$status" -ne 0 ] || fail "(a) spawn integrate ran with git 2.42"
 assert_contains "$(err)$(out)" "2.43" "(a) spawn integrate's refusal of git 2.42"
@@ -287,6 +288,7 @@ assert_contains "$(err)$(out)" "2.43" "(a) spawn integrate's refusal of git 2.42
 with_git "$WORK/git-2.43" env SPAWN_WORKSPACE_ROOT="$host" "$SPAWN_BIN" tick
 [ "$status" -eq 0 ] || fail "(a) spawn tick refused git 2.43: $(err)"
 with_git "$WORK/git-2.43" env -u SPAWN_TEST_DATABASE_URL SPAWN_GATE="$WORK/fake-gate.sh" \
+    SPAWN_GATE_MIN_FREE_GB=0 SPAWN_GATE_MIN_FREE_MEMORY_MB=1 \
     "$SPAWN_BIN" integrate --once --root "$integrator"
 [ "$status" -eq 0 ] || fail "(a) spawn integrate refused git 2.43: $(err)"
 tick_on "$host"
@@ -331,7 +333,8 @@ command=$(q "select id from spawn_commands where idempotency_key = 'kx1'")
 [ "$(q "select spawn_task_reported($task, 'done')")" = t ] || harness "task $task not reported"
 
 with_git "$WORK/git-no-attr-source" env -u SPAWN_TEST_DATABASE_URL \
-    SPAWN_GATE="$WORK/fake-gate.sh" "$SPAWN_BIN" integrate --once --root "$integrator"
+    SPAWN_GATE="$WORK/fake-gate.sh" SPAWN_GATE_MIN_FREE_GB=0 SPAWN_GATE_MIN_FREE_MEMORY_MB=1 \
+    "$SPAWN_BIN" integrate --once --root "$integrator"
 output="$(out) $(err)"
 assert_eq "$(gated_records)" 0 \
     "(b) gate verdicts recorded for task $task when git could not merge (integrate: $output)"
@@ -342,6 +345,7 @@ assert_contains "$output" "unknown option" "(b) what the integrator showed of gi
 assert_eq "$(src_ref refs/heads/main)" "$moved" "(b) the source's main after a failed merge"
 
 capture env -u SPAWN_TEST_DATABASE_URL SPAWN_GATE="$WORK/fake-gate.sh" \
+    SPAWN_GATE_MIN_FREE_GB=0 SPAWN_GATE_MIN_FREE_MEMORY_MB=1 \
     "$SPAWN_BIN" integrate --once --root "$integrator"
 assert_eq "$(task_state)" landed \
     "(b) task $task once git can merge again (integrate: $(out) $(err))"
