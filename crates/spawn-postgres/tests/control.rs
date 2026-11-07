@@ -2724,3 +2724,108 @@ fn a_host_fault_moves_no_count_and_its_run_is_folded() {
         "the tables are the fold of the log"
     );
 }
+
+/// A report still a draft is not taken (crates/spawn-cli/src/deliver.rs):
+/// `task.report_unfinished` records the check, once per content and
+/// revision, only while the task is delivered, and folds into nothing.
+#[test]
+fn an_unfinished_report_is_recorded_once_per_content_and_revision_and_moves_nothing() {
+    let (store, schema) = store("control_unfinished");
+    let mission = store
+        .mission_add("Payouts", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    let task = store
+        .task_assign(mission, "ephemeral", "draft", "brief", "default")
+        .expect("assign");
+    let markers = json!([{"line": 9, "kind": "placeholder", "marker": "PENDING_RESULTS",
+                          "text": "**Results.** PENDING_RESULTS"}]);
+    assert!(
+        !store
+            .task_report_unfinished(task, "d1", &markers, "report-unfinished-x", 7)
+            .expect("an undelivered task"),
+        "only a delivered task's report is read"
+    );
+    store.task_delivered(task, 41).expect("delivered");
+    let mut client = admin(&schema);
+    let before = tables(&mut client);
+    assert!(!store.report_unfinished_recorded(task, "d1").expect("read"));
+    assert!(
+        store
+            .task_report_unfinished(task, "d1", &markers, "report-unfinished-d1", 7)
+            .expect("recorded")
+    );
+    assert!(store.report_unfinished_recorded(task, "d1").expect("read"));
+    assert!(
+        !store
+            .task_report_unfinished(task, "d1", &markers, "report-unfinished-d1", 8)
+            .expect("the same content"),
+        "once per content"
+    );
+    assert!(!store.report_unfinished_recorded(task, "d2").expect("read"));
+    assert!(
+        store
+            .task_report_unfinished(task, "d2", &markers, "report-unfinished-d2", 9)
+            .expect("another content")
+    );
+    assert_eq!(tables(&mut client), before, "the task stays delivered");
+    assert_eq!(task_state(&mut client, task), "delivered");
+
+    // Sent back and delivered again: the same content is read anew.
+    assert!(store.task_reported(task, "done").expect("reported"));
+    assert!(
+        !store
+            .task_report_unfinished(task, "d3", &markers, "report-unfinished-d3", 10)
+            .expect("a reported task"),
+        "a report taken ends the reading"
+    );
+    store
+        .task_review(task, false, "again", None)
+        .expect("send back");
+    store.task_delivered(task, 42).expect("delivered again");
+    assert!(!store.report_unfinished_recorded(task, "d1").expect("read"));
+    assert!(
+        store
+            .task_report_unfinished(task, "d1", &markers, "report-unfinished-d1-r1", 11)
+            .expect("revision 1")
+    );
+
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(tables(&mut client), live, "the tables are the fold of the log");
+    let record: serde_json::Value = client
+        .query_one(
+            "select kind -> 'detail' -> 'record' from spawn_events
+              where session_id = 'session_control'
+                and kind -> 'detail' -> 'record' ->> 'type' = 'task.report_unfinished'
+              order by session_seq limit 1",
+            &[],
+        )
+        .expect("the first record")
+        .get(0);
+    assert_eq!(
+        record,
+        json!({"type": "task.report_unfinished", "id": task, "revision": 0, "digest": "d1",
+               "markers": markers, "note": "report-unfinished-d1", "command_id": 7})
+    );
+    let stages: Vec<String> = store
+        .task_stages(task)
+        .expect("stages")
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|stage| stage["stage"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        stages,
+        [
+            "assigned",
+            "delivered",
+            "report_unfinished",
+            "report_unfinished",
+            "reported",
+            "reviewed",
+            "delivered",
+            "report_unfinished"
+        ]
+    );
+}
