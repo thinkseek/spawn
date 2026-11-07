@@ -7047,7 +7047,11 @@ mod database_tests {
             .expect("the aborts")
             .get(0);
         assert_eq!(aborts, 0, "an overrun is no abort");
-        assert_eq!(gate_counters(&db, mission), (0, 0), "an overrun is no gate abort");
+        assert_eq!(
+            gate_counters(&db, mission),
+            (0, 0),
+            "an overrun is no gate abort"
+        );
         let told = db.store.objective_yields().expect("the yields to tell");
         assert!(
             told.as_array().expect("a list").is_empty(),
