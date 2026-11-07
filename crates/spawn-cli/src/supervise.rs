@@ -585,4 +585,64 @@ work.",
         };
         assert_eq!(decide(&unbound, 0), Revive::Start { handoff: true });
     }
+
+    /// The revive backoff is the rule's own timer: a failed revival is
+    /// waited for until its pause ends (one at 20 s, two at 40 s, three at
+    /// 80 s, as `decide` waits), and a session the rule leaves alone for no
+    /// clock waits for nothing.
+    #[test]
+    fn a_backing_off_revival_is_due_when_its_pause_ends() {
+        let failed = |failures: u32| LivenessFacts {
+            failures,
+            last_failure_ms: Some(100_000),
+            cause: Some("lost".to_string()),
+            last_kind: Some("resume".to_string()),
+            ..facts()
+        };
+        for (failures, pause) in [(1, 20_000), (2, 40_000), (3, 80_000)] {
+            let facts = failed(failures);
+            assert_eq!(
+                next_due(&facts, 100_000 + pause - 1),
+                Some(100_000 + pause),
+                "the pause of {failures} failure(s) is not over"
+            );
+            assert_eq!(
+                decide(&facts, 100_000 + pause - 1),
+                Revive::Nothing,
+                "the rule waits too"
+            );
+            assert_eq!(
+                decide(&facts, 100_000 + pause),
+                Revive::Resume,
+                "and acts when it is"
+            );
+            assert!(
+                next_due(&facts, 100_000 + pause).is_some_and(|due| due <= 100_000 + pause),
+                "a time already reached is due now"
+            );
+        }
+        let live = LivenessFacts {
+            live: true,
+            failures: 2,
+            ..failed(2)
+        };
+        assert_eq!(next_due(&live, 0), None, "a live session waits for nothing");
+        let busy = LivenessFacts {
+            open_command: true,
+            ..failed(2)
+        };
+        assert_eq!(next_due(&busy, 0), None);
+        let stopped = LivenessFacts {
+            last_kind: Some("stop".to_string()),
+            ..failed(2)
+        };
+        assert_eq!(next_due(&stopped, 0), None, "a stopped session stays down");
+        let fresh = LivenessFacts {
+            execution_id: None,
+            failures: 0,
+            last_failure_ms: None,
+            ..failed(0)
+        };
+        assert_eq!(next_due(&fresh, 0), None, "it starts at the next pass");
+    }
 }
