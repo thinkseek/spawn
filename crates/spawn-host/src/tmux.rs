@@ -8,6 +8,7 @@
 //! terminal. The host keeps no state, so it works the same in a new
 //! process.
 
+use std::collections::HashMap;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -105,6 +106,10 @@ impl TmuxHost {
 
 /// How long a `capture-pane` may take.
 const CAPTURE_LIMIT: Duration = Duration::from_secs(5);
+
+/// The fields [`runner_of`] reads, in its order.
+const PANE_STATE: &str =
+    "#{pane_dead}\t#{pane_dead_status}\t#{pane_current_command}\t#{pane_start_command}";
 
 /// The command that runs `words` (the program, then its arguments), with
 /// the controller's settings kept out of its environment.
@@ -511,15 +516,13 @@ impl TerminalHost for TmuxHost {
         terminal: &TerminalName,
         _workspace: &WorkspaceId,
     ) -> Result<Runner, TerminalError> {
-        // One tmux call, as `has-session` was: what the Bridge asks of every
-        // live execution each pass costs no more than before.
+        // One tmux call, as `has-session` was.
         let run = self.run(&[
             "list-panes".to_string(),
             "-t".to_string(),
             Self::pane(terminal),
             "-F".to_string(),
-            "#{pane_dead}\t#{pane_dead_status}\t#{pane_current_command}\t#{pane_start_command}"
-                .to_string(),
+            PANE_STATE.to_string(),
         ])?;
         match run.code {
             Some(0) => {}
@@ -539,6 +542,53 @@ impl TerminalHost for TmuxHost {
             .lines()
             .next()
             .map_or(Runner::Gone, |line| runner_of(terminal, line)))
+    }
+
+    /// One `list-panes -a` for the whole fleet, not one per terminal: what a
+    /// Bridge pass costs when every execution is asked whether its runner
+    /// still runs. The sessions of other programs on the socket are read too
+    /// and ignored.
+    fn runners(
+        &self,
+        terminals: &[(TerminalName, WorkspaceId)],
+    ) -> Result<Vec<(TerminalName, Runner)>, TerminalError> {
+        let run = self.run(&[
+            "list-panes".to_string(),
+            "-a".to_string(),
+            "-F".to_string(),
+            format!("#{{session_name}}\t{PANE_STATE}"),
+        ])?;
+        match run.code {
+            Some(0) => {}
+            // No server, no session: every terminal is gone.
+            Some(1) if gone(&run.stderr) => {
+                return Ok(terminals
+                    .iter()
+                    .map(|(terminal, _)| (terminal.clone(), Runner::Gone))
+                    .collect());
+            }
+            other => {
+                return Err(TerminalError(format!(
+                    "list-panes -a returned {other:?}: {}",
+                    run.stderr.trim()
+                )));
+            }
+        }
+        let mut states: HashMap<&str, &str> = HashMap::new();
+        for line in run.stdout.lines() {
+            let (session, state) = line.split_once('\t').unwrap_or((line, ""));
+            // A session with more than one pane is the first one's.
+            states.entry(session).or_insert(state);
+        }
+        Ok(terminals
+            .iter()
+            .map(|(terminal, _)| {
+                let state = states
+                    .get(terminal.as_str())
+                    .map_or(Runner::Gone, |state| runner_of(terminal, state));
+                (terminal.clone(), state)
+            })
+            .collect())
     }
 
     fn capture_tail(
