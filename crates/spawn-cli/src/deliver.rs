@@ -3185,6 +3185,11 @@ PENDING_ISSUES\n";
             100_000,
             Some("pane state Busy does not accept input"),
         )];
-        assert_eq!(next_due(&tasks, &[busy], 100_000), None, "in flight");
+        assert_eq!(
+            next_due(&tasks, &[busy], 100_000),
+            Some(100_000 + NOT_READY_RETRY_MS),
+            "a command in flight holds the retry, but its end is an event: the wait is still \
+             the one the attempt names"
+        );
     }
 }
