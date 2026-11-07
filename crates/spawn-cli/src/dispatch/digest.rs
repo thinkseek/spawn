@@ -72,6 +72,7 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::HoldExpired => "a source hold expired",
         Why::ObjectiveYielded => "an objective ran out of attempts and yielded its slot",
         Why::ObjectiveOrder => "a backlog names an order no task can meet",
+        Why::OverBudget => "a task went over its budget twice",
     }
 }
 
