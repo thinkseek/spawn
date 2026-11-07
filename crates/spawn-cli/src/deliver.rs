@@ -1480,6 +1480,12 @@ mod tests {
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
+
+    /// The helpers the due-time tests in [`super::due_tests`] share.
+    pub(super) use super::{NOT_READY_RETRY_MS, next_due, retry_wait_ms};
+    pub(super) use super::{sent as sent_of, task as task_of, worker as worker_of};
+    pub(super) use spawn_core::mission::TaskState as DueState;
+    pub(super) type DueWork = super::Work;
     use spawn_core::command::CommandAction;
     use spawn_core::event::{ModelProfile, SessionSeq};
     use spawn_core::mission::TaskState;
@@ -3112,5 +3118,88 @@ PENDING_ISSUES\n";
         assert!(db.notes(&task.session_id).is_empty());
         assert!(db.records(task.id, "task.report_unfinished").is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod due_tests {
+    use super::{
+        NOT_READY_RETRY_MS, TaskState, Work, next_due, retry_wait_ms, sent_of, task_of, worker_of,
+    };
+
+    /// The timers the mission layer waits for are the waits its own rules
+    /// name: a delivery refused because the pane was not ready goes again
+    /// after [`NOT_READY_RETRY_MS`], one that failed after `retry_wait_ms` of
+    /// its failures, and neither is waited for once it is due (the step acts
+    /// on it then) or when its retries are spent.
+    #[test]
+    fn a_waiting_delivery_is_due_at_the_end_of_its_own_wait() {
+        let refused = worker_of(true, true);
+        let mut refused = refused;
+        refused.dispatched = vec![sent_of(
+            30,
+            "deliver-7-0",
+            100_000,
+            Some("pane state Busy does not accept input"),
+        )];
+        let tasks = Work {
+            tasks: vec![task_of(7, TaskState::Assigned)],
+            ..Work::default()
+        };
+        assert_eq!(
+            next_due(&tasks, &[refused.clone()], 100_000),
+            Some(100_000 + NOT_READY_RETRY_MS),
+            "a refusal before typing waits the not-ready wait"
+        );
+        assert_eq!(
+            next_due(&tasks, &[refused], 100_000 + NOT_READY_RETRY_MS),
+            None,
+            "a wait already over is the step's to act on now"
+        );
+
+        let mut failed = worker_of(true, true);
+        failed.dispatched = vec![sent_of(31, "deliver-7-0", 500_000, Some("terminal gone"))];
+        assert_eq!(
+            next_due(&tasks, &[failed.clone()], 500_000),
+            Some(500_000 + retry_wait_ms(1)),
+            "a failed attempt waits its doubling wait"
+        );
+        failed.dispatched.push(sent_of(
+            32,
+            "deliver-7-0-retry-1",
+            700_000,
+            Some("terminal gone"),
+        ));
+        assert_eq!(
+            next_due(&tasks, &[failed], 700_000),
+            Some(700_000 + retry_wait_ms(2)),
+            "each failure after the first waits twice as long"
+        );
+    }
+
+    /// Nothing waits while nothing can be retried: an attempt in flight, one
+    /// that got through, a worker with a command in flight, and a delivery
+    /// the step is about to send for the first time.
+    #[test]
+    fn a_delivery_with_nothing_to_retry_waits_for_no_time() {
+        let tasks = Work {
+            tasks: vec![task_of(7, TaskState::Assigned)],
+            ..Work::default()
+        };
+        let mut fresh = worker_of(true, true);
+        fresh.dispatched = Vec::new();
+        assert_eq!(next_due(&tasks, &[fresh.clone()], 0), None, "its first try");
+        let mut through = worker_of(true, true);
+        through.dispatched = vec![sent_of(30, "deliver-7-0", 100_000, None)];
+        assert_eq!(next_due(&tasks, &[through], 100_000), None, "it got through");
+        let mut busy = worker_of(true, true);
+        busy.open_command = true;
+        busy.dispatched = vec![sent_of(
+            31,
+            "deliver-7-0",
+            100_000,
+            Some("pane state Busy does not accept input"),
+        )];
+        assert_eq!(next_due(&tasks, &[busy], 100_000), None, "in flight");
     }
 }
