@@ -1,4 +1,4 @@
-import { Infinity as Forever, Wrench } from "lucide-react";
+import { Infinity as Forever } from "lucide-react";
 
 import type { FleetAgent } from "../../fleet";
 import { stateLabelUpper } from "../../fleet";
@@ -8,7 +8,7 @@ import { heldTask, residentName } from "../../ordering";
 import { LiveBadge } from "../Terminal";
 import { Ago, Card, CardHeader, EmptyState, FOCUS_RING_INSET, MiddleId, cx, sinceText } from "../ui";
 import { FleetStateDot } from "./bits";
-import { TaskCell, doingNow } from "./FleetBoard";
+import { DoingIcon, TaskCell, doingNow } from "./FleetBoard";
 
 /** How long an agent's current execution has run, while it runs. */
 export function uptimeMs(agent: Pick<FleetAgent, "live" | "started_at_ms">, now = Date.now()): number | null {
@@ -161,8 +161,8 @@ function AlwaysOnTile({
 
         <dt className="text-faint-foreground">Last activity</dt>
         <dd className="flex min-w-0 items-center gap-1.5">
-          {now.tool && <Wrench size={12} className="shrink-0 text-success" />}
-          <span className={cx("min-w-0 truncate font-mono", now.tool ? "text-foreground" : "text-muted-foreground")}>
+          <DoingIcon now={now} />
+          <span className={cx("min-w-0 truncate font-mono", now.tool || now.job ? "text-foreground" : "text-muted-foreground")}>
             {now.label}
           </span>
           <Ago ms={now.at} className="shrink-0 text-muted-foreground" />

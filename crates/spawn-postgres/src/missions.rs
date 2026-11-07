@@ -128,8 +128,9 @@ from (
 /// - `sessions`: per session with a delivered task, its latest fact (a
 ///   record that is neither the Observer's nor storage's, nor the Bridge's
 ///   `waiting` step of an input, which says nothing the worker did, as
-///   [`DISPATCH_FACTS`](crate::fleet::DISPATCH_FACTS)'s `evidence_seq`) and
-///   the evidence of its latest screen reading;
+///   [`DISPATCH_FACTS`](crate::fleet::DISPATCH_FACTS)'s `evidence_seq`);
+///   whether its worker waits on a background job of its own is read from
+///   that query's `jobs`, never from the screen;
 /// - `halted`: every halted mission with open tasks, its latest
 ///   `mission.halted` record and those tasks.
 pub(crate) const STALL_FACTS: &str = r"
@@ -199,19 +200,15 @@ select jsonb_build_object(
        order by k.mission_id, e.session_seq desc) v), '[]'::jsonb),
   'sessions', coalesce((select jsonb_agg(jsonb_build_object(
       'session_id', s.session_id, 'seq', f.session_seq, 'event_name', f.event_name,
-      'at_ms', f.recorded_at_ms, 'age_ms', (select ms from now) - f.recorded_at_ms,
-      'screen', sc.evidence) order by s.session_id)
+      'at_ms', f.recorded_at_ms, 'age_ms', (select ms from now) - f.recorded_at_ms)
+      order by s.session_id)
     from (select distinct session_id from open where state = 'delivered') s
     left join lateral (
       select e.session_seq, e.event_name, e.recorded_at_ms from spawn_events e
        where e.session_id = s.session_id and e.source <> 'observer'
          and e.event_name not in ('artifact.committed', 'merge.conflicted')
          and coalesce(e.kind -> 'detail' ->> 'step', '') <> 'waiting'
-       order by e.session_seq desc limit 1) f on true
-    left join lateral (
-      select e.kind -> 'detail' ->> 'evidence' as evidence from spawn_events e
-       where e.session_id = s.session_id and e.event_name = 'screen.observed'
-       order by e.id desc limit 1) sc on true), '[]'::jsonb),
+       order by e.session_seq desc limit 1) f on true), '[]'::jsonb),
   'halted', coalesce((select jsonb_agg(jsonb_build_object(
       'mission_id', m.id, 'reason', m.halted, 'record', h.record, 'tasks', t.ids) order by m.id)
     from mission_missions m

@@ -3,6 +3,7 @@ import {
   ChevronDown,
   ChevronRight,
   CircleCheck,
+  Hourglass,
   MessageCircle,
   MessageCircleQuestion,
   NotebookPen,
@@ -15,6 +16,7 @@ import type { PollResult } from "../../api";
 import type {
   Attention,
   AttentionItem,
+  OnOwnJob,
   OwnerNote,
   SupervisorQuestion,
   SupervisorView,
@@ -30,6 +32,7 @@ import {
   ambiguityText,
   fleetState,
   humanQuestion,
+  jobsText,
   percent,
   reasonText,
   rulesDisagree,
@@ -117,11 +120,63 @@ function DispatcherQueue(props: {
   stale: string | null;
   talk: ReactNode;
 }) {
+  const groups = attentionGroups(props.attention);
   return (
     <>
       <Queue {...props} />
-      <OwnerNotes notes={attentionGroups(props.attention).forOwner} />
+      <OnOwnJobs workers={groups.onOwnJobs} agents={props.agents} onSelect={props.onSelect} />
+      <OwnerNotes notes={groups.forOwner} />
     </>
+  );
+}
+
+/** Workers the rules hold as working on a background job of their own: in
+ * no queue (no Jev call, no idle item, no nudge, no stall), each with its
+ * job and the job's age. A job past its bound is an item in the queue. */
+function OnOwnJobs({
+  workers,
+  agents,
+  onSelect,
+}: {
+  workers: OnOwnJob[];
+  agents: FleetAgent[];
+  onSelect: (sessionId: string) => void;
+}) {
+  if (workers.length === 0) return null;
+  const known = new Set(agents.map((agent) => agent.session_id));
+  return (
+    <section
+      aria-label="Working on their own background jobs"
+      className="shrink-0 rounded-lg border border-border px-4 py-2"
+    >
+      <header className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <Hourglass size={14} className="shrink-0 text-success" />
+        <h2 className="text-label font-medium text-foreground">On their own background jobs</h2>
+        <span className="tnum text-micro text-muted-foreground">{workers.length}</span>
+        <span className="text-micro text-faint-foreground">
+          working, not idle: the engine wakes each when its job reports
+        </span>
+      </header>
+      <ul className="mt-1 divide-y divide-border">
+        {workers.map((worker) => (
+          <li key={worker.session_id}>
+            <button
+              type="button"
+              disabled={!known.has(worker.session_id)}
+              onClick={() => onSelect(worker.session_id)}
+              className="flex w-full items-baseline gap-3 py-1.5 text-left enabled:hover:bg-surface-hover"
+            >
+              <span className="min-w-0 truncate text-caption font-medium text-foreground">
+                {worker.agent_id || worker.session_id}
+              </span>
+              <span className="min-w-0 flex-1 truncate font-mono text-caption text-muted-foreground">
+                {jobsText(worker.jobs) ?? "—"}
+              </span>
+            </button>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 

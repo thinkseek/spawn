@@ -8,12 +8,13 @@
 //!
 //! Lines that carry no Spawn meaning give nothing, so a new engine release
 //! adds no failure mode. Events carry a key the engine made unique (the
-//! line's `uuid`, the `tool_use_id`), so reading a file again appends
-//! nothing twice.
+//! line's `uuid`, the `tool_use_id`, a background job's id with the call
+//! that started it or a digest of the notification that ended it), so
+//! reading a file again appends nothing twice.
 
 use serde_json::Value;
 
-use crate::event::EventKind;
+use crate::event::{EventKind, JobEnd, JobKind};
 
 /// Maximum characters kept from engine error text.
 const MAX_ERROR_CHARS: usize = 2000;
@@ -147,9 +148,277 @@ fn tool_results(blocks: &[Value]) -> Vec<Normalized> {
         .collect()
 }
 
+/// The whole text of a content value: a string, or its text blocks joined.
+/// Not truncated, unlike [`text_of`]: what it is searched for may come late.
+fn whole_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Opens every notification the engine gives the agent about a background
+/// job (and the line that carries it must start with it).
+const NOTIFICATION: &str = "<task-notification>";
+
+/// The longest job id kept; the engine's are 9 characters (an Agent's 17).
+const MAX_JOB_ID: usize = 64;
+
+/// How a background Agent's notification ends its summary when the agent
+/// only paused: it stopped with background work of its own still running,
+/// may resume on its own, and notifies again under the same id. That is no
+/// end of the job.
+const AGENT_PAUSED: &str = "is waiting on its own background work";
+
+/// A job id as the engine writes it (`b8w03og7k`): letters, digits, `_` and
+/// `-`, not starting with `_` (the engine's own markers, such as
+/// `__orphan_summary__:shell`, are no job). Anything else is no id.
+fn job_id(text: &str) -> Option<&str> {
+    let id = text.trim();
+    (!id.is_empty()
+        && id.len() <= MAX_JOB_ID
+        && !id.starts_with('_')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+    .then_some(id)
+}
+
+/// The leading id-like run of `text` (`b8w03og7k. Output is…` gives
+/// `b8w03og7k`).
+fn leading_id(text: &str) -> Option<&str> {
+    let end = text
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .unwrap_or(text.len());
+    job_id(&text[..end])
+}
+
+/// A start of job `id`, keyed by the tool call whose result started it
+/// (`by`, its `tool_use_id`): a background Agent resumed under its id runs
+/// again, and that run's start is a record of its own.
+fn job_started(id: &str, kind: JobKind, by: &str) -> Normalized {
+    keyed(
+        EventKind::JobStarted {
+            job_id: id.to_string(),
+            kind,
+        },
+        format!("job:{id}:started:{by}"),
+    )
+}
+
+/// An end of job `id`, keyed by `what` ended it: the notification
+/// ([`notification_key`]) or the `TaskStop` call.
+fn job_ended(id: &str, how: JobEnd, what: &str) -> Normalized {
+    keyed(
+        EventKind::JobEnded {
+            job_id: id.to_string(),
+            how,
+        },
+        format!("job:{id}:{what}"),
+    )
+}
+
+/// The key of the end a notification records: a digest of the whole
+/// notification (FNV-1a, the same across builds and hosts). A copy of one
+/// notification (mid-turn and as a prompt, byte for byte the same) records
+/// one end; a later run of the same Agent ends with another notification
+/// (its own result and usage), so with an end of its own.
+fn notification_key(body: &str) -> String {
+    let digest = body.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("ended:{digest:016x}")
+}
+
+/// Whether a notification's `<summary>` says a background Agent only paused
+/// ([`AGENT_PAUSED`]). The agent's description is quoted in the summary, so
+/// only the summary's end is read.
+fn agent_paused(body: &str) -> bool {
+    element(body, "summary").is_some_and(|summary| {
+        let summary = summary.trim();
+        summary.starts_with("Agent \"") && summary.ends_with(AGENT_PAUSED)
+    })
+}
+
+/// The jobs a `<task-notification>` (or several) says ended. Its head (up
+/// to its `<summary>` or `<event>`, which quote the job's own output and
+/// may hold anything) names the jobs (`<task-id>`, one or more) and, when
+/// the job ended, how (`<status>`). With no status it is a Monitor's event,
+/// which ends nothing, unless the event is the Monitor's expiry
+/// (`[Monitor expired after …]`). A background Agent that only paused
+/// ([`agent_paused`]) ends nothing either, whatever its status. The text
+/// must open with the notification: a prompt that quotes one is no
+/// notification.
+fn job_ends(text: &str) -> Vec<Normalized> {
+    let mut ended = Vec::new();
+    if !text.trim_start().starts_with(NOTIFICATION) {
+        return ended;
+    }
+    for body in text.split(NOTIFICATION).skip(1) {
+        let body = body.split("</task-notification>").next().unwrap_or(body);
+        let cut = ["<summary>", "<event>"]
+            .iter()
+            .filter_map(|tag| body.find(tag))
+            .min()
+            .unwrap_or(body.len());
+        let head = &body[..cut];
+        let how = match element(head, "status") {
+            Some(_) if agent_paused(body) => continue,
+            Some(status) => JobEnd::from_status(status),
+            None if element(body, "event")
+                .is_some_and(|event| event.trim_start().starts_with("[Monitor expired")) =>
+            {
+                JobEnd::Expired
+            }
+            None => continue,
+        };
+        let key = notification_key(body);
+        ended.extend(
+            elements(head, "task-id")
+                .filter_map(job_id)
+                .map(|id| job_ended(id, how, &key)),
+        );
+    }
+    ended
+}
+
+/// The text of the first `<name>…</name>` in `text`.
+fn element<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    elements(text, name).next()
+}
+
+/// The text of every `<name>…</name>` in `text`, in order.
+fn elements<'a>(text: &'a str, name: &str) -> impl Iterator<Item = &'a str> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        let start = rest.find(&open)? + open.len();
+        let length = rest[start..].find(&close)?;
+        let found = &rest[start..start + length];
+        rest = &rest[start + length + close.len()..];
+        Some(found)
+    })
+}
+
+/// The job one tool result (of the call `by`) started or stopped, if any.
+///
+/// The engine keeps a structured copy of a tool's result on the line
+/// (`toolUseResult`), which only a tool writes: a background Bash names
+/// its `backgroundTaskId` (also one moved to the background), a Monitor
+/// its `taskId` with its `timeoutMs`, a background Agent its `agentId`
+/// (`isAsync`, `status` `async_launched`; or a Skill forked to run in the
+/// background, `status` `forked`, `background`), a `SendMessage` that resumed a
+/// finished Agent its `resumedAgentId` (`success`), and a `TaskStop` that
+/// succeeded the `task_id` it stopped ("Successfully stopped task: …"). A
+/// failed stop stops nothing: the job's own notification ends it. A message
+/// only queued for a running Agent starts nothing. The result's text (what
+/// the model reads) is the fallback only for a line with no structured
+/// copy, and only where it opens with the engine's own words: a command's
+/// output that quotes them is no job.
+fn tool_job(structured: Option<&Value>, text: &str, by: &str) -> Option<Normalized> {
+    if let Some(result) = structured.filter(|result| result.is_object()) {
+        let field = |name: &str| result.get(name).and_then(Value::as_str).and_then(job_id);
+        let flag = |name: &str| result.get(name).and_then(Value::as_bool) == Some(true);
+        if let Some(id) = field("backgroundTaskId") {
+            return Some(job_started(id, JobKind::Bash, by));
+        }
+        if result.get("timeoutMs").is_some()
+            && let Some(id) = field("taskId")
+        {
+            return Some(job_started(id, JobKind::Monitor, by));
+        }
+        let status = result.get("status").and_then(Value::as_str);
+        if (flag("isAsync") && status == Some("async_launched")
+            || flag("background") && status == Some("forked"))
+            && let Some(id) = field("agentId")
+        {
+            return Some(job_started(id, JobKind::Agent, by));
+        }
+        if flag("success")
+            && let Some(id) = field("resumedAgentId")
+        {
+            return Some(job_started(id, JobKind::Agent, by));
+        }
+        let stopped = result
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.starts_with("Successfully stopped task"));
+        return stopped
+            .then(|| field("task_id").or_else(|| field("shell_id")))
+            .flatten()
+            .map(|id| job_ended(id, JobEnd::Stopped, &format!("stopped:{by}")));
+    }
+    // A line without the structured copy: the engine's words, at the start
+    // of the result (after the notes it may put first).
+    let text = text
+        .trim_start()
+        .lines()
+        .skip_while(|line| line.starts_with("Shell cwd was reset to "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Some(rest) = text
+        .strip_prefix("Command running in background with ID: ")
+        .or_else(|| text.strip_prefix("Command was moved to the background (ID: "))
+    {
+        return leading_id(rest).map(|id| job_started(id, JobKind::Bash, by));
+    }
+    if let Some(rest) = text.strip_prefix("Monitor started (task ") {
+        return leading_id(rest).map(|id| job_started(id, JobKind::Monitor, by));
+    }
+    if text.starts_with("Async agent launched successfully") {
+        return text
+            .lines()
+            .find_map(|line| line.strip_prefix("agentId: "))
+            .and_then(leading_id)
+            .map(|id| job_started(id, JobKind::Agent, by));
+    }
+    if text.starts_with('{') {
+        let parsed = serde_json::from_str::<Value>(&text).ok()?;
+        return tool_job(Some(&parsed), "", by);
+    }
+    None
+}
+
+/// The jobs a user line's tool results started or stopped. The structured
+/// copy (`toolUseResult`) belongs to the line's one result: a line with
+/// several results is read from their texts.
+fn tool_jobs(value: &Value, blocks: &[Value]) -> Vec<Normalized> {
+    let results: Vec<&Value> = blocks
+        .iter()
+        .filter(|block| block_type(block) == Some("tool_result"))
+        .collect();
+    let structured = (results.len() == 1)
+        .then(|| value.get("toolUseResult"))
+        .flatten();
+    results
+        .into_iter()
+        .filter(|block| block.get("is_error").and_then(Value::as_bool) != Some(true))
+        .filter_map(|block| {
+            let by = block.get("tool_use_id").and_then(Value::as_str)?;
+            let text = whole_text(block.get("content").unwrap_or(&Value::Null));
+            tool_job(structured, &text, by)
+        })
+        .collect()
+}
+
 /// What a user line that is not a tool result means: a prompt, an
-/// interrupt (which stops the turn), or a slash command (nothing).
+/// interrupt (which stops the turn), or a slash command (nothing). A
+/// prompt that is the engine's notification about a background job also
+/// ends the jobs it reports, before the turn it starts.
 fn user_text(content: &Value, uuid: &str) -> Vec<Normalized> {
+    let mut events = job_ends(&whole_text(content));
+    events.extend(user_turn(content, uuid));
+    events
+}
+
+/// The turn a user line that is not a tool result starts or stops.
+fn user_turn(content: &Value, uuid: &str) -> Vec<Normalized> {
     let text = text_of(content);
     let text = text.trim_start();
     if text.starts_with("[Request interrupted") {
@@ -182,6 +451,25 @@ fn user_text(content: &Value, uuid: &str) -> Vec<Normalized> {
 ///   stop the turn; an API error line fails it.
 ///
 /// Sub-agent (`isSidechain`) lines are the sub-agent's, not the session's.
+///
+/// Background jobs ([`JobKind`]) are read from the same lines:
+///
+/// - a tool result that started one: a Bash's `backgroundTaskId`, a
+///   Monitor's `taskId`, a background Agent's `agentId`, or a `SendMessage`
+///   that resumed a finished Agent ([`tool_job`]), keyed by the job's id and
+///   the call; one that stopped one: a `TaskStop` that succeeded;
+/// - the engine's notification that one ended (`<task-notification>` with a
+///   `<status>`, or a Monitor's expiry event; not an Agent's pause), as the
+///   engine gave it to the agent: mid-turn (an `attachment` of type
+///   `queued_command`) or as the prompt of a turn of its own (a user line).
+///   Each is keyed by the job's id and a digest of the notification
+///   ([`notification_key`]), so a second copy adds nothing.
+///
+/// The engine's queue (`queue-operation`) is not read. What it queues for
+/// the agent comes back as one of those copies, after the tool result that
+/// started the job; but it also queues the notifications of sub-agents'
+/// jobs (then removes them and hands them to the sub-agent), and it can
+/// queue a quick job's end before it writes the result that started it.
 pub fn claude_line(line: &str) -> Vec<Normalized> {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return Vec::new();
@@ -190,6 +478,7 @@ pub fn claude_line(line: &str) -> Vec<Normalized> {
     if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
         return Vec::new();
     }
+    // No line id: the engine's queue (`queue-operation`), which is not read.
     let Some(uuid) = field("uuid") else {
         return Vec::new();
     };
@@ -233,10 +522,20 @@ pub fn claude_line(line: &str) -> Vec<Normalized> {
                 .iter()
                 .any(|block| block_type(block) == Some("tool_result")) =>
         {
-            tool_results(blocks)
+            let mut events = tool_results(blocks);
+            events.extend(tool_jobs(&value, blocks));
+            events
         }
         Some("user") if value.get("isMeta").and_then(Value::as_bool) != Some(true) => {
             user_text(content, uuid)
+        }
+        Some("attachment")
+            if value.pointer("/attachment/type").and_then(Value::as_str)
+                == Some("queued_command") =>
+        {
+            value
+                .pointer("/attachment/prompt")
+                .map_or_else(Vec::new, |prompt| job_ends(&whole_text(prompt)))
         }
         _ => Vec::new(),
     }
@@ -428,5 +727,361 @@ mod tests {
             kinds(&interrupted),
             vec![("turn.stopped".into(), Some("u9".into()))]
         );
+    }
+
+    /// Lines as Claude Code 2.1.318 writes them, cut to the fields read
+    /// (taken from worker transcripts of 2026-11-06).
+    mod jobs {
+        use super::kinds;
+        use crate::event::{EventKind, JobEnd, JobKind};
+        use crate::ingest::claude_line;
+
+        fn jobs(line: &str) -> Vec<EventKind> {
+            claude_line(line)
+                .into_iter()
+                .map(|event| event.kind)
+                .filter(|kind| {
+                    matches!(
+                        kind,
+                        EventKind::JobStarted { .. } | EventKind::JobEnded { .. }
+                    )
+                })
+                .collect()
+        }
+
+        fn started(id: &str, kind: JobKind) -> EventKind {
+            EventKind::JobStarted {
+                job_id: id.to_string(),
+                kind,
+            }
+        }
+
+        fn ended(id: &str, how: JobEnd) -> EventKind {
+            EventKind::JobEnded {
+                job_id: id.to_string(),
+                how,
+            }
+        }
+
+        /// The keys of the job records of `line`, in order.
+        fn keys(line: &str) -> Vec<String> {
+            claude_line(line)
+                .into_iter()
+                .filter(|event| event.kind.name().starts_with("job."))
+                .filter_map(|event| event.source_event_id)
+                .collect()
+        }
+
+        /// The one end key of `line`, which must be the digest form.
+        fn end_key(line: &str, id: &str) -> String {
+            let keys = keys(line);
+            assert_eq!(keys.len(), 1, "{keys:?}");
+            let prefix = format!("job:{id}:ended:");
+            let digest = keys[0].strip_prefix(&prefix).expect("an end key");
+            assert_eq!(digest.len(), 16, "{keys:?}");
+            assert!(digest.chars().all(|c| c.is_ascii_hexdigit()), "{keys:?}");
+            keys[0].clone()
+        }
+
+        const BASH_USE: &str = r#"{"parentUuid":"p","isSidechain":false,"message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"tool_use","id":"toolu_01CU","name":"Bash","input":{"command":"until grep -qE '^exit=' gate.log; do sleep 5; done","description":"Wait for test-gate v1","timeout":3600000,"run_in_background":true}}],"stop_reason":"tool_use"},"type":"assistant","uuid":"a1","timestamp":"2026-11-06T10:14:01.980Z","version":"2.1.318"}"#;
+        const BASH_RESULT: &str = r#"{"parentUuid":"a1","isSidechain":false,"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01CU","type":"tool_result","content":"Command running in background with ID: b8w03og7k. Output is being written to: /var/tmp/spawn/claude-1000/w/tasks/b8w03og7k.output. You will be notified when it completes — do not poll that file or sleep while waiting.","is_error":false}]},"uuid":"u1","timestamp":"2026-11-06T10:14:02.117Z","toolUseResult":{"stdout":"","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false,"backgroundTaskId":"b8w03og7k"},"version":"2.1.318"}"#;
+        const BASH_QUEUED: &str = r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-11-06T12:39:59.670Z","sessionId":"s","content":"<task-notification>\n<task-id>b8w03og7k</task-id>\n<tool-use-id>toolu_01CU</tool-use-id>\n<output-file>/var/tmp/spawn/claude-1000/w/tasks/b8w03og7k.output</output-file>\n<status>completed</status>\n<summary>Background command \"Wait for test-gate v1\" completed (exit code 0)</summary>\n</task-notification>"}"#;
+        const BASH_MID_TURN: &str = r#"{"parentUuid":"d5","isSidechain":false,"attachment":{"type":"queued_command","prompt":"<task-notification>\n<task-id>b8w03og7k</task-id>\n<tool-use-id>toolu_01CU</tool-use-id>\n<output-file>/var/tmp/spawn/claude-1000/w/tasks/b8w03og7k.output</output-file>\n<status>completed</status>\n<summary>Background command \"Wait for test-gate v1\" completed (exit code 0)</summary>\n</task-notification>","commandMode":"task-notification","origin":{"kind":"task-notification","producer":"session-task"}},"type":"attachment","uuid":"t0","version":"2.1.318"}"#;
+        const BASH_DONE: &str = r#"{"parentUuid":"c7","isSidechain":false,"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>b8w03og7k</task-id>\n<tool-use-id>toolu_01CU</tool-use-id>\n<output-file>/var/tmp/spawn/claude-1000/w/tasks/b8w03og7k.output</output-file>\n<status>completed</status>\n<summary>Background command \"Wait for test-gate v1\" completed (exit code 0)</summary>\n</task-notification>"},"uuid":"u2","timestamp":"2026-11-06T12:39:59.677Z","origin":{"kind":"task-notification","producer":"session-task"},"promptSource":"system","turnOrigin":"task_notification","version":"2.1.318"}"#;
+
+        #[test]
+        fn a_background_bash_starts_with_its_result_and_ends_with_its_notification() {
+            assert_eq!(
+                kinds(BASH_USE),
+                vec![("tool.started".into(), Some("toolu_01CU:started".into()))],
+                "the call itself is a tool, not yet a job"
+            );
+            assert_eq!(
+                kinds(BASH_RESULT),
+                vec![
+                    ("tool.completed".into(), Some("toolu_01CU:completed".into())),
+                    (
+                        "job.started".into(),
+                        Some("job:b8w03og7k:started:toolu_01CU".into())
+                    ),
+                ],
+                "keyed by the job and the call that started it"
+            );
+            assert_eq!(jobs(BASH_RESULT), [started("b8w03og7k", JobKind::Bash)]);
+            // Queued when it ended: the engine's queue is not read
+            // (`the_engines_queue_is_not_read`). Given to the agent mid-turn,
+            // or as the prompt of a turn of its own: the same notification,
+            // one key, so a second copy records nothing new.
+            assert!(kinds(BASH_QUEUED).is_empty());
+            let end = end_key(BASH_MID_TURN, "b8w03og7k");
+            assert_eq!(
+                kinds(BASH_DONE),
+                vec![
+                    ("job.ended".into(), Some(end)),
+                    ("message.received".into(), Some("u2".into())),
+                ],
+                "the job ends before the turn its notification starts"
+            );
+            assert_eq!(jobs(BASH_DONE), [ended("b8w03og7k", JobEnd::Completed)]);
+            let failed = BASH_DONE.replace("<status>completed", "<status>failed");
+            assert_eq!(jobs(&failed), [ended("b8w03og7k", JobEnd::Failed)]);
+            let killed = BASH_DONE.replace("<status>completed", "<status>killed");
+            assert_eq!(jobs(&killed), [ended("b8w03og7k", JobEnd::Killed)]);
+        }
+
+        #[test]
+        fn a_command_moved_to_the_background_is_a_bash_job() {
+            let timed_out = r#"{"isSidechain":false,"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_02","type":"tool_result","content":"cli=0\nCommand did not complete within its 600s timeout and was moved to the background (ID: bq1n7c2x4). Output is being written to: /tmp/x/tasks/bq1n7c2x4.output.","is_error":false}]},"uuid":"u3","toolUseResult":{"stdout":"cli=0","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false,"backgroundTaskId":"bq1n7c2x4","timedOutAfterMs":600000},"version":"2.1.318"}"#;
+            assert_eq!(jobs(timed_out), [started("bq1n7c2x4", JobKind::Bash)]);
+            let for_a_message = r#"{"isSidechain":false,"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_03","type":"tool_result","content":"Command was moved to the background (ID: bcc6zkquw) so that a message that arrived while it was running can reach you; it was not interrupted.","is_error":false}]},"uuid":"u4","toolUseResult":{"stdout":"","stderr":"","interrupted":false,"backgroundTaskId":"bcc6zkquw","backgroundedToDeliverMessage":true},"version":"2.1.318"}"#;
+            assert_eq!(jobs(for_a_message), [started("bcc6zkquw", JobKind::Bash)]);
+        }
+
+        const MONITOR_RESULT: &str = r#"{"parentUuid":"f1","isSidechain":false,"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01BD","type":"tool_result","content":"Monitor started (task bv41gl0hm, expires in 30m unless the source ends first; you get one notice at expiry — re-arm if you still need the watch). You will be notified on each event. Keep working — do not poll or sleep."}]},"uuid":"u5","timestamp":"2026-11-06T10:14:21.356Z","toolUseResult":{"taskId":"bv41gl0hm","timeoutMs":1800000,"persistent":false},"version":"2.1.318"}"#;
+
+        #[test]
+        fn a_monitor_runs_through_its_events_until_it_expires_or_its_command_ends() {
+            assert_eq!(
+                jobs(MONITOR_RESULT),
+                [started("bv41gl0hm", JobKind::Monitor)]
+            );
+            // Its events end nothing, however they reach the agent.
+            let event = r#"{"isSidechain":false,"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>bv41gl0hm</task-id>\n<summary>Monitor event: \"test-gate v1 failures or completion\"</summary>\n<event>gate: all cases pass\nexit=0 seconds=849</event>\n</task-notification>"},"uuid":"u6","origin":{"kind":"task-notification","producer":"session-task"},"version":"2.1.318"}"#;
+            assert_eq!(
+                kinds(event),
+                vec![("message.received".into(), Some("u6".into()))]
+            );
+            let quoting = r#"{"isSidechain":false,"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>bv41gl0hm</task-id>\n<summary>Monitor event: \"test-gate v1\"</summary>\n<event>ok   <status>completed</status> as the log printed it</event>\n</task-notification>"},"uuid":"u6b","origin":{"kind":"task-notification","producer":"session-task"},"version":"2.1.318"}"#;
+            assert_eq!(
+                kinds(quoting),
+                vec![("message.received".into(), Some("u6b".into()))],
+                "an event quoting a status is no end"
+            );
+            let mid_turn = r#"{"parentUuid":"d5","isSidechain":false,"attachment":{"type":"queued_command","prompt":"<task-notification>\n<task-id>bv41gl0hm</task-id>\n<summary>Monitor event: \"test-gate v1\"</summary>\n<event>ok   the verdict names the commits it judged</event>\n</task-notification>","commandMode":"task-notification","origin":{"kind":"task-notification","producer":"session-task"}},"type":"attachment","uuid":"t1","version":"2.1.318"}"#;
+            assert!(kinds(mid_turn).is_empty());
+            // Its expiry ends it: as a turn's prompt, or mid-turn.
+            let expired = r#"{"isSidechain":false,"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>bv41gl0hm</task-id>\n<summary>Monitor event: \"test-gate v1\"</summary>\n<event>[Monitor expired after 30m with 1 event delivered. Re-arm it if you still need the watch.]</event>\n</task-notification>"},"uuid":"u7","origin":{"kind":"task-notification","producer":"session-task"},"version":"2.1.318"}"#;
+            assert_eq!(jobs(expired), [ended("bv41gl0hm", JobEnd::Expired)]);
+            let expired_mid_turn = mid_turn.replace(
+                "ok   the verdict names the commits it judged",
+                "[Monitor expired after 30m with no events delivered. Re-arm it if you still need the watch.]",
+            );
+            assert_eq!(
+                jobs(&expired_mid_turn),
+                [ended("bv41gl0hm", JobEnd::Expired)]
+            );
+            end_key(&expired_mid_turn, "bv41gl0hm");
+            // Its command ended, or failed.
+            let stream_ended = r#"{"parentUuid":"d5","isSidechain":false,"attachment":{"type":"queued_command","prompt":"<task-notification>\n<task-id>bv41gl0hm</task-id>\n<status>completed</status>\n<summary>Monitor \"test-gate v1\" stream ended</summary>\n<event>[exited with code 0]</event>\n</task-notification>","commandMode":"task-notification","origin":{"kind":"task-notification","producer":"session-task"}},"type":"attachment","uuid":"t3","version":"2.1.318"}"#;
+            assert_eq!(jobs(stream_ended), [ended("bv41gl0hm", JobEnd::Completed)]);
+            let script_failed = stream_ended
+                .replace("<status>completed", "<status>failed")
+                .replace("stream ended", "script failed (exit 1)");
+            assert_eq!(jobs(&script_failed), [ended("bv41gl0hm", JobEnd::Failed)]);
+        }
+
+        #[test]
+        fn a_task_stop_that_succeeded_ends_the_job_and_one_that_failed_does_not() {
+            let stop = r#"{"parentUuid":"2b","isSidechain":false,"message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_0122","name":"TaskStop","input":{"task_id":"bpjhfs6ly"}}],"stop_reason":"tool_use"},"type":"assistant","uuid":"a2","version":"2.1.318"}"#;
+            assert_eq!(
+                kinds(stop),
+                vec![("tool.started".into(), Some("toolu_0122:started".into()))],
+                "asking for a stop stops nothing yet"
+            );
+            let stopped = r#"{"parentUuid":"a2","isSidechain":false,"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_0122","type":"tool_result","content":"{\"message\":\"Successfully stopped task: bpjhfs6ly (tail -f gate.log)\",\"task_id\":\"bpjhfs6ly\",\"task_type\":\"local_bash\",\"command\":\"tail -f gate.log\"}"}]},"uuid":"u8","toolUseResult":{"message":"Successfully stopped task: bpjhfs6ly (tail -f gate.log)","task_id":"bpjhfs6ly","task_type":"local_bash","command":"tail -f gate.log"},"version":"2.1.318"}"#;
+            assert_eq!(
+                kinds(stopped),
+                vec![
+                    ("tool.completed".into(), Some("toolu_0122:completed".into())),
+                    (
+                        "job.ended".into(),
+                        Some("job:bpjhfs6ly:stopped:toolu_0122".into())
+                    ),
+                ]
+            );
+            assert_eq!(jobs(stopped), [ended("bpjhfs6ly", JobEnd::Stopped)]);
+            let not_running = r#"{"isSidechain":false,"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"<tool_use_error>Task bpjhfs6ly is not running (status: completed)</tool_use_error>","is_error":true,"tool_use_id":"toolu_0123"}]},"uuid":"u9","toolUseResult":"Error: Task bpjhfs6ly is not running (status: completed)","version":"2.1.318"}"#;
+            assert!(jobs(not_running).is_empty(), "a failed stop ends no job");
+        }
+
+        #[test]
+        fn the_jobs_a_resume_finds_dead_are_marked_stopped() {
+            let orphans = r#"{"isSidechain":false,"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>bqikdrfgk</task-id>\n<task-id>bo58jvmfb</task-id>\n<task-id>__orphan_summary__:shell</task-id>\n<status>stopped</status>\n<summary>2 background shell command tasks didn't finish before the previous session ended. Task ids: bqikdrfgk, bo58jvmfb.</summary>\n<note>They have been marked stopped. Task ids in this notification beginning with \"__orphan_summary\" are internal scan markers, not tasks.</note>\n</task-notification>"},"uuid":"u10","origin":{"kind":"task-notification"},"version":"2.1.312"}"#;
+            assert_eq!(
+                jobs(orphans),
+                [
+                    ended("bqikdrfgk", JobEnd::Stopped),
+                    ended("bo58jvmfb", JobEnd::Stopped)
+                ],
+                "every job it names, and no marker"
+            );
+        }
+
+        const AGENT_LAUNCH: &str = r#"{"type":"user","isSidechain":false,"uuid":"e0246752","timestamp":"2026-11-04T12:52:07.592Z","version":"2.1.317","toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"a2adacaabc9f9b048","description":"Build storage phase 2a","resolvedModel":"claude-opus-5-5","prompt":"Implement storage phase 2a for","outputFile":"/data/tmp/claude-1000/p/s/tasks/a2adacaabc9f9b048.output","canReadOutputFile":true,"canContinueAgent":true},"message":{"role":"user","content":[{"tool_use_id":"toolu_018hgmBWFMc3fomfMC4sgXBo","type":"tool_result","content":[{"type":"text","text":"Async agent launched successfully. (This tool result is internal metadata — never quote or paste any part of it, including the agentId below, into a user-facing reply.)\nagentId: a2adacaabc9f9b048 (internal ID - do not mention to user. Use SendMessage with to: 'a2adacaabc9f9b048', summary: '<5-10 word recap>' to continue this agent.)\nThe agent is working in the background. You will be notified automatically when it completes.\noutput_file: /data/tmp/claude-1000/p/s/tasks/a2adacaabc9f9b048.output"}]}]}}"#;
+        const AGENT_MID_TURN: &str = r#"{"parentUuid":"d5","isSidechain":false,"attachment":{"type":"queued_command","prompt":"<task-notification>\n<task-id>a2adacaabc9f9b048</task-id>\n<tool-use-id>toolu_018hgmBWFMc3fomfMC4sgXBo</tool-use-id>\n<output-file>/data/tmp/claude-1000/p/s/tasks/a2adacaabc9f9b048.output</output-file>\n<status>completed</status>\n<summary>Agent \"Build storage phase 2a\" finished</summary>\n<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>\n<result>Storage phase 2a is built and committed.</result>\n<usage><subagent_tokens>256088</subagent_tokens><tool_uses>122</tool_uses><duration_ms>1751619</duration_ms></usage>\n<worktree><worktreePath>/home/ckl/projects/Spawn/.claude/worktrees/agent-a2adacaabc9f9b048</worktreePath><worktreeBranch>worktree-agent-a2adacaabc9f9b048</worktreeBranch></worktree>\n</task-notification>","commandMode":"task-notification","origin":{"kind":"task-notification","producer":"session-task"}},"type":"attachment","uuid":"t20","version":"2.1.318"}"#;
+        const AGENT_DONE: &str = r#"{"type":"user","isSidechain":false,"uuid":"54ce99c8","timestamp":"2026-11-04T13:21:21.212Z","origin":{"kind":"task-notification","producer":"session-task","runId":"0mw24999i-aec44194"},"version":"2.1.317","message":{"role":"user","content":"<task-notification>\n<task-id>a2adacaabc9f9b048</task-id>\n<tool-use-id>toolu_018hgmBWFMc3fomfMC4sgXBo</tool-use-id>\n<output-file>/data/tmp/claude-1000/p/s/tasks/a2adacaabc9f9b048.output</output-file>\n<status>completed</status>\n<summary>Agent \"Build storage phase 2a\" finished</summary>\n<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>\n<result>Storage phase 2a is built and committed.</result>\n<usage><subagent_tokens>256088</subagent_tokens><tool_uses>122</tool_uses><duration_ms>1751619</duration_ms></usage>\n<worktree><worktreePath>/home/ckl/projects/Spawn/.claude/worktrees/agent-a2adacaabc9f9b048</worktreePath><worktreeBranch>worktree-agent-a2adacaabc9f9b048</worktreeBranch></worktree>\n</task-notification>"}}"#;
+        const AGENT_RESUMED: &str = r#"{"type":"user","isSidechain":false,"uuid":"8c491cc0","timestamp":"2026-11-04T13:39:01.340Z","version":"2.1.317","toolUseResult":{"success":true,"message":"Resuming agent a2adaca","resumedAgentId":"a2adacaabc9f9b048","revivedAgentId":"a2adacaabc9f9b048","pin":{"id":"a2adacaabc9f9b048","name":"a2adacaabc9f9b048","ref":"6d82fa"}},"message":{"role":"user","content":[{"tool_use_id":"toolu_01C8SfVsFL53ceFvQyhH19yS","type":"tool_result","content":[{"type":"text","text":"{\"success\":true,\"message\":\"Resuming agent a2adaca\",\"resumedAgentId\":\"a2adacaabc9f9b048\",\"pin\":{\"id\":\"a2adacaabc9f9b048\",\"name\":\"a2adacaabc9f9b048\",\"ref\":\"6d82fa\"}}"}]}]}}"#;
+        const AGENT_DONE_AGAIN: &str = r#"{"parentUuid":"d5","isSidechain":false,"attachment":{"type":"queued_command","prompt":"<task-notification>\n<task-id>a2adacaabc9f9b048</task-id>\n<tool-use-id>toolu_01C8SfVsFL53ceFvQyhH19yS</tool-use-id>\n<output-file>/data/tmp/claude-1000/p/s/tasks/a2adacaabc9f9b048.output</output-file>\n<status>completed</status>\n<summary>Agent \"Build storage phase 2a\" finished</summary>\n<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>\n<result>Done: the review's three points are fixed.</result>\n<usage><subagent_tokens>298923</subagent_tokens><tool_uses>39</tool_uses><duration_ms>614360</duration_ms></usage>\n<worktree><worktreePath>/home/ckl/projects/Spawn/.claude/worktrees/agent-a2adacaabc9f9b048</worktreePath><worktreeBranch>worktree-agent-a2adacaabc9f9b048</worktreeBranch></worktree>\n</task-notification>","commandMode":"task-notification","origin":{"kind":"task-notification","producer":"session-task"}},"type":"attachment","uuid":"t21","version":"2.1.318"}"#;
+        const AGENT_PAUSED: &str = r#"{"parentUuid":"d5","isSidechain":false,"attachment":{"type":"queued_command","prompt":"<task-notification>\n<task-id>a0c5b4ae43e0f3f2d</task-id>\n<tool-use-id>toolu_01Aox6JqikTcY5AyfCxei3HP</tool-use-id>\n<output-file>/var/tmp/spawn/claude-1000/w/s/tasks/a0c5b4ae43e0f3f2d.output</output-file>\n<status>completed</status>\n<summary>Agent \"Write objective 032 soak scenario\" is waiting on its own background work</summary>\n<note>This agent stopped with background work of its own still running. It may resume on its own when that work completes or reports, and the same task-id notifies again if it does; the result below may be interim.</note>\n<result>The soak runs in the background; I will report when it ends.</result>\n<usage><subagent_tokens>362660</subagent_tokens><tool_uses>88</tool_uses><duration_ms>2226227</duration_ms></usage>\n</task-notification>","commandMode":"task-notification","origin":{"kind":"task-notification","producer":"session-task"}},"type":"attachment","uuid":"t22","version":"2.1.318"}"#;
+
+        #[test]
+        fn a_background_agent_runs_from_its_launch_to_its_notification_and_again_when_resumed() {
+            const ID: &str = "a2adacaabc9f9b048";
+            assert_eq!(jobs(AGENT_LAUNCH), [started(ID, JobKind::Agent)]);
+            assert_eq!(
+                keys(AGENT_LAUNCH),
+                ["job:a2adacaabc9f9b048:started:toolu_018hgmBWFMc3fomfMC4sgXBo"]
+            );
+            // Its notification's task-id is the agentId: given mid-turn, then
+            // as a prompt, byte for byte the same, so one end.
+            assert_eq!(jobs(AGENT_MID_TURN), [ended(ID, JobEnd::Completed)]);
+            let first = end_key(AGENT_MID_TURN, ID);
+            assert_eq!(
+                kinds(AGENT_DONE),
+                vec![
+                    ("job.ended".into(), Some(first.clone())),
+                    ("message.received".into(), Some("54ce99c8".into())),
+                ]
+            );
+            // A message resumes it: a new run, started by that call, ended by
+            // a notification of its own (another result and usage), which
+            // the first end's key does not swallow.
+            assert_eq!(jobs(AGENT_RESUMED), [started(ID, JobKind::Agent)]);
+            assert_eq!(
+                keys(AGENT_RESUMED),
+                ["job:a2adacaabc9f9b048:started:toolu_01C8SfVsFL53ceFvQyhH19yS"]
+            );
+            assert_eq!(jobs(AGENT_DONE_AGAIN), [ended(ID, JobEnd::Completed)]);
+            assert_ne!(end_key(AGENT_DONE_AGAIN, ID), first);
+            // Its other ends.
+            let failed = AGENT_MID_TURN.replace("<status>completed", "<status>failed").replace(
+                "finished</summary>",
+                "failed: Agent terminated early due to an API error: API Error: 502 status code</summary>",
+            );
+            assert_eq!(jobs(&failed), [ended(ID, JobEnd::Failed)]);
+            let killed = AGENT_MID_TURN
+                .replace("<status>completed", "<status>killed")
+                .replace("finished</summary>", "was stopped by Claude</summary>");
+            assert_eq!(jobs(&killed), [ended(ID, JobEnd::Killed)]);
+            let stopped = r#"{"type":"user","isSidechain":false,"uuid":"u30","version":"2.1.318","toolUseResult":{"message":"Successfully stopped task: a322ed2198f742e41 (Validate objective 026 variants)","task_id":"a322ed2198f742e41","task_type":"local_agent","command":"Validate objective 026 variants"},"message":{"role":"user","content":[{"tool_use_id":"toolu_01132fAc6a6EP9oKpFzTnwSS","type":"tool_result","content":"{\"message\":\"Successfully stopped task: a322ed2198f742e41 (Validate objective 026 variants)\",\"task_id\":\"a322ed2198f742e41\",\"task_type\":\"local_agent\",\"command\":\"Validate objective 026 variants\"}"}]}}"#;
+            assert_eq!(jobs(stopped), [ended("a322ed2198f742e41", JobEnd::Stopped)]);
+            // A Skill forked to run in the background is an Agent too: it
+            // notifies under its agentId ("Agent \"/code-review …\" finished").
+            let forked = r#"{"type":"user","isSidechain":false,"uuid":"7da83220","timestamp":"2026-10-28T09:49:33.065Z","version":"2.1.312","toolUseResult":{"success":true,"commandName":"code-review","status":"forked","background":true,"agentId":"aea25189ec7ec0cb0","result":"Running in the background as @code-review"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_863cd0d956c042169b9daf2732efa1e7","content":"Skill \"code-review\" launched (forked execution, running in the background).\n\nRunning in the background as @code-review"}]}}"#;
+            assert_eq!(jobs(forked), [started("aea25189ec7ec0cb0", JobKind::Agent)]);
+        }
+
+        #[test]
+        fn an_agent_that_only_paused_or_was_sent_a_message_is_still_running() {
+            // Stopped with background work of its own still running: it may
+            // resume on its own and notifies again under its id.
+            assert!(kinds(AGENT_PAUSED).is_empty(), "{:?}", kinds(AGENT_PAUSED));
+            let as_prompt = AGENT_DONE.replace(
+                "finished</summary>",
+                "is waiting on its own background work</summary>",
+            );
+            assert_eq!(
+                kinds(&as_prompt),
+                vec![("message.received".into(), Some("54ce99c8".into()))]
+            );
+            // Only the summary's end says so: a description that quotes the
+            // words, in an agent that finished, is an end.
+            let quoting = AGENT_MID_TURN.replace(
+                "Build storage phase 2a\\\" finished",
+                "Check is waiting on its own background work\\\" finished",
+            );
+            assert_ne!(quoting, AGENT_MID_TURN);
+            assert_eq!(
+                jobs(&quoting),
+                [ended("a2adacaabc9f9b048", JobEnd::Completed)]
+            );
+            // A message queued for a running agent starts nothing.
+            let queued = r#"{"type":"user","isSidechain":false,"uuid":"u31","version":"2.1.318","toolUseResult":{"success":true,"message":"Message queued for delivery to a90ac3ddd1ee082aa at its next tool round. Sending this moved nothing it is running to the background just now, so the message waits for that round unless something moves sooner. If it finishes first, it is resumed with the message and notifies again, so wait for that notification before resending.","pin":{"id":"a90ac3ddd1ee082aa","name":"a90ac3ddd1ee082aa","ref":"4b8ec1"}},"message":{"role":"user","content":[{"tool_use_id":"toolu_07","type":"tool_result","content":[{"type":"text","text":"{\"success\":true,\"message\":\"Message queued for delivery to a90ac3ddd1ee082aa at its next tool round.\"}"}]}]}}"#;
+            assert!(jobs(queued).is_empty());
+            // Without the structured copy, the engine's words.
+            let launch = AGENT_LAUNCH.replace(
+                r#""toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"a2adacaabc9f9b048","description":"Build storage phase 2a","resolvedModel":"claude-opus-5-5","prompt":"Implement storage phase 2a for","outputFile":"/data/tmp/claude-1000/p/s/tasks/a2adacaabc9f9b048.output","canReadOutputFile":true,"canContinueAgent":true},"#,
+                "",
+            );
+            assert_ne!(launch, AGENT_LAUNCH);
+            assert_eq!(
+                jobs(&launch),
+                [started("a2adacaabc9f9b048", JobKind::Agent)]
+            );
+            let resumed = AGENT_RESUMED.replace(
+                r#""toolUseResult":{"success":true,"message":"Resuming agent a2adaca","resumedAgentId":"a2adacaabc9f9b048","revivedAgentId":"a2adacaabc9f9b048","pin":{"id":"a2adacaabc9f9b048","name":"a2adacaabc9f9b048","ref":"6d82fa"}},"#,
+                "",
+            );
+            assert_ne!(resumed, AGENT_RESUMED);
+            assert_eq!(
+                jobs(&resumed),
+                [started("a2adacaabc9f9b048", JobKind::Agent)]
+            );
+        }
+
+        #[test]
+        fn the_engines_queue_is_not_read() {
+            // A sub-agent's background job (its start is in the sub-agent's
+            // own transcript): its end is queued in the session's queue, then
+            // removed and handed to the sub-agent (2.1.312).
+            let sub_agents = r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-10-30T14:23:49.953Z","sessionId":"b95b0598","content":"<task-notification>\n<task-id>b8zq0ev2d</task-id>\n<tool-use-id>toolu_015jsZnoPvD9rHp9A2vnbWAq</tool-use-id>\n<output-file>/data/tmp/claude-1000/p/b95b0598/tasks/b8zq0ev2d.output</output-file>\n<status>completed</status>\n<summary>Background command \"sparse checkout of TensorRT-LLM\" completed (exit code 0)</summary>\n</task-notification>"}"#;
+            assert!(kinds(sub_agents).is_empty());
+            // A quick job's end, queued before the line with the result that
+            // started it (2.1.312): only the copy the agent is given, after
+            // that result, ends it.
+            let early = r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-10-28T21:22:22.200Z","sessionId":"9654af04","content":"<task-notification>\n<task-id>bf1cus1ov</task-id>\n<tool-use-id>call_a96802b9760049bdb0930dff1bccada5</tool-use-id>\n<status>failed</status>\n<summary>Background command \"Compile and run isolated world-one MPK Engram tasks\" failed with exit code 1</summary>\n</task-notification>"}"#;
+            let start = r#"{"isSidechain":false,"type":"user","message":{"role":"user","content":[{"tool_use_id":"call_a96802b9760049bdb0930dff1bccada5","type":"tool_result","content":"Command running in background with ID: bf1cus1ov. Output is being written to: /data/tmp/claude-1000/p/9654af04/tasks/bf1cus1ov.output."}]},"uuid":"u40","toolUseResult":{"stdout":"","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false,"backgroundTaskId":"bf1cus1ov"},"version":"2.1.312"}"#;
+            let given = early
+                .replace(
+                    r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-10-28T21:22:22.200Z","sessionId":"9654af04","content":"#,
+                    r#"{"isSidechain":false,"type":"attachment","uuid":"t40","version":"2.1.312","attachment":{"type":"queued_command","commandMode":"task-notification","prompt":"#,
+                )
+                .replace(r#"</task-notification>"}"#, r#"</task-notification>"}}"#);
+            assert!(kinds(early).is_empty());
+            assert_eq!(jobs(start), [started("bf1cus1ov", JobKind::Bash)]);
+            assert_eq!(jobs(&given), [ended("bf1cus1ov", JobEnd::Failed)]);
+        }
+
+        #[test]
+        fn shapes_that_start_or_end_no_job_give_none() {
+            // A prompt that quotes a notification (this task's own brief).
+            let quoted = r#"{"isSidechain":false,"type":"user","message":{"role":"user","content":"Read it: a `user` message holds `<task-notification> <task-id><id></task-id> <status>completed</status>`."},"uuid":"u11","version":"2.1.318"}"#;
+            assert_eq!(
+                kinds(quoted),
+                vec![("message.received".into(), Some("u11".into()))]
+            );
+            // A foreground command whose output quotes the engine's words.
+            let quoting = r#"{"isSidechain":false,"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_04","type":"tool_result","content":"Command running in background with ID: b0uk1xi12.","is_error":false}]},"uuid":"u12","toolUseResult":{"stdout":"Command running in background with ID: b0uk1xi12.","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false},"version":"2.1.318"}"#;
+            assert!(jobs(quoting).is_empty());
+            // A sub-agent's background shell dies with the sub-agent.
+            let side = BASH_RESULT.replace(r#""isSidechain":false"#, r#""isSidechain":true"#);
+            assert!(kinds(&side).is_empty());
+            // The queue handing a notification out again; other queue moves.
+            let removed = BASH_QUEUED.replace(r#""enqueue""#, r#""remove""#);
+            assert!(kinds(&removed).is_empty());
+            assert!(
+                kinds(
+                    r#"{"type":"queue-operation","operation":"enqueue","content":"fix the build"}"#
+                )
+                .is_empty()
+            );
+            // Other attachments, and a status this build does not know.
+            assert!(kinds(r#"{"type":"attachment","uuid":"t2","attachment":{"type":"task_status","taskId":"b8w03og7k","status":"running"}}"#).is_empty());
+            let unknown = BASH_DONE.replace("<status>completed", "<status>vanished");
+            assert_eq!(jobs(&unknown), [ended("b8w03og7k", JobEnd::Ended)]);
+            let bad_id = BASH_DONE.replace("<task-id>b8w03og7k", "<task-id><id>");
+            assert!(jobs(&bad_id).is_empty(), "no id, no job");
+        }
+
+        #[test]
+        fn a_line_without_the_structured_copy_is_read_from_the_engines_words() {
+            let bash = r#"{"isSidechain":false,"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_06","type":"tool_result","content":"Shell cwd was reset to /w\nCommand running in background with ID: b437vogks. Output is being written to: /tmp/b437vogks.output.","is_error":false}]},"uuid":"u14","version":"2.1.311"}"#;
+            assert_eq!(jobs(bash), [started("b437vogks", JobKind::Bash)]);
+            let monitor = MONITOR_RESULT.replace(
+                r#","toolUseResult":{"taskId":"bv41gl0hm","timeoutMs":1800000,"persistent":false}"#,
+                "",
+            );
+            assert_eq!(jobs(&monitor), [started("bv41gl0hm", JobKind::Monitor)]);
+        }
     }
 }

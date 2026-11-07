@@ -72,11 +72,34 @@ export interface SupervisorView {
   for_owner: OwnerNote[];
 }
 
+/** One of a worker's open background jobs. */
+export interface OwnJob {
+  id: string;
+  /** `bash`, `monitor` or `agent`. */
+  kind: string;
+  started_at_ms: number | null;
+  /** Its age when the view was read, on the database's clock. */
+  age_ms: number | null;
+}
+
+/** A worker the rules hold as working on a background job of its own (its
+ * turn ended while a job it started runs): in no queue, listed so a person
+ * sees why. */
+export interface OnOwnJob {
+  session_id: string;
+  agent_id: string;
+  judged_at_ms: number | null;
+  /** Oldest first. */
+  jobs: OwnJob[];
+}
+
 export interface Attention {
   generated_at_ms: number;
   pending: AttentionItem[];
   told: AttentionItem[];
   supervisor: SupervisorView | null;
+  /** Workers on their own background jobs, not escalated. */
+  on_own_jobs: OnOwnJob[];
   warnings: string[];
 }
 
@@ -92,6 +115,8 @@ export interface AttentionGroups {
   /** The supervisor's lines for the owner, newest first: to read, not
    * counted, since the supervisor does not wait on them. */
   forOwner: OwnerNote[];
+  /** Workers on their own background jobs: working, not counted. */
+  onOwnJobs: OnOwnJob[];
 }
 
 type JsonObject = Record<string, unknown>;
@@ -180,6 +205,32 @@ function normalizeNotes(value: unknown): OwnerNote[] {
   });
 }
 
+function normalizeOnOwnJobs(value: unknown): OnOwnJob[] {
+  return list(value).flatMap((entry) => {
+    const raw = object(entry);
+    const session = raw ? optionalText(raw.session_id) : null;
+    if (!raw || !session) return [];
+    const jobs = list(raw.jobs).flatMap((job) => {
+      const fields = object(job);
+      const id = fields ? optionalText(fields.id) : null;
+      return fields && id
+        ? [{
+            id,
+            kind: text(fields.kind, "job"),
+            started_at_ms: optionalNumber(fields.started_at_ms),
+            age_ms: optionalNumber(fields.age_ms),
+          }]
+        : [];
+    });
+    return [{
+      session_id: session,
+      agent_id: text(raw.agent_id),
+      judged_at_ms: optionalNumber(raw.judged_at_ms),
+      jobs,
+    }];
+  });
+}
+
 function normalizeSupervisor(value: unknown): SupervisorView | null {
   const raw = object(value);
   if (!raw) return null;
@@ -215,6 +266,7 @@ export function normalizeAttention(value: unknown): Attention {
     pending: items(raw.pending, false),
     told: items(raw.told, true),
     supervisor: normalizeSupervisor(raw.supervisor),
+    on_own_jobs: normalizeOnOwnJobs(raw.on_own_jobs),
     warnings: list(raw.warnings).filter(
       (warning): warning is string => typeof warning === "string",
     ),
@@ -249,6 +301,7 @@ export function attentionGroups(attention: Attention): AttentionGroups {
     told,
     count: needsHuman(attention).count,
     forOwner: attention.supervisor?.for_owner ?? [],
+    onOwnJobs: attention.on_own_jobs,
   };
 }
 

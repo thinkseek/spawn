@@ -62,6 +62,14 @@ from (
                         where o.session_id = s.session_id
                           and o.execution_id = s.execution_id and s.live
                         order by o.session_seq desc limit 1),
+      -- The live execution's open background jobs, oldest first, with their
+      -- age on the database's clock.
+      'jobs', (select coalesce(jsonb_agg(jsonb_build_object(
+                 'id', j.job_id, 'kind', j.job_kind, 'started_at_ms', j.started_at_ms,
+                 'age_ms', spawn_now_ms() - j.started_at_ms) order by j.session_seq), '[]'::jsonb)
+                 from agent_open_jobs j
+                where j.session_id = s.session_id
+                  and j.execution_id = s.execution_id and s.live),
       'last_event_name', (select e.event_name from spawn_events e
                            where e.session_id = s.session_id and e.source <> 'observer'
                            order by e.session_seq desc limit 1),
@@ -172,7 +180,9 @@ select jsonb_build_object(
 /// `turn.stopped`, `turn.failed`) is a turn's end; the Bridge records a
 /// turn's checkpoint before its end, so `checkpoint`, the agent's latest
 /// `artifact.committed`, read in the same statement, is then that turn's
-/// (or a later one).
+/// (or a later one). `jobs`: the live execution's open background jobs
+/// (`agent_open_jobs`), oldest first, each with the id of its
+/// `job.started` and its age on the database's clock.
 ///
 /// A delivery counts as the worker's (its `last_delivery`, and the episode)
 /// only when it reached the worker or may have: it succeeded, has not
@@ -214,6 +224,13 @@ from (
     (select e.kind -> 'detail' -> 'artifact' ->> 'commit' from spawn_events e
       where e.agent_id = s.agent_id and e.event_name = 'artifact.committed'
       order by e.id desc limit 1) as checkpoint,
+    (select coalesce(jsonb_agg(jsonb_build_object(
+              'id', j.job_id, 'kind', j.job_kind, 'event_id', j.event_id,
+              'started_at_ms', j.started_at_ms,
+              'age_ms', spawn_now_ms() - j.started_at_ms) order by j.session_seq), '[]'::jsonb)
+       from agent_open_jobs j
+      where s.live and j.session_id = s.session_id
+        and j.execution_id = s.execution_id) as jobs,
     ep.id as episode,
     ep.action ->> 'type' as episode_action,
     exists (select 1 from spawn_commands c

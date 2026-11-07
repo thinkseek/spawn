@@ -288,6 +288,7 @@ mod tests {
                 given: given.map(|charter| charter.hash.clone()),
                 inputs,
             }),
+            jobs: Vec::new(),
         }
     }
 

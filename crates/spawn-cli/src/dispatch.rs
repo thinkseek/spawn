@@ -23,6 +23,11 @@
 //! new one is typed in at its next idle prompt, once, in place of that
 //! pass's digest.
 //!
+//! A worker waiting on a background job of its own is working, not idle
+//! ([`jobs`]): the rules settle its stopped turn as WORKING, so it is not
+//! nudged nor escalated, and its task is not stalled; a job open past its
+//! bound (`SPAWN_STALL_JOB_SECS`) is escalated once.
+//!
 //! No task waits silently ([`stall`]): every open task is at one step
 //! (`delivery`, `activity`, `judgement`, `landing`, `stop`, or its mission
 //! `halted`), measured from the record that started it on the database's
@@ -53,11 +58,14 @@
 
 mod charter;
 mod digest;
+mod jobs;
 mod stall;
 mod stops;
 mod worker;
 
 pub(crate) use digest::{OPENING as DIGEST_OPENING, heading};
+#[cfg(test)]
+pub(crate) use jobs::items as job_items;
 pub(crate) use stall::Bounds;
 
 use std::collections::BTreeSet;
@@ -109,6 +117,24 @@ pub(crate) struct StopSent {
     pub(crate) succeeded: Option<bool>,
     #[serde(default)]
     pub(crate) error: Option<String>,
+}
+
+/// A background job the session's live execution started and that has not
+/// ended (`job.started` without its `job.ended`), as `dispatch_facts`
+/// reads it. The execution's end closes it, so only a live one has any.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct Job {
+    /// The engine's task id.
+    pub(crate) id: String,
+    /// `bash`, `monitor` or `agent`.
+    pub(crate) kind: String,
+    /// The `job.started` record's id.
+    pub(crate) event_id: i64,
+    /// When it started (the record's time).
+    pub(crate) started_at_ms: i64,
+    /// How long it has run when the facts were read, on the database's
+    /// clock.
+    pub(crate) age_ms: i64,
 }
 
 /// Facts about one session, as `dispatch_facts` returns them.
@@ -178,6 +204,16 @@ pub(crate) struct Facts {
     /// session holds ([`charter::Records`]); `None` for every other session.
     #[serde(default)]
     pub(crate) charter: Option<charter::Records>,
+    /// The live execution's open background jobs, oldest first.
+    #[serde(default)]
+    pub(crate) jobs: Vec<Job>,
+}
+
+/// Whether a judgement says the turn stopped at the prompt: the rules left
+/// it to the judge (`TurnStoppedIdle`), or settled it as waiting on a
+/// background job of its own. Either way the pane waits at its prompt.
+fn stopped_at_prompt(observation: &Observation) -> bool {
+    observation.ambiguity == Some(Ambiguity::TurnStoppedIdle) || observation.waits_on_own_job()
 }
 
 impl Facts {
@@ -213,16 +249,24 @@ impl Facts {
         self.live && !self.open_command
     }
 
-    /// Whether the worker sits idle at its prompt, judged on its latest
-    /// fact, with nothing in flight: the only moment typed input is safe.
-    /// The turn stopped and the pane waits at its prompt, whatever Jev made
-    /// of it: a fact the rules settle. A report written by then is the
-    /// worker's answer even when it asks a question (judged BLOCKED).
+    /// Whether the worker sits at its prompt, judged on its latest fact,
+    /// with nothing in flight: the only moment typed input is safe. The
+    /// turn stopped and the pane waits at its prompt, whatever Jev made of
+    /// it: a fact the rules settle. A report written by then is the
+    /// worker's answer even when it asks a question (judged BLOCKED). A
+    /// worker waiting on its own background job sits at its prompt too
+    /// (judged WORKING): input is safe, though it is not idle.
     pub(crate) fn turn_stopped_idle(&self) -> bool {
-        self.live_and_free()
-            && self.current_observation().is_some_and(|observation| {
-                observation.ambiguity == Some(Ambiguity::TurnStoppedIdle)
-            })
+        self.live_and_free() && self.current_observation().is_some_and(stopped_at_prompt)
+    }
+
+    /// Whether the rules judged the worker, on its latest fact, at its
+    /// prompt waiting on a background job of its own: working, not idle.
+    pub(crate) fn waits_on_own_job(&self) -> bool {
+        self.live
+            && self
+                .current_observation()
+                .is_some_and(Observation::waits_on_own_job)
     }
 
     /// Whether a report written in the worker's workspace may be collected
@@ -242,8 +286,7 @@ impl Facts {
     /// new situation, so a stale one waits for the model's judgement of the
     /// turn, as before.
     pub(crate) fn report_due(&self) -> bool {
-        let idle =
-            |observation: &Observation| observation.ambiguity == Some(Ambiguity::TurnStoppedIdle);
+        let idle = stopped_at_prompt;
         self.live_and_free()
             && self.turn_ended
             && match self.current_observation() {
@@ -311,6 +354,8 @@ pub(crate) enum Why {
     /// every attempt was refused before typing, and the retries are spent
     /// ([`charter`]).
     Charter,
+    /// A worker's background job has run longer than its bound ([`jobs`]).
+    BackgroundJob,
 }
 
 impl Why {
@@ -524,7 +569,8 @@ pub(crate) struct Reading {
 
 /// The plan for this moment, reading only: the host's news (the disk items
 /// `disk` gives for the moment's clock, the gate-room and gate host-fault
-/// records, the stalls past their `bounds`, [`stall`]) added to the facts and mission rows
+/// records, the stalls past their `bounds`, [`stall`], and the background
+/// jobs past theirs, [`jobs`]) added to the facts and mission rows
 /// `loaded` ([`load`]), then [`decide_with`], then the input that gives the
 /// supervisor the `deployed` charter if it holds another ([`charter::give`];
 /// `None`: no input, as for a reader that submits nothing). [`step`]
@@ -564,6 +610,7 @@ pub(crate) fn read_plan(
         Ok(stalls) => host.extend(stall::items(&rows, &work, &stalls, bounds)),
         Err(error) => lines.push(format!("dispatch: stalls: {error}")),
     }
+    host.extend(jobs::items(&rows, bounds.job));
     let mut plan = decide_with(&rows, &work, &host, supervised, now, spawn);
     if let Some(deployed) = deployed.filter(|_| supervised) {
         charter::give(&mut plan, &rows, deployed);
@@ -797,6 +844,7 @@ mod tests {
             turn_ended: true,
             checkpoint: None,
             charter: None,
+            jobs: Vec::new(),
         }
     }
 
@@ -900,6 +948,7 @@ mod tests {
             turn_ended: true,
             checkpoint: None,
             charter: None,
+            jobs: Vec::new(),
         }
     }
 

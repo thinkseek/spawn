@@ -71,6 +71,8 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | `tool.failed` | 会话记录 | tool_use_id、error |
 | `turn.stopped` | 会话记录（`turn_duration`、中断） | input_tokens、output_tokens |
 | `turn.failed` | 会话记录（API 错误行） | error |
+| `job.started` | 会话记录：启动后台任务的工具结果（Bash 的 `toolUseResult.backgroundTaskId`，含超时或为送达消息被移到后台的命令；Monitor 的 `taskId`；后台 Agent 的 `agentId`，`isAsync` 且 `status` 为 `async_launched`，或派生到后台的 Skill，`status` 为 `forked`、`background`）；`SendMessage` 恢复已结束的 Agent（结果带 `resumedAgentId`）是同一 id 的又一次运行；键 `job:<id>:started:<tool_use_id>`，每次运行一条 | job_id、kind（`bash`、`monitor`、`agent`）；开始时间即记录时间 |
+| `job.ended` | 会话记录：引擎的 `<task-notification>`（头部带 `<status>`，或 Monitor 的 `[Monitor expired …]` 事件），以引擎交给代理的那份为准：`queued_command` 附件或用户行（`queue-operation` 不读：它也排着子代理任务的通知，并可能早于启动该任务的工具结果写下）；Agent 的通知若说 `is waiting on its own background work`（暂停，自己的后台工作还在跑，会再通知）不算结束；成功的 `TaskStop` 结果；键 `job:<id>:ended:<通知摘要>`（两处副本字节相同，记一条；同一 Agent 下一次运行的通知不同，另记一条），`TaskStop` 为 `job:<id>:stopped:<tool_use_id>` | job_id、how（`completed`、`failed`、`killed`、`stopped`、`expired`，不认识的状态为 `ended`） |
 | `execution.started` | Bridge | engine、workspace、command_id（终端总是 `spawn-<execution>`，由执行推出，不记录；旧记录里的 terminal 照常读入）；本次启动新建了分支时另有 fork（from：`main` 或启动的 `from`，跨主机删除之前的旧记录里还可能是 `spawn/<agent>`；commit：分支起点） |
 | `execution.ended` | Bridge | cause、exit_code；Bridge 结束一个已无自己的 runner 在跑的执行时另带 evidence（主机看到了什么、哪条命令发现的） |
 | `execution.unmounting` | Bridge（结束流程过了最后一次 checkpoint 与 terminate、卸载之前；键 `<exec>:unmounting`） | — |
@@ -196,7 +198,7 @@ Claude 以 `--ax-screen-reader` 运行，屏幕是唯一可靠的完成信号来
 
 `Observation { state, reason, based_on_seq, confidence, judge }`。`SemanticState` 取值 `Working`、`Waiting`、`Blocked`、`Completed`、`Unknown`，序列化为 `SCREAMING_SNAKE_CASE`，`ALL` 数组即声明顺序。
 
-`JudgeInput` 字段：`agent_id`、`session_id`、`engine`、`execution_active`、`stalled_end`、`last_end`、`open_tools`、`last_tool`、`permission_pending`、`screen`、`turn`、`last_error`、`evidence_seq`。`stalled_end` 来自当前执行的 `execution.end_stalled`（到 `execution.ended` 为止）：规则直接判 BLOCKED，attention 原因 `end_stalled`，不问判定器。
+`JudgeInput` 字段：`agent_id`、`session_id`、`engine`、`execution_active`、`stalled_end`、`last_end`、`open_tools`、`open_jobs`、`oldest_job_ms`、`last_tool`、`permission_pending`、`screen`、`turn`、`last_error`、`evidence_seq`。`stalled_end` 来自当前执行的 `execution.end_stalled`（到 `execution.ended` 为止）：规则直接判 BLOCKED，attention 原因 `end_stalled`，不问判定器。`open_jobs` 是当前执行里最近一次 `job.started` 之后没有 `job.ended` 的后台任务数（执行结束或新执行开始时清零；没有时不写进证据）：回合停在提示符（`turn.stopped` 或 Ready 屏）而 `open_jobs > 0` 时规则直接判 WORKING，原因 `WAITING_FOR_BACKGROUND_JOB`，不问判定器（[fleet-architecture.md](fleet-architecture.md) §2.2）；任务开了多久不改变这个结论，上限由调度器管（`SPAWN_STALL_JOB_SECS`）。
 
 Observer 每次 tick：
 
@@ -375,6 +377,8 @@ Bridge、Observer、调度器（`deliver.rs`、`dispatch.rs`）、集成器（`i
 审计第 1、2、3、9、16、23 条已修复（分支 `audit-stops`）：失败的 Stop，不论谁发的，调度器都从命令队列读出当前执行的 Stop 及其结果，换新键重发、等待加倍，三次后升级给 supervisor（`dispatch/stops.rs`）；集成器先提交中止的 Stop 再记 `task.aborted`；没打进去的 nudge 不算催过；人发的命令完成后才算消息，失败的照实说；`done-<episode>` 看记下的 `end_cause`；`dispatched` 保留当前回合的 nudge 与当前执行的 resume，关闭的临时任务在工人仍在跑时留在投递行里，批准与人的消息直到告知为止都算消息：不再凭 24 小时窗口判断“没发过”或“不是消息”。
 
 所有者的改动同样受它约束：线上的门禁脚本、场景、objective backlog 与维护脚本都来自控制器 `~/.local/share/spawn-rsi/controllers/<name>`（部署的那个提交的树，部署时原子切换，`deploy/controller.sh`），从不来自所有者的工作检出。否则检出里每次保存都立即生效，门禁还没评判过（曾经：改 gate.sh 改变了一个正在运行的门禁；提交到 `rsi/backlog` 的 objective 在部署前几秒内就被分派）。运行的东西必须是被评判过的东西的记录：**所有者的改动部署后才生效**。
+
+后台任务同样守这条规则（[fleet-architecture.md](fleet-architecture.md) §2.2）：工人是否在等自己的后台任务，只依据 Bridge 从会话记录读出的 `job.started` 与 `job.ended`（以及结束它所在执行的 `execution.ended`），从不依据屏幕上的 “N shells still running” 或 “N monitors still running”：屏尾只作为 Jev 看到的证据。停止任务要看 `TaskStop` 的结果说它停了，不看发出的调用（打算不等于做了）；任务开了多久用数据库的时钟（`spawn_now_ms()` 对 `job.started` 的 `recorded_at_ms`）。
 
 停滞的升级（`dispatch/stall.rs`，[fleet-architecture.md](fleet-architecture.md) §3 “Stalls”）同样守这条规则：每个未结任务所处的一步都从开始它的那条记录量起（控制记录的 id，或会话事实的 `session_seq`），年龄只用数据库的时钟（`spawn_now_ms()` 对 `recorded_at_ms`），从不凭“集成器最近没跑”之类的缺席推断；条目写明它量自哪条记录，标签里带着这条记录，所以每次停滞只升级一次，重启的 loop 算出同样的结果。
 
