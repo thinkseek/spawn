@@ -4,6 +4,11 @@
 //! Humans run them with the owner's login, the supervisor with its own; the
 //! SQL functions behind them decide who may do what (only a human approves a
 //! resident). Every command prints JSON.
+//!
+//! `spawn mission configure` changes only the settings it is given (objective
+//! 027): the database merges them into the mission's row under the append
+//! lock and records the whole result; a setting is cleared only by its own
+//! `--no-<setting>` switch.
 
 use serde_json::{Value, json};
 use spawn_core::event::ModelProfile;
@@ -12,13 +17,18 @@ use crate::{Flags, open_store};
 
 const USAGE: &str = "usage:
   spawn mission add --text <mission> [--source <git repo path or URL>] [<settings>]
-  spawn mission configure --id N [<settings>] [--clear <names>]   (owner only)
-      changes only the settings it is given and keeps the mission's others; --clear removes
-      some, a comma-separated list of gate, budget, minutes, tool-calls, objectives, workers
-      (e.g. --clear minutes,workers). Prints every setting the mission has after the change.
+  spawn mission configure --id N [<settings>] [<clearing switches>]   (owner only)
+      changes only the settings it is given and keeps every other as the mission has it;
+      the database merges them under its lock, checks the result and records it whole.
+      A setting is cleared only by its own switch, which takes no value: --no-gate,
+      --no-budget (both fields), --no-minutes, --no-tool-calls, --no-objectives,
+      --no-workers (back to the default 1); a switch and a value for the same setting
+      are refused. Prints {mission, before, after}; with nothing given it changes nothing.
+      Clearing the gate, or moving accept away from gate, waits while a task is landing.
       settings: --gate <scenarios dir> [--accept review|gate] [--minutes N] [--tool-calls N]
                 [--backlog <dir> --resident <name> [--workers N]]
-                (with add, all of them at once; with configure, any of them alone)
+                (with add, all of them at once; with configure, any of them alone, and
+                --backlog with --resident for a mission without objectives)
                 (--workers: objective tasks in flight at once, 1 to 16, default 1: the
                 resident takes one, per-task workers the rest)
   spawn mission resume --id N
@@ -161,6 +171,20 @@ fn split(rest: &[String]) -> Result<(&str, Flags), String> {
     Ok((verb.as_str(), Flags::parse(rest)?))
 }
 
+/// As [`split`], with `configure`'s clearing switches (`--no-gate`, ...),
+/// which take no value; every other verb and flag needs one as before.
+fn split_mission(rest: &[String]) -> Result<(&str, Flags), String> {
+    let Some((verb, rest)) = rest.split_first() else {
+        return Err(USAGE.to_string());
+    };
+    let switches: &[&str] = if verb == "configure" {
+        &CLEARING.map(|(switch, _, _)| switch)
+    } else {
+        &[]
+    };
+    Ok((verb.as_str(), Flags::parse_with_switches(rest, switches)?))
+}
+
 /// An absolute path for a directory flag, resolved against the working
 /// directory.
 fn directory(flags: &Flags, name: &str) -> Result<Option<String>, String> {
@@ -240,22 +264,25 @@ impl Settings {
     }
 }
 
-/// What `--clear` may name, and the setting (and key in it) each clears.
-const CLEARABLE: [(&str, &str, Option<&str>); 6] = [
-    ("gate", "gate", None),
-    ("budget", "budget", None),
-    ("minutes", "budget", Some("minutes")),
-    ("tool-calls", "budget", Some("tool_calls")),
-    ("objectives", "objectives", None),
-    ("workers", "objectives", Some("workers")),
+/// `configure`'s clearing switches (they take no value), and the setting
+/// (and key in it) each clears.
+const CLEARING: [(&str, &str, Option<&str>); 6] = [
+    ("no-gate", "gate", None),
+    ("no-budget", "budget", None),
+    ("no-minutes", "budget", Some("minutes")),
+    ("no-tool-calls", "budget", Some("tool_calls")),
+    ("no-objectives", "objectives", None),
+    ("no-workers", "objectives", Some("workers")),
 ];
 
-/// The change `spawn mission configure` asks for: only the settings its
-/// flags name, for `spawn_mission_reconfigure` to merge into the mission's
-/// own; `--clear a,b` sets the named ones to null. A setting both given and
-/// cleared, an unknown name, or no change at all is refused.
+/// The change `spawn mission configure` asks for (objective 027): only the
+/// settings its flags name, for `spawn_mission_reconfigure` to merge into
+/// the mission's own under the append lock; each `--no-<setting>` switch
+/// sets its setting to null, which clears it. A setting both given and
+/// cleared, or a flag configure does not know, is refused. No flag at all is
+/// an empty change, which changes and records nothing.
 fn change(flags: &Flags) -> Result<Value, String> {
-    const KNOWN: [&str; 9] = [
+    const KNOWN: [&str; 8] = [
         "id",
         "gate",
         "accept",
@@ -264,7 +291,6 @@ fn change(flags: &Flags) -> Result<Value, String> {
         "backlog",
         "resident",
         "workers",
-        "clear",
     ];
     if let Some(unknown) = flags.names().find(|name| !KNOWN.contains(name)) {
         return Err(format!(
@@ -326,35 +352,27 @@ fn change(flags: &Flags) -> Result<Value, String> {
         ("resident", "objectives", Some("resident")),
         ("workers", "objectives", Some("workers")),
     ];
-    for name in flags.get("clear").iter().flat_map(|list| list.split(',')) {
-        let name = name.trim();
-        let Some((_, setting, key)) = CLEARABLE.iter().find(|(flag, _, _)| *flag == name) else {
-            return Err(format!(
-                "--clear names gate, budget, minutes, tool-calls, objectives or workers, not \
-                 {name}\n{USAGE}"
-            ));
-        };
-        let conflict = written.iter().any(|(flag, written_setting, written_key)| {
+    for (switch, setting, key) in CLEARING {
+        if !flags.switch(switch) {
+            continue;
+        }
+        if let Some((flag, _, _)) = written.iter().find(|(flag, written_setting, written_key)| {
             flags.get(flag).is_some()
-                && written_setting == setting
-                && (key.is_none() || written_key == key)
-        });
-        if conflict {
+                && *written_setting == setting
+                && (key.is_none() || *written_key == key)
+        }) {
             return Err(format!(
-                "--clear {name} and a value for it together\n{USAGE}"
+                "--{switch} and --{flag} set the same setting: give one\n{USAGE}"
             ));
         }
-        part(setting, *key, Value::Null);
-    }
-    if change.is_empty() {
-        return Err(format!("nothing to change\n{USAGE}"));
+        part(setting, key, Value::Null);
     }
     Ok(Value::Object(change))
 }
 
 /// `spawn mission ...`
 pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
-    let (verb, flags) = split(rest)?;
+    let (verb, flags) = split_mission(rest)?;
     let store = open_store()?;
     let err = |error: spawn_core::port::StoreError| error.to_string();
     match verb {
@@ -518,7 +536,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{change, hold_bound, model};
+    use super::{change, hold_bound, model, split_mission};
     use crate::Flags;
 
     #[test]
@@ -539,58 +557,97 @@ mod tests {
         );
     }
 
-    #[test]
-    fn configure_clears_only_what_clear_names() {
-        assert_eq!(
-            change(&flags(&["--id", "4", "--clear", "minutes,workers"])),
-            Ok(json!({"budget": {"minutes": null}, "objectives": {"workers": null}}))
-        );
-        assert_eq!(
-            change(&flags(&["--id", "4", "--clear", "gate,objectives,budget"])),
-            Ok(json!({"gate": null, "objectives": null, "budget": null}))
-        );
-        assert_eq!(
-            change(&flags(&[
-                "--id",
-                "4",
-                "--minutes",
-                "30",
-                "--clear",
-                "tool-calls"
-            ])),
-            Ok(json!({"budget": {"minutes": 30, "tool_calls": null}}))
-        );
+    /// `configure`'s flags, its clearing switches taking no value.
+    fn configure(words: &[&str]) -> Result<serde_json::Value, String> {
+        let words: Vec<String> = ["configure"]
+            .iter()
+            .chain(words)
+            .map(ToString::to_string)
+            .collect();
+        let (_, flags) = split_mission(&words)?;
+        change(&flags)
     }
 
     #[test]
-    fn configure_refuses_an_empty_unknown_or_contradictory_change() {
+    fn configure_clears_only_what_its_switches_name() {
+        assert_eq!(
+            configure(&["--id", "4", "--no-minutes", "--no-workers"]),
+            Ok(json!({"budget": {"minutes": null}, "objectives": {"workers": null}}))
+        );
+        assert_eq!(
+            configure(&["--no-gate", "--id", "4", "--no-objectives", "--no-budget"]),
+            Ok(json!({"gate": null, "objectives": null, "budget": null}))
+        );
+        assert_eq!(
+            configure(&["--id", "4", "--minutes", "30", "--no-tool-calls"]),
+            Ok(json!({"budget": {"minutes": 30, "tool_calls": null}}))
+        );
+        assert_eq!(
+            configure(&["--id", "4", "--no-gate", "--accept", "review"]),
+            Ok(json!({"gate": null, "accept": "review"}))
+        );
+        // Nothing given: an empty change, which changes nothing.
+        assert_eq!(configure(&["--id", "4"]), Ok(json!({})));
+    }
+
+    #[test]
+    fn a_switch_takes_no_value_and_every_other_flag_still_needs_one() {
+        let refused = configure(&["--id", "4", "--no-gate", "yes"]).expect_err("a value");
+        assert!(refused.contains("--no-gate takes no value"), "{refused}");
+        let refused = configure(&["--id", "4", "--minutes"]).expect_err("no value");
+        assert!(refused.contains("--minutes needs a value"), "{refused}");
+        let refused = configure(&["--id", "4", "--minutes", "--no-budget"]).expect_err("a switch");
+        assert!(refused.contains("--minutes needs a value"), "{refused}");
+        // Only configure knows the switches.
+        let words: Vec<String> = ["close", "--id", "4", "--no-gate"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let refused = split_mission(&words).expect_err("not a switch of close");
+        assert!(refused.contains("--no-gate needs a value"), "{refused}");
+    }
+
+    #[test]
+    fn configure_refuses_an_unknown_flag_or_a_switch_with_a_value_for_its_setting() {
         for (words, said) in [
-            (vec!["--id", "4"], "nothing to change"),
             (
                 vec!["--id", "4", "--toolcalls", "600"],
                 "has no --toolcalls",
             ),
-            (vec!["--id", "4", "--clear", "accept"], "--clear names"),
+            (vec!["--id", "4", "--clear", "gate"], "has no --clear"),
             (
-                vec!["--id", "4", "--minutes", "5", "--clear", "budget"],
-                "together",
+                vec!["--id", "4", "--minutes", "5", "--no-budget"],
+                "same setting",
             ),
             (
-                vec!["--id", "4", "--minutes", "5", "--clear", "minutes"],
-                "together",
+                vec!["--id", "4", "--minutes", "5", "--no-minutes"],
+                "same setting",
             ),
             (
-                vec!["--id", "4", "--workers", "2", "--clear", "objectives"],
-                "together",
+                vec!["--id", "4", "--gate", "/", "--no-gate"],
+                "same setting",
             ),
             (
-                vec!["--id", "4", "--resident", "r", "--clear", "objectives"],
-                "together",
+                vec!["--id", "4", "--workers", "2", "--no-objectives"],
+                "same setting",
+            ),
+            (
+                vec!["--id", "4", "--resident", "r", "--no-objectives"],
+                "same setting",
+            ),
+            (
+                vec!["--id", "4", "--workers", "2", "--no-workers"],
+                "same setting",
             ),
         ] {
-            let refused = change(&flags(&words)).expect_err(said);
+            let refused = configure(&words).expect_err(said);
             assert!(refused.contains(said), "{words:?}: {refused}");
         }
+        // A switch and a value for different keys of one setting go together.
+        assert_eq!(
+            configure(&["--id", "4", "--workers", "2", "--no-minutes"]),
+            Ok(json!({"objectives": {"workers": 2}, "budget": {"minutes": null}}))
+        );
     }
 
     #[test]

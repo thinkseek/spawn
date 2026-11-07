@@ -2969,6 +2969,7 @@ fn settings(client: &mut Client, mission: i64) -> (serde_json::Value, serde_json
 /// every setting of mission 4: a change keeps what it does not name, and
 /// only an explicit null clears.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn a_partial_configure_keeps_the_other_settings_and_only_a_null_clears() {
     let (store, schema) = store("control_reconfigure");
     let mut client = admin(&schema);
@@ -2996,9 +2997,8 @@ fn a_partial_configure_keeps_the_other_settings_and_only_a_null_clears() {
     expected["budget"] = json!({"minutes": 90, "tool_calls": 600});
     assert_eq!(
         after,
-        json!({"mission": mission, "gate": expected["gate"],
-                             "accept": "gate", "budget": expected["budget"],
-                             "objectives": expected["objectives"]})
+        json!({"mission": mission, "before": full, "after": expected}),
+        "it says what the mission was and is"
     );
     assert_eq!(
         settings(&mut client, mission),
@@ -3029,8 +3029,25 @@ fn a_partial_configure_keeps_the_other_settings_and_only_a_null_clears() {
         (expected.clone(), expected.clone())
     );
 
-    // The result is checked as a whole, and a refusal records nothing.
+    // A change that sets nothing, or sets what the mission already has,
+    // changes and records nothing.
     let before = control_types(&mut client).len();
+    let same = json!({"mission": mission, "before": expected, "after": expected});
+    assert_eq!(
+        store
+            .mission_reconfigure(mission, &json!({}))
+            .expect("nothing"),
+        same
+    );
+    assert_eq!(
+        store
+            .mission_reconfigure(mission, &json!({"budget": {"tool_calls": 600}}))
+            .expect("the same value"),
+        same
+    );
+    assert_eq!(control_types(&mut client).len(), before, "nothing recorded");
+
+    // The result is checked as a whole, and a refusal records nothing.
     assert!(
         refusal(store.mission_reconfigure(mission, &json!({"gate": null})))
             .contains("objectives need a gate"),
@@ -3067,4 +3084,57 @@ fn a_partial_configure_keeps_the_other_settings_and_only_a_null_clears() {
         live,
         "the tables are the fold of the log"
     );
+}
+
+/// GitHub issue #9 (objective 027): clearing a gated mission's gate, or moving
+/// its accept away from gate, while one of its tasks is landing would leave
+/// that task where nothing lands it; it is refused, naming the task, and
+/// goes through once nothing is landing.
+#[test]
+fn a_gate_is_not_cleared_while_a_task_of_its_mission_is_landing() {
+    let (store, schema) = store("control_configure_landing");
+    let mut client = admin(&schema);
+    let mission = store
+        .mission_add("Landing", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(mission, Some("/scenarios"), "gate", None, None)
+        .expect("configure");
+    let task = task_in(&store, mission, "ephemeral", "w", "landing");
+    assert_eq!(task_state(&mut client, task), "landing");
+
+    let before = control_types(&mut client).len();
+    for change in [
+        json!({"gate": null}),
+        json!({"accept": "review"}),
+        json!({"gate": null, "accept": "review"}),
+    ] {
+        let refused = refusal(store.mission_reconfigure(mission, &change));
+        assert!(
+            refused.contains(&format!("task {task} is landing")),
+            "{change}: {refused}"
+        );
+    }
+    assert!(
+        refusal(store.mission_configure(mission, None, "gate", None, None)).contains("is landing"),
+        "the full configure refuses it too"
+    );
+    assert_eq!(control_types(&mut client).len(), before, "nothing recorded");
+    // What keeps the task landable still goes through.
+    store
+        .mission_reconfigure(mission, &json!({"budget": {"minutes": 30}}))
+        .expect("a budget while landing");
+
+    store
+        .integrator_record(&json!({"type": "task.landed", "id": task, "from": "b",
+                                   "to": format!("c{task}")}))
+        .expect("landed");
+    let after = store
+        .mission_reconfigure(mission, &json!({"gate": null, "accept": "review"}))
+        .expect("nothing is landing");
+    assert_eq!(after["after"]["gate"], json!(null));
+    assert_eq!(after["after"]["accept"], "review");
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(tables(&mut client), live);
 }

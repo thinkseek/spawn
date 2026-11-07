@@ -2180,6 +2180,8 @@ drop function if exists spawn_mission_configure(bigint, text, text, jsonb);
 create or replace function spawn_mission_configure(p_mission bigint, p_gate text, p_accept text,
                                                    p_budget jsonb, p_objectives jsonb)
 returns void language plpgsql security definer as $$
+declare
+    v_landing bigint;
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
@@ -2220,20 +2222,39 @@ begin
         raise exception 'mission % has a remote source: a gate lands only on a directory on this host',
                         p_mission;
     end if;
+    -- GitHub issue #9: a task in `landing` (accepted, not yet landed) is
+    -- landed by the integrator only while its mission has a gate it accepts
+    -- by; clearing the gate, or moving accept away from gate, would leave the
+    -- task where nothing lands it and `spawn task cancel` refuses it. So
+    -- neither goes through while a task of the mission is landing.
+    select k.id into v_landing
+      from mission_tasks k join mission_missions m on m.id = k.mission_id
+     where k.mission_id = p_mission and k.state = 'landing'
+       and ((m.gate is not null and p_gate is null)
+            or (m.accept = 'gate' and coalesce(p_accept, 'review') <> 'gate'))
+     order by k.id limit 1;
+    if v_landing is not null then
+        raise exception 'mission %: task % is landing; clearing the gate or moving accept away from gate waits until nothing lands',
+            p_mission, v_landing;
+    end if;
     perform spawn_control_record(jsonb_build_object(
         'type', 'mission.configured', 'id', p_mission, 'gate', p_gate,
         'accept', coalesce(p_accept, 'review'), 'budget', p_budget, 'objectives', p_objectives));
 end $$;
 
 -- Change some of a mission's settings and keep the rest (owner only;
--- `spawn mission configure`). `p_change` names only what changes: `gate`
--- and `accept` replace theirs when present (a JSON null gate clears it);
--- `budget` and `objectives` merge key by key into the current ones (a key
--- set to null is removed, the whole setting set to null is cleared, and one
--- left empty is cleared). The merge is read and recorded under the append
--- lock, so a concurrent change is never lost, and `spawn_mission_configure`
--- checks the result and records it whole: `mission.configured` always
--- carries every setting the mission has. Returns them.
+-- `spawn mission configure`, objective 027). `p_change` names only what
+-- changes: `gate` and `accept` replace theirs when present (a JSON null
+-- gate clears it); `budget` and `objectives` merge key by key into the
+-- current ones (a key set to null is removed, so `workers` falls back to
+-- its default 1; the whole setting set to null is cleared; one left empty
+-- is cleared). The result is computed from the mission's row read under
+-- the append lock that records it, so a concurrent change is never lost and
+-- no caller stores a configuration it did not read; `spawn_mission_configure`
+-- checks it and records it whole: `mission.configured` always carries every
+-- setting. A change that leaves the settings as they were records nothing.
+-- Returns `{mission, before, after}`, each `{gate, accept, budget,
+-- objectives}`.
 create or replace function spawn_mission_reconfigure(p_mission bigint, p_change jsonb)
 returns jsonb language plpgsql security definer as $$
 declare
@@ -2241,6 +2262,8 @@ declare
     v_accept text;
     v_budget jsonb;
     v_objectives jsonb;
+    v_before jsonb;
+    v_after jsonb;
     v_key text;
 begin
     perform pg_advisory_xact_lock(1399957335);
@@ -2260,6 +2283,11 @@ begin
     if not found then
         raise exception 'mission % is not open', p_mission;
     end if;
+    -- The fold stores a setting recorded as null as JSON null: no setting.
+    v_budget := nullif(v_budget, 'null'::jsonb);
+    v_objectives := nullif(v_objectives, 'null'::jsonb);
+    v_before := jsonb_build_object('gate', v_gate, 'accept', v_accept, 'budget', v_budget,
+                                   'objectives', v_objectives);
     if p_change ? 'gate' then
         v_gate := p_change ->> 'gate';
     end if;
@@ -2268,10 +2296,12 @@ begin
     end if;
     v_budget := spawn_settings_merge(v_budget, p_change, 'budget');
     v_objectives := spawn_settings_merge(v_objectives, p_change, 'objectives');
-    perform spawn_mission_configure(p_mission, v_gate, v_accept, v_budget, v_objectives);
-    return jsonb_build_object('mission', p_mission, 'gate', v_gate,
-                              'accept', coalesce(v_accept, 'review'),
-                              'budget', v_budget, 'objectives', v_objectives);
+    v_after := jsonb_build_object('gate', v_gate, 'accept', coalesce(v_accept, 'review'),
+                                  'budget', v_budget, 'objectives', v_objectives);
+    if v_after is distinct from v_before then
+        perform spawn_mission_configure(p_mission, v_gate, v_accept, v_budget, v_objectives);
+    end if;
+    return jsonb_build_object('mission', p_mission, 'before', v_before, 'after', v_after);
 end $$;
 
 -- One setting of `spawn_mission_reconfigure`: `p_current` with
@@ -2293,7 +2323,10 @@ begin
     if jsonb_typeof(v_change) is distinct from 'object' then
         raise exception 'a mission''s % is a JSON object, not %', p_name, v_change;
     end if;
-    v_merged := jsonb_strip_nulls(coalesce(p_current, '{}'::jsonb) || v_change);
+    -- Only this level's nulls are removed (jsonb_strip_nulls is deep).
+    select coalesce(jsonb_object_agg(key, value), '{}'::jsonb) into v_merged
+      from jsonb_each(coalesce(p_current, '{}'::jsonb) || v_change)
+     where jsonb_typeof(value) <> 'null';
     return case when v_merged = '{}'::jsonb then null else v_merged end;
 end $$;
 
