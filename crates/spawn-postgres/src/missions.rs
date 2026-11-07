@@ -1169,6 +1169,39 @@ impl PostgresStore {
         Ok(row.get(0))
     }
 
+    /// Whether a report of `task` with content digest `digest` was already
+    /// found unfinished for the task's current revision: its
+    /// `task.report_unfinished` record exists.
+    pub fn report_unfinished_recorded(&self, task: i64, digest: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .query_one(
+                "select spawn_task_report_unfinished_recorded($1, $2)",
+                &[&task, &digest],
+            )?
+            .get(0))
+    }
+
+    /// Record that a delivered task's report was not taken because it is
+    /// still a draft: its content's `digest`, the `markers` found, and the
+    /// note to its worker (`note`, its key, and `command`). False, and
+    /// nothing recorded, when that content was recorded already for the
+    /// task's revision, or the task is not delivered.
+    pub fn task_report_unfinished(
+        &self,
+        task: i64,
+        digest: &str,
+        markers: &Value,
+        note: &str,
+        command: i64,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .query_one(
+                "select spawn_task_report_unfinished($1, $2, $3, $4, $5)",
+                &[&task, &digest, markers, &note, &command],
+            )?
+            .get(0))
+    }
+
     /// The checkpoint the task's latest report names (`commit` of its latest
     /// `task.reported`): `None` for a report that names none (one recorded
     /// before reports named their checkpoint), or no report.

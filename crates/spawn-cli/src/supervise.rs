@@ -357,7 +357,7 @@ new one; anything you learned before is in your workspace and its reports."
         let resume = |facts: &LivenessFacts| {
             format!(
                 "Spawn restarted your engine (execution {} ended: {}). Continue your current \
-task; when it is finished, write `{REPORT}`.",
+task; when it is finished, write `{REPORT}` once, with everything done (draft anywhere else).",
                 facts.execution_id.as_deref().unwrap_or("none"),
                 facts.cause.as_deref().unwrap_or("unknown")
             )
