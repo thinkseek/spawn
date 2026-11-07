@@ -1809,6 +1809,7 @@ struct RestoreError {
 
 /// Fetch, check, restore, compare; the scratch database is dropped on every
 /// path after it was made.
+#[allow(clippy::too_many_lines)]
 fn restore_and_compare(
     settings: &Settings,
     drill_url: &str,
@@ -2361,7 +2362,7 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         fs::create_dir_all(root.join("agent_a")).expect("mkdir");
         fs::write(root.join("agent_a/new.jsonl"), b"x").expect("write");
         fs::write(root.join("agent_a/old.jsonl"), b"y").expect("write");
-        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 86_400);
+        let old = std::time::SystemTime::now() - std::time::Duration::from_hours(20 * 24);
         let file = fs::File::options()
             .write(true)
             .open(root.join("agent_a/old.jsonl"))
@@ -2369,8 +2370,7 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         file.set_modified(old).expect("touch");
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(0))
-            .unwrap_or(0);
+            .map_or(0, |elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(0));
         let files = window_files(&root, now_ms, 14).expect("window");
         let names: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
         assert_eq!(
