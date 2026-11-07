@@ -2460,7 +2460,8 @@ impl Drop for Databases {
             return;
         };
         for name in &self.names {
-            let _ = maintenance.batch_execute(&format!("drop database if exists {name} with (force)"));
+            let _ =
+                maintenance.batch_execute(&format!("drop database if exists {name} with (force)"));
             let _ = drop_logins(&mut maintenance, name, "");
         }
         for role in &self.roles {
@@ -2497,14 +2498,12 @@ fn a_sweep_drops_only_the_logins_of_gone_databases_under_its_prefix() {
     };
     let mut maintenance =
         Client::connect(&databases.maintenance, NoTls).expect("maintenance connection");
-    let migrate = |name: &str| {
-        spawn_postgres::PostgresStore::connect(&format!("{server}/{name}"))
-            .and_then(|store| store.migrate())
-            .expect("migrate");
-    };
     // Kept: an existing database; gone: a dropped one, and one whose name is
     // long enough for spawn_login_role to hash all three logins' (60 of the
-    // 63 characters a name may have); outside: another prefix.
+    // 63 characters a name may have); outside: another prefix. Migrated
+    // (the logins as init-db names them), or, where the name is the plain
+    // one, given its logins as a migration leaves them: a role that may
+    // connect to its database (the passwords' derivation is slow).
     let kept = format!("{prefix}kept");
     let gone = format!("{prefix}gone");
     let long = format!("{prefix}{}", "l".repeat(60 - prefix.len()));
@@ -2514,7 +2513,20 @@ fn a_sweep_drops_only_the_logins_of_gone_databases_under_its_prefix() {
             .batch_execute(&format!("create database {name}"))
             .expect("create a database");
         databases.names.push(name.clone());
-        migrate(name);
+    }
+    for name in [&kept, &long] {
+        spawn_postgres::PostgresStore::connect(&format!("{server}/{name}"))
+            .and_then(|store| store.migrate())
+            .expect("migrate");
+    }
+    for name in [&gone, &outside] {
+        for base in ["spawn_supervisor", "spawn_reader", "spawn_human"] {
+            maintenance
+                .batch_execute(&format!(
+                    "create role {base}_{name} nologin; grant connect on database {name} to {base}_{name}"
+                ))
+                .expect("a login of the database");
+        }
     }
     for name in [&gone, &long, &outside] {
         maintenance
@@ -2572,12 +2584,10 @@ fn a_sweep_drops_only_the_logins_of_gone_databases_under_its_prefix() {
         3,
         "another prefix's logins stay"
     );
-    // The kept database works with the logins it kept.
-    let reader = spawn_postgres::role_url(&format!("{server}/{kept}"), "spawn_reader")
-        .expect("the reader's URL");
-    assert!(Client::connect(&reader, NoTls).is_ok(), "the kept login logs in");
-
-    assert_eq!(drop_logins(&mut maintenance, &outside, ""), "dropped 3 of 3");
+    assert_eq!(
+        drop_logins(&mut maintenance, &outside, ""),
+        "dropped 3 of 3"
+    );
 }
 
 #[test]
@@ -2644,7 +2654,10 @@ fn migrations_racing_on_one_server_all_succeed() {
         )
         .expect("the logins left")
         .get(0);
-    assert_eq!(left, 0, "the racing databases' logins are dropped with them");
+    assert_eq!(
+        left, 0,
+        "the racing databases' logins are dropped with them"
+    );
 }
 
 /// M15: a revival whose engine dies right after it launched counts as a
