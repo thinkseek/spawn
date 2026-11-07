@@ -56,6 +56,7 @@ fn worker(state: SemanticState, idle: bool) -> Facts {
         last_delivery: None,
         model: ModelProfile::Default,
         resumed_young: 0,
+        failed_resume: None,
     }
 }
 
