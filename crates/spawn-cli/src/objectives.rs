@@ -312,15 +312,23 @@ fn ordered(task: &Task, backlog: &[Task], landings: &[Landing]) -> bool {
 
 /// What is wrong with the order `backlog` names: each `after` id the
 /// backlog does not hold (its objective waits until that id lands, which
-/// no task of this backlog can make happen), and each cycle of objectives
-/// that come after each other (none of them is ever assigned), once each,
-/// by id.
+/// no task of this backlog can make happen), and each set of objectives
+/// that come after each other (a strongly connected component of more than
+/// one, or one that comes after itself: none of them is ever assigned),
+/// once each, by id. Linear in the objectives and their `after` ids
+/// (Tarjan's components, without recursion): it runs in every dispatcher
+/// pass, and a long chain of objectives each after the ones before must
+/// cost no more than its length.
 pub(crate) fn order_problems(backlog: &[Task]) -> Vec<String> {
-    let ids: BTreeSet<u32> = backlog.iter().map(|task| task.id).collect();
+    let index: BTreeMap<u32, usize> = backlog
+        .iter()
+        .enumerate()
+        .map(|(at, task)| (task.id, at))
+        .collect();
     let mut problems = Vec::new();
     for task in backlog {
         for before in &task.after {
-            if !ids.contains(before) {
+            if !index.contains_key(before) {
                 problems.push(format!(
                     "objective {} comes after {before}, which the backlog does not hold: it \
                      waits until {before} lands",
@@ -329,41 +337,94 @@ pub(crate) fn order_problems(backlog: &[Task]) -> Vec<String> {
             }
         }
     }
-    let after: BTreeMap<u32, &[u32]> = backlog
+    let edges: Vec<Vec<usize>> = backlog
         .iter()
-        .map(|task| (task.id, task.after.as_slice()))
+        .map(|task| {
+            task.after
+                .iter()
+                .filter_map(|id| index.get(id).copied())
+                .collect()
+        })
         .collect();
-    let mut cycles: BTreeSet<Vec<u32>> = BTreeSet::new();
-    for start in after.keys() {
-        // Every path from `start` back to it, shortest first by search order.
-        let mut stack: Vec<Vec<u32>> = vec![vec![*start]];
-        while let Some(path) = stack.pop() {
-            let last = *path.last().unwrap_or(start);
-            for next in after.get(&last).copied().unwrap_or_default() {
-                if next == start {
-                    let lowest = path
-                        .iter()
-                        .position(|id| id == path.iter().min().unwrap_or(start));
-                    let mut cycle = path.clone();
-                    cycle.rotate_left(lowest.unwrap_or(0));
-                    cycles.insert(cycle);
-                } else if !path.contains(next) && after.contains_key(next) {
-                    let mut longer = path.clone();
-                    longer.push(*next);
-                    stack.push(longer);
+    let mut cycles: Vec<Vec<u32>> = components(&edges)
+        .into_iter()
+        .filter(|component| component.len() > 1 || edges[component[0]].contains(&component[0]))
+        .map(|component| {
+            let mut ids: Vec<u32> = component.iter().map(|at| backlog[*at].id).collect();
+            ids.sort_unstable();
+            ids
+        })
+        .collect();
+    cycles.sort();
+    for ids in cycles {
+        problems.push(if let [id] = ids.as_slice() {
+            format!("objective {id} comes after itself: it is never assigned")
+        } else {
+            let shown: Vec<String> = ids.iter().map(u32::to_string).collect();
+            format!(
+                "objectives {} come after each other: none of them is ever assigned",
+                shown.join(", ")
+            )
+        });
+    }
+    problems
+}
+
+/// The strongly connected components of the graph `edges` (node `n`'s
+/// successors are `edges[n]`), by Tarjan's algorithm with an explicit
+/// stack: O(nodes + edges).
+fn components(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    const UNSEEN: usize = usize::MAX;
+    let mut order = vec![UNSEEN; edges.len()];
+    let mut low = vec![0; edges.len()];
+    let mut on_stack = vec![false; edges.len()];
+    let mut stack = Vec::new();
+    let mut found = Vec::new();
+    let mut next = 0;
+    for root in 0..edges.len() {
+        if order[root] != UNSEEN {
+            continue;
+        }
+        // Each frame: a node and how many of its edges were followed.
+        let mut frames = vec![(root, 0)];
+        order[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(&mut (node, ref mut edge)) = frames.last_mut() {
+            if let Some(&target) = edges[node].get(*edge) {
+                *edge += 1;
+                if order[target] == UNSEEN {
+                    order[target] = next;
+                    low[target] = next;
+                    next += 1;
+                    stack.push(target);
+                    on_stack[target] = true;
+                    frames.push((target, 0));
+                } else if on_stack[target] {
+                    low[node] = low[node].min(order[target]);
                 }
+                continue;
+            }
+            frames.pop();
+            if let Some(&(parent, _)) = frames.last() {
+                low[parent] = low[parent].min(low[node]);
+            }
+            if low[node] == order[node] {
+                let mut component = Vec::new();
+                while let Some(member) = stack.pop() {
+                    on_stack[member] = false;
+                    component.push(member);
+                    if member == node {
+                        break;
+                    }
+                }
+                found.push(component);
             }
         }
     }
-    for cycle in cycles {
-        let mut shown: Vec<String> = cycle.iter().map(u32::to_string).collect();
-        shown.push(cycle[0].to_string());
-        problems.push(format!(
-            "objectives {} come after each other: none of them is ever assigned",
-            shown.join(" after ")
-        ));
-    }
-    problems
+    found
 }
 
 /// The objectives that fill `free` slots: the open ones without a task in
@@ -1378,11 +1439,32 @@ mod tests {
             [
                 "objective 33 comes after 99, which the backlog does not hold: it waits until \
                  99 lands",
-                "objectives 28 after 30 after 28 come after each other: none of them is ever \
-                 assigned",
-                "objectives 31 after 33 after 32 after 31 come after each other: none of them \
-                 is ever assigned",
+                "objectives 28, 30 come after each other: none of them is ever assigned",
+                "objectives 31, 32, 33 come after each other: none of them is ever assigned",
             ]
+        );
+        assert_eq!(
+            order_problems(&[task(30, &[30])]),
+            ["objective 30 comes after itself: it is never assigned"]
+        );
+        // A dense order with no cycle (each of 200 after every one before
+        // it, 19,900 edges) is checked at once: no path is enumerated.
+        let dense: Vec<Task> = (1..=200)
+            .map(|id| task(id, &(1..id).collect::<Vec<u32>>()))
+            .collect();
+        let started = std::time::Instant::now();
+        assert!(order_problems(&dense).is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+        let mut cyclic = dense.clone();
+        cyclic[0].after = vec![200];
+        assert_eq!(
+            order_problems(&cyclic).len(),
+            1,
+            "one component of all 200, said once"
         );
         let backlog = load_backlog(
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rsi/backlog"),

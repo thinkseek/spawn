@@ -238,10 +238,7 @@ pub(crate) fn objective_order(missions: &[Value]) -> Vec<Escalation> {
         .iter()
         .filter_map(|row| {
             let mission = row["mission"].as_i64()?;
-            let backlog =
-                crate::objectives::load_backlog(std::path::Path::new(row["backlog"].as_str()?))
-                    .ok()?;
-            let problems = crate::objectives::order_problems(&backlog);
+            let problems = backlog_problems(std::path::Path::new(row["backlog"].as_str()?))?;
             if problems.is_empty() {
                 return None;
             }
@@ -259,6 +256,52 @@ pub(crate) fn objective_order(missions: &[Value]) -> Vec<Escalation> {
             })
         })
         .collect()
+}
+
+/// What a backlog directory's files are now: each JSON file's name, size
+/// and modification time, by name.
+type Fingerprint = Vec<(std::ffi::OsString, u64, u128)>;
+
+fn fingerprint(directory: &std::path::Path) -> Option<Fingerprint> {
+    let mut files: Fingerprint = std::fs::read_dir(directory)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            let modified = metadata
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos());
+            Some((entry.file_name(), metadata.len(), modified))
+        })
+        .collect();
+    files.sort();
+    Some(files)
+}
+
+/// The order problems of the backlog in `directory`
+/// ([`crate::objectives::order_problems`]), parsed again only when its
+/// files' names, sizes or modification times changed: the dispatcher asks
+/// every pass, and the backlog is over a megabyte of JSON. `None` when the
+/// directory or a file cannot be read (the integrator reports that).
+fn backlog_problems(directory: &std::path::Path) -> Option<Vec<String>> {
+    type Cache = std::collections::BTreeMap<std::path::PathBuf, (Fingerprint, Vec<String>)>;
+    static CACHE: std::sync::Mutex<Cache> = std::sync::Mutex::new(Cache::new());
+    let now = fingerprint(directory)?;
+    if let Ok(cache) = CACHE.lock()
+        && let Some((seen, problems)) = cache.get(directory)
+        && *seen == now
+    {
+        return Some(problems.clone());
+    }
+    let problems =
+        crate::objectives::order_problems(&crate::objectives::load_backlog(directory).ok()?);
+    if let Ok(mut cache) = CACHE.lock() {
+        cache.insert(directory.to_path_buf(), (now, problems.clone()));
+    }
+    Some(problems)
 }
 
 /// The session of escalations about missions rather than an agent (a
