@@ -1020,6 +1020,46 @@ mod tests {
         assert!(plan.pending.is_empty(), "{:?}", plan.pending);
     }
 
+    /// Nothing a step decides depends on how often it ran: given the same
+    /// records and the same clock, a pass over them makes the same plan — the
+    /// same orders under the same idempotency keys — whether the step ran on
+    /// every pass or only on the one that saw them first. A re-submission of
+    /// the same key writes nothing (`spawn_submit`'s `on conflict do
+    /// nothing`), so the two schedules order the same work.
+    #[test]
+    fn the_same_facts_make_the_same_plan_however_often_the_step_ran() {
+        let mut resident = worker(judged(SemanticState::Waiting, 0.9));
+        resident.session_id = "session_resident_core".to_string();
+        resident.agent_id = "agent_resident_core".to_string();
+        resident.dispatched = vec![Sent {
+            id: Some(31),
+            key: "deliver-25-0".to_string(),
+            text: None,
+            created_at_ms: NOW - 10_001,
+            finished_at_ms: Some(NOW - 10_000),
+            succeeded: Some(false),
+            error: Some("pane state Busy does not accept input".to_string()),
+        }];
+        let work = Work {
+            tasks: serde_json::from_value(serde_json::json!([{
+                "id": 25, "mission_id": 1, "kind": "resident",
+                "agent_id": "agent_resident_core", "session_id": "session_resident_core",
+                "brief": "brief 25", "state": "assigned", "revisions": 0,
+                "mission_text": "m", "resident": "core", "charter": "c",
+            }]))
+            .expect("task rows"),
+            ..Work::default()
+        };
+        // The record is 10 s old: its not-ready wait (5 s) is over, so this
+        // pass retries it. Run the step again on the same records and the
+        // same clock: the same key, the same plan.
+        let first = decide_with(&[resident.clone()], &work, &[], false, NOW, "spawn");
+        let second = decide_with(&[resident], &work, &[], false, NOW, "spawn");
+        assert_eq!(first, second, "the same records make the same plan");
+        assert_eq!(first.orders.len(), 1, "{:?}", first.orders);
+        assert_eq!(first.orders[0].key, "deliver-25-0-retry-1");
+    }
+
     /// The digest `order` reached the supervisor: the tags it filed are
     /// told, as the dispatcher's facts read them back.
     fn delivered(supervisor: &mut Facts, order: &super::Order) {
