@@ -1839,6 +1839,7 @@ declare
 begin
     perform pg_advisory_xact_lock(1399957335);
     delete from mission_source_holds;
+    delete from spawn_alerts;
     delete from mission_tasks;
     delete from mission_residents;
     delete from mission_missions;

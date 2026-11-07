@@ -2079,9 +2079,16 @@ fn follow_stream(store: &PostgresStore, after: i64, json: bool) -> Result<i32, S
     let mut cursor = after;
     let mut out = std::io::stdout();
     loop {
-        let transitions = store
-            .alert_transitions(cursor, BATCH)
-            .map_err(|error| error.to_string())?;
+        let transitions = match store.alert_transitions(cursor, BATCH) {
+            Ok(transitions) => transitions,
+            Err(error) => {
+                // A read that failed is tried again: a stream that ends on
+                // one glitch tells nobody what happened after it.
+                eprintln!("spawn alerts: {error}");
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+        };
         for transition in transitions.as_array().into_iter().flatten() {
             let event_id = transition["event_id"].as_i64().unwrap_or_default();
             cursor = cursor.max(event_id);
