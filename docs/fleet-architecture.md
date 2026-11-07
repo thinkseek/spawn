@@ -1462,8 +1462,10 @@ record of what was judged (§14 of design.md).
      verdict; the gate aborts`, then `| stage gate aborted <ms>ms base:
      <name> again (unsolved needs two runs that agree)`, with the same
      `<name>` in both (a scenario's file name, no space, no `|`), the gate's
-     `| gate time:` line last when it printed one and nothing else after the
-     pair. That pair, with exit 4, is `host_fault` with the evidence
+     own trailing lines after them when it printed them — its `| base runs:`
+     phase line and its `| gate time:` line, whose `setup <n> s` is the
+     record's `setup_s` — and nothing else after the pair. That pair, with
+     exit 4, is `host_fault` with the evidence
      `base_disagrees`, not `aborted`: the task stays where it was, its
      revisions and note do not move, nothing goes back to the worker, and
      neither `gate_rejections` nor `gate_aborts` grows or resets. The record
