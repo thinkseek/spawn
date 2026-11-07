@@ -445,10 +445,18 @@ wait_for 30 turn_ended_after_busy || harness "the busy turn of task $task2 never
 settle_after_waiting two.txt
 wait_for 30 is_state "$task2" reported ||
     fail "(2) the second report was not collected within 30 s ($(explain))"
-wait_for 15 covered WAITING ||
+# The idle window starts covered: the latest fact and the count are read
+# while the latest observation covers that fact, so a fact landing between
+# the check and the reads is not taken for churn.
+idle_window_starts() {
+    covered WAITING || return 1
+    facts_before=$(latest_fact)
+    seen_before=$(observations)
+    covered WAITING && [ "$(latest_fact)" = "$facts_before" ] &&
+        [ "$(observations)" = "$seen_before" ]
+}
+wait_for 15 idle_window_starts ||
     fail "(1) after the second task, the latest judgement does not cover the latest fact ($(explain))"
-facts_before=$(latest_fact)
-seen_before=$(observations)
 sleep 20
 if [ "$(latest_fact)" = "$facts_before" ]; then
     assert_eq "$(observations)" "$seen_before" \
