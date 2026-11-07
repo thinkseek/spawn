@@ -207,15 +207,15 @@ impl InotifyWatch {
     fn drain_linux(&self) -> Vec<String> {
         use rustix::fs::inotify::ReadFlags;
         let mut state = self.lock();
-        state.pending.extend(std::mem::take(&mut state.recheck));
+        let recheck = std::mem::take(&mut state.recheck);
+        state.pending.extend(recheck);
         let changes = self.read_changes();
         let mut moved = BTreeSet::new();
         for change in changes {
             if change.flags & ReadFlags::QUEUE_OVERFLOW.bits() != 0 {
                 // Events were dropped: every key is due.
-                state
-                    .pending
-                    .extend(state.wanted.keys().map(|(key, _)| key.clone()));
+                let keys: Vec<String> = state.wanted.keys().map(|(key, _)| key.clone()).collect();
+                state.pending.extend(keys);
                 continue;
             }
             let Some(dir) = state.dirs.get(&change.descriptor) else {
