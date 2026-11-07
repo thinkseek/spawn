@@ -627,10 +627,11 @@ fn base_disagrees(stdout: &str) -> Option<BaseDisagrees> {
     if scenario.is_empty() {
         return None;
     }
-    let staged = stage
-        .strip_prefix(BASE_STAGE_HEAD)?
-        .split_once("ms ")?
-        .1
+    let (millis, rest) = stage.strip_prefix(BASE_STAGE_HEAD)?.split_once("ms ")?;
+    if millis.is_empty() || !millis.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let staged = rest
         .strip_prefix("base: ")?
         .strip_suffix(BASE_STAGE_SAID)?;
     (staged == scenario).then(|| BaseDisagrees {
