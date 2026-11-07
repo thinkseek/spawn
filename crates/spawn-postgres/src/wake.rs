@@ -189,7 +189,9 @@ mod tests {
             Some(0),
             "an unfinished command with no lease is due at once"
         );
-        let claimed = store.claim("worker-lease", 60_000).expect("claim");
+        let claimed = store
+            .claim("worker-lease", Duration::from_secs(60))
+            .expect("claim");
         assert!(claimed.is_some(), "the Bridge claims the command");
         let due = store.next_lease_ms().expect("lease").expect("a lease");
         assert!(due > 0, "the claimed command's lease dates the next pass");
