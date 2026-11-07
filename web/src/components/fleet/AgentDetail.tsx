@@ -4,7 +4,6 @@ import {
   History,
   Send,
   Sparkles,
-  Wrench,
 } from "lucide-react";
 import { useState } from "react";
 
@@ -41,7 +40,7 @@ import {
   RoleBadge,
   SectionLabel,
 } from "./bits";
-import { doingNow } from "./FleetBoard";
+import { DoingIcon, doingNow } from "./FleetBoard";
 import { InputBox } from "./InputBox";
 
 interface AgentDetailProps {
@@ -171,7 +170,7 @@ function AgentSummary({ agent }: { agent: FleetAgent }) {
       <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4 lg:grid-cols-8">
         <Fact label="Doing now" mono>
           <span className="inline-flex items-center gap-1">
-            {now.tool && <Wrench size={11} className="text-success" />}
+            <DoingIcon now={now} size={11} />
             {now.label}
           </span>
         </Fact>
