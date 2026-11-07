@@ -74,6 +74,23 @@ pub const END_ATTEMPTS: u32 = 20;
 /// clock.
 pub const END_RETRY_MS: i64 = 30_000;
 
+/// Backstop captures one pass takes at most (see [`BridgeConfig::screen_refresh`]):
+/// the screens that fell due are read over the next passes, so a fleet does
+/// not spend one pass capturing every pane and holding the next command.
+pub const BACKSTOPS_PER_PASS: usize = 2;
+
+/// Why a pass wants a live execution's pane read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wanted {
+    /// A command is in flight, a reading awaits its twin, or the transcript
+    /// has just held still: read it now.
+    Now,
+    /// Nothing changed for [`BridgeConfig::screen_refresh`]: the backstop.
+    Backstop,
+    /// Nothing to read.
+    Nothing,
+}
+
 /// The session and settings of one launch.
 ///
 /// Grouped so that [`Bridge::launch`] keeps a readable parameter list.
@@ -613,6 +630,8 @@ pub struct Bridge {
     /// the start of a pass: what an execution whose files are quiet is left
     /// alone for.
     touched: HashSet<String>,
+    /// Backstop captures taken this pass ([`BACKSTOPS_PER_PASS`]).
+    backstops: std::sync::atomic::AtomicUsize,
 }
 
 /// What [`Bridge::settle`] did with an open execution no runner runs.
@@ -656,6 +675,7 @@ impl Bridge {
             transcripts: None,
             held: HashMap::new(),
             touched: HashSet::new(),
+            backstops: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -879,6 +899,8 @@ impl Bridge {
                 self.queue.release(claimed, self.config.input_wait_retry)?;
             }
         }
+        self.backstops
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         // What changed in the engines' files since the last pass: a
         // transcript or an exit status is read when it is here, not on every
         // pass ([`Self::follow_output`]).
@@ -1419,7 +1441,7 @@ impl Bridge {
             || active.follow.dirty
             || self.due_to_read(active)
             || self.in_flight(session)
-            || self.capture_due(active)
+            || !matches!(self.screen_wanted(active), Wanted::Nothing)
     }
 
     /// Whether a command of this session is claimed and unfinished: the
@@ -1430,16 +1452,15 @@ impl Bridge {
             .any(|claimed| &claimed.session_id == session)
     }
 
-    /// Whether the pane is captured on this pass: a command is in flight on
-    /// the session, a reading awaits its twin, the transcript has held still
-    /// since the screen was last read, or the backstop is due.
-    fn capture_due(&self, active: &Active) -> bool {
+    /// Why this pass wants the pane read, if it does.
+    fn screen_wanted(&self, active: &Active) -> Wanted {
         let follow = &active.follow;
+        // No watch: read on every pass, as before watches.
         if self.config.watch.is_none() || follow.poll {
-            return true;
+            return Wanted::Now;
         }
         if follow.again {
-            return true;
+            return Wanted::Now;
         }
         let now = self.clock.now().0;
         if follow.fresh {
@@ -1447,16 +1468,38 @@ impl Bridge {
             // for the screen to say what the transcript cannot (the prompt
             // is back), then read it until two readings agree.
             let quiet = i64::try_from(self.config.screen_quiet.as_millis()).unwrap_or(i64::MAX);
-            return follow
+            return if follow
                 .growth
-                .is_none_or(|growth| now.saturating_sub(growth) >= quiet);
+                .is_none_or(|growth| now.saturating_sub(growth) >= quiet)
+            {
+                Wanted::Now
+            } else {
+                Wanted::Nothing
+            };
         }
         // The backstop: a screen that changes with nothing in the
         // transcript (a dialog, a crash to a shell).
-        follow.last_capture.is_none_or(|at| {
-            now.saturating_sub(at)
-                >= i64::try_from(self.config.screen_refresh.as_millis()).unwrap_or(i64::MAX)
-        })
+        let refresh = i64::try_from(self.config.screen_refresh.as_millis()).unwrap_or(i64::MAX);
+        if follow.last_capture.is_none_or(|at| now.saturating_sub(at) >= refresh) {
+            Wanted::Backstop
+        } else {
+            Wanted::Nothing
+        }
+    }
+
+    /// Whether the pane is captured on this pass: a change or a command in
+    /// flight is read at once, a backstop only within the passes' budget, so
+    /// a fleet whose screens fall due together does not spend one pass
+    /// capturing them all.
+    fn capture_due(&self, active: &Active) -> bool {
+        match self.screen_wanted(active) {
+            Wanted::Now => true,
+            Wanted::Nothing => false,
+            Wanted::Backstop => {
+                let taken = self.backstops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                taken < BACKSTOPS_PER_PASS
+            }
+        }
     }
 
     /// The engine's version, read from the execution's transcript: the
@@ -1494,6 +1537,9 @@ impl Bridge {
         session: &SessionId,
         active: &mut Active,
     ) -> Result<(), StoreError> {
+        if !self.capture_due(active) {
+            return Ok(());
+        }
         let Ok(pane) =
             self.terminals
                 .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
