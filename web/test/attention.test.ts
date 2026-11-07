@@ -401,3 +401,42 @@ test("told and unresolved items fold to a count when nothing is pending", () => 
   assert.equal(calm.told.length, 2, "folded, still counted");
   assert.equal(calm.count, needsHuman({ ...view, pending: [] }).count);
 });
+
+test("workers on their own background jobs are listed, never counted", () => {
+  const raw = answer() as Record<string, unknown>;
+  raw.on_own_jobs = [
+    {
+      session_id: "session_worker_gate_cache_92",
+      agent_id: "agent_worker_gate_cache_92",
+      judged_at_ms: NOW - 30_000,
+      jobs: [
+        { id: "bys3gpa46", kind: "monitor", started_at_ms: NOW - 15 * 60_000, age_ms: 15 * 60_000 },
+        { id: "a2adacaabc9f9b048", kind: "agent", started_at_ms: NOW - 5 * 60_000, age_ms: 5 * 60_000 },
+        { kind: "bash" },
+      ],
+    },
+    { agent_id: "no session" },
+  ];
+  const attention = normalizeAttention(raw);
+  assert.deepEqual(attention.on_own_jobs, [
+    {
+      session_id: "session_worker_gate_cache_92",
+      agent_id: "agent_worker_gate_cache_92",
+      judged_at_ms: NOW - 30_000,
+      jobs: [
+        { id: "bys3gpa46", kind: "monitor", started_at_ms: NOW - 15 * 60_000, age_ms: 15 * 60_000 },
+        { id: "a2adacaabc9f9b048", kind: "agent", started_at_ms: NOW - 5 * 60_000, age_ms: 5 * 60_000 },
+      ],
+    },
+  ]);
+  const without = normalizeAttention(answer());
+  assert.deepEqual(without.on_own_jobs, [], "an older server lists none");
+  const groups = attentionGroups(attention);
+  assert.equal(groups.onOwnJobs.length, 1);
+  assert.equal(groups.count, attentionGroups(without).count, "working, so not counted");
+  assert.equal(
+    needsHuman(attention).ids.has("session_worker_gate_cache_92"),
+    false,
+    "and not marked as needing a human",
+  );
+});

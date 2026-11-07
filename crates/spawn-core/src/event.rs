@@ -186,6 +186,83 @@ pub struct Fork {
     pub commit: CommitId,
 }
 
+/// What runs as a background job of the engine: work the agent started
+/// that goes on after its turn ends, and whose end the engine reports to
+/// the agent by waking it (docs/fleet-architecture.md §2, "Waiting on its
+/// own job").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    /// A shell command in the background: a Bash call with
+    /// `run_in_background`, or one the engine moved there (its timeout ran
+    /// out, or a message had to reach the agent).
+    Bash,
+    /// A Monitor: a command whose output lines the engine delivers as
+    /// events. It expires by itself (within an hour).
+    Monitor,
+    /// An Agent launched in the background (`isAsync`). It can run again
+    /// under the same id when a message resumes it; each run is a start
+    /// and an end of the job.
+    Agent,
+}
+
+impl JobKind {
+    /// Wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Monitor => "monitor",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+/// How a background job ended, as the engine reported it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobEnd {
+    /// It finished (exit status 0, or a Monitor's command ended).
+    Completed,
+    /// It finished with a failing status.
+    Failed,
+    /// The engine killed it (low memory, a stop from its UI).
+    Killed,
+    /// The agent stopped it (`TaskStop`, which succeeded), or the engine
+    /// marked it stopped (a job of an earlier engine process).
+    Stopped,
+    /// A Monitor that ran out its time.
+    Expired,
+    /// An end the engine named in a way this build does not know.
+    #[serde(other)]
+    Ended,
+}
+
+impl JobEnd {
+    /// The end a task notification's `<status>` names.
+    pub fn from_status(status: &str) -> Self {
+        match status.trim() {
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "killed" => Self::Killed,
+            "stopped" => Self::Stopped,
+            "expired" => Self::Expired,
+            _ => Self::Ended,
+        }
+    }
+
+    /// Wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Killed => "killed",
+            Self::Stopped => "stopped",
+            Self::Expired => "expired",
+            Self::Ended => "ended",
+        }
+    }
+}
+
 /// Source-independent event vocabulary. Wire names are stable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "name", content = "detail")]
@@ -280,6 +357,29 @@ pub enum EventKind {
     TurnFailed {
         /// Engine error text, truncated.
         error: String,
+    },
+    /// The agent started a background job ([`JobKind`]), read from its
+    /// transcript: the job's id as the engine named it. When it started is
+    /// the record's time. A job is open only within its execution: the
+    /// execution's end (or the start of the next, a resume) closes it. An
+    /// Agent resumed under its id starts again: the job is open when its
+    /// latest start has no later end.
+    #[serde(rename = "job.started")]
+    JobStarted {
+        /// The engine's task id (`b8w03og7k`, an Agent's `a5e451ae390ad7923`).
+        job_id: String,
+        /// Bash, Monitor or Agent.
+        kind: JobKind,
+    },
+    /// A background job ended, read from the transcript: the engine's
+    /// notification of it, or the agent's `TaskStop` that succeeded. When it
+    /// ended is the record's time. It ends the job's latest start before it.
+    #[serde(rename = "job.ended")]
+    JobEnded {
+        /// The engine's task id.
+        job_id: String,
+        /// How it ended.
+        how: JobEnd,
     },
     /// An execution started in a terminal against a workspace. The
     /// terminal is [`crate::id::TerminalName::for_execution`] of the event's
@@ -440,6 +540,8 @@ impl EventKind {
             Self::ToolFailed { .. } => "tool.failed",
             Self::TurnStopped { .. } => "turn.stopped",
             Self::TurnFailed { .. } => "turn.failed",
+            Self::JobStarted { .. } => "job.started",
+            Self::JobEnded { .. } => "job.ended",
             Self::ExecutionStarted { .. } => "execution.started",
             Self::ExecutionEnded { .. } => "execution.ended",
             Self::ExecutionEndStalled { .. } => "execution.end_stalled",

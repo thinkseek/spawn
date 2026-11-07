@@ -48,8 +48,22 @@ export interface Judgement {
   fingerprint: string | null;
 }
 
+/** A background job the agent's live execution started and that has not
+ * ended (a Bash in the background, a Monitor, a background Agent), from its
+ * transcript. */
+export interface BackgroundJob {
+  id: string;
+  /** `bash`, `monitor` or `agent`. */
+  kind: string;
+  started_at_ms: number | null;
+  /** Its age when the board was read, on the database's clock. */
+  age_ms: number | null;
+}
+
 export interface Activity {
   current_tool: string | null;
+  /** Open background jobs of the live execution, oldest first. */
+  jobs: BackgroundJob[];
   last_event_name: string | null;
   last_event_at_ms: number | null;
   event_count: number | null;
@@ -289,6 +303,22 @@ export function normalizeJudgement(value: unknown): Judgement | null {
   };
 }
 
+function normalizeJobs(value: unknown): BackgroundJob[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    const raw = object(entry);
+    const id = optionalText(raw.id);
+    return id
+      ? [{
+          id,
+          kind: text(raw.kind) || "job",
+          started_at_ms: optionalNumber(raw.started_at_ms),
+          age_ms: optionalNumber(raw.age_ms),
+        }]
+      : [];
+  });
+}
+
 function normalizeAgent(value: unknown): FleetAgent | null {
   const raw = object(value);
   const sessionId = text(raw.session_id);
@@ -315,6 +345,7 @@ function normalizeAgent(value: unknown): FleetAgent | null {
     task: optionalText(raw.task),
     activity: {
       current_tool: optionalText(activity.current_tool),
+      jobs: normalizeJobs(activity.jobs),
       last_event_name: optionalText(activity.last_event_name),
       last_event_at_ms: optionalNumber(activity.last_event_at_ms),
       event_count: optionalNumber(activity.event_count),
@@ -555,7 +586,35 @@ export function ambiguityQuestion(ambiguity: string | null): string | null {
 const REASON_TEXT: Record<string, string> = {
   JUDGE_UNAVAILABLE: "No judge answered (Jev unreachable or not configured), showing the rules' guess",
   WAITING_FOR_USER_INPUT: "Waiting for user input",
+  WAITING_FOR_BACKGROUND_JOB:
+    "Working on its own background job: its turn ended while a job it started still runs, and the engine wakes it when the job reports",
 };
+
+/** Whether the rules judged the agent at its prompt waiting on a background
+ * job of its own: working, not idle (no Jev call, nothing escalated). */
+export function onOwnJob(agent: FleetAgent): boolean {
+  return agent.live && agent.judgement?.reason === "WAITING_FOR_BACKGROUND_JOB";
+}
+
+/** A job's age as a short duration (`12m`, `2h 05m`), from the server's
+ * reading, else from its start by this clock. */
+export function jobAge(job: BackgroundJob, now = Date.now()): string {
+  const ms = job.age_ms ?? (job.started_at_ms === null ? null : now - job.started_at_ms);
+  if (ms === null || !Number.isFinite(ms)) return "—";
+  const minutes = Math.floor(Math.max(0, ms) / 60_000);
+  if (minutes < 1) return `${Math.floor(Math.max(0, ms) / 1_000)}s`;
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+/** One line for the agent's open background jobs: the oldest, its age, and
+ * how many more. Null when none is open. */
+export function jobsText(jobs: BackgroundJob[]): string | null {
+  const [oldest, ...rest] = jobs;
+  if (!oldest) return null;
+  const more = rest.length > 0 ? ` (+${rest.length} more)` : "";
+  return `${oldest.kind} ${oldest.id} · ${jobAge(oldest)}${more}`;
+}
 
 export function reasonText(reason: string | null): string | null {
   if (!reason) return null;

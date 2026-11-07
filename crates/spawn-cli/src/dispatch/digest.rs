@@ -68,6 +68,7 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::GateHostFault => "host faults at the gate (the host's, not the work's)",
         Why::Stalled => "stalled",
         Why::Charter => "new charter not typed",
+        Why::BackgroundJob => "background job past its bound",
     }
 }
 

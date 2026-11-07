@@ -41,6 +41,14 @@ pub struct JudgeInput {
     pub exit_code: Option<i32>,
     /// Number of tool calls still open.
     pub open_tools: usize,
+    /// Number of background jobs the running execution started that have
+    /// not ended (`job.started` without its `job.ended`): work the engine
+    /// wakes the agent for when it reports. Left out when none.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub open_jobs: usize,
+    /// Milliseconds since the oldest of those jobs started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_job_ms: Option<u64>,
     /// Tool that started last.
     pub last_tool: Option<String>,
     /// Whether a permission dialog is open.
@@ -76,6 +84,11 @@ pub struct JudgeInput {
     /// instructions rather than completing.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub perpetual: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes a reference
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 /// How the latest turn ended.

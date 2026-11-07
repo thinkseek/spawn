@@ -57,6 +57,7 @@ fn worker(state: SemanticState, idle: bool) -> Facts {
         model: ModelProfile::Default,
         resumed_young: 0,
         charter: None,
+        jobs: Vec::new(),
     }
 }
 
@@ -201,11 +202,20 @@ fn a_worker_idle_at_its_prompt_with_no_report_is_at_activity_too() {
 }
 
 /// Task 33: a resident ran clippy, the tests and the e2e in background
-/// shells for over 15 minutes, at its prompt, with no events. Its screen
-/// says the shells still run: that is activity.
+/// shells for over 15 minutes, at its prompt, with no events. Its transcript
+/// says the jobs it started have not ended: it works on them. The screen
+/// saying "shells still running" is no rule: without the records it stalls.
 #[test]
-fn a_worker_whose_screen_shows_background_shells_running_is_not_stalled() {
-    let facts = [worker(SemanticState::Waiting, true)];
+fn a_worker_at_its_prompt_with_a_background_job_open_is_not_stalled() {
+    let job = crate::dispatch::Job {
+        id: "b8w03og7k".to_string(),
+        kind: "bash".to_string(),
+        event_id: 130,
+        started_at_ms: NOW - 1_950_000,
+        age_ms: 1_950_000,
+    };
+    let mut waiting = worker(SemanticState::Working, true);
+    waiting.jobs = vec![job];
     let tasks = work(&[row(7, "delivered", SESSION)]);
     let found = stalls(json!({
         "tasks": [open(7, "delivered", (140, "task.delivered", 2_000_000))],
@@ -213,7 +223,17 @@ fn a_worker_whose_screen_shows_background_shells_running_is_not_stalled() {
                       "at_ms": NOW - 1_900_000,
                       "screen": "✻ Sautéed for 6s · done 11:27 PM · 3 shells still running"}],
     }));
-    assert!(items(&facts, &tasks, &found, &bounds()).is_empty());
+    assert!(items(&[waiting.clone()], &tasks, &found, &bounds()).is_empty());
+    // Its turn going again ends the wait: the step is measured as ever.
+    let mut running = waiting.clone();
+    running.turn_ended = false;
+    assert_eq!(items(&[running], &tasks, &found, &bounds()).len(), 1);
+    // No job open, whatever the screen says: stalled.
+    let idle = worker(SemanticState::Waiting, true);
+    assert_eq!(
+        only(&items(&[idle], &tasks, &found, &bounds())).id,
+        "stall-7-activity-20"
+    );
 }
 
 #[test]
@@ -408,8 +428,13 @@ fn a_bound_that_is_not_a_whole_number_of_seconds_warns_and_keeps_its_default() {
         [600_000, 900_000, 1_800_000, 3_600_000]
     );
     assert_eq!(
-        [defaults.landing, defaults.stop, defaults.halted],
-        [600_000, 300_000, 0]
+        [
+            defaults.landing,
+            defaults.stop,
+            defaults.halted,
+            defaults.job
+        ],
+        [600_000, 300_000, 0, 7_200_000]
     );
 }
 

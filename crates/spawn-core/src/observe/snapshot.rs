@@ -1,10 +1,10 @@
 //! The facts the Observer keeps for one session, folded from the log.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use super::SCREEN_STALE;
 use super::judge::{JudgeInput, TurnFact};
-use crate::event::{CommandStep, EndCause, EventKind, EventRecord, SessionSeq, Source};
+use crate::event::{CommandStep, EndCause, EventKind, EventRecord, JobKind, SessionSeq, Source};
 use crate::id::{AgentId, ExecutionId, SessionId, WorkspaceId};
 use crate::screen::ScreenState;
 use crate::time::Timestamp;
@@ -25,6 +25,10 @@ pub(super) struct Snapshot {
     stalled_end: Option<EndCause>,
     last_end: Option<EndCause>,
     open_tools: HashSet<String>,
+    /// The background jobs the current execution started and that have not
+    /// ended, by id, with their kind and when they started. A turn's end
+    /// leaves them open; the execution's end or the next start closes them.
+    open_jobs: BTreeMap<String, (JobKind, Timestamp)>,
     last_tool: Option<String>,
     permission_pending: bool,
     screen: Option<ScreenState>,
@@ -97,6 +101,7 @@ impl Snapshot {
                 self.last_end = Some(*cause);
                 self.exit_code = *exit_code;
                 self.open_tools.clear();
+                self.open_jobs.clear();
                 // The pane is gone with the execution; nothing on it is a
                 // current fact any more.
                 self.screen = None;
@@ -139,6 +144,7 @@ impl Snapshot {
                 self.turn = Some(TurnFact::Stopped);
                 self.open_tools.clear();
             }
+            EventKind::JobStarted { .. } | EventKind::JobEnded { .. } => self.job(record),
             EventKind::TurnFailed { error } => {
                 self.turn = Some(TurnFact::Failed);
                 self.last_error = Some(error.clone());
@@ -179,6 +185,26 @@ impl Snapshot {
         }
     }
 
+    /// A background job started or ended. A start recorded for an earlier
+    /// execution opens nothing: its jobs died with it. An Agent resumed
+    /// under its id starts again after its end: open again, as of the new
+    /// start.
+    fn job(&mut self, record: &EventRecord) {
+        match &record.event.kind {
+            EventKind::JobStarted { job_id, kind }
+                if record.event.execution_id.is_none()
+                    || record.event.execution_id == self.execution =>
+            {
+                self.open_jobs
+                    .insert(job_id.clone(), (*kind, record.recorded_at));
+            }
+            EventKind::JobEnded { job_id, .. } => {
+                self.open_jobs.remove(job_id);
+            }
+            _ => {}
+        }
+    }
+
     /// A new execution: what the previous one showed is gone.
     fn started(&mut self, engine: &str, workspace: &WorkspaceId, execution: Option<&ExecutionId>) {
         self.engine = Some(engine.to_string());
@@ -189,6 +215,7 @@ impl Snapshot {
         self.last_end = None;
         self.exit_code = None;
         self.open_tools.clear();
+        self.open_jobs.clear();
         self.permission_pending = false;
         self.screen = None;
         self.turn = None;
@@ -228,6 +255,8 @@ impl Snapshot {
             last_end: self.last_end,
             exit_code: self.exit_code,
             open_tools: self.open_tools.len(),
+            open_jobs: self.open_jobs.len(),
+            oldest_job_ms: self.open_jobs.values().map(|(_, at)| since(*at)).max(),
             last_tool: self.last_tool.clone(),
             permission_pending: self.permission_pending,
             screen,
