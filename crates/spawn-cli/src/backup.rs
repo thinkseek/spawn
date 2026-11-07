@@ -48,9 +48,9 @@
 //! database password to libpq through `PGPASSWORD`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -59,8 +59,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use spawn_postgres::PostgresStore;
 
-use crate::config::{env_or, env_value, open_store, workspace_root};
 use crate::Flags;
+use crate::config::{env_or, env_value, open_store, workspace_root};
 
 /// The default limits, in decimal megabytes (1,000,000 bytes each): R2's
 /// free tier is 10 GB-month of storage, and the owner's alert is at 8 GB.
@@ -236,8 +236,7 @@ fn mode_of(path: &Path) -> Option<u32> {
 /// A file the owner made mode 600 and did not leave empty: a passphrase or
 /// an environment. Its content is never printed.
 fn private_file(path: &Path, what: &str) -> Result<(), String> {
-    let meta = fs::metadata(path)
-        .map_err(|error| format!("{what} {}: {error}", path.display()))?;
+    let meta = fs::metadata(path).map_err(|error| format!("{what} {}: {error}", path.display()))?;
     if !meta.is_file() {
         return Err(format!("{what} {} is not a file", path.display()));
     }
@@ -444,8 +443,7 @@ fn random_hex(bytes: usize) -> Result<String, String> {
 
 /// sha256 of a file.
 fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file =
-        File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
@@ -471,8 +469,8 @@ fn md5_file(path: &Path) -> Result<String, String> {
 pub(crate) fn md5_hex(bytes: &[u8]) -> String {
     const S: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
-        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6,
-        10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
     ];
     const K: [u32; 64] = [
         0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
@@ -493,7 +491,8 @@ pub(crate) fn md5_hex(bytes: &[u8]) -> String {
         message.push(0);
     }
     message.extend_from_slice(&bits.to_le_bytes());
-    let (mut a0, mut b0, mut c0, mut d0) = (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
+    let (mut a0, mut b0, mut c0, mut d0) =
+        (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
     for chunk in message.chunks(64) {
         let mut m = [0u32; 16];
         for (index, word) in chunk.chunks(4).enumerate() {
@@ -598,13 +597,14 @@ impl Stamp {
         for start in 0..bytes.len().saturating_sub(14) {
             let candidate = &text[start..start + 15];
             let bytes = candidate.as_bytes();
-            if bytes[8] != b'-'
-                || !bytes[..8].iter().chain(&bytes[9..]).all(u8::is_ascii_digit)
-            {
+            if bytes[8] != b'-' || !bytes[..8].iter().chain(&bytes[9..]).all(u8::is_ascii_digit) {
                 continue;
             }
             let number = |a: usize, b: usize| -> i64 {
-                candidate.get(a..b).and_then(|part| part.parse().ok()).unwrap_or(0)
+                candidate
+                    .get(a..b)
+                    .and_then(|part| part.parse().ok())
+                    .unwrap_or(0)
             };
             let day = days_from_civil(number(0, 4), number(4, 6), number(6, 8));
             let seconds = number(9, 11) * 3600 + number(11, 13) * 60 + number(13, 15);
@@ -979,7 +979,11 @@ struct DumpRecord {
 
 fn dump_records(store: &PostgresStore, now_ms: i64) -> Result<Vec<DumpRecord>, String> {
     let records = store
-        .backup_records("backup.dumped", now_ms.saturating_sub(400 * 86_400_000), 10_000)
+        .backup_records(
+            "backup.dumped",
+            now_ms.saturating_sub(400 * 86_400_000),
+            10_000,
+        )
         .map_err(|error| error.to_string())?;
     Ok(records
         .as_array()
@@ -995,10 +999,7 @@ fn dump_records(store: &PostgresStore, now_ms: i64) -> Result<Vec<DumpRecord>, S
 /// `pg_dump -Fc` of the database, its password in the environment.
 fn pg_dump(settings: &Settings, url: &PgUrl, out: &Path) -> Result<(), String> {
     let mut command = Command::new(settings.pg_tool("pg_dump"));
-    command
-        .arg("-Fc")
-        .arg("--no-owner")
-        .arg("--no-acl");
+    command.arg("-Fc").arg("--no-owner").arg("--no-acl");
     if !settings.compress.trim().is_empty() {
         command.arg("-Z").arg(&settings.compress);
     }
@@ -1034,7 +1035,10 @@ fn count_events(settings: &Settings, scratch: &Scratch, dump: &Path) -> Result<(
         .arg(dump);
     let (ok, _stdout, stderr) = output(command, "pg_restore")?;
     if !ok {
-        return Err(format!("pg_restore (to count the archive): {}", stderr.trim()));
+        return Err(format!(
+            "pg_restore (to count the archive): {}",
+            stderr.trim()
+        ));
     }
     let text = fs::read_to_string(scratch.join("events.sql"))
         .map_err(|error| format!("the archive's events: {error}"))?;
@@ -1194,7 +1198,12 @@ fn list_bucket(settings: &Settings) -> Result<(u64, Vec<(String, u64)>), String>
 }
 
 fn first_line(text: &str) -> String {
-    text.lines().next().unwrap_or("").chars().take(160).collect()
+    text.lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(160)
+        .collect()
 }
 
 fn percent_encode(text: &str) -> String {
@@ -1256,7 +1265,11 @@ struct BundleRecord {
 
 fn bundle_records(store: &PostgresStore, now_ms: i64) -> Result<Vec<BundleRecord>, String> {
     let records = store
-        .backup_records("backup.bundled", now_ms.saturating_sub(400 * 86_400_000), 10_000)
+        .backup_records(
+            "backup.bundled",
+            now_ms.saturating_sub(400 * 86_400_000),
+            10_000,
+        )
         .map_err(|error| error.to_string())?;
     Ok(records
         .as_array()
@@ -1323,8 +1336,14 @@ fn heads_of(source: &str) -> Result<BTreeMap<String, String>, String> {
     let (ok, stdout, stderr) = output(
         {
             let mut command = Command::new("git");
-            command.args(["-C", source, "for-each-ref", "--format=%(objectname) %(refname)",
-                          "refs/heads", "refs/tags"]);
+            command.args([
+                "-C",
+                source,
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                "refs/heads",
+                "refs/tags",
+            ]);
             command
         },
         "git for-each-ref",
@@ -1360,9 +1379,19 @@ fn source_name(source: &str, taken: &mut BTreeSet<String>, index: usize) -> Stri
         .next()
         .unwrap_or("source")
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect::<String>();
-    let base = if base.is_empty() { format!("source-{index}") } else { base };
+    let base = if base.is_empty() {
+        format!("source-{index}")
+    } else {
+        base
+    };
     let mut name = base.clone();
     let mut suffix = 1;
     while !taken.insert(name.clone()) {
@@ -1422,7 +1451,11 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
         let base_size = base
             .and_then(|base| base.record["transcripts"]["sizes"].get(path))
             .and_then(Value::as_u64);
-        let offset = if full { 0 } else { transcript_offset(base_size, *size) };
+        let offset = if full {
+            0
+        } else {
+            transcript_offset(base_size, *size)
+        };
         if !full && offset >= *size {
             continue;
         }
@@ -1442,7 +1475,9 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
     let mut missing: Vec<String> = Vec::new();
     let mut taken = BTreeSet::new();
     for (index, source) in sources.iter().enumerate() {
-        let Some(source) = source.as_str() else { continue };
+        let Some(source) = source.as_str() else {
+            continue;
+        };
         let Ok(heads) = heads_of(source) else {
             missing.push(source.to_string());
             continue;
@@ -1459,9 +1494,9 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
         let unchanged = !full
             && base.is_some()
             && base_heads.len() == heads.len()
-            && heads
-                .iter()
-                .all(|(name, commit)| base_heads.get(name).and_then(Value::as_str) == Some(commit.as_str()));
+            && heads.iter().all(|(name, commit)| {
+                base_heads.get(name).and_then(Value::as_str) == Some(commit.as_str())
+            });
         if unchanged {
             repos_record.push(json!({
                 "source": source, "heads": heads, "refs": refs, "bytes": 0, "unchanged": true,
@@ -1515,7 +1550,12 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
     let (ok, _stdout, stderr) = output(
         {
             let mut command = Command::new("tar");
-            command.arg("-C").arg(&staging).arg("-cf").arg(&tar).arg(".");
+            command
+                .arg("-C")
+                .arg(&staging)
+                .arg("-cf")
+                .arg(&tar)
+                .arg(".");
             command
         },
         "tar",
@@ -1540,11 +1580,7 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
 
     let held = list_bucket(&settings)?.0;
     let tier = if full { "full" } else { "incr" };
-    let key = format!(
-        "bundles/{}/spawn-bundle-{}.tar.gpg",
-        tier,
-        now.text()
-    );
+    let key = format!("bundles/{}/spawn-bundle-{}.tar.gpg", tier, now.text());
     let mut keys: Vec<String> = Vec::new();
     let mut skipped: Vec<Value> = Vec::new();
     let mut written = 0u64;
@@ -1596,15 +1632,18 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
         bytes,
         transcript_entries.len(),
         transp_bytes,
-        if keys.is_empty() { "nothing".to_string() } else { keys.join(", ") }
+        if keys.is_empty() {
+            "nothing".to_string()
+        } else {
+            keys.join(", ")
+        }
     );
     Ok(0)
 }
 
 /// Copy `size - offset` bytes from `offset` of `source` to `target`.
 fn append_slice(source: &Path, target: &Path, offset: u64, size: u64) -> Result<(), String> {
-    let mut file =
-        File::open(source).map_err(|error| format!("{}: {error}", source.display()))?;
+    let mut file = File::open(source).map_err(|error| format!("{}: {error}", source.display()))?;
     let mut out = File::create(target).map_err(|error| format!("{}: {error}", target.display()))?;
     if offset > 0 {
         use std::io::{Seek, SeekFrom};
@@ -1631,7 +1670,10 @@ fn append_slice(source: &Path, target: &Path, offset: u64, size: u64) -> Result<
 /// A git bundle of every ref of `source`, but not `not`'s commits.
 fn git_bundle(source: &str, file: &Path, not: &[String]) -> Result<(), String> {
     let mut command = Command::new("git");
-    command.args(["-C", source, "bundle", "create"]).arg(file).arg("--all");
+    command
+        .args(["-C", source, "bundle", "create"])
+        .arg(file)
+        .arg("--all");
     if !not.is_empty() {
         command.arg("--not");
         for commit in not {
@@ -1661,14 +1703,22 @@ fn verify(flags: &Flags) -> Result<i32, String> {
         Ok(settings) => settings,
         Err(error) => {
             eprintln!("spawn backup verify: {error}");
-            record_verified(None, false, &error, &json!({}), &Drilled::default(), started);
+            record_verified(
+                None,
+                false,
+                &error,
+                &json!({}),
+                &Drilled::default(),
+                started,
+            );
             return Ok(2);
         }
     };
     let _lock = Lock::acquire(&settings.root)?;
     let store = open_store()?;
     let Some(drill_url) = settings.drill_url.clone() else {
-        let reason = "SPAWN_BACKUP_DRILL_DATABASE_URL is not set: the drill has no server to restore into";
+        let reason =
+            "SPAWN_BACKUP_DRILL_DATABASE_URL is not set: the drill has no server to restore into";
         record_verified(
             Some(&store),
             false,
@@ -1702,7 +1752,10 @@ fn verify(flags: &Flags) -> Result<i32, String> {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let expected_sha = latest.record["sha256"].as_str().unwrap_or_default().to_string();
+    let expected_sha = latest.record["sha256"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     let expected = json!({
         "events": latest.record["events"],
         "max_event_id": latest.record["max_event_id"],
@@ -1721,7 +1774,11 @@ fn verify(flags: &Flags) -> Result<i32, String> {
     let mut record = naming;
     record["events"] = json!(drilled.events);
     record["max_event_id"] = json!(drilled.max_event_id);
-    record["server"] = json!(parse_pg_url(&drill_url).map(|url| url.server()).unwrap_or_default());
+    record["server"] = json!(
+        parse_pg_url(&drill_url)
+            .map(|url| url.server())
+            .unwrap_or_default()
+    );
     let code = if ok {
         record_verified(Some(&store), true, "", &record, &drilled, started);
         0
@@ -1760,8 +1817,8 @@ fn restore_and_compare(
     let fail = |reason: String, drilled: Drilled| RestoreError { reason, drilled };
     let key = latest.record["keys"][0].as_str().unwrap_or_default();
     let expected_sha = latest.record["sha256"].as_str().unwrap_or_default();
-    let Some((bytes, headers)) = get_object_bytes(settings, key)
-        .map_err(|error| fail(error, drilled.clone()))?
+    let Some((bytes, headers)) =
+        get_object_bytes(settings, key).map_err(|error| fail(error, drilled.clone()))?
     else {
         return Err(RestoreError {
             reason: format!("the bucket does not hold {key}"),
@@ -1772,7 +1829,9 @@ fn restore_and_compare(
         && meta != expected_sha
     {
         return Err(RestoreError {
-            reason: format!("the object's x-amz-meta-sha256 {meta} is not the record's {expected_sha}"),
+            reason: format!(
+                "the object's x-amz-meta-sha256 {meta} is not the record's {expected_sha}"
+            ),
             drilled,
         });
     }
@@ -1795,7 +1854,12 @@ fn restore_and_compare(
                 drilled,
             });
         }
-        Err(error) => return Err(RestoreError { reason: error, drilled }),
+        Err(error) => {
+            return Err(RestoreError {
+                reason: error,
+                drilled,
+            });
+        }
     }
     let url = parse_pg_url(drill_url).map_err(|error| fail(error, drilled.clone()))?;
     let base = if url.database.is_empty() {
@@ -1809,7 +1873,10 @@ fn restore_and_compare(
         random_hex(4).unwrap_or_default()
     );
     if let Err(error) = create_database(settings, &url, &base, &database) {
-        return Err(RestoreError { reason: error, drilled });
+        return Err(RestoreError {
+            reason: error,
+            drilled,
+        });
     }
     drilled.database = Some(database.clone());
     let outcome = restore_into(settings, &url, &base, &database, &raw, &scratch);
@@ -1832,7 +1899,9 @@ fn restore_and_compare(
             }
             if let Err(error) = dropped {
                 return Err(RestoreError {
-                    reason: format!("the scratch database {database} could not be dropped: {error}"),
+                    reason: format!(
+                        "the scratch database {database} could not be dropped: {error}"
+                    ),
                     drilled,
                 });
             }
@@ -1909,7 +1978,9 @@ fn create_database(
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
-        return Err(format!("the scratch database name {database:?} is not a plain identifier"));
+        return Err(format!(
+            "the scratch database name {database:?} is not a plain identifier"
+        ));
     }
     let (ok, found, stderr) = psql(
         settings,
@@ -1924,7 +1995,9 @@ fn create_database(
         return Err(format!("the drill server: {}", stderr.trim()));
     }
     if !found.trim().is_empty() {
-        return Err(format!("the database {database} already exists: the drill makes its own"));
+        return Err(format!(
+            "the database {database} already exists: the drill makes its own"
+        ));
     }
     let (ok, _stdout, stderr) = psql(
         settings,
@@ -1949,7 +2022,9 @@ fn drop_database(
         settings,
         url,
         base,
-        Some(&format!("drop database if exists \"{database}\" with (force)")),
+        Some(&format!(
+            "drop database if exists \"{database}\" with (force)"
+        )),
         None,
     )?;
     if ok {
@@ -2013,7 +2088,8 @@ fn restore_into(
     if !ok {
         return Err(format!("pg_restore: {}", stderr.trim()));
     }
-    let sql = fs::read_to_string(&script).map_err(|error| format!("{}: {error}", script.display()))?;
+    let sql =
+        fs::read_to_string(&script).map_err(|error| format!("{}: {error}", script.display()))?;
     let filtered = scratch.join("restore.filtered.sql");
     fs::write(&filtered, without_transaction_timeout(&sql, major))
         .map_err(|error| format!("{}: {error}", filtered.display()))?;
@@ -2032,8 +2108,14 @@ fn restore_into(
         return Err(format!("the restored database: {}", stderr.trim()));
     }
     let mut parts = counts.split_whitespace();
-    let events = parts.next().and_then(|part| part.parse().ok()).unwrap_or(-1);
-    let max = parts.next().and_then(|part| part.parse().ok()).unwrap_or(-1);
+    let events = parts
+        .next()
+        .and_then(|part| part.parse().ok())
+        .unwrap_or(-1);
+    let max = parts
+        .next()
+        .and_then(|part| part.parse().ok())
+        .unwrap_or(-1);
     Ok((events, max))
 }
 
@@ -2070,4 +2152,256 @@ fn record_verified(
         record["server"] = json!(url.server());
     }
     let _ = store.backup_record(&record);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Stamp, Tier, copy_events, full_bundle, md5_hex, parse_env_file, parse_listing,
+        parse_pg_url, server_major, suspect, tiers_for, transcript_offset, window_files,
+        within_limit, without_transaction_timeout,
+    };
+    use serde_json::json;
+    use std::fs;
+
+    fn stamp(text: &str) -> Stamp {
+        Stamp::parse(text).expect("a stamp")
+    }
+
+    #[test]
+    fn md5_matches_its_known_answers() {
+        assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            md5_hex(b"The quick brown fox jumps over the lazy dog"),
+            "9e107d9d372bb6826bd81d3542a419d6"
+        );
+    }
+
+    #[test]
+    fn a_url_is_read_the_way_libpq_reads_it() {
+        let url = parse_pg_url("postgres://u:p%40ss@db.example:6543/spawn?sslmode=disable")
+            .expect("a URL");
+        assert_eq!(url.user, "u");
+        assert_eq!(url.password, "p@ss");
+        assert_eq!(url.host, "db.example");
+        assert_eq!(url.port, "6543");
+        assert_eq!(url.database, "spawn");
+        assert_eq!(url.server(), "db.example:6543");
+        let socket = parse_pg_url("postgres://u@%2Frun%2Fpostgresql/x").expect("a socket URL");
+        assert_eq!(socket.host, "/run/postgresql");
+        assert_eq!(socket.port, "5432");
+        assert_eq!(socket.server(), "/run/postgresql");
+        let v6 = parse_pg_url("postgres://u@[::1]:5433/x").expect("an IPv6 URL");
+        assert_eq!(v6.host, "::1");
+        assert_eq!(v6.port, "5433");
+        let overridden = parse_pg_url("postgres://u@a/b?host=/tmp&port=5555").expect("a URL");
+        assert_eq!(overridden.host, "/tmp");
+        assert_eq!(overridden.port, "5555");
+        assert!(parse_pg_url("mysql://x").is_err());
+        assert!(parse_pg_url("postgres://a,b/x").is_err());
+    }
+
+    #[test]
+    fn an_environment_file_is_parsed_never_sourced() {
+        let vars = parse_env_file(
+            "# the owner's\nSPAWN_R2_ENDPOINT=\"http://127.0.0.1:1\"\nexport SPAWN_R2_BUCKET=b\n\
+SPAWN_R2_SECRET_ACCESS_KEY=s3cr3t\n\n",
+        );
+        assert_eq!(vars["SPAWN_R2_ENDPOINT"], "http://127.0.0.1:1");
+        assert_eq!(vars["SPAWN_R2_BUCKET"], "b");
+        assert_eq!(vars["SPAWN_R2_SECRET_ACCESS_KEY"], "s3cr3t");
+    }
+
+    #[test]
+    fn the_tiers_are_the_days_first_and_the_weeks_first() {
+        let now = stamp("20261108-071500");
+        assert_eq!(
+            tiers_for(now, &[]),
+            [Tier::Hourly, Tier::Daily, Tier::Weekly],
+            "the first dump of the day and of the week"
+        );
+        let same_day = [stamp("20261108-031500")];
+        assert_eq!(tiers_for(now, &same_day), [Tier::Hourly]);
+        // The day before, in the same ISO week (2026-11-08 is a Sunday, so
+        // the 2nd is the same week's Monday).
+        let same_week = [stamp("20261102-031500")];
+        assert_eq!(tiers_for(now, &same_week), [Tier::Hourly, Tier::Daily]);
+        let last_week = [stamp("20261101-031500")];
+        assert_eq!(
+            tiers_for(now, &last_week),
+            [Tier::Hourly, Tier::Daily, Tier::Weekly]
+        );
+        assert_eq!(
+            Tier::Daily.key("20261108-071500"),
+            "postgres/daily/spawn-20261108-071500.dump.gpg"
+        );
+    }
+
+    #[test]
+    fn a_copy_past_the_limit_is_never_written() {
+        assert!(within_limit(0, 0, 1_700_000, 10_000_000_000));
+        assert!(within_limit(9_998_300_000, 0, 1_700_000, 10_000_000_000));
+        assert!(
+            !within_limit(9_998_300_001, 0, 1_700_000, 10_000_000_000),
+            "one byte past the limit is past it"
+        );
+        assert!(
+            !within_limit(8_000_000_000, 1_999_999_999, 2, 10_000_000_000),
+            "the copies this run wrote count too"
+        );
+        // The hourly copy is subject to it like every other.
+        assert!(!within_limit(1_000_000, 0, 2, 1_000_000));
+    }
+
+    #[test]
+    fn a_bundle_is_full_on_the_weeks_first_or_after_seven_days_without_one() {
+        let now = stamp("20261108-071500");
+        let now_ms = 1_760_000_000_000i64;
+        // No bundle before it: full.
+        assert!(full_bundle(now, &[], now_ms));
+        // A full one earlier the same week: an increment.
+        assert!(!full_bundle(
+            now,
+            &[(stamp("20261102-031500"), true, now_ms - 86_400_000)],
+            now_ms
+        ));
+        // Only increments this week, but a full one eight days back: full.
+        assert!(full_bundle(
+            now,
+            &[
+                (stamp("20261031-031500"), true, now_ms - 8 * 86_400_000),
+                (stamp("20261107-031500"), false, now_ms - 86_400_000),
+            ],
+            now_ms
+        ));
+        // A full one yesterday: an increment.
+        assert!(!full_bundle(
+            now,
+            &[(stamp("20261107-031500"), true, now_ms - 86_400_000)],
+            now_ms
+        ));
+    }
+
+    #[test]
+    fn an_increment_takes_its_offset_from_its_base() {
+        assert_eq!(transcript_offset(Some(100), 250), 100, "a grown file");
+        assert_eq!(
+            transcript_offset(None, 250),
+            0,
+            "a file the base did not name"
+        );
+        assert_eq!(
+            transcript_offset(Some(300), 250),
+            0,
+            "a smaller file, whole"
+        );
+        assert_eq!(transcript_offset(Some(250), 250), 250, "unchanged: nothing");
+    }
+
+    #[test]
+    fn the_archive_counts_its_events_and_its_watermark_with_a_gap() {
+        let text = "\
+--
+-- Data for Name: spawn_events; Type: TABLE DATA; Schema: public; Owner: -
+--
+
+COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
+1\ta\ts
+2\ta\ts
+1002\ta\ts
+\\.
+";
+        assert_eq!(
+            copy_events(text),
+            (3, 1002),
+            "the ids skip; the count is not the watermark"
+        );
+        assert_eq!(copy_events("no copy block\n"), (0, 0));
+    }
+
+    #[test]
+    fn a_dump_smaller_than_the_newest_good_one_is_suspect() {
+        assert_eq!(suspect(100, 2000, None), None);
+        assert_eq!(suspect(100, 2000, Some((100, 4000))), None, "at the line");
+        assert!(suspect(99, 4000, Some((100, 4000))).is_some());
+        assert!(
+            suspect(100, 1999, Some((100, 4000))).is_some(),
+            "under half its size"
+        );
+        assert_eq!(suspect(100, 2000, Some((100, 4000))), None);
+    }
+
+    #[test]
+    fn a_listing_of_several_pages_adds_up() {
+        let page = "<?xml version=\"1.0\"?><ListBucketResult><Contents><Key>a</Key><Size>10</Size>\
+</Contents><Contents><Key>b</Key><Size>25</Size></Contents><IsTruncated>true</IsTruncated>\
+<NextContinuationToken>dG9rZW4=</NextContinuationToken></ListBucketResult>";
+        let (entries, token) = parse_listing(page);
+        assert_eq!(entries, [("a".to_string(), 10), ("b".to_string(), 25)]);
+        assert_eq!(token.as_deref(), Some("dG9rZW4="));
+        let last = "<ListBucketResult><Contents><Key>c</Key><Size>5</Size></Contents>\
+<IsTruncated>false</IsTruncated></ListBucketResult>";
+        let (entries, token) = parse_listing(last);
+        assert_eq!(entries, [("c".to_string(), 5)]);
+        assert_eq!(token, None, "the last page names no token");
+    }
+
+    #[test]
+    fn the_transaction_timeout_is_left_out_only_for_a_server_older_than_17() {
+        let sql =
+            "SET statement_timeout = 0;\nSET transaction_timeout = 0;\nSET lock_timeout = 0;\n";
+        assert_eq!(server_major("16.15"), 16);
+        assert_eq!(server_major("18.6 (Ubuntu)"), 18);
+        assert!(!without_transaction_timeout(sql, 16).contains("transaction_timeout"));
+        assert!(without_transaction_timeout(sql, 16).contains("statement_timeout"));
+        assert!(without_transaction_timeout(sql, 17).contains("transaction_timeout"));
+        assert!(without_transaction_timeout(sql, 18).contains("transaction_timeout"));
+    }
+
+    #[test]
+    fn the_transcript_window_is_the_last_days() {
+        let root = std::env::temp_dir().join(format!(
+            "spawn-backup-window-{}-{}",
+            std::process::id(),
+            super::random_hex(4).expect("random")
+        ));
+        fs::create_dir_all(root.join("agent_a")).expect("mkdir");
+        fs::write(root.join("agent_a/new.jsonl"), b"x").expect("write");
+        fs::write(root.join("agent_a/old.jsonl"), b"y").expect("write");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 86_400);
+        let file = fs::File::options()
+            .write(true)
+            .open(root.join("agent_a/old.jsonl"))
+            .expect("open");
+        file.set_modified(old).expect("touch");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(0))
+            .unwrap_or(0);
+        let files = window_files(&root, now_ms, 14).expect("window");
+        let names: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(
+            names,
+            ["agent_a/new.jsonl"],
+            "the 20-day-old file is outside"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_records_shape_a_manifest_the_restore_can_read() {
+        // The manifest's shape, as the scenario reads it: paths and offsets
+        // for the transcripts, a file and the heads for each source.
+        let manifest = json!({
+            "kind": "incremental",
+            "base_event_id": 7,
+            "transcripts": [{"path": "a/x.jsonl", "offset": 100, "bytes": 5, "size": 105}],
+            "repos": [{"source": "/s.git", "file": "repos/s.git.bundle",
+                       "heads": {"refs/heads/main": "abc"}, "unchanged": false}],
+        });
+        assert_eq!(manifest["transcripts"][0]["offset"], 100);
+        assert_eq!(manifest["repos"][0]["file"], "repos/s.git.bundle");
+        assert_eq!(manifest["repos"][0]["heads"]["refs/heads/main"], "abc");
+    }
 }
