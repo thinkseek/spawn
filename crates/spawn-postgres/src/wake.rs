@@ -94,8 +94,7 @@ impl Listener {
         loop {
             match fallible_iterator::FallibleIterator::next(&mut waiting) {
                 Ok(Some(_)) => received += 1,
-                Ok(None) => return Ok(received),
-                Err(_) => return Ok(received),
+                Ok(None) | Err(_) => return Ok(received),
             }
         }
     }
@@ -190,7 +189,7 @@ mod tests {
             "an unfinished command with no lease is due at once"
         );
         let claimed = store
-            .claim("worker-lease", Duration::from_secs(60))
+            .claim("worker-lease", Duration::from_mins(1))
             .expect("claim");
         assert!(claimed.is_some(), "the Bridge claims the command");
         let due = store.next_lease_ms().expect("lease").expect("a lease");
