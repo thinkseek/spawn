@@ -39,6 +39,22 @@
 //! gate's own exit 5 above stays: a TMPDIR that fills between the check and
 //! the gate's start is still found.
 //!
+//! **A base that disagrees with itself is the host's, not a verdict.** The
+//! gate judges every objective scenario on the base before any candidate
+//! code runs, and an unsolved result needs two runs that agree. A first run
+//! that exits 1 and a second that exits 0 is no verdict on the candidate: no
+//! candidate code has run yet, and the base is code that already landed. The
+//! gate says so itself, and exits [`BASE_DISAGREES_EXIT`] with its own pair
+//! of lines at the end of stdout (`| <name> exited 1, then 0 on the base: a
+//! harness error, not a verdict; the gate aborts`, then `| stage gate aborted
+//! <ms>ms base: <name> again (unsolved needs two runs that agree)`), the
+//! gate's `| gate time:` line last when it printed one. That pair, with exit
+//! 4, is [`GateFailure::BaseDisagrees`]: the integrator records it
+//! `host_fault` (objective 020's verdict) with the evidence `base_disagrees`,
+//! never a count toward a halt. Every other harness error on the base (a
+//! first run that exits 2, `1, then 2`, `1, then 3`, a missing line, the
+//! pair with any other exit) stays an abort.
+//!
 //! The gate runs with a cleared environment: [`GATE_ENV`] and nothing else.
 //! The integrator's own database URL never reaches candidate code.
 
