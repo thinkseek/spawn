@@ -2112,6 +2112,35 @@ impl Judge {
                 "no_room",
                 no_room(mission, task.id, free_kb, min_gb, &tmpdir, &log, now_ms()),
             ),
+            // The base disagreed with itself: a scenario of it exited 1 and
+            // then 0, before any candidate code ran. The host was too loaded
+            // or too flaky to judge: `host_fault` with that evidence, never
+            // a count toward a halt, judged again after the run's backoff.
+            Err(GateFailure::BaseDisagrees {
+                scenario,
+                setup_s,
+                log,
+            }) => {
+                let faults = mission.gate_host_faults.saturating_add(1);
+                let disagreements = mission.gate_base_disagrees.saturating_add(1);
+                let backoff = host_fault_backoff(self.host.backoff, faults);
+                let mut extra = base_disagrees_fields(
+                    &scenario,
+                    [1, 0],
+                    setup_s,
+                    faults,
+                    disagreements,
+                    backoff,
+                    &log,
+                );
+                extra["candidate"] = json!(candidate);
+                println!(
+                    "integrate: task {}: {}",
+                    task.id,
+                    extra["reason"].as_str().unwrap_or_default()
+                );
+                gated("host_fault", extra)
+            }
             Err(failure) => gated("aborted", aborted(&failure)),
         }
     }
