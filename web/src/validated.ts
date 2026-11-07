@@ -104,6 +104,40 @@ export class Validated {
   }
 }
 
+/** Values read on demand, once per key (an objective's whole prompt when
+ * it is pointed at): a second want of a key shares the first read, a
+ * failed read is forgotten so the next want tries again, and past `limit`
+ * keys the oldest goes. */
+export class OnDemand<V> {
+  private readonly values = new Map<string, Promise<V>>();
+  private readonly limit: number;
+
+  constructor(limit = KEPT_URLS) {
+    this.limit = limit;
+  }
+
+  get(key: string, read: () => Promise<V>): Promise<V> {
+    const kept = this.values.get(key);
+    if (kept) return kept;
+    const value = read();
+    this.values.set(key, value);
+    value.catch(() => {
+      if (this.values.get(key) === value) this.values.delete(key);
+    });
+    while (this.values.size > this.limit) {
+      const oldest = this.values.keys().next().value;
+      if (oldest === undefined) break;
+      this.values.delete(oldest);
+    }
+    return value;
+  }
+
+  /** How many keys are kept (for tests). */
+  get size(): number {
+    return this.values.size;
+  }
+}
+
 /** Bytes of `text` in UTF-8, as the server counts a text's length. */
 export function utf8Bytes(text: string): number {
   return new TextEncoder().encode(text).length;
