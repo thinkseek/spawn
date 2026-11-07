@@ -84,19 +84,38 @@ pub struct Listener {
 }
 
 impl Listener {
-    /// Wait up to `timeout` for a notification, draining every one that
-    /// arrives (a burst is one wake-up): the count. A disconnect ends the
-    /// wait too, and the caller's next pass reconnects.
+    /// Wait up to `timeout` for a notification: the number drained. A
+    /// notification already buffered ends the wait at once, and the ones
+    /// behind it are counted too (a burst is one wake-up; the caller acts on
+    /// it by reading the watermark once, so a notification left unread only
+    /// wakes the next pass a little sooner). A disconnect ends the wait, and
+    /// the caller reconnects on its next pass.
     pub fn wait(&mut self, timeout: Duration) -> Result<usize, StoreError> {
-        let mut received = 0;
+        use fallible_iterator::FallibleIterator;
+        let mut received = self.drain();
+        if received > 0 {
+            return Ok(received);
+        }
         let mut notifications = self.client.notifications();
         let mut waiting = notifications.timeout_iter(timeout);
-        loop {
-            match fallible_iterator::FallibleIterator::next(&mut waiting) {
-                Ok(Some(_)) => received += 1,
-                Ok(None) | Err(_) => return Ok(received),
-            }
+        match waiting.next() {
+            Ok(Some(_)) => received += 1,
+            Ok(None) | Err(_) => return Ok(received),
         }
+        drop(waiting);
+        Ok(received + self.drain())
+    }
+
+    /// Every notification already buffered on the connection.
+    fn drain(&mut self) -> usize {
+        use fallible_iterator::FallibleIterator;
+        let mut received = 0;
+        let mut notifications = self.client.notifications();
+        let mut buffered = notifications.iter();
+        while matches!(buffered.next(), Ok(Some(_))) {
+            received += 1;
+        }
+        received
     }
 }
 
