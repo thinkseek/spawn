@@ -663,15 +663,20 @@ struct Context<'a> {
     judged_next: BTreeSet<i64>,
 }
 
-/// The stall items for the current facts: one per open task (or halted
-/// mission) whose step has stood still for its bound or longer. Whether
-/// the supervisor was told already is the digest's business (the tag).
+/// The stall items for the current facts, and the earliest time a stall
+/// this pass has not escalated yet becomes due: one item per open task (or
+/// halted mission) whose step has stood still for its bound or longer.
+/// Whether the supervisor was told already is the digest's business (the
+/// tag): an item whose tag is in `told` was sent and is not sent again, so
+/// it waits for no time. The times are on the database's clock
+/// ([`Stalls::now_ms`], which the ages are measured against), never this
+/// host's.
 pub(crate) fn items(
     rows: &[Facts],
     work: &Work,
     stalls: &Stalls,
     bounds: &Bounds,
-) -> Vec<Escalation> {
+) -> (Vec<Escalation>, Option<i64>) {
     let empty = BTreeSet::new();
     let told = rows
         .iter()
@@ -690,6 +695,13 @@ pub(crate) fn items(
     };
     let now = stalls.now_ms;
     let mut items = Vec::new();
+    let mut due: Option<i64> = None;
+    let mut deadline = |session: &str, id: String, at: i64| {
+        if told.contains(&format!("{session} {id}")) {
+            return;
+        }
+        due = Some(due.map_or(at, |known| known.min(at)));
+    };
     for task in &stalls.tasks {
         let Some(record) = &task.record else {
             // No record names it (a row from before the control stream).
@@ -698,14 +710,17 @@ pub(crate) fn items(
         let Some(measured) = measure(task, record, &context, bounds) else {
             continue;
         };
+        let step = measured.step.word();
+        let id = format!("stall-{}-{step}-{}", task.id, measured.n);
+        let at = measured.since_ms.saturating_add(measured.bound_ms);
+        deadline(&task.session_id, id.clone(), at);
         let still = now - measured.since_ms;
         if still < measured.bound_ms {
             continue;
         }
-        let step = measured.step.word();
         items.push(Escalation {
             session_id: task.session_id.clone(),
-            id: format!("stall-{}-{step}-{}", task.id, measured.n),
+            id,
             why: Why::Stalled,
             line: one_line(
                 &format!(
@@ -725,6 +740,12 @@ pub(crate) fn items(
         let Some(record) = &halt.record else {
             continue;
         };
+        let id = format!("stall-mission-{}-halted-{}", halt.mission_id, record.id);
+        deadline(
+            "missions",
+            id.clone(),
+            record.at_ms.saturating_add(bounds.halted),
+        );
         let still = now - record.at_ms;
         if still < bounds.halted {
             continue;
@@ -732,7 +753,7 @@ pub(crate) fn items(
         let tasks: Vec<String> = halt.tasks.iter().map(|id| format!("#{id}")).collect();
         items.push(Escalation {
             session_id: "missions".to_string(),
-            id: format!("stall-mission-{}-halted-{}", halt.mission_id, record.id),
+            id,
             why: Why::Stalled,
             line: one_line(
                 &format!(
@@ -750,7 +771,7 @@ pub(crate) fn items(
             since_ms: Some(record.at_ms),
         });
     }
-    items
+    (items, due)
 }
 
 #[cfg(test)]
