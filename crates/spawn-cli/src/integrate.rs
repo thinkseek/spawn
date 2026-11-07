@@ -8832,6 +8832,227 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Objective 33, end to end: a gate that exits 4 after its own pair of
+    /// lines (a scenario of the base exiting 1 and then 0) is recorded
+    /// `host_fault` with the evidence `base_disagrees`, the gate's own
+    /// scenario (not a nested gate's 102.sh), both exits and its setup
+    /// seconds; the task stays reported and is not judged again before the
+    /// record's `due_ms`; three in a row double the backoff, share 020's run,
+    /// never escalate and carry the alert at the third; a base run that
+    /// exits 2, or `1, then 2`, is an abort and resets both runs; the
+    /// accepted run lands and the mission is never halted.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_base_that_disagrees_with_itself_is_a_host_fault_judged_again() {
+        let dir =
+            std::env::temp_dir().join(format!("spawn-db-base-disagrees-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let runs = dir.join("runs");
+        let runs_path = runs.display();
+        let template = r#"
+n=$(cat 'RUNS' 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" >'RUNS'
+disagrees() {
+  echo '| == base: 011.sh'
+  echo '| stage gate exit 1 74210ms base: 011.sh'
+  echo '| == base: 011.sh again (unsolved needs two runs that agree)'
+  if [ "$2" = nested ]; then
+    echo '| | 102.sh exited 1, then 0 on the base: a harness error, not a verdict; the gate aborts'
+    echo '| | stage gate aborted 5ms base: 102.sh again (unsolved needs two runs that agree)'
+  fi
+  echo '| 011.sh exited 1, then 0 on the base: a harness error, not a verdict; the gate aborts'
+  echo '| stage gate aborted 66871ms base: 011.sh again (unsolved needs two runs that agree)'
+  echo "| gate time: base 141 s (2 scenario runs, 19 results from the cache), candidate 0 s, setup $1 s (exports, socket scan, static checks), total 385 s"
+  exit 4
+}
+case "$n" in
+1) disagrees 244 nested ;;
+2) disagrees 31 ;;
+3) disagrees 29 ;;
+4)
+  echo '| == base: 011.sh'
+  echo '| 011.sh exited 2 on the base: a harness error, not a verdict; the gate aborts'
+  echo '| stage gate aborted 5120ms base: 011.sh again (unsolved needs two runs that agree)'
+  exit 4
+  ;;
+5)
+  echo '| == base: 011.sh'
+  echo '| 011.sh exited 1, then 2 on the base: a harness error, not a verdict; the gate aborts'
+  echo '| stage gate aborted 12003ms base: 011.sh again (unsolved needs two runs that agree)'
+  exit 4
+  ;;
+esac
+printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
+"#;
+        let gate = template.replace("RUNS", &runs_path.to_string());
+        let (base, source, scenarios, mut integrator) = world("base-disagrees-pass", &gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_secs(2),
+        };
+        let db = Db::new("base_disagrees_pass");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        let count = || {
+            std::fs::read_to_string(&runs).map_or(0, |text| text.trim().parse::<u32>().unwrap_or(0))
+        };
+        let pass = || {
+            integrator.pass_on(&db.store).expect("a pass");
+            integrator.settle();
+        };
+        let wait_until = |due: i64| {
+            let left = due - super::now_ms();
+            if left > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    u64::try_from(left).unwrap_or(0) + 50,
+                ));
+            }
+        };
+        let state = |db: &Db| {
+            let after = gated(db, mission);
+            (after.tasks[0].state, after.tasks[0].revisions)
+        };
+
+        // (1) Run 1: the base disagreed with itself.
+        pass();
+        assert_eq!(count(), 1);
+        let (record, event, at) = last_verdict(&db);
+        assert_eq!(record["verdict"], "host_fault", "{record}");
+        assert_eq!(record["evidence"], "base_disagrees");
+        assert_eq!(record["scenario"], "011.sh", "the gate's own line, not 102.sh");
+        assert_eq!(record["exits"], json!([1, 0]));
+        assert_eq!(record["setup_s"], 244);
+        assert_eq!(record["host_faults"], 1);
+        assert_eq!(record["base_disagrees"], 1);
+        assert_eq!(record["escalate"], false);
+        assert_eq!(record["alert"], false);
+        assert_eq!(record["backoff_ms"], 2000);
+        assert_eq!(record["due_ms"], at + 2000, "its own time plus the backoff");
+        assert!(record["candidate"].is_string());
+        assert!(
+            record["log"].as_str().is_some_and(|log| {
+                log.contains(
+                    "| 011.sh exited 1, then 0 on the base: a harness error, not a verdict; the \
+                     gate aborts",
+                ) && log.contains("| | 102.sh exited 1, then 0")
+            }),
+            "{record}"
+        );
+        assert!(record["reason"].as_str().is_some_and(|reason| {
+            reason.starts_with("host fault: the base disagrees with itself: 011.sh exited 1, then 0")
+                && reason.contains("244 s")
+                && reason.ends_with("not a verdict, judged again later")
+        }));
+        let after = gated(&db, mission);
+        assert_eq!(
+            (after.gate_host_faults, after.gate_base_disagrees),
+            (1, 1)
+        );
+        assert_eq!((after.gate_rejections, after.gate_aborts), (0, 0));
+        assert_eq!(
+            state(&db),
+            (spawn_core::mission::TaskState::Reported, 0),
+            "nothing went back to the worker"
+        );
+        assert!(after.halted.is_none());
+        assert_eq!(
+            db.store
+                .gate_base_disagrees_alerts()
+                .expect("alerts")
+                .as_array()
+                .map(Vec::len),
+            Some(0),
+            "the first in a row is no alert"
+        );
+
+        // (2) Held until its due time, then judged again.
+        pass();
+        assert_eq!(count(), 1, "not judged again before due_ms");
+        assert_eq!(last_verdict(&db).1, event);
+        wait_until(at + 2000);
+
+        // (3) Run 2: the second in a row, the backoff doubled, no escalation.
+        pass();
+        assert_eq!(count(), 2);
+        let (record, _, at) = last_verdict(&db);
+        assert_eq!(record["verdict"], "host_fault", "{record}");
+        assert_eq!(record["host_faults"], 2);
+        assert_eq!(record["base_disagrees"], 2);
+        assert_eq!(record["setup_s"], 31);
+        assert_eq!(record["backoff_ms"], 4000);
+        assert_eq!(record["due_ms"], at + 4000);
+        assert_eq!(record["escalate"], false, "never, whatever the count");
+        assert_eq!(record["alert"], false);
+        assert_eq!(gated(&db, mission).gate_aborts, 0);
+        assert_eq!(
+            db.store
+                .gate_host_fault_escalations()
+                .expect("escalations")
+                .as_array()
+                .map(Vec::len),
+            Some(0),
+            "a base disagreement is no escalation"
+        );
+
+        // (4) Run 3: three in a row, the alert, and no halt.
+        pass();
+        assert_eq!(count(), 2, "held again, for the doubled backoff");
+        wait_until(at + 4000);
+        pass();
+        let (record, alert_event, at) = last_verdict(&db);
+        assert_eq!(record["verdict"], "host_fault", "{record}");
+        assert_eq!(record["host_faults"], 3);
+        assert_eq!(record["base_disagrees"], 3);
+        assert_eq!(record["backoff_ms"], 8000);
+        assert_eq!(record["escalate"], false);
+        assert_eq!(record["alert"], true, "three in a row raise one alert");
+        let after = gated(&db, mission);
+        assert_eq!((after.gate_host_faults, after.gate_base_disagrees), (3, 3));
+        assert!(after.halted.is_none(), "no halt counts a host fault");
+        assert_eq!(after.gate_aborts, 0);
+        let alerts = db.store.gate_base_disagrees_alerts().expect("alerts");
+        assert_eq!(alerts.as_array().map(Vec::len), Some(1), "{alerts}");
+        assert_eq!(alerts[0]["event_id"], alert_event);
+        assert_eq!(alerts[0]["scenario"], "011.sh");
+
+        // (5) Control: a real harness error on the base is an abort, counts,
+        // and ends both runs.
+        wait_until(at + 8000);
+        pass();
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["verdict"], "aborted", "{record}");
+        let after = gated(&db, mission);
+        assert_eq!(
+            (after.gate_aborts, after.gate_host_faults, after.gate_base_disagrees),
+            (1, 0, 0),
+            "a base run that exited 2 is an abort and resets both runs"
+        );
+        pass();
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["verdict"], "aborted", "1, then 2 is an abort too");
+        assert_eq!(gated(&db, mission).gate_aborts, 2);
+        assert!(gated(&db, mission).halted.is_none());
+
+        // Run 6 accepts and lands, ending both runs.
+        pass();
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["verdict"], "accepted", "{record}");
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        let after = gated(&db, mission);
+        assert_eq!(
+            (after.gate_host_faults, after.gate_base_disagrees, after.gate_aborts),
+            (0, 0, 0)
+        );
+        assert!(after.halted.is_none());
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- the owner's hold (objective 034) --------------------------------
 
     /// A stub gate that accepts every candidate.
