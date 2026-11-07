@@ -747,6 +747,33 @@ select coalesce(jsonb_agg((r - 'log') || jsonb_build_object('event_id', e.id,
    and e.kind -> 'detail' -> 'record' ->> 'escalate' = 'true'
    and not exists (select 1 from told where tag = 'host gate-host-fault-' || e.id)";
 
+/// The `task.over_budget` records of a task that continues an overrun task
+/// of its objective (its `continues` is named): a second overrun in a chain,
+/// escalated to the supervisor once. A digest that reached the supervisor
+/// carrying the tag `host over-budget-<event_id>` means it was told,
+/// however long ago. Each carries its `event_id`, `at_ms`, its `mission`,
+/// and the record's fields (`id`, `continues`, `objective`, `branch`,
+/// `commit`, `diff`, `tool_calls`, `budget`, `reason`).
+pub(crate) const OVER_BUDGET_ESCALATIONS: &str = r"
+with told as (
+  select distinct tag
+    from spawn_commands d
+   cross join lateral jsonb_array_elements_text(
+           case when jsonb_typeof(d.action -> 'tags') = 'array'
+                then d.action -> 'tags' else '[]'::jsonb end) tag
+   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
+)
+select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.recorded_at_ms,
+                                                  'mission', k.mission_id)
+                          order by e.session_seq), '[]'::jsonb)
+  from spawn_events e
+ cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+  left join mission_tasks k on k.id = (r ->> 'id')::bigint
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.over_budget'
+   and e.kind -> 'detail' -> 'record' ->> 'continues' is not null
+   and not exists (select 1 from told where tag = 'host over-budget-' || e.id)";
+
 /// The last `task.gated` record of every task, keyed by task id:
 /// `{"<id>": {verdict, reason, metric, candidate, at_ms}}`. Kept out of
 /// [`MISSION_BOARD`]: the supervisor's login reads the board and may not
@@ -1324,6 +1351,12 @@ impl PostgresStore {
     /// supervisor yet ([`GATE_HOST_FAULT_ESCALATIONS`]).
     pub fn gate_host_fault_escalations(&self) -> Result<Value, StoreError> {
         self.query_json(GATE_HOST_FAULT_ESCALATIONS, &[])
+    }
+
+    /// The second overrun of an objective's chain that the supervisor was
+    /// not told of yet ([`OVER_BUDGET_ESCALATIONS`]).
+    pub fn over_budget_escalations(&self) -> Result<Value, StoreError> {
+        self.query_json(OVER_BUDGET_ESCALATIONS, &[])
     }
 
     /// The `source.hold_expired` records not told to the supervisor yet,
