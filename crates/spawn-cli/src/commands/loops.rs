@@ -66,6 +66,37 @@ fn pause_unless_stopped(pause: Duration, stop: &AtomicBool) -> bool {
     true
 }
 
+/// Wait for `pause`, or less once `stop` is set, or at once when a
+/// notification arrives on `listener` (the log's change signal: a hint, not
+/// the record — the next pass reads the watermark anyway). True when the
+/// stop is set. Without a listener it is [`pause_unless_stopped`]: the
+/// watermark alone wakes the loop, one interval late at worst.
+fn wait_unless_stopped(
+    listener: Option<&mut spawn_postgres::Listener>,
+    pause: Duration,
+    stop: &AtomicBool,
+) -> bool {
+    let Some(listener) = listener else {
+        return pause_unless_stopped(pause, stop);
+    };
+    let until = std::time::Instant::now() + pause;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return true;
+        }
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        match listener.wait(left) {
+            // A notification (or a burst of them) ends the wait: one pass
+            // acts on all of it.
+            Ok(1..) | Err(_) => return false,
+            Ok(0) => {}
+        }
+    }
+}
+
 /// Consecutive failed passes after which the loop exits, so its unit
 /// restarts it with fresh connections (the store does not reconnect).
 const MAX_FAILURES: u32 = 10;
