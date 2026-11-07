@@ -24,10 +24,8 @@
 --   - it is in no role membership, and no session is logged in as it.
 -- No init-db can be midway: a migration makes a database's logins and their
 -- grants in one transaction, after the database exists, so a sweep sees
--- either nothing of them or logins their database owns. A sweep also holds
--- the server's migration lock (the advisory lock PostgresStore::migrate
--- takes in this database, key 1399957400) while it runs, and skips when
--- the lock is not free within 10 s. DROP ROLE also refuses a login that
+-- either nothing of them or logins their database owns; a login whose
+-- database exists is never dropped. DROP ROLE also refuses a login that
 -- still holds anything. It never drops a database, and never touches a
 -- server whose port is 15433 (the live server's, over TCP and over its
 -- socket).
@@ -37,7 +35,6 @@ declare
     v_prefix text := coalesce(current_setting('spawn_logins.prefix', true), '');
     v_login record;
     v_scope integer := 0;
-    v_lock_timeout text := current_setting('lock_timeout');
     v_dropped integer := 0;
 begin
     perform set_config('spawn_logins.result', 'skipped: did not finish', false);
@@ -50,20 +47,6 @@ begin
                            'skipped: run in the postgres database, where the migration lock is', false);
         return;
     end if;
-    -- A sweep waits for the migrations under way. One database's logins,
-    -- dropped after the database, need no lock: no init-db can be making
-    -- the logins of a database that is gone.
-    if v_database = '' then
-        perform set_config('lock_timeout', '10s', true);
-        begin
-            perform pg_advisory_xact_lock(1399957400);
-        exception when lock_not_available then
-            perform set_config('spawn_logins.result', 'skipped: a migration holds the lock', false);
-            return;
-        end;
-        perform set_config('lock_timeout', v_lock_timeout, true);
-    end if;
-
     for v_login in
         with bases(base) as (values ('spawn_supervisor'), ('spawn_reader'), ('spawn_human')),
              databases(d, present) as (
