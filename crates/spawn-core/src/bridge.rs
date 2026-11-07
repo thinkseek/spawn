@@ -57,8 +57,10 @@
 //! changes with nothing in the transcript (a dialog, a crash to a shell).
 //! A busy screen is still recorded again every `screen_refresh` while a
 //! turn keeps it busy. An idle session with a quiet transcript and nothing
-//! in flight costs no capture between backstops, and no tmux call at all:
-//! the liveness question (`runner`) rides on the same decision.
+//! in flight costs no capture between backstops, and no tmux call of its
+//! own: whether the fleet still runs is one call per pass
+//! ([`TerminalHost::runners`]), so a terminal killed from outside ends its
+//! execution as lost on the next pass, as before.
 //!
 //! Causality (§14): a screen state is recorded from a capture, and a turn's
 //! end from the transcript's line. The absence of a capture, or of a
