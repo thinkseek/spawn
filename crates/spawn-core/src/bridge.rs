@@ -1221,7 +1221,13 @@ impl Bridge {
 
     /// Append the events in what the engine wrote to its transcript since
     /// the last read. Only whole lines are read; a line being written waits
-    /// for the next tick.
+    /// for the next tick, and so does one whose checkpoint failed.
+    ///
+    /// The read happens when the watch says the file changed, and on every
+    /// pass when no watch could be set for the execution
+    /// ([`Follow::poll`]). A read that leaves a line half-written, or a
+    /// checkpoint uncommitted, keeps the execution due, so the next pass
+    /// reads again: a line is never lost to the moment it was written.
     fn follow_output(
         &self,
         agent_id: &AgentId,
@@ -1230,6 +1236,10 @@ impl Bridge {
         active: &mut Active,
         report: &mut TickReport,
     ) -> Result<(), StoreError> {
+        let watched = self.config.watch.is_some() && !active.follow.poll;
+        if watched && !active.follow.dirty && !self.due_to_read(active) {
+            return Ok(());
+        }
         let Some(native) = native else {
             return Ok(());
         };
@@ -1249,6 +1259,11 @@ impl Bridge {
                         .warnings
                         .push(format!("{session}: no engine output at {path}"));
                 }
+                // The file's appearance is a change the watch reports: with
+                // one set, it is not asked again every pass, only once at
+                // the grace that reports a transcript that never came.
+                active.follow.dirty = false;
+                active.follow.due_at = (!active.follow.warned).then(|| since.saturating_add(60_001));
                 return Ok(());
             }
             Err(error) => {
@@ -1258,15 +1273,25 @@ impl Bridge {
                         .warnings
                         .push(format!("{session}: read {path}: {error}"));
                 }
+                // An error says nothing about the file: it is read again on
+                // the next pass.
                 return Ok(());
             }
         };
+        let now = self.clock.now().0;
+        if !bytes.is_empty() {
+            active.follow.growth = Some(now);
+            active.follow.fresh = true;
+            active.follow.due_at = None;
+        }
         let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') else {
             // A full read without a newline is one line longer than the
             // limit: skip what was read rather than stall on it forever (the
-            // rest of it parses as nothing).
+            // rest of it parses as nothing). Anything shorter is a line
+            // still being written: it is read next pass.
             if bytes.len() >= READ_LIMIT {
                 active.follow.offset += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                active.follow.dirty = false;
                 report.warnings.push(format!(
                     "{session}: skipped a line over {READ_LIMIT} bytes in {path}"
                 ));
@@ -1298,6 +1323,7 @@ impl Bridge {
                 )?
             {
                 active.follow.offset += u64::try_from(start).unwrap_or(u64::MAX);
+                // The commit stays due: the line is read again next pass.
                 return Ok(());
             }
             if active.follow.version.is_none()
@@ -1317,7 +1343,104 @@ impl Bridge {
             }
         }
         active.follow.offset += u64::try_from(end + 1).unwrap_or(u64::MAX);
+        active.follow.dirty = false;
         Ok(())
+    }
+
+    /// Whether the transcript is read on this pass although nothing was
+    /// watched: the grace that reports a transcript that never appeared.
+    fn due_to_read(&self, active: &Active) -> bool {
+        active
+            .follow
+            .due_at
+            .is_some_and(|at| self.clock.now().0 >= at)
+    }
+
+    /// Watch the execution's files: its transcript (once the session's
+    /// native id is known) and the runner's exit status. A file that cannot
+    /// be watched is read on every pass instead, said once.
+    fn register_watch(
+        &self,
+        session: &SessionId,
+        native: Option<&str>,
+        active: &mut Active,
+        report: &mut TickReport,
+    ) {
+        let Some(watch) = &self.config.watch else {
+            return;
+        };
+        let key = watch_key(&active.execution_id);
+        if self.touched.contains(&key) {
+            active.follow.dirty = true;
+        } else if active.follow.watched {
+            // Nothing new, and the watch is set: no system call at all.
+            return;
+        }
+        let mut paths = vec![exit_file(active)];
+        if let Some(native) = native {
+            paths.push(transcript_path(
+                &self.config.claude_projects,
+                &active.workspace,
+                native,
+            ));
+        }
+        for path in paths {
+            if let Err(error) = watch.watch(&key, &path) {
+                active.follow.poll = true;
+                active.follow.dirty = true;
+                if !active.follow.watch_warned {
+                    active.follow.watch_warned = true;
+                    report.warnings.push(format!(
+                        "{session}: no watch on {path} ({error}); its files are read on every pass"
+                    ));
+                }
+                return;
+            }
+        }
+        active.follow.watched = true;
+    }
+
+    /// Whether this pass looks at the execution: reads the runner's exit
+    /// status, asks whether its runner still runs, and captures its pane.
+    /// An execution with nothing in flight, no pending end or checkpoint and
+    /// a quiet transcript is left alone between backstops.
+    fn looked_at(&self, session: &SessionId, active: &Active) -> bool {
+        self.config.watch.is_none()
+            || active.reported_end.is_some()
+            || active.unmounting
+            || active.checkpoint.is_some()
+            || active.follow.stale.is_some()
+            || active.follow.end_failures > 0
+            || active.follow.poll
+            || active.follow.dirty
+            || self.due_to_read(active)
+            || self.in_flight(session)
+            || self.capture_due(active)
+    }
+
+    /// Whether a command of this session is claimed and unfinished: the
+    /// Bridge holds it waiting for its turn.
+    fn in_flight(&self, session: &SessionId) -> bool {
+        self.held
+            .values()
+            .any(|claimed| &claimed.session_id == session)
+    }
+
+    /// Whether the pane is captured on this pass: a command is in flight on
+    /// the session, a reading awaits its twin, the transcript has held still
+    /// since the screen was last read, or the backstop is due.
+    fn capture_due(&self, active: &Active) -> bool {
+        let follow = &active.follow;
+        if self.config.watch.is_none() || follow.poll {
+            return true;
+        }
+        if follow.again || follow.fresh {
+            return follow.fresh_is_quiet(active, self.clock.now().0, self.config.screen_quiet);
+        }
+        follow.last_capture.is_none_or(|at| {
+            self.clock.now().0.saturating_sub(at)
+                >= i64::try_from(self.config.screen_refresh.as_millis()).unwrap_or(i64::MAX)
+        })
     }
 
     /// The engine's version, read from the execution's transcript: the
