@@ -3097,6 +3097,7 @@ mod tests {
         let store = GitWorkspace::new("/nonexistent.git", std::env::temp_dir());
         for command in [
             super::git_command("git"),
+            super::test_git_command(),
             store.command(),
             store.command_in(Path::new("/work"), Path::new("/index")),
         ] {
@@ -3115,6 +3116,117 @@ mod tests {
             "git_command's, and tar's"
         );
         assert_eq!(code.matches("Command::new(\"tar\")").count(), 1);
+    }
+
+    /// Every git a test of this crate runs for itself is built by
+    /// [`super::test_git_command`], which no setting of the host's reaches:
+    /// no file of the crate, its tests included, starts git another way.
+    #[test]
+    fn every_test_git_is_built_by_test_git_command() {
+        use std::ffi::OsStr;
+        let command = super::test_git_command();
+        let envs: Vec<_> = command.get_envs().collect();
+        for expected in [
+            (
+                OsStr::new("GIT_CONFIG_GLOBAL"),
+                Some(OsStr::new("/dev/null")),
+            ),
+            (OsStr::new("GIT_CONFIG_NOSYSTEM"), Some(OsStr::new("1"))),
+            (OsStr::new("GIT_CONFIG_COUNT"), None),
+            (OsStr::new("GIT_CONFIG_PARAMETERS"), None),
+        ] {
+            assert!(envs.contains(&expected), "{expected:?} in {envs:?}");
+        }
+        fn sources(directory: &Path, found: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(directory).expect("a source directory") {
+                let path = entry.expect("an entry").path();
+                if path.is_dir() {
+                    sources(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        sources(&crate_root.join("src"), &mut files);
+        sources(&crate_root.join("tests"), &mut files);
+        assert!(
+            files.iter().any(|file| file.ends_with("tests/branches.rs")),
+            "{files:?}"
+        );
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("read a source");
+            assert!(
+                !text.contains("Command::new(\"git\")"),
+                "{} starts git without test_git_command",
+                file.display()
+            );
+            if file.starts_with(crate_root.join("tests")) {
+                assert!(
+                    !text
+                        .replace("test_git_command(", "")
+                        .contains("git_command("),
+                    "{} runs a test's git with the host's configuration",
+                    file.display()
+                );
+            }
+        }
+    }
+
+    /// A host whose `~/.gitconfig` signs every commit with a key that is
+    /// not there, runs a hook that refuses every commit and guesses no
+    /// identity: git with that configuration cannot commit, and a test's
+    /// own git ([`super::test_git_command`]) commits as if it were not.
+    #[test]
+    fn a_tests_git_ignores_the_hosts_git_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("spawn-git-hostile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let hooks = base.join("hooks");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&hooks).expect("hooks");
+        let refusing = hooks.join("pre-commit");
+        std::fs::write(&refusing, "#!/bin/sh\nexit 1\n").expect("hook");
+        std::fs::set_permissions(&refusing, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::write(
+            home.join(".gitconfig"),
+            format!(
+                "[commit]\n\tgpgsign = true\n[tag]\n\tgpgsign = true\n[gpg]\n\tformat = ssh\n\
+                 [user]\n\tsigningkey = {}\n\tuseConfigOnly = true\n[core]\n\thooksPath = {}\n",
+                base.join("no-such-key.pub").display(),
+                hooks.display()
+            ),
+        )
+        .expect("write the hostile configuration");
+        let repo = base.join("repo").to_string_lossy().to_string();
+        let commit = |mut command: Command| {
+            command
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &home)
+                .args(["-C", &repo, "commit", "--allow-empty", "-qm", "work"])
+                .output()
+                .expect("git runs")
+        };
+        let init = super::test_git_command()
+            .args(["init", "-q", &repo])
+            .status()
+            .expect("git runs");
+        assert!(init.success());
+
+        let mut hosts = super::git_command("git");
+        hosts
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .stdin(std::process::Stdio::null());
+        let refused = commit(hosts);
+        assert!(
+            !refused.status.success(),
+            "the hostile configuration counts for a git with the host's: {refused:?}"
+        );
+        let committed = commit(super::test_git_command());
+        assert!(committed.status.success(), "{committed:?}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Marks a line of [`merge_decisions_in_this_locale`]'s output.

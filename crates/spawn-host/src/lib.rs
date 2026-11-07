@@ -20,13 +20,13 @@ pub mod tree_path;
 #[cfg(test)]
 mod audit;
 
+#[cfg(any(test, feature = "testing"))]
+pub use git::test_git_command;
 pub use git::{
     DEFAULT_MAX_FILE_MB, ENGINE_RUNTIME_FILES, GitWorkspace, LARGE_FILE_TRAILER, MAIN_COPIES,
     git_command, has_conflict_block, has_conflict_block_sized, max_file_bytes,
     names_files_outside_git,
 };
-#[cfg(any(test, feature = "testing"))]
-pub use git::test_git_command;
 pub use root::canonical_root;
 pub use tmux::TmuxHost;
 pub use transcripts::{LocalTranscriptArchive, TRANSCRIPT_DIRECTORY};
