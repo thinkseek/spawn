@@ -460,6 +460,7 @@ fn md5_file(path: &Path) -> Result<String, String> {
     Ok(md5_hex(&bytes))
 }
 
+#[allow(clippy::unreadable_literal, clippy::many_single_char_names)]
 pub(crate) fn md5_hex(bytes: &[u8]) -> String {
     const S: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
