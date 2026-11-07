@@ -918,6 +918,14 @@ pub(crate) const LATEST_CHECKPOINT: &str = "select kind -> 'detail' -> 'artifact
                   where agent_id = $1 and event_name = 'artifact.committed'
                   order by id desc limit 1";
 
+/// An agent's latest checkpoint and when it was recorded, for the work an
+/// overrun task keeps: `{commit, at_ms}`, or no row.
+pub(crate) const CHECKPOINT_AT: &str = "select jsonb_build_object(
+                   'commit', kind -> 'detail' -> 'artifact' ->> 'commit', 'at_ms', recorded_at_ms)
+                   from spawn_events
+                  where agent_id = $1 and event_name = 'artifact.committed'
+                  order by id desc limit 1";
+
 /// The `commit` of a task's latest `task.reported` control record. `$1`
 /// the task id, as text (the record's `id`).
 pub(crate) const REPORTED_COMMIT: &str = "select kind -> 'detail' -> 'record' ->> 'commit'
@@ -1407,6 +1415,14 @@ impl PostgresStore {
 
     /// The commit of the agent's latest `artifact.committed` event, if it
     /// has one: what its pushed branch must contain to be landed.
+    /// An agent's latest checkpoint and when it was recorded
+    /// ([`CHECKPOINT_AT`]), or null.
+    pub fn checkpoint_at(&self, agent: &str) -> Result<Option<Value>, StoreError> {
+        Ok(self
+            .query_opt(CHECKPOINT_AT, &[&agent])?
+            .map(|row| row.get::<_, Value>(0)))
+    }
+
     pub fn latest_checkpoint(&self, agent: &str) -> Result<Option<String>, StoreError> {
         Ok(self
             .query_opt(LATEST_CHECKPOINT, &[&agent])?
