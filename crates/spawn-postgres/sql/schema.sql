@@ -3206,8 +3206,9 @@ $$;
 -- cancelled (spawn_task_record_cancelled) left tasks the fold cancelled with
 -- no record of it: their stages end at `assigned`, `delivered` or
 -- `reported`. Each cancelled task whose last `task.%` record closes nothing
--- is recorded cancelled, once: a task that ends with `task.cancelled` or
--- `task.aborted` (cancelled over budget) gets none, and neither does a row
+-- is recorded cancelled, once: a task that ends with `task.cancelled`,
+-- `task.aborted` or `task.over_budget` (cancelled over budget, its work
+-- kept) gets none, and neither does a row
 -- from before the control stream (`legacy.imported`, no `task.%` records).
 do $$
 declare
@@ -3225,7 +3226,7 @@ begin
                    and r.record ->> 'type' like 'task.%'
                  order by r.record ->> 'id', e.session_seq desc) last on last.id = k.id::text
          where k.state = 'cancelled'
-           and last.type not in ('task.cancelled', 'task.aborted')
+           and last.type not in ('task.cancelled', 'task.aborted', 'task.over_budget')
          order by k.id
     loop
         perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task,
