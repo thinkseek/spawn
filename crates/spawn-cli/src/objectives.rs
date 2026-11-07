@@ -720,6 +720,55 @@ pub(crate) fn workers(objectives: &serde_json::Value) -> usize {
         .max(1)
 }
 
+/// What a continuation is told: the overrun task it continues, the branch,
+/// the commit and the diff stat its workspace holds, and its budget.
+pub(crate) fn continuation_note(over: &Overrun) -> String {
+    let mut note = format!(
+        "\nYour task continues task #{} of this objective, which went over its budget: {}. \
+         It made {} tool calls. Its work is safe on branch {}",
+        over.task,
+        cut(&over.reason, REASON_CHARS),
+        over.tool_calls,
+        over.branch
+    );
+    match (&over.commit, &over.diff) {
+        (Some(commit), diff) => {
+            let _ = write!(note, ", at commit {commit}");
+            match diff.as_deref().filter(|diff| !diff.trim().is_empty()) {
+                Some(diff) => {
+                    let _ = writeln!(
+                        note,
+                        "; against main it holds:\n{}\nThat work is in your workspace: \
+                         continue it, do not redo it.",
+                        diff.trim_end()
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        note,
+                        ".\nThat work is in your workspace: continue it, do not redo it."
+                    );
+                }
+            }
+        }
+        _ => {
+            let _ = writeln!(
+                note,
+                ", but its push failed: the log says so, and your workspace may not hold all \
+                 of it. The report of the task it continues says what it did."
+            );
+        }
+    }
+    if let Some(budget) = &over.budget {
+        let _ = writeln!(
+            note,
+            "Your budget is the mission's ({budget}); it may be raised once, for this task \
+             only, to at most twice that, by the owner's `spawn mission configure`."
+        );
+    }
+    note
+}
+
 /// The brief of an objective task: the objective, the working rules, the
 /// work earlier tasks of it left without landing, and what the gate said
 /// about earlier attempts.
@@ -761,50 +810,7 @@ pub(crate) fn brief(
         brief.push('\n');
     }
     if let Some(over) = continues {
-        let _ = write!(
-            brief,
-            "\nYour task continues task #{} of this objective, which went over its budget: {}. \
-             It made {} tool calls. Its work is safe on branch {}",
-            over.task,
-            cut(&over.reason, REASON_CHARS),
-            over.tool_calls,
-            over.branch
-        );
-        match (&over.commit, &over.diff) {
-            (Some(commit), diff) => {
-                let _ = write!(brief, ", at commit {commit}");
-                match diff.as_deref().filter(|diff| !diff.trim().is_empty()) {
-                    Some(diff) => {
-                        let _ = writeln!(
-                            brief,
-                            "; against main it holds:\n{}\nThat work is in your workspace: \
-                             continue it, do not redo it.",
-                            diff.trim_end()
-                        );
-                    }
-                    None => {
-                        let _ = writeln!(
-                            brief,
-                            ".\nThat work is in your workspace: continue it, do not redo it."
-                        );
-                    }
-                }
-            }
-            _ => {
-                let _ = writeln!(
-                    brief,
-                    ", but its push failed: the log says so, and your workspace may not hold \
-                     all of it. The report of the task it continues says what it did."
-                );
-            }
-        }
-        if let Some(budget) = &over.budget {
-            let _ = writeln!(
-                brief,
-                "Your budget is the mission's ({budget}); it may be raised once, for this task \
-                 only, to at most twice that, by the owner's `spawn mission configure`."
-            );
-        }
+        brief.push_str(&continuation_note(over));
     }
     if !prior.is_empty() {
         brief.push_str(
@@ -998,7 +1004,7 @@ fn assign(
     let scenario = scenario.is_file().then(|| scenario.display().to_string());
     let text = brief(task, landed_value(task, landings), &prior, &history, continues);
     let assigned = store
-        .objective_assign(
+        .objective_assign_continuing(
             mission.id,
             id,
             scenario.as_deref(),
