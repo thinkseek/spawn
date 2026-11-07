@@ -103,7 +103,7 @@
 //! the next check.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -397,10 +397,7 @@ impl Monitor {
         if !self.started {
             self.start(store, &mut lines)?;
         }
-        let now = store.now_ms().map_err(|error| error.to_string())?;
-        let watermark = store
-            .alert_watermark()
-            .map_err(|error| error.to_string())?;
+        let (watermark, now) = store.alert_clock().map_err(|error| error.to_string())?;
         let reading_due = now >= self.next_reading_ms;
         let bound_due = self.next_bound_ms.is_some_and(|due| now >= due);
         if watermark <= self.watermark && !reading_due && !bound_due {
@@ -432,7 +429,7 @@ impl Monitor {
             self.read_host(now, &mut events, &mut lines);
         }
         self.bounds(now, &mut events);
-        self.flush(store, &events, &mut lines);
+        self.flush(store, now, &events, &mut lines);
         self.plan(now);
         Ok(lines)
     }
@@ -498,10 +495,23 @@ impl Monitor {
             .alert_failed_commands(self.commands_after)
             .map_err(|error| error.to_string())?;
         self.commands(&commands, &mut events);
-        self.watermark = store
-            .alert_watermark()
-            .map_err(|error| error.to_string())?;
-        self.flush(store, &events, lines);
+        self.watermark = store.alert_clock().map_err(|error| error.to_string())?.0;
+        for log in &mut self.logs {
+            let open = self
+                .known
+                .iter()
+                .filter(|(_, row)| row.open() && row.kind == "postgres_crash" && row.subject == log.subject)
+                .max_by_key(|(_, row)| row.fired_at_ms);
+            if let Some((_, row)) = open {
+                log.last_match_ms = row.fired_at_ms;
+                log.last_line = row.evidence["lines"]
+                    .as_array()
+                    .and_then(|lines| lines.last())
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+        }
+        self.flush(store, now, &events, lines);
         self.started = true;
         self.next_reading_ms = now;
         self.plan(now);
@@ -648,8 +658,8 @@ impl Monitor {
                     subject: format!("task #{id}"),
                     evidence: json!({
                         "task": id, "mission": task.mission, "objective": task.objective,
-                        "agent_id": task.agent, "from": task.state, "to": after,
-                        "record": kind, "event_id": event_id,
+                        "agent_id": task.agent.clone(), "from": task.state.clone(),
+                        "to": after, "record": kind, "event_id": event_id,
                     }),
                     text: format!(
                         "task #{id}: {} -> {after} (by {kind})",
@@ -706,7 +716,7 @@ impl Monitor {
                 });
             }
         }
-        if let Some(evidence) = base_disagrees(record) {
+        if base_disagrees(record).is_some() {
             out.push(Event::Fire {
                 key: format!("gate_base_disagrees:{event_id}"),
                 kind: "gate_base_disagrees",
@@ -726,7 +736,6 @@ times in a row)",
                 notice: true,
             });
         }
-        let _ = evidence;
     }
 
     /// An admission's wait and its clear.
@@ -1269,7 +1278,7 @@ times in a row)",
 
     /// Record `events`, in order, each once: the store refuses a second
     /// `alert.fired` for a key, so two loops at once still fire once.
-    fn flush(&mut self, store: &PostgresStore, events: &[Event], lines: &mut Vec<String>) {
+    fn flush(&mut self, store: &PostgresStore, now: i64, events: &[Event], lines: &mut Vec<String>) {
         for event in events {
             let key = event.key().to_string();
             let record = match event {
@@ -1321,7 +1330,7 @@ times in a row)",
                                 },
                                 evidence: record["evidence"].clone(),
                                 fired_event_id: id,
-                                fired_at_ms: store.now_ms().unwrap_or_default(),
+                                fired_at_ms: now,
                             },
                         );
                         lines.push(format!("alerts: fired {key} ({subject})"));
@@ -1358,7 +1367,7 @@ times in a row)",
     }
 
     /// The earliest bound that has not fired yet, for the next due time.
-    fn plan(&mut self, now: i64) {
+    fn plan(&mut self, _now: i64) {
         let mut next = i64::MAX;
         for (id, task) in &self.tasks {
             if task.state.as_deref() != Some("assigned") || !task.agent_free {
@@ -1399,7 +1408,6 @@ times in a row)",
                 next = next.min(log.last_match_ms.saturating_add(self.settings.quiet_ms));
             }
         }
-        let _ = now;
         self.next_bound_ms = (next != i64::MAX).then_some(next);
     }
 
