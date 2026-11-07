@@ -117,6 +117,15 @@ mod tests {
     use super::{MORE_USAGE, USAGE};
 
     #[test]
+    fn the_usage_names_the_backup_command() {
+        assert!(
+            MORE_USAGE.contains("spawn backup dump|bundle|verify"),
+            "{MORE_USAGE}"
+        );
+        assert!(!USAGE.contains("backup"), "the contract's line stays as it was");
+    }
+
+    #[test]
     fn the_usage_names_the_alerts_command() {
         assert!(
             MORE_USAGE.contains("spawn alerts --once")
