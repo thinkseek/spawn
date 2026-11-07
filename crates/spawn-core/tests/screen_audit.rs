@@ -131,6 +131,7 @@ mod bridge {
     };
     use spawn_core::memory::MemoryStore;
     use spawn_core::port::{CommandQueue, EventLog, Launch, TerminalError, TerminalHost};
+    use spawn_core::screen::TRUST_KEYS;
     use spawn_core::time::{ManualClock, Timestamp};
 
     const DIALOG: &str = "[Screen Reader Mode: on via flag]
@@ -221,13 +222,18 @@ Enter to confirm · Esc to cancel
         }
     }
 
-    /// Start a session whose first pane is `pane`, with a short wait for a
-    /// ready prompt: the keys pressed, and whether the start succeeded.
-    fn start_on(pane: &str) -> (Vec<String>, bool) {
+    fn terminal_of(command: u64) -> TerminalName {
+        TerminalName::for_execution(&ExecutionId::for_command(CommandId(command)))
+    }
+
+    fn store() -> Arc<MemoryStore> {
         let clock: Arc<ManualClock> = Arc::new(ManualClock::new(Timestamp(1_000)));
-        let store = Arc::new(MemoryStore::new("shop", clock));
-        let terminal = TerminalName::for_execution(&ExecutionId::for_command(CommandId(1)));
-        store.set_pane(&terminal, pane);
+        Arc::new(MemoryStore::new("shop", clock))
+    }
+
+    /// A Bridge over `store` whose terminal keeps the keys pressed, with a
+    /// short wait for a ready prompt.
+    fn bridge_over(store: &Arc<MemoryStore>) -> (Bridge, Arc<Keys>) {
         let keys = Arc::new(Keys {
             inner: store.clone(),
             pressed: Mutex::new(Vec::new()),
@@ -235,33 +241,44 @@ Enter to confirm · Esc to cancel
         let mut config = BridgeConfig::new("tester");
         config.ready_attempts = 4;
         config.ready_interval = Duration::ZERO;
-        let mut bridge = Bridge::new(
+        let bridge = Bridge::new(
             store.clone(),
             store.clone(),
             store.clone(),
             keys.clone(),
             config,
         );
+        (bridge, keys)
+    }
+
+    fn submit(store: &MemoryStore, key: &str, action: CommandAction) {
         store
             .submit(
                 &Principal::new("tester").expect("valid principal"),
                 &Submission {
                     agent_id: AgentId::new("agent_one").expect("valid agent"),
                     session_id: SessionId::new("session_one").expect("valid session"),
-                    idempotency_key: IdempotencyKey::new("key_start").expect("valid key"),
-                    action: CommandAction::Start {
-                        engine: ENGINE.to_string(),
-                        prompt: "work".to_string(),
-                        parent_session_id: None,
-                        from: None,
-                        model: None,
-                        charter: None,
-                    },
+                    idempotency_key: IdempotencyKey::new(key).expect("valid key"),
+                    action,
                 },
             )
             .expect("submit succeeds");
-        bridge.tick().expect("tick");
-        let succeeded = store
+    }
+
+    fn start() -> CommandAction {
+        CommandAction::Start {
+            engine: ENGINE.to_string(),
+            prompt: "work".to_string(),
+            parent_session_id: None,
+            from: None,
+            model: None,
+            charter: None,
+        }
+    }
+
+    /// Whether the command `id` finished and succeeded.
+    fn succeeded(store: &MemoryStore, id: u64) -> bool {
+        store
             .read_global(GlobalPosition(0), 100)
             .expect("read")
             .iter()
@@ -269,13 +286,60 @@ Enter to confirm · Esc to cancel
                 matches!(
                     record.event.kind,
                     EventKind::CommandFinished {
+                        command_id,
                         succeeded: true,
                         ..
-                    }
+                    } if command_id == CommandId(id)
                 )
-            });
-        let pressed = keys.pressed.lock().expect("lock").clone();
-        (pressed, succeeded)
+            })
+    }
+
+    fn pressed(keys: &Keys) -> Vec<String> {
+        keys.pressed.lock().expect("lock").clone()
+    }
+
+    /// Start a session whose first pane is `pane`, with a short wait for a
+    /// ready prompt: the keys pressed, and whether the start succeeded.
+    fn start_on(pane: &str) -> (Vec<String>, bool) {
+        let store = store();
+        store.set_pane(&terminal_of(1), pane);
+        let (mut bridge, keys) = bridge_over(&store);
+        submit(&store, "key_start", start());
+        bridge.tick().expect("tick");
+        (pressed(&keys), succeeded(&store, 1))
+    }
+
+    /// Start a session on a ready pane and stop it, then resume it in a
+    /// terminal whose first pane is `pane`: the keys pressed by the resume,
+    /// whether it succeeded, and the arguments the engine was resumed with.
+    /// The engine's own config can lose a workspace's trust while the
+    /// session's transcript survives (a host move, a rewritten
+    /// `~/.claude.json`), so a resume can meet the dialog too.
+    fn resume_on(pane: &str) -> (Vec<String>, bool, Vec<String>) {
+        let store = store();
+        store.set_pane(&terminal_of(1), READY);
+        let (mut bridge, keys) = bridge_over(&store);
+        submit(&store, "key_start", start());
+        bridge.tick().expect("tick");
+        assert!(succeeded(&store, 1), "the start succeeded");
+        submit(&store, "key_stop", CommandAction::Stop);
+        bridge.tick().expect("tick");
+        assert!(succeeded(&store, 2), "the stop succeeded");
+        assert!(pressed(&keys).is_empty(), "{:?}", pressed(&keys));
+        store.set_pane(&terminal_of(3), pane);
+        submit(
+            &store,
+            "key_resume",
+            CommandAction::Resume {
+                prompt: Some("go on".to_string()),
+                model: None,
+            },
+        );
+        bridge.tick().expect("tick");
+        let launches = store.launches();
+        assert_eq!(launches.len(), 2, "one start, one resume");
+        let arguments = launches[1].arguments.clone();
+        (pressed(&keys), succeeded(&store, 3), arguments)
     }
 
     #[test]
@@ -299,5 +363,30 @@ Enter to confirm · Esc to cancel
             pressed.is_empty(),
             "a prompt above is not the dialog: {pressed:?}"
         );
+    }
+
+    /// The engine forgot the workspace (task 129 after the host move):
+    /// the resume answers the dialog once, and its prompt is typed.
+    #[test]
+    fn a_resume_answers_the_trust_dialog_once_and_becomes_ready() {
+        let (pressed, resumed, arguments) = resume_on(DIALOG);
+        assert!(
+            arguments.iter().any(|argument| argument == "--resume"),
+            "{arguments:?}"
+        );
+        assert_eq!(pressed, TRUST_KEYS);
+        assert!(resumed, "the prompt was typed once the input box came");
+    }
+
+    /// A resume whose engine still trusts the workspace gets no keys.
+    #[test]
+    fn a_resume_without_the_trust_dialog_gets_no_keys() {
+        let (pressed, resumed, arguments) = resume_on(READY);
+        assert!(
+            arguments.iter().any(|argument| argument == "--resume"),
+            "{arguments:?}"
+        );
+        assert!(pressed.is_empty(), "{pressed:?}");
+        assert!(resumed);
     }
 }
