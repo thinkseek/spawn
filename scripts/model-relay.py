@@ -105,7 +105,16 @@ PING_EVERY = 10
 PING = b'event: ping\ndata: {"type": "ping"}\n\n'
 STREAM_END = b"event: message_stop"
 # Statuses of an upstream that could not serve this time: asked again.
-SERVER_ERRORS = {500, 502, 503, 504, 529}
+SERVER_ERRORS = {429, 500, 502, 503, 504, 529}
+# Seconds DeepSeek may send nothing at all (no headers, no event, not even
+# its keep-alive comment, which it sends every 10-15 s while a request
+# waits): then the attempt is over. Seen 2026-11-07: a request held over
+# 120 s without headers.
+DEEPSEEK_SILENCE = 60
+# Seconds after which no new attempt at a DeepSeek stream starts: the client
+# gets the overloaded error and asks again itself (one wait of 495 s with
+# pings was seen to keep Claude Code waiting).
+STREAM_BUDGET = 480
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -287,22 +296,15 @@ def handler(settings):
             cut = ""
             attempts = 1
             try:
-                try:
-                    response = opener().open(request, timeout=TIMEOUT)
-                except urllib.error.HTTPError as error:
-                    response = error
-                status = response.status if hasattr(response, "status") else response.code
-                if (
-                    route == "deepseek"
-                    and (status == 200 or status in SERVER_ERRORS)
-                    and wants_stream(body)
-                ):
-                    if status != 200:
-                        response.close()
-                        response = None
-                    sent, attempts, whole = self._pass_whole_stream(response, request)
-                    status = 200 if whole else "overloaded"
+                if route == "deepseek" and wants_stream(body):
+                    sent, attempts, status = self._pass_whole_stream(request)
                 else:
+                    timeout = DEEPSEEK_SILENCE if route == "deepseek" else TIMEOUT
+                    try:
+                        response = opener().open(request, timeout=timeout)
+                    except urllib.error.HTTPError as error:
+                        response = error
+                    status = response.status if hasattr(response, "status") else response.code
                     sent = self._pass(response, status)
             except (BrokenPipeError, ConnectionResetError) as error:
                 # The client went away; the upstream stream is dropped with it.
@@ -409,24 +411,28 @@ def handler(settings):
                     self._chunk(PING)
                 time.sleep(1)
 
-        def _ask_again(self, request):
-            """`request` sent again: its response if a 200, else None."""
+        def _open(self, request):
+            """One attempt at a DeepSeek request: its response and status, or
+            (None, None) if DeepSeek was unreachable or silent."""
             try:
-                response = opener().open(request, timeout=TIMEOUT)
+                response = opener().open(request, timeout=DEEPSEEK_SILENCE)
             except urllib.error.HTTPError as error:
-                error.close()  # a refusal: its body is not a stream
-                return None
-            except Exception:  # unreachable this time
-                return None
-            if response.status != 200:
-                response.close()
-                return None
-            return response
+                response = error
+            except Exception:
+                return None, None
+            return response, response.status if hasattr(response, "status") else response.code
 
-        def _pass_whole_stream(self, response, request):
-            """Send DeepSeek's stream once whole (see the module's notes),
-            `response` its first attempt (None if that failed); returns the
-            body bytes sent, the attempts it took, and whether it was whole."""
+        def _pass_whole_stream(self, request):
+            """Send DeepSeek's stream for `request` once whole (see the
+            module's notes); returns the body bytes sent, the attempts it
+            took, and the status to log. A refusal that asking again cannot
+            mend (a 400, a 401) goes to the client as it is."""
+            response, status = self._open(request)
+            if response is not None and status != 200 and status not in SERVER_ERRORS:
+                return self._pass(response, status), 1, status
+            if response is not None and status != 200:
+                response.close()
+                response = None
             self._started = True
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -435,13 +441,16 @@ def handler(settings):
             self.end_headers()
             self.wfile.flush()
             attempts = 1
+            budget = time.monotonic() + STREAM_BUDGET
             data, whole = self._await(response) if response is not None else (b"", False)
-            while not whole and attempts < STREAM_ATTEMPTS:
+            while not whole and attempts < STREAM_ATTEMPTS and time.monotonic() < budget:
                 self._pause(STREAM_BACKOFF[min(attempts, len(STREAM_BACKOFF)) - 1])
                 attempts += 1
-                again = self._ask_again(request)
-                if again is not None:
+                again, status = self._open(request)
+                if again is not None and status == 200:
                     data, whole = self._await(again)
+                elif again is not None:
+                    again.close()
             if not whole:
                 message = (
                     f"model relay: DeepSeek failed or cut its stream {attempts} times; try again"
@@ -452,7 +461,7 @@ def handler(settings):
                 self._chunk(data[start : start + CHUNK])
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
-            return len(data), attempts, whole
+            return len(data), attempts, 200 if whole else "overloaded"
 
         do_POST = _relay
         do_GET = _relay

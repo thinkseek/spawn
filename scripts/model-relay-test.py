@@ -17,6 +17,7 @@ import json
 import os
 import pathlib
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -45,6 +46,8 @@ class Upstream:
         self.cuts = []
         # Requests still to refuse with a 500, as a loaded DeepSeek does.
         self.failures = 0
+        # Requests still to hold, silent, for 3 s before dropping them.
+        self.silences = 0
         upstream = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -80,6 +83,10 @@ class Upstream:
                     self.end_headers()
                 elif request.get("unauthorized"):
                     self._json(401, {"type": "error", "error": {"type": "authentication_error"}})
+                elif request.get("stream") and upstream.silences:
+                    upstream.silences -= 1
+                    time.sleep(3)
+                    self.close_connection = True
                 elif request.get("stream") and upstream.failures:
                     upstream.failures -= 1
                     self._json(500, {"type": "error", "error": {"type": "api_error"}})
@@ -334,7 +341,8 @@ class RelayTest(unittest.TestCase):
         return connection, connection.getresponse()
 
     def fast_retries(self):
-        for name, value in (("STREAM_BACKOFF", (0, 0, 0, 0)), ("PING_EVERY", 1)):
+        settings = (("STREAM_BACKOFF", (0, 0, 0, 0)), ("PING_EVERY", 1), ("DEEPSEEK_SILENCE", 1))
+        for name, value in settings:
             self.addCleanup(setattr, relay, name, getattr(relay, name))
             setattr(relay, name, value)
 
@@ -377,6 +385,30 @@ class RelayTest(unittest.TestCase):
         self.assertEqual(events, WHOLE)
         self.assertEqual(len(self.deepseek.requests), 4)
         self.assertEqual((self.deepseek.failures, self.deepseek.cuts), (0, []))
+
+    def test_a_silent_deepseek_is_asked_again(self):
+        self.fast_retries()
+        self.deepseek.release.set()
+        self.deepseek.silences = 1
+        connection, response = self.stream()
+        self.assertEqual(response.status, 200)
+        events = response.read().replace(relay.PING, b"")
+        connection.close()
+        self.assertEqual(events, WHOLE)
+        self.assertEqual(len(self.deepseek.requests), 2)
+
+    def test_a_deepseek_stream_refused_for_its_request_passes_as_it_is(self):
+        self.fast_retries()
+        connection = self.connect()
+        body = json.dumps({"model": "deepseek-flash", "stream": True, "unauthorized": True})
+        connection.request(
+            "POST", "/v1/messages", body=body, headers={"Content-Type": "application/json"}
+        )
+        response = connection.getresponse()
+        self.assertEqual(response.status, 401)
+        self.assertEqual(json.loads(response.read())["error"]["type"], "authentication_error")
+        connection.close()
+        self.assertEqual(len(self.deepseek.requests), 1)
 
     def test_a_deepseek_stream_cut_every_time_is_an_overloaded_error(self):
         self.fast_retries()
