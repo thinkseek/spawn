@@ -2928,28 +2928,7 @@ fn a_base_that_disagrees_with_itself_is_a_host_fault_with_its_own_count() {
     assert!(refused(&|record| {
         record.as_object_mut().expect("object").remove("backoff_ms");
     }));
-    // Without a setup line the field is simply absent.
-    assert!(
-        store
-            .integrator_record(&{
-                let mut record = disagrees(task, 0, 1, 1, false);
-                record.as_object_mut().expect("object").remove("setup_s");
-                record
-            })
-            .is_ok(),
-        "the setup's seconds are optional"
-    );
-    let (_record, _) = recorded(&mut client, {
-        let row = client
-            .query_one(
-                "select max(id) from spawn_events where session_id = 'session_control'",
-                &[],
-            )
-            .expect("the record");
-        row.get::<_, i64>(0)
-    });
-
-    // A rejection and an abort first: the runs a host fault must leave.
+    // The task's shape before any host fault.
     let before = task_row(&mut client, task);
     assert_eq!(
         (before["state"].clone(), before["revisions"].clone()),
@@ -2957,9 +2936,14 @@ fn a_base_that_disagrees_with_itself_is_a_host_fault_with_its_own_count() {
     );
 
     // The first: its own time plus its backoff, the task where it was, both
-    // counts at 1 and no escalation.
+    // counts at 1 and no escalation. A gate that printed no timing line
+    // leaves `setup_s` out, and the store takes it.
     let event = store
-        .integrator_record(&disagrees(task, 0, 1, 1, false))
+        .integrator_record(&{
+            let mut record = disagrees(task, 0, 1, 1, false);
+            record.as_object_mut().expect("object").remove("setup_s");
+            record
+        })
         .expect("the store accepts a base that disagrees");
     let (record, at) = recorded(&mut client, event);
     assert_eq!(record["due_ms"], at + 300_000);
