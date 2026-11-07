@@ -2557,6 +2557,8 @@ begin
         'spawn_resident_retire(text)', 'spawn_resident_approve(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
         'spawn_task_reported(bigint, text, text)',
+        'spawn_task_report_unfinished(bigint, text, jsonb, text, bigint)',
+        'spawn_task_report_unfinished_recorded(bigint, text)',
         'spawn_control_apply(jsonb, bigint)', 'spawn_control_record(jsonb)',
         'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
