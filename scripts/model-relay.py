@@ -21,9 +21,19 @@ by the `model` of its JSON body:
   none, and a redacted one becomes empty. Signed thinking blocks, tool calls
   and everything else pass as they are.
 
-Responses, server-sent events included, are passed on as they arrive. A
-redirect is passed back to the client, never followed: following it would
-send the request's credentials to whatever host it names.
+Responses, server-sent events included, are passed on as they arrive, but
+for one: DeepSeek's stream. DeepSeek cuts streams partway when loaded (seen
+2026-11-07: keep-alive comments, then the connection closed, without
+`message_stop`; over HTTP/1.1 and HTTP/2, and for both of its models), and
+Claude Code ends its turn on a cut stream ("Connection lost mid-response").
+So a DeepSeek stream is passed on only once it is whole, ending in
+`message_stop`. A cut one is asked for again, up to STREAM_ATTEMPTS times in
+all. The client gets a `ping` event (which it skips, as it skips the API's
+own pings) every PING_EVERY seconds meanwhile, so its connection stays
+alive. If every attempt is cut, it gets an `overloaded_error` event, which
+Claude Code retries. A redirect is passed back to the client, never
+followed: following it would send the request's credentials to whatever
+host it names.
 
 The DeepSeek key stays in this process. It never enters Spawn's environment,
 the engine's environment, the event log, or an agent's terminal.
@@ -49,7 +59,9 @@ Environment:
 
 import json
 import os
+import queue
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -81,6 +93,14 @@ DEEPSEEK_HEADERS = {"content-type", "accept", "anthropic-version", "anthropic-be
 # may pause as long between events.
 TIMEOUT = 600
 CHUNK = 64 * 1024
+# A DeepSeek stream is asked for this many times in all before the client is
+# told the upstream is overloaded; the waits between attempts, in seconds.
+STREAM_ATTEMPTS = 5
+STREAM_BACKOFF = (2, 4, 8, 16)
+# Seconds between the pings a client gets while a whole stream is awaited.
+PING_EVERY = 10
+PING = b'event: ping\ndata: {"type": "ping"}\n\n'
+STREAM_END = b"event: message_stop"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -160,6 +180,14 @@ def as_model(body, model):
             content.insert(0, dict(EMPTY_THINKING))
         message["content"] = content
     return json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
+
+
+def wants_stream(body):
+    """Whether the JSON request `body` asks for a stream."""
+    try:
+        return json.loads(body).get("stream") is True
+    except (ValueError, AttributeError, UnicodeDecodeError):
+        return False
 
 
 def error_body(message):
@@ -252,13 +280,17 @@ def handler(settings):
             # Why a response stopped partway, if it did: the client sees only
             # a connection lost.
             cut = ""
+            attempts = 1
             try:
                 try:
                     response = opener().open(request, timeout=TIMEOUT)
                 except urllib.error.HTTPError as error:
                     response = error
                 status = response.status if hasattr(response, "status") else response.code
-                sent = self._pass(response, status)
+                if route == "deepseek" and status == 200 and wants_stream(body):
+                    sent, attempts = self._pass_whole_stream(response, request)
+                else:
+                    sent = self._pass(response, status)
             except (BrokenPipeError, ConnectionResetError) as error:
                 # The client went away; the upstream stream is dropped with it.
                 self.close_connection = True
@@ -280,6 +312,7 @@ def handler(settings):
                     if self._error_head
                     else ""
                 )
+                + (f" after {attempts} attempts" if attempts > 1 else "")
                 + (f" CUT {cut}" if cut else "")
                 + "\n"
             )
@@ -321,6 +354,90 @@ def handler(settings):
                 elif sent != int(length):
                     self.close_connection = True
                 return sent
+
+        def _chunk(self, data):
+            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+            self.wfile.flush()
+
+        def _await(self, response):
+            """`response`'s body, read in a thread while the client gets a
+            ping every PING_EVERY seconds; and whether the body ended in
+            `message_stop`."""
+            arrived = queue.Queue()
+
+            def read():
+                try:
+                    with response:
+                        while True:
+                            chunk = response.read1(CHUNK)
+                            if not chunk:
+                                break
+                            arrived.put(chunk)
+                except Exception:  # a cut connection: the body is not whole
+                    pass
+                arrived.put(None)
+
+            threading.Thread(target=read, daemon=True).start()
+            data = bytearray()
+            while True:
+                try:
+                    chunk = arrived.get(timeout=PING_EVERY)
+                except queue.Empty:
+                    self._chunk(PING)
+                    continue
+                if chunk is None:
+                    return bytes(data), STREAM_END in data
+                data += chunk
+
+        def _pause(self, seconds):
+            """Wait `seconds`, the client getting its pings meanwhile."""
+            for second in range(seconds):
+                if second % PING_EVERY == 0:
+                    self._chunk(PING)
+                time.sleep(1)
+
+        def _ask_again(self, request):
+            """`request` sent again: its response if a 200, else None."""
+            try:
+                response = opener().open(request, timeout=TIMEOUT)
+            except urllib.error.HTTPError as error:
+                error.close()  # a refusal: its body is not a stream
+                return None
+            except Exception:  # unreachable this time
+                return None
+            if response.status != 200:
+                response.close()
+                return None
+            return response
+
+        def _pass_whole_stream(self, response, request):
+            """Send DeepSeek's stream once whole (see the module's notes);
+            returns the body bytes sent and the attempts it took."""
+            self._started = True
+            self.send_response(200)
+            for name, value in response.headers.items():
+                if name.lower() not in HOP:
+                    self.send_header(name, value)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.flush()
+            attempts = 1
+            data, whole = self._await(response)
+            while not whole and attempts < STREAM_ATTEMPTS:
+                self._pause(STREAM_BACKOFF[min(attempts, len(STREAM_BACKOFF)) - 1])
+                attempts += 1
+                again = self._ask_again(request)
+                if again is not None:
+                    data, whole = self._await(again)
+            if not whole:
+                message = f"model relay: DeepSeek cut its stream {attempts} times; try again"
+                error = {"type": "error", "error": {"type": "overloaded_error", "message": message}}
+                data = b"event: error\ndata: " + json.dumps(error).encode() + b"\n\n"
+            for start in range(0, len(data), CHUNK):
+                self._chunk(data[start : start + CHUNK])
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            return len(data), attempts
 
         do_POST = _relay
         do_GET = _relay

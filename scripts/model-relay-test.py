@@ -4,7 +4,8 @@
 Run: python3 -I scripts/model-relay-test.py   (no network, no keys)
 
 Covers routing by model, header replacement (an allow-list toward DeepSeek),
-server-sent events arriving before the upstream finishes, upstream errors,
+server-sent events arriving before the upstream finishes (the gateway's), a
+DeepSeek stream passed only whole and asked for again when cut, upstream errors,
 an unreachable upstream, redirects passed back unfollowed, a stalled client
 timed out, and the request size cap.
 """
@@ -26,6 +27,8 @@ SPEC.loader.exec_module(relay)
 
 FAKE_KEY = "sk-test-deepseek"
 CLIENT_TOKEN = "Bearer client-gateway-token"
+# The fake upstream's whole stream.
+WHOLE = b"event: message_start\ndata: {}\n\nevent: message_stop\ndata: {}\n\n"
 
 
 class Upstream:
@@ -37,6 +40,9 @@ class Upstream:
         # Set by the test to let a held stream finish.
         self.release = threading.Event()
         self.finished = threading.Event()
+        # Streams still to cut, and how: "close" drops the connection
+        # partway, "end" ends the body cleanly without message_stop.
+        self.cuts = []
         upstream = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -96,6 +102,12 @@ class Upstream:
                     self.wfile.flush()
 
                 chunk(b"event: message_start\ndata: {}\n\n")
+                if upstream.cuts:
+                    if upstream.cuts.pop(0) == "end":
+                        self.wfile.write(b"0\r\n\r\n")
+                        self.wfile.flush()
+                    self.close_connection = True
+                    return
                 # Hold the rest until the client has the first event.
                 upstream.release.wait(10)
                 chunk(b"event: message_stop\ndata: {}\n\n")
@@ -289,25 +301,77 @@ class RelayTest(unittest.TestCase):
         self.assertEqual(len(self.gateway.requests), 2)
         self.assertEqual(self.deepseek.requests, [])
 
-    def test_a_stream_arrives_event_by_event(self):
-        for upstream, model in ((self.deepseek, "deepseek-flash"), (self.gateway, "claude-x")):
-            connection = self.connect()
-            body = json.dumps({"model": model, "stream": True}).encode()
-            connection.request(
-                "POST", "/v1/messages", body=body, headers={"Content-Type": "application/json"}
-            )
-            response = connection.getresponse()
-            self.assertEqual(response.status, 200)
-            self.assertEqual(response.getheader("Content-Type"), "text/event-stream")
-            first = response.read1(65536)
-            # The upstream still holds the rest of the stream.
-            self.assertIn(b"message_start", first)
-            self.assertFalse(upstream.finished.is_set())
-            upstream.release.set()
-            rest = response.read()
-            self.assertIn(b"message_stop", first + rest)
-            self.assertTrue(upstream.finished.is_set())
-            connection.close()
+    def test_a_gateway_stream_arrives_event_by_event(self):
+        connection = self.connect()
+        body = json.dumps({"model": "claude-x", "stream": True}).encode()
+        connection.request(
+            "POST", "/v1/messages", body=body, headers={"Content-Type": "application/json"}
+        )
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.getheader("Content-Type"), "text/event-stream")
+        first = response.read1(65536)
+        # The upstream still holds the rest of the stream.
+        self.assertIn(b"message_start", first)
+        self.assertFalse(self.gateway.finished.is_set())
+        self.gateway.release.set()
+        rest = response.read()
+        self.assertIn(b"message_stop", first + rest)
+        self.assertTrue(self.gateway.finished.is_set())
+        connection.close()
+
+    def stream(self, model="deepseek-flash", server=None):
+        connection = self.connect(server)
+        body = json.dumps({"model": model, "stream": True}).encode()
+        connection.request(
+            "POST", "/v1/messages", body=body, headers={"Content-Type": "application/json"}
+        )
+        return connection, connection.getresponse()
+
+    def fast_retries(self):
+        for name, value in (("STREAM_BACKOFF", (0, 0, 0, 0)), ("PING_EVERY", 1)):
+            self.addCleanup(setattr, relay, name, getattr(relay, name))
+            setattr(relay, name, value)
+
+    def test_a_deepseek_stream_arrives_whole_with_pings_while_it_is_held(self):
+        self.fast_retries()
+        connection, response = self.stream()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.getheader("Content-Type"), "text/event-stream")
+        first = response.read1(65536)
+        # Only pings while the upstream holds the rest.
+        self.assertEqual(first.replace(relay.PING, b""), b"")
+        self.assertIn(b"ping", first)
+        self.assertFalse(self.deepseek.finished.is_set())
+        self.deepseek.release.set()
+        events = (first + response.read()).replace(relay.PING, b"")
+        self.assertEqual(events, WHOLE)
+        connection.close()
+
+    def test_a_cut_deepseek_stream_is_asked_for_again(self):
+        self.fast_retries()
+        self.deepseek.release.set()
+        self.deepseek.cuts = ["close", "end"]
+        connection, response = self.stream()
+        events = response.read().replace(relay.PING, b"")
+        connection.close()
+        # The client gets the one whole stream, nothing of the cut ones.
+        self.assertEqual(events, WHOLE)
+        self.assertEqual(len(self.deepseek.requests), 3)
+        self.assertEqual(self.deepseek.cuts, [])
+
+    def test_a_deepseek_stream_cut_every_time_is_an_overloaded_error(self):
+        self.fast_retries()
+        self.deepseek.release.set()
+        self.deepseek.cuts = ["end"] * relay.STREAM_ATTEMPTS
+        connection, response = self.stream()
+        events = response.read().replace(relay.PING, b"")
+        connection.close()
+        self.assertEqual(len(self.deepseek.requests), relay.STREAM_ATTEMPTS)
+        self.assertTrue(events.startswith(b"event: error\ndata: "), events)
+        error = json.loads(events.split(b"data: ", 1)[1])
+        self.assertEqual(error["error"]["type"], "overloaded_error")
+        self.assertNotIn(b"message_start", events)
 
     def test_deepseek_gets_only_the_messages_api_headers(self):
         extra = {"Cookie": "session=gateway", "X-Gateway-Tenant": "tenant-secret"}
