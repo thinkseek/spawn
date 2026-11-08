@@ -649,6 +649,56 @@ time.sleep(900)' "$vanish/service.sock" &
     esac
     kill "$vanish_listener" 2>/dev/null || true
     rm -rf "$vanish" "$hold" "$hold.held"
+    # A base run whose sandbox never started writes no cache entry, and the
+    # gate says the fact (exit 6, the base's tree): held at the base job's
+    # run (the hold file says `base-run`), the mask path made a file, so
+    # bwrap fails there. One objective, a cache of its own: the next gate
+    # on it runs the objective again rather than read a false result.
+    nsbase=$work/never-base
+    mkdir -p "$nsbase"
+    cp "$scenarios/protected" "$nsbase/"
+    printf '#!/bin/sh\nexit 0\n' >"$nsbase/101.sh"
+    vanish=$(mktemp -d "$work/vanish.XXXXXX")
+    python3 -c '
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen()
+time.sleep(900)' "$vanish/service.sock" &
+    vanish_listener=$!
+    background="$background $vanish_listener"
+    while [ ! -S "$vanish/service.sock" ]; do sleep 0.1; done
+    printf 'base-run\n' >"$hold"
+    (
+        held=0
+        until [ -s "$hold.held" ] || [ "$held" -ge 600 ]; do sleep 0.05; held=$((held + 1)); done
+        kill "$vanish_listener"
+        rm -rf "$vanish"
+        : >"$vanish"
+        rm -f "$hold"
+    ) &
+    vanish_watcher=$!
+    never_base=$(
+        export SPAWN_GATE_TEST_HOLD="$hold" XDG_CACHE_HOME="$work/caches/never-base"
+        unset TMPDIR
+        judge "$good" "" "$nsbase"
+    )
+    wait "$vanish_watcher" 2>/dev/null || true
+    case "$(cat "$hold.held" 2>/dev/null)" in
+    */baseline) ;;
+    *) echo "FAIL the base-run hold held $(cat "$hold.held" 2>/dev/null), not the base's tree"; exit 1 ;;
+    esac
+    expect "a base run whose sandbox never started is a host fault: exit 6" "$never_base" 'exit=6 {"host_fault":true'
+    expect "in the base's tree" "$never_base" '"evidence":"sandbox_never_started","tree":"base"'
+    expect "the base job says nothing was cached" "$(cat "$work/gate.out")" \
+        'its sandbox never started it; no result, nothing cached'
+    rm -f "$vanish" "$hold.held"
+    never_again=$(
+        export XDG_CACHE_HOME="$work/caches/never-base"
+        unset TMPDIR
+        judge "$good" "" "$nsbase"
+    )
+    expect "the next gate judges" "$never_again" 'exit=0 {"verdict":"accepted"}'
+    expect "and runs the objective again, never a cached result" "$(cat "$work/gate.out")" \
+        '| base results from the cache: none; run on the base: 101.sh'
 else
     echo "note: $vanish was not under a scanned directory (TMPDIR covers it): no mask, no hold"
 fi
