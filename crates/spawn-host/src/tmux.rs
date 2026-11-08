@@ -108,8 +108,14 @@ impl TmuxHost {
 const CAPTURE_LIMIT: Duration = Duration::from_secs(5);
 
 /// The fields [`runner_of`] reads, in its order.
+///
+/// The separator is a printable `|`, not a tab: tmux replaces a tab with `_`
+/// when its locale is not UTF-8 (`env -i tmux ... -F '#{a}\t#{b}'`), which
+/// would make every field one and every runner unreadable. Only the last
+/// field, a pane's start command, may hold a `|` of its own, and it is read
+/// whole.
 const PANE_STATE: &str =
-    "#{pane_dead}\t#{pane_dead_status}\t#{pane_current_command}\t#{pane_start_command}";
+    "#{pane_dead}|#{pane_dead_status}|#{pane_current_command}|#{pane_start_command}";
 
 /// The command that runs `words` (the program, then its arguments), with
 /// the controller's settings kept out of its environment.
@@ -241,7 +247,7 @@ fn launch_marker(terminal: &TerminalName) -> String {
 /// ([`TerminalHost::runner`]): the runner this host launched there, alive,
 /// or why not.
 fn runner_of(terminal: &TerminalName, line: &str) -> Runner {
-    let mut fields = line.splitn(4, '\t');
+    let mut fields = line.splitn(4, '|');
     let dead = fields.next().unwrap_or_default();
     let status = fields.next().unwrap_or_default();
     let current = fields.next().unwrap_or_default();
@@ -552,14 +558,12 @@ impl TerminalHost for TmuxHost {
         &self,
         terminals: &[(TerminalName, WorkspaceId)],
     ) -> Result<Vec<(TerminalName, Runner)>, TerminalError> {
-        eprintln!("DEBUG arg={:?} program={:?}", format!("#{{session_name}}\t{PANE_STATE}"), self.program);
         let run = self.run(&[
             "list-panes".to_string(),
             "-a".to_string(),
             "-F".to_string(),
-            format!("#{{session_name}}\t{PANE_STATE}"),
+            format!("#{{session_name}}|{PANE_STATE}"),
         ])?;
-        eprintln!("DEBUG runners code={:?} stdout={:?} stderr={:?}", run.code, run.stdout, run.stderr);
         match run.code {
             Some(0) => {}
             // No server, no session: every terminal is gone.
@@ -578,7 +582,7 @@ impl TerminalHost for TmuxHost {
         }
         let mut states: HashMap<&str, &str> = HashMap::new();
         for line in run.stdout.lines() {
-            let (session, state) = line.split_once('\t').unwrap_or((line, ""));
+            let (session, state) = line.split_once('|').unwrap_or((line, ""));
             // A session with more than one pane is the first one's.
             states.entry(session).or_insert(state);
         }
@@ -794,14 +798,14 @@ mod tests {
     #[test]
     fn a_pane_hosts_its_runner_only_when_this_host_launched_it_and_it_lives() {
         let terminal = TerminalName::new("spawn-exec_1").expect("valid terminal");
-        let launched = "0\t\tspawn\t/bin/sh -c \"set -a; . \\\"$0\\\"; exec \\\"$@\\\"\" \
+        let launched = "0||spawn|/bin/sh -c \"set -a; . \\\"$0\\\"; exec \\\"$@\\\"\" \
                         /run/user/1000/spawn-launch-spawn-exec_1-42-7.env /bin/spawn run -- claude";
         assert_eq!(runner_of(&terminal, launched), Runner::Running);
         // The same launch of another terminal is not this one's runner.
         let other = launched.replace("spawn-exec_1-", "spawn-exec_10-");
         assert!(matches!(runner_of(&terminal, &other), Runner::Untracked(_)));
         // A shell at its prompt, as a session restored after a restart is.
-        let Runner::Untracked(why) = runner_of(&terminal, "0\t\tbash\t") else {
+        let Runner::Untracked(why) = runner_of(&terminal, "0||bash|") else {
             panic!("a restored shell hosts no runner");
         };
         assert!(
@@ -811,7 +815,7 @@ mod tests {
         // A dead pane (remain-on-exit) hosts nothing, whatever it ran.
         let dead = launched
             .replacen('0', "1", 1)
-            .replacen("\t\t", "\t137\t", 1);
+            .replacen("||", "|137|", 1);
         let Runner::Untracked(why) = runner_of(&terminal, &dead) else {
             panic!("a dead pane hosts no runner");
         };
