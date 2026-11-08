@@ -1129,8 +1129,13 @@ judges every landing, RSI or fleet. It exports both commits to temporary
 directories and judges the candidate with the controller's scenarios, never
 the tree's own:
 
-- it refuses changes to the paths in `<scenarios>/protected` (`rsi/`,
-  `scripts/rsi/`, `scripts/blackbox/`, `scripts/e2e.sh`), any build-time code
+- it refuses changes to any path in `<scenarios>/protected` (one prefix per
+  line, `#` comments, a line `!<prefix>` excepting paths under it; the
+  deployed list, `rsi/scenarios/protected`, protects `rsi/`, `scripts/`,
+  `deploy/`, `web/` but `web/src/` and `web/index.html`, `rust-toolchain`,
+  `rust-toolchain.toml` and `.cargo/` — everything that runs as the owner
+  outside the sandbox or that judges the candidate, which no candidate may
+  edit), any build-time code
   (`build.rs`, `.cargo/`, a `build` key in a Cargo.toml), any change to lint
   configuration, fewer runnable tests than the base, and the loss of a base
   test by name. The owner retires a test with the feature it removed by
