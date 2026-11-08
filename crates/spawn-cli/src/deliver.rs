@@ -743,99 +743,6 @@ fn attempt_records(task: &TaskRow, facts: &Facts) -> Vec<Attempt> {
         .collect()
 }
 
-/// When the mission layer's next step is due, from the rows and facts this
-/// pass decided with: the earliest retry that is not due yet
-/// ([`Attempts::Retry`]), a cancelled resident's notice after its wait
-/// ([`cancel_order`]), or a report note refused before typing
-/// ([`note_retry`]). On this host's clock, the one those waits are compared
-/// against. `None`: nothing here waits for a clock.
-pub(crate) fn next_due(work: &Work, rows: &[Facts], now_ms: i64) -> Option<i64> {
-    let facts: BTreeMap<&str, &Facts> = rows
-        .iter()
-        .map(|facts| (facts.session_id.as_str(), facts))
-        .collect();
-    let mut due: Option<i64> = None;
-    // A time already reached is not a wait: this pass either acted on it or
-    // found the worker not ready for it, and either way the records that
-    // change that are what moves the watermark.
-    let mut soon = |at: i64| {
-        if at > now_ms {
-            due = Some(due.map_or(at, |known: i64| known.min(at)));
-        }
-    };
-    let next = next_up(work);
-    for task in &work.tasks {
-        if !matches!(task.state, TaskState::Assigned | TaskState::Revise)
-            || !next.contains(&task.id)
-        {
-            continue;
-        }
-        let Some(found) = facts.get(task.session_id.as_str()).copied() else {
-            continue;
-        };
-        if let Attempts::Retry { due_ms, .. } = attempts(&work.waits, task, found) {
-            soon(due_ms);
-        }
-    }
-    for cancelled in work.cancelled.iter().filter(|cancelled| !cancelled.told) {
-        let Some(found) = facts.get(cancelled.session_id.as_str()).copied() else {
-            continue;
-        };
-        if found.open_command || found.stopping() || found.live {
-            continue;
-        }
-        let prefix = cancelled.notice_prefix();
-        let tries: Vec<&crate::dispatch::Sent> = found
-            .dispatched
-            .iter()
-            .filter(|sent| sent.key.starts_with(&prefix))
-            .collect();
-        if let Some(last) = tries.last()
-            && last.succeeded == Some(false)
-        {
-            let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
-            soon(finished.saturating_add(retry_wait_ms(tries.len())));
-        }
-    }
-    for found in rows {
-        for tries in notes(&found.dispatched).into_values() {
-            let Some(last) = tries.last() else {
-                continue;
-            };
-            if crate::dispatch::reached_with(last.succeeded, last.error.as_deref())
-                || tries.len() > NOT_READY_FREE
-            {
-                continue;
-            }
-            let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
-            soon(finished.saturating_add(NOT_READY_RETRY_MS));
-        }
-    }
-    due
-}
-
-/// The report notes among the commands the dispatcher sent into one session,
-/// by the note's own key, each with its attempts oldest first
-/// ([`note_retry`]).
-fn notes(sent: &[crate::dispatch::Sent]) -> BTreeMap<&str, Vec<&crate::dispatch::Sent>> {
-    let mut notes: BTreeMap<&str, Vec<&crate::dispatch::Sent>> = BTreeMap::new();
-    for command in sent {
-        let key = match command.key.rsplit_once("-retry-") {
-            Some((base, number))
-                if !number.is_empty()
-                    && number.bytes().all(|byte| byte.is_ascii_digit())
-                    && base.starts_with(UNFINISHED_KEY) =>
-            {
-                base
-            }
-            _ if command.key.starts_with(UNFINISHED_KEY) => command.key.as_str(),
-            _ => continue,
-        };
-        notes.entry(key).or_default().push(command);
-    }
-    notes
-}
-
 /// Where a waiting task's current delivery stands, from its attempts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Attempts {
@@ -1849,10 +1756,9 @@ fn send_note(
 #[cfg(test)]
 mod tests {
     use super::{
-        CREDENTIALS_LINE, Cancelled, DELIVERY_RETRIES, NOT_READY_RETRY_MS, News, PROCESSES_LINE,
-        REPORT, TaskRow, Work, delivered, delivery_mark, mark_delivery, new_report, news_items,
-        next_due, notice_task, put_aside, report_contract, report_due, retry_wait_ms, task_prompt,
-        typed,
+        CREDENTIALS_LINE, Cancelled, DELIVERY_RETRIES, News, PROCESSES_LINE, REPORT, TaskRow, Work,
+        delivered, delivery_mark, mark_delivery, new_report, news_items, notice_task, put_aside,
+        report_contract, report_due, task_prompt, typed,
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
@@ -3904,89 +3810,5 @@ PENDING_ISSUES\n";
         );
         assert!(super::orders(&tasks, &rows, 60_000).is_empty());
         assert_eq!(super::reissues(&tasks, &rows, 60_000).len(), 1);
-    }
-
-    /// The timers the mission layer waits for are the waits its own rules
-    /// name: a delivery refused because the pane was not ready goes again
-    /// after [`NOT_READY_RETRY_MS`], one that failed after `retry_wait_ms` of
-    /// its failures, and neither is waited for once it is due (the step acts
-    /// on it then) or when its retries are spent.
-    #[test]
-    fn a_waiting_delivery_is_due_at_the_end_of_its_own_wait() {
-        let mut refused = worker(true, true);
-        refused.dispatched = vec![sent(
-            30,
-            "deliver-7-0",
-            100_000,
-            Some("pane state Busy does not accept input"),
-        )];
-        let tasks = Work {
-            tasks: vec![task(7, TaskState::Assigned, "resident")],
-            ..Work::default()
-        };
-        assert_eq!(
-            next_due(&tasks, &[refused.clone()], 100_000),
-            Some(100_000 + NOT_READY_RETRY_MS),
-            "a refusal before typing waits the not-ready wait"
-        );
-        assert_eq!(
-            next_due(&tasks, &[refused], 100_000 + NOT_READY_RETRY_MS),
-            None,
-            "a wait already over is the step's to act on now"
-        );
-
-        let mut failed = worker(true, true);
-        failed.dispatched = vec![sent(31, "deliver-7-0", 500_000, Some("terminal gone"))];
-        assert_eq!(
-            next_due(&tasks, &[failed.clone()], 500_000),
-            Some(500_000 + retry_wait_ms(1)),
-            "a failed attempt waits its doubling wait"
-        );
-        failed.dispatched.push(sent(
-            32,
-            "deliver-7-0-retry-1",
-            700_000,
-            Some("terminal gone"),
-        ));
-        assert_eq!(
-            next_due(&tasks, &[failed], 700_000),
-            Some(700_000 + retry_wait_ms(2)),
-            "each failure after the first waits twice as long"
-        );
-    }
-
-    /// Nothing waits while nothing can be retried: an attempt in flight, one
-    /// that got through, a worker with a command in flight, and a delivery
-    /// the step is about to send for the first time.
-    #[test]
-    fn a_delivery_with_nothing_to_retry_waits_for_no_time() {
-        let tasks = Work {
-            tasks: vec![task(7, TaskState::Assigned, "resident")],
-            ..Work::default()
-        };
-        let mut fresh = worker(true, true);
-        fresh.dispatched = Vec::new();
-        assert_eq!(next_due(&tasks, &[fresh.clone()], 0), None, "its first try");
-        let mut through = worker(true, true);
-        through.dispatched = vec![sent(30, "deliver-7-0", 100_000, None)];
-        assert_eq!(
-            next_due(&tasks, &[through], 100_000),
-            None,
-            "it got through"
-        );
-        let mut busy = worker(true, true);
-        busy.open_command = true;
-        busy.dispatched = vec![sent(
-            31,
-            "deliver-7-0",
-            100_000,
-            Some("pane state Busy does not accept input"),
-        )];
-        assert_eq!(
-            next_due(&tasks, &[busy], 100_000),
-            Some(100_000 + NOT_READY_RETRY_MS),
-            "a command in flight holds the retry, but its end is an event: the wait is still \
-             the one the attempt names"
-        );
     }
 }

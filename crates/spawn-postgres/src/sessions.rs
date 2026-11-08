@@ -77,44 +77,33 @@ pub(crate) const LAST_POSITION: &str = "select coalesce(max(id), 0) as id from s
 /// succeeded commands started that died young: a revival is judged by
 /// whether its engine stayed up, not by whether it launched.
 pub(crate) const LIVENESS_FACTS: &str = concat!(
-    // The session's executions once: every use below reads this row set, and
-    // the view behind it (`agent_executions`) is a scan of the log with a
-    // lateral read of each execution's end, so evaluating it once per call
-    // rather than once per question keeps the loop's liveness read to one
-    // scan of the log per session.
-    "with execs as materialized (
-                    select e.execution_id, e.started_at_ms, e.ended_at_ms, e.cause,
-                           e.duration_ms, e.exit_code, e.command_id
+    "with last_exec as (
+                    select e.execution_id, e.started_at_ms, e.ended_at_ms, e.cause
                       from agent_executions e
                      where e.session_id = $1
-                 ), cmds as materialized (
-                    select c.id, c.principal, c.action, c.state, c.succeeded,
-                           c.created_at_ms, c.finished_at_ms
-                      from spawn_commands c where c.session_id = $1
-                 ), last_exec as (
-                    select execution_id, started_at_ms, ended_at_ms, cause from execs
-                     order by started_at_ms desc, execution_id desc limit 1
+                     order by e.started_at_ms desc, e.execution_id desc limit 1
                  ), last_cmd as (
                     select c.action ->> 'type' as kind
-                      from cmds c
+                      from spawn_commands c where c.session_id = $1
                      order by c.id desc limit 1
                  ), healthy as (
                     select coalesce(max(x.started_at_ms), 0) as since
-                      from execs x
-                     where not ",
+                      from agent_executions x
+                     where x.session_id = $1 and not ",
     died_young!("x"),
     "
                  ), died as (
                     select x.ended_at_ms
-                      from execs x
-                      join cmds c on c.id = x.command_id
-                     where c.principal = $2 and c.succeeded
+                      from agent_executions x
+                      join spawn_commands c on c.id = x.command_id
+                     where x.session_id = $1 and c.principal = $2 and c.succeeded
                        and x.started_at_ms > (select since from healthy) and ",
     died_young!("x"),
     "
                  )
                  select
-                    exists (select 1 from cmds c where c.state <> 'finished') as open_command,
+                    exists (select 1 from spawn_commands c
+                             where c.session_id = $1 and c.state <> 'finished') as open_command,
                     (select execution_id from last_exec) as execution_id,
                     coalesce((select ended_at_ms is null from last_exec), false) as live,
                     (select cause from last_exec) as cause,
@@ -122,13 +111,13 @@ pub(crate) const LIVENESS_FACTS: &str = concat!(
                     exists (select 1 from spawn_events e
                              where e.session_id = $1
                                and e.event_name = 'session.native_started') as native_bound,
-                    (select count(*) from cmds c
-                      where c.principal = $2 and c.succeeded = false
+                    (select count(*) from spawn_commands c
+                      where c.session_id = $1 and c.principal = $2 and c.succeeded = false
                         and c.created_at_ms > (select since from healthy)
                     ) + (select count(*) from died) as failures,
                     greatest(
-                      (select max(c.finished_at_ms) from cmds c
-                        where c.principal = $2 and c.succeeded = false),
+                      (select max(c.finished_at_ms) from spawn_commands c
+                        where c.session_id = $1 and c.principal = $2 and c.succeeded = false),
                       (select max(ended_at_ms) from died)
                     ) as last_failure_ms"
 );
@@ -418,7 +407,7 @@ impl PostgresStore {
         session: &SessionId,
         reviver: &str,
     ) -> Result<LivenessFacts, StoreError> {
-        let row = self.query_one_prepared(LIVENESS_FACTS, &[&session.as_str(), &reviver])?;
+        let row = self.query_one(LIVENESS_FACTS, &[&session.as_str(), &reviver])?;
         Ok(LivenessFacts {
             open_command: row.get("open_command"),
             execution_id: row.get("execution_id"),

@@ -22,8 +22,6 @@
 //! (the facts' `age_ms`). It is an item, never an action: stopping the job
 //! or the worker is the supervisor's decision.
 
-use std::collections::BTreeSet;
-
 use super::stall::took;
 use super::{Escalation, Facts, Job, Why, is_worker};
 
@@ -49,34 +47,6 @@ fn worker_line(facts: &Facts) -> String {
 /// One job, for a line: `bash b8w03og7k`.
 fn named(job: &Job) -> String {
     format!("{} {}", job.kind, job.id)
-}
-
-/// When the dispatcher's next step is due for a background job it has not
-/// escalated yet: the earliest time a job open for less than `bound_ms`
-/// reaches its bound, on the database's clock (the facts' `age_ms` is that
-/// clock's age of the job). A job whose item the supervisor was told waits
-/// for no time: told once, it stays told while it runs.
-pub(crate) fn next_due(rows: &[Facts], bound_ms: i64) -> Option<i64> {
-    let empty = BTreeSet::new();
-    let told = rows
-        .iter()
-        .find(|facts| facts.session_id == crate::supervise::SUPERVISOR_SESSION)
-        .map_or(&empty, |facts| &facts.told);
-    let mut due: Option<i64> = None;
-    for facts in rows.iter().filter(|facts| is_worker(facts) && facts.live) {
-        let execution = facts.execution_id.as_deref().unwrap_or("none");
-        for job in facts.jobs.iter().filter(|job| job.age_ms < bound_ms) {
-            if told.contains(&format!(
-                "{} job-{execution}-{}-{}",
-                facts.session_id, job.id, job.event_id
-            )) {
-                continue;
-            }
-            let at = job.started_at_ms.saturating_add(bound_ms);
-            due = Some(due.map_or(at, |known: i64| known.min(at)));
-        }
-    }
-    due
 }
 
 /// The escalations for the background jobs in `rows` open for `bound_ms`

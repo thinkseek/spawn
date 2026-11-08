@@ -409,22 +409,12 @@ impl Monitor {
             let batch = store
                 .alert_control(self.watermark, BATCH)
                 .map_err(|error| error.to_string())?;
-            let records = batch["records"].as_array().map_or(&[][..], Vec::as_slice);
-            for entry in records {
+            for entry in batch["records"].as_array().into_iter().flatten() {
                 let id = entry["event_id"].as_i64().unwrap_or_default();
                 let at = entry["at_ms"].as_i64().unwrap_or(now);
                 self.feed(id, at, &entry["record"], &mut events);
             }
-            // What the step has read: the last control record when the
-            // batch was cut at its limit (the rest waits for the next
-            // check), and otherwise everything up to the clock, which is
-            // what makes an idle check one statement (objective 023: the
-            // log's watermark, never the clock, says whether there is work).
-            self.watermark = if i64::try_from(records.len()).unwrap_or(i64::MAX) < BATCH {
-                watermark
-            } else {
-                batch["next"].as_i64().unwrap_or(self.watermark)
-            };
+            self.watermark = batch["next"].as_i64().unwrap_or(self.watermark);
             let observations = store
                 .alert_observations()
                 .map_err(|error| error.to_string())?;
@@ -443,16 +433,6 @@ impl Monitor {
         self.flush(store, now, &events, &mut lines);
         self.plan(now);
         Ok(lines)
-    }
-
-    /// The earliest time the step waits for even when no record is
-    /// written: its next host reading (`SPAWN_ALERT_CHECK_SECS`), or a
-    /// bound's due time. Before the first check it is `0`, so a fresh loop
-    /// runs it once.
-    pub(crate) fn due_ms(&self) -> i64 {
-        self.next_bound_ms.map_or(self.next_reading_ms, |bound| {
-            bound.min(self.next_reading_ms)
-        })
     }
 
     /// Read what the step needs back: its alerts, the missions and tasks, the

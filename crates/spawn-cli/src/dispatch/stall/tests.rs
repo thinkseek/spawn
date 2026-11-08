@@ -7,7 +7,7 @@ use serde_json::json;
 use spawn_core::event::{ModelProfile, SessionSeq};
 use spawn_core::observation::{Ambiguity, Confidence, Observation, SemanticState};
 
-use super::{Bounds, Stalls, items, next_due};
+use super::{Bounds, Stalls, items};
 use crate::deliver::Work;
 use crate::dispatch::{Escalation, Facts, Sent, Why, decide_with};
 
@@ -688,101 +688,4 @@ fn a_stall_reaches_the_supervisor_once_under_its_heading() {
     let host = items(&rows, &tasks, &found, &bounds());
     let plan = decide_with(&rows, &tasks, &host, true, NOW, "spawn");
     assert!(plan.pending.is_empty(), "{:?}", plan.pending);
-}
-
-// --- when the next step is due ---------------------------------------------
-
-/// Every step's timer is the record it stands on plus its bound, on the
-/// database's clock: not a clock of the loop's, and not a second before the
-/// item it makes is due.
-#[test]
-fn each_step_is_due_at_its_record_plus_its_bound() {
-    let facts = [worker(SemanticState::Waiting, true)];
-    let at = |tasks: serde_json::Value, rows: &[serde_json::Value]| {
-        let found = stalls(tasks);
-        next_due(&facts, &work(rows), &found, &bounds())
-    };
-    // delivery: assigned 100 s ago, bound 600 s.
-    assert_eq!(
-        at(
-            json!({"tasks": [open(7, "assigned", (120, "task.assigned", 100_000))]}),
-            &[row(7, "assigned", SESSION)],
-        ),
-        Some(NOW - 100_000 + 600_000)
-    );
-    // activity: delivered 100 s ago, bound 900 s, no fact since.
-    assert_eq!(
-        at(
-            json!({"tasks": [open(7, "delivered", (121, "task.delivered", 100_000))]}),
-            &[row(7, "delivered", SESSION)],
-        ),
-        Some(NOW - 100_000 + 900_000)
-    );
-    // judgement: reported 100 s ago, bound 1800 s.
-    assert_eq!(
-        at(
-            json!({"tasks": [open(7, "reported", (122, "task.reported", 100_000))]}),
-            &[row(7, "reported", SESSION)],
-        ),
-        Some(NOW - 100_000 + 1_800_000)
-    );
-    // landing: accepted by the gate 100 s ago, bound 600 s.
-    assert_eq!(
-        at(
-            json!({"tasks": [open(7, "landing", (123, "task.gated", 100_000))]}),
-            &[],
-        ),
-        Some(NOW - 100_000 + 600_000)
-    );
-    // stop: an ephemeral task closed 100 s ago whose worker still runs,
-    // bound 300 s.
-    let mut closed = open(7, "cancelled", (124, "task.cancelled", 100_000));
-    closed["kind"] = json!("ephemeral");
-    let mut running = worker(SemanticState::Working, false);
-    running
-        .dispatched
-        .push(failed(41, "retire-task-7", 200_000, "kill-session refused"));
-    let found = stalls(json!({"tasks": [closed]}));
-    assert_eq!(
-        next_due(&[running], &work(&[]), &found, &bounds()),
-        Some(NOW - 100_000 + 300_000)
-    );
-    // A halted mission's bound (0 by default) is its record's time.
-    let halted = stalls(json!({"halted": [{
-        "mission_id": 3, "reason": "3 gate rejections in a row",
-        "record": {"id": 500, "type": "mission.halted", "at_ms": NOW - 1_000},
-        "tasks": [11]}]}));
-    assert_eq!(
-        next_due(&[], &work(&[]), &halted, &bounds()),
-        Some(NOW - 1_000)
-    );
-}
-
-/// An item the supervisor was told waits for no time: the tag never
-/// changes while its record stands, so the step has nothing to do for it
-/// again. A step measured from a newer record is a new tag, and due again.
-#[test]
-fn a_stall_already_told_waits_for_no_time() {
-    let tasks = work(&[row(7, "assigned", SESSION)]);
-    let found = stalls(json!({"tasks": [open(7, "assigned", (120, "task.assigned", 100_000))]}));
-    let rows = [worker(SemanticState::Waiting, true)];
-    assert_eq!(
-        next_due(&rows, &tasks, &found, &bounds()),
-        Some(NOW - 100_000 + 600_000)
-    );
-    let rows = [
-        worker(SemanticState::Waiting, true),
-        supervisor(&[format!("{SESSION} stall-7-delivery-120")]),
-    ];
-    assert_eq!(
-        next_due(&rows, &tasks, &found, &bounds()),
-        None,
-        "told once, it waits for no clock"
-    );
-    let newer = stalls(json!({"tasks": [open(7, "assigned", (130, "task.assigned", 100_000))]}));
-    assert_eq!(
-        next_due(&rows, &tasks, &newer, &bounds()),
-        Some(NOW - 100_000 + 600_000),
-        "a new record is a new tag, with its own bound"
-    );
 }
