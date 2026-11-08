@@ -27,7 +27,11 @@
 #                                       MANIFEST (sha256 of each file),
 #                                       exit, seconds, gate.log (or
 #                                       keys.log) and verdict when present
-#   remote remove <job>                 delete the job's directory and scratch
+#   remote remove <job> [force]         delete the job's directory and scratch;
+#                                       refuses a job whose run has not
+#                                       finished (out/exit is missing: a gate
+#                                       may still be running there) unless
+#                                       `force` is given
 #
 # <job> is letters, digits, '.', '_' and '-' (deploy/gate-runner.sh makes
 # one per attempt). The root is the directory two levels above this file.
@@ -42,6 +46,9 @@
 #   GATE_RUNNER_PATH          the PATH a gate runs with (the toolchain)
 #   GATE_RUNNER_KEEP_JOBS     1: keep every job directory (the dispatcher's
 #                             --keep does the same for one job)
+#   GATE_RUNNER_KEEP_DAYS     prune job directories (and their scratch) older
+#                             than this many days on preflight and accept
+#                             (default 7; 0 keeps them)
 #
 # POSIX sh. Requires: git, tar, gzip, sha256sum, nice, timeout (coreutils
 # >= 8.5, for --kill-after), and docker or a PostgreSQL bin directory.
@@ -80,6 +87,7 @@ seconds() {
 # out.
 load_config() {
     cfg_jobs="" cfg_pg_image="" cfg_pg_bin="" cfg_min_free="" cfg_nice="" cfg_path="" cfg_keep=""
+    cfg_keep_days=""
     if [ -f "$config" ]; then
         # shellcheck source=/dev/null
         . "$config"
@@ -91,11 +99,13 @@ load_config() {
     cfg_nice=${GATE_RUNNER_NICE:-}
     cfg_path=${GATE_RUNNER_PATH:-}
     cfg_keep=${GATE_RUNNER_KEEP_JOBS:-}
+    cfg_keep_days=${GATE_RUNNER_KEEP_DAYS:-}
     [ -n "$cfg_jobs" ] || cfg_jobs=$(($(nproc 2>/dev/null || echo 2) / 2))
     [ "$cfg_jobs" -ge 1 ] || cfg_jobs=1
     [ "$cfg_jobs" -le 8 ] || cfg_jobs=8
     [ -n "$cfg_min_free" ] || cfg_min_free=10
     [ -n "$cfg_nice" ] || cfg_nice=10
+    [ -n "$cfg_keep_days" ] || cfg_keep_days=7
     [ -n "$cfg_path" ] || cfg_path=$PATH
     [ -n "$cfg_pg_image$cfg_pg_bin" ] || {
         echo "gate-runner: $config names no private server (GATE_RUNNER_PG_IMAGE or GATE_RUNNER_PG_BIN); a runner never uses a shared test database" >&2
@@ -105,7 +115,7 @@ load_config() {
         echo "gate-runner: $config names both a docker image and a bin directory; the gate takes one" >&2
         exit 3
     }
-    case "$cfg_jobs$cfg_min_free$cfg_nice" in *[!0-9]*) echo "gate-runner: $config: jobs, the disk floor and nice are numbers" >&2; exit 3 ;; esac
+    case "$cfg_jobs$cfg_min_free$cfg_nice$cfg_keep_days" in *[!0-9]*) echo "gate-runner: $config: jobs, the disk floor, nice and the keep days are numbers" >&2; exit 3 ;; esac
 }
 
 # ensure_dirs: the root's own directories, this uid's only.
@@ -114,6 +124,23 @@ ensure_dirs() {
         [ -d "$dir" ] || mkdir -p "$dir"
         chmod 700 "$dir" 2>/dev/null || :
     done
+}
+
+# prune_jobs: job directories (and their scratch) older than the keep days
+# go, on preflight and accept. A gate's own timeout is hours, so a directory
+# that old belongs to no run of this runner's; what is kept is anything
+# younger, whatever state it is in (so a job left for a look survives the
+# next dispatch for a while).
+prune_jobs() {
+    [ "$cfg_keep_days" != 0 ] || return 0
+    pruned=0
+    for dir in "$jobs"/* "$work"/* /tmp/gate-runner/*; do
+        [ -e "$dir" ] || [ -L "$dir" ] || continue
+        [ -n "$(find "$dir" -maxdepth 0 -mtime "+$cfg_keep_days" 2>/dev/null)" ] || continue
+        rm -rf "$dir"
+        pruned=$((pruned + 1))
+    done
+    [ "$pruned" = 0 ] || echo "gate-runner: pruned $pruned job director(ies) older than ${cfg_keep_days} days" >&2
 }
 
 # tool <name> <command...>: `name=<first line>` or `name=missing`.
@@ -131,6 +158,7 @@ tool() {
 preflight() {
     load_config
     ensure_dirs
+    prune_jobs
     version=$(sha256sum "$root/bin/remote" 2>/dev/null | cut -d' ' -f1) || version="unknown"
     printf 'version=%s\n' "$version"
     printf 'root=%s\n' "$root"
@@ -153,6 +181,7 @@ preflight() {
     printf 'jobs=%s\n' "$cfg_jobs"
     printf 'nice_level=%s\n' "$cfg_nice"
     printf 'min_free_gb=%s\n' "$cfg_min_free"
+    printf 'keep_days=%s\n' "$cfg_keep_days"
     printf 'nproc=%s\n' "$(nproc 2>/dev/null || echo 1)"
     printf 'pg_image=%s\n' "$cfg_pg_image"
     printf 'pg_bin=%s\n' "$cfg_pg_bin"
@@ -174,6 +203,7 @@ accept_job() {
     job=$1
     load_config
     ensure_dirs
+    prune_jobs
     dir=$jobs/$job
     partial=$dir.partial
     rm -rf "$partial"
@@ -300,9 +330,18 @@ collect_job() {
     tar -czf - -C "$out" MANIFEST $files
 }
 
-remove_job() {
+remove_job() { # <job> [force]
     job_name "$1"
     load_config
+    out=$jobs/$1/out
+    # A job whose run has not finished has no out/exit: its gate may still
+    # be running (a run whose SSH connection died keeps going under the
+    # runner's own timeout), and deleting the directory under it would strand
+    # its server and scratch. A human may force it.
+    if [ -d "$out" ] && [ ! -f "$out/exit" ] && [ "${2-}" != force ]; then
+        echo "gate-runner: $1 has no result yet (out/exit): a gate may still be running there; not removed (remove $1 force to remove it anyway)" >&2
+        exit 4
+    fi
     rm -rf "$jobs/$1" "$jobs/$1.partial" "$work/$1" "/tmp/gate-runner/$1"
 }
 
@@ -336,8 +375,8 @@ collect)
     ;;
 remove)
     shift
-    [ $# -eq 1 ] || { echo "usage: remote remove <job>" >&2; exit 2; }
-    remove_job "$1"
+    [ $# -ge 1 ] && [ $# -le 2 ] || { echo "usage: remote remove <job> [force]" >&2; exit 2; }
+    remove_job "$@"
     ;;
 *)
     echo "usage: remote version|preflight|accept <job>|run <job> <seconds>|keys <job> <seconds>|collect <job>|remove <job>" >&2

@@ -167,7 +167,8 @@ case $cmd in
 *" run "*) action=run ;;
 *" keys "*) action=keys ;;
 *collect*) action=collect ;;
-*preflight* | *remove*) action=other ;;
+*remove*) action=remove ;;
+*preflight*) action=other ;;
 esac
 n=0
 if [ -n "$action" ] && [ -f "$STUB_COUNT_DIR/$action" ]; then
@@ -194,6 +195,17 @@ sh -c "$cmd" || status=$?
 if [ "$action" = run ] && [ "${STUB_DROP_VERDICT:-0}" = 1 ]; then
     rm -f "$STUB_ROOT"/jobs/*/out/verdict 2>/dev/null || true
 fi
+if [ "$action" = run ] && [ "${STUB_TWO_LINE_VERDICT:-0}" = 1 ]; then
+    for verdict in "$STUB_ROOT"/jobs/*/out/verdict; do
+        [ ! -f "$verdict" ] || printf 'extra line\n' >>"$verdict"
+    done
+fi
+if [ "$action" = run ] && [ "${STUB_FOREIGN_VERDICT:-0}" = 1 ]; then
+    for verdict in "$STUB_ROOT"/jobs/*/out/verdict; do
+        [ ! -f "$verdict" ] ||
+            sed -i 's/"base":"[0-9a-f]*"/"base":"0000000000000000000000000000000000000000"/' "$verdict"
+    done
+fi
 exit "$status"
 EOF
 chmod 755 "$stub_dir/ssh"
@@ -209,7 +221,8 @@ dispatch() { # <out dir> [args...]
 reset() { # <out dir>: a clean out directory and per-case stub counters
     rm -rf "$1"
     rm -f "$STUB_COUNT_DIR"/*
-    unset STUB_FAIL_SHIP STUB_FAIL_RUN STUB_FAIL_COLLECT STUB_DROP_VERDICT STUB_TRUNCATE_COLLECT
+    unset STUB_FAIL_SHIP STUB_FAIL_RUN STUB_FAIL_COLLECT STUB_FAIL_REMOVE STUB_DROP_VERDICT \
+        STUB_TRUNCATE_COLLECT STUB_TWO_LINE_VERDICT STUB_FOREIGN_VERDICT
 }
 job_of() { # <out dir>: the one job's directory
     find "$1" -mindepth 1 -maxdepth 1 -type d -not -name '.*' | head -n 1
@@ -321,6 +334,112 @@ check_status=0
     >"$scratch/check.out" 2>"$scratch/check.err" || check_status=$?
 expect "--check under a gate environment file: exit 0" "$check_status" 0
 contains "and the keys are equal" "$scratch/check.out" "a base result cached here is a hit there"
+
+# 8c. A job whose run has not finished is not removed: its gate may still be
+# running (a run whose connection died keeps going under the runner's own
+# timeout), and deleting the directory under it would strand its server.
+# A human may force it.
+reset "$out"
+dispatch --keep "$runner_home" "$repo_git" "$base" "$candidate" "$scen" "$out"
+expect "a kept job: exit 0" "$status" 0
+job=$(job_of "$out")
+kept_attempt=$(find "$runner_home/jobs" -maxdepth 1 -name '*.a1' | head -n 1)
+[ -n "$kept_attempt" ] && pass "the runner's job is there" || fail "the kept job is missing"
+rm -f "$kept_attempt/out/exit"
+remove_status=0
+"$runner_home/bin/remote" remove "$(basename "$kept_attempt")" >"$scratch/remove.out" 2>"$scratch/remove.err" ||
+    remove_status=$?
+expect "remove refuses a job with no result" "$remove_status" 4
+contains "and says a gate may still be running there" "$scratch/remove.err" "a gate may still be running there"
+[ -d "$kept_attempt" ] && pass "the job is still there" || fail "the job was removed anyway"
+"$runner_home/bin/remote" remove "$(basename "$kept_attempt")" force
+[ ! -e "$kept_attempt" ] && pass "remove force removes it" || fail "remove force left the job"
+
+# 8h. A removal that fails is said and does not fail the dispatch: the gate
+# answered, and what stayed on the runner is named. (The helper's own
+# refusal of a job whose gate may still be running is case 8c.)
+reset "$out"
+STUB_FAIL_REMOVE=1 dispatch "$runner_home" "$repo_git" "$base" "$candidate" "$scen" "$out"
+expect "a removal that fails: the dispatch still exits 0" "$status" 0
+contains "and the dispatcher says which job it left" "$scratch/dispatch.err" "left the runner's job"
+job=$(job_of "$out")
+expect "the verdict is the gate's" "$(jq -r .verdict "$job/verdict.json")" accepted
+# Tidy: the stub refused every remove; take them by hand.
+for attempt_job in "$runner_home"/jobs/*; do
+    [ -e "$attempt_job" ] || continue
+    "$runner_home/bin/remote" remove "$(basename "$attempt_job")" force
+done
+
+# 8i. A verdict that is not one line, and one that names other commits, are
+# refused: exit 2 and no verdict file (the gate's answer must be one whole
+# line about the commits asked for).
+reset "$out"
+STUB_TWO_LINE_VERDICT=1 dispatch --retries 0 "$runner_home" "$repo_git" "$base" "$candidate" "$scen" "$out"
+expect "a two-line verdict: exit 2" "$status" 2
+job=$(job_of "$out")
+[ ! -f "$job/verdict.json" ] && pass "no verdict file" || fail "a two-line verdict became a verdict.json"
+contains "and says it is truncated" "$scratch/dispatch.err" "truncated"
+reset "$out"
+STUB_FOREIGN_VERDICT=1 dispatch --retries 0 "$runner_home" "$repo_git" "$base" "$candidate" "$scen" "$out"
+expect "a verdict that names other commits: exit 2" "$status" 2
+job=$(job_of "$out")
+[ ! -f "$job/verdict.json" ] && pass "no verdict file either" || fail "a foreign verdict became a verdict.json"
+contains "and says so" "$scratch/dispatch.err" "names other commits"
+
+# 8d. Old job directories are pruned on preflight (a gate's own timeout is
+# hours, so nothing that old is running); fresh ones stay.
+mkdir -p "$runner_home/jobs/old-$$" "$runner_home/jobs/new-$$"
+mkdir -p "/tmp/gate-runner/old-$$" "/tmp/gate-runner/new-$$"
+touch -d '10 days ago' "$runner_home/jobs/old-$$" "/tmp/gate-runner/old-$$"
+"$runner_home/bin/remote" preflight >"$scratch/preflight.out" 2>"$scratch/preflight.err"
+[ ! -e "$runner_home/jobs/old-$$" ] && pass "a job older than the keep days is pruned" ||
+    fail "an old job survived"
+[ -d "$runner_home/jobs/new-$$" ] && pass "a fresh job stays" || fail "a fresh job was pruned"
+[ ! -e "/tmp/gate-runner/old-$$" ] && [ -d "/tmp/gate-runner/new-$$" ] &&
+    pass "and its short scratch, old and new" || fail "the short scratch did not follow"
+contains "and says what it pruned" "$scratch/preflight.err" "older than 7 days"
+rm -rf "$runner_home/jobs/new-$$" "/tmp/gate-runner/new-$$"
+
+# 8e. A dispatch to a runner rooted where the gate's sandbox empties its
+# directories is refused, not run: its gate could not see the controller.
+tmp_root="/tmp/gate-runner-root.$$"
+cp -R "$runner_home" "$tmp_root"
+status=0
+GATE_RUNNER_REMOTE_BIN="$tmp_root/bin/remote" \
+    "$repo/deploy/gate-runner.sh" "$tmp_root" "$repo_git" "$base" "$candidate" "$scen" "$out" \
+    >"$scratch/dispatch.out" 2>"$scratch/dispatch.err" || status=$?
+expect "a mis-rooted runner is refused: exit 3" "$status" 3
+contains "and says why" "$scratch/dispatch.err" "the gate's sandbox empties"
+rm -rf "$tmp_root"
+
+# 8f. --check fails a missing toolchain tool and a scenarios directory with
+# no objective to compare (equal and empty is no comparison).
+mkdir -p "$scratch/broken"
+printf '#!/bin/sh\nexit 1\n' >"$scratch/broken/jq"
+chmod 755 "$scratch/broken/jq"
+check_status=0
+PATH="$scratch/broken:$PATH" "$repo/deploy/gate-runner.sh" --check "$runner_home" "$repo_git" "$base" "$keysscen" \
+    >"$scratch/check.out" 2>"$scratch/check.err" || check_status=$?
+expect "--check with a missing tool: exit 1" "$check_status" 1
+contains "and the tool is a failure" "$scratch/check.out" "jq           FAIL"
+nokeysscen=$scratch/scen-nokeys
+mkdir -p "$nokeysscen"
+cp "$scen/protected" "$nokeysscen/"
+printf '#!/bin/sh\nexit 0\n' >"$nokeysscen/check-ok.sh"
+check_status=0
+"$repo/deploy/gate-runner.sh" --check "$runner_home" "$repo_git" "$base" "$nokeysscen" \
+    >"$scratch/check.out" 2>"$scratch/check.err" || check_status=$?
+expect "--check with no objective to compare: exit 1" "$check_status" 1
+contains "and says nothing would be shared" "$scratch/check.out" "no objective scenario to compare"
+
+# 8g. A root under this shell's TMPDIR is fine (the gate never runs with
+# it): setup.sh accepts it.
+tmpdir_root=$HOME/.cache/gate-runner-tmpdir.$$
+TMPDIR=$HOME/.cache sh "$repo/deploy/gate-runner/setup.sh" --root "$tmpdir_root" --pg-bin "$pg_bin" \
+    >"$scratch/setup3.out" 2>"$scratch/setup3.err" &&
+    pass "a root under the setup shell's TMPDIR is accepted" ||
+    fail "a root under the setup shell's TMPDIR was refused: $(head -n 1 "$scratch/setup3.err")"
+rm -rf "$tmpdir_root"
 
 # 9. --check: a runner whose helper is another version.
 cp "$runner_home/bin/remote" "$scratch/remote.orig"

@@ -50,14 +50,17 @@ until the PoC is measured and the owner says to switch.
   `check-web.sh` fails on the runner.
 - SSH access from the primary (key-based, no password; the dispatcher uses
   `BatchMode=yes`).
-- A root **not** under `/tmp`, `/run`, `/var/tmp` or `TMPDIR`: the gate's
-  sandbox empties those and would not see the controller's scripts inside
-  the job (under `$HOME` it binds them back; elsewhere the sandbox shows the
-  host's files). `setup.sh` refuses such a root and `--check` reports it.
-  Keep it short, too: a Unix socket path is at most 107 bytes, and the
-  gate's own server puts one about 40 bytes below `TMPDIR`; a root whose
-  path is too long moves the job's scratch to `/tmp/gate-runner/<job>` (and
-  then the disk floor is measured on `/tmp`).
+- A root **not** under `/tmp`, `/run` or `/var/tmp`: the gate's sandbox
+  empties those and would not see the controller's scripts inside the job
+  (under `$HOME` it binds them back; elsewhere the sandbox shows the host's
+  files). `setup.sh` refuses such a root, `--check` reports it, and the
+  dispatcher refuses to dispatch to it (a dispatch that skips `--check` gets
+  no wrong rejection from a gate whose sandbox cannot see the controller).
+  The shell's own `TMPDIR` is not one of them: the gate never runs with it.
+  Keep the root short, too: a Unix socket path is at most 107 bytes, and
+  the gate's own server puts one about 40 bytes below `TMPDIR`; a root
+  whose path is too long moves the job's scratch to `/tmp/gate-runner/<job>`
+  (and then the disk floor is measured on `/tmp`).
 
 What it must **not** have: no engines, no workspaces, no tmux sessions, no
 live database. `setup.sh` wants nothing of the fleet, and the dispatcher
@@ -75,9 +78,9 @@ It writes `~/.local/share/gate-runner/config` (mode 0600), installs
 `~/.local/share/gate-runner/bin/remote`, makes `jobs/`, `cache/` and `work/`,
 links `web/node_modules` in, and ends by printing the preflight report
 (`remote preflight`), the same one `--check` reads. Options:
-`--root`, `--pg-image`, `--pg-bin`, `--jobs`, `--min-free-gb`, `--nice`;
-`--force` rewrites a config the owner may have tuned. A plain rerun keeps the
-config and reinstalls only the helper.
+`--root`, `--pg-image`, `--pg-bin`, `--jobs`, `--min-free-gb`, `--nice`,
+`--keep-days`; `--force` rewrites a config the owner may have tuned. A plain
+rerun keeps the config and reinstalls only the helper.
 
 The helper's sha256 is the protocol version: the dispatcher refuses a runner
 whose installed helper differs from its own copy, so **upgrading the runner
@@ -127,14 +130,17 @@ deploy/gate-runner.sh --check <runner> <source.git> <base> <scenarios>
 ```
 
 It reports what the runner has — helper version, git/tar/gzip/sha256sum/
-nice/timeout/bwrap, the private server, free disk against the floor, the
-UI's lockfile against the controller's, the toolchain — and then asks the
+nice/timeout/bwrap, rustc/cargo/node/psql/python3/jq (a missing one is a
+failure), the private server, free disk against the floor, the UI's
+lockfile against the controller's — and then asks the
 question the base cache depends on: **does the runner compute the same
 base-cache key this host does?** It ships the archive, runs
 `gate.sh --base-keys` on the runner and the same script here, and compares
 the keys scenario by scenario (the mode runs the gate's setup — the exports,
 the socket scan and the toolchain probe — and no scenario). Equal keys mean
-a base result cached here is a hit there; different keys mean the toolchain,
+a base result cached here is a hit there; a scenarios directory with no
+objective the base phase judges compares nothing and is a failure, not an
+equal one; different keys mean the toolchain,
 the server, `LANG` or a bound directory differs, and the two caches do not
 share (the difference is printed; `--keep` keeps the runner's log).
 
@@ -169,6 +175,12 @@ with.
 - A transport failure during the run can leave the gate running on the
   runner until the runner's own `timeout` ends it; the retry ships a new
   attempt with its own id and directory, so nothing is overwritten.
-- The runner's disk is its own: jobs are removed after a successful
+- The runner's disk is its own: a job is removed after a successful
   collection, and a failed attempt's job is kept for a look (remove it by
-  hand, or with `remote remove <job>`).
+  hand, or with `remote remove <job> [force]`). A job whose run has not
+  finished (no `out/exit`) is refused by `remove`: its gate may still be
+  running under the runner's timeout, and deleting the directory under it
+  would strand its server and scratch — the dispatcher says which attempt
+  it left. Job directories older than `GATE_RUNNER_KEEP_DAYS` (default 7;
+  0 keeps them) are pruned on every preflight and accept, whatever their
+  state: a gate's own timeout is hours, so nothing that old is running.

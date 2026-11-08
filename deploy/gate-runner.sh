@@ -284,6 +284,12 @@ require_runner() {
     case "$free" in '' | *[!0-9]*) die "the runner cannot read its free disk" 3 ;; esac
     [ "$free" -ge $((floor * 1048576)) ] ||
         die "the runner has $((free / 1048576)) GiB free, under its floor of ${floor} GiB" 3
+    case "$(pv "$report" root)" in
+    /tmp/* | /run/* | /var/tmp/*)
+        die "the runner's root is under a directory the gate's sandbox empties ($(pv "$report" root)): the controller's scripts in it would be invisible to the gate (reinstall under \$HOME)" 3
+        ;;
+    "") die "the runner reports no root" 3 ;;
+    esac
     there=$(pv "$report" version)
     [ "$there" = "$local_remote_sha" ] ||
         die "the runner's helper is another version ($there, this tree's $local_remote_sha): rerun deploy/gate-runner/setup.sh there" 3
@@ -447,7 +453,11 @@ if [ "$check" = 1 ]; then
         esac
     fi
     for name in rustc cargo node psql python3 jq; do
-        report "$name" ok "runner: $(pv "$reportlines" "$name")"
+        value=$(pv "$reportlines" "$name")
+        case $value in
+        "" | missing | unreadable) report "$name" FAIL "missing on the runner (a gate builds and asks them)" ;;
+        *) report "$name" ok "runner: $value" ;;
+        esac
     done
     if [ "$bad" != 0 ]; then
         say "$prog: the runner is not ready (above); not asking it for keys"
@@ -498,15 +508,21 @@ if [ "$check" = 1 ]; then
         exit 3
     fi
     grep '^key ' "$stage_dir/local.log" 2>/dev/null | LC_ALL=C sort >"$stage_dir/local.keys" || true
-    report "this host" ok "$(grep -c '^key ' "$stage_dir/local.keys" || true) key(s), $(sed -n 's/^| base cache: toolchain //p' "$stage_dir/local.log" | head -n 1)"
-    report "runner" ok "$(grep -c '^key ' "$stage_dir/remote.keys" || true) key(s), exit $remote_exit, $(pv "$reportlines" root)/jobs/$job/out/keys.log"
+    local_count=$(grep -c '^key ' "$stage_dir/local.keys" || true)
+    remote_count=$(grep -c '^key ' "$stage_dir/remote.keys" || true)
+    report "this host" ok "$local_count key(s), $(sed -n 's/^| base cache: toolchain //p' "$stage_dir/local.log" | head -n 1)"
+    report "runner" ok "$remote_count key(s), exit $remote_exit, $(pv "$reportlines" root)/jobs/$job/out/keys.log"
     if [ "$remote_exit" != 0 ]; then
         report "base keys" FAIL "the runner's key run exited $remote_exit"
         note "its log: $(tail -n 3 "$stage_dir/remote/keys.log" 2>/dev/null | tr '\n' ' ')"
+    elif [ "$local_count" = 0 ] && [ "$remote_count" = 0 ]; then
+        # Equal and empty is no comparison at all: the scenarios directory
+        # holds no objective the base phase would judge.
+        report "base keys" FAIL "no objective scenario to compare (this directory has none the base phase judges; nothing would be shared)"
     elif cmp -s "$stage_dir/local.keys" "$stage_dir/remote.keys"; then
-        report "base keys" ok "equal ($(grep -c '^key ' "$stage_dir/local.keys" || true) scenario(s)): a base result cached here is a hit there"
+        report "base keys" ok "equal ($local_count scenario(s)): a base result cached here is a hit there"
     else
-        report "base keys" FAIL "differ (this host $(grep -c '^key ' "$stage_dir/local.keys" || true), runner $(grep -c '^key ' "$stage_dir/remote.keys" || true))"
+        report "base keys" FAIL "differ (this host $local_count, runner $remote_count)"
         diff -u "$stage_dir/local.keys" "$stage_dir/remote.keys" 2>/dev/null | sed -n '3,20p' | sed 's/^/      /' || true
         note "toolchain, the server's version or LANG differ; the two logs are $stage_dir/local.log and the runner's job log"
     fi
@@ -654,10 +670,18 @@ verdict_word=""
 record=$(the_record "$(result_kind "$gate_exit")" "$gate_exit" "$attempts")
 place "$attempt_dir/collected" "$record"
 if [ "$keep_jobs" = 0 ]; then
-    # The job lives on the runner under its attempts' ids; remove them all.
+    # The job lives on the runner under its attempts' ids. Every attempt is
+    # asked to go, but the helper refuses one whose run has not finished
+    # (out/exit is missing: a run whose connection died keeps going under
+    # the runner's own timeout, and deleting its directory under it would
+    # strand its server). What stays is said.
     for attempt_job in "${attempt_ids[@]}"; do
-        ssh_run "$remote_bin remove $attempt_job" </dev/null >/dev/null 2>&1 ||
-            note "could not remove the runner's job $attempt_job"
+        remove_status=0
+        ssh_run "$remote_bin remove $attempt_job" </dev/null >/dev/null 2>"$stage_dir/remove.err" ||
+            remove_status=$?
+        if [ "$remove_status" != 0 ]; then
+            note "left the runner's job $attempt_job: $(head -n 1 "$stage_dir/remove.err" 2>/dev/null)"
+        fi
     done
 else
     say "$prog: kept the runner's jobs ${attempt_ids[*]}"
