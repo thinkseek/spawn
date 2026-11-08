@@ -1269,6 +1269,7 @@ impl One<'_> {
     fn interrupt(&mut self, fact: Fact) -> Result<(), String> {
         match fact {
             Fact::Turn(turn) => self.interrupt_turn(&turn),
+            Fact::Tool(tool) => self.interrupt_tool(&tool),
             Fact::End(end) => self.interrupt_end(&end),
         }
     }
