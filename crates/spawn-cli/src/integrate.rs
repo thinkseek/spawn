@@ -1354,7 +1354,7 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         gates,
         envelopes.envelope().cloned(),
     );
->>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
+>>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
@@ -2601,7 +2601,7 @@ impl Judge {
                     task.id,
                     extra["reason"].as_str().unwrap_or_default()
                 );
->>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
+>>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
                 gated("host_fault", extra)
             }
             Err(failure) => gated("aborted", aborted(&failure)),
@@ -3362,7 +3362,7 @@ fn size_text(bytes: u64) -> String {
         format!("{} MiB", bytes / MIB)
     } else {
         format!("{bytes} bytes")
->>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
+>>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
     }
 }
 

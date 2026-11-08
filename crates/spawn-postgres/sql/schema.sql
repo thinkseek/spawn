@@ -3057,7 +3057,7 @@ begin
            end) then
         raise exception 'a host_fault verdict names its evidence, its facts and backoff_ms '
                         '(or, killed by its memory limit, its scope, memory_max and oom_kills): %',
->>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
+>>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
                         p_record;
     end if;
     -- No room to judge names what it measured: the check that fell short
