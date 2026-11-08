@@ -1891,10 +1891,9 @@ mod tests {
     /// same no-room class, its own check, measure and threshold.
     #[test]
     fn exit_5_with_the_slot_fact_is_no_room_for_the_slot() {
-        let fact = r#"{"no_room":true,"check":"host scenario slot","waited_ms":1800000,"budget":2}"#;
-        let gate = FakeGate::new(&format!(
-            "echo '{fact}' >\"$SPAWN_GATE_VERDICT\"\nexit 5\n"
-        ));
+        let fact =
+            r#"{"no_room":true,"check":"host scenario slot","waited_ms":1800000,"budget":2}"#;
+        let gate = FakeGate::new(&format!("echo '{fact}' >\"$SPAWN_GATE_VERDICT\"\nexit 5\n"));
         let Err(GateFailure::NoRoom {
             short: Shortfall::Slot { waited_ms, budget },
             ..

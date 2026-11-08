@@ -757,9 +757,11 @@ within 10 s\": ERROR: could not resize shared memory segment (53100)."
     /// wait, the budget, and what holds the slots.
     #[test]
     fn a_gate_without_a_host_scenario_slot_is_told_with_its_wait_and_the_budget() {
-        let records = [json!({"type": "task.gated", "verdict": "no_room", "escalate": true,
+        let records = [
+            json!({"type": "task.gated", "verdict": "no_room", "escalate": true,
                               "id": 7, "check": "host scenario slot", "measured": 1_800_000,
-                              "threshold": 2, "event_id": 24, "mission": 10})];
+                              "threshold": 2, "event_id": 24, "mission": 10}),
+        ];
         let items = gate_room_escalations(&records);
         assert_eq!(items.len(), 1);
         assert_eq!(
