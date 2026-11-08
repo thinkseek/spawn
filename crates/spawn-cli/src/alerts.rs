@@ -435,6 +435,18 @@ impl Monitor {
         Ok(lines)
     }
 
+    /// The earliest time the step waits for even when no record is
+    /// written: its next host reading (`SPAWN_ALERT_CHECK_SECS`), or a
+    /// bound's due time. `None` while only the log can make it run (never:
+    /// the reading is always a clock). Before the first check it is `0`, so
+    /// a fresh loop runs it once.
+    pub(crate) fn due_ms(&self) -> Option<i64> {
+        Some(
+            self.next_bound_ms
+                .map_or(self.next_reading_ms, |bound| bound.min(self.next_reading_ms)),
+        )
+    }
+
     /// Read what the step needs back: its alerts, the missions and tasks, the
     /// pending records, and where the event log stands.
     fn start(&mut self, store: &PostgresStore, lines: &mut Vec<String>) -> Result<(), String> {
