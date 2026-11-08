@@ -552,6 +552,7 @@ impl TerminalHost for TmuxHost {
         &self,
         terminals: &[(TerminalName, WorkspaceId)],
     ) -> Result<Vec<(TerminalName, Runner)>, TerminalError> {
+        eprintln!("DEBUG arg={:?} program={:?}", format!("#{{session_name}}\t{PANE_STATE}"), self.program);
         let run = self.run(&[
             "list-panes".to_string(),
             "-a".to_string(),
