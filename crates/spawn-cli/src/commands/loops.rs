@@ -694,6 +694,9 @@ impl Fleet<'_> {
         // wait's probe, and an outage the failed passes left, force it
         // regardless.
         let pending_outage = self.recovery.outage_pending();
+        if !self.schedule.recovery.runs(watermark, now) && !pending_outage {
+            return;
+        }
         let forced = self.schedule.recovery.clock_due(now) || pending_outage;
         let signals = if forced {
             true
@@ -706,7 +709,7 @@ impl Fleet<'_> {
                 }
             }
         };
-        if signals && (self.schedule.recovery.runs(watermark, now) || pending_outage) {
+        if signals {
             match crate::deliver::Work::load(open) {
                 Ok(work) => {
                     let world = crate::recover::World {
