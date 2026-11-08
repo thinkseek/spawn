@@ -1495,11 +1495,6 @@ fn host_disk_records_are_owner_only_facts_the_fold_ignores() {
     assert_eq!(control_types(&mut client), ["host.disk"; 3]);
 
     let mut supervisor = common::as_login(&schema, "spawn_supervisor");
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-    assert!(
-        supervisor
-            .query_one("select spawn_host_record($1)", &[&record("/ws", "low", 1)])
-=======
     assert!(
         supervisor
             .query_one("select spawn_host_record($1)", &[&record("/ws", "low", 1)])
@@ -1650,14 +1645,10 @@ fn host_envelope_admission_and_interruption_records_are_owner_only_facts() {
     assert_eq!(tables(&mut client), before);
     assert!(control_types(&mut client).contains(&"host.envelope".to_string()));
 
-    let supervisor = common::login(&schema, "spawn_supervisor");
-    client
-        .batch_execute(&format!("set session authorization {supervisor}"))
-        .expect("become the supervisor");
+    let mut supervisor = common::as_login(&schema, "spawn_supervisor");
     assert!(
-        client
+        supervisor
             .query_one("select spawn_host_record($1)", &[&envelope])
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
             .is_err(),
         "the supervisor records no host facts"
     );

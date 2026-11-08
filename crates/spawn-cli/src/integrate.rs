@@ -188,7 +188,12 @@
 //!    or a check that failed twice on the candidate and once on the base)
 //!    is gated `host_fault` with `evidence` `gate` and the gate's `fact`
 //!    ([`gate_host_fault_fields`]), under the backoff, escalation and counts
-//!    below: never an abort;
+//!    below: never an abort. A scenario the host cannot judge at all (029:
+//!    no systemd user manager in the sandbox) states its own fact
+//!    ([`GateFailure::CannotJudge`], the same exit 6 and the key
+//!    `cannot_judge`): `host_fault` with evidence [`CANNOT_JUDGE`], likewise
+//!    never a rejection and never an abort, so the objective is judged
+//!    outside the gate, by the owner;
 //!
 //!    **A host fault is not a verdict.** When the gate rejects C with
 //!    [`host::CHECK_TESTS_REGRESSION`], the integrator reads the failures
@@ -1045,6 +1050,40 @@ pub(crate) fn gate_host_fault_fields(
     })
 }
 
+/// The record of a gate that cannot judge `scenario` here (029: no systemd
+/// user manager in the sandbox), the gate's own `cannot_judge` fact (exit
+/// [`gate::HOST_FAULT_EXIT`], the key that tells it from the gate's
+/// `host_fault` fact): the `faults`-th host fault in a row on the mission
+/// (020's run, which every evidence shares), with its `backoff`. It says the
+/// objective is judged outside the gate, by the owner (mission 7), never
+/// that the work failed.
+pub(crate) fn cannot_judge_fields(
+    scenario: &str,
+    faults: u32,
+    backoff: Duration,
+    log: &str,
+) -> Value {
+    json!({
+        "reason": format!(
+            "host fault: this host cannot judge {scenario} (it needs what the gate's sandbox \
+             has none of, a systemd user manager); the objective is judged outside the gate, by \
+             the owner; not a verdict on the work, judged again in {}",
+            spoken(backoff)
+        ),
+        "log": log,
+        "evidence": CANNOT_JUDGE,
+        "scenario": scenario,
+        "host_faults": faults,
+        "backoff_ms": u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+        "escalate": faults == HOST_FAULT_ESCALATE_AT,
+    })
+}
+
+/// The evidence a `host_fault` record names when the host cannot judge the
+/// objective's scenario at all (029's systemd user scopes): a fact about the
+/// host, which judges that objective outside the gate.
+pub(crate) const CANNOT_JUDGE: &str = "cannot_judge";
+
 /// The record of a gate that had no room to judge `task`, at `now_ms`: the
 /// reason with the free space and TMPDIR, the facts themselves, and
 /// `escalate` when the run of them on this task began more than
@@ -1332,18 +1371,6 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     // What the host must have before a gate starts, read once like the
     // gate's environment (gate::Room).
     let host_room = gate::Room::from_env(|name| std::env::var(name).ok());
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
-    // The host's cores, shared among the gates (gate::Cpu), read once.
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let cpu = gate::Cpu::from_env(|name| std::env::var(name).ok(), cores)
-        .map_err(|error| format!("{error}\n{USAGE}"))?;
-    let integrator = Integrator::new(root, gate, gate_env, host_room, gates).with_cpu(cpu);
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
-=======
     // The gates' resource envelope (objective 029): a setting that does not
     // parse, or an envelope that does not fit under the slice, refuses the
     // start; the slice is given its limits before any gate starts in it.
@@ -1351,6 +1378,10 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     for warning in envelopes.prepare() {
         eprintln!("integrate: {warning}");
     }
+    // The host's cores, shared among the gates (gate::Cpu), read once.
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let cpu = gate::Cpu::from_env(|name| std::env::var(name).ok(), cores)
+        .map_err(|error| format!("{error}\n{USAGE}"))?;
     let integrator = Integrator::new(
         root,
         gate,
@@ -1358,9 +1389,8 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         host_room,
         gates,
         envelopes.envelope().cloned(),
-    );
->>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
+    )
+    .with_cpu(cpu);
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
@@ -1466,14 +1496,18 @@ pub(crate) fn host_fault_cap(text: Option<&str>) -> u32 {
 /// cap neither counts nor caps them ([`HOST_FAULT_CAP`]).
 fn base_only_fault(fields: &Value) -> bool {
     // Objective 033's evidence is a base that disagreed with itself, before
-    // any candidate code; the gate's own fact names `on` `base`. Either is a
-    // base-only fault: neither counts toward the cap nor is ever capped.
-    fields.get("evidence").and_then(Value::as_str) == Some(BASE_DISAGREES)
-        || fields
-            .get("fact")
-            .and_then(|fact| fact.get("on"))
-            .and_then(Value::as_str)
-            == Some("base")
+    // any candidate code; the gate's own fact names `on` `base`; the
+    // `cannot_judge` a scenario says of a host that cannot judge it at all
+    // (029) is no fault of the work either. No one of them counts toward the
+    // cap nor is ever capped.
+    matches!(
+        fields.get("evidence").and_then(Value::as_str),
+        Some(BASE_DISAGREES | CANNOT_JUDGE)
+    ) || fields
+        .get("fact")
+        .and_then(|fact| fact.get("on"))
+        .and_then(Value::as_str)
+        == Some("base")
 }
 
 /// The `aborted` record of a host fault past the cap: `faults` host faults
@@ -2516,6 +2550,19 @@ impl Judge {
                         }
                         gated("host_fault", extra)
                     }
+                    Rejection::HeadCannotJudge {
+                        scenario,
+                        log,
+                        head,
+                    } => {
+                        let mut extra = self.cannot_judge(mission, task.id, &scenario, &log);
+                        if let (Some(target), Some(head)) =
+                            (extra.as_object_mut(), head.as_object())
+                        {
+                            target.extend(head.clone());
+                        }
+                        gated("host_fault", extra)
+                    }
                 }
             }
             // No room in TMPDIR: a fact about the host, never a count.
@@ -2557,20 +2604,6 @@ impl Judge {
                 );
                 gated("host_fault", extra)
             }
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
-            // The gate found a host or harness fault, not a verdict: a
-            // scenario's harness error on the base, or a check failing on
-            // the candidate and the base. `host_fault`: retried after a
-            // backoff, never counted toward a halt.
-            Err(failure @ GateFailure::HostFault { .. }) => {
-                let mut extra = self.gate_host_fault(mission, task.id, &failure);
-                extra["candidate"] = json!(candidate);
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
-=======
             // A gate its own envelope killed is the host's fault: not a
             // verdict, judged again after objective 020's backoff, never an
             // abort and never toward a halt (the owner's ruling). The task
@@ -2612,8 +2645,24 @@ impl Judge {
                     task.id,
                     extra["reason"].as_str().unwrap_or_default()
                 );
->>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
+                gated("host_fault", extra)
+            }
+            // The gate found a host or harness fault, not a verdict: a
+            // scenario's harness error on the base, or a check failing on
+            // the candidate and the base. `host_fault`: retried after a
+            // backoff, never counted toward a halt.
+            Err(failure @ GateFailure::HostFault { .. }) => {
+                let mut extra = self.gate_host_fault(mission, task.id, &failure);
+                extra["candidate"] = json!(candidate);
+                gated("host_fault", extra)
+            }
+            // The host cannot judge this objective's scenario at all: the
+            // objective is judged outside the gate, by the owner.
+            // `host_fault`: retried after a backoff, never counted toward a
+            // halt, never a rejection and never an abort.
+            Err(GateFailure::CannotJudge { scenario, log }) => {
+                let mut extra = self.cannot_judge(mission, task.id, &scenario, &log);
+                extra["candidate"] = json!(candidate);
                 gated("host_fault", extra)
             }
             Err(failure) => gated("aborted", aborted(&failure)),
@@ -2631,7 +2680,9 @@ impl Judge {
         let Some(envelope) = envelope else {
             return Ok(None);
         };
-        let (runs, _) = store.gate_runs(task.id).map_err(|error| error.to_string())?;
+        let (runs, _) = store
+            .gate_runs(task.id)
+            .map_err(|error| error.to_string())?;
         let mut n = runs.saturating_add(1);
         let mut unit = envelope.gate_scope(task.id, n);
         // A name is never reused while its unit exists: a run that is still
@@ -2663,7 +2714,9 @@ impl Judge {
     ) -> Result<bool, String> {
         let envelope = &scope.envelope;
         let bytes = envelope.settings.gate.max;
-        let (_, after) = store.gate_runs(task.id).map_err(|error| error.to_string())?;
+        let (_, after) = store
+            .gate_runs(task.id)
+            .map_err(|error| error.to_string())?;
         let start = spawn_core::envelope::Admission {
             kind: "gate",
             fields: json!({"task": task.id}),
@@ -2678,15 +2731,12 @@ impl Judge {
                 task.id, short.measure, short.measured, short.threshold
             );
         }
-        if !spawn_core::envelope::admit(store, &start, short)
-            .map_err(|error| error.to_string())?
-        {
+        if !spawn_core::envelope::admit(store, &start, short).map_err(|error| error.to_string())? {
             return Ok(false);
         }
         spawn_core::envelope::admitted(store, &start).map_err(|error| error.to_string())?;
         Ok(true)
     }
-
 }
 
 impl Judge {
@@ -2697,6 +2747,20 @@ impl Judge {
         let faults = mission.gate_host_faults.saturating_add(1);
         let backoff = host_fault_backoff(self.host.backoff, faults);
         let extra = gate_host_fault_fields(failure, faults, backoff);
+        println!(
+            "integrate: task {task}: {}",
+            extra["reason"].as_str().unwrap_or_default()
+        );
+        extra
+    }
+
+    /// The record of a scenario the host cannot judge
+    /// ([`GateFailure::CannotJudge`]) for `task`: the mission's next host
+    /// fault in a row, with its backoff, said on stdout as the others are.
+    fn cannot_judge(&self, mission: &Mission, task: i64, scenario: &str, log: &str) -> Value {
+        let faults = mission.gate_host_faults.saturating_add(1);
+        let backoff = host_fault_backoff(self.host.backoff, faults);
+        let extra = cannot_judge_fields(scenario, faults, backoff, log);
         println!(
             "integrate: task {task}: {}",
             extra["reason"].as_str().unwrap_or_default()
@@ -3060,6 +3124,13 @@ enum Rejection {
     /// the base, a check failing on both trees): `host_fault`, as any, with
     /// `head` added.
     HeadHostFault { failure: GateFailure, head: Value },
+    /// The head's own run cannot judge the objective here: `host_fault` with
+    /// that evidence, as any, with `head` added.
+    HeadCannotJudge {
+        scenario: String,
+        log: String,
+        head: Value,
+    },
 }
 
 /// The record of a gate rejection: the reason, the gate's output and the
@@ -3299,6 +3370,11 @@ fn rejection(
             failure,
             head: named,
         },
+        Err(GateFailure::CannotJudge { scenario, log }) => Rejection::HeadCannotJudge {
+            scenario,
+            log,
+            head: named,
+        },
         Err(failure) => {
             let mut record = aborted(&failure);
             if let Some(reason) = record["reason"].as_str() {
@@ -3339,26 +3415,32 @@ fn aborted(failure: &GateFailure) -> Value {
             "scenario": scenario,
             "log": log,
         }),
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
+        // Recorded `host_fault` by the caller; counted here only if a caller
+        // forgets that.
+        GateFailure::MemoryLimit {
+            memory_max, log, ..
+        } => json!({
+            "reason": format!(
+                "the gate was killed by its memory limit (MemoryMax {})",
+                size_text(*memory_max)
+            ),
+            "log": log,
+        }),
         // Recorded as `host_fault` by the caller, likewise.
         GateFailure::HostFault {
             scenario, on, log, ..
         } => {
             json!({"reason": format!("the gate found {scenario} failing on the {on}"), "log": log})
         }
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
-=======
-        // Recorded `host_fault` by the caller; counted here only if a caller
-        // forgets that.
-        GateFailure::MemoryLimit { memory_max, log, .. } => json!({
+        // Recorded as `host_fault` with evidence `cannot_judge` by the
+        // caller; counted here only if a caller forgets that.
+        GateFailure::CannotJudge { scenario, log } => json!({
             "reason": format!(
-                "the gate was killed by its memory limit (MemoryMax {})",
-                size_text(*memory_max)
+                "host fault: this host cannot judge {scenario}; the objective is judged outside \
+                 the gate, by the owner; not a verdict on the work"
             ),
+            "evidence": CANNOT_JUDGE,
+            "scenario": scenario,
             "log": log,
         }),
     }
@@ -3379,8 +3461,6 @@ fn size_text(bytes: u64) -> String {
         format!("{} MiB", bytes / MIB)
     } else {
         format!("{bytes} bytes")
->>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
     }
 }
 
@@ -7004,6 +7084,64 @@ mod base_disagrees_tests {
     }
 }
 
+/// A scenario the host cannot judge here (029's systemd user scopes): the
+/// record says so, names the scenario, and is a host fault like any other.
+#[cfg(test)]
+mod cannot_judge_tests {
+    use super::{
+        CANNOT_JUDGE, cannot_judge_fields, halt_reason, host_fault_backoff, host_fault_base,
+    };
+    use serde_json::json;
+
+    fn fields(faults: u32) -> serde_json::Value {
+        cannot_judge_fields(
+            "029.sh",
+            faults,
+            host_fault_backoff(host_fault_base(None), faults),
+            "the gate's log",
+        )
+    }
+
+    /// The record: the evidence, the scenario, the shared host-fault count,
+    /// the backoff and escalation (the second in a row, as any host fault's).
+    /// Never a rejection, never an abort.
+    #[test]
+    fn the_record_names_the_scenario_and_the_host_fault() {
+        let record = fields(1);
+        assert_eq!(record["evidence"], CANNOT_JUDGE);
+        assert_eq!(record["evidence"], "cannot_judge");
+        assert_eq!(record["scenario"], "029.sh");
+        assert_eq!(record["host_faults"], 1);
+        assert_eq!(record["backoff_ms"], 300_000);
+        assert_eq!(record["escalate"], false);
+        assert_eq!(record["log"], "the gate's log");
+        assert!(record.get("due_ms").is_none(), "the store writes it");
+        assert_eq!(
+            record["reason"],
+            "host fault: this host cannot judge 029.sh (it needs what the gate's sandbox has \
+             none of, a systemd user manager); the objective is judged outside the gate, by the \
+             owner; not a verdict on the work, judged again in 5 min"
+        );
+        assert!(record.get("candidate").is_none(), "the caller adds it");
+        let second = fields(2);
+        assert_eq!(second["escalate"], true, "the second in a row, as any");
+        assert_eq!(second["backoff_ms"], 600_000);
+    }
+
+    /// No halt rule counts it, however many in a row.
+    #[test]
+    fn no_number_of_cannot_judge_host_faults_halts_a_mission() {
+        for count in [1, 2, 3, 10, 1000, u32::MAX] {
+            let mission: super::Mission = serde_json::from_value(json!({
+                "id": 1, "gate": "/g", "accept": "gate", "gate_rejections": 2,
+                "gate_aborts": 2, "gate_host_faults": count,
+            }))
+            .expect("a mission");
+            assert_eq!(halt_reason(&mission, 7), None, "{count}");
+        }
+    }
+}
+
 /// The integrator's passes against the test database
 /// (`SPAWN_TEST_DATABASE_URL`; like the spawn-postgres tests, they do not
 /// skip), each in a schema of its own, dropped afterwards, with real git
@@ -9337,6 +9475,112 @@ mod database_tests {
         assert_eq!((after.gate_aborts, after.gate_host_faults), (2, 0));
         assert_eq!(super::halt_reason(&after, 0), None);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Objective 29, end to end: its task scenario exits 6 (the gate cannot
+    /// judge it here: no systemd user manager in the sandbox) and the gate
+    /// states its `cannot_judge` fact. The task is gated `host_fault` with
+    /// the evidence `cannot_judge`: never rejected, never aborted, nothing
+    /// back to the worker, not judged again before its `due_ms`, escalating
+    /// at the second in a row as any host fault — and never capped into an
+    /// abort, however many in a row (`SPAWN_GATE_HOST_FAULT_CAP` counts no
+    /// `cannot_judge`).
+    #[test]
+    fn a_scenario_the_host_cannot_judge_is_a_host_fault_never_a_rejection() {
+        let dir = std::env::temp_dir().join(format!("spawn-db-cannot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let runs = dir.join("runs");
+        let runs_path = runs.display();
+        let gate = format!(
+            "n=$(cat '{runs_path}' 2>/dev/null || echo 0); n=$((n + 1)); echo \"$n\" >'{runs_path}'\n\
+             echo '| == candidate: 029.sh must pass'\n\
+             echo '029: cannot be judged here: no systemd user manager is reachable' >&2\n\
+             printf '{{\"cannot_judge\":true,\"scenario\":\"029.sh\",\"runs\":\"6\"}}\n' \
+             >\"$SPAWN_GATE_VERDICT\"\n\
+             exit 6\n"
+        );
+        let (base, source, scenarios, mut integrator) = world("cannot-judge", &gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_millis(1),
+            cap: 2,
+        };
+        let db = Db::new("cannot_judge");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        let count = || {
+            std::fs::read_to_string(&runs).map_or(0, |text| text.trim().parse::<u32>().unwrap_or(0))
+        };
+        let pass = || {
+            integrator.pass_on(&db.store).expect("a pass");
+            integrator.settle();
+        };
+
+        pass();
+        assert_eq!(count(), 1);
+        let (record, _, at) = last_verdict(&db);
+        assert_eq!(record["verdict"], "host_fault", "{record}");
+        assert_eq!(record["evidence"], "cannot_judge");
+        assert_eq!(record["scenario"], "029.sh");
+        assert_eq!(record["host_faults"], 1);
+        assert_eq!(record["escalate"], false);
+        assert_eq!(record["backoff_ms"], 1);
+        assert_eq!(record["due_ms"], at + 1, "its own time plus the backoff");
+        assert!(record["candidate"].is_string());
+        assert!(record["reason"].as_str().is_some_and(|reason| {
+            reason.starts_with("host fault: this host cannot judge 029.sh")
+                && reason.contains("judged outside the gate")
+        }));
+        assert!(
+            record["log"]
+                .as_str()
+                .is_some_and(|log| log.contains("029: cannot be judged here")),
+            "the gate's log is kept"
+        );
+        let after = gated(&db, mission);
+        assert_eq!(
+            (after.gate_host_faults, after.gate_host_task),
+            (1, Some(task))
+        );
+        assert_eq!((after.gate_rejections, after.gate_aborts), (0, 0));
+        assert_eq!(
+            (after.tasks[0].state, after.tasks[0].revisions),
+            (spawn_core::mission::TaskState::Reported, 0),
+            "nothing went back to the worker"
+        );
+        assert!(after.halted.is_none());
+
+        // Judged again after its due time (this test's backoff is 1 ms; the
+        // hold itself is every host fault's, tested above): the second in a
+        // row escalates, as any.
+        pass();
+        assert_eq!(count(), 2);
+        let record = last_verdict(&db).0;
+        assert_eq!(record["verdict"], "host_fault", "{record}");
+        assert_eq!(record["evidence"], "cannot_judge");
+        assert_eq!(record["host_faults"], 2);
+        assert_eq!(record["escalate"], true);
+
+        // The cap (2 here) never reaches it: four faults in a row stay host
+        // faults, and `gate_aborts` never moves.
+        for _ in 0..2 {
+            pass();
+        }
+        assert_eq!(count(), 4);
+        let record = last_verdict(&db).0;
+        assert_eq!(record["verdict"], "host_fault", "{record}");
+        assert_eq!(record["host_faults"], 4);
+        let after = gated(&db, mission);
+        assert_eq!((after.gate_aborts, after.gate_rejections), (0, 0));
+        assert!(after.halted.is_none(), "no halt counts a host fault");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The task's latest `task.gated` record and its event's id and time.

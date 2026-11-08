@@ -165,12 +165,17 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
             let crash = quoted(&record["crash"], &|line| {
                 line.as_str().map(|line| one_line(line, 300))
             });
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
             let fact = &record["fact"];
-            let evidence = if record["evidence"] == "gate" {
+            let evidence = if record["evidence"] == "cannot_judge" {
+                // The host cannot judge the objective at all (029: no
+                // systemd user manager in the sandbox): not a transient
+                // fault of the test database or the load.
+                let scenario = record["scenario"].as_str().unwrap_or("its scenario");
+                format!(
+                    "this host cannot judge the objective here ({scenario} needs what the \
+                     gate's sandbox has none of, a systemd user manager)"
+                )
+            } else if record["evidence"] == "gate" {
                 let scenario = fact["scenario"].as_str().unwrap_or("a scenario");
                 let runs = one_line(fact["runs"].as_str().unwrap_or_default(), 200);
                 if fact["on"] == "base" {
@@ -184,10 +189,7 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                          ({runs})"
                     )
                 }
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
-=======
-            let evidence = if record["evidence"] == "memory_limit" {
+            } else if record["evidence"] == "memory_limit" {
                 // A gate its own resource envelope killed (objective 029).
                 format!(
                     "the gate was killed by its memory limit (MemoryMax {} bytes, \
@@ -195,8 +197,6 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                     record["memory_max"].as_u64().unwrap_or_default(),
                     record["oom_kills"].as_u64().unwrap_or_default()
                 )
->>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
             } else if crash.is_empty() {
                 let failures = record["failures"].as_array().map_or(0, Vec::len);
                 format!(
@@ -217,9 +217,14 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                 || "after its backoff".to_string(),
                 |due| format!("at {}", crate::scorecard::time::format_rfc3339(due)),
             );
-            let check = if record["evidence"] == "gate" {
+            let check = if record["evidence"] == "cannot_judge" {
+                "The objective is judged outside the gate, by the owner (mission 7): judge it \
+                 there, or tell the owner."
+            } else if record["evidence"] == "gate" {
                 "Check the host's load and that scenario's harness (its log in the gate output), \
                  or tell the owner."
+            } else if record["evidence"] == "memory_limit" {
+                "Check the host's memory and swap (the executor's envelope) or tell the owner."
             } else {
                 "Check the test database's host (its memory, /dev/shm, its log) or tell the owner."
             };
@@ -230,17 +235,7 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                 line: format!(
                     "task #{task} of {mission}: {faults} gate failures in a row were the \
                      host's, not the work's: {evidence}. It is judged again {due}; nothing is \
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
                      counted and nothing halts. {check}"
-=======
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-                     counted and nothing halts. {check}"
-=======
-                     counted and nothing halts. Check the host's memory and swap (the \
-                     executor's envelope) or the test database's host (its memory, /dev/shm, \
-                     its log), or tell the owner."
->>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
                 ),
                 since_ms: record["at_ms"].as_i64(),
             })
