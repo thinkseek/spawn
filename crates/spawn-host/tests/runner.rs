@@ -151,8 +151,11 @@ fn launch(program: &str, arguments: &[&str], environment: &[(&str, &str)]) -> La
 
 /// Dead panes the test starts for one whose exit status the server records
 /// (see the dead-pane section: a server that never reaps its child records
-/// none).
-const DEAD_PANE_ATTEMPTS: u32 = 3;
+/// none), and how long one is waited for: the status is recorded the moment
+/// the child is reaped, so an attempt that has not seen it in seconds will
+/// never see it.
+const DEAD_PANE_ATTEMPTS: u32 = 5;
+const DEAD_PANE_WAIT: Duration = Duration::from_secs(5);
 
 /// What `runner` answers once it stops answering `Running` or `limit`
 /// passes.
@@ -233,7 +236,7 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
     for attempt in 1..=DEAD_PANE_ATTEMPTS {
         host.start(&launch("/bin/sh", &["-c", "exit 3"], &[("A", "1")]))
             .expect("start");
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + DEAD_PANE_WAIT;
         loop {
             let Runner::Untracked(why) = settled(&host, Duration::from_secs(5)) else {
                 panic!("a dead pane hosts no runner");
