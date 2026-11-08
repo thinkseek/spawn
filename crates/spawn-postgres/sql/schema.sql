@@ -1542,6 +1542,15 @@ begin
            set hold = excluded.hold, main = excluded.main, by = excluded.by,
                reason = excluded.reason, held_at_ms = excluded.held_at_ms,
                expires_ms = excluded.expires_ms;
+        -- A renewal ends the previous hold with this record, so the tasks
+        -- that waited behind it wait behind this one from now on: the board,
+        -- a release and an expiry name them at once, without waiting for the
+        -- next pass's `task.held` (which the integrator still records, once
+        -- per task and hold, as the landing's own evidence).
+        if p_record ->> 'renews' is not null then
+            update mission_tasks set held_by = p_event
+             where held_by = (p_record ->> 'renews')::bigint;
+        end if;
     when 'source.released', 'source.hold_expired' then
         -- The record that ends a hold: only the one naming the active hold.
         delete from mission_source_holds
