@@ -773,7 +773,7 @@ impl Fleet<'_> {
         let pause = if self.pace.failures > 0 || self.pace.outages > 0 {
             // The pause [`Pace`] put after the last failed pass: a database
             // outage paces the loop, the pass interval per pass at first and
-            // at most 30 intervals ([`MAX_BACKOFF_INTERVALS`]).
+            // at most four ([`MAX_OUTAGE_INTERVALS`]).
             self.pause
         } else {
             self.schedule.earliest().map_or(self.interval, |due| {
