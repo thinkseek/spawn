@@ -533,6 +533,7 @@ const STATUS_STYLE: Record<RsiObjective["status"], string> = {
   open: "bg-info/12 text-info ring-info/25",
   solved: "bg-success/12 text-success ring-success/25",
   met: "bg-success/12 text-success ring-success/25",
+  owner: "bg-warning/12 text-warning ring-warning/25",
 };
 
 function StatusPill({ status }: { status: RsiObjective["status"] }) {
@@ -568,7 +569,7 @@ function ObjectivesCard({
         title="Objectives"
         meta={
           <span className="tnum">
-            {mission.objectives.filter((entry) => entry.status !== "open").length}/
+            {mission.objectives.filter((entry) => entry.status === "solved" || entry.status === "met").length}/
             {mission.objectives.length} settled
           </span>
         }
