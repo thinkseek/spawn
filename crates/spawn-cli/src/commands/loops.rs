@@ -334,9 +334,11 @@ impl Pace {
             backoff(interval, self.failures)
         } else {
             // Only the database was unreachable: it does not count toward
-            // MAX_FAILURES, and the pause grows to at most 30 intervals.
+            // MAX_FAILURES, and the pause grows to at most four intervals
+            // ([`MAX_OUTAGE_INTERVALS`]): a restart is noticed within a few
+            // seconds of its end.
             self.outages = self.outages.saturating_add(1);
-            backoff(interval, self.outages)
+            backoff(interval, self.outages.min(MAX_OUTAGE_INTERVALS))
         };
         Ok(Paused {
             wait,
