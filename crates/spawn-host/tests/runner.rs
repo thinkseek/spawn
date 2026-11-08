@@ -253,7 +253,7 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
     // when the status does not come; what is asserted — a dead pane kept by
     // the option names its runner's exit status — is unchanged.
     let mut seen = String::new();
-    for _start in 1..=START_ATTEMPTS {
+    for _start in 1..=STATUS_STARTS {
         host.start(&launch(
             "/bin/sh",
             &["-c", "sleep 1; exit 3"],
