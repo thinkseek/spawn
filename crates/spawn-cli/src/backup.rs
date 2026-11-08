@@ -23,9 +23,14 @@
 //!   `manifest.json` and the bundle's contents, full (the first of an ISO
 //!   week, or none full within 7 days, from the records) or incremental (its
 //!   base the newest `backup.bundled` record): a git bundle of every mission
-//!   source, whole or `--not` its base's heads, and the transcript archive's
-//!   files modified within `SPAWN_BACKUP_TRANSCRIPT_DAYS` (default 14),
-//!   whole or the bytes appended since the base's sizes.
+//!   source's branches and tags — exactly the refs the record names, never a
+//!   remote-tracking ref a mirror clone left (the live `supply-pa.git` has
+//!   `refs/remotes/github/main`) nor a pending `refs/spawn-owner/` push — whole
+//!   or `--not` its base's heads, and the transcript archive's files modified
+//!   within `SPAWN_BACKUP_TRANSCRIPT_DAYS` (default 14), whole or the bytes
+//!   appended since the base's sizes. The record is a true description of the
+//!   archive: verify refuses a bundle that lists a ref its manifest does not
+//!   name, so the bundle may hold only what the manifest holds.
 //! - `spawn backup verify`, every day: the newest good dump fetched,
 //!   decrypted and checked against its record's sha256, restored into a
 //!   database of its own on `SPAWN_BACKUP_DRILL_DATABASE_URL` (never the
@@ -1900,13 +1905,19 @@ fn append_slice(source: &Path, target: &Path, offset: u64, size: u64) -> Result<
     Ok(())
 }
 
-/// A git bundle of every ref of `source`, but not `not`'s commits.
+/// A git bundle of `source`'s branches and tags, but not `not`'s commits:
+/// exactly the refs `heads_of` puts in the record, so the record describes
+/// everything the archive holds (and nothing else, which `verify` refuses).
+/// `--all` would also carry refs/remotes/* (live `supply-pa.git` has
+/// `refs/remotes/github/main` from the mirror clone it was seeded as) and any
+/// `refs/spawn-owner/*` request: neither is the mission's history, and a
+/// record that names neither could not describe a bundle that holds them.
 fn git_bundle(source: &str, file: &Path, not: &[String]) -> Result<(), String> {
     let mut command = crate::sources::controller_git();
     command
         .args(["-C", source, "bundle", "create"])
         .arg(file)
-        .arg("--all");
+        .args(["--branches", "--tags"]);
     if !not.is_empty() {
         command.arg("--not");
         for commit in not {

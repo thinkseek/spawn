@@ -58,7 +58,11 @@
 #       file whole (offset 0), nothing of the unchanged one; a git bundle of
 #       spawn.git with prerequisites that, fetched after the full one's,
 #       gives exactly the source's branches, and other.git `unchanged`; the
-#       full bundle and the increment give the window back byte for byte. A
+#       full bundle and the increment give the window back byte for byte.
+#       other.git also carries refs/remotes/github/main, as the live
+#       missions/supply-pa.git does: it is not the mission's history, so the
+#       bundle lists no ref the manifest does not name and the record names
+#       it not. A
 #       drill after the full bundle exits 0 and records `.bundle.kind` full.
 #   (4) After more records (the database now holds more events than the
 #       dump), `spawn backup verify` exits 0 and records `backup.verified`
@@ -548,6 +552,10 @@ git -C "$WORK/seed2" add -A
 git -C "$WORK/seed2" commit -qm other
 git init -q --bare --initial-branch=main "$src_other"
 git -C "$WORK/seed2" push -q "$src_other" main:main
+# As the live missions/supply-pa.git was seeded (a mirror clone leaves its
+# remote-tracking ref): not a branch, not the mission's history.
+remote_ref=refs/remotes/github/main
+git --git-dir="$src_other" update-ref "$remote_ref" "$(git -C "$WORK/seed2" rev-parse HEAD)"
 
 # The transcript archive, as the Bridge keeps it beside the workspaces.
 SPAWN_WORKSPACE_ROOT=$WORK/ws
@@ -887,6 +895,18 @@ named=$(field "$bun" '[.repos[]?.source] | sort | join(" ")')
 [ "$named" = "$(printf '%s\n%s\n' "$src_other" "$src_spawn" | sort | tr '\n' ' ' | sed 's/ $//')" ] ||
     measured_fail "(3) the record names the sources [$named], not the two missions' $src_spawn and $src_other"
 echo "031: full bundle: $(field "$bun" '.stored_bytes') bytes stored for $bytes bytes of transcripts and two sources, in $bundle_ms ms"
+
+# The remote-tracking ref other.git carries is not the mission's history: the
+# bundle holds no ref the manifest does not name, and the record names it not.
+[ -n "$(git --git-dir="$src_other" for-each-ref --format='%(refname)' "$remote_ref")" ] ||
+    harness "the fixture lost $src_other's $remote_ref"
+field "$bun" '.repos[].heads | keys[]' | grep -qxF -- "$remote_ref" &&
+    measured_fail "(3) the record names $remote_ref, which no source's bundle holds"
+for b in "$WORK"/unpacked/repos/*.bundle; do
+    [ -f "$b" ] || continue
+    git bundle list-heads "$b" 2>/dev/null | awk '{ print $2 }' | grep -qxF -- "$remote_ref" &&
+        measured_fail "(3) the bundle $(basename "$b") holds $remote_ref, which its manifest does not name"
+done
 
 # The drill opens the newest bundle too: now it is the full one.
 backup verify SPAWN_BACKUP_DRILL_DATABASE_URL="$DRILL_URL"
