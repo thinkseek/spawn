@@ -16,10 +16,6 @@ Environment=SPAWN_PROGRAM=%h/.local/share/spawn-rsi/bin/spawn
 # from the owner's checkout. The integrator resolves the symlink once per
 # step, so a gate runs with one commit's gate.sh and scenarios.
 Environment=SPAWN_GATE=%h/.local/share/spawn-rsi/controllers/spawn/scripts/rsi/gate.sh
-# Its gate environment for the deploy's base-only gate (deploy.sh,
-# warm_base_cache): the integrator is not dumpable, so /proc/<pid>/environ
-# is unreadable; this 0600 file under ~/.config/spawn is what the deploy reads.
-Environment=SPAWN_GATE_ENV_FILE=%h/.config/spawn/gate-env
 ExecStart=%h/.local/share/spawn-rsi/bin/spawn integrate
 # A halt is per mission and recorded in the log; the process keeps running.
 Restart=always

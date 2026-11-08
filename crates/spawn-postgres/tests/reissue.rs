@@ -228,9 +228,12 @@ fn only_a_task_waiting_for_its_first_delivery_is_reissued_and_only_once() {
     let task = store
         .task_assign(other, "ephemeral", "w", "brief", "default")
         .expect("assign");
-    let mut supervisor = common::as_login(&schema, "spawn_supervisor");
+    let supervisor = common::login(&schema, "spawn_supervisor");
+    client
+        .batch_execute(&format!("set session authorization {supervisor}"))
+        .expect("become the supervisor");
     assert!(
-        supervisor
+        client
             .query_one(
                 "select spawn_task_reissue($1, $2)",
                 &[&task, &attempts(task, 14)]

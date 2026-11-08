@@ -325,14 +325,11 @@ fn peer_uid(peer: SocketAddr, port: u16, tables: &[String]) -> Option<u32> {
         .map(|socket| socket.uid)
 }
 
-/// The uid this server runs as; none without `/proc`, where no socket's
-/// uid can be read either. Not the owner of `/proc/self`: the server is
-/// not dumpable ([`spawn_host::undumpable`]), and that makes root own its
-/// `/proc/<pid>`.
+/// The uid this server runs as: the owner of `/proc/self`. Without `/proc`,
+/// none.
 fn owner_uid() -> Option<u32> {
-    std::path::Path::new("/proc/self")
-        .exists()
-        .then(spawn_host::current_uid)
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").ok().map(|meta| meta.uid())
 }
 
 /// Whether a request from `peer` reads without the token: only with

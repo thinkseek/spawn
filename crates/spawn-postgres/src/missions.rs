@@ -469,25 +469,13 @@ select coalesce(jsonb_agg(jsonb_build_object(
 /// An objective mission's landed tasks: `[{objective, metric}]`, newest
 /// first. `$1` mission.
 pub(crate) const OBJECTIVE_LANDINGS: &str = r"
-select coalesce(jsonb_agg(jsonb_build_object('objective', x.objective, 'metric', x.metric)
-                          order by x.at_ms desc, x.id desc), '[]'::jsonb)
-  from (
-   select k.objective, k.metric, k.updated_at_ms as at_ms, k.id
-     from mission_tasks k
-    where k.mission_id = $1 and k.state = 'landed' and k.objective is not null
-   union all
-   -- An objective solved on the base (its scenario passes at the base
-   -- commit, so no task of it can change anything) is solved as a landing
-   -- solves it: no task for it is assigned again.
-   select (e.kind -> 'detail' -> 'record' ->> 'objective')::integer, null,
-          e.recorded_at_ms, e.id
-     from spawn_events e
-    where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-      and e.kind -> 'detail' -> 'record' ->> 'type' = 'objective.solved'
-      and e.kind -> 'detail' -> 'record' ->> 'id' = $1::text) x";
+select coalesce(jsonb_agg(jsonb_build_object('objective', k.objective, 'metric', k.metric)
+                          order by k.updated_at_ms desc, k.id desc), '[]'::jsonb)
+  from mission_tasks k
+ where k.mission_id = $1 and k.state = 'landed' and k.objective is not null";
 
 /// The outcomes of an objective mission's tasks, oldest first, from the
-/// control stream: `[{seq, type, task, objective, verdict, merge, measure, yielded}]`, the
+/// control stream: `[{seq, type, task, objective, verdict, merge}]`, the
 /// gate verdicts, the aborts and the yields (a `task.cancelled` that names
 /// `yielded`). What spawn-cli's `objectives::attempts` counts. `$1` mission.
 /// Each task's records by the record-id index, the record taken out of
@@ -498,8 +486,7 @@ select coalesce(jsonb_agg(jsonb_build_object('objective', x.objective, 'metric',
 pub(crate) const OBJECTIVE_OUTCOMES: &str = r"
 select coalesce(jsonb_agg(jsonb_build_object(
          'seq', o.seq, 'type', o.r ->> 'type', 'task', k.id, 'objective', k.objective,
-         'verdict', o.r ->> 'verdict', 'merge', o.r ->> 'merge',
-         'measure', o.r ->> 'measure', 'yielded', o.r -> 'yielded',
+         'verdict', o.r ->> 'verdict', 'merge', o.r ->> 'merge', 'yielded', o.r -> 'yielded',
          'event_id', o.event_id, 'at_ms', o.at_ms,
          'continues', (o.r ->> 'continues')::bigint, 'chain', o.r -> 'chain',
          'branch', o.r ->> 'branch', 'commit', o.r ->> 'commit', 'diff', o.r ->> 'diff',
@@ -612,22 +599,6 @@ select coalesce(jsonb_agg(jsonb_build_object(
             offset 0) x
      where x.r ->> 'type' in ('task.gated', 'task.aborted', 'task.cancelled')
      order by x.seq desc limit 1) o on true";
-
-/// [`PostgresStore::task_host_faults`]: a task's `host_fault` verdicts at
-/// one report revision, but a base-only one: the gate's fact with `on`
-/// `base` (a scenario's harness error before any candidate code ran), or
-/// objective 033's `base_disagrees`. Those count toward no halt, so they
-/// never count toward the cap either.
-pub(crate) const TASK_HOST_FAULTS: &str = r"
-select count(*)
-  from spawn_events e
- where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-   and e.kind -> 'detail' -> 'record' ->> 'id' = $1
-   and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
-   and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
-   and e.kind -> 'detail' -> 'record' ->> 'revision' = $2
-   and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') <> 'base'
-   and coalesce(e.kind -> 'detail' -> 'record' ->> 'evidence', '') <> 'base_disagrees'";
 
 /// The work an ephemeral objective task starts from: the newest earlier
 /// task of its objective that ended without landing (cancelled, aborted or
@@ -1782,20 +1753,6 @@ impl PostgresStore {
             .query_one(
                 "select spawn_task_fork_failed($1, $2, $3, $4)",
                 &[&task, &from, &commit, &error],
-            )?
-            .get(0))
-    }
-
-    /// How many `host_fault` gate verdicts task `task` has at its report
-    /// revision `revision`, but a base-only one (the gate's fact `on`
-    /// `base`, before any candidate code ran): read from its control
-    /// records by the record-id index. The integrator counts the next one
-    /// past its cap as an abort.
-    pub fn task_host_faults(&self, task: i64, revision: i64) -> Result<i64, StoreError> {
-        Ok(self
-            .query_one(
-                TASK_HOST_FAULTS,
-                &[&task.to_string(), &revision.to_string()],
             )?
             .get(0))
     }
