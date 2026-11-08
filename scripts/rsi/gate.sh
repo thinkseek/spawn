@@ -38,7 +38,6 @@
 #   below). One that passes the second time is
 #   a flake, said in the log, and the gate goes on ("Checks run twice"
 #   below).
-<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
 #
 # A scenario that cannot be judged here. Some objectives judge the host
 # itself (029: every execution and gate in a systemd user scope with memory
@@ -71,16 +70,6 @@
 # (twice, from two runs that agree) = unsolved, 6 = cannot_judge (cached: the
 # host's answer does not change), anything else is a host fault (exit 6 with
 # its fact in the verdict file, no verdict: the integrator records
-=======
-#
-# Exit-code contract for objective scenarios and the task scenario: 0 =
-# pass, 1 = an assertion failed, anything else = a harness error (a missing
-# tool, an unreachable database, a timeout kill). Each is judged on the base
-# BEFORE any candidate code runs, since both share the test server and a
-# candidate could otherwise sabotage the base's run: 0 = solved, 1 (twice,
-# from two runs that agree) = unsolved, anything else is a host fault (exit
-# 6 with its fact in the verdict file, no verdict: the integrator records
->>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
 # `host_fault`, retried after a backoff and counted toward no halt, never a
 # skip). The one other shape is objective 033's: a first run that exits 1
 # and a second that exits 0 (a base that disagrees with itself) keeps the
@@ -383,7 +372,6 @@ host_fault() {
     exit 6
 }
 
-<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
 # cannot_judge <scenario> <runs>: the scenario says this host cannot judge it
 # here (029: no systemd user manager in the sandbox), so the gate states that
 # as the fact and exits 6, no verdict: `{"cannot_judge":true,"scenario",
@@ -404,8 +392,6 @@ cannot_judge() {
     exit 6
 }
 
-=======
->>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
 # What the verdict is about: both commits, resolved once.
 base_commit=$(git --git-dir="$repo" rev-parse --verify --quiet "$baseline^{commit}") || {
     echo "gate: no commit $baseline in $repo" >&2
@@ -2088,7 +2074,6 @@ candidate_printed() {
         echo "gate: the gate could not run $(basename "$printed_scenario") on the candidate" >&2
         exit 3
     fi
-<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
     if [ "$printed_status" = 6 ]; then
         # The scenario says the host cannot judge it (see "A scenario that
         # cannot be judged here"): not a rejection, whatever it is. A
@@ -2103,8 +2088,6 @@ candidate_printed() {
         run_stage "skipped|$printed_name" "$printed_ms"
         return 0
     fi
-=======
->>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
     if [ "$printed_status" = abort ]; then
         run_stage "host_fault|$(cat "$1/last")" "$printed_ms"
         phase_time candidate

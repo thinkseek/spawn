@@ -128,7 +128,6 @@ fn bridge_config(
     Ok(config)
 }
 
-<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
 /// The deps store's path for engines that build a tree's dependencies
 /// (SUPPLY_PA_DEPS, `gate/scenarios/build`): a path, never a login, and only
 /// what the integrator has.
@@ -139,8 +138,6 @@ fn supply_pa_env(lookup: impl Fn(&str) -> Option<String>) -> Vec<(String, String
         .unwrap_or_default()
 }
 
-=======
->>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
 /// The variable a test reads its database from.
 const TEST_DATABASE: &str = "SPAWN_TEST_DATABASE_URL";
 
@@ -337,11 +334,7 @@ fn judge(flags: &Flags) -> Option<Arc<dyn StateJudge>> {
 
 #[cfg(test)]
 mod tests {
-<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
     use super::{FleetTestDatabase, resolve_claude_projects, supply_pa_env};
-=======
-    use super::{FleetTestDatabase, resolve_claude_projects};
->>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
     use spawn_core::bridge::LaunchEnvironment;
 
     fn environment(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
