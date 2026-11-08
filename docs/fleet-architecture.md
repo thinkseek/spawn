@@ -1248,7 +1248,8 @@ tree: its `pnpm install` output, which git does not hold, at
 `~/.local/share/spawn-rsi/deps/<name>/<sha256 of the lockfile>` (read-only;
 `deploy/controller.sh deps` installs one, `update` does it when the
 lockfile's is missing, and a switch keeps the previous controller's tree and
-any tree an agent's workspace still links to, removing the rest, and points
+any tree an agent's workspace still links to, and any a process still uses,
+removing the rest, and points
 `<live>/deps/<name>/current` at the current one). It is
 never the owner's checkout, whose `node_modules` every agent may write. The
 gate binds the store read-only into its sandbox, and engines and gates read
