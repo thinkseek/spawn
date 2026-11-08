@@ -1350,8 +1350,8 @@ pub(crate) fn count_scenarios(directory: &Path) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaseDisagrees, Cpu, GateFailure, PrivateDirectory, gate_env, judge, judge_in, on_shared_server, run_bounded,
-        withhold_owners_cluster, write_gate_env,
+        BaseDisagrees, Cpu, GateFailure, PrivateDirectory, gate_env, judge, judge_in,
+        on_shared_server, run_bounded, withhold_owners_cluster, write_gate_env,
     };
     use std::path::{Path, PathBuf};
     use std::process::Command;
