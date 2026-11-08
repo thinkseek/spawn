@@ -1,0 +1,11 @@
+[Unit]
+Description=Spawn: daily restore drill of the newest dump
+
+[Timer]
+# 05:00 local, after the night's dump and bundle.
+OnCalendar=*-*-* 05:00:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

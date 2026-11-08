@@ -1,0 +1,11 @@
+[Unit]
+Description=Spawn: daily bundle of the mission sources and the transcripts to R2
+
+[Timer]
+# 04:00 local, after the 03:30 dump's hour; a missed day runs at next boot.
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

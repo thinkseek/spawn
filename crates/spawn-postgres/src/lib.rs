@@ -82,11 +82,13 @@ mod missions;
 mod row;
 mod scorecard;
 mod sessions;
+mod wake;
 
 pub use missions::{ActivityEvent, LandingHold};
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
 };
+pub use wake::Listener;
 
 /// Schema installed by [`PostgresStore::migrate`].
 const SCHEMA: &str = include_str!("../sql/schema.sql");
@@ -120,6 +122,10 @@ pub struct PostgresStore {
     /// The URL this store connected with, for the server-wide migration
     /// lock ([`PostgresStore::migrate`]).
     url: String,
+    /// The statements this connection has prepared, by the SQL they were
+    /// prepared from: the loop's fixed reads are parsed and planned once and
+    /// reused, not once per pass ([`PostgresStore::query_prepared`]).
+    prepared: Mutex<std::collections::HashMap<&'static str, postgres::Statement>>,
 }
 
 /// The restricted logins, by their base name; each database has its own
@@ -173,6 +179,7 @@ impl PostgresStore {
             client: Mutex::new(client),
             password: url_password(url),
             url: url.to_string(),
+            prepared: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -706,6 +713,56 @@ impl PostgresStore {
     /// typically a `jsonb` aggregate.
     fn query_json(&self, sql: &str, params: &Params<'_>) -> Result<serde_json::Value, StoreError> {
         Ok(self.query_one(sql, params)?.get(0))
+    }
+
+    /// A fixed statement, prepared on this connection the first time and
+    /// reused after: the loop runs the same reads on every pass, and parsing
+    /// and planning them again each time is work with no decision in it.
+    /// `sql` is `'static` so the statement cache is keyed by the SQL text
+    /// this build ships, never by a string built at run time.
+    fn query_prepared(
+        &self,
+        sql: &'static str,
+        params: &Params<'_>,
+    ) -> Result<Vec<Row>, StoreError> {
+        let mut client = self.lock();
+        let mut prepared = self
+            .prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let statement = if let Some(statement) = prepared.get(sql) {
+            statement.clone()
+        } else {
+            let statement = client.prepare(sql).map_err(|error| backend(&error))?;
+            prepared.insert(sql, statement.clone());
+            statement
+        };
+        drop(prepared);
+        client
+            .query(&statement, params)
+            .map_err(|error| backend(&error))
+    }
+
+    /// One row from a fixed statement (prepared once, [`Self::query_prepared`]).
+    fn query_one_prepared(
+        &self,
+        sql: &'static str,
+        params: &Params<'_>,
+    ) -> Result<Row, StoreError> {
+        let mut rows = self.query_prepared(sql, params)?;
+        rows.pop().ok_or_else(|| {
+            StoreError::Backend(format!("a prepared statement returned no row: {sql}"))
+        })
+    }
+
+    /// The single `jsonb` value of a fixed statement (prepared once,
+    /// [`Self::query_prepared`]).
+    fn query_json_prepared(
+        &self,
+        sql: &'static str,
+        params: &Params<'_>,
+    ) -> Result<serde_json::Value, StoreError> {
+        Ok(self.query_one_prepared(sql, params)?.get(0))
     }
 
     /// Rows changed.

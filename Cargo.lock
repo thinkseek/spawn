@@ -648,6 +648,7 @@ dependencies = [
 name = "spawn-postgres"
 version = "0.1.0"
 dependencies = [
+ "fallible-iterator",
  "hmac",
  "postgres",
  "postgres-protocol",
