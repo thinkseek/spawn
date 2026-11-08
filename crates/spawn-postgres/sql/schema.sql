@@ -1480,21 +1480,13 @@ begin
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
                                    created_by, objective, scenario, model, reissue_of,
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
                                    continues, created_at_ms, updated_at_ms)
-=======
-                                   created_at_ms, updated_at_ms)
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         values (v_id, (p_record ->> 'mission_id')::bigint, p_record ->> 'kind',
                 p_record ->> 'agent_id', p_record ->> 'session_id', p_record ->> 'brief',
                 p_record ->> 'created_by', (p_record ->> 'objective')::integer,
                 p_record ->> 'scenario', coalesce(p_record ->> 'model', 'default'),
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
                 (p_record ->> 'reissue_of')::bigint, (p_record ->> 'continues')::bigint,
                 p_at, p_at);
-=======
-                (p_record ->> 'reissue_of')::bigint, p_at, p_at);
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         update mission_missions set state = 'active', updated_at_ms = p_at
          where id = (p_record ->> 'mission_id')::bigint and state = 'open';
     when 'mission.configured' then
