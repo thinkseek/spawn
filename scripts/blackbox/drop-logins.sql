@@ -22,6 +22,11 @@
 --   - it holds no privilege and owns nothing anywhere on the server
 --     (pg_shdepend): a live database's login holds CONNECT on it;
 --   - it is in no role membership, and no session is logged in as it.
+--     Not counted: the grant PostgreSQL 16 gives the login that made it
+--     when that login is not a superuser (a CREATEROLE login gets ADMIN
+--     OPTION, without SET or INHERIT, on each role it makes); DROP ROLE
+--     removes it. The fleet's test server has no superuser for tests
+--     (deploy/fleet-test-db.sh).
 -- No init-db can be midway: a migration makes a database's logins and their
 -- grants in one transaction, after the database exists, so a sweep sees
 -- either nothing of them or logins their database owns; a login whose
@@ -65,7 +70,13 @@ begin
                not exists (select 1 from logins l where l.present and l.rolname = r.rolname)
                and not exists (select 1 from pg_shdepend s
                                 where s.refclassid = 'pg_authid'::regclass and s.refobjid = r.oid)
-               and not exists (select 1 from pg_auth_members m where r.oid in (m.roleid, m.member))
+               and not exists (select 1 from pg_auth_members m
+                                where r.oid in (m.roleid, m.member)
+                                  and not (m.roleid = r.oid
+                                           and m.member = (select oid from pg_roles
+                                                            where rolname = current_user)
+                                           and m.admin_option and not m.inherit_option
+                                           and not m.set_option))
                and not exists (select 1 from pg_stat_activity a where a.usesysid = r.oid)
                    as droppable
           from pg_roles r

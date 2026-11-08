@@ -809,6 +809,10 @@ snapshot() {
         where e.session_id = '$session' and e.event_name = 'session.native_started'
         order by e.id desc limit 1")"
     put "$1" command "$(max_command)"
+    # What it had written when the fault came: every line of it must be found
+    # again. Read now, not after the end: by then a resumed engine has written
+    # more, and the lines it found would be miscounted as lost.
+    put "$1" written "$(last_line "$(get "$1" agent)" | cut -d' ' -f2)"
     put "$1" fault "$(now_ms)"
 }
 
@@ -911,8 +915,7 @@ check_resume() { # <check> <label> <cause> <jq test of the evidence> <what was d
     ended_info "$label"
     ended=$(get "$label" ended)
     [ -n "$ended" ] || measured_fail "($n) $agent's execution $exec did not end after $what"
-    written=$(last_line "$agent" | cut -d' ' -f2)
-    put "$label" written "$written"
+    written=$(get "$label" written)
     record=$(interrupted "$exec" "$(get "$label" fault)")
     if [ -z "$record" ]; then
         measured_fail "($n) $agent's execution $exec ended after $what (the Bridge recorded execution.ended $(end_of "$session" "$exec")), and no execution.interrupted names its cause; every end records its cause ($cause) and the path it takes: $(describe "$label" "$(get "$label" fault)" "$(get "$label" command)")"

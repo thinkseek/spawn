@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use spawn_postgres::PostgresStore;
 
 mod common;
-use common::{admin, login, store};
+use common::{admin, store};
 
 /// A main as a source's commit id.
 const MAIN: &str = "1111111111111111111111111111111111111111";
@@ -165,16 +165,13 @@ fn a_hold_is_the_owners_on_a_local_source_a_mission_names_with_a_bound() {
     assert!(source_types(&mut client).is_empty(), "nothing was recorded");
 
     // The supervisor's login is refused every command.
-    let supervisor = login(&schema, "spawn_supervisor");
-    client
-        .batch_execute(&format!("set session authorization {supervisor}"))
-        .expect("become the supervisor");
+    let mut supervisor = common::as_login(&schema, "spawn_supervisor");
     for call in [
         "select spawn_source_hold_lock('/tmp/held.git')",
         "select spawn_source_hold('/tmp/held.git', '1111111111111111111111111111111111111111', 60, null)",
         "select spawn_source_release('/tmp/held.git')",
     ] {
-        let refused = client
+        let refused = supervisor
             .batch_execute(call)
             .expect_err("the supervisor is refused");
         assert_eq!(
@@ -184,12 +181,10 @@ fn a_hold_is_the_owners_on_a_local_source_a_mission_names_with_a_bound() {
         );
     }
     // It reads the holds on the board.
-    client
+    supervisor
         .batch_execute("select * from mission_source_holds")
         .expect("the supervisor reads the holds");
-    client
-        .batch_execute("reset session authorization")
-        .expect("back to the owner");
+    drop(supervisor);
     assert!(source_types(&mut client).is_empty(), "nothing was recorded");
 }
 

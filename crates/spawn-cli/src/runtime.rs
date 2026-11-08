@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use spawn_core::bridge::{Bridge, BridgeConfig, ModelRelay};
+use spawn_core::bridge::{Bridge, BridgeConfig, LaunchEnvironment, ModelRelay};
 use spawn_core::observe::{Observer, StateJudge};
 use spawn_core::port::{CommandQueue, EventLog, TerminalHost, WorkspaceStore};
 use spawn_host::GitWorkspace;
@@ -116,7 +116,154 @@ fn bridge_config(
         Err(error) if crate::config::supervised() => return Err(error),
         Err(_) => {}
     }
+    if let Some(fleet) = FleetTestDatabase::from_env(env_value, |url| {
+        spawn_postgres::cluster_identity(url).map_err(|error| error.to_string())
+    }) {
+        config.launch_environment = Some(Arc::new(fleet));
+    }
     Ok(config)
+}
+
+/// The variable a test reads its database from.
+const TEST_DATABASE: &str = "SPAWN_TEST_DATABASE_URL";
+
+/// How a server's identity is read: [`spawn_postgres::cluster_identity`].
+type Identity = fn(&str) -> Result<String, String>;
+
+/// The fleet's own test server, which engines get as
+/// `SPAWN_TEST_DATABASE_URL`: `SPAWN_FLEET_TEST_DATABASE_URL`
+/// (`deploy/fleet-test-db.sh` sets one up), or none.
+///
+/// Never the gates' shared server (this process's own
+/// `SPAWN_TEST_DATABASE_URL`) nor the live database: a worker's tests
+/// there slow a gate's or touch the fleet's record. Fails closed, like the
+/// gates' [`crate::gate::withhold_owners_cluster`]: an engine gets the URL
+/// only once the fleet's server and every other one configured answer with
+/// their identity (`system_identifier`) and the fleet's differs from each.
+/// Until then every launch goes without it and checks again, so a fleet
+/// server that comes up later is given from then on; the reason it is
+/// withheld goes to the loop's output once per reason. Once given, it is
+/// not checked again: the URLs do not change while the loop runs.
+struct FleetTestDatabase {
+    fleet: String,
+    /// The servers it must not be: (variable, what it is, URL).
+    others: Vec<(&'static str, &'static str, String)>,
+    identity: Identity,
+    state: std::sync::Mutex<FleetCheck>,
+}
+
+#[derive(Default)]
+struct FleetCheck {
+    given: bool,
+    /// The last reason said, so a reason is said once.
+    told: Option<String>,
+}
+
+impl std::fmt::Debug for FleetTestDatabase {
+    // Never the URLs: they hold passwords.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FleetTestDatabase")
+            .field(
+                "others",
+                &self
+                    .others
+                    .iter()
+                    .map(|(name, ..)| *name)
+                    .collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl FleetTestDatabase {
+    /// The fleet's test server named in the environment `lookup` reads,
+    /// or none when `SPAWN_FLEET_TEST_DATABASE_URL` is unset.
+    fn from_env(lookup: impl Fn(&str) -> Option<String>, identity: Identity) -> Option<Self> {
+        let fleet = lookup("SPAWN_FLEET_TEST_DATABASE_URL")?;
+        let others = [
+            (TEST_DATABASE, "the gates' shared test server"),
+            ("SPAWN_DATABASE_URL", "the live database"),
+        ]
+        .into_iter()
+        .filter_map(|(name, what)| lookup(name).map(|url| (name, what, url)))
+        .collect();
+        Some(Self {
+            fleet,
+            others,
+            identity,
+            state: std::sync::Mutex::new(FleetCheck::default()),
+        })
+    }
+
+    /// Why the URL may not be given now, or nothing when it may.
+    fn withheld(&self) -> Option<String> {
+        if self.others.is_empty() {
+            return Some(
+                "SPAWN_DATABASE_URL is unset, so the fleet's test server cannot be told apart \
+                 from the live one"
+                    .to_string(),
+            );
+        }
+        let fleet = match (self.identity)(&self.fleet) {
+            Ok(fleet) => fleet,
+            Err(error) => {
+                return Some(format!(
+                    "the fleet's test server has no readable identity: {error}"
+                ));
+            }
+        };
+        for (name, what, url) in &self.others {
+            if *url == self.fleet {
+                return Some(format!("SPAWN_FLEET_TEST_DATABASE_URL is {what} ({name})"));
+            }
+            match (self.identity)(url) {
+                Ok(other) if other != fleet => {}
+                Ok(_) => {
+                    return Some(format!(
+                        "SPAWN_FLEET_TEST_DATABASE_URL reaches {what} ({name})"
+                    ));
+                }
+                Err(error) => {
+                    return Some(format!("{what} ({name}) has no readable identity: {error}"));
+                }
+            }
+        }
+        None
+    }
+}
+
+impl LaunchEnvironment for FleetTestDatabase {
+    fn environment(&self) -> Vec<(String, String)> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.given {
+            match self.withheld() {
+                None => {
+                    state.given = true;
+                    if state.told.take().is_some() {
+                        eprintln!(
+                            "bridge: the fleet's test server checks out; engines started from \
+                             now on get SPAWN_TEST_DATABASE_URL"
+                        );
+                    }
+                }
+                Some(reason) => {
+                    if state.told.as_ref() != Some(&reason) {
+                        eprintln!(
+                            "bridge: engines get no SPAWN_TEST_DATABASE_URL: {reason} \
+                             (checked again at each launch)"
+                        );
+                        state.told = Some(reason);
+                    }
+                    return Vec::new();
+                }
+            }
+        }
+        vec![(TEST_DATABASE.to_string(), self.fleet.clone())]
+    }
 }
 
 /// The model relay (`scripts/model-relay.py`) Claude Code engines reach
@@ -173,7 +320,8 @@ fn judge(flags: &Flags) -> Option<Arc<dyn StateJudge>> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_claude_projects;
+    use super::{FleetTestDatabase, resolve_claude_projects};
+    use spawn_core::bridge::LaunchEnvironment;
 
     fn environment(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let pairs: Vec<(String, String)> = pairs
@@ -207,5 +355,110 @@ mod tests {
             ("SPAWN_CLAUDE_PROJECTS", "/mnt/transcripts"),
         ]);
         assert_eq!(resolve_claude_projects(&explicit), "/mnt/transcripts");
+    }
+
+    const FLEET: &str = "postgres://fleet:pw@%2Fhome%2Fo%2Ffleet-pg%2Fsock:5442/spawn_fleet_test";
+    const GATES: &str = "postgres://gate:pw@127.0.0.1:5433/spawn_test";
+    const LIVE: &str = "postgres://spawn:pw@127.0.0.1:5432/spawn";
+    /// The gates' server, spelt another way.
+    const GATES_SOCKET: &str = "postgres://gate:pw@%2Fvar%2Frun%2Fpostgresql:5433/spawn_test";
+    /// The fleet's server while it is down (see [`FLEET_UP`]).
+    const FLEET_LATER: &str = "postgres://fleet:pw@%2Ftmp%2Flater:5442/spawn_fleet_test";
+
+    static FLEET_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn identity(url: &str) -> Result<String, String> {
+        match url {
+            FLEET => Ok("fleet".to_string()),
+            FLEET_LATER if FLEET_UP.load(std::sync::atomic::Ordering::SeqCst) => {
+                Ok("later".to_string())
+            }
+            FLEET_LATER => Err("connection refused".to_string()),
+            GATES | GATES_SOCKET => Ok("gates".to_string()),
+            LIVE => Ok("live".to_string()),
+            _ => Err("no such server".to_string()),
+        }
+    }
+
+    fn given(fleet: &FleetTestDatabase) -> Vec<String> {
+        fleet
+            .environment()
+            .into_iter()
+            .map(|(name, value)| {
+                assert_eq!(name, "SPAWN_TEST_DATABASE_URL");
+                value
+            })
+            .collect()
+    }
+
+    fn loop_env(fleet: &str, gates: &str) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(String, String)> = [
+            ("SPAWN_FLEET_TEST_DATABASE_URL", fleet),
+            ("SPAWN_TEST_DATABASE_URL", gates),
+            ("SPAWN_DATABASE_URL", LIVE),
+        ]
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(known, _)| known == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    #[test]
+    fn engines_get_the_fleet_test_server_once_it_is_known_to_be_its_own() {
+        let fleet = FleetTestDatabase::from_env(loop_env(FLEET, GATES), identity).expect("set");
+        assert_eq!(given(&fleet), [FLEET]);
+        assert_eq!(given(&fleet), [FLEET]);
+        // Unset: engines get no test database at all, not the gates'.
+        let unset = environment(&[("SPAWN_TEST_DATABASE_URL", GATES)]);
+        assert!(FleetTestDatabase::from_env(unset, identity).is_none());
+        // Never the URLs in what the loop may print.
+        assert!(!format!("{fleet:?}").contains("pw"));
+    }
+
+    #[test]
+    fn a_fleet_test_server_whose_identity_cannot_be_read_is_withheld_until_it_can() {
+        let fleet =
+            FleetTestDatabase::from_env(loop_env(FLEET_LATER, GATES), identity).expect("set");
+        assert!(given(&fleet).is_empty());
+        assert!(given(&fleet).is_empty());
+        let reason = fleet.withheld().expect("withheld");
+        assert!(reason.contains("no readable identity"), "{reason}");
+        assert!(!reason.contains("pw"), "no password in {reason}");
+        // Up later: the next launch gets it.
+        FLEET_UP.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(given(&fleet), [FLEET_LATER]);
+        // An unreadable other server withholds it too.
+        let unknown = FleetTestDatabase::from_env(
+            loop_env(FLEET, "postgres://gate:pw@%2Fgone:5433/spawn_test"),
+            identity,
+        )
+        .expect("set");
+        assert!(given(&unknown).is_empty());
+        let reason = unknown.withheld().expect("withheld");
+        assert!(reason.contains("the gates' shared test server"), "{reason}");
+        // Without the live URL it cannot be told apart: withheld.
+        let alone = environment(&[("SPAWN_FLEET_TEST_DATABASE_URL", FLEET)]);
+        let alone = FleetTestDatabase::from_env(alone, identity).expect("set");
+        assert!(given(&alone).is_empty());
+    }
+
+    #[test]
+    fn a_fleet_test_server_that_is_the_gates_or_the_live_one_is_withheld() {
+        for (fleet, gates, what) in [
+            (GATES, GATES, "the gates' shared test server"),
+            (GATES_SOCKET, GATES, "the gates' shared test server"),
+            (LIVE, GATES, "the live database"),
+        ] {
+            let fleet = FleetTestDatabase::from_env(loop_env(fleet, gates), identity).expect("set");
+            assert!(given(&fleet).is_empty());
+            let reason = fleet.withheld().expect("withheld");
+            assert!(reason.contains(what), "{reason}");
+            assert!(!reason.contains("pw"), "no password in {reason}");
+        }
     }
 }
