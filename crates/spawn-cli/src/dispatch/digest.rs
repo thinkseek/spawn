@@ -73,10 +73,7 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::HoldExpired => "a source hold expired",
         Why::ObjectiveYielded => "an objective ran out of attempts and yielded its slot",
         Why::ObjectiveOrder => "a backlog names an order no task can meet",
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
         Why::OverBudget => "a task went over its budget twice",
-=======
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
     }
 }
 
@@ -204,7 +201,6 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
         .collect()
 }
 
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
 /// The digest items for `records`, the integrator's `host_fault` gate
 /// records whose base disagreed with itself and that carry `alert` (the
 /// mission's third such base in a row, objective 033), and that no delivered
@@ -256,8 +252,6 @@ pub(crate) fn base_disagrees_alerts(records: &[Value]) -> Vec<Escalation> {
         .collect()
 }
 
-=======
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
 /// The digest items for `records`, the integrator's yields (`task.cancelled`
 /// naming `yielded`) that no delivered digest told yet
 /// (`PostgresStore::objective_yields`). Each is an item of session
@@ -291,7 +285,6 @@ pub(crate) fn objective_yields(records: &[Value]) -> Vec<Escalation> {
         .collect()
 }
 
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
 /// The digest items for `records` (`PostgresStore::over_budget_escalations`):
 /// a task that continued an overrun task of its objective went over the
 /// budget too, so no third task is issued for it and the objective waits
@@ -352,8 +345,6 @@ pub(crate) fn over_budget_escalations(records: &[Value]) -> Vec<Escalation> {
         .collect()
 }
 
-=======
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
 /// The digest items for `missions` (`PostgresStore::objective_backlogs`):
 /// one per open objective mission whose backlog names an order that cannot
 /// be met ([`crate::objectives::order_problems`]), of session `missions`,

@@ -412,13 +412,10 @@ pub(crate) enum Why {
     /// An objective ran out of attempts and its task yielded the slot to
     /// the next objective ([`digest::objective_yields`]).
     ObjectiveYielded,
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
     /// A task that continued an overrun task went over its budget too
     /// ([`digest::over_budget_escalations`]): its objective is held until
     /// the mission is configured again.
     OverBudget,
-=======
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
     /// An objective mission's backlog names an order that cannot be met
     /// ([`digest::objective_order`]): a condition until the backlog changes.
     ObjectiveOrder,
@@ -691,7 +688,6 @@ pub(crate) fn read_plan(
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
     host.extend(digest::base_disagrees_alerts(
         store
             .gate_base_disagrees_alerts()
@@ -706,8 +702,6 @@ pub(crate) fn read_plan(
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
-=======
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
     host.extend(digest::objective_yields(
         store
             .objective_yields()
@@ -1635,7 +1629,6 @@ mod tests {
         );
     }
 
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
     /// Objective 33: three bases in a row that disagreed with themselves
     /// reach an idle supervisor once, as an item of `host` tagged
     /// `host gate-base-disagrees-<event id>`, naming the task, the mission,
@@ -1729,8 +1722,6 @@ mod tests {
         );
     }
 
-=======
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
     /// A backlog whose order no task can meet reaches the supervisor as
     /// one `missions` item per mission and content of the problems: the
     /// same problems keep their tag (told once), changed ones get a new
@@ -1792,7 +1783,6 @@ mod tests {
     /// an idle supervisor once, as an item of `missions` tagged
     /// `missions objective-yielded-<event id>`, its line naming the mission
     /// and the record's reason; two yields keep a line each.
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
     /// A second overrun of an objective's chain is one digest item, tagging
     /// the overrun's record, naming both tasks, and holding the objective.
     #[test]
@@ -1839,8 +1829,6 @@ mod tests {
         );
     }
 
-=======
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
     #[test]
     fn a_yielded_objective_reaches_an_idle_supervisor_once() {
         let reason = "objective 19 had 3 failed attempts since its last turn (conflict, \

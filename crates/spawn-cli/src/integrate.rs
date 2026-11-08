@@ -49,7 +49,6 @@
 //!    landing failed may have moved main before its record; it is applied
 //!    or refused by a later pass). A main moved with no record at all (a
 //!    push behind Spawn's back) still halts;
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
 //! 2. a delivered task over its mission's budget keeps its work. Its worker
 //!    is stopped (the Stop, and its final checkpoint on the task's branch)
 //!    and the overrun is its own record, `task.over_budget` {`reason`,
@@ -88,19 +87,6 @@
 //!      `mission.configured` record newer than the overrun's), while the
 //!      mission's other objectives go on with the freed slot. A third
 //!      overrun after such a configure is treated as a first;
-=======
-//! 2. a delivered task over its mission's budget is aborted and its worker
-//!    stopped. Its minutes are active time ([`active_ms`]): the gaps of its
-//!    session's events, readings (`screen.observed`,
-//!    `observation.recorded`) left out; a gap counts at most
-//!    `SPAWN_BUDGET_GAP_SECS` (300 s), and only if it ends in the model's
-//!    progress (a tool, a job, a stopped turn), not in a failed turn, a
-//!    prompt or a command; a gap inside a tool or job that ended counts
-//!    while the whole fleet was alive. So no outage (the fleet stopped, a
-//!    frozen host, a dead engine, the model API down) can by itself put a
-//!    task over budget (a subagent's job open across a model API outage
-//!    adds up to its retry window, see [`active_ms`]);
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
 //! 3. a task whose gate passed is landed (again, after a crash), unless the
 //!    owner holds its source (`spawn mission hold`, a `source.held` record):
 //!    [`land`] reads the hold from the store under the landing lock, before
@@ -1747,23 +1733,15 @@ impl Integrator {
         Ok(())
     }
 
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
     /// Stop the delivered tasks over budget and record each as its own
     /// `task.over_budget`, with the work it keeps; the ids of those it
     /// recorded. A task whose work has not reached its branch yet waits for
     /// the push ([`kept_work`]) and is recorded by a later pass.
-=======
-    /// Abort delivered tasks over budget; the ids of those it aborted.
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
     fn enforce_budget(store: &PostgresStore, mission: &Mission) -> Result<Vec<i64>, String> {
         let Some(budget) = &mission.budget else {
             return Ok(Vec::new());
         };
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
         let mut over: Vec<i64> = Vec::new();
-=======
-        let mut aborted = Vec::new();
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
         let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
         let gap_ms = budget_gap(crate::config::env_value("SPAWN_BUDGET_GAP_SECS").as_deref())
             .as_millis()
@@ -1787,7 +1765,6 @@ impl Integrator {
                     .fleet_alive_ms(from, to, gap_ms)
                     .map_err(|error| error.to_string())
             })?;
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
             let Some(reason) = over_budget(budget, active, calls) else {
                 continue;
             };
@@ -1812,30 +1789,6 @@ impl Integrator {
                                      "branch": branch});
             if let Some(commit) = &commit {
                 overrun["commit"] = json!(commit);
-=======
-            if let Some(reason) = over_budget(budget, active, calls) {
-                // The Stop first, under its fixed key: if the record then
-                // fails, the next pass finds the task still delivered and
-                // over budget, and submits (a no-op) and records again.
-                stop(store, task)?;
-                // An abort that is its objective's last failed attempt
-                // before the limit is the yield too: the task is gone, and
-                // nothing else would yield the slot.
-                let mut aborted_record =
-                    json!({"type": "task.aborted", "id": task.id, "reason": reason});
-                if let Some(yielded) = objectives::abort_yield(store, mission, task)?
-                    && let (Some(record), Some(fields)) =
-                        (aborted_record.as_object_mut(), yielded.as_object())
-                {
-                    record.extend(fields.clone());
-                }
-                record(store, &aborted_record)?;
-                println!("integrate: task {} aborted: {reason}", task.id);
-                if let Some(why) = aborted_record["yield_reason"].as_str() {
-                    println!("integrate: mission {}: {why}", mission.id);
-                }
-                aborted.push(task.id);
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
             }
             if !diff.is_empty() {
                 overrun["diff"] = json!(diff);
@@ -7406,24 +7359,15 @@ mod database_tests {
             tool_work(&db, task, delivered + 5_000, now);
         };
         overrun(&first);
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
         overrun(&other);
         let over =
             Integrator::enforce_budget(&db.store, &snapshot(&db, mission)).expect("the budget");
         assert_eq!(over, vec![first.id, other.id]);
-=======
-        // 025's first abort: under the limit, a plain abort.
-        overrun(&other);
-        let aborted =
-            Integrator::enforce_budget(&db.store, &snapshot(&db, mission)).expect("the budget");
-        assert_eq!(aborted, vec![first.id, other.id]);
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
         let record = |task: i64| -> Value {
             db.admin()
                 .query_one(
                     "select kind -> 'detail' -> 'record' from spawn_events
                       where session_id = 'session_control'
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
                         and kind -> 'detail' -> 'record' ->> 'type' = 'task.over_budget'
                         and kind -> 'detail' -> 'record' ->> 'id' = $1",
                     &[&task.to_string()],
@@ -7468,45 +7412,10 @@ mod database_tests {
         // gets its slot when one is free.
         pass();
         let mut flying: Vec<u32> = flying(&db, mission)
-=======
-                        and kind -> 'detail' -> 'record' ->> 'type' = 'task.aborted'
-                        and kind -> 'detail' -> 'record' ->> 'id' = $1",
-                    &[&task.to_string()],
-                )
-                .expect("the abort")
-                .get(0)
-        };
-        let yielded = record(first.id);
-        assert_eq!(yielded["yielded"], true);
-        assert_eq!(
-            (yielded["objective"].as_i64(), yielded["failures"].as_i64()),
-            (Some(23), Some(3))
-        );
-        let why = yielded["yield_reason"]
-            .as_str()
-            .expect("its reason")
-            .to_string();
-        assert!(
-            why.contains("objective 23 had 3 failed attempts")
-                && why.contains("conflict, conflict, aborted over budget"),
-            "{why}"
-        );
-        assert!(record(other.id).get("yielded").is_none(), "under the limit");
-        let told = db.store.objective_yields().expect("the yields to tell");
-        let told = told.as_array().expect("a list");
-        assert_eq!(told.len(), 1);
-        assert_eq!(told[0]["id"], first.id);
-        assert_eq!(told[0]["reason"].as_str(), Some(why.as_str()));
-
-        // Both slots free: 025 (one failure, no yield) first, then 023.
-        pass();
-        let flying: Vec<u32> = flying(&db, mission)
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
             .iter()
             .filter(|(task, _)| *task != first.id && *task != other.id)
             .map(|(_, objective)| *objective)
             .collect();
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
         flying.sort_unstable();
         assert_eq!(flying, [23, 25], "the continuation of the overrun, and 025");
         let again = objective_task(&db, mission, 23);
@@ -7514,15 +7423,6 @@ mod database_tests {
             continues_of(&db, again.id),
             Some(first.id),
             "023's task continues the overrun"
-=======
-        assert_eq!(flying, [25, 23]);
-        let again = objective_task(&db, mission, 23);
-        assert!(pass().is_empty(), "nothing yields, no slot is free");
-        assert_eq!(
-            task_state(&db, mission, again.id),
-            "assigned",
-            "023's new task stays"
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -7559,20 +7459,13 @@ mod database_tests {
             .expect("deliver 70 minutes ago");
         tool_work(&db, &task, delivered + 5_000, now);
         let pass = snapshot(&db, mission);
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
         let over = Integrator::enforce_budget(&db.store, &pass).expect("the budget");
         assert_eq!(over, vec![task.id]);
         let settled = over.into_iter().collect();
-=======
-        let aborted = Integrator::enforce_budget(&db.store, &pass).expect("the budget");
-        assert_eq!(aborted, vec![task.id]);
-        let settled = aborted.into_iter().collect();
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
         assert!(
             crate::objectives::assign_next(&db.store, &pass, &settled)
                 .expect("the same pass")
                 .is_empty(),
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
             "nothing in the pass that overran"
         );
         // The next pass assigns the overrun's continuation, and it says so:
@@ -7730,20 +7623,6 @@ mod database_tests {
             ),
             "a push that never came is lost"
         );
-=======
-            "nothing in the pass that aborted"
-        );
-        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
-            .expect("the next pass");
-        let next: Vec<u32> = flying(&db, mission)
-            .iter()
-            .filter(|(id, _)| *id != task.id)
-            .map(|(_, objective)| *objective)
-            .collect();
-        assert_eq!(next, [25], "the fewest attempts, not the aborted objective");
-        let brief = objective_task(&db, mission, 25).brief;
-        assert!(!brief.contains("Earlier tasks"));
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
         let _ = std::fs::remove_dir_all(&base);
     }
 
