@@ -676,7 +676,6 @@ impl Fleet<'_> {
         }
     }
 
-
     fn debug(line: &str) {
         if std::env::var("SPAWN_RECOVER_DEBUG").is_ok() {
             use std::io::Write as _;
