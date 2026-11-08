@@ -2060,6 +2060,192 @@ expect "naming the TMPDIR" "$tmp_out" "the host's TMPDIR ($TMPDIR)"
 expect "and why" "$tmp_out" "the sandbox empties too"
 refuse "and nothing ran" "$tmp_out" "=="
 
+# 21. A warm claims last. A low claimant (SPAWN_GATE_SLOT_PRIORITY=low, the
+# default of --base-only) takes a slot only when no gate is waiting for
+# one: with one slot held, a normal gate already waiting gets it before a
+# low one that arrived later; a low claimant alone takes an idle slot at
+# once; and the demand lock goes with a waiting gate that is killed.
+demand=$HOME/.cache/spawn/gate-slots/demand
+# The holder holds the one slot long enough for both later gates to be
+# waiting before it lets go (each needs its exports and static checks
+# first).
+priohold=$work/prio-hold
+mkdir -p "$priohold"
+cp "$scenarios/protected" "$priohold/"
+printf '#!/bin/sh\nsleep 15\nexit 0\n' >"$priohold/check-hold.sh"
+prio_hold() { # <tag>: a normal gate holding the one slot for 15 s, in the background
+    XDG_CACHE_HOME="$work/caches/prio-$1" SPAWN_GATE_JOBS=1 SPAWN_GATE_HOST_JOBS=1 \
+        sh "$gate" "$repo" "$base" "$good" "$priohold" >"$work/prio-$1.log" 2>&1 &
+    prio_holder=$!
+    prio_n=0
+    until ! flock -n "$slot_file" true 2>/dev/null; do
+        sleep 0.1
+        prio_n=$((prio_n + 1))
+        [ "$prio_n" -lt 300 ] || { echo "FAIL the holder ($1) never took its slot"; exit 1; }
+    done
+}
+prio_gate() { # <tag> <priority>: a gate on the slot scenario, in the background
+    XDG_CACHE_HOME="$work/caches/prio-$1" SPAWN_GATE_JOBS=1 SPAWN_GATE_HOST_JOBS=1 \
+        SPAWN_GATE_SLOT_PRIORITY="$2" \
+        sh "$gate" "$repo" "$base" "$good" "$slots" >"$work/prio-$1.log" 2>&1 &
+}
+prio_said() { # <tag> <text>: wait (up to 30 s) until the gate's log says it
+    prio_n=0
+    until grep -qF "$2" "$work/prio-$1.log" 2>/dev/null; do
+        sleep 0.1
+        prio_n=$((prio_n + 1))
+        [ "$prio_n" -lt 300 ] || { echo "FAIL $1 never said: $2"; exit 1; }
+    done
+}
+prio_hold h1
+prio_gate normal normal
+prio_normal=$!
+prio_said normal "waiting for a host scenario slot (all 1 taken"
+prio_gate low low
+prio_low=$!
+prio_said low "waiting for a host scenario slot (claimed last"
+prio_status=0
+wait "$prio_holder" "$prio_normal" "$prio_low" || prio_status=$?
+expect "the three gates finish: exit 0" "$prio_status" 0
+prio_wn=$(slot_window "$work/prio-normal.log" 1)
+prio_wl=$(slot_window "$work/prio-low.log" 1)
+[ -n "$prio_wn" ] && [ -n "$prio_wl" ] || { echo "FAIL no slot run in a priority log"; exit 1; }
+expect "a waiting gate gets the slot before a warm that came later" \
+    "$([ "${prio_wn%% *}" -lt "${prio_wl%% *}" ] && echo first)" first
+expect "the low claimant says it claims last" "$(cat "$work/prio-low.log")" \
+    '| host scenario slots: claimed last (a warm: a slot only when no gate is waiting for one)'
+refuse "and a normal gate does not" "$(cat "$work/prio-normal.log")" 'claimed last'
+expect "the demand lock is free after" "$(flock -n -x "$demand" true && echo free)" free
+# Alone, a low claimant takes an idle slot at once.
+prio_gate alone low
+prio_alone=$!
+prio_status=0
+wait "$prio_alone" || prio_status=$?
+expect "a low claimant alone: exit 0" "$prio_status" 0
+refuse "without waiting" "$(cat "$work/prio-alone.log")" 'waited'
+# A waiting gate that is killed takes its demand with it: the low claimant
+# behind it gets the slot when the holder frees it.
+prio_hold h2
+XDG_CACHE_HOME="$work/caches/prio-killed" SPAWN_GATE_JOBS=1 SPAWN_GATE_HOST_JOBS=1 \
+    setsid sh -c 'echo $$ >"$1"; shift; exec "$@"' _ "$work/prio-killed.pid" \
+    sh "$gate" "$repo" "$base" "$good" "$slots" >"$work/prio-killed.log" 2>&1 &
+prio_said killed "waiting for a host scenario slot (all 1 taken"
+prio_gate behind low
+prio_behind=$!
+prio_said behind "waiting for a host scenario slot (claimed last"
+prio_killed=$(cat "$work/prio-killed.pid")
+# Its scratch, found by its session as in case 20, removed after the kill
+# (no trap runs on KILL).
+prio_scratch=""
+for prio_pid in $(ps -eo pid=,sess= | awk -v s="$prio_killed" '$2 == s { print $1 }'); do
+    for prio_fd in /proc/"$prio_pid"/fd/*; do
+        prio_path=$(readlink "$prio_fd" 2>/dev/null) || continue
+        case "$prio_path" in
+        "${TMPDIR:-/tmp}"/spawn-gate.*)
+            prio_rest=${prio_path#"${TMPDIR:-/tmp}"/spawn-gate.}
+            prio_scratch=${prio_rest%%/*}
+            ;;
+        esac
+    done
+done
+kill -KILL "-$prio_killed" 2>/dev/null || { echo "FAIL could not kill the waiting gate's group"; exit 1; }
+[ -z "$prio_scratch" ] || rm -rf "${TMPDIR:-/tmp}/spawn-gate.$prio_scratch"
+prio_status=0
+wait "$prio_behind" || prio_status=$?
+expect "with the waiting gate killed, the warm behind it runs: exit 0" "$prio_status" 0
+expect "and its scenario ran" "$(cat "$work/prio-behind.log")" '| slot-start '
+wait "$prio_holder" || true
+expect "and the demand lock is free after" "$(flock -n -x "$demand" true && echo free)" free
+# --base-only is low by default, whatever the environment says otherwise.
+prio_status=0
+XDG_CACHE_HOME="$work/caches/prio-base" SPAWN_GATE_JOBS=4 SPAWN_GATE_HOST_JOBS=1 \
+    sh "$gate" --base-only "$repo" "$base" "$slots" >"$work/prio-base.log" 2>&1 || prio_status=$?
+expect "a base-only run: exit 0" "$prio_status" 0
+expect "claims last by default" "$(cat "$work/prio-base.log")" 'claimed last'
+expect "a bad SPAWN_GATE_SLOT_PRIORITY refuses to start: exit 3" \
+    "exit=$(SPAWN_GATE_SLOT_PRIORITY=first sh "$gate" "$repo" "$base" "$good" "$slots" >/dev/null 2>&1 || echo $?)" \
+    'exit=3'
+
+# 21c. No inversion through a base entry. A warm (low) and a gate share a
+# base cache and miss the same key, with the one slot held. The warm waits
+# for its slot before it takes the key's lock, so the key stays free while
+# it waits; the gate that comes after takes the key and the slot first (it
+# is waiting, so the warm cannot scan), judges the objective itself, and
+# the warm reads that entry (or skips the key, if the gate still holds it).
+invert=$work/invert
+mkdir -p "$invert"
+cp "$scenarios/protected" "$invert/"
+printf '#!/bin/sh\nsleep 1\nexit 0\n' >"$invert/302.sh"
+invert_release=$work/invert.release
+rm -f "$invert_release"
+flock "$slot_file" sh -c 'until [ -e "$1" ]; do sleep 0.1; done' _ "$invert_release" &
+invert_holder=$!
+prio_n=0
+until ! flock -n "$slot_file" true 2>/dev/null; do
+    sleep 0.1
+    prio_n=$((prio_n + 1))
+    [ "$prio_n" -lt 300 ] || { echo "FAIL the inversion case's holder never took the slot"; exit 1; }
+done
+XDG_CACHE_HOME="$work/caches/invert" SPAWN_GATE_HOST_JOBS=1 \
+    sh "$gate" --base-only "$repo" "$base" "$invert" >"$work/prio-invert-warm.log" 2>&1 &
+invert_warm=$!
+prio_said invert-warm "waiting for a host scenario slot (claimed last"
+invert_lock=$(find "$work/caches/invert" -name '*.lock' | head -n 1)
+[ -n "$invert_lock" ] || { echo "FAIL no base entry lock in the inversion case's cache"; exit 1; }
+expect "a warm waiting for a slot holds no key's lock" \
+    "$(flock -n "$invert_lock" true && echo free)" free
+XDG_CACHE_HOME="$work/caches/invert" SPAWN_GATE_JOBS=1 SPAWN_GATE_HOST_JOBS=1 \
+    sh "$gate" "$repo" "$base" "$good" "$invert" >"$work/prio-invert-gate.log" 2>&1 &
+invert_gate=$!
+prio_said invert-gate "waiting for a host scenario slot (all 1 taken"
+: >"$invert_release"
+prio_status=0
+wait "$invert_holder" "$invert_warm" "$invert_gate" || prio_status=$?
+expect "the warm and the gate finish: exit 0" "$prio_status" 0
+expect "the gate judged the key itself" "$(cat "$work/prio-invert-gate.log")" '| == base: 302.sh: solved'
+refuse "not from the warm's entry" "$(cat "$work/prio-invert-gate.log")" 'another gate judged it meanwhile'
+invert_w=$(cat "$work/prio-invert-warm.log")
+expect "the warm took the gate's entry or skipped the key" \
+    "$(case "$invert_w" in *'302.sh: solved (cached: another gate judged it meanwhile)'* | *'302.sh: skipped (another gate is judging it'*) echo yes ;; esac)" yes
+refuse "and never ran it" "$invert_w" '| == base: 302.sh
+'
+
+# 22. The build's share: CARGO_BUILD_JOBS inside the sandbox for the build
+# hook is not set (nor set empty) unless SPAWN_GATE_BUILD_JOBS is, whatever
+# SPAWN_GATE_JOBS says; a warm (--base-only) builds at 1 whatever is set;
+# anything but a whole number from 1 refuses to start.
+jobsdir=$work/build-jobs
+mkdir -p "$jobsdir"
+cp "$scenarios/protected" "$jobsdir/"
+printf '#!/bin/sh\nprintf "%%s\\n" "${CARGO_BUILD_JOBS-unset}" >build-jobs\n' >"$jobsdir/build"
+printf '#!/bin/sh\necho "build-jobs $(cat build-jobs)"\nexit 0\n' >"$jobsdir/check-jobs.sh"
+jobs_run() { # <tag> [VAR=value ...]: the gate's exit status; its log in $work/jobs-<tag>.log
+    jobs_tag=$1
+    shift
+    status=0
+    env XDG_CACHE_HOME="$work/caches/jobs-$jobs_tag" SPAWN_GATE_HOST_JOBS=1 "$@" \
+        sh "$gate" "$repo" "$base" "$good" "$jobsdir" >"$work/jobs-$jobs_tag.log" 2>&1 || status=$?
+    echo "exit=$status"
+}
+expect "a gate's build share is cargo's own by default" "$(jobs_run share SPAWN_GATE_JOBS=3)" 'exit=0'
+expect "CARGO_BUILD_JOBS is not passed (not even empty)" "$(cat "$work/jobs-share.log")" '| build-jobs unset'
+expect "SPAWN_GATE_BUILD_JOBS sets it" \
+    "$(jobs_run own SPAWN_GATE_JOBS=3 SPAWN_GATE_BUILD_JOBS=2)" 'exit=0'
+expect "to its value" "$(cat "$work/jobs-own.log")" '| build-jobs 2'
+expect "a bad SPAWN_GATE_BUILD_JOBS refuses to start: exit 3" \
+    "$(jobs_run bad SPAWN_GATE_BUILD_JOBS=0)" 'exit=3'
+expect "naming it" "$(cat "$work/jobs-bad.log")" 'SPAWN_GATE_BUILD_JOBS is a whole number from 1'
+# A warm judges objectives only: one that says what its build ran at.
+warmjobs=$work/build-jobs-warm
+mkdir -p "$warmjobs"
+cp "$jobsdir/protected" "$jobsdir/build" "$warmjobs/"
+printf '#!/bin/sh\necho "build-jobs $(cat build-jobs)"\nexit 0\n' >"$warmjobs/301.sh"
+status=0
+env XDG_CACHE_HOME="$work/caches/jobs-warm" SPAWN_GATE_HOST_JOBS=1 SPAWN_GATE_BUILD_JOBS=4 \
+    sh "$gate" --base-only "$repo" "$base" "$warmjobs" >"$work/jobs-warm.log" 2>&1 || status=$?
+expect "a warm with SPAWN_GATE_BUILD_JOBS=4: exit 0" "$status" 0
+expect "builds at 1 all the same" "$(cat "$work/jobs-warm.log")" 'build-jobs 1'
+
 # The toolchain probe reads the test server through the gate's own
 # scripts/pg-url.sh, inside the sandbox. For a project that is not Spawn the
 # scenarios are another checkout's (Supply PA's gate/scenarios), so the
