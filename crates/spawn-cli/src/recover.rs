@@ -805,14 +805,6 @@ impl Recovery {
         self.pending_due = Some(self.pending_due.map_or(due, |held| held.min(due)));
     }
 
-    /// Whether the loop's next pass must read again although the log did
-    /// not move: a wait is open (its cause is re-read every probe), or an
-    /// outage is pending (the first pass that reaches the database records
-    /// it at once).
-    pub(crate) fn probing(&self) -> bool {
-        self.open_waits || self.outage.is_some()
-    }
-
     /// The outage this pass clears: the one the last failed passes made, if
     /// any, ending at `now_ms`. `None` when no pass failed or the last pass
     /// did.
@@ -2088,18 +2080,31 @@ mod tests {
     use serde_json::json;
 
     /// The loop's next pass reads again although the log did not move only
-    /// while a wait is open or an outage is pending: with neither, the
-    /// recovery waits for the log (the idle pass costs the watermark read).
+    /// while a wait is open, a revival is pending or an outage is pending:
+    /// with none, the recovery waits for the log (an idle pass costs the
+    /// watermark read alone), and a pending revival is never lost to its
+    /// backoff.
     #[test]
-    fn the_loop_re_reads_only_for_an_open_wait_or_a_pending_outage() {
+    fn the_loop_re_reads_for_a_wait_a_pending_revival_or_an_outage() {
         let mut state = Recovery::new();
-        assert!(!state.probing(), "nothing to probe");
+        assert_eq!(state.next_due(10_000, 1_000), None, "nothing to read for");
         state.open_waits = true;
-        assert!(state.probing(), "a wait's cause is re-read every probe");
+        assert_eq!(
+            state.next_due(10_000, 1_000),
+            Some(11_000),
+            "a wait's cause is re-read every probe"
+        );
         state.open_waits = false;
+        state.pending_due = Some(4_000);
+        assert_eq!(
+            state.next_due(10_000, 2_000),
+            Some(4_000),
+            "a revival behind its backoff runs when it is due"
+        );
+        state.pending_due = None;
         state.failed(1_000, "the database is unreachable");
         assert!(state.outage_pending(), "the first good pass records it");
-        assert!(state.probing());
+        assert_eq!(state.next_due(10_000, 2_000), Some(2_000), "at once");
     }
 
     fn end(cause: &str, exit_code: Option<i32>, signal: Option<i32>) -> End {
