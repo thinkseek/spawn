@@ -401,6 +401,22 @@ fn every_engine_the_bridge_starts_is_denied_the_credential_files() {
             .any(|rule| rule == "Bash(kill:*)" || rule == "Bash(*kill *)"),
         "kill <pid> stays allowed"
     );
+    // `kill -1` (every process the user may signal), never `kill -15`:
+    // the patterns want -1 as a whole argument.
+    for rule in [
+        "Bash(*kill -1)",
+        "Bash(*kill -1 *)",
+        "Bash(*kill -- -1)",
+        "Bash(*kill -- -1 *)",
+        "Bash(*kill * -1)",
+        "Bash(*kill * -1 *)",
+    ] {
+        assert!(rules.iter().any(|known| known == rule), "{rule}");
+    }
+    // The pipeline that hides the id: ps | grep | awk | xargs kill.
+    for rule in ["Bash(*xargs kill*)", "Bash(*xargs * kill*)"] {
+        assert!(rules.iter().any(|known| known == rule), "{rule}");
+    }
     // Not the fleet's TMPDIR itself, only the scripts in it.
     assert!(
         !rules
@@ -474,5 +490,72 @@ fn the_launch_environment_is_asked_at_every_launch() {
                 .iter()
                 .any(|argument| argument.contains("postgres://"))
         );
+    }
+}
+
+/// The `kill` rules, run the way Claude Code matches them (a `*` is any run
+/// of characters; the command is matched as a whole): `-1` as a whole
+/// argument matches, `-15` and `-19` do not, and `kill <pid>` of an own
+/// job matches nothing.
+#[test]
+fn the_kill_rules_catch_one_as_a_whole_argument_only() {
+    fn matches(rule: &str, command: &str) -> bool {
+        // Bash(<pattern>) or Bash(<prefix>:*)
+        let body = &rule["Bash(".len()..rule.len() - 1];
+        if let Some(prefix) = body.strip_suffix(":*") {
+            return command.starts_with(prefix);
+        }
+        let pattern: Vec<char> = body.chars().collect();
+        let text: Vec<char> = command.chars().collect();
+        // Glob with `*`: dynamic programming over (pattern, text).
+        let (n, m) = (pattern.len(), text.len());
+        let mut reach = vec![vec![false; m + 1]; n + 1];
+        reach[0][0] = true;
+        for i in 1..=n {
+            if pattern[i - 1] == '*' {
+                reach[i][0] = reach[i - 1][0];
+            }
+        }
+        for i in 1..=n {
+            for j in 1..=m {
+                reach[i][j] = match pattern[i - 1] {
+                    '*' => reach[i - 1][j] || reach[i][j - 1],
+                    c => reach[i - 1][j - 1] && c == text[j - 1],
+                };
+            }
+        }
+        reach[n][m]
+    }
+    let rules: Vec<&str> = CREDENTIAL_DENY
+        .iter()
+        .copied()
+        .filter(|rule| rule.contains("kill"))
+        .collect();
+    let denied = |command: &str| rules.iter().any(|rule| matches(rule, command));
+    for command in [
+        "kill -1",
+        "kill -1 1234",
+        "kill -- -1",
+        "kill -9 1234 -1",
+        "kill -s TERM -1",
+        "sudo kill -1",
+    ] {
+        assert!(denied(command), "{command}");
+    }
+    for command in [
+        "kill 1234",
+        "kill -15 1234",
+        "kill -19 1234",
+        "kill -TERM 1234",
+        "kill -- 1234",
+        "kill -9 1234",
+    ] {
+        assert!(!denied(command), "{command}");
+    }
+    for command in [
+        "ps aux | grep worker | awk '{print $2}' | xargs kill",
+        "ps -ef | awk '{print $2}' | xargs -r kill",
+    ] {
+        assert!(denied(command), "{command}");
     }
 }

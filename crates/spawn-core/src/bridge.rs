@@ -3136,7 +3136,9 @@ fn files_digest(files: &[String]) -> u64 {
 ///   `pg-backup.sh` and `pg-restore-drill.sh` source).
 /// - Killing by name or pattern (`pkill`, `killall`, `kill $(pgrep …)`,
 ///   `pgrep … | xargs kill`): it reaches other agents' and the gates'
-///   processes. `kill <pid>` of the engine's own job stays allowed.
+///   processes. So does `kill -1`, which signals every process the user
+///   may signal, where `-1` is a whole argument (the patterns never match
+///   `-15` or `-19`). `kill <pid>` of the engine's own job stays allowed.
 /// - Another process's environment (`/proc/<pid>/environ`, `ps e`): the
 ///   long-lived spawn processes are also not dumpable
 ///   (`spawn_host::undumpable`), which is what keeps their environment
@@ -3245,6 +3247,19 @@ pub const CREDENTIAL_DENY: &[&str] = &[
     "Bash(*kill *$(pidof*)",
     "Bash(*pgrep *|*kill*)",
     "Bash(*pidof *|*kill*)",
+    // A signal to every process the user may signal: `-1` as a whole
+    // argument, never as the first digits of `-15` or `-19`. Not
+    // `Bash(kill -1:*)`: a prefix match, it also catches `kill -15`.
+    "Bash(*kill -1)",
+    "Bash(*kill -1 *)",
+    "Bash(*kill -- -1)",
+    "Bash(*kill -- -1 *)",
+    "Bash(*kill * -1)",
+    "Bash(*kill * -1 *)",
+    // A pipeline that ends in `xargs kill` (ps | grep | awk | xargs kill):
+    // the id it kills is the pipeline's to choose.
+    "Bash(*xargs kill*)",
+    "Bash(*xargs * kill*)",
 ];
 
 /// Settings passed to Claude Code for an engine on `profile`, through

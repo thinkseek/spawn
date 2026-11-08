@@ -1248,7 +1248,7 @@ fn cancel_order(cancelled: &Cancelled, facts: &Facts, now_ms: i64) -> Option<Ord
 /// (`SPAWN_FLEET_TEST_DATABASE_URL`); without one a worker went looking for
 /// a database in the loop's environment file (2026-11-08).
 pub(crate) const CREDENTIALS_LINE: &str = "Your test database is $SPAWN_TEST_DATABASE_URL; never \
-read any credential file, never put a URL on a command line.";
+read any credential file, never put a URL on a command line, never print or echo it.";
 
 /// The line every task's prompt carries about other processes: a resident
 /// killed a ccd's test run with `pkill -f 'cargo test'` (2026-11-08); the
@@ -2846,7 +2846,7 @@ mod tests {
         assert_eq!(
             CREDENTIALS_LINE,
             "Your test database is $SPAWN_TEST_DATABASE_URL; never read any credential file, \
-             never put a URL on a command line."
+             never put a URL on a command line, never print or echo it."
         );
         let resident = task(9, TaskState::Assigned, "resident");
         let mut ephemeral = task(10, TaskState::Assigned, "ephemeral");
