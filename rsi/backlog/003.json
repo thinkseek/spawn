@@ -1,5 +1,0 @@
-{
-  "id": 3,
-  "title": "Keep large files across remounts",
-  "prompt": "A file an engine writes in its workspace, up to SPAWN_MAX_FILE_MB (100 MiB by default), is part of the agent's checkpoint as a plain git blob, so it survives the end of the execution: when the session is resumed (or the agent's branch is mounted again, or another agent forks from that checkpoint), the file is back in the fresh mount, byte for byte, before the engine starts. Larger files stay out of the checkpoint and are reported, never silently half-kept.\n\nThe gate judges this with rsi/scenarios/003.sh (read it): a fake Claude engine writes a 20 MiB file and a text file, exits, and the session is resumed; the large file must be back (sha256) and the text file on the agent's branch; an edit, checkpointed when the engine exits, must be a new checkpoint whose content survives another remount; a second agent started with `from` = the first checkpoint's commit id must get the original bytes. The scenario exits 0 when every check passes, 1 when an assertion fails, 2 on a harness or infrastructure failure."
-}
