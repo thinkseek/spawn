@@ -409,12 +409,22 @@ impl Monitor {
             let batch = store
                 .alert_control(self.watermark, BATCH)
                 .map_err(|error| error.to_string())?;
-            for entry in batch["records"].as_array().into_iter().flatten() {
+            let records = batch["records"].as_array().map_or(&[][..], Vec::as_slice);
+            for entry in records {
                 let id = entry["event_id"].as_i64().unwrap_or_default();
                 let at = entry["at_ms"].as_i64().unwrap_or(now);
                 self.feed(id, at, &entry["record"], &mut events);
             }
-            self.watermark = batch["next"].as_i64().unwrap_or(self.watermark);
+            // What the step has read: the last control record when the
+            // batch was cut at its limit (the rest waits for the next
+            // check), and otherwise everything up to the clock, which is
+            // what makes an idle check one statement (objective 023: the
+            // log's watermark, never the clock, says whether there is work).
+            self.watermark = if records.len() < BATCH {
+                watermark
+            } else {
+                batch["next"].as_i64().unwrap_or(self.watermark)
+            };
             let observations = store
                 .alert_observations()
                 .map_err(|error| error.to_string())?;
