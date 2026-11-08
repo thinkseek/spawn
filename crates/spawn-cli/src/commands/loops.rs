@@ -108,7 +108,6 @@ fn pause_unless_stopped(pause: Duration, stop: &AtomicBool) -> bool {
     true
 }
 
-<<<<<<< f05915f5a98fa3cf6e3db78ce9a1a5ee14801f84
 /// What a pass's wait ended for.
 enum Waited {
     /// The wait timed out with nothing announced.
@@ -158,7 +157,9 @@ fn wait_unless_stopped(
             // wait for good and the caller listens again with a fresh one.
             Err(_) => return Waited::Lost,
         }
-=======
+    }
+}
+
 /// Record the host's envelope (the slice and its settings) once, before
 /// anything starts in it (objective 029): its lines go to the loop's log, a
 /// failure is the pass's.
@@ -174,26 +175,6 @@ fn record_envelope(
             }
         }
         Err(error) => fail("envelope", &error),
-    }
-}
-
-/// Open the store on the first pass that needs it, then record the host's
-/// envelope (the slice and its settings) before anything starts in it
-/// (objective 029): a failed open or record is the pass's.
-fn store_ready(
-    store: &mut Option<std::sync::Arc<PostgresStore>>,
-    envelopes: &mut envelope::Runtime,
-    fail: &mut impl FnMut(&str, &str),
-) {
-    if store.is_none() {
-        *store = open_store()
-            .map(std::sync::Arc::new)
-            .map_err(|error| fail("store", &error))
-            .ok();
-    }
-    if let Some(open) = store {
-        record_envelope(envelopes, open, fail);
->>>>>>> 24cb0f06181039d06bdf8e5d4047f7e61550bc18
     }
 }
 
@@ -326,18 +307,7 @@ fn now_ms() -> i64 {
 /// systemd starts it again.
 pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     let stopping = stop_on_signal()?;
-<<<<<<< f05915f5a98fa3cf6e3db78ce9a1a5ee14801f84
-    let (bridge, observer) = runtime(flags)?;
-=======
-    let interval = loop_interval();
-    let (mut bridge, mut observer, mut envelopes) = runtime(flags)?;
-    let supervised = supervised();
-    let dispatching = env_value("SPAWN_DISPATCH").is_none_or(|value| value != "0");
-    let spawn = spawn_program();
-    let mut store: Option<std::sync::Arc<PostgresStore>> = None;
-    let workspace_root = workspace_root(flags).map(std::path::PathBuf::from);
-    let mut disk = disk::Monitor::new(workspace_root.as_deref());
->>>>>>> 24cb0f06181039d06bdf8e5d4047f7e61550bc18
+    let (bridge, observer, envelopes) = runtime(flags)?;
     let (bounds, mut warnings) = dispatch::Bounds::from_env();
     let (waits, more) = crate::deliver::Waits::from_env();
     warnings.extend(more);
@@ -351,6 +321,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     let mut fleet = Fleet {
         bridge,
         observer,
+        envelopes,
         store: None,
         listener: None,
         schedule: Schedule::new(),
@@ -386,6 +357,9 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
 struct Fleet {
     bridge: spawn_core::bridge::Bridge,
     observer: spawn_core::observe::Observer,
+    /// The host's resource envelope (objective 029): the settings, the
+    /// slice, and the `host.envelope` record once written.
+    envelopes: envelope::Runtime,
     /// The store's connection, reopened after a failed pass.
     store: Option<std::sync::Arc<PostgresStore>>,
     /// The connection that listens for `spawn_events`, on its own session.
@@ -424,23 +398,11 @@ impl Fleet {
         let mut lines: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
         let mut failed = false;
-<<<<<<< f05915f5a98fa3cf6e3db78ce9a1a5ee14801f84
         if self.store.is_none() {
             match open_store().map(std::sync::Arc::new) {
                 Ok(open) => self.store = Some(open),
                 Err(error) => {
                     Fleet::fail(&mut failed, "store", &error);
-=======
-        let mut fail = |what: &str, error: &str| {
-            failed = true;
-            eprintln!("spawn loop: {what}: {error}");
-        };
-        store_ready(&mut store, &mut envelopes, &mut fail);
-        match bridge.tick() {
-            Ok(report) => {
-                for warning in &report.warnings {
-                    eprintln!("spawn loop warning: {warning}");
->>>>>>> 24cb0f06181039d06bdf8e5d4047f7e61550bc18
                 }
             }
             self.listener = None;
@@ -455,6 +417,13 @@ impl Fleet {
             },
             None => None,
         };
+        // The host's envelope (objective 029): recorded before any
+        // execution or gate starts on this pass, once, and again only when
+        // one of its settings changes.
+        if let Some(open) = self.store.clone() {
+            let mut fail = |what: &str, error: &str| Fleet::fail(&mut failed, what, error);
+            record_envelope(&mut self.envelopes, &open, &mut fail);
+        }
         // A time the records named runs its step now, never behind the pass
         // interval; a change of the log may wait for that interval, so a
         // burst of appends inside one interval is one pass's work.
@@ -467,7 +436,6 @@ impl Fleet {
                 self.steps(&open, watermark, now, &mut lines, &mut failed);
             }
         }
-<<<<<<< f05915f5a98fa3cf6e3db78ce9a1a5ee14801f84
         // The screens and transcripts the Bridge reads are not announced by
         // an append: this is what keeps them on the pass interval, and what
         // keeps an engine's turn end seen as soon as it is written.
@@ -480,58 +448,6 @@ impl Fleet {
         }
         for line in &lines {
             println!("{line}");
-=======
-        if let Some(open) = &store {
-            let mut lines = Vec::new();
-            let mut step = |what: &str, result: Result<Vec<String>, String>| match result {
-                Ok(more) => lines.extend(more),
-                Err(error) => fail(what, &error),
-            };
-            // The disk watch never fails a pass: a fleet must not stop
-            // because it cannot record a warning.
-            step(
-                "disk",
-                Ok(disk
-                    .check(open)
-                    .unwrap_or_else(|error| vec![format!("disk: {error}")])),
-            );
-            // The alerts never fail a pass either: an error is said and
-            // tried again at the next check.
-            step(
-                "alerts",
-                Ok(alerting
-                    .check(open)
-                    .unwrap_or_else(|error| vec![format!("alerts: {error}")])),
-            );
-            if dispatching {
-                step(
-                    "dispatch",
-                    dispatch::step(
-                        open,
-                        supervised,
-                        &spawn,
-                        workspace_root.as_deref(),
-                        &disk,
-                        &bounds,
-                        waits,
-                    ),
-                );
-            }
-            // Under the disk floor no resident is revived (a new execution);
-            // the supervisor still is, to act on the warning.
-            if !disk.below_floor() {
-                step("residents", supervise::keep_residents(open));
-            }
-            if supervised {
-                step(
-                    "supervise",
-                    supervise::keep_alive(open).map(|line| line.into_iter().collect()),
-                );
-            }
-            for line in &lines {
-                println!("{line}");
-            }
->>>>>>> 24cb0f06181039d06bdf8e5d4047f7e61550bc18
         }
         if failed {
             // A broken connection is reopened on the next pass.
