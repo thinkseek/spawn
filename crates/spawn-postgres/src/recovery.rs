@@ -118,6 +118,14 @@ with x as (
     from spawn_events e, x
    where e.session_id = $1 and e.execution_id = x.execution_id
      and e.event_name = 'turn.failed'
+), tools as (
+  select coalesce(jsonb_agg(jsonb_build_object(
+            'event_id', e.id,
+            'at_ms', e.recorded_at_ms,
+            'text', e.kind -> 'detail' ->> 'error') order by e.id), '[]'::jsonb) as list
+    from spawn_events e, x
+   where e.session_id = $1 and e.execution_id = x.execution_id
+     and e.event_name = 'tool.failed'
 ), progress as (
   select coalesce(max(e.id), 0) as last_id, coalesce(max(e.recorded_at_ms), 0) as last_at
     from spawn_events e, x
