@@ -803,6 +803,10 @@ mod tests {
         // The same launch of another terminal is not this one's runner.
         let other = launched.replace("spawn-exec_1-", "spawn-exec_10-");
         assert!(matches!(runner_of(&terminal, &other), Runner::Untracked(_)));
+        // A start command that holds the separator is read whole: it is the
+        // last field, and the fields before it are unchanged.
+        let piped = launched.replace("/bin/spawn run", "/bin/spawn run | tee");
+        assert_eq!(runner_of(&terminal, &piped), Runner::Running);
         // A shell at its prompt, as a session restored after a restart is.
         let Runner::Untracked(why) = runner_of(&terminal, "0||bash|") else {
             panic!("a restored shell hosts no runner");
