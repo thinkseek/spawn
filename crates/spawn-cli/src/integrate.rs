@@ -1093,7 +1093,10 @@ pub(crate) fn cannot_judge_cause(scenario: &str, log: &str) -> Option<String> {
             .or_else(|| line.strip_prefix('!'))
             .unwrap_or(line)
             .trim();
-        if !says(text) {
+        // The gate's own stage lines ("stage gate cannot judge 120ms base:
+        // 073.sh", an uncached base run that exited 6) name the outcome,
+        // not a cause: never quoted as the scenario's words.
+        if !says(text) || text.starts_with("stage ") {
             continue;
         }
         if in_block {
@@ -7045,6 +7048,19 @@ mod cannot_judge_tests {
             )
             .as_deref(),
             Some("073: cannot judge: last")
+        );
+        // The gate's own stage line in the scenario's base block is no
+        // cause: a candidate that exited 6 saying nothing has none.
+        let log = "| == base: 073.sh\n\
+                   | stage gate cannot judge 120ms base: 073.sh\n\
+                   | == candidate: 073.sh must pass\n";
+        let record = cannot_judge_fields("073.sh", 1, std::time::Duration::from_mins(5), log);
+        assert_eq!(record["cause"], serde_json::Value::Null, "{record}");
+        assert!(
+            record["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("the gate's log gives no cause")),
+            "{record}"
         );
         // Another scenario's line is no cause of this one's.
         assert_eq!(
