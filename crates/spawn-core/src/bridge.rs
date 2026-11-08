@@ -1539,6 +1539,17 @@ impl Bridge {
             return Wanted::Now;
         }
         let now = self.clock.now().0;
+        // A turn ended in the transcript and the screen has not shown it
+        // over yet: the engine paints the prompt a moment later, and a
+        // reading that turns to the prompt decides a delivery. Read on
+        // until it does, within the bound the backstop would take — a
+        // screen that never settles costs no more than before watches.
+        if let Some(ended) = follow.settling {
+            let bound = i64::try_from(self.config.screen_refresh.as_millis()).unwrap_or(i64::MAX);
+            if now.saturating_sub(ended) < bound {
+                return Wanted::Now;
+            }
+        }
         if let Some(grown) = follow.unread_since {
             // The transcript grew: wait until it has held still long enough
             // for the screen to say what the transcript cannot (the prompt
