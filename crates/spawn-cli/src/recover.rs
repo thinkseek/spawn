@@ -2623,7 +2623,7 @@ mod tests {
             succeeded: Some(true),
         };
         assert!(
-            pending(&[handoff], &[], &execution, &[], &[sent]).is_none(),
+            pending(&[handoff], &[], &[], &execution, &[], &[sent]).is_none(),
             "the handoff's stop is no interruption of its own"
         );
     }
