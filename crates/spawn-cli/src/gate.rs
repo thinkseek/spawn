@@ -106,6 +106,10 @@ pub(crate) const GATE_ENV: &[&str] = &[
     // only. A gate that gets no test database
     // ([`crate::integrate::NO_TEST_DATABASE`]) gets no server either.
     "SPAWN_GATE_JOBS",
+    // The host's scenario budget, every gate together (scripts/rsi/gate.sh,
+    // "Host scenario slots"): without it each gate's SPAWN_GATE_JOBS was
+    // the whole host's, and two gates doubled the scenario load.
+    "SPAWN_GATE_HOST_JOBS",
     "SPAWN_GATE_PG_IMAGE",
     "SPAWN_GATE_PG_BIN",
     // A tree's deps store (Supply PA's `gate/scenarios/build`, `bind` and
@@ -175,7 +179,12 @@ const MAX_DEFAULT_JOBS: usize = 8;
 /// SPAWN_GATE_JOBS when set; 1 for a gate on the shared test server
 /// (whose connections every agent's tests share, as gate.sh says); else
 /// the cores less those kept for the workers, divided among the gates that
-/// can run at once, at most 8. A gate starts only when its jobs, the
+/// can run at once, at most 8. That number is also the host's whole
+/// scenario budget ([`GATE_ENV`]'s SPAWN_GATE_HOST_JOBS, which gate.sh
+/// takes by default): every scenario run on the host, from every gate,
+/// holds one of them, so several gates share it instead of each running
+/// its own (2026-11-08: two gates' heavy scenarios at once starved a test
+/// past its wait and a task was rejected wrongly). A gate starts only when its jobs, the
 /// running gates' jobs and the cores kept for the workers fit within the
 /// cores, or when no gate runs ([`Cpu::fits`]); otherwise it waits for the
 /// next pass, as it waits for a gate slot: no record, no count. (2026-11-08:
@@ -2355,6 +2364,7 @@ mod tests {
             "SPAWN_TEST_DATABASE_URL" => Some("postgres://t:p@127.0.0.1:15434/spawn_test".into()),
             "SPAWN_GATE_MIN_FREE_GB" => Some("10".into()),
             "SPAWN_GATE_JOBS" => Some("4".into()),
+            "SPAWN_GATE_HOST_JOBS" => Some("2".into()),
             "SPAWN_GATE_PG_IMAGE" => Some("postgres:16-alpine".into()),
             "SPAWN_GATE_PG_BIN" => Some("/usr/lib/postgresql/16/bin".into()),
             "SUPPLY_PA_DEPS" => {
@@ -2378,6 +2388,7 @@ mod tests {
                 "SPAWN_TEST_DATABASE_URL",
                 "SPAWN_GATE_MIN_FREE_GB",
                 "SPAWN_GATE_JOBS",
+                "SPAWN_GATE_HOST_JOBS",
                 "SPAWN_GATE_PG_IMAGE",
                 "SPAWN_GATE_PG_BIN",
                 "SUPPLY_PA_DEPS"
