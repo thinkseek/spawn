@@ -19,7 +19,7 @@
 # `spawn submit` as `human` and as `spawn_supervisor` (the supervisor's
 # principal).
 # Checked:
-#   (1) waiting, not refused: two inputs sent while a 45 s turn runs (one
+#   (1) waiting, not refused: two inputs sent while a 30 s turn runs (one
 #       from `human`, one from `spawn_supervisor`) are not finished while it
 #       runs, and each has a `command.step` record from the Bridge with step
 #       `waiting` (once per command); nothing reached the engine.
@@ -404,7 +404,7 @@ wait_until 120 judged_waiting || harness "the resident was never judged waiting 
 
 # --- (1) two inputs sent while a long turn runs wait ----------------------------------
 
-open_turn bb-busy-first 45 first
+open_turn bb-busy-first 30 first
 one=$(say human bb-note-one "BB:NOTE one")
 sleep 1
 two=$(say spawn_supervisor bb-note-two "BB:NOTE two")
@@ -474,7 +474,7 @@ wait_until 120 judged_waiting || harness "the resumed resident was never judged 
 
 # --- (4) the dispatcher's deliveries still land ----------------------------------------
 
-open_turn bb-busy-second 30 second
+open_turn bb-busy-second 12 second
 four=$(say human bb-note-four "BB:NOTE four")
 wait_until 15 is_waiting "$four" || fail "(1) input $four, sent during turn second, was not recorded waiting ($(state_of "$four") $(error_of "$four"))"
 capture "$SPAWN_BIN" task assign --mission "$mission" --kind resident --worker echo \
@@ -482,6 +482,8 @@ capture "$SPAWN_BIN" task assign --mission "$mission" --kind resident --worker e
 [ "$status" -eq 0 ] || harness "task assign failed: $(err)"
 task=$(jq -r .task "$WORK/out.txt")
 [ -n "$task" ] && [ "$task" != null ] || harness "task assign printed no id"
+# The task must be assigned while turn second still runs, behind input four.
+logged busy-end "second\$" && harness "turn second ended before the task could be assigned behind it"
 delivered() { [ "$(q "select state from mission_tasks where id = $task")" = delivered ]; }
 wait_until 60 logged busy-end "second\$" || harness "turn second never ended"
 wait_until 240 delivered ||
