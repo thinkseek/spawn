@@ -192,6 +192,12 @@ select jsonb_build_object(
 /// (`agent_open_jobs`), oldest first, each with the id of its
 /// `job.started` and its age on the database's clock.
 ///
+/// Four of those — `evidence_seq`, `turn_ended`, `checkpoint`, `model` — are
+/// one row per session or per agent over the log, so they are read once for
+/// the whole fleet and joined, not once per session: the dispatcher reads
+/// these facts on every pass it acts on, and four scans of the log do the
+/// work of four per session (objective 023).
+///
 /// A delivery counts as the worker's (its `last_delivery`, and the episode)
 /// only when it reached the worker or may have: it succeeded, has not
 /// finished, or failed after typing may have begun (its error names `$1`,
