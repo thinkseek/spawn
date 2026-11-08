@@ -3280,7 +3280,6 @@ create index if not exists spawn_events_source_push
       and kind -> 'detail' -> 'record' ->> 'type'
           in ('source.push_requested', 'source.push_refused', 'source.moved');
 
-<<<<<<< 08bfa3be91383b75120d4039e7cf1495af7c2c1b
 -- The objectives that closed solved on the base, found without reading the
 -- rest of the stream: the supervisor's digest reads the ones it has not told
 -- yet on every dispatch pass. Measured on the live stream today: 1,442
@@ -3293,11 +3292,6 @@ create index if not exists spawn_events_objective_solved
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'objective.solved';
 
--- The loop's disk records (`host.disk`, owner only): free space on a path
--- the fleet writes to fell under the warning threshold (`low`) or came back
--- (`recovered`). One record per crossing; the loop reads the latest per path
--- back from the log after a restart.
-=======
 -- The loop's own records, owner only, folded into no table: what this host
 -- saw and what it did about it (docs/fleet-architecture.md §3.1, "the
 -- recovery"). One function, so a restricted login can write none of them.
@@ -3320,7 +3314,6 @@ create index if not exists spawn_events_objective_solved
 -- - `execution.cleared`: the wait an interruption opened is over, with what
 --   showed it and `waited_ms` from the first interruption of the wait. Its
 --   `execution_id` and `cause` are those of the interruption it answers.
->>>>>>> 0775957f3aa5d67154437cc82efb93e2fdac0609
 create or replace function spawn_host_record(p_record jsonb)
 returns bigint language plpgsql security definer as $$
 declare
