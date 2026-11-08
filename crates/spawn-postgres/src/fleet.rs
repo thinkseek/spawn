@@ -341,6 +341,40 @@ from (
       order by x.started_at_ms desc, x.execution_id desc limit 1) as failed_resume
   from agent_status s
   join spawn_session_state p using (session_id)
+  -- Four of the facts are one row per session or per agent over the log,
+  -- read once for the whole fleet rather than once per session: the
+  -- session's latest evidence, the latest event of its running execution
+  -- (whether its turn ended), its agent's newest checkpoint, and the model
+  -- its latest execution started with. Each is the same row the correlated
+  -- read returned, and the loop reads these facts on every pass it acts on
+  -- (objective 023: four reads of the log, not four per session).
+  left join (
+    select e.session_id, max(e.session_seq) as evidence_seq
+      from spawn_events e
+     where e.source <> 'observer'
+       and e.event_name not in ('artifact.committed', 'merge.conflicted')
+       and coalesce(e.kind -> 'detail' ->> 'step', '') <> 'waiting'
+     group by e.session_id) ev on ev.session_id = s.session_id
+  left join (
+    select distinct on (e.session_id, e.execution_id)
+           e.session_id, e.execution_id,
+           e.event_name in ('turn.stopped', 'turn.failed') as ended
+      from spawn_events e
+     where e.event_name in ('message.received', 'turn.stopped', 'turn.failed')
+     order by e.session_id, e.execution_id, e.session_seq desc) tn
+    on tn.session_id = s.session_id and tn.execution_id = s.execution_id
+  left join (
+    select distinct on (e.agent_id) e.agent_id,
+           e.kind -> 'detail' -> 'artifact' ->> 'commit' as commit
+      from spawn_events e
+     where e.event_name = 'artifact.committed'
+     order by e.agent_id, e.id desc) ck on ck.agent_id = s.agent_id
+  left join (
+    select distinct on (e.session_id) e.session_id,
+           e.kind -> 'detail' ->> 'model' as model
+      from spawn_events e
+     where e.event_name = 'execution.started'
+     order by e.session_id, e.session_seq desc) mo on mo.session_id = s.session_id
   -- The supervisor's current native session (the one its latest
   -- `session.native_started` names, which a resume resumes) and the start
   -- that began it: the command of the execution that named it first.
