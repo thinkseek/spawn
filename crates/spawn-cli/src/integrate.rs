@@ -2442,8 +2442,7 @@ impl Judge {
                 match rejection(&mirror_path, main, &candidate, &branch, &verdict, &run_gate)? {
                     Rejection::Record(verdict, extra) => gated(verdict, extra),
                     Rejection::HeadNoRoom { short, log, head } => {
-                        let mut extra =
-                            no_room(mission, task.id, &short, &log, now_ms());
+                        let mut extra = no_room(mission, task.id, &short, &log, now_ms());
                         if let (Some(target), Some(head)) =
                             (extra.as_object_mut(), head.as_object())
                         {
@@ -5176,7 +5175,10 @@ mod tests {
              (SPAWN_GATE_HOST_JOBS=2 in all, shared by every gate on this host); not a verdict, \
              judged again later"
         );
-        assert_eq!(slot["log"], "waited 30.0 min for a host scenario slot (all 2 taken)\n");
+        assert_eq!(
+            slot["log"],
+            "waited 30.0 min for a host scenario slot (all 2 taken)\n"
+        );
         assert!(slot.get("free_kb").is_none() && slot.get("server").is_none());
 
         // Two hours into the task's run: the first record escalates,
