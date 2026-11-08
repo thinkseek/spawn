@@ -3526,10 +3526,6 @@ PENDING_ISSUES\n";
         assert!(db.records(task.id, "task.report_unfinished").is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
-=======
-<<<<<<< 5717a8b81b1258edb584141d2964fa3364553668
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 
     // --- spent deliveries: re-issued, escalated, tried after a deploy -------
 
