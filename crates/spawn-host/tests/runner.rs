@@ -149,6 +149,11 @@ fn launch(program: &str, arguments: &[&str], environment: &[(&str, &str)]) -> La
     }
 }
 
+/// Dead panes the test starts for one whose exit status the server records
+/// (see the dead-pane section: a server that never reaps its child records
+/// none).
+const DEAD_PANE_ATTEMPTS: u32 = 3;
+
 /// What `runner` answers once it stops answering `Running` or `limit`
 /// passes.
 fn settled(host: &TmuxHost, limit: Duration) -> Runner {
