@@ -214,6 +214,10 @@ impl Step {
     fn clock_due(&self, now_ms: i64) -> bool {
         self.due.is_some_and(|due| due <= now_ms)
     }
+
+    fn due_debug(&self) -> Option<i64> {
+        self.due
+    }
 }
 
 /// The steps of one loop, each with what decides whether a pass runs it.
@@ -694,6 +698,13 @@ impl Fleet<'_> {
         // wait's probe, and an outage the failed passes left, force it
         // regardless.
         let pending_outage = self.recovery.outage_pending();
+        if std::env::var("SPAWN_RECOVER_DEBUG").is_ok() {
+            let s = self.schedule.recovery;
+            eprintln!(
+                "DEBUG recovery check: mark={:?} watermark={watermark} due={:?} now={now} outage={pending_outage}",
+                s.mark(), s.due_debug()
+            );
+        }
         if !self.schedule.recovery.runs(watermark, now) && !pending_outage {
             return;
         }
@@ -724,6 +735,11 @@ impl Fleet<'_> {
                     };
                     match crate::recover::step(&mut self.recovery, &world) {
                         Ok(more) => {
+                            if std::env::var("SPAWN_RECOVER_DEBUG").is_ok() {
+                                eprintln!(
+                                    "DEBUG recovery: ran at {now}, probing {}", self.recovery.probing()
+                                );
+                            }
                             lines.extend(more);
                             // An open wait is re-read every probe (the
                             // credentials file, the free space, a retry's
