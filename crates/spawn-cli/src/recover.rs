@@ -2056,11 +2056,26 @@ impl Cause {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cause, Config, Credentials, End, Executed, Execution, Facts, Outage, Path, Recorded, Sent,
-        Stop, Turn, auth_retry_due, classify, counts_as_failure, disk_cleared, key, model_due,
-        pending, resume_due, resume_failed, retry_at, way,
+        Cause, Config, Credentials, End, Executed, Execution, Facts, Outage, Path, Recorded,
+        Recovery, Sent, Stop, Turn, auth_retry_due, classify, counts_as_failure, disk_cleared, key,
+        model_due, pending, resume_due, resume_failed, retry_at, way,
     };
     use serde_json::json;
+
+    /// The loop's next pass reads again although the log did not move only
+    /// while a wait is open or an outage is pending: with neither, the
+    /// recovery waits for the log (the idle pass costs the watermark read).
+    #[test]
+    fn the_loop_re_reads_only_for_an_open_wait_or_a_pending_outage() {
+        let mut state = Recovery::new();
+        assert!(!state.probing(), "nothing to probe");
+        state.open_waits = true;
+        assert!(state.probing(), "a wait's cause is re-read every probe");
+        state.open_waits = false;
+        state.failed(1_000, "the database is unreachable");
+        assert!(state.outage_pending(), "the first good pass records it");
+        assert!(state.probing());
+    }
 
     fn end(cause: &str, exit_code: Option<i32>, signal: Option<i32>) -> End {
         End {

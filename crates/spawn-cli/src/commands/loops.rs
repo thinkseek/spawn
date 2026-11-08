@@ -848,7 +848,10 @@ mod tests {
         assert!(step.runs(9, 2_000), "and is, when its time comes");
         step.ran(9, None);
         step.advance(10);
-        assert!(!step.runs(10, 9_999), "a step with no clock waits for the log");
+        assert!(
+            !step.runs(10, 9_999),
+            "a step with no clock waits for the log"
+        );
     }
 
     /// A step runs on a record or on a time, never on the clock: a pass
