@@ -785,17 +785,6 @@ impl Recovery {
         self.open_waits || self.outage.is_some()
     }
 
-    /// A pass could not reach the database: the next pass that can must
-    /// read again at once, whether the log moved or not ([`Self::probing`]).
-    pub(crate) fn wake(&mut self) {
-        self.outage.get_or_insert(Outage {
-            from_ms: 0,
-            to_ms: 0,
-            failed_passes: 0,
-            error: String::new(),
-        });
-    }
-
     /// The outage this pass clears: the one the last failed passes made, if
     /// any, ending at `now_ms`. `None` when no pass failed or the last pass
     /// did.
