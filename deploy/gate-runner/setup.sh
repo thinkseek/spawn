@@ -22,6 +22,8 @@
 #                       the cores, at most 8)
 #   --min-free-gb <n>   the gate's disk floor (default 10)
 #   --nice <n>          the gate's nice level (default 10)
+#   --keep-days <n>     prune job directories older than this on the runner
+#                       (default 7; 0 keeps them)
 #   --force             rewrite an existing config (it is the owner's; a
 #                       plain rerun keeps it and only reinstalls remote.sh)
 #
@@ -37,6 +39,7 @@ pg_bin=""
 jobs=""
 min_free=""
 nice=""
+keep_days=""
 force=""
 
 say() { printf '%s\n' "$*"; }
@@ -51,6 +54,7 @@ while [ $# -gt 0 ]; do
     --jobs) shift; [ $# -gt 0 ] || die "--jobs needs a number"; jobs=$1 ;;
     --min-free-gb) shift; [ $# -gt 0 ] || die "--min-free-gb needs a number"; min_free=$1 ;;
     --nice) shift; [ $# -gt 0 ] || die "--nice needs a number"; nice=$1 ;;
+    --keep-days) shift; [ $# -gt 0 ] || die "--keep-days needs a number"; keep_days=$1 ;;
     --force) force=1 ;;
     -h | --help)
         awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
@@ -75,10 +79,12 @@ esac
 # Not where the gate's sandbox replaces the host's directories: it would not
 # see the controller's scripts inside the root (scripts/ is bound back only
 # under $HOME; elsewhere the sandbox shows the host's files, except /tmp,
-# /run, /var/tmp and TMPDIR, which it empties).
+# /run and /var/tmp, which it empties). This shell's TMPDIR is not one of
+# them: the gate never runs with it (deploy/gate-runner/remote.sh gives each
+# job a scratch of its own), so a root under it is fine.
 case "$root" in
-/tmp/* | /run/* | /var/tmp/* | "${TMPDIR:-/nonexistent}"/*)
-    die "the root must not be under /tmp, /run, /var/tmp or TMPDIR: the gate's sandbox empties those, so it could not see the controller's scripts in $root (the default, \$HOME/.local/share/gate-runner, is under \$HOME)"
+/tmp/* | /run/* | /var/tmp/*)
+    die "the root must not be under /tmp, /run or /var/tmp: the gate's sandbox empties those, so it could not see the controller's scripts in $root (the default, \$HOME/.local/share/gate-runner, is under \$HOME)"
     ;;
 esac
 
@@ -88,7 +94,8 @@ esac
 [ "$jobs" -le 8 ] || jobs=8
 [ -n "$min_free" ] || min_free=10
 [ -n "$nice" ] || nice=10
-for number in "$jobs" "$min_free" "$nice"; do
+[ -n "$keep_days" ] || keep_days=7
+for number in "$jobs" "$min_free" "$nice" "$keep_days"; do
     case "$number" in '' | *[!0-9]*) die "not a whole number: $number" ;; esac
 done
 if [ -z "$pg_image$pg_bin" ]; then
@@ -133,6 +140,7 @@ else
         printf 'GATE_RUNNER_NICE=%s\n' "$nice"
         printf "GATE_RUNNER_PATH='%s'\n" "$PATH"
         printf 'GATE_RUNNER_KEEP_JOBS=%s\n' 0
+        printf 'GATE_RUNNER_KEEP_DAYS=%s\n' "$keep_days"
     } >"$config"
     chmod 600 "$config"
     say "wrote $config"
