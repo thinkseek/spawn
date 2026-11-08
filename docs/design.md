@@ -150,6 +150,7 @@ Claude Code 是唯一的引擎（`ENGINE` = `claude`）。`execution.started` �
 | 会话上有命令在飞（Bridge 领取了还没完成；同一个 pass 领到的也算） | 投递等着它的读数 |
 | transcript 自上次增长以来静止满 `SPAWN_SCREEN_QUIET_MS`（默认 500 ms）而屏幕此后还没读过，之后的 pass 接着读，直到连续两次读数一致 | transcript 说不了的事：提示符回来了 |
 | 距上次抓屏满 `screen_refresh`（30 s）的兜底 | transcript 不动而屏幕变了：对话框、掉回 shell |
+| transcript 里刚读到一轮的结束（`turn.stopped`、`turn.failed`），而屏幕还没回到提示符：之后的 pass 接着读，直到某次读数接受输入（提示符回来了），或距这一轮的结束满 `screen_refresh` | 引擎在结束这一轮的那一行之后才画提示符；那份读数正是投递在等的，不能留给兜底 |
 
 忙碌的屏幕仍每 30 秒重记一次。兜底抓屏一个 pass 最多 `BACKSTOPS_PER_PASS`（2）个，同时到期的屏幕分摊到后面几个 pass：一个 pass 抓完整个舰队会把下一条命令挡在后面。“引擎还在不在”不靠每个执行的 `runner`：有监视时，`TerminalHost::runners` 一个 pass 问一次终端服务器（tmux 一次 `list-panes -a`，整个舰队一次调用），终端不在或不再托管本主机的 runner 的执行，下一个 pass 就按 `lost` 结束，和以前一样快；没有监视时（`spawn tick`、测试）仍然逐个问。引擎自己退出照旧由退出文件的变化在半秒级发现。因果（§14）：屏幕状态只从抓屏来、一轮的结束只从 transcript 的行来；没抓屏、transcript 没变化都不算状态，transcript 静止只说明什么时候该再看屏幕。
 
