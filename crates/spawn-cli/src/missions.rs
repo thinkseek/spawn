@@ -31,6 +31,11 @@ const USAGE: &str = "usage:
                 --backlog with --resident for a mission without objectives)
                 (--workers: objective tasks in flight at once, 1 to 16, default 1: the
                 resident takes one, per-task workers the rest)
+  spawn mission objectives [--mission N]
+      the backlog of every objective mission (--mission: that one): the fleet's open
+      objectives and separately the owner-judged ones (the backlog field `owner_judged`:
+      the owner judges those outside the gate, and the fleet never assigns them),
+      each with its title, plus the counts of solved and met
   spawn mission resume --id N
   spawn mission push --source <path> --commit <commit> [--repo <dir>] [--wait <seconds>]
       (owner: land a commit on a mission source's main. <commit> is resolved in the git
@@ -384,6 +389,56 @@ fn change(flags: &Flags) -> Result<Value, String> {
 }
 
 /// `spawn mission ...`
+/// `spawn mission objectives [--mission N]`: every objective mission's
+/// backlog, the owner-judged objectives apart from the fleet's open ones.
+fn list_objectives(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Value, String> {
+    let only = flags
+        .get("mission")
+        .map(|text| {
+            text.parse::<i64>()
+                .map_err(|_| "--mission takes a mission id".to_string())
+        })
+        .transpose()?;
+    let missions = store
+        .objective_missions()
+        .map_err(|error| error.to_string())?;
+    let missions = missions.as_array().cloned().unwrap_or_default();
+    let rows: Vec<Value> = missions
+        .into_iter()
+        .map(crate::serve::with_objectives)
+        .filter(|mission| only.is_none_or(|id| mission["id"].as_i64() == Some(id)))
+        .map(|mission| objectives_row(&mission))
+        .collect();
+    Ok(json!(rows))
+}
+
+/// One mission's backlog split by who judges it: the owner's objectives
+/// (`status` "owner": the fleet never assigns them) and the fleet's open
+/// ones; solved and met are counts.
+fn objectives_row(mission: &Value) -> Value {
+    let rows = mission["objectives"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let pick = |status: &str| -> Vec<Value> {
+        rows.iter()
+            .filter(|row| row["status"] == status)
+            .map(|row| json!({"id": row["id"], "title": row["title"]}))
+            .collect()
+    };
+    let count = |status: &str| rows.iter().filter(|row| row["status"] == status).count();
+    json!({
+        "mission": mission["id"],
+        "backlog": mission["backlog"],
+        "backlog_error": mission["backlog_error"],
+        "owner_judged": pick("owner"),
+        "open": pick("open"),
+        "solved": count("solved"),
+        "met": count("met"),
+        "next_objective": mission["next_objective"],
+    })
+}
+
 pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
     let (verb, flags) = split_mission(rest)?;
     let store = open_store()?;
@@ -459,6 +514,7 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
             let source = text(&flags, "source")?;
             print(&store.source_release(&source).map_err(err)?);
         }
+        "objectives" => print(&list_objectives(&store, &flags)?),
         "list" => {
             let limit = flags
                 .get("limit")
@@ -667,7 +723,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{change, hold_bound, model, split_mission};
+    use super::{change, hold_bound, model, objectives_row, split_mission};
     use crate::Flags;
 
     #[test]
@@ -902,5 +958,33 @@ mod tests {
             assert!(refused.contains("is not a commit"), "{wanted}: {refused}");
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The objectives listing splits a mission's backlog by who judges it:
+    /// the owner's apart from the fleet's open ones, with the counts.
+    #[test]
+    fn the_objectives_listing_puts_the_owners_apart_from_the_fleets() {
+        let mission = json!({
+            "id": 4,
+            "backlog": "/b",
+            "backlog_error": null,
+            "next_objective": 30,
+            "objectives": [
+                {"id": 29, "title": "the owner's", "status": "owner"},
+                {"id": 30, "title": "the fleet's", "status": "open"},
+                {"id": 28, "title": "done", "status": "solved"},
+                {"id": 7, "title": "met", "status": "met"},
+            ],
+        });
+        let row = objectives_row(&mission);
+        assert_eq!(row["mission"], json!(4));
+        assert_eq!(
+            row["owner_judged"],
+            json!([{"id": 29, "title": "the owner's"}])
+        );
+        assert_eq!(row["open"], json!([{"id": 30, "title": "the fleet's"}]));
+        assert_eq!(row["solved"], json!(1));
+        assert_eq!(row["met"], json!(1));
+        assert_eq!(row["next_objective"], json!(30));
     }
 }
