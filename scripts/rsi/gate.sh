@@ -429,7 +429,8 @@ verdict() {
     # flake, not a regression), in the log's order.
     [ -n "${flakes-}" ] && json="$json,\"flakes\":[$flakes]"
     # The check main was red on (SPAWN_GATE_BASE_CHECK), when it passed on
-    # this base before any candidate code ran: main is green on it again.
+    # this base before any candidate code ran: main is green on it again,
+    # whatever this gate ends with (gate.rs reads it from any fact).
     [ -n "${base_check_passed-}" ] && json="$json,\"base_check\":\"$base_check_passed\""
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
@@ -465,6 +466,10 @@ host_fault() {
     json="$json,\"runs\":\"$(json_string "$3")\",\"reason\":\"$(json_string "$4")\""
     [ -z "${5-}" ] || json="$json,\"evidence\":\"$5\""
     [ -z "${6-}" ] || json="$json,\"tree\":\"$6\""
+    # The check main was red on (SPAWN_GATE_BASE_CHECK), when it passed on
+    # this base before any candidate code ran: main is green on it again,
+    # whatever this gate ends with (gate.rs reads it from any fact).
+    [ -n "${base_check_passed-}" ] && json="$json,\"base_check\":\"$base_check_passed\""
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
@@ -504,6 +509,10 @@ EOF_MAIN_RED
     json="$json,\"runs\":\"$(json_string "$2")\""
     json="$json,\"reason\":\"$(json_string "$1 fails on the base twice ($2), with the same failing tests: main is red on it, not a verdict on the candidate")\""
     json="$json,\"failures\":[$main_red_list]"
+    # The check main was red on (SPAWN_GATE_BASE_CHECK), when it passed on
+    # this base before any candidate code ran: main is green on it again,
+    # whatever this gate ends with (gate.rs reads it from any fact).
+    [ -n "${base_check_passed-}" ] && json="$json,\"base_check\":\"$base_check_passed\""
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
@@ -535,6 +544,10 @@ cannot_judge() {
     stage_emit gate cannot_judge "$(($(stage_now) - gate_started))" total
     json="{\"cannot_judge\":true,\"scenario\":\"$(json_string "$1")\""
     json="$json,\"runs\":\"$(json_string "$2")\""
+    # The check main was red on (SPAWN_GATE_BASE_CHECK), when it passed on
+    # this base before any candidate code ran: main is green on it again,
+    # whatever this gate ends with (gate.rs reads it from any fact).
+    [ -n "${base_check_passed-}" ] && json="$json,\"base_check\":\"$base_check_passed\""
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
@@ -1641,6 +1654,10 @@ slot_no_room() {
     echo "| $(basename "$slot_name"): gave up waiting for a host scenario slot after $(spoken_wait "$slot_gave") ($slot_busy)"
     json="{\"no_room\":true,\"check\":\"host scenario slot\",\"waited_ms\":$slot_gave,\"budget\":$gate_slots"
     json="$json,\"scenario\":\"$(json_string "$(basename "$slot_name")")\""
+    # The check main was red on (SPAWN_GATE_BASE_CHECK), when it passed on
+    # this base before any candidate code ran: main is green on it again,
+    # whatever this gate ends with (gate.rs reads it from any fact).
+    [ -n "${base_check_passed-}" ] && json="$json,\"base_check\":\"$base_check_passed\""
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT" 2>/dev/null || :
@@ -2745,6 +2762,13 @@ if [ -n "${SPAWN_GATE_BASE_CHECK-}" ]; then
             elif [ "$base_check_first" -eq 0 ]; then
                 echo "| base check: $base_check_name passes on the base: main is green on it again"
                 base_check_passed=$base_check_name
+                # Said at once, in the integrator's file, so an exit with no
+                # fact of its own (exit 3, a kill) still says it; every fact
+                # written after keeps it.
+                if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
+                    printf '{"base_check":"%s","base":"%s","candidate":"%s"}\n' \
+                        "$base_check_passed" "$base_commit" "$candidate_commit" >"$SPAWN_GATE_VERDICT"
+                fi
             else
                 base_check_again=0
                 job_run "$job" 2 "$work/baseline" "$base_check_file" || base_check_again=$?

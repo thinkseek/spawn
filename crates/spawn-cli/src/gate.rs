@@ -739,10 +739,6 @@ pub(crate) struct Verdict {
     /// verdict's `flakes`: a flake, not a regression), in the log's order;
     /// only names of checks (`check-*.sh`) are kept.
     pub(crate) flakes: Vec<String>,
-    /// The check main was red on (`SPAWN_GATE_BASE_CHECK`), when it passed
-    /// on this base before the candidate ran: the verdict's `base_check`, a
-    /// check's file name; main is green on it again.
-    pub(crate) base_check: Option<String>,
     /// Everything the gate printed, stderr marked `! `, the verdict last.
     pub(crate) output: String,
 }
@@ -1046,7 +1042,27 @@ pub(crate) fn judge(
     env: &[(String, String)],
     limit: Duration,
 ) -> Result<Verdict, GateFailure> {
-    judge_in(
+    judge_seeing_base_check(gate, repo, base, candidate, scenarios, scenario, env, limit).0
+}
+
+/// [`judge`], and the red check the gate found passing on the base before
+/// any candidate code ran (SPAWN_GATE_BASE_CHECK), whatever the gate's
+/// outcome: a verdict, a host fault on another check, no room, a scenario
+/// it cannot judge, an abort. The gate writes it to its verdict file as soon
+/// as it passes ([`seen_base_check`]), and only that file is believed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn judge_seeing_base_check(
+    gate: &Path,
+    repo: &Path,
+    base: &str,
+    candidate: &str,
+    scenarios: &Path,
+    scenario: Option<&Path>,
+    env: &[(String, String)],
+    limit: Duration,
+) -> (Result<Verdict, GateFailure>, Option<String>) {
+    let mut seen = None;
+    let judged = judge_in(
         &std::env::temp_dir(),
         &measured_free_kb,
         gate,
@@ -1057,7 +1073,21 @@ pub(crate) fn judge(
         scenario,
         env,
         limit,
-    )
+        &mut seen,
+    );
+    (judged, seen)
+}
+
+/// The verdict file's `base_check` (a check's name, `check-<name>.sh`),
+/// whatever else it says: the gate writes it there first, and every fact
+/// it writes after keeps it.
+fn seen_base_check(file: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(file.trim()).ok()?;
+    value
+        .get("base_check")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| is_check_name(name))
+        .map(str::to_string)
 }
 
 /// [`judge`], with the private directory made under `parent` and free space
@@ -1074,6 +1104,7 @@ fn judge_in(
     scenario: Option<&Path>,
     env: &[(String, String)],
     limit: Duration,
+    seen: &mut Option<String>,
 ) -> Result<Verdict, GateFailure> {
     let floor = env_value(env, "SPAWN_GATE_MIN_FREE_GB")
         .map_or(Some(DEFAULT_MIN_FREE_GB), |text| text.parse::<u64>().ok());
@@ -1134,6 +1165,7 @@ fn judge_in(
         Err(other) => return Err(other),
     };
     let verdict = std::fs::read_to_string(&verdict_path).ok();
+    *seen = verdict.as_deref().and_then(seen_base_check);
     match decide(&run, verdict.as_deref()) {
         // Exit 5 with no readable fact: the gate said "no room" but could
         // not write it down. It also prints the fact, so read that before
@@ -1278,7 +1310,6 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
         reason: text("reason").unwrap_or_else(|| "gate rejected the candidate".to_string()),
         metric: text("metric"),
         flakes: flakes(&value),
-        base_check: text("base_check").filter(|name| is_check_name(name)),
         output,
     })
 }
@@ -1901,6 +1932,25 @@ mod tests {
                 Duration::from_secs(20),
             )
         }
+
+        /// [`FakeGate::judge`], and the base check it saw
+        /// ([`super::judge_seeing_base_check`]).
+        fn judge_seeing(
+            &self,
+            env: &[(String, String)],
+        ) -> (Result<super::Verdict, GateFailure>, Option<String>) {
+            let path = |name: &str| -> PathBuf { self.directory.path().join(name) };
+            super::judge_seeing_base_check(
+                &path("gate.sh"),
+                Path::new("/nonexistent/repo.git"),
+                "base",
+                "candidate",
+                &path("scenarios"),
+                None,
+                env,
+                Duration::from_secs(20),
+            )
+        }
     }
 
     impl FakeGate {
@@ -1924,6 +1974,7 @@ mod tests {
                 None,
                 env,
                 Duration::from_secs(20),
+                &mut None,
             )
         }
     }
@@ -2484,30 +2535,46 @@ mod tests {
         );
     }
 
-    /// A verdict's `base_check`: the red check that passed on the base,
-    /// kept only as a check's name; a verdict without it has none.
+    /// A base check that passed is seen whatever the gate ends with: a host
+    /// fault on another check, an exit with no fact of its own after the
+    /// gate's first word of it, a verdict; only as a check's name.
     #[test]
-    fn a_verdict_names_the_red_check_that_passed_on_the_base() {
-        let gate = FakeGate::new(
+    fn a_passing_base_check_is_seen_whatever_the_gate_ends_with() {
+        let fault = FakeGate::new(
+            "echo '{\"host_fault\":true,\"scenario\":\"check-e2e.sh\",\"on\":\"candidate and base\",\"runs\":\"1, then 1 on the candidate; 1, then 1 on the base\",\"reason\":\"r\",\"base_check\":\"check-tests.sh\"}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n",
+        );
+        let (judged, seen) = fault.judge_seeing(&path_only());
+        assert!(
+            matches!(judged, Err(GateFailure::HostFault { .. })),
+            "{judged:?}"
+        );
+        assert_eq!(seen.as_deref(), Some("check-tests.sh"));
+        let aborted = FakeGate::new(
+            "echo '{\"base_check\":\"check-tests.sh\",\"base\":\"b\",\"candidate\":\"c\"}' >\"$SPAWN_GATE_VERDICT\"\nexit 3\n",
+        );
+        let (judged, seen) = aborted.judge_seeing(&path_only());
+        assert!(
+            matches!(judged, Err(GateFailure::Aborted { .. })),
+            "{judged:?}"
+        );
+        assert_eq!(seen.as_deref(), Some("check-tests.sh"));
+        let accepted = FakeGate::new(
             "echo '{\"verdict\":\"accepted\",\"base_check\":\"check-tests.sh\"}' >\"$SPAWN_GATE_VERDICT\"\n",
         );
-        let verdict = gate.judge(&path_only()).expect("a verdict");
-        assert_eq!(verdict.base_check.as_deref(), Some("check-tests.sh"));
+        assert_eq!(
+            accepted.judge_seeing(&path_only()).1.as_deref(),
+            Some("check-tests.sh")
+        );
         for other in ["../check-tests.sh", "011.sh", ""] {
-            let gate = FakeGate::new(&format!(
+            let named_badly = FakeGate::new(&format!(
                 "echo '{{\"verdict\":\"rejected\",\"reason\":\"r\",\"base_check\":\"{other}\"}}' >\"$SPAWN_GATE_VERDICT\"\n"
             ));
-            assert_eq!(
-                gate.judge(&path_only()).expect("a verdict").base_check,
-                None,
-                "{other}"
-            );
+            assert_eq!(named_badly.judge_seeing(&path_only()).1, None, "{other}");
         }
-        let gate = FakeGate::new("echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n");
-        assert_eq!(
-            gate.judge(&path_only()).expect("a verdict").base_check,
-            None
-        );
+        let without = FakeGate::new("echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n");
+        assert_eq!(without.judge_seeing(&path_only()).1, None);
+        let none = FakeGate::new("exit 3\n");
+        assert_eq!(none.judge_seeing(&path_only()).1, None);
     }
 
     #[test]
