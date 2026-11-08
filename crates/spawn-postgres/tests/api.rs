@@ -425,7 +425,6 @@ fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
     let ended = |cause| EventKind::ExecutionEnded {
         cause,
         exit_code: Some(0),
-        signal: None,
         evidence: None,
     };
     let row = |label: &str| {
@@ -455,6 +454,7 @@ fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                envelope: None,
             },
         ))
         .expect("append succeeds");
@@ -510,6 +510,7 @@ fn two_connections_racing_to_start_one_session_record_one_execution() {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                envelope: None,
             },
         )
     };
@@ -551,7 +552,6 @@ fn two_connections_racing_to_start_one_session_record_one_execution() {
             EventKind::ExecutionEnded {
                 cause: EndCause::Lost,
                 exit_code: None,
-                signal: None,
                 evidence: None,
             },
         ))
@@ -601,7 +601,6 @@ fn open_tools_are_started_minus_finished_in_live_executions() {
             EventKind::ExecutionEnded {
                 cause: EndCause::Exited,
                 exit_code: Some(0),
-                signal: None,
                 evidence: None,
             },
         ))
@@ -667,6 +666,7 @@ fn a_task_lists_its_command_and_execution_events() {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                envelope: None,
             },
         ))
         .expect("append succeeds");
@@ -1137,6 +1137,7 @@ fn status_joins_the_judgement_and_the_latest_execution() {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                envelope: None,
             },
         ))
         .expect("append succeeds");
@@ -1348,6 +1349,7 @@ fn public_holds_only_the_gateway_the_readers_and_pure_helpers() {
             "spawn_mission_caller EXECUTE",
             "spawn_now_ms EXECUTE",
             "spawn_principal EXECUTE",
+            "spawn_read_admissions EXECUTE",
             "spawn_read_freshness EXECUTE",
             "spawn_read_judgements EXECUTE",
             "spawn_read_state EXECUTE",
@@ -1380,7 +1382,7 @@ fn view_columns_match_the_snapshot() {
     let expected = [
         "agent_artifacts: session_id text, agent_id text, execution_id text, project text, branch text, commit_id text, reason text, session_seq bigint, recorded_at_ms bigint",
         "agent_commands: id bigint, agent_id text, session_id text, idempotency_key text, action jsonb, created_at_ms bigint",
-        "agent_executions: session_id text, agent_id text, execution_id text, engine text, terminal text, workspace text, started_at_ms bigint, cause text, exit_code integer, signal integer, evidence text, ended_at_ms bigint, exit_reported boolean, duration_ms bigint, command_id bigint",
+        "agent_executions: session_id text, agent_id text, execution_id text, engine text, terminal text, workspace text, started_at_ms bigint, cause text, exit_code integer, ended_at_ms bigint, exit_reported boolean, duration_ms bigint, command_id bigint, slice text, scope text, cgroup text",
         "agent_freshness: session_id text, agent_id text, last_session_seq bigint, last_event_id bigint, last_event_at_ms bigint, event_count bigint",
         "agent_judgements: session_id text, session_seq bigint, event_id bigint, agent_id text, state text, reason text, based_on_seq bigint, observation jsonb, recorded_at_ms bigint",
         "agent_lineage: session_id text, agent_id text, ancestor_session_id text, depth integer",
@@ -1388,7 +1390,7 @@ fn view_columns_match_the_snapshot() {
         "agent_open_tools: session_id text, agent_id text, execution_id text, tool_use_id text, tool_name text, session_seq bigint, started_at_ms bigint",
         "agent_relations: session_id text, agent_id text, parent_session_id text, recorded_at_ms bigint",
         "agent_state: session_id text, agent_id text, state text, reason text, confidence double precision, based_on_seq bigint, judge text, session_seq bigint, recorded_at_ms bigint, event_id bigint, observation jsonb",
-        "agent_status: session_id text, agent_id text, state text, reason text, observation_seq bigint, last_session_seq bigint, last_event_at_ms bigint, execution_id text, engine text, started_at_ms bigint, ended_at_ms bigint, exit_reported boolean, live boolean",
+        "agent_status: session_id text, agent_id text, state text, reason text, observation_seq bigint, last_session_seq bigint, last_event_at_ms bigint, execution_id text, engine text, started_at_ms bigint, ended_at_ms bigint, exit_reported boolean, live boolean, slice text, scope text, cgroup text",
         "agent_task_events: command_id bigint, session_id text, agent_id text, session_seq bigint, event_id bigint, execution_id text, event_name text, recorded_at_ms bigint",
         "agent_tasks: command_id bigint, agent_id text, session_id text, action text, state text, lease_worker text, lease_attempt integer, succeeded boolean, error text, created_at_ms bigint, finished_at_ms bigint, prompt text, principal text",
         "agent_timeline: session_id text, session_seq bigint, id bigint, agent_id text, execution_id text, source text, event_name text, detail jsonb, recorded_at_ms bigint",
@@ -1692,6 +1694,7 @@ impl Worker<'_> {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                envelope: None,
             },
         );
     }
@@ -1703,7 +1706,6 @@ impl Worker<'_> {
             EventKind::ExecutionEnded {
                 cause: EndCause::Stopped,
                 exit_code: None,
-                signal: None,
                 evidence: None,
             },
         );
@@ -2295,6 +2297,7 @@ fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
                         fork: None,
                         model: profile,
                         transcript_from: None,
+                        envelope: None,
                     },
                 )
             })
@@ -2312,7 +2315,6 @@ fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
                     EventKind::ExecutionEnded {
                         cause: EndCause::Stopped,
                         exit_code: None,
-                        signal: None,
                         evidence: None,
                     },
                 )
@@ -2902,6 +2904,7 @@ fn m15_a_revival_that_dies_at_once_counts_as_a_failure() {
                     fork: None,
                     model: ModelProfile::Default,
                     transcript_from: None,
+                    envelope: None,
                 },
             ))
             .expect("started");
@@ -2913,7 +2916,6 @@ fn m15_a_revival_that_dies_at_once_counts_as_a_failure() {
                 EventKind::ExecutionEnded {
                     cause: EndCause::Lost,
                     exit_code: None,
-                    signal: None,
                     evidence: None,
                 },
             ))
@@ -3001,6 +3003,7 @@ fn dispatch_facts_count_resumes_lost_again_at_once() {
                     fork: None,
                     model: ModelProfile::Default,
                     transcript_from: None,
+                    envelope: None,
                 },
             ),
             (
@@ -3008,7 +3011,6 @@ fn dispatch_facts_count_resumes_lost_again_at_once() {
                 EventKind::ExecutionEnded {
                     cause: EndCause::Lost,
                     exit_code: None,
-                    signal: None,
                     evidence: None,
                 },
             ),
@@ -3128,6 +3130,7 @@ fn dispatch_facts_name_the_resume_lost_before_its_engine_became_ready() {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                envelope: None,
             },
         );
         match became {
@@ -3148,7 +3151,6 @@ fn dispatch_facts_name_the_resume_lost_before_its_engine_became_ready() {
             EventKind::ExecutionEnded {
                 cause: EndCause::Lost,
                 exit_code: None,
-                signal: None,
                 evidence: Some(evidence.to_string()),
             },
         );

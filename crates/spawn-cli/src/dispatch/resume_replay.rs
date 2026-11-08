@@ -178,6 +178,7 @@ impl Replay<'_> {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                envelope: None,
             },
         );
         (claimed, execution)
@@ -202,7 +203,6 @@ impl Replay<'_> {
             EventKind::ExecutionEnded {
                 cause: EndCause::Lost,
                 exit_code: None,
-                signal: None,
                 evidence: Some(evidence.to_string()),
             },
         );

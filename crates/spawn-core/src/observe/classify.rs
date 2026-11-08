@@ -142,7 +142,10 @@ fn ended_execution(input: &JudgeInput) -> RulesVerdict {
                 SemanticState::Completed
             },
         },
-        Some(EndCause::Lost) => Ambiguous {
+        // Killed by its own resource envelope (objective 029) is the same
+        // fact as a lost terminal: the execution is gone without a verdict
+        // of its own.
+        Some(EndCause::Lost | EndCause::MemoryLimit) => Ambiguous {
             ambiguity: Ambiguity::Lost,
             guess: SemanticState::Unknown,
         },
