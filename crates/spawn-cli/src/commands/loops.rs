@@ -20,7 +20,9 @@
 //!   Stop's retry, a background job's bound, or a report note's retry;
 //! - the liveness rule ([`supervise::keep_residents`],
 //!   [`supervise::keep_alive`]), which waits for the end of a failed
-//!   revival's backoff.
+//!   revival's backoff;
+//! - the alerts ([`alerts::Monitor::check`]), which waits for its next host
+//!   reading (`SPAWN_ALERT_CHECK_SECS`, 30 s) or a bound's due time.
 //!
 //! What does not follow this rule is what no append announces: the Bridge's
 //! reading of each engine's screen and transcript runs every pass (objective
