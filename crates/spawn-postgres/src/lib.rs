@@ -432,22 +432,13 @@ fn role_password(owner_password: &str, salt: &str, role: &str) -> String {
 }
 
 fn pbkdf2_hex(owner_password: &str, salt: &str, role: &str) -> String {
-    use hmac::{Hmac, KeyInit, Mac};
-    let keyed = Hmac::<sha2::Sha256>::new_from_slice(owner_password.as_bytes())
-        .expect("HMAC takes a key of any length");
-    let mut round = keyed.clone();
-    round.update(format!("spawn-login-v2\0{salt}\0{role}").as_bytes());
-    round.update(&1u32.to_be_bytes());
-    let mut previous = round.finalize().into_bytes();
-    let mut output = previous;
-    for _ in 1..ROLE_PASSWORD_ROUNDS {
-        let mut round = keyed.clone();
-        round.update(&previous);
-        previous = round.finalize().into_bytes();
-        for (out, byte) in output.iter_mut().zip(previous.iter()) {
-            *out ^= byte;
-        }
-    }
+    // The derivation itself is spawn-kdf's, compiled optimised in debug
+    // builds too; its output is pinned (`the_login_passwords_are_the_ones_installs_have`).
+    let output = spawn_kdf::pbkdf2_sha256(
+        owner_password.as_bytes(),
+        format!("spawn-login-v2\0{salt}\0{role}").as_bytes(),
+        ROLE_PASSWORD_ROUNDS,
+    );
     output.iter().fold(String::new(), |mut hex, byte| {
         use std::fmt::Write as _;
         let _ = write!(hex, "{byte:02x}");
@@ -790,6 +781,46 @@ impl PostgresStore {
 #[cfg(test)]
 mod tests {
     use super::{login_url, role_password, role_url, url_password};
+
+    /// The restricted logins' passwords are byte for byte what every install
+    /// already has (computed by the derivation as it was at 554a4bd4, before
+    /// spawn-kdf): a different one would set new passwords at the next
+    /// migration and lock the fleet's other processes out of its database.
+    /// The last case is a login as an install names it
+    /// (`spawn_login_role('spawn_supervisor')` in database `spawn`).
+    #[test]
+    fn the_login_passwords_are_the_ones_installs_have() {
+        for (owner, salt, role, password) in [
+            (
+                "owner",
+                "ab".repeat(32),
+                "spawn_reader_db",
+                "f4e769b999554a01831a49183a5a9ffe13646043436172744f18a3fed9cc7185",
+            ),
+            (
+                "",
+                "00".to_string(),
+                "spawn_human_x",
+                "b06e99b80df3e38614f43f508ccd574abe465cfad207b8f37bbf23b6313b5798",
+            ),
+            (
+                "p\u{e4}ssw\u{f6}rd with spaces",
+                "cd".repeat(32),
+                "spawn_supervisor_spawn_test",
+                "b369a5c6b48d61eab9515eebe860416ee78c572573d7f450db8171e28804ddad",
+            ),
+            (
+                "fleet-owner-secret",
+                "0123456789abcdef".repeat(4),
+                "spawn_supervisor_spawn",
+                "2b9dc89a75cd2e38bf9d10f7272d67a6c698e8e1fa53fd4ae8498d40f66a3b6a",
+            ),
+        ] {
+            // role_password, the path a migration takes (cached), and
+            // through it pbkdf2_hex.
+            assert_eq!(role_password(owner, &salt, role), password, "{role}");
+        }
+    }
 
     /// A dashboard reader gives up on a slow statement (audit M2): the
     /// timeout is its connection's, not the server's. Needs
