@@ -25,16 +25,20 @@
 # through the server (pg_read_file, COPY ... PROGRAM, lo_import): those are
 # the superuser's, and pg_read_server_files, pg_write_server_files and
 # pg_execute_server_program are roles a CREATEROLE login cannot grant
-# itself (PostgreSQL 16: that needs ADMIN OPTION on them).
+# itself (PostgreSQL 16: that needs ADMIN OPTION on them). It may run
+# pg_stat_file (the scenarios' sweep reads a database's age with it): for
+# a login that is not a superuser, only the size and times of the
+# cluster's own files.
 #
-# The cost: 15 of Spawn's own spawn-postgres tests need a superuser (they
-# act as the restricted logins with SET SESSION AUTHORIZATION, because the
-# schema names its caller by session_user; one reads pg_authid), and fail
-# on this login with "permission denied to set session authorization"; the
-# gate's login is a superuser, so the gate still runs them. Measured
-# 2026-11-08: 129 of 144 pass on spawn_fleet, 144 of 144 with superuser.
-# FLEET_PG_SUPERUSER=1 makes spawn_fleet a superuser instead, for a host
-# whose workers run those tests; the owner decides. The engines'
+# Spawn's own spawn-postgres tests pass on it: 144 of 144 (2026-11-08, on a
+# fresh cluster from this script). They log in as the restricted logins
+# (role_url) where they act as one, and skip the two checks that need a
+# superuser (pg_authid, an earlier install's login another install may
+# still use), each with a reason.
+#
+# FLEET_PG_SUPERUSER=1 makes spawn_fleet a superuser instead. The owner
+# decided against it: a superuser login turns COPY ... PROGRAM (and
+# pg_read_file) into a way around every deny rule an engine has. The engines'
 # URL goes to ~/.config/spawn/fleet-test-database.url (mode 0600), never
 # to the screen. Then, by hand, once (deploy/systemd/README.md, "Fleet
 # test database", has the whole order):
@@ -113,6 +117,11 @@ if ! PGPASSWORD=$(cat "$admin_file") "$pg_bin/psql" -X -q -v ON_ERROR_STOP=1 \
 create role spawn_fleet login $superuser createdb createrole noreplication nobypassrls
     password '$fleet_password';
 create database spawn_fleet_test owner spawn_fleet;
+-- The scenarios' sweep (scripts/blackbox/scenario-db.sh) reads the age of
+-- a leftover database from its PG_VERSION. For a login that is not a
+-- superuser, pg_stat_file reads only files of the cluster's own
+-- directory, and only their size and times.
+grant execute on function pg_stat_file(text, boolean) to spawn_fleet;
 EOF
 then
     stop

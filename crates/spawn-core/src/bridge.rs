@@ -3134,6 +3134,9 @@ fn files_digest(files: &[String]) -> u64 {
 ///   `deploy/hold.sh`, `deploy/deploy.sh`, `deploy/test-deploy.sh`,
 ///   `deploy/cutover-controller.sh` and `deploy/backup` (`lib.sh`, which
 ///   `pg-backup.sh` and `pg-restore-drill.sh` source).
+/// - Killing by name or pattern (`pkill`, `killall`, `kill $(pgrep …)`,
+///   `pgrep … | xargs kill`): it reaches other agents' and the gates'
+///   processes. `kill <pid>` of the engine's own job stays allowed.
 /// - Another process's environment (`/proc/<pid>/environ`, `ps e`): the
 ///   long-lived spawn processes are also not dumpable
 ///   (`spawn_host::undumpable`), which is what keeps their environment
@@ -3229,6 +3232,19 @@ pub const CREDENTIAL_DENY: &[&str] = &[
     "Bash(*ps *eww*)",
     "Bash(*ps *axe*)",
     "Bash(*ps *auxe*)",
+    // Killing by name or pattern reaches other agents' and gates'
+    // processes (2026-11-08 05:19: a resident's `pkill -f 'cargo test'`
+    // killed a ccd's run). `kill <pid>` stays: an engine stops its own
+    // background jobs by their id.
+    "Bash(pkill:*)",
+    "Bash(killall:*)",
+    "Bash(*pkill *)",
+    "Bash(*killall *)",
+    "Bash(*kill *$(pgrep*)",
+    "Bash(*kill *`pgrep*)",
+    "Bash(*kill *$(pidof*)",
+    "Bash(*pgrep *|*kill*)",
+    "Bash(*pidof *|*kill*)",
 ];
 
 /// Settings passed to Claude Code for an engine on `profile`, through

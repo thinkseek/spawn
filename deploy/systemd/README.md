@@ -76,9 +76,11 @@ created with root). The fleet's is a user cluster instead, like the relays:
 no root, created by a script in the checkout, kept running by a user unit
 (the user lingers, so it starts at boot), and `spawn-loop` wants it and
 starts after it. Its data is test data, `fsync` off; lost, it is made again.
-Engines log in as `spawn_fleet`, not a superuser, unless the owner chose
-`FLEET_PG_SUPERUSER=1` (the script's header: 15 of Spawn's spawn-postgres
-tests need a superuser and fail without one).
+Engines log in as `spawn_fleet`, not a superuser: a superuser login would
+turn `COPY ... PROGRAM` and `pg_read_file` into a way around every deny
+rule an engine has. Spawn's spawn-postgres tests pass on it, 144 of 144
+(the script's header; the two checks that need a superuser skip with a
+reason).
 
 What protects the credentials ships in the binary: the deploy, then the
 units, in this order.
