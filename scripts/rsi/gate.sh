@@ -208,7 +208,8 @@
 # Any other status is an infrastructure failure (no bwrap, a git error, a
 # missing bind directory, a bad SPAWN_GATE_MIN_FREE_GB, a killed gate), which
 # the integrator records as an abort that counts. A gate whose own tree is
-# under /tmp, /run or /var/tmp refuses up front (exit 3, below): the sandbox
+# under /tmp, /run or /var/tmp — itself or below it — or under the host's
+# TMPDIR when that is not /tmp refuses up front (exit 3, below): the sandbox
 # empties those, so it could not read its own scripts there and would
 # compute base keys no other host matches — silently.
 
@@ -216,20 +217,41 @@ set -eu
 
 # A gate whose own tree the sandbox empties cannot judge: toolchain() reads
 # scripts/pg-url.sh through `$(dirname "$0")/..` inside the sandbox, and from
-# under /tmp, /run or /var/tmp there it finds nothing — the toolchain block
-# says "server: unreadable", the base cache key is like no other host's, and
-# every scenario runs again in every gate, silently (measured 2026-11-08:
-# the same base from /var/tmp gave 30 of 30 different keys, every tool
-# version identical; deploy/gate-runner/setup.sh refuses a runner root the
-# same way). Refuse up front, exit 3, naming the root and the reason.
+# a root the sandbox empties there it finds nothing. Those roots are /tmp,
+# /run and /var/tmp, and the host's TMPDIR when that is not /tmp
+# (`sandbox()` below masks it whole). A tree that *is* such a root is in it
+# as much as one under it. The toolchain block then says "server:
+# unreadable", the base cache key is like no other host's, and every
+# scenario runs again in every gate, silently (measured 2026-11-08: the same
+# base from /var/tmp gave 30 of 30 different keys, every tool version
+# identical; deploy/gate-runner/setup.sh refuses a runner root the same
+# way). Refuse up front, exit 3, naming the root and the reason — and no
+# advice about where to run it instead: where a gate may run from is the
+# caller's to know.
 gate_root=$(cd "$(dirname "$0")/../.." && pwd) || {
     echo "gate: cannot resolve the directory of $0" >&2
     exit 3
 }
-case "$gate_root" in
-/tmp/* | /run/* | /var/run/* | /var/tmp/*)
-    echo "gate: refusing to run from $gate_root: the sandbox empties /tmp, /run and /var/tmp, so the gate could not read its own scripts there (pg-url.sh) and every base key it computed would be one no other host matches; run it from a tree the sandbox shows, under \$HOME" >&2
+masked_root() {
+    printf 'gate: refusing to run from %s: %s; the gate could not read its own scripts there (scripts/pg-url.sh) inside the sandbox, so its toolchain block would say "server: unreadable" and every base key it computed would be one no other host matches\n' "$gate_root" "$1" >&2
     exit 3
+}
+case "$gate_root" in
+/tmp | /tmp/* | /run | /run/* | /var/run | /var/run/* | /var/tmp | /var/tmp/*)
+    masked_root "it is under /tmp, /run or /var/tmp, roots the sandbox empties"
+    ;;
+esac
+# The host's TMPDIR is emptied too when it is /tmp's job to be the gateway's
+# scratch: `sandbox()` masks it whole unless it is /tmp (or /).
+case "${TMPDIR-}" in
+'' | / | /tmp | /tmp/) ;;
+*)
+    tmpdir_root=$(cd "$TMPDIR" 2>/dev/null && pwd) || tmpdir_root=$TMPDIR
+    case "$gate_root" in
+    "$tmpdir_root" | "$tmpdir_root"/*)
+        masked_root "it is under the host's TMPDIR ($tmpdir_root), which the sandbox empties too (TMPDIR is not /tmp)"
+        ;;
+    esac
     ;;
 esac
 
