@@ -1017,6 +1017,7 @@ struct One<'a> {
 /// The fact an interruption is told from.
 enum Fact {
     Turn(Turn),
+    Tool(ToolFailure),
     End(End),
 }
 
