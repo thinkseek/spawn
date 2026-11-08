@@ -125,8 +125,10 @@
 #                              socket URL (postgres://u:p@%2Fdir/db, or
 #                              ?host=/dir) or a TCP one, read by
 #                              scripts/pg-url.sh
-#   SPAWN_GATE_JOBS            scenarios run at once (default min(8, half the
-#                              cores); 1 on the shared test server)
+#   SPAWN_GATE_JOBS            scenarios run at once; spawn integrate always
+#                              sets it (its share of the cores, gate.rs Cpu);
+#                              by hand: default min(8, half the cores), 1 on
+#                              the shared test server
 #   SPAWN_GATE_PG_IMAGE        the test server's docker image: the gate runs a
 #                              server of its own from it (GitHub issue #6),
 #                              and SPAWN_TEST_DATABASE_URL is not used
@@ -464,9 +466,12 @@ cache_exposed() {
 # infrastructure error (exit 3).
 #
 # Scenarios at once (see "Parallel runs" below): SPAWN_GATE_JOBS, a whole
-# number from 1; by default min(8, half the cores), or 1 on the shared test
-# server (SPAWN_TEST_DATABASE_URL without a server of the gate's own), whose
-# connections every agent's tests share.
+# number from 1. `spawn integrate` always sets it, sharing the host's cores
+# among the gates that can run at once and starting a gate only within
+# them (crates/spawn-cli/src/gate.rs, Cpu; SPAWN_GATE_WORKER_CORES keeps
+# cores for the workers). Run by hand without it: min(8, half the cores),
+# or 1 on the shared test server (SPAWN_TEST_DATABASE_URL without a server
+# of the gate's own), whose connections every agent's tests share.
 # shellcheck source=scripts/pg-url.sh
 . "$(dirname "$0")/../pg-url.sh"
 # shellcheck source=scripts/rsi/gate-pg.sh

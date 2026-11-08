@@ -332,7 +332,20 @@
 //!   later pass (said once). A mission whose scenarios directory holds
 //!   [`NO_TEST_DATABASE`] gets no SPAWN_TEST_DATABASE_URL, so its judgings
 //!   cannot reach the shared server and do not count against the cap: they
-//!   run beside the others, still one per mission and per source.
+//!   run beside the others, still one per mission and per source;
+//! - every gate gets its SPAWN_GATE_JOBS from the integrator, and starts
+//!   only within the host's cores ([`gate::Cpu`]): the owner's
+//!   SPAWN_GATE_JOBS when set, 1 on the shared test server, else the cores
+//!   less SPAWN_GATE_WORKER_CORES (default a quarter, at least 1) divided
+//!   among the gates that can run at once ([`gates_at_once`]: one per
+//!   source, those on the shared server within `--gates`), at most 8. A
+//!   gate whose jobs, with the running gates' jobs and the cores kept for
+//!   the workers, would exceed the cores waits for a later pass (said
+//!   once), as over the cap: no record, no count, nothing against the
+//!   task. With no gate running, one always starts. (2026-11-08: each gate
+//!   took half the 9 cores by gate.sh's default, two or three gates and
+//!   the workers made a load of 18-20, and task 172's gate failed on its
+//!   base.)
 //!
 //! Every judging records its own outcome (`task.gated`, `task.landed`), as
 //! before; the pass reads those records, never the thread's result. An
@@ -1237,7 +1250,11 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     // What the host must have before a gate starts, read once like the
     // gate's environment (gate::Room).
     let host_room = gate::Room::from_env(|name| std::env::var(name).ok());
-    let integrator = Integrator::new(root, gate, gate_env, host_room, gates);
+    // The host's cores, shared among the gates (gate::Cpu), read once.
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let cpu = gate::Cpu::from_env(|name| std::env::var(name).ok(), cores)
+        .map_err(|error| format!("{error}\n{USAGE}"))?;
+    let integrator = Integrator::new(root, gate, gate_env, host_room, gates).with_cpu(cpu);
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
@@ -1264,6 +1281,10 @@ struct Integrator {
     judge: Judge,
     /// Gates that may run at once ([`gate_slots`]).
     gates: usize,
+    /// How the host's cores are shared among the gates ([`gate::Cpu`]):
+    /// each gate's SPAWN_GATE_JOBS and whether it has room to start. None
+    /// (tests) leaves the gate its own default and never waits for CPU.
+    cpu: Option<gate::Cpu>,
     /// The judgings in flight, one per mission at most.
     running: RefCell<Vec<Running>>,
     /// The store whose connection holds the integrator's lock, kept while
@@ -1346,6 +1367,9 @@ struct Running {
     /// Whether this judging's gate gets the shared test server
     /// ([`needs_test_database`]): only those count against `--gates`.
     shares_server: bool,
+    /// The scenarios its gate runs at once (SPAWN_GATE_JOBS as given), 0
+    /// when the integrator does not share the cores ([`gate::Cpu`]).
+    jobs: usize,
     handle: std::thread::JoinHandle<()>,
 }
 
@@ -1372,6 +1396,20 @@ fn withheld_without_test_database(name: &str) -> bool {
     )
 }
 
+/// How many gates can run at once: one per source (`sources`: each gated
+/// mission's source and whether its gate gets the test server), those
+/// whose gate gets the shared test server at most `gates` (`--gates`); at
+/// least 1. A source with both kinds counts as one that gets the server.
+pub(crate) fn gates_at_once(sources: impl Iterator<Item = (String, bool)>, gates: usize) -> usize {
+    let mut kinds: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for (source, shares) in sources {
+        *kinds.entry(source).or_default() |= shares;
+    }
+    let shared = kinds.values().filter(|shares| **shares).count();
+    let alone = kinds.len() - shared;
+    (shared.min(gates) + alone).max(1)
+}
+
 /// Whether a judging must wait for a gate: only one that shares the test
 /// server, when `shared_running` such judgings already fill the `cap`.
 fn waits_for_gate(shares_server: bool, shared_running: usize, cap: usize) -> bool {
@@ -1395,11 +1433,18 @@ impl Integrator {
                 room: host_room,
             },
             gates,
+            cpu: None,
             running: RefCell::new(Vec::new()),
             held: RefCell::new(None),
             waiting: RefCell::new(std::collections::HashSet::new()),
             last_judged: RefCell::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// This integrator with the host's cores shared among its gates.
+    fn with_cpu(mut self, cpu: gate::Cpu) -> Self {
+        self.cpu = Some(cpu);
+        self
     }
 
     fn pass(&self) -> Result<(), String> {
@@ -1524,7 +1569,17 @@ impl Integrator {
             }
         }
         ready.retain(|candidate: &Ready| !moved.contains(&candidate.source));
-        self.start_ready(store, ready);
+        let at_once = gates_at_once(
+            missions.iter().filter_map(|mission| {
+                let source = mission.source.clone()?;
+                Some((
+                    source,
+                    needs_test_database(&pinned(Path::new(&mission.gate))),
+                ))
+            }),
+            self.gates,
+        );
+        self.start_ready(store, ready, at_once);
         Ok(())
     }
 
@@ -1638,7 +1693,11 @@ impl Integrator {
     /// runs). Two missions that are always ready thus take turns, and the
     /// mission id decides nothing. At most one judging per mission and per
     /// source.
-    fn start_ready(&self, store: &Arc<PostgresStore>, mut ready: Vec<Ready>) {
+    /// Start the gates of `ready` that may run now: one per mission and per
+    /// source, those on the shared test server within `--gates`, and each
+    /// within the host's cores ([`gate::Cpu::fits`]), `at_once` being how
+    /// many gates can run at once ([`gates_at_once`]) for the default jobs.
+    fn start_ready(&self, store: &Arc<PostgresStore>, mut ready: Vec<Ready>, at_once: usize) {
         let since = |candidate: &Ready| {
             let ended = self
                 .last_judged
@@ -1674,9 +1733,27 @@ impl Integrator {
                 }
                 continue;
             }
+            let jobs = self.cpu.as_ref().map(|cpu| {
+                let shared = shares_server && gate::on_shared_server(&self.judge.gate_env);
+                cpu.jobs_for(shared, at_once)
+            });
+            if let (Some(cpu), Some(jobs)) = (&self.cpu, jobs) {
+                let busy: usize = self.running.borrow().iter().map(|gate| gate.jobs).sum();
+                if !cpu.fits(busy, jobs) {
+                    if self.waiting.borrow_mut().insert(candidate.task.id) {
+                        println!(
+                            "integrate: mission {}: task {} waits for CPU room: its gate's {jobs} \
+                             jobs, the running gates' {busy} and the {} cores kept for the \
+                             workers (SPAWN_GATE_WORKER_CORES) exceed the {} cores",
+                            candidate.mission, candidate.task.id, cpu.reserved, cpu.cores
+                        );
+                    }
+                    continue;
+                }
+            }
             self.waiting.borrow_mut().remove(&candidate.task.id);
             let mission = candidate.mission;
-            if let Err(error) = self.start_judging(store, candidate, running, shares_server) {
+            if let Err(error) = self.start_judging(store, candidate, running, shares_server, jobs) {
                 eprintln!("integrate: mission {mission}: {error}");
             }
         }
@@ -1689,6 +1766,7 @@ impl Integrator {
         candidate: Ready,
         running: usize,
         shares_server: bool,
+        jobs: Option<usize>,
     ) -> Result<(), String> {
         let Ready {
             mission: mission_id,
@@ -1706,7 +1784,16 @@ impl Integrator {
             .name(format!("gate-{task_id}"))
             .spawn(move || {
                 judged_or_aborted(&store, &task, &main, mission_id, || {
-                    judge.judge(&store, &mirror, &source_owned, &main, &gated, count, &task)
+                    judge.judge(
+                        &store,
+                        &mirror,
+                        &source_owned,
+                        &main,
+                        &gated,
+                        count,
+                        &task,
+                        jobs,
+                    )
                 });
             })
             .map_err(|error| format!("start the judging of task {task_id}: {error}"))?;
@@ -1728,6 +1815,7 @@ impl Integrator {
             source,
             task: task_id,
             shares_server,
+            jobs: jobs.unwrap_or(0),
             handle,
         });
         Ok(())
@@ -1908,6 +1996,7 @@ impl Judge {
         mission: &Mission,
         count: u32,
         task: &Task,
+        jobs: Option<usize>,
     ) -> Result<bool, String> {
         let branch = match Self::pushed_candidate(store, mirror, source, task)? {
             Freshness::Fresh(branch) => Some(branch),
@@ -1932,6 +2021,7 @@ impl Judge {
             count,
             task,
             branch.as_deref(),
+            jobs,
         )
         .map(|()| true)
     }
@@ -1949,6 +2039,7 @@ impl Judge {
         count: u32,
         task: &Task,
         branch: Option<&str>,
+        jobs: Option<usize>,
     ) -> Result<(), String> {
         let scenarios = Path::new(&mission.gate);
         // Read only: the integrator never commits a workspace.
@@ -2053,6 +2144,11 @@ impl Judge {
             });
         if !needs_test_database(scenarios) {
             gate_env.retain(|(name, _)| !withheld_without_test_database(name));
+        }
+        // The jobs this gate was given room for, never its own default.
+        if let Some(jobs) = jobs {
+            gate_env.retain(|(name, _)| name != "SPAWN_GATE_JOBS");
+            gate_env.push(("SPAWN_GATE_JOBS".to_string(), jobs.to_string()));
         }
         if let Some(warning) = warning {
             eprintln!("integrate: {warning}");
@@ -3337,8 +3433,8 @@ fn task_scenario(scenarios: &Path, recorded: Option<&str>) -> Option<PathBuf> {
 mod tests {
     use super::{
         BUDGET_GAP, Freshness, Mission, NO_TEST_DATABASE, aborted, active_ms, budget_gap,
-        freshness, halt_reason, markers_note, merged_tree, needs_test_database, no_room,
-        over_budget, pinned, report_freshness, room_backoff, room_wait, short_of_room,
+        freshness, gates_at_once, halt_reason, markers_note, merged_tree, needs_test_database,
+        no_room, over_budget, pinned, report_freshness, room_backoff, room_wait, short_of_room,
         task_scenario, waits_for_gate, wall_clock_minutes, withheld_without_test_database,
     };
     use crate::gate::{GateFailure, Shortfall};
@@ -4679,6 +4775,34 @@ mod tests {
         assert!(!waits_for_gate(false, 1, 1));
         assert!(!waits_for_gate(false, 8, 1));
         assert!(!waits_for_gate(true, 2, 3));
+    }
+
+    /// The gates that can run at once, which the default jobs divide the
+    /// cores among: one per source, those on the shared test server within
+    /// `--gates`.
+    #[test]
+    fn gates_at_once_are_one_per_source_within_the_shared_cap() {
+        let of = |pairs: &[(&str, bool)], gates| {
+            gates_at_once(
+                pairs
+                    .iter()
+                    .map(|(source, shares)| ((*source).to_string(), *shares)),
+                gates,
+            )
+        };
+        // Spawn (shared server) and Supply PA (no test database, two missions).
+        assert_eq!(
+            of(&[("spawn", true), ("supply", false), ("supply", false)], 1),
+            2
+        );
+        assert_eq!(of(&[("a", true), ("b", true)], 1), 1);
+        assert_eq!(of(&[("a", true), ("b", true)], 2), 2);
+        assert_eq!(
+            of(&[("a", true), ("a", false)], 1),
+            1,
+            "one gate per source"
+        );
+        assert_eq!(of(&[], 1), 1);
     }
 
     #[test]
