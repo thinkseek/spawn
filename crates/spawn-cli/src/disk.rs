@@ -272,6 +272,22 @@ pub(crate) fn gate_room_escalations(records: &[Value]) -> Vec<Escalation> {
                     ),
                     "repair the test database server (its /dev/shm, its connections)",
                 ),
+                // A scenario run that waited past its bound for one of the
+                // host's slots: the same room statement, about the fifth
+                // resource — and the advice has to name what the owner can
+                // act on, or the escalation only repeats the symptom.
+                "host scenario slot" => (
+                    format!(
+                        "a scenario run waited {} for one of SPAWN_GATE_HOST_JOBS={} scenario \
+                         slots (other gates on this host were running, or a hand-run gate was \
+                         left waiting)",
+                        crate::gate::spoken_ms(record["measured"].as_u64().unwrap_or_default()),
+                        text("threshold")
+                    ),
+                    "find what holds the slots (another mission's gate, an owner gate left \
+                     waiting in its log) and finish or stop it, or raise SPAWN_GATE_HOST_JOBS if \
+                     this host can serve more scenarios",
+                ),
                 _ => (
                     format!(
                         "{} free in TMPDIR {}, under SPAWN_GATE_MIN_FREE_GB={}",
@@ -734,5 +750,28 @@ within 10 s\": ERROR: could not resize shared memory segment (53100)."
         );
         assert!(items.iter().all(|item| item.why == Why::GateRoom));
         assert_eq!(items[1].tag(), "host gate-room-22");
+    }
+
+    /// A gate that gave up waiting for a host scenario slot is short of
+    /// room too, and the escalation says what the owner can act on: the
+    /// wait, the budget, and what holds the slots.
+    #[test]
+    fn a_gate_without_a_host_scenario_slot_is_told_with_its_wait_and_the_budget() {
+        let records = [json!({"type": "task.gated", "verdict": "no_room", "escalate": true,
+                              "id": 7, "check": "host scenario slot", "measured": 1_800_000,
+                              "threshold": 2, "event_id": 24, "mission": 10})];
+        let items = gate_room_escalations(&records);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].line,
+            "host scenario slot check: the gate of mission 10 has had no room to judge for \
+over two hours: a scenario run waited 30.0 min for one of SPAWN_GATE_HOST_JOBS=2 scenario \
+slots (other gates on this host were running, or a hand-run gate was left waiting). Its work \
+waits (no halt counts); find what holds the slots (another mission's gate, an owner gate left \
+waiting in its log) and finish or stop it, or raise SPAWN_GATE_HOST_JOBS if this host can \
+serve more scenarios or tell the owner."
+        );
+        assert_eq!(items[0].why, Why::GateRoom);
+        assert_eq!(items[0].tag(), "host gate-room-24");
     }
 }

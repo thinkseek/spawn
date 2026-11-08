@@ -285,11 +285,13 @@
 //!    gate: the task is gated `no_room`, the path above, unchanged in its
 //!    meaning (no verdict, no count, the same `gate_room_*` run, backoff and
 //!    escalation), and the record names `check` (`disk`, `memory`,
-//!    `database`), `measured` and `threshold` (free KiB and the floor in
-//!    KiB, with `free_kb`, `min_gb` and `tmpdir`; available MiB and the
-//!    floor in MiB; the error and the probe, with the server named
-//!    host:port/database, never the URL's password), and a reason that names
-//!    the three ([`short_of_room`]). A threshold of 0 disables its check; one
+//!    `database`, or `host scenario slot` for a scenario run that gave up
+//!    waiting for one of the host's slots), `measured` and `threshold`
+//!    (free KiB and the floor in KiB, with `free_kb`, `min_gb` and
+//!    `tmpdir`; available MiB and the floor in MiB; the error and the
+//!    probe, with the server named host:port/database, never the URL's
+//!    password; the wait in milliseconds and the host's scenario budget),
+//!    and a reason that names the three ([`short_of_room`]). A threshold of 0 disables its check; one
 //!    that does not parse is an abort. Every check met: the gate runs as
 //!    before, its own floor and exit 5 included. The decision rests on
 //!    measures taken at the judging, recorded with their thresholds (design
@@ -1060,25 +1062,18 @@ pub(crate) fn cannot_judge_fields(
 pub(crate) const CANNOT_JUDGE: &str = "cannot_judge";
 
 /// The record of a gate that had no room to judge `task`, at `now_ms`: the
-/// reason with the free space and TMPDIR, the facts themselves, and
-/// `escalate` when the run of them on this task began more than
-/// [`ROOM_ESCALATE_AFTER`] ago and none escalated yet. Another task's run
-/// gives it no age.
+/// reason with the check, its measure and its threshold, the facts
+/// themselves, and `escalate` when the run of them on this task began more
+/// than [`ROOM_ESCALATE_AFTER`] ago and none escalated yet. Another task's
+/// run gives it no age.
 pub(crate) fn no_room(
     mission: &Mission,
     task: i64,
-    free_kb: u64,
-    min_gb: u64,
-    tmpdir: &str,
+    short: &Shortfall,
     log: &str,
     now_ms: i64,
 ) -> Value {
-    let disk = Shortfall::Disk {
-        free_kb,
-        min_gb,
-        tmpdir: tmpdir.to_string(),
-    };
-    short_of_room(mission, task, &disk, log, now_ms)
+    short_of_room(mission, task, short, log, now_ms)
 }
 
 /// The record of a judging of `task` that found the host short of room at
@@ -1129,6 +1124,12 @@ pub(crate) fn short_of_room(
             "no room to judge now: the test database ({server}) failed the probe \"{probe}\": \
              {error}; not a verdict, judged again later"
         ),
+        Shortfall::Slot { waited_ms, budget } => format!(
+            "no room to judge now: a scenario run waited {} for a host scenario slot \
+             (SPAWN_GATE_HOST_JOBS={budget} in all, shared by every gate on this host); \
+             not a verdict, judged again later",
+            gate::spoken_ms(*waited_ms)
+        ),
     };
     let mut record = json!({
         "reason": reason,
@@ -1144,7 +1145,7 @@ pub(crate) fn short_of_room(
             min_gb,
             tmpdir,
         } => json!({"free_kb": free_kb, "min_gb": min_gb, "tmpdir": tmpdir}),
-        Shortfall::Memory { .. } => json!({}),
+        Shortfall::Memory { .. } | Shortfall::Slot { .. } => json!({}),
         Shortfall::Database { server, .. } => json!({ "server": server }),
     };
     if let (Some(target), Some(extra)) = (record.as_object_mut(), extra.as_object()) {
@@ -2440,15 +2441,9 @@ impl Judge {
             Ok(verdict) => {
                 match rejection(&mirror_path, main, &candidate, &branch, &verdict, &run_gate)? {
                     Rejection::Record(verdict, extra) => gated(verdict, extra),
-                    Rejection::HeadNoRoom {
-                        free_kb,
-                        min_gb,
-                        tmpdir,
-                        log,
-                        head,
-                    } => {
+                    Rejection::HeadNoRoom { short, log, head } => {
                         let mut extra =
-                            no_room(mission, task.id, free_kb, min_gb, &tmpdir, &log, now_ms());
+                            no_room(mission, task.id, &short, &log, now_ms());
                         if let (Some(target), Some(head)) =
                             (extra.as_object_mut(), head.as_object())
                         {
@@ -2505,16 +2500,10 @@ impl Judge {
                     }
                 }
             }
-            // No room in TMPDIR: a fact about the host, never a count.
-            Err(GateFailure::NoRoom {
-                free_kb,
-                min_gb,
-                tmpdir,
-                log,
-            }) => gated(
-                "no_room",
-                no_room(mission, task.id, free_kb, min_gb, &tmpdir, &log, now_ms()),
-            ),
+            // No room to judge: a fact about the host, never a count.
+            Err(GateFailure::NoRoom { short, log }) => {
+                gated("no_room", no_room(mission, task.id, &short, &log, now_ms()))
+            }
             // The base disagreed with itself: a scenario of it exited 1 and
             // then 0, before any candidate code ran. The host was too loaded
             // or too flaky to judge: `host_fault` with that evidence, never
@@ -2930,12 +2919,11 @@ fn markers_note(pending: bool, marked: &[String]) -> Option<String> {
 enum Rejection {
     /// Record this verdict with these fields.
     Record(&'static str, Value),
-    /// The head's own run found no room in TMPDIR: `no_room`, as any, with
-    /// `head` (the fields naming the head and the rejected merge) added.
+    /// The head's own run found the host short of room: `no_room`, as any,
+    /// with `head` (the fields naming the head and the rejected merge)
+    /// added.
     HeadNoRoom {
-        free_kb: u64,
-        min_gb: u64,
-        tmpdir: String,
+        short: Shortfall,
         log: String,
         head: Value,
     },
@@ -3172,15 +3160,8 @@ fn rejection(
                 &json!({"head_verdict": "rejected", "head_reason": alone.reason}),
             ),
         ),
-        Err(GateFailure::NoRoom {
-            free_kb,
-            min_gb,
-            tmpdir,
-            log,
-        }) => Rejection::HeadNoRoom {
-            free_kb,
-            min_gb,
-            tmpdir,
+        Err(GateFailure::NoRoom { short, log }) => Rejection::HeadNoRoom {
+            short,
             log,
             head: named,
         },
@@ -3229,8 +3210,8 @@ fn aborted(failure: &GateFailure) -> Value {
         }
         // Recorded as `no_room` by the caller; counted here only if a
         // caller forgets that.
-        GateFailure::NoRoom { tmpdir, log, .. } => {
-            json!({"reason": format!("the gate had no room in {tmpdir}"), "log": log})
+        GateFailure::NoRoom { short, log } => {
+            json!({"reason": format!("the gate had no room: {}", short.line()), "log": log})
         }
         // Recorded as `host_fault` with evidence `base_disagrees` by the
         // caller; counted here only if a caller forgets that.
@@ -3844,6 +3825,14 @@ mod tests {
     };
     use crate::gate::{GateFailure, Shortfall};
     use serde_json::json;
+
+    fn disk_short(free_kb: u64, min_gb: u64, tmpdir: &str) -> Shortfall {
+        Shortfall::Disk {
+            free_kb,
+            min_gb,
+            tmpdir: tmpdir.to_string(),
+        }
+    }
 
     /// One gate at a time unless the test server is per gate: more is
     /// refused without the opt-in, whatever asks for it.
@@ -5053,9 +5042,7 @@ mod tests {
         let first = no_room(
             &waiting,
             4,
-            3 * 1_048_576 + 104_858,
-            10,
-            "/data/tmp",
+            &disk_short(3 * 1_048_576 + 104_858, 10, "/data/tmp"),
             "log",
             0,
         );
@@ -5071,10 +5058,10 @@ mod tests {
         waiting.gate_room_task = Some(4);
         waiting.gate_room_since_ms = Some(0);
         let at = |mission: &Mission, minutes: i64| {
-            no_room(mission, 4, 1, 10, "/t", "", minutes * MINUTE)["escalate"].clone()
+            no_room(mission, 4, &disk_short(1, 10, "/t"), "", minutes * MINUTE)["escalate"].clone()
         };
         assert_eq!(
-            no_room(&waiting, 5, 1, 10, "/t", "", 500 * MINUTE)["escalate"],
+            no_room(&waiting, 5, &disk_short(1, 10, "/t"), "", 500 * MINUTE)["escalate"],
             false,
             "a later task's first no_room starts its own run"
         );
@@ -5097,7 +5084,13 @@ mod tests {
     #[test]
     fn a_no_room_names_its_check_measure_and_threshold() {
         let waiting = mission(0, 0, 0);
-        let disk = no_room(&waiting, 4, 3 * 1_048_576, 10, "/data/tmp", "log", 0);
+        let disk = no_room(
+            &waiting,
+            4,
+            &disk_short(3 * 1_048_576, 10, "/data/tmp"),
+            "log",
+            0,
+        );
         assert_eq!(
             (&disk["check"], &disk["measured"], &disk["threshold"]),
             (
@@ -5159,6 +5152,32 @@ mod tests {
             ) && reason.ends_with("not a verdict, judged again later"),
             "{reason}"
         );
+
+        // A scenario run that gave up waiting for a host scenario slot is
+        // the host's capacity too: the wait and the budget, the gate's own
+        // fact, and no disk or database fields.
+        let slot = short_of_room(
+            &waiting,
+            4,
+            &Shortfall::Slot {
+                waited_ms: 1_800_000,
+                budget: 2,
+            },
+            "waited 30.0 min for a host scenario slot (all 2 taken)\n",
+            0,
+        );
+        assert_eq!(
+            (&slot["check"], &slot["measured"], &slot["threshold"]),
+            (&json!("host scenario slot"), &json!(1_800_000), &json!(2))
+        );
+        assert_eq!(
+            slot["reason"],
+            "no room to judge now: a scenario run waited 30.0 min for a host scenario slot \
+             (SPAWN_GATE_HOST_JOBS=2 in all, shared by every gate on this host); not a verdict, \
+             judged again later"
+        );
+        assert_eq!(slot["log"], "waited 30.0 min for a host scenario slot (all 2 taken)\n");
+        assert!(slot.get("free_kb").is_none() && slot.get("server").is_none());
 
         // Two hours into the task's run: the first record escalates,
         // whichever check fell short.
