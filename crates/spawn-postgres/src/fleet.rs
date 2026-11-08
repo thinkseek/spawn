@@ -221,17 +221,9 @@ from (
     p.observation,
     p.observation_event_id,
     p.observation_at_ms,
-    (select max(e.session_seq) from spawn_events e
-      where e.session_id = s.session_id and e.source <> 'observer'
-        and e.event_name not in ('artifact.committed', 'merge.conflicted')
-        and coalesce(e.kind -> 'detail' ->> 'step', '') <> 'waiting') as evidence_seq,
-    coalesce((select e.event_name in ('turn.stopped', 'turn.failed') from spawn_events e
-               where e.session_id = s.session_id and e.execution_id = s.execution_id
-                 and e.event_name in ('message.received', 'turn.stopped', 'turn.failed')
-               order by e.session_seq desc limit 1), false) as turn_ended,
-    (select e.kind -> 'detail' -> 'artifact' ->> 'commit' from spawn_events e
-      where e.agent_id = s.agent_id and e.event_name = 'artifact.committed'
-      order by e.id desc limit 1) as checkpoint,
+    ev.evidence_seq,
+    coalesce(tn.ended, false) as turn_ended,
+    ck.commit as checkpoint,
     (select coalesce(jsonb_agg(jsonb_build_object(
               'id', j.job_id, 'kind', j.job_kind, 'event_id', j.event_id,
               'started_at_ms', j.started_at_ms,
