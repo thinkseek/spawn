@@ -3854,9 +3854,8 @@ PENDING_ISSUES\n";
         );
         assert!(super::orders(&tasks, &rows, 60_000).is_empty());
         assert_eq!(super::reissues(&tasks, &rows, 60_000).len(), 1);
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
-=======
-=======
+    }
+
     /// The timers the mission layer waits for are the waits its own rules
     /// name: a delivery refused because the pane was not ready goes again
     /// after [`NOT_READY_RETRY_MS`], one that failed after `retry_wait_ms` of
@@ -3935,7 +3934,5 @@ PENDING_ISSUES\n";
             "a command in flight holds the retry, but its end is an event: the wait is still \
              the one the attempt names"
         );
->>>>>>> 1860071c4915de594d47f690dd83c046e0190ea7
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
     }
 }
