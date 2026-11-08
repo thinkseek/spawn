@@ -2027,7 +2027,8 @@ fn describe(record: &Recorded) -> String {
 }
 
 /// The next fact of `execution` that no interruption explains, in log
-/// order: the failed turn after the latest one recorded, or the end.
+/// order: the first failed turn or failed tool call after the latest one
+/// recorded, or the end.
 ///
 /// While a wait is open its execution's end is no interruption of its own —
 /// the wait's revival resumes it — unless a Stop ended it: a person's
@@ -2037,6 +2038,7 @@ fn describe(record: &Recorded) -> String {
 fn pending(
     records: &[Recorded],
     turns: &[Turn],
+    tools: &[ToolFailure],
     execution: &Execution,
     stops: &[Stop],
     commands: &[Sent],
