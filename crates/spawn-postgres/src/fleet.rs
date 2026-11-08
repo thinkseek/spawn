@@ -233,7 +233,8 @@ from (
     coalesce(jb.jobs, '[]'::jsonb) as jobs,
     ep.id as episode,
     ep.action ->> 'type' as episode_action,
-    oc.session_id is not null as open_command,
+    exists (select 1 from spawn_commands c
+             where c.session_id = s.session_id and c.state <> 'finished') as open_command,
     coalesce(mo.model, 'default') as model,
     (select coalesce(jsonb_agg(jsonb_build_object(
               'id', c.id,
