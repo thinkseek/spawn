@@ -65,7 +65,7 @@ pub(crate) const RECOVERY_SIGNALS: &str = r"
 select exists (
   select 1 from spawn_events e
    where e.id > $1
-     and (e.event_name in ('turn.failed', 'execution.ended')
+     and (e.event_name in ('turn.failed', 'tool.failed', 'execution.ended')
           or (e.event_name = 'control.recorded'
               and e.kind -> 'detail' -> 'record' ->> 'type' in
                   ('execution.interrupted', 'execution.cleared', 'task.over_budget',
