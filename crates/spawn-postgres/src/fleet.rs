@@ -383,6 +383,15 @@ from (
       from agent_open_jobs j
      group by j.session_id, j.execution_id) jb
     on s.live and jb.session_id = s.session_id and jb.execution_id = s.execution_id
+  -- Each session's last delivery the worker may have received: one read of
+  -- the queue for the fleet, not one per session.
+  left join (
+    select distinct on (c.session_id) c.session_id, c.idempotency_key
+      from spawn_commands c
+     where c.principal = 'spawn-dispatch'
+       and c.idempotency_key like 'deliver-%'
+       and (c.succeeded is distinct from false or position($1 in coalesce(c.error, '')) > 0)
+     order by c.session_id, c.id desc) ld on ld.session_id = s.session_id
   -- The supervisor's current native session (the one its latest
   -- `session.native_started` names, which a resume resumes) and the start
   -- that began it: the command of the execution that named it first.
