@@ -9458,6 +9458,7 @@ mod database_tests {
         // Judged again after its due time (this test's backoff is 1 ms; the
         // hold itself is every host fault's, tested above): the second in a
         // row escalates, as any.
+        past_due(&db);
         pass();
         assert_eq!(count(), 2);
         let record = last_verdict(&db).0;
@@ -9469,6 +9470,7 @@ mod database_tests {
         // The cap (2 here) never reaches it: four faults in a row stay host
         // faults, and `gate_aborts` never moves.
         for _ in 0..2 {
+            past_due(&db);
             pass();
         }
         assert_eq!(count(), 4);
@@ -9480,6 +9482,28 @@ mod database_tests {
         assert!(after.halted.is_none(), "no halt counts a host fault");
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Wait until the database's clock is past the latest record's `due_ms`:
+    /// a pass judges a task again only then, and the tests' backoffs of a few
+    /// milliseconds otherwise race a pass started at once after the last
+    /// (one short in the count, now and then).
+    fn past_due(db: &Db) {
+        let due = last_verdict(db).0["due_ms"].as_i64().expect("a due time");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while db
+            .admin()
+            .query_one("select spawn_now_ms()", &[])
+            .expect("the database's clock")
+            .get::<_, i64>(0)
+            <= due
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the clock never passed {due}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
 
     /// The task's latest `task.gated` record and its event's id and time.
