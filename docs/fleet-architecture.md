@@ -1543,8 +1543,7 @@ record of what was judged (§14 of design.md).
      the shared test server), and an uncounted one would hold the task for
      ever. A base-only fault (the gate's fact `on` `base`, or the base's own
      disagreement) comes before any candidate code and counts toward no
-     halt, so it neither counts toward the cap nor is ever capped.
-  6. moves `main` on the source with a compare-and-swap push
+     halt, so it neither counts toward the cap nor is ever capped.  6. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate
      is already in `main`'s history (an earlier push of this landing whose

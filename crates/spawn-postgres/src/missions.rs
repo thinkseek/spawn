@@ -601,6 +601,20 @@ select coalesce(jsonb_agg(jsonb_build_object(
      where x.r ->> 'type' in ('task.gated', 'task.aborted', 'task.cancelled')
      order by x.seq desc limit 1) o on true";
 
+/// [`PostgresStore::task_host_faults`]: a task's `host_fault` verdicts at
+/// one report revision, but a base-only one (the gate's fact with `on`
+/// `base`: a scenario's harness error before any candidate code ran, which
+/// counts toward no halt).
+pub(crate) const TASK_HOST_FAULTS: &str = r"
+select count(*)
+  from spawn_events e
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'id' = $1
+   and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+   and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
+   and e.kind -> 'detail' -> 'record' ->> 'revision' = $2
+   and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') <> 'base'";
+
 /// The work an ephemeral objective task starts from: the newest earlier
 /// task of its objective that ended without landing (cancelled, aborted or
 /// yielded) and left work, a checkpoint of its own (`tool_completed`,
@@ -612,17 +626,6 @@ select coalesce(jsonb_agg(jsonb_build_object(
 /// the merge of main on top of it for its next delivery, hold none of the
 /// work: rev-e on a114a9e, objective 55's task 149). spawn-cli checks in
 /// git that the commit holds changes of its own. `$1` the task.
-/// [`PostgresStore::task_host_faults`]: a task's `host_fault` verdicts at
-/// one report revision.
-pub(crate) const TASK_HOST_FAULTS: &str = r"
-select count(*)
-  from spawn_events e
- where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-   and e.kind -> 'detail' -> 'record' ->> 'id' = $1
-   and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
-   and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
-   and e.kind -> 'detail' -> 'record' ->> 'revision' = $2";
-
 pub(crate) const OBJECTIVE_FORK: &str = r"
 select coalesce((
   select jsonb_build_object('task', p.id, 'commit', c.commit)
@@ -1770,8 +1773,10 @@ impl PostgresStore {
     }
 
     /// How many `host_fault` gate verdicts task `task` has at its report
-    /// revision `revision`: read from its control records by the record-id
-    /// index. The integrator counts the next one past its cap as an abort.
+    /// revision `revision`, but a base-only one (the gate's fact `on`
+    /// `base`, before any candidate code ran): read from its control
+    /// records by the record-id index. The integrator counts the next one
+    /// past its cap as an abort.
     pub fn task_host_faults(&self, task: i64, revision: i64) -> Result<i64, StoreError> {
         Ok(self
             .query_one(

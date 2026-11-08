@@ -1400,6 +1400,18 @@ pub(crate) fn host_fault_cap(text: Option<&str>) -> u32 {
         .unwrap_or(HOST_FAULT_CAP)
 }
 
+/// Whether a gate `host_fault` record's fields say the fault is the base's
+/// alone (the gate's fact with `on` `base`: a scenario's harness error
+/// before any candidate code ran). Those never count toward a halt, so the
+/// cap neither counts nor caps them ([`HOST_FAULT_CAP`]).
+fn base_only_fault(fields: &Value) -> bool {
+    fields
+        .get("fact")
+        .and_then(|fact| fact.get("on"))
+        .and_then(Value::as_str)
+        == Some("base")
+}
+
 /// The `aborted` record of a host fault past the cap: `faults` host faults
 /// already at this revision, `cap` allowed; the fault's own record kept under
 /// `host_fault` (its log at the top, as an abort's).
@@ -2149,8 +2161,11 @@ impl Judge {
         let flakes: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
         let gated = |verdict: &str, extra: Value| -> Result<(), String> {
             // A host fault past the cap for this revision counts as an abort
-            // ([`HOST_FAULT_CAP`]).
-            let (verdict, extra) = if verdict == "host_fault" {
+            // ([`HOST_FAULT_CAP`]). Only a fault judged after the candidate
+            // ran does: a base-only one (the gate's fact `on` `base`) comes
+            // before any candidate code and counts toward no halt, so it
+            // never reaches the cap and is never capped.
+            let (verdict, extra) = if verdict == "host_fault" && !base_only_fault(&extra) {
                 let faults = store
                     .task_host_faults(task.id, i64::from(task.revisions))
                     .map_err(|error| error.to_string())?;
@@ -9366,6 +9381,57 @@ mod database_tests {
         integrator.settle();
         let (record, _, _) = last_verdict(&db);
         assert_eq!(record["flakes"], json!(["check-e2e.sh"]), "{record}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A base-only host fault (the gate's fact `on` `base`, before any
+    /// candidate code ran) counts toward no halt, so it never counts toward
+    /// the cap and is never capped: with the cap at 2, a gate that keeps
+    /// reporting a base harness error is `host_fault` every time, and the
+    /// task never aborts.
+    #[test]
+    fn base_only_host_faults_never_reach_the_cap() {
+        let gate = "echo '| == base: 012.sh'\n\
+                    printf '{\"host_fault\":true,\"scenario\":\"012.sh\",\"on\":\"base\",\"runs\":\"1, then 0\",\"reason\":\"012.sh exited 1, then 0 on the base\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+                    exit 6\n";
+        let (base, source, scenarios, mut integrator) = world("gate-fault-base-cap", gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_secs(1),
+            cap: 2,
+        };
+        let db = Db::new("gate_host_fault_base_cap");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        let mut due = None;
+        for round in 0..4 {
+            if let Some(due) = due {
+                let left = due - super::now_ms();
+                if left > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        u64::try_from(left).unwrap_or(0) + 50,
+                    ));
+                }
+            }
+            integrator.pass_on(&db.store).expect("a pass");
+            integrator.settle();
+            let record = last_verdict(&db).0;
+            assert_eq!(record["verdict"], "host_fault", "round {round}: {record}");
+            assert_eq!(record["fact"]["on"], "base", "{record}");
+            due = record["due_ms"].as_i64();
+        }
+        assert_eq!(
+            db.store.task_host_faults(task, 0).expect("count"),
+            0,
+            "base-only faults are not counted"
+        );
+        assert_eq!(gated(&db, mission).gate_aborts, 0);
+        assert_eq!(gated(&db, mission).gate_host_faults, 4, "each one a run");
         let _ = std::fs::remove_dir_all(&base);
     }
 
