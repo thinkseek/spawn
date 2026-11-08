@@ -2024,7 +2024,9 @@ fn verify(flags: &Flags) -> Result<i32, String> {
         match verify_bundle(&settings, &store, now_ms) {
             Ok(check) => record["bundle"] = check,
             Err(error) => {
-                record["bundle"] = json!({"checked": true, "reason": error.clone()});
+                // A failed check says so itself: a reader that greps `.bundle.checked` alone must not
+                // read this as a pass (the record's top-level ok is false too).
+                record["bundle"] = json!({"checked": true, "ok": false, "reason": error.clone()});
                 ok = false;
                 reason = error;
             }
@@ -2300,6 +2302,7 @@ fn verify_bundle(settings: &Settings, store: &PostgresStore, now_ms: i64) -> Res
     }
     Ok(json!({
         "checked": true,
+        "ok": true,
         "key": key,
         "bundled_event_id": latest.event_id,
         "kind": kind,
