@@ -21,6 +21,17 @@
 //! under the floor (SPAWN_GATE_MIN_FREE_GB, default 10). Otherwise the run is
 //! an abort, as is a fact with any other exit status.
 //!
+//! **A host fault is no verdict either.** Exit [`HOST_FAULT_EXIT`] *and* a
+//! host-fault fact in the verdict file (`{"host_fault":true,"scenario",
+//! "on","runs","reason"}`) means the gate found a scenario failing where the
+//! candidate is not to blame ([`GateFailure::HostFault`]): a scenario's
+//! harness error on the base, before any candidate code ran (`on` `base`),
+//! or a check that failed twice on the candidate and once on the base (`on`
+//! `candidate and base`). The integrator records `host_fault`, retried after
+//! a backoff and counted toward no halt. The fact counts only from the
+//! verdict file the sandbox never sees, and only with that exit; exit 6
+//! without it is an abort.
+//!
 //! **The host's room is measured before a gate, not learned from its
 //! crash.** Before it starts a gate, the integrator checks the host
 //! ([`Room::check`]), in this order, stopping at the first that falls short:
@@ -110,6 +121,11 @@ pub(crate) const GATE_ENV: &[&str] = &[
 /// verdict file.
 pub(crate) const NO_ROOM_EXIT: i32 = 5;
 
+/// The gate's exit status when it found a host or harness fault instead of
+/// a verdict (scripts/rsi/gate.sh `host_fault`). It counts only with the
+/// host-fault fact in the verdict file.
+pub(crate) const HOST_FAULT_EXIT: i32 = 6;
+
 /// The gate's exit status when a scenario's two base runs disagreed
 /// (scripts/rsi/gate.sh: the first exited 1, the second did not exit 1). It
 /// counts only with the gate's own pair of lines at the end of its stdout
@@ -149,6 +165,110 @@ const DEFAULT_MIN_FREE_MEMORY_MB: u64 = 2048;
 /// How long the test database has to connect, and then to run the parallel
 /// query ([`Room`]).
 const DATABASE_PROBE_LIMIT: Duration = Duration::from_secs(10);
+
+/// The most scenarios a gate runs at once by default, as gate.sh caps its
+/// own default.
+const MAX_DEFAULT_JOBS: usize = 8;
+
+/// The host's cores and how the integrator shares them among its gates
+/// (gate-cpu-room). Each gate gets SPAWN_GATE_JOBS from the integrator
+/// ([`Cpu::jobs_for`]), never its own default: the owner's
+/// SPAWN_GATE_JOBS when set; 1 for a gate on the shared test server
+/// (whose connections every agent's tests share, as gate.sh says); else
+/// the cores less those kept for the workers, divided among the gates that
+/// can run at once, at most 8. A gate starts only when its jobs, the
+/// running gates' jobs and the cores kept for the workers fit within the
+/// cores, or when no gate runs ([`Cpu::fits`]); otherwise it waits for the
+/// next pass, as it waits for a gate slot: no record, no count. (2026-11-08:
+/// with SPAWN_GATE_PG_BIN each gate took half of the 9 cores, two or three
+/// gates and the workers made a load of 18-20, and a gate failed on its
+/// base.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Cpu {
+    /// The host's cores (`available_parallelism`).
+    pub(crate) cores: usize,
+    /// Cores kept for the workers and the host: SPAWN_GATE_WORKER_CORES,
+    /// a whole number from 0 to `cores` - 1, by default a quarter of the
+    /// cores (at least 1).
+    pub(crate) reserved: usize,
+    /// SPAWN_GATE_JOBS as the owner set it: every gate runs that many.
+    pub(crate) jobs: Option<usize>,
+}
+
+impl Cpu {
+    /// The settings as the integrator's environment (`lookup`) sets them,
+    /// for a host of `cores` cores. A setting that does not parse is an
+    /// error: the integrator does not start, as for `--gates`.
+    pub(crate) fn from_env(
+        lookup: impl Fn(&str) -> Option<String>,
+        cores: usize,
+    ) -> Result<Self, String> {
+        let cores = cores.max(1);
+        let set = |name: &str| lookup(name).filter(|value| !value.trim().is_empty());
+        let jobs = match set("SPAWN_GATE_JOBS") {
+            None => None,
+            Some(text) => Some(whole(&text).filter(|jobs| *jobs >= 1).ok_or_else(|| {
+                format!("SPAWN_GATE_JOBS is a whole number from 1, not '{text}'")
+            })?),
+        };
+        let reserved = match set("SPAWN_GATE_WORKER_CORES") {
+            None => (cores / 4).max(1).min(cores - 1),
+            Some(text) => whole(&text).filter(|kept| *kept < cores).ok_or_else(|| {
+                format!(
+                    "SPAWN_GATE_WORKER_CORES is a whole number from 0 to {}, not '{text}'",
+                    cores - 1
+                )
+            })?,
+        };
+        Ok(Self {
+            cores,
+            reserved,
+            jobs,
+        })
+    }
+
+    /// The jobs of a gate when `at_once` gates can run at once; `shared`:
+    /// the gate runs on the shared test server (it gets
+    /// SPAWN_TEST_DATABASE_URL and no server of its own).
+    pub(crate) fn jobs_for(&self, shared: bool, at_once: usize) -> usize {
+        if let Some(jobs) = self.jobs {
+            return jobs;
+        }
+        if shared {
+            return 1;
+        }
+        ((self.cores - self.reserved) / at_once.max(1)).clamp(1, MAX_DEFAULT_JOBS)
+    }
+
+    /// Whether a gate of `jobs` may start beside running gates of
+    /// `running` jobs in all: they and the cores kept for the workers fit
+    /// within the cores, or no gate runs (one gate always may: a host whose
+    /// cores cannot hold even one must still judge).
+    pub(crate) fn fits(&self, running: usize, jobs: usize) -> bool {
+        running == 0 || running + jobs + self.reserved <= self.cores
+    }
+}
+
+/// A whole number as gate.sh reads one: digits only, no sign, no leading
+/// zero (0 itself is a whole number).
+fn whole(text: &str) -> Option<usize> {
+    let text = text.trim();
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if text.len() > 1 && text.starts_with('0') {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// Whether a gate whose environment is `env` runs on the shared test
+/// server: it gets SPAWN_TEST_DATABASE_URL and neither SPAWN_GATE_PG_IMAGE
+/// nor SPAWN_GATE_PG_BIN (gate.sh then defaults to one job).
+pub(crate) fn on_shared_server(env: &[(String, String)]) -> bool {
+    let set = |name: &str| env_value(env, name).is_some_and(|value| !value.is_empty());
+    set("SPAWN_TEST_DATABASE_URL") && !set("SPAWN_GATE_PG_IMAGE") && !set("SPAWN_GATE_PG_BIN")
+}
 
 /// Free KiB of the filesystem holding a path, as this host reports it now.
 fn measured_free_kb(path: &Path) -> Option<u64> {
@@ -588,6 +708,10 @@ pub(crate) struct Verdict {
     pub(crate) reason: String,
     /// The candidate's task metric, from the verdict only.
     pub(crate) metric: Option<String>,
+    /// The checks that failed once and passed again on the candidate (the
+    /// verdict's `flakes`: a flake, not a regression), in the log's order;
+    /// only names of checks (`check-*.sh`) are kept.
+    pub(crate) flakes: Vec<String>,
     /// Everything the gate printed, stderr marked `! `, the verdict last.
     pub(crate) output: String,
 }
@@ -609,6 +733,17 @@ pub(crate) enum GateFailure {
         free_kb: u64,
         min_gb: u64,
         tmpdir: String,
+        log: String,
+    },
+    /// The gate found a scenario failing where the candidate is not to
+    /// blame (exit [`HOST_FAULT_EXIT`] with its fact): `scenario`, where it
+    /// failed (`on`: `base`, or `candidate and base`), its runs' exits as
+    /// the gate says them, and the gate's reason.
+    HostFault {
+        scenario: String,
+        on: String,
+        runs: String,
+        reason: String,
         log: String,
     },
     /// The base disagreed with itself: one of its scenarios exited 1 and then
@@ -730,6 +865,56 @@ pub(crate) fn gate_env(lookup: impl Fn(&str) -> Option<String>) -> Vec<(String, 
                     .is_none_or(|owner| cluster_of(owner) != cluster_of(value))
         })
         .collect()
+}
+
+/// Where the integrator writes its gate environment for the deploy
+/// (`deploy/deploy.sh`, warm_base_cache): set in spawn-integrate's unit to
+/// `%h/.config/spawn/gate-env`. Unset, nothing is written.
+pub(crate) const GATE_ENV_FILE: &str = "SPAWN_GATE_ENV_FILE";
+
+/// Writes `env` (the integrator's [`gate_env`]) to `path` for the deploy's
+/// base-only gate, which must compute the same cache key as the
+/// integrator's gates. The deploy read it from `/proc/<pid>/environ`
+/// before the integrator was made not dumpable; this file is what it reads
+/// now, and it holds the gates' test URL, so: mode 0600 from its creation,
+/// under `~/.config/spawn` (denied to engines), written whole (a file
+/// beside it, renamed over it).
+///
+/// The format is `/proc/<pid>/environ`'s, `NAME=value` records each ended
+/// by a NUL, with a first record `SPAWN_INTEGRATE_PID=<pid>` so the deploy
+/// knows the file is the running integrator's and not a previous one's.
+pub(crate) fn write_gate_env(
+    path: &Path,
+    pid: u32,
+    env: &[(String, String)],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut records = format!("SPAWN_INTEGRATE_PID={pid}\0").into_bytes();
+    for (name, value) in env {
+        records.extend_from_slice(format!("{name}={value}\0").as_bytes());
+    }
+    let staged = path.with_file_name(format!(
+        ".{}.{pid}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("gate-env")
+    ));
+    let _ = std::fs::remove_file(&staged);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&staged)?;
+    let written = file.write_all(&records).and_then(|()| file.sync_all());
+    drop(file);
+    match written.and_then(|()| std::fs::rename(&staged, path)) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&staged);
+            Err(error)
+        }
+    }
 }
 
 /// The decisive pass over [`gate_env`]'s result: SPAWN_TEST_DATABASE_URL
@@ -1037,6 +1222,23 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
             log: record(&run.stdout),
         });
     }
+    if run.status.code() == Some(HOST_FAULT_EXIT)
+        && let Some(GateFailure::HostFault {
+            scenario,
+            on,
+            runs,
+            reason,
+            ..
+        }) = verdict.and_then(host_fault)
+    {
+        return Err(GateFailure::HostFault {
+            scenario,
+            on,
+            runs,
+            reason,
+            log: record(&run.stdout),
+        });
+    }
     if !run.status.success() {
         return Err(aborted(format!("the gate ended with {}", run.status)));
     }
@@ -1067,8 +1269,32 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
         accepted,
         reason: text("reason").unwrap_or_else(|| "gate rejected the candidate".to_string()),
         metric: text("metric"),
+        flakes: flakes(&value),
         output,
     })
+}
+
+/// The verdict's `flakes`: the names of checks (`check-<name>.sh`, no path)
+/// that failed once and passed again; anything else in the list is dropped.
+fn flakes(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("flakes")
+        .and_then(serde_json::Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|name| {
+                    name.strip_prefix("check-")
+                        .and_then(|rest| rest.strip_suffix(".sh"))
+                        .is_some_and(|stem| !stem.is_empty())
+                        && name.len() <= 100
+                        && !name.contains('/')
+                })
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The no-room fact of a verdict file, `(free_kb, min_gb, tmpdir)`: one
@@ -1086,6 +1312,30 @@ fn no_room(file: &str) -> Option<(u64, u64, String)> {
     let min_gb = value.get("min_gb")?.as_u64()?;
     let tmpdir = value.get("tmpdir")?.as_str()?;
     (!tmpdir.is_empty()).then(|| (free_kb, min_gb, tmpdir.to_string()))
+}
+
+/// The host-fault fact of a verdict file: one JSON line with `host_fault`
+/// true, a scenario, where it failed (`base` or `candidate and base`), its
+/// runs and a reason, and no verdict. Its `log` is left empty.
+fn host_fault(file: &str) -> Option<GateFailure> {
+    let line = file.trim();
+    if line.contains('\n') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("host_fault")?.as_bool() != Some(true) || value.get("verdict").is_some() {
+        return None;
+    }
+    let text = |name: &str| value.get(name)?.as_str().map(str::to_string);
+    let scenario = text("scenario").filter(|scenario| !scenario.is_empty())?;
+    let on = text("on").filter(|on| on == "base" || on == "candidate and base")?;
+    Some(GateFailure::HostFault {
+        scenario,
+        on,
+        runs: text("runs").unwrap_or_default(),
+        reason: text("reason").unwrap_or_default(),
+        log: String::new(),
+    })
 }
 
 fn failed(error: &std::io::Error) -> GateFailure {
@@ -1235,14 +1485,237 @@ pub(crate) fn count_scenarios(directory: &Path) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::{
+<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
+        BaseDisagrees, Cpu, GateFailure, PrivateDirectory, gate_env, judge, judge_in, on_shared_server, run_bounded,
+        withhold_owners_cluster, write_gate_env,
+=======
         BaseDisagrees, GateFailure, PrivateDirectory, Run, Scope,
         gate_env, judge, judge_in, memory_limit, run_bounded, withhold_owners_cluster,
+>>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
     };
     use spawn_core::envelope::{Envelope, Limits, Manager, ScopeFacts, Settings};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{Duration, Instant};
 
+<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
+    fn cpu(pairs: &[(&str, &str)], cores: usize) -> Result<Cpu, String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+        Cpu::from_env(
+            |name| {
+                pairs
+                    .iter()
+                    .find(|(known, _)| known == name)
+                    .map(|(_, value)| value.clone())
+            },
+            cores,
+        )
+    }
+
+    /// SPAWN_GATE_JOBS and SPAWN_GATE_WORKER_CORES parse as gate.sh reads a
+    /// whole number (digits, no leading zero); unset or empty is the
+    /// default; anything else refuses to start, naming the variable.
+    #[test]
+    fn the_cpu_settings_parse_like_the_others() {
+        let plain = cpu(&[], 9).expect("defaults");
+        assert_eq!(
+            plain,
+            Cpu {
+                cores: 9,
+                reserved: 2,
+                jobs: None
+            }
+        );
+        assert_eq!(cpu(&[("SPAWN_GATE_JOBS", "")], 9), Ok(plain.clone()));
+        assert_eq!(
+            cpu(&[("SPAWN_GATE_JOBS", " 2 ")], 9).map(|c| c.jobs),
+            Ok(Some(2))
+        );
+        for bad in ["0", "-1", "two", "01", "2.5", "+3"] {
+            let error = cpu(&[("SPAWN_GATE_JOBS", bad)], 9).expect_err(bad);
+            assert!(
+                error.contains("SPAWN_GATE_JOBS is a whole number from 1"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            cpu(&[("SPAWN_GATE_WORKER_CORES", "0")], 9).map(|c| c.reserved),
+            Ok(0)
+        );
+        assert_eq!(
+            cpu(&[("SPAWN_GATE_WORKER_CORES", "8")], 9).map(|c| c.reserved),
+            Ok(8)
+        );
+        for bad in ["9", "12", "x", "-1", "03"] {
+            let error = cpu(&[("SPAWN_GATE_WORKER_CORES", bad)], 9).expect_err(bad);
+            assert!(
+                error.contains("SPAWN_GATE_WORKER_CORES is a whole number from 0 to 8"),
+                "{error}"
+            );
+        }
+        // Small hosts: a quarter of the cores, at least 1, never all of them.
+        assert_eq!(cpu(&[], 2).map(|c| c.reserved), Ok(1));
+        assert_eq!(cpu(&[], 1).map(|c| c.reserved), Ok(0));
+        assert_eq!(cpu(&[], 16).map(|c| c.reserved), Ok(4));
+    }
+
+    /// The room decision at its boundary, on the 9-core host of 2026-11-08
+    /// (2 cores kept for the workers).
+    #[test]
+    fn a_gate_starts_only_within_the_cores() {
+        let host = cpu(&[], 9).expect("defaults");
+        // The default divides the 7 cores among the gates that can run at once.
+        assert_eq!(host.jobs_for(false, 1), 7);
+        assert_eq!(host.jobs_for(false, 2), 3);
+        assert_eq!(host.jobs_for(false, 3), 2);
+        assert_eq!(host.jobs_for(false, 9), 1, "at least one");
+        assert_eq!(
+            cpu(&[], 64).expect("big").jobs_for(false, 1),
+            8,
+            "at most 8"
+        );
+        assert_eq!(host.jobs_for(true, 1), 1, "the shared test server");
+        // Exactly the cores: starts; one more: waits.
+        assert!(host.fits(3, 4), "3 + 4 + 2 = 9");
+        assert!(!host.fits(3, 5), "3 + 5 + 2 = 10");
+        assert!(!host.fits(4, 4), "SPAWN_GATE_JOBS=4: a second gate waits");
+        // The defaults for two gates fit together; a third does not.
+        let two = host.jobs_for(false, 2);
+        assert!(host.fits(two, two));
+        assert!(!host.fits(two + two, two));
+        // No gate running: one always starts, however many jobs.
+        assert!(host.fits(0, 20));
+        // The owner's SPAWN_GATE_JOBS is every gate's.
+        let owner = cpu(&[("SPAWN_GATE_JOBS", "2")], 9).expect("set");
+        assert_eq!(owner.jobs_for(false, 3), 2);
+        assert_eq!(owner.jobs_for(true, 1), 2);
+        assert!(owner.fits(4, 2) && !owner.fits(6, 2));
+    }
+
+    #[test]
+    fn a_gate_is_on_the_shared_server_without_one_of_its_own() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect()
+        };
+        assert!(on_shared_server(&env(&[(
+            "SPAWN_TEST_DATABASE_URL",
+            "postgres://x"
+        )])));
+        assert!(!on_shared_server(&env(&[
+            ("SPAWN_TEST_DATABASE_URL", "postgres://x"),
+            ("SPAWN_GATE_PG_BIN", "/usr/lib/postgresql/16/bin")
+        ])));
+        assert!(!on_shared_server(&env(&[
+            ("SPAWN_TEST_DATABASE_URL", "postgres://x"),
+            ("SPAWN_GATE_PG_IMAGE", "postgres:16-alpine")
+        ])));
+        assert!(!on_shared_server(&env(&[])));
+    }
+
+    /// The file the integrator writes is read by the deploy (through
+    /// deploy/gate-env.sh, which deploy.sh sources) as exactly the
+    /// environment the integrator's gates get: the deploy's base-only gate
+    /// computes the same cache key from it.
+    #[test]
+    fn the_deploy_reads_the_integrators_gate_environment_from_its_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let host = [
+            ("PATH", "/home/o/.cargo/bin:/usr/bin:/bin"),
+            ("HOME", "/home/o"),
+            ("LANG", "C.UTF-8"),
+            ("TMPDIR", "/var/tmp/spawn"),
+            ("CARGO_HOME", "/home/o/.cargo"),
+            ("RUSTUP_HOME", "/home/o/.rustup"),
+            ("SPAWN_GATE_MIN_FREE_GB", "10"),
+            ("SPAWN_GATE_JOBS", ""),
+            ("SPAWN_GATE_PG_BIN", "/usr/lib/postgresql/16/bin"),
+            (
+                "SPAWN_TEST_DATABASE_URL",
+                "postgres://gate:p%40ss@%2Fvar%2Frun%2Fpostgresql:5433/spawn_test",
+            ),
+            (
+                "SPAWN_DATABASE_URL",
+                "postgres://spawn:pw@127.0.0.1:15433/spawn",
+            ),
+            ("SPAWN_SERVE_TOKEN", "never-in-the-file"),
+        ];
+        let env = gate_env(|name| {
+            host.iter()
+                .find(|(known, _)| *known == name)
+                .map(|(_, value)| (*value).to_string())
+        });
+        let directory = PrivateDirectory::create().expect("directory");
+        let file = directory.path().join("gate-env");
+        write_gate_env(&file, 4242, &env).expect("written");
+        let mode = std::fs::metadata(&file)
+            .expect("the file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let bytes = std::fs::read(&file).expect("read");
+        assert!(bytes.starts_with(b"SPAWN_INTEGRATE_PID=4242\0"));
+        let text = String::from_utf8(bytes).expect("utf-8");
+        assert!(!text.contains("never-in-the-file") && !text.contains("15433"));
+        // Written whole: nothing staged is left beside it.
+        let names: Vec<_> = std::fs::read_dir(directory.path())
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["gate-env"]);
+
+        let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/gate-env.sh");
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(
+                r#"set -eu; . "$1"; keep=(); own=""; test_url=""; home=""
+                gate_env_read "$2"
+                printf '%s\0' "${keep[@]}" "own=$own" "test_url=$test_url" "home=$home""#,
+            )
+            .arg("bash")
+            .arg(&helper)
+            .arg(&file)
+            .output()
+            .expect("bash runs");
+        assert!(output.status.success(), "{output:?}");
+        let read: Vec<String> = String::from_utf8(output.stdout)
+            .expect("utf-8")
+            .split_terminator('\0')
+            .map(str::to_string)
+            .collect();
+        let mut expected: Vec<String> = env
+            .iter()
+            .filter(|(name, _)| name != "SPAWN_TEST_DATABASE_URL")
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        expected.push("own=/usr/lib/postgresql/16/bin".to_string());
+        expected.push(format!(
+            "test_url={}",
+            "postgres://gate:p%40ss@%2Fvar%2Frun%2Fpostgresql:5433/spawn_test"
+        ));
+        expected.push("home=/home/o".to_string());
+        assert_eq!(read, expected);
+        // An empty value is not the gate's (gate_env drops it), nor the
+        // deploy's any more.
+        assert!(
+            !read
+                .iter()
+                .any(|assignment| assignment == "SPAWN_GATE_JOBS=")
+        );
+
+        // Written again by the next integrator: replaced whole.
+        write_gate_env(&file, 4343, &env[..1]).expect("rewritten");
+        let bytes = std::fs::read(&file).expect("read");
+        assert_eq!(
+            bytes,
+            format!("SPAWN_INTEGRATE_PID=4343\0{}={}\0", env[0].0, env[0].1).into_bytes()
+        );
+=======
     /// A gate's envelope: 30 MiB high, 32 MiB max, 8 MiB swap.
     fn scope() -> Scope {
         Scope {
@@ -1326,6 +1799,7 @@ mod tests {
             ..ScopeFacts::default()
         };
         assert!(memory_limit(&scope(), &counted, None, &killed).is_some());
+>>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
     }
 
     fn shell(script: &str) -> Command {
@@ -1428,6 +1902,26 @@ mod tests {
 
     fn path_only() -> Vec<(String, String)> {
         vec![("PATH".to_string(), "/usr/bin:/bin".to_string())]
+    }
+
+    /// A verdict names the checks that failed once and passed again
+    /// (`flakes`); only check names are kept, and a verdict without the key
+    /// (every gate before it) has none.
+    #[test]
+    fn a_verdict_names_its_flakes_and_keeps_only_check_names() {
+        let gate = FakeGate::new(
+            "echo '{\"verdict\":\"accepted\",\"flakes\":[\"check-e2e.sh\",\"../x.sh\",\"007.sh\",3,\"check-tests.sh\"]}' >\"$SPAWN_GATE_VERDICT\"\n",
+        );
+        let verdict = gate.judge(&path_only()).expect("verdict");
+        assert_eq!(verdict.flakes, ["check-e2e.sh", "check-tests.sh"]);
+        let gate = FakeGate::new(
+            "echo '{\"verdict\":\"rejected\",\"reason\":\"r\",\"flakes\":[\"check-clippy.sh\"]}' >\"$SPAWN_GATE_VERDICT\"\n",
+        );
+        let verdict = gate.judge(&path_only()).expect("verdict");
+        assert!(!verdict.accepted);
+        assert_eq!(verdict.flakes, ["check-clippy.sh"]);
+        let gate = FakeGate::new("echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n");
+        assert!(gate.judge(&path_only()).expect("verdict").flakes.is_empty());
     }
 
     #[test]
@@ -1857,6 +2351,78 @@ mod tests {
             gate.judge(&path_only()),
             Err(GateFailure::NoRoom { .. })
         ));
+    }
+
+    /// The gate's fact of a host fault (scripts/rsi/gate.sh `host_fault`).
+    const HOST_FAULT_FACT: &str = "{\"host_fault\":true,\"scenario\":\"012.sh\",\"on\":\"base\",\
+         \"runs\":\"1, then 0\",\"reason\":\"012.sh exited 1, then 0 on the base\"}";
+
+    #[test]
+    fn exit_6_with_the_host_fault_fact_is_a_host_fault() {
+        let gate = FakeGate::new(&format!(
+            "echo '| == base: 012.sh'\necho '{HOST_FAULT_FACT}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
+        ));
+        let Err(GateFailure::HostFault {
+            scenario,
+            on,
+            runs,
+            reason,
+            log,
+        }) = gate.judge(&path_only())
+        else {
+            panic!("exit 6 with its fact is a host fault");
+        };
+        assert_eq!(
+            (scenario.as_str(), on.as_str(), runs.as_str()),
+            ("012.sh", "base", "1, then 0")
+        );
+        assert!(reason.contains("on the base"), "{reason}");
+        assert!(
+            log.contains("| == base: 012.sh"),
+            "the gate's output: {log}"
+        );
+        let both = HOST_FAULT_FACT
+            .replace("\"on\":\"base\"", "\"on\":\"candidate and base\"")
+            .replace("012.sh", "check-e2e.sh");
+        let gate = FakeGate::new(&format!("echo '{both}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"));
+        assert!(matches!(
+            gate.judge(&path_only()),
+            Err(GateFailure::HostFault { on, .. }) if on == "candidate and base"
+        ));
+    }
+
+    #[test]
+    fn the_host_fault_fact_counts_only_whole_and_with_exit_6() {
+        // Another status, the fact on stdout only, or a fact that names no
+        // scenario, an unknown place, or a verdict too: an abort, which is
+        // what a gate that dies is.
+        let cases = [
+            format!("echo '{HOST_FAULT_FACT}' >\"$SPAWN_GATE_VERDICT\"\nexit 4\n"),
+            format!("echo '{HOST_FAULT_FACT}' >\"$SPAWN_GATE_VERDICT\"\nexit 0\n"),
+            format!("echo '{HOST_FAULT_FACT}'\nexit 6\n"),
+            "exit 6\n".to_string(),
+            format!(
+                "echo '{}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n",
+                HOST_FAULT_FACT.replace("\"scenario\":\"012.sh\"", "\"scenario\":\"\"")
+            ),
+            format!(
+                "echo '{}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n",
+                HOST_FAULT_FACT.replace("\"on\":\"base\"", "\"on\":\"candidate\"")
+            ),
+            format!(
+                "echo '{}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n",
+                HOST_FAULT_FACT.replace('{', "{\"verdict\":\"accepted\",")
+            ),
+        ];
+        for script in cases {
+            assert!(
+                matches!(
+                    FakeGate::new(&script).judge(&path_only()),
+                    Err(GateFailure::Aborted { .. })
+                ),
+                "{script}"
+            );
+        }
     }
 
     #[test]

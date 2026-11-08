@@ -846,26 +846,16 @@ fn a_granted_principal_inserts_and_reads_only_its_agents() {
 
     // Another login reads only the agents its principal holds a grant for:
     // this database's reader login acts as `spawn_reader`.
-    let reader = common::login(&schema, "spawn_reader");
-    let as_reader = |client: &mut Client| {
-        client
-            .batch_execute(&format!("set session authorization {reader}"))
-            .expect("become the reader");
-    };
-    as_reader(&mut client);
-    assert!(readable(&mut client).is_empty(), "no grant reads nothing");
-    client
-        .batch_execute("reset session authorization")
-        .expect("back to the owner");
+    let mut reader = common::as_login(&schema, "spawn_reader");
+    assert!(readable(&mut reader).is_empty(), "no grant reads nothing");
     client
         .execute(
             "insert into spawn_grants (principal, agent_id) values ('spawn_reader', 'agent_one')",
             &[],
         )
         .expect("grant");
-    as_reader(&mut client);
-    assert_eq!(readable(&mut client), vec!["session_one"]);
-    let timeline: i64 = client
+    assert_eq!(readable(&mut reader), vec!["session_one"]);
+    let timeline: i64 = reader
         .query_one(
             "select count(*) from spawn_read_timeline('session_two')",
             &[],
@@ -873,9 +863,7 @@ fn a_granted_principal_inserts_and_reads_only_its_agents() {
         .expect("spawn_read_timeline answers")
         .get(0);
     assert_eq!(timeline, 0, "an ungranted agent's session reads empty");
-    client
-        .batch_execute("reset session authorization")
-        .expect("back to the owner");
+    drop(reader);
     client
         .execute(
             "insert into spawn_grants (principal, agent_id) values (session_user, 'agent_one')",
@@ -1228,19 +1216,21 @@ fn views_are_closed_to_other_roles() {
     // is this run's alone (the pid alone is the same in every gate's PID
     // namespace, and two gates on one server would share the role).
     let role = format!("{schema}_reader");
+    let password = common::password();
     client
         .batch_execute(&format!(
-            "drop role if exists {role}; create role {role}; \
-             grant usage on schema {schema} to {role}; set role {role}"
+            "drop role if exists {role}; create role {role} login password '{password}'; \
+             grant usage on schema {schema} to {role}"
         ))
-        .expect("become a plain role");
+        .expect("a plain role");
+    let mut plain = common::connect_as(&schema, &role, &password);
     for view in [
         "agent_state",
         "agent_status",
         "agent_timeline",
         "agent_tasks",
     ] {
-        let error = client
+        let error = plain
             .query(&format!("select * from {view}"), &[])
             .expect_err("a plain role cannot read a view");
         assert_eq!(
@@ -1249,13 +1239,14 @@ fn views_are_closed_to_other_roles() {
             "{view}"
         );
     }
-    let rows = client
+    let rows = plain
         .query("select * from spawn_read_status()", &[])
         .expect("the read function answers");
     assert!(rows.is_empty(), "no grant reads nothing");
+    drop(plain);
     client
         .batch_execute(&format!(
-            "reset role; drop owned by {role}; drop role {role}"
+            "revoke usage on schema {schema} from {role}; drop role {role}"
         ))
         .expect("clean up the role");
 }
@@ -1271,12 +1262,15 @@ fn a_login_without_grants_reads_no_command_ids() {
         .expect("a command");
     let mut client = admin(&schema);
     let role = common::schema_name("plain").replace("spawn_test_", "spawn_plain_");
+    let password = common::password();
     client
         .batch_execute(&format!(
-            "create role {role}; grant usage on schema {schema} to {role}; \
-             set session authorization {role}"
+            "create role {role} login password '{password}'; \
+             grant usage on schema {schema} to {role}"
         ))
-        .expect("become a login with no grants");
+        .expect("a login with no grants");
+    let mut owner = client;
+    let mut client = common::connect_as(&schema, &role, &password);
     for query in [
         "select id from agent_commands",
         "select count(*) from agent_commands",
@@ -1304,9 +1298,10 @@ fn a_login_without_grants_reads_no_command_ids() {
         error.code(),
         Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
     );
-    client
+    drop(client);
+    owner
         .batch_execute(&format!(
-            "reset session authorization; drop owned by {role}; drop role {role}"
+            "revoke usage on schema {schema} from {role}; drop role {role}"
         ))
         .expect("clean up the role");
 }
@@ -2475,7 +2470,11 @@ impl Drop for Databases {
             let _ = drop_logins(&mut maintenance, name, "");
         }
         for role in &self.roles {
-            let _ = maintenance.batch_execute(&format!("drop owned by {role}; drop role {role}"));
+            // Apart: a login that is not a superuser may not `drop owned`
+            // of a role it only administers; what the role held went with
+            // the databases above.
+            let _ = maintenance.batch_execute(&format!("drop owned by {role}"));
+            let _ = maintenance.batch_execute(&format!("drop role if exists {role}"));
         }
     }
 }
@@ -2536,12 +2535,14 @@ fn a_sweep_drops_only_the_logins_of_gone_databases_under_its_prefix() {
             .batch_execute(&format!("drop database {name} with (force)"))
             .expect("drop a database, not its logins");
     }
-    // A login-shaped role of no database that still holds a privilege.
+    // A login-shaped role of no database that still holds a privilege: on
+    // a database this test made (a login that is not a superuser grants
+    // nothing on `postgres`, which it does not own).
     let holding = format!("spawn_reader_{prefix}holding");
     databases.roles.push(holding.clone());
     maintenance
         .batch_execute(&format!(
-            "create role {holding} nologin; grant connect on database postgres to {holding}"
+            "create role {holding} nologin; grant connect on database {kept} to {holding}"
         ))
         .expect("a role that holds a privilege");
     let logins = |client: &mut Client, pattern: &str| -> Vec<String> {
