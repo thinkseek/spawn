@@ -189,9 +189,7 @@ fn same_envelope(recorded: Option<&Value>, record: &Value) -> bool {
         "gate_memory_max",
         "gate_memory_swap_max",
     ];
-    fields
-        .iter()
-        .all(|field| recorded.get(*field) == record.get(*field))
+    fields.iter().all(|field| recorded.get(*field) == record.get(*field))
         && recorded["state"] == record["state"]
 }
 
@@ -367,8 +365,8 @@ mod tests {
         let off = Runtime::with(environment(&[("SPAWN_ENVELOPE", "off")]), manager).expect("off");
         assert!(matches!(off.state, State::Off));
         assert!(off.envelope().is_none());
-        let unavailable =
-            Runtime::with(environment(&[]), || Err("no bus".to_string())).expect("unavailable");
+        let unavailable = Runtime::with(environment(&[]), || Err("no bus".to_string()))
+            .expect("unavailable");
         assert!(matches!(unavailable.state, State::Unavailable(_)));
         assert!(unavailable.envelope().is_none());
         assert_eq!(unavailable.record_value()["state"], "unavailable");
@@ -393,15 +391,13 @@ mod tests {
                             "cpu_weight": 50, "event_id": 3, "at_ms": 10});
         assert!(!same_envelope(None, &record));
         assert!(same_envelope(Some(&record.clone()), &record));
-        assert!(!same_envelope(
-            Some(&record),
-            &json!({"state": "systemd",
-                                                     "slice": "spawn.slice"})
-        ));
+        assert!(!same_envelope(Some(&record), &json!({"state": "systemd",
+                                                     "slice": "spawn.slice"})));
         let changed = json!({"type": "host.envelope", "state": "systemd", "slice": "spawn.slice",
                              "memory_high": 17_179_869_184_u64, "memory_max": 21_474_836_480_u64,
                              "cpu_weight": 30});
         assert!(!same_envelope(Some(&record), &changed));
         let _ = Settings::from_lookup(environment(&[])).expect("settings");
     }
+
 }

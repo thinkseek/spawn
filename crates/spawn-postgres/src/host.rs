@@ -138,10 +138,7 @@ impl spawn_core::port::HostRecords for PostgresStore {
             .query_one("select spawn_host_record($1)", &[record])?
             .get(0);
         let at_ms: i64 = self
-            .query_one(
-                "select recorded_at_ms from spawn_events where id = $1",
-                &[&id],
-            )?
+            .query_one("select recorded_at_ms from spawn_events where id = $1", &[&id])?
             .get(0);
         Ok(spawn_core::port::Recorded { id, at_ms })
     }
@@ -160,7 +157,9 @@ impl spawn_core::port::HostRecords for PostgresStore {
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
         {
-            return Err(StoreError::Rejected(format!("not a record field: {field}")));
+            return Err(StoreError::Rejected(format!(
+                "not a record field: {field}"
+            )));
         }
         let sql = format!(
             "select min(e.recorded_at_ms) from spawn_events e \

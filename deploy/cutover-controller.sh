@@ -124,11 +124,7 @@ controller() {
         say "$modules was installed from $commit's web/pnpm-lock.yaml"
       fi
     fi
-    local what="build $controllers/$name-$commit (git archive of $commit from $git_dir${modules:+, web/node_modules reflinked from $modules})"
-    if git --git-dir="$git_dir" cat-file -e "$commit:pnpm-lock.yaml" 2>/dev/null; then
-      what="$what, with its deps tree installed from that pnpm-lock.yaml if missing"
-    fi
-    would "$what and point $controllers/$name at it"
+    would "build $controllers/$name-$commit (git archive of $commit from $git_dir${modules:+, web/node_modules reflinked from $modules}) and point $controllers/$name at it"
   else
     bash "$ctl" update "$name" "$git_dir" "$commit" ${modules:+"$modules"} >/dev/null
   fi
