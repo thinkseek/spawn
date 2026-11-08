@@ -130,22 +130,10 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
                 Ok(more) => lines.extend(more),
                 Err(error) => fail(what, &error),
             };
-            // The disk watch never fails a pass: a fleet must not stop
-            // because it cannot record a warning.
-            step(
-                "disk",
-                Ok(disk
-                    .check(open)
-                    .unwrap_or_else(|error| vec![format!("disk: {error}")])),
-            );
-            // The alerts never fail a pass either: an error is said and
-            // tried again at the next check.
-            step(
-                "alerts",
-                Ok(alerting
-                    .check(open)
-                    .unwrap_or_else(|error| vec![format!("alerts: {error}")])),
-            );
+            // The disk watch and the alerts never fail a pass: a fleet must
+            // not stop because it cannot record a warning.
+            step("disk", watched("disk", disk.check(open)));
+            step("alerts", watched("alerts", alerting.check(open)));
             if dispatching {
                 step(
                     "dispatch",
