@@ -682,6 +682,9 @@ pub(crate) struct Sent {
     pub(crate) finished_at_ms: Option<i64>,
     #[serde(default)]
     pub(crate) succeeded: Option<bool>,
+    /// Why a failed one failed, as the Bridge ended it.
+    #[serde(default)]
+    pub(crate) error: Option<String>,
 }
 
 /// One session's facts (`spawn_postgres::RECOVERY_FACTS`).
