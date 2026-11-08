@@ -39,13 +39,37 @@
 #   a flake, said in the log, and the gate goes on ("Checks run twice"
 #   below).
 #
+# A scenario that cannot be judged here. Some objectives judge the host
+# itself (029: every execution and gate in a systemd user scope with memory
+# and CPU limits), and the gate's sandbox has no systemd user manager and no
+# delegated cgroup (the owner's ruling, 2026-11-06). Such a scenario exits 6
+# and says why (029's "cannot be judged here: ..."). Exit 6 from the
+# scenario is not the harness error above: it says the host cannot judge that
+# scenario at all, the same on every run, and the gate reads it as a fact
+# about the host, never as a result:
+# - on the base, the result is `cannot_judge`, recorded in the base cache
+#   like solved and unsolved (one run: the host says the same every time); a
+#   gate on a tree for another objective is therefore not stopped by it
+#   (029 is a regression in every Spawn gate's set);
+# - on the candidate, a regression whose scenario exits 6 is skipped
+#   ("| <name> cannot be judged here: not a regression"), and a *task*
+#   scenario that exits 6 makes the gate write {"cannot_judge":true,
+#   "scenario":"<name>"} to SPAWN_GATE_VERDICT and exit 6: no verdict. The
+#   integrator records `host_fault` with the evidence `cannot_judge` (beside
+#   the gate's own `host_fault` fact), retried after the backoff and counted
+#   toward no halt: nothing is rejected or aborted. Which objectives the
+#   gate cannot judge: deploy/systemd/README.md "Which objectives the gate
+#   cannot judge" lists them, 029 and why.
+#
 # Exit-code contract for objective scenarios and the task scenario: 0 =
-# pass, 1 = an assertion failed, anything else = a harness error (a missing
-# tool, an unreachable database, a timeout kill). Each is judged on the base
-# BEFORE any candidate code runs, since both share the test server and a
-# candidate could otherwise sabotage the base's run: 0 = solved, 1 (twice,
-# from two runs that agree) = unsolved, anything else is a host fault (exit
-# 6 with its fact in the verdict file, no verdict: the integrator records
+# pass, 1 = an assertion failed, 6 = the host cannot judge it here (below: "A
+# scenario that cannot be judged here"), anything else = a harness error (a
+# missing tool, an unreachable database, a timeout kill). Each is judged on
+# the base BEFORE any candidate code runs, since both share the test server
+# and a candidate could otherwise sabotage the base's run: 0 = solved, 1
+# (twice, from two runs that agree) = unsolved, 6 = cannot_judge (cached: the
+# host's answer does not change), anything else is a host fault (exit 6 with
+# its fact in the verdict file, no verdict: the integrator records
 # `host_fault`, retried after a backoff and counted toward no halt, never a
 # skip). The one other shape is objective 033's: a first run that exits 1
 # and a second that exits 0 (a base that disagrees with itself) keeps the
@@ -340,6 +364,26 @@ host_fault() {
     stage_emit gate host_fault "$(($(stage_now) - gate_started))" total
     json="{\"host_fault\":true,\"scenario\":\"$(json_string "$1")\",\"on\":\"$2\""
     json="$json,\"runs\":\"$(json_string "$3")\",\"reason\":\"$(json_string "$4")\""
+    json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
+    if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
+        printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
+    fi
+    echo "$json"
+    exit 6
+}
+
+# cannot_judge <scenario> <runs>: the scenario says this host cannot judge it
+# here (029: no systemd user manager in the sandbox), so the gate states that
+# as the fact and exits 6, no verdict: `{"cannot_judge":true,"scenario",
+# "runs","base","candidate"}`. Exit 6 is the host-fault exit too; the fact's
+# key says which one this is (gate.rs `cannot_judge`, `host_fault`), and the
+# integrator records the evidence `cannot_judge` for it.
+cannot_judge() {
+    stage_close cannot_judge
+    gate_times
+    stage_emit gate cannot_judge "$(($(stage_now) - gate_started))" total
+    json="{\"cannot_judge\":true,\"scenario\":\"$(json_string "$1")\""
+    json="$json,\"runs\":\"$(json_string "$2")\""
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
@@ -1608,14 +1652,15 @@ toolchain() {
         "$(sed -n 's/^\(psql\) (PostgreSQL) \([^ ]*\).*/\1 \2/p' "$work/toolchain" | head -n 1)" \
         "server $(sed -n 's/^\([0-9]\{5,6\}\)$/\1/p' "$work/toolchain" | head -n 1 | grep . || echo none)"
 }
-# entry_result <entry>: solved or unsolved, as the entry holds it; nothing
-# for an entry that is missing, unreadable, or holds anything else.
+# entry_result <entry>: solved, unsolved or cannot_judge (see "A scenario
+# that cannot be judged here"), as the entry holds it; nothing for an entry
+# that is missing, unreadable, or holds anything else.
 entry_result() {
     entry_held=""
     if [ -e "$1" ] || [ -L "$1" ]; then
         entry_held=$(cat -- "$1" 2>/dev/null) || entry_held=""
     fi
-    case "$entry_held" in solved | unsolved) printf '%s' "$entry_held" ;; esac
+    case "$entry_held" in solved | unsolved | cannot_judge) printf '%s' "$entry_held" ;; esac
 }
 # base_job <job>: the base's result for one objective, in the background,
 # under its key's lock (above); <job>/entry is its cache entry. A completed
@@ -1656,6 +1701,14 @@ base_job() {
         job_output 2
         [ "$again" -eq 1 ] && result=unsolved
         first="1, then $again"
+        ;;
+    6)
+        # The scenario says the host cannot judge it here (see "A scenario
+        # that cannot be judged here"): a fact about the host, the same on
+        # every run, so it is not run again. It is not unsolved either: the
+        # candidate's own run of it is not a regression (below).
+        job_stage "$(($(stage_now) - run_at))" "cannot judge" "$run_name"
+        result=cannot_judge
         ;;
     esac
     if [ -z "$result" ]; then
@@ -1699,7 +1752,7 @@ base_printed() {
         from_cache="$from_cache $printed_name"
         result=$3
         ;;
-    solved | unsolved)
+    solved | unsolved | cannot_judge)
         run_on_base="$run_on_base $printed_name"
         result=$2
         ;;
@@ -1994,6 +2047,8 @@ base_ready() {
 # a regression's (an objective the base did not leave unsolved).
 decisive() {
     [ "$(cat "$1/result")" != 0 ] || return 1
+    # A scenario the host cannot judge is no verdict either way (below).
+    [ "$(cat "$1/result")" != 6 ] || return 1
     [ -e "$1/task" ] || [ "$(cat "$1/result")" = error ] ||
         [ "$(base_result "$(cat "$1/scenario")")" != unsolved ]
 }
@@ -2015,6 +2070,20 @@ candidate_printed() {
         phase_time candidate
         echo "gate: the gate could not run $(basename "$printed_scenario") on the candidate" >&2
         exit 3
+    fi
+    if [ "$printed_status" = 6 ]; then
+        # The scenario says the host cannot judge it (see "A scenario that
+        # cannot be judged here"): not a rejection, whatever it is. A
+        # regression is skipped; the task itself cannot be judged, so the
+        # gate answers the fact, not a verdict.
+        if [ -e "$1/task" ]; then
+            phase_time candidate
+            run_stage "cannot_judge|$printed_name" "$printed_ms"
+            cannot_judge "$(basename "$printed_scenario")" "$printed_status"
+        fi
+        echo "| $(basename "$printed_scenario") cannot be judged here: not a regression"
+        run_stage "skipped|$printed_name" "$printed_ms"
+        return 0
     fi
     if [ "$printed_status" = abort ]; then
         run_stage "host_fault|$(cat "$1/last")" "$printed_ms"

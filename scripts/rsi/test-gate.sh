@@ -1157,6 +1157,42 @@ refuse "and no host-fault fact is written" "$(cat "$integrator/verdict" 2>/dev/n
 expect "the base's disagreement is said as 033 says it" "$(cat "$work/gate.out")" \
     '012.sh exited 1, then 0 on the base: a harness error, not a verdict; the gate aborts'
 expect "the flake is named" "$(cat "$work/gate.out")" 'exited 1, then 0 on the base'
+
+# A scenario the host cannot judge here says so with exit 6 (029: no systemd
+# user manager in the sandbox) and its own fact: a fact about the host, never
+# a verdict (the host-fault fact's exit, the other key). On the base it is
+# cached as `cannot_judge`, one run (the host's answer does not change); on
+# the candidate a regression is skipped, and the task scenario makes the gate
+# state the fact (exit 6, no verdict) rather than reject.
+unjudgeable=$work/unjudgeable
+mkdir -p "$unjudgeable"
+printf 'judge/\n' >"$unjudgeable/protected"
+cat >"$unjudgeable/010.sh" <<'JUDGE'
+#!/bin/sh
+echo "010: cannot be judged here: no systemd user manager is reachable" >&2
+exit 6
+JUDGE
+expect "a regression that cannot be judged here is skipped" \
+    "$(judge "$good" "" "$unjudgeable")" 'exit=0 {"verdict":"accepted"}'
+expect "and says so, not a regression" "$(cat "$work/gate.out")" \
+    '| 010.sh cannot be judged here: not a regression'
+expect "the base records the fact" "$(cat "$work/gate.out")" '| == base: 010.sh: cannot_judge'
+judge "$good" "" "$unjudgeable" >/dev/null
+expect "the fact is cached: one run on the base" "$(from_cache)" '010.sh'
+expect "and kept as cannot_judge" "$(grep -l '^cannot_judge$' "$cache"/* | wc -l)" '1'
+unjudged_task=$work/unjudged-task
+mkdir -p "$unjudged_task"
+printf 'judge/\n' >"$unjudged_task/protected"
+cat >"$unjudged_task/012.sh" <<'JUDGE'
+#!/bin/sh
+echo "012: cannot be judged here: no systemd user manager is reachable" >&2
+exit 6
+JUDGE
+expect "a task scenario that cannot be judged here is no verdict" \
+    "$(judge "$good" "$unjudged_task/012.sh" "$unjudged_task")" 'exit=6 '
+expect "the gate states the fact" "$(cat "$integrator/verdict")" \
+    '{"cannot_judge":true,"scenario":"012.sh","runs":"6"'
+refuse "never a verdict" "$(cat "$integrator/verdict")" 'verdict'
 unset SPAWN_TEST_DATABASE_URL
 
 # 10. The URL parser the gate and the checks share (scripts/pg-url.sh):

@@ -225,3 +225,24 @@ installs these units, reconfigures missions 4 and 6 to the controller paths
 runs. Deploy this change first (so the integrator pins the controller and
 reads tasks' scenarios from the mission's directory), then run the cutover;
 it is safe to run again.
+
+## Which objectives the gate cannot judge
+
+The gate's sandbox is not the host: it has no systemd user manager and no
+delegated cgroup (the owner's ruling, 2026-11-06), so an objective whose
+scenario judges the host's resource envelopes cannot run in it. Such a
+scenario exits 6, the gate's host-fault exit, with its own `cannot_judge`
+fact (`rsi/scenarios/029.sh`'s `cannot_judge()`). On the base the gate
+caches the result `cannot_judge`, so the scenario stops no other landing;
+on the candidate it is skipped as a regression, and an objective-29 task is
+never rejected or aborted for it: the integrator records a `host_fault`
+with the evidence `cannot_judge`, retried after the backoff and counted
+toward no halt. The owner judges that objective outside the gate (mission
+7).
+
+| Objective | Scenario | Why the gate cannot judge it |
+| --- | --- | --- |
+| 029 | `rsi/scenarios/029.sh` | every execution and gate runs in a systemd user scope with memory and CPU limits; the sandbox has no user manager to make one |
+
+A new objective of this kind says so in its scenario's header and adds a row
+here.

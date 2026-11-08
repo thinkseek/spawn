@@ -166,7 +166,16 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                 line.as_str().map(|line| one_line(line, 300))
             });
             let fact = &record["fact"];
-            let evidence = if record["evidence"] == "gate" {
+            let evidence = if record["evidence"] == "cannot_judge" {
+                // The host cannot judge the objective at all (029: no
+                // systemd user manager in the sandbox): not a transient
+                // fault of the test database or the load.
+                let scenario = record["scenario"].as_str().unwrap_or("its scenario");
+                format!(
+                    "this host cannot judge the objective here ({scenario} needs what the \
+                     gate's sandbox has none of, a systemd user manager)"
+                )
+            } else if record["evidence"] == "gate" {
                 let scenario = fact["scenario"].as_str().unwrap_or("a scenario");
                 let runs = one_line(fact["runs"].as_str().unwrap_or_default(), 200);
                 if fact["on"] == "base" {
@@ -200,7 +209,10 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                 || "after its backoff".to_string(),
                 |due| format!("at {}", crate::scorecard::time::format_rfc3339(due)),
             );
-            let check = if record["evidence"] == "gate" {
+            let check = if record["evidence"] == "cannot_judge" {
+                "The objective is judged outside the gate, by the owner (mission 7): judge it \
+                 there, or tell the owner."
+            } else if record["evidence"] == "gate" {
                 "Check the host's load and that scenario's harness (its log in the gate output), \
                  or tell the owner."
             } else {
