@@ -203,6 +203,17 @@ impl Step {
         self.mark = Some(watermark);
         self.due = due;
     }
+
+    /// The watermark this step last acted on (`None`: never).
+    fn mark(&self) -> Option<i64> {
+        self.mark
+    }
+
+    /// Whether the step's own clock has reached its due time, whatever the
+    /// log says: an open wait's probe, or a retry a record named.
+    fn clock_due(&self, now_ms: i64) -> bool {
+        self.due.is_some_and(|due| due <= now_ms)
+    }
 }
 
 /// The steps of one loop, each with what decides whether a pass runs it.
@@ -603,7 +614,22 @@ impl Fleet<'_> {
         // takes the one way back that cause has. The dispatcher's
         // one-resume rule and the liveness rule's revival give way to what
         // it has recorded (docs/fleet-architecture.md §3.1).
+        // The recovery reads a few kinds of record, not every event: a pass
+        // whose watermark moved on a screen or a delivery asks once, cheaply,
+        // and skips every session's facts when none of them is here. A wait
+        // that is open and an outage that just ended force it regardless.
+        let recovery_signals = self.schedule.recovery.clock_due(now)
+            || match open.recovery_signals(self.schedule.recovery.mark().unwrap_or(0)) {
+                Ok(signals) => signals,
+                Err(error) => {
+                    Fleet::fail(errors, "recover", &error.to_string());
+                    false
+                }
+            };
         if self.schedule.recovery.runs(watermark, now) {
+            if !recovery_signals {
+                self.schedule.recovery.ran(watermark, None);
+            } else {
             match crate::deliver::Work::load(open) {
                 Ok(work) => {
                     let world = crate::recover::World {
@@ -619,17 +645,23 @@ impl Fleet<'_> {
                     match crate::recover::step(&mut self.recovery, &world) {
                         Ok(more) => {
                             lines.extend(more);
-                            // An open wait is re-read every probe: the
+                            // An open wait is re-read every probe (the
                             // credentials file, the free space, a retry's
-                            // due time ([`crate::recover::Config::probe`]).
-                            self.schedule
+                            // due time: [`crate::recover::Config::probe`]);
+                            // with none, the step runs again when the log
+                            // moves, never before — an idle pass then costs
+                            // the watermark read alone.
+                            let due = self
                                 .recovery
-                                .ran(watermark, Some(now.saturating_add(self.config.probe)));
+                                .probing()
+                                .then(|| now.saturating_add(self.config.probe));
+                            self.schedule.recovery.ran(watermark, due);
                         }
                         Err(error) => Fleet::fail(errors, "recover", &error),
                     }
                 }
                 Err(error) => Fleet::fail(errors, "recover", &error),
+            }
             }
         }
         if self.dispatching && self.schedule.dispatch.runs(watermark, now) {
