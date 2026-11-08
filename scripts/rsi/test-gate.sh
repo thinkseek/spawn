@@ -1718,7 +1718,16 @@ EOF
             judge "${2:-$good}" "" "$1"
         )
     }
-    left() { ps -eo args | grep -F "$pgtmp/" | grep -v grep || true; }
+    # What names this case's $pgtmp other than as a mask: another suite's
+    # sandbox on this host masks the socket directory under $pgtmp
+    # (`--tmpfs <dir>`, or `--ro-bind /dev/null <socket>`: gate.sh's socket
+    # masks) and is no server of ours, so those two forms are dropped
+    # before the match. A server cannot outlive the bwrap that names it
+    # (gate-pg.sh: --unshare-all --die-with-parent, its own pid namespace).
+    left() {
+        ps -eo args | sed -e 's| --tmpfs [^ ]*||g' -e 's| --ro-bind /dev/null [^ ]*||g' |
+            grep -F "$pgtmp/" | grep -v grep || true
+    }
     expect "$kind: a gate on a server of its own" "$(with_pg "$own")" 'exit=0 {"verdict":"accepted"}'
     expect "$kind: says so, and how big" "$(cat "$work/gate.out")" "| test database: a server of the gate's own, $pg_source ("
     expect "$kind: with room for its scenarios" "$(cat "$work/gate.out")" 'max_connections 300; scenarios at once: 4'
