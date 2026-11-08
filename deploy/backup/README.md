@@ -135,6 +135,14 @@ that each `git bundle` verifies on its own, that the archive decrypts back
 to the same SHA-256 (the archive, not the tar: compression is before
 encryption), and that the upload's ETag is the MD5 sent.
 
+A source's bundle holds its branches and tags, exactly the refs the record
+names (`refs/heads/*` and `refs/tags/*`, in each repo's `heads`), and nothing
+else: not a remote-tracking ref a mirror clone left (the live
+`missions/supply-pa.git` carries `refs/remotes/github/main`), not a pending
+`refs/spawn-owner/*` push. Those are not the mission's history, and a record
+that named neither could not be a true description of an archive that held
+them — the drill refuses any ref the manifest does not name (below).
+
 `spawn backup verify` is the drill (below): the newest good dump restores to
 its record, and the newest bundle is opened and compared with its own. Exit
 0 both pass; 1 either does not (missing, corrupt, a sha256 or a count that
