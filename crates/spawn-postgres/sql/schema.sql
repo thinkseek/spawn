@@ -391,6 +391,14 @@ create index if not exists spawn_commands_open
 create index if not exists spawn_commands_session
     on spawn_commands (session_id, id);
 
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+-- Commands that finished failed, since a time: the alert step's notice of a
+-- failed command, found without reading the queue (docs/fleet-architecture.md
+-- §3.4).
+create index if not exists spawn_commands_failed
+    on spawn_commands (finished_at_ms)
+    where succeeded = false;
+=======
 -- A session's commands by who sent them: the dispatcher's facts read one
 -- session's dispatcher commands (what it already sent, its deliveries and
 -- nudges, the tags the supervisor was told) on every pass, and these two
@@ -400,6 +408,7 @@ create index if not exists spawn_commands_session
 -- test's first shapes included).
 create index if not exists spawn_commands_by_session
     on spawn_commands (session_id, principal, id);
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 
 -- A grant either lets a principal read an agent's views (`read`) or also
 -- submit commands for it (`all`). `agent_id` is an id, `*`, or a prefix
@@ -1285,7 +1294,15 @@ create table if not exists mission_tasks (
     -- delivery spent without typing is cancelled and assigned again once,
     -- by the dispatcher (`spawn_task_reissue`); a re-issue is never
     -- re-issued again.
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+    reissue_of      bigint,
+    -- The task this one continues (its `task.assigned` names it): the
+    -- objective's task after one that went over its budget keeps that
+    -- task's work (`task.over_budget`, docs/fleet-architecture.md §10.4).
+    continues       bigint
+=======
     reissue_of      bigint
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 );
 
 -- Columns added since the first shape of these tables (see spawn_grants).
@@ -1318,6 +1335,10 @@ alter table mission_tasks add column if not exists model text not null default '
     check (model in ('default', 'cheap'));
 alter table mission_tasks add column if not exists held_by bigint;
 alter table mission_tasks add column if not exists reissue_of bigint;
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+alter table mission_tasks add column if not exists continues bigint;
+=======
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
@@ -1354,6 +1375,30 @@ create table if not exists mission_source_holds (
     held_at_ms bigint not null,
     expires_ms bigint not null
 );
+
+-- What went wrong, in the record (docs/fleet-architecture.md, "Alerts";
+-- docs/storage.md, "Alerts"). One row per occurrence, keyed by the key its
+-- `alert.fired` and `alert.cleared` records share: an alert fires once and
+-- clears at most once, across loop restarts and two loops at once. A notice
+-- is a `fired` that never clears. The loop writes the records
+-- (`spawn_alert_record`, owner only); the table is their fold, so a
+-- restarted loop reads its alerts back and fires nothing twice.
+create table if not exists spawn_alerts (
+    key              text    primary key,
+    kind             text    not null,
+    subject          text    not null,
+    state            text    not null,
+    notice           boolean not null default false,
+    text             text,
+    evidence         jsonb   not null default '{}'::jsonb,
+    fired_event_id   bigint  not null,
+    fired_at_ms      bigint  not null,
+    cleared_event_id bigint,
+    cleared_at_ms    bigint,
+    cleared_evidence jsonb
+);
+
+create index if not exists spawn_alerts_time on spawn_alerts (fired_at_ms);
 
 
 -- Who may call the mission functions: the owner (humans' CLI, the
@@ -1444,12 +1489,21 @@ begin
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
                                    created_by, objective, scenario, model, reissue_of,
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+                                   continues, created_at_ms, updated_at_ms)
+=======
                                    created_at_ms, updated_at_ms)
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         values (v_id, (p_record ->> 'mission_id')::bigint, p_record ->> 'kind',
                 p_record ->> 'agent_id', p_record ->> 'session_id', p_record ->> 'brief',
                 p_record ->> 'created_by', (p_record ->> 'objective')::integer,
                 p_record ->> 'scenario', coalesce(p_record ->> 'model', 'default'),
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+                (p_record ->> 'reissue_of')::bigint, (p_record ->> 'continues')::bigint,
+                p_at, p_at);
+=======
                 (p_record ->> 'reissue_of')::bigint, p_at, p_at);
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         update mission_missions set state = 'active', updated_at_ms = p_at
          where id = (p_record ->> 'mission_id')::bigint and state = 'open';
     when 'mission.configured' then
@@ -1638,6 +1692,21 @@ begin
                                     gate_room_last_ms = null, gate_room_waits = 0,
                                     gate_room_escalated = false, updated_at_ms = p_at
          where gate_room_task = v_id;
+    when 'task.over_budget' then
+        -- Over budget: the task is bigger than its budget, not a failed
+        -- gate. Its work is kept on its branch and its objective's next
+        -- task continues it (`task.assigned` naming `continues`), so the
+        -- task leaves flight and counts toward no halt: the mission's
+        -- gate_aborts and gate_rejections stay as they were
+        -- (docs/fleet-architecture.md §10.4).
+        update mission_tasks set state = 'cancelled', review_note = p_record ->> 'reason',
+                                 updated_at_ms = p_at
+         where id = v_id;
+        -- A task that leaves the gate ends its run of `no_room`.
+        update mission_missions set gate_room_task = null, gate_room_since_ms = null,
+                                    gate_room_last_ms = null, gate_room_waits = 0,
+                                    gate_room_escalated = false, updated_at_ms = p_at
+         where gate_room_task = v_id;
     when 'task.reported' then
         update mission_tasks set state = 'reported', report = p_record ->> 'report',
                                  updated_at_ms = p_at
@@ -1687,6 +1756,39 @@ begin
         -- A fact about this host's free disk (spawn loop, crate disk.rs):
         -- read from the log, folded into no table.
         null;
+    when 'alert.fired' then
+        -- An alert's one occurrence (spawn loop, crate alerts.rs): one row
+        -- per key, and a second `fired` for it is refused (also by
+        -- `spawn_alert_record`, the writer). A notice never clears.
+        if exists (select 1 from spawn_alerts where key = p_record ->> 'key') then
+            raise exception 'alert % was already fired', p_record ->> 'key';
+        end if;
+        insert into spawn_alerts (key, kind, subject, state, notice, text, evidence,
+                                  fired_event_id, fired_at_ms)
+        values (p_record ->> 'key', p_record ->> 'kind', p_record ->> 'subject',
+                case when coalesce((p_record ->> 'notice')::boolean, false)
+                     then 'notice' else 'open' end,
+                coalesce((p_record ->> 'notice')::boolean, false),
+                p_record ->> 'text', coalesce(p_record -> 'evidence', '{}'::jsonb),
+                p_event, p_at);
+    when 'backup.dumped', 'backup.bundled', 'backup.verified' then
+        -- What `spawn backup` did (crate backup.rs): read from the log by the
+        -- next run, folded into no table. What a copy holds is in its record
+        -- (its events, watermark and sha256), so the drill compares a
+        -- restore with the record and not with the live database
+        -- (docs/storage.md, "Where state lives").
+        null;
+    when 'alert.cleared' then
+        -- What cleared an alert, once: the row must be open (a notice never
+        -- clears, and a cleared alert is cleared at most once).
+        if not exists (select 1 from spawn_alerts
+                        where key = p_record ->> 'key' and state = 'open') then
+            raise exception 'alert % is not open: nothing to clear', p_record ->> 'key';
+        end if;
+        update spawn_alerts
+           set state = 'cleared', cleared_event_id = p_event, cleared_at_ms = p_at,
+               cleared_evidence = coalesce(p_record -> 'evidence', '{}'::jsonb)
+         where key = p_record ->> 'key';
     when 'task.report_unfinished' then
         -- A report still a draft, not taken (spawn_task_report_unfinished):
         -- the task stays delivered, so nothing is folded.
@@ -1778,6 +1880,7 @@ declare
 begin
     perform pg_advisory_xact_lock(1399957335);
     delete from mission_source_holds;
+    delete from spawn_alerts;
     delete from mission_tasks;
     delete from mission_residents;
     delete from mission_missions;
@@ -2450,8 +2553,15 @@ end $$;
 -- ephemeral, agent `agent_worker_objective_<task>`), as `spawn_task_assign`
 -- makes one: no approval, a fresh workspace from the source's main, stopped
 -- by the dispatcher once its task lands or is cancelled.
+drop function if exists spawn_objective_assign(bigint, integer, text, text);
+
+-- An objective's task, assigned by the integrator (owner only). `p_continues`
+-- names the overrun task whose work this one keeps (`task.over_budget`): the
+-- record says so, and the task's workspace starts from that work
+-- (`OBJECTIVE_FORK`). Returns the task's id.
 create or replace function spawn_objective_assign(p_mission bigint, p_objective integer,
-                                                  p_scenario text, p_brief text)
+                                                  p_scenario text, p_brief text,
+                                                  p_continues bigint)
 returns bigint language plpgsql security definer as $$
 declare
     v_id bigint;
@@ -2486,9 +2596,13 @@ begin
             p_mission, v_open, v_workers;
     end if;
     v_id := nextval(pg_get_serial_sequence('mission_tasks', 'id'));
-    if exists (select 1 from mission_tasks
-                where mission_id = p_mission and agent_id = v_agent
-                  and state not in ('landed', 'cancelled')) then
+    -- A continuation of an overrun always starts on a per-task worker: its
+    -- workspace is made from the overrun's work (OBJECTIVE_FORK), which a
+    -- resident's own branch no longer holds (its cancel set the work aside).
+    if p_continues is not null
+       or exists (select 1 from mission_tasks
+                   where mission_id = p_mission and agent_id = v_agent
+                     and state not in ('landed', 'cancelled')) then
         v_kind := 'ephemeral';
         v_agent := format('agent_worker_objective_%s', v_id);
         v_session := format('session_worker_objective_%s', v_id);
@@ -2496,7 +2610,8 @@ begin
     perform spawn_control_record(jsonb_build_object(
         'type', 'task.assigned', 'id', v_id, 'mission_id', p_mission, 'kind', v_kind,
         'agent_id', v_agent, 'session_id', v_session, 'brief', p_brief,
-        'created_by', 'spawn-integrate', 'objective', p_objective, 'scenario', p_scenario));
+        'created_by', 'spawn-integrate', 'objective', p_objective, 'scenario', p_scenario)
+        || jsonb_strip_nulls(jsonb_build_object('continues', p_continues)));
     return v_id;
 end $$;
 
@@ -2617,7 +2732,12 @@ begin
     if p_record ->> 'type' is null
        or p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
                                       'task.held', 'source.hold_expired', 'task.cancelled',
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+                                      'source.moved', 'source.push_refused',
+                                      'task.over_budget') then
+=======
                                       'source.moved', 'source.push_refused') then
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         raise exception 'the integrator does not record %', p_record ->> 'type';
     end if;
     -- The integrator cancels one kind of task: an objective's task in flight
@@ -2634,6 +2754,18 @@ begin
         end if;
         p_record := p_record || jsonb_build_object('by', 'spawn-integrate');
     end if;
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+    -- An overrun names what it measured: its reason, its tool calls and the
+    -- budget it ran past (the mission's, as it was). Its branch, commit and
+    -- diff stat say what work the objective's next task continues.
+    if p_record ->> 'type' = 'task.over_budget'
+       and (coalesce(p_record ->> 'reason', '') = ''
+            or jsonb_typeof(p_record -> 'tool_calls') is distinct from 'number'
+            or jsonb_typeof(p_record -> 'budget') is distinct from 'object') then
+        raise exception 'a task.over_budget names its reason, tool_calls and budget: %', p_record;
+    end if;
+=======
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
     -- The outcome of an owner's landing names its request: a
     -- `source.push_requested` that has no outcome yet, so every request has
     -- at most one. A move names the request's source, where main went from
@@ -2754,6 +2886,10 @@ begin
                               when 'task.landed' then array['landing']
                               when 'task.held' then array['landing']
                               when 'task.aborted' then array['delivered']
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+                              when 'task.over_budget' then array['delivered']
+=======
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
                               when 'task.cancelled' then array['assigned', 'delivered', 'revise']
                               else array['reported', 'accepted', 'landing'] end)) then
         raise exception 'task % is not waiting for %', p_record ->> 'id', p_record ->> 'type';
@@ -3047,6 +3183,77 @@ create index if not exists spawn_events_host_disk
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'host.disk';
 
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+-- The alert transitions: the loop's `alert.fired` and `alert.cleared`
+-- records (`spawn_alert_record`, owner only), each once per occurrence
+-- (docs/fleet-architecture.md, "Alerts"). The checked writer refuses a
+-- second `fired` for a key, a `cleared` without its `fired`, and a second
+-- `cleared`; the fold does the same, so the log and the table agree.
+create or replace function spawn_alert_record(p_record jsonb)
+returns bigint language plpgsql security definer as $$
+declare
+    v_type text := p_record ->> 'type';
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not record alerts', session_user using errcode = '42501';
+    end if;
+    if v_type not in ('alert.fired', 'alert.cleared') then
+        raise exception 'not an alert record: %', v_type;
+    end if;
+    if nullif(p_record ->> 'key', '') is null or nullif(p_record ->> 'kind', '') is null
+       or nullif(p_record ->> 'subject', '') is null then
+        raise exception 'an alert record names a key, a kind and a subject: %', p_record;
+    end if;
+    if v_type = 'alert.fired' then
+        if exists (select 1 from spawn_alerts where key = p_record ->> 'key') then
+            raise exception 'alert % was already fired', p_record ->> 'key';
+        end if;
+    else
+        if not exists (select 1 from spawn_alerts where key = p_record ->> 'key') then
+            raise exception 'alert % was not fired', p_record ->> 'key';
+        end if;
+        if exists (select 1 from spawn_alerts
+                    where key = p_record ->> 'key' and state <> 'open') then
+            raise exception 'alert % is not open: nothing to clear', p_record ->> 'key';
+        end if;
+    end if;
+    return spawn_control_record(p_record);
+end $$;
+
+-- The backup records: the loop's `spawn backup dump|bundle|verify` writes
+-- them through `spawn_backup_record` (owner only); each names what a copy
+-- holds and what the run measured (docs/storage.md, "Where state lives").
+-- Folded into no table, like `host.disk`.
+create or replace function spawn_backup_record(p_record jsonb)
+returns bigint language plpgsql security definer as $$
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not record backups', session_user using errcode = '42501';
+    end if;
+    if p_record ->> 'type' not in ('backup.dumped', 'backup.bundled', 'backup.verified') then
+        raise exception 'not a backup record: %', p_record ->> 'type';
+    end if;
+    return spawn_control_record(p_record);
+end $$;
+
+-- The backup records, found without reading the rest of the stream: a run
+-- reads the ones before it to decide its tiers and its bundle's base.
+create index if not exists spawn_events_backup
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type'
+          in ('backup.dumped', 'backup.bundled', 'backup.verified');
+
+-- The alert transitions, found without reading the rest of the stream.
+create index if not exists spawn_events_alert
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' in ('alert.fired', 'alert.cleared');
+
+=======
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 -- The `source.moved` records (deploys), found without reading the rest of
 -- the stream: the dispatcher reads the latest on every step
 -- (`LATEST_SOURCE_MOVED`).
@@ -3172,8 +3379,9 @@ $$;
 -- cancelled (spawn_task_record_cancelled) left tasks the fold cancelled with
 -- no record of it: their stages end at `assigned`, `delivered` or
 -- `reported`. Each cancelled task whose last `task.%` record closes nothing
--- is recorded cancelled, once: a task that ends with `task.cancelled` or
--- `task.aborted` (cancelled over budget) gets none, and neither does a row
+-- is recorded cancelled, once: a task that ends with `task.cancelled`,
+-- `task.aborted` or `task.over_budget` (cancelled over budget, its work
+-- kept) gets none, and neither does a row
 -- from before the control stream (`legacy.imported`, no `task.%` records).
 do $$
 declare
@@ -3191,7 +3399,7 @@ begin
                    and r.record ->> 'type' like 'task.%'
                  order by r.record ->> 'id', e.session_seq desc) last on last.id = k.id::text
          where k.state = 'cancelled'
-           and last.type not in ('task.cancelled', 'task.aborted')
+           and last.type not in ('task.cancelled', 'task.aborted', 'task.over_budget')
          order by k.id
     loop
         perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task,
@@ -3200,7 +3408,7 @@ begin
 end
 $$;
 
-revoke all on mission_missions, mission_residents, mission_tasks, mission_source_holds from public;
+revoke all on mission_missions, mission_residents, mission_tasks, mission_source_holds, spawn_alerts from public;
 -- Every mission function: search_path pinned, closed to public. The
 -- supervisor may call the ones it decides with; the rest are the owner's
 -- (humans, the dispatcher, the integrator).
@@ -3225,7 +3433,8 @@ begin
         'spawn_mission_reconfigure(bigint, jsonb)', 'spawn_settings_merge(jsonb, jsonb, text)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
-        'spawn_objective_assign(bigint, integer, text, text)', 'spawn_task_stages(bigint)',
+        'spawn_alert_record(jsonb)', 'spawn_backup_record(jsonb)',
+        'spawn_objective_assign(bigint, integer, text, text, bigint)', 'spawn_task_stages(bigint)',
         'spawn_landing_hold(bigint)', 'spawn_landing_release()',
         'spawn_source_holdable(text)', 'spawn_source_hold_lock(text)',
         'spawn_source_hold(text, text, integer, text)', 'spawn_source_release(text)',
@@ -3243,7 +3452,8 @@ begin
                        spawn_login_role('spawn_supervisor'));
     end loop;
     execute format('grant select on mission_missions, mission_residents, mission_tasks, '
-                   'mission_source_holds to %I', spawn_login_role('spawn_supervisor'));
+                   'mission_source_holds, spawn_alerts to %I',
+                   spawn_login_role('spawn_supervisor'));
 end
 $$;
 

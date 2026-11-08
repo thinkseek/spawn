@@ -727,6 +727,22 @@ fn delivery_attempts<'a>(task: &TaskRow, facts: &'a Facts) -> Vec<&'a crate::dis
         .filter(|sent| {
             sent.key == key || sent.key.starts_with(&retry) || sent.key.starts_with(&moved)
         })
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+        .collect()
+}
+
+/// Every attempt at `task`'s current delivery, as a re-issue's
+/// cancellation names them.
+fn attempt_records(task: &TaskRow, facts: &Facts) -> Vec<Attempt> {
+    delivery_attempts(task, facts)
+        .into_iter()
+        .map(|sent| Attempt {
+            command: sent.id,
+            key: sent.key.clone(),
+            error: sent.error.clone(),
+        })
+=======
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         .collect()
 }
 
@@ -3526,7 +3542,10 @@ PENDING_ISSUES\n";
         assert!(db.records(task.id, "task.report_unfinished").is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+=======
 <<<<<<< 5717a8b81b1258edb584141d2964fa3364553668
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 
     // --- spent deliveries: re-issued, escalated, tried after a deploy -------
 
@@ -3855,6 +3874,8 @@ PENDING_ISSUES\n";
         );
         assert!(super::orders(&tasks, &rows, 60_000).is_empty());
         assert_eq!(super::reissues(&tasks, &rows, 60_000).len(), 1);
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+=======
 =======
     /// The timers the mission layer waits for are the waits its own rules
     /// name: a delivery refused because the pane was not ready goes again
@@ -3935,5 +3956,6 @@ PENDING_ISSUES\n";
              the one the attempt names"
         );
 >>>>>>> 1860071c4915de594d47f690dd83c046e0190ea7
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
     }
 }
