@@ -1239,7 +1239,15 @@ create table if not exists mission_missions (
     -- other verdict, a landing and a resume end it.
     gate_host_faults integer not null default 0,
     gate_host_task   bigint,
-    gate_host_due_ms bigint
+    gate_host_due_ms bigint,
+    -- The gate's current run of `host_fault` outcomes whose evidence is a
+    -- base that disagreed with itself (objective 033: a scenario of the base
+    -- exited 1 and then 0, before any candidate code ran), in a row across
+    -- the mission: the record that makes it 3 carries `alert`, and every
+    -- other one does not. No verdict on the work, so it counts toward no
+    -- halt. `no_room` and `stale` leave the run; every other verdict
+    -- (020's host faults included), a landing and a resume end it.
+    gate_base_disagrees integer not null default 0
 );
 
 create table if not exists mission_residents (
@@ -1318,6 +1326,7 @@ alter table mission_missions add column if not exists objectives jsonb;
 alter table mission_missions add column if not exists gate_host_faults integer not null default 0;
 alter table mission_missions add column if not exists gate_host_task bigint;
 alter table mission_missions add column if not exists gate_host_due_ms bigint;
+alter table mission_missions add column if not exists gate_base_disagrees integer not null default 0;
 alter table mission_tasks add column if not exists base text;
 alter table mission_tasks add column if not exists candidate text;
 alter table mission_tasks add column if not exists gate_log text;
@@ -1507,7 +1516,7 @@ begin
                                     gate_room_last_ms = null, gate_room_waits = 0,
                                     gate_room_escalated = false, gate_host_faults = 0,
                                     gate_host_task = null, gate_host_due_ms = null,
-                                    updated_at_ms = p_at
+                                    gate_base_disagrees = 0, updated_at_ms = p_at
          where id = v_id;
     when 'source.moved' then
         -- The owner moved a source's main on purpose: a deploy behind
@@ -1620,6 +1629,17 @@ begin
                                     when 'host_fault' then (p_record ->> 'due_ms')::bigint
                                     when 'no_room' then gate_host_due_ms
                                     when 'stale' then gate_host_due_ms end,
+               -- The mission's base disagreements in a row (objective 033):
+               -- + 1 on a host fault with that evidence, kept by `no_room`
+               -- and `stale`, ended by every other verdict (020's host faults
+               -- included), a landing and a resume. The record that makes it
+               -- 3 carries `alert`.
+               gate_base_disagrees = case
+                   when v_verdict = 'host_fault'
+                        and p_record ->> 'evidence' = 'base_disagrees'
+                       then gate_base_disagrees + 1
+                   when v_verdict in ('no_room', 'stale') then gate_base_disagrees
+                   else 0 end,
                -- The run is this task's: a `no_room` on another task starts
                -- a new one (no inherited backoff or age).
                gate_room_task = case v_verdict when 'no_room' then v_id
@@ -1646,9 +1666,10 @@ begin
          where id = v_mission;
     when 'task.landed' then
         update mission_tasks set state = 'landed', updated_at_ms = p_at where id = v_id;
-        -- A landing ends its mission's run of host faults.
+        -- A landing ends its mission's run of host faults, and its run of
+        -- bases that disagreed with themselves.
         update mission_missions set gate_host_faults = 0, gate_host_task = null,
-                                    gate_host_due_ms = null
+                                    gate_host_due_ms = null, gate_base_disagrees = 0
          where id = (select mission_id from mission_tasks where id = v_id);
         -- Every mission on the same source sees the same main: the landing
         -- moves its own mission's baseline, and those of the other missions
@@ -2827,14 +2848,27 @@ begin
     -- each the host's, and, when the test database's log decided it, the
     -- crash lines stamped inside the gate's window; and its backoff.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
-       and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log')
-            or case when jsonb_typeof(p_record -> 'failures') = 'array'
-                    then jsonb_array_length(p_record -> 'failures') else 0 end = 0
+       and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log',
+                                                          'base_disagrees')
             or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
-            or (p_record ->> 'evidence' = 'server_log'
-                and case when jsonb_typeof(p_record -> 'crash') = 'array'
-                         then jsonb_array_length(p_record -> 'crash') else 0 end = 0)) then
-        raise exception 'a host_fault verdict names its evidence, failures and backoff_ms: %',
+            or (p_record ->> 'evidence' in ('failures', 'server_log')
+                and (case when jsonb_typeof(p_record -> 'failures') = 'array'
+                          then jsonb_array_length(p_record -> 'failures') else 0 end = 0
+                     or (p_record ->> 'evidence' = 'server_log'
+                         and case when jsonb_typeof(p_record -> 'crash') = 'array'
+                                  then jsonb_array_length(p_record -> 'crash') else 0 end = 0)))
+            or (p_record ->> 'evidence' = 'base_disagrees'
+                and (coalesce(p_record ->> 'scenario', '') !~ '^[^[:space:]|]+$'
+                     or jsonb_typeof(p_record -> 'exits') is distinct from 'array'
+                     or jsonb_array_length(p_record -> 'exits') <> 2
+                     or p_record -> 'exits' ->> 0 is distinct from '1'
+                     or p_record -> 'exits' ->> 1 is distinct from '0'
+                     or jsonb_typeof(p_record -> 'base_disagrees') is distinct from 'number'
+                     or jsonb_typeof(p_record -> 'alert') is distinct from 'boolean'
+                     or p_record ->> 'escalate' is distinct from 'false'
+                     or (p_record ? 'setup_s'
+                         and jsonb_typeof(p_record -> 'setup_s') is distinct from 'number')))) then
+        raise exception 'a host_fault verdict names its evidence, its facts and backoff_ms: %',
                         p_record;
     end if;
     -- No room to judge names what it measured: the check that fell short
@@ -3249,6 +3283,17 @@ create index if not exists spawn_events_gate_host_fault
       and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
       and kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
       and kind -> 'detail' -> 'record' ->> 'escalate' = 'true';
+
+-- The `host_fault` gate records whose base disagreed with itself and that
+-- carry `alert` (the mission's third in a row, objective 033), found the
+-- same way: the dispatcher's digest takes each to the supervisor once.
+create index if not exists spawn_events_gate_base_disagrees
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+      and kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
+      and kind -> 'detail' -> 'record' ->> 'evidence' = 'base_disagrees'
+      and kind -> 'detail' -> 'record' ->> 'alert' = 'true';
 
 -- A task's stages, oldest first: `[{stage, verdict?, at_ms, took_ms?}]`.
 -- `stage` is the record type without `task.`; `verdict` is a gate's verdict
