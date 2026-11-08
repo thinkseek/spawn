@@ -3156,7 +3156,6 @@ create index if not exists spawn_events_host_disk
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'host.disk';
 
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
 -- The alert transitions: the loop's `alert.fired` and `alert.cleared`
 -- records (`spawn_alert_record`, owner only), each once per occurrence
 -- (docs/fleet-architecture.md, "Alerts"). The checked writer refuses a
@@ -3225,8 +3224,6 @@ create index if not exists spawn_events_alert
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' in ('alert.fired', 'alert.cleared');
 
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 -- The `source.moved` records (deploys), found without reading the rest of
 -- the stream: the dispatcher reads the latest on every step
 -- (`LATEST_SOURCE_MOVED`).
