@@ -11,10 +11,11 @@
 # environment: delivery 90 s, activity 30 s, everything else 600 s. Two
 # stalls are injected from outside Spawn, never by editing it:
 #   - `stuck`: the tmux wrapper refuses every paste-buffer and send-keys into
-#     the stuck resident's pane, so its task's delivery never lands (each
-#     attempt fails after the Bridge began typing; the dispatcher's own
-#     retry, 60 s later, inside the bound, fails the same way, or is held
-#     while the worker has no current judgement);
+#     the stuck resident's pane, so its task's delivery never lands: its one
+#     attempt fails after the Bridge began typing, so its error says the
+#     text may have been typed, and the dispatcher never tries it again
+#     (deliver.rs `judge_attempts`, bridge.rs `MAY_HAVE_TYPED`): whatever
+#     SPAWN_DELIVERY_RETRY_SECS says, `deliver-<id>-0` is its only attempt;
 #   - `quiet`: its engine takes the task, opens the turn, and goes silent:
 #     no transcript line, no screen change, the turn never ends.
 # Beside them, `busy` works through one turn of 60 s with a tool call every
@@ -28,7 +29,9 @@
 #       assignment; its line names `task #<id>`, the step, the failed
 #       attempt's key (`deliver-<id>-0`) and its error, and the key of every
 #       other attempt that had failed by then (what Spawn already tried).
-#       Later failed retries in the window add none (the step did not move);
+#       Later failed retries would add none (the step did not move), but
+#       this run does not exercise that: the stuck delivery is never retried
+#       (above), so no retry falls in the window;
 #   (2) the silent worker: exactly one escalation for its task, with step
 #       `activity`, between the bound and the bound + 30 s after the
 #       session's latest fact; its text names `task #<id>`, the step, that
@@ -500,7 +503,6 @@ for id in "$task_stuck" "$task_quiet" "$task_busy" "$task_quick"; do
     [ -n "$id" ] && [ "$id" != null ] || harness "task assign printed no id"
 done
 healthy="$task_busy $task_quick"
-started=$(now)
 
 # The premises: the stuck delivery failed at the pane, the quiet worker took
 # its task and went silent, the healthy ones were delivered.
@@ -611,10 +613,10 @@ woke_at=$(q "select max(recorded_at_ms) from spawn_events
 
 # --- (4) the window closes: exactly one per stall, none for the healthy ----------------
 
-# At least 240 s after the assignments: the stuck delivery's second retry
-# (180 s after its first failure) fails within it, and moves nothing.
-hold_until=$((started + 240))
-[ "$(($(now) + 20))" -gt "$hold_until" ] && hold_until=$(($(now) + 20))
+# 20 s past (3), so a second escalation of either stall, or a first of a
+# healthy task, has time to show before the counts below. No retry of the
+# stuck delivery is waited for: it has none (see the header).
+hold_until=$(($(now) + 20))
 while [ "$(now)" -lt "$hold_until" ]; do
     tend
     sleep 0.5
