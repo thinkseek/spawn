@@ -2680,7 +2680,9 @@ impl Judge {
         let Some(envelope) = envelope else {
             return Ok(None);
         };
-        let (runs, _) = store.gate_runs(task.id).map_err(|error| error.to_string())?;
+        let (runs, _) = store
+            .gate_runs(task.id)
+            .map_err(|error| error.to_string())?;
         let mut n = runs.saturating_add(1);
         let mut unit = envelope.gate_scope(task.id, n);
         // A name is never reused while its unit exists: a run that is still
@@ -2712,7 +2714,9 @@ impl Judge {
     ) -> Result<bool, String> {
         let envelope = &scope.envelope;
         let bytes = envelope.settings.gate.max;
-        let (_, after) = store.gate_runs(task.id).map_err(|error| error.to_string())?;
+        let (_, after) = store
+            .gate_runs(task.id)
+            .map_err(|error| error.to_string())?;
         let start = spawn_core::envelope::Admission {
             kind: "gate",
             fields: json!({"task": task.id}),
@@ -2727,15 +2731,12 @@ impl Judge {
                 task.id, short.measure, short.measured, short.threshold
             );
         }
-        if !spawn_core::envelope::admit(store, &start, short)
-            .map_err(|error| error.to_string())?
-        {
+        if !spawn_core::envelope::admit(store, &start, short).map_err(|error| error.to_string())? {
             return Ok(false);
         }
         spawn_core::envelope::admitted(store, &start).map_err(|error| error.to_string())?;
         Ok(true)
     }
-
 }
 
 impl Judge {
@@ -3416,7 +3417,9 @@ fn aborted(failure: &GateFailure) -> Value {
         }),
         // Recorded `host_fault` by the caller; counted here only if a caller
         // forgets that.
-        GateFailure::MemoryLimit { memory_max, log, .. } => json!({
+        GateFailure::MemoryLimit {
+            memory_max, log, ..
+        } => json!({
             "reason": format!(
                 "the gate was killed by its memory limit (MemoryMax {})",
                 size_text(*memory_max)

@@ -1100,12 +1100,9 @@ fn judge_in(
     // The gate runs in its own scope, inside Spawn's slice, when the host
     // has an envelope (objective 029): everything it starts is in it.
     let (program, arguments) = match scope {
-        Some(scope) => scope.envelope.wrap(
-            &scope.unit,
-            scope.envelope.settings.gate,
-            "sh",
-            &words,
-        ),
+        Some(scope) => scope
+            .envelope
+            .wrap(&scope.unit, scope.envelope.settings.gate, "sh", &words),
         None => ("sh".to_string(), words),
     };
     let mut command = Command::new(program);
