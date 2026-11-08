@@ -424,13 +424,10 @@ pub(crate) enum Why {
     /// An objective ran out of attempts and its task yielded the slot to
     /// the next objective ([`digest::objective_yields`]).
     ObjectiveYielded,
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
-    /// A task that continued an overrun task went over its budget too
+
     /// ([`digest::over_budget_escalations`]): its objective is held until
     /// the mission is configured again.
     OverBudget,
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
     /// An objective mission's backlog names an order that cannot be met
     /// ([`digest::objective_order`]): a condition until the backlog changes.
     ObjectiveOrder,
@@ -707,16 +704,13 @@ pub(crate) fn read_plan(
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
-    host.extend(digest::over_budget_escalations(
+
         store
             .over_budget_escalations()
             .map_err(|error| format!("over budget records: {error}"))?
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
     host.extend(digest::objective_yields(
         store
             .objective_yields()
@@ -807,18 +801,9 @@ pub(crate) fn read_plan(
 /// workers under `root` (a draft is not taken: its worker is told instead,
 /// [`deliver::collect_reports`]), then submit the plan ([`read_plan`]), with the
 /// stalls past their `bounds` among its escalations ([`stall`]), without
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
 /// its new executions while the disk is under its floor ([`crate::disk`]),
-/// delivering with `waits` ([`deliver::Waits`]). Returns log lines.
-=======
-<<<<<<< 5717a8b81b1258edb584141d2964fa3364553668
-/// its new executions while the disk is under its floor ([`crate::disk`]),
-/// delivering with `waits` ([`deliver::Waits`]). Returns log lines.
-=======
-/// its new executions while the disk is under its floor ([`crate::disk`]).
-/// Returns log lines, and when the next step is due ([`Reading::due_ms`]).
->>>>>>> 1860071c4915de594d47f690dd83c046e0190ea7
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
+/// delivering with `waits` ([`deliver::Waits`]). Returns log lines, and when
+/// the next step is due ([`Reading::due_ms`]).
 pub(crate) fn step(
     store: &std::sync::Arc<PostgresStore>,
     supervised: bool,
@@ -826,20 +811,9 @@ pub(crate) fn step(
     root: Option<&Path>,
     disk: &crate::disk::Monitor,
     bounds: &Bounds,
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
     waits: deliver::Waits,
-) -> Result<Vec<String>, String> {
-    let (mut rows, mut work) = load(store, waits)?;
-=======
-<<<<<<< 5717a8b81b1258edb584141d2964fa3364553668
-    waits: deliver::Waits,
-) -> Result<Vec<String>, String> {
-    let (mut rows, mut work) = load(store, waits)?;
-=======
 ) -> Result<(Vec<String>, Option<i64>), String> {
-    let (mut rows, mut work) = load(store)?;
->>>>>>> 1860071c4915de594d47f690dd83c046e0190ea7
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
+    let (mut rows, mut work) = load(store, waits)?;
     let mut lines = root.map_or_else(Vec::new, |root| {
         deliver::collect_reports(store, &work, &rows, root, now_ms())
     });
