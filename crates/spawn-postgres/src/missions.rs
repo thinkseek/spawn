@@ -1585,12 +1585,6 @@ impl PostgresStore {
         self.query_json(LATEST_SOURCE_MOVED, &[])
     }
 
-    /// The latest `source.moved` record, `{id, at_ms}`, or null
-    /// ([`LATEST_SOURCE_MOVED`]).
-    pub fn latest_source_moved(&self) -> Result<Value, StoreError> {
-        self.query_json(LATEST_SOURCE_MOVED, &[])
-    }
-
     /// Residents whose latest delivered task is cancelled, with the
     /// checkpoint it started from ([`CANCELLED_DELIVERIES`]).
     pub fn cancelled_deliveries(&self) -> Result<Value, StoreError> {
