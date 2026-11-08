@@ -190,6 +190,7 @@ struct Schedule {
     dispatch: Step,
     residents: Step,
     alive: Step,
+    alerts: Step,
 }
 
 impl Schedule {
@@ -200,6 +201,7 @@ impl Schedule {
             dispatch: Step::new(),
             residents: Step::new(),
             alive: Step::new(),
+            alerts: Step::new(),
         }
     }
 
@@ -212,6 +214,7 @@ impl Schedule {
             &self.dispatch,
             &self.residents,
             &self.alive,
+            &self.alerts,
         ]
         .into_iter()
         .any(|step| step.due.is_some_and(|due| due <= now_ms))
@@ -226,6 +229,7 @@ impl Schedule {
             &self.dispatch,
             &self.residents,
             &self.alive,
+            &self.alerts,
         ]
         .into_iter()
         .filter_map(|step| step.due)
@@ -321,6 +325,13 @@ struct Fleet {
     workspace_root: Option<std::path::PathBuf>,
     disk: disk::Monitor,
     bounds: dispatch::Bounds,
+    /// The delivery waits `SPAWN_DELIVERY_RETRY_SECS` and
+    /// `SPAWN_REISSUE_AFTER_SECS` set ([`crate::deliver::Waits`]).
+    waits: crate::deliver::Waits,
+    /// The loop's own alerts ([`alerts::Monitor`]): its recods decide
+    /// whether this pass has anything to do, on the same watermark and
+    /// due-time rule as the other steps.
+    alerting: alerts::Monitor,
     interval: Duration,
     /// When the steps last ran over the store. They run at most once a pass
     /// interval, which is the resolution the loop always had: a burst of
@@ -467,6 +478,7 @@ impl Fleet {
                 self.workspace_root.as_deref(),
                 &self.disk,
                 &self.bounds,
+                self.waits,
             ) {
                 Ok((more, due)) => {
                     lines.extend(more);
