@@ -387,10 +387,6 @@ from (
       from agent_open_jobs j
      group by j.session_id, j.execution_id) jb
     on s.live and jb.session_id = s.session_id and jb.execution_id = s.execution_id
-  -- The sessions with a command still in the queue, one read of the queue.
-  left join (
-    select distinct c.session_id from spawn_commands c where c.state <> 'finished') oc
-    on oc.session_id = s.session_id
   -- The supervisor's current native session (the one its latest
   -- `session.native_started` names, which a resume resumes) and the start
   -- that began it: the command of the execution that named it first.
