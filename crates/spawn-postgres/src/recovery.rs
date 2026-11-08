@@ -65,7 +65,7 @@ pub(crate) const RECOVERY_SIGNALS: &str = r"
 select exists (
   select 1 from spawn_events e
    where e.id > $1
-     and (e.event_name in ('turn.failed', 'execution.ended')
+     and (e.event_name in ('turn.failed', 'tool.failed', 'execution.ended')
           or (e.event_name = 'control.recorded'
               and e.kind -> 'detail' -> 'record' ->> 'type' in
                   ('execution.interrupted', 'execution.cleared', 'task.over_budget',
@@ -80,6 +80,10 @@ select exists (
 ///   `session.native_started` names, which a resume resumes.
 /// - `turns`: every `turn.failed` of the execution, oldest first, with the
 ///   engine's `status`, `error` tag (`kind`) and `text`, by event id.
+/// - `failed_tools`: every `tool.failed` of the execution, oldest first,
+///   with the engine's error `text`, by event id: a full disk is told here
+///   (Claude Code's ENOSPC message) and nowhere else while the engine
+///   waits at its prompt.
 /// - `progress`: the execution's latest `tool.started`, `tool.completed` or
 ///   `turn.stopped` — the event id and its time; `0` when it made no
 ///   progress at all. A model answer after a failed turn is a progress event
@@ -114,6 +118,14 @@ with x as (
     from spawn_events e, x
    where e.session_id = $1 and e.execution_id = x.execution_id
      and e.event_name = 'turn.failed'
+), tools as (
+  select coalesce(jsonb_agg(jsonb_build_object(
+            'event_id', e.id,
+            'at_ms', e.recorded_at_ms,
+            'text', e.kind -> 'detail' ->> 'error') order by e.id), '[]'::jsonb) as list
+    from spawn_events e, x
+   where e.session_id = $1 and e.execution_id = x.execution_id
+     and e.event_name = 'tool.failed'
 ), progress as (
   select coalesce(max(e.id), 0) as last_id, coalesce(max(e.recorded_at_ms), 0) as last_at
     from spawn_events e, x
@@ -195,6 +207,7 @@ select jsonb_build_object(
                          where e.session_id = $1 and e.event_name = 'session.native_started'
                          order by e.id desc limit 1),
   'turns', (select list from turns),
+  'failed_tools', (select list from tools),
   'progress', (select jsonb_build_object('event_id', last_id, 'at_ms', last_at) from progress),
   'stops', (select list from stops),
   'records', (select list from records),

@@ -257,6 +257,31 @@ impl Turn {
     }
 }
 
+/// A tool call that failed, with the engine's error text (`tool.failed`).
+/// A full disk ends a turn with one — Claude Code's ENOSPC message — and
+/// leaves the engine at its prompt; no other record of the execution says
+/// so, so the recovery reads it here.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct ToolFailure {
+    pub(crate) event_id: i64,
+    #[serde(default)]
+    pub(crate) at_ms: i64,
+    /// The engine's error text, as the transcript showed it.
+    #[serde(default)]
+    pub(crate) text: String,
+}
+
+impl ToolFailure {
+    /// The cause this failure names, if any: a full disk is the one tool
+    /// failure that interrupts an execution (any other failed tool is the
+    /// work's, and the engine goes on).
+    pub(crate) fn cause(&self) -> Option<Cause> {
+        let text = self.text.to_lowercase();
+        (text.contains("enospc") || text.contains("disk is full") || text.contains("no space left"))
+            .then_some(Cause::DiskFull)
+    }
+}
+
 /// The engine's end, as `execution.ended` recorded it.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub(crate) struct End {
@@ -670,6 +695,10 @@ pub(crate) struct FactsRow {
     pub(crate) native_session_id: Option<String>,
     #[serde(default)]
     pub(crate) turns: Vec<Turn>,
+    /// Every `tool.failed` of the execution, oldest first: a full disk shows
+    /// here and nowhere else while the engine waits at its prompt.
+    #[serde(default)]
+    pub(crate) failed_tools: Vec<ToolFailure>,
     #[serde(default)]
     pub(crate) progress: Progress,
     #[serde(default)]
@@ -986,6 +1015,7 @@ struct One<'a> {
 /// The fact an interruption is told from.
 enum Fact {
     Turn(Turn),
+    Tool(ToolFailure),
     End(End),
 }
 
@@ -1060,6 +1090,7 @@ impl One<'_> {
         pending(
             &self.records,
             &self.row.turns,
+            &self.row.failed_tools,
             &self.execution(),
             &self.row.stops,
             &self.row.commands,
@@ -1237,6 +1268,7 @@ impl One<'_> {
     fn interrupt(&mut self, fact: Fact) -> Result<(), String> {
         match fact {
             Fact::Turn(turn) => self.interrupt_turn(&turn),
+            Fact::Tool(tool) => self.interrupt_tool(&tool),
             Fact::End(end) => self.interrupt_end(&end),
         }
     }
@@ -1303,6 +1335,48 @@ impl One<'_> {
             path,
             Some(due),
             "its turn failed with a model cause and its engine waits at its prompt",
+        )?;
+        Ok(())
+    }
+
+    /// The interruption a failed tool call makes: a full disk ends the turn
+    /// and leaves the engine at its prompt, waiting for room. The wait is
+    /// the disk's: every probe reads the free space again, and the clear is
+    /// the reading at or above the floor.
+    fn interrupt_tool(&mut self, tool: &ToolFailure) -> Result<(), String> {
+        let Some(cause) = tool.cause() else {
+            return Ok(());
+        };
+        let mut evidence = Map::new();
+        evidence.insert("event_id".to_string(), json!(tool.event_id));
+        evidence.insert(
+            "text".to_string(),
+            json!(crate::deliver::one_line(&tool.text, 600)),
+        );
+        // The reading the wait is told by, taken now; the clear takes a
+        // fresh one every probe.
+        if let Some(reading) = self.disk_reading() {
+            evidence.insert(
+                "path".to_string(),
+                json!(reading.place.path.display().to_string()),
+            );
+            evidence.insert("free_bytes".to_string(), json!(reading.free));
+            evidence.insert("floor_bytes".to_string(), json!(Self::floor_bytes()));
+            evidence.insert("read_at_ms".to_string(), json!(self.now_ms));
+        }
+        let (path, mut gains) = way(
+            cause,
+            self.row.native_session_id.is_some(),
+            self.failures_in_a_row(),
+        );
+        evidence.append(&mut gains);
+        self.record(
+            cause,
+            evidence,
+            tool.event_id,
+            path,
+            Some(self.now_ms),
+            "its tool call failed on a full disk and its engine waits at its prompt",
         )?;
         Ok(())
     }
@@ -1993,7 +2067,8 @@ fn describe(record: &Recorded) -> String {
 }
 
 /// The next fact of `execution` that no interruption explains, in log
-/// order: the failed turn after the latest one recorded, or the end.
+/// order: the first failed turn or failed tool call after the latest one
+/// recorded, or the end.
 ///
 /// While a wait is open its execution's end is no interruption of its own —
 /// the wait's revival resumes it — unless a Stop ended it: a person's
@@ -2003,6 +2078,7 @@ fn describe(record: &Recorded) -> String {
 fn pending(
     records: &[Recorded],
     turns: &[Turn],
+    tools: &[ToolFailure],
     execution: &Execution,
     stops: &[Stop],
     commands: &[Sent],
@@ -2020,11 +2096,21 @@ fn pending(
     };
     let open_wait =
         last.is_some_and(|record| record.path() == Some(Path::Wait.name()) && !cleared(record));
-    if let Some(turn) = turns
+    let turn = turns
         .iter()
-        .find(|turn| turn.event_id > after && turn.cause().is_some())
-    {
-        return Some(Fact::Turn(turn.clone()));
+        .find(|turn| turn.event_id > after && turn.cause().is_some());
+    let tool = tools
+        .iter()
+        .find(|tool| tool.event_id > after && tool.cause().is_some());
+    match (turn, tool) {
+        // The first of the two in the log: a disk's tool failure and a
+        // model's turn failure can sit in the same stretch of work.
+        (Some(turn), Some(tool)) if tool.event_id < turn.event_id => {
+            return Some(Fact::Tool(tool.clone()));
+        }
+        (Some(turn), _) => return Some(Fact::Turn(turn.clone())),
+        (None, Some(tool)) => return Some(Fact::Tool(tool.clone())),
+        (None, None) => {}
     }
     // A handoff ends the execution with its own Stop.
     if last.is_some_and(|record| {
@@ -2074,8 +2160,8 @@ impl Cause {
 mod tests {
     use super::{
         Cause, Config, Credentials, End, Executed, Execution, Facts, Outage, Path, Recorded,
-        Recovery, Sent, Stop, Turn, auth_retry_due, classify, counts_as_failure, disk_cleared, key,
-        model_due, pending, resume_due, resume_failed, retry_at, way,
+        Recovery, Sent, Stop, ToolFailure, Turn, auth_retry_due, classify, counts_as_failure,
+        disk_cleared, key, model_due, pending, resume_due, resume_failed, retry_at, way,
     };
     use serde_json::json;
 
@@ -2462,13 +2548,20 @@ mod tests {
             },
         ];
         // Nothing recorded: the first failed turn is the next fact.
-        match pending(&[], &turns, &execution, &[], &[]) {
+        match pending(&[], &turns, &[], &execution, &[], &[]) {
             Some(super::Fact::Turn(turn)) => assert_eq!(turn.event_id, 50),
             _ => panic!("the first failed turn"),
         }
         // That turn recorded: the second one.
         let first = recorded("execution.interrupted", "wait", 1, 50, 10);
-        match pending(std::slice::from_ref(&first), &turns, &execution, &[], &[]) {
+        match pending(
+            std::slice::from_ref(&first),
+            &turns,
+            &[],
+            &execution,
+            &[],
+            &[],
+        ) {
             Some(super::Fact::Turn(turn)) => assert_eq!(turn.event_id, 60),
             _ => panic!("the second failed turn"),
         }
@@ -2478,6 +2571,7 @@ mod tests {
         match pending(
             &[first.clone(), second.clone(), clear.clone()],
             &turns,
+            &[],
             &execution,
             &[],
             &[],
@@ -2490,6 +2584,7 @@ mod tests {
             pending(
                 &[first.clone(), second.clone()],
                 &turns,
+                &[],
                 &execution,
                 &[],
                 &[]
@@ -2500,8 +2595,96 @@ mod tests {
         // The end recorded: nothing, however often the loop reads it.
         let ended = recorded("execution.interrupted", "resume", 3, 90, 13);
         assert!(
-            pending(&[first, second, clear, ended], &turns, &execution, &[], &[]).is_none(),
+            pending(
+                &[first, second, clear, ended],
+                &turns,
+                &[],
+                &execution,
+                &[],
+                &[]
+            )
+            .is_none(),
             "a restarted loop records the same interruption once"
+        );
+    }
+
+    /// A full disk's tool failure is an interruption of its own: the engine
+    /// ends the turn with Claude Code's ENOSPC message and waits at its
+    /// prompt, and no failed turn or end says so. Any other failed tool is
+    /// the work's, and no fact at all.
+    #[test]
+    fn a_full_disks_tool_failure_is_a_fact_and_the_earliest_one_wins() {
+        let full = ToolFailure {
+            event_id: 55,
+            at_ms: 1_000,
+            text: "Disk full: a test write failed with ENOSPC (the volume, or the user's quota \
+                   on it, has no space left)"
+                .to_string(),
+        };
+        assert_eq!(full.cause(), Some(Cause::DiskFull));
+        let other = ToolFailure {
+            event_id: 56,
+            at_ms: 1_100,
+            text: "exit 1".to_string(),
+        };
+        assert_eq!(other.cause(), None, "a failed tool is the work's");
+        let execution = execution(Some(2_000));
+        // The disk's failure is the next fact, ahead of the end at 90.
+        match pending(&[], &[], std::slice::from_ref(&full), &execution, &[], &[]) {
+            Some(super::Fact::Tool(tool)) => assert_eq!(tool.event_id, 55),
+            _ => panic!("the disk's tool failure"),
+        }
+        // An ordinary failed tool explains nothing: the end is next.
+        match pending(&[], &[], std::slice::from_ref(&other), &execution, &[], &[]) {
+            Some(super::Fact::End(end)) => assert_eq!(end.event_id, 90),
+            _ => panic!("the end"),
+        }
+        // The first of a failed turn and a disk failure in the log is the
+        // fact, whichever it is.
+        let earlier = Turn {
+            event_id: 50,
+            ..turn(Some(529), Some("overloaded"), "API Error: 529")
+        };
+        assert!(matches!(
+            pending(
+                &[],
+                std::slice::from_ref(&earlier),
+                std::slice::from_ref(&full),
+                &execution,
+                &[],
+                &[]
+            ),
+            Some(super::Fact::Turn(_))
+        ));
+        let later = Turn {
+            event_id: 60,
+            ..turn(Some(529), Some("overloaded"), "API Error: 529")
+        };
+        assert!(matches!(
+            pending(
+                &[],
+                std::slice::from_ref(&later),
+                std::slice::from_ref(&full),
+                &execution,
+                &[],
+                &[]
+            ),
+            Some(super::Fact::Tool(_))
+        ));
+    }
+
+    /// While a disk_full wait is open the free space is read again every
+    /// `SPAWN_RECOVER_PROBE_SECS` (the soak's 2 s), not once a minute: the
+    /// loop's next pass is due at the probe, and the clear is that reading.
+    #[test]
+    fn a_disk_wait_is_re_read_every_probe_not_once_a_minute() {
+        let mut state = Recovery::new();
+        state.open_waits = true;
+        let now = 1_000_000;
+        assert_eq!(
+            state.next_due(2_000, now),
+            Some(now + 2_000),
+            "the wait's cause is re-read at the probe"
         );
     }
 
@@ -2510,12 +2693,23 @@ mod tests {
         let execution = execution(Some(2_000));
         let waiting = recorded("execution.interrupted", "wait", 1, 50, 10);
         // The wait is open: the end is its revival's, not a new interruption.
-        assert!(pending(std::slice::from_ref(&waiting), &[], &execution, &[], &[]).is_none());
+        assert!(
+            pending(
+                std::slice::from_ref(&waiting),
+                &[],
+                &[],
+                &execution,
+                &[],
+                &[]
+            )
+            .is_none()
+        );
         // A person's Stop since: it is.
         let stopped = stop("bb-stop-3", 7);
         assert!(matches!(
             pending(
                 std::slice::from_ref(&waiting),
+                &[],
                 &[],
                 &execution,
                 &[stopped],
@@ -2532,7 +2726,7 @@ mod tests {
             succeeded: Some(true),
         };
         assert!(
-            pending(&[handoff], &[], &execution, &[], &[sent]).is_none(),
+            pending(&[handoff], &[], &[], &execution, &[], &[sent]).is_none(),
             "the handoff's stop is no interruption of its own"
         );
     }
