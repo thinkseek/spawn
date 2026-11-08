@@ -49,7 +49,6 @@
 //!    landing failed may have moved main before its record; it is applied
 //!    or refused by a later pass). A main moved with no record at all (a
 //!    push behind Spawn's back) still halts;
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
 //! 2. a delivered task over its mission's budget keeps its work. Its worker
 //!    is stopped (the Stop, and its final checkpoint on the task's branch)
 //!    and the overrun is its own record, `task.over_budget` {`reason`,
@@ -88,19 +87,6 @@
 //!      `mission.configured` record newer than the overrun's), while the
 //!      mission's other objectives go on with the freed slot. A third
 //!      overrun after such a configure is treated as a first;
-=======
-//! 2. a delivered task over its mission's budget is aborted and its worker
-//!    stopped. Its minutes are active time ([`active_ms`]): the gaps of its
-//!    session's events, readings (`screen.observed`,
-//!    `observation.recorded`) left out; a gap counts at most
-//!    `SPAWN_BUDGET_GAP_SECS` (300 s), and only if it ends in the model's
-//!    progress (a tool, a job, a stopped turn), not in a failed turn, a
-//!    prompt or a command; a gap inside a tool or job that ended counts
-//!    while the whole fleet was alive. So no outage (the fleet stopped, a
-//!    frozen host, a dead engine, the model API down) can by itself put a
-//!    task over budget (a subagent's job open across a model API outage
-//!    adds up to its retry window, see [`active_ms`]);
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 //! 3. a task whose gate passed is landed (again, after a crash), unless the
 //!    owner holds its source (`spawn mission hold`, a `source.held` record):
 //!    [`land`] reads the hold from the store under the landing lock, before
