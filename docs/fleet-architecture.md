@@ -1243,10 +1243,14 @@ tree: its `pnpm install` output, which git does not hold, at
 `~/.local/share/spawn-rsi/deps/<name>/<sha256 of the lockfile>` (read-only;
 `deploy/controller.sh deps` installs one, `update` does it when the
 lockfile's is missing, and a switch keeps the previous controller's tree and
-any tree an agent's workspace still links to, removing the rest). It is
+any tree an agent's workspace still links to, removing the rest, and points
+`<live>/deps/<name>/current` at the current one). It is
 never the owner's checkout, whose `node_modules` every agent may write. The
 gate binds the store read-only into its sandbox, and engines and gates read
-it through `SUPPLY_PA_DEPS` (deploy/systemd/README.md "The controller").
+it through `SUPPLY_PA_DEPS` in `spawn.env`, the literal path of `current`
+(unset, they use that pointer as they do anyway; set it only once a
+controller's tree and its pointer exist, since a path to no tree fails every
+engine's and gate's build) (deploy/systemd/README.md "The controller").
 Read-only is a boundary against accidents, not agents: the same uid can
 hardlink a store file and write it; boundaries against a deliberate agent
 are per-agent uids or a mount per engine.
