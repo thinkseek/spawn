@@ -702,12 +702,6 @@ select
     s.recorded_at_ms as started_at_ms,
     x.kind -> 'detail' ->> 'cause'     as cause,
     (x.kind -> 'detail' ->> 'exit_code')::integer as exit_code,
-    -- The signal that killed the engine, when one did (the runner writes it
-    -- beside the exit status; the Bridge records it). Null for an exit.
-    (x.kind -> 'detail' ->> 'signal')::integer as signal,
-    -- What the Bridge saw when no runner of its own ran the execution any
-    -- more; null for an exit or a stop of a running engine.
-    x.kind -> 'detail' ->> 'evidence' as evidence,
     x.recorded_at_ms as ended_at_ms,
     -- The execution ends only when the Bridge writes its own end event. An
     -- end from another source is an exit report of an old runner: runners
@@ -720,7 +714,16 @@ select
           and r.source <> 'bridge'
     ) as exit_reported,
     x.recorded_at_ms - s.recorded_at_ms as duration_ms,
-    (s.kind -> 'detail' ->> 'command_id')::bigint as command_id
+    (s.kind -> 'detail' ->> 'command_id')::bigint as command_id,
+    -- Columns added after the first are appended here, never inserted:
+    -- `create or replace view` keeps every existing column in place, so a
+    -- live database refuses a new one in the middle (42P16).
+    -- The signal that killed the engine, when one did (the runner writes it
+    -- beside the exit status; the Bridge records it). Null for an exit.
+    (x.kind -> 'detail' ->> 'signal')::integer as signal,
+    -- What the Bridge saw when no runner of its own ran the execution any
+    -- more; null for an exit or a stop of a running engine.
+    x.kind -> 'detail' ->> 'evidence' as evidence
 from spawn_events s
 left join lateral (
     select e.kind, e.recorded_at_ms
