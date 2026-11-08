@@ -777,6 +777,13 @@ impl Recovery {
         }
     }
 
+    /// Whether the failed passes since the last good one made an outage the
+    /// recovery must record: the first pass that reaches the database runs
+    /// it at once, whether the log moved or not.
+    pub(crate) fn outage_pending(&self) -> bool {
+        self.outage.is_some()
+    }
+
     /// Whether the loop's next pass must read again although the log did
     /// not move: a wait is open (its cause is re-read every probe), or an
     /// outage is pending (the first pass that reaches the database records
