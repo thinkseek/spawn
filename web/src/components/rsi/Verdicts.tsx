@@ -30,7 +30,7 @@ function defaultNote(verdict: TaskVerdict): string {
     case "no_room":
       return "No room for the gate (disk, memory or the test database); judged again later";
     case "host_fault":
-      return "The host failed (the test database, or a base that disagreed with itself), not the work; judged again after a backoff";
+      return "The host failed (the test database), not the work; judged again after a backoff";
     default:
       return "";
   }
