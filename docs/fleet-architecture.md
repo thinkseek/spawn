@@ -1158,8 +1158,9 @@ the tree's own:
 - everything the candidate controls runs in a bubblewrap sandbox (docs/rsi.md
   §4). The verdict is one JSON line that names the base and candidate
   commits it judged; the integrator believes only the verdict file it owns.
-- objective results on the base (solved, or unsolved after two runs that
-  agree) are cached outside the sandbox, keyed by everything that decides
+- objective results on the base (solved, unsolved after two runs that
+  agree, or `cannot_judge` when the scenario says the host cannot judge it,
+  one run) are cached outside the sandbox, keyed by everything that decides
   them: the base commit, the blobs of the scenario and of the gate, the
   tools the scenarios run (`rustc -vV`, `cargo -V`, `node --version`,
   `psql -V`, `git --version`, `tmux -V`, `python3 -V`, `jq --version`, in
@@ -1196,8 +1197,17 @@ the tree's own:
   gate's `TMPDIR`), or the integrator could not create or use its private
   directory for the gate (it measures that directory's parent). It exits 6
   with a host-fault fact (a scenario's harness error on the base, or a
-  check failing on the candidate and the base): `host_fault`, §10.3. Any
-  other status is an abort: exit 3 (no bwrap, a missing bind directory, an unreadable
+  check failing on the candidate and the base): `host_fault`, §10.3. It
+  also exits 6, the same status, with a scenario's own `cannot_judge` fact
+  (a scenario that says this host cannot judge it at all: 029, whose
+  resource envelopes need a systemd user manager the sandbox has none of).
+  On the base that is the cached result `cannot_judge`, one run (the host's
+  answer does not change), so 029 in every Spawn gate's regression set
+  stops no landing; on the candidate a regression that exits 6 is skipped,
+  never passed or failed, and the task scenario that exits 6 states the
+  fact: `host_fault` with the evidence `cannot_judge`, never a rejection and
+  never an abort (§10.3). Exit 6 with neither fact is an abort, as is any
+  other status: exit 3 (no bwrap, a missing bind directory, an unreadable
   `TMPDIR`, a floor that is not whole GiB), exit 4 (a run the gate lost:
   ended without a result),
   a timeout or a signal. The integrator measures the same floor, free
@@ -1217,6 +1227,19 @@ judges with one commit's gate, scenarios and helpers. **An owner edit is
 live only after its deploy**: a change to the gate, a scenario or the backlog
 is judged like any other commit before anything runs it, and what runs is a
 record of what was judged (§14 of design.md).
+
+A commit whose root holds a `pnpm-lock.yaml` (Supply PA) also has a deps
+tree: its `pnpm install` output, which git does not hold, at
+`~/.local/share/spawn-rsi/deps/<name>/<sha256 of the lockfile>` (read-only;
+`deploy/controller.sh deps` installs one, `update` does it when the
+lockfile's is missing, and a switch keeps the previous controller's tree and
+any tree an agent's workspace still links to, removing the rest). It is
+never the owner's checkout, whose `node_modules` every agent may write. The
+gate binds the store read-only into its sandbox, and engines and gates read
+it through `SUPPLY_PA_DEPS` (deploy/systemd/README.md "The controller").
+Read-only is a boundary against accidents, not agents: the same uid can
+hardlink a store file and write it; boundaries against a deliberate agent
+are per-agent uids or a mount per engine.
 
 ### 10.3 Landing
 
@@ -1517,6 +1540,25 @@ record of what was judged (§14 of design.md).
      pair of lines named in the record (`scenario`, `exits`), never on the
      reason's text, on time or on a scenario's name; the wait rests on the
      recorded `due_ms`.
+     **A scenario the host cannot judge is the host's, not the work.** Some
+     objectives judge the host itself, and the gate's sandbox can never
+     supply what they need: 029 needs a systemd user manager that delegates
+     the memory controller, and the sandbox has no user manager at all (the
+     owner's ruling, 2026-11-06). Such a scenario exits 6 and says why, with
+     its own fact (`{"cannot_judge":true,"scenario","runs"}`): the same exit
+     as a host fault, the key that tells them apart (gate.rs
+     `GateFailure::CannotJudge`). On the base the gate records the result
+     `cannot_judge`, once, in the base cache beside solved and unsolved; on
+     the candidate a regression that exits 6 is skipped and a task scenario
+     that exits 6 makes the gate state the fact and exit 6. The integrator
+     records `host_fault` with the evidence `cannot_judge`: never a
+     rejection, never an abort, no count toward a halt (and no count toward
+     `SPAWN_GATE_HOST_FAULT_CAP`, like a base-only fault), under 020's
+     backoff and escalation at the second in a row, the supervisor's digest
+     naming the objective as judged outside the gate by the owner (mission
+     7). Which objectives the gate cannot judge is said in
+     deploy/systemd/README.md ("Which objectives the gate cannot judge") and
+     in each scenario's header.
      The gate reports host faults of its own too: exit 6 with its fact in
      the verdict file (`{"host_fault":true,"scenario","on","runs",
      "reason"}`, gate.rs `HOST_FAULT_EXIT`), for a scenario's harness error
