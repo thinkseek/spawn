@@ -1978,11 +1978,17 @@ refuse "and its log says no wait" "$(cat "$work/slots-after-kill.log")" "waited"
 # A run that cannot get a slot within its bound: no room to judge now (exit
 # 5, the slot-shaped no-room fact), never a verdict; it starts nothing, and
 # the holder keeps and then frees its slot. The bound is 30 min; the test's
-# seam says 2 s, which is what SPAWN_GATE_SLOT_WAIT_SECS is for.
+# seam says 2 s, which is what SPAWN_GATE_SLOT_WAIT_SECS is for. The holder
+# holds its slot until the suite lets it go (the release file, at most
+# 120 s), not for a fixed time: the waiting gate's own setup comes before
+# its claim, and at a load of 9 it outlasted a 5 s hold, so the waiter found
+# the slot free and judged (exit 0).
 waitfold=$work/slots-wait
 mkdir -p "$waitfold"
 cp "$scenarios/protected" "$waitfold/"
-printf '#!/bin/sh\nsleep 5\nexit 0\n' >"$waitfold/check-hold.sh"
+rm -f "$waitfold/release"
+printf '#!/bin/sh\nn=0\nwhile [ ! -e %s/release ] && [ "$n" -lt 1200 ]; do sleep 0.1; n=$((n + 1)); done\nexit 0\n' \
+    "$waitfold" >"$waitfold/check-hold.sh"
 XDG_CACHE_HOME="$work/caches/slots-hold" SPAWN_GATE_JOBS=1 SPAWN_GATE_HOST_JOBS=1 \
     sh "$gate" "$repo" "$base" "$good" "$waitfold" >"$work/slots-hold.log" 2>&1 &
 hold=$!
@@ -2005,6 +2011,7 @@ expect "and its threshold the budget" "$(cat "$wait_verdict")" '"budget":1'
 expect "and the log says it gave up" "$(cat "$work/slots-wait.log")" \
     "gave up waiting for a host scenario slot after 2."
 refuse "the scenario never ran in it" "$(cat "$work/slots-wait.log")" "slot-start"
+: >"$waitfold/release"
 hold_status=0
 wait "$hold" || hold_status=$?
 expect "the holder still finished: exit 0" "$hold_status" 0
