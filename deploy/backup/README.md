@@ -57,11 +57,21 @@ Each `update` replaces the whole rule set. Tested with the host's S3 key:
 returns `403 AccessDenied`.
 
 **What can still remove backups:** a Cloudflare login with account rights,
-which can delete the lock rules. The `cf` OAuth login in
-`~/.config/cloudflare/` on this host is one, and it is readable by the same
-uid the agents run as. To make the locks hold against this host too, log `cf`
-out here when not administering Cloudflare (`cf auth logout`) and do bucket
-administration from another machine.
+which can change or delete the lock and lifecycle rules. None is on this
+host: there is no `cf` binary and no `~/.config/cloudflare/`, the bucket's
+S3 key answers `403` to the lifecycle (above), and the key is the S3 form of
+a token limited to bucket item read/write, which cannot change bucket
+settings at all. So the rules are applied from the owner's machine (the `cf`
+commands above). What that holds: no process running as this host's uid can
+delete or edit the lock rules, so a locked object cannot be deleted from here
+before its lock runs out (`DELETE` and an overwriting `PUT` answer
+`409 ObjectLockedByBucketPolicy`). What it does not hold: the same uid can
+read every object, and the passphrase in `~/.config/spawn/backup.key` is its
+to read, so a compromised host can take the backups with it; and it can
+delete what the locks do not cover — an object whose lock has lapsed, or
+`postgres/suspect/`, which has no lock rule. The locks bound deletion, not
+reading; a missing dump or bundle fails the daily `verify` (exit 1) and
+raises the `backup.verified` alert afterwards.
 
 ## The limit and the alert
 
@@ -92,7 +102,7 @@ failure and is told not to retry). Find out why; if the drop is intended
 | --- | --- | --- |
 | `~/.config/spawn/backup.key` | the encryption passphrase (32 random bytes, base64) | **every dump and bundle in R2 is unreadable.** Copy it off this host now (password manager or paper) |
 | `~/.config/spawn/r2.env` | `SPAWN_R2_ENDPOINT`, `SPAWN_R2_BUCKET`, `SPAWN_R2_ACCESS_KEY_ID`, `SPAWN_R2_SECRET_ACCESS_KEY` | make a new token (below) |
-| `~/.local/share/spawn-rsi/spawn.env` | `SPAWN_DATABASE_URL` (live) and `SPAWN_BACKUP_DRILL_DATABASE_URL` (the drill's server) | — |
+| `~/.local/share/spawn-rsi/spawn.env` | `SPAWN_DATABASE_URL` (live) and `SPAWN_BACKUP_DRILL_DATABASE_URL` (the fleet test database's server; the drill makes and drops its own database there) | — |
 
 The R2 credentials are the S3 form of a Cloudflare user API token named
 `spawn-store-backup` with only *Workers R2 Storage Bucket Item Read/Write* on
@@ -171,7 +181,11 @@ with a warning and exit 2), creates a database of its own
 `SPAWN_BACKUP_DRILL_DATABASE_URL`, restores into it with no error ignored,
 counts `spawn_events` and their highest id there, compares both with the
 record's, and drops the database on every path. It never restores into the
-source database or any database it did not create.
+source database or any database it did not create: `SPAWN_BACKUP_DRILL_DATABASE_URL`
+names the fleet test database's server — the database in the URL is the one
+the drill connects to for its `create` and `drop`, not a restore target — so
+its login needs `CREATEDB` and nothing more, a scratch name that already
+exists is refused, and the drop is only ever of the database the drill made.
 
 It then opens the newest `backup.bundled` record with a key — the sources
 and transcripts, the other half of what leaves the host — the same way:
