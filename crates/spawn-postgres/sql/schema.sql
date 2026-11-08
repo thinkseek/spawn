@@ -2924,7 +2924,8 @@ begin
     -- where); and its backoff.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
        and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log',
-                                                          'base_disagrees', 'gate')
+                                                          'base_disagrees', 'gate',
+                                                          'cannot_judge')
             or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
             or (p_record ->> 'evidence' in ('failures', 'server_log')
                 and (case when jsonb_typeof(p_record -> 'failures') = 'array'
@@ -2945,7 +2946,10 @@ begin
                          and jsonb_typeof(p_record -> 'setup_s') is distinct from 'number')))
             or (p_record ->> 'evidence' = 'gate'
                 and (coalesce(p_record -> 'fact' ->> 'scenario', '') !~ '^[^[:space:]|]+$'
-                     or coalesce(p_record -> 'fact' ->> 'on', '') not in ('base', 'candidate and base')))) then
+                     or coalesce(p_record -> 'fact' ->> 'on', '') not in ('base', 'candidate and base')))
+            or (p_record ->> 'evidence' = 'cannot_judge'
+                and (coalesce(p_record ->> 'scenario', '') !~ '^[^[:space:]|]+$'
+                     or jsonb_typeof(p_record -> 'escalate') is distinct from 'boolean'))) then
         raise exception 'a host_fault verdict names its evidence, its facts and backoff_ms: %',
                         p_record;
     end if;
