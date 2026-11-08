@@ -195,6 +195,15 @@ mkdir -p "$pnpm_dir"
 cat >"$pnpm_dir/pnpm" <<'SH'
 #!/bin/sh
 [ "${1-}" = install ] || { echo "stub pnpm: only install" >&2; exit 2; }
+# A lifecycle script would run as the owner with network: the install must
+# refuse them (controller.sh deps --ignore-scripts).
+case " $* " in
+*" --ignore-scripts "*) ;;
+*)
+    echo "stub pnpm: install without --ignore-scripts" >&2
+    exit 3
+    ;;
+esac
 [ -f pnpm-lock.yaml ] || { echo "stub pnpm: no pnpm-lock.yaml" >&2; exit 2; }
 mkdir -p node_modules/.pnpm node_modules/.bin
 cp pnpm-lock.yaml node_modules/.pnpm/lock.yaml

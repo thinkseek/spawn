@@ -173,7 +173,16 @@ deps() {
   # inodes, and a read-only tree would make those files read-only for every
   # tree and the store too. A clone (reflink) or a copy is the tree's own; the
   # check below refuses anything else.
-  ( cd "$tmp" && "$pnpm" install --frozen-lockfile --config.package-import-method=clone-or-copy ) >&2 ||
+  #
+  # --ignore-scripts: --frozen-lockfile freezes the lockfile, not the
+  # dependencies' lifecycle scripts, and this runs as the owner with network:
+  # a postinstall or prepare in the commit's root or in a workspace package
+  # (the protected list is a prefix list and could grow to cover one) would
+  # run here. Nothing in the tree needs one: pnpm-workspace.yaml sets
+  # `allowBuilds: esbuild: false`, and esbuild's binary comes from its
+  # platform package, not its postinstall. A new dependency that does need a
+  # build step is an owner decision, and a reason to revisit this line.
+  ( cd "$tmp" && "$pnpm" install --frozen-lockfile --ignore-scripts --config.package-import-method=clone-or-copy ) >&2 ||
     die "pnpm install failed in $tmp"
   # The install is the commit's: the export is the commit's tree, so the
   # lockfile pnpm froze against is the commit's (`--frozen-lockfile` refuses
