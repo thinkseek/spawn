@@ -998,6 +998,41 @@ mod tests {
         );
     }
 
+    /// A database outage's pause grows one interval per failed pass and
+    /// stops at four: the loop notices a restart within a few seconds of
+    /// its end (objective 032's soak), and an outage never ends it.
+    #[test]
+    fn an_outages_pause_grows_to_four_intervals_and_never_ends_the_loop() {
+        let interval = Duration::from_millis(500);
+        let dark = vec![format!(
+            "{}: connection closed",
+            spawn_core::port::UNREACHABLE
+        )];
+        let mut pace = Pace::default();
+        let mut recovery = crate::recover::Recovery::new();
+        let waits: Vec<Duration> = (0..8)
+            .map(|_| {
+                pace.after(&dark, interval, &mut recovery)
+                    .expect("an outage never ends the loop")
+                    .wait
+            })
+            .collect();
+        assert_eq!(
+            waits,
+            vec![
+                interval,
+                interval * 2,
+                interval * 3,
+                interval * 4,
+                interval * 4,
+                interval * 4,
+                interval * 4,
+                interval * 4,
+            ],
+            "at most two seconds at the 500 ms interval"
+        );
+    }
+
     #[test]
     fn backoff_waits_one_interval_per_failure_between_one_and_thirty() {
         let interval = Duration::from_millis(100);
