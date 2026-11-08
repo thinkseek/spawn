@@ -12,13 +12,9 @@
 //! No objective holds a slot for ever. A failed attempt is an outcome that
 //! says the work did not make it: a gate's `rejected`, `incompatible` or
 //! `conflict` (unless main could not be merged into the workspace, or merged
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
 //! cleanly: `merge` names how). An overrun over budget is not one: the work
 //! is kept and continued ([`Overrun`]), and a record from before an overrun
 //! was its own record (`task.aborted`) counts as it was written.
-=======
-//! cleanly: `merge` names how), or an abort over budget (`task.aborted`).
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 //! The host's outcomes (`no_room`, `host_fault`, a gate `aborted`) are not
 //! the work's and count for nothing, as for the halt rules. Once an
 //! objective has `SPAWN_OBJECTIVE_ATTEMPTS` (3) failed attempts since its
@@ -37,7 +33,6 @@
 //! (2026-11-07), three objectives whose tasks kept failing held mission 4's
 //! three slots for a day and ten objectives were never assigned.
 //!
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
 //! **A task over its budget keeps its work** (docs/fleet-architecture.md
 //! §10.4). The integrator stops it and records `task.over_budget`, which
 //! counts toward no halt; this module assigns the objective's next task
@@ -53,8 +48,6 @@
 //! mission's other objectives take the freed slot. A third overrun after
 //! such a configure is treated as a first.
 //!
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 //! An objective assigned again after earlier tasks of it ended without
 //! landing (cancelled, aborted, yielded) gets their work in its brief: each
 //! one's id, last checkpoint, last verdict or reason, and report, with the
@@ -460,10 +453,7 @@ pub(crate) fn choose<'a>(
     landings: &[Landing],
     in_flight: &BTreeSet<u32>,
     attempts: &BTreeMap<u32, Attempts>,
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
     held: &BTreeSet<u32>,
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
     free: usize,
 ) -> Vec<&'a Task> {
     let mut open: Vec<&Task> = backlog
@@ -471,10 +461,7 @@ pub(crate) fn choose<'a>(
         .filter(|task| {
             is_open(task, landings)
                 && !in_flight.contains(&task.id)
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
                 && !held.contains(&task.id)
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
                 && ordered(task, backlog, landings)
         })
         .collect();
@@ -494,7 +481,6 @@ pub(crate) struct Outcome {
     #[serde(rename = "type")]
     pub(crate) kind: String,
     pub(crate) objective: u32,
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
     /// The task the outcome is about, and the record's event id and time
     /// (the overrun's, for a continuation and its hold).
     #[serde(default)]
@@ -520,8 +506,6 @@ pub(crate) struct Outcome {
     pub(crate) budget: Option<serde_json::Value>,
     #[serde(default)]
     pub(crate) reason: Option<String>,
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
     #[serde(default)]
     pub(crate) verdict: Option<String>,
     /// For a conflict, how main went into the workspace (`main_merge`'s
@@ -560,7 +544,6 @@ impl Outcome {
     }
 }
 
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
 /// An objective's latest overrun (`task.over_budget`), and the work its next
 /// task continues.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -615,8 +598,6 @@ pub(crate) fn holds(overrun: &Overrun, configured_ms: Option<i64>) -> bool {
     overrun.chain && configured_ms.is_none_or(|at| at <= overrun.at_ms)
 }
 
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 /// An objective's attempts, read from its tasks' outcomes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Attempts {
@@ -717,10 +698,7 @@ pub(crate) fn yields(
 /// yield the slot. Without this the objective kept no yield and its
 /// failures, sorted ahead, and the next task for it yielded at once (rev-b
 /// on 226fa4a: objective 023, task 113 aborted with its fifth failure).
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
 #[cfg(test)]
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 pub(crate) fn abort_yields(
     attempts: &BTreeMap<u32, Attempts>,
     task: i64,
@@ -739,36 +717,6 @@ pub(crate) fn abort_yields(
     })
 }
 
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
-=======
-/// The yield an abort of `task` over budget makes, read from the store:
-/// the fields its `task.aborted` record adds (`yielded`, `objective`,
-/// `failures`, `limit`, `yield_reason`), or none.
-pub(crate) fn abort_yield(
-    store: &PostgresStore,
-    mission: &Mission,
-    task: &crate::integrate::Task,
-) -> Result<Option<serde_json::Value>, String> {
-    let (Some(_), Some(objective)) = (&mission.objectives, task.objective) else {
-        return Ok(None);
-    };
-    let outcomes: Vec<Outcome> = serde_json::from_value(
-        store
-            .objective_outcomes(mission.id)
-            .map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| format!("objective outcomes: {error}"))?;
-    let limit = attempt_limit(crate::config::env_value("SPAWN_OBJECTIVE_ATTEMPTS").as_deref());
-    Ok(
-        abort_yields(&attempts(&outcomes), task.id, objective, limit).map(|slot| {
-            json!({"yielded": true, "objective": slot.objective,
-               "failures": slot.failures.len(), "limit": limit,
-               "yield_reason": slot.reason()})
-        }),
-    )
-}
-
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 /// An objective mission's worker limit: `objectives ->> 'workers'`, 1 when
 /// absent (every mission configured before the limit existed).
 pub(crate) fn workers(objectives: &serde_json::Value) -> usize {
@@ -780,7 +728,6 @@ pub(crate) fn workers(objectives: &serde_json::Value) -> usize {
         .max(1)
 }
 
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
 /// What a continuation is told: the overrun task it continues, the branch,
 /// the commit and the diff stat its workspace holds, and its budget.
 pub(crate) fn continuation_note(over: &Overrun) -> String {
@@ -830,8 +777,6 @@ pub(crate) fn continuation_note(over: &Overrun) -> String {
     note
 }
 
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 /// The brief of an objective task: the objective, the working rules, the
 /// work earlier tasks of it left without landing, and what the gate said
 /// about earlier attempts.
@@ -840,10 +785,7 @@ pub(crate) fn brief(
     current: Option<f64>,
     prior: &[PriorWork],
     history: &[GateRecord],
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
     continues: Option<&Overrun>,
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 ) -> String {
     let mut brief = format!("Objective {}: {}\n\n{}\n", task.id, task.title, task.prompt);
     brief.push_str(
@@ -875,12 +817,9 @@ pub(crate) fn brief(
         }
         brief.push('\n');
     }
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
     if let Some(over) = continues {
         brief.push_str(&continuation_note(over));
     }
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
     if !prior.is_empty() {
         brief.push_str(
             "\nEarlier tasks on this objective ended without landing, newest first. Their \
@@ -970,10 +909,7 @@ pub(crate) fn assign_next(
     )
     .map_err(|error| format!("objective outcomes: {error}"))?;
     let mut attempts = attempts(&outcomes);
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
     let overruns = overruns(&outcomes);
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
     let limit = attempt_limit(crate::config::env_value("SPAWN_OBJECTIVE_ATTEMPTS").as_deref());
     let mut yielded = BTreeSet::new();
     for slot in yields(mission, &attempts, limit, settled) {
@@ -1017,7 +953,6 @@ pub(crate) fn assign_next(
     )
     .map_err(|error| format!("objective landings: {error}"))?;
     let in_flight: BTreeSet<u32> = flying.iter().filter_map(|task| task.objective).collect();
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
     // An overrun chain whose second overrun is not yet answered by a
     // configure holds its objective: no task is issued for it, and the
     // freed slot goes to the next open objective (the dispatcher tells the
@@ -1038,11 +973,6 @@ pub(crate) fn assign_next(
     let mut assigned = Vec::new();
     for task in choose(&objectives, &landings, &in_flight, &attempts, &held, free) {
         match assign(store, mission, task, &landings, overruns.get(&task.id)) {
-=======
-    let mut assigned = Vec::new();
-    for task in choose(&objectives, &landings, &in_flight, &attempts, free) {
-        match assign(store, mission, task, &landings) {
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
             Ok(id) => assigned.push(id),
             Err(error) if assigned.is_empty() => return Err(error),
             Err(error) => {
@@ -1080,22 +1010,12 @@ fn assign(
     .map_err(|error| format!("objective prior work: {error}"))?;
     let scenario = Path::new(&mission.gate).join(format!("{:03}.sh", task.id));
     let scenario = scenario.is_file().then(|| scenario.display().to_string());
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
     let text = brief(
         task,
         landed_value(task, landings),
         &prior,
         &history,
         continues,
-=======
-    let text = brief(task, landed_value(task, landings), &prior, &history);
-    let assigned = store
-        .objective_assign(mission.id, id, scenario.as_deref(), &text)
-        .map_err(|error| error.to_string())?;
-    println!(
-        "integrate: mission {} objective {} -> task {assigned}",
-        mission.id, task.id
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
     );
     let assigned = store
         .objective_assign_continuing(
@@ -1131,12 +1051,8 @@ fn assign(
 mod tests {
     use super::{
         Attempts, Landing, Outcome, PriorWork, Task, abort_yields, attempt_limit, attempts, brief,
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
         choose, holds, load_backlog, metric_lines, next_open, order_problems, overruns, workers,
         yields,
-=======
-        choose, load_backlog, metric_lines, next_open, order_problems, workers, yields,
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
@@ -1349,7 +1265,6 @@ mod tests {
         ];
         let none = BTreeSet::new();
         assert_eq!(
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
             ids(&choose(
                 &backlog,
                 &[],
@@ -1358,9 +1273,6 @@ mod tests {
                 &BTreeSet::new(),
                 3
             )),
-=======
-            ids(&choose(&backlog, &[], &none, &untried(), 3)),
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
             vec![1, 2, 3],
             "lowest first"
         );
@@ -1368,7 +1280,6 @@ mod tests {
         let solved = [landing(1, None)];
         let flying = BTreeSet::from([2]);
         assert_eq!(
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
             ids(&choose(
                 &backlog,
                 &solved,
@@ -1392,17 +1303,6 @@ mod tests {
                 &BTreeSet::new(),
                 3
             )),
-=======
-            ids(&choose(&backlog, &solved, &flying, &untried(), 3)),
-            vec![3, 4]
-        );
-        // No free slot, nothing.
-        assert!(choose(&backlog, &[], &none, &untried(), 0).is_empty());
-        // Fewer open objectives than slots: only those.
-        let three_solved = [landing(1, None), landing(2, None), landing(3, None)];
-        assert_eq!(
-            ids(&choose(&backlog, &three_solved, &none, &untried(), 3)),
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
             vec![4]
         );
     }
@@ -1417,7 +1317,6 @@ mod tests {
         )];
         let none = BTreeSet::new();
         assert_eq!(
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
             ids(&choose(
                 &backlog,
                 &missed,
@@ -1426,14 +1325,10 @@ mod tests {
                 &BTreeSet::new(),
                 2
             )),
-=======
-            ids(&choose(&backlog, &missed, &none, &untried(), 2)),
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
             vec![1, 2]
         );
         let flying = BTreeSet::from([1]);
         assert_eq!(
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
             ids(&choose(
                 &backlog,
                 &missed,
@@ -1442,9 +1337,6 @@ mod tests {
                 &BTreeSet::new(),
                 2
             )),
-=======
-            ids(&choose(&backlog, &missed, &flying, &untried(), 2)),
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
             vec![2]
         );
     }
@@ -1486,7 +1378,6 @@ mod tests {
         Outcome {
             kind: kind.to_string(),
             objective,
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
             task: 0,
             at_ms: None,
             continues: None,
@@ -1497,8 +1388,6 @@ mod tests {
             tool_calls: None,
             budget: None,
             reason: None,
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
             verdict: verdict.map(str::to_string),
             merge: merge.map(str::to_string),
             yielded: None,
@@ -1597,7 +1486,6 @@ mod tests {
         ]);
         let none = BTreeSet::new();
         assert_eq!(
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
             ids(&choose(&backlog, &[], &none, &tried, &BTreeSet::new(), 5)),
             vec![25, 26, 21, 23, 19]
         );
@@ -1605,12 +1493,6 @@ mod tests {
             ids(&choose(&backlog, &[], &none, &tried, &BTreeSet::new(), 1)),
             vec![25]
         );
-=======
-            ids(&choose(&backlog, &[], &none, &tried, 5)),
-            vec![25, 26, 21, 23, 19]
-        );
-        assert_eq!(ids(&choose(&backlog, &[], &none, &tried, 1)), vec![25]);
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
     }
 
     /// Three slots held by three objectives at the limit: the tasks being
@@ -1660,7 +1542,6 @@ mod tests {
         }
         let backlog: Vec<Task> = [19, 21, 23, 25, 26].map(|id| objective(id, false)).to_vec();
         assert_eq!(
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
             ids(&choose(
                 &backlog,
                 &[],
@@ -1669,9 +1550,6 @@ mod tests {
                 &BTreeSet::new(),
                 3
             )),
-=======
-            ids(&choose(&backlog, &[], &BTreeSet::new(), &after, 3)),
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
             vec![25, 26, 19]
         );
 
@@ -1718,14 +1596,10 @@ mod tests {
             .map(|id| objective(id, false))
             .to_vec();
         let flying = BTreeSet::from([19, 21]);
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
         assert_eq!(
             ids(&choose(&backlog, &[], &flying, &tried, &BTreeSet::new(), 1)),
             vec![25]
         );
-=======
-        assert_eq!(ids(&choose(&backlog, &[], &flying, &tried, 1)), vec![25]);
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         // Had 127 been sent back to revise, it would yield as well, and 026
         // take its slot.
         let sent_back = mission(3, &[(127, 19, "revise"), (106, 21, "reported")]);
@@ -1735,7 +1609,6 @@ mod tests {
             [127]
         );
         assert_eq!(
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
             ids(&choose(
                 &backlog,
                 &[],
@@ -1744,9 +1617,6 @@ mod tests {
                 &BTreeSet::new(),
                 2
             )),
-=======
-            ids(&choose(&backlog, &[], &BTreeSet::from([21]), &tried, 2)),
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
             vec![25, 26]
         );
     }
@@ -1781,11 +1651,7 @@ mod tests {
                 report: Some("x".repeat(5000)),
             },
         ];
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
         let text = brief(&objective(59, false), None, &prior, &[], None);
-=======
-        let text = brief(&objective(59, false), None, &prior, &[]);
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         assert!(text.contains("Their reports below say what each did and found"));
         assert!(!text.contains("branch"), "{text}");
         assert!(text.contains(
@@ -1796,11 +1662,7 @@ mod tests {
         assert!(text.contains("- task 150: yielded; it recorded no checkpoint"));
         assert!(text.contains("… (cut)"), "a long report is cut");
         assert!(text.len() < 5000);
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
         let first = brief(&objective(59, false), None, &[], &[], None);
-=======
-        let first = brief(&objective(59, false), None, &[], &[]);
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         assert!(!first.contains("Earlier tasks"), "a first task has none");
     }
 
@@ -1842,7 +1704,6 @@ mod tests {
         );
         let backlog: Vec<Task> = [23, 25, 26].map(|id| objective(id, false)).to_vec();
         assert_eq!(
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
             ids(&choose(
                 &backlog,
                 &[],
@@ -1851,9 +1712,6 @@ mod tests {
                 &BTreeSet::new(),
                 3
             )),
-=======
-            ids(&choose(&backlog, &[], &BTreeSet::new(), &tried, 3)),
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
             vec![26, 23, 25],
             "the untried first, then the yielded"
         );
@@ -1881,7 +1739,6 @@ mod tests {
         let backlog = vec![objective(28, false), objective(29, false), later, gone];
         let none = BTreeSet::new();
         assert_eq!(
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
             ids(&choose(
                 &backlog,
                 &[],
@@ -1914,16 +1771,6 @@ mod tests {
                 &BTreeSet::new(),
                 4
             )),
-=======
-            ids(&choose(&backlog, &[], &none, &untried(), 4)),
-            vec![28, 29]
-        );
-        let one = [landing(28, None)];
-        assert_eq!(ids(&choose(&backlog, &one, &none, &untried(), 4)), vec![29]);
-        let both = [landing(29, None), landing(28, None), landing(22, None)];
-        assert_eq!(
-            ids(&choose(&backlog, &both, &none, &untried(), 4)),
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
             vec![30, 32]
         );
 
