@@ -276,11 +276,7 @@ from (
         where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
           and c.succeeded and jsonb_typeof(c.action -> 'tags') = 'array')
     else '[]'::jsonb end as told,
-    (select c.idempotency_key from spawn_commands c
-      where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
-        and c.idempotency_key like 'deliver-%'
-        and (c.succeeded is distinct from false or position($1 in coalesce(c.error, '')) > 0)
-      order by c.id desc limit 1) as last_delivery,
+    ld.idempotency_key as last_delivery,
     (select count(*) from agent_executions x
        join spawn_commands c on c.id = x.command_id
       where x.session_id = s.session_id and c.principal = 'spawn-dispatch'
