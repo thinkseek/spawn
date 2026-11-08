@@ -835,6 +835,22 @@ mod tests {
         schedule
     }
 
+    /// A step that saw a moved watermark and had nothing to do keeps the
+    /// time it already waited for: an unrelated event never wipes an open
+    /// wait's probe.
+    #[test]
+    fn a_step_that_had_nothing_to_do_keeps_its_due_time() {
+        let mut step = Step::new();
+        step.ran(7, Some(2_000));
+        step.advance(9);
+        assert_eq!(step.mark(), Some(9), "the watermark it saw");
+        assert!(!step.runs(9, 1_999), "its probe is not due yet");
+        assert!(step.runs(9, 2_000), "and is, when its time comes");
+        step.ran(9, None);
+        step.advance(10);
+        assert!(!step.runs(10, 9_999), "a step with no clock waits for the log");
+    }
+
     /// A step runs on a record or on a time, never on the clock: a pass
     /// whose watermark is unchanged and whose due times are in the future
     /// runs nothing, one whose watermark moved runs it, and one whose due
