@@ -11,23 +11,16 @@ use spawn_jev::{JevConfig, JevJudge};
 
 use crate::Flags;
 use crate::config::{env_or, env_value, open_store, required_env, spawn_program, workspace_root};
-use crate::{context, envelope, sources, supervise};
+use crate::{context, sources, supervise};
 
 /// Build the Bridge and the Observer over one store.
 ///
 /// Both keep the event-log cursor in memory, so the resident loop builds
 /// them once. Rebuilding them per step would replay the whole log on every
 /// tick, and that cost grows with the log.
-pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer, envelope::Runtime), String> {
+pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
     // The Bridge merges main into branches with `git --attr-source`.
     crate::config::require_git()?;
-    // The host's resource envelope (objective 029): a setting that does not
-    // parse, or does not nest, refuses the start; the slice is given its
-    // limits before anything starts in it.
-    let envelopes = envelope::Runtime::from_env()?;
-    for warning in envelopes.prepare() {
-        eprintln!("spawn: {warning}");
-    }
     let store = Arc::new(open_store()?);
     let repo = flags
         .get("repo")
@@ -54,7 +47,7 @@ pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer, envelope::Runt
     let workspaces: Arc<dyn WorkspaceStore> = Arc::new(missions);
     let terminals: Arc<dyn TerminalHost> = Arc::new(crate::config::terminal_host());
 
-    let config = bridge_config(&envelopes, &store)?;
+    let config = bridge_config()?;
     let log: Arc<dyn EventLog> = store.clone();
     let queue: Arc<dyn CommandQueue> = store.clone();
     // Beside the workspaces: the transcripts are the agents' history.
@@ -77,21 +70,12 @@ pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer, envelope::Runt
         observer = observer.with_judge(judge);
     }
     observer.recover().map_err(|error| error.to_string())?;
-    Ok((bridge, observer, envelopes))
+    Ok((bridge, observer))
 }
 
 /// Programs and environment the Bridge puts into every terminal it starts.
-fn bridge_config(
-    envelopes: &envelope::Runtime,
-    store: &Arc<spawn_postgres::PostgresStore>,
-) -> Result<BridgeConfig, String> {
+fn bridge_config() -> Result<BridgeConfig, String> {
     let mut config = BridgeConfig::new(&env_or("SPAWN_WORKER", "spawn-worker"));
-    // Every execution in a scope of its own in the slice, and its admission
-    // and interruption records written as the owner (objectives 028, 029).
-    config.envelope = envelopes.envelope().cloned();
-    if config.envelope.is_some() {
-        config.records = Some(store.clone());
-    }
     config.spawn_program = spawn_program();
     config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
     config.claude_projects = claude_projects();

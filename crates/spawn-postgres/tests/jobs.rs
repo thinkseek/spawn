@@ -48,7 +48,6 @@ fn started(store: &PostgresStore, execution: u64) {
             fork: None,
             model: ModelProfile::Default,
             transcript_from: None,
-            envelope: None,
         },
     );
 }
@@ -161,6 +160,7 @@ fn an_executions_open_jobs_are_facts_until_they_or_it_end() {
         EventKind::ExecutionEnded {
             cause: EndCause::Stopped,
             exit_code: None,
+            signal: None,
             evidence: None,
         },
     );

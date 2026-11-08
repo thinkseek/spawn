@@ -161,27 +161,6 @@ pub enum EndCause {
     /// no runner (a dead pane, a shell restored after a restart). The end
     /// record's `evidence` says which.
     Lost,
-    /// The execution's resource envelope killed it (objective 029): the
-    /// kernel's OOM kill inside its scope, read from the scope's
-    /// `memory.events` or its unit's `Result` `oom-kill` at the end, never
-    /// from an exit code alone.
-    MemoryLimit,
-}
-
-/// The resource envelope an execution runs in (objective 029): its slice,
-/// its own scope unit and the cgroup the engine's process tree is in. The
-/// start records it before the engine starts, so any reader finds the
-/// cgroup an execution ran in. Left out when the host runs executions
-/// without one (no systemd user manager, SPAWN_ENVELOPE=off, or a record
-/// from before envelopes).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct EnvelopeRef {
-    /// The slice the scope is in (`spawn.slice`).
-    pub slice: String,
-    /// The scope unit (`spawn-exec_12.scope`).
-    pub scope: String,
-    /// The scope's cgroup, as `/sys/fs/cgroup` names it.
-    pub cgroup: String,
 }
 
 /// One workspace commit linked to the event that records why it happened.
@@ -374,10 +353,27 @@ pub enum EventKind {
         output_tokens: Option<u64>,
     },
     /// The turn ended with an engine or API failure.
+    ///
+    /// Claude Code fails a turn by writing an API error line to its
+    /// transcript and waiting at its prompt: nothing ends the execution,
+    /// so this record is what says a turn failed with a model cause. It
+    /// keeps the engine's own tags so a recovery can tell a model outage
+    /// from an expired login from an exhausted context without reading the
+    /// text (crate::ingest's `claude_line`).
     #[serde(rename = "turn.failed")]
     TurnFailed {
-        /// Engine error text, truncated.
+        /// The error text the engine showed, truncated (the line's
+        /// `message.content[].text`).
         error: String,
+        /// The engine's `apiErrorStatus`: the HTTP status of the failed
+        /// request (529, 503, 429, 401, 400, ...).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<i64>,
+        /// The engine's `error` tag: `overloaded`, `rate_limit`,
+        /// `server_error`, `authentication_failed`, `invalid_request`,
+        /// `unknown`, ...
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_kind: Option<String>,
     },
     /// The agent started a background job ([`JobKind`]), read from its
     /// transcript: the job's id as the engine named it. When it started is
@@ -427,10 +423,6 @@ pub enum EventKind {
         /// was kept (read from the start of the file).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transcript_from: Option<u64>,
-        /// The resource envelope the execution runs in (objective 029),
-        /// recorded before the engine starts.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        envelope: Option<EnvelopeRef>,
     },
     /// The execution ended.
     #[serde(rename = "execution.ended")]
@@ -439,6 +431,13 @@ pub enum EventKind {
         cause: EndCause,
         /// Process exit code when the OS reported one.
         exit_code: Option<i32>,
+        /// The signal that killed the engine, when one did (`9` for a
+        /// SIGKILL): the runner writes it to the exit file beside the
+        /// status (`crate::bridge`, "the end's cause and the signal"). An
+        /// engine the OS killed has no exit code, so without this every
+        /// kill reads as a clean exit with no code.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<i32>,
         /// What the Bridge saw when it ended an execution no runner of its
         /// own ran any more: the terminal gone, or there and hosting no
         /// runner ([`crate::port::Runner`]), and a stop or start that found

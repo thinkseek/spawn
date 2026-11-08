@@ -8,34 +8,23 @@
 //! it writes that event only after the final checkpoint, the terminal kill
 //! and the unmount. A refold of the log therefore never repeats cleanup.
 //!
-//! **Every execution runs in a resource envelope of its own** (objective
-//! 029). On a host whose systemd user manager delegates the memory
-//! controller (and unless SPAWN_ENVELOPE=off), the pane runs the engine
-//! through `systemd-run --user --scope --unit <slice stem>-<execution
-//! id>.scope --slice <slice> -p MemoryHigh=… -p MemoryMax=… -p
-//! MemorySwapMax=… -p OOMPolicy=stop`, so the engine and everything it
-//! starts (builds, tests, tools and their children) are in that scope's
-//! cgroup, directly inside Spawn's slice. One execution that runs away is
-//! throttled at its MemoryHigh, killed at its MemoryMax, and the kill ends
-//! that execution only: `OOMPolicy=stop` ends the rest of its scope, no
-//! other scope and not the slice. The start records the scope and its
-//! cgroup in `execution.started`, and the end classifies a kill from the
-//! scope's own `memory.events` `oom_kill` (or its unit's `Result`
-//! `oom-kill`, read before the unit is reset), never from an exit status:
-//! the end is cause `memory_limit`, its final checkpoint and unmount run as
-//! for any end, and objective 028's `execution.interrupted` record (cause
-//! `memory_limit`, path `resume`) says which scope and how many kills. A
-//! scope is no unit left behind once its end is recorded.
-//!
-//! **A start or a resume is admitted only when its envelope fits**, under
-//! the slice (its `anon` + `shmem` at most the slice's MemoryMax minus the
-//! envelope's MemoryMax) and on the host (`MemAvailable` at least the
-//! envelope's MemoryMax). A start that does not fit writes `admission.waiting`
-//! once and stays unfinished — neither it nor its execution fails — and is
-//! decided again at the next pass, so a restarted Bridge goes on with it; when
-//! it runs it writes `admission.admitted` with `waited_ms`. A host without a
-//! reachable user manager, or with SPAWN_ENVELOPE=off, runs executions as
-//! before: no scope, no admission.
+//! **An end's cause and its signal.** The Bridge tells three ends apart:
+//! `exited` (the runner wrote the engine's exit status), `stopped` (a Stop
+//! or a Discard, a workspace the store kept off its branch) and `lost` (no
+//! runner of the Bridge's own runs the execution any more: its terminal is
+//! gone, or is there and hosts no runner, which the end's `evidence` says).
+//! An engine the OS killed has no exit status, so the runner writes the
+//! signal that killed it beside the status (<[`signal_file`]> of
+//! [`exit_file`], `9` for a SIGKILL) and the end records it: without it a
+//! SIGKILL read as a clean exit with no code, and a crash was
+//! indistinguishable from an exit. What the Bridge records is the *how*; the
+//! *why* — the class a recovery acts on (`crashed`, `disk_full`,
+//! `model_unavailable`, `host_restart`, …) — is read from these facts, the
+//! transcript's API error lines and the host's own observations by the
+//! recovery (`spawn-cli`'s `recover`, docs/fleet-architecture.md §3.1).
+//! A turn the model failed ends no execution: Claude Code writes its API
+//! error line to the transcript and waits at its prompt, so `turn.failed`
+//! keeps the engine's own `apiErrorStatus` and `error` tag for that rule.
 //!
 //! An input to a busy session waits for its turn (docs/design.md §5). An
 //! `Input` from a person or the supervisor (any principal but the loops in
@@ -112,10 +101,9 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::command::{Claimed, CommandAction, Outcome};
-use crate::envelope::{Admission, Envelope, ScopeFacts, admit};
 use crate::event::{
-    ArtifactRef, CheckpointReason, CommandStep, ENGINE, EndCause, EnvelopeRef, EventKind,
-    EventRecord, Fork, GlobalPosition, ModelProfile, NewEvent, Source,
+    ArtifactRef, CheckpointReason, CommandStep, ENGINE, EndCause, EventKind, EventRecord, Fork,
+    GlobalPosition, ModelProfile, NewEvent, Source,
 };
 use crate::id::{
     AgentId, BranchName, CommandId, CommitId, ExecutionId, SessionId, TerminalName, WorkspaceId,
@@ -123,11 +111,7 @@ use crate::id::{
 use crate::ingest::{claude_line, claude_version};
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
-<<<<<<< 29aae0b4179d6ac364f6919628d3483f17b6e4a7
     BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch, Launch, READ_LIMIT, Runner,
-=======
-    BaseMerge, Branch, CommandQueue, Commit, EventLog, HostRecords, Launch, READ_LIMIT, Runner,
->>>>>>> 56be41ede20d8467385b4f125cb46807fcea05ce
     StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError, WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
@@ -268,25 +252,11 @@ pub struct BridgeConfig {
     pub screen_quiet: Duration,
     /// The model relay, when Claude Code engines go through one.
     pub model_relay: Option<ModelRelay>,
-<<<<<<< 29aae0b4179d6ac364f6919628d3483f17b6e4a7
     /// The watch on the files the engines write (transcripts and exit
     /// statuses), when the host has one. `None` reads every live execution's
     /// files on every pass, as Spawn did before watches: correct, and the
     /// cost grows with the fleet.
     pub watch: Option<Arc<dyn FileWatch>>,
-=======
-    /// The resource envelope every execution runs in (objective 029), when
-    /// the host has one: a systemd user scope of its own inside Spawn's
-    /// slice, with its own MemoryHigh, MemoryMax and MemorySwapMax. None
-    /// when SPAWN_ENVELOPE=off, when no user manager is reachable, or on a
-    /// host whose user manager does not delegate the memory controller:
-    /// executions then run as before.
-    pub envelope: Option<Envelope>,
-    /// Where the Bridge records admission waits and interruptions
-    /// ([`HostRecords`], the owner-only `spawn_host_record`). Needed only
-    /// with an [`Self::envelope`].
-    pub records: Option<Arc<dyn HostRecords>>,
->>>>>>> 56be41ede20d8467385b4f125cb46807fcea05ce
     /// Environment decided again at every engine launch, after
     /// `environment` and before `session_environment`: the fleet's test
     /// database, given only once it is known not to be the gates' server or
@@ -322,16 +292,17 @@ impl BridgeConfig {
             screen_refresh: Duration::from_secs(30),
             screen_quiet: Duration::from_millis(500),
             model_relay: None,
-<<<<<<< 29aae0b4179d6ac364f6919628d3483f17b6e4a7
             watch: None,
-=======
-            envelope: None,
-            records: None,
->>>>>>> 56be41ede20d8467385b4f125cb46807fcea05ce
             launch_environment: None,
         }
     }
 }
+
+/// An end the Bridge found: its cause, the exit code the runner wrote and
+/// the signal that killed the engine (one of the two codes is set when the
+/// end has one). It is what `execution.ended` records, and the recovery
+/// reads it to classify the end.
+type Ending = (EndCause, Option<i32>, Option<i32>);
 
 /// Running execution of one session.
 #[derive(Debug, Clone)]
@@ -344,7 +315,7 @@ struct Active {
     // Workspace calls get expensive.
     checkpoint: Option<CheckpointReason>,
     /// The runner reported the engine exit; cleanup is still due.
-    reported_end: Option<(EndCause, Option<i32>)>,
+    reported_end: Option<Ending>,
     /// The end committed its final checkpoint and killed the terminal
     /// (`execution.unmounting`): what is left is the unmount and the record.
     unmounting: bool,
@@ -440,11 +411,6 @@ struct Follow {
     /// execution (the terminal gone, or there and hosting no runner): the
     /// end record's `evidence`.
     evidence: Option<String>,
-    /// The execution's resource envelope, read at its end (objective 029):
-    /// its scope's cgroup and unit, so a memory-limit kill is classified
-    /// from the scope's own facts and the interruption record says which
-    /// scope it was.
-    envelope: Option<ScopeFacts>,
 }
 
 /// The watch on an execution's files ([`FileWatch`]).
@@ -974,8 +940,28 @@ impl Bridge {
         }
     }
 
-    /// Handle queued commands and advance running executions.
+    /// Handle queued commands and advance running executions: the whole
+    /// tick, in the order [`Self::work`] then [`Self::poll`] run it.
     pub fn tick(&mut self) -> Result<TickReport, StoreError> {
+        let (mut report, _) = self.work()?;
+        self.act(&mut report)?;
+        self.catch_up()?;
+        Ok(report)
+    }
+
+    /// The Bridge's own reading of the log and of the command queue: catch
+    /// up with the events written since the last one, and claim the commands
+    /// waiting in the queue, one per session at a time, until none is
+    /// claimable or [`BridgeConfig::max_commands_per_tick`] is reached.
+    ///
+    /// This is the part of a tick that reads the database, and it reads it
+    /// for records: its input is the log's latest events and the queue's
+    /// rows, so it is run when the log's watermark has moved and not on a
+    /// clock (docs/design.md §14). `true` says the claim stopped at that
+    /// limit, so a command may still be waiting for a claim now: the caller
+    /// runs this again on its next pass. The wait a lease dates
+    /// (`lease_until_ms`) is the caller's to time.
+    pub fn work(&mut self) -> Result<(TickReport, bool), StoreError> {
         self.catch_up()?;
         let mut report = TickReport::default();
         // Inputs left waiting keep their lease until the claims of this tick
@@ -1008,7 +994,6 @@ impl Bridge {
                 self.queue.release(claimed, self.config.input_wait_retry)?;
             }
         }
-<<<<<<< 29aae0b4179d6ac364f6919628d3483f17b6e4a7
         let left = report.commands >= self.config.max_commands_per_tick;
         Ok((report, left))
     }
@@ -1039,10 +1024,7 @@ impl Bridge {
         // terminal killed from outside ends its execution as lost on the
         // next pass, as before, without a tmux call per agent.
         self.runners = self.fleet_runners();
-=======
->>>>>>> 56be41ede20d8467385b4f125cb46807fcea05ce
         self.act(&mut report)?;
-        self.catch_up()?;
         Ok(report)
     }
 
@@ -1127,10 +1109,13 @@ impl Bridge {
             // An exit report of an old runner (engine-sourced; runners now
             // write SPAWN_EXIT_FILE): only old logs hold one.
             EventKind::ExecutionEnded {
-                cause, exit_code, ..
+                cause,
+                exit_code,
+                signal,
+                ..
             } if current => {
                 if let Some(active) = view.active.as_mut() {
-                    active.reported_end = Some((*cause, *exit_code));
+                    active.reported_end = Some((*cause, *exit_code, *signal));
                 }
             }
             // A recovered end goes straight to the unmount.
@@ -1144,7 +1129,7 @@ impl Bridge {
                 cause, exit_code, ..
             } if current => {
                 if let Some(active) = view.active.as_mut() {
-                    active.reported_end = Some((*cause, *exit_code));
+                    active.reported_end = Some((*cause, *exit_code, None));
                     active.follow.end_failures = active.follow.end_failures.max(END_ATTEMPTS);
                 }
             }
@@ -1293,16 +1278,10 @@ impl Bridge {
         } else {
             None
         };
-        // A memory-limit kill is read from the execution's own scope at its
-        // end, whatever the runner wrote (objective 029).
-        let end = end.map(|(cause, exit_code)| match self.envelope_end(active) {
-            Some(EndCause::MemoryLimit) => (EndCause::MemoryLimit, None),
-            _ => (cause, exit_code),
-        });
-        if let Some((cause, exit_code)) = end {
+        if let Some(ending) = end {
             // What the engine wrote last comes before its end.
             self.follow_output(agent_id, session, native, active, report)?;
-            return self.end(agent_id, session, active, cause, exit_code, false, report);
+            return self.end(agent_id, session, active, ending, false, report);
         }
         if let Some(reason) = active.checkpoint {
             // A commit that failed was reported; the checkpoint stays due.
@@ -1318,8 +1297,7 @@ impl Bridge {
                 agent_id,
                 session,
                 active,
-                EndCause::Stopped,
-                None,
+                (EndCause::Stopped, None, None),
                 false,
                 report,
             );
@@ -1330,12 +1308,17 @@ impl Bridge {
     /// The exit status the runner wrote when the engine exited, if it has.
     /// An unreadable file (not a regular file, a host error) is warned once
     /// and the engine counts as running: the pane's liveness still ends it.
+    ///
+    /// The runner writes the signal that killed the engine beside the
+    /// status ([`signal_file`]): an engine the OS killed has no exit code,
+    /// and without its signal a SIGKILL would read as a clean exit with
+    /// none. The end's record carries it (`execution.ended`'s `signal`).
     fn exit_status(
         &self,
         session: &SessionId,
         active: &mut Active,
         report: &mut TickReport,
-    ) -> Option<(EndCause, Option<i32>)> {
+    ) -> Option<Ending> {
         let bytes = match self
             .terminals
             .read_from(&active.workspace, &exit_file(active), 0)
@@ -1352,7 +1335,13 @@ impl Bridge {
             }
         };
         let text = String::from_utf8_lossy(&bytes);
-        Some((EndCause::Exited, text.trim().parse().ok()))
+        let signal = self
+            .terminals
+            .read_from(&active.workspace, &signal_file(active), 0)
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8_lossy(&bytes).trim().parse().ok());
+        Some((EndCause::Exited, text.trim().parse().ok(), signal))
     }
 
     /// How the execution ended when no runner of the Bridge's own runs it
@@ -1367,7 +1356,9 @@ impl Bridge {
         session: &SessionId,
         active: &mut Active,
         report: &mut TickReport,
-    ) -> Result<Option<(EndCause, Option<i32>)>, TerminalError> {
+    ) -> Result<Option<Ending>, TerminalError> {
+        // The fleet's view of every runner when it is watched
+        // ([`Self::fleet_runners`]), else the one terminal asked about.
         let asked = match self.runners.as_ref() {
             Some(runners) => runners.get(&active.terminal()).cloned(),
             None => Some(
@@ -1385,7 +1376,7 @@ impl Bridge {
             return Ok(Some(end));
         }
         active.follow.evidence = Some(format!("{seen}; its runner wrote no exit status"));
-        Ok(Some((EndCause::Lost, None)))
+        Ok(Some((EndCause::Lost, None, None)))
     }
 
     /// Append the events in what the engine wrote to its transcript since
@@ -1798,18 +1789,17 @@ impl Bridge {
     /// checkpoint is retried every [`END_RETRY_MS`] until it commits. Only
     /// `discard` (a person's or the supervisor's decision) unmounts a
     /// workspace whose final checkpoint failed.
-    #[allow(clippy::too_many_arguments)]
     fn end(
         &self,
         agent_id: &AgentId,
         session: &SessionId,
         active: &mut Active,
-        cause: EndCause,
-        exit_code: Option<i32>,
+        ending: Ending,
         discard: bool,
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
-        active.reported_end = Some((cause, exit_code));
+        let (cause, exit_code, signal) = ending;
+        active.reported_end = Some(ending);
         // The checkpoint and the terminal are behind an end that recorded
         // its unmount: what is left is the unmount and the record.
         if active.unmounting {
@@ -1823,7 +1813,7 @@ impl Bridge {
                     .push(format!("terminate {}: {error}", active.terminal()));
                 return Ok(false);
             }
-            return self.finish_end(agent_id, session, active, cause, exit_code, report);
+            return self.finish_end(agent_id, session, active, ending, report);
         }
         // A checkpoint whose record waits is recorded before the end.
         if let Err(error) = self.record_unrecorded_commit(session) {
@@ -1892,7 +1882,13 @@ impl Bridge {
             EventKind::ExecutionUnmounting,
         )?;
         active.unmounting = true;
-        self.finish_end(agent_id, session, active, cause, exit_code, report)
+        self.finish_end(
+            agent_id,
+            session,
+            active,
+            (cause, exit_code, signal),
+            report,
+        )
     }
 
     /// The last of an end, from its recorded `execution.unmounting` (the
@@ -1903,10 +1899,10 @@ impl Bridge {
         agent_id: &AgentId,
         session: &SessionId,
         active: &Active,
-        cause: EndCause,
-        exit_code: Option<i32>,
+        ending: Ending,
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
+        let (cause, exit_code, signal) = ending;
         if let Err(error) = self.workspaces.unmount(&active.workspace) {
             report
                 .warnings
@@ -1921,17 +1917,10 @@ impl Bridge {
             EventKind::ExecutionEnded {
                 cause,
                 exit_code,
+                signal,
                 evidence: active.follow.evidence.clone(),
             },
         )?;
-        // What the end was, if it was the envelope's (objective 028's
-        // record), and then the scope goes: a failed unit keeps its `Result`
-        // only until it is read, and a unit left behind would be one per
-        // execution.
-        self.record_interruption(agent_id, session, active, cause, report);
-        if let Some(envelope) = self.config.envelope.as_ref() {
-            envelope.reset_failed(&envelope.execution_scope(&active.execution_id));
-        }
         Ok(true)
     }
 
@@ -1961,7 +1950,7 @@ impl Bridge {
             active.workspace,
             END_RETRY_MS / 1000
         ));
-        let (cause, exit_code) = active.reported_end.unwrap_or((EndCause::Lost, None));
+        let (cause, exit_code, _) = active.reported_end.unwrap_or((EndCause::Lost, None, None));
         self.append(
             agent_id,
             session,
@@ -2138,18 +2127,6 @@ impl Bridge {
                 "stored action is not valid".to_string(),
             )));
         };
-        // A start or a resume runs only when its envelope fits under the
-        // slice and on the host (objective 029); while it does not, the
-        // command waits unfinished, decided again at the next pass.
-        if matches!(
-            &action,
-            CommandAction::Start { .. } | CommandAction::Resume { .. }
-        ) {
-            if !self.admitted(claimed)? {
-                return Ok(Handled::Waiting);
-            }
-            self.finish_admission(claimed)?;
-        }
         // What a command appends comes after the session's waiting commit
         // records. While the log refuses them the command is not handled
         // (the error ends the tick; the lease brings the command back).
@@ -2296,7 +2273,7 @@ impl Bridge {
             return Ok(None);
         }
         let mut report = TickReport::default();
-        let Ok(Some((cause, exit_code))) =
+        let Ok(Some((cause, exit_code, signal))) =
             self.not_running(&claimed.session_id, &mut active, &mut report)
         else {
             return Ok(None);
@@ -2313,8 +2290,7 @@ impl Bridge {
             &claimed.agent_id,
             &claimed.session_id,
             &mut active,
-            cause,
-            exit_code,
+            (cause, exit_code, signal),
             false,
             &mut report,
         )?;
@@ -2430,10 +2406,6 @@ impl Bridge {
             unmounting: false,
             follow: Follow::default(),
         };
-        // The envelope the engine is about to run in, named before it
-        // starts: any reader of the log finds the cgroup the execution ran
-        // in (objective 029).
-        let envelope = self.envelope_ref(&active);
         // The event goes first: a crash after it leaves a recorded execution
         // whose missing terminal the next tick ends as lost.
         let recorded = self.append(
@@ -2449,7 +2421,6 @@ impl Bridge {
                 fork,
                 model,
                 transcript_from,
-                envelope,
             },
         );
         match recorded {
@@ -2967,8 +2938,7 @@ impl Bridge {
             &claimed.agent_id,
             &claimed.session_id,
             &mut ending,
-            EndCause::Lost,
-            None,
+            (EndCause::Lost, None, None),
             discard,
             &mut report,
         )?;
@@ -3061,119 +3031,6 @@ impl Bridge {
         Ok(Some(id))
     }
 
-    /// Whether a start or a resume may run now (objective 029): its
-    /// execution envelope must fit under the slice and on the host. While it
-    /// does not, the wait is recorded once (`admission.waiting`) and the
-    /// command stays unfinished — claimed again after
-    /// [`BridgeConfig::input_wait_retry`] and decided from that pass's
-    /// measures — so nothing starts and no command fails. A start that fits
-    /// at once writes nothing.
-    fn admitted(&self, claimed: &Claimed) -> Result<bool, StoreError> {
-        let (Some(envelope), Some(records)) = (&self.config.envelope, &self.config.records) else {
-            return Ok(true);
-        };
-        admit(
-            records.as_ref(),
-            &claimed_admission(claimed, envelope.settings.execution.max),
-            envelope.shortfall(envelope.settings.execution.max),
-        )
-    }
-
-    /// The `admission.admitted` record of a start or resume that waited,
-    /// written once when it runs: `waited_ms` is from the wait's first
-    /// decision to now, by the database's clock. A start that fits at once
-    /// wrote no wait and writes nothing here.
-    fn finish_admission(&self, claimed: &Claimed) -> Result<(), StoreError> {
-        let (Some(envelope), Some(records)) = (&self.config.envelope, &self.config.records) else {
-            return Ok(());
-        };
-        crate::envelope::admitted(
-            records.as_ref(),
-            &claimed_admission(claimed, envelope.settings.execution.max),
-        )
-    }
-
-    /// The resource envelope the execution runs in, as its start records it:
-    /// the slice, the scope unit and the cgroup, so any reader of the log
-    /// finds the cgroup the execution ran in.
-    fn envelope_ref(&self, active: &Active) -> Option<EnvelopeRef> {
-        let envelope = self.config.envelope.as_ref()?;
-        let scope = envelope.execution_scope(&active.execution_id);
-        Some(EnvelopeRef {
-            slice: envelope.settings.slice.clone(),
-            cgroup: envelope.scope_cgroup(&scope).display().to_string(),
-            scope,
-        })
-    }
-
-    /// The end the execution's envelope makes of it (objective 029): a
-    /// memory-limit kill, read from the execution's own scope now — its
-    /// `memory.events` `oom_kill`, or its unit's `Result` `oom-kill` when
-    /// the cgroup is already gone — never from an exit status (137 is any
-    /// SIGKILL) and never from the host's state. The facts are kept for the
-    /// end's record and its interruption.
-    fn envelope_end(&self, active: &mut Active) -> Option<EndCause> {
-        let envelope = self.config.envelope.as_ref()?;
-        let scope = envelope.execution_scope(&active.execution_id);
-        let mut facts = envelope.scope_facts(&scope);
-        if facts.memory_peak.is_none() {
-            facts.memory_peak = read_peak(&envelope_file(active));
-        }
-        let killed = facts.oom_killed();
-        active.follow.envelope = Some(facts);
-        killed.then_some(EndCause::MemoryLimit)
-    }
-
-    /// Record a memory-limit kill as objective 028's interruption
-    /// (`execution.interrupted`, cause `memory_limit`, path `resume`), once
-    /// per execution, from the facts the scope gave: any reader sees why the
-    /// execution ended and which scope it was in.
-    fn record_interruption(
-        &self,
-        agent_id: &AgentId,
-        session: &SessionId,
-        active: &Active,
-        cause: EndCause,
-        report: &mut TickReport,
-    ) {
-        if cause != EndCause::MemoryLimit {
-            return;
-        }
-        let (Some(envelope), Some(records)) = (&self.config.envelope, &self.config.records) else {
-            return;
-        };
-        let execution = active.execution_id.to_string();
-        match records.interrupted(&execution) {
-            Ok(false) => {}
-            Ok(true) => return,
-            Err(error) => {
-                report
-                    .warnings
-                    .push(format!("{session}: interruption record: {error}"));
-                return;
-            }
-        }
-        let mut facts = active.follow.envelope.clone().unwrap_or_default();
-        if facts.scope.is_empty() {
-            facts.scope = envelope.execution_scope(&active.execution_id);
-        }
-        let record = json!({
-            "type": "execution.interrupted",
-            "agent_id": agent_id.to_string(),
-            "session_id": session.to_string(),
-            "execution_id": execution,
-            "cause": "memory_limit",
-            "path": "resume",
-            "attempt": 1,
-            "evidence": facts.evidence(envelope.settings.execution.max),
-        });
-        if let Err(error) = records.record(&record) {
-            report
-                .warnings
-                .push(format!("{session}: interruption record: {error}"));
-        }
-    }
-
     fn launch(&self, claimed: &Claimed, active: &Active, run: &Run<'_>) -> Launch {
         let Run {
             native,
@@ -3214,35 +3071,11 @@ impl Bridge {
         // The runner writes the exit status where the Bridge reads it: the
         // pane needs no login of its own.
         environment.push(("SPAWN_EXIT_FILE".to_string(), exit_file(active)));
-        // The engine (and the runner, and everything either starts) runs in
-        // a scope of its own inside the slice (objective 029): one build,
-        // test or tool that runs away is bounded by the execution's
-        // MemoryHigh, MemoryMax and MemorySwapMax, and its kill ends this
-        // execution only.
-        let (program, arguments) = match self.config.envelope.as_ref() {
-            Some(envelope) => {
-                environment.push(("SPAWN_ENVELOPE_FILE".to_string(), envelope_file(active)));
-                // The pane's `systemd-run` finds the manager whose bus the
-                // Bridge probed, whatever the tmux server's environment says.
-                environment.push((
-                    "XDG_RUNTIME_DIR".to_string(),
-                    envelope.manager.runtime_dir.clone(),
-                ));
-                let scope = envelope.execution_scope(&active.execution_id);
-                envelope.wrap(
-                    &scope,
-                    envelope.settings.execution,
-                    &self.config.spawn_program,
-                    &arguments,
-                )
-            }
-            None => (self.config.spawn_program.clone(), arguments),
-        };
         Launch {
             terminal: active.terminal(),
             workspace: active.workspace.clone(),
             cwd: active.workspace.path().to_string(),
-            program,
+            program: self.config.spawn_program.clone(),
             arguments,
             environment,
         }
@@ -3584,7 +3417,10 @@ impl Bridge {
         };
         let mut report = TickReport::default();
         // A stop of an end already under way keeps its cause.
-        let (cause, exit_code) = active.reported_end.unwrap_or((EndCause::Stopped, None));
+        let (cause, exit_code, signal) =
+            active
+                .reported_end
+                .unwrap_or((EndCause::Stopped, None, None));
         // A stop that finds no runner of its own there (the terminal gone,
         // or hosting no runner) still writes the end the log waits for, and
         // says what it found.
@@ -3605,8 +3441,7 @@ impl Bridge {
             &claimed.agent_id,
             &claimed.session_id,
             &mut active,
-            cause,
-            exit_code,
+            (cause, exit_code, signal),
             discard,
             &mut report,
         )?;
@@ -3706,7 +3541,6 @@ fn cause_name(cause: EndCause) -> &'static str {
         EndCause::Exited => "exited",
         EndCause::Stopped => "stopped",
         EndCause::Lost => "lost",
-        EndCause::MemoryLimit => "memory_limit",
     }
 }
 
@@ -3720,10 +3554,6 @@ fn untyped_because(cause: Option<EndCause>) -> String {
         }
         Some(EndCause::Lost) => {
             "the session's execution ended (lost) before the input was typed".to_string()
-        }
-        Some(EndCause::MemoryLimit) => {
-            "the session's execution was killed by its memory limit before the input was              typed"
-                .to_string()
         }
         None => "the session's execution ended before the input was typed".to_string(),
     }
@@ -4028,7 +3858,13 @@ fn exit_file(active: &Active) -> String {
     )
 }
 
-<<<<<<< 29aae0b4179d6ac364f6919628d3483f17b6e4a7
+/// Where the runner notes the signal that killed the engine, beside the
+/// exit status ([`exit_file`]): the status of a program the OS killed is
+/// empty, and a kill without its signal cannot be told from a clean exit.
+fn signal_file(active: &Active) -> String {
+    format!("{}.signal", exit_file(active))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -4576,35 +4412,3 @@ mod tests {
         );
     }
 }
-=======
-/// Where the runner notes its cgroup's memory peak (`memory.peak`) while it
-/// runs: the scope's cgroup is gone by the time the Bridge reads the end, so
-/// the last reading the runner wrote is what an end's evidence can say.
-fn envelope_file(active: &Active) -> String {
-    format!(
-        "{}/.spawn/envelope-{}",
-        active.workspace.path(),
-        active.execution_id
-    )
-}
-
-/// The admission of a start or resume command: the record's fields and the
-/// envelope it must fit in.
-fn claimed_admission<'a>(claimed: &Claimed, envelope_bytes: u64) -> Admission<'a> {
-    Admission {
-        kind: "execution",
-        fields: json!({
-            "agent_id": claimed.agent_id.to_string(),
-            "session_id": claimed.session_id.to_string(),
-            "command_id": claimed.command_id.0,
-        }),
-        envelope_bytes,
-        after: 0,
-    }
-}
-
-/// The bytes `path` holds, a number, when it reads as one.
-fn read_peak(path: &str) -> Option<u64> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
-}
->>>>>>> 56be41ede20d8467385b4f125cb46807fcea05ce

@@ -171,6 +171,29 @@ fn nudges_this_hour(facts: &Facts, now_ms: i64) -> usize {
         .count()
 }
 
+/// How long until this worker's nudge limit frees up with no new record:
+/// the moment a nudge that reached it leaves the hour
+/// ([`nudges_this_hour`]). `None` when nothing keeps it from a nudge now.
+pub(super) fn due_in(facts: &Facts, now_ms: i64) -> Option<i64> {
+    if !facts.live || facts.open_command {
+        return None;
+    }
+    if !nudgeable(facts.current_observation()?) {
+        return None;
+    }
+    facts
+        .dispatched
+        .iter()
+        .filter(|sent| sent.key.starts_with(NUDGE_KEY_PREFIX) && reached(sent))
+        .map(|sent| {
+            sent.created_at_ms
+                .saturating_add(HOUR_MS)
+                .saturating_sub(now_ms)
+        })
+        .filter(|left| *left > 0)
+        .min()
+}
+
 /// The guarded nudge, for a worker Jev judged idle and fine: `continue`
 /// once per episode within the hourly limit; a nudge that did not help, or
 /// the limit, escalates. Only a nudge that reached the worker ([`reached`])
@@ -249,9 +272,13 @@ pub(super) fn decide_worker(facts: &Facts, now_ms: i64) -> Decision {
     if facts.open_command {
         return Decision::Nothing;
     }
-    // 1. Rules over facts. Residents are revived by the liveness rule
-    // (crate::supervise), so only ephemeral workers are resumed here.
+    // 1. Rules over facts. The recovery (crate::recover) revives every end
+    // it recorded, whatever the cause and whoever the agent; the one-resume
+    // rule below is what is left for an end it has not recorded (a host
+    // whose loop is not running the recovery), so only ephemeral workers
+    // are resumed here.
     if !facts.live
+        && facts.recovered.is_none()
         && facts.end_cause.as_deref() == Some("lost")
         && facts.agent_id.starts_with("agent_worker_")
     {
