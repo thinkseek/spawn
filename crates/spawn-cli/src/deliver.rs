@@ -377,7 +377,7 @@ pub(crate) struct Cancelled {
     #[serde(default)]
     pub(crate) reason: Option<String>,
     /// That record yielded the task's objective's slot
-    /// (`objectives::yields`, `objectives::abort_yield`).
+    /// (`objectives::yields`).
     #[serde(default)]
     pub(crate) yielded: bool,
     /// An abort's reason for yielding as well (`yield_reason`).
@@ -1243,6 +1243,19 @@ fn cancel_order(cancelled: &Cancelled, facts: &Facts, now_ms: i64) -> Option<Ord
     ))
 }
 
+/// The line every task's prompt carries about databases and credentials.
+/// The Bridge sets `SPAWN_TEST_DATABASE_URL` to the fleet's own test server
+/// (`SPAWN_FLEET_TEST_DATABASE_URL`); without one a worker went looking for
+/// a database in the loop's environment file (2026-11-08).
+pub(crate) const CREDENTIALS_LINE: &str = "Your test database is $SPAWN_TEST_DATABASE_URL; never \
+read any credential file, never put a URL on a command line, never print or echo it.";
+
+/// The line every task's prompt carries about other processes: a resident
+/// killed a ccd's test run with `pkill -f 'cargo test'` (2026-11-08); the
+/// engines' settings deny killing by pattern too (`CREDENTIAL_DENY`).
+pub(crate) const PROCESSES_LINE: &str =
+    "Never kill a process you did not start; stop your own background jobs by their id.";
+
 /// How every task asks to be reported on.
 fn report_contract() -> String {
     format!(
@@ -1272,7 +1285,7 @@ pub(crate) fn task_prompt(task: &TaskRow) -> String {
         _ => "You are a Spawn worker started for one task. Work only on it.".to_string(),
     };
     format!(
-        "{role}\n\nMission #{}: {}\n\nTask #{}:\n{}\n\n{}",
+        "{role}\n\nMission #{}: {}\n\nTask #{}:\n{}\n\n{CREDENTIALS_LINE}\n{PROCESSES_LINE}\n\n{}",
         task.mission_id,
         task.mission_text,
         task.id,
@@ -1295,7 +1308,7 @@ fn typed(task: &TaskRow) -> String {
         )
     } else {
         format!(
-            "New task #{} for mission #{}: {}\n\nTask:\n{}\n\n{}",
+            "New task #{} for mission #{}: {}\n\nTask:\n{}\n\n{CREDENTIALS_LINE}\n{PROCESSES_LINE}\n\n{}",
             task.id,
             task.mission_id,
             task.mission_text,
@@ -1743,9 +1756,9 @@ fn send_note(
 #[cfg(test)]
 mod tests {
     use super::{
-        Cancelled, DELIVERY_RETRIES, News, REPORT, TaskRow, Work, delivered, delivery_mark,
-        mark_delivery, new_report, news_items, notice_task, put_aside, report_contract, report_due,
-        task_prompt,
+        CREDENTIALS_LINE, Cancelled, DELIVERY_RETRIES, News, PROCESSES_LINE, REPORT, TaskRow, Work,
+        delivered, delivery_mark, mark_delivery, new_report, news_items, notice_task, put_aside,
+        report_contract, report_due, task_prompt, typed,
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
@@ -2826,6 +2839,41 @@ mod tests {
             assert!(contract.contains(words), "{words:?} in {contract}");
         }
         assert!(task_prompt(&task(9, TaskState::Assigned, "ephemeral")).contains(&contract));
+    }
+
+    #[test]
+    fn every_new_task_names_the_test_database_and_forbids_credentials() {
+        assert_eq!(
+            CREDENTIALS_LINE,
+            "Your test database is $SPAWN_TEST_DATABASE_URL; never read any credential file, \
+             never put a URL on a command line, never print or echo it."
+        );
+        let resident = task(9, TaskState::Assigned, "resident");
+        let mut ephemeral = task(10, TaskState::Assigned, "ephemeral");
+        ephemeral.resident = None;
+        ephemeral.charter = None;
+        for prompt in [
+            task_prompt(&resident),
+            task_prompt(&ephemeral),
+            typed(&resident),
+        ] {
+            assert!(prompt.contains(CREDENTIALS_LINE), "{prompt}");
+            assert!(prompt.contains(PROCESSES_LINE), "{prompt}");
+            // Before the report contract, after the brief.
+            let line = prompt.find(CREDENTIALS_LINE).expect("the line");
+            assert!(prompt.find("brief ").is_some_and(|brief| brief < line));
+            assert!(
+                prompt
+                    .find(&report_contract())
+                    .is_some_and(|contract| line < contract)
+            );
+        }
+        // A revision continues a task whose prompt had it.
+        assert!(!typed(&task(9, TaskState::Revise, "resident")).contains(CREDENTIALS_LINE));
+        assert_eq!(
+            PROCESSES_LINE,
+            "Never kill a process you did not start; stop your own background jobs by their id."
+        );
     }
 
     #[test]

@@ -81,9 +81,21 @@ if ! pg_url_parse "$base_url"; then
   exit 1
 fi
 owner_password=$pg_url_password
+# e2e_psql <psql arguments>: psql on the test database with its connection
+# from PG* variables (pg_url_parse above), never a URL on its command line,
+# which every local user reads in /proc. In this run's schema unless
+# E2E_PSQL_SCHEMA is empty.
+e2e_psql() {
+  (
+    export PGHOST=$pg_url_host PGPORT=$pg_url_port PGUSER=$pg_url_user
+    export PGPASSWORD=$pg_url_password PGDATABASE=$pg_url_database
+    if [ -n "${E2E_PSQL_SCHEMA-$schema}" ]; then export PGOPTIONS="-csearch_path=$schema"; fi
+    psql -X "$@"
+  )
+}
 supervisor_url() {
   local login role salt password
-  login=$(psql -X -q -At "$url" -c "select r.rolname || ' ' || substring(
+  login=$(e2e_psql -q -At -c "select r.rolname || ' ' || substring(
             shobj_description(r.oid, 'pg_authid') from '^spawn login salt ([0-9a-f]{64})$')
             from pg_roles r where r.rolname = spawn_login_role('spawn_supervisor')")
   role=${login% *}
@@ -99,12 +111,13 @@ print(hashlib.pbkdf2_hmac("sha256", owner.encode(), salt, 600000).hex())' "$salt
 
 cleanup() {
   [ -n "$timing_out" ] && timing_report "$timing_out"
+  [ -n "$loop_pid" ] && kill -CONT "$loop_pid" 2>/dev/null || true
   [ -n "$loop_pid" ] && kill "$loop_pid" 2>/dev/null || true
   [ -n "$jev_pid" ] && kill "$jev_pid" 2>/dev/null || true
   "$tmux" -L "$socket" kill-server 2>/dev/null || true
   rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$socket"
   if [ "${KEEP:-0}" != 1 ] && command -v psql >/dev/null; then
-    psql -q "$base_url" -c "drop schema if exists $schema cascade" >/dev/null 2>&1 || true
+    E2E_PSQL_SCHEMA='' e2e_psql -q -c "drop schema if exists $schema cascade" >/dev/null 2>&1 || true
   fi
   if [ "${KEEP:-0}" != 1 ]; then rm -rf "$work"; else echo "e2e: kept $work" >&2; fi
 }
@@ -172,7 +185,8 @@ ln -s ws-real "$work/ws"
 # Draws a prompt, writes a Claude Code session transcript where the real
 # engine does (the Bridge reads it; nothing reports to Spawn), and acts on
 # tokens in typed lines:
-#   E2E:WORK   one tool call, then "DONE", then stop
+#   E2E:WORK   one tool call (held while the test holds tools), then
+#              "DONE", then stop
 #   E2E:STALL  stop partway ("STALLED"); a later "continue" finishes it
 #   E2E:ASK    stop with a HUMAN: question
 #   E2E:REPORT write .spawn/report.md, then stop; with E2E:WRITE=<file>,
@@ -205,6 +219,24 @@ tool() {
   sleep "${1:-0.3}"
   line "\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"$id\",\"content\":\"ok\"}]}"
 }
+# held_tool: E2E:WORK's tool call. While the test holds tools
+# ($E2E_WORK/tool.hold exists) it stays open until the test lets go, so a
+# judgement the test waits for "while the tool runs" can be recorded however
+# slow the loop is; $E2E_WORK/tool.held.<session> says the call has begun.
+# E2E_TOOL_HOLD_GUARD (seconds, default 900) bounds a hold nobody lifts.
+held_tool() {
+  n=$((n + 1))
+  id=t$n-$SPAWN_EXECUTION_ID
+  line "\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"$id\",\"name\":\"Bash\",\"input\":{}}]}"
+  if [ -e "$E2E_WORK/tool.hold" ]; then
+    : >"$E2E_WORK/tool.held.$SPAWN_SESSION_ID"
+    guard=$((SECONDS + ${E2E_TOOL_HOLD_GUARD:-900}))
+    while [ -e "$E2E_WORK/tool.hold" ] && [ "$SECONDS" -lt "$guard" ]; do sleep 0.2; done
+  else
+    sleep 0.3
+  fi
+  line "\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"$id\",\"content\":\"ok\"}]}"
+}
 stop() { line '"type":"system","subtype":"turn_duration","durationMs":1'; printf '\n❯ '; }
 printf 'Welcome to Claude Code\n\n❯ '
 pending=0
@@ -216,7 +248,7 @@ while :; do
     *E2E:WORK*)
       prompt
       printf '\nworking...\n'
-      tool "${E2E_TOOL_SECONDS:-0.3}"
+      held_tool
       printf 'DONE: work finished\n'
       stop; pending=0 ;;
     *E2E:STALL*)
@@ -367,17 +399,27 @@ wait_for 30 "the supervisor's native session" grep -q '^session_supervisor' "$wo
 pass "supervisor started by the liveness rule"
 
 # --- 1+2. rules decide WORKING; Jev decides the idle prompt; digest ---------
-# Long enough for the transcript's tool.started to be ingested and judged
-# while the tool still runs, on a loaded host too.
-export E2E_TOOL_SECONDS=15
+# The tool runs until the test has seen the judgement, never for a fixed
+# time: with a fixed window (15 s until 2026-11-08) a loop starved past it
+# never records WORKING and the step fails whatever the candidate (task 127's
+# gate). To prove that, the loop is stopped (SIGSTOP) for E2E_STARVE_SECS
+# (default 5; the tool would otherwise take 0.3 s) once the tool has begun:
+# the judgement must still come once the loop runs again.
+hold_tools() { : >"$work/tool.hold"; }
+release_tools() { rm -f "$work/tool.hold"; }
+hold_tools
 start_worker session_worker_a "E2E:WORK build the thing"
+wait_for 60 "worker a's tool call to begin" test -e "$work/tool.held.session_worker_a"
+kill -STOP "$loop_pid"
+sleep "${E2E_STARVE_SECS:-5}"
+kill -CONT "$loop_pid"
 judged_working_by_rules() {
   tail_of session_worker_a | jq -e '
     any(.judgements[]?; .state == "WORKING" and .judge == "rules")' >/dev/null
 }
 wait_for 40 "a rules WORKING judgement for worker a" judged_working_by_rules
-pass "rule decided WORKING while the tool ran"
-unset E2E_TOOL_SECONDS
+release_tools
+pass "rule decided WORKING while the tool ran (the loop starved ${E2E_STARVE_SECS:-5} s meanwhile)"
 completed_by_jev() { observation session_worker_a | jq -e '.state == "COMPLETED" and .judge == "jev"'; }
 wait_for 60 "Jev to judge worker a COMPLETED" completed_by_jev
 # A digest item reads `- <session> — <what>: …`.
@@ -408,17 +450,20 @@ wait_for 60 "attention on worker c's question" asks
 observation session_worker_c | jq -e '.state == "WAITING" and .judge == "jev"' >/dev/null ||
   fail "the stub should have called worker c a harmless WAITING"
 wait_for 60 "a digest about worker c" digest_has session_worker_c
+# The answer's tool is held until the clear judgement is seen (as in step 1):
+# the clear judgement exists only while the tool runs.
+hold_tools
 submit human session_worker_c '{"type":"input","text":"E2E:WORK eu-west"}'
 # Resolved: a judgement after the question's has no attention. Not the
 # latest judgement: the question stays on the screen, so the finished turn
-# raises attention again, and the clear one lasts only while the tool runs
-# (0.3 s, shorter than a poll).
+# raises attention again, and the clear one lasts only while the tool runs.
 resolved() {
   tail_of session_worker_c | jq -e '
     .judgements | (map(.attention_reason == "human_question") | index(true)) as $asked
     | $asked != null and (.[$asked + 1:] | any(.attention == false))'
 }
 wait_for 60 "worker c's attention to clear after the human answer" resolved
+release_tools
 pass "a HUMAN: question reached attention and a human command resolved it"
 
 # --- 5. Jev down: rules and escalation only ---------------------------------
