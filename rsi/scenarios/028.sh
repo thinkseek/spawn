@@ -993,7 +993,10 @@ session=$(get $label session)
 exec=$(get $label exec)
 failed_at=$(q "select min(recorded_at_ms) from spawn_events where session_id = '$session'
     and execution_id = '$exec' and event_name = 'turn.failed' and recorded_at_ms >= $t0")
-put $label written "$(last_line "$agent" | cut -d' ' -f2)"
+# `written` stays the snapshot's, taken with the fault: the turn that
+# follows must find every line the engine had written then. Reading it
+# here, tens of seconds on, would count the resumed session's own work
+# as lines it failed to find (task 202: "held 5 ... had written 47").
 record=$(interrupted "$exec" "$(get $label fault)")
 if [ -z "$record" ]; then
     measured_fail "(3) $agent's model answered 'prompt is too long' (turn.failed at ${failed_at:-never}), and no execution.interrupted names it: $(describe $label "$t0" "$(get $label command)")"
@@ -1017,7 +1020,10 @@ label=model
 agent=$(get $label agent)
 session=$(get $label session)
 exec=$(get $label exec)
-put $label written "$(last_line "$agent" | cut -d' ' -f2)"
+# `written` stays the snapshot's, taken with the fault: the turn that
+# follows must find every line the engine had written then. Reading it
+# here, tens of seconds on, would count the resumed session's own work
+# as lines it failed to find (task 202: "held 5 ... had written 47").
 records=$(records_of execution.interrupted "$exec" | awk -F'|' -v t="$(get $label fault)" '$1 >= t')
 first=$(printf '%s\n' "$records" | sed -n 1p)
 if [ -z "$first" ]; then
@@ -1067,7 +1073,10 @@ label=auth
 agent=$(get $label agent)
 session=$(get $label session)
 exec=$(get $label exec)
-put $label written "$(last_line "$agent" | cut -d' ' -f2)"
+# `written` stays the snapshot's, taken with the fault: the turn that
+# follows must find every line the engine had written then. Reading it
+# here, tens of seconds on, would count the resumed session's own work
+# as lines it failed to find (task 202: "held 5 ... had written 47").
 record=$(interrupted "$exec" "$(get $label fault)")
 if [ -z "$record" ]; then
     measured_fail "(5) $agent's turn failed with the model's 401 (login expired) and no execution.interrupted names it: $(describe $label "$t0" "$(get $label command)")"
