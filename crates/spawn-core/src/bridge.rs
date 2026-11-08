@@ -3267,9 +3267,16 @@ pub const CREDENTIAL_DENY: &[&str] = &[
 /// small model; the cheap profile also puts its main model in the main,
 /// sonnet and opus slots. Without a relay nothing about models is set: the
 /// cheap profile needs one, and the Bridge refuses to start it without.
+///
+/// Every engine is denied the host's credential files and the programs
+/// that read them ([`CREDENTIAL_DENY`]): a fleet worker read the loop's
+/// environment file once (2026-11-08).
 pub fn claude_settings(relay: Option<&ModelRelay>, profile: ModelProfile) -> String {
     let mut settings = json!({
-        "permissions": { "defaultMode": "bypassPermissions" },
+        "permissions": {
+            "defaultMode": "bypassPermissions",
+            "deny": CREDENTIAL_DENY,
+        },
         "skipDangerousModePermissionPrompt": true,
     });
     if let Some(relay) = relay {
