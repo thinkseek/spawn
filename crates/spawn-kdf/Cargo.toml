@@ -1,0 +1,15 @@
+[package]
+name = "spawn-kdf"
+description = "PBKDF2-HMAC-SHA256 for Spawn's login passwords, in a crate of its own so that debug builds compile it optimised."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sha2.workspace = true
+hmac.workspace = true
+
+[lints]
+workspace = true
