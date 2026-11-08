@@ -596,7 +596,59 @@ time.sleep(900)' "$vanish/service.sock" &
     refuse "a mask path still there (a file now) is no race: no second start" \
         "$(cat "$work/gate.out")" "started again without it"
     refuse "and the gate does not pass it off as accepted" "$replaced" 'exit=0 {"verdict":"accepted"}'
+    # A sandbox that never started its command is no verdict either way: a
+    # host fault, said as such (exit 6, on the sandbox, its own evidence),
+    # never "does not build" (A sandbox that never started its command).
+    expect "a sandbox that never started its command is a host fault: exit 6" "$replaced" 'exit=6 {"host_fault":true'
+    expect "on the sandbox" "$replaced" '"on":"sandbox","runs":"never started"'
+    expect "with its evidence" "$replaced" '"evidence":"sandbox_never_started"'
+    expect "quoting bwrap" "$replaced" 'never started (bwrap exited'
+    refuse "never a rejection" "$replaced" '"verdict":"rejected"'
     rm -f "$vanish" "$hold.held"
+    # The candidate's own tree bwrap cannot start in, while it starts in the
+    # base's: the candidate's doing, so a rejection quoting bwrap, never a
+    # host fault it could repeat forever. Emulated at the same hold: the
+    # held tree (the candidate's: the base's results are cached by now) is
+    # made untraversable, so bwrap's --chdir fails there, and stays so for
+    # the gate's probe of both trees.
+    vanish=$(mktemp -d "$work/vanish.XXXXXX")
+    python3 -c '
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen()
+time.sleep(900)' "$vanish/service.sock" &
+    vanish_listener=$!
+    background="$background $vanish_listener"
+    while [ ! -S "$vanish/service.sock" ]; do sleep 0.1; done
+    : >"$hold"
+    (
+        held=0
+        until [ -s "$hold.held" ] || [ "$held" -ge 600 ]; do sleep 0.05; held=$((held + 1)); done
+        held_tree=$(cat "$hold.held" 2>/dev/null)
+        case "$held_tree" in */candidate) chmod 000 "$held_tree" ;; esac
+        rm -f "$hold"
+    ) &
+    vanish_watcher=$!
+    untraversable=$(
+        export SPAWN_GATE_TEST_HOLD="$hold"
+        unset TMPDIR
+        judge "$good"
+    )
+    wait "$vanish_watcher" 2>/dev/null || true
+    held_tree=$(cat "$hold.held" 2>/dev/null || true)
+    case "$held_tree" in
+    */candidate)
+        # The gate's own exit could not remove a tree it cannot read.
+        chmod 700 "$held_tree" 2>/dev/null || true
+        rm -rf "$(dirname "$held_tree")"
+        expect "a candidate's tree bwrap cannot start in is rejected" "$untraversable" \
+            "exit=0 {\"verdict\":\"rejected\",\"reason\":\"the sandbox cannot start in the candidate's tree, where it starts in the base's: sandbox: "
+        expect "quoting bwrap" "$untraversable" 'never started (bwrap exited'
+        refuse "not a host fault" "$untraversable" 'host_fault'
+        ;;
+    *) echo "FAIL the hold held $held_tree, not the candidate's tree (the base's results were not cached)"; exit 1 ;;
+    esac
+    kill "$vanish_listener" 2>/dev/null || true
+    rm -rf "$vanish" "$hold" "$hold.held"
 else
     echo "note: $vanish was not under a scanned directory (TMPDIR covers it): no mask, no hold"
 fi

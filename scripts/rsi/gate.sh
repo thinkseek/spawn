@@ -403,6 +403,11 @@ json_string() {
 # verdict <accepted|rejected> [reason]: the verdict names the commits it
 # judged, resolved, so a reader can check what it is about (deploy.sh does).
 verdict() {
+    # A step whose sandbox never started is evidence the gate does not
+    # have: no verdict, accepted or rejected, stands on it.
+    if [ -z "${sandbox_checked-}" ] && [ -s "$work/sandbox-never-started" ]; then
+        sandbox_fault "$work/sandbox-never-started"
+    fi
     # The open section passed unless the verdict is a rejection of it.
     if [ "$1" = accepted ]; then stage_close ok; else stage_close "$1"; fi
     gate_times
@@ -420,13 +425,16 @@ verdict() {
     echo "$json"
 }
 
-# host_fault <scenario> <on> <runs> <reason>: no verdict on the candidate,
+# host_fault <scenario> <on> <runs> <reason> [<evidence>]: no verdict on the candidate,
 # a fact about the host or the harness instead (exit 6), written where a
 # verdict would be: `{"host_fault":true,"scenario","on","runs","reason",
 # "base","candidate"}`. `on` is where it failed: `base` (a scenario's
 # harness error on the base, before any candidate code ran: its runs did
-# not agree, or it exited neither 0 nor 1) or `candidate and base` (a check
-# that failed twice on the candidate and once on the base). The integrator
+# not agree, or it exited neither 0 nor 1), `candidate and base` (a check
+# that failed twice on the candidate and once on the base) or `sandbox` (a
+# sandbox that never started its command, with the evidence
+# `sandbox_never_started`: "A sandbox that never started its command"). The
+# integrator
 # believes the fact only from its own verdict file with exit 6 (the sandbox
 # never sees that file) and records `host_fault`: retried after a backoff,
 # counted toward no halt (gate.rs `HOST_FAULT_EXIT`).
@@ -442,6 +450,7 @@ host_fault() {
     stage_emit gate host_fault "$(($(stage_now) - gate_started))" total
     json="{\"host_fault\":true,\"scenario\":\"$(json_string "$1")\",\"on\":\"$2\""
     json="$json,\"runs\":\"$(json_string "$3")\",\"reason\":\"$(json_string "$4")\""
+    [ -z "${5-}" ] || json="$json,\"evidence\":\"$5\""
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
@@ -1134,7 +1143,7 @@ sandbox_once() {
     # mount, until the suite has removed what it wanted gone.
     if [ -n "${SPAWN_GATE_TEST_HOLD-}" ] && [ -e "$SPAWN_GATE_TEST_HOLD" ] &&
         [ -n "$sandbox_masked" ] && [ -n "${sandbox_hold_here-}" ]; then
-        : >"$SPAWN_GATE_TEST_HOLD.held"
+        printf '%s\n' "$tree" >"$SPAWN_GATE_TEST_HOLD.held"
         sandbox_held=0
         while [ -e "$SPAWN_GATE_TEST_HOLD" ] && [ "$sandbox_held" -lt 600 ]; do
             sleep 0.1
@@ -1172,6 +1181,17 @@ sandbox() {
     sandbox_rc=0
     sandbox_once "$@" || sandbox_rc=$?
     [ "$sandbox_rc" -ne 0 ] && [ -z "$sandbox_started" ] || return "$sandbox_rc"
+    if sandbox_retry "$@"; then sandbox_rc=0; else sandbox_rc=$?; fi
+    # Still never started: bwrap's status is no answer of the command's,
+    # whatever the caller would make of it. The fact goes to the note
+    # (sandbox_never), which the gate reads before any verdict or cache
+    # entry ("A sandbox that never started its command").
+    [ -n "$sandbox_started" ] || sandbox_never "$@"
+    return "$sandbox_rc"
+}
+# sandbox_retry <tree> <command...>: the F-race's one more start (above);
+# returns the first run's status when it does not apply.
+sandbox_retry() {
     sandbox_gone=""
     sandbox_ifs=$IFS
     IFS='
@@ -1194,6 +1214,72 @@ sandbox() {
     sandbox_once "$@"
 }
 
+# A sandbox that never started its command. bwrap failing before the
+# command ran (its start byte never came: sandbox_once) is no answer of the
+# command's, yet its status reads like one: 1 is "unsolved" on the base (and,
+# twice, a cached `unsolved` every later gate on that base believes), "does
+# not build" or "manifests do not parse" on the candidate, a regression of a
+# check; and the socket scan's empty list masks nothing. So every such start
+# is noted (sandbox_never: `<tree>|<what>|<line>` in $sandbox_note, the
+# gate's own note, or a job's: job_run), and the gate reads the note before
+# it states anything: verdict() and the job printers turn it into the fact
+# (sandbox_fault), a never-started run writes no cache entry (base_job),
+# and the socket scan and the toolchain probe stop the gate at once.
+#
+# The fact is a host fault (exit 6, `on` `sandbox`, evidence
+# `sandbox_never_started`), not `cannot_judge`: that is a scenario's own
+# statement, cached; a bwrap failure is the harness's and usually passes.
+# One exception: a candidate's tree bwrap will not start in while the
+# base's starts (a symlink where the sandbox binds, a path its mounts trip
+# on) is the candidate's doing, so that is a rejection quoting bwrap, else
+# a candidate could make itself unjudgeable.
+sandbox_note=""
+# sandbox_never <tree> <command...>: the note of a start that never ran the
+# command: the tree, what was to run (the command's first words, past `env`
+# and its assignments: never a value of those), bwrap's first line.
+sandbox_never() {
+    sandbox_never_tree=$1
+    shift
+    if [ "${1-}" = env ]; then
+        shift
+        while [ $# -gt 0 ]; do
+            case "$1" in *=*) shift ;; *) break ;; esac
+        done
+    fi
+    sandbox_never_what=$(printf '%s %s' "${1-}" "${2-}" | sed 's/ *$//')
+    sandbox_never_said=$(printf '%s\n' "$sandbox_said" | sed -n '/./{p;q;}')
+    sandbox_never_line="sandbox: $sandbox_never_what in $sandbox_never_tree never started (bwrap exited $sandbox_rc: ${sandbox_never_said:-it said nothing})"
+    echo "$sandbox_never_line" >&2
+    printf '%s|%s|%s\n' "$sandbox_never_tree" "$sandbox_never_what" "$sandbox_never_line" \
+        >>"${sandbox_note:-$work/sandbox-never-started}" 2>/dev/null || :
+}
+# sandbox_fault <note> [<scenario>]: the fact of a note (above); exits.
+# <scenario> names the run in the fact (a job's scenario), else what the
+# sandbox was to run.
+sandbox_fault() {
+    sandbox_checked=1
+    sandbox_fault_entry=$(awk -F'|' -v c="$work/candidate" '$1 == c { print; exit }' "$1" 2>/dev/null)
+    if [ -n "$sandbox_fault_entry" ] && [ -z "$base_only" ]; then
+        # The candidate's tree. Its doing only when bwrap still will not
+        # start there and does start in the base's: a start that failed once
+        # and starts now was the host's, as is one that starts in neither.
+        # sandbox_once, never sandbox: a probe notes nothing.
+        sandbox_once "$work/candidate" true >/dev/null 2>&1 || :
+        sandbox_fault_candidate=$sandbox_started
+        sandbox_once "$work/baseline" true >/dev/null 2>&1 || :
+        if [ -z "$sandbox_fault_candidate" ] && [ -n "$sandbox_started" ]; then
+            verdict rejected "the sandbox cannot start in the candidate's tree, where it starts in the base's: ${sandbox_fault_entry#*|*|}"
+            exit 0
+        fi
+    else
+        sandbox_fault_entry=$(sed -n '1p' "$1" 2>/dev/null)
+    fi
+    sandbox_fault_what=${sandbox_fault_entry#*|}
+    sandbox_fault_what=${sandbox_fault_what%%|*}
+    host_fault "${2:-${sandbox_fault_what:-sandbox}}" sandbox "never started" \
+        "${sandbox_fault_entry#*|*|}: a host fault, not a verdict on the candidate" sandbox_never_started
+}
+
 extract() {
     mkdir -p "$2"
     git --git-dir="$repo" archive "$1" | tar -x -C "$2"
@@ -1211,6 +1297,9 @@ extract() {
 mkdir "$work/socket-scan"
 sandbox "$work/socket-scan" find / \( -path /proc -o -path /sys -o -path /dev \) -prune -o \
     -type s -writable -print >"$work/sockets" 2>/dev/null || true
+# A scan that never ran found nothing to mask: the gate stops rather than
+# run scenarios beside sockets it did not hide.
+if [ -s "$work/sandbox-never-started" ]; then sandbox_fault "$work/sandbox-never-started" socket-scan; fi
 # needed_by_sandbox <directory>: 0 when hiding the directory would hide
 # something the sandbox uses (a system directory, PATH, a bound path), or
 # the directory is one of those or above one.
@@ -1505,6 +1594,9 @@ slot_claim() {
 # returns its exit status. With slot_kept set, the caller already holds
 # the slot (a low claimant's base job: below) and keeps it after the run.
 job_run() {
+    # This job's note of a sandbox that never started (sandbox_never): its
+    # printer reads it, whatever the run's status says.
+    sandbox_note=$1/never-started
     if [ -z "$slot_kept" ]; then
         slot_claim "$1" || return 125
     fi
@@ -2186,6 +2278,8 @@ toolchain() {
         else
             echo "server: unreadable"
         fi' toolchain "$gate_scripts/pg-url.sh" >"$work/toolchain" 2>&1 || true
+    # A probe that never ran would key the base cache by bwrap's message.
+    if [ -s "$work/sandbox-never-started" ]; then sandbox_fault "$work/sandbox-never-started" toolchain; fi
     [ -z "$gate_pg_id" ] || echo "server: the gate's own, $gate_pg_kind $gate_pg_id" >>"$work/toolchain"
     toolchain_key=$(sha256sum <"$work/toolchain" | cut -d' ' -f1)
     echo "| base cache: toolchain $(sed -n 's/^release: /rustc /p' "$work/toolchain" | head -n 1)" \
@@ -2282,6 +2376,7 @@ base_job() {
     first=0
     job_run "$job" 1 "$work/baseline" "$objective" || first=$?
     [ ! -e "$job/slot-waited" ] || return 0
+    base_never_started && return 0
     job_output 1
     result=""
     case "$first" in
@@ -2294,6 +2389,7 @@ base_job() {
         again=0
         job_run "$job" 2 "$work/baseline" "$objective" || again=$?
         [ ! -e "$job/slot-waited" ] || return 0
+        base_never_started && return 0
         job_output 2
         [ "$again" -eq 1 ] && result=unsolved
         first="1, then $again"
@@ -2335,6 +2431,16 @@ base_job() {
     job_done "$result"
     base_job_release
 }
+# base_never_started: the run's sandbox never started its command
+# (sandbox_never): no result, so no cache entry; base_printed states the
+# fact. 0 when so.
+base_never_started() {
+    [ -s "$job/never-started" ] || return 1
+    job_say "| == base: $name: its sandbox never started it; no result, nothing cached"
+    job_done abort
+    base_job_release
+    return 0
+}
 # base_job_release: the slot a low claimant kept for its runs (above), let go
 # when the job is done. The job's subshell exiting would drop it too; this
 # says so where it happens.
@@ -2352,6 +2458,7 @@ base_printed() {
     # shellcheck disable=SC2046 # the result's words
     set -- "$1" $(cat "$1/result")
     if [ -e "$1/slot-waited" ]; then slot_no_room "$1"; fi
+    if [ -s "$1/never-started" ]; then sandbox_fault "$1/never-started" "$printed_name"; fi
     case "$2" in
     cached)
         from_cache="$from_cache $printed_name"
@@ -2689,6 +2796,9 @@ candidate_printed() {
     # rejection, and never the "failed twice" story below, which would be
     # untrue of a run that never started.
     if [ -e "$1/slot-waited" ]; then slot_no_room "$1"; fi
+    if [ -s "$1/never-started" ]; then
+        sandbox_fault "$1/never-started" "$(basename "$printed_scenario")"
+    fi
     if [ "$printed_status" = error ]; then
         phase_time candidate
         echo "gate: the gate could not run $(basename "$printed_scenario") on the candidate" >&2

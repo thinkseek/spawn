@@ -1011,8 +1011,17 @@ pub(crate) fn gate_host_fault_fields(
     };
     let place = if on == "base" {
         format!("{scenario} exited {runs} on the base, before any candidate code ran")
+    } else if on == "sandbox" {
+        format!("the gate's sandbox never started {scenario} ({reason})")
     } else {
         format!("{scenario} failed on the candidate and on the base ({runs})")
+    };
+    // A sandbox that never started has its own evidence, so a record says
+    // which fault it was without reading its text.
+    let evidence = if on == "sandbox" {
+        gate::SANDBOX_NEVER_STARTED
+    } else {
+        "gate"
     };
     json!({
         "reason": format!(
@@ -1020,7 +1029,7 @@ pub(crate) fn gate_host_fault_fields(
             spoken(backoff)
         ),
         "log": log,
-        "evidence": "gate",
+        "evidence": evidence,
         "fact": {"scenario": scenario, "on": on, "runs": runs, "reason": reason},
         "host_faults": faults,
         "backoff_ms": u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
@@ -9890,6 +9899,31 @@ mod database_tests {
         );
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sandbox that never started its command is recorded with its own
+    /// evidence, `sandbox_never_started`, beside the gate's fact, so a
+    /// record names the fault without its text being read.
+    #[test]
+    fn a_sandbox_that_never_started_has_its_own_evidence() {
+        let failure = crate::gate::GateFailure::HostFault {
+            scenario: "sh build".to_string(),
+            on: "sandbox".to_string(),
+            runs: "never started".to_string(),
+            reason: "sandbox: sh build in /w/candidate never started (bwrap exited 1: bwrap: \
+                     Can't chdir to /w/candidate: Permission denied)"
+                .to_string(),
+            log: String::new(),
+        };
+        let record = super::gate_host_fault_fields(&failure, 1, std::time::Duration::from_mins(1));
+        assert_eq!(record["evidence"], crate::gate::SANDBOX_NEVER_STARTED);
+        assert_eq!(record["fact"]["on"], "sandbox");
+        let reason = record["reason"].as_str().expect("a reason");
+        assert!(
+            reason.starts_with("host fault: the gate's sandbox never started sh build (sandbox: ")
+                && reason.contains("Can't chdir"),
+            "{reason}"
+        );
     }
 
     /// The gate's own host faults (exit 6 with its fact, gate.rs

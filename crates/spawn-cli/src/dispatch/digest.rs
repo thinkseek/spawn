@@ -186,6 +186,10 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                          gives no cause)"
                     ),
                 }
+            } else if record["evidence"] == crate::gate::SANDBOX_NEVER_STARTED {
+                let scenario = fact["scenario"].as_str().unwrap_or("a scenario");
+                let said = one_line(fact["reason"].as_str().unwrap_or_default(), 300);
+                format!("the gate's sandbox never started {scenario} ({said})")
             } else if record["evidence"] == "gate" {
                 let scenario = fact["scenario"].as_str().unwrap_or("a scenario");
                 let runs = one_line(fact["runs"].as_str().unwrap_or_default(), 200);
@@ -220,18 +224,7 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                 || "after its backoff".to_string(),
                 |due| format!("at {}", crate::scorecard::time::format_rfc3339(due)),
             );
-            let check = if record["evidence"] == "cannot_judge" {
-                // What to do follows from the scenario's own cause (quoted
-                // above), not from 029's: give the gate what the scenario
-                // says it lacks, or judge it outside the gate.
-                "Give the gate what the scenario says it lacks (its environment, a server, a \
-                 service), or have the owner judge the objective outside the gate."
-            } else if record["evidence"] == "gate" {
-                "Check the host's load and that scenario's harness (its log in the gate output), \
-                 or tell the owner."
-            } else {
-                "Check the test database's host (its memory, /dev/shm, its log) or tell the owner."
-            };
+            let check = host_fault_check(&record["evidence"]);
             Some(Escalation {
                 session_id: "host".to_string(),
                 id: format!("gate-host-fault-{id}"),
@@ -245,6 +238,26 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
             })
         })
         .collect()
+}
+
+/// What a gate host fault's item asks the supervisor to do, by its
+/// evidence.
+fn host_fault_check(evidence: &Value) -> &'static str {
+    if evidence == "cannot_judge" {
+        // What to do follows from the scenario's own cause (quoted in the
+        // item), not from 029's: give the gate what the scenario says it
+        // lacks, or judge it outside the gate.
+        "Give the gate what the scenario says it lacks (its environment, a server, a service), \
+         or have the owner judge the objective outside the gate."
+    } else if evidence == crate::gate::SANDBOX_NEVER_STARTED {
+        "Check that bubblewrap starts on this host (user namespaces, the paths it binds and \
+         masks) or tell the owner."
+    } else if evidence == "gate" {
+        "Check the host's load and that scenario's harness (its log in the gate output), or \
+         tell the owner."
+    } else {
+        "Check the test database's host (its memory, /dev/shm, its log) or tell the owner."
+    }
 }
 
 /// The digest items for `records`, the integrator's `host_fault` gate

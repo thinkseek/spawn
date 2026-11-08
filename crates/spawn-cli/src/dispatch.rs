@@ -1709,6 +1709,33 @@ mod tests {
         assert!(host.iter().all(|item| !item.line.contains('\n')));
     }
 
+    /// A sandbox that never started its command (evidence
+    /// `sandbox_never_started`) says so with bwrap's words and points at
+    /// bubblewrap on the host, not the scenario's harness.
+    #[test]
+    fn a_sandbox_that_never_started_is_said_with_bwraps_words() {
+        let records = [
+            serde_json::json!({"type": "task.gated", "verdict": "host_fault",
+            "id": 11, "event_id": 60, "mission": 6, "host_faults": 2, "escalate": true,
+            "evidence": "sandbox_never_started", "fact": {"scenario": "sh build",
+                "on": "sandbox", "runs": "never started",
+                "reason": "sandbox: sh build in /w/baseline never started (bwrap exited 1: \
+                           bwrap: Can't mount tmpfs on /run/x: No such file or directory)"},
+            "backoff_ms": 600_000, "due_ms": 1_793_930_000_000_i64}),
+        ];
+        let host = super::digest::host_fault_escalations(&records);
+        assert!(
+            host[0]
+                .line
+                .contains("the gate's sandbox never started sh build (sandbox: sh build in")
+                && host[0].line.contains("Can't mount tmpfs on /run/x")
+                && host[0].line.contains("that bubblewrap starts on this host")
+                && !host[0].line.contains("that scenario's harness"),
+            "{}",
+            host[0].line
+        );
+    }
+
     #[test]
     fn two_host_faults_in_a_row_reach_an_idle_supervisor_once() {
         let crash = "2026-11-06 01:46:58.017 UTC [1] LOG:  server process (PID 4242) was \
