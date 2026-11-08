@@ -223,7 +223,7 @@ export function RailContent({
             />
             <Field
               label="Objectives"
-              value={`${rsi.objectives.open} open · ${rsi.objectives.solved} solved · ${rsi.objectives.met} met`}
+              value={`${rsi.objectives.open} open · ${rsi.objectives.solved} solved · ${rsi.objectives.met} met · ${rsi.objectives.owner_judged} owner-judged`}
             />
           </div>
         </Card>

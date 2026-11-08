@@ -17,7 +17,7 @@
 
 backlog、场景和门禁都从控制器按绝对路径读取，agent 改不到。控制器是部署的提交的树（`~/.local/share/spawn-rsi/controllers/spawn`，`deploy/deploy.sh` 部署时原子切换），不是所有者的工作检出：所有者改门禁、场景或 backlog，部署后才生效（deploy/systemd/README.md「The controller」）。
 
-**`owner_judged`。** backlog 文件里写 `"owner_judged": true`（只有一个布尔值，别的值加载时报错）的目标，由所有者在门禁外判定：它的场景需要舰队没有的东西（例如 029 需要 systemd user manager，而门禁的沙箱里没有）。积分器填槽和报 `next_objective` 时都跳过它，所以它不占常驻 worker、不派任务、不再进入 host fault 的重试；在顺序上它仍算未完成，`after` 链经过它的目标要等它解决（依赖它建在所有者那部分之上），backlog 的顺序检查照常读它。它在本 mission 里一直显示为未完成（是否完成只看落地），`spawn mission objectives` 把所有者判定的和舰队待做的分开列出，看板里它的状态是 `owner`。如果这样的目标有任务在飞，照常判定：`cannot_judge` 的 host fault 与其退避不变（这里是预防，不是新的裁决）。
+**`owner_judged`。** backlog 文件里写 `"owner_judged": true`（只有一个布尔值，别的值包括 `null` 加载时报错）的目标，由所有者在门禁外判定：它的场景需要舰队没有的东西（例如 029 需要 systemd user manager，而门禁的沙箱里没有）。积分器填槽和报 `next_objective` 时都跳过它，所以它不占常驻 worker、不派任务、不再进入 host fault 的重试；在顺序上它仍算未完成，`after` 链经过它的目标要等它解决（依赖它建在所有者那部分之上），backlog 的顺序检查照常读它。依赖必须落在同一个 mission：未完成只看本 mission 的落地，而 029 的活在 mission 7 落地，所以 mission 4 的 029 永远不算解决——写进 mission 4 backlog 的 `after: [29]` 会永远等待，顺序检查也看不出来（029 在依赖图里且未完成，看不出异常）。它在本 mission 里一直显示为未完成（是否完成只看落地），`spawn mission objectives` 把所有者判定的和舰队待做的分开列出，看板里它的状态是 `owner`。如果这样的目标有任务在飞，照常判定：`cannot_judge` 的 host fault 与其退避不变（这里是预防，不是新的裁决）。
 
 ## 2. 一个目标怎样落地
 
