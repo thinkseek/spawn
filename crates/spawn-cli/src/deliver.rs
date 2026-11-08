@@ -1849,15 +1849,10 @@ fn send_note(
 #[cfg(test)]
 mod tests {
     use super::{
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-        CREDENTIALS_LINE, Cancelled, DELIVERY_RETRIES, News, PROCESSES_LINE, REPORT, TaskRow, Work,
-        delivered, delivery_mark, mark_delivery, new_report, news_items, notice_task, put_aside,
-        report_contract, report_due, task_prompt, typed,
-=======
-        Cancelled, DELIVERY_RETRIES, NOT_READY_RETRY_MS, News, REPORT, TaskRow, Work, delivered,
-        delivery_mark, mark_delivery, new_report, news_items, next_due, notice_task, put_aside,
-        report_contract, report_due, retry_wait_ms, task_prompt,
->>>>>>> be554e48a94e1419b2ee54295e0de5de974502d7
+        CREDENTIALS_LINE, Cancelled, DELIVERY_RETRIES, NOT_READY_RETRY_MS, News, PROCESSES_LINE,
+        REPORT, TaskRow, Work, delivered, delivery_mark, mark_delivery, new_report, news_items,
+        next_due, notice_task, put_aside, report_contract, report_due, retry_wait_ms, task_prompt,
+        typed,
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
