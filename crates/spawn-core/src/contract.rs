@@ -137,7 +137,6 @@ pub fn one_execution(tag: &str, log: &dyn EventLog) {
                 fork: None,
                 model: crate::event::ModelProfile::Default,
                 transcript_from: None,
-                envelope: None,
             },
         )
     };
@@ -149,6 +148,7 @@ pub fn one_execution(tag: &str, log: &dyn EventLog) {
             EventKind::ExecutionEnded {
                 cause,
                 exit_code: None,
+                signal: None,
                 evidence: None,
             },
         )

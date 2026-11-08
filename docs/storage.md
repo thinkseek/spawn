@@ -584,53 +584,6 @@ state and wedges nothing:
   file is left alone. A dry run (`SPAWN_MAINTENANCE_DRY_RUN=1`) prints what
   would go.
 
-## Memory room
-
-Memory is the other resource every execution shares, and on this host it is
-bounded the same way disk is (objective 029; design.md §11, "Resources"):
-nothing an agent's build, test or tool does may take the host's memory, its
-swap (zram, that is RAM) or its CPU from the rest of the fleet or from the
-owner's work.
-
-- **Every execution and every gate runs in a systemd user scope of its own**,
-  directly inside Spawn's slice (`SPAWN_SLICE`, `spawn.slice`): an execution
-  in `<slice stem>-<execution id>.scope`, a gate in
-  `<slice stem>-gate-<task id>-<n>.scope`. The engine, its children and
-  everything they start are in that cgroup; the scope carries
-  `SPAWN_EXECUTION_MEMORY_HIGH` / `_MAX` / `_SWAP_MAX` (10G, 12G and 4G by
-  default; a gate the same with `SPAWN_GATE_*`) and `OOMPolicy=stop`, so a
-  process killed at the hard limit ends that scope and nothing else. The
-  slice carries `SPAWN_SLICE_MEMORY_HIGH` / `_MAX` / `_CPU_WEIGHT` (16G, 20G
-  and 50: Spawn yields to the host's other jobs, weight 100, under
-  contention and uses an idle CPU otherwise), so Spawn's memory is at most
-  20 GiB and throttled above 16 GiB whatever it runs. Each envelope caps its
-  swap: a cap without one is no cap on a host whose swap is compressed RAM.
-- **A kill by the envelope costs one execution.** A memory-limit kill
-  (`memory.events` `oom_kill`, or the unit's `Result` `oom-kill`, read at the
-  end, never an exit status alone) ends that execution only: its final
-  checkpoint and its end run as for any end, no checkpointed work is lost,
-  and the record is `execution.interrupted` with cause `memory_limit`, path
-  `resume` (objective 028's rules; the session is resumed, not replaced). A
-  scope leaves no unit behind once its end is recorded.
-- **Admission waits for room.** An execution or a gate starts only when its
-  envelope fits under the slice (the slice's `anon` + `shmem` at most its
-  MemoryMax minus the envelope's) and on the host (`MemAvailable` at least
-  the envelope's MemoryMax). Otherwise it waits, recorded once as
-  `admission.waiting` with the measure and the threshold, and starts when it
-  fits (`admission.admitted`, with `waited_ms`); nothing fails and nothing is
-  lost. With the default numbers that is 8 GiB of the slice's room and
-  12 GiB of the host's per execution or gate.
-- **The loop records the envelope once** (`host.envelope`, the slice and
-  every setting in bytes) and again only when a setting changes; a host
-  without a reachable systemd user manager (the gate's sandbox is one) runs
-  as before and records state `unavailable`. The fleet view shows each live
-  execution's scope — its memory now, its peak, its limits, its swap and how
-  often it was throttled — and the slice's.
-
-Not guarded: the page cache an execution's build leaves behind (reclaimed
-under the limit, and not counted by admission), the owner's own processes,
-and the rest of the host outside Spawn's slice.
-
 Not guarded: the kache compiler cache (`~/.cache/kache`, a derived cache
 outside Spawn's cleanup), the mirrors under `<root>/.sources`, which hold
 branches, and the transcript archive under `<root>/.transcripts`, which
