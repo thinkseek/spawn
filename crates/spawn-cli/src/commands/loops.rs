@@ -263,8 +263,7 @@ impl Schedule {
 /// This host's clock in epoch milliseconds.
 fn now_ms() -> i64 {
     spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
-=======
-/// What a watcher that must not}
+}
 
 /// Run the Bridge, the Observer, the disk watch, the dispatcher and the
 /// liveness rule, until SIGTERM or SIGINT ends it after its pass.
@@ -375,8 +374,7 @@ impl Fleet {
         let now = now_ms();
         let mut lines: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
-=======
-        // A pass takes its inte        let mut failed = false;
+        let mut failed = false;
         if self.store.is_none() {
             match open_store().map(std::sync::Arc::new) {
                 Ok(open) => self.store = Some(open),
@@ -420,8 +418,7 @@ impl Fleet {
         }
         for line in &lines {
             println!("{line}");
-=======
-        if let Some(open) = &sto        }
+        }
         if failed {
             // A broken connection is reopened on the next pass.
             self.store = None;
@@ -601,8 +598,7 @@ impl Fleet {
                 self.listener = None;
                 pause_unless_stopped(pause, stopping)
             }
-=======
-        // ponytail: fixed backo        }
+        }
     }
 }
 
