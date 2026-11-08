@@ -235,9 +235,7 @@ from (
     ep.action ->> 'type' as episode_action,
     exists (select 1 from spawn_commands c
              where c.session_id = s.session_id and c.state <> 'finished') as open_command,
-    coalesce((select e.kind -> 'detail' ->> 'model' from spawn_events e
-               where e.session_id = s.session_id and e.event_name = 'execution.started'
-               order by e.session_seq desc limit 1), 'default') as model,
+    coalesce(mo.model, 'default') as model,
     (select coalesce(jsonb_agg(jsonb_build_object(
               'id', c.id,
               'key', c.idempotency_key,
