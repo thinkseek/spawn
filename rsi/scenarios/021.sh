@@ -196,17 +196,23 @@ printf '# nothing protected\n' >"$gate/protected"
 
 # The recording gate: accepts every candidate; one holding alpha.txt or
 # beta2.txt runs until $WORK/release-<name> exists (at most 600 s). Notes
-# `<time> start|end <name> <base> <candidate>`, and its pid while held.
+# `<time> start|end <name> <base> <candidate>`, and its pid while held
+# (written before its start line).
 cat >"$WORK/fake-gate.sh" <<EOF
 #!/bin/sh
 name=other
 for held in beta2 alpha; do
     if git --git-dir="\$1" cat-file -e "\$3:\$held.txt" 2>/dev/null; then name=\$held; break; fi
 done
+# The pid first, whole (written aside, then moved in): the scenario reads it
+# as soon as the start line below is there, and found it missing or empty
+# when the start line came first.
+if [ "\$name" != other ]; then
+    echo \$\$ >'$WORK/gate-'\$name.pid.\$\$ && mv -f '$WORK/gate-'\$name.pid.\$\$ '$WORK/gate-'\$name.pid
+fi
 printf '%s start %s %s %s\n' "\$(date +%s)" "\$name" "\$2" "\$3" >>'$WORK/judged.log'
 echo "== candidate: build"
 if [ "\$name" != other ]; then
-    echo \$\$ >'$WORK/gate-'\$name.pid
     waited=0
     until [ -e '$WORK/release-'\$name ] || [ "\$waited" -ge 1200 ]; do
         sleep 0.5
