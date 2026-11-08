@@ -4031,8 +4031,13 @@ mod tests {
             world
         }
 
+        /// One pass of the loop: the Bridge's reading of the log and the
+        /// queue, then its reading of the engines' files and screens.
         fn tick(&mut self) -> Vec<String> {
-            self.bridge.tick().expect("tick").warnings
+            let (report, _) = self.bridge.work().expect("work");
+            let mut warnings = report.warnings;
+            warnings.extend(self.bridge.poll().expect("poll").warnings);
+            warnings
         }
 
         fn pass(&mut self) -> usize {
