@@ -1129,10 +1129,25 @@ judges every landing, RSI or fleet. It exports both commits to temporary
 directories and judges the candidate with the controller's scenarios, never
 the tree's own:
 
-- it refuses changes to the paths in `<scenarios>/protected` (`rsi/`,
-  `scripts/rsi/`, `scripts/blackbox/`, `scripts/e2e.sh`), any build-time code
+- it refuses changes to any path in `<scenarios>/protected` (one prefix per
+  line, `#` comments, a line `!<prefix>` excepting paths under it; the
+  deployed list, `rsi/scenarios/protected`, protects `rsi/`, `scripts/`,
+  `deploy/`, `web/` but `web/src/` and `web/index.html`, `rust-toolchain`,
+  `rust-toolchain.toml` and `.cargo/` — everything that runs as the owner
+  outside the sandbox or that judges the candidate, which no candidate may
+  edit), any build-time code
   (`build.rs`, `.cargo/`, a `build` key in a Cargo.toml), any change to lint
-  configuration, and fewer runnable tests than the base;
+  configuration, fewer runnable tests than the base, and the loss of a base
+  test by name. The owner retires a test with the feature it removed by
+  naming it in `<scenarios>/retired-tests` (one name per line, `#` comments,
+  kept out of the base cache's key), which the gate reads on the host from
+  the scenarios directory it was given: for a mission gate,
+  `rsi/scenarios/retired-tests`, so a retirement there is a commit to the
+  mission's scenarios directory — a landing and a deploy of its own, not a
+  supervisor-side edit; for the owner's gate, a copy of the scenarios
+  directory the owner keeps in the checkout — `rsi/.gate-owner`, kept out of
+  the tree by `.gitignore` — with `retired-tests` beside that copy's own
+  `protected`, which is where the list has actually been used;
 - `<scenarios>/build` builds each tree;
 - when a task has a scenario, that scenario must fail on the base (exit 1)
   and pass on the candidate;
@@ -1233,10 +1248,15 @@ tree: its `pnpm install` output, which git does not hold, at
 `~/.local/share/spawn-rsi/deps/<name>/<sha256 of the lockfile>` (read-only;
 `deploy/controller.sh deps` installs one, `update` does it when the
 lockfile's is missing, and a switch keeps the previous controller's tree and
-any tree an agent's workspace still links to, removing the rest). It is
+any tree an agent's workspace still links to, and any a process still uses,
+removing the rest, and points
+`<live>/deps/<name>/current` at the current one). It is
 never the owner's checkout, whose `node_modules` every agent may write. The
 gate binds the store read-only into its sandbox, and engines and gates read
-it through `SUPPLY_PA_DEPS` (deploy/systemd/README.md "The controller").
+it through `SUPPLY_PA_DEPS` in `spawn.env`, the literal path of `current`
+(unset, they use that pointer as they do anyway; set it only once a
+controller's tree and its pointer exist, since a path to no tree fails every
+engine's and gate's build) (deploy/systemd/README.md "The controller").
 Read-only is a boundary against accidents, not agents: the same uid can
 hardlink a store file and write it; boundaries against a deliberate agent
 are per-agent uids or a mount per engine.
@@ -2081,7 +2101,27 @@ are per-agent uids or a mount per engine.
   jobs it gave). A setting that does not parse stops the integrator from
   starting, naming it. On 2026-11-08, with `SPAWN_GATE_PG_BIN` set, each
   gate took half of the 9 cores; two or three gates and the workers made a
-  load of 18-20, and task 172's gate failed on its base. Each judging records its own verdict and landing, which the next
+  load of 18-20, and task 172's gate failed on its base. **Host scenario
+  slots.** The jobs above bound one gate; the host's whole scenario budget
+  is separate and `scripts/rsi/gate.sh` takes it itself: every scenario
+  run, from every gate, first takes one of `SPAWN_GATE_HOST_JOBS` slots
+  (default: the gate's `SPAWN_GATE_JOBS` when the owner set it, else the
+  min(8, cores/2) a hand-run gate takes), files under
+  `$HOME/.cache/spawn/gate-slots` locked by flock on an fd of the run's own
+  subshell. The claim is in the gate, not here, so an integrator's gate, an
+  owner's hand-run and the deploy's base-cache warm-up share one budget
+  with nothing to configure; the fd's close releases a slot, so a killed
+  gate loses none, and a gate with two runs holds two slots (one each). A
+  waiting run says so while it waits ("waiting for a host scenario slot"),
+  and its block then records how long it waited and the slot it took, the
+  way the room no-room fact records disk. The build hook, the test listing
+  and the snapshot take no slot (one each per gate, and gates are few). Without the budget, on 2026-11-08 an owner
+  gate plus a fleet gate, and after the deploy a warm-up plus a fleet gate,
+  ran four heavy scenarios on 9 cores, and two tests with real-clock
+  windows — `a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it`
+  (a dead tmux pane's exit status unrecorded after 30 s) and
+  `dispatch::resume_replay::a_resume_that_succeeded_and_died_young` — failed
+  under it and rejected tasks 183, 184 and others. Each judging records its own verdict and landing, which the next
   pass reads; finished judgings are reaped before a pass reads the
   missions. A judging that panics before any record of its own is
   recorded `aborted` with the reason, so the three-aborts halt bounds a

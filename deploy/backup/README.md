@@ -57,11 +57,21 @@ Each `update` replaces the whole rule set. Tested with the host's S3 key:
 returns `403 AccessDenied`.
 
 **What can still remove backups:** a Cloudflare login with account rights,
-which can delete the lock rules. The `cf` OAuth login in
-`~/.config/cloudflare/` on this host is one, and it is readable by the same
-uid the agents run as. To make the locks hold against this host too, log `cf`
-out here when not administering Cloudflare (`cf auth logout`) and do bucket
-administration from another machine.
+which can change or delete the lock and lifecycle rules. None is on this
+host: there is no `cf` binary and no `~/.config/cloudflare/`, the bucket's
+S3 key answers `403` to the lifecycle (above), and the key is the S3 form of
+a token limited to bucket item read/write, which cannot change bucket
+settings at all. So the rules are applied from the owner's machine (the `cf`
+commands above). What that holds: no process running as this host's uid can
+delete or edit the lock rules, so a locked object cannot be deleted from here
+before its lock runs out (`DELETE` and an overwriting `PUT` answer
+`409 ObjectLockedByBucketPolicy`). What it does not hold: the same uid can
+read every object, and the passphrase in `~/.config/spawn/backup.key` is its
+to read, so a compromised host can take the backups with it; and it can
+delete what the locks do not cover — an object whose lock has lapsed, or
+`postgres/suspect/`, which has no lock rule. The locks bound deletion, not
+reading; a missing dump or bundle fails the daily `verify` (exit 1) and
+raises the `backup.verified` alert afterwards.
 
 ## The limit and the alert
 
@@ -92,7 +102,7 @@ failure and is told not to retry). Find out why; if the drop is intended
 | --- | --- | --- |
 | `~/.config/spawn/backup.key` | the encryption passphrase (32 random bytes, base64) | **every dump and bundle in R2 is unreadable.** Copy it off this host now (password manager or paper) |
 | `~/.config/spawn/r2.env` | `SPAWN_R2_ENDPOINT`, `SPAWN_R2_BUCKET`, `SPAWN_R2_ACCESS_KEY_ID`, `SPAWN_R2_SECRET_ACCESS_KEY` | make a new token (below) |
-| `~/.local/share/spawn-rsi/spawn.env` | `SPAWN_DATABASE_URL` (live) and `SPAWN_BACKUP_DRILL_DATABASE_URL` (the drill's server) | — |
+| `~/.local/share/spawn-rsi/spawn.env` | `SPAWN_DATABASE_URL` (live) and `SPAWN_BACKUP_DRILL_DATABASE_URL` (the fleet test database's server; the drill makes and drops its own database there) | — |
 
 The R2 credentials are the S3 form of a Cloudflare user API token named
 `spawn-store-backup` with only *Workers R2 Storage Bucket Item Read/Write* on
@@ -124,6 +134,30 @@ this host (one that is not is recorded `missing` and the bundle goes on),
 that each `git bundle` verifies on its own, that the archive decrypts back
 to the same SHA-256 (the archive, not the tar: compression is before
 encryption), and that the upload's ETag is the MD5 sent.
+
+A source's bundle holds its branches and tags, exactly the refs the record
+names (`refs/heads/*` and `refs/tags/*`, in each repo's `heads`), and nothing
+else: not a remote-tracking ref a mirror clone left (the live
+`missions/supply-pa.git` carries `refs/remotes/github/main`), not a pending
+`refs/spawn-owner/*` push. Those are not the mission's history, and a record
+that named neither could not be a true description of an archive that held
+them — the drill refuses any ref the manifest does not name (below). A
+source with no branches and no tags (a mission added before its first push)
+is recorded `empty`, `heads` `{}` and no file in the archive: `git bundle
+create` will not make an empty bundle, there is nothing of the mission to
+hold, and a restore of it makes an empty repository. Every repo entry carries
+its `file` in the archive, `null` when the archive holds none of it, and the
+record and the manifest use the same shape.
+
+Every repo entry of an increment carries a `delta` (`added`, `moved`,
+`removed`, each the ref names; their commits are in `heads` where they still
+exist) and a `bundled` list naming the refs the bundle actually holds
+(empty when nothing needed bytes). An increment whose refs all point into its
+base — a tag added at a commit the base already holds, a branch moved back to
+one, a branch removed — would write no bytes, and git refuses to make an
+empty bundle; the run says so itself: no file, `bytes` 0, the `delta` and
+`bundled` `[]`. A reader can tell a source that moved in a way that needs no
+bytes from a bundle that failed.
 
 `spawn backup verify` is the drill (below): the newest good dump restores to
 its record, and the newest bundle is opened and compared with its own. Exit
@@ -171,7 +205,11 @@ with a warning and exit 2), creates a database of its own
 `SPAWN_BACKUP_DRILL_DATABASE_URL`, restores into it with no error ignored,
 counts `spawn_events` and their highest id there, compares both with the
 record's, and drops the database on every path. It never restores into the
-source database or any database it did not create.
+source database or any database it did not create: `SPAWN_BACKUP_DRILL_DATABASE_URL`
+names the fleet test database's server — the database in the URL is the one
+the drill connects to for its `create` and `drop`, not a restore target — so
+its login needs `CREATEDB` and nothing more, a scratch name that already
+exists is refused, and the drop is only ever of the database the drill made.
 
 It then opens the newest `backup.bundled` record with a key — the sources
 and transcripts, the other half of what leaves the host — the same way:
@@ -180,11 +218,12 @@ SHA-256 against the record's, decompresses it by its magic, untars it, and
 compares `manifest.json` with the record (kind, transcript file count and
 bytes), every transcript file it names at the recorded size, and every
 repo's bundle: `git bundle list-heads` must list every head the manifest
-names and nothing it does not — for an increment, the heads that are new or
-moved since its base, since `--not` leaves an unmoved head out — and a full
-bundle must additionally pass `git bundle verify` in an empty repository
-(an increment's prerequisites are its base's commits, which the drill does
-not fetch). A store with no bundle yet says so in the record and passes. The result is the record's `bundle`
+names and nothing it does not — a full bundle holds every head; an increment
+holds a subset, which its manifest names as `bundled` (`--not` leaves out a
+ref that did not move, and one whose new commit the base already has), and
+the bundle must list exactly those — and a full bundle must additionally
+pass `git bundle verify` in an empty repository (an increment's
+prerequisites are its base's commits, which the drill does not fetch). A store with no bundle yet says so in the record and passes. The result is the record's `bundle`
 object; a bundle that fails makes the day's verdict a failure.
 
 `pg-restore-drill.sh [KEY]` remains for the manual, docker-based drill the
@@ -236,6 +275,13 @@ bundle fetches on top of the full one's, its prerequisites naming it), write
 each `transcripts/<agent>/<file>` part at the offset its manifest records,
 and `manifest.json` says which offset and how many bytes each part holds. A
 full bundle fetches on its own.
+
+Two entries name no file: one marked `empty` is a source with no branches and
+no tags — there is nothing to clone, and `git init --bare <name>.git` makes
+the empty repository its record describes; one carrying a `delta` and no file
+is a change that needs no bytes (a tag added at a commit the base holds, a
+branch removed) — restore the source as it stood at the base, and nothing
+changes.
 
 ## Cost
 

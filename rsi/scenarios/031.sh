@@ -23,8 +23,9 @@
 # by real `spawn mission add` commands (its id sequence skips 1,000 values on
 # the way, as a rolled-back append makes it skip, so the id watermark is not
 # the row count), a throwaway passphrase file and R2 credentials file (mode
-# 600), two mission sources (spawn.git with main and an agent's branch,
-# other.git), and a transcript archive (<workspace root>/.transcripts, two
+# 600), four mission sources (spawn.git with main and an agent's branch,
+# other.git with a remote-tracking ref, empty.git with no branches or tags,
+# tag.git with main and a scratch branch), and a transcript archive (<workspace root>/.transcripts, two
 # agents written now and a third's file last written 20 days ago). HOME is
 # a scratch directory: nothing here can read the owner's ~/.config/spawn.
 # Checked:
@@ -45,20 +46,29 @@
 #   (3) `spawn backup bundle` exits 0 and records `backup.bundled` kind
 #       `full` (none before it): its key under bundles/full/, encrypted with
 #       the same passphrase, a tar (plain, gzip or zstd) holding
-#       manifest.json, for each mission source a git bundle that verifies
-#       alone and lists exactly the source's branches at their commits (the
+#       manifest.json, for each mission source with a branch a git bundle
+#       that verifies alone and lists exactly the source's branches at their
+#       commits (the
 #       agent's work is in its branch), and every transcript file modified
 #       within 14 days under transcripts/<agent>/<file>, the same bytes, and
-#       not the 20-day-old one; the record names both sources and the
-#       window's file count and bytes. Then one transcript grows, a new one
+#       not the 20-day-old one; the record names all four sources and the
+#       window's file count and bytes, the empty one `empty` with no refs and
+#       no file (a restore of it makes an empty repository). Then one transcript grows, a new one
 #       appears, the agent's branch moves and other.git does not: a second
 #       bundle the same day records kind `incremental`, `base_event_id` the
 #       full one's, one object under bundles/incr/, holding the grown file's
 #       appended bytes alone (the manifest's offset its old size), the new
 #       file whole (offset 0), nothing of the unchanged one; a git bundle of
 #       spawn.git with prerequisites that, fetched after the full one's,
-#       gives exactly the source's branches, and other.git `unchanged`; the
-#       full bundle and the increment give the window back byte for byte. A
+#       gives exactly the source's branches, and other.git `unchanged`;
+#       tag.git gains a tag at a commit the full holds and loses a branch,
+#       which the record names as a `delta` with no file (the increment would
+#       be empty and git refuses one); the
+#       full bundle and the increment give the window back byte for byte.
+#       other.git also carries refs/remotes/github/main, as the live
+#       missions/supply-pa.git does: it is not the mission's history, so the
+#       bundle lists no ref the manifest does not name and the record names
+#       it not. A
 #       drill after the full bundle exits 0 and records `.bundle.kind` full.
 #   (4) After more records (the database now holds more events than the
 #       dump), `spawn backup verify` exits 0 and records `backup.verified`
@@ -548,6 +558,22 @@ git -C "$WORK/seed2" add -A
 git -C "$WORK/seed2" commit -qm other
 git init -q --bare --initial-branch=main "$src_other"
 git -C "$WORK/seed2" push -q "$src_other" main:main
+# As the live missions/supply-pa.git was seeded (a mirror clone leaves its
+# remote-tracking ref): not a branch, not the mission's history.
+remote_ref=refs/remotes/github/main
+git --git-dir="$src_other" update-ref "$remote_ref" "$(git -C "$WORK/seed2" rev-parse HEAD)"
+# A third source with nothing in it yet (a mission added before its first
+# push): no branches, no tags. `git bundle create` refuses to make an empty
+# bundle, so the record has to say what there is by name, not a git error.
+src_empty=$WORK/empty.git
+git init -q --bare --initial-branch=main "$src_empty"
+# A fourth source that will change in the increment in ways that need no
+# bytes: a tag added at a commit the full already holds, and a branch
+# removed. Its main and its scratch branch are in the full bundle.
+src_tag=$WORK/tag.git
+git init -q --bare --initial-branch=main "$src_tag"
+git -C "$WORK/seed2" push -q "$src_tag" main:main
+git --git-dir="$src_tag" update-ref refs/heads/scratch "$(git -C "$WORK/seed2" rev-parse HEAD)"
 
 # The transcript archive, as the Bridge keeps it beside the workspaces.
 SPAWN_WORKSPACE_ROOT=$WORK/ws
@@ -720,6 +746,12 @@ psql -d "$SPAWN_DB_NAME" -tA -c "select setval(pg_get_serial_sequence('spawn_eve
         coalesce((select max(id) from spawn_events), 0) + 1000)" >/dev/null ||
     harness "cannot move the events' id sequence"
 add_missions 81 120
+capture "$SPAWN_BIN" mission add --source "$src_empty" \
+    --text "031 mission 146: a mission whose source holds nothing yet"
+[ "$status" -eq 0 ] || harness "mission add failed: $(err)"
+capture "$SPAWN_BIN" mission add --source "$src_tag" \
+    --text "031 mission 147: a mission whose source changes without new history"
+[ "$status" -eq 0 ] || harness "mission add failed: $(err)"
 
 # --- (1) an hourly encrypted dump ------------------------------------------------------
 
@@ -852,7 +884,7 @@ unpack_bundle "$bkey" "$WORK/unpacked" ||
 [ "$(jq -r '.kind // empty' "$WORK/unpacked/manifest.json" 2>/dev/null)" = full ] ||
     measured_fail "(3) the full bundle holds no manifest.json of kind full: $(head -c 200 "$WORK/unpacked/manifest.json" 2>/dev/null)"
 git init -q --bare "$WORK/check.git"
-for src in "$src_spawn" "$src_other"; do
+for src in "$src_spawn" "$src_other" "$src_tag"; do
     want=$(heads_of "$src")
     found=""
     for b in "$WORK"/unpacked/repos/*.bundle; do
@@ -884,9 +916,31 @@ done
 [ "$(field "$bun" '.transcripts.files')" = "$files" ] && [ "$(field "$bun" '.transcripts.bytes')" = "$bytes" ] ||
     measured_fail "(3) the record's transcripts [$(field "$bun" '.transcripts | {files, bytes}' | tr -d ' \n')] are not the window's $files files, $bytes bytes"
 named=$(field "$bun" '[.repos[]?.source] | sort | join(" ")')
-[ "$named" = "$(printf '%s\n%s\n' "$src_other" "$src_spawn" | sort | tr '\n' ' ' | sed 's/ $//')" ] ||
-    measured_fail "(3) the record names the sources [$named], not the two missions' $src_spawn and $src_other"
-echo "031: full bundle: $(field "$bun" '.stored_bytes') bytes stored for $bytes bytes of transcripts and two sources, in $bundle_ms ms"
+[ "$named" = "$(printf '%s\n%s\n%s\n%s\n' "$src_empty" "$src_other" "$src_spawn" "$src_tag" | sort | tr '\n' ' ' | sed 's/ $//')" ] ||
+    measured_fail "(3) the record names the sources [$named], not the four missions' $src_spawn, $src_other, $src_empty and $src_tag"
+# The empty source: named `empty` with no refs and no file in the archive
+# (there is nothing of it to hold, and nothing to leave to a git error).
+empty_entry=$(field "$bun" '.repos[] | select(.source == "'"$src_empty"'")' 2>/dev/null)
+[ -n "$empty_entry" ] && [ "$(printf '%s' "$empty_entry" | jq -r '.empty // false')" = true ] &&
+    [ "$(printf '%s' "$empty_entry" | jq -r '.refs')" = 0 ] &&
+    [ "$(printf '%s' "$empty_entry" | jq -r '.bytes')" = 0 ] &&
+    [ "$(printf '%s' "$empty_entry" | jq -c '.heads')" = '{}' ] ||
+    measured_fail "(3) the record does not name the empty source $src_empty as empty, 0 refs, no bytes, {}: $(printf '%s' "$empty_entry" | head -c 300)"
+[ "$(jq -r --arg s "$src_empty" '[.repos[]? | select(.source == $s) | (.empty == true and .file == null)][0] // false' "$WORK/unpacked/manifest.json" 2>/dev/null)" = true ] ||
+    measured_fail "(3) the manifest does not name the empty source $src_empty as empty with no file: $(jq -c '.repos' "$WORK/unpacked/manifest.json" 2>/dev/null | head -c 400)"
+echo "031: full bundle: $(field "$bun" '.stored_bytes') bytes stored for $bytes bytes of transcripts and three sources (one empty), in $bundle_ms ms"
+
+# The remote-tracking ref other.git carries is not the mission's history: the
+# bundle holds no ref the manifest does not name, and the record names it not.
+[ -n "$(git --git-dir="$src_other" for-each-ref --format='%(refname)' "$remote_ref")" ] ||
+    harness "the fixture lost $src_other's $remote_ref"
+field "$bun" '.repos[].heads | keys[]' | grep -qxF -- "$remote_ref" &&
+    measured_fail "(3) the record names $remote_ref, which no source's bundle holds"
+for b in "$WORK"/unpacked/repos/*.bundle; do
+    [ -f "$b" ] || continue
+    git bundle list-heads "$b" 2>/dev/null | awk '{ print $2 }' | grep -qxF -- "$remote_ref" &&
+        measured_fail "(3) the bundle $(basename "$b") holds $remote_ref, which its manifest does not name"
+done
 
 # The drill opens the newest bundle too: now it is the full one.
 backup verify SPAWN_BACKUP_DRILL_DATABASE_URL="$DRILL_URL"
@@ -913,6 +967,12 @@ printf 'more agent work\n' >>"$WORK/seed/work.txt"
 git -C "$WORK/seed" add -A
 git -C "$WORK/seed" commit -qm "spawn checkpoint exec_8"
 git -C "$WORK/seed" push -q "$src_spawn" work:refs/heads/spawn/agent_worker_objective_7
+# tag.git moves without new history: a tag at a commit the full bundle
+# already holds, and a branch removed. `git bundle create` would refuse an
+# empty increment, so the run has to name it.
+main_tag=$(git --git-dir="$src_tag" rev-parse refs/heads/main)
+git --git-dir="$src_tag" update-ref refs/tags/v1 "$main_tag"
+git --git-dir="$src_tag" update-ref -d refs/heads/scratch
 lines=$(log_lines)
 backup bundle
 [ "$status" -eq 0 ] || fail "(3) the second \`spawn backup bundle\` exited $status: $(err | tail -n 2 | tr '\n' ' ')"
@@ -983,6 +1043,23 @@ else
         [ "$(jq -r --arg s "$src_other" '[.repos[]? | select(.source == $s) | .unchanged][0] // empty' "$manifest" 2>/dev/null)" = true ] &&
             [ "$(printf '%s' "$inc" | cut -d'|' -f2- | jq -r --arg s "$src_other" '[.repos[]? | select(.source == $s) | .unchanged][0] // empty' 2>/dev/null)" = true ] ||
             measured_fail "(3) the increment and its record do not mark other.git unchanged (no ref of it moved): $(jq -c '.repos' "$manifest" 2>/dev/null)"
+        # spawn.git's bundle holds one ref, and the record says so: `bundled`
+        # is what the bundle lists, not what a reader infers from the base.
+        bundled=$(printf '%s' "$inc" | cut -d'|' -f2- | jq -c --arg s "$src_spawn" '[.repos[]? | select(.source == $s)][0].bundled // empty')
+        moved_commit=$(git --git-dir="$src_spawn" rev-parse refs/heads/spawn/agent_worker_objective_7)
+        [ "$(printf '%s' "$bundled" | jq -c 'length')" = 1 ] &&
+            [ "$(printf '%s' "$bundled" | jq -r --arg c "$moved_commit" '.[0] | select(.ref == "refs/heads/spawn/agent_worker_objective_7" and .commit == $c) | .ref')" = refs/heads/spawn/agent_worker_objective_7 ] ||
+            measured_fail "(3) the increment's record does not name its bundle's one ref (refs/heads/spawn/agent_worker_objective_7 at $moved_commit): $bundled"
+        # tag.git changed without new history: the record and the manifest name
+        # the delta (the tag added, the branch removed), bundled [], and no
+        # file, rather than leaving git's empty-bundle refusal to land in the run.
+        tag_record=$(printf '%s' "$inc" | cut -d'|' -f2- | jq -c --arg s "$src_tag" '[.repos[]? | select(.source == $s)][0] // empty')
+        printf '%s' "$tag_record" | jq -e '.file == null and .bytes == 0 and .delta.added == ["refs/tags/v1"] and .delta.removed == ["refs/heads/scratch"] and .bundled == []' >/dev/null 2>&1 ||
+            measured_fail "(3) the increment's record does not name tag.git's change as a delta with no file (the tag v1 added at a held commit, the branch scratch removed): $tag_record"
+        jq -e --arg s "$src_tag" '[.repos[]? | select(.source == $s)][0] | .file == null and .delta.added == ["refs/tags/v1"] and .delta.removed == ["refs/heads/scratch"] and .bundled == []' "$manifest" >/dev/null 2>&1 ||
+            measured_fail "(3) the increment's manifest does not name tag.git's delta with no file: $(jq -c '.repos' "$manifest" 2>/dev/null)"
+        [ ! -e "$WORK/unpacked2/repos/tag.git.bundle" ] ||
+            measured_fail "(3) the increment holds a bundle of tag.git, whose change needs no bytes"
     fi
     echo "031: increment: $(field "$inc" '.stored_bytes') bytes stored for $(field "$inc" '.transcripts.bytes') bytes of transcripts, in $incr_ms ms"
 fi

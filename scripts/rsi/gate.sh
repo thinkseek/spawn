@@ -167,6 +167,11 @@
 #                              sets it (its share of the cores, gate.rs Cpu);
 #                              by hand: default min(8, half the cores), 1 on
 #                              the shared test server
+#   SPAWN_GATE_HOST_JOBS       the host's scenario budget, all gates together
+#                              ("Host scenario slots" below); default: the
+#                              value every gate is given (SPAWN_GATE_JOBS)
+#                              when it is set, else the same default one
+#                              gate takes (min(8, half the cores))
 #   SPAWN_GATE_PG_IMAGE        the test server's docker image: the gate runs a
 #                              server of its own from it (GitHub issue #6),
 #                              and SPAWN_TEST_DATABASE_URL is not used
@@ -584,6 +589,56 @@ case "$gate_jobs" in
     exit 3
     ;;
 esac
+# The host's scenario budget (see "Host scenario slots"): SPAWN_GATE_HOST_JOBS,
+# else the value every gate is given (SPAWN_GATE_JOBS) when the owner set
+# it, else the same default one gate takes. Without flock, or a writable
+# slot directory, it becomes 0 — no budget, said below.
+gate_slots=${SPAWN_GATE_HOST_JOBS-}
+if [ -z "$gate_slots" ]; then
+    if [ -n "${SPAWN_GATE_JOBS-}" ]; then
+        gate_slots=$gate_jobs
+    else
+        gate_slots=$(($(nproc 2>/dev/null || echo 2) / 2))
+        [ "$gate_slots" -le 8 ] || gate_slots=8
+        [ "$gate_slots" -ge 1 ] || gate_slots=1
+    fi
+fi
+case "$gate_slots" in
+'' | *[!0-9]* | 0*)
+    echo "gate: SPAWN_GATE_HOST_JOBS is a whole number from 1, not '$gate_slots'" >&2
+    exit 3
+    ;;
+esac
+# The slots themselves: files this host's gates lock one at a time, under
+# $HOME (0700), so the integrator's gate, an owner's hand-run gate and the
+# deploy's warm-up all find the same ones — with no variable to set, and
+# whatever XDG_CACHE_HOME a hand-run shell carries. (test-gate.sh gives its
+# runs a HOME of their own, so its gates stay out of the host's budget.)
+# Outside the sandbox: no scenario can see or take a lock, and the kernel
+# drops a held one when its fd closes, a kill included.
+slot_dir=$HOME/.cache/spawn/gate-slots
+slot_held=""
+if command -v flock >/dev/null 2>&1; then
+    if mkdir -p "$slot_dir" 2>/dev/null && chmod 700 "$slot_dir" 2>/dev/null; then
+        slot_i=1
+        while [ "$slot_i" -le "$gate_slots" ]; do
+            if ! (umask 077 && : >>"$slot_dir/slot.$slot_i") 2>/dev/null; then
+                gate_slots=0
+                break
+            fi
+            slot_i=$((slot_i + 1))
+        done
+    else
+        gate_slots=0
+    fi
+else
+    gate_slots=0
+fi
+if [ "$gate_slots" = 0 ]; then
+    echo "| host scenario slots: none (no flock, or $slot_dir cannot be written): each gate runs its own SPAWN_GATE_JOBS"
+else
+    echo "| host scenario slots: $gate_slots (every gate on this host takes one per scenario run)"
+fi
 # Whatever the gate started dies with it: its scenario runs, the private
 # server, the forwarder (below). A SIGKILL leaves none either: each runs
 # under bubblewrap's --die-with-parent or the parent-death signal.
@@ -953,6 +1008,38 @@ build() {
     }
 }
 
+# Host scenario slots. SPAWN_GATE_JOBS is one gate's own share, and every
+# gate on a host once ran that many: an owner gate beside the integrator's
+# (or the deploy's base-cache warm-up, which is a gate run too) doubled the
+# host's scenario load, and on 2026-11-08 two gates' heavy scenarios at
+# once starved a test past its wait and a task was rejected wrongly. So the
+# host has one budget: every scenario run, from every gate, takes one of
+# SPAWN_GATE_HOST_JOBS slots first, and a run waits when they are all
+# taken.
+#
+# The claim sits in this file, in `job_run` (through `slot_acquire`), never
+# in the integrator around it: whoever starts a gate — `spawn integrate`, an
+# owner's hand-run, the deploy's warm-up — takes the same budget, with no
+# configuration. A gate running two scenarios holds two slots (one per run's
+# own subshell, one fd each, so the same process starting a second scenario
+# claims a second slot and never re-counts the first). The slots are files
+# under $HOME/.cache/spawn/gate-slots (not under XDG_CACHE_HOME: the budget
+# is the user's, and a hand-run gate with any XDG_CACHE_HOME still finds it;
+# the gate makes it 0700), held by flock on an fd of the run's subshell: the
+# kernel drops a lock when the fd closes, so a killed gate loses no slot and
+# a run that never started takes none. A wait of more than one round is
+# said while it is going (as a line beside the run's, so a waiting gate and
+# a stalled one never look alike), and every ten minutes again while it
+# lasts; the run's own block then records how long it waited and the slot
+# it took. A hung holder is not bounded here — the gate has no per-scenario
+# timeout; a gate the integrator started is killed at its gate wall clock
+# (SPAWN_GATE_WALL_CLOCK_MINUTES, default 120), and a hand-run gate's owner
+# kills it — and until then the waiter waits, saying so. The build hook is not a scenario and
+# takes none (one per gate, and gates are few); everything that runs a
+# scenario does — the base's runs and the cache warm-up's, the candidate's
+# checks and the task scenario. Gates on different hosts have different
+# budgets; the slots are per host, not per fleet.
+#
 # Parallel runs. The base's scenario runs, and then the candidate's, run
 # SPAWN_GATE_JOBS at a time (above), the base's all done before any
 # candidate code runs. Each run is a sandbox of its own: its own /tmp (so its
@@ -988,20 +1075,71 @@ build() {
 # last: the job is done. `job.pid` is its subshell; `pid`, while a run is
 # going, the subshell bubblewrap is the child of (job_stop above).
 
+# slot_acquire <job>: one of the host's scenario slots (see "Host scenario
+# slots"), waiting while every one is taken; sets slot_held (the slot's
+# path, empty when there is no budget), slot_n (its number) and
+# slot_wait_ms. Taken in the run's own subshell, on fd 6, so the lock goes
+# when the run's processes do. A wait past the first round leaves <job>/waiting
+# for the gate's own loop to print, so a waiting gate is visible while it
+# waits; the run's block then says how long it waited and the slot it took.
+slot_acquire() {
+    slot_held="" slot_n="" slot_wait_ms=0 slot_said=""
+    [ "$gate_slots" -gt 0 ] || return 0
+    rm -f "$1/waiting" "$1/waiting.said" "$1/waiting.said.n" 2>/dev/null || :
+    slot_from=$(stage_now)
+    while [ -z "$slot_held" ]; do
+        slot_i=1
+        while [ "$slot_i" -le "$gate_slots" ]; do
+            if [ ! -e "$slot_dir/slot.$slot_i" ]; then
+                # The slot files went away (a cache root cleaned under us):
+                # judge as before rather than wait forever.
+                gate_slots=0
+                return 0
+            fi
+            exec 6>>"$slot_dir/slot.$slot_i"
+            if flock -n 6 2>/dev/null; then
+                slot_held=$slot_dir/slot.$slot_i
+                slot_n=$slot_i
+                break
+            fi
+            exec 6>&-
+            slot_i=$((slot_i + 1))
+        done
+        if [ -z "$slot_held" ]; then
+            [ -n "$slot_said" ] || : >"$1/waiting" 2>/dev/null || :
+            slot_said=1
+            sleep 0.2
+        fi
+    done
+    [ -z "$slot_said" ] || rm -f "$1/waiting" 2>/dev/null || :
+    slot_wait_ms=$(( $(stage_now) - slot_from ))
+}
+slot_release() {
+    [ -n "$slot_held" ] || return 0
+    exec 6>&-
+    slot_held=""
+}
+
 # job_run <job> <run> <tree> <scenario>: one run of the scenario in the
-# built tree, in the sandbox; returns its exit status.
+# built tree, in the sandbox, holding one of the host's scenario slots;
+# returns its exit status.
 job_run() {
+    slot_acquire "$1"
+    if [ "$slot_wait_ms" -ge 200 ]; then
+        job_say "| waited $((slot_wait_ms / 1000)).$((slot_wait_ms % 1000 / 100)) s for host scenario slot $slot_n of $gate_slots (shared by every gate on this host)"
+    fi
     {
         {
             run_status=0
             sandbox "$3" env SPAWN_BIN="$(spawn_bin "$3")" SPAWN_BASELINE_TREE="$work/baseline" \
-                CARGO_TARGET_DIR="$3/target" sh "$4" 8>&- &
+                CARGO_TARGET_DIR="$3/target" sh "$4" 6>&- 8>&- &
             printf '%s\n' "$!" >"$1/pid"
             wait "$!" || run_status=$?
             rm -f "$1/pid"
             echo "$run_status" >"$1/status.$2"
         } | tee "$1/out.$2"
     } >"$1/log.$2" 2>&1
+    slot_release
     return "$(cat "$1/status.$2" 2>/dev/null || echo 1)"
 }
 # The job's block, written by the job ($job, $job_part): text, and a stage
@@ -1115,6 +1253,26 @@ run_jobs() {
         rj_still=""
         for rj_i in $rj_running; do
             rj_job=$jobs_dir/$rj_phase.$rj_i
+            # A run waiting for a host scenario slot says so while it waits,
+            # and every ten minutes again: a stalled gate and a waiting one
+            # must never look alike, and a holder that never ends (a hung
+            # gate without a timeout) must stay visible.
+            if [ -e "$rj_job/waiting" ]; then
+                rj_wait_name=$(basename "$rj_job")
+                if [ ! -e "$rj_job/waiting.said" ]; then
+                    echo "| $rj_wait_name: waiting for a host scenario slot (all $gate_slots taken, shared by every gate on this host)"
+                    : >"$rj_job/waiting.said" 2>/dev/null || :
+                    echo 0 >"$rj_job/waiting.said.n" 2>/dev/null || :
+                else
+                    rj_wait_from=$(date -r "$rj_job/waiting" +%s 2>/dev/null || echo 0)
+                    rj_wait_due=$((($(date +%s) - rj_wait_from) / 600))
+                    rj_wait_said=$(cat "$rj_job/waiting.said.n" 2>/dev/null || echo 0)
+                    if [ "$rj_wait_due" -gt "$rj_wait_said" ] && [ "$rj_wait_due" -gt 0 ]; then
+                        echo "| $rj_wait_name: still waiting for a host scenario slot ($((rj_wait_due * 10)) min; all $gate_slots taken)"
+                        echo "$rj_wait_due" >"$rj_job/waiting.said.n" 2>/dev/null || :
+                    fi
+                fi
+            fi
             # A subshell gone without a result (killed by someone else) is
             # an error, not a wait forever.
             if [ ! -e "$rj_job/result" ] && ! kill -0 "$(cat "$rj_job/job.pid")" 2>/dev/null &&
