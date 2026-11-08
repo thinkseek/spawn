@@ -501,6 +501,12 @@ base_cache=$(cd "$base_cache" && pwd -P)
 # The controller's checkout, as the checks locate it (two levels above the
 # scenarios directory).
 controller=$(cd "$scenarios/../.." && pwd)
+# The gate's own helpers (scripts/pg-url.sh, which `toolchain` sources
+# inside the sandbox): beside this script, which for a project that is not
+# Spawn (Supply PA's gate/scenarios) is another checkout than the
+# controller's. Bound back like the controller's scripts, or the probe of
+# the test server reads nothing ("server: unreadable", 2026-11-09).
+gate_scripts=$(cd "$(dirname "$0")/.." && pwd)
 
 # $HOME in the sandbox is an empty tmpfs. Bound back read-only, one path per
 # line: the Rust toolchain (rustup's proxies and toolchains), the install
@@ -554,6 +560,9 @@ done
 for path in "$controller/scripts" "$controller/web/node_modules"; do
     under_home "$path" && bind_home "$path"
 done
+if [ "$gate_scripts" != "$controller/scripts" ] && under_home "$gate_scripts"; then
+    bind_home "$gate_scripts"
+fi
 # The owner's own read-only inputs for a tree that is not Spawn (a project's
 # installed dependencies, which the sandbox cannot download): one absolute
 # directory per line in `<scenarios-dir>/bind`, `#` comments. Only under
@@ -1145,7 +1154,7 @@ sandbox "$work/socket-scan" find / \( -path /proc -o -path /sys -o -path /dev \)
 # something the sandbox uses (a system directory, PATH, a bound path), or
 # the directory is one of those or above one.
 sandbox_paths=$(printf '%s\n' /bin /etc /lib /lib32 /lib64 /libx32 /nix /gnu /opt /sbin /usr \
-    "$work" "$scenarios" "$HOME" "$cargo_home" "$rustup_home" "$controller/scripts" \
+    "$work" "$scenarios" "$HOME" "$cargo_home" "$rustup_home" "$controller/scripts" "$gate_scripts" \
     "$controller/web/node_modules" "$scenario" "$db_socket" "$PATH" | tr ':' '\n'
 printf '%s%s' "$home_binds" "$hidden_path_dirs")
 needed_by_sandbox() {
@@ -2048,13 +2057,34 @@ toolchain() {
             echo "server: $?"
         else
             echo "server: unreadable"
-        fi' toolchain "$(cd "$(dirname "$0")/.." && pwd)/pg-url.sh" >"$work/toolchain" 2>&1 || true
+        fi' toolchain "$gate_scripts/pg-url.sh" >"$work/toolchain" 2>&1 || true
     [ -z "$gate_pg_id" ] || echo "server: the gate's own, $gate_pg_kind $gate_pg_id" >>"$work/toolchain"
     toolchain_key=$(sha256sum <"$work/toolchain" | cut -d' ' -f1)
     echo "| base cache: toolchain $(sed -n 's/^release: /rustc /p' "$work/toolchain" | head -n 1)" \
         "$(sed -n 's/^\(cargo [^ ]*\).*/\1/p' "$work/toolchain" | head -n 1)" \
         "$(sed -n 's/^\(psql\) (PostgreSQL) \([^ ]*\).*/\1 \2/p' "$work/toolchain" | head -n 1)" \
-        "server $(sed -n 's/^\([0-9]\{5,6\}\)$/\1/p' "$work/toolchain" | head -n 1 | grep . || echo none)"
+        "$(toolchain_server)"
+}
+# toolchain_server: what the probe saw of the test server, as one phrase:
+# its version, "none" only when the gate had no test database, "unreadable"
+# when the gate's own pg-url.sh was not visible in the sandbox, or
+# "unreachable" with psql's status and first line — never "none" for a
+# server the gate runs (2026-11-09: Supply PA's gate said "server none"
+# beside its own server, because the probe could not read pg-url.sh).
+toolchain_server() {
+    tc_version=$(sed -n 's/^\([0-9]\{5,6\}\)$/\1/p' "$work/toolchain" | head -n 1)
+    tc_status=$(sed -n -E 's/^server: (none|unreadable|[0-9]+)$/\1/p' "$work/toolchain" | head -n 1)
+    if [ -n "$tc_version" ]; then
+        printf 'server %s' "$tc_version"
+    elif [ "$tc_status" = none ]; then
+        printf 'server none'
+    elif [ "$tc_status" = unreadable ]; then
+        printf "server unreadable (the gate's pg-url.sh is not visible in the sandbox)"
+    else
+        tc_said=$(awk '/^jq: [0-9]+$/ { after = 1; next } after && !/^server: / { print; exit }' \
+            "$work/toolchain" | cut -c1-160)
+        printf 'server unreachable: psql exit %s%s' "${tc_status:-unknown}" "${tc_said:+ ($tc_said)}"
+    fi
 }
 # entry_result <entry>: solved, unsolved or cannot_judge (see "A scenario
 # that cannot be judged here"), as the entry holds it; nothing for an entry

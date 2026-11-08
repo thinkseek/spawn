@@ -2060,4 +2060,38 @@ expect "naming the TMPDIR" "$tmp_out" "the host's TMPDIR ($TMPDIR)"
 expect "and why" "$tmp_out" "the sandbox empties too"
 refuse "and nothing ran" "$tmp_out" "=="
 
+# The toolchain probe reads the test server through the gate's own
+# scripts/pg-url.sh, inside the sandbox. For a project that is not Spawn the
+# scenarios are another checkout's (Supply PA's gate/scenarios), so the
+# gate's own scripts/ must be bound back under $HOME too: without it the
+# probe read nothing and the log said "server none" beside a server the
+# gate ran (2026-11-09). The gate here sits under $HOME, its scenarios in
+# another tree, and the log names the server's version.
+other_ctl=$HOME/other-ctl
+other_project=$work/other-project/gate/scenarios
+mkdir -p "$other_ctl" "$other_project" "$work/other-tmp"
+cp -r "$(dirname "$gate")/.." "$other_ctl/scripts"
+chmod -R u+w "$other_ctl"
+cp "$scenarios/protected" "$other_project/"
+printf '#!/bin/sh\nexit 0\n' >"$other_project/001.sh"
+# With a server of the gate's own, as the live gate had (the programs of
+# PostgreSQL 16 where this host has them; otherwise the case says so).
+other_pg=${SPAWN_GATE_PG_BIN:-/usr/lib/postgresql/16/bin}
+if [ -x "$other_pg/postgres" ] && [ -x "$other_pg/initdb" ]; then
+    other_status=0
+    other_out=$(unset SPAWN_TEST_DATABASE_URL; TMPDIR=$work/other-tmp XDG_CACHE_HOME="$work/caches/other" \
+        SPAWN_GATE_PG_BIN=$other_pg \
+        sh "$other_ctl/scripts/rsi/gate.sh" --base-only "$repo" "$base" "$other_project" 2>&1) ||
+        other_status=$?
+    expect "a gate under \$HOME judging another checkout's scenarios: exit 0" "$other_status" 0
+    expect "with a server of its own" "$other_out" "| test database: a server of the gate's own"
+    expect "its toolchain line names the server's version" \
+        "$(printf '%s\n' "$other_out" | grep -E '^\| base cache: toolchain .* server [0-9]{5,6}$' || true)" \
+        'server '
+    refuse "never none while it runs one" "$other_out" "server none"
+    refuse "nor unreadable" "$other_out" "server unreadable"
+else
+    echo "note: no PostgreSQL programs in $other_pg: the toolchain line's server case is not run"
+fi
+
 echo "gate: all cases pass"
