@@ -817,8 +817,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        MAX_BACKOFF_INTERVALS, MAX_FAILURES, MAX_OUTAGE_INTERVALS, Pace, Schedule, Step, backoff,
-        pause_unless_stopped, stop_on_signal,
+        MAX_FAILURES, MAX_OUTAGE_INTERVALS, Pace, Schedule, Step, backoff, pause_unless_stopped,
+        stop_on_signal,
     };
 
     /// A schedule whose steps have all run on `watermark` and wait for no

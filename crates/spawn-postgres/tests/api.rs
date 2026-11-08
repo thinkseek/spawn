@@ -27,6 +27,7 @@ use spawn_core::memory::MemoryStore;
 use spawn_core::observation::{Confidence, Observation, SemanticState};
 use spawn_core::observe::Observer;
 use spawn_core::port::{CommandQueue, EventLog};
+use spawn_postgres::PostgresStore;
 use spawn_core::time::SystemClock;
 
 mod common;
