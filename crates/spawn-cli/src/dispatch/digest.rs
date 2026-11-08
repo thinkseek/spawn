@@ -72,10 +72,7 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::HoldExpired => "a source hold expired",
         Why::ObjectiveYielded => "an objective ran out of attempts and yielded its slot",
         Why::ObjectiveOrder => "a backlog names an order no task can meet",
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
         Why::OverBudget => "a task went over its budget twice",
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
     }
 }
 
@@ -231,7 +228,6 @@ pub(crate) fn objective_yields(records: &[Value]) -> Vec<Escalation> {
         .collect()
 }
 
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
 /// The digest items for `records` (`PostgresStore::over_budget_escalations`):
 /// a task that continued an overrun task of its objective went over the
 /// budget too, so no third task is issued for it and the objective waits
@@ -292,8 +288,6 @@ pub(crate) fn over_budget_escalations(records: &[Value]) -> Vec<Escalation> {
         .collect()
 }
 
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 /// The digest items for `missions` (`PostgresStore::objective_backlogs`):
 /// one per open objective mission whose backlog names an order that cannot
 /// be met ([`crate::objectives::order_problems`]), of session `missions`,
