@@ -26,9 +26,11 @@ use postgres::{Client, NoTls, Row};
 use spawn_core::port::StoreError;
 
 /// SQL: whether the `agent_executions` row aliased `$x` died young: it
-/// ended lost or with a non-zero exit within a minute of its start. An
-/// engine that launches and dies at once is a failed revival, whatever its
-/// command's outcome says.
+/// ended lost or with a non-zero exit within a minute of its start, before
+/// it made any progress (no tool call completed and no turn ended after it
+/// started). An engine that launches and dies at once is a failed revival,
+/// whatever its command's outcome says; one that worked before a fault took
+/// it is not, and is revived at once (objective 032's soak).
 macro_rules! died_young {
     ($x:literal) => {
         concat!(
@@ -40,7 +42,12 @@ macro_rules! died_young {
             $x,
             ".cause = 'lost' or coalesce(",
             $x,
-            ".exit_code, 0) <> 0))"
+            ".exit_code, 0) <> 0) and not exists (select 1 from spawn_events p \
+             where p.session_id = ",
+            $x,
+            ".session_id and p.execution_id = ",
+            $x,
+            ".execution_id and p.event_name in ('tool.completed', 'turn.stopped')))"
         )
     };
 }
