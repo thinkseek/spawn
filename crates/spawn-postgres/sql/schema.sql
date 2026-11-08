@@ -2715,12 +2715,8 @@ begin
     if p_record ->> 'type' is null
        or p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
                                       'task.held', 'source.hold_expired', 'task.cancelled',
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
                                       'source.moved', 'source.push_refused',
                                       'task.over_budget') then
-=======
-                                      'source.moved', 'source.push_refused') then
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         raise exception 'the integrator does not record %', p_record ->> 'type';
     end if;
     -- The integrator cancels one kind of task: an objective's task in flight
@@ -2737,7 +2733,6 @@ begin
         end if;
         p_record := p_record || jsonb_build_object('by', 'spawn-integrate');
     end if;
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
     -- An overrun names what it measured: its reason, its tool calls and the
     -- budget it ran past (the mission's, as it was). Its branch, commit and
     -- diff stat say what work the objective's next task continues.
@@ -2747,8 +2742,6 @@ begin
             or jsonb_typeof(p_record -> 'budget') is distinct from 'object') then
         raise exception 'a task.over_budget names its reason, tool_calls and budget: %', p_record;
     end if;
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
     -- The outcome of an owner's landing names its request: a
     -- `source.push_requested` that has no outcome yet, so every request has
     -- at most one. A move names the request's source, where main went from
