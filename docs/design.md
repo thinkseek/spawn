@@ -141,7 +141,20 @@ Claude Code 是唯一的引擎（`ENGINE` = `claude`）。`execution.started` �
 
 凭证：引擎以主机用户身份运行、处于 bypass 模式，内联 settings 的 `permissions.deny` 写入 `CREDENTIAL_DENY`（`bridge.rs`，2026-11-08 起：一个 fleet worker 读过 loop 的环境文件）。文件：`~/.local/share/spawn-rsi/*.env*`、`env.sh`、`backups/`、`fleet-pg/`，`~/.config/spawn/**`、`~/.config/cloudflare/**`、`~/.hermes/**`、整个 `~/.claude/**`（设置、登录、以及记录了会话打印过的一切的转录）和 `~/.claude.json`、`~/.ssh/**`、`~/.gnupg/**`、`/data/tmp/ccd/**`、`/data/tmp/ccd-pg/**`、`/var/tmp/spawn/**/*.sh`，各有 `Read(…)`、`Edit(…)` 规则；另有 `Bash(*…*)` 规则拒绝命令文本里写出这些路径或文件名的调用，以及替调用者读取凭证的程序（owner 在 `/var/tmp/spawn` 的辅助脚本——那里也是 fleet 的 `TMPDIR`，所以只拒 `*.sh`——以及任何 Spawn 检出里的 `deploy/hold.sh`、`deploy/deploy.sh`、`test-deploy.sh`、`cutover-controller.sh`、`deploy/backup`），，别的进程的环境（`*/environ*`、`ps …e`），以及按名字或模式杀进程（`pkill`、`killall`、`kill $(pgrep …)`、`pgrep … | kill`：会杀到别的 agent 和 gate 的进程，2026-11-08 一个 resident 的 `pkill -f 'cargo test'` 杀了一个 ccd 的测试；`kill <pid>` 保留，用来停自己的后台任务）。Claude Code 2.1.319 实测：deny 规则在 bypass 模式下照样生效；`Read` 规则拦住 Read/Grep/Glob 工具和 cat、head、tail、grep、sed、awk、cp、base64、od、`<` 重定向，拦不住 `source`、`.`、`less`、`xargs cat`、`bash -c`、python 的 `open()`，这些由 `Bash(*…*)` 规则拦住；`~/.claude/**` 全部拒绝时，引擎照常工作、写转录、读全局指令、`--resume` 照常（这些是它的内部读写，不是工具调用）。`spawn loop`、`spawn integrate`、`spawn serve` 启动时调用 `prctl(PR_SET_DUMPABLE, 0)`（`spawn_host::undumpable`）：同一用户的进程读不到它们的 `/proc/<pid>/environ`；它们 exec 的程序（引擎、gate、git）从 exec 起重新可转储。因此 `deploy.sh` 不再读集成器的 environ，改读集成器启动时写的 `~/.config/spawn/gate-env`（`SPAWN_GATE_ENV_FILE`，0600，首条记录是它的 pid）。仍然拦不住的：不写出路径的命令（变量拼接、通配、先 `cd` 再相对路径交给解释器）、读取命令没写出的文件的程序、gate 进程的环境（gate 由 exec 启动，可转储，带 gate 共用测试库的 URL），以及引擎自身环境里的变量（网关的 `ANTHROPIC_*` 来自用户 settings）。这是规则，不是边界；边界要靠 Claude Code 的 sandbox（Linux 上需要 bubblewrap 和 socat）。
 
-不注入 hook。新会话由 Bridge 用 `--session-id <uuid>` 命名并先记 `session.native_started`，恢复用 `--resume <uuid>`；Bridge 每个 tick 通过终端主机读取 `<Claude projects 目录>/<工作目录转义>/<uuid>.jsonl` 的新增整行（`SPAWN_CLAUDE_PROJECTS`），以引擎自带的 `uuid`、`tool_use_id` 作键去重。runner 把退出码写到 `SPAWN_EXIT_FILE`；终端里没有数据库登录。测试库例外：loop 设了 `SPAWN_FLEET_TEST_DATABASE_URL`（fleet 自己的测试服务器，`deploy/fleet-test-db.sh`、`spawn-fleet-test-db` 单元）时，引擎的环境里 `SPAWN_TEST_DATABASE_URL` 就是它，但只在核对通过之后（`BridgeConfig.launch_environment`，每次启动时询问）：fleet 的服务器和配置的其他服务器（loop 自己的 `SPAWN_TEST_DATABASE_URL`，即 gate 共用的测试服务器，以及 `SPAWN_DATABASE_URL`）都读得到 `system_identifier`，且 fleet 的与每个都不同。失败即关闭：读不到、写法相同或身份相同，这次启动就不给，原因在 loop 日志里每种说一次，下次启动再查；通过之后不再查。不设就没有测试库，绝不给 gate 的。每个任务的提示（`task_prompt` 和新任务的输入）在 brief 之后带 `CREDENTIALS_LINE` 和 `PROCESSES_LINE`（"Never kill a process you did not start; stop your own background jobs by their id."）两行，`CREDENTIALS_LINE`："Your test database is $SPAWN_TEST_DATABASE_URL; never read any credential file, never put a URL on a command line."
+不注入 hook。新会话由 Bridge 用 `--session-id <uuid>` 命名并先记 `session.native_started`，恢复用 `--resume <uuid>`；Bridge 监视 `<Claude projects 目录>/<工作目录转义>/<uuid>.jsonl`（`SPAWN_CLAUDE_PROJECTS`）和 runner 的退出文件，文件变了才读新增整行，以引擎自带的 `uuid`、`tool_use_id` 作键去重。runner 把退出码写到 `SPAWN_EXIT_FILE`；终端里没有数据库登录。测试库例外：loop 设了 `SPAWN_FLEET_TEST_DATABASE_URL`（fleet 自己的测试服务器，`deploy/fleet-test-db.sh`、`spawn-fleet-test-db` 单元）时，引擎的环境里 `SPAWN_TEST_DATABASE_URL` 就是它，但只在核对通过之后（`BridgeConfig.launch_environment`，每次启动时询问）：fleet 的服务器和配置的其他服务器（loop 自己的 `SPAWN_TEST_DATABASE_URL`，即 gate 共用的测试服务器，以及 `SPAWN_DATABASE_URL`）都读得到 `system_identifier`，且 fleet 的与每个都不同。失败即关闭：读不到、写法相同或身份相同，这次启动就不给，原因在 loop 日志里每种说一次，下次启动再查；通过之后不再查。不设就没有测试库，绝不给 gate 的。每个任务的提示（`task_prompt` 和新任务的输入）在 brief 之后带 `CREDENTIALS_LINE` 和 `PROCESSES_LINE`（"Never kill a process you did not start; stop your own background jobs by their id."）两行，`CREDENTIALS_LINE`："Your test database is $SPAWN_TEST_DATABASE_URL; never read any credential file, never put a URL on a command line."
+
+**Bridge 读什么，什么时候读。** 监视走 `FileWatch` 端口：Linux 上是 inotify（`spawn_host::InotifyWatch`），一个描述符、每个文件一条目录监视；路径还不存在时监视它上面最深的已存在目录，目录随引擎出现时监视跟着往下走（transcript 在 `<projects>/<工作目录转义>/`，退出文件在 `<工作区>/.spawn/`，两者都由引擎稍后创建）。设不了监视的执行（系统调用出错、文件系统不支持、`max_user_watches` 到顶）退回每个 pass 都读，并在循环输出里告警一次。读的偏移规则不变：只读整行，读到一半的行留到下一次变化或下一个 pass，绝不丢；一次 checkpoint 没提交的行同样留到下一个 pass。
+
+一个 pass 对空闲的 agent 不花钱。没有命令在飞（Bridge 拿着在等，`held`）、transcript 没有变化、屏幕知道得够新的执行，这个 pass 不抓屏、不读任何文件、也不为它单独问一次 runner（`list-panes`）。屏幕只在能改变决定时抓：
+
+| 何时 | 出处 |
+| --- | --- |
+| 会话上有命令在飞（Bridge 领取了还没完成；同一个 pass 领到的也算） | 投递等着它的读数 |
+| transcript 自上次增长以来静止满 `SPAWN_SCREEN_QUIET_MS`（默认 500 ms）而屏幕此后还没读过，之后的 pass 接着读，直到连续两次读数一致 | transcript 说不了的事：提示符回来了 |
+| 距上次抓屏满 `screen_refresh`（30 s）的兜底 | transcript 不动而屏幕变了：对话框、掉回 shell |
+| transcript 里刚读到一轮的结束（`turn.stopped`、`turn.failed`），而屏幕还没回到提示符：之后的 pass 接着读，直到某次读数接受输入（提示符回来了），或距这一轮的结束满 `screen_refresh` | 引擎在结束这一轮的那一行之后才画提示符；那份读数正是投递在等的，不能留给兜底 |
+
+忙碌的屏幕仍每 30 秒重记一次。兜底抓屏一个 pass 最多 `BACKSTOPS_PER_PASS` （2）个，同时到期的屏幕分摊到后面几个 pass：一个 pass 抓完整个舰队会把下一条命令挡在后面。“引擎还在不在”不靠每个执行的 `runner`：有监视时，`TerminalHost::runners` 一个 pass 问一次终端服务器（tmux 一次 `list-panes -a`，整个舰队一次调用），终端不在或不再托管本主机的 runner 的执行，下一个 pass 就按 `lost` 结束，和以前一样快；没有监视时（`spawn tick`、测试）仍然逐个问。引擎自己退出照旧由退出文件的变化在半秒级发现。因果（§14）：屏幕状态只从抓屏来、一轮的结束只从 transcript 的行来；没抓屏、transcript 没变化都不算状态，transcript 静止只说明什么时候该再看屏幕。
 
 启动参数超过 7 个时按 `Run { engine, native, prompt }` 结构体传引用，保持签名可读。
 
@@ -173,7 +186,7 @@ checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.commit
 
 ## 6. 屏尾判定
 
-Claude 以 `--ax-screen-reader` 运行，屏幕是唯一可靠的完成信号来源。会话记录给结构化事件；屏尾只判两件事：能否输入、是否被阻塞。Bridge 每个 tick 读屏，两次读数一致才记录，忙碌状态每 30 秒重记一次。
+Claude 以 `--ax-screen-reader` 运行，屏幕是唯一可靠的完成信号来源。会话记录给结构化事件；屏尾只判两件事：能否输入、是否被阻塞。Bridge 不是每个 tick 都读屏（§5）：会话上有命令在飞、transcript 静止满 `SPAWN_SCREEN_QUIET_MS`、transcript 刚读到一轮的结束而屏幕还没回到提示符（读到接受输入为止，最长 `screen_refresh`）、或距上次抓屏满 30 秒的兜底时才读，两次读数一致才记录；兜底读到的与已记录的一样时不重复记录，忙碌状态每 30 秒重记一次。一轮的结束先由 transcript 的行确定，提示符后由屏尾确认：两者都不是推断，各是自己的证据（§14）。
 
 | 常量 | 值 | 含义 |
 | --- | --- | --- |
