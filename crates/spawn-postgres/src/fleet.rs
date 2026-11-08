@@ -374,6 +374,22 @@ from (
       from spawn_events e
      where e.event_name = 'execution.started'
      order by e.session_id, e.session_seq desc) mo on mo.session_id = s.session_id
+  -- The live sessions' open background jobs, grouped once: the view is two
+  -- reads of the log per job start, so it is evaluated for the fleet, not
+  -- for each session.
+  left join (
+    select j.session_id, j.execution_id,
+           jsonb_agg(jsonb_build_object(
+             'id', j.job_id, 'kind', j.job_kind, 'event_id', j.event_id,
+             'started_at_ms', j.started_at_ms,
+             'age_ms', spawn_now_ms() - j.started_at_ms) order by j.session_seq) as jobs
+      from agent_open_jobs j
+     group by j.session_id, j.execution_id) jb
+    on s.live and jb.session_id = s.session_id and jb.execution_id = s.execution_id
+  -- The sessions with a command still in the queue, one read of the queue.
+  left join (
+    select distinct c.session_id from spawn_commands c where c.state <> 'finished') oc
+    on oc.session_id = s.session_id
   -- The supervisor's current native session (the one its latest
   -- `session.native_started` names, which a resume resumes) and the start
   -- that began it: the command of the execution that named it first.
