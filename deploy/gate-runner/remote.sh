@@ -32,6 +32,14 @@
 #                                       finished (out/exit is missing: a gate
 #                                       may still be running there) unless
 #                                       `force` is given
+#   remote registry-need                read the primary's cargo registry
+#                                       listing (`<path>\t<size>` lines) on
+#                                       stdin; print the paths this machine
+#                                       lacks or holds at another size
+#   remote registry-accept              unpack a tar of registry files from
+#                                       stdin into this machine's registry
+#                                       (adds and replaces, never deletes: a
+#                                       running gate binds it read-only)
 #
 # <job> is letters, digits, '.', '_' and '-' (deploy/gate-runner.sh makes
 # one per attempt). The root is the directory two levels above this file.
@@ -49,6 +57,19 @@
 #   GATE_RUNNER_KEEP_DAYS     prune job directories (and their scratch) older
 #                             than this many days on preflight and accept
 #                             (default 7; 0 keeps them)
+#   GATE_RUNNER_DISK_LIMIT_GB the machine's own disk limit when df cannot see
+#                             it (an OrbStack --disk limit is a btrfs quota:
+#                             df shows the shared disk); 0 or unset: none
+#   GATE_RUNNER_CARGO_HOME    the CARGO_HOME whose registry, git and config
+#                             the gate binds (default $HOME/.cargo)
+#
+# What a gate really gets is measured where it runs, not where it is easy to
+# read: the cores are nproc capped by the cgroup's cpu.max, the memory is
+# MemAvailable capped by memory.max less memory.current (a machine inside a
+# shared VM sees the whole VM in nproc and /proc/meminfo), and the disk is
+# df capped by GATE_RUNNER_DISK_LIMIT_GB less what du counts on the root
+# filesystem. GATE_RUNNER_CGROUP, GATE_RUNNER_MEMINFO and GATE_RUNNER_MOUNTS
+# move /sys/fs/cgroup, /proc/meminfo and /proc/mounts, for tests only.
 #
 # POSIX sh. Requires: git, tar, gzip, sha256sum, nice, timeout (coreutils
 # >= 8.5, for --kill-after), and docker or a PostgreSQL bin directory.
@@ -87,7 +108,7 @@ seconds() {
 # out.
 load_config() {
     cfg_jobs="" cfg_pg_image="" cfg_pg_bin="" cfg_min_free="" cfg_nice="" cfg_path="" cfg_keep=""
-    cfg_keep_days=""
+    cfg_keep_days="" cfg_disk_limit="" cfg_cargo_home=""
     if [ -f "$config" ]; then
         # shellcheck source=/dev/null
         . "$config"
@@ -100,7 +121,10 @@ load_config() {
     cfg_path=${GATE_RUNNER_PATH:-}
     cfg_keep=${GATE_RUNNER_KEEP_JOBS:-}
     cfg_keep_days=${GATE_RUNNER_KEEP_DAYS:-}
-    [ -n "$cfg_jobs" ] || cfg_jobs=$(($(nproc 2>/dev/null || echo 2) / 2))
+    cfg_disk_limit=${GATE_RUNNER_DISK_LIMIT_GB:-0}
+    cfg_cargo_home=${GATE_RUNNER_CARGO_HOME:-}
+    cargo_home=${cfg_cargo_home:-$HOME/.cargo}
+    [ -n "$cfg_jobs" ] || cfg_jobs=$(($(cpus) / 2))
     [ "$cfg_jobs" -ge 1 ] || cfg_jobs=1
     [ "$cfg_jobs" -le 8 ] || cfg_jobs=8
     [ -n "$cfg_min_free" ] || cfg_min_free=10
@@ -115,7 +139,96 @@ load_config() {
         echo "gate-runner: $config names both a docker image and a bin directory; the gate takes one" >&2
         exit 3
     }
-    case "$cfg_jobs$cfg_min_free$cfg_nice$cfg_keep_days" in *[!0-9]*) echo "gate-runner: $config: jobs, the disk floor, nice and the keep days are numbers" >&2; exit 3 ;; esac
+    case "$cfg_jobs$cfg_min_free$cfg_nice$cfg_keep_days$cfg_disk_limit" in *[!0-9]*) echo "gate-runner: $config: jobs, the disk floor, nice, the keep days and the disk limit are numbers" >&2; exit 3 ;; esac
+}
+
+# cgroup <file>: the first line of a cgroup v2 file of this machine, empty
+# when there is none.
+cgroup() {
+    head -n 1 "${GATE_RUNNER_CGROUP:-/sys/fs/cgroup}/$1" 2>/dev/null || :
+}
+
+# cpus: the cores a gate gets: nproc, capped by cpu.max's quota (rounded up).
+cpus() {
+    n=$(nproc 2>/dev/null || echo 1)
+    # shellcheck disable=SC2046 # cpu.max is "<quota|max> <period>"
+    set -- $(cgroup cpu.max)
+    case "${1-}" in
+    '' | *[!0-9]*) ;;
+    *)
+        case "${2-}" in
+        '' | *[!0-9]* | 0) ;;
+        *) q=$((($1 + $2 - 1) / $2)); [ "$q" -ge "$n" ] || n=$q ;;
+        esac
+        ;;
+    esac
+    [ "$n" -ge 1 ] || n=1
+    echo "$n"
+}
+
+# mem_available_kb: MemAvailable, capped by what memory.max leaves above
+# memory.current; "unreadable" when neither can be read.
+mem_available_kb() {
+    avail=$(awk '/^MemAvailable:/ { print $2 }' "${GATE_RUNNER_MEMINFO:-/proc/meminfo}" 2>/dev/null) || avail=""
+    max=$(cgroup memory.max)
+    cur=$(cgroup memory.current)
+    case "$max$cur" in
+    '' | *[!0-9]*) ;;
+    *)
+        left=$(((max - cur) / 1024))
+        [ "$left" -ge 0 ] || left=0
+        if [ -z "$avail" ] || [ "$left" -lt "$avail" ]; then avail=$left; fi
+        ;;
+    esac
+    echo "${avail:-unreadable}"
+}
+
+# host_shares: mount points that are the host's files (virtiofs, 9p, a fuse
+# file system other than lxcfs, or OrbStack's /mnt/mac) or other machines'
+# (OrbStack's /mnt/machines/<name>, read-write: the primary's own disk, its
+# live database included), comma-separated, or "none". A gate's sandbox
+# starts from a read-only / : on such a machine candidate code reads them,
+# and the gate's socket scan walks them.
+host_shares() {
+    shares=$(awk '($3 ~ /^(virtiofs|9p)$/ || ($3 ~ /^fuse\./ && $3 != "fuse.lxcfs") || $2 ~ /^\/mnt\/(mac|machines)(\/|$)/) { print $2 }' \
+        "${GATE_RUNNER_MOUNTS:-/proc/mounts}" 2>/dev/null | sort -u | paste -sd, -) || shares=""
+    echo "${shares:-none}"
+}
+
+# disk_free_kb: the free KiB a gate has under the root: df's, and under
+# GATE_RUNNER_DISK_LIMIT_GB the limit less what du counts on / (sudo when it
+# may, so directories this user cannot read are counted), whichever is less.
+disk_free_kb() {
+    free=$(df -Pk -- "$root" 2>/dev/null | awk 'NR == 2 { print $4 }') || free=""
+    case "$free" in '' | *[!0-9]*) echo unreadable; return 0 ;; esac
+    if [ "$cfg_disk_limit" != 0 ]; then
+        used=$({ sudo -n du -sxk / 2>/dev/null || du -sxk / 2>/dev/null; } | awk 'END { print $1 }') || used=""
+        case "$used" in '' | *[!0-9]*) echo unreadable; return 0 ;; esac
+        left=$((cfg_disk_limit * 1048576 - used))
+        [ "$left" -ge 0 ] || left=0
+        [ "$left" -ge "$free" ] || free=$left
+    fi
+    echo "$free"
+}
+
+# cargo_wrapper: the rustc-wrapper the cargo config names (the gate binds
+# config and config.toml into its sandbox), "none", or "<name> missing" when
+# the gate's PATH has no such program: every build would fail there.
+cargo_wrapper() {
+    w=$(sed -n 's/^[[:space:]]*rustc-wrapper[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$cargo_home/config.toml" "$cargo_home/config" 2>/dev/null | head -n 1) || w=""
+    if [ -z "$w" ]; then
+        echo none
+    elif PATH=$cfg_path command -v "$w" >/dev/null 2>&1; then
+        echo "$w"
+    else
+        echo "$w missing"
+    fi
+}
+
+# registry_list <dir>: `<path>\t<size>` of every file under a registry.
+registry_list() {
+    [ ! -d "$1" ] || (cd "$1" && find . -type f -printf '%P\t%s\n')
 }
 
 # ensure_dirs: the root's own directories, this uid's only.
@@ -183,11 +296,20 @@ preflight() {
     printf 'min_free_gb=%s\n' "$cfg_min_free"
     printf 'keep_days=%s\n' "$cfg_keep_days"
     printf 'nproc=%s\n' "$(nproc 2>/dev/null || echo 1)"
+    printf 'cpus=%s\n' "$(cpus)"
+    printf 'cpu_max=%s\n' "$(cgroup cpu.max)"
+    printf 'mem_available_kb=%s\n' "$(mem_available_kb)"
+    printf 'mem_max=%s\n' "$(cgroup memory.max)"
+    printf 'swap_max=%s\n' "$(cgroup memory.swap.max)"
+    printf 'host_shares=%s\n' "$(host_shares)"
+    printf 'tmp_fs=%s\n' "$(df -PT /tmp 2>/dev/null | awk 'NR == 2 { print $2 }')"
+    printf 'cargo_home=%s\n' "$cargo_home"
+    printf 'cargo_wrapper=%s\n' "$(cargo_wrapper)"
     printf 'pg_image=%s\n' "$cfg_pg_image"
     printf 'pg_bin=%s\n' "$cfg_pg_bin"
     printf 'disk_root=%s\n' "$root"
-    free_kb=$(df -Pk -- "$root" 2>/dev/null | awk 'NR == 2 { print $4 }') || free_kb=""
-    printf 'disk_free_kb=%s\n' "${free_kb:-unreadable}"
+    printf 'disk_limit_gb=%s\n' "$cfg_disk_limit"
+    printf 'disk_free_kb=%s\n' "$(disk_free_kb)"
     if [ -d "$root/web/node_modules" ]; then
         printf 'web=%s\n' "$root/web/node_modules"
         [ ! -f "$root/web/lock.sha256" ] || printf 'web_lock=%s\n' "$(cat "$root/web/lock.sha256")"
@@ -283,6 +405,7 @@ run_job() {
     export TMPDIR=$scratch
     export SPAWN_GATE_JOBS=$cfg_jobs
     export SPAWN_GATE_MIN_FREE_GB=$cfg_min_free
+    [ -z "$cfg_cargo_home" ] || export CARGO_HOME=$cfg_cargo_home
     [ -z "$cfg_pg_image" ] || export SPAWN_GATE_PG_IMAGE=$cfg_pg_image
     [ -z "$cfg_pg_bin" ] || export SPAWN_GATE_PG_BIN=$cfg_pg_bin
     if [ "$mode" = keys ]; then
@@ -345,6 +468,37 @@ remove_job() { # <job> [force]
     rm -rf "$jobs/$1" "$jobs/$1.partial" "$work/$1" "/tmp/gate-runner/$1"
 }
 
+# registry_need: of the primary's registry listing on stdin, the paths this
+# machine's registry lacks or holds at another size. The gate builds
+# offline from the registry it binds, so a crate the primary has and this
+# machine lacks would make the gate reject work the primary accepts.
+registry_need() {
+    load_config
+    have=$(mktemp "${TMPDIR:-/tmp}/gate-runner-registry.XXXXXX")
+    registry_list "$cargo_home/registry" >"$have"
+    code=0
+    # The listing here is read in BEGIN, not as a first file: an empty one (a
+    # runner with no registry yet) would leave NR == FNR true for stdin.
+    awk -F '\t' -v have="$have" 'BEGIN {
+            while ((getline line < have) > 0) { split(line, f, "\t"); size[f[1]] = f[2] }
+        }
+        !($1 in size) || size[$1] != $2 { print $1 }' || code=$?
+    rm -f "$have"
+    exit "$code"
+}
+
+# registry_accept: registry files (a tar on stdin) into this machine's
+# registry. It only adds and replaces: a running gate binds the registry
+# read-only, and a file it reads must not go from under it.
+registry_accept() {
+    load_config
+    mkdir -p "$cargo_home/registry"
+    tar -xf - -C "$cargo_home/registry" || {
+        echo "gate-runner: the registry files did not arrive whole" >&2
+        exit 2
+    }
+}
+
 case "${1-}" in
 version)
     sha256sum "$root/bin/remote" 2>/dev/null | cut -d' ' -f1 || {
@@ -378,8 +532,10 @@ remove)
     [ $# -ge 1 ] && [ $# -le 2 ] || { echo "usage: remote remove <job> [force]" >&2; exit 2; }
     remove_job "$@"
     ;;
+registry-need) registry_need ;;
+registry-accept) registry_accept ;;
 *)
-    echo "usage: remote version|preflight|accept <job>|run <job> <seconds>|keys <job> <seconds>|collect <job>|remove <job>" >&2
+    echo "usage: remote version|preflight|accept <job>|run <job> <seconds>|keys <job> <seconds>|collect <job>|remove <job>|registry-need|registry-accept" >&2
     exit 2
     ;;
 esac
