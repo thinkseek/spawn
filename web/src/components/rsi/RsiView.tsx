@@ -569,7 +569,7 @@ function ObjectivesCard({
         title="Objectives"
         meta={
           <span className="tnum">
-            {mission.objectives.filter((entry) => entry.status !== "open").length}/
+            {mission.objectives.filter((entry) => entry.status === "solved" || entry.status === "met").length}/
             {mission.objectives.length} settled
           </span>
         }
