@@ -4063,4 +4063,15 @@ mod tests {
             "said once: {warnings:?}"
         );
     }
+
+    #[test]
+    fn tmp_trace_backstop_on_an_unchanged_screen() {
+        let mut world = World::new();
+        let mut counts = Vec::new();
+        for step in 0..8 {
+            world.advance(if step == 0 { 30_000 } else { 500 });
+            counts.push(world.pass());
+        }
+        panic!("counts per pass: {counts:?} screens: {:?}", world.screens());
+    }
 }
