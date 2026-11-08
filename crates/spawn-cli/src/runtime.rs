@@ -80,6 +80,21 @@ fn bridge_config() -> Result<BridgeConfig, String> {
     config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
     config.claude_projects = claude_projects();
     config.model_relay = model_relay();
+    config.screen_quiet = std::time::Duration::from_millis(
+        env_value("SPAWN_SCREEN_QUIET_MS")
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(500),
+    );
+    // The engines' files are watched, so a pass reads a transcript or an
+    // exit status when it changed and not on every pass. A host with no
+    // watch reads them every pass, as before, and says so once.
+    match spawn_host::InotifyWatch::new() {
+        Ok(watch) => config.watch = Some(Arc::new(watch)),
+        Err(error) => eprintln!(
+            "spawn: {error}; every live execution's transcript and exit status are read on \
+             every pass"
+        ),
+    }
     // A workspace builds against the deps store at SUPPLY_PA_DEPS
     // (`gate/scenarios/build`); the pane's engine runs the build, so it gets
     // the path. Unset, the store's default under $HOME stands.
