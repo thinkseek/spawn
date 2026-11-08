@@ -19,6 +19,9 @@
 //!
 //! A turn in progress still shows an empty prompt, so an empty prompt alone
 //! does not mean that input is safe: the activity region must be idle too.
+//! An engine that printed an error above its prompt sits at its prompt and
+//! accepts text: the error is what it says about the turn, not a lock on
+//! the box.
 //!
 //! - Busy: a spinner or a running-turn hint in the activity region.
 //! - Error: an `API Error` (or a hook error) in the activity region.
