@@ -141,7 +141,11 @@ else: not a remote-tracking ref a mirror clone left (the live
 `missions/supply-pa.git` carries `refs/remotes/github/main`), not a pending
 `refs/spawn-owner/*` push. Those are not the mission's history, and a record
 that named neither could not be a true description of an archive that held
-them — the drill refuses any ref the manifest does not name (below).
+them — the drill refuses any ref the manifest does not name (below). A
+source with no branches and no tags (a mission added before its first push)
+is recorded `empty`, `heads` `{}` and no file in the archive: `git bundle
+create` will not make an empty bundle, there is nothing of the mission to
+hold, and a restore of it makes an empty repository.
 
 `spawn backup verify` is the drill (below): the newest good dump restores to
 its record, and the newest bundle is opened and compared with its own. Exit

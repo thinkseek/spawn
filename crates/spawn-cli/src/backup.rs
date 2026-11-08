@@ -25,8 +25,10 @@
 //!   base the newest `backup.bundled` record): a git bundle of every mission
 //!   source's branches and tags — exactly the refs the record names, never a
 //!   remote-tracking ref a mirror clone left (the live `supply-pa.git` has
-//!   `refs/remotes/github/main`) nor a pending `refs/spawn-owner/` push — whole
-//!   or `--not` its base's heads, and the transcript archive's files modified
+//!   `refs/remotes/github/main`) nor a pending `refs/spawn-owner/` push; a
+//!   source with no branches and no tags is recorded `empty`, with no file in
+//!   the archive — whole or `--not` its base's heads, and the transcript
+//!   archive's files modified
 //!   within `SPAWN_BACKUP_TRANSCRIPT_DAYS` (default 14), whole or the bytes
 //!   appended since the base's sizes. The record is a true description of the
 //!   archive: verify refuses a bundle that lists a ref its manifest does not
@@ -1711,6 +1713,22 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
             missing.push(source.to_string());
             continue;
         };
+        // A source with no branches and no tags has nothing of the mission in
+        // the archive, and `git bundle create` refuses to make an empty one:
+        // the record says so by name (`empty`) and the manifest names no file,
+        // so nothing is left to a git error, and a restore of it makes an
+        // empty repository.
+        if heads.is_empty() {
+            repos_record.push(json!({
+                "source": source, "heads": {}, "refs": 0, "bytes": 0,
+                "unchanged": false, "empty": true,
+            }));
+            repos_manifest.push(json!({
+                "source": source, "file": Value::Null, "heads": {},
+                "unchanged": false, "empty": true,
+            }));
+            continue;
+        }
         let refs = heads.len();
         let base_repos = base
             .and_then(|base| base.record["repos"].as_array().cloned())

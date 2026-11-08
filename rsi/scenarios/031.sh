@@ -23,8 +23,8 @@
 # by real `spawn mission add` commands (its id sequence skips 1,000 values on
 # the way, as a rolled-back append makes it skip, so the id watermark is not
 # the row count), a throwaway passphrase file and R2 credentials file (mode
-# 600), two mission sources (spawn.git with main and an agent's branch,
-# other.git), and a transcript archive (<workspace root>/.transcripts, two
+# 600), three mission sources (spawn.git with main and an agent's branch,
+# other.git, and empty.git with no branches or tags), and a transcript archive (<workspace root>/.transcripts, two
 # agents written now and a third's file last written 20 days ago). HOME is
 # a scratch directory: nothing here can read the owner's ~/.config/spawn.
 # Checked:
@@ -45,12 +45,14 @@
 #   (3) `spawn backup bundle` exits 0 and records `backup.bundled` kind
 #       `full` (none before it): its key under bundles/full/, encrypted with
 #       the same passphrase, a tar (plain, gzip or zstd) holding
-#       manifest.json, for each mission source a git bundle that verifies
-#       alone and lists exactly the source's branches at their commits (the
+#       manifest.json, for each mission source with a branch a git bundle
+#       that verifies alone and lists exactly the source's branches at their
+#       commits (the
 #       agent's work is in its branch), and every transcript file modified
 #       within 14 days under transcripts/<agent>/<file>, the same bytes, and
-#       not the 20-day-old one; the record names both sources and the
-#       window's file count and bytes. Then one transcript grows, a new one
+#       not the 20-day-old one; the record names all three sources and the
+#       window's file count and bytes, the empty one `empty` with no refs and
+#       no file (a restore of it makes an empty repository). Then one transcript grows, a new one
 #       appears, the agent's branch moves and other.git does not: a second
 #       bundle the same day records kind `incremental`, `base_event_id` the
 #       full one's, one object under bundles/incr/, holding the grown file's
@@ -556,6 +558,11 @@ git -C "$WORK/seed2" push -q "$src_other" main:main
 # remote-tracking ref): not a branch, not the mission's history.
 remote_ref=refs/remotes/github/main
 git --git-dir="$src_other" update-ref "$remote_ref" "$(git -C "$WORK/seed2" rev-parse HEAD)"
+# A third source with nothing in it yet (a mission added before its first
+# push): no branches, no tags. `git bundle create` refuses to make an empty
+# bundle, so the record has to say what there is by name, not a git error.
+src_empty=$WORK/empty.git
+git init -q --bare --initial-branch=main "$src_empty"
 
 # The transcript archive, as the Bridge keeps it beside the workspaces.
 SPAWN_WORKSPACE_ROOT=$WORK/ws
@@ -728,6 +735,9 @@ psql -d "$SPAWN_DB_NAME" -tA -c "select setval(pg_get_serial_sequence('spawn_eve
         coalesce((select max(id) from spawn_events), 0) + 1000)" >/dev/null ||
     harness "cannot move the events' id sequence"
 add_missions 81 120
+capture "$SPAWN_BIN" mission add --source "$src_empty" \
+    --text "031 mission 146: a mission whose source holds nothing yet"
+[ "$status" -eq 0 ] || harness "mission add failed: $(err)"
 
 # --- (1) an hourly encrypted dump ------------------------------------------------------
 
@@ -892,9 +902,19 @@ done
 [ "$(field "$bun" '.transcripts.files')" = "$files" ] && [ "$(field "$bun" '.transcripts.bytes')" = "$bytes" ] ||
     measured_fail "(3) the record's transcripts [$(field "$bun" '.transcripts | {files, bytes}' | tr -d ' \n')] are not the window's $files files, $bytes bytes"
 named=$(field "$bun" '[.repos[]?.source] | sort | join(" ")')
-[ "$named" = "$(printf '%s\n%s\n' "$src_other" "$src_spawn" | sort | tr '\n' ' ' | sed 's/ $//')" ] ||
-    measured_fail "(3) the record names the sources [$named], not the two missions' $src_spawn and $src_other"
-echo "031: full bundle: $(field "$bun" '.stored_bytes') bytes stored for $bytes bytes of transcripts and two sources, in $bundle_ms ms"
+[ "$named" = "$(printf '%s\n%s\n%s\n' "$src_empty" "$src_other" "$src_spawn" | sort | tr '\n' ' ' | sed 's/ $//')" ] ||
+    measured_fail "(3) the record names the sources [$named], not the three missions' $src_spawn, $src_other and $src_empty"
+# The empty source: named `empty` with no refs and no file in the archive
+# (there is nothing of it to hold, and nothing to leave to a git error).
+empty_entry=$(field "$bun" '.repos[] | select(.source == "'"$src_empty"'")' 2>/dev/null)
+[ -n "$empty_entry" ] && [ "$(printf '%s' "$empty_entry" | jq -r '.empty // false')" = true ] &&
+    [ "$(printf '%s' "$empty_entry" | jq -r '.refs')" = 0 ] &&
+    [ "$(printf '%s' "$empty_entry" | jq -r '.bytes')" = 0 ] &&
+    [ "$(printf '%s' "$empty_entry" | jq -c '.heads')" = '{}' ] ||
+    measured_fail "(3) the record does not name the empty source $src_empty as empty, 0 refs, no bytes, {}: $(printf '%s' "$empty_entry" | head -c 300)"
+[ "$(jq -r --arg s "$src_empty" '[.repos[]? | select(.source == $s) | (.empty == true and .file == null)][0] // false' "$WORK/unpacked/manifest.json" 2>/dev/null)" = true ] ||
+    measured_fail "(3) the manifest does not name the empty source $src_empty as empty with no file: $(jq -c '.repos' "$WORK/unpacked/manifest.json" 2>/dev/null | head -c 400)"
+echo "031: full bundle: $(field "$bun" '.stored_bytes') bytes stored for $bytes bytes of transcripts and three sources (one empty), in $bundle_ms ms"
 
 # The remote-tracking ref other.git carries is not the mission's history: the
 # bundle holds no ref the manifest does not name, and the record names it not.
