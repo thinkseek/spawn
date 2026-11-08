@@ -616,20 +616,23 @@ impl Fleet<'_> {
         // it has recorded (docs/fleet-architecture.md §3.1).
         // The recovery reads a few kinds of record, not every event: a pass
         // whose watermark moved on a screen or a delivery asks once, cheaply,
-        // and skips every session's facts when none of them is here. A wait
-        // that is open and an outage that just ended force it regardless.
-        let recovery_signals = self.schedule.recovery.clock_due(now)
-            || match open.recovery_signals(self.schedule.recovery.mark().unwrap_or(0)) {
+        // and skips every session's facts when none of them is here. An open
+        // wait's probe, and an outage the failed passes left, force it
+        // regardless.
+        let pending_outage = self.recovery.outage_pending();
+        let forced = self.schedule.recovery.clock_due(now) || pending_outage;
+        let signals = if forced {
+            true
+        } else {
+            match open.recovery_signals(self.schedule.recovery.mark().unwrap_or(0)) {
                 Ok(signals) => signals,
                 Err(error) => {
                     Fleet::fail(errors, "recover", &error.to_string());
                     false
                 }
-            };
-        if self.schedule.recovery.runs(watermark, now) {
-            if !recovery_signals {
-                self.schedule.recovery.ran(watermark, None);
-            } else {
+            }
+        };
+        if signals && (self.schedule.recovery.runs(watermark, now) || pending_outage) {
             match crate::deliver::Work::load(open) {
                 Ok(work) => {
                     let world = crate::recover::World {
@@ -662,7 +665,10 @@ impl Fleet<'_> {
                 }
                 Err(error) => Fleet::fail(errors, "recover", &error),
             }
-            }
+        } else if self.schedule.recovery.runs(watermark, now) {
+            // Nothing the recovery reads moved: it acts on the watermark
+            // this pass and waits for the next record it reads.
+            self.schedule.recovery.ran(watermark, None);
         }
         if self.dispatching && self.schedule.dispatch.runs(watermark, now) {
             match dispatch::step(
