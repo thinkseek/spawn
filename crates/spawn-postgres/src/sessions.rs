@@ -83,8 +83,8 @@ pub(crate) const LIVENESS_FACTS: &str = concat!(
     // rather than once per question keeps the loop's liveness read to one
     // scan of the log per session.
     "with execs as materialized (
-                    select e.execution_id, e.started_at_ms, e.ended_at_ms, e.cause,
-                           e.duration_ms, e.exit_code, e.command_id
+                    select e.execution_id, e.session_id, e.started_at_ms, e.ended_at_ms,
+                           e.cause, e.duration_ms, e.exit_code, e.command_id
                       from agent_executions e
                      where e.session_id = $1
                  ), cmds as materialized (

@@ -26,9 +26,11 @@ use postgres::{Client, NoTls, Row};
 use spawn_core::port::StoreError;
 
 /// SQL: whether the `agent_executions` row aliased `$x` died young: it
-/// ended lost or with a non-zero exit within a minute of its start. An
-/// engine that launches and dies at once is a failed revival, whatever its
-/// command's outcome says.
+/// ended lost or with a non-zero exit within a minute of its start, before
+/// it made any progress (no tool call completed and no turn ended after it
+/// started). An engine that launches and dies at once is a failed revival,
+/// whatever its command's outcome says; one that worked before a fault took
+/// it is not, and is revived at once (objective 032's soak).
 macro_rules! died_young {
     ($x:literal) => {
         concat!(
@@ -40,7 +42,12 @@ macro_rules! died_young {
             $x,
             ".cause = 'lost' or coalesce(",
             $x,
-            ".exit_code, 0) <> 0))"
+            ".exit_code, 0) <> 0) and not exists (select 1 from spawn_events p \
+             where p.session_id = ",
+            $x,
+            ".session_id and p.execution_id = ",
+            $x,
+            ".execution_id and p.event_name in ('tool.completed', 'turn.stopped')))"
         )
     };
 }
@@ -102,6 +109,16 @@ fn backend(error: &postgres::Error) -> StoreError {
             &postgres::error::SqlState::INSUFFICIENT_PRIVILEGE
             | &postgres::error::SqlState::EXCLUSION_VIOLATION => {
                 StoreError::Rejected(db.message().to_string())
+            }
+            // The server is going away, or coming back (a restart: an
+            // administrator's shutdown, a crash's, a server that cannot
+            // serve connections yet). The work is not at fault; the loop
+            // waits for the database instead of ending (crate::port's
+            // `is_unreachable`, objective 032).
+            &postgres::error::SqlState::ADMIN_SHUTDOWN
+            | &postgres::error::SqlState::CRASH_SHUTDOWN
+            | &postgres::error::SqlState::CANNOT_CONNECT_NOW => {
+                StoreError::Unreachable(db.message().to_string())
             }
             _ => StoreError::Backend(format!(
                 "{} ({}) {}",

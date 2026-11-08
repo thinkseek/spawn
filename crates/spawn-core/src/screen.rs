@@ -19,6 +19,9 @@
 //!
 //! A turn in progress still shows an empty prompt, so an empty prompt alone
 //! does not mean that input is safe: the activity region must be idle too.
+//! An engine that printed an error above its prompt sits at its prompt and
+//! accepts text: the error is what it says about the turn, not a lock on
+//! the box.
 //!
 //! - Busy: a spinner or a running-turn hint in the activity region.
 //! - Error: an `API Error` (or a hook error) in the activity region.
@@ -89,9 +92,12 @@ pub enum ScreenState {
 }
 
 impl ScreenState {
-    /// Whether the pane accepts typed text.
+    /// Whether the pane accepts typed text. A finished turn shows `Ready`;
+    /// an engine that printed an error above its prompt (`Error`) is at its
+    /// prompt too — a model relay's outage leaves it there until the work
+    /// goes on — so it accepts text as well (objective 032).
     pub fn accepts_input(self) -> bool {
-        matches!(self, Self::Ready)
+        matches!(self, Self::Ready | Self::Error)
     }
 }
 
@@ -373,11 +379,19 @@ pub fn read_claude_screen(pane: &str) -> ScreenReading {
     }
 
     let region = activity_region(&tail, index);
-    if let Some(line) = region.iter().find(|line| busy_line(line)) {
-        return ScreenReading::new(ScreenState::Busy, line);
-    }
-    if let Some(line) = region.iter().find(|line| error_line(line)) {
-        return ScreenReading::new(ScreenState::Error, line);
+    // The line nearest the prompt decides which turn it is: a fresh spinner
+    // over an older error is a running turn; an error over a spinner left
+    // behind is the engine's failed turn, at its prompt (a relay outage
+    // leaves the turn's spinner line above the error, objective 032).
+    if let Some(line) = region
+        .iter()
+        .find(|line| busy_line(line) || error_line(line))
+    {
+        return if busy_line(line) {
+            ScreenReading::new(ScreenState::Busy, line)
+        } else {
+            ScreenReading::new(ScreenState::Error, line)
+        };
     }
 
     match prompt_body(prompt) {
@@ -459,6 +473,19 @@ $";
     fn an_api_error_still_reads_as_an_error() {
         let pane = "API Error: 529 overloaded_error\n$ \nbypass permissions on";
         assert_eq!(read_claude_screen(pane).state, ScreenState::Error);
+    }
+
+    /// The line nearest the prompt decides: a turn that failed leaves its
+    /// spinner line above the error, and the engine is at its prompt (its
+    /// nudge gets in); a turn started after an older error is running.
+    #[test]
+    fn the_line_nearest_the_prompt_decides_between_a_running_turn_and_a_failure() {
+        let failed = "✻ Working… (esc to interrupt)\nAPI Error: 529 overloaded_error\n\n❯ ";
+        assert_eq!(read_claude_screen(failed).state, ScreenState::Error);
+        assert!(read_claude_screen(failed).state.accepts_input());
+        let running = "API Error: 529 overloaded_error\n✻ Working… (esc to interrupt)\n\n❯ ";
+        assert_eq!(read_claude_screen(running).state, ScreenState::Busy);
+        assert!(!read_claude_screen(running).state.accepts_input());
     }
 }
 
