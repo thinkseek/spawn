@@ -581,7 +581,7 @@ impl Fleet {
             match open.listen() {
                 Ok(listener) => self.listener = Some(listener),
                 Err(error) => {
-                    eprintln!("spawn loop: listen: {error}; the watermark alone wakes it")
+                    eprintln!("spawn loop: listen: {error}; the watermark alone wakes it");
                 }
             }
         }
