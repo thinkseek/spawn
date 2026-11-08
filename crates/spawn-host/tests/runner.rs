@@ -216,7 +216,7 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
     // A dead pane kept by remain-on-exit: the runner exited (3) and the
     // session stays.
     server.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
-    host.start(&launch("/bin/sh", &["-c", "exit 3"], &[("A", "1")]))
+    host.start(&launch("/bin/sh", &["-c", "sleep 0.3; exit 3"], &[("A", "1")]))
         .expect("start");
     // tmux marks the pane dead when its terminal closes, and records the
     // exit status when it reaps the process, a moment later on a loaded host
