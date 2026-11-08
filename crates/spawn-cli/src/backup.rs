@@ -42,10 +42,21 @@
 //! 8000) is the alert: the record says `over_alert` and the run says it on
 //! its output; objective 030 raises its own alert from the record.
 //!
+//! The bundle's tar is compressed before it is encrypted — zstd (`-3`) when
+//! the host has it, gzip when it does not, plain otherwise — and the key
+//! names what it holds (`<...>.tar.zst.gpg`, `.tar.gz.gpg`, `.tar.gpg`): on
+//! 2026-11-08 a real full bundle of 426 MB of transcripts and two sources
+//! was 90 MB as zstd and 437 MB as a plain tar. `SPAWN_BACKUP_PREFIX`
+//! (empty in the fleet) puts every object under a prefix, so a measurement
+//! or a test writes to a scratch place (`locktest/`) and never over a real
+//! backup; the records name the stored key, prefix included.
+//!
 //! Secrets come from files the owner made mode 600 and are never on a
 //! command line, in the output or in a record: the passphrase file goes to
 //! gpg by path, the R2 credentials to curl on stdin (`--config -`), and the
-//! database password to libpq through `PGPASSWORD`.
+//! database password to libpq through `PGPASSWORD`. A drop the plausibility
+//! check doubts is accepted once by the owner with
+//! `SPAWN_BACKUP_ACCEPT_DROP=1`, which still records the drop (`accepted`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -196,6 +207,11 @@ pub(crate) struct Settings {
     pub(crate) transcript_days: i64,
     pub(crate) limit_bytes: u64,
     pub(crate) alert_bytes: u64,
+    /// `SPAWN_BACKUP_PREFIX`: prepended to every object's key, for a run
+    /// that must not touch a real backup (a test writes under `locktest/`).
+    /// Empty in the fleet. The records name the stored key — prefix included
+    /// — so a restore reads exactly the object the run wrote.
+    pub(crate) prefix: String,
     pub(crate) drill_url: Option<String>,
 }
 
@@ -293,7 +309,40 @@ fn megabytes(name: &str, default: u64) -> Result<u64, String> {
     }
 }
 
+/// `SPAWN_BACKUP_PREFIX` as a key prefix: empty, or letters, digits, `.`,
+/// `_`, `-` and `/` ending in `/`; nothing that could leave the bucket's
+/// namespace (`..`, a leading `/`).
+fn prefix_value(text: Option<String>) -> Result<String, String> {
+    let Some(text) = text else {
+        return Ok(String::new());
+    };
+    let text = text.trim().trim_start_matches('/');
+    if text.is_empty() {
+        return Ok(String::new());
+    }
+    if !text
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/'))
+        || text
+            .trim_end_matches('/')
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || !text.ends_with('/')
+    {
+        return Err(format!(
+            "SPAWN_BACKUP_PREFIX: {text:?} is not a key prefix (letters, digits, '.', '_', \
+             '-' and '/', ending in '/')"
+        ));
+    }
+    Ok(text.to_string())
+}
+
 impl Settings {
+    /// `key` as it is stored: under `SPAWN_BACKUP_PREFIX`, or as given.
+    fn stored(&self, key: &str) -> String {
+        format!("{}{key}", self.prefix)
+    }
+
     pub(crate) fn from_env(flags: &Flags) -> Result<Self, String> {
         let root = workspace_root(flags)
             .map(PathBuf::from)
@@ -320,6 +369,7 @@ impl Settings {
             access_key: needed("SPAWN_R2_ACCESS_KEY_ID")?,
             secret_key: needed("SPAWN_R2_SECRET_ACCESS_KEY")?,
         };
+        let prefix = prefix_value(env_value("SPAWN_BACKUP_PREFIX"))?;
         let limit_bytes = megabytes("SPAWN_BACKUP_R2_LIMIT_MB", DEFAULT_LIMIT_MB)?;
         let alert_bytes = megabytes("SPAWN_BACKUP_R2_ALERT_MB", DEFAULT_ALERT_MB)?;
         if alert_bytes > limit_bytes {
@@ -343,6 +393,7 @@ SPAWN_BACKUP_R2_LIMIT_MB ({limit_bytes} bytes)"
             transcript_days,
             limit_bytes,
             alert_bytes,
+            prefix,
             drill_url: env_value("SPAWN_BACKUP_DRILL_DATABASE_URL"),
         })
     }
@@ -872,9 +923,14 @@ fn dump(flags: &Flags) -> Result<i32, String> {
     let held = list_bucket(&settings)?.0;
     let mut written = 0u64;
     let upload_started = Instant::now();
-    match suspect(events, bytes, newest_good) {
+    // An intended drop (data deliberately removed) is accepted once by the
+    // owner, as `pg-backup.sh --accept-drop` did: the record still names the
+    // drop, under `accepted`, and the dump is stored as a good one.
+    let dropped = suspect(events, bytes, newest_good);
+    let accepted = dropped.is_some() && env_or("SPAWN_BACKUP_ACCEPT_DROP", "0") == "1";
+    match dropped.clone().filter(|_| !accepted) {
         Some(reason) => {
-            let key = format!("postgres/suspect/spawn-{}.dump.gpg", now.text());
+            let key = settings.stored(&format!("postgres/suspect/spawn-{}.dump.gpg", now.text()));
             if within_limit(held, written, stored_bytes, settings.limit_bytes) {
                 put_object(&settings, &key, &encrypted, &sha256, events)?;
                 written = written.saturating_add(stored_bytes);
@@ -886,7 +942,7 @@ fn dump(flags: &Flags) -> Result<i32, String> {
         }
         None => {
             for tier in tiers_for(now, &earlier) {
-                let key = tier.key(&now.text());
+                let key = settings.stored(&tier.key(&now.text()));
                 if !within_limit(held, written, stored_bytes, settings.limit_bytes) {
                     skipped.push(skip(tier.name(), held, written, stored_bytes, &settings));
                     continue;
@@ -919,8 +975,21 @@ fn dump(flags: &Flags) -> Result<i32, String> {
         "upload_ms": upload_ms,
         "duration_ms": i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
     });
+    if accepted {
+        eprintln!(
+            "spawn backup dump: accepted by SPAWN_BACKUP_ACCEPT_DROP: {}",
+            dropped.as_deref().unwrap_or_default()
+        );
+        suspect_reason = None;
+    }
     if let Some(reason) = &suspect_reason {
         record["suspect"] = json!(reason);
+    }
+    if accepted && let Some(target) = record.as_object_mut() {
+        target.insert(
+            "accepted".to_string(),
+            dropped.clone().map_or(Value::Null, Value::String),
+        );
     }
     store
         .backup_record(&record)
@@ -943,7 +1012,10 @@ fn dump(flags: &Flags) -> Result<i32, String> {
     if suspect_reason.is_some() {
         return Ok(3);
     }
-    if !keys.iter().any(|key| key.starts_with("postgres/hourly/")) {
+    if !keys
+        .iter()
+        .any(|key| key.starts_with(&settings.stored("postgres/hourly/")))
+    {
         return Ok(4);
     }
     Ok(0)
@@ -1240,6 +1312,40 @@ fn percent_encode(text: &str) -> String {
 
 /// Store one object, its ETag checked against the MD5 sent and its metadata
 /// naming the plaintext's sha256 and event count.
+/// The tar as it is stored: compressed with zstd when the host has it,
+/// else gzip, else as it is; and the extension that says which.
+fn compress_bundle(scratch: &Path, tar: &Path) -> Result<(PathBuf, &'static str), String> {
+    for (program, arguments, extension) in [
+        ("zstd", vec!["-q", "-3", "-f", "-o"], "tar.zst"),
+        ("gzip", vec!["-6", "-c", "-n"], "tar.gz"),
+    ] {
+        let out = scratch.join(extension);
+        let mut command = Command::new(program);
+        if program == "gzip" {
+            // gzip writes to stdout.
+            let file = File::create(&out).map_err(|error| format!("{}: {error}", out.display()))?;
+            command.args(&arguments).arg(tar).stdout(Stdio::from(file));
+        } else {
+            command.args(&arguments).arg(&out).arg(tar);
+        }
+        match command.output() {
+            Ok(run) if run.status.success() => return Ok((out, extension)),
+            // Not installed: the next one.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(run) => {
+                return Err(format!(
+                    "{program}: {}",
+                    String::from_utf8_lossy(&run.stderr).trim()
+                ));
+            }
+            Err(error) => return Err(format!("{program}: {error}")),
+        }
+    }
+    let plain = scratch.join("tar");
+    fs::copy(tar, &plain).map_err(|error| format!("{}: {error}", plain.display()))?;
+    Ok((plain, "tar"))
+}
+
 fn put_object(
     settings: &Settings,
     key: &str,
@@ -1582,12 +1688,17 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
     if !ok {
         return Err(format!("tar: {}", stderr.trim()));
     }
-    let bytes = fs::metadata(&tar)
-        .map_err(|error| format!("{}: {error}", tar.display()))?
+    // A tar of transcripts is mostly text: zstd (fast, and what the drill's
+    // other copies use) or gzip when there is no zstd; plain when neither.
+    // The stored key names what it holds, and a restore sniffs the magic
+    // anyway (objective 031's contract: plain, gzip or zstd).
+    let (archive, extension) = compress_bundle(&scratch.join(""), &tar)?;
+    let bytes = fs::metadata(&archive)
+        .map_err(|error| format!("{}: {error}", archive.display()))?
         .len();
-    let sha256 = sha256_file(&tar)?;
+    let sha256 = sha256_file(&archive)?;
     let encrypted = scratch.join("bundle.gpg");
-    encrypt(&settings, &tar, &encrypted)?;
+    encrypt(&settings, &archive, &encrypted)?;
     let stored_bytes = fs::metadata(&encrypted)
         .map_err(|error| format!("{}: {error}", encrypted.display()))?
         .len();
@@ -1599,7 +1710,11 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
 
     let held = list_bucket(&settings)?.0;
     let tier = if full { "full" } else { "incr" };
-    let key = format!("bundles/{}/spawn-bundle-{}.tar.gpg", tier, now.text());
+    let key = settings.stored(&format!(
+        "bundles/{}/spawn-bundle-{}.{extension}.gpg",
+        tier,
+        now.text()
+    ));
     let mut keys: Vec<String> = Vec::new();
     let mut skipped: Vec<Value> = Vec::new();
     let mut written = 0u64;
@@ -2172,6 +2287,30 @@ mod tests {
         parse_pg_url, server_major, suspect, tiers_for, transcript_offset, window_files,
         within_limit, without_transaction_timeout,
     };
+
+    /// `SPAWN_BACKUP_PREFIX` is a bucket prefix and nothing else: unset or
+    /// empty keeps the fleet's keys; a test's `locktest/` puts every object
+    /// under it; anything that could leave the namespace is refused.
+    #[test]
+    fn the_prefix_is_a_key_prefix_or_nothing() {
+        assert_eq!(super::prefix_value(None), Ok(String::new()));
+        assert_eq!(super::prefix_value(Some(String::new())), Ok(String::new()));
+        assert_eq!(super::prefix_value(Some("  ".into())), Ok(String::new()));
+        assert_eq!(
+            super::prefix_value(Some("locktest/".into())),
+            Ok("locktest/".into())
+        );
+        assert_eq!(
+            super::prefix_value(Some("/locktest/rev-a/".into())),
+            Ok("locktest/rev-a/".into())
+        );
+        for bad in ["locktest", "a//b/", "../x/", "a/../b/", "s3://x/", "a b/"] {
+            assert!(
+                super::prefix_value(Some(bad.into())).is_err(),
+                "{bad:?} was accepted"
+            );
+        }
+    }
     use serde_json::json;
     use std::fs;
 
