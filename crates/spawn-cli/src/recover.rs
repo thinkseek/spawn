@@ -2162,8 +2162,8 @@ impl Cause {
 mod tests {
     use super::{
         Cause, Config, Credentials, End, Executed, Execution, Facts, Outage, Path, Recorded,
-        Recovery, Sent, Stop, Turn, auth_retry_due, classify, counts_as_failure, disk_cleared, key,
-        model_due, pending, resume_due, resume_failed, retry_at, way,
+        Recovery, Sent, Stop, ToolFailure, Turn, auth_retry_due, classify, counts_as_failure,
+        disk_cleared, key, model_due, pending, resume_due, resume_failed, retry_at, way,
     };
     use serde_json::json;
 
