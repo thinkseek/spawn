@@ -233,13 +233,38 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
     // seconds, 2026-11-08). Wait for the status, with room for a loaded host
     // and a read rarely enough not to add to the load; a server that never
     // records it still fails the assertion below.
+    let dump = |label: &str| {
+        let panes = Command::new("tmux")
+            .args([
+                "-L",
+                &server.socket,
+                "-f",
+                "/dev/null",
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}|#{pane_dead}|#{pane_dead_status}|#{pane_current_command}|#{pane_pid}",
+            ])
+            .output()
+            .expect("tmux is installed");
+        eprintln!(
+            "DIAG {label}: {:?}",
+            String::from_utf8_lossy(&panes.stdout)
+        );
+    };
+    dump("after start");
     let deadline = Instant::now() + Duration::from_secs(120);
+    let mut rounds = 0_u32;
     let seen = loop {
         let Runner::Untracked(seen) = settled(&host, Duration::from_secs(5)) else {
             panic!("a dead pane hosts no runner");
         };
         if !seen.contains("exit status none") || Instant::now() > deadline {
             break seen;
+        }
+        rounds += 1;
+        if rounds % 8 == 1 {
+            dump(&format!("round {rounds}"));
         }
         std::thread::sleep(Duration::from_millis(250));
     };
