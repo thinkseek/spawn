@@ -747,6 +747,11 @@ pub(crate) struct Recovery {
     outage: Option<Outage>,
     /// When an open wait last re-read its cause, by session and attempt.
     probes: BTreeMap<String, i64>,
+    /// Whether this pass left a wait open: its cause (a model that refuses,
+    /// a login that expires, a full disk) is cleared by an observation no
+    /// append announces, so the loop must run the step again every probe,
+    /// not only when the log moves ([`Self::probing`]).
+    open_waits: bool,
 }
 
 impl Recovery {
@@ -770,6 +775,25 @@ impl Recovery {
                 });
             }
         }
+    }
+
+    /// Whether the loop's next pass must read again although the log did
+    /// not move: a wait is open (its cause is re-read every probe), or an
+    /// outage is pending (the first pass that reaches the database records
+    /// it at once).
+    pub(crate) fn probing(&self) -> bool {
+        self.open_waits || self.outage.is_some()
+    }
+
+    /// A pass could not reach the database: the next pass that can must
+    /// read again at once, whether the log moved or not ([`Self::probing`]).
+    pub(crate) fn wake(&mut self) {
+        self.outage.get_or_insert(Outage {
+            from_ms: 0,
+            to_ms: 0,
+            failed_passes: 0,
+            error: String::new(),
+        });
     }
 
     /// The outage this pass clears: the one the last failed passes made, if
@@ -820,6 +844,7 @@ pub(crate) fn step(state: &mut Recovery, world: &World<'_>) -> Result<Vec<String
         spawn,
     } = *world;
     let mut lines = Vec::new();
+    state.open_waits = false;
     state.record_start(store, now_ms)?;
     let outage = state.clearing(now_ms);
     let sessions: Vec<Candidate> = serde_json::from_value(
@@ -1534,6 +1559,9 @@ impl One<'_> {
             // Cleared: the revival is due now.
             return self.revive(last, cause, true);
         }
+        // The cause still holds: no append may announce its clearing, so the
+        // loop re-reads it every probe until it does.
+        self.state.open_waits = true;
         match cause {
             Cause::ModelUnavailable => {
                 // The retry is the revival; the clear is the model's answer
