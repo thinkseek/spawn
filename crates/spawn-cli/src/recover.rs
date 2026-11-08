@@ -1892,7 +1892,14 @@ impl One<'_> {
                 model: None,
             }
         };
-        self.submit(&next, action, "retrying a failed revival")
+        let why = self
+            .row
+            .commands
+            .iter()
+            .find(|sent| sent.key == key)
+            .and_then(|sent| sent.error.clone())
+            .unwrap_or_default();
+        self.submit(&next, action, &format!("retrying a failed revival: {why}"))
     }
 
     /// A handoff: stop the execution if it still runs, then start a new
