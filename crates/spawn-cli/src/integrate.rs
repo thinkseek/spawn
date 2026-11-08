@@ -1947,7 +1947,8 @@ impl Integrator {
                 let source = mission.source.clone()?;
                 Some((
                     source,
-                    needs_test_database(&pinned(Path::new(&mission.gate))),
+                    needs_test_database(&pinned(Path::new(&mission.gate)))
+                        && gate::on_shared_server(&self.judge.gate_env),
                 ))
             }),
             self.gates,
@@ -2097,7 +2098,12 @@ impl Integrator {
             if taken {
                 continue;
             }
-            let shares_server = needs_test_database(Path::new(&candidate.gated.gate));
+            // A gate shares the test server only when it gets one and that
+            // one is the shared server: with SPAWN_GATE_PG_IMAGE or
+            // SPAWN_GATE_PG_BIN every gate runs a server of its own, and
+            // `--gates` (a bound on the shared server) does not hold it.
+            let shares_server = needs_test_database(Path::new(&candidate.gated.gate))
+                && gate::on_shared_server(&self.judge.gate_env);
             let running = self
                 .running
                 .borrow()
@@ -7540,6 +7546,17 @@ mod database_tests {
         }
     }
 
+    /// The gate's environment names the shared test server (this test's
+    /// own), so every gate that gets a test database shares it and
+    /// `--gates` bounds them.
+    fn on_the_shared_server(integrator: &mut Integrator) {
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect("SPAWN_TEST_DATABASE_URL");
+        integrator
+            .judge
+            .gate_env
+            .push(("SPAWN_TEST_DATABASE_URL".to_string(), url));
+    }
+
     fn agent_of(db: &Db, mission: i64, task: i64) -> String {
         db.mission(mission)["tasks"]
             .as_array()
@@ -7705,6 +7722,7 @@ mod database_tests {
         let _release = Release(marks.clone());
         let (base_a, source_a, scenarios, mut integrator) = world("turns-a", &holding_gate(&marks));
         integrator.gates = 1;
+        on_the_shared_server(&mut integrator);
         let (base_b, source_b, _, _) = world("turns-b", "exit 1\n");
         let db = Db::new("turns");
         let a = db.gated_mission(&source_a, &scenarios);
@@ -7841,12 +7859,48 @@ mod database_tests {
 
     /// A cap of one is one gate at a time across missions, as before.
     #[test]
+    fn gates_with_servers_of_their_own_are_not_held_by_the_cap() {
+        // With SPAWN_GATE_PG_BIN every gate runs a PostgreSQL server of its
+        // own, so `--gates` (a bound on the shared server) does not hold
+        // them: two missions' gates run at once under a cap of one (Supply PA
+        // and Spawn were serialized for no reason, 2026-11-09).
+        let marks = fresh_marks("spawn-db-gate-own-servers");
+        let _release = Release(marks.clone());
+        let (base_a, source_a, scenarios, mut integrator) =
+            world("own-servers-a", &holding_gate(&marks));
+        integrator.gates = 1;
+        on_the_shared_server(&mut integrator);
+        integrator.judge.gate_env.push((
+            "SPAWN_GATE_PG_BIN".to_string(),
+            "/usr/lib/postgresql/16/bin".to_string(),
+        ));
+        let (base_b, source_b, _, _) = world("own-servers-b", "exit 1\n");
+        let db = Db::new("own_servers");
+        let a = db.gated_mission(&source_a, &scenarios);
+        let b = db.gated_mission(&source_b, &scenarios);
+        let a_one = db.reported_task(a, "a1");
+        let b_one = db.reported_task(b, "b1");
+        push_work(&base_a, &source_a, &agent_of(&db, a, a_one), "a1.txt");
+        push_work(&base_b, &source_b, &agent_of(&db, b, b_one), "b1.txt");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.pass_on(&db.store).expect("another pass");
+        assert_eq!(
+            wait_started(&marks, 2).len(),
+            2,
+            "both missions' gates run at once"
+        );
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+    }
+
+    #[test]
     fn a_cap_of_one_gates_one_mission_at_a_time() {
         let marks = fresh_marks("spawn-db-gate-cap");
         let _release = Release(marks.clone());
         let (base_a, source_a, scenarios, mut integrator) =
             world("cap-one-a", &holding_gate(&marks));
         integrator.gates = 1;
+        on_the_shared_server(&mut integrator);
         let (base_b, source_b, _, _) = world("cap-one-b", "exit 1\n");
         let db = Db::new("cap_one");
         let a = db.gated_mission(&source_a, &scenarios);
