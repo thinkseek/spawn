@@ -437,9 +437,8 @@ impl Monitor {
 
     /// The earliest time the step waits for even when no record is
     /// written: its next host reading (`SPAWN_ALERT_CHECK_SECS`), or a
-    /// bound's due time. `None` while only the log can make it run (never:
-    /// the reading is always a clock). Before the first check it is `0`, so
-    /// a fresh loop runs it once.
+    /// bound's due time. Before the first check it is `0`, so a fresh loop
+    /// runs it once.
     pub(crate) fn due_ms(&self) -> i64 {
         self.next_bound_ms
             .map_or(self.next_reading_ms, |bound| bound.min(self.next_reading_ms))
