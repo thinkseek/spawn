@@ -961,6 +961,28 @@ printf 'two\n' >"$seed/value"
 sed -i '1i #![forbid(unsafe_code)]' "$lib"
 tightened=$(commit lints-deny-added)
 expect "a new crate-level forbid is fine" "$(judge "$tightened")" 'exit=0 {"verdict":"accepted"}'
+# A new crate that inherits the workspace's lints relaxes nothing, the way
+# one with no [lints] table does not (spawn-kdf, batch 8, was refused for
+# it); one that brings a [lints.clippy] table of its own, or more under its
+# [lints] than `workspace = true`, is still refused.
+branch lints-new-inherits
+printf 'two\n' >"$seed/value"
+mkdir -p "$seed/crates/kdf"
+printf '[package]\nname = "kdf"\n\n[lints]\nworkspace = true # the strict choice\n' >"$seed/crates/kdf/Cargo.toml"
+inherits=$(commit lints-new-inherits)
+expect "a new crate inheriting the workspace's lints is fine" "$(judge "$inherits")" 'exit=0 {"verdict":"accepted"}'
+branch lints-new-relaxed
+printf 'two\n' >"$seed/value"
+mkdir -p "$seed/crates/kdf"
+printf '[package]\nname = "kdf"\n\n[lints]\nworkspace = true\n\n[lints.clippy]\nall = "allow"\n' >"$seed/crates/kdf/Cargo.toml"
+relaxed=$(commit lints-new-relaxed)
+expect "a new crate with a [lints.clippy] relaxation of its own is refused" "$(judge "$relaxed")" 'lint configuration'
+branch lints-new-extra
+printf 'two\n' >"$seed/value"
+mkdir -p "$seed/crates/kdf"
+printf '[package]\nname = "kdf"\n\n[lints]\nworkspace = true\nclippy = { all = "allow" }\n' >"$seed/crates/kdf/Cargo.toml"
+extra=$(commit lints-new-extra)
+expect "a new crate with more than workspace = true under [lints] is refused" "$(judge "$extra")" 'lint configuration'
 
 # 9. Objectives are judged on the base before any candidate code runs, and
 # cached. A fake shared test server (a Unix socket the gate binds in, as it
