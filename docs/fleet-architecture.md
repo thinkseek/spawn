@@ -1144,10 +1144,10 @@ the tree's own:
   the scenarios directory it was given: for a mission gate,
   `rsi/scenarios/retired-tests`, so a retirement there is a commit to the
   mission's scenarios directory — a landing and a deploy of its own, not a
-  supervisor-side edit; for the owner's gate, the copy of the scenarios
-  directory it passes, `rsi/.gate-owner` in the owner's checkout
-  (gitignored, `.gitignore`), with the file beside that copy's own
-  `protected` — where the list has actually been used;
+  supervisor-side edit; for the owner's gate, a copy of the scenarios
+  directory the owner keeps in the checkout — `rsi/.gate-owner`, kept out of
+  the tree by `.gitignore` — with `retired-tests` beside that copy's own
+  `protected`, which is where the list has actually been used;
 - `<scenarios>/build` builds each tree;
 - when a task has a scenario, that scenario must fail on the base (exit 1)
   and pass on the candidate;
