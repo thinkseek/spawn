@@ -441,6 +441,10 @@ pub(crate) enum Why {
     /// An objective ran out of attempts and its task yielded the slot to
     /// the next objective ([`digest::objective_yields`]).
     ObjectiveYielded,
+    /// An objective closed solved on the base: its scenario passed at a base
+    /// commit main already holds, so its task ended as a solved cancel, not
+    /// a rejection ([`digest::objective_solved`]).
+    ObjectiveSolved,
     /// A task that continued an overrun task went over its budget too
     /// ([`digest::over_budget_escalations`]): its objective is held until
     /// the mission is configured again.
@@ -454,8 +458,9 @@ impl Why {
     /// Whether an item of this kind is news rather than a condition: told
     /// once, it leaves nothing to resolve. A disk recovery, an approval, a
     /// human's message, a pair of host faults at the gate (the integrator
-    /// judges again on its own) and an expired hold (its landings resumed
-    /// on their own) are news. Every other item is a
+    /// judges again on its own), an expired hold (its landings resumed on
+    /// their own) and an objective closed solved on the base (nothing is
+    /// assigned for it again) are news. Every other item is a
     /// condition that holds while its facts do (a worker's state, a stall,
     /// a path still low on disk, a gate still without room): told, it stays
     /// in [`Plan::told`] until its facts change.
@@ -468,6 +473,7 @@ impl Why {
                 | Self::GateHostFault
                 | Self::GateBaseDisagrees
                 | Self::HoldExpired
+                | Self::ObjectiveSolved
         )
     }
 }
@@ -742,6 +748,10 @@ pub(crate) fn read_plan(
     host.extend(digest::objective_yields(&records(
         store.objective_yields(),
         "objective yield records",
+    )?));
+    host.extend(digest::objective_solved(&records(
+        store.objective_solved_news(),
+        "objective solved records",
     )?));
     host.extend(digest::objective_order(&records(
         store.objective_backlogs(),
@@ -1815,6 +1825,44 @@ mod tests {
         assert!(!line.contains("test database"), "{line}");
         assert!(!line.contains("load"), "{line}");
         assert!(!line.contains('\n'), "{line}");
+    }
+
+    /// An objective solved on the base (integrator `solved_on_base`) is news:
+    /// the digest names the mission, the objective and the task it ended, and
+    /// says it ended solved rather than rejected, reading every fact from the
+    /// record's own fields. One item per close, each its own line.
+    #[test]
+    fn an_objective_solved_on_the_base_is_news_naming_mission_objective_and_task() {
+        let record = serde_json::json!({"type": "objective.solved", "id": 4, "objective": 34,
+            "task": 201,
+            "scenario": "/home/o/.local/share/spawn-rsi/controllers/spawn/rsi/scenarios/034.sh",
+            "base": "f05915f5a98fa3cf6e3db78ce9a1a5ee14801f84",
+            "event_id": 109_278, "at_ms": 1_793_934_704_000_i64});
+        let items = super::digest::objective_solved(&[record]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tag(), "missions objective-solved-109278");
+        assert_eq!(items[0].why, Why::ObjectiveSolved);
+        let line = &items[0].line;
+        for part in [
+            "mission #4",
+            "objective 34",
+            "task #201",
+            "ended solved, not rejected",
+            "034.sh",
+            "at f05915f,",
+            "closed",
+        ] {
+            assert!(line.contains(part), "{part:?} in {line}");
+        }
+        assert!(
+            !line.contains("controllers/spawn"),
+            "the full path stays out: {line}"
+        );
+        assert!(!line.contains('\n'), "{line}");
+        assert!(
+            Why::ObjectiveSolved.is_news(),
+            "told once, nothing left to resolve"
+        );
     }
 
     /// Objective 33: three bases in a row that disagreed with themselves

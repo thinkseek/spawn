@@ -1310,10 +1310,16 @@ the tree's own:
   same uid outside the sandbox can (the same-uid limit).
 - **Exit status.** The gate exits 0 with a verdict. It exits 5 when it has
   no room to judge now: `TMPDIR` has less than `SPAWN_GATE_MIN_FREE_GB`
-  free (`scripts/disk.sh` `gate_room`). In that case it first writes the
-  fact `{"no_room":true,"free_kb","min_gb","tmpdir"}` to the verdict file,
-  before any scratch is made or any candidate code runs. On a disk with no
-  room at all, that write may fail, and the gate still exits 5. The
+  free (`scripts/disk.sh` `gate_room`), or a scenario run waited past its
+  bound (`SPAWN_GATE_SLOT_WAIT_SECS`, 30 minutes by default) for one of the
+  host's scenario slots (§10.2 "Host scenario slots"). In the first case
+  it first writes the fact `{"no_room":true,"free_kb","min_gb","tmpdir"}`
+  to the verdict file, before any scratch is made or any candidate code
+  runs; in the second, `{"no_room":true,"check":"host scenario slot",
+  "waited_ms","budget"}`, and no scenario of that run starts. On a disk
+  with no room at all, that write may fail, and the gate still exits 5; it
+  also prints the fact, and the integrator reads the last JSON line of
+  stdout before measuring, so a slot wait keeps its own check. The
   integrator reads `no_room` from exit 5 together with the fact (`gate.rs`).
   Without a readable fact, it measures the free space itself (`df`), and it
   records `no_room` with its own measurement only when that is under the
@@ -1332,7 +1338,11 @@ the tree's own:
   fact: `host_fault` with the evidence `cannot_judge`, never a rejection and
   never an abort (§10.3). Exit 6 with neither fact is an abort, as is any
   other status: exit 3 (no bwrap, a missing bind directory, an unreadable
-  `TMPDIR`, a floor that is not whole GiB), exit 4 (a run the gate lost:
+  `TMPDIR`, a floor that is not whole GiB, the gate's own tree under `/tmp`,
+  `/run` or `/var/tmp` — itself or below it — or under the host's `TMPDIR`
+  when that is not `/tmp`, all of which it refuses up front so that no base
+  key is computed from scripts the sandbox empties), exit 4 (a run the gate
+  lost:
   ended without a result),
   a timeout or a signal. The integrator measures the same floor, free
   memory and the test database itself before it starts the gate (§10.3,
@@ -1543,8 +1553,9 @@ are per-agent uids or a mount per engine.
      git moves. A check before the gate that fell short (step 3), or a gate
      that had no room (exit 5 with its fact, §10.2), is gated `no_room`. This
      is no verdict on the work. The task stays where it was, and the record
-     names `check` (`disk`, `memory` or `database`; the gate's own floor is
-     `disk`), `measured` and `threshold` (free KiB and the floor in KiB, with
+     names `check` (`disk`, `memory`, `database` or `host scenario slot`;
+     the gate's own floor is `disk`, and a slot wait is the host's scenario
+     budget), `measured` and `threshold` (free KiB and the floor in KiB, with
      `free_kb`, `min_gb` and `tmpdir`; available MiB and the floor in MiB;
      the error and the probe it failed, with `server` as
      host:port/database or the socket directory, never the URL's password),
@@ -2213,10 +2224,15 @@ are per-agent uids or a mount per engine.
   load of 18-20, and task 172's gate failed on its base. **Host scenario
   slots.** The jobs above bound one gate; the host's whole scenario budget
   is separate and `scripts/rsi/gate.sh` takes it itself: every scenario
-  run, from every gate, first takes one of `SPAWN_GATE_HOST_JOBS` slots
-  (default: the gate's `SPAWN_GATE_JOBS` when the owner set it, else the
-  min(8, cores/2) a hand-run gate takes), files under
-  `$HOME/.cache/spawn/gate-slots` locked by flock on an fd of the run's own
+  run, from every gate, first takes one of the host's slots. The number is
+  the host's own statement in `$HOME/.cache/spawn/gate-slots/host_jobs`,
+  which the deploy writes from the integrator's gate environment and the
+  owner may edit; without it, `SPAWN_GATE_HOST_JOBS`, then the gate's
+  `SPAWN_GATE_JOBS`, then the hand-run default min(8, cores/2). The file
+  outranks the environment so a hand-run shell cannot raise the cap, and a
+  gate started with a larger value cannot exceed it; the gate only reads
+  the file. The slots themselves are files under
+  `$HOME/.cache/spawn/gate-slots`, locked by flock on an fd of the run's own
   subshell. The claim is in the gate, not here, so an integrator's gate, an
   owner's hand-run and the deploy's base-cache warm-up share one budget
   with nothing to configure; the fd's close releases a slot, so a killed

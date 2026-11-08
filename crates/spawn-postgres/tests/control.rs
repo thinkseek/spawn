@@ -3923,3 +3923,71 @@ fn an_objective_solved_on_the_base_ends_its_task() {
     let board = store.mission_board(10).expect("board");
     assert_eq!(board["missions"][0]["tasks"][0]["state"], "cancelled");
 }
+
+/// An objective closed solved on the base is news the supervisor was not told
+/// of yet: the store returns the `objective.solved` record (the gate's log
+/// left out) with its event, time, mission and the record's own fields, and
+/// once a delivered digest carries the tag `missions objective-solved-<event
+/// id>` it is no news any more.
+#[test]
+fn an_objective_solved_is_news_until_a_digest_tells_it() {
+    let (store, schema) = store("solved_news");
+    let mission = store
+        .mission_add("objectives", &json!(["/tmp/solved.git"]), "human")
+        .expect("add");
+    store
+        .resident_propose("rsi", "Pursues objectives")
+        .expect("propose");
+    store.resident_approve("rsi").expect("approve");
+    store
+        .mission_configure(
+            mission,
+            Some("/controller/rsi/scenarios"),
+            "gate",
+            None,
+            Some(&json!({"backlog": "/controller/rsi/backlog", "resident": "rsi"})),
+        )
+        .expect("configure");
+    let task = store
+        .objective_assign(mission, 34, Some("/s/034.sh"), "Objective 34")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    let solved = store
+        .integrator_record(&json!({"type": "objective.solved", "id": mission,
+                                   "objective": 34, "task": task, "scenario": "/s/034.sh",
+                                   "base": "f05915f5a98fa3cf6e3db78ce9a1a5ee14801f84",
+                                   "log": "| the gate's output"}))
+        .expect("solved");
+    let news = store.objective_solved_news().expect("news");
+    assert_eq!(news.as_array().map(Vec::len), Some(1), "{news}");
+    assert_eq!(news[0]["event_id"], solved);
+    assert_eq!(news[0]["mission"], mission);
+    assert_eq!(news[0]["objective"], 34);
+    assert_eq!(news[0]["task"], task);
+    assert_eq!(news[0]["scenario"], "/s/034.sh");
+    assert_eq!(news[0]["base"], "f05915f5a98fa3cf6e3db78ce9a1a5ee14801f84");
+    assert!(news[0]["at_ms"].is_i64());
+    assert!(news[0].get("log").is_none(), "the gate's log stays out");
+    admin(&schema)
+        .execute(
+            "insert into spawn_commands (principal, idempotency_key, agent_id, session_id,
+                                         action, state, succeeded, created_at_ms)
+             values ('spawn-dispatch', 'dispatch-digest-solved', 'agent_supervisor',
+                     'session_supervisor',
+                     jsonb_build_object('type', 'input', 'text', 'digest',
+                                        'tags', jsonb_build_array($1::text)),
+                     'finished', true, 0)",
+            &[&format!("missions objective-solved-{solved}")],
+        )
+        .expect("a delivered digest");
+    assert_eq!(
+        store
+            .objective_solved_news()
+            .expect("news")
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "told once"
+    );
+}

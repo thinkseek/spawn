@@ -172,6 +172,12 @@
 #                              value every gate is given (SPAWN_GATE_JOBS)
 #                              when it is set, else the same default one
 #                              gate takes (min(8, half the cores))
+#   SPAWN_GATE_SLOT_WAIT_SECS  how long one scenario run may wait for a slot
+#                              before the gate says it had no room and exits 5
+#                              (whole seconds from 1; default 1800, 30 min).
+#                              A seam for the tests, which cannot wait 30
+#                              minutes: spawn integrate does not pass it, and
+#                              an owner who sets it is changing the bound
 #   SPAWN_GATE_PG_IMAGE        the test server's docker image: the gate runs a
 #                              server of its own from it (GitHub issue #6),
 #                              and SPAWN_TEST_DATABASE_URL is not used
@@ -200,10 +206,54 @@
 # records `no_room` from that exit status with that file, or, with no
 # readable file, from its own measure of TMPDIR under the floor (gate.rs). It is no verdict and does not count toward a mission's halt.
 # Any other status is an infrastructure failure (no bwrap, a git error, a
-# missing bind directory, a bad SPAWN_GATE_MIN_FREE_GB, a killed gate),
-# which the integrator records as an abort that counts.
+# missing bind directory, a bad SPAWN_GATE_MIN_FREE_GB, a killed gate), which
+# the integrator records as an abort that counts. A gate whose own tree is
+# under /tmp, /run or /var/tmp — itself or below it — or under the host's
+# TMPDIR when that is not /tmp refuses up front (exit 3, below): the sandbox
+# empties those, so it could not read its own scripts there and would
+# compute base keys no other host matches — silently.
 
 set -eu
+
+# A gate whose own tree the sandbox empties cannot judge: toolchain() reads
+# scripts/pg-url.sh through `$(dirname "$0")/..` inside the sandbox, and from
+# a root the sandbox empties there it finds nothing. Those roots are /tmp,
+# /run and /var/tmp, and the host's TMPDIR when that is not /tmp
+# (`sandbox()` below masks it whole). A tree that *is* such a root is in it
+# as much as one under it. The toolchain block then says "server:
+# unreadable", the base cache key is like no other host's, and every
+# scenario runs again in every gate, silently (measured 2026-11-08: the same
+# base from /var/tmp gave 30 of 30 different keys, every tool version
+# identical; deploy/gate-runner/setup.sh refuses a runner root the same
+# way). Refuse up front, exit 3, naming the root and the reason — and no
+# advice about where to run it instead: where a gate may run from is the
+# caller's to know.
+gate_root=$(cd "$(dirname "$0")/../.." && pwd) || {
+    echo "gate: cannot resolve the directory of $0" >&2
+    exit 3
+}
+masked_root() {
+    printf 'gate: refusing to run from %s: %s; the gate could not read its own scripts there (scripts/pg-url.sh) inside the sandbox, so its toolchain block would say "server: unreadable" and every base key it computed would be one no other host matches\n' "$gate_root" "$1" >&2
+    exit 3
+}
+case "$gate_root" in
+/tmp | /tmp/* | /run | /run/* | /var/run | /var/run/* | /var/tmp | /var/tmp/*)
+    masked_root "it is under /tmp, /run or /var/tmp, roots the sandbox empties"
+    ;;
+esac
+# The host's TMPDIR is emptied too when it is /tmp's job to be the gateway's
+# scratch: `sandbox()` masks it whole unless it is /tmp (or /).
+case "${TMPDIR-}" in
+'' | / | /tmp | /tmp/) ;;
+*)
+    tmpdir_root=$(cd "$TMPDIR" 2>/dev/null && pwd) || tmpdir_root=$TMPDIR
+    case "$gate_root" in
+    "$tmpdir_root" | "$tmpdir_root"/*)
+        masked_root "it is under the host's TMPDIR ($tmpdir_root), which the sandbox empties too (TMPDIR is not /tmp)"
+        ;;
+    esac
+    ;;
+esac
 
 # Base-only (`gate.sh --base-only <bare-repo> <base-commit> <scenarios-dir>`):
 # the base phase alone, for the base cache (see "Base only" below). The
@@ -242,12 +292,15 @@ case $room in
     # it (no candidate code has run), and a status of its own. A disk with
     # no room at all may refuse the write: the status stays 5, and the
     # integrator measures the free space itself.
+    no_room_json=$(printf '{"no_room":true,"free_kb":%s,"min_gb":%s,"tmpdir":"%s"}' \
+        "$disk_free" "$disk_min_gb" \
+        "$(printf '%s' "$disk_dir" | tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')")
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
-        (printf '{"no_room":true,"free_kb":%s,"min_gb":%s,"tmpdir":"%s"}\n' \
-            "$disk_free" "$disk_min_gb" \
-            "$(printf '%s' "$disk_dir" | tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')" \
-            >"$SPAWN_GATE_VERDICT") 2>/dev/null || :
+        printf '%s\n' "$no_room_json" >"$SPAWN_GATE_VERDICT" 2>/dev/null || :
     fi
+    # Printed too: a full disk may refuse the file, and the integrator then
+    # reads the last line here before measuring TMPDIR itself.
+    printf '%s\n' "$no_room_json"
     exit 5
     ;;
 *) exit 3 ;;
@@ -593,14 +646,36 @@ esac
 # else the value every gate is given (SPAWN_GATE_JOBS) when the owner set
 # it, else the same default one gate takes. Without flock, or a writable
 # slot directory, it becomes 0 — no budget, said below.
-gate_slots=${SPAWN_GATE_HOST_JOBS-}
-if [ -z "$gate_slots" ]; then
-    if [ -n "${SPAWN_GATE_JOBS-}" ]; then
-        gate_slots=$gate_jobs
-    else
-        gate_slots=$(($(nproc 2>/dev/null || echo 2) / 2))
-        [ "$gate_slots" -le 8 ] || gate_slots=8
-        [ "$gate_slots" -ge 1 ] || gate_slots=1
+# The host's budget comes, in this order, from a file the host states
+# (`$HOME/.cache/spawn/gate-slots/host_jobs`: the deploy writes it from the
+# integrator's gate environment, the owner may edit it), then
+# SPAWN_GATE_HOST_JOBS, then the value every gate is given (SPAWN_GATE_JOBS),
+# then the hand-run default. The file wins precisely so a hand-run shell
+# cannot raise (or lower) the host's cap by carrying another value; the gate
+# only reads it, so no gate that runs first can decide it for the others.
+slot_dir=$HOME/.cache/spawn/gate-slots
+slot_stated=""
+if [ -f "$slot_dir/host_jobs" ]; then
+    slot_stated=$(tr -d ' \t\n' <"$slot_dir/host_jobs" 2>/dev/null || true)
+    case "$slot_stated" in
+    '' | *[!0-9]* | 0*)
+        echo "gate: $slot_dir/host_jobs is not a whole number from 1: '$slot_stated'" >&2
+        exit 3
+        ;;
+    esac
+fi
+if [ -n "$slot_stated" ]; then
+    gate_slots=$slot_stated
+else
+    gate_slots=${SPAWN_GATE_HOST_JOBS-}
+    if [ -z "$gate_slots" ]; then
+        if [ -n "${SPAWN_GATE_JOBS-}" ]; then
+            gate_slots=$gate_jobs
+        else
+            gate_slots=$(($(nproc 2>/dev/null || echo 2) / 2))
+            [ "$gate_slots" -le 8 ] || gate_slots=8
+            [ "$gate_slots" -ge 1 ] || gate_slots=1
+        fi
     fi
 fi
 case "$gate_slots" in
@@ -609,6 +684,21 @@ case "$gate_slots" in
     exit 3
     ;;
 esac
+# How long one run may wait for a slot before the gate says it has no room
+# (exit 5): SPAWN_GATE_SLOT_WAIT_SECS, default 30 minutes. Below the
+# integrator's gate wall clock (SPAWN_GATE_WALL_CLOCK_MINUTES, default 120),
+# which the gate cannot read, and said in the output when it is reached.
+slot_wait=${SPAWN_GATE_SLOT_WAIT_SECS-}
+if [ -z "$slot_wait" ]; then
+    slot_wait=1800
+else
+    case "$slot_wait" in
+    '' | *[!0-9]* | 0*)
+        echo "gate: SPAWN_GATE_SLOT_WAIT_SECS is a whole number of seconds from 1, not '$slot_wait'" >&2
+        exit 3
+        ;;
+    esac
+fi
 # The slots themselves: files this host's gates lock one at a time, under
 # $HOME (0700), so the integrator's gate, an owner's hand-run gate and the
 # deploy's warm-up all find the same ones — with no variable to set, and
@@ -616,7 +706,6 @@ esac
 # runs a HOME of their own, so its gates stay out of the host's budget.)
 # Outside the sandbox: no scenario can see or take a lock, and the kernel
 # drops a held one when its fd closes, a kill included.
-slot_dir=$HOME/.cache/spawn/gate-slots
 slot_held=""
 if command -v flock >/dev/null 2>&1; then
     if mkdir -p "$slot_dir" 2>/dev/null && chmod 700 "$slot_dir" 2>/dev/null; then
@@ -637,6 +726,9 @@ fi
 if [ "$gate_slots" = 0 ]; then
     echo "| host scenario slots: none (no flock, or $slot_dir cannot be written): each gate runs its own SPAWN_GATE_JOBS"
 else
+    if [ -z "$slot_stated" ]; then
+        echo "| host scenario slots: no $slot_dir/host_jobs file: $gate_slots from SPAWN_GATE_HOST_JOBS or the default, so a gate started with a larger value can exceed this cap"
+    fi
     echo "| host scenario slots: $gate_slots (every gate on this host takes one per scenario run)"
 fi
 # Whatever the gate started dies with it: its scenario runs, the private
@@ -1022,8 +1114,17 @@ build() {
 # owner's hand-run, the deploy's warm-up — takes the same budget, with no
 # configuration. A gate running two scenarios holds two slots (one per run's
 # own subshell, one fd each, so the same process starting a second scenario
-# claims a second slot and never re-counts the first). The slots are files
-# under $HOME/.cache/spawn/gate-slots (not under XDG_CACHE_HOME: the budget
+# claims a second slot and never re-counts the first). The number is the
+# host's own statement, not each gate's: $HOME/.cache/spawn/gate-slots/host_jobs
+# when it exists (the deploy writes it from the integrator's gate
+# environment; the owner may edit it), else SPAWN_GATE_HOST_JOBS, else the
+# value every gate is given (SPAWN_GATE_JOBS), else the hand-run default. The
+# file wins so a hand-run shell cannot raise (or lower) the host's cap by
+# carrying another value, and a gate started with a larger value cannot
+# exceed it; the gate only reads the file, so no gate that runs first can
+# decide it for the others. Without one, the gate says so in its output.
+# The slots are files under $HOME/.cache/spawn/gate-slots (not under
+# XDG_CACHE_HOME: the budget
 # is the user's, and a hand-run gate with any XDG_CACHE_HOME still finds it;
 # the gate makes it 0700), held by flock on an fd of the run's subshell: the
 # kernel drops a lock when the fd closes, so a killed gate loses no slot and
@@ -1031,14 +1132,19 @@ build() {
 # said while it is going (as a line beside the run's, so a waiting gate and
 # a stalled one never look alike), and every ten minutes again while it
 # lasts; the run's own block then records how long it waited and the slot
-# it took. A hung holder is not bounded here — the gate has no per-scenario
-# timeout; a gate the integrator started is killed at its gate wall clock
-# (SPAWN_GATE_WALL_CLOCK_MINUTES, default 120), and a hand-run gate's owner
-# kills it — and until then the waiter waits, saying so. The build hook is not a scenario and
-# takes none (one per gate, and gates are few); everything that runs a
-# scenario does — the base's runs and the cache warm-up's, the candidate's
-# checks and the task scenario. Gates on different hosts have different
-# budgets; the slots are per host, not per fleet.
+# it took. A wait is bounded: after SPAWN_GATE_SLOT_WAIT_SECS (default 1800,
+# 30 min, well inside the integrator's gate wall clock) the run gives up,
+# the gate says so, writes the no-room fact with `check` `host scenario
+# slot` (its measure the wait, its threshold the budget) and exits 5 — the
+# same class as a TMPDIR under its floor ("no room to judge now"): not a
+# verdict, the task waits and is judged again after the room backoff, and
+# the record says which check fell short. A hung holder therefore costs one
+# judging's wait, not the host; the gate never holds a slot while giving up.
+# The build hook is not a scenario and takes none (one per gate, and gates
+# are few); everything that runs a scenario does — the base's runs and the
+# cache warm-up's, the candidate's checks and the task scenario. Gates on
+# different hosts have different budgets; the slots are per host, not per
+# fleet.
 #
 # Parallel runs. The base's scenario runs, and then the candidate's, run
 # SPAWN_GATE_JOBS at a time (above), the base's all done before any
@@ -1083,7 +1189,7 @@ build() {
 # for the gate's own loop to print, so a waiting gate is visible while it
 # waits; the run's block then says how long it waited and the slot it took.
 slot_acquire() {
-    slot_held="" slot_n="" slot_wait_ms=0 slot_said=""
+    slot_held="" slot_n="" slot_wait_ms=0 slot_said="" slot_gave_up=""
     [ "$gate_slots" -gt 0 ] || return 0
     rm -f "$1/waiting" "$1/waiting.said" "$1/waiting.said.n" 2>/dev/null || :
     slot_from=$(stage_now)
@@ -1106,6 +1212,14 @@ slot_acquire() {
             slot_i=$((slot_i + 1))
         done
         if [ -z "$slot_held" ]; then
+            slot_wait_ms=$(( $(stage_now) - slot_from ))
+            if [ "$slot_wait_ms" -ge $((slot_wait * 1000)) ]; then
+                # The bound: no room to judge now (see "Host scenario
+                # slots"). No fd is open here, so giving up holds nothing.
+                rm -f "$1/waiting" 2>/dev/null || :
+                slot_gave_up=1
+                return 0
+            fi
             [ -n "$slot_said" ] || : >"$1/waiting" 2>/dev/null || :
             slot_said=1
             sleep 0.2
@@ -1113,6 +1227,36 @@ slot_acquire() {
     done
     [ -z "$slot_said" ] || rm -f "$1/waiting" 2>/dev/null || :
     slot_wait_ms=$(( $(stage_now) - slot_from ))
+}
+# spoken_wait <ms>: a wait in one line, as a person reads it ("2.1 s",
+# "30.0 min").
+spoken_wait() {
+    if [ "$1" -ge 60000 ]; then
+        printf '%s.%s min' "$(($1 / 60000))" "$((($1 % 60000) / 6000))"
+    else
+        printf '%s.%s s' "$(($1 / 1000))" "$((($1 % 1000) / 100))"
+    fi
+}
+# slot_no_room <job>: the run gave up waiting for a slot: a fact about the
+# host, written where only the integrator reads it and printed (the integrator
+# reads the file, and its last line here when the write failed, so the slot
+# keeps its shape either way), then exit 5 — no verdict, the task waits and
+# is judged again. Nothing here holds a slot.
+slot_no_room() {
+    slot_gave=$(cat "$1/slot-waited" 2>/dev/null || echo 0)
+    slot_name=$(cat "$1/scenario" 2>/dev/null || true)
+    stage_close no_room
+    gate_times
+    stage_emit gate no_room "$(($(stage_now) - gate_started))" total
+    echo "| $(basename "$slot_name"): gave up waiting for a host scenario slot after $(spoken_wait "$slot_gave") (all $gate_slots taken, shared by every gate on this host)"
+    json="{\"no_room\":true,\"check\":\"host scenario slot\",\"waited_ms\":$slot_gave,\"budget\":$gate_slots"
+    json="$json,\"scenario\":\"$(json_string "$(basename "$slot_name")")\""
+    json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
+    if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
+        printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT" 2>/dev/null || :
+    fi
+    printf '%s\n' "$json"
+    exit 5
 }
 slot_release() {
     [ -n "$slot_held" ] || return 0
@@ -1125,6 +1269,16 @@ slot_release() {
 # returns its exit status.
 job_run() {
     slot_acquire "$1"
+    if [ -n "$slot_gave_up" ]; then
+        # No room to judge now: the run is not started, and the printed
+        # handler states it (exit 5) rather than judging into a starved host.
+        job_say "| gave up waiting for a host scenario slot after $(spoken_wait "$slot_wait_ms") (all $gate_slots taken, shared by every gate on this host)"
+        printf 'waited %s for a host scenario slot (all %s taken, shared by every gate on this host)\n' \
+            "$(spoken_wait "$slot_wait_ms")" "$gate_slots" >"$1/runs"
+        printf '%s\n' "$slot_wait_ms" >"$1/slot-waited"
+        job_done abort
+        return 125
+    fi
     if [ "$slot_wait_ms" -ge 200 ]; then
         job_say "| waited $((slot_wait_ms / 1000)).$((slot_wait_ms % 1000 / 100)) s for host scenario slot $slot_n of $gate_slots (shared by every gate on this host)"
     fi
@@ -1848,6 +2002,7 @@ base_job() {
     run_at=$(stage_now)
     first=0
     job_run "$job" 1 "$work/baseline" "$objective" || first=$?
+    [ ! -e "$job/slot-waited" ] || return 0
     job_output 1
     result=""
     case "$first" in
@@ -1859,6 +2014,7 @@ base_job() {
         run_at=$(stage_now)
         again=0
         job_run "$job" 2 "$work/baseline" "$objective" || again=$?
+        [ ! -e "$job/slot-waited" ] || return 0
         job_output 2
         [ "$again" -eq 1 ] && result=unsolved
         first="1, then $again"
@@ -1908,6 +2064,7 @@ base_printed() {
     printed_name=$(basename "$(cat "$1/scenario")")
     # shellcheck disable=SC2046 # the result's words
     set -- "$1" $(cat "$1/result")
+    if [ -e "$1/slot-waited" ]; then slot_no_room "$1"; fi
     case "$2" in
     cached)
         from_cache="$from_cache $printed_name"
@@ -2132,6 +2289,7 @@ candidate_job() {
     run_at=$(stage_now)
     run_status=0
     job_run "$job" 1 "$work/candidate" "$job_scenario" || run_status=$?
+    [ ! -e "$job/slot-waited" ] || return 0
     job_output 1
     is_check=""
     case "$(basename "$job_scenario")" in check-*) is_check=1 ;; esac
@@ -2141,6 +2299,7 @@ candidate_job() {
         run_at=$(stage_now)
         again=0
         job_run "$job" 2 "$work/candidate" "$job_scenario" || again=$?
+        [ ! -e "$job/slot-waited" ] || return 0
         job_output 2
         if [ "$again" -eq 0 ]; then
             job_say "| $(basename "$job_scenario") failed once ($run_status) and passed again on the candidate: a flake, not a regression"
@@ -2159,6 +2318,7 @@ candidate_job() {
             else
                 on_base=0
                 job_run "$job" 3 "$work/baseline" "$job_scenario" || on_base=$?
+                [ ! -e "$job/slot-waited" ] || return 0
                 job_output 3
                 job_stage "$(($(stage_now) - run_at))" "exit $on_base" "$base_name"
                 if [ "$on_base" -eq 0 ]; then
@@ -2227,6 +2387,11 @@ candidate_printed() {
     printed_ms=$(cat "$1/ms" 2>/dev/null || echo 0)
     printed_status=$(cat "$1/result")
     printed_scenario=$(cat "$1/scenario")
+    # No room to judge now (a run gave up waiting for a slot): that is the
+    # answer whatever else the job's status would have meant — never a
+    # rejection, and never the "failed twice" story below, which would be
+    # untrue of a run that never started.
+    if [ -e "$1/slot-waited" ]; then slot_no_room "$1"; fi
     if [ "$printed_status" = error ]; then
         phase_time candidate
         echo "gate: the gate could not run $(basename "$printed_scenario") on the candidate" >&2
