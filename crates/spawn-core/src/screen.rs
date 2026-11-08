@@ -379,11 +379,19 @@ pub fn read_claude_screen(pane: &str) -> ScreenReading {
     }
 
     let region = activity_region(&tail, index);
-    if let Some(line) = region.iter().find(|line| busy_line(line)) {
-        return ScreenReading::new(ScreenState::Busy, line);
-    }
-    if let Some(line) = region.iter().find(|line| error_line(line)) {
-        return ScreenReading::new(ScreenState::Error, line);
+    // The line nearest the prompt decides which turn it is: a fresh spinner
+    // over an older error is a running turn; an error over a spinner left
+    // behind is the engine's failed turn, at its prompt (a relay outage
+    // leaves the turn's spinner line above the error, objective 032).
+    if let Some(line) = region
+        .iter()
+        .find(|line| busy_line(line) || error_line(line))
+    {
+        return if busy_line(line) {
+            ScreenReading::new(ScreenState::Busy, line)
+        } else {
+            ScreenReading::new(ScreenState::Error, line)
+        };
     }
 
     match prompt_body(prompt) {
