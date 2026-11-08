@@ -243,6 +243,20 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
         }
         std::thread::sleep(Duration::from_millis(250));
     };
+    if !seen.contains("dead (exit status 3)") {
+        let panes = Command::new("tmux")
+            .args(["-L", &server.socket, "-f", "/dev/null", "list-panes", "-a", "-F",
+                   "#{session_name}|#{pane_dead}|#{pane_dead_status}|#{pane_current_command}|#{pane_pid}|#{pane_start_command}"])
+            .output()
+            .expect("tmux is installed");
+        eprintln!("DIAG panes: {}", String::from_utf8_lossy(&panes.stdout));
+        eprintln!("DIAG seen: {seen}");
+        let dead = Command::new("tmux")
+            .args(["-L", &server.socket, "-f", "/dev/null", "show-options", "-g", "remain-on-exit"])
+            .output()
+            .expect("tmux");
+        eprintln!("DIAG option: {}", String::from_utf8_lossy(&dead.stdout));
+    }
     assert!(seen.contains("dead (exit status 3)"), "{seen}");
     assert!(host.is_alive(&terminal(), &workspace()).expect("alive"));
 }
