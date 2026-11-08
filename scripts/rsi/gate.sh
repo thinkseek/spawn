@@ -2012,7 +2012,20 @@ lint_config() {
         done
     )
 }
-if [ "$(lint_config "$work/baseline")" != "$(lint_config "$work/candidate")" ]; then
+# A crate new in the candidate that only inherits the workspace's lints
+# (`[lints]` with `workspace = true`, nothing else) relaxes nothing: those two
+# lines of a manifest the base does not have are left out of the comparison.
+# Without this a new crate that inherits the lints was refused while one with
+# no [lints] table at all (lint-free) passed (spawn-kdf, 2026-11-09).
+lint_config_inherits_new() { # <base tree> <candidate tree>
+    (cd "$1" && find . -name Cargo.toml -type f | sort) >"$work/lint-base-manifests"
+    lint_config "$2" | awk -v known="$work/lint-base-manifests" '
+        BEGIN { while ((getline line < known) > 0) base[line] = 1 }
+        { split($0, part, ": "); file = part[1]; rest = substr($0, length(file) + 3) }
+        !(file in base) && (rest == "[lints]" || rest == "workspace=true") { next }
+        { print }'
+}
+if [ "$(lint_config "$work/baseline")" != "$(lint_config_inherits_new "$work/baseline" "$work/candidate")" ]; then
     echo "| candidate changes lint configuration ([lints] tables or clippy.toml)"
     verdict rejected "candidate changes lint configuration"
     exit 0
