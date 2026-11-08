@@ -2128,7 +2128,27 @@ are per-agent uids or a mount per engine.
   jobs it gave). A setting that does not parse stops the integrator from
   starting, naming it. On 2026-11-08, with `SPAWN_GATE_PG_BIN` set, each
   gate took half of the 9 cores; two or three gates and the workers made a
-  load of 18-20, and task 172's gate failed on its base. Each judging records its own verdict and landing, which the next
+  load of 18-20, and task 172's gate failed on its base. **Host scenario
+  slots.** The jobs above bound one gate; the host's whole scenario budget
+  is separate and `scripts/rsi/gate.sh` takes it itself: every scenario
+  run, from every gate, first takes one of `SPAWN_GATE_HOST_JOBS` slots
+  (default: the gate's `SPAWN_GATE_JOBS` when the owner set it, else the
+  min(8, cores/2) a hand-run gate takes), files under
+  `$HOME/.cache/spawn/gate-slots` locked by flock on an fd of the run's own
+  subshell. The claim is in the gate, not here, so an integrator's gate, an
+  owner's hand-run and the deploy's base-cache warm-up share one budget
+  with nothing to configure; the fd's close releases a slot, so a killed
+  gate loses none, and a gate with two runs holds two slots (one each). A
+  waiting run says so while it waits ("waiting for a host scenario slot"),
+  and its block then records how long it waited and the slot it took, the
+  way the room no-room fact records disk. The build hook, the test listing
+  and the snapshot take no slot (one each per gate, and gates are few). Without the budget, on 2026-11-08 an owner
+  gate plus a fleet gate, and after the deploy a warm-up plus a fleet gate,
+  ran four heavy scenarios on 9 cores, and two tests with real-clock
+  windows — `a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it`
+  (a dead tmux pane's exit status unrecorded after 30 s) and
+  `dispatch::resume_replay::a_resume_that_succeeded_and_died_young` — failed
+  under it and rejected tasks 183, 184 and others. Each judging records its own verdict and landing, which the next
   pass reads; finished judgings are reaped before a pass reads the
   missions. A judging that panics before any record of its own is
   recorded `aborted` with the reason, so the three-aborts halt bounds a

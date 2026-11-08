@@ -1375,9 +1375,14 @@ with_jobs() {
 }
 # normalized: the gate's log without its times and its parallelism.
 normalized() {
-    # Times, and the sockets the host has open (other processes' too).
+    # Times, and the sockets the host has open (other processes' too), and
+    # the host's scenario budget: it is SPAWN_GATE_JOBS, which differs here
+    # (1 against 4), and a wait for a slot is the host's, not the log's.
     sed -E -e 's/[0-9]+ms/Nms/g' -e 's/[0-9]+ s\b/N s/g' -e '/^\| (base|candidate) runs: /d' \
-        -e '/^\| gate time: /d' -e '/^\| sockets hidden from the sandbox: /d' "$work/gate.out"
+        -e '/^\| gate time: /d' -e '/^\| sockets hidden from the sandbox: /d' \
+        -e '/^\| host scenario slots: /d' \
+        -e '/^\| waited [0-9.]+ s for host scenario slot /d' \
+        -e '/^\| [a-z]+\.[0-9]+: (still )?waiting for a host scenario slot /d' "$work/gate.out"
 }
 # own_and_wall <phase>: the wall clock and the runs' own time the log names.
 wall_of() { sed -n "s/^| $1 runs: [0-9]* in \([0-9]*\) s, .*/\1/p" "$work/gate.out"; }
@@ -1746,5 +1751,124 @@ expect "unset, the sandbox has none: the check fails and the gate states no verd
     "$(unset SUPPLY_PA_DEPS; judge "$good" "" "$deps_scenarios")" \
     'exit=6 {"host_fault":true,"scenario":"check-supply-deps.sh'
 expect "and says what the sandbox saw" "$(cat "$work/gate.out")" 'SUPPLY_PA_DEPS is <unset>'
+
+# 20. Host scenario slots: every scenario run takes one of the host's
+# SPAWN_GATE_HOST_JOBS, across gates, so two gates do not each run their own
+# SPAWN_GATE_JOBS. The scenarios note when they start and end (their own
+# clock), which is what this case reads: with one slot the two gates' runs do
+# not overlap, with two they do; a single gate with two jobs gets both slots;
+# and a gate killed outright (its whole process group) leaves no slot held.
+slots=$work/slots
+mkdir -p "$slots"
+cp "$scenarios/protected" "$slots/"
+cat >"$slots/check-slot.sh" <<'SLOT'
+#!/bin/sh
+echo "slot-start $(date +%s%3N)"
+sleep 2
+echo "slot-end $(date +%s%3N)"
+exit 0
+SLOT
+cp "$slots/check-slot.sh" "$slots/check-slot-two.sh"
+# slot_run <tag> <budget> [<jobs>]: one gate's exit status, its log in
+# $work/slots-<tag>.log.
+slot_run() { # <tag> <budget> [<jobs>]
+    status=0
+    # Its own cache root per gate: the budget must not depend on
+    # XDG_CACHE_HOME (the slots are under $HOME), or a hand-run gate with
+    # another cache root would miss it.
+    XDG_CACHE_HOME="$work/caches/slots-$1" SPAWN_GATE_JOBS="${3:-2}" SPAWN_GATE_HOST_JOBS="$2" \
+        sh "$gate" "$repo" "$base" "$good" "$slots" >"$work/slots-$1.log" 2>&1 || status=$?
+    echo "exit=$status"
+}
+# slot_window <log> <n>: the n-th run's start and end, in ms, "start end".
+slot_window() {
+    awk -v want="$2" '
+        /^\| slot-start / { n++; if (n == want) { start = $3; next } }
+        /^\| slot-end / && start != "" { print start, $3; exit }' "$1"
+}
+# overlaps <a-start> <a-end> <b-start> <b-end>: "overlap" or "apart".
+overlaps() {
+    if [ "$1" -lt "$4" ] && [ "$3" -lt "$2" ]; then echo overlap; else echo apart; fi
+}
+slot_run a 1 1 >/dev/null & slot_a=$!
+slot_run b 1 1 >/dev/null & slot_b=$!
+wait "$slot_a" "$slot_b"
+# Both checks run (one scenario each gate), two gates, one slot in all.
+wa=$(slot_window "$work/slots-a.log" 1)
+wb=$(slot_window "$work/slots-b.log" 1)
+[ -n "$wa" ] && [ -n "$wb" ] || { echo "FAIL no scenario run in a log"; exit 1; }
+expect "one host slot: two gates' runs do not overlap" "$(overlaps $wa $wb)" apart
+expect "the budget is in the log" "$(cat "$work/slots-a.log")" \
+    '| host scenario slots: 1 (every gate on this host takes one per scenario run)'
+expect "and the gate that waited says how long, and the slot it took" \
+    "$(cat "$work/slots-a.log" "$work/slots-b.log")" \
+    "for host scenario slot 1 of 1 (shared by every gate on this host)"
+expect "and it was visible while it waited" \
+    "$(cat "$work/slots-a.log" "$work/slots-b.log")" \
+    "waiting for a host scenario slot (all 1 taken, shared by every gate on this host)"
+slot_run c 2 1 >/dev/null & slot_c=$!
+slot_run d 2 1 >/dev/null & slot_d=$!
+wait "$slot_c" "$slot_d"
+expect "two host slots: the same two runs overlap" \
+    "$(overlaps $(slot_window "$work/slots-c.log" 1) $(slot_window "$work/slots-d.log" 1))" overlap
+slot_run e 2 2
+expect "one gate with two jobs gets both slots (no deadlock)" \
+    "$(overlaps $(slot_window "$work/slots-e.log" 1) $(slot_window "$work/slots-e.log" 2))" overlap
+rm -f "$slots/check-slot-two.sh"
+# A gate killed as a whole process group: its scenario dies, the kernel
+# drops its slot, and the next gate takes it at once.
+slowslots=$work/slots-slow
+mkdir -p "$slowslots"
+cp "$scenarios/protected" "$slowslots/"
+printf '#!/bin/sh\nsleep 30\nexit 0\n' >"$slowslots/check-slow.sh"
+killed_pidfile=$work/slots-killed.pid
+rm -f "$killed_pidfile"
+slots_before=$(ls -d "${TMPDIR:-/tmp}"/spawn-gate.* 2>/dev/null || true)
+XDG_CACHE_HOME="$work/caches/slots-kill" SPAWN_GATE_JOBS=1 SPAWN_GATE_HOST_JOBS=1 \
+    setsid sh -c 'echo $$ >"$1"; shift; exec "$@"' _ "$killed_pidfile" \
+    sh "$gate" "$repo" "$base" "$good" "$slowslots" >"$work/slots-killed.log" 2>&1 &
+slot_file=$HOME/.cache/spawn/gate-slots/slot.1
+waited=0
+until [ -s "$killed_pidfile" ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+    [ "$waited" -lt 100 ] || break
+done
+killed_gate=$(cat "$killed_pidfile" 2>/dev/null || true)
+[ -n "$killed_gate" ] || { echo "FAIL the killed gate never started"; exit 1; }
+waited=0
+until ! flock -n "$slot_file" true 2>/dev/null; do
+    sleep 0.1
+    waited=$((waited + 1))
+    [ "$waited" -lt 300 ] || break
+done
+[ "$waited" -lt 300 ] || { echo "FAIL the killed gate never took its slot"; exit 1; }
+# No `--`: this file's sh is dash, whose kill reads "--" as a signal option
+# and (-"$pid" never delivered) left the gate alive. A negative pid names the
+# process group; the gate is its own session leader (setsid above).
+kill -KILL "-$killed_gate" 2>/dev/null || { echo "FAIL the killed gate could not be killed"; exit 1; }
+# The killed gate's scratch is its own (no trap ran): take it, and only it.
+for scratch_dir in "${TMPDIR:-/tmp}"/spawn-gate.*; do
+    [ -e "$scratch_dir" ] || continue
+    case " $slots_before " in
+    *" $scratch_dir "*) ;;
+    *) rm -rf "$scratch_dir" ;;
+    esac
+done
+waited=0
+until flock -n "$slot_file" true 2>/dev/null; do
+    sleep 0.1
+    waited=$((waited + 1))
+    [ "$waited" -lt 100 ] || break
+done
+expect "a killed gate leaves its slot free" "$([ "$waited" -lt 100 ] && echo free || echo held)" free
+printf '#!/bin/sh\nsleep 1\nexit 0\n' >"$slowslots/check-slow.sh"
+killed_run=0
+started=$(date +%s)
+XDG_CACHE_HOME="$work/caches/slots-kill" SPAWN_GATE_JOBS=1 SPAWN_GATE_HOST_JOBS=1 \
+    sh "$gate" "$repo" "$base" "$good" "$slowslots" >"$work/slots-after-kill.log" 2>&1 || killed_run=$?
+expect "and the next gate runs at once: exit 0" "$killed_run" 0
+expect "without waiting for a slot" "$([ $(( $(date +%s) - started )) -lt 20 ] && echo quick)" quick
+refuse "and its log says no wait" "$(cat "$work/slots-after-kill.log")" "waited"
 
 echo "gate: all cases pass"
