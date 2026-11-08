@@ -81,15 +81,22 @@
 # the host's cgroup v2 tree: it is judged outside the gate's sandbox (whose
 # /run is empty, so no user manager is reachable), by the owner (mission 7):
 # the gate gets no delegated cgroup (the owner's ruling, 2026-11-06), and 032's
-# real memory-limit kill is judged the same way. Without one it exits 1
-# with "029: cannot be judged here: ...", never 2: an objective scenario that
-# exits 2 on the base aborts every gate. The units it makes (the slice, the
-# scopes in it, set-property drop-ins under $XDG_RUNTIME_DIR) are named after
-# its run and removed at its end; it never touches another unit.
+# real memory-limit kill is judged the same way. Without one it says so with
+# "029: cannot be judged here: ..." and exits 6 (the gate's cannot_judge
+# exit, scripts/rsi/gate.sh "A scenario that cannot be judged here"), never 1
+# and never 2: a 1 is a regression on every candidate, an objective scenario
+# that exits 2 on the base aborts every gate. An objective-29 task is then
+# never rejected or aborted for this: the gate states the fact, and the
+# integrator records a host fault with the evidence `cannot_judge`. The units
+# it makes (the slice, the scopes in it, set-property drop-ins under
+# $XDG_RUNTIME_DIR) are named after its run and removed at its end; it never
+# touches another unit.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
-# missing or wrong, or it cannot be judged on this host); 2 a harness or
-# infrastructure failure. Any unexpected error exits 2, never 1.
+# missing or wrong); 6 this host cannot judge it (no systemd user manager
+# that delegates the memory controller, no cgroup v2 tree: the gate's
+# cannot_judge exit, never a verdict); 2 a harness or infrastructure failure.
+# Any unexpected error exits 2, never 1.
 # BB_029_MEASURE=1 (only to show today's behaviour) reports every failed
 # check and goes on, then exits 1 if any failed; with no envelope to kill
 # hog's tool it kills hog's engine itself (SIGKILL to the pid the engine
@@ -128,11 +135,13 @@ harness() {
     echo "029: harness: $*" >&2
     exit 2
 }
-# Not judgeable on this host: an assertion (1), never a harness failure (2).
+# Not judgeable on this host: the gate's cannot_judge exit (6), never a
+# harness failure (2), and never an assertion (1: that is a regression on
+# every candidate).
 cannot_judge() {
     asserted=1
     echo "029: cannot be judged here: $*. Resource envelopes are systemd user scopes; this objective is judged outside the gate's sandbox, by the owner (mission 7)." >&2
-    exit 1
+    exit 6
 }
 
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
