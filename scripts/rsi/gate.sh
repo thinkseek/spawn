@@ -34,7 +34,11 @@
 #   `check-*` scenarios are invariants and always must pass. A check that
 #   fails on the candidate is run again there; one that fails twice is run
 #   on the base: passing there, it is a regression (rejected); failing there
-#   too, it is no verdict on the candidate (a host or harness fault: exit 6,
+#   too, it is no verdict on the candidate, and is run on the base once
+#   more: two base runs that exit 1 with the same failing tests (the
+#   `FAILED <test>:` lines check-tests.sh prints) say main is red on the
+#   check (main_red: exit 6 with `on` `main` and the failures); anything
+#   else is a host or harness fault (exit 6, `on` `candidate and base`,
 #   below). One that passes the second time is
 #   a flake, said in the log, and the gate goes on ("Checks run twice"
 #   below).
@@ -190,6 +194,12 @@
 #                              test listing, inside the sandbox (whole number
 #                              from 1); unset by default (cargo's own, every
 #                              core), and 1 for --base-only, whatever is set
+#   SPAWN_GATE_BASE_CHECK      a check's file name (check-<name>.sh, one of
+#                              the scenarios): run on the base before the
+#                              candidate, the main a source was red on
+#                              ("main is red", the integrator sets it): its
+#                              verdict says `base_check` when it passes, and
+#                              two runs that fail alike are main_red (exit 6)
 #   SPAWN_GATE_PG_IMAGE        the test server's docker image: the gate runs a
 #                              server of its own from it (GitHub issue #6),
 #                              and SPAWN_TEST_DATABASE_URL is not used
@@ -418,6 +428,9 @@ verdict() {
     # The checks that failed once and passed again on the candidate (a
     # flake, not a regression), in the log's order.
     [ -n "${flakes-}" ] && json="$json,\"flakes\":[$flakes]"
+    # The check main was red on (SPAWN_GATE_BASE_CHECK), when it passed on
+    # this base before any candidate code ran: main is green on it again.
+    [ -n "${base_check_passed-}" ] && json="$json,\"base_check\":\"$base_check_passed\""
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
@@ -458,6 +471,56 @@ host_fault() {
     fi
     echo "$json"
     exit 6
+}
+
+# main_red <scenario> <runs> <failures file>: main is red on a check, a
+# fact about the base, not a verdict on the candidate (exit 6), written
+# where a verdict would be: `{"host_fault":true,"scenario","on":"main",
+# "runs","reason","failures":[{"test","message"}],"base","candidate"}`. The
+# check failed twice on the base and the two runs share failing tests
+# (shared_failed); <failures file> holds those, `FAILED <test>: <message>`,
+# at most 20 of them in the fact. The integrator tells a red main from a
+# host's fault by the failures' classes and the test server's log, and
+# records `source.main_red` (gate.rs `GateFailure::MainRed`).
+main_red() {
+    if [ -n "$base_only" ]; then
+        echo "| $1 fails on the base twice ($2): main is red on it"
+        exit 4
+    fi
+    stage_close host_fault
+    gate_times
+    stage_emit gate host_fault "$(($(stage_now) - gate_started))" total
+    main_red_list=""
+    while IFS= read -r main_red_line; do
+        main_red_rest=${main_red_line#FAILED }
+        main_red_test=${main_red_rest%%: *}
+        main_red_message=${main_red_rest#*: }
+        [ "$main_red_message" != "$main_red_rest" ] || main_red_message=""
+        main_red_list="$main_red_list${main_red_list:+,}{\"test\":\"$(json_string "$main_red_test")\",\"message\":\"$(json_string "$main_red_message")\"}"
+    done <<EOF_MAIN_RED
+$(head -n 20 "$3")
+EOF_MAIN_RED
+    json="{\"host_fault\":true,\"scenario\":\"$(json_string "$1")\",\"on\":\"main\""
+    json="$json,\"runs\":\"$(json_string "$2")\""
+    json="$json,\"reason\":\"$(json_string "$1 fails on the base twice ($2), with the same failing tests: main is red on it, not a verdict on the candidate")\""
+    json="$json,\"failures\":[$main_red_list]"
+    json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
+    if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
+        printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
+    fi
+    echo "$json"
+    exit 6
+}
+
+# shared_failed <out> <out> <dest>: the `FAILED <test>: …` lines of the first
+# run whose test the second run failed too (check-tests.sh prints one per
+# failing test); <dest> empty when they share none. 0 when they share one.
+shared_failed() {
+    awk '
+        FNR == NR { if ($1 == "FAILED") { t = $2; sub(/:$/, "", t); seen[t] = 1 } next }
+        $1 == "FAILED" { t = $2; sub(/:$/, "", t); if (t in seen && !(t in said)) { said[t] = 1; print } }
+    ' "$2" "$1" >"$3" 2>/dev/null
+    [ -s "$3" ]
 }
 
 # cannot_judge <scenario> <runs>: the scenario says this host cannot judge it
@@ -2626,6 +2689,78 @@ if [ -n "$scenario" ] && [ "$(base_result "$scenario")" = solved ]; then
     exit 0
 fi
 
+# base_ready: the base built and its spawn copied, once for the gate (a
+# check's base run may be the first the gate needs, from several jobs at
+# once: one builds while the others wait on its lock, which a killed job
+# releases; without flock, as for the base cache's lock, they do not wait).
+# 0 = ready.
+base_ready() {
+    if command -v flock >/dev/null 2>&1 && { command exec 7>>"$work/base-build.lock"; } 2>/dev/null; then
+        flock 7
+    fi
+    if [ ! -e "$work/base-built" ]; then
+        if build "$work/baseline" >"$work/base-build.out" 2>&1 &&
+            snapshot_bin "$work/baseline" >>"$work/base-build.out" 2>&1; then
+            : >"$work/base-built"
+        else
+            sed 's/^/| /' "$work/base-build.out" | tail -n 20 >>"$job/text.$job_part"
+        fi
+    fi
+    exec 7>&-
+    [ -e "$work/base-built" ]
+}
+
+# The check main was red on (SPAWN_GATE_BASE_CHECK: the integrator passes
+# it while a source's main is red on a check, design-main-red.md), run on
+# the base before any candidate code: passing, main is green on it again and
+# the verdict says so (`base_check`); failing twice with the same failing
+# tests, main is still red (main_red, exit 6), and no candidate is judged on
+# it; anything else (once and then not, different tests, no room) is
+# neither, said, and the gate judges the candidate as usual.
+base_check_passed=""
+if [ -n "${SPAWN_GATE_BASE_CHECK-}" ]; then
+    base_check_name=$SPAWN_GATE_BASE_CHECK
+    case "$base_check_name" in
+    check-*.sh) base_check_file=$scenarios/$base_check_name ;;
+    *) base_check_file="" ;;
+    esac
+    case "$base_check_name" in */*) base_check_file="" ;; esac
+    if [ -z "$base_check_file" ] || [ ! -f "$base_check_file" ]; then
+        echo "| base check: $base_check_name is no check of this gate's: not run"
+    else
+        section "base: $base_check_name (main was red on it)"
+        job=$jobs_dir/base-check
+        mkdir -p "$job"
+        job_part=0
+        : >"$job/text.0"
+        if ! base_ready; then
+            cat "$job/text.0"
+            echo "| base check: the base cannot be built to run $base_check_name: neither red nor green"
+        else
+            base_check_first=0
+            job_run "$job" 1 "$work/baseline" "$base_check_file" || base_check_first=$?
+            sed 's/^/| /' "$job/log.1" | tail -n 20
+            if [ -e "$job/slot-waited" ]; then
+                echo "| base check: no scenario slot for $base_check_name: neither red nor green"
+            elif [ "$base_check_first" -eq 0 ]; then
+                echo "| base check: $base_check_name passes on the base: main is green on it again"
+                base_check_passed=$base_check_name
+            else
+                base_check_again=0
+                job_run "$job" 2 "$work/baseline" "$base_check_file" || base_check_again=$?
+                sed 's/^/| /' "$job/log.2" | tail -n 20
+                if [ ! -e "$job/slot-waited" ] && [ "$base_check_first" -eq 1 ] &&
+                    [ "$base_check_again" -eq 1 ] &&
+                    shared_failed "$job/out.1" "$job/out.2" "$job/main-red"; then
+                    main_red "$base_check_name" "$base_check_first, then $base_check_again on the base, before the candidate" "$job/main-red"
+                fi
+                echo "| base check: $base_check_name exited $base_check_first, then $base_check_again on the base: neither red nor green"
+            fi
+        fi
+        stage_close ok
+    fi
+fi
+
 section "candidate: build"
 if ! build "$work/candidate"; then
     verdict rejected "candidate does not build"
@@ -2773,9 +2908,27 @@ candidate_job() {
                     job_say "| $(basename "$job_scenario") passes on the base and failed twice on the candidate: a regression"
                     run_status=$again
                 else
-                    job_say "| $(basename "$job_scenario") fails on the base too ($on_base): a host or harness fault, no verdict on the candidate"
-                    printf '%s\n' "$run_status, then $again on the candidate; $on_base on the base" >"$job/runs"
-                    run_status=abort
+                    # Once more on the base: two runs that fail with the same
+                    # failing tests say main is red on the check (main_red),
+                    # not this candidate's doing and not the host's for one
+                    # run; anything else stays the host's or the harness's.
+                    job_say "| == $base_name (again: is main red on it?)"
+                    run_at=$(stage_now)
+                    on_base2=0
+                    job_run "$job" 4 "$work/baseline" "$job_scenario" || on_base2=$?
+                    [ ! -e "$job/slot-waited" ] || return 0
+                    job_output 4
+                    job_stage "$(($(stage_now) - run_at))" "exit $on_base2" "$base_name (again)"
+                    printf '%s\n' "$run_status, then $again on the candidate; $on_base, then $on_base2 on the base" >"$job/runs"
+                    if [ "$on_base" -eq 1 ] && [ "$on_base2" -eq 1 ] &&
+                        shared_failed "$job/out.3" "$job/out.4" "$job/main-red"; then
+                        job_say "| $(basename "$job_scenario") fails on the base twice with the same failing tests: main is red on it, no verdict on the candidate"
+                        run_status=main_red
+                    else
+                        rm -f "$job/main-red"
+                        job_say "| $(basename "$job_scenario") fails on the base too ($on_base, then $on_base2): a host or harness fault, no verdict on the candidate"
+                        run_status=abort
+                    fi
                 fi
                 run_name=$base_name
             fi
@@ -2791,27 +2944,6 @@ candidate_job() {
     echo "$run_name" >"$job/last"
     job_done "$run_status"
 }
-# base_ready: the base built and its spawn copied, once for the gate (a
-# check's base run may be the first the gate needs, from several jobs at
-# once: one builds while the others wait on its lock, which a killed job
-# releases; without flock, as for the base cache's lock, they do not wait).
-# 0 = ready.
-base_ready() {
-    if command -v flock >/dev/null 2>&1 && { command exec 7>>"$work/base-build.lock"; } 2>/dev/null; then
-        flock 7
-    fi
-    if [ ! -e "$work/base-built" ]; then
-        if build "$work/baseline" >"$work/base-build.out" 2>&1 &&
-            snapshot_bin "$work/baseline" >>"$work/base-build.out" 2>&1; then
-            : >"$work/base-built"
-        else
-            sed 's/^/| /' "$work/base-build.out" | tail -n 20 >>"$job/text.$job_part"
-        fi
-    fi
-    exec 7>&-
-    [ -e "$work/base-built" ]
-}
-
 # decisive <job>: 0 when its failure is the verdict: the task scenario's, or
 # a regression's (an objective the base did not leave unsolved).
 decisive() {
@@ -2861,6 +2993,12 @@ candidate_printed() {
         echo "| $(basename "$printed_scenario") cannot be judged here: not a regression"
         run_stage "skipped|$printed_name" "$printed_ms"
         return 0
+    fi
+    if [ "$printed_status" = main_red ]; then
+        run_stage "host_fault|$(cat "$1/last")" "$printed_ms"
+        phase_time candidate
+        echo "| $(basename "$printed_scenario") fails on the base twice with the same failing tests: main is red on it, no verdict"
+        main_red "$(basename "$printed_scenario")" "$(cat "$1/runs" 2>/dev/null)" "$1/main-red"
     fi
     if [ "$printed_status" = abort ]; then
         run_stage "host_fault|$(cat "$1/last")" "$printed_ms"

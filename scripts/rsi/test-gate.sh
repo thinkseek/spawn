@@ -280,13 +280,84 @@ printf '#!/bin/sh\necho "broken: fails on every tree"\nexit 1\n' >"$broken_scena
 printf '#!/bin/sh\nexit 0\n' >"$broken_scenarios/check-tests.sh"
 expect "a check that fails on the candidate and on the base is no verdict" \
     "$(judge "$good" "" "$broken_scenarios")" \
-    'exit=6 {"host_fault":true,"scenario":"check-broken.sh","on":"candidate and base","runs":"1, then 1 on the candidate; 1 on the base"'
+    'exit=6 {"host_fault":true,"scenario":"check-broken.sh","on":"candidate and base","runs":"1, then 1 on the candidate; 1, then 1 on the base"'
 expect "the log says so" "$(cat "$work/gate.out")" \
     'check-broken.sh fails on the candidate and on the base: a host or harness fault, no verdict'
 expect "with every base result cached the base is built for it" \
     "$(judge "$good" "" "$broken_scenarios")" 'exit=6 {"host_fault":true,"scenario":"check-broken.sh"'
 expect "the cached run still judged it on the base" "$(cat "$work/gate.out")" \
-    'check-broken.sh fails on the base too (1)'
+    'check-broken.sh fails on the base too (1, then 1)'
+# 5a'. Main is red on a check (design-main-red.md): a check that fails twice
+# on the candidate and twice on the base, both base runs failing the same
+# tests (check-tests.sh's `FAILED <test>: <message>` lines), is main_red, a
+# fact about main (exit 6, `on` `main`, the shared failures); one whose base
+# runs fail once and then pass, or fail different tests, stays the host's
+# (`candidate and base`). The red check named by SPAWN_GATE_BASE_CHECK runs
+# on the base before the candidate: passing, the verdict says main is green
+# on it again (`base_check`); failing alike, main is still red.
+red_scenarios=$work/red
+cp -r "$scenarios" "$red_scenarios"
+printf '#!/bin/sh\nexit 0\n' >"$red_scenarios/check-tests.sh"
+cat >"$red_scenarios/check-red.sh" <<'EOF'
+#!/bin/sh
+echo "FAILED lib::tests::adds: assertion failed: 1 + 1 == 3"
+echo "FAILED lib::tests::other: boom"
+exit 1
+EOF
+expect "a check failing twice on the base with the same tests is main red" \
+    "$(judge "$good" "" "$red_scenarios")" \
+    'exit=6 {"host_fault":true,"scenario":"check-red.sh","on":"main","runs":"1, then 1 on the candidate; 1, then 1 on the base"'
+expect "naming the failing tests both base runs share" "$(cat "$integrator/verdict")" \
+    '"failures":[{"test":"lib::tests::adds","message":"assertion failed: 1 + 1 == 3"},{"test":"lib::tests::other","message":"boom"}]'
+expect "the log says main is red" "$(cat "$work/gate.out")" \
+    'check-red.sh fails on the base twice with the same failing tests: main is red on it'
+flaky_red=$work/red-flaky
+cp -r "$red_scenarios" "$flaky_red"
+cat >"$flaky_red/check-red.sh" <<'EOF'
+#!/bin/sh
+# On the base, fails its first run only (the base tree is the run's, writable).
+if [ "$PWD" = "$SPAWN_BASELINE_TREE" ]; then
+    [ -f .red-once ] && exit 0
+    : >.red-once
+fi
+echo "FAILED lib::tests::adds: assertion failed"
+exit 1
+EOF
+expect "a base that fails once and then passes is no red main" \
+    "$(judge "$good" "" "$flaky_red")" \
+    'exit=6 {"host_fault":true,"scenario":"check-red.sh","on":"candidate and base","runs":"1, then 1 on the candidate; 1, then 0 on the base"'
+apart_red=$work/red-apart
+cp -r "$red_scenarios" "$apart_red"
+cat >"$apart_red/check-red.sh" <<'EOF'
+#!/bin/sh
+# On the base, a different test fails on each run.
+if [ "$PWD" = "$SPAWN_BASELINE_TREE" ]; then
+    if [ -f .red-once ]; then echo "FAILED lib::tests::second: boom"; exit 1; fi
+    : >.red-once
+fi
+echo "FAILED lib::tests::first: boom"
+exit 1
+EOF
+expect "two base failures that share no test are no red main" \
+    "$(judge "$good" "" "$apart_red")" \
+    'exit=6 {"host_fault":true,"scenario":"check-red.sh","on":"candidate and base","runs":"1, then 1 on the candidate; 1, then 1 on the base"'
+expect "still red on the base before the candidate: main_red, no candidate judged" \
+    "$(SPAWN_GATE_BASE_CHECK=check-red.sh; export SPAWN_GATE_BASE_CHECK; judge "$good" "" "$red_scenarios")" \
+    'exit=6 {"host_fault":true,"scenario":"check-red.sh","on":"main","runs":"1, then 1 on the base, before the candidate"'
+refuse "the candidate was not built" "$(cat "$work/gate.out")" '| == candidate: build'
+green_scenarios=$work/green
+cp -r "$scenarios" "$green_scenarios"
+printf '#!/bin/sh\nexit 0\n' >"$green_scenarios/check-tests.sh"
+printf '#!/bin/sh\necho "lib: all pass"\nexit 0\n' >"$green_scenarios/check-red.sh"
+expect "a later main that passes the red check is green on it, in the verdict" \
+    "$(SPAWN_GATE_BASE_CHECK=check-red.sh; export SPAWN_GATE_BASE_CHECK; judge "$good" "" "$green_scenarios")" \
+    'exit=0 {"verdict":"accepted","base_check":"check-red.sh"}'
+expect "the log says so" "$(cat "$work/gate.out")" \
+    'base check: check-red.sh passes on the base: main is green on it again'
+expect "a base check that is no check of the gate's is not run" \
+    "$(SPAWN_GATE_BASE_CHECK=../check-red.sh; export SPAWN_GATE_BASE_CHECK; judge "$good" "" "$green_scenarios")" \
+    'exit=0 {"verdict":"accepted"}'
+expect "and says so" "$(cat "$work/gate.out")" "base check: ../check-red.sh is no check of this gate's: not run"
 expect "check-tests.sh runs first among the regressions" \
     "$(grep -E '^\| == regression: (check-tests|007)\.sh' "$work/gate.out" | head -n 1)" 'check-tests.sh'
 
@@ -1541,11 +1612,12 @@ cp -r "$scenarios" "$unlisted_scenarios"
 printf '#!/bin/sh\n[ "$(cat "%s/marker" 2>/dev/null)" = here ]\n' "$owner_inputs" \
     >"$unlisted_scenarios/check-owner-inputs.sh"
 # Unseen on the base as on the candidate: the check fails on both, which the
-# gate takes for a harness fault (no verdict, exit 4).
+# gate takes for a harness fault (no verdict, exit 6; it prints no FAILED
+# lines, so it is no red main).
 expect "an unlisted directory under \$HOME is not visible" \
     "$(judge "$good" "" "$unlisted_scenarios")" 'exit=6 {"host_fault":true,"scenario":"check-owner-inputs.sh"'
 expect "on the candidate or the base" "$(cat "$work/gate.out")" \
-    'check-owner-inputs.sh fails on the base too (1)'
+    'check-owner-inputs.sh fails on the base too (1, then 1)'
 listed_inputs=$work/listed-inputs
 cp -r "$unlisted_scenarios" "$listed_inputs"
 printf '# owner inputs\n%s\n' "$owner_inputs" >"$listed_inputs/bind"

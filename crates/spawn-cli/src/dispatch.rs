@@ -83,7 +83,7 @@
 //! keys and tags (docs/fleet-architecture.md §3, docs/design.md §14).
 
 mod charter;
-mod digest;
+pub(crate) mod digest;
 mod jobs;
 #[cfg(test)]
 mod resume_replay;
@@ -425,6 +425,13 @@ pub(crate) enum Why {
     /// scenario of the base exited 1 and then 0, before any candidate code
     /// ran ([`digest::base_disagrees_alerts`], objective 033).
     GateBaseDisagrees,
+    /// Main of a source is red on a check: it failed twice on the base with
+    /// the same failing tests, so its gates wait until main moves
+    /// ([`digest::main_red_news`], told once a red).
+    MainRed,
+    /// Main of a source that was red on a check passes it again
+    /// ([`digest::main_red_news`]).
+    MainGreen,
     /// An open task's step has not moved within its bound ([`stall`]).
     Stalled,
     /// The deployed charter could not be typed into the supervisor's pane:
@@ -472,6 +479,8 @@ impl Why {
                 | Self::Human
                 | Self::GateHostFault
                 | Self::GateBaseDisagrees
+                | Self::MainRed
+                | Self::MainGreen
                 | Self::HoldExpired
                 | Self::ObjectiveSolved
         )
@@ -740,6 +749,10 @@ pub(crate) fn read_plan(
     host.extend(digest::base_disagrees_alerts(&records(
         store.gate_base_disagrees_alerts(),
         "gate base disagreement records",
+    )?));
+    host.extend(digest::main_red_news(&records(
+        store.main_red_news(),
+        "red main records",
     )?));
     host.extend(digest::over_budget_escalations(&records(
         store.over_budget_escalations(),

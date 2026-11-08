@@ -1730,6 +1730,40 @@ are per-agent uids or a mount per engine.
      counting it made a red main (Supply PA's check-tests, 2026-11-09
      00:48-03:42) cap every task's next gate as an abort, feeding the abort
      halt for a fault in no candidate.
+     **Main is red** when a check fails twice on the candidate and then
+     twice on the base, both base runs exit 1, and their `FAILED <test>:`
+     lines share at least one test (the rule "an unsolved result needs two
+     runs that agree", in one gate). The gate states it with its own fact,
+     exit 6 (`{"host_fault":true,"scenario","on":"main","runs","failures":
+     [{"test","message"}]}`, gate.rs `GateFailure::MainRed`). A base whose
+     second run passes, or whose two runs share no failing test, stays `on`
+     `candidate and base`. The integrator believes it only when some failure
+     is classed the work's (host.rs `classify`) and the test server's log
+     shows no crash in the gate's window; otherwise it is a `candidate and
+     base` host fault, as before. A red is one record per source,
+     `source.main_red` (`main`, `scenario`, `failures` with their class),
+     the first of its red carrying `alert`; the store keeps one row per
+     source (`mission_source_reds`; a later red, on the same main or a
+     later one, moves `main` on and keeps `since_ms`, with no new alert) and GATED gives each mission its
+     source's `red`. The task's gate is recorded `host_fault` with evidence
+     `main_red` and `fact.on` `main`: no backoff, no run of host faults, no
+     escalation, never counted toward the cap or a halt.
+     While the source's fetched main is the red one, its gates wait: a
+     ready task stays `reported`, no `task.gated` is written, and the
+     integrator says so once. Each `SPAWN_GATE_MAIN_RED_PROBE_MS` (an hour
+     by default) after the last red or probe, one gate runs anyway, a probe
+     (`source.main_probe`, the store refusing one that is not due, and
+     `probe` on its `task.gated`), so a candidate that fixes main is not
+     starved. While a source is red, every gate on it is given
+     `SPAWN_GATE_BASE_CHECK=<check>`: the gate builds the base first and
+     runs that check on it twice before the candidate. A pass names it in
+     the verdict (`base_check`) and the integrator records
+     `source.main_green`, which deletes the row (with the red's `since_ms`),
+     and the gate goes on judging the candidate as usual. Two failures that
+     agree are the red again, before the candidate is built. A main that
+     moved lifts the hold at once (the next gate runs, with the base check).
+     The supervisor's digest tells a red once (its `alert`) and a green
+     once.
   6. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate

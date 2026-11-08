@@ -739,8 +739,20 @@ pub(crate) struct Verdict {
     /// verdict's `flakes`: a flake, not a regression), in the log's order;
     /// only names of checks (`check-*.sh`) are kept.
     pub(crate) flakes: Vec<String>,
+    /// The check main was red on (`SPAWN_GATE_BASE_CHECK`), when it passed
+    /// on this base before the candidate ran: the verdict's `base_check`, a
+    /// check's file name; main is green on it again.
+    pub(crate) base_check: Option<String>,
     /// Everything the gate printed, stderr marked `! `, the verdict last.
     pub(crate) output: String,
+}
+
+/// One failing test of a red main, as the gate quotes it from the check's
+/// `FAILED <test>: <message>` lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RedFailure {
+    pub(crate) test: String,
+    pub(crate) message: String,
 }
 
 /// Why the gate produced no verdict.
@@ -771,6 +783,18 @@ pub(crate) enum GateFailure {
         /// For `on` `sandbox`, which tree's sandbox never started; None for
         /// the other places.
         tree: Option<SandboxTree>,
+        log: String,
+    },
+    /// Main is red on a check (exit [`HOST_FAULT_EXIT`] with the gate's
+    /// fact `on` `main`): it failed twice on the base with the same failing
+    /// tests, after failing twice on the candidate, or as the red check run
+    /// on the base before it (`SPAWN_GATE_BASE_CHECK`). A fact about the
+    /// source's main, not the work: `scenario` the check, `runs` its exits
+    /// as the gate says them, `failures` the tests both base runs failed.
+    MainRed {
+        scenario: String,
+        runs: String,
+        failures: Vec<RedFailure>,
         log: String,
     },
     /// The host cannot judge the objective's scenario at all (029's systemd
@@ -1206,6 +1230,16 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
         });
     }
     if run.status.code() == Some(HOST_FAULT_EXIT)
+        && let Some((scenario, runs, failures)) = verdict.and_then(main_red)
+    {
+        return Err(GateFailure::MainRed {
+            scenario,
+            runs,
+            failures,
+            log: record(&run.stdout),
+        });
+    }
+    if run.status.code() == Some(HOST_FAULT_EXIT)
         && let Some(scenario) = verdict.and_then(cannot_judge)
     {
         return Err(GateFailure::CannotJudge {
@@ -1244,8 +1278,18 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
         reason: text("reason").unwrap_or_else(|| "gate rejected the candidate".to_string()),
         metric: text("metric"),
         flakes: flakes(&value),
+        base_check: text("base_check").filter(|name| is_check_name(name)),
         output,
     })
+}
+
+/// Whether `name` is a check's file name, `check-<name>.sh` with no path.
+fn is_check_name(name: &str) -> bool {
+    name.strip_prefix("check-")
+        .and_then(|rest| rest.strip_suffix(".sh"))
+        .is_some_and(|stem| !stem.is_empty())
+        && name.len() <= 100
+        && !name.contains('/')
 }
 
 /// The verdict's `flakes`: the names of checks (`check-<name>.sh`, no path)
@@ -1258,13 +1302,7 @@ fn flakes(value: &serde_json::Value) -> Vec<String> {
             names
                 .iter()
                 .filter_map(serde_json::Value::as_str)
-                .filter(|name| {
-                    name.strip_prefix("check-")
-                        .and_then(|rest| rest.strip_suffix(".sh"))
-                        .is_some_and(|stem| !stem.is_empty())
-                        && name.len() <= 100
-                        && !name.contains('/')
-                })
+                .filter(|name| is_check_name(name))
                 .map(str::to_string)
                 .collect()
         })
@@ -1371,6 +1409,54 @@ fn host_fault(file: &str) -> Option<GateFailure> {
         tree,
         log: String::new(),
     })
+}
+
+/// The red-main fact of a verdict file: one JSON line with `host_fault`
+/// true, `on` `main`, a check's name, its runs and at least one failure
+/// (`{"test","message"}`, a test named), and no verdict: `(scenario, runs,
+/// failures)`.
+fn main_red(file: &str) -> Option<(String, String, Vec<RedFailure>)> {
+    let line = file.trim();
+    if line.contains('\n') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("host_fault")?.as_bool() != Some(true)
+        || value.get("verdict").is_some()
+        || value.get("on")?.as_str() != Some("main")
+    {
+        return None;
+    }
+    let scenario = value
+        .get("scenario")?
+        .as_str()
+        .filter(|name| is_check_name(name))?
+        .to_string();
+    let failures: Vec<RedFailure> = value
+        .get("failures")?
+        .as_array()?
+        .iter()
+        .filter_map(|failure| {
+            let test = failure.get("test")?.as_str()?.trim();
+            (!test.is_empty()).then(|| RedFailure {
+                test: test.to_string(),
+                message: failure
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .collect();
+    if failures.is_empty() {
+        return None;
+    }
+    let runs = value
+        .get("runs")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some((scenario, runs, failures))
 }
 
 /// The cannot-judge fact of a verdict file: one JSON line with
@@ -2342,6 +2428,87 @@ mod tests {
     /// The gate's fact of a host fault (scripts/rsi/gate.sh `host_fault`).
     const HOST_FAULT_FACT: &str = "{\"host_fault\":true,\"scenario\":\"012.sh\",\"on\":\"base\",\
          \"runs\":\"1, then 0\",\"reason\":\"012.sh exited 1, then 0 on the base\"}";
+
+    /// Main is red on a check: exit 6 with the gate's fact `on` `main`, a
+    /// check's name and its shared failures; believed only whole (a check's
+    /// name, a failure that names its test) and only with exit 6.
+    #[test]
+    fn exit_6_with_the_main_red_fact_is_main_red() {
+        let fact = "{\"host_fault\":true,\"scenario\":\"check-tests.sh\",\"on\":\"main\",\
+                    \"runs\":\"1, then 1 on the candidate; 1, then 1 on the base\",\
+                    \"reason\":\"r\",\"failures\":[{\"test\":\"api::tests::one\",\
+                    \"message\":\"assertion failed\"},{\"test\":\"\",\"message\":\"x\"}]}";
+        let gate = FakeGate::new(&format!(
+            "echo '| == base: check-tests.sh'\necho '{fact}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
+        ));
+        let Err(GateFailure::MainRed {
+            scenario,
+            runs,
+            failures,
+            log,
+        }) = gate.judge(&path_only())
+        else {
+            panic!("exit 6 with the red fact is main red");
+        };
+        assert_eq!(scenario, "check-tests.sh");
+        assert_eq!(runs, "1, then 1 on the candidate; 1, then 1 on the base");
+        assert_eq!(
+            failures,
+            [super::RedFailure {
+                test: "api::tests::one".to_string(),
+                message: "assertion failed".to_string()
+            }],
+            "a failure without its test is dropped"
+        );
+        assert!(log.contains("| == base: check-tests.sh"), "{log}");
+        for wrong in [
+            fact.replace("check-tests.sh", "011.sh"),
+            fact.replace(
+                "{\"test\":\"api::tests::one\",\"message\":\"assertion failed\"},",
+                "",
+            ),
+            fact.replace("\"on\":\"main\"", "\"on\":\"mainline\""),
+        ] {
+            let gate = FakeGate::new(&format!(
+                "echo '{wrong}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
+            ));
+            assert!(
+                !matches!(gate.judge(&path_only()), Err(GateFailure::MainRed { .. })),
+                "{wrong}"
+            );
+        }
+        let gate = FakeGate::new(&format!("echo '{fact}' >\"$SPAWN_GATE_VERDICT\"\nexit 0\n"));
+        assert!(
+            !matches!(gate.judge(&path_only()), Err(GateFailure::MainRed { .. })),
+            "only with exit 6"
+        );
+    }
+
+    /// A verdict's `base_check`: the red check that passed on the base,
+    /// kept only as a check's name; a verdict without it has none.
+    #[test]
+    fn a_verdict_names_the_red_check_that_passed_on_the_base() {
+        let gate = FakeGate::new(
+            "echo '{\"verdict\":\"accepted\",\"base_check\":\"check-tests.sh\"}' >\"$SPAWN_GATE_VERDICT\"\n",
+        );
+        let verdict = gate.judge(&path_only()).expect("a verdict");
+        assert_eq!(verdict.base_check.as_deref(), Some("check-tests.sh"));
+        for other in ["../check-tests.sh", "011.sh", ""] {
+            let gate = FakeGate::new(&format!(
+                "echo '{{\"verdict\":\"rejected\",\"reason\":\"r\",\"base_check\":\"{other}\"}}' >\"$SPAWN_GATE_VERDICT\"\n"
+            ));
+            assert_eq!(
+                gate.judge(&path_only()).expect("a verdict").base_check,
+                None,
+                "{other}"
+            );
+        }
+        let gate = FakeGate::new("echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n");
+        assert_eq!(
+            gate.judge(&path_only()).expect("a verdict").base_check,
+            None
+        );
+    }
 
     #[test]
     fn exit_6_with_the_host_fault_fact_is_a_host_fault() {

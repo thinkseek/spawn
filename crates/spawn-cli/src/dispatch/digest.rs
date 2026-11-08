@@ -67,6 +67,8 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::GateRoom => "no room for the gate on this host",
         Why::GateHostFault => "host faults at the gate (the host's, not the work's)",
         Why::GateBaseDisagrees => "the base disagreed with itself at the gate (the host's)",
+        Why::MainRed => "a source's main is red on a check (its gates wait)",
+        Why::MainGreen => "a source's main is green again",
         Why::Stalled => "stalled",
         Why::Charter => "new charter not typed",
         Why::BackgroundJob => "background job past its bound",
@@ -304,6 +306,75 @@ pub(crate) fn base_disagrees_alerts(records: &[Value]) -> Vec<Escalation> {
                      code had run, so it is the host's (too loaded or too flaky to judge), not \
                      the work's. It is judged again {due}; nothing is counted and nothing halts. \
                      Check the host's load or tell the owner."
+                ),
+                since_ms: record["at_ms"].as_i64(),
+            })
+        })
+        .collect()
+}
+
+/// The digest items for `records`, the red mains that started and ended
+/// that no delivered digest told yet (`PostgresStore::main_red_news`): a
+/// `source.main_red` with `alert` (the first of its red) is item
+/// `main-red-<event id>` of session `host`, naming the source, its main, the
+/// check, up to [`HOST_FAULT_QUOTED`] of the failing tests and what holds; a
+/// `source.main_green` is `main-green-<event id>`, naming how long it was red.
+/// Each is told once.
+pub(crate) fn main_red_news(records: &[Value]) -> Vec<Escalation> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let id = record["event_id"].as_i64()?;
+            let source = record["source"].as_str()?;
+            let main = record["main"].as_str().unwrap_or("its main");
+            let main = main.get(..12).unwrap_or(main);
+            let scenario = record["scenario"].as_str().unwrap_or("a check");
+            if record["type"] == "source.main_green" {
+                let red_for = match (record["at_ms"].as_i64(), record["since_ms"].as_i64()) {
+                    (Some(at), Some(since)) if at >= since => {
+                        format!(" after {} min", (at - since) / 60_000)
+                    }
+                    _ => String::new(),
+                };
+                return Some(Escalation {
+                    session_id: HOST_SESSION.to_string(),
+                    id: format!("main-green-{id}"),
+                    why: Why::MainGreen,
+                    line: format!(
+                        "main of {source} passes {scenario} again at {main}{red_for}: it is \
+                         green, and its gates run as usual."
+                    ),
+                    since_ms: record["at_ms"].as_i64(),
+                });
+            }
+            if record["type"] != "source.main_red" || record["alert"].as_bool() != Some(true) {
+                return None;
+            }
+            let failures = record["failures"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|failure| {
+                    let test = failure["test"].as_str()?;
+                    let message = failure["message"].as_str().unwrap_or_default();
+                    Some(one_line(&format!("{test}: {message}"), 200))
+                })
+                .take(HOST_FAULT_QUOTED)
+                .collect::<Vec<String>>()
+                .join(" / ");
+            let task = record["task"]
+                .as_i64()
+                .map_or_else(String::new, |task| format!(" (task #{task}'s gate)"));
+            Some(Escalation {
+                session_id: HOST_SESSION.to_string(),
+                id: format!("main-red-{id}"),
+                why: Why::MainRed,
+                line: format!(
+                    "main of {source} ({main}) is red on {scenario}: it failed twice on the \
+                     base with the same failing tests{task}: {failures}. No candidate is to \
+                     blame: the gates on {source} wait until main moves (a probe gate each \
+                     SPAWN_GATE_MAIN_RED_PROBE_MS, an hour by default), nothing is counted and \
+                     nothing halts. Fix main, or tell the owner."
                 ),
                 since_ms: record["at_ms"].as_i64(),
             })
