@@ -328,7 +328,7 @@ struct Fleet {
     /// The delivery waits `SPAWN_DELIVERY_RETRY_SECS` and
     /// `SPAWN_REISSUE_AFTER_SECS` set ([`crate::deliver::Waits`]).
     waits: crate::deliver::Waits,
-    /// The loop's own alerts ([`alerts::Monitor`]): its recods decide
+    /// The loop's own alerts ([`alerts::Monitor`]): its records decide
     /// whether this pass has anything to do, on the same watermark and
     /// due-time rule as the other steps.
     alerting: alerts::Monitor,
@@ -507,6 +507,20 @@ impl Fleet {
                 Err(error) => Fleet::fail(failed, "supervise", &error),
             }
         }
+        // The alerts never fail a pass either: an error is said and tried
+        // again at the next check, like the disk watch's.
+        if self.schedule.alerts.runs(watermark, now) {
+            match self.alerting.check(open) {
+                Ok(more) => {
+                    lines.extend(more);
+                    self.schedule.alerts.ran(watermark, self.alerting.due_ms());
+                }
+                Err(error) => {
+                    lines.push(format!("alerts: {error}"));
+                    self.schedule.alerts.ran(watermark, self.alerting.due_ms());
+                }
+            }
+        }
     }
 
     /// Log a failed step and mark the pass failed.
@@ -567,6 +581,7 @@ mod tests {
             &mut schedule.dispatch,
             &mut schedule.residents,
             &mut schedule.alive,
+            &mut schedule.alerts,
         ] {
             step.ran(watermark, None);
         }
