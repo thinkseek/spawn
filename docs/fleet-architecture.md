@@ -1132,7 +1132,17 @@ the tree's own:
 - it refuses changes to the paths in `<scenarios>/protected` (`rsi/`,
   `scripts/rsi/`, `scripts/blackbox/`, `scripts/e2e.sh`), any build-time code
   (`build.rs`, `.cargo/`, a `build` key in a Cargo.toml), any change to lint
-  configuration, and fewer runnable tests than the base;
+  configuration, fewer runnable tests than the base, and the loss of a base
+  test by name. The owner retires a test with the feature it removed by
+  naming it in `<scenarios>/retired-tests` (one name per line, `#` comments,
+  kept out of the base cache's key), which the gate reads on the host from
+  the scenarios directory it was given: for a mission gate,
+  `rsi/scenarios/retired-tests`, so a retirement there is a commit to the
+  mission's scenarios directory — a landing and a deploy of its own, not a
+  supervisor-side edit; for the owner's gate, the copy of the scenarios
+  directory it passes, `rsi/.gate-owner` in the owner's checkout
+  (gitignored, `.gitignore`), with the file beside that copy's own
+  `protected` — where the list has actually been used;
 - `<scenarios>/build` builds each tree;
 - when a task has a scenario, that scenario must fail on the base (exit 1)
   and pass on the candidate;
