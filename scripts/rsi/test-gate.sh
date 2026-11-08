@@ -9,7 +9,10 @@
 # case 20's killed gate — which no trap cleans up — leaves its scratch in
 # that TMPDIR for the case to remove. (The cleanup removes only the killed
 # gate's own scratch, found by its session, but a private TMPDIR keeps any
-# lapse local.)
+# lapse local.) The TMPDIR must not contain the checkout the gate is run
+# from (so not /data/tmp with the tree at /data/tmp/ccd/...): the gate
+# refuses a tree under the host's TMPDIR, because its sandbox empties that
+# directory whole, and every case would stop at the refusal.
 #
 # usage: scripts/rsi/test-gate.sh
 set -eu
@@ -27,12 +30,13 @@ export SPAWN_GATE_MIN_FREE_GB=0
 # A file in the host's /tmp, which the sandbox must not show.
 marker=$(mktemp /tmp/test-gate-marker.XXXXXX)
 # Background helpers (listeners, fake servers) are killed on exit. One case
-# copies the gate under /var/tmp (a root the sandbox empties); its scratch is
-# removed on exit too, whatever happens in between.
+# copies the gate under /var/tmp and one straight into it (roots the sandbox
+# empties); their scratch is removed on exit too, whatever happens between.
 background=""
 masked=$work/no-masked-root
+bare=$work/no-bare-root
 # shellcheck disable=SC2086 # pids
-trap 'kill $background 2>/dev/null || true; rm -rf "$work" "$marker" "$masked"' EXIT
+trap 'kill $background 2>/dev/null || true; rm -rf "$work" "$marker" "$masked" "$bare"' EXIT
 
 # The owner's home, with secrets the candidate must not read. The gate's base
 # cache goes under it too, never into the real one.
@@ -955,7 +959,14 @@ expect "a miss: another base commit" "$(cat "$work/gate.out")" \
     'from the cache: none; run on the base: 007.sh 011.sh'
 
 gate_copy=$work/gate-copy/scripts
-mkdir -p "$gate_copy/rsi"
+# The gate refuses a tree under the host's TMPDIR (the sandbox empties that
+# directory whole), and $work is under the suite's TMPDIR: the copy is run
+# with a TMPDIR of its own, beside it, so the copy is not inside it.
+gate_tmp=$work/gate-tmp
+mkdir -p "$gate_copy/rsi" "$gate_tmp"
+saved_tmpdir=${TMPDIR-}
+TMPDIR=$gate_tmp
+export TMPDIR
 cp "$(dirname "$gate")"/../*.sh "$gate_copy/"
 cp "$gate" "$(dirname "$gate")/gate-pg.sh" "$gate_copy/rsi/"
 # The suite runs from a deployed controller too, a read-only tree whose
@@ -975,6 +986,8 @@ judge "$good" "" "$keyed" >/dev/null
 gate=$saved_gate
 expect "a miss: the private server's script (gate-pg.sh) changed" "$(cat "$work/gate.out")" \
     'from the cache: none; run on the base: 007.sh 011.sh'
+TMPDIR=$saved_tmpdir
+export TMPDIR
 
 # Another toolchain: a rustc that says another version, first on PATH.
 mkdir -p "$work/other-rust"
@@ -1964,4 +1977,44 @@ out=$(sh "$gate" /nonexistent no-such-commit no-such-commit "$scenarios" 2>&1) |
 expect "a tree under no masked root is not refused" "exit=$status $out" "no commit no-such-commit"
 refuse "and is not refused for its root" "exit=$status $out" "refusing to run from"
 
-echo "gate: all cases pass"
+# A tree copied straight into a root the sandbox empties is in it as much as
+# one under it: /var/tmp itself, not /var/tmp/<something>. The copy goes in
+# /var/tmp/scripts so the gate's root is exactly /var/tmp (mkdir is the
+# exclusion: a directory that is already there is not ours to use, and the
+# case says so rather than removing it).
+if mkdir /var/tmp/scripts 2>/dev/null; then
+    bare=/var/tmp/scripts
+else
+    echo "FAIL a tree copied to /var/tmp itself: /var/tmp/scripts exists"
+    exit 1
+fi
+mkdir -p "$bare/rsi"
+cp "$gate" "$bare/rsi/gate.sh"
+bare_status=0
+bare_out=$(sh "$bare/rsi/gate.sh" 2>&1) || bare_status=$?
+expect "a tree copied to /var/tmp itself: exit 3" "$bare_status" 3
+expect "naming the root itself" "$bare_out" "refusing to run from /var/tmp:"
+expect "and why" "$bare_out" "roots the sandbox empties"
+refuse "and nothing ran" "$bare_out" "=="
+rm -rf "$bare"
+bare=$work/no-bare-root
+
+# The host's TMPDIR is emptied too when it is not /tmp (`sandbox()` masks it
+# whole): a tree under it loses its own scripts the same way. The suite's
+# own TMPDIR is the masked root here — the header requires it private, and
+# under it the suite's scratch already lives.
+case "${TMPDIR:-/tmp}" in
+/tmp | /tmp/)
+    echo "FAIL the host's TMPDIR case needs a private TMPDIR (the header says so)"
+    exit 1
+    ;;
+esac
+tmpdir_tree=$work/masked-tmpdir
+mkdir -p "$tmpdir_tree/scripts/rsi"
+cp "$gate" "$tmpdir_tree/scripts/rsi/gate.sh"
+tmp_status=0
+tmp_out=$(sh "$tmpdir_tree/scripts/rsi/gate.sh" 2>&1) || tmp_status=$?
+expect "a tree under the host's TMPDIR: exit 3" "$tmp_status" 3
+expect "naming the TMPDIR" "$tmp_out" "the host's TMPDIR ($TMPDIR)"
+expect "and why" "$tmp_out" "the sandbox empties too"
+refuse "and nothing ran" "$tmp_out" "=="

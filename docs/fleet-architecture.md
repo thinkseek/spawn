@@ -1257,8 +1257,10 @@ the tree's own:
   never an abort (§10.3). Exit 6 with neither fact is an abort, as is any
   other status: exit 3 (no bwrap, a missing bind directory, an unreadable
   `TMPDIR`, a floor that is not whole GiB, the gate's own tree under `/tmp`,
-  `/run` or `/var/tmp`, which it refuses up front so that no base key is
-  computed from scripts the sandbox empties), exit 4 (a run the gate lost:
+  `/run` or `/var/tmp` — itself or below it — or under the host's `TMPDIR`
+  when that is not `/tmp`, all of which it refuses up front so that no base
+  key is computed from scripts the sandbox empties), exit 4 (a run the gate
+  lost:
   ended without a result),
   a timeout or a signal. The integrator measures the same floor, free
   memory and the test database itself before it starts the gate (§10.3,
