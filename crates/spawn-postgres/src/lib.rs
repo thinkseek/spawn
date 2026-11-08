@@ -9,6 +9,7 @@
 //!
 //! - `event_log`: the [`EventLog`] port.
 //! - `command_queue`: the [`CommandQueue`] port.
+//! - `alerts`: the loop's alert transitions and the alerts they fold into.
 //! - `sessions`: per-session read side over the `agent_*` views.
 //! - `gateway`: grant-filtered reads and submissions for restricted logins.
 //! - `fleet`: the dashboard and dispatcher read model.
@@ -71,6 +72,7 @@ macro_rules! lost_before_ready {
     };
 }
 
+mod alerts;
 mod command_queue;
 mod event_log;
 mod fleet;
@@ -82,12 +84,16 @@ mod scorecard;
 mod sessions;
 mod wake;
 
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+pub use missions::{ActivityEvent, LandingHold};
+=======
 <<<<<<< 5717a8b81b1258edb584141d2964fa3364553668
 pub use missions::{ActivityEvent, LandingHold};
 =======
 pub use missions::LandingHold;
 pub use wake::Listener;
 >>>>>>> 1860071c4915de594d47f690dd83c046e0190ea7
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
 };

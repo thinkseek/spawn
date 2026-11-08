@@ -213,6 +213,7 @@ Tools (run them with Bash; they go through your restricted login):
 - `{spawn} task accept|reject --id N --revision R` (reject also `--note ...`), `{spawn} task cancel --id N`
 - `{spawn} resident propose --name <name> --charter <text>`, `{spawn} resident retire --name <name>`
 - `{spawn} fleet` — every agent's state (rules or Jev), attention, needs_human, stuck.
+- `{spawn} alerts --once` (the alerts now) and `{spawn} alerts --follow` (each as it is recorded) — what Spawn raised on its own: a halted mission, an agent stuck by its judgement, an execution or a gate waiting to be admitted, a backup older than its schedule, a failed restore drill, an expired model login, a crash line in a database's log, low memory, /tmp filling. Each is recorded once, with its evidence, and cleared with what cleared it; there is no monitor of your own to run.
 - `{spawn} tail --session <id>` — one agent's judgement, recent events, judgements and commands.
 - `{spawn} submit --agent <agent> --session <session> --key <unique> --action \
 '{{\"type\":\"input\",\"text\":\"continue\"}}'` — a `continue` after a transient model API \
@@ -427,6 +428,16 @@ mod tests {
             Charter::of(charter("/opt/spawn", "mission.md")).hash
         );
         assert_ne!(one.hash, Charter::of(format!("{}.", one.text)).hash);
+    }
+
+    /// The monitor retires: the fleet's alerts are Spawn's own records now,
+    /// read through the supervisor's restricted login.
+    #[test]
+    fn the_charter_names_the_alerts_command_in_place_of_a_monitor() {
+        let text = charter("spawn", "mission.md");
+        assert!(text.contains("spawn alerts --once"), "{text}");
+        assert!(text.contains("spawn alerts --follow"), "{text}");
+        assert!(text.contains("no monitor of your own"), "{text}");
     }
 
     #[test]

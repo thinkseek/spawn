@@ -486,17 +486,35 @@ select coalesce(jsonb_agg(jsonb_build_object('objective', k.objective, 'metric',
 pub(crate) const OBJECTIVE_OUTCOMES: &str = r"
 select coalesce(jsonb_agg(jsonb_build_object(
          'seq', o.seq, 'type', o.r ->> 'type', 'task', k.id, 'objective', k.objective,
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+         'verdict', o.r ->> 'verdict', 'merge', o.r ->> 'merge', 'yielded', o.r -> 'yielded',
+         'event_id', o.event_id, 'at_ms', o.at_ms,
+         'continues', (o.r ->> 'continues')::bigint, 'chain', o.r -> 'chain',
+         'branch', o.r ->> 'branch', 'commit', o.r ->> 'commit', 'diff', o.r ->> 'diff',
+         'tool_calls', o.r -> 'tool_calls', 'budget', o.r -> 'budget',
+         'reason', o.r ->> 'reason')
+         order by o.seq), '[]'::jsonb)
+  from mission_tasks k
+ cross join lateral (
+   select e.id as event_id, e.recorded_at_ms as at_ms, e.session_seq as seq,
+          e.kind -> 'detail' -> 'record' as r
+=======
          'verdict', o.r ->> 'verdict', 'merge', o.r ->> 'merge', 'yielded', o.r -> 'yielded')
          order by o.seq), '[]'::jsonb)
   from mission_tasks k
  cross join lateral (
    select e.session_seq as seq, e.kind -> 'detail' -> 'record' as r
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
      from spawn_events e
     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
       and e.kind -> 'detail' -> 'record' ->> 'id' = k.id::text
    offset 0) o
  where k.mission_id = $1 and k.objective is not null
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+   and (o.r ->> 'type' in ('task.gated', 'task.aborted', 'task.over_budget')
+=======
    and (o.r ->> 'type' in ('task.gated', 'task.aborted')
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         or (o.r ->> 'type' = 'task.cancelled' and o.r ->> 'yielded' = 'true'))";
 
 /// The yields not told to the supervisor yet: a `task.cancelled` of the
@@ -653,6 +671,10 @@ from (
          m.gate_room_waits, m.gate_room_escalated, m.gate_host_faults, m.gate_host_task,
          m.gate_host_due_ms, m.objectives, m.sources ->> 0 as source,
          (select h.hold from mission_source_holds h where h.source = m.sources ->> 0) as hold,
+         (select max(e.recorded_at_ms) from spawn_events e
+           where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+             and e.kind -> 'detail' -> 'record' ->> 'type' = 'mission.configured'
+             and e.kind -> 'detail' -> 'record' ->> 'id' = m.id::text) as configured_ms,
          coalesce(t.tasks, '[]'::jsonb) as tasks
     from mission_missions m
     left join lateral (
@@ -662,7 +684,8 @@ from (
                'candidate', k.candidate, 'scenario', k.scenario,
                'delivered_at_ms', k.delivered_at_ms, 'objective', k.objective,
                'revisions', k.revisions, 'brief', k.brief, 'report', k.report,
-               'updated_at_ms', k.updated_at_ms, 'held_by', k.held_by)
+               'updated_at_ms', k.updated_at_ms, 'held_by', k.held_by,
+               'continues', k.continues)
                order by k.id) as tasks
         from mission_tasks k
         left join mission_residents r on r.agent_id = k.agent_id
@@ -735,6 +758,33 @@ select coalesce(jsonb_agg((r - 'log') || jsonb_build_object('event_id', e.id,
    and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
    and e.kind -> 'detail' -> 'record' ->> 'escalate' = 'true'
    and not exists (select 1 from told where tag = 'host gate-host-fault-' || e.id)";
+
+/// The `task.over_budget` records that are a second overrun in a chain (a
+/// task that continues an overrun task of its objective, with no configure
+/// between: its `chain` is true), escalated to the supervisor once. A digest that reached the supervisor
+/// carrying the tag `host over-budget-<event_id>` means it was told,
+/// however long ago. Each carries its `event_id`, `at_ms`, its `mission`,
+/// and the record's fields (`id`, `continues`, `objective`, `branch`,
+/// `commit`, `diff`, `tool_calls`, `budget`, `reason`).
+pub(crate) const OVER_BUDGET_ESCALATIONS: &str = r"
+with told as (
+  select distinct tag
+    from spawn_commands d
+   cross join lateral jsonb_array_elements_text(
+           case when jsonb_typeof(d.action -> 'tags') = 'array'
+                then d.action -> 'tags' else '[]'::jsonb end) tag
+   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
+)
+select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.recorded_at_ms,
+                                                  'mission', k.mission_id)
+                          order by e.session_seq), '[]'::jsonb)
+  from spawn_events e
+ cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+  left join mission_tasks k on k.id = (r ->> 'id')::bigint
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.over_budget'
+   and e.kind -> 'detail' -> 'record' ->> 'chain' = 'true'
+   and not exists (select 1 from told where tag = 'host over-budget-' || e.id)";
 
 /// The last `task.gated` record of every task, keyed by task id:
 /// `{"<id>": {verdict, reason, metric, candidate, at_ms}}`. Kept out of
@@ -875,7 +925,24 @@ pub(crate) const FLEET_ALIVE: &str = "select coalesce(sum(least(greatest(gap, 0)
 
 /// The commit of an agent's latest checkpoint (or merge of main): its last
 /// `artifact.committed` event.
+/// When task `$1` went over its budget (`task.over_budget`), or no row: the
+/// chain of overruns a mission.configured resets.
+pub(crate) const OVERRUN_AT: &str = "select recorded_at_ms from spawn_events
+                   where session_id = 'session_control' and event_name = 'control.recorded'
+                     and kind -> 'detail' -> 'record' ->> 'type' = 'task.over_budget'
+                     and kind -> 'detail' -> 'record' ->> 'id' = $1
+                   order by id desc limit 1";
+
+/// An agent's latest checkpoint (`LATEST_CHECKPOINT`)
 pub(crate) const LATEST_CHECKPOINT: &str = "select kind -> 'detail' -> 'artifact' ->> 'commit'
+                   from spawn_events
+                  where agent_id = $1 and event_name = 'artifact.committed'
+                  order by id desc limit 1";
+
+/// An agent's latest checkpoint and when it was recorded, for the work an
+/// overrun task keeps: `{commit, at_ms}`, or no row.
+pub(crate) const CHECKPOINT_AT: &str = "select jsonb_build_object(
+                   'commit', kind -> 'detail' -> 'artifact' ->> 'commit', 'at_ms', recorded_at_ms)
                    from spawn_events
                   where agent_id = $1 and event_name = 'artifact.committed'
                   order by id desc limit 1";
@@ -1078,10 +1145,23 @@ impl PostgresStore {
         scenario: Option<&str>,
         brief: &str,
     ) -> Result<i64, StoreError> {
+        self.objective_assign_continuing(mission, objective, scenario, brief, None)
+    }
+
+    /// Objective `objective`'s task, continuing the overrun task `continues`
+    /// (its work is what the task starts from), or a first task when none.
+    pub fn objective_assign_continuing(
+        &self,
+        mission: i64,
+        objective: i32,
+        scenario: Option<&str>,
+        brief: &str,
+        continues: Option<i64>,
+    ) -> Result<i64, StoreError> {
         Ok(self
             .query_one(
-                "select spawn_objective_assign($1, $2, $3, $4)",
-                &[&mission, &objective, &scenario, &brief],
+                "select spawn_objective_assign($1, $2, $3, $4, $5)",
+                &[&mission, &objective, &scenario, &brief, &continues],
             )?
             .get(0))
     }
@@ -1314,6 +1394,12 @@ impl PostgresStore {
         self.query_json(GATE_HOST_FAULT_ESCALATIONS, &[])
     }
 
+    /// The second overrun of an objective's chain that the supervisor was
+    /// not told of yet ([`OVER_BUDGET_ESCALATIONS`]).
+    pub fn over_budget_escalations(&self) -> Result<Value, StoreError> {
+        self.query_json(OVER_BUDGET_ESCALATIONS, &[])
+    }
+
     /// The `source.hold_expired` records not told to the supervisor yet,
     /// with their holds and waiting tasks ([`HOLD_EXPIRIES`]).
     pub fn hold_expiries(&self) -> Result<Value, StoreError> {
@@ -1362,6 +1448,21 @@ impl PostgresStore {
 
     /// The commit of the agent's latest `artifact.committed` event, if it
     /// has one: what its pushed branch must contain to be landed.
+    /// When task `task` went over its budget (`[`OVERRUN_AT`]`), or null.
+    pub fn overrun_at(&self, task: i64) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .query_opt(OVERRUN_AT, &[&task.to_string()])?
+            .map(|row| row.get(0)))
+    }
+
+    /// An agent's latest checkpoint and when it was recorded
+    /// ([`CHECKPOINT_AT`]), or null.
+    pub fn checkpoint_at(&self, agent: &str) -> Result<Option<Value>, StoreError> {
+        Ok(self
+            .query_opt(CHECKPOINT_AT, &[&agent])?
+            .map(|row| row.get::<_, Value>(0)))
+    }
+
     pub fn latest_checkpoint(&self, agent: &str) -> Result<Option<String>, StoreError> {
         Ok(self
             .query_opt(LATEST_CHECKPOINT, &[&agent])?
@@ -1488,6 +1589,12 @@ impl PostgresStore {
     /// Tasks the dispatcher has to deliver, watch or wind down.
     pub fn delivery_rows(&self) -> Result<Value, StoreError> {
         self.query_json_prepared(DELIVERY_TASKS, &[])
+    }
+
+    /// The latest `source.moved` record, `{id, at_ms}`, or null
+    /// ([`LATEST_SOURCE_MOVED`]).
+    pub fn latest_source_moved(&self) -> Result<Value, StoreError> {
+        self.query_json(LATEST_SOURCE_MOVED, &[])
     }
 
     /// The latest `source.moved` record, `{id, at_ms}`, or null

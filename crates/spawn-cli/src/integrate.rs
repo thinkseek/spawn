@@ -49,6 +49,46 @@
 //!    landing failed may have moved main before its record; it is applied
 //!    or refused by a later pass). A main moved with no record at all (a
 //!    push behind Spawn's back) still halts;
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+//! 2. a delivered task over its mission's budget keeps its work. Its worker
+//!    is stopped (the Stop, and its final checkpoint on the task's branch)
+//!    and the overrun is its own record, `task.over_budget` {`reason`,
+//!    `tool_calls`, `elapsed_ms`, `budget`, and the work it keeps: `branch`,
+//!    `commit`, `diff`} — never `task.aborted`, which keeps its other
+//!    meaning (a landing gone stale after its mission was done). It counts
+//!    toward no halt: `gate_aborts` and `gate_rejections` stay as they were,
+//!    no run of either is broken or started, and the task leaves flight
+//!    without a report or a gate. The record is written once the work has
+//!    reached the source's `spawn/<agent>` (the pusher's head holds the
+//!    final checkpoint, read from the source after the Stop, never
+//!    assumed), so its `commit` and `diff` (`git diff --stat main
+//!    <commit>`) name what the objective's next task continues; when the
+//!    push failed, it says so instead. Its minutes are active time
+//!    ([`active_ms`]): the gaps of its session's events, readings
+//!    (`screen.observed`, `observation.recorded`) left out; a gap counts at
+//!    most `SPAWN_BUDGET_GAP_SECS` (300 s), and only if it ends in the
+//!    model's progress (a tool, a job, a stopped turn), not in a failed
+//!    turn, a prompt or a command; a gap inside a tool or job that ended
+//!    counts while the whole fleet was alive. So no outage (the fleet
+//!    stopped, a frozen host, a dead engine, the model API down) can by
+//!    itself put a task over budget (a subagent's job open across a model
+//!    API outage adds up to its retry window, see [`active_ms`]);
+//!    - the objective's next task continues it (`objectives.rs`): it is
+//!      assigned once the overrun's work is on that branch, its
+//!      `task.assigned` names `continues` (the overrun task) and its brief
+//!      names that task, the branch, the commit and its diff stat, so its
+//!      workspace starts from the work (`main_merge::fork_from_prior`) and
+//!      not from main: 51 minutes of work are continued, not redone;
+//!    - a second overrun of a task that continues one is escalated to the
+//!      supervisor once (`dispatch::digest::over_budget_escalations`, the
+//!      digest tag `host over-budget-<record>`), naming both tasks, the
+//!      objective, the branch and its diff stat, the budget and the tool
+//!      calls, and what can be done; the objective is then held — no task is
+//!      issued for it — until the mission is configured again (a
+//!      `mission.configured` record newer than the overrun's), while the
+//!      mission's other objectives go on with the freed slot. A third
+//!      overrun after such a configure is treated as a first;
+=======
 //! 2. a delivered task over its mission's budget is aborted and its worker
 //!    stopped. Its minutes are active time ([`active_ms`]): the gaps of its
 //!    session's events, readings (`screen.observed`,
@@ -60,6 +100,7 @@
 //!    frozen host, a dead engine, the model API down) can by itself put a
 //!    task over budget (a subagent's job open across a model API outage
 //!    adds up to its retry window, see [`active_ms`]);
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 //! 3. a task whose gate passed is landed (again, after a crash), unless the
 //!    owner holds its source (`spawn mission hold`, a `source.held` record):
 //!    [`land`] reads the hold from the store under the landing lock, before
@@ -606,6 +647,11 @@ pub(crate) struct Mission {
     pub(crate) gate_host_due_ms: Option<i64>,
     #[serde(default)]
     pub(crate) objectives: Option<Value>,
+    /// When the mission was last configured (`mission.configured`), on the
+    /// database's clock: an overrun chain's hold ends with a configure newer
+    /// than its escalated record ([`crate::objectives`]).
+    #[serde(default)]
+    pub(crate) configured_ms: Option<i64>,
     #[serde(default)]
     pub(crate) source: Option<String>,
     /// The owner's active hold on its source (the `source.held` record's
@@ -659,6 +705,11 @@ pub(crate) struct Task {
     /// `task.held`), if any.
     #[serde(default)]
     pub(crate) held_by: Option<i64>,
+    /// The overrun task whose work this one continues (its `task.assigned`
+    /// names it), if any: a second overrun of such a task goes to the
+    /// supervisor and holds its objective.
+    #[serde(default)]
+    pub(crate) continues: Option<i64>,
 }
 
 impl Mission {
@@ -1596,12 +1647,23 @@ impl Integrator {
         Ok(())
     }
 
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+    /// Stop the delivered tasks over budget and record each as its own
+    /// `task.over_budget`, with the work it keeps; the ids of those it
+    /// recorded. A task whose work has not reached its branch yet waits for
+    /// the push ([`kept_work`]) and is recorded by a later pass.
+=======
     /// Abort delivered tasks over budget; the ids of those it aborted.
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
     fn enforce_budget(store: &PostgresStore, mission: &Mission) -> Result<Vec<i64>, String> {
         let Some(budget) = &mission.budget else {
             return Ok(Vec::new());
         };
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+        let mut over: Vec<i64> = Vec::new();
+=======
         let mut aborted = Vec::new();
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
         let gap_ms = budget_gap(crate::config::env_value("SPAWN_BUDGET_GAP_SECS").as_deref())
             .as_millis()
@@ -1625,6 +1687,32 @@ impl Integrator {
                     .fleet_alive_ms(from, to, gap_ms)
                     .map_err(|error| error.to_string())
             })?;
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+            let Some(reason) = over_budget(budget, active, calls) else {
+                continue;
+            };
+            // The Stop first, under its fixed key: if the record then
+            // fails, the next pass finds the task still delivered and
+            // over budget, and submits (a no-op) and records again.
+            stop(store, task)?;
+            let (branch, commit, diff) = match kept_work(store, mission, task)? {
+                // Its work has not reached the source yet: the next pass
+                // records what the pusher's head will hold.
+                Kept::Waiting => continue,
+                Kept::Work {
+                    branch,
+                    commit,
+                    diff,
+                } => (branch, Some(commit), diff),
+                Kept::Lost { branch } => (branch, None, String::new()),
+            };
+            let mut overrun = json!({"type": "task.over_budget", "id": task.id,
+                                     "reason": reason, "tool_calls": calls,
+                                     "elapsed_ms": active, "budget": budget.clone(),
+                                     "branch": branch});
+            if let Some(commit) = &commit {
+                overrun["commit"] = json!(commit);
+=======
             if let Some(reason) = over_budget(budget, active, calls) {
                 // The Stop first, under its fixed key: if the record then
                 // fails, the next pass finds the task still delivered and
@@ -1647,9 +1735,48 @@ impl Integrator {
                     println!("integrate: mission {}: {why}", mission.id);
                 }
                 aborted.push(task.id);
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
             }
+            if !diff.is_empty() {
+                overrun["diff"] = json!(diff);
+            }
+            if let Some(continues) = task.continues {
+                overrun["continues"] = json!(continues);
+                // A second overrun of a chain: a task that continues an
+                // overrun task, while no configure came between (a third
+                // overrun after a configure is a first).
+                let earlier = store
+                    .overrun_at(continues)
+                    .map_err(|error| error.to_string())?;
+                if earlier.is_some_and(|at| {
+                    mission
+                        .configured_ms
+                        .is_none_or(|configured| configured <= at)
+                }) {
+                    overrun["chain"] = json!(true);
+                }
+            }
+            if let Some(objective) = task.objective {
+                overrun["objective"] = json!(objective);
+            }
+            if commit.is_none() {
+                overrun["pushed"] = json!(false);
+            }
+            record(store, &overrun)?;
+            println!(
+                "integrate: task {} over its budget, its work kept on {branch}: {reason}",
+                task.id
+            );
+            if commit.is_none() {
+                eprintln!(
+                    "integrate: task {}: its work never reached {branch} (the push failed): its \
+                     next task is told so",
+                    task.id
+                );
+            }
+            over.push(task.id);
         }
-        Ok(aborted)
+        Ok(over)
     }
 }
 
@@ -2957,6 +3084,92 @@ pub(crate) fn stop_worker(store: &PostgresStore, task: &Task, key: &str) -> Resu
         .submit(&principal, &submission)
         .map(|_| ())
         .map_err(|e| error(&e))
+}
+
+/// The work an overrun task keeps on its branch, once it reached the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Kept {
+    /// The source's `spawn/<agent>` holds the checkpoint: the branch, the
+    /// commit and `git diff --stat main <commit>`.
+    Work {
+        branch: String,
+        commit: String,
+        diff: String,
+    },
+    /// The push has not happened yet: the next pass looks again.
+    Waiting,
+    /// The work never reached the branch (no checkpoint, no source, or the
+    /// push failed): the branch alone is named, and the next task is told so.
+    Lost { branch: String },
+}
+
+/// How long a Stop's final checkpoint may take to reach the source before
+/// the work counts as lost (the pusher pushes within its interval, and
+/// retries a failed push): `SPAWN_KEPT_WAIT_SECS`, a whole number of
+/// seconds from 1 up; anything else is 30.
+pub(crate) fn kept_wait_ms(text: Option<&str>) -> i64 {
+    const DEFAULT: i64 = 30;
+    text.and_then(|text| text.trim().parse::<i64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT)
+        .saturating_mul(1_000)
+}
+
+/// Whether the source's `spawn/<agent>` holds `commit` (its ancestry), read
+/// from the source itself, never assumed.
+fn source_holds(source: &str, agent: &str, commit: &str) -> bool {
+    sources::git(&[
+        "--git-dir",
+        source,
+        "merge-base",
+        "--is-ancestor",
+        commit,
+        &format!("refs/heads/spawn/{agent}"),
+    ])
+    .is_ok()
+}
+
+/// `git diff --stat main <commit>` in the source, the work's shape for the
+/// task that continues it.
+fn diff_stat(source: &str, commit: &str) -> String {
+    sources::git(&["--git-dir", source, "diff", "--stat", "main", commit])
+        .map(|text| text.trim_end().to_string())
+        .unwrap_or_default()
+}
+
+/// The work `task` keeps on its branch: [`Kept`].
+fn kept_work(store: &PostgresStore, mission: &Mission, task: &Task) -> Result<Kept, String> {
+    let branch = format!("spawn/{}", task.agent_id);
+    let Some(source) = mission.source.as_deref() else {
+        return Ok(Kept::Lost { branch });
+    };
+    let wait_ms = kept_wait_ms(crate::config::env_value("SPAWN_KEPT_WAIT_SECS").as_deref());
+    let Some(checkpoint) = store
+        .checkpoint_at(&task.agent_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(Kept::Lost { branch });
+    };
+    let commit = checkpoint["commit"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let at_ms = checkpoint["at_ms"].as_i64().unwrap_or_default();
+    if commit.is_empty() {
+        return Ok(Kept::Lost { branch });
+    }
+    if source_holds(source, &task.agent_id, &commit) {
+        return Ok(Kept::Work {
+            diff: diff_stat(source, &commit),
+            branch,
+            commit,
+        });
+    }
+    let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+    if now - at_ms >= wait_ms {
+        return Ok(Kept::Lost { branch });
+    }
+    Ok(Kept::Waiting)
 }
 
 /// A path through the controller's symlink (`controllers/<name>` in the
@@ -6843,16 +7056,69 @@ mod database_tests {
             tool_work(&db, task, delivered + 5_000, now);
         };
         overrun(&first);
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+        overrun(&other);
+        let over =
+            Integrator::enforce_budget(&db.store, &snapshot(&db, mission)).expect("the budget");
+        assert_eq!(over, vec![first.id, other.id]);
+=======
         // 025's first abort: under the limit, a plain abort.
         overrun(&other);
         let aborted =
             Integrator::enforce_budget(&db.store, &snapshot(&db, mission)).expect("the budget");
         assert_eq!(aborted, vec![first.id, other.id]);
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         let record = |task: i64| -> Value {
             db.admin()
                 .query_one(
                     "select kind -> 'detail' -> 'record' from spawn_events
                       where session_id = 'session_control'
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+                        and kind -> 'detail' -> 'record' ->> 'type' = 'task.over_budget'
+                        and kind -> 'detail' -> 'record' ->> 'id' = $1",
+                    &[&task.to_string()],
+                )
+                .expect("the overrun")
+                .get(0)
+        };
+        // An overrun is its own record, at the attempt limit too: no abort,
+        // no yield, no counter.
+        for task in [first.id, other.id] {
+            let overrun = record(task);
+            assert!(overrun["tool_calls"].as_i64().unwrap_or_default() > 0);
+            assert_eq!(overrun["budget"], json!({"minutes": 60}));
+            assert_eq!(
+                overrun["objective"].as_u64(),
+                objective_of(&db, task).and_then(|objective| u64::try_from(objective).ok())
+            );
+        }
+        let aborts: i64 = db
+            .admin()
+            .query_one(
+                "select count(*) from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = 'task.aborted'",
+                &[],
+            )
+            .expect("the aborts")
+            .get(0);
+        assert_eq!(aborts, 0, "an overrun is no abort");
+        assert_eq!(
+            gate_counters(&db, mission),
+            (0, 0),
+            "an overrun is no gate abort"
+        );
+        let told = db.store.objective_yields().expect("the yields to tell");
+        assert!(
+            told.as_array().expect("a list").is_empty(),
+            "an overrun yields nothing"
+        );
+
+        // The next pass assigns 023's continuation of the overrun, and 025
+        // gets its slot when one is free.
+        pass();
+        let mut flying: Vec<u32> = flying(&db, mission)
+=======
                         and kind -> 'detail' -> 'record' ->> 'type' = 'task.aborted'
                         and kind -> 'detail' -> 'record' ->> 'id' = $1",
                     &[&task.to_string()],
@@ -6885,10 +7151,20 @@ mod database_tests {
         // Both slots free: 025 (one failure, no yield) first, then 023.
         pass();
         let flying: Vec<u32> = flying(&db, mission)
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
             .iter()
             .filter(|(task, _)| *task != first.id && *task != other.id)
             .map(|(_, objective)| *objective)
             .collect();
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+        flying.sort_unstable();
+        assert_eq!(flying, [23, 25], "the continuation of the overrun, and 025");
+        let again = objective_task(&db, mission, 23);
+        assert_eq!(
+            continues_of(&db, again.id),
+            Some(first.id),
+            "023's task continues the overrun"
+=======
         assert_eq!(flying, [25, 23]);
         let again = objective_task(&db, mission, 23);
         assert!(pass().is_empty(), "nothing yields, no slot is free");
@@ -6896,6 +7172,7 @@ mod database_tests {
             task_state(&db, mission, again.id),
             "assigned",
             "023's new task stays"
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -6932,13 +7209,178 @@ mod database_tests {
             .expect("deliver 70 minutes ago");
         tool_work(&db, &task, delivered + 5_000, now);
         let pass = snapshot(&db, mission);
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+        let over = Integrator::enforce_budget(&db.store, &pass).expect("the budget");
+        assert_eq!(over, vec![task.id]);
+        let settled = over.into_iter().collect();
+=======
         let aborted = Integrator::enforce_budget(&db.store, &pass).expect("the budget");
         assert_eq!(aborted, vec![task.id]);
         let settled = aborted.into_iter().collect();
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         assert!(
             crate::objectives::assign_next(&db.store, &pass, &settled)
                 .expect("the same pass")
                 .is_empty(),
+<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
+            "nothing in the pass that overran"
+        );
+        // The next pass assigns the overrun's continuation, and it says so:
+        // the work is continued, not redone.
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
+            .expect("the next pass");
+        let next: Vec<(i64, u32)> = flying(&db, mission)
+            .into_iter()
+            .filter(|(id, _)| *id != task.id)
+            .collect();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].1, 23, "the overrun's objective, continued");
+        let again = objective_task(&db, mission, 23);
+        assert_eq!(continues_of(&db, again.id), Some(task.id));
+        let brief = again.brief;
+        assert!(
+            brief.contains(&format!("continues task #{}", task.id)),
+            "{brief}"
+        );
+        assert!(
+            brief.contains(&format!("- task {}: cancelled", task.id)),
+            "the overrun task is the work the brief says ended: {brief}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A mission's run of gate aborts and rejections.
+    fn gate_counters(db: &Db, mission: i64) -> (i32, i32) {
+        let row = db
+            .admin()
+            .query_one(
+                "select gate_aborts, gate_rejections from mission_missions where id = $1",
+                &[&mission],
+            )
+            .expect("the mission");
+        (row.get(0), row.get(1))
+    }
+
+    /// The objective a task pursues, as the store folded it.
+    fn objective_of(db: &Db, task: i64) -> Option<i64> {
+        db.admin()
+            .query_one(
+                "select objective from mission_tasks where id = $1",
+                &[&task],
+            )
+            .expect("the task")
+            .get::<_, Option<i32>>(0)
+            .map(i64::from)
+    }
+
+    /// The task a continuation continues, as the store folded it.
+    fn continues_of(db: &Db, task: i64) -> Option<i64> {
+        db.admin()
+            .query_one(
+                "select continues from mission_tasks where id = $1",
+                &[&task],
+            )
+            .expect("the task")
+            .get(0)
+    }
+
+    /// An overrun counts toward no halt: three in a row leave the mission's
+    /// counters alone, and each task leaves flight.
+    #[test]
+    fn three_overruns_halt_nothing() {
+        let db = Db::new("overrun_halt");
+        let (base, source, scenarios, _integrator) = world("overrun-halt", "#!/bin/sh\nexit 0\n");
+        let mission = db.gated_mission(&source, &scenarios);
+        let mut tasks = Vec::new();
+        for worker in ["a", "b", "c"] {
+            let task = db
+                .store
+                .task_assign(mission, "ephemeral", worker, "brief", "default")
+                .expect("assign");
+            db.store.task_delivered(task, 1).expect("delivered");
+            db.record(&json!({"type": "task.over_budget", "id": task,
+                              "reason": "the task made more than 5 tool calls",
+                              "tool_calls": 6, "elapsed_ms": 1_000,
+                              "budget": {"tool_calls": 5}}));
+            tasks.push(task);
+        }
+        let row = snapshot(&db, mission);
+        assert_eq!((row.gate_aborts, row.gate_rejections), (0, 0));
+        assert_eq!(
+            super::halt_reason(&row, 0),
+            None,
+            "no halt counts an overrun"
+        );
+        for task in tasks {
+            let state: String = db
+                .admin()
+                .query_one("select state from mission_tasks where id = $1", &[&task])
+                .expect("the task")
+                .get(0);
+            assert_eq!(state, "cancelled", "an overrun leaves flight");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The work an overrun keeps: its branch's commit and that commit's
+    /// diff stat against main; waited for while the push is pending, and
+    /// lost (said so) when it never reaches the source.
+    #[test]
+    fn an_overrun_keeps_the_work_its_branch_holds() {
+        let db = Db::new("overrun_kept");
+        let (base, source, scenarios, _integrator) = world("overrun-kept", "#!/bin/sh\nexit 0\n");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = ready_task(&db, db.reported_task(mission, "kept"));
+        let clone = base.join("kept-clone");
+        let clone_path = clone.to_string_lossy().to_string();
+        git(&["clone", "-q", &source, &clone_path]).expect("clone");
+        std::fs::write(clone.join("big.txt"), "line\n").expect("write");
+        super::tests::commit_in(&clone_path, "the big work");
+        let commit = git(&["-C", &clone_path, "rev-parse", "HEAD"]).expect("head");
+        git(&[
+            "-C",
+            &clone_path,
+            "push",
+            "-q",
+            "origin",
+            &format!("{commit}:refs/heads/spawn/{}", task.agent_id),
+        ])
+        .expect("push the branch");
+        let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+        checkpoint(&db, &task, now, &commit, "tool_completed");
+        let row = snapshot(&db, mission);
+        let kept = super::kept_work(&db.store, &row, &task).expect("the work");
+        let super::Kept::Work {
+            branch,
+            commit: kept_commit,
+            diff,
+        } = kept
+        else {
+            panic!("the branch holds it: {kept:?}");
+        };
+        assert_eq!(branch, format!("spawn/{}", task.agent_id));
+        assert_eq!(kept_commit, commit);
+        assert!(
+            diff.contains("big.txt") && diff.contains("insertion"),
+            "{diff}"
+        );
+        // A checkpoint the pusher has not made it there yet: wait, until
+        // the push has had its time, then say it was lost.
+        let unpushed = "0123456789abcdef0123456789abcdef01234567";
+        checkpoint(&db, &task, now, unpushed, "tool_completed");
+        assert_eq!(
+            super::kept_work(&db.store, &row, &task).expect("kept"),
+            super::Kept::Waiting
+        );
+        checkpoint(&db, &task, now - 120_000, unpushed, "tool_completed");
+        assert!(
+            matches!(
+                super::kept_work(&db.store, &row, &task).expect("kept"),
+                super::Kept::Lost { .. }
+            ),
+            "a push that never came is lost"
+        );
+=======
             "nothing in the pass that aborted"
         );
         crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
@@ -6951,6 +7393,7 @@ mod database_tests {
         assert_eq!(next, [25], "the fewest attempts, not the aborted objective");
         let brief = objective_task(&db, mission, 25).brief;
         assert!(!brief.contains("Earlier tasks"));
+>>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         let _ = std::fs::remove_dir_all(&base);
     }
 
