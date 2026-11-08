@@ -47,8 +47,13 @@
 # from two runs that agree) = unsolved, anything else is a host fault (exit
 # 6 with its fact in the verdict file, no verdict: the integrator records
 # `host_fault`, retried after a backoff and counted toward no halt, never a
-# skip). Exit 4 is left for a run the gate itself lost (ended without a
-# result). The base's
+# skip). The one other shape is objective 033's: a first run that exits 1
+# and a second that exits 0 (a base that disagrees with itself) keeps the
+# gate's own pair of lines and exit 4, which the integrator records as
+# `base_disagrees`, also a host fault counted toward no halt; the pair and
+# exit 4 are 033's statement of it, one run is one record, never the host
+# fact too. Apart from that pair, exit 4 is left for a run the gate itself
+# lost (ended without a result). The base's
 # runs all end before the candidate builds; within each phase, scenarios run
 # SPAWN_GATE_JOBS at a time, the log and the verdict still the serial
 # order's ("Parallel runs" below). Results are

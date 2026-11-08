@@ -1405,11 +1405,15 @@ pub(crate) fn host_fault_cap(text: Option<&str>) -> u32 {
 /// before any candidate code ran). Those never count toward a halt, so the
 /// cap neither counts nor caps them ([`HOST_FAULT_CAP`]).
 fn base_only_fault(fields: &Value) -> bool {
-    fields
-        .get("fact")
-        .and_then(|fact| fact.get("on"))
-        .and_then(Value::as_str)
-        == Some("base")
+    // Objective 033's evidence is a base that disagreed with itself, before
+    // any candidate code; the gate's own fact names `on` `base`. Either is a
+    // base-only fault: neither counts toward the cap nor is ever capped.
+    fields.get("evidence").and_then(Value::as_str) == Some(BASE_DISAGREES)
+        || fields
+            .get("fact")
+            .and_then(|fact| fact.get("on"))
+            .and_then(Value::as_str)
+            == Some("base")
 }
 
 /// The `aborted` record of a host fault past the cap: `faults` host faults
@@ -9435,6 +9439,61 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Objective 033's evidence beside the cap (this objective's): a base
+    /// that disagreed with itself is a base-only fault, before any candidate
+    /// code, so it counts toward no halt and never reaches
+    /// `SPAWN_GATE_HOST_FAULT_CAP`: with the cap at 2, four disagreements in
+    /// a row are `host_fault` every time, `base_disagrees` every time, and
+    /// the task never aborts (the store's count leaves them out too).
+    #[test]
+    fn base_disagreements_never_reach_the_cap() {
+        let gate = "echo '| == base: 011.sh'\n\
+                    echo '| 011.sh exited 1, then 0 on the base: a harness error, not a verdict; the gate aborts'\n\
+                    echo '| stage gate aborted 12003ms base: 011.sh again (unsolved needs two runs that agree)'\n\
+                    exit 4\n";
+        let (base, source, scenarios, mut integrator) = world("base-disagrees-cap", gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_secs(1),
+            cap: 2,
+        };
+        let db = Db::new("base_disagrees_cap");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        let mut due = None;
+        for round in 0..4 {
+            if let Some(due) = due {
+                let left = due - super::now_ms();
+                if left > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        u64::try_from(left).unwrap_or(0) + 50,
+                    ));
+                }
+            }
+            integrator.pass_on(&db.store).expect("a pass");
+            integrator.settle();
+            let record = last_verdict(&db).0;
+            assert_eq!(record["verdict"], "host_fault", "round {round}: {record}");
+            assert_eq!(record["evidence"], "base_disagrees", "{record}");
+            due = record["due_ms"].as_i64();
+        }
+        assert_eq!(
+            db.store.task_host_faults(task, 0).expect("count"),
+            0,
+            "a base's disagreement is not counted"
+        );
+        let after = gated(&db, mission);
+        assert_eq!(after.gate_aborts, 0);
+        assert_eq!(after.gate_host_faults, 4, "each one a run");
+        assert_eq!(after.gate_base_disagrees, 4, "each one a disagreement");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Objective 20 beside main's `no-test-database`: a mission whose gate
     /// needs no test database has no host faults. Its check-tests.sh
     /// failures, connection errors though they are, stay a rejection.
@@ -9521,6 +9580,7 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         integrator.judge.host = super::HostSettings {
             server_log: None,
             backoff: std::time::Duration::from_secs(2),
+            cap: super::HOST_FAULT_CAP,
         };
         let db = Db::new("base_disagrees_pass");
         let mission = db.gated_mission(&source, &scenarios);

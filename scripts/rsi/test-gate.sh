@@ -1149,9 +1149,13 @@ cat >"$task_scenarios/012.sh" <<'EOF'
 exit 1
 EOF
 server reset >/dev/null
+# Objective 033's disagreement keeps its own statement: exit 4 and the pair,
+# never a host-fault fact (one run is one record; gate.rs tells them apart).
 expect "an unsolved result needs two runs that agree" \
-    "$(judge "$good" "$task_scenarios/012.sh" "$task_scenarios")" \
-    'exit=6 {"host_fault":true,"scenario":"012.sh","on":"base","runs":"1, then 0"'
+    "$(judge "$good" "$task_scenarios/012.sh" "$task_scenarios")" 'exit=4 '
+refuse "and no host-fault fact is written" "$(cat "$integrator/verdict" 2>/dev/null || true)" 'host_fault'
+expect "the base's disagreement is said as 033 says it" "$(cat "$work/gate.out")" \
+    '012.sh exited 1, then 0 on the base: a harness error, not a verdict; the gate aborts'
 expect "the flake is named" "$(cat "$work/gate.out")" 'exited 1, then 0 on the base'
 unset SPAWN_TEST_DATABASE_URL
 
