@@ -1396,46 +1396,13 @@ fn rsi_pane(query: &str) -> Result<Value, String> {
 /// fleet health, the decision ladder and each gated mission's gate-room
 /// waits. Computed by SQL from storage, except what the host has now, read
 /// at this request: the health's `disk` (free space, [`crate::disk::report`])
-/// and `memory` (`/proc/meminfo`, [`crate::memory::report`]), and each live
-/// execution's resource envelope (its scope's cgroup, [`crate::envelope`]:
-/// objective 029) beside the slice's.
+/// and `memory` (`/proc/meminfo`, [`crate::memory::report`]).
 fn fleet() -> Result<Value, String> {
     let store = open_store()?;
     let mut health = store.fleet_health().map_err(err)?;
     health["disk"] = crate::disk::report(&store.host_disk().map_err(err)?);
     health["memory"] = crate::memory::report();
     let mut agents = store.fleet_board().map_err(err)?;
-    let envelopes = crate::envelope::Runtime::from_env().ok();
-    let envelope = envelopes.as_ref().and_then(|runtime| runtime.envelope());
-    let waits = store.admissions().map_err(err)?;
-    if let Some(rows) = agents.as_array_mut() {
-        crate::envelope::fleet(envelope, rows);
-        crate::envelope::admissions(rows, &waits);
-    }
-    let gates: Vec<Value> = waits
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|wait| wait["kind"] == "gate")
-        .cloned()
-        .collect();
-    health["admission_gates"] = json!(gates);
-    health["envelope"] = crate::envelope::host_measure();
-    health["envelope"]["state"] = match (&envelopes, envelope) {
-        (Some(_), Some(_)) => json!("systemd"),
-        (Some(runtime), None) => runtime.record_value()["state"].clone(),
-        (None, _) => json!("unavailable"),
-    };
-    if let Some(envelope) = envelope {
-        health["envelope"]["slice"] = json!({
-            "name": envelope.settings.slice,
-            "memory_high": envelope.settings.slice_high,
-            "memory_max": envelope.settings.slice_max,
-            "cpu_weight": envelope.settings.cpu_weight,
-            "execution_memory_max": envelope.settings.execution.max,
-            "gate_memory_max": envelope.settings.gate.max,
-        });
-    }
     labels::label_fleet(&mut agents, &label_context(&store)?);
     Ok(json!({
         "agents": agents,

@@ -79,6 +79,7 @@ mod fleet;
 mod gateway;
 mod host;
 mod missions;
+mod recovery;
 mod row;
 mod scorecard;
 mod sessions;
@@ -108,7 +109,11 @@ fn backend(error: &postgres::Error) -> StoreError {
             )),
         };
     }
-    StoreError::Backend(error.to_string())
+    // No server-side error: the server did not answer (a connection cut, a
+    // refused connect, a timeout). The work is not at fault, and the loop
+    // waits for the database instead of ending (crate::port's
+    // `is_unreachable`).
+    StoreError::Unreachable(error.to_string())
 }
 
 /// PostgreSQL store.
@@ -128,13 +133,6 @@ pub struct PostgresStore {
 /// `spawn_human_input`) as `human`. Their passwords derive from the owner's
 /// ([`role_url`]) and are set on every migration.
 const LOGINS: [&str; 3] = ["spawn_supervisor", "spawn_reader", "spawn_human"];
-
-impl std::fmt::Debug for PostgresStore {
-    /// The store names itself, never its connection's password.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("PostgresStore")
-    }
-}
 
 impl PostgresStore {
     /// Connect to the database in the URL.
@@ -713,6 +711,15 @@ impl PostgresStore {
     /// typically a `jsonb` aggregate.
     fn query_json(&self, sql: &str, params: &Params<'_>) -> Result<serde_json::Value, StoreError> {
         Ok(self.query_one(sql, params)?.get(0))
+    }
+
+    /// [`Self::query_json`] for a query that may return no row.
+    fn query_opt_json(
+        &self,
+        sql: &str,
+        params: &Params<'_>,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        Ok(self.query_opt(sql, params)?.map(|row| row.get(0)))
     }
 
     /// Rows changed.

@@ -320,6 +320,15 @@ from (
                     and c.action ->> 'type' = 'input' and t.hash is not null
                     and c.id > coalesce(born.command_id, 0)))
     end as charter,
+    -- The recovery recorded this execution's interruption: it, not the
+    -- one-resume rule below, is what brings the worker back (crate
+    -- spawn-cli's `recover`).
+    (select max(r.id) from spawn_events r
+      where r.session_id = 'session_control' and r.event_name = 'control.recorded'
+        and r.kind -> 'detail' -> 'record' ->> 'type' = 'execution.interrupted'
+        and r.kind -> 'detail' -> 'record' ->> 'session_id' = s.session_id
+        and r.kind -> 'detail' -> 'record' ->> 'execution_id' = s.execution_id)
+      as recovered,
     (select jsonb_build_object(
               'execution_id', x.execution_id,
               'command_id', c.id,

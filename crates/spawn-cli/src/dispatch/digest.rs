@@ -165,15 +165,7 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
             let crash = quoted(&record["crash"], &|line| {
                 line.as_str().map(|line| one_line(line, 300))
             });
-            let evidence = if record["evidence"] == "memory_limit" {
-                // A gate its own resource envelope killed (objective 029).
-                format!(
-                    "the gate was killed by its memory limit (MemoryMax {} bytes, \
-                     {} kills), not a verdict on the work",
-                    record["memory_max"].as_u64().unwrap_or_default(),
-                    record["oom_kills"].as_u64().unwrap_or_default()
-                )
-            } else if crash.is_empty() {
+            let evidence = if crash.is_empty() {
                 let failures = record["failures"].as_array().map_or(0, Vec::len);
                 format!(
                     "every check-tests.sh failure ({failures}) was a connection error to the \
@@ -200,9 +192,8 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                 line: format!(
                     "task #{task} of {mission}: {faults} gate failures in a row were the \
                      host's, not the work's: {evidence}. It is judged again {due}; nothing is \
-                     counted and nothing halts. Check the host's memory and swap (the \
-                     executor's envelope) or the test database's host (its memory, /dev/shm, \
-                     its log), or tell the owner."
+                     counted and nothing halts. Check the test database's host (its memory, \
+                     /dev/shm, its log) or tell the owner."
                 ),
                 since_ms: record["at_ms"].as_i64(),
             })

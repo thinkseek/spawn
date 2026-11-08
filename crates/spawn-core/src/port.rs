@@ -35,6 +35,24 @@ pub enum StoreError {
     /// The backend failed.
     #[error("storage backend failure: {0}")]
     Backend(String),
+    /// The database could not be reached: no server answered, the
+    /// connection was cut, or the connect itself failed. It is not a
+    /// verdict on the work: the engines run on, and the loop that reads the
+    /// store waits for it instead of ending ([`UNREACHABLE`]).
+    #[error("{UNREACHABLE}: {0}")]
+    Unreachable(String),
+}
+
+/// The prefix of every [`StoreError::Unreachable`]: what a caller holding
+/// only the error's text reads to tell "the database is not there" from
+/// "the database said no" (`is_unreachable`).
+pub const UNREACHABLE: &str = "database unreachable";
+
+/// Whether an error's text is a [`StoreError::Unreachable`]: the store
+/// could not be reached, so the pass that failed says nothing about the
+/// fleet and must be retried rather than counted as a failed one.
+pub fn is_unreachable(error: &str) -> bool {
+    error.contains(UNREACHABLE)
 }
 
 /// Append-only event log with per-session and global order.
@@ -485,6 +503,16 @@ pub trait TerminalHost: Send + Sync {
         workspace: &WorkspaceId,
     ) -> Result<bool, TerminalError>;
 
+    /// Whether the terminal server that holds the terminals is there. A
+    /// host whose terminals share one server (tmux) that has gone took
+    /// every terminal in it with it, which is how a host restart is told
+    /// from one terminal that vanished ([`crate::event::EndCause`], and the
+    /// recovery's `host_restart`). A host that cannot tell answers true:
+    /// an execution then reads as crashed, never as a host restart.
+    fn server_alive(&self) -> bool {
+        true
+    }
+
     /// Whether the terminal hosts the runner this host started in it
     /// ([`Self::start`]), alive: what the Bridge asks before it calls an
     /// execution running or types into it. A terminal of that name can
@@ -584,45 +612,4 @@ pub trait TranscriptArchive: Send + Sync {
         at: u64,
         bytes: &[u8],
     ) -> Result<(), ArchiveError>;
-}
-
-/// One record written to the control stream, as the store made it: its
-/// event's id and the time the append gave it (the database's clock).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Recorded {
-    /// The event's id.
-    pub id: i64,
-    /// The event's `recorded_at_ms`.
-    pub at_ms: i64,
-}
-
-/// Owner-only host records (`spawn_host_record`): what the host does to
-/// Spawn's work — an execution's or a gate's admission wait, a resource
-/// envelope's kill — written to the control stream beside the loop's
-/// `host.disk` records (objectives 018, 028, 029). The Bridge records its
-/// admission waits and interruptions through it; the store implements it as
-/// the owner-only SQL function, so no other login can write one.
-pub trait HostRecords: Send + Sync + std::fmt::Debug {
-    /// Record `record` (whose `type` the store checks with its fields).
-    fn record(&self, record: &serde_json::Value) -> Result<Recorded, StoreError>;
-
-    /// The first record of `record_type` (a control record's `type`) with
-    /// `kind` and `field` equal to `value`, after event id `after`: its
-    /// event's time. The admission wait it names began then, so a restarted
-    /// loop neither records it again nor forgets when it began.
-    fn admission_record(
-        &self,
-        record_type: &str,
-        kind: &str,
-        field: &str,
-        value: &str,
-        after: i64,
-    ) -> Result<Option<i64>, StoreError>;
-
-    /// Whether an `execution.interrupted` record names `execution`.
-    fn interrupted(&self, execution: &str) -> Result<bool, StoreError>;
-
-    /// The database's clock, in milliseconds: what a record's `waited_ms`
-    /// is measured by.
-    fn now_ms(&self) -> Result<i64, StoreError>;
 }
