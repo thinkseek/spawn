@@ -1893,14 +1893,20 @@ are per-agent uids or a mount per engine.
     owner's work is what its dependents build on), and the backlog's order
     check reads it as any other. It stays open in its mission until it
     lands there (openness reads landings only), which is why the owner
-    sees it listed rather than solved. `spawn mission objectives` lists the
+    sees it listed rather than solved. That makes a dependent in another
+    mission wait forever: 029's work lands in mission 7, so mission 4's
+    029 never closes, and an `after: [29]` written into mission 4's
+    backlog could never be satisfied. The order check would not see it
+    either (029 is in the graph and open, so nothing looks wrong): a
+    dependency is on a landing in the same mission. `spawn mission objectives` lists the
     owner-judged and the fleet's open objectives apart for every objective
     mission, and the board shows such an objective with status `owner`
     (`owner_judged: true`), its landings as any other's. A task for such an
     objective that is somehow in flight is judged as any other: the
     `cannot_judge` host fault and its backoff are unchanged (this is
     prevention, not a new verdict). The field is read by `load_backlog`;
-    a value that is not a boolean is refused, never read as true or false.
+    a value that is not a boolean (`null` included) is refused, never read
+    as true or false.
   - **An objective already solved on the base.** A one-shot objective is
     solved once a task for it lands (below); it is also solved when its
     scenario passes at a base commit main already holds, because then no
@@ -1925,8 +1931,12 @@ are per-agent uids or a mount per engine.
   - **Named order.** A backlog objective may name the objectives it comes
     after (`"after": [28]` in its JSON, versioned with the backlog): it is
     not assigned while one of them is open (one the backlog does not hold
-    must have landed). Only 032 names one (after 028, whose wait paths its
-    soak exercises); the owner's preferred order of 028-033 stays prose,
+    must have landed). The dependency is on a landing in this mission
+    (openness reads the mission's own landings): an objective whose work
+    lands elsewhere is never seen solved here, so a dependency on one
+    waits forever, and the order check cannot see that (the objective is
+    in the graph and open). Only 032 names one (after 028, whose wait paths
+    its soak exercises); the owner's preferred order of 028-033 stays prose,
     since those prompts say each may be solved before or with the others.
   - Who gets which task: the resident takes a task whenever it has none
     open in the mission; every other task goes to a new per-task worker

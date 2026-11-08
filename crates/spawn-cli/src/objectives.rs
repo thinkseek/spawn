@@ -251,8 +251,11 @@ pub(crate) fn load_backlog(directory: &Path) -> Result<Vec<Task>, String> {
             unit: text_field("unit").unwrap_or_default(),
             lower_is_better: text_field("direction").as_deref() != Some("higher"),
             target: value.get("target").and_then(serde_json::Value::as_f64),
+            // A boolean and nothing else: an absent field is the fleet's,
+            // and `null` is refused like any other non-boolean (a flag that
+            // json tools leave unset is not a statement about the owner).
             owner_judged: match value.get("owner_judged") {
-                None | Some(serde_json::Value::Null) => false,
+                None => false,
                 Some(flag) => flag.as_bool().ok_or_else(|| {
                     format!("{}: `owner_judged` is not true or false", path.display())
                 })?,
@@ -1997,6 +2000,12 @@ mod tests {
         )
         .expect("write");
         assert!(load_backlog(&dir).is_err(), "not a boolean");
+        std::fs::write(
+            dir.join("030.json"),
+            r#"{"id": 30, "prompt": "p", "owner_judged": null}"#,
+        )
+        .expect("write");
+        assert!(load_backlog(&dir).is_err(), "null is not a boolean either");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
