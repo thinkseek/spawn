@@ -983,8 +983,8 @@ mod tests {
             .expect("still an outage");
         assert_eq!(
             paused.wait,
-            interval * MAX_BACKOFF_INTERVALS,
-            "the outage's pause grows to at most thirty intervals"
+            interval * MAX_OUTAGE_INTERVALS,
+            "the outage's pause grows to at most four intervals, so a restart is noticed in seconds"
         );
         // Any other failure counts, and ten of them end the loop.
         for _ in 1..MAX_FAILURES {
