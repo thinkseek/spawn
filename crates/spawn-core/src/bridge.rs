@@ -202,9 +202,6 @@ pub struct BridgeConfig {
     /// The model relay, when Claude Code engines go through one.
     pub model_relay: Option<ModelRelay>,
 <<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
     /// Environment decided again at every engine launch, after
     /// `environment` and before `session_environment`: the fleet's test
     /// database, given only once it is known not to be the gates' server or
@@ -219,8 +216,6 @@ pub trait LaunchEnvironment: Send + Sync + std::fmt::Debug {
     /// The variables to add now; none when they are withheld (the
     /// implementation says why where the owner reads it).
     fn environment(&self) -> Vec<(String, String)>;
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
 =======
     /// The resource envelope every execution runs in (objective 029), when
     /// the host has one: a systemd user scope of its own inside Spawn's
@@ -233,8 +228,7 @@ pub trait LaunchEnvironment: Send + Sync + std::fmt::Debug {
     /// ([`HostRecords`], the owner-only `spawn_host_record`). Needed only
     /// with an [`Self::envelope`].
     pub records: Option<Arc<dyn HostRecords>>,
->>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
+>>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
 }
 
 impl BridgeConfig {
@@ -258,13 +252,9 @@ impl BridgeConfig {
 <<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
             launch_environment: None,
 =======
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-            launch_environment: None,
-=======
             envelope: None,
             records: None,
->>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
+>>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
         }
     }
 }
