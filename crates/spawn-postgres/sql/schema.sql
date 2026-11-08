@@ -2862,10 +2862,7 @@ begin
                               when 'task.landed' then array['landing']
                               when 'task.held' then array['landing']
                               when 'task.aborted' then array['delivered']
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
                               when 'task.over_budget' then array['delivered']
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
                               when 'task.cancelled' then array['assigned', 'delivered', 'revise']
                               else array['reported', 'accepted', 'landing'] end)) then
         raise exception 'task % is not waiting for %', p_record ->> 'id', p_record ->> 'type';
