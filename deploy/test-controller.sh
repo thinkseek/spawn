@@ -186,6 +186,99 @@ check "supply-pa is B, with no node_modules" \
   bash -c '[ "$(cat "$1/supply-pa/rsi/scenarios/which")" = B ] && [ ! -e "$1/supply-pa/web/node_modules" ]' _ "$dir"
 check "spawn is untouched" [ "$(readlink "$dir/spawn")" = "spawn-$C" ]
 
+echo "== a deps store (a commit with a pnpm-lock.yaml at its root)"
+# A stub pnpm: `install` writes the installed lockfile where pnpm keeps it,
+# and a tool a tree runs. SPAWN_PNPM_STUB_HARDLINK=1 makes it import as
+# hardlinks, as pnpm's default import method may.
+pnpm_dir=$scratch/bin
+mkdir -p "$pnpm_dir"
+cat >"$pnpm_dir/pnpm" <<'SH'
+#!/bin/sh
+[ "${1-}" = install ] || { echo "stub pnpm: only install" >&2; exit 2; }
+# A lifecycle script would run as the owner with network: the install must
+# refuse them (controller.sh deps --ignore-scripts).
+case " $* " in
+*" --ignore-scripts "*) ;;
+*)
+    echo "stub pnpm: install without --ignore-scripts" >&2
+    exit 3
+    ;;
+esac
+[ -f pnpm-lock.yaml ] || { echo "stub pnpm: no pnpm-lock.yaml" >&2; exit 2; }
+mkdir -p node_modules/.pnpm node_modules/.bin
+cp pnpm-lock.yaml node_modules/.pnpm/lock.yaml
+printf 'tool: %s\n' "$(cat pnpm-lock.yaml)" >node_modules/.bin/tool
+[ "${SPAWN_PNPM_STUB_HARDLINK-}" = 1 ] && ln pnpm-lock.yaml node_modules/.pnpm/hardlinked
+exit 0
+SH
+chmod +x "$pnpm_dir/pnpm"
+export SPAWN_PNPM=$pnpm_dir/pnpm
+deps_dir=$SPAWN_LIVE/deps
+lock_sha() { sha256sum | cut -d' ' -f1; }
+sha_of() { printf '%s\n' "$1" | lock_sha; }
+commit_root() { # commit_root <label> <lockfile>
+  mkdir -p "$src/rsi/scenarios" "$src/scripts" "$src/web"
+  echo "$1" >"$src/rsi/scenarios/which"
+  printf '#!/bin/sh\nexec cat "$(dirname "$0")/../rsi/scenarios/which"\n' >"$src/scripts/gate.sh"
+  printf '%s\n' "$2" >"$src/pnpm-lock.yaml"
+  git -C "$src" add -A
+  git -C "$src" -c user.name=t -c user.email=t@t commit -q -m "$1"
+  git -C "$src" rev-parse HEAD
+}
+E=$(commit_root E "lockfile v1")
+F=$(commit_root F "lockfile v2")
+G=$(commit_root G "lockfile v3")
+H=$(commit_root H "lockfile v4")
+one=$(sha_of "lockfile v1")
+two=$(sha_of "lockfile v2")
+three=$(sha_of "lockfile v3")
+set +e
+ctl build supply-pa "$git_dir" "$E" >/dev/null 2>"$scratch/err"
+status=$?
+set -e
+check "build refuses a commit whose deps tree is not installed" [ "$status" -ne 0 ]
+check "and says how to install it" grep -q "controller.sh deps supply-pa" "$scratch/err"
+out=$(ctl deps supply-pa "$git_dir" "$E" 2>"$scratch/err")
+check "deps prints the tree under the lockfile's hash" [ "$out" = "$deps_dir/supply-pa/$one" ]
+check "with the commit's tree" [ "$(cat "$deps_dir/supply-pa/$one/rsi/scenarios/which")" = E ]
+check "installed from that lockfile" [ "$(cat "$deps_dir/supply-pa/$one/node_modules/.pnpm/lock.yaml")" = "lockfile v1" ]
+check "naming its hash" [ "$(cat "$deps_dir/supply-pa/$one/.deps")" = "$one" ]
+check "its files are read-only" bash -c '! echo x 2>/dev/null >>"$1/pnpm-lock.yaml"' _ "$deps_dir/supply-pa/$one"
+check "and nothing can be added" bash -c '! touch "$1/node_modules/new" 2>/dev/null' _ "$deps_dir/supply-pa/$one"
+ctl deps supply-pa "$git_dir" "$E" >/dev/null 2>"$scratch/err"
+check "installing it again changes nothing" grep -q "already installed" "$scratch/err"
+check "no current pointer before the switch" [ ! -e "$deps_dir/supply-pa/current" ]
+ctl update supply-pa "$git_dir" "$E" >/dev/null 2>&1
+check "the controller names its deps tree" [ "$(cat "$dir/supply-pa-$E/.deps")" = "$one" ]
+check "current names it" [ "$(readlink "$deps_dir/supply-pa/current")" = "$one" ]
+check "a tree built with deps is read-only too" bash -c '! touch "$1/new" 2>/dev/null' _ "$dir/supply-pa-$E"
+ctl update supply-pa "$git_dir" "$F" >/dev/null 2>"$scratch/err"
+check "a new lockfile is installed by update itself" [ -d "$deps_dir/supply-pa/$two" ]
+check "current moves to it" [ "$(readlink "$deps_dir/supply-pa/current")" = "$two" ]
+check "the previous controller's tree is kept" [ -d "$deps_dir/supply-pa/$one" ]
+# An agent's workspace, built against the first tree, outlives both
+# controllers: the workspace's node_modules/.pnpm is a symlink into it.
+ws=$SPAWN_LIVE/ws/agent_1
+mkdir -p "$ws/node_modules"
+ln -s "$deps_dir/supply-pa/$one/node_modules/.pnpm" "$ws/node_modules/.pnpm"
+ctl update supply-pa "$git_dir" "$G" >/dev/null 2>"$scratch/err"
+check "the first tree, named by no controller now, is kept: a workspace links to it" \
+  [ -d "$deps_dir/supply-pa/$one" ]
+check "says so" grep -q "kept deps/supply-pa/$one: an agent's workspace still links to it" "$scratch/err"
+check "the one only the previous controller names stays" [ -d "$deps_dir/supply-pa/$two" ]
+rm -f "$ws/node_modules/.pnpm"
+ctl deps-prune supply-pa >/dev/null 2>"$scratch/err"
+check "once the workspace is gone, deps-prune removes it" [ ! -e "$deps_dir/supply-pa/$one" ]
+check "and keeps the current one" [ -d "$deps_dir/supply-pa/$three" ]
+set +e
+SPAWN_PNPM_STUB_HARDLINK=1 ctl deps supply-pa "$git_dir" "$H" >/dev/null 2>"$scratch/err"
+status=$?
+set -e
+four=$(sha_of "lockfile v4")
+check "a tree pnpm imported as hardlinks is refused" [ "$status" -ne 0 ]
+check "says why" grep -q "hardlinked outside it" "$scratch/err"
+check "and leaves nothing behind" [ ! -e "$deps_dir/supply-pa/$four" ]
+
 echo
 if [ "$failures" -eq 0 ]; then echo "test-controller: all passed"; else
   echo "test-controller: $failures failed"

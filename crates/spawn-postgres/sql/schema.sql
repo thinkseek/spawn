@@ -2990,7 +2990,10 @@ begin
     end if;
     -- A host fault names its evidence (§14): the failures the gate printed,
     -- each the host's, and, when the test database's log decided it, the
+<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
+=======
 <<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
+>>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
     -- crash lines stamped inside the gate's window (`failures`,
     -- `server_log`); the base's own disagreement (objective 033's
     -- `base_disagrees`, with its scenario, both exits and its run); or the
@@ -2999,7 +3002,12 @@ begin
     -- where); and its backoff.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
        and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log',
+<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
+                                                          'base_disagrees', 'gate',
+                                                          'cannot_judge')
+=======
                                                           'base_disagrees', 'gate')
+>>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
             or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
             or (p_record ->> 'evidence' in ('failures', 'server_log')
                 and (case when jsonb_typeof(p_record -> 'failures') = 'array'
@@ -3020,7 +3028,14 @@ begin
                          and jsonb_typeof(p_record -> 'setup_s') is distinct from 'number')))
             or (p_record ->> 'evidence' = 'gate'
                 and (coalesce(p_record -> 'fact' ->> 'scenario', '') !~ '^[^[:space:]|]+$'
+<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
+                     or coalesce(p_record -> 'fact' ->> 'on', '') not in ('base', 'candidate and base')))
+            or (p_record ->> 'evidence' = 'cannot_judge'
+                and (coalesce(p_record ->> 'scenario', '') !~ '^[^[:space:]|]+$'
+                     or jsonb_typeof(p_record -> 'escalate') is distinct from 'boolean'))) then
+=======
                      or coalesce(p_record -> 'fact' ->> 'on', '') not in ('base', 'candidate and base')))) then
+>>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
         raise exception 'a host_fault verdict names its evidence, its facts and backoff_ms: %',
 =======
     -- crash lines stamped inside the gate's window; and its backoff. One its

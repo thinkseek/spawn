@@ -201,7 +201,10 @@ pub struct BridgeConfig {
     pub screen_refresh: Duration,
     /// The model relay, when Claude Code engines go through one.
     pub model_relay: Option<ModelRelay>,
+<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
+=======
 <<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
+>>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
     /// Environment decided again at every engine launch, after
     /// `environment` and before `session_environment`: the fleet's test
     /// database, given only once it is known not to be the gates' server or
@@ -216,6 +219,8 @@ pub trait LaunchEnvironment: Send + Sync + std::fmt::Debug {
     /// The variables to add now; none when they are withheld (the
     /// implementation says why where the owner reads it).
     fn environment(&self) -> Vec<(String, String)>;
+<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
+=======
 =======
     /// The resource envelope every execution runs in (objective 029), when
     /// the host has one: a systemd user scope of its own inside Spawn's
@@ -229,6 +234,7 @@ pub trait LaunchEnvironment: Send + Sync + std::fmt::Debug {
     /// with an [`Self::envelope`].
     pub records: Option<Arc<dyn HostRecords>>,
 >>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
+>>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
 }
 
 impl BridgeConfig {
@@ -249,12 +255,16 @@ impl BridgeConfig {
             claude_projects: "/root/.claude/projects".to_string(),
             screen_refresh: Duration::from_secs(30),
             model_relay: None,
+<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
+            launch_environment: None,
+=======
 <<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
             launch_environment: None,
 =======
             envelope: None,
             records: None,
 >>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
+>>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
         }
     }
 }

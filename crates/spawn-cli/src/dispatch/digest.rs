@@ -165,9 +165,23 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
             let crash = quoted(&record["crash"], &|line| {
                 line.as_str().map(|line| one_line(line, 300))
             });
+<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
+            let fact = &record["fact"];
+            let evidence = if record["evidence"] == "cannot_judge" {
+                // The host cannot judge the objective at all (029: no
+                // systemd user manager in the sandbox): not a transient
+                // fault of the test database or the load.
+                let scenario = record["scenario"].as_str().unwrap_or("its scenario");
+                format!(
+                    "this host cannot judge the objective here ({scenario} needs what the \
+                     gate's sandbox has none of, a systemd user manager)"
+                )
+            } else if record["evidence"] == "gate" {
+=======
 <<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
             let fact = &record["fact"];
             let evidence = if record["evidence"] == "gate" {
+>>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
                 let scenario = fact["scenario"].as_str().unwrap_or("a scenario");
                 let runs = one_line(fact["runs"].as_str().unwrap_or_default(), 200);
                 if fact["on"] == "base" {
@@ -181,6 +195,8 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                          ({runs})"
                     )
                 }
+<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
+=======
 =======
             let evidence = if record["evidence"] == "memory_limit" {
                 // A gate its own resource envelope killed (objective 029).
@@ -191,6 +207,7 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                     record["oom_kills"].as_u64().unwrap_or_default()
                 )
 >>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
+>>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
             } else if crash.is_empty() {
                 let failures = record["failures"].as_array().map_or(0, Vec::len);
                 format!(
@@ -211,7 +228,14 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                 || "after its backoff".to_string(),
                 |due| format!("at {}", crate::scorecard::time::format_rfc3339(due)),
             );
+<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
+            let check = if record["evidence"] == "cannot_judge" {
+                "The objective is judged outside the gate, by the owner (mission 7): judge it \
+                 there, or tell the owner."
+            } else if record["evidence"] == "gate" {
+=======
             let check = if record["evidence"] == "gate" {
+>>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
                 "Check the host's load and that scenario's harness (its log in the gate output), \
                  or tell the owner."
             } else {
@@ -224,6 +248,9 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                 line: format!(
                     "task #{task} of {mission}: {faults} gate failures in a row were the \
                      host's, not the work's: {evidence}. It is judged again {due}; nothing is \
+<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
+                     counted and nothing halts. {check}"
+=======
 <<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
                      counted and nothing halts. {check}"
 =======
@@ -231,6 +258,7 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                      executor's envelope) or the test database's host (its memory, /dev/shm, \
                      its log), or tell the owner."
 >>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
+>>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
                 ),
                 since_ms: record["at_ms"].as_i64(),
             })
