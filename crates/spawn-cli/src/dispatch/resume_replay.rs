@@ -424,6 +424,7 @@ fn a_resume_that_succeeded_and_died_young_follows_the_young_death_rule_through_t
     world.tick();
     let (rows, plan) = world.db.plan();
     let facts = only(&rows);
+    eprintln!("DEBUG facts={facts:?}");
     assert_eq!(facts.resumed_young, 1);
     assert_eq!(facts.failed_resume, None, "its engine became ready");
     assert!(plan.orders.is_empty(), "{:?}", plan.orders);
