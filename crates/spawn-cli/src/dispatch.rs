@@ -1786,7 +1786,6 @@ mod tests {
     /// an idle supervisor once, as an item of `missions` tagged
     /// `missions objective-yielded-<event id>`, its line naming the mission
     /// and the record's reason; two yields keep a line each.
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
     /// A second overrun of an objective's chain is one digest item, tagging
     /// the overrun's record, naming both tasks, and holding the objective.
     #[test]
@@ -1833,8 +1832,6 @@ mod tests {
         );
     }
 
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
     #[test]
     fn a_yielded_objective_reaches_an_idle_supervisor_once() {
         let reason = "objective 19 had 3 failed attempts since its last turn (conflict, \
