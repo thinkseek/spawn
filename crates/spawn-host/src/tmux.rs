@@ -504,23 +504,6 @@ impl TerminalHost for TmuxHost {
         }
     }
 
-    /// Whether the server that holds every terminal is there. `list-sessions`
-    /// only asks: unlike `new-session` it never starts a server, so a
-    /// check after a host restart cannot make one appear and hide the fact
-    /// that every terminal died with it.
-    fn server_alive(&self) -> bool {
-        let Ok(run) = self.run(&["list-sessions".to_string()]) else {
-            return true;
-        };
-        match run.code {
-            // Exit 1 says no server answers, unless tmux said something
-            // else (a socket we may not open, a failing tmux): that says
-            // nothing about the terminals.
-            Some(1) if gone(&run.stderr) => false,
-            _ => true,
-        }
-    }
-
     /// `list-panes`, not `display-message`, which answers a target that is
     /// not there with empty fields and success.
     fn runner(

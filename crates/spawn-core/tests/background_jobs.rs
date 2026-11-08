@@ -149,6 +149,7 @@ fn execution_started(store: &MemoryStore, execution: u64) {
             fork: None,
             model: ModelProfile::Default,
             transcript_from: None,
+            envelope: None,
         },
     );
 }
@@ -278,7 +279,6 @@ fn a_job_is_open_only_within_its_execution() {
         EventKind::ExecutionEnded {
             cause: spawn_core::event::EndCause::Lost,
             exit_code: None,
-            signal: None,
             evidence: None,
         },
     );
@@ -375,8 +375,6 @@ fn a_failed_turn_with_a_job_open_is_still_the_judges_and_it_sees_the_job() {
         None,
         EventKind::TurnFailed {
             error: "API Error: 529 overloaded".to_string(),
-            status: Some(529),
-            error_kind: Some("overloaded".to_string()),
         },
     );
     let observation = judge(&mut fixture);

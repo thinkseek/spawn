@@ -284,6 +284,31 @@
 //!    in seconds, not by a gate whose every database test fails 25 minutes
 //!    in and reads as a regression;
 //!
+//!    **A gate runs in a resource envelope of its own, and only when that
+//!    envelope fits** (objective 029). After the host's room, the integrator
+//!    measures the same two things for the gate's envelope: the slice's
+//!    `anon` + `shmem` against its MemoryMax minus the gate's MemoryMax, and
+//!    `MemAvailable` against the gate's MemoryMax (SPAWN_GATE_* settings
+//!    10G/12G/4G by default, under SPAWN_SLICE's 16G/20G). A gate that does
+//!    not fit does not run this pass: `admission.waiting` (kind `gate`, the
+//!    task, the measure, what it measured and its threshold), recorded once
+//!    per wait, which is not a verdict, moves no count and keeps the task's
+//!    place, and it is checked again at the next pass; one that runs after
+//!    waiting records `admission.admitted` with its `waited_ms` (the store's
+//!    clock). The gate itself runs in a transient scope
+//!    `<slice stem>-gate-<task id>-<n>.scope` inside the slice (`n` that
+//!    task's judging from 1; a name a unit still holds is skipped), with the
+//!    gate's MemoryHigh, MemoryMax and MemorySwapMax and OOMPolicy stop, so
+//!    everything it starts is in that cgroup. A gate its own envelope killed
+//!    — its scope's `memory.events` `oom_kill` or its unit's `Result`
+//!    `oom-kill`, read at its end, never its exit status — is the host's
+//!    fault, `host_fault`, exactly as the test database's crash is: no
+//!    verdict, no count, no halt, judged again after the same recorded
+//!    `due_ms`, escalated the same way at the second in a row, its record
+//!    naming `evidence` `memory_limit`, the scope, `memory_high`,
+//!    `memory_max`, `oom_kills` and `memory_peak` (when it could be read
+//!    while the scope lived), and its log;
+//!
 //!    **A report is judged against the checkpoint of the turn that produced
 //!    it.** The dispatcher collects a report only after the turn that wrote
 //!    it ended in the log, and the Bridge records a turn's checkpoint before
@@ -1237,7 +1262,21 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     // What the host must have before a gate starts, read once like the
     // gate's environment (gate::Room).
     let host_room = gate::Room::from_env(|name| std::env::var(name).ok());
-    let integrator = Integrator::new(root, gate, gate_env, host_room, gates);
+    // The gates' resource envelope (objective 029): a setting that does not
+    // parse, or an envelope that does not fit under the slice, refuses the
+    // start; the slice is given its limits before any gate starts in it.
+    let envelopes = crate::envelope::Runtime::from_env()?;
+    for warning in envelopes.prepare() {
+        eprintln!("integrate: {warning}");
+    }
+    let integrator = Integrator::new(
+        root,
+        gate,
+        gate_env,
+        host_room,
+        gates,
+        envelopes.envelope().cloned(),
+    );
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
@@ -1288,6 +1327,9 @@ struct Judge {
     host: HostSettings,
     /// The host's room, checked before each gate starts ([`gate::Room`]).
     room: gate::Room,
+    /// The gate's resource envelope (objective 029), when the host has one:
+    /// each gate runs in a scope of its own inside Spawn's slice.
+    envelope: Option<spawn_core::envelope::Envelope>,
 }
 
 /// The settings of host faults: the test database's log
@@ -1385,6 +1427,7 @@ impl Integrator {
         gate_env: Vec<(String, String)>,
         host_room: gate::Room,
         gates: usize,
+        envelope: Option<spawn_core::envelope::Envelope>,
     ) -> Self {
         Self {
             judge: Judge {
@@ -1393,6 +1436,7 @@ impl Integrator {
                 gate_env,
                 host: HostSettings::from_env(),
                 room: host_room,
+                envelope,
             },
             gates,
             running: RefCell::new(Vec::new()),
@@ -2040,6 +2084,20 @@ impl Judge {
                 return gated("aborted", json!({ "reason": reason }));
             }
         }
+        // The gate's own envelope (objective 029), measured now, after the
+        // host's room: it must fit under the slice (its anon + shmem at most
+        // the slice's MemoryMax minus the gate's) and on the host
+        // (MemAvailable at least the gate's MemoryMax). A gate that does not
+        // fit does not run this pass: `admission.waiting`, once, which is
+        // not a verdict and keeps the task's place; it is checked again at
+        // the next pass. One that runs after waiting leaves
+        // `admission.admitted` with its `waited_ms`.
+        let scope = Self::gate_scope(store, task, self.envelope.as_ref())?;
+        if let Some(scope) = &scope
+            && !Self::admitted_gate(store, task, scope)?
+        {
+            return Ok(());
+        }
         // The test server must not be the owner's, by identity, asked now:
         // a socket mount or a DNS name can change between gate runs.
         let owner = std::env::var("SPAWN_DATABASE_URL").ok();
@@ -2064,6 +2122,7 @@ impl Judge {
                 scenario.as_deref(),
                 &gate_env,
                 gate_wall_clock(),
+                scope.as_ref(),
             )
         };
         // Only a gate that runs on the test database can fail because it
@@ -2201,9 +2260,120 @@ impl Judge {
                 );
                 gated("host_fault", extra)
             }
+            // A gate its own envelope killed is the host's fault: not a
+            // verdict, judged again after objective 020's backoff, never an
+            // abort and never toward a halt (the owner's ruling). The task
+            // stays where it was, its revisions do not move, and nothing
+            // goes back to the worker.
+            Err(GateFailure::MemoryLimit {
+                scope,
+                memory_high,
+                memory_max,
+                oom_kills,
+                memory_peak,
+                log,
+            }) => {
+                let faults = mission.gate_host_faults.saturating_add(1);
+                let backoff = host_fault_backoff(self.host.backoff, faults);
+                let mut extra = json!({
+                    "reason": format!(
+                        "host fault: the gate was killed by its memory limit (MemoryMax {}, \
+                         peak {}), not a verdict, judged again later",
+                        size_text(memory_max),
+                        memory_peak.map_or_else(|| "unread".to_string(), size_text)
+                    ),
+                    "log": log,
+                    "evidence": "memory_limit",
+                    "scope": scope,
+                    "memory_high": memory_high,
+                    "memory_max": memory_max,
+                    "oom_kills": oom_kills,
+                    "host_faults": faults,
+                    "backoff_ms": u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+                    "escalate": faults == HOST_FAULT_ESCALATE_AT,
+                });
+                if let Some(peak) = memory_peak {
+                    extra["memory_peak"] = json!(peak);
+                }
+                extra["candidate"] = json!(candidate);
+                println!(
+                    "integrate: task {}: {}",
+                    task.id,
+                    extra["reason"].as_str().unwrap_or_default()
+                );
+                gated("host_fault", extra)
+            }
             Err(failure) => gated("aborted", aborted(&failure)),
         }
     }
+
+    /// The scope this judging's gate runs in (objective 029), when the host
+    /// has an envelope: `<slice stem>-gate-<task id>-<n>.scope`, `n` that
+    /// task's judging from 1, and never a name a unit still holds.
+    fn gate_scope(
+        store: &PostgresStore,
+        task: &Task,
+        envelope: Option<&spawn_core::envelope::Envelope>,
+    ) -> Result<Option<gate::Scope>, String> {
+        let Some(envelope) = envelope else {
+            return Ok(None);
+        };
+        let (runs, _) = store.gate_runs(task.id).map_err(|error| error.to_string())?;
+        let mut n = runs.saturating_add(1);
+        let mut unit = envelope.gate_scope(task.id, n);
+        // A name is never reused while its unit exists: a run that is still
+        // winding down takes the next one.
+        while envelope
+            .scope_facts(&unit)
+            .load_state
+            .as_deref()
+            .is_some_and(|state| state != "not-found")
+        {
+            n = n.saturating_add(1);
+            unit = envelope.gate_scope(task.id, n);
+        }
+        Ok(Some(gate::Scope {
+            unit,
+            envelope: envelope.clone(),
+        }))
+    }
+
+    /// Whether this judging's gate may run now (objective 029): its
+    /// envelope fits under the slice and on the host. While it does not, the
+    /// wait is recorded once (`admission.waiting`, from the task's last
+    /// judging) and the gate does not run this pass; a gate that runs after
+    /// waiting records `admission.admitted` with its `waited_ms`.
+    fn admitted_gate(
+        store: &PostgresStore,
+        task: &Task,
+        scope: &gate::Scope,
+    ) -> Result<bool, String> {
+        let envelope = &scope.envelope;
+        let bytes = envelope.settings.gate.max;
+        let (_, after) = store.gate_runs(task.id).map_err(|error| error.to_string())?;
+        let start = spawn_core::envelope::Admission {
+            kind: "gate",
+            fields: json!({"task": task.id}),
+            envelope_bytes: bytes,
+            after,
+        };
+        let short = envelope.shortfall(bytes);
+        if let Some(short) = &short {
+            println!(
+                "integrate: task {}: no room for its gate's envelope now ({}: {} of {} bytes); \
+                 the gate does not run",
+                task.id, short.measure, short.measured, short.threshold
+            );
+        }
+        if !spawn_core::envelope::admit(store, &start, short)
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(false);
+        }
+        spawn_core::envelope::admitted(store, &start).map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
 }
 
 impl Judge {
@@ -2834,6 +3004,33 @@ fn aborted(failure: &GateFailure) -> Value {
             "scenario": scenario,
             "log": log,
         }),
+        // Recorded `host_fault` by the caller; counted here only if a caller
+        // forgets that.
+        GateFailure::MemoryLimit { memory_max, log, .. } => json!({
+            "reason": format!(
+                "the gate was killed by its memory limit (MemoryMax {})",
+                size_text(*memory_max)
+            ),
+            "log": log,
+        }),
+    }
+}
+
+/// A size as a person reads it: whole MiB under a GiB, else GiB with one
+/// decimal.
+fn size_text(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        // Display only: the precision lost converting to f64 is far below
+        // one decimal place.
+        #[allow(clippy::cast_precision_loss)]
+        let value = bytes as f64 / GIB as f64;
+        format!("{value:.1} GiB")
+    } else if bytes >= MIB {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
@@ -4289,6 +4486,7 @@ mod tests {
                 None,
                 &env,
                 std::time::Duration::from_mins(1),
+                None,
             )
         };
         let candidate = super::landing_candidate(mirror, main, head, "Work (task 48)\n")
@@ -6475,6 +6673,7 @@ mod database_tests {
             test_gate_env(),
             room_to_spare(),
             super::DEFAULT_GATES,
+            None,
         );
         (base, source, scenarios, integrator)
     }
@@ -7853,6 +8052,7 @@ mod database_tests {
             Vec::new(),
             room_to_spare(),
             super::DEFAULT_GATES,
+            None,
         );
         integrator.pass_on(&db.store).expect("a pass");
         let halted = db.mission(mission)["halted"].clone();
@@ -8559,6 +8759,58 @@ mod database_tests {
                "failures": [{"test": "api::tests::one", "message": "Connection refused",
                              "class": "connection"}],
                "host_faults": faults, "backoff_ms": 300_000, "escalate": faults == 2})
+    }
+
+    /// A `host_fault` record as objective 029 writes it, by its envelope's
+    /// kill: the scope, its limits and its kill count.
+    fn memory_limit_record(task: i64, revision: i32, faults: u32) -> Value {
+        json!({"type": "task.gated", "id": task, "revision": revision, "verdict": "host_fault",
+               "base": "b0", "scenarios": 0,
+               "reason": "host fault: the gate was killed by its memory limit (MemoryMax 32 MiB, \
+                          peak 31 MiB), not a verdict, judged again later",
+               "log": "gate: the tool ended with 137", "evidence": "memory_limit",
+               "scope": "spawn-gate-9-1.scope", "memory_high": 31_457_280_u64,
+               "memory_max": 33_554_432_u64, "oom_kills": 1, "memory_peak": 33_509_376_u64,
+               "host_faults": faults, "backoff_ms": 3_000, "escalate": faults == 2})
+    }
+
+    /// A gate its own envelope killed is the host's fault the store accepts,
+    /// and it leaves the task where it was, nothing counted and a due time
+    /// to be judged again at (objective 029).
+    #[test]
+    fn a_memory_limit_host_fault_is_recorded_and_waits_out_its_backoff() {
+        let (base, source, scenarios, _) = world("memory-limit-fault", "exit 1\n");
+        let db = Db::new("memory_limit_fault");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        db.record(&memory_limit_record(task, 0, 1));
+        let after = gated(&db, mission);
+        assert_eq!(after.gate_host_faults, 1);
+        assert_eq!(after.gate_host_task, Some(task));
+        assert!(after.gate_host_due_ms.is_some(), "due to be judged again");
+        assert_eq!(after.gate_aborts, 0, "no abort counts it");
+        assert_eq!(after.gate_rejections, 0);
+        assert!(after.halted.is_none(), "no halt counts it");
+        assert_eq!(
+            task_state(&db, mission, task),
+            "reported",
+            "the task stays where it was"
+        );
+        // A memory-limit host fault without its scope and kill count is
+        // refused, as one without its failures is.
+        let mut bad = memory_limit_record(task, 0, 1);
+        bad["oom_kills"] = json!(0);
+        assert!(
+            db.store.integrator_record(&bad).is_err(),
+            "no kill named: {bad}"
+        );
+        let mut bad = memory_limit_record(task, 0, 1);
+        bad.as_object_mut().expect("object").remove("scope");
+        assert!(
+            db.store.integrator_record(&bad).is_err(),
+            "no scope named: {bad}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Objective 20: a host fault between two rejections leaves the

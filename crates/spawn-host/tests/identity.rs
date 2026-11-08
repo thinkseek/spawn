@@ -454,6 +454,7 @@ fn an_execution_recorded_before_the_upgrade_is_followed_where_its_engine_writes(
             fork: None,
             model: spawn_core::event::ModelProfile::Default,
             transcript_from: None,
+            envelope: None,
         },
     );
     append(

@@ -120,6 +120,7 @@ fn started(store: &MemoryStore) {
             fork: None,
             model: ModelProfile::Default,
             transcript_from: None,
+            envelope: None,
         },
     );
 }
@@ -228,7 +229,6 @@ fn a_stalled_end_asks_for_attention_until_the_execution_ends() {
         EventKind::ExecutionEnded {
             cause: EndCause::Exited,
             exit_code: Some(0),
-            signal: None,
             evidence: None,
         },
     );
@@ -534,7 +534,6 @@ fn a_failing_exit_asks_for_attention_whatever_the_model_says() {
         EventKind::ExecutionEnded {
             cause: EndCause::Exited,
             exit_code: Some(1),
-            signal: None,
             evidence: None,
         },
     );
@@ -628,7 +627,6 @@ fn a_permission_screen_dies_with_its_execution() {
         EventKind::ExecutionEnded {
             cause: EndCause::Stopped,
             exit_code: None,
-            signal: None,
             evidence: None,
         },
     );
@@ -665,7 +663,6 @@ fn a_restarted_observer_corrects_a_stale_row() {
         EventKind::ExecutionEnded {
             cause: EndCause::Stopped,
             exit_code: None,
-            signal: None,
             evidence: None,
         },
     );
@@ -957,7 +954,6 @@ fn a_late_end_of_an_older_execution_does_not_end_the_current_one() {
         EventKind::ExecutionEnded {
             cause: EndCause::Lost,
             exit_code: None,
-            signal: None,
             evidence: None,
         },
     );
@@ -971,6 +967,7 @@ fn a_late_end_of_an_older_execution_does_not_end_the_current_one() {
             fork: None,
             model: ModelProfile::Default,
             transcript_from: None,
+            envelope: None,
         },
     );
     in_execution(
@@ -979,7 +976,6 @@ fn a_late_end_of_an_older_execution_does_not_end_the_current_one() {
         EventKind::ExecutionEnded {
             cause: EndCause::Exited,
             exit_code: Some(0),
-            signal: None,
             evidence: None,
         },
     );

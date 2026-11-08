@@ -290,7 +290,6 @@ mod tests {
                 inputs,
             }),
             jobs: Vec::new(),
-            recovered: None,
         }
     }
 
