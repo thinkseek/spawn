@@ -1872,8 +1872,11 @@ impl Integrator {
                 Kept::Lost { branch } => (branch, None, String::new()),
             };
             // `measure` says the active-time budget made this overrun, with
-            // what it measured: the record an objective counts as a failed
-            // attempt (objectives.rs, `Outcome::failure`).
+            // what it measured. `Outcome::failure` (objectives.rs) does not
+            // count it as a failed attempt: attempts are per objective since
+            // its last yield, so a counted overrun would yield the
+            // continuation task on assignment. The measure stays on the
+            // record for a later rule.
             let mut overrun = json!({"type": "task.over_budget", "id": task.id,
                                      "reason": reason, "tool_calls": calls,
                                      "elapsed_ms": active, "budget": budget.clone(),
