@@ -89,9 +89,12 @@ pub enum ScreenState {
 }
 
 impl ScreenState {
-    /// Whether the pane accepts typed text.
+    /// Whether the pane accepts typed text. A finished turn shows `Ready`;
+    /// an engine that printed an error above its prompt (`Error`) is at its
+    /// prompt too — a model relay's outage leaves it there until the work
+    /// goes on — so it accepts text as well (objective 032).
     pub fn accepts_input(self) -> bool {
-        matches!(self, Self::Ready)
+        matches!(self, Self::Ready | Self::Error)
     }
 }
 
