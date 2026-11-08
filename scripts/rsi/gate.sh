@@ -868,7 +868,10 @@ sandbox() {
         --setenv CARGO_HOME /tmp/cargo-home --setenv CARGO_NET_OFFLINE true \
         --setenv npm_config_cache /tmp/npm-cache \
         --setenv GIT_CONFIG_GLOBAL /tmp/gitconfig
-    for name in LANG RUSTUP_HOME; do
+    # LANG and RUSTUP_HOME as they are; a tree's deps store (SUPPLY_PA_DEPS)
+    # as the integrator names it, so `build` and the scenarios read the tree
+    # the owner installed rather than the default under $HOME.
+    for name in LANG RUSTUP_HOME SUPPLY_PA_DEPS; do
         eval "value=\${$name-}"
         [ -n "$value" ] && set -- "$@" --setenv "$name" "$value"
     done

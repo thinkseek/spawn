@@ -201,10 +201,34 @@ tests the switch (scratch directories only).
 | `spawn` | the deployed commit (the missions repo's `main` after a deploy) | `spawn-integrate` (`SPAWN_GATE`), `spawn-maintenance`, mission 4's `--gate .../rsi/scenarios` and `--backlog .../rsi/backlog` | `deploy/deploy.sh`, with the install |
 | `supply-pa` | the live `main` of `missions/supply-pa.git` | mission 6's `--gate .../gate/scenarios` and `--backlog .../gate/backlog` (the gate script is Spawn's) | the owner's push to that repo, below |
 
-Supply PA's scenarios still name the owner's installed dependencies in
-`~/projects/supply-pa` (`gate/scenarios/bind`, `SUPPLY_PA_DEPS`): those are
-`pnpm install` output, not tracked files, and its manifests and lockfile are
-protected, so only an owner install changes them.
+Supply PA's tree runs on dependencies git does not hold: `pnpm install`
+output from its lockfile (its manifests and lockfile are protected, so only
+an owner install changes them). They live in a deps store, one tree per
+lockfile hash, never in the owner's checkout, whose `.pnpm` every agent may
+write:
+
+    ~/.local/share/spawn-rsi/deps/supply-pa/<sha256 of pnpm-lock.yaml>/
+    ~/.local/share/spawn-rsi/deps/supply-pa/current -> <that hash>
+
+`deploy/controller.sh deps supply-pa <git-dir> <commit>` installs a tree
+(`pnpm install --frozen-lockfile --config.package-import-method=clone-or-copy` from
+the commit's lockfile, then read-only; a hardlink into pnpm's store is
+refused, since making it read-only would change the store). `update`
+installs the tree when the lockfile's has none, and `build` refuses a commit
+whose tree is missing. A switch points `current` at that commit's tree and
+removes the trees nothing uses: not the current or the previous controller's
+(`.deps` in each), not one an agent's workspace links into
+(`ws/<agent>/node_modules/.pnpm`), not one a process holds. An agent's
+workspace therefore keeps the dependencies it built with until the
+workspace is gone.
+
+Engines and gates read the store through `SUPPLY_PA_DEPS`: a line
+`SUPPLY_PA_DEPS=/home/ckl/.local/share/spawn-rsi/deps/supply-pa/current`
+in `spawn.env` (a literal path, as systemd's EnvironmentFile does not expand
+`$HOME`); Spawn hands it to every engine's pane, and the gate carries it into
+its sandbox. Unset, `gate/scenarios/build`, the drivers and the default in
+`gate/scenarios/bind` use that pointer anyway, and the owner's checkout is
+never a source.
 
 An owner push to a gated source other than Spawn (Supply PA): stop
 `spawn-integrate`, push to `~/.local/share/spawn-rsi/missions/<repo>.git`, run
@@ -215,7 +239,10 @@ deploy/controller.sh update supply-pa ~/.local/share/spawn-rsi/missions/supply-p
 ```
 
 and start `spawn-integrate` again. Until that update, the mission keeps
-judging with the scenarios and backlog of the commit before.
+judging with the scenarios and backlog of the commit before. The update
+installs the new lockfile's deps tree first when it has none (it needs
+network and `pnpm`), so a push that changes the lockfile is complete only
+once that has run.
 
 The move to controllers, once per host: `deploy/cutover-controller.sh
 --dry-run` shows what it would do (nothing changes), then
