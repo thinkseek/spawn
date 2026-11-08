@@ -51,12 +51,14 @@ command -v bwrap >/dev/null 2>&1 || {
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/gate-runner-test.XXXXXX")
 runner_home=""
+badroot=""
 # A long root moves a job's scratch to /tmp/gate-runner/<job> (the socket
 # path limit); remember what was there, so only this test's jobs go.
 short_before=$(ls -A /tmp/gate-runner 2>/dev/null || true)
 cleanup() {
     chmod -R u+w "$scratch" "$runner_home" 2>/dev/null || true
     rm -rf "$scratch" "$runner_home"
+    [ -z "$badroot" ] || rm -rf "$badroot"
     for job in $(ls -A /tmp/gate-runner 2>/dev/null || true); do
         case " $short_before " in
         *" $job "*) ;;
@@ -112,18 +114,22 @@ mkdir -p "$keysscen"
 cp "$scen/protected" "$keysscen/"
 printf '#!/bin/sh\nexit 1\n' >"$keysscen/001.sh"
 
-# A root the gate's sandbox empties is refused, before anything else.
-mkdir -p "$scratch/root-tmp"
+# A root the gate's sandbox empties is refused, before anything else. The
+# root is under /tmp explicitly: the suite's own scratch follows TMPDIR, and
+# a root under any other TMPDIR is correct to accept (case 8g).
+badroot=$(mktemp -d /tmp/gate-runner-refuse.XXXXXX)
 refused=0
-sh "$repo/deploy/gate-runner/setup.sh" --root "$scratch/root-tmp" --pg-bin "$pg_bin" \
+sh "$repo/deploy/gate-runner/setup.sh" --root "$badroot" --pg-bin "$pg_bin" \
     >"$scratch/refuse.out" 2>&1 || refused=$?
 expect "setup.sh refuses a root the sandbox empties" "$refused" 1
 contains "and says why" "$scratch/refuse.out" "the gate's sandbox empties those"
+rm -rf "$badroot"
 
 # The fake runner: setup.sh installs into a directory under $HOME (the
-# gate's sandbox binds the controller's scripts back only under $HOME; it
-# empties TMPDIR). The UI's dependencies are the controller's lockfile with
-# a stand-in install, so --check's web comparison has both sides of it.
+# gate's sandbox binds the controller's scripts back only under $HOME;
+# elsewhere it shows the host's files, but it empties /tmp, /run and
+# /var/tmp). The UI's dependencies are the controller's lockfile with a
+# stand-in install, so --check's web comparison has both sides of it.
 mkdir -p "$HOME/.cache"
 runner_home=$(mktemp -d "$HOME/.cache/gate-runner-test.XXXXXX")
 webdir=$runner_home/web-deps
