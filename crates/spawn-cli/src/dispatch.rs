@@ -424,7 +424,7 @@ pub(crate) enum Why {
     /// An objective ran out of attempts and its task yielded the slot to
     /// the next objective ([`digest::objective_yields`]).
     ObjectiveYielded,
-
+    /// A task that continued an overrun task went over its budget too
     /// ([`digest::over_budget_escalations`]): its objective is held until
     /// the mission is configured again.
     OverBudget,
@@ -704,7 +704,7 @@ pub(crate) fn read_plan(
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
-
+    host.extend(digest::over_budget_escalations(
         store
             .over_budget_escalations()
             .map_err(|error| format!("over budget records: {error}"))?
