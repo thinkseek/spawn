@@ -1645,12 +1645,9 @@ fn host_envelope_admission_and_interruption_records_are_owner_only_facts() {
     assert_eq!(tables(&mut client), before);
     assert!(control_types(&mut client).contains(&"host.envelope".to_string()));
 
-    let supervisor = common::login(&schema, "spawn_supervisor");
-    client
-        .batch_execute(&format!("set session authorization {supervisor}"))
-        .expect("become the supervisor");
+    let mut supervisor = common::as_login(&schema, "spawn_supervisor");
     assert!(
-        client
+        supervisor
             .query_one("select spawn_host_record($1)", &[&envelope])
             .is_err(),
         "the supervisor records no host facts"
