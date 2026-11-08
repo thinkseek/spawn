@@ -1917,7 +1917,22 @@ record of what was judged (§14 of design.md).
   database, as Supply PA's tests run on PGlite) gets no
   SPAWN_TEST_DATABASE_URL, so its candidate code cannot reach the shared
   server: its judgings do not count against N and run beside a Spawn gate,
-  still one per mission and per source. Each judging records its own verdict and landing, which the next
+  still one per mission and per source. **CPU room.** The integrator
+  gives every gate its `SPAWN_GATE_JOBS` (scenarios at once), never
+  gate.sh's own default: the owner's `SPAWN_GATE_JOBS` when set; 1 for a
+  gate on the shared test server; otherwise the host's cores less
+  `SPAWN_GATE_WORKER_CORES` (cores kept for the workers and the host; a
+  whole number from 0 to cores - 1, default a quarter of the cores, at
+  least 1), divided among the gates that can run at once (one per source,
+  those on the shared server at most N), at most 8. A gate starts only
+  when its jobs, the running gates' jobs and the kept cores fit within the
+  cores, or when no gate runs; otherwise it waits for a later pass, said
+  once, like a gate over N: no record and nothing counted against the task
+  (unlike `no_room`, there is nothing to measure: the integrator knows the
+  jobs it gave). A setting that does not parse stops the integrator from
+  starting, naming it. On 2026-11-08, with `SPAWN_GATE_PG_BIN` set, each
+  gate took half of the 9 cores; two or three gates and the workers made a
+  load of 18-20, and task 172's gate failed on its base. Each judging records its own verdict and landing, which the next
   pass reads; finished judgings are reaped before a pass reads the
   missions. A judging that panics before any record of its own is
   recorded `aborted` with the reason, so the three-aborts halt bounds a

@@ -135,6 +135,110 @@ const DEFAULT_MIN_FREE_MEMORY_MB: u64 = 2048;
 /// query ([`Room`]).
 const DATABASE_PROBE_LIMIT: Duration = Duration::from_secs(10);
 
+/// The most scenarios a gate runs at once by default, as gate.sh caps its
+/// own default.
+const MAX_DEFAULT_JOBS: usize = 8;
+
+/// The host's cores and how the integrator shares them among its gates
+/// (gate-cpu-room). Each gate gets SPAWN_GATE_JOBS from the integrator
+/// ([`Cpu::jobs_for`]), never its own default: the owner's
+/// SPAWN_GATE_JOBS when set; 1 for a gate on the shared test server
+/// (whose connections every agent's tests share, as gate.sh says); else
+/// the cores less those kept for the workers, divided among the gates that
+/// can run at once, at most 8. A gate starts only when its jobs, the
+/// running gates' jobs and the cores kept for the workers fit within the
+/// cores, or when no gate runs ([`Cpu::fits`]); otherwise it waits for the
+/// next pass, as it waits for a gate slot: no record, no count. (2026-11-08:
+/// with SPAWN_GATE_PG_BIN each gate took half of the 9 cores, two or three
+/// gates and the workers made a load of 18-20, and a gate failed on its
+/// base.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Cpu {
+    /// The host's cores (`available_parallelism`).
+    pub(crate) cores: usize,
+    /// Cores kept for the workers and the host: SPAWN_GATE_WORKER_CORES,
+    /// a whole number from 0 to `cores` - 1, by default a quarter of the
+    /// cores (at least 1).
+    pub(crate) reserved: usize,
+    /// SPAWN_GATE_JOBS as the owner set it: every gate runs that many.
+    pub(crate) jobs: Option<usize>,
+}
+
+impl Cpu {
+    /// The settings as the integrator's environment (`lookup`) sets them,
+    /// for a host of `cores` cores. A setting that does not parse is an
+    /// error: the integrator does not start, as for `--gates`.
+    pub(crate) fn from_env(
+        lookup: impl Fn(&str) -> Option<String>,
+        cores: usize,
+    ) -> Result<Self, String> {
+        let cores = cores.max(1);
+        let set = |name: &str| lookup(name).filter(|value| !value.trim().is_empty());
+        let jobs = match set("SPAWN_GATE_JOBS") {
+            None => None,
+            Some(text) => Some(whole(&text).filter(|jobs| *jobs >= 1).ok_or_else(|| {
+                format!("SPAWN_GATE_JOBS is a whole number from 1, not '{text}'")
+            })?),
+        };
+        let reserved = match set("SPAWN_GATE_WORKER_CORES") {
+            None => (cores / 4).max(1).min(cores - 1),
+            Some(text) => whole(&text).filter(|kept| *kept < cores).ok_or_else(|| {
+                format!(
+                    "SPAWN_GATE_WORKER_CORES is a whole number from 0 to {}, not '{text}'",
+                    cores - 1
+                )
+            })?,
+        };
+        Ok(Self {
+            cores,
+            reserved,
+            jobs,
+        })
+    }
+
+    /// The jobs of a gate when `at_once` gates can run at once; `shared`:
+    /// the gate runs on the shared test server (it gets
+    /// SPAWN_TEST_DATABASE_URL and no server of its own).
+    pub(crate) fn jobs_for(&self, shared: bool, at_once: usize) -> usize {
+        if let Some(jobs) = self.jobs {
+            return jobs;
+        }
+        if shared {
+            return 1;
+        }
+        ((self.cores - self.reserved) / at_once.max(1)).clamp(1, MAX_DEFAULT_JOBS)
+    }
+
+    /// Whether a gate of `jobs` may start beside running gates of
+    /// `running` jobs in all: they and the cores kept for the workers fit
+    /// within the cores, or no gate runs (one gate always may: a host whose
+    /// cores cannot hold even one must still judge).
+    pub(crate) fn fits(&self, running: usize, jobs: usize) -> bool {
+        running == 0 || running + jobs + self.reserved <= self.cores
+    }
+}
+
+/// A whole number as gate.sh reads one: digits only, no sign, no leading
+/// zero (0 itself is a whole number).
+fn whole(text: &str) -> Option<usize> {
+    let text = text.trim();
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if text.len() > 1 && text.starts_with('0') {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// Whether a gate whose environment is `env` runs on the shared test
+/// server: it gets SPAWN_TEST_DATABASE_URL and neither SPAWN_GATE_PG_IMAGE
+/// nor SPAWN_GATE_PG_BIN (gate.sh then defaults to one job).
+pub(crate) fn on_shared_server(env: &[(String, String)]) -> bool {
+    let set = |name: &str| env_value(env, name).is_some_and(|value| !value.is_empty());
+    set("SPAWN_TEST_DATABASE_URL") && !set("SPAWN_GATE_PG_IMAGE") && !set("SPAWN_GATE_PG_BIN")
+}
+
 /// Free KiB of the filesystem holding a path, as this host reports it now.
 fn measured_free_kb(path: &Path) -> Option<u64> {
     crate::disk::free_bytes(path).ok().map(|bytes| bytes / 1024)
@@ -1100,12 +1204,131 @@ pub(crate) fn count_scenarios(directory: &Path) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaseDisagrees, GateFailure, PrivateDirectory, gate_env, judge, judge_in, run_bounded,
-        withhold_owners_cluster,
+        BaseDisagrees, Cpu, GateFailure, PrivateDirectory, gate_env, judge, judge_in,
+        on_shared_server, run_bounded, withhold_owners_cluster,
     };
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    fn cpu(pairs: &[(&str, &str)], cores: usize) -> Result<Cpu, String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+        Cpu::from_env(
+            |name| {
+                pairs
+                    .iter()
+                    .find(|(known, _)| known == name)
+                    .map(|(_, value)| value.clone())
+            },
+            cores,
+        )
+    }
+
+    /// SPAWN_GATE_JOBS and SPAWN_GATE_WORKER_CORES parse as gate.sh reads a
+    /// whole number (digits, no leading zero); unset or empty is the
+    /// default; anything else refuses to start, naming the variable.
+    #[test]
+    fn the_cpu_settings_parse_like_the_others() {
+        let plain = cpu(&[], 9).expect("defaults");
+        assert_eq!(
+            plain,
+            Cpu {
+                cores: 9,
+                reserved: 2,
+                jobs: None
+            }
+        );
+        assert_eq!(cpu(&[("SPAWN_GATE_JOBS", "")], 9), Ok(plain.clone()));
+        assert_eq!(
+            cpu(&[("SPAWN_GATE_JOBS", " 2 ")], 9).map(|c| c.jobs),
+            Ok(Some(2))
+        );
+        for bad in ["0", "-1", "two", "01", "2.5", "+3"] {
+            let error = cpu(&[("SPAWN_GATE_JOBS", bad)], 9).expect_err(bad);
+            assert!(
+                error.contains("SPAWN_GATE_JOBS is a whole number from 1"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            cpu(&[("SPAWN_GATE_WORKER_CORES", "0")], 9).map(|c| c.reserved),
+            Ok(0)
+        );
+        assert_eq!(
+            cpu(&[("SPAWN_GATE_WORKER_CORES", "8")], 9).map(|c| c.reserved),
+            Ok(8)
+        );
+        for bad in ["9", "12", "x", "-1", "03"] {
+            let error = cpu(&[("SPAWN_GATE_WORKER_CORES", bad)], 9).expect_err(bad);
+            assert!(
+                error.contains("SPAWN_GATE_WORKER_CORES is a whole number from 0 to 8"),
+                "{error}"
+            );
+        }
+        // Small hosts: a quarter of the cores, at least 1, never all of them.
+        assert_eq!(cpu(&[], 2).map(|c| c.reserved), Ok(1));
+        assert_eq!(cpu(&[], 1).map(|c| c.reserved), Ok(0));
+        assert_eq!(cpu(&[], 16).map(|c| c.reserved), Ok(4));
+    }
+
+    /// The room decision at its boundary, on the 9-core host of 2026-11-08
+    /// (2 cores kept for the workers).
+    #[test]
+    fn a_gate_starts_only_within_the_cores() {
+        let host = cpu(&[], 9).expect("defaults");
+        // The default divides the 7 cores among the gates that can run at once.
+        assert_eq!(host.jobs_for(false, 1), 7);
+        assert_eq!(host.jobs_for(false, 2), 3);
+        assert_eq!(host.jobs_for(false, 3), 2);
+        assert_eq!(host.jobs_for(false, 9), 1, "at least one");
+        assert_eq!(
+            cpu(&[], 64).expect("big").jobs_for(false, 1),
+            8,
+            "at most 8"
+        );
+        assert_eq!(host.jobs_for(true, 1), 1, "the shared test server");
+        // Exactly the cores: starts; one more: waits.
+        assert!(host.fits(3, 4), "3 + 4 + 2 = 9");
+        assert!(!host.fits(3, 5), "3 + 5 + 2 = 10");
+        assert!(!host.fits(4, 4), "SPAWN_GATE_JOBS=4: a second gate waits");
+        // The defaults for two gates fit together; a third does not.
+        let two = host.jobs_for(false, 2);
+        assert!(host.fits(two, two));
+        assert!(!host.fits(two + two, two));
+        // No gate running: one always starts, however many jobs.
+        assert!(host.fits(0, 20));
+        // The owner's SPAWN_GATE_JOBS is every gate's.
+        let owner = cpu(&[("SPAWN_GATE_JOBS", "2")], 9).expect("set");
+        assert_eq!(owner.jobs_for(false, 3), 2);
+        assert_eq!(owner.jobs_for(true, 1), 2);
+        assert!(owner.fits(4, 2) && !owner.fits(6, 2));
+    }
+
+    #[test]
+    fn a_gate_is_on_the_shared_server_without_one_of_its_own() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect()
+        };
+        assert!(on_shared_server(&env(&[(
+            "SPAWN_TEST_DATABASE_URL",
+            "postgres://x"
+        )])));
+        assert!(!on_shared_server(&env(&[
+            ("SPAWN_TEST_DATABASE_URL", "postgres://x"),
+            ("SPAWN_GATE_PG_BIN", "/usr/lib/postgresql/16/bin")
+        ])));
+        assert!(!on_shared_server(&env(&[
+            ("SPAWN_TEST_DATABASE_URL", "postgres://x"),
+            ("SPAWN_GATE_PG_IMAGE", "postgres:16-alpine")
+        ])));
+        assert!(!on_shared_server(&env(&[])));
+    }
 
     fn shell(script: &str) -> Command {
         let mut command = Command::new("sh");
