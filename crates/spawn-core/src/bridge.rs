@@ -1379,6 +1379,11 @@ impl Bridge {
             let ends_turn = events
                 .iter()
                 .any(|event| event.kind.checkpoint_reason() == Some(CheckpointReason::TurnStopped));
+            if ends_turn {
+                // The screen has not shown this turn over yet, or this pass
+                // would not be reading it: see [`Follow::settling`].
+                active.follow.settling = Some(self.clock.now().0);
+            }
             if ends_turn
                 && !self.checkpoint(
                     agent_id,
