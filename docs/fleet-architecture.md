@@ -1529,7 +1529,10 @@ record of what was judged (§14 of design.md).
     that `main`. A hold on a source already held renews it: a new
     `source.held` naming `renews` (the active hold), which ends with it (no
     release or expiry is recorded for it). A source has at most one active
-    hold.
+    hold. A renewal moves the tasks that waited behind the old hold to the
+    new one in the fold (`held_by`), so the board, a release and an expiry
+    name them at once; the integrator still records `task.held` for the new
+    hold, once, when it next sees its landing wait.
   - `spawn mission release --source <source>` (owner only) records
     `source.released` {`source`, `hold`, `by`: `human`} and prints
     `{source, released, waiting}`. With no active hold it records nothing
