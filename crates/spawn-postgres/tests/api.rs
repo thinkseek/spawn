@@ -28,6 +28,7 @@ use spawn_core::observation::{Confidence, Observation, SemanticState};
 use spawn_core::observe::Observer;
 use spawn_core::port::{CommandQueue, EventLog};
 use spawn_core::time::SystemClock;
+use spawn_postgres::PostgresStore;
 
 mod common;
 use common::{admin, store, url};
@@ -2980,6 +2981,158 @@ fn m15_a_revival_that_dies_at_once_counts_as_a_failure() {
     assert_eq!(
         facts.failures, 0,
         "an engine that stayed up resets the count"
+    );
+}
+
+/// Objective 032: a revival that made progress before a fault took it is no
+/// failed revival, though it ended lost within the grace minute — its
+/// command succeeded and its engine worked. The liveness rule counts none
+/// of them, so it revives at once instead of backing off; revivals that
+/// never got to work are still failures.
+#[test]
+fn a_revival_that_worked_before_it_was_lost_is_not_a_failure() {
+    let (store, _schema) = store("revival_progress");
+    let reviver = "spawn-supervise";
+    let run = |number: u64, command: CommandId, worked: bool| {
+        let execution = ExecutionId::new(format!("exec_{number}")).expect("valid execution");
+        store
+            .append(lifecycle(
+                &execution,
+                Source::Bridge,
+                &format!("exec_{number}:started"),
+                EventKind::ExecutionStarted {
+                    engine: ENGINE.to_string(),
+                    workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+                    command_id: command,
+                    fork: None,
+                    model: ModelProfile::Default,
+                    transcript_from: None,
+                },
+            ))
+            .expect("started");
+        if worked {
+            store
+                .append(lifecycle(
+                    &execution,
+                    Source::Bridge,
+                    &format!("exec_{number}:tool"),
+                    EventKind::ToolCompleted {
+                        tool_use_id: format!("toolu_{number}"),
+                        duration_ms: Some(5),
+                    },
+                ))
+                .expect("progress");
+        }
+        store
+            .append(lifecycle(
+                &execution,
+                Source::Bridge,
+                &format!("exec_{number}:ended"),
+                EventKind::ExecutionEnded {
+                    cause: EndCause::Lost,
+                    exit_code: None,
+                    signal: None,
+                    evidence: None,
+                },
+            ))
+            .expect("ended");
+    };
+    let revive = |key: &str| {
+        let command = store
+            .submit(
+                &Principal::new(reviver).expect("valid principal"),
+                &Submission {
+                    action: CommandAction::Resume {
+                        prompt: None,
+                        model: None,
+                    },
+                    ..start(session(), key)
+                },
+            )
+            .expect("submit");
+        let claimed = store
+            .claim("bridge", Duration::from_mins(1))
+            .expect("claim")
+            .expect("the resume");
+        store
+            .finish(&claimed, &Outcome::Succeeded)
+            .expect("the engine launched");
+        command
+    };
+    let first = store
+        .submit(
+            &Principal::new("human").expect("valid"),
+            &start(session(), "first"),
+        )
+        .expect("submit");
+    let claimed = store
+        .claim("bridge", Duration::from_mins(1))
+        .expect("claim")
+        .expect("start");
+    store.finish(&claimed, &Outcome::Succeeded).expect("finish");
+    run(1, first, false);
+    // Three revivals that each worked a unit, then were lost: none failed.
+    for attempt in 2..=4 {
+        let command = revive(&format!("revive-{attempt}"));
+        run(attempt, command, true);
+    }
+    let facts = store.liveness_facts(&session(), reviver).expect("facts");
+    assert_eq!(
+        facts.failures, 0,
+        "a revival that worked is no failed revival; counted {}",
+        facts.failures
+    );
+    // Revivals after it that never got to work are failures.
+    for attempt in 5..=6 {
+        let command = revive(&format!("revive-{attempt}"));
+        run(attempt, command, false);
+    }
+    let facts = store.liveness_facts(&session(), reviver).expect("facts");
+    assert_eq!(
+        facts.failures, 2,
+        "revivals that never worked are failures; counted {}",
+        facts.failures
+    );
+}
+
+/// Objective 032: a database restart breaks the store's connection. The
+/// pass that meets it says so (`Unreachable`: the loop paces it and never
+/// ends on it), and the loop's next pass opens a store of its own, which
+/// reads the log again — the loop does not keep a dead connection.
+#[test]
+fn a_restarted_databases_broken_connection_is_unreachable_and_a_fresh_store_reads() {
+    let (_, schema) = store("restart_reopens");
+    let name = format!("spawn_test_restart_{}", std::process::id());
+    let url = url();
+    let separator = if url.contains('?') { '&' } else { '?' };
+    let named = format!("{url}{separator}application_name={name}");
+    let store = PostgresStore::connect_in_schema(&named, &schema).expect("connect");
+    assert!(
+        store.watermark().is_ok(),
+        "the connection works before the restart"
+    );
+    // The restart, as the database's own end of the connection: this
+    // store's backend is terminated, and only it (the name is this test's).
+    let ended = admin(&schema)
+        .execute(
+            "select pg_terminate_backend(pid) from pg_stat_activity
+              where application_name = $1 and pid <> pg_backend_pid()",
+            &[&name],
+        )
+        .expect("terminate the store's backend");
+    assert_eq!(ended, 1, "one backend of this test's");
+    let error = store
+        .watermark()
+        .expect_err("a closed connection says the database is unreachable");
+    assert!(
+        spawn_core::port::is_unreachable(&error.to_string()),
+        "the loop paces an unreachable pass instead of ending: {error}"
+    );
+    // The loop's next pass: a store of its own, on a live connection.
+    let fresh = PostgresStore::connect_in_schema(&named, &schema).expect("reconnect");
+    assert!(
+        fresh.watermark().is_ok(),
+        "a fresh store reads the log again after the restart"
     );
 }
 

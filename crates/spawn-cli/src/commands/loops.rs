@@ -58,6 +58,11 @@ use crate::{alerts, disk, dispatch, supervise};
 /// Most intervals a failing loop waits before its next pass.
 const MAX_BACKOFF_INTERVALS: u32 = 30;
 
+/// Most intervals an outage's pause grows to. The loop must notice the
+/// database is back within a few seconds of its clearing (objective 032:
+/// a restart of 8-20 s costs at most that), not half a minute.
+const MAX_OUTAGE_INTERVALS: u32 = 4;
+
 /// Pause after `failures` consecutive failures: one interval per failure,
 /// at least one, at most [`MAX_BACKOFF_INTERVALS`].
 fn backoff(interval: std::time::Duration, failures: u32) -> std::time::Duration {
@@ -329,9 +334,11 @@ impl Pace {
             backoff(interval, self.failures)
         } else {
             // Only the database was unreachable: it does not count toward
-            // MAX_FAILURES, and the pause grows to at most 30 intervals.
+            // MAX_FAILURES, and the pause grows to at most four intervals
+            // ([`MAX_OUTAGE_INTERVALS`]): a restart is noticed within a few
+            // seconds of its end.
             self.outages = self.outages.saturating_add(1);
-            backoff(interval, self.outages)
+            backoff(interval, self.outages.min(MAX_OUTAGE_INTERVALS))
         };
         Ok(Paused {
             wait,
@@ -766,7 +773,7 @@ impl Fleet<'_> {
         let pause = if self.pace.failures > 0 || self.pace.outages > 0 {
             // The pause [`Pace`] put after the last failed pass: a database
             // outage paces the loop, the pass interval per pass at first and
-            // at most 30 intervals ([`MAX_BACKOFF_INTERVALS`]).
+            // at most four ([`MAX_OUTAGE_INTERVALS`]).
             self.pause
         } else {
             self.schedule.earliest().map_or(self.interval, |due| {
@@ -810,7 +817,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        MAX_BACKOFF_INTERVALS, MAX_FAILURES, Pace, Schedule, Step, backoff, pause_unless_stopped,
+        MAX_FAILURES, MAX_OUTAGE_INTERVALS, Pace, Schedule, Step, backoff, pause_unless_stopped,
         stop_on_signal,
     };
 
@@ -976,8 +983,8 @@ mod tests {
             .expect("still an outage");
         assert_eq!(
             paused.wait,
-            interval * MAX_BACKOFF_INTERVALS,
-            "the outage's pause grows to at most thirty intervals"
+            interval * MAX_OUTAGE_INTERVALS,
+            "the outage's pause grows to at most four intervals, so a restart is noticed in seconds"
         );
         // Any other failure counts, and ten of them end the loop.
         for _ in 1..MAX_FAILURES {
@@ -988,6 +995,41 @@ mod tests {
         assert!(
             pace.after(&other, interval, &mut recovery).is_err(),
             "{MAX_FAILURES} failed passes end the loop"
+        );
+    }
+
+    /// A database outage's pause grows one interval per failed pass and
+    /// stops at four: the loop notices a restart within a few seconds of
+    /// its end (objective 032's soak), and an outage never ends it.
+    #[test]
+    fn an_outages_pause_grows_to_four_intervals_and_never_ends_the_loop() {
+        let interval = Duration::from_millis(500);
+        let dark = vec![format!(
+            "{}: connection closed",
+            spawn_core::port::UNREACHABLE
+        )];
+        let mut pace = Pace::default();
+        let mut recovery = crate::recover::Recovery::new();
+        let waits: Vec<Duration> = (0..8)
+            .map(|_| {
+                pace.after(&dark, interval, &mut recovery)
+                    .expect("an outage never ends the loop")
+                    .wait
+            })
+            .collect();
+        assert_eq!(
+            waits,
+            vec![
+                interval,
+                interval * 2,
+                interval * 3,
+                interval * 4,
+                interval * 4,
+                interval * 4,
+                interval * 4,
+                interval * 4,
+            ],
+            "at most two seconds at the 500 ms interval"
         );
     }
 
