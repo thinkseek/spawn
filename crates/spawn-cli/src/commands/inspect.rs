@@ -16,10 +16,7 @@ pub(crate) fn fleet() -> Result<i32, String> {
     let envelopes = crate::envelope::Runtime::from_env().ok();
     let waits = store.admissions().map_err(|error| error.to_string())?;
     if let Some(agents) = fleet.as_array_mut() {
-        crate::envelope::fleet(
-            envelopes.as_ref().and_then(|runtime| runtime.envelope()),
-            agents,
-        );
+        crate::envelope::fleet(envelopes.as_ref().and_then(|runtime| runtime.envelope()), agents);
         crate::envelope::admissions(agents, &waits);
     }
     println!(

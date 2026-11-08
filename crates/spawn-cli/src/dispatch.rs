@@ -1668,38 +1668,6 @@ mod tests {
         );
     }
 
-    /// A record whose evidence is `cannot_judge` (029: no systemd user
-    /// manager in the sandbox) names the objective and says it is judged
-    /// outside the gate, never that the test database failed or that the
-    /// load should be checked. The second in a row still escalates.
-    #[test]
-    fn a_cannot_judge_host_fault_names_the_objective_judged_outside_the_gate() {
-        let record = serde_json::json!({"type": "task.gated", "verdict": "host_fault", "id": 11,
-            "event_id": 61, "mission": 7, "host_faults": 2, "escalate": true,
-            "evidence": "cannot_judge", "scenario": "029.sh",
-            "backoff_ms": 600_000, "due_ms": 1_793_930_000_000_i64});
-        let host = super::digest::host_fault_escalations(&[record]);
-        assert_eq!(host.len(), 1);
-        assert_eq!(host[0].tag(), "host gate-host-fault-61");
-        assert_eq!(host[0].why, Why::GateHostFault);
-        let line = &host[0].line;
-        assert!(
-            line.contains("this host cannot judge the objective here (029.sh"),
-            "{line}"
-        );
-        assert!(
-            line.contains("judged outside the gate, by the owner (mission 7)"),
-            "{line}"
-        );
-        assert!(
-            line.contains("nothing is counted and nothing halts"),
-            "{line}"
-        );
-        assert!(!line.contains("test database"), "{line}");
-        assert!(!line.contains("load"), "{line}");
-        assert!(!line.contains('\n'), "{line}");
-    }
-
     /// Objective 33: three bases in a row that disagreed with themselves
     /// reach an idle supervisor once, as an item of `host` tagged
     /// `host gate-base-disagrees-<event id>`, naming the task, the mission,

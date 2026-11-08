@@ -177,7 +177,10 @@ impl Settings {
         };
         let slice = match lookup("SPAWN_SLICE").map(|text| text.trim().to_string()) {
             Some(name) if !name.is_empty() => {
-                if name.len() > 200 || name.contains('/') || name.chars().any(char::is_whitespace) {
+                if name.len() > 200
+                    || name.contains('/')
+                    || name.chars().any(char::is_whitespace)
+                {
                     return Err(format!("SPAWN_SLICE is a unit name, not '{name}'"));
                 }
                 match name.strip_suffix(".slice") {
@@ -386,21 +389,13 @@ pub struct Admission<'a> {
 impl Admission<'_> {
     /// The field that names the start in the log.
     fn field(&self) -> &'static str {
-        if self.kind == "gate" {
-            "task"
-        } else {
-            "command_id"
-        }
+        if self.kind == "gate" { "task" } else { "command_id" }
     }
 
     /// Its value there.
     fn value(&self) -> Option<String> {
         let value = self.fields.get(self.field())?;
-        Some(
-            value
-                .as_u64()
-                .map_or_else(|| value.to_string(), |number| number.to_string()),
-        )
+        Some(value.as_u64().map_or_else(|| value.to_string(), |number| number.to_string()))
     }
 }
 
@@ -516,10 +511,7 @@ pub fn probe() -> Result<Manager, String> {
         ));
     }
     let subtree = std::fs::read_to_string(path.join("cgroup.subtree_control")).unwrap_or_default();
-    if !subtree
-        .split_whitespace()
-        .any(|controller| controller == "memory")
-    {
+    if !subtree.split_whitespace().any(|controller| controller == "memory") {
         return Err(format!(
             "the user manager does not delegate the memory controller (subtree_control: {})",
             subtree.trim()
@@ -889,11 +881,11 @@ fn read_u64(path: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Admission, DEFAULT_EXECUTION_MEMORY_HIGH, DEFAULT_EXECUTION_MEMORY_MAX,
-        DEFAULT_GATE_MEMORY_HIGH, DEFAULT_GATE_MEMORY_MAX, DEFAULT_MEMORY_SWAP_MAX, DEFAULT_SLICE,
-        DEFAULT_SLICE_CPU_WEIGHT, DEFAULT_SLICE_MEMORY_HIGH, DEFAULT_SLICE_MEMORY_MAX, Envelope,
-        GIB, Limits, MIB, Manager, Mode, Settings, admit, admitted, available_bytes, parse_size,
-        shortfall_of,
+        Admission, admit, admitted, shortfall_of,
+        DEFAULT_EXECUTION_MEMORY_HIGH, DEFAULT_EXECUTION_MEMORY_MAX, DEFAULT_GATE_MEMORY_HIGH,
+        DEFAULT_GATE_MEMORY_MAX, DEFAULT_MEMORY_SWAP_MAX, DEFAULT_SLICE, DEFAULT_SLICE_CPU_WEIGHT,
+        DEFAULT_SLICE_MEMORY_HIGH, DEFAULT_SLICE_MEMORY_MAX, Envelope, GIB, Limits, MIB, Manager,
+        Mode, Settings, available_bytes, parse_size,
     };
 
     fn environment(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -978,7 +970,8 @@ mod tests {
             ("SPAWN_EXECUTION_MEMORY_SWAP_MAX", "lots"),
             ("SPAWN_GATE_MEMORY_HIGH", "-1G"),
         ] {
-            let error = Settings::from_lookup(environment(&[(name, value)])).expect_err("refused");
+            let error = Settings::from_lookup(environment(&[(name, value)]))
+                .expect_err("refused");
             if !value.is_empty() {
                 assert!(error.contains(name), "{name} in {error}");
             }
@@ -1046,10 +1039,7 @@ mod tests {
     fn scopes_are_named_after_the_slice_and_the_execution() {
         let envelope = envelope("bb029_1_2.slice");
         let execution = crate::id::ExecutionId::new("exec_1").expect("an id");
-        assert_eq!(
-            envelope.execution_scope(&execution),
-            "bb029_1_2-exec_1.scope"
-        );
+        assert_eq!(envelope.execution_scope(&execution), "bb029_1_2-exec_1.scope");
         assert_eq!(envelope.gate_scope(7, 1), "bb029_1_2-gate-7-1.scope");
         assert_eq!(envelope.gate_scope(7, 2), "bb029_1_2-gate-7-2.scope");
         assert_eq!(
@@ -1104,15 +1094,9 @@ mod tests {
         let gib = GIB;
         // Fits: 2 GiB held under a 20 GiB slice leaves 12 GiB for a 12 GiB
         // envelope; 20 GiB available on the host.
-        assert_eq!(
-            super::shortfall_of(20 * gib, 12 * gib, Some(2 * gib), Some(20 * gib)),
-            None
-        );
+        assert_eq!(super::shortfall_of(20 * gib, 12 * gib, Some(2 * gib), Some(20 * gib)), None);
         // An empty slice measures nothing.
-        assert_eq!(
-            super::shortfall_of(20 * gib, 12 * gib, None, Some(20 * gib)),
-            None
-        );
+        assert_eq!(super::shortfall_of(20 * gib, 12 * gib, None, Some(20 * gib)), None);
         // The slice short: 9 GiB > 20 - 12.
         let short = super::shortfall_of(20 * gib, 12 * gib, Some(9 * gib), Some(20 * gib))
             .expect("the slice is short");
@@ -1125,14 +1109,10 @@ mod tests {
         assert_eq!(short.measure, "host");
         assert_eq!(short.threshold, 12 * gib);
         // Both short: the slice is the one named.
-        let short =
-            super::shortfall_of(20 * gib, 12 * gib, Some(9 * gib), Some(gib)).expect("short");
+        let short = super::shortfall_of(20 * gib, 12 * gib, Some(9 * gib), Some(gib)).expect("short");
         assert_eq!(short.measure, "slice");
         // A host measure that cannot be read decides nothing.
-        assert_eq!(
-            super::shortfall_of(20 * gib, 12 * gib, Some(2 * gib), None),
-            None
-        );
+        assert_eq!(super::shortfall_of(20 * gib, 12 * gib, Some(2 * gib), None), None);
         // The scenario's own numbers: 144 MiB slice, 96 MiB envelope, 49 MiB
         // held means the threshold 48 MiB is passed.
         let mib = MIB;
@@ -1140,10 +1120,7 @@ mod tests {
             .expect("the slice is short");
         assert_eq!(short.threshold, 48 * mib);
         assert_eq!(short.measure, "slice");
-        assert_eq!(
-            super::shortfall_of(144 * mib, 96 * mib, Some(48 * mib), Some(96 * mib)),
-            None
-        );
+        assert_eq!(super::shortfall_of(144 * mib, 96 * mib, Some(48 * mib), Some(96 * mib)), None);
     }
 
     #[test]
@@ -1180,10 +1157,7 @@ mod tests {
         }
 
         fn at(&self, now: i64) {
-            *self
-                .now
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = now;
+            *self.now.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = now;
         }
     }
 
@@ -1196,10 +1170,7 @@ mod tests {
                 .records
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let at = *self
-                .now
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let at = *self.now.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             records.push((record.clone(), at));
             Ok(crate::port::Recorded {
                 id: i64::try_from(records.len()).unwrap_or(i64::MAX),
@@ -1234,10 +1205,7 @@ mod tests {
         }
 
         fn now_ms(&self) -> Result<i64, crate::port::StoreError> {
-            Ok(*self
-                .now
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner))
+            Ok(*self.now.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
         }
     }
 

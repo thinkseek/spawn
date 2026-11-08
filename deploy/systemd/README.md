@@ -201,50 +201,10 @@ tests the switch (scratch directories only).
 | `spawn` | the deployed commit (the missions repo's `main` after a deploy) | `spawn-integrate` (`SPAWN_GATE`), `spawn-maintenance`, mission 4's `--gate .../rsi/scenarios` and `--backlog .../rsi/backlog` | `deploy/deploy.sh`, with the install |
 | `supply-pa` | the live `main` of `missions/supply-pa.git` | mission 6's `--gate .../gate/scenarios` and `--backlog .../gate/backlog` (the gate script is Spawn's) | the owner's push to that repo, below |
 
-Supply PA's tree runs on dependencies git does not hold: `pnpm install`
-output from its lockfile (its manifests and lockfile are protected, so only
-an owner install changes them). They live in a deps store, one tree per
-lockfile hash, never in the owner's checkout, whose `.pnpm` every agent may
-write:
-
-    ~/.local/share/spawn-rsi/deps/supply-pa/<sha256 of pnpm-lock.yaml>/
-    ~/.local/share/spawn-rsi/deps/supply-pa/current -> <that hash>
-
-`deploy/controller.sh deps supply-pa <git-dir> <commit>` installs a tree
-(`pnpm install --frozen-lockfile --ignore-scripts
---config.package-import-method=clone-or-copy` from the commit's lockfile,
-then read-only; a hardlink into pnpm's store is refused, since making it
-read-only would change the store). `--ignore-scripts` is deliberate: the
-install runs as the owner with network, and a lifecycle script in the root
-or a workspace package would run there. Nothing in the tree needs one
-(`pnpm-workspace.yaml` sets `allowBuilds: esbuild: false`, and esbuild's
-binary comes from its platform package); a dependency that does need a
-build step is an owner decision and a reason to revisit the line. `update`
-installs the tree when the lockfile's has none, and `build` refuses a commit
-whose tree is missing. A switch points `current` at that commit's tree and
-removes the trees nothing uses: not the current or the previous controller's
-(`.deps` in each), not one an agent's workspace links into
-(`ws/<agent>/node_modules/.pnpm`), not one a process holds. An agent's
-workspace therefore keeps the dependencies it built with until the
-workspace is gone.
-
-"Read-only" is a boundary against accidents, not against agents. Engines run
-as the same uid as everything else here: one that means to can hardlink a
-store file (the inode is then writable by its workspace and the store
-together) and write it, or chmod a file it copies. What the modes give is
-the accident: a build, a test or an engine's Write tool cannot change the
-store by mistake, the gate's sandbox shows it read-only, and a deliberate
-change has to be a deliberate act (a hardlink, a chmod) instead of a slip.
-Confining a deliberate agent takes per-agent uids or a mount per engine,
-which is the owner's decision.
-
-Engines and gates read the store through `SUPPLY_PA_DEPS`: a line
-`SUPPLY_PA_DEPS=/home/ckl/.local/share/spawn-rsi/deps/supply-pa/current`
-in `spawn.env` (a literal path, as systemd's EnvironmentFile does not expand
-`$HOME`); Spawn hands it to every engine's pane, and the gate carries it into
-its sandbox. Unset, `gate/scenarios/build`, the drivers and the default in
-`gate/scenarios/bind` use that pointer anyway, and the owner's checkout is
-never a source.
+Supply PA's scenarios still name the owner's installed dependencies in
+`~/projects/supply-pa` (`gate/scenarios/bind`, `SUPPLY_PA_DEPS`): those are
+`pnpm install` output, not tracked files, and its manifests and lockfile are
+protected, so only an owner install changes them.
 
 An owner push to a gated source other than Spawn (Supply PA): stop
 `spawn-integrate`, push to `~/.local/share/spawn-rsi/missions/<repo>.git`, run
@@ -255,10 +215,7 @@ deploy/controller.sh update supply-pa ~/.local/share/spawn-rsi/missions/supply-p
 ```
 
 and start `spawn-integrate` again. Until that update, the mission keeps
-judging with the scenarios and backlog of the commit before. The update
-installs the new lockfile's deps tree first when it has none (it needs
-network and `pnpm`), so a push that changes the lockfile is complete only
-once that has run.
+judging with the scenarios and backlog of the commit before.
 
 The move to controllers, once per host: `deploy/cutover-controller.sh
 --dry-run` shows what it would do (nothing changes), then
@@ -268,24 +225,3 @@ installs these units, reconfigures missions 4 and 6 to the controller paths
 runs. Deploy this change first (so the integrator pins the controller and
 reads tasks' scenarios from the mission's directory), then run the cutover;
 it is safe to run again.
-
-## Which objectives the gate cannot judge
-
-The gate's sandbox is not the host: it has no systemd user manager and no
-delegated cgroup (the owner's ruling, 2026-11-06), so an objective whose
-scenario judges the host's resource envelopes cannot run in it. Such a
-scenario exits 6, the gate's host-fault exit, with its own `cannot_judge`
-fact (`rsi/scenarios/029.sh`'s `cannot_judge()`). On the base the gate
-caches the result `cannot_judge`, so the scenario stops no other landing;
-on the candidate it is skipped as a regression, and an objective-29 task is
-never rejected or aborted for it: the integrator records a `host_fault`
-with the evidence `cannot_judge`, retried after the backoff and counted
-toward no halt. The owner judges that objective outside the gate (mission
-7).
-
-| Objective | Scenario | Why the gate cannot judge it |
-| --- | --- | --- |
-| 029 | `rsi/scenarios/029.sh` | every execution and gate runs in a systemd user scope with memory and CPU limits; the sandbox has no user manager to make one |
-
-A new objective of this kind says so in its scenario's header and adds a row
-here.
