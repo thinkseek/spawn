@@ -234,7 +234,11 @@ pub struct BridgeConfig {
     pub screen_quiet: Duration,
     /// The model relay, when Claude Code engines go through one.
     pub model_relay: Option<ModelRelay>,
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
+    /// The watch on the files the engines write (transcripts and exit
+    /// statuses), when the host has one. `None` reads every live execution's
+    /// files on every pass, as Spawn did before watches: correct, and the
+    /// cost grows with the fleet.
+    pub watch: Option<Arc<dyn FileWatch>>,
     /// Environment decided again at every engine launch, after
     /// `environment` and before `session_environment`: the fleet's test
     /// database, given only once it is known not to be the gates' server or
@@ -249,13 +253,6 @@ pub trait LaunchEnvironment: Send + Sync + std::fmt::Debug {
     /// The variables to add now; none when they are withheld (the
     /// implementation says why where the owner reads it).
     fn environment(&self) -> Vec<(String, String)>;
-=======
-    /// The watch on the files the engines write (transcripts and exit
-    /// statuses), when the host has one. `None` reads every live execution's
-    /// files on every pass, as Spawn did before watches: correct, and the
-    /// cost grows with the fleet.
-    pub watch: Option<Arc<dyn FileWatch>>,
->>>>>>> babe30d9d936ddf896cadefec9000f6f46e38794
 }
 
 impl BridgeConfig {
@@ -277,11 +274,8 @@ impl BridgeConfig {
             screen_refresh: Duration::from_secs(30),
             screen_quiet: Duration::from_millis(500),
             model_relay: None,
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-            launch_environment: None,
-=======
             watch: None,
->>>>>>> babe30d9d936ddf896cadefec9000f6f46e38794
+            launch_environment: None,
         }
     }
 }
