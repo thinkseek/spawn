@@ -425,6 +425,7 @@ fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
     let ended = |cause| EventKind::ExecutionEnded {
         cause,
         exit_code: Some(0),
+        signal: None,
         evidence: None,
     };
     let row = |label: &str| {
@@ -550,6 +551,7 @@ fn two_connections_racing_to_start_one_session_record_one_execution() {
             EventKind::ExecutionEnded {
                 cause: EndCause::Lost,
                 exit_code: None,
+                signal: None,
                 evidence: None,
             },
         ))
@@ -599,6 +601,7 @@ fn open_tools_are_started_minus_finished_in_live_executions() {
             EventKind::ExecutionEnded {
                 cause: EndCause::Exited,
                 exit_code: Some(0),
+                signal: None,
                 evidence: None,
             },
         ))
@@ -1377,7 +1380,7 @@ fn view_columns_match_the_snapshot() {
     let expected = [
         "agent_artifacts: session_id text, agent_id text, execution_id text, project text, branch text, commit_id text, reason text, session_seq bigint, recorded_at_ms bigint",
         "agent_commands: id bigint, agent_id text, session_id text, idempotency_key text, action jsonb, created_at_ms bigint",
-        "agent_executions: session_id text, agent_id text, execution_id text, engine text, terminal text, workspace text, started_at_ms bigint, cause text, exit_code integer, ended_at_ms bigint, exit_reported boolean, duration_ms bigint, command_id bigint",
+        "agent_executions: session_id text, agent_id text, execution_id text, engine text, terminal text, workspace text, started_at_ms bigint, cause text, exit_code integer, signal integer, evidence text, ended_at_ms bigint, exit_reported boolean, duration_ms bigint, command_id bigint",
         "agent_freshness: session_id text, agent_id text, last_session_seq bigint, last_event_id bigint, last_event_at_ms bigint, event_count bigint",
         "agent_judgements: session_id text, session_seq bigint, event_id bigint, agent_id text, state text, reason text, based_on_seq bigint, observation jsonb, recorded_at_ms bigint",
         "agent_lineage: session_id text, agent_id text, ancestor_session_id text, depth integer",
@@ -1700,6 +1703,7 @@ impl Worker<'_> {
             EventKind::ExecutionEnded {
                 cause: EndCause::Stopped,
                 exit_code: None,
+                signal: None,
                 evidence: None,
             },
         );
@@ -2308,6 +2312,7 @@ fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
                     EventKind::ExecutionEnded {
                         cause: EndCause::Stopped,
                         exit_code: None,
+                        signal: None,
                         evidence: None,
                     },
                 )
@@ -2908,6 +2913,7 @@ fn m15_a_revival_that_dies_at_once_counts_as_a_failure() {
                 EventKind::ExecutionEnded {
                     cause: EndCause::Lost,
                     exit_code: None,
+                    signal: None,
                     evidence: None,
                 },
             ))
@@ -3002,6 +3008,7 @@ fn dispatch_facts_count_resumes_lost_again_at_once() {
                 EventKind::ExecutionEnded {
                     cause: EndCause::Lost,
                     exit_code: None,
+                    signal: None,
                     evidence: None,
                 },
             ),
@@ -3141,6 +3148,7 @@ fn dispatch_facts_name_the_resume_lost_before_its_engine_became_ready() {
             EventKind::ExecutionEnded {
                 cause: EndCause::Lost,
                 exit_code: None,
+                signal: None,
                 evidence: Some(evidence.to_string()),
             },
         );

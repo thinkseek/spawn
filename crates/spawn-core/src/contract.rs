@@ -148,6 +148,7 @@ pub fn one_execution(tag: &str, log: &dyn EventLog) {
             EventKind::ExecutionEnded {
                 cause,
                 exit_code: None,
+                signal: None,
                 evidence: None,
             },
         )

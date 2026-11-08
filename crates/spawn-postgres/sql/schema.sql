@@ -692,6 +692,12 @@ select
     s.recorded_at_ms as started_at_ms,
     x.kind -> 'detail' ->> 'cause'     as cause,
     (x.kind -> 'detail' ->> 'exit_code')::integer as exit_code,
+    -- The signal that killed the engine, when one did (the runner writes it
+    -- beside the exit status; the Bridge records it). Null for an exit.
+    (x.kind -> 'detail' ->> 'signal')::integer as signal,
+    -- What the Bridge saw when no runner of its own ran the execution any
+    -- more; null for an exit or a stop of a running engine.
+    x.kind -> 'detail' ->> 'evidence' as evidence,
     x.recorded_at_ms as ended_at_ms,
     -- The execution ends only when the Bridge writes its own end event. An
     -- end from another source is an exit report of an old runner: runners
@@ -1762,6 +1768,22 @@ begin
            set state = 'cleared', cleared_event_id = p_event, cleared_at_ms = p_at,
                cleared_evidence = coalesce(p_record -> 'evidence', '{}'::jsonb)
          where key = p_record ->> 'key';
+    when 'host.loop_started' then
+        -- `spawn loop` started (its boot id and start time): the recovery
+        -- reads it to tell an execution whose end this loop found after a
+        -- host restart from one it watched fail (spawn_host_record).
+        null;
+    when 'execution.interrupted' then
+        -- One interruption of one execution: how it ended (or how a turn
+        -- failed) with its cause, its evidence and the path back. Read from
+        -- the log by the next pass, this one and after a restart, folded
+        -- into no table (spawn_host_record).
+        null;
+    when 'execution.cleared' then
+        -- The wait an interruption opened is over: what showed the cause
+        -- gone and how long it held. Read from the log, folded into no
+        -- table (spawn_host_record).
+        null;
     when 'task.report_unfinished' then
         -- A report still a draft, not taken (spawn_task_report_unfinished):
         -- the task stays delivered, so nothing is folded.
@@ -3119,26 +3141,104 @@ create index if not exists spawn_events_source_push
       and kind -> 'detail' -> 'record' ->> 'type'
           in ('source.push_requested', 'source.push_refused', 'source.moved');
 
--- The loop's disk records (`host.disk`, owner only): free space on a path
--- the fleet writes to fell under the warning threshold (`low`) or came back
--- (`recovered`). One record per crossing; the loop reads the latest per path
--- back from the log after a restart.
+-- The loop's own records, owner only, folded into no table: what this host
+-- saw and what it did about it (docs/fleet-architecture.md §3.1, "the
+-- recovery"). One function, so a restricted login can write none of them.
+--
+-- - `host.disk`: free space on a path the fleet writes to fell under the
+--   warning threshold (`low`) or came back (`recovered`). One record per
+--   crossing; the loop reads the latest per path back from the log after a
+--   restart.
+-- - `host.loop_started`: one `spawn loop` started, with its `boot_id` and
+--   `started_at_ms`. A restarted loop tells an execution whose end it found
+--   from one it watched fail by the records of the loops before it.
+-- - `execution.interrupted`: one interruption of one execution, recorded
+--   once, whatever an earlier loop recorded and whether or not it was
+--   revived. Its `attempt` counts the interruptions of that execution, so
+--   `recover-<execution_id>-<attempt>` names this one and no other; `path`
+--   is the way back (`resume`, `handoff`, `wait`, `final`) and `due_ms`
+--   when it is due (null on `final`). The required fields, and the cause
+--   and path vocabulary, are checked here: a record the recovery could not
+--   act on is refused, never written and re-read.
+-- - `execution.cleared`: the wait an interruption opened is over, with what
+--   showed it and `waited_ms` from the first interruption of the wait. Its
+--   `execution_id` and `cause` are those of the interruption it answers.
 create or replace function spawn_host_record(p_record jsonb)
 returns bigint language plpgsql security definer as $$
+declare
+    v_type text := p_record ->> 'type';
+    v_cause text := p_record ->> 'cause';
+    v_path text := p_record ->> 'path';
 begin
     perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record host facts', session_user using errcode = '42501';
     end if;
-    if p_record ->> 'type' is distinct from 'host.disk' then
-        raise exception 'not a host record: %', p_record ->> 'type';
+    if v_type is null then
+        raise exception 'a host record has a type';
     end if;
-    if p_record ->> 'state' not in ('low', 'recovered') or p_record ->> 'path' is null
-       or jsonb_typeof(p_record -> 'free_bytes') is distinct from 'number' then
-        raise exception 'a host.disk record has a path, free_bytes and state low or recovered: %', p_record;
+    if v_type = 'host.disk' then
+        if p_record ->> 'state' not in ('low', 'recovered') or p_record ->> 'path' is null
+           or jsonb_typeof(p_record -> 'free_bytes') is distinct from 'number' then
+            raise exception 'a host.disk record has a path, free_bytes and state low or recovered: %', p_record;
+        end if;
+    elsif v_type = 'host.loop_started' then
+        if p_record ->> 'boot_id' is null
+           or jsonb_typeof(p_record -> 'started_at_ms') is distinct from 'number' then
+            raise exception 'a host.loop_started record has a boot_id and started_at_ms: %', p_record;
+        end if;
+    elsif v_type = 'execution.interrupted' then
+        if p_record ->> 'agent_id' is null or p_record ->> 'session_id' is null
+           or p_record ->> 'execution_id' is null then
+            raise exception 'an execution.interrupted record names its agent, session and execution: %', p_record;
+        end if;
+        -- One vocabulary for every cause and path: a reader that knows
+        -- them is the only one that may write them.
+        if v_cause is null or v_cause not in (
+               'exited', 'crashed', 'memory_limit', 'context_exhausted',
+               'model_unavailable', 'model_auth', 'host_restart',
+               'database_unavailable', 'disk_full', 'budget', 'stopped') then
+            raise exception 'not an interruption cause: %', v_cause
+                using errcode = '22023';
+        end if;
+        if v_path is null or v_path not in ('resume', 'handoff', 'wait', 'final') then
+            raise exception 'not a recovery path: %', v_path using errcode = '22023';
+        end if;
+        if jsonb_typeof(p_record -> 'attempt') is distinct from 'number'
+           or (p_record ->> 'attempt')::numeric < 1 then
+            raise exception 'an interruption has an attempt of 1 or more: %', p_record;
+        end if;
+        if jsonb_typeof(p_record -> 'evidence') is distinct from 'object' then
+            raise exception 'an interruption names its evidence: %', p_record;
+        end if;
+        if v_path = 'final' then
+            if p_record -> 'due_ms' is not null and jsonb_typeof(p_record -> 'due_ms') = 'number' then
+                raise exception 'a final interruption is due never (due_ms null): %', p_record;
+            end if;
+        elsif jsonb_typeof(p_record -> 'due_ms') is distinct from 'number' then
+            raise exception 'a revival is due at due_ms: %', p_record;
+        end if;
+    elsif v_type = 'execution.cleared' then
+        if p_record ->> 'execution_id' is null or p_record ->> 'session_id' is null
+           or v_cause is null then
+            raise exception 'an execution.cleared record names its execution, session and cause: %', p_record;
+        end if;
+        if jsonb_typeof(p_record -> 'waited_ms') is distinct from 'number' then
+            raise exception 'an execution.cleared record names waited_ms: %', p_record;
+        end if;
+    else
+        raise exception 'not a host record: %', v_type;
     end if;
     return spawn_control_record(p_record);
 end $$;
+
+-- The recovery's records of one execution, found without reading the rest
+-- of the stream: every pass of every loop reads the latest back.
+create index if not exists spawn_events_recovery
+    on spawn_events ((kind -> 'detail' -> 'record' ->> 'execution_id'), session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type'
+          in ('execution.interrupted', 'execution.cleared');
 
 -- The `host.disk` records, found without reading the rest of the stream.
 create index if not exists spawn_events_host_disk

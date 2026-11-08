@@ -44,7 +44,7 @@ pub fn redact_event(kind: &mut EventKind) {
     let clean = |text: &mut String| *text = redact(text);
     match kind {
         EventKind::ToolFailed { error, .. }
-        | EventKind::TurnFailed { error }
+        | EventKind::TurnFailed { error, .. }
         | EventKind::ExecutionEndStalled { error, .. }
         | EventKind::CommandFinished {
             error: Some(error), ..

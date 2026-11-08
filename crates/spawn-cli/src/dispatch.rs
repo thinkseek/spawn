@@ -6,6 +6,14 @@
 //! 1. Rules over facts decide fixed cases: a lost execution is resumed once,
 //!    and a session whose resume failed is escalated, never resumed again by
 //!    rule (the one-resume rule, `worker::resume_lost`).
+//!
+//!    Every end its cause and its way back is the recovery's business
+//!    (`crate::recover`, docs/fleet-architecture.md §3.1): it records each
+//!    interruption with the facts it was told from and revives by one keyed
+//!    command, whatever the agent, and the one-resume rule gives way where
+//!    it has recorded one ([`Facts::recovered`]). What is left here is the
+//!    fallback for an end it has not recorded: a lost execution of an
+//!    ephemeral worker, resumed once and else escalated.
 //! 2. One guarded nudge: when Jev judged that a worker stopped at an idle
 //!    prompt without needing anyone (WAITING, confident, `needs_human` and
 //!    `stuck` low), it gets `continue` typed in, once per episode and at most
@@ -240,6 +248,11 @@ pub(crate) struct Facts {
     /// session's latest execution, which no resume was sent under.
     #[serde(default)]
     pub(crate) failed_resume: Option<FailedResume>,
+    /// The log's id of the recovery's `execution.interrupted` record for the
+    /// live execution: it revives the worker by its own rule, so the
+    /// one-resume ladder below gives way (crate::recover).
+    #[serde(default)]
+    pub(crate) recovered: Option<i64>,
     /// Every Stop and Discard sent into the session since its live
     /// execution started (none when it is not live), oldest first.
     #[serde(default)]
@@ -1111,6 +1124,7 @@ mod tests {
             checkpoint: None,
             charter: None,
             jobs: Vec::new(),
+            recovered: None,
         }
     }
 
@@ -1216,6 +1230,7 @@ mod tests {
             checkpoint: None,
             charter: None,
             jobs: Vec::new(),
+            recovered: None,
         }
     }
 
