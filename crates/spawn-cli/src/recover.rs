@@ -1092,6 +1092,7 @@ impl One<'_> {
         pending(
             &self.records,
             &self.row.turns,
+            &self.row.failed_tools,
             &self.execution(),
             &self.row.stops,
             &self.row.commands,
