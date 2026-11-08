@@ -220,9 +220,11 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
         .expect("start");
     // tmux marks the pane dead when its terminal closes, and records the
     // exit status when it reaps the process, a moment later on a loaded host
-    // ("exit status none" in between: an owner gate, 2026-11-07). Wait for
-    // the status, within the same bound.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // ("exit status none" in between: an owner gate, 2026-11-07; and a gate
+    // running 34 test binaries two at a time starved the server past five
+    // seconds, 2026-11-08). Wait for the status, with room for a loaded host;
+    // a server that never records it still fails the assertion below.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let seen = loop {
         let Runner::Untracked(seen) = settled(&host, Duration::from_secs(5)) else {
             panic!("a dead pane hosts no runner");

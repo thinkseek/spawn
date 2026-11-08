@@ -66,12 +66,17 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::DiskRecovered => "disk space back on this host",
         Why::GateRoom => "no room for the gate on this host",
         Why::GateHostFault => "host faults at the gate (the host's, not the work's)",
+        Why::GateBaseDisagrees => "the base disagreed with itself at the gate (the host's)",
         Why::Stalled => "stalled",
         Why::Charter => "new charter not typed",
         Why::BackgroundJob => "background job past its bound",
         Why::HoldExpired => "a source hold expired",
         Why::ObjectiveYielded => "an objective ran out of attempts and yielded its slot",
         Why::ObjectiveOrder => "a backlog names an order no task can meet",
+<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
+        Why::OverBudget => "a task went over its budget twice",
+=======
+>>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
     }
 }
 
@@ -141,6 +146,11 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
         .filter_map(|record| {
             let id = record["event_id"].as_i64()?;
             let task = record["id"].as_i64()?;
+            // Only a record that carries the escalation is one: a base that
+            // disagreed with itself never does (objective 033).
+            if record["escalate"].as_bool() != Some(true) {
+                return None;
+            }
             let mission = record["mission"]
                 .as_i64()
                 .map_or_else(|| "its mission".to_string(), |id| format!("mission {id}"));
@@ -194,6 +204,60 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
         .collect()
 }
 
+<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
+/// The digest items for `records`, the integrator's `host_fault` gate
+/// records whose base disagreed with itself and that carry `alert` (the
+/// mission's third such base in a row, objective 033), and that no delivered
+/// digest told yet (`PostgresStore::gate_base_disagrees_alerts`). Each names
+/// the task, the mission, the count in a row, the scenario, its exits, the
+/// gate's setup time when it printed one, and when the task is judged again
+/// (the record's `due_ms`). No time window: a record stays an item until a
+/// digest carrying its tag (`host gate-base-disagrees-<event id>`) reaches
+/// the supervisor, so it is told once. Before objective 030 exists this item
+/// is how the alert reaches a person; 030 raises its `gate_base_disagrees`
+/// notice from the same record.
+pub(crate) fn base_disagrees_alerts(records: &[Value]) -> Vec<Escalation> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let id = record["event_id"].as_i64()?;
+            let task = record["id"].as_i64()?;
+            // Only the record that makes the run three carries the alert;
+            // the other ones of the run are no news.
+            if record["alert"].as_bool() != Some(true) {
+                return None;
+            }
+            let mission = record["mission"]
+                .as_i64()
+                .map_or_else(|| "its mission".to_string(), |id| format!("mission {id}"));
+            let count = record["base_disagrees"].as_u64().unwrap_or(3);
+            let scenario = record["scenario"].as_str().unwrap_or("a scenario");
+            let setup = record["setup_s"]
+                .as_u64()
+                .map_or_else(String::new, |secs| format!(", setup {secs} s"));
+            let due = record["due_ms"].as_i64().map_or_else(
+                || "after its backoff".to_string(),
+                |due| format!("at {}", crate::scorecard::time::format_rfc3339(due)),
+            );
+            Some(Escalation {
+                session_id: HOST_SESSION.to_string(),
+                id: format!("gate-base-disagrees-{id}"),
+                why: Why::GateBaseDisagrees,
+                line: format!(
+                    "task #{task} of {mission}: the base disagreed with itself {count} in a row \
+                     at the gate ({scenario} exited 1, then 0 on the base{setup}): no candidate \
+                     code had run, so it is the host's (too loaded or too flaky to judge), not \
+                     the work's. It is judged again {due}; nothing is counted and nothing halts. \
+                     Check the host's load or tell the owner."
+                ),
+                since_ms: record["at_ms"].as_i64(),
+            })
+        })
+        .collect()
+}
+
+=======
+>>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
 /// The digest items for `records`, the integrator's yields (`task.cancelled`
 /// naming `yielded`) that no delivered digest told yet
 /// (`PostgresStore::objective_yields`). Each is an item of session
@@ -227,6 +291,69 @@ pub(crate) fn objective_yields(records: &[Value]) -> Vec<Escalation> {
         .collect()
 }
 
+<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
+/// The digest items for `records` (`PostgresStore::over_budget_escalations`):
+/// a task that continued an overrun task of its objective went over the
+/// budget too, so no third task is issued for it and the objective waits
+/// for the mission to be configured again. The item names both tasks, the
+/// objective, the branch and the work it holds (`git diff --stat main`),
+/// the budget and the tool calls, and what can be done. Told once: the
+/// record carries no window, a digest that reached the supervisor with the
+/// tag `host over-budget-<event id>` means it was told.
+pub(crate) fn over_budget_escalations(records: &[Value]) -> Vec<Escalation> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let id = record["event_id"].as_i64()?;
+            let task = record["id"].as_i64()?;
+            let continues = record["continues"].as_i64()?;
+            let mission = record["mission"]
+                .as_i64()
+                .map_or_else(|| "its mission".to_string(), |id| format!("mission {id}"));
+            let objective = record["objective"].as_u64().map_or_else(
+                || "an objective".to_string(),
+                |id| format!("objective {id}"),
+            );
+            let branch = record["branch"].as_str().unwrap_or("its branch");
+            let commit = record["commit"]
+                .as_str()
+                .map_or_else(|| "none (its push failed)".to_string(), str::to_string);
+            let diff = record["diff"]
+                .as_str()
+                .map(str::trim)
+                .filter(|diff| !diff.is_empty())
+                .map_or_else(
+                    || ":the work it holds: none recorded".to_string(),
+                    |diff| format!(":\n{diff}"),
+                );
+            let budget = record["budget"].to_string();
+            let calls = record["tool_calls"]
+                .as_i64()
+                .map_or_else(|| "its".to_string(), |calls| calls.to_string());
+            let reason = record["reason"].as_str().map_or_else(
+                || format!("task #{task} went over its budget too"),
+                |reason| one_line(reason, 300),
+            );
+            Some(Escalation {
+                session_id: "host".to_string(),
+                id: format!("over-budget-{id}"),
+                why: Why::OverBudget,
+                line: format!(
+                    "{mission}: task #{task} (a continuation of task #{continues}) went over \
+                     {objective}'s budget too: {reason}; it made {calls} tool calls, the budget \
+                     {budget}. Its branch {branch} at {commit}{diff}. Split the objective, raise \
+                     the budget with `spawn mission configure`, or take it over: no task is \
+                     issued for it until the mission is configured again, and its other \
+                     objectives go on."
+                ),
+                since_ms: record["at_ms"].as_i64(),
+            })
+        })
+        .collect()
+}
+
+=======
+>>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
 /// The digest items for `missions` (`PostgresStore::objective_backlogs`):
 /// one per open objective mission whose backlog names an order that cannot
 /// be met ([`crate::objectives::order_problems`]), of session `missions`,

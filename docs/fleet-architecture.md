@@ -708,9 +708,10 @@ stream (§10.1).
 
 **When a task closes.** A task closes by landing (or, without a gate,
 acceptance), or by a cancel: `spawn task cancel`, the supervisor's, the
-integrator's abort over budget (`task.aborted`), a gate rejection the
-closure rule turns into a cancel, or a mission closed or a resident retired
-under it (§10). A cancelled task's live work ends with it, at the source:
+integrator's overrun over budget (`task.over_budget`, whose work the
+objective's next task continues, §10.4), a gate rejection the closure rule
+turns into a cancel, or a mission closed or a resident retired under it
+(§10). A cancelled task's live work ends with it, at the source:
 
 - *Stopped.* When a delivered task is cancelled and it was its worker's
   latest delivery, the dispatcher stops the worker at once, in the middle of
@@ -807,6 +808,75 @@ systemd restarts it (`Restart=always`). Engines use the relay only where
 `SPAWN_MODEL_RELAY` names it (`http://127.0.0.1:8791` in `spawn.env`):
 unset or `off`, every engine runs on Claude Code's own settings, nothing
 probes a relay, and a cheap start fails.
+
+### 3.4 Alerts: what Spawn tells about itself
+
+The fleet used to be watched by a monitor the supervisor ran by hand: a loop
+in its pane, its state in its process. Nothing of it was recorded, a restart
+re-reported what was still true and forgot what changed, and no view of Spawn
+showed an alert. `spawn loop` now raises its own, from records and readings
+(`crates/spawn-cli/src/alerts.rs`):
+
+- **A record per transition.** Each alert is two control records at most:
+  `alert.fired {key, kind, subject, evidence, text}` and `alert.cleared {key,
+  kind, subject, evidence}`, written through the owner-only
+  `spawn_alert_record` and folded into `spawn_alerts`
+  ([storage.md](storage.md#alerts)). `key` names the occurrence; the store
+  refuses a second `alert.fired` for it, an `alert.cleared` without its
+  `alert.fired`, and a second `alert.cleared`. The step reads the keys back
+  on start, so a restart fires nothing twice, and two loops at once still
+  record each transition once.
+- **What fires.** Notices, for every mission: `task_state` (a control record
+  after which the task's state differs, with `from` and `to`),
+  `mission_state` (its `state`, `halted`, `gate_rejections`, `gate_aborts` or
+  `gate_room_escalated` differs, with `before` and `after`),
+  `gate_base_disagrees` (objective 033's host fault with `alert`), and
+  `command_failed` (a command that finished failed; an owner's note is not
+  news). Conditions: `task_undelivered` (assigned longer than
+  `SPAWN_ALERT_UNDELIVERED_SECS`, default 300, while its agent holds no
+  delivered or reported task), `mission_halted` (cleared at its
+  `mission.resumed`), `postgres_crash` (a `terminated by signal`, `No space
+  left` or `could not resize` line in a database's log, cleared by the
+  first `database system is ready to accept connections` line after it or by
+  `SPAWN_ALERT_PG_QUIET_SECS` of silence, default 900), `memory_low`
+  (MemAvailable under `SPAWN_ALERT_MEMORY_LOW_MB`, default 4096; clears at
+  `SPAWN_ALERT_MEMORY_OK_MB`, default 8192), `tmpfs_high` (the used space of
+  the filesystem holding `SPAWN_ALERT_TMPFS_PATH`, default `/tmp`, over
+  `SPAWN_ALERT_TMPFS_HIGH_MB`, default 8000; clears under
+  `SPAWN_ALERT_TMPFS_OK_MB`, default 6000), `agent_stuck` (the session's
+  latest judgement at or above the Observer's 0.5, whatever the dispatcher
+  does with it), `admission_wait` (objective 029's record older than
+  `SPAWN_ALERT_ADMISSION_SECS`, default 600, with no admission after it),
+  `backup_stale` (the newest dump older than
+  `SPAWN_ALERT_BACKUP_DUMP_MAX_AGE_SECS`, default 7200, or bundle older than
+  `SPAWN_ALERT_BACKUP_BUNDLE_MAX_AGE_SECS`, default 93600; no record at all
+  is no alert), `backup_budget` (objective 031's `over_alert`), `drill_failed`
+  (a `backup.verified` with `ok` false) and `model_auth` (objective 028's
+  `execution.interrupted` with cause `model_auth`). Each fires once per
+  occurrence and clears with the record or reading that cleared it; a
+  threshold of `0` disables its check.
+- **When.** A record-borne alert is recorded within one pass of its record; a
+  host reading or a log line within `SPAWN_ALERT_CHECK_SECS` (default 30)
+  and one pass; a bound within one pass of falling due, never before,
+  measured on the database's clock from the record's `recorded_at_ms`. The
+  step runs when the event watermark moved or one of its timers is due, and
+  an idle pass reads the watermark once and nothing else (§14; objective
+  023). Like the disk watch it never fails a pass: an error is said and
+  tried at the next check.
+- **The same alerts everywhere.** `spawn alerts --once [--json] [--since
+  <span>]` prints every open alert and the window's transitions
+  (`SPAWN_ALERT_WINDOW_SECS`, default a day); `spawn alerts --follow
+  [--json]` prints each transition as it is recorded; `GET /api/alerts`
+  answers the same array as `--once --json`, from the same store method; the
+  dashboard shows the open alerts on every page and an Alerts view with
+  their evidence and their clearing. The supervisor's charter names the
+  command: its hand-run monitor retires, and the fleet's alerting is the
+  record's.
+- **Causality (§14).** An alert rests on a named record (its `event_id`) or
+  on a recorded reading (its measure and threshold); a clearing names what
+  cleared it; nothing rests on the step's memory, on absence, or on time
+  without a record. Evidence never holds a secret: no database URL with its
+  password, no environment, process names without their arguments.
 
 ## 4. Experience
 
@@ -1011,10 +1081,15 @@ controller. Missions, tasks, residents and landings are events in
   `source.released`, `source.hold_expired`, `task.assigned`,
   `task.delivered`, `task.report_unfinished`, `task.reported`,
   `task.reviewed`, `task.cancelled`, `task.gated`, `task.held`, `task.landed`,
+<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
+  `task.aborted`, `task.over_budget`, `resident.proposed`, `resident.approved`,
+=======
   `task.aborted`, `resident.proposed`, `resident.approved`,
+>>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
   `resident.retired`, `legacy.imported`, `host.disk`,
   `source.push_requested`, `source.push_refused` (§10.3, "The owner's
-  landings").
+  landings"), and the loop's alerts: `alert.fired` and `alert.cleared`
+  (§3.4, folded into `spawn_alerts`).
   `task.report_unfinished` is a delivered task's report the dispatcher read
   and did not take because it is still a draft: it names the task's
   `revision`, the content's `digest`, the `markers` (each with its `line`,
@@ -1033,13 +1108,16 @@ controller. Missions, tasks, residents and landings are events in
   ([design.md](design.md) §15).
 - **Who writes it:** only the checked mission functions, through
   `spawn_control_record`. The integrator's records (`task.gated`,
-  `task.landed`, `task.aborted`, `mission.halted`, and the outcomes of the
+  `task.landed`, `task.aborted`, `task.over_budget`, `mission.halted`, and
+  the outcomes of the
   owner's landings: `source.moved` naming a `request`,
   `source.push_refused`), `source.moved` (`spawn mission moved`), the
   owner's `source.push_requested` (`spawn mission push`; folded into no
-  table, nor is `source.push_refused`) and the loop's `host.disk` (through
+  table, nor is `source.push_refused`), the loop's `host.disk` (through
   `spawn_host_record`; folded into no table,
-  [storage.md](storage.md#disk-room)) need the owner's login. The
+  [storage.md](storage.md#disk-room)) and the loop's `alert.fired` and
+  `alert.cleared` (through `spawn_alert_record`, §3.4) need the owner's
+  login. The
   restricted logins write no events at all: `spawn_append` refuses them.
 - **The tables are a projection.** `spawn_control_apply(record)` is the only
   writer of `mission_*`, and it runs in the same transaction as the append.
@@ -1156,11 +1234,25 @@ record of what was judged (§14 of design.md).
     reports (`mission_news`) and `spawn_task_review` refuses them, because
     a review could send back the revision the gate is judging. Both stand
     until the Review point is built (§1.1, §9);
+<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
+  - budget: `--minutes` and `--tool-calls`. A delivered task over budget
+    keeps its work: its worker is stopped (the Stop is submitted before the
+    record, so a failed record is retried with it; a Stop that fails is
+    pursued and escalated by the dispatcher) and the overrun is its own
+    record, `task.over_budget`, written once the work reached the source's
+    `spawn/<agent>` so it names the branch, the commit and the commit's
+    diff stat; it counts toward no halt, and the objective's next task
+    continues that work (§10.4, "A task over its budget keeps its work").
+    `task.aborted` keeps its other meaning (a landing gone stale after its
+    mission was done); records from before this were overruns recorded as
+    aborts, and count toward the abort halt as they were written.
+=======
   - budget: `--minutes` and `--tool-calls`. A delivered task over budget is
     aborted (`task.aborted`) and its worker stopped (the Stop is submitted
     before the record, so a failed record is retried with it; a Stop that
     fails is pursued and escalated by the dispatcher); an abort counts
     toward the abort halt, not as a rejection.
+>>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
     The minutes are active time, never the wall clock (`integrate::active_ms`):
     from the delivery, through each event of the task's session, to now.
     Readings are no events here: the Bridge re-reads a busy pane every
@@ -1370,6 +1462,52 @@ record of what was judged (§14 of design.md).
      the failures and the crash lines named in the record, the wait on the
      recorded `due_ms`, never on the reason's text alone or on time without
      a record (design.md §14).
+
+     **A base that disagrees with itself is the host's too, not an abort.**
+     The gate judges every objective scenario on the base before any
+     candidate code runs, and an unsolved result needs two runs that agree.
+     A first run that exits 1 and a second that exits 0 says nothing about
+     the candidate: no candidate code has run yet, and the base is code that
+     already landed. The gate states it itself and exits 4
+     (`BASE_DISAGREES_EXIT`) with its own pair of lines at the end of its
+     stdout: `| <name> exited 1, then 0 on the base: a harness error, not a
+     verdict; the gate aborts`, then `| stage gate aborted <ms>ms base:
+     <name> again (unsolved needs two runs that agree)`, with the same
+     `<name>` in both (a scenario's file name, no space, no `|`), the gate's
+     own trailing lines after them when it printed them — its `| base runs:`
+     phase line and its `| gate time:` line, whose `setup <n> s` is the
+     record's `setup_s` — and nothing else after the pair. That pair, with
+     exit 4, is `host_fault` with the evidence
+     `base_disagrees`, not `aborted`: the task stays where it was, its
+     revisions and note do not move, nothing goes back to the worker, and
+     neither `gate_rejections` nor `gate_aborts` grows or resets. The record
+     names `base`, `candidate`, `revision`, `scenarios`, `reason`,
+     `log`, `evidence` `base_disagrees`, `scenario`, `exits` ([1, 0]),
+     `setup_s` (the whole seconds of the gate's `setup <n> s`, left out when
+     it printed no timing line), `host_faults`, `backoff_ms`, `due_ms`,
+     `base_disagrees` and `alert`. A base disagreement never carries
+     `escalate` (020's escalation at the second in a row stays for its own
+     evidence): the one that makes the mission's `gate_base_disagrees` 3
+     carries `alert` true, and every other one, the later ones of the same
+     run too, carries false. Until objective 030 exists that record is the
+     alert — named by its event id, no second record of it — and the
+     dispatcher's digest takes it to the supervisor once, as `host
+     gate-base-disagrees-<event>`, naming the task, the mission, the count in
+     a row, the scenario, `exited 1, then 0`, the setup time when known and
+     when the task is judged again; 030 raises its `gate_base_disagrees`
+     notice from the same record. The fold (`gate_base_disagrees`, beside
+     `gate_host_faults`) keeps the mission's run of them: + 1 on a
+     `host_fault` with that evidence, unchanged on `no_room` and `stale`, 0
+     on every other verdict (020's host faults included), on `task.landed`
+     and on `mission.resumed`. Both evidences share 020's run and backoff
+     (`gate_host_faults`, `due_ms`). Every other harness error on the base — a
+     first run that exits 2, `1, then 2`, `1, then 3`, the pair with any
+     other exit status (0, 1, 3, 5, a signal) — stays an abort and counts,
+     and so does a `| | …` line (a nested gate's, prefixed again) anywhere in
+     the log. The decision rests on the gate's recorded exit status and the
+     pair of lines named in the record (`scenario`, `exits`), never on the
+     reason's text, on time or on a scenario's name; the wait rests on the
+     recorded `due_ms`.
   6. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate
@@ -1502,7 +1640,7 @@ record of what was judged (§14 of design.md).
   (`spawn_control_refold()`) gives the same tables and adds no record. A
   database from before this rule gets the missing record once, on
   migration. This covers each cancelled task whose last `task.%` record is
-  neither `task.cancelled` nor `task.aborted`. The
+  none of `task.cancelled`, `task.aborted` and `task.over_budget`. The
   integrator's selection uses the same rule, and no transition moves a task
   into a state the rule drops: a send-back is refused, a gate rejection
   cancels the task, and deliveries and reports are not recorded. A worker
@@ -1525,9 +1663,11 @@ record of what was judged (§14 of design.md).
     no record explains (a push behind Spawn's back) halts.
 
   A halted mission lands nothing until a human runs `spawn mission resume`.
-  No rule counts host faults, however many in a row: a halt needs a human,
-  and a host fault is the host's, so it is judged again after its backoff
-  and escalated at two in a row instead.
+  No rule counts host faults, however many in a row, whatever their evidence:
+  a halt needs a human, and a host fault is the host's, so it is judged again
+  after its backoff; 020's evidence (the test database) is escalated at two
+  in a row instead, and a base that disagreed with itself raises one alert at
+  three in a row (its record's `alert`), never a halt.
 - **A shared source has one baseline.** A landing moves the baseline of
   every mission on that source whose baseline was its `from` and that is not
   halted (the record names them), so RSI and fleet work on the same
@@ -1616,7 +1756,13 @@ record of what was judged (§14 of design.md).
     `incompatible`, or `conflict` when the worker got conflicts to resolve
     (the record's `merge` is `marked`, `unmarked` or `pending`, or absent on
     records from before it was named; not `not_mounted`, `busy`, `failed`
+<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
+    or a clean merge). A budget overrun is not one: it says the task is
+    bigger than its budget, not that the work failed, and it is handled on
+    its own (below). The host's outcomes
+=======
     or a clean merge), or an abort over budget. The host's outcomes
+>>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
     (`no_room`, `host_fault`, a gate `aborted`) count for nothing, as for
     the halt rules, and an `accepted` verdict ends the count. Once an
     objective has `SPAWN_OBJECTIVE_ATTEMPTS` (3, a whole number from 1)
@@ -1629,12 +1775,20 @@ record of what was judged (§14 of design.md).
     any other cancel by the integrator). Its work is set aside like any
     cancel's, no halt counts it, the supervisor's digest tells it once
     (`missions objective-yielded-<event id>`), and a resident's cancel
+<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
+    notice gives the reason, and records from before an overrun was its
+    own record still count as they were written (an abort over budget that
+    was its objective's limit-th failed attempt carried `yielded`, the
+    count and a `yield_reason`). The objective goes to the back of the
+    queue. A task whose gate runs now, or that this pass
+=======
     notice gives the reason. An abort over budget that is the objective's
     limit-th failed attempt is the yield itself: its `task.aborted` carries
     `yielded`, the count and a `yield_reason`, and is told the same way
     (otherwise the objective kept its failures and no yield, sorted ahead,
     and its next task yielded at once). The objective goes to the back of
     the queue. A task whose gate runs now, or that this pass
+>>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
     aborted, does not yield; the slot an abort frees is filled from the
     next pass on, fewest attempts first, so the aborted objective is not
     re-issued at once. Before this, on 2026-11-07, three objectives whose
@@ -1679,6 +1833,44 @@ record of what was judged (§14 of design.md).
     names no branch: a worker has no `.git` and cannot read one. The first
     prompt of a forked task (below) says its workspace already contains
     that work.
+<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
+  - **A task over its budget keeps its work.** The integrator stops a
+    delivered task over its mission's budget and records
+    `task.over_budget` {`reason`, `tool_calls`, `elapsed_ms`, `budget` (the
+    mission's, as it was), `branch`, `commit`, `diff`, and `continues` when
+    it continues an overrun}; the record is written once the Stop's final
+    checkpoint reached the source's `spawn/<agent>` (read from the source
+    after the Stop, never assumed), so `commit` and `diff` (`git diff
+    --stat main <commit>`) name the work; the wait lasts at most
+    `SPAWN_KEPT_WAIT_SECS` (30, a whole number of seconds) after the
+    checkpoint, and a push that failed is said so instead (`pushed: false`,
+    in the log and in the next task's brief). It is never a `task.aborted`:
+    the mission's `gate_aborts` and `gate_rejections` stay as they were, no
+    run of either is broken or started, and the task leaves flight without
+    a report or a gate. The objective's next task is assigned once that
+    work is on the branch, its `task.assigned` names `continues` (the
+    overrun task) and its record carries `budget`, and its brief names the
+    overrun task (#id, its objective, the reason and the tool calls), the
+    branch, the commit and the commit's diff stat, and says the work is in
+    its workspace to continue, not to redo; it goes to a new per-task
+    worker, whose workspace the dispatcher forks from that work as for any
+    earlier task's work (a resident's own branch no longer holds it: its
+    cancel set the work aside), so the worker starts on the work, not on
+    main. Its budget is the mission's; it
+    may be raised once, for that task only, to at most twice the budget.
+    A **second overrun** of a task that continues one is recorded the same
+    way and escalated to the supervisor once: a digest item tagged `host
+    over-budget-<record>`, naming both tasks (#id each), the objective, the
+    branch and its diff stat, the budget and the tool calls, and what can
+    be done (split the objective, raise the budget with `spawn mission
+    configure`, or take it over). The objective is then held: no task is
+    issued for it until the mission is configured again (a
+    `mission.configured` record newer than the overrun's), while the
+    mission's other objectives take the freed slot. A third overrun after
+    such a configure is treated as a first. Everything is read from the
+    records (§14), never from the integrator's memory.
+=======
+>>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
   - **An ephemeral task starts from that work.** When the newest earlier
     task of its objective that ended without landing left work (a
     checkpoint of its own while it ran, before its set-aside if it was a

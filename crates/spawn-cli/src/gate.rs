@@ -39,6 +39,23 @@
 //! gate's own exit 5 above stays: a TMPDIR that fills between the check and
 //! the gate's start is still found.
 //!
+//! **A base that disagrees with itself is the host's, not a verdict.** The
+//! gate judges every objective scenario on the base before any candidate
+//! code runs, and an unsolved result needs two runs that agree. A first run
+//! that exits 1 and a second that exits 0 is no verdict on the candidate: no
+//! candidate code has run yet, and the base is code that already landed. The
+//! gate says so itself, and exits [`BASE_DISAGREES_EXIT`] with its own pair
+//! of lines at the end of stdout (`| <name> exited 1, then 0 on the base: a
+//! harness error, not a verdict; the gate aborts`, then `| stage gate aborted
+//! <ms>ms base: <name> again (unsolved needs two runs that agree)`), its own
+//! trailing lines last when it printed them (its `| base runs:` phase line
+//! and its `| gate time:` line) and nothing else. That pair, with exit
+//! 4, is [`GateFailure::BaseDisagrees`]: the integrator records it
+//! `host_fault` (objective 020's verdict) with the evidence `base_disagrees`,
+//! never a count toward a halt. Every other harness error on the base (a
+//! first run that exits 2, `1, then 2`, `1, then 3`, a missing line, the
+//! pair with any other exit) stays an abort.
+//!
 //! The gate runs with a cleared environment: [`GATE_ENV`] and nothing else.
 //! The integrator's own database URL never reaches candidate code.
 
@@ -77,6 +94,35 @@ pub(crate) const GATE_ENV: &[&str] = &[
 /// (scripts/rsi/gate.sh). It counts only with the no-room fact in the
 /// verdict file.
 pub(crate) const NO_ROOM_EXIT: i32 = 5;
+
+/// The gate's exit status when a scenario's two base runs disagreed
+/// (scripts/rsi/gate.sh: the first exited 1, the second did not exit 1). It
+/// counts only with the gate's own pair of lines at the end of its stdout
+/// ([`base_disagrees`]); with any other output it is an abort.
+pub(crate) const BASE_DISAGREES_EXIT: i32 = 4;
+
+/// The gate's `| gate time:` line, one of the two it may end a
+/// base-disagreement with.
+const GATE_TIME_LINE: &str = "| gate time:";
+
+/// The gate's `| base runs:` line (scripts/rsi/gate.sh's `phase_time`), the
+/// other one: a gate run at 2026-11-08 05:02 printed it after the pair and
+/// before the timing line, where the 2026-11-06 14:43 one printed none, so
+/// both shapes are the gate's own.
+const BASE_RUNS_LINE: &str = "| base runs:";
+
+/// The tail of a base run's `exited` line
+/// (`| <name> exited 1, then 0 on the base: …`).
+const BASE_EXITED_TAIL: &str = " exited 1, then 0 on the base";
+
+/// The rest of the gate's `exited` line, after the scenario's name.
+const BASE_EXITED_SAID: &str = ": a harness error, not a verdict; the gate aborts";
+
+/// The head of the stage line the gate closes a disagreeing base with.
+const BASE_STAGE_HEAD: &str = "| stage gate aborted ";
+
+/// The rest of that stage line, after its milliseconds and `base: <name>`.
+const BASE_STAGE_SAID: &str = " again (unsolved needs two runs that agree)";
 
 /// The gate's floor when SPAWN_GATE_MIN_FREE_GB is unset (scripts/disk.sh).
 const DEFAULT_MIN_FREE_GB: u64 = 10;
@@ -533,6 +579,83 @@ pub(crate) enum GateFailure {
         tmpdir: String,
         log: String,
     },
+    /// The base disagreed with itself: one of its scenarios exited 1 and then
+    /// 0, before any candidate code ran (exit [`BASE_DISAGREES_EXIT`] and the
+    /// gate's own pair of lines). A fact about the host, not the work.
+    BaseDisagrees {
+        /// The scenario's file name, as the gate named it.
+        scenario: String,
+        /// The whole seconds of the gate's `setup <n> s`, when it printed
+        /// its `| gate time:` line.
+        setup_s: Option<u64>,
+        log: String,
+    },
+}
+
+/// A base that disagreed with itself, as the gate's own pair of lines says
+/// it: the scenario and, when the gate printed its `| gate time:` line, the
+/// setup's seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BaseDisagrees {
+    pub(crate) scenario: String,
+    pub(crate) setup_s: Option<u64>,
+}
+
+/// Read the gate's own account of a base that disagreed with itself from
+/// its stdout: the last two lines before the gate's own trailing ones are
+/// its pair (`| <name> exited 1, then 0 on the base: …`, then `| stage gate
+/// aborted <ms>ms base: <name> again (…)`), with the same `<name>` in both,
+/// a scenario's file name (no space, no `|`), optionally followed by its
+/// `| base runs:` line and its `| gate time:` line (the gate's own trailing
+/// lines, the timing one read for the setup) and nothing else. Anywhere else
+/// in the log, with another prefix (`| | …`: a nested gate's line, prefixed
+/// again), with other exits, or with anything after the pair it says
+/// nothing.
+fn base_disagrees(stdout: &str) -> Option<BaseDisagrees> {
+    let mut lines: Vec<&str> = stdout.lines().collect();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    let mut setup_s = None;
+    while let Some(line) = lines.last() {
+        if line.starts_with(BASE_RUNS_LINE) {
+            lines.pop();
+        } else if let Some(times) = line.strip_prefix(GATE_TIME_LINE) {
+            setup_s = setup_seconds(times);
+            lines.pop();
+        } else {
+            break;
+        }
+    }
+    let stage = lines.pop()?;
+    let exited = lines.pop()?;
+    let name = exited
+        .strip_prefix("| ")?
+        .strip_suffix(BASE_EXITED_SAID)?
+        .strip_suffix(BASE_EXITED_TAIL)?;
+    let scenario = name
+        .chars()
+        .all(|char| !char.is_whitespace() && char != '|')
+        .then_some(name)?;
+    if scenario.is_empty() {
+        return None;
+    }
+    let (millis, rest) = stage.strip_prefix(BASE_STAGE_HEAD)?.split_once("ms ")?;
+    if millis.is_empty() || !millis.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let staged = rest.strip_prefix("base: ")?.strip_suffix(BASE_STAGE_SAID)?;
+    (staged == scenario).then(|| BaseDisagrees {
+        scenario: scenario.to_string(),
+        setup_s,
+    })
+}
+
+/// The whole seconds of `setup <n> s` in the gate's `| gate time:` line.
+fn setup_seconds(times: &str) -> Option<u64> {
+    let (_, after) = times.split_once("setup ")?;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 /// The gate's environment, read through `lookup`: the [`GATE_ENV`]
@@ -760,6 +883,16 @@ fn env_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 /// The verdict of a finished gate run: the verdict file's, only after a
 /// clean exit.
+///
+/// Two failures are facts about the host rather than aborts, each an exit
+/// status together with a fact the gate states: exit [`NO_ROOM_EXIT`] with
+/// its no-room fact in the verdict file ([`no_room`]), and exit
+/// [`BASE_DISAGREES_EXIT`] with its own pair of lines at the end of stdout
+/// ([`base_disagrees`]: a scenario that exited 1 and then 0 on the base,
+/// before any candidate code ran). Every other non-zero or signalled exit is
+/// an abort with the whole record, the gate's stdout then its stderr marked
+/// `! `: the pair with any other exit, a base run that exited 2 or `1, then
+/// 2`, and a nested gate's line (`| | …`) in a scenario's log.
 fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
     // The record: stdout, then stderr marked `! ` so no line of it can pass
     // for a verdict or a section header. An abort keeps all of it.
@@ -781,6 +914,15 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
             free_kb,
             min_gb,
             tmpdir,
+            log: record(&run.stdout),
+        });
+    }
+    if run.status.code() == Some(BASE_DISAGREES_EXIT)
+        && let Some(fact) = base_disagrees(&run.stdout)
+    {
+        return Err(GateFailure::BaseDisagrees {
+            scenario: fact.scenario,
+            setup_s: fact.setup_s,
             log: record(&run.stdout),
         });
     }
@@ -958,7 +1100,7 @@ pub(crate) fn count_scenarios(directory: &Path) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GateFailure, PrivateDirectory, gate_env, judge, judge_in, run_bounded,
+        BaseDisagrees, GateFailure, PrivateDirectory, gate_env, judge, judge_in, run_bounded,
         withhold_owners_cluster,
     };
     use std::path::{Path, PathBuf};
@@ -1255,6 +1397,243 @@ mod tests {
                 "exit {status}"
             );
         }
+    }
+
+    // --- objective 033: a base that disagrees with itself ------------------
+
+    /// The gate's own pair for a scenario that exited 1 and then 0 on the
+    /// base, as scripts/rsi/gate.sh prints it, inside a log.
+    const DISAGREES_PAIR: &str = "| == base: 011.sh\n\
+         | 011: covered within 10 s, delivered within 30 s, no churn\n\
+         | 011.sh exited 1, then 0 on the base: a harness error, not a verdict; the gate aborts\n\
+         | stage gate aborted 66871ms base: 011.sh again (unsolved needs two runs that agree)\n";
+
+    /// The gate's timing line, after the pair.
+    const GATE_TIME_LINE: &str = "| gate time: base 141 s (2 scenario runs, 19 results from the cache), candidate 0 s, \
+         setup 244 s (exports, socket scan, static checks), total 385 s\n";
+
+    /// A gate that prints `output` on stdout, then runs `status`.
+    fn printing_gate(output: &str, status: &str) -> FakeGate {
+        FakeGate::new(&format!("cat <<'GATE'\n{output}GATE\n{status}\n"))
+    }
+
+    #[test]
+    fn the_pair_at_the_end_of_stdout_is_a_base_that_disagrees() {
+        let gate = printing_gate(DISAGREES_PAIR, "exit 4");
+        let Err(GateFailure::BaseDisagrees {
+            scenario,
+            setup_s,
+            log,
+        }) = gate.judge(&path_only())
+        else {
+            panic!("the pair with exit 4 is a base that disagrees");
+        };
+        assert_eq!(scenario, "011.sh");
+        assert_eq!(setup_s, None, "no timing line: no setup");
+        assert!(log.contains("| 011.sh exited 1, then 0"), "{log}");
+
+        // Its `| gate time:` line may follow the pair, and nothing else.
+        let gate = printing_gate(&format!("{DISAGREES_PAIR}{GATE_TIME_LINE}"), "exit 4");
+        let Err(GateFailure::BaseDisagrees {
+            scenario, setup_s, ..
+        }) = gate.judge(&path_only())
+        else {
+            panic!("the pair with its timing line");
+        };
+        assert_eq!((scenario.as_str(), setup_s), ("011.sh", Some(244)));
+
+        // The gate's own `| base runs:` phase line may sit between the pair
+        // and its timing line: the gate printed one on 2026-11-08 05:02 and
+        // none on 2026-11-06 14:43, and both are its own.
+        let runs = "| base runs: 17 in 139 s, 5 at a time (their own time: 576 s)\n";
+        for trailing in [
+            runs.to_string(),
+            format!("{runs}{GATE_TIME_LINE}"),
+            format!("{GATE_TIME_LINE}{runs}"),
+        ] {
+            let gate = printing_gate(&format!("{DISAGREES_PAIR}{trailing}"), "exit 4");
+            let Err(GateFailure::BaseDisagrees {
+                scenario, setup_s, ..
+            }) = gate.judge(&path_only())
+            else {
+                panic!("{trailing:?} is the gate's own trailing line");
+            };
+            assert_eq!(scenario, "011.sh");
+            assert_eq!(
+                setup_s,
+                if trailing.contains("gate time") {
+                    Some(244)
+                } else {
+                    None
+                },
+                "{trailing:?}"
+            );
+        }
+
+        // Stderr lines after it say nothing about the pair.
+        let gate = printing_gate(
+            &format!("{DISAGREES_PAIR}{GATE_TIME_LINE}"),
+            "echo '! 011: a line on stderr' >&2; exit 4",
+        );
+        let Err(GateFailure::BaseDisagrees {
+            scenario, setup_s, ..
+        }) = gate.judge(&path_only())
+        else {
+            panic!("stderr after the pair is no part of it");
+        };
+        assert_eq!((scenario.as_str(), setup_s), ("011.sh", Some(244)));
+    }
+
+    #[test]
+    fn the_setup_is_read_from_the_timing_line_or_left_out() {
+        let pair = |times: &str| super::base_disagrees(&format!("{DISAGREES_PAIR}{times}"));
+        assert_eq!(
+            pair(""),
+            Some(BaseDisagrees {
+                scenario: "011.sh".to_string(),
+                setup_s: None,
+            })
+        );
+        for (seconds, want) in [("0", 0), ("29", 29), ("244", 244), ("1417", 1417)] {
+            let line =
+                format!("| gate time: base 1 s, candidate 0 s, setup {seconds} s (x), total 2 s\n");
+            assert_eq!(
+                pair(&line).map(|found| found.setup_s),
+                Some(Some(want)),
+                "setup {seconds} s"
+            );
+        }
+        // A timing line without a setup says nothing: no field.
+        assert_eq!(
+            pair("| gate time: base 1 s, candidate 0 s, total 2 s\n").map(|found| found.setup_s),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn a_nested_gates_copy_of_the_line_is_not_it() {
+        // A scenario of the gate ran a gate of its own, whose output the
+        // outer gate prefixes again: `| | …`. It names the inner scenario,
+        // and is not the outer gate's own pair.
+        let nested = "| | 102.sh exited 1, then 0 on the base: a harness error, not a verdict; \
+                      the gate aborts\n\
+                      | | stage gate aborted 5ms base: 102.sh again (unsolved needs two runs that \
+                      agree)\n";
+        let mut output = String::from(DISAGREES_PAIR);
+        output.push_str(nested);
+        // The nested copy first, the gate's own pair last: the outer one.
+        let mut reordered = String::from(nested);
+        reordered.push_str(DISAGREES_PAIR);
+        assert_eq!(
+            super::base_disagrees(&reordered).map(|found| found.scenario),
+            Some("011.sh".to_string())
+        );
+        // The nested copy alone, at the end, is nobody's pair.
+        let mut alone = String::from("| == base: 011.sh\n");
+        alone.push_str(nested);
+        assert_eq!(super::base_disagrees(&alone), None);
+        let gate = printing_gate(&alone, "exit 4");
+        assert!(matches!(
+            gate.judge(&path_only()),
+            Err(GateFailure::Aborted { .. })
+        ));
+    }
+
+    #[test]
+    fn anything_after_the_pair_is_not_it() {
+        // A line after the pair, even a harmless one: the gate's stdout does
+        // not end with its own pair.
+        for tail in [
+            "| == candidate: build\n",
+            "| gate time: base 1 s, candidate 0 s, setup 2 s (x), total 3 s\n| == more\n",
+            "| stage gate ok 5ms candidate: build\n",
+        ] {
+            let output = format!("{DISAGREES_PAIR}{tail}");
+            assert_eq!(super::base_disagrees(&output), None, "{tail:?}");
+            let gate = printing_gate(&output, "exit 4");
+            assert!(
+                matches!(gate.judge(&path_only()), Err(GateFailure::Aborted { .. })),
+                "{tail:?}"
+            );
+        }
+        // The pair is two lines: the first alone, or with another name in
+        // the second, is no pair.
+        assert_eq!(
+            super::base_disagrees(
+                "| 011.sh exited 1, then 0 on the base: a harness error, not a verdict; the gate \
+                 aborts\n"
+            ),
+            None
+        );
+        assert_eq!(
+            super::base_disagrees(
+                "| 011.sh exited 1, then 0 on the base: a harness error, not a verdict; the gate \
+                 aborts\n\
+                 | stage gate aborted 5ms base: 012.sh again (unsolved needs two runs that agree)\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn another_harness_error_on_the_base_stays_an_abort() {
+        // `exited 2`, `1, then 2`, `1, then 3`: real harness errors.
+        for said in [
+            "011.sh exited 2 on the base: a harness error, not a verdict; the gate aborts",
+            "011.sh exited 1, then 2 on the base: a harness error, not a verdict; the gate aborts",
+            "011.sh exited 1, then 3 on the base: a harness error, not a verdict; the gate aborts",
+            "011.sh exited 1 on the base: a harness error, not a verdict; the gate aborts",
+        ] {
+            let output = format!(
+                "| == base: 011.sh\n| {said}\n\
+                 | stage gate aborted 5ms base: 011.sh again (unsolved needs two runs that agree)\n"
+            );
+            assert_eq!(super::base_disagrees(&output), None, "{said}");
+            let gate = printing_gate(&output, "exit 4");
+            let Err(GateFailure::Aborted { log, .. }) = gate.judge(&path_only()) else {
+                panic!("{said} is an abort");
+            };
+            assert!(log.contains("011.sh"), "{log}");
+        }
+    }
+
+    #[test]
+    fn the_pair_with_another_exit_status_is_no_host_fault() {
+        let parent = std::env::temp_dir();
+        // 0 (a verdict, or none), 1, 3 and a signal: each an abort.
+        for status in ["exit 0", "exit 1", "exit 3", "kill -9 $$"] {
+            let gate = printing_gate(&format!("{DISAGREES_PAIR}{GATE_TIME_LINE}"), status);
+            assert!(
+                matches!(
+                    gate.judge_room(&path_only(), &parent, Some(u64::MAX)),
+                    Err(GateFailure::Aborted { .. })
+                ),
+                "{status}"
+            );
+        }
+        // 5 is the no-room exit: with no room measured, it is an abort; the
+        // pair says nothing.
+        let gate = printing_gate(&format!("{DISAGREES_PAIR}{GATE_TIME_LINE}"), "exit 5");
+        assert!(matches!(
+            gate.judge_room(&path_only(), &parent, Some(u64::MAX)),
+            Err(GateFailure::Aborted { .. })
+        ));
+    }
+
+    #[test]
+    fn the_pair_with_a_readable_no_room_fact_is_no_room() {
+        // Exit 5 with its fact is the gate's no-room fact, whatever it
+        // printed before: the first of the two host facts wins.
+        let gate = FakeGate::new(&format!(
+            "cat <<'GATE'\n{DISAGREES_PAIR}GATE\n\
+             echo '{{\"no_room\":true,\"free_kb\":2097152,\"min_gb\":10,\"tmpdir\":\"/data/tmp\"}}' \
+             >\"$SPAWN_GATE_VERDICT\"\n\
+             exit 5\n"
+        ));
+        assert!(matches!(
+            gate.judge(&path_only()),
+            Err(GateFailure::NoRoom { .. })
+        ));
     }
 
     #[test]

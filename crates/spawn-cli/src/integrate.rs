@@ -49,6 +49,46 @@
 //!    landing failed may have moved main before its record; it is applied
 //!    or refused by a later pass). A main moved with no record at all (a
 //!    push behind Spawn's back) still halts;
+<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
+//! 2. a delivered task over its mission's budget keeps its work. Its worker
+//!    is stopped (the Stop, and its final checkpoint on the task's branch)
+//!    and the overrun is its own record, `task.over_budget` {`reason`,
+//!    `tool_calls`, `elapsed_ms`, `budget`, and the work it keeps: `branch`,
+//!    `commit`, `diff`} — never `task.aborted`, which keeps its other
+//!    meaning (a landing gone stale after its mission was done). It counts
+//!    toward no halt: `gate_aborts` and `gate_rejections` stay as they were,
+//!    no run of either is broken or started, and the task leaves flight
+//!    without a report or a gate. The record is written once the work has
+//!    reached the source's `spawn/<agent>` (the pusher's head holds the
+//!    final checkpoint, read from the source after the Stop, never
+//!    assumed), so its `commit` and `diff` (`git diff --stat main
+//!    <commit>`) name what the objective's next task continues; when the
+//!    push failed, it says so instead. Its minutes are active time
+//!    ([`active_ms`]): the gaps of its session's events, readings
+//!    (`screen.observed`, `observation.recorded`) left out; a gap counts at
+//!    most `SPAWN_BUDGET_GAP_SECS` (300 s), and only if it ends in the
+//!    model's progress (a tool, a job, a stopped turn), not in a failed
+//!    turn, a prompt or a command; a gap inside a tool or job that ended
+//!    counts while the whole fleet was alive. So no outage (the fleet
+//!    stopped, a frozen host, a dead engine, the model API down) can by
+//!    itself put a task over budget (a subagent's job open across a model
+//!    API outage adds up to its retry window, see [`active_ms`]);
+//!    - the objective's next task continues it (`objectives.rs`): it is
+//!      assigned once the overrun's work is on that branch, its
+//!      `task.assigned` names `continues` (the overrun task) and its brief
+//!      names that task, the branch, the commit and its diff stat, so its
+//!      workspace starts from the work (`main_merge::fork_from_prior`) and
+//!      not from main: 51 minutes of work are continued, not redone;
+//!    - a second overrun of a task that continues one is escalated to the
+//!      supervisor once (`dispatch::digest::over_budget_escalations`, the
+//!      digest tag `host over-budget-<record>`), naming both tasks, the
+//!      objective, the branch and its diff stat, the budget and the tool
+//!      calls, and what can be done; the objective is then held — no task is
+//!      issued for it — until the mission is configured again (a
+//!      `mission.configured` record newer than the overrun's), while the
+//!      mission's other objectives go on with the freed slot. A third
+//!      overrun after such a configure is treated as a first;
+=======
 //! 2. a delivered task over its mission's budget is aborted and its worker
 //!    stopped. Its minutes are active time ([`active_ms`]): the gaps of its
 //!    session's events, readings (`screen.observed`,
@@ -60,6 +100,7 @@
 //!    frozen host, a dead engine, the model API down) can by itself put a
 //!    task over budget (a subagent's job open across a model API outage
 //!    adds up to its retry window, see [`active_ms`]);
+>>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
 //! 3. a task whose gate passed is landed (again, after a crash), unless the
 //!    owner holds its source (`spawn mission hold`, a `source.held` record):
 //!    [`land`] reads the hold from the store under the landing lock, before
@@ -190,6 +231,41 @@
 //!    judged as before. The decision rests on the failures and the crash
 //!    lines named in the record, never on the reason's text alone; the wait
 //!    rests on the recorded `due_ms`;
+//!
+//!    **A base that disagrees with itself is the host's, not an abort.** The
+//!    gate judges every objective scenario on the base before any candidate
+//!    code runs, and an unsolved result needs two runs that agree. A first
+//!    run that exits 1 and a second that exits 0 is no verdict on the
+//!    candidate: no candidate code has run yet, and the base is code that
+//!    already landed. It says the host was too loaded or too flaky to judge
+//!    ([`GateFailure::BaseDisagrees`]: exit [`gate::BASE_DISAGREES_EXIT`]
+//!    with the gate's own pair of lines at the end of its stdout, naming the
+//!    scenario and both exits). The task is gated `host_fault` with the
+//!    evidence [`BASE_DISAGREES`], never `aborted`: the task stays where it
+//!    was, its revisions and note do not move, nothing goes back to the
+//!    worker, and neither `gate_rejections` nor `gate_aborts` grows or
+//!    resets. The record names, besides `base`, `candidate`, `revision`,
+//!    `scenarios`, `reason` and `log`, `evidence` `base_disagrees`,
+//!    `scenario`, `exits` ([1, 0]), `setup_s` (the gate's `| gate time:`
+//!    line's `setup <n> s`, left out when it printed none), `host_faults`
+//!    (020's run in a row, which both evidences share), `backoff_ms`,
+//!    `due_ms` (the store's), `base_disagrees` (this evidence's own run in a
+//!    row, folded by the store) and `alert`. A base disagreement never
+//!    carries `escalate`: the one that makes the run
+//!    [`BASE_DISAGREES_ALERT_AT`] carries `alert` true instead, and every
+//!    other one, the later ones of the same run too, carries false. That
+//!    record is the alert until objective 030 exists (named by its event
+//!    id, no second record of it), and the dispatcher's digest takes it to
+//!    the supervisor once ([`crate::dispatch::digest::base_disagrees_alerts`],
+//!    the tag `host gate-base-disagrees-<event id>`); 030 raises its
+//!    `gate_base_disagrees` notice from the same record. No halt counts a
+//!    host fault, whatever its evidence, and the task waits its recorded
+//!    `due_ms` like any ([`host_wait`]). Every other harness error on the
+//!    base (a first run that exits 2, `1, then 2`, the pair with any other
+//!    exit) stays an abort and counts. The decision rests on the gate's
+//!    recorded exit status and the pair of lines named in the record, never
+//!    on the reason's text, on time or on a scenario's name; the wait rests
+//!    on the recorded `due_ms`;
 //!
 //!    **The host's room is measured before the gate, never learned from
 //!    its crash** ([`gate::Room`]). At the start of each judging, after the
@@ -341,8 +417,14 @@ const HOST_FAULT_BACKOFF: Duration = Duration::from_mins(5);
 const HOST_FAULT_BACKOFF_MAX: Duration = Duration::from_hours(1);
 
 /// The host fault in a row that is escalated to the supervisor (once per
-/// run: the later ones are not).
+/// run: the later ones are not). Only 020's evidence escalates: a base that
+/// disagrees with itself raises an alert at [`BASE_DISAGREES_ALERT_AT`].
 const HOST_FAULT_ESCALATE_AT: u32 = 2;
+
+/// The base disagreement in a row that raises the mission's alert (once per
+/// run, carried by that record): the owner's ruling of 2026-11-06, where
+/// 020's evidence escalates at two.
+const BASE_DISAGREES_ALERT_AT: u32 = 3;
 
 /// The test database server's log (`log_line_prefix` `%m [%p] `), read for
 /// a crash in a gate's window. Optional.
@@ -604,8 +686,19 @@ pub(crate) struct Mission {
     pub(crate) gate_host_task: Option<i64>,
     #[serde(default)]
     pub(crate) gate_host_due_ms: Option<i64>,
+    /// The mission's current run of `host_fault` gate outcomes whose
+    /// evidence is a base that disagreed with itself (objective 033), folded
+    /// by the store: the record that makes it [`BASE_DISAGREES_ALERT_AT`]
+    /// carries `alert`, and every other one does not.
+    #[serde(default)]
+    pub(crate) gate_base_disagrees: u32,
     #[serde(default)]
     pub(crate) objectives: Option<Value>,
+    /// When the mission was last configured (`mission.configured`), on the
+    /// database's clock: an overrun chain's hold ends with a configure newer
+    /// than its escalated record ([`crate::objectives`]).
+    #[serde(default)]
+    pub(crate) configured_ms: Option<i64>,
     #[serde(default)]
     pub(crate) source: Option<String>,
     /// The owner's active hold on its source (the `source.held` record's
@@ -659,6 +752,11 @@ pub(crate) struct Task {
     /// `task.held`), if any.
     #[serde(default)]
     pub(crate) held_by: Option<i64>,
+    /// The overrun task whose work this one continues (its `task.assigned`
+    /// names it), if any: a second overrun of such a task goes to the
+    /// supervisor and holds its objective.
+    #[serde(default)]
+    pub(crate) continues: Option<i64>,
 }
 
 impl Mission {
@@ -820,6 +918,59 @@ pub(crate) fn host_fault_fields(
     }
     fields
 }
+
+/// The record of a gate whose base disagreed with itself (objective 033):
+/// the scenario the gate named, both of its exits, the gate's setup seconds
+/// when it printed its timing, the `faults`-th host fault in a row on the
+/// mission (020's run, which this evidence shares) and the
+/// `disagreements`-th base disagreement in a row, with its `backoff`.
+///
+/// A base that disagrees with itself never escalates (`escalate` false, for
+/// every one of the run): the record that makes the run
+/// [`BASE_DISAGREES_ALERT_AT`] carries `alert` true, and every other one
+/// false. That record is the alert until objective 030 exists, and the
+/// dispatcher's digest takes it to the supervisor once
+/// ([`crate::dispatch::digest::base_disagrees_alerts`]).
+pub(crate) fn base_disagrees_fields(
+    scenario: &str,
+    exits: [u8; 2],
+    setup_s: Option<u64>,
+    faults: u32,
+    disagreements: u32,
+    backoff: Duration,
+    log: &str,
+) -> Value {
+    let setup = setup_s.map_or_else(String::new, |seconds| {
+        format!(", after a setup of {seconds} s")
+    });
+    let mut fields = json!({
+        "reason": format!(
+            "host fault: the base disagrees with itself: {scenario} exited {}, then {} on the base\
+             {setup}; not a verdict, judged again later",
+            exits[0], exits[1]
+        ),
+        "log": log,
+        "evidence": BASE_DISAGREES,
+        "scenario": scenario,
+        "exits": exits,
+        "host_faults": faults,
+        "backoff_ms": u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+        "escalate": false,
+        "base_disagrees": disagreements,
+        "alert": disagreements == BASE_DISAGREES_ALERT_AT,
+    });
+    // The setup's seconds only when the gate printed its timing line: the
+    // field is left out, not null.
+    if let Some(seconds) = setup_s {
+        fields["setup_s"] = json!(seconds);
+    }
+    fields
+}
+
+/// The evidence a `host_fault` record names when the base disagreed with
+/// itself (its own scenario failing and then passing, before any candidate
+/// code ran): objective 020's verdict with this objective's evidence.
+pub(crate) const BASE_DISAGREES: &str = "base_disagrees";
 
 /// The record of a gate that had no room to judge `task`, at `now_ms`: the
 /// reason with the free space and TMPDIR, the facts themselves, and
@@ -1596,12 +1747,23 @@ impl Integrator {
         Ok(())
     }
 
+<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
+    /// Stop the delivered tasks over budget and record each as its own
+    /// `task.over_budget`, with the work it keeps; the ids of those it
+    /// recorded. A task whose work has not reached its branch yet waits for
+    /// the push ([`kept_work`]) and is recorded by a later pass.
+=======
     /// Abort delivered tasks over budget; the ids of those it aborted.
+>>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
     fn enforce_budget(store: &PostgresStore, mission: &Mission) -> Result<Vec<i64>, String> {
         let Some(budget) = &mission.budget else {
             return Ok(Vec::new());
         };
+<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
+        let mut over: Vec<i64> = Vec::new();
+=======
         let mut aborted = Vec::new();
+>>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
         let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
         let gap_ms = budget_gap(crate::config::env_value("SPAWN_BUDGET_GAP_SECS").as_deref())
             .as_millis()
@@ -1625,6 +1787,32 @@ impl Integrator {
                     .fleet_alive_ms(from, to, gap_ms)
                     .map_err(|error| error.to_string())
             })?;
+<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
+            let Some(reason) = over_budget(budget, active, calls) else {
+                continue;
+            };
+            // The Stop first, under its fixed key: if the record then
+            // fails, the next pass finds the task still delivered and
+            // over budget, and submits (a no-op) and records again.
+            stop(store, task)?;
+            let (branch, commit, diff) = match kept_work(store, mission, task)? {
+                // Its work has not reached the source yet: the next pass
+                // records what the pusher's head will hold.
+                Kept::Waiting => continue,
+                Kept::Work {
+                    branch,
+                    commit,
+                    diff,
+                } => (branch, Some(commit), diff),
+                Kept::Lost { branch } => (branch, None, String::new()),
+            };
+            let mut overrun = json!({"type": "task.over_budget", "id": task.id,
+                                     "reason": reason, "tool_calls": calls,
+                                     "elapsed_ms": active, "budget": budget.clone(),
+                                     "branch": branch});
+            if let Some(commit) = &commit {
+                overrun["commit"] = json!(commit);
+=======
             if let Some(reason) = over_budget(budget, active, calls) {
                 // The Stop first, under its fixed key: if the record then
                 // fails, the next pass finds the task still delivered and
@@ -1647,9 +1835,48 @@ impl Integrator {
                     println!("integrate: mission {}: {why}", mission.id);
                 }
                 aborted.push(task.id);
+>>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
             }
+            if !diff.is_empty() {
+                overrun["diff"] = json!(diff);
+            }
+            if let Some(continues) = task.continues {
+                overrun["continues"] = json!(continues);
+                // A second overrun of a chain: a task that continues an
+                // overrun task, while no configure came between (a third
+                // overrun after a configure is a first).
+                let earlier = store
+                    .overrun_at(continues)
+                    .map_err(|error| error.to_string())?;
+                if earlier.is_some_and(|at| {
+                    mission
+                        .configured_ms
+                        .is_none_or(|configured| configured <= at)
+                }) {
+                    overrun["chain"] = json!(true);
+                }
+            }
+            if let Some(objective) = task.objective {
+                overrun["objective"] = json!(objective);
+            }
+            if commit.is_none() {
+                overrun["pushed"] = json!(false);
+            }
+            record(store, &overrun)?;
+            println!(
+                "integrate: task {} over its budget, its work kept on {branch}: {reason}",
+                task.id
+            );
+            if commit.is_none() {
+                eprintln!(
+                    "integrate: task {}: its work never reached {branch} (the push failed): its \
+                     next task is told so",
+                    task.id
+                );
+            }
+            over.push(task.id);
         }
-        Ok(aborted)
+        Ok(over)
     }
 }
 
@@ -1955,6 +2182,31 @@ impl Judge {
                         }
                         gated("no_room", extra)
                     }
+                    Rejection::HeadBaseDisagrees {
+                        scenario,
+                        setup_s,
+                        log,
+                        head,
+                    } => {
+                        let faults = mission.gate_host_faults.saturating_add(1);
+                        let disagreements = mission.gate_base_disagrees.saturating_add(1);
+                        let backoff = host_fault_backoff(self.host.backoff, faults);
+                        let mut extra = base_disagrees_fields(
+                            &scenario,
+                            [1, 0],
+                            setup_s,
+                            faults,
+                            disagreements,
+                            backoff,
+                            &log,
+                        );
+                        if let (Some(target), Some(head)) =
+                            (extra.as_object_mut(), head.as_object())
+                        {
+                            target.extend(head.clone());
+                        }
+                        gated("host_fault", extra)
+                    }
                 }
             }
             // No room in TMPDIR: a fact about the host, never a count.
@@ -1967,6 +2219,35 @@ impl Judge {
                 "no_room",
                 no_room(mission, task.id, free_kb, min_gb, &tmpdir, &log, now_ms()),
             ),
+            // The base disagreed with itself: a scenario of it exited 1 and
+            // then 0, before any candidate code ran. The host was too loaded
+            // or too flaky to judge: `host_fault` with that evidence, never
+            // a count toward a halt, judged again after the run's backoff.
+            Err(GateFailure::BaseDisagrees {
+                scenario,
+                setup_s,
+                log,
+            }) => {
+                let faults = mission.gate_host_faults.saturating_add(1);
+                let disagreements = mission.gate_base_disagrees.saturating_add(1);
+                let backoff = host_fault_backoff(self.host.backoff, faults);
+                let mut extra = base_disagrees_fields(
+                    &scenario,
+                    [1, 0],
+                    setup_s,
+                    faults,
+                    disagreements,
+                    backoff,
+                    &log,
+                );
+                extra["candidate"] = json!(candidate);
+                println!(
+                    "integrate: task {}: {}",
+                    task.id,
+                    extra["reason"].as_str().unwrap_or_default()
+                );
+                gated("host_fault", extra)
+            }
             Err(failure) => gated("aborted", aborted(&failure)),
         }
     }
@@ -2316,6 +2597,15 @@ enum Rejection {
         log: String,
         head: Value,
     },
+    /// The head's own run found the base disagreeing with itself:
+    /// `host_fault` with that evidence, as any, with `head` (the fields
+    /// naming the head and the rejected merge) added.
+    HeadBaseDisagrees {
+        scenario: String,
+        setup_s: Option<u64>,
+        log: String,
+        head: Value,
+    },
 }
 
 /// The record of a gate rejection: the reason, the gate's output and the
@@ -2541,6 +2831,16 @@ fn rejection(
             log,
             head: named,
         },
+        Err(GateFailure::BaseDisagrees {
+            scenario,
+            setup_s,
+            log,
+        }) => Rejection::HeadBaseDisagrees {
+            scenario,
+            setup_s,
+            log,
+            head: named,
+        },
         Err(failure) => {
             let mut record = aborted(&failure);
             if let Some(reason) = record["reason"].as_str() {
@@ -2570,6 +2870,17 @@ fn aborted(failure: &GateFailure) -> Value {
         GateFailure::NoRoom { tmpdir, log, .. } => {
             json!({"reason": format!("the gate had no room in {tmpdir}"), "log": log})
         }
+        // Recorded as `host_fault` with evidence `base_disagrees` by the
+        // caller; counted here only if a caller forgets that.
+        GateFailure::BaseDisagrees { scenario, log, .. } => json!({
+            "reason": format!(
+                "host fault: the base disagrees with itself: {scenario} exited 1, then 0 on the \
+                 base; not a verdict, judged again later"
+            ),
+            "evidence": BASE_DISAGREES,
+            "scenario": scenario,
+            "log": log,
+        }),
     }
 }
 
@@ -2957,6 +3268,92 @@ pub(crate) fn stop_worker(store: &PostgresStore, task: &Task, key: &str) -> Resu
         .submit(&principal, &submission)
         .map(|_| ())
         .map_err(|e| error(&e))
+}
+
+/// The work an overrun task keeps on its branch, once it reached the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Kept {
+    /// The source's `spawn/<agent>` holds the checkpoint: the branch, the
+    /// commit and `git diff --stat main <commit>`.
+    Work {
+        branch: String,
+        commit: String,
+        diff: String,
+    },
+    /// The push has not happened yet: the next pass looks again.
+    Waiting,
+    /// The work never reached the branch (no checkpoint, no source, or the
+    /// push failed): the branch alone is named, and the next task is told so.
+    Lost { branch: String },
+}
+
+/// How long a Stop's final checkpoint may take to reach the source before
+/// the work counts as lost (the pusher pushes within its interval, and
+/// retries a failed push): `SPAWN_KEPT_WAIT_SECS`, a whole number of
+/// seconds from 1 up; anything else is 30.
+pub(crate) fn kept_wait_ms(text: Option<&str>) -> i64 {
+    const DEFAULT: i64 = 30;
+    text.and_then(|text| text.trim().parse::<i64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT)
+        .saturating_mul(1_000)
+}
+
+/// Whether the source's `spawn/<agent>` holds `commit` (its ancestry), read
+/// from the source itself, never assumed.
+fn source_holds(source: &str, agent: &str, commit: &str) -> bool {
+    sources::git(&[
+        "--git-dir",
+        source,
+        "merge-base",
+        "--is-ancestor",
+        commit,
+        &format!("refs/heads/spawn/{agent}"),
+    ])
+    .is_ok()
+}
+
+/// `git diff --stat main <commit>` in the source, the work's shape for the
+/// task that continues it.
+fn diff_stat(source: &str, commit: &str) -> String {
+    sources::git(&["--git-dir", source, "diff", "--stat", "main", commit])
+        .map(|text| text.trim_end().to_string())
+        .unwrap_or_default()
+}
+
+/// The work `task` keeps on its branch: [`Kept`].
+fn kept_work(store: &PostgresStore, mission: &Mission, task: &Task) -> Result<Kept, String> {
+    let branch = format!("spawn/{}", task.agent_id);
+    let Some(source) = mission.source.as_deref() else {
+        return Ok(Kept::Lost { branch });
+    };
+    let wait_ms = kept_wait_ms(crate::config::env_value("SPAWN_KEPT_WAIT_SECS").as_deref());
+    let Some(checkpoint) = store
+        .checkpoint_at(&task.agent_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(Kept::Lost { branch });
+    };
+    let commit = checkpoint["commit"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let at_ms = checkpoint["at_ms"].as_i64().unwrap_or_default();
+    if commit.is_empty() {
+        return Ok(Kept::Lost { branch });
+    }
+    if source_holds(source, &task.agent_id, &commit) {
+        return Ok(Kept::Work {
+            diff: diff_stat(source, &commit),
+            branch,
+            commit,
+        });
+    }
+    let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+    if now - at_ms >= wait_ms {
+        return Ok(Kept::Lost { branch });
+    }
+    Ok(Kept::Waiting)
 }
 
 /// A path through the controller's symlink (`controllers/<name>` in the
@@ -5833,6 +6230,172 @@ mod host_fault_tests {
     }
 }
 
+/// Objective 33: a base that disagrees with itself (a scenario of it exited
+/// 1 and then 0, before any candidate code ran) is objective 020's
+/// `host_fault` with the evidence `base_disagrees`. Its record, its share of
+/// 020's run and backoff, its own count in a row and the alert at three, and
+/// no halt.
+#[cfg(test)]
+mod base_disagrees_tests {
+    use std::time::Duration;
+
+    use serde_json::json;
+
+    use super::{Mission, halt_reason, host_fault_backoff, host_fault_base, host_wait};
+
+    fn fields(
+        scenario: &str,
+        setup_s: Option<u64>,
+        faults: u32,
+        disagreements: u32,
+    ) -> serde_json::Value {
+        super::base_disagrees_fields(
+            scenario,
+            [1, 0],
+            setup_s,
+            faults,
+            disagreements,
+            host_fault_backoff(host_fault_base(None), faults),
+            "the gate's log",
+        )
+    }
+
+    /// The record: the evidence, the scenario, both exits, the setup's
+    /// seconds when the gate printed a timing line (left out when it did
+    /// not), the shared count, its own count, its backoff and its alert.
+    #[test]
+    fn the_record_names_the_scenario_its_exits_and_the_setup() {
+        let record = fields("011.sh", Some(244), 1, 1);
+        assert_eq!(record["evidence"], "base_disagrees");
+        assert_eq!(record["scenario"], "011.sh");
+        assert_eq!(record["exits"], json!([1, 0]));
+        assert_eq!(record["setup_s"], 244);
+        assert_eq!(record["host_faults"], 1);
+        assert_eq!(record["base_disagrees"], 1);
+        assert_eq!(record["backoff_ms"], 300_000);
+        assert_eq!(record["escalate"], false);
+        assert_eq!(record["alert"], false);
+        assert_eq!(record["log"], "the gate's log");
+        assert!(record.get("due_ms").is_none(), "the store writes it");
+        assert_eq!(
+            record["reason"],
+            "host fault: the base disagrees with itself: 011.sh exited 1, then 0 on the base, \
+             after a setup of 244 s; not a verdict, judged again later"
+        );
+
+        // No timing line: the field is left out, not null.
+        let record = fields("011.sh", None, 1, 1);
+        assert!(record.get("setup_s").is_none(), "{record}");
+        assert_eq!(
+            record["reason"],
+            "host fault: the base disagrees with itself: 011.sh exited 1, then 0 on the base; \
+             not a verdict, judged again later"
+        );
+
+        // The record keeps no `candidate` of its own: the caller adds it.
+        assert!(record.get("candidate").is_none());
+    }
+
+    /// A base disagreement never escalates, at any count: the record that
+    /// makes the mission's run 3 carries the alert, and every other one
+    /// (the later ones of the same run too) does not.
+    #[test]
+    fn a_base_disagrees_never_escalates_and_alerts_at_the_third() {
+        let alerts: Vec<(bool, bool)> = (1..=6)
+            .map(|disagreements| {
+                let record = fields("011.sh", None, disagreements, disagreements);
+                (
+                    record["escalate"].as_bool().expect("escalate"),
+                    record["alert"].as_bool().expect("alert"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            alerts,
+            [
+                (false, false),
+                (false, false),
+                (false, true),
+                (false, false),
+                (false, false),
+                (false, false),
+            ]
+        );
+        // 020's evidence still escalates at the second in a row.
+        let fault = super::host::host_fault(
+            super::host::CHECK_TESTS_REGRESSION,
+            "| == regression: check-tests.sh must still pass\n\
+             | FAILED api::tests::one: error connecting to server: Connection refused (os error \
+             111)\n",
+            Vec::new,
+        )
+        .expect("a host fault by its failures");
+        let escalations: Vec<bool> = (1..=4)
+            .map(|faults| {
+                super::host_fault_fields(&fault, faults, Duration::from_secs(5), "")["escalate"]
+                    .as_bool()
+                    .expect("escalate")
+            })
+            .collect();
+        assert_eq!(escalations, [false, true, false, false]);
+    }
+
+    /// Both evidences share 020's run and its backoff: five minutes,
+    /// doubling with each host fault in a row whatever its evidence, at most
+    /// an hour.
+    #[test]
+    fn both_evidences_share_the_run_and_its_backoff() {
+        let base = host_fault_base(None);
+        let minutes: Vec<u64> = (0..=7)
+            .map(|faults| host_fault_backoff(base, faults).as_secs() / 60)
+            .collect();
+        assert_eq!(minutes, [0, 5, 10, 20, 40, 60, 60, 60]);
+        assert_eq!(
+            host_fault_backoff(Duration::from_secs(4), 3),
+            Duration::from_secs(16),
+            "the scenario's four seconds, doubled twice"
+        );
+        assert_eq!(
+            host_fault_backoff(base, u32::MAX),
+            Duration::from_hours(1),
+            "no overflow"
+        );
+    }
+
+    /// The hold until the recorded `due_ms` is 020's: a base disagreement
+    /// folds into the same run (`gate_host_faults`, `gate_host_task`,
+    /// `gate_host_due_ms`), so the task waits as behind any host fault.
+    #[test]
+    fn a_base_disagreement_holds_its_task_until_its_due_time() {
+        let due = 10_000_000;
+        let waiting: Mission = serde_json::from_value(json!({
+            "id": 1, "gate": "/g", "accept": "gate",
+            "gate_host_faults": 2, "gate_host_task": 4, "gate_host_due_ms": due,
+            "gate_base_disagrees": 2,
+        }))
+        .expect("a mission");
+        assert_eq!(
+            host_wait(&waiting, 4, due - 8_000),
+            Some(Duration::from_secs(8))
+        );
+        assert_eq!(host_wait(&waiting, 4, due), None, "due: judged again");
+        assert_eq!(host_wait(&waiting, 5, 0), None, "another task's");
+    }
+
+    /// No halt rule counts a base disagreement, however many in a row.
+    #[test]
+    fn no_number_of_base_disagreements_halts_a_mission() {
+        for count in [1, 2, 3, 10, 1000, u32::MAX] {
+            let mission: Mission = serde_json::from_value(json!({
+                "id": 1, "gate": "/g", "accept": "gate", "gate_rejections": 2,
+                "gate_aborts": 2, "gate_host_faults": count, "gate_base_disagrees": count,
+            }))
+            .expect("a mission");
+            assert_eq!(halt_reason(&mission, 7), None, "{count}");
+        }
+    }
+}
+
 /// The integrator's passes against the test database
 /// (`SPAWN_TEST_DATABASE_URL`; like the spawn-postgres tests, they do not
 /// skip), each in a schema of its own, dropped afterwards, with real git
@@ -6843,16 +7406,69 @@ mod database_tests {
             tool_work(&db, task, delivered + 5_000, now);
         };
         overrun(&first);
+<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
+        overrun(&other);
+        let over =
+            Integrator::enforce_budget(&db.store, &snapshot(&db, mission)).expect("the budget");
+        assert_eq!(over, vec![first.id, other.id]);
+=======
         // 025's first abort: under the limit, a plain abort.
         overrun(&other);
         let aborted =
             Integrator::enforce_budget(&db.store, &snapshot(&db, mission)).expect("the budget");
         assert_eq!(aborted, vec![first.id, other.id]);
+>>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
         let record = |task: i64| -> Value {
             db.admin()
                 .query_one(
                     "select kind -> 'detail' -> 'record' from spawn_events
                       where session_id = 'session_control'
+<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
+                        and kind -> 'detail' -> 'record' ->> 'type' = 'task.over_budget'
+                        and kind -> 'detail' -> 'record' ->> 'id' = $1",
+                    &[&task.to_string()],
+                )
+                .expect("the overrun")
+                .get(0)
+        };
+        // An overrun is its own record, at the attempt limit too: no abort,
+        // no yield, no counter.
+        for task in [first.id, other.id] {
+            let overrun = record(task);
+            assert!(overrun["tool_calls"].as_i64().unwrap_or_default() > 0);
+            assert_eq!(overrun["budget"], json!({"minutes": 60}));
+            assert_eq!(
+                overrun["objective"].as_u64(),
+                objective_of(&db, task).and_then(|objective| u64::try_from(objective).ok())
+            );
+        }
+        let aborts: i64 = db
+            .admin()
+            .query_one(
+                "select count(*) from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = 'task.aborted'",
+                &[],
+            )
+            .expect("the aborts")
+            .get(0);
+        assert_eq!(aborts, 0, "an overrun is no abort");
+        assert_eq!(
+            gate_counters(&db, mission),
+            (0, 0),
+            "an overrun is no gate abort"
+        );
+        let told = db.store.objective_yields().expect("the yields to tell");
+        assert!(
+            told.as_array().expect("a list").is_empty(),
+            "an overrun yields nothing"
+        );
+
+        // The next pass assigns 023's continuation of the overrun, and 025
+        // gets its slot when one is free.
+        pass();
+        let mut flying: Vec<u32> = flying(&db, mission)
+=======
                         and kind -> 'detail' -> 'record' ->> 'type' = 'task.aborted'
                         and kind -> 'detail' -> 'record' ->> 'id' = $1",
                     &[&task.to_string()],
@@ -6885,10 +7501,20 @@ mod database_tests {
         // Both slots free: 025 (one failure, no yield) first, then 023.
         pass();
         let flying: Vec<u32> = flying(&db, mission)
+>>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
             .iter()
             .filter(|(task, _)| *task != first.id && *task != other.id)
             .map(|(_, objective)| *objective)
             .collect();
+<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
+        flying.sort_unstable();
+        assert_eq!(flying, [23, 25], "the continuation of the overrun, and 025");
+        let again = objective_task(&db, mission, 23);
+        assert_eq!(
+            continues_of(&db, again.id),
+            Some(first.id),
+            "023's task continues the overrun"
+=======
         assert_eq!(flying, [25, 23]);
         let again = objective_task(&db, mission, 23);
         assert!(pass().is_empty(), "nothing yields, no slot is free");
@@ -6896,6 +7522,7 @@ mod database_tests {
             task_state(&db, mission, again.id),
             "assigned",
             "023's new task stays"
+>>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -6932,13 +7559,178 @@ mod database_tests {
             .expect("deliver 70 minutes ago");
         tool_work(&db, &task, delivered + 5_000, now);
         let pass = snapshot(&db, mission);
+<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
+        let over = Integrator::enforce_budget(&db.store, &pass).expect("the budget");
+        assert_eq!(over, vec![task.id]);
+        let settled = over.into_iter().collect();
+=======
         let aborted = Integrator::enforce_budget(&db.store, &pass).expect("the budget");
         assert_eq!(aborted, vec![task.id]);
         let settled = aborted.into_iter().collect();
+>>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
         assert!(
             crate::objectives::assign_next(&db.store, &pass, &settled)
                 .expect("the same pass")
                 .is_empty(),
+<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
+            "nothing in the pass that overran"
+        );
+        // The next pass assigns the overrun's continuation, and it says so:
+        // the work is continued, not redone.
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
+            .expect("the next pass");
+        let next: Vec<(i64, u32)> = flying(&db, mission)
+            .into_iter()
+            .filter(|(id, _)| *id != task.id)
+            .collect();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].1, 23, "the overrun's objective, continued");
+        let again = objective_task(&db, mission, 23);
+        assert_eq!(continues_of(&db, again.id), Some(task.id));
+        let brief = again.brief;
+        assert!(
+            brief.contains(&format!("continues task #{}", task.id)),
+            "{brief}"
+        );
+        assert!(
+            brief.contains(&format!("- task {}: cancelled", task.id)),
+            "the overrun task is the work the brief says ended: {brief}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A mission's run of gate aborts and rejections.
+    fn gate_counters(db: &Db, mission: i64) -> (i32, i32) {
+        let row = db
+            .admin()
+            .query_one(
+                "select gate_aborts, gate_rejections from mission_missions where id = $1",
+                &[&mission],
+            )
+            .expect("the mission");
+        (row.get(0), row.get(1))
+    }
+
+    /// The objective a task pursues, as the store folded it.
+    fn objective_of(db: &Db, task: i64) -> Option<i64> {
+        db.admin()
+            .query_one(
+                "select objective from mission_tasks where id = $1",
+                &[&task],
+            )
+            .expect("the task")
+            .get::<_, Option<i32>>(0)
+            .map(i64::from)
+    }
+
+    /// The task a continuation continues, as the store folded it.
+    fn continues_of(db: &Db, task: i64) -> Option<i64> {
+        db.admin()
+            .query_one(
+                "select continues from mission_tasks where id = $1",
+                &[&task],
+            )
+            .expect("the task")
+            .get(0)
+    }
+
+    /// An overrun counts toward no halt: three in a row leave the mission's
+    /// counters alone, and each task leaves flight.
+    #[test]
+    fn three_overruns_halt_nothing() {
+        let db = Db::new("overrun_halt");
+        let (base, source, scenarios, _integrator) = world("overrun-halt", "#!/bin/sh\nexit 0\n");
+        let mission = db.gated_mission(&source, &scenarios);
+        let mut tasks = Vec::new();
+        for worker in ["a", "b", "c"] {
+            let task = db
+                .store
+                .task_assign(mission, "ephemeral", worker, "brief", "default")
+                .expect("assign");
+            db.store.task_delivered(task, 1).expect("delivered");
+            db.record(&json!({"type": "task.over_budget", "id": task,
+                              "reason": "the task made more than 5 tool calls",
+                              "tool_calls": 6, "elapsed_ms": 1_000,
+                              "budget": {"tool_calls": 5}}));
+            tasks.push(task);
+        }
+        let row = snapshot(&db, mission);
+        assert_eq!((row.gate_aborts, row.gate_rejections), (0, 0));
+        assert_eq!(
+            super::halt_reason(&row, 0),
+            None,
+            "no halt counts an overrun"
+        );
+        for task in tasks {
+            let state: String = db
+                .admin()
+                .query_one("select state from mission_tasks where id = $1", &[&task])
+                .expect("the task")
+                .get(0);
+            assert_eq!(state, "cancelled", "an overrun leaves flight");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The work an overrun keeps: its branch's commit and that commit's
+    /// diff stat against main; waited for while the push is pending, and
+    /// lost (said so) when it never reaches the source.
+    #[test]
+    fn an_overrun_keeps_the_work_its_branch_holds() {
+        let db = Db::new("overrun_kept");
+        let (base, source, scenarios, _integrator) = world("overrun-kept", "#!/bin/sh\nexit 0\n");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = ready_task(&db, db.reported_task(mission, "kept"));
+        let clone = base.join("kept-clone");
+        let clone_path = clone.to_string_lossy().to_string();
+        git(&["clone", "-q", &source, &clone_path]).expect("clone");
+        std::fs::write(clone.join("big.txt"), "line\n").expect("write");
+        super::tests::commit_in(&clone_path, "the big work");
+        let commit = git(&["-C", &clone_path, "rev-parse", "HEAD"]).expect("head");
+        git(&[
+            "-C",
+            &clone_path,
+            "push",
+            "-q",
+            "origin",
+            &format!("{commit}:refs/heads/spawn/{}", task.agent_id),
+        ])
+        .expect("push the branch");
+        let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+        checkpoint(&db, &task, now, &commit, "tool_completed");
+        let row = snapshot(&db, mission);
+        let kept = super::kept_work(&db.store, &row, &task).expect("the work");
+        let super::Kept::Work {
+            branch,
+            commit: kept_commit,
+            diff,
+        } = kept
+        else {
+            panic!("the branch holds it: {kept:?}");
+        };
+        assert_eq!(branch, format!("spawn/{}", task.agent_id));
+        assert_eq!(kept_commit, commit);
+        assert!(
+            diff.contains("big.txt") && diff.contains("insertion"),
+            "{diff}"
+        );
+        // A checkpoint the pusher has not made it there yet: wait, until
+        // the push has had its time, then say it was lost.
+        let unpushed = "0123456789abcdef0123456789abcdef01234567";
+        checkpoint(&db, &task, now, unpushed, "tool_completed");
+        assert_eq!(
+            super::kept_work(&db.store, &row, &task).expect("kept"),
+            super::Kept::Waiting
+        );
+        checkpoint(&db, &task, now - 120_000, unpushed, "tool_completed");
+        assert!(
+            matches!(
+                super::kept_work(&db.store, &row, &task).expect("kept"),
+                super::Kept::Lost { .. }
+            ),
+            "a push that never came is lost"
+        );
+=======
             "nothing in the pass that aborted"
         );
         crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
@@ -6951,6 +7743,7 @@ mod database_tests {
         assert_eq!(next, [25], "the fewest attempts, not the aborted objective");
         let brief = objective_task(&db, mission, 25).brief;
         assert!(!brief.contains("Earlier tasks"));
+>>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -8158,6 +8951,236 @@ mod database_tests {
         let after = gated(&db, mission);
         assert_eq!((after.gate_rejections, after.gate_host_faults), (1, 0));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Objective 33, end to end: a gate that exits 4 after its own pair of
+    /// lines (a scenario of the base exiting 1 and then 0) is recorded
+    /// `host_fault` with the evidence `base_disagrees`, the gate's own
+    /// scenario (not a nested gate's 102.sh), both exits and its setup
+    /// seconds; the task stays reported and is not judged again before the
+    /// record's `due_ms`; three in a row double the backoff, share 020's run,
+    /// never escalate and carry the alert at the third; a base run that
+    /// exits 2, or `1, then 2`, is an abort and resets both runs; the
+    /// accepted run lands and the mission is never halted.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_base_that_disagrees_with_itself_is_a_host_fault_judged_again() {
+        let dir =
+            std::env::temp_dir().join(format!("spawn-db-base-disagrees-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let runs = dir.join("runs");
+        let runs_path = runs.display();
+        let template = r#"
+n=$(cat 'RUNS' 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" >'RUNS'
+disagrees() {
+  echo '| == base: 011.sh'
+  echo '| stage gate exit 1 74210ms base: 011.sh'
+  echo '| == base: 011.sh again (unsolved needs two runs that agree)'
+  if [ "$2" = nested ]; then
+    echo '| | 102.sh exited 1, then 0 on the base: a harness error, not a verdict; the gate aborts'
+    echo '| | stage gate aborted 5ms base: 102.sh again (unsolved needs two runs that agree)'
+  fi
+  echo '| 011.sh exited 1, then 0 on the base: a harness error, not a verdict; the gate aborts'
+  echo '| stage gate aborted 66871ms base: 011.sh again (unsolved needs two runs that agree)'
+  echo "| gate time: base 141 s (2 scenario runs, 19 results from the cache), candidate 0 s, setup $1 s (exports, socket scan, static checks), total 385 s"
+  exit 4
+}
+case "$n" in
+1) disagrees 244 nested ;;
+2) disagrees 31 ;;
+3) disagrees 29 ;;
+4)
+  echo '| == base: 011.sh'
+  echo '| 011.sh exited 2 on the base: a harness error, not a verdict; the gate aborts'
+  echo '| stage gate aborted 5120ms base: 011.sh again (unsolved needs two runs that agree)'
+  exit 4
+  ;;
+5)
+  echo '| == base: 011.sh'
+  echo '| 011.sh exited 1, then 2 on the base: a harness error, not a verdict; the gate aborts'
+  echo '| stage gate aborted 12003ms base: 011.sh again (unsolved needs two runs that agree)'
+  exit 4
+  ;;
+esac
+printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
+"#;
+        let gate = template.replace("RUNS", &runs_path.to_string());
+        let (base, source, scenarios, mut integrator) = world("base-disagrees-pass", &gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_secs(2),
+        };
+        let db = Db::new("base_disagrees_pass");
+        let mission = db.gated_mission(&source, &scenarios);
+        let _task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        let count = || {
+            std::fs::read_to_string(&runs).map_or(0, |text| text.trim().parse::<u32>().unwrap_or(0))
+        };
+        let pass = || {
+            integrator.pass_on(&db.store).expect("a pass");
+            integrator.settle();
+        };
+        let wait_until = |due: i64| {
+            let left = due - super::now_ms();
+            if left > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    u64::try_from(left).unwrap_or(0) + 50,
+                ));
+            }
+        };
+        let state = |db: &Db| {
+            let after = gated(db, mission);
+            (after.tasks[0].state, after.tasks[0].revisions)
+        };
+
+        // (1) Run 1: the base disagreed with itself.
+        pass();
+        assert_eq!(count(), 1);
+        let (record, event, at) = last_verdict(&db);
+        assert_eq!(record["verdict"], "host_fault", "{record}");
+        assert_eq!(record["evidence"], "base_disagrees");
+        assert_eq!(
+            record["scenario"], "011.sh",
+            "the gate's own line, not 102.sh"
+        );
+        assert_eq!(record["exits"], json!([1, 0]));
+        assert_eq!(record["setup_s"], 244);
+        assert_eq!(record["host_faults"], 1);
+        assert_eq!(record["base_disagrees"], 1);
+        assert_eq!(record["escalate"], false);
+        assert_eq!(record["alert"], false);
+        assert_eq!(record["backoff_ms"], 2000);
+        assert_eq!(record["due_ms"], at + 2000, "its own time plus the backoff");
+        assert!(record["candidate"].is_string());
+        assert!(
+            record["log"].as_str().is_some_and(|log| {
+                log.contains(
+                    "| 011.sh exited 1, then 0 on the base: a harness error, not a verdict; the \
+                     gate aborts",
+                ) && log.contains("| | 102.sh exited 1, then 0")
+            }),
+            "{record}"
+        );
+        assert!(record["reason"].as_str().is_some_and(|reason| {
+            reason
+                .starts_with("host fault: the base disagrees with itself: 011.sh exited 1, then 0")
+                && reason.contains("244 s")
+                && reason.ends_with("not a verdict, judged again later")
+        }));
+        let after = gated(&db, mission);
+        assert_eq!((after.gate_host_faults, after.gate_base_disagrees), (1, 1));
+        assert_eq!((after.gate_rejections, after.gate_aborts), (0, 0));
+        assert_eq!(
+            state(&db),
+            (spawn_core::mission::TaskState::Reported, 0),
+            "nothing went back to the worker"
+        );
+        assert!(after.halted.is_none());
+        assert_eq!(
+            db.store
+                .gate_base_disagrees_alerts()
+                .expect("alerts")
+                .as_array()
+                .map(Vec::len),
+            Some(0),
+            "the first in a row is no alert"
+        );
+
+        // (2) Held until its due time, then judged again.
+        pass();
+        assert_eq!(count(), 1, "not judged again before due_ms");
+        assert_eq!(last_verdict(&db).1, event);
+        wait_until(at + 2000);
+
+        // (3) Run 2: the second in a row, the backoff doubled, no escalation.
+        pass();
+        assert_eq!(count(), 2);
+        let (record, _, at) = last_verdict(&db);
+        assert_eq!(record["verdict"], "host_fault", "{record}");
+        assert_eq!(record["host_faults"], 2);
+        assert_eq!(record["base_disagrees"], 2);
+        assert_eq!(record["setup_s"], 31);
+        assert_eq!(record["backoff_ms"], 4000);
+        assert_eq!(record["due_ms"], at + 4000);
+        assert_eq!(record["escalate"], false, "never, whatever the count");
+        assert_eq!(record["alert"], false);
+        assert_eq!(gated(&db, mission).gate_aborts, 0);
+        assert_eq!(
+            db.store
+                .gate_host_fault_escalations()
+                .expect("escalations")
+                .as_array()
+                .map(Vec::len),
+            Some(0),
+            "a base disagreement is no escalation"
+        );
+
+        // (4) Run 3: three in a row, the alert, and no halt.
+        pass();
+        assert_eq!(count(), 2, "held again, for the doubled backoff");
+        wait_until(at + 4000);
+        pass();
+        let (record, alert_event, at) = last_verdict(&db);
+        assert_eq!(record["verdict"], "host_fault", "{record}");
+        assert_eq!(record["host_faults"], 3);
+        assert_eq!(record["base_disagrees"], 3);
+        assert_eq!(record["backoff_ms"], 8000);
+        assert_eq!(record["escalate"], false);
+        assert_eq!(record["alert"], true, "three in a row raise one alert");
+        let after = gated(&db, mission);
+        assert_eq!((after.gate_host_faults, after.gate_base_disagrees), (3, 3));
+        assert!(after.halted.is_none(), "no halt counts a host fault");
+        assert_eq!(after.gate_aborts, 0);
+        let alerts = db.store.gate_base_disagrees_alerts().expect("alerts");
+        assert_eq!(alerts.as_array().map(Vec::len), Some(1), "{alerts}");
+        assert_eq!(alerts[0]["event_id"], alert_event);
+        assert_eq!(alerts[0]["scenario"], "011.sh");
+
+        // (5) Control: a real harness error on the base is an abort, counts,
+        // and ends both runs.
+        wait_until(at + 8000);
+        pass();
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["verdict"], "aborted", "{record}");
+        let after = gated(&db, mission);
+        assert_eq!(
+            (
+                after.gate_aborts,
+                after.gate_host_faults,
+                after.gate_base_disagrees
+            ),
+            (1, 0, 0),
+            "a base run that exited 2 is an abort and resets both runs"
+        );
+        pass();
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["verdict"], "aborted", "1, then 2 is an abort too");
+        assert_eq!(gated(&db, mission).gate_aborts, 2);
+        assert!(gated(&db, mission).halted.is_none());
+
+        // Run 6 accepts and lands, ending both runs.
+        pass();
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["verdict"], "accepted", "{record}");
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        let after = gated(&db, mission);
+        assert_eq!(
+            (
+                after.gate_host_faults,
+                after.gate_base_disagrees,
+                after.gate_aborts
+            ),
+            (0, 0, 0)
+        );
+        assert!(after.halted.is_none());
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- the owner's hold (objective 034) --------------------------------

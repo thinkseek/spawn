@@ -354,7 +354,11 @@ commit with a key no agent holds cannot hang or fail a test.
   `SPAWN_TEST_DATABASE_LOG`, shows a crash during the gate) is gated
   `host_fault`: no verdict on the work, never counted, the task left where it
   was and judged again after a backoff from the record's `due_ms`, two in a
-  row escalated to the supervisor (fleet-architecture.md §10.3); marker blocks in the files
+  row escalated to the supervisor; or one whose own base disagreed with
+  itself (a scenario of it exited 1 and then 0, before any candidate code
+  ran) is gated `host_fault` with the evidence `base_disagrees`, never
+  counted, judged again after the same run's backoff and alerted at three in
+  a row in the record itself (fleet-architecture.md §10.3); marker blocks in the files
   the branch changes are gated `conflict`, a pending merge of `main` (it lives with the workspace
   directory, on the Bridge's host) blocks judging when that directory is on
   the integrator's host, and its markers, once checkpointed and pushed, are
@@ -585,6 +589,33 @@ outside Spawn's cleanup), the mirrors under `<root>/.sources`, which hold
 branches, and the transcript archive under `<root>/.transcripts`, which
 holds the agents' history; none of them is pruned automatically.
 
+## Alerts
+
+What went wrong is recorded, not printed into a pane
+([fleet-architecture.md](fleet-architecture.md) §3.4). Each alert transition
+is a control record in the stream, in the same shape as everything else:
+
+- `alert.fired {key, kind, subject, evidence, text, notice?}` — one
+  occurrence. `key` names it (a task's state change, a halt's record, a
+  crash line's stamp and pid, a reading's time, a backup's record, and so
+  on); `evidence` holds the record's `event_id` or the reading's measure and
+  threshold. A notice (`notice: true`) is news and never clears.
+- `alert.cleared {key, kind, subject, evidence}` — what cleared it, with the
+  clearing record's `event_id` (or the log line, or the reading).
+
+The records are written by the loop through `spawn_alert_record` (owner
+only) and folded into `spawn_alerts`, one row per key: `key` (primary key),
+`kind`, `subject`, `state` (`open`, `notice` or `cleared`), `notice`,
+`text`, `evidence`, `fired_event_id`, `fired_at_ms`, and `cleared_event_id`,
+`cleared_at_ms`, `cleared_evidence`. The fold — and the writer — refuses a
+second `alert.fired` for a key, an `alert.cleared` without its `alert.fired`
+and a second `alert.cleared`, so an alert fires once per occurrence and
+clears at most once, across restarts and two loops at once. The loop reads
+the keys back on start and fires nothing twice; `spawn alerts --once`,
+`spawn alerts --follow` and `/api/alerts` read the table, so the fleet, the
+supervisor and the dashboard see the same alerts (`spawn_reader` and the
+supervisor's login may read it; only the owner writes it).
+
 ## Not built
 
 - **Files over the cap**: they stay in the workspace only; nothing keeps
@@ -600,9 +631,9 @@ holds the agents' history; none of them is pruned automatically.
 | State | Where | Rebuildable? |
 | --- | --- | --- |
 | Event log | PostgreSQL, one container on this host, bound to 127.0.0.1 | It *is* the source |
-| Event log backups | daily encrypted `pg_dump` in R2 bucket `spawn-store`: `postgres/daily/` (15 d), `weekly/` (60 d), `monthly/` (400 d), bucket-locked against deletion, expired by R2 lifecycle; newest also in `~/.local/share/spawn-rsi/backups/` ([deploy/backup](../deploy/backup/README.md)) | They are the copy; the key is kept off-host |
+| Event log backups | `spawn backup dump`, every hour: an encrypted `pg_dump` in R2 bucket `spawn-store` under `postgres/hourly/` (6 h), plus the day's first under `postgres/daily/` (7 d) and the ISO week's first under `postgres/weekly/` (28 d), bucket-locked against deletion and expired by R2 lifecycle; a copy the plausibility check doubts goes to `postgres/suspect/` (30 d) ([deploy/backup](../deploy/backup/README.md)) | They are the copy; the key is kept off-host |
 | What an engine did | read by the Bridge from transcript and pane into the log | Yes: in the log |
-| Full transcript text | `~/.claude/projects/...` on the compute host, copied to `<root>/.transcripts/<agent>/` at turn ends and execution ends | From the archive, on the same host (restored before a resume when missing); **no** on another host |
+| Full transcript text | `~/.claude/projects/...` on the compute host, copied to `<root>/.transcripts/<agent>/` at turn ends and execution ends; the last 14 days leave the host in the daily bundle below | From the archive, on the same host (restored before a resume when missing); from `bundles/` on another host |
 | Code: mission sources | bare repos (`missions/*.git`) or remote URLs | Remote URLs: yes |
 | Code: agents' work | per-agent branches in host-local mirrors (`ws/.sources/*.git`), pushed as `spawn/<agent>` to a source that is a directory on this host (a remote source receives none) | Yes for missions with a directory source; no for remote sources, scratch missions and the default repository |
 | Work a task lands | the source's `spawn/<agent>`, fetched by the integrator into its mirror's `refs/spawn-integrate/<agent>`; judged only when it contains the agent's latest checkpoint (its `artifact.committed` in the event log) | Yes: the source holds it; nothing on the host that ran the agent is needed |
@@ -610,6 +641,50 @@ holds the agents' history; none of them is pruned automatically.
 | A mission's settings (gate, accept, budget, objectives) | `mission_missions`, the fold of its latest `mission.configured`, which holds the whole configuration: `spawn mission configure` merges what it is given into the row read under the append lock and records the result, clearing only on its `--no-<setting>` switches; clearing the gate, or moving accept away from gate, is refused while a task of the mission is `landing` (nothing would land it: GitHub issue #9) ([fleet-architecture.md](fleet-architecture.md) §10.3) | Yes: from the log |
 | Backlog, scenarios, gate | files in the controller's checkout, by absolute path | **No** on another host (versioning them with the source is not built) |
 | Secrets | `spawn.env`, `~/.config/spawn/*`, mode 600 | Deliberately not stored |
+
+### What leaves the host
+
+`spawn backup` (crates/spawn-cli/src/backup.rs) is the binary's part; the
+timers, the bucket's lifecycle and lock rules and the README are the owner's
+(deploy/backup). Each run records what it did, through the owner-only
+`spawn_backup_record`:
+
+- `backup.dumped {keys, tiers, skipped, sha256, bytes, stored_bytes, events,
+  max_event_id, held_bytes, written_bytes, alert_bytes, limit_bytes,
+  over_alert, suspect?, dump_ms, upload_ms}` — one `pg_dump -Fc` of the
+  database `spawn backup` records into, its `spawn_events` rows and highest
+  id counted in the archive itself, encrypted (AES256) and decrypted back to
+  compare its sha256. A dump holding fewer events than the newest good one,
+  or under half its size, is suspect and goes to `postgres/suspect/` only
+  (exit 3). The tiers come from the earlier records: hourly always, daily
+  the UTC day's first good dump, weekly the ISO week's first.
+- `backup.bundled {kind, base_event_id, keys, tiers, skipped, sha256, bytes,
+  stored_bytes, repos, missing, transcripts, held_bytes, written_bytes,
+  alert_bytes, limit_bytes, over_alert, duration_ms}` — one encrypted tar
+  holding `manifest.json`, a git bundle of every mission source (whole, or
+  `--not` its base's heads) and the transcript archive's files of the last
+  `SPAWN_BACKUP_TRANSCRIPT_DAYS` (14) days, whole or the bytes appended
+  since its base's recorded sizes.
+- `backup.verified {ok, reason, key, sha256, dumped_event_id, expected,
+  events, max_event_id, database, server, duration_ms}` — the restore drill:
+  the newest good dump fetched, decrypted, restored into a database of its
+  own on `SPAWN_BACKUP_DRILL_DATABASE_URL` (never the source), its events and
+  watermark compared with that record's (never with the live database), and
+  the database dropped. Exit 0 restores to the record; 1 does not; 2 cannot
+  run.
+
+Nothing is written past `SPAWN_BACKUP_R2_LIMIT_MB` (10,000,000,000 bytes,
+the free tier in decimal GB): every run lists the whole bucket under
+`<root>/.backup.lock` and skips any copy that would pass it, the hourly one
+included (a dump whose hourly copy was skipped exits 4, so its timer unit
+fails). `SPAWN_BACKUP_R2_ALERT_MB` (8,000,000,000) is the owner's alert: the
+record says `over_alert` and the run says it on its output; objective 030's
+`backup_budget` alert is raised from that record. The passphrase
+(`SPAWN_BACKUP_KEY_FILE`) and the R2 credentials (`SPAWN_R2_ENV_FILE`) are
+mode-600 files read by path and on stdin, never on a command line, in the
+output or in a record. A host restored from these: the log from a dump, the
+sources and the transcript window from the newest full bundle and the
+increments after it.
 
 ## Where the one store runs
 
