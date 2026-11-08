@@ -3892,6 +3892,11 @@ mod tests {
         }
     }
 
+    /// The engine's line that ends a turn: a checkpoint, and the moment the
+    /// screen is about to turn back to its prompt.
+    const TURN_LINE: &str =
+        "{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"t1\"}\n";
+
     /// Something the engine wrote during the turn (no checkpoint of a turn's
     /// end, so nothing is committed).
     const TOOL_LINE: &str = "{\"type\":\"assistant\",\"uuid\":\"a1\",\"timestamp\":\"2099-01-01T00:00:00.000Z\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Bash\"}]}}\n";
@@ -3925,6 +3930,51 @@ mod tests {
         assert_eq!(world.pass(), 1, "a waiting command keeps the pane read");
         world.advance(500);
         assert_eq!(world.pass(), 1);
+    }
+
+    /// A turn ends in the transcript while the screen still shows the turn:
+    /// the pane keeps being read until the engine paints its prompt, so the
+    /// reading a delivery waits for is never left to the backstop.
+    #[test]
+    fn a_turn_that_ended_is_read_until_its_prompt_is_back() {
+        let mut world = World::new();
+        world.set_pane(BUSY);
+        world.engine_writes(TURN_LINE);
+        assert_eq!(world.pass(), 1, "the turn's end: a reading at once");
+        assert_eq!(world.pass(), 1, "and its twin, which agrees");
+        assert_eq!(world.screens(), vec![ScreenState::Busy]);
+        // The transcript is quiet and the engine paints the prompt a moment
+        // later: that reading is due on the next pass, not at the backstop.
+        world.set_pane(READY);
+        assert_eq!(world.pass(), 1, "the prompt: a reading");
+        assert_eq!(world.pass(), 1, "and its twin");
+        assert_eq!(
+            world.screens(),
+            vec![ScreenState::Busy, ScreenState::Ready],
+            "the worker at its prompt is a fact"
+        );
+        assert_eq!(world.pass(), 0, "and then the session is left alone");
+    }
+
+    /// A screen that never shows its turn over costs the passes of one
+    /// `screen_refresh`, no more: the backstop takes it back.
+    #[test]
+    fn a_screen_that_never_settles_is_read_for_one_refresh_at_most() {
+        let mut world = World::new();
+        world.set_pane(BUSY);
+        world.engine_writes(TURN_LINE);
+        world.pass();
+        world.pass();
+        let mut reads = 0;
+        for _ in 0..70 {
+            world.advance(500);
+            reads += world.pass();
+        }
+        assert!(
+            (58..=62).contains(&reads),
+            "one capture a pass for the 30 s after the turn ended: {reads}"
+        );
+        assert_eq!(world.pass(), 0, "then not until the backstop");
     }
 
     /// A transcript that grew does not take the pane with it: the screen is
