@@ -214,17 +214,26 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
     host.terminate(&terminal(), &workspace()).expect("kill");
 
     // A dead pane kept by remain-on-exit: the runner exited (3) and the
-    // session stays.
+    // session stays. The runner lives a moment before it exits: a pane whose
+    // process is gone before the server has taken the pane up can die with no
+    // status recorded ("exit status none" for good: 1 of 8 runs on a host at
+    // load 14 with the fleet's own gates running, 2026-11-08), and the point
+    // here is the status a dead pane keeps, not how fast a process can exit.
     server.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
-    host.start(&launch("/bin/sh", &["-c", "exit 3"], &[("A", "1")]))
-        .expect("start");
+    host.start(&launch(
+        "/bin/sh",
+        &["-c", "sleep 1; exit 3"],
+        &[("A", "1")],
+    ))
+    .expect("start");
     // tmux marks the pane dead when its terminal closes, and records the
     // exit status when it reaps the process, a moment later on a loaded host
     // ("exit status none" in between: an owner gate, 2026-11-07; and a gate
     // running 34 test binaries two at a time starved the server past five
-    // seconds, 2026-11-08). Wait for the status, with room for a loaded host;
-    // a server that never records it still fails the assertion below.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // seconds, 2026-11-08). Wait for the status, with room for a loaded host
+    // and a read rarely enough not to add to the load; a server that never
+    // records it still fails the assertion below.
+    let deadline = Instant::now() + Duration::from_secs(120);
     let seen = loop {
         let Runner::Untracked(seen) = settled(&host, Duration::from_secs(5)) else {
             panic!("a dead pane hosts no runner");
@@ -232,7 +241,7 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
         if !seen.contains("exit status none") || Instant::now() > deadline {
             break seen;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(250));
     };
     assert!(seen.contains("dead (exit status 3)"), "{seen}");
     assert!(host.is_alive(&terminal(), &workspace()).expect("alive"));
