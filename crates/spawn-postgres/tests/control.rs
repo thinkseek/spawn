@@ -1423,26 +1423,20 @@ fn a_tasks_stages_are_its_records_in_order_with_the_time_each_took() {
     let board = store.mission_board(10).expect("board");
     assert_eq!(board["missions"][0]["tasks"][0]["stages"], expected);
     for login in ["spawn_supervisor", "spawn_reader"] {
-        let role = common::login(&schema, login);
-        client
-            .batch_execute(&format!("set session authorization {role}"))
-            .expect("become the login");
-        let stages: serde_json::Value = client
+        let mut as_login = common::as_login(&schema, login);
+        let stages: serde_json::Value = as_login
             .query_one("select spawn_task_stages($1)", &[&task])
             .expect("the login reads the stages")
             .get(0);
         assert_eq!(stages, expected, "{login}");
         if login == "spawn_supervisor" {
             assert!(
-                client
+                as_login
                     .query_one("select count(*) from spawn_events", &[])
                     .is_err(),
                 "the supervisor still reads no events"
             );
         }
-        client
-            .batch_execute("reset session authorization")
-            .expect("back to the owner");
     }
 }
 
@@ -1500,12 +1494,9 @@ fn host_disk_records_are_owner_only_facts_the_fold_ignores() {
     assert_eq!(tables(&mut client), before);
     assert_eq!(control_types(&mut client), ["host.disk"; 3]);
 
-    let supervisor = common::login(&schema, "spawn_supervisor");
-    client
-        .batch_execute(&format!("set session authorization {supervisor}"))
-        .expect("become the supervisor");
+    let mut supervisor = common::as_login(&schema, "spawn_supervisor");
     assert!(
-        client
+        supervisor
             .query_one("select spawn_host_record($1)", &[&record("/ws", "low", 1)])
             .is_err(),
         "the supervisor records no host facts"
@@ -3663,12 +3654,9 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
         assert!(types.iter().any(|seen| seen == kind), "{kind}: {types:?}");
     }
 
-    let supervisor = common::login(&schema, "spawn_supervisor");
-    client
-        .batch_execute(&format!("set session authorization {supervisor}"))
-        .expect("become the supervisor");
+    let mut supervisor = common::as_login(&schema, "spawn_supervisor");
     assert!(
-        client
+        supervisor
             .query_one(
                 "select spawn_source_push_request($1, $2, $3)",
                 &[&source, &c1, &owner_ref(&c1)],
@@ -3677,7 +3665,7 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
         "the supervisor asks for no owner landing"
     );
     assert!(
-        client
+        supervisor
             .query_one("select spawn_source_push_hold()", &[])
             .is_err(),
         "the supervisor holds no landing"

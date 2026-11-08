@@ -383,6 +383,24 @@ fn every_engine_the_bridge_starts_is_denied_the_credential_files() {
     ] {
         assert!(rules.iter().any(|rule| rule == program), "{program}");
     }
+    // Killing by name or pattern; never `kill` itself, which stops the
+    // engine's own job by its id.
+    for kill in [
+        "Bash(pkill:*)",
+        "Bash(killall:*)",
+        "Bash(*pkill *)",
+        "Bash(*killall *)",
+        "Bash(*kill *$(pgrep*)",
+        "Bash(*pgrep *|*kill*)",
+    ] {
+        assert!(rules.iter().any(|rule| rule == kill), "{kill}");
+    }
+    assert!(
+        !rules
+            .iter()
+            .any(|rule| rule == "Bash(kill:*)" || rule == "Bash(*kill *)"),
+        "kill <pid> stays allowed"
+    );
     // Not the fleet's TMPDIR itself, only the scripts in it.
     assert!(
         !rules
