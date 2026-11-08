@@ -66,7 +66,6 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::DiskRecovered => "disk space back on this host",
         Why::GateRoom => "no room for the gate on this host",
         Why::GateHostFault => "host faults at the gate (the host's, not the work's)",
-        Why::GateBaseDisagrees => "the base disagreed with itself at the gate (the host's)",
         Why::Stalled => "stalled",
         Why::Charter => "new charter not typed",
         Why::BackgroundJob => "background job past its bound",
@@ -143,11 +142,6 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
         .filter_map(|record| {
             let id = record["event_id"].as_i64()?;
             let task = record["id"].as_i64()?;
-            // Only a record that carries the escalation is one: a base that
-            // disagreed with itself never does (objective 033).
-            if record["escalate"].as_bool() != Some(true) {
-                return None;
-            }
             let mission = record["mission"]
                 .as_i64()
                 .map_or_else(|| "its mission".to_string(), |id| format!("mission {id}"));
@@ -194,57 +188,6 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                      host's, not the work's: {evidence}. It is judged again {due}; nothing is \
                      counted and nothing halts. Check the test database's host (its memory, \
                      /dev/shm, its log) or tell the owner."
-                ),
-                since_ms: record["at_ms"].as_i64(),
-            })
-        })
-        .collect()
-}
-
-/// The digest items for `records`, the integrator's `host_fault` gate
-/// records whose base disagreed with itself and that carry `alert` (the
-/// mission's third such base in a row, objective 033), and that no delivered
-/// digest told yet (`PostgresStore::gate_base_disagrees_alerts`). Each names
-/// the task, the mission, the count in a row, the scenario, its exits, the
-/// gate's setup time when it printed one, and when the task is judged again
-/// (the record's `due_ms`). No time window: a record stays an item until a
-/// digest carrying its tag (`host gate-base-disagrees-<event id>`) reaches
-/// the supervisor, so it is told once. Before objective 030 exists this item
-/// is how the alert reaches a person; 030 raises its `gate_base_disagrees`
-/// notice from the same record.
-pub(crate) fn base_disagrees_alerts(records: &[Value]) -> Vec<Escalation> {
-    records
-        .iter()
-        .filter_map(|record| {
-            let id = record["event_id"].as_i64()?;
-            let task = record["id"].as_i64()?;
-            // Only the record that makes the run three carries the alert;
-            // the other ones of the run are no news.
-            if record["alert"].as_bool() != Some(true) {
-                return None;
-            }
-            let mission = record["mission"]
-                .as_i64()
-                .map_or_else(|| "its mission".to_string(), |id| format!("mission {id}"));
-            let count = record["base_disagrees"].as_u64().unwrap_or(3);
-            let scenario = record["scenario"].as_str().unwrap_or("a scenario");
-            let setup = record["setup_s"]
-                .as_u64()
-                .map_or_else(String::new, |secs| format!(", setup {secs} s"));
-            let due = record["due_ms"].as_i64().map_or_else(
-                || "after its backoff".to_string(),
-                |due| format!("at {}", crate::scorecard::time::format_rfc3339(due)),
-            );
-            Some(Escalation {
-                session_id: HOST_SESSION.to_string(),
-                id: format!("gate-base-disagrees-{id}"),
-                why: Why::GateBaseDisagrees,
-                line: format!(
-                    "task #{task} of {mission}: the base disagreed with itself {count} in a row \
-                     at the gate ({scenario} exited 1, then 0 on the base{setup}): no candidate \
-                     code had run, so it is the host's (too loaded or too flaky to judge), not \
-                     the work's. It is judged again {due}; nothing is counted and nothing halts. \
-                     Check the host's load or tell the owner."
                 ),
                 since_ms: record["at_ms"].as_i64(),
             })

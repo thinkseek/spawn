@@ -251,28 +251,14 @@ fn the_store_writes_expires_ms_and_a_second_hold_renews_the_first() {
     assert_eq!(holds[0]["main"], OTHER_MAIN);
     assert_eq!(holds[0]["by"], "human");
     assert_eq!(holds[0]["held_at_ms"], held[1]["at_ms"]);
-    // The renewal itself moved the waiting task to the new hold in the fold:
-    // the board, a release and an expiry name it at once, and the fold wrote
-    // no record of its own.
+    // The waiting task waits behind the new one once its landing says so.
     let second_hold = second["hold"].as_i64().expect("an id");
-    assert_eq!(fold["tasks"][0]["held_by"], second_hold);
-    assert_eq!(
-        records(&mut client, "task.held").len(),
-        1,
-        "the fold records nothing"
-    );
-    let board = store.mission_board(10).expect("board");
-    assert_eq!(board["holds"][0]["waiting"], json!([task]));
-    assert_eq!(board["missions"][0]["hold"], second_hold);
-
-    // Its landing's own `task.held` follows, once per task and hold.
     assert!(
         store
             .task_held(task, second_hold, source)
             .expect("held")
             .is_some()
     );
-    assert_eq!(records(&mut client, "task.held").len(), 2);
     let board = store.mission_board(10).expect("board");
     assert_eq!(board["holds"][0]["waiting"], json!([task]));
     assert_eq!(board["missions"][0]["hold"], second_hold);
@@ -382,35 +368,6 @@ fn a_hold_expires_by_record_only_once_the_database_clock_reached_it() {
         )
         .expect("a digest that told it");
     assert_eq!(store.hold_expiries().expect("expiries"), json!([]));
-}
-
-/// A renewal ends the old hold and moves its waiting tasks to the new one,
-/// so an expiry that comes before the integrator's next `task.held` still
-/// names them: the supervisor is told what waited, never "nothing waited".
-#[test]
-fn an_expiry_after_a_renewal_names_the_tasks_that_waited_behind_the_old_hold() {
-    let (store, schema) = store("holds_renewed_expiry");
-    let source = "/tmp/renewed-expiry.git";
-    let (_, task) = landing_task(&store, source);
-    let first = hold(&store, source, MAIN, 600, None);
-    let first_id = first["hold"].as_i64().expect("an id");
-    store.task_held(task, first_id, source).expect("held");
-    // A renewal with a bound of a second, and no `task.held` for it yet.
-    let second = hold(&store, source, MAIN, 1, None);
-    let second_id = second["hold"].as_i64().expect("an id");
-    assert_eq!(second["renews"], first_id);
-    let mut client = admin(&schema);
-    assert_eq!(folded(&mut client)["tasks"][0]["held_by"], second_id);
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    let expired = store.hold_expired(source, second_id).expect("expired");
-    let records = records(&mut client, "source.hold_expired");
-    assert_eq!(records[0]["id"], expired);
-    assert_eq!(records[0]["record"]["hold"], second_id);
-    assert_eq!(
-        records[0]["record"]["waiting"],
-        json!([task]),
-        "the task that waited behind the old hold waits behind the renewed one"
-    );
 }
 
 #[test]

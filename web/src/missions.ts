@@ -406,9 +406,8 @@ export function stageStep(stage: TaskStage): StageStep {
         : { label: "sent back", tone: "back" };
     case "gated":
       if (stage.verdict === "accepted") return { label: "landing", tone: "forward" };
-      // The host failed (the test database, or a base that disagreed with
-      // itself), not the work: no verdict on it, judged again after a
-      // backoff.
+      // The host failed (the test database), not the work: no verdict on
+      // it, judged again after a backoff.
       if (stage.verdict === "host_fault")
         return { label: "gate host fault (the host's, not the work's)", tone: "forward" };
       return {
