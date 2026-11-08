@@ -1,8 +1,0 @@
-# Scenarios the gate runs with nothing else of the gate beside them (SPAWN_GATE_JOBS > 1).
-# Only the gate reads this file. Task 121 measured these as host-load sensitive:
-# 011: counts observations in a 20 s idle window; a busy host lands one already in flight.
-# 023: delivery within 4 s. 025: a claim within 750 ms. 032: the p90 of resumes within 15 s.
-011.sh
-023.sh
-025.sh
-032.sh
