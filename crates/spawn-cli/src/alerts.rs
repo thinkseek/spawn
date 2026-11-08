@@ -420,7 +420,7 @@ impl Monitor {
             // check), and otherwise everything up to the clock, which is
             // what makes an idle check one statement (objective 023: the
             // log's watermark, never the clock, says whether there is work).
-            self.watermark = if records.len() < BATCH {
+            self.watermark = if i64::try_from(records.len()).unwrap_or(i64::MAX) < BATCH {
                 watermark
             } else {
                 batch["next"].as_i64().unwrap_or(self.watermark)
