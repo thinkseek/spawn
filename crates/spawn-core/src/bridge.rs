@@ -3894,8 +3894,7 @@ mod tests {
 
     /// The engine's line that ends a turn: a checkpoint, and the moment the
     /// screen is about to turn back to its prompt.
-    const TURN_LINE: &str =
-        "{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"t1\"}\n";
+    const TURN_LINE: &str = "{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"t1\"}\n";
 
     /// Something the engine wrote during the turn (no checkpoint of a turn's
     /// end, so nothing is committed).
