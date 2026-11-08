@@ -234,35 +234,7 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    eprintln!(
-        "TRACE seen={seen:?} raw={:?}",
-        Command::new("tmux")
-            .args([
-                "-L",
-                &server.socket,
-                "list-panes",
-                "-a",
-                "-F",
-                "#{session_name}|#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pane_current_command}|#{pane_pid}"
-            ])
-            .output()
-            .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
-    );
-    assert!(
-        seen.contains("dead (exit status 3)"),
-        "{seen} / raw: {:?}",
-        Command::new("tmux")
-            .args([
-                "-L",
-                &server.socket,
-                "list-panes",
-                "-a",
-                "-F",
-                "#{session_name}|#{pane_dead}|#{pane_dead_status}|#{pane_current_command}|#{pane_start_command}"
-            ])
-            .output()
-            .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
-    );
+    assert!(seen.contains("dead (exit status 3)"), "{seen}");
     assert!(host.is_alive(&terminal(), &workspace()).expect("alive"));
 }
 
