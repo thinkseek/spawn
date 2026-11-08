@@ -487,9 +487,7 @@ impl PostgresStore {
     /// index scans of `(session_id, id)` and `(session_id, principal, id)`,
     /// never a scan of the table (tests/wake.rs states it over 20,000 rows).
     pub fn dispatch_facts_plan(&self) -> Result<Value, StoreError> {
-        let sql = format!(
-            "explain (format json, costs off) {DISPATCH_FACTS}"
-        );
+        let sql = format!("explain (format json, costs off) {DISPATCH_FACTS}");
         self.query_json(&sql, &[&spawn_core::bridge::MAY_HAVE_TYPED])
     }
 
@@ -513,4 +511,3 @@ impl PostgresStore {
         self.query_json(SESSION_COMMANDS, &[&session, &i64::from(limit)])
     }
 }
-

@@ -57,7 +57,9 @@ fn init_db_makes_both_indexes_on_a_fresh_schema() {
 fn init_db_makes_both_indexes_on_an_existing_schema() {
     let (schema, mut client) = first_shapes("wake_indexes_upgrade");
     assert!(
-        plain_keys(&mut client).iter().all(|key| key != "session_id,principal,id"),
+        plain_keys(&mut client)
+            .iter()
+            .all(|key| key != "session_id,principal,id"),
         "the first shapes have no such index: the migration must make it"
     );
     drop(client);
@@ -100,7 +102,9 @@ fn the_dispatch_facts_do_not_scan_the_command_table() {
     let mut scans = Vec::new();
     collect(&plan, &mut scans);
     assert!(
-        !scans.iter().any(|node| node == "Seq Scan on spawn_commands"),
+        !scans
+            .iter()
+            .any(|node| node == "Seq Scan on spawn_commands"),
         "the dispatch facts read the command table: {scans:#?}"
     );
     assert!(

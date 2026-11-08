@@ -374,10 +374,8 @@ impl Fleet {
         // A time the records named runs its step now, never behind the pass
         // interval; a change of the log may wait for that interval, so a
         // burst of appends inside one interval is one pass's work.
-        let due = self.schedule.due(now)
-            || self
-                .steps_at
-                .is_none_or(|at| at.elapsed() >= self.interval);
+        let due =
+            self.schedule.due(now) || self.steps_at.is_none_or(|at| at.elapsed() >= self.interval);
         if let (Some(open), Some(watermark)) = (self.store.clone(), watermark) {
             self.bridge_work(&open, watermark, now, &mut warnings, &mut failed);
             if due {
@@ -513,11 +511,15 @@ impl Fleet {
             match self.alerting.check(open) {
                 Ok(more) => {
                     lines.extend(more);
-                    self.schedule.alerts.ran(watermark, Some(self.alerting.due_ms()));
+                    self.schedule
+                        .alerts
+                        .ran(watermark, Some(self.alerting.due_ms()));
                 }
                 Err(error) => {
                     lines.push(format!("alerts: {error}"));
-                    self.schedule.alerts.ran(watermark, Some(self.alerting.due_ms()));
+                    self.schedule
+                        .alerts
+                        .ran(watermark, Some(self.alerting.due_ms()));
                 }
             }
         }
@@ -557,7 +559,9 @@ impl Fleet {
         {
             match open.listen() {
                 Ok(listener) => self.listener = Some(listener),
-                Err(error) => eprintln!("spawn loop: listen: {error}; the watermark alone wakes it"),
+                Err(error) => {
+                    eprintln!("spawn loop: listen: {error}; the watermark alone wakes it")
+                }
             }
         }
         wait_unless_stopped(self.listener.as_mut(), pause, stopping)

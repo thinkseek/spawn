@@ -440,8 +440,9 @@ impl Monitor {
     /// bound's due time. Before the first check it is `0`, so a fresh loop
     /// runs it once.
     pub(crate) fn due_ms(&self) -> i64 {
-        self.next_bound_ms
-            .map_or(self.next_reading_ms, |bound| bound.min(self.next_reading_ms))
+        self.next_bound_ms.map_or(self.next_reading_ms, |bound| {
+            bound.min(self.next_reading_ms)
+        })
     }
 
     /// Read what the step needs back: its alerts, the missions and tasks, the

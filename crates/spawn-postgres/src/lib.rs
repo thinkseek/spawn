@@ -85,10 +85,10 @@ mod sessions;
 mod wake;
 
 pub use missions::{ActivityEvent, LandingHold};
-pub use wake::Listener;
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
 };
+pub use wake::Listener;
 
 /// Schema installed by [`PostgresStore::migrate`].
 const SCHEMA: &str = include_str!("../sql/schema.sql");

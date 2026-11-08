@@ -763,11 +763,7 @@ fn walk(
             continue;
         };
         let id = format!("stall-mission-{}-halted-{}", halt.mission_id, record.id);
-        deadline(
-            "missions",
-            &id,
-            record.at_ms.saturating_add(bounds.halted),
-        );
+        deadline("missions", &id, record.at_ms.saturating_add(bounds.halted));
         let still = now - record.at_ms;
         if still < bounds.halted {
             continue;
