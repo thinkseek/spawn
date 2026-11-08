@@ -2923,6 +2923,7 @@ begin
                or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
              when p_record ->> 'evidence' = 'base_disagrees' then
                coalesce(p_record ->> 'scenario', '') !~ '^[^[:space:]|]+$'
+               or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
                or jsonb_typeof(p_record -> 'exits') is distinct from 'array'
                or jsonb_array_length(p_record -> 'exits') <> 2
                or p_record -> 'exits' ->> 0 is distinct from '1'
