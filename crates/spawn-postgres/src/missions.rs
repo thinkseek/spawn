@@ -486,7 +486,6 @@ select coalesce(jsonb_agg(jsonb_build_object('objective', k.objective, 'metric',
 pub(crate) const OBJECTIVE_OUTCOMES: &str = r"
 select coalesce(jsonb_agg(jsonb_build_object(
          'seq', o.seq, 'type', o.r ->> 'type', 'task', k.id, 'objective', k.objective,
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
          'verdict', o.r ->> 'verdict', 'merge', o.r ->> 'merge', 'yielded', o.r -> 'yielded',
          'event_id', o.event_id, 'at_ms', o.at_ms,
          'continues', (o.r ->> 'continues')::bigint, 'chain', o.r -> 'chain',
@@ -498,23 +497,12 @@ select coalesce(jsonb_agg(jsonb_build_object(
  cross join lateral (
    select e.id as event_id, e.recorded_at_ms as at_ms, e.session_seq as seq,
           e.kind -> 'detail' -> 'record' as r
-=======
-         'verdict', o.r ->> 'verdict', 'merge', o.r ->> 'merge', 'yielded', o.r -> 'yielded')
-         order by o.seq), '[]'::jsonb)
-  from mission_tasks k
- cross join lateral (
-   select e.session_seq as seq, e.kind -> 'detail' -> 'record' as r
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
      from spawn_events e
     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
       and e.kind -> 'detail' -> 'record' ->> 'id' = k.id::text
    offset 0) o
  where k.mission_id = $1 and k.objective is not null
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
    and (o.r ->> 'type' in ('task.gated', 'task.aborted', 'task.over_budget')
-=======
-   and (o.r ->> 'type' in ('task.gated', 'task.aborted')
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         or (o.r ->> 'type' = 'task.cancelled' and o.r ->> 'yielded' = 'true'))";
 
 /// The yields not told to the supervisor yet: a `task.cancelled` of the
