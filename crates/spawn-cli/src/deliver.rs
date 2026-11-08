@@ -204,6 +204,10 @@ pub(crate) struct Waits {
     /// (`SPAWN_DELIVERY_NOT_READY_MS`, milliseconds, at least
     /// [`NOT_READY_MIN_MS`], default [`NOT_READY_RETRY_MS`]). It says when,
     /// never how many: [`NOT_READY_FREE`] refusals stay free whatever it is.
+    /// The free refusals are counted, not timed, so the grace a pane gets
+    /// before refusals count is about `NOT_READY_FREE` times this wait (50 s
+    /// at the default, 5 s at 019's 500 ms, 1 s at the floor); a pane slower
+    /// than that pays the counted backoff (`SPAWN_DELIVERY_RETRY_SECS`).
     pub(crate) not_ready_ms: i64,
 }
 

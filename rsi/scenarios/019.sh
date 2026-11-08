@@ -19,10 +19,11 @@
 # (the wait after a spent delivery before its re-issue) and
 # SPAWN_DELIVERY_NOT_READY_MS=500 (the wait after each of the 10 refusals
 # free of count, 5 s by default); the stall bounds are long. The last one is
-# why a run takes about a minute and a half less than it did: each spent
-# delivery's 10 free refusals waited 5 s apart, about 55 s of the run's
-# ~193 s twice over (rev-e, work-gate-stage-costs.md §6). The count of free
-# refusals is the same, so what is checked is the same. Checked:
+# why a run takes about 55 s less than it did: each spent delivery's 10 free
+# refusals waited 5 s apart (rev-e, work-gate-stage-costs.md §6), and with
+# 500 ms a run measured 136 s and 139 s against 193 s at 5 s (2026-11-09,
+# nice 19, one host). The count of free refusals is the same, so what is
+# checked is the same. Checked:
 #   (1) spent: task T1 (frail1, broken) has its delivery's retries spent
 #       within 150 s: every attempt (`deliver-T1-0`, `-retry-<n>`) failed,
 #       none may have typed, and the failures past the free refusals number
