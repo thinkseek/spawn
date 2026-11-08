@@ -120,6 +120,7 @@ fn started(store: &MemoryStore) {
             fork: None,
             model: ModelProfile::Default,
             transcript_from: None,
+            envelope: None,
         },
     );
 }
@@ -966,6 +967,7 @@ fn a_late_end_of_an_older_execution_does_not_end_the_current_one() {
             fork: None,
             model: ModelProfile::Default,
             transcript_from: None,
+            envelope: None,
         },
     );
     in_execution(

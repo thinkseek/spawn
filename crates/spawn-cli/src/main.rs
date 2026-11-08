@@ -36,6 +36,7 @@ mod config;
 mod context;
 mod deliver;
 mod disk;
+mod envelope;
 mod dispatch;
 mod gate;
 mod integrate;

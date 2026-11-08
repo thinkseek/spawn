@@ -178,6 +178,7 @@ impl Replay<'_> {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                envelope: None,
             },
         );
         (claimed, execution)

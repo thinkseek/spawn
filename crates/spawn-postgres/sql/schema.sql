@@ -704,7 +704,12 @@ select
           and r.source <> 'bridge'
     ) as exit_reported,
     x.recorded_at_ms - s.recorded_at_ms as duration_ms,
-    (s.kind -> 'detail' ->> 'command_id')::bigint as command_id
+    (s.kind -> 'detail' ->> 'command_id')::bigint as command_id,
+    -- The resource envelope it ran in (objective 029), when the host had
+    -- one: its slice, its scope unit and the cgroup.
+    s.kind -> 'detail' -> 'envelope' ->> 'slice' as slice,
+    s.kind -> 'detail' -> 'envelope' ->> 'scope' as scope,
+    s.kind -> 'detail' -> 'envelope' ->> 'cgroup' as cgroup
 from spawn_events s
 left join lateral (
     select e.kind, e.recorded_at_ms
@@ -863,10 +868,14 @@ select
     x.started_at_ms,
     x.ended_at_ms,
     x.exit_reported,
-    x.execution_id is not null and x.ended_at_ms is null as live
+    x.execution_id is not null and x.ended_at_ms is null as live,
+    x.slice,
+    x.scope,
+    x.cgroup
 from spawn_session_state p
 left join lateral (
-    select a.execution_id, a.engine, a.started_at_ms, a.ended_at_ms, a.exit_reported
+    select a.execution_id, a.engine, a.started_at_ms, a.ended_at_ms, a.exit_reported,
+           a.slice, a.scope, a.cgroup
     from agent_executions a
     where a.session_id = p.session_id
     order by a.started_at_ms desc, a.execution_id desc
@@ -952,6 +961,54 @@ begin
             ' as $f$ select r.* from agent_%1$s r where r.session_id = p_session and %3$s $f$',
             v_view, current_schema(), v_filter);
     end loop;
+end
+$$;
+
+-- The admission waits still open (objective 029): for each execution (by
+-- command) and each gate (by task) whose latest `admission.waiting` record
+-- has no `admission.admitted` after it, what it measured and what it needs.
+-- The fleet view names the agent that waits for room, with its measure and
+-- threshold; a start that fits at once appears in neither. Filtered like the
+-- other readers: an execution's wait only to a caller with a grant for its
+-- agent, a gate's to anyone reading the fleet.
+do $$
+begin
+    execute format($create$
+        create or replace function spawn_read_admissions()
+        returns table (kind text, agent_id text, session_id text, task bigint,
+                       command_id bigint, envelope_bytes bigint, measure text,
+                       measured_bytes bigint, threshold_bytes bigint, at_ms bigint)
+        language sql stable security definer set search_path = %1$I, pg_temp as $f$
+          select w.kind, w.agent_id, w.session_id, w.task, w.command_id,
+                 w.envelope_bytes, w.measure, w.measured_bytes, w.threshold_bytes, w.at_ms
+            from (
+              select distinct on (x.r ->> 'kind',
+                                  coalesce(x.r ->> 'command_id', x.r ->> 'task'))
+                     x.r ->> 'type' as record_type,
+                     x.r ->> 'kind' as kind,
+                     x.r ->> 'agent_id' as agent_id,
+                     x.r ->> 'session_id' as session_id,
+                     (x.r ->> 'task')::bigint as task,
+                     (x.r ->> 'command_id')::bigint as command_id,
+                     (x.r ->> 'envelope_bytes')::bigint as envelope_bytes,
+                     x.r ->> 'measure' as measure,
+                     (x.r ->> 'measured_bytes')::bigint as measured_bytes,
+                     (x.r ->> 'threshold_bytes')::bigint as threshold_bytes,
+                     e.recorded_at_ms as at_ms
+                from spawn_events e
+               cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+               where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                 and x.r ->> 'type' in ('admission.waiting', 'admission.admitted')
+               order by x.r ->> 'kind', coalesce(x.r ->> 'command_id', x.r ->> 'task'), e.id desc
+            ) w
+           where w.record_type = 'admission.waiting'
+             and (session_user = current_user or w.agent_id is null
+                  or exists (select 1 from spawn_grants g
+                              where g.principal = spawn_principal()
+                                and spawn_grant_matches(g.agent_id, w.agent_id)))
+        $f$
+        $create$, current_schema());
+    execute format('grant execute on function spawn_read_admissions() to public');
 end
 $$;
 
@@ -1284,9 +1341,7 @@ create table if not exists mission_tasks (
     model           text   not null default 'default' check (model in ('default', 'cheap')),
     -- The owner's hold this landing task last waited behind (`task.held`,
     -- the `source.held` record's event id): its `land()` pushed nothing
-    -- under it. Set by `task.held`, and moved to the new hold by a renewal
-    -- (`source.held` naming `renews`), which ends the hold it replaces; the
-    -- hold's end does not clear it.
+    -- under it. Set only by `task.held`; the hold's end does not clear it.
     held_by         bigint,
     -- The task this one re-issues (its `task.assigned` names it): a first
     -- delivery spent without typing is cancelled and assigned again once,
@@ -1544,15 +1599,6 @@ begin
            set hold = excluded.hold, main = excluded.main, by = excluded.by,
                reason = excluded.reason, held_at_ms = excluded.held_at_ms,
                expires_ms = excluded.expires_ms;
-        -- A renewal ends the previous hold with this record, so the tasks
-        -- that waited behind it wait behind this one from now on: the board,
-        -- a release and an expiry name them at once, without waiting for the
-        -- next pass's `task.held` (which the integrator still records, once
-        -- per task and hold, as the landing's own evidence).
-        if p_record ->> 'renews' is not null then
-            update mission_tasks set held_by = p_event
-             where held_by = (p_record ->> 'renews')::bigint;
-        end if;
     when 'source.released', 'source.hold_expired' then
         -- The record that ends a hold: only the one naming the active hold.
         delete from mission_source_holds
@@ -1794,6 +1840,13 @@ begin
            set state = 'cleared', cleared_event_id = p_event, cleared_at_ms = p_at,
                cleared_evidence = coalesce(p_record -> 'evidence', '{}'::jsonb)
          where key = p_record ->> 'key';
+
+    when 'host.envelope', 'admission.waiting', 'admission.admitted',
+         'execution.interrupted' then
+        -- The host's resource envelope, an execution's or a gate's wait for
+        -- room, and how an execution was interrupted (objectives 028, 029):
+        -- facts read from the log, folded into no table.
+        null;
     when 'task.report_unfinished' then
         -- A report still a draft, not taken (spawn_task_report_unfinished):
         -- the task stays delivered, so nothing is folded.
@@ -1860,6 +1913,16 @@ begin
        and jsonb_typeof(p_record -> 'backoff_ms') = 'number' then
         p_record := p_record || jsonb_build_object(
             'due_ms', v_at + (p_record ->> 'backoff_ms')::numeric::bigint);
+        update spawn_events
+           set kind = jsonb_set(kind, '{detail,record}', p_record)
+         where id = v_id;
+    end if;
+    -- An interruption whose path revives the session at once is due at its
+    -- record's time (objective 028): a resume or a handoff.
+    if p_record ->> 'type' = 'execution.interrupted'
+       and p_record ->> 'path' in ('resume', 'handoff')
+       and p_record -> 'due_ms' is null then
+        p_record := p_record || jsonb_build_object('due_ms', v_at);
         update spawn_events
            set kind = jsonb_set(kind, '{detail,record}', p_record)
          where id = v_id;
@@ -2847,29 +2910,39 @@ begin
     end if;
     -- A host fault names its evidence (§14): the failures the gate printed,
     -- each the host's, and, when the test database's log decided it, the
-    -- crash lines stamped inside the gate's window; and its backoff.
+    -- crash lines stamped inside the gate's window; and its backoff. One its
+    -- own resource envelope killed (objective 029) names `memory_limit`, the
+    -- scope it ran in, its memory_max and its oom_kills (above 0) instead.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
-       and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log',
-                                                          'base_disagrees')
-            or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
-            or (p_record ->> 'evidence' in ('failures', 'server_log')
-                and (case when jsonb_typeof(p_record -> 'failures') = 'array'
-                          then jsonb_array_length(p_record -> 'failures') else 0 end = 0
-                     or (p_record ->> 'evidence' = 'server_log'
-                         and case when jsonb_typeof(p_record -> 'crash') = 'array'
-                                  then jsonb_array_length(p_record -> 'crash') else 0 end = 0)))
-            or (p_record ->> 'evidence' = 'base_disagrees'
-                and (coalesce(p_record ->> 'scenario', '') !~ '^[^[:space:]|]+$'
-                     or jsonb_typeof(p_record -> 'exits') is distinct from 'array'
-                     or jsonb_array_length(p_record -> 'exits') <> 2
-                     or p_record -> 'exits' ->> 0 is distinct from '1'
-                     or p_record -> 'exits' ->> 1 is distinct from '0'
-                     or jsonb_typeof(p_record -> 'base_disagrees') is distinct from 'number'
-                     or jsonb_typeof(p_record -> 'alert') is distinct from 'boolean'
-                     or p_record ->> 'escalate' is distinct from 'false'
-                     or (p_record ? 'setup_s'
-                         and jsonb_typeof(p_record -> 'setup_s') is distinct from 'number')))) then
-        raise exception 'a host_fault verdict names its evidence, its facts and backoff_ms: %',
+       and (case
+             when p_record ->> 'evidence' = 'memory_limit' then
+               p_record ->> 'scope' is null
+               or jsonb_typeof(p_record -> 'memory_max') is distinct from 'number'
+               or jsonb_typeof(p_record -> 'oom_kills') is distinct from 'number'
+               or (p_record ->> 'oom_kills')::bigint <= 0
+               or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
+             when p_record ->> 'evidence' = 'base_disagrees' then
+               coalesce(p_record ->> 'scenario', '') !~ '^[^[:space:]|]+$'
+               or jsonb_typeof(p_record -> 'exits') is distinct from 'array'
+               or jsonb_array_length(p_record -> 'exits') <> 2
+               or p_record -> 'exits' ->> 0 is distinct from '1'
+               or p_record -> 'exits' ->> 1 is distinct from '0'
+               or jsonb_typeof(p_record -> 'base_disagrees') is distinct from 'number'
+               or jsonb_typeof(p_record -> 'alert') is distinct from 'boolean'
+               or p_record ->> 'escalate' is distinct from 'false'
+               or (p_record ? 'setup_s'
+                   and jsonb_typeof(p_record -> 'setup_s') is distinct from 'number')
+             when p_record ->> 'evidence' in ('failures', 'server_log') then
+               case when jsonb_typeof(p_record -> 'failures') = 'array'
+                    then jsonb_array_length(p_record -> 'failures') else 0 end = 0
+               or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
+               or (p_record ->> 'evidence' = 'server_log'
+                   and case when jsonb_typeof(p_record -> 'crash') = 'array'
+                            then jsonb_array_length(p_record -> 'crash') else 0 end = 0)
+             else true
+           end) then
+        raise exception 'a host_fault verdict names its evidence, its facts and backoff_ms '
+                        '(or, killed by its memory limit, its scope, memory_max and oom_kills): %',
                         p_record;
     end if;
     -- No room to judge names what it measured: the check that fell short
@@ -3170,17 +3243,94 @@ create index if not exists spawn_events_source_push
 -- back from the log after a restart.
 create or replace function spawn_host_record(p_record jsonb)
 returns bigint language plpgsql security definer as $$
+declare
+    v_type text := p_record ->> 'type';
+    v_state text := p_record ->> 'state';
 begin
     perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record host facts', session_user using errcode = '42501';
     end if;
-    if p_record ->> 'type' is distinct from 'host.disk' then
-        raise exception 'not a host record: %', p_record ->> 'type';
-    end if;
-    if p_record ->> 'state' not in ('low', 'recovered') or p_record ->> 'path' is null
-       or jsonb_typeof(p_record -> 'free_bytes') is distinct from 'number' then
-        raise exception 'a host.disk record has a path, free_bytes and state low or recovered: %', p_record;
+    if v_type = 'host.disk' then
+        if v_state not in ('low', 'recovered') or p_record ->> 'path' is null
+           or jsonb_typeof(p_record -> 'free_bytes') is distinct from 'number' then
+            raise exception 'a host.disk record has a path, free_bytes and state low or recovered: %', p_record;
+        end if;
+    elsif v_type = 'host.envelope' then
+        -- The slice and every setting of the resource envelope (objective
+        -- 029), or why the host runs none.
+        if v_state not in ('systemd', 'unavailable', 'off') then
+            raise exception 'a host.envelope record has state systemd, unavailable or off: %', p_record;
+        end if;
+        if v_state = 'unavailable' and p_record ->> 'error' is null then
+            raise exception 'a host.envelope record with state unavailable says its error: %', p_record;
+        end if;
+        if v_state = 'systemd' and (
+               p_record ->> 'slice' is null
+               or jsonb_typeof(p_record -> 'memory_high') is distinct from 'number'
+               or jsonb_typeof(p_record -> 'memory_max') is distinct from 'number'
+               or jsonb_typeof(p_record -> 'cpu_weight') is distinct from 'number'
+               or jsonb_typeof(p_record -> 'execution_memory_high') is distinct from 'number'
+               or jsonb_typeof(p_record -> 'execution_memory_max') is distinct from 'number'
+               or jsonb_typeof(p_record -> 'execution_memory_swap_max') is distinct from 'number'
+               or jsonb_typeof(p_record -> 'gate_memory_high') is distinct from 'number'
+               or jsonb_typeof(p_record -> 'gate_memory_max') is distinct from 'number'
+               or jsonb_typeof(p_record -> 'gate_memory_swap_max') is distinct from 'number') then
+            raise exception 'a host.envelope record with state systemd names its slice and every '
+                            'setting in bytes: %', p_record;
+        end if;
+    elsif v_type = 'admission.waiting' then
+        -- An execution's or a gate's wait for room: the first measure that
+        -- fell short, what it measured and what it needed.
+        if p_record ->> 'kind' not in ('execution', 'gate')
+           or p_record ->> 'measure' not in ('slice', 'host')
+           or jsonb_typeof(p_record -> 'envelope_bytes') is distinct from 'number'
+           or jsonb_typeof(p_record -> 'measured_bytes') is distinct from 'number'
+           or jsonb_typeof(p_record -> 'threshold_bytes') is distinct from 'number' then
+            raise exception 'an admission.waiting record names kind execution or gate, measure '
+                            'slice or host, and envelope_bytes, measured_bytes and '
+                            'threshold_bytes in bytes: %', p_record;
+        end if;
+        if p_record ->> 'kind' = 'execution' and (
+               p_record ->> 'agent_id' is null or p_record ->> 'session_id' is null
+               or jsonb_typeof(p_record -> 'command_id') is distinct from 'number') then
+            raise exception 'an admission.waiting record of an execution names its agent_id, '
+                            'session_id and command_id: %', p_record;
+        end if;
+        if p_record ->> 'kind' = 'gate'
+           and jsonb_typeof(p_record -> 'task') is distinct from 'number' then
+            raise exception 'an admission.waiting record of a gate names its task: %', p_record;
+        end if;
+    elsif v_type = 'admission.admitted' then
+        if p_record ->> 'kind' not in ('execution', 'gate')
+           or jsonb_typeof(p_record -> 'envelope_bytes') is distinct from 'number'
+           or jsonb_typeof(p_record -> 'waited_ms') is distinct from 'number' then
+            raise exception 'an admission.admitted record names kind execution or gate, '
+                            'envelope_bytes and waited_ms: %', p_record;
+        end if;
+        if p_record ->> 'kind' = 'execution' and (
+               p_record ->> 'agent_id' is null or p_record ->> 'session_id' is null
+               or jsonb_typeof(p_record -> 'command_id') is distinct from 'number') then
+            raise exception 'an admission.admitted record of an execution names its agent_id, '
+                            'session_id and command_id: %', p_record;
+        end if;
+        if p_record ->> 'kind' = 'gate'
+           and jsonb_typeof(p_record -> 'task') is distinct from 'number' then
+            raise exception 'an admission.admitted record of a gate names its task: %', p_record;
+        end if;
+    elsif v_type = 'execution.interrupted' then
+        -- How an execution was interrupted and the path back (objective
+        -- 028; a memory-limit kill is objective 029's).
+        if p_record ->> 'agent_id' is null or p_record ->> 'session_id' is null
+           or p_record ->> 'execution_id' is null
+           or p_record ->> 'cause' is null or p_record ->> 'path' is null
+           or jsonb_typeof(p_record -> 'attempt') is distinct from 'number'
+           or jsonb_typeof(p_record -> 'evidence') is distinct from 'object' then
+            raise exception 'an execution.interrupted record names its agent, session, execution, '
+                            'cause, evidence, path and attempt: %', p_record;
+        end if;
+    else
+        raise exception 'not a host record: %', v_type;
     end if;
     return spawn_control_record(p_record);
 end $$;
@@ -3258,6 +3408,13 @@ create index if not exists spawn_events_alert
     on spawn_events (session_seq)
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' in ('alert.fired', 'alert.cleared');
+
+-- The latest `host.envelope` record, found without reading the rest of the
+-- stream (the loop reads it back on start, the fleet view shows it).
+create index if not exists spawn_events_host_envelope
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' = 'host.envelope';
 
 -- The `source.moved` records (deploys), found without reading the rest of
 -- the stream: the dispatcher reads the latest on every step

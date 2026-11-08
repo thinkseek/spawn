@@ -161,6 +161,27 @@ pub enum EndCause {
     /// no runner (a dead pane, a shell restored after a restart). The end
     /// record's `evidence` says which.
     Lost,
+    /// The execution's resource envelope killed it (objective 029): the
+    /// kernel's OOM kill inside its scope, read from the scope's
+    /// `memory.events` or its unit's `Result` `oom-kill` at the end, never
+    /// from an exit code alone.
+    MemoryLimit,
+}
+
+/// The resource envelope an execution runs in (objective 029): its slice,
+/// its own scope unit and the cgroup the engine's process tree is in. The
+/// start records it before the engine starts, so any reader finds the
+/// cgroup an execution ran in. Left out when the host runs executions
+/// without one (no systemd user manager, SPAWN_ENVELOPE=off, or a record
+/// from before envelopes).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EnvelopeRef {
+    /// The slice the scope is in (`spawn.slice`).
+    pub slice: String,
+    /// The scope unit (`spawn-exec_12.scope`).
+    pub scope: String,
+    /// The scope's cgroup, as `/sys/fs/cgroup` names it.
+    pub cgroup: String,
 }
 
 /// One workspace commit linked to the event that records why it happened.
@@ -406,6 +427,10 @@ pub enum EventKind {
         /// was kept (read from the start of the file).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transcript_from: Option<u64>,
+        /// The resource envelope the execution runs in (objective 029),
+        /// recorded before the engine starts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        envelope: Option<EnvelopeRef>,
     },
     /// The execution ended.
     #[serde(rename = "execution.ended")]

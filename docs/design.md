@@ -315,6 +315,27 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 | 登录开销 | dev profile 对 `sha2`、`hmac`、`postgres-protocol` 开 `opt-level = 3`，SCRAM 登录从约 50 ms 降到约 6 ms |
 | 目标目录 | 门禁的构建钩子把 `CARGO_TARGET_DIR` 固定在被测树内，两棵树不共用 |
 
+### 资源限额（objective 029）
+
+每次执行、每次门禁都在自己的一套资源限额里跑：Spawn 的一个 systemd 用户 slice（`SPAWN_SLICE`，线上是 `spawn.slice`）里的一个临时 scope。用户管理器不需要 root：`systemctl --user set-property --runtime <slice> MemoryHigh=… MemoryMax=… CPUWeight=…` 给没有 unit 文件的 slice 写上限额（drop-in 落在 `$XDG_RUNTIME_DIR/systemd/user.control/`），`systemd-run --user --quiet --scope --unit <slice stem>-<执行 id>.scope --slice <slice> -p MemoryHigh=… -p MemoryMax=… -p MemorySwapMax=… -p OOMPolicy=stop -- spawn run -- <引擎>` 让引擎和它启动的一切（构建、测试、工具及其子进程）都在那个 cgroup 里。门禁是 `<slice stem>-gate-<任务 id>-<n>.scope`（`n` 是该任务的第几次判定，从 1 起；单元还在时名字不复用），scope 由集成器在启动门禁前建好；`systemd-run --scope` 原地 exec，所以门禁的进程组与墙钟照旧。scope 用完即去：正常结束的临时 scope 自己消失，失败的单元先读 `Result` 再 `reset-failed`（`--collect` 会让单元不再说明死因）。
+
+| 设置 | 默认 | 含义 |
+| --- | --- | --- |
+| `SPAWN_ENVELOPE` | `systemd` | `off` 时不建 scope，与从前一样 |
+| `SPAWN_SLICE` | `spawn.slice` | 每个 Spawn 实例一个 slice；测试用自己的 |
+| `SPAWN_SLICE_MEMORY_HIGH` / `_MAX` | 16G / 20G | 整个 Spawn 先被限流、再被封顶 |
+| `SPAWN_SLICE_CPU_WEIGHT` | 50 | 竞争时让给主机的其它任务（权重 100），空闲时用满 CPU |
+| `SPAWN_EXECUTION_MEMORY_HIGH` / `_MAX` / `_SWAP_MAX` | 10G / 12G / 4G | 一次执行（含它的构建、测试、工具） |
+| `SPAWN_GATE_MEMORY_HIGH` / `_MAX` / `_SWAP_MAX` | 10G / 12G / 4G | 一次门禁（含 bwrap、构建、场景与其中的引擎） |
+
+大小是字节或带 K/M/G/T 的数（1024 的幂，与 systemd 一致）；解析不了的大小、slice 的 MemoryHigh 高于它的 MemoryMax、某个限额的 MemoryHigh 高于自己的 MemoryMax、某个 MemoryMax 高于 slice 的，都是启动错误：loop 与集成器拒绝启动并点名那个设置，绝不静默取默认值。每个限额都封顶自己的 swap（默认 4G）：这台主机的 swap 是 zram，也就是内存本身，不封顶的 swap 什么也封不住；slice 不封 swap，所以 zram 里的内存正是准入看得到的主机内存。
+
+**准入等着有余量，而不是先跑起来再说。** scope 的限额挡住的是跑起来之后，准入挡住的是它该不该跑：一次执行或一次门禁，只有当它的限额既装得进 slice（slice `memory.stat` 的 `anon` + `shmem` ≤ slice 的 MemoryMax − 该限额的 MemoryMax；页缓存可在限额下回收，不计）又装得进主机（`MemAvailable` ≥ 该限额的 MemoryMax）时才启动。装不下就不启动：Bridge 记一次 `admission.waiting`（`kind` `execution`，`agent_id`、`session_id`、`command_id`，`envelope_bytes`、`measure` `slice`/`host`、`measured_bytes`、`threshold_bytes`，先量的 slice 短了就报 slice），命令不失败、保持未完成，下一拍按当时的测量再决定（重启的 loop 从日志接着来）；真跑起来时记 `admission.admitted`（`waited_ms` 是数据库时钟下从第一次判定到启动的时间）。一次就装得下的启动两条都不写。门禁同理：每次判定在 objective 018 的检查之后量同样两项，装不下就这一轮不跑（`admission.waiting`，`kind` `gate`，`task`，没有 agent 字段），它不是判定、不动任何计数、任务留在原地，下一轮再看；等过之后跑起来记 `admission.admitted`。按默认数字，一次执行和一次门禁的门槛相同：slice 的 anon + shmem 最多 20 − 12 = 8 GiB，`MemAvailable` 至少 12 GiB。
+
+**内存限额的击杀只结束那一次执行。** 内核在 scope 里 OOM 击杀（scope 的 `memory.events` 的 `oom_kill`，或单元 `Result` 的 `oom-kill`，在结束时读，从不只看 exit status——137 可以是任何 SIGKILL）时，`OOMPolicy=stop` 结束整个 scope，别处不碰：执行的最后 checkpoint、卸载与 `execution.ended`（cause `memory_limit`）照常走，写入工作区的东西一点不丢；objective 028 的 `execution.interrupted` 记下 cause `memory_limit`、path `resume` 与证据 `{scope, memory_max, oom_kills, memory_peak?}`，按 028 的规则（同一原生会话，经 `SPAWN_RECOVER_BACKOFF_SECS` 的退避）恢复。被自己的限额杀掉的门禁是 objective 020 的 `host_fault`：`task.gated` 写清 `evidence` `memory_limit`、scope、`memory_high`、`memory_max`、`oom_kills`、`memory_peak?`、020 的 `host_faults` / `backoff_ms` / `due_ms` / `escalate`，任务留在原地、修订号不动、不退回工人，两个计数都不动，停机规则也不数它；过了 `due_ms` 再判一次，换下一个 `n` 的 scope。
+
+没有可达的用户管理器（门禁沙箱的 `/run` 是空的：用户总线会让候选代码在沙箱外启动单元），或它不委派 memory 控制器时，执行与门禁照旧跑，loop 记一次 `host.envelope` state `unavailable` 并在日志里说一次；`SPAWN_ENVELOPE=off` 记 `off`。有用户管理器时 loop 在启动任何执行之前把限额写到 slice 上，并记 `host.envelope`（state `systemd`、slice 与全部设置，字节），只在某项改变时再记（启动时从日志读回最近一条，与 `host.disk` 相同）。`execution.started` 记下这次执行的 slice、scope 与 cgroup，任何读者都能找到它跑在哪个 cgroup 里。
+
 ## 12. 测试策略
 
 库 crate 只测公开 API：断言位于各 crate 的 `tests/`（`api.rs` 等），库内不写 `#[cfg(test)]`。`spawn-cli` 是二进制，它的单元测试写在模块里。
@@ -395,6 +416,8 @@ Bridge、Observer、调度器（`deliver.rs`、`dispatch.rs`）、集成器（`i
 基线自己与自己不一致同样是主机的故障（objective 033，[fleet-architecture.md](fleet-architecture.md) §10.3）：门禁在跑任何候选代码之前先在基线上评判每个 objective 场景，未解决的结果要两次一致的运行；第一次退出 1、第二次退出 0，候选代码一行还没跑，基线是已经落地的代码，这说的是主机太忙或太不稳定，不是工作的问题。集成器只依据门禁记下的退出状态（4）和它自己写在 stdout 末尾的那一对行（记录里的 `scenario` 与 `exits`）判定，从不凭理由的文字、时间或场景名：记 `host_fault`（objective 020 的结论）加证据 `base_disagrees`，任务原地不动，两种证据共用同一条连续计数与退避；之后再判只依据记录里的 `due_ms`。它不升级（020 的第二条才升级），连续三条的第三条在记录里带 `alert`，由调度器的 digest 送给 supervisor 一次（`host gate-base-disagrees-<事件 id>`），任何数量都不停机。
 
 门禁之前先量主机，不靠门禁崩溃才知道主机没有余量（objective 018）：每次判定在候选构建之后、门禁启动之前，集成器按序量门禁 `TMPDIR` 的剩余空间（`SPAWN_GATE_MIN_FREE_GB`）、`MemAvailable`（`SPAWN_GATE_MIN_FREE_MEMORY_MB`）与测试数据库（连接，再跑一条强制并行的查询，各 10 秒内），第一项不够就不启动门禁，记 `no_room` 并写明 `check`、`measured` 与 `threshold`。判断只凭判定当时的测量和它的阈值；一次跑了 25 分钟、因测试库 `/dev/shm` 不足而崩溃的门禁，不再被读成候选的回归。
+
+资源限额同样守这条规则（objective 029）：一次执行是不是被限额杀掉的，只按它自己 scope 在结束时的记录判定（`memory.events` 的 `oom_kill`，或单元的 `Result`；cgroup 已消失时读单元），从不按退出码（137 可以是任何 SIGKILL），也不按主机的状态；`task.gated` 记下它读到的那个 scope、`memory_max` 与击杀次数。准入的每一次决定只用那一次判定当时的测量与阈值，并写明它们；记录里带着 slice 与每个 scope 的名字，读者能回到那次执行或那次门禁所在的 cgroup。等与不等都由记录决定：`admission.waiting` 先写、`admission.admitted` 后写，`waited_ms` 用数据库的时钟量，重启的 loop 从日志读回等待是什么时候开始的。
 
 写新代码时的检查：读另一个循环的产物时，问它覆盖的是哪一个 commit、哪一个会话位置、哪一个命令 id；读 `spawn_commands` 时区分成功、失败与尚未运行；超时只决定何时再看，不证明任何事；删掉一个生产者时，搜出它的每个读者。
 

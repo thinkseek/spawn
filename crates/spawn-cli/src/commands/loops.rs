@@ -11,6 +11,7 @@ use crate::Flags;
 use crate::config::{
     env_value, loop_interval, open_store, spawn_program, supervised, workspace_root,
 };
+use crate::envelope;
 use crate::runtime::runtime;
 use crate::{alerts, disk, dispatch, supervise};
 
@@ -25,7 +26,7 @@ fn backoff(interval: std::time::Duration, failures: u32) -> std::time::Duration 
 
 /// `spawn tick`: one Bridge and Observer pass.
 pub(crate) fn tick(flags: &Flags) -> Result<i32, String> {
-    let (mut bridge, mut observer) = runtime(flags)?;
+    let (mut bridge, mut observer, _envelopes) = runtime(flags)?;
     let report = bridge.tick().map_err(|error| error.to_string())?;
     for warning in &report.warnings {
         eprintln!("spawn tick warning: {warning}");
@@ -66,6 +67,43 @@ fn pause_unless_stopped(pause: Duration, stop: &AtomicBool) -> bool {
     true
 }
 
+/// Record the host's envelope (the slice and its settings) once, before
+/// anything starts in it (objective 029): its lines go to the loop's log, a
+/// failure is the pass's.
+fn record_envelope(
+    envelopes: &mut envelope::Runtime,
+    store: &PostgresStore,
+    fail: &mut impl FnMut(&str, &str),
+) {
+    match envelopes.record(store) {
+        Ok(lines) => {
+            for line in &lines {
+                println!("{line}");
+            }
+        }
+        Err(error) => fail("envelope", &error),
+    }
+}
+
+/// Open the store on the first pass that needs it, then record the host's
+/// envelope (the slice and its settings) before anything starts in it
+/// (objective 029): a failed open or record is the pass's.
+fn store_ready(
+    store: &mut Option<std::sync::Arc<PostgresStore>>,
+    envelopes: &mut envelope::Runtime,
+    fail: &mut impl FnMut(&str, &str),
+) {
+    if store.is_none() {
+        *store = open_store()
+            .map(std::sync::Arc::new)
+            .map_err(|error| fail("store", &error))
+            .ok();
+    }
+    if let Some(open) = store {
+        record_envelope(envelopes, open, fail);
+    }
+}
+
 /// Consecutive failed passes after which the loop exits, so its unit
 /// restarts it with fresh connections (the store does not reconnect).
 const MAX_FAILURES: u32 = 10;
@@ -81,7 +119,7 @@ const MAX_FAILURES: u32 = 10;
 pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     let stopping = stop_on_signal()?;
     let interval = loop_interval();
-    let (mut bridge, mut observer) = runtime(flags)?;
+    let (mut bridge, mut observer, mut envelopes) = runtime(flags)?;
     let supervised = supervised();
     let dispatching = env_value("SPAWN_DISPATCH").is_none_or(|value| value != "0");
     let spawn = spawn_program();
@@ -103,6 +141,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
             failed = true;
             eprintln!("spawn loop: {what}: {error}");
         };
+        store_ready(&mut store, &mut envelopes, &mut fail);
         match bridge.tick() {
             Ok(report) => {
                 for warning in &report.warnings {
@@ -113,12 +152,6 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         }
         if let Err(error) = observer.tick() {
             fail("observer", &error.to_string());
-        }
-        if store.is_none() {
-            store = open_store()
-                .map(std::sync::Arc::new)
-                .map_err(|error| fail("store", &error))
-                .ok();
         }
         if let Some(open) = &store {
             let mut lines = Vec::new();

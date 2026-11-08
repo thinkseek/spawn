@@ -585,3 +585,44 @@ pub trait TranscriptArchive: Send + Sync {
         bytes: &[u8],
     ) -> Result<(), ArchiveError>;
 }
+
+/// One record written to the control stream, as the store made it: its
+/// event's id and the time the append gave it (the database's clock).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recorded {
+    /// The event's id.
+    pub id: i64,
+    /// The event's `recorded_at_ms`.
+    pub at_ms: i64,
+}
+
+/// Owner-only host records (`spawn_host_record`): what the host does to
+/// Spawn's work — an execution's or a gate's admission wait, a resource
+/// envelope's kill — written to the control stream beside the loop's
+/// `host.disk` records (objectives 018, 028, 029). The Bridge records its
+/// admission waits and interruptions through it; the store implements it as
+/// the owner-only SQL function, so no other login can write one.
+pub trait HostRecords: Send + Sync + std::fmt::Debug {
+    /// Record `record` (whose `type` the store checks with its fields).
+    fn record(&self, record: &serde_json::Value) -> Result<Recorded, StoreError>;
+
+    /// The first record of `record_type` (a control record's `type`) with
+    /// `kind` and `field` equal to `value`, after event id `after`: its
+    /// event's time. The admission wait it names began then, so a restarted
+    /// loop neither records it again nor forgets when it began.
+    fn admission_record(
+        &self,
+        record_type: &str,
+        kind: &str,
+        field: &str,
+        value: &str,
+        after: i64,
+    ) -> Result<Option<i64>, StoreError>;
+
+    /// Whether an `execution.interrupted` record names `execution`.
+    fn interrupted(&self, execution: &str) -> Result<bool, StoreError>;
+
+    /// The database's clock, in milliseconds: what a record's `waited_ms`
+    /// is measured by.
+    fn now_ms(&self) -> Result<i64, StoreError>;
+}

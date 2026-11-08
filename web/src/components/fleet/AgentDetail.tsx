@@ -27,7 +27,7 @@ import {
   reasonText,
   stateLabelUpper,
 } from "../../fleet";
-import { clockTime, formatDuration, relativeTime } from "../../format";
+import { clockTime, formatBytes, formatDuration, relativeTime } from "../../format";
 import { freshAt } from "../../validated";
 import { LiveBadge, TerminalBlock, TerminalPanel } from "../Terminal";
 import { Ago, Button, Card, CardHeader, Drawer, EmptyState, cx } from "../ui";
@@ -200,6 +200,45 @@ function AgentSummary({ agent }: { agent: FleetAgent }) {
         <Fact label="Session" mono>
           {agent.session_id}
         </Fact>
+        {agent.envelope && (
+          <>
+            <Fact label="Scope" mono>
+              {agent.envelope.scope}
+            </Fact>
+            <Fact label="Memory now · peak">
+              <span className="tnum">
+                {formatBytes(agent.envelope.memory_current)} ·{" "}
+                {formatBytes(agent.envelope.memory_peak)}
+              </span>
+            </Fact>
+            <Fact label="MemoryHigh · MemoryMax">
+              <span className="tnum">
+                {formatBytes(agent.envelope.memory_high)} ·{" "}
+                {formatBytes(agent.envelope.memory_max)}
+              </span>
+            </Fact>
+            <Fact label="Swap · throttled">
+              <span className="tnum">
+                {formatBytes(agent.envelope.memory_swap_current)} ·{" "}
+                {agent.envelope.throttled ?? "—"}
+              </span>
+            </Fact>
+            {agent.envelope.slice && (
+              <Fact label="Slice" mono>
+                {agent.envelope.slice.name ?? "—"} ·{" "}
+                {formatBytes(agent.envelope.slice.measured_bytes)} held of{" "}
+                {formatBytes(agent.envelope.slice.memory_max)}
+              </Fact>
+            )}
+          </>
+        )}
+        {agent.admission && (
+          <Fact label="Waiting for room" mono>
+            {agent.admission.measure}: {formatBytes(agent.admission.measured_bytes)}{" "}
+            of {formatBytes(agent.admission.threshold_bytes)} needed for a{" "}
+            {formatBytes(agent.admission.envelope_bytes)} envelope
+          </Fact>
+        )}
       </div>
     </div>
   );

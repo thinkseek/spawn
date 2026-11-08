@@ -199,6 +199,7 @@ fn the_log_answers_the_open_execution_its_guard_refuses_by() {
         fork: None,
         model: spawn_core::event::ModelProfile::Default,
         transcript_from: None,
+        envelope: None,
     };
     let ended = |cause| EventKind::ExecutionEnded {
         cause,

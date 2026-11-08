@@ -129,6 +129,13 @@ pub struct PostgresStore {
 /// ([`role_url`]) and are set on every migration.
 const LOGINS: [&str; 3] = ["spawn_supervisor", "spawn_reader", "spawn_human"];
 
+impl std::fmt::Debug for PostgresStore {
+    /// The store names itself, never its connection's password.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PostgresStore")
+    }
+}
+
 impl PostgresStore {
     /// Connect to the database in the URL.
     pub fn connect(url: &str) -> Result<Self, StoreError> {
