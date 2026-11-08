@@ -55,8 +55,13 @@
 //! passes until two in a row agree, the confirmation a fact needs — or once
 //! per [`BridgeConfig::screen_refresh`] as a backstop for a screen that
 //! changes with nothing in the transcript (a dialog, a crash to a shell).
-//! A busy screen is still recorded again every `screen_refresh` while a
-//! turn keeps it busy. An idle session with a quiet transcript and nothing
+//! A turn that ends in the transcript is read on the following passes until
+//! a reading accepts input or `screen_refresh` has passed since the turn
+//! ended: the engine paints its prompt a moment after the line that ends
+//! the turn, and that reading — the worker idle at its prompt — is the one
+//! a delivery waits for, so it is never left to the backstop. A busy screen
+//! is still recorded again every `screen_refresh` while a turn keeps it
+//! busy. An idle session with a quiet transcript and nothing
 //! in flight costs no capture between backstops, and no tmux call of its
 //! own: whether the fleet still runs is one call per pass
 //! ([`TerminalHost::runners`]), so a terminal killed from outside ends its
@@ -67,7 +72,8 @@
 //! transcript change, is never read as a state; a quiet transcript only
 //! says when to look at the screen again. So a screen change that decides a
 //! delivery (the worker at its prompt, its turn stopped) is recorded no
-//! later than the transcript's end of the turn is read.
+//! later than a reading of the pane would show it: the prompt a turn's end
+//! is followed by is read on the pass it appears, not at the next backstop.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
