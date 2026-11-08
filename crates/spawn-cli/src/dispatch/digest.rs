@@ -166,6 +166,9 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                 line.as_str().map(|line| one_line(line, 300))
             });
 <<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
+=======
+<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
+>>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
             let fact = &record["fact"];
             let evidence = if record["evidence"] == "gate" {
                 let scenario = fact["scenario"].as_str().unwrap_or("a scenario");
@@ -181,6 +184,8 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                          ({runs})"
                     )
                 }
+<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
+=======
 =======
             let evidence = if record["evidence"] == "memory_limit" {
                 // A gate its own resource envelope killed (objective 029).
@@ -191,6 +196,7 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                     record["oom_kills"].as_u64().unwrap_or_default()
                 )
 >>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
+>>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
             } else if crash.is_empty() {
                 let failures = record["failures"].as_array().map_or(0, Vec::len);
                 format!(
@@ -227,10 +233,14 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
 <<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
                      counted and nothing halts. {check}"
 =======
+<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
+                     counted and nothing halts. {check}"
+=======
                      counted and nothing halts. Check the host's memory and swap (the \
                      executor's envelope) or the test database's host (its memory, /dev/shm, \
                      its log), or tell the owner."
 >>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
+>>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
                 ),
                 since_ms: record["at_ms"].as_i64(),
             })
