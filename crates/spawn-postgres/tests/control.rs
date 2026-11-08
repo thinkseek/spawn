@@ -2827,6 +2827,301 @@ fn a_host_fault_moves_no_count_and_its_run_is_folded() {
     );
 }
 
+/// Objective 33: a `host_fault` whose evidence is a base that disagreed with
+/// itself. The store accepts it only with its facts (the scenario, both
+/// exits, its counts, `alert` and `escalate` false), stamps its `due_ms` from
+/// the record's own time, leaves the task where it was and both halt counts
+/// as they were, and folds two runs: 020's `gate_host_faults` (which both
+/// evidences share) and this objective's `gate_base_disagrees`. The third in
+/// a row is the alert, told once; every other verdict, a landing and a resume
+/// end the run.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_base_that_disagrees_with_itself_is_a_host_fault_with_its_own_count() {
+    let (store, schema) = store("control_base_disagrees");
+    let mission = store
+        .mission_add("Gated", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(
+            mission,
+            Some("/controller/rsi/scenarios"),
+            "review",
+            None,
+            None,
+        )
+        .expect("configure");
+    let accepted_task = |brief: &str| {
+        let task = store
+            .task_assign(mission, "ephemeral", "w", brief, "default")
+            .expect("assign");
+        store.task_delivered(task, 1).expect("delivered");
+        assert!(store.task_reported(task, "done").expect("reported"));
+        store.task_review(task, true, "", None).expect("accept");
+        task
+    };
+    let task = accepted_task("first");
+    let mut client = admin(&schema);
+    let disagrees = |task: i64, revision: i32, faults: i64, count: i64, alert: bool| {
+        json!({"type": "task.gated", "id": task, "revision": revision, "verdict": "host_fault",
+               "base": "b1", "scenarios": 7, "candidate": "c-host",
+               "reason": "host fault: the base disagrees with itself: 011.sh exited 1, then 0 on \
+                          the base; not a verdict, judged again later",
+               "log": "| 011.sh exited 1, then 0 on the base: a harness error, not a verdict; \
+                       the gate aborts",
+               "evidence": "base_disagrees", "scenario": "011.sh", "exits": [1, 0],
+               "setup_s": 244, "host_faults": faults, "backoff_ms": 300_000,
+               "escalate": false, "base_disagrees": count, "alert": alert})
+    };
+    let verdict = |task: i64, revision: i32, verdict: &str| {
+        store
+            .integrator_record(
+                &json!({"type": "task.gated", "id": task, "revision": revision,
+                                       "verdict": verdict, "base": "b1", "note": "real",
+                                       "candidate": "c1", "reason": "r", "free_kb": 1,
+                                       "min_gb": 10, "tmpdir": "/t"}),
+            )
+            .expect("record a verdict");
+    };
+    let mission_row = |client: &mut Client| tables(client)["missions"][0].clone();
+    let task_row = |client: &mut Client, id: i64| {
+        tables(client)["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .find(|row| row["id"] == id)
+            .cloned()
+            .expect("the task")
+    };
+    let recorded = |client: &mut Client, event: i64| -> (serde_json::Value, i64) {
+        let row = client
+            .query_one(
+                "select kind -> 'detail' -> 'record', recorded_at_ms from spawn_events
+                  where id = $1",
+                &[&event],
+            )
+            .expect("the record");
+        (row.get(0), row.get(1))
+    };
+
+    // Only with its facts.
+    let refused = |change: &dyn Fn(&mut serde_json::Value)| {
+        let mut record = disagrees(task, 0, 1, 1, false);
+        change(&mut record);
+        store.integrator_record(&record).is_err()
+    };
+    assert!(refused(&|record| {
+        record.as_object_mut().expect("object").remove("scenario");
+    }));
+    assert!(refused(
+        &|record| record["scenario"] = json!("011.sh | 102.sh")
+    ));
+    assert!(refused(&|record| record["scenario"] = json!("011 bash.sh")));
+    assert!(refused(&|record| record["exits"] = json!([2, 0])));
+    assert!(refused(&|record| record["exits"] = json!([1])));
+    assert!(refused(&|record| record["exits"] = json!(1)));
+    assert!(refused(&|record| record["base_disagrees"] = json!("1")));
+    assert!(refused(&|record| {
+        record.as_object_mut().expect("object").remove("alert");
+    }));
+    assert!(refused(&|record| record["alert"] = json!("yes")));
+    assert!(refused(&|record| record["setup_s"] = json!("244 s")));
+    assert!(refused(&|record| record["escalate"] = json!(true)));
+    assert!(refused(&|record| {
+        record.as_object_mut().expect("object").remove("backoff_ms");
+    }));
+    // The task's shape before any host fault.
+    let before = task_row(&mut client, task);
+    assert_eq!(
+        (before["state"].clone(), before["revisions"].clone()),
+        (json!("accepted"), json!(0))
+    );
+
+    // The first: its own time plus its backoff, the task where it was, both
+    // counts at 1 and no escalation. A gate that printed no timing line
+    // leaves `setup_s` out, and the store takes it.
+    let event = store
+        .integrator_record(&{
+            let mut record = disagrees(task, 0, 1, 1, false);
+            record.as_object_mut().expect("object").remove("setup_s");
+            record
+        })
+        .expect("the store accepts a base that disagrees");
+    let (record, at) = recorded(&mut client, event);
+    assert_eq!(record["due_ms"], at + 300_000);
+    let after = task_row(&mut client, task);
+    assert_eq!(after["state"], "accepted", "the task stays where it was");
+    assert_eq!(after["revisions"], 0);
+    assert_eq!(after["review_note"], before["review_note"]);
+    assert_eq!(after["candidate"], before["candidate"]);
+    let row = mission_row(&mut client);
+    assert_eq!(row["gate_host_faults"], 1);
+    assert_eq!(row["gate_base_disagrees"], 1);
+    assert_eq!(row["gate_host_due_ms"], at + 300_000);
+    assert_eq!(
+        (row["gate_rejections"].clone(), row["gate_aborts"].clone()),
+        (json!(0), json!(0))
+    );
+    assert!(row["halted"].is_null());
+    assert_eq!(
+        store
+            .gate_base_disagrees_alerts()
+            .expect("alerts")
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "the first in a row is no alert"
+    );
+    assert_eq!(
+        store
+            .gate_host_fault_escalations()
+            .expect("escalations")
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "a base disagreement never escalates"
+    );
+
+    // `no_room` and `stale` keep both runs; 020's evidence ends this one and
+    // grows the shared one.
+    verdict(task, 0, "no_room");
+    verdict(task, 0, "stale");
+    let row = mission_row(&mut client);
+    assert_eq!(
+        (
+            row["gate_host_faults"].clone(),
+            row["gate_base_disagrees"].clone()
+        ),
+        (json!(1), json!(1))
+    );
+    store
+        .integrator_record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                                   "verdict": "host_fault", "base": "b1",
+                                   "reason": "host fault: a connection error",
+                                   "evidence": "failures",
+                                   "failures": [{"test": "api::tests::one",
+                                                 "message": "Connection refused",
+                                                 "class": "connection"}],
+                                   "host_faults": 2, "backoff_ms": 600_000,
+                                   "escalate": true}))
+        .expect("020's host fault");
+    let row = mission_row(&mut client);
+    assert_eq!(row["gate_host_faults"], 2, "both evidences share the run");
+    assert_eq!(
+        row["gate_base_disagrees"], 0,
+        "020's evidence ends the base disagreements"
+    );
+
+    // Three in a row: the third is the alert, folded as 3.
+    store
+        .integrator_record(&disagrees(task, 0, 3, 1, false))
+        .expect("a base disagrees");
+    store
+        .integrator_record(&disagrees(task, 0, 4, 2, false))
+        .expect("a second base disagrees");
+    let third = store
+        .integrator_record(&disagrees(task, 0, 5, 3, true))
+        .expect("a third base disagrees");
+    let row = mission_row(&mut client);
+    assert_eq!(row["gate_base_disagrees"], 3);
+    assert_eq!(row["gate_host_faults"], 5);
+    assert!(row["halted"].is_null());
+    let alerts = store.gate_base_disagrees_alerts().expect("alerts");
+    assert_eq!(alerts.as_array().map(Vec::len), Some(1), "{alerts}");
+    assert_eq!(alerts[0]["event_id"], third);
+    assert_eq!(alerts[0]["mission"], mission);
+    assert_eq!(alerts[0]["scenario"], "011.sh");
+    assert_eq!(alerts[0]["base_disagrees"], 3);
+    assert_eq!(alerts[0]["setup_s"], 244);
+    assert!(alerts[0].get("log").is_none(), "the gate's log stays out");
+    // Told once: a digest carrying its tag ends it.
+    client
+        .execute(
+            "insert into spawn_commands (principal, idempotency_key, agent_id, session_id,
+                                         action, state, succeeded, created_at_ms)
+             values ('spawn-dispatch', 'dispatch-digest-base', 'agent_supervisor',
+                     'session_supervisor',
+                     jsonb_build_object('type', 'input', 'text', 'digest',
+                                        'tags', jsonb_build_array($1::text)),
+                     'finished', true, 0)",
+            &[&format!("host gate-base-disagrees-{third}")],
+        )
+        .expect("a delivered digest");
+    assert_eq!(
+        store
+            .gate_base_disagrees_alerts()
+            .expect("alerts")
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "told once"
+    );
+
+    // A real abort counts and resets both runs; so does a real verdict.
+    verdict(task, 0, "aborted");
+    let row = mission_row(&mut client);
+    assert_eq!(
+        (
+            row["gate_aborts"].clone(),
+            row["gate_host_faults"].clone(),
+            row["gate_base_disagrees"].clone()
+        ),
+        (json!(1), json!(0), json!(0))
+    );
+
+    // A landing ends both runs.
+    let landing = accepted_task("second");
+    store
+        .integrator_record(&disagrees(task, 0, 2, 2, false))
+        .expect("a base disagrees");
+    assert_eq!(
+        mission_row(&mut client)["gate_base_disagrees"],
+        1,
+        "a new run after the abort"
+    );
+    verdict(landing, 0, "accepted");
+    store
+        .integrator_record(&json!({"type": "task.landed", "id": landing, "from": "b1",
+                                   "to": "c1"}))
+        .expect("landed");
+    let row = mission_row(&mut client);
+    assert_eq!(
+        (
+            row["gate_host_faults"].clone(),
+            row["gate_base_disagrees"].clone()
+        ),
+        (json!(0), json!(0)),
+        "a landing ends both runs"
+    );
+
+    // A resume ends both runs.
+    store
+        .integrator_record(&disagrees(task, 0, 1, 1, false))
+        .expect("a base disagrees");
+    store
+        .integrator_record(&json!({"type": "mission.halted", "id": mission, "reason": "x"}))
+        .expect("halt");
+    assert_eq!(mission_row(&mut client)["gate_base_disagrees"], 1);
+    store.mission_resume(mission).expect("resume");
+    let row = mission_row(&mut client);
+    assert_eq!(
+        (
+            row["gate_host_faults"].clone(),
+            row["gate_base_disagrees"].clone()
+        ),
+        (json!(0), json!(0)),
+        "a resume ends both runs"
+    );
+
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
+}
+
 /// A report still a draft is not taken (crates/spawn-cli/src/deliver.rs):
 /// `task.report_unfinished` records the check, once per content and
 /// revision, only while the task is delivered, and folds into nothing.
