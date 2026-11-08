@@ -404,6 +404,8 @@ Bridge、Observer、调度器（`deliver.rs`、`dispatch.rs`）、集成器（`i
 
 门禁的主机故障同样守这条规则（objective 20，[fleet-architecture.md](fleet-architecture.md) §10.3）：check-tests.sh 在候选上失败时，集成器只依据记下的门禁输出里每条失败及其消息（记录的 `failures`），以及测试数据库日志里落在它自己量出的门禁时间窗内（前后各 1 秒）的崩溃行（记录的 `crash`），判定是主机的故障（`host_fault`）还是工作的（`rejected`），从不只凭拒绝理由的文字；之后的等待只依据记录里的 `due_ms`（记录自己的 `recorded_at_ms` 加退避，由存储写入），不凭进程内存或没有记录的时间。主机故障不计入任何停机规则，连续两次升级给 supervisor 一次。
 
+基线自己与自己不一致同样是主机的故障（objective 033，[fleet-architecture.md](fleet-architecture.md) §10.3）：门禁在跑任何候选代码之前先在基线上评判每个 objective 场景，未解决的结果要两次一致的运行；第一次退出 1、第二次退出 0，候选代码一行还没跑，基线是已经落地的代码，这说的是主机太忙或太不稳定，不是工作的问题。集成器只依据门禁记下的退出状态（4）和它自己写在 stdout 末尾的那一对行（记录里的 `scenario` 与 `exits`）判定，从不凭理由的文字、时间或场景名：记 `host_fault`（objective 020 的结论）加证据 `base_disagrees`，任务原地不动，两种证据共用同一条连续计数与退避；之后再判只依据记录里的 `due_ms`。它不升级（020 的第二条才升级），连续三条的第三条在记录里带 `alert`，由调度器的 digest 送给 supervisor 一次（`host gate-base-disagrees-<事件 id>`），任何数量都不停机。
+
 门禁之前先量主机，不靠门禁崩溃才知道主机没有余量（objective 018）：每次判定在候选构建之后、门禁启动之前，集成器按序量门禁 `TMPDIR` 的剩余空间（`SPAWN_GATE_MIN_FREE_GB`）、`MemAvailable`（`SPAWN_GATE_MIN_FREE_MEMORY_MB`）与测试数据库（连接，再跑一条强制并行的查询，各 10 秒内），第一项不够就不启动门禁，记 `no_room` 并写明 `check`、`measured` 与 `threshold`。判断只凭判定当时的测量和它的阈值；一次跑了 25 分钟、因测试库 `/dev/shm` 不足而崩溃的门禁，不再被读成候选的回归。
 
 写新代码时的检查：读另一个循环的产物时，问它覆盖的是哪一个 commit、哪一个会话位置、哪一个命令 id；读 `spawn_commands` 时区分成功、失败与尚未运行；超时只决定何时再看，不证明任何事；删掉一个生产者时，搜出它的每个读者。

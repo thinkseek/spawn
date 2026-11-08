@@ -695,6 +695,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/missions" => Box::new(missions),
         "/api/events" => Box::new(move || events(query)),
         "/api/scorecard" => Box::new(move || scorecard(query)),
+        "/api/alerts" => Box::new(move || alerts(query)),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
                 Box::new(move || session(id, query))
@@ -1655,6 +1656,18 @@ fn scorecard(query: &str) -> Result<Value, String> {
             crate::scorecard::Failure::Record(error) => error,
         }
     })
+}
+
+/// `/api/alerts?since=`: exactly the JSON array of `spawn alerts --once
+/// --json` with the same flag (crate::alerts), from the same store method,
+/// read through the reader login. An empty parameter is the configured
+/// window.
+fn alerts(query: &str) -> Result<Value, String> {
+    let store = open_store()?;
+    let since = parameter(query, "since")
+        .map(|text| percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad since {text}")))
+        .transpose()?;
+    crate::alerts::window(&store, since.as_deref())
 }
 
 /// A query parameter's value with its `%XX` escapes decoded (a `+` stays a
