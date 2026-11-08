@@ -693,6 +693,10 @@ pub(crate) struct Mission {
     pub(crate) gate_room_waits: u32,
     #[serde(default)]
     pub(crate) gate_room_escalated: bool,
+    /// Main of the mission's source is red on a check ([`Red`], the store's
+    /// `mission_source_reds` row): none while it is not.
+    #[serde(default)]
+    pub(crate) red: Option<Red>,
     /// The database's clock when the store read the mission
     /// (`spawn_now_ms()`, in the same query): the gate's due times are the
     /// store's (`gate_room_last_ms` is its record's time, `gate_host_due_ms`
@@ -734,6 +738,22 @@ pub(crate) struct Mission {
     /// mission; of a done one, delivered, reported, accepted and landing.
     #[serde(default)]
     pub(crate) tasks: Vec<Task>,
+}
+
+/// Main of a source red on a check (docs/fleet-architecture.md §10.3, "Main
+/// is red"): the store's fold of its `source.main_red` records less the
+/// `source.main_green` that ends it. `main` is the main last found red,
+/// `scenario` the check, `since_ms` the first red record's time, `latest_ms`
+/// the latest's and `probed_ms` the latest probe gate's (the store's clock
+/// all three).
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct Red {
+    pub(crate) main: String,
+    pub(crate) scenario: String,
+    pub(crate) since_ms: i64,
+    pub(crate) latest_ms: i64,
+    #[serde(default)]
+    pub(crate) probed_ms: Option<i64>,
 }
 
 /// One of its tasks the integrator may act on.
@@ -1142,6 +1162,11 @@ pub(crate) fn cannot_judge_cause(scenario: &str, log: &str) -> Option<String> {
 /// host, which judges that objective outside the gate.
 pub(crate) const CANNOT_JUDGE: &str = "cannot_judge";
 
+/// The evidence of a task's `host_fault` whose gate found main of its source
+/// red on a check ([`main_red_fields`]): no fault of the work, no run of host
+/// faults, no count toward the cap or a halt.
+pub(crate) const MAIN_RED: &str = "main_red";
+
 /// The record of a gate that had no room to judge `task`, at `now_ms`: the
 /// reason with the check, its measure and its threshold, the facts
 /// themselves, and `escalate` when the run of them on this task began more
@@ -1507,6 +1532,23 @@ struct Integrator {
     /// cache to the gates and the deploy (tests, and a warm directory that
     /// cannot be named).
     warms: RefCell<Option<warm::Warms>>,
+    /// While a source's main is red, how long after the last red gate or
+    /// probe one more gate on it runs anyway, a probe
+    /// (`SPAWN_GATE_MAIN_RED_PROBE_MS`, [`main_red_probe_ms`]).
+    red_probe_ms: i64,
+}
+
+/// How long a source red on a check waits between probe gates by default:
+/// an hour. A probe lets a candidate that fixes main reach the gate before
+/// main moves by other means.
+const MAIN_RED_PROBE_MS: i64 = 3_600_000;
+
+/// [`MAIN_RED_PROBE_MS`] from `SPAWN_GATE_MAIN_RED_PROBE_MS`'s text: a whole
+/// number of milliseconds from 1 up; anything else is the default.
+pub(crate) fn main_red_probe_ms(text: Option<&str>) -> i64 {
+    text.and_then(|text| text.trim().parse::<i64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(MAIN_RED_PROBE_MS)
 }
 
 /// What a judging needs, owned, so it runs on a thread of its own.
@@ -1581,15 +1623,17 @@ fn base_only_fault(fields: &Value) -> bool {
     // check-tests, 2026-11-09 00:48-03:42) would otherwise cap every task's
     // next gate as an abort and feed the abort halt. No one of them counts
     // toward the cap nor is ever capped.
+    // A red main (evidence `main_red`, `on` `main`) is main's, not the
+    // candidate's, likewise.
     matches!(
         fields.get("evidence").and_then(Value::as_str),
-        Some(BASE_DISAGREES | CANNOT_JUDGE)
+        Some(BASE_DISAGREES | CANNOT_JUDGE | MAIN_RED)
     ) || matches!(
         fields
             .get("fact")
             .and_then(|fact| fact.get("on"))
             .and_then(Value::as_str),
-        Some("base" | "candidate and base")
+        Some("base" | "candidate and base" | "main")
     )
         // A sandbox that never started in the base's tree or the gate's own
         // (the socket scan): before any candidate code ran, as on the base.
@@ -1738,7 +1782,69 @@ impl Integrator {
             waiting: RefCell::new(std::collections::HashSet::new()),
             last_judged: RefCell::new(std::collections::HashMap::new()),
             warms: RefCell::new(None),
+            red_probe_ms: main_red_probe_ms(
+                crate::config::env_value("SPAWN_GATE_MAIN_RED_PROBE_MS").as_deref(),
+            ),
         }
+    }
+
+    /// Whether `task`'s gate waits because main of `source` is red on a
+    /// check and has not moved (`main` is the red one), said when it does.
+    /// Once [`Self::red_probe_ms`] has passed since the last red gate or
+    /// probe on it, the gate runs anyway, a probe: its `source.main_probe`
+    /// record says so, and the store takes one probe per interval per
+    /// source, so two missions on it never both probe. A main that moved
+    /// is judged as usual (with the red check run on its base first).
+    fn red_holds(
+        &self,
+        store: &PostgresStore,
+        mission: &Mission,
+        source: &str,
+        main: &str,
+        task: &Task,
+    ) -> bool {
+        let Some(red) = mission.red.as_ref().filter(|red| red.main == main) else {
+            return false;
+        };
+        // The database's clock, as the red's times are its own.
+        let Some(now) = mission.now_ms else {
+            return false;
+        };
+        let last = red
+            .probed_ms
+            .map_or(red.latest_ms, |probed| probed.max(red.latest_ms));
+        if now.saturating_sub(last) >= self.red_probe_ms {
+            match store.integrator_record(&json!({
+                "type": "source.main_probe", "source": source, "main": main,
+                "scenario": red.scenario, "task": task.id, "mission": mission.id,
+                "probe_ms": self.red_probe_ms,
+            })) {
+                Ok(_) => {
+                    println!(
+                        "integrate: mission {}: main of {source} is red on {}; task {} is \
+                         judged anyway, a probe",
+                        mission.id, red.scenario, task.id
+                    );
+                    return false;
+                }
+                Err(error) => println!(
+                    "integrate: mission {}: no probe of {source}'s red main now: {error}",
+                    mission.id
+                ),
+            }
+        }
+        if self.waiting.borrow_mut().insert(task.id) {
+            println!(
+                "integrate: mission {}: main of {source} ({}) is red on {} since {}; task {} \
+                 waits until main moves (or the next probe)",
+                mission.id,
+                main.get(..12).unwrap_or(main),
+                red.scenario,
+                red.since_ms,
+                task.id
+            );
+        }
+        true
     }
 
     /// This integrator with the host's cores shared among its gates.
@@ -2060,7 +2166,7 @@ impl Integrator {
             return Ok(false);
         }
         if let (Some((mirror, main)), Some(task)) = (judgeable, mission.ready()) {
-            if gate_waits(mission, task) {
+            if gate_waits(mission, task) || self.red_holds(store, mission, source, &main, task) {
                 return Ok(false);
             }
             let mut gated = mission.clone();
@@ -2448,6 +2554,9 @@ impl Judge {
         // (its verdict's `flakes`), carried on whichever record this judging
         // writes: set once the run has a verdict.
         let flakes: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        // A gate on a main that is red (design-main-red.md) runs only as a
+        // probe ([`Integrator::red_holds`]): its record says so.
+        let probe = mission.red.as_ref().is_some_and(|red| red.main == main);
         let gated = |verdict: &str, extra: Value| -> Result<(), String> {
             // A host fault past the cap for this revision counts as an abort
             // ([`HOST_FAULT_CAP`]). Only a fault that may be the candidate's
@@ -2478,6 +2587,9 @@ impl Judge {
             }
             if !flakes.borrow().is_empty() {
                 record_value["flakes"] = json!(*flakes.borrow());
+            }
+            if probe {
+                record_value["probe"] = json!(true);
             }
             record(store, &record_value)?;
             println!("integrate: task {} gated: {verdict}", task.id);
@@ -2588,6 +2700,13 @@ impl Judge {
         if let Some(warning) = warning {
             eprintln!("integrate: {warning}");
         }
+        // Main of the source is red on a check: the gate runs it on the base
+        // before the candidate, so a main that is green on it again says so
+        // (`base_check`) and one still red stops there (`main_red`).
+        gate_env.retain(|(name, _)| name != "SPAWN_GATE_BASE_CHECK");
+        if let Some(red) = &mission.red {
+            gate_env.push(("SPAWN_GATE_BASE_CHECK".to_string(), red.scenario.clone()));
+        }
         let gate_path = pinned(&self.gate);
         let run_gate = |base: &str, judged: &str| {
             gate::judge(
@@ -2612,6 +2731,22 @@ impl Judge {
         let ended = now_ms();
         if let Ok(verdict) = &judged {
             flakes.replace(verdict.flakes.clone());
+            // The red check passed on this base before the candidate ran:
+            // main of the source is green on it again.
+            if let (Some(red), Some(passed)) = (&mission.red, verdict.base_check.as_deref())
+                && passed == red.scenario
+            {
+                match store.integrator_record(&json!({
+                    "type": "source.main_green", "source": source, "main": main,
+                    "scenario": passed, "task": task.id, "mission": mission.id,
+                })) {
+                    Ok(_) => println!(
+                        "integrate: main of {source} ({}) passes {passed} again: green",
+                        main.get(..12).unwrap_or(main)
+                    ),
+                    Err(error) => eprintln!("integrate: main of {source} green again: {error}"),
+                }
+            }
         }
         match judged {
             Ok(verdict) if verdict.accepted => {
@@ -2779,6 +2914,60 @@ impl Judge {
                     extra["reason"].as_str().unwrap_or_default()
                 );
                 gated("host_fault", extra)
+            }
+            // Main is red on a check: it failed twice on the base with the
+            // same failing tests. Believed only when a failure is the work's
+            // and the test server's log shows no crash in the gate's window:
+            // then `source.main_red` (one per source, the owner alerted once)
+            // and the task's `host_fault` with evidence `main_red`, which
+            // starts no run, no backoff and no count. Else it is the host's,
+            // as a check failing on the candidate and on the base.
+            Err(GateFailure::MainRed {
+                scenario,
+                runs,
+                failures,
+                log,
+            }) => {
+                let classes: Vec<host::Class> = failures
+                    .iter()
+                    .map(|failure| host::classify(&failure.message))
+                    .collect();
+                let crash = if test_database {
+                    self.crash_in(started, ended)
+                } else {
+                    Vec::new()
+                };
+                if classes.contains(&host::Class::Work) && crash.is_empty() {
+                    let listed: Vec<Value> = failures
+                        .iter()
+                        .zip(&classes)
+                        .map(|(failure, class)| {
+                            json!({"test": failure.test, "message": crate::deliver::one_line(&failure.message, 200),
+                                   "class": class.name()})
+                        })
+                        .collect();
+                    store
+                        .integrator_record(&json!({
+                            "type": "source.main_red", "source": source, "main": main,
+                            "scenario": scenario, "runs": runs, "failures": listed,
+                            "task": task.id, "mission": mission.id,
+                        }))
+                        .map_err(|error| error.to_string())?;
+                    let mut extra =
+                        main_red_fields(mission, source, main, &scenario, &runs, &listed, &log);
+                    extra["candidate"] = json!(candidate);
+                    println!(
+                        "integrate: task {}: {}",
+                        task.id,
+                        extra["reason"].as_str().unwrap_or_default()
+                    );
+                    gated("host_fault", extra)
+                } else {
+                    let failure = red_as_host_fault(scenario, runs, &crash, log);
+                    let mut extra = self.gate_host_fault(mission, task.id, &failure);
+                    extra["candidate"] = json!(candidate);
+                    gated("host_fault", extra)
+                }
             }
             // The gate found a host or harness fault, not a verdict: a
             // scenario's harness error on the base, or a check failing on
@@ -3426,6 +3615,17 @@ fn rejection(
             failure,
             head: named,
         },
+        // Red on the head's own base, an older main: said as the host's for
+        // this judging, never as the source's main now.
+        Err(GateFailure::MainRed {
+            scenario,
+            runs,
+            log,
+            ..
+        }) => Rejection::HeadHostFault {
+            failure: red_as_host_fault(scenario, runs, &[], log),
+            head: named,
+        },
         Err(GateFailure::CannotJudge { scenario, log }) => Rejection::HeadCannotJudge {
             scenario,
             log,
@@ -3477,6 +3677,12 @@ fn aborted(failure: &GateFailure) -> Value {
         } => {
             json!({"reason": format!("the gate found {scenario} failing on the {on}"), "log": log})
         }
+        // Recorded as `host_fault` with evidence `main_red` (or as the
+        // host's) by the caller; counted here only if a caller forgets that.
+        GateFailure::MainRed { scenario, log, .. } => json!({
+            "reason": format!("the gate found main red on {scenario}"),
+            "log": log,
+        }),
         // Recorded as `host_fault` with evidence `cannot_judge` by the
         // caller; counted here only if a caller forgets that.
         GateFailure::CannotJudge { scenario, log } => json!({
@@ -3489,6 +3695,60 @@ fn aborted(failure: &GateFailure) -> Value {
             "log": log,
         }),
     }
+}
+
+/// The gate's red-main fact taken as the host's: no failure was the work's,
+/// or the test server's log shows a crash in the gate's window (`crash`), or
+/// it was about another base than main. A check failing on the candidate and
+/// on the base, as the gate says it without the red rule.
+fn red_as_host_fault(scenario: String, runs: String, crash: &[String], log: String) -> GateFailure {
+    let why = crash.first().map_or_else(
+        || "none of the shared failures is the work's".to_string(),
+        |line| format!("the test database's log shows a crash during the gate ({line})"),
+    );
+    GateFailure::HostFault {
+        reason: format!(
+            "{scenario} failed twice on the candidate and twice on the base with the same tests, \
+             but {why}: a host or harness fault, not a verdict on the candidate"
+        ),
+        scenario,
+        on: "candidate and base".to_string(),
+        runs,
+        tree: None,
+        log,
+    }
+}
+
+/// The task's record of a gate that found main red on `scenario`
+/// (`host_fault`, evidence [`MAIN_RED`]): `fact` with `on` `main`, the
+/// source, its main and the shared failures; no backoff of its own
+/// (`backoff_ms` 0: the source's red holds the gates instead) and no
+/// escalation (the owner is told once, of the source's `source.main_red`).
+/// The mission's run of host faults is untouched (the store's fold).
+pub(crate) fn main_red_fields(
+    mission: &Mission,
+    source: &str,
+    main: &str,
+    scenario: &str,
+    runs: &str,
+    failures: &[Value],
+    log: &str,
+) -> Value {
+    json!({
+        "reason": format!(
+            "main of {source} ({}) is red on {scenario}: it failed twice on the base ({runs}) \
+             with the same failing tests; not a verdict on the work, judged again when main \
+             moves",
+            main.get(..12).unwrap_or(main)
+        ),
+        "log": log,
+        "evidence": MAIN_RED,
+        "fact": {"scenario": scenario, "on": "main", "runs": runs, "source": source,
+                 "main": main, "failures": failures},
+        "host_faults": mission.gate_host_faults,
+        "backoff_ms": 0,
+        "escalate": false,
+    })
 }
 
 fn now_ms() -> i64 {
@@ -10544,6 +10804,189 @@ mod database_tests {
         assert_eq!(gated(&db, mission).gate_aborts, 0);
         assert_eq!(gated(&db, mission).gate_host_faults, 4, "each one a run");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Main is red on a check (design-main-red.md), through the store. A gate
+    /// that finds check-tests.sh failing twice on the base with the same test
+    /// (an assertion: the work's class) gives the source one red,
+    /// `source.main_red` with `alert`, and the task a `host_fault` with
+    /// evidence `main_red` that starts no run and is never capped (the cap
+    /// here is 1). The red main holds the source's gates: the next pass
+    /// starts none. Once the probe interval has passed, one gate runs anyway,
+    /// a probe (`source.main_probe`, the record's `probe`), with the red check
+    /// given to the gate (SPAWN_GATE_BASE_CHECK); the store takes one probe
+    /// per interval. When the red check passes on the base, the source is
+    /// green again (`source.main_green`, its red's `since_ms`), the work is
+    /// judged as usual, and the supervisor is told of the red once and of the
+    /// green once.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_red_main_holds_its_sources_gates_until_a_probe_finds_it_green() {
+        let dir = std::env::temp_dir().join(format!("spawn-db-main-red-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let (runs, green) = (dir.join("runs"), dir.join("green"));
+        let (runs_path, green_path) = (runs.display(), green.display());
+        let gate = format!(
+            "echo \"base_check=${{SPAWN_GATE_BASE_CHECK-}}\" >>'{runs_path}'\n\
+             if [ -e '{green_path}' ]; then\n\
+               echo '| base check: check-tests.sh passes on the base: main is green on it again'\n\
+               printf '{{\"verdict\":\"accepted\",\"base_check\":\"check-tests.sh\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+               exit 0\n\
+             fi\n\
+             echo '| == regression: check-tests.sh must still pass'\n\
+             printf '{{\"host_fault\":true,\"scenario\":\"check-tests.sh\",\"on\":\"main\",\"runs\":\"1, then 1 on the candidate; 1, then 1 on the base\",\"reason\":\"r\",\"failures\":[{{\"test\":\"api::tests::adds\",\"message\":\"assertion `left == right` failed\"}}]}}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+             exit 6\n"
+        );
+        let (base, source, scenarios, mut integrator) = world("main-red", &gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_secs(1),
+            cap: 1,
+        };
+        let db = Db::new("main_red");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        let main = source_main(&source);
+        let gates = || {
+            std::fs::read_to_string(&runs)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        };
+        let pass = |integrator: &Integrator| {
+            integrator.pass_on(&db.store).expect("a pass");
+            integrator.settle();
+        };
+
+        // The first gate finds main red: one red for the source, the task's
+        // host_fault with no run, no backoff, no count.
+        pass(&integrator);
+        assert_eq!(gates(), ["base_check="], "no red yet, so no base check");
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["verdict"], "host_fault", "{record}");
+        assert_eq!(record["evidence"], super::MAIN_RED, "{record}");
+        assert_eq!(record["fact"]["on"], "main");
+        assert_eq!(record["fact"]["main"], main.as_str());
+        assert_eq!(record["backoff_ms"], 0);
+        assert!(record.get("probe").is_none(), "{record}");
+        let reds = control_records(&db, "source.main_red");
+        assert_eq!(reds.len(), 1);
+        assert_eq!(reds[0]["alert"], true, "the first of the red: {}", reds[0]);
+        assert_eq!(reds[0]["scenario"], "check-tests.sh");
+        assert_eq!(reds[0]["failures"][0]["test"], "api::tests::adds");
+        assert_eq!(reds[0]["failures"][0]["class"], "work");
+        let after = gated(&db, mission);
+        let red = after.red.clone().expect("the source is red");
+        assert_eq!(
+            (red.main.as_str(), red.scenario.as_str()),
+            (main.as_str(), "check-tests.sh")
+        );
+        assert_eq!(
+            (after.gate_host_faults, after.gate_aborts),
+            (0, 0),
+            "no run, no count"
+        );
+        assert_eq!(db.store.task_host_faults(task, 0).expect("count"), 0);
+
+        // Told once: the red's alert.
+        let news = crate::dispatch::digest::main_red_news(
+            db.store
+                .main_red_news()
+                .expect("news")
+                .as_array()
+                .expect("records"),
+        );
+        assert_eq!(news.len(), 1, "{news:?}");
+        assert_eq!(news[0].why, crate::dispatch::Why::MainRed);
+        assert!(
+            news[0].line.contains("is red on check-tests.sh")
+                && news[0].line.contains("api::tests::adds"),
+            "{}",
+            news[0].line
+        );
+
+        // The red main holds the source's gates: no gate, no record.
+        let verdicts = control_records(&db, "task.gated").len();
+        pass(&integrator);
+        assert_eq!(gates().len(), 1, "held: no gate ran");
+        assert_eq!(control_records(&db, "task.gated").len(), verdicts);
+
+        // Past the probe interval: one gate anyway, a probe, given the red
+        // check; still red, so a second red record, no alert, still no count.
+        integrator.red_probe_ms = 1;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        pass(&integrator);
+        assert_eq!(gates(), ["base_check=", "base_check=check-tests.sh"]);
+        assert_eq!(control_records(&db, "source.main_probe").len(), 1);
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["probe"], true, "{record}");
+        assert_eq!(
+            record["verdict"], "host_fault",
+            "the cap of 1 never caps it: {record}"
+        );
+        let reds = control_records(&db, "source.main_red");
+        assert_eq!(reds.len(), 2);
+        assert_eq!(reds[1]["alert"], false, "{}", reds[1]);
+        assert_eq!(gated(&db, mission).gate_aborts, 0);
+        // The store takes one probe per interval: none is due an hour after
+        // the last.
+        assert!(
+            db.store
+                .integrator_record(&json!({"type": "source.main_probe", "source": source,
+                                           "main": main, "task": task, "probe_ms": 3_600_000}))
+                .is_err()
+        );
+        // A red that names no failure is refused.
+        assert!(
+            db.store
+                .integrator_record(&json!({"type": "source.main_red", "source": source,
+                                           "main": main, "scenario": "check-tests.sh",
+                                           "failures": [], "task": task}))
+                .is_err()
+        );
+
+        // The red check passes on the base: green again, the work judged.
+        std::fs::write(&green, "").expect("green");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        pass(&integrator);
+        assert_eq!(gates().len(), 3);
+        let greens = control_records(&db, "source.main_green");
+        assert_eq!(greens.len(), 1);
+        assert_eq!(greens[0]["scenario"], "check-tests.sh");
+        assert!(
+            greens[0]["since_ms"].is_i64(),
+            "the red's since: {}",
+            greens[0]
+        );
+        assert!(gated(&db, mission).red.is_none(), "green: no red");
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["verdict"], "accepted", "{record}");
+        assert_eq!(
+            record["probe"], true,
+            "the gate that found it green was a probe"
+        );
+        let news = crate::dispatch::digest::main_red_news(
+            db.store
+                .main_red_news()
+                .expect("news")
+                .as_array()
+                .expect("records"),
+        );
+        assert!(
+            news.iter()
+                .any(|item| item.why == crate::dispatch::Why::MainGreen
+                    && item.line.contains("passes check-tests.sh again")),
+            "{news:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Objective 033's evidence beside the cap (this objective's): a base

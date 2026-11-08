@@ -1385,6 +1385,27 @@ create table if not exists mission_source_holds (
     expires_ms bigint not null
 );
 
+-- A source whose main is red on a check (docs/fleet-architecture.md §10.3,
+-- "Main is red"): the fold of the integrator's `source.main_red` records
+-- (keyed by source: a red on a later main moves `main` on, keeping `since_ms`)
+-- less the `source.main_green` that ends it. While a source has a row and its
+-- main is still `main`, the integrator starts no gate on it but one probe per
+-- interval (`source.main_probe`). `event` is the first red record's id,
+-- `since_ms` its time, `red_ms` the latest red record's, `probed_ms` the
+-- latest probe's; `failures` the latest red record's shared failures and
+-- `tasks` the tasks whose gates found it, in order.
+create table if not exists mission_source_reds (
+    source    text   primary key,
+    event     bigint not null,
+    main      text   not null,
+    scenario  text   not null,
+    failures  jsonb  not null,
+    since_ms  bigint not null,
+    red_ms    bigint not null,
+    probed_ms bigint,
+    tasks     jsonb  not null default '[]'::jsonb
+);
+
 -- What went wrong, in the record (docs/fleet-architecture.md, "Alerts";
 -- docs/storage.md, "Alerts"). One row per occurrence, keyed by the key its
 -- `alert.fired` and `alert.cleared` records share: an alert fires once and
@@ -1574,6 +1595,28 @@ begin
         -- The record that ends a hold: only the one naming the active hold.
         delete from mission_source_holds
          where source = p_record ->> 'source' and hold = (p_record ->> 'hold')::bigint;
+    when 'source.main_red' then
+        -- Main of a source is red on a check (the integrator, after a gate
+        -- found it failing twice on the base with the same tests): the first
+        -- record starts the row, a later one (another task's gate, or a later
+        -- main red the same way) moves `main` and `failures` on and keeps
+        -- `since_ms` and `event`.
+        insert into mission_source_reds (source, event, main, scenario, failures, since_ms,
+                                         red_ms, tasks)
+        values (p_record ->> 'source', p_event, p_record ->> 'main', p_record ->> 'scenario',
+                p_record -> 'failures', p_at, p_at,
+                jsonb_build_array((p_record ->> 'task')::bigint))
+        on conflict (source) do update
+           set main = excluded.main, scenario = excluded.scenario,
+               failures = excluded.failures, red_ms = excluded.red_ms,
+               tasks = mission_source_reds.tasks || excluded.tasks;
+    when 'source.main_probe' then
+        -- A gate on the red main anyway, so a candidate that fixes it is
+        -- judged: the next probe is due an interval after this one.
+        update mission_source_reds set probed_ms = p_at where source = p_record ->> 'source';
+    when 'source.main_green' then
+        -- The red check passed on main's base (a probe's, or a later main's): green.
+        delete from mission_source_reds where source = p_record ->> 'source';
     when 'task.held' then
         -- A landing that pushed nothing: its source is held. It stays
         -- `landing`, waiting behind that hold.
@@ -1636,17 +1679,27 @@ begin
                -- The mission's host faults in a row: a landing or a real
                -- verdict ends the run; `no_room` and `stale` leave it. The
                -- task waits until the record's `due_ms`.
-               gate_host_faults = case v_verdict when 'host_fault' then gate_host_faults + 1
-                                                 when 'no_room' then gate_host_faults
-                                                 when 'stale' then gate_host_faults
-                                                 else 0 end,
-               gate_host_task = case v_verdict when 'host_fault' then v_id
-                                               when 'no_room' then gate_host_task
-                                               when 'stale' then gate_host_task end,
-               gate_host_due_ms = case v_verdict
-                                    when 'host_fault' then (p_record ->> 'due_ms')::bigint
-                                    when 'no_room' then gate_host_due_ms
-                                    when 'stale' then gate_host_due_ms end,
+               -- A red main (evidence `main_red`) is no host fault of the run:
+               -- it leaves the run as it was, as `no_room` does; the
+               -- source's red holds the gates instead of a backoff.
+               gate_host_faults = case when v_verdict = 'host_fault'
+                                            and p_record ->> 'evidence' = 'main_red'
+                                           then gate_host_faults
+                                       when v_verdict = 'host_fault' then gate_host_faults + 1
+                                       when v_verdict in ('no_room', 'stale') then gate_host_faults
+                                       else 0 end,
+               gate_host_task = case when v_verdict = 'host_fault'
+                                          and p_record ->> 'evidence' = 'main_red'
+                                         then gate_host_task
+                                     when v_verdict = 'host_fault' then v_id
+                                     when v_verdict in ('no_room', 'stale') then gate_host_task end,
+               gate_host_due_ms = case when v_verdict = 'host_fault'
+                                            and p_record ->> 'evidence' = 'main_red'
+                                           then gate_host_due_ms
+                                       when v_verdict = 'host_fault'
+                                           then (p_record ->> 'due_ms')::bigint
+                                       when v_verdict in ('no_room', 'stale')
+                                           then gate_host_due_ms end,
                -- The mission's base disagreements in a row (objective 033):
                -- + 1 on a host fault with that evidence, kept by `no_room`
                -- and `stale`, ended by every other verdict (020's host faults
@@ -1656,6 +1709,8 @@ begin
                    when v_verdict = 'host_fault'
                         and p_record ->> 'evidence' = 'base_disagrees'
                        then gate_base_disagrees + 1
+                   when v_verdict = 'host_fault' and p_record ->> 'evidence' = 'main_red'
+                       then gate_base_disagrees
                    when v_verdict in ('no_room', 'stale') then gate_base_disagrees
                    else 0 end,
                -- The run is this task's: a `no_room` on another task starts
@@ -1924,6 +1979,7 @@ declare
 begin
     perform pg_advisory_xact_lock(1399957335);
     delete from mission_source_holds;
+    delete from mission_source_reds;
     delete from spawn_alerts;
     delete from mission_tasks;
     delete from mission_residents;
@@ -2798,8 +2854,53 @@ begin
        or p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
                                       'task.held', 'source.hold_expired', 'task.cancelled',
                                       'source.moved', 'source.push_refused',
-                                      'task.over_budget', 'objective.solved') then
+                                      'task.over_budget', 'objective.solved',
+                                      'source.main_red', 'source.main_probe',
+                                      'source.main_green') then
         raise exception 'the integrator does not record %', p_record ->> 'type';
+    end if;
+    -- Main of a source red on a check (docs/fleet-architecture.md §10.3,
+    -- "Main is red"): a red names its source, main, check and the shared
+    -- failures, and says whether it is the first (`alert`, the store's: the
+    -- owner is told once a red); a probe is due only an interval after the
+    -- last red or probe on that main (`probe_ms`), so two missions on one
+    -- source never probe at once; a green names the check that was red, and
+    -- carries the red's `since_ms`.
+    if p_record ->> 'type' = 'source.main_red' then
+        if coalesce(p_record ->> 'source', '') = '' or coalesce(p_record ->> 'main', '') = ''
+           or coalesce(p_record ->> 'scenario', '') !~ '^check-[^/[:space:]]+\.sh$'
+           or jsonb_typeof(p_record -> 'failures') is distinct from 'array'
+           or jsonb_array_length(p_record -> 'failures') = 0
+           or jsonb_typeof(p_record -> 'task') is distinct from 'number' then
+            raise exception 'a source.main_red names its source, main, check, failures and task: %',
+                            p_record;
+        end if;
+        p_record := p_record || jsonb_build_object('alert', not exists (
+            select 1 from mission_source_reds r where r.source = p_record ->> 'source'));
+    end if;
+    if p_record ->> 'type' = 'source.main_probe' then
+        if jsonb_typeof(p_record -> 'probe_ms') is distinct from 'number'
+           or (p_record ->> 'probe_ms')::numeric < 1
+           or jsonb_typeof(p_record -> 'task') is distinct from 'number' then
+            raise exception 'a source.main_probe names its task and probe_ms: %', p_record;
+        end if;
+        if not exists (
+            select 1 from mission_source_reds r
+             where r.source = p_record ->> 'source' and r.main = p_record ->> 'main'
+               and spawn_now_ms() - greatest(r.red_ms, coalesce(r.probed_ms, r.red_ms))
+                   >= (p_record ->> 'probe_ms')::numeric) then
+            raise exception 'no probe of % is due', p_record ->> 'source';
+        end if;
+    end if;
+    if p_record ->> 'type' = 'source.main_green' then
+        if not exists (select 1 from mission_source_reds r
+                        where r.source = p_record ->> 'source'
+                          and r.scenario = p_record ->> 'scenario') then
+            raise exception '% is not red on %', p_record ->> 'source', p_record ->> 'scenario';
+        end if;
+        p_record := p_record || (select jsonb_build_object('since_ms', r.since_ms, 'red_main', r.main)
+                                   from mission_source_reds r
+                                  where r.source = p_record ->> 'source');
     end if;
     -- The integrator cancels one kind of task: an objective's task in flight
     -- whose objective ran out of attempts, which yields its slot
@@ -2964,7 +3065,7 @@ begin
        and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log',
                                                           'base_disagrees', 'gate',
                                                           'cannot_judge',
-                                                          'sandbox_never_started')
+                                                          'sandbox_never_started', 'main_red')
             or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
             or (p_record ->> 'evidence' in ('failures', 'server_log')
                 and (case when jsonb_typeof(p_record -> 'failures') = 'array'
@@ -2994,7 +3095,12 @@ begin
                      or p_record -> 'fact' ->> 'on' is distinct from 'sandbox'
                      or p_record -> 'fact' ->> 'runs' is distinct from 'never started'
                      or coalesce(p_record -> 'fact' ->> 'tree', '') not in
-                        ('candidate', 'base', 'gate')))) then
+                        ('candidate', 'base', 'gate')))
+            or (p_record ->> 'evidence' = 'main_red'
+                and (coalesce(p_record -> 'fact' ->> 'scenario', '') !~ '^check-[^/[:space:]]+\.sh$'
+                     or p_record -> 'fact' ->> 'on' is distinct from 'main'
+                     or jsonb_typeof(p_record -> 'fact' -> 'failures') is distinct from 'array'
+                     or jsonb_array_length(p_record -> 'fact' -> 'failures') = 0))) then
         raise exception 'a host_fault verdict names its evidence, its facts and backoff_ms: %',
                         p_record;
     end if;
@@ -3643,7 +3749,8 @@ begin
 end
 $$;
 
-revoke all on mission_missions, mission_residents, mission_tasks, mission_source_holds, spawn_alerts from public;
+revoke all on mission_missions, mission_residents, mission_tasks, mission_source_holds,
+               mission_source_reds, spawn_alerts from public;
 -- Every mission function: search_path pinned, closed to public. The
 -- supervisor may call the ones it decides with; the rest are the owner's
 -- (humans, the dispatcher, the integrator).
@@ -3687,7 +3794,7 @@ begin
                        spawn_login_role('spawn_supervisor'));
     end loop;
     execute format('grant select on mission_missions, mission_residents, mission_tasks, '
-                   'mission_source_holds, spawn_alerts to %I',
+                   'mission_source_holds, mission_source_reds, spawn_alerts to %I',
                    spawn_login_role('spawn_supervisor'));
 end
 $$;

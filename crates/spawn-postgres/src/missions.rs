@@ -650,11 +650,11 @@ select count(*)
    and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
    and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
    and e.kind -> 'detail' -> 'record' ->> 'revision' = $2
-   and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') not in ('base', 'candidate and base')
+   and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') not in ('base', 'candidate and base', 'main')
    and not (coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') = 'sandbox'
             and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'tree', '') <> 'candidate')
    and coalesce(e.kind -> 'detail' -> 'record' ->> 'evidence', '') not in
-       ('base_disagrees', 'cannot_judge')";
+       ('base_disagrees', 'cannot_judge', 'main_red')";
 
 /// The work an ephemeral objective task starts from: the newest earlier
 /// task of its objective that ended without landing (cancelled, aborted or
@@ -705,7 +705,9 @@ select coalesce((
 /// (`spawn_task_may_continue`) still lets go on, with that work: every task
 /// the integrator may judge, land, or hold to its budget, with the brief and
 /// the report a landing's message is written from. Each names `hold`, the
-/// active owner's hold on its source (or null), and each task `held_by`.
+/// active owner's hold on its source (or null), `red` its source's red main
+/// (`mission_source_reds`: main, scenario, since_ms, latest_ms, probed_ms; or
+/// null), and each task `held_by`.
 pub(crate) const GATED: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
@@ -716,6 +718,10 @@ from (
          m.gate_room_waits, m.gate_room_escalated, m.gate_host_faults, m.gate_host_task,
          m.gate_host_due_ms, m.gate_base_disagrees, m.objectives, m.sources ->> 0 as source,
          (select h.hold from mission_source_holds h where h.source = m.sources ->> 0) as hold,
+         (select jsonb_build_object('main', r.main, 'scenario', r.scenario,
+                                    'since_ms', r.since_ms, 'latest_ms', r.red_ms,
+                                    'probed_ms', r.probed_ms)
+            from mission_source_reds r where r.source = m.sources ->> 0) as red,
          (select max(e.recorded_at_ms) from spawn_events e
            where e.session_id = 'session_control' and e.event_name = 'control.recorded'
              and e.kind -> 'detail' -> 'record' ->> 'type' = 'mission.configured'
@@ -803,6 +809,32 @@ select coalesce(jsonb_agg((r - 'log') || jsonb_build_object('event_id', e.id,
    and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
    and e.kind -> 'detail' -> 'record' ->> 'escalate' = 'true'
    and not exists (select 1 from told where tag = 'host gate-host-fault-' || e.id)";
+
+/// The `source.main_red` records that start a red (`alert`: the first of
+/// the source's red, the store's) and the `source.main_green` records that
+/// end one, that the supervisor was not told of yet, oldest first, each with
+/// its `event_id` and `at_ms`. Told is a record, as for
+/// [`GATE_HOST_FAULT_ESCALATIONS`]: a digest that reached the supervisor
+/// carrying the tag `host main-red-<event_id>` or `host main-green-<event_id>`,
+/// however long ago.
+pub(crate) const MAIN_RED_NEWS: &str = r"
+with told as (
+  select distinct tag
+    from spawn_commands d
+   cross join lateral jsonb_array_elements_text(
+           case when jsonb_typeof(d.action -> 'tags') = 'array'
+                then d.action -> 'tags' else '[]'::jsonb end) tag
+   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
+)
+select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.recorded_at_ms)
+                          order by e.session_seq), '[]'::jsonb)
+  from spawn_events e
+ cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and ((r ->> 'type' = 'source.main_red' and r ->> 'alert' = 'true'
+         and not exists (select 1 from told where tag = 'host main-red-' || e.id))
+        or (r ->> 'type' = 'source.main_green'
+            and not exists (select 1 from told where tag = 'host main-green-' || e.id)))";
 
 /// The `host_fault` gate records whose base disagreed with itself and that
 /// carry `alert` (the mission's third such base in a row, objective 033),
@@ -1479,6 +1511,12 @@ impl PostgresStore {
     /// supervisor yet ([`GATE_BASE_DISAGREES_ALERTS`]).
     pub fn gate_base_disagrees_alerts(&self) -> Result<Value, StoreError> {
         self.query_json(GATE_BASE_DISAGREES_ALERTS, &[])
+    }
+
+    /// The red mains that started and the ones that ended, not told to the
+    /// supervisor yet ([`MAIN_RED_NEWS`]).
+    pub fn main_red_news(&self) -> Result<Value, StoreError> {
+        self.query_json(MAIN_RED_NEWS, &[])
     }
 
     /// The second overrun of an objective's chain that the supervisor was
