@@ -145,7 +145,19 @@ them — the drill refuses any ref the manifest does not name (below). A
 source with no branches and no tags (a mission added before its first push)
 is recorded `empty`, `heads` `{}` and no file in the archive: `git bundle
 create` will not make an empty bundle, there is nothing of the mission to
-hold, and a restore of it makes an empty repository.
+hold, and a restore of it makes an empty repository. Every repo entry carries
+its `file` in the archive, `null` when the archive holds none of it, and the
+record and the manifest use the same shape.
+
+Every repo entry of an increment carries a `delta` (`added`, `moved`,
+`removed`, each the ref names; their commits are in `heads` where they still
+exist) and a `bundled` list naming the refs the bundle actually holds
+(empty when nothing needed bytes). An increment whose refs all point into its
+base — a tag added at a commit the base already holds, a branch moved back to
+one, a branch removed — would write no bytes, and git refuses to make an
+empty bundle; the run says so itself: no file, `bytes` 0, the `delta` and
+`bundled` `[]`. A reader can tell a source that moved in a way that needs no
+bytes from a bundle that failed.
 
 `spawn backup verify` is the drill (below): the newest good dump restores to
 its record, and the newest bundle is opened and compared with its own. Exit
@@ -206,11 +218,12 @@ SHA-256 against the record's, decompresses it by its magic, untars it, and
 compares `manifest.json` with the record (kind, transcript file count and
 bytes), every transcript file it names at the recorded size, and every
 repo's bundle: `git bundle list-heads` must list every head the manifest
-names and nothing it does not — for an increment, the heads that are new or
-moved since its base, since `--not` leaves an unmoved head out — and a full
-bundle must additionally pass `git bundle verify` in an empty repository
-(an increment's prerequisites are its base's commits, which the drill does
-not fetch). A store with no bundle yet says so in the record and passes. The result is the record's `bundle`
+names and nothing it does not — a full bundle holds every head; an increment
+holds a subset, which its manifest names as `bundled` (`--not` leaves out a
+ref that did not move, and one whose new commit the base already has), and
+the bundle must list exactly those — and a full bundle must additionally
+pass `git bundle verify` in an empty repository (an increment's
+prerequisites are its base's commits, which the drill does not fetch). A store with no bundle yet says so in the record and passes. The result is the record's `bundle`
 object; a bundle that fails makes the day's verdict a failure.
 
 `pg-restore-drill.sh [KEY]` remains for the manual, docker-based drill the
@@ -262,6 +275,13 @@ bundle fetches on top of the full one's, its prerequisites naming it), write
 each `transcripts/<agent>/<file>` part at the offset its manifest records,
 and `manifest.json` says which offset and how many bytes each part holds. A
 full bundle fetches on its own.
+
+Two entries name no file: one marked `empty` is a source with no branches and
+no tags — there is nothing to clone, and `git init --bare <name>.git` makes
+the empty repository its record describes; one carrying a `delta` and no file
+is a change that needs no bytes (a tag added at a commit the base holds, a
+branch removed) — restore the source as it stood at the base, and nothing
+changes.
 
 ## Cost
 

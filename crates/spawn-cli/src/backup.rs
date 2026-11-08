@@ -26,9 +26,13 @@
 //!   source's branches and tags — exactly the refs the record names, never a
 //!   remote-tracking ref a mirror clone left (the live `supply-pa.git` has
 //!   `refs/remotes/github/main`) nor a pending `refs/spawn-owner/` push; a
-//!   source with no branches and no tags is recorded `empty`, with no file in
-//!   the archive — whole or `--not` its base's heads, and the transcript
-//!   archive's files modified
+//!   source with no branches and no tags is recorded `empty`, and an
+//!   increment whose refs all point into its base records the `delta` that
+//!   changed (a tag added at a held commit, a branch removed), both with no
+//!   file in the archive; an increment's entry also names the refs its
+//!   bundle holds (`bundled`), since `--not` leaves out a ref the base has
+//!   — whole or `--not` its base's heads, and the transcript archive's
+//!   files modified
 //!   within `SPAWN_BACKUP_TRANSCRIPT_DAYS` (default 14), whole or the bytes
 //!   appended since the base's sizes. The record is a true description of the
 //!   archive: verify refuses a bundle that lists a ref its manifest does not
@@ -1720,7 +1724,7 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
         // empty repository.
         if heads.is_empty() {
             repos_record.push(json!({
-                "source": source, "heads": {}, "refs": 0, "bytes": 0,
+                "source": source, "file": Value::Null, "heads": {}, "refs": 0, "bytes": 0,
                 "unchanged": false, "empty": true,
             }));
             repos_manifest.push(json!({
@@ -1738,23 +1742,6 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
             .find(|repo| repo["source"].as_str() == Some(source))
             .and_then(|repo| repo["heads"].as_object().cloned())
             .unwrap_or_default();
-        let unchanged = !full
-            && base.is_some()
-            && base_heads.len() == heads.len()
-            && heads.iter().all(|(name, commit)| {
-                base_heads.get(name).and_then(Value::as_str) == Some(commit.as_str())
-            });
-        if unchanged {
-            repos_record.push(json!({
-                "source": source, "heads": heads, "refs": refs, "bytes": 0, "unchanged": true,
-            }));
-            repos_manifest.push(json!({
-                "source": source, "file": Value::Null, "heads": heads, "unchanged": true,
-            }));
-            continue;
-        }
-        let name = source_name(source, &mut taken, index);
-        let file = scratch.join(format!("{name}.bundle"));
         let not: Vec<String> = if full {
             Vec::new()
         } else {
@@ -1765,20 +1752,107 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
                 .map(str::to_string)
                 .collect()
         };
+        // What changed against the base, by ref name: `added` (a ref the
+        // base did not have), `moved` (one both have at different commits)
+        // and `removed` (one the base had). An increment's record says it, so
+        // a reader need not diff two records to see what the day did; its
+        // `bundled` list says which of them the archive actually holds.
+        let delta = json!({
+            "added": heads
+                .keys()
+                .filter(|name| !base_heads.contains_key(name.as_str()))
+                .cloned()
+                .collect::<Vec<String>>(),
+            "moved": heads
+                .iter()
+                .filter(|(name, commit)| {
+                    base_heads
+                        .get(name.as_str())
+                        .and_then(Value::as_str)
+                        .is_some_and(|held| held != commit.as_str())
+                })
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<String>>(),
+            "removed": base_heads
+                .keys()
+                .filter(|name| !heads.contains_key(name.as_str()))
+                .cloned()
+                .collect::<Vec<String>>(),
+        });
+        let unchanged = !full
+            && base.is_some()
+            && base_heads.len() == heads.len()
+            && heads.iter().all(|(name, commit)| {
+                base_heads.get(name).and_then(Value::as_str) == Some(commit.as_str())
+            });
+        if unchanged {
+            repos_record.push(json!({
+                "source": source, "file": Value::Null, "heads": heads, "refs": refs,
+                "bytes": 0, "unchanged": true,
+            }));
+            repos_manifest.push(json!({
+                "source": source, "file": Value::Null, "heads": heads, "unchanged": true,
+            }));
+            continue;
+        }
+        // An increment whose refs all point into the base — a tag added at a
+        // commit the base already holds, a branch removed — would write no
+        // bytes, and `git bundle create` refuses to make an empty one. The
+        // run says it by name instead: the entry names the refs that changed
+        // (the delta) and no file, so a reader can tell "the source moved in
+        // a way that needs no bytes" from "the bundle failed".
+        if !full && !bundle_would_write(source, &not)? {
+            repos_record.push(json!({
+                "source": source, "file": Value::Null, "heads": heads, "refs": refs,
+                "bytes": 0, "unchanged": false, "delta": delta, "bundled": [],
+            }));
+            repos_manifest.push(json!({
+                "source": source, "file": Value::Null, "heads": heads, "unchanged": false,
+                "delta": delta, "bundled": [],
+            }));
+            continue;
+        }
+        let name = source_name(source, &mut taken, index);
+        let file = scratch.join(format!("{name}.bundle"));
         git_bundle(source, &file, &not)?;
+        // What the bundle actually holds. An increment says it by name:
+        // `--not` leaves out a ref whose tip the base has, so the manifest's
+        // `heads` is not the same as its ref list, and the drill compares the
+        // bundle with this rather than inferring it from the base.
+        let bundled: Vec<Value> = if full {
+            Vec::new()
+        } else {
+            bundle_refs(&file)?
+                .into_iter()
+                .map(|(commit, name)| json!({"commit": commit, "ref": name}))
+                .collect()
+        };
         let bytes = fs::metadata(&file)
             .map_err(|error| format!("{}: {error}", file.display()))?
             .len();
         let relative = format!("repos/{name}.bundle");
         fs::copy(&file, staging.join(&relative))
             .map_err(|error| format!("{}: {error}", file.display()))?;
-        repos_record.push(json!({
-            "source": source, "heads": heads, "refs": refs, "bytes": bytes,
-            "unchanged": false, "file": relative,
-        }));
-        repos_manifest.push(json!({
-            "source": source, "file": relative, "heads": heads, "unchanged": false,
-        }));
+        // A full bundle holds every head, so its entry needs no `bundled`;
+        // an increment's holds a subset and says which.
+        if full {
+            repos_record.push(json!({
+                "source": source, "file": relative, "heads": heads, "refs": refs,
+                "bytes": bytes, "unchanged": false,
+            }));
+            repos_manifest.push(json!({
+                "source": source, "file": relative, "heads": heads, "unchanged": false,
+            }));
+        } else {
+            repos_record.push(json!({
+                "source": source, "file": relative, "heads": heads, "refs": refs,
+                "bytes": bytes, "unchanged": false, "delta": delta, "bundled": bundled,
+            }));
+            repos_manifest.push(json!({
+                "source": source, "file": relative, "heads": heads, "unchanged": false,
+                "delta": delta, "bundled": bundled,
+            }));
+        }
     }
 
     let manifest = json!({
@@ -1947,6 +2021,61 @@ fn git_bundle(source: &str, file: &Path, not: &[String]) -> Result<(), String> {
         return Err(format!("git bundle create {source}: {}", stderr.trim()));
     }
     Ok(())
+}
+
+/// The refs a bundle file lists, `(commit, ref)` and no `HEAD`: what an
+/// increment's manifest records as `bundled`, so the archive says which refs
+/// it holds instead of a reader inferring them from the base.
+fn bundle_refs(file: &Path) -> Result<Vec<(String, String)>, String> {
+    let mut command = crate::sources::controller_git();
+    command.args(["bundle", "list-heads"]).arg(file);
+    let (ok, stdout, stderr) = output(command, "git bundle list-heads")?;
+    if !ok {
+        return Err(format!(
+            "git bundle list-heads {}: {}",
+            file.display(),
+            stderr.trim()
+        ));
+    }
+    Ok(stdout
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter(|(_, name)| *name != "HEAD")
+        .map(|(commit, name)| (commit.to_string(), name.to_string()))
+        .collect())
+}
+
+/// Whether a bundle of `source`'s branches and tags, but not `not`'s, would
+/// carry anything at all: when it would not (every ref points into the base)
+/// `git bundle create` refuses to make an empty bundle, and an increment says
+/// so by name before it asks (`bundle`). The object listing, not a commit
+/// count: an annotated tag at a commit the base already holds is an object
+/// outside it, and a bundle of just that tag is not empty.
+fn bundle_would_write(source: &str, not: &[String]) -> Result<bool, String> {
+    let mut command = crate::sources::controller_git();
+    command.args([
+        "-C",
+        source,
+        "rev-list",
+        "--objects",
+        "--max-count=1",
+        "--branches",
+        "--tags",
+    ]);
+    if !not.is_empty() {
+        command.arg("--not");
+        for commit in not {
+            command.arg(commit);
+        }
+    }
+    let (ok, stdout, stderr) = output(command, "git rev-list --objects")?;
+    if !ok {
+        return Err(format!(
+            "git rev-list --objects {source}: {}",
+            stderr.trim()
+        ));
+    }
+    Ok(stdout.lines().next().is_some())
 }
 
 /// What the drill restored and where, for its record.
@@ -2261,35 +2390,45 @@ fn verify_bundle(settings: &Settings, store: &PostgresStore, now_ms: i64) -> Res
             ));
         }
         // A full bundle names every head. An increment's bundle lists only
-        // the refs whose tips the base does not hold (`--not` leaves a head
-        // that did not move out), so what it must list is every head that is
-        // new or moved since the base. A bundle that lists nothing is empty.
+        // the refs whose tips the base does not hold (`--not` drops a ref
+        // that did not move, and one whose new commit the base already has),
+        // so its manifest says which refs it holds (`bundled`) and the bundle
+        // must list exactly those — not what a reader, or this drill, would
+        // infer from the base.
         let mut required: Vec<(String, String)> = Vec::new();
         if kind == "full" {
             required.clone_from(&named);
         } else {
-            let base = latest.record["base_event_id"]
-                .as_i64()
-                .and_then(|id| earlier.iter().find(|entry| entry.event_id == id))
-                .and_then(|entry| entry.record["repos"].as_array().cloned())
-                .and_then(|repos| {
-                    repos
-                        .into_iter()
-                        .find(|repo| repo["source"].as_str() == Some(source))
-                });
-            let base_heads = base
-                .as_ref()
-                .and_then(|repo| repo["heads"].as_object())
-                .cloned()
-                .unwrap_or_default();
             required.extend(
-                named
-                    .iter()
-                    .filter(|(commit, name)| {
-                        base_heads.get(name).and_then(Value::as_str) != Some(commit.as_str())
-                    })
-                    .cloned(),
+                repo["bundled"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| {
+                        Some((
+                            entry["commit"].as_str()?.to_string(),
+                            entry["ref"].as_str()?.to_string(),
+                        ))
+                    }),
             );
+            // `bundled` is a subset of `heads`: a ref the bundle holds is one
+            // the source has, at the same commit.
+            let inconsistent: Vec<String> = required
+                .iter()
+                .filter(|pair| !named.contains(*pair))
+                .map(|(commit, name)| format!("{name} at {commit}"))
+                .collect();
+            if !inconsistent.is_empty() {
+                return Err(format!(
+                    "{source}'s manifest records as bundled {} not among its heads",
+                    inconsistent.join(", ")
+                ));
+            }
+            if required.is_empty() {
+                return Err(format!(
+                    "{source}'s bundle in {key} is an increment that holds no ref"
+                ));
+            }
         }
         let missing: Vec<String> = required
             .iter()
