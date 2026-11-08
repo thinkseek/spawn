@@ -91,11 +91,8 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     let (bounds, mut warnings) = dispatch::Bounds::from_env();
     let (waits, more) = crate::deliver::Waits::from_env();
     warnings.extend(more);
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
     let (mut alerting, more) = alerts::Monitor::from_env();
     warnings.extend(more);
-=======
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
     for warning in &warnings {
         eprintln!("spawn loop warning: {warning}");
     }

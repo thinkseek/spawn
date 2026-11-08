@@ -1290,15 +1290,11 @@ create table if not exists mission_tasks (
     -- delivery spent without typing is cancelled and assigned again once,
     -- by the dispatcher (`spawn_task_reissue`); a re-issue is never
     -- re-issued again.
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
     reissue_of      bigint,
     -- The task this one continues (its `task.assigned` names it): the
     -- objective's task after one that went over its budget keeps that
     -- task's work (`task.over_budget`, docs/fleet-architecture.md §10.4).
     continues       bigint
-=======
-    reissue_of      bigint
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
 );
 
 -- Columns added since the first shape of these tables (see spawn_grants).
@@ -1332,10 +1328,7 @@ alter table mission_tasks add column if not exists model text not null default '
     check (model in ('default', 'cheap'));
 alter table mission_tasks add column if not exists held_by bigint;
 alter table mission_tasks add column if not exists reissue_of bigint;
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
 alter table mission_tasks add column if not exists continues bigint;
-=======
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
@@ -1486,21 +1479,13 @@ begin
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
                                    created_by, objective, scenario, model, reissue_of,
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
                                    continues, created_at_ms, updated_at_ms)
-=======
-                                   created_at_ms, updated_at_ms)
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
         values (v_id, (p_record ->> 'mission_id')::bigint, p_record ->> 'kind',
                 p_record ->> 'agent_id', p_record ->> 'session_id', p_record ->> 'brief',
                 p_record ->> 'created_by', (p_record ->> 'objective')::integer,
                 p_record ->> 'scenario', coalesce(p_record ->> 'model', 'default'),
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
                 (p_record ->> 'reissue_of')::bigint, (p_record ->> 'continues')::bigint,
                 p_at, p_at);
-=======
-                (p_record ->> 'reissue_of')::bigint, p_at, p_at);
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
         update mission_missions set state = 'active', updated_at_ms = p_at
          where id = (p_record ->> 'mission_id')::bigint and state = 'open';
     when 'mission.configured' then
@@ -2741,12 +2726,8 @@ begin
     if p_record ->> 'type' is null
        or p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
                                       'task.held', 'source.hold_expired', 'task.cancelled',
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
                                       'source.moved', 'source.push_refused',
                                       'task.over_budget') then
-=======
-                                      'source.moved', 'source.push_refused') then
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
         raise exception 'the integrator does not record %', p_record ->> 'type';
     end if;
     -- The integrator cancels one kind of task: an objective's task in flight
@@ -2763,7 +2744,6 @@ begin
         end if;
         p_record := p_record || jsonb_build_object('by', 'spawn-integrate');
     end if;
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
     -- An overrun names what it measured: its reason, its tool calls and the
     -- budget it ran past (the mission's, as it was). Its branch, commit and
     -- diff stat say what work the objective's next task continues.
@@ -2773,8 +2753,6 @@ begin
             or jsonb_typeof(p_record -> 'budget') is distinct from 'object') then
         raise exception 'a task.over_budget names its reason, tool_calls and budget: %', p_record;
     end if;
-=======
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
     -- The outcome of an owner's landing names its request: a
     -- `source.push_requested` that has no outcome yet, so every request has
     -- at most one. A move names the request's source, where main went from
@@ -2908,10 +2886,7 @@ begin
                               when 'task.landed' then array['landing']
                               when 'task.held' then array['landing']
                               when 'task.aborted' then array['delivered']
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
                               when 'task.over_budget' then array['delivered']
-=======
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
                               when 'task.cancelled' then array['assigned', 'delivered', 'revise']
                               else array['reported', 'accepted', 'landing'] end)) then
         raise exception 'task % is not waiting for %', p_record ->> 'id', p_record ->> 'type';
@@ -3205,7 +3180,6 @@ create index if not exists spawn_events_host_disk
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'host.disk';
 
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
 -- The alert transitions: the loop's `alert.fired` and `alert.cleared`
 -- records (`spawn_alert_record`, owner only), each once per occurrence
 -- (docs/fleet-architecture.md, "Alerts"). The checked writer refuses a
@@ -3274,8 +3248,6 @@ create index if not exists spawn_events_alert
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' in ('alert.fired', 'alert.cleared');
 
-=======
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
 -- The `source.moved` records (deploys), found without reading the rest of
 -- the stream: the dispatcher reads the latest on every step
 -- (`LATEST_SOURCE_MOVED`).

@@ -1081,11 +1081,7 @@ controller. Missions, tasks, residents and landings are events in
   `source.released`, `source.hold_expired`, `task.assigned`,
   `task.delivered`, `task.report_unfinished`, `task.reported`,
   `task.reviewed`, `task.cancelled`, `task.gated`, `task.held`, `task.landed`,
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
   `task.aborted`, `task.over_budget`, `resident.proposed`, `resident.approved`,
-=======
-  `task.aborted`, `resident.proposed`, `resident.approved`,
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
   `resident.retired`, `legacy.imported`, `host.disk`,
   `source.push_requested`, `source.push_refused` (§10.3, "The owner's
   landings"), and the loop's alerts: `alert.fired` and `alert.cleared`
@@ -1234,7 +1230,6 @@ record of what was judged (§14 of design.md).
     reports (`mission_news`) and `spawn_task_review` refuses them, because
     a review could send back the revision the gate is judging. Both stand
     until the Review point is built (§1.1, §9);
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
   - budget: `--minutes` and `--tool-calls`. A delivered task over budget
     keeps its work: its worker is stopped (the Stop is submitted before the
     record, so a failed record is retried with it; a Stop that fails is
@@ -1246,13 +1241,6 @@ record of what was judged (§14 of design.md).
     `task.aborted` keeps its other meaning (a landing gone stale after its
     mission was done); records from before this were overruns recorded as
     aborts, and count toward the abort halt as they were written.
-=======
-  - budget: `--minutes` and `--tool-calls`. A delivered task over budget is
-    aborted (`task.aborted`) and its worker stopped (the Stop is submitted
-    before the record, so a failed record is retried with it; a Stop that
-    fails is pursued and escalated by the dispatcher); an abort counts
-    toward the abort halt, not as a rejection.
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
     The minutes are active time, never the wall clock (`integrate::active_ms`):
     from the delivery, through each event of the task's session, to now.
     Readings are no events here: the Bridge re-reads a busy pane every
@@ -1756,13 +1744,9 @@ record of what was judged (§14 of design.md).
     `incompatible`, or `conflict` when the worker got conflicts to resolve
     (the record's `merge` is `marked`, `unmarked` or `pending`, or absent on
     records from before it was named; not `not_mounted`, `busy`, `failed`
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
     or a clean merge). A budget overrun is not one: it says the task is
     bigger than its budget, not that the work failed, and it is handled on
     its own (below). The host's outcomes
-=======
-    or a clean merge), or an abort over budget. The host's outcomes
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
     (`no_room`, `host_fault`, a gate `aborted`) count for nothing, as for
     the halt rules, and an `accepted` verdict ends the count. Once an
     objective has `SPAWN_OBJECTIVE_ATTEMPTS` (3, a whole number from 1)
@@ -1775,20 +1759,11 @@ record of what was judged (§14 of design.md).
     any other cancel by the integrator). Its work is set aside like any
     cancel's, no halt counts it, the supervisor's digest tells it once
     (`missions objective-yielded-<event id>`), and a resident's cancel
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
     notice gives the reason, and records from before an overrun was its
     own record still count as they were written (an abort over budget that
     was its objective's limit-th failed attempt carried `yielded`, the
     count and a `yield_reason`). The objective goes to the back of the
     queue. A task whose gate runs now, or that this pass
-=======
-    notice gives the reason. An abort over budget that is the objective's
-    limit-th failed attempt is the yield itself: its `task.aborted` carries
-    `yielded`, the count and a `yield_reason`, and is told the same way
-    (otherwise the objective kept its failures and no yield, sorted ahead,
-    and its next task yielded at once). The objective goes to the back of
-    the queue. A task whose gate runs now, or that this pass
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
     aborted, does not yield; the slot an abort frees is filled from the
     next pass on, fewest attempts first, so the aborted objective is not
     re-issued at once. Before this, on 2026-11-07, three objectives whose
@@ -1833,7 +1808,6 @@ record of what was judged (§14 of design.md).
     names no branch: a worker has no `.git` and cannot read one. The first
     prompt of a forked task (below) says its workspace already contains
     that work.
-<<<<<<< 7ce096a9090cfdde2c17be1de54ba72911bc18e3
   - **A task over its budget keeps its work.** The integrator stops a
     delivered task over its mission's budget and records
     `task.over_budget` {`reason`, `tool_calls`, `elapsed_ms`, `budget` (the
@@ -1869,8 +1843,6 @@ record of what was judged (§14 of design.md).
     mission's other objectives take the freed slot. A third overrun after
     such a configure is treated as a first. Everything is read from the
     records (§14), never from the integrator's memory.
-=======
->>>>>>> 0a705641fb3ff1720ab4e26d344e7b15c7f604bd
   - **An ephemeral task starts from that work.** When the newest earlier
     task of its objective that ended without landing left work (a
     checkpoint of its own while it ran, before its set-aside if it was a
