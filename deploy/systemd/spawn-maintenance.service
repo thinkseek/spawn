@@ -1,0 +1,24 @@
+[Unit]
+Description=Spawn: routine cleanup of what Spawn writes (the gate's leftover scratch, old deploy dumps)
+After=spawn-loop.service
+
+[Service]
+Type=oneshot
+# Run from the controller, the deployed commit's tree, like the gate (scripts/
+# is protected: no candidate changes it; an owner edit runs once deployed).
+# It sources scripts/disk.sh beside it.
+WorkingDirectory=%h/.local/share/spawn-rsi
+# Through sh: the controller is a git export, so a file mode never decides
+# whether the cleanup runs.
+ExecStart=/bin/sh %h/.local/share/spawn-rsi/controllers/spawn/scripts/maintenance.sh
+# TMPDIR (the integrator's, so the gate's scratch is found), SPAWN_BACKUP_DIR
+# and any SPAWN_MAINTENANCE_*.
+EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Scratch older than 3 h is a dead gate's: no gate runs longer (the
+# integrator's wall clock, SPAWN_GATE_WALL_CLOCK_MINUTES, is 120 min by
+# default; keep it below this age).
+Environment=SPAWN_MAINTENANCE_SCRATCH_AGE_MIN=180
+TimeoutStartSec=1h
+Nice=10
+IOSchedulingClass=idle

@@ -1,0 +1,23 @@
+[package]
+name = "spawn-postgres"
+description = "PostgreSQL Event Log, leased command queue and SQL views for Spawn."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+spawn-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+postgres.workspace = true
+postgres-protocol.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+
+[dev-dependencies]
+spawn-core = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[Unit]
+Description=Spawn: hourly routine cleanup (scripts/maintenance.sh)
+
+[Timer]
+# Hourly: a gate killed outright (SIGKILL: a timeout, an interrupted run)
+# leaves its scratch, 1.6 GB each, which no trap can remove; a day of them
+# filled the disk. A run missed while the host was off happens at boot.
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
