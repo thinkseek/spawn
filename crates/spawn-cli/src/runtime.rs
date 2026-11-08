@@ -80,12 +80,6 @@ fn bridge_config() -> Result<BridgeConfig, String> {
     config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
     config.claude_projects = claude_projects();
     config.model_relay = model_relay();
-<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
-    // A workspace builds against the deps store at SUPPLY_PA_DEPS
-    // (`gate/scenarios/build`); the pane's engine runs the build, so it gets
-    // the path. Unset, the store's default under $HOME stands.
-    config.environment.extend(supply_pa_env(env_value));
-=======
     config.screen_quiet = std::time::Duration::from_millis(
         env_value("SPAWN_SCREEN_QUIET_MS")
             .and_then(|text| text.parse().ok())
@@ -101,7 +95,10 @@ fn bridge_config() -> Result<BridgeConfig, String> {
              every pass"
         ),
     }
->>>>>>> b0bb7dfd2da8da802e15481c6220190c57a76dcd
+    // A workspace builds against the deps store at SUPPLY_PA_DEPS
+    // (`gate/scenarios/build`); the pane's engine runs the build, so it gets
+    // the path. Unset, the store's default under $HOME stands.
+    config.environment.extend(supply_pa_env(env_value));
     // A worker's pane gets no database login: the Bridge reads what the
     // engine does from its files and screen. The supervisor's pane gets its
     // own login: it reads the fleet and commands workers through the
