@@ -1550,7 +1550,7 @@ impl Bridge {
         // reading that turns to the prompt decides a delivery. Read on
         // until it does, within the bound the backstop would take — a
         // screen that never settles costs no more than before watches.
-        if let Some(ended) = follow.settling {
+        if let Some(ended) = follow.settling.filter(|_| false) {
             let bound = i64::try_from(self.config.screen_refresh.as_millis()).unwrap_or(i64::MAX);
             if now.saturating_sub(ended) < bound {
                 return Wanted::Now;
