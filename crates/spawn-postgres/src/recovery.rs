@@ -52,6 +52,24 @@ where (s.agent_id like 'agent\_worker\_%' or s.agent_id like 'agent\_resident\_%
                                      and c.kind -> 'detail' -> 'record' ->> 'execution_id' = s.execution_id))
   )";
 
+/// Whether the log holds, above `$1` (an event id), a record the recovery
+/// reads: a failed turn, a tool call or turn (its progress), an execution's
+/// end, a native session's start, a commit's head, one of its own
+/// interruption or clear records, or a task's over-budget Stop. The loop
+/// asks this once before reading every session's facts, so a pass whose
+/// watermark moved on some other event (a screen, a delivery) costs one
+/// index range read and nothing more.
+pub(crate) const RECOVERY_SIGNALS: &str = r"
+select exists (
+  select 1 from spawn_events e
+   where e.id > $1
+     and (e.event_name in ('turn.failed', 'tool.started', 'tool.completed', 'turn.stopped',
+                           'execution.ended', 'session.native_started', 'artifact.committed')
+          or (e.event_name = 'control.recorded'
+              and e.kind -> 'detail' -> 'record' ->> 'type' in
+                  ('execution.interrupted', 'execution.cleared', 'task.over_budget',
+                   'host.loop_started'))))";
+
 /// One session's facts, as `recovery_facts` returns them. `$1` session.
 ///
 /// - `execution`: the session's latest execution — its id, start, end, the
@@ -231,6 +249,12 @@ impl PostgresStore {
     /// The sessions the recovery looks at ([`RECOVERY_SESSIONS`]).
     pub fn recovery_sessions(&self) -> Result<Value, StoreError> {
         self.query_json(RECOVERY_SESSIONS, &[&RECENT_MS])
+    }
+
+    /// Whether an event above `after` is one the recovery reads
+    /// ([`RECOVERY_SIGNALS`]).
+    pub fn recovery_signals(&self, after: i64) -> Result<bool, StoreError> {
+        Ok(self.query_one(RECOVERY_SIGNALS, &[&after])?.get(0))
     }
 
     /// One session's recovery facts ([`RECOVERY_FACTS`]).
