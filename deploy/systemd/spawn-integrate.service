@@ -1,0 +1,29 @@
+[Unit]
+Description=Spawn integrator (spawn integrate): lands gated missions' work, assigns objectives (RSI)
+After=spawn-loop.service docker.service
+Wants=spawn-loop.service
+
+[Service]
+# Not the owner's checkout: nothing live reads it (deploy/deploy.sh).
+WorkingDirectory=%h/.local/share/spawn-rsi
+EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
+Environment=PATH=%h/.cargo/bin:%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=http_proxy=http://127.0.0.1:10801 https_proxy=http://127.0.0.1:10801 HTTP_PROXY=http://127.0.0.1:10801 HTTPS_PROXY=http://127.0.0.1:10801
+Environment=no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
+Environment=SPAWN_PROGRAM=%h/.local/share/spawn-rsi/bin/spawn
+# The gate comes from the controller, the deployed commit's tree (switched by
+# deploy/deploy.sh, deploy/controller.sh), never from a tree under test nor
+# from the owner's checkout. The integrator resolves the symlink once per
+# step, so a gate runs with one commit's gate.sh and scenarios.
+Environment=SPAWN_GATE=%h/.local/share/spawn-rsi/controllers/spawn/scripts/rsi/gate.sh
+# Its gate environment for the deploy's base-only gate (deploy.sh,
+# warm_base_cache): the integrator is not dumpable, so /proc/<pid>/environ
+# is unreadable; this 0600 file under ~/.config/spawn is what the deploy reads.
+Environment=SPAWN_GATE_ENV_FILE=%h/.config/spawn/gate-env
+ExecStart=%h/.local/share/spawn-rsi/bin/spawn integrate
+# A halt is per mission and recorded in the log; the process keeps running.
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

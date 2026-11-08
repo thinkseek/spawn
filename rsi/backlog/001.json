@@ -1,0 +1,4 @@
+{
+  "id": 1,
+  "prompt": "Add a `version` subcommand to the `spawn` binary. Running `spawn version` must print exactly one line to standard output, starting with `spawn ` followed by the crate version taken from Cargo.toml, and must exit with code 0. Every existing subcommand must keep working unchanged."
+}
