@@ -58,14 +58,17 @@
 #       file whole (offset 0), nothing of the unchanged one; a git bundle of
 #       spawn.git with prerequisites that, fetched after the full one's,
 #       gives exactly the source's branches, and other.git `unchanged`; the
-#       full bundle and the increment give the window back byte for byte.
+#       full bundle and the increment give the window back byte for byte. A
+#       drill after the full bundle exits 0 and records `.bundle.kind` full.
 #   (4) After more records (the database now holds more events than the
 #       dump), `spawn backup verify` exits 0 and records `backup.verified`
 #       ok, naming the newest dump's key and its record's event id, with the
 #       restored `events` and `max_event_id` equal to that record's (not to
 #       the database's now); it restored into a database it created (named
 #       in the record, absent before and after), never the source, whose
-#       other records did not change, and names no password.
+#       other records did not change, and names no password; `.bundle` is
+#       the newest bundle opened — a full one, or the increment unless the
+#       ISO week turned between the two bundles.
 #   (5) Without SPAWN_BACKUP_DRILL_DATABASE_URL the drill refuses (exit 2,
 #       `backup.verified` not ok, the setting named) and touches the source
 #       not. With the newest dump's stored objects corrupted (one byte
@@ -885,6 +888,15 @@ named=$(field "$bun" '[.repos[]?.source] | sort | join(" ")')
     measured_fail "(3) the record names the sources [$named], not the two missions' $src_spawn and $src_other"
 echo "031: full bundle: $(field "$bun" '.stored_bytes') bytes stored for $bytes bytes of transcripts and two sources, in $bundle_ms ms"
 
+# The drill opens the newest bundle too: now it is the full one.
+backup verify SPAWN_BACKUP_DRILL_DATABASE_URL="$DRILL_URL"
+[ "$status" -eq 0 ] ||
+    fail "(3) \`spawn backup verify\` after the full bundle exited $status: $(err | tail -n 1)"
+ver_full=$(newest backup.verified)
+[ "$(field "$ver_full" '.ok')" = true ] && [ "$(field "$ver_full" '.bundle.checked')" = true ] &&
+    [ "$(field "$ver_full" '.bundle.kind')" = full ] && [ "$(field "$ver_full" '.bundle.key')" = "$(field "$bun" '.keys[0]')" ] ||
+    measured_fail "(3) the drill after the full bundle recorded $(field "$ver_full" '.bundle // empty' | head -c 300), not the full bundle $bkey opened as kind full"
+
 # The archive grows (one file appended to, one new), the agent's branch
 # moves, other.git does not: the next bundle the same day is an increment.
 sup=agent_supervisor/0b7e3c52-5d1e-4c1a-9a36-1f0c6f2d0001.jsonl
@@ -997,6 +1009,10 @@ ver=$(newest backup.verified)
 [ "$(field "$ver" '.events') $(field "$ver" '.max_event_id')" = "$(field "$latest" '.events') $(field "$latest" '.max_event_id')" ] &&
     [ "$(field "$ver" '.expected.events') $(field "$ver" '.expected.max_event_id')" = "$(field "$latest" '.events') $(field "$latest" '.max_event_id')" ] ||
     measured_fail "(4) the drill restored events [$(field "$ver" '.events')] max id [$(field "$ver" '.max_event_id')], expected [$(field "$ver" '.expected' | tr -d ' \n')]; the dump's record says $(field "$latest" '.events') and $(field "$latest" '.max_event_id') (the database now: $now_events)"
+want_kind=incremental
+if [ "$(date -u +%G%V)" != "$week1" ]; then want_kind=full; fi
+[ "$(field "$ver" '.bundle.checked')" = true ] && [ "$(field "$ver" '.bundle.kind')" = "$want_kind" ] ||
+    measured_fail "(4) the drill recorded bundle [$(field "$ver" '.bundle | {checked, kind, key}' | tr -d ' \n')], not the newest bundle ($want_kind)"
 scratch=$(field "$ver" '.database // empty')
 case "$scratch" in
 "" | "$SPAWN_DB_NAME" | postgres | template* | *[!A-Za-z0-9_]*)
