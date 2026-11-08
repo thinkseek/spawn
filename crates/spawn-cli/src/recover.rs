@@ -2595,6 +2595,86 @@ mod tests {
         );
     }
 
+    /// A full disk's tool failure is an interruption of its own: the engine
+    /// ends the turn with Claude Code's ENOSPC message and waits at its
+    /// prompt, and no failed turn or end says so. Any other failed tool is
+    /// the work's, and no fact at all.
+    #[test]
+    fn a_full_disks_tool_failure_is_a_fact_and_the_earliest_one_wins() {
+        let full = ToolFailure {
+            event_id: 55,
+            at_ms: 1_000,
+            text: "Disk full: a test write failed with ENOSPC (the volume, or the user's quota \
+                   on it, has no space left)"
+                .to_string(),
+        };
+        assert_eq!(full.cause(), Some(Cause::DiskFull));
+        let other = ToolFailure {
+            event_id: 56,
+            at_ms: 1_100,
+            text: "exit 1".to_string(),
+        };
+        assert_eq!(other.cause(), None, "a failed tool is the work's");
+        let execution = execution(Some(2_000));
+        // The disk's failure is the next fact, ahead of the end at 90.
+        match pending(&[], &[], std::slice::from_ref(&full), &execution, &[], &[]) {
+            Some(super::Fact::Tool(tool)) => assert_eq!(tool.event_id, 55),
+            _ => panic!("the disk's tool failure"),
+        }
+        // An ordinary failed tool explains nothing: the end is next.
+        match pending(&[], &[], std::slice::from_ref(&other), &execution, &[], &[]) {
+            Some(super::Fact::End(end)) => assert_eq!(end.event_id, 90),
+            _ => panic!("the end"),
+        }
+        // The first of a failed turn and a disk failure in the log is the
+        // fact, whichever it is.
+        let earlier = Turn {
+            event_id: 50,
+            ..turn(Some(529), Some("overloaded"), "API Error: 529")
+        };
+        assert!(matches!(
+            pending(
+                &[],
+                std::slice::from_ref(&earlier),
+                std::slice::from_ref(&full),
+                &execution,
+                &[],
+                &[]
+            ),
+            Some(super::Fact::Turn(_))
+        ));
+        let later = Turn {
+            event_id: 60,
+            ..turn(Some(529), Some("overloaded"), "API Error: 529")
+        };
+        assert!(matches!(
+            pending(
+                &[],
+                std::slice::from_ref(&later),
+                std::slice::from_ref(&full),
+                &execution,
+                &[],
+                &[]
+            ),
+            Some(super::Fact::Tool(_))
+        ));
+    }
+
+    /// While a disk_full wait is open the free space is read again every
+    /// `SPAWN_RECOVER_PROBE_SECS` (the soak's 2 s), not once a minute: the
+    /// loop's next pass is due at the probe, and the clear is that reading.
+    #[test]
+    fn a_disk_wait_is_re_read_every_probe_not_once_a_minute() {
+        let mut state = Recovery::new();
+        state.open_waits = true;
+        let now = 1_000_000;
+        assert_eq!(
+            state.next_due(2_000, now),
+            Some(now + 2_000),
+            "the wait's cause is re-read at the probe"
+        );
+    }
+
     #[test]
     fn an_open_wait_explains_its_execution_until_a_person_stops_it() {
         let execution = execution(Some(2_000));
