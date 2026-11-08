@@ -2990,57 +2990,16 @@ begin
     end if;
     -- A host fault names its evidence (§14): the failures the gate printed,
     -- each the host's, and, when the test database's log decided it, the
-<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
-=======
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
->>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
     -- crash lines stamped inside the gate's window (`failures`,
     -- `server_log`); the base's own disagreement (objective 033's
-    -- `base_disagrees`, with its scenario, both exits and its run); or the
+    -- `base_disagrees`, with its scenario, both exits and its run); the
     -- gate's own fact (`gate`: a scenario's harness error on the base, or a
     -- check failing on the candidate and the base, naming the scenario and
-    -- where); and its backoff.
-    if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
-       and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log',
-<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
-                                                          'base_disagrees', 'gate',
-                                                          'cannot_judge')
-=======
-                                                          'base_disagrees', 'gate')
->>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
-            or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
-            or (p_record ->> 'evidence' in ('failures', 'server_log')
-                and (case when jsonb_typeof(p_record -> 'failures') = 'array'
-                          then jsonb_array_length(p_record -> 'failures') else 0 end = 0
-                     or (p_record ->> 'evidence' = 'server_log'
-                         and case when jsonb_typeof(p_record -> 'crash') = 'array'
-                                  then jsonb_array_length(p_record -> 'crash') else 0 end = 0)))
-            or (p_record ->> 'evidence' = 'base_disagrees'
-                and (coalesce(p_record ->> 'scenario', '') !~ '^[^[:space:]|]+$'
-                     or jsonb_typeof(p_record -> 'exits') is distinct from 'array'
-                     or jsonb_array_length(p_record -> 'exits') <> 2
-                     or p_record -> 'exits' ->> 0 is distinct from '1'
-                     or p_record -> 'exits' ->> 1 is distinct from '0'
-                     or jsonb_typeof(p_record -> 'base_disagrees') is distinct from 'number'
-                     or jsonb_typeof(p_record -> 'alert') is distinct from 'boolean'
-                     or p_record ->> 'escalate' is distinct from 'false'
-                     or (p_record ? 'setup_s'
-                         and jsonb_typeof(p_record -> 'setup_s') is distinct from 'number')))
-            or (p_record ->> 'evidence' = 'gate'
-                and (coalesce(p_record -> 'fact' ->> 'scenario', '') !~ '^[^[:space:]|]+$'
-<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
-                     or coalesce(p_record -> 'fact' ->> 'on', '') not in ('base', 'candidate and base')))
-            or (p_record ->> 'evidence' = 'cannot_judge'
-                and (coalesce(p_record ->> 'scenario', '') !~ '^[^[:space:]|]+$'
-                     or jsonb_typeof(p_record -> 'escalate') is distinct from 'boolean'))) then
-=======
-                     or coalesce(p_record -> 'fact' ->> 'on', '') not in ('base', 'candidate and base')))) then
->>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
-        raise exception 'a host_fault verdict names its evidence, its facts and backoff_ms: %',
-=======
-    -- crash lines stamped inside the gate's window; and its backoff. One its
-    -- own resource envelope killed (objective 029) names `memory_limit`, the
-    -- scope it ran in, its memory_max and its oom_kills (above 0) instead.
+    -- where); the host's inability to judge the objective at all
+    -- (`cannot_judge`, 029 in the gate's sandbox); and its backoff. One a
+    -- gate's own resource envelope killed (objective 029) names
+    -- `memory_limit`, the scope it ran in, its memory_max and its
+    -- oom_kills (above 0) instead.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
        and (case
              when p_record ->> 'evidence' = 'memory_limit' then
@@ -3061,6 +3020,14 @@ begin
                or p_record ->> 'escalate' is distinct from 'false'
                or (p_record ? 'setup_s'
                    and jsonb_typeof(p_record -> 'setup_s') is distinct from 'number')
+             when p_record ->> 'evidence' = 'gate' then
+               coalesce(p_record -> 'fact' ->> 'scenario', '') !~ '^[^[:space:]|]+$'
+               or coalesce(p_record -> 'fact' ->> 'on', '') not in ('base', 'candidate and base')
+               or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
+             when p_record ->> 'evidence' = 'cannot_judge' then
+               coalesce(p_record ->> 'scenario', '') !~ '^[^[:space:]|]+$'
+               or jsonb_typeof(p_record -> 'escalate') is distinct from 'boolean'
+               or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
              when p_record ->> 'evidence' in ('failures', 'server_log') then
                case when jsonb_typeof(p_record -> 'failures') = 'array'
                     then jsonb_array_length(p_record -> 'failures') else 0 end = 0
@@ -3072,7 +3039,6 @@ begin
            end) then
         raise exception 'a host_fault verdict names its evidence, its facts and backoff_ms '
                         '(or, killed by its memory limit, its scope, memory_max and oom_kills): %',
->>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
                         p_record;
     end if;
     -- No room to judge names what it measured: the check that fell short

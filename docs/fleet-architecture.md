@@ -1197,7 +1197,6 @@ the tree's own:
   gate's `TMPDIR`), or the integrator could not create or use its private
   directory for the gate (it measures that directory's parent). It exits 6
   with a host-fault fact (a scenario's harness error on the base, or a
-<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
   check failing on the candidate and the base): `host_fault`, §10.3. It
   also exits 6, the same status, with a scenario's own `cannot_judge` fact
   (a scenario that says this host cannot judge it at all: 029, whose
@@ -1209,10 +1208,6 @@ the tree's own:
   fact: `host_fault` with the evidence `cannot_judge`, never a rejection and
   never an abort (§10.3). Exit 6 with neither fact is an abort, as is any
   other status: exit 3 (no bwrap, a missing bind directory, an unreadable
-=======
-  check failing on the candidate and the base): `host_fault`, §10.3. Any
-  other status is an abort: exit 3 (no bwrap, a missing bind directory, an unreadable
->>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
   `TMPDIR`, a floor that is not whole GiB), exit 4 (a run the gate lost:
   ended without a result),
   a timeout or a signal. The integrator measures the same floor, free
@@ -1545,7 +1540,6 @@ are per-agent uids or a mount per engine.
      pair of lines named in the record (`scenario`, `exits`), never on the
      reason's text, on time or on a scenario's name; the wait rests on the
      recorded `due_ms`.
-<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
      **A scenario the host cannot judge is the host's, not the work.** Some
      objectives judge the host itself, and the gate's sandbox can never
      supply what they need: 029 needs a systemd user manager that delegates
@@ -1565,8 +1559,6 @@ are per-agent uids or a mount per engine.
      7). Which objectives the gate cannot judge is said in
      deploy/systemd/README.md ("Which objectives the gate cannot judge") and
      in each scenario's header.
-=======
->>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
      The gate reports host faults of its own too: exit 6 with its fact in
      the verdict file (`{"host_fault":true,"scenario","on","runs",
      "reason"}`, gate.rs `HOST_FAULT_EXIT`), for a scenario's harness error

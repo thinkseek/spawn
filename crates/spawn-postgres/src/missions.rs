@@ -615,16 +615,10 @@ select coalesce(jsonb_agg(jsonb_build_object(
 
 /// [`PostgresStore::task_host_faults`]: a task's `host_fault` verdicts at
 /// one report revision, but a base-only one: the gate's fact with `on`
-<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
 /// `base` (a scenario's harness error before any candidate code ran),
 /// objective 033's `base_disagrees`, or the `cannot_judge` a scenario says
 /// of a host that cannot judge it at all (029). Those count toward no halt,
 /// so they never count toward the cap either.
-=======
-/// `base` (a scenario's harness error before any candidate code ran), or
-/// objective 033's `base_disagrees`. Those count toward no halt, so they
-/// never count toward the cap either.
->>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
 pub(crate) const TASK_HOST_FAULTS: &str = r"
 select count(*)
   from spawn_events e
@@ -634,12 +628,8 @@ select count(*)
    and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
    and e.kind -> 'detail' -> 'record' ->> 'revision' = $2
    and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') <> 'base'
-<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
    and coalesce(e.kind -> 'detail' -> 'record' ->> 'evidence', '') not in
        ('base_disagrees', 'cannot_judge')";
-=======
-   and coalesce(e.kind -> 'detail' -> 'record' ->> 'evidence', '') <> 'base_disagrees'";
->>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
 
 /// The work an ephemeral objective task starts from: the newest earlier
 /// task of its objective that ended without landing (cancelled, aborted or
