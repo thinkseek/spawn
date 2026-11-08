@@ -1644,6 +1644,11 @@ impl Bridge {
         active.follow.last_capture = Some(now);
         active.follow.unread_since = None;
         let reading = read_claude_screen(&pane);
+        // A reading that accepts input is the screen showing the turn over:
+        // what a turn's end in the transcript was waiting for.
+        if reading.state.accepts_input() {
+            active.follow.settling = None;
+        }
         let confirmed = active.follow.seen == Some(reading.state);
         active.follow.seen = Some(reading.state);
         let due = match active.follow.screen {
