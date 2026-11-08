@@ -813,9 +813,7 @@ mod tests {
             "{why}"
         );
         // A dead pane (remain-on-exit) hosts nothing, whatever it ran.
-        let dead = launched
-            .replacen('0', "1", 1)
-            .replacen("||", "|137|", 1);
+        let dead = launched.replacen('0', "1", 1).replacen("||", "|137|", 1);
         let Runner::Untracked(why) = runner_of(&terminal, &dead) else {
             panic!("a dead pane hosts no runner");
         };
