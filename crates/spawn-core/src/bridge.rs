@@ -970,7 +970,6 @@ impl Bridge {
                 self.queue.release(claimed, self.config.input_wait_retry)?;
             }
         }
-<<<<<<< f05915f5a98fa3cf6e3db78ce9a1a5ee14801f84
         let left = report.commands >= self.config.max_commands_per_tick;
         Ok((report, left))
     }
@@ -987,7 +986,6 @@ impl Bridge {
     /// (objective 025 gives that schedule its own bounds).
     pub fn poll(&mut self) -> Result<TickReport, StoreError> {
         let mut report = TickReport::default();
-=======
         self.backstops.store(0, std::sync::atomic::Ordering::SeqCst);
         // What changed in the engines' files since the last pass: a
         // transcript or an exit status is read when it is here, not on every
@@ -1002,7 +1000,6 @@ impl Bridge {
         // terminal killed from outside ends its execution as lost on the
         // next pass, as before, without a tmux call per agent.
         self.runners = self.fleet_runners();
->>>>>>> 8f0a8010c56bceca9c335f98b07cd777f7f6b217
         self.act(&mut report)?;
         Ok(report)
     }
