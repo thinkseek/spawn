@@ -558,6 +558,7 @@ impl TerminalHost for TmuxHost {
             "-F".to_string(),
             format!("#{{session_name}}\t{PANE_STATE}"),
         ])?;
+        eprintln!("DEBUG runners code={:?} stdout={:?} stderr={:?}", run.code, run.stdout, run.stderr);
         match run.code {
             Some(0) => {}
             // No server, no session: every terminal is gone.
