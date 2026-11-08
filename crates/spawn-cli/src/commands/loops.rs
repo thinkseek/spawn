@@ -209,14 +209,16 @@ impl Step {
         self.mark
     }
 
+    /// Record that the step saw `watermark` and had nothing to do: its own
+    /// clock, an open wait's probe, keeps the time it had.
+    fn advance(&mut self, watermark: i64) {
+        self.mark = Some(watermark);
+    }
+
     /// Whether the step's own clock has reached its due time, whatever the
     /// log says: an open wait's probe, or a retry a record named.
     fn clock_due(&self, now_ms: i64) -> bool {
         self.due.is_some_and(|due| due <= now_ms)
-    }
-
-    fn due_debug(&self) -> Option<i64> {
-        self.due
     }
 }
 
@@ -676,18 +678,6 @@ impl Fleet<'_> {
         }
     }
 
-    fn debug(line: &str) {
-        if std::env::var("SPAWN_RECOVER_DEBUG").is_ok() {
-            use std::io::Write as _;
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/t203/recover-debug.log")
-            {
-                let _ = writeln!(file, "{line}");
-            }
-        }
-    }
     /// The recovery's step: record every interruption once, with its cause
     /// and its evidence, and take the one way back that cause has. The
     /// dispatcher's one-resume rule and the liveness rule's revival give way
@@ -713,11 +703,6 @@ impl Fleet<'_> {
         if !self.schedule.recovery.runs(watermark, now) && !pending_outage {
             return;
         }
-        Self::debug(&format!(
-            "check mark={:?} watermark={watermark} due={:?} now={now} outage={pending_outage}",
-            self.schedule.recovery.mark(),
-            self.schedule.recovery.due_debug()
-        ));
         let forced = self.schedule.recovery.clock_due(now) || pending_outage;
         let signals = if forced {
             true
@@ -745,13 +730,6 @@ impl Fleet<'_> {
                     };
                     match crate::recover::step(&mut self.recovery, &world) {
                         Ok(more) => {
-                            Self::debug(&format!(
-                                "ran now={now} probing={} due={:?}",
-                                self.recovery.probing(),
-                                self.recovery
-                                    .probing()
-                                    .then(|| now.saturating_add(self.config.probe))
-                            ));
                             lines.extend(more);
                             // An open wait is re-read every probe (the
                             // credentials file, the free space, a retry's
@@ -772,8 +750,8 @@ impl Fleet<'_> {
             }
         } else if self.schedule.recovery.runs(watermark, now) {
             // Nothing the recovery reads moved: it acts on the watermark
-            // this pass and waits for the next record it reads.
-            self.schedule.recovery.ran(watermark, None);
+            // this pass and keeps the probe time an open wait already had.
+            self.schedule.recovery.advance(watermark);
         }
     }
 
