@@ -1566,24 +1566,31 @@ pub(crate) fn host_fault_cap(text: Option<&str>) -> u32 {
         .unwrap_or(HOST_FAULT_CAP)
 }
 
-/// Whether a gate `host_fault` record's fields say the fault is the base's
-/// alone (the gate's fact with `on` `base`: a scenario's harness error
-/// before any candidate code ran). Those never count toward a halt, so the
-/// cap neither counts nor caps them ([`HOST_FAULT_CAP`]).
+/// Whether a gate `host_fault` record's fields say the fault is not the
+/// candidate's doing: the base's alone (the gate's fact with `on` `base`: a
+/// scenario's harness error before any candidate code ran), or a check that
+/// failed on the base as well as on the candidate (`on` `candidate and
+/// base`: main fails it without the candidate). Those never count toward a
+/// halt, so the cap neither counts nor caps them ([`HOST_FAULT_CAP`]).
 fn base_only_fault(fields: &Value) -> bool {
     // Objective 033's evidence is a base that disagreed with itself, before
     // any candidate code; the gate's own fact names `on` `base`; the
     // `cannot_judge` a scenario says of a host that cannot judge it at all
-    // (029) is no fault of the work either. No one of them counts toward the
-    // cap nor is ever capped.
+    // (029) is no fault of the work either. A check failing on the base too
+    // is main's failure, whatever the candidate does: a red main (Supply PA's
+    // check-tests, 2026-11-09 00:48-03:42) would otherwise cap every task's
+    // next gate as an abort and feed the abort halt. No one of them counts
+    // toward the cap nor is ever capped.
     matches!(
         fields.get("evidence").and_then(Value::as_str),
         Some(BASE_DISAGREES | CANNOT_JUDGE)
-    ) || fields
-        .get("fact")
-        .and_then(|fact| fact.get("on"))
-        .and_then(Value::as_str)
-        == Some("base")
+    ) || matches!(
+        fields
+            .get("fact")
+            .and_then(|fact| fact.get("on"))
+            .and_then(Value::as_str),
+        Some("base" | "candidate and base")
+    )
         // A sandbox that never started in the base's tree or the gate's own
         // (the socket scan): before any candidate code ran, as on the base.
         || fields.get("fact").is_some_and(|fact| {
@@ -2443,10 +2450,11 @@ impl Judge {
         let flakes: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
         let gated = |verdict: &str, extra: Value| -> Result<(), String> {
             // A host fault past the cap for this revision counts as an abort
-            // ([`HOST_FAULT_CAP`]). Only a fault judged after the candidate
-            // ran does: a base-only one (the gate's fact `on` `base`) comes
-            // before any candidate code and counts toward no halt, so it
-            // never reaches the cap and is never capped.
+            // ([`HOST_FAULT_CAP`]). Only a fault that may be the candidate's
+            // does: a base-only one (the gate's fact `on` `base`) comes
+            // before any candidate code, and one on the candidate and the
+            // base fails on main too; neither counts toward a halt, so
+            // neither reaches the cap nor is ever capped.
             let (verdict, extra) = if verdict == "host_fault" && !base_only_fault(&extra) {
                 let faults = store
                     .task_host_faults(task.id, i64::from(task.revisions))
@@ -10330,9 +10338,12 @@ mod database_tests {
     /// `host_fault`: it counts toward the abort halt, as the next one does.
     #[test]
     fn host_faults_past_the_cap_on_one_revision_count_as_aborts() {
-        let gate = "echo '| == regression: check-e2e.sh must still pass'\n\
-                    printf '{\"host_fault\":true,\"scenario\":\"check-e2e.sh\",\"on\":\"candidate and base\",\"runs\":\"1, then 1 on the candidate; 1 on the base\",\"reason\":\"check-e2e.sh failed twice on the candidate and on the base\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
-                    exit 6\n";
+        // A host fault the cap counts: check-tests.sh's failures, every one
+        // a connection error to the test database (evidence `failures`).
+        let gate = "echo '| == regression: check-tests.sh must still pass'\n\
+                    echo '| FAILED api::tests::one: error connecting to server: Connection refused (os error 111)'\n\
+                    echo '| stage gate rejected 5ms regression: check-tests.sh must still pass'\n\
+                    printf '{\"verdict\":\"rejected\",\"reason\":\"regression: check-tests.sh fails on the candidate\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
         let (base, source, scenarios, mut integrator) = world("gate-fault-cap", gate);
         integrator.judge.host = super::HostSettings {
             server_log: None,
@@ -10376,12 +10387,15 @@ mod database_tests {
             reason.contains(&format!("task {task} has had 2 at report revision 0"))
                 && reason.contains("SPAWN_GATE_HOST_FAULT_CAP allows is 2")
                 && reason.contains("counts as an abort")
-                && reason.contains("check-e2e.sh failed on the candidate and on the base")
+                && reason.contains("is a connection error to the test database")
                 && !reason.contains("judged again"),
             "{reason}"
         );
-        assert_eq!(third["host_fault"]["evidence"], "gate", "{third}");
-        assert_eq!(third["host_fault"]["fact"]["scenario"], "check-e2e.sh");
+        assert_eq!(third["host_fault"]["evidence"], "failures", "{third}");
+        assert_eq!(
+            third["host_fault"]["failures"][0]["test"],
+            "api::tests::one"
+        );
         assert!(third["log"].is_string(), "{third}");
         let after = gated(&db, mission);
         assert_eq!(
@@ -10474,6 +10488,58 @@ mod database_tests {
             db.store.task_host_faults(task, 0).expect("count"),
             0,
             "base-only faults are not counted"
+        );
+        assert_eq!(gated(&db, mission).gate_aborts, 0);
+        assert_eq!(gated(&db, mission).gate_host_faults, 4, "each one a run");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A check that failed on the candidate and on the base (the gate's fact
+    /// `on` `candidate and base`) fails on main without the candidate, so it
+    /// counts toward no halt, never counts toward the cap and is never
+    /// capped: with the cap at 2, a gate that keeps reporting it (a red main:
+    /// Supply PA's check-tests, 2026-11-09 00:48-03:42) is `host_fault` every
+    /// time, and the task never aborts.
+    #[test]
+    fn candidate_and_base_host_faults_never_reach_the_cap() {
+        let gate = "echo '| == regression: check-e2e.sh must still pass'\n\
+                    printf '{\"host_fault\":true,\"scenario\":\"check-e2e.sh\",\"on\":\"candidate and base\",\"runs\":\"1, then 1 on the candidate; 1 on the base\",\"reason\":\"check-e2e.sh failed twice on the candidate and on the base\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+                    exit 6\n";
+        let (base, source, scenarios, mut integrator) = world("gate-fault-both-cap", gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_secs(1),
+            cap: 2,
+        };
+        let db = Db::new("gate_host_fault_both_cap");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        let mut due = None;
+        for round in 0..4 {
+            if let Some(due) = due {
+                let left = due - super::now_ms();
+                if left > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        u64::try_from(left).unwrap_or(0) + 50,
+                    ));
+                }
+            }
+            integrator.pass_on(&db.store).expect("a pass");
+            integrator.settle();
+            let record = last_verdict(&db).0;
+            assert_eq!(record["verdict"], "host_fault", "round {round}: {record}");
+            assert_eq!(record["fact"]["on"], "candidate and base", "{record}");
+            due = record["due_ms"].as_i64();
+        }
+        assert_eq!(
+            db.store.task_host_faults(task, 0).expect("count"),
+            0,
+            "faults on the candidate and the base are not counted"
         );
         assert_eq!(gated(&db, mission).gate_aborts, 0);
         assert_eq!(gated(&db, mission).gate_host_faults, 4, "each one a run");

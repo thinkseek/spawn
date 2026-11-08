@@ -1715,17 +1715,21 @@ are per-agent uids or a mount per engine.
      base-only fault of either evidence never counts toward
      `SPAWN_GATE_HOST_FAULT_CAP` and is never capped (§10.3).
      A task's report revision has at most `SPAWN_GATE_HOST_FAULT_CAP` (3 by
-     default) host faults judged after the candidate ran (either kind: the
-     test database's, or the gate's own with `on` `candidate and base`),
-     counted from its `task.gated` records: the next one at that revision
-     is recorded `aborted` instead, its reason saying so and the fault kept
-     under `host_fault`, so it counts toward the abort halt. A host fault is
-     no verdict on the work, but one that keeps recurring on the same work
-     may be the work's doing (a check's base run follows candidate code on
-     the shared test server), and an uncounted one would hold the task for
-     ever. A base-only fault (the gate's fact `on` `base`, or the base's own
-     disagreement) comes before any candidate code and counts toward no
-     halt, so it neither counts toward the cap nor is ever capped.
+     default) host faults judged after the candidate ran (the test
+     database's), counted from its `task.gated` records: the next one at
+     that revision is recorded `aborted` instead, its reason saying so and
+     the fault kept under `host_fault`, so it counts toward the abort halt.
+     A host fault is no verdict on the work, but one that keeps recurring on
+     the same work may be the work's doing (candidate code leaving the test
+     server broken for what runs after it), and an uncounted one would hold
+     the task for ever. A base-only fault (the gate's fact `on` `base`, or
+     the base's own disagreement) comes before any candidate code and
+     counts toward no halt, so it neither counts toward the cap nor is ever
+     capped. Nor does a check that failed on the candidate and on the base
+     (`on` `candidate and base`): main fails it without the candidate, and
+     counting it made a red main (Supply PA's check-tests, 2026-11-09
+     00:48-03:42) cap every task's next gate as an abort, feeding the abort
+     halt for a fault in no candidate.
   6. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate

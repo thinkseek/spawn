@@ -650,7 +650,7 @@ select count(*)
    and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
    and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
    and e.kind -> 'detail' -> 'record' ->> 'revision' = $2
-   and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') <> 'base'
+   and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') not in ('base', 'candidate and base')
    and not (coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') = 'sandbox'
             and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'tree', '') <> 'candidate')
    and coalesce(e.kind -> 'detail' -> 'record' ->> 'evidence', '') not in
