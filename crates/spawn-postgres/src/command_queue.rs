@@ -39,7 +39,7 @@ impl CommandQueue for PostgresStore {
 
     fn claim(&self, worker: &str, ttl: Duration) -> Result<Option<Claimed>, StoreError> {
         let ttl = bigint(ttl.as_millis());
-        let rows = self.query_prepared(CLAIM, &[&worker, &ttl])?;
+        let rows = self.query(CLAIM, &[&worker, &ttl])?;
         let Some(row) = rows.first() else {
             return Ok(None);
         };

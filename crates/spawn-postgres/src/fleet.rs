@@ -192,12 +192,6 @@ select jsonb_build_object(
 /// (`agent_open_jobs`), oldest first, each with the id of its
 /// `job.started` and its age on the database's clock.
 ///
-/// Four of those — `evidence_seq`, `turn_ended`, `checkpoint`, `model` — are
-/// one row per session or per agent over the log, so they are read once for
-/// the whole fleet and joined, not once per session: the dispatcher reads
-/// these facts on every pass it acts on, and four scans of the log do the
-/// work of four per session (objective 023).
-///
 /// A delivery counts as the worker's (its `last_delivery`, and the episode)
 /// only when it reached the worker or may have: it succeeded, has not
 /// finished, or failed after typing may have begun (its error names `$1`,
@@ -222,19 +216,36 @@ from (
     s.agent_id,
     s.live,
     s.execution_id,
-    ec.cause as end_cause,
+    (select x.cause from agent_executions x where x.session_id = s.session_id
+      order by x.started_at_ms desc, x.execution_id desc limit 1) as end_cause,
     p.observation,
     p.observation_event_id,
     p.observation_at_ms,
-    ev.evidence_seq,
-    coalesce(tn.ended, false) as turn_ended,
-    ck.commit as checkpoint,
-    coalesce(jb.jobs, '[]'::jsonb) as jobs,
+    (select max(e.session_seq) from spawn_events e
+      where e.session_id = s.session_id and e.source <> 'observer'
+        and e.event_name not in ('artifact.committed', 'merge.conflicted')
+        and coalesce(e.kind -> 'detail' ->> 'step', '') <> 'waiting') as evidence_seq,
+    coalesce((select e.event_name in ('turn.stopped', 'turn.failed') from spawn_events e
+               where e.session_id = s.session_id and e.execution_id = s.execution_id
+                 and e.event_name in ('message.received', 'turn.stopped', 'turn.failed')
+               order by e.session_seq desc limit 1), false) as turn_ended,
+    (select e.kind -> 'detail' -> 'artifact' ->> 'commit' from spawn_events e
+      where e.agent_id = s.agent_id and e.event_name = 'artifact.committed'
+      order by e.id desc limit 1) as checkpoint,
+    (select coalesce(jsonb_agg(jsonb_build_object(
+              'id', j.job_id, 'kind', j.job_kind, 'event_id', j.event_id,
+              'started_at_ms', j.started_at_ms,
+              'age_ms', spawn_now_ms() - j.started_at_ms) order by j.session_seq), '[]'::jsonb)
+       from agent_open_jobs j
+      where s.live and j.session_id = s.session_id
+        and j.execution_id = s.execution_id) as jobs,
     ep.id as episode,
     ep.action ->> 'type' as episode_action,
     exists (select 1 from spawn_commands c
              where c.session_id = s.session_id and c.state <> 'finished') as open_command,
-    coalesce(mo.model, 'default') as model,
+    coalesce((select e.kind -> 'detail' ->> 'model' from spawn_events e
+               where e.session_id = s.session_id and e.event_name = 'execution.started'
+               order by e.session_seq desc limit 1), 'default') as model,
     (select coalesce(jsonb_agg(jsonb_build_object(
               'id', c.id,
               'key', c.idempotency_key,
@@ -267,19 +278,16 @@ from (
         and c.id > (select x.command_id from agent_executions x
                      where x.session_id = s.session_id
                        and x.execution_id = s.execution_id)) as stops,
-    -- Only the supervisor's told set is read (the tags its digests filed):
-    -- every other session's is not gathered.
-    case when s.session_id = 'session_supervisor' then
-      (select coalesce(jsonb_agg(distinct tag), '[]'::jsonb)
-         from spawn_commands c, jsonb_array_elements_text(c.action -> 'tags') tag
-        where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
-          and c.succeeded and jsonb_typeof(c.action -> 'tags') = 'array')
-    else '[]'::jsonb end as told,
-    ld.idempotency_key as last_delivery,
-    case when s.session_id in (select r.session_id from spawn_commands r
-                                where r.principal = 'spawn-dispatch'
-                                  and r.idempotency_key like 'dispatch-resume-%')
-      then (select count(*) from agent_executions x
+    (select coalesce(jsonb_agg(distinct tag), '[]'::jsonb)
+       from spawn_commands c, jsonb_array_elements_text(c.action -> 'tags') tag
+      where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
+        and c.succeeded and jsonb_typeof(c.action -> 'tags') = 'array') as told,
+    (select c.idempotency_key from spawn_commands c
+      where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
+        and c.idempotency_key like 'deliver-%'
+        and (c.succeeded is distinct from false or position($1 in coalesce(c.error, '')) > 0)
+      order by c.id desc limit 1) as last_delivery,
+    (select count(*) from agent_executions x
        join spawn_commands c on c.id = x.command_id
       where x.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and c.idempotency_key like 'dispatch-resume-%' and c.succeeded
@@ -290,7 +298,7 @@ from (
     r")
         and ",
     died_young!("x"),
-    r") else 0 end as resumed_young,
+    r") as resumed_young,
     case when s.session_id = 'session_supervisor' then jsonb_build_object(
       'start', born.command_id,
       'given', born.charter,
@@ -312,10 +320,7 @@ from (
                     and c.action ->> 'type' = 'input' and t.hash is not null
                     and c.id > coalesce(born.command_id, 0)))
     end as charter,
-    case when s.session_id in (select r.session_id from spawn_commands r
-                                where r.principal = 'spawn-dispatch'
-                                  and r.idempotency_key like 'dispatch-resume-%')
-      then (select jsonb_build_object(
+    (select jsonb_build_object(
               'execution_id', x.execution_id,
               'command_id', c.id,
               'ended_at_ms', x.ended_at_ms,
@@ -339,72 +344,9 @@ from (
     r" and not ",
     lost_before_ready!("h"),
     r")
-      order by x.started_at_ms desc, x.execution_id desc limit 1) else null end as failed_resume
+      order by x.started_at_ms desc, x.execution_id desc limit 1) as failed_resume
   from agent_status s
   join spawn_session_state p using (session_id)
-  -- Four of the facts are one row per session or per agent over the log,
-  -- read once for the whole fleet rather than once per session: the
-  -- session's latest evidence, the latest event of its running execution
-  -- (whether its turn ended), its agent's newest checkpoint, and the model
-  -- its latest execution started with. Each is the same row the correlated
-  -- read returned, and the loop reads these facts on every pass it acts on
-  -- (objective 023: four reads of the log, not four per session).
-  -- The latest execution's end cause, one read for the whole fleet: the
-  -- view behind it reads the log for every execution, so it is evaluated
-  -- once here rather than once per session.
-  left join (
-    select distinct on (x.session_id) x.session_id, x.cause
-      from agent_executions x
-     order by x.session_id, x.started_at_ms desc, x.execution_id desc) ec
-    on ec.session_id = s.session_id
-  left join (
-    select e.session_id, max(e.session_seq) as evidence_seq
-      from spawn_events e
-     where e.source <> 'observer'
-       and e.event_name not in ('artifact.committed', 'merge.conflicted')
-       and coalesce(e.kind -> 'detail' ->> 'step', '') <> 'waiting'
-     group by e.session_id) ev on ev.session_id = s.session_id
-  left join (
-    select distinct on (e.session_id, e.execution_id)
-           e.session_id, e.execution_id,
-           e.event_name in ('turn.stopped', 'turn.failed') as ended
-      from spawn_events e
-     where e.event_name in ('message.received', 'turn.stopped', 'turn.failed')
-     order by e.session_id, e.execution_id, e.session_seq desc) tn
-    on tn.session_id = s.session_id and tn.execution_id = s.execution_id
-  left join (
-    select distinct on (e.agent_id) e.agent_id,
-           e.kind -> 'detail' -> 'artifact' ->> 'commit' as commit
-      from spawn_events e
-     where e.event_name = 'artifact.committed'
-     order by e.agent_id, e.id desc) ck on ck.agent_id = s.agent_id
-  left join (
-    select distinct on (e.session_id) e.session_id,
-           e.kind -> 'detail' ->> 'model' as model
-      from spawn_events e
-     where e.event_name = 'execution.started'
-     order by e.session_id, e.session_seq desc) mo on mo.session_id = s.session_id
-  -- The live sessions' open background jobs, grouped once: the view is two
-  -- reads of the log per job start, so it is evaluated for the fleet, not
-  -- for each session.
-  left join (
-    select j.session_id, j.execution_id,
-           jsonb_agg(jsonb_build_object(
-             'id', j.job_id, 'kind', j.job_kind, 'event_id', j.event_id,
-             'started_at_ms', j.started_at_ms,
-             'age_ms', spawn_now_ms() - j.started_at_ms) order by j.session_seq) as jobs
-      from agent_open_jobs j
-     group by j.session_id, j.execution_id) jb
-    on s.live and jb.session_id = s.session_id and jb.execution_id = s.execution_id
-  -- Each session's last delivery the worker may have received: one read of
-  -- the queue for the fleet, not one per session.
-  left join (
-    select distinct on (c.session_id) c.session_id, c.idempotency_key
-      from spawn_commands c
-     where c.principal = 'spawn-dispatch'
-       and c.idempotency_key like 'deliver-%'
-       and (c.succeeded is distinct from false or position($1 in coalesce(c.error, '')) > 0)
-     order by c.session_id, c.id desc) ld on ld.session_id = s.session_id
   -- The supervisor's current native session (the one its latest
   -- `session.native_started` names, which a resume resumes) and the start
   -- that began it: the command of the execution that named it first.
@@ -533,16 +475,7 @@ impl PostgresStore {
 
     /// Facts for the dispatcher, as JSON rows.
     pub fn dispatch_facts(&self) -> Result<Value, StoreError> {
-        self.query_json_prepared(DISPATCH_FACTS, &[&spawn_core::bridge::MAY_HAVE_TYPED])
-    }
-
-    /// The plan the dispatcher's facts read, as `EXPLAIN (FORMAT JSON)` gives
-    /// it, without running it: the per-session reads of `spawn_commands` are
-    /// index scans of `(session_id, id)` and `(session_id, principal, id)`,
-    /// never a scan of the table (tests/wake.rs states it over 20,000 rows).
-    pub fn dispatch_facts_plan(&self) -> Result<Value, StoreError> {
-        let sql = format!("explain (format json, costs off) {DISPATCH_FACTS}");
-        self.query_json(&sql, &[&spawn_core::bridge::MAY_HAVE_TYPED])
+        self.query_json(DISPATCH_FACTS, &[&spawn_core::bridge::MAY_HAVE_TYPED])
     }
 
     /// Every session with its judgement, task and activity, supervisor first.
