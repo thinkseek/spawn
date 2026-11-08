@@ -377,7 +377,7 @@ pub(crate) struct Cancelled {
     #[serde(default)]
     pub(crate) reason: Option<String>,
     /// That record yielded the task's objective's slot
-    /// (`objectives::yields`, `objectives::abort_yield`).
+    /// (`objectives::yields`).
     #[serde(default)]
     pub(crate) yielded: bool,
     /// An abort's reason for yielding as well (`yield_reason`).

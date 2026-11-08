@@ -1783,9 +1783,13 @@ impl Integrator {
                 } => (branch, Some(commit), diff),
                 Kept::Lost { branch } => (branch, None, String::new()),
             };
+            // `measure` says the active-time budget made this overrun, with
+            // what it measured: the record an objective counts as a failed
+            // attempt (objectives.rs, `Outcome::failure`).
             let mut overrun = json!({"type": "task.over_budget", "id": task.id,
                                      "reason": reason, "tool_calls": calls,
                                      "elapsed_ms": active, "budget": budget.clone(),
+                                     "measure": objectives::ACTIVE_MEASURE,
                                      "branch": branch});
             if let Some(commit) = &commit {
                 overrun["commit"] = json!(commit);
@@ -7120,21 +7124,26 @@ mod database_tests {
             .expect("the objective's task")
     }
 
-    /// `task` delivered, reported, and sent back by `conflicts` gate
-    /// verdicts of a merge that left markers.
-    fn conflicts(db: &Db, task: i64, conflicts: i32) {
-        for revision in 0..conflicts {
+    /// `task` delivered, reported, and sent back by `count` gate verdicts
+    /// `verdict`, from revision `from` on: a rejection, or a conflict of a
+    /// merge that left markers (main moved: not a failed attempt).
+    fn sent_back(db: &Db, task: i64, verdict: &str, from: i32, count: i32) {
+        for revision in from..from + count {
             db.store.task_delivered(task, 1).expect("delivered");
             assert!(
                 db.store
                     .task_reported(task, "## Outcome\nhalf of it")
                     .expect("reported")
             );
-            db.record(
-                &json!({"type": "task.gated", "id": task, "revision": revision,
-                              "verdict": "conflict", "merge": "marked", "base": "b",
-                              "reason": "main conflicts with your branch"}),
-            );
+            let record = if verdict == "conflict" {
+                json!({"type": "task.gated", "id": task, "revision": revision,
+                       "verdict": "conflict", "merge": "marked", "base": "b",
+                       "reason": "main conflicts with your branch"})
+            } else {
+                json!({"type": "task.gated", "id": task, "revision": revision,
+                       "verdict": verdict, "base": "b", "note": "a check failed"})
+            };
+            db.record(&record);
         }
     }
 
@@ -7254,9 +7263,12 @@ mod database_tests {
         );
         let task_19 = objective_task(&db, mission, 19);
         let (t19, t21, t23) = (first[0].0, first[1].0, first[2].0);
-        conflicts(&db, t19, 3);
-        conflicts(&db, t21, 3);
-        conflicts(&db, t23, 2);
+        sent_back(&db, t19, "rejected", 0, 3);
+        sent_back(&db, t21, "rejected", 0, 3);
+        // 023: two rejections, then three conflicts (main moving), which do
+        // not count: it stays under the limit.
+        sent_back(&db, t23, "rejected", 0, 2);
+        sent_back(&db, t23, "conflict", 2, 3);
         let assigned_at: i64 = db
             .admin()
             .query_one(
@@ -7317,18 +7329,18 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// rev-b on 226fa4a, on the store: objective 023 has two failed
-    /// attempts when its task is aborted over budget, its third. The abort
-    /// is recorded as the yield (`yielded`, its count and reason), told to
-    /// the supervisor once, and the objective goes behind the untried 025;
-    /// when 023 is assigned again its new task does not yield at once. An
-    /// abort under the limit stays a plain abort.
+    /// On the store: objective 023 has two failed attempts when its task
+    /// goes over budget. An overrun is its own record, no abort and no
+    /// yield: nothing is told to the supervisor as a yield, and the
+    /// objective's next task continues the work instead (task 174, "A task
+    /// over its budget keeps its work"). The record names the measure that
+    /// made it, `active`.
     #[test]
-    fn an_abort_at_the_limit_is_recorded_as_the_yield() {
+    fn an_overrun_at_the_limit_is_no_yield() {
         let base =
-            std::env::temp_dir().join(format!("spawn-db-abort-yield-{}", std::process::id()));
+            std::env::temp_dir().join(format!("spawn-db-overrun-yield-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let db = Db::new("abort_yield");
+        let db = Db::new("overrun_yield");
         let mission = backlog_mission(
             &db,
             &base,
@@ -7345,7 +7357,7 @@ mod database_tests {
         pass();
         let first = objective_task(&db, mission, 23);
         let other = objective_task(&db, mission, 25);
-        conflicts(&db, first.id, 2);
+        sent_back(&db, first.id, "rejected", 0, 2);
         let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
         let overrun = |task: &super::Task| {
             db.store.task_delivered(task.id, 1).expect("delivered");
@@ -7397,9 +7409,10 @@ mod database_tests {
             .expect("the aborts")
             .get(0);
         assert_eq!(aborts, 0, "an overrun is no abort");
+        // The two rejections stand; the overrun adds no gate verdict.
         assert_eq!(
             gate_counters(&db, mission),
-            (0, 0),
+            (0, 2),
             "an overrun is no gate abort"
         );
         let told = db.store.objective_yields().expect("the yields to tell");
@@ -7461,6 +7474,11 @@ mod database_tests {
         let pass = snapshot(&db, mission);
         let over = Integrator::enforce_budget(&db.store, &pass).expect("the budget");
         assert_eq!(over, vec![task.id]);
+        // The overrun names the active-time measure, so it is the
+        // objective's failed attempt (an abort without one, the old
+        // budget's, is not).
+        let raw = db.store.objective_outcomes(mission).expect("outcomes");
+        assert_eq!(raw[0]["measure"], "active", "{raw}");
         let settled = over.into_iter().collect();
         assert!(
             crate::objectives::assign_next(&db.store, &pass, &settled)
