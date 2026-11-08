@@ -121,12 +121,15 @@ and `spawn_events` count as `x-amz-meta-sha256` and
 
 `spawn backup bundle` checks that every mission source is a repository on
 this host (one that is not is recorded `missing` and the bundle goes on),
-that each `git bundle` verifies on its own, that the tar decrypts back to
-the same SHA-256, and that the upload's ETag is the MD5 sent.
+that each `git bundle` verifies on its own, that the archive decrypts back
+to the same SHA-256 (the archive, not the tar: compression is before
+encryption), and that the upload's ETag is the MD5 sent.
 
-`spawn backup verify` is the drill (below). Exit 0 restores to the record; 1
-does not (missing, corrupt, a sha256 or a count that differs, a failed
-restore); 2 cannot run (no drill server named, no credentials, no key).
+`spawn backup verify` is the drill (below): the newest good dump restores to
+its record, and the newest bundle is opened and compared with its own. Exit
+0 both pass; 1 either does not (missing, corrupt, a sha256 or a count that
+differs, a failed restore, a bundle that does not open or verify); 2 cannot
+run (no drill server named, no credentials, no key).
 
 ## Install
 
@@ -170,6 +173,20 @@ counts `spawn_events` and their highest id there, compares both with the
 record's, and drops the database on every path. It never restores into the
 source database or any database it did not create.
 
+It then opens the newest `backup.bundled` record with a key — the sources
+and transcripts, the other half of what leaves the host — the same way:
+fetches its object, checks `x-amz-meta-sha256` and the decrypted archive's
+SHA-256 against the record's, decompresses it by its magic, untars it, and
+compares `manifest.json` with the record (kind, transcript file count and
+bytes), every transcript file it names at the recorded size, and every
+repo's bundle: `git bundle list-heads` must list every head the manifest
+names and nothing it does not — for an increment, the heads that are new or
+moved since its base, since `--not` leaves an unmoved head out — and a full
+bundle must additionally pass `git bundle verify` in an empty repository
+(an increment's prerequisites are its base's commits, which the drill does
+not fetch). A store with no bundle yet says so in the record and passes. The result is the record's `bundle`
+object; a bundle that fails makes the day's verdict a failure.
+
 `pg-restore-drill.sh [KEY]` remains for the manual, docker-based drill the
 old daily script documented: a throwaway container of the live server's
 image, no network, tmpfs data, the row counts beside live's. Run it after any
@@ -199,8 +216,22 @@ pg_restore --no-owner -d '<url of spawn_restored>' spawn.dump
 hand, which is why the command does not do it.)
 
 The sources and transcripts come from the newest `bundles/full/` object and
-every `bundles/incr/` object after it, in order (at most 6): decrypt each,
-untar it, `git clone --mirror` each `repos/<name>.bundle` (an increment's
+every `bundles/incr/` object after it, in order (at most 6): decrypt each, and
+unpack it by its magic — the key names what it holds, and the first bytes say
+the same:
+
+```sh
+gpg --batch --pinentry-mode loopback --passphrase-file ~/.config/spawn/backup.key \
+  -o bundle.raw -d spawn-bundle-YYYYMMDD-HHMMSS.tar.zst.gpg
+case "$(head -c 4 bundle.raw | od -An -tx1 | tr -d ' \n')" in
+1f8b*)     gzip -dc <bundle.raw >bundle.tar ;;
+28b52ffd*) zstd -q -dc <bundle.raw >bundle.tar ;;
+*)         cp bundle.raw bundle.tar ;;   # plain
+esac
+mkdir -p unpacked && tar -xf bundle.tar -C unpacked
+```
+
+Then `git clone --mirror` each `unpacked/repos/<name>.bundle` (an increment's
 bundle fetches on top of the full one's, its prerequisites naming it), write
 each `transcripts/<agent>/<file>` part at the offset its manifest records,
 and `manifest.json` says which offset and how many bytes each part holds. A
@@ -213,23 +244,41 @@ real backup or record was touched; see the work record):
 
 | What | Size | Time |
 | --- | --- | --- |
-| Full bundle: 122 transcript files (426,266,637 bytes) and both mission sources (spawn.git, supply-pa.git) | 89,767,892 bytes stored (tar + zstd + gpg) | 26 s |
+| Full bundle: 122 transcript files (426,266,637 bytes) and both mission sources (spawn.git, supply-pa.git) | 89,767,892 bytes stored (tar + zstd + gpg); zstd -3 measured 7.7:1 on real transcript text | 26 s |
 | The same full bundle as a plain tar (before compression was added) | 437,032,960 bytes | 3 m 58 s |
-| Increment: 2,000,000 bytes appended to one transcript | 19,209 bytes | 3 s |
+| Increment: 2,000,000 bytes appended to a real transcript | 260,948 bytes (zstd -3; 323,913 with gzip -6) | 3 s |
 | A dump of the live database (the last `pg-backup.sh` run, 2026-11-08) | 9,698,154 bytes | — |
 
-At the owner's windows the bucket holds at most 43 dump copies (30 hourly, 8
-daily, 5 weekly), 3 full bundles and 13 increments. A steady state at today's
-sizes: 43 × 9.7 MB ≈ 417 MB of dumps, 3 × 89.8 MB ≈ 269 MB of full bundles,
-and 13 increments, each a day of transcript growth (the measured 2 MB
-appended in a day is 19 KB; even a day ten times that is under 200 KB, so
-the increments are well under 10 MB together) — about 0.7 GB in all, 9 % of
-the 8 GB alert (and of the 10 GB free tier). R2's free tier is 10 GB-month
-storage, 1M Class A and 10M Class B operations a month, no egress fees;
-lifecycle rules and bucket locks are free. Operations: the hourly dump is a
-list plus 1-3 PUTs (Class A), 30 times a month; the bundle a list plus one
-PUT, the drill a GET and a list; at most a few hundred Class A a month
-against the million. The cheapest failure is not compression but the dump,
-a whole copy of a log that only grows: it is what the alert watches. If the
-tier were ever passed, storage is $0.015 per GB-month (about $0.011 a month
-at 0.7 GB); egress is free, so a restore costs nothing.
+The increment figure is a correction of the first measurement: 2,000,000
+bytes of 031-style synthetic JSONL compress to 19,209 bytes, but real
+transcript text does not — the same 2 MB of a real transcript's tail is
+260,948 bytes, 13 times more. The earlier estimate of a day's growth used
+the synthetic number; this one does not.
+
+At the owner's lifecycle windows the bucket holds one dump object per tier
+per run (the hourly always, the daily the first of the UTC day, the weekly
+the first of the ISO week), and the 6 h / 7 d / 28 d windows keep about 7
+hourly, 8 daily and 5 weekly copies: ≈ 20 dump objects ≈ 194 MB — the
+windows decide the count, not how often the dump runs. With 3 full bundles
+(≈ 269 MB) and up to 13 increments of a real day's growth (MB-scale each —
+the live archive is 428,849,784 bytes and grew tens of MB in the last day —
+so tens of MB up to ≈ 150 MB together), a steady state is ≈ 0.5–0.6 GB in
+all: about 7 % of the 8 GB alert and 6 % of
+the 10 GB free tier. The earlier ≈ 0.7 GB / 9 % estimate stands by
+correction, not by luck: its dump line was about twice too high (417 MB for
+43 daily copies, against ≈ 20 tier objects at ≈ 194 MB) and its increment
+line about ten times too low (under 10 MB, against tens to ≈ 150 MB); the
+two errors happened to cancel inside the same conclusion, and now the
+conclusion is the corrected numbers' own — the bucket is nowhere near the
+alert or the tier.
+
+R2's free tier is 10 GB-month storage, 1M Class A and 10M Class B operations
+a month, no egress fees; lifecycle rules and bucket locks are free.
+Operations: the hourly dump runs about 730 times a month, a list plus 1–3
+PUTs each (the daily and weekly copies included), ≈ 1,500–2,200 Class A a
+month; the bundle a list plus one PUT, the drill a GET and a list — at most
+a few thousand Class A against the million. The cheapest failure is not
+compression but the dump, a whole copy of a log that only grows: it is what
+the alert watches. If the tier were ever passed, storage is $0.015 per
+GB-month (about $0.01 a month at 0.6 GB); egress is free, so a restore costs
+nothing.
