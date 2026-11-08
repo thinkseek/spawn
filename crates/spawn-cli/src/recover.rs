@@ -682,9 +682,6 @@ pub(crate) struct Sent {
     pub(crate) finished_at_ms: Option<i64>,
     #[serde(default)]
     pub(crate) succeeded: Option<bool>,
-    /// Why a failed one failed, as the Bridge ended it.
-    #[serde(default)]
-    pub(crate) error: Option<String>,
 }
 
 /// One session's facts (`spawn_postgres::RECOVERY_FACTS`).
@@ -1895,14 +1892,7 @@ impl One<'_> {
                 model: None,
             }
         };
-        let why = self
-            .row
-            .commands
-            .iter()
-            .find(|sent| sent.key == key)
-            .and_then(|sent| sent.error.clone())
-            .unwrap_or_default();
-        self.submit(&next, action, &format!("retrying a failed revival: {why}"))
+        self.submit(&next, action, "retrying a failed revival")
     }
 
     /// A handoff: stop the execution if it still runs, then start a new
