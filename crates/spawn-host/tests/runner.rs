@@ -154,7 +154,7 @@ fn launch(program: &str, arguments: &[&str], environment: &[(&str, &str)]) -> La
 /// none), and how long one is waited for: the status is recorded the moment
 /// the child is reaped, so an attempt that has not seen it in seconds will
 /// never see it.
-const DEAD_PANE_ATTEMPTS: u32 = 5;
+const DEAD_PANE_ATTEMPTS: u32 = 6;
 const DEAD_PANE_WAIT: Duration = Duration::from_secs(5);
 
 /// What `runner` answers once it stops answering `Running` or `limit`
