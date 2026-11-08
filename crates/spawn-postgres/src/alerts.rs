@@ -107,11 +107,24 @@ from (select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
 /// stop clears a stuck alert). The Observer keeps the latest judgement
 /// covering the latest fact; the alert reads the same one.
 ///
-/// One index read for the judgements and one range read per session for its
-/// end, joined `left` once: the two ends are one row, not two correlated
-/// reads per judgement (the live log's ten judgements made this 21 scans
-/// of `spawn_events` a pass, five here).
+/// Two reads of the log whatever the number of sessions: the judgements,
+/// and the first end after each of them, joined once. (The live log's ten
+/// judgements cost 21 scans a pass read as correlated subqueries, one per
+/// judgement and one per end.)
 pub(crate) const OBSERVATIONS: &str = r"
+with latest as (
+  select distinct on (e.session_id)
+         e.session_id, e.agent_id, e.id, e.recorded_at_ms,
+         e.kind -> 'detail' -> 'observation' as observation
+    from spawn_events e
+   where e.event_name = 'observation.recorded'
+   order by e.session_id, e.id desc),
+ended as (
+  select distinct on (e.session_id) e.session_id, e.id, e.kind
+    from spawn_events e
+    join latest l using (session_id)
+   where e.event_name = 'execution.ended' and e.id > l.id
+   order by e.session_id, e.id)
 select coalesce(jsonb_agg(jsonb_build_object(
       'session_id', o.session_id, 'agent_id', o.agent_id, 'event_id', o.id,
       'at_ms', o.recorded_at_ms, 'observation', o.observation,
@@ -119,17 +132,8 @@ select coalesce(jsonb_agg(jsonb_build_object(
     order by o.session_id), '[]'::jsonb)
 from (select l.session_id, l.agent_id, l.id, l.recorded_at_ms, l.observation,
              x.id as ended_event, x.kind -> 'detail' ->> 'cause' as ended_cause
-        from (select distinct on (e.session_id)
-                     e.session_id, e.agent_id, e.id, e.recorded_at_ms,
-                     e.kind -> 'detail' -> 'observation' as observation
-                from spawn_events e
-               where e.event_name = 'observation.recorded'
-               order by e.session_id, e.id desc) l
-        left join lateral (
-          select e.id, e.kind from spawn_events e
-           where e.session_id = l.session_id and e.event_name = 'execution.ended'
-             and e.id > l.id
-           order by e.id limit 1) x on true
+        from latest l
+        left join ended x using (session_id)
        order by l.session_id) o";
 
 /// Commands that finished failed after `$1`, oldest first: a notice each,
