@@ -105,33 +105,54 @@ fn pause_unless_stopped(pause: Duration, stop: &AtomicBool) -> bool {
     true
 }
 
+/// What a pass's wait ended for.
+enum Waited {
+    /// The wait timed out with nothing announced.
+    TimedOut,
+    /// A notification, or a burst of them, arrived: one pass acts on all.
+    Notified,
+    /// The stop flag is set.
+    Stopped,
+    /// The listening connection is gone: it proves nothing, and the loop
+    /// waits out the interval and listens again on its next pass.
+    Lost,
+}
+
 /// Wait for `pause`, or less once `stop` is set, or at once when a
 /// notification arrives on `listener` (the log's change signal: a hint, not
-/// the record — the next pass reads the watermark anyway). True when the
-/// stop is set. Without a listener it is [`pause_unless_stopped`]: the
-/// watermark alone wakes the loop, one interval late at worst.
+/// the record — the next pass reads the watermark anyway). Without a
+/// listener it is [`pause_unless_stopped`]: the watermark alone wakes the
+/// loop, one interval late at worst.
 fn wait_unless_stopped(
     listener: Option<&mut spawn_postgres::Listener>,
     pause: Duration,
     stop: &AtomicBool,
-) -> bool {
+) -> Waited {
     let Some(listener) = listener else {
-        return pause_unless_stopped(pause, stop);
+        return if pause_unless_stopped(pause, stop) {
+            Waited::Stopped
+        } else {
+            Waited::TimedOut
+        };
     };
     let until = std::time::Instant::now() + pause;
     loop {
         if stop.load(Ordering::SeqCst) {
-            return true;
+            return Waited::Stopped;
         }
         let left = until.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
-            return false;
+            return Waited::TimedOut;
         }
         match listener.wait(left) {
             // A notification (or a burst of them) ends the wait: one pass
             // acts on all of it.
-            Ok(1..) | Err(_) => return false,
+            Ok(1..) => return Waited::Notified,
             Ok(0) => {}
+            // A broken connection, never a hint: returning at once would
+            // spin the loop on a wait that fails instantly, so it ends the
+            // wait for good and the caller listens again with a fresh one.
+            Err(_) => return Waited::Lost,
         }
     }
 }
