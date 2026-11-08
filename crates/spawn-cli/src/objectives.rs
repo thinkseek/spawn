@@ -98,7 +98,9 @@
 //! `spawn_objective_assign` checks both limits again under the append lock.
 //! With N = 1 this is one task at a time on the resident.
 //!
-//! A one-shot objective is solved once a task for it lands; a recurring one
+//! A one-shot objective is solved once a task for it lands, or once its
+//! scenario passes at a base commit main already holds (`objective.solved`,
+//! read as a landing: the work could change nothing); a recurring one
 //! stays open until the metric of its latest landing meets its target. The
 //! metric is the gate's verdict line, never scenario output, which candidate
 //! code controls.
@@ -320,14 +322,39 @@ pub(crate) fn landed_value(task: &Task, landings: &[Landing]) -> Option<f64> {
         .find_map(|landing| candidate_value(landing.metric.as_deref()?, name))
 }
 
-/// Whether an objective is open: a one-shot one with no landing, or a
-/// recurring one whose latest landed metric misses its target.
+/// Whether an objective is open: a one-shot one with no landing (a landing
+/// or an `objective.solved`: the objective's scenario passed at a base commit
+/// main already holds), or a recurring one whose latest landed metric misses
+/// its target.
 fn is_open(task: &Task, landings: &[Landing]) -> bool {
     if task.recurring {
         !landed_value(task, landings).is_some_and(|value| task.meets(value))
     } else {
         !landings.iter().any(|landing| landing.objective == task.id)
     }
+}
+
+/// Whether `objective` of `mission` is a one-shot objective: the base-solved
+/// rule (`crate::integrate`'s `solved_on_base`) ends a one-shot objective on
+/// the record; a recurring one stays open until its metric meets its target,
+/// and a scenario passing on the base says nothing about the metric the gate
+/// would land. False when the backlog cannot be read (the old verdict
+/// stands).
+pub(crate) fn one_shot(mission: &Mission, objective: u32) -> bool {
+    let Some(backlog) = mission
+        .objectives
+        .as_ref()
+        .and_then(|config| config.get("backlog"))
+    else {
+        return false;
+    };
+    let Some(backlog) = backlog.as_str().map(std::path::Path::new) else {
+        return false;
+    };
+    load_backlog(backlog)
+        .ok()
+        .and_then(|tasks| tasks.into_iter().find(|task| task.id == objective))
+        .is_some_and(|task| !task.recurring)
 }
 
 /// The lowest open objective: what one free slot gets with nothing in flight.

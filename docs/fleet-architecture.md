@@ -1693,10 +1693,16 @@ record of what was judged (§14 of design.md).
     the mission has counted since it was configured or last resumed);
   - the source's `main` not where the last landing left it, read only
     from a fetch that succeeded, while no other mission's landing on the
-    source is unresolved, and while no owner's landing on the source is
+    source is unresolved, while no owner's landing on the source is
     pending (step 0 below applies them first; one still pending, its
-    landing failed, may have moved `main` before its record). A move that
-    no record explains (a push behind Spawn's back) halts.
+    landing failed, may have moved `main` before its record), and while the
+    owner does not hold the source. The hold is exactly what says "the
+    owner is moving `main`": on 2026-11-08 the owner held mission 6's
+    source, pushed `main` and recorded the move afterwards, and a pass
+    between the push and the record halted the mission. A move that no
+    record explains and no hold covers (a push behind Spawn's back) halts;
+    the halt's record names the source and both commits (`cause`:
+    `main_moved`), so `spawn mission moved` can tell it from any other.
 
   A halted mission lands nothing until a human runs `spawn mission resume`.
   No rule counts host faults, however many in a row, whatever their evidence:
@@ -1708,7 +1714,13 @@ record of what was judged (§14 of design.md).
   every mission on that source whose baseline was its `from` and that is not
   halted (the record names them), so RSI and fleet work on the same
   repository don't halt each other, and a move of `main` that no landing
-  explains still halts the missions that saw `main` before it. A deploy that moves `main` forward records
+  explains still halts the missions that saw `main` before it — unless
+  that is exactly the halt the move is: a mission halted because `main`
+  was neither its baseline nor explained, at this source, from this commit
+  to this one (`cause`: `main_moved` in its `mission.halted`), is named in
+  the move's `clear` list, and the fold unhalts it as it moves its
+  baseline. The owner's record is the explanation its halt was waiting
+  for; a halt for any other reason keeps its baseline. A deploy that moves `main` forward records
   `source.moved` (`spawn mission moved`, run by `deploy/deploy.sh`), and the
   missions on that source take the new `main` as their baseline instead of
   halting.
@@ -1828,6 +1840,27 @@ record of what was judged (§14 of design.md).
     tasks kept failing held mission 4's three slots for a day (an abort was
     followed by a new task for the same objective five seconds later), and
     objectives 025 to 034 were never assigned.
+  - **An objective already solved on the base.** A one-shot objective is
+    solved once a task for it lands (below); it is also solved when its
+    scenario passes at a base commit main already holds, because then no
+    work of a task can change anything. Mission 4's task 182 (objective
+    34) was rejected three times on 2026-11-08 — "the work changes nothing
+    on main" twice, then "scenario already passes on the base" — after the
+    owner batch had landed the behaviour already, and the third rejection
+    halted the mission. Now: a gate that says the objective's scenario
+    passes on the base (its base check, before any candidate build) is a
+    fact about the objective, not about the task's work. The integrator
+    records `objective.solved` {`id`: the mission, `objective`, `task`,
+    `scenario`, `base`: the commit, `log`: the gate's}, stops the worker
+    and ends the task as `task.cancelled` on that record (`solved`: its
+    event id, `by: spawn-integrate`): no rejection, no failed attempt, no
+    halt. The assignment rule reads `objective.solved` as a landing, so the
+    objective is not assigned again, and an objective that names it in
+    `after` is not held by it. A candidate whose tree is main's tree is not
+    rejected at once in an objective mission either: it is judged, and the
+    gate's base check answers the same question (cheaply: the base is
+    cached by the deploy's warm-up). A gate verdict on the base that
+    disagrees with itself is a host fault (§10.3), unrelated.
   - **Named order.** A backlog objective may name the objectives it comes
     after (`"after": [28]` in its JSON, versioned with the backlog): it is
     not assigned while one of them is open (one the backlog does not hold
