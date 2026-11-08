@@ -321,6 +321,13 @@ struct Follow {
     /// Its last capture could not be recorded (one reading is not a fact, or
     /// it read [`ScreenState::Unknown`]): capture again next pass.
     again: bool,
+    /// When a turn of this execution last ended in its transcript, by the
+    /// Bridge's clock, while the screen has not yet shown the turn over (a
+    /// reading that accepts input). The engine paints the prompt a moment
+    /// after the line that ends the turn, and that reading decides a
+    /// delivery: the pane is read on the following passes until it is here,
+    /// or [`BridgeConfig::screen_refresh`] has passed since the turn ended.
+    settling: Option<i64>,
     /// When its pane was last captured.
     last_capture: Option<i64>,
     /// When to read its files next although nothing was watched: the grace
