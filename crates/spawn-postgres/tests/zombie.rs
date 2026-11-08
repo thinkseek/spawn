@@ -132,7 +132,7 @@ fn ends(store: &PostgresStore) -> Vec<(String, EndCause, Option<String>)> {
 /// The supervisor's exec_1 runs, then the host restarts: its runner died
 /// without an exit status, and a terminal manager restored `spawn-exec_1`
 /// at a shell prompt. The log holds exec_1 open.
-fn restarted(case: &str) -> (Arc<PostgresStore>, Arc<MemoryStore>, String) {
+fn restarted(case: &str) -> (Arc<PostgresStore>, Arc<MemoryStore>, common::Schema) {
     let (store, schema) = store(case);
     let store = Arc::new(store);
     let host = Arc::new(MemoryStore::new("supervisor", Arc::new(SystemClock)));

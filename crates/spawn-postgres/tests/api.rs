@@ -199,7 +199,7 @@ fn two_commands_of_a_session_are_never_leased_at_once_when_their_submissions_rac
     // A submission starts and waits for it, in a transaction it keeps open.
     let (submitted_tx, submitted) = std::sync::mpsc::channel::<(i32, Option<i64>)>();
     let (commit_tx, commit) = std::sync::mpsc::channel::<()>();
-    let waiter_schema = schema.clone();
+    let waiter_schema = schema.to_string();
     let waiter_submit = submit("key_waiter");
     let waiter = std::thread::spawn(move || {
         let mut client = admin(&waiter_schema);
@@ -1326,7 +1326,7 @@ fn public_holds_only_the_gateway_the_readers_and_pure_helpers() {
               cross join lateral aclexplode(o.acl) a
               where a.grantee = 0
               order by 1",
-            &[&schema],
+            &[&&*schema],
         )
         .expect("read the access lists")
         .iter()
@@ -1365,7 +1365,7 @@ fn view_columns_match_the_snapshot() {
                from information_schema.columns
               where table_schema = $1 and table_name like 'agent\\_%'
               group by table_name order by table_name",
-            &[&schema],
+            &[&&*schema],
         )
         .expect("information_schema answers");
     let actual: Vec<String> = rows

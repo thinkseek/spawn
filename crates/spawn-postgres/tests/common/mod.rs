@@ -21,11 +21,47 @@ pub fn schema_name(case: &str) -> String {
     format!("spawn_test_{}_{nanos:x}_{case}", std::process::id())
 }
 
-/// Store in a schema of its own.
-pub fn store(case: &str) -> (PostgresStore, String) {
+/// Store in a schema of its own, and the schema's name: a guard that drops
+/// the schema when the test lets go of it ([`Schema`]).
+pub fn store(case: &str) -> (PostgresStore, Schema) {
     let schema = schema_name(case);
     let store = PostgresStore::connect_in_schema(&url(), &schema).expect("connect and migrate");
-    (store, schema)
+    (store, Schema(schema))
+}
+
+/// A test's schema, by name (it derefs to `str`), dropped with everything
+/// in it when the test ends, passed or failed. Before it, every case left
+/// its schema behind: a shared test database grew without bound (2,342 of
+/// them, 2.1 GB, on one server by 2026-11-09). A failed case's schema is
+/// not kept either: the test process ends with the case, so nothing reads
+/// it, and the case run again builds the same state. The drop waits at most
+/// 5 s for a lock (a connection of the test still open in another thread)
+/// and gives up quietly: a schema left then is the old behaviour, never a
+/// failed test.
+pub struct Schema(String);
+
+impl std::ops::Deref for Schema {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Schema {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Drop for Schema {
+    fn drop(&mut self) {
+        if let Ok(mut client) = Client::connect(&url(), NoTls) {
+            let _ = client.batch_execute(&format!(
+                "set lock_timeout = '5s'; drop schema if exists {} cascade",
+                self.0
+            ));
+        }
+    }
 }
 
 /// An owner connection inside the case's schema.
@@ -85,8 +121,9 @@ pub fn connect_as(schema: &str, role: &str, password: &str) -> Client {
 }
 
 /// A schema holding the first shape of every table (tests/first-shapes.sql),
-/// not migrated yet, and an owner connection in it.
-pub fn first_shapes(case: &str) -> (String, Client) {
+/// not migrated yet, and an owner connection in it; the schema is dropped
+/// with its guard, as [`store`]'s is.
+pub fn first_shapes(case: &str) -> (Schema, Client) {
     let schema = schema_name(case);
     let mut client = Client::connect(&url(), NoTls).expect("admin connection");
     client
@@ -95,7 +132,7 @@ pub fn first_shapes(case: &str) -> (String, Client) {
             include_str!("../first-shapes.sql")
         ))
         .expect("the first shapes");
-    (schema, client)
+    (Schema(schema), client)
 }
 
 /// Run the schema over `schema` as the owner and return its warnings, but
