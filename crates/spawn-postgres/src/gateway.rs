@@ -16,7 +16,6 @@ pub(crate) const FLEET: &str =
                    from (
                      select s.session_id, s.agent_id, s.state, s.live, s.engine,
                             s.execution_id, s.started_at_ms, s.ended_at_ms, s.last_event_at_ms,
-                            s.slice, s.scope, s.cgroup,
                             st.observation ->> 'judge' as judge,
                             (st.observation ->> 'confidence')::float8 as confidence,
                             coalesce((st.observation ->> 'attention')::boolean, false) as attention,

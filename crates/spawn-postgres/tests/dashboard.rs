@@ -113,7 +113,6 @@ fn the_board_dates_the_current_state_from_its_first_judgement_and_names_the_open
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
-                envelope: None,
             },
         ))
         .expect("append succeeds");

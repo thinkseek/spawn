@@ -76,21 +76,6 @@
 //! first run that exits 2, `1, then 2`, `1, then 3`, a missing line, the
 //! pair with any other exit) stays an abort.
 //!
-//! **The gate runs in a resource envelope of its own** (objective 029): a
-//! transient systemd user scope `<slice stem>-gate-<task id>-<n>.scope`
-//! directly inside Spawn's slice, with SPAWN_GATE_MEMORY_HIGH, _MAX and
-//! _SWAP_MAX and OOMPolicy stop, so everything the gate starts (bwrap, the
-//! builds, the scenarios and their engines) is in that scope's cgroup. The
-//! gate's process group and wall-clock kill work as before (`systemd-run`
-//! execs the gate in place, so the group is the gate's). A gate its own
-//! envelope kills — its scope's `memory.events` `oom_kill` above 0, or the
-//! unit's `Result` `oom-kill`, read at its end, never its exit status alone
-//! — is [`GateFailure::MemoryLimit`]: the host's fault, not a verdict. The
-//! unit is then reset, so no unit is left behind; a scope that ended another
-//! way needs nothing (a transient scope that stops is collected). The
-//! integrator admits a gate whose envelope fits under the slice and on the
-//! host ([`crate::integrate`]).
-//!
 //! The gate runs with a cleared environment: [`GATE_ENV`] and nothing else.
 //! The integrator's own database URL never reaches candidate code.
 
@@ -707,23 +692,6 @@ fn percent_decoded(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// A gate's resource envelope (objective 029): its own scope unit inside
-/// Spawn's slice, and the slice, manager and settings it runs under.
-#[derive(Debug, Clone)]
-pub(crate) struct Scope {
-    /// The scope unit, `<slice stem>-gate-<task id>-<n>.scope`.
-    pub(crate) unit: String,
-    /// The slice it runs in and the limits it carries.
-    pub(crate) envelope: spawn_core::envelope::Envelope,
-}
-
-impl Scope {
-    /// The scope's cgroup directory.
-    fn cgroup(&self) -> std::path::PathBuf {
-        self.envelope.scope_cgroup(&self.unit)
-    }
-}
-
 /// One gate verdict.
 #[derive(Debug, Clone)]
 pub(crate) struct Verdict {
@@ -783,22 +751,6 @@ pub(crate) enum GateFailure {
         /// The whole seconds of the gate's `setup <n> s`, when it printed
         /// its `| gate time:` line.
         setup_s: Option<u64>,
-        log: String,
-    },
-    /// The gate's own resource envelope killed it (objective 029): its
-    /// scope's `memory.events` `oom_kill` or the unit's `Result` `oom-kill`,
-    /// read at its end. The host's fault, never a verdict on the work.
-    MemoryLimit {
-        /// The scope unit the gate ran in.
-        scope: String,
-        /// Its MemoryHigh and MemoryMax, in bytes.
-        memory_high: u64,
-        memory_max: u64,
-        /// Processes the kernel killed in it (above 0).
-        oom_kills: u64,
-        /// Its `memory.peak` when it could be read before the cgroup went.
-        memory_peak: Option<u64>,
-        /// What the gate printed.
         log: String,
     },
 }
@@ -1033,7 +985,6 @@ pub(crate) fn judge(
     scenario: Option<&Path>,
     env: &[(String, String)],
     limit: Duration,
-    scope: Option<&Scope>,
 ) -> Result<Verdict, GateFailure> {
     judge_in(
         &std::env::temp_dir(),
@@ -1046,7 +997,6 @@ pub(crate) fn judge(
         scenario,
         env,
         limit,
-        scope,
     )
 }
 
@@ -1064,7 +1014,6 @@ fn judge_in(
     scenario: Option<&Path>,
     env: &[(String, String)],
     limit: Duration,
-    scope: Option<&Scope>,
 ) -> Result<Verdict, GateFailure> {
     let floor = env_value(env, "SPAWN_GATE_MIN_FREE_GB")
         .map_or(Some(DEFAULT_MIN_FREE_GB), |text| text.parse::<u64>().ok());
@@ -1096,37 +1045,21 @@ fn judge_in(
         }
     };
     let verdict_path = directory.path().join("verdict");
-    let mut words = vec![
-        gate.display().to_string(),
-        repo.display().to_string(),
-        base.to_string(),
-        candidate.to_string(),
-        scenarios.display().to_string(),
-    ];
+    let mut command = Command::new("sh");
+    command
+        .arg(gate)
+        .arg(repo)
+        .arg(base)
+        .arg(candidate)
+        .arg(scenarios);
     if let Some(scenario) = scenario {
-        words.push(scenario.display().to_string());
+        command.arg(scenario);
     }
-    // The gate runs in its own scope, inside Spawn's slice, when the host
-    // has an envelope (objective 029): everything it starts is in it.
-    let (program, arguments) = match scope {
-        Some(scope) => scope
-            .envelope
-            .wrap(&scope.unit, scope.envelope.settings.gate, "sh", &words),
-        None => ("sh".to_string(), words),
-    };
-    let mut command = Command::new(program);
-    command.args(&arguments);
     command
         .env_clear()
         .envs(env.iter().map(|(name, value)| (name, value)))
         .env("SPAWN_GATE_VERDICT", &verdict_path);
-    if let Some(scope) = scope {
-        // The manager's bus, for systemd-run only: candidate code runs in a
-        // sandbox whose /run is an empty tmpfs and reaches no manager.
-        command.env("XDG_RUNTIME_DIR", &scope.envelope.manager.runtime_dir);
-    }
-    let cgroup = scope.map(Scope::cgroup);
-    let run = match run_bounded_in(command, limit, directory.path(), cgroup.as_deref()) {
+    let run = match run_bounded(command, limit, directory.path()) {
         Ok(run) => run,
         Err(GateFailure::Failed(error)) => {
             return Err(short(
@@ -1138,19 +1071,7 @@ fn judge_in(
         }
         Err(other) => return Err(other),
     };
-    // The scope's own facts, read before its unit is reset: a unit left
-    // behind is one per gate, and a collected one no longer says why it
-    // ended.
-    let facts = scope.map(|scope| scope.envelope.scope_facts(&scope.unit));
-    if let Some(scope) = scope {
-        scope.envelope.reset_failed(&scope.unit);
-    }
     let verdict = std::fs::read_to_string(&verdict_path).ok();
-    if let (Some(scope), Some(facts)) = (scope, &facts)
-        && let Some(failure) = memory_limit(scope, facts, run.memory_peak, &run)
-    {
-        return Err(failure);
-    }
     match decide(&run, verdict.as_deref()) {
         // Exit 5 with no readable fact: the gate said "no room" but could
         // not write it down. Measure; believe it only under the floor.
@@ -1171,35 +1092,6 @@ fn env_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
     env.iter()
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.as_str())
-}
-
-/// The failure a gate's envelope makes of its end (objective 029), when it
-/// killed it: the scope's own `oom_kill` counter or its unit's `Result`
-/// `oom-kill`, never the exit status (137 is any SIGKILL). `None` when the
-/// envelope did not kill it.
-fn memory_limit(
-    scope: &Scope,
-    facts: &spawn_core::envelope::ScopeFacts,
-    peak: Option<u64>,
-    run: &Run,
-) -> Option<GateFailure> {
-    if !facts.oom_killed() {
-        return None;
-    }
-    let mut output = run.stdout.clone();
-    for line in run.stderr.lines() {
-        let _ = writeln!(output, "! {line}");
-    }
-    Some(GateFailure::MemoryLimit {
-        scope: scope.unit.clone(),
-        memory_high: scope.envelope.settings.gate.high,
-        memory_max: scope.envelope.settings.gate.max,
-        oom_kills: facts
-            .oom_kills
-            .max(u64::from(facts.result.as_deref() == Some("oom-kill"))),
-        memory_peak: peak.or(facts.memory_peak),
-        log: output,
-    })
 }
 
 /// The verdict of a finished gate run: the verdict file's, only after a
@@ -1437,10 +1329,6 @@ pub(crate) struct Run {
     pub(crate) status: ExitStatus,
     pub(crate) stdout: String,
     pub(crate) stderr: String,
-    /// The highest `memory.peak` the cgroup showed while it ran (objective
-    /// 029): the scope is gone once the gate ends, so this is what its
-    /// record can say.
-    pub(crate) memory_peak: Option<u64>,
 }
 
 /// Run a command with a wall clock and no stdin, its stdout and stderr in
@@ -1451,22 +1339,10 @@ pub(crate) struct Run {
 /// process group, and the whole group is killed when the gate ends or times
 /// out, so nothing the candidate started outlives the verdict (the gate's
 /// sandbox also dies with its parent).
-#[cfg(test)]
 pub(crate) fn run_bounded(
-    command: Command,
-    limit: Duration,
-    directory: &Path,
-) -> Result<Run, GateFailure> {
-    run_bounded_in(command, limit, directory, None)
-}
-
-/// [`run_bounded`] with a cgroup to sample while the command runs (the
-/// gate's scope, whose `memory.peak` goes with the cgroup).
-pub(crate) fn run_bounded_in(
     mut command: Command,
     limit: Duration,
     directory: &Path,
-    cgroup: Option<&Path>,
 ) -> Result<Run, GateFailure> {
     use std::os::unix::process::CommandExt as _;
 
@@ -1489,14 +1365,7 @@ pub(crate) fn run_bounded_in(
             .status();
     };
     let deadline = Instant::now() + limit;
-    let mut memory_peak: Option<u64> = None;
     let status = loop {
-        if let Some(cgroup) = cgroup
-            && let Ok(text) = std::fs::read_to_string(cgroup.join("memory.peak"))
-            && let Ok(peak) = text.trim().parse::<u64>()
-        {
-            memory_peak = Some(memory_peak.map_or(peak, |seen: u64| seen.max(peak)));
-        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
@@ -1517,7 +1386,6 @@ pub(crate) fn run_bounded_in(
         status,
         stdout: std::fs::read_to_string(&out_path).unwrap_or_default(),
         stderr: std::fs::read_to_string(&err_path).unwrap_or_default(),
-        memory_peak,
     })
 }
 
@@ -1543,98 +1411,12 @@ pub(crate) fn count_scenarios(directory: &Path) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaseDisagrees, Cpu, GateFailure, PrivateDirectory, Run, Scope, gate_env, judge, judge_in,
-        memory_limit, on_shared_server, run_bounded, withhold_owners_cluster, write_gate_env,
+        BaseDisagrees, Cpu, GateFailure, PrivateDirectory, gate_env, judge, judge_in,
+        on_shared_server, run_bounded, withhold_owners_cluster, write_gate_env,
     };
-    use spawn_core::envelope::{Envelope, Limits, Manager, ScopeFacts, Settings};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{Duration, Instant};
-
-    /// A gate's envelope: 30 MiB high, 32 MiB max, 8 MiB swap.
-    fn scope() -> Scope {
-        Scope {
-            unit: "spawn-gate-9-1.scope".to_string(),
-            envelope: Envelope {
-                settings: Settings {
-                    mode: spawn_core::envelope::Mode::Systemd,
-                    slice: "spawn.slice".to_string(),
-                    slice_high: 16 << 30,
-                    slice_max: 20 << 30,
-                    cpu_weight: 50,
-                    execution: Limits {
-                        high: 10 << 30,
-                        max: 12 << 30,
-                        swap_max: 4 << 30,
-                    },
-                    gate: Limits {
-                        high: 30 << 20,
-                        max: 32 << 20,
-                        swap_max: 8 << 20,
-                    },
-                },
-                manager: Manager {
-                    control_group: "/user.slice/user-1000.slice/user@1000.service".to_string(),
-                    runtime_dir: "/run/user/1000".to_string(),
-                },
-            },
-        }
-    }
-
-    #[test]
-    fn only_the_scopes_own_kill_is_a_memory_limit_not_an_exit_status() {
-        use std::os::unix::process::ExitStatusExt as _;
-        // A gate killed by a signal, exit status 137: any SIGKILL looks like
-        // that, so the status alone decides nothing.
-        let killed = Run {
-            status: std::process::ExitStatus::from_raw(137 << 8),
-            stdout: "gate: out".to_string(),
-            stderr: "! err".to_string(),
-            memory_peak: Some(33 << 20),
-        };
-        let quiet = ScopeFacts {
-            scope: "spawn-gate-9-1.scope".to_string(),
-            result: Some("success".to_string()),
-            load_state: Some("not-found".to_string()),
-            ..ScopeFacts::default()
-        };
-        assert!(memory_limit(&scope(), &quiet, killed.memory_peak, &killed).is_none());
-        // The scope's own facts say the memory limit killed it.
-        let killed_by_envelope = ScopeFacts {
-            scope: "spawn-gate-9-1.scope".to_string(),
-            result: Some("oom-kill".to_string()),
-            load_state: Some("failed".to_string()),
-            memory_peak: Some(33 << 20),
-            ..ScopeFacts::default()
-        };
-        let failure = memory_limit(&scope(), &killed_by_envelope, killed.memory_peak, &killed)
-            .expect("the envelope killed it");
-        match failure {
-            GateFailure::MemoryLimit {
-                scope,
-                memory_high,
-                memory_max,
-                oom_kills,
-                memory_peak,
-                log,
-            } => {
-                assert_eq!(scope, "spawn-gate-9-1.scope");
-                assert_eq!(memory_high, 30 << 20);
-                assert_eq!(memory_max, 32 << 20);
-                assert!(oom_kills > 0);
-                assert_eq!(memory_peak, Some(33 << 20));
-                assert!(log.contains("gate: out") && log.contains("! err"));
-            }
-            other => panic!("not a memory limit: {other:?}"),
-        }
-        // The cgroup's own counter counts too, without the unit's Result.
-        let counted = ScopeFacts {
-            scope: "spawn-gate-9-1.scope".to_string(),
-            oom_kills: 2,
-            ..ScopeFacts::default()
-        };
-        assert!(memory_limit(&scope(), &counted, None, &killed).is_some());
-    }
 
     fn cpu(pairs: &[(&str, &str)], cores: usize) -> Result<Cpu, String> {
         let pairs: Vec<(String, String)> = pairs
@@ -1921,7 +1703,6 @@ mod tests {
                 None,
                 env,
                 Duration::from_secs(20),
-                None,
             )
         }
     }
@@ -1947,7 +1728,6 @@ mod tests {
                 None,
                 env,
                 Duration::from_secs(20),
-                None,
             )
         }
     }

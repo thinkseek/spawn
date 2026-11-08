@@ -5,23 +5,10 @@ use spawn_core::id::SessionId;
 use crate::Flags;
 use crate::config::open_store;
 
-/// The fleet as JSON: one object per session the login may read, each live
-/// execution with its resource envelope (its scope, its memory now, its
-/// peak, its limits and its swap: objective 029) inside the slice's own.
+/// The fleet as JSON: one object per session the login may read.
 pub(crate) fn fleet() -> Result<i32, String> {
     let store = open_store()?;
-    let mut fleet = store.fleet_json().map_err(|error| error.to_string())?;
-    // A bad envelope setting does not hide the fleet: the rows then show
-    // what their cgroups say, without this process's settings.
-    let envelopes = crate::envelope::Runtime::from_env().ok();
-    let waits = store.admissions().map_err(|error| error.to_string())?;
-    if let Some(agents) = fleet.as_array_mut() {
-        crate::envelope::fleet(
-            envelopes.as_ref().and_then(|runtime| runtime.envelope()),
-            agents,
-        );
-        crate::envelope::admissions(agents, &waits);
-    }
+    let fleet = store.fleet_json().map_err(|error| error.to_string())?;
     println!(
         "{}",
         serde_json::to_string_pretty(&fleet).unwrap_or_else(|_| "[]".to_string())

@@ -95,47 +95,6 @@ export interface FleetAgent extends Labels {
   task: string | null;
   activity: Activity;
   judgement: Judgement | null;
-  /** The execution's resource envelope (objective 029): its scope's memory
-   * now, its peak, its limits and its swap, and the slice's; null when the
-   * host runs executions without one or the agent runs nothing. */
-  envelope: EnvelopeReading | null;
-  /** The admission wait it is in, when it has not started for lack of
-   * room: the measure, what it measured and the threshold. */
-  admission: AdmissionWait | null;
-}
-
-export interface EnvelopeReading {
-  scope: string;
-  memory_current: number | null;
-  memory_peak: number | null;
-  memory_high: number | null;
-  memory_max: number | null;
-  memory_swap_current: number | null;
-  memory_swap_max: number | null;
-  /** How often the cgroup was throttled at its MemoryHigh. */
-  throttled: number | null;
-  oom_kills: number;
-  slice: SliceReading | null;
-}
-
-export interface SliceReading {
-  name: string | null;
-  memory_high: number | null;
-  memory_max: number | null;
-  cpu_weight: number | null;
-  memory_current: number | null;
-  /** Anonymous and shared memory: what admission measures. */
-  measured_bytes: number | null;
-  oom_kills: number | null;
-}
-
-export interface AdmissionWait {
-  measure: "slice" | "host";
-  envelope_bytes: number;
-  measured_bytes: number;
-  threshold_bytes: number;
-  command_id: number | null;
-  at_ms: number | null;
 }
 
 export const LADDER_STEPS = [
@@ -389,8 +348,6 @@ function normalizeAgent(value: unknown): FleetAgent | null {
     attention: false,
     judged_at_ms: optionalNumber(raw.judged_at_ms),
     task: optionalText(raw.task),
-    envelope: normalizeEnvelope(raw.envelope),
-    admission: normalizeAdmission(raw.admission),
     activity: {
       current_tool: optionalText(activity.current_tool),
       jobs: normalizeJobs(activity.jobs),
@@ -401,50 +358,6 @@ function normalizeAgent(value: unknown): FleetAgent | null {
       executions: optionalNumber(activity.executions),
     },
     judgement,
-  };
-}
-
-/** A scope's numbers, as the server read them when the page loaded. */
-function normalizeEnvelope(value: unknown): EnvelopeReading | null {
-  if (!isObject(value)) return null;
-  const raw = value;
-  const slice = isObject(raw.slice)
-    ? {
-        name: optionalText(raw.slice.name),
-        memory_high: optionalNumber(raw.slice.memory_high),
-        memory_max: optionalNumber(raw.slice.memory_max),
-        cpu_weight: optionalNumber(raw.slice.cpu_weight),
-        memory_current: optionalNumber(raw.slice.memory_current),
-        measured_bytes: optionalNumber(raw.slice.measured_bytes),
-        oom_kills: optionalNumber(raw.slice.oom_kills),
-      }
-    : null;
-  return {
-    scope: text(raw.scope),
-    memory_current: optionalNumber(raw.memory_current),
-    memory_peak: optionalNumber(raw.memory_peak),
-    memory_high: optionalNumber(raw.memory_high),
-    memory_max: optionalNumber(raw.memory_max),
-    memory_swap_current: optionalNumber(raw.memory_swap_current),
-    memory_swap_max: optionalNumber(raw.memory_swap_max),
-    throttled: optionalNumber(raw.throttled),
-    oom_kills: optionalNumber(raw.oom_kills) ?? 0,
-    slice,
-  };
-}
-
-/** The admission wait an agent is in, when the server names one. */
-function normalizeAdmission(value: unknown): AdmissionWait | null {
-  if (!isObject(value)) return null;
-  const measure = text(value.measure);
-  if (measure !== "slice" && measure !== "host") return null;
-  return {
-    measure,
-    envelope_bytes: number(value.envelope_bytes),
-    measured_bytes: number(value.measured_bytes),
-    threshold_bytes: number(value.threshold_bytes),
-    command_id: optionalNumber(value.command_id),
-    at_ms: optionalNumber(value.at_ms),
   };
 }
 
