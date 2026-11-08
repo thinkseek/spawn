@@ -52,7 +52,20 @@
 # (default 2), GATE_RUNNER_PREFLIGHT_TIMEOUT (300), GATE_RUNNER_SHIP_TIMEOUT
 # (900), GATE_RUNNER_RUN_TIMEOUT (7200), GATE_RUNNER_COLLECT_TIMEOUT (600),
 # GATE_RUNNER_TOTAL_TIMEOUT (10800), GATE_RUNNER_ENV_FILE (--check: the
-# integrator's gate environment file, as deploy/deploy.sh reads it).
+# integrator's gate environment file, as deploy/deploy.sh reads it),
+# GATE_RUNNER_MIN_FREE_MEMORY_MB (the runner's memory floor, default 2048, 0
+# off; the integrator's SPAWN_GATE_MIN_FREE_MEMORY_MB for a gate run here),
+# GATE_RUNNER_REGISTRY (the cargo registry the runner's must hold, default
+# ${CARGO_HOME:-$HOME/.cargo}/registry; empty: no sync).
+#
+# The runner must judge in the environment this host judges in, or its
+# verdict is not this host's verdict. So before any job the dispatcher
+# refuses (exit 3) a runner that shows the host's files to the gate (an
+# OrbStack machine that is not --isolated), whose cargo config names a
+# rustc-wrapper it does not have, or whose memory is under the floor; and it
+# sends the runner whatever files of this host's cargo registry it lacks (the
+# gate builds offline from the registry: a crate missing there is a rejection
+# here of work this host accepts).
 #
 # Nothing here needs the live fleet: the runner gets its own server, its
 # own scratch and no database URL (a URL never goes on a command line, and
@@ -69,6 +82,8 @@ total_timeout=${GATE_RUNNER_TOTAL_TIMEOUT:-10800}
 ssh_cmd=${GATE_RUNNER_SSH:-ssh}
 remote_bin=${GATE_RUNNER_REMOTE_BIN:-'$HOME/.local/share/gate-runner/bin/remote'}
 env_file=${GATE_RUNNER_ENV_FILE:-}
+min_free_memory_mb=${GATE_RUNNER_MIN_FREE_MEMORY_MB:-2048}
+registry_src=${GATE_RUNNER_REGISTRY-${CARGO_HOME:-$HOME/.cargo}/registry}
 keep_jobs=0
 check=0
 stage_dir=""
@@ -111,6 +126,7 @@ while [ $# -gt 0 ]; do
     *) break ;;
     esac
 done
+case $min_free_memory_mb in '' | *[!0-9]*) die "GATE_RUNNER_MIN_FREE_MEMORY_MB is a whole number of MiB, not '$min_free_memory_mb'" 2 ;; esac
 for number in "$retries" "$preflight_timeout" "$ship_timeout" "$run_timeout" "$collect_timeout" "$total_timeout"; do
     case $number in '' | *[!0-9]*) die "not a whole number of seconds: $number" 2 ;; esac
 done
@@ -269,7 +285,7 @@ ask_preflight() {
 # require_runner <report>: what every job needs of the runner. A missing
 # tool is the runner's setup, not the candidate's: exit 3.
 require_runner() {
-    local report=$1 name value bad="" floor free there
+    local report=$1 name value bad="" floor free there memory jobs cpus
     for name in sh git tar gzip sha256sum nice timeout bwrap; do
         value=$(pv "$report" "$name")
         case $value in "" | missing | unreadable) bad="$bad $name" ;; esac
@@ -293,6 +309,57 @@ require_runner() {
     there=$(pv "$report" version)
     [ "$there" = "$local_remote_sha" ] ||
         die "the runner's helper is another version ($there, this tree's $local_remote_sha): rerun deploy/gate-runner/setup.sh there" 3
+    # The environment the gate judges in (the header): not the host's
+    # files, no build that cannot start, room in memory.
+    case "$(pv "$report" host_shares)" in
+    none) ;;
+    "") die "the runner reports no host_shares (its helper predates the check)" 3 ;;
+    *) die "the runner shows the host's files to the gate ($(pv "$report" host_shares)): candidate code could read them, and the gate's socket scan walks them (an OrbStack machine must be --isolated)" 3 ;;
+    esac
+    case "$(pv "$report" cargo_wrapper)" in
+    *" missing") die "the runner's cargo config ($(pv "$report" cargo_home)) names rustc-wrapper $(pv "$report" cargo_wrapper | cut -d' ' -f1), which its gate PATH lacks: every build would fail" 3 ;;
+    esac
+    memory=$(pv "$report" mem_available_kb)
+    if [ "$min_free_memory_mb" != 0 ]; then
+        case "$memory" in '' | *[!0-9]*) die "the runner cannot read its available memory" 3 ;; esac
+        [ "$memory" -ge $((min_free_memory_mb * 1024)) ] ||
+            die "the runner has $((memory / 1024)) MiB of memory available, under the floor of ${min_free_memory_mb} MiB (GATE_RUNNER_MIN_FREE_MEMORY_MB)" 3
+    fi
+    jobs=$(pv "$report" jobs)
+    cpus=$(pv "$report" cpus)
+    case "$jobs$cpus" in
+    '' | *[!0-9]*) ;;
+    *) [ "$jobs" -le "$cpus" ] || note "the runner runs $jobs scenarios at once on $cpus cores (its config's GATE_RUNNER_JOBS)" ;;
+    esac
+}
+
+# registry_missing <file>: ask the runner which files of this host's cargo
+# registry it lacks; their paths into <file>. Status: the transport's.
+registry_missing() {
+    local file=$1 limit
+    limit=$(stage_limit "$preflight_timeout")
+    (cd "$registry_src" && find . -type f -printf '%P\t%s\n') |
+        ssh_limited "$limit" "$remote_bin registry-need" >"$file" 2>"$file.err"
+}
+
+# sync_registry: the runner's registry holds every file of this host's, or
+# a die (exit 3: the runner cannot judge as this host does). Only what it
+# lacks is sent; nothing there is deleted.
+sync_registry() {
+    local need=$stage_dir/registry.need status=0 count limit
+    [ -n "$registry_src" ] || return 0
+    [ -d "$registry_src" ] || { note "no cargo registry at $registry_src; nothing to send"; return 0; }
+    registry_missing "$need" || status=$?
+    [ "$status" = 0 ] || die "the runner could not list its registry (exit $status): $(head -n 2 "$need.err" 2>/dev/null | tr '\n' ' ')" 3
+    count=$(wc -l <"$need")
+    [ "$count" != 0 ] || return 0
+    say "$prog: sending $count file(s) of the cargo registry the runner lacks"
+    limit=$(stage_limit "$ship_timeout")
+    tar -cf - -C "$registry_src" -T "$need" |
+        ssh_limited "$limit" "$remote_bin registry-accept" 2>"$need.err" ||
+        die "the registry files did not reach the runner: $(head -n 2 "$need.err" 2>/dev/null | tr '\n' ' ')" 3
+    registry_missing "$need" || die "the runner could not list its registry after the send" 3
+    [ ! -s "$need" ] || die "the runner still lacks $(wc -l <"$need") file(s) of the registry after the send" 3
 }
 
 # verify_collected <dir>: the MANIFEST, then the gate's exit and verdict.
@@ -440,6 +507,35 @@ if [ "$check" = 1 ]; then
         fi
         ;;
     esac
+    case "$(pv "$reportlines" host_shares)" in
+    none) report "isolation" ok "no host files visible to the gate" ;;
+    "") report "isolation" FAIL "the runner reports no host_shares" ;;
+    *) report "isolation" FAIL "the host's files are visible to the gate ($(pv "$reportlines" host_shares)): an OrbStack machine must be --isolated" ;;
+    esac
+    report "cores" ok "$(pv "$reportlines" cpus) (nproc $(pv "$reportlines" nproc), cpu.max '$(pv "$reportlines" cpu_max)'), $(pv "$reportlines" jobs) scenario(s) at once"
+    memory=$(pv "$reportlines" mem_available_kb)
+    case "$memory" in
+    '' | *[!0-9]*) report "memory" FAIL "cannot read the available memory" ;;
+    *)
+        detail="$((memory / 1024)) MiB available (memory.max '$(pv "$reportlines" mem_max)', swap '$(pv "$reportlines" swap_max)'), floor ${min_free_memory_mb} MiB"
+        if [ "$min_free_memory_mb" = 0 ] || [ "$memory" -ge $((min_free_memory_mb * 1024)) ]; then
+            report "memory" ok "$detail"
+        else
+            report "memory" FAIL "$detail"
+        fi
+        ;;
+    esac
+    case "$(pv "$reportlines" cargo_wrapper)" in
+    *" missing") report "cargo" FAIL "its config names rustc-wrapper $(pv "$reportlines" cargo_wrapper | cut -d' ' -f1), which the gate's PATH lacks" ;;
+    *) report "cargo" ok "rustc-wrapper $(pv "$reportlines" cargo_wrapper), home $(pv "$reportlines" cargo_home)" ;;
+    esac
+    if [ -n "$registry_src" ] && [ -d "$registry_src" ]; then
+        if registry_missing "$stage_dir/registry.need"; then
+            report "registry" ok "$(wc -l <"$stage_dir/registry.need") file(s) of this host's to send at dispatch"
+        else
+            report "registry" FAIL "the runner could not list its registry: $(head -n 1 "$stage_dir/registry.need.err" 2>/dev/null)"
+        fi
+    fi
     controller_lock=""
     [ ! -f "$controller/web/pnpm-lock.yaml" ] ||
         controller_lock=$(sha256sum "$controller/web/pnpm-lock.yaml" | cut -d' ' -f1)
@@ -541,6 +637,7 @@ fi
 say "$prog: job $job ($runner): $(printf '%s' "$base_sha" | cut -c1-12) -> $(printf '%s' "$candidate_sha" | cut -c1-12)"
 ask_preflight "$stage_dir"
 require_runner "$stage_dir/preflight"
+sync_registry
 
 attempt=0
 max_attempts=$((retries + 1))
@@ -631,13 +728,13 @@ while [ "$attempt" -lt "$max_attempts" ]; do
             failed=result
         fi
     fi
-    ms=$(((SECONDS - started) * 1000))
+    seconds=$((SECONDS - started))
     if [ "$collected_ok" = 1 ]; then
-        record="$record,\"gate_exit\":$gate_exit,\"seconds\":$ms,\"result\":\"$(result_kind "$gate_exit")\"}"
+        record="$record,\"gate_exit\":$gate_exit,\"seconds\":$seconds,\"result\":\"$(result_kind "$gate_exit")\"}"
         attempts_json+=("$record")
         break
     fi
-    record="$record,\"seconds\":$ms,\"result\":\"${failed}\"}"
+    record="$record,\"seconds\":$seconds,\"result\":\"${failed}\"}"
     attempts_json+=("$record")
     if [ "$failed" != transport ]; then
         break

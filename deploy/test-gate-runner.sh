@@ -74,6 +74,10 @@ trap cleanup EXIT
 export SPAWN_GATE_MIN_FREE_GB=0
 export SPAWN_GATE_JOBS=2
 export SPAWN_GATE_PG_BIN=$pg_bin
+# The registry sync and the memory floor have cases of their own (8l-8n);
+# the others do not depend on this host's cargo registry or its free memory.
+export GATE_RUNNER_REGISTRY=""
+export GATE_RUNNER_MIN_FREE_MEMORY_MB=0
 export XDG_CACHE_HOME=$scratch/local-cache
 mkdir -p "$XDG_CACHE_HOME"
 
@@ -169,6 +173,7 @@ shift # the host
 cmd=$*
 action=""
 case $cmd in
+*registry-*) action=registry ;;
 *accept*) action=ship ;;
 *" run "*) action=run ;;
 *" keys "*) action=keys ;;
@@ -244,6 +249,8 @@ expect "the verdict names the commits judged" \
     "$(jq -r '.base + " " + .candidate' "$job/verdict.json")" "$base $candidate"
 expect "the record names one attempt" "$(jq -r '.attempts | length' "$job/record.json")" 1
 expect "and its result" "$(jq -r '.result' "$job/record.json")" verdict
+expect "the attempt's time is in seconds (a gate of exit 0 here takes well under 600)" \
+    "$(jq '.attempts[0].seconds | (. >= 0 and . < 600 and . == floor)' "$job/record.json")" true
 expect "the whole log comes back" \
     "$(jq -r '.attempts[0].ship + " " + .attempts[0].run + " " + .attempts[0].collect' "$job/record.json")" \
     "ok ok ok"
@@ -447,6 +454,117 @@ TMPDIR=$HOME/.cache sh "$repo/deploy/gate-runner/setup.sh" --root "$tmpdir_root"
     fail "a root under the setup shell's TMPDIR was refused: $(head -n 1 "$scratch/setup3.err")"
 rm -rf "$tmpdir_root"
 
+# The fake runner's settings, kept: the cases below change them.
+cp "$runner_home/config" "$scratch/config.orig"
+nothing_ran() { # <what>: no job directory came back to $out
+    if [ ! -d "$out" ] || [ -z "$(find "$out" -mindepth 1 -maxdepth 1 -type d -not -name '.*')" ]; then
+        pass "$1"
+    else
+        fail "$1: a job came back to $out"
+    fi
+}
+
+# 8j. What a gate gets is the cgroup's, not the VM's: cpu.max caps nproc
+# (rounded up), memory.max less memory.current caps MemAvailable, and the
+# default scenarios at once is half the capped cores.
+fakecg=$scratch/cgroup
+mkdir -p "$fakecg"
+printf '150000 100000\n' >"$fakecg/cpu.max"
+printf '%s\n' $((3 * 1073741824)) >"$fakecg/memory.max"
+printf '%s\n' 1073741824 >"$fakecg/memory.current"
+printf 'MemTotal:       16000000 kB\nMemAvailable:   12000000 kB\n' >"$scratch/meminfo"
+sed -i 's/^GATE_RUNNER_JOBS=.*/GATE_RUNNER_JOBS=/' "$runner_home/config"
+GATE_RUNNER_CGROUP=$fakecg GATE_RUNNER_MEMINFO=$scratch/meminfo \
+    "$runner_home/bin/remote" preflight >"$scratch/preflight.out" 2>/dev/null
+want_cpus=2
+[ "$(nproc)" -ge 2 ] || want_cpus=$(nproc)
+expect "cores: nproc capped by cpu.max, rounded up" "$(sed -n 's/^cpus=//p' "$scratch/preflight.out")" "$want_cpus"
+expect "memory: what memory.max leaves above memory.current" \
+    "$(sed -n 's/^mem_available_kb=//p' "$scratch/preflight.out")" 2097152
+expect "the default scenarios at once: half the capped cores" "$(sed -n 's/^jobs=//p' "$scratch/preflight.out")" 1
+printf 'max 100000\n' >"$fakecg/cpu.max"
+printf 'max\n' >"$fakecg/memory.max"
+GATE_RUNNER_CGROUP=$fakecg GATE_RUNNER_MEMINFO=$scratch/meminfo \
+    "$runner_home/bin/remote" preflight >"$scratch/preflight.out" 2>/dev/null
+expect "no quota: nproc" "$(sed -n 's/^cpus=//p' "$scratch/preflight.out")" "$(nproc)"
+expect "no memory.max: MemAvailable" "$(sed -n 's/^mem_available_kb=//p' "$scratch/preflight.out")" 12000000
+cp "$scratch/config.orig" "$runner_home/config"
+
+# 8k. A runner that shows the host's files to the gate (an OrbStack machine
+# that is not --isolated mounts the Mac at /mnt/mac) is refused before any
+# ship; lxcfs and fusectl are the machine's own, not the host's.
+printf 'mac /mnt/mac virtiofs rw 0 0\nlxcfs /proc/meminfo fuse.lxcfs rw 0 0\n' >"$scratch/mounts"
+printf '/dev/vdb1 /mnt/machines/spawn btrfs rw 0 0\n' >>"$scratch/mounts"
+reset "$out"
+GATE_RUNNER_MOUNTS=$scratch/mounts dispatch "$runner_home" "$repo_git" "$base" "$candidate" "$scen" "$out"
+expect "a runner showing the host's files is refused: exit 3" "$status" 3
+contains "and says why" "$scratch/dispatch.err" "an OrbStack machine must be --isolated"
+contains "naming the shares, the host's and another machine's" "$scratch/dispatch.err" "(/mnt/mac,/mnt/machines/spawn)"
+lacks "lxcfs is not a host share" "$scratch/dispatch.err" "/proc/meminfo"
+nothing_ran "nothing was shipped or run"
+check_status=0
+GATE_RUNNER_MOUNTS=$scratch/mounts "$repo/deploy/gate-runner.sh" --check "$runner_home" "$repo_git" "$base" "$keysscen" \
+    >"$scratch/check.out" 2>"$scratch/check.err" || check_status=$?
+expect "--check on that runner: exit 1" "$check_status" 1
+contains "with isolation a failure" "$scratch/check.out" "isolation    FAIL"
+printf 'lxcfs /proc/meminfo fuse.lxcfs rw 0 0\nfusectl /sys/fs/fuse/connections fusectl rw 0 0\n' >"$scratch/mounts"
+GATE_RUNNER_MOUNTS=$scratch/mounts "$runner_home/bin/remote" preflight >"$scratch/preflight.out" 2>/dev/null
+expect "lxcfs and fusectl alone: no host share" "$(sed -n 's/^host_shares=//p' "$scratch/preflight.out")" none
+
+# 8l. A cargo config naming a rustc-wrapper the gate's PATH lacks (the
+# primary's kache config copied to a runner without kache) is refused: every
+# build there would fail, and the gate would reject the work.
+mkdir -p "$scratch/rcargo"
+printf '[build]\nrustc-wrapper = "no-such-wrapper-%s"\n' "$$" >"$scratch/rcargo/config.toml"
+printf "GATE_RUNNER_CARGO_HOME='%s'\n" "$scratch/rcargo" >>"$runner_home/config"
+reset "$out"
+dispatch "$runner_home" "$repo_git" "$base" "$candidate" "$scen" "$out"
+expect "a runner whose cargo wrapper is missing is refused: exit 3" "$status" 3
+contains "and says which" "$scratch/dispatch.err" "names rustc-wrapper no-such-wrapper-$$"
+nothing_ran "nothing was run on it"
+cp "$scratch/config.orig" "$runner_home/config"
+
+# 8m. The runner's registry gets what it lacks of this host's before the
+# job: only the missing files and those of another size, nothing deleted
+# there (a running gate binds it read-only), and nothing when in step.
+regsrc=$scratch/reg-src
+mkdir -p "$regsrc/index/x" "$regsrc/cache/y"
+printf 'a\n' >"$regsrc/index/x/one"
+printf 'bb\n' >"$regsrc/cache/y/two.crate"
+mkdir -p "$scratch/rcargo2"
+printf "GATE_RUNNER_CARGO_HOME='%s'\n" "$scratch/rcargo2" >>"$runner_home/config"
+reset "$out"
+GATE_RUNNER_REGISTRY=$regsrc dispatch "$runner_home" "$repo_git" "$base" "$candidate" "$scen" "$out"
+expect "a dispatch to a runner with no registry: the gate's 0" "$status" 0
+[ "$status" = 0 ] || sed -n '1,5s/^/      /p' "$scratch/dispatch.err"
+contains "the files it lacked are sent" "$scratch/dispatch.out" "sending 2 file(s) of the cargo registry"
+diff -r "$regsrc" "$scratch/rcargo2/registry" >/dev/null && pass "the runner's registry is this host's" ||
+    fail "the runner's registry differs from this host's"
+printf 'ccc\n' >"$regsrc/cache/y/two.crate"
+printf 'theirs\n' >"$scratch/rcargo2/registry/extra"
+reset "$out"
+GATE_RUNNER_REGISTRY=$regsrc dispatch "$runner_home" "$repo_git" "$base" "$candidate" "$scen" "$out"
+contains "a file of another size is sent again" "$scratch/dispatch.out" "sending 1 file(s) of the cargo registry"
+cmp -s "$regsrc/cache/y/two.crate" "$scratch/rcargo2/registry/cache/y/two.crate" && pass "and replaced there" ||
+    fail "the changed file was not replaced"
+[ -f "$scratch/rcargo2/registry/extra" ] && pass "nothing of the runner's own is deleted" ||
+    fail "the runner's own file was deleted"
+reset "$out"
+GATE_RUNNER_REGISTRY=$regsrc dispatch "$runner_home" "$repo_git" "$base" "$candidate" "$scen" "$out"
+lacks "in step, nothing is sent" "$scratch/dispatch.out" "sending"
+check_status=0
+GATE_RUNNER_REGISTRY=$regsrc "$repo/deploy/gate-runner.sh" --check "$runner_home" "$repo_git" "$base" "$keysscen" \
+    >"$scratch/check.out" 2>"$scratch/check.err" || check_status=$?
+contains "--check reports the registry" "$scratch/check.out" "0 file(s) of this host's to send at dispatch"
+cp "$scratch/config.orig" "$runner_home/config"
+
+# 8n. A runner whose memory is under the floor is refused, before any ship.
+reset "$out"
+GATE_RUNNER_MIN_FREE_MEMORY_MB=99999999 dispatch "$runner_home" "$repo_git" "$base" "$candidate" "$scen" "$out"
+expect "a runner under the memory floor is refused: exit 3" "$status" 3
+contains "and says by how much" "$scratch/dispatch.err" "under the floor of 99999999 MiB"
+nothing_ran "nothing was run on it"
+
 # 9. --check: a runner whose helper is another version.
 cp "$runner_home/bin/remote" "$scratch/remote.orig"
 printf '\n# edited\n' >>"$runner_home/bin/remote"
@@ -458,8 +576,12 @@ contains "and says to rerun setup.sh" "$scratch/check.out" "rerun setup.sh there
 cp "$scratch/remote.orig" "$runner_home/bin/remote"
 
 # 10. --check: a runner whose toolchain is not this host's (the key differs).
+# Its cargo home is its own and names no rustc-wrapper: this host's may name
+# one its PATH lacks (case 8l), and the toolchain is to be the only change.
+mkdir -p "$scratch/rcargo-plain"
 GATE_RUNNER_ROOT=$runner_home PATH=/usr/bin:/bin sh "$repo/deploy/gate-runner/setup.sh" \
     --root "$runner_home" --pg-bin "$pg_bin" --jobs 2 --min-free-gb 0 --nice 10 --force \
+    --cargo-home "$scratch/rcargo-plain" \
     >"$scratch/setup2.out" 2>"$scratch/setup2.err" || {
     printf '%s: setup.sh --force failed:\n' "$prog" >&2
     cat "$scratch/setup2.err" >&2

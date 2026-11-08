@@ -19,8 +19,12 @@
 #   --pg-bin <dir>      or the PostgreSQL programs' directory
 #                       (default: the newest /usr/lib/postgresql/*/bin)
 #   --jobs <n>          scenarios at once, SPAWN_GATE_JOBS (default: half
-#                       the cores, at most 8)
+#                       the cores the gate really gets, at most 8, measured
+#                       by remote.sh on every run: nproc capped by cpu.max)
 #   --min-free-gb <n>   the gate's disk floor (default 10)
+#   --disk-limit-gb <n> the machine's disk limit when df cannot see it (an
+#                       OrbStack --disk limit; default 0, none)
+#   --cargo-home <dir>  the CARGO_HOME the gate binds (default $HOME/.cargo)
 #   --nice <n>          the gate's nice level (default 10)
 #   --keep-days <n>     prune job directories older than this on the runner
 #                       (default 7; 0 keeps them)
@@ -40,6 +44,8 @@ jobs=""
 min_free=""
 nice=""
 keep_days=""
+disk_limit=""
+cargo_home=""
 force=""
 
 say() { printf '%s\n' "$*"; }
@@ -55,6 +61,8 @@ while [ $# -gt 0 ]; do
     --min-free-gb) shift; [ $# -gt 0 ] || die "--min-free-gb needs a number"; min_free=$1 ;;
     --nice) shift; [ $# -gt 0 ] || die "--nice needs a number"; nice=$1 ;;
     --keep-days) shift; [ $# -gt 0 ] || die "--keep-days needs a number"; keep_days=$1 ;;
+    --disk-limit-gb) shift; [ $# -gt 0 ] || die "--disk-limit-gb needs a number"; disk_limit=$1 ;;
+    --cargo-home) shift; [ $# -gt 0 ] || die "--cargo-home needs a directory"; cargo_home=$1 ;;
     --force) force=1 ;;
     -h | --help)
         awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
@@ -88,16 +96,25 @@ case "$root" in
     ;;
 esac
 
-# The defaults, from what this machine has.
-[ -n "$jobs" ] || jobs=$(($(nproc) / 2))
-[ "$jobs" -ge 1 ] || jobs=1
-[ "$jobs" -le 8 ] || jobs=8
+# The defaults, from what this machine has. No --jobs leaves it to remote.sh,
+# which measures the cores a gate gets on every run (a machine's limits can
+# change after setup; nproc here would freeze the VM's count).
+if [ -n "$jobs" ]; then
+    case "$jobs" in '' | *[!0-9]*) die "not a whole number: $jobs" ;; esac
+    [ "$jobs" -ge 1 ] || jobs=1
+    [ "$jobs" -le 8 ] || jobs=8
+fi
 [ -n "$min_free" ] || min_free=10
 [ -n "$nice" ] || nice=10
 [ -n "$keep_days" ] || keep_days=7
-for number in "$jobs" "$min_free" "$nice" "$keep_days"; do
+[ -n "$disk_limit" ] || disk_limit=0
+for number in "$min_free" "$nice" "$keep_days" "$disk_limit"; do
     case "$number" in '' | *[!0-9]*) die "not a whole number: $number" ;; esac
 done
+case "$cargo_home" in
+'' | /*) ;;
+*) die "--cargo-home must be absolute: $cargo_home" ;;
+esac
 if [ -z "$pg_image$pg_bin" ]; then
     if command -v docker >/dev/null 2>&1; then
         pg_image=postgres:16-alpine
@@ -141,6 +158,8 @@ else
         printf "GATE_RUNNER_PATH='%s'\n" "$PATH"
         printf 'GATE_RUNNER_KEEP_JOBS=%s\n' 0
         printf 'GATE_RUNNER_KEEP_DAYS=%s\n' "$keep_days"
+        printf 'GATE_RUNNER_DISK_LIMIT_GB=%s\n' "$disk_limit"
+        printf "GATE_RUNNER_CARGO_HOME='%s'\n" "$cargo_home"
     } >"$config"
     chmod 600 "$config"
     say "wrote $config"

@@ -43,7 +43,29 @@ until the PoC is measured and the owner says to switch.
   build a gate does anywhere.
 - **CPU**: gates are CPU- and memory-bound and IO-free; a runner with fewer
   cores than the primary simply takes fewer scenarios at once
-  (`SPAWN_GATE_JOBS`, half the cores at most 8 by default).
+  (`SPAWN_GATE_JOBS`, half the cores at most 8 by default). The cores are
+  the ones a gate really gets: `nproc` capped by the cgroup's `cpu.max`. A
+  machine inside a shared VM (OrbStack, a container) shows the whole VM to
+  `nproc` and `/proc/meminfo`; its own limits are in `/sys/fs/cgroup`.
+- **Memory**: `GATE_RUNNER_MIN_FREE_MEMORY_MB` (default 2048) available,
+  measured as `MemAvailable` capped by `memory.max` less `memory.current`;
+  under it the dispatch is refused (exit 3). A machine with no swap
+  (`memory.swap.max` 0) kills a gate over its limit rather than slowing it.
+- **Isolation from its host**: no host files visible (virtiofs, 9p, a fuse
+  file system other than lxcfs, OrbStack's `/mnt/mac`). The gate's sandbox
+  starts from a read-only `/`, so on such a machine candidate code reads the
+  host's files, and the gate's socket scan walks the host's whole disk (on
+  an OrbStack machine made without `--isolated`, for more than an hour). The
+  dispatcher refuses such a runner (exit 3).
+- **The cargo registry the primary's gate builds from.** The gate builds
+  offline from the registry it binds read-only, so a crate the primary has
+  and the runner lacks makes the runner reject work the primary accepts —
+  as a verdict, not a host fault. The dispatcher sends the runner whatever
+  files of its registry the runner lacks before every job (only those; it
+  never deletes there). **Not** the primary's cargo config: a
+  `rustc-wrapper` it names (the primary's `kache`) must be on the runner's
+  gate `PATH`, or every build fails; the dispatcher refuses a runner whose
+  config names a wrapper it lacks.
 - **The UI's dependencies**, if the gate is to run `check-web.sh`: install
   the controller's `web/` dependencies in a checkout and point setup at it
   (`--web <checkout>/web`). Without it the check reports the gap and
@@ -60,7 +82,13 @@ until the PoC is measured and the owner says to switch.
   Keep the root short, too: a Unix socket path is at most 107 bytes, and
   the gate's own server puts one about 40 bytes below `TMPDIR`; a root
   whose path is too long moves the job's scratch to `/tmp/gate-runner/<job>`
-  (and then the disk floor is measured on `/tmp`).
+  (and then the disk floor is measured on `/tmp`; where `/tmp` is a tmpfs,
+  the preflight's `tmp_fs`, that scratch is memory).
+- **Disk, as the machine's limit sees it**: `df` cannot see a limit that is
+  a quota on a shared file system (an OrbStack `--disk` limit is a btrfs
+  quota: `df` shows the whole shared disk). Give the limit to setup
+  (`--disk-limit-gb`), and the free disk is the smaller of `df`'s and the
+  limit less what `du` counts on `/`.
 
 What it must **not** have: no engines, no workspaces, no tmux sessions, no
 live database. `setup.sh` wants nothing of the fleet, and the dispatcher
@@ -78,8 +106,9 @@ It writes `~/.local/share/gate-runner/config` (mode 0600), installs
 `~/.local/share/gate-runner/bin/remote`, makes `jobs/`, `cache/` and `work/`,
 links `web/node_modules` in, and ends by printing the preflight report
 (`remote preflight`), the same one `--check` reads. Options:
-`--root`, `--pg-image`, `--pg-bin`, `--jobs`, `--min-free-gb`, `--nice`,
-`--keep-days`; `--force` rewrites a config the owner may have tuned. A plain
+`--root`, `--pg-image`, `--pg-bin`, `--jobs` (unset: measured on every
+run), `--min-free-gb`, `--nice`, `--keep-days`, `--disk-limit-gb`,
+`--cargo-home`; `--force` rewrites a config the owner may have tuned. A plain
 rerun keeps the config and reinstalls only the helper.
 
 The helper's sha256 is the protocol version: the dispatcher refuses a runner
@@ -131,8 +160,10 @@ deploy/gate-runner.sh --check <runner> <source.git> <base> <scenarios>
 
 It reports what the runner has — helper version, git/tar/gzip/sha256sum/
 nice/timeout/bwrap, rustc/cargo/node/psql/python3/jq (a missing one is a
-failure), the private server, free disk against the floor, the UI's
-lockfile against the controller's — and then asks the
+failure), the private server, free disk against the floor, isolation from
+the host, the cores and memory a gate gets, the cargo wrapper, how many
+registry files the next dispatch would send, the UI's lockfile against the
+controller's — and then asks the
 question the base cache depends on: **does the runner compute the same
 base-cache key this host does?** It ships the archive, runs
 `gate.sh --base-keys` on the runner and the same script here, and compares
@@ -153,7 +184,10 @@ Exit 0: compatible. 1: not. 3: the runner could not be asked.
 ## The protocol (for a reader of `remote.sh`)
 
 `remote version | preflight | accept <job> | run <job> <seconds> |
-keys <job> <seconds> | collect <job> | remove <job>`. `accept` takes the
+keys <job> <seconds> | collect <job> | remove <job> | registry-need |
+registry-accept`. `registry-need` reads the primary's registry listing
+(`<path>\t<size>`) and prints what the runner lacks; `registry-accept`
+unpacks those files, adding and replacing only. `accept` takes the
 job's tar.gz on stdin and installs it whole or not at all; `collect` writes
 a MANIFEST of sha256s and the result files as one tar.gz on stdout; the
 dispatcher verifies the manifest before it believes anything. The runner's
