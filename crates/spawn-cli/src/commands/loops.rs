@@ -585,7 +585,18 @@ impl Fleet {
                 }
             }
         }
-        wait_unless_stopped(self.listener.as_mut(), pause, stopping)
+        match wait_unless_stopped(self.listener.as_mut(), pause, stopping) {
+            Waited::Stopped => true,
+            Waited::Notified | Waited::TimedOut => false,
+            // A dead listening connection is no hint and no reason to spin:
+            // the loop waits out the interval (its watermark read is the
+            // record either way) and opens a fresh listener next pass.
+            Waited::Lost => {
+                eprintln!("spawn loop: listen: the notification connection is gone; reopening");
+                self.listener = None;
+                pause_unless_stopped(pause, stopping)
+            }
+        }
     }
 }
 
