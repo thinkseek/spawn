@@ -1152,7 +1152,14 @@ fn judge_in(
         .env_clear()
         .envs(env.iter().map(|(name, value)| (name, value)))
         .env("SPAWN_GATE_VERDICT", &verdict_path);
-    let run = match run_bounded(command, limit, directory.path()) {
+    let run = run_bounded(command, limit, directory.path());
+    // The base check is read before anything else of the run, so a gate the
+    // wall clock killed (a timeout) still says main passed it.
+    *seen = std::fs::read_to_string(&verdict_path)
+        .ok()
+        .as_deref()
+        .and_then(seen_base_check);
+    let run = match run {
         Ok(run) => run,
         Err(GateFailure::Failed(error)) => {
             return Err(short(
@@ -1165,7 +1172,6 @@ fn judge_in(
         Err(other) => return Err(other),
     };
     let verdict = std::fs::read_to_string(&verdict_path).ok();
-    *seen = verdict.as_deref().and_then(seen_base_check);
     match decide(&run, verdict.as_deref()) {
         // Exit 5 with no readable fact: the gate said "no room" but could
         // not write it down. It also prints the fact, so read that before
@@ -1939,6 +1945,15 @@ mod tests {
             &self,
             env: &[(String, String)],
         ) -> (Result<super::Verdict, GateFailure>, Option<String>) {
+            self.judge_seeing_within(env, Duration::from_secs(20))
+        }
+
+        /// [`FakeGate::judge_seeing`] with the gate's wall clock `limit`.
+        fn judge_seeing_within(
+            &self,
+            env: &[(String, String)],
+            limit: Duration,
+        ) -> (Result<super::Verdict, GateFailure>, Option<String>) {
             let path = |name: &str| -> PathBuf { self.directory.path().join(name) };
             super::judge_seeing_base_check(
                 &path("gate.sh"),
@@ -1948,7 +1963,7 @@ mod tests {
                 &path("scenarios"),
                 None,
                 env,
-                Duration::from_secs(20),
+                limit,
             )
         }
     }
@@ -2573,6 +2588,14 @@ mod tests {
         }
         let without = FakeGate::new("echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n");
         assert_eq!(without.judge_seeing(&path_only()).1, None);
+        // The integrator's wall clock kills the gate after the base check
+        // passed: still seen.
+        let killed = FakeGate::new(
+            "echo '{\"base_check\":\"check-tests.sh\",\"base\":\"b\",\"candidate\":\"c\"}' >\"$SPAWN_GATE_VERDICT\"\nexec sleep 30\n",
+        );
+        let (judged, seen) = killed.judge_seeing_within(&path_only(), Duration::from_millis(500));
+        assert!(matches!(judged, Err(GateFailure::Timeout)), "{judged:?}");
+        assert_eq!(seen.as_deref(), Some("check-tests.sh"));
         let none = FakeGate::new("exit 3\n");
         assert_eq!(none.judge_seeing(&path_only()).1, None);
     }
