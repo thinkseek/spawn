@@ -398,6 +398,16 @@ create index if not exists spawn_commands_failed
     on spawn_commands (finished_at_ms)
     where succeeded = false;
 
+-- A session's commands by who sent them: the dispatcher's facts read one
+-- session's dispatcher commands (what it already sent, its deliveries and
+-- nudges, the tags the supervisor was told) on every pass, and these two
+-- keys are what those reads need. Both are plain, so a read of one session
+-- is a range scan of its own, never a scan of the table; a database made
+-- before this pass gets them on its next `spawn init-db` (the upgrade
+-- test's first shapes included).
+create index if not exists spawn_commands_by_session
+    on spawn_commands (session_id, principal, id);
+
 -- A grant either lets a principal read an agent's views (`read`) or also
 -- submit commands for it (`all`). `agent_id` is an id, `*`, or a prefix
 -- pattern such as `agent_worker_*`, so the supervisor can command every worker
