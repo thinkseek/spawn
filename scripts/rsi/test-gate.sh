@@ -4,6 +4,13 @@
 # dependencies, offline). Prints one line per case and exits non-zero on
 # the first wrong verdict. Needs bwrap, as the gate does.
 #
+# Run it with a private TMPDIR (e.g. TMPDIR=/data/tmp/<you>-suite), never the
+# shared one: the suite's own scratch and sockets then stay out of /tmp, and
+# case 20's killed gate — which no trap cleans up — leaves its scratch in
+# that TMPDIR for the case to remove. (The cleanup removes only the killed
+# gate's own scratch, found by its session, but a private TMPDIR keeps any
+# lapse local.)
+#
 # usage: scripts/rsi/test-gate.sh
 set -eu
 
@@ -19,10 +26,13 @@ work=$(mktemp -d)
 export SPAWN_GATE_MIN_FREE_GB=0
 # A file in the host's /tmp, which the sandbox must not show.
 marker=$(mktemp /tmp/test-gate-marker.XXXXXX)
-# Background helpers (listeners, fake servers) are killed on exit.
+# Background helpers (listeners, fake servers) are killed on exit. One case
+# copies the gate under /var/tmp (a root the sandbox empties); its scratch is
+# removed on exit too, whatever happens in between.
 background=""
+masked=$work/no-masked-root
 # shellcheck disable=SC2086 # pids
-trap 'kill $background 2>/dev/null || true; rm -rf "$work" "$marker"' EXIT
+trap 'kill $background 2>/dev/null || true; rm -rf "$work" "$marker" "$masked"' EXIT
 
 # The owner's home, with secrets the candidate must not read. The gate's base
 # cache goes under it too, never into the real one.
@@ -1806,6 +1816,20 @@ expect "and the gate that waited says how long, and the slot it took" \
 expect "and it was visible while it waited" \
     "$(cat "$work/slots-a.log" "$work/slots-b.log")" \
     "waiting for a host scenario slot (all 1 taken, shared by every gate on this host)"
+# The host's own statement outranks the environment: with host_jobs set to
+# 1, a gate given SPAWN_GATE_HOST_JOBS=2 still takes one slot, and the
+# no-file caveat is not said.
+mkdir -p "$HOME/.cache/spawn/gate-slots"
+printf '1\n' >"$HOME/.cache/spawn/gate-slots/host_jobs"
+slot_run f 2 1 >/dev/null & slot_f=$!
+slot_run g 2 1 >/dev/null & slot_g=$!
+wait "$slot_f" "$slot_g"
+expect "a host_jobs file outranks SPAWN_GATE_HOST_JOBS" \
+    "$(overlaps $(slot_window "$work/slots-f.log" 1) $(slot_window "$work/slots-g.log" 1))" apart
+expect "and its number is the one stated" "$(cat "$work/slots-f.log")" \
+    '| host scenario slots: 1 (every gate on this host takes one per scenario run)'
+refuse "and no no-file caveat is said" "$(cat "$work/slots-f.log")" "host_jobs file"
+rm -f "$HOME/.cache/spawn/gate-slots/host_jobs"
 slot_run c 2 1 >/dev/null & slot_c=$!
 slot_run d 2 1 >/dev/null & slot_d=$!
 wait "$slot_c" "$slot_d"
@@ -1823,7 +1847,12 @@ cp "$scenarios/protected" "$slowslots/"
 printf '#!/bin/sh\nsleep 30\nexit 0\n' >"$slowslots/check-slow.sh"
 killed_pidfile=$work/slots-killed.pid
 rm -f "$killed_pidfile"
-slots_before=$(ls -d "${TMPDIR:-/tmp}"/spawn-gate.* 2>/dev/null || true)
+# The killed gate's scratch is its own (no trap ran): find it while its
+# processes exist — the gate is a setsid leader, so every process of it has
+# that session id — and remove only that directory afterwards, never another
+# gate's scratch that a shared TMPDIR may hold.
+bystander=${TMPDIR:-/tmp}/spawn-gate.bystander.$$
+mkdir -p "$bystander"
 XDG_CACHE_HOME="$work/caches/slots-kill" SPAWN_GATE_JOBS=1 SPAWN_GATE_HOST_JOBS=1 \
     setsid sh -c 'echo $$ >"$1"; shift; exec "$@"' _ "$killed_pidfile" \
     sh "$gate" "$repo" "$base" "$good" "$slowslots" >"$work/slots-killed.log" 2>&1 &
@@ -1846,15 +1875,23 @@ done
 # No `--`: this file's sh is dash, whose kill reads "--" as a signal option
 # and (-"$pid" never delivered) left the gate alive. A negative pid names the
 # process group; the gate is its own session leader (setsid above).
-kill -KILL "-$killed_gate" 2>/dev/null || { echo "FAIL the killed gate could not be killed"; exit 1; }
-# The killed gate's scratch is its own (no trap ran): take it, and only it.
-for scratch_dir in "${TMPDIR:-/tmp}"/spawn-gate.*; do
-    [ -e "$scratch_dir" ] || continue
-    case " $slots_before " in
-    *" $scratch_dir "*) ;;
-    *) rm -rf "$scratch_dir" ;;
-    esac
+killed_scratch=""
+for killed_pid in $(ps -eo pid=,sess= | awk -v s="$killed_gate" '$2 == s { print $1 }'); do
+    for killed_fd in /proc/"$killed_pid"/fd/*; do
+        killed_path=$(readlink "$killed_fd" 2>/dev/null) || continue
+        case "$killed_path" in
+        "${TMPDIR:-/tmp}"/spawn-gate.*)
+            killed_rest=${killed_path#"${TMPDIR:-/tmp}"/spawn-gate.}
+            killed_scratch=${killed_rest%%/*}
+            ;;
+        esac
+    done
 done
+kill -KILL "-$killed_gate" 2>/dev/null || { echo "FAIL the killed gate could not be killed"; exit 1; }
+[ -z "$killed_scratch" ] || rm -rf "${TMPDIR:-/tmp}/spawn-gate.$killed_scratch"
+expect "and it removes only the killed gate's scratch" \
+    "$([ -e "$bystander" ] && echo kept || echo gone)" kept
+rm -rf "$bystander"
 waited=0
 until flock -n "$slot_file" true 2>/dev/null; do
     sleep 0.1
@@ -1870,5 +1907,61 @@ XDG_CACHE_HOME="$work/caches/slots-kill" SPAWN_GATE_JOBS=1 SPAWN_GATE_HOST_JOBS=
 expect "and the next gate runs at once: exit 0" "$killed_run" 0
 expect "without waiting for a slot" "$([ $(( $(date +%s) - started )) -lt 20 ] && echo quick)" quick
 refuse "and its log says no wait" "$(cat "$work/slots-after-kill.log")" "waited"
+# A run that cannot get a slot within its bound: no room to judge now (exit
+# 5, the slot-shaped no-room fact), never a verdict; it starts nothing, and
+# the holder keeps and then frees its slot. The bound is 30 min; the test's
+# seam says 2 s, which is what SPAWN_GATE_SLOT_WAIT_SECS is for.
+waitfold=$work/slots-wait
+mkdir -p "$waitfold"
+cp "$scenarios/protected" "$waitfold/"
+printf '#!/bin/sh\nsleep 5\nexit 0\n' >"$waitfold/check-hold.sh"
+XDG_CACHE_HOME="$work/caches/slots-hold" SPAWN_GATE_JOBS=1 SPAWN_GATE_HOST_JOBS=1 \
+    sh "$gate" "$repo" "$base" "$good" "$waitfold" >"$work/slots-hold.log" 2>&1 &
+hold=$!
+waited=0
+until ! flock -n "$slot_file" true 2>/dev/null; do
+    sleep 0.1
+    waited=$((waited + 1))
+    [ "$waited" -lt 300 ] || break
+done
+[ "$waited" -lt 300 ] || { echo "FAIL the holder never took its slot"; exit 1; }
+wait_verdict=$work/slots-wait.verdict
+wait_status=0
+XDG_CACHE_HOME="$work/caches/slots-wait" SPAWN_GATE_JOBS=1 SPAWN_GATE_HOST_JOBS=1 \
+    SPAWN_GATE_SLOT_WAIT_SECS=2 SPAWN_GATE_VERDICT="$wait_verdict" \
+    sh "$gate" "$repo" "$base" "$good" "$waitfold" >"$work/slots-wait.log" 2>&1 || wait_status=$?
+expect "a run that cannot get a slot in its bound: exit 5" "$wait_status" 5
+expect "with the slot-shaped no-room fact" "$(cat "$wait_verdict")" '"check":"host scenario slot"'
+expect "its measure the wait" "$(cat "$wait_verdict")" '"waited_ms":'
+expect "and its threshold the budget" "$(cat "$wait_verdict")" '"budget":1'
+expect "and the log says it gave up" "$(cat "$work/slots-wait.log")" \
+    "gave up waiting for a host scenario slot after 2."
+refuse "the scenario never ran in it" "$(cat "$work/slots-wait.log")" "slot-start"
+hold_status=0
+wait "$hold" || hold_status=$?
+expect "the holder still finished: exit 0" "$hold_status" 0
+expect "and the slot is free after" "$(flock -n "$slot_file" true && echo free)" free
+
+# A gate whose own tree the sandbox empties (/tmp, /run, /var/tmp): it would
+# read its scripts there as unreadable, compute base keys no other host
+# matches, and say nothing (30 of 30 keys differed from /var/tmp, every tool
+# version identical). Refused up front instead: exit 3, naming the root.
+masked=$(mktemp -d /var/tmp/test-gate-masked.XXXXXX) || exit 1
+mkdir -p "$masked/scripts/rsi"
+cp "$gate" "$masked/scripts/rsi/gate.sh"
+masked_status=0
+masked_out=$(sh "$masked/scripts/rsi/gate.sh" "$repo" "$base" "$good" "$scenarios" 2>&1) || masked_status=$?
+expect "a gate run from a root the sandbox empties: exit 3" "$masked_status" 3
+expect "naming its own tree" "$masked_out" "refusing to run from $masked"
+expect "and why" "$masked_out" "could not read its own scripts"
+refuse "and nothing ran" "$masked_out" "=="
+rm -rf "$masked"
+masked=$work/no-masked-root
+# The same gate under a root the sandbox shows gets past the refusal: it
+# stops at the commit it cannot resolve, not before.
+status=0
+out=$(sh "$gate" /nonexistent no-such-commit no-such-commit "$scenarios" 2>&1) || status=$?
+expect "a tree under no masked root is not refused" "exit=$status $out" "no commit no-such-commit"
+refuse "and is not refused for its root" "exit=$status $out" "refusing to run from"
 
 echo "gate: all cases pass"
