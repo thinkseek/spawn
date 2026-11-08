@@ -2991,6 +2991,9 @@ begin
     -- A host fault names its evidence (§14): the failures the gate printed,
     -- each the host's, and, when the test database's log decided it, the
 <<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
+=======
+<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
+>>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
     -- crash lines stamped inside the gate's window (`failures`,
     -- `server_log`); the base's own disagreement (objective 033's
     -- `base_disagrees`, with its scenario, both exits and its run); or the
