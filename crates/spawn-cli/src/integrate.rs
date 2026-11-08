@@ -2546,7 +2546,7 @@ impl Judge {
                 );
                 return gated(
                     "no_room",
-                    short_of_room(mission, task.id, &short, &log, now_ms()),
+                    short_of_room(mission, task.id, &short, &log, database_now(store)?),
                 );
             }
             Err(RoomFailure::Bad(reason)) => {
@@ -2671,7 +2671,8 @@ impl Judge {
                 match rejection(&mirror_path, main, &candidate, &branch, &verdict, &run_gate)? {
                     Rejection::Record(verdict, extra) => gated(verdict, extra),
                     Rejection::HeadNoRoom { short, log, head } => {
-                        let mut extra = no_room(mission, task.id, &short, &log, now_ms());
+                        let mut extra =
+                            no_room(mission, task.id, &short, &log, database_now(store)?);
                         if let (Some(target), Some(head)) =
                             (extra.as_object_mut(), head.as_object())
                         {
@@ -2729,9 +2730,10 @@ impl Judge {
                 }
             }
             // No room to judge: a fact about the host, never a count.
-            Err(GateFailure::NoRoom { short, log }) => {
-                gated("no_room", no_room(mission, task.id, &short, &log, now_ms()))
-            }
+            Err(GateFailure::NoRoom { short, log }) => gated(
+                "no_room",
+                no_room(mission, task.id, &short, &log, database_now(store)?),
+            ),
             // The base disagreed with itself: a scenario of it exited 1 and
             // then 0, before any candidate code ran. The host was too loaded
             // or too flaky to judge: `host_fault` with that evidence, never
@@ -3474,6 +3476,14 @@ fn aborted(failure: &GateFailure) -> Value {
 
 fn now_ms() -> i64 {
     spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
+}
+
+/// The database's clock now (`spawn_now_ms()`): what a no-room record's
+/// escalation compares with `gate_room_since_ms`, the store's own time of
+/// the run's first record, after a gate that took minutes (the mission's
+/// `now_ms` was read before it).
+fn database_now(store: &PostgresStore) -> Result<i64, String> {
+    store.database_now_ms().map_err(|error| error.to_string())
 }
 
 /// Whether `task`'s gate waits this pass, said when it does: the gate had
