@@ -8,24 +8,6 @@
 //! it writes that event only after the final checkpoint, the terminal kill
 //! and the unmount. A refold of the log therefore never repeats cleanup.
 //!
-//! **An end's cause and its signal.** The Bridge tells three ends apart:
-//! `exited` (the runner wrote the engine's exit status), `stopped` (a Stop
-//! or a Discard, a workspace the store kept off its branch) and `lost` (no
-//! runner of the Bridge's own runs the execution any more: its terminal is
-//! gone, or is there and hosts no runner, which the end's `evidence` says).
-//! An engine the OS killed has no exit status, so the runner writes the
-//! signal that killed it beside the status (<[`signal_file`]> of
-//! [`exit_file`], `9` for a SIGKILL) and the end records it: without it a
-//! SIGKILL read as a clean exit with no code, and a crash was
-//! indistinguishable from an exit. What the Bridge records is the *how*; the
-//! *why* — the class a recovery acts on (`crashed`, `disk_full`,
-//! `model_unavailable`, `host_restart`, …) — is read from these facts, the
-//! transcript's API error lines and the host's own observations by the
-//! recovery (`spawn-cli`'s `recover`, docs/fleet-architecture.md §3.1).
-//! A turn the model failed ends no execution: Claude Code writes its API
-//! error line to the transcript and waits at its prompt, so `turn.failed`
-//! keeps the engine's own `apiErrorStatus` and `error` tag for that rule.
-//!
 //! An input to a busy session waits for its turn (docs/design.md §5). An
 //! `Input` from a person or the supervisor (any principal but the loops in
 //! [`LOOP_PRINCIPALS`]) that finds the pane not ready, or a capture that
@@ -213,12 +195,6 @@ impl BridgeConfig {
     }
 }
 
-/// An end the Bridge found: its cause, the exit code the runner wrote and
-/// the signal that killed the engine (one of the two codes is set when the
-/// end has one). It is what `execution.ended` records, and the recovery
-/// reads it to classify the end.
-type Ending = (EndCause, Option<i32>, Option<i32>);
-
 /// Running execution of one session.
 #[derive(Debug, Clone)]
 struct Active {
@@ -230,7 +206,7 @@ struct Active {
     // Workspace calls get expensive.
     checkpoint: Option<CheckpointReason>,
     /// The runner reported the engine exit; cleanup is still due.
-    reported_end: Option<Ending>,
+    reported_end: Option<(EndCause, Option<i32>)>,
     /// The end committed its final checkpoint and killed the terminal
     /// (`execution.unmounting`): what is left is the unmount and the record.
     unmounting: bool,
@@ -911,13 +887,10 @@ impl Bridge {
             // An exit report of an old runner (engine-sourced; runners now
             // write SPAWN_EXIT_FILE): only old logs hold one.
             EventKind::ExecutionEnded {
-                cause,
-                exit_code,
-                signal,
-                ..
+                cause, exit_code, ..
             } if current => {
                 if let Some(active) = view.active.as_mut() {
-                    active.reported_end = Some((*cause, *exit_code, *signal));
+                    active.reported_end = Some((*cause, *exit_code));
                 }
             }
             // A recovered end goes straight to the unmount.
@@ -931,7 +904,7 @@ impl Bridge {
                 cause, exit_code, ..
             } if current => {
                 if let Some(active) = view.active.as_mut() {
-                    active.reported_end = Some((*cause, *exit_code, None));
+                    active.reported_end = Some((*cause, *exit_code));
                     active.follow.end_failures = active.follow.end_failures.max(END_ATTEMPTS);
                 }
             }
@@ -1065,10 +1038,10 @@ impl Bridge {
                 }
             },
         };
-        if let Some(ending) = end {
+        if let Some((cause, exit_code)) = end {
             // What the engine wrote last comes before its end.
             self.follow_output(agent_id, session, native, active, report)?;
-            return self.end(agent_id, session, active, ending, false, report);
+            return self.end(agent_id, session, active, cause, exit_code, false, report);
         }
         if let Some(reason) = active.checkpoint {
             // A commit that failed was reported; the checkpoint stays due.
@@ -1084,7 +1057,8 @@ impl Bridge {
                 agent_id,
                 session,
                 active,
-                (EndCause::Stopped, None, None),
+                EndCause::Stopped,
+                None,
                 false,
                 report,
             );
@@ -1095,17 +1069,12 @@ impl Bridge {
     /// The exit status the runner wrote when the engine exited, if it has.
     /// An unreadable file (not a regular file, a host error) is warned once
     /// and the engine counts as running: the pane's liveness still ends it.
-    ///
-    /// The runner writes the signal that killed the engine beside the
-    /// status ([`signal_file`]): an engine the OS killed has no exit code,
-    /// and without its signal a SIGKILL would read as a clean exit with
-    /// none. The end's record carries it (`execution.ended`'s `signal`).
     fn exit_status(
         &self,
         session: &SessionId,
         active: &mut Active,
         report: &mut TickReport,
-    ) -> Option<Ending> {
+    ) -> Option<(EndCause, Option<i32>)> {
         let bytes = match self
             .terminals
             .read_from(&active.workspace, &exit_file(active), 0)
@@ -1122,13 +1091,7 @@ impl Bridge {
             }
         };
         let text = String::from_utf8_lossy(&bytes);
-        let signal = self
-            .terminals
-            .read_from(&active.workspace, &signal_file(active), 0)
-            .ok()
-            .flatten()
-            .and_then(|bytes| String::from_utf8_lossy(&bytes).trim().parse().ok());
-        Some((EndCause::Exited, text.trim().parse().ok(), signal))
+        Some((EndCause::Exited, text.trim().parse().ok()))
     }
 
     /// How the execution ended when no runner of the Bridge's own runs it
@@ -1143,7 +1106,7 @@ impl Bridge {
         session: &SessionId,
         active: &mut Active,
         report: &mut TickReport,
-    ) -> Result<Option<Ending>, TerminalError> {
+    ) -> Result<Option<(EndCause, Option<i32>)>, TerminalError> {
         let seen = match self
             .terminals
             .runner(&active.terminal(), &active.workspace)?
@@ -1156,7 +1119,7 @@ impl Bridge {
             return Ok(Some(end));
         }
         active.follow.evidence = Some(format!("{seen}; its runner wrote no exit status"));
-        Ok(Some((EndCause::Lost, None, None)))
+        Ok(Some((EndCause::Lost, None)))
     }
 
     /// Append the events in what the engine wrote to its transcript since
@@ -1346,17 +1309,18 @@ impl Bridge {
     /// checkpoint is retried every [`END_RETRY_MS`] until it commits. Only
     /// `discard` (a person's or the supervisor's decision) unmounts a
     /// workspace whose final checkpoint failed.
+    #[allow(clippy::too_many_arguments)]
     fn end(
         &self,
         agent_id: &AgentId,
         session: &SessionId,
         active: &mut Active,
-        ending: Ending,
+        cause: EndCause,
+        exit_code: Option<i32>,
         discard: bool,
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
-        let (cause, exit_code, signal) = ending;
-        active.reported_end = Some(ending);
+        active.reported_end = Some((cause, exit_code));
         // The checkpoint and the terminal are behind an end that recorded
         // its unmount: what is left is the unmount and the record.
         if active.unmounting {
@@ -1370,7 +1334,7 @@ impl Bridge {
                     .push(format!("terminate {}: {error}", active.terminal()));
                 return Ok(false);
             }
-            return self.finish_end(agent_id, session, active, ending, report);
+            return self.finish_end(agent_id, session, active, cause, exit_code, report);
         }
         // A checkpoint whose record waits is recorded before the end.
         if let Err(error) = self.record_unrecorded_commit(session) {
@@ -1439,13 +1403,7 @@ impl Bridge {
             EventKind::ExecutionUnmounting,
         )?;
         active.unmounting = true;
-        self.finish_end(
-            agent_id,
-            session,
-            active,
-            (cause, exit_code, signal),
-            report,
-        )
+        self.finish_end(agent_id, session, active, cause, exit_code, report)
     }
 
     /// The last of an end, from its recorded `execution.unmounting` (the
@@ -1456,10 +1414,10 @@ impl Bridge {
         agent_id: &AgentId,
         session: &SessionId,
         active: &Active,
-        ending: Ending,
+        cause: EndCause,
+        exit_code: Option<i32>,
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
-        let (cause, exit_code, signal) = ending;
         if let Err(error) = self.workspaces.unmount(&active.workspace) {
             report
                 .warnings
@@ -1474,7 +1432,6 @@ impl Bridge {
             EventKind::ExecutionEnded {
                 cause,
                 exit_code,
-                signal,
                 evidence: active.follow.evidence.clone(),
             },
         )?;
@@ -1507,7 +1464,7 @@ impl Bridge {
             active.workspace,
             END_RETRY_MS / 1000
         ));
-        let (cause, exit_code, _) = active.reported_end.unwrap_or((EndCause::Lost, None, None));
+        let (cause, exit_code) = active.reported_end.unwrap_or((EndCause::Lost, None));
         self.append(
             agent_id,
             session,
@@ -1830,7 +1787,7 @@ impl Bridge {
             return Ok(None);
         }
         let mut report = TickReport::default();
-        let Ok(Some((cause, exit_code, signal))) =
+        let Ok(Some((cause, exit_code))) =
             self.not_running(&claimed.session_id, &mut active, &mut report)
         else {
             return Ok(None);
@@ -1847,7 +1804,8 @@ impl Bridge {
             &claimed.agent_id,
             &claimed.session_id,
             &mut active,
-            (cause, exit_code, signal),
+            cause,
+            exit_code,
             false,
             &mut report,
         )?;
@@ -2495,7 +2453,8 @@ impl Bridge {
             &claimed.agent_id,
             &claimed.session_id,
             &mut ending,
-            (EndCause::Lost, None, None),
+            EndCause::Lost,
+            None,
             discard,
             &mut report,
         )?;
@@ -2968,10 +2927,7 @@ impl Bridge {
         };
         let mut report = TickReport::default();
         // A stop of an end already under way keeps its cause.
-        let (cause, exit_code, signal) =
-            active
-                .reported_end
-                .unwrap_or((EndCause::Stopped, None, None));
+        let (cause, exit_code) = active.reported_end.unwrap_or((EndCause::Stopped, None));
         // A stop that finds no runner of its own there (the terminal gone,
         // or hosting no runner) still writes the end the log waits for, and
         // says what it found.
@@ -2992,7 +2948,8 @@ impl Bridge {
             &claimed.agent_id,
             &claimed.session_id,
             &mut active,
-            (cause, exit_code, signal),
+            cause,
+            exit_code,
             discard,
             &mut report,
         )?;
@@ -3250,11 +3207,4 @@ fn exit_file(active: &Active) -> String {
         active.workspace.path(),
         active.execution_id
     )
-}
-
-/// Where the runner notes the signal that killed the engine, beside the
-/// exit status ([`exit_file`]): the status of a program the OS killed is
-/// empty, and a kill without its signal cannot be told from a clean exit.
-fn signal_file(active: &Active) -> String {
-    format!("{}.signal", exit_file(active))
 }

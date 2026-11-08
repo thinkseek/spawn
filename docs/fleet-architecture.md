@@ -309,10 +309,8 @@ it, on the same ladder.
   a deterministic **policy** that maps (facts, observation) to an action.
   Jev never chooses the action; its judgement is one input, and only within
   the limits of §2.1:
-  1. *Facts and rules* decide fixed cases: every end of an execution is
-     classified and given its way back (the recovery, below); where the
-     recovery has not recorded an interruption, a lost execution is still
-     resumed once (the one-resume rule, the fallback).
+  1. *Facts and rules* decide fixed cases: a lost execution is resumed
+     once (the one-resume rule, below).
   2. *A guarded nudge*: when the agent stopped without asking anything
      (Jev: WAITING, `needs_human` low, confidence high) and its task is not
      done, type `continue`, once per episode, rate-limited per agent.
@@ -386,82 +384,6 @@ it, on the same ladder.
   every 20 s for ten minutes.) The facts are `failed_resume` and
   `resumed_young` in `dispatch_facts`; the rule is `resume_lost` in
   `dispatch/worker.rs`.
-
-  **The recovery: every way an execution ends is classified.** An
-  execution ends in many ways, and how it is brought back used to depend on
-  who kept it and how it ended; nothing recorded why. Now one rule
-  (`crate::recover`, in the loop before the dispatcher and the liveness
-  rule) reads every ending from recorded facts, records it once, and takes
-  its way back:
-
-  | Cause | Told from | Path | The numbers |
-  | --- | --- | --- | --- |
-  | `exited` | the end's exit status 0 | `resume` | due at once |
-  | `crashed` | a non-zero exit status, the signal the runner wrote beside it (9 for a SIGKILL), or a terminal gone while its server lives | `resume` | due at once; a resume's backoff doubles per failed one: 10, 20, 40, 80 … up to 640 s |
-  | `memory_limit` | the engine's resource envelope killed it (objective 029) | `resume` | as a crash |
-  | `host_restart` | the end found while the terminal server is gone, so every terminal in it died | `resume` | as a crash |
-  | `disk_full` | the workspace's filesystem read under `SPAWN_DISK_FLOOR_GB` at the end | `wait` | probed every `SPAWN_RECOVER_PROBE_SECS` (10 s); revived within one probe of room |
-  | `database_unavailable` | two or more passes of the loop that could not reach the database while the execution ran | `wait` | cleared at the first pass that gets through |
-  | `model_auth` | an API error line with status 401 or 403, `authentication_failed`, or a text holding `/login` | `wait` | probed every 10 s; cleared when the credentials file changes, one retry every `SPAWN_RECOVER_AUTH_RETRY_SECS` (1800 s) while it does not |
-  | `model_unavailable` | an API error line with status 529, 503, 500, 429 or none, or error `overloaded`, `rate_limit`, `server_error` | `wait` | retried after `SPAWN_RECOVER_MODEL_BACKOFF_SECS` (60 s) doubling per failed turn, capped at 4 x it, or at `retry_at_ms` when the text names when an account is available again |
-  | `context_exhausted` | an API error line whose text holds `Prompt is too long` | `handoff` | due at once: a Stop with its final checkpoint, then a new native session in the same workspace and branch |
-  | `budget` | the integrator's Stop of a task over its budget (objective 026) | `handoff` | as a context's |
-  | `stopped` | a Stop or Discard from a person, the supervisor, a cancelled task or a retirement | `final` | never revived |
-
-  When several hold the first in that order wins: a person's Stop before the
-  budget, a memory kill before a host restart, a full disk before a database
-  outage, a model login before a model outage before a context, a crash
-  before a clean exit. A Stop that is part of a revival (a handoff's) is no
-  interruption of its own.
-
-  Each interruption is one control record, written by the owner only
-  (`spawn_host_record`): `{"type": "execution.interrupted", "agent_id",
-  "session_id", "execution_id", "cause", "evidence", "path", "attempt",
-  "due_ms"}`. `attempt` counts the interruptions of that execution, so its
-  revival's key `recover-<execution>-<attempt>` names this one and no other;
-  `due_ms` is when the revival is due (null on `final`). The record names
-  the fact it rests on, so a restarted loop finds nothing to record twice
-  and revives nothing twice. The revival is one command — `resume` for a
-  resume path and a wait whose execution ended, `input` into a live engine,
-  `start` for a handoff — submitted as `spawn-liveness`, no earlier than
-  its `due_ms`. A wait clears on an observation, never on time: a model
-  answer to a retried turn, a changed credentials file, the loop's first
-  pass that reaches the database, or a free-space reading at the floor; its
-  clear is one `execution.cleared` record
-  (`{"execution_id", "session_id", "cause", "evidence", "waited_ms"}`) and
-  then the revival. A wait never counts toward the handoff.
-
-  A resume fails when its execution ends within 60 s of its start before it
-  made progress (no tool call completed and no turn ended after it started);
-  a revival that made progress succeeded, whatever ends it later. After
-  three failed resumes in a row the next interruption hands off instead, its
-  evidence naming `resumes_failed`. No path discards the workspace or the
-  checkpointed work: an ending execution's final checkpoint is taken as
-  before, a handoff stops first and starts on the same branch, a wait
-  leaves the engine or its workspace as it is, and a final path keeps the
-  branch.
-
-  One rule for every agent: the supervisor, the residents, and the ephemeral
-  workers that hold a delivered task (an idle worker with no open task is
-  not revived). Where the recovery has recorded an interruption, the
-  liveness rule (`supervise.rs`) starts nothing and the dispatcher's
-  one-resume rule revives nothing: they keep their own jobs (the charter,
-  the digest, the mission rows). The code is `crates/spawn-cli/src/recover.rs`;
-  the facts `spawn_postgres::RECOVERY_FACTS`, which reads the end's status
-  and signal, the transcript's API error lines by event id, the Stops sent
-  into the execution, its progress and the interruptions and revivals
-  already recorded.
-
-  **The loop outlives its database.** A pass that failed only because the
-  database could not be reached (`StoreError::Unreachable`) does not count
-  toward `MAX_FAILURES`: the loop keeps passing on its backoff (at most 30
-  intervals), builds the Bridge and the Observer again when the database
-  answers, and the engines run on untouched. At the first pass that gets
-  through, the recovery records the outage's interruptions
-  (`database_unavailable`, with its window, its failed passes and one line
-  of the error), clears them at once (that pass *is* the observation) and
-  the Bridge checkpoints what the engines wrote meanwhile. Every other
-  failure counts as before.
 
   **Deliveries that never reached their worker.** A delivery whose retries
   are spent on a host fault typed nothing (every attempt was refused before
@@ -709,14 +631,10 @@ the system. Its continuity is a design requirement, not a best effort:
 | Threat | What keeps the session |
 | --- | --- |
 | `spawn loop` restarts or is replaced | The engine runs in tmux outside the loop's lifetime (`KillMode=process`); the next loop recovers the execution from the log and keeps observing it |
-| The engine process exits or crashes | The **recovery** (control layer, facts only, no model): the end is an `exited` or `crashed` interruption — a signal, a non-zero status or a terminal gone while its server lives — recorded once and `resume`d in the same native session at once, then after 10, 20, 40, 80 … s as resumes fail, capped at 640 s. A resume whose execution ends within a minute before any progress failed; three in a row hand off |
-| The machine reboots | tmux is gone, so every terminal in it died: the recovery records `host_restart` and resumes each execution by its key, within one pass of the loop's start |
-| The model API is overloaded, rate limited or unreachable, or the login expired | No execution ends: Claude Code writes its API error line and waits at its prompt. The recovery records `model_unavailable` or `model_auth` as the interruption and `wait`s: a retry after 60 s doubling to 4 minutes (or at the time a 429's text names), a probe of the credentials file every 10 s and one retry every 30 minutes while it does not change. The wait clears on the model's answer or the changed file, and the same native session goes on |
-| The context window is spent | `Prompt is too long` in an API error line: `context_exhausted`, and the handoff path below |
-| The engine's resource envelope kills it, or the disk fills | `memory_limit` (objective 029) resumes at once; `disk_full` waits until a reading of the workspace's filesystem is at or above `SPAWN_DISK_FLOOR_GB` |
-| Spawn's database is unreachable | The loop does not exit: only passes that could not reach it are not failed ones, the engines run on, and at the first pass that gets through the recovery records `database_unavailable` for each execution that lived through it, clears it, and the Bridge checkpoints what the engines wrote meanwhile |
+| The engine process exits or crashes | A **liveness rule** (control layer, facts only, no model): no live execution means `resume` with the recorded native session id, with backoff; a revival whose engine is lost or exits non-zero within a minute counts as a failed one, and only an execution that stayed up starts the count over |
+| The machine reboots | tmux is gone, so the execution is `Lost`; the same rule resumes it from the native transcript |
 | A transcript Claude Code deleted | The resume puts it back from the transcript archive (`<root>/.transcripts`, copied at turn ends and execution ends; docs/storage.md, "The transcript archive"); one gone with no copy fails the resume instead of starting blank under the old id |
-| The native session cannot be resumed (transcript lost with no copy, resume fails three times, or there is none) | `start` a fresh native session inside the same Spawn session, on the same workspace and branch, with a handoff prompt rebuilt from the log: mission, open worker tasks, recent escalations and decisions, the interruption and the branch head |
+| The native session cannot be resumed (transcript lost with no copy, resume fails three times) | `start` a fresh native session inside the same Spawn session, with a handoff prompt rebuilt from the log: mission, open worker tasks, recent escalations and decisions |
 | The context window fills | Claude Code compacts on its own; the handoff path above is the fallback when it cannot |
 | A deploy changes its charter | Each new native session's start records the hash of the charter it gives; when the native session that runs holds another (after a loop restart, a resume or a compaction), the dispatcher types the new charter in at its next idle prompt, once, by record (§3, the supervisor) |
 | The supervisor hangs or loops | Its own observations (rules, then Jev) flag `stuck`; that goes to a human, never to an automatic stop |
@@ -1611,7 +1529,10 @@ record of what was judged (§14 of design.md).
     that `main`. A hold on a source already held renews it: a new
     `source.held` naming `renews` (the active hold), which ends with it (no
     release or expiry is recorded for it). A source has at most one active
-    hold.
+    hold. A renewal moves the tasks that waited behind the old hold to the
+    new one in the fold (`held_by`), so the board, a release and an expiry
+    name them at once; the integrator still records `task.held` for the new
+    hold, once, when it next sees its landing wait.
   - `spawn mission release --source <source>` (owner only) records
     `source.released` {`source`, `hold`, `by`: `human`} and prints
     `{source, released, waiting}`. With no active hold it records nothing

@@ -44,7 +44,6 @@ mod memory;
 mod missions;
 mod objectives;
 mod push;
-mod recover;
 mod runtime;
 mod scorecard;
 mod serve;
