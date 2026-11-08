@@ -169,6 +169,8 @@ spawn fleet
 | `SPAWN_STALL_JOB_SECS` | `7200` | 工人的一个后台任务（Bash 后台命令、Monitor）开着多久后升级一次（“a background job has run for …”，带种类与 id）。在此之前，等着自己后台任务的工人算在工作：不问 Jev、不升级、不催、不算停滞。Monitor 一小时内自己到期；门禁一次约半小时 |
 | `SPAWN_GATE` | `scripts/rsi/gate.sh` | `spawn integrate` 的门禁脚本，输出一行 JSON 判定；线上指向控制器（部署的提交树）`~/.local/share/spawn-rsi/controllers/spawn/scripts/rsi/gate.sh`，从不指向所有者的检出：所有者的改动部署后才生效 |
 | `SPAWN_INTEGRATE_GATES` | `1` | `spawn integrate` 同时跑的门禁数（跨任务组；每个任务组至多一个；`--gates` 优先）。大于 1（至多 8）须设 `SPAWN_TEST_DATABASE_PER_GATE=1`：门禁目前共用一个测试数据库服务器。场景目录里有 `no-test-database` 文件的任务组（如 Supply PA，测试用 PGlite）拿不到测试库地址，其判定不占这个名额，可与 Spawn 的门禁并行 |
+| `SPAWN_GATE_JOBS` | 未设 | 每个门禁同时跑的场景数（大于等于 1 的整数）。`spawn integrate` 总是把每个门禁的值传给 gate.sh：设了就用它；未设时，共用测试服务器的门禁为 1，其他门禁为（核数 − `SPAWN_GATE_WORKER_CORES`）÷ 能同时跑的门禁数（每个源一个，共用服务器的至多 `--gates`），至多 8。手跑 gate.sh 时未设则为 min(8, 核数/2) |
+| `SPAWN_GATE_WORKER_CORES` | 核数的四分之一（至少 1） | 给工人和主机留的核数（0 到核数 − 1 的整数，其他值使 `spawn integrate` 不启动并报出变量名）。门禁只在它的场景数 + 正在跑的门禁的场景数 + 这个数不超过核数时才开始（没有门禁在跑时总能开始），否则下一趟再试，不记录、不算失败 |
 | `SPAWN_TEST_DATABASE_LOG` | 未设 | 测试数据库服务器的日志（`log_line_prefix` `%m [%p] `）；`spawn integrate` 读它找门禁期间的崩溃：有崩溃时数据库错误也让 check-tests.sh 的失败算主机故障（`host_fault`）而非拒绝。未设时只有连接错误算 |
 | `SPAWN_GATE_HOST_FAULT_BACKOFF_SECS` | `300` | 连续第一次主机故障后，任务等多久再判；每多一次连续主机故障加倍，至多一小时 |
 | `SPAWN_SOURCE_HOLD_SECS` | `10800` | `spawn mission hold` 的上限（整秒，1 到 86400；其他值拒绝并报出变量名，不换成默认值）：暂停记录的 `expires_ms` 是它自己的时间加这么多，之后集成器记 `source.hold_expired` 结束它。3 小时长于最慢的所有者门禁（80 分钟）加一次部署，也长于门禁默认的墙钟（120 分钟） |

@@ -1140,6 +1140,21 @@ the tree's own:
   and objective scenarios (`<digits>.sh`) the base fails too. The checks are
   scenarios: `check-clippy`, `check-tests`, `check-e2e`, `check-blackbox`,
   `check-web`. The halt rule on the scenario count (§10.3) protects them.
+  check-tests runs first among the regressions (the most often decisive,
+  so its failure stops the rest early);
+- a check that fails on the candidate is run again there, as an
+  objective's "unsolved" needs two runs that agree: passing the second
+  time, it is a flake (said in the log, and named in the verdict's and the
+  `task.gated` record's `flakes`, so a check that keeps flaking on one
+  candidate or mission shows) and the gate goes on; failing
+  twice, it is run on the base (built for it when every base result came
+  from the cache): passing there, it is a regression; failing there too, it
+  is a host or harness fault, no verdict (exit 6, a `host_fault`, §10.3:
+  backed off, never counted toward a halt). That base run follows
+  candidate code on the shared test server, so it can only turn a
+  rejection into a host fault, never into an acceptance. (2026-11-07: one e2e
+  run that failed under load rejected task 127's 85-minute gate; the same
+  tree passes it.)
 - everything the candidate controls runs in a bubblewrap sandbox (docs/rsi.md
   §4). The verdict is one JSON line that names the base and candidate
   commits it judged; the integrator believes only the verdict file it owns.
@@ -1179,9 +1194,12 @@ the tree's own:
   records `no_room` with its own measurement only when that is under the
   floor. It does this in two cases: the gate exited 5 (it measures the
   gate's `TMPDIR`), or the integrator could not create or use its private
-  directory for the gate (it measures that directory's parent). Any other
-  status is an abort: exit 3 (no bwrap, a missing bind directory, an unreadable
-  `TMPDIR`, a floor that is not whole GiB), exit 4 (the base's run errored),
+  directory for the gate (it measures that directory's parent). It exits 6
+  with a host-fault fact (a scenario's harness error on the base, or a
+  check failing on the candidate and the base): `host_fault`, §10.3. Any
+  other status is an abort: exit 3 (no bwrap, a missing bind directory, an unreadable
+  `TMPDIR`, a floor that is not whole GiB), exit 4 (a run the gate lost:
+  ended without a result),
   a timeout or a signal. The integrator measures the same floor, free
   memory and the test database itself before it starts the gate (§10.3,
   step 3), so a short host is found before a gate runs; the gate's own
@@ -1238,6 +1256,9 @@ record of what was judged (§14 of design.md).
     `spawn/<agent>` so it names the branch, the commit and the commit's
     diff stat; it counts toward no halt, and the objective's next task
     continues that work (§10.4, "A task over its budget keeps its work").
+    The record names the measure that made it (`measure: "active"`, with
+    the tool calls and elapsed time it measured), so a reader sees which
+    budget ended the task; it is a continuation, not a failed attempt.
     `task.aborted` keeps its other meaning (a landing gone stale after its
     mission was done); records from before this were overruns recorded as
     aborts, and count toward the abort halt as they were written.
@@ -1496,6 +1517,33 @@ record of what was judged (§14 of design.md).
      pair of lines named in the record (`scenario`, `exits`), never on the
      reason's text, on time or on a scenario's name; the wait rests on the
      recorded `due_ms`.
+     The gate reports host faults of its own too: exit 6 with its fact in
+     the verdict file (`{"host_fault":true,"scenario","on","runs",
+     "reason"}`, gate.rs `HOST_FAULT_EXIT`), for a scenario's harness error
+     on the base that is not the disagreement above (its two runs did not
+     end 1 and then 0: an exit neither 0 nor 1, or 1 and then something
+     else; `on` `base`), and for a check that failed twice on the candidate
+     and on the base (`on` `candidate and base`, §10.2). Each is recorded
+     `host_fault` with `evidence` `gate` and the gate's `fact`, under the
+     same backoff, escalation and counts: `gate_aborts` does not move. The
+     fact counts only from the integrator's own verdict file, which the
+     sandbox never sees, and only with exit 6. A base that disagrees with
+     itself stays the disagreement above: the gate keeps its exit 4 and its
+     pair for it (`base_disagrees`), so the two never describe one run; a
+     base-only fault of either evidence never counts toward
+     `SPAWN_GATE_HOST_FAULT_CAP` and is never capped (§10.3).
+     A task's report revision has at most `SPAWN_GATE_HOST_FAULT_CAP` (3 by
+     default) host faults judged after the candidate ran (either kind: the
+     test database's, or the gate's own with `on` `candidate and base`),
+     counted from its `task.gated` records: the next one at that revision
+     is recorded `aborted` instead, its reason saying so and the fault kept
+     under `host_fault`, so it counts toward the abort halt. A host fault is
+     no verdict on the work, but one that keeps recurring on the same work
+     may be the work's doing (a check's base run follows candidate code on
+     the shared test server), and an uncounted one would hold the task for
+     ever. A base-only fault (the gate's fact `on` `base`, or the base's own
+     disagreement) comes before any candidate code and counts toward no
+     halt, so it neither counts toward the cap nor is ever capped.
   6. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate
@@ -1645,10 +1693,16 @@ record of what was judged (§14 of design.md).
     the mission has counted since it was configured or last resumed);
   - the source's `main` not where the last landing left it, read only
     from a fetch that succeeded, while no other mission's landing on the
-    source is unresolved, and while no owner's landing on the source is
+    source is unresolved, while no owner's landing on the source is
     pending (step 0 below applies them first; one still pending, its
-    landing failed, may have moved `main` before its record). A move that
-    no record explains (a push behind Spawn's back) halts.
+    landing failed, may have moved `main` before its record), and while the
+    owner does not hold the source. The hold is exactly what says "the
+    owner is moving `main`": on 2026-11-08 the owner held mission 6's
+    source, pushed `main` and recorded the move afterwards, and a pass
+    between the push and the record halted the mission. A move that no
+    record explains and no hold covers (a push behind Spawn's back) halts;
+    the halt's record names the source and both commits (`cause`:
+    `main_moved`), so `spawn mission moved` can tell it from any other.
 
   A halted mission lands nothing until a human runs `spawn mission resume`.
   No rule counts host faults, however many in a row, whatever their evidence:
@@ -1660,7 +1714,13 @@ record of what was judged (§14 of design.md).
   every mission on that source whose baseline was its `from` and that is not
   halted (the record names them), so RSI and fleet work on the same
   repository don't halt each other, and a move of `main` that no landing
-  explains still halts the missions that saw `main` before it. A deploy that moves `main` forward records
+  explains still halts the missions that saw `main` before it — unless
+  that is exactly the halt the move is: a mission halted because `main`
+  was neither its baseline nor explained, at this source, from this commit
+  to this one (`cause`: `main_moved` in its `mission.halted`), is named in
+  the move's `clear` list, and the fold unhalts it as it moves its
+  baseline. The owner's record is the explanation its halt was waiting
+  for; a halt for any other reason keeps its baseline. A deploy that moves `main` forward records
   `source.moved` (`spawn mission moved`, run by `deploy/deploy.sh`), and the
   missions on that source take the new `main` as their baseline instead of
   halting.
@@ -1740,15 +1800,25 @@ record of what was judged (§14 of design.md).
     under the append lock, so a second integrator or a stale read cannot
     oversubscribe.
   - **No objective holds a slot for ever.** A failed attempt is an outcome
-    that says the work did not make it: the gate's `rejected`,
-    `incompatible`, or `conflict` when the worker got conflicts to resolve
-    (the record's `merge` is `marked`, `unmarked` or `pending`, or absent on
-    records from before it was named; not `not_mounted`, `busy`, `failed`
-    or a clean merge). A budget overrun is not one: it says the task is
-    bigger than its budget, not that the work failed, and it is handled on
-    its own (below). The host's outcomes
-    (`no_room`, `host_fault`, a gate `aborted`) count for nothing, as for
-    the halt rules, and an `accepted` verdict ends the count. Once an
+    that is evidence against the work, and only that: the gate's `rejected`
+    or `incompatible` (the work, as delivered, failed a check or failed
+    merged with main; the gate cannot tell a host's cause, and the yield's
+    reasons reach the supervisor), or an abort the active-time budget made
+    (a record that names `measure: "active"`, with the `active_minutes` and
+    `tool_calls` it measured). A `conflict` never counts: main moved under
+    the task (another landing, an owner batch), and a worker that cannot
+    resolve it shows up as rejected or over budget. An abort without a
+    measure never counts either: the old wall-clock budget's (it aborted
+    tasks a restart had kept waiting) and the store's for a landing gone
+    stale after its mission was done. A budget overrun is not one either:
+    it says the task is bigger than its budget, not that the work failed;
+    its record names the measure and the objective's next task continues
+    the work (below). The host's outcomes (`no_room`, `host_fault`,
+    `stale`, a gate `aborted`) count for nothing, as for the halt rules,
+    and an `accepted` verdict ends the count. (On 2026-11-08 at 04:47,
+    right after an owner batch, the earlier rule set aside tasks 166 and
+    167, both reviewed and passing, on old wall-clock and tool-call aborts
+    and on conflicts from the batch; each had one rejection.) Once an
     objective has `SPAWN_OBJECTIVE_ATTEMPTS` (3, a whole number from 1)
     failed attempts since its last yield, its task yields the slot as soon
     as it is being worked again (assigned, delivered or `revise`; a
@@ -1770,6 +1840,27 @@ record of what was judged (§14 of design.md).
     tasks kept failing held mission 4's three slots for a day (an abort was
     followed by a new task for the same objective five seconds later), and
     objectives 025 to 034 were never assigned.
+  - **An objective already solved on the base.** A one-shot objective is
+    solved once a task for it lands (below); it is also solved when its
+    scenario passes at a base commit main already holds, because then no
+    work of a task can change anything. Mission 4's task 182 (objective
+    34) was rejected three times on 2026-11-08 — "the work changes nothing
+    on main" twice, then "scenario already passes on the base" — after the
+    owner batch had landed the behaviour already, and the third rejection
+    halted the mission. Now: a gate that says the objective's scenario
+    passes on the base (its base check, before any candidate build) is a
+    fact about the objective, not about the task's work. The integrator
+    records `objective.solved` {`id`: the mission, `objective`, `task`,
+    `scenario`, `base`: the commit, `log`: the gate's}, stops the worker
+    and ends the task as `task.cancelled` on that record (`solved`: its
+    event id, `by: spawn-integrate`): no rejection, no failed attempt, no
+    halt. The assignment rule reads `objective.solved` as a landing, so the
+    objective is not assigned again, and an objective that names it in
+    `after` is not held by it. A candidate whose tree is main's tree is not
+    rejected at once in an objective mission either: it is judged, and the
+    gate's base check answers the same question (cheaply: the base is
+    cached by the deploy's warm-up). A gate verdict on the base that
+    disagrees with itself is a host fault (§10.3), unrelated.
   - **Named order.** A backlog objective may name the objectives it comes
     after (`"after": [28]` in its JSON, versioned with the backlog): it is
     not assigned while one of them is open (one the backlog does not hold
@@ -1904,7 +1995,22 @@ record of what was judged (§14 of design.md).
   database, as Supply PA's tests run on PGlite) gets no
   SPAWN_TEST_DATABASE_URL, so its candidate code cannot reach the shared
   server: its judgings do not count against N and run beside a Spawn gate,
-  still one per mission and per source. Each judging records its own verdict and landing, which the next
+  still one per mission and per source. **CPU room.** The integrator
+  gives every gate its `SPAWN_GATE_JOBS` (scenarios at once), never
+  gate.sh's own default: the owner's `SPAWN_GATE_JOBS` when set; 1 for a
+  gate on the shared test server; otherwise the host's cores less
+  `SPAWN_GATE_WORKER_CORES` (cores kept for the workers and the host; a
+  whole number from 0 to cores - 1, default a quarter of the cores, at
+  least 1), divided among the gates that can run at once (one per source,
+  those on the shared server at most N), at most 8. A gate starts only
+  when its jobs, the running gates' jobs and the kept cores fit within the
+  cores, or when no gate runs; otherwise it waits for a later pass, said
+  once, like a gate over N: no record and nothing counted against the task
+  (unlike `no_room`, there is nothing to measure: the integrator knows the
+  jobs it gave). A setting that does not parse stops the integrator from
+  starting, naming it. On 2026-11-08, with `SPAWN_GATE_PG_BIN` set, each
+  gate took half of the 9 cores; two or three gates and the workers made a
+  load of 18-20, and task 172's gate failed on its base. Each judging records its own verdict and landing, which the next
   pass reads; finished judgings are reaped before a pass reads the
   missions. A judging that panics before any record of its own is
   recorded `aborted` with the reason, so the three-aborts halt bounds a
