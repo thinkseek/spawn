@@ -57,6 +57,22 @@
 //! [`Plan`] ([`decide_with`]), reads it from the store ([`read_plan`], which
 //! the UI's attention queue calls too: `GET /api/attention`) and submits it
 //! ([`step`]).
+//!
+//! When the step runs. A step is a decision over records: the facts, the
+//! mission rows, the control stream and the queue. It runs when the log's
+//! watermark has moved since it last ran (a record it decides from may be
+//! new), and otherwise only when a time one of those records names has come
+//! ([`Reading::due_ms`]): a delivery's retry (`deliver::attempts`: the
+//! wait after a refusal that typed nothing, or the doubling wait after a
+//! failure), a stall's bound ([`stall`], measured from the record the step
+//! stands on), a failed Stop's retry ([`stops`]), a background job's bound
+//! ([`jobs`]), a cancelled resident's notice, a report note refused before
+//! typing. Every time it returns is computed from a record — an attempt's
+//! `finished_at_ms`, a stall's record, a job's start — never counted by the
+//! loop, and one it cannot date is due now, never later. Nothing it decides
+//! depends on how often it ran: the same records and the same clock make
+//! the same orders, deliveries, escalations and digests, under the same
+//! keys and tags (docs/fleet-architecture.md §3, docs/design.md §14).
 
 mod charter;
 mod digest;
@@ -615,6 +631,20 @@ fn load_stalls(store: &PostgresStore) -> Result<stall::Stalls, String> {
         .map_err(|error| format!("stall facts: {error}"))
 }
 
+/// The records one read of the escalation lists returns, as their item
+/// builders take them; a read that fails fails the pass, as [`read_plan`]
+/// always did.
+fn records(
+    read: Result<serde_json::Value, spawn_core::port::StoreError>,
+    what: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    Ok(read
+        .map_err(|error| format!("{what}: {error}"))?
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
+}
+
 fn now_ms() -> i64 {
     spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
 }
@@ -643,6 +673,12 @@ pub(crate) struct Reading {
     pub(crate) plan: Plan,
     /// Log lines: what could not be read (a stall read that failed).
     pub(crate) lines: Vec<String>,
+    /// When the dispatcher's next step is due even if no record is written
+    /// meanwhile: the earliest retry, stall bound, Stop retry or job bound
+    /// the records this pass read name (`None`: no clock is waited for).
+    /// On this host's clock, and after this pass: a time already reached is
+    /// the step's to act on now, not a wait.
+    pub(crate) due_ms: Option<i64>,
 }
 
 /// The plan for this moment, reading only: the host's news (the disk items
@@ -674,59 +710,73 @@ pub(crate) fn read_plan(
     let mut lines = Vec::new();
     let now = now_ms();
     let mut host = disk(now);
-    host.extend(crate::disk::gate_room_escalations(
-        store
-            .gate_room_escalations()
-            .map_err(|error| format!("gate room records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::host_fault_escalations(
-        store
-            .gate_host_fault_escalations()
-            .map_err(|error| format!("gate host fault records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::base_disagrees_alerts(
-        store
-            .gate_base_disagrees_alerts()
-            .map_err(|error| format!("gate base disagreement records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::over_budget_escalations(
-        store
-            .over_budget_escalations()
-            .map_err(|error| format!("over budget records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::objective_yields(
-        store
-            .objective_yields()
-            .map_err(|error| format!("objective yield records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::objective_order(
-        store
-            .objective_backlogs()
-            .map_err(|error| format!("objective backlogs: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::hold_expiries(
-        store
-            .hold_expiries()
-            .map_err(|error| format!("source hold records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
+    host.extend(crate::disk::gate_room_escalations(&records(
+        store.gate_room_escalations(),
+        "gate room records",
+    )?));
+    host.extend(digest::host_fault_escalations(&records(
+        store.gate_host_fault_escalations(),
+        "gate host fault records",
+    )?));
+    host.extend(digest::base_disagrees_alerts(&records(
+        store.gate_base_disagrees_alerts(),
+        "gate base disagreement records",
+    )?));
+    host.extend(digest::over_budget_escalations(&records(
+        store.over_budget_escalations(),
+        "over budget records",
+    )?));
+    host.extend(digest::objective_yields(&records(
+        store.objective_yields(),
+        "objective yield records",
+    )?));
+    host.extend(digest::objective_order(&records(
+        store.objective_backlogs(),
+        "objective backlogs",
+    )?));
+    host.extend(digest::hold_expiries(&records(
+        store.hold_expiries(),
+        "source hold records",
+    )?));
+    // Every timer the records read here name: the times at which this step
+    // would decide something new even though nothing is appended meanwhile.
+    // A time already reached is no wait (the step acts on it now), so only
+    // later ones count.
+    let mut due: Option<i64> = None;
+    let mut soon = |at: i64| {
+        if at > now {
+            due = Some(due.map_or(at, |known: i64| known.min(at)));
+        }
+    };
+    if let Some(at) = deliver::next_due(&work, &rows, now) {
+        soon(at);
+    }
+    for facts in rows.iter().filter(|facts| is_worker(facts)) {
+        if let Some(at) = stops::next_due(facts) {
+            soon(at);
+        }
+        // A worker held back from its one nudge by the hourly limit is due
+        // when the oldest nudge of that hour leaves it.
+        if let Some(left) = worker::due_in(facts, now) {
+            soon(now.saturating_add(left));
+        }
+    }
     // A stall read that failed costs this pass its stall items, never its
     // deliveries: the next pass measures the same stalls again.
     match load_stalls(store) {
-        Ok(stalls) => host.extend(stall::items(&rows, &work, &stalls, bounds)),
+        Ok(stalls) => {
+            host.extend(stall::items(&rows, &work, &stalls, bounds));
+            // Stalls and jobs are measured on the database's clock, which
+            // `stalls.now_ms` names; the loop waits on its own. Only the
+            // interval between them is read from the database's.
+            let on_host = |at: i64| now.saturating_add(at.saturating_sub(stalls.now_ms));
+            if let Some(at) = stall::next_due(&rows, &work, &stalls, bounds) {
+                soon(on_host(at));
+            }
+            if let Some(at) = jobs::next_due(&rows, bounds.job) {
+                soon(on_host(at));
+            }
+        }
         Err(error) => lines.push(format!("dispatch: stalls: {error}")),
     }
     host.extend(jobs::items(&rows, bounds.job));
@@ -749,6 +799,7 @@ pub(crate) fn read_plan(
         work,
         plan,
         lines,
+        due_ms: due,
     })
 }
 
@@ -757,7 +808,8 @@ pub(crate) fn read_plan(
 /// [`deliver::collect_reports`]), then submit the plan ([`read_plan`]), with the
 /// stalls past their `bounds` among its escalations ([`stall`]), without
 /// its new executions while the disk is under its floor ([`crate::disk`]),
-/// delivering with `waits` ([`deliver::Waits`]). Returns log lines.
+/// delivering with `waits` ([`deliver::Waits`]). Returns log lines, and when
+/// the next step is due ([`Reading::due_ms`]).
 pub(crate) fn step(
     store: &std::sync::Arc<PostgresStore>,
     supervised: bool,
@@ -766,7 +818,7 @@ pub(crate) fn step(
     disk: &crate::disk::Monitor,
     bounds: &Bounds,
     waits: deliver::Waits,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Option<i64>), String> {
     let (mut rows, mut work) = load(store, waits)?;
     let mut lines = root.map_or_else(Vec::new, |root| {
         deliver::collect_reports(store, &work, &rows, root, now_ms())
@@ -779,6 +831,7 @@ pub(crate) fn step(
         work,
         mut plan,
         lines: read,
+        due_ms,
         ..
     } = read_plan(
         store,
@@ -873,7 +926,16 @@ pub(crate) fn step(
         submit(store, &principal, order)?;
         lines.push(line);
     }
-    Ok(lines)
+    // A `recovered` disk record stops being a digest item after its day
+    // without a record of its own: that moment is a time this step waits for.
+    let at = now_ms();
+    let due_ms = match disk.due_in(at) {
+        Some(left) if left > 0 => Some(due_ms.map_or(at.saturating_add(left), |due| {
+            due.min(at.saturating_add(left))
+        })),
+        _ => due_ms,
+    };
+    Ok((lines, due_ms))
 }
 
 /// Set aside the work of the cancelled task `task` before `order`, its
@@ -1179,6 +1241,46 @@ mod tests {
         assert_eq!(plan.orders[0].task, Some(25));
         assert!(matches!(plan.orders[0].action, CommandAction::Input { .. }));
         assert!(plan.pending.is_empty(), "{:?}", plan.pending);
+    }
+
+    /// Nothing a step decides depends on how often it ran: given the same
+    /// records and the same clock, a pass over them makes the same plan — the
+    /// same orders under the same idempotency keys — whether the step ran on
+    /// every pass or only on the one that saw them first. A re-submission of
+    /// the same key writes nothing (`spawn_submit`'s `on conflict do
+    /// nothing`), so the two schedules order the same work.
+    #[test]
+    fn the_same_facts_make_the_same_plan_however_often_the_step_ran() {
+        let mut resident = worker(judged(SemanticState::Waiting, 0.9));
+        resident.session_id = "session_resident_core".to_string();
+        resident.agent_id = "agent_resident_core".to_string();
+        resident.dispatched = vec![Sent {
+            id: Some(31),
+            key: "deliver-25-0".to_string(),
+            text: None,
+            created_at_ms: NOW - 10_001,
+            finished_at_ms: Some(NOW - 10_000),
+            succeeded: Some(false),
+            error: Some("pane state Busy does not accept input".to_string()),
+        }];
+        let work = Work {
+            tasks: serde_json::from_value(serde_json::json!([{
+                "id": 25, "mission_id": 1, "kind": "resident",
+                "agent_id": "agent_resident_core", "session_id": "session_resident_core",
+                "brief": "brief 25", "state": "assigned", "revisions": 0,
+                "mission_text": "m", "resident": "core", "charter": "c",
+            }]))
+            .expect("task rows"),
+            ..Work::default()
+        };
+        // The record is 10 s old: its not-ready wait (5 s) is over, so this
+        // pass retries it. Run the step again on the same records and the
+        // same clock: the same key, the same plan.
+        let first = decide_with(&[resident.clone()], &work, &[], false, NOW, "spawn");
+        let second = decide_with(&[resident], &work, &[], false, NOW, "spawn");
+        assert_eq!(first, second, "the same records make the same plan");
+        assert_eq!(first.orders.len(), 1, "{:?}", first.orders);
+        assert_eq!(first.orders[0].key, "deliver-25-0-retry-1");
     }
 
     /// The digest `order` reached the supervisor: the tags it filed are

@@ -144,6 +144,39 @@ impl Tracked {
         }
     }
 
+    /// The earliest time at `now` (or before it) this session is due, by the
+    /// rules [`Self::is_due`] applies: a time this process waits for, never
+    /// a reason to read the log. `None` while nothing about the session
+    /// waits on the clock.
+    fn due_at(&self, now: Timestamp) -> Option<Timestamp> {
+        if self.snapshot.evidence_seq > self.judged_seq {
+            return Some(now);
+        }
+        let mut due: Option<Timestamp> = None;
+        let mut soonest = |at: Timestamp| {
+            due = Some(due.map_or(at, |known: Timestamp| known.min(at)));
+        };
+        if self.lagging() {
+            // The facts settle when either clock says `SETTLE` has passed
+            // since the last one, so the earlier of the two is the wait.
+            let mut settle: Option<Timestamp> = None;
+            for at in [self.fact_at, self.fact_seen].into_iter().flatten() {
+                let at = at.plus(SETTLE);
+                settle = Some(settle.map_or(at, |known: Timestamp| known.min(at)));
+            }
+            if let Some(at) = settle {
+                soonest(at);
+            }
+        }
+        match self.judged_at {
+            Some(at) if self.failures > 0 => soonest(at.plus(retry_after(self.failures))),
+            Some(at) if self.snapshot.execution_active => soonest(at.plus(RECHECK_EVERY)),
+            Some(_) => {}
+            None => soonest(now),
+        }
+        due
+    }
+
     /// Restore what the Observer last wrote and asked from one of its own
     /// rows, so a new process neither writes the same observation again nor
     /// asks the model about the same evidence.
@@ -263,6 +296,19 @@ impl Observer {
         self.cursor = GlobalPosition(0);
         self.sessions.clear();
         self.catch_up()
+    }
+
+    /// When the loop must run [`Self::tick`] again even if the log has not
+    /// moved: the earliest time a session's own schedule waits for (its
+    /// facts settling, a recheck of a running execution, a judge's backoff),
+    /// on this clock. `None`: nothing waits on the clock.
+    pub fn next_due_ms(&self) -> Option<i64> {
+        let now = self.clock.now();
+        self.sessions
+            .values()
+            .filter_map(|tracked| tracked.due_at(now))
+            .map(|at| at.0)
+            .min()
     }
 
     /// Read new events and classify changed or due sessions.
