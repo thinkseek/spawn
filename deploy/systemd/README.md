@@ -17,6 +17,7 @@ main, changes nothing live until that commit is gated and deployed.
 | `spawn-serve` | `spawn serve`: UI and API, read as `spawn_reader`, and a person's input to a session typed as `spawn_human` (the one write, `POST /api/session/<id>/input`); the UI is the build `deploy.sh` installs in `~/.local/share/spawn-rsi/web` (`SPAWN_WEB_DIR`), on `SPAWN_SERVE_ADDRESS` (default `127.0.0.1:8787`). Off loopback (e.g. `0.0.0.0:8787` for the LAN) it refuses to start without `SPAWN_SERVE_TOKEN`; open the UI once as `http://<host>:8787/?token=<token>` | never; without the token it exits and restarts every 3 s |
 | `spawn-jev-relay` | `scripts/jev-relay.py` on 127.0.0.1:8790, holding the API key | never |
 | `spawn-model-relay` | `scripts/model-relay.py` on 127.0.0.1:8791: the engines' model calls, `deepseek-*` to DeepSeek with `DEEPSEEK_API_KEY` (from `~/.hermes/.env`, held only here), everything else to the gateway of `~/.claude/settings.json` with the engine's own auth ([fleet-architecture.md §3.3](../../docs/fleet-architecture.md#33-engine-models)) | never |
+| `spawn-fleet-test-db` | PostgreSQL 16 on a Unix socket only (`~/.local/share/spawn-rsi/fleet-pg`): the fleet's test server, which engines get as `SPAWN_TEST_DATABASE_URL` once it checks out (below) | never (`Restart=on-failure`) |
 | `spawn-backup` (`.timer`) | `pg-backup.sh`: daily encrypted `pg_dump` to R2 (bucket-locked, R2 expires it); install and keys in [deploy/backup](../backup/README.md) | oneshot, daily at 03:30 + random delay |
 | `spawn-maintenance` (`.timer`) | `scripts/maintenance.sh` from the controller: the gate's leftover scratch (`$TMPDIR/spawn-gate.XXXXXX` older than 3 h), deploy.sh's dumps in the backups directory beyond the newest 5; nothing Spawn did not create ([docs/storage.md](../../docs/storage.md#disk-room)) | oneshot, hourly (scratch older than 3 h) |
 
@@ -61,6 +62,68 @@ with `SPAWN_SERVE_TOKEN` when the UI serves the LAN (a URL-safe secret, e.g.
 lets the owner's intranet read without the token, by the server's address
 (`http://192.168.31.112:8787/`); a client elsewhere (Tailscale, a container)
 still needs it.
+
+## Fleet test database and credentials
+
+Workers run tests that need PostgreSQL. They get a server of their own,
+never the gates' shared one (the system cluster `16-test` that the loop's
+and the integrator's `SPAWN_TEST_DATABASE_URL` names) and never the live
+one: a worker's test load there failed fleet gates, and a worker without a
+test database went looking for one in `spawn.env` (2026-11-08).
+
+`spawn-test` is a system cluster (`postgresql@16-test`, run by `postgres`,
+created with root). The fleet's is a user cluster instead, like the relays:
+no root, created by a script in the checkout, kept running by a user unit
+(the user lingers, so it starts at boot), and `spawn-loop` wants it and
+starts after it. Its data is test data, `fsync` off; lost, it is made again.
+Engines log in as `spawn_fleet`, not a superuser: a superuser login would
+turn `COPY ... PROGRAM` and `pg_read_file` into a way around every deny
+rule an engine has. Spawn's spawn-postgres tests pass on it, 144 of 144
+(the script's header; the two checks that need a superuser skip with a
+reason).
+
+What protects the credentials ships in the binary: the deploy, then the
+units, in this order.
+
+1. Deploy the commit (`deploy/deploy.sh`, above). The new binary gives
+   engines the deny rules (`CREDENTIAL_DENY` in
+   `crates/spawn-core/src/bridge.rs`: Claude Code rules in bypass mode,
+   not a sandbox, [design.md](../../docs/design.md)), makes `spawn loop`,
+   `spawn integrate` and `spawn serve` not dumpable (their
+   `/proc/<pid>/environ` is no longer readable by the engines, which run as
+   the same user), and passes the fleet test URL only once it checks out.
+   This deploy's own base-cache warm-up finds no gate environment file yet
+   (step 2) and says "not warmed"; the next deploy warms it.
+2. Install the units: `spawn-integrate` now writes its gate environment to
+   `~/.config/spawn/gate-env` (0600; `SPAWN_GATE_ENV_FILE` in its unit),
+   which `deploy.sh` reads instead of the integrator's environ.
+
+```sh
+sh deploy/fleet-test-db.sh       # once: initdb, logins spawn_fleet_admin and spawn_fleet, database spawn_fleet_test
+printf 'SPAWN_FLEET_TEST_DATABASE_URL=%s\n' "$(cat ~/.config/spawn/fleet-test-database.url)" \
+    >> ~/.local/share/spawn-rsi/spawn.env
+cp deploy/systemd/spawn-fleet-test-db.service deploy/systemd/spawn-loop.service \
+    deploy/systemd/spawn-integrate.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now spawn-fleet-test-db
+systemctl --user restart spawn-loop spawn-integrate   # agents keep running (KillMode=process)
+```
+
+3. **Running engines keep the settings and environment they started with.**
+   The deny rules and the test URL reach an engine only at its next start
+   or resume: an engine that was running before the deploy has neither
+   until then. Stop and resume the idle workers after the restart to close
+   that window; a busy one gets them at its next resume.
+
+The loop gives an engine that URL as `SPAWN_TEST_DATABASE_URL` (the pane's
+private environment file, never a command line), and the task prompt says
+so. It fails closed: the URL is given only once the fleet's server and
+every other one configured (the gates' `SPAWN_TEST_DATABASE_URL`, the live
+`SPAWN_DATABASE_URL`) answer with their `system_identifier`, and the
+fleet's differs from each. Until then each launch goes without it, the
+loop's log says why once, and the next launch checks again (a fleet server
+that comes up late is given from then on). Without
+`SPAWN_FLEET_TEST_DATABASE_URL`, engines get no test database at all.
 
 ## Disk room
 
