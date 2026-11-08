@@ -752,6 +752,10 @@ pub(crate) struct Recovery {
     /// append announces, so the loop must run the step again every probe,
     /// not only when the log moves ([`Self::probing`]).
     open_waits: bool,
+    /// The earliest time a revival this pass left pending is due (a resume
+    /// or a handoff behind its backoff): the step must run then, whether
+    /// the log moves or not.
+    pending_due: Option<i64>,
 }
 
 impl Recovery {
@@ -782,6 +786,23 @@ impl Recovery {
     /// it at once, whether the log moved or not.
     pub(crate) fn outage_pending(&self) -> bool {
         self.outage.is_some()
+    }
+
+    /// The earliest time the loop must run the step again with no log
+    /// move: a wait's probe, a pending revival's due, or now while an
+    /// outage is pending.
+    pub(crate) fn next_due(&self, probe_ms: i64, now_ms: i64) -> Option<i64> {
+        let probe = self.open_waits.then(|| now_ms.saturating_add(probe_ms));
+        let outage = self.outage.is_some().then_some(now_ms);
+        [probe, self.pending_due, outage]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// A revival is due at `due`, later than now: the step runs then.
+    fn hold_until(&mut self, due: i64) {
+        self.pending_due = Some(self.pending_due.map_or(due, |held| held.min(due)));
     }
 
     /// Whether the loop's next pass must read again although the log did
@@ -841,6 +862,7 @@ pub(crate) fn step(state: &mut Recovery, world: &World<'_>) -> Result<Vec<String
     } = *world;
     let mut lines = Vec::new();
     state.open_waits = false;
+    state.pending_due = None;
     state.record_start(store, now_ms)?;
     let outage = state.clearing(now_ms);
     let sessions: Vec<Candidate> = serde_json::from_value(
@@ -1726,6 +1748,7 @@ impl One<'_> {
             last.due_ms().unwrap_or(self.now_ms)
         };
         if self.now_ms < due {
+            self.state.hold_until(due);
             return Ok(());
         }
         if cause.path() == Path::Wait && !cleared {
@@ -1788,6 +1811,7 @@ impl One<'_> {
             self.now_ms,
         );
         if self.now_ms < due {
+            self.state.hold_until(due);
             return Ok(());
         }
         let next = format!("{key}-r{}", retries.len().saturating_add(1));
@@ -1824,6 +1848,7 @@ impl One<'_> {
         }
         let due = last.due_ms().unwrap_or(self.now_ms);
         if self.now_ms < due {
+            self.state.hold_until(due);
             return Ok(());
         }
         let (prompt, charter) = self.handoff_prompt(last, cause);

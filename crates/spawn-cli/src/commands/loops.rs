@@ -737,10 +737,7 @@ impl Fleet<'_> {
                             // with none, the step runs again when the log
                             // moves, never before — an idle pass then costs
                             // the watermark read alone.
-                            let due = self
-                                .recovery
-                                .probing()
-                                .then(|| now.saturating_add(self.config.probe));
+                            let due = self.recovery.next_due(self.config.probe, now);
                             self.schedule.recovery.ran(watermark, due);
                         }
                         Err(error) => Fleet::fail(errors, "recover", &error),
