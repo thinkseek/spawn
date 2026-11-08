@@ -772,7 +772,7 @@ pub(crate) fn next_due(work: &Work, rows: &[Facts], now_ms: i64) -> Option<i64> 
         let Some(found) = facts.get(task.session_id.as_str()).copied() else {
             continue;
         };
-        if let Attempts::Retry { due_ms, .. } = attempts(task, found) {
+        if let Attempts::Retry { due_ms, .. } = attempts(&work.waits, task, found) {
             soon(due_ms);
         }
     }
