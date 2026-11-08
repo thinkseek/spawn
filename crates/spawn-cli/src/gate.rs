@@ -116,6 +116,12 @@ pub(crate) const GATE_ENV: &[&str] = &[
     // "Host scenario slots"): without it each gate's SPAWN_GATE_JOBS was
     // the whole host's, and two gates doubled the scenario load.
     "SPAWN_GATE_HOST_JOBS",
+    // The gate's build share (CARGO_BUILD_JOBS for its build hook and test
+    // listing, scripts/rsi/gate.sh): the owner's, when set; unset, a gate
+    // builds with cargo's default and a warm at 1. Who claims a slot first
+    // (SPAWN_GATE_SLOT_PRIORITY) is not passed: the integrator's gates are
+    // normal and its warms are `--base-only`, which is low by itself.
+    "SPAWN_GATE_BUILD_JOBS",
     "SPAWN_GATE_PG_IMAGE",
     "SPAWN_GATE_PG_BIN",
     // A tree's deps store (Supply PA's `gate/scenarios/build`, `bind` and
@@ -2459,6 +2465,8 @@ mod tests {
             "SPAWN_GATE_MIN_FREE_GB" => Some("10".into()),
             "SPAWN_GATE_JOBS" => Some("4".into()),
             "SPAWN_GATE_HOST_JOBS" => Some("2".into()),
+            "SPAWN_GATE_BUILD_JOBS" => Some("3".into()),
+            "SPAWN_GATE_SLOT_PRIORITY" => Some("low".into()),
             "SPAWN_GATE_PG_IMAGE" => Some("postgres:16-alpine".into()),
             "SPAWN_GATE_PG_BIN" => Some("/usr/lib/postgresql/16/bin".into()),
             "SUPPLY_PA_DEPS" => {
@@ -2483,6 +2491,7 @@ mod tests {
                 "SPAWN_GATE_MIN_FREE_GB",
                 "SPAWN_GATE_JOBS",
                 "SPAWN_GATE_HOST_JOBS",
+                "SPAWN_GATE_BUILD_JOBS",
                 "SPAWN_GATE_PG_IMAGE",
                 "SPAWN_GATE_PG_BIN",
                 "SUPPLY_PA_DEPS"

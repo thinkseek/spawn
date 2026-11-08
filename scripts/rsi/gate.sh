@@ -183,6 +183,13 @@
 #                              waits between its mask check and bwrap (it creates
 #                              <file>.held first); spawn integrate never
 #                              passes it
+#   SPAWN_GATE_SLOT_PRIORITY   normal or low: who claims a slot first ("Host
+#                              scenario slots"); default low for --base-only
+#                              (a warm), normal for every other gate
+#   SPAWN_GATE_BUILD_JOBS      CARGO_BUILD_JOBS for the build hook and the
+#                              test listing, inside the sandbox (whole number
+#                              from 1); unset by default (cargo's own, every
+#                              core), and 1 for --base-only, whatever is set
 #   SPAWN_GATE_PG_IMAGE        the test server's docker image: the gate runs a
 #                              server of its own from it (GitHub issue #6),
 #                              and SPAWN_TEST_DATABASE_URL is not used
@@ -198,7 +205,10 @@
 #
 # Base only (`--base-only`): the base phase alone, for the base cache: the
 # results the next gates on that base take from it. deploy/deploy.sh starts
-# one in the background once it moved main. Exit 0 with no verdict (none is
+# one in the background once it moved main, and spawn integrate after each
+# landing and each owner's landing (`source.moved`). It is a warm: one job,
+# CARGO_BUILD_JOBS=1, and the last to claim a host scenario slot, so its
+# footprint is at most one slot no gate is waiting for and one compiler job. Exit 0 with no verdict (none is
 # written, whatever SPAWN_GATE_VERDICT says), 4 on a harness error, 3 as
 # below.
 #
@@ -661,6 +671,30 @@ case "$gate_jobs" in
     exit 3
     ;;
 esac
+# A base-only run is a warm (the deploy's, the integrator's after a
+# landing): one job, whatever SPAWN_GATE_JOBS says, so that every warm has
+# the same footprint — at most one host scenario slot, claimed last ("Host
+# scenario slots"), and one compiler job (below).
+[ -z "$base_only" ] || gate_jobs=1
+# The gate's build share: CARGO_BUILD_JOBS inside the sandbox for the
+# build hook (`<scenarios-dir>/build`) and the test listing. Only a warm
+# (`--base-only`) is pinned, to 1, so its build takes one core beside the
+# gates it yields to; any other gate builds as before, with cargo's own
+# default, unless the owner sets SPAWN_GATE_BUILD_JOBS (a gate's
+# SPAWN_GATE_JOBS sizes its scenario runs, not its compiler: a lone gate
+# building at that would build slower than it did). Unset, the variable is
+# not passed at all, never passed empty. It is not in the base cache key: a
+# -j changes how fast a tree builds, never what a scenario on it returns.
+gate_build_jobs=${SPAWN_GATE_BUILD_JOBS-}
+if [ -n "$gate_build_jobs" ]; then
+    case "$gate_build_jobs" in
+    *[!0-9]* | 0*)
+        echo "gate: SPAWN_GATE_BUILD_JOBS is a whole number from 1, not '$gate_build_jobs'" >&2
+        exit 3
+        ;;
+    esac
+fi
+[ -z "$base_only" ] || gate_build_jobs=1
 # The host's scenario budget (see "Host scenario slots"): SPAWN_GATE_HOST_JOBS,
 # else the value every gate is given (SPAWN_GATE_JOBS) when the owner set
 # it, else the same default one gate takes. Without flock, or a writable
@@ -718,6 +752,20 @@ else
         ;;
     esac
 fi
+# Who claims first (see "Host scenario slots"): a warm (`--base-only`) is
+# `low`, every other gate `normal`; SPAWN_GATE_SLOT_PRIORITY says otherwise
+# (the suite, an owner's hand-run warm that should not wait).
+slot_priority=${SPAWN_GATE_SLOT_PRIORITY-}
+if [ -z "$slot_priority" ]; then
+    if [ -n "$base_only" ]; then slot_priority=low; else slot_priority=normal; fi
+fi
+case "$slot_priority" in
+normal | low) ;;
+*)
+    echo "gate: SPAWN_GATE_SLOT_PRIORITY is normal or low, not '$slot_priority'" >&2
+    exit 3
+    ;;
+esac
 # The slots themselves: files this host's gates lock one at a time, under
 # $HOME (0700), so the integrator's gate, an owner's hand-run gate and the
 # deploy's warm-up all find the same ones — with no variable to set, and
@@ -725,7 +773,7 @@ fi
 # runs a HOME of their own, so its gates stay out of the host's budget.)
 # Outside the sandbox: no scenario can see or take a lock, and the kernel
 # drops a held one when its fd closes, a kill included.
-slot_held=""
+slot_held="" slot_kept=""
 if command -v flock >/dev/null 2>&1; then
     if mkdir -p "$slot_dir" 2>/dev/null && chmod 700 "$slot_dir" 2>/dev/null; then
         slot_i=1
@@ -736,6 +784,11 @@ if command -v flock >/dev/null 2>&1; then
             fi
             slot_i=$((slot_i + 1))
         done
+        # The demand lock beside the slots (see "Host scenario slots"):
+        # without it no priority, every claimant as before.
+        if [ "$gate_slots" -gt 0 ] && ! (umask 077 && : >>"$slot_dir/demand") 2>/dev/null; then
+            slot_priority=normal
+        fi
     else
         gate_slots=0
     fi
@@ -749,6 +802,14 @@ else
         echo "| host scenario slots: no $slot_dir/host_jobs file: $gate_slots from SPAWN_GATE_HOST_JOBS or the default, so a gate started with a larger value can exceed this cap"
     fi
     echo "| host scenario slots: $gate_slots (every gate on this host takes one per scenario run)"
+    [ "$slot_priority" = normal ] ||
+        echo "| host scenario slots: claimed last (a warm: a slot only when no gate is waiting for one)"
+fi
+# Why a run waits, as its lines say it.
+if [ "$slot_priority" = normal ]; then
+    slot_busy="all $gate_slots taken, shared by every gate on this host"
+else
+    slot_busy="claimed last: all $gate_slots taken, or a gate is waiting for one"
 fi
 # Whatever the gate started dies with it: its scenario runs, the private
 # server, the forwarder (below). A SIGKILL leaves none either: each runs
@@ -1190,7 +1251,8 @@ build() {
     # is where a vanished mask was a false "does not build".
     sandbox_hold_here=1
     build_status=0
-    sandbox "$1" sh "$scenarios/build" >"$work/build.log" 2>&1 || build_status=$?
+    sandbox "$1" env ${gate_build_jobs:+"CARGO_BUILD_JOBS=$gate_build_jobs"} sh "$scenarios/build" >"$work/build.log" 2>&1 ||
+        build_status=$?
     sandbox_hold_here=""
     [ "$build_status" -eq 0 ] || {
         sed 's/^/| build: /' "$work/build.log" | tail -n 30
@@ -1244,6 +1306,18 @@ build() {
 # different hosts have different budgets; the slots are per host, not per
 # fleet.
 #
+# A warm claims last. A `--base-only` run (the deploy's warm-up, spawn
+# integrate's warm after a landing) is `low`: it takes a slot only when no
+# gate is waiting for one, through a demand lock beside the slots
+# ($slot_dir/demand, fd 5; `slot_acquire` says how). So a warm runs in the
+# slots the gates leave idle — during their builds, their test listings,
+# between them — and a gate never waits behind a warm for more than the one
+# run the warm already had when the gate arrived: there is no preemption,
+# and a warm runs one job. When a warm and a gate share a base, they share
+# its results too: each scenario's entry is judged under its key's lock
+# (`base_job`), so whichever starts one first runs it and the other reads
+# it.
+#
 # Parallel runs. The base's scenario runs, and then the candidate's, run
 # SPAWN_GATE_JOBS at a time (above), the base's all done before any
 # candidate code runs. Each run is a sandbox of its own: its own /tmp (so its
@@ -1286,17 +1360,57 @@ build() {
 # when the run's processes do. A wait past the first round leaves <job>/waiting
 # for the gate's own loop to print, so a waiting gate is visible while it
 # waits; the run's block then says how long it waited and the slot it took.
+#
+# Priority, on the demand lock ($slot_dir/demand, fd 5). A normal claimant
+# holds it shared from just before its first scan until it holds a slot (or
+# gives up): exactly while a gate wants a slot it does not have. A low one
+# (a warm) scans only under the lock held exclusively, taken without
+# waiting; when it cannot have it, a gate is waiting or scanning, so it
+# takes no slot this round. No gate can start or be mid-scan while a warm
+# scans, so a warm never takes the slot a waiting gate would have had. What
+# is left is no preemption: a gate that arrives while a warm holds a slot
+# waits out that one job of the warm (at most one: a warm runs one job, two
+# runs at most, and keeps its slot between them: base_job).
 slot_acquire() {
     slot_held="" slot_n="" slot_wait_ms=0 slot_said="" slot_gave_up=""
     [ "$gate_slots" -gt 0 ] || return 0
     rm -f "$1/waiting" "$1/waiting.said" "$1/waiting.said.n" 2>/dev/null || :
     slot_from=$(stage_now)
+    if [ "$slot_priority" = normal ] && [ -e "$slot_dir/demand" ] &&
+        { exec 5>>"$slot_dir/demand"; } 2>/dev/null; then
+        flock -s 5 2>/dev/null || exec 5>&-
+    fi
     while [ -z "$slot_held" ]; do
+        slot_scan=1
+        if [ "$slot_priority" = low ]; then
+            slot_scan=""
+            if [ ! -e "$slot_dir/demand" ]; then
+                if [ ! -e "$slot_dir/slot.1" ]; then
+                    # The slot files went away with it (a cache root cleaned
+                    # under us): judge as before, as the scan does below.
+                    gate_slots=0
+                    return 0
+                fi
+                # The demand file alone went away: made again, so the warm
+                # does not spin out its whole wait unable to scan. A normal
+                # claimant that opened the old one before it went still holds
+                # that one: until it has its slot, a warm may scan beside it.
+                (umask 077 && : >>"$slot_dir/demand") 2>/dev/null || :
+            fi
+            if [ -e "$slot_dir/demand" ] && { exec 5>>"$slot_dir/demand"; } 2>/dev/null; then
+                flock -n -x 5 2>/dev/null && slot_scan=1
+            else
+                # No demand lock to be had: no priority, as at the start
+                # when it could not be made.
+                slot_scan=1
+            fi
+        fi
         slot_i=1
-        while [ "$slot_i" -le "$gate_slots" ]; do
+        while [ -n "$slot_scan" ] && [ "$slot_i" -le "$gate_slots" ]; do
             if [ ! -e "$slot_dir/slot.$slot_i" ]; then
                 # The slot files went away (a cache root cleaned under us):
                 # judge as before rather than wait forever.
+                exec 5>&-
                 gate_slots=0
                 return 0
             fi
@@ -1309,11 +1423,15 @@ slot_acquire() {
             exec 6>&-
             slot_i=$((slot_i + 1))
         done
+        # A warm holds the demand lock only for its scan.
+        [ "$slot_priority" != low ] || exec 5>&-
         if [ -z "$slot_held" ]; then
             slot_wait_ms=$(( $(stage_now) - slot_from ))
             if [ "$slot_wait_ms" -ge $((slot_wait * 1000)) ]; then
                 # The bound: no room to judge now (see "Host scenario
-                # slots"). No fd is open here, so giving up holds nothing.
+                # slots"). Closing fd 5 drops the demand: giving up holds
+                # nothing.
+                exec 5>&-
                 rm -f "$1/waiting" 2>/dev/null || :
                 slot_gave_up=1
                 return 0
@@ -1323,6 +1441,7 @@ slot_acquire() {
             sleep 0.2
         fi
     done
+    exec 5>&-
     [ -z "$slot_said" ] || rm -f "$1/waiting" 2>/dev/null || :
     slot_wait_ms=$(( $(stage_now) - slot_from ))
 }
@@ -1346,7 +1465,7 @@ slot_no_room() {
     stage_close no_room
     gate_times
     stage_emit gate no_room "$(($(stage_now) - gate_started))" total
-    echo "| $(basename "$slot_name"): gave up waiting for a host scenario slot after $(spoken_wait "$slot_gave") (all $gate_slots taken, shared by every gate on this host)"
+    echo "| $(basename "$slot_name"): gave up waiting for a host scenario slot after $(spoken_wait "$slot_gave") ($slot_busy)"
     json="{\"no_room\":true,\"check\":\"host scenario slot\",\"waited_ms\":$slot_gave,\"budget\":$gate_slots"
     json="$json,\"scenario\":\"$(json_string "$(basename "$slot_name")")\""
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
@@ -1362,23 +1481,32 @@ slot_release() {
     slot_held=""
 }
 
-# job_run <job> <run> <tree> <scenario>: one run of the scenario in the
-# built tree, in the sandbox, holding one of the host's scenario slots;
-# returns its exit status.
-job_run() {
+# slot_claim <job>: slot_acquire, and what the run's block says of it;
+# fails when it gave up waiting, with the job done (abort, <job>/slot-waited:
+# the printed handler states it, exit 5, rather than judging into a starved
+# host).
+slot_claim() {
     slot_acquire "$1"
     if [ -n "$slot_gave_up" ]; then
-        # No room to judge now: the run is not started, and the printed
-        # handler states it (exit 5) rather than judging into a starved host.
-        job_say "| gave up waiting for a host scenario slot after $(spoken_wait "$slot_wait_ms") (all $gate_slots taken, shared by every gate on this host)"
+        job_say "| gave up waiting for a host scenario slot after $(spoken_wait "$slot_wait_ms") ($slot_busy)"
         printf 'waited %s for a host scenario slot (all %s taken, shared by every gate on this host)\n' \
             "$(spoken_wait "$slot_wait_ms")" "$gate_slots" >"$1/runs"
         printf '%s\n' "$slot_wait_ms" >"$1/slot-waited"
         job_done abort
-        return 125
+        return 1
     fi
     if [ "$slot_wait_ms" -ge 200 ]; then
         job_say "| waited $((slot_wait_ms / 1000)).$((slot_wait_ms % 1000 / 100)) s for host scenario slot $slot_n of $gate_slots (shared by every gate on this host)"
+    fi
+}
+
+# job_run <job> <run> <tree> <scenario>: one run of the scenario in the
+# built tree, in the sandbox, holding one of the host's scenario slots;
+# returns its exit status. With slot_kept set, the caller already holds
+# the slot (a low claimant's base job: below) and keeps it after the run.
+job_run() {
+    if [ -z "$slot_kept" ]; then
+        slot_claim "$1" || return 125
     fi
     {
         {
@@ -1391,7 +1519,7 @@ job_run() {
             echo "$run_status" >"$1/status.$2"
         } | tee "$1/out.$2"
     } >"$1/log.$2" 2>&1
-    slot_release
+    [ -n "$slot_kept" ] || slot_release
     return "$(cat "$1/status.$2" 2>/dev/null || echo 1)"
 }
 # The job's block, written by the job ($job, $job_part): text, and a stage
@@ -1512,7 +1640,7 @@ run_jobs() {
             if [ -e "$rj_job/waiting" ]; then
                 rj_wait_name=$(basename "$rj_job")
                 if [ ! -e "$rj_job/waiting.said" ]; then
-                    echo "| $rj_wait_name: waiting for a host scenario slot (all $gate_slots taken, shared by every gate on this host)"
+                    echo "| $rj_wait_name: waiting for a host scenario slot ($slot_busy)"
                     : >"$rj_job/waiting.said" 2>/dev/null || :
                     echo 0 >"$rj_job/waiting.said.n" 2>/dev/null || :
                 else
@@ -1520,7 +1648,7 @@ run_jobs() {
                     rj_wait_due=$((($(date +%s) - rj_wait_from) / 600))
                     rj_wait_said=$(cat "$rj_job/waiting.said.n" 2>/dev/null || echo 0)
                     if [ "$rj_wait_due" -gt "$rj_wait_said" ] && [ "$rj_wait_due" -gt 0 ]; then
-                        echo "| $rj_wait_name: still waiting for a host scenario slot ($((rj_wait_due * 10)) min; all $gate_slots taken)"
+                        echo "| $rj_wait_name: still waiting for a host scenario slot ($((rj_wait_due * 10)) min; $slot_busy)"
                         echo "$rj_wait_due" >"$rj_job/waiting.said.n" 2>/dev/null || :
                     fi
                 fi
@@ -2105,11 +2233,43 @@ base_job() {
     objective=$(cat "$job/scenario")
     entry=$(cat "$job/entry")
     name=$(basename "$objective")
+    slot_kept="" result=""
     if command -v flock >/dev/null 2>&1 &&
         { command exec 8>>"$entry.lock"; } 2>/dev/null; then
-        flock 8
-        result=$(entry_result "$entry")
+        if [ "$slot_priority" = low ] && [ "$gate_slots" -gt 0 ]; then
+            # A low claimant takes its slot before the key's lock, and the
+            # lock only without waiting, then keeps both for its runs: it
+            # never waits for a slot while holding a key a gate may be
+            # waiting on (that gate would wait out the warm's whole slot
+            # wait, silently). A gate holding the key while it waits for a
+            # slot is no inversion: no warm scans while a gate waits.
+            while :; do
+                slot_claim "$job" || return 0
+                if flock -n 8; then
+                    slot_kept=1
+                    break
+                fi
+                slot_release
+                if [ -n "$base_only" ]; then
+                    # Another gate judges this key and writes its entry: a
+                    # warm has nothing to add.
+                    job_say "| == base: $name: skipped (another gate is judging it; that gate writes the entry)"
+                    job_done skipped
+                    return 0
+                fi
+                # A whole gate needs the result: it waits for the key
+                # holding no slot, and reads the entry the other gate left.
+                flock 8
+                result=$(entry_result "$entry")
+                [ -z "$result" ] || break
+                flock -u 8
+            done
+        else
+            flock 8
+        fi
+        [ -n "$result" ] || result=$(entry_result "$entry")
         if [ -n "$result" ]; then
+            base_job_release
             touch -c -- "$entry" 2>/dev/null || :
             job_say "| == base: $name: $result (cached: another gate judged it meanwhile)"
             job_done cached "$result"
@@ -2162,6 +2322,7 @@ base_job() {
         fi
         job_stage "$(($(stage_now) - run_at))" aborted "$run_name"
         job_done abort
+        base_job_release
         return 0
     fi
     if [ -d "$entry" ] && [ ! -L "$entry" ]; then rm -rf -- "$entry"; fi
@@ -2172,6 +2333,13 @@ base_job() {
     job_say "| == base: $name: $result"
     job_stage "$(($(stage_now) - run_at))" "$result" "$run_name"
     job_done "$result"
+    base_job_release
+}
+# base_job_release: the slot a low claimant kept for its runs (above), let go
+# when the job is done. The job's subshell exiting would drop it too; this
+# says so where it happens.
+base_job_release() {
+    [ -z "$slot_kept" ] || { slot_kept=""; slot_release; }
 }
 # base_finished <job> <n>: an abort needs no run after it.
 base_finished() {
@@ -2192,6 +2360,12 @@ base_printed() {
     solved | unsolved | cannot_judge)
         run_on_base="$run_on_base $printed_name"
         result=$2
+        ;;
+    skipped)
+        # A warm's key another gate was judging (base_job): that gate
+        # writes the entry; this run has no result of it.
+        skipped_on_base="$skipped_on_base $printed_name"
+        return 0
         ;;
     abort)
         phase_time base
@@ -2218,6 +2392,7 @@ base_printed() {
 : >"$work/base-results"
 from_cache=""
 run_on_base=""
+skipped_on_base=""
 mkdir -p "$jobs_dir"
 base_count=0
 base_misses=0
@@ -2290,6 +2465,8 @@ base_result() {
 if [ -n "$base_only" ]; then
     echo "| base only: $(grep -c . "$work/base-results" || true) results for the base $base_commit" \
         "are in the base cache $base_cache"
+    [ -z "$skipped_on_base" ] ||
+        echo "| base only: skipped, another gate was judging them:$skipped_on_base"
     exit 0
 fi
 
@@ -2318,7 +2495,8 @@ runnable_tests() {
     for list_mode in all ignored; do
         set -- --list --format terse
         [ "$list_mode" = ignored ] && set -- "$@" --ignored
-        sandbox "$list_dir" env CARGO_TARGET_DIR="$list_target" cargo test --quiet --workspace \
+        sandbox "$list_dir" env CARGO_TARGET_DIR="$list_target" ${gate_build_jobs:+"CARGO_BUILD_JOBS=$gate_build_jobs"} \
+            cargo test --quiet --workspace \
             --manifest-path "$list_tree/Cargo.toml" -- "$@" \
             >"$work/tests.$list_mode" 2>>"$work/tests.log" || return 1
         sed -n 's/: test$//p' "$work/tests.$list_mode" | sed -E 's/ \(line [0-9]+\)$//' |

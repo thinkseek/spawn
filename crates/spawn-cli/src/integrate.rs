@@ -407,6 +407,7 @@ use crate::{main_merge, objectives, sources};
 
 mod host;
 pub(crate) mod owner;
+mod warm;
 
 /// Rejections, or aborts, in a row that halt a mission.
 const HALT_AFTER: u32 = 3;
@@ -1406,7 +1407,15 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let cpu = gate::Cpu::from_env(|name| std::env::var(name).ok(), cores)
         .map_err(|error| format!("{error}\n{USAGE}"))?;
-    let integrator = Integrator::new(root, gate, gate_env, host_room, gates).with_cpu(cpu);
+    let mut integrator = Integrator::new(root, gate, gate_env, host_room, gates).with_cpu(cpu);
+    // The base warm after each landing (warm.rs), unless the owner turned
+    // it off; its logs and pid file under the user's cache, beside the base
+    // cache it fills.
+    match warm_dir(crate::config::env_value(WARM_ENV).as_deref()) {
+        Ok(Some(dir)) => integrator = integrator.with_warm(dir),
+        Ok(None) => println!("integrate: {WARM_ENV}=0: no base warm after a landing"),
+        Err(error) => eprintln!("integrate: {error}; no base warm after a landing"),
+    }
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
@@ -1429,6 +1438,27 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     }
 }
 
+/// `SPAWN_INTEGRATE_WARM=0` turns the base warm after each landing off
+/// (warm.rs); unset or 1, it is on.
+const WARM_ENV: &str = "SPAWN_INTEGRATE_WARM";
+
+/// Where the warm's logs and pid file go, from `SPAWN_INTEGRATE_WARM`:
+/// `$XDG_CACHE_HOME/spawn/gate-warm`, else `$HOME/.cache/spawn/gate-warm`;
+/// None when it is off.
+fn warm_dir(setting: Option<&str>) -> Result<Option<PathBuf>, String> {
+    match setting.map(str::trim) {
+        None | Some("" | "1") => {}
+        Some("0") => return Ok(None),
+        Some(other) => return Err(format!("{WARM_ENV} is 0 or 1, not {other:?}")),
+    }
+    let cache = crate::config::env_value("XDG_CACHE_HOME")
+        .filter(|path| Path::new(path).is_absolute())
+        .map(PathBuf::from)
+        .or_else(|| crate::config::env_value("HOME").map(|home| Path::new(&home).join(".cache")))
+        .ok_or_else(|| "neither XDG_CACHE_HOME nor HOME is set".to_string())?;
+    Ok(Some(cache.join("spawn").join("gate-warm")))
+}
+
 struct Integrator {
     judge: Judge,
     /// Gates that may run at once ([`gate_slots`]).
@@ -1448,6 +1478,10 @@ struct Integrator {
     /// When each mission's last judging ended (this process's reading):
     /// its next task waits for a gate from then.
     last_judged: RefCell<std::collections::HashMap<i64, i64>>,
+    /// The base warm after each landing ([`warm`]); None leaves the base
+    /// cache to the gates and the deploy (tests, and a warm directory that
+    /// cannot be named).
+    warms: RefCell<Option<warm::Warms>>,
 }
 
 /// What a judging needs, owned, so it runs on a thread of its own.
@@ -1461,6 +1495,10 @@ struct Judge {
     host: HostSettings,
     /// The host's room, checked before each gate starts ([`gate::Room`]).
     room: gate::Room,
+    /// The landings the judging threads made, for the main thread's base
+    /// warm ([`Integrator::poll_warm`]): a thread cannot start the warm
+    /// itself (its parent-death signal follows the thread that spawned it).
+    landed: Arc<std::sync::Mutex<Vec<warm::Want>>>,
 }
 
 /// The settings of host faults: the test database's log
@@ -1650,6 +1688,7 @@ impl Integrator {
                 gate_env,
                 host: HostSettings::from_env(),
                 room: host_room,
+                landed: Arc::new(std::sync::Mutex::new(Vec::new())),
             },
             gates,
             cpu: None,
@@ -1657,6 +1696,7 @@ impl Integrator {
             held: RefCell::new(None),
             waiting: RefCell::new(std::collections::HashSet::new()),
             last_judged: RefCell::new(std::collections::HashMap::new()),
+            warms: RefCell::new(None),
         }
     }
 
@@ -1664,6 +1704,76 @@ impl Integrator {
     fn with_cpu(mut self, cpu: gate::Cpu) -> Self {
         self.cpu = Some(cpu);
         self
+    }
+
+    /// This integrator warming the base cache after each landing, its logs
+    /// and pid file in `dir`; a warm a predecessor left there is stopped
+    /// first ([`warm::Warms::take_over`]).
+    fn with_warm(self, dir: PathBuf) -> Self {
+        let warms = warm::Warms::new(self.judge.gate.clone(), self.judge.gate_env.clone(), dir);
+        warms.take_over();
+        *self.warms.borrow_mut() = Some(warms);
+        self
+    }
+
+    /// Main of `source` is `commit` now: warm it for the gates that judge
+    /// with `scenarios`, at the pass's end ([`Self::poll_warm`]).
+    fn want_warm(&self, source: &str, commit: &str, scenarios: &Path) {
+        if let Some(warms) = self.warms.borrow_mut().as_mut() {
+            warms.want(warm::Want {
+                source: source.to_string(),
+                commit: commit.to_string(),
+                scenarios: scenarios.to_path_buf(),
+            });
+        }
+    }
+
+    /// The pass's warm, after its gates were given out: started when the
+    /// source's mirror has the commit. The mirror is fetched only while no
+    /// gate of that source uses it; otherwise a later pass starts it.
+    fn poll_warm(&self) {
+        // The judgings' landings since the last pass, in order: the last
+        // one is the source's main now.
+        let landed: Vec<warm::Want> = self
+            .judge
+            .landed
+            .lock()
+            .map(|mut landed| landed.drain(..).collect())
+            .unwrap_or_default();
+        let mut warms = self.warms.borrow_mut();
+        let Some(warms) = warms.as_mut() else {
+            return;
+        };
+        for want in landed {
+            warms.want(want);
+        }
+        let root = self.judge.root.clone();
+        let busy = |source: &str| {
+            self.running
+                .borrow()
+                .iter()
+                .any(|gate| gate.source == source)
+        };
+        warms.poll(&|want: &warm::Want| {
+            let mirror = sources::ensure_mirror(&root, Some(&want.source)).ok()?;
+            let has = |mirror: &Path| {
+                git(&[
+                    "--git-dir",
+                    &mirror.to_string_lossy(),
+                    "cat-file",
+                    "-e",
+                    &format!("{}^{{commit}}", want.commit),
+                ])
+                .is_ok()
+            };
+            if has(&mirror) {
+                return Some(mirror);
+            }
+            if busy(&want.source) || sources::refresh(&mirror, &want.source).is_err() {
+                return None;
+            }
+            has(&mirror).then_some(mirror)
+        });
     }
 
     fn pass(&self) -> Result<(), String> {
@@ -1748,8 +1858,11 @@ impl Integrator {
         // reads its source's main, so no baseline check sees a main the
         // owner moved without its record. A source whose request is still
         // pending has its halts by baseline held this pass.
-        let pending = owner::apply_pending(store)?;
-        self.steps(store, &pending)
+        let mut owner_moved = Vec::new();
+        let pending = owner::apply_pending(store, &mut owner_moved)?;
+        let steps = self.steps(store, &pending, &owner_moved);
+        self.poll_warm();
+        steps
     }
 
     /// Every mission's step, after the holds past their bound and step 0:
@@ -1760,10 +1873,20 @@ impl Integrator {
         &self,
         store: &Arc<PostgresStore>,
         pending: &std::collections::HashMap<String, i64>,
+        owner_moved: &[(String, String)],
     ) -> Result<(), String> {
         let missions: Vec<Mission> =
             serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
                 .map_err(|error| format!("gated missions: {error}"))?;
+        // The owner's landings of step 0 are warmed for the scenarios of
+        // the first mission on their source that is not halted.
+        for (source, to) in owner_moved {
+            if let Some(mission) = missions.iter().find(|mission| {
+                mission.halted.is_none() && mission.source.as_deref() == Some(source.as_str())
+            }) {
+                self.want_warm(source, to, &pinned(Path::new(&mission.gate)));
+            }
+        }
         // Every mission gets its step in every pass: halts, budgets,
         // landings and objective assignments never wait for another
         // mission's gate. A landing moves its source's main and the
@@ -1845,7 +1968,15 @@ impl Integrator {
             if let Some(task) = mission.landing() {
                 match land(store, &mirror, source, task)? {
                     Landing::Held(_) => held = true,
-                    Landing::Landed | Landing::Stale | Landing::Gone => return Ok(true),
+                    Landing::Landed => {
+                        // The next gates on this source judge against the
+                        // new main: warm its base now, in the background.
+                        if let Some(candidate) = task.candidate.as_deref() {
+                            self.want_warm(source, candidate, &scenarios);
+                        }
+                        return Ok(true);
+                    }
+                    Landing::Stale | Landing::Gone => return Ok(true),
                 }
             }
             // Another mission's landing on this source may have moved main
@@ -2442,6 +2573,7 @@ impl Judge {
                     "accepted",
                     json!({"candidate": candidate, "log": verdict.output, "metric": verdict.metric}),
                 )?;
+                let landed_commit = candidate.clone();
                 let landing = Task {
                     state: TaskState::Landing,
                     base: Some(main.to_string()),
@@ -2449,7 +2581,18 @@ impl Judge {
                     ..task.clone()
                 };
                 // On a held source this records its `task.held`: it waits.
-                land(store, mirror, source, &landing).map(|_| ())
+                if let Landing::Landed = land(store, mirror, source, &landing)? {
+                    // The next gates on this source judge against the new
+                    // main: the main thread warms its base ([`warm`]).
+                    if let Ok(mut landed) = self.landed.lock() {
+                        landed.push(warm::Want {
+                            source: source.to_string(),
+                            commit: landed_commit,
+                            scenarios: pinned(scenarios),
+                        });
+                    }
+                }
+                Ok(())
             }
             // The objective's scenario passes on the base: a fact about the
             // objective, not about the task's work. The objective is
@@ -9166,6 +9309,61 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// The base warm after a landing (warm.rs): a task whose gate accepts
+    /// lands in its judging's thread, and the pass after it starts one
+    /// `gate.sh --base-only` of the new main, on the source's mirror, with
+    /// the mission's scenarios — in the background, the landing never
+    /// waiting for it.
+    #[test]
+    fn a_landing_starts_a_base_warm_of_the_new_main() {
+        let dir = std::env::temp_dir().join(format!("spawn-db-warm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let args = dir.join("warm-args");
+        let gate = format!(
+            "if [ \"$1\" = --base-only ]; then printf '%s\\n' \"$@\" >'{}'; exit 0; fi\n\
+             printf '{{\"verdict\":\"accepted\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+             echo '{{\"verdict\":\"accepted\"}}'\n",
+            args.display()
+        );
+        let (base, source, scenarios, integrator) = world("warm", &gate);
+        let integrator = integrator.with_warm(dir.join("gate-warm"));
+        let db = Db::new("landing_warm");
+        let mission = db.gated_mission(&source, &scenarios);
+        db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+
+        integrator.pass_on(&db.store).expect("the judging's pass");
+        integrator.settle();
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        let main = source_main(&source);
+        // The landing was made in the judging's thread, after that pass
+        // looked for warms: the next pass starts it.
+        integrator.pass_on(&db.store).expect("the next pass");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !args.exists() {
+            assert!(std::time::Instant::now() < deadline, "no warm started");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let said = std::fs::read_to_string(&args).expect("the warm's arguments");
+        let words: Vec<&str> = said.lines().collect();
+        assert_eq!(words.len(), 4, "{said}");
+        assert_eq!(words[0], "--base-only");
+        assert!(words[1].contains(".sources"), "the source's mirror: {said}");
+        assert_eq!(words[2], main, "the new main");
+        assert_eq!(
+            Path::new(words[3]),
+            super::pinned(&scenarios),
+            "the mission's scenarios, as its gates read them"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Audit #10: the integrator's verdict names the revision it judged. A
     /// task sent back once by the gate is reported again (revision 1); the
     /// stub gate accepts, and the verdict for revision 1 lands it.
@@ -10938,7 +11136,7 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         let held = super::owner::pending_by_source(&db.store).expect("pending");
         assert_eq!(held.get(&source_a), Some(&request));
         assert_eq!(held.len(), 1);
-        integrator.steps(&db.store, &held).expect("the steps");
+        integrator.steps(&db.store, &held, &[]).expect("the steps");
         assert!(halted(&db, a).is_null(), "held: {}", halted(&db, a));
         assert!(
             halted(&db, b)

@@ -2246,7 +2246,37 @@ are per-agent uids or a mount per engine.
   windows — `a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it`
   (a dead tmux pane's exit status unrecorded after 30 s) and
   `dispatch::resume_replay::a_resume_that_succeeded_and_died_young` — failed
-  under it and rejected tasks 183, 184 and others. Each judging records its own verdict and landing, which the next
+  under it and rejected tasks 183, 184 and others.
+  **The base warm after a landing.** A gate judges against main, so after
+  every landing the next gate on that source had no base results cached and
+  judged the base again (36% of 54 gates' time on 2026-11-08; 1158 s for
+  the first gate after one landing). So the integrator warms it: after a
+  `task.landed` (recorded in the judging's thread and handed to the main
+  thread) and after an owner's `source.moved`, it starts one
+  `gate.sh --base-only <mirror> <new main> <scenarios>` in the background,
+  never waited for, its exit decides nothing (its log is
+  `~/.cache/spawn/gate-warm/<commit>.log`, its line in the integrator's
+  output). One at a time: a warm main moved past is abandoned (TERM, then
+  KILL after 10 s), what it finished stays cached for its commit, and a
+  commit is warmed once. A `--base-only` run is the lowest claimant of the
+  host's slots: it takes one only when no gate is waiting for one (a demand
+  lock beside the slots), runs one job, and builds with
+  `CARGO_BUILD_JOBS=1`, so its whole footprint is at most one slot no gate
+  wanted and one compiler job; a gate that arrives while it holds a slot
+  waits out that one job, two runs at most (no preemption), and shares the base results
+  through the base cache's per-key locks. It cannot outlive the integrator
+  unaccounted for: it runs under `setpriv --pdeathsig TERM`, in the
+  integrator's process tree and cgroup, and a starting integrator stops a
+  predecessor's warm only when `gate-warm/warm.pid` still names it (this
+  user, the recorded start time, `gate.sh --base-only` of the recorded
+  commit). `SPAWN_INTEGRATE_WARM=0` turns it off. The deploy's own warm-up
+  is the same `--base-only` run and claims as low. A warm's build hook
+  and test listing build at `CARGO_BUILD_JOBS=1` inside the sandbox; any
+  other gate builds with cargo's own default unless the owner sets
+  `SPAWN_GATE_BUILD_JOBS`. A warm takes its slot before a base entry's
+  lock, and that lock only without waiting (busy: another gate judges the
+  key, and the warm skips it), so a gate never waits on a key a warm holds
+  while the warm waits for a slot. Each judging records its own verdict and landing, which the next
   pass reads; finished judgings are reaped before a pass reads the
   missions. A judging that panics before any record of its own is
   recorded `aborted` with the reason, so the three-aborts halt bounds a
