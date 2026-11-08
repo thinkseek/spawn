@@ -1543,45 +1543,6 @@ mod tests {
     /// supervisor once, as an item of `host` tagged
     /// `host gate-host-fault-<event id>`, naming the task, the mission, the
     /// count, the evidence and when the task is judged again.
-    /// The gate's own host faults (evidence `gate`) say what the gate
-    /// found: the scenario, where it failed and its runs, and point at the
-    /// host's load and the scenario's harness, not the test database.
-    #[test]
-    fn a_gates_own_host_fault_names_its_scenario_and_where() {
-        let records = [
-            serde_json::json!({"type": "task.gated", "verdict": "host_fault", "id": 9,
-                "event_id": 41, "mission": 6, "host_faults": 2, "escalate": true,
-                "evidence": "gate", "fact": {"scenario": "012.sh", "on": "base",
-                    "runs": "1, then 0", "reason": "012.sh exited 1, then 0 on the base"},
-                "backoff_ms": 600_000, "due_ms": 1_793_930_000_000_i64}),
-            serde_json::json!({"type": "task.gated", "verdict": "host_fault", "id": 10,
-                "event_id": 52, "mission": 4, "host_faults": 2, "escalate": true,
-                "evidence": "gate", "fact": {"scenario": "check-e2e.sh",
-                    "on": "candidate and base",
-                    "runs": "1, then 1 on the candidate; 1 on the base"},
-                "backoff_ms": 600_000, "due_ms": 1_793_930_000_500_i64}),
-        ];
-        let host = super::digest::host_fault_escalations(&records);
-        assert!(
-            host[0].line.contains(
-                "the gate found 012.sh exiting 1, then 0 on the base before any candidate \
-                 code ran"
-            ) && host[0].line.contains("that scenario's harness")
-                && !host[0].line.contains("test database's host"),
-            "{}",
-            host[0].line
-        );
-        assert!(
-            host[1].line.contains(
-                "the gate found check-e2e.sh failing on the candidate and on the base (1, then \
-                 1 on the candidate; 1 on the base)"
-            ),
-            "{}",
-            host[1].line
-        );
-        assert!(host.iter().all(|item| !item.line.contains('\n')));
-    }
-
     #[test]
     fn two_host_faults_in_a_row_reach_an_idle_supervisor_once() {
         let crash = "2026-11-06 01:46:58.017 UTC [1] LOG:  server process (PID 4242) was \

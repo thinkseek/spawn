@@ -642,22 +642,11 @@ dump_events() {
         on { rows++; split($0, f, "\t"); if (f[col] + 0 > max) max = f[col] + 0 }
         END { print rows + 0, max + 0 }'
 }
-# The run in a subshell whose environment holds the NAME=value settings it
-# is given: never on a command line (`env VAR=value`), which every local
-# user reads in /proc. The drill's database URL is one of them.
-backup_env() { # backup_env <verb> [NAME=value ...]
-    bv_verb=$1
-    shift
-    (
-        for bv_setting in "$@"; do export "$bv_setting"; done
-        exec "$SPAWN_BIN" backup "$bv_verb"
-    )
-}
-backup() { # backup <verb> [NAME=value ...]: run `spawn backup <verb>`, timed
+backup() { # backup <verb> [env...]: run `spawn backup <verb>`, timed
     verb=$1
     shift
     started=$(now_ms)
-    capture backup_env "$verb" "$@"
+    capture env "$@" "$SPAWN_BIN" backup "$verb"
     took=$(($(now_ms) - started))
     cat "$WORK/out.txt" "$WORK/err.txt" >>"$WORK/backup.log"
 }

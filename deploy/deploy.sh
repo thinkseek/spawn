@@ -318,14 +318,9 @@ say "restarted; live at $head"
 # against it (the integrator's, the owner's) take their base results from
 # the cache instead of 30-60 minutes of base runs. The same key those gates
 # compute: the controller's gate and scenarios, and the integrator's own
-# gate environment (the variables gate.rs passes the gate), from the file
-# the running integrator writes at its start ($SPAWN_GATE_ENV_FILE in its
-# unit, ~/.config/spawn/gate-env, 0600, /proc/<pid>/environ's format with
-# its pid first; the integrator is not dumpable, so its environ is not
-# readable), and never from a command line, as its database URL must not
-# be. A file whose pid is not the integrator's running MainPID (an older
-# integrator's, or one not written yet after the restart above) is waited
-# for up to 30 s, then the cache is not warmed. With a server of the gate's own
+# gate environment, read from the running integrator (/proc/<pid>/environ,
+# the variables gate.rs passes the gate) and never from a command line, as
+# its database URL must not be. With a server of the gate's own
 # (SPAWN_GATE_PG_IMAGE or SPAWN_GATE_PG_BIN) it does not get the shared
 # SPAWN_TEST_DATABASE_URL; without one it gets it only when its server is
 # not the owner's (by text; the integrator also asks the servers), and its
@@ -343,28 +338,26 @@ warm_base_cache() {
     return 0
   }
   pid=$(systemctl --user show -p MainPID --value spawn-integrate 2>/dev/null) || pid=""
-  if ! [[ $pid =~ ^[1-9][0-9]*$ ]]; then
-    say "base cache: spawn-integrate is not running; not warmed"
+  if ! [[ $pid =~ ^[1-9][0-9]*$ ]] || [ ! -r "/proc/$pid/environ" ]; then
+    say "base cache: the integrator's environment is not readable (spawn-integrate is not running); not warmed"
     return 0
   fi
-  local env_file=${SPAWN_GATE_ENV_FILE:-$HOME/.config/spawn/gate-env} first="" waited=0
-  while :; do
-    first=""
-    [ -r "$env_file" ] && IFS= read -r -d '' first <"$env_file" || true
-    [ "$first" != "SPAWN_INTEGRATE_PID=$pid" ] || break
-    if [ "$waited" -ge 30 ]; then
-      say "base cache: $env_file is not the running integrator's (pid $pid; is SPAWN_GATE_ENV_FILE in its unit?); not warmed"
-      return 0
-    fi
-    sleep 1
-    waited=$((waited + 1))
-  done
   # shellcheck source=scripts/pg-url.sh
   . "$controller/scripts/pg-url.sh"
   local own="" test_url="" home=$HOME
-  # shellcheck source=deploy/gate-env.sh
-  . "$repo/deploy/gate-env.sh"
-  gate_env_read "$env_file"
+  while IFS= read -r -d '' assignment; do
+    name=${assignment%%=*}
+    case $name in
+    PATH | HOME | LANG | TMPDIR | CARGO_HOME | RUSTUP_HOME | SPAWN_GATE_MIN_FREE_GB | SPAWN_GATE_JOBS)
+      keep+=("$assignment") ;;
+    SPAWN_GATE_PG_IMAGE | SPAWN_GATE_PG_BIN)
+      own=${own:-${assignment#*=}}
+      keep+=("$assignment")
+      ;;
+    SPAWN_TEST_DATABASE_URL) test_url=${assignment#*=} ;;
+    esac
+    [ "$name" != HOME ] || home=${assignment#*=}
+  done <"/proc/$pid/environ"
   if [ -z "$own" ] && [ -n "$test_url" ]; then
     local owner_server="" test_server=""
     pg_url_parse "${SPAWN_DATABASE_URL-}" && owner_server="$pg_url_host:$pg_url_port"

@@ -53,14 +53,9 @@ impl Database {
         if let Some((role, password)) = owner {
             client
                 .batch_execute(&format!(
-                    "create role {role} login createrole password '{password}';
-                     grant {role} to current_user"
+                    "create role {role} login createrole password '{password}'"
                 ))
                 .expect("a second owner");
-            // Granted to the test's login so it may make the database
-            // theirs and drop it, and their logins, afterwards: a login
-            // that is not a superuser needs the role's privileges for both
-            // (a superuser has them anyway).
         }
         let owner_clause = owner.map_or(String::new(), |(role, _)| format!(" owner {role}"));
         client
@@ -235,13 +230,6 @@ fn the_logins_of_earlier_installs_lose_everything_here() {
         .iter()
         .any(|warning| warning.contains("role spawn_supervisor from an earlier install"));
     assert_eq!(warned, can_login, "a login that can still log in is named");
-    let superuser: bool = client
-        .query_one(
-            "select rolsuper from pg_roles where rolname = current_user",
-            &[],
-        )
-        .expect("the test login")
-        .get(0);
 
     // And it acts as nobody: even let into the schema again, none of the
     // supervisor's grants reaches it.
@@ -249,13 +237,34 @@ fn the_logins_of_earlier_installs_lose_everything_here() {
         .batch_execute(&format!(
             "select spawn_submit('human', 'k', 'agent_worker_x', 'session_worker_x',
                                  '{{\"type\":\"stop\"}}');
-             grant usage on schema {schema} to spawn_supervisor"
+             grant usage on schema {schema} to spawn_supervisor;
+             set session authorization spawn_supervisor"
         ))
         .expect("a worker's command, and the earlier login in the schema");
-    check_earlier_login_acts_as_nobody(&schema, &mut client, superuser);
+    let principal: Option<String> = client
+        .query_one("select spawn_principal()", &[])
+        .expect("the principal")
+        .get(0);
+    assert_eq!(principal, None);
+    let tasks: i64 = client
+        .query_one("select count(*) from spawn_read_tasks()", &[])
+        .expect("the reader answers")
+        .get(0);
+    assert_eq!(tasks, 0, "the supervisor's read grant does not reach it");
+    let error = client
+        .execute(
+            "insert into agent_commands (agent_id, session_id, idempotency_key, action)
+             values ('agent_worker_x', 'session_worker_x', 'k2', '{\"type\":\"stop\"}')",
+            &[],
+        )
+        .expect_err("nor its command grant");
+    assert_eq!(
+        error.code(),
+        Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+    );
     client
         .batch_execute(&format!(
-            "revoke usage on schema {schema} from spawn_supervisor"
+            "reset session authorization; revoke usage on schema {schema} from spawn_supervisor"
         ))
         .expect("back to the owner");
 
@@ -282,76 +291,6 @@ fn the_logins_of_earlier_installs_lose_everything_here() {
         .expect("the database's grants")
         .get(0);
     assert_eq!(left, 0, "nothing on the database is left");
-}
-
-/// [`acts_as_nobody`] for whichever way this login may act as the earlier
-/// install's `spawn_supervisor`: logged in as it (when the test may give it
-/// a password: it made it), or with SET SESSION AUTHORIZATION (a
-/// superuser). A login that may neither skips that session check with its
-/// reason (its grants were checked either way).
-fn check_earlier_login_acts_as_nobody(schema: &str, client: &mut Client, superuser: bool) {
-    let alterable: bool = client
-        .query_one(
-            "select not r.rolcanlogin and pg_has_role(current_user, r.oid, 'member with admin option')
-               from pg_roles r where r.rolname = 'spawn_supervisor'",
-            &[],
-        )
-        .expect("whether the earlier login may be given a password")
-        .get(0);
-    if alterable {
-        let password = common::password();
-        client
-            .batch_execute(&format!(
-                "alter role spawn_supervisor login password '{password}'"
-            ))
-            .expect("a password for the while");
-        let mut login = common::connect_as(schema, "spawn_supervisor", &password);
-        acts_as_nobody(&mut login);
-        drop(login);
-        client
-            .batch_execute("alter role spawn_supervisor nologin password null")
-            .expect("no login again");
-    } else if superuser {
-        client
-            .batch_execute("set session authorization spawn_supervisor")
-            .expect("become the earlier login");
-        acts_as_nobody(client);
-        client
-            .batch_execute("reset session authorization")
-            .expect("back to the owner");
-    } else {
-        eprintln!(
-            "the_logins_of_earlier_installs_lose_everything_here: spawn_supervisor can log in \
-             with another install's password and this login may not become it; that session \
-             is not checked here (its grants are, above)"
-        );
-    }
-}
-
-/// The earlier install's login acts as nobody: no principal, no read, no
-/// write, even with its grants back.
-fn acts_as_nobody(login: &mut Client) {
-    let principal: Option<String> = login
-        .query_one("select spawn_principal()", &[])
-        .expect("the principal")
-        .get(0);
-    assert_eq!(principal, None);
-    let tasks: i64 = login
-        .query_one("select count(*) from spawn_read_tasks()", &[])
-        .expect("the reader answers")
-        .get(0);
-    assert_eq!(tasks, 0, "the supervisor's read grant does not reach it");
-    let error = login
-        .execute(
-            "insert into agent_commands (agent_id, session_id, idempotency_key, action)
-                 values ('agent_worker_x', 'session_worker_x', 'k2', '{\"type\":\"stop\"}')",
-            &[],
-        )
-        .expect_err("nor its command grant");
-    assert_eq!(
-        error.code(),
-        Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
-    );
 }
 
 #[test]

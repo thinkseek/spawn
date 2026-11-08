@@ -621,22 +621,7 @@ def refusal(settings):
     return None
 
 
-def not_dumpable():
-    """Makes this process not dumpable (prctl PR_SET_DUMPABLE=0): another
-    process of this user can no longer read its environment, where the
-    key lives. A child it execs is dumpable again (the kernel resets the
-    flag at execve), so nothing else changes. Best effort: a kernel without
-    prctl leaves the relay as it was."""
-    try:
-        import ctypes
-
-        ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE
-    except Exception:  # noqa: BLE001 - a relay must start whatever the kernel says
-        pass
-
-
 def main():
-    not_dumpable()  # its environment holds the key
     settings = config(os.environ)
     problem = refusal(settings)
     if problem:

@@ -182,14 +182,6 @@
 //!    other gate failure, the gate's own exit 3 included (a missing bind
 //!    directory, a bad SPAWN_GATE_MIN_FREE_GB), is an abort and counts;
 //!
-//!    **The gate's own host faults.** A gate that exits
-//!    [`gate::HOST_FAULT_EXIT`] with its fact ([`GateFailure::HostFault`]: a
-//!    scenario's harness error on the base, before any candidate code ran,
-//!    or a check that failed twice on the candidate and once on the base)
-//!    is gated `host_fault` with `evidence` `gate` and the gate's `fact`
-//!    ([`gate_host_fault_fields`]), under the backoff, escalation and counts
-//!    below: never an abort;
-//!
 //!    **A host fault is not a verdict.** When the gate rejects C with
 //!    [`host::CHECK_TESTS_REGRESSION`], the integrator reads the failures
 //!    check-tests.sh printed in the gate's recorded output
@@ -365,20 +357,7 @@
 //!   later pass (said once). A mission whose scenarios directory holds
 //!   [`NO_TEST_DATABASE`] gets no SPAWN_TEST_DATABASE_URL, so its judgings
 //!   cannot reach the shared server and do not count against the cap: they
-//!   run beside the others, still one per mission and per source;
-//! - every gate gets its SPAWN_GATE_JOBS from the integrator, and starts
-//!   only within the host's cores ([`gate::Cpu`]): the owner's
-//!   SPAWN_GATE_JOBS when set, 1 on the shared test server, else the cores
-//!   less SPAWN_GATE_WORKER_CORES (default a quarter, at least 1) divided
-//!   among the gates that can run at once ([`gates_at_once`]: one per
-//!   source, those on the shared server within `--gates`), at most 8. A
-//!   gate whose jobs, with the running gates' jobs and the cores kept for
-//!   the workers, would exceed the cores waits for a later pass (said
-//!   once), as over the cap: no record, no count, nothing against the
-//!   task. With no gate running, one always starts. (2026-11-08: each gate
-//!   took half the 9 cores by gate.sh's default, two or three gates and
-//!   the workers made a load of 18-20, and task 172's gate failed on its
-//!   base.)
+//!   run beside the others, still one per mission and per source.
 //!
 //! Every judging records its own outcome (`task.gated`, `task.landed`), as
 //! before; the pass reads those records, never the thread's result. An
@@ -1004,47 +983,6 @@ pub(crate) fn base_disagrees_fields(
 /// code ran): objective 020's verdict with this objective's evidence.
 pub(crate) const BASE_DISAGREES: &str = "base_disagrees";
 
-/// The record of a host fault the gate reported itself
-/// ([`GateFailure::HostFault`], exit [`gate::HOST_FAULT_EXIT`] with its
-/// fact), the `faults`-th host fault in a row on the mission, with its
-/// `backoff`: `evidence` `gate` and the gate's `fact` (`scenario`, `on`:
-/// `base` or `candidate and base`, `runs`), and the rest as
-/// [`host_fault_fields`] writes it. Neither `gate_aborts` nor
-/// `gate_rejections` moves.
-pub(crate) fn gate_host_fault_fields(
-    failure: &GateFailure,
-    faults: u32,
-    backoff: Duration,
-) -> Value {
-    let GateFailure::HostFault {
-        scenario,
-        on,
-        runs,
-        reason,
-        log,
-    } = failure
-    else {
-        return aborted(failure);
-    };
-    let place = if on == "base" {
-        format!("{scenario} exited {runs} on the base, before any candidate code ran")
-    } else {
-        format!("{scenario} failed on the candidate and on the base ({runs})")
-    };
-    json!({
-        "reason": format!(
-            "host fault: {place}; not a verdict on the work, judged again in {}",
-            spoken(backoff)
-        ),
-        "log": log,
-        "evidence": "gate",
-        "fact": {"scenario": scenario, "on": on, "runs": runs, "reason": reason},
-        "host_faults": faults,
-        "backoff_ms": u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
-        "escalate": faults == HOST_FAULT_ESCALATE_AT,
-    })
-}
-
 /// The record of a gate that had no room to judge `task`, at `now_ms`: the
 /// reason with the free space and TMPDIR, the facts themselves, and
 /// `escalate` when the run of them on this task began more than
@@ -1315,14 +1253,6 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
              the gate does not get it"
         );
     }
-    if let Some(path) = crate::config::env_value(gate::GATE_ENV_FILE)
-        && let Err(error) = gate::write_gate_env(Path::new(&path), std::process::id(), &gate_env)
-    {
-        eprintln!(
-            "integrate: {}: {error}; a deploy does not warm the gate's base cache",
-            gate::GATE_ENV_FILE
-        );
-    }
     let gates = gate_slots(
         flags.get("gates"),
         crate::config::env_value("SPAWN_INTEGRATE_GATES"),
@@ -1332,13 +1262,6 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     // What the host must have before a gate starts, read once like the
     // gate's environment (gate::Room).
     let host_room = gate::Room::from_env(|name| std::env::var(name).ok());
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-    // The host's cores, shared among the gates (gate::Cpu), read once.
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let cpu = gate::Cpu::from_env(|name| std::env::var(name).ok(), cores)
-        .map_err(|error| format!("{error}\n{USAGE}"))?;
-    let integrator = Integrator::new(root, gate, gate_env, host_room, gates).with_cpu(cpu);
-=======
     // The gates' resource envelope (objective 029): a setting that does not
     // parse, or an envelope that does not fit under the slice, refuses the
     // start; the slice is given its limits before any gate starts in it.
@@ -1354,7 +1277,6 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         gates,
         envelopes.envelope().cloned(),
     );
->>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
@@ -1381,10 +1303,6 @@ struct Integrator {
     judge: Judge,
     /// Gates that may run at once ([`gate_slots`]).
     gates: usize,
-    /// How the host's cores are shared among the gates ([`gate::Cpu`]):
-    /// each gate's SPAWN_GATE_JOBS and whether it has room to start. None
-    /// (tests) leaves the gate its own default and never waits for CPU.
-    cpu: Option<gate::Cpu>,
     /// The judgings in flight, one per mission at most.
     running: RefCell<Vec<Running>>,
     /// The store whose connection holds the integrator's lock, kept while
@@ -1415,15 +1333,12 @@ struct Judge {
 }
 
 /// The settings of host faults: the test database's log
-/// ([`TEST_DATABASE_LOG`], none when unset), the first backoff
-/// (`SPAWN_GATE_HOST_FAULT_BACKOFF_SECS`, [`host_fault_base`]) and how many
-/// host faults one report revision of a task may have before the next counts
-/// as an abort (`SPAWN_GATE_HOST_FAULT_CAP`, [`host_fault_cap`]).
+/// ([`TEST_DATABASE_LOG`], none when unset) and the first backoff
+/// (`SPAWN_GATE_HOST_FAULT_BACKOFF_SECS`, [`host_fault_base`]).
 #[derive(Clone, Debug)]
 struct HostSettings {
     server_log: Option<PathBuf>,
     backoff: Duration,
-    cap: u32,
 }
 
 impl HostSettings {
@@ -1433,68 +1348,8 @@ impl HostSettings {
             backoff: host_fault_base(
                 crate::config::env_value("SPAWN_GATE_HOST_FAULT_BACKOFF_SECS").as_deref(),
             ),
-            cap: host_fault_cap(crate::config::env_value("SPAWN_GATE_HOST_FAULT_CAP").as_deref()),
         }
     }
-}
-
-/// How many `host_fault` verdicts one report revision of a task may have; the
-/// next one is recorded as `aborted` instead, so it counts toward the abort
-/// halt. A host fault is never a verdict on the work, but one that recurs on
-/// the same work may be the work's own doing (a candidate that leaves the
-/// shared test server broken for the base run after it), and an uncounted
-/// fault would hold that task for ever. 3 by default, like the halts.
-const HOST_FAULT_CAP: u32 = 3;
-
-/// [`HOST_FAULT_CAP`] from `SPAWN_GATE_HOST_FAULT_CAP`'s text: a whole number
-/// from 1 up; anything else is the default.
-pub(crate) fn host_fault_cap(text: Option<&str>) -> u32 {
-    text.and_then(|text| text.trim().parse::<u32>().ok())
-        .filter(|cap| *cap > 0)
-        .unwrap_or(HOST_FAULT_CAP)
-}
-
-/// Whether a gate `host_fault` record's fields say the fault is the base's
-/// alone (the gate's fact with `on` `base`: a scenario's harness error
-/// before any candidate code ran). Those never count toward a halt, so the
-/// cap neither counts nor caps them ([`HOST_FAULT_CAP`]).
-fn base_only_fault(fields: &Value) -> bool {
-    // Objective 033's evidence is a base that disagreed with itself, before
-    // any candidate code; the gate's own fact names `on` `base`. Either is a
-    // base-only fault: neither counts toward the cap nor is ever capped.
-    fields.get("evidence").and_then(Value::as_str) == Some(BASE_DISAGREES)
-        || fields
-            .get("fact")
-            .and_then(|fact| fact.get("on"))
-            .and_then(Value::as_str)
-            == Some("base")
-}
-
-/// The `aborted` record of a host fault past the cap: `faults` host faults
-/// already at this revision, `cap` allowed; the fault's own record kept under
-/// `host_fault` (its log at the top, as an abort's).
-fn capped_host_fault(task: &Task, faults: i64, cap: u32, mut fault: Value) -> Value {
-    let log = fault
-        .as_object_mut()
-        .and_then(|fields| fields.remove("log"))
-        .unwrap_or(Value::Null);
-    // The fault as it was said, without its promise to judge again.
-    let said = fault["reason"]
-        .as_str()
-        .unwrap_or_default()
-        .split("; not a verdict on the work")
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    json!({
-        "reason": format!(
-            "a host fault again: task {} has had {faults} at report revision {}, the most \
-             SPAWN_GATE_HOST_FAULT_CAP allows is {cap}, so this one counts as an abort ({said})",
-            task.id, task.revisions
-        ),
-        "log": log,
-        "host_fault": fault,
-    })
 }
 
 /// Whether the integrator said it has no log evidence: said once.
@@ -1533,9 +1388,6 @@ struct Running {
     /// Whether this judging's gate gets the shared test server
     /// ([`needs_test_database`]): only those count against `--gates`.
     shares_server: bool,
-    /// The scenarios its gate runs at once (SPAWN_GATE_JOBS as given), 0
-    /// when the integrator does not share the cores ([`gate::Cpu`]).
-    jobs: usize,
     handle: std::thread::JoinHandle<()>,
 }
 
@@ -1560,20 +1412,6 @@ fn withheld_without_test_database(name: &str) -> bool {
         name,
         "SPAWN_TEST_DATABASE_URL" | "SPAWN_GATE_PG_IMAGE" | "SPAWN_GATE_PG_BIN"
     )
-}
-
-/// How many gates can run at once: one per source (`sources`: each gated
-/// mission's source and whether its gate gets the test server), those
-/// whose gate gets the shared test server at most `gates` (`--gates`); at
-/// least 1. A source with both kinds counts as one that gets the server.
-pub(crate) fn gates_at_once(sources: impl Iterator<Item = (String, bool)>, gates: usize) -> usize {
-    let mut kinds: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-    for (source, shares) in sources {
-        *kinds.entry(source).or_default() |= shares;
-    }
-    let shared = kinds.values().filter(|shares| **shares).count();
-    let alone = kinds.len() - shared;
-    (shared.min(gates) + alone).max(1)
 }
 
 /// Whether a judging must wait for a gate: only one that shares the test
@@ -1601,18 +1439,11 @@ impl Integrator {
                 envelope,
             },
             gates,
-            cpu: None,
             running: RefCell::new(Vec::new()),
             held: RefCell::new(None),
             waiting: RefCell::new(std::collections::HashSet::new()),
             last_judged: RefCell::new(std::collections::HashMap::new()),
         }
-    }
-
-    /// This integrator with the host's cores shared among its gates.
-    fn with_cpu(mut self, cpu: gate::Cpu) -> Self {
-        self.cpu = Some(cpu);
-        self
     }
 
     fn pass(&self) -> Result<(), String> {
@@ -1737,17 +1568,7 @@ impl Integrator {
             }
         }
         ready.retain(|candidate: &Ready| !moved.contains(&candidate.source));
-        let at_once = gates_at_once(
-            missions.iter().filter_map(|mission| {
-                let source = mission.source.clone()?;
-                Some((
-                    source,
-                    needs_test_database(&pinned(Path::new(&mission.gate))),
-                ))
-            }),
-            self.gates,
-        );
-        self.start_ready(store, ready, at_once);
+        self.start_ready(store, ready);
         Ok(())
     }
 
@@ -1861,11 +1682,7 @@ impl Integrator {
     /// runs). Two missions that are always ready thus take turns, and the
     /// mission id decides nothing. At most one judging per mission and per
     /// source.
-    /// Start the gates of `ready` that may run now: one per mission and per
-    /// source, those on the shared test server within `--gates`, and each
-    /// within the host's cores ([`gate::Cpu::fits`]), `at_once` being how
-    /// many gates can run at once ([`gates_at_once`]) for the default jobs.
-    fn start_ready(&self, store: &Arc<PostgresStore>, mut ready: Vec<Ready>, at_once: usize) {
+    fn start_ready(&self, store: &Arc<PostgresStore>, mut ready: Vec<Ready>) {
         let since = |candidate: &Ready| {
             let ended = self
                 .last_judged
@@ -1901,27 +1718,9 @@ impl Integrator {
                 }
                 continue;
             }
-            let jobs = self.cpu.as_ref().map(|cpu| {
-                let shared = shares_server && gate::on_shared_server(&self.judge.gate_env);
-                cpu.jobs_for(shared, at_once)
-            });
-            if let (Some(cpu), Some(jobs)) = (&self.cpu, jobs) {
-                let busy: usize = self.running.borrow().iter().map(|gate| gate.jobs).sum();
-                if !cpu.fits(busy, jobs) {
-                    if self.waiting.borrow_mut().insert(candidate.task.id) {
-                        println!(
-                            "integrate: mission {}: task {} waits for CPU room: its gate's {jobs} \
-                             jobs, the running gates' {busy} and the {} cores kept for the \
-                             workers (SPAWN_GATE_WORKER_CORES) exceed the {} cores",
-                            candidate.mission, candidate.task.id, cpu.reserved, cpu.cores
-                        );
-                    }
-                    continue;
-                }
-            }
             self.waiting.borrow_mut().remove(&candidate.task.id);
             let mission = candidate.mission;
-            if let Err(error) = self.start_judging(store, candidate, running, shares_server, jobs) {
+            if let Err(error) = self.start_judging(store, candidate, running, shares_server) {
                 eprintln!("integrate: mission {mission}: {error}");
             }
         }
@@ -1934,7 +1733,6 @@ impl Integrator {
         candidate: Ready,
         running: usize,
         shares_server: bool,
-        jobs: Option<usize>,
     ) -> Result<(), String> {
         let Ready {
             mission: mission_id,
@@ -1952,16 +1750,7 @@ impl Integrator {
             .name(format!("gate-{task_id}"))
             .spawn(move || {
                 judged_or_aborted(&store, &task, &main, mission_id, || {
-                    judge.judge(
-                        &store,
-                        &mirror,
-                        &source_owned,
-                        &main,
-                        &gated,
-                        count,
-                        &task,
-                        jobs,
-                    )
+                    judge.judge(&store, &mirror, &source_owned, &main, &gated, count, &task)
                 });
             })
             .map_err(|error| format!("start the judging of task {task_id}: {error}"))?;
@@ -1983,7 +1772,6 @@ impl Integrator {
             source,
             task: task_id,
             shares_server,
-            jobs: jobs.unwrap_or(0),
             handle,
         });
         Ok(())
@@ -2039,16 +1827,9 @@ impl Integrator {
                 } => (branch, Some(commit), diff),
                 Kept::Lost { branch } => (branch, None, String::new()),
             };
-            // `measure` says the active-time budget made this overrun, with
-            // what it measured. `Outcome::failure` (objectives.rs) does not
-            // count it as a failed attempt: attempts are per objective since
-            // its last yield, so a counted overrun would yield the
-            // continuation task on assignment. The measure stays on the
-            // record for a later rule.
             let mut overrun = json!({"type": "task.over_budget", "id": task.id,
                                      "reason": reason, "tool_calls": calls,
                                      "elapsed_ms": active, "budget": budget.clone(),
-                                     "measure": objectives::ACTIVE_MEASURE,
                                      "branch": branch});
             if let Some(commit) = &commit {
                 overrun["commit"] = json!(commit);
@@ -2167,7 +1948,6 @@ impl Judge {
         mission: &Mission,
         count: u32,
         task: &Task,
-        jobs: Option<usize>,
     ) -> Result<bool, String> {
         let branch = match Self::pushed_candidate(store, mirror, source, task)? {
             Freshness::Fresh(branch) => Some(branch),
@@ -2192,7 +1972,6 @@ impl Judge {
             count,
             task,
             branch.as_deref(),
-            jobs,
         )
         .map(|()| true)
     }
@@ -2210,44 +1989,16 @@ impl Judge {
         count: u32,
         task: &Task,
         branch: Option<&str>,
-        jobs: Option<usize>,
     ) -> Result<(), String> {
         let scenarios = Path::new(&mission.gate);
         // Read only: the integrator never commits a workspace.
         let repo = GitWorkspace::new(mirror, &self.root);
-        // The checks the candidate's gate run saw fail once and pass again
-        // (its verdict's `flakes`), carried on whichever record this judging
-        // writes: set once the run has a verdict.
-        let flakes: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
         let gated = |verdict: &str, extra: Value| -> Result<(), String> {
-            // A host fault past the cap for this revision counts as an abort
-            // ([`HOST_FAULT_CAP`]). Only a fault judged after the candidate
-            // ran does: a base-only one (the gate's fact `on` `base`) comes
-            // before any candidate code and counts toward no halt, so it
-            // never reaches the cap and is never capped.
-            let (verdict, extra) = if verdict == "host_fault" && !base_only_fault(&extra) {
-                let faults = store
-                    .task_host_faults(task.id, i64::from(task.revisions))
-                    .map_err(|error| error.to_string())?;
-                if faults >= i64::from(self.host.cap) {
-                    (
-                        "aborted",
-                        capped_host_fault(task, faults, self.host.cap, extra),
-                    )
-                } else {
-                    (verdict, extra)
-                }
-            } else {
-                (verdict, extra)
-            };
             let mut record_value = json!({"type": "task.gated", "id": task.id, "verdict": verdict,
                                           "revision": task.revisions, "base": main,
                                           "scenarios": count});
             if let (Some(target), Some(extra)) = (record_value.as_object_mut(), extra.as_object()) {
                 target.extend(extra.clone());
-            }
-            if !flakes.borrow().is_empty() {
-                record_value["flakes"] = json!(*flakes.borrow());
             }
             record(store, &record_value)?;
             println!("integrate: task {} gated: {verdict}", task.id);
@@ -2293,14 +2044,7 @@ impl Judge {
                 &format!("{commit}^{{tree}}"),
             ])
         };
-        // A candidate equal to main in an objective mission is not judged
-        // here: the gate's base check answers what it means before it builds
-        // anything (a scenario that passes on the base is the objective
-        // solved there, not a failed task; a scenario that fails there is a
-        // rejection like any other). Mission 4's task 182 was rejected three
-        // times for "the work changes nothing on main" when the owner batch
-        // had already landed the behaviour, and the third halted the mission.
-        if tree_of(&candidate)? == tree_of(main)? && task.objective.is_none() {
+        if tree_of(&candidate)? == tree_of(main)? {
             return rejected("the work changes nothing on main", "");
         }
         let patch = repo
@@ -2364,11 +2108,6 @@ impl Judge {
         if !needs_test_database(scenarios) {
             gate_env.retain(|(name, _)| !withheld_without_test_database(name));
         }
-        // The jobs this gate was given room for, never its own default.
-        if let Some(jobs) = jobs {
-            gate_env.retain(|(name, _)| name != "SPAWN_GATE_JOBS");
-            gate_env.push(("SPAWN_GATE_JOBS".to_string(), jobs.to_string()));
-        }
         if let Some(warning) = warning {
             eprintln!("integrate: {warning}");
         }
@@ -2395,9 +2134,6 @@ impl Judge {
         let started = now_ms();
         let judged = run_gate(main, &candidate);
         let ended = now_ms();
-        if let Ok(verdict) = &judged {
-            flakes.replace(verdict.flakes.clone());
-        }
         match judged {
             Ok(verdict) if verdict.accepted => {
                 // The verdict is stored before git moves, so a crash lands
@@ -2414,24 +2150,6 @@ impl Judge {
                 };
                 // On a held source this records its `task.held`: it waits.
                 land(store, mirror, source, &landing).map(|_| ())
-            }
-            // The objective's scenario passes on the base: a fact about the
-            // objective, not about the task's work. The objective is
-            // recorded solved there and the task ends without a rejection.
-            Ok(verdict)
-                if verdict.reason.trim() == SOLVED_ON_BASE
-                    && task.objective.is_some_and(|objective| {
-                        crate::objectives::one_shot(mission, objective)
-                    }) =>
-            {
-                solved_on_base(
-                    store,
-                    mission,
-                    task,
-                    scenario.as_deref(),
-                    main,
-                    &verdict.output,
-                )
             }
             // A rejection whose every failure is the host's (the test
             // database failed) is no verdict on the work: `host_fault`, not
@@ -2501,15 +2219,6 @@ impl Judge {
                         }
                         gated("host_fault", extra)
                     }
-                    Rejection::HeadHostFault { failure, head } => {
-                        let mut extra = self.gate_host_fault(mission, task.id, &failure);
-                        if let (Some(target), Some(head)) =
-                            (extra.as_object_mut(), head.as_object())
-                        {
-                            target.extend(head.clone());
-                        }
-                        gated("host_fault", extra)
-                    }
                 }
             }
             // No room in TMPDIR: a fact about the host, never a count.
@@ -2551,15 +2260,6 @@ impl Judge {
                 );
                 gated("host_fault", extra)
             }
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-            // The gate found a host or harness fault, not a verdict: a
-            // scenario's harness error on the base, or a check failing on
-            // the candidate and the base. `host_fault`: retried after a
-            // backoff, never counted toward a halt.
-            Err(failure @ GateFailure::HostFault { .. }) => {
-                let mut extra = self.gate_host_fault(mission, task.id, &failure);
-                extra["candidate"] = json!(candidate);
-=======
             // A gate its own envelope killed is the host's fault: not a
             // verdict, judged again after objective 020's backoff, never an
             // abort and never toward a halt (the owner's ruling). The task
@@ -2601,7 +2301,6 @@ impl Judge {
                     task.id,
                     extra["reason"].as_str().unwrap_or_default()
                 );
->>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
                 gated("host_fault", extra)
             }
             Err(failure) => gated("aborted", aborted(&failure)),
@@ -2678,20 +2377,6 @@ impl Judge {
 }
 
 impl Judge {
-    /// The record of a host fault the gate itself reported
-    /// ([`GateFailure::HostFault`]) for `task`: the mission's next in a row,
-    /// with its backoff, said on stdout as the other host faults are.
-    fn gate_host_fault(&self, mission: &Mission, task: i64, failure: &GateFailure) -> Value {
-        let faults = mission.gate_host_faults.saturating_add(1);
-        let backoff = host_fault_backoff(self.host.backoff, faults);
-        let extra = gate_host_fault_fields(failure, faults, backoff);
-        println!(
-            "integrate: task {task}: {}",
-            extra["reason"].as_str().unwrap_or_default()
-        );
-        extra
-    }
-
     /// The test database's log lines that show a crash stamped inside the
     /// gate's window [`started`, `ended`] (with [`host::WINDOW_SLACK_MS`]
     /// around it). None to read (unset, unreadable): no evidence, said once.
@@ -3044,10 +2729,6 @@ enum Rejection {
         log: String,
         head: Value,
     },
-    /// The head's own run found a host fault (a scenario's harness error on
-    /// the base, a check failing on both trees): `host_fault`, as any, with
-    /// `head` added.
-    HeadHostFault { failure: GateFailure, head: Value },
 }
 
 /// The record of a gate rejection: the reason, the gate's output and the
@@ -3283,10 +2964,6 @@ fn rejection(
             log,
             head: named,
         },
-        Err(failure @ GateFailure::HostFault { .. }) => Rejection::HeadHostFault {
-            failure,
-            head: named,
-        },
         Err(failure) => {
             let mut record = aborted(&failure);
             if let Some(reason) = record["reason"].as_str() {
@@ -3327,14 +3004,6 @@ fn aborted(failure: &GateFailure) -> Value {
             "scenario": scenario,
             "log": log,
         }),
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-        // Recorded as `host_fault` by the caller, likewise.
-        GateFailure::HostFault {
-            scenario, on, log, ..
-        } => {
-            json!({"reason": format!("the gate found {scenario} failing on the {on}"), "log": log})
-        }
-=======
         // Recorded `host_fault` by the caller; counted here only if a caller
         // forgets that.
         GateFailure::MemoryLimit { memory_max, log, .. } => json!({
@@ -3362,7 +3031,6 @@ fn size_text(bytes: u64) -> String {
         format!("{} MiB", bytes / MIB)
     } else {
         format!("{bytes} bytes")
->>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
     }
 }
 
@@ -3676,91 +3344,12 @@ fn read_main(
         );
         return Ok(Reading::Nothing);
     }
-    // The owner holds the source: the hold says the owner is moving its
-    // main, so a main away from the baseline is what the hold is for, not
-    // something no record explains. Nothing is judged against it until the
-    // hold ends (and `spawn mission moved` takes the new main as the
-    // baseline).
-    if let Some(hold) = mission.hold {
-        println!(
-            "integrate: mission {}: the source's main is {main}, its baseline {baseline}; no \
-             halt while the owner holds the source (hold {hold})",
-            mission.id
-        );
-        return Ok(Reading::Nothing);
-    }
-    halt_moved(store, mission, source, baseline, &main)?;
-    Ok(Reading::Halted)
-}
-
-/// Halt `mission` because its source's main moved with no record that
-/// explains it: the record names the source and both commits, so `spawn
-/// mission moved` can tell this halt from any other and clear it when the
-/// owner records the move (`spawn_source_moved`).
-fn halt_moved(
-    store: &PostgresStore,
-    mission: &Mission,
-    source: &str,
-    from: &str,
-    to: &str,
-) -> Result<(), String> {
-    let reason = format!("the source's main is {to}, but the last landing left {from}");
-    record(
+    halt(
         store,
-        &json!({"type": "mission.halted", "id": mission.id, "reason": reason,
-                "cause": "main_moved", "source": source, "from": from, "to": to}),
+        mission,
+        &format!("the source's main is {main}, but the last landing left {baseline}"),
     )?;
-    println!("integrate: mission {} HALTED: {reason}", mission.id);
-    Ok(())
-}
-
-/// The gate's verdict when the objective's scenario passes at the base
-/// commit (`scripts/rsi/gate.sh`'s base check, before any candidate build).
-pub(crate) const SOLVED_ON_BASE: &str = "scenario already passes on the base";
-
-/// Record that `mission`'s objective is solved on the base and end `task`
-/// with it: the gate found its scenario passing at `base`, so no work of
-/// the task could change anything (mission 4's task 182, objective 34, whose
-/// owner batch had landed the behaviour first). The objective is a landing
-/// for the assignment rule (`OBJECTIVE_LANDINGS` reads the record), and the
-/// task is cancelled on that record — no rejection, no failed attempt, no
-/// halt (`spawn_integrator_record` accepts this cancel and no other without
-/// a yield).
-fn solved_on_base(
-    store: &PostgresStore,
-    mission: &Mission,
-    task: &Task,
-    scenario: Option<&Path>,
-    base: &str,
-    log: &str,
-) -> Result<(), String> {
-    let objective = task
-        .objective
-        .ok_or("an objective task without its objective")?;
-    let scenario = scenario
-        .map(|path| path.display().to_string())
-        .unwrap_or_default();
-    let solved = store
-        .integrator_record(&json!({"type": "objective.solved", "id": mission.id,
-                                   "objective": objective, "task": task.id,
-                                   "scenario": scenario, "base": base, "log": log}))
-        .map_err(|error| error.to_string())?;
-    // The Stop first, as for a yield: if the cancel then fails, the next
-    // pass finds the task again and records both again.
-    stop_worker(store, task, "integrate-solved")?;
-    let reason = format!(
-        "objective {objective} is solved on the base: {scenario} passes at {base}, so task \
-         #{} ends without a rejection",
-        task.id
-    );
-    store
-        .integrator_record(
-            &json!({"type": "task.cancelled", "id": task.id, "solved": solved,
-                                   "reason": reason}),
-        )
-        .map_err(|error| error.to_string())?;
-    println!("integrate: mission {}: {reason}", mission.id);
-    Ok(())
+    Ok(Reading::Halted)
 }
 
 /// Why a mission on `source` can never land, if it cannot: agents' branches
@@ -3941,8 +3530,8 @@ fn task_scenario(scenarios: &Path, recorded: Option<&str>) -> Option<PathBuf> {
 mod tests {
     use super::{
         BUDGET_GAP, Freshness, Mission, NO_TEST_DATABASE, aborted, active_ms, budget_gap,
-        freshness, gates_at_once, halt_reason, markers_note, merged_tree, needs_test_database,
-        no_room, over_budget, pinned, report_freshness, room_backoff, room_wait, short_of_room,
+        freshness, halt_reason, markers_note, merged_tree, needs_test_database, no_room,
+        over_budget, pinned, report_freshness, room_backoff, room_wait, short_of_room,
         task_scenario, waits_for_gate, wall_clock_minutes, withheld_without_test_database,
     };
     use crate::gate::{GateFailure, Shortfall};
@@ -5284,34 +4873,6 @@ mod tests {
         assert!(!waits_for_gate(false, 1, 1));
         assert!(!waits_for_gate(false, 8, 1));
         assert!(!waits_for_gate(true, 2, 3));
-    }
-
-    /// The gates that can run at once, which the default jobs divide the
-    /// cores among: one per source, those on the shared test server within
-    /// `--gates`.
-    #[test]
-    fn gates_at_once_are_one_per_source_within_the_shared_cap() {
-        let of = |pairs: &[(&str, bool)], gates| {
-            gates_at_once(
-                pairs
-                    .iter()
-                    .map(|(source, shares)| ((*source).to_string(), *shares)),
-                gates,
-            )
-        };
-        // Spawn (shared server) and Supply PA (no test database, two missions).
-        assert_eq!(
-            of(&[("spawn", true), ("supply", false), ("supply", false)], 1),
-            2
-        );
-        assert_eq!(of(&[("a", true), ("b", true)], 1), 1);
-        assert_eq!(of(&[("a", true), ("b", true)], 2), 2);
-        assert_eq!(
-            of(&[("a", true), ("a", false)], 1),
-            1,
-            "one gate per source"
-        );
-        assert_eq!(of(&[], 1), 1);
     }
 
     #[test]
@@ -7758,26 +7319,21 @@ mod database_tests {
             .expect("the objective's task")
     }
 
-    /// `task` delivered, reported, and sent back by `count` gate verdicts
-    /// `verdict`, from revision `from` on: a rejection, or a conflict of a
-    /// merge that left markers (main moved: not a failed attempt).
-    fn sent_back(db: &Db, task: i64, verdict: &str, from: i32, count: i32) {
-        for revision in from..from + count {
+    /// `task` delivered, reported, and sent back by `conflicts` gate
+    /// verdicts of a merge that left markers.
+    fn conflicts(db: &Db, task: i64, conflicts: i32) {
+        for revision in 0..conflicts {
             db.store.task_delivered(task, 1).expect("delivered");
             assert!(
                 db.store
                     .task_reported(task, "## Outcome\nhalf of it")
                     .expect("reported")
             );
-            let record = if verdict == "conflict" {
-                json!({"type": "task.gated", "id": task, "revision": revision,
-                       "verdict": "conflict", "merge": "marked", "base": "b",
-                       "reason": "main conflicts with your branch"})
-            } else {
-                json!({"type": "task.gated", "id": task, "revision": revision,
-                       "verdict": verdict, "base": "b", "note": "a check failed"})
-            };
-            db.record(&record);
+            db.record(
+                &json!({"type": "task.gated", "id": task, "revision": revision,
+                              "verdict": "conflict", "merge": "marked", "base": "b",
+                              "reason": "main conflicts with your branch"}),
+            );
         }
     }
 
@@ -7897,12 +7453,9 @@ mod database_tests {
         );
         let task_19 = objective_task(&db, mission, 19);
         let (t19, t21, t23) = (first[0].0, first[1].0, first[2].0);
-        sent_back(&db, t19, "rejected", 0, 3);
-        sent_back(&db, t21, "rejected", 0, 3);
-        // 023: two rejections, then three conflicts (main moving), which do
-        // not count: it stays under the limit.
-        sent_back(&db, t23, "rejected", 0, 2);
-        sent_back(&db, t23, "conflict", 2, 3);
+        conflicts(&db, t19, 3);
+        conflicts(&db, t21, 3);
+        conflicts(&db, t23, 2);
         let assigned_at: i64 = db
             .admin()
             .query_one(
@@ -7963,18 +7516,18 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// On the store: objective 023 has two failed attempts when its task
-    /// goes over budget. An overrun is its own record, no abort and no
-    /// yield: nothing is told to the supervisor as a yield, and the
-    /// objective's next task continues the work instead (task 174, "A task
-    /// over its budget keeps its work"). The record names the measure that
-    /// made it, `active`.
+    /// rev-b on 226fa4a, on the store: objective 023 has two failed
+    /// attempts when its task is aborted over budget, its third. The abort
+    /// is recorded as the yield (`yielded`, its count and reason), told to
+    /// the supervisor once, and the objective goes behind the untried 025;
+    /// when 023 is assigned again its new task does not yield at once. An
+    /// abort under the limit stays a plain abort.
     #[test]
-    fn an_overrun_at_the_limit_is_no_yield() {
+    fn an_abort_at_the_limit_is_recorded_as_the_yield() {
         let base =
-            std::env::temp_dir().join(format!("spawn-db-overrun-yield-{}", std::process::id()));
+            std::env::temp_dir().join(format!("spawn-db-abort-yield-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let db = Db::new("overrun_yield");
+        let db = Db::new("abort_yield");
         let mission = backlog_mission(
             &db,
             &base,
@@ -7991,7 +7544,7 @@ mod database_tests {
         pass();
         let first = objective_task(&db, mission, 23);
         let other = objective_task(&db, mission, 25);
-        sent_back(&db, first.id, "rejected", 0, 2);
+        conflicts(&db, first.id, 2);
         let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
         let overrun = |task: &super::Task| {
             db.store.task_delivered(task.id, 1).expect("delivered");
@@ -8043,10 +7596,9 @@ mod database_tests {
             .expect("the aborts")
             .get(0);
         assert_eq!(aborts, 0, "an overrun is no abort");
-        // The two rejections stand; the overrun adds no gate verdict.
         assert_eq!(
             gate_counters(&db, mission),
-            (0, 2),
+            (0, 0),
             "an overrun is no gate abort"
         );
         let told = db.store.objective_yields().expect("the yields to tell");
@@ -8108,11 +7660,6 @@ mod database_tests {
         let pass = snapshot(&db, mission);
         let over = Integrator::enforce_budget(&db.store, &pass).expect("the budget");
         assert_eq!(over, vec![task.id]);
-        // The overrun names the active-time measure, so it is the
-        // objective's failed attempt (an abort without one, the old
-        // budget's, is not).
-        let raw = db.store.objective_outcomes(mission).expect("outcomes");
-        assert_eq!(raw[0]["measure"], "active", "{raw}");
         let settled = over.into_iter().collect();
         assert!(
             crate::objectives::assign_next(&db.store, &pass, &settled)
@@ -9381,7 +8928,6 @@ mod database_tests {
         integrator.judge.host = super::HostSettings {
             server_log: Some(server_log.clone()),
             backoff: std::time::Duration::from_secs(2),
-            cap: super::HOST_FAULT_CAP,
         };
         let db = Db::new("host_fault_pass");
         let mission = db.gated_mission(&source, &scenarios);
@@ -9509,363 +9055,6 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The gate's own host faults (exit 6 with its fact, gate.rs
-    /// `HOST_FAULT_EXIT`): a scenario's harness error on the base (012.sh
-    /// exited 1, then 0: Supply PA's gate aborted twice on that, 2026-11-08)
-    /// and a check failing on the candidate and on the base (task 127's
-    /// e2e) are each `host_fault` by the gate's fact: `gate_aborts` does not
-    /// move, the task stays reported and is held until its due time, the
-    /// second in a row escalates with its backoff doubled, and the next run
-    /// that accepts lands it.
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn the_gates_own_host_faults_are_held_and_never_counted() {
-        let dir = std::env::temp_dir().join(format!("spawn-db-gate-fault-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
-        let runs = dir.join("runs");
-        let runs_path = runs.display();
-        let gate = format!(
-            "n=$(cat '{runs_path}' 2>/dev/null || echo 0); n=$((n + 1)); echo \"$n\" >'{runs_path}'\n\
-             if [ \"$n\" -eq 1 ]; then\n\
-               echo '| == base: 012.sh'\n\
-               echo '| 012.sh exited 1, then 0 on the base: a harness error, not a verdict on the candidate'\n\
-               printf '{{\"host_fault\":true,\"scenario\":\"012.sh\",\"on\":\"base\",\"runs\":\"1, then 0\",\"reason\":\"012.sh exited 1, then 0 on the base\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
-               exit 6\n\
-             elif [ \"$n\" -eq 2 ]; then\n\
-               echo '| == regression: check-e2e.sh must still pass'\n\
-               printf '{{\"host_fault\":true,\"scenario\":\"check-e2e.sh\",\"on\":\"candidate and base\",\"runs\":\"1, then 1 on the candidate; 1 on the base\",\"reason\":\"check-e2e.sh failed twice on the candidate and on the base\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
-               exit 6\n\
-             fi\n\
-             printf '{{\"verdict\":\"accepted\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n"
-        );
-        let (base, source, scenarios, mut integrator) = world("gate-fault", &gate);
-        integrator.judge.host = super::HostSettings {
-            server_log: None,
-            backoff: std::time::Duration::from_secs(2),
-            cap: super::HOST_FAULT_CAP,
-        };
-        let db = Db::new("gate_host_fault");
-        let mission = db.gated_mission(&source, &scenarios);
-        let task = db.reported_task(mission, "w");
-        let agent = db.mission(mission)["tasks"][0]["agent_id"]
-            .as_str()
-            .expect("the task's agent")
-            .to_string();
-        push_work(&base, &source, &agent, "work.txt");
-        let count = || {
-            std::fs::read_to_string(&runs).map_or(0, |text| text.trim().parse::<u32>().unwrap_or(0))
-        };
-        let pass = || {
-            integrator.pass_on(&db.store).expect("a pass");
-            integrator.settle();
-        };
-        let wait_until = |due: i64| {
-            let left = due - super::now_ms();
-            if left > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(
-                    u64::try_from(left).unwrap_or(0) + 50,
-                ));
-            }
-        };
-
-        // A scenario's harness error on the base.
-        pass();
-        assert_eq!(count(), 1);
-        let (record, event, at) = last_verdict(&db);
-        assert_eq!(record["verdict"], "host_fault", "{record}");
-        assert_eq!(record["evidence"], "gate");
-        assert_eq!(
-            record["fact"],
-            json!({"scenario": "012.sh", "on": "base", "runs": "1, then 0",
-                   "reason": "012.sh exited 1, then 0 on the base"})
-        );
-        assert!(
-            record["reason"].as_str().is_some_and(
-                |reason| reason.starts_with("host fault: 012.sh exited 1, then 0 on the base")
-            ),
-            "{record}"
-        );
-        assert!(
-            record["log"]
-                .as_str()
-                .is_some_and(|log| log.contains("| == base: 012.sh"))
-        );
-        assert_eq!(
-            (
-                &record["host_faults"],
-                &record["escalate"],
-                &record["backoff_ms"]
-            ),
-            (&json!(1), &json!(false), &json!(2000))
-        );
-        assert_eq!(record["due_ms"], at + 2000);
-        assert!(record["candidate"].is_string());
-        let after = gated(&db, mission);
-        assert_eq!(
-            (
-                after.gate_host_faults,
-                after.gate_host_task,
-                after.gate_aborts,
-                after.gate_rejections
-            ),
-            (1, Some(task), 0, 0),
-            "a host fault, not an abort"
-        );
-        assert_eq!(
-            (after.tasks[0].state, after.tasks[0].revisions),
-            (spawn_core::mission::TaskState::Reported, 0)
-        );
-        pass();
-        assert_eq!(count(), 1, "not judged again before due_ms");
-        assert_eq!(last_verdict(&db).1, event);
-        wait_until(at + 2000);
-
-        // A check failing on the candidate and on the base.
-        pass();
-        assert_eq!(count(), 2);
-        let (record, event, at) = last_verdict(&db);
-        assert_eq!(record["verdict"], "host_fault", "{record}");
-        assert_eq!(record["fact"]["scenario"], "check-e2e.sh");
-        assert_eq!(record["fact"]["on"], "candidate and base");
-        assert_eq!(
-            (
-                &record["host_faults"],
-                &record["escalate"],
-                &record["backoff_ms"]
-            ),
-            (&json!(2), &json!(true), &json!(4000))
-        );
-        let escalations = db.store.gate_host_fault_escalations().expect("escalations");
-        assert_eq!(escalations[0]["event_id"], event, "{escalations}");
-        let after = gated(&db, mission);
-        assert_eq!((after.gate_host_faults, after.gate_aborts), (2, 0));
-        assert_eq!(super::halt_reason(&after, 0), None);
-
-        pass();
-        assert_eq!(count(), 2, "held again, for the doubled backoff");
-        wait_until(at + 4000);
-        pass();
-        assert_eq!(count(), 3);
-        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
-        assert_eq!(gated(&db, mission).gate_aborts, 0);
-        let _ = std::fs::remove_dir_all(&base);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The host-fault cap (rev-e on gate-check-flakes): one report revision
-    /// of a task has at most `SPAWN_GATE_HOST_FAULT_CAP` uncounted host
-    /// faults. With the cap at 2, a gate that reports the same host fault on
-    /// every run is `host_fault` twice (no count), and the third run is
-    /// recorded `aborted` with a reason that says why, the fault kept under
-    /// `host_fault`: it counts toward the abort halt, as the next one does.
-    #[test]
-    fn host_faults_past_the_cap_on_one_revision_count_as_aborts() {
-        let gate = "echo '| == regression: check-e2e.sh must still pass'\n\
-                    printf '{\"host_fault\":true,\"scenario\":\"check-e2e.sh\",\"on\":\"candidate and base\",\"runs\":\"1, then 1 on the candidate; 1 on the base\",\"reason\":\"check-e2e.sh failed twice on the candidate and on the base\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
-                    exit 6\n";
-        let (base, source, scenarios, mut integrator) = world("gate-fault-cap", gate);
-        integrator.judge.host = super::HostSettings {
-            server_log: None,
-            backoff: std::time::Duration::from_secs(1),
-            cap: 2,
-        };
-        let db = Db::new("gate_host_fault_cap");
-        let mission = db.gated_mission(&source, &scenarios);
-        let task = db.reported_task(mission, "w");
-        let agent = db.mission(mission)["tasks"][0]["agent_id"]
-            .as_str()
-            .expect("the task's agent")
-            .to_string();
-        push_work(&base, &source, &agent, "work.txt");
-        // One judging: a pass, its gate settled, after the last record's
-        // due time (a host fault's backoff) has come.
-        let judge_once = |due: Option<i64>| {
-            if let Some(due) = due {
-                let left = due - super::now_ms();
-                if left > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        u64::try_from(left).unwrap_or(0) + 50,
-                    ));
-                }
-            }
-            integrator.pass_on(&db.store).expect("a pass");
-            integrator.settle();
-            last_verdict(&db).0
-        };
-
-        let first = judge_once(None);
-        assert_eq!(first["verdict"], "host_fault", "{first}");
-        let second = judge_once(first["due_ms"].as_i64());
-        assert_eq!(second["verdict"], "host_fault", "the cap is 2: {second}");
-        assert_eq!(gated(&db, mission).gate_aborts, 0, "no count yet");
-
-        let third = judge_once(second["due_ms"].as_i64());
-        assert_eq!(third["verdict"], "aborted", "past the cap: {third}");
-        let reason = third["reason"].as_str().unwrap_or_default();
-        assert!(
-            reason.contains(&format!("task {task} has had 2 at report revision 0"))
-                && reason.contains("SPAWN_GATE_HOST_FAULT_CAP allows is 2")
-                && reason.contains("counts as an abort")
-                && reason.contains("check-e2e.sh failed on the candidate and on the base")
-                && !reason.contains("judged again"),
-            "{reason}"
-        );
-        assert_eq!(third["host_fault"]["evidence"], "gate", "{third}");
-        assert_eq!(third["host_fault"]["fact"]["scenario"], "check-e2e.sh");
-        assert!(third["log"].is_string(), "{third}");
-        let after = gated(&db, mission);
-        assert_eq!(
-            (after.gate_aborts, after.gate_host_faults),
-            (1, 0),
-            "an abort, which ends the run of host faults"
-        );
-        assert_eq!(
-            after.tasks[0].state,
-            spawn_core::mission::TaskState::Reported
-        );
-
-        // The same revision's next host fault counts too.
-        let fourth = judge_once(None);
-        assert_eq!(fourth["verdict"], "aborted", "{fourth}");
-        assert_eq!(gated(&db, mission).gate_aborts, 2);
-        assert_eq!(db.store.task_host_faults(task, 0).expect("count"), 2);
-
-        assert_eq!(super::host_fault_cap(None), 3);
-        assert_eq!(super::host_fault_cap(Some(" 5 ")), 5);
-        assert_eq!(super::host_fault_cap(Some("0")), 3);
-        assert_eq!(super::host_fault_cap(Some("x")), 3);
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// A gate verdict's `flakes` (checks that failed once and passed again)
-    /// are on the task's `task.gated` record; a verdict without them leaves
-    /// the record without the key, as every record before it.
-    #[test]
-    fn a_verdicts_flakes_are_on_its_record() {
-        let gate = "printf '{\"verdict\":\"rejected\",\"reason\":\"regression: check-tests.sh fails on the candidate\",\"flakes\":[\"check-e2e.sh\"]}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
-        let (base, source, scenarios, integrator) = world("gate-flakes", gate);
-        let db = Db::new("gate_flakes");
-        let mission = db.gated_mission(&source, &scenarios);
-        let _task = db.reported_task(mission, "w");
-        let agent = db.mission(mission)["tasks"][0]["agent_id"]
-            .as_str()
-            .expect("the task's agent")
-            .to_string();
-        push_work(&base, &source, &agent, "work.txt");
-        integrator.pass_on(&db.store).expect("a pass");
-        integrator.settle();
-        let (record, _, _) = last_verdict(&db);
-        assert_eq!(record["flakes"], json!(["check-e2e.sh"]), "{record}");
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// A base-only host fault (the gate's fact `on` `base`, before any
-    /// candidate code ran) counts toward no halt, so it never counts toward
-    /// the cap and is never capped: with the cap at 2, a gate that keeps
-    /// reporting a base harness error is `host_fault` every time, and the
-    /// task never aborts.
-    #[test]
-    fn base_only_host_faults_never_reach_the_cap() {
-        let gate = "echo '| == base: 012.sh'\n\
-                    printf '{\"host_fault\":true,\"scenario\":\"012.sh\",\"on\":\"base\",\"runs\":\"1, then 0\",\"reason\":\"012.sh exited 1, then 0 on the base\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
-                    exit 6\n";
-        let (base, source, scenarios, mut integrator) = world("gate-fault-base-cap", gate);
-        integrator.judge.host = super::HostSettings {
-            server_log: None,
-            backoff: std::time::Duration::from_secs(1),
-            cap: 2,
-        };
-        let db = Db::new("gate_host_fault_base_cap");
-        let mission = db.gated_mission(&source, &scenarios);
-        let task = db.reported_task(mission, "w");
-        let agent = db.mission(mission)["tasks"][0]["agent_id"]
-            .as_str()
-            .expect("the task's agent")
-            .to_string();
-        push_work(&base, &source, &agent, "work.txt");
-        let mut due = None;
-        for round in 0..4 {
-            if let Some(due) = due {
-                let left = due - super::now_ms();
-                if left > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        u64::try_from(left).unwrap_or(0) + 50,
-                    ));
-                }
-            }
-            integrator.pass_on(&db.store).expect("a pass");
-            integrator.settle();
-            let record = last_verdict(&db).0;
-            assert_eq!(record["verdict"], "host_fault", "round {round}: {record}");
-            assert_eq!(record["fact"]["on"], "base", "{record}");
-            due = record["due_ms"].as_i64();
-        }
-        assert_eq!(
-            db.store.task_host_faults(task, 0).expect("count"),
-            0,
-            "base-only faults are not counted"
-        );
-        assert_eq!(gated(&db, mission).gate_aborts, 0);
-        assert_eq!(gated(&db, mission).gate_host_faults, 4, "each one a run");
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// Objective 033's evidence beside the cap (this objective's): a base
-    /// that disagreed with itself is a base-only fault, before any candidate
-    /// code, so it counts toward no halt and never reaches
-    /// `SPAWN_GATE_HOST_FAULT_CAP`: with the cap at 2, four disagreements in
-    /// a row are `host_fault` every time, `base_disagrees` every time, and
-    /// the task never aborts (the store's count leaves them out too).
-    #[test]
-    fn base_disagreements_never_reach_the_cap() {
-        let gate = "echo '| == base: 011.sh'\n\
-                    echo '| 011.sh exited 1, then 0 on the base: a harness error, not a verdict; the gate aborts'\n\
-                    echo '| stage gate aborted 12003ms base: 011.sh again (unsolved needs two runs that agree)'\n\
-                    exit 4\n";
-        let (base, source, scenarios, mut integrator) = world("base-disagrees-cap", gate);
-        integrator.judge.host = super::HostSettings {
-            server_log: None,
-            backoff: std::time::Duration::from_secs(1),
-            cap: 2,
-        };
-        let db = Db::new("base_disagrees_cap");
-        let mission = db.gated_mission(&source, &scenarios);
-        let task = db.reported_task(mission, "w");
-        let agent = db.mission(mission)["tasks"][0]["agent_id"]
-            .as_str()
-            .expect("the task's agent")
-            .to_string();
-        push_work(&base, &source, &agent, "work.txt");
-        let mut due = None;
-        for round in 0..4 {
-            if let Some(due) = due {
-                let left = due - super::now_ms();
-                if left > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        u64::try_from(left).unwrap_or(0) + 50,
-                    ));
-                }
-            }
-            integrator.pass_on(&db.store).expect("a pass");
-            integrator.settle();
-            let record = last_verdict(&db).0;
-            assert_eq!(record["verdict"], "host_fault", "round {round}: {record}");
-            assert_eq!(record["evidence"], "base_disagrees", "{record}");
-            due = record["due_ms"].as_i64();
-        }
-        assert_eq!(
-            db.store.task_host_faults(task, 0).expect("count"),
-            0,
-            "a base's disagreement is not counted"
-        );
-        let after = gated(&db, mission);
-        assert_eq!(after.gate_aborts, 0);
-        assert_eq!(after.gate_host_faults, 4, "each one a run");
-        assert_eq!(after.gate_base_disagrees, 4, "each one a disagreement");
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
     /// Objective 20 beside main's `no-test-database`: a mission whose gate
     /// needs no test database has no host faults. Its check-tests.sh
     /// failures, connection errors though they are, stay a rejection.
@@ -9952,7 +9141,6 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         integrator.judge.host = super::HostSettings {
             server_log: None,
             backoff: std::time::Duration::from_secs(2),
-            cap: super::HOST_FAULT_CAP,
         };
         let db = Db::new("base_disagrees_pass");
         let mission = db.gated_mission(&source, &scenarios);
@@ -10778,224 +9966,6 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         for base in [base_a, base_b] {
             let _ = std::fs::remove_dir_all(&base);
         }
-    }
-
-    /// Mission 4, 2026-11-08 09:23: task 182 (objective 34) was rejected
-    /// three times — "the work changes nothing on main" twice, then "scenario
-    /// already passes on the base" — because the owner batch had landed the
-    /// behaviour already, and the third halted the mission. A gate that says
-    /// the objective's scenario passes on the base is a fact about the
-    /// objective: it is recorded solved there, the task ends as a cancel,
-    /// no rejection is counted, and no task for it is assigned again.
-    #[test]
-    fn an_objective_solved_on_the_base_ends_its_task_without_a_rejection() {
-        let gate = "echo '| == base: 023.sh'\n\
-                    echo '| verdict rejected scenario already passes on the base'\n\
-                    printf '{\"verdict\":\"rejected\",\"reason\":\"scenario already passes on the base\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
-        let (base, source, scenarios, integrator) = world("solved-base", gate);
-        let db = Db::new("solved_base");
-        let mission = backlog_mission(&db, &base, "solved", &[23], 1, None);
-        std::fs::write(scenarios.join("023.sh"), "exit 0\n").expect("the scenario");
-        let none = std::collections::BTreeSet::new();
-        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none).expect("assign");
-        let task = objective_task(&db, mission, 23);
-        db.store.task_delivered(task.id, 1).expect("delivered");
-        assert!(db.store.task_reported(task.id, "done").expect("reported"));
-        let agent = db.mission(mission)["tasks"][0]["agent_id"]
-            .as_str()
-            .expect("the task's agent")
-            .to_string();
-        let base_commit = source_main(&source);
-        push_work(&base, &source, &agent, "work.txt");
-
-        integrator.pass_on(&db.store).expect("a pass");
-        integrator.settle();
-        let solved = control_records(&db, "objective.solved");
-        assert_eq!(solved.len(), 1, "{solved:?}");
-        assert_eq!(solved[0]["objective"], json!(23));
-        assert_eq!(solved[0]["task"], json!(task.id));
-        assert_eq!(solved[0]["base"], json!(base_commit));
-        assert!(
-            solved[0]["scenario"]
-                .as_str()
-                .is_some_and(|scenario| scenario.ends_with("023.sh")),
-            "{}",
-            solved[0]
-        );
-        let cancelled = control_records(&db, "task.cancelled");
-        assert_eq!(cancelled.len(), 1, "{cancelled:?}");
-        assert_eq!(cancelled[0]["id"], json!(task.id));
-        assert!(cancelled[0]["solved"].is_number(), "{}", cancelled[0]);
-        assert!(
-            control_records(&db, "task.gated").is_empty(),
-            "no rejection is recorded"
-        );
-        let after = gated(&db, mission);
-        assert_eq!((after.gate_rejections, after.gate_aborts), (0, 0));
-        assert!(db.mission(mission)["halted"].is_null());
-        assert_eq!(db.mission(mission)["tasks"][0]["state"], "cancelled");
-        // No task for it again: the objective is a landing.
-        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
-            .expect("the next pass");
-        assert!(
-            flying(&db, mission).is_empty(),
-            "no task for a solved objective"
-        );
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// The same for the other wording mission 4's task 182 hit: a candidate
-    /// whose tree is main's is not rejected at once in an objective mission,
-    /// but judged — the gate's base check answers "solved on the base"
-    /// before any candidate build, so the objective is recorded solved
-    /// instead of the task rejected ("the work changes nothing on main").
-    #[test]
-    fn an_objective_task_whose_work_changes_nothing_is_judged_not_rejected() {
-        let gate = "echo '| verdict rejected scenario already passes on the base'\n\
-                    printf '{\"verdict\":\"rejected\",\"reason\":\"scenario already passes on the base\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
-        let (base, source, scenarios, integrator) = world("solved-base-empty", gate);
-        let db = Db::new("solved_base_empty");
-        let mission = backlog_mission(&db, &base, "solved", &[23], 1, None);
-        std::fs::write(scenarios.join("023.sh"), "exit 0\n").expect("the scenario");
-        let none = std::collections::BTreeSet::new();
-        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none).expect("assign");
-        let task = objective_task(&db, mission, 23);
-        db.store.task_delivered(task.id, 1).expect("delivered");
-        assert!(db.store.task_reported(task.id, "done").expect("reported"));
-        let agent = db.mission(mission)["tasks"][0]["agent_id"]
-            .as_str()
-            .expect("the task's agent")
-            .to_string();
-        // A branch with a commit that changes no file: main's tree.
-        let clone = base.join("empty-work");
-        let clone_path = clone.to_string_lossy().to_string();
-        git(&["clone", "-q", &source, &clone_path]).expect("clone");
-        git(&[
-            "-C",
-            &clone_path,
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "nothing",
-        ])
-        .expect("empty");
-        git(&[
-            "-C",
-            &clone_path,
-            "push",
-            "-q",
-            "origin",
-            &format!("HEAD:refs/heads/spawn/{agent}"),
-        ])
-        .expect("push the agent's branch");
-
-        integrator.pass_on(&db.store).expect("a pass");
-        integrator.settle();
-        assert!(
-            control_records(&db, "task.gated").is_empty(),
-            "not rejected at once: {:?}",
-            control_records(&db, "task.gated")
-        );
-        assert_eq!(control_records(&db, "objective.solved").len(), 1);
-        assert_eq!(db.mission(mission)["tasks"][0]["state"], "cancelled");
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// The owner's hold says the owner is moving main. Mission 6, 2026-11-08
-    /// 06:36: the owner held the source, pushed main behind Spawn's back and
-    /// recorded the move after; a pass between the push and the record
-    /// halted the mission, and `spawn mission moved` then matched no mission
-    /// (it skipped the halted ones), so the halt stood until a human resumed
-    /// it. The real order: hold, push, a pass, then moved and release.
-    #[test]
-    fn the_owners_hold_keeps_a_moved_main_from_halting() {
-        let (base, source, scenarios, integrator) = world("owner-hold-move", "exit 1\n");
-        let db = Db::new("owner_hold_move");
-        let b0 = source_main(&source);
-        let mission = mission_at_baseline(&db, &source, &scenarios, &b0);
-        let lock = db
-            .store
-            .source_hold_lock(&source)
-            .expect("the landing lock");
-        db.store
-            .source_hold(&source, &b0, 3600, Some("the owner's deploy"))
-            .expect("held");
-        drop(lock);
-        let moved = main_moves(&base, &source, "owner-push.txt");
-
-        integrator.pass_on(&db.store).expect("a pass");
-        assert!(
-            halted(&db, mission).is_null(),
-            "no halt while held: {}",
-            halted(&db, mission)
-        );
-        let after = db.mission(mission);
-        assert_eq!(
-            after["baseline"],
-            b0.as_str(),
-            "nothing is judged against it"
-        );
-
-        // Then the move is recorded, as `spawn mission moved` does, and the
-        // hold released: the mission takes the owner's main.
-        assert_eq!(
-            db.store
-                .source_moved(&source, &b0, &moved)
-                .expect("the owner's move"),
-            1
-        );
-        db.store.source_release(&source).expect("released");
-        let after = db.mission(mission);
-        assert_eq!(after["baseline"], moved.as_str());
-        assert!(after["halted"].is_null(), "halted: {}", after["halted"]);
-        integrator.pass_on(&db.store).expect("another pass");
-        assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// A mission the integrator halted on a moved main is moved and cleared
-    /// by the owner's record of that very move: same source, from and to.
-    /// A halt for another reason at the same baseline keeps it.
-    #[test]
-    fn a_main_move_is_recorded_over_a_halt_that_says_so() {
-        let (base, source, scenarios, integrator) = world("owner-move-halted", "exit 1\n");
-        let db = Db::new("owner_move_halted");
-        let b0 = source_main(&source);
-        let mission = mission_at_baseline(&db, &source, &scenarios, &b0);
-        let other = mission_at_baseline(&db, &source, &scenarios, &b0);
-        db.record(&json!({"type": "mission.halted", "id": other,
-                          "reason": "three gate rejections in a row"}));
-        let moved = main_moves(&base, &source, "owner-push.txt");
-
-        integrator.pass_on(&db.store).expect("a pass");
-        assert!(
-            halted(&db, mission)
-                .as_str()
-                .is_some_and(|reason| reason.contains("but the last landing left")),
-            "{}",
-            halted(&db, mission)
-        );
-        // The move the halt names: applied.
-        assert_eq!(
-            db.store
-                .source_moved(&source, &b0, &moved)
-                .expect("the owner's move"),
-            1
-        );
-        let after = db.mission(mission);
-        assert!(after["halted"].is_null(), "halted: {}", after["halted"]);
-        assert_eq!(after["baseline"], moved.as_str());
-        let kept = db.mission(other);
-        assert_eq!(
-            kept["halted"],
-            json!("three gate rejections in a row"),
-            "another halt keeps its baseline"
-        );
-        assert_eq!(kept["baseline"], b0.as_str());
-        integrator.pass_on(&db.store).expect("another pass");
-        assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The integrator stopped between an owner landing's move of main and
