@@ -727,19 +727,6 @@ fn delivery_attempts<'a>(task: &TaskRow, facts: &'a Facts) -> Vec<&'a crate::dis
         .filter(|sent| {
             sent.key == key || sent.key.starts_with(&retry) || sent.key.starts_with(&moved)
         })
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
-}
-
-/// Every attempt at `task`'s current delivery, as a re-issue's
-/// cancellation names them.
-fn attempt_records(task: &TaskRow, facts: &Facts) -> Vec<Attempt> {
-    delivery_attempts(task, facts)
-        .into_iter()
-        .map(|sent| Attempt {
-            command: sent.id,
-            key: sent.key.clone(),
-            error: sent.error.clone(),
-        })
         .collect()
 }
 
