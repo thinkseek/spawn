@@ -224,7 +224,7 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
     // running 34 test binaries two at a time starved the server past five
     // seconds, 2026-11-08). Wait for the status, with room for a loaded host;
     // a server that never records it still fails the assertion below.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(150);
     let seen = loop {
         let Runner::Untracked(seen) = settled(&host, Duration::from_secs(5)) else {
             panic!("a dead pane hosts no runner");
