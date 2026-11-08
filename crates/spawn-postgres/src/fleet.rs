@@ -276,7 +276,10 @@ from (
           and c.succeeded and jsonb_typeof(c.action -> 'tags') = 'array')
     else '[]'::jsonb end as told,
     ld.idempotency_key as last_delivery,
-    (select count(*) from agent_executions x
+    case when s.session_id in (select r.session_id from spawn_commands r
+                                where r.principal = 'spawn-dispatch'
+                                  and r.idempotency_key like 'dispatch-resume-%')
+      then (select count(*) from agent_executions x
        join spawn_commands c on c.id = x.command_id
       where x.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and c.idempotency_key like 'dispatch-resume-%' and c.succeeded
@@ -287,7 +290,7 @@ from (
     r")
         and ",
     died_young!("x"),
-    r") as resumed_young,
+    r") else 0 end as resumed_young,
     case when s.session_id = 'session_supervisor' then jsonb_build_object(
       'start', born.command_id,
       'given', born.charter,
@@ -309,7 +312,10 @@ from (
                     and c.action ->> 'type' = 'input' and t.hash is not null
                     and c.id > coalesce(born.command_id, 0)))
     end as charter,
-    (select jsonb_build_object(
+    case when s.session_id in (select r.session_id from spawn_commands r
+                                where r.principal = 'spawn-dispatch'
+                                  and r.idempotency_key like 'dispatch-resume-%')
+      then (select jsonb_build_object(
               'execution_id', x.execution_id,
               'command_id', c.id,
               'ended_at_ms', x.ended_at_ms,
@@ -333,7 +339,7 @@ from (
     r" and not ",
     lost_before_ready!("h"),
     r")
-      order by x.started_at_ms desc, x.execution_id desc limit 1) as failed_resume
+      order by x.started_at_ms desc, x.execution_id desc limit 1) else null end as failed_resume
   from agent_status s
   join spawn_session_state p using (session_id)
   -- Four of the facts are one row per session or per agent over the log,
