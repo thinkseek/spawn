@@ -110,6 +110,16 @@ fn backend(error: &postgres::Error) -> StoreError {
             | &postgres::error::SqlState::EXCLUSION_VIOLATION => {
                 StoreError::Rejected(db.message().to_string())
             }
+            // The server is going away, or coming back (a restart: an
+            // administrator's shutdown, a crash's, a server that cannot
+            // serve connections yet). The work is not at fault; the loop
+            // waits for the database instead of ending (crate::port's
+            // `is_unreachable`, objective 032).
+            &postgres::error::SqlState::ADMIN_SHUTDOWN
+            | &postgres::error::SqlState::CRASH_SHUTDOWN
+            | &postgres::error::SqlState::CANNOT_CONNECT_NOW => {
+                StoreError::Unreachable(db.message().to_string())
+            }
             _ => StoreError::Backend(format!(
                 "{} ({}) {}",
                 db.message(),
