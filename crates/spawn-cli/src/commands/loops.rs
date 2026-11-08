@@ -261,27 +261,14 @@ fn now_ms() -> i64 {
 /// systemd starts it again.
 pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     let stopping = stop_on_signal()?;
-<<<<<<< 5717a8b81b1258edb584141d2964fa3364553668
-    let interval = loop_interval();
-    let (mut bridge, mut observer) = runtime(flags)?;
-    let supervised = supervised();
-    let dispatching = env_value("SPAWN_DISPATCH").is_none_or(|value| value != "0");
-    let spawn = spawn_program();
-    let mut store: Option<std::sync::Arc<PostgresStore>> = None;
-    let workspace_root = workspace_root(flags).map(std::path::PathBuf::from);
-    let mut disk = disk::Monitor::new(workspace_root.as_deref());
+pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
+    let stopping = stop_on_signal()?;
+    let (bridge, observer) = runtime(flags)?;
     let (bounds, mut warnings) = dispatch::Bounds::from_env();
     let (waits, more) = crate::deliver::Waits::from_env();
     warnings.extend(more);
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
-    let (mut alerting, more) = alerts::Monitor::from_env();
+    let (alerting, more) = alerts::Monitor::from_env();
     warnings.extend(more);
-=======
-=======
-    let (bridge, observer) = runtime(flags)?;
-    let (bounds, warnings) = dispatch::Bounds::from_env();
->>>>>>> 1860071c4915de594d47f690dd83c046e0190ea7
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
     for warning in &warnings {
         eprintln!("spawn loop warning: {warning}");
     }
@@ -299,6 +286,8 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         workspace_root: root,
         disk: monitor,
         bounds,
+        waits,
+        alerting,
         interval: loop_interval(),
         steps_at: None,
         failures: 0,
@@ -311,83 +300,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
                 fleet.failed()
             ));
         }
-<<<<<<< 5717a8b81b1258edb584141d2964fa3364553668
-        if let Err(error) = observer.tick() {
-            fail("observer", &error.to_string());
-        }
-        if store.is_none() {
-            store = open_store()
-                .map(std::sync::Arc::new)
-                .map_err(|error| fail("store", &error))
-                .ok();
-        }
-        if let Some(open) = &store {
-            let mut lines = Vec::new();
-            let mut step = |what: &str, result: Result<Vec<String>, String>| match result {
-                Ok(more) => lines.extend(more),
-                Err(error) => fail(what, &error),
-            };
-            // The disk watch never fails a pass: a fleet must not stop
-            // because it cannot record a warning.
-            step(
-                "disk",
-                Ok(disk
-                    .check(open)
-                    .unwrap_or_else(|error| vec![format!("disk: {error}")])),
-            );
-            // The alerts never fail a pass either: an error is said and
-            // tried again at the next check.
-            step(
-                "alerts",
-                Ok(alerting
-                    .check(open)
-                    .unwrap_or_else(|error| vec![format!("alerts: {error}")])),
-            );
-            if dispatching {
-                step(
-                    "dispatch",
-                    dispatch::step(
-                        open,
-                        supervised,
-                        &spawn,
-                        workspace_root.as_deref(),
-                        &disk,
-                        &bounds,
-                        waits,
-                    ),
-                );
-            }
-            // Under the disk floor no resident is revived (a new execution);
-            // the supervisor still is, to act on the warning.
-            if !disk.below_floor() {
-                step("residents", supervise::keep_residents(open));
-            }
-            if supervised {
-                step(
-                    "supervise",
-                    supervise::keep_alive(open).map(|line| line.into_iter().collect()),
-                );
-            }
-            for line in &lines {
-                println!("{line}");
-            }
-        }
-        if failed {
-            // A broken connection is reopened on the next pass.
-            store = None;
-            failures = failures.saturating_add(1);
-            if failures >= MAX_FAILURES {
-                return Err(format!("{failures} failed passes in a row; exiting"));
-            }
-        } else {
-            failures = 0;
-        }
-        // ponytail: fixed backoff, cap at 30 intervals. A per-error-kind
-        // schedule only matters once a failure class is slow to clear.
-        if pause_unless_stopped(backoff(interval, failures), &stopping) {
-=======
         if fleet.wait(&stopping) {
->>>>>>> 1860071c4915de594d47f690dd83c046e0190ea7
             eprintln!("spawn loop: stopping; pending pushes are made first");
             return Ok(0);
         }
