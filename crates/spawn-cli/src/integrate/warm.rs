@@ -621,6 +621,11 @@ mod tests {
         old.want(want("fff666"));
         old.poll(&|_| Some(PathBuf::from("/mirror.git")));
         let pid = old.running_pid().expect("the predecessor's warm");
+        // Until the child has exec'd gate.sh it runs no gate.sh, and every
+        // take_over below would find it "gone" for that reason alone.
+        until("the warm to start its gate", || {
+            scratch.0.join("args.fff666").exists()
+        });
         let record = std::fs::read_to_string(scratch.0.join("warm").join(PID_FILE)).expect("pid");
         // Another commit in the file: not this warm, nothing stopped.
         std::fs::write(
