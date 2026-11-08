@@ -261,8 +261,6 @@ fn now_ms() -> i64 {
 /// systemd starts it again.
 pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     let stopping = stop_on_signal()?;
-pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
-    let stopping = stop_on_signal()?;
     let (bridge, observer) = runtime(flags)?;
     let (bounds, mut warnings) = dispatch::Bounds::from_env();
     let (waits, more) = crate::deliver::Waits::from_env();
