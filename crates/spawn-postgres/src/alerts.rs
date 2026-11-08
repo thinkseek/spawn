@@ -68,21 +68,22 @@ select jsonb_build_object(
 /// The control records after `$1`, oldest first, at most `$2`: what the loop
 /// has not looked at yet. `next` is the event id it continues from (the
 /// batch's last one, or `$1` when there was none).
+/// The batch is read once: `next` and `records` are that one read's last id
+/// and rows, not two reads of the control stream (the loop reads it on every
+/// pass it acts on).
 pub(crate) const CONTROL: &str = r"
+with batch as (
+  select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
+    from spawn_events e
+   where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+     and e.id > $1
+   order by e.id limit $2)
 select jsonb_build_object(
-  'next', coalesce((select max(x.id) from (
-      select e.id from spawn_events e
-       where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-         and e.id > $1
-       order by e.id limit $2) x), $1),
-  'records', coalesce((select jsonb_agg(jsonb_build_object(
-        'event_id', x.id, 'at_ms', x.recorded_at_ms, 'record', x.record)
-      order by x.id) from (
-      select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
-        from spawn_events e
-       where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-         and e.id > $1
-       order by e.id limit $2) x), '[]'::jsonb))";
+  'next', coalesce(max(b.id), $1),
+  'records', coalesce(jsonb_agg(jsonb_build_object(
+        'event_id', b.id, 'at_ms', b.recorded_at_ms, 'record', b.record)
+      order by b.id), '[]'::jsonb))
+from batch b";
 
 /// The records the alert conditions read, newest last, since `$1`: the ones
 /// objectives 028, 029, 031 and 033 define, and the halt and resume, so a
