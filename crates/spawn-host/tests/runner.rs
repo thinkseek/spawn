@@ -162,6 +162,28 @@ fn settled(host: &TmuxHost, limit: Duration) -> Runner {
     }
 }
 
+/// How long a dead pane's exit status is waited for, and how many times the
+/// launch that ends it is started: a server that lost the status once loses
+/// the next one rarely, and each wait costs a second at worst on a quiet
+/// host.
+const WAIT_STATUS: Duration = Duration::from_secs(30);
+const STATUS_STARTS: usize = 3;
+
+/// What `terminal()`'s pane says once it is dead, waiting up to `limit` for
+/// tmux to name its exit status (`exit status none` until it does).
+fn wait_for_status(host: &TmuxHost, limit: Duration) -> String {
+    let deadline = Instant::now() + limit;
+    loop {
+        let Runner::Untracked(seen) = settled(host, Duration::from_secs(5)) else {
+            panic!("a dead pane hosts no runner");
+        };
+        if !seen.contains("exit status none") || Instant::now() > deadline {
+            return seen;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
     let _exclusive = exclusive();
