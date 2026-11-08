@@ -2550,13 +2550,13 @@ mod tests {
             },
         ];
         // Nothing recorded: the first failed turn is the next fact.
-        match pending(&[], &turns, &execution, &[], &[]) {
+        match pending(&[], &turns, &[], &execution, &[], &[]) {
             Some(super::Fact::Turn(turn)) => assert_eq!(turn.event_id, 50),
             _ => panic!("the first failed turn"),
         }
         // That turn recorded: the second one.
         let first = recorded("execution.interrupted", "wait", 1, 50, 10);
-        match pending(std::slice::from_ref(&first), &turns, &execution, &[], &[]) {
+        match pending(std::slice::from_ref(&first), &turns, &[], &execution, &[], &[]) {
             Some(super::Fact::Turn(turn)) => assert_eq!(turn.event_id, 60),
             _ => panic!("the second failed turn"),
         }
@@ -2566,6 +2566,7 @@ mod tests {
         match pending(
             &[first.clone(), second.clone(), clear.clone()],
             &turns,
+            &[],
             &execution,
             &[],
             &[],
@@ -2578,6 +2579,7 @@ mod tests {
             pending(
                 &[first.clone(), second.clone()],
                 &turns,
+                &[],
                 &execution,
                 &[],
                 &[]
@@ -2588,7 +2590,7 @@ mod tests {
         // The end recorded: nothing, however often the loop reads it.
         let ended = recorded("execution.interrupted", "resume", 3, 90, 13);
         assert!(
-            pending(&[first, second, clear, ended], &turns, &execution, &[], &[]).is_none(),
+            pending(&[first, second, clear, ended], &turns, &[], &execution, &[], &[]).is_none(),
             "a restarted loop records the same interruption once"
         );
     }
@@ -2598,7 +2600,7 @@ mod tests {
         let execution = execution(Some(2_000));
         let waiting = recorded("execution.interrupted", "wait", 1, 50, 10);
         // The wait is open: the end is its revival's, not a new interruption.
-        assert!(pending(std::slice::from_ref(&waiting), &[], &execution, &[], &[]).is_none());
+        assert!(pending(std::slice::from_ref(&waiting), &[], &[], &execution, &[], &[]).is_none());
         // A person's Stop since: it is.
         let stopped = stop("bb-stop-3", 7);
         assert!(matches!(
