@@ -1423,26 +1423,20 @@ fn a_tasks_stages_are_its_records_in_order_with_the_time_each_took() {
     let board = store.mission_board(10).expect("board");
     assert_eq!(board["missions"][0]["tasks"][0]["stages"], expected);
     for login in ["spawn_supervisor", "spawn_reader"] {
-        let role = common::login(&schema, login);
-        client
-            .batch_execute(&format!("set session authorization {role}"))
-            .expect("become the login");
-        let stages: serde_json::Value = client
+        let mut as_login = common::as_login(&schema, login);
+        let stages: serde_json::Value = as_login
             .query_one("select spawn_task_stages($1)", &[&task])
             .expect("the login reads the stages")
             .get(0);
         assert_eq!(stages, expected, "{login}");
         if login == "spawn_supervisor" {
             assert!(
-                client
+                as_login
                     .query_one("select count(*) from spawn_events", &[])
                     .is_err(),
                 "the supervisor still reads no events"
             );
         }
-        client
-            .batch_execute("reset session authorization")
-            .expect("back to the owner");
     }
 }
 
@@ -1500,12 +1494,9 @@ fn host_disk_records_are_owner_only_facts_the_fold_ignores() {
     assert_eq!(tables(&mut client), before);
     assert_eq!(control_types(&mut client), ["host.disk"; 3]);
 
-    let supervisor = common::login(&schema, "spawn_supervisor");
-    client
-        .batch_execute(&format!("set session authorization {supervisor}"))
-        .expect("become the supervisor");
+    let mut supervisor = common::as_login(&schema, "spawn_supervisor");
     assert!(
-        client
+        supervisor
             .query_one("select spawn_host_record($1)", &[&record("/ws", "low", 1)])
             .is_err(),
         "the supervisor records no host facts"
@@ -2678,6 +2669,25 @@ fn a_host_fault_moves_no_count_and_its_run_is_folded() {
         record["evidence"] = json!("server_log");
         record["crash"] = json!([]);
     }));
+    // The gate's own fact (evidence `gate`): it names its scenario and
+    // where it failed, and needs no failures.
+    let gate_fact = |record: &mut serde_json::Value| {
+        record["evidence"] = json!("gate");
+        record["failures"] = json!([]);
+        record["fact"] = json!({"scenario": "012.sh", "on": "base", "runs": "1, then 0"});
+    };
+    assert!(refused(&|record| {
+        gate_fact(record);
+        record.as_object_mut().expect("object").remove("fact");
+    }));
+    assert!(refused(&|record| {
+        gate_fact(record);
+        record["fact"]["scenario"] = json!("");
+    }));
+    assert!(refused(&|record| {
+        gate_fact(record);
+        record["fact"]["on"] = json!("candidate");
+    }));
 
     // A rejection and an abort first: the runs a host fault must leave.
     verdict(task, 0, "rejected");
@@ -3644,12 +3654,9 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
         assert!(types.iter().any(|seen| seen == kind), "{kind}: {types:?}");
     }
 
-    let supervisor = common::login(&schema, "spawn_supervisor");
-    client
-        .batch_execute(&format!("set session authorization {supervisor}"))
-        .expect("become the supervisor");
+    let mut supervisor = common::as_login(&schema, "spawn_supervisor");
     assert!(
-        client
+        supervisor
             .query_one(
                 "select spawn_source_push_request($1, $2, $3)",
                 &[&source, &c1, &owner_ref(&c1)],
@@ -3658,7 +3665,7 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
         "the supervisor asks for no owner landing"
     );
     assert!(
-        client
+        supervisor
             .query_one("select spawn_source_push_hold()", &[])
             .is_err(),
         "the supervisor holds no landing"
@@ -3773,4 +3780,146 @@ fn an_overrun_takes_its_task_out_of_flight_and_moves_no_counter() {
             .is_err(),
         "not a reported task"
     );
+}
+
+/// A halt on a moved main says what moved it (`cause: main_moved`, the
+/// source and both commits), so the owner's record of that very move
+/// clears it and moves the mission's baseline. A halt for another reason,
+/// at the same baseline, keeps both; a structured halt that does not name
+/// the move is refused.
+#[test]
+fn a_move_clears_the_halt_that_names_it() {
+    let (store, schema) = store("move_clears_halt");
+    let source = "/tmp/cleared.git";
+    let moved = store
+        .mission_add("moved", &json!([source]), "human")
+        .expect("add");
+    let kept = store
+        .mission_add("kept", &json!([source]), "human")
+        .expect("add");
+    let task = store
+        .task_assign(moved, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    store
+        .integrator_record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                                   "verdict": "aborted", "base": "b0"}))
+        .expect("a base");
+    assert!(
+        store
+            .integrator_record(&json!({"type": "mission.halted", "id": moved,
+                                       "reason": "main moved", "cause": "main_moved",
+                                       "source": source, "from": "b0"}))
+            .is_err(),
+        "a structured halt names both commits"
+    );
+    store
+        .integrator_record(&json!({"type": "mission.halted", "id": moved,
+                                   "reason": "the source's main is c1, but the last landing \
+                                    left b0",
+                                   "cause": "main_moved", "source": source,
+                                   "from": "b0", "to": "c1"}))
+        .expect("halted on the move");
+    let other = store
+        .task_assign(kept, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_delivered(other, 1).expect("delivered");
+    assert!(store.task_reported(other, "done").expect("reported"));
+    store
+        .integrator_record(&json!({"type": "task.gated", "id": other, "revision": 0,
+                                   "verdict": "aborted", "base": "b0"}))
+        .expect("the same baseline");
+    store
+        .integrator_record(&json!({"type": "mission.halted", "id": kept,
+                                   "reason": "three gate rejections in a row"}))
+        .expect("halted for another reason");
+
+    let mut client = admin(&schema);
+    assert_eq!(store.source_moved(source, "b0", "c1").expect("moved"), 1);
+    let board = store.mission_board(10).expect("board");
+    let found = |id: i64| -> serde_json::Value {
+        board["missions"]
+            .as_array()
+            .expect("missions")
+            .iter()
+            .find(|mission| mission["id"] == json!(id))
+            .cloned()
+            .expect("the mission")
+    };
+    let after = found(moved);
+    assert!(after["halted"].is_null(), "{after}");
+    assert_eq!(after["baseline"], json!("c1"));
+    let kept = found(kept);
+    assert_eq!(kept["halted"], json!("three gate rejections in a row"));
+    assert_eq!(kept["baseline"], json!("b0"));
+    refold(&mut client);
+    let folded = found(moved);
+    assert!(folded["halted"].is_null(), "the fold agrees: {folded}");
+    assert_eq!(folded["baseline"], json!("c1"));
+}
+
+/// An objective solved on the base is the integrator's record, names its
+/// objective, scenario and base, and the cancel that ends its task must
+/// name a solved record for that very task: no other cancel by the
+/// integrator without a yield is allowed.
+#[test]
+fn an_objective_solved_on_the_base_ends_its_task() {
+    let (store, _schema) = store("solved_on_base");
+    let mission = store
+        .mission_add("objectives", &json!(["/tmp/solved.git"]), "human")
+        .expect("add");
+    store
+        .resident_propose("rsi", "Pursues objectives")
+        .expect("propose");
+    store.resident_approve("rsi").expect("approve");
+    store
+        .mission_configure(
+            mission,
+            Some("/controller/rsi/scenarios"),
+            "gate",
+            None,
+            Some(&json!({"backlog": "/controller/rsi/backlog", "resident": "rsi"})),
+        )
+        .expect("configure");
+    let task = store
+        .objective_assign(mission, 34, Some("/s/034.sh"), "Objective 34")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    assert!(
+        store
+            .integrator_record(&json!({"type": "objective.solved", "id": mission,
+                                       "objective": 34, "task": task,
+                                       "scenario": "/s/034.sh"}))
+            .is_err(),
+        "no base, no record"
+    );
+    assert!(
+        store
+            .integrator_record(&json!({"type": "task.cancelled", "id": task,
+                                       "reason": "solved"}))
+            .is_err(),
+        "the integrator cancels only a yield or a solved objective"
+    );
+    let solved = store
+        .integrator_record(&json!({"type": "objective.solved", "id": mission,
+                                   "objective": 34, "task": task,
+                                   "scenario": "/s/034.sh", "base": "b0", "log": "| ok"}))
+        .expect("solved");
+    assert!(
+        store
+            .integrator_record(&json!({"type": "task.cancelled", "id": task,
+                                       "solved": solved + 1, "reason": "solved"}))
+            .is_err(),
+        "the cancel names the solved record of its task"
+    );
+    store
+        .integrator_record(
+            &json!({"type": "task.cancelled", "id": task, "solved": solved,
+                                   "reason": "objective 34 is solved on the base"}),
+        )
+        .expect("cancelled");
+    let board = store.mission_board(10).expect("board");
+    assert_eq!(board["missions"][0]["tasks"][0]["state"], "cancelled");
 }

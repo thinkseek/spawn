@@ -810,6 +810,57 @@ mod tests {
         );
     }
 
+    /// [`a_migration_without_the_owner_password_turns_the_logins_off`]'s check
+    /// after the passwordless migration: the three logins cannot log in, read
+    /// from `pg_roles`, which every login reads (`pg_authid` is the
+    /// superuser's; the test server's login need not be one). Its `rolpassword`
+    /// is a mask, so "no password is left" is shown by the refused logins, and
+    /// read from `pg_authid` only where the login may.
+    fn assert_logins_off(name: &str, ours: &str) {
+        use postgres::{Client, NoTls};
+        let logins = "rolname in ('spawn_supervisor_' || $1, 'spawn_reader_' || $1,
+                              'spawn_human_' || $1)";
+        let mut admin = Client::connect(ours, NoTls).expect("admin");
+        let off: Vec<(String, bool)> = admin
+            .query(
+                &format!(
+                    "select rolname::text, rolcanlogin from pg_roles where {logins} order by 1"
+                ),
+                &[&name],
+            )
+            .expect("the logins")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(
+            off,
+            [
+                (format!("spawn_human_{name}"), false),
+                (format!("spawn_reader_{name}"), false),
+                (format!("spawn_supervisor_{name}"), false),
+            ]
+        );
+        let superuser: bool = admin
+            .query_one(
+                "select rolsuper from pg_roles where rolname = current_user",
+                &[],
+            )
+            .expect("the test login")
+            .get(0);
+        if superuser {
+            let passwords: i64 = admin
+                .query_one(
+                    &format!(
+                        "select count(*) from pg_authid where {logins} and rolpassword is null"
+                    ),
+                    &[&name],
+                )
+                .expect("the passwords")
+                .get(0);
+            assert_eq!(passwords, 3, "no password is left");
+        }
+    }
+
     /// With no owner password (a peer or trust login: nothing in the URL,
     /// so nothing the logins could derive from), a migration turns the
     /// logins off, says so, and removes a password an earlier install set;
@@ -861,27 +912,7 @@ mod tests {
                 Client::connect(&supervisor, NoTls).is_err(),
                 "the derived one too"
             );
-            let off: Vec<(String, bool, bool)> = Client::connect(&url, NoTls)
-                .expect("admin")
-                .query(
-                    "select rolname::text, rolcanlogin, rolpassword is null from pg_authid
-                      where rolname in ('spawn_supervisor_' || $1, 'spawn_reader_' || $1,
-                                        'spawn_human_' || $1)
-                      order by 1",
-                    &[&name],
-                )
-                .expect("the logins")
-                .iter()
-                .map(|row| (row.get(0), row.get(1), row.get(2)))
-                .collect();
-            assert_eq!(
-                off,
-                [
-                    (format!("spawn_human_{name}"), false, true),
-                    (format!("spawn_reader_{name}"), false, true),
-                    (format!("spawn_supervisor_{name}"), false, true),
-                ]
-            );
+            assert_logins_off(&name, &ours);
             // It says so.
             let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
             let sink = std::sync::Arc::clone(&warnings);

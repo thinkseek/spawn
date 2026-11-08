@@ -233,6 +233,50 @@ printf 'two\n' >"$seed/other"
 regress=$(commit regress-2)
 expect "a failing check rejects" "$(judge "$regress")" '"verdict":"rejected"'
 
+# 5a. Checks run twice (task 127: one e2e run that failed under load rejected
+# an 85-minute gate). A check that fails twice on the candidate and passes on
+# the base is a regression; one that fails once and then passes is a flake;
+# one that fails on the candidate and on the base is no verdict (exit 4).
+branch broken-probe
+printf 'two\n' >"$seed/value"
+printf 'echo "probe: broken"\nexit 1\n' >"$seed/probe.sh"
+broken_probe=$(commit broken-probe)
+expect "a check that fails twice and passes on the base is a regression" "$(judge "$broken_probe")" \
+    'exit=0 {"verdict":"rejected","reason":"regression: check-probe.sh fails on the candidate"}'
+expect "it ran again before the base" "$(cat "$work/gate.out")" \
+    '| == regression: check-probe.sh must still pass (again: a failing check runs twice)'
+expect "and the log says why" "$(cat "$work/gate.out")" \
+    'check-probe.sh passes on the base and failed twice on the candidate: a regression'
+branch flaky
+printf 'two\n' >"$seed/value"
+cat >"$seed/probe.sh" <<'EOF'
+# Fails on its first run only: the tree is the candidate's, writable.
+[ -f .probe-ran ] && exit 0
+: >.probe-ran
+echo "probe: a load flake"
+exit 1
+EOF
+flaky=$(commit flaky)
+expect "a check that fails once and then passes is a flake, not a regression, named in the verdict" \
+    "$(judge "$flaky")" 'exit=0 {"verdict":"accepted","flakes":["check-probe.sh"]}'
+expect "the log says it" "$(cat "$work/gate.out")" \
+    'check-probe.sh failed once (1) and passed again on the candidate: a flake, not a regression'
+broken_scenarios=$work/broken
+cp -r "$scenarios" "$broken_scenarios"
+printf '#!/bin/sh\necho "broken: fails on every tree"\nexit 1\n' >"$broken_scenarios/check-broken.sh"
+printf '#!/bin/sh\nexit 0\n' >"$broken_scenarios/check-tests.sh"
+expect "a check that fails on the candidate and on the base is no verdict" \
+    "$(judge "$good" "" "$broken_scenarios")" \
+    'exit=6 {"host_fault":true,"scenario":"check-broken.sh","on":"candidate and base","runs":"1, then 1 on the candidate; 1 on the base"'
+expect "the log says so" "$(cat "$work/gate.out")" \
+    'check-broken.sh fails on the candidate and on the base: a host or harness fault, no verdict'
+expect "with every base result cached the base is built for it" \
+    "$(judge "$good" "" "$broken_scenarios")" 'exit=6 {"host_fault":true,"scenario":"check-broken.sh"'
+expect "the cached run still judged it on the base" "$(cat "$work/gate.out")" \
+    'check-broken.sh fails on the base too (1)'
+expect "check-tests.sh runs first among the regressions" \
+    "$(grep -E '^\| == regression: (check-tests|007)\.sh' "$work/gate.out" | head -n 1)" 'check-tests.sh'
+
 # 5b. An objective scenario the base fails too is unsolved, not a regression;
 # one the base passes and the candidate breaks is a regression.
 unsolved_scenarios=$work/unsolved
@@ -1084,8 +1128,9 @@ expect "and says why" "$(cat "$work/gate.out")" 'which the sandbox shows'
 # A harness error on the base aborts the gate: no verdict, never a skip.
 server break >/dev/null
 printf '# changed again, so not cached\n' >>"$objectives/011.sh"
-expect "a harness exit on the base aborts the gate" "$(judge "$good" "" "$objectives")" 'exit=4 '
-refuse "with no verdict" "$(cat "$integrator/verdict" 2>/dev/null || true)" 'verdict'
+expect "a harness exit on the base is a host fault, no verdict" "$(judge "$good" "" "$objectives")" \
+    'exit=6 {"host_fault":true,"scenario":"011.sh","on":"base","runs":"2"'
+refuse "with no verdict" "$(cat "$integrator/verdict" 2>/dev/null || true)" '"verdict"'
 expect "and says why" "$(cat "$work/gate.out")" '011.sh exited 2 on the base: a harness error'
 server fix >/dev/null
 
@@ -1094,8 +1139,8 @@ task_scenarios=$work/task-objectives
 cp -r "$objectives" "$task_scenarios"
 rm "$task_scenarios/011.sh"
 printf '#!/bin/sh\n[ "$(cat value)" = two ] || exit 7\n' >"$task_scenarios/012.sh"
-expect "a task scenario that exits 7 on the base aborts" \
-    "$(judge "$good" "$task_scenarios/012.sh" "$task_scenarios")" 'exit=4 '
+expect "a task scenario that exits 7 on the base is a host fault" \
+    "$(judge "$good" "$task_scenarios/012.sh" "$task_scenarios")" 'exit=6 {"host_fault":true,"scenario":"012.sh","on":"base","runs":"7"'
 cat >"$task_scenarios/012.sh" <<'EOF'
 #!/bin/sh
 # Flaky on the base: fails the first time, passes the second.
@@ -1104,8 +1149,13 @@ cat >"$task_scenarios/012.sh" <<'EOF'
 exit 1
 EOF
 server reset >/dev/null
+# Objective 033's disagreement keeps its own statement: exit 4 and the pair,
+# never a host-fault fact (one run is one record; gate.rs tells them apart).
 expect "an unsolved result needs two runs that agree" \
     "$(judge "$good" "$task_scenarios/012.sh" "$task_scenarios")" 'exit=4 '
+refuse "and no host-fault fact is written" "$(cat "$integrator/verdict" 2>/dev/null || true)" 'host_fault'
+expect "the base's disagreement is said as 033 says it" "$(cat "$work/gate.out")" \
+    '012.sh exited 1, then 0 on the base: a harness error, not a verdict; the gate aborts'
 expect "the flake is named" "$(cat "$work/gate.out")" 'exited 1, then 0 on the base'
 unset SPAWN_TEST_DATABASE_URL
 
@@ -1246,7 +1296,9 @@ rust_base=$saved_rust_base
 # 6. A reason with a quote stays valid JSON.
 quoted_scenarios=$work/quoted
 cp -r "$scenarios" "$quoted_scenarios"
-printf '#!/bin/sh\nexit 1\n' >"$quoted_scenarios/check-\"q\".sh"
+# It fails on the candidate (value two) and passes on the base (one): a
+# regression, whose reason holds the quote.
+printf '#!/bin/sh\n[ "$(cat value)" = one ]\n' >"$quoted_scenarios/check-\"q\".sh"
 expect "a quote in a reason is escaped" "$(judge "$good" "" "$quoted_scenarios")" \
     '{"verdict":"rejected","reason":"regression: check-\"q\".sh fails on the candidate"}'
 
@@ -1259,8 +1311,12 @@ unlisted_scenarios=$work/unlisted
 cp -r "$scenarios" "$unlisted_scenarios"
 printf '#!/bin/sh\n[ "$(cat "%s/marker" 2>/dev/null)" = here ]\n' "$owner_inputs" \
     >"$unlisted_scenarios/check-owner-inputs.sh"
+# Unseen on the base as on the candidate: the check fails on both, which the
+# gate takes for a harness fault (no verdict, exit 4).
 expect "an unlisted directory under \$HOME is not visible" \
-    "$(judge "$good" "" "$unlisted_scenarios")" 'check-owner-inputs.sh fails'
+    "$(judge "$good" "" "$unlisted_scenarios")" 'exit=6 {"host_fault":true,"scenario":"check-owner-inputs.sh"'
+expect "on the candidate or the base" "$(cat "$work/gate.out")" \
+    'check-owner-inputs.sh fails on the base too (1)'
 listed_inputs=$work/listed-inputs
 cp -r "$unlisted_scenarios" "$listed_inputs"
 printf '# owner inputs\n%s\n' "$owner_inputs" >"$listed_inputs/bind"
@@ -1375,7 +1431,7 @@ expect "one put on the list is judged again, alone" \
     '| base results from the cache: 071.sh 073.sh; run on the base: 072.sh'
 rm "$alone/serial"
 expect "the control: without the list, 071 meets its neighbours" \
-    "$(with_jobs 4 alone-control "$good" "$alone")" 'exit=4 '
+    "$(with_jobs 4 alone-control "$good" "$alone")" 'exit=6 {"host_fault":true,'
 
 # 16d. The base phase ends before any candidate code runs: each base run
 # leaves a mark in the base tree, and each candidate run wants all of them.
@@ -1409,8 +1465,8 @@ printf '#!/bin/sh\nsleep 2\n' >"$abort/091.sh"
 printf '#!/bin/sh\nexit 3\n' >"$abort/092.sh"
 printf '#!/bin/sh\nsleep 29.5\n' >"$abort/093.sh"
 started=$(date +%s)
-expect "a harness error among parallel base runs aborts the gate" \
-    "$(with_jobs 4 abort "$good" "$abort")" 'exit=4 '
+expect "a harness error among parallel base runs ends the gate: a host fault" \
+    "$(with_jobs 4 abort "$good" "$abort")" 'exit=6 {"host_fault":true,'
 expect "without waiting for the runs after it" "$([ $(($(date +%s) - started)) -lt 25 ] && echo early)" early
 expect "after the blocks before it" "$(cat "$work/gate.out")" '| == base: 091.sh: solved'
 expect "and says why" "$(cat "$work/gate.out")" '092.sh exited 3 on the base'

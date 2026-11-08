@@ -54,6 +54,36 @@ pub fn login(schema: &str, base: &str) -> String {
         .get(0)
 }
 
+/// A connection logged in as the database's restricted login `base`
+/// (`spawn_supervisor`, `spawn_reader`, `spawn_human`) in `schema`, by its
+/// own password ([`spawn_postgres::role_url`]), as an install's login
+/// connects: `session_user` is the login. Not `SET SESSION AUTHORIZATION`,
+/// which needs a superuser; the test server's login need not be one (the
+/// fleet's is not: deploy/fleet-test-db.sh).
+pub fn as_login(schema: &str, base: &str) -> Client {
+    let url = spawn_postgres::role_url(&schema_url(schema), base).expect("the login's URL");
+    Client::connect(&url, NoTls).expect("log in as the restricted login")
+}
+
+/// A random password for a role a test makes: hex, nothing to quote.
+pub fn password() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    format!("{:x}{nanos:x}", std::process::id())
+}
+
+/// A connection logged in as `role` with `password` (a role the test
+/// made with `login password`), in `schema`.
+pub fn connect_as(schema: &str, role: &str, password: &str) -> Client {
+    let mut config: postgres::Config = url().parse().expect("the test URL parses");
+    config
+        .user(role)
+        .password(password)
+        .options(&format!("-csearch_path={schema}"));
+    config.connect(NoTls).expect("log in as the role")
+}
+
 /// A schema holding the first shape of every table (tests/first-shapes.sql),
 /// not migrated yet, and an owner connection in it.
 pub fn first_shapes(case: &str) -> (String, Client) {
