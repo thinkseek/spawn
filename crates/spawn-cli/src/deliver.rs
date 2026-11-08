@@ -728,7 +728,6 @@ fn delivery_attempts<'a>(task: &TaskRow, facts: &'a Facts) -> Vec<&'a crate::dis
             sent.key == key || sent.key.starts_with(&retry) || sent.key.starts_with(&moved)
         })
 <<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
-        .collect()
 }
 
 /// Every attempt at `task`'s current delivery, as a re-issue's
@@ -741,8 +740,6 @@ fn attempt_records(task: &TaskRow, facts: &Facts) -> Vec<Attempt> {
             key: sent.key.clone(),
             error: sent.error.clone(),
         })
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
         .collect()
 }
 
