@@ -614,6 +614,80 @@ impl Fleet<'_> {
         // takes the one way back that cause has. The dispatcher's
         // one-resume rule and the liveness rule's revival give way to what
         // it has recorded (docs/fleet-architecture.md §3.1).
+        self.recovery_step(open, watermark, now, lines, errors);
+        if self.dispatching && self.schedule.dispatch.runs(watermark, now) {
+            match dispatch::step(
+                open,
+                self.supervised,
+                &self.spawn,
+                self.workspace_root.as_deref(),
+                &self.disk,
+                &self.bounds,
+                self.waits,
+            ) {
+                Ok((more, due)) => {
+                    lines.extend(more);
+                    self.schedule.dispatch.ran(watermark, due);
+                }
+                Err(error) => Fleet::fail(errors, "dispatch", &error),
+            }
+        }
+        // Under the disk floor no resident is revived (a new execution); the
+        // supervisor still is, to act on the warning.
+        if !self.disk.below_floor() && self.schedule.residents.runs(watermark, now) {
+            match supervise::keep_residents(open) {
+                Ok((more, due)) => {
+                    lines.extend(more);
+                    self.schedule.residents.ran(watermark, due);
+                }
+                Err(error) => Fleet::fail(errors, "residents", &error),
+            }
+        }
+        if self.supervised && self.schedule.alive.runs(watermark, now) {
+            match supervise::keep_alive(open) {
+                Ok((line, due)) => {
+                    lines.extend(line);
+                    self.schedule.alive.ran(watermark, due);
+                }
+                Err(error) => Fleet::fail(errors, "supervise", &error),
+            }
+        }
+        // The alerts never fail a pass either: an error is said and tried
+        // again at the next check, like the disk watch's.
+        if self.schedule.alerts.runs(watermark, now) {
+            match self.alerting.check(open) {
+                Ok(more) => {
+                    lines.extend(more);
+                    self.schedule
+                        .alerts
+                        .ran(watermark, Some(self.alerting.due_ms()));
+                }
+                Err(error) => {
+                    lines.push(format!("alerts: {error}"));
+                    self.schedule
+                        .alerts
+                        .ran(watermark, Some(self.alerting.due_ms()));
+                }
+            }
+        }
+    }
+
+    /// The recovery's step: record every interruption once, with its cause
+    /// and its evidence, and take the one way back that cause has. The
+    /// dispatcher's one-resume rule and the liveness rule's revival give way
+    /// to what it records (docs/fleet-architecture.md §3.1). It reads a few
+    /// kinds of record, not every event: a pass whose watermark moved on a
+    /// screen or a delivery asks once, cheaply, and skips every session's
+    /// facts when none of them is here; an open wait's probe, and an outage
+    /// the failed passes left, force it regardless.
+    fn recovery_step(
+        &mut self,
+        open: &std::sync::Arc<PostgresStore>,
+        watermark: i64,
+        now: i64,
+        lines: &mut Vec<String>,
+        errors: &mut Vec<String>,
+    ) {
         // The recovery reads a few kinds of record, not every event: a pass
         // whose watermark moved on a screen or a delivery asks once, cheaply,
         // and skips every session's facts when none of them is here. An open
@@ -669,61 +743,6 @@ impl Fleet<'_> {
             // Nothing the recovery reads moved: it acts on the watermark
             // this pass and waits for the next record it reads.
             self.schedule.recovery.ran(watermark, None);
-        }
-        if self.dispatching && self.schedule.dispatch.runs(watermark, now) {
-            match dispatch::step(
-                open,
-                self.supervised,
-                &self.spawn,
-                self.workspace_root.as_deref(),
-                &self.disk,
-                &self.bounds,
-                self.waits,
-            ) {
-                Ok((more, due)) => {
-                    lines.extend(more);
-                    self.schedule.dispatch.ran(watermark, due);
-                }
-                Err(error) => Fleet::fail(errors, "dispatch", &error),
-            }
-        }
-        // Under the disk floor no resident is revived (a new execution); the
-        // supervisor still is, to act on the warning.
-        if !self.disk.below_floor() && self.schedule.residents.runs(watermark, now) {
-            match supervise::keep_residents(open) {
-                Ok((more, due)) => {
-                    lines.extend(more);
-                    self.schedule.residents.ran(watermark, due);
-                }
-                Err(error) => Fleet::fail(errors, "residents", &error),
-            }
-        }
-        if self.supervised && self.schedule.alive.runs(watermark, now) {
-            match supervise::keep_alive(open) {
-                Ok((line, due)) => {
-                    lines.extend(line);
-                    self.schedule.alive.ran(watermark, due);
-                }
-                Err(error) => Fleet::fail(errors, "supervise", &error),
-            }
-        }
-        // The alerts never fail a pass either: an error is said and tried
-        // again at the next check, like the disk watch's.
-        if self.schedule.alerts.runs(watermark, now) {
-            match self.alerting.check(open) {
-                Ok(more) => {
-                    lines.extend(more);
-                    self.schedule
-                        .alerts
-                        .ran(watermark, Some(self.alerting.due_ms()));
-                }
-                Err(error) => {
-                    lines.push(format!("alerts: {error}"));
-                    self.schedule
-                        .alerts
-                        .ran(watermark, Some(self.alerting.due_ms()));
-                }
-            }
         }
     }
 
