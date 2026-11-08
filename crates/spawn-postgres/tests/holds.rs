@@ -251,14 +251,28 @@ fn the_store_writes_expires_ms_and_a_second_hold_renews_the_first() {
     assert_eq!(holds[0]["main"], OTHER_MAIN);
     assert_eq!(holds[0]["by"], "human");
     assert_eq!(holds[0]["held_at_ms"], held[1]["at_ms"]);
-    // The waiting task waits behind the new one once its landing says so.
+    // The renewal itself moved the waiting task to the new hold in the fold:
+    // the board, a release and an expiry name it at once, and the fold wrote
+    // no record of its own.
     let second_hold = second["hold"].as_i64().expect("an id");
+    assert_eq!(fold["tasks"][0]["held_by"], second_hold);
+    assert_eq!(
+        records(&mut client, "task.held").len(),
+        1,
+        "the fold records nothing"
+    );
+    let board = store.mission_board(10).expect("board");
+    assert_eq!(board["holds"][0]["waiting"], json!([task]));
+    assert_eq!(board["missions"][0]["hold"], second_hold);
+
+    // Its landing's own `task.held` follows, once per task and hold.
     assert!(
         store
             .task_held(task, second_hold, source)
             .expect("held")
             .is_some()
     );
+    assert_eq!(records(&mut client, "task.held").len(), 2);
     let board = store.mission_board(10).expect("board");
     assert_eq!(board["holds"][0]["waiting"], json!([task]));
     assert_eq!(board["missions"][0]["hold"], second_hold);
