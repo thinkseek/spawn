@@ -72,6 +72,7 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::BackgroundJob => "background job past its bound",
         Why::HoldExpired => "a source hold expired",
         Why::ObjectiveYielded => "an objective ran out of attempts and yielded its slot",
+        Why::ObjectiveSolved => "an objective closed: solved on the base (not a rejection)",
         Why::ObjectiveOrder => "a backlog names an order no task can meet",
         Why::OverBudget => "a task went over its budget twice",
     }
@@ -89,9 +90,10 @@ struct Line<'a> {
 
 /// The pending escalations grouped by session and reason, in the order
 /// their first item is pending. Items about the host (session `host`: a
-/// disk place, a mission's gate room, a task's host faults) and expired
-/// holds (each another hold, with its own waiting tasks) are each about
-/// something else, and keep a line each.
+/// disk place, a mission's gate room, a task's host faults), expired holds
+/// (each another hold, with its own waiting tasks) and an objective's
+/// close (each its own objective, task and base) are each about something
+/// else, and keep a line each.
 fn lines(pending: &[Escalation]) -> Vec<(Line<'_>, Vec<String>)> {
     let mut lines: Vec<(Line<'_>, Vec<String>)> = Vec::new();
     for item in pending {
@@ -99,6 +101,7 @@ fn lines(pending: &[Escalation]) -> Vec<(Line<'_>, Vec<String>)> {
             item.session_id != HOST_SESSION
                 && item.why != Why::HoldExpired
                 && item.why != Why::ObjectiveYielded
+                && item.why != Why::ObjectiveSolved
                 && item.why != Why::ObjectiveOrder
                 && line.first.session_id == item.session_id
                 && line.first.why == item.why
@@ -310,6 +313,52 @@ pub(crate) fn objective_yields(records: &[Value]) -> Vec<Escalation> {
                     "{mission}: {reason}. It is tried again after the other open objectives; \
                      nothing halts. Split the objective, sharpen its brief, or raise its budget \
                      if it keeps failing."
+                ),
+                since_ms: record["at_ms"].as_i64(),
+            })
+        })
+        .collect()
+}
+
+/// The digest items for `records`, the integrator's objectives closed solved
+/// on the base (`objective.solved`) that no delivered digest told yet
+/// (`PostgresStore::objective_solved_news`). Each is an item of session
+/// `missions`, id `objective-solved-<event id>`: the mission, the objective,
+/// the task it ended, and the record's own scenario and base — a reader
+/// knows an objective closed without opening the record, and that it ended
+/// solved rather than rejected.
+pub(crate) fn objective_solved(records: &[Value]) -> Vec<Escalation> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let id = record["event_id"].as_i64()?;
+            // The record's `id` is the mission it closes.
+            let mission = record["mission"]
+                .as_i64()
+                .or_else(|| record["id"].as_i64())
+                .unwrap_or_default();
+            let objective = record["objective"].as_i64()?;
+            let task = record["task"].as_i64()?;
+            let scenario = record["scenario"].as_str().map_or_else(
+                || "its scenario".to_string(),
+                |path| {
+                    path.rsplit('/')
+                        .next()
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or(path)
+                        .to_string()
+                },
+            );
+            let base = record["base"].as_str().unwrap_or_default();
+            let base: String = base.chars().take(7).collect();
+            Some(Escalation {
+                session_id: MISSIONS_SESSION.to_string(),
+                id: format!("objective-solved-{id}"),
+                why: Why::ObjectiveSolved,
+                line: format!(
+                    "mission #{mission} objective {objective}: task #{task} ended solved, not \
+                     rejected — {scenario} passes on the base at {base}, so the objective is \
+                     closed and no task for it is assigned again."
                 ),
                 since_ms: record["at_ms"].as_i64(),
             })
