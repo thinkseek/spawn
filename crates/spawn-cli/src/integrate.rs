@@ -1652,8 +1652,10 @@ struct Running {
     mission: i64,
     source: String,
     task: i64,
-    /// Whether this judging's gate gets the shared test server
-    /// ([`needs_test_database`]): only those count against `--gates`.
+    /// Whether this judging's gate gets the shared test server (it gets a
+    /// test database, [`needs_test_database`], and the gate's environment
+    /// names the shared server, [`gate::on_shared_server`], not a server of
+    /// its own): only those count against `--gates`.
     shares_server: bool,
     /// The scenarios its gate runs at once (SPAWN_GATE_JOBS as given), 0
     /// when the integrator does not share the cores ([`gate::Cpu`]).
@@ -1685,7 +1687,8 @@ fn withheld_without_test_database(name: &str) -> bool {
 }
 
 /// How many gates can run at once: one per source (`sources`: each gated
-/// mission's source and whether its gate gets the test server), those
+/// mission's source and whether its gate gets the shared test server, as
+/// [`Running::shares_server`] says), those
 /// whose gate gets the shared test server at most `gates` (`--gates`); at
 /// least 1. A source with both kinds counts as one that gets the server.
 pub(crate) fn gates_at_once(sources: impl Iterator<Item = (String, bool)>, gates: usize) -> usize {
@@ -2121,7 +2124,7 @@ impl Integrator {
                 continue;
             }
             let jobs = self.cpu.as_ref().map(|cpu| {
-                let shared = shares_server && gate::on_shared_server(&self.judge.gate_env);
+                let shared = shares_server;
                 cpu.jobs_for(shared, at_once)
             });
             if let (Some(cpu), Some(jobs)) = (&self.cpu, jobs) {
@@ -2192,8 +2195,8 @@ impl Integrator {
             );
         } else {
             println!(
-                "integrate: mission {mission_id}: judging task {task_id} (no test database: \
-                 beside the {running} of {} gates)",
+                "integrate: mission {mission_id}: judging task {task_id} (not on the shared \
+                 test server: beside the {running} of {} gates)",
                 self.gates
             );
         }
@@ -7857,7 +7860,7 @@ mod database_tests {
         }
     }
 
-    /// A cap of one is one gate at a time across missions, as before.
+    /// Gates with servers of their own run beside each other whatever the cap.
     #[test]
     fn gates_with_servers_of_their_own_are_not_held_by_the_cap() {
         // With SPAWN_GATE_PG_BIN every gate runs a PostgreSQL server of its
@@ -7893,6 +7896,7 @@ mod database_tests {
         integrator.settle();
     }
 
+    /// A cap of one is one gate at a time across missions, as before.
     #[test]
     fn a_cap_of_one_gates_one_mission_at_a_time() {
         let marks = fresh_marks("spawn-db-gate-cap");
