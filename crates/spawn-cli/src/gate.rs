@@ -1295,9 +1295,15 @@ fn no_room(file: &str) -> Option<Shortfall> {
     })
 }
 
+/// The evidence of a gate's host fault whose sandbox never started its
+/// command (`on` `sandbox`): bwrap failed before the command ran, so its
+/// status was no answer of the scenario's (scripts/rsi/gate.sh).
+pub(crate) const SANDBOX_NEVER_STARTED: &str = "sandbox_never_started";
+
 /// The host-fault fact of a verdict file: one JSON line with `host_fault`
-/// true, a scenario, where it failed (`base` or `candidate and base`), its
-/// runs and a reason, and no verdict. Its `log` is left empty.
+/// true, a scenario, where it failed (`base`, `candidate and base`, or
+/// `sandbox` with the evidence [`SANDBOX_NEVER_STARTED`]), its runs and a
+/// reason, and no verdict. Its `log` is left empty.
 fn host_fault(file: &str) -> Option<GateFailure> {
     let line = file.trim();
     if line.contains('\n') {
@@ -1309,7 +1315,14 @@ fn host_fault(file: &str) -> Option<GateFailure> {
     }
     let text = |name: &str| value.get(name)?.as_str().map(str::to_string);
     let scenario = text("scenario").filter(|scenario| !scenario.is_empty())?;
-    let on = text("on").filter(|on| on == "base" || on == "candidate and base")?;
+    // `sandbox`: a sandbox that never started its command (gate.sh "A
+    // sandbox that never started its command"), believed only with its
+    // evidence.
+    let on = text("on").filter(|on| {
+        on == "base"
+            || on == "candidate and base"
+            || (on == "sandbox" && text("evidence").as_deref() == Some(SANDBOX_NEVER_STARTED))
+    })?;
     Some(GateFailure::HostFault {
         scenario,
         on,
@@ -2321,6 +2334,33 @@ mod tests {
             gate.judge(&path_only()),
             Err(GateFailure::HostFault { on, .. }) if on == "candidate and base"
         ));
+    }
+
+    /// A sandbox that never started its command (gate.sh): `on` `sandbox`,
+    /// believed with its evidence and only with it.
+    #[test]
+    fn a_sandbox_that_never_started_is_a_host_fault_with_its_evidence() {
+        let fact = HOST_FAULT_FACT
+            .replace("\"on\":\"base\"", "\"on\":\"sandbox\"")
+            .replace("\"runs\":\"1, then 0\"", "\"runs\":\"never started\"")
+            .replace('}', ",\"evidence\":\"sandbox_never_started\"}");
+        let gate = FakeGate::new(&format!("echo '{fact}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"));
+        assert!(matches!(
+            gate.judge(&path_only()),
+            Err(GateFailure::HostFault { on, runs, .. }) if on == "sandbox" && runs == "never started"
+        ));
+        for wrong in [
+            fact.replace(",\"evidence\":\"sandbox_never_started\"", ""),
+            fact.replace("sandbox_never_started", "gate"),
+        ] {
+            let gate = FakeGate::new(&format!(
+                "echo '{wrong}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
+            ));
+            assert!(
+                matches!(gate.judge(&path_only()), Err(GateFailure::Aborted { .. })),
+                "{wrong}"
+            );
+        }
     }
 
     #[test]
