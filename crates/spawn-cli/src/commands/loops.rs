@@ -70,6 +70,12 @@ fn pause_unless_stopped(pause: Duration, stop: &AtomicBool) -> bool {
 /// restarts it with fresh connections (the store does not reconnect).
 const MAX_FAILURES: u32 = 10;
 
+/// What a watcher that must not fail a pass reports: its lines, or the error
+/// as a warning named `what`.
+fn watched(what: &str, result: Result<Vec<String>, String>) -> Result<Vec<String>, String> {
+    Ok(result.unwrap_or_else(|error| vec![format!("{what}: {error}")]))
+}
+
 /// Run the Bridge, the Observer, the disk watch, the dispatcher and the
 /// liveness rule, until SIGTERM or SIGINT ends it after its pass.
 ///
