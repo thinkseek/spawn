@@ -1157,6 +1157,42 @@ refuse "and no host-fault fact is written" "$(cat "$integrator/verdict" 2>/dev/n
 expect "the base's disagreement is said as 033 says it" "$(cat "$work/gate.out")" \
     '012.sh exited 1, then 0 on the base: a harness error, not a verdict; the gate aborts'
 expect "the flake is named" "$(cat "$work/gate.out")" 'exited 1, then 0 on the base'
+
+# A scenario the host cannot judge here says so with exit 6 (029: no systemd
+# user manager in the sandbox) and its own fact: a fact about the host, never
+# a verdict (the host-fault fact's exit, the other key). On the base it is
+# cached as `cannot_judge`, one run (the host's answer does not change); on
+# the candidate a regression is skipped, and the task scenario makes the gate
+# state the fact (exit 6, no verdict) rather than reject.
+unjudgeable=$work/unjudgeable
+mkdir -p "$unjudgeable"
+printf 'judge/\n' >"$unjudgeable/protected"
+cat >"$unjudgeable/010.sh" <<'JUDGE'
+#!/bin/sh
+echo "010: cannot be judged here: no systemd user manager is reachable" >&2
+exit 6
+JUDGE
+expect "a regression that cannot be judged here is skipped" \
+    "$(judge "$good" "" "$unjudgeable")" 'exit=0 {"verdict":"accepted"}'
+expect "and says so, not a regression" "$(cat "$work/gate.out")" \
+    '| 010.sh cannot be judged here: not a regression'
+expect "the base records the fact" "$(cat "$work/gate.out")" '| == base: 010.sh: cannot_judge'
+judge "$good" "" "$unjudgeable" >/dev/null
+expect "the fact is cached: one run on the base" "$(from_cache)" '010.sh'
+expect "and kept as cannot_judge" "$(grep -l '^cannot_judge$' "$cache"/* | wc -l)" '1'
+unjudged_task=$work/unjudged-task
+mkdir -p "$unjudged_task"
+printf 'judge/\n' >"$unjudged_task/protected"
+cat >"$unjudged_task/012.sh" <<'JUDGE'
+#!/bin/sh
+echo "012: cannot be judged here: no systemd user manager is reachable" >&2
+exit 6
+JUDGE
+expect "a task scenario that cannot be judged here is no verdict" \
+    "$(judge "$good" "$unjudged_task/012.sh" "$unjudged_task")" 'exit=6 '
+expect "the gate states the fact" "$(cat "$integrator/verdict")" \
+    '{"cannot_judge":true,"scenario":"012.sh","runs":"6"'
+refuse "never a verdict" "$(cat "$integrator/verdict")" 'verdict'
 unset SPAWN_TEST_DATABASE_URL
 
 # 10. The URL parser the gate and the checks share (scripts/pg-url.sh):
@@ -1672,5 +1708,43 @@ if command -v docker >/dev/null 2>&1 && docker image inspect "$pg_image" >/dev/n
 else
     echo "skip the gate's own test server from a docker image: docker has no image $pg_image (TEST_GATE_PG_IMAGE)"
 fi
+
+# 19. The gate passes a tree's deps store into the sandbox: SUPPLY_PA_DEPS,
+# which a project's build hook and scenarios read, from the integrator's own
+# environment (the sandbox clears it). Unset, the sandbox has none — the
+# check below then fails on the candidate and on the base, which is how
+# the case knows the value came through; a check failing on both is the
+# host's, no verdict (exit 6, "Checks run twice"), never a rejection.
+deps_scenarios=$work/supply-pa-deps-scenarios
+mkdir -p "$deps_scenarios"
+cp "$scenarios/protected" "$scenarios/build" "$deps_scenarios/"
+# The store sits where the scenarios are, which the gate binds read-only (a
+# project binds its own): so the check below can see the path it was given.
+store=$deps_scenarios/store
+mkdir -p "$store/node_modules"
+printf '%s\n' "$store" >"$deps_scenarios/expected-deps"
+cat >"$deps_scenarios/check-supply-deps.sh" <<'CHECK'
+#!/bin/sh
+# The store the integrator named reached the sandbox, and nothing else of the
+# integrator's: the environment is cleared.
+expected=$(cat "$(dirname "$0")/expected-deps")
+[ "${SUPPLY_PA_DEPS-}" = "$expected" ] || {
+    echo "SUPPLY_PA_DEPS is ${SUPPLY_PA_DEPS-<unset>}, not $expected"
+    exit 1
+}
+[ -z "${SPAWN_DATABASE_URL-}" ] || {
+    echo "the integrator's SPAWN_DATABASE_URL reached the sandbox"
+    exit 1
+}
+[ -d "$SUPPLY_PA_DEPS" ] && echo "the store is visible through the path"
+exit 0
+CHECK
+expect "the gate passes SUPPLY_PA_DEPS into the sandbox" \
+    "$(export SUPPLY_PA_DEPS="$store"; judge "$good" "" "$deps_scenarios")" 'exit=0 {"verdict":"accepted"}'
+expect "and the sandbox shows its path" "$(cat "$work/gate.out")" 'the store is visible through the path'
+expect "unset, the sandbox has none: the check fails and the gate states no verdict" \
+    "$(unset SUPPLY_PA_DEPS; judge "$good" "" "$deps_scenarios")" \
+    'exit=6 {"host_fault":true,"scenario":"check-supply-deps.sh'
+expect "and says what the sandbox saw" "$(cat "$work/gate.out")" 'SUPPLY_PA_DEPS is <unset>'
 
 echo "gate: all cases pass"

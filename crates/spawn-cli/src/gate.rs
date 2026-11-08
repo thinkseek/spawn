@@ -32,6 +32,15 @@
 //! verdict file the sandbox never sees, and only with that exit; exit 6
 //! without it is an abort.
 //!
+//! **A scenario the host cannot judge is no verdict either.** A scenario may
+//! need something the sandbox never has (029 needs a systemd user manager),
+//! and says so by exiting [`HOST_FAULT_EXIT`] with its own fact
+//! (`{"cannot_judge":true,"scenario","runs"}`): the same exit, and the fact's
+//! key says which it is ([`GateFailure::CannotJudge`]). The integrator
+//! records `host_fault` with the evidence `cannot_judge`: never a rejection,
+//! never an abort, counted toward no halt, and the objective is judged
+//! outside the gate, by the owner. Exit 6 with neither fact is an abort.
+//!
 //! **The host's room is measured before a gate, not learned from its
 //! crash.** Before it starts a gate, the integrator checks the host
 //! ([`Room::check`]), in this order, stopping at the first that falls short:
@@ -99,6 +108,11 @@ pub(crate) const GATE_ENV: &[&str] = &[
     "SPAWN_GATE_JOBS",
     "SPAWN_GATE_PG_IMAGE",
     "SPAWN_GATE_PG_BIN",
+    // A tree's deps store (Supply PA's `gate/scenarios/build`, `bind` and
+    // `owner-deps.mjs`): a path the owner installs, never the owner's
+    // checkout. Without it those scripts use the store's default under
+    // $HOME; the gate forwards it into its sandbox (`scripts/rsi/gate.sh`).
+    "SUPPLY_PA_DEPS",
 ];
 
 /// The gate's exit status when TMPDIR has no room to judge now
@@ -714,6 +728,11 @@ pub(crate) enum GateFailure {
         reason: String,
         log: String,
     },
+    /// The host cannot judge the objective's scenario at all (029's systemd
+    /// user scopes): the task scenario exited [`HOST_FAULT_EXIT`] with its
+    /// `cannot_judge` fact, the scenario's file name. A fact about the host,
+    /// not the work.
+    CannotJudge { scenario: String, log: String },
     /// The base disagreed with itself: one of its scenarios exited 1 and then
     /// 0, before any candidate code ran (exit [`BASE_DISAGREES_EXIT`] and the
     /// gate's own pair of lines). A fact about the host, not the work.
@@ -1128,6 +1147,14 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
             log: record(&run.stdout),
         });
     }
+    if run.status.code() == Some(HOST_FAULT_EXIT)
+        && let Some(scenario) = verdict.and_then(cannot_judge)
+    {
+        return Err(GateFailure::CannotJudge {
+            scenario,
+            log: record(&run.stdout),
+        });
+    }
     if !run.status.success() {
         return Err(aborted(format!("the gate ended with {}", run.status)));
     }
@@ -1225,6 +1252,23 @@ fn host_fault(file: &str) -> Option<GateFailure> {
         reason: text("reason").unwrap_or_default(),
         log: String::new(),
     })
+}
+
+/// The cannot-judge fact of a verdict file: one JSON line with
+/// `cannot_judge` true, a scenario, and no verdict. Exit 6 is the host-fault
+/// exit too ([`host_fault`] above); the fact's key says which one this is.
+fn cannot_judge(file: &str) -> Option<String> {
+    let line = file.trim();
+    if line.contains('\n') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("cannot_judge")?.as_bool() != Some(true) || value.get("verdict").is_some() {
+        return None;
+    }
+    let scenario = value.get("scenario")?.as_str()?;
+    (!scenario.is_empty() && !scenario.contains(|c: char| c.is_whitespace() || c == '|'))
+        .then(|| scenario.to_string())
 }
 
 fn failed(error: &std::io::Error) -> GateFailure {
@@ -2204,6 +2248,67 @@ mod tests {
         }
     }
 
+    /// The gate's fact of a scenario the host cannot judge (scripts/rsi/
+    /// gate.sh `cannot_judge`): the same exit 6, the other key.
+    const CANNOT_JUDGE_FACT: &str =
+        "{\"cannot_judge\":true,\"scenario\":\"029.sh\",\"runs\":\"6\"}";
+
+    #[test]
+    fn exit_6_with_the_cannot_judge_fact_is_no_verdict() {
+        let gate = FakeGate::new(&format!(
+            "echo \"gate: cannot judge this objective's scenario here (029.sh); not a verdict\" \
+             >&2\n\
+             echo '{CANNOT_JUDGE_FACT}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
+        ));
+        let Err(GateFailure::CannotJudge { scenario, log }) = gate.judge(&path_only()) else {
+            panic!("cannot judge is its own outcome");
+        };
+        assert_eq!(scenario, "029.sh");
+        assert!(
+            log.contains("! gate: cannot judge this objective's scenario here (029.sh)"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn the_cannot_judge_fact_counts_only_whole_and_with_exit_6() {
+        // Another status, the fact on stdout only, a fact that names no
+        // scenario or one that could not be a file name, the flag false, or
+        // a verdict too: an abort. (A `host_fault` fact stays a host fault:
+        // it is the batch's, classified first.)
+        let cases = [
+            format!("echo '{CANNOT_JUDGE_FACT}' >\"$SPAWN_GATE_VERDICT\"\nexit 0\n"),
+            format!("echo '{CANNOT_JUDGE_FACT}' >\"$SPAWN_GATE_VERDICT\"\nexit 4\n"),
+            format!("echo '{CANNOT_JUDGE_FACT}'\nexit 6\n"),
+            "exit 6\n".to_string(),
+            format!(
+                "echo '{}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n",
+                CANNOT_JUDGE_FACT.replace("\"scenario\":\"029.sh\"", "\"scenario\":\"\"")
+            ),
+            format!(
+                "echo '{}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n",
+                CANNOT_JUDGE_FACT.replace("\"029.sh\"", "\"029 sh\"")
+            ),
+            format!(
+                "echo '{}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n",
+                CANNOT_JUDGE_FACT.replace(":true", ":false")
+            ),
+            format!(
+                "echo '{}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n",
+                CANNOT_JUDGE_FACT.replace('{', "{\"verdict\":\"accepted\",")
+            ),
+        ];
+        for script in cases {
+            assert!(
+                matches!(
+                    FakeGate::new(&script).judge(&path_only()),
+                    Err(GateFailure::Aborted { .. })
+                ),
+                "{script}"
+            );
+        }
+    }
+
     #[test]
     fn the_file_outranks_stdout() {
         let gate = FakeGate::new(
@@ -2252,6 +2357,9 @@ mod tests {
             "SPAWN_GATE_JOBS" => Some("4".into()),
             "SPAWN_GATE_PG_IMAGE" => Some("postgres:16-alpine".into()),
             "SPAWN_GATE_PG_BIN" => Some("/usr/lib/postgresql/16/bin".into()),
+            "SUPPLY_PA_DEPS" => {
+                Some("/home/o/.local/share/spawn-rsi/deps/supply-pa/current".into())
+            }
             "SPAWN_DATABASE_URL" => Some("postgres://o:p@127.0.0.1:15433/spawn".into()),
             "SPAWN_JUDGE_URL" | "http_proxy" | "SSH_AUTH_SOCK" => Some("secret".into()),
             _ => None,
@@ -2271,7 +2379,8 @@ mod tests {
                 "SPAWN_GATE_MIN_FREE_GB",
                 "SPAWN_GATE_JOBS",
                 "SPAWN_GATE_PG_IMAGE",
-                "SPAWN_GATE_PG_BIN"
+                "SPAWN_GATE_PG_BIN",
+                "SUPPLY_PA_DEPS"
             ]
         );
         let unset = |name: &str| (name == "PATH").then(|| "/usr/bin".to_string());
