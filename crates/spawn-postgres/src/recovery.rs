@@ -80,6 +80,10 @@ select exists (
 ///   `session.native_started` names, which a resume resumes.
 /// - `turns`: every `turn.failed` of the execution, oldest first, with the
 ///   engine's `status`, `error` tag (`kind`) and `text`, by event id.
+/// - `failed_tools`: every `tool.failed` of the execution, oldest first,
+///   with the engine's error `text`, by event id: a full disk is told here
+///   (Claude Code's ENOSPC message) and nowhere else while the engine
+///   waits at its prompt.
 /// - `progress`: the execution's latest `tool.started`, `tool.completed` or
 ///   `turn.stopped` — the event id and its time; `0` when it made no
 ///   progress at all. A model answer after a failed turn is a progress event
