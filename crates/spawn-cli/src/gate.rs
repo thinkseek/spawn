@@ -1491,7 +1491,7 @@ mod tests {
 =======
         BaseDisagrees, GateFailure, PrivateDirectory, Run, Scope,
         gate_env, judge, judge_in, memory_limit, run_bounded, withhold_owners_cluster,
->>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
+>>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
     };
     use spawn_core::envelope::{Envelope, Limits, Manager, ScopeFacts, Settings};
     use std::path::{Path, PathBuf};
@@ -1799,7 +1799,7 @@ mod tests {
             ..ScopeFacts::default()
         };
         assert!(memory_limit(&scope(), &counted, None, &killed).is_some());
->>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
+>>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
     }
 
     fn shell(script: &str) -> Command {

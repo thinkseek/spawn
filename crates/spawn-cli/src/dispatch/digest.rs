@@ -190,7 +190,7 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                     record["memory_max"].as_u64().unwrap_or_default(),
                     record["oom_kills"].as_u64().unwrap_or_default()
                 )
->>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
+>>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
             } else if crash.is_empty() {
                 let failures = record["failures"].as_array().map_or(0, Vec::len);
                 format!(
@@ -230,7 +230,7 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                      counted and nothing halts. Check the host's memory and swap (the \
                      executor's envelope) or the test database's host (its memory, /dev/shm, \
                      its log), or tell the owner."
->>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
+>>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
                 ),
                 since_ms: record["at_ms"].as_i64(),
             })

@@ -228,7 +228,7 @@ pub trait LaunchEnvironment: Send + Sync + std::fmt::Debug {
     /// ([`HostRecords`], the owner-only `spawn_host_record`). Needed only
     /// with an [`Self::envelope`].
     pub records: Option<Arc<dyn HostRecords>>,
->>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
+>>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
 }
 
 impl BridgeConfig {
@@ -254,7 +254,7 @@ impl BridgeConfig {
 =======
             envelope: None,
             records: None,
->>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
+>>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
         }
     }
 }
