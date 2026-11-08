@@ -676,6 +676,19 @@ impl Fleet<'_> {
         }
     }
 
+
+    fn debug(line: &str) {
+        if std::env::var("SPAWN_RECOVER_DEBUG").is_ok() {
+            use std::io::Write as _;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/t203/recover-debug.log")
+            {
+                let _ = writeln!(file, "{line}");
+            }
+        }
+    }
     /// The recovery's step: record every interruption once, with its cause
     /// and its evidence, and take the one way back that cause has. The
     /// dispatcher's one-resume rule and the liveness rule's revival give way
@@ -698,15 +711,14 @@ impl Fleet<'_> {
         // wait's probe, and an outage the failed passes left, force it
         // regardless.
         let pending_outage = self.recovery.outage_pending();
-        if std::env::var("SPAWN_RECOVER_DEBUG").is_ok() {
-            eprintln!(
-                "DEBUG recovery check: mark={:?} watermark={watermark} due={:?} now={now} outage={pending_outage}",
-                self.schedule.recovery.mark(), self.schedule.recovery.due_debug()
-            );
-        }
         if !self.schedule.recovery.runs(watermark, now) && !pending_outage {
             return;
         }
+        Self::debug(&format!(
+            "check mark={:?} watermark={watermark} due={:?} now={now} outage={pending_outage}",
+            self.schedule.recovery.mark(),
+            self.schedule.recovery.due_debug()
+        ));
         let forced = self.schedule.recovery.clock_due(now) || pending_outage;
         let signals = if forced {
             true
@@ -734,11 +746,13 @@ impl Fleet<'_> {
                     };
                     match crate::recover::step(&mut self.recovery, &world) {
                         Ok(more) => {
-                            if std::env::var("SPAWN_RECOVER_DEBUG").is_ok() {
-                                eprintln!(
-                                    "DEBUG recovery: ran at {now}, probing {}", self.recovery.probing()
-                                );
-                            }
+                            Self::debug(&format!(
+                                "ran now={now} probing={} due={:?}",
+                                self.recovery.probing(),
+                                self.recovery
+                                    .probing()
+                                    .then(|| now.saturating_add(self.config.probe))
+                            ));
                             lines.extend(more);
                             // An open wait is re-read every probe (the
                             // credentials file, the free space, a retry's
