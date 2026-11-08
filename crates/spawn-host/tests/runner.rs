@@ -215,72 +215,34 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
 
     // A dead pane kept by remain-on-exit: the runner exited (3) and the
     // session stays. The runner lives a moment before it exits: a pane whose
-    // process is gone before the server has taken the pane up can die with no
-    // status recorded ("exit status none" for good: 1 of 8 runs on a host at
-    // load 14 with the fleet's own gates running, 2026-11-08), and the point
-    // here is the status a dead pane keeps, not how fast a process can exit.
+    // process is gone the instant the server takes it up can die with no
+    // status recorded, and what this case is about is the status a dead pane
+    // keeps, not how fast a process can exit.
     server.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
-    host.start(&launch(
-        "/bin/sh",
-        &["-c", "sleep 1; exit 3"],
-        &[("A", "1")],
-    ))
-    .expect("start");
-    // tmux marks the pane dead when its terminal closes, and records the
-    // exit status when it reaps the process, a moment later on a loaded host
-    // ("exit status none" in between: an owner gate, 2026-11-07; and a gate
-    // running 34 test binaries two at a time starved the server past five
-    // seconds, 2026-11-08). Wait for the status, with room for a loaded host
-    // and a read rarely enough not to add to the load; a server that never
-    // records it still fails the assertion below.
-    let dump = |label: &str| {
-        let panes = Command::new("tmux")
-            .args([
-                "-L",
-                &server.socket,
-                "-f",
-                "/dev/null",
-                "list-panes",
-                "-a",
-                "-F",
-                "#{session_name}|#{pane_dead}|#{pane_dead_status}|#{pane_current_command}|#{pane_pid}",
-            ])
-            .output()
-            .expect("tmux is installed");
-        eprintln!(
-            "DIAG {label}: {:?}",
-            String::from_utf8_lossy(&panes.stdout)
-        );
-    };
-    dump("after start");
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let mut rounds = 0_u32;
-    let seen = loop {
-        let Runner::Untracked(seen) = settled(&host, Duration::from_secs(5)) else {
-            panic!("a dead pane hosts no runner");
-        };
-        if !seen.contains("exit status none") || Instant::now() > deadline {
-            break seen;
+    // tmux marks the pane dead when its terminal closes and records the exit
+    // status when it reaps the process, a moment later ("exit status none" in
+    // between: an owner gate, 2026-11-07; a gate running 34 test binaries two
+    // at a time starved the server past five seconds, 2026-11-08). A starved
+    // server sometimes marks the pane dead and never fills the status in at
+    // all (measured on 2026-11-08 under twelve busy loops on ten cores:
+    // `pane_dead=1` with an empty `pane_dead_status` for two minutes, the
+    // pane's process reaped without one). That is the server losing the
+    // status, not this host reading another's, so the step is started again
+    // when the status does not come; what is asserted — a dead pane kept by
+    // the option names its runner's exit status — is unchanged.
+    let mut seen = String::new();
+    for _start in 1..=START_ATTEMPTS {
+        host.start(&launch(
+            "/bin/sh",
+            &["-c", "sleep 1; exit 3"],
+            &[("A", "1")],
+        ))
+        .expect("start");
+        seen = wait_for_status(&host, WAIT_STATUS);
+        if seen.contains("dead (exit status 3)") {
+            break;
         }
-        rounds += 1;
-        if rounds % 8 == 1 {
-            dump(&format!("round {rounds}"));
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    };
-    if !seen.contains("dead (exit status 3)") {
-        let panes = Command::new("tmux")
-            .args(["-L", &server.socket, "-f", "/dev/null", "list-panes", "-a", "-F",
-                   "#{session_name}|#{pane_dead}|#{pane_dead_status}|#{pane_current_command}|#{pane_pid}|#{pane_start_command}"])
-            .output()
-            .expect("tmux is installed");
-        eprintln!("DIAG panes: {}", String::from_utf8_lossy(&panes.stdout));
-        eprintln!("DIAG seen: {seen}");
-        let dead = Command::new("tmux")
-            .args(["-L", &server.socket, "-f", "/dev/null", "show-options", "-g", "remain-on-exit"])
-            .output()
-            .expect("tmux");
-        eprintln!("DIAG option: {}", String::from_utf8_lossy(&dead.stdout));
+        host.terminate(&terminal(), &workspace()).expect("kill");
     }
     assert!(seen.contains("dead (exit status 3)"), "{seen}");
     assert!(host.is_alive(&terminal(), &workspace()).expect("alive"));
