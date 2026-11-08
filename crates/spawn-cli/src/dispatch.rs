@@ -631,6 +631,20 @@ fn load_stalls(store: &PostgresStore) -> Result<stall::Stalls, String> {
         .map_err(|error| format!("stall facts: {error}"))
 }
 
+/// The records one read of the escalation lists returns, as their item
+/// builders take them; a read that fails fails the pass, as [`read_plan`]
+/// always did.
+fn records(
+    read: Result<serde_json::Value, spawn_core::port::StoreError>,
+    what: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    Ok(read
+        .map_err(|error| format!("{what}: {error}"))?
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
+}
+
 fn now_ms() -> i64 {
     spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
 }
