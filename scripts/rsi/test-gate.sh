@@ -531,7 +531,12 @@ esac
 
 # 3d'. A socket directory the scan found and that then goes away (a host
 # process's temporary directory) does not break the sandbox: the gate does
-# not mount over it, and the verdict is the candidate's.
+# not mount over it, and the verdict is the candidate's. Deterministic: the
+# gate is held (SPAWN_GATE_TEST_HOLD) after its build hook's sandbox checked
+# the mask and before bwrap mounts it (the build is where this was a false
+# "does not build"), the directory goes in that window, and
+# the sandbox, whose bwrap names the path now gone, is started once more
+# without it — and says so.
 vanish=$(mktemp -d "$work/vanish.XXXXXX")
 python3 -c '
 import socket, sys, time
@@ -541,18 +546,60 @@ vanish_listener=$!
 background="$background $vanish_listener"
 while [ ! -S "$vanish/service.sock" ]; do sleep 0.1; done
 rm -f "$work/gate.out"
+hold=$work/sandbox-hold
+: >"$hold"
 (
-    until grep -q 'sockets hidden from the sandbox' "$work/gate.out" 2>/dev/null; do sleep 0.05; done
+    held=0
+    until [ -e "$hold.held" ] || [ "$held" -ge 600 ]; do sleep 0.05; held=$((held + 1)); done
     kill "$vanish_listener"
     rm -rf "$vanish"
+    rm -f "$hold"
 ) &
 vanish_watcher=$!
 expect "a hidden socket directory that goes away mid-gate changes no verdict" "$(
+    export SPAWN_GATE_TEST_HOLD="$hold"
     unset TMPDIR
     judge "$good"
 )" 'exit=0 {"verdict":"accepted"}'
 kill "$vanish_watcher" 2>/dev/null || true
-[ ! -e "$vanish" ] || echo "note: $vanish was not under a scanned directory (TMPDIR covers it)"
+if [ -e "$hold.held" ]; then
+    expect "the sandbox it broke was started again, and said so" "$(cat "$work/gate.out")" \
+        "| sandbox: $vanish went away between the mask check and bwrap's mount"
+    rm -f "$hold.held"
+    # Any other bwrap failure stays a failure: here the masked path is
+    # still there, as a file where the directory was, so bwrap fails on it
+    # and the gate does not start the sandbox again.
+    vanish=$(mktemp -d "$work/vanish.XXXXXX")
+    python3 -c '
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen()
+time.sleep(900)' "$vanish/service.sock" &
+    vanish_listener=$!
+    background="$background $vanish_listener"
+    while [ ! -S "$vanish/service.sock" ]; do sleep 0.1; done
+    : >"$hold"
+    (
+        held=0
+        until [ -e "$hold.held" ] || [ "$held" -ge 600 ]; do sleep 0.05; held=$((held + 1)); done
+        kill "$vanish_listener"
+        rm -rf "$vanish"
+        : >"$vanish"
+        rm -f "$hold"
+    ) &
+    vanish_watcher=$!
+    replaced=$(
+        export SPAWN_GATE_TEST_HOLD="$hold"
+        unset TMPDIR
+        judge "$good"
+    )
+    wait "$vanish_watcher" 2>/dev/null || true
+    refuse "a mask path still there (a file now) is no race: no second start" \
+        "$(cat "$work/gate.out")" "started again without it"
+    refuse "and the gate does not pass it off as accepted" "$replaced" 'exit=0 {"verdict":"accepted"}'
+    rm -f "$vanish" "$hold.held"
+else
+    echo "note: $vanish was not under a scanned directory (TMPDIR covers it): no mask, no hold"
+fi
 
 # 3e. A TCP test database URL works inside, through the gate's forwarder,
 # for 127.0.0.1, localhost and [::1] (when the host has it): the sandbox

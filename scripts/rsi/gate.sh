@@ -178,6 +178,11 @@
 #                              A seam for the tests, which cannot wait 30
 #                              minutes: spawn integrate does not pass it, and
 #                              an owner who sets it is changing the bound
+#   SPAWN_GATE_TEST_HOLD       the suite's seam: while this file exists, the
+#                              build hook's first sandbox with socket masks
+#                              waits between its mask check and bwrap (it creates
+#                              <file>.held first); spawn integrate never
+#                              passes it
 #   SPAWN_GATE_PG_IMAGE        the test server's docker image: the gate runs a
 #                              server of its own from it (GitHub issue #6),
 #                              and SPAWN_TEST_DATABASE_URL is not used
@@ -343,6 +348,11 @@ gate_times() {
         "$(printf '%s' "${from_cache-}" | wc -w | tr -d ' ') results from the cache)," \
         "candidate $((candidate_ms / 1000)) s, setup $(((total_ms - base_ms - candidate_ms) / 1000)) s" \
         "(exports, socket scan, static checks), total $((total_ms / 1000)) s"
+    # A sandbox started again after a masked path went away (`sandbox`):
+    # said in the gate's own output whatever the command's log shows.
+    if [ -s "${work-}/sandbox-retries" ]; then
+        sed 's/^/| /' "$work/sandbox-retries"
+    fi
 }
 # section <name>: a gate stage starts (and the one before it ends as ok).
 section() {
@@ -942,11 +952,12 @@ socket_masks=""
 # gate. What the tests write there took the host's memory besides. The
 # directory is removed when the command ends, and with $work at the gate's
 # exit.
-sandbox() {
+sandbox_once() {
     tree=$1
     shift
     count=$#
     sandbox_tmp=$(mktemp -d "$work/sandbox-tmp.XXXXXX")
+    sandbox_masked=""
     set -- "$@" bwrap --ro-bind / / --dev /dev --proc /proc --bind "$sandbox_tmp" /tmp --tmpfs /run \
         --unshare-pid --unshare-net --die-with-parent --new-session
     if [ -d /var/run ] && [ ! -L /var/run ]; then set -- "$@" --tmpfs /var/run; fi
@@ -1003,10 +1014,18 @@ sandbox() {
     for mask in $socket_masks; do
         case "$mask" in
         "directory "*)
-            [ -d "${mask#directory }" ] && set -- "$@" --tmpfs "${mask#directory }"
+            if [ -d "${mask#directory }" ]; then
+                set -- "$@" --tmpfs "${mask#directory }"
+                sandbox_masked="$sandbox_masked${mask#directory }
+"
+            fi
             ;;
         "file "*)
-            [ -e "${mask#file }" ] && set -- "$@" --ro-bind /dev/null "${mask#file }"
+            if [ -e "${mask#file }" ]; then
+                set -- "$@" --ro-bind /dev/null "${mask#file }"
+                sandbox_masked="$sandbox_masked${mask#file }
+"
+            fi
             ;;
         esac
     done
@@ -1024,6 +1043,12 @@ sandbox() {
     done
     [ -n "$sandbox_db_url" ] && set -- "$@" --args 9
     set -- "$@" --chdir "$tree" --
+    # Inside, before the command: one byte on fd 4 says it started (bwrap's
+    # setup is done), and the caller's stderr comes back from fd 3, so the
+    # command writes where it always did and bwrap's own messages stay apart
+    # (see `sandbox` below). The command sees neither descriptor.
+    # shellcheck disable=SC2016 # expanded inside the sandbox
+    set -- "$@" sh -c 'printf s >&4; exec 4>&- 2>&3 3>&-; exec "$@"' sandbox-start
     # The command was given first: move it after the options.
     while [ "$count" -gt 0 ]; do
         set -- "$@" "$1"
@@ -1031,14 +1056,72 @@ sandbox() {
         count=$((count - 1))
     done
     sandbox_status=0
-    if [ -n "$sandbox_db_url" ]; then
-        "$@" </dev/null 9<"$work/sandbox-db-args" || sandbox_status=$?
-    else
-        "$@" </dev/null || sandbox_status=$?
+    sandbox_started=""
+    sandbox_said=""
+    : >"$sandbox_tmp.started"
+    # The suite's seam (SPAWN_GATE_TEST_HOLD): the build hook's first
+    # sandbox with masks waits here, between the check above and bwrap's
+    # mount, until the suite has removed what it wanted gone.
+    if [ -n "${SPAWN_GATE_TEST_HOLD-}" ] && [ -e "$SPAWN_GATE_TEST_HOLD" ] &&
+        [ -n "$sandbox_masked" ] && [ -n "${sandbox_hold_here-}" ]; then
+        : >"$SPAWN_GATE_TEST_HOLD.held"
+        sandbox_held=0
+        while [ -e "$SPAWN_GATE_TEST_HOLD" ] && [ "$sandbox_held" -lt 600 ]; do
+            sleep 0.1
+            sandbox_held=$((sandbox_held + 1))
+        done
     fi
+    if [ -n "$sandbox_db_url" ]; then
+        "$@" </dev/null 9<"$work/sandbox-db-args" 3>&2 2>"$sandbox_tmp.bwrap" 4>"$sandbox_tmp.started" ||
+            sandbox_status=$?
+    else
+        "$@" </dev/null 3>&2 2>"$sandbox_tmp.bwrap" 4>"$sandbox_tmp.started" || sandbox_status=$?
+    fi
+    [ ! -s "$sandbox_tmp.started" ] || sandbox_started=1
+    if [ -s "$sandbox_tmp.bwrap" ]; then
+        sandbox_said=$(cat "$sandbox_tmp.bwrap")
+        # Nothing bwrap said is lost: the caller's stderr gets it, as before.
+        cat "$sandbox_tmp.bwrap" >&2
+    fi
+    rm -f "$sandbox_tmp.started" "$sandbox_tmp.bwrap"
     chmod -R u+w "$sandbox_tmp" 2>/dev/null || true
     rm -rf "$sandbox_tmp"
     return "$sandbox_status"
+}
+
+# sandbox <tree> <command...>: `sandbox_once`, started once more when the
+# first one never ran the command because a path it was to mask went away
+# between the check and bwrap's mount (a host process's temporary socket
+# directory, removed in those milliseconds): bwrap's own message names that
+# path, and the path is gone now. Only then: any other failure of bwrap's,
+# or of the command, is the result as it is. The second start checks the
+# masks again, so it skips the path that went away. The retry is said on
+# stderr (the command's log) and in the gate's own output (`gate_times`),
+# so a host race is never silent, nor a verdict on the candidate.
+sandbox() {
+    sandbox_rc=0
+    sandbox_once "$@" || sandbox_rc=$?
+    [ "$sandbox_rc" -ne 0 ] && [ -z "$sandbox_started" ] || return "$sandbox_rc"
+    sandbox_gone=""
+    sandbox_ifs=$IFS
+    IFS='
+'
+    for sandbox_path in $sandbox_masked; do
+        case "$sandbox_said" in
+        *"$sandbox_path"*)
+            if [ ! -e "$sandbox_path" ] && [ ! -L "$sandbox_path" ]; then
+                sandbox_gone=$sandbox_path
+                break
+            fi
+            ;;
+        esac
+    done
+    IFS=$sandbox_ifs
+    [ -n "$sandbox_gone" ] || return "$sandbox_rc"
+    sandbox_line="sandbox: $sandbox_gone went away between the mask check and bwrap's mount (bwrap: $(printf '%s\n' "$sandbox_said" | head -n 1)); started again without it"
+    echo "$sandbox_line" >&2
+    printf '%s\n' "$sandbox_line" >>"$work/sandbox-retries" 2>/dev/null || :
+    sandbox_once "$@"
 }
 
 extract() {
@@ -1094,7 +1177,13 @@ done <"$work/sockets"
 # 0 = built (or nothing to build), 2 = did not build.
 build() {
     [ -f "$scenarios/build" ] || return 0
-    sandbox "$1" sh "$scenarios/build" >"$work/build.log" 2>&1 || {
+    # The suite's seam (SPAWN_GATE_TEST_HOLD) holds this sandbox: the build
+    # is where a vanished mask was a false "does not build".
+    sandbox_hold_here=1
+    build_status=0
+    sandbox "$1" sh "$scenarios/build" >"$work/build.log" 2>&1 || build_status=$?
+    sandbox_hold_here=""
+    [ "$build_status" -eq 0 ] || {
         sed 's/^/| build: /' "$work/build.log" | tail -n 30
         return 2
     }
