@@ -505,6 +505,22 @@ pub trait TerminalHost: Send + Sync {
         })
     }
 
+    /// [`Self::runner`] for a whole fleet in one call, in the order given: a
+    /// host that can ask its terminal server once for every pane does, so a
+    /// pass over a fleet costs one call and not one per terminal. Each
+    /// terminal not there is [`Runner::Gone`]; an error says nothing about
+    /// any of them. The default asks [`Self::runner`] for each.
+    fn runners(
+        &self,
+        terminals: &[(TerminalName, WorkspaceId)],
+    ) -> Result<Vec<(TerminalName, Runner)>, TerminalError> {
+        let mut states = Vec::with_capacity(terminals.len());
+        for (terminal, workspace) in terminals {
+            states.push((terminal.clone(), self.runner(terminal, workspace)?));
+        }
+        Ok(states)
+    }
+
     /// Last `lines` lines of the terminal screen, newest last.
     fn capture_tail(
         &self,
@@ -545,6 +561,38 @@ pub trait TerminalHost: Send + Sync {
         terminal: &TerminalName,
         workspace: &WorkspaceId,
     ) -> Result<(), TerminalError>;
+}
+
+/// Why a watch could not be set: the platform has none, the filesystem does
+/// not support one, or the platform's watch limit is reached.
+#[derive(Debug, Error)]
+#[error("watch: {0}")]
+pub struct WatchError(pub String);
+
+/// A change watch on files a running engine writes (its transcript and the
+/// exit status its runner leaves), so the Bridge reads a file when it
+/// changed instead of on every pass.
+///
+/// The watch names no process and holds nothing of the Bridge's state: a
+/// key is a name the caller chooses, and every path watched under it is the
+/// caller's interest. A path that does not exist yet may be watched,
+/// including one whose parent directory does not exist yet: what is watched
+/// then is the deepest directory above it that does, and the watch moves
+/// down as the directories appear.
+pub trait FileWatch: Send + Sync + std::fmt::Debug {
+    /// Watch `path` for `key`: a change to it (a write, a creation, a
+    /// removal, a replacement) is reported by the next [`Self::drain`].
+    /// Watching a path twice under one key changes nothing. A path that
+    /// cannot be watched is an error, and the caller reads that file on
+    /// every pass instead.
+    fn watch(&self, key: &str, path: &str) -> Result<(), WatchError>;
+
+    /// Watch nothing more for `key`, and forget every change it reported
+    /// that no [`Self::drain`] took yet.
+    fn unwatch(&self, key: &str);
+
+    /// The keys whose paths changed since the last call, each at most once.
+    fn drain(&self) -> Vec<String>;
 }
 
 /// Transcript archive failure.
