@@ -225,7 +225,8 @@
 //!    row only; the dispatcher's digest takes it to the supervisor once,
 //!    [`crate::dispatch::digest::host_fault_escalations`]). No pass gates
 //!    the task before `due_ms` ([`host_wait`], read from the store, never
-//!    from memory; its mission's other tasks wait behind it). A real failure
+//!    from memory, and measured by the database's clock, which stamped it,
+//!    never the host's; its mission's other tasks wait behind it). A real failure
 //!    among them, or none read, keeps it `rejected`; any other rejection is
 //!    judged as before. The decision rests on the failures and the crash
 //!    lines named in the record, never on the reason's text alone; the wait
@@ -692,6 +693,13 @@ pub(crate) struct Mission {
     pub(crate) gate_room_waits: u32,
     #[serde(default)]
     pub(crate) gate_room_escalated: bool,
+    /// The database's clock when the store read the mission
+    /// (`spawn_now_ms()`, in the same query): the gate's due times are the
+    /// store's (`gate_room_last_ms` is its record's time, `gate_host_due_ms`
+    /// that plus the backoff), so a wait is measured against it, never the
+    /// host's clock ([`gate_waits`]). Absent only in a mission built by hand.
+    #[serde(default)]
+    pub(crate) now_ms: Option<i64>,
     /// The mission's current run of `host_fault` gate outcomes, folded by
     /// the store: how many in a row, the task the latest was about, and the
     /// latest record's `due_ms` (its own time plus its backoff).
@@ -836,7 +844,8 @@ pub(crate) fn room_backoff(waits: u32) -> Duration {
         .min(ROOM_BACKOFF_MAX)
 }
 
-/// How long `task`'s gate still waits for room at `now_ms`, read from the
+/// How long `task`'s gate still waits for room at `now_ms` (the database's
+/// clock, [`Mission::now_ms`]: the record's time is the store's), read from the
 /// store's record of its latest `no_room` (never from memory). None when the
 /// gate may run: also when the mission's run is another task's, which never
 /// lends its backoff.
@@ -870,9 +879,10 @@ pub(crate) fn host_fault_base(text: Option<&str>) -> Duration {
         .map_or(HOST_FAULT_BACKOFF, Duration::from_secs)
 }
 
-/// How long `task`'s gate still waits after a host fault at `now_ms`, read
-/// from the store's record of the latest one (its `due_ms`, folded into the
-/// mission), never from memory. None when the gate may run: no run of host
+/// How long `task`'s gate still waits after a host fault at `now_ms` (the
+/// database's clock, [`Mission::now_ms`]), read from the store's record of
+/// the latest one (its `due_ms`, folded into the mission), never from
+/// memory. None when the gate may run: no run of host
 /// faults, or the latest was about another task.
 pub(crate) fn host_wait(mission: &Mission, task: i64, now_ms: i64) -> Option<Duration> {
     if mission.gate_host_faults == 0 || mission.gate_host_task != Some(task) {
@@ -3471,7 +3481,12 @@ fn now_ms() -> i64 {
 /// on it was a host fault (it waits until the recorded due time, then judges
 /// it again). The mission's other tasks wait behind it.
 fn gate_waits(mission: &Mission, task: &Task) -> bool {
-    if let Some(wait) = room_wait(mission, task.id, now_ms()) {
+    // One clock, the database's: the due times are its own. A mission read
+    // without it (never from the store) waits for nothing.
+    let Some(now) = mission.now_ms else {
+        return false;
+    };
+    if let Some(wait) = room_wait(mission, task.id, now) {
         println!(
             "integrate: mission {}: the gate had no room; task {} is judged again in {}s",
             mission.id,
@@ -3480,7 +3495,7 @@ fn gate_waits(mission: &Mission, task: &Task) -> bool {
         );
         return true;
     }
-    if let Some(wait) = host_wait(mission, task.id, now_ms()) {
+    if let Some(wait) = host_wait(mission, task.id, now) {
         println!(
             "integrate: mission {}: the gate's last run on task {} was a host fault ({} in a \
              row); it is judged again in {}s",
@@ -6849,6 +6864,47 @@ mod host_fault_tests {
         assert_eq!(host_fault_backoff(short, 2), Duration::from_secs(10));
     }
 
+    /// The wait follows the database's clock, the one that stamped the due
+    /// time, whatever the host's says: a database clock before the due time
+    /// holds the task even when the host's is long past it (the due time
+    /// here is in 2001), and one past it lets the gate run even when the
+    /// host's is before it (the due time here is in 2200).
+    #[test]
+    fn a_host_faults_wait_follows_the_databases_clock_not_the_hosts() {
+        let task: super::Task = serde_json::from_value(json!({
+            "id": 4, "agent_id": "a", "session_id": "s", "state": "reported",
+        }))
+        .expect("a task");
+        let at = |due: i64, database_now: i64| {
+            let mut mission = with_host_faults(1, Some(4), Some(due));
+            mission.now_ms = Some(database_now);
+            mission
+        };
+        let past = 1_000_000_000_000; // 2001-09-09, long before the host's now
+        assert!(super::now_ms() > past + 60_000);
+        assert!(
+            super::gate_waits(&at(past, past - 60_000), &task),
+            "the database's clock is before it"
+        );
+        assert!(
+            !super::gate_waits(&at(past, past), &task),
+            "the database's clock is at it"
+        );
+        let future = 7_258_118_400_000; // 2200-01-01, after the host's now
+        assert!(super::now_ms() < future);
+        assert!(
+            !super::gate_waits(&at(future, future + 1), &task),
+            "the database's clock is past it"
+        );
+        assert!(super::gate_waits(&at(future, future - 1), &task));
+        // A mission read without the database's clock (never from the store)
+        // waits for nothing.
+        assert!(!super::gate_waits(
+            &with_host_faults(1, Some(4), Some(future)),
+            &task
+        ));
+    }
+
     /// The task waits until the recorded due time, read from the mission's
     /// fold; another task, or no run, does not wait.
     #[test]
@@ -9247,7 +9303,8 @@ mod database_tests {
                 (Some(task), 1)
             );
             assert!(
-                super::room_wait(&after, task, super::now_ms()).is_some(),
+                super::room_wait(&after, task, after.now_ms.expect("the database's clock"))
+                    .is_some(),
                 "judged again after the backoff"
             );
             let _ = std::fs::remove_dir_all(&base);
