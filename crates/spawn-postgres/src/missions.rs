@@ -475,7 +475,7 @@ select coalesce(jsonb_agg(jsonb_build_object('objective', k.objective, 'metric',
  where k.mission_id = $1 and k.state = 'landed' and k.objective is not null";
 
 /// The outcomes of an objective mission's tasks, oldest first, from the
-/// control stream: `[{seq, type, task, objective, verdict, merge}]`, the
+/// control stream: `[{seq, type, task, objective, verdict, merge, measure, yielded}]`, the
 /// gate verdicts, the aborts and the yields (a `task.cancelled` that names
 /// `yielded`). What spawn-cli's `objectives::attempts` counts. `$1` mission.
 /// Each task's records by the record-id index, the record taken out of
@@ -486,7 +486,8 @@ select coalesce(jsonb_agg(jsonb_build_object('objective', k.objective, 'metric',
 pub(crate) const OBJECTIVE_OUTCOMES: &str = r"
 select coalesce(jsonb_agg(jsonb_build_object(
          'seq', o.seq, 'type', o.r ->> 'type', 'task', k.id, 'objective', k.objective,
-         'verdict', o.r ->> 'verdict', 'merge', o.r ->> 'merge', 'yielded', o.r -> 'yielded',
+         'verdict', o.r ->> 'verdict', 'merge', o.r ->> 'merge',
+         'measure', o.r ->> 'measure', 'yielded', o.r -> 'yielded',
          'event_id', o.event_id, 'at_ms', o.at_ms,
          'continues', (o.r ->> 'continues')::bigint, 'chain', o.r -> 'chain',
          'branch', o.r ->> 'branch', 'commit', o.r ->> 'commit', 'diff', o.r ->> 'diff',

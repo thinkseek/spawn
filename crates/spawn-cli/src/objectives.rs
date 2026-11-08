@@ -10,13 +10,36 @@
 //! yield, then the lowest id. With no failures this is the lowest open id.
 //!
 //! No objective holds a slot for ever. A failed attempt is an outcome that
-//! says the work did not make it: a gate's `rejected`, `incompatible` or
-//! `conflict` (unless main could not be merged into the workspace, or merged
-//! cleanly: `merge` names how). An overrun over budget is not one: the work
-//! is kept and continued ([`Overrun`]), and a record from before an overrun
-//! was its own record (`task.aborted`) counts as it was written.
-//! The host's outcomes (`no_room`, `host_fault`, a gate `aborted`) are not
-//! the work's and count for nothing, as for the halt rules. Once an
+//! is evidence against the work, and only that ([`Outcome::failure`]):
+//!
+//! - A gate's `rejected`: the scenario or a check failed on the work. It
+//!   counts, even when the cause was the host's (a contended test server,
+//!   a flaky self-test): the gate cannot tell, and the supervisor reads
+//!   the yield's reasons. `incompatible` counts the same way: the work, as
+//!   delivered, fails once merged with main.
+//! - A gate's `conflict` never counts. It says main moved under the task
+//!   (another landing, an owner batch), not that the work failed: the
+//!   worker gets the conflict to resolve, and one that cannot resolve it
+//!   shows up as `rejected` or as an overrun over its budget, which the
+//!   supervisor reads. Mission 4's objectives 023 and 025 yielded at
+//!   2026-11-08 04:47 on conflicts from an owner batch, with work that had
+//!   passed review.
+//! - An overrun over budget is not one either: the work is kept and
+//!   continued ([`Overrun`]), and the next task of the objective takes it
+//!   on. Its record names the budget that made it (`measure: "active"`,
+//!   with the elapsed time and tool calls it measured, [`crate::integrate`]'s
+//!   `enforce_budget`), so a reader of the record sees what ended the task.
+//!   A record from before an overrun was its own record (`task.aborted`)
+//!   counts only with that measure; one without it is an older abort (the
+//!   wall-clock budget's, which aborted tasks that a restart had kept
+//!   waiting, the thing the owner said must never happen again) or the
+//!   store's (a landing gone stale after its mission was done): neither
+//!   judged the work.
+//! - The host's outcomes (`no_room`, `host_fault`, `stale`, a gate
+//!   `aborted`) are not the work's and count for nothing, as for the halt
+//!   rules.
+//!
+//! Once an
 //! objective has `SPAWN_OBJECTIVE_ATTEMPTS` (3) failed attempts since its
 //! last yield (an accepted verdict also ends the count), its task yields
 //! the slot once it is being worked again (assigned, delivered or sent back;
@@ -508,10 +531,12 @@ pub(crate) struct Outcome {
     pub(crate) reason: Option<String>,
     #[serde(default)]
     pub(crate) verdict: Option<String>,
-    /// For a conflict, how main went into the workspace (`main_merge`'s
-    /// `Merge::kind`); absent on records from before it was named.
+    /// The budget measure that ended the task: `active` for the
+    /// integrator's active-time budget, on its abort record and on the
+    /// overrun record that replaced it; absent on older aborts and on the
+    /// store's.
     #[serde(default)]
-    pub(crate) merge: Option<String>,
+    pub(crate) measure: Option<String>,
     /// The task yielded its objective's slot by this record: a
     /// `task.cancelled` of the integrator's, or a `task.aborted` whose
     /// abort was the objective's last failed attempt before its limit.
@@ -520,19 +545,19 @@ pub(crate) struct Outcome {
 }
 
 impl Outcome {
-    /// The failed attempt this outcome is, if it is one: what it says about
-    /// the work. A conflict is one when the worker got conflicts to resolve
-    /// (`marked`, `unmarked`, or markers still `pending`; a record from
-    /// before `merge` was named counts too), not when main could not be
-    /// merged (`not_mounted`, `busy`, `failed`) or merged cleanly.
+    /// The failed attempt this outcome is, if it is one: evidence against
+    /// the work (the module comment argues each case). A gate's `rejected`
+    /// or `incompatible`, and a task aborted by the active-time budget
+    /// (`measure: "active"`; the integrator's overrun record of that budget
+    /// is a continuation, not a failed attempt). Never a `conflict` (main
+    /// moved), an abort without a measure (the old wall-clock budget's, or
+    /// the store's for a stale landing), or the host's verdicts.
     fn failure(&self) -> Option<&str> {
         match (self.kind.as_str(), self.verdict.as_deref()) {
-            ("task.aborted", _) => Some("aborted over budget"),
+            ("task.aborted", _) if self.measure.as_deref() == Some(ACTIVE_MEASURE) => {
+                Some("aborted over budget")
+            }
             ("task.gated", Some(verdict @ ("rejected" | "incompatible"))) => Some(verdict),
-            ("task.gated", Some("conflict")) => match self.merge.as_deref() {
-                None | Some("marked" | "unmarked" | "pending") => Some("conflict"),
-                Some(_) => None,
-            },
             _ => None,
         }
     }
@@ -627,6 +652,10 @@ pub(crate) fn attempts(outcomes: &[Outcome]) -> BTreeMap<u32, Attempts> {
     attempts
 }
 
+/// The `measure` of an abort the active-time budget made: the only abort
+/// that counts as a failed attempt.
+pub(crate) const ACTIVE_MEASURE: &str = "active";
+
 /// Failed attempts after which an objective's task yields its slot:
 /// `SPAWN_OBJECTIVE_ATTEMPTS`, a whole number from 1 up; anything else is 3.
 pub(crate) fn attempt_limit(text: Option<&str>) -> usize {
@@ -690,31 +719,6 @@ pub(crate) fn yields(
             })
         })
         .collect()
-}
-
-/// Whether aborting `task` (of `objective`) over budget is its objective's
-/// last failed attempt before `limit`: then the abort is recorded as the
-/// yield ([`abort_yield`]), since the task is gone and nothing else would
-/// yield the slot. Without this the objective kept no yield and its
-/// failures, sorted ahead, and the next task for it yielded at once (rev-b
-/// on 226fa4a: objective 023, task 113 aborted with its fifth failure).
-#[cfg(test)]
-pub(crate) fn abort_yields(
-    attempts: &BTreeMap<u32, Attempts>,
-    task: i64,
-    objective: u32,
-    limit: usize,
-) -> Option<Yield> {
-    let mut failures = attempts
-        .get(&objective)
-        .map(|tried| tried.failures.clone())
-        .unwrap_or_default();
-    failures.push("aborted over budget".to_string());
-    (failures.len() >= limit).then_some(Yield {
-        task,
-        objective,
-        failures,
-    })
 }
 
 /// An objective mission's worker limit: `objectives ->> 'workers'`, 1 when
@@ -1050,9 +1054,9 @@ fn assign(
 #[cfg(test)]
 mod tests {
     use super::{
-        Attempts, Landing, Outcome, PriorWork, Task, abort_yields, attempt_limit, attempts, brief,
-        choose, holds, load_backlog, metric_lines, next_open, order_problems, overruns, workers,
-        yields,
+        ACTIVE_MEASURE, Attempts, Landing, Outcome, PriorWork, Task, attempt_limit, attempts,
+        brief, choose, holds, load_backlog, metric_lines, next_open, order_problems, overruns,
+        workers, yields,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
@@ -1142,7 +1146,7 @@ mod tests {
             budget: Some(json!({"tool_calls": 5})),
             reason: Some("the task made more than 5 tool calls".to_string()),
             verdict: None,
-            merge: None,
+            measure: None,
             yielded: None,
         }
     }
@@ -1374,7 +1378,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn outcome(kind: &str, objective: u32, verdict: Option<&str>, merge: Option<&str>) -> Outcome {
+    /// An outcome as the store gives it. A conflict's `merge` (how main went
+    /// into the workspace) is in the record but no longer read: no conflict
+    /// counts, however it merged.
+    fn outcome(kind: &str, objective: u32, verdict: Option<&str>, _merge: Option<&str>) -> Outcome {
         Outcome {
             kind: kind.to_string(),
             objective,
@@ -1389,9 +1396,16 @@ mod tests {
             budget: None,
             reason: None,
             verdict: verdict.map(str::to_string),
-            merge: merge.map(str::to_string),
+            measure: None,
             yielded: None,
         }
+    }
+
+    /// An abort the active-time budget made, as `enforce_budget` records it.
+    fn active_abort(objective: u32) -> Outcome {
+        let mut abort = outcome("task.aborted", objective, None, None);
+        abort.measure = Some(ACTIVE_MEASURE.to_string());
+        abort
     }
 
     fn gated(objective: u32, verdict: &str) -> Outcome {
@@ -1413,41 +1427,40 @@ mod tests {
         .expect("a mission")
     }
 
-    /// What the work did counts; what the host did, or a clean or failed
-    /// merge of main, does not; a yield or an acceptance starts the count
-    /// again.
+    /// Only evidence against the work counts: a rejection, an
+    /// incompatibility, an abort the active-time budget made. Main moving
+    /// (a conflict, however it was merged), an abort without a measure (the
+    /// old wall-clock budget's, the store's for a stale landing) and the
+    /// host's verdicts count for nothing; a yield or an acceptance starts
+    /// the count again.
     #[test]
-    fn failed_attempts_are_the_works_outcomes() {
+    fn failed_attempts_are_evidence_against_the_work() {
         let outcomes = [
             gated(1, "rejected"),
             gated(1, "incompatible"),
+            active_abort(1),
+            // Main moved under the task: nothing, whatever the merge.
             outcome("task.gated", 1, Some("conflict"), Some("marked")),
             outcome("task.gated", 1, Some("conflict"), Some("unmarked")),
             outcome("task.gated", 1, Some("conflict"), Some("pending")),
             outcome("task.gated", 1, Some("conflict"), None),
-            outcome("task.aborted", 1, None, None),
-            // The host's, or main not merged: nothing.
-            gated(1, "no_room"),
-            gated(1, "host_fault"),
-            gated(1, "aborted"),
             outcome("task.gated", 1, Some("conflict"), Some("not_mounted")),
             outcome("task.gated", 1, Some("conflict"), Some("busy")),
             outcome("task.gated", 1, Some("conflict"), Some("failed")),
             outcome("task.gated", 1, Some("conflict"), Some("merged")),
+            // An abort no active-time measure made: nothing.
+            outcome("task.aborted", 1, None, None),
+            // The host's: nothing.
+            gated(1, "no_room"),
+            gated(1, "host_fault"),
+            gated(1, "stale"),
+            gated(1, "aborted"),
         ];
         let counted = attempts(&outcomes);
         assert_eq!(counted[&1].yields, 0);
         assert_eq!(
             counted[&1].failures,
-            [
-                "rejected",
-                "incompatible",
-                "conflict",
-                "conflict",
-                "conflict",
-                "conflict",
-                "aborted over budget"
-            ]
+            ["rejected", "incompatible", "aborted over budget"]
         );
         let after = attempts(&[
             gated(2, "rejected"),
@@ -1456,7 +1469,7 @@ mod tests {
             gated(3, "rejected"),
             gated(3, "rejected"),
             gated(3, "accepted"),
-            gated(3, "conflict"),
+            gated(3, "incompatible"),
         ]);
         assert_eq!(
             after[&2],
@@ -1467,7 +1480,7 @@ mod tests {
         );
         assert_eq!(
             after[&3].failures,
-            ["conflict"],
+            ["incompatible"],
             "an acceptance ends the count"
         );
     }
@@ -1477,8 +1490,8 @@ mod tests {
     fn free_slots_go_to_the_fewest_attempts() {
         let backlog: Vec<Task> = [19, 21, 23, 25, 26].map(|id| objective(id, false)).to_vec();
         let tried = attempts(&[
-            gated(19, "conflict"),
-            gated(19, "conflict"),
+            gated(19, "rejected"),
+            gated(19, "rejected"),
             outcome("task.cancelled", 19, None, None),
             gated(21, "rejected"),
             gated(23, "rejected"),
@@ -1503,9 +1516,9 @@ mod tests {
     fn objectives_at_the_limit_yield_their_slots() {
         let three = |objective| {
             [
-                gated(objective, "conflict"),
                 gated(objective, "rejected"),
-                gated(objective, "conflict"),
+                gated(objective, "incompatible"),
+                active_abort(objective),
             ]
         };
         let outcomes: Vec<Outcome> = [three(19), three(21), three(23)].concat();
@@ -1576,8 +1589,9 @@ mod tests {
     /// store's objective outcomes). Then, 127 (019) and 106 (021) were
     /// reported, and the old rule gave the freed slot to 023 again (task
     /// 160, five seconds later). Now neither reported task yields (106 went
-    /// on to land), and the slot goes to 025: 023 has five failed attempts
-    /// and 025 none.
+    /// on to land, 127 to be accepted), and the slot goes to 025: 023 has a
+    /// failed attempt (113's rejection; its conflicts were main moving) and
+    /// 025 none.
     #[test]
     fn mission_4_at_23_05_assigns_objective_25() {
         let outcomes: Vec<Outcome> = serde_json::from_str(include_str!(
@@ -1585,9 +1599,9 @@ mod tests {
         ))
         .expect("the outcomes");
         let tried = attempts(&outcomes);
-        assert_eq!(tried[&19].failures.len(), 7);
-        assert_eq!(tried[&21].failures.len(), 4);
-        assert_eq!(tried[&23].failures.len(), 5);
+        assert_eq!(tried[&19].failures, ["incompatible"]);
+        assert_eq!(tried[&21].failures, ["rejected"]);
+        assert_eq!(tried[&23].failures, ["rejected"]);
         let after_abort = mission(3, &[(127, 19, "reported"), (106, 21, "reported")]);
         let none = BTreeSet::new();
         assert!(yields(&after_abort, &tried, attempt_limit(None), &none).is_empty());
@@ -1600,14 +1614,10 @@ mod tests {
             ids(&choose(&backlog, &[], &flying, &tried, &BTreeSet::new(), 1)),
             vec![25]
         );
-        // Had 127 been sent back to revise, it would yield as well, and 026
-        // take its slot.
+        // Had 127 been sent back to revise, it would keep its slot too: one
+        // failed attempt (the old rule counted seven and yielded it).
         let sent_back = mission(3, &[(127, 19, "revise"), (106, 21, "reported")]);
-        let slots = yields(&sent_back, &tried, attempt_limit(None), &none);
-        assert_eq!(
-            slots.iter().map(|slot| slot.task).collect::<Vec<_>>(),
-            [127]
-        );
+        assert!(yields(&sent_back, &tried, attempt_limit(None), &none).is_empty());
         assert_eq!(
             ids(&choose(
                 &backlog,
@@ -1619,6 +1629,70 @@ mod tests {
             )),
             vec![25, 26]
         );
+    }
+
+    /// Mission 4 as the live log had it at 2026-11-08 04:47:05, right after
+    /// the owner batch deployed: every outcome of its objective tasks up to
+    /// task 167's conflict (seq 1027), without the yield of 166 (seq 1025)
+    /// that the old rule made then (read-only, the store's objective
+    /// outcomes). The old rule set aside 166 (objective 025: "aborted over
+    /// budget, rejected, conflict") and 167 (023: "conflict, conflict,
+    /// conflict, rejected, aborted over budget, aborted over budget,
+    /// conflict"), both reviewed and passing. The aborts were the old
+    /// budget's (113 by the wall clock at 23:05, 160 and 164 at 300 tool
+    /// calls), recorded without a measure, and the conflicts were main
+    /// moving. Now each has one failed attempt, its rejection, and neither
+    /// yields.
+    #[test]
+    fn mission_4_at_04_47_sets_aside_neither_166_nor_167() {
+        let outcomes: Vec<Outcome> = serde_json::from_str(include_str!(
+            "../tests/data/mission-4-outcomes-2026-11-08T04-47-05.json"
+        ))
+        .expect("the outcomes");
+        let tried = attempts(&outcomes);
+        assert_eq!(tried[&25].failures, ["rejected"]);
+        assert_eq!(tried[&23].failures, ["rejected"]);
+        assert_eq!(tried[&25].yields, 0);
+        assert_eq!(tried[&23].yields, 0);
+        // Both sent back to resolve their conflicts.
+        let at_04_47 = mission(3, &[(166, 25, "revise"), (167, 23, "revise")]);
+        assert!(
+            yields(&at_04_47, &tried, attempt_limit(None), &BTreeSet::new()).is_empty(),
+            "neither 166 nor 167 yields"
+        );
+        // An objective failing for real still yields: three rejections, in
+        // the shape of the live records, with conflicts between them that
+        // do not change the count.
+        let mut failing = outcomes.clone();
+        for (seq, verdict, merge) in [
+            (2000, "rejected", None),
+            (2001, "conflict", Some("marked")),
+            (2002, "rejected", None),
+            (2003, "rejected", None),
+        ] {
+            failing.push(
+                serde_json::from_value(json!({
+                    "seq": seq, "type": "task.gated", "task": 166, "objective": 26,
+                    "verdict": verdict, "merge": merge, "measure": null, "yielded": null,
+                }))
+                .expect("an outcome"),
+            );
+        }
+        let tried = attempts(&failing);
+        assert_eq!(tried[&26].failures, ["rejected", "rejected", "rejected"]);
+        let stuck = mission(3, &[(166, 25, "revise"), (200, 26, "revise")]);
+        let slots = yields(&stuck, &tried, attempt_limit(None), &BTreeSet::new());
+        assert_eq!(
+            slots
+                .iter()
+                .map(|slot| (slot.task, slot.objective))
+                .collect::<Vec<_>>(),
+            [(200, 26)]
+        );
+        // So does one whose aborts the active-time budget made.
+        let mut aborted = outcomes;
+        aborted.extend([active_abort(27), gated(27, "rejected"), active_abort(27)]);
+        assert_eq!(attempts(&aborted)[&27].failures.len(), 3);
     }
 
     #[test]
@@ -1666,30 +1740,18 @@ mod tests {
         assert!(!first.contains("Earlier tasks"), "a first task has none");
     }
 
-    /// rev-b on 226fa4a: an objective whose limit-th failure is an abort
-    /// over budget. The abort is recorded as the yield, so the objective
-    /// goes behind the others as any yield does, and its next task starts
-    /// a fresh count instead of yielding at once.
+    /// A yield ends an objective's count, and its next task starts afresh;
+    /// an abort that was recorded as the yield (a task.aborted with
+    /// `yielded`, from before an overrun was its own record) counts so.
+    /// After that an abort the active-time budget made is one failed
+    /// attempt; one without a measure is none.
     #[test]
-    fn an_abort_that_reaches_the_limit_is_the_yield() {
-        let before = attempts(&[gated(23, "conflict"), gated(23, "conflict")]);
-        let slot = abort_yields(&before, 113, 23, 3).expect("the abort yields");
-        assert_eq!(
-            slot.failures,
-            ["conflict", "conflict", "aborted over budget"]
-        );
-        assert!(slot.reason().contains("task #113 yields its slot"));
-        assert!(
-            abort_yields(&before, 113, 23, 4).is_none(),
-            "under the limit"
-        );
-        assert!(abort_yields(&attempts(&[]), 113, 23, 3).is_none());
-
+    fn a_yield_ends_the_count_and_an_abort_counts_by_its_measure() {
         let mut aborted = outcome("task.aborted", 23, None, None);
         aborted.yielded = Some(true);
         let outcomes = [
-            gated(23, "conflict"),
-            gated(23, "conflict"),
+            gated(23, "rejected"),
+            gated(23, "rejected"),
             aborted,
             gated(25, "rejected"),
             outcome("task.cancelled", 25, None, None),
@@ -1720,10 +1782,13 @@ mod tests {
             yields(&next, &tried, 3, &BTreeSet::new()).is_empty(),
             "its next task does not yield at once"
         );
-        // An abort under the limit stays a failure, as before.
-        let plain = attempts(&[outcome("task.aborted", 23, None, None)]);
+        // An abort under the limit stays a failure, as before, when the
+        // active-time budget made it; one without a measure is none.
+        let plain = attempts(&[active_abort(23)]);
         assert_eq!(plain[&23].failures, ["aborted over budget"]);
         assert_eq!(plain[&23].yields, 0);
+        let old = attempts(&[outcome("task.aborted", 23, None, None)]);
+        assert!(old[&23].failures.is_empty());
     }
 
     /// An objective that names the objectives it comes after is not chosen

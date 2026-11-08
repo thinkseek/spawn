@@ -1238,6 +1238,9 @@ record of what was judged (§14 of design.md).
     `spawn/<agent>` so it names the branch, the commit and the commit's
     diff stat; it counts toward no halt, and the objective's next task
     continues that work (§10.4, "A task over its budget keeps its work").
+    The record names the measure that made it (`measure: "active"`, with
+    the tool calls and elapsed time it measured), so a reader sees which
+    budget ended the task; it is a continuation, not a failed attempt.
     `task.aborted` keeps its other meaning (a landing gone stale after its
     mission was done); records from before this were overruns recorded as
     aborts, and count toward the abort halt as they were written.
@@ -1740,15 +1743,25 @@ record of what was judged (§14 of design.md).
     under the append lock, so a second integrator or a stale read cannot
     oversubscribe.
   - **No objective holds a slot for ever.** A failed attempt is an outcome
-    that says the work did not make it: the gate's `rejected`,
-    `incompatible`, or `conflict` when the worker got conflicts to resolve
-    (the record's `merge` is `marked`, `unmarked` or `pending`, or absent on
-    records from before it was named; not `not_mounted`, `busy`, `failed`
-    or a clean merge). A budget overrun is not one: it says the task is
-    bigger than its budget, not that the work failed, and it is handled on
-    its own (below). The host's outcomes
-    (`no_room`, `host_fault`, a gate `aborted`) count for nothing, as for
-    the halt rules, and an `accepted` verdict ends the count. Once an
+    that is evidence against the work, and only that: the gate's `rejected`
+    or `incompatible` (the work, as delivered, failed a check or failed
+    merged with main; the gate cannot tell a host's cause, and the yield's
+    reasons reach the supervisor), or an abort the active-time budget made
+    (a record that names `measure: "active"`, with the `active_minutes` and
+    `tool_calls` it measured). A `conflict` never counts: main moved under
+    the task (another landing, an owner batch), and a worker that cannot
+    resolve it shows up as rejected or over budget. An abort without a
+    measure never counts either: the old wall-clock budget's (it aborted
+    tasks a restart had kept waiting) and the store's for a landing gone
+    stale after its mission was done. A budget overrun is not one either:
+    it says the task is bigger than its budget, not that the work failed;
+    its record names the measure and the objective's next task continues
+    the work (below). The host's outcomes (`no_room`, `host_fault`,
+    `stale`, a gate `aborted`) count for nothing, as for the halt rules,
+    and an `accepted` verdict ends the count. (On 2026-11-08 at 04:47,
+    right after an owner batch, the earlier rule set aside tasks 166 and
+    167, both reviewed and passing, on old wall-clock and tool-call aborts
+    and on conflicts from the batch; each had one rejection.) Once an
     objective has `SPAWN_OBJECTIVE_ATTEMPTS` (3, a whole number from 1)
     failed attempts since its last yield, its task yields the slot as soon
     as it is being worked again (assigned, delivered or `revise`; a
