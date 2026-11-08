@@ -72,8 +72,8 @@ const MAX_FAILURES: u32 = 10;
 
 /// What a watcher that must not fail a pass reports: its lines, or the error
 /// as a warning named `what`.
-fn watched(what: &str, result: Result<Vec<String>, String>) -> Result<Vec<String>, String> {
-    Ok(result.unwrap_or_else(|error| vec![format!("{what}: {error}")]))
+fn watched(what: &str, result: Result<Vec<String>, String>) -> Vec<String> {
+    result.unwrap_or_else(|error| vec![format!("{what}: {error}")])
 }
 
 /// Run the Bridge, the Observer, the disk watch, the dispatcher and the
@@ -138,8 +138,8 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
             };
             // The disk watch and the alerts never fail a pass: a fleet must
             // not stop because it cannot record a warning.
-            step("disk", watched("disk", disk.check(open)));
-            step("alerts", watched("alerts", alerting.check(open)));
+            step("disk", Ok(watched("disk", disk.check(open))));
+            step("alerts", Ok(watched("alerts", alerting.check(open))));
             if dispatching {
                 step(
                     "dispatch",
