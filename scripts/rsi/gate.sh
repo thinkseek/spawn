@@ -425,7 +425,7 @@ verdict() {
     echo "$json"
 }
 
-# host_fault <scenario> <on> <runs> <reason> [<evidence>]: no verdict on the candidate,
+# host_fault <scenario> <on> <runs> <reason> [<evidence> [<tree>]]: no verdict on the candidate,
 # a fact about the host or the harness instead (exit 6), written where a
 # verdict would be: `{"host_fault":true,"scenario","on","runs","reason",
 # "base","candidate"}`. `on` is where it failed: `base` (a scenario's
@@ -451,6 +451,7 @@ host_fault() {
     json="{\"host_fault\":true,\"scenario\":\"$(json_string "$1")\",\"on\":\"$2\""
     json="$json,\"runs\":\"$(json_string "$3")\",\"reason\":\"$(json_string "$4")\""
     [ -z "${5-}" ] || json="$json,\"evidence\":\"$5\""
+    [ -z "${6-}" ] || json="$json,\"tree\":\"$6\""
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
@@ -1267,7 +1268,15 @@ sandbox_fault() {
         sandbox_once "$work/candidate" true >/dev/null 2>&1 || :
         sandbox_fault_candidate=$sandbox_started
         sandbox_once "$work/baseline" true >/dev/null 2>&1 || :
-        if [ -z "$sandbox_fault_candidate" ] && [ -n "$sandbox_started" ]; then
+        sandbox_fault_base=$sandbox_started
+        # Once more in the candidate's, after the base's: a start that a
+        # host race failed once (as the F-race does) does not make a
+        # rejection.
+        if [ -z "$sandbox_fault_candidate" ] && [ -n "$sandbox_fault_base" ]; then
+            sandbox_once "$work/candidate" true >/dev/null 2>&1 || :
+            sandbox_fault_candidate=$sandbox_started
+        fi
+        if [ -z "$sandbox_fault_candidate" ] && [ -n "$sandbox_fault_base" ]; then
             verdict rejected "the sandbox cannot start in the candidate's tree, where it starts in the base's: ${sandbox_fault_entry#*|*|}"
             exit 0
         fi
@@ -1276,8 +1285,18 @@ sandbox_fault() {
     fi
     sandbox_fault_what=${sandbox_fault_entry#*|}
     sandbox_fault_what=${sandbox_fault_what%%|*}
+    # Which tree it was, in the fact: the candidate's counts toward the
+    # integrator's host-fault cap; the base's and the gate's own (the
+    # socket scan) come before any candidate code ran, as a fault on the
+    # base does, and do not (integrate.rs base_only_fault).
+    case "${sandbox_fault_entry%%|*}" in
+    "$work/candidate") sandbox_fault_tree=candidate ;;
+    "$work/baseline") sandbox_fault_tree=base ;;
+    *) sandbox_fault_tree=gate ;;
+    esac
     host_fault "${2:-${sandbox_fault_what:-sandbox}}" sandbox "never started" \
-        "${sandbox_fault_entry#*|*|}: a host fault, not a verdict on the candidate" sandbox_never_started
+        "${sandbox_fault_entry#*|*|}: a host fault, not a verdict on the candidate" \
+        sandbox_never_started "$sandbox_fault_tree"
 }
 
 extract() {
@@ -1337,8 +1356,10 @@ done <"$work/sockets"
 build() {
     [ -f "$scenarios/build" ] || return 0
     # The suite's seam (SPAWN_GATE_TEST_HOLD) holds this sandbox: the build
-    # is where a vanished mask was a false "does not build".
+    # is where a vanished mask was a false "does not build". A hold file
+    # that says `base-run` holds a base job's run instead (job_run).
     sandbox_hold_here=1
+    [ "$(sandbox_hold_at)" != base-run ] || sandbox_hold_here=""
     build_status=0
     sandbox "$1" env ${gate_build_jobs:+"CARGO_BUILD_JOBS=$gate_build_jobs"} sh "$scenarios/build" >"$work/build.log" 2>&1 ||
         build_status=$?
@@ -1589,6 +1610,12 @@ slot_claim() {
     fi
 }
 
+# sandbox_hold_at: what the suite's hold file (SPAWN_GATE_TEST_HOLD) asks to
+# hold: `base-run`, or the build (anything else).
+sandbox_hold_at() {
+    [ -n "${SPAWN_GATE_TEST_HOLD-}" ] && sed -n '1p' "$SPAWN_GATE_TEST_HOLD" 2>/dev/null || :
+}
+
 # job_run <job> <run> <tree> <scenario>: one run of the scenario in the
 # built tree, in the sandbox, holding one of the host's scenario slots;
 # returns its exit status. With slot_kept set, the caller already holds
@@ -1597,6 +1624,10 @@ job_run() {
     # This job's note of a sandbox that never started (sandbox_never): its
     # printer reads it, whatever the run's status says.
     sandbox_note=$1/never-started
+    sandbox_hold_here=""
+    if [ "$3" = "$work/baseline" ] && [ "$(sandbox_hold_at)" = base-run ]; then
+        sandbox_hold_here=1
+    fi
     if [ -z "$slot_kept" ]; then
         slot_claim "$1" || return 125
     fi

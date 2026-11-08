@@ -2956,11 +2956,15 @@ begin
     -- `base_disagrees`, with its scenario, both exits and its run); or the
     -- gate's own fact (`gate`: a scenario's harness error on the base, or a
     -- check failing on the candidate and the base, naming the scenario and
-    -- where); and its backoff.
+    -- where); a sandbox that never started its command
+    -- (`sandbox_never_started`: on `sandbox`, runs `never started`, what was
+    -- to run, which may hold spaces, and the tree: `candidate`, `base` or
+    -- `gate`); and its backoff.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
        and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log',
                                                           'base_disagrees', 'gate',
-                                                          'cannot_judge')
+                                                          'cannot_judge',
+                                                          'sandbox_never_started')
             or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
             or (p_record ->> 'evidence' in ('failures', 'server_log')
                 and (case when jsonb_typeof(p_record -> 'failures') = 'array'
@@ -2984,7 +2988,13 @@ begin
                      or coalesce(p_record -> 'fact' ->> 'on', '') not in ('base', 'candidate and base')))
             or (p_record ->> 'evidence' = 'cannot_judge'
                 and (coalesce(p_record ->> 'scenario', '') !~ '^[^[:space:]|]+$'
-                     or jsonb_typeof(p_record -> 'escalate') is distinct from 'boolean'))) then
+                     or jsonb_typeof(p_record -> 'escalate') is distinct from 'boolean'))
+            or (p_record ->> 'evidence' = 'sandbox_never_started'
+                and (coalesce(p_record -> 'fact' ->> 'scenario', '') = ''
+                     or p_record -> 'fact' ->> 'on' is distinct from 'sandbox'
+                     or p_record -> 'fact' ->> 'runs' is distinct from 'never started'
+                     or coalesce(p_record -> 'fact' ->> 'tree', '') not in
+                        ('candidate', 'base', 'gate')))) then
         raise exception 'a host_fault verdict names its evidence, its facts and backoff_ms: %',
                         p_record;
     end if;

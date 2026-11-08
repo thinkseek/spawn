@@ -1004,6 +1004,7 @@ pub(crate) fn gate_host_fault_fields(
         on,
         runs,
         reason,
+        tree,
         log,
     } = failure
     else {
@@ -1030,7 +1031,12 @@ pub(crate) fn gate_host_fault_fields(
         ),
         "log": log,
         "evidence": evidence,
-        "fact": {"scenario": scenario, "on": on, "runs": runs, "reason": reason},
+        "fact": if let Some(tree) = tree {
+            json!({"scenario": scenario, "on": on, "runs": runs, "reason": reason,
+                   "tree": tree.as_str()})
+        } else {
+            json!({"scenario": scenario, "on": on, "runs": runs, "reason": reason})
+        },
         "host_faults": faults,
         "backoff_ms": u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
         "escalate": faults == HOST_FAULT_ESCALATE_AT,
@@ -1568,6 +1574,12 @@ fn base_only_fault(fields: &Value) -> bool {
         .and_then(|fact| fact.get("on"))
         .and_then(Value::as_str)
         == Some("base")
+        // A sandbox that never started in the base's tree or the gate's own
+        // (the socket scan): before any candidate code ran, as on the base.
+        || fields.get("fact").is_some_and(|fact| {
+            fact.get("on").and_then(Value::as_str) == Some("sandbox")
+                && fact.get("tree").and_then(Value::as_str) != Some("candidate")
+        })
 }
 
 /// The `aborted` record of a host fault past the cap: `faults` host faults
@@ -9913,11 +9925,13 @@ mod database_tests {
             reason: "sandbox: sh build in /w/candidate never started (bwrap exited 1: bwrap: \
                      Can't chdir to /w/candidate: Permission denied)"
                 .to_string(),
+            tree: Some(crate::gate::SandboxTree::Candidate),
             log: String::new(),
         };
         let record = super::gate_host_fault_fields(&failure, 1, std::time::Duration::from_mins(1));
         assert_eq!(record["evidence"], crate::gate::SANDBOX_NEVER_STARTED);
         assert_eq!(record["fact"]["on"], "sandbox");
+        assert_eq!(record["fact"]["tree"], "candidate");
         let reason = record["reason"].as_str().expect("a reason");
         assert!(
             reason.starts_with("host fault: the gate's sandbox never started sh build (sandbox: ")
@@ -10066,6 +10080,119 @@ mod database_tests {
         assert_eq!(count(), 3);
         assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
         assert_eq!(gated(&db, mission).gate_aborts, 0);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sandbox that never started its command, recorded through the
+    /// store for every tree the gate names (rev-e on 81dd42f9: the store's
+    /// host_fault check refused the evidence, and no test wrote one): each
+    /// is `host_fault` with evidence `sandbox_never_started` and its tree.
+    /// The base's and the gate's own come before any candidate code ran, as
+    /// a fault on the base does: neither counts toward the host-fault cap
+    /// nor is ever capped. With the cap at 1, the candidate's first is a
+    /// host fault, a base one after it still is, and the candidate's second
+    /// is capped, recorded `aborted`.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_sandbox_that_never_started_is_recorded_for_each_tree_and_capped_only_on_the_candidate() {
+        let dir =
+            std::env::temp_dir().join(format!("spawn-db-never-started-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let runs = dir.join("runs");
+        let runs_path = runs.display();
+        let fact = |scenario: &str, tree: &str| {
+            format!(
+                "printf '{{\"host_fault\":true,\"scenario\":\"{scenario}\",\"on\":\"sandbox\",\
+                 \"runs\":\"never started\",\"reason\":\"sandbox: {scenario} in /w/{tree} never \
+                 started (bwrap exited 1: bwrap: cannot mount tmpfs on /run/x)\",\
+                 \"evidence\":\"sandbox_never_started\",\"tree\":\"{tree}\"}}\\n' \
+                 >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
+            )
+        };
+        let gate = format!(
+            "n=$(cat '{runs_path}' 2>/dev/null || echo 0); n=$((n + 1)); echo \"$n\" >'{runs_path}'\n\
+             case \"$n\" in\n\
+             1) {}\n;;\n\
+             2) {}\n;;\n\
+             3) {}\n;;\n\
+             4) {}\n;;\n\
+             5) {}\n;;\n\
+             esac\n\
+             printf '{{\"verdict\":\"accepted\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n",
+            fact("sh build", "base"),
+            fact("socket-scan", "gate"),
+            fact("sh build", "candidate"),
+            fact("sh 012.sh", "base"),
+            fact("sh check-e2e.sh", "candidate"),
+        );
+        let (base, source, scenarios, mut integrator) = world("never-started", &gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_millis(300),
+            cap: 1,
+        };
+        let db = Db::new("gate_never_started");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        let count = || {
+            std::fs::read_to_string(&runs).map_or(0, |text| text.trim().parse::<u32>().unwrap_or(0))
+        };
+        // One judging: wait out the last record's due time, then pass.
+        let judged = |n: u32| -> Value {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while count() < n {
+                assert!(std::time::Instant::now() < deadline, "run {n} never came");
+                integrator.pass_on(&db.store).expect("a pass");
+                integrator.settle();
+                if count() < n {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+            last_verdict(&db).0
+        };
+        for (n, tree) in [(1, "base"), (2, "gate"), (3, "candidate"), (4, "base")] {
+            let record = judged(n);
+            assert_eq!(record["verdict"], "host_fault", "run {n}: {record}");
+            assert_eq!(
+                record["evidence"],
+                crate::gate::SANDBOX_NEVER_STARTED,
+                "{record}"
+            );
+            assert_eq!(record["fact"]["on"], "sandbox", "{record}");
+            assert_eq!(record["fact"]["tree"], tree, "{record}");
+            assert_eq!(record["fact"]["runs"], "never started", "{record}");
+            assert!(
+                record["reason"].as_str().is_some_and(
+                    |reason| reason.starts_with("host fault: the gate's sandbox never started")
+                ),
+                "{record}"
+            );
+        }
+        // Only the candidate's counted: one, at the cap, so the next
+        // candidate fault is capped.
+        assert_eq!(
+            db.store.task_host_faults(task, 0).expect("the count"),
+            1,
+            "the base's and the gate's own do not count"
+        );
+        let record = judged(5);
+        assert_eq!(record["verdict"], "aborted", "{record}");
+        assert_eq!(
+            record["host_fault"]["evidence"],
+            crate::gate::SANDBOX_NEVER_STARTED,
+            "{record}"
+        );
+        assert_eq!(
+            record["host_fault"]["fact"]["tree"], "candidate",
+            "{record}"
+        );
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&dir);
     }

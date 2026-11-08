@@ -768,6 +768,9 @@ pub(crate) enum GateFailure {
         on: String,
         runs: String,
         reason: String,
+        /// For `on` `sandbox`, which tree's sandbox never started; None for
+        /// the other places.
+        tree: Option<SandboxTree>,
         log: String,
     },
     /// The host cannot judge the objective's scenario at all (029's systemd
@@ -1189,6 +1192,7 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
             on,
             runs,
             reason,
+            tree,
             ..
         }) = verdict.and_then(host_fault)
     {
@@ -1197,6 +1201,7 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
             on,
             runs,
             reason,
+            tree,
             log: record(&run.stdout),
         });
     }
@@ -1295,6 +1300,37 @@ fn no_room(file: &str) -> Option<Shortfall> {
     })
 }
 
+/// Which tree a sandbox that never started was for (`tree` of the gate's
+/// fact, `on` `sandbox`): the candidate's counts toward the host-fault cap;
+/// the base's and the gate's own (the socket scan) come before any
+/// candidate code ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SandboxTree {
+    Candidate,
+    Base,
+    Gate,
+}
+
+impl SandboxTree {
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "candidate" => Some(Self::Candidate),
+            "base" => Some(Self::Base),
+            "gate" => Some(Self::Gate),
+            _ => None,
+        }
+    }
+
+    /// As the gate's fact and the record name it.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Candidate => "candidate",
+            Self::Base => "base",
+            Self::Gate => "gate",
+        }
+    }
+}
+
 /// The evidence of a gate's host fault whose sandbox never started its
 /// command (`on` `sandbox`): bwrap failed before the command ran, so its
 /// status was no answer of the scenario's (scripts/rsi/gate.sh).
@@ -1317,17 +1353,22 @@ fn host_fault(file: &str) -> Option<GateFailure> {
     let scenario = text("scenario").filter(|scenario| !scenario.is_empty())?;
     // `sandbox`: a sandbox that never started its command (gate.sh "A
     // sandbox that never started its command"), believed only with its
-    // evidence.
+    // evidence and the tree it never started in.
+    let tree = text("tree").as_deref().and_then(SandboxTree::parse);
     let on = text("on").filter(|on| {
         on == "base"
             || on == "candidate and base"
-            || (on == "sandbox" && text("evidence").as_deref() == Some(SANDBOX_NEVER_STARTED))
+            || (on == "sandbox"
+                && text("evidence").as_deref() == Some(SANDBOX_NEVER_STARTED)
+                && tree.is_some())
     })?;
+    let tree = tree.filter(|_| on == "sandbox");
     Some(GateFailure::HostFault {
         scenario,
         on,
         runs: text("runs").unwrap_or_default(),
         reason: text("reason").unwrap_or_default(),
+        tree,
         log: String::new(),
     })
 }
@@ -2313,6 +2354,7 @@ mod tests {
             runs,
             reason,
             log,
+            ..
         }) = gate.judge(&path_only())
         else {
             panic!("exit 6 with its fact is a host fault");
@@ -2343,15 +2385,21 @@ mod tests {
         let fact = HOST_FAULT_FACT
             .replace("\"on\":\"base\"", "\"on\":\"sandbox\"")
             .replace("\"runs\":\"1, then 0\"", "\"runs\":\"never started\"")
-            .replace('}', ",\"evidence\":\"sandbox_never_started\"}");
+            .replace(
+                '}',
+                ",\"evidence\":\"sandbox_never_started\",\"tree\":\"base\"}",
+            );
         let gate = FakeGate::new(&format!("echo '{fact}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"));
         assert!(matches!(
             gate.judge(&path_only()),
-            Err(GateFailure::HostFault { on, runs, .. }) if on == "sandbox" && runs == "never started"
+            Err(GateFailure::HostFault { on, runs, tree, .. })
+                if on == "sandbox" && runs == "never started" && tree == Some(super::SandboxTree::Base)
         ));
         for wrong in [
             fact.replace(",\"evidence\":\"sandbox_never_started\"", ""),
             fact.replace("sandbox_never_started", "gate"),
+            fact.replace(",\"tree\":\"base\"", ""),
+            fact.replace("\"tree\":\"base\"", "\"tree\":\"elsewhere\""),
         ] {
             let gate = FakeGate::new(&format!(
                 "echo '{wrong}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
