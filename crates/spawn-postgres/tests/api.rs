@@ -2983,6 +2983,117 @@ fn m15_a_revival_that_dies_at_once_counts_as_a_failure() {
     );
 }
 
+/// Objective 032: a revival that made progress before a fault took it is no
+/// failed revival, though it ended lost within the grace minute — its
+/// command succeeded and its engine worked. The liveness rule counts none
+/// of them, so it revives at once instead of backing off; revivals that
+/// never got to work are still failures.
+#[test]
+fn a_revival_that_worked_before_it_was_lost_is_not_a_failure() {
+    let (store, _schema) = store("revival_progress");
+    let reviver = "spawn-supervise";
+    let run = |number: u64, command: CommandId, worked: bool| {
+        let execution = ExecutionId::new(format!("exec_{number}")).expect("valid execution");
+        store
+            .append(lifecycle(
+                &execution,
+                Source::Bridge,
+                &format!("exec_{number}:started"),
+                EventKind::ExecutionStarted {
+                    engine: ENGINE.to_string(),
+                    workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+                    command_id: command,
+                    fork: None,
+                    model: ModelProfile::Default,
+                    transcript_from: None,
+                },
+            ))
+            .expect("started");
+        if worked {
+            store
+                .append(lifecycle(
+                    &execution,
+                    Source::Bridge,
+                    &format!("exec_{number}:tool"),
+                    EventKind::ToolCompleted {
+                        tool_use_id: format!("toolu_{number}"),
+                        duration_ms: Some(5),
+                    },
+                ))
+                .expect("progress");
+        }
+        store
+            .append(lifecycle(
+                &execution,
+                Source::Bridge,
+                &format!("exec_{number}:ended"),
+                EventKind::ExecutionEnded {
+                    cause: EndCause::Lost,
+                    exit_code: None,
+                    signal: None,
+                    evidence: None,
+                },
+            ))
+            .expect("ended");
+    };
+    let revive = |key: &str| {
+        let command = store
+            .submit(
+                &Principal::new(reviver).expect("valid principal"),
+                &Submission {
+                    action: CommandAction::Resume {
+                        prompt: None,
+                        model: None,
+                    },
+                    ..start(session(), key)
+                },
+            )
+            .expect("submit");
+        let claimed = store
+            .claim("bridge", Duration::from_mins(1))
+            .expect("claim")
+            .expect("the resume");
+        store
+            .finish(&claimed, &Outcome::Succeeded)
+            .expect("the engine launched");
+        command
+    };
+    let first = store
+        .submit(
+            &Principal::new("human").expect("valid"),
+            &start(session(), "first"),
+        )
+        .expect("submit");
+    let claimed = store
+        .claim("bridge", Duration::from_mins(1))
+        .expect("claim")
+        .expect("start");
+    store.finish(&claimed, &Outcome::Succeeded).expect("finish");
+    run(1, first, false);
+    // Three revivals that each worked a unit, then were lost: none failed.
+    for attempt in 2..=4 {
+        let command = revive(&format!("revive-{attempt}"));
+        run(attempt, command, true);
+    }
+    let facts = store.liveness_facts(&session(), reviver).expect("facts");
+    assert_eq!(
+        facts.failures, 0,
+        "a revival that worked is no failed revival; counted {}",
+        facts.failures
+    );
+    // Revivals after it that never got to work are failures.
+    for attempt in 5..=6 {
+        let command = revive(&format!("revive-{attempt}"));
+        run(attempt, command, false);
+    }
+    let facts = store.liveness_facts(&session(), reviver).expect("facts");
+    assert_eq!(
+        facts.failures, 2,
+        "revivals that never worked are failures; counted {}",
+        facts.failures
+    );
+}
+
 /// The dispatcher's facts count a resume whose engine was lost again within
 /// the grace minute (`resumed_young`), until an execution stays up.
 #[test]
