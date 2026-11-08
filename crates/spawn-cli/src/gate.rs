@@ -7,19 +7,25 @@
 //! verdict: candidate code once wrote an accepted line to the gate's stdout
 //! through /proc and killed the gate. A gate that exits non-zero, or dies
 //! of a signal, is an abort whatever it printed, with one exception: exit
-//! [`NO_ROOM_EXIT`] *and* a no-room fact in the verdict file
-//! (`{"no_room":true,"free_kb":n,"min_gb":n,"tmpdir":"…"}`) means TMPDIR had
-//! no room to judge ([`GateFailure::NoRoom`]). The gate writes that file
-//! before any candidate code runs (scripts/disk.sh `gate_room`).
+//! [`NO_ROOM_EXIT`] *and* a no-room fact in the verdict file means the host
+//! was short of room ([`GateFailure::NoRoom`]): TMPDIR under the floor
+//! (`{"no_room":true,"free_kb":n,"min_gb":n,"tmpdir":"…"}`, written before
+//! any candidate code runs, scripts/disk.sh `gate_room`), or a scenario run
+//! that gave up waiting for one of the host's scenario slots
+//! (`{"no_room":true,"check":"host scenario slot","waited_ms":n,"budget":n}`,
+//! scripts/rsi/gate.sh "Host scenario slots"). `Shortfall` names the check,
+//! its measure and its threshold for either.
 //!
-//! A TMPDIR with no room at all may leave no fact: the gate cannot write
-//! its verdict file, or this process cannot create its private directory.
-//! Then this process measures the free space itself ([`judge`]'s `free_kb`,
-//! `df` in production): of the directory it could not create in, or of the
-//! gate's TMPDIR after an exit [`NO_ROOM_EXIT`] with no readable fact. It
-//! records [`GateFailure::NoRoom`] with its own measurement only when that is
-//! under the floor (SPAWN_GATE_MIN_FREE_GB, default 10). Otherwise the run is
-//! an abort, as is a fact with any other exit status.
+//! A TMPDIR with no room at all may leave no fact in the file: the gate
+//! cannot write it, or this process cannot create its private directory.
+//! The gate prints the fact as well, so the last JSON line of stdout is read
+//! first (a slot wait keeps its own shape); failing that, this process
+//! measures the free space itself ([`judge`]'s `free_kb`, `df` in
+//! production): of the directory it could not create in, or of the gate's
+//! TMPDIR after an exit [`NO_ROOM_EXIT`] with no readable fact. It records
+//! [`GateFailure::NoRoom`] with its own measurement only when that is under
+//! the floor (SPAWN_GATE_MIN_FREE_GB, default 10). Otherwise the run is an
+//! abort, as is a fact with any other exit status.
 //!
 //! **A host fault is no verdict either.** Exit [`HOST_FAULT_EXIT`] *and* a
 //! host-fault fact in the verdict file (`{"host_fault":true,"scenario",
@@ -350,6 +356,16 @@ pub(crate) struct Room {
     probe: std::sync::Arc<DatabaseProbe>,
 }
 
+/// A wait in one line: tenths of a second under a minute, tenths of a minute
+/// from there.
+pub(crate) fn spoken_ms(ms: u64) -> String {
+    if ms >= 60_000 {
+        format!("{}.{} min", ms / 60_000, (ms % 60_000) / 6_000)
+    } else {
+        format!("{}.{} s", ms / 1000, (ms % 1000) / 100)
+    }
+}
+
 /// What fell short before a gate: the check, what it measured, and the
 /// threshold it measured against.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,39 +385,49 @@ pub(crate) enum Shortfall {
         probe: String,
         error: String,
     },
+    /// A scenario run waited for one of the host's slots (scripts/rsi/gate.sh
+    /// "Host scenario slots") past its own bound: the wait and the budget it
+    /// waited against. A shortfall of the host's capacity, like the others:
+    /// not a verdict on the work, judged again later.
+    Slot { waited_ms: u64, budget: u64 },
 }
 
 impl Shortfall {
-    /// The check's name in the record: `disk`, `memory` or `database`.
+    /// The check's name in the record: `disk`, `memory`, `database` or
+    /// `host scenario slot`.
     pub(crate) fn check(&self) -> &'static str {
         match self {
             Self::Disk { .. } => "disk",
             Self::Memory { .. } => "memory",
             Self::Database { .. } => "database",
+            Self::Slot { .. } => "host scenario slot",
         }
     }
 
-    /// What the check measured: free KiB, available MiB, or the error.
+    /// What the check measured: free KiB, available MiB, the error, or the
+    /// wait in milliseconds.
     pub(crate) fn measured(&self) -> serde_json::Value {
         match self {
             Self::Disk { free_kb, .. } => (*free_kb).into(),
             Self::Memory { available_mb, .. } => (*available_mb).into(),
             Self::Database { error, .. } => error.as_str().into(),
+            Self::Slot { waited_ms, .. } => (*waited_ms).into(),
         }
     }
 
-    /// What it measured against: the floor in KiB, the floor in MiB, or
-    /// the probe it failed.
+    /// What it measured against: the floor in KiB, the floor in MiB, the
+    /// probe it failed, or the host's scenario budget.
     pub(crate) fn threshold(&self) -> serde_json::Value {
         match self {
             Self::Disk { min_gb, .. } => min_gb.saturating_mul(1_048_576).into(),
             Self::Memory { min_mb, .. } => (*min_mb).into(),
             Self::Database { probe, .. } => probe.as_str().into(),
+            Self::Slot { budget, .. } => (*budget).into(),
         }
     }
 
     /// The measure against its threshold, in one line for the log.
-    fn line(&self) -> String {
+    pub(crate) fn line(&self) -> String {
         match self {
             Self::Disk {
                 free_kb,
@@ -424,6 +450,10 @@ impl Shortfall {
                 probe,
                 error,
             } => format!("database: the test database ({server}) failed \"{probe}\": {error}"),
+            Self::Slot { waited_ms, budget } => format!(
+                "host scenario slot: waited {} for one of SPAWN_GATE_HOST_JOBS={budget}",
+                spoken_ms(*waited_ms)
+            ),
         }
     }
 }
@@ -717,15 +747,12 @@ pub(crate) enum GateFailure {
     /// The gate ran but gave no verdict to believe: a non-zero or signalled
     /// exit, or no verdict file. `log` is what it printed.
     Aborted { reason: String, log: String },
-    /// TMPDIR had less than SPAWN_GATE_MIN_FREE_GB free, so the gate did not
-    /// start. A fact about the host, not the work. It names what the gate
-    /// saw: free KiB, the floor in GiB, and the directory.
-    NoRoom {
-        free_kb: u64,
-        min_gb: u64,
-        tmpdir: String,
-        log: String,
-    },
+    /// The host was short of room, so the gate did not judge: TMPDIR under
+    /// SPAWN_GATE_MIN_FREE_GB (the gate did not start), or a scenario run
+    /// that waited for a host scenario slot past its bound (exit
+    /// [`NO_ROOM_EXIT`] with the slot fact). A fact about the host, not the
+    /// work. `short` names the check, its measure and its threshold.
+    NoRoom { short: Shortfall, log: String },
     /// The gate found a scenario failing where the candidate is not to
     /// blame (exit [`HOST_FAULT_EXIT`] with its fact): `scenario`, where it
     /// failed (`on`: `base`, or `candidate and base`), its runs' exits as
@@ -1023,9 +1050,11 @@ fn judge_in(
         let min_gb = floor?;
         let free = free_kb(path)?;
         (free < min_gb.saturating_mul(1_048_576)).then(|| GateFailure::NoRoom {
-            free_kb: free,
-            min_gb,
-            tmpdir: path.display().to_string(),
+            short: Shortfall::Disk {
+                free_kb: free,
+                min_gb,
+                tmpdir: path.display().to_string(),
+            },
             log: format!(
                 "{log}! integrate: {why}; measured {free} KiB free in {}, under \
                  SPAWN_GATE_MIN_FREE_GB={min_gb}\n",
@@ -1074,8 +1103,19 @@ fn judge_in(
     let verdict = std::fs::read_to_string(&verdict_path).ok();
     match decide(&run, verdict.as_deref()) {
         // Exit 5 with no readable fact: the gate said "no room" but could
-        // not write it down. Measure; believe it only under the floor.
+        // not write it down. It also prints the fact, so read that before
+        // measuring: a slot wait keeps its own shape instead of passing for
+        // a disk shortfall, and one no disk measure could confirm.
         Err(GateFailure::Aborted { reason, log }) if run.status.code() == Some(NO_ROOM_EXIT) => {
+            if let Some(fact) = run
+                .stdout
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .and_then(no_room)
+            {
+                return Err(GateFailure::NoRoom { short: fact, log });
+            }
             Err(short(
                 &tmpdir,
                 &log,
@@ -1121,12 +1161,10 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
         log: record(&run.stdout),
     };
     if run.status.code() == Some(NO_ROOM_EXIT)
-        && let Some((free_kb, min_gb, tmpdir)) = verdict.and_then(no_room)
+        && let Some(short) = verdict.and_then(no_room)
     {
         return Err(GateFailure::NoRoom {
-            free_kb,
-            min_gb,
-            tmpdir,
+            short,
             log: record(&run.stdout),
         });
     }
@@ -1224,7 +1262,7 @@ fn flakes(value: &serde_json::Value) -> Vec<String> {
 
 /// The no-room fact of a verdict file, `(free_kb, min_gb, tmpdir)`: one
 /// JSON line with `no_room` true, whole numbers and a directory.
-fn no_room(file: &str) -> Option<(u64, u64, String)> {
+fn no_room(file: &str) -> Option<Shortfall> {
     let line = file.trim();
     if line.contains('\n') {
         return None;
@@ -1233,10 +1271,22 @@ fn no_room(file: &str) -> Option<(u64, u64, String)> {
     if value.get("no_room")?.as_bool() != Some(true) || value.get("verdict").is_some() {
         return None;
     }
+    // A scenario run that gave up waiting for one of the host's slots: its
+    // own shape, so the record says `host scenario slot`, not `disk`.
+    if value.get("check").and_then(serde_json::Value::as_str) == Some("host scenario slot") {
+        return Some(Shortfall::Slot {
+            waited_ms: value.get("waited_ms")?.as_u64()?,
+            budget: value.get("budget")?.as_u64()?,
+        });
+    }
     let free_kb = value.get("free_kb")?.as_u64()?;
     let min_gb = value.get("min_gb")?.as_u64()?;
     let tmpdir = value.get("tmpdir")?.as_str()?;
-    (!tmpdir.is_empty()).then(|| (free_kb, min_gb, tmpdir.to_string()))
+    (!tmpdir.is_empty()).then(|| Shortfall::Disk {
+        free_kb,
+        min_gb,
+        tmpdir: tmpdir.to_string(),
+    })
 }
 
 /// The host-fault fact of a verdict file: one JSON line with `host_fault`
@@ -1411,7 +1461,7 @@ pub(crate) fn count_scenarios(directory: &Path) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaseDisagrees, Cpu, GateFailure, PrivateDirectory, gate_env, judge, judge_in,
+        BaseDisagrees, Cpu, GateFailure, PrivateDirectory, Shortfall, gate_env, judge, judge_in,
         on_shared_server, run_bounded, withhold_owners_cluster, write_gate_env,
     };
     use std::path::{Path, PathBuf};
@@ -1819,9 +1869,12 @@ mod tests {
             "echo 'gate: 2.0 GiB free' >&2\necho '{NO_ROOM_FACT}' >\"$SPAWN_GATE_VERDICT\"\nexit 5\n"
         ));
         let Err(GateFailure::NoRoom {
-            free_kb,
-            min_gb,
-            tmpdir,
+            short:
+                Shortfall::Disk {
+                    free_kb,
+                    min_gb,
+                    tmpdir,
+                },
             log,
         }) = gate.judge(&path_only())
         else {
@@ -1832,6 +1885,41 @@ mod tests {
             (2_097_152, 10, "/data/tmp")
         );
         assert!(log.contains("! gate: 2.0 GiB free"), "{log}");
+    }
+
+    /// A scenario run that gave up waiting for a host scenario slot: the
+    /// same no-room class, its own check, measure and threshold.
+    #[test]
+    fn exit_5_with_the_slot_fact_is_no_room_for_the_slot() {
+        let fact =
+            r#"{"no_room":true,"check":"host scenario slot","waited_ms":1800000,"budget":2}"#;
+        let gate = FakeGate::new(&format!("echo '{fact}' >\"$SPAWN_GATE_VERDICT\"\nexit 5\n"));
+        let Err(GateFailure::NoRoom {
+            short: Shortfall::Slot { waited_ms, budget },
+            ..
+        }) = gate.judge(&path_only())
+        else {
+            panic!("a slot wait is no room");
+        };
+        assert_eq!((waited_ms, budget), (1_800_000, 2));
+    }
+
+    /// The fact reached stdout but not the file (a full disk): the slot
+    /// shape survives the fallback, where a disk measure would be wrong.
+    #[test]
+    fn exit_5_with_the_fact_on_stdout_alone_keeps_its_slot_shape() {
+        let fact = r#"{"no_room":true,"check":"host scenario slot","waited_ms":2000,"budget":1}"#;
+        let gate = FakeGate::new(&format!("echo '{fact}'\nexit 5\n"));
+        // Room to spare by measure: the slot fact still decides.
+        let Err(GateFailure::NoRoom {
+            short: Shortfall::Slot { waited_ms, budget },
+            log,
+        }) = gate.judge_room(&path_only(), &std::env::temp_dir(), Some(u64::MAX))
+        else {
+            panic!("the printed fact keeps the slot shape");
+        };
+        assert_eq!((waited_ms, budget), (2_000, 1));
+        assert!(log.contains("host scenario slot"), "{log}");
     }
 
     #[test]
@@ -1867,9 +1955,12 @@ mod tests {
         let gate = FakeGate::new("exit 0\n");
         let full = Path::new("/nonexistent/full-tmp");
         let Err(GateFailure::NoRoom {
-            free_kb,
-            min_gb,
-            tmpdir,
+            short:
+                Shortfall::Disk {
+                    free_kb,
+                    min_gb,
+                    tmpdir,
+                },
             log,
         }) = gate.judge_room(&path_only(), full, Some(0))
         else {
@@ -1906,9 +1997,12 @@ mod tests {
             env
         };
         let Err(GateFailure::NoRoom {
-            free_kb,
-            min_gb,
-            tmpdir,
+            short:
+                Shortfall::Disk {
+                    free_kb,
+                    min_gb,
+                    tmpdir,
+                },
             log,
         }) = gate.judge_room(&env("4"), &parent, Some(0))
         else {
