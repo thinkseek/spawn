@@ -8,6 +8,35 @@
 //! it writes that event only after the final checkpoint, the terminal kill
 //! and the unmount. A refold of the log therefore never repeats cleanup.
 //!
+//! **Every execution runs in a resource envelope of its own** (objective
+//! 029). On a host whose systemd user manager delegates the memory
+//! controller (and unless SPAWN_ENVELOPE=off), the pane runs the engine
+//! through `systemd-run --user --scope --unit <slice stem>-<execution
+//! id>.scope --slice <slice> -p MemoryHigh=… -p MemoryMax=… -p
+//! MemorySwapMax=… -p OOMPolicy=stop`, so the engine and everything it
+//! starts (builds, tests, tools and their children) are in that scope's
+//! cgroup, directly inside Spawn's slice. One execution that runs away is
+//! throttled at its MemoryHigh, killed at its MemoryMax, and the kill ends
+//! that execution only: `OOMPolicy=stop` ends the rest of its scope, no
+//! other scope and not the slice. The start records the scope and its
+//! cgroup in `execution.started`, and the end classifies a kill from the
+//! scope's own `memory.events` `oom_kill` (or its unit's `Result`
+//! `oom-kill`, read before the unit is reset), never from an exit status:
+//! the end is cause `memory_limit`, its final checkpoint and unmount run as
+//! for any end, and objective 028's `execution.interrupted` record (cause
+//! `memory_limit`, path `resume`) says which scope and how many kills. A
+//! scope is no unit left behind once its end is recorded.
+//!
+//! **A start or a resume is admitted only when its envelope fits**, under
+//! the slice (its `anon` + `shmem` at most the slice's MemoryMax minus the
+//! envelope's MemoryMax) and on the host (`MemAvailable` at least the
+//! envelope's MemoryMax). A start that does not fit writes `admission.waiting`
+//! once and stays unfinished — neither it nor its execution fails — and is
+//! decided again at the next pass, so a restarted Bridge goes on with it; when
+//! it runs it writes `admission.admitted` with `waited_ms`. A host without a
+//! reachable user manager, or with SPAWN_ENVELOPE=off, runs executions as
+//! before: no scope, no admission.
+//!
 //! An input to a busy session waits for its turn (docs/design.md §5). An
 //! `Input` from a person or the supervisor (any principal but the loops in
 //! [`LOOP_PRINCIPALS`]) that finds the pane not ready, or a capture that
@@ -46,9 +75,10 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::command::{Claimed, CommandAction, Outcome};
+use crate::envelope::{Admission, Envelope, ScopeFacts, admit};
 use crate::event::{
-    ArtifactRef, CheckpointReason, CommandStep, ENGINE, EndCause, EventKind, EventRecord, Fork,
-    GlobalPosition, ModelProfile, NewEvent, Source,
+    ArtifactRef, CheckpointReason, CommandStep, ENGINE, EndCause, EnvelopeRef, EventKind,
+    EventRecord, Fork, GlobalPosition, ModelProfile, NewEvent, Source,
 };
 use crate::id::{
     AgentId, BranchName, CommandId, CommitId, ExecutionId, SessionId, TerminalName, WorkspaceId,
@@ -56,8 +86,8 @@ use crate::id::{
 use crate::ingest::{claude_line, claude_version};
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
-    BaseMerge, Branch, CommandQueue, Commit, EventLog, Launch, READ_LIMIT, Runner, StoreError,
-    TerminalError, TerminalHost, TranscriptArchive, WorkspaceError, WorkspaceStore,
+    BaseMerge, Branch, CommandQueue, Commit, EventLog, HostRecords, Launch, READ_LIMIT, Runner,
+    StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError, WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
 use crate::time::{Clock, SystemClock};
@@ -171,6 +201,17 @@ pub struct BridgeConfig {
     pub screen_refresh: Duration,
     /// The model relay, when Claude Code engines go through one.
     pub model_relay: Option<ModelRelay>,
+    /// The resource envelope every execution runs in (objective 029), when
+    /// the host has one: a systemd user scope of its own inside Spawn's
+    /// slice, with its own MemoryHigh, MemoryMax and MemorySwapMax. None
+    /// when SPAWN_ENVELOPE=off, when no user manager is reachable, or on a
+    /// host whose user manager does not delegate the memory controller:
+    /// executions then run as before.
+    pub envelope: Option<Envelope>,
+    /// Where the Bridge records admission waits and interruptions
+    /// ([`HostRecords`], the owner-only `spawn_host_record`). Needed only
+    /// with an [`Self::envelope`].
+    pub records: Option<Arc<dyn HostRecords>>,
 }
 
 impl BridgeConfig {
@@ -191,6 +232,8 @@ impl BridgeConfig {
             claude_projects: "/root/.claude/projects".to_string(),
             screen_refresh: Duration::from_secs(30),
             model_relay: None,
+            envelope: None,
+            records: None,
         }
     }
 }
@@ -281,6 +324,11 @@ struct Follow {
     /// execution (the terminal gone, or there and hosting no runner): the
     /// end record's `evidence`.
     evidence: Option<String>,
+    /// The execution's resource envelope, read at its end (objective 029):
+    /// its scope's cgroup and unit, so a memory-limit kill is classified
+    /// from the scope's own facts and the interruption record says which
+    /// scope it was.
+    envelope: Option<ScopeFacts>,
 }
 
 /// What the Bridge knows about one session.
@@ -1038,6 +1086,12 @@ impl Bridge {
                 }
             },
         };
+        // A memory-limit kill is read from the execution's own scope at its
+        // end, whatever the runner wrote (objective 029).
+        let end = end.map(|(cause, exit_code)| match self.envelope_end(active) {
+            Some(EndCause::MemoryLimit) => (EndCause::MemoryLimit, None),
+            _ => (cause, exit_code),
+        });
         if let Some((cause, exit_code)) = end {
             // What the engine wrote last comes before its end.
             self.follow_output(agent_id, session, native, active, report)?;
@@ -1435,6 +1489,14 @@ impl Bridge {
                 evidence: active.follow.evidence.clone(),
             },
         )?;
+        // What the end was, if it was the envelope's (objective 028's
+        // record), and then the scope goes: a failed unit keeps its `Result`
+        // only until it is read, and a unit left behind would be one per
+        // execution.
+        self.record_interruption(agent_id, session, active, cause, report);
+        if let Some(envelope) = self.config.envelope.as_ref() {
+            envelope.reset_failed(&envelope.execution_scope(&active.execution_id));
+        }
         Ok(true)
     }
 
@@ -1641,6 +1703,18 @@ impl Bridge {
                 "stored action is not valid".to_string(),
             )));
         };
+        // A start or a resume runs only when its envelope fits under the
+        // slice and on the host (objective 029); while it does not, the
+        // command waits unfinished, decided again at the next pass.
+        if matches!(
+            &action,
+            CommandAction::Start { .. } | CommandAction::Resume { .. }
+        ) {
+            if !self.admitted(claimed)? {
+                return Ok(Handled::Waiting);
+            }
+            self.finish_admission(claimed)?;
+        }
         // What a command appends comes after the session's waiting commit
         // records. While the log refuses them the command is not handled
         // (the error ends the tick; the lease brings the command back).
@@ -1921,6 +1995,10 @@ impl Bridge {
             unmounting: false,
             follow: Follow::default(),
         };
+        // The envelope the engine is about to run in, named before it
+        // starts: any reader of the log finds the cgroup the execution ran
+        // in (objective 029).
+        let envelope = self.envelope_ref(&active);
         // The event goes first: a crash after it leaves a recorded execution
         // whose missing terminal the next tick ends as lost.
         let recorded = self.append(
@@ -1936,6 +2014,7 @@ impl Bridge {
                 fork,
                 model,
                 transcript_from,
+                envelope,
             },
         );
         match recorded {
@@ -2547,6 +2626,119 @@ impl Bridge {
         Ok(Some(id))
     }
 
+    /// Whether a start or a resume may run now (objective 029): its
+    /// execution envelope must fit under the slice and on the host. While it
+    /// does not, the wait is recorded once (`admission.waiting`) and the
+    /// command stays unfinished — claimed again after
+    /// [`BridgeConfig::input_wait_retry`] and decided from that pass's
+    /// measures — so nothing starts and no command fails. A start that fits
+    /// at once writes nothing.
+    fn admitted(&self, claimed: &Claimed) -> Result<bool, StoreError> {
+        let (Some(envelope), Some(records)) = (&self.config.envelope, &self.config.records) else {
+            return Ok(true);
+        };
+        admit(
+            records.as_ref(),
+            &claimed_admission(claimed, envelope.settings.execution.max),
+            envelope.shortfall(envelope.settings.execution.max),
+        )
+    }
+
+    /// The `admission.admitted` record of a start or resume that waited,
+    /// written once when it runs: `waited_ms` is from the wait's first
+    /// decision to now, by the database's clock. A start that fits at once
+    /// wrote no wait and writes nothing here.
+    fn finish_admission(&self, claimed: &Claimed) -> Result<(), StoreError> {
+        let (Some(envelope), Some(records)) = (&self.config.envelope, &self.config.records) else {
+            return Ok(());
+        };
+        crate::envelope::admitted(
+            records.as_ref(),
+            &claimed_admission(claimed, envelope.settings.execution.max),
+        )
+    }
+
+    /// The resource envelope the execution runs in, as its start records it:
+    /// the slice, the scope unit and the cgroup, so any reader of the log
+    /// finds the cgroup the execution ran in.
+    fn envelope_ref(&self, active: &Active) -> Option<EnvelopeRef> {
+        let envelope = self.config.envelope.as_ref()?;
+        let scope = envelope.execution_scope(&active.execution_id);
+        Some(EnvelopeRef {
+            slice: envelope.settings.slice.clone(),
+            cgroup: envelope.scope_cgroup(&scope).display().to_string(),
+            scope,
+        })
+    }
+
+    /// The end the execution's envelope makes of it (objective 029): a
+    /// memory-limit kill, read from the execution's own scope now — its
+    /// `memory.events` `oom_kill`, or its unit's `Result` `oom-kill` when
+    /// the cgroup is already gone — never from an exit status (137 is any
+    /// SIGKILL) and never from the host's state. The facts are kept for the
+    /// end's record and its interruption.
+    fn envelope_end(&self, active: &mut Active) -> Option<EndCause> {
+        let envelope = self.config.envelope.as_ref()?;
+        let scope = envelope.execution_scope(&active.execution_id);
+        let mut facts = envelope.scope_facts(&scope);
+        if facts.memory_peak.is_none() {
+            facts.memory_peak = read_peak(&envelope_file(active));
+        }
+        let killed = facts.oom_killed();
+        active.follow.envelope = Some(facts);
+        killed.then_some(EndCause::MemoryLimit)
+    }
+
+    /// Record a memory-limit kill as objective 028's interruption
+    /// (`execution.interrupted`, cause `memory_limit`, path `resume`), once
+    /// per execution, from the facts the scope gave: any reader sees why the
+    /// execution ended and which scope it was in.
+    fn record_interruption(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        active: &Active,
+        cause: EndCause,
+        report: &mut TickReport,
+    ) {
+        if cause != EndCause::MemoryLimit {
+            return;
+        }
+        let (Some(envelope), Some(records)) = (&self.config.envelope, &self.config.records) else {
+            return;
+        };
+        let execution = active.execution_id.to_string();
+        match records.interrupted(&execution) {
+            Ok(false) => {}
+            Ok(true) => return,
+            Err(error) => {
+                report
+                    .warnings
+                    .push(format!("{session}: interruption record: {error}"));
+                return;
+            }
+        }
+        let mut facts = active.follow.envelope.clone().unwrap_or_default();
+        if facts.scope.is_empty() {
+            facts.scope = envelope.execution_scope(&active.execution_id);
+        }
+        let record = json!({
+            "type": "execution.interrupted",
+            "agent_id": agent_id.to_string(),
+            "session_id": session.to_string(),
+            "execution_id": execution,
+            "cause": "memory_limit",
+            "path": "resume",
+            "attempt": 1,
+            "evidence": facts.evidence(envelope.settings.execution.max),
+        });
+        if let Err(error) = records.record(&record) {
+            report
+                .warnings
+                .push(format!("{session}: interruption record: {error}"));
+        }
+    }
+
     fn launch(&self, claimed: &Claimed, active: &Active, run: &Run<'_>) -> Launch {
         let Run {
             native,
@@ -2581,11 +2773,35 @@ impl Bridge {
         // The runner writes the exit status where the Bridge reads it: the
         // pane needs no login of its own.
         environment.push(("SPAWN_EXIT_FILE".to_string(), exit_file(active)));
+        // The engine (and the runner, and everything either starts) runs in
+        // a scope of its own inside the slice (objective 029): one build,
+        // test or tool that runs away is bounded by the execution's
+        // MemoryHigh, MemoryMax and MemorySwapMax, and its kill ends this
+        // execution only.
+        let (program, arguments) = match self.config.envelope.as_ref() {
+            Some(envelope) => {
+                environment.push(("SPAWN_ENVELOPE_FILE".to_string(), envelope_file(active)));
+                // The pane's `systemd-run` finds the manager whose bus the
+                // Bridge probed, whatever the tmux server's environment says.
+                environment.push((
+                    "XDG_RUNTIME_DIR".to_string(),
+                    envelope.manager.runtime_dir.clone(),
+                ));
+                let scope = envelope.execution_scope(&active.execution_id);
+                envelope.wrap(
+                    &scope,
+                    envelope.settings.execution,
+                    &self.config.spawn_program,
+                    &arguments,
+                )
+            }
+            None => (self.config.spawn_program.clone(), arguments),
+        };
         Launch {
             terminal: active.terminal(),
             workspace: active.workspace.clone(),
             cwd: active.workspace.path().to_string(),
-            program: self.config.spawn_program.clone(),
+            program,
             arguments,
             environment,
         }
@@ -3049,6 +3265,7 @@ fn cause_name(cause: EndCause) -> &'static str {
         EndCause::Exited => "exited",
         EndCause::Stopped => "stopped",
         EndCause::Lost => "lost",
+        EndCause::MemoryLimit => "memory_limit",
     }
 }
 
@@ -3062,6 +3279,10 @@ fn untyped_because(cause: Option<EndCause>) -> String {
         }
         Some(EndCause::Lost) => {
             "the session's execution ended (lost) before the input was typed".to_string()
+        }
+        Some(EndCause::MemoryLimit) => {
+            "the session's execution was killed by its memory limit before the input was              typed"
+                .to_string()
         }
         None => "the session's execution ended before the input was typed".to_string(),
     }
@@ -3207,4 +3428,35 @@ fn exit_file(active: &Active) -> String {
         active.workspace.path(),
         active.execution_id
     )
+}
+
+/// Where the runner notes its cgroup's memory peak (`memory.peak`) while it
+/// runs: the scope's cgroup is gone by the time the Bridge reads the end, so
+/// the last reading the runner wrote is what an end's evidence can say.
+fn envelope_file(active: &Active) -> String {
+    format!(
+        "{}/.spawn/envelope-{}",
+        active.workspace.path(),
+        active.execution_id
+    )
+}
+
+/// The admission of a start or resume command: the record's fields and the
+/// envelope it must fit in.
+fn claimed_admission<'a>(claimed: &Claimed, envelope_bytes: u64) -> Admission<'a> {
+    Admission {
+        kind: "execution",
+        fields: json!({
+            "agent_id": claimed.agent_id.to_string(),
+            "session_id": claimed.session_id.to_string(),
+            "command_id": claimed.command_id.0,
+        }),
+        envelope_bytes,
+        after: 0,
+    }
+}
+
+/// The bytes `path` holds, a number, when it reads as one.
+fn read_peak(path: &str) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }

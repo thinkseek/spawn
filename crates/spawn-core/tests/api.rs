@@ -1120,6 +1120,7 @@ fn observer_writes_only_on_change() {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                envelope: None,
             },
         })
         .expect("append succeeds");
