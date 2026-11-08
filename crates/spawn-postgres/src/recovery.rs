@@ -53,18 +53,19 @@ where (s.agent_id like 'agent\_worker\_%' or s.agent_id like 'agent\_resident\_%
   )";
 
 /// Whether the log holds, above `$1` (an event id), a record the recovery
-/// reads: a failed turn, a tool call or turn (its progress), an execution's
-/// end, a native session's start, a commit's head, one of its own
-/// interruption or clear records, or a task's over-budget Stop. The loop
-/// asks this once before reading every session's facts, so a pass whose
-/// watermark moved on some other event (a screen, a delivery) costs one
-/// index range read and nothing more.
+/// acts on by itself: a failed turn, an execution's end, one of its own
+/// interruption or clear records, a task's over-budget Stop, or a loop's
+/// start. Progress records (a tool call, a turn's end, a commit, a native
+/// session's start) do not move it: a live execution needs no read, and a
+/// wait is re-read every probe anyway. The loop asks this once before
+/// reading every session's facts, so a pass whose watermark moved on some
+/// other event (a screen, a delivery, a turn's progress) costs one index
+/// range read and nothing more.
 pub(crate) const RECOVERY_SIGNALS: &str = r"
 select exists (
   select 1 from spawn_events e
    where e.id > $1
-     and (e.event_name in ('turn.failed', 'tool.started', 'tool.completed', 'turn.stopped',
-                           'execution.ended', 'session.native_started', 'artifact.committed')
+     and (e.event_name in ('turn.failed', 'execution.ended')
           or (e.event_name = 'control.recorded'
               and e.kind -> 'detail' -> 'record' ->> 'type' in
                   ('execution.interrupted', 'execution.cleared', 'task.over_budget',
