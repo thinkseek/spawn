@@ -194,6 +194,7 @@ mod tests {
             resumed_young: 0,
             failed_resume: None,
             stops: Vec::new(),
+            recovered: None,
             charter: None,
             jobs,
         }

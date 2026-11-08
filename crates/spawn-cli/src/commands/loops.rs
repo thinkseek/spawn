@@ -203,6 +203,23 @@ impl Step {
         self.mark = Some(watermark);
         self.due = due;
     }
+
+    /// The watermark this step last acted on (`None`: never).
+    fn mark(&self) -> Option<i64> {
+        self.mark
+    }
+
+    /// Record that the step saw `watermark` and had nothing to do: its own
+    /// clock, an open wait's probe, keeps the time it had.
+    fn advance(&mut self, watermark: i64) {
+        self.mark = Some(watermark);
+    }
+
+    /// Whether the step's own clock has reached its due time, whatever the
+    /// log says: an open wait's probe, or a retry a record named.
+    fn clock_due(&self, now_ms: i64) -> bool {
+        self.due.is_some_and(|due| due <= now_ms)
+    }
 }
 
 /// The steps of one loop, each with what decides whether a pass runs it.
@@ -210,6 +227,7 @@ impl Step {
 struct Schedule {
     bridge: Step,
     observer: Step,
+    recovery: Step,
     dispatch: Step,
     residents: Step,
     alive: Step,
@@ -221,6 +239,7 @@ impl Schedule {
         Self {
             bridge: Step::new(),
             observer: Step::new(),
+            recovery: Step::new(),
             dispatch: Step::new(),
             residents: Step::new(),
             alive: Step::new(),
@@ -228,35 +247,31 @@ impl Schedule {
         }
     }
 
-    /// Whether one of the steps waits for no time still to come: its due
-    /// time has been reached, and it is the step's to act on now.
-    fn due(&self, now_ms: i64) -> bool {
+    /// Every step, for the rules that hold for all of them.
+    fn steps(&self) -> [&Step; 7] {
         [
             &self.bridge,
             &self.observer,
+            &self.recovery,
             &self.dispatch,
             &self.residents,
             &self.alive,
             &self.alerts,
         ]
-        .into_iter()
-        .any(|step| step.due.is_some_and(|due| due <= now_ms))
+    }
+
+    /// Whether one of the steps waits for no time still to come: its due
+    /// time has been reached, and it is the step's to act on now.
+    fn due(&self, now_ms: i64) -> bool {
+        self.steps()
+            .into_iter()
+            .any(|step| step.due.is_some_and(|due| due <= now_ms))
     }
 
     /// The earliest due time among the steps; `None` when none waits on a
     /// clock.
     fn earliest(&self) -> Option<i64> {
-        [
-            &self.bridge,
-            &self.observer,
-            &self.dispatch,
-            &self.residents,
-            &self.alive,
-            &self.alerts,
-        ]
-        .into_iter()
-        .filter_map(|step| step.due)
-        .min()
+        self.steps().into_iter().filter_map(|step| step.due).min()
     }
 }
 
@@ -265,30 +280,102 @@ fn now_ms() -> i64 {
     spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
 }
 
-/// Run the Bridge, the Observer, the disk watch, the dispatcher and the
-/// liveness rule, until SIGTERM or SIGINT ends it after its pass.
+/// How the loop counts failed passes. A pass that failed only because the
+/// database could not be reached paces the loop but never ends it: the
+/// engines run on untouched, and the recovery records the outage's
+/// interruptions at the first pass that gets through. Every other failure
+/// counts toward [`MAX_FAILURES`].
+#[derive(Default)]
+struct Pace {
+    failures: u32,
+    outages: u32,
+}
+
+/// The pause after a pass, and whether the pass could not reach the
+/// database at all.
+struct Paused {
+    wait: Duration,
+    unreachable: bool,
+}
+
+impl Pace {
+    /// The pause before the next pass, or an error once too many passes in a
+    /// row failed.
+    fn after(
+        &mut self,
+        errors: &[String],
+        interval: Duration,
+        recovery: &mut crate::recover::Recovery,
+    ) -> Result<Paused, String> {
+        let unreachable = errors
+            .iter()
+            .find(|error| spawn_core::port::is_unreachable(error));
+        if let Some(error) = unreachable {
+            recovery.failed(
+                spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0,
+                error,
+            );
+        }
+        let wait = if errors.is_empty() {
+            self.failures = 0;
+            self.outages = 0;
+            backoff(interval, self.failures)
+        } else if crate::recover::counts_as_failure(errors) {
+            self.failures = self.failures.saturating_add(1);
+            self.outages = 0;
+            if self.failures >= MAX_FAILURES {
+                return Err(format!("{} failed passes in a row; exiting", self.failures));
+            }
+            backoff(interval, self.failures)
+        } else {
+            // Only the database was unreachable: it does not count toward
+            // MAX_FAILURES, and the pause grows to at most 30 intervals.
+            self.outages = self.outages.saturating_add(1);
+            backoff(interval, self.outages)
+        };
+        Ok(Paused {
+            wait,
+            unreachable: unreachable.is_some(),
+        })
+    }
+}
+
+/// Run the Bridge, the Observer, the disk watch, the recovery, the
+/// dispatcher and the liveness rule, until SIGTERM or SIGINT ends it after
+/// its pass.
 ///
 /// What the loop reads follows what happens, not the clock
 /// (docs/fleet-architecture.md §3, docs/design.md §14): the log's watermark
 /// is read once a pass — one index-only read of `spawn_events`' primary
 /// key — and the Bridge's reading of the log and the queue, the Observer,
-/// the dispatcher and the liveness rule run only when that watermark has
-/// moved since they last ran, or when a time one of their records named has
-/// come. Between passes the loop waits on `LISTEN spawn_events` with a
-/// timeout of the earlier of the pass interval and the next due time, so a
-/// change ends the wait at once and is acted on sooner than a clock could,
-/// and a notification lost costs one interval at most. The Bridge's own
-/// reading of screens and transcripts is not on this schedule: neither is
-/// announced by an append, so it runs every pass.
+/// the recovery, the dispatcher and the liveness rule run only when that
+/// watermark has moved since they last ran, or when a time one of their
+/// records named has come. Between passes the loop waits on `LISTEN
+/// spawn_events` with a timeout of the earlier of the pass interval and the
+/// next due time, so a change ends the wait at once and is acted on sooner
+/// than a clock could, and a notification lost costs one interval at most.
+/// The Bridge's own reading of screens and transcripts is not on this
+/// schedule: neither is announced by an append, so it runs every pass.
+///
+/// The recovery ([`crate::recover`]) runs before the dispatcher and the
+/// liveness rule, and both give way to it: every way an execution ends — its
+/// end by exit, signal or a vanished terminal server, a turn the model
+/// failed, an outage of Spawn's own database it lived through — is one
+/// `execution.interrupted` record naming its cause and the path it takes,
+/// and each path brings the agent back without throwing the work away
+/// (docs/fleet-architecture.md §3.1: resume at once, then a doubling
+/// backoff, a handoff, a wait cleared by a recorded observation, or final).
 ///
 /// The loop holds its connections and one in-memory cursor, so its cost does
 /// not grow with the event log. A failed pass is logged and retried with a
-/// growing pause; the dispatcher's connection is reopened. After
+/// growing pause; the store, and with it the Bridge and the Observer, are
+/// rebuilt after a pass that could not reach the database. After
 /// [`MAX_FAILURES`] failed passes in a row the loop exits with an error and
-/// systemd starts it again.
+/// systemd starts it again — but a pass that failed only because the
+/// database could not be reached is [`Pace`]d, never counted: the engines
+/// run on untouched, and the loop outlives the outage.
 pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     let stopping = stop_on_signal()?;
-    let (bridge, observer) = runtime(flags)?;
     let (bounds, mut warnings) = dispatch::Bounds::from_env();
     let (waits, more) = crate::deliver::Waits::from_env();
     warnings.extend(more);
@@ -300,8 +387,8 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     let root = workspace_root(flags).map(std::path::PathBuf::from);
     let monitor = disk::Monitor::new(root.as_deref());
     let mut fleet = Fleet {
-        bridge,
-        observer,
+        flags,
+        running: Some(runtime(flags)?),
         store: None,
         listener: None,
         schedule: Schedule::new(),
@@ -310,21 +397,19 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         spawn: spawn_program(),
         workspace_root: root,
         disk: monitor,
+        terminals: crate::config::terminal_host(),
+        config: crate::recover::Config::from_env(),
+        recovery: crate::recover::Recovery::new(),
+        pace: Pace::default(),
+        pause: loop_interval(),
         bounds,
         waits,
         alerting,
         interval: loop_interval(),
         steps_at: None,
-        failures: 0,
     };
     loop {
-        fleet.pass();
-        if fleet.failed() >= MAX_FAILURES {
-            return Err(format!(
-                "{} failed passes in a row; exiting",
-                fleet.failed()
-            ));
-        }
+        fleet.pass()?;
         if fleet.wait(&stopping) {
             eprintln!("spawn loop: stopping; pending pushes are made first");
             return Ok(0);
@@ -334,9 +419,13 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
 
 /// The loop between passes: the Bridge, the Observer and the reads over the
 /// store, and the marks that say what each has acted on.
-struct Fleet {
-    bridge: spawn_core::bridge::Bridge,
-    observer: spawn_core::observe::Observer,
+struct Fleet<'a> {
+    /// The command line, for the Bridge and the Observer rebuilt after an
+    /// outage of the database.
+    flags: &'a Flags,
+    /// The Bridge and the Observer, built again after such an outage: each
+    /// holds its own connection, and the store does not reconnect.
+    running: Option<(spawn_core::bridge::Bridge, spawn_core::observe::Observer)>,
     /// The store's connection, reopened after a failed pass.
     store: Option<std::sync::Arc<PostgresStore>>,
     /// The connection that listens for `spawn_events`, on its own session.
@@ -347,6 +436,20 @@ struct Fleet {
     spawn: String,
     workspace_root: Option<std::path::PathBuf>,
     disk: disk::Monitor,
+    /// The terminal host the recovery asks whether a native session's
+    /// terminal server lives on (an end found with it gone is a host
+    /// restart).
+    terminals: spawn_host::TmuxHost,
+    /// The recovery's settings (`SPAWN_RECOVER_*`).
+    config: crate::recover::Config,
+    /// The recovery's own state: this loop's start, and the database outage
+    /// its failed passes made, cleared at its first good pass.
+    recovery: crate::recover::Recovery,
+    /// How many passes in a row failed, and how many in a row failed only
+    /// because the database could not be reached ([`Pace`]).
+    pace: Pace,
+    /// The pause [`Pace`] put after the last failed pass.
+    pause: Duration,
     bounds: dispatch::Bounds,
     /// The delivery waits `SPAWN_DELIVERY_RETRY_SECS` and
     /// `SPAWN_REISSUE_AFTER_SECS` set ([`crate::deliver::Waits`]).
@@ -361,25 +464,30 @@ struct Fleet {
     /// notifications inside one interval is one pass's work, not one run per
     /// event.
     steps_at: Option<std::time::Instant>,
-    /// Consecutive failed passes: the wait and the exit both grow with them.
-    failures: u32,
 }
 
-impl Fleet {
-    /// One pass: open the store if it was closed, read the watermark once,
-    /// run the steps it names, and read the Bridge's screens and
-    /// transcripts — which no append announces, so they are read every
-    /// pass.
-    fn pass(&mut self) {
+impl Fleet<'_> {
+    /// One pass: open the store and the runtime if they were closed, read
+    /// the watermark once, run the steps it names, and read the Bridge's
+    /// screens and transcripts — which no append announces, so they are read
+    /// every pass. The pass's failures are [`Pace`]d: one that could only
+    /// not reach the database never ends the loop.
+    fn pass(&mut self) -> Result<(), String> {
         let now = now_ms();
         let mut lines: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
-        let mut failed = false;
+        let mut errors: Vec<String> = Vec::new();
+        if self.running.is_none() {
+            match runtime(self.flags) {
+                Ok(built) => self.running = Some(built),
+                Err(error) => Fleet::fail(&mut errors, "runtime", &error),
+            }
+        }
         if self.store.is_none() {
             match open_store().map(std::sync::Arc::new) {
                 Ok(open) => self.store = Some(open),
                 Err(error) => {
-                    Fleet::fail(&mut failed, "store", &error);
+                    Fleet::fail(&mut errors, "store", &error);
                 }
             }
             self.listener = None;
@@ -388,7 +496,7 @@ impl Fleet {
             Some(open) => match open.watermark() {
                 Ok(watermark) => Some(watermark),
                 Err(error) => {
-                    Fleet::fail(&mut failed, "watermark", &error.to_string());
+                    Fleet::fail(&mut errors, "watermark", &error.to_string());
                     None
                 }
             },
@@ -400,18 +508,20 @@ impl Fleet {
         let due =
             self.schedule.due(now) || self.steps_at.is_none_or(|at| at.elapsed() >= self.interval);
         if let (Some(open), Some(watermark)) = (self.store.clone(), watermark) {
-            self.bridge_work(&open, watermark, now, &mut warnings, &mut failed);
+            self.bridge_work(&open, watermark, now, &mut warnings, &mut errors);
             if due {
                 self.steps_at = Some(std::time::Instant::now());
-                self.steps(&open, watermark, now, &mut lines, &mut failed);
+                self.steps(&open, watermark, now, &mut lines, &mut errors);
             }
         }
         // The screens and transcripts the Bridge reads are not announced by
         // an append: this is what keeps them on the pass interval, and what
         // keeps an engine's turn end seen as soon as it is written.
-        match self.bridge.poll() {
-            Ok(report) => warnings.extend(report.warnings),
-            Err(error) => Fleet::fail(&mut failed, "bridge", &error.to_string()),
+        if let Some((bridge, _)) = self.running.as_mut() {
+            match bridge.poll() {
+                Ok(report) => warnings.extend(report.warnings),
+                Err(error) => Fleet::fail(&mut errors, "bridge", &error.to_string()),
+            }
         }
         for warning in &warnings {
             eprintln!("spawn loop warning: {warning}");
@@ -419,14 +529,21 @@ impl Fleet {
         for line in &lines {
             println!("{line}");
         }
-        if failed {
-            // A broken connection is reopened on the next pass.
+        let paused = self
+            .pace
+            .after(&errors, self.interval, &mut self.recovery)?;
+        self.pause = paused.wait;
+        if !errors.is_empty() {
+            // A broken connection is reopened on the next pass, and the
+            // Bridge and the Observer are built again when it was the
+            // database that could not be reached.
             self.store = None;
             self.listener = None;
-            self.failures = self.failures.saturating_add(1);
-        } else {
-            self.failures = 0;
+            if paused.unreachable {
+                self.running = None;
+            }
         }
+        Ok(())
     }
 
     /// The Bridge's reading of the log and its claims of the queue: a few
@@ -439,48 +556,55 @@ impl Fleet {
         watermark: i64,
         now: i64,
         warnings: &mut Vec<String>,
-        failed: &mut bool,
+        errors: &mut Vec<String>,
     ) {
-        if self.schedule.bridge.runs(watermark, now) {
-            match self.bridge.work() {
-                Ok((report, more)) => {
-                    warnings.extend(report.warnings);
-                    // Its own wait is the earliest lease still running, or
-                    // the next pass when the claim stopped at its per-tick
-                    // limit and a command may still be waiting for one.
-                    let due = if more {
-                        Some(now)
-                    } else {
-                        open.next_lease_ms().unwrap_or_else(|error| {
-                            Fleet::fail(failed, "bridge", &error.to_string());
-                            None
-                        })
-                    };
-                    self.schedule.bridge.ran(watermark, due);
-                }
-                Err(error) => Fleet::fail(failed, "bridge", &error.to_string()),
+        if !self.schedule.bridge.runs(watermark, now) {
+            return;
+        }
+        // `None`: the runtime is built again on the next pass.
+        let worked = self.running.as_mut().map(|(bridge, _)| bridge.work());
+        match worked {
+            Some(Ok((report, more))) => {
+                warnings.extend(report.warnings);
+                // Its own wait is the earliest lease still running, or the
+                // next pass when the claim stopped at its per-tick limit and
+                // a command may still be waiting for one.
+                let due = if more {
+                    Some(now)
+                } else {
+                    open.next_lease_ms().unwrap_or_else(|error| {
+                        Fleet::fail(errors, "bridge", &error.to_string());
+                        None
+                    })
+                };
+                self.schedule.bridge.ran(watermark, due);
             }
+            Some(Err(error)) => Fleet::fail(errors, "bridge", &error.to_string()),
+            None => {}
         }
     }
 
     /// The steps whose input is the store besides the Bridge's own reads:
-    /// the Observer's judgements, the dispatcher, the liveness rule. Each
-    /// runs when the watermark moved or its own time came, and records both.
+    /// the Observer's judgements, the disk watch, the recovery, the
+    /// dispatcher and the liveness rule. Each runs when the watermark moved
+    /// or its own time came, and records both.
     fn steps(
         &mut self,
         open: &std::sync::Arc<PostgresStore>,
         watermark: i64,
         now: i64,
         lines: &mut Vec<String>,
-        failed: &mut bool,
+        errors: &mut Vec<String>,
     ) {
-        if self.schedule.observer.runs(watermark, now) {
-            match self.observer.tick() {
+        if self.schedule.observer.runs(watermark, now)
+            && let Some((_, observer)) = self.running.as_mut()
+        {
+            match observer.tick() {
                 Ok(_) => self
                     .schedule
                     .observer
-                    .ran(watermark, self.observer.next_due_ms()),
-                Err(error) => Fleet::fail(failed, "observer", &error.to_string()),
+                    .ran(watermark, observer.next_due_ms()),
+                Err(error) => Fleet::fail(errors, "observer", &error.to_string()),
             }
         }
         // The disk watch never fails a pass: a fleet must not stop because it
@@ -491,6 +615,12 @@ impl Fleet {
                 .check(open)
                 .unwrap_or_else(|error| vec![format!("disk: {error}")]),
         );
+        // The recovery first of the rules that revive an agent: it records
+        // every interruption once, with its cause and its evidence, and
+        // takes the one way back that cause has. The dispatcher's
+        // one-resume rule and the liveness rule's revival give way to what
+        // it has recorded (docs/fleet-architecture.md §3.1).
+        self.recovery_step(open, watermark, now, lines, errors);
         if self.dispatching && self.schedule.dispatch.runs(watermark, now) {
             match dispatch::step(
                 open,
@@ -505,7 +635,7 @@ impl Fleet {
                     lines.extend(more);
                     self.schedule.dispatch.ran(watermark, due);
                 }
-                Err(error) => Fleet::fail(failed, "dispatch", &error),
+                Err(error) => Fleet::fail(errors, "dispatch", &error),
             }
         }
         // Under the disk floor no resident is revived (a new execution); the
@@ -516,7 +646,7 @@ impl Fleet {
                     lines.extend(more);
                     self.schedule.residents.ran(watermark, due);
                 }
-                Err(error) => Fleet::fail(failed, "residents", &error),
+                Err(error) => Fleet::fail(errors, "residents", &error),
             }
         }
         if self.supervised && self.schedule.alive.runs(watermark, now) {
@@ -525,7 +655,7 @@ impl Fleet {
                     lines.extend(line);
                     self.schedule.alive.ran(watermark, due);
                 }
-                Err(error) => Fleet::fail(failed, "supervise", &error),
+                Err(error) => Fleet::fail(errors, "supervise", &error),
             }
         }
         // The alerts never fail a pass either: an error is said and tried
@@ -548,15 +678,84 @@ impl Fleet {
         }
     }
 
-    /// Log a failed step and mark the pass failed.
-    fn fail(failed: &mut bool, what: &str, error: &str) {
-        *failed = true;
-        eprintln!("spawn loop: {what}: {error}");
+    /// The recovery's step: record every interruption once, with its cause
+    /// and its evidence, and take the one way back that cause has. The
+    /// dispatcher's one-resume rule and the liveness rule's revival give way
+    /// to what it records (docs/fleet-architecture.md §3.1). It reads a few
+    /// kinds of record, not every event: a pass whose watermark moved on a
+    /// screen or a delivery asks once, cheaply, and skips every session's
+    /// facts when none of them is here; an open wait's probe, and an outage
+    /// the failed passes left, force it regardless.
+    fn recovery_step(
+        &mut self,
+        open: &std::sync::Arc<PostgresStore>,
+        watermark: i64,
+        now: i64,
+        lines: &mut Vec<String>,
+        errors: &mut Vec<String>,
+    ) {
+        // The recovery reads a few kinds of record, not every event: a pass
+        // whose watermark moved on a screen or a delivery asks once, cheaply,
+        // and skips every session's facts when none of them is here. An open
+        // wait's probe, and an outage the failed passes left, force it
+        // regardless.
+        let pending_outage = self.recovery.outage_pending();
+        if !self.schedule.recovery.runs(watermark, now) && !pending_outage {
+            return;
+        }
+        let forced = self.schedule.recovery.clock_due(now) || pending_outage;
+        let signals = if forced {
+            true
+        } else {
+            match open.recovery_signals(self.schedule.recovery.mark().unwrap_or(0)) {
+                Ok(signals) => signals,
+                Err(error) => {
+                    Fleet::fail(errors, "recover", &error.to_string());
+                    false
+                }
+            }
+        };
+        if signals {
+            match crate::deliver::Work::load(open) {
+                Ok(work) => {
+                    let world = crate::recover::World {
+                        store: open,
+                        work: &work,
+                        terminals: &self.terminals,
+                        monitor: &self.disk,
+                        root: self.workspace_root.as_deref(),
+                        config: &self.config,
+                        now_ms: now,
+                        spawn: &self.spawn,
+                    };
+                    match crate::recover::step(&mut self.recovery, &world) {
+                        Ok(more) => {
+                            lines.extend(more);
+                            // An open wait is re-read every probe (the
+                            // credentials file, the free space, a retry's
+                            // due time: [`crate::recover::Config::probe`]);
+                            // with none, the step runs again when the log
+                            // moves, never before — an idle pass then costs
+                            // the watermark read alone.
+                            let due = self.recovery.next_due(self.config.probe, now);
+                            self.schedule.recovery.ran(watermark, due);
+                        }
+                        Err(error) => Fleet::fail(errors, "recover", &error),
+                    }
+                }
+                Err(error) => Fleet::fail(errors, "recover", &error),
+            }
+        } else if self.schedule.recovery.runs(watermark, now) {
+            // Nothing the recovery reads moved: it acts on the watermark
+            // this pass and keeps the probe time an open wait already had.
+            self.schedule.recovery.advance(watermark);
+        }
     }
 
-    /// Consecutive failed passes.
-    fn failed(&self) -> u32 {
-        self.failures
+    /// Log a failed step and mark the pass failed.
+    fn fail(errors: &mut Vec<String>, what: &str, error: &str) {
+        eprintln!("spawn loop: {what}: {error}");
+        errors.push(error.to_string());
     }
 
     /// Wait for the next pass: the pass interval at most (the Bridge's
@@ -564,8 +763,11 @@ impl Fleet {
     /// pass's backoff — ended early by a notification or a stop. True when
     /// the loop must stop.
     fn wait(&mut self, stopping: &AtomicBool) -> bool {
-        let pause = if self.failures > 0 {
-            backoff(self.interval, self.failures)
+        let pause = if self.pace.failures > 0 || self.pace.outages > 0 {
+            // The pause [`Pace`] put after the last failed pass: a database
+            // outage paces the loop, the pass interval per pass at first and
+            // at most 30 intervals ([`MAX_BACKOFF_INTERVALS`]).
+            self.pause
         } else {
             self.schedule.earliest().map_or(self.interval, |due| {
                 self.interval.min(Duration::from_millis(
@@ -607,7 +809,10 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
-    use super::{Schedule, Step, backoff, pause_unless_stopped, stop_on_signal};
+    use super::{
+        MAX_BACKOFF_INTERVALS, MAX_FAILURES, Pace, Schedule, Step, backoff, pause_unless_stopped,
+        stop_on_signal,
+    };
 
     /// A schedule whose steps have all run on `watermark` and wait for no
     /// clock, for the cases that set one of them.
@@ -616,6 +821,7 @@ mod tests {
         for step in [
             &mut schedule.bridge,
             &mut schedule.observer,
+            &mut schedule.recovery,
             &mut schedule.dispatch,
             &mut schedule.residents,
             &mut schedule.alive,
@@ -624,6 +830,25 @@ mod tests {
             step.ran(watermark, None);
         }
         schedule
+    }
+
+    /// A step that saw a moved watermark and had nothing to do keeps the
+    /// time it already waited for: an unrelated event never wipes an open
+    /// wait's probe.
+    #[test]
+    fn a_step_that_had_nothing_to_do_keeps_its_due_time() {
+        let mut step = Step::new();
+        step.ran(7, Some(2_000));
+        step.advance(9);
+        assert_eq!(step.mark(), Some(9), "the watermark it saw");
+        assert!(!step.runs(9, 1_999), "its probe is not due yet");
+        assert!(step.runs(9, 2_000), "and is, when its time comes");
+        step.ran(9, None);
+        step.advance(10);
+        assert!(
+            !step.runs(10, 9_999),
+            "a step with no clock waits for the log"
+        );
     }
 
     /// A step runs on a record or on a time, never on the clock: a pass
@@ -721,6 +946,49 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         stop.store(false, Ordering::SeqCst);
         assert!(!pause_unless_stopped(Duration::from_millis(10), &stop));
+    }
+
+    /// A pass that failed only because the database could not be reached is
+    /// no failed pass: the loop outlives the outage (it paces itself on the
+    /// outage's own count, at most thirty intervals) and ends only after
+    /// [`MAX_FAILURES`] passes that failed for another reason.
+    #[test]
+    fn only_a_pass_that_failed_for_more_than_the_database_counts_toward_the_exit() {
+        let interval = Duration::from_millis(100);
+        let dark = vec![format!(
+            "{}: connection closed",
+            spawn_core::port::UNREACHABLE
+        )];
+        let other = vec!["storage backend failure: permission denied".to_string()];
+        let mut pace = Pace::default();
+        let mut recovery = crate::recover::Recovery::new();
+        // Ten failed passes in a row would end the loop; ten passes that
+        // could not reach the database do not.
+        for _ in 0..(MAX_FAILURES * 3) {
+            let paused = pace
+                .after(&dark, interval, &mut recovery)
+                .expect("an outage never ends the loop");
+            assert!(paused.unreachable);
+        }
+        assert_eq!(pace.failures, 0, "no outage pass counts as a failure");
+        let paused = pace
+            .after(&dark, interval, &mut recovery)
+            .expect("still an outage");
+        assert_eq!(
+            paused.wait,
+            interval * MAX_BACKOFF_INTERVALS,
+            "the outage's pause grows to at most thirty intervals"
+        );
+        // Any other failure counts, and ten of them end the loop.
+        for _ in 1..MAX_FAILURES {
+            pace.after(&other, interval, &mut recovery)
+                .expect("under the bound");
+        }
+        assert_eq!(pace.failures, MAX_FAILURES - 1);
+        assert!(
+            pace.after(&other, interval, &mut recovery).is_err(),
+            "{MAX_FAILURES} failed passes end the loop"
+        );
     }
 
     #[test]

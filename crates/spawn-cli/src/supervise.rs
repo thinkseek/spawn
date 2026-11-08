@@ -16,6 +16,21 @@
 //! Idempotency keys derive from the facts, so a restarted loop never submits
 //! the same revival twice.
 //!
+//! **The recovery owns every end it recorded.** Whether an agent comes back
+//! after its execution ends is one rule for every agent
+//! (`crate::recover`, docs/fleet-architecture.md §3.1): the end's cause is
+//! read from recorded facts, recorded once, and given its way back — a
+//! resume at once then on a doubling backoff, a handoff after three failed
+//! resumes, a wait until a model outage, an expired login, a database
+//! outage or a full disk clears, or nothing for a person's Stop. This
+//! module starts a session that has no execution yet (the supervisor's
+//! first start, a resident's), and keeps the charter and the handoff
+//! summary the recovery gives a new native session; a session whose latest
+//! execution the recovery has recorded an interruption of is left to it
+//! ([`revive`]). [`decide`] stays the rule for the ends it has not recorded
+//! — a host whose loop runs no recovery — and its schedule is the one the
+//! recovery implements.
+//!
 //! A new native session's start records the hash of the charter it gives
 //! ([`Charter`], the start's `charter`). A resume, a restarted loop or a
 //! compaction keeps the native session and the charter it holds: when that
@@ -236,8 +251,9 @@ ephemeral workers should not exist.
     )
 }
 
-/// Summary of the log for a new native session.
-fn handoff(store: &PostgresStore) -> String {
+/// Summary of the log for a new native session. The recovery's handoff
+/// gives the supervisor this and its charter ([`crate::recover`]).
+pub(crate) fn handoff(store: &PostgresStore) -> String {
     let fleet = store.fleet_json().map_or_else(
         |error| format!("(fleet unavailable: {error})"),
         |value| serde_json::to_string_pretty(&value).unwrap_or_default(),
@@ -272,6 +288,11 @@ fn revive(
 ) -> Result<(Option<String>, Option<i64>), String> {
     let error = |error: &dyn std::fmt::Display| error.to_string();
     let session_id = SessionId::new(session).map_err(|e| error(&e))?;
+    // The recovery owns every end it recorded (crate::recover): this rule
+    // starts a session that never ran, and leaves the rest to it.
+    if store.recovered(&session_id).map_err(|e| error(&e))? {
+        return Ok((None, None));
+    }
     let facts = store
         .liveness_facts(&session_id, REVIVER)
         .map_err(|e| error(&e))?;

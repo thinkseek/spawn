@@ -272,9 +272,13 @@ pub(super) fn decide_worker(facts: &Facts, now_ms: i64) -> Decision {
     if facts.open_command {
         return Decision::Nothing;
     }
-    // 1. Rules over facts. Residents are revived by the liveness rule
-    // (crate::supervise), so only ephemeral workers are resumed here.
+    // 1. Rules over facts. The recovery (crate::recover) revives every end
+    // it recorded, whatever the cause and whoever the agent; the one-resume
+    // rule below is what is left for an end it has not recorded (a host
+    // whose loop is not running the recovery), so only ephemeral workers
+    // are resumed here.
     if !facts.live
+        && facts.recovered.is_none()
         && facts.end_cause.as_deref() == Some("lost")
         && facts.agent_id.starts_with("agent_worker_")
     {

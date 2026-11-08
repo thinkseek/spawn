@@ -1920,6 +1920,7 @@ mod tests {
             checkpoint: None,
             charter: None,
             jobs: Vec::new(),
+            recovered: None,
         }
     }
 
@@ -2187,6 +2188,7 @@ mod tests {
         // The stop runs: nothing else goes to the session meanwhile.
         let stopping = Facts {
             open_command: true,
+            recovered: None,
             ..worker(true, true)
         };
         assert!(orders(&work, &[stopping]).is_empty());
@@ -2207,6 +2209,7 @@ mod tests {
         // Submitted: nothing more while it runs, and the task still waits.
         let mut resuming = Facts {
             open_command: true,
+            recovered: None,
             ..stopped
         };
         resuming.dispatched.push(Sent {

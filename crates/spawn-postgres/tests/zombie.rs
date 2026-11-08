@@ -203,6 +203,7 @@ fn the_log_answers_the_open_execution_its_guard_refuses_by() {
     let ended = |cause| EventKind::ExecutionEnded {
         cause,
         exit_code: None,
+        signal: None,
         evidence: None,
     };
     let open = || {
