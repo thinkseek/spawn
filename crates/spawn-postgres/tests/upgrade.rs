@@ -2,6 +2,12 @@
 //! earlier install left, so a database from the first shape of every table
 //! (tests/first-shapes.sql) must come out as a fresh one does.
 //!
+//! Views are not covered here: first-shapes.sql holds tables only, so every
+//! view is created fresh, and a `create or replace view` that renames or
+//! reorders an existing view's columns (42P16) passes. The gate's
+//! rsi/scenarios/check-schema-upgrade.sh migrates the base's whole schema to
+//! the candidate's for that.
+//!
 //! A real database is required (`SPAWN_TEST_DATABASE_URL`).
 
 use postgres::Client;
