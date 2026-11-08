@@ -35,6 +35,24 @@ pub enum StoreError {
     /// The backend failed.
     #[error("storage backend failure: {0}")]
     Backend(String),
+    /// The database could not be reached: no server answered, the
+    /// connection was cut, or the connect itself failed. It is not a
+    /// verdict on the work: the engines run on, and the loop that reads the
+    /// store waits for it instead of ending ([`UNREACHABLE`]).
+    #[error("{UNREACHABLE}: {0}")]
+    Unreachable(String),
+}
+
+/// The prefix of every [`StoreError::Unreachable`]: what a caller holding
+/// only the error's text reads to tell "the database is not there" from
+/// "the database said no" (`is_unreachable`).
+pub const UNREACHABLE: &str = "database unreachable";
+
+/// Whether an error's text is a [`StoreError::Unreachable`]: the store
+/// could not be reached, so the pass that failed says nothing about the
+/// fleet and must be retried rather than counted as a failed one.
+pub fn is_unreachable(error: &str) -> bool {
+    error.contains(UNREACHABLE)
 }
 
 /// Append-only event log with per-session and global order.
@@ -484,6 +502,16 @@ pub trait TerminalHost: Send + Sync {
         terminal: &TerminalName,
         workspace: &WorkspaceId,
     ) -> Result<bool, TerminalError>;
+
+    /// Whether the terminal server that holds the terminals is there. A
+    /// host whose terminals share one server (tmux) that has gone took
+    /// every terminal in it with it, which is how a host restart is told
+    /// from one terminal that vanished ([`crate::event::EndCause`], and the
+    /// recovery's `host_restart`). A host that cannot tell answers true:
+    /// an execution then reads as crashed, never as a host restart.
+    fn server_alive(&self) -> bool {
+        true
+    }
 
     /// Whether the terminal hosts the runner this host started in it
     /// ([`Self::start`]), alive: what the Bridge asks before it calls an
