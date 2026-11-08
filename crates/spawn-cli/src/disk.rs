@@ -432,6 +432,22 @@ impl Monitor {
     pub(crate) fn escalations(&self, now_ms: i64) -> Vec<Escalation> {
         escalations(self.records.as_deref().unwrap_or_default(), now_ms)
     }
+
+    /// How long until these items change with no new record: a `recovered`
+    /// one is news for [`RECOVERY_NEWS_MS`] from its record, and stops being
+    /// an item then ([`escalations`]). A `low` one holds until its path
+    /// recovers, which writes a record. `None` when nothing here waits on a
+    /// clock.
+    pub(crate) fn due_in(&self, now_ms: i64) -> Option<i64> {
+        self.records
+            .iter()
+            .flatten()
+            .filter(|record| record["state"] == "recovered")
+            .filter_map(|record| record["at_ms"].as_i64())
+            .map(|at| at.saturating_add(RECOVERY_NEWS_MS).saturating_sub(now_ms))
+            .filter(|left| *left > 0)
+            .min()
+    }
 }
 
 #[cfg(test)]

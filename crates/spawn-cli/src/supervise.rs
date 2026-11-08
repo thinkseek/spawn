@@ -73,8 +73,7 @@ pub(crate) fn decide(facts: &LivenessFacts, now_ms: i64) -> Revive {
         return Revive::Nothing;
     }
     if facts.failures > 0 {
-        let exponent = facts.failures.min(6);
-        let pause = BACKOFF_MS.saturating_mul(1 << exponent);
+        let pause = pause_ms(facts.failures);
         if facts
             .last_failure_ms
             .is_some_and(|failed| now_ms.saturating_sub(failed) < pause)
@@ -89,6 +88,33 @@ pub(crate) fn decide(facts: &LivenessFacts, now_ms: i64) -> Revive {
         return Revive::Resume;
     }
     Revive::Start { handoff: true }
+}
+
+/// The pause after `failures` failed revivals: [`BACKOFF_MS`] doubled per
+/// failure, at most six doublings (the backoff [`decide`] applies).
+fn pause_ms(failures: u32) -> i64 {
+    BACKOFF_MS.saturating_mul(1 << failures.min(6))
+}
+
+/// When the rule next acts on a session it leaves alone for now, from the
+/// facts it read: the end of the backoff after a failed revival, on the
+/// database's clock. `None` while the rule waits for no clock — a running
+/// session, one with a command in flight, one whose stop ended it, one that
+/// has never failed. A due time in the past is due now, never later; a
+/// revival the loop cannot date is due now.
+pub(crate) fn next_due(facts: &LivenessFacts, now_ms: i64) -> Option<i64> {
+    if matches!(facts.last_kind.as_deref(), Some("stop" | "discard"))
+        || facts.open_command
+        || facts.live
+        || facts.failures == 0
+    {
+        return None;
+    }
+    let due = facts.last_failure_ms.map_or_else(
+        || now_ms,
+        |failed| failed.saturating_add(pause_ms(facts.failures)),
+    );
+    Some(due)
 }
 
 /// The supervisor's charter as this build and its environment write it: the
@@ -235,14 +261,15 @@ Your last commands, newest first:\n{mine}\n\nStart with `mission list` and `flee
 /// `resume` words the resume prompt from the facts; `start` builds the
 /// prompt of a new native session, given whether it is a handoff, with the
 /// hash of the charter it gives, if it gives one (recorded on the start).
-/// Returns a line for the loop's log when it acted.
+/// Returns a line for the loop's log when it acted, and when the rule next
+/// acts if it left the session alone for a timer ([`next_due`]).
 fn revive(
     store: &PostgresStore,
     agent: &str,
     session: &str,
     resume: impl FnOnce(&LivenessFacts) -> String,
     start: impl FnOnce(bool) -> (String, Option<String>),
-) -> Result<Option<String>, String> {
+) -> Result<(Option<String>, Option<i64>), String> {
     let error = |error: &dyn std::fmt::Display| error.to_string();
     let session_id = SessionId::new(session).map_err(|e| error(&e))?;
     let facts = store
@@ -252,7 +279,7 @@ fn revive(
     let decision = decide(&facts, now);
     let execution = facts.execution_id.as_deref().unwrap_or("none");
     let (action, key) = match decision {
-        Revive::Nothing => return Ok(None),
+        Revive::Nothing => return Ok((None, next_due(&facts, now))),
         Revive::Resume => (
             // No profile named: a revived session keeps the one it last
             // started with, so a resident keeps its models.
@@ -291,12 +318,16 @@ fn revive(
     store
         .submit(&principal, &submission)
         .map_err(|e| error(&e))?;
-    Ok(Some(format!("liveness: {session} {decision:?} ({key})")))
+    Ok((
+        Some(format!("liveness: {session} {decision:?} ({key})")),
+        None,
+    ))
 }
 
 /// Keep the supervisor alive. A new native session is given the deployed
-/// charter, and its start records the charter's hash.
-pub(crate) fn keep_alive(store: &PostgresStore) -> Result<Option<String>, String> {
+/// charter, and its start records the charter's hash. Returns the log line,
+/// and when the rule next acts if it waits for a backoff to end.
+pub(crate) fn keep_alive(store: &PostgresStore) -> Result<(Option<String>, Option<i64>), String> {
     let spawn = spawn_program();
     revive(
         store,
@@ -323,8 +354,11 @@ fleet` and continue supervising per your charter.",
 
 /// Keep every approved resident alive: resumed after an outage, given its
 /// charter (and its current task) when a new native session must start.
-pub(crate) fn keep_residents(store: &PostgresStore) -> Result<Vec<String>, String> {
+/// Returns the log lines, and the earliest time the rule waits for (a
+/// resident whose revival is backing off).
+pub(crate) fn keep_residents(store: &PostgresStore) -> Result<(Vec<String>, Option<i64>), String> {
     let mut lines = Vec::new();
+    let mut due: Option<i64> = None;
     for (agent, session, charter) in store
         .residents_to_keep()
         .map_err(|error| error.to_string())?
@@ -363,14 +397,18 @@ task; when it is finished, write `{REPORT}` once, with everything done (draft an
                 facts.cause.as_deref().unwrap_or("unknown")
             )
         };
-        lines.extend(revive(store, &agent, &session, resume, start)?);
+        let (line, next) = revive(store, &agent, &session, resume, start)?;
+        lines.extend(line);
+        if let Some(next) = next {
+            due = Some(due.map_or(next, |known| known.min(next)));
+        }
     }
-    Ok(lines)
+    Ok((lines, due))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Charter, Revive, charter, decide};
+    use super::{Charter, Revive, charter, decide, next_due};
     use spawn_postgres::LivenessFacts;
 
     /// The hash a start records names the text it gave: the same text, the
@@ -560,5 +598,76 @@ work.",
             ..facts()
         };
         assert_eq!(decide(&unbound, 0), Revive::Start { handoff: true });
+    }
+
+    /// The revive backoff is the rule's own timer: a failed revival is
+    /// waited for until its pause ends (one at 20 s, two at 40 s, three at
+    /// 80 s, as `decide` waits), and a session the rule leaves alone for no
+    /// clock waits for nothing.
+    #[test]
+    fn a_backing_off_revival_is_due_when_its_pause_ends() {
+        let failed = |failures: u32| LivenessFacts {
+            failures,
+            last_failure_ms: Some(100_000),
+            cause: Some("lost".to_string()),
+            last_kind: Some("resume".to_string()),
+            ..facts()
+        };
+        for (failures, pause) in [(1, 20_000), (2, 40_000)] {
+            let facts = failed(failures);
+            assert_eq!(
+                next_due(&facts, 100_000 + pause - 1),
+                Some(100_000 + pause),
+                "the pause of {failures} failure(s) is not over"
+            );
+            assert_eq!(
+                decide(&facts, 100_000 + pause - 1),
+                Revive::Nothing,
+                "the rule waits too"
+            );
+            assert_eq!(
+                decide(&facts, 100_000 + pause),
+                Revive::Resume,
+                "and acts when it is"
+            );
+            assert!(
+                next_due(&facts, 100_000 + pause).is_some_and(|due| due <= 100_000 + pause),
+                "a time already reached is due now"
+            );
+        }
+        // The third failure's pause ends in a new native session, not a
+        // resume (the rule hands off after `RESUME_ATTEMPTS`).
+        let exhausted = failed(3);
+        assert_eq!(
+            next_due(&exhausted, 100_000 + 79_999),
+            Some(100_000 + 80_000)
+        );
+        assert_eq!(
+            decide(&exhausted, 100_000 + 80_000),
+            Revive::Start { handoff: true }
+        );
+        let live = LivenessFacts {
+            live: true,
+            failures: 2,
+            ..failed(2)
+        };
+        assert_eq!(next_due(&live, 0), None, "a live session waits for nothing");
+        let busy = LivenessFacts {
+            open_command: true,
+            ..failed(2)
+        };
+        assert_eq!(next_due(&busy, 0), None);
+        let stopped = LivenessFacts {
+            last_kind: Some("stop".to_string()),
+            ..failed(2)
+        };
+        assert_eq!(next_due(&stopped, 0), None, "a stopped session stays down");
+        let fresh = LivenessFacts {
+            execution_id: None,
+            failures: 0,
+            last_failure_ms: None,
+            ..failed(0)
+        };
+        assert_eq!(next_due(&fresh, 0), None, "it starts at the next pass");
     }
 }
