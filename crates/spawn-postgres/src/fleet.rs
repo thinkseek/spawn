@@ -222,8 +222,7 @@ from (
     s.agent_id,
     s.live,
     s.execution_id,
-    (select x.cause from agent_executions x where x.session_id = s.session_id
-      order by x.started_at_ms desc, x.execution_id desc limit 1) as end_cause,
+    ec.cause as end_cause,
     p.observation,
     p.observation_event_id,
     p.observation_at_ms,
@@ -344,6 +343,14 @@ from (
   -- its latest execution started with. Each is the same row the correlated
   -- read returned, and the loop reads these facts on every pass it acts on
   -- (objective 023: four reads of the log, not four per session).
+  -- The latest execution's end cause, one read for the whole fleet: the
+  -- view behind it reads the log for every execution, so it is evaluated
+  -- once here rather than once per session.
+  left join (
+    select distinct on (x.session_id) x.session_id, x.cause
+      from agent_executions x
+     order by x.session_id, x.started_at_ms desc, x.execution_id desc) ec
+    on ec.session_id = s.session_id
   left join (
     select e.session_id, max(e.session_seq) as evidence_seq
       from spawn_events e
