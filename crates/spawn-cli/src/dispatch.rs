@@ -696,55 +696,34 @@ pub(crate) fn read_plan(
     let mut lines = Vec::new();
     let now = now_ms();
     let mut host = disk(now);
-    host.extend(crate::disk::gate_room_escalations(
-        store
-            .gate_room_escalations()
-            .map_err(|error| format!("gate room records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::host_fault_escalations(
-        store
-            .gate_host_fault_escalations()
-            .map_err(|error| format!("gate host fault records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::base_disagrees_alerts(
-        store
-            .gate_base_disagrees_alerts()
-            .map_err(|error| format!("gate base disagreement records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::over_budget_escalations(
-        store
-            .over_budget_escalations()
-            .map_err(|error| format!("over budget records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::objective_yields(
-        store
-            .objective_yields()
-            .map_err(|error| format!("objective yield records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::objective_order(
-        store
-            .objective_backlogs()
-            .map_err(|error| format!("objective backlogs: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::hold_expiries(
-        store
-            .hold_expiries()
-            .map_err(|error| format!("source hold records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
+    host.extend(crate::disk::gate_room_escalations(&records(
+        store.gate_room_escalations(),
+        "gate room records",
+    )?));
+    host.extend(digest::host_fault_escalations(&records(
+        store.gate_host_fault_escalations(),
+        "gate host fault records",
+    )?));
+    host.extend(digest::base_disagrees_alerts(&records(
+        store.gate_base_disagrees_alerts(),
+        "gate base disagreement records",
+    )?));
+    host.extend(digest::over_budget_escalations(&records(
+        store.over_budget_escalations(),
+        "over budget records",
+    )?));
+    host.extend(digest::objective_yields(&records(
+        store.objective_yields(),
+        "objective yield records",
+    )?));
+    host.extend(digest::objective_order(&records(
+        store.objective_backlogs(),
+        "objective backlogs",
+    )?));
+    host.extend(digest::hold_expiries(&records(
+        store.hold_expiries(),
+        "source hold records",
+    )?));
     // Every timer the records read here name: the times at which this step
     // would decide something new even though nothing is appended meanwhile.
     // A time already reached is no wait (the step acts on it now), so only
