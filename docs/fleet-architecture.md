@@ -353,6 +353,33 @@ it, on the same ladder.
   that failed is reported as failed) is news until it was told, however
   long that takes.
 
+  **When the dispatcher's pass runs.** The loop acts on records and on the
+  times records name, never on the clock. Every pass reads the log's
+  watermark (`max(spawn_events.id)`, one index-only read of its primary
+  key); the dispatcher's step — the facts, the mission rows, the stall
+  facts, the gate and hold records, the liveness of every resident and of
+  the supervisor — runs when that watermark has moved since it last ran, or
+  when one of its own timers is due, and on an idle fleet it runs not at all.
+  Its timers are all computed from the records it read, never counted:
+  a delivery's retry (`deliver.rs` `attempts()`: `NOT_READY_RETRY_MS`, 5 s,
+  after a refusal that typed nothing, `retry_wait_ms()` — a minute doubling,
+  at most 30 — after a failure), a stall's bound from the record it stands
+  on (`dispatch/stall.rs`), a failed Stop's retry (`dispatch/stops.rs`), a
+  background job's bound (`dispatch/jobs.rs`), a cancelled resident's notice
+  and a report note refused before typing. A due time the step cannot date
+  is due now, never later; a time already reached is the step's to act on
+  now, not a wait. Between passes the loop waits on `LISTEN spawn_events`
+  (the append's own notify) with a timeout of the earlier of the pass
+  interval and the next due time, so a change ends the wait at once and a
+  notification lost costs one interval at most: the notification is a hint,
+  the watermark is the record (§14 of design.md). The steps run at most once
+  a pass interval — the resolution the loop always had — so a burst of
+  appends inside one interval is one pass's work, while the Bridge's claim
+  of a submitted command is not held behind that interval. The Bridge's
+  reading of each engine's screen and transcript is not on this schedule:
+  neither is announced by an append, so it runs every pass (§5 of
+  design.md).
+
   **The one-resume rule.** A lost worker execution is resumed once
   (`dispatch-resume-<execution>`); once that resume has failed, the session
   is escalated (`resume failed`) and never resumed again by rule, until one

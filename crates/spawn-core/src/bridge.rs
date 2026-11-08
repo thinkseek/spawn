@@ -37,6 +37,43 @@
 //! The `waiting` record is not activity: the stall layer and the
 //! dispatcher's staleness ignore it, and the Observer covers it like any
 //! command step.
+//!
+//! What a pass reads of a running engine, and when (docs/design.md §5, §6).
+//! A pass costs nothing per idle agent. The Bridge watches each live
+//! execution's transcript and its runner's exit status ([`FileWatch`]) and
+//! reads one only when it changed; where no watch can be set for an
+//! execution (an error, a filesystem without watches, the platform's
+//! limit) its files are read on every pass, as before, and the fallback is
+//! said once. The offset rule of [`Bridge::follow_output`] stays: a line
+//! written while a read is in progress is read at the next change or pass,
+//! never lost.
+//!
+//! A pane is captured on a pass only when it can matter: a command is in
+//! flight on the session (claimed and unfinished), or its transcript has
+//! held still for [`BridgeConfig::screen_quiet`] since it last grew and its
+//! screen was not read since — with readings repeated on the following
+//! passes until two in a row agree, the confirmation a fact needs — or once
+//! per [`BridgeConfig::screen_refresh`] as a backstop for a screen that
+//! changes with nothing in the transcript (a dialog, a crash to a shell).
+//! A turn that ends in the transcript is read on the following passes until
+//! a reading accepts input or `screen_refresh` has passed since the turn
+//! ended: the engine paints its prompt a moment after the line that ends
+//! the turn, and that reading — the worker idle at its prompt — is the one
+//! a delivery waits for, so it is never left to the backstop. A busy screen
+//! is still recorded again every `screen_refresh` while a turn keeps it
+//! busy. An idle session with a quiet transcript and nothing
+//! in flight costs no capture between backstops, and no tmux call of its
+//! own: whether the fleet still runs is one call per pass
+//! ([`TerminalHost::runners`]), so a terminal killed from outside ends its
+//! execution as lost on the next pass, as before.
+//!
+//! Causality (§14): a screen state is recorded from a capture, and a turn's
+//! end from the transcript's line. The absence of a capture, or of a
+//! transcript change, is never read as a state; a quiet transcript only
+//! says when to look at the screen again. So a screen change that decides a
+//! delivery (the worker at its prompt, its turn stopped) is recorded no
+//! later than a reading of the pane would show it: the prompt a turn's end
+//! is followed by is read on the pass it appears, not at the next backstop.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -56,8 +93,8 @@ use crate::id::{
 use crate::ingest::{claude_line, claude_version};
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
-    BaseMerge, Branch, CommandQueue, Commit, EventLog, Launch, READ_LIMIT, Runner, StoreError,
-    TerminalError, TerminalHost, TranscriptArchive, WorkspaceError, WorkspaceStore,
+    BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch, Launch, READ_LIMIT, Runner,
+    StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError, WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
 use crate::time::{Clock, SystemClock};
@@ -73,6 +110,23 @@ pub const END_ATTEMPTS: u32 = 20;
 /// How often a stalled end retries its final checkpoint, by the Bridge's
 /// clock.
 pub const END_RETRY_MS: i64 = 30_000;
+
+/// Backstop captures one pass takes at most (see [`BridgeConfig::screen_refresh`]):
+/// the screens that fell due are read over the next passes, so a fleet does
+/// not spend one pass capturing every pane and holding the next command.
+pub const BACKSTOPS_PER_PASS: usize = 2;
+
+/// Why a pass wants a live execution's pane read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wanted {
+    /// A command is in flight, a reading awaits its twin, or the transcript
+    /// has just held still: read it now.
+    Now,
+    /// Nothing changed for [`BridgeConfig::screen_refresh`]: the backstop.
+    Backstop,
+    /// Nothing to read.
+    Nothing,
+}
 
 /// The session and settings of one launch.
 ///
@@ -167,10 +221,24 @@ pub struct BridgeConfig {
     /// directory), as the terminal host sees it.
     pub claude_projects: String,
     /// A busy screen is recorded again this often while it stays busy, so
-    /// the Observer keeps a current fact for a long turn.
+    /// the Observer keeps a current fact for a long turn. It is also the
+    /// backstop of a screen that changes with nothing in the transcript (a
+    /// dialog, a crash to a shell): every live pane is captured at least
+    /// this often.
     pub screen_refresh: Duration,
+    /// How long a live execution's transcript must hold still before its
+    /// pane is read for what the transcript cannot say: the prompt is back.
+    /// A turn's end is read from the transcript as soon as the file changes;
+    /// this is how long after the last line the screen is compared with what
+    /// was recorded. Shorter is readier sooner and costs more captures.
+    pub screen_quiet: Duration,
     /// The model relay, when Claude Code engines go through one.
     pub model_relay: Option<ModelRelay>,
+    /// The watch on the files the engines write (transcripts and exit
+    /// statuses), when the host has one. `None` reads every live execution's
+    /// files on every pass, as Spawn did before watches: correct, and the
+    /// cost grows with the fleet.
+    pub watch: Option<Arc<dyn FileWatch>>,
     /// Environment decided again at every engine launch, after
     /// `environment` and before `session_environment`: the fleet's test
     /// database, given only once it is known not to be the gates' server or
@@ -204,7 +272,9 @@ impl BridgeConfig {
             input_wait_retry: Duration::from_secs(1),
             claude_projects: "/root/.claude/projects".to_string(),
             screen_refresh: Duration::from_secs(30),
+            screen_quiet: Duration::from_millis(500),
             model_relay: None,
+            watch: None,
             launch_environment: None,
         }
     }
@@ -263,6 +333,27 @@ impl Active {
 /// last recorded screen is folded from the log.
 #[derive(Debug, Clone, Default)]
 struct Follow {
+    /// The watch on its files.
+    watch: Watching,
+    /// When its transcript last grew and its screen has not been read since,
+    /// by the Bridge's clock. The pane is due once the transcript has held
+    /// still for [`BridgeConfig::screen_quiet`].
+    unread_since: Option<i64>,
+    /// Its last capture could not be recorded (one reading is not a fact, or
+    /// it read [`ScreenState::Unknown`]): capture again next pass.
+    again: bool,
+    /// When a turn of this execution last ended in its transcript, by the
+    /// Bridge's clock, while the screen has not yet shown the turn over (a
+    /// reading that accepts input). The engine paints the prompt a moment
+    /// after the line that ends the turn, and that reading decides a
+    /// delivery: the pane is read on the following passes until it is here,
+    /// or [`BridgeConfig::screen_refresh`] has passed since the turn ended.
+    settling: Option<i64>,
+    /// When its pane was last captured.
+    last_capture: Option<i64>,
+    /// When to read its files next although nothing was watched: the grace
+    /// after which a transcript that never appeared is reported.
+    due_at: Option<i64>,
     /// Bytes of the transcript read so far.
     offset: u64,
     /// The last screen state recorded, and when.
@@ -296,6 +387,31 @@ struct Follow {
     /// execution (the terminal gone, or there and hosting no runner): the
     /// end record's `evidence`.
     evidence: Option<String>,
+}
+
+/// The watch on an execution's files ([`FileWatch`]).
+#[derive(Debug, Clone)]
+struct Watching {
+    /// Its files changed since the last read. A session read on every pass
+    /// keeps it set, so a read that left a line half-written or a checkpoint
+    /// uncommitted tries again next pass.
+    dirty: bool,
+    /// No watch could be set on its files: they are read on every pass, as
+    /// before watches, and [`Watching::said`] says so once.
+    poll: bool,
+    /// The fallback to reading on every pass was said.
+    said: bool,
+}
+
+impl Default for Watching {
+    fn default() -> Self {
+        Self {
+            // Nothing has been read yet: the first pass reads.
+            dirty: true,
+            poll: false,
+            said: false,
+        }
+    }
 }
 
 /// What the Bridge knows about one session.
@@ -555,6 +671,17 @@ pub struct Bridge {
     /// restarted Bridge, which has none, fails them when it claims them
     /// next (the log says which wait and how the execution ended).
     held: HashMap<CommandId, Claimed>,
+    /// The watch keys whose files changed since the last pass, drained at
+    /// the start of a pass: what an execution whose files are quiet is left
+    /// alone for.
+    touched: HashSet<String>,
+    /// Backstop captures taken this pass ([`BACKSTOPS_PER_PASS`]).
+    backstops: std::sync::atomic::AtomicUsize,
+    /// Whether each live terminal hosts its runner, asked once this pass
+    /// ([`TerminalHost::runners`]) when the fleet's files are watched: a
+    /// killed terminal is then seen on the next pass without a tmux call per
+    /// agent. `None` asks each terminal when the execution is advanced.
+    runners: Option<HashMap<TerminalName, Runner>>,
 }
 
 /// What [`Bridge::settle`] did with an open execution no runner runs.
@@ -597,6 +724,9 @@ impl Bridge {
             warned: std::sync::Mutex::default(),
             transcripts: None,
             held: HashMap::new(),
+            touched: HashSet::new(),
+            backstops: std::sync::atomic::AtomicUsize::new(0),
+            runners: None,
         }
     }
 
@@ -786,8 +916,28 @@ impl Bridge {
         }
     }
 
-    /// Handle queued commands and advance running executions.
+    /// Handle queued commands and advance running executions: the whole
+    /// tick, in the order [`Self::work`] then [`Self::poll`] run it.
     pub fn tick(&mut self) -> Result<TickReport, StoreError> {
+        let (mut report, _) = self.work()?;
+        self.act(&mut report)?;
+        self.catch_up()?;
+        Ok(report)
+    }
+
+    /// The Bridge's own reading of the log and of the command queue: catch
+    /// up with the events written since the last one, and claim the commands
+    /// waiting in the queue, one per session at a time, until none is
+    /// claimable or [`BridgeConfig::max_commands_per_tick`] is reached.
+    ///
+    /// This is the part of a tick that reads the database, and it reads it
+    /// for records: its input is the log's latest events and the queue's
+    /// rows, so it is run when the log's watermark has moved and not on a
+    /// clock (docs/design.md §14). `true` says the claim stopped at that
+    /// limit, so a command may still be waiting for a claim now: the caller
+    /// runs this again on its next pass. The wait a lease dates
+    /// (`lease_until_ms`) is the caller's to time.
+    pub fn work(&mut self) -> Result<(TickReport, bool), StoreError> {
         self.catch_up()?;
         let mut report = TickReport::default();
         // Inputs left waiting keep their lease until the claims of this tick
@@ -820,8 +970,37 @@ impl Bridge {
                 self.queue.release(claimed, self.config.input_wait_retry)?;
             }
         }
+        let left = report.commands >= self.config.max_commands_per_tick;
+        Ok((report, left))
+    }
+
+    /// What the Bridge reads on its own clock, never from the log: each
+    /// running execution's transcript (what the engine wrote) and its screen
+    /// (what the terminal shows), the checkpoints they ask for, the exit
+    /// statuses they leave, and the executions whose engines are gone. What
+    /// it reads it turns into records; the next [`Self::work`] folds them.
+    ///
+    /// This holds no read of the log: it runs on every pass, whatever the
+    /// watermark says, because an engine's turn ending and its screen
+    /// settling at the prompt are facts no append announces
+    /// (objective 025 gives that schedule its own bounds).
+    pub fn poll(&mut self) -> Result<TickReport, StoreError> {
+        let mut report = TickReport::default();
+        self.backstops.store(0, std::sync::atomic::Ordering::SeqCst);
+        // What changed in the engines' files since the last pass: a
+        // transcript or an exit status is read when it is here, not on every
+        // pass ([`Self::follow_output`]).
+        self.touched = self
+            .config
+            .watch
+            .as_ref()
+            .map(|watch| watch.drain().into_iter().collect())
+            .unwrap_or_default();
+        // One call for the fleet's liveness, its end detection included: a
+        // terminal killed from outside ends its execution as lost on the
+        // next pass, as before, without a tmux call per agent.
+        self.runners = self.fleet_runners();
         self.act(&mut report)?;
-        self.catch_up()?;
         Ok(report)
     }
 
@@ -897,7 +1076,11 @@ impl Bridge {
                 }
             }
             EventKind::ExecutionEnded { .. } if current && event.source == Source::Bridge => {
-                view.active = None;
+                if let Some(active) = view.active.take()
+                    && let Some(watch) = &self.config.watch
+                {
+                    watch.unwatch(&watch_key(&active.execution_id));
+                }
             }
             // An exit report of an old runner (engine-sourced; runners now
             // write SPAWN_EXIT_FILE): only old logs hold one.
@@ -1013,6 +1196,15 @@ impl Bridge {
     /// Record what the engine did since the last tick, commit a pending
     /// checkpoint, or end an execution whose process is gone. Returns
     /// whether the execution ended.
+    ///
+    /// An execution with nothing to say is left alone: its files are read
+    /// when the watch says they changed, and its pane captured when a
+    /// command is in flight on it, when its transcript has held still and
+    /// the screen was not read since (or a reading awaits its twin), or
+    /// every [`BridgeConfig::screen_refresh`] as a backstop. Its terminal's
+    /// liveness was already asked once for the whole fleet
+    /// ([`Self::fleet_runners`]), so an idle fleet costs no call per agent
+    /// per pass; a terminal found gone is looked at at once.
     fn advance(
         &self,
         agent_id: &AgentId,
@@ -1029,29 +1221,35 @@ impl Bridge {
             ));
             return Ok(false);
         }
+        self.register_watch(session, native, active, report);
         self.follow_output(agent_id, session, native, active, report)?;
-        let end = match active
-            .reported_end
-            .or_else(|| self.exit_status(session, active, report))
-        {
-            Some(end) => Some(end),
-            // Running means a runner of the Bridge's own in the terminal, not
-            // a terminal of that name: one that outlived its runner (a dead
-            // pane, a shell restored after a restart) runs no engine of
-            // Spawn's, and would otherwise hold the execution open forever.
-            None => match self.not_running(session, active, report) {
-                Ok(None) => {
-                    self.follow_screen(agent_id, session, active)?;
-                    None
-                }
-                Ok(Some(end)) => Some(end),
-                Err(error) => {
-                    report
-                        .warnings
-                        .push(format!("runner {}: {error}", active.terminal()));
-                    None
-                }
-            },
+        let end = if self.looked_at(session, active) {
+            match active
+                .reported_end
+                .or_else(|| self.exit_status(session, active, report))
+            {
+                Some(end) => Some(end),
+                // Running means a runner of the Bridge's own in the terminal,
+                // not a terminal of that name: one that outlived its runner
+                // (a dead pane, a shell restored after a restart) runs no
+                // engine of Spawn's, and would otherwise hold the execution
+                // open forever.
+                None => match self.not_running(session, active, report) {
+                    Ok(None) => {
+                        self.follow_screen(agent_id, session, active)?;
+                        None
+                    }
+                    Ok(Some(end)) => Some(end),
+                    Err(error) => {
+                        report
+                            .warnings
+                            .push(format!("runner {}: {error}", active.terminal()));
+                        None
+                    }
+                },
+            }
+        } else {
+            None
         };
         if let Some((cause, exit_code)) = end {
             // What the engine wrote last comes before its end.
@@ -1122,13 +1320,18 @@ impl Bridge {
         active: &mut Active,
         report: &mut TickReport,
     ) -> Result<Option<(EndCause, Option<i32>)>, TerminalError> {
-        let seen = match self
-            .terminals
-            .runner(&active.terminal(), &active.workspace)?
-        {
-            Runner::Running => return Ok(None),
-            Runner::Gone => format!("its terminal {} is gone", active.terminal()),
-            Runner::Untracked(seen) => seen,
+        let asked = match self.runners.as_ref() {
+            Some(runners) => runners.get(&active.terminal()).cloned(),
+            None => Some(
+                self.terminals
+                    .runner(&active.terminal(), &active.workspace)?,
+            ),
+        };
+        let seen = match asked {
+            // The fleet's answer has no terminal of that name.
+            None | Some(Runner::Gone) => format!("its terminal {} is gone", active.terminal()),
+            Some(Runner::Running) => return Ok(None),
+            Some(Runner::Untracked(seen)) => seen,
         };
         if let Some(end) = self.exit_status(session, active, report) {
             return Ok(Some(end));
@@ -1139,7 +1342,13 @@ impl Bridge {
 
     /// Append the events in what the engine wrote to its transcript since
     /// the last read. Only whole lines are read; a line being written waits
-    /// for the next tick.
+    /// for the next tick, and so does one whose checkpoint failed.
+    ///
+    /// The read happens when the watch says the file changed, and on every
+    /// pass when no watch could be set for the execution
+    /// ([`Follow::poll`]). A read that leaves a line half-written, or a
+    /// checkpoint uncommitted, keeps the execution due, so the next pass
+    /// reads again: a line is never lost to the moment it was written.
     fn follow_output(
         &self,
         agent_id: &AgentId,
@@ -1148,6 +1357,10 @@ impl Bridge {
         active: &mut Active,
         report: &mut TickReport,
     ) -> Result<(), StoreError> {
+        let watched = self.config.watch.is_some() && !active.follow.watch.poll;
+        if watched && !active.follow.watch.dirty && !self.due_to_read(active) {
+            return Ok(());
+        }
         let Some(native) = native else {
             return Ok(());
         };
@@ -1167,6 +1380,12 @@ impl Bridge {
                         .warnings
                         .push(format!("{session}: no engine output at {path}"));
                 }
+                // The file's appearance is a change the watch reports: with
+                // one set, it is not asked again every pass, only once at
+                // the grace that reports a transcript that never came.
+                active.follow.watch.dirty = false;
+                active.follow.due_at =
+                    (!active.follow.warned).then(|| since.saturating_add(60_001));
                 return Ok(());
             }
             Err(error) => {
@@ -1176,15 +1395,25 @@ impl Bridge {
                         .warnings
                         .push(format!("{session}: read {path}: {error}"));
                 }
+                // An error says nothing about the file: it is read again on
+                // the next pass.
                 return Ok(());
             }
         };
+        if !bytes.is_empty() {
+            // The transcript grew: its screen is looked at once it holds
+            // still, not while it is being written.
+            active.follow.unread_since = Some(self.clock.now().0);
+            active.follow.due_at = None;
+        }
         let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') else {
             // A full read without a newline is one line longer than the
             // limit: skip what was read rather than stall on it forever (the
-            // rest of it parses as nothing).
+            // rest of it parses as nothing). Anything shorter is a line
+            // still being written: it is read next pass.
             if bytes.len() >= READ_LIMIT {
                 active.follow.offset += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                active.follow.watch.dirty = false;
                 report.warnings.push(format!(
                     "{session}: skipped a line over {READ_LIMIT} bytes in {path}"
                 ));
@@ -1206,6 +1435,11 @@ impl Bridge {
             let ends_turn = events
                 .iter()
                 .any(|event| event.kind.checkpoint_reason() == Some(CheckpointReason::TurnStopped));
+            if ends_turn {
+                // The screen has not shown this turn over yet, or this pass
+                // would not be reading it: see [`Follow::settling`].
+                active.follow.settling = Some(self.clock.now().0);
+            }
             if ends_turn
                 && !self.checkpoint(
                     agent_id,
@@ -1216,6 +1450,7 @@ impl Bridge {
                 )?
             {
                 active.follow.offset += u64::try_from(start).unwrap_or(u64::MAX);
+                // The commit stays due: the line is read again next pass.
                 return Ok(());
             }
             if active.follow.version.is_none()
@@ -1235,7 +1470,183 @@ impl Bridge {
             }
         }
         active.follow.offset += u64::try_from(end + 1).unwrap_or(u64::MAX);
+        active.follow.watch.dirty = false;
         Ok(())
+    }
+
+    /// Whether the transcript is read on this pass although nothing was
+    /// watched: the grace that reports a transcript that never appeared.
+    fn due_to_read(&self, active: &Active) -> bool {
+        active
+            .follow
+            .due_at
+            .is_some_and(|at| self.clock.now().0 >= at)
+    }
+
+    /// Watch the execution's files: its transcript (once the session's
+    /// native id is known) and the runner's exit status. A file that cannot
+    /// be watched is read on every pass instead, said once.
+    fn register_watch(
+        &self,
+        session: &SessionId,
+        native: Option<&str>,
+        active: &mut Active,
+        report: &mut TickReport,
+    ) {
+        let Some(watch) = &self.config.watch else {
+            return;
+        };
+        let key = watch_key(&active.execution_id);
+        if self.touched.contains(&key) {
+            active.follow.watch.dirty = true;
+        } else if !active.follow.watch.dirty {
+            // Nothing new and the watch is set: no system call at all. A
+            // dirty execution calls again, so a watch the kernel dropped
+            // (its directory went) is carried again or falls back.
+            return;
+        }
+        let mut paths = vec![exit_file(active)];
+        if let Some(native) = native {
+            paths.push(transcript_path(
+                &self.config.claude_projects,
+                &active.workspace,
+                native,
+            ));
+        }
+        for path in paths {
+            if let Err(error) = watch.watch(&key, &path) {
+                active.follow.watch.poll = true;
+                active.follow.watch.dirty = true;
+                if !active.follow.watch.said {
+                    active.follow.watch.said = true;
+                    report.warnings.push(format!(
+                        "{session}: no watch on {path} ({error}); its files are read on every pass"
+                    ));
+                }
+                return;
+            }
+        }
+    }
+
+    /// Whether this pass looks at the execution: reads the runner's exit
+    /// status, asks whether its runner still runs, and captures its pane.
+    /// An execution with nothing in flight, no pending end or checkpoint and
+    /// a quiet transcript is left alone between backstops.
+    fn looked_at(&self, session: &SessionId, active: &Active) -> bool {
+        self.config.watch.is_none()
+            || active.reported_end.is_some()
+            || active.unmounting
+            || active.checkpoint.is_some()
+            || active.follow.stale.is_some()
+            || active.follow.end_failures > 0
+            || active.follow.watch.poll
+            || active.follow.watch.dirty
+            || self.due_to_read(active)
+            || self.in_flight(session)
+            || !matches!(self.screen_wanted(session, active), Wanted::Nothing)
+            // A terminal killed from outside, or one hosting no runner of
+            // ours, is asked about on every pass: its end is due now, and
+            // the fleet's answer already holds it.
+            || self
+                .runners
+                .as_ref()
+                .is_some_and(|runners| !matches!(runners.get(&active.terminal()), Some(Runner::Running)))
+    }
+
+    /// The liveness of every live execution's terminal in one call, when the
+    /// fleet's files are watched ([`Self::advance`]); `None` when they are
+    /// not, so each execution asks its own terminal as it is advanced.
+    fn fleet_runners(&self) -> Option<HashMap<TerminalName, Runner>> {
+        self.config.watch.as_ref()?;
+        let terminals: Vec<(TerminalName, WorkspaceId)> = self
+            .sessions
+            .values()
+            .filter_map(|view| view.active.as_ref())
+            .map(|active| (active.terminal(), active.workspace.clone()))
+            .collect();
+        if terminals.is_empty() {
+            return Some(HashMap::new());
+        }
+        match self.terminals.runners(&terminals) {
+            Ok(states) => Some(states.into_iter().collect()),
+            // A failing terminal server says nothing about any execution: it
+            // is asked per terminal as it is advanced, as before.
+            Err(_) => None,
+        }
+    }
+
+    /// Whether a command of this session is claimed and unfinished: the
+    /// Bridge holds it waiting for its turn.
+    fn in_flight(&self, session: &SessionId) -> bool {
+        self.held
+            .values()
+            .any(|claimed| &claimed.session_id == session)
+    }
+
+    /// Why this pass wants the pane read, if it does.
+    fn screen_wanted(&self, session: &SessionId, active: &Active) -> Wanted {
+        let follow = &active.follow;
+        // No watch: read on every pass, as before watches. A command in
+        // flight reads it too: its next move waits on what the pane says.
+        if self.config.watch.is_none() || follow.watch.poll || self.in_flight(session) {
+            return Wanted::Now;
+        }
+        if follow.again {
+            return Wanted::Now;
+        }
+        let now = self.clock.now().0;
+        // A turn ended in the transcript and the screen has not shown it
+        // over yet: the engine paints the prompt a moment later, and a
+        // reading that turns to the prompt decides a delivery. Read on
+        // until it does, within the bound the backstop would take — a
+        // screen that never settles costs no more than before watches.
+        if let Some(ended) = follow.settling {
+            let bound = i64::try_from(self.config.screen_refresh.as_millis()).unwrap_or(i64::MAX);
+            if now.saturating_sub(ended) < bound {
+                return Wanted::Now;
+            }
+        }
+        if let Some(grown) = follow.unread_since {
+            // The transcript grew: wait until it has held still long enough
+            // for the screen to say what the transcript cannot (the prompt
+            // is back), then read it until two readings agree.
+            let quiet = i64::try_from(self.config.screen_quiet.as_millis()).unwrap_or(i64::MAX);
+            return if now.saturating_sub(grown) >= quiet {
+                Wanted::Now
+            } else {
+                Wanted::Nothing
+            };
+        }
+        // The first look at an execution is not a backstop: nothing is
+        // known about its screen yet.
+        let Some(last) = follow.last_capture else {
+            return Wanted::Now;
+        };
+        // The backstop: a screen that changes with nothing in the
+        // transcript (a dialog, a crash to a shell).
+        let refresh = i64::try_from(self.config.screen_refresh.as_millis()).unwrap_or(i64::MAX);
+        if now.saturating_sub(last) >= refresh {
+            Wanted::Backstop
+        } else {
+            Wanted::Nothing
+        }
+    }
+
+    /// Whether the pane is captured on this pass: a change or a command in
+    /// flight is read at once, a backstop only within the passes' budget, so
+    /// a fleet whose screens fall due together does not spend one pass
+    /// capturing them all.
+    fn capture_due(&self, session: &SessionId, active: &Active) -> bool {
+        match self.screen_wanted(session, active) {
+            Wanted::Now => true,
+            Wanted::Nothing => false,
+            Wanted::Backstop => {
+                let taken = self
+                    .backstops
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                taken < BACKSTOPS_PER_PASS
+            }
+        }
     }
 
     /// The engine's version, read from the execution's transcript: the
@@ -1273,19 +1684,29 @@ impl Bridge {
         session: &SessionId,
         active: &mut Active,
     ) -> Result<(), StoreError> {
+        if !self.capture_due(session, active) {
+            return Ok(());
+        }
         let Ok(pane) =
             self.terminals
                 .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
         else {
+            // A pane that cannot be read says nothing: the reading is due
+            // again on the next pass, never read as a state (§14).
+            active.follow.again = self.config.watch.is_some() && !active.follow.watch.poll;
             return Ok(());
         };
+        let now = self.clock.now().0;
+        active.follow.last_capture = Some(now);
+        active.follow.unread_since = None;
         let reading = read_claude_screen(&pane);
+        // A reading that accepts input is the screen showing the turn over:
+        // what a turn's end in the transcript was waiting for.
+        if reading.state.accepts_input() {
+            active.follow.settling = None;
+        }
         let confirmed = active.follow.seen == Some(reading.state);
         active.follow.seen = Some(reading.state);
-        if !confirmed || reading.state == ScreenState::Unknown {
-            return Ok(());
-        }
-        let now = self.clock.now().0;
         let due = match active.follow.screen {
             None => true,
             Some((state, _)) if state != reading.state => true,
@@ -1295,20 +1716,25 @@ impl Bridge {
                         >= i64::try_from(self.config.screen_refresh.as_millis()).unwrap_or(i64::MAX)
             }
         };
-        if due {
-            active.follow.screen = Some((reading.state, now));
-            self.append(
-                agent_id,
-                session,
-                Some(&active.execution_id),
-                Source::Bridge,
-                None,
-                EventKind::ScreenObserved {
-                    state: reading.state,
-                    evidence: reading.evidence,
-                },
-            )?;
+        // Unknown is never a fact, and one reading is not one either: what
+        // the log cannot say now is read again next pass.
+        let record = due && confirmed && reading.state != ScreenState::Unknown;
+        active.follow.again = due && !record;
+        if !record {
+            return Ok(());
         }
+        active.follow.screen = Some((reading.state, now));
+        self.append(
+            agent_id,
+            session,
+            Some(&active.execution_id),
+            Source::Bridge,
+            None,
+            EventKind::ScreenObserved {
+                state: reading.state,
+                evidence: reading.evidence,
+            },
+        )?;
         Ok(())
     }
 
@@ -3372,6 +3798,11 @@ pub fn transcript_path(projects: &str, workspace: &WorkspaceId, native: &str) ->
     )
 }
 
+/// The watch key of an execution's files.
+fn watch_key(execution: &ExecutionId) -> String {
+    format!("execution:{execution}")
+}
+
 /// Where the runner writes the engine's exit status. `.spawn/` is never
 /// committed.
 fn exit_file(active: &Active) -> String {
@@ -3380,4 +3811,552 @@ fn exit_file(active: &Active) -> String {
         active.workspace.path(),
         active.execution_id
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{Bridge, BridgeConfig};
+    use crate::command::{CommandAction, Submission};
+    use crate::event::{ENGINE, EventKind, GlobalPosition};
+    use crate::id::{
+        AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
+        WorkspaceId,
+    };
+    use crate::memory::{MemoryStore, MemoryWatch};
+    use crate::port::{CommandQueue, EventLog, Launch, TerminalError, TerminalHost};
+    use crate::screen::ScreenState;
+    use crate::time::{ManualClock, Timestamp};
+    use std::time::Duration;
+
+    /// A pane at the input box, as the screen reader draws it.
+    const READY: &str = "❯ \n  deepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 249 tok/s";
+
+    /// A pane of a turn that runs.
+    const BUSY: &str = "✽ Effecting… (esc to interrupt)\n❯ \n  model line";
+
+    /// A pane the engine blocked on a question of its own: the choices sit
+    /// at the prompt position.
+    const DIALOG: &str = "claude: Which branch should I use?\n\
+                          ❯ 1. main\n  2. a new one\n";
+
+    /// The memory terminal, counting the panes it is asked for.
+    struct Counted {
+        inner: Arc<MemoryStore>,
+        captures: Mutex<usize>,
+    }
+
+    impl Counted {
+        fn captures(&self) -> usize {
+            *self.captures.lock().expect("lock")
+        }
+    }
+
+    impl TerminalHost for Counted {
+        fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
+            self.inner.start(launch)
+        }
+        fn stage_text(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            text: &str,
+        ) -> Result<(), TerminalError> {
+            self.inner.stage_text(terminal, workspace, text)
+        }
+        fn submit_staged(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<(), TerminalError> {
+            self.inner.submit_staged(terminal, workspace)
+        }
+        fn send_keys(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            keys: &[&str],
+        ) -> Result<(), TerminalError> {
+            self.inner.send_keys(terminal, workspace, keys)
+        }
+        fn is_alive(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<bool, TerminalError> {
+            self.inner.is_alive(terminal, workspace)
+        }
+        fn runner(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<crate::port::Runner, TerminalError> {
+            self.inner.runner(terminal, workspace)
+        }
+        fn capture_tail(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            lines: usize,
+        ) -> Result<String, TerminalError> {
+            *self.captures.lock().expect("lock") += 1;
+            self.inner.capture_tail(terminal, workspace, lines)
+        }
+        fn read_from(
+            &self,
+            workspace: &WorkspaceId,
+            path: &str,
+            offset: u64,
+        ) -> Result<Option<Vec<u8>>, TerminalError> {
+            self.inner.read_from(workspace, path, offset)
+        }
+        fn write_new(
+            &self,
+            workspace: &WorkspaceId,
+            path: &str,
+            bytes: &[u8],
+        ) -> Result<bool, TerminalError> {
+            self.inner.write_new(workspace, path, bytes)
+        }
+        fn terminate(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<(), TerminalError> {
+            self.inner.terminate(terminal, workspace)
+        }
+    }
+
+    /// A Bridge over one memory store, its clock, and a watch the test
+    /// drives. One start command has run in it: a session whose engine waits
+    /// at its prompt, its transcript known and watched.
+    struct World {
+        store: Arc<MemoryStore>,
+        terminal: Arc<Counted>,
+        watch: Arc<MemoryWatch>,
+        clock: Arc<ManualClock>,
+        bridge: Bridge,
+        /// The session's transcript.
+        path: String,
+        /// Screens the log held once the start had settled: a test reads
+        /// what was recorded after that.
+        record: usize,
+        /// What the start's own tick reported.
+        first: Vec<String>,
+    }
+
+    impl World {
+        fn new() -> Self {
+            Self::with_watch(Arc::new(MemoryWatch::new()))
+        }
+
+        /// A Bridge whose watch refuses every path: its files are read on
+        /// every pass, so it never settles.
+        fn polled() -> Self {
+            Self::build(Arc::new(MemoryWatch::refusing()), false)
+        }
+
+        fn with_watch(watch: Arc<MemoryWatch>) -> Self {
+            Self::build(watch, true)
+        }
+
+        fn build(watch: Arc<MemoryWatch>, settle: bool) -> Self {
+            let clock: Arc<ManualClock> = Arc::new(ManualClock::new(Timestamp(1_000)));
+            let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+            let terminal = Arc::new(Counted {
+                inner: store.clone(),
+                captures: Mutex::new(0),
+            });
+            let mut config = BridgeConfig::new("tester");
+            config.claude_projects = "/projects".to_string();
+            config.screen_quiet = Duration::from_millis(500);
+            config.screen_refresh = Duration::from_secs(30);
+            config.watch = Some(watch.clone());
+            let mut bridge = Bridge::new(
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                terminal.clone(),
+                config,
+            )
+            .with_clock(clock.clone());
+            let execution = ExecutionId::for_command(CommandId(1));
+            store.set_pane(&TerminalName::for_execution(&execution), READY);
+            store
+                .submit(
+                    &Principal::new("tester").expect("principal"),
+                    &Submission {
+                        agent_id: AgentId::new("agent_one").expect("agent"),
+                        session_id: SessionId::new("session_one").expect("session"),
+                        idempotency_key: IdempotencyKey::new("start").expect("key"),
+                        action: CommandAction::Start {
+                            engine: ENGINE.to_string(),
+                            prompt: String::new(),
+                            parent_session_id: None,
+                            from: None,
+                            model: None,
+                            charter: None,
+                        },
+                    },
+                )
+                .expect("submit");
+            let first = bridge.tick().expect("the start's tick").warnings;
+            let path = store
+                .read_global(GlobalPosition(0), 100)
+                .expect("read")
+                .into_iter()
+                .find_map(|record| match record.event.kind {
+                    EventKind::NativeSessionStarted {
+                        transcript_path, ..
+                    } => transcript_path,
+                    _ => None,
+                })
+                .expect("the start records the transcript's path");
+            let mut world = Self {
+                store,
+                terminal,
+                watch,
+                clock,
+                bridge,
+                path,
+                record: 0,
+                first,
+            };
+            // Two readings in a row: the screen at the prompt is recorded.
+            if settle {
+                world.settle();
+            }
+            world.record = world.all_screens().len();
+            world
+        }
+
+        /// One pass of the loop: the Bridge's reading of the log and the
+        /// queue, then its reading of the engines' files and screens.
+        fn tick(&mut self) -> Vec<String> {
+            let (report, _) = self.bridge.work().expect("work");
+            let mut warnings = report.warnings;
+            warnings.extend(self.bridge.poll().expect("poll").warnings);
+            warnings
+        }
+
+        fn pass(&mut self) -> usize {
+            let before = self.terminal.captures();
+            self.tick();
+            self.terminal.captures() - before
+        }
+
+        /// Passes until nothing is captured any more.
+        fn settle(&mut self) {
+            for _ in 0..6 {
+                if self.pass() == 0 {
+                    return;
+                }
+            }
+            panic!("the Bridge kept capturing an idle session");
+        }
+
+        fn advance(&self, millis: u64) {
+            self.clock.advance(Duration::from_millis(millis));
+        }
+
+        /// Append whole lines of the engine's transcript, as the engine
+        /// would, and let the watch say so.
+        fn engine_writes(&mut self, lines: &str) {
+            self.store.append_file(&self.path, lines);
+            self.watch.changed(&self.path);
+        }
+
+        /// The engine's lines the log holds.
+        fn engine_events(&self) -> Vec<&'static str> {
+            self.store
+                .read_global(GlobalPosition(0), 500)
+                .expect("read")
+                .into_iter()
+                .filter(|record| record.event.source == crate::event::Source::Claude)
+                .map(|record| record.event.kind.name())
+                .collect()
+        }
+
+        /// The screen states the Bridge recorded since the start settled.
+        fn screens(&self) -> Vec<crate::screen::ScreenState> {
+            let mut screens = self.all_screens();
+            screens.drain(..self.record.min(screens.len()));
+            screens
+        }
+
+        fn all_screens(&self) -> Vec<crate::screen::ScreenState> {
+            self.store
+                .read_global(GlobalPosition(0), 500)
+                .expect("read")
+                .into_iter()
+                .filter_map(|record| match record.event.kind {
+                    EventKind::ScreenObserved { state, .. } => Some(state),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn set_pane(&self, pane: &str) {
+            self.store.set_pane(
+                &TerminalName::for_execution(&ExecutionId::for_command(CommandId(1))),
+                pane,
+            );
+        }
+    }
+
+    /// The engine's line that ends a turn: a checkpoint, and the moment the
+    /// screen is about to turn back to its prompt.
+    const TURN_LINE: &str = "{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"t1\"}\n";
+
+    /// Something the engine wrote during the turn (no checkpoint of a turn's
+    /// end, so nothing is committed).
+    const TOOL_LINE: &str = "{\"type\":\"assistant\",\"uuid\":\"a1\",\"timestamp\":\"2099-01-01T00:00:00.000Z\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Bash\"}]}}\n";
+
+    /// A session whose command is in flight (an input waiting for its turn)
+    /// is captured on every pass: its screen is what the delivery waits for.
+    #[test]
+    fn a_session_with_a_command_in_flight_is_captured_every_pass() {
+        let mut world = World::new();
+        assert_eq!(world.pass(), 0, "an idle session costs no capture");
+        world.set_pane(BUSY);
+        world
+            .store
+            .submit(
+                &Principal::new("person").expect("principal"),
+                &Submission {
+                    agent_id: AgentId::new("agent_one").expect("agent"),
+                    session_id: SessionId::new("session_one").expect("session"),
+                    idempotency_key: IdempotencyKey::new("input").expect("key"),
+                    action: CommandAction::Input {
+                        text: "go on".to_string(),
+                        tags: Vec::new(),
+                    },
+                },
+            )
+            .expect("submit");
+        // The input finds the pane busy and waits for its turn.
+        world.tick();
+        let held = world.pass();
+        assert_eq!(held, 1, "the pass after the claim captures once");
+        assert_eq!(world.pass(), 1, "a waiting command keeps the pane read");
+        world.advance(500);
+        assert_eq!(world.pass(), 1);
+    }
+
+    /// A turn ends in the transcript while the screen still shows the turn:
+    /// the pane keeps being read until the engine paints its prompt, so the
+    /// reading a delivery waits for is never left to the backstop.
+    #[test]
+    fn a_turn_that_ended_is_read_until_its_prompt_is_back() {
+        let mut world = World::new();
+        world.set_pane(BUSY);
+        world.engine_writes(TURN_LINE);
+        assert_eq!(world.pass(), 1, "the turn's end: a reading at once");
+        assert_eq!(world.pass(), 1, "and its twin, which agrees");
+        assert_eq!(world.screens(), vec![ScreenState::Busy]);
+        // The transcript is quiet and the engine paints the prompt a moment
+        // later: that reading is due on the next pass, not at the backstop.
+        world.set_pane(READY);
+        assert_eq!(world.pass(), 1, "the prompt: a reading");
+        assert_eq!(world.pass(), 1, "and its twin");
+        assert_eq!(
+            world.screens(),
+            vec![ScreenState::Busy, ScreenState::Ready],
+            "the worker at its prompt is a fact"
+        );
+        assert_eq!(world.pass(), 0, "and then the session is left alone");
+    }
+
+    /// A screen that never shows its turn over costs the passes of one
+    /// `screen_refresh`, no more: the backstop takes it back.
+    #[test]
+    fn a_screen_that_never_settles_is_read_for_one_refresh_at_most() {
+        let mut world = World::new();
+        world.set_pane(BUSY);
+        world.engine_writes(TURN_LINE);
+        world.pass();
+        world.pass();
+        let mut reads = 0;
+        for _ in 0..70 {
+            world.advance(500);
+            reads += world.pass();
+        }
+        assert!(
+            (58..=62).contains(&reads),
+            "one capture a pass for the 30 s after the turn ended: {reads}"
+        );
+        assert_eq!(world.pass(), 0, "then not until the backstop");
+    }
+
+    /// A transcript that grew does not take the pane with it: the screen is
+    /// read once the transcript has held still, then again until two
+    /// readings agree, and then not again until the backstop.
+    #[test]
+    fn a_grown_transcript_waits_for_quiet_then_two_readings() {
+        let mut world = World::new();
+        world.set_pane(BUSY);
+        world.engine_writes(TOOL_LINE);
+        world.advance(100);
+        assert_eq!(world.pass(), 0, "the transcript only just grew");
+        assert!(
+            world.engine_events().contains(&"tool.started"),
+            "the transcript is read as soon as it changed: {:?}",
+            world.engine_events()
+        );
+        world.advance(500);
+        assert_eq!(world.pass(), 1, "quiet for the bound: one reading");
+        assert!(
+            world.screens().is_empty(),
+            "one reading is not a fact: {:?}",
+            world.screens()
+        );
+        world.advance(500);
+        assert_eq!(world.pass(), 1, "the second reading, which agrees");
+        assert_eq!(world.screens(), vec![ScreenState::Busy]);
+        world.advance(500);
+        assert_eq!(world.pass(), 0, "and then nothing more");
+    }
+
+    /// The backstop: a screen that changes with nothing in the transcript (a
+    /// dialog, a crash to a shell) is read once per `screen_refresh`.
+    #[test]
+    fn the_backstop_reads_a_screen_the_transcript_does_not_move() {
+        let mut world = World::new();
+        world.set_pane(DIALOG);
+        assert_eq!(world.pass(), 0, "not yet due");
+        world.advance(29_000);
+        assert_eq!(world.pass(), 0, "still short of the backstop");
+        world.advance(1_000);
+        assert_eq!(world.pass(), 1, "the backstop reads it");
+        assert_eq!(world.pass(), 1, "the reading waits for its twin");
+        assert_eq!(world.screens(), vec![ScreenState::Permission]);
+        assert_eq!(world.pass(), 0, "and then nothing until the next");
+    }
+
+    /// A busy screen is recorded again every `screen_refresh` while the turn
+    /// keeps it busy, so the Observer keeps a current fact for a long turn.
+    #[test]
+    fn a_busy_screen_is_recorded_again_every_refresh() {
+        let mut world = World::new();
+        world.set_pane(BUSY);
+        world.advance(30_000);
+        world.pass();
+        world.pass();
+        assert_eq!(world.screens(), vec![ScreenState::Busy]);
+        world.advance(30_000);
+        world.pass();
+        world.pass();
+        assert_eq!(
+            world.screens(),
+            vec![ScreenState::Busy, ScreenState::Busy],
+            "a long turn keeps a current fact"
+        );
+    }
+
+    /// A change is read once, and a line written while a read is in progress
+    /// is read at the next pass: never lost to the moment it was written.
+    #[test]
+    fn a_transcript_change_is_read_once_and_a_half_written_line_next_pass() {
+        let mut world = World::new();
+        world.engine_writes(TOOL_LINE);
+        world.tick();
+        assert_eq!(world.engine_events(), vec!["tool.started"]);
+        world.tick();
+        assert_eq!(
+            world.engine_events(),
+            vec!["tool.started"],
+            "nothing read twice"
+        );
+        // Half a line: the read that took it left it half-written, so the
+        // next pass reads again even though no change is reported for the
+        // rest (the write and the read raced).
+        world
+            .store
+            .append_file(&world.path, "{\"type\":\"system\",\"subtype\":\"turn_dur");
+        world.watch.changed(&world.path);
+        world.tick();
+        assert_eq!(world.engine_events(), vec!["tool.started"]);
+        world
+            .store
+            .append_file(&world.path, "ation\",\"uuid\":\"t2\"}\n");
+        world.tick();
+        assert_eq!(
+            world.engine_events(),
+            vec!["tool.started", "turn.stopped"],
+            "the rest of the line is read at the next pass"
+        );
+    }
+
+    /// A terminal killed from outside ends its execution on the next pass,
+    /// as before: the fleet's liveness is one call per pass, not a capture
+    /// and not a call per agent.
+    #[test]
+    fn a_killed_terminal_ends_its_execution_on_the_next_pass() {
+        let mut world = World::new();
+        assert_eq!(world.pass(), 0, "idle: nothing to do");
+        world.store.untrack(
+            &TerminalName::for_execution(&ExecutionId::for_command(CommandId(1))),
+            "a shell prompt after the host move",
+        );
+        world.tick();
+        let ended = world
+            .store
+            .read_global(GlobalPosition(0), 500)
+            .expect("read")
+            .into_iter()
+            .find_map(|record| match record.event.kind {
+                EventKind::ExecutionEnded { cause, .. } => Some(cause),
+                _ => None,
+            });
+        assert_eq!(ended, Some(crate::event::EndCause::Lost), "ended as lost");
+    }
+
+    /// A watch that can be set on one of an execution's files and not on
+    /// another falls back for the whole execution: both are read on every
+    /// pass, and the file that could not be watched is named once.
+    #[test]
+    fn a_watch_refused_for_one_file_falls_back_for_the_whole_execution() {
+        let watch = Arc::new(MemoryWatch::new());
+        // The first mount's exit file: the start command's execution.
+        let exit = "/workspaces/1/.spawn/exit-exec_1";
+        watch.refuse(exit);
+        let mut world = World::build(watch.clone(), false);
+        assert!(
+            world
+                .first
+                .iter()
+                .any(|warning| warning.contains(exit) && warning.contains("read on every pass")),
+            "the file that cannot be watched is named: {:?}",
+            world.first
+        );
+        world.set_pane(BUSY);
+        assert_eq!(world.pass(), 1, "its files are read on every pass");
+        assert_eq!(world.pass(), 1);
+    }
+
+    /// A session whose files cannot be watched is read on every pass, as
+    /// before, and the fallback is said once.
+    #[test]
+    fn a_watch_that_cannot_be_set_falls_back_to_reading_every_pass_once() {
+        let mut world = World::polled();
+        assert!(
+            world
+                .first
+                .iter()
+                .any(|warning| warning.contains("read on every pass")),
+            "the fallback is said: {:?}",
+            world.first
+        );
+        world.set_pane(BUSY);
+        assert_eq!(world.pass(), 1, "read on every pass");
+        assert_eq!(world.pass(), 1);
+        let warnings = world.tick();
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("read on every pass")),
+            "said once: {warnings:?}"
+        );
+    }
 }

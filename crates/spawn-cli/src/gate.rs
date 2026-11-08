@@ -1287,10 +1287,18 @@ impl PrivateDirectory {
 
     fn create_in(parent: &Path) -> std::io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt as _;
+        // The clock alone is not a nonce: two tests that ask in the same
+        // nanosecond (the clock's own resolution under a loaded host) would
+        // name one directory and one of them would fail on `AlreadyExists`.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
-        let path = parent.join(format!("spawn-gate-{}-{nonce:x}", std::process::id()));
+        let path = parent.join(format!(
+            "spawn-gate-{}-{nonce:x}-{ordinal}",
+            std::process::id()
+        ));
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
         Ok(Self(path))
     }
