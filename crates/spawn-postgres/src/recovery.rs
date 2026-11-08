@@ -207,6 +207,7 @@ select jsonb_build_object(
                          where e.session_id = $1 and e.event_name = 'session.native_started'
                          order by e.id desc limit 1),
   'turns', (select list from turns),
+  'failed_tools', (select list from tools),
   'progress', (select jsonb_build_object('event_id', last_id, 'at_ms', last_at) from progress),
   'stops', (select list from stops),
   'records', (select list from records),
