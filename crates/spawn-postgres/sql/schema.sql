@@ -391,14 +391,13 @@ create index if not exists spawn_commands_open
 create index if not exists spawn_commands_session
     on spawn_commands (session_id, id);
 
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
 -- Commands that finished failed, since a time: the alert step's notice of a
 -- failed command, found without reading the queue (docs/fleet-architecture.md
 -- §3.4).
 create index if not exists spawn_commands_failed
     on spawn_commands (finished_at_ms)
     where succeeded = false;
-=======
+
 -- A session's commands by who sent them: the dispatcher's facts read one
 -- session's dispatcher commands (what it already sent, its deliveries and
 -- nudges, the tags the supervisor was told) on every pass, and these two
@@ -408,7 +407,6 @@ create index if not exists spawn_commands_failed
 -- test's first shapes included).
 create index if not exists spawn_commands_by_session
     on spawn_commands (session_id, principal, id);
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 
 -- A grant either lets a principal read an agent's views (`read`) or also
 -- submit commands for it (`all`). `agent_id` is an id, `*`, or a prefix
