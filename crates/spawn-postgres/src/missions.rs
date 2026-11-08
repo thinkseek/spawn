@@ -550,6 +550,29 @@ select coalesce(jsonb_agg(jsonb_build_object(
         and d.succeeded and jsonb_typeof(d.action -> 'tags') = 'array'
         and d.action -> 'tags' ? ('missions objective-yielded-' || x.id))";
 
+/// The objectives that closed solved on the base and the supervisor was not
+/// told of yet, oldest first: an `objective.solved` record of the
+/// integrator's (its `solved_on_base`: the objective's scenario passes at a
+/// base commit main already holds, so its task ends as a solved cancel and
+/// no task for it is assigned again) that no digest which reached the
+/// supervisor carried the tag `missions objective-solved-<event_id>` of.
+/// Each names its event, time, mission and the record's own fields
+/// (`objective`, `task`, `scenario`, `base`); the gate's `log` is left out.
+pub(crate) const OBJECTIVE_SOLVED_NEWS: &str = r"
+select coalesce(jsonb_agg(
+         ((e.kind -> 'detail' -> 'record') - 'log'::text)
+           || jsonb_build_object('event_id', e.id, 'at_ms', e.recorded_at_ms,
+                                 'mission', (e.kind -> 'detail' -> 'record' ->> 'id')::bigint)
+         order by e.session_seq), '[]'::jsonb)
+  from spawn_events e
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' = 'objective.solved'
+   and not exists (
+     select 1 from spawn_commands d
+      where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch'
+        and d.succeeded and jsonb_typeof(d.action -> 'tags') = 'array'
+        and d.action -> 'tags' ? ('missions objective-solved-' || e.id))";
+
 /// Gate verdicts on one objective's tasks, newest first, from the control
 /// stream: `[{task, verdict, reason, metric, at_ms}]`, `incompatible` (sent
 /// back because main moved, not a rejection) among them. `$1` mission,
@@ -1225,6 +1248,12 @@ impl PostgresStore {
     /// ([`OBJECTIVE_YIELDS`]).
     pub fn objective_yields(&self) -> Result<Value, StoreError> {
         self.query_json(OBJECTIVE_YIELDS, &[])
+    }
+
+    /// The objectives that closed solved on the base and were not told to the
+    /// supervisor yet ([`OBJECTIVE_SOLVED_NEWS`]).
+    pub fn objective_solved_news(&self) -> Result<Value, StoreError> {
+        self.query_json(OBJECTIVE_SOLVED_NEWS, &[])
     }
 
     /// An objective mission's landed tasks, newest first.
