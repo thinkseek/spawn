@@ -405,6 +405,10 @@ pub(crate) enum Why {
     /// A mission's gate failed twice in a row because the host did (the
     /// test database), not the work ([`digest::host_fault_escalations`]).
     GateHostFault,
+    /// A mission's base disagreed with itself three times in a row: a
+    /// scenario of the base exited 1 and then 0, before any candidate code
+    /// ran ([`digest::base_disagrees_alerts`], objective 033).
+    GateBaseDisagrees,
     /// An open task's step has not moved within its bound ([`stall`]).
     Stalled,
     /// The deployed charter could not be typed into the supervisor's pane:
@@ -446,6 +450,7 @@ impl Why {
                 | Self::Approved
                 | Self::Human
                 | Self::GateHostFault
+                | Self::GateBaseDisagrees
                 | Self::HoldExpired
         )
     }
@@ -654,8 +659,9 @@ pub(crate) struct Reading {
 }
 
 /// The plan for this moment, reading only: the host's news (the disk items
-/// `disk` gives for the moment's clock, the gate-room and gate host-fault
-/// records, the owner's holds that expired, the stalls past their `bounds`,
+/// `disk` gives for the moment's clock, the gate-room, gate host-fault and
+/// base-disagreement records, the owner's holds that expired, the stalls past
+/// their `bounds`,
 /// [`stall`], and the background
 /// jobs past theirs, [`jobs`]) added to the facts and mission rows
 /// `loaded` ([`load`]), then [`decide_with`], then the input that gives the
@@ -692,6 +698,13 @@ pub(crate) fn read_plan(
         store
             .gate_host_fault_escalations()
             .map_err(|error| format!("gate host fault records: {error}"))?
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+    ));
+    host.extend(digest::base_disagrees_alerts(
+        store
+            .gate_base_disagrees_alerts()
+            .map_err(|error| format!("gate base disagreement records: {error}"))?
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
@@ -1628,6 +1641,99 @@ mod tests {
         assert!(
             plan.orders.is_empty() && plan.pending.is_empty(),
             "told once"
+        );
+    }
+
+    /// Objective 33: three bases in a row that disagreed with themselves
+    /// reach an idle supervisor once, as an item of `host` tagged
+    /// `host gate-base-disagrees-<event id>`, naming the task, the mission,
+    /// the count, the scenario, both exits, the gate's setup time and when
+    /// the task is judged again. A record without `alert` is no item, and a
+    /// base disagreement is never an escalation.
+    #[test]
+    fn three_disagreeing_bases_reach_an_idle_supervisor_once() {
+        let record = serde_json::json!({
+            "type": "task.gated", "verdict": "host_fault", "id": 1, "event_id": 87,
+            "mission": 1, "host_faults": 3, "base_disagrees": 3, "alert": true,
+            "escalate": false, "evidence": "base_disagrees", "scenario": "011.sh",
+            "exits": [1, 0], "setup_s": 244, "backoff_ms": 16_000,
+            "due_ms": 1_793_930_000_000_i64,
+        });
+        let host = super::digest::base_disagrees_alerts(std::slice::from_ref(&record));
+        assert_eq!(host.len(), 1);
+        assert_eq!(host[0].why, Why::GateBaseDisagrees);
+        assert_eq!(host[0].tag(), "host gate-base-disagrees-87");
+        assert_eq!(host[0].session_id, "host");
+        assert!(Why::GateBaseDisagrees.is_news());
+        assert_eq!(host[0].since_ms, None, "the record names no time here");
+        for said in [
+            "task #1",
+            "mission 1",
+            "3 in a row",
+            "011.sh",
+            "exited 1, then 0",
+            "setup 244 s",
+            "judged again at 2026-11-06T",
+            "nothing is counted and nothing halts",
+        ] {
+            assert!(host[0].line.contains(said), "{said}: {}", host[0].line);
+        }
+        assert!(!host[0].line.contains('\n'));
+        // The setup time is left out when the gate printed none.
+        let mut bare = record.clone();
+        bare.as_object_mut().expect("object").remove("setup_s");
+        let host = super::digest::base_disagrees_alerts(&[bare]);
+        assert!(!host[0].line.contains("setup"), "{}", host[0].line);
+
+        let rows = [idle_supervisor()];
+        let plan = decide_with(&rows, &Work::default(), &host[..1], true, NOW, "spawn");
+        assert_eq!(plan.orders.len(), 1, "the digest goes to the supervisor");
+        let CommandAction::Input { text, tags } = &plan.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert_eq!(tags, &["host gate-base-disagrees-87"]);
+        let line = text
+            .lines()
+            .find(|line| line.contains("task #1"))
+            .expect("the item's line");
+        assert!(
+            line.starts_with(
+                "- host — the base disagreed with itself at the gate (the host's): task #1"
+            ) && line.contains("011.sh exited 1, then 0"),
+            "{line}"
+        );
+        let mut supervisor = idle_supervisor();
+        delivered(&mut supervisor, &plan.orders[0]);
+        let plan = decide_with(
+            &[supervisor],
+            &Work::default(),
+            &host[..1],
+            true,
+            NOW,
+            "spawn",
+        );
+        assert!(
+            plan.orders.is_empty() && plan.pending.is_empty(),
+            "told once"
+        );
+
+        // A base disagreement that does not make the run 3 is no item, and
+        // the store's escalation query never gives one: its `escalate` is
+        // false.
+        let quiet = serde_json::json!({
+            "type": "task.gated", "verdict": "host_fault", "id": 1, "event_id": 86,
+            "mission": 1, "host_faults": 2, "base_disagrees": 2, "alert": false,
+            "escalate": false, "evidence": "base_disagrees", "scenario": "011.sh",
+            "exits": [1, 0], "backoff_ms": 8_000,
+        });
+        assert!(super::digest::base_disagrees_alerts(&[quiet]).is_empty());
+        assert!(
+            super::digest::host_fault_escalations(&[record]).is_empty(),
+            "a base disagreement is no host-fault escalation"
+        );
+        assert!(
+            super::digest::base_disagrees_alerts(&[serde_json::json!({"id": 1})]).is_empty(),
+            "a record without its event is no item"
         );
     }
 
