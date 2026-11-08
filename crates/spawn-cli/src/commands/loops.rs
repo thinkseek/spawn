@@ -163,7 +163,6 @@ fn wait_unless_stopped(
 /// restarts it with fresh connections (the store does not reconnect).
 const MAX_FAILURES: u32 = 10;
 
-<<<<<<< f05915f5a98fa3cf6e3db78ce9a1a5ee14801f84
 /// One step of the loop, and what decides whether this pass runs it: the
 /// watermark it last acted on, and the earliest time it waits for.
 ///
@@ -265,12 +264,7 @@ impl Schedule {
 fn now_ms() -> i64 {
     spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
 =======
-/// What a watcher that must not fail a pass reports: its lines, or the error
-/// as a warning named `what`.
-fn watched(what: &str, result: Result<Vec<String>, String>) -> Vec<String> {
-    result.unwrap_or_else(|error| vec![format!("{what}: {error}")])
->>>>>>> 8f0a8010c56bceca9c335f98b07cd777f7f6b217
-}
+/// What a watcher that must not}
 
 /// Run the Bridge, the Observer, the disk watch, the dispatcher and the
 /// liveness rule, until SIGTERM or SIGINT ends it after its pass.
@@ -325,7 +319,6 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         failures: 0,
     };
     loop {
-<<<<<<< f05915f5a98fa3cf6e3db78ce9a1a5ee14801f84
         fleet.pass();
         if fleet.failed() >= MAX_FAILURES {
             return Err(format!(
@@ -383,12 +376,7 @@ impl Fleet {
         let mut lines: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
 =======
-        // A pass takes its interval, the work included: the pause is what is
-        // left of it, so a command submitted just after a pass waits about
-        // one interval for its claim, not an interval plus the last pass.
-        let started = std::time::Instant::now();
->>>>>>> 8f0a8010c56bceca9c335f98b07cd777f7f6b217
-        let mut failed = false;
+        // A pass takes its inte        let mut failed = false;
         if self.store.is_none() {
             match open_store().map(std::sync::Arc::new) {
                 Ok(open) => self.store = Some(open),
@@ -427,53 +415,13 @@ impl Fleet {
             Ok(report) => warnings.extend(report.warnings),
             Err(error) => Fleet::fail(&mut failed, "bridge", &error.to_string()),
         }
-<<<<<<< f05915f5a98fa3cf6e3db78ce9a1a5ee14801f84
         for warning in &warnings {
             eprintln!("spawn loop warning: {warning}");
         }
         for line in &lines {
             println!("{line}");
 =======
-        if let Some(open) = &store {
-            let mut lines = Vec::new();
-            let mut step = |what: &str, result: Result<Vec<String>, String>| match result {
-                Ok(more) => lines.extend(more),
-                Err(error) => fail(what, &error),
-            };
-            // The disk watch and the alerts never fail a pass: a fleet must
-            // not stop because it cannot record a warning.
-            step("disk", Ok(watched("disk", disk.check(open))));
-            step("alerts", Ok(watched("alerts", alerting.check(open))));
-            if dispatching {
-                step(
-                    "dispatch",
-                    dispatch::step(
-                        open,
-                        supervised,
-                        &spawn,
-                        workspace_root.as_deref(),
-                        &disk,
-                        &bounds,
-                        waits,
-                    ),
-                );
-            }
-            // Under the disk floor no resident is revived (a new execution);
-            // the supervisor still is, to act on the warning.
-            if !disk.below_floor() {
-                step("residents", supervise::keep_residents(open));
-            }
-            if supervised {
-                step(
-                    "supervise",
-                    supervise::keep_alive(open).map(|line| line.into_iter().collect()),
-                );
-            }
-            for line in &lines {
-                println!("{line}");
-            }
->>>>>>> 8f0a8010c56bceca9c335f98b07cd777f7f6b217
-        }
+        if let Some(open) = &sto        }
         if failed {
             // A broken connection is reopened on the next pass.
             self.store = None;
@@ -482,7 +430,6 @@ impl Fleet {
         } else {
             self.failures = 0;
         }
-<<<<<<< f05915f5a98fa3cf6e3db78ce9a1a5ee14801f84
     }
 
     /// The Bridge's reading of the log and its claims of the queue: a few
@@ -655,14 +602,7 @@ impl Fleet {
                 pause_unless_stopped(pause, stopping)
             }
 =======
-        // ponytail: fixed backoff, cap at 30 intervals. A per-error-kind
-        // schedule only matters once a failure class is slow to clear.
-        let pause = backoff(interval, failures).saturating_sub(started.elapsed());
-        if pause_unless_stopped(pause, &stopping) {
-            eprintln!("spawn loop: stopping; pending pushes are made first");
-            return Ok(0);
->>>>>>> 8f0a8010c56bceca9c335f98b07cd777f7f6b217
-        }
+        // ponytail: fixed backo        }
     }
 }
 
