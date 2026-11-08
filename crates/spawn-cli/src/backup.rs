@@ -1395,13 +1395,12 @@ fn bundle_compression(magic: &[u8]) -> &'static str {
 /// `archive` decompressed back to the tar it was made from, by its magic:
 /// what `compress_bundle` did, undone.
 fn decompress_bundle(scratch: &Path, archive: &Path) -> Result<(PathBuf, &'static str), String> {
-    let mut magic = [0u8; 4];
-    let mut file =
-        File::open(archive).map_err(|error| format!("{}: {error}", archive.display()))?;
-    let read = file
-        .read(&mut magic)
+    let mut magic = Vec::with_capacity(4);
+    let file = File::open(archive).map_err(|error| format!("{}: {error}", archive.display()))?;
+    file.take(4)
+        .read_to_end(&mut magic)
         .map_err(|error| format!("{}: {error}", archive.display()))?;
-    let compression = bundle_compression(&magic[..read]);
+    let compression = bundle_compression(&magic);
     let tar = scratch.join("bundle.tar");
     let program = match compression {
         "gzip" => Some(("gzip", vec!["-dc"])),
@@ -2025,6 +2024,7 @@ fn verify(flags: &Flags) -> Result<i32, String> {
         match verify_bundle(&settings, &store, now_ms) {
             Ok(check) => record["bundle"] = check,
             Err(error) => {
+                record["bundle"] = json!({"checked": true, "reason": error.clone()});
                 ok = false;
                 reason = error;
             }
@@ -2646,6 +2646,7 @@ fn record_verified(
         "max_event_id": drilled.max_event_id,
         "database": drilled.database,
         "server": naming.get("server").cloned().unwrap_or(Value::Null),
+        "bundle": naming.get("bundle").cloned().unwrap_or(Value::Null),
         "duration_ms": i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
     });
     if record["server"].is_null()

@@ -17,5 +17,9 @@ Restart=on-failure
 RestartSec=1h
 RestartPreventExitStatus=1 2
 TimeoutStartSec=1h
+# The object is fetched into memory before it is decrypted and unpacked: the
+# dump is ~10 MB, the bundle tens of MB (a full one ~90 MB). A cap keeps a
+# runaway fetch from taking the host's memory with it.
+MemoryMax=1G
 Nice=10
 IOSchedulingClass=idle
