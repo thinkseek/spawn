@@ -1027,26 +1027,36 @@ pub(crate) fn gate_host_fault_fields(
     })
 }
 
-/// The record of a gate that cannot judge `scenario` here (029: no systemd
-/// user manager in the sandbox), the gate's own `cannot_judge` fact (exit
-/// [`gate::HOST_FAULT_EXIT`], the key that tells it from the gate's
-/// `host_fault` fact): the `faults`-th host fault in a row on the mission
-/// (020's run, which every evidence shares), with its `backoff`. It says the
-/// objective is judged outside the gate, by the owner (mission 7), never
-/// that the work failed.
+/// The record of a gate that cannot judge `scenario` here, the gate's own
+/// `cannot_judge` fact (exit [`gate::HOST_FAULT_EXIT`], the key that tells
+/// it from the gate's `host_fault` fact): the `faults`-th host fault in a row
+/// on the mission (020's run, which every evidence shares), with its
+/// `backoff`, never that the work failed.
+///
+/// Its cause is the scenario's own, quoted from the gate's log
+/// ([`cannot_judge_cause`]) into `cause` and the reason: 029 says it needs a
+/// systemd user manager, Supply PA's 073 that it needs a PostgreSQL server,
+/// and a record that named one cause for all of them sent a supervisor to
+/// build a task on a cause nobody had seen (task 208). With no such line in
+/// the log, the record says the gate gave no cause, and names none.
 pub(crate) fn cannot_judge_fields(
     scenario: &str,
     faults: u32,
     backoff: Duration,
     log: &str,
 ) -> Value {
+    let cause = cannot_judge_cause(scenario, log);
+    let said = cause.as_deref().map_or_else(
+        || "the gate's log gives no cause".to_string(),
+        |cause| format!("it says: {cause}"),
+    );
     json!({
         "reason": format!(
-            "host fault: this host cannot judge {scenario} (it needs what the gate's sandbox \
-             has none of, a systemd user manager); the objective is judged outside the gate, by \
-             the owner; not a verdict on the work, judged again in {}",
+            "host fault: this host cannot judge {scenario} ({said}); not a verdict on the work, \
+             judged again in {}",
             spoken(backoff)
         ),
+        "cause": cause,
         "log": log,
         "evidence": CANNOT_JUDGE,
         "scenario": scenario,
@@ -1054,6 +1064,48 @@ pub(crate) fn cannot_judge_fields(
         "backoff_ms": u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
         "escalate": faults == HOST_FAULT_ESCALATE_AT,
     })
+}
+
+/// What `scenario` said when it could not be judged, from the gate's `log`:
+/// the last line of its own block (from a `| == ` line naming it to the next
+/// `| == ` line) that says it cannot judge ("073: cannot judge: …", 029's
+/// "029: cannot be judged here: …"), on one line, without the log's
+/// markers (the gate's `| `, the integrator's `! ` before the gate's stderr).
+/// Outside any block (a line on the gate's stderr, after its blocks), the
+/// last line that begins with the scenario's own name and says the same.
+/// None when the log has neither: the scenario gave no cause.
+pub(crate) fn cannot_judge_cause(scenario: &str, log: &str) -> Option<String> {
+    let says = |text: &str| text.contains("cannot judge") || text.contains("cannot be judged");
+    let stem = scenario.split('.').next().unwrap_or(scenario);
+    let mut in_block = false;
+    let mut in_own_block = None;
+    let mut by_name = None;
+    for line in log.lines() {
+        if let Some(header) = line.strip_prefix("| == ") {
+            in_block = header.split([' ', ':']).any(|word| word == scenario);
+            continue;
+        }
+        // The gate's `| ` before a scenario's output, the integrator's `! `
+        // before a line of the gate's stderr: markers of the log, not the
+        // scenario's words.
+        let text = line
+            .strip_prefix('|')
+            .or_else(|| line.strip_prefix('!'))
+            .unwrap_or(line)
+            .trim();
+        if !says(text) {
+            continue;
+        }
+        if in_block {
+            in_own_block = Some(text);
+        }
+        if text.starts_with(&format!("{stem}:")) {
+            by_name = Some(text);
+        }
+    }
+    in_own_block
+        .or(by_name)
+        .map(|text| crate::deliver::one_line(text, 400))
 }
 
 /// The evidence a `host_fault` record names when the host cannot judge the
@@ -6937,14 +6989,71 @@ mod cannot_judge_tests {
         assert!(record.get("due_ms").is_none(), "the store writes it");
         assert_eq!(
             record["reason"],
-            "host fault: this host cannot judge 029.sh (it needs what the gate's sandbox has \
-             none of, a systemd user manager); the objective is judged outside the gate, by the \
-             owner; not a verdict on the work, judged again in 5 min"
+            "host fault: this host cannot judge 029.sh (the gate's log gives no cause); not a \
+             verdict on the work, judged again in 5 min",
+            "a log with no line of the scenario's names no cause"
         );
+        assert_eq!(record["cause"], serde_json::Value::Null);
         assert!(record.get("candidate").is_none(), "the caller adds it");
         let second = fields(2);
         assert_eq!(second["escalate"], true, "the second in a row, as any");
         assert_eq!(second["backoff_ms"], 600_000);
+    }
+
+    /// The cause is the scenario's own line, quoted from its block in the
+    /// gate's log: 029's systemd user manager, or Supply PA 073's
+    /// PostgreSQL server — never one scenario's cause for another.
+    #[test]
+    fn the_reason_quotes_the_scenario_s_own_cannot_judge_line() {
+        let line_073 = "073: cannot judge: SPAWN_TEST_DATABASE_URL names no PostgreSQL server, \
+                        and the race needs two connections (the gate starts one from \
+                        SPAWN_GATE_PG_BIN or SPAWN_GATE_PG_IMAGE)";
+        let log = format!(
+            "| server: none\n\
+             | == candidate: 044.sh must pass\n\
+             | 044: ok\n\
+             | == candidate: 073.sh must pass\n\
+             | 073: starting\n\
+             | {line_073}\n\
+             | == candidate: 075.sh must pass\n\
+             | 075: cannot judge: something else entirely\n"
+        );
+        let record = cannot_judge_fields("073.sh", 1, std::time::Duration::from_mins(5), &log);
+        assert_eq!(record["cause"], line_073);
+        let reason = record["reason"].as_str().expect("a reason");
+        assert!(reason.contains(&format!("it says: {line_073}")), "{reason}");
+        assert!(!reason.contains("systemd"), "never 029's cause: {reason}");
+        assert!(
+            !reason.contains("something else"),
+            "never another block's: {reason}"
+        );
+
+        // 029's own line, on the gate's stderr (the integrator's `! `).
+        let log = "| == candidate: 029.sh must pass\n\
+                   ! 029: cannot be judged here: no systemd user manager is reachable\n";
+        let record = cannot_judge_fields("029.sh", 1, std::time::Duration::from_mins(5), log);
+        assert_eq!(
+            record["cause"],
+            "029: cannot be judged here: no systemd user manager is reachable"
+        );
+
+        // The last line of the block wins; the log's `| ` is not quoted.
+        assert_eq!(
+            super::cannot_judge_cause(
+                "073.sh",
+                "| == base: 073.sh\n| 073: cannot judge: first\n| 073: cannot judge: last\n"
+            )
+            .as_deref(),
+            Some("073: cannot judge: last")
+        );
+        // Another scenario's line is no cause of this one's.
+        assert_eq!(
+            super::cannot_judge_cause(
+                "073.sh",
+                "| == base: 029.sh\n| 029: cannot be judged here: x\n"
+            ),
+            None
+        );
     }
 
     /// No halt rule counts it, however many in a row.
@@ -9298,10 +9407,19 @@ mod database_tests {
         assert_eq!(record["backoff_ms"], 1);
         assert_eq!(record["due_ms"], at + 1, "its own time plus the backoff");
         assert!(record["candidate"].is_string());
-        assert!(record["reason"].as_str().is_some_and(|reason| {
-            reason.starts_with("host fault: this host cannot judge 029.sh")
-                && reason.contains("judged outside the gate")
-        }));
+        assert!(
+            record["reason"].as_str().is_some_and(|reason| {
+                reason.starts_with("host fault: this host cannot judge 029.sh")
+                    && reason.contains(
+                        "it says: 029: cannot be judged here: no systemd user manager is reachable",
+                    )
+            }),
+            "the scenario's own line, quoted: {record}"
+        );
+        assert_eq!(
+            record["cause"],
+            "029: cannot be judged here: no systemd user manager is reachable"
+        );
         assert!(
             record["log"]
                 .as_str()

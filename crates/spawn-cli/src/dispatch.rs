@@ -1795,29 +1795,56 @@ mod tests {
         );
     }
 
-    /// A record whose evidence is `cannot_judge` (029: no systemd user
-    /// manager in the sandbox) names the objective and says it is judged
-    /// outside the gate, never that the test database failed or that the
-    /// load should be checked. The second in a row still escalates.
+    /// A record whose evidence is `cannot_judge` names the objective and
+    /// quotes the scenario's own cause from the record (`cause`), never
+    /// another scenario's: 029's systemd user manager was once said of
+    /// Supply PA's 073, which needed a PostgreSQL server, and a supervisor
+    /// built task 208 on it. A record without a cause says the gate gave
+    /// none. Never that the test database failed or that the load should be
+    /// checked. The second in a row still escalates.
     #[test]
-    fn a_cannot_judge_host_fault_names_the_objective_judged_outside_the_gate() {
+    fn a_cannot_judge_host_fault_quotes_the_scenario_s_own_cause() {
+        let line_of = |record: serde_json::Value| {
+            let host = super::digest::host_fault_escalations(&[record]);
+            assert_eq!(host.len(), 1);
+            assert_eq!(host[0].why, Why::GateHostFault);
+            host[0].line.clone()
+        };
+        let cause_073 = "073: cannot judge: SPAWN_TEST_DATABASE_URL names no PostgreSQL server, \
+                         and the race needs two connections";
+        let line = line_of(
+            serde_json::json!({"type": "task.gated", "verdict": "host_fault",
+            "id": 205, "event_id": 62, "mission": 9, "host_faults": 2, "escalate": true,
+            "evidence": "cannot_judge", "scenario": "073.sh", "cause": cause_073,
+            "backoff_ms": 600_000, "due_ms": 1_793_930_000_000_i64}),
+        );
+        assert!(
+            line.contains(&format!(
+                "this host cannot judge the objective here (073.sh says: {cause_073})"
+            )),
+            "{line}"
+        );
+        assert!(!line.contains("systemd"), "never 029's cause: {line}");
+        assert!(!line.contains("mission 7"), "never 029's remedy: {line}");
+        assert!(
+            line.contains("Give the gate what the scenario says it lacks"),
+            "{line}"
+        );
+
         let record = serde_json::json!({"type": "task.gated", "verdict": "host_fault", "id": 11,
             "event_id": 61, "mission": 7, "host_faults": 2, "escalate": true,
             "evidence": "cannot_judge", "scenario": "029.sh",
             "backoff_ms": 600_000, "due_ms": 1_793_930_000_000_i64});
         let host = super::digest::host_fault_escalations(&[record]);
-        assert_eq!(host.len(), 1);
         assert_eq!(host[0].tag(), "host gate-host-fault-61");
-        assert_eq!(host[0].why, Why::GateHostFault);
         let line = &host[0].line;
         assert!(
-            line.contains("this host cannot judge the objective here (029.sh"),
-            "{line}"
+            line.contains(
+                "this host cannot judge the objective here (029.sh; the gate's log gives no cause)"
+            ),
+            "a record without a cause names none: {line}"
         );
-        assert!(
-            line.contains("judged outside the gate, by the owner (mission 7)"),
-            "{line}"
-        );
+        assert!(!line.contains("systemd"), "{line}");
         assert!(
             line.contains("nothing is counted and nothing halts"),
             "{line}"

@@ -170,14 +170,22 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
             });
             let fact = &record["fact"];
             let evidence = if record["evidence"] == "cannot_judge" {
-                // The host cannot judge the objective at all (029: no
-                // systemd user manager in the sandbox): not a transient
-                // fault of the test database or the load.
+                // The host cannot judge the objective at all: the scenario's
+                // own cause, as the record quotes it from the gate's log
+                // (integrate.rs `cannot_judge_cause`), or none — never one
+                // scenario's cause for another (029's systemd user manager
+                // was said of 073, which needed a PostgreSQL server).
                 let scenario = record["scenario"].as_str().unwrap_or("its scenario");
-                format!(
-                    "this host cannot judge the objective here ({scenario} needs what the \
-                     gate's sandbox has none of, a systemd user manager)"
-                )
+                match record["cause"].as_str() {
+                    Some(cause) => format!(
+                        "this host cannot judge the objective here ({scenario} says: {})",
+                        one_line(cause, 300)
+                    ),
+                    None => format!(
+                        "this host cannot judge the objective here ({scenario}; the gate's log \
+                         gives no cause)"
+                    ),
+                }
             } else if record["evidence"] == "gate" {
                 let scenario = fact["scenario"].as_str().unwrap_or("a scenario");
                 let runs = one_line(fact["runs"].as_str().unwrap_or_default(), 200);
@@ -213,8 +221,11 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                 |due| format!("at {}", crate::scorecard::time::format_rfc3339(due)),
             );
             let check = if record["evidence"] == "cannot_judge" {
-                "The objective is judged outside the gate, by the owner (mission 7): judge it \
-                 there, or tell the owner."
+                // What to do follows from the scenario's own cause (quoted
+                // above), not from 029's: give the gate what the scenario
+                // says it lacks, or judge it outside the gate.
+                "Give the gate what the scenario says it lacks (its environment, a server, a \
+                 service), or have the owner judge the objective outside the gate."
             } else if record["evidence"] == "gate" {
                 "Check the host's load and that scenario's harness (its log in the gate output), \
                  or tell the owner."
