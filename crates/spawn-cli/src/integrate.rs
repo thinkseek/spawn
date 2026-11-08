@@ -2744,6 +2744,13 @@ impl Judge {
             gate_env.push(("SPAWN_GATE_BASE_CHECK".to_string(), red.scenario.clone()));
         }
         let gate_path = pinned(&self.gate);
+        // The head's re-judgings ([`rejection`]) run on an older base, where
+        // the red check says nothing about main: they are not given it.
+        let head_env: Vec<(String, String)> = gate_env
+            .iter()
+            .filter(|(name, _)| name != "SPAWN_GATE_BASE_CHECK")
+            .cloned()
+            .collect();
         let run_gate = |base: &str, judged: &str| {
             gate::judge(
                 &gate_path,
@@ -2752,7 +2759,7 @@ impl Judge {
                 judged,
                 scenarios,
                 scenario.as_deref(),
-                &gate_env,
+                &head_env,
                 gate_wall_clock(),
             )
         };
