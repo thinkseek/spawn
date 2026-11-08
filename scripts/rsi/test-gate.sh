@@ -1709,4 +1709,42 @@ else
     echo "skip the gate's own test server from a docker image: docker has no image $pg_image (TEST_GATE_PG_IMAGE)"
 fi
 
+# 19. The gate passes a tree's deps store into the sandbox: SUPPLY_PA_DEPS,
+# which a project's build hook and scenarios read, from the integrator's own
+# environment (the sandbox clears it). Unset, the sandbox has none — the
+# check below then fails on the candidate and on the base, which is how
+# the case knows the value came through; a check failing on both is the
+# host's, no verdict (exit 6, "Checks run twice"), never a rejection.
+deps_scenarios=$work/supply-pa-deps-scenarios
+mkdir -p "$deps_scenarios"
+cp "$scenarios/protected" "$scenarios/build" "$deps_scenarios/"
+# The store sits where the scenarios are, which the gate binds read-only (a
+# project binds its own): so the check below can see the path it was given.
+store=$deps_scenarios/store
+mkdir -p "$store/node_modules"
+printf '%s\n' "$store" >"$deps_scenarios/expected-deps"
+cat >"$deps_scenarios/check-supply-deps.sh" <<'CHECK'
+#!/bin/sh
+# The store the integrator named reached the sandbox, and nothing else of the
+# integrator's: the environment is cleared.
+expected=$(cat "$(dirname "$0")/expected-deps")
+[ "${SUPPLY_PA_DEPS-}" = "$expected" ] || {
+    echo "SUPPLY_PA_DEPS is ${SUPPLY_PA_DEPS-<unset>}, not $expected"
+    exit 1
+}
+[ -z "${SPAWN_DATABASE_URL-}" ] || {
+    echo "the integrator's SPAWN_DATABASE_URL reached the sandbox"
+    exit 1
+}
+[ -d "$SUPPLY_PA_DEPS" ] && echo "the store is visible through the path"
+exit 0
+CHECK
+expect "the gate passes SUPPLY_PA_DEPS into the sandbox" \
+    "$(export SUPPLY_PA_DEPS="$store"; judge "$good" "" "$deps_scenarios")" 'exit=0 {"verdict":"accepted"}'
+expect "and the sandbox shows its path" "$(cat "$work/gate.out")" 'the store is visible through the path'
+expect "unset, the sandbox has none: the check fails and the gate states no verdict" \
+    "$(unset SUPPLY_PA_DEPS; judge "$good" "" "$deps_scenarios")" \
+    'exit=6 {"host_fault":true,"scenario":"check-supply-deps.sh'
+expect "and says what the sandbox saw" "$(cat "$work/gate.out")" 'SUPPLY_PA_DEPS is <unset>'
+
 echo "gate: all cases pass"

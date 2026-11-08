@@ -211,9 +211,15 @@ write:
     ~/.local/share/spawn-rsi/deps/supply-pa/current -> <that hash>
 
 `deploy/controller.sh deps supply-pa <git-dir> <commit>` installs a tree
-(`pnpm install --frozen-lockfile --config.package-import-method=clone-or-copy` from
-the commit's lockfile, then read-only; a hardlink into pnpm's store is
-refused, since making it read-only would change the store). `update`
+(`pnpm install --frozen-lockfile --ignore-scripts
+--config.package-import-method=clone-or-copy` from the commit's lockfile,
+then read-only; a hardlink into pnpm's store is refused, since making it
+read-only would change the store). `--ignore-scripts` is deliberate: the
+install runs as the owner with network, and a lifecycle script in the root
+or a workspace package would run there. Nothing in the tree needs one
+(`pnpm-workspace.yaml` sets `allowBuilds: esbuild: false`, and esbuild's
+binary comes from its platform package); a dependency that does need a
+build step is an owner decision and a reason to revisit the line. `update`
 installs the tree when the lockfile's has none, and `build` refuses a commit
 whose tree is missing. A switch points `current` at that commit's tree and
 removes the trees nothing uses: not the current or the previous controller's
@@ -221,6 +227,16 @@ removes the trees nothing uses: not the current or the previous controller's
 (`ws/<agent>/node_modules/.pnpm`), not one a process holds. An agent's
 workspace therefore keeps the dependencies it built with until the
 workspace is gone.
+
+"Read-only" is a boundary against accidents, not against agents. Engines run
+as the same uid as everything else here: one that means to can hardlink a
+store file (the inode is then writable by its workspace and the store
+together) and write it, or chmod a file it copies. What the modes give is
+the accident: a build, a test or an engine's Write tool cannot change the
+store by mistake, the gate's sandbox shows it read-only, and a deliberate
+change has to be a deliberate act (a hardlink, a chmod) instead of a slip.
+Confining a deliberate agent takes per-agent uids or a mount per engine,
+which is the owner's decision.
 
 Engines and gates read the store through `SUPPLY_PA_DEPS`: a line
 `SUPPLY_PA_DEPS=/home/ckl/.local/share/spawn-rsi/deps/supply-pa/current`

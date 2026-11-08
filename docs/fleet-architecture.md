@@ -1237,6 +1237,9 @@ any tree an agent's workspace still links to, removing the rest). It is
 never the owner's checkout, whose `node_modules` every agent may write. The
 gate binds the store read-only into its sandbox, and engines and gates read
 it through `SUPPLY_PA_DEPS` (deploy/systemd/README.md "The controller").
+Read-only is a boundary against accidents, not agents: the same uid can
+hardlink a store file and write it; boundaries against a deliberate agent
+are per-agent uids or a mount per engine.
 
 ### 10.3 Landing
 
