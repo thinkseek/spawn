@@ -1474,6 +1474,8 @@ mod tests {
             ("SPAWN_GATE_PG_IMAGE", "postgres:16-alpine")
         ])));
         assert!(!on_shared_server(&env(&[])));
+    }
+
     /// The file the integrator writes is read by the deploy (through
     /// deploy/gate-env.sh, which deploy.sh sources) as exactly the
     /// environment the integrator's gates get: the deploy's base-only gate
