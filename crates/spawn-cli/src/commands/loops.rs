@@ -699,10 +699,9 @@ impl Fleet<'_> {
         // regardless.
         let pending_outage = self.recovery.outage_pending();
         if std::env::var("SPAWN_RECOVER_DEBUG").is_ok() {
-            let s = self.schedule.recovery;
             eprintln!(
                 "DEBUG recovery check: mark={:?} watermark={watermark} due={:?} now={now} outage={pending_outage}",
-                s.mark(), s.due_debug()
+                self.schedule.recovery.mark(), self.schedule.recovery.due_debug()
             );
         }
         if !self.schedule.recovery.runs(watermark, now) && !pending_outage {
