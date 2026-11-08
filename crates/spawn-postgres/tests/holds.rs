@@ -384,6 +384,35 @@ fn a_hold_expires_by_record_only_once_the_database_clock_reached_it() {
     assert_eq!(store.hold_expiries().expect("expiries"), json!([]));
 }
 
+/// A renewal ends the old hold and moves its waiting tasks to the new one,
+/// so an expiry that comes before the integrator's next `task.held` still
+/// names them: the supervisor is told what waited, never "nothing waited".
+#[test]
+fn an_expiry_after_a_renewal_names_the_tasks_that_waited_behind_the_old_hold() {
+    let (store, schema) = store("holds_renewed_expiry");
+    let source = "/tmp/renewed-expiry.git";
+    let (_, task) = landing_task(&store, source);
+    let first = hold(&store, source, MAIN, 600, None);
+    let first_id = first["hold"].as_i64().expect("an id");
+    store.task_held(task, first_id, source).expect("held");
+    // A renewal with a bound of a second, and no `task.held` for it yet.
+    let second = hold(&store, source, MAIN, 1, None);
+    let second_id = second["hold"].as_i64().expect("an id");
+    assert_eq!(second["renews"], first_id);
+    let mut client = admin(&schema);
+    assert_eq!(folded(&mut client)["tasks"][0]["held_by"], second_id);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let expired = store.hold_expired(source, second_id).expect("expired");
+    let records = records(&mut client, "source.hold_expired");
+    assert_eq!(records[0]["id"], expired);
+    assert_eq!(records[0]["record"]["hold"], second_id);
+    assert_eq!(
+        records[0]["record"]["waiting"],
+        json!([task]),
+        "the task that waited behind the old hold waits behind the renewed one"
+    );
+}
+
 #[test]
 fn a_landing_waits_once_per_task_and_hold_and_the_fold_and_refold_agree() {
     let (store, schema) = store("holds_task_held");
