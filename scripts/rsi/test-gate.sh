@@ -354,6 +354,16 @@ expect "a later main that passes the red check is green on it, in the verdict" \
     'exit=0 {"verdict":"accepted","base_check":"check-red.sh"}'
 expect "the log says so" "$(cat "$work/gate.out")" \
     'base check: check-red.sh passes on the base: main is green on it again'
+# Green on the red check, then a host fault on another check: the fact
+# still says main is green on it (`base_check`), as every fact the gate
+# writes after the base check does.
+green_fault=$work/green-fault
+cp -r "$green_scenarios" "$green_fault"
+printf '#!/bin/sh\nexit 1\n' >"$green_fault/check-down.sh"
+expect "a host fault after a green base check still says it is green" \
+    "$(SPAWN_GATE_BASE_CHECK=check-red.sh; export SPAWN_GATE_BASE_CHECK; judge "$good" "" "$green_fault")" \
+    '"on":"candidate and base","runs":"1, then 1 on the candidate; 1, then 1 on the base"'
+expect "with base_check in its fact" "$(cat "$integrator/verdict")" '"base_check":"check-red.sh"'
 expect "a base check that is no check of the gate's is not run" \
     "$(SPAWN_GATE_BASE_CHECK=../check-red.sh; export SPAWN_GATE_BASE_CHECK; judge "$good" "" "$green_scenarios")" \
     'exit=0 {"verdict":"accepted"}'

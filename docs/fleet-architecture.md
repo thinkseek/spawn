@@ -1737,14 +1737,20 @@ are per-agent uids or a mount per engine.
      exit 6 (`{"host_fault":true,"scenario","on":"main","runs","failures":
      [{"test","message"}]}`, gate.rs `GateFailure::MainRed`). A base whose
      second run passes, or whose two runs share no failing test, stays `on`
-     `candidate and base`. The integrator believes it only when some failure
-     is classed the work's (host.rs `classify`) and the test server's log
-     shows no crash in the gate's window; otherwise it is a `candidate and
-     base` host fault, as before. A red is one record per source,
+     `candidate and base`. The integrator believes it only when some shared
+     failure is classed the work's (host.rs `classify`), none is a
+     connection or database error (a broken test server fails main and
+     candidate alike, so a shared {assertion, connection refused} is the
+     host's), and the test server's log shows no crash in the gate's window;
+     otherwise it is a `candidate and base` host fault, as before (`base`
+     when the base check below found it, before any candidate ran). A red is
+     one record per source,
      `source.main_red` (`main`, `scenario`, `failures` with their class),
      the first of its red carrying `alert`; the store keeps one row per
-     source (`mission_source_reds`; a later red, on the same main or a
-     later one, moves `main` on and keeps `since_ms`, with no new alert) and GATED gives each mission its
+     source (`mission_source_reds`: one row per source, whatever the check;
+     a later red, on the same main or a later one, moves `main` on and
+     keeps `since_ms`, with no new alert, and a red on a second check
+     replaces the first's `scenario`) and GATED gives each mission its
      source's `red`. The task's gate is recorded `host_fault` with evidence
      `main_red` and `fact.on` `main`: no backoff, no run of host faults, no
      escalation, never counted toward the cap or a halt.
@@ -1752,14 +1758,20 @@ are per-agent uids or a mount per engine.
      ready task stays `reported`, no `task.gated` is written, and the
      integrator says so once. Each `SPAWN_GATE_MAIN_RED_PROBE_MS` (an hour
      by default) after the last red or probe, one gate runs anyway, a probe
-     (`source.main_probe`, the store refusing one that is not due, and
-     `probe` on its `task.gated`), so a candidate that fixes main is not
-     starved. While a source is red, every gate on it is given
+     (`source.main_probe`, written as its gate starts, so a ready task that
+     gets no gate that pass spends none; the store refuses one that is not
+     due, and the gate then does not start; `probe` on its `task.gated`), so
+     a candidate that fixes main is not starved. While a source is red, every gate on it is given
      `SPAWN_GATE_BASE_CHECK=<check>`: the gate builds the base first and
-     runs that check on it twice before the candidate. A pass names it in
-     the verdict (`base_check`) and the integrator records
-     `source.main_green`, which deletes the row (with the red's `since_ms`),
-     and the gate goes on judging the candidate as usual. Two failures that
+     runs that check on it twice before the candidate. A pass is written to
+     the verdict file at once and kept in every fact the gate writes after
+     (`base_check`), so the integrator records `source.main_green` whatever
+     the gate ends with (a verdict, a host fault on another check, no room,
+     an abort); it deletes the row (with the red's `since_ms`), and the
+     gate goes on judging the candidate as usual. A mission on the source
+     whose scenarios have no such check cannot run it ("not run"): it waits
+     like the others, until main moves or another mission's gate finds main
+     green. Two failures that
      agree are the red again, before the candidate is built. A main that
      moved lifts the hold at once (the next gate runs, with the base check).
      The supervisor's digest tells a red once (its `alert`) and a green
