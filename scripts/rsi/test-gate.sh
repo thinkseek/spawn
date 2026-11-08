@@ -2012,3 +2012,5 @@ expect "a tree under the host's TMPDIR: exit 3" "$tmp_status" 3
 expect "naming the TMPDIR" "$tmp_out" "the host's TMPDIR ($TMPDIR)"
 expect "and why" "$tmp_out" "the sandbox empties too"
 refuse "and nothing ran" "$tmp_out" "=="
+
+echo "gate: all cases pass"
