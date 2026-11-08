@@ -474,6 +474,19 @@ $";
         let pane = "API Error: 529 overloaded_error\n$ \nbypass permissions on";
         assert_eq!(read_claude_screen(pane).state, ScreenState::Error);
     }
+
+    /// The line nearest the prompt decides: a turn that failed leaves its
+    /// spinner line above the error, and the engine is at its prompt (its
+    /// nudge gets in); a turn started after an older error is running.
+    #[test]
+    fn the_line_nearest_the_prompt_decides_between_a_running_turn_and_a_failure() {
+        let failed = "✻ Working… (esc to interrupt)\nAPI Error: 529 overloaded_error\n\n❯ ";
+        assert_eq!(read_claude_screen(failed).state, ScreenState::Error);
+        assert!(read_claude_screen(failed).state.accepts_input());
+        let running = "API Error: 529 overloaded_error\n✻ Working… (esc to interrupt)\n\n❯ ";
+        assert_eq!(read_claude_screen(running).state, ScreenState::Busy);
+        assert!(!read_claude_screen(running).state.accepts_input());
+    }
 }
 
 #[cfg(test)]
