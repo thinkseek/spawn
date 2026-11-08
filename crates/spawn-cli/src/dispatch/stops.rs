@@ -171,7 +171,10 @@ mod tests {
     fn a_failed_stop_is_due_one_wait_after_it_failed() {
         let failed = stopping(vec![stop(1, 100_000, Some(false))]);
         assert_eq!(next_due(&failed), Some(100_000 + retry_wait_ms(1)));
-        let twice = stopping(vec![stop(1, 100_000, Some(false)), stop(2, 200_000, Some(false))]);
+        let twice = stopping(vec![
+            stop(1, 100_000, Some(false)),
+            stop(2, 200_000, Some(false)),
+        ]);
         assert_eq!(next_due(&twice), Some(200_000 + retry_wait_ms(2)));
         let spent = stopping(
             (0..=DELIVERY_RETRIES)

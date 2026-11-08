@@ -444,10 +444,7 @@ impl Monitor {
             .flatten()
             .filter(|record| record["state"] == "recovered")
             .filter_map(|record| record["at_ms"].as_i64())
-            .map(|at| {
-                at.saturating_add(RECOVERY_NEWS_MS)
-                    .saturating_sub(now_ms)
-            })
+            .map(|at| at.saturating_add(RECOVERY_NEWS_MS).saturating_sub(now_ms))
             .filter(|left| *left > 0)
             .min()
     }

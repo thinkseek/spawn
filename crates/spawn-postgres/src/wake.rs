@@ -187,7 +187,11 @@ mod tests {
             .map_or(0, |elapsed| elapsed.subsec_nanos());
         let schema = format!("spawn_test_lease_{}_{nanos:x}", std::process::id());
         let store = PostgresStore::connect_in_schema(&url, &schema).expect("migrate");
-        assert_eq!(store.next_lease_ms().expect("lease"), None, "an empty queue");
+        assert_eq!(
+            store.next_lease_ms().expect("lease"),
+            None,
+            "an empty queue"
+        );
         let submission = spawn_core::command::Submission {
             agent_id: spawn_core::id::AgentId::new("agent_resident_lease").expect("agent"),
             session_id: spawn_core::id::SessionId::new("session_resident_lease").expect("session"),

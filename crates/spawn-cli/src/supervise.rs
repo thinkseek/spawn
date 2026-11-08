@@ -318,7 +318,10 @@ fn revive(
     store
         .submit(&principal, &submission)
         .map_err(|e| error(&e))?;
-    Ok((Some(format!("liveness: {session} {decision:?} ({key})")), None))
+    Ok((
+        Some(format!("liveness: {session} {decision:?} ({key})")),
+        None,
+    ))
 }
 
 /// Keep the supervisor alive. A new native session is given the deployed
@@ -635,7 +638,10 @@ work.",
         // The third failure's pause ends in a new native session, not a
         // resume (the rule hands off after `RESUME_ATTEMPTS`).
         let exhausted = failed(3);
-        assert_eq!(next_due(&exhausted, 100_000 + 79_999), Some(100_000 + 80_000));
+        assert_eq!(
+            next_due(&exhausted, 100_000 + 79_999),
+            Some(100_000 + 80_000)
+        );
         assert_eq!(
             decide(&exhausted, 100_000 + 80_000),
             Revive::Start { handoff: true }

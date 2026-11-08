@@ -765,7 +765,8 @@ pub(crate) fn next_due(work: &Work, rows: &[Facts], now_ms: i64) -> Option<i64> 
     };
     let next = next_up(work);
     for task in &work.tasks {
-        if !matches!(task.state, TaskState::Assigned | TaskState::Revise) || !next.contains(&task.id)
+        if !matches!(task.state, TaskState::Assigned | TaskState::Revise)
+            || !next.contains(&task.id)
         {
             continue;
         }
@@ -3919,7 +3920,11 @@ PENDING_ISSUES\n";
         assert_eq!(next_due(&tasks, &[fresh.clone()], 0), None, "its first try");
         let mut through = worker(true, true);
         through.dispatched = vec![sent(30, "deliver-7-0", 100_000, None)];
-        assert_eq!(next_due(&tasks, &[through], 100_000), None, "it got through");
+        assert_eq!(
+            next_due(&tasks, &[through], 100_000),
+            None,
+            "it got through"
+        );
         let mut busy = worker(true, true);
         busy.open_command = true;
         busy.dispatched = vec![sent(

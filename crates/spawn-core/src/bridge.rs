@@ -845,7 +845,6 @@ impl Bridge {
         Ok(report)
     }
 
-
     fn catch_up(&mut self) -> Result<(), StoreError> {
         const BATCH: usize = 200;
         loop {
