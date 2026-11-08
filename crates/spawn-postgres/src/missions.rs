@@ -1643,7 +1643,7 @@ impl PostgresStore {
 
     /// Tasks the dispatcher has to deliver, watch or wind down.
     pub fn delivery_rows(&self) -> Result<Value, StoreError> {
-        self.query_json(DELIVERY_TASKS, &[])
+        self.query_json_prepared(DELIVERY_TASKS, &[])
     }
 
     /// The latest `source.moved` record, `{id, at_ms}`, or null
@@ -1655,23 +1655,23 @@ impl PostgresStore {
     /// Residents whose latest delivered task is cancelled, with the
     /// checkpoint it started from ([`CANCELLED_DELIVERIES`]).
     pub fn cancelled_deliveries(&self) -> Result<Value, StoreError> {
-        self.query_json(CANCELLED_DELIVERIES, &[])
+        self.query_json_prepared(CANCELLED_DELIVERIES, &[])
     }
 
     /// What the dispatcher measures stalls from ([`STALL_FACTS`]).
     pub fn stall_facts(&self) -> Result<Value, StoreError> {
-        self.query_json(STALL_FACTS, &[])
+        self.query_json_prepared(STALL_FACTS, &[])
     }
 
     /// Missions, reports, approvals and human messages for the digest.
     pub fn mission_news(&self) -> Result<Value, StoreError> {
-        self.query_json(MISSION_NEWS, &[])
+        self.query_json_prepared(MISSION_NEWS, &[])
     }
 
     /// Approved residents that have run before: the ones the liveness rule
     /// keeps, as (agent, session, charter).
     pub fn residents_to_keep(&self) -> Result<Vec<(String, String, String)>, StoreError> {
-        let rows = self.query(RESIDENTS_TO_KEEP, &[])?;
+        let rows = self.query_prepared(RESIDENTS_TO_KEEP, &[])?;
         Ok(rows
             .iter()
             .map(|row| (row.get(0), row.get(1), row.get(2)))
@@ -1680,7 +1680,7 @@ impl PostgresStore {
 
     /// Residents that are retired, for winding down their sessions.
     pub fn retired_residents(&self) -> Result<Vec<(String, String)>, StoreError> {
-        let rows = self.query(RETIRED_RESIDENTS, &[])?;
+        let rows = self.query_prepared(RETIRED_RESIDENTS, &[])?;
         Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
     }
 

@@ -786,8 +786,28 @@ impl Bridge {
         }
     }
 
-    /// Handle queued commands and advance running executions.
+    /// Handle queued commands and advance running executions: the whole
+    /// tick, in the order [`Self::work`] then [`Self::poll`] run it.
     pub fn tick(&mut self) -> Result<TickReport, StoreError> {
+        let (mut report, _) = self.work()?;
+        self.act(&mut report)?;
+        self.catch_up()?;
+        Ok(report)
+    }
+
+    /// The Bridge's own reading of the log and of the command queue: catch
+    /// up with the events written since the last one, and claim the commands
+    /// waiting in the queue, one per session at a time, until none is
+    /// claimable or [`BridgeConfig::max_commands_per_tick`] is reached.
+    ///
+    /// This is the part of a tick that reads the database, and it reads it
+    /// for records: its input is the log's latest events and the queue's
+    /// rows, so it is run when the log's watermark has moved and not on a
+    /// clock (docs/design.md §14). `true` says the claim stopped at that
+    /// limit, so a command may still be waiting for a claim now: the caller
+    /// runs this again on its next pass. The wait a lease dates
+    /// (`lease_until_ms`) is the caller's to time.
+    pub fn work(&mut self) -> Result<(TickReport, bool), StoreError> {
         self.catch_up()?;
         let mut report = TickReport::default();
         // Inputs left waiting keep their lease until the claims of this tick
@@ -820,8 +840,23 @@ impl Bridge {
                 self.queue.release(claimed, self.config.input_wait_retry)?;
             }
         }
+        let left = report.commands >= self.config.max_commands_per_tick;
+        Ok((report, left))
+    }
+
+    /// What the Bridge reads on its own clock, never from the log: each
+    /// running execution's transcript (what the engine wrote) and its screen
+    /// (what the terminal shows), the checkpoints they ask for, the exit
+    /// statuses they leave, and the executions whose engines are gone. What
+    /// it reads it turns into records; the next [`Self::work`] folds them.
+    ///
+    /// This holds no read of the log: it runs on every pass, whatever the
+    /// watermark says, because an engine's turn ending and its screen
+    /// settling at the prompt are facts no append announces
+    /// (objective 025 gives that schedule its own bounds).
+    pub fn poll(&mut self) -> Result<TickReport, StoreError> {
+        let mut report = TickReport::default();
         self.act(&mut report)?;
-        self.catch_up()?;
         Ok(report)
     }
 
