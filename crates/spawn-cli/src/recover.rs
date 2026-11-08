@@ -257,6 +257,33 @@ impl Turn {
     }
 }
 
+/// A tool call that failed, with the engine's error text (`tool.failed`).
+/// A full disk ends a turn with one — Claude Code's ENOSPC message — and
+/// leaves the engine at its prompt; no other record of the execution says
+/// so, so the recovery reads it here.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct ToolFailure {
+    pub(crate) event_id: i64,
+    #[serde(default)]
+    pub(crate) at_ms: i64,
+    /// The engine's error text, as the transcript showed it.
+    #[serde(default)]
+    pub(crate) text: String,
+}
+
+impl ToolFailure {
+    /// The cause this failure names, if any: a full disk is the one tool
+    /// failure that interrupts an execution (any other failed tool is the
+    /// work's, and the engine goes on).
+    pub(crate) fn cause(&self) -> Option<Cause> {
+        let text = self.text.to_lowercase();
+        (text.contains("enospc")
+            || text.contains("disk is full")
+            || text.contains("no space left"))
+        .then_some(Cause::DiskFull)
+    }
+}
+
 /// The engine's end, as `execution.ended` recorded it.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub(crate) struct End {
