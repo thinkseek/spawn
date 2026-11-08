@@ -513,11 +513,11 @@ impl Fleet {
             match self.alerting.check(open) {
                 Ok(more) => {
                     lines.extend(more);
-                    self.schedule.alerts.ran(watermark, self.alerting.due_ms());
+                    self.schedule.alerts.ran(watermark, Some(self.alerting.due_ms()));
                 }
                 Err(error) => {
                     lines.push(format!("alerts: {error}"));
-                    self.schedule.alerts.ran(watermark, self.alerting.due_ms());
+                    self.schedule.alerts.ran(watermark, Some(self.alerting.due_ms()));
                 }
             }
         }
