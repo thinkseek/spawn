@@ -111,9 +111,8 @@ const CAPTURE_LIMIT: Duration = Duration::from_secs(5);
 ///
 /// The separator is a printable `|`, not a tab: tmux replaces a tab with `_`
 /// when its locale is not UTF-8 (`env -i tmux ... -F '#{a}\t#{b}'`), which
-/// would make every field one and every runner unreadable. Only the last
-/// field, a pane's start command, may hold a `|` of its own, and it is read
-/// whole.
+/// would make every field one and every runner unreadable. A `|` inside the
+/// last field, a pane's start command, is read whole.
 const PANE_STATE: &str =
     "#{pane_dead}|#{pane_dead_status}|#{pane_current_command}|#{pane_start_command}";
 
