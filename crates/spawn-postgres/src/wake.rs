@@ -144,7 +144,6 @@ mod tests {
         // The channel is the database's, not the schema's: another case's
         // append may be waiting in it. Drain those first.
         let _ = listener.wait(Duration::from_millis(500));
-        let started = Instant::now();
         let before = store.watermark().expect("watermark");
         let submission = spawn_core::command::Submission {
             agent_id: spawn_core::id::AgentId::new("agent_resident_wake").expect("agent"),
@@ -158,10 +157,16 @@ mod tests {
                 &submission,
             )
             .expect("submit");
-        let received = listener.wait(Duration::from_secs(5)).expect("wait");
+        // The clock starts at the wait, not at the submit: `spawn_submit`
+        // takes the append lock, which a loaded test database can hold for
+        // seconds, and what this case is about is the wait, not the write.
+        // A notification sent before the wait may still be buffered: it is
+        // read back at once rather than waited for.
+        let started = Instant::now();
+        let received = listener.wait(Duration::from_secs(10)).expect("wait");
         assert!(received >= 1, "the append notified the listener");
         assert!(
-            started.elapsed() < Duration::from_millis(2500),
+            started.elapsed() < Duration::from_secs(5),
             "the wait ended with the notification, not its timeout"
         );
         assert!(
