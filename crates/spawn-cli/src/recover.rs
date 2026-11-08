@@ -697,6 +697,10 @@ pub(crate) struct FactsRow {
     pub(crate) native_session_id: Option<String>,
     #[serde(default)]
     pub(crate) turns: Vec<Turn>,
+    /// Every `tool.failed` of the execution, oldest first: a full disk shows
+    /// here and nowhere else while the engine waits at its prompt.
+    #[serde(default)]
+    pub(crate) failed_tools: Vec<ToolFailure>,
     #[serde(default)]
     pub(crate) progress: Progress,
     #[serde(default)]
