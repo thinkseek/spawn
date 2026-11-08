@@ -2289,4 +2289,62 @@ else
     echo "note: no PostgreSQL programs in $other_pg: the toolchain line's server case is not run"
 fi
 
+# 23. The candidate's schema must migrate the base's database
+# (rsi/scenarios/check-schema-upgrade.sh, the real check, from a controller
+# copy so it finds its scripts/). A base whose schema.sql makes a view
+# v(a, b): a candidate that appends a column is accepted; one that puts it
+# mid-list is rejected with PostgreSQL's own words (42P16, what refused
+# 554a4bd4's deploy); one whose schema does not apply over itself is
+# rejected as such.
+schema_ctl=$work/schema-ctl
+mkdir -p "$schema_ctl/rsi/scenarios"
+cp -r "$(dirname "$gate")/.." "$schema_ctl/scripts"
+chmod -R u+w "$schema_ctl"
+cp "$(dirname "$gate")/../../rsi/scenarios/check-schema-upgrade.sh" "$schema_ctl/rsi/scenarios/"
+cp "$scenarios/protected" "$schema_ctl/rsi/scenarios/"
+git -C "$seed" checkout -q -B schema-base "$base"
+mkdir -p "$seed/crates/spawn-postgres/sql"
+printf 'create table if not exists t (a integer, b integer);\ncreate or replace view v as select a, b from t;\n' \
+    >"$seed/crates/spawn-postgres/sql/schema.sql"
+schema_base=$(commit schema-base)
+schema_candidate() { # <name> <schema.sql>: a candidate on the schema base
+    git -C "$seed" checkout -q -B "$1" "$schema_base"
+    printf '%s\n' "$2" >"$seed/crates/spawn-postgres/sql/schema.sql"
+    commit "$1"
+}
+schema_append=$(schema_candidate schema-append \
+    'create table if not exists t (a integer, b integer);
+create or replace view v as select a, b, a + b as c from t;')
+schema_midlist=$(schema_candidate schema-midlist \
+    'create table if not exists t (a integer, b integer);
+create or replace view v as select a, a + b as c, b from t;')
+schema_twice=$(schema_candidate schema-twice \
+    'create table if not exists t (a integer, b integer);
+create or replace view v as select a, b from t;
+create table t2 (x integer);')
+# On a server of the gate's own (the suite has no shared test server), from
+# the host's PostgreSQL programs; without them the case says so.
+schema_pg=${SPAWN_GATE_PG_BIN:-/usr/lib/postgresql/16/bin}
+schema_judge() { # <candidate>: judge it on the schema base, with a server of its own
+    (
+        export SPAWN_GATE_PG_BIN="$schema_pg" TMPDIR="$work/schema-tmp" XDG_CACHE_HOME="$work/caches/schema"
+        base=$schema_base
+        judge "$1" "" "$schema_ctl/rsi/scenarios"
+    )
+}
+if [ -x "$schema_pg/postgres" ] && [ -x "$schema_pg/initdb" ]; then
+    mkdir -p "$work/schema-tmp"
+    expect "a schema that appends a view's column migrates the base's database" \
+        "$(schema_judge "$schema_append")" 'exit=0 {"verdict":"accepted"}'
+    expect "the check said so" "$(cat "$work/gate.out")" "migrates the base's database, and applies over itself"
+    expect "one that puts it mid-list is rejected" "$(schema_judge "$schema_midlist")" '"verdict":"rejected"'
+    expect "with PostgreSQL's words" "$(cat "$work/gate.out")" 'cannot change name of view column "b" to "c"'
+    expect "naming what a deploy would do" "$(cat "$work/gate.out")" \
+        "the candidate's schema.sql cannot migrate the base's database (a deploy would refuse it the same way)"
+    expect "one that does not apply over itself is rejected" "$(schema_judge "$schema_twice")" '"verdict":"rejected"'
+    expect "saying so" "$(cat "$work/gate.out")" "applied once but not over itself"
+else
+    echo "note: no PostgreSQL programs in $schema_pg: the schema upgrade case is not run"
+fi
+
 echo "gate: all cases pass"
