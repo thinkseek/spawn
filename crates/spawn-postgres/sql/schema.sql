@@ -1292,15 +1292,11 @@ create table if not exists mission_tasks (
     -- delivery spent without typing is cancelled and assigned again once,
     -- by the dispatcher (`spawn_task_reissue`); a re-issue is never
     -- re-issued again.
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
     reissue_of      bigint,
     -- The task this one continues (its `task.assigned` names it): the
     -- objective's task after one that went over its budget keeps that
     -- task's work (`task.over_budget`, docs/fleet-architecture.md §10.4).
     continues       bigint
-=======
-    reissue_of      bigint
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 );
 
 -- Columns added since the first shape of these tables (see spawn_grants).
@@ -1333,10 +1329,7 @@ alter table mission_tasks add column if not exists model text not null default '
     check (model in ('default', 'cheap'));
 alter table mission_tasks add column if not exists held_by bigint;
 alter table mission_tasks add column if not exists reissue_of bigint;
-<<<<<<< 1c159f6bf8edf227d07548bc8f44a20d9ac126fa
 alter table mission_tasks add column if not exists continues bigint;
-=======
->>>>>>> 1f617871ad7e9cfd48c5e3fe2761012b121bd7bc
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
