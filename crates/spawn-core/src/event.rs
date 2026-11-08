@@ -353,27 +353,10 @@ pub enum EventKind {
         output_tokens: Option<u64>,
     },
     /// The turn ended with an engine or API failure.
-    ///
-    /// Claude Code fails a turn by writing an API error line to its
-    /// transcript and waiting at its prompt: nothing ends the execution,
-    /// so this record is what says a turn failed with a model cause. It
-    /// keeps the engine's own tags so a recovery can tell a model outage
-    /// from an expired login from an exhausted context without reading the
-    /// text (crate::ingest's `claude_line`).
     #[serde(rename = "turn.failed")]
     TurnFailed {
-        /// The error text the engine showed, truncated (the line's
-        /// `message.content[].text`).
+        /// Engine error text, truncated.
         error: String,
-        /// The engine's `apiErrorStatus`: the HTTP status of the failed
-        /// request (529, 503, 429, 401, 400, ...).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        status: Option<i64>,
-        /// The engine's `error` tag: `overloaded`, `rate_limit`,
-        /// `server_error`, `authentication_failed`, `invalid_request`,
-        /// `unknown`, ...
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        error_kind: Option<String>,
     },
     /// The agent started a background job ([`JobKind`]), read from its
     /// transcript: the job's id as the engine named it. When it started is
@@ -431,13 +414,6 @@ pub enum EventKind {
         cause: EndCause,
         /// Process exit code when the OS reported one.
         exit_code: Option<i32>,
-        /// The signal that killed the engine, when one did (`9` for a
-        /// SIGKILL): the runner writes it to the exit file beside the
-        /// status (`crate::bridge`, "the end's cause and the signal"). An
-        /// engine the OS killed has no exit code, so without this every
-        /// kill reads as a clean exit with no code.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        signal: Option<i32>,
         /// What the Bridge saw when it ended an execution no runner of its
         /// own ran any more: the terminal gone, or there and hosting no
         /// runner ([`crate::port::Runner`]), and a stop or start that found

@@ -79,7 +79,6 @@ mod fleet;
 mod gateway;
 mod host;
 mod missions;
-mod recovery;
 mod row;
 mod scorecard;
 mod sessions;
@@ -109,11 +108,7 @@ fn backend(error: &postgres::Error) -> StoreError {
             )),
         };
     }
-    // No server-side error: the server did not answer (a connection cut, a
-    // refused connect, a timeout). The work is not at fault, and the loop
-    // waits for the database instead of ending (crate::port's
-    // `is_unreachable`).
-    StoreError::Unreachable(error.to_string())
+    StoreError::Backend(error.to_string())
 }
 
 /// PostgreSQL store.
@@ -711,15 +706,6 @@ impl PostgresStore {
     /// typically a `jsonb` aggregate.
     fn query_json(&self, sql: &str, params: &Params<'_>) -> Result<serde_json::Value, StoreError> {
         Ok(self.query_one(sql, params)?.get(0))
-    }
-
-    /// [`Self::query_json`] for a query that may return no row.
-    fn query_opt_json(
-        &self,
-        sql: &str,
-        params: &Params<'_>,
-    ) -> Result<Option<serde_json::Value>, StoreError> {
-        Ok(self.query_opt(sql, params)?.map(|row| row.get(0)))
     }
 
     /// Rows changed.
