@@ -58,6 +58,11 @@ use crate::{alerts, disk, dispatch, supervise};
 /// Most intervals a failing loop waits before its next pass.
 const MAX_BACKOFF_INTERVALS: u32 = 30;
 
+/// Most intervals an outage's pause grows to. The loop must notice the
+/// database is back within a few seconds of its clearing (objective 032:
+/// a restart of 8-20 s costs at most that), not half a minute.
+const MAX_OUTAGE_INTERVALS: u32 = 4;
+
 /// Pause after `failures` consecutive failures: one interval per failure,
 /// at least one, at most [`MAX_BACKOFF_INTERVALS`].
 fn backoff(interval: std::time::Duration, failures: u32) -> std::time::Duration {
