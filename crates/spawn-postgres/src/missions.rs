@@ -469,10 +469,22 @@ select coalesce(jsonb_agg(jsonb_build_object(
 /// An objective mission's landed tasks: `[{objective, metric}]`, newest
 /// first. `$1` mission.
 pub(crate) const OBJECTIVE_LANDINGS: &str = r"
-select coalesce(jsonb_agg(jsonb_build_object('objective', k.objective, 'metric', k.metric)
-                          order by k.updated_at_ms desc, k.id desc), '[]'::jsonb)
-  from mission_tasks k
- where k.mission_id = $1 and k.state = 'landed' and k.objective is not null";
+select coalesce(jsonb_agg(jsonb_build_object('objective', x.objective, 'metric', x.metric)
+                          order by x.at_ms desc, x.id desc), '[]'::jsonb)
+  from (
+   select k.objective, k.metric, k.updated_at_ms as at_ms, k.id
+     from mission_tasks k
+    where k.mission_id = $1 and k.state = 'landed' and k.objective is not null
+   union all
+   -- An objective solved on the base (its scenario passes at the base
+   -- commit, so no task of it can change anything) is solved as a landing
+   -- solves it: no task for it is assigned again.
+   select (e.kind -> 'detail' -> 'record' ->> 'objective')::integer, null,
+          e.recorded_at_ms, e.id
+     from spawn_events e
+    where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+      and e.kind -> 'detail' -> 'record' ->> 'type' = 'objective.solved'
+      and e.kind -> 'detail' -> 'record' ->> 'id' = $1::text) x";
 
 /// The outcomes of an objective mission's tasks, oldest first, from the
 /// control stream: `[{seq, type, task, objective, verdict, merge, measure, yielded}]`, the

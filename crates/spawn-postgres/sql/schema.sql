@@ -1515,13 +1515,22 @@ begin
         -- request (`spawn mission push`; the record names the `request`):
         -- the missions on that source take the new main as their baseline
         -- instead of halting at the next pass. The record names them (never
-        -- a halted one); a record from before it did moved every mission on
-        -- the source at that baseline.
+        -- a halted one, unless its halt was this very move: `clear`); a
+        -- record from before it did moved every mission on the source at
+        -- that baseline.
         update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at
          where sources ->> 0 = p_record ->> 'source' and baseline = p_record ->> 'from'
            and (p_record -> 'missions' is null
                 or id in (select m::bigint
                             from jsonb_array_elements_text(p_record -> 'missions') m));
+        -- The `clear` list: missions whose only halt was the integrator's
+        -- reading of this very move (main away from their baseline with no
+        -- record). The owner's record is that explanation, so they are not
+        -- halted any more and are judged again at the next pass.
+        update mission_missions set halted = null, updated_at_ms = p_at
+         where jsonb_typeof(p_record -> 'clear') = 'array'
+           and id in (select m::bigint
+                        from jsonb_array_elements_text(p_record -> 'clear') m);
         -- An owner's landing also names the missions on the source with no
         -- baseline yet (new, or resumed), not halted: they take the new main
         -- as their first baseline, so a gate of theirs that was judging
@@ -1803,6 +1812,12 @@ begin
         -- The integrator could not apply an owner's request (a conflict, a
         -- commit not in the source, main moving under it twice): main and
         -- every baseline stay where they were.
+        null;
+    when 'objective.solved' then
+        -- The objective's scenario passes at a base commit main already
+        -- holds, so no task of it can change anything: the assignment rule
+        -- reads this record as a landing (OBJECTIVE_LANDINGS), and the task
+        -- it ends is cancelled on it. Folded into no table.
         null;
     when 'legacy.imported' then
         -- A row from before the control stream, as it was.
@@ -2639,19 +2654,40 @@ returns integer language plpgsql security definer as $$
 declare
     v_count integer;
     v_missions jsonb;
+    v_cleared jsonb;
 begin
     perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception 'only the owner moves a source outside the gate' using errcode = '42501';
     end if;
     -- A halted mission keeps its baseline: the human who resumes it sees
-    -- the source as it is, and the resume re-anchors it.
-    select count(*), coalesce(jsonb_agg(id order by id), '[]'::jsonb) into v_count, v_missions
-      from mission_missions
-     where sources ->> 0 = p_source and baseline = p_from and halted is null;
+    -- the source as it is, and the resume re-anchors it. One halt is not
+    -- that: the integrator's `mission.halted` whose evidence is this very
+    -- move (`cause` main_moved, this source, this from and to). The owner's
+    -- record is the explanation the halt was waiting for, so the mission
+    -- moves and the halt is cleared, as if the push had been recorded
+    -- before the pass that saw it.
+    select coalesce(jsonb_agg(m.id order by m.id) filter (where m.halted is null), '[]'::jsonb),
+           coalesce(jsonb_agg(m.id order by m.id) filter (where m.halted is not null), '[]'::jsonb)
+      into v_missions, v_cleared
+      from mission_missions m
+      left join lateral (
+        select e.kind -> 'detail' -> 'record' as r
+          from spawn_events e
+         where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and e.kind -> 'detail' -> 'record' ->> 'type' = 'mission.halted'
+           and e.kind -> 'detail' -> 'record' ->> 'id' = m.id::text
+         order by e.id desc limit 1) halt on true
+     where m.sources ->> 0 = p_source and m.baseline = p_from
+       and (m.halted is null
+            or (halt.r ->> 'cause' = 'main_moved' and halt.r ->> 'source' = p_source
+                and halt.r ->> 'from' = p_from and halt.r ->> 'to' = p_to));
+    v_count := jsonb_array_length(v_missions) + jsonb_array_length(v_cleared);
     perform spawn_control_record(jsonb_build_object(
         'type', 'source.moved', 'source', p_source, 'from', p_from, 'to', p_to,
-        'missions', v_missions));
+        'missions', (select coalesce(jsonb_agg(id order by id), '[]'::jsonb)
+                       from jsonb_array_elements_text(v_missions || v_cleared) m(id)),
+        'clear', v_cleared));
     return v_count;
 end $$;
 
@@ -2727,7 +2763,7 @@ begin
        or p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
                                       'task.held', 'source.hold_expired', 'task.cancelled',
                                       'source.moved', 'source.push_refused',
-                                      'task.over_budget') then
+                                      'task.over_budget', 'objective.solved') then
         raise exception 'the integrator does not record %', p_record ->> 'type';
     end if;
     -- The integrator cancels one kind of task: an objective's task in flight
@@ -2735,14 +2771,58 @@ begin
     -- (spawn-cli objectives.rs). The cancel's fold sets its work aside and
     -- counts toward no halt.
     if p_record ->> 'type' = 'task.cancelled' then
-        if p_record ->> 'yielded' is distinct from 'true' or not exists (
+        -- In flight: for a yield, a task being worked again (not one whose
+        -- gate runs now); for an objective solved on the base, the task
+        -- whose gate just said so, `reported` too.
+        if not exists (
             select 1 from mission_tasks
              where id = (p_record ->> 'id')::bigint and objective is not null
-               and state in ('assigned', 'delivered', 'revise')) then
-            raise exception 'the integrator cancels only an objective''s task in flight that yields its slot, not task %',
+               and (state in ('assigned', 'delivered', 'revise')
+                    or (state = 'reported' and p_record ->> 'yielded' is distinct from 'true'
+                        and jsonb_typeof(p_record -> 'solved') = 'number'))) then
+            raise exception 'the integrator cancels only an objective''s task in flight, not task %',
                             p_record ->> 'id';
         end if;
+        -- Two kinds: the yield of a slot (out of attempts), and an
+        -- objective already solved on the base (its scenario passes at the
+        -- base commit), which ends the task and counts nothing against it.
+        if p_record ->> 'yielded' is distinct from 'true' then
+            if jsonb_typeof(p_record -> 'solved') is distinct from 'number' or not exists (
+                select 1 from spawn_events e
+                 where e.id = (p_record ->> 'solved')::bigint
+                   and e.session_id = 'session_control'
+                   and e.event_name = 'control.recorded'
+                   and e.kind -> 'detail' -> 'record' ->> 'type' = 'objective.solved'
+                   and e.kind -> 'detail' -> 'record' ->> 'task' = p_record ->> 'id') then
+                raise exception 'the integrator cancels task % only as a yield or as an objective solved on the base',
+                                p_record ->> 'id';
+            end if;
+        end if;
         p_record := p_record || jsonb_build_object('by', 'spawn-integrate');
+    end if;
+    -- A halt that says what moved it names the source and both commits, so
+    -- `spawn mission moved` can tell this halt from any other and clear it
+    -- when the owner records that very move (spawn_source_moved).
+    if p_record ->> 'type' = 'mission.halted' and p_record ? 'cause' then
+        if p_record ->> 'cause' is distinct from 'main_moved'
+           or coalesce(p_record ->> 'source', '') = ''
+           or coalesce(p_record ->> 'from', '') = ''
+           or coalesce(p_record ->> 'to', '') = '' then
+            raise exception 'a halt on a moved main names cause main_moved, the source and both commits: %',
+                            p_record;
+        end if;
+    end if;
+    -- An objective solved on the base: its scenario passes at the base
+    -- commit, so the work could not change anything and the objective needs
+    -- no task. Names the mission, the objective, the task it ends, the
+    -- scenario, the base commit and the gate's log.
+    if p_record ->> 'type' = 'objective.solved' then
+        if coalesce(p_record ->> 'objective', '') !~ '^[0-9]{1,6}$'
+           or coalesce(p_record ->> 'scenario', '') = ''
+           or coalesce(p_record ->> 'base', '') = '' then
+            raise exception 'an objective.solved names its objective, scenario and base: %',
+                            p_record;
+        end if;
     end if;
     -- An overrun names what it measured: its reason, its tool calls and the
     -- budget it ran past (the mission's, as it was). Its branch, commit and
@@ -2895,7 +2975,10 @@ begin
                               when 'task.held' then array['landing']
                               when 'task.aborted' then array['delivered']
                               when 'task.over_budget' then array['delivered']
-                              when 'task.cancelled' then array['assigned', 'delivered', 'revise']
+                              when 'task.cancelled' then
+                                  case when jsonb_typeof(p_record -> 'solved') = 'number'
+                                       then array['assigned', 'delivered', 'revise', 'reported']
+                                       else array['assigned', 'delivered', 'revise'] end
                               else array['reported', 'accepted', 'landing'] end)) then
         raise exception 'task % is not waiting for %', p_record ->> 'id', p_record ->> 'type';
     end if;

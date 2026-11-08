@@ -2237,7 +2237,14 @@ impl Judge {
                 &format!("{commit}^{{tree}}"),
             ])
         };
-        if tree_of(&candidate)? == tree_of(main)? {
+        // A candidate equal to main in an objective mission is not judged
+        // here: the gate's base check answers what it means before it builds
+        // anything (a scenario that passes on the base is the objective
+        // solved there, not a failed task; a scenario that fails there is a
+        // rejection like any other). Mission 4's task 182 was rejected three
+        // times for "the work changes nothing on main" when the owner batch
+        // had already landed the behaviour, and the third halted the mission.
+        if tree_of(&candidate)? == tree_of(main)? && task.objective.is_none() {
             return rejected("the work changes nothing on main", "");
         }
         let patch = repo
@@ -2336,6 +2343,24 @@ impl Judge {
                 };
                 // On a held source this records its `task.held`: it waits.
                 land(store, mirror, source, &landing).map(|_| ())
+            }
+            // The objective's scenario passes on the base: a fact about the
+            // objective, not about the task's work. The objective is
+            // recorded solved there and the task ends without a rejection.
+            Ok(verdict)
+                if verdict.reason.trim() == SOLVED_ON_BASE
+                    && task.objective.is_some_and(|objective| {
+                        crate::objectives::one_shot(mission, objective)
+                    }) =>
+            {
+                solved_on_base(
+                    store,
+                    mission,
+                    task,
+                    scenario.as_deref(),
+                    main,
+                    &verdict.output,
+                )
             }
             // A rejection whose every failure is the host's (the test
             // database failed) is no verdict on the work: `host_fault`, not
@@ -3438,12 +3463,91 @@ fn read_main(
         );
         return Ok(Reading::Nothing);
     }
-    halt(
-        store,
-        mission,
-        &format!("the source's main is {main}, but the last landing left {baseline}"),
-    )?;
+    // The owner holds the source: the hold says the owner is moving its
+    // main, so a main away from the baseline is what the hold is for, not
+    // something no record explains. Nothing is judged against it until the
+    // hold ends (and `spawn mission moved` takes the new main as the
+    // baseline).
+    if let Some(hold) = mission.hold {
+        println!(
+            "integrate: mission {}: the source's main is {main}, its baseline {baseline}; no \
+             halt while the owner holds the source (hold {hold})",
+            mission.id
+        );
+        return Ok(Reading::Nothing);
+    }
+    halt_moved(store, mission, source, baseline, &main)?;
     Ok(Reading::Halted)
+}
+
+/// Halt `mission` because its source's main moved with no record that
+/// explains it: the record names the source and both commits, so `spawn
+/// mission moved` can tell this halt from any other and clear it when the
+/// owner records the move (`spawn_source_moved`).
+fn halt_moved(
+    store: &PostgresStore,
+    mission: &Mission,
+    source: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), String> {
+    let reason = format!("the source's main is {to}, but the last landing left {from}");
+    record(
+        store,
+        &json!({"type": "mission.halted", "id": mission.id, "reason": reason,
+                "cause": "main_moved", "source": source, "from": from, "to": to}),
+    )?;
+    println!("integrate: mission {} HALTED: {reason}", mission.id);
+    Ok(())
+}
+
+/// The gate's verdict when the objective's scenario passes at the base
+/// commit (`scripts/rsi/gate.sh`'s base check, before any candidate build).
+pub(crate) const SOLVED_ON_BASE: &str = "scenario already passes on the base";
+
+/// Record that `mission`'s objective is solved on the base and end `task`
+/// with it: the gate found its scenario passing at `base`, so no work of
+/// the task could change anything (mission 4's task 182, objective 34, whose
+/// owner batch had landed the behaviour first). The objective is a landing
+/// for the assignment rule (`OBJECTIVE_LANDINGS` reads the record), and the
+/// task is cancelled on that record — no rejection, no failed attempt, no
+/// halt (`spawn_integrator_record` accepts this cancel and no other without
+/// a yield).
+fn solved_on_base(
+    store: &PostgresStore,
+    mission: &Mission,
+    task: &Task,
+    scenario: Option<&Path>,
+    base: &str,
+    log: &str,
+) -> Result<(), String> {
+    let objective = task
+        .objective
+        .ok_or("an objective task without its objective")?;
+    let scenario = scenario
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let solved = store
+        .integrator_record(&json!({"type": "objective.solved", "id": mission.id,
+                                   "objective": objective, "task": task.id,
+                                   "scenario": scenario, "base": base, "log": log}))
+        .map_err(|error| error.to_string())?;
+    // The Stop first, as for a yield: if the cancel then fails, the next
+    // pass finds the task again and records both again.
+    stop_worker(store, task, "integrate-solved")?;
+    let reason = format!(
+        "objective {objective} is solved on the base: {scenario} passes at {base}, so task \
+         #{} ends without a rejection",
+        task.id
+    );
+    store
+        .integrator_record(
+            &json!({"type": "task.cancelled", "id": task.id, "solved": solved,
+                                   "reason": reason}),
+        )
+        .map_err(|error| error.to_string())?;
+    println!("integrate: mission {}: {reason}", mission.id);
+    Ok(())
 }
 
 /// Why a mission on `source` can never land, if it cannot: agents' branches
@@ -10406,6 +10510,224 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         for base in [base_a, base_b] {
             let _ = std::fs::remove_dir_all(&base);
         }
+    }
+
+    /// Mission 4, 2026-11-08 09:23: task 182 (objective 34) was rejected
+    /// three times — "the work changes nothing on main" twice, then "scenario
+    /// already passes on the base" — because the owner batch had landed the
+    /// behaviour already, and the third halted the mission. A gate that says
+    /// the objective's scenario passes on the base is a fact about the
+    /// objective: it is recorded solved there, the task ends as a cancel,
+    /// no rejection is counted, and no task for it is assigned again.
+    #[test]
+    fn an_objective_solved_on_the_base_ends_its_task_without_a_rejection() {
+        let gate = "echo '| == base: 023.sh'\n\
+                    echo '| verdict rejected scenario already passes on the base'\n\
+                    printf '{\"verdict\":\"rejected\",\"reason\":\"scenario already passes on the base\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+        let (base, source, scenarios, integrator) = world("solved-base", gate);
+        let db = Db::new("solved_base");
+        let mission = backlog_mission(&db, &base, "solved", &[23], 1, None);
+        std::fs::write(scenarios.join("023.sh"), "exit 0\n").expect("the scenario");
+        let none = std::collections::BTreeSet::new();
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none).expect("assign");
+        let task = objective_task(&db, mission, 23);
+        db.store.task_delivered(task.id, 1).expect("delivered");
+        assert!(db.store.task_reported(task.id, "done").expect("reported"));
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        let base_commit = source_main(&source);
+        push_work(&base, &source, &agent, "work.txt");
+
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        let solved = control_records(&db, "objective.solved");
+        assert_eq!(solved.len(), 1, "{solved:?}");
+        assert_eq!(solved[0]["objective"], json!(23));
+        assert_eq!(solved[0]["task"], json!(task.id));
+        assert_eq!(solved[0]["base"], json!(base_commit));
+        assert!(
+            solved[0]["scenario"]
+                .as_str()
+                .is_some_and(|scenario| scenario.ends_with("023.sh")),
+            "{}",
+            solved[0]
+        );
+        let cancelled = control_records(&db, "task.cancelled");
+        assert_eq!(cancelled.len(), 1, "{cancelled:?}");
+        assert_eq!(cancelled[0]["id"], json!(task.id));
+        assert!(cancelled[0]["solved"].is_number(), "{}", cancelled[0]);
+        assert!(
+            control_records(&db, "task.gated").is_empty(),
+            "no rejection is recorded"
+        );
+        let after = gated(&db, mission);
+        assert_eq!((after.gate_rejections, after.gate_aborts), (0, 0));
+        assert!(db.mission(mission)["halted"].is_null());
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "cancelled");
+        // No task for it again: the objective is a landing.
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
+            .expect("the next pass");
+        assert!(
+            flying(&db, mission).is_empty(),
+            "no task for a solved objective"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The same for the other wording mission 4's task 182 hit: a candidate
+    /// whose tree is main's is not rejected at once in an objective mission,
+    /// but judged — the gate's base check answers "solved on the base"
+    /// before any candidate build, so the objective is recorded solved
+    /// instead of the task rejected ("the work changes nothing on main").
+    #[test]
+    fn an_objective_task_whose_work_changes_nothing_is_judged_not_rejected() {
+        let gate = "echo '| verdict rejected scenario already passes on the base'\n\
+                    printf '{\"verdict\":\"rejected\",\"reason\":\"scenario already passes on the base\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+        let (base, source, scenarios, integrator) = world("solved-base-empty", gate);
+        let db = Db::new("solved_base_empty");
+        let mission = backlog_mission(&db, &base, "solved", &[23], 1, None);
+        std::fs::write(scenarios.join("023.sh"), "exit 0\n").expect("the scenario");
+        let none = std::collections::BTreeSet::new();
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none).expect("assign");
+        let task = objective_task(&db, mission, 23);
+        db.store.task_delivered(task.id, 1).expect("delivered");
+        assert!(db.store.task_reported(task.id, "done").expect("reported"));
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        // A branch with a commit that changes no file: main's tree.
+        let clone = base.join("empty-work");
+        let clone_path = clone.to_string_lossy().to_string();
+        git(&["clone", "-q", &source, &clone_path]).expect("clone");
+        git(&[
+            "-C",
+            &clone_path,
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "nothing",
+        ])
+        .expect("empty");
+        git(&[
+            "-C",
+            &clone_path,
+            "push",
+            "-q",
+            "origin",
+            &format!("HEAD:refs/heads/spawn/{agent}"),
+        ])
+        .expect("push the agent's branch");
+
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        assert!(
+            control_records(&db, "task.gated").is_empty(),
+            "not rejected at once: {:?}",
+            control_records(&db, "task.gated")
+        );
+        assert_eq!(control_records(&db, "objective.solved").len(), 1);
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "cancelled");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The owner's hold says the owner is moving main. Mission 6, 2026-11-08
+    /// 06:36: the owner held the source, pushed main behind Spawn's back and
+    /// recorded the move after; a pass between the push and the record
+    /// halted the mission, and `spawn mission moved` then matched no mission
+    /// (it skipped the halted ones), so the halt stood until a human resumed
+    /// it. The real order: hold, push, a pass, then moved and release.
+    #[test]
+    fn the_owners_hold_keeps_a_moved_main_from_halting() {
+        let (base, source, scenarios, integrator) = world("owner-hold-move", "exit 1\n");
+        let db = Db::new("owner_hold_move");
+        let b0 = source_main(&source);
+        let mission = mission_at_baseline(&db, &source, &scenarios, &b0);
+        let lock = db
+            .store
+            .source_hold_lock(&source)
+            .expect("the landing lock");
+        db.store
+            .source_hold(&source, &b0, 3600, Some("the owner's deploy"))
+            .expect("held");
+        drop(lock);
+        let moved = main_moves(&base, &source, "owner-push.txt");
+
+        integrator.pass_on(&db.store).expect("a pass");
+        assert!(
+            halted(&db, mission).is_null(),
+            "no halt while held: {}",
+            halted(&db, mission)
+        );
+        let after = db.mission(mission);
+        assert_eq!(
+            after["baseline"],
+            b0.as_str(),
+            "nothing is judged against it"
+        );
+
+        // Then the move is recorded, as `spawn mission moved` does, and the
+        // hold released: the mission takes the owner's main.
+        assert_eq!(
+            db.store
+                .source_moved(&source, &b0, &moved)
+                .expect("the owner's move"),
+            1
+        );
+        db.store.source_release(&source).expect("released");
+        let after = db.mission(mission);
+        assert_eq!(after["baseline"], moved.as_str());
+        assert!(after["halted"].is_null(), "halted: {}", after["halted"]);
+        integrator.pass_on(&db.store).expect("another pass");
+        assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A mission the integrator halted on a moved main is moved and cleared
+    /// by the owner's record of that very move: same source, from and to.
+    /// A halt for another reason at the same baseline keeps it.
+    #[test]
+    fn a_main_move_is_recorded_over_a_halt_that_says_so() {
+        let (base, source, scenarios, integrator) = world("owner-move-halted", "exit 1\n");
+        let db = Db::new("owner_move_halted");
+        let b0 = source_main(&source);
+        let mission = mission_at_baseline(&db, &source, &scenarios, &b0);
+        let other = mission_at_baseline(&db, &source, &scenarios, &b0);
+        db.record(&json!({"type": "mission.halted", "id": other,
+                          "reason": "three gate rejections in a row"}));
+        let moved = main_moves(&base, &source, "owner-push.txt");
+
+        integrator.pass_on(&db.store).expect("a pass");
+        assert!(
+            halted(&db, mission)
+                .as_str()
+                .is_some_and(|reason| reason.contains("but the last landing left")),
+            "{}",
+            halted(&db, mission)
+        );
+        // The move the halt names: applied.
+        assert_eq!(
+            db.store
+                .source_moved(&source, &b0, &moved)
+                .expect("the owner's move"),
+            1
+        );
+        let after = db.mission(mission);
+        assert!(after["halted"].is_null(), "halted: {}", after["halted"]);
+        assert_eq!(after["baseline"], moved.as_str());
+        let kept = db.mission(other);
+        assert_eq!(
+            kept["halted"],
+            json!("three gate rejections in a row"),
+            "another halt keeps its baseline"
+        );
+        assert_eq!(kept["baseline"], b0.as_str());
+        integrator.pass_on(&db.store).expect("another pass");
+        assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The integrator stopped between an owner landing's move of main and
