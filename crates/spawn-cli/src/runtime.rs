@@ -96,6 +96,10 @@ fn bridge_config(
     config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
     config.claude_projects = claude_projects();
     config.model_relay = model_relay();
+    // A workspace builds against the deps store at SUPPLY_PA_DEPS
+    // (`gate/scenarios/build`); the pane's engine runs the build, so it gets
+    // the path. Unset, the store's default under $HOME stands.
+    config.environment.extend(supply_pa_env(env_value));
     // A worker's pane gets no database login: the Bridge reads what the
     // engine does from its files and screen. The supervisor's pane gets its
     // own login: it reads the fleet and commands workers through the
@@ -124,6 +128,19 @@ fn bridge_config(
     Ok(config)
 }
 
+<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
+/// The deps store's path for engines that build a tree's dependencies
+/// (SUPPLY_PA_DEPS, `gate/scenarios/build`): a path, never a login, and only
+/// what the integrator has.
+fn supply_pa_env(lookup: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    lookup("SUPPLY_PA_DEPS")
+        .filter(|value| !value.is_empty())
+        .map(|value| vec![("SUPPLY_PA_DEPS".to_string(), value)])
+        .unwrap_or_default()
+}
+
+=======
+>>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
 /// The variable a test reads its database from.
 const TEST_DATABASE: &str = "SPAWN_TEST_DATABASE_URL";
 
@@ -320,7 +337,11 @@ fn judge(flags: &Flags) -> Option<Arc<dyn StateJudge>> {
 
 #[cfg(test)]
 mod tests {
+<<<<<<< 3665bb570fe9e2d662c1ffd16ffd749817f4ed91
+    use super::{FleetTestDatabase, resolve_claude_projects, supply_pa_env};
+=======
     use super::{FleetTestDatabase, resolve_claude_projects};
+>>>>>>> f67195ab3a93a503fb6ba8d0dcff7e2050064baa
     use spawn_core::bridge::LaunchEnvironment;
 
     fn environment(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -345,6 +366,23 @@ mod tests {
         );
         let configured = environment(&[("HOME", "/home/owner"), ("CLAUDE_CONFIG_DIR", "/cc")]);
         assert_eq!(resolve_claude_projects(configured), "/cc/projects");
+    }
+
+    #[test]
+    fn a_deps_store_reaches_the_pane_and_nothing_else_does() {
+        let store = environment(&[(
+            "SUPPLY_PA_DEPS",
+            "/home/o/.local/share/spawn-rsi/deps/supply-pa/current",
+        )]);
+        assert_eq!(
+            supply_pa_env(store),
+            [(
+                "SUPPLY_PA_DEPS".to_string(),
+                "/home/o/.local/share/spawn-rsi/deps/supply-pa/current".to_string()
+            )]
+        );
+        assert!(supply_pa_env(environment(&[("SUPPLY_PA_DEPS", "")])).is_empty());
+        assert!(supply_pa_env(environment(&[])).is_empty());
     }
 
     #[test]
