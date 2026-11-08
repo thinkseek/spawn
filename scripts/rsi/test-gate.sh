@@ -30,13 +30,12 @@ export SPAWN_GATE_MIN_FREE_GB=0
 # A file in the host's /tmp, which the sandbox must not show.
 marker=$(mktemp /tmp/test-gate-marker.XXXXXX)
 # Background helpers (listeners, fake servers) are killed on exit. One case
-# copies the gate under /var/tmp and one straight into it (roots the sandbox
-# empties); their scratch is removed on exit too, whatever happens between.
+# copies the gate under /var/tmp (a root the sandbox empties); its scratch is
+# removed on exit too, whatever happens in between.
 background=""
 masked=$work/no-masked-root
-bare=$work/no-bare-root
 # shellcheck disable=SC2086 # pids
-trap 'kill $background 2>/dev/null || true; rm -rf "$work" "$marker" "$masked" "$bare"' EXIT
+trap 'kill $background 2>/dev/null || true; rm -rf "$work" "$marker" "$masked"' EXIT
 
 # The owner's home, with secrets the candidate must not read. The gate's base
 # cache goes under it too, never into the real one.
@@ -1978,26 +1977,21 @@ expect "a tree under no masked root is not refused" "exit=$status $out" "no comm
 refuse "and is not refused for its root" "exit=$status $out" "refusing to run from"
 
 # A tree copied straight into a root the sandbox empties is in it as much as
-# one under it: /var/tmp itself, not /var/tmp/<something>. The copy goes in
-# /var/tmp/scripts so the gate's root is exactly /var/tmp (mkdir is the
-# exclusion: a directory that is already there is not ours to use, and the
-# case says so rather than removing it).
-if mkdir /var/tmp/scripts 2>/dev/null; then
-    bare=/var/tmp/scripts
-else
-    echo "FAIL a tree copied to /var/tmp itself: /var/tmp/scripts exists"
-    exit 1
-fi
-mkdir -p "$bare/rsi"
-cp "$gate" "$bare/rsi/gate.sh"
+# one under it: /var/tmp itself, not /var/tmp/<something>. Nothing is written
+# into the shared root to test that: the copy stays in the suite's $work and
+# a bwrap of the case's own binds it over /var/tmp for the gate under test,
+# so the gate's root is exactly /var/tmp. bwrap is the suite's dependency
+# already, and the refusal runs before the gate reaches bwrap itself.
+bare_tree=$work/bare-root
+mkdir -p "$bare_tree/scripts/rsi"
+cp "$gate" "$bare_tree/scripts/rsi/gate.sh"
 bare_status=0
-bare_out=$(sh "$bare/rsi/gate.sh" 2>&1) || bare_status=$?
+bare_out=$(bwrap --ro-bind / / --bind "$bare_tree" /var/tmp \
+    sh /var/tmp/scripts/rsi/gate.sh 2>&1) || bare_status=$?
 expect "a tree copied to /var/tmp itself: exit 3" "$bare_status" 3
 expect "naming the root itself" "$bare_out" "refusing to run from /var/tmp:"
 expect "and why" "$bare_out" "roots the sandbox empties"
 refuse "and nothing ran" "$bare_out" "=="
-rm -rf "$bare"
-bare=$work/no-bare-root
 
 # The host's TMPDIR is emptied too when it is not /tmp (`sandbox()` masks it
 # whole): a tree under it loses its own scripts the same way. The suite's
