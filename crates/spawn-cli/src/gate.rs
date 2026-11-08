@@ -108,6 +108,11 @@ pub(crate) const GATE_ENV: &[&str] = &[
     "SPAWN_GATE_JOBS",
     "SPAWN_GATE_PG_IMAGE",
     "SPAWN_GATE_PG_BIN",
+    // A tree's deps store (Supply PA's `gate/scenarios/build`, `bind` and
+    // `owner-deps.mjs`): a path the owner installs, never the owner's
+    // checkout. Without it those scripts use the store's default under
+    // $HOME; the gate forwards it into its sandbox (`scripts/rsi/gate.sh`).
+    "SUPPLY_PA_DEPS",
 ];
 
 /// The gate's exit status when TMPDIR has no room to judge now
@@ -2344,6 +2349,9 @@ mod tests {
             "SPAWN_GATE_JOBS" => Some("4".into()),
             "SPAWN_GATE_PG_IMAGE" => Some("postgres:16-alpine".into()),
             "SPAWN_GATE_PG_BIN" => Some("/usr/lib/postgresql/16/bin".into()),
+            "SUPPLY_PA_DEPS" => {
+                Some("/home/o/.local/share/spawn-rsi/deps/supply-pa/current".into())
+            }
             "SPAWN_DATABASE_URL" => Some("postgres://o:p@127.0.0.1:15433/spawn".into()),
             "SPAWN_JUDGE_URL" | "http_proxy" | "SSH_AUTH_SOCK" => Some("secret".into()),
             _ => None,
@@ -2363,7 +2371,8 @@ mod tests {
                 "SPAWN_GATE_MIN_FREE_GB",
                 "SPAWN_GATE_JOBS",
                 "SPAWN_GATE_PG_IMAGE",
-                "SPAWN_GATE_PG_BIN"
+                "SPAWN_GATE_PG_BIN",
+                "SUPPLY_PA_DEPS"
             ]
         );
         let unset = |name: &str| (name == "PATH").then(|| "/usr/bin".to_string());

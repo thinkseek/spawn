@@ -1228,6 +1228,16 @@ live only after its deploy**: a change to the gate, a scenario or the backlog
 is judged like any other commit before anything runs it, and what runs is a
 record of what was judged (§14 of design.md).
 
+A commit whose root holds a `pnpm-lock.yaml` (Supply PA) also has a deps
+tree: its `pnpm install` output, which git does not hold, at
+`~/.local/share/spawn-rsi/deps/<name>/<sha256 of the lockfile>` (read-only;
+`deploy/controller.sh deps` installs one, `update` does it when the
+lockfile's is missing, and a switch keeps the previous controller's tree and
+any tree an agent's workspace still links to, removing the rest). It is
+never the owner's checkout, whose `node_modules` every agent may write. The
+gate binds the store read-only into its sandbox, and engines and gates read
+it through `SUPPLY_PA_DEPS` (deploy/systemd/README.md "The controller").
+
 ### 10.3 Landing
 
 - **Mission settings** (`spawn mission configure`, owner only): a gate (a
