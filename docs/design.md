@@ -394,6 +394,8 @@ Bridge、Observer、调度器（`deliver.rs`、`dispatch.rs`）、集成器（`i
 
 门禁之前先量主机，不靠门禁崩溃才知道主机没有余量（objective 018）：每次判定在候选构建之后、门禁启动之前，集成器按序量门禁 `TMPDIR` 的剩余空间（`SPAWN_GATE_MIN_FREE_GB`）、`MemAvailable`（`SPAWN_GATE_MIN_FREE_MEMORY_MB`）与测试数据库（连接，再跑一条强制并行的查询，各 10 秒内），第一项不够就不启动门禁，记 `no_room` 并写明 `check`、`measured` 与 `threshold`。判断只凭判定当时的测量和它的阈值；一次跑了 25 分钟、因测试库 `/dev/shm` 不足而崩溃的门禁，不再被读成候选的回归。
 
+执行的每一种结束同样受它约束（objective 28，[fleet-architecture.md](fleet-architecture.md) §3 “The recovery”）：一次 interruption（执行的结束、模型失败的一轮、执行活过来的一次数据库中断）的 cause 全部从记下的事实读出——runner 写在退出文件旁的信号（`9` 是 SIGKILL）、`execution.ended` 的退出码、transcript 里 API error 行的 event id 及其 `apiErrorStatus`/`error`、结束它的那条 Stop 的 command id、环境包络与磁盘读数、恢复时终端服务器的状态、loop 自己数出的失败轮次与窗口——每一条都写进记录的 `evidence`；优先级固定（stopped、budget、memory_limit、host_restart、disk_full、database_unavailable、model_auth、model_unavailable、context_exhausted、crashed、exited），同一个事实只记一次（记录写明它依据的 log 事件 id，重起的 loop 因此既不会重记也不会重发）。每条记录是一次性的控制记录 `execution.interrupted`（owner 写，`spawn_host_record`），它的 `attempt` 是该执行的第几次 interruption，于是 `recover-<execution>-<attempt>` 只指向这一次；revive 是一条命令，不早于 `due_ms` 发出，结果从命令队列读回。wait 只在观测到时解除，从不凭时间：重试的一轮得到模型回答、凭据文件变化、loop 第一次连上数据库、磁盘读数回到 floor——解除本身是一条 `execution.cleared` 记录，然后才是 revive。loop 不因数据库不可达而退出：只有“连不上”的失败不计入 `MAX_FAILURES`，引擎照跑，第一个成功的轮次补记 outage 的 interruption 并让 Bridge 补 checkpoint 引擎在这段时间写下的东西。
+
 写新代码时的检查：读另一个循环的产物时，问它覆盖的是哪一个 commit、哪一个会话位置、哪一个命令 id；读 `spawn_commands` 时区分成功、失败与尚未运行；超时只决定何时再看，不证明任何事；删掉一个生产者时，搜出它的每个读者。
 
 ## 15. 记分卡（`spawn scorecard`）
