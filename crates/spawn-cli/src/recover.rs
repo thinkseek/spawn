@@ -1341,6 +1341,48 @@ impl One<'_> {
         Ok(())
     }
 
+    /// The interruption a failed tool call makes: a full disk ends the turn
+    /// and leaves the engine at its prompt, waiting for room. The wait is
+    /// the disk's: every probe reads the free space again, and the clear is
+    /// the reading at or above the floor.
+    fn interrupt_tool(&mut self, tool: &ToolFailure) -> Result<(), String> {
+        let Some(cause) = tool.cause() else {
+            return Ok(());
+        };
+        let mut evidence = Map::new();
+        evidence.insert("event_id".to_string(), json!(tool.event_id));
+        evidence.insert(
+            "text".to_string(),
+            json!(crate::deliver::one_line(&tool.text, 600)),
+        );
+        // The reading the wait is told by, taken now; the clear takes a
+        // fresh one every probe.
+        if let Some(reading) = self.disk_reading() {
+            evidence.insert(
+                "path".to_string(),
+                json!(reading.place.path.display().to_string()),
+            );
+            evidence.insert("free_bytes".to_string(), json!(reading.free));
+            evidence.insert("floor_bytes".to_string(), json!(Self::floor_bytes()));
+            evidence.insert("read_at_ms".to_string(), json!(self.now_ms));
+        }
+        let (path, mut gains) = way(
+            cause,
+            self.row.native_session_id.is_some(),
+            self.failures_in_a_row(),
+        );
+        evidence.append(&mut gains);
+        self.record(
+            cause,
+            evidence,
+            tool.event_id,
+            path,
+            Some(self.now_ms),
+            "its tool call failed on a full disk and its engine waits at its prompt",
+        )?;
+        Ok(())
+    }
+
     fn interrupt_end(&mut self, end: &End) -> Result<(), String> {
         // The reading a full disk is told by is taken now: the workspace's
         // filesystem, as the engine found it.
