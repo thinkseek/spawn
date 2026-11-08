@@ -8,7 +8,7 @@
 use serde_json::json;
 
 mod common;
-use common::{admin, login, store};
+use common::{admin, store};
 
 #[test]
 fn a_mission_source_is_a_checked_shape_and_the_supervisor_names_only_listed_ones() {
@@ -41,11 +41,7 @@ fn a_mission_source_is_a_checked_shape_and_the_supervisor_names_only_listed_ones
         );
     }
 
-    let mut client = admin(&schema);
-    let supervisor = login(&schema, "spawn_supervisor");
-    client
-        .batch_execute(&format!("set session authorization {supervisor}"))
-        .expect("become the supervisor");
+    let mut client = common::as_login(&schema, "spawn_supervisor");
     let add = |client: &mut postgres::Client, sources: serde_json::Value| {
         client.query_one(
             "select spawn_mission_add('from the supervisor', $1, null)",
@@ -69,9 +65,7 @@ fn a_mission_source_is_a_checked_shape_and_the_supervisor_names_only_listed_ones
             "{unlisted}: {refused}"
         );
     }
-    client
-        .batch_execute("reset session authorization")
-        .expect("back to the owner");
+    let mut client = admin(&schema);
     // A source only the supervisor named (here none was recorded) never
     // lists itself: the supervisor's own missions do not count.
     let listed: i64 = client

@@ -14,17 +14,29 @@ use spawn_postgres::PostgresStore;
 
 /// Run `first` in an open transaction on one connection, start `second` on
 /// another, let it wait on the first, then commit the first. Returns the
-/// second's result.
-fn race(schema: &str, setup: &str, first: &str, second: &str) -> Result<u64, postgres::Error> {
-    let mut one = admin(schema);
-    one.batch_execute(setup).expect("the first login");
+/// second's result. Both connect as `login` (a restricted login, logged in
+/// as itself), or as the owner when `None`.
+fn race(
+    schema: &str,
+    login: Option<&str>,
+    first: &str,
+    second: &str,
+) -> Result<u64, postgres::Error> {
+    let connect = |schema: &str, login: Option<&str>| match login {
+        Some(base) => common::as_login(schema, base),
+        None => admin(schema),
+    };
+    let mut one = connect(schema, login);
     let mut transaction = one.transaction().expect("begin");
     transaction.execute(first, &[]).expect("the first write");
     let schema = schema.to_string();
-    let (setup, second) = (setup.to_string(), second.to_string());
+    let login = login.map(str::to_string);
+    let second = second.to_string();
     let other = std::thread::spawn(move || {
-        let mut two = admin(&schema);
-        two.batch_execute(&setup).expect("the second login");
+        let mut two = match login.as_deref() {
+            Some(base) => common::as_login(&schema, base),
+            None => admin(&schema),
+        };
         two.execute(&second, &[])
     });
     // The second is past its own checks and waits on the first's lock.
@@ -58,10 +70,7 @@ fn two_first_submissions_for_one_session_with_different_agents_cannot_both_win()
     };
     let second = race(
         &schema,
-        &format!(
-            "set session authorization {}",
-            common::login(&schema, "spawn_supervisor")
-        ),
+        Some("spawn_supervisor"),
         &insert("agent_worker_a"),
         &insert("agent_worker_b"),
     );
@@ -92,12 +101,7 @@ fn two_first_submissions_for_one_agent_with_different_sessions_cannot_both_win()
                                  '{{\"type\":\"stop\"}}')"
         )
     };
-    let second = race(
-        &schema,
-        "select 1",
-        &submit("session_x"),
-        &submit("session_y"),
-    );
+    let second = race(&schema, None, &submit("session_x"), &submit("session_y"));
     let error = second.expect_err("the second session is refused");
     assert_eq!(
         error.code(),

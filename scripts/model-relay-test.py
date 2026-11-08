@@ -763,5 +763,38 @@ class RelayTest(unittest.TestCase):
         ):
             self.assertIsNotNone(relay.refusal(relay.config({**good, **change})))
 
+    def test_a_relay_is_not_dumpable_so_its_environment_is_its_own(self):
+        """The key lives in the relay's environment; a same-user process
+        cannot read it once main() has run not_dumpable()."""
+        if os.getuid() == 0:
+            self.skipTest("root reads it anyway")
+
+        # A child of this test: calls the relay's own not_dumpable(), says
+        # it is ready through a pipe, then waits to be killed. Only
+        # async-signal-safe calls after the fork.
+        read_end, write_end = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(read_end)
+            relay.not_dumpable()
+            os.write(write_end, b"ready")
+            os.close(write_end)
+            while True:
+                time.sleep(60)
+        os.close(write_end)
+        try:
+            self.assertEqual(os.read(read_end, 16), b"ready")
+            os.close(read_end)
+            with self.assertRaises(PermissionError):
+                with open(f"/proc/{pid}/environ", "rb") as handle:
+                    handle.read()
+            # A forked child is not dumpable either (it did not exec): the
+            # test itself, which did not call it, still is.
+            with open(f"/proc/{os.getpid()}/environ", "rb") as handle:
+                self.assertIn(b"PATH=", handle.read())
+        finally:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
