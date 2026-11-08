@@ -2607,6 +2607,7 @@ mod tests {
             pending(
                 std::slice::from_ref(&waiting),
                 &[],
+                &[],
                 &execution,
                 &[stopped],
                 &[]
