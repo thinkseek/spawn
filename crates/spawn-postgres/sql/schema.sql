@@ -1284,7 +1284,9 @@ create table if not exists mission_tasks (
     model           text   not null default 'default' check (model in ('default', 'cheap')),
     -- The owner's hold this landing task last waited behind (`task.held`,
     -- the `source.held` record's event id): its `land()` pushed nothing
-    -- under it. Set only by `task.held`; the hold's end does not clear it.
+    -- under it. Set by `task.held`, and moved to the new hold by a renewal
+    -- (`source.held` naming `renews`), which ends the hold it replaces; the
+    -- hold's end does not clear it.
     held_by         bigint,
     -- The task this one re-issues (its `task.assigned` names it): a first
     -- delivery spent without typing is cancelled and assigned again once,
