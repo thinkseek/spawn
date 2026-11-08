@@ -230,17 +230,10 @@ from (
     ev.evidence_seq,
     coalesce(tn.ended, false) as turn_ended,
     ck.commit as checkpoint,
-    (select coalesce(jsonb_agg(jsonb_build_object(
-              'id', j.job_id, 'kind', j.job_kind, 'event_id', j.event_id,
-              'started_at_ms', j.started_at_ms,
-              'age_ms', spawn_now_ms() - j.started_at_ms) order by j.session_seq), '[]'::jsonb)
-       from agent_open_jobs j
-      where s.live and j.session_id = s.session_id
-        and j.execution_id = s.execution_id) as jobs,
+    coalesce(jb.jobs, '[]'::jsonb) as jobs,
     ep.id as episode,
     ep.action ->> 'type' as episode_action,
-    exists (select 1 from spawn_commands c
-             where c.session_id = s.session_id and c.state <> 'finished') as open_command,
+    oc.session_id is not null as open_command,
     coalesce(mo.model, 'default') as model,
     (select coalesce(jsonb_agg(jsonb_build_object(
               'id', c.id,
