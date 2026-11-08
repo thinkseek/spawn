@@ -2056,11 +2056,21 @@ fn pending(
     };
     let open_wait =
         last.is_some_and(|record| record.path() == Some(Path::Wait.name()) && !cleared(record));
-    if let Some(turn) = turns
+    let turn = turns
         .iter()
-        .find(|turn| turn.event_id > after && turn.cause().is_some())
-    {
-        return Some(Fact::Turn(turn.clone()));
+        .find(|turn| turn.event_id > after && turn.cause().is_some());
+    let tool = tools
+        .iter()
+        .find(|tool| tool.event_id > after && tool.cause().is_some());
+    match (turn, tool) {
+        // The first of the two in the log: a disk's tool failure and a
+        // model's turn failure can sit in the same stretch of work.
+        (Some(turn), Some(tool)) if tool.event_id < turn.event_id => {
+            return Some(Fact::Tool(tool.clone()));
+        }
+        (Some(turn), _) => return Some(Fact::Turn(turn.clone())),
+        (None, Some(tool)) => return Some(Fact::Tool(tool.clone())),
+        (None, None) => {}
     }
     // A handoff ends the execution with its own Stop.
     if last.is_some_and(|record| {
