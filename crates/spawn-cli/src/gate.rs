@@ -1489,14 +1489,9 @@ mod tests {
         BaseDisagrees, Cpu, GateFailure, PrivateDirectory, gate_env, judge, judge_in, on_shared_server, run_bounded,
         withhold_owners_cluster, write_gate_env,
 =======
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-        BaseDisagrees, Cpu, GateFailure, PrivateDirectory, gate_env, judge, judge_in, on_shared_server, run_bounded,
-        withhold_owners_cluster, write_gate_env,
-=======
         BaseDisagrees, GateFailure, PrivateDirectory, Run, Scope,
         gate_env, judge, judge_in, memory_limit, run_bounded, withhold_owners_cluster,
->>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
+>>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
     };
     use spawn_core::envelope::{Envelope, Limits, Manager, ScopeFacts, Settings};
     use std::path::{Path, PathBuf};
@@ -1504,9 +1499,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
 <<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
     fn cpu(pairs: &[(&str, &str)], cores: usize) -> Result<Cpu, String> {
         let pairs: Vec<(String, String)> = pairs
             .iter()
@@ -1723,8 +1715,6 @@ mod tests {
             bytes,
             format!("SPAWN_INTEGRATE_PID=4343\0{}={}\0", env[0].0, env[0].1).into_bytes()
         );
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
 =======
     /// A gate's envelope: 30 MiB high, 32 MiB max, 8 MiB swap.
     fn scope() -> Scope {
@@ -1809,8 +1799,7 @@ mod tests {
             ..ScopeFacts::default()
         };
         assert!(memory_limit(&scope(), &counted, None, &killed).is_some());
->>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
+>>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
     }
 
     fn shell(script: &str) -> Command {

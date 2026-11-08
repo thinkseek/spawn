@@ -1333,16 +1333,11 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     // gate's environment (gate::Room).
     let host_room = gate::Room::from_env(|name| std::env::var(name).ok());
 <<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
     // The host's cores, shared among the gates (gate::Cpu), read once.
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let cpu = gate::Cpu::from_env(|name| std::env::var(name).ok(), cores)
         .map_err(|error| format!("{error}\n{USAGE}"))?;
     let integrator = Integrator::new(root, gate, gate_env, host_room, gates).with_cpu(cpu);
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
 =======
     // The gates' resource envelope (objective 029): a setting that does not
     // parse, or an envelope that does not fit under the slice, refuses the
@@ -1359,8 +1354,7 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         gates,
         envelopes.envelope().cloned(),
     );
->>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
+>>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
@@ -2558,9 +2552,6 @@ impl Judge {
                 gated("host_fault", extra)
             }
 <<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
             // The gate found a host or harness fault, not a verdict: a
             // scenario's harness error on the base, or a check failing on
             // the candidate and the base. `host_fault`: retried after a
@@ -2568,8 +2559,6 @@ impl Judge {
             Err(failure @ GateFailure::HostFault { .. }) => {
                 let mut extra = self.gate_host_fault(mission, task.id, &failure);
                 extra["candidate"] = json!(candidate);
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
 =======
             // A gate its own envelope killed is the host's fault: not a
             // verdict, judged again after objective 020's backoff, never an
@@ -2612,8 +2601,7 @@ impl Judge {
                     task.id,
                     extra["reason"].as_str().unwrap_or_default()
                 );
->>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
+>>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
                 gated("host_fault", extra)
             }
             Err(failure) => gated("aborted", aborted(&failure)),
@@ -3340,17 +3328,12 @@ fn aborted(failure: &GateFailure) -> Value {
             "log": log,
         }),
 <<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
         // Recorded as `host_fault` by the caller, likewise.
         GateFailure::HostFault {
             scenario, on, log, ..
         } => {
             json!({"reason": format!("the gate found {scenario} failing on the {on}"), "log": log})
         }
-<<<<<<< f0da0711f669349bf3aaf42d7cf54d31a7d76a82
-=======
 =======
         // Recorded `host_fault` by the caller; counted here only if a caller
         // forgets that.
@@ -3379,8 +3362,7 @@ fn size_text(bytes: u64) -> String {
         format!("{} MiB", bytes / MIB)
     } else {
         format!("{bytes} bytes")
->>>>>>> 1810cddf170ceaec780257528360e58ffa3e304b
->>>>>>> d21d29bd36a4a185cd27c962cbf8e41b3a68838b
+>>>>>>> 02fe54aaa12137a35856bc8cee3eba9412f0b0f4
     }
 }
 
