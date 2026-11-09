@@ -127,7 +127,7 @@ export function Sidebar({
             openAlerts > 0 && (
               <span
                 title={`${openAlerts} open alert${openAlerts === 1 ? "" : "s"}`}
-                className="tnum rounded bg-destructive/15 px-1.5 py-px text-micro font-medium text-destructive"
+                className="tnum rounded bg-fail-tint px-1.5 py-px text-micro font-medium text-destructive"
               >
                 {openAlerts}
               </span>
@@ -316,9 +316,9 @@ function SessionRow({
       aria-current={selected ? "true" : undefined}
       title={[agentId || sessionId, sessionId, task].filter(Boolean).join("\n")}
       className={cx(
-        "relative block w-full min-w-0 rounded-md px-2.5 py-1.5 text-left transition-colors",
+        "relative block w-full min-w-0 rounded-control px-2.5 py-1.5 text-left transition-colors",
         FOCUS_RING_INSET,
-        selected ? "bg-surface-selected" : "hover:bg-sidebar-accent",
+        selected ? "bg-surface-selected" : "hover:bg-surface-hover",
       )}
     >
       {attention && (
@@ -374,11 +374,12 @@ function NavItem({
       onClick={onClick}
       aria-current={active ? "page" : undefined}
       className={cx(
-        "flex h-8 w-full items-center gap-2.5 rounded-md px-2.5 text-left text-label font-medium transition-colors",
+        // A fixed row: 32 px, 44 px under a finger.
+        "flex h-8 w-full items-center gap-2.5 rounded-control px-2.5 text-left text-label transition-colors pointer-coarse:h-11",
         FOCUS_RING_INSET,
         active
-          ? "bg-surface-selected text-foreground"
-          : "text-muted-foreground hover:bg-sidebar-accent hover:text-foreground",
+          ? "bg-surface-selected font-semibold text-foreground"
+          : "font-medium text-muted-foreground hover:bg-surface-hover hover:text-foreground",
       )}
     >
       <span className={active ? "text-foreground" : "text-faint-foreground"}>
@@ -408,7 +409,7 @@ function AttentionCount({ count, error }: HumanCount) {
   return (
     <span
       title={`${count} thing${count === 1 ? "" : "s"} in Escalations (the dispatcher's queue)`}
-      className="tnum rounded bg-warning/15 px-1.5 py-px text-micro font-medium text-warning"
+      className="tnum rounded bg-wait-tint px-1.5 py-px text-micro font-medium text-warning"
     >
       {count}
     </span>

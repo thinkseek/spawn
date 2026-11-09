@@ -12,19 +12,19 @@ const TONE: Record<
 > = {
   working: {
     dot: "bg-success",
-    badge: "bg-success/12 text-success ring-success/25",
+    badge: "bg-ok-tint text-success ring-success/25",
     pulse: true,
     label: "Working",
   },
   waiting: {
     dot: "bg-info",
-    badge: "bg-info/12 text-info ring-info/25",
+    badge: "bg-info-tint text-info ring-info/25",
     pulse: false,
     label: "Waiting",
   },
   blocked: {
     dot: "bg-warning",
-    badge: "bg-warning/12 text-warning ring-warning/25",
+    badge: "bg-wait-tint text-warning ring-warning/25",
     pulse: false,
     label: "Blocked",
   },

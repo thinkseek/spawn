@@ -44,8 +44,8 @@ const WINDOW_OPTIONS: ReadonlyArray<ViewOption<WindowPreset>> = WINDOW_PRESETS.m
 );
 
 const TONE_STYLE: Record<TrendTone, string> = {
-  good: "bg-success/12 text-success ring-success/25",
-  bad: "bg-destructive/12 text-destructive ring-destructive/25",
+  good: "bg-ok-tint text-success ring-success/25",
+  bad: "bg-fail-tint text-destructive ring-destructive/25",
   flat: "bg-muted text-muted-foreground ring-surface-border",
 };
 

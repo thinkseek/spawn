@@ -38,7 +38,7 @@ export function LiveBadge({ live, known = true }: { live: boolean; known?: boole
       className={cx(
         "inline-flex h-5 items-center gap-1.5 rounded-md px-1.5 text-caption font-medium ring-1 ring-inset",
         live
-          ? "bg-success/10 text-success ring-success/25"
+          ? "bg-ok-tint text-success ring-success/25"
           : "bg-white/[0.04] text-muted-foreground ring-white/10",
       )}
     >

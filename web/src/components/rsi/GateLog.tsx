@@ -66,7 +66,7 @@ export function GateLog({ log }: { log: string }) {
               className={cx(
                 "mx-4 my-2 flex items-center gap-3 rounded-md px-3 py-2 ring-1 ring-inset",
                 verdict.accepted
-                  ? "bg-success/10 text-success ring-success/25"
+                  ? "bg-ok-tint text-success ring-success/25"
                   : "bg-destructive/10 text-destructive ring-destructive/25",
               )}
             >

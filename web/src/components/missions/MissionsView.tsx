@@ -251,8 +251,8 @@ function CommandLine({ command }: { command: string }) {
 }
 
 const RESIDENT_STYLE: Record<Resident["state"], string> = {
-  proposed: "bg-warning/15 text-warning ring-warning/30",
-  approved: "bg-success/12 text-success ring-success/25",
+  proposed: "bg-wait-tint text-warning ring-warning/30",
+  approved: "bg-ok-tint text-success ring-success/25",
   retired: "bg-muted text-faint-foreground ring-surface-border",
   unknown: "bg-transparent text-faint-foreground ring-surface-border",
 };
@@ -343,11 +343,11 @@ function ResidentRoster({ residents }: { residents: Resident[] }) {
 // Missions
 
 const MISSION_STATE_STYLE: Record<string, string> = {
-  active: "bg-info/12 text-info ring-info/25",
-  done: "bg-success/12 text-success ring-success/25",
-  completed: "bg-success/12 text-success ring-success/25",
-  accepted: "bg-success/12 text-success ring-success/25",
-  failed: "bg-destructive/12 text-destructive ring-destructive/25",
+  active: "bg-info-tint text-info ring-info/25",
+  done: "bg-ok-tint text-success ring-success/25",
+  completed: "bg-ok-tint text-success ring-success/25",
+  accepted: "bg-ok-tint text-success ring-success/25",
+  failed: "bg-fail-tint text-destructive ring-destructive/25",
   cancelled: "bg-muted text-faint-foreground ring-surface-border",
 };
 
@@ -690,7 +690,7 @@ function TaskRow({
           <Pill
             className={
               task.kind === "resident"
-                ? "bg-jev/12 text-jev ring-jev/30"
+                ? "bg-judge-tint text-jev ring-jev/30"
                 : undefined
             }
           >
@@ -874,8 +874,8 @@ function Pipeline({
                   ? "text-faint-foreground/60 ring-surface-border line-through"
                   : current
                     ? step === "accepted" || step === "landed"
-                      ? "bg-success/15 text-success ring-success/30"
-                      : "bg-info/15 text-info ring-info/30"
+                      ? "bg-ok-tint text-success ring-success/30"
+                      : "bg-info-tint text-info ring-info/30"
                     : done
                       ? "bg-muted text-foreground ring-surface-border"
                       : "text-faint-foreground ring-surface-border",
@@ -890,7 +890,7 @@ function Pipeline({
       {revise && (
         <li className="flex items-center gap-1">
           <RotateCcw size={12} className="text-warning" />
-          <span className="inline-flex h-6 items-center gap-1 rounded-md bg-warning/15 px-2 text-micro font-medium text-warning ring-1 ring-warning/30 ring-inset">
+          <span className="inline-flex h-6 items-center gap-1 rounded-md bg-wait-tint px-2 text-micro font-medium text-warning ring-1 ring-warning/30 ring-inset">
             revise
             <span className="tnum">×{task.revisions}</span>
           </span>
@@ -898,7 +898,7 @@ function Pipeline({
       )}
       {cancelled && (
         <li className="flex items-center gap-1 pl-1">
-          <span className="inline-flex h-6 items-center gap-1 rounded-md bg-destructive/12 px-2 text-micro font-medium text-destructive ring-1 ring-destructive/25 ring-inset">
+          <span className="inline-flex h-6 items-center gap-1 rounded-md bg-fail-tint px-2 text-micro font-medium text-destructive ring-1 ring-destructive/25 ring-inset">
             <Ban size={11} />
             cancelled
           </span>
@@ -964,11 +964,11 @@ function StageSteps({
             title={`task.${stage.stage}${stage.verdict ? ` ${stage.verdict}` : ""} at ${absolute(stage.at_ms) ?? "an unknown time"}`}
             chip={
               step.tone === "closed"
-                ? "bg-destructive/12 text-destructive ring-destructive/25"
+                ? "bg-fail-tint text-destructive ring-destructive/25"
                 : current && settled
-                  ? "bg-success/15 text-success ring-success/30"
+                  ? "bg-ok-tint text-success ring-success/30"
                   : current
-                    ? "bg-info/15 text-info ring-info/30"
+                    ? "bg-info-tint text-info ring-info/30"
                     : "bg-muted text-foreground ring-surface-border"
             }
             icon={
@@ -1050,7 +1050,7 @@ function StepItem({
           className={cx(
             "tnum h-4 rounded px-1 text-micro leading-4",
             slow
-              ? "bg-warning/15 font-semibold text-warning"
+              ? "bg-wait-tint font-semibold text-warning"
               : pending
                 ? "text-faint-foreground"
                 : "text-muted-foreground",

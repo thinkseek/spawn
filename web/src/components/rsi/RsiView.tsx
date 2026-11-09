@@ -100,7 +100,7 @@ export function RsiView({ onOpenSession }: RsiViewProps) {
       </PageHeader>
 
       {mission?.halted && (
-        <div className="flex shrink-0 items-start gap-3 border-b border-destructive/30 bg-destructive/12 px-4 py-3 sm:px-5">
+        <div className="flex shrink-0 items-start gap-3 border-b border-destructive/30 bg-fail-tint px-4 py-3 sm:px-5">
           <OctagonAlert size={18} className="mt-0.5 shrink-0 text-destructive" />
           <div className="min-w-0">
             <div className="text-body font-semibold text-destructive">
@@ -530,10 +530,10 @@ function Guard({
 }
 
 const STATUS_STYLE: Record<RsiObjective["status"], string> = {
-  open: "bg-info/12 text-info ring-info/25",
-  solved: "bg-success/12 text-success ring-success/25",
-  met: "bg-success/12 text-success ring-success/25",
-  owner: "bg-warning/12 text-warning ring-warning/25",
+  open: "bg-info-tint text-info ring-info/25",
+  solved: "bg-ok-tint text-success ring-success/25",
+  met: "bg-ok-tint text-success ring-success/25",
+  owner: "bg-wait-tint text-warning ring-warning/25",
 };
 
 function StatusPill({ status }: { status: RsiObjective["status"] }) {

@@ -249,7 +249,7 @@ function JevPanel({
               <button
                 type="button"
                 onClick={onBackToLatest}
-                className="rounded px-1.5 py-0.5 text-caption font-medium text-jev hover:bg-jev/10"
+                className="rounded px-1.5 py-0.5 text-caption font-medium text-jev hover:bg-judge-tint"
               >
                 Back to latest
               </button>
@@ -400,7 +400,7 @@ function JevPanel({
                     </span>
                     <span className="flex gap-1 text-micro">
                       {isFinal && (
-                        <span className="rounded bg-jev/12 px-1 text-jev">final</span>
+                        <span className="rounded bg-judge-tint px-1 text-jev">final</span>
                       )}
                       {isRules && (
                         <span className="rounded bg-muted px-1 text-muted-foreground">rules</span>
@@ -603,7 +603,7 @@ function JudgementHistory({
                   className={cx(
                     "grid w-full grid-cols-[4.25rem_4.75rem_6.5rem_2.75rem_minmax(0,1fr)] items-center gap-2 px-4 py-1.5 text-left text-caption transition-colors",
                     seq != null && seq === selectedSeq
-                      ? "bg-jev/10"
+                      ? "bg-judge-tint"
                       : "hover:bg-surface-hover",
                   )}
                 >
@@ -660,7 +660,7 @@ function PrincipalBadge({ principal }: { principal: string }) {
       className={cx(
         "inline-flex h-5 shrink-0 items-center rounded-md px-1.5 text-micro font-medium ring-1 ring-inset",
         human
-          ? "bg-warning/12 text-warning ring-warning/30"
+          ? "bg-wait-tint text-warning ring-warning/30"
           : principal === "spawn_supervisor"
             ? "bg-foreground/[0.07] text-foreground ring-border-strong"
             : "bg-muted text-muted-foreground ring-surface-border",
