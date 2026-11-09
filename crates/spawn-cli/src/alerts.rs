@@ -89,6 +89,19 @@
 //!   first later one with `over_alert` false.
 //! - `drill_failed`, `drill`, key `drill_failed:<its record>`: a
 //!   `backup.verified` with `ok` false; clears at the next with `ok` true.
+//! - `integrator_down`, `spawn-integrate`, key `integrator_down:<the first
+//!   reading's ms>`: no backend holds the integrator's lock on this store
+//!   (`pg_locks`, the lock `integrator_try_lock` takes) at every reading for
+//!   `SPAWN_ALERT_INTEGRATOR_DOWN_SECS` (default 300, longer than a deploy's
+//!   restart; 0 disables it) while a gated mission has a reported task that
+//!   waits for a gate: open or active, not halted, its source held by no
+//!   owner (a deploy and an owner's push hold it). Clears at the first
+//!   reading that finds the lock held. It rests on readings: the first one
+//!   that found the lock free is kept by the step, so a restarted loop
+//!   starts the bound again (later, never sooner, never twice). The lock is
+//!   read only while the step's fold has a reported task of a mission that
+//!   is open and not halted, or this alert is open: an idle loop reads
+//!   nothing more (objective 023).
 //! - `model_auth`, the session id, key
 //!   `model_auth:<its execution.interrupted>`: an `execution.interrupted`
 //!   (028) with cause `model_auth`; clears at that execution's
@@ -117,6 +130,9 @@ use crate::config::{env_value, open_store};
 /// The Observer's own attention threshold: a `stuck` judgement at or above
 /// it says the agent loops or makes no progress.
 pub(crate) const LIKELY: f64 = 0.5;
+
+/// The integrator-down alert's subject: the unit that runs the integrator.
+const INTEGRATOR: &str = "spawn-integrate";
 
 /// The most control records one pass handles; the next pass goes on.
 const BATCH: i64 = 500;
@@ -165,6 +181,9 @@ pub(crate) struct Settings {
     pub(crate) tmpfs_ok_mb: u64,
     /// How long a crash line clears itself by silence.
     pub(crate) quiet_ms: i64,
+    /// How long no integrator may hold its lock while reported work waits
+    /// (0: never alerted).
+    pub(crate) integrator_down_ms: i64,
     /// The window `spawn alerts --once` shows.
     pub(crate) window_ms: i64,
     /// The two database logs, when named.
@@ -215,6 +234,7 @@ impl Settings {
             tmpfs_high_mb: number("SPAWN_ALERT_TMPFS_HIGH_MB", 8000, &mut warnings),
             tmpfs_ok_mb: number("SPAWN_ALERT_TMPFS_OK_MB", 6000, &mut warnings),
             quiet_ms: secs("SPAWN_ALERT_PG_QUIET_SECS", 900, &mut warnings),
+            integrator_down_ms: secs("SPAWN_ALERT_INTEGRATOR_DOWN_SECS", 300, &mut warnings),
             window_ms: secs("SPAWN_ALERT_WINDOW_SECS", 86_400, &mut warnings),
             test_log: env_value("SPAWN_TEST_DATABASE_LOG").map(PathBuf::from),
             live_log: env_value("SPAWN_DATABASE_LOG").map(PathBuf::from),
@@ -359,6 +379,9 @@ pub(crate) struct Monitor {
     backups: BTreeMap<&'static str, Backup>,
     commands_after: i64,
     logs: Vec<LogWatch>,
+    /// The first reading of the current run that found no integrator
+    /// holding its lock while reported work waited (`integrator_down`).
+    unlocked_since: Option<i64>,
 }
 
 impl Monitor {
@@ -368,7 +391,7 @@ impl Monitor {
         (Self::with(settings), warnings)
     }
 
-    fn with(settings: Settings) -> Self {
+    pub(crate) fn with(settings: Settings) -> Self {
         let logs = vec![
             LogWatch::new("test", settings.test_log.clone()),
             LogWatch::new("live", settings.live_log.clone()),
@@ -387,6 +410,7 @@ impl Monitor {
             backups: BTreeMap::new(),
             commands_after: 0,
             logs,
+            unlocked_since: None,
         }
     }
 
@@ -438,6 +462,7 @@ impl Monitor {
         if reading_due {
             self.next_reading_ms = now.saturating_add(self.settings.check_ms);
             self.read_host(now, &mut events, &mut lines);
+            self.read_integrator(store, now, &mut events, &mut lines);
         }
         self.bounds(now, &mut events);
         self.flush(store, now, &events, &mut lines);
@@ -1144,6 +1169,105 @@ times in a row)",
         for index in 0..self.logs.len() {
             self.read_log(index, now, out, lines);
         }
+    }
+
+    /// The integrator-down reading (`integrator_down`): read only while
+    /// the fold has a reported task of a mission open and not halted, or the
+    /// alert is open.
+    fn read_integrator(
+        &mut self,
+        store: &PostgresStore,
+        now: i64,
+        out: &mut Vec<Event>,
+        lines: &mut Vec<String>,
+    ) {
+        if self.settings.integrator_down_ms <= 0 {
+            return;
+        }
+        let waits = self.tasks.values().any(|task| {
+            task.state.as_deref() == Some("reported")
+                && self.missions.get(&task.mission).is_some_and(|mission| {
+                    mission.halted.is_none() && matches!(mission.state.as_str(), "open" | "active")
+                })
+        });
+        if !waits && self.open_keys("integrator_down", INTEGRATOR).is_empty() {
+            self.unlocked_since = None;
+            return;
+        }
+        match store.alert_integrator() {
+            Ok(reading) => self.integrator(now, &reading, out),
+            Err(error) => lines.push(format!("alerts: the integrator's lock: {error}")),
+        }
+    }
+
+    /// One reading of the integrator's lock and the work waiting for it
+    /// (the store's `INTEGRATOR`): fire after the bound of readings with
+    /// the lock free and work waiting, clear when the lock is held.
+    fn integrator(&mut self, now: i64, reading: &Value, out: &mut Vec<Event>) {
+        let Some(locked) = reading["locked"].as_bool() else {
+            return;
+        };
+        let at = reading["now_ms"].as_i64().unwrap_or(now);
+        let open = self.open_keys("integrator_down", INTEGRATOR);
+        if locked {
+            self.unlocked_since = None;
+            for key in open {
+                out.push(Event::Clear {
+                    key,
+                    evidence: json!({"locked": true, "reading_ms": at}),
+                });
+            }
+            return;
+        }
+        let waiting = reading["waiting"].as_array().map_or(&[][..], Vec::as_slice);
+        if waiting.is_empty() {
+            // Nothing waits: no bound runs (an open alert stays open until
+            // the integrator runs again).
+            self.unlocked_since = None;
+            return;
+        }
+        let since = *self.unlocked_since.get_or_insert(at);
+        let down = at.saturating_sub(since);
+        if !open.is_empty() || down < self.settings.integrator_down_ms {
+            return;
+        }
+        let tasks: Vec<String> = waiting
+            .iter()
+            .take(5)
+            .map(|entry| {
+                format!(
+                    "task #{} of mission #{}",
+                    entry["task"].as_i64().unwrap_or_default(),
+                    entry["mission"].as_i64().unwrap_or_default()
+                )
+            })
+            .collect();
+        out.push(Event::Fire {
+            key: format!("integrator_down:{since}"),
+            kind: "integrator_down",
+            subject: INTEGRATOR.to_string(),
+            evidence: json!({
+                "since_ms": since, "reading_ms": at, "down_ms": down,
+                "threshold_ms": self.settings.integrator_down_ms,
+                "waiting": waiting.iter().take(20).collect::<Vec<_>>(),
+                "waiting_count": waiting.len(),
+            }),
+            text: format!(
+                "spawn-integrate is not running: no integrator has held its lock for {}s while \
+                 {} reported task{} wait{} for a gate ({}{})",
+                down / 1000,
+                waiting.len(),
+                if waiting.len() == 1 { "" } else { "s" },
+                if waiting.len() == 1 { "s" } else { "" },
+                tasks.join(", "),
+                if waiting.len() > tasks.len() {
+                    ", …"
+                } else {
+                    ""
+                }
+            ),
+            notice: false,
+        });
     }
 
     fn read_memory(&mut self, now: i64, out: &mut Vec<Event>, lines: &mut Vec<String>) {
@@ -2161,6 +2285,7 @@ mod tests {
             tmpfs_high_mb: 8000,
             tmpfs_ok_mb: 6000,
             quiet_ms: 900_000,
+            integrator_down_ms: 300_000,
             window_ms: 86_400_000,
             test_log: None,
             live_log: None,
