@@ -1727,6 +1727,58 @@ expect "the runs overlapped: the base's wall clock is under their own time" \
     "$([ "$(wall_of base)" -lt "$(own_of base)" ] && echo overlapped)" overlapped
 expect "and the candidate's" "$([ "$(wall_of candidate)" -lt "$(own_of candidate)" ] && echo overlapped)" overlapped
 expect "the log says how many ran at once" "$(cat "$work/gate.out")" '| base runs: 4 in '
+# The gate's time line: setup is its own measure (the time before the first
+# stage), never the total less the phases, which overlap ("setup -416 s");
+# and no phase is said longer than the gate. gate_time_ok [<log>].
+gate_time_ok() {
+    sed -n 's/^| gate time: base \([0-9]*\) s .*candidate \([0-9-]*\) s, setup \([0-9-]*\) s .*total \([0-9]*\) s$/\1 \2 \3 \4/p' \
+        "${1:-$work/gate.out}" | {
+        read -r gt_base gt_candidate gt_setup gt_total || {
+            echo "no gate time line"
+            return 0
+        }
+        if [ "$gt_setup" -ge 0 ] && [ $((gt_base + gt_candidate)) -le $((gt_total + 1)) ]; then
+            echo fine
+        else
+            echo "base $gt_base, candidate $gt_candidate, setup $gt_setup, total $gt_total"
+        fi
+    }
+}
+expect "four at a time: setup is not negative, and base and candidate fit in the total" \
+    "$(gate_time_ok)" fine
+# A gate killed while its candidate runs overlap (two at a time, the slow
+# one last, so five fast ones are printed first, 10 s of their own time in about 6 s): the open phase is its wall
+# clock so far, not its runs' own time added up.
+slow=$work/slow-par
+mkdir -p "$slow"
+cp "$scenarios/protected" "$scenarios/build" "$slow/"
+for n in 1 2 3 4 5; do
+    printf '#!/bin/sh\necho "06%s"\nsleep 2\n' "$n" >"$slow/06$n.sh"
+done
+printf '#!/bin/sh\necho "066"\nsleep 12\n' >"$slow/066.sh"
+killed=$work/killed-gate.out
+rm -rf "$integrator"
+mkdir -m 700 "$integrator"
+(
+    export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$work/caches/slow-killed" SPAWN_GATE_VERDICT="$integrator/verdict"
+    exec sh "$gate" "$repo" "$base" "$good" "$slow"
+) >"$killed" 2>&1 &
+killed_pid=$!
+killed_wait=0
+until grep -q '^| == regression: 065.sh' "$killed" 2>/dev/null; do
+    killed_wait=$((killed_wait + 1))
+    if [ "$killed_wait" -gt 600 ]; then
+        echo "FAIL the slow gate never printed its candidate's fifth run"
+        kill -TERM "$killed_pid" 2>/dev/null || :
+        exit 1
+    fi
+    sleep 0.1
+done
+kill -TERM "$killed_pid"
+wait "$killed_pid" || :
+expect "killed inside its candidate phase: the gate still says its time" "$(cat "$killed")" '| gate time: '
+expect "with setup not negative, and base and candidate within the total" "$(gate_time_ok "$killed")" fine
+expect "the open phase is said as it stood" "$(cat "$killed")" '| candidate runs: '
 expect "the gate time line counts the runs" "$(cat "$work/gate.out")" '(4 scenario runs, 0 results from the cache)'
 expect "a bad SPAWN_GATE_JOBS is no verdict" "$(with_jobs 0 bad "$good" "$par")" 'exit=3 '
 expect "and says why" "$(cat "$work/gate.out")" 'SPAWN_GATE_JOBS is a whole number from 1'
