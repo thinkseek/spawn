@@ -112,7 +112,11 @@ from (select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
 /// when that is an end, not an end after the latest judgement: the Observer
 /// judges once more after every end (a rules judgement with no `stuck`), so
 /// an end is never after the latest judgement of a session that ended. A
-/// later `execution.started` (a resume) means the end is not current.
+/// later `execution.started` (a resume) means the end is not current. Only
+/// the Bridge's `execution.ended` is an end, as the store's own fold has it
+/// (schema.sql: "a runner's exit report is no end"): a runner's late report
+/// of an older execution, after the resume's start, would otherwise read a
+/// live session as ended.
 ///
 /// Two reads of the log whatever the number of sessions: the judgements,
 /// and each session's latest start or end, joined once. (The live log's ten
@@ -130,7 +134,8 @@ current as (
   select distinct on (e.session_id) e.session_id, e.id, e.event_name, e.kind
     from spawn_events e
     join latest l using (session_id)
-   where e.event_name in ('execution.started', 'execution.ended')
+   where (e.event_name = 'execution.started'
+          or (e.event_name = 'execution.ended' and e.source = 'bridge'))
    order by e.session_id, e.id desc)
 select coalesce(jsonb_agg(jsonb_build_object(
       'session_id', o.session_id, 'agent_id', o.agent_id, 'event_id', o.id,

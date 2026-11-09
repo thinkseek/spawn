@@ -2970,16 +2970,39 @@ connections\n";
             }
         }
 
-        /// One worker session's records, appended in order.
+        /// One worker session's records, appended in order; each start
+        /// begins an execution of its own (`exec_<name>_<n>`), as the
+        /// Bridge's do.
         struct Session {
             name: &'static str,
             next: u64,
+            execution: u32,
         }
 
         impl Session {
+            fn new(name: &'static str) -> Self {
+                Self {
+                    name,
+                    next: 0,
+                    execution: 0,
+                }
+            }
+
             fn append(&mut self, store: &PostgresStore, source: Source, kind: EventKind) -> i64 {
+                let execution = self.execution;
+                self.append_to(store, execution, source, kind)
+            }
+
+            /// A record of execution `n` of this session.
+            fn append_to(
+                &mut self,
+                store: &PostgresStore,
+                n: u32,
+                source: Source,
+                kind: EventKind,
+            ) -> i64 {
                 self.next += 1;
-                let execution = ExecutionId::new(format!("exec_{}", self.name)).expect("valid");
+                let execution = ExecutionId::new(format!("exec_{}_{n}", self.name)).expect("valid");
                 let appended = store
                     .append(NewEvent {
                         agent_id: AgentId::new(format!("agent_{}", self.name)).expect("valid"),
@@ -2995,6 +3018,7 @@ connections\n";
             }
 
             fn started(&mut self, store: &PostgresStore) -> i64 {
+                self.execution += 1;
                 self.append(
                     store,
                     Source::Bridge,
@@ -3070,14 +3094,8 @@ connections\n";
         fn a_stuck_alert_clears_at_its_executions_end_whatever_judgement_follows() {
             in_schema("stuck_end", |store| {
                 let mut monitor = monitor();
-                let mut stopped = Session {
-                    name: "worker_stop",
-                    next: 0,
-                };
-                let mut lost = Session {
-                    name: "worker_lost",
-                    next: 0,
-                };
+                let mut stopped = Session::new("worker_stop");
+                let mut lost = Session::new("worker_lost");
                 stopped.started(store);
                 lost.started(store);
                 let stuck = stopped.judged(store, Some(0.64));
@@ -3123,10 +3141,7 @@ connections\n";
         fn an_end_followed_by_a_start_clears_nothing() {
             in_schema("stuck_resume", |store| {
                 let mut monitor = monitor();
-                let mut session = Session {
-                    name: "supervisor",
-                    next: 0,
-                };
+                let mut session = Session::new("supervisor");
                 session.started(store);
                 session.ended(store, EndCause::Lost);
                 session.started(store);
@@ -3142,6 +3157,40 @@ connections\n";
             });
         }
 
+        /// A runner's late report of the older execution's end, recorded
+        /// after the resume's start (only old logs hold one: bridge.rs), is
+        /// no end: the store counts the Bridge's alone (schema.sql's "a
+        /// runner's exit report is no end"). The live execution's stuck
+        /// judgement fires, and nothing clears it. rev-f's probe on
+        /// 4897d444, which read that report as the current end.
+        #[test]
+        fn a_runners_late_end_report_of_an_older_execution_is_no_end() {
+            in_schema("stuck_late_report", |store| {
+                let mut monitor = monitor();
+                let mut session = Session::new("late");
+                session.started(store);
+                session.ended(store, EndCause::Lost);
+                session.started(store);
+                session.append_to(
+                    store,
+                    1,
+                    Source::Claude,
+                    EventKind::ExecutionEnded {
+                        cause: EndCause::Exited,
+                        exit_code: Some(0),
+                        signal: None,
+                        evidence: None,
+                    },
+                );
+                let stuck = session.judged(store, Some(0.8));
+                let fired = observe(&mut monitor, store);
+                assert_eq!(fires(&fired), [format!("agent_stuck:session_late:{stuck}")]);
+                commit(&mut monitor, &fired);
+                session.judged(store, None);
+                assert!(observe(&mut monitor, store).is_empty(), "nothing clears it");
+            });
+        }
+
         /// A loop that starts after the session ended, its latest scored
         /// judgement stuck: nothing fires. And an alert already open on a
         /// judgement made after the end (one fired before this rule) clears
@@ -3149,10 +3198,7 @@ connections\n";
         #[test]
         fn an_ended_session_fires_nothing_and_its_open_alert_clears() {
             in_schema("stuck_ended", |store| {
-                let mut session = Session {
-                    name: "worker_done",
-                    next: 0,
-                };
+                let mut session = Session::new("worker_done");
                 session.started(store);
                 let end = session.ended(store, EndCause::Exited);
                 let stuck = session.judged(store, Some(0.9));
