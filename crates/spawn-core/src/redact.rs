@@ -37,7 +37,8 @@ pub fn redact(text: &str) -> String {
 }
 
 /// Redact the free-text fields of `kind`: engine and command errors,
-/// screen evidence, and the text an observation quotes. Identifiers,
+/// screen evidence, a tool call's summary of its input, and the text an
+/// observation quotes. Identifiers,
 /// paths and control records (which carry mission sources and prompts the
 /// folds read back) are left as they are.
 pub fn redact_event(kind: &mut EventKind) {
@@ -50,6 +51,10 @@ pub fn redact_event(kind: &mut EventKind) {
             error: Some(error), ..
         } => clean(error),
         EventKind::ScreenObserved { evidence, .. } => clean(evidence),
+        EventKind::ToolStarted {
+            summary: Some(summary),
+            ..
+        } => clean(summary),
         EventKind::ObservationRecorded { observation } => {
             if let Some(text) = observation.human_question.as_mut() {
                 clean(text);

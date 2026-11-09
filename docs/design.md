@@ -66,7 +66,7 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | `notice.typed` | 无；保留它以读取日志里已有的行（主线不再合入运行中的工作区） | through |
 | `notice.received` | 无；保留它以读取日志里已有的行 | 无 |
 | `notification.received` | 无；保留它以读取日志里已有的行 | notification_type |
-| `tool.started` | 会话记录 | tool_name、tool_use_id |
+| `tool.started` | 会话记录 | tool_name、tool_use_id、summary（可选：调用的关键输入，如命令首行、文件路径、模式；凭证已脱敏，至多 160 字符） |
 | `tool.completed` | 会话记录 | tool_use_id、duration_ms |
 | `tool.failed` | 会话记录 | tool_use_id、error |
 | `turn.stopped` | 会话记录（`turn_duration`、中断） | input_tokens、output_tokens |

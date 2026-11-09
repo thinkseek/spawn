@@ -464,6 +464,22 @@ export async function fetchSession(
   return readApi(url, signal, normalizeSession);
 }
 
+/** The newest events of a session, up to `count`: one read for the
+ * session's latest sequence number (an `after` past any event answers an
+ * empty timeline and the session's state), then the page that ends there.
+ * No endpoint of its own: /api/session pages forward from `after`. */
+export async function fetchSessionTail(
+  id: string,
+  count: number,
+  signal: AbortSignal,
+): Promise<SessionDetail> {
+  const base = `/api/session/${encodeURIComponent(id)}`;
+  const head = await readApi(`${base}?after=${Number.MAX_SAFE_INTEGER}&limit=1`, signal, normalizeSession);
+  const latest = Math.max(head.session_seq, head.freshness?.last_session_seq ?? 0);
+  const after = Math.max(0, latest - count);
+  return readApi(`${base}?after=${after}&limit=${count}`, signal, normalizeSession);
+}
+
 export interface PollResult<T> {
   data: T | null;
   error: string | null;

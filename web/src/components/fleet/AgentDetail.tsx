@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   ArrowRight,
   CircleAlert,
   History,
@@ -8,7 +9,8 @@ import {
 import { useId, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
 
-import { usePoll } from "../../api";
+import { fetchSessionTail, usePoll } from "../../api";
+import type { SessionDetail } from "../../api";
 import type {
   CommandRecord,
   FleetAgent,
@@ -29,6 +31,7 @@ import {
   stateLabelUpper,
 } from "../../fleet";
 import { clockTime, formatDuration, relativeTime } from "../../format";
+import { recentToolRows, rowText, runEnd } from "../../trace";
 import { freshAt } from "../../validated";
 import { LiveBadge, TerminalPanel } from "../Terminal";
 import { Ago, Button, Card, CardHeader, Drawer, EmptyState, FOCUS_RING, cx } from "../ui";
@@ -61,6 +64,11 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
   const commands = usePoll<CommandRecord[]>(
     `commands:${sessionId}`,
     (signal) => fetchCommands(sessionId, signal),
+    5_000,
+  );
+  const tail = usePoll<SessionDetail>(
+    `tail:${sessionId}`,
+    (signal) => fetchSessionTail(sessionId, TAIL_EVENTS, signal),
     5_000,
   );
   // A judgement picked from the history; null follows the latest.
@@ -132,6 +140,7 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
         <AgentSummary agent={agent} />
         <div className="grid gap-3 p-3 sm:p-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
           <div className="flex min-w-0 flex-col gap-3">
+            <RecentTools session={tail.data} error={tail.error} />
             {/* Read and type in one place: the screen, then the input. */}
             <div className="flex min-w-0 flex-col gap-2">
               <AgentScreen
@@ -178,6 +187,54 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
         </div>
       </div>
     </Drawer>
+  );
+}
+
+/** How many of the session's newest events the tool rows are read from. */
+const TAIL_EVENTS = 200;
+const TOOL_ROWS = 8;
+
+/** The agent's latest tool calls in words (`Bash · cargo test ×3`), newest
+ * last, each with its duration and, when it failed, its outcome. */
+function RecentTools({ session, error }: { session: SessionDetail | null; error: string | null }) {
+  const now = Date.now();
+  const rows = session ? recentToolRows(session.timeline, now, TOOL_ROWS) : [];
+  return (
+    <Card>
+      <CardHeader title="Latest tool calls" />
+      {rows.length === 0 ? (
+        <p className="px-4 pb-3 text-caption text-faint-foreground">
+          {error ? `Could not read the session: ${error}` : session ? "No tool calls in its latest events." : "Loading…"}
+        </p>
+      ) : (
+        <ol className="px-2 pb-2">
+          {rows.map(({ span, run }) => (
+            <li
+              key={span.id}
+              className="flex items-center gap-2 rounded-md px-2 py-1 text-caption"
+              title={span.summary ? `${span.label} · ${span.summary}` : span.label}
+            >
+              <span className="tnum w-16 shrink-0 text-faint-foreground">{clockTime(span.start)}</span>
+              <span className="min-w-0 truncate font-mono text-foreground/85">{rowText(span)}</span>
+              {run.length > 1 && <span className="tnum shrink-0 font-medium text-muted-foreground">×{run.length}</span>}
+              {span.failed && (
+                <span className="flex min-w-0 shrink items-center gap-1 text-muted-foreground">
+                  <AlertTriangle size={11} className="shrink-0 text-destructive" aria-label="Failed" />
+                  <span className="truncate">{span.outcome}</span>
+                </span>
+              )}
+              <span className="tnum ml-auto shrink-0 pl-2 text-faint-foreground">
+                {span.state === "open"
+                  ? `running · ${formatDuration(now - span.start)}`
+                  : span.state === "orphan"
+                    ? "no start"
+                    : formatDuration(runEnd(run, now) - span.start)}
+              </span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </Card>
   );
 }
 

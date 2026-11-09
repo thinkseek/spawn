@@ -7,7 +7,7 @@ import type { TimelineEvent } from "../../api";
 import { pairs } from "../../eventFormat";
 import { clockTime, formatDuration } from "../../format";
 import { fitDomain } from "../../timeWindow";
-import { chainOf, deriveTrace, spanEnd, visibleSpans } from "../../trace";
+import { chainOf, deriveTrace, foldRuns, rowText, runEnd, spanEnd, visibleSpans } from "../../trace";
 import type { Span, SpanKind, TraceMarker } from "../../trace";
 import { Overview } from "../timeaxis/Overview";
 import type { OverviewLine } from "../timeaxis/Overview";
@@ -43,10 +43,14 @@ const BAR_H: Record<SpanKind, number> = {
 const INDENT_PX = 14;
 const BOTTOM_SLACK_PX = 56;
 
-/** A visible row: a span, or the session row for events no span owns. */
+/** A visible row: a span, or the session row for events no span owns. A
+ * tool row can stand for a run of identical calls (`run`, ×N); opened, the
+ * run's calls follow as their own rows. */
 interface Row {
   key: string;
   span: Span | null;
+  run: Span[];
+  unfolded: boolean;
   markers: TraceMarker[];
 }
 
@@ -77,6 +81,7 @@ export function TraceView({
   );
 
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+  const [unfoldedRuns, setUnfoldedRuns] = useState<Set<string>>(() => new Set());
   const [selected, setSelected] = useState<string | null>(null);
   const [selectedEvent, setSelectedEvent] = useState<number | null>(null);
   const [hover, setHover] = useState<Hover | null>(null);
@@ -84,13 +89,14 @@ export function TraceView({
   const rows = useMemo<Row[]>(() => {
     const list: Row[] = [];
     if (trace.markers.length > 0) {
-      list.push({ key: "session", span: null, markers: trace.markers });
+      list.push({ key: "session", span: null, run: [], unfolded: false, markers: trace.markers });
     }
-    for (const span of visibleSpans(trace, collapsed)) {
-      list.push({ key: span.id, span, markers: span.markers });
+    for (const { span, run, unfolded } of foldRuns(visibleSpans(trace, collapsed), unfoldedRuns)) {
+      const markers = unfolded || run.length === 1 ? span.markers : run.flatMap((call) => call.markers);
+      list.push({ key: span.id, span, run, unfolded, markers });
     }
     return list;
-  }, [trace, collapsed]);
+  }, [trace, collapsed, unfoldedRuns]);
   const rowIndex = useMemo(
     () => new Map(rows.map((row, index) => [row.key, index])),
     [rows],
@@ -177,17 +183,19 @@ export function TraceView({
     setSelected(key);
     setSelectedEvent(null);
   };
-  const toggle = (id: string) =>
-    setCollapsed((current) => {
-      const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+  const flip = (current: Set<string>, id: string) => {
+    const next = new Set(current);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    return next;
+  };
+  const toggle = (id: string) => setCollapsed((current) => flip(current, id));
+  const toggleRun = (id: string) => setUnfoldedRuns((current) => flip(current, id));
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     const index = selected ? (rowIndex.get(selected) ?? -1) : -1;
-    const span = index >= 0 ? rows[index].span : null;
+    const row = index >= 0 ? rows[index] : null;
+    const span = row?.span ?? null;
     switch (event.key) {
       case "ArrowDown":
       case "ArrowUp": {
@@ -206,6 +214,9 @@ export function TraceView({
           event.preventDefault();
           const isCollapsed = collapsed.has(span.id);
           if (isCollapsed === (event.key === "ArrowRight")) toggle(span.id);
+        } else if (span && row && row.run.length > 1) {
+          event.preventDefault();
+          if (row.unfolded === (event.key === "ArrowLeft")) toggleRun(span.id);
         }
         break;
       case "Enter":
@@ -334,6 +345,7 @@ export function TraceView({
                   dimmed={chain !== null && !(row.span && chain.has(row.span.id))}
                   collapsed={row.span ? collapsed.has(row.span.id) : false}
                   onToggle={toggle}
+                  onToggleRun={toggleRun}
                   onSelect={select}
                 />
               ))}
@@ -365,19 +377,19 @@ export function TraceView({
                     now={now}
                     chain={chain}
                   />
-                  {rows.map((row, index) =>
-                    row.span ? (
+                  {rows.flatMap((row, index) =>
+                    (row.unfolded ? row.run.slice(0, 1) : row.run).map((span) => (
                       <SpanBar
-                        key={row.key}
-                        span={row.span}
+                        key={span.id}
+                        span={span}
                         cy={index * ROW_H + ROW_H / 2}
                         px={px}
                         plotW={plotW}
                         now={now}
                         gradientId={gradientId}
-                        dimmed={chain !== null && !chain.has(row.span.id)}
+                        dimmed={chain !== null && !chain.has(row.key)}
                       />
-                    ) : null,
+                    )),
                   )}
                   {rows.map((row, index) => (
                     <Markers
@@ -489,6 +501,7 @@ function RowLabel({
   dimmed,
   collapsed,
   onToggle,
+  onToggleRun,
   onSelect,
 }: {
   row: Row;
@@ -499,17 +512,20 @@ function RowLabel({
   dimmed: boolean;
   collapsed: boolean;
   onToggle: (id: string) => void;
+  onToggleRun: (id: string) => void;
   onSelect: (key: string) => void;
 }) {
   const span = row.span;
   const depth = span?.depth ?? 0;
-  const hasChildren = (span?.childIds.length ?? 0) > 0;
+  const isRun = row.run.length > 1;
+  const hasChildren = (span?.childIds.length ?? 0) > 0 || isRun;
+  const shut = isRun ? !row.unfolded : collapsed;
   return (
     <div
       role="treeitem"
       aria-level={depth + 1}
       aria-selected={selected}
-      aria-expanded={hasChildren ? !collapsed : undefined}
+      aria-expanded={hasChildren ? !shut : undefined}
       className={cx(
         "absolute inset-x-0 flex items-center transition-colors duration-150 motion-reduce:transition-none",
         selected ? "bg-surface-selected" : hovered ? "bg-surface-hover" : "",
@@ -528,15 +544,15 @@ function RowLabel({
           <button
             type="button"
             tabIndex={-1}
-            aria-label={collapsed ? "Expand" : "Collapse"}
-            onClick={() => span && onToggle(span.id)}
+            aria-label={isRun ? (shut ? `List the ${row.run.length} calls` : "Fold the calls") : shut ? "Expand" : "Collapse"}
+            onClick={() => span && (isRun ? onToggleRun(span.id) : onToggle(span.id))}
             className="grid size-4 shrink-0 place-items-center rounded text-faint-foreground hover:text-foreground"
           >
             <ChevronRight
               size={12}
               className={cx(
                 "transition-transform duration-150 motion-reduce:transition-none",
-                !collapsed && "rotate-90",
+                !shut && "rotate-90",
               )}
             />
           </button>
@@ -547,6 +563,7 @@ function RowLabel({
           type="button"
           tabIndex={-1}
           onClick={() => onSelect(row.key)}
+          title={span?.summary ? `${span.label} · ${span.summary}` : undefined}
           className="flex min-w-0 flex-1 items-center gap-2 text-left"
         >
           {span ? (
@@ -560,16 +577,28 @@ function RowLabel({
           )}
           <span
             className={cx(
-              "min-w-0 max-w-full shrink-0 truncate",
+              "min-w-0 max-w-full truncate",
+              span?.kind !== "tool" && "shrink-0",
               span && span.kind !== "tool"
                 ? "text-label text-foreground"
                 : "font-mono text-caption text-foreground/85",
             )}
           >
-            {span ? span.label : "Session"}
+            {span ? rowText(span) : "Session"}
           </span>
+          {isRun && (
+            <span className="tnum shrink-0 text-caption font-medium text-muted-foreground">
+              ×{row.run.length}
+            </span>
+          )}
           {span?.failed && (
-            <span className="flex min-w-0 flex-1 items-center gap-1 text-caption text-muted-foreground">
+            <span
+              className={cx(
+                "flex min-w-0 items-center gap-1 text-caption text-muted-foreground",
+                // A tool's outcome is short (`exit 1`); its input gives way first.
+                span.kind === "tool" ? "max-w-[45%] shrink-0" : "flex-1",
+              )}
+            >
               <AlertTriangle size={11} className="shrink-0 text-destructive" aria-label="Failed" />
               <span className="truncate">{span.outcome}</span>
             </span>
@@ -583,6 +612,7 @@ function RowLabel({
           {span?.state === "open" && span.kind !== "tool" && (
             <span className="sr-only">running</span>
           )}
+
         </button>
       </div>
     </div>
@@ -837,7 +867,8 @@ function Tooltip({
     );
   } else if (row.span) {
     const span = row.span;
-    const end = spanEnd(span, now);
+    const folded = row.run.length > 1 && !row.unfolded;
+    const end = folded ? runEnd(row.run, now) : spanEnd(span, now);
     body = (
       <>
         <div className="flex items-center gap-2">
@@ -845,8 +876,10 @@ function Tooltip({
             className="size-2 shrink-0 rounded-full"
             style={{ background: KIND_COLOR[span.kind] }}
           />
-          <span className="font-medium">{span.label}</span>
-          <span className="text-white/50">{KIND_LABEL[span.kind].toLowerCase()}</span>
+          <span className="max-w-72 truncate font-medium">{rowText(span)}</span>
+          <span className="shrink-0 text-white/50">
+            {folded ? `×${row.run.length} calls` : KIND_LABEL[span.kind].toLowerCase()}
+          </span>
         </div>
         <div className="tnum mt-0.5 text-white/60">
           {clockTime(span.start)}

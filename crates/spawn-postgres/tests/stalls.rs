@@ -122,6 +122,7 @@ fn each_open_task_comes_with_its_steps_record_and_its_age_on_the_databases_clock
         EventKind::ToolStarted {
             tool_name: "Bash".to_string(),
             tool_use_id: "toolu_1".to_string(),
+            summary: None,
         },
     );
     let shells = "✻ Sautéed for 6s · done 11:27 PM · 2 shells still running";
@@ -294,6 +295,7 @@ fn a_waiting_input_does_not_move_the_sessions_latest_fact() {
         EventKind::ToolStarted {
             tool_name: "Bash".to_string(),
             tool_use_id: "toolu_1".to_string(),
+            summary: None,
         },
     );
     let latest = |facts: &Value| {

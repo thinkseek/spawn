@@ -107,6 +107,110 @@ pub fn utc_ms(text: &str) -> Option<i64> {
     Some((((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis - offset_ms)
 }
 
+/// The longest summary a `tool.started` keeps.
+pub const TOOL_SUMMARY_CHARS: usize = 160;
+
+/// `text` shortened to [`TOOL_SUMMARY_CHARS`] characters, an ellipsis
+/// marking a cut.
+fn summary_cut(text: &str) -> String {
+    if text.chars().count() <= TOOL_SUMMARY_CHARS {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(TOOL_SUMMARY_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
+/// A string field of a tool call's input, trimmed and not empty.
+fn input_text<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+/// A tool call's key input in a few words, read from its `input` by tool:
+/// Bash's command (its first line), the path an Edit, Write or Read works
+/// on (a Read with its line range), a Grep's pattern and where, a Glob's
+/// pattern, a Task's description, a fetched URL's host and path, a
+/// search's words, a todo list's length. None for any other tool or an
+/// input without the field. Credentials are redacted before the text is
+/// cut ([`crate::redact::redact`]: a cut first could leave half a token
+/// the redactor no longer knows), and the event's redaction runs again
+/// when it is stored.
+pub fn tool_summary(tool: &str, input: Option<&Value>) -> Option<String> {
+    let input = input?;
+    let text = match tool {
+        "Bash" => {
+            let command = input_text(input, "command")?;
+            let first = command
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())?;
+            if command
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+                > 1
+            {
+                format!("{first} …")
+            } else {
+                first.to_string()
+            }
+        }
+        "Edit" | "MultiEdit" | "Write" => input_text(input, "file_path")?.to_string(),
+        "NotebookEdit" => input_text(input, "notebook_path")?.to_string(),
+        "Read" => {
+            let path = input_text(input, "file_path")?;
+            let offset = input.get("offset").and_then(Value::as_u64);
+            let limit = input.get("limit").and_then(Value::as_u64);
+            match (offset, limit) {
+                (Some(offset), Some(limit)) => {
+                    format!(
+                        "{path}:{offset}-{}",
+                        offset.saturating_add(limit).saturating_sub(1)
+                    )
+                }
+                (Some(offset), None) => format!("{path}:{offset}-"),
+                (None, Some(limit)) => format!("{path}:1-{limit}"),
+                (None, None) => path.to_string(),
+            }
+        }
+        "Grep" => {
+            let pattern = input_text(input, "pattern")?;
+            match input_text(input, "path").or_else(|| input_text(input, "glob")) {
+                Some(place) => format!("\"{pattern}\" in {place}"),
+                None => format!("\"{pattern}\""),
+            }
+        }
+        "Glob" => match (input_text(input, "pattern")?, input_text(input, "path")) {
+            (pattern, Some(path)) => format!("{pattern} in {path}"),
+            (pattern, None) => pattern.to_string(),
+        },
+        "Task" | "Agent" => input_text(input, "description")?.to_string(),
+        "WebFetch" => {
+            // Host and path: the query, the fragment and any user:password@
+            // can carry a credential, and the page is enough.
+            let url = input_text(input, "url")?;
+            let page = url.split(['?', '#']).next().unwrap_or(url);
+            let page = page.split_once("://").map_or(page, |(_, rest)| rest);
+            let host_end = page.find('/').unwrap_or(page.len());
+            match page[..host_end].rfind('@') {
+                Some(at) => page[at + 1..].to_string(),
+                None => page.to_string(),
+            }
+        }
+        "WebSearch" => input_text(input, "query")?.to_string(),
+        "TodoWrite" => {
+            let items = input.get("todos").and_then(Value::as_array)?.len();
+            format!("{items} item{}", if items == 1 { "" } else { "s" })
+        }
+        _ => return None,
+    };
+    Some(summary_cut(&crate::redact::redact(&text)))
+}
+
 fn block_type(block: &Value) -> Option<&str> {
     block.get("type").and_then(Value::as_str)
 }
@@ -518,6 +622,7 @@ pub fn claude_line(line: &str) -> Vec<Normalized> {
                     EventKind::ToolStarted {
                         tool_name: name.to_string(),
                         tool_use_id: id.to_string(),
+                        summary: tool_summary(name, block.get("input")),
                     },
                     format!("{id}:started"),
                 ))
@@ -1103,6 +1208,165 @@ mod tests {
                 "",
             );
             assert_eq!(jobs(&monitor), [started("bv41gl0hm", JobKind::Monitor)]);
+        }
+    }
+
+    mod tool_summaries {
+        use crate::event::EventKind;
+        use crate::ingest::{TOOL_SUMMARY_CHARS, claude_line, tool_summary};
+        use serde_json::json;
+
+        fn summary(tool: &str, input: &serde_json::Value) -> Option<String> {
+            tool_summary(tool, Some(input))
+        }
+
+        /// A transcript line's tool call carries its key input as the
+        /// event's `summary`.
+        #[test]
+        fn a_tool_call_line_carries_its_summary() {
+            let line = r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test -p spawn-cli\necho done","description":"run the tests"}}],"stop_reason":"tool_use"}}"#;
+            let events = claude_line(line);
+            let kinds: Vec<&EventKind> = events.iter().map(|normalized| &normalized.kind).collect();
+            assert!(
+                matches!(
+                    kinds.as_slice(),
+                    [EventKind::ToolStarted { tool_name, summary: Some(summary), .. }]
+                        if tool_name == "Bash" && summary == "cargo test -p spawn-cli …"
+                ),
+                "{kinds:?}"
+            );
+        }
+
+        #[test]
+        fn each_tool_says_its_key_input() {
+            assert_eq!(
+                summary("Bash", &json!({"command": "  git status  "})).as_deref(),
+                Some("git status")
+            );
+            assert_eq!(
+                summary(
+                    "Edit",
+                    &json!({"file_path": "crates/spawn-cli/src/integrate.rs", "old_string": "a"})
+                )
+                .as_deref(),
+                Some("crates/spawn-cli/src/integrate.rs")
+            );
+            assert_eq!(
+                summary("Write", &json!({"file_path": ".spawn/report.md"})).as_deref(),
+                Some(".spawn/report.md")
+            );
+            assert_eq!(
+                summary(
+                    "Read",
+                    &json!({"file_path": "docs/protocol.md", "offset": 120, "limit": 61})
+                )
+                .as_deref(),
+                Some("docs/protocol.md:120-180")
+            );
+            assert_eq!(
+                summary("Read", &json!({"file_path": "a.rs", "limit": 40})).as_deref(),
+                Some("a.rs:1-40")
+            );
+            assert_eq!(
+                summary("Read", &json!({"file_path": "a.rs"})).as_deref(),
+                Some("a.rs")
+            );
+            assert_eq!(
+                summary(
+                    "Grep",
+                    &json!({"pattern": "fn step", "path": "crates/spawn-cli"})
+                )
+                .as_deref(),
+                Some("\"fn step\" in crates/spawn-cli")
+            );
+            assert_eq!(
+                summary("Grep", &json!({"pattern": "x", "glob": "*.rs"})).as_deref(),
+                Some("\"x\" in *.rs")
+            );
+            assert_eq!(
+                summary("Glob", &json!({"pattern": "rsi/scenarios/0*.sh"})).as_deref(),
+                Some("rsi/scenarios/0*.sh")
+            );
+            assert_eq!(
+                summary("Task", &json!({"description": "find the retry path"})).as_deref(),
+                Some("find the retry path")
+            );
+            assert_eq!(
+                summary(
+                    "WebFetch",
+                    &json!({"url": "https://docs.rs/tokio/latest?token=abc#x"})
+                )
+                .as_deref(),
+                Some("docs.rs/tokio/latest"),
+                "the scheme, query and fragment go"
+            );
+            assert_eq!(
+                summary(
+                    "WebFetch",
+                    &json!({"url": "https://bot:hunter2@example.com/a@b/c"})
+                )
+                .as_deref(),
+                Some("example.com/a@b/c"),
+                "credentials before the host go; an @ in the path stays"
+            );
+            assert_eq!(
+                summary("TodoWrite", &json!({"todos": [{}, {}, {}]})).as_deref(),
+                Some("3 items")
+            );
+            assert_eq!(
+                summary("ScheduleWakeup", &json!({"delaySeconds": 60})),
+                None,
+                "a tool with no key input"
+            );
+            assert_eq!(summary("Bash", &json!({"description": "no command"})), None);
+            assert_eq!(tool_summary("Bash", None), None);
+        }
+
+        /// A command's credentials never reach the summary: an assignment's
+        /// value, a bearer token, a URL's password, an API key.
+        #[test]
+        fn a_summary_loses_the_credentials_a_command_carries() {
+            assert_eq!(
+                summary(
+                    "Bash",
+                    &json!({"command": "PGPASSWORD=s3cret psql -h db -U spawn"})
+                )
+                .as_deref(),
+                Some("PGPASSWORD=[redacted] psql -h db -U spawn")
+            );
+            let curl = summary(
+                "Bash",
+                &json!({"command": "curl -H \"Authorization: Bearer abcdef0123456789abcdef\" https://api.example/v1"}),
+            )
+            .unwrap_or_default();
+            assert!(!curl.contains("abcdef0123456789abcdef"), "{curl}");
+            let url = summary(
+                "Bash",
+                &json!({"command": "psql postgres://spawn:pa55w0rd@db:5432/spawn"}),
+            )
+            .unwrap_or_default();
+            assert!(!url.contains("pa55w0rd"), "{url}");
+            let key = summary(
+                "Bash",
+                &json!({"command": "export X=sk-0123456789abcdefghij; run"}),
+            )
+            .unwrap_or_default();
+            assert!(!key.contains("sk-0123456789abcdefghij"), "{key}");
+        }
+
+        /// The redaction runs before the cut: a key that the cut would split
+        /// is gone whole, and a long summary is at most the limit.
+        #[test]
+        fn a_long_summary_is_cut_after_its_credentials_go() {
+            let command = format!("{} sk-{}", "x".repeat(150), "a".repeat(30));
+            let cut = summary("Bash", &json!({ "command": command })).unwrap_or_default();
+            assert!(
+                cut.chars().count() <= TOOL_SUMMARY_CHARS,
+                "{}",
+                cut.chars().count()
+            );
+            assert!(cut.ends_with('…'));
+            assert!(!cut.contains("sk-aaaa"), "{cut}");
         }
     }
 }

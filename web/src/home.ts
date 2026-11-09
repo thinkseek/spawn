@@ -11,7 +11,7 @@
 import type { Alert } from "./api";
 import type { Attention, AttentionItem } from "./attention";
 import { itemSince, questionSummary } from "./attention.ts";
-import type { FleetAgent, FleetHealth } from "./fleet";
+import type { Activity, FleetAgent, FleetHealth } from "./fleet";
 import type { Mission, Missions, MissionTask } from "./missions";
 import type { FleetContext, TaskRef } from "./ordering";
 import {
@@ -466,11 +466,20 @@ const STATE_WORDS: Record<string, string> = {
   UNKNOWN: "state unknown",
 };
 
+/** The open tool call in one line: `Bash · cargo test -p spawn-cli`, or the
+ * tool alone when its call carries no summary; null when no tool is open. */
+export function currentToolText(activity: Activity): string | null {
+  if (!activity.current_tool) return null;
+  const summary = activity.current_tool_summary;
+  return summary ? `${activity.current_tool} · ${summary}` : activity.current_tool;
+}
+
 /** What an agent is doing, in words: its open tool, its background job,
  * else its task's step, else its judged state. */
 export function doingWords(agent: FleetAgent, task: TaskRef | null): string {
   const activity = agent.activity;
-  if (activity.current_tool) return `running ${activity.current_tool}`;
+  const tool = currentToolText(activity);
+  if (tool) return `running ${tool}`;
   const job = activity.jobs[0];
   if (job) return `waiting on its background ${job.kind} job`;
   if (task && task.label !== "assigned" && task.label !== "delivered" && agent.state !== "WORKING") return task.label;

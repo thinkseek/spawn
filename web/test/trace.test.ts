@@ -2,7 +2,19 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { TimelineEvent } from "../src/api.ts";
-import { chainOf, deriveTrace, spanEnd, spanEvents, visibleSpans } from "../src/trace.ts";
+import {
+  chainOf,
+  deriveTrace,
+  foldRuns,
+  recentToolRows,
+  rowText,
+  shortPath,
+  shortSummary,
+  spanEnd,
+  spanEvents,
+  toolOutcome,
+  visibleSpans,
+} from "../src/trace.ts";
 
 const T0 = 1_780_000_000_000;
 
@@ -337,4 +349,127 @@ test("span ids survive new events, so a selection stays on its span", () => {
   ]);
   const after = new Set(deriveTrace(more, T0).spans.map((s) => s.id));
   for (const id of before) assert.ok(after.has(id), id);
+});
+
+test("a tool row reads as the tool and its key input; a call recorded without one reads as the tool", () => {
+  const trace = deriveTrace(
+    timeline([
+      ["execution.started", 0, { engine: "claude" }],
+      ["message.received", 1],
+      ["tool.started", 2, { tool_name: "Bash", tool_use_id: "a", summary: "cargo test -p spawn-cli" }],
+      ["tool.completed", 3, { tool_use_id: "a" }],
+      ["tool.started", 4, { tool_name: "Edit", tool_use_id: "b", summary: "crates/spawn-cli/src/integrate.rs" }],
+      ["tool.completed", 5, { tool_use_id: "b" }],
+      ["tool.started", 6, { tool_name: "Read", tool_use_id: "c", summary: "/data/tmp/ccd/rev-b/docs/protocol.md:120-180" }],
+      ["tool.completed", 7, { tool_use_id: "c" }],
+      ["tool.started", 8, { tool_name: "Bash", tool_use_id: "d" }],
+      ["tool.completed", 9, { tool_use_id: "d" }],
+      ["tool.started", 10, { tool_name: "Bash", tool_use_id: "e", summary: `echo ${"x".repeat(100)}` }],
+      ["tool.completed", 11, { tool_use_id: "e" }],
+    ]),
+    T0,
+  );
+  const tools = trace.spans.filter((span) => span.kind === "tool");
+  assert.deepEqual(tools.slice(0, 4).map(rowText), [
+    "Bash · cargo test -p spawn-cli",
+    "Edit · crates/…/integrate.rs",
+    "Read · /data/…/protocol.md:120-180",
+    "Bash",
+  ]);
+  const long = rowText(tools[4]);
+  assert.equal(long.length, "Bash · ".length + 80, "a command shows its first 80 characters");
+  assert.ok(long.endsWith("…"));
+  assert.equal(tools[4].summary, `echo ${"x".repeat(100)}`, "the span keeps the whole summary");
+  assert.equal(shortPath("docs/design.md"), "docs/design.md", "a short path stays whole");
+  assert.equal(shortSummary("Bash", "cd /data/tmp/ccd/wt && cargo test -p spawn-cli"), "cargo test -p spawn-cli");
+  assert.equal(shortSummary("Bash", 'cd "/a b"; git status'), "git status");
+  assert.equal(shortSummary("Bash", "cd /data/tmp"), "cd /data/tmp", "a bare cd is the command");
+});
+
+test("a failed tool's outcome is `exit N` or its error's first line", () => {
+  assert.equal(toolOutcome("Exit code 137\nKilled"), "exit 137");
+  assert.equal(toolOutcome("Error: Exit code 2"), "exit 2");
+  assert.equal(toolOutcome("\nFile has not been read yet. Read it first.\nmore"), "File has not been read yet. Read it first.");
+  assert.equal(toolOutcome(null), "failed");
+  assert.equal(toolOutcome(""), "failed");
+});
+
+test("consecutive identical calls fold into one row; different inputs, no input, a failure or an open call do not", () => {
+  const call = (id: string, at: number, summary?: string, end = "tool.completed", detail: object = {}) =>
+    [
+      ["tool.started", at, { tool_name: "Bash", tool_use_id: id, ...(summary ? { summary } : {}) }],
+      [end, at + 0.5, { tool_use_id: id, ...detail }],
+    ] as Array<[string, number, unknown]>;
+  const trace = deriveTrace(
+    timeline([
+      ["execution.started", 0, { engine: "claude" }],
+      ["message.received", 1],
+      ...call("a", 2, "git status"),
+      ...call("b", 3, "git status"),
+      ...call("c", 4, "git status"),
+      ...call("d", 5, "git diff"),
+      ...call("e", 6),
+      ...call("f", 7),
+      ...call("g", 8, "git diff", "tool.failed", { error: "Exit code 1" }),
+      ...call("h", 9, "git diff", "tool.failed", { error: "Exit code 1" }),
+      ...call("i", 10, "git diff"),
+      ["tool.started", 11, { tool_name: "Bash", tool_use_id: "j", summary: "git diff" }],
+    ]),
+    T0 + 20_000,
+  );
+  const spans = visibleSpans(trace, new Set());
+  const rows = foldRuns(spans, new Set());
+  const words = (list: typeof rows) =>
+    list.map((row) => `${rowText(row.span)}${row.run.length > 1 ? ` ×${row.run.length}` : ""}${row.span.failed ? ` (${row.span.outcome})` : ""}`);
+  assert.deepEqual(words(rows), [
+    "execution · claude",
+    "turn 1",
+    "Bash · git status ×3",
+    "Bash · git diff",
+    "Bash",
+    "Bash",
+    "Bash · git diff ×2 (exit 1)",
+    "Bash · git diff",
+    "Bash · git diff",
+  ]);
+  const run = rows[2];
+  assert.equal(run.run[0].start, T0 + 2000);
+  assert.equal(run.run[2].end, T0 + 4500);
+
+  // Opened, the run keeps its row and lists each call after it.
+  const opened = foldRuns(spans, new Set([run.span.id]));
+  assert.equal(opened.length, rows.length + 2);
+  assert.deepEqual(
+    opened.slice(2, 5).map((row) => [row.span.startEvent?.detail, row.run.length, row.unfolded]),
+    [
+      [{ tool_name: "Bash", tool_use_id: "a", summary: "git status" }, 3, true],
+      [{ tool_name: "Bash", tool_use_id: "b", summary: "git status" }, 1, false],
+      [{ tool_name: "Bash", tool_use_id: "c", summary: "git status" }, 1, false],
+    ],
+  );
+});
+
+test("the agent page's tool rows: the newest calls across turns, folded, oldest first", () => {
+  const events = timeline([
+    ["execution.started", 0, { engine: "claude" }],
+    ["message.received", 1],
+    ["tool.started", 2, { tool_name: "Read", tool_use_id: "a", summary: "a.rs" }],
+    ["tool.completed", 3, { tool_use_id: "a" }],
+    ["turn.stopped", 4],
+    ["message.received", 5],
+    ["tool.started", 6, { tool_name: "Bash", tool_use_id: "b", summary: "git status" }],
+    ["tool.completed", 7, { tool_use_id: "b" }],
+    ["tool.started", 8, { tool_name: "Bash", tool_use_id: "c", summary: "git status" }],
+    ["tool.completed", 9, { tool_use_id: "c" }],
+    ["tool.started", 10, { tool_name: "Edit", tool_use_id: "d", summary: "b.rs" }],
+  ]);
+  const rows = recentToolRows(events, T0 + 20_000, 2);
+  assert.deepEqual(
+    rows.map((row) => [rowText(row.span), row.run.length, row.span.state]),
+    [
+      ["Bash · git status", 2, "closed"],
+      ["Edit · b.rs", 1, "open"],
+    ],
+  );
+  assert.equal(recentToolRows(events, T0 + 20_000).length, 3);
 });

@@ -64,6 +64,10 @@ export interface BackgroundJob {
 
 export interface Activity {
   current_tool: string | null;
+  /** The open tool call's key input (its command's first line, its file,
+   * its pattern), redacted and cut to 160 characters by the server; null
+   * when the call has none or was recorded before calls carried one. */
+  current_tool_summary: string | null;
   /** Open background jobs of the live execution, oldest first. */
   jobs: BackgroundJob[];
   last_event_name: string | null;
@@ -350,6 +354,7 @@ function normalizeAgent(value: unknown): FleetAgent | null {
     task: optionalText(raw.task),
     activity: {
       current_tool: optionalText(activity.current_tool),
+      current_tool_summary: optionalText(activity.current_tool_summary),
       jobs: normalizeJobs(activity.jobs),
       last_event_name: optionalText(activity.last_event_name),
       last_event_at_ms: optionalNumber(activity.last_event_at_ms),

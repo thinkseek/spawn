@@ -66,6 +66,11 @@ impl Snapshot {
         self.evidence_seq = self.evidence_seq.max(record.session_seq);
     }
 
+    fn tool_started(&mut self, tool_name: &str, tool_use_id: &str) {
+        self.last_tool = Some(tool_name.to_string());
+        self.open_tools.insert(tool_use_id.to_string());
+    }
+
     /// Apply one event.
     pub(super) fn apply(&mut self, record: &EventRecord) {
         self.note_times(record);
@@ -129,10 +134,8 @@ impl Snapshot {
             EventKind::ToolStarted {
                 tool_name,
                 tool_use_id,
-            } => {
-                self.last_tool = Some(tool_name.clone());
-                self.open_tools.insert(tool_use_id.clone());
-            }
+                ..
+            } => self.tool_started(tool_name, tool_use_id),
             EventKind::ToolCompleted { tool_use_id, .. }
             | EventKind::ToolFailed { tool_use_id, .. } => {
                 self.open_tools.remove(tool_use_id);
