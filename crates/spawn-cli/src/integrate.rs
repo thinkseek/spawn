@@ -37,8 +37,13 @@
 //!    the pass that reaps that judging applies it before any new gate
 //!    starts, so the judging's verdict is on the main it ran against, never
 //!    `stale` because of the owner. A judging of another source goes on. A
-//!    judging in flight is never stopped, and the integrator is never
-//!    stopped for an owner's landing. A gated request (`spawn mission push
+//!    judging in flight is never stopped but by an urgent request
+//!    (`--urgent`, D2): a task's judging on its source is stopped (its gate
+//!    killed) and records itself discarded by the request (`task.gated`
+//!    `stale`, found `discarded`, the request and the owner's reason),
+//!    counted nowhere, and the request is applied or judged at the pass
+//!    that reaps it; an owner judging is never stopped. The integrator is
+//!    never stopped for an owner's landing. A gated request (`spawn mission push
 //!    --gated`) is not applied here: it is an owner judging, a judging of its
 //!    source started ahead of the source's ready tasks (never in place of a
 //!    running judging, within the same caps): the mission's gate judges the
@@ -1619,6 +1624,45 @@ struct Judge {
     /// warm ([`Integrator::poll_warm`]): a thread cannot start the warm
     /// itself (its parent-death signal follows the thread that spawned it).
     landed: Arc<std::sync::Mutex<Vec<warm::Want>>>,
+    /// The stop of the judging this clone runs (set on its thread's clone,
+    /// [`Integrator::start_judging`]); None on the main thread's.
+    stop: Option<Arc<Stop>>,
+}
+
+/// The stop of one judging in flight: an owner's urgent landing on its
+/// source (design-owner-push-between-gates.md, D2) sets `by` and then
+/// `flag`, which kills its gate ([`gate::stop_with`]); the judging then
+/// records itself discarded by that request, never a verdict on the work.
+#[derive(Default)]
+struct Stop {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    /// The request that stopped it, and the owner's reason.
+    by: std::sync::Mutex<Option<(i64, Option<String>)>>,
+}
+
+impl Stop {
+    /// Stop the judging for `request` (the owner's `reason`); false when it
+    /// was stopped already.
+    fn stop(&self, request: i64, reason: Option<String>) -> bool {
+        let mut by = self
+            .by
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if by.is_some() {
+            return false;
+        }
+        *by = Some((request, reason));
+        self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
+    /// The request that stopped the judging, if one did.
+    fn by(&self) -> Option<(i64, Option<String>)> {
+        self.by
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// The settings of host faults: the test database's log
@@ -1787,6 +1831,8 @@ struct Running {
     /// The owner's request this judging judges (an owner judging,
     /// [`Integrator::start_owner`]); None for a task's.
     owner: Option<i64>,
+    /// Its stop, for an owner's urgent landing on its source ([`Stop`]).
+    stop: Arc<Stop>,
     handle: std::thread::JoinHandle<()>,
 }
 
@@ -1850,6 +1896,7 @@ impl Integrator {
                 host: HostSettings::from_env(),
                 room: host_room,
                 landed: Arc::new(std::sync::Mutex::new(Vec::new())),
+                stop: None,
             },
             gates,
             cpu: None,
@@ -2099,16 +2146,40 @@ impl Integrator {
             .collect();
         let mut owner_moved = Vec::new();
         let mut owner_judge = Vec::new();
+        let mut urgent = Vec::new();
         let pending = owner::apply_pending(
             store,
             &mut owner_moved,
             &busy,
             &mut self.owner.borrow_mut(),
             &mut owner_judge,
+            &mut urgent,
         )?;
+        self.stop_for(&urgent);
         let steps = self.steps(store, &pending, &owner_moved, owner_judge);
         self.poll_warm();
         steps
+    }
+
+    /// Stop the task judgings in flight on the sources of `urgent` (the
+    /// owner's urgent requests step 0 found waiting, D2), each once: its
+    /// gate is killed, and it records itself discarded by the request
+    /// ([`Stop`]). An owner judging is never stopped.
+    fn stop_for(&self, urgent: &[owner::Request]) {
+        for request in urgent {
+            for gate in self.running.borrow().iter() {
+                if gate.source == request.source
+                    && gate.owner.is_none()
+                    && gate.stop.stop(request.id, request.reason.clone())
+                {
+                    println!(
+                        "integrate: the owner's urgent landing of {} on {} (request {}) stops the \
+                         judging of task {} (mission {}): discarded, judged again on the new main",
+                        request.commit, request.source, request.id, gate.task, gate.mission
+                    );
+                }
+            }
+        }
     }
 
     /// Every mission's step, after the holds past their bound and step 0:
@@ -2309,6 +2380,7 @@ impl Integrator {
             shares_server,
             jobs: jobs.unwrap_or(0),
             owner: Some(id),
+            stop: Arc::new(Stop::default()),
             handle,
         });
     }
@@ -2559,12 +2631,17 @@ impl Integrator {
                 task.id
             );
         }
-        let judge = self.judge.clone();
+        let mut judge = self.judge.clone();
+        let stop = Arc::new(Stop::default());
+        judge.stop = Some(Arc::clone(&stop));
         let task_id = task.id;
         let (store, source_owned) = (Arc::clone(store), source.clone());
         let handle = std::thread::Builder::new()
             .name(format!("gate-{task_id}"))
             .spawn(move || {
+                if let Some(stop) = &judge.stop {
+                    gate::stop_with(Arc::clone(&stop.flag));
+                }
                 judged_or_aborted(&store, &task, &main, mission_id, || {
                     judge.judge(
                         &store,
@@ -2599,6 +2676,7 @@ impl Integrator {
             shares_server,
             jobs: jobs.unwrap_or(0),
             owner: None,
+            stop,
             handle,
         });
         Ok(())
@@ -2867,6 +2945,30 @@ impl Judge {
         let moved: std::cell::OnceCell<Result<Option<String>, String>> = std::cell::OnceCell::new();
         let main_now = || moved.get_or_init(|| main_moved(source, main)).clone();
         let gated = |verdict: &str, extra: Value| -> Result<(), String> {
+            // Stopped for an owner's urgent landing (D2): whatever the gate
+            // found but an acceptance (which lands as usual), the judging is
+            // discarded by that request, `stale`, counted nowhere, and the
+            // task is judged again on the main the owner lands.
+            if verdict != "accepted"
+                && let Some((request, reason)) = self.stop.as_ref().and_then(|stop| stop.by())
+            {
+                let mut discarded = json!({"type": "task.gated", "id": task.id,
+                "verdict": "stale", "found": "discarded", "revision": task.revisions,
+                "base": main, "scenarios": count, "request": request,
+                "reason": format!(
+                    "discarded by the owner's urgent landing (request {request}){}",
+                    reason.map(|reason| format!(": {reason}")).unwrap_or_default()
+                )});
+                if let Some(log) = extra.get("log") {
+                    discarded["log"] = log.clone();
+                }
+                record(store, &discarded)?;
+                println!(
+                    "integrate: task {} gated: stale (discarded by the owner's request {request})",
+                    task.id
+                );
+                return Ok(());
+            }
             let mut unread = None;
             // Main moved while the gate ran: what it found is about a main
             // that is no longer main, so it is `stale`, judged again on the
@@ -12461,6 +12563,103 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// An urgent owner's request (`spawn mission push --urgent`,
+    /// design-owner-push-between-gates.md, D2) stops the task's gate in
+    /// flight on its source: the gate is killed, not waited for, and the
+    /// task's judging records itself discarded by the request (`stale`,
+    /// found `discarded`, the request and the owner's reason), counted
+    /// nowhere. The next pass applies the request, and the task is judged
+    /// again on the owner's main. A request that is not urgent waits for
+    /// the gate (D1, above).
+    #[test]
+    fn an_urgent_owner_push_stops_the_gate_in_flight_and_discards_it() {
+        let marks = fresh_marks("spawn-owner-urgent");
+        let release = Release(marks.clone());
+        let gate = gate_holding_then(&marks, "", "{\"verdict\":\"accepted\"}", 0);
+        let (base, source, scenarios, integrator) = world("owner-urgent", &gate);
+        let db = Db::new("owner_urgent");
+        let m0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let before = gated(&db, mission);
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        push_work(&base, &source, &agent, "work.txt");
+        let _ = std::fs::remove_file(marks.join("release"));
+        integrator.pass_on(&db.store).expect("a pass");
+        assert_eq!(wait_started(&marks, 1).len(), 1, "the task's gate started");
+
+        let commit = owner_commit(&base, &source, "FIX.md", "fix\n", "owner: fix 046");
+        let request = db
+            .store
+            .source_push_request(
+                &source,
+                &commit,
+                &super::owner::owner_ref(&commit),
+                &spawn_postgres::PushRequest {
+                    urgent: true,
+                    reason: Some("046 is red on main".to_string()),
+                    ..spawn_postgres::PushRequest::default()
+                },
+            )
+            .expect("the urgent request");
+        // A gate that is not stopped is released after 300 s (a guard
+        // against a hang only): it then lands `accepted`, and the test fails.
+        let watchdog = marks.join("release");
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_mins(5));
+            let _ = std::fs::write(watchdog, "");
+        });
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass that stops it");
+        assert_eq!(source_main(&source), m0, "nothing moves under the gate");
+        integrator.settle();
+        assert!(!marks.join("release").exists(), "never released");
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["verdict"], "stale", "{record}");
+        assert_eq!(record["found"], "discarded");
+        assert_eq!(record["request"], json!(request));
+        assert_eq!(
+            record["reason"],
+            format!(
+                "discarded by the owner's urgent landing (request {request}): 046 is red on main"
+            )
+        );
+        let after = gated(&db, mission);
+        assert_eq!(after.gate_aborts, before.gate_aborts, "counted nowhere");
+        assert_eq!(after.gate_rejections, before.gate_rejections);
+        assert!(control_records(&db, "source.moved").is_empty());
+
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.pass_on(&db.store).expect("the pass after it");
+        let moved = control_records(&db, "source.moved");
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(moved[0]["request"], json!(request));
+        assert_eq!(moved[0]["from"], m0.as_str());
+        let owner_main = source_main(&source);
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass that judges again");
+        integrator.settle();
+        assert_eq!(verdicts(&db, task), vec!["stale", "accepted"]);
+        let judged = started(&marks);
+        assert_eq!(judged.len(), 2, "{judged:?}");
+        assert_eq!(
+            git(&[
+                "--git-dir",
+                &source,
+                "rev-parse",
+                &format!("{}^1", source_main(&source))
+            ])
+            .expect("first parent"),
+            owner_main,
+            "judged again and landed on the owner's main"
+        );
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
+    }
+
     /// A red main (design-main-red.md) is a fact about the main the gate
     /// judged against: when main moved while the gate ran, no
     /// `source.main_red` is written for a main that is no longer main, and
@@ -13126,6 +13325,7 @@ mod database_tests {
             shares_server: false,
             jobs: 2,
             owner: None,
+            stop: std::sync::Arc::new(super::Stop::default()),
             handle: std::thread::spawn(move || {
                 let _ = waiting.recv();
             }),

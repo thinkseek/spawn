@@ -38,7 +38,7 @@ const USAGE: &str = "usage:
       each with its title, plus the counts of solved and met
   spawn mission resume --id N
   spawn mission push --source <path> --commit <commit> [--repo <dir>] [--wait <seconds>]
-                     [--gated] [--reason <text>]
+                     [--gated] [--urgent] [--reason <text>]
       (owner: land a commit on a mission source's main. <commit> is resolved in the git
        repository of the current directory (--repo: another), or is already in the source;
        it is put in the source at refs/spawn-owner/<hash>, no branch moves, and the request
@@ -51,8 +51,10 @@ const USAGE: &str = "usage:
        stopped for it. --gated: the source's gate judges the landing first, as a judging of
        its own taken before the source's next task, with the commit's own scenarios: moved
        when accepted, source.push_refused (with the gate's reason and log) when rejected,
-       pending again after a host fault or no room. --reason: the owner's words, on the
-       record. --wait: wait that long for
+       pending again after a host fault or no room. --urgent: a judging of a task in flight
+       on the source is stopped and recorded as discarded by this request (stale, counted
+       nowhere; the task is judged again on the new main), for a fix of a red main.
+       --reason: the owner's words, on the record. --wait: wait that long for
        the outcome and print it; exit 0 applied, 1 refused, 3 still pending)
   spawn mission moved --source <path> --from <commit> --to <commit>   (owner: a deploy moved main)
       (recorded as source.moved for every deploy, also when no mission's baseline moves;
@@ -204,7 +206,7 @@ fn split_mission(rest: &[String]) -> Result<(&str, Flags), String> {
     let switches: &[&str] = if verb == "configure" {
         &CLEARING.map(|(switch, _, _)| switch)
     } else if verb == "push" {
-        &["gated"]
+        &["gated", "urgent"]
     } else {
         &[]
     };
@@ -576,7 +578,7 @@ fn push(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<i32, Str
     };
     let how = spawn_postgres::PushRequest {
         gated: flags.switch("gated"),
-        urgent: false,
+        urgent: flags.switch("urgent"),
         reason: flags
             .get("reason")
             .filter(|reason| !reason.trim().is_empty()),

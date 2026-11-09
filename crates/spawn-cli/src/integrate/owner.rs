@@ -46,6 +46,12 @@
 //! already holding it) and hands it to the integrator, which starts an owner
 //! judging ([`super::Judge::judge_owner`]) ahead of the source's ready
 //! tasks; the later requests of its source wait behind it.
+//!
+//! An urgent request (`--urgent`, D2), gated or not, does not wait out a
+//! task's judging in flight on its source: step 0 names it to the
+//! integrator, which stops that judging (`Integrator::stop_for`); the
+//! judging records itself discarded by the request, and the request is
+//! applied or judged at the pass that reaps it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -84,6 +90,10 @@ pub(super) struct Request {
     /// ([`Outcome::Judge`]).
     #[serde(default)]
     pub(super) gated: bool,
+    /// `--urgent`: the judging in flight on its source is stopped and
+    /// discarded for it (D2), so it is applied or judged at the next pass.
+    #[serde(default)]
+    pub(super) urgent: bool,
     /// The owner's reason, as given.
     #[serde(default)]
     pub(super) reason: Option<String>,
@@ -151,6 +161,7 @@ pub(super) fn apply_pending(
     busy: &HashSet<String>,
     kept: &mut Kept,
     judge: &mut Vec<Request>,
+    urgent: &mut Vec<Request>,
 ) -> Result<HashMap<String, i64>, String> {
     let requests = pending(store)?;
     kept.said
@@ -173,6 +184,11 @@ pub(super) fn apply_pending(
         // A judging of the source is in flight: main moves after it, never
         // under it (its verdict would be stale), at the pass that reaps it.
         if busy.contains(&request.source) {
+            // Urgent (D2): that judging is stopped and discarded for it; the
+            // request is applied (or judged) at the pass that reaps it.
+            if request.urgent {
+                urgent.push(request.clone());
+            }
             if kept.said.insert(request.id) {
                 println!("{said} waits for the judging in flight on its source");
             }

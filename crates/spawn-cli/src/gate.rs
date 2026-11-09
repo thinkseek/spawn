@@ -1575,6 +1575,33 @@ pub(crate) struct Run {
     pub(crate) stderr: String,
 }
 
+thread_local! {
+    /// This thread's stop: set ([`stop_with`]) on a judging's thread, so an
+    /// owner's urgent landing (design-owner-push-between-gates.md, D2) can
+    /// stop the gate it runs, and any gate it would start after.
+    static STOP: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The reason of the abort a stopped gate ends with ([`stop_with`]).
+pub(crate) const STOPPED: &str = "the gate was stopped (an owner's urgent landing)";
+
+/// Every gate this thread runs from now on is stopped (its group killed,
+/// [`GateFailure::Aborted`] with [`STOPPED`]) once `flag` is set; a gate
+/// it would start after that does not start.
+pub(crate) fn stop_with(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    STOP.with(|stop| *stop.borrow_mut() = Some(flag));
+}
+
+/// Whether this thread's gates are to stop.
+fn stopped() -> bool {
+    STOP.with(|stop| {
+        stop.borrow()
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+    })
+}
+
 /// Run a command with a wall clock and no stdin, its stdout and stderr in
 /// files in `directory`.
 ///
@@ -1590,6 +1617,12 @@ pub(crate) fn run_bounded(
 ) -> Result<Run, GateFailure> {
     use std::os::unix::process::CommandExt as _;
 
+    if stopped() {
+        return Err(GateFailure::Aborted {
+            reason: STOPPED.to_string(),
+            log: String::new(),
+        });
+    }
     let out_path = directory.join("stdout");
     let err_path = directory.join("stderr");
     let stdout = std::fs::File::create(&out_path).map_err(|error| failed(&error))?;
@@ -1617,6 +1650,15 @@ pub(crate) fn run_bounded(
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(GateFailure::Timeout);
+            }
+            Ok(None) if stopped() => {
+                kill_group();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(GateFailure::Aborted {
+                    reason: STOPPED.to_string(),
+                    log: std::fs::read_to_string(&out_path).unwrap_or_default(),
+                });
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(200)),
             Err(error) => {
@@ -1921,6 +1963,48 @@ mod tests {
         assert!(matches!(killed, Err(GateFailure::Timeout)));
         std::thread::sleep(Duration::from_secs(3));
         assert!(!marker.exists(), "the background child died with the gate");
+    }
+
+    /// A stop on the gate's thread (an owner's urgent landing,
+    /// [`super::stop_with`]) kills the whole group, as a timeout does, and
+    /// is an abort with [`super::STOPPED`]; a gate that thread would start
+    /// after it does not start.
+    #[test]
+    fn a_stop_kills_the_whole_group_and_starts_no_gate_after() {
+        let dir = std::env::temp_dir().join(format!("spawn-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let (running, marker, after) = (dir.join("running"), dir.join("marker"), dir.join("after"));
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_flag = std::sync::Arc::clone(&flag);
+        let script = format!(
+            "(sleep 2; touch {}) & touch {}; sleep 60",
+            marker.display(),
+            running.display()
+        );
+        let second = format!("touch {}", after.display());
+        let gate = std::thread::spawn(move || {
+            super::stop_with(thread_flag);
+            let first = bounded(&script, Duration::from_mins(5));
+            let second = bounded(&second, Duration::from_mins(5));
+            (first, second)
+        });
+        let deadline = Instant::now() + Duration::from_mins(5);
+        while !running.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(running.exists(), "the gate started");
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (first, second) = gate.join().expect("the gate's thread");
+        assert!(
+            matches!(&first, Err(GateFailure::Aborted { reason, .. }) if reason == super::STOPPED),
+            "{first:?}"
+        );
+        assert!(matches!(second, Err(GateFailure::Aborted { .. })));
+        assert!(!after.exists(), "no gate starts on a stopped thread");
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(!marker.exists(), "the background child died with the gate");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A stand-in gate: `body` runs as the gate script, with the usual

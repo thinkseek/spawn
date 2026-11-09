@@ -2096,7 +2096,15 @@ are per-agent uids or a mount per engine.
   with `verdict` and the gate's `log`; nothing moves and no mission counts
   it. No verdict (the host's fault, an abort, which is a harness error, no
   room, a gate that could not run): nothing is recorded, and the request is
-  judged again after the host-fault backoff. So the owner's landing is a record
+  judged again after the host-fault backoff. With `--urgent` (gated or
+  not; for a fix of a red `main`, D2) the request does not wait out a
+  task's judging in flight on its source: that judging is stopped (its
+  gate's process group killed, as at its wall clock) and records itself
+  discarded by the request, `task.gated` `stale` with `found` `discarded`,
+  the `request` and the owner's reason, counted nowhere; the task is
+  judged again on the new `main`, and the request is applied or judged at
+  the pass that reaps the stopped judging. An owner judging is never
+  stopped. So the owner's landing is a record
   (the request, then the outcome that names it), and the integrator acts on
   that record, never on a `main` that changed under it ([design.md](design.md)
   §14). `spawn mission moved` still records a move the owner made behind
