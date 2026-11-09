@@ -44,7 +44,10 @@
 #       300 is about twice the worst minute host load gave (152), and well
 #       under one minute of task 202's regression (142 -> 675, +530). So
 #       the lower minute judges what the loop does on every pass, at 150,
-#       and the higher one judges what it does once, at 300.
+#       and the higher one judges what it does once, at 300. What it
+#       gives up: a once-in-two-minutes cost under about 150 (142 + 140 <
+#       300) is never caught, where the single minute before caught it
+#       about 2 times in 3. A cost that small is not task 202's kind.
 #       The transactions printed beside the scans are not judged:
 #       pg_stat_database.xact_commit also counts the server's own
 #       (autovacuum and analyze after the busy setup), 159 to 300 a minute
@@ -472,8 +475,9 @@ done
 
 # --- (2) an idle minute ------------------------------------------------------------
 
-# Two idle minutes back to back, and the lower is the measure (the header
-# says why): the loop's own cost is the same in both, a host's is not.
+# Two idle minutes back to back (the header says why): the lower judges
+# what the loop does on every pass, at IDLE_MAX, and the higher what it
+# does once in the two, at twice that.
 idle_from=$(q "select coalesce(max(id), 0) from spawn_events")
 snapshot "$WORK/idle.before"
 sleep 60
@@ -485,18 +489,21 @@ first=$(delta "$WORK/idle.before" "$WORK/idle.mid")
 second=$(delta "$WORK/idle.mid" "$WORK/idle.after")
 echo "023: idle minutes: first ${first%% *} scans, second ${second%% *}"
 if [ "${second%% *}" -lt "${first%% *}" ]; then
-    idle_high=${first%% *}
+    high=$first
     set -- $second
 else
-    idle_high=${second%% *}
+    high=$second
     set -- $first
 fi
+idle_high=${high%% *}
+# The higher minute's tables, for its own message.
+idle_high_top=$(printf '%s\n' "$high" | cut -d' ' -f5-)
 idle_scans=$1 idle_seq=$2 idle_idx=$3 idle_xact=$4
 shift 4
 idle_top="$*"
 echo "023: idle minute: $idle_scans scans ($idle_seq sequential, $idle_idx by index), $idle_xact transactions, $idle_events events appended; most:$idle_top"
 [ "$idle_high" -le $((2 * IDLE_MAX)) ] ||
-    measured_fail "(2) the higher of the two idle minutes (no task open, no command pending, $idle_events events appended, nothing due) cost $idle_high table scans, more than $((2 * IDLE_MAX)) (twice IDLE_MAX): something reads everything once in the two minutes (a slower schedule than a minute, or a cost that settles), which the lower minute cannot see"
+    measured_fail "(2) the higher of the two idle minutes (no task open, no command pending, $idle_events events appended, nothing due) cost $idle_high table scans (most: $idle_high_top), more than $((2 * IDLE_MAX)) (twice IDLE_MAX): something reads everything once in the two minutes (a slower schedule than a minute, or a cost that settles), which the lower minute cannot see"
 [ "$idle_scans" -le "$IDLE_MAX" ] ||
     measured_fail "(2) an idle minute (no task open, no command pending, $idle_events events appended, nothing due) cost $idle_scans table scans ($idle_seq sequential, $idle_idx by index; most:$idle_top), more than $IDLE_MAX (one watermark read per pass at 120 passes a minute, and slack): the loop reads everything on every pass whether or not anything changed"
 
