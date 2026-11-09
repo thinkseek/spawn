@@ -229,13 +229,27 @@ commit with a key no agent holds cannot hang or fail a test.
   snapshot holds is not merged back: a person or the supervisor takes what
   they need from `refs/spawn-stale/<agent>` (it is never pushed or
   landed).
-- **Ending an execution**: final checkpoint, terminal killed, workspace
-  unmounted, then `execution.ended`. The workspace holds the only copy of
+- **Ending an execution**: terminal killed, final checkpoint, workspace
+  unmounted, then `execution.ended`. The kill comes first and returns only
+  once the runner and every process it started have exited
+  (`TerminalHost::terminate`; the tmux host reads the pane's pid, the
+  leader of the session its runner runs in, before `kill-session`, waits up
+  to 5 s for that session's processes to exit, sends what is left SIGKILL
+  and waits 2 s more). A stopped engine writes until it is gone: with the
+  checkpoint first, a line it wrote after the checkpoint was deleted by the
+  unmount (028's stop, 2026-11-09). Now nothing it writes can land after
+  the final checkpoint. Every end goes this way: a stop, an exit, a lost
+  runner, an abandoned start. A process that left the runner's session
+  (`setsid`) is not waited for. A runner that outlives the kill and the
+  SIGKILL fails the attempt: no checkpoint and no unmount while it may still
+  write, and the attempt counts toward the stall below like a failed
+  checkpoint (`execution.end_stalled`'s `error` then names the kill). The
+  workspace holds the only copy of
   what the execution did not commit, so it is unmounted only after the final
   checkpoint commits, or on a `discard` command. A final checkpoint that
   fails keeps the execution and its workspace and is tried again each tick;
-  after 20 failures (`END_ATTEMPTS`) the end is stalled: the terminal is
-  killed, `execution.end_stalled {cause, exit_code, failures, error}` is
+  after 20 failures (`END_ATTEMPTS`) the end is stalled:
+  `execution.end_stalled {cause, exit_code, failures, error}` is
   recorded and warned once, the Observer marks the session BLOCKED with
   attention `end_stalled` (the fleet view and the supervisor's digest show
   it), and the checkpoint is retried every 30 s (`END_RETRY_MS`) by the
@@ -257,9 +271,9 @@ commit with a key no agent holds cannot hang or fail a test.
   `spawn-launch-<terminal>-`; every launch has one). Anything else is
   `lost`, and its `execution.ended` carries `evidence`: what the host saw
   (the dead pane's status, or what the pane was started with and runs),
-  and which command found it. The end is the one above: final checkpoint,
-  terminal killed (the restored shell too: no untracked engine is ever
-  adopted), unmount, record. A start, a resume and an input settle such an
+  and which command found it. The end is the one above: terminal killed
+  (the restored shell too: no untracked engine is ever adopted), final
+  checkpoint, unmount, record. A start, a resume and an input settle such an
   execution before they act (`Bridge::settle`), instead of failing on it
   until a later tick: a start or resume then goes on, an input fails once
   (it needs a running engine) so the normal resume path applies; a stop

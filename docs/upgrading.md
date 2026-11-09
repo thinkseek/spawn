@@ -94,7 +94,7 @@ These are not about process lifetime. They break when two versions meet.
    environment file (`spawn-launch-<terminal>-...`); every launch since
    6f677b4 (2026-11-05) has one. A runner launched by an older binary that
    is still running when this one is deployed carries no such name and is
-   ended as lost (its final checkpoint taken, its terminal killed) at the
+   ended as lost (its terminal killed, its final checkpoint taken) at the
    first tick: stop such executions before the deploy, or let the normal
    paths resume them (the liveness rule for the supervisor and residents,
    the dispatcher's one resume of a lost worker).

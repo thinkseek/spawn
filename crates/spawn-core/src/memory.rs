@@ -106,6 +106,14 @@ struct State {
     exits_on_check: HashMap<TerminalName, (String, Vec<u8>)>,
     /// The transcript archive: per agent and native session, its copies.
     transcripts: HashMap<(AgentId, String), Vec<Vec<u8>>>,
+    /// Engines that write to their workspace as they die: `terminate`
+    /// leaves the workspace dirty ([`MemoryStore::write_as_it_dies`]).
+    dies_writing: HashSet<TerminalName>,
+    /// How many of the next `terminate` calls of a terminal its runner
+    /// outlives ([`MemoryStore::outlive_kills`]).
+    outlives: HashMap<TerminalName, u32>,
+    /// Workspaces unmounted with uncommitted work in them.
+    unmounted_dirty: Vec<WorkspaceId>,
 }
 
 impl State {
@@ -314,6 +322,23 @@ impl MemoryStore {
         } else {
             state.branch_records_refused.remove(session);
         }
+    }
+
+    /// Make the engine in `terminal` write to its workspace as it dies, as
+    /// a stopped engine does between the hang-up and its exit. Test helper.
+    pub fn write_as_it_dies(&self, terminal: &TerminalName) {
+        self.lock().dies_writing.insert(terminal.clone());
+    }
+
+    /// Make the runner in `terminal` outlive the next `kills` terminates:
+    /// each fails, the terminal still there. Test helper.
+    pub fn outlive_kills(&self, terminal: &TerminalName, kills: u32) {
+        self.lock().outlives.insert(terminal.clone(), kills);
+    }
+
+    /// The workspaces unmounted with uncommitted work in them: work lost.
+    pub fn unmounted_dirty(&self) -> Vec<WorkspaceId> {
+        self.lock().unmounted_dirty.clone()
     }
 
     /// Mark a workspace as holding uncommitted changes. Test helper.
@@ -641,7 +666,13 @@ impl WorkspaceStore for MemoryStore {
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
         let mut state = self.lock();
         state.workspace_calls.push("unmount".to_string());
-        state.mounts.remove(workspace);
+        if state
+            .mounts
+            .remove(workspace)
+            .is_some_and(|mount| mount.dirty)
+        {
+            state.unmounted_dirty.push(workspace.clone());
+        }
         Ok(())
     }
 
@@ -873,9 +904,20 @@ impl TerminalHost for MemoryStore {
     fn terminate(
         &self,
         terminal: &TerminalName,
-        _workspace: &WorkspaceId,
+        workspace: &WorkspaceId,
     ) -> Result<(), TerminalError> {
         let mut state = self.lock();
+        if let Some(left) = state.outlives.get_mut(terminal).filter(|left| **left > 0) {
+            *left -= 1;
+            return Err(TerminalError(format!(
+                "the runner of {terminal} outlived its kill"
+            )));
+        }
+        if state.terminals.contains(terminal) && state.dies_writing.remove(terminal) {
+            if let Some(mount) = state.mounts.get_mut(workspace) {
+                mount.dirty = true;
+            }
+        }
         state.terminals.remove(terminal);
         state.panes.remove(terminal);
         state.untracked.remove(terminal);
