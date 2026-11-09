@@ -66,7 +66,7 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | `notice.typed` | 无；保留它以读取日志里已有的行（主线不再合入运行中的工作区） | through |
 | `notice.received` | 无；保留它以读取日志里已有的行 | 无 |
 | `notification.received` | 无；保留它以读取日志里已有的行 | notification_type |
-| `tool.started` | 会话记录 | tool_name、tool_use_id、summary（可选：调用的关键输入，只留不可能是凭证的词：Bash 去掉 `cd X &&` 与 `NAME=value` 前置后的前几个词，至多 4 个，遇到 `-` 开头的参数、含 `@ : = ' " ` $ \` 的词、8 字符以上且字母数字混合的词或命令结束即停，余下记作 `…`；`echo`、`printf`、`read`、`sudo`、`su`、`sshpass`、`passwd`、`export`、`eval`、`set` 只留程序名；路径与主机逐段检查，段内字母数字混合的上限为 16 字符；按设计仍会保留的：前几个位置参数里不足 8 字符、或纯字母、或纯数字的词；Grep 的模式整体合格才留；WebFetch 只记主机；其上仍经脱敏，至多 160 字符）、summary_whole（可选，默认 false：summary 即调用的全部输入，没有省掉任何词或前置、未被脱敏或截断，界面只折叠这样的重复调用） |
+| `tool.started` | 会话记录 | tool_name、tool_use_id、summary（可选：调用的关键输入，只留不可能是凭证的词：Bash 去掉 `cd X &&` 与 `NAME=value` 前置后的前几个词，至多 4 个，遇到 `-` 开头的参数、含 `@ : = ' " ` $ \` 的词、8 字符以上且字母数字混合的词或命令结束即停，余下记作 `…`；`echo`、`printf`、`read`、`sudo`、`su`、`sshpass`、`passwd`、`export`、`eval`、`set`、`env` 只留程序名；路径与主机逐段检查，段内字母数字混合的上限为 16 字符；按设计仍会保留的：前几个位置参数里不足 8 字符、或纯字母、或纯数字的词；Grep 的模式整体合格才留；WebFetch 只记主机；其上仍经脱敏，至多 160 字符）、summary_whole（可选，默认 false：summary 即调用的全部输入，没有省掉任何词或前置、未被脱敏或截断，界面只折叠这样的重复调用） |
 | `tool.completed` | 会话记录 | tool_use_id、duration_ms |
 | `tool.failed` | 会话记录 | tool_use_id、error |
 | `turn.stopped` | 会话记录（`turn_duration`、中断） | input_tokens、output_tokens |
