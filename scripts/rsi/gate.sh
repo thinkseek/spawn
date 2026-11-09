@@ -1773,13 +1773,18 @@ run_stage() {
 }
 
 # snapshot_bin <tree>: the binary the scenarios run (SPAWN_BIN), copied
-# once the tree is built to target/gate/spawn, where no cargo command
-# writes: check-tests' `cargo test` links target/debug/spawn again (the
-# test profile's features) while other scenarios run it. Taken right before
-# the scenarios of the tree start, so it is the binary the serial gate's
-# scenarios ran (for the candidate, the one the test listing linked). Copied
-# inside the sandbox: the tree is the candidate's. A tree with no such binary
-# keeps the path its build would have made.
+# to target/gate/spawn, where no cargo command writes, as soon as the build
+# hook has built the tree, and before anything else of the gate runs cargo
+# in it. `cargo test` links target/debug/spawn again with the test build's
+# features: the dev-dependencies turn on spawn-core's and spawn-host's
+# `testing`. That covers check-tests while other scenarios run, and also the
+# candidate's test listing, which runs before its scenarios. Until
+# 2026-11-09 the candidate's copy was taken after that listing, so the
+# candidate's scenarios ran a testing-featured binary and the base's ran
+# the build hook's (rev-f, design-gate-time.md 3a). Both trees now run the
+# build hook's binary. Copied inside the sandbox: the tree is the
+# candidate's. A tree with no such binary keeps the path its build would
+# have made.
 snapshot_bin() {
     sandbox "$1" sh -c '[ -f target/debug/spawn ] || exit 0
         mkdir -p target/gate && cp target/debug/spawn target/gate/spawn.new &&
@@ -2819,6 +2824,10 @@ if ! build "$work/candidate"; then
     verdict rejected "candidate does not build"
     exit 0
 fi
+if ! snapshot_bin "$work/candidate"; then
+    echo "gate: cannot copy the candidate's spawn for its scenarios" >&2
+    exit 3
+fi
 
 # runnable_tests <writable dir> <tree> <target dir> <names file>: how many
 # tests cargo runs in the tree, from inside the sandbox: libtest's
@@ -3113,10 +3122,6 @@ for other in "$scenarios"/check-tests.sh "$scenarios"/*.sh; do
     add_candidate_job "$other" "regression: $(basename "$other") must still pass"
 done
 stage_close ok
-if [ "$candidate_count" -gt 0 ] && ! snapshot_bin "$work/candidate"; then
-    echo "gate: cannot copy the candidate's spawn for its scenarios" >&2
-    exit 3
-fi
 phase_start candidate
 run_jobs candidate "$candidate_count" candidate_job candidate_finished candidate_printed
 phase_time candidate
