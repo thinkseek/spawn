@@ -20,7 +20,7 @@ export function Card({
   return (
     <section
       className={cx(
-        "rounded-lg border border-surface-border bg-surface",
+        "rounded-card bg-surface shadow-card",
         className,
       )}
     >
@@ -104,7 +104,7 @@ export function LiveStatus({
     return (
       <span
         title={error}
-        className="inline-flex h-6 items-center gap-1.5 rounded-md bg-destructive/12 px-2 text-caption font-medium text-destructive ring-1 ring-destructive/25 ring-inset"
+        className="inline-flex h-6 items-center gap-1.5 rounded-md bg-fail-tint px-2 text-caption font-medium text-destructive ring-1 ring-destructive/25 ring-inset"
       >
         <WifiOff size={12} />
         {error.startsWith("HTTP 401") ? "Token needed" : "Disconnected"}
@@ -139,7 +139,7 @@ export function Button({
       onClick={onClick}
       title={title}
       className={cx(
-        "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-surface-border bg-surface px-2.5 text-caption font-medium text-muted-foreground transition-colors hover:border-border-strong hover:bg-surface-hover hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring",
+        "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-control bg-surface px-2.5 text-caption font-medium text-muted-foreground shadow-hairline transition-[color,box-shadow,background-color] hover:bg-surface-hover hover:text-foreground hover:shadow-raised focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring",
         className,
       )}
     >
@@ -272,6 +272,19 @@ export function Tabs<T extends string>({
         );
       })}
     </div>
+  );
+}
+
+/** A filter chip: a pill with a hairline, the chosen one on the neutral
+ * selected fill. One style for every row of filters (missions, the
+ * scorecard's window, the RSI mission, the Show's speed): content is the
+ * colour on the page, the chips are not. */
+export function chip(on: boolean): string {
+  return cx(
+    "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-full px-3 text-caption shadow-hairline transition-[color,background-color,box-shadow]",
+    on
+      ? "bg-surface-selected font-medium text-foreground"
+      : "text-muted-foreground hover:bg-surface-hover hover:text-foreground",
   );
 }
 

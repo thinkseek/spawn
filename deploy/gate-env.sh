@@ -11,7 +11,7 @@ gate_env_read() {
   while IFS= read -r -d '' assignment; do
     name=${assignment%%=*}
     case $name in
-    PATH | HOME | LANG | TMPDIR | CARGO_HOME | RUSTUP_HOME | SPAWN_GATE_MIN_FREE_GB | SPAWN_GATE_JOBS | SPAWN_GATE_HOST_JOBS)
+    PATH | HOME | LANG | TMPDIR | CARGO_HOME | RUSTUP_HOME | SPAWN_GATE_MIN_FREE_GB | SPAWN_GATE_JOBS | SPAWN_GATE_HOST_JOBS | SPAWN_GATE_BUILD_JOBS)
       keep+=("$assignment") ;;
     SPAWN_GATE_PG_IMAGE | SPAWN_GATE_PG_BIN)
       own=${own:-${assignment#*=}}

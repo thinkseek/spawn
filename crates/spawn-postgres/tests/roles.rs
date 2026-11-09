@@ -225,7 +225,7 @@ fn the_logins_of_earlier_installs_lose_everything_here() {
                     has_function_privilege('spawn_supervisor',
                                            'spawn_mission_add(text, jsonb, text)', 'execute'),
                     (select rolcanlogin from pg_roles where rolname = 'spawn_supervisor')",
-            &[&schema],
+            &[&&*schema],
         )
         .expect("the privileges");
     let (usage, select, execute, can_login): (bool, bool, bool, bool) =

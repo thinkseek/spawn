@@ -15,9 +15,15 @@
 # exists, failing `load-buffer` with tmux's own words, `command too long`
 # (task 66's fault on 2026-11-06): nothing is typed, every attempt is refused
 # before typing. The loop runs with SPAWN_DELIVERY_RETRY_SECS=2 (the wait
-# before the first counted retry; it doubles) and SPAWN_REISSUE_AFTER_SECS=10
-# (the wait after a spent delivery before its re-issue); the stall bounds are
-# long. Checked:
+# before the first counted retry; it doubles), SPAWN_REISSUE_AFTER_SECS=10
+# (the wait after a spent delivery before its re-issue) and
+# SPAWN_DELIVERY_NOT_READY_MS=500 (the wait after each of the 10 refusals
+# free of count, 5 s by default); the stall bounds are long. The last one is
+# why a run takes about 55 s less than it did: each spent delivery's 10 free
+# refusals waited 5 s apart (rev-e, work-gate-stage-costs.md §6), and with
+# 500 ms a run measured 136 s and 139 s against 193 s at 5 s (2026-11-09,
+# nice 19, one host). The count of free refusals is the same, so what is
+# checked is the same. Checked:
 #   (1) spent: task T1 (frail1, broken) has its delivery's retries spent
 #       within 150 s: every attempt (`deliver-T1-0`, `-retry-<n>`) failed,
 #       none may have typed, and the failures past the free refusals number
@@ -263,7 +269,7 @@ for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SP
     SPAWN_DISPATCH CLAUDE_CONFIG_DIR SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \
     SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS SPAWN_DELIVERY_RETRY_SECS \
-    SPAWN_REISSUE_AFTER_SECS; do
+    SPAWN_REISSUE_AFTER_SECS SPAWN_DELIVERY_NOT_READY_MS; do
     unset "$name" 2>/dev/null || true
 done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
@@ -285,6 +291,7 @@ RETRY_SECS=2
 REISSUE_AFTER=10
 SPAWN_DELIVERY_RETRY_SECS=$RETRY_SECS
 SPAWN_REISSUE_AFTER_SECS=$REISSUE_AFTER
+SPAWN_DELIVERY_NOT_READY_MS=500
 SPAWN_STALL_DELIVERY_SECS=1800
 SPAWN_STALL_ACTIVITY_SECS=1800
 SPAWN_STALL_REVIEW_SECS=1800
@@ -295,7 +302,7 @@ SPAWN_STALL_HALTED_SECS=1800
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
     SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
     SPAWN_LOOP_INTERVAL_MS SPAWN_SUPERVISOR SPAWN_MISSION_FILE SPAWN_DISK_WARN_GB \
-    SPAWN_DISK_FLOOR_GB SPAWN_DELIVERY_RETRY_SECS SPAWN_REISSUE_AFTER_SECS \
+    SPAWN_DISK_FLOOR_GB SPAWN_DELIVERY_RETRY_SECS SPAWN_REISSUE_AFTER_SECS SPAWN_DELIVERY_NOT_READY_MS \
     SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_REVIEW_SECS \
     SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS
 mkdir -p "$SPAWN_WORKSPACE_ROOT"

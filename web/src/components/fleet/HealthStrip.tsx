@@ -61,7 +61,7 @@ function Cell({
   className?: string;
 }) {
   return (
-    <div className={cx("min-w-0 bg-surface px-4 py-3", className)}>
+    <div className={cx("min-w-0 rounded-card bg-surface px-4 py-3 shadow-card", className)}>
       <div className="mb-1.5 truncate text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">
         {label}
       </div>
@@ -299,7 +299,7 @@ export function HealthStrip({
   return (
     <section
       aria-label="Fleet health"
-      className="grid shrink-0 grid-cols-1 gap-px overflow-hidden rounded-lg border border-surface-border bg-surface-border sm:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.25fr)_minmax(0,1.2fr)_minmax(0,1.75fr)]"
+      className="grid shrink-0 grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.25fr)_minmax(0,1.2fr)_minmax(0,1.75fr)]"
     >
       <Cell label="Liveness">
         <div className="flex items-baseline gap-2">

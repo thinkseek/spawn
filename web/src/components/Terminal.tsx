@@ -38,7 +38,7 @@ export function LiveBadge({ live, known = true }: { live: boolean; known?: boole
       className={cx(
         "inline-flex h-5 items-center gap-1.5 rounded-md px-1.5 text-caption font-medium ring-1 ring-inset",
         live
-          ? "bg-success/10 text-success ring-success/25"
+          ? "bg-ok-tint text-success ring-success/25"
           : "bg-white/[0.04] text-muted-foreground ring-white/10",
       )}
     >
@@ -56,6 +56,10 @@ export function LiveBadge({ live, known = true }: { live: boolean; known?: boole
 
 interface TerminalPanelProps {
   title?: ReactNode;
+  /** Beside the title: a switch between views of one screen. */
+  tabs?: ReactNode;
+  /** With `tabs`: the body is their tabpanel (its id, and the selected tab's id). */
+  panel?: { id: string; labelledBy: string };
   /** Short identifier shown beside the title, e.g. the tmux session. */
   tag?: string | null;
   /** Right side of the header: freshness, live badge. */
@@ -73,6 +77,8 @@ interface TerminalPanelProps {
  */
 export function TerminalPanel({
   title = "Terminal",
+  tabs,
+  panel,
   tag,
   status,
   text,
@@ -98,6 +104,7 @@ export function TerminalPanel({
       <header className="flex h-10 shrink-0 items-center gap-2 border-b border-white/[0.06] bg-white/[0.02] px-4">
         <SquareTerminal size={14} className="shrink-0 text-faint-foreground" />
         <h2 className="text-label font-medium text-foreground">{title}</h2>
+        {tabs}
         {tag && (
           <span className="hidden truncate rounded bg-white/[0.05] px-1.5 py-px font-mono text-micro text-muted-foreground sm:inline">
             {tag}
@@ -112,6 +119,10 @@ export function TerminalPanel({
 
       <div
         ref={scroller}
+        id={panel?.id}
+        role={panel ? "tabpanel" : undefined}
+        aria-labelledby={panel?.labelledBy}
+        tabIndex={panel ? 0 : undefined}
         onScroll={(event) => {
           const element = event.currentTarget;
           const atBottom =

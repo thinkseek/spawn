@@ -67,6 +67,8 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::GateRoom => "no room for the gate on this host",
         Why::GateHostFault => "host faults at the gate (the host's, not the work's)",
         Why::GateBaseDisagrees => "the base disagreed with itself at the gate (the host's)",
+        Why::MainRed => "a source's main is red on a check (its gates wait)",
+        Why::MainGreen => "a source's main is green again",
         Why::Stalled => "stalled",
         Why::Charter => "new charter not typed",
         Why::BackgroundJob => "background job past its bound",
@@ -170,14 +172,24 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
             });
             let fact = &record["fact"];
             let evidence = if record["evidence"] == "cannot_judge" {
-                // The host cannot judge the objective at all (029: no
-                // systemd user manager in the sandbox): not a transient
-                // fault of the test database or the load.
+                // The host cannot judge the objective at all: the scenario's
+                // own cause, as the record quotes it from the gate's log
+                // (integrate.rs `cannot_judge_cause`), or none — never one
+                // scenario's cause for another (029's systemd user manager
+                // was said of 073, which needed a PostgreSQL server).
                 let scenario = record["scenario"].as_str().unwrap_or("its scenario");
-                format!(
-                    "this host cannot judge the objective here ({scenario} needs what the \
-                     gate's sandbox has none of, a systemd user manager)"
-                )
+                match record["cause"].as_str() {
+                    Some(cause) => format!(
+                        "this host cannot judge the objective here ({scenario} says: {})",
+                        one_line(cause, 300)
+                    ),
+                    None => format!(
+                        "this host cannot judge the objective here ({scenario}; the gate's log \
+                         gives no cause)"
+                    ),
+                }
+            } else if let Some(said) = never_started(&record["evidence"], fact) {
+                said
             } else if record["evidence"] == "gate" {
                 let scenario = fact["scenario"].as_str().unwrap_or("a scenario");
                 let runs = one_line(fact["runs"].as_str().unwrap_or_default(), 200);
@@ -208,19 +220,22 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
             } else {
                 format!("the test database's log shows a crash during the gate: {crash}")
             };
+            // The head's run alone on the base it was built on (integrate.rs
+            // `on_the_head`): its fault is that base's and the work's, never
+            // the merge's on main, and the item says so.
+            let evidence = match record["head_base"].as_str() {
+                Some(head_base) => format!(
+                    "judging the work alone against the base it was built on ({}), after main \
+                     rejected the merge, {evidence}",
+                    head_base.get(..12).unwrap_or(head_base)
+                ),
+                None => evidence,
+            };
             let due = record["due_ms"].as_i64().map_or_else(
                 || "after its backoff".to_string(),
                 |due| format!("at {}", crate::scorecard::time::format_rfc3339(due)),
             );
-            let check = if record["evidence"] == "cannot_judge" {
-                "The objective is judged outside the gate, by the owner (mission 7): judge it \
-                 there, or tell the owner."
-            } else if record["evidence"] == "gate" {
-                "Check the host's load and that scenario's harness (its log in the gate output), \
-                 or tell the owner."
-            } else {
-                "Check the test database's host (its memory, /dev/shm, its log) or tell the owner."
-            };
+            let check = host_fault_check(&record["evidence"]);
             Some(Escalation {
                 session_id: "host".to_string(),
                 id: format!("gate-host-fault-{id}"),
@@ -234,6 +249,47 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
             })
         })
         .collect()
+}
+
+/// What a gate host fault that never started something says: its sandbox
+/// (`sandbox_never_started`) or the gate's own test server
+/// (`test_server_never_started`), with the gate's reason; `None` for
+/// another evidence.
+fn never_started(evidence: &Value, fact: &Value) -> Option<String> {
+    let said = one_line(fact["reason"].as_str().unwrap_or_default(), 300);
+    if evidence == crate::gate::SANDBOX_NEVER_STARTED {
+        let scenario = fact["scenario"].as_str().unwrap_or("a scenario");
+        Some(format!(
+            "the gate's sandbox never started {scenario} ({said})"
+        ))
+    } else if evidence == crate::gate::TEST_SERVER_NEVER_STARTED {
+        Some(format!("the gate's own test server never started ({said})"))
+    } else {
+        None
+    }
+}
+
+/// What a gate host fault's item asks the supervisor to do, by its
+/// evidence.
+fn host_fault_check(evidence: &Value) -> &'static str {
+    if evidence == "cannot_judge" {
+        // What to do follows from the scenario's own cause (quoted in the
+        // item), not from 029's: give the gate what the scenario says it
+        // lacks, or judge it outside the gate.
+        "Give the gate what the scenario says it lacks (its environment, a server, a service), \
+         or have the owner judge the objective outside the gate."
+    } else if evidence == crate::gate::SANDBOX_NEVER_STARTED {
+        "Check that bubblewrap starts on this host (user namespaces, the paths it binds and \
+         masks) or tell the owner."
+    } else if evidence == crate::gate::TEST_SERVER_NEVER_STARTED {
+        "Check that the gate's test server starts on this host (its memory, disk, \
+         SPAWN_GATE_PG_BIN or image, the server's FATAL line in the record) or tell the owner."
+    } else if evidence == "gate" {
+        "Check the host's load and that scenario's harness (its log in the gate output), or \
+         tell the owner."
+    } else {
+        "Check the test database's host (its memory, /dev/shm, its log) or tell the owner."
+    }
 }
 
 /// The digest items for `records`, the integrator's `host_fault` gate
@@ -280,6 +336,75 @@ pub(crate) fn base_disagrees_alerts(records: &[Value]) -> Vec<Escalation> {
                      code had run, so it is the host's (too loaded or too flaky to judge), not \
                      the work's. It is judged again {due}; nothing is counted and nothing halts. \
                      Check the host's load or tell the owner."
+                ),
+                since_ms: record["at_ms"].as_i64(),
+            })
+        })
+        .collect()
+}
+
+/// The digest items for `records`, the red mains that started and ended
+/// that no delivered digest told yet (`PostgresStore::main_red_news`): a
+/// `source.main_red` with `alert` (the first of its red) is item
+/// `main-red-<event id>` of session `host`, naming the source, its main, the
+/// check, up to [`HOST_FAULT_QUOTED`] of the failing tests and what holds; a
+/// `source.main_green` is `main-green-<event id>`, naming how long it was red.
+/// Each is told once.
+pub(crate) fn main_red_news(records: &[Value]) -> Vec<Escalation> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let id = record["event_id"].as_i64()?;
+            let source = record["source"].as_str()?;
+            let main = record["main"].as_str().unwrap_or("its main");
+            let main = main.get(..12).unwrap_or(main);
+            let scenario = record["scenario"].as_str().unwrap_or("a check");
+            if record["type"] == "source.main_green" {
+                let red_for = match (record["at_ms"].as_i64(), record["since_ms"].as_i64()) {
+                    (Some(at), Some(since)) if at >= since => {
+                        format!(" after {} min", (at - since) / 60_000)
+                    }
+                    _ => String::new(),
+                };
+                return Some(Escalation {
+                    session_id: HOST_SESSION.to_string(),
+                    id: format!("main-green-{id}"),
+                    why: Why::MainGreen,
+                    line: format!(
+                        "main of {source} passes {scenario} again at {main}{red_for}: it is \
+                         green, and its gates run as usual."
+                    ),
+                    since_ms: record["at_ms"].as_i64(),
+                });
+            }
+            if record["type"] != "source.main_red" || record["alert"].as_bool() != Some(true) {
+                return None;
+            }
+            let failures = record["failures"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|failure| {
+                    let test = failure["test"].as_str()?;
+                    let message = failure["message"].as_str().unwrap_or_default();
+                    Some(one_line(&format!("{test}: {message}"), 200))
+                })
+                .take(HOST_FAULT_QUOTED)
+                .collect::<Vec<String>>()
+                .join(" / ");
+            let task = record["task"]
+                .as_i64()
+                .map_or_else(String::new, |task| format!(" (task #{task}'s gate)"));
+            Some(Escalation {
+                session_id: HOST_SESSION.to_string(),
+                id: format!("main-red-{id}"),
+                why: Why::MainRed,
+                line: format!(
+                    "main of {source} ({main}) is red on {scenario}: it failed twice on the \
+                     base with the same failing tests{task}: {failures}. No candidate is to \
+                     blame: the gates on {source} wait until main moves (a probe gate each \
+                     SPAWN_GATE_MAIN_RED_PROBE_MS, an hour by default), nothing is counted and \
+                     nothing halts. Fix main, or tell the owner."
                 ),
                 since_ms: record["at_ms"].as_i64(),
             })

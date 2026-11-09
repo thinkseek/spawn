@@ -25,13 +25,16 @@
 #   shared server has them (Spawn derives its restricted logins' passwords
 #   from the owner's, so the URL carries one), and the database
 #   `spawn_test`. One lock per id: two gates never make it twice.
-# - Each gate copies the template into its scratch (a reflink on btrfs) and
-#   runs `postgres` in bubblewrap, as this uid: as `/` the image's files, or
-#   the host's /usr (and the server's own installation when it is not under
-#   /usr) with the loader's cache and nothing else of the host's: not /etc,
-#   /home, /var or /run, all read-only; its data directory and socket
-#   directory the only writable paths, no network (a socket only), its own
-#   PID, IPC and user namespaces. A superuser's `COPY ... TO PROGRAM` runs
+# - Each gate copies the template and its password into its scratch once (a
+#   reflink on btrfs), at its first start: the shared one may be removed and
+#   remade with a new password while the gate runs, and each server the gate
+#   starts must take the password its sandbox was given. Each copies its data
+#   from the gate's copy and runs `postgres` in bubblewrap, as this uid: as
+#   `/` the image's files, or the host's /usr (and the server's own
+#   installation when it is not under /usr) with the loader's cache and
+#   nothing else of the host's: not /etc, /home, /var or /run, all
+#   read-only; its data directory and socket directory the only writable
+#   paths, no network (a socket only), its own PID, IPC and user namespaces. A superuser's `COPY ... TO PROGRAM` runs
 #   there, not on the host. It dies with the gate (`--die-with-parent`, and
 #   the gate's EXIT trap); the scratch goes with its data.
 # - The sandbox reaches it through a hard link to its socket in a directory
@@ -43,10 +46,14 @@
 #   per job (SPAWN_GATE_JOBS), shared_buffers the programs' 128MB, and no
 #   fsync (the data is thrown away; durability decides no query result).
 #
-# gate_pg_start <dir> <jobs> starts it with its files in <dir> (created,
-# under the gate's scratch) and sets gate_pg_pid (bubblewrap's), gate_pg_root,
-# gate_pg_socket (the server's own socket path) and gate_pg_password, or says
-# why on stderr and returns 1. gate_pg names what it runs (the image or the
+# gate_pg_start <dir> <jobs> [<option>] starts it with its files in <dir>
+# (created, under the gate's scratch) and sets gate_pg_pid (bubblewrap's),
+# gate_pg_root, gate_pg_socket (the server's own socket path) and
+# gate_pg_password, or says why on stderr and returns 1 when the programs or
+# their template cannot be prepared (the owner's configuration: a wrong
+# SPAWN_GATE_PG_BIN or image) and 2 when the server itself does not start
+# (the host's: test_server_never_started in gate.sh). <option> is one more
+# `-c name=value` for the server (the suite's seam, SPAWN_GATE_TEST_PG_FAIL). gate_pg names what it runs (the image or the
 # directory), gate_pg_kind and gate_pg_id (`image <id>` or `programs <id>`)
 # are for the base cache's key. gate_pg_stop kills it.
 
@@ -242,17 +249,60 @@ gate_pg_prepare() {
     touch "$gate_pg_dir/ready"
 }
 
-gate_pg_start() { # <dir> <jobs>
+# gate_pg_keep <dir>: the template and its password, both of one making:
+# the password is read again after the copy, and a template remade in
+# between (a new random password) is copied again from the new one.
+# Returns 1 when the template cannot be made (gate_pg_prepare: the
+# programs), 2 when it cannot be copied (the host's: its disk, or the
+# template remade under every copy), with the reason in gate_pg_said. The
+# suite's seam, SPAWN_GATE_TEST_PG_KEEP_FAIL=1, makes every copy look
+# remade.
+gate_pg_keep() {
+    gate_pg_said=""
+    mkdir -m 700 "$1" || { gate_pg_said="cannot make $1"; return 2; }
+    for _ in 1 2 3; do
+        kept_password=$(cat "$gate_pg_dir/password" 2>/dev/null) &&
+            cp -a --reflink=auto "$gate_pg_dir/template" "$1/template" 2>/dev/null &&
+            [ "$(cat "$gate_pg_dir/password" 2>/dev/null)" = "$kept_password" ] &&
+            [ -z "${SPAWN_GATE_TEST_PG_KEEP_FAIL-}" ] && {
+            (umask 077 && printf '%s' "$kept_password" >"$1/password") ||
+                { gate_pg_said="cannot write $1/password"; return 2; }
+            return 0
+        }
+        chmod -R u+w "$1/template" 2>/dev/null
+        rm -rf "$1/template"
+        gate_pg_prepare || return 1
+    done
+    gate_pg_said="its template in $gate_pg_dir could not be copied whole: missing, or remade while it was copied, three times"
+    echo "gate: the private test server's $gate_pg_said" >&2
+    return 2
+}
+
+gate_pg_kept=""
+gate_pg_start() { # <dir> <jobs> [<option>]
     gate_pg_prepare || return 1
-    mkdir -m 700 "$1" "$1/socket" "$1/users" || return 1
-    cp "$gate_pg_dir/env" "$1/users/env" || return 1
+    mkdir -m 700 "$1" "$1/socket" "$1/users" || return 2
+    cp "$gate_pg_dir/env" "$1/users/env" || return 2
     gate_pg_users "$1/users"
     gate_pg_started=$(date +%s%3N)
-    cp -a --reflink=auto "$gate_pg_dir/template" "$1/data" || return 1
+    # The gate's own copy of the template and its password, taken at its
+    # first start: every later start (the candidate phase's fresh server)
+    # copies that, whatever became of the shared one, which another gate
+    # remakes with a new password once it is gone (spawn-maintenance's,
+    # or a hand's, removal), while the sandbox's URL keeps the first.
+    if [ -z "$gate_pg_kept" ]; then
+        gate_pg_keep "$1/kept" || {
+            keep_rc=$?
+            [ -z "$gate_pg_said" ] || printf '%s\n' "$gate_pg_said" >"$1/start.said"
+            return "$keep_rc"
+        }
+        gate_pg_kept=$1/kept
+    fi
+    cp -a --reflink=auto "$gate_pg_kept/template" "$1/data" || return 2
     gate_pg_bwrap "$gate_pg_root" "$1/users" "$1/data" "$1/socket" - \
         postgres -c listen_addresses= -c unix_socket_directories=/run/postgresql \
         -c max_connections=$((100 + 50 * $2)) -c fsync=off -c synchronous_commit=off \
-        -c full_page_writes=off -c max_wal_size=4GB </dev/null >"$1/server.log" 2>&1 &
+        -c full_page_writes=off -c max_wal_size=4GB ${3:+-c "$3"} </dev/null >"$1/server.log" 2>&1 &
     gate_pg_pid=$!
     gate_pg_socket=$1/socket/.s.PGSQL.5432
     waited=0
@@ -260,16 +310,16 @@ gate_pg_start() { # <dir> <jobs>
         if ! kill -0 "$gate_pg_pid" 2>/dev/null || [ "$waited" -ge 600 ]; then
             echo "gate: the private test server did not start:" >&2
             tail -n 20 "$1/server.log" >&2
-            return 1
+            return 2
         fi
         sleep 0.05
         waited=$((waited + 1))
     done
     [ -S "$gate_pg_socket" ] && [ ! -h "$gate_pg_socket" ] || {
         echo "gate: the private test server made no socket at $gate_pg_socket" >&2
-        return 1
+        return 2
     }
-    gate_pg_password=$(cat "$gate_pg_dir/password") || return 1
+    gate_pg_password=$(cat "$gate_pg_kept/password") || return 2
     gate_pg_ms=$(($(date +%s%3N) - gate_pg_started))
 }
 

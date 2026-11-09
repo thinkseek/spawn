@@ -15,7 +15,8 @@
 //!   its own schedule (a fact settling, a recheck of a running execution, a
 //!   judge's backoff);
 //! - the dispatcher ([`dispatch::step`]), which waits for a delivery's retry
-//!   (`attempts()`: [`NOT_READY_RETRY_MS`] after a refusal, `retry_wait_ms()`
+//!   (`attempts()`: `SPAWN_DELIVERY_NOT_READY_MS`, default
+//!   [`NOT_READY_RETRY_MS`], after a refusal, `retry_wait_ms()`
 //!   after a failure), a stall's bound ([`dispatch::Bounds`]), a failed
 //!   Stop's retry, a background job's bound, or a report note's retry;
 //! - the liveness rule ([`supervise::keep_residents`],
@@ -458,8 +459,9 @@ struct Fleet<'a> {
     /// The pause [`Pace`] put after the last failed pass.
     pause: Duration,
     bounds: dispatch::Bounds,
-    /// The delivery waits `SPAWN_DELIVERY_RETRY_SECS` and
-    /// `SPAWN_REISSUE_AFTER_SECS` set ([`crate::deliver::Waits`]).
+    /// The delivery waits `SPAWN_DELIVERY_RETRY_SECS`,
+    /// `SPAWN_REISSUE_AFTER_SECS` and `SPAWN_DELIVERY_NOT_READY_MS` set
+    /// ([`crate::deliver::Waits`]).
     waits: crate::deliver::Waits,
     /// The loop's own alerts ([`alerts::Monitor`]): its records decide
     /// whether this pass has anything to do, on the same watermark and

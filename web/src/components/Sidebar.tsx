@@ -1,4 +1,4 @@
-import { Activity, BellRing, Gauge, LayoutGrid, Orbit, Rows3, Target, Waypoints } from "lucide-react";
+import { Activity, BellRing, Gauge, LayoutGrid, Monitor, Moon, Orbit, Rows3, Sun, Target, Waypoints } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { OverviewSession, RsiSummary, SessionState } from "../api";
@@ -6,6 +6,8 @@ import type { View } from "../App";
 import type { FleetAgent } from "../fleet";
 import { sessionState } from "../fleet";
 import { rsiPhase, sessionTaskLabel } from "../missions";
+import type { ThemeChoice } from "../theme";
+import { THEME_CHOICES, THEME_KEY, useTheme } from "../theme";
 import type { FleetContext } from "../ordering";
 import { AGENT_GROUP_LABEL, groupAgents, heldTask } from "../ordering";
 import { phaseStyle } from "./rsi/Phase";
@@ -47,7 +49,7 @@ interface SidebarProps {
 function Brand() {
   return (
     <div className="flex items-center gap-2.5">
-      <span className="grid size-7 place-items-center rounded-md border border-border-strong bg-gradient-to-b from-white/[0.10] to-white/[0.02] text-foreground">
+      <span className="grid size-7 place-items-center rounded-md border border-border-strong bg-surface text-foreground">
         <Orbit size={15} strokeWidth={2} />
       </span>
       <span className="text-body font-semibold tracking-tight text-foreground">
@@ -125,7 +127,7 @@ export function Sidebar({
             openAlerts > 0 && (
               <span
                 title={`${openAlerts} open alert${openAlerts === 1 ? "" : "s"}`}
-                className="tnum rounded bg-destructive/15 px-1.5 py-px text-micro font-medium text-destructive"
+                className="tnum rounded bg-fail-tint px-1.5 py-px text-micro font-medium text-destructive"
               >
                 {openAlerts}
               </span>
@@ -198,6 +200,7 @@ export function Sidebar({
         />
         <span className="truncate font-mono">{window.location.host}</span>
         <span className="ml-auto">{error ? "offline" : "online"}</span>
+        <ThemeSwitch />
       </div>
     </aside>
   );
@@ -313,9 +316,9 @@ function SessionRow({
       aria-current={selected ? "true" : undefined}
       title={[agentId || sessionId, sessionId, task].filter(Boolean).join("\n")}
       className={cx(
-        "relative block w-full min-w-0 rounded-md px-2.5 py-1.5 text-left transition-colors",
+        "relative block w-full min-w-0 rounded-control px-2.5 py-1.5 text-left transition-colors",
         FOCUS_RING_INSET,
-        selected ? "bg-surface-selected" : "hover:bg-sidebar-accent",
+        selected ? "bg-surface-selected" : "hover:bg-surface-hover",
       )}
     >
       {attention && (
@@ -371,11 +374,12 @@ function NavItem({
       onClick={onClick}
       aria-current={active ? "page" : undefined}
       className={cx(
-        "flex h-8 w-full items-center gap-2.5 rounded-md px-2.5 text-left text-label font-medium transition-colors",
+        // A fixed row: 32 px, 44 px under a finger.
+        "flex h-8 w-full items-center gap-2.5 rounded-control px-2.5 text-left text-label transition-colors pointer-coarse:h-11",
         FOCUS_RING_INSET,
         active
-          ? "bg-surface-selected text-foreground"
-          : "text-muted-foreground hover:bg-sidebar-accent hover:text-foreground",
+          ? "bg-surface-selected font-semibold text-foreground"
+          : "font-medium text-muted-foreground hover:bg-surface-hover hover:text-foreground",
       )}
     >
       <span className={active ? "text-foreground" : "text-faint-foreground"}>
@@ -405,7 +409,7 @@ function AttentionCount({ count, error }: HumanCount) {
   return (
     <span
       title={`${count} thing${count === 1 ? "" : "s"} in Escalations (the dispatcher's queue)`}
-      className="tnum rounded bg-warning/15 px-1.5 py-px text-micro font-medium text-warning"
+      className="tnum rounded bg-wait-tint px-1.5 py-px text-micro font-medium text-warning"
     >
       {count}
     </span>
@@ -476,5 +480,39 @@ export function MobileNav({
         ))}
       </div>
     </div>
+  );
+}
+
+const THEME_ICON = { system: Monitor, light: Sun, dark: Moon } as const;
+
+/** The page's theme: the system's, light or dark (src/theme.ts). */
+function ThemeSwitch() {
+  const [choice, choose] = useStoredChoice<ThemeChoice>(THEME_KEY, THEME_CHOICES, "system");
+  useTheme(choice);
+  return (
+    <span role="radiogroup" aria-label="Theme" className="flex items-center gap-px rounded-md p-px ring-1 ring-surface-border">
+      {THEME_CHOICES.map((option) => {
+        const Icon = THEME_ICON[option];
+        return (
+          <button
+            key={option}
+            type="button"
+            role="radio"
+            aria-checked={choice === option}
+            title={`Theme: ${option}`}
+            onClick={() => choose(option)}
+            className={cx(
+              "grid size-5 place-items-center rounded-[5px]",
+              FOCUS_RING_INSET,
+              choice === option
+                ? "bg-surface-selected text-foreground"
+                : "text-faint-foreground hover:text-muted-foreground",
+            )}
+          >
+            <Icon size={12} strokeWidth={2} />
+          </button>
+        );
+      })}
+    </span>
   );
 }
