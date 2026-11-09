@@ -1059,6 +1059,38 @@ printf '#[test]\nfn broken() { let x: u32 = "no"; }\n' >>"$seed/tests/extra.rs"
 broken=$(commit rust-broken)
 expect "tests that do not build are refused" "$(judge_rust "$broken")" 'candidate tests do not build'
 
+# 7b. The candidate's scenarios run the binary its build hook built, as the
+# base's do, never the one the test listing linked again. Here a
+# dev-dependency turns on a feature, as spawn-core's `testing` does in
+# Spawn. The `spawn` bin says whether it was built with it, and 095 wants
+# it built without, on both trees.
+git -C "$seed" checkout -q -B rust-bin-base "$rust_base"
+printf '\n[features]\ntesting = []\n\n[dev-dependencies]\nt = { path = ".", features = ["testing"] }\n' \
+    >>"$seed/Cargo.toml"
+mkdir -p "$seed/src/bin"
+printf 'fn main() {\n    println!("{}", if cfg!(feature = "testing") { "testing" } else { "plain" });\n}\n' \
+    >"$seed/src/bin/spawn.rs"
+(cd "$seed" && CARGO_NET_OFFLINE=true cargo generate-lockfile -q)
+bin_base=$(commit rust-bin-base)
+printf 'two\n' >"$seed/value"
+bin_candidate=$(commit rust-bin-candidate)
+feature_scenarios=$work/feature-bin
+mkdir -p "$feature_scenarios"
+cp "$scenarios/protected" "$feature_scenarios/"
+printf '#!/bin/sh\nCARGO_TARGET_DIR="$PWD/target" cargo build -q --bin spawn\n' >"$feature_scenarios/build"
+printf '#!/bin/sh\nout=$("$SPAWN_BIN")\n[ "$out" = plain ] || { echo "SPAWN_BIN was built $out"; exit 1; }\n' \
+    >"$feature_scenarios/095.sh"
+# The control, a check (it must pass on the candidate): by the time the
+# candidate's scenarios run, the listing has linked target/debug/spawn
+# again, with the feature.
+printf '#!/bin/sh\nout=$(target/debug/spawn)\n[ "$out" = testing ] || { echo "target/debug/spawn was built $out"; exit 1; }\n' \
+    >"$feature_scenarios/check-relinked.sh"
+saved_base=$base
+base=$bin_base
+expect "the candidate's scenarios run its build hook's binary, not the listing's" \
+    "$(judge "$bin_candidate" "" "$feature_scenarios")" 'exit=0 {"verdict":"accepted"}'
+base=$saved_base
+
 # 8. Nor relax its lints: [lints] tables, clippy.toml, crate-level allows,
 # a removed crate-level deny.
 branch lints-table
