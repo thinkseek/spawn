@@ -44,7 +44,14 @@
 # Rows: inserts naming only the columns of tests/first-shapes.sql, which every
 # later schema keeps, so the same SQL writes into any base; each skipped where
 # the base has no such table (a tree that is not Spawn's, the suite's
-# fixture). Not done: migrate's second step, the logins' passwords (role
+# fixture). Then the migrated database's columns are compared with those of
+# a fresh database that took the candidate's schema alone: every table's
+# columns, in order, with their types and nullability. An `alter table … add
+# column if not exists` left out passes everything above (the base's table
+# exists, so `create table if not exists` adds nothing, and plpgsql does not
+# read columns until it runs) and fails every write that names the column;
+# here it is the missing column. Defaults are not compared. Not done:
+# migrate's second step, the logins' passwords (role
 # attributes, set again on every start).
 #
 # Exit status: 0 the candidate's schema migrates the base's database (or
@@ -82,10 +89,15 @@ pg_url_export "$SPAWN_TEST_DATABASE_URL" ||
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 db="check_schema_upgrade_$run"
 work=$(mktemp -d) || harness "mktemp failed"
+fresh="${db}_fresh"
 made=""
+made_fresh=""
 cleanup() {
     if [ -n "$made" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$db" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$made_fresh" ]; then
+        sh "$controller/scripts/blackbox/scenario-db.sh" drop "$fresh" >/dev/null 2>&1 || true
     fi
     rm -rf "$work"
 }
@@ -97,9 +109,26 @@ psql -X -d postgres -tA -c "create database $db" >/dev/null 2>"$work/create.err"
     harness "cannot create the scratch database: $(head -n 3 "$work/create.err")"
 made=1
 
-# apply <tree>: its schema.sql over the scratch database, as migrate does.
+# apply <tree> [database]: its schema.sql over the scratch database (or
+# the one named), as migrate does.
 apply() {
-    psql -X -q -d "$db" -1 -v ON_ERROR_STOP=1 -f "$1/$schema" >"$work/apply.out" 2>&1
+    psql -X -q -d "${2:-$db}" -1 -v ON_ERROR_STOP=1 -f "$1/$schema" >"$work/apply.out" 2>&1
+}
+# columns <database>: every column of its tables in the schema the file
+# made them in, table by table, in order (renumbered: a column dropped in
+# place leaves a gap a fresh table does not have), with type and nullability.
+columns() {
+    psql -X -d "$1" -tA -c "select format('%s #%s %s %s %s', c.table_name,
+                                          row_number() over (partition by c.table_name
+                                                             order by c.ordinal_position),
+                                          c.column_name, c.data_type, c.is_nullable)
+                              from information_schema.columns c
+                              join information_schema.tables t
+                                on t.table_schema = c.table_schema
+                               and t.table_name = c.table_name
+                             where c.table_schema = current_schema()
+                               and t.table_type = 'BASE TABLE'
+                             order by c.table_name, c.ordinal_position"
 }
 # reachable: the server still answers (a failure that is the server's is a
 # harness failure, never the candidate's).
@@ -177,4 +206,24 @@ if [ -n "$(psql -X -d "$db" -tA -c "select to_regclass('mission_tasks')")" ]; th
         exit 1
     fi
 fi
-echo "check-schema-upgrade: the candidate's schema.sql migrates the base's database, and applies over itself"
+# The migrated columns against a fresh database's.
+psql -X -d postgres -tA -c "create database $fresh" >/dev/null 2>"$work/create.err" ||
+    harness "cannot create the fresh database: $(head -n 3 "$work/create.err")"
+made_fresh=1
+if ! apply "$candidate" "$fresh"; then
+    reachable || harness "the server stopped answering while the candidate's schema applied fresh"
+    echo "check-schema-upgrade: the candidate's schema.sql does not apply to an empty database:"
+    said
+    exit 1
+fi
+columns "$db" >"$work/migrated.cols" 2>"$work/cols.err" ||
+    { reachable || harness "the server stopped answering"; harness "reading the migrated columns failed: $(head -n 3 "$work/cols.err")"; }
+columns "$fresh" >"$work/fresh.cols" 2>"$work/cols.err" ||
+    harness "reading the fresh columns failed: $(head -n 3 "$work/cols.err")"
+[ -s "$work/fresh.cols" ] || harness "the fresh database has no columns to compare"
+if ! diff "$work/fresh.cols" "$work/migrated.cols" >"$work/cols.diff"; then
+    echo "check-schema-upgrade: the migrated database's columns differ from a fresh one's (< fresh, > migrated; an added column needs its \`alter table ... add column if not exists\`, appended):"
+    grep -E '^[<>]' "$work/cols.diff" | head -n 10 | sed 's/^/  /'
+    exit 1
+fi
+echo "check-schema-upgrade: the candidate's schema.sql migrates the base's database, and applies over itself; every table's columns are as a fresh database has them"

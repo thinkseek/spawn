@@ -2604,7 +2604,10 @@ fi
 # v(a, b): a candidate that appends a column is accepted; one that puts it
 # mid-list is rejected with PostgreSQL's own words (42P16, what refused
 # 554a4bd4's deploy); one whose schema does not apply over itself is
-# rejected as such.
+# rejected as such. A candidate that adds a column to t in its create table
+# alone (no `alter table ... add column if not exists`, which the base's
+# database needs: its t exists) is rejected naming the missing column, and
+# accepted with the alter.
 schema_ctl=$work/schema-ctl
 mkdir -p "$schema_ctl/rsi/scenarios"
 cp -r "$(dirname "$gate")/.." "$schema_ctl/scripts"
@@ -2631,6 +2634,13 @@ schema_twice=$(schema_candidate schema-twice \
     'create table if not exists t (a integer, b integer);
 create or replace view v as select a, b from t;
 create table t2 (x integer);')
+schema_column=$(schema_candidate schema-column \
+    'create table if not exists t (a integer, b integer, c integer);
+create or replace view v as select a, b from t;')
+schema_altered=$(schema_candidate schema-altered \
+    'create table if not exists t (a integer, b integer, c integer);
+alter table t add column if not exists c integer;
+create or replace view v as select a, b from t;')
 # On a server of the gate's own (the suite has no shared test server), from
 # the host's PostgreSQL programs; without them the case says so.
 schema_pg=${SPAWN_GATE_PG_BIN:-/usr/lib/postgresql/16/bin}
@@ -2652,6 +2662,10 @@ if [ -x "$schema_pg/postgres" ] && [ -x "$schema_pg/initdb" ]; then
         "the candidate's schema.sql cannot migrate the base's database (a deploy would refuse it the same way)"
     expect "one that does not apply over itself is rejected" "$(schema_judge "$schema_twice")" '"verdict":"rejected"'
     expect "saying so" "$(cat "$work/gate.out")" "applied once but not over itself"
+    expect "a column added without its alter is rejected" "$(schema_judge "$schema_column")" '"verdict":"rejected"'
+    expect "naming the column a fresh database has" "$(cat "$work/gate.out")" "< t #3 c integer YES"
+    expect "with its alter it is accepted" "$(schema_judge "$schema_altered")" 'exit=0 {"verdict":"accepted"}'
+    expect "the columns compared" "$(cat "$work/gate.out")" "every table's columns are as a fresh database has them"
 else
     echo "note: no PostgreSQL programs in $schema_pg: the schema upgrade case is not run"
 fi
