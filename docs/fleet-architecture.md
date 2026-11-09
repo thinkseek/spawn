@@ -1543,7 +1543,15 @@ are per-agent uids or a mount per engine.
      base `head_base` = `git merge-base <head> <main>` (the `main` the head
      last took in), candidate the pushed head. The head passes: the verdict
      is `incompatible` (below). The head fails too: `rejected`. The head's
-     run gives no verdict: `aborted` (or `no_room`), naming the head. When
+     run gives no verdict: `aborted` (or `no_room`, or a host fault),
+     naming the head. Such a record's log and fact are the head's run on
+     `head_base`, never the merge's on `main`: it carries `head` and
+     `head_base`, its reason begins "the merge with main <main> was rejected
+     (<reason>); judging the work alone against the base it was built on,
+     <head_base>, gave no verdict:", and the supervisor's digest item says
+     the work was judged alone on that base (Supply PA's task 207,
+     2026-11-09, read as main failing check-tests while its head_base was
+     the red main). When
      the head contains `main`, a rejection of C is a rejection and no second
      run happens. The decision rests on two recorded verdicts on named
      commits, never on the text of a reason or on timing. The second run
