@@ -282,6 +282,7 @@ preflight() {
     version=$(sha256sum "$root/bin/remote" 2>/dev/null | cut -d' ' -f1) || version="unknown"
     printf 'version=%s\n' "$version"
     printf 'root=%s\n' "$root"
+    printf 'host=%s\n' "$(uname -n)"
     tool sh sh -c 'echo sh ok'
     tool git git --version
     tool tar tar --version

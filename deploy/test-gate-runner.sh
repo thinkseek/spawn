@@ -243,6 +243,7 @@ expect "the verdict comes back" "$(jq -r .verdict "$job/verdict.json")" accepted
 expect "the verdict names the commits judged" \
     "$(jq -r '.base + " " + .candidate' "$job/verdict.json")" "$base $candidate"
 expect "the record names one attempt" "$(jq -r '.attempts | length' "$job/record.json")" 1
+expect "the record names the machine that judged" "$(jq -r .host "$job/record.json")" "$(uname -n)"
 expect "and its result" "$(jq -r '.result' "$job/record.json")" verdict
 expect "the attempt's time is in seconds (a gate of exit 0 here takes well under 600)" \
     "$(jq '.attempts[0].seconds | (. >= 0 and . < 600 and . == floor)' "$job/record.json")" true

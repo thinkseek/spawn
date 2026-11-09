@@ -443,6 +443,9 @@ place() {
 }
 
 # the_record <result> <exit|-> <attempts json>: the record.json, one line.
+# `host` is the machine that judged, as its own preflight names it (uname -n),
+# null from a runner whose helper does not say: `runner` is only the name this
+# side dials, and a verdict must say where it was judged (objective 035's env).
 the_record() { # <result> <exit> <attempts-json> [<reason>]
     local result=$1 code=$2 attempts=$3 reason=${4:-}
     jq -cn \
@@ -450,8 +453,9 @@ the_record() { # <result> <exit> <attempts-json> [<reason>]
         --arg base "$base_sha" --arg candidate "$candidate_sha" --arg scenarios "$scenarios" \
         --arg result "$result" --arg reason "$reason" --argjson exit "$code" \
         --arg started "$started_at" --argjson attempts "$attempts" \
-        '{job: $job, runner: $runner, source: $source, base: $base, candidate: $candidate,
-          scenarios: $scenarios, started: $started, attempts: $attempts,
+        --arg host "$(pv "$stage_dir/preflight" host)" \
+        '{job: $job, runner: $runner, host: (if $host == "" then null else $host end),
+          source: $source, base: $base, candidate: $candidate, scenarios: $scenarios, started: $started, attempts: $attempts,
           result: $result, exit: $exit} + (if $reason == "" then {} else {reason: $reason} end)'
 }
 
