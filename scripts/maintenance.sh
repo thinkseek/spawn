@@ -138,8 +138,11 @@ if whole SPAWN_MAINTENANCE_CACHE_AGE_DAYS "$days" 2>/dev/null && [ -d "$servers"
         -regextype posix-extended -regex '.*/[0-9a-f]{64}' | sort) \
         $(find "$servers" -mindepth 1 -maxdepth 1 -type d -user "$(id -u)" \
             -regextype posix-extended -regex '.*/\.[0-9a-f]{64}\.[A-Za-z0-9]{6}' -mmin +1440 | sort); do
-        case "$root" in
-        */.*) ;;
+        # By its own name: the path above it may hold a dot directory
+        # (~/.cache), and a match on the whole path took every template
+        # for a half-made one and removed it whatever its age.
+        case "${root##*/}" in
+        .*) ;;
         *)
             # In use within the age (`ready` touched at each start), or a
             # gate is making it: it stays.
