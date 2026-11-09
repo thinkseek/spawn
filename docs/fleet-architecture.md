@@ -957,10 +957,11 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   does with it; clears under 0.5, or when the session's current execution
   has ended, whatever the cause, with the Bridge's `execution.ended` as
   evidence; a session whose current execution has ended fires none),
-  `judge_down` (the model judge's watcher recorded `host.judge` `down`, a
-  call failed after its last answer, and no `up` after it for
-  `SPAWN_ALERT_JUDGE_DOWN_SECS`, default 900: no call answered for that
-  long; clears at the `up`, the first answer, with `failed_calls`; it rests
+  `judge_down` (the model judge's watcher recorded `host.judge` `down`, two
+  calls in a row failed after its last answer, and no `up` after it,
+  `SPAWN_ALERT_JUDGE_DOWN_SECS` after the first failed (default 900): no
+  call answered since; one failure alone records nothing; clears at the
+  `up`, the first answer, with `failed_calls`; it rests
   on that record, never on how few judgements a judge that is down leaves:
   an open `agent_stuck` also shows when its session was last scored),
   `admission_wait` (objective 029's record older than

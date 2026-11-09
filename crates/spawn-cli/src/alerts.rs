@@ -74,13 +74,15 @@
 //!   one is under 0.5, or when the session's current execution has ended,
 //!   whatever the cause (stopped, exited, lost), with that end as evidence.
 //! - `judge_down`, the judge's name (`jev`), key `judge_down:<its
-//!   host.judge down event>`: the model judge's watcher recorded `down` (a
-//!   call failed after its last answer, crate judge_watch.rs) and no `up`
-//!   after it for `SPAWN_ALERT_JUDGE_DOWN_SECS` (default 900): no call
-//!   answered for that long. It rests on that record, not on the absence
-//!   of judgements (a judge that is down writes few: the Observer records a
-//!   failure once, not each retry). Clears at the `up` record, the first
-//!   call answered, with its `failed_calls`.
+//!   host.judge down event>`: the model judge's watcher recorded `down` (two
+//!   calls in a row failed after its last answer, crate judge_watch.rs) and
+//!   no `up` after it, `SPAWN_ALERT_JUDGE_DOWN_SECS` (default 900) after the
+//!   first of them failed (`first_failed_ms`): no call answered since. It
+//!   rests on that record, not on the absence of judgements (a judge that
+//!   is down writes few: the Observer records a failure once, not each
+//!   retry). Clears at the `up` record, the first call answered, with its
+//!   `failed_calls`; an `up` whose `down` is older than the history (a loop
+//!   restarted during a week-long outage) clears the judge's open alert.
 //! - `admission_wait`, an execution's `agent_id` or a gate's `task #<id>`,
 //!   key `admission_wait:<its admission.waiting event>`: an
 //!   `admission.waiting` (029) older than `SPAWN_ALERT_ADMISSION_SECS`
@@ -863,9 +865,14 @@ times in a row)",
             Some("down") => {
                 // A second `down` with no `up` between keeps the first: the
                 // judge has answered nothing since it.
+                // The bound runs from the first failed call, when known.
+                let first = record["first_failed_ms"]
+                    .as_i64()
+                    .unwrap_or(at_ms)
+                    .min(at_ms);
                 self.judge_down.entry(judge.clone()).or_insert(Pending {
                     event_id,
-                    at_ms,
+                    at_ms: first,
                     subject: judge,
                     evidence: json!({"error": scrub(record["error"].as_str().unwrap_or_default())}),
                 });
@@ -880,6 +887,18 @@ times in a row)",
                             "down_ms": at_ms.saturating_sub(pending.at_ms),
                         }),
                     });
+                } else {
+                    // Its `down` fell out of the history: the open alert
+                    // still clears, without a span.
+                    for key in self.open_keys("judge_down", &judge) {
+                        out.push(Event::Clear {
+                            key,
+                            evidence: json!({
+                                "event_id": event_id,
+                                "failed_calls": record["failed_calls"],
+                            }),
+                        });
+                    }
                 }
             }
             _ => {}
@@ -1115,7 +1134,8 @@ times in a row)",
                     "event_id": pending.event_id,
                 }),
                 text: format!(
-                    "the model judge {} has answered no call for {} s: {error}",
+                    "the model judge {} failed two calls in a row, the first {} s ago, \
+                     and has answered none since: {error}",
                     pending.subject,
                     now.saturating_sub(pending.at_ms) / 1000
                 ),
@@ -3285,16 +3305,24 @@ connections\n";
 
         /// The model judge's `down` record (crate judge_watch.rs), read back
         /// through the store's history as a restarted loop reads it: no
-        /// alert before SPAWN_ALERT_JUDGE_DOWN_SECS, `judge_down` at it, once,
-        /// and its `up` record, read as the next pass reads the control
-        /// stream, clears it with `failed_calls`.
+        /// alert before SPAWN_ALERT_JUDGE_DOWN_SECS after its first failed
+        /// call (30 s before the record), `judge_down` at it, once, and its
+        /// `up` record, read as the next pass reads the control stream,
+        /// clears it with `failed_calls`. A loop whose history no longer
+        /// holds the `down` (restarted a week into the outage) clears the
+        /// open alert at the `up` all the same.
         #[test]
         fn a_judge_down_for_its_bound_fires_once_and_its_up_clears_it() {
             in_schema("judge_down", |store| {
                 let mut monitor = monitor();
+                let first = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(0))
+                    - 30_000;
                 let down = store
                     .host_record(&json!({"type": "host.judge", "judge": "jev",
-                                         "state": "down", "error": "judge unavailable: 502"}))
+                                         "state": "down", "error": "judge unavailable: 502",
+                                         "first_failed_ms": first}))
                     .expect("record down");
                 let history = store.alert_history(0, 100).expect("history");
                 let mut fed = Vec::new();
@@ -3307,7 +3335,8 @@ connections\n";
                     );
                 }
                 assert!(fed.is_empty(), "a down is not yet an alert");
-                let at = history[0]["at_ms"].as_i64().expect("its time");
+                assert!(history[0]["at_ms"].as_i64().is_some_and(|at| at > first));
+                let at = first;
                 let mut early = Vec::new();
                 monitor.bounds(at + 899_999, &mut early);
                 assert!(early.is_empty(), "never before its bound");
@@ -3327,9 +3356,14 @@ connections\n";
                 assert_eq!(subject, "jev");
                 assert_eq!(evidence["down_ms"], 900_000);
                 assert_eq!(evidence["error"], "judge unavailable: 502");
-                assert!(text.contains("answered no call for 900 s"), "{text}");
+                assert!(
+                    text.contains("failed two calls in a row, the first 900 s ago"),
+                    "{text}"
+                );
                 let recorded = decided(&monitor, due);
                 commit(&mut monitor, &recorded);
+                let mut restarted = super::monitor();
+                commit(&mut restarted, &recorded);
                 let mut again = Vec::new();
                 monitor.bounds(at + 1_800_000, &mut again);
                 assert!(decided(&monitor, again).is_empty(), "once per occurrence");
@@ -3353,7 +3387,25 @@ connections\n";
                 assert_eq!(cleared[0].0, key);
                 assert_eq!(cleared[0].1["event_id"], up);
                 assert_eq!(cleared[0].1["failed_calls"], 41);
-                assert!(cleared[0].1["down_ms"].as_i64().is_some_and(|ms| ms >= 0));
+                assert!(
+                    cleared[0].1["down_ms"]
+                        .as_i64()
+                        .is_some_and(|ms| ms >= 30_000)
+                );
+
+                let mut orphan = Vec::new();
+                for entry in batch["records"].as_array().into_iter().flatten() {
+                    restarted.feed(
+                        entry["event_id"].as_i64().unwrap_or_default(),
+                        entry["at_ms"].as_i64().unwrap_or_default(),
+                        &entry["record"],
+                        &mut orphan,
+                    );
+                }
+                let orphan = cleared_by(&decided(&restarted, orphan));
+                assert_eq!(orphan.len(), 1, "the up with no down known: {orphan:?}");
+                assert_eq!(orphan[0].0, key);
+                assert_eq!(orphan[0].1["event_id"], up);
             });
         }
 
