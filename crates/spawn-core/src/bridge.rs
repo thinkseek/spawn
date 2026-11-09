@@ -399,6 +399,11 @@ struct Follow {
     /// When the end's final checkpoint was last tried, by the Bridge's
     /// clock: a stalled end retries every [`END_RETRY_MS`].
     end_tried_at: Option<i64>,
+    /// When the end's kill last failed (the runner outlived it), by the
+    /// Bridge's clock: the kill blocks the Bridge's loop for its whole wait
+    /// (TerminalHost::terminate), so it is tried again only after
+    /// [`END_RETRY_MS`], discard or not (rev-f on 204d1a1f).
+    kill_failed_at: Option<i64>,
     /// The workspace answered [`WORKSPACE_STALE`] with this message: it
     /// cannot checkpoint to its branch again, and its state is kept off it,
     /// so the execution is ended (and its workspace unmounted) instead of
@@ -1813,16 +1818,21 @@ impl Bridge {
         // The checkpoint and the terminal are behind an end that recorded
         // its unmount: what is left is the unmount and the record.
         if active.unmounting {
+            if self.kill_waits(active) {
+                return Ok(false);
+            }
             // A restart may find the engine's terminal still there.
             if let Err(error) = self
                 .terminals
                 .terminate(&active.terminal(), &active.workspace)
             {
+                active.follow.kill_failed_at = Some(self.clock.now().0);
                 report
                     .warnings
                     .push(format!("terminate {}: {error}", active.terminal()));
                 return Ok(false);
             }
+            active.follow.kill_failed_at = None;
             return self.finish_end(agent_id, session, active, ending, report);
         }
         // A checkpoint whose record waits is recorded before the end.
@@ -1844,6 +1854,12 @@ impl Bridge {
         {
             return Ok(false);
         }
+        // A runner that outlived its last kill: the next waits, so a runner
+        // that will not die holds the loop once per END_RETRY_MS, not every
+        // tick.
+        if self.kill_waits(active) {
+            return Ok(false);
+        }
         active.follow.end_tried_at = Some(now);
         // The runner first, gone with everything it started: what the engine
         // writes as it dies is in the checkpoint below.
@@ -1851,10 +1867,12 @@ impl Bridge {
             .terminals
             .terminate(&active.terminal(), &active.workspace)
         {
+            active.follow.kill_failed_at = Some(now);
             let error = format!("terminate {}: {error}", active.terminal());
             report.warnings.push(error.clone());
             return self.end_failed(agent_id, session, active, (false, error), report);
         }
+        active.follow.kill_failed_at = None;
         let committed = self.checkpoint(
             agent_id,
             session,
@@ -1923,6 +1941,16 @@ impl Bridge {
             },
         )?;
         Ok(true)
+    }
+
+    /// Whether the end's last kill failed within [`END_RETRY_MS`]: the next
+    /// kill waits for it.
+    fn kill_waits(&self, active: &Active) -> bool {
+        let now = self.clock.now().0;
+        active
+            .follow
+            .kill_failed_at
+            .is_some_and(|at| now.saturating_sub(at) < END_RETRY_MS)
     }
 
     /// One end attempt failed, at its kill (`checkpoint` false: the runner
@@ -2351,6 +2379,7 @@ impl Bridge {
             held.reported_end = active.reported_end;
             held.follow.end_failures = active.follow.end_failures;
             held.follow.end_tried_at = active.follow.end_tried_at;
+            held.follow.kill_failed_at = active.follow.kill_failed_at;
             held.follow.evidence = active.follow.evidence;
         }
         report.warnings.insert(
@@ -2987,6 +3016,7 @@ impl Bridge {
                 held.reported_end = ending.reported_end;
                 held.follow.end_failures = ending.follow.end_failures;
                 held.follow.end_tried_at = ending.follow.end_tried_at;
+                held.follow.kill_failed_at = ending.follow.kill_failed_at;
                 held.follow.evidence = ending.follow.evidence;
             }
         }
@@ -3496,6 +3526,7 @@ impl Bridge {
             held.reported_end = active.reported_end;
             held.follow.end_failures = active.follow.end_failures;
             held.follow.end_tried_at = active.follow.end_tried_at;
+            held.follow.kill_failed_at = active.follow.kill_failed_at;
             held.follow.evidence = active.follow.evidence;
         }
         if report.warnings.is_empty() {

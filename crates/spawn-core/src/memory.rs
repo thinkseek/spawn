@@ -114,6 +114,8 @@ struct State {
     outlives: HashMap<TerminalName, u32>,
     /// Workspaces unmounted with uncommitted work in them.
     unmounted_dirty: Vec<WorkspaceId>,
+    /// Every `terminate` call, failed or not.
+    terminates: usize,
 }
 
 impl State {
@@ -334,6 +336,11 @@ impl MemoryStore {
     /// each fails, the terminal still there. Test helper.
     pub fn outlive_kills(&self, terminal: &TerminalName, kills: u32) {
         self.lock().outlives.insert(terminal.clone(), kills);
+    }
+
+    /// How many times `terminate` was called. Test helper.
+    pub fn terminates(&self) -> usize {
+        self.lock().terminates
     }
 
     /// The workspaces unmounted with uncommitted work in them: work lost.
@@ -907,6 +914,7 @@ impl TerminalHost for MemoryStore {
         workspace: &WorkspaceId,
     ) -> Result<(), TerminalError> {
         let mut state = self.lock();
+        state.terminates += 1;
         if let Some(left) = state.outlives.get_mut(terminal).filter(|left| **left > 0) {
             *left -= 1;
             return Err(TerminalError(format!(
