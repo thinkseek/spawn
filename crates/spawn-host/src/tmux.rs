@@ -100,7 +100,13 @@ impl TmuxHost {
                 .lines()
                 .filter_map(|line| line.trim().parse().ok())
                 .collect()),
-            Some(1) if gone(&run.stderr) => Ok(Vec::new()),
+            // A terminal already gone has nothing to wait for. `list-panes
+            // -s -t` names a missing session's window: "can't find window"
+            // (the shared contract terminates a missing terminal; batch
+            // 14's owner gate).
+            Some(1) if gone(&run.stderr) || run.stderr.contains("can't find window") => {
+                Ok(Vec::new())
+            }
             other => Err(TerminalError(format!(
                 "list-panes returned {other:?}: {}",
                 run.stderr.trim()
