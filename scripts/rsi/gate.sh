@@ -1855,6 +1855,93 @@ runs_alone() {
     [ -n "$serial_list" ] && printf '%s\n' "$serial_list" | grep -qxF -- "$(basename "$1")"
 }
 
+# The order runs start in (design-gate-time.md, cut B). The log and the
+# verdict keep the scenario order (above); only the start order changes,
+# and only with more than one run at a time: the runs on the serial list
+# first, one by one, while nothing else runs (together, not scattered
+# between the others, where each would wait for the runs before it to end
+# and leave slots idle); then the job's own task and check-tests (`head`:
+# the candidate's runs that decide most often); then the rest, longest
+# first by the time the scenario's last completed run took in that phase,
+# a scenario with no time yet first among them. The longest runs no longer
+# start last and leave one slot busy alone at the end: on Spawn's measured
+# phases about 80 s each (sim2.py). The times are the host's, under
+# ${XDG_CACHE_HOME:-~/.cache}/spawn/gate-times/<the repository's root
+# commit>/<phase>.<scenario>: one number, milliseconds, written after a run
+# that completed (exit 0, solved or unsolved), read by the next gate of the
+# same repository; never in a base cache key: the order changes no result.
+# What it costs: a failure late in the scenario order may be found later,
+# and a run's neighbours change (what `serial` is for).
+gate_times_dir=""
+# job_times_dir: the repository's directory of times, made once.
+job_times_dir() {
+    if [ -z "$gate_times_dir" ]; then
+        jt_root=$(git --git-dir="$repo" rev-list --max-parents=0 "$base_commit" 2>/dev/null | LC_ALL=C sort | head -n 1)
+        gate_times_dir=${XDG_CACHE_HOME:-$HOME/.cache}/spawn/gate-times/${jt_root:-unknown}
+        mkdir -p "$gate_times_dir" 2>/dev/null || :
+    fi
+    printf '%s' "$gate_times_dir"
+}
+# job_time <phase> <scenario name>: its last completed run's milliseconds,
+# or nothing.
+job_time() {
+    jt_held=$(cat "$(job_times_dir)/$1.$2" 2>/dev/null) || jt_held=""
+    case "$jt_held" in '' | *[!0-9]*) ;; *) printf '%s' "$jt_held" ;; esac
+}
+# job_time_note <phase> <job>: the time of a job that completed, for the
+# next gate's order. Its runs' stage times added (an objective's two base
+# runs are one job, run in one slot), and a candidate run's last (`ms`, its
+# stage line said when it is printed).
+job_time_note() {
+    case "$(cat "$2/result" 2>/dev/null)" in 0 | solved | unsolved) ;; *) return 0 ;; esac
+    [ ! -e "$2/slot-waited" ] && [ ! -s "$2/never-started" ] || return 0
+    jn_ms=$(awk '$1 == "stage" { ms += $2 } END { print ms + 0 }' "$2/events" 2>/dev/null) || return 0
+    jn_last=$(cat "$2/ms" 2>/dev/null) || jn_last=0
+    case "$jn_last" in '' | *[!0-9]*) jn_last=0 ;; esac
+    jn_ms=$((jn_ms + jn_last))
+    [ "${jn_ms:-0}" -gt 0 ] 2>/dev/null || return 0
+    jn_file=$(job_times_dir)/$1.$(basename "$(cat "$2/scenario")")
+    printf '%s\n' "$jn_ms" >"$jn_file.$$" 2>/dev/null && mv -f "$jn_file.$$" "$jn_file" 2>/dev/null ||
+        rm -f "$jn_file.$$" 2>/dev/null || :
+}
+# job_order <phase> <count>: the start order of $jobs_dir/<phase>.1 ..
+# <count> (above), their numbers in jo_order; said in the log when it is
+# not the scenario order.
+job_order() {
+    jo_i=1 jo_known=0 jo_rest=0
+    : >"$work/order.$1"
+    while [ "$jo_i" -le "$2" ]; do
+        jo_job=$jobs_dir/$1.$jo_i
+        if [ -e "$jo_job/alone" ]; then
+            jo_group=0 jo_ms=0
+        elif [ -e "$jo_job/head" ]; then
+            jo_group=1 jo_ms=0
+        else
+            jo_group=2
+            jo_ms=$(job_time "$1" "$(basename "$(cat "$jo_job/scenario")")")
+            # A result already (a cache hit) never starts: not counted.
+            if [ ! -e "$jo_job/result" ]; then
+                jo_rest=$((jo_rest + 1))
+                [ -z "$jo_ms" ] || jo_known=$((jo_known + 1))
+            fi
+            [ -n "$jo_ms" ] || jo_ms=999999999999
+        fi
+        [ "$gate_jobs" -gt 1 ] || jo_group=0 jo_ms=0
+        printf '%s %s %s\n' "$jo_group" "$jo_ms" "$jo_i" >>"$work/order.$1"
+        jo_i=$((jo_i + 1))
+    done
+    jo_order=$(sort -k1,1n -k2,2nr -k3,3n "$work/order.$1" | awk '{ printf "%s%s", sep, $3; sep = " " }')
+    if [ "$jo_order" != "$(seq -s ' ' 1 "$2")" ] && [ "$2" -gt 0 ]; then
+        jo_names=""
+        for jo_i in $jo_order; do
+            [ ! -e "$jobs_dir/$1.$jo_i/result" ] || continue
+            jo_names="$jo_names $(basename "$(cat "$jobs_dir/$1.$jo_i/scenario")")"
+        done
+        [ -z "$jo_names" ] ||
+            echo "| $1 start order (serial list first, then the task and check-tests, then longest first by the last runs' times, $jo_known of $jo_rest known):$jo_names"
+    fi
+}
+
 # run_jobs <phase> <count> <start> <finished> <printed>: the jobs
 # $jobs_dir/<phase>.1 .. <count>, $gate_jobs at a time, in order. A job with
 # a result already (a cache hit) is not started. <start> <job> runs one, in
@@ -1864,20 +1951,31 @@ runs_alone() {
 run_jobs() {
     rj_phase=$1 rj_count=$2 rj_start=$3 rj_finished=$4 rj_printed=$5
     jobs_stop=$rj_count
-    rj_next=1 rj_print=1 rj_running="" rj_busy=0 rj_alone=""
+    rj_print=1 rj_running="" rj_busy=0 rj_alone=""
+    job_order "$rj_phase" "$rj_count"
+    rj_pending=$jo_order
     while [ "$rj_print" -le "$jobs_stop" ]; do
         rj_changed=""
-        while [ "$rj_next" -le "$jobs_stop" ] && [ -z "$rj_alone" ]; do
+        rj_left="" rj_blocked=""
+        for rj_next in $rj_pending; do
+            # Past the first decisive run in the scenario order: never needed.
+            [ "$rj_next" -le "$jobs_stop" ] || continue
             rj_job=$jobs_dir/$rj_phase.$rj_next
-            if [ -e "$rj_job/result" ]; then
-                rj_next=$((rj_next + 1))
+            [ ! -e "$rj_job/result" ] || continue
+            # In order: one that cannot start yet holds back every one after it.
+            if [ -n "$rj_blocked" ] || [ -n "$rj_alone" ]; then
+                rj_left="$rj_left $rj_next"
                 continue
             fi
             if [ -e "$rj_job/alone" ]; then
-                [ "$rj_busy" -eq 0 ] || break
+                if [ "$rj_busy" -ne 0 ]; then
+                    rj_blocked=1 rj_left="$rj_left $rj_next"
+                    continue
+                fi
                 rj_alone=$rj_next
             elif [ "$rj_busy" -ge "$gate_jobs" ]; then
-                break
+                rj_blocked=1 rj_left="$rj_left $rj_next"
+                continue
             fi
             # The gate's traps are not the job's; a failure inside it is
             # its result (`error`), never a silent end.
@@ -1895,9 +1993,9 @@ run_jobs() {
             phase_started=$((phase_started + 1))
             rj_running="$rj_running $rj_next"
             rj_busy=$((rj_busy + 1))
-            rj_next=$((rj_next + 1))
             rj_changed=1
         done
+        rj_pending=$rj_left
         rj_still=""
         for rj_i in $rj_running; do
             rj_job=$jobs_dir/$rj_phase.$rj_i
@@ -1932,6 +2030,7 @@ run_jobs() {
             fi
             if [ -e "$rj_job/result" ]; then
                 "$rj_finished" "$rj_job" "$rj_i"
+                job_time_note "$rj_phase" "$rj_job"
                 [ "$rj_alone" != "$rj_i" ] || rj_alone=""
                 rj_busy=$((rj_busy - 1))
                 rj_changed=1
@@ -3271,6 +3370,7 @@ seed() {
 if [ -n "$scenario" ]; then
     add_candidate_job "$scenario" "candidate: $(basename "$scenario") must pass"
     : >"$job/task"
+    : >"$job/head"
 fi
 for other in "$scenarios"/check-tests.sh "$scenarios"/*.sh; do
     [ -f "$other" ] || continue
@@ -3279,6 +3379,7 @@ for other in "$scenarios"/check-tests.sh "$scenarios"/*.sh; do
     [ "$other" = "$scenarios/check-tests.sh" ] && tests_queued=1
     grep -q '^# rsi: ratchet' "$other" && continue
     add_candidate_job "$other" "regression: $(basename "$other") must still pass"
+    [ "$other" != "$scenarios/check-tests.sh" ] || : >"$job/head"
 done
 stage_close ok
 # A fresh server for the candidate's runs: the base phase's runs leave the
