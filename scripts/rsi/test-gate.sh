@@ -1563,7 +1563,10 @@ expect "and says so, not a regression" "$(cat "$work/gate.out")" \
 expect "the base records the fact" "$(cat "$work/gate.out")" '| == base: 010.sh: cannot_judge'
 judge "$good" "" "$unjudgeable" >/dev/null
 expect "the fact is cached: one run on the base" "$(from_cache)" '010.sh'
-expect "and kept as cannot_judge" "$(grep -l '^cannot_judge$' "$cache"/* | wc -l)" '1'
+# -s: "an entry that is a directory is a miss" (above) left every entry and
+# every entry's .lock a directory, and grep named each one on stderr: about
+# 83 "Is a directory" lines in every suite log.
+expect "and kept as cannot_judge" "$(grep -ls '^cannot_judge$' "$cache"/* | wc -l)" '1'
 unjudged_task=$work/unjudged-task
 mkdir -p "$unjudged_task"
 printf 'judge/\n' >"$unjudged_task/protected"
