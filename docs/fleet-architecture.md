@@ -1731,8 +1731,17 @@ are per-agent uids or a mount per engine.
      `SPAWN_GATE_HOST_FAULT_CAP` and is never capped (§10.3).
      A task's report revision has at most `SPAWN_GATE_HOST_FAULT_CAP` (3 by
      default) host faults judged after the candidate ran (the test
-     database's), counted from its `task.gated` records: the next one at
-     that revision is recorded `aborted` instead, its reason saying so and
+     database's) against the same main, counted from its `task.gated`
+     records whose `base` is the main being judged now (a fault on an
+     older main says nothing of this one: Supply PA's task 207 had its
+     01:45 fault on fcf5e1e still counted at 08:32; a head judged alone is
+     recorded under main and counts there). The trade-off: every move of
+     main starts the count again, so on a busy source a candidate that
+     breaks the test server is capped only while main holds still; the
+     escalation at the second host fault in a row still tells the
+     supervisor. Every `host_fault` record names its `base` (the live
+     store's 10 of 10, 2026-11-09), so none is left uncounted. The next
+     one at that revision on that main is recorded `aborted` instead, its reason saying so and
      the fault kept under `host_fault`, so it counts toward the abort halt.
      A host fault is no verdict on the work, but one that keeps recurring on
      the same work may be the work's doing (candidate code leaving the test
