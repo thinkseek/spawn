@@ -13,7 +13,7 @@ import {
   metricPoints,
   openTask,
 } from "../../rsi";
-import { Button, Card, CardHeader, Eyebrow, LiveStatus, PageHeader, cx } from "../ui";
+import { Button, Card, CardHeader, Eyebrow, FOCUS_RING, LiveStatus, PageHeader, chip, cx } from "../ui";
 import { AgentPane } from "./AgentPane";
 import { ObjectiveName } from "./ObjectiveName";
 import { ChartLegend, MetricChart } from "./MetricChart";
@@ -59,7 +59,7 @@ export function RsiView({ onOpenSession }: RsiViewProps) {
         }
       >
         {data && data.missions.length > 1 && (
-          <div className="flex rounded-lg border border-surface-border bg-surface p-0.5">
+          <div className="flex gap-1.5">
             {data.missions.map((entry) => (
               <button
                 key={entry.id}
@@ -70,12 +70,7 @@ export function RsiView({ onOpenSession }: RsiViewProps) {
                   setChosenObjective(null);
                 }}
                 aria-current={entry.id === mission?.id ? "true" : undefined}
-                className={cx(
-                  "tnum h-6 rounded-md px-2 text-caption font-medium",
-                  entry.id === mission?.id
-                    ? "bg-surface-selected text-foreground"
-                    : "text-muted-foreground",
-                )}
+                className={cx("tnum", chip(entry.id === mission?.id), FOCUS_RING)}
               >
                 #{entry.id}
               </button>
@@ -435,7 +430,7 @@ function GuardsCard({
     <Card
       className={cx(
         "flex flex-col p-4",
-        halted && "border-destructive/40 bg-destructive/[0.06]",
+        halted && "border-destructive/40 bg-fail-tint",
       )}
     >
       <div className="flex items-center gap-2">

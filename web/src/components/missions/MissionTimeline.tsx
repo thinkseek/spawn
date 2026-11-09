@@ -47,7 +47,7 @@ import {
   useWheelZoom,
   useWidth,
 } from "../timeaxis/useTimeWindow";
-import { EmptyState, FOCUS_RING, FOCUS_RING_INSET, cx } from "../ui";
+import { EmptyState, FOCUS_RING, FOCUS_RING_INSET, chip, cx } from "../ui";
 import { useStoredChoice } from "../ViewToggle";
 import { TaskPanel } from "./TaskPanel";
 import { PHASE_COLOR, PHASE_LEGEND, verdictColor } from "./timelineStyle";
@@ -701,7 +701,7 @@ function Chips<T extends string | number | null>({
   options: ReadonlyArray<{ id: T; label: string }>;
 }) {
   return (
-    <div role="radiogroup" aria-label={label} className="flex min-w-0 flex-wrap items-center gap-1">
+    <div role="radiogroup" aria-label={label} className="flex min-w-0 flex-wrap items-center gap-1.5">
       {options.map((option) => (
         <button
           key={String(option.id)}
@@ -709,13 +709,7 @@ function Chips<T extends string | number | null>({
           role="radio"
           aria-checked={value === option.id}
           onClick={() => onChange(option.id)}
-          className={cx(
-            "h-6 max-w-56 truncate rounded-md px-2 text-caption transition-colors",
-            FOCUS_RING,
-            value === option.id
-              ? "bg-surface-selected font-medium text-foreground"
-              : "text-muted-foreground hover:bg-surface-hover hover:text-foreground",
-          )}
+          className={cx(chip(value === option.id), "max-w-56 truncate", FOCUS_RING)}
         >
           {option.label}
         </button>
@@ -760,10 +754,7 @@ function MissionChips({
           aria-expanded={more}
           onClick={onMore}
           title={more ? "Hide the closed missions" : "Show the closed missions"}
-          className={cx(
-            "inline-flex h-6 items-center gap-1 rounded-md px-2 text-caption text-muted-foreground transition-colors hover:bg-surface-hover hover:text-foreground",
-            FOCUS_RING,
-          )}
+          className={cx(chip(false), FOCUS_RING)}
         >
           {more ? "Fewer" : `More · ${closed.length} closed`}
           <ChevronRight

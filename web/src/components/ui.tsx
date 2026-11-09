@@ -275,6 +275,19 @@ export function Tabs<T extends string>({
   );
 }
 
+/** A filter chip: a pill with a hairline, the chosen one on the neutral
+ * selected fill. One style for every row of filters (missions, the
+ * scorecard's window, the RSI mission, the Show's speed): content is the
+ * colour on the page, the chips are not. */
+export function chip(on: boolean): string {
+  return cx(
+    "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-full px-3 text-caption shadow-hairline transition-[color,background-color,box-shadow]",
+    on
+      ? "bg-surface-selected font-medium text-foreground"
+      : "text-muted-foreground hover:bg-surface-hover hover:text-foreground",
+  );
+}
+
 /** The focus ring every interactive element shows on keyboard focus.
  * `outline-solid`, never `outline-none` beside it: in Tailwind 4,
  * `outline-none` sets the style variable `outline-2` reads to none. */

@@ -168,7 +168,7 @@ export function ScorecardView({ missions }: { missions: Missions | null }) {
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="mx-auto flex max-w-[1600px] flex-col gap-3 p-3 sm:p-4">
             {scorecard.error && (
-              <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/[0.08] px-3 py-2">
+              <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-fail-tint px-3 py-2">
                 <OctagonAlert size={14} className="mt-0.5 shrink-0 text-destructive" />
                 <div className="min-w-0 text-label">
                   <span className="font-medium text-destructive">

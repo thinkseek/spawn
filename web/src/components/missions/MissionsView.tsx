@@ -196,7 +196,7 @@ function ApprovalQueue({ residents }: { residents: Resident[] }) {
   return (
     <section
       aria-label="Residents waiting for human approval"
-      className="rounded-lg border border-warning/30 bg-warning/[0.07]"
+      className="rounded-lg border border-warning/30 bg-wait-tint"
     >
       <header className="flex items-center gap-2 border-b border-warning/20 px-4 py-2.5">
         <Hourglass size={15} className="shrink-0 text-warning" />
@@ -296,7 +296,7 @@ function ResidentRoster({ residents }: { residents: Resident[] }) {
               key={resident.name ?? `index-${index}`}
               className={cx(
                 "space-y-1.5 px-4 py-3",
-                resident.state === "proposed" && "bg-warning/[0.05]",
+                resident.state === "proposed" && "bg-wait-tint",
                 resident.state === "retired" && "opacity-60",
               )}
             >
@@ -443,7 +443,7 @@ function MissionCard({ mission }: { mission: Mission }) {
         </div>
 
         {mission.halted && (
-          <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/[0.08] px-3 py-2">
+          <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-fail-tint px-3 py-2">
             <OctagonAlert size={14} className="mt-0.5 shrink-0 text-destructive" />
             <div className="min-w-0 text-label">
               <span className="font-medium text-destructive">Halted</span>
@@ -511,7 +511,7 @@ function MissionCard({ mission }: { mission: Mission }) {
         )}
 
         {mission.summary && (
-          <div className="rounded-md border border-success/20 bg-success/[0.05] px-3 py-2">
+          <div className="rounded-md border border-success/20 bg-ok-tint px-3 py-2">
             <SectionLabel>Summary</SectionLabel>
             <Markdown source={mission.summary} className="mt-1" />
           </div>
@@ -762,7 +762,7 @@ function TaskRow({
       )}
 
       {(task.state === "revise" || task.revisions > 0) && (
-        <div className="rounded-md border border-warning/25 bg-warning/[0.06] px-3 py-2">
+        <div className="rounded-md border border-warning/25 bg-wait-tint px-3 py-2">
           <div className="flex items-center gap-1.5 text-caption font-medium text-warning">
             <RotateCcw size={12} />
             {task.state === "revise" ? "Sent back for revision" : "Revised"}

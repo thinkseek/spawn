@@ -13,7 +13,7 @@ import { focusObjective, fetchDashboard } from "../../rsi";
 import type { RsiMission } from "../../rsi";
 import { REPLAY_HOURS, REPLAY_SPEEDS } from "../../show";
 import type { Mode, Tone } from "../../show";
-import { cx } from "../ui";
+import { FOCUS_RING, chip, cx } from "../ui";
 import { TONE_COLOR, TONE_LABEL } from "./layout";
 import { Scene } from "./Scene";
 import { useShowFeed } from "./useShowFeed";
@@ -153,17 +153,14 @@ function Segment<T extends string | number>({
   onChange: (option: T) => void;
 }) {
   return (
-    <div className="flex gap-0.5">
+    <div className="flex gap-1.5">
       {options.map((option) => (
         <button
           key={option}
           type="button"
           aria-pressed={option === value}
           onClick={() => onChange(option)}
-          className={cx(
-            "rounded px-1.5 py-0.5 text-micro transition-colors",
-            option === value ? "bg-foreground/[0.07] text-foreground" : "text-faint-foreground hover:text-muted-foreground",
-          )}
+          className={cx(chip(option === value), FOCUS_RING)}
         >
           {label(option)}
         </button>
