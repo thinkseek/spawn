@@ -460,9 +460,11 @@ verdict() {
 # "base","candidate"}`. `on` is where it failed: `base` (a scenario's
 # harness error on the base, before any candidate code ran: its runs did
 # not agree, or it exited neither 0 nor 1), `candidate and base` (a check
-# that failed twice on the candidate and once on the base) or `sandbox` (a
+# that failed twice on the candidate and once on the base), `sandbox` (a
 # sandbox that never started its command, with the evidence
-# `sandbox_never_started`: "A sandbox that never started its command"). The
+# `sandbox_never_started`: "A sandbox that never started its command") or
+# `test server` (the gate's own server did not start, with the evidence
+# `test_server_never_started` and the start as its tree: start_server). The
 # integrator
 # believes the fact only from its own verdict file with exit 6 (the sandbox
 # never sees that file) and records `host_fault`: retried after a backoff,
@@ -954,8 +956,38 @@ trap 'stage_close aborted; gate_times; gate_stop_children; gate_remove_work' EXI
 db_socket=""
 db_forward=""
 sandbox_db_url=""
+# start_server <dir> <tree>: the gate's own server, its files in <dir>;
+# <tree> is which start: `gate`, the first, before anything of either tree,
+# or `candidate`, the candidate phase's fresh one. Programs or a template
+# that cannot be prepared are the owner's configuration: exit 3, as before.
+# A server that does not come up is the host's: no verdict, the fact
+# `test_server_never_started` (exit 6, `host_fault`), with the server's
+# first FATAL line or the gate's own word, retried after a backoff and
+# never counted toward the task. The suite's seam,
+# SPAWN_GATE_TEST_PG_FAIL=<tree>, gives that start one setting no server
+# knows, so it fails as a real server does.
+start_server() {
+    start_option=""
+    [ "${SPAWN_GATE_TEST_PG_FAIL-}" != "$2" ] || start_option=spawn_gate_test_no_such_setting=1
+    start_rc=0
+    gate_pg_start "$1" "$gate_jobs" "$start_option" || start_rc=$?
+    [ "$start_rc" -eq 0 ] && return 0
+    [ "$start_rc" -eq 2 ] || exit 3
+    start_said=$(sed -n -E 's/^.*(FATAL|PANIC):/\1:/p' "$1/server.log" 2>/dev/null | head -n 1 | cut -c1-300) ||
+        start_said=""
+    # Or what kept it from starting at all (gate-pg.sh: its copy of the
+    # template).
+    [ -n "$start_said" ] || start_said=$(head -n 1 "$1/start.said" 2>/dev/null | cut -c1-300) || start_said=""
+    case "$2" in
+    gate) start_what="the gate's test server" ;;
+    *) start_what="the candidate phase's fresh test server" ;;
+    esac
+    host_fault "test server" "test server" "never started" \
+        "$start_what did not start${start_said:+: $start_said}: a host fault, not a verdict on the candidate" \
+        test_server_never_started "$2"
+}
 if [ -n "$gate_pg" ]; then
-    gate_pg_start "$work/pg" "$gate_jobs" || exit 3
+    start_server "$work/pg" gate
     # A link of the gate's to the socket the server made at start: the
     # server cannot change what it names (scripts/rsi/gate-pg.sh).
     mkdir -m 700 "$work/test-db"
@@ -3257,7 +3289,7 @@ stage_close ok
 # path the sandbox is given.
 if [ -n "$gate_pg" ] && [ "$candidate_count" -gt 0 ]; then
     gate_pg_stop
-    gate_pg_start "$work/pg.candidate" "$gate_jobs" || exit 3
+    start_server "$work/pg.candidate" candidate
     rm -f "$db_socket"
     if ! ln -P "$gate_pg_socket" "$db_socket" || [ ! -S "$db_socket" ]; then
         echo "gate: cannot link the candidate's fresh test server's socket into $work/test-db" >&2

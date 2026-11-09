@@ -1411,10 +1411,18 @@ impl SandboxTree {
 /// status was no answer of the scenario's (scripts/rsi/gate.sh).
 pub(crate) const SANDBOX_NEVER_STARTED: &str = "sandbox_never_started";
 
+/// The evidence of a gate's host fault whose own test server did not start
+/// (`on` `test server`, its `tree` which start: `gate`, the first, or
+/// `candidate`, the candidate phase's fresh one; gate.sh `start_server`):
+/// the host's, never the candidate's, so it never counts toward the task.
+pub(crate) const TEST_SERVER_NEVER_STARTED: &str = "test_server_never_started";
+
 /// The host-fault fact of a verdict file: one JSON line with `host_fault`
-/// true, a scenario, where it failed (`base`, `candidate and base`, or
-/// `sandbox` with the evidence [`SANDBOX_NEVER_STARTED`]), its runs and a
-/// reason, and no verdict. Its `log` is left empty.
+/// true, a scenario, where it failed (`base`, `candidate and base`,
+/// `sandbox` with the evidence [`SANDBOX_NEVER_STARTED`], or `test server`
+/// with the evidence [`TEST_SERVER_NEVER_STARTED`] and a start of `gate` or
+/// `candidate`), its runs and a reason, and no verdict. Its `log` is left
+/// empty.
 fn host_fault(file: &str) -> Option<GateFailure> {
     let line = file.trim();
     if line.contains('\n') {
@@ -1436,8 +1444,11 @@ fn host_fault(file: &str) -> Option<GateFailure> {
             || (on == "sandbox"
                 && text("evidence").as_deref() == Some(SANDBOX_NEVER_STARTED)
                 && tree.is_some())
+            || (on == "test server"
+                && text("evidence").as_deref() == Some(TEST_SERVER_NEVER_STARTED)
+                && matches!(tree, Some(SandboxTree::Gate | SandboxTree::Candidate)))
     })?;
-    let tree = tree.filter(|_| on == "sandbox");
+    let tree = tree.filter(|_| on == "sandbox" || on == "test server");
     Some(GateFailure::HostFault {
         scenario,
         on,
@@ -2657,6 +2668,50 @@ mod tests {
             fact.replace("sandbox_never_started", "gate"),
             fact.replace(",\"tree\":\"base\"", ""),
             fact.replace("\"tree\":\"base\"", "\"tree\":\"elsewhere\""),
+        ] {
+            let gate = FakeGate::new(&format!(
+                "echo '{wrong}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
+            ));
+            assert!(
+                matches!(gate.judge(&path_only()), Err(GateFailure::Aborted { .. })),
+                "{wrong}"
+            );
+        }
+    }
+
+    /// The gate's own test server that did not start (gate.sh
+    /// `start_server`): `on` `test server`, believed with its evidence and a
+    /// start of `gate` or `candidate`, and only with them.
+    #[test]
+    fn a_test_server_that_never_started_is_a_host_fault_with_its_evidence() {
+        let fact = HOST_FAULT_FACT
+            .replace("\"scenario\":\"012.sh\"", "\"scenario\":\"test server\"")
+            .replace("\"on\":\"base\"", "\"on\":\"test server\"")
+            .replace("\"runs\":\"1, then 0\"", "\"runs\":\"never started\"")
+            .replace(
+                '}',
+                ",\"evidence\":\"test_server_never_started\",\"tree\":\"candidate\"}",
+            );
+        for (tree, expected) in [
+            ("candidate", super::SandboxTree::Candidate),
+            ("gate", super::SandboxTree::Gate),
+        ] {
+            let fact = fact.replace("\"tree\":\"candidate\"", &format!("\"tree\":\"{tree}\""));
+            let gate = FakeGate::new(&format!("echo '{fact}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"));
+            assert!(
+                matches!(
+                    gate.judge(&path_only()),
+                    Err(GateFailure::HostFault { on, runs, tree, .. })
+                        if on == "test server" && runs == "never started" && tree == Some(expected)
+                ),
+                "{fact}"
+            );
+        }
+        for wrong in [
+            fact.replace(",\"evidence\":\"test_server_never_started\"", ""),
+            fact.replace("test_server_never_started", "sandbox_never_started"),
+            fact.replace(",\"tree\":\"candidate\"", ""),
+            fact.replace("\"tree\":\"candidate\"", "\"tree\":\"base\""),
         ] {
             let gate = FakeGate::new(&format!(
                 "echo '{wrong}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
