@@ -1,4 +1,4 @@
-import { Activity, BellRing, Gauge, LayoutGrid, Monitor, Moon, Orbit, Rows3, Sun, Target, Waypoints } from "lucide-react";
+import { Activity, BellRing, Gauge, House, Monitor, Moon, Orbit, Rows3, Sun, Target, Waypoints } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { OverviewSession, RsiSummary, SessionState } from "../api";
@@ -88,8 +88,8 @@ export function Sidebar({
         <NavItem
           active={view === "fleet"}
           onClick={onShowFleet}
-          icon={<LayoutGrid size={15} />}
-          label="Fleet"
+          icon={<House size={15} />}
+          label="Home"
           trailing={<AttentionCount {...attention} />}
         />
         <NavItem
@@ -447,7 +447,7 @@ export function MobileNav({
       <div className="ml-auto flex min-w-0 overflow-x-auto rounded-lg border border-surface-border bg-surface p-0.5">
         {(
           [
-            ["fleet", "Fleet", <LayoutGrid key="f" size={13} />, onShowFleet],
+            ["fleet", "Home", <House key="f" size={13} />, onShowFleet],
             ["missions", "Missions", <Target key="m" size={13} />, onShowMissions],
             ["rsi", "RSI", <Activity key="a" size={13} />, onShowRsi],
             ["alerts", "Alerts", <BellRing key="b" size={13} />, onShowAlerts],
