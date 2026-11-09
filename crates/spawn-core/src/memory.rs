@@ -921,10 +921,11 @@ impl TerminalHost for MemoryStore {
                 "the runner of {terminal} outlived its kill"
             )));
         }
-        if state.terminals.contains(terminal) && state.dies_writing.remove(terminal) {
-            if let Some(mount) = state.mounts.get_mut(workspace) {
-                mount.dirty = true;
-            }
+        if state.terminals.contains(terminal)
+            && state.dies_writing.remove(terminal)
+            && let Some(mount) = state.mounts.get_mut(workspace)
+        {
+            mount.dirty = true;
         }
         state.terminals.remove(terminal);
         state.panes.remove(terminal);
