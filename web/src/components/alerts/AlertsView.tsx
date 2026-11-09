@@ -10,9 +10,9 @@ import { LiveStatus, PageHeader, cx } from "../ui";
 function stateClass(state: Alert["state"]): string {
   switch (state) {
     case "open":
-      return "bg-destructive/12 text-destructive ring-destructive/25";
+      return "bg-fail-tint text-destructive ring-destructive/25";
     case "notice":
-      return "bg-warning/15 text-warning ring-warning/25";
+      return "bg-wait-tint text-warning ring-warning/25";
     default:
       return "bg-muted text-muted-foreground ring-surface-border";
   }
@@ -131,7 +131,7 @@ export function OpenAlerts({ alerts, onOpen }: { alerts: PollResult<Alert[]>; on
   if (open.length === 0) return null;
   const shown = expanded ? open : open.slice(0, 1);
   return (
-    <div className="shrink-0 border-b border-destructive/25 bg-destructive/[0.06] px-3 py-1.5">
+    <div className="shrink-0 border-b border-surface-border bg-fail-tint px-3 py-1.5">
       <div className="flex items-center gap-2 text-micro">
         <button
           type="button"

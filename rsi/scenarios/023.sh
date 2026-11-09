@@ -27,7 +27,31 @@
 #   (2) an idle minute: every session waits at its prompt, no task is open,
 #       no command is pending, nothing is due. Over 60 s the scans of every
 #       user table add up to at most IDLE_MAX (150: 1.25 per pass, one
-#       watermark read per pass and the disk watch's minute).
+#       watermark read per pass and the disk watch's minute). Two minutes
+#       are measured back to back and the lower one is judged: the loop's
+#       own cost does not drop in the second minute (a step that reads on
+#       every pass reads in both), while a host's does. A loaded host
+#       (another gate's scenarios beside it, an alert such as tmpfs_high
+#       firing) once put one minute at 152 with the loop's statements
+#       unchanged (2026-11-09, batch 8, under log_statement=all: 137 and 138
+#       statements, the same ones, on the candidate and the base). The bound
+#       is not raised: a regression adds to both minutes. One extra
+#       watermark read per pass still fails it, as below.
+#       The higher minute is judged too, coarsely: at most 2 x IDLE_MAX
+#       (300). The lower one cannot see what fires at most once in the two
+#       minutes (a reread on a schedule slower than a minute, a cost that
+#       settles in the first minute, a regression on a two-minute period).
+#       300 is about twice the worst minute host load gave (152), and well
+#       under one minute of task 202's regression (142 -> 675, +530). So
+#       the lower minute judges what the loop does on every pass, at 150,
+#       and the higher one judges what it does once, at 300. What it
+#       gives up: a once-in-two-minutes cost under about 150 (142 + 140 <
+#       300) is never caught, where the single minute before caught it
+#       about 2 times in 3. A cost that small is not task 202's kind.
+#       The transactions printed beside the scans are not judged:
+#       pg_stat_database.xact_commit also counts the server's own
+#       (autovacuum and analyze after the busy setup), 159 to 300 a minute
+#       for the same build.
 #   (3) a busy minute, the same decisions at the same times. At its start
 #       T1 is assigned to alpha (whose engine then stays busy and quiet) and
 #       T2 to frail, whose text the tmux wrapper refuses to stage while
@@ -43,10 +67,26 @@
 #         `session_resident_alpha stall-T1-activity-<n>`), no sooner than 20 s
 #         and no later than 20 s + STALL_SLACK_MS (2500) after alpha's last
 #         fact (deliver.rs and dispatch/stall.rs measure it so);
-#       - the minute's scans add up to at most IDLE_MAX + SLICE_MAX (150) per
-#         half-second slice of it that holds an event (recorded_at_ms): a full
-#         pass's work (118 scans today) at most once per slice in which
-#         something happened, and one watermark read per pass.
+#       - the minute's scans add up to at most BUSY_MAX (9,100). The minute
+#         makes the same decisions at the same times on every run, so its
+#         cost varies little, though the host adds some (7,771-8,282, 6.5%,
+#         over 6 alternating runs of the same loop code): 7,340-8,282 on 22
+#         runs, 2026-11-08/09 (8 base runs from the gate's warm cache, mains
+#         up to 984d0592; 8 owner-gate runs; 6 runs alternating 984d0592 and
+#         f10c4e98, whose code 023 reaches is the same). 9,100 is the highest
+#         plus 10%, rounded down. It was IDLE_MAX + 150 per half-second
+#         slice holding an event (recorded_at_ms), a full pass (118 scans)
+#         per slice in which something happened; but the slice count moves
+#         with event timing (52-64 on one build) while the scans do not, so
+#         the per-slice figure swung 122.7-151.5 on unchanged code and
+#         rejected batch 12 at 151.5 with nothing in the loop changed. The
+#         slices are still printed.
+#         What it catches: a full pass on every pass where nothing changed
+#         (the live main before objective 023: 14,753), a full pass more per
+#         event (about +118 x 55 = +6,500), or any change adding about 820
+#         scans over the highest run (15 a slice, 7 full passes). What it
+#         does not: one extra watermark read per pass (+120 a minute), which
+#         (2) catches (an idle minute then costs about 260, over IDLE_MAX).
 #
 # Measured on the live main (49b92be, the deployed binary built from it),
 # this fleet, this host, 2026-11-06 (BB_023_MEASURE=1 prints them):
@@ -54,11 +94,10 @@
 #   spawn_commands 4,164, mission_tasks 520, mission_residents 312,
 #   mission_missions 312, spawn_session_state 208), 3,400 transactions, no
 #   event appended;
-#   busy minute: 14,753-14,761 scans, events in 68 of its 120 slices (so its
-#   bound is 150 + 150 x 68 = 10,350); T1 delivered 1.8-1.9 s after its
-#   assignment; T2's retries 5.34-5.51 s after the attempt before; T1's stall
-#   digests (two: the busy screen's 30 s refresh starts a second stall)
-#   0.1-0.5 s after their due times.
+#   busy minute: 14,753-14,761 scans, events in 68 of its 120 slices; T1
+#   delivered 1.8-1.9 s after its assignment; T2's retries 5.34-5.51 s after
+#   the attempt before; T1's stall digests (two: the busy screen's 30 s
+#   refresh starts a second stall) 0.1-0.5 s after their due times.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -96,7 +135,7 @@ done
 
 MEASURE=${BB_023_MEASURE:-}
 IDLE_MAX=150
-SLICE_MAX=150
+BUSY_MAX=9100
 DELIVER_MAX_MS=4000
 RETRY_SLACK_MS=1500
 STALL_SECS=20
@@ -451,16 +490,35 @@ done
 
 # --- (2) an idle minute ------------------------------------------------------------
 
+# Two idle minutes back to back (the header says why): the lower judges
+# what the loop does on every pass, at IDLE_MAX, and the higher what it
+# does once in the two, at twice that.
 idle_from=$(q "select coalesce(max(id), 0) from spawn_events")
 snapshot "$WORK/idle.before"
 sleep 60
+snapshot "$WORK/idle.mid"
+sleep 60
 snapshot "$WORK/idle.after"
 idle_events=$(q "select count(*) from spawn_events where id > $idle_from")
-set -- $(delta "$WORK/idle.before" "$WORK/idle.after")
+first=$(delta "$WORK/idle.before" "$WORK/idle.mid")
+second=$(delta "$WORK/idle.mid" "$WORK/idle.after")
+echo "023: idle minutes: first ${first%% *} scans, second ${second%% *}"
+if [ "${second%% *}" -lt "${first%% *}" ]; then
+    high=$first
+    set -- $second
+else
+    high=$second
+    set -- $first
+fi
+idle_high=${high%% *}
+# The higher minute's tables, for its own message.
+idle_high_top=$(printf '%s\n' "$high" | cut -d' ' -f5-)
 idle_scans=$1 idle_seq=$2 idle_idx=$3 idle_xact=$4
 shift 4
 idle_top="$*"
 echo "023: idle minute: $idle_scans scans ($idle_seq sequential, $idle_idx by index), $idle_xact transactions, $idle_events events appended; most:$idle_top"
+[ "$idle_high" -le $((2 * IDLE_MAX)) ] ||
+    measured_fail "(2) the higher of the two idle minutes (no task open, no command pending, $idle_events events appended, nothing due) cost $idle_high table scans (most: $idle_high_top), more than $((2 * IDLE_MAX)) (twice IDLE_MAX): something reads everything once in the two minutes (a slower schedule than a minute, or a cost that settles), which the lower minute cannot see"
 [ "$idle_scans" -le "$IDLE_MAX" ] ||
     measured_fail "(2) an idle minute (no task open, no command pending, $idle_events events appended, nothing due) cost $idle_scans table scans ($idle_seq sequential, $idle_idx by index; most:$idle_top), more than $IDLE_MAX (one watermark read per pass at 120 passes a minute, and slack): the loop reads everything on every pass whether or not anything changed"
 
@@ -569,15 +627,14 @@ while IFS='|' read -r tag digest_ms copies; do
         fail "(3) task #$t1's stall '$tag' was escalated $((digest_ms - due)) ms after it was due (alpha's last fact + ${STALL_SECS} s), late by more than $STALL_SLACK_MS ms: a timer must wake the loop"
 done <"$WORK/stalls"
 echo "023: task #$t1's stall digests, each after its due time (ms):$lateness"
-# The passes that had something to act on, at most: the busy minute's 500 ms
-# slices that hold an event.
+# The busy minute's 500 ms slices that hold an event: printed beside the
+# scans, not judged (the count moves with event timing; BUSY_MAX above).
 slices=$(q "select count(distinct (recorded_at_ms - $busy_start) / 500) from spawn_events
              where recorded_at_ms >= $busy_start and recorded_at_ms < $busy_start + 60000")
 echo "023: busy minute: events in $slices of its 120 half-second slices"
 
-busy_max=$((IDLE_MAX + SLICE_MAX * slices))
-[ "$busy_scans" -le "$busy_max" ] ||
-    measured_fail "(3) the busy minute cost $busy_scans table scans ($busy_seq sequential, $busy_idx by index; most:$busy_top), more than $busy_max ($IDLE_MAX, and $SLICE_MAX for each of the $slices half-second slices that held an event): its steps ran on passes where nothing had changed"
+[ "$busy_scans" -le "$BUSY_MAX" ] ||
+    measured_fail "(3) the busy minute cost $busy_scans table scans ($busy_seq sequential, $busy_idx by index; most:$busy_top; events in $slices of its 120 half-second slices), more than $BUSY_MAX (the highest of 22 runs of today's loop, 8,282, plus 10%): its steps ran on passes where nothing had changed"
 
 if [ -n "$MEASURE" ]; then
     echo "023: measured (BB_023_MEASURE=1): idle $idle_scans, busy $busy_scans scans a minute"

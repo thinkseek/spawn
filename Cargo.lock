@@ -645,17 +645,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "spawn-kdf"
+version = "0.1.0"
+dependencies = [
+ "hmac",
+ "sha2",
+]
+
+[[package]]
 name = "spawn-postgres"
 version = "0.1.0"
 dependencies = [
  "fallible-iterator",
- "hmac",
  "postgres",
  "postgres-protocol",
  "serde",
  "serde_json",
- "sha2",
  "spawn-core",
+ "spawn-kdf",
 ]
 
 [[package]]

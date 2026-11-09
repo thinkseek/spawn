@@ -10,11 +10,14 @@
 # `ping_supervisor`). The stall bounds are set short by the loop's
 # environment: delivery 90 s, activity 30 s, everything else 600 s. Two
 # stalls are injected from outside Spawn, never by editing it:
-#   - `stuck`: the tmux wrapper refuses every paste-buffer and send-keys into
-#     the stuck resident's pane, so its task's delivery never lands (each
-#     attempt fails after the Bridge began typing; the dispatcher's own
-#     retry, 60 s later, inside the bound, fails the same way, or is held
-#     while the worker has no current judgement);
+#   - `stuck`: the tmux wrapper refuses to stage any text for the stuck
+#     resident's pane (`load-buffer` into its buffer fails, the step before
+#     any key reaches the pane), so its task's delivery never lands and
+#     nothing is ever typed: every attempt is refused before typing (bridge.rs
+#     `PANE_NOT_READY`, never `MAY_HAVE_TYPED`), and the dispatcher tries it
+#     again and again (deliver.rs `judge_attempts`): with
+#     SPAWN_DELIVERY_NOT_READY_MS=15000 its ten free refusals come 15 s
+#     apart, so its retries go on through the whole run and none is spent;
 #   - `quiet`: its engine takes the task, opens the turn, and goes silent:
 #     no transcript line, no screen change, the turn never ends.
 # Beside them, `busy` works through one turn of 60 s with a tool call every
@@ -27,8 +30,10 @@
 #       `delivery`, between the bound and the bound + 30 s after the task's
 #       assignment; its line names `task #<id>`, the step, the failed
 #       attempt's key (`deliver-<id>-0`) and its error, and the key of every
-#       other attempt that had failed by then (what Spawn already tried).
-#       Later failed retries in the window add none (the step did not move);
+#       other attempt that had failed by then (what Spawn already tried),
+#       none of which may have typed. Later failed retries add none (the
+#       step did not move): at least one retry fails after the escalation,
+#       within the window, and the escalation is still the only one;
 #   (2) the silent worker: exactly one escalation for its task, with step
 #       `activity`, between the bound and the bound + 30 s after the
 #       session's latest fact; its text names `task #<id>`, the step, that
@@ -253,21 +258,23 @@ done
 ENGINE
 chmod 755 "$WORK/claude"
 
-# tmux on the private socket. Every pane named in $WORK/refused (one tmux
-# pane target per line, `=<terminal>:`) refuses input: paste-buffer and
-# send-keys into it fail, as a pane that never takes the text would.
+# tmux on the private socket. Every terminal named in $WORK/refused (one per
+# line) takes no text: `load-buffer` into its paste buffer (`spawn-<terminal>`;
+# the Bridge stages every text there before any key reaches the pane) fails,
+# so nothing is ever typed into it.
 : >"$WORK/refused"
 # (Spawn puts its own `-L <socket>` before the subcommand.)
 cat >"$WORK/tmux" <<EOF
 #!/bin/sh
-input=
+stage=
 for argument in "\$@"; do
-  case "\$argument" in paste-buffer | send-keys) input=\$argument ;; esac
+  [ "\$argument" = load-buffer ] && stage=1
 done
-if [ -n "\$input" ]; then
+if [ -n "\$stage" ]; then
   for argument in "\$@"; do
-    if [ -n "\$argument" ] && grep -qxF -- "\$argument" '$WORK/refused'; then
-      echo "\$input refused by the scenario" >&2
+    case "\$argument" in spawn-?*) ;; *) continue ;; esac
+    if grep -qxF -- "\${argument#spawn-}" '$WORK/refused'; then
+      echo "load-buffer refused by the scenario" >&2
       exit 1
     fi
   done
@@ -279,7 +286,8 @@ chmod 755 "$WORK/tmux"
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_DISPATCH CLAUDE_CONFIG_DIR SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \
-    SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS; do
+    SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS SPAWN_DELIVERY_RETRY_SECS \
+    SPAWN_DELIVERY_NOT_READY_MS SPAWN_REISSUE_AFTER_SECS; do
     unset "$name" 2>/dev/null || true
 done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
@@ -309,6 +317,11 @@ SPAWN_STALL_GATE_SECS=600
 SPAWN_STALL_LANDING_SECS=600
 SPAWN_STALL_STOP_SECS=600
 SPAWN_STALL_HALTED_SECS=600
+# The stuck delivery's refusals before typing, 15 s apart: its ten free ones
+# span the run, so retries fail after the escalation and none is spent
+# (DeliveryFailed would take over the stall's escalation).
+SPAWN_DELIVERY_NOT_READY_MS=15000
+export SPAWN_DELIVERY_NOT_READY_MS
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
     SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
     SPAWN_LOOP_INTERVAL_MS SPAWN_SUPERVISOR SPAWN_MISSION_FILE SPAWN_DISK_WARN_GB \
@@ -471,9 +484,9 @@ for name in stuck quiet busy quick; do
     [ -n "$command" ] || harness "submit of $name's start printed no command id: $(out)"
     eval "start_$name=$command"
 done
-# The stuck resident's pane refuses input from the start; its start has no
-# prompt to type, so it starts all the same.
-printf '=spawn-exec_%s:\n' "$start_stuck" >"$WORK/refused"
+# The stuck resident's terminal takes no text from the start; its start has
+# no prompt to type, so it starts all the same.
+printf 'spawn-exec_%s\n' "$start_stuck" >"$WORK/refused"
 
 "$SPAWN_BIN" loop --repo "$repo" --root "$SPAWN_WORKSPACE_ROOT" >>"$WORK/loop.log" 2>&1 &
 loop_pid=$!
@@ -500,7 +513,6 @@ for id in "$task_stuck" "$task_quiet" "$task_busy" "$task_quick"; do
     [ -n "$id" ] && [ "$id" != null ] || harness "task assign printed no id"
 done
 healthy="$task_busy $task_quick"
-started=$(now)
 
 # The premises: the stuck delivery failed at the pane, the quiet worker took
 # its task and went silent, the healthy ones were delivered.
@@ -514,6 +526,14 @@ wait_for 60 first_failed ||
 q "select coalesce(error, '') from spawn_commands where idempotency_key = 'deliver-$task_stuck-0'" |
     grep -q 'refused by the scenario' ||
     harness "the stuck task's first delivery failed for another reason"
+# Refused before typing: nothing reached the pane, so no attempt may say it
+# may have typed (that delivery would never be tried again).
+typed() {
+    q "select count(*) from spawn_commands
+        where (idempotency_key = 'deliver-$task_stuck-0' or idempotency_key like 'deliver-$task_stuck-0-retry-%')
+          and error like '%may have been typed%'"
+}
+assert_eq "$(typed)" 0 "(1) attempts of task #$task_stuck's delivery, refused before typing, that say they may have typed"
 went_silent() { grep -q "^silent [0-9]* quiet\$" "$WORK/engine.log"; }
 wait_for 60 went_silent || harness "the quiet worker never took its task"
 is_past_assigned() { [ "$(task_state "$1")" != assigned ]; }
@@ -523,10 +543,11 @@ done
 
 # --- (1) the stuck delivery ---------------------------------------------------------
 
-# The dispatcher's own retry of the delivery (60 s after the failure) is
-# its recovery, inside the bound; the escalation comes once the bound is
-# behind, whether that retry ran (and failed) or is held (a worker with no
-# current judgement gets nothing typed), and names what was tried.
+# The dispatcher's own retries of the delivery (every 15 s, refused before
+# typing) are its recovery, inside the bound; the escalation comes once the
+# bound is behind, whether the latest retry ran (and failed) or is held (a
+# worker with no current judgement gets nothing typed), and names what was
+# tried.
 wait_for $((DELIVERY_BOUND + SLACK + 30)) escalated "$task_stuck" delivery ||
     fail "(1) no escalation of task #$task_stuck stuck at its delivery within $((DELIVERY_BOUND + SLACK + 30)) s (state $(task_state "$task_stuck"), stall digests for it: $(stall_digests "$task_stuck"))"
 digest=$(nth_digest "$task_stuck" 1)
@@ -544,7 +565,7 @@ for word in delivery "deliver-$task_stuck-0" "refused by the scenario"; do
 done
 # Every attempt that had failed by then is named: what Spawn already tried.
 for key in $(q "select idempotency_key from spawn_commands
-                 where idempotency_key like 'deliver-$task_stuck-0%' and state = 'finished'
+                 where (idempotency_key = 'deliver-$task_stuck-0' or idempotency_key like 'deliver-$task_stuck-0-retry-%') and state = 'finished'
                    and finished_at_ms < $at"); do
     printf '%s\n' "$lines" | grep -qF -- "$key" ||
         fail "(1) the escalation of task #$task_stuck does not name the failed attempt $key: $lines"
@@ -611,14 +632,25 @@ woke_at=$(q "select max(recorded_at_ms) from spawn_events
 
 # --- (4) the window closes: exactly one per stall, none for the healthy ----------------
 
-# At least 240 s after the assignments: the stuck delivery's second retry
-# (180 s after its first failure) fails within it, and moves nothing.
-hold_until=$((started + 240))
-[ "$(($(now) + 20))" -gt "$hold_until" ] && hold_until=$(($(now) + 20))
+# 20 s past (3), so a second escalation of either stall, or a first of a
+# healthy task, has time to show before the counts below; and at least one
+# retry of the stuck delivery has failed after its escalation (they come
+# 15 s apart), so "later failed retries add none" is measured.
+stuck_at=$(digest_at "$(nth_digest "$task_stuck" 1)")
+retried_after() {
+    [ "$(q "select count(*) from spawn_commands
+             where idempotency_key like 'deliver-$task_stuck-0-retry-%'
+               and state = 'finished' and not succeeded
+               and finished_at_ms > $stuck_at")" -ge 1 ]
+}
+hold_until=$(($(now) + 20))
 while [ "$(now)" -lt "$hold_until" ]; do
     tend
     sleep 0.5
 done
+wait_for 60 retried_after ||
+    fail "(1) no retry of task #$task_stuck's delivery failed after its escalation: the stuck delivery, refused before typing, was not tried again ($(q "select string_agg(idempotency_key || ' ' || state, ', ' order by id) from spawn_commands where (idempotency_key = 'deliver-$task_stuck-0' or idempotency_key like 'deliver-$task_stuck-0-retry-%')"))"
+assert_eq "$(typed)" 0 "(1) attempts of task #$task_stuck's delivery that say they may have typed"
 is_accepted() { [ "$(task_state "$1")" = accepted ]; }
 for id in $healthy; do
     wait_for 60 is_accepted "$id" ||

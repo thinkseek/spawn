@@ -1,0 +1,9 @@
+# Base tests the owner retired with what they asserted; the gate lets these go
+# (scripts/rsi/gate.sh, "drops or renames base tests"). One per line.
+#
+# 029's remedy ("the objective is judged outside the gate, by the owner") was
+# stated for every cannot_judge; it was a cause and a remedy nobody observed for
+# any other scenario (073's was a missing test server). The record now quotes
+# the scenario's own cause and a general remedy (32ce722a), tested by
+# a_cannot_judge_host_fault_quotes_the_scenario_s_own_cause and its siblings.
+dispatch::tests::a_cannot_judge_host_fault_names_the_objective_judged_outside_the_gate

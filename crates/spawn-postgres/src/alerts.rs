@@ -180,6 +180,35 @@ from (select 'fired' as transition, a.key, a.kind, a.subject,
         from spawn_alerts a where a.cleared_event_id > $1) t
 limit $2";
 
+/// Whether an integrator runs, and the work that waits for one: `locked`,
+/// some backend holds the integrator's advisory lock on this store
+/// (`integrator_try_lock`: the two-key form, `$1` and the schema's
+/// `hashtext`, in this database); `waiting`, every reported task of a gated
+/// mission that is open or active, not halted, and whose source no owner
+/// holds now (a deploy restarting the integrator holds it, and so does an
+/// owner's push). pg_locks is no table: a reading with no waiting work
+/// scans nothing but the tasks' index.
+pub(crate) const INTEGRATOR: &str = r"
+select jsonb_build_object(
+  'now_ms', spawn_now_ms(),
+  'locked', exists (select 1 from pg_locks l
+                     where l.locktype = 'advisory' and l.granted
+                       and l.database = (select d.oid from pg_database d
+                                          where d.datname = current_database())
+                       and l.classid = $1::int4::oid
+                       and l.objid = hashtext(current_schema())::oid
+                       and l.objsubid = 2),
+  'waiting', coalesce((select jsonb_agg(jsonb_build_object('mission', m.id, 'task', k.id)
+                                        order by k.id)
+                         from mission_tasks k
+                         join mission_missions m on m.id = k.mission_id
+                        where k.state = 'reported' and m.gate is not null
+                          and m.state in ('open', 'active') and m.halted is null
+                          and not exists (select 1 from mission_source_holds h
+                                           where h.source = m.sources ->> 0
+                                             and h.expires_ms > spawn_now_ms())),
+                      '[]'::jsonb))";
+
 impl PostgresStore {
     /// Record an `alert.fired` or `alert.cleared` record (owner only).
     /// Returns the event's id; a second `fired` for a key, a `cleared`
@@ -230,6 +259,12 @@ impl PostgresStore {
     /// Commands that finished failed after `since_ms` ([`FAILED_COMMANDS`]).
     pub fn alert_failed_commands(&self, since_ms: i64) -> Result<Value, StoreError> {
         self.query_json(FAILED_COMMANDS, &[&since_ms])
+    }
+
+    /// Whether an integrator holds its lock, and the reported work that
+    /// waits for one ([`INTEGRATOR`]).
+    pub fn alert_integrator(&self) -> Result<Value, StoreError> {
+        self.query_json(INTEGRATOR, &[&crate::missions::INTEGRATOR_LOCK_KEY])
     }
 
     /// The alerts the window shows ([`ALERTS`]).

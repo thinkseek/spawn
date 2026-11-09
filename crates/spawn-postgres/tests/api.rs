@@ -200,7 +200,7 @@ fn two_commands_of_a_session_are_never_leased_at_once_when_their_submissions_rac
     // A submission starts and waits for it, in a transaction it keeps open.
     let (submitted_tx, submitted) = std::sync::mpsc::channel::<(i32, Option<i64>)>();
     let (commit_tx, commit) = std::sync::mpsc::channel::<()>();
-    let waiter_schema = schema.clone();
+    let waiter_schema = schema.to_string();
     let waiter_submit = submit("key_waiter");
     let waiter = std::thread::spawn(move || {
         let mut client = admin(&waiter_schema);
@@ -1327,7 +1327,7 @@ fn public_holds_only_the_gateway_the_readers_and_pure_helpers() {
               cross join lateral aclexplode(o.acl) a
               where a.grantee = 0
               order by 1",
-            &[&schema],
+            &[&&*schema],
         )
         .expect("read the access lists")
         .iter()
@@ -1366,7 +1366,7 @@ fn view_columns_match_the_snapshot() {
                from information_schema.columns
               where table_schema = $1 and table_name like 'agent\\_%'
               group by table_name order by table_name",
-            &[&schema],
+            &[&&*schema],
         )
         .expect("information_schema answers");
     let actual: Vec<String> = rows
@@ -1376,7 +1376,7 @@ fn view_columns_match_the_snapshot() {
     let expected = [
         "agent_artifacts: session_id text, agent_id text, execution_id text, project text, branch text, commit_id text, reason text, session_seq bigint, recorded_at_ms bigint",
         "agent_commands: id bigint, agent_id text, session_id text, idempotency_key text, action jsonb, created_at_ms bigint",
-        "agent_executions: session_id text, agent_id text, execution_id text, engine text, terminal text, workspace text, started_at_ms bigint, cause text, exit_code integer, signal integer, evidence text, ended_at_ms bigint, exit_reported boolean, duration_ms bigint, command_id bigint",
+        "agent_executions: session_id text, agent_id text, execution_id text, engine text, terminal text, workspace text, started_at_ms bigint, cause text, exit_code integer, ended_at_ms bigint, exit_reported boolean, duration_ms bigint, command_id bigint, signal integer, evidence text",
         "agent_freshness: session_id text, agent_id text, last_session_seq bigint, last_event_id bigint, last_event_at_ms bigint, event_count bigint",
         "agent_judgements: session_id text, session_seq bigint, event_id bigint, agent_id text, state text, reason text, based_on_seq bigint, observation jsonb, recorded_at_ms bigint",
         "agent_lineage: session_id text, agent_id text, ancestor_session_id text, depth integer",

@@ -109,8 +109,12 @@ pub(super) fn pending_by_source(store: &PostgresStore) -> Result<HashMap<String,
 /// or fails keeps the later ones of its source for the next pass (they land
 /// in order); other sources go on. Returns the sources with a request still
 /// pending, read again after applying (a request recorded meanwhile moved
-/// nothing, but is held all the same).
-pub(super) fn apply_pending(store: &PostgresStore) -> Result<HashMap<String, i64>, String> {
+/// nothing, but is held all the same). Every move it recorded goes to
+/// `moved` as (source, new main), for the base warm (`warm.rs`).
+pub(super) fn apply_pending(
+    store: &PostgresStore,
+    moved: &mut Vec<(String, String)>,
+) -> Result<HashMap<String, i64>, String> {
     let requests = pending(store)?;
     if requests.is_empty() {
         return Ok(HashMap::new());
@@ -125,7 +129,12 @@ pub(super) fn apply_pending(store: &PostgresStore) -> Result<HashMap<String, i64
             request.commit, request.source, request.id
         );
         match apply(store, request) {
-            Ok(Outcome::Applied { from, to }) => println!("{said}: main {from} -> {to}"),
+            Ok(Outcome::Applied { from, to }) => {
+                println!("{said}: main {from} -> {to}");
+                if from != to {
+                    moved.push((request.source.clone(), to));
+                }
+            }
             Ok(Outcome::Refused(reason)) => println!("{said}: refused: {reason}"),
             Ok(Outcome::Waits(why)) => {
                 println!("{said} waits: {why}");

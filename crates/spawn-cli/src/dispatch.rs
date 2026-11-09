@@ -83,7 +83,7 @@
 //! keys and tags (docs/fleet-architecture.md §3, docs/design.md §14).
 
 mod charter;
-mod digest;
+pub(crate) mod digest;
 mod jobs;
 #[cfg(test)]
 mod resume_replay;
@@ -425,6 +425,13 @@ pub(crate) enum Why {
     /// scenario of the base exited 1 and then 0, before any candidate code
     /// ran ([`digest::base_disagrees_alerts`], objective 033).
     GateBaseDisagrees,
+    /// Main of a source is red on a check: it failed twice on the base with
+    /// the same failing tests, so its gates wait until main moves
+    /// ([`digest::main_red_news`], told once a red).
+    MainRed,
+    /// Main of a source that was red on a check passes it again
+    /// ([`digest::main_red_news`]).
+    MainGreen,
     /// An open task's step has not moved within its bound ([`stall`]).
     Stalled,
     /// The deployed charter could not be typed into the supervisor's pane:
@@ -472,6 +479,8 @@ impl Why {
                 | Self::Human
                 | Self::GateHostFault
                 | Self::GateBaseDisagrees
+                | Self::MainRed
+                | Self::MainGreen
                 | Self::HoldExpired
                 | Self::ObjectiveSolved
         )
@@ -740,6 +749,10 @@ pub(crate) fn read_plan(
     host.extend(digest::base_disagrees_alerts(&records(
         store.gate_base_disagrees_alerts(),
         "gate base disagreement records",
+    )?));
+    host.extend(digest::main_red_news(&records(
+        store.main_red_news(),
+        "red main records",
     )?));
     host.extend(digest::over_budget_escalations(&records(
         store.over_budget_escalations(),
@@ -1709,6 +1722,66 @@ mod tests {
         assert!(host.iter().all(|item| !item.line.contains('\n')));
     }
 
+    /// A sandbox that never started its command (evidence
+    /// `sandbox_never_started`) says so with bwrap's words and points at
+    /// bubblewrap on the host, not the scenario's harness.
+    #[test]
+    fn a_sandbox_that_never_started_is_said_with_bwraps_words() {
+        let records = [
+            serde_json::json!({"type": "task.gated", "verdict": "host_fault",
+            "id": 11, "event_id": 60, "mission": 6, "host_faults": 2, "escalate": true,
+            "evidence": "sandbox_never_started", "fact": {"scenario": "sh build",
+                "on": "sandbox", "runs": "never started",
+                "reason": "sandbox: sh build in /w/baseline never started (bwrap exited 1: \
+                           bwrap: Can't mount tmpfs on /run/x: No such file or directory)"},
+            "backoff_ms": 600_000, "due_ms": 1_793_930_000_000_i64}),
+        ];
+        let host = super::digest::host_fault_escalations(&records);
+        assert!(
+            host[0]
+                .line
+                .contains("the gate's sandbox never started sh build (sandbox: sh build in")
+                && host[0].line.contains("Can't mount tmpfs on /run/x")
+                && host[0].line.contains("that bubblewrap starts on this host")
+                && !host[0].line.contains("that scenario's harness"),
+            "{}",
+            host[0].line
+        );
+    }
+
+    /// The gate's own test server that did not start (evidence
+    /// `test_server_never_started`) says so with the server's words and
+    /// points at the server on the host, not at bubblewrap or a scenario.
+    #[test]
+    fn a_test_server_that_never_started_is_said_with_the_servers_words() {
+        let records = [
+            serde_json::json!({"type": "task.gated", "verdict": "host_fault",
+            "id": 12, "event_id": 61, "mission": 6, "host_faults": 2, "escalate": true,
+            "evidence": "test_server_never_started", "fact": {"scenario": "test server",
+                "on": "test server", "runs": "never started", "tree": "candidate",
+                "reason": "the candidate phase's fresh test server did not start: FATAL:  \
+                           could not create shared memory segment: a host fault, not a \
+                           verdict on the candidate"},
+            "backoff_ms": 600_000, "due_ms": 1_793_930_000_000_i64}),
+        ];
+        let host = super::digest::host_fault_escalations(&records);
+        assert!(
+            host[0]
+                .line
+                .contains("the gate's own test server never started (the candidate phase's")
+                && host[0]
+                    .line
+                    .contains("could not create shared memory segment")
+                && host[0]
+                    .line
+                    .contains("that the gate's test server starts on this host")
+                && !host[0].line.contains("bubblewrap")
+                && !host[0].line.contains("that scenario's harness"),
+            "{}",
+            host[0].line
+        );
+    }
+
     #[test]
     fn two_host_faults_in_a_row_reach_an_idle_supervisor_once() {
         let crash = "2026-11-06 01:46:58.017 UTC [1] LOG:  server process (PID 4242) was \
@@ -1795,29 +1868,56 @@ mod tests {
         );
     }
 
-    /// A record whose evidence is `cannot_judge` (029: no systemd user
-    /// manager in the sandbox) names the objective and says it is judged
-    /// outside the gate, never that the test database failed or that the
-    /// load should be checked. The second in a row still escalates.
+    /// A record whose evidence is `cannot_judge` names the objective and
+    /// quotes the scenario's own cause from the record (`cause`), never
+    /// another scenario's: 029's systemd user manager was once said of
+    /// Supply PA's 073, which needed a PostgreSQL server, and a supervisor
+    /// built task 208 on it. A record without a cause says the gate gave
+    /// none. Never that the test database failed or that the load should be
+    /// checked. The second in a row still escalates.
     #[test]
-    fn a_cannot_judge_host_fault_names_the_objective_judged_outside_the_gate() {
+    fn a_cannot_judge_host_fault_quotes_the_scenario_s_own_cause() {
+        let line_of = |record: serde_json::Value| {
+            let host = super::digest::host_fault_escalations(&[record]);
+            assert_eq!(host.len(), 1);
+            assert_eq!(host[0].why, Why::GateHostFault);
+            host[0].line.clone()
+        };
+        let cause_073 = "073: cannot judge: SPAWN_TEST_DATABASE_URL names no PostgreSQL server, \
+                         and the race needs two connections";
+        let line = line_of(
+            serde_json::json!({"type": "task.gated", "verdict": "host_fault",
+            "id": 205, "event_id": 62, "mission": 9, "host_faults": 2, "escalate": true,
+            "evidence": "cannot_judge", "scenario": "073.sh", "cause": cause_073,
+            "backoff_ms": 600_000, "due_ms": 1_793_930_000_000_i64}),
+        );
+        assert!(
+            line.contains(&format!(
+                "this host cannot judge the objective here (073.sh says: {cause_073})"
+            )),
+            "{line}"
+        );
+        assert!(!line.contains("systemd"), "never 029's cause: {line}");
+        assert!(!line.contains("mission 7"), "never 029's remedy: {line}");
+        assert!(
+            line.contains("Give the gate what the scenario says it lacks"),
+            "{line}"
+        );
+
         let record = serde_json::json!({"type": "task.gated", "verdict": "host_fault", "id": 11,
             "event_id": 61, "mission": 7, "host_faults": 2, "escalate": true,
             "evidence": "cannot_judge", "scenario": "029.sh",
             "backoff_ms": 600_000, "due_ms": 1_793_930_000_000_i64});
         let host = super::digest::host_fault_escalations(&[record]);
-        assert_eq!(host.len(), 1);
         assert_eq!(host[0].tag(), "host gate-host-fault-61");
-        assert_eq!(host[0].why, Why::GateHostFault);
         let line = &host[0].line;
         assert!(
-            line.contains("this host cannot judge the objective here (029.sh"),
-            "{line}"
+            line.contains(
+                "this host cannot judge the objective here (029.sh; the gate's log gives no cause)"
+            ),
+            "a record without a cause names none: {line}"
         );
-        assert!(
-            line.contains("judged outside the gate, by the owner (mission 7)"),
-            "{line}"
-        );
+        assert!(!line.contains("systemd"), "{line}");
         assert!(
             line.contains("nothing is counted and nothing halts"),
             "{line}"
