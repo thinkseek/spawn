@@ -233,6 +233,10 @@ package_archive() { # <dir> <job> <base> <candidate>
     cp -R "$controller/scripts" "$dir/controller/scripts"
     mkdir -p "$dir/controller/rsi"
     cp -R "$scenarios" "$dir/controller/rsi/scenarios"
+    # A deployed controller is read-only (deploy/controller.sh), and cp keeps
+    # the modes: without this the package, and the runner's job unpacked from
+    # it, could not be removed (the supply-pa controller, 2026-11-09).
+    chmod -R u+w "$dir/controller"
     printf 'job=%s\nbase=%s\ncandidate=%s\ncreated=%s\n' \
         "$pjob" "$pbase" "$pcandidate" "$(date -Is)" >"$dir/meta"
     cat >"$dir/run.sh" <<'SH'
