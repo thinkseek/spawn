@@ -1657,7 +1657,7 @@ fn base_only_fault(fields: &Value) -> bool {
 /// The `aborted` record of a host fault past the cap: `faults` host faults
 /// already at this revision, `cap` allowed; the fault's own record kept under
 /// `host_fault` (its log at the top, as an abort's).
-fn capped_host_fault(task: &Task, faults: i64, cap: u32, mut fault: Value) -> Value {
+fn capped_host_fault(task: &Task, main: &str, faults: i64, cap: u32, mut fault: Value) -> Value {
     let log = fault
         .as_object_mut()
         .and_then(|fields| fields.remove("log"))
@@ -1672,9 +1672,12 @@ fn capped_host_fault(task: &Task, faults: i64, cap: u32, mut fault: Value) -> Va
         .to_string();
     json!({
         "reason": format!(
-            "a host fault again: task {} has had {faults} at report revision {}, the most \
-             SPAWN_GATE_HOST_FAULT_CAP allows is {cap}, so this one counts as an abort ({said})",
-            task.id, task.revisions
+            "a host fault again: task {} has had {faults} at report revision {} on main {}, the \
+             most SPAWN_GATE_HOST_FAULT_CAP allows is {cap}, so this one counts as an abort \
+             ({said})",
+            task.id,
+            task.revisions,
+            short_commit(main)
         ),
         "log": log,
         "host_fault": fault,
@@ -2640,12 +2643,12 @@ impl Judge {
             // neither reaches the cap nor is ever capped.
             let (verdict, extra) = if verdict == "host_fault" && !base_only_fault(&extra) {
                 let faults = store
-                    .task_host_faults(task.id, i64::from(task.revisions))
+                    .task_host_faults(task.id, i64::from(task.revisions), main)
                     .map_err(|error| error.to_string())?;
                 if faults >= i64::from(self.host.cap) {
                     (
                         "aborted",
-                        capped_host_fault(task, faults, self.host.cap, extra),
+                        capped_host_fault(task, main, faults, self.host.cap, extra),
                     )
                 } else {
                     (verdict, extra)
@@ -10859,7 +10862,9 @@ mod database_tests {
         // Only the candidate's counted: one, at the cap, so the next
         // candidate fault is capped.
         assert_eq!(
-            db.store.task_host_faults(task, 0).expect("the count"),
+            db.store
+                .task_host_faults(task, 0, &source_main(&source))
+                .expect("the count"),
             1,
             "the base's and the gate's own do not count"
         );
@@ -10932,8 +10937,10 @@ mod database_tests {
         assert_eq!(third["verdict"], "aborted", "past the cap: {third}");
         let reason = third["reason"].as_str().unwrap_or_default();
         assert!(
-            reason.contains(&format!("task {task} has had 2 at report revision 0"))
-                && reason.contains("SPAWN_GATE_HOST_FAULT_CAP allows is 2")
+            reason.contains(&format!(
+                "task {task} has had 2 at report revision 0 on main {}",
+                &source_main(&source)[..12]
+            )) && reason.contains("SPAWN_GATE_HOST_FAULT_CAP allows is 2")
                 && reason.contains("counts as an abort")
                 && reason.contains("is a connection error to the test database")
                 && !reason.contains("judged again"),
@@ -10960,7 +10967,12 @@ mod database_tests {
         let fourth = judge_once(None);
         assert_eq!(fourth["verdict"], "aborted", "{fourth}");
         assert_eq!(gated(&db, mission).gate_aborts, 2);
-        assert_eq!(db.store.task_host_faults(task, 0).expect("count"), 2);
+        assert_eq!(
+            db.store
+                .task_host_faults(task, 0, &source_main(&source))
+                .expect("count"),
+            2
+        );
 
         assert_eq!(super::host_fault_cap(None), 3);
         assert_eq!(super::host_fault_cap(Some(" 5 ")), 5);
@@ -11094,7 +11106,7 @@ mod database_tests {
             );
             assert!(after.halted.is_none(), "{found}");
             assert_eq!(
-                db.store.task_host_faults(task, 0).expect("count"),
+                db.store.task_host_faults(task, 0, &m0).expect("count"),
                 0,
                 "{found}: no host fault for the cap"
             );
@@ -11142,7 +11154,7 @@ mod database_tests {
         integrator.settle();
         let first = last_verdict(&db).0;
         assert_eq!(first["verdict"], "host_fault", "{first}");
-        assert_eq!(db.store.task_host_faults(task, 0).expect("count"), 1);
+        assert_eq!(db.store.task_host_faults(task, 0, &a).expect("count"), 1);
         assert_eq!(gated(&db, mission).gate_aborts, 2);
         past_due(&db);
 
@@ -11294,6 +11306,74 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&marks);
     }
 
+    /// The cap counts per main: only the host faults judged against the main
+    /// being judged now. Supply PA's task 207 (2026-11-09): its host fault of
+    /// 01:45 on fcf5e1e (a red main) still counted at 08:32, on a main that
+    /// had moved since. With the cap at 1, a host fault on A reaches it; main
+    /// moves to B (the owner's push, recorded); the next host fault, on B, is
+    /// `host_fault` again, the first on B, never capped into an abort.
+    #[test]
+    fn host_faults_on_an_older_main_count_nothing_toward_the_cap_on_this_one() {
+        let gate = "echo '| == regression: check-tests.sh must still pass'\n\
+                    echo '| FAILED api::tests::one: error connecting to server: Connection refused (os error 111)'\n\
+                    printf '{\"verdict\":\"rejected\",\"reason\":\"regression: check-tests.sh fails on the candidate\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+        let (base, source, scenarios, mut integrator) = world("cap-per-main", gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_millis(1),
+            cap: 1,
+        };
+        let db = Db::new("cap_per_main");
+        let a = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        push_work(&base, &source, &agent, "work.txt");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        let first = last_verdict(&db).0;
+        assert_eq!(first["verdict"], "host_fault", "{first}");
+        assert_eq!(first["base"], a.as_str());
+        assert_eq!(db.store.task_host_faults(task, 0, &a).expect("count"), 1);
+
+        let b = main_moves(&base, &source, "main.txt");
+        db.store.source_moved(&source, &a, &b).expect("moved");
+        assert_eq!(
+            db.store.task_host_faults(task, 0, &b).expect("count"),
+            0,
+            "none on B yet"
+        );
+        past_due(&db);
+        integrator.pass_on(&db.store).expect("a pass on B");
+        integrator.settle();
+        let second = last_verdict(&db).0;
+        assert_eq!(
+            second["verdict"], "host_fault",
+            "A's fault is not B's: {second}"
+        );
+        assert_eq!(second["base"], b.as_str());
+        assert_eq!(db.store.task_host_faults(task, 0, &b).expect("count"), 1);
+        assert_eq!(gated(&db, mission).gate_aborts, 0);
+
+        // On B, the cap holds as before: the next one is an abort.
+        past_due(&db);
+        integrator.pass_on(&db.store).expect("a third pass");
+        integrator.settle();
+        let third = last_verdict(&db).0;
+        assert_eq!(third["verdict"], "aborted", "{third}");
+        assert!(
+            third["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains(&format!(
+                    "has had 1 at report revision 0 on main {}",
+                    &b[..12]
+                ))),
+            "{third}"
+        );
+        assert_eq!(gated(&db, mission).gate_aborts, 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A gate verdict's `flakes` (checks that failed once and passed again)
     /// are on the task's `task.gated` record; a verdict without them leaves
     /// the record without the key, as every record before it.
@@ -11358,7 +11438,9 @@ mod database_tests {
             due = record["due_ms"].as_i64();
         }
         assert_eq!(
-            db.store.task_host_faults(task, 0).expect("count"),
+            db.store
+                .task_host_faults(task, 0, &source_main(&source))
+                .expect("count"),
             0,
             "base-only faults are not counted"
         );
@@ -11410,7 +11492,9 @@ mod database_tests {
             due = record["due_ms"].as_i64();
         }
         assert_eq!(
-            db.store.task_host_faults(task, 0).expect("count"),
+            db.store
+                .task_host_faults(task, 0, &source_main(&source))
+                .expect("count"),
             0,
             "faults on the candidate and the base are not counted"
         );
@@ -11712,7 +11796,12 @@ mod database_tests {
             (0, 0),
             "no run, no count"
         );
-        assert_eq!(db.store.task_host_faults(task, 0).expect("count"), 0);
+        assert_eq!(
+            db.store
+                .task_host_faults(task, 0, &source_main(&source))
+                .expect("count"),
+            0
+        );
 
         // Told once: the red's alert.
         let news = crate::dispatch::digest::main_red_news(
@@ -11905,7 +11994,9 @@ mod database_tests {
             due = record["due_ms"].as_i64();
         }
         assert_eq!(
-            db.store.task_host_faults(task, 0).expect("count"),
+            db.store
+                .task_host_faults(task, 0, &source_main(&source))
+                .expect("count"),
             0,
             "a base's disagreement is not counted"
         );

@@ -650,6 +650,7 @@ select count(*)
    and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
    and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
    and e.kind -> 'detail' -> 'record' ->> 'revision' = $2
+   and e.kind -> 'detail' -> 'record' ->> 'base' = $3
    and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') not in ('base', 'candidate and base', 'main')
    and not (coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') = 'sandbox'
             and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'tree', '') <> 'candidate')
@@ -1859,15 +1860,21 @@ impl PostgresStore {
     }
 
     /// How many `host_fault` gate verdicts task `task` has at its report
-    /// revision `revision`, but a base-only one (the gate's fact `on`
-    /// `base`, before any candidate code ran): read from its control
-    /// records by the record-id index. The integrator counts the next one
-    /// past its cap as an abort.
-    pub fn task_host_faults(&self, task: i64, revision: i64) -> Result<i64, StoreError> {
+    /// revision `revision` judged against main `base` (the record's `base`:
+    /// a fault on an older main says nothing of this one), but a base-only
+    /// one (the gate's fact `on` `base`, before any candidate code ran):
+    /// read from its control records by the record-id index. The integrator
+    /// counts the next one past its cap as an abort.
+    pub fn task_host_faults(
+        &self,
+        task: i64,
+        revision: i64,
+        base: &str,
+    ) -> Result<i64, StoreError> {
         Ok(self
             .query_one(
                 TASK_HOST_FAULTS,
-                &[&task.to_string(), &revision.to_string()],
+                &[&task.to_string(), &revision.to_string(), &base],
             )?
             .get(0))
     }
