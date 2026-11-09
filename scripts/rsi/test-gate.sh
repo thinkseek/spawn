@@ -34,8 +34,36 @@ marker=$(mktemp /tmp/test-gate-marker.XXXXXX)
 # removed on exit too, whatever happens in between.
 background=""
 masked=$work/no-masked-root
-# shellcheck disable=SC2086 # pids
-trap 'kill $background 2>/dev/null || true; rm -rf "$work" "$marker" "$masked"' EXIT
+leftover=""
+# Release files the suite's holders wait on (a lock held until the file
+# exists): the exit creates them first, so a FAIL between a hold and its
+# release ends the holder at once rather than at its bound.
+releases=""
+# The exit's cleanup. It never changes the suite's status: a helper killed
+# just now (a server, a listener) may still be writing its last files while
+# the scratch goes, and `rm -rf` then fails with "Directory not empty" (a
+# suite whose every case passed exited 1 so inside a gate, check-test-gate,
+# 2026-11-09). It retries, and says what it could not remove.
+cleanup() {
+    status=$?
+    if [ -n "$releases" ]; then
+        for release in $releases; do : >"$release" 2>/dev/null || true; done
+        # Long enough for every poll of them (0.32 s at most) to see them
+        # before the scratch, and the files with it, goes.
+        sleep 1
+    fi
+    # shellcheck disable=SC2086 # pids
+    kill $background 2>/dev/null || true
+    # shellcheck disable=SC2086 # paths without spaces
+    [ -z "$leftover" ] || rm -f $leftover
+    for _ in 1 2 3 4 5; do
+        rm -rf "$work" "$marker" "$masked" 2>/dev/null && break
+        sleep 1
+    done
+    [ ! -e "$work" ] || echo "test-gate: could not remove $work" >&2
+    exit "$status"
+}
+trap cleanup EXIT
 
 # The owner's home, with secrets the candidate must not read. The gate's base
 # cache goes under it too, never into the real one.
@@ -549,7 +577,7 @@ background="$background $!"
 for path in "$socket_db/.s.PGSQL.5432" $planted; do
     while [ ! -S "$path" ]; do sleep 0.1; done
 done
-trap 'kill $background 2>/dev/null || true; rm -f /tmp/.s.PGSQL.$$ /run/user/$(id -u)/test-gate-$$.sock /var/tmp/test-gate-$$.sock; rm -rf "$work" "$marker"' EXIT
+leftover="/tmp/.s.PGSQL.$$ /run/user/$(id -u)/test-gate-$$.sock /var/tmp/test-gate-$$.sock"
 find / \( -path /proc -o -path /sys \) -prune -o -type s -writable -print 2>/dev/null |
     grep -vxF "$socket_db/.s.PGSQL.5432" >"$work/host-sockets" || true
 for path in $planted; do
@@ -631,7 +659,7 @@ hold=$work/sandbox-hold
 : >"$hold"
 (
     held=0
-    until [ -e "$hold.held" ] || [ "$held" -ge 600 ]; do sleep 0.05; held=$((held + 1)); done
+    until [ -e "$hold.held" ] || [ "$held" -ge 6000 ]; do sleep 0.05; held=$((held + 1)); done
     kill "$vanish_listener"
     rm -rf "$vanish"
     rm -f "$hold"
@@ -662,7 +690,7 @@ time.sleep(900)' "$vanish/service.sock" &
     : >"$hold"
     (
         held=0
-        until [ -e "$hold.held" ] || [ "$held" -ge 600 ]; do sleep 0.05; held=$((held + 1)); done
+        until [ -e "$hold.held" ] || [ "$held" -ge 6000 ]; do sleep 0.05; held=$((held + 1)); done
         kill "$vanish_listener"
         rm -rf "$vanish"
         : >"$vanish"
@@ -695,7 +723,7 @@ time.sleep(900)' "$vanish/service.sock" &
     : >"$hold"
     (
         held=0
-        until [ -e "$hold.held" ] || [ "$held" -ge 600 ]; do sleep 0.05; held=$((held + 1)); done
+        until [ -e "$hold.held" ] || [ "$held" -ge 6000 ]; do sleep 0.05; held=$((held + 1)); done
         kill "$vanish_listener"
         rm -rf "$vanish"
         mkfifo "$vanish"
@@ -737,7 +765,7 @@ time.sleep(900)' "$vanish/service.sock" &
     : >"$hold"
     (
         held=0
-        until [ -s "$hold.held" ] || [ "$held" -ge 600 ]; do sleep 0.05; held=$((held + 1)); done
+        until [ -s "$hold.held" ] || [ "$held" -ge 6000 ]; do sleep 0.05; held=$((held + 1)); done
         held_tree=$(cat "$hold.held" 2>/dev/null)
         case "$held_tree" in */candidate) chmod 000 "$held_tree" ;; esac
         rm -f "$hold"
@@ -784,7 +812,7 @@ time.sleep(900)' "$vanish/service.sock" &
     printf 'base-run\n' >"$hold"
     (
         held=0
-        until [ -s "$hold.held" ] || [ "$held" -ge 600 ]; do sleep 0.05; held=$((held + 1)); done
+        until [ -s "$hold.held" ] || [ "$held" -ge 6000 ]; do sleep 0.05; held=$((held + 1)); done
         kill "$vanish_listener"
         rm -rf "$vanish"
         mkfifo "$vanish"
@@ -834,7 +862,7 @@ time.sleep(900)' "$vanish/service.sock" &
     printf 'base-run\n' >"$hold"
     (
         held=0
-        until [ -s "$hold.held" ] || [ "$held" -ge 600 ]; do sleep 0.05; held=$((held + 1)); done
+        until [ -s "$hold.held" ] || [ "$held" -ge 6000 ]; do sleep 0.05; held=$((held + 1)); done
         kill "$vanish_listener"
         rm -rf "$vanish"
         mkfifo "$vanish"
@@ -859,7 +887,20 @@ time.sleep(900)' "$vanish/service.sock" &
     refuse "before the candidate is built" "$(cat "$work/gate.out")" '| == candidate: build'
     rm -f "$vanish" "$hold.held"
 else
-    echo "note: $vanish was not under a scanned directory (TMPDIR covers it): no mask, no hold"
+    # No hold is right only where the sandbox shows no socket to scan: under
+    # the roots it covers whole (/tmp, which is the gate's TMPDIR here, /run
+    # and /var/tmp). Anywhere else the gate should have masked the socket and
+    # held, and every check above passed with nothing tested (rev-b on
+    # 401d5e62: a gate too slow to reach the hold, as at load 45).
+    case "$vanish" in
+    /tmp/* | /run/* | /var/tmp/*)
+        echo "note: $vanish was not under a scanned directory (TMPDIR covers it): no mask, no hold"
+        ;;
+    *)
+        echo "FAIL the hold never held: $vanish is under a scanned directory, so the gate should have masked its socket and held there"
+        exit 1
+        ;;
+    esac
 fi
 
 # 3e. A TCP test database URL works inside, through the gate's forwarder,
@@ -1807,13 +1848,19 @@ normalized() {
     # The lines are dropped before the times are masked: masking first made
     # "waited 0.4 s" into "waited 0.N s", which the drop no longer matched,
     # so a wait for a slot (another gate on the host) failed the comparison.
+    # A wait of a minute or more is said in minutes (spoken_wait). normalized [<log>].
     sed -E -e '/^\| (base|candidate) runs: /d' \
         -e '/^\| gate time: /d' -e '/^\| sockets hidden from the sandbox: /d' \
         -e '/^\| host scenario slots: /d' -e '/^\| [a-z]+ start order /d' \
-        -e '/^\| waited [0-9.]+ s for host scenario slot /d' \
+        -e '/^\| waited [0-9.]+ (s|min) for host scenario slot /d' \
         -e '/^\| [a-z]+\.[0-9]+: (still )?waiting for a host scenario slot /d' \
-        -e 's/[0-9]+ms/Nms/g' -e 's/[0-9]+ s\b/N s/g' "$work/gate.out"
+        -e 's/[0-9]+ms/Nms/g' -e 's/[0-9]+ s\b/N s/g' "${1:-$work/gate.out}"
 }
+printf '%s\n' '| waited 0.4 s for host scenario slot 4 of 4 (shared by every gate on this host)' \
+    '| waited 2.1 min for host scenario slot 1 of 2 (shared by every gate on this host)' \
+    '| == base: 051.sh' >"$work/waits.log"
+expect "a wait for a host slot is not the log's, in seconds or in minutes" \
+    "$(normalized "$work/waits.log" | tr '\n' '/' | sed 's%^| == base: 051.sh/$%dropped%')" dropped
 # own_and_wall <phase>: the wall clock and the runs' own time the log names.
 wall_of() { sed -n "s/^| $1 runs: [0-9]* in \([0-9]*\) s, .*/\1/p" "$work/gate.out"; }
 own_of() { sed -n "s/^| $1 runs: .*their own time: \([0-9]*\) s)$/\1/p" "$work/gate.out"; }
@@ -1866,7 +1913,7 @@ cp "$scenarios/protected" "$scenarios/build" "$slow/"
 for n in 1 2 3 4 5; do
     printf '#!/bin/sh\necho "06%s"\nsleep 2\n' "$n" >"$slow/06$n.sh"
 done
-printf '#!/bin/sh\necho "066"\nsleep 12\n' >"$slow/066.sh"
+printf '#!/bin/sh\necho "066"\nsleep 120\n' >"$slow/066.sh"
 killed=$work/killed-gate.out
 rm -rf "$integrator"
 mkdir -m 700 "$integrator"
@@ -1878,7 +1925,7 @@ killed_pid=$!
 killed_wait=0
 until grep -q '^| == regression: 065.sh' "$killed" 2>/dev/null; do
     killed_wait=$((killed_wait + 1))
-    if [ "$killed_wait" -gt 600 ]; then
+    if [ "$killed_wait" -gt 3000 ]; then
         echo "FAIL the slow gate never printed its candidate's fifth run"
         kill -TERM "$killed_pid" 2>/dev/null || :
         exit 1
@@ -1894,9 +1941,22 @@ expect "the gate time line counts the runs" "$(cat "$work/gate.out")" '(4 scenar
 expect "a bad SPAWN_GATE_JOBS is no verdict" "$(with_jobs 0 bad "$good" "$par")" 'exit=3 '
 expect "and says why" "$(cat "$work/gate.out")" 'SPAWN_GATE_JOBS is a whole number from 1'
 
+# gone_within <seconds> <text>: the processes whose command line holds
+# <text>, once none is left or <seconds> are up (a run the gate stopped
+# can take a moment to go; one it left lives far longer than the poll).
+gone_within() {
+    gw_n=0
+    while ps -eo args | grep -F "$2" | grep -qv grep && [ "$gw_n" -lt $(($1 * 10)) ]; do
+        sleep 0.1
+        gw_n=$((gw_n + 1))
+    done
+    ps -eo args | grep -F "$2" | grep -v grep || true
+}
 # 16b. A failing scenario among passing ones: the first failure in the
 # scenario order is the verdict, whichever ended first, and the runs after
-# it stop. 062 fails slowly, 063 at once, 064 would run for 29 s.
+# it stop. 062 fails slowly, 063 at once, 064 would run for 120 s, far
+# longer than any load stretches the rest (the bounds below are 100 s and
+# 60 s: 29 s, the old length, left a load-45 gate 4 s of slack).
 pfail=$work/parallel-fail
 mkdir -p "$pfail"
 cp "$scenarios/protected" "$scenarios/build" "$pfail/"
@@ -1906,16 +1966,28 @@ on_candidate() { # <name> <the candidate's commands>: passes on the base
 on_candidate 061.sh 'sleep 2'
 on_candidate 062.sh 'sleep 3; echo "062 failed"; exit 1'
 on_candidate 063.sh 'echo "063 failed"; exit 1'
-on_candidate 064.sh 'sleep 29.25'
+on_candidate 064.sh 'sleep 120.25'
 started=$(date +%s)
 expect "the first failure in order is the verdict, not the first to end" \
     "$(with_jobs 4 pfail "$good" "$pfail")" '"reason":"regression: 062.sh fails on the candidate"'
-expect "the runs after it were stopped, not waited for" "$([ $(($(date +%s) - started)) -lt 25 ] && echo early)" early
+outer=$(($(date +%s) - started))
+# The candidate phase's own wall clock, not the gate's: its setup (the
+# exports, the socket scan, the build) took 22 s of a 26 s gate at load 17
+# inside another gate's sandbox (check-test-gate, 2026-11-09), while its
+# runs took 3.
+expect "the verdict came at the failure, not after the runs after it" \
+    "$([ "$(wall_of candidate)" -lt 100 ] && echo early)" early
+# That clock and the gate's total close at the verdict; the runs after it
+# are stopped later, on the gate's exit. So the time from the verdict to
+# the exit is the outer clock less the total: about 1 s when 064 is
+# stopped, 117 s more when it is waited for (rev-b, F1).
+gate_total=$(sed -n 's/^| gate time: .*total \([0-9]*\) s$/\1/p' "$work/gate.out")
+expect "the runs after it were stopped, not waited for" \
+    "$([ -n "$gate_total" ] && [ $((outer - gate_total)) -lt 60 ] && echo early) (outer $outer s, gate total ${gate_total:-none} s)" early
 refuse "and their blocks are not printed" "$(cat "$work/gate.out")" '== regression: 063.sh'
 refuse "nor is anything after them" "$(cat "$work/gate.out")" '== regression: 064.sh'
 expect "the blocks before it are" "$(cat "$work/gate.out")" '| == regression: 061.sh must still pass'
-sleep 1
-refuse "no run of the gate is left" "$(ps -eo args | grep -F 'sleep 29.25' | grep -v grep || true)" 'sleep'
+refuse "no run of the gate is left" "$(gone_within 30 'sleep 120.25')" 'sleep'
 
 # 16c. A scenario on the serial list runs alone: each scenario marks itself
 # running in the tree, and one that sees a neighbour it must not have exits 2
@@ -2067,15 +2139,20 @@ mkdir -p "$abort"
 cp "$scenarios/protected" "$scenarios/build" "$abort/"
 printf '#!/bin/sh\nsleep 2\n' >"$abort/091.sh"
 printf '#!/bin/sh\nexit 3\n' >"$abort/092.sh"
-printf '#!/bin/sh\nsleep 29.5\n' >"$abort/093.sh"
+printf '#!/bin/sh\nsleep 120.5\n' >"$abort/093.sh"
 started=$(date +%s)
 expect "a harness error among parallel base runs ends the gate: a host fault" \
     "$(with_jobs 4 abort "$good" "$abort")" 'exit=6 {"host_fault":true,'
-expect "without waiting for the runs after it" "$([ $(($(date +%s) - started)) -lt 25 ] && echo early)" early
+outer=$(($(date +%s) - started))
+# As 16b: the gate's own total closes before the runs after it are
+# stopped, so the outer clock less the total is that stop (a 25 s wall
+# clock around the whole gate counted its setup, 45 s at load 45).
+gate_total=$(sed -n 's/^| gate time: .*total \([0-9]*\) s$/\1/p' "$work/gate.out")
+expect "without waiting for the runs after it" \
+    "$([ -n "$gate_total" ] && [ "$(wall_of base)" -lt 100 ] && [ $((outer - gate_total)) -lt 60 ] && echo early) (base $(wall_of base) s, outer $outer s, gate total ${gate_total:-none} s)" early
 expect "after the blocks before it" "$(cat "$work/gate.out")" '| == base: 091.sh: solved'
 expect "and says why" "$(cat "$work/gate.out")" '092.sh exited 3 on the base'
-sleep 1
-refuse "no run of the gate is left" "$(ps -eo args | grep -F 'sleep 29.5' | grep -v grep || true)" 'sleep'
+refuse "no run of the gate is left" "$(gone_within 30 'sleep 120.5')" 'sleep'
 
 # 16f. The scenarios run a copy of the built binary, which no cargo command
 # writes: here one scenario links target/debug/spawn again, as check-tests'
@@ -2134,7 +2211,7 @@ refuse "and the gate seeds nothing there" "$(cat "$work/gate.out")" '201.sh: sol
 # A key whose lock another gate holds (it is judging that key) is not
 # seeded: the seed does not wait, and does not write beside it.
 rm -f "$seeded_entry"
-sh -c 'exec 9>>"$1" && flock 9 && exec sleep 120' holder "$seeded_entry.lock" &
+sh -c 'exec 9>>"$1" && flock 9 && exec sleep 3600' holder "$seeded_entry.lock" &
 seed_holder=$!
 background="$background $seed_holder"
 while flock -n "$seeded_entry.lock" true; do sleep 0.1; done
@@ -2167,12 +2244,20 @@ expect "a changed scenario is another key: its seed is not read" \
 shortd=$work/seed-short
 mkdir -p "$shortd"
 cp "$scenarios/protected" "$shortd/"
-printf '#!/bin/sh\nsleep 4\nexit 0\n' >"$shortd/204.sh"
+# 204 runs until the suite lets it go, after the gate that decided early
+# has ended: a 4 s run ended on its own when the task's failure took longer
+# than that to decide (load), and was seeded.
+shortd_release=$shortd/release
+rm -f "$shortd_release"
+releases="$releases $shortd_release"
+printf '#!/bin/sh\nn=0\nwhile [ ! -e %s ] && [ "$n" -lt 6000 ]; do sleep 0.1; n=$((n + 1)); done\nexit 0\n' \
+    "$shortd_release" >"$shortd/204.sh"
 printf '#!/bin/sh\nexit 1\n' >"$work/seed-task.sh"
 base=$saved_base
 expect "a gate decided early" "$(with_jobs 2 seed-short "$good" "$shortd" "$work/seed-task.sh")" \
     '"reason":"scenario fails on the candidate"'
 refuse "seeds nothing from the run it stopped" "$(cat "$work/gate.out")" '204.sh: solved on the candidate'
+: >"$shortd_release"
 base=$good
 expect "and the next gate runs that objective on the base" \
     "$(with_jobs 2 seed-short "$seeded_next" "$shortd" >/dev/null; cat "$work/gate.out")" \
@@ -2207,18 +2292,56 @@ expect "a harness error in base only is exit 4" \
 slow=$work/slow
 mkdir -p "$slow"
 cp "$scenarios/protected" "$scenarios/build" "$slow/"
-printf '#!/bin/sh\n[ "$(cat value)" = one ] && sleep 12\nexit 0\n' >"$slow/111.sh"
+# 111 runs on the base until the suite lets it go, and the suite does once
+# the gate started meanwhile is blocked on the key's lock (its `flock 8`,
+# a process under that gate), so the gate waits whatever its setup takes: a
+# 12 s run ended before a gate that slow reached the key. Not /proc/locks:
+# on this host a lock taken on an open descriptor (the gate's `exec 8>>`,
+# then `flock -n 8`) is held but not listed there.
+slow_release=$slow/release
+rm -f "$slow_release"
+releases="$releases $slow_release"
+printf '#!/bin/sh\n[ "$(cat value)" = one ] || exit 0\nn=0\nwhile [ ! -e %s ] && [ "$n" -lt 6000 ]; do sleep 0.1; n=$((n + 1)); done\nexit 0\n' \
+    "$slow_release" >"$slow/111.sh"
 (
     export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$work/caches/locked"
     sh "$gate" --base-only "$repo" "$base" "$slow" >"$work/warm.out" 2>&1
 ) &
 warming=$!
+background="$background $warming"
+# flock_under <pid>: whether a `flock 8` (a gate blocked on a key's lock)
+# runs among <pid>'s descendants.
+flock_under() {
+    for fu_pid in $(pgrep -xf 'flock 8'); do
+        fu_up=$fu_pid
+        while [ -n "$fu_up" ] && [ "$fu_up" -gt 1 ]; do
+            [ "$fu_up" = "$1" ] && return 0
+            fu_up=$(ps -o ppid= -p "$fu_up" 2>/dev/null | tr -d ' ')
+        done
+    done
+    return 1
+}
+# 111 going is the key held: the warm runs it only under the key's lock (a
+# probe of the lock would take it for a moment, and a warm that found it
+# taken then would skip the key).
 waited=0
-until ls "$work/caches/locked/spawn/gate-base/"*.lock >/dev/null 2>&1 || [ "$waited" -ge 600 ]; do
+until ps -eo args | grep -F "$slow/111.sh" | grep -qv grep; do
     sleep 0.1
     waited=$((waited + 1))
+    [ "$waited" -lt 3000 ] || { echo "FAIL the base-only run never ran 111 under its key"; exit 1; }
 done
-expect "a gate started meanwhile" "$(with_jobs 2 locked "$good" "$slow")" 'exit=0 {"verdict":"accepted"}'
+(with_jobs 2 locked "$good" "$slow" >"$work/locked.result") &
+locked_gate=$!
+background="$background $locked_gate"
+waited=0
+until flock_under "$locked_gate"; do
+    sleep 0.1
+    waited=$((waited + 1))
+    [ "$waited" -lt 3000 ] || { echo "FAIL the gate started meanwhile never waited for the key"; exit 1; }
+done
+: >"$slow_release"
+wait "$locked_gate" || true
+expect "a gate started meanwhile" "$(cat "$work/locked.result")" 'exit=0 {"verdict":"accepted"}'
 expect "waits for the other run's result" "$(cat "$work/gate.out")" \
     '| == base: 111.sh: solved (cached: another gate judged it meanwhile)'
 expect "and counts it from the cache" "$(cat "$work/gate.out")" \
@@ -2346,10 +2469,19 @@ EOF
     kept=$work/own-kept-$kind
     mkdir -p "$kept"
     cp "$scenarios/protected" "$kept/"
+    # 103's base run lasts until the suite has removed the template (its
+    # release file), not 3 s: at load the removal came after the base phase.
+    kept_release=$kept/release
+    rm -f "$kept_release"
+    releases="$releases $kept_release"
     cat >"$kept/103.sh" <<EOF
 #!/bin/sh
 $q_function
-if [ "\$(cat value)" = one ]; then sleep 3.125; exit 0; fi
+if [ "\$(cat value)" = one ]; then
+    n=0
+    while [ ! -e $kept_release ] && [ "\$n" -lt 1000 ]; do sleep 0.3125; n=\$((n + 1)); done
+    exit 0
+fi
 [ "\$(q 'select 42')" = 42 ] || { echo "the candidate's server refused the sandbox's password"; exit 1; }
 EOF
     (
@@ -2358,14 +2490,16 @@ EOF
     ) &
     kept_gate=$!
     waited=0
-    until ps -eo args | grep -F 'sleep 3.125' | grep -qv grep || [ "$waited" -ge 600 ]; do
+    until ps -eo args | grep -F 'sleep 0.3125' | grep -qv grep || [ "$waited" -ge 3000 ]; do
         sleep 0.1
         waited=$((waited + 1))
     done
+    [ "$waited" -lt 3000 ] || { echo "FAIL $kind: 103 never ran on the base"; exit 1; }
     templates=$work/caches/own-kept-$kind/spawn/gate-pg
     first_password=$(cat "$templates"/*/password)
     find "$templates" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9a-f]{64}' \
         -exec chmod -R u+w {} + -exec rm -rf {} +
+    : >"$kept_release"
     wait "$kept_gate" || :
     expect "$kind: a template removed during the base phase" "$(cat "$work/kept.result")" 'exit=0 {"verdict":"accepted"}'
     refuse "$kind: was remade with a new password" "$(cat "$templates"/*/password)" "$first_password"
@@ -2394,7 +2528,7 @@ EOF
     expect "$kind: saying why" "$(cat "$integrator/verdict")" \
         'did not start: its template in '
     # A gate ended by a signal takes its server and its runs with it.
-    printf '#!/bin/sh\n[ "$(cat value)" = one ] || sleep 29.75\n' >"$own/check-long.sh"
+    printf '#!/bin/sh\n[ "$(cat value)" = one ] || sleep 120.75\n' >"$own/check-long.sh"
     rm -rf "$integrator"
     mkdir -m 700 "$integrator"
     (
@@ -2403,14 +2537,14 @@ EOF
     ) &
     signalled=$!
     waited=0
-    until ps -eo args | grep -F 'sleep 29.75' | grep -qv grep || [ "$waited" -ge 600 ]; do
+    until ps -eo args | grep -F 'sleep 120.75' | grep -qv grep || [ "$waited" -ge 3000 ]; do
         sleep 0.1
         waited=$((waited + 1))
     done
+    [ "$waited" -lt 3000 ] || { echo "FAIL $kind: check-long never ran"; exit 1; }
     kill -TERM "$signalled"
     wait "$signalled" || :
-    sleep 1
-    refuse "$kind: a gate ended by a signal leaves no run" "$(ps -eo args | grep -F 'sleep 29.75' | grep -v grep || true)" 'sleep'
+    refuse "$kind: a gate ended by a signal leaves no run" "$(gone_within 30 'sleep 120.75')" 'sleep'
     refuse "$kind: and no server" "$(left)" 'bwrap'
     rm -f "$own/check-long.sh"
 }
@@ -2487,13 +2621,44 @@ expect "and says what the sandbox saw" "$(cat "$work/gate.out")" 'SUPPLY_PA_DEPS
 slots=$work/slots
 mkdir -p "$slots"
 cp "$scenarios/protected" "$slots/"
-cat >"$slots/check-slot.sh" <<'SLOT'
+# Each run lasts until the suite lets it go (the release file), polling with
+# a sleep of its own length (slot_token) so the suite can count the runs
+# going: the suite releases two gates' runs once one gate says it waits
+# (one slot) or once two runs go (two slots). A 2 s run asked the gates'
+# setups to land within 2 s of each other, which load does not keep. Once
+# released, a run lasts 1 s.
+slot_release=$slots/release
+releases="$releases $slot_release"
+slot_token=0.2$$
+cat >"$slots/check-slot.sh" <<SLOT
 #!/bin/sh
-echo "slot-start $(date +%s%3N)"
-sleep 2
-echo "slot-end $(date +%s%3N)"
+echo "slot-start \$(date +%s%3N)"
+n=0
+while [ ! -e $slot_release ] && [ "\$n" -lt 1500 ]; do sleep $slot_token; n=\$((n + 1)); done
+sleep 1
+echo "slot-end \$(date +%s%3N)"
 exit 0
 SLOT
+# slots_going <n>: wait until <n> slot runs go (up to 300 s).
+slots_going() {
+    sg_n=0
+    until [ "$(ps -eo args | grep -F "sleep $slot_token" | grep -cv grep)" -ge "$1" ]; do
+        sleep 0.1
+        sg_n=$((sg_n + 1))
+        [ "$sg_n" -lt 3000 ] || { echo "FAIL $1 slot runs never went at once"; exit 1; }
+    done
+}
+# slots_said <text> <log>...: wait until one of the logs says it (up to 300 s).
+slots_said() {
+    ss_text=$1
+    shift
+    ss_n=0
+    until cat "$@" 2>/dev/null | grep -qF "$ss_text"; do
+        sleep 0.1
+        ss_n=$((ss_n + 1))
+        [ "$ss_n" -lt 3000 ] || { echo "FAIL no gate said: $ss_text"; exit 1; }
+    done
+}
 cp "$slots/check-slot.sh" "$slots/check-slot-two.sh"
 # slot_run <tag> <budget> [<jobs>]: one gate's exit status, its log in
 # $work/slots-<tag>.log.
@@ -2516,8 +2681,11 @@ slot_window() {
 overlaps() {
     if [ "$1" -lt "$4" ] && [ "$3" -lt "$2" ]; then echo overlap; else echo apart; fi
 }
+rm -f "$slot_release"
 slot_run a 1 1 >/dev/null & slot_a=$!
 slot_run b 1 1 >/dev/null & slot_b=$!
+slots_said "waiting for a host scenario slot (all 1 taken" "$work/slots-a.log" "$work/slots-b.log"
+: >"$slot_release"
 wait "$slot_a" "$slot_b"
 # Both checks run (one scenario each gate), two gates, one slot in all.
 wa=$(slot_window "$work/slots-a.log" 1)
@@ -2537,8 +2705,11 @@ expect "and it was visible while it waited" \
 # no-file caveat is not said.
 mkdir -p "$HOME/.cache/spawn/gate-slots"
 printf '1\n' >"$HOME/.cache/spawn/gate-slots/host_jobs"
+rm -f "$slot_release"
 slot_run f 2 1 >/dev/null & slot_f=$!
 slot_run g 2 1 >/dev/null & slot_g=$!
+slots_said "waiting for a host scenario slot (all 1 taken" "$work/slots-f.log" "$work/slots-g.log"
+: >"$slot_release"
 wait "$slot_f" "$slot_g"
 expect "a host_jobs file outranks SPAWN_GATE_HOST_JOBS" \
     "$(overlaps $(slot_window "$work/slots-f.log" 1) $(slot_window "$work/slots-g.log" 1))" apart
@@ -2546,12 +2717,19 @@ expect "and its number is the one stated" "$(cat "$work/slots-f.log")" \
     '| host scenario slots: 1 (every gate on this host takes one per scenario run)'
 refuse "and no no-file caveat is said" "$(cat "$work/slots-f.log")" "host_jobs file"
 rm -f "$HOME/.cache/spawn/gate-slots/host_jobs"
+rm -f "$slot_release"
 slot_run c 2 1 >/dev/null & slot_c=$!
 slot_run d 2 1 >/dev/null & slot_d=$!
+slots_going 2
+: >"$slot_release"
 wait "$slot_c" "$slot_d"
 expect "two host slots: the same two runs overlap" \
     "$(overlaps $(slot_window "$work/slots-c.log" 1) $(slot_window "$work/slots-d.log" 1))" overlap
-slot_run e 2 2
+rm -f "$slot_release"
+slot_run e 2 2 >/dev/null & slot_e=$!
+slots_going 2
+: >"$slot_release"
+wait "$slot_e"
 expect "one gate with two jobs gets both slots (no deadlock)" \
     "$(overlaps $(slot_window "$work/slots-e.log" 1) $(slot_window "$work/slots-e.log" 2))" overlap
 rm -f "$slots/check-slot-two.sh"
@@ -2560,7 +2738,7 @@ rm -f "$slots/check-slot-two.sh"
 slowslots=$work/slots-slow
 mkdir -p "$slowslots"
 cp "$scenarios/protected" "$slowslots/"
-printf '#!/bin/sh\nsleep 30\nexit 0\n' >"$slowslots/check-slow.sh"
+printf '#!/bin/sh\nsleep 120\nexit 0\n' >"$slowslots/check-slow.sh"
 killed_pidfile=$work/slots-killed.pid
 rm -f "$killed_pidfile"
 # The killed gate's scratch is its own (no trap ran): find it while its
@@ -2577,7 +2755,7 @@ waited=0
 until [ -s "$killed_pidfile" ]; do
     sleep 0.1
     waited=$((waited + 1))
-    [ "$waited" -lt 100 ] || break
+    [ "$waited" -lt 3000 ] || break
 done
 killed_gate=$(cat "$killed_pidfile" 2>/dev/null || true)
 [ -n "$killed_gate" ] || { echo "FAIL the killed gate never started"; exit 1; }
@@ -2585,9 +2763,9 @@ waited=0
 until ! flock -n "$slot_file" true 2>/dev/null; do
     sleep 0.1
     waited=$((waited + 1))
-    [ "$waited" -lt 300 ] || break
+    [ "$waited" -lt 3000 ] || break
 done
-[ "$waited" -lt 300 ] || { echo "FAIL the killed gate never took its slot"; exit 1; }
+[ "$waited" -lt 3000 ] || { echo "FAIL the killed gate never took its slot"; exit 1; }
 # No `--`: this file's sh is dash, whose kill reads "--" as a signal option
 # and (-"$pid" never delivered) left the gate alive. A negative pid names the
 # process group; the gate is its own session leader (setsid above).
@@ -2612,16 +2790,20 @@ waited=0
 until flock -n "$slot_file" true 2>/dev/null; do
     sleep 0.1
     waited=$((waited + 1))
-    [ "$waited" -lt 100 ] || break
+    [ "$waited" -lt 600 ] || break
 done
-expect "a killed gate leaves its slot free" "$([ "$waited" -lt 100 ] && echo free || echo held)" free
+expect "a killed gate leaves its slot free" "$([ "$waited" -lt 600 ] && echo free || echo held)" free
 printf '#!/bin/sh\nsleep 1\nexit 0\n' >"$slowslots/check-slow.sh"
 killed_run=0
-started=$(date +%s)
 XDG_CACHE_HOME="$work/caches/slots-kill" SPAWN_GATE_JOBS=1 SPAWN_GATE_HOST_JOBS=1 \
     sh "$gate" "$repo" "$base" "$good" "$slowslots" >"$work/slots-after-kill.log" 2>&1 || killed_run=$?
 expect "and the next gate runs at once: exit 0" "$killed_run" 0
-expect "without waiting for a slot" "$([ $(( $(date +%s) - started )) -lt 20 ] && echo quick)" quick
+# No clock: the gate says a wait for its slot itself, "waiting for …"
+# when it starts and "waited N s" for any wait from 200 ms (slot_claim). A
+# 20 s wall clock around the gate counted its process start (load 45 inside
+# another gate, check-test-gate on 2d0cab71), and its own total counts its
+# setup, 45 s at that load.
+refuse "without waiting for a slot" "$(cat "$work/slots-after-kill.log")" "waiting for a host scenario slot"
 refuse "and its log says no wait" "$(cat "$work/slots-after-kill.log")" "waited"
 # A run that cannot get a slot within its bound: no room to judge now (exit
 # 5, the slot-shaped no-room fact), never a verdict; it starts nothing, and
@@ -2635,7 +2817,7 @@ waitfold=$work/slots-wait
 mkdir -p "$waitfold"
 cp "$scenarios/protected" "$waitfold/"
 rm -f "$waitfold/release"
-printf '#!/bin/sh\nn=0\nwhile [ ! -e %s/release ] && [ "$n" -lt 1200 ]; do sleep 0.1; n=$((n + 1)); done\nexit 0\n' \
+printf '#!/bin/sh\nn=0\nwhile [ ! -e %s/release ] && [ "$n" -lt 3000 ]; do sleep 0.1; n=$((n + 1)); done\nexit 0\n' \
     "$waitfold" >"$waitfold/check-hold.sh"
 XDG_CACHE_HOME="$work/caches/slots-hold" SPAWN_GATE_JOBS=1 SPAWN_GATE_HOST_JOBS=1 \
     sh "$gate" "$repo" "$base" "$good" "$waitfold" >"$work/slots-hold.log" 2>&1 &
@@ -2644,9 +2826,9 @@ waited=0
 until ! flock -n "$slot_file" true 2>/dev/null; do
     sleep 0.1
     waited=$((waited + 1))
-    [ "$waited" -lt 300 ] || break
+    [ "$waited" -lt 3000 ] || break
 done
-[ "$waited" -lt 300 ] || { echo "FAIL the holder never took its slot"; exit 1; }
+[ "$waited" -lt 3000 ] || { echo "FAIL the holder never took its slot"; exit 1; }
 wait_verdict=$work/slots-wait.verdict
 wait_status=0
 XDG_CACHE_HOME="$work/caches/slots-wait" SPAWN_GATE_JOBS=1 SPAWN_GATE_HOST_JOBS=1 \
@@ -2730,35 +2912,37 @@ refuse "and nothing ran" "$tmp_out" "=="
 # low one that arrived later; a low claimant alone takes an idle slot at
 # once; and the demand lock goes with a waiting gate that is killed.
 demand=$HOME/.cache/spawn/gate-slots/demand
-# The holder holds the one slot long enough for both later gates to be
-# waiting before it lets go (each needs its exports and static checks
-# first).
-priohold=$work/prio-hold
-mkdir -p "$priohold"
-cp "$scenarios/protected" "$priohold/"
-printf '#!/bin/sh\nsleep 15\nexit 0\n' >"$priohold/check-hold.sh"
-prio_hold() { # <tag>: a normal gate holding the one slot for 15 s, in the background
-    XDG_CACHE_HOME="$work/caches/prio-$1" SPAWN_GATE_JOBS=1 SPAWN_GATE_HOST_JOBS=1 \
-        sh "$gate" "$repo" "$base" "$good" "$priohold" >"$work/prio-$1.log" 2>&1 &
+# The holder holds the one slot (the slot file's lock, as in 21c) until the
+# test lets go, once the later gates have said they wait: a holder that let
+# go after a fixed 15 s was gone before a gate slow to start (each needs its
+# exports and static checks first) was waiting, at load 19 with 12 gates
+# (check-test-gate on f0c0d41c, 2026-11-10: "low never said").
+prio_release=$work/prio.release
+releases="$releases $prio_release"
+prio_hold() { # <tag>: the one slot held until prio_let_go, in the background
+    rm -f "$prio_release"
+    flock "$slot_file" sh -c 'n=0; until [ -e "$1" ] || [ "$n" -ge 6000 ]; do sleep 0.1; n=$((n + 1)); done' \
+        _ "$prio_release" &
     prio_holder=$!
     prio_n=0
     until ! flock -n "$slot_file" true 2>/dev/null; do
         sleep 0.1
         prio_n=$((prio_n + 1))
-        [ "$prio_n" -lt 300 ] || { echo "FAIL the holder ($1) never took its slot"; exit 1; }
+        [ "$prio_n" -lt 3000 ] || { echo "FAIL the holder ($1) never took its slot"; exit 1; }
     done
 }
+prio_let_go() { : >"$prio_release"; }
 prio_gate() { # <tag> <priority>: a gate on the slot scenario, in the background
     XDG_CACHE_HOME="$work/caches/prio-$1" SPAWN_GATE_JOBS=1 SPAWN_GATE_HOST_JOBS=1 \
         SPAWN_GATE_SLOT_PRIORITY="$2" \
         sh "$gate" "$repo" "$base" "$good" "$slots" >"$work/prio-$1.log" 2>&1 &
 }
-prio_said() { # <tag> <text>: wait (up to 30 s) until the gate's log says it
+prio_said() { # <tag> <text>: wait (up to 300 s: a gate's setup took 45 s at load 45) until the gate's log says it
     prio_n=0
     until grep -qF "$2" "$work/prio-$1.log" 2>/dev/null; do
         sleep 0.1
         prio_n=$((prio_n + 1))
-        [ "$prio_n" -lt 300 ] || { echo "FAIL $1 never said: $2"; exit 1; }
+        [ "$prio_n" -lt 3000 ] || { echo "FAIL $1 never said: $2"; exit 1; }
     done
 }
 prio_hold h1
@@ -2768,9 +2952,10 @@ prio_said normal "waiting for a host scenario slot (all 1 taken"
 prio_gate low low
 prio_low=$!
 prio_said low "waiting for a host scenario slot (claimed last"
+prio_let_go
 prio_status=0
 wait "$prio_holder" "$prio_normal" "$prio_low" || prio_status=$?
-expect "the three gates finish: exit 0" "$prio_status" 0
+expect "the holder and the two gates finish: exit 0" "$prio_status" 0
 prio_wn=$(slot_window "$work/prio-normal.log" 1)
 prio_wl=$(slot_window "$work/prio-low.log" 1)
 [ -n "$prio_wn" ] && [ -n "$prio_wl" ] || { echo "FAIL no slot run in a priority log"; exit 1; }
@@ -2814,6 +2999,7 @@ for prio_pid in $(ps -eo pid=,sess= | awk -v s="$prio_killed" '$2 == s { print $
 done
 kill -KILL "-$prio_killed" 2>/dev/null || { echo "FAIL could not kill the waiting gate's group"; exit 1; }
 [ -z "$prio_scratch" ] || rm -rf "${TMPDIR:-/tmp}/spawn-gate.$prio_scratch"
+prio_let_go
 prio_status=0
 wait "$prio_behind" || prio_status=$?
 expect "with the waiting gate killed, the warm behind it runs: exit 0" "$prio_status" 0
@@ -2842,13 +3028,14 @@ cp "$scenarios/protected" "$invert/"
 printf '#!/bin/sh\nsleep 1\nexit 0\n' >"$invert/302.sh"
 invert_release=$work/invert.release
 rm -f "$invert_release"
-flock "$slot_file" sh -c 'until [ -e "$1" ]; do sleep 0.1; done' _ "$invert_release" &
+releases="$releases $invert_release"
+flock "$slot_file" sh -c 'n=0; until [ -e "$1" ] || [ "$n" -ge 6000 ]; do sleep 0.1; n=$((n + 1)); done' _ "$invert_release" &
 invert_holder=$!
 prio_n=0
 until ! flock -n "$slot_file" true 2>/dev/null; do
     sleep 0.1
     prio_n=$((prio_n + 1))
-    [ "$prio_n" -lt 300 ] || { echo "FAIL the inversion case's holder never took the slot"; exit 1; }
+    [ "$prio_n" -lt 3000 ] || { echo "FAIL the inversion case's holder never took the slot"; exit 1; }
 done
 XDG_CACHE_HOME="$work/caches/invert" SPAWN_GATE_HOST_JOBS=1 \
     sh "$gate" --base-only "$repo" "$base" "$invert" >"$work/prio-invert-warm.log" 2>&1 &
