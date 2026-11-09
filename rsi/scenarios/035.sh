@@ -603,11 +603,12 @@ rm -f "$ctl/.controller"
 printf '#!/bin/sh\nexit 0\n' >"$gate/check-two.sh"
 digest_b=$(scenarios_digest)
 [ "$digest_b" != "$digest_a" ] || harness "the scenario set's digest did not change with a new file"
+# Counted before the report: a running integrator can judge it within 0.5 s.
+rejections_before=$(rejections)
 assign_and_report two
 task_b=$task
 main_b=$(main_of)
 [ "$main_b" != "$main_a" ] || harness "task #$task_a's landing did not move the source's main"
-rejections_before=$(rejections)
 judge_next "$task_b" "$assigned_at"
 e4=$event
 [ "$verdict" = rejected ] ||
