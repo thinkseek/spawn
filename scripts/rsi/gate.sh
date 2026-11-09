@@ -158,7 +158,11 @@
 #   Cargo.toml, any change to clippy.toml or .clippy.toml, a new crate-level
 #   `#![allow(..)]` / `#![expect(..)]` (or one in `cfg_attr`), or a removed
 #   `#![warn|deny|forbid(..)]` is refused. An item-level `#[allow]` is a
-#   reviewer's job.
+#   reviewer's job. A crate new in the candidate (a Cargo.toml with a
+#   [package] table the base does not have) must inherit the workspace's
+#   lints, `[lints]` with `workspace = true` and nothing else (or the dotted
+#   `lints.workspace = true`, or `lints = { workspace = true }`): one without
+#   it would be linted by nothing.
 #
 # Environment (the integrator passes these and nothing else, gate.rs):
 #   PATH, HOME, LANG, TMPDIR   as usual
@@ -2112,8 +2116,11 @@ lint_config() {
     )
 }
 # A crate new in the candidate that only inherits the workspace's lints
-# (`[lints]` with `workspace = true`, nothing else) relaxes nothing: those two
-# lines of a manifest the base does not have are left out of the comparison.
+# relaxes nothing: its inheritance, in any of the forms Cargo reads the same
+# (`[lints]` with `workspace = true` under it, the dotted
+# `lints.workspace = true`, the inline `lints = { workspace = true }`, any
+# spacing: lint_config drops whitespace), is left out of the comparison for
+# a manifest the base does not have.
 # Without this a new crate that inherits the lints was refused while one with
 # no [lints] table at all (lint-free) passed (spawn-kdf, 2026-11-09).
 lint_config_inherits_new() { # <base tree> <candidate tree>
@@ -2121,12 +2128,51 @@ lint_config_inherits_new() { # <base tree> <candidate tree>
     lint_config "$2" | awk -v known="$work/lint-base-manifests" '
         BEGIN { while ((getline line < known) > 0) base[line] = 1 }
         { split($0, part, ": "); file = part[1]; rest = substr($0, length(file) + 3) }
-        !(file in base) && (rest == "[lints]" || rest == "workspace=true") { next }
+        !(file in base) && (rest == "[lints]" || rest == "workspace=true" ||
+                            rest == "lints.workspace=true" || rest == "lints={workspace=true}") { next }
         { print }'
 }
 if [ "$(lint_config "$work/baseline")" != "$(lint_config_inherits_new "$work/baseline" "$work/candidate")" ]; then
     echo "| candidate changes lint configuration ([lints] tables or clippy.toml)"
     verdict rejected "candidate changes lint configuration"
+    exit 0
+fi
+# lint_free_new <base tree> <candidate tree>: every crate new in the
+# candidate (a Cargo.toml with a [package] table the base does not have)
+# that does not inherit the workspace's lints (`[lints]` with
+# `workspace = true`, or the dotted or inline form of it), one manifest per
+# line. A crate with no [lints] table
+# gets no lints at all: neither the workspace's nor any of its own, so every
+# check-clippy rule passes over it unread. Inheriting is required, not only
+# allowed (77fc38ae allowed it).
+lint_free_new() {
+    new_lints=$(lint_config "$2")
+    (
+        cd "$2" || exit 1
+        find . -name Cargo.toml -type f | sort | while IFS= read -r manifest; do
+            [ -f "$1/$manifest" ] && continue
+            awk '{ sub(/#.*/, "") } /^[[:space:]]*\[package\][[:space:]]*$/ { found = 1 }
+                 END { exit !found }' "$manifest" || continue
+            if printf '%s\n' "$new_lints" | grep -qxF -- "$manifest: [lints]" &&
+                printf '%s\n' "$new_lints" | grep -qxF -- "$manifest: workspace=true"; then
+                continue
+            fi
+            if printf '%s\n' "$new_lints" | grep -qxF -e "$manifest: lints.workspace=true" \
+                -e "$manifest: lints={workspace=true}"; then
+                continue
+            fi
+            echo "$manifest"
+        done
+    )
+}
+lint_free=$(lint_free_new "$work/baseline" "$work/candidate")
+if [ -n "$lint_free" ]; then
+    echo "| crates new in the candidate without [lints] workspace = true: $(echo "$lint_free" | tr '\n' ' ')"
+    # The reason says the fix: it is where the agent meets the rule.
+    reason=$(echo "$lint_free" | sed 's|^\./||; s|^Cargo\.toml$|.|; s|/Cargo\.toml$||' | while IFS= read -r crate; do
+        printf '%s; ' "crate ${crate:-.} is new and lacks \`[lints] workspace = true\` in its Cargo.toml; add it"
+    done | sed 's/; $//')
+    verdict rejected "$reason (a crate new in the candidate must inherit the workspace's lints)"
     exit 0
 fi
 

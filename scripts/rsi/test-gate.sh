@@ -891,7 +891,8 @@ expect "a socket URL whose socket is missing is no verdict" \
 expect "and says why" "$(cat "$work/gate.out")" 'no test database socket at /nonexistent/dir/.s.PGSQL.5432'
 
 # 4. A build script by another name: `build = ` in any Cargo.toml, however
-# spelled. `[build-dependencies]` and `build-override` are not build keys.
+# spelled. `[build-dependencies]` and `build-override` are not build keys
+# (the new crate inherits the workspace's lints, as every new crate must).
 branch buildkey
 printf 'two\n' >"$seed/value"
 mkdir -p "$seed/tools"
@@ -908,7 +909,7 @@ expect "a quoted build key in a nested Cargo.toml refused" "$(judge "$quoted")" 
 branch buildkey-none
 printf 'two\n' >"$seed/value"
 mkdir -p "$seed/crates/x"
-printf '[package]\nname = "x"\n[build-dependencies]\ncc = "1"\n[profile.dev.build-override]\nopt-level = 1\n' \
+printf '[package]\nname = "x"\n[build-dependencies]\ncc = "1"\n[profile.dev.build-override]\nopt-level = 1\n[lints]\nworkspace = true\n' \
     >"$seed/crates/x/Cargo.toml"
 nobuildkey=$(commit buildkey-none)
 expect "build-dependencies are not a build key" "$(judge "$nobuildkey")" 'exit=0 {"verdict":"accepted"}'
@@ -1108,6 +1109,43 @@ mkdir -p "$seed/crates/kdf"
 printf '[package]\nname = "kdf"\n\n[lints]\nworkspace = true\nclippy = { all = "allow" }\n' >"$seed/crates/kdf/Cargo.toml"
 extra=$(commit lints-new-extra)
 expect "a new crate with more than workspace = true under [lints] is refused" "$(judge "$extra")" 'lint configuration'
+# Inheriting is required: a new crate with no [lints] table gets no lints at
+# all, and is refused naming its manifest (batch 12; 77fc38ae only allowed
+# it). A manifest with no [package] (a workspace root) is no crate.
+branch lints-new-none
+printf 'two\n' >"$seed/value"
+mkdir -p "$seed/crates/kdf"
+printf '[package]\nname = "kdf"\n' >"$seed/crates/kdf/Cargo.toml"
+lint_free=$(commit lints-new-none)
+expect "a new crate without [lints] workspace = true is refused, naming it" "$(judge "$lint_free")" \
+    "crate crates/kdf is new and lacks \`[lints] workspace = true\` in its Cargo.toml; add it (a crate new in the candidate must inherit the workspace's lints)"
+expect "the gate's log says so" "$(cat "$work/gate.out")" \
+    "| crates new in the candidate without [lints] workspace = true: ./crates/kdf/Cargo.toml"
+# The dotted and inline forms, with any spacing, inherit the same.
+branch lints-new-dotted
+printf 'two\n' >"$seed/value"
+mkdir -p "$seed/crates/kdf"
+printf '[package]\nname = "kdf"\nversion = "0.1.0"\n\nlints.workspace=true\n' >"$seed/crates/kdf/Cargo.toml"
+dotted=$(commit lints-new-dotted)
+expect "a new crate with lints.workspace = true is fine" "$(judge "$dotted")" 'exit=0 {"verdict":"accepted"}'
+branch lints-new-inline
+printf 'two\n' >"$seed/value"
+mkdir -p "$seed/crates/kdf"
+printf '[package]\nname = "kdf"\n\nlints = {  workspace =true }\n' >"$seed/crates/kdf/Cargo.toml"
+inline=$(commit lints-new-inline)
+expect "a new crate with lints = { workspace = true } is fine" "$(judge "$inline")" 'exit=0 {"verdict":"accepted"}'
+branch lints-new-spaced
+printf 'two\n' >"$seed/value"
+mkdir -p "$seed/crates/kdf"
+printf '[package]\nname = "kdf"\n\n  [lints]\n\tworkspace=   true\n' >"$seed/crates/kdf/Cargo.toml"
+spaced=$(commit lints-new-spaced)
+expect "a new crate with [lints] workspace=true in other spacing is fine" "$(judge "$spaced")" 'exit=0 {"verdict":"accepted"}'
+branch lints-new-other-table
+printf 'two\n' >"$seed/value"
+mkdir -p "$seed/crates/kdf"
+printf '[package]\nname = "kdf"\n\n[dependencies]\nworkspace = true\n' >"$seed/crates/kdf/Cargo.toml"
+other_table=$(commit lints-new-other-table)
+expect "workspace = true under another table is no inheritance" "$(judge "$other_table")" "crate crates/kdf is new and lacks"
 
 # 9. Objectives are judged on the base before any candidate code runs, and
 # cached. A fake shared test server (a Unix socket the gate binds in, as it
