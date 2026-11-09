@@ -27,7 +27,20 @@
 #   (2) an idle minute: every session waits at its prompt, no task is open,
 #       no command is pending, nothing is due. Over 60 s the scans of every
 #       user table add up to at most IDLE_MAX (150: 1.25 per pass, one
-#       watermark read per pass and the disk watch's minute).
+#       watermark read per pass and the disk watch's minute). Two minutes
+#       are measured back to back and the lower one is judged: the loop's
+#       own cost does not drop in the second minute (a step that reads on
+#       every pass reads in both), while a host's does. A loaded host
+#       (another gate's scenarios beside it, an alert such as tmpfs_high
+#       firing) once put one minute at 152 with the loop's statements
+#       unchanged (2026-11-09, batch 8, under log_statement=all: 137 and 138
+#       statements, the same ones, on the candidate and the base). The bound
+#       is not raised: a regression adds to both minutes. One extra
+#       watermark read per pass still fails it, as below.
+#       The transactions printed beside the scans are not judged:
+#       pg_stat_database.xact_commit also counts the server's own
+#       (autovacuum and analyze after the busy setup), 159 to 300 a minute
+#       for the same build.
 #   (3) a busy minute, the same decisions at the same times. At its start
 #       T1 is assigned to alpha (whose engine then stays busy and quiet) and
 #       T2 to frail, whose text the tmux wrapper refuses to stage while
@@ -451,12 +464,19 @@ done
 
 # --- (2) an idle minute ------------------------------------------------------------
 
+# Two idle minutes back to back, and the lower is the measure (the header
+# says why): the loop's own cost is the same in both, a host's is not.
 idle_from=$(q "select coalesce(max(id), 0) from spawn_events")
 snapshot "$WORK/idle.before"
 sleep 60
+snapshot "$WORK/idle.mid"
+sleep 60
 snapshot "$WORK/idle.after"
 idle_events=$(q "select count(*) from spawn_events where id > $idle_from")
-set -- $(delta "$WORK/idle.before" "$WORK/idle.after")
+first=$(delta "$WORK/idle.before" "$WORK/idle.mid")
+second=$(delta "$WORK/idle.mid" "$WORK/idle.after")
+echo "023: idle minutes: first ${first%% *} scans, second ${second%% *}"
+if [ "${second%% *}" -lt "${first%% *}" ]; then set -- $second; else set -- $first; fi
 idle_scans=$1 idle_seq=$2 idle_idx=$3 idle_xact=$4
 shift 4
 idle_top="$*"
