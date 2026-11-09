@@ -59,7 +59,10 @@ export async function readBack(
     const from = Math.max(0, after - size);
     const older = await read(from, after - from);
     events = mergeEvents(older, events);
-    found += older.length;
+    // The server's limit counts visible rows: past a hidden stretch a read
+    // runs on beyond `after` into events already held. Only those up to
+    // `after` are new.
+    found += older.filter((event) => event.session_seq <= after).length;
     after = from;
   }
   return { events, after, through: window.through };
