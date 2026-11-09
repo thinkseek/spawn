@@ -1804,11 +1804,15 @@ normalized() {
     # Times, and the sockets the host has open (other processes' too), and
     # the host's scenario budget: it is SPAWN_GATE_JOBS, which differs here
     # (1 against 4), and a wait for a slot is the host's, not the log's.
-    sed -E -e 's/[0-9]+ms/Nms/g' -e 's/[0-9]+ s\b/N s/g' -e '/^\| (base|candidate) runs: /d' \
+    # The lines are dropped before the times are masked: masking first made
+    # "waited 0.4 s" into "waited 0.N s", which the drop no longer matched,
+    # so a wait for a slot (another gate on the host) failed the comparison.
+    sed -E -e '/^\| (base|candidate) runs: /d' \
         -e '/^\| gate time: /d' -e '/^\| sockets hidden from the sandbox: /d' \
         -e '/^\| host scenario slots: /d' \
         -e '/^\| waited [0-9.]+ s for host scenario slot /d' \
-        -e '/^\| [a-z]+\.[0-9]+: (still )?waiting for a host scenario slot /d' "$work/gate.out"
+        -e '/^\| [a-z]+\.[0-9]+: (still )?waiting for a host scenario slot /d' \
+        -e 's/[0-9]+ms/Nms/g' -e 's/[0-9]+ s\b/N s/g' "$work/gate.out"
 }
 # own_and_wall <phase>: the wall clock and the runs' own time the log names.
 wall_of() { sed -n "s/^| $1 runs: [0-9]* in \([0-9]*\) s, .*/\1/p" "$work/gate.out"; }
