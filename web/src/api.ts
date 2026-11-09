@@ -70,6 +70,9 @@ export interface Alert {
   cleared_at_ms: number | null;
   cleared_evidence: unknown;
   text: string;
+  /** An open agent_stuck's session's last scored judgement (the score it
+   * stands on may be hours old while the judge is down); null otherwise. */
+  scored_at_ms?: number | null;
 }
 
 export interface Execution {

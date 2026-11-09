@@ -99,7 +99,7 @@ from (select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
          and e.kind -> 'detail' -> 'record' ->> 'type' in
              ('mission.halted', 'mission.resumed', 'admission.waiting', 'admission.admitted',
               'backup.dumped', 'backup.bundled', 'backup.verified',
-              'execution.interrupted', 'execution.cleared')
+              'execution.interrupted', 'execution.cleared', 'host.judge')
        order by e.id
        limit $2) x";
 
@@ -170,7 +170,11 @@ select coalesce(jsonb_agg(jsonb_build_object(
       'fired_event_id', a.fired_event_id, 'fired_at_ms', a.fired_at_ms,
       'evidence', a.evidence,
       'cleared_event_id', a.cleared_event_id, 'cleared_at_ms', a.cleared_at_ms,
-      'cleared_evidence', a.cleared_evidence, 'text', a.text)
+      'cleared_evidence', a.cleared_evidence, 'text', a.text,
+      'scored_at_ms', case when a.kind = 'agent_stuck' and a.state = 'open' then
+        (select max(e.recorded_at_ms) from spawn_events e
+          where e.session_id = a.subject and e.event_name = 'observation.recorded'
+            and e.kind -> 'detail' -> 'observation' ? 'stuck') end)
     order by a.fired_at_ms, a.key), '[]'::jsonb)
 from spawn_alerts a
 where a.state = 'open' or a.fired_at_ms >= $1
