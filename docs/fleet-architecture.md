@@ -1791,6 +1791,27 @@ are per-agent uids or a mount per engine.
      moved lifts the hold at once (the next gate runs, with the base check).
      The supervisor's digest tells a red once (its `alert`) and a green
      once.
+
+     **A verdict on a main that moved is `stale`.** When the gate ends with
+     anything but `accepted` (rejected, conflict, incompatible, a host
+     fault, no room, an abort, a judging that panicked), the integrator
+     reads the source's main once (`git ls-remote`). If it is no longer the
+     base the gate judged, the task is gated `stale` with what the gate
+     found (`found`), main then (`base`) and now (`main_now`) and the
+     found verdict's reason, and judged again on the new main. Nothing is
+     counted: no rejection, no abort, no host fault toward
+     `SPAWN_GATE_HOST_FAULT_CAP` or its run, no room count, and no
+     `source.main_red` for a main that is no longer main. A read that
+     fails records the verdict as found, with the read's error as
+     `main_read` (main was never checked): it fails toward the behaviour
+     before the check, where judging again on an unknown main could loop.
+     Stale has no bound of its own; it is bounded in practice, since one
+     gate runs per source and only landings, owner pushes and moves the
+     owner records move main. Supply PA's mission 6 (2026-11-09):
+     a gate started on ab21a25, main moved to 513a34e at 09:00:35, and at
+     09:20:54 its host fault, capped as the third abort in a row, halted
+     the mission. An `accepted` keeps step 6's compare-and-swap as its
+     guard;
   6. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate

@@ -2593,7 +2593,45 @@ impl Judge {
         // A gate on a main that is red (design-main-red.md) runs only as a
         // probe ([`Integrator::red_holds`]): its record says so.
         let probe = mission.red.as_ref().is_some_and(|red| red.main == main);
+        // Where main is now, read once per judging after the gate ends (one
+        // `ls-remote`), by whichever of the main_red record and `gated` asks
+        // first; the error when it could not be read.
+        let moved: std::cell::OnceCell<Result<Option<String>, String>> = std::cell::OnceCell::new();
+        let main_now = || moved.get_or_init(|| main_moved(source, main)).clone();
         let gated = |verdict: &str, extra: Value| -> Result<(), String> {
+            let mut unread = None;
+            // Main moved while the gate ran: what it found is about a main
+            // that is no longer main, so it is `stale`, judged again on the
+            // new one, before anything is counted (the cap below, the abort
+            // halt). An `accepted` keeps the landing's compare-and-swap as
+            // its guard ([`land`]).
+            let now = if verdict == "accepted" {
+                None
+            } else {
+                main_now().unwrap_or_else(|error| {
+                    eprintln!("integrate: task {}: where main is now: {error}", task.id);
+                    unread = Some(error);
+                    None
+                })
+            };
+            if let Some(now) = now {
+                let reason = extra["reason"].as_str().unwrap_or_default();
+                let mut stale = stale_on_main_move(main, &now, verdict, reason);
+                stale["id"] = json!(task.id);
+                stale["revision"] = json!(task.revisions);
+                stale["scenarios"] = json!(count);
+                if let Some(log) = extra.get("log") {
+                    stale["log"] = log.clone();
+                }
+                record(store, &stale)?;
+                println!(
+                    "integrate: task {} gated: stale ({verdict} on {}, main is {} now)",
+                    task.id,
+                    short_commit(main),
+                    short_commit(&now)
+                );
+                return Ok(());
+            }
             // A host fault past the cap for this revision counts as an abort
             // ([`HOST_FAULT_CAP`]). Only a fault that may be the candidate's
             // does: a base-only one (the gate's fact `on` `base`) comes
@@ -2626,6 +2664,11 @@ impl Judge {
             }
             if probe {
                 record_value["probe"] = json!(true);
+            }
+            // Main could not be read: the verdict as found, and the record
+            // says main was never checked.
+            if let Some(error) = unread {
+                record_value["main_read"] = json!(error);
             }
             record(store, &record_value)?;
             println!("integrate: task {} gated: {verdict}", task.id);
@@ -2976,7 +3019,8 @@ impl Judge {
                 } else {
                     Vec::new()
                 };
-                if red_believed(&classes) && crash.is_empty() {
+                if red_believed(&classes) && crash.is_empty() && !matches!(main_now(), Ok(Some(_)))
+                {
                     let listed: Vec<Value> = failures
                         .iter()
                         .zip(&classes)
@@ -3111,8 +3155,8 @@ fn judged_or_aborted(
     };
     eprintln!("integrate: mission {mission}: task {}: {reason}", task.id);
     match abort_unrecorded(store, task, main, &reason) {
-        Ok(true) => println!("integrate: task {} gated: aborted", task.id),
-        Ok(false) => {}
+        Ok(Some(verdict)) => println!("integrate: task {} gated: {verdict}", task.id),
+        Ok(None) => {}
         Err(error) => eprintln!(
             "integrate: mission {mission}: task {}: record the abort: {error}",
             task.id
@@ -3122,13 +3166,14 @@ fn judged_or_aborted(
 
 /// Record `task.gated aborted` for a judging that ended in an error, when
 /// the log shows it recorded nothing: the task is still in the state and at
-/// the revision it was judged from. True when it recorded the abort.
+/// the revision it was judged from. `stale` instead when main moved since
+/// (`main` is no longer main). The verdict it recorded, if any.
 fn abort_unrecorded(
     store: &PostgresStore,
     task: &Task,
     main: &str,
     reason: &str,
-) -> Result<bool, String> {
+) -> Result<Option<&'static str>, String> {
     let missions: Vec<Mission> =
         serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
             .map_err(|error| format!("gated missions: {error}"))?;
@@ -3137,14 +3182,69 @@ fn abort_unrecorded(
         .flat_map(|mission| &mission.tasks)
         .any(|now| now.id == task.id && now.state == task.state && now.revisions == task.revisions);
     if !unrecorded {
-        return Ok(false);
+        return Ok(None);
     }
-    record(
-        store,
-        &json!({"type": "task.gated", "id": task.id, "verdict": "aborted",
-                "revision": task.revisions, "base": main, "reason": reason}),
-    )?;
-    Ok(true)
+    // Main moved while it ran: no abort of a judging on a main that is no
+    // longer main, counted toward the halt; `stale`, judged again.
+    let source = missions
+        .iter()
+        .find(|mission| mission.tasks.iter().any(|now| now.id == task.id))
+        .and_then(|mission| mission.source.clone());
+    let mut aborted = json!({"type": "task.gated", "id": task.id, "verdict": "aborted",
+                             "revision": task.revisions, "base": main, "reason": reason});
+    match source.map(|source| main_moved(&source, main)) {
+        Some(Ok(Some(now))) => {
+            let mut stale = stale_on_main_move(main, &now, "aborted", reason);
+            stale["id"] = json!(task.id);
+            stale["revision"] = json!(task.revisions);
+            record(store, &stale)?;
+            return Ok(Some("stale"));
+        }
+        Some(Err(error)) => {
+            eprintln!("integrate: task {}: where main is now: {error}", task.id);
+            aborted["main_read"] = json!(error);
+        }
+        Some(Ok(None)) | None => {}
+    }
+    record(store, &aborted)?;
+    Ok(Some("aborted"))
+}
+
+/// The main of `source` now, when it is no longer `main` (the base a gate
+/// judged): one `ls-remote`, as the landing reads it ([`source_head`]).
+/// `None` when main is still `main`. The read's error when it fails: then
+/// the verdict is recorded as it was found, as before this check, with the
+/// error as its `main_read` (main was never checked). A source that cannot
+/// be read leaves no task unrecorded, and is no reason to judge again.
+fn main_moved(source: &str, main: &str) -> Result<Option<String>, String> {
+    let (_, now) = source_head(source)?;
+    Ok((now != main).then_some(now))
+}
+
+/// The `stale` record of a gate whose base `main` is no longer main (`now`):
+/// what it `found` (the verdict it would have been) and that verdict's
+/// reason, never counted. Supply PA's mission 6 (2026-11-09): a gate started
+/// on ab21a25, main moved to 513a34e at 09:00:35, and at 09:20:54 its host
+/// fault was capped as the third abort in a row and halted the mission.
+fn stale_on_main_move(main: &str, now: &str, found: &str, reason: &str) -> Value {
+    let said = if reason.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", crate::deliver::one_line(reason, 300))
+    };
+    json!({"type": "task.gated", "verdict": "stale", "base": main, "main_now": now,
+    "found": found,
+    "reason": format!(
+        "main moved from {} to {} while the gate ran: its {found}{said} is no verdict on \
+         the new main; judged again",
+        short_commit(main),
+        short_commit(now)
+    )})
+}
+
+/// A commit's first 12 characters, as the integrator's messages name them.
+fn short_commit(commit: &str) -> &str {
+    commit.get(..12).unwrap_or(commit)
 }
 
 /// The commit that lands `branch` (the agent's pushed head, in the mirror)
@@ -10867,6 +10967,331 @@ mod database_tests {
         assert_eq!(super::host_fault_cap(Some("0")), 3);
         assert_eq!(super::host_fault_cap(Some("x")), 3);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A gate that notes its candidate in `<marks>/started`, holds until
+    /// `<marks>/release` exists, then writes `verdict` and exits `exit`:
+    /// main moves while it holds.
+    fn gate_holding_then(marks: &Path, lines: &str, verdict: &str, exit: i32) -> String {
+        let marks = marks.to_string_lossy();
+        format!(
+            "echo \"$3\" >>'{marks}/started'\n\
+             while [ ! -e '{marks}/release' ]; do sleep 0.05; done\n\
+             {lines}\
+             printf '%s\\n' '{verdict}' >\"$SPAWN_GATE_VERDICT\"\n\
+             exit {exit}\n"
+        )
+    }
+
+    /// One judging whose gate holds while main moves on the source: the
+    /// pass starts the gate on `m0`, main moves (the owner's push, recorded
+    /// `source.moved` as `spawn mission moved` does, so no pass halts on a
+    /// main no record explains), the gate is released and settled. Main's
+    /// new commit.
+    fn judged_while_main_moves(
+        integrator: &Integrator,
+        db: &Db,
+        base: &Path,
+        source: &str,
+        marks: &Path,
+        file: &str,
+    ) -> String {
+        let _ = std::fs::remove_file(marks.join("release"));
+        let before = started(marks).len();
+        integrator.pass_on(&db.store).expect("a pass");
+        assert_eq!(
+            wait_started(marks, before + 1).len(),
+            before + 1,
+            "the gate started"
+        );
+        let was = source_main(source);
+        let now = main_moves(base, source, file);
+        db.store.source_moved(source, &was, &now).expect("moved");
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+        now
+    }
+
+    /// Main moved while the gate ran (design-stale-on-main-move.md): every
+    /// verdict but `accepted` (whose landing's compare-and-swap is its own
+    /// guard) is `stale`, judged again on the new main, with what the gate
+    /// found (`found`), main then (`base`) and now (`main_now`), and its
+    /// reason; nothing is counted: no rejection, no abort, no run of host
+    /// faults, no room count, and the task is ready again.
+    #[test]
+    fn a_verdict_on_a_main_that_moved_while_the_gate_ran_is_stale() {
+        let cases = [
+            (
+                "host_fault",
+                "echo '| == regression: check-tests.sh must still pass'\n\
+                 echo '| FAILED api::tests::one: error connecting to server: Connection refused (os error 111)'\n",
+                "{\"verdict\":\"rejected\",\"reason\":\"regression: check-tests.sh fails on the candidate\"}",
+                0,
+            ),
+            (
+                "rejected",
+                "",
+                "{\"verdict\":\"rejected\",\"reason\":\"regression: 012.sh must still pass\"}",
+                0,
+            ),
+            (
+                "no_room",
+                "",
+                "{\"no_room\":true,\"free_kb\":2048,\"min_gb\":10,\"tmpdir\":\"/data/tmp\"}",
+                5,
+            ),
+            ("aborted", "echo 'gate: a harness error' >&2\n", "", 3),
+        ];
+        for (found, lines, verdict, exit) in cases {
+            let marks = fresh_marks(&format!("spawn-stale-move-{found}"));
+            let release = Release(marks.clone());
+            let (base, source, scenarios, mut integrator) = world(
+                &format!("stale-move-{found}"),
+                &gate_holding_then(&marks, lines, verdict, exit),
+            );
+            integrator.judge.host = super::HostSettings {
+                server_log: None,
+                backoff: std::time::Duration::from_secs(1),
+                cap: 3,
+            };
+            let db = Db::new(&format!("stale_move_{found}"));
+            let m0 = source_main(&source);
+            let mission = db.gated_mission(&source, &scenarios);
+            let task = db.reported_task(mission, "w");
+            let agent = agent_of(&db, mission, task);
+            push_work(&base, &source, &agent, "work.txt");
+
+            let m1 = judged_while_main_moves(&integrator, &db, &base, &source, &marks, "main.txt");
+            let (record, _, _) = last_verdict(&db);
+            assert_eq!(record["verdict"], "stale", "{found}: {record}");
+            assert_eq!(record["found"], found, "{found}: {record}");
+            assert_eq!(record["base"], m0.as_str(), "{found}");
+            assert_eq!(record["main_now"], m1.as_str(), "{found}");
+            let reason = record["reason"].as_str().unwrap_or_default();
+            assert!(
+                reason.starts_with(&format!(
+                    "main moved from {} to {} while the gate ran: its {found}",
+                    &m0[..12],
+                    &m1[..12]
+                )) && reason.ends_with("is no verdict on the new main; judged again"),
+                "{found}: {reason}"
+            );
+            assert!(record.get("backoff_ms").is_none(), "{found}: {record}");
+            let after = gated(&db, mission);
+            assert_eq!(
+                (
+                    after.gate_rejections,
+                    after.gate_aborts,
+                    after.gate_host_faults
+                ),
+                (0, 0, 0),
+                "{found}: nothing counted"
+            );
+            assert_eq!(
+                after.tasks[0].state,
+                spawn_core::mission::TaskState::Reported,
+                "{found}: ready to be judged again"
+            );
+            assert!(after.halted.is_none(), "{found}");
+            assert_eq!(
+                db.store.task_host_faults(task, 0).expect("count"),
+                0,
+                "{found}: no host fault for the cap"
+            );
+            drop(release);
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&marks);
+        }
+    }
+
+    /// Supply PA's mission 6, 114516 (2026-11-09): two gate aborts in a row,
+    /// a task at the host-fault cap, and a gate started on main A whose
+    /// verdict lands, after main moved to B, as a host fault the cap would
+    /// make the third abort and halt the mission. It is `stale` instead,
+    /// found `host_fault`: `gate_aborts` stays 2, and no halt.
+    #[test]
+    fn a_capped_host_fault_on_a_main_that_moved_is_stale_and_halts_nothing() {
+        let marks = fresh_marks("spawn-stale-114516");
+        let release = Release(marks.clone());
+        let gate = gate_holding_then(
+            &marks,
+            "echo '| == regression: check-tests.sh must still pass'\n\
+             echo '| FAILED api::tests::one: error connecting to server: Connection refused (os error 111)'\n",
+            "{\"verdict\":\"rejected\",\"reason\":\"regression: check-tests.sh fails on the candidate\"}",
+            0,
+        );
+        let (base, source, scenarios, mut integrator) = world("stale-114516", &gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_millis(1),
+            cap: 1,
+        };
+        let db = Db::new("stale_114516");
+        let a = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        for _ in 0..2 {
+            db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                              "verdict": "aborted", "base": a, "reason": "a harness error"}));
+        }
+        let agent = agent_of(&db, mission, task);
+        push_work(&base, &source, &agent, "work.txt");
+        // The task's first host fault, on A: the cap (1) is reached.
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        let first = last_verdict(&db).0;
+        assert_eq!(first["verdict"], "host_fault", "{first}");
+        assert_eq!(db.store.task_host_faults(task, 0).expect("count"), 1);
+        assert_eq!(gated(&db, mission).gate_aborts, 2);
+        past_due(&db);
+
+        let b = judged_while_main_moves(&integrator, &db, &base, &source, &marks, "main.txt");
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["verdict"], "stale", "never capped: {record}");
+        assert_eq!(record["found"], "host_fault");
+        assert_eq!(
+            (record["base"].as_str(), record["main_now"].as_str()),
+            (Some(a.as_str()), Some(b.as_str()))
+        );
+        assert!(record.get("host_fault").is_none(), "{record}");
+        let after = gated(&db, mission);
+        assert_eq!(after.gate_aborts, 2, "gate_aborts unchanged");
+        assert_eq!(super::halt_reason(&after, 0), None, "no halt");
+        assert!(after.halted.is_none());
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
+    }
+
+    /// A red main (design-main-red.md) is a fact about the main the gate
+    /// judged against: when main moved while the gate ran, no
+    /// `source.main_red` is written for a main that is no longer main, and
+    /// the task's verdict is `stale`, found `host_fault`.
+    #[test]
+    fn no_red_main_is_recorded_for_a_main_that_moved_while_the_gate_ran() {
+        let marks = fresh_marks("spawn-stale-red");
+        let release = Release(marks.clone());
+        let gate = gate_holding_then(
+            &marks,
+            "echo '| == regression: check-tests.sh must still pass'\n",
+            "{\"host_fault\":true,\"scenario\":\"check-tests.sh\",\"on\":\"main\",\"runs\":\"1, then 1 on the candidate; 1, then 1 on the base\",\"reason\":\"r\",\"failures\":[{\"test\":\"api::slice_11\",\"message\":\"expected 23 to be 21\"}]}",
+            6,
+        );
+        let (base, source, scenarios, mut integrator) = world("stale-red", &gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_secs(1),
+            cap: 3,
+        };
+        let db = Db::new("stale_red");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        push_work(&base, &source, &agent, "work.txt");
+        judged_while_main_moves(&integrator, &db, &base, &source, &marks, "main.txt");
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["verdict"], "stale", "{record}");
+        assert_eq!(record["found"], "host_fault");
+        assert!(control_records(&db, "source.main_red").is_empty());
+        assert!(
+            db.mission(mission)["red"].is_null(),
+            "{}",
+            db.mission(mission)
+        );
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
+    }
+
+    /// A judging that panics after main moved (judged_or_aborted): no abort
+    /// counted toward the halt for a main that is no longer main, `stale`
+    /// with found `aborted` and the panic's reason. Three of them halt
+    /// nothing.
+    #[test]
+    fn a_judging_that_panics_after_main_moved_is_stale() {
+        let (base, source, scenarios, integrator) = world("panic-moved", "exit 1\n");
+        let db = Db::new("panic_moved");
+        let m0 = source_main(&source);
+        let mission = mission_at_baseline(&db, &source, &scenarios, &m0);
+        let aborts = gated(&db, mission).gate_aborts;
+        let task = db.reported_task(mission, "w");
+        let m1 = main_moves(&base, &source, "main.txt");
+        db.store.source_moved(&source, &m0, &m1).expect("moved");
+        for _ in 0..3 {
+            super::judged_or_aborted(&db.store, &ready_task(&db, task), &m0, mission, || {
+                panic!("a bug in the judging")
+            });
+        }
+        assert_eq!(verdicts(&db, task), vec!["stale"; 3]);
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["found"], "aborted", "{record}");
+        assert_eq!(record["main_now"], m1.as_str());
+        assert!(
+            record["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("a bug in the judging")),
+            "{record}"
+        );
+        assert_eq!(gated(&db, mission).gate_aborts, aborts, "none counted");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        let board = db.mission(mission);
+        assert!(board["halted"].is_null(), "{board}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Main cannot be read when the gate ends (the source is gone for the
+    /// moment): the verdict is recorded as found, as before the stale check,
+    /// with the read's error as `main_read`, so the record says main was
+    /// never checked. The same for a judging that panicked.
+    #[test]
+    fn a_verdict_whose_main_cannot_be_read_is_recorded_as_found_with_main_read() {
+        let marks = fresh_marks("spawn-main-unread");
+        let release = Release(marks.clone());
+        let gate = gate_holding_then(
+            &marks,
+            "",
+            "{\"verdict\":\"rejected\",\"reason\":\"regression: 012.sh must still pass\"}",
+            0,
+        );
+        let (base, source, scenarios, integrator) = world("main-unread", &gate);
+        let db = Db::new("main_unread");
+        let m0 = source_main(&source);
+        let mission = mission_at_baseline(&db, &source, &scenarios, &m0);
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        push_work(&base, &source, &agent, "work.txt");
+        let away = base.join("source-away.git");
+        integrator.pass_on(&db.store).expect("a pass");
+        assert_eq!(wait_started(&marks, 1).len(), 1, "the gate started");
+        std::fs::rename(&source, &away).expect("the source goes away");
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["verdict"], "rejected", "as found: {record}");
+        assert_eq!(record["base"], m0.as_str());
+        assert!(
+            record["main_read"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty()),
+            "{record}"
+        );
+        assert!(record.get("main_now").is_none(), "{record}");
+
+        // A judging that panics while the source is away: aborted, as
+        // before, and it says main was not read.
+        let other = db.reported_task(mission, "x");
+        super::judged_or_aborted(&db.store, &ready_task(&db, other), &m0, mission, || {
+            panic!("a bug in the judging")
+        });
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["verdict"], "aborted", "{record}");
+        assert!(record["main_read"].is_string(), "{record}");
+        std::fs::rename(&away, &source).expect("the source is back");
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
     }
 
     /// A gate verdict's `flakes` (checks that failed once and passed again)
