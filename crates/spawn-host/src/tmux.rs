@@ -90,7 +90,11 @@ impl TmuxHost {
             "list-panes".to_string(),
             "-s".to_string(),
             "-t".to_string(),
-            Self::target(terminal),
+            // The session form, `=name:`: exact. `=name` is a window target
+            // here, and a session that is gone falls back to a prefix or a
+            // window name, so terminating a gone spawn-exec_1 read
+            // spawn-exec_12's pane and killed its runner (rev-f on ca758b4b).
+            Self::pane(terminal),
             "-F".to_string(),
             "#{pane_pid}".to_string(),
         ])?;
@@ -100,13 +104,8 @@ impl TmuxHost {
                 .lines()
                 .filter_map(|line| line.trim().parse().ok())
                 .collect()),
-            // A terminal already gone has nothing to wait for. `list-panes
-            // -s -t` names a missing session's window: "can't find window"
-            // (the shared contract terminates a missing terminal; batch
-            // 14's owner gate).
-            Some(1) if gone(&run.stderr) || run.stderr.contains("can't find window") => {
-                Ok(Vec::new())
-            }
+            // A terminal already gone has nothing to wait for.
+            Some(1) if gone(&run.stderr) => Ok(Vec::new()),
             other => Err(TerminalError(format!(
                 "list-panes returned {other:?}: {}",
                 run.stderr.trim()
