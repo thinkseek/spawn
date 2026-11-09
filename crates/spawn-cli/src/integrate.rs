@@ -3450,6 +3450,39 @@ fn on_the_head(mut extra: Value, head: &Value, main: &str, merged: &str) -> Valu
     extra
 }
 
+/// The merge's rejection, standing: the head alone, judged against
+/// `head_base` (the base it was built on), failed `scenario` there on the head
+/// and on that base too (`runs`), so that base cannot judge it and the
+/// gate's verdict on the merge with main is the one there is. `rejected`, with
+/// the merge's reason, log and note, `head_verdict` `unjudged` and a
+/// `head_reason` that says why; the note ends by saying it.
+fn unjudged_head(
+    fields: Value,
+    named: &Value,
+    head_base: &str,
+    scenario: &str,
+    runs: &str,
+) -> Rejection {
+    let short = head_base.get(..12).unwrap_or(head_base);
+    let why = format!(
+        "the work alone could not be judged against the base it was built on, {short}: \
+         {scenario} fails there too ({runs})"
+    );
+    let mut record = fields;
+    if let (Some(target), Some(named)) = (record.as_object_mut(), named.as_object()) {
+        target.extend(named.clone());
+    }
+    let note = record["note"].as_str().unwrap_or_default().to_string();
+    record["note"] = json!(format!(
+        "{note}\n\nThe work alone could not be judged against the base it was built on \
+         ({short}): {scenario} fails there too, so the gate's rejection of the merge with main \
+         stands. Fix what fails on the merge."
+    ));
+    record["head_verdict"] = json!("unjudged");
+    record["head_reason"] = json!(why);
+    Rejection::Record("rejected", record)
+}
+
 /// The record of a gate rejection: the reason, the gate's output and the
 /// note that quotes its tail.
 fn rejected_fields(reason: &str, log: &str) -> Value {
@@ -3676,19 +3709,22 @@ fn rejection(
             log,
             head: named,
         },
+        // The head alone fails a check on its own base too (`candidate and
+        // base`, or red there): the base it was built on cannot judge it, so
+        // the merge's rejection stands, as the gate gave it on main, with a
+        // word that the head could not be judged alone. Never a host fault:
+        // retried, it would find that base failing every time (Supply PA's
+        // task 207, 2026-11-09, on the red main fcf5e1e).
+        Err(GateFailure::HostFault {
+            scenario, on, runs, ..
+        }) if on == "candidate and base" => {
+            unjudged_head(fields, &named, &head_base, &scenario, &runs)
+        }
+        Err(GateFailure::MainRed { scenario, runs, .. }) => {
+            unjudged_head(fields, &named, &head_base, &scenario, &runs)
+        }
         Err(failure @ GateFailure::HostFault { .. }) => Rejection::HeadHostFault {
             failure,
-            head: named,
-        },
-        // Red on the head's own base, an older main: said as the host's for
-        // this judging, never as the source's main now.
-        Err(GateFailure::MainRed {
-            scenario,
-            runs,
-            log,
-            ..
-        }) => Rejection::HeadHostFault {
-            failure: red_as_host_fault(scenario, runs, &[], log),
             head: named,
         },
         Err(GateFailure::CannotJudge { scenario, log }) => Rejection::HeadCannotJudge {
@@ -11072,6 +11108,92 @@ mod database_tests {
             items[0].line
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The other half of task 207: the head alone fails the check on its own
+    /// base too (that base was a red main), so it cannot be judged there. The
+    /// merge's rejection stands, through the store: `rejected`, counted, with
+    /// the merge's reason and log (the failing test), `head_verdict`
+    /// `unjudged` and the reason, and a note that says so; no host fault, no
+    /// backoff, no run of host faults. Both shapes the gate gives a check
+    /// failing on a base: `candidate and base`, and a red main.
+    #[test]
+    fn a_head_whose_own_base_fails_the_check_leaves_the_merges_rejection_standing() {
+        for (tag, fault) in [
+            (
+                "both",
+                "{\"host_fault\":true,\"scenario\":\"check-tests.sh\",\"on\":\"candidate and base\",\"runs\":\"1, then 1 on the candidate; 1 on the base\",\"reason\":\"r\"}",
+            ),
+            (
+                "red",
+                "{\"host_fault\":true,\"scenario\":\"check-tests.sh\",\"on\":\"main\",\"runs\":\"1, then 1 on the candidate; 1, then 1 on the base\",\"reason\":\"r\",\"failures\":[{\"test\":\"api::slice_11\",\"message\":\"expected 23 to be 21\"}]}",
+            ),
+        ] {
+            let (base, source, scenarios, mut integrator) =
+                world(&format!("head-unjudged-{tag}"), &head_alone_gate(fault));
+            integrator.judge.host = super::HostSettings {
+                server_log: None,
+                backoff: std::time::Duration::from_secs(1),
+                cap: 3,
+            };
+            let db = Db::new(&format!("head_unjudged_{tag}"));
+            let m0 = source_main(&source);
+            let mission = db.gated_mission(&source, &scenarios);
+            db.reported_task(mission, "w");
+            let agent = db.mission(mission)["tasks"][0]["agent_id"]
+                .as_str()
+                .expect("the task's agent")
+                .to_string();
+            main_moves(&base, &source, "main.txt");
+            let head = push_work_on(&base, &source, &agent, &m0, "work.txt");
+            integrator.pass_on(&db.store).expect("a pass");
+            integrator.settle();
+            let (record, _, _) = last_verdict(&db);
+            assert_eq!(record["verdict"], "rejected", "{tag}: {record}");
+            assert_eq!(
+                record["reason"], "regression: check-tests.sh fails on the candidate",
+                "{tag}: the merge's reason"
+            );
+            assert!(
+                record["log"]
+                    .as_str()
+                    .is_some_and(|log| log.contains("shifts what the server stamps")),
+                "{tag}: the merge's log, with its failing test: {record}"
+            );
+            assert_eq!(record["head"], head.as_str());
+            assert_eq!(record["head_base"], m0.as_str());
+            assert_eq!(record["head_verdict"], "unjudged", "{tag}: {record}");
+            let why = record["head_reason"].as_str().expect("why");
+            assert!(
+                why.contains(&m0[..12]) && why.contains("check-tests.sh fails there too"),
+                "{tag}: {why}"
+            );
+            let note = record["note"].as_str().expect("a note");
+            assert!(
+                note.starts_with("The gate rejected this work: regression: check-tests.sh")
+                    && note.contains("shifts what the server stamps")
+                    && note.contains("so the gate's rejection of the merge with main stands"),
+                "{tag}: {note}"
+            );
+            assert!(
+                record.get("backoff_ms").is_none(),
+                "{tag}: no backoff: {record}"
+            );
+            let after = gated(&db, mission);
+            assert_eq!(after.gate_host_faults, 0, "{tag}: no run of host faults");
+            assert_eq!(after.gate_aborts, 0);
+            assert_eq!(after.gate_rejections, 1, "{tag}: a rejection, counted");
+            let board = db.mission(mission);
+            assert_eq!(
+                board["tasks"][0]["state"], "revise",
+                "{tag}: sent back: {board}"
+            );
+            assert!(
+                control_records(&db, "source.main_red").is_empty(),
+                "{tag}: the head's old base is not the source's main"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 
     /// Main is red on a check (design-main-red.md), through the store. A gate

@@ -1542,8 +1542,15 @@ are per-agent uids or a mount per engine.
      before recording anything: the same gate, scenarios and task scenario,
      base `head_base` = `git merge-base <head> <main>` (the `main` the head
      last took in), candidate the pushed head. The head passes: the verdict
-     is `incompatible` (below). The head fails too: `rejected`. The head's
-     run gives no verdict: `aborted` (or `no_room`, or a host fault),
+     is `incompatible` (below). The head fails too: `rejected`. The head
+     fails a check on `head_base` as well (the gate's `candidate and base`,
+     or a red main there): that base cannot judge it, and the merge's
+     rejection stands, `rejected` and counted, with the merge's reason, log
+     and note, `head_verdict` `unjudged`, a `head_reason` naming the check
+     and `head_base`, and a note saying the work alone could not be judged
+     there; never a host fault, which retried would find that base failing
+     each time. The head's
+     run gives no verdict otherwise: `aborted` (or `no_room`, or a host fault),
      naming the head. Such a record's log and fact are the head's run on
      `head_base`, never the merge's on `main`: it carries `head` and
      `head_base`, its reason begins "the merge with main <main> was rejected
