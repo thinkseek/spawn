@@ -1,16 +1,20 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
+import { ChevronRight } from "lucide-react";
 
-import type { PollResult } from "../../api";
+import type { Alert, PollResult } from "../../api";
 import type { Attention } from "../../attention";
 import type { Fleet } from "../../fleet";
 import { relativeTime } from "../../format";
+import type { NeedItem } from "../../home";
+import { agentsNow, digestToday, latestNotes, missionsToday, needsSummary } from "../../home";
+import type { Missions } from "../../missions";
 import type { FleetContext } from "../../ordering";
 import { groupAgents, missingAlwaysOn, residentName, usualEngine } from "../../ordering";
 import { useNow } from "../rsi/Phase";
-import { LiveStatus, PageHeader } from "../ui";
+import { FOCUS_RING_INSET, LiveStatus, PageHeader, cx } from "../ui";
+import { AgentsNowCard, DigestCard, MissionsTodayCard, NeedsYou, SupervisorNotes } from "../home/Home";
 import { AgentDetail } from "./AgentDetail";
 import { AlwaysOnAgents, uptimeMs } from "./AlwaysOnAgents";
-import { AttentionQueue } from "./AttentionQueue";
 import { FleetBoard } from "./FleetBoard";
 import { InputBox } from "./InputBox";
 import { HealthStrip } from "./HealthStrip";
@@ -23,26 +27,40 @@ interface FleetViewProps {
   attention: PollResult<Attention>;
   /** Residents and held tasks, from /api/missions (App polls it). */
   context: FleetContext;
+  /** The missions themselves, for the home page's mission rows. */
+  missions: Missions | null;
+  /** The alert window (App polls it for the band). */
+  alerts: Alert[] | null;
+  /** "Needs you", computed once in App (its badge counts the same). */
+  needs: NeedItem[];
+  onShowMissions: () => void;
   selectedId: string | null;
   onSelect: (sessionId: string | null) => void;
   onOpenTimeline: (sessionId: string) => void;
 }
 
 /**
- * The landing page, in the order an observer asks: what is escalated (and,
- * always at the top, a box to type to the supervisor), are the always-on
- * agents alive and moving, are resources fine, then how the rest of the
- * fleet works (on a task, idle, ended). The fleet and attention polls live
- * in App so the sidebar can show the escalations' count from any view.
+ * The home page, in the order the owner asks (design-ui-information.md §3,
+ * layout A): does anything need me, is work moving (each mission today),
+ * who is working now and on what, what the supervisor said lately (with
+ * the box to type to it), and today as a digest. The always-on cards, the
+ * health tiles and the whole fleet board are folded under "Every agent and
+ * the host" at the bottom. The polls live in App, so the sidebar shows the
+ * same counts from any view.
  */
 export function FleetView({
   fleet,
   attention,
   context,
+  missions,
+  alerts,
+  needs,
   selectedId,
   onSelect,
   onOpenTimeline,
+  onShowMissions,
 }: FleetViewProps) {
+  const [detailsOpen, setDetailsOpen] = useState(false);
   // Relative times ("12s ago", "waiting 4m") tick between polls.
   useNow(1_000);
   const data = fleet.data;
@@ -74,15 +92,20 @@ export function FleetView({
     }, null),
   };
 
+  const now = Date.now();
+
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-page-canvas">
       <PageHeader
         title={
           <h1 className="truncate text-body font-semibold text-foreground">
-            Fleet
+            Home
           </h1>
         }
       >
+        <span className="tnum hidden text-caption text-muted-foreground sm:inline">
+          {needsSummary(needs)}
+        </span>
         <LiveStatus
           error={fleet.error}
           label={
@@ -105,11 +128,13 @@ export function FleetView({
         </div>
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto">
-          <div className="mx-auto flex max-w-[1600px] flex-col gap-3 p-3 sm:p-4">
-            <AttentionQueue
-              view={attention}
-              agents={data.agents}
-              onSelect={onSelect}
+          <div className="mx-auto flex max-w-[1200px] flex-col gap-3 p-3 sm:p-4">
+            <NeedsYou items={needs} onOpenAgent={(session) => onSelect(session)} />
+            <MissionsTodayCard model={missionsToday(missions, now)} onOpen={onShowMissions} />
+            <AgentsNowCard model={agentsNow(agents ?? null, context)} onOpenAgent={(session) => onSelect(session)} />
+            <SupervisorNotes
+              model={latestNotes(attention.data, now)}
+              all={[...(attention.data?.supervisor?.for_owner ?? [])].sort((left, right) => (right.at_ms ?? 0) - (left.at_ms ?? 0))}
               talk={
                 <InputBox
                   key={supervisor.session}
@@ -119,6 +144,28 @@ export function FleetView({
                 />
               }
             />
+            <DigestCard digest={digestToday(missions, alerts, now, agents ?? null)} />
+            <button
+              type="button"
+              onClick={() => setDetailsOpen((value) => !value)}
+              aria-expanded={detailsOpen}
+              className={cx(
+                "mt-2 flex items-center gap-1.5 self-start rounded-control px-2 py-1 text-caption font-medium text-muted-foreground hover:bg-surface-hover hover:text-foreground",
+                FOCUS_RING_INSET,
+              )}
+            >
+              <ChevronRight
+                size={12}
+                aria-hidden="true"
+                className={cx("transition-transform motion-reduce:transition-none", detailsOpen && "rotate-90")}
+              />
+              Every agent and the host
+              <span className="tnum font-normal text-faint-foreground">
+                {data.agents.length} agents · health · resources
+              </span>
+            </button>
+            {detailsOpen && (
+              <>
             <AlwaysOnAgents
               agents={alwaysOn}
               missing={missing}
@@ -136,6 +183,8 @@ export function FleetView({
               selectedId={selectedId}
               onSelect={onSelect}
             />
+              </>
+            )}
           </div>
         </div>
       )}
