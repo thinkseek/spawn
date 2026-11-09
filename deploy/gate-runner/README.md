@@ -131,8 +131,9 @@ are shipped with it); `<out>` receives `<out>/<job>/`:
 - `verdict.json` — the gate's own one-line verdict, when it wrote one (a
   no-room, an abort or a setup failure leaves none);
 - `gate.log` — the whole gate output, stdout and stderr;
-- `record.json` — the job, the resolved commits, and every attempt with its
-  id, its stages, its gate exit and its result.
+- `record.json` — the job, the machine that judged (`host`, the runner's own
+  `uname -n`; `runner` is only the name dialled), the resolved commits, and
+  every attempt with its id, its stages, its gate exit and its result.
 
 The job id is the candidate's first 12 characters and a nonce; every
 transport retry is a new attempt (`<job>.a1`, `.a2`, …) with its own runner
