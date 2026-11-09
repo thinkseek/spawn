@@ -1437,6 +1437,19 @@ create table if not exists spawn_alerts (
 
 create index if not exists spawn_alerts_time on spawn_alerts (fired_at_ms);
 
+-- When each open agent_stuck alert's session was last scored (its latest
+-- judgement carrying `stuck`): the alerts window's `scored_at_ms`, so a
+-- score that stands while the judge is down shows its age. A view, read
+-- with its owner's rights: a login that may read the alerts (the
+-- supervisor's `spawn alerts`) reads it without any grant on spawn_events.
+create or replace view spawn_alert_scores as
+select a.key,
+       (select max(e.recorded_at_ms) from spawn_events e
+         where e.session_id = a.subject and e.event_name = 'observation.recorded'
+           and e.kind -> 'detail' -> 'observation' ? 'stuck') as scored_at_ms
+from spawn_alerts a
+where a.kind = 'agent_stuck' and a.state = 'open';
+
 
 -- Who may call the mission functions: the owner (humans' CLI, the
 -- controller) and the supervisor's login; not the reader's, and not the web
@@ -3852,7 +3865,8 @@ begin
                        spawn_login_role('spawn_supervisor'));
     end loop;
     execute format('grant select on mission_missions, mission_residents, mission_tasks, '
-                   'mission_source_holds, mission_source_reds, spawn_alerts to %I',
+                   'mission_source_holds, mission_source_reds, spawn_alerts, '
+                   'spawn_alert_scores to %I',
                    spawn_login_role('spawn_supervisor'));
 end
 $$;
