@@ -341,7 +341,12 @@ gate_started=$(stage_now)
 # Where the time goes, said once at the end (`gate_times`): the base's
 # stages (its build and scenario runs, all skipped on a cache hit), the
 # candidate's (its build, the test listing of both trees, its scenarios),
-# and the rest, the setup (exports, the socket scan, the static checks).
+# and the setup: the time before the first stage or phase (exports, the
+# socket scan, and the static checks, which all come before it: the
+# build-time code check, lint_config, crate-level lints). Each is its own
+# measure, so the three need not add up to the total. Time between stages
+# that belongs to neither phase (the base results read from the cache,
+# for one) is in the total only.
 # stage_emit is stage.sh's, with the sum kept.
 base_ms=0
 candidate_ms=0
@@ -363,10 +368,18 @@ times_said=""
 gate_times() {
     [ -z "$times_said" ] || return 0
     times_said=1
+    # A phase still running (the gate ends inside it: a kill, an exit from
+    # a job's printer) is its wall clock so far, never the sum of its
+    # overlapping runs' own times.
+    if [ "${phase_started:-0}" -gt 0 ]; then phase_time "$phase_open"; fi
     total_ms=$(($(stage_now) - gate_started))
+    # Setup is its own measure: the time before the gate's first stage, never
+    # what is left of the total once the phases are taken off (they overlap
+    # it and each other, which made it negative: "setup -416 s").
+    [ -n "${setup_ms-}" ] || setup_ms=$total_ms
     echo "| gate time: base $((base_ms / 1000)) s ($base_runs scenario runs," \
         "$(printf '%s' "${from_cache-}" | wc -w | tr -d ' ') results from the cache)," \
-        "candidate $((candidate_ms / 1000)) s, setup $(((total_ms - base_ms - candidate_ms) / 1000)) s" \
+        "candidate $((candidate_ms / 1000)) s, setup $((setup_ms / 1000)) s" \
         "(exports, socket scan, static checks), total $((total_ms / 1000)) s"
     # A sandbox started again after a masked path went away (`sandbox`):
     # said in the gate's own output whatever the command's log shows.
@@ -376,6 +389,8 @@ gate_times() {
 }
 # section <name>: a gate stage starts (and the one before it ends as ok).
 section() {
+    # The first stage ends the setup (exports, socket scan, static checks).
+    [ -n "${setup_ms-}" ] || setup_ms=$(($(stage_now) - gate_started))
     stage_open gate "$1"
     echo "| == $1"
 }
@@ -1898,7 +1913,11 @@ run_jobs() {
 }
 
 # phase_start: the clock of a phase's runs starts.
-phase_start() {
+phase_start() { # <base|candidate>
+    # A phase that starts before any stage (a base read whole from the
+    # cache) ends the setup too.
+    [ -n "${setup_ms-}" ] || setup_ms=$(($(stage_now) - gate_started))
+    phase_open=$1
     phase_at=$(stage_now)
     phase_base_ms=$base_ms
     phase_candidate_ms=$candidate_ms
@@ -2677,7 +2696,7 @@ if [ "$base_misses" -gt 0 ]; then
     : >"$work/base-built"
     stage_close ok
 fi
-phase_start
+phase_start base
 run_jobs base "$base_count" base_job base_finished base_printed
 phase_time base
 if [ -n "$from_cache$run_on_base" ]; then
@@ -3098,7 +3117,7 @@ if [ "$candidate_count" -gt 0 ] && ! snapshot_bin "$work/candidate"; then
     echo "gate: cannot copy the candidate's spawn for its scenarios" >&2
     exit 3
 fi
-phase_start
+phase_start candidate
 run_jobs candidate "$candidate_count" candidate_job candidate_finished candidate_printed
 phase_time candidate
 verdict accepted
