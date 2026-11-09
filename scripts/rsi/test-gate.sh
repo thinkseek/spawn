@@ -2292,6 +2292,28 @@ EOF
     refuse "$kind: was remade with a new password" "$(cat "$templates"/*/password)" "$first_password"
     expect "$kind: and the candidate's server took the sandbox's" "$(cat "$work/gate.out")" \
         '| 103.sh: solved on the candidate'
+    # A server that does not start is the host's, not a verdict on the
+    # candidate: exit 6, `test server`, with its evidence and which start,
+    # quoting the server's FATAL line; either start (SPAWN_GATE_TEST_PG_FAIL
+    # gives that start a setting no server knows).
+    for start in gate candidate; do
+        expect "$kind: a test server that does not start ($start) is a host fault, not a verdict" \
+            "$(export SPAWN_GATE_TEST_PG_FAIL=$start; with_pg "$fresh")" \
+            'exit=6 {"host_fault":true,"scenario":"test server","on":"test server","runs":"never started"'
+        expect "$kind: with its evidence and its start ($start)" "$(cat "$integrator/verdict")" \
+            "\"evidence\":\"test_server_never_started\",\"tree\":\"$start\""
+        expect "$kind: quoting the server ($start)" "$(cat "$integrator/verdict")" \
+            'did not start: FATAL:  unrecognized configuration parameter'
+        refuse "$kind: and no server is left ($start)" "$(left)" 'bwrap'
+    done
+    # The gate's own copy of the template that cannot be taken (the shared
+    # one remade under every copy; SPAWN_GATE_TEST_PG_KEEP_FAIL) is the
+    # host's too, not an abort.
+    expect "$kind: a template that cannot be copied is a host fault, not an abort" \
+        "$(export SPAWN_GATE_TEST_PG_KEEP_FAIL=1; with_pg "$fresh")" \
+        'exit=6 {"host_fault":true,"scenario":"test server","on":"test server","runs":"never started"'
+    expect "$kind: saying why" "$(cat "$integrator/verdict")" \
+        'did not start: its template in '
     # A gate ended by a signal takes its server and its runs with it.
     printf '#!/bin/sh\n[ "$(cat value)" = one ] || sleep 29.75\n' >"$own/check-long.sh"
     rm -rf "$integrator"

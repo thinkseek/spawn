@@ -641,7 +641,9 @@ select coalesce(jsonb_agg(jsonb_build_object(
 /// `base` (a scenario's harness error before any candidate code ran),
 /// objective 033's `base_disagrees`, or the `cannot_judge` a scenario says
 /// of a host that cannot judge it at all (029). Those count toward no halt,
-/// so they never count toward the cap either.
+/// so they never count toward the cap either. Nor does the gate's own test
+/// server that did not start (`on` `test server`), whichever start it was:
+/// no candidate code makes a server start.
 pub(crate) const TASK_HOST_FAULTS: &str = r"
 select count(*)
   from spawn_events e
@@ -651,7 +653,7 @@ select count(*)
    and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
    and e.kind -> 'detail' -> 'record' ->> 'revision' = $2
    and e.kind -> 'detail' -> 'record' ->> 'base' = $3
-   and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') not in ('base', 'candidate and base', 'main')
+   and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') not in ('base', 'candidate and base', 'main', 'test server')
    and not (coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') = 'sandbox'
             and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'tree', '') <> 'candidate')
    and coalesce(e.kind -> 'detail' -> 'record' ->> 'evidence', '') not in
