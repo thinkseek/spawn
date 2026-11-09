@@ -341,7 +341,12 @@ gate_started=$(stage_now)
 # Where the time goes, said once at the end (`gate_times`): the base's
 # stages (its build and scenario runs, all skipped on a cache hit), the
 # candidate's (its build, the test listing of both trees, its scenarios),
-# and the rest, the setup (exports, the socket scan, the static checks).
+# and the setup: the time before the first stage or phase (exports, the
+# socket scan, and the static checks, which all come before it: the
+# build-time code check, lint_config, crate-level lints). Each is its own
+# measure, so the three need not add up to the total. Time between stages
+# that belongs to neither phase (the base results read from the cache,
+# for one) is in the total only.
 # stage_emit is stage.sh's, with the sum kept.
 base_ms=0
 candidate_ms=0
