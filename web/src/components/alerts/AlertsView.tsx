@@ -54,6 +54,11 @@ function AlertRow({ alert }: { alert: Alert }) {
         </span>
       </div>
       <p className="mt-1 text-caption text-foreground">{alert.text}</p>
+      {alert.scored_at_ms != null && (
+        <p className="tnum mt-0.5 text-micro text-muted-foreground" title={absoluteTitle(alert.scored_at_ms)}>
+          last scored {relativeTime(alert.scored_at_ms)}
+        </p>
+      )}
       <Evidence label="evidence" value={alert.evidence} />
       {alert.state === "cleared" && <Evidence label="cleared by" value={alert.cleared_evidence} />}
     </li>

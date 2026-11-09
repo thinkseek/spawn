@@ -1864,6 +1864,11 @@ begin
         -- A fact about this host's free disk (spawn loop, crate disk.rs):
         -- read from the log, folded into no table.
         null;
+    when 'host.judge' then
+        -- The model judge's calls began failing (`down`) or answered again
+        -- (`up`): one record per crossing (spawn loop, crate judge_watch.rs),
+        -- read from the log by the alert step, folded into no table.
+        null;
     when 'alert.fired' then
         -- An alert's one occurrence (spawn loop, crate alerts.rs): one row
         -- per key, and a second `fired` for it is refused (also by
@@ -3450,6 +3455,12 @@ create index if not exists spawn_events_objective_solved
 --   warning threshold (`low`) or came back (`recovered`). One record per
 --   crossing; the loop reads the latest per path back from the log after a
 --   restart.
+-- - `host.judge`: the model judge (`judge`, its name) failed a call after
+--   its last answer (`down`, with the call's `error`) or answered after
+--   failing (`up`, with `failed_calls` since the `down`). One record per
+--   crossing; the judge's watcher reads the latest per judge back after a
+--   restart, and the alert step fires `judge_down` on a `down` with no `up`
+--   after it for SPAWN_ALERT_JUDGE_DOWN_SECS.
 -- - `host.loop_started`: one `spawn loop` started, with its `boot_id` and
 --   `started_at_ms`. A restarted loop tells an execution whose end it found
 --   from one it watched fail by the records of the loops before it.
@@ -3482,6 +3493,19 @@ begin
         if p_record ->> 'state' not in ('low', 'recovered') or p_record ->> 'path' is null
            or jsonb_typeof(p_record -> 'free_bytes') is distinct from 'number' then
             raise exception 'a host.disk record has a path, free_bytes and state low or recovered: %', p_record;
+        end if;
+    elsif v_type = 'host.judge' then
+        if p_record ->> 'judge' is null or p_record ->> 'state' is null
+           or p_record ->> 'state' not in ('down', 'up') then
+            raise exception 'a host.judge record names its judge and a state down or up: %', p_record;
+        end if;
+        if p_record ->> 'state' = 'down'
+           and jsonb_typeof(p_record -> 'error') is distinct from 'string' then
+            raise exception 'a host.judge down record says the call''s error: %', p_record;
+        end if;
+        if p_record ->> 'state' = 'up'
+           and jsonb_typeof(p_record -> 'failed_calls') is distinct from 'number' then
+            raise exception 'a host.judge up record counts failed_calls: %', p_record;
         end if;
     elsif v_type = 'host.loop_started' then
         if p_record ->> 'boot_id' is null

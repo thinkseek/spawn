@@ -73,6 +73,14 @@
 //!   current execution has ended fires nothing; clears when the latest
 //!   one is under 0.5, or when the session's current execution has ended,
 //!   whatever the cause (stopped, exited, lost), with that end as evidence.
+//! - `judge_down`, the judge's name (`jev`), key `judge_down:<its
+//!   host.judge down event>`: the model judge's watcher recorded `down` (a
+//!   call failed after its last answer, crate judge_watch.rs) and no `up`
+//!   after it for `SPAWN_ALERT_JUDGE_DOWN_SECS` (default 900): no call
+//!   answered for that long. It rests on that record, not on the absence
+//!   of judgements (a judge that is down writes few: the Observer records a
+//!   failure once, not each retry). Clears at the `up` record, the first
+//!   call answered, with its `failed_calls`.
 //! - `admission_wait`, an execution's `agent_id` or a gate's `task #<id>`,
 //!   key `admission_wait:<its admission.waiting event>`: an
 //!   `admission.waiting` (029) older than `SPAWN_ALERT_ADMISSION_SECS`
@@ -171,6 +179,8 @@ pub(crate) struct Settings {
     pub(crate) undelivered_ms: i64,
     /// How long an admission may wait.
     pub(crate) admission_ms: i64,
+    /// How long the model judge may answer no call.
+    pub(crate) judge_down_ms: i64,
     /// The dump's and the bundle's schedules, with room for one late run.
     pub(crate) dump_max_age_ms: i64,
     pub(crate) bundle_max_age_ms: i64,
@@ -223,6 +233,7 @@ impl Settings {
             check_ms: secs("SPAWN_ALERT_CHECK_SECS", 30, &mut warnings).max(1),
             undelivered_ms: secs("SPAWN_ALERT_UNDELIVERED_SECS", 300, &mut warnings),
             admission_ms: secs("SPAWN_ALERT_ADMISSION_SECS", 600, &mut warnings),
+            judge_down_ms: secs("SPAWN_ALERT_JUDGE_DOWN_SECS", 900, &mut warnings),
             dump_max_age_ms: secs("SPAWN_ALERT_BACKUP_DUMP_MAX_AGE_SECS", 7200, &mut warnings),
             bundle_max_age_ms: secs(
                 "SPAWN_ALERT_BACKUP_BUNDLE_MAX_AGE_SECS",
@@ -375,6 +386,8 @@ pub(crate) struct Monitor {
     missions: HashMap<i64, Mission>,
     /// The pending admission waits, by kind and agent or task.
     admitted: HashMap<String, Pending>,
+    /// The model judge's `down` records with no `up` after them, by judge.
+    judge_down: HashMap<String, Pending>,
     /// An open (or pending) model-login alert key, by execution id.
     auth: HashMap<String, String>,
     /// The newest dump and bundle records.
@@ -408,6 +421,7 @@ impl Monitor {
             tasks: HashMap::new(),
             missions: HashMap::new(),
             admitted: HashMap::new(),
+            judge_down: HashMap::new(),
             auth: HashMap::new(),
             backups: BTreeMap::new(),
             commands_after: 0,
@@ -588,6 +602,7 @@ impl Monitor {
             "execution.interrupted" | "execution.cleared" => {
                 self.auth_record(event_id, record, out);
             }
+            "host.judge" => self.judge_record(event_id, at_ms, record, out),
             _ => {}
         }
     }
@@ -840,6 +855,37 @@ times in a row)",
         }
     }
 
+    /// The model judge's crossing: a `down` waits for its bound, an `up`
+    /// clears it (or forgets the `down` before it fired).
+    fn judge_record(&mut self, event_id: i64, at_ms: i64, record: &Value, out: &mut Vec<Event>) {
+        let judge = record["judge"].as_str().unwrap_or("judge").to_string();
+        match record["state"].as_str() {
+            Some("down") => {
+                // A second `down` with no `up` between keeps the first: the
+                // judge has answered nothing since it.
+                self.judge_down.entry(judge.clone()).or_insert(Pending {
+                    event_id,
+                    at_ms,
+                    subject: judge,
+                    evidence: json!({"error": scrub(record["error"].as_str().unwrap_or_default())}),
+                });
+            }
+            Some("up") => {
+                if let Some(pending) = self.judge_down.remove(&judge) {
+                    out.push(Event::Clear {
+                        key: format!("judge_down:{}", pending.event_id),
+                        evidence: json!({
+                            "event_id": event_id,
+                            "failed_calls": record["failed_calls"],
+                            "down_ms": at_ms.saturating_sub(pending.at_ms),
+                        }),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// A backup record: the stale one it clears, and 031's over-alert budget.
     fn backup_record(&mut self, event_id: i64, at_ms: i64, record: &Value, out: &mut Vec<Event>) {
         let subject = if record["type"] == "backup.dumped" {
@@ -1048,8 +1094,38 @@ times in a row)",
         }
     }
 
+    /// The model judge's `down` records that reached their bound
+    /// (`judge_down`), once each.
+    fn judge_bounds(&self, now: i64, out: &mut Vec<Event>) {
+        for pending in self.judge_down.values() {
+            let due = pending.at_ms.saturating_add(self.settings.judge_down_ms);
+            let key = format!("judge_down:{}", pending.event_id);
+            if now < due || self.known.contains_key(&key) {
+                continue;
+            }
+            let error = pending.evidence["error"].as_str().unwrap_or_default();
+            out.push(Event::Fire {
+                key,
+                kind: "judge_down",
+                subject: pending.subject.clone(),
+                evidence: json!({
+                    "judge": pending.subject, "error": error,
+                    "down_ms": now.saturating_sub(pending.at_ms),
+                    "threshold_ms": self.settings.judge_down_ms,
+                    "event_id": pending.event_id,
+                }),
+                text: format!(
+                    "the model judge {} has answered no call for {} s: {error}",
+                    pending.subject,
+                    now.saturating_sub(pending.at_ms) / 1000
+                ),
+                notice: false,
+            });
+        }
+    }
+
     /// The bounds that fall due: an undelivered task, an admission's wait, a
-    /// backup's age, a crash line gone quiet.
+    /// judge that answers nothing, a backup's age, a crash line gone quiet.
     fn bounds(&mut self, now: i64, out: &mut Vec<Event>) {
         for (id, task) in &self.tasks {
             let Some(assigned) = task.assigned_event else {
@@ -1114,6 +1190,7 @@ times in a row)",
                 notice: false,
             });
         }
+        self.judge_bounds(now, out);
         for (subject, max_age) in [
             ("dump", self.settings.dump_max_age_ms),
             ("bundle", self.settings.bundle_max_age_ms),
@@ -1564,6 +1641,14 @@ times in a row)",
                 .contains_key(&format!("admission_wait:{}", pending.event_id))
             {
                 next = next.min(pending.at_ms.saturating_add(self.settings.admission_ms));
+            }
+        }
+        for pending in self.judge_down.values() {
+            if !self
+                .known
+                .contains_key(&format!("judge_down:{}", pending.event_id))
+            {
+                next = next.min(pending.at_ms.saturating_add(self.settings.judge_down_ms));
             }
         }
         for (subject, max_age) in [
@@ -2071,7 +2156,7 @@ pub(crate) fn time_text(ms: i64) -> String {
 
 /// A password in a URL is a secret: evidence never holds one. `scheme://
 /// user:password@host` becomes `scheme://user:***@host`.
-fn scrub(text: &str) -> String {
+pub(crate) fn scrub(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(index) = rest.find("://") {
@@ -2213,7 +2298,9 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
 }
 
 /// One alert as a line for a person: its state, kind, subject, time and
-/// text.
+/// text; an open `agent_stuck` also says when the session was last scored
+/// (`scored_at_ms`, read with the window): a judge that has been down
+/// since leaves the alert on an old score.
 fn line(alert: &Value) -> String {
     let state = alert["state"].as_str().unwrap_or("open");
     let at = alert
@@ -2221,8 +2308,12 @@ fn line(alert: &Value) -> String {
         .and_then(Value::as_i64)
         .or_else(|| alert["fired_at_ms"].as_i64())
         .unwrap_or_default();
+    let scored = alert["scored_at_ms"]
+        .as_i64()
+        .map(|scored| format!(" (last scored {})", time_text(scored)))
+        .unwrap_or_default();
     format!(
-        "{state} {} {} {} {}",
+        "{state} {} {} {} {}{scored}",
         alert["kind"].as_str().unwrap_or("alert"),
         alert["subject"].as_str().unwrap_or(""),
         time_text(at),
@@ -2281,6 +2372,7 @@ mod tests {
             check_ms: 30_000,
             undelivered_ms: 300_000,
             admission_ms: 600_000,
+            judge_down_ms: 900_000,
             dump_max_age_ms: 7_200_000,
             bundle_max_age_ms: 93_600_000,
             memory_low_mb: 4096,
@@ -3188,6 +3280,108 @@ connections\n";
                 commit(&mut monitor, &fired);
                 session.judged(store, None);
                 assert!(observe(&mut monitor, store).is_empty(), "nothing clears it");
+            });
+        }
+
+        /// The model judge's `down` record (crate judge_watch.rs), read back
+        /// through the store's history as a restarted loop reads it: no
+        /// alert before SPAWN_ALERT_JUDGE_DOWN_SECS, `judge_down` at it, once,
+        /// and its `up` record, read as the next pass reads the control
+        /// stream, clears it with `failed_calls`.
+        #[test]
+        fn a_judge_down_for_its_bound_fires_once_and_its_up_clears_it() {
+            in_schema("judge_down", |store| {
+                let mut monitor = monitor();
+                let down = store
+                    .host_record(&json!({"type": "host.judge", "judge": "jev",
+                                         "state": "down", "error": "judge unavailable: 502"}))
+                    .expect("record down");
+                let history = store.alert_history(0, 100).expect("history");
+                let mut fed = Vec::new();
+                for entry in history.as_array().into_iter().flatten() {
+                    monitor.feed(
+                        entry["event_id"].as_i64().unwrap_or_default(),
+                        entry["at_ms"].as_i64().unwrap_or_default(),
+                        &entry["record"],
+                        &mut fed,
+                    );
+                }
+                assert!(fed.is_empty(), "a down is not yet an alert");
+                let at = history[0]["at_ms"].as_i64().expect("its time");
+                let mut early = Vec::new();
+                monitor.bounds(at + 899_999, &mut early);
+                assert!(early.is_empty(), "never before its bound");
+                let mut due = Vec::new();
+                monitor.bounds(at + 900_000, &mut due);
+                let key = format!("judge_down:{down}");
+                assert_eq!(fires(&due), [key.as_str()]);
+                let Event::Fire {
+                    subject,
+                    evidence,
+                    text,
+                    ..
+                } = &due[0]
+                else {
+                    panic!("a fire");
+                };
+                assert_eq!(subject, "jev");
+                assert_eq!(evidence["down_ms"], 900_000);
+                assert_eq!(evidence["error"], "judge unavailable: 502");
+                assert!(text.contains("answered no call for 900 s"), "{text}");
+                let recorded = decided(&monitor, due);
+                commit(&mut monitor, &recorded);
+                let mut again = Vec::new();
+                monitor.bounds(at + 1_800_000, &mut again);
+                assert!(decided(&monitor, again).is_empty(), "once per occurrence");
+
+                let up = store
+                    .host_record(&json!({"type": "host.judge", "judge": "jev",
+                                         "state": "up", "failed_calls": 41}))
+                    .expect("record up");
+                let batch = store.alert_control(down, 100).expect("the control stream");
+                let mut cleared = Vec::new();
+                for entry in batch["records"].as_array().into_iter().flatten() {
+                    monitor.feed(
+                        entry["event_id"].as_i64().unwrap_or_default(),
+                        entry["at_ms"].as_i64().unwrap_or_default(),
+                        &entry["record"],
+                        &mut cleared,
+                    );
+                }
+                let cleared = cleared_by(&decided(&monitor, cleared));
+                assert_eq!(cleared.len(), 1, "{cleared:?}");
+                assert_eq!(cleared[0].0, key);
+                assert_eq!(cleared[0].1["event_id"], up);
+                assert_eq!(cleared[0].1["failed_calls"], 41);
+                assert!(cleared[0].1["down_ms"].as_i64().is_some_and(|ms| ms >= 0));
+            });
+        }
+
+        /// An open agent_stuck says when its session was last scored, read
+        /// with the window: an unscored judgement after it (a judge that is
+        /// down) leaves that time where it was.
+        #[test]
+        fn an_open_stuck_alert_carries_the_time_of_its_sessions_last_score() {
+            in_schema("stuck_scored_at", |store| {
+                let mut session = Session::new("scored");
+                session.started(store);
+                let stuck = session.judged(store, Some(0.7));
+                let scored_at = store.alert_observations().expect("the judgements")[0]["at_ms"]
+                    .as_i64()
+                    .expect("its time");
+                store
+                    .alert_record(&json!({
+                        "type": "alert.fired", "key": format!("agent_stuck:session_scored:{stuck}"),
+                        "kind": "agent_stuck", "subject": "session_scored",
+                        "evidence": {"stuck": 0.7, "event_id": stuck},
+                        "text": "session_scored is stuck (0.70): UNKNOWN", "notice": false,
+                    }))
+                    .expect("fire");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                session.judged(store, None);
+                let window = store.alerts(0).expect("the window");
+                assert_eq!(window[0]["scored_at_ms"], scored_at, "{window}");
+                assert!(super::super::line(&window[0]).contains("(last scored "));
             });
         }
 

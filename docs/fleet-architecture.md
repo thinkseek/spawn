@@ -957,6 +957,12 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   does with it; clears under 0.5, or when the session's current execution
   has ended, whatever the cause, with the Bridge's `execution.ended` as
   evidence; a session whose current execution has ended fires none),
+  `judge_down` (the model judge's watcher recorded `host.judge` `down`, a
+  call failed after its last answer, and no `up` after it for
+  `SPAWN_ALERT_JUDGE_DOWN_SECS`, default 900: no call answered for that
+  long; clears at the `up`, the first answer, with `failed_calls`; it rests
+  on that record, never on how few judgements a judge that is down leaves:
+  an open `agent_stuck` also shows when its session was last scored),
   `admission_wait` (objective 029's record older than
   `SPAWN_ALERT_ADMISSION_SECS`, default 600, with no admission after it),
   `backup_stale` (the newest dump older than
@@ -1200,7 +1206,7 @@ controller. Missions, tasks, residents and landings are events in
   `task.delivered`, `task.report_unfinished`, `task.reported`,
   `task.reviewed`, `task.cancelled`, `task.gated`, `task.held`, `task.landed`,
   `task.aborted`, `task.over_budget`, `resident.proposed`, `resident.approved`,
-  `resident.retired`, `legacy.imported`, `host.disk`,
+  `resident.retired`, `legacy.imported`, `host.disk`, `host.judge`,
   `source.push_requested`, `source.push_refused` (§10.3, "The owner's
   landings"), and the loop's alerts: `alert.fired` and `alert.cleared`
   (§3.4, folded into `spawn_alerts`).
@@ -1227,8 +1233,8 @@ controller. Missions, tasks, residents and landings are events in
   owner's landings: `source.moved` naming a `request`,
   `source.push_refused`), `source.moved` (`spawn mission moved`), the
   owner's `source.push_requested` (`spawn mission push`; folded into no
-  table, nor is `source.push_refused`), the loop's `host.disk` (through
-  `spawn_host_record`; folded into no table,
+  table, nor is `source.push_refused`), the loop's `host.disk` and the
+  judge watcher's `host.judge` (through `spawn_host_record`; folded into no table,
   [storage.md](storage.md#disk-room)) and the loop's `alert.fired` and
   `alert.cleared` (through `spawn_alert_record`, §3.4) need the owner's
   login. The
