@@ -30,7 +30,11 @@
 #   ratchet scenarios (a line `# rsi: ratchet`), which compare against the
 #   base and so fail on any tree that did not improve, and objective
 #   scenarios (`<digits>.sh`) the base fails too: an objective nobody has
-#   solved yet is not a regression, and must not block unrelated work.
+#   solved yet is not a regression, and must not block unrelated work. One
+#   the base fails that was solved, with all else that decides it the same, on an ancestor of
+#   the base is not an objective nobody solved: main is red on it, said
+#   ("main red: <name>") and listed in the verdict (`main_red_scenarios`),
+#   and still no verdict on the candidate ("Main red on a scenario" below).
 #   `check-*` scenarios are invariants and always must pass. A check that
 #   fails on the candidate is run again there; one that fails twice is run
 #   on the base: passing there, it is a regression (rejected); failing there
@@ -451,6 +455,8 @@ verdict() {
     # this base before any candidate code ran: main is green on it again,
     # whatever this gate ends with (gate.rs reads it from any fact).
     [ -n "${base_check_passed-}" ] && json="$json,\"base_check\":\"$base_check_passed\""
+    # The scenarios main is red on ("Main red on a scenario").
+    [ -n "${red_scenarios-}" ] && json="$json,\"main_red_scenarios\":[${red_scenarios#,}]"
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
@@ -491,6 +497,8 @@ host_fault() {
     # this base before any candidate code ran: main is green on it again,
     # whatever this gate ends with (gate.rs reads it from any fact).
     [ -n "${base_check_passed-}" ] && json="$json,\"base_check\":\"$base_check_passed\""
+    # The scenarios main is red on ("Main red on a scenario").
+    [ -n "${red_scenarios-}" ] && json="$json,\"main_red_scenarios\":[${red_scenarios#,}]"
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
@@ -534,6 +542,8 @@ EOF_MAIN_RED
     # this base before any candidate code ran: main is green on it again,
     # whatever this gate ends with (gate.rs reads it from any fact).
     [ -n "${base_check_passed-}" ] && json="$json,\"base_check\":\"$base_check_passed\""
+    # The scenarios main is red on ("Main red on a scenario").
+    [ -n "${red_scenarios-}" ] && json="$json,\"main_red_scenarios\":[${red_scenarios#,}]"
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
@@ -569,6 +579,8 @@ cannot_judge() {
     # this base before any candidate code ran: main is green on it again,
     # whatever this gate ends with (gate.rs reads it from any fact).
     [ -n "${base_check_passed-}" ] && json="$json,\"base_check\":\"$base_check_passed\""
+    # The scenarios main is red on ("Main red on a scenario").
+    [ -n "${red_scenarios-}" ] && json="$json,\"main_red_scenarios\":[${red_scenarios#,}]"
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
@@ -615,6 +627,36 @@ base_cache=${XDG_CACHE_HOME:-$HOME/.cache}/spawn/gate-base
 mkdir -p "$base_cache"
 chmod 700 "$base_cache"
 base_cache=$(cd "$base_cache" && pwd -P)
+# Main red on a scenario (046's lesson: from 62516f9 Supply PA's 046 failed
+# on main, and every gate read it as "unsolved on the base", an objective
+# not yet met, so nothing guarded it). Beside the base cache, the base
+# commits of this repository on which each scenario was solved, with what
+# else decided that result (the scenario's base cache key without the
+# commit: its blob, the gate, the toolchain, the scenarios directory's other
+# files, the binds, the files it names), newest last, at most 50 a
+# scenario: `gate-solved/<root>/<name>`,
+# the repository named by its root commit, so another project's 046.sh is
+# another file. A scenario unsolved on this base that was solved, with the
+# same key, on one of this base's ancestors was broken by something that
+# landed or was pushed since: main is red on it. The gate says so ("main
+# red: <name>") and the verdict lists it (`main_red_scenarios`), where an unsolved
+# objective says neither; the candidate is judged as before (main's failure
+# is not the candidate's). The index is not the base cache: spawn-
+# maintenance's expiry of entries leaves it; it holds at most 50 lines a
+# scenario. The base cache's entries cannot say it: their
+# key holds the base commit, and nothing there says which commits were
+# main.
+solved_root=$(git --git-dir="$repo" rev-list --max-parents=0 "$base_commit" 2>/dev/null | LC_ALL=C sort | head -n 1)
+# Beside the base cache, not in it (its entries are the files directly in
+# it), and hidden from the sandbox the same way (a tmpfs over it, below).
+solved_base=$(dirname "$base_cache")/gate-solved
+solved_dir=""
+if [ -n "$solved_root" ] && mkdir -p "$solved_base/$solved_root" 2>/dev/null; then
+    chmod 700 "$solved_base"
+    solved_base=$(cd "$solved_base" && pwd -P)
+    solved_dir=$solved_base/$solved_root
+fi
+red_scenarios=""
 # The controller's checkout, as the checks locate it (two levels above the
 # scenarios directory).
 controller=$(cd "$scenarios/../.." && pwd)
@@ -1179,6 +1221,7 @@ sandbox_once() {
     *) [ -d "$TMPDIR" ] && set -- "$@" --tmpfs "$TMPDIR" ;;
     esac
     set -- "$@" --tmpfs "$work" --tmpfs "$base_cache"
+    [ ! -d "${solved_base-}" ] || set -- "$@" --tmpfs "$solved_base"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         set -- "$@" --tmpfs "$(dirname "$SPAWN_GATE_VERDICT")"
     fi
@@ -1722,6 +1765,8 @@ slot_no_room() {
     # this base before any candidate code ran: main is green on it again,
     # whatever this gate ends with (gate.rs reads it from any fact).
     [ -n "${base_check_passed-}" ] && json="$json,\"base_check\":\"$base_check_passed\""
+    # The scenarios main is red on ("Main red on a scenario").
+    [ -n "${red_scenarios-}" ] && json="$json,\"main_red_scenarios\":[${red_scenarios#,}]"
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT" 2>/dev/null || :
@@ -2851,6 +2896,51 @@ base_printed() {
         ;;
     esac
     printf '%s|%s\n' "$result" "$(cat "$1/scenario")" >>"$work/base-results"
+    case "$result" in
+    solved) solved_note "$(cat "$1/scenario")" "$(cat "$1/solved-key" 2>/dev/null)" ;;
+    unsolved)
+        red_at=$(main_red_of "$(cat "$1/scenario")" "$(cat "$1/solved-key" 2>/dev/null)")
+        if [ -n "$red_at" ]; then
+            echo "| main red: $printed_name was solved on $(printf '%s' "$red_at" | cut -c1-12)," \
+                "an ancestor of this base, by this very scenario, and is unsolved on the base" \
+                "$(printf '%s' "$base_commit" | cut -c1-12): something that landed or was pushed since broke it"
+            red_scenarios="$red_scenarios,\"$(json_string "$printed_name")\""
+        fi
+        ;;
+    esac
+}
+# solved_note <scenario> <key>: this base solved it, on record for
+# main_red_of ("Main red on a scenario"), with what decided the result but
+# the base (<key>: objective_key without the commit). Nothing without a key
+# (a task scenario outside the scenarios directory). Once per base and key;
+# the oldest lines go past 50. Written whole and renamed, so a reader never
+# sees half a file; two gates writing at once lose a line at worst, never
+# the file.
+solved_note() {
+    [ -n "$solved_dir" ] && [ -n "$2" ] || return 0
+    solved_file=$solved_dir/$(basename "$1")
+    solved_line="$base_commit $2"
+    grep -qxF -- "$solved_line" "$solved_file" 2>/dev/null && return 0
+    if ! { { tail -n 49 "$solved_file" 2>/dev/null || :; printf '%s\n' "$solved_line"; } >"$solved_file.$$" &&
+        mv -f -- "$solved_file.$$" "$solved_file"; } 2>/dev/null; then
+        rm -f -- "$solved_file.$$"
+    fi
+}
+# main_red_of <scenario> <key>: the newest ancestor of this base (not the
+# base itself) on which the scenario was solved with everything else that
+# decides its result the same (<key>: the scenario's blob, the gate, the
+# toolchain, the scenarios directory's other files, the binds, the files it
+# names); nothing when there is none, or without a key.
+main_red_of() {
+    [ -n "$solved_dir" ] && [ -n "$2" ] && [ -f "$solved_dir/$(basename "$1")" ] || return 0
+    red_key=$2
+    tac -- "$solved_dir/$(basename "$1")" | while read -r red_commit red_was; do
+        [ "$red_was" = "$red_key" ] && [ "$red_commit" != "$base_commit" ] || continue
+        if git --git-dir="$repo" merge-base --is-ancestor "$red_commit" "$base_commit" 2>/dev/null; then
+            printf '%s\n' "$red_commit"
+            break
+        fi
+    done
 }
 
 # objective_key <commit> <toolchain key> <objective>: the key of the
@@ -2890,6 +2980,13 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
     mkdir "$job"
     printf '%s\n' "$objective" >"$job/scenario"
     printf '%s\n' "$entry" >"$job/entry"
+    # What decides the result but the base ("Main red on a scenario"): the
+    # same key with no commit in it. Only the scenarios directory's own:
+    # a task scenario kept elsewhere is judged by its own task's gates only,
+    # so no other gate could ever see it green again.
+    if [ "$(dirname "$objective")" = "$scenarios" ]; then
+        objective_key - "$toolchain_key" "$objective" >"$job/solved-key"
+    fi
     if runs_alone "$objective"; then : >"$job/alone"; fi
     result=$(entry_result "$entry")
     if [ -z "$result" ] && { [ -e "$entry" ] || [ -L "$entry" ]; }; then
@@ -3310,7 +3407,11 @@ candidate_printed() {
         # An objective scenario is a regression only if the base solved it,
         # as judged before any candidate code ran.
         if [ "$(base_result "$printed_scenario")" = unsolved ]; then
-            echo "| $(basename "$printed_scenario") fails on the base too: an unsolved objective, not a regression"
+            case "$red_scenarios," in
+            *",\"$(json_string "$(basename "$printed_scenario")")\","*)
+                echo "| $(basename "$printed_scenario") fails on the base too: main is red on it (above), not a verdict on the candidate" ;;
+            *) echo "| $(basename "$printed_scenario") fails on the base too: an unsolved objective, not a regression" ;;
+            esac
             run_stage "unsolved|$printed_name" "$printed_ms"
             return 0
         fi

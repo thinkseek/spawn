@@ -3203,4 +3203,113 @@ else
     echo "note: no PostgreSQL programs in $schema_pg: the schema upgrade case is not run"
 fi
 
+# 24. Main red on a scenario (046's lesson: Supply PA's 046 failed on main
+# from 62516f9, and every gate read it as an objective not yet met). 071
+# passes while `marker` says ok. Judged as a base on A (it passes), then on
+# B, a descendant of A where it fails: main is red on 071, said and in the
+# verdict, and the candidate's failure of it is not a verdict on the
+# candidate. Not red: on a branch that never had A, and when the scenario
+# itself changed since A (another blob: a stricter scenario, not a broken
+# main).
+red=$work/main-red
+mkdir -p "$red"
+cp "$scenarios/build" "$scenarios/protected" "$red/"
+printf '#!/bin/sh\n[ "$(cat marker 2>/dev/null)" = ok ]\n' >"$red/071.sh"
+git -C "$seed" checkout -q -B red-a "$base"
+printf 'ok\n' >"$seed/marker"
+red_a=$(commit red-a)
+printf 'broken\n' >"$seed/marker"
+red_b=$(commit red-b)
+printf 'more\n' >"$seed/unrelated"
+red_c=$(commit red-c)
+git -C "$seed" checkout -q -B red-side "$base"
+printf 'broken\n' >"$seed/marker"
+red_side=$(commit red-side)
+printf 'more\n' >"$seed/unrelated"
+red_side_c=$(commit red-side-c)
+red_cache=$work/caches/main-red
+expect "071 is solved on A (base only)" \
+    "$(export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$red_cache"; base=$red_a; base_only "$red"; cat "$work/gate.out")" \
+    '| == base: 071.sh: solved'
+red_out=$(export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$red_cache"; base=$red_b; judge "$red_c" "" "$red")
+expect "solved on an ancestor, unsolved on the base: main red, in the verdict" "$red_out" \
+    '"main_red_scenarios":["071.sh"]'
+expect "and said, naming where it was solved" "$(cat "$work/gate.out")" \
+    "| main red: 071.sh was solved on $(printf '%s' "$red_a" | cut -c1-12), an ancestor of this base"
+expect "the candidate's failure of it is main's" "$(cat "$work/gate.out")" \
+    '| 071.sh fails on the base too: main is red on it (above), not a verdict on the candidate'
+refuse "never called an unsolved objective" "$(cat "$work/gate.out")" 'an unsolved objective, not a regression'
+expect "and the candidate is judged as before: accepted" "$red_out" 'exit=0 {"verdict":"accepted"'
+red_out=$(export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$red_cache"; base=$red_side; judge "$red_side_c" "" "$red")
+refuse "a branch that never had A: not red" "$red_out" 'main_red_scenarios'
+expect "an unsolved objective there" "$(cat "$work/gate.out")" \
+    '| 071.sh fails on the base too: an unsolved objective, not a regression'
+printf '# stricter since A\n' >>"$red/071.sh"
+red_out=$(export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$red_cache"; base=$red_b; judge "$red_c" "" "$red")
+refuse "the scenario changed since A (another blob): not red" "$red_out" 'main_red_scenarios'
+refuse "nor said" "$(cat "$work/gate.out")" '| main red:'
+# Not red when anything else that decides the result changed since A (rev-f
+# F1 on 517965e3): 074 compares marker with a data file beside it, solved on
+# A; only that file changes, and B fails it: the scenarios changed, not
+# main.
+red4=$work/main-red-data
+mkdir -p "$red4"
+cp "$scenarios/build" "$scenarios/protected" "$red4/"
+printf '#!/bin/sh\n[ "$(cat marker 2>/dev/null)" = "$(cat "$(dirname "$0")/074.want")" ]\n' >"$red4/074.sh"
+printf 'ok\n' >"$red4/074.want"
+expect "074 is solved on A" \
+    "$(export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$red_cache"; base=$red_a; base_only "$red4"; cat "$work/gate.out")" \
+    '| == base: 074.sh: solved'
+printf 'nope\n' >"$red4/074.want"
+red_out=$(export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$red_cache"; base=$red_b; judge "$red_c" "" "$red4")
+refuse "a data file beside it changed since A (the same blob): not red" "$red_out" 'main_red_scenarios'
+expect "an unsolved objective" "$(cat "$work/gate.out")" '| 074.sh fails on the base too: an unsolved objective, not a regression'
+# Not red for a task scenario kept outside the scenarios directory (rev-f
+# F2): no other task's gate runs it, so none could see it green again.
+red5=$work/main-red-task
+mkdir -p "$red5" "$work/elsewhere"
+cp "$scenarios/build" "$scenarios/protected" "$red5/"
+printf '#!/bin/sh\n[ "$(cat marker 2>/dev/null)" != broken ]\n' >"$work/elsewhere/075.sh"
+expect "the task scenario passes on A" \
+    "$(export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$red_cache"; base=$red_a; judge "$red_c" "$work/elsewhere/075.sh" "$red5")" \
+    '"reason":"scenario already passes on the base"'
+red_out=$(export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$red_cache"; base=$red_b; judge "$red_c" "$work/elsewhere/075.sh" "$red5")
+refuse "and fails on B: no main red for it" "$red_out" 'main_red_scenarios'
+refuse "nor said" "$(cat "$work/gate.out")" '| main red:'
+# The same commit solved and then not (a helper beside the scenario changed:
+# another base cache key, the same blob): a flake or the host, never main
+# red, which needs an ancestor.
+red2=$work/main-red-same
+mkdir -p "$red2"
+cp "$scenarios/build" "$scenarios/protected" "$red2/"
+printf '#!/bin/sh\n[ "$(cat "$(dirname "$0")/072.want")" = "$(cat marker 2>/dev/null)" ]\n' >"$red2/072.sh"
+printf 'ok\n' >"$red2/072.want"
+expect "072 is solved on A" \
+    "$(export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$red_cache"; base=$red_a; base_only "$red2"; cat "$work/gate.out")" \
+    '| == base: 072.sh: solved'
+printf 'other\n' >"$red2/072.want"
+refuse "unsolved on that very commit: not main red" \
+    "$(export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$red_cache"; base=$red_a; base_only "$red2"; cat "$work/gate.out")" \
+    '| main red:'
+expect "it was judged again there" "$(cat "$work/gate.out")" '| == base: 072.sh: unsolved'
+# The index is hidden from the sandbox like the base cache (a tmpfs over it;
+# this test's caches lie under a TMPDIR the sandbox does not empty): a
+# scenario that looks into it sees nothing, so candidate code can neither
+# read nor forge what main solved.
+red3=$work/main-red-forge
+mkdir -p "$red3"
+cp "$scenarios/build" "$scenarios/protected" "$red3/"
+printf '#!/bin/sh
+echo "index holds: $(ls -A %s 2>/dev/null | tr "\\n" " ")."
+' \
+    "$red_cache/spawn/gate-solved/$(git -C "$seed" rev-list --max-parents=0 "$red_a" | LC_ALL=C sort | head -n 1)" >"$red3/073.sh"
+expect "the index holds 071 and 072 on the host" \
+    "$(ls -A "$red_cache/spawn/gate-solved/$(git -C "$seed" rev-list --max-parents=0 "$red_a" | LC_ALL=C sort | head -n 1)" | tr '\n' ' ')" '071.sh'
+expect "a scenario that looks into the index: accepted" \
+    "$(export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$red_cache"; base=$red_b; judge "$red_c" "" "$red3")" \
+    'exit=0 {"verdict":"accepted"'
+expect "and sees it empty" "$(cat "$work/gate.out")" '| index holds: .'
+refuse "never what main solved" "$(cat "$work/gate.out")" 'index holds: 07'
+git -C "$seed" checkout -q main 2>/dev/null || git -C "$seed" checkout -q -B main "$base"
+
 echo "gate: all cases pass"

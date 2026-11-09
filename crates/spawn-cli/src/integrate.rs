@@ -2642,6 +2642,12 @@ impl Judge {
         // (its verdict's `flakes`), carried on whichever record this judging
         // writes: set once the run has a verdict.
         let flakes: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        // The scenarios the gate found main red on (its verdict's
+        // `main_red_scenarios`: solved on an ancestor of this base, unsolved
+        // on it), carried the same way: alerts.rs opens `scenario_red` from
+        // them and clears it when a later gate of the mission no longer
+        // names one.
+        let red_scenarios: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
         // A gate on a main that is red (design-main-red.md) runs only as a
         // probe ([`Integrator::red_holds`]): its record says so.
         let probe = mission.red.as_ref().is_some_and(|red| red.main == main);
@@ -2713,6 +2719,9 @@ impl Judge {
             }
             if !flakes.borrow().is_empty() {
                 record_value["flakes"] = json!(*flakes.borrow());
+            }
+            if !red_scenarios.borrow().is_empty() {
+                record_value["main_red_scenarios"] = json!(*red_scenarios.borrow());
             }
             if probe {
                 record_value["probe"] = json!(true);
@@ -2878,6 +2887,7 @@ impl Judge {
         let ended = now_ms();
         if let Ok(verdict) = &judged {
             flakes.replace(verdict.flakes.clone());
+            red_scenarios.replace(verdict.main_red_scenarios.clone());
         }
         // The red check passed on this base before the candidate ran: main
         // of the source is green on it again, whatever the gate ended with
@@ -11943,6 +11953,51 @@ mod database_tests {
         integrator.settle();
         let (record, _, _) = last_verdict(&db);
         assert_eq!(record["flakes"], json!(["check-e2e.sh"]), "{record}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A gate verdict's `main_red_scenarios` (scenarios solved on an
+    /// ancestor of the base and unsolved on it) are on the task's
+    /// `task.gated` record, whatever the verdict; a verdict without them
+    /// leaves the record without the key.
+    #[test]
+    fn a_verdicts_red_scenarios_are_on_its_record() {
+        let gate = "printf '{\"verdict\":\"accepted\",\"main_red_scenarios\":[\"046.sh\"]}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+        let (base, source, scenarios, integrator) = world("gate-red-scenarios", gate);
+        let db = Db::new("gate_red_scenarios");
+        let mission = db.gated_mission(&source, &scenarios);
+        let _task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["main_red_scenarios"], json!(["046.sh"]), "{record}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A gate verdict without `main_red_scenarios` (every gate before it)
+    /// leaves the record without the key.
+    #[test]
+    fn a_verdict_without_red_scenarios_has_none_on_its_record() {
+        let gate =
+            "printf '{\"verdict\":\"rejected\",\"reason\":\"r\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+        let (base, source, scenarios, integrator) = world("gate-no-red-scenarios", gate);
+        let db = Db::new("gate_no_red_scenarios");
+        let mission = db.gated_mission(&source, &scenarios);
+        let _task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        let (record, _, _) = last_verdict(&db);
+        assert!(record.get("main_red_scenarios").is_none(), "{record}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
