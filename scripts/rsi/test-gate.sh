@@ -2259,6 +2259,39 @@ EOF
     expect "$kind: the log says so" "$(cat "$work/gate.out")" "| test database: a fresh server for the candidate's runs, up in "
     expect "$kind: and a gate on its own server seeds" "$(cat "$work/gate.out")" \
         '| 102.sh: solved on the candidate, seeded into the base cache for '
+    # The shared template removed while a gate runs (spawn-maintenance's
+    # removal, batch 13, 2026-11-09) is remade by the next gate with a new
+    # password; the candidate's fresh server still takes the password its
+    # sandbox was given, from the gate's own copy. 103's base run waits while
+    # the template goes, and the candidate's start remakes it.
+    kept=$work/own-kept-$kind
+    mkdir -p "$kept"
+    cp "$scenarios/protected" "$kept/"
+    cat >"$kept/103.sh" <<EOF
+#!/bin/sh
+$q_function
+if [ "\$(cat value)" = one ]; then sleep 3.125; exit 0; fi
+[ "\$(q 'select 42')" = 42 ] || { echo "the candidate's server refused the sandbox's password"; exit 1; }
+EOF
+    (
+        export "$pg_var=$pg_source" SPAWN_GATE_JOBS=4 XDG_CACHE_HOME="$work/caches/own-kept-$kind" TMPDIR="$pgtmp"
+        judge "$good" "" "$kept" >"$work/kept.result"
+    ) &
+    kept_gate=$!
+    waited=0
+    until ps -eo args | grep -F 'sleep 3.125' | grep -qv grep || [ "$waited" -ge 600 ]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    templates=$work/caches/own-kept-$kind/spawn/gate-pg
+    first_password=$(cat "$templates"/*/password)
+    find "$templates" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9a-f]{64}' \
+        -exec chmod -R u+w {} + -exec rm -rf {} +
+    wait "$kept_gate" || :
+    expect "$kind: a template removed during the base phase" "$(cat "$work/kept.result")" 'exit=0 {"verdict":"accepted"}'
+    refuse "$kind: was remade with a new password" "$(cat "$templates"/*/password)" "$first_password"
+    expect "$kind: and the candidate's server took the sandbox's" "$(cat "$work/gate.out")" \
+        '| 103.sh: solved on the candidate'
     # A gate ended by a signal takes its server and its runs with it.
     printf '#!/bin/sh\n[ "$(cat value)" = one ] || sleep 29.75\n' >"$own/check-long.sh"
     rm -rf "$integrator"

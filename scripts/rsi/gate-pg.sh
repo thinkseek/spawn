@@ -25,13 +25,16 @@
 #   shared server has them (Spawn derives its restricted logins' passwords
 #   from the owner's, so the URL carries one), and the database
 #   `spawn_test`. One lock per id: two gates never make it twice.
-# - Each gate copies the template into its scratch (a reflink on btrfs) and
-#   runs `postgres` in bubblewrap, as this uid: as `/` the image's files, or
-#   the host's /usr (and the server's own installation when it is not under
-#   /usr) with the loader's cache and nothing else of the host's: not /etc,
-#   /home, /var or /run, all read-only; its data directory and socket
-#   directory the only writable paths, no network (a socket only), its own
-#   PID, IPC and user namespaces. A superuser's `COPY ... TO PROGRAM` runs
+# - Each gate copies the template and its password into its scratch once (a
+#   reflink on btrfs), at its first start: the shared one may be removed and
+#   remade with a new password while the gate runs, and each server the gate
+#   starts must take the password its sandbox was given. Each copies its data
+#   from the gate's copy and runs `postgres` in bubblewrap, as this uid: as
+#   `/` the image's files, or the host's /usr (and the server's own
+#   installation when it is not under /usr) with the loader's cache and
+#   nothing else of the host's: not /etc, /home, /var or /run, all
+#   read-only; its data directory and socket directory the only writable
+#   paths, no network (a socket only), its own PID, IPC and user namespaces. A superuser's `COPY ... TO PROGRAM` runs
 #   there, not on the host. It dies with the gate (`--die-with-parent`, and
 #   the gate's EXIT trap); the scratch goes with its data.
 # - The sandbox reaches it through a hard link to its socket in a directory
@@ -242,13 +245,43 @@ gate_pg_prepare() {
     touch "$gate_pg_dir/ready"
 }
 
+# gate_pg_keep <dir>: the template and its password, both of one making:
+# the password is read again after the copy, and a template remade in
+# between (a new random password) is copied again from the new one.
+gate_pg_keep() {
+    mkdir -m 700 "$1" || return 1
+    for _ in 1 2 3; do
+        kept_password=$(cat "$gate_pg_dir/password" 2>/dev/null) &&
+            cp -a --reflink=auto "$gate_pg_dir/template" "$1/template" 2>/dev/null &&
+            [ "$(cat "$gate_pg_dir/password" 2>/dev/null)" = "$kept_password" ] && {
+            (umask 077 && printf '%s' "$kept_password" >"$1/password") || return 1
+            return 0
+        }
+        chmod -R u+w "$1/template" 2>/dev/null
+        rm -rf "$1/template"
+        gate_pg_prepare || return 1
+    done
+    echo "gate: the private test server's template in $gate_pg_dir changed while it was copied, three times" >&2
+    return 1
+}
+
+gate_pg_kept=""
 gate_pg_start() { # <dir> <jobs>
     gate_pg_prepare || return 1
     mkdir -m 700 "$1" "$1/socket" "$1/users" || return 1
     cp "$gate_pg_dir/env" "$1/users/env" || return 1
     gate_pg_users "$1/users"
     gate_pg_started=$(date +%s%3N)
-    cp -a --reflink=auto "$gate_pg_dir/template" "$1/data" || return 1
+    # The gate's own copy of the template and its password, taken at its
+    # first start: every later start (the candidate phase's fresh server)
+    # copies that, whatever became of the shared one, which another gate
+    # remakes with a new password once it is gone (spawn-maintenance's,
+    # or a hand's, removal), while the sandbox's URL keeps the first.
+    if [ -z "$gate_pg_kept" ]; then
+        gate_pg_keep "$1/kept" || return 1
+        gate_pg_kept=$1/kept
+    fi
+    cp -a --reflink=auto "$gate_pg_kept/template" "$1/data" || return 1
     gate_pg_bwrap "$gate_pg_root" "$1/users" "$1/data" "$1/socket" - \
         postgres -c listen_addresses= -c unix_socket_directories=/run/postgresql \
         -c max_connections=$((100 + 50 * $2)) -c fsync=off -c synchronous_commit=off \
@@ -269,7 +302,7 @@ gate_pg_start() { # <dir> <jobs>
         echo "gate: the private test server made no socket at $gate_pg_socket" >&2
         return 1
     }
-    gate_pg_password=$(cat "$gate_pg_dir/password") || return 1
+    gate_pg_password=$(cat "$gate_pg_kept/password") || return 1
     gate_pg_ms=$(($(date +%s%3N) - gate_pg_started))
 }
 
