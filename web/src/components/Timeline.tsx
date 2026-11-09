@@ -1,8 +1,14 @@
-import { ArrowDown, GanttChart, List } from "lucide-react";
-import { Fragment, Suspense, lazy, useLayoutEffect, useRef, useState } from "react";
+import { ArrowDown, ChevronsUp, GanttChart, List } from "lucide-react";
+import { Fragment, Suspense, lazy, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
-import type { TimelineEvent } from "../api";
+import { sessionReader, usePoll } from "../api";
+import { fetchCommands } from "../fleet";
+import type { CommandRecord } from "../fleet";
+import type { KnownCommand } from "../trace";
+import type { Execution, TimelineEvent } from "../api";
+import { hasEarlier, joinTail, mergeEvents, readBack } from "../sessionWindow";
+import type { EventWindow } from "../sessionWindow";
 import { eventTone, fullText, pairs } from "../eventFormat";
 import { clockTime } from "../format";
 import { EmptyState, cx } from "./ui";
@@ -23,9 +29,62 @@ const MODE_OPTIONS: ReadonlyArray<ViewOption<Mode>> = [
 ];
 
 /** A session's events as a trace (spans on a time axis) or as the plain
- * list, for searching and copying. The choice is remembered. */
-export function Timeline({ events }: { events: TimelineEvent[] }) {
+ * list, for searching and copying. The choice is remembered. `tail` is the
+ * newest window, polled; it joins the window held when they touch and
+ * replaces it when they do not (a hidden tab), so no stretch is ever
+ * missing unmarked; older events load when the reader asks
+ * (sessionWindow.ts). */
+export function Timeline({
+  sessionId,
+  tail,
+  executions,
+}: {
+  sessionId: string;
+  tail: EventWindow;
+  executions: Execution[];
+}) {
   const [mode, choose] = useStoredChoice<Mode>("spawn.timeline.mode", MODES, "trace");
+  const [held, setHeld] = useState<EventWindow>(tail);
+  const [loading, setLoading] = useState(false);
+  const [failed, setFailed] = useState<string | null>(null);
+  useEffect(() => setHeld((current) => joinTail(current, tail)), [tail]);
+  const events = held.events;
+  const earlier = hasEarlier(held);
+
+  // What each command was, for the trace's command rows (UI note §4.3).
+  const commandPoll = usePoll<CommandRecord[]>(
+    `trace-commands:${sessionId}`,
+    (signal) => fetchCommands(sessionId, signal, COMMANDS_READ),
+    15_000,
+  );
+  const commands = useMemo(() => {
+    const byId = new Map<string, KnownCommand>();
+    for (const record of commandPoll.data ?? []) {
+      if (record.command_id !== null) byId.set(String(record.command_id), record);
+    }
+    return byId;
+  }, [commandPoll.data]);
+
+  // An older page, once, on request; the component is keyed by session.
+  const aborts = useRef<AbortController | null>(null);
+  useEffect(() => () => aborts.current?.abort(), []);
+  const loadEarlier = () => {
+    if (!earlier || loading) return;
+    const controller = new AbortController();
+    aborts.current = controller;
+    setLoading(true);
+    setFailed(null);
+    const from = held;
+    readBack(from, sessionReader(sessionId, controller.signal))
+      // Joined to what is held now, unless a new tail replaced it meanwhile.
+      .then((older) => setHeld((current) => (current.after === from.after ? { ...older, through: current.through, events: mergeEvents(older.events, current.events) } : current)))
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) setFailed(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+  };
 
   if (events.length === 0) {
     return (
@@ -38,12 +97,27 @@ export function Timeline({ events }: { events: TimelineEvent[] }) {
     );
   }
 
+  const first = held.after + 1;
   const toggle = (
-    <ViewToggle label="Timeline view" options={MODE_OPTIONS} value={mode} onChange={choose} />
+    <>
+      <ViewToggle label="Timeline view" options={MODE_OPTIONS} value={mode} onChange={choose} />
+      {earlier && (
+        <button
+          type="button"
+          onClick={loadEarlier}
+          disabled={loading}
+          title={failed ?? `Events from #${first}; load the ones before them`}
+          className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-caption text-muted-foreground hover:bg-surface-hover hover:text-foreground disabled:opacity-60"
+        >
+          <ChevronsUp size={13} />
+          {loading ? "Loading…" : failed ? "Retry earlier" : `Earlier · from #${first}`}
+        </button>
+      )}
+    </>
   );
   return mode === "trace" ? (
     <Suspense fallback={<div className="min-h-0 flex-1" />}>
-      <TraceView events={events} header={toggle} />
+      <TraceView events={events} executions={executions} commands={commands} header={toggle} />
     </Suspense>
   ) : (
     <EventList events={events} header={toggle} />
@@ -51,6 +125,9 @@ export function Timeline({ events }: { events: TimelineEvent[] }) {
 }
 
 const BOTTOM_SLACK_PX = 56;
+/** The newest commands read for the trace's words: more than a page of
+ * events can hold. */
+const COMMANDS_READ = 300;
 
 const COLUMNS =
   "md:grid-cols-[3rem_4.5rem_4.5rem_minmax(9rem,13rem)_minmax(0,1fr)]";

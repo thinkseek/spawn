@@ -434,7 +434,7 @@ test("consecutive identical calls fold into one row; different inputs, no input,
   const words = (list: typeof rows) =>
     list.map((row) => `${rowText(row.span)}${row.run.length > 1 ? ` ×${row.run.length}` : ""}${row.span.failed ? ` (${row.span.outcome})` : ""}`);
   assert.deepEqual(words(rows), [
-    "execution · claude",
+    "execution · claude · running",
     "turn 1",
     "Bash · git status ×3",
     "Bash · git diff",
@@ -511,5 +511,109 @@ test("calls whose summary leaves input out never fold: two Edits of one file, tw
   assert.deepEqual(
     rows.filter((row) => row.span.kind === "tool").map((row) => row.run.length),
     [1, 1, 1, 1, 1, 1],
+  );
+});
+
+test("a window that starts mid-execution: the record seeds the execution, its turns are unnumbered, its end comes from the record", () => {
+  const events = timeline([
+    ["tool.completed", 1, { tool_use_id: "early" }],
+    ["turn.stopped", 2],
+    ["message.received", 3],
+    ["tool.started", 4, { tool_name: "Bash", tool_use_id: "t" }],
+    ["tool.completed", 5, { tool_use_id: "t" }],
+    ["turn.stopped", 6],
+  ]);
+  const record = [
+    { execution_id: "ex_1", engine: "claude", started_at_ms: T0 - 3_600_000, ended_at_ms: null, cause: null },
+    { execution_id: "ex_0", engine: "claude", started_at_ms: T0 - 7_200_000, ended_at_ms: T0 - 3_600_000, cause: "exited" },
+  ];
+  const trace = deriveTrace(events, T0 + 10_000, record);
+  assert.deepEqual(shape(trace), [
+    "execution · claude open",
+    "  tool orphan",
+    "  turn orphan",
+    "  turn closed",
+    "    Bash closed",
+  ]);
+  const execution = trace.spans[0];
+  assert.equal(execution.start, T0 - 3_600_000, "it began before the window");
+  assert.equal(execution.startEvent, null);
+  assert.equal(trace.start, T0 + 1000, "the axis fits the window, not the execution");
+  assert.ok(!trace.byId.has("execution:ex_0"), "an execution with nothing in the window is not drawn");
+
+  // Ended, by the record, after the window's last event.
+  const ended = deriveTrace(events, T0 + 10_000, [{ ...record[0], ended_at_ms: T0 + 8000, cause: "lost" }]);
+  assert.deepEqual(
+    [ended.spans[0].state, ended.spans[0].end, ended.spans[0].outcome, ended.spans[0].failed],
+    ["closed", T0 + 8000, "lost", true],
+  );
+});
+
+test("command rows say who sent what; same-sender runs fold, a command that started an execution or is unknown does not", () => {
+  const commands = new Map([
+    ["1", { principal: "spawn-dispatch", action: "input", text: "Spawn dispatcher: 1 update for you.\n- a — stalled\n" }],
+    ["2", { principal: "spawn-dispatch", action: "input", text: "Spawn dispatcher: 1 update for you.\n- b — waiting\n" }],
+    ["3", { principal: "spawn-dispatch", action: "input", text: "x" }],
+    ["4", { principal: "human", action: "input", text: "keep the branch\nand rebase" }],
+  ]);
+  const finished = (id: number, at: number) =>
+    [
+      ["command.accepted", at, { command_id: id }, "cli", null],
+      ["command.finished", at + 0.5, { command_id: id, succeeded: true }, "cli", null],
+    ] as Array<[string, number, unknown, string, null]>;
+  const trace = deriveTrace(
+    timeline([
+      ...finished(1, 1),
+      ...finished(2, 2),
+      ...finished(3, 3),
+      ["command.accepted", 4, { command_id: 5 }, "cli", null],
+      ["execution.started", 4.5, { engine: "claude", command_id: 5 }],
+      ["command.finished", 5, { command_id: 5, succeeded: true }, "cli", null],
+      ...finished(4, 6),
+      ...finished(9, 7),
+      ...finished(10, 8),
+    ]),
+    T0 + 20_000,
+    [],
+    commands,
+  );
+  const rows = foldRuns(visibleSpans(trace, new Set()), new Set());
+  assert.deepEqual(
+    rows.map((row) => [rowText(row.span, trace), row.run.length]),
+    [
+      ["Dispatcher → input · a — stalled", 3],
+      ["command 5", 1],
+      ["execution · claude · running", 1],
+      ["You → input · keep the branch", 1],
+      ["command 9", 1],
+      ["command 10", 1],
+    ],
+  );
+  // The run keeps each command's own words.
+  assert.deepEqual(
+    rows[0].run.map((span) => span.summary),
+    ["a — stalled", "b — waiting", "x"],
+  );
+});
+
+test("a turn row counts its tools", () => {
+  const trace = deriveTrace(
+    timeline([
+      ["execution.started", 0, { engine: "claude" }],
+      ["message.received", 1],
+      ["tool.started", 2, { tool_name: "Bash", tool_use_id: "a" }],
+      ["tool.completed", 3, { tool_use_id: "a" }],
+      ["tool.started", 4, { tool_name: "Read", tool_use_id: "b" }],
+      ["tool.completed", 5, { tool_use_id: "b" }],
+      ["turn.stopped", 6],
+      ["message.received", 7],
+      ["turn.stopped", 8],
+      ["execution.ended", 9, { cause: "exited" }],
+    ]),
+    T0 + 20_000,
+  );
+  assert.deepEqual(
+    trace.spans.filter((span) => span.kind !== "tool").map((span) => rowText(span, trace)),
+    ["execution · claude", "turn 1 · 2 tools", "turn 2"],
   );
 });

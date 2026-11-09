@@ -14,6 +14,7 @@
  * becomes an orphan span, drawn as a zero-length mark at the end's time. */
 
 import type { TimelineEvent } from "./api";
+import { commandGist, commandHead } from "./commands.ts";
 
 export type SpanKind = "command" | "execution" | "turn" | "tool";
 
@@ -126,7 +127,34 @@ class Pending<T> {
   }
 }
 
-export function deriveTrace(input: TimelineEvent[], now: number): Trace {
+/** An execution as the session's record knows it (api.ts `Execution`):
+ * what the trace needs when its window starts after the execution did. */
+export interface KnownExecution {
+  execution_id: string;
+  engine: string | null;
+  started_at_ms: number;
+  ended_at_ms: number | null;
+  cause: string | null;
+}
+
+/** Spans from a window of a session's events. `executions` (the session's
+ * record of them) seeds the span of an execution whose start is before the
+ * window, so its turns and tools still sit under it; such an execution's
+ * turns are not numbered, as its earlier turns are not in the window. */
+/** A command as the commands endpoint knows it (fleet.ts
+ * `CommandRecord`): who sent it, what it is, its text. */
+export interface KnownCommand {
+  principal: string;
+  action: string;
+  text: string | null;
+}
+
+export function deriveTrace(
+  input: TimelineEvent[],
+  now: number,
+  executions: readonly KnownExecution[] = [],
+  commands: ReadonlyMap<string, KnownCommand> = new Map(),
+): Trace {
   const events = [...input].sort(compareEvents);
   const spans: Span[] = [];
   const byId = new Map<string, Span>();
@@ -201,6 +229,40 @@ export function deriveTrace(input: TimelineEvent[], now: number): Trace {
 
   const currentTurn = (key: string) => openTurns.get(key)?.at(-1) ?? null;
 
+  // Executions that began before the window: seeded from the record.
+  const seeded = new Map<string, KnownExecution>();
+  const started = new Set(
+    events.filter((event) => event.event_name === "execution.started").map((event) => event.execution_id),
+  );
+  const inWindow = new Set(events.map((event) => event.execution_id));
+  for (const execution of executions) {
+    const id = execution.execution_id;
+    if (started.has(id) || !inWindow.has(id)) continue;
+    const span: Span = {
+      id: `execution:${id}`,
+      kind: "execution",
+      label: execution.engine ? `execution · ${execution.engine}` : "execution",
+      start: execution.started_at_ms,
+      end: null,
+      state: "open",
+      failed: false,
+      outcome: null,
+      summary: null,
+      summaryWhole: false,
+      parentId: null,
+      depth: 0,
+      childIds: [],
+      executionId: id,
+      startEvent: null,
+      endEvent: null,
+      markers: [],
+    };
+    spans.push(span);
+    byId.set(span.id, span);
+    executionSpan.set(id, span);
+    seeded.set(id, execution);
+  }
+
   /** The innermost span open in this event's execution, for a marker. */
   const innermost = (event: TimelineEvent): Span | null => {
     const key = execKey(event);
@@ -242,7 +304,10 @@ export function deriveTrace(input: TimelineEvent[], now: number): Trace {
       case "command.accepted": {
         const id = text(event.detail, "command_id");
         if (!id) break;
-        const span = open("command", `command ${id}`, event, null);
+        // In words when the commands endpoint knows it (§4.3).
+        const known = commands.get(id);
+        const span = open("command", known ? commandHead(known.principal, known.action) : `command ${id}`, event, null);
+        if (known) span.summary = commandGist(known.text);
         commandSpan.set(id, span);
         const early = earlyCommandEnds.shift(id);
         if (early) close(span, early);
@@ -306,7 +371,8 @@ export function deriveTrace(input: TimelineEvent[], now: number): Trace {
       case "message.received": {
         const index = (turnCount.get(key) ?? 0) + 1;
         turnCount.set(key, index);
-        const span = open("turn", `turn ${index}`, event, turnParent(event));
+        const label = seeded.has(key) ? "turn" : `turn ${index}`;
+        const span = open("turn", label, event, turnParent(event));
         const turns = openTurns.get(key);
         if (turns) turns.push(span);
         else openTurns.set(key, [span]);
@@ -344,6 +410,18 @@ export function deriveTrace(input: TimelineEvent[], now: number): Trace {
       }
     }
     mark(event, innermost(event));
+  }
+
+  // A seeded execution the record says ended, with its end outside the
+  // window: closed where the record puts it.
+  for (const [id, execution] of seeded) {
+    const span = executionSpan.get(id);
+    if (span && span.state === "open" && execution.ended_at_ms !== null) {
+      span.end = Math.max(span.start, execution.ended_at_ms);
+      span.state = "closed";
+      span.outcome = execution.cause;
+      span.failed = execution.cause === "lost";
+    }
   }
 
   // Ends whose start never arrived.
@@ -573,9 +651,21 @@ export function commandProper(summary: string): string {
 
 /** A span's row text: `Bash · cargo test -p spawn-cli` for a tool call
  * with a summary, its label otherwise. */
-export function rowText(span: Span): string {
-  if (span.kind !== "tool" || !span.summary) return span.label;
-  return `${span.label} · ${shortSummary(span.label, span.summary)}`;
+export function rowText(span: Span, trace?: Trace): string {
+  switch (span.kind) {
+    case "tool":
+      return span.summary ? `${span.label} · ${shortSummary(span.label, span.summary)}` : span.label;
+    case "command":
+      return span.summary ? `${span.label} · ${span.summary}` : span.label;
+    case "turn": {
+      // `turn 3 · 14 tools`: the tools are its children.
+      if (!trace) return span.label;
+      const tools = span.childIds.filter((id) => trace.byId.get(id)?.kind === "tool").length;
+      return tools > 0 ? `${span.label} · ${tools} tool${tools === 1 ? "" : "s"}` : span.label;
+    }
+    case "execution":
+      return span.state === "open" ? `${span.label} · running` : span.label;
+  }
 }
 
 /** Two tool calls one row can stand for: the same tool with the same
@@ -584,6 +674,7 @@ export function rowText(span: Span): string {
  * cut command) does not say two calls are the same, and neither does no
  * summary at all. */
 function sameCall(a: Span, b: Span): boolean {
+  if (a.kind === "command" || b.kind === "command") return sameSender(a, b);
   return (
     a.kind === "tool" &&
     b.kind === "tool" &&
@@ -596,6 +687,23 @@ function sameCall(a: Span, b: Span): boolean {
     a.outcome === b.outcome &&
     a.state !== "open" &&
     b.state !== "open"
+  );
+}
+
+/** Two commands one row can stand for: the same sender and action (their
+ * texts differ, and the run opens to list them), neither running nor
+ * having started anything under it, ending the same way. */
+function sameSender(a: Span, b: Span): boolean {
+  return (
+    a.kind === "command" &&
+    b.kind === "command" &&
+    a.label === b.label &&
+    !a.label.startsWith("command ") &&
+    a.childIds.length === 0 &&
+    b.childIds.length === 0 &&
+    a.state === "closed" &&
+    b.state === "closed" &&
+    a.failed === b.failed
   );
 }
 
