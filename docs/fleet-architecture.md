@@ -954,7 +954,9 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   `SPAWN_ALERT_TMPFS_HIGH_MB`, default 8000; clears under
   `SPAWN_ALERT_TMPFS_OK_MB`, default 6000), `agent_stuck` (the session's
   latest judgement at or above the Observer's 0.5, whatever the dispatcher
-  does with it), `admission_wait` (objective 029's record older than
+  does with it; clears under 0.5, or when the session's current execution
+  has ended, whatever the cause, with that `execution.ended` as evidence;
+  a session whose current execution has ended fires none), `admission_wait` (objective 029's record older than
   `SPAWN_ALERT_ADMISSION_SECS`, default 600, with no admission after it),
   `backup_stale` (the newest dump older than
   `SPAWN_ALERT_BACKUP_DUMP_MAX_AGE_SECS`, default 7200, or bundle older than
