@@ -1058,6 +1058,8 @@ pub(crate) fn gate_host_fault_fields(
         format!("{scenario} exited {runs} on the base, before any candidate code ran")
     } else if on == "sandbox" {
         format!("the gate's sandbox never started {scenario} ({reason})")
+    } else if on == "test server" {
+        format!("the gate's own test server never started ({reason})")
     } else {
         format!("{scenario} failed on the candidate and on the base ({runs})")
     };
@@ -1065,6 +1067,8 @@ pub(crate) fn gate_host_fault_fields(
     // which fault it was without reading its text.
     let evidence = if on == "sandbox" {
         gate::SANDBOX_NEVER_STARTED
+    } else if on == "test server" {
+        gate::TEST_SERVER_NEVER_STARTED
     } else {
         "gate"
     };
@@ -1650,7 +1654,9 @@ fn base_only_fault(fields: &Value) -> bool {
     // next gate as an abort and feed the abort halt. No one of them counts
     // toward the cap nor is ever capped.
     // A red main (evidence `main_red`, `on` `main`) is main's, not the
-    // candidate's, likewise.
+    // candidate's, likewise, and so is the gate's own test server that did
+    // not start (`on` `test server`, evidence `test_server_never_started`),
+    // whichever start it was: no candidate code makes a server start.
     matches!(
         fields.get("evidence").and_then(Value::as_str),
         Some(BASE_DISAGREES | CANNOT_JUDGE | MAIN_RED)
@@ -1659,7 +1665,7 @@ fn base_only_fault(fields: &Value) -> bool {
             .get("fact")
             .and_then(|fact| fact.get("on"))
             .and_then(Value::as_str),
-        Some("base" | "candidate and base" | "main")
+        Some("base" | "candidate and base" | "main" | "test server")
     )
         // A sandbox that never started in the base's tree or the gate's own
         // (the socket scan): before any candidate code ran, as on the base.
@@ -11327,6 +11333,102 @@ mod database_tests {
             record["host_fault"]["fact"]["tree"], "candidate",
             "{record}"
         );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gate's own test server that did not start (gate.sh
+    /// `start_server`), recorded through the store for both starts: the
+    /// first (`gate`) and the candidate phase's fresh one (`candidate`).
+    /// Each is `host_fault` with evidence `test_server_never_started` and
+    /// its start. Neither is the candidate's doing: with the cap at 1, both
+    /// are recorded as host faults, neither counts toward the task, and the
+    /// next judging lands.
+    #[test]
+    fn a_test_server_that_never_started_is_recorded_for_both_starts_and_never_counted() {
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-db-server-never-started-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let runs = dir.join("runs");
+        let runs_path = runs.display();
+        let fact = |tree: &str, what: &str| {
+            format!(
+                "printf '{{\"host_fault\":true,\"scenario\":\"test server\",\"on\":\"test server\",\
+                 \"runs\":\"never started\",\"reason\":\"{what} did not start: FATAL:  could not \
+                 create shared memory segment: a host fault, not a verdict on the candidate\",\
+                 \"evidence\":\"test_server_never_started\",\"tree\":\"{tree}\"}}\\n' \
+                 >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
+            )
+        };
+        let gate = format!(
+            "n=$(cat '{runs_path}' 2>/dev/null || echo 0); n=$((n + 1)); echo \"$n\" >'{runs_path}'\n\
+             case \"$n\" in\n\
+             1) {}\n;;\n\
+             2) {}\n;;\n\
+             esac\n\
+             printf '{{\"verdict\":\"accepted\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n",
+            // No apostrophe: the fact is in a single-quoted printf.
+            fact("gate", "the first test server"),
+            fact("candidate", "the fresh test server of the candidate phase"),
+        );
+        let (base, source, scenarios, mut integrator) = world("server-never-started", &gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_millis(300),
+            cap: 1,
+        };
+        let db = Db::new("gate_server_never_started");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        let count = || {
+            std::fs::read_to_string(&runs).map_or(0, |text| text.trim().parse::<u32>().unwrap_or(0))
+        };
+        let judged = |n: u32| -> Value {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while count() < n {
+                assert!(std::time::Instant::now() < deadline, "run {n} never came");
+                integrator.pass_on(&db.store).expect("a pass");
+                integrator.settle();
+                if count() < n {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+            last_verdict(&db).0
+        };
+        for (n, tree) in [(1, "gate"), (2, "candidate")] {
+            let record = judged(n);
+            assert_eq!(record["verdict"], "host_fault", "run {n}: {record}");
+            assert_eq!(
+                record["evidence"],
+                crate::gate::TEST_SERVER_NEVER_STARTED,
+                "{record}"
+            );
+            assert_eq!(record["fact"]["on"], "test server", "{record}");
+            assert_eq!(record["fact"]["tree"], tree, "{record}");
+            assert_eq!(record["fact"]["runs"], "never started", "{record}");
+            assert!(
+                record["reason"].as_str().is_some_and(|reason| reason
+                    .starts_with("host fault: the gate's own test server never started")),
+                "{record}"
+            );
+        }
+        assert_eq!(
+            db.store
+                .task_host_faults(task, 0, &source_main(&source))
+                .expect("the count"),
+            0,
+            "no server start counts toward the task"
+        );
+        let record = judged(3);
+        assert_eq!(record["verdict"], "accepted", "{record}");
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&dir);
     }

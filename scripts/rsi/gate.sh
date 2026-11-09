@@ -464,9 +464,11 @@ verdict() {
 # "base","candidate"}`. `on` is where it failed: `base` (a scenario's
 # harness error on the base, before any candidate code ran: its runs did
 # not agree, or it exited neither 0 nor 1), `candidate and base` (a check
-# that failed twice on the candidate and once on the base) or `sandbox` (a
+# that failed twice on the candidate and once on the base), `sandbox` (a
 # sandbox that never started its command, with the evidence
-# `sandbox_never_started`: "A sandbox that never started its command"). The
+# `sandbox_never_started`: "A sandbox that never started its command") or
+# `test server` (the gate's own server did not start, with the evidence
+# `test_server_never_started` and the start as its tree: start_server). The
 # integrator
 # believes the fact only from its own verdict file with exit 6 (the sandbox
 # never sees that file) and records `host_fault`: retried after a backoff,
@@ -958,8 +960,38 @@ trap 'stage_close aborted; gate_times; gate_stop_children; gate_remove_work' EXI
 db_socket=""
 db_forward=""
 sandbox_db_url=""
+# start_server <dir> <tree>: the gate's own server, its files in <dir>;
+# <tree> is which start: `gate`, the first, before anything of either tree,
+# or `candidate`, the candidate phase's fresh one. Programs or a template
+# that cannot be prepared are the owner's configuration: exit 3, as before.
+# A server that does not come up is the host's: no verdict, the fact
+# `test_server_never_started` (exit 6, `host_fault`), with the server's
+# first FATAL line or the gate's own word, retried after a backoff and
+# never counted toward the task. The suite's seam,
+# SPAWN_GATE_TEST_PG_FAIL=<tree>, gives that start one setting no server
+# knows, so it fails as a real server does.
+start_server() {
+    start_option=""
+    [ "${SPAWN_GATE_TEST_PG_FAIL-}" != "$2" ] || start_option=spawn_gate_test_no_such_setting=1
+    start_rc=0
+    gate_pg_start "$1" "$gate_jobs" "$start_option" || start_rc=$?
+    [ "$start_rc" -eq 0 ] && return 0
+    [ "$start_rc" -eq 2 ] || exit 3
+    start_said=$(sed -n -E 's/^.*(FATAL|PANIC):/\1:/p' "$1/server.log" 2>/dev/null | head -n 1 | cut -c1-300) ||
+        start_said=""
+    # Or what kept it from starting at all (gate-pg.sh: its copy of the
+    # template).
+    [ -n "$start_said" ] || start_said=$(head -n 1 "$1/start.said" 2>/dev/null | cut -c1-300) || start_said=""
+    case "$2" in
+    gate) start_what="the gate's test server" ;;
+    *) start_what="the candidate phase's fresh test server" ;;
+    esac
+    host_fault "test server" "test server" "never started" \
+        "$start_what did not start${start_said:+: $start_said}: a host fault, not a verdict on the candidate" \
+        test_server_never_started "$2"
+}
 if [ -n "$gate_pg" ]; then
-    gate_pg_start "$work/pg" "$gate_jobs" || exit 3
+    start_server "$work/pg" gate
     # A link of the gate's to the socket the server made at start: the
     # server cannot change what it names (scripts/rsi/gate-pg.sh).
     mkdir -m 700 "$work/test-db"
@@ -1265,14 +1297,23 @@ sandbox_once() {
 }
 
 # sandbox <tree> <command...>: `sandbox_once`, started once more when the
-# first one never ran the command because a path it was to mask went away
+# first one never ran the command because a path it was to mask changed
 # between the check and bwrap's mount (a host process's temporary socket
-# directory, removed in those milliseconds): bwrap's own message names that
-# path, and the path is gone now. Only then: any other failure of bwrap's,
-# or of the command, is the result as it is. The second start checks the
-# masks again, so it skips the path that went away. The retry is said on
-# stderr (the command's log) and in the gate's own output (`gate_times`),
-# so a host race is never silent, nor a verdict on the candidate.
+# directory, removed in those milliseconds, or replaced by a regular file):
+# bwrap's own message names that path, and the path is gone now or is a
+# regular file. A regular file holds no socket, so leaving it unmasked shows
+# nothing that a path gone would not; and candidate code can neither remove
+# a host path nor put a file there (the host is read-only in the sandbox).
+# Only then: any other failure of bwrap's (the path still a directory, a
+# symlink, a socket, a FIFO), or of the command, is the result as it is.
+# The second start checks the masks again, so it skips the path. The retry
+# is said on stderr (the command's log) and in the gate's own output
+# (`gate_times`), so a host race is never silent, nor a verdict on the
+# candidate. A gate's masks come from a scan of every socket the host shows
+# it, other gates' and suites' scratch under /data/tmp too, so this race
+# is with unrelated host activity (2026-11-09: rev-b's suite case 3d' put a
+# file where its socket directory was, and a gate of rev-f's suite that had
+# scanned it failed to start its sandbox).
 sandbox() {
     sandbox_rc=0
     sandbox_once "$@" || sandbox_rc=$?
@@ -1296,7 +1337,11 @@ sandbox_retry() {
         case "$sandbox_said" in
         *"$sandbox_path"*)
             if [ ! -e "$sandbox_path" ] && [ ! -L "$sandbox_path" ]; then
-                sandbox_gone=$sandbox_path
+                sandbox_gone=$sandbox_path sandbox_became="went away"
+                break
+            fi
+            if [ -f "$sandbox_path" ] && [ ! -L "$sandbox_path" ]; then
+                sandbox_gone=$sandbox_path sandbox_became="became a regular file"
                 break
             fi
             ;;
@@ -1304,7 +1349,7 @@ sandbox_retry() {
     done
     IFS=$sandbox_ifs
     [ -n "$sandbox_gone" ] || return "$sandbox_rc"
-    sandbox_line="sandbox: $sandbox_gone went away between the mask check and bwrap's mount (bwrap: $(printf '%s\n' "$sandbox_said" | head -n 1)); started again without it"
+    sandbox_line="sandbox: $sandbox_gone $sandbox_became between the mask check and bwrap's mount (bwrap: $(printf '%s\n' "$sandbox_said" | head -n 1)); started again without it"
     echo "$sandbox_line" >&2
     printf '%s\n' "$sandbox_line" >>"$work/sandbox-retries" 2>/dev/null || :
     sandbox_once "$@"
@@ -1777,13 +1822,18 @@ run_stage() {
 }
 
 # snapshot_bin <tree>: the binary the scenarios run (SPAWN_BIN), copied
-# once the tree is built to target/gate/spawn, where no cargo command
-# writes: check-tests' `cargo test` links target/debug/spawn again (the
-# test profile's features) while other scenarios run it. Taken right before
-# the scenarios of the tree start, so it is the binary the serial gate's
-# scenarios ran (for the candidate, the one the test listing linked). Copied
-# inside the sandbox: the tree is the candidate's. A tree with no such binary
-# keeps the path its build would have made.
+# to target/gate/spawn, where no cargo command writes, as soon as the build
+# hook has built the tree, and before anything else of the gate runs cargo
+# in it. `cargo test` links target/debug/spawn again with the test build's
+# features: the dev-dependencies turn on spawn-core's and spawn-host's
+# `testing`. That covers check-tests while other scenarios run, and also the
+# candidate's test listing, which runs before its scenarios. Until
+# 2026-11-09 the candidate's copy was taken after that listing, so the
+# candidate's scenarios ran a testing-featured binary and the base's ran
+# the build hook's (rev-f, design-gate-time.md 3a). Both trees now run the
+# build hook's binary. Copied inside the sandbox: the tree is the
+# candidate's. A tree with no such binary keeps the path its build would
+# have made.
 snapshot_bin() {
     sandbox "$1" sh -c '[ -f target/debug/spawn ] || exit 0
         mkdir -p target/gate && cp target/debug/spawn target/gate/spawn.new &&
@@ -2447,13 +2497,13 @@ depends_on() {
         if [ -f "$file" ]; then printf '%s %s\n' "$(blob "$file")" "$name"; else printf 'missing %s\n' "$name"; fi
     done <"$work/deps.files" | LC_ALL=C sort
 }
-# The toolchain, asked once, when the first objective needs a key.
-toolchain_key=""
-toolchain() {
-    [ -z "$toolchain_key" ] || return 0
+# toolchain_probe <tree> <file>: the tools the scenarios run, asked in the
+# sandbox inside <tree> (its rust-toolchain.toml picks the Rust toolchain),
+# with the server's version, into <file>; prints the file's sha256.
+toolchain_probe() {
     # The server's version through libpq's variables (pg-url.sh), never a
     # URL on psql's command line: it holds the password.
-    sandbox "$work/baseline" sh -c '
+    sandbox "$1" sh -c '
         for tool in "rustc -vV" "cargo -V" "node --version" "psql -V" "git --version" \
             "tmux -V" "python3 -V" "jq --version"; do
             $tool 2>&1
@@ -2466,11 +2516,17 @@ toolchain() {
             echo "server: $?"
         else
             echo "server: unreadable"
-        fi' toolchain "$gate_scripts/pg-url.sh" >"$work/toolchain" 2>&1 || true
+        fi' toolchain "$gate_scripts/pg-url.sh" >"$2" 2>&1 || true
     # A probe that never ran would key the base cache by bwrap's message.
     if [ -s "$work/sandbox-never-started" ]; then sandbox_fault "$work/sandbox-never-started" toolchain; fi
-    [ -z "$gate_pg_id" ] || echo "server: the gate's own, $gate_pg_kind $gate_pg_id" >>"$work/toolchain"
-    toolchain_key=$(sha256sum <"$work/toolchain" | cut -d' ' -f1)
+    [ -z "$gate_pg_id" ] || echo "server: the gate's own, $gate_pg_kind $gate_pg_id" >>"$2"
+    sha256sum <"$2" | cut -d' ' -f1
+}
+# The base's toolchain, asked once, when the first objective needs a key.
+toolchain_key=""
+toolchain() {
+    [ -z "$toolchain_key" ] || return 0
+    toolchain_key=$(toolchain_probe "$work/baseline" "$work/toolchain")
     echo "| base cache: toolchain $(sed -n 's/^release: /rustc /p' "$work/toolchain" | head -n 1)" \
         "$(sed -n 's/^\(cargo [^ ]*\).*/\1/p' "$work/toolchain" | head -n 1)" \
         "$(sed -n 's/^\(psql\) (PostgreSQL) \([^ ]*\).*/\1 \2/p' "$work/toolchain" | head -n 1)" \
@@ -2499,13 +2555,28 @@ toolchain_server() {
 }
 # entry_result <entry>: solved, unsolved or cannot_judge (see "A scenario
 # that cannot be judged here"), as the entry holds it; nothing for an entry
-# that is missing, unreadable, or holds anything else.
+# that is missing, unreadable, or holds anything else. A seeded entry
+# ("Seeds from the accepting gate", below) is `solved` and a second line,
+# `seeded-by-gate <candidate commit> at <UTC time>`, and nothing else.
 entry_result() {
     entry_held=""
     if [ -e "$1" ] || [ -L "$1" ]; then
         entry_held=$(cat -- "$1" 2>/dev/null) || entry_held=""
     fi
-    case "$entry_held" in solved | unsolved | cannot_judge) printf '%s' "$entry_held" ;; esac
+    case "$entry_held" in
+    solved | unsolved | cannot_judge) printf '%s' "$entry_held" ;;
+    "solved
+seeded-by-gate "*)
+        [ "$(printf '%s\n' "$entry_held" | wc -l)" -eq 2 ] &&
+            printf '%s\n' "$entry_held" | sed -n 2p |
+            grep -qE '^seeded-by-gate [0-9a-f]{40} at [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' &&
+            printf solved
+        ;;
+    esac
+}
+# entry_origin <entry>: the seed line of a seeded entry, or nothing.
+entry_origin() {
+    sed -n '2s/^seeded-by-gate \([0-9a-f]\{40\}\) at \(.*\)$/seeded by the gate of \1 at \2/p' -- "$1" 2>/dev/null || :
 }
 # base_job <job>: the base's result for one objective, in the background,
 # under its key's lock (above); <job>/entry is its cache entry. A completed
@@ -2683,6 +2754,18 @@ base_printed() {
     printf '%s|%s\n' "$result" "$(cat "$1/scenario")" >>"$work/base-results"
 }
 
+# objective_key <commit> <toolchain key> <objective>: the key of the
+# objective's result on <commit> as a base ("The base cache" above). Not to
+# be run in parallel: depends_on writes $work/deps.files.
+objective_key() {
+    {
+        printf 'base %s\nscenario %s\n%s\ntoolchain %s\nscenarios %s\nbinds %s\n' "$1" \
+            "$(blob "$3")" "$gate_key" "$2" "$scenarios_key" "$binds_key"
+        if runs_alone "$3"; then printf 'runs alone\n'; fi
+        depends_on "$3"
+    } | sha256sum | cut -d' ' -f1
+}
+
 # The base phase: every objective's key (and its result, when the cache
 # has it), then one build of the base for those it has not, then their runs.
 : >"$work/base-results"
@@ -2702,13 +2785,7 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
     printf '%s\n' "$objective" >>"$work/base-results.seen"
     objective_name=$(basename "$objective")
     toolchain
-    key=$( {
-        printf 'base %s\nscenario %s\n%s\ntoolchain %s\nscenarios %s\nbinds %s\n' "$base_commit" \
-            "$(blob "$objective")" "$gate_key" "$toolchain_key" "$scenarios_key" "$binds_key"
-        if runs_alone "$objective"; then printf 'runs alone\n'; fi
-        depends_on "$objective"
-    } | sha256sum | cut -d' ' -f1)
-    entry=$base_cache/$key
+    entry=$base_cache/$(objective_key "$base_commit" "$toolchain_key" "$objective")
     base_count=$((base_count + 1))
     job=$jobs_dir/base.$base_count
     mkdir "$job"
@@ -2722,7 +2799,8 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
     if [ -n "$result" ]; then
         # A used entry stays: maintenance removes the ones untouched.
         touch -c -- "$entry" 2>/dev/null || :
-        echo "| == base: $objective_name: $result (cached)" >"$job/text.0"
+        origin=$(entry_origin "$entry")
+        echo "| == base: $objective_name: $result (cached${origin:+, $origin})" >"$job/text.0"
         printf 'text %s\n' "$job/text.0" >"$job/events"
         echo "cached $result" >"$job/result"
     else
@@ -2865,6 +2943,10 @@ if ! build "$work/candidate"; then
     verdict rejected "candidate does not build"
     exit 0
 fi
+if ! snapshot_bin "$work/candidate"; then
+    echo "gate: cannot copy the candidate's spawn for its scenarios" >&2
+    exit 3
+fi
 
 # runnable_tests <writable dir> <tree> <target dir> <names file>: how many
 # tests cargo runs in the tree, from inside the sandbox: libtest's
@@ -2973,6 +3055,9 @@ candidate_job() {
     job_run "$job" 1 "$work/candidate" "$job_scenario" || run_status=$?
     [ ! -e "$job/slot-waited" ] || return 0
     job_output 1
+    if [ "$run_status" -eq 0 ] && [ -s "$job/seed-entry" ] && [ ! -s "$job/never-started" ]; then
+        seed
+    fi
     is_check=""
     case "$(basename "$job_scenario")" in check-*) is_check=1 ;; esac
     if [ -n "$is_check" ] && [ "$run_status" -ne 0 ]; then
@@ -3137,6 +3222,45 @@ candidate_printed() {
     fi
     run_stage "ok|$printed_name" "$printed_ms"
 }
+# Seeds from the accepting gate (design-gate-time.md §2). The commit a gate
+# accepts is the commit the integrator lands: the next gate's base is this
+# gate's candidate, the same commit. So a candidate run of an objective
+# scenario that completes with exit 0 is that commit's `solved`, and the
+# gate writes it into the base cache under the key a base run of the
+# candidate commit would use (objective_key, with the candidate's own
+# toolchain probe). A key no later gate computes is never read. A seed is
+# taken only where a candidate run sees what a base run sees:
+# - a fresh server: the candidate phase gets one of its own, started after
+#   the base phase ("A fresh server for the candidate's runs", below), as
+#   the next gate's base phase does. A gate with no test database at all
+#   seeds too; a gate on the shared test server never does;
+# - an objective `<digits>.sh` or the task scenario, never a check, a
+#   ratchet, or a scenario that reads SPAWN_BASELINE_TREE (a candidate run
+#   sees the old base there, a base run itself) or runs cargo or anything
+#   under target/ (the candidate tree's target/debug is the test listing's
+#   build, linked again by check-tests while the candidate's runs go on; a
+#   base run's is the build hook's), in it or in any file it names
+#   (depends_on; for cargo and target/, its whole text). Scenarios run SPAWN_BIN, the build hook's
+#   binary in both phases;
+# - neighbours: the candidate phase runs the checks (check-tests among
+#   them) beside the objectives, the base phase objectives only. The
+#   load-sensitive scenarios run alone in both (`serial`); more load beside
+#   a run makes it pass no more easily, the same flake risk a base run has;
+# - the first run, completed, exit 0 (never a failure, a run stopped or cut
+#   short, a sandbox that never started, a run that waited out its slot):
+#   only `solved` is ever seeded, never `unsolved` or `cannot_judge`;
+# - an entry that holds no result yet, under the key's lock without waiting.
+# The entry says where it came from (`seeded-by-gate <candidate> at <UTC
+# time>`, entry_result), and the gate that reads it says so.
+seeding=""
+seed_toolchain_key=""
+if [ -z "$base_only" ]; then
+    if [ -n "$gate_pg" ] || { [ -z "$db_socket" ] && [ -z "$sandbox_db_url" ]; }; then
+        seeding=1
+    else
+        echo "| base cache: no seeds from this gate's candidate runs: they share the test server, not a fresh one"
+    fi
+fi
 candidate_count=0
 add_candidate_job() { # <scenario> <section>
     candidate_count=$((candidate_count + 1))
@@ -3145,6 +3269,50 @@ add_candidate_job() { # <scenario> <section>
     printf '%s\n' "$1" >"$job/scenario"
     printf '%s\n' "$2" >"$job/section"
     if runs_alone "$1"; then : >"$job/alone"; fi
+    seed_plan "$1"
+}
+# seed_plan <scenario>: $job/seed-entry, the entry a passing first run of
+# the scenario seeds, when it may (above).
+seed_plan() {
+    [ -n "$seeding" ] || return 0
+    if [ "$1" != "$scenario" ]; then
+        case "$(basename "$1")" in *[!0-9].sh | .sh) return 0 ;; esac
+    fi
+    grep -q '^# rsi: ratchet' "$1" && return 0
+    if [ -z "$seed_toolchain_key" ]; then
+        seed_toolchain_key=$(toolchain_probe "$work/candidate" "$work/toolchain.candidate")
+    fi
+    seed_key=$(objective_key "$candidate_commit" "$seed_toolchain_key" "$1")
+    # depends_on (in objective_key) left the scenario and every file it names.
+    while IFS= read -r seed_file; do
+        [ -f "$seed_file" ] || continue
+        if grep -q 'SPAWN_BASELINE_TREE' -- "$seed_file"; then
+            echo "| base cache: $(basename "$1") is not seeded: ${seed_file#"$scenarios"/} reads SPAWN_BASELINE_TREE"
+            return 0
+        fi
+        # The whole text, comments too: a word read wrongly can only cost a
+        # seed, never make a wrong one.
+        if grep -qE '(^|[^A-Za-z0-9_])cargo([^A-Za-z0-9_-]|$)|target/' -- "$seed_file"; then
+            echo "| base cache: $(basename "$1") is not seeded: ${seed_file#"$scenarios"/} runs cargo or reads target/"
+            return 0
+        fi
+    done <"$work/deps.files"
+    printf '%s\n' "$base_cache/$seed_key" >"$job/seed-entry"
+}
+# seed <job>: its first run passed; the entry it may seed gets `solved`.
+seed() {
+    seed_entry=$(cat "$job/seed-entry")
+    [ -z "$(entry_result "$seed_entry")" ] || return 0
+    command -v flock >/dev/null 2>&1 || return 0
+    { command exec 8>>"$seed_entry.lock"; } 2>/dev/null || return 0
+    if flock -n 8 && [ -z "$(entry_result "$seed_entry")" ] &&
+        printf 'solved\nseeded-by-gate %s at %s\n' "$candidate_commit" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            >"$seed_entry.seed.$$" 2>/dev/null &&
+        mv -f "$seed_entry.seed.$$" "$seed_entry" 2>/dev/null; then
+        job_say "| $(basename "$job_scenario"): solved on the candidate, seeded into the base cache for $(printf '%s' "$candidate_commit" | cut -c1-12) as a base"
+    fi
+    rm -f "$seed_entry.seed.$$" 2>/dev/null || :
+    exec 8>&-
 }
 if [ -n "$scenario" ]; then
     add_candidate_job "$scenario" "candidate: $(basename "$scenario") must pass"
@@ -3159,9 +3327,21 @@ for other in "$scenarios"/check-tests.sh "$scenarios"/*.sh; do
     add_candidate_job "$other" "regression: $(basename "$other") must still pass"
 done
 stage_close ok
-if [ "$candidate_count" -gt 0 ] && ! snapshot_bin "$work/candidate"; then
-    echo "gate: cannot copy the candidate's spawn for its scenarios" >&2
-    exit 3
+# A fresh server for the candidate's runs: the base phase's runs leave the
+# server as they leave it, and a candidate run is to see what the next
+# gate's base run of this commit will see, a server only this tree's runs
+# have used (the seeds above). The same programs, the same password (the
+# data of the gate's own copy of the template, gate-pg.sh), the same socket
+# path the sandbox is given.
+if [ -n "$gate_pg" ] && [ "$candidate_count" -gt 0 ]; then
+    gate_pg_stop
+    start_server "$work/pg.candidate" candidate
+    rm -f "$db_socket"
+    if ! ln -P "$gate_pg_socket" "$db_socket" || [ ! -S "$db_socket" ]; then
+        echo "gate: cannot link the candidate's fresh test server's socket into $work/test-db" >&2
+        exit 3
+    fi
+    echo "| test database: a fresh server for the candidate's runs, up in $gate_pg_ms ms"
 fi
 phase_start candidate
 run_jobs candidate "$candidate_count" candidate_job candidate_finished candidate_printed
