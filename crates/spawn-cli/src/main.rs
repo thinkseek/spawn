@@ -39,6 +39,7 @@ mod disk;
 mod dispatch;
 mod gate;
 mod integrate;
+mod judge_watch;
 mod main_merge;
 mod memory;
 mod missions;

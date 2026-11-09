@@ -67,7 +67,10 @@ pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
     let context = context::HostContext::new(open_store()?, terminals);
     let mut observer = Observer::new(log).with_context(Arc::new(context));
     if let Some(judge) = judge(flags) {
-        observer = observer.with_judge(judge);
+        // Every call watched: its crossings between answering and failing
+        // are recorded (`host.judge`), what the `judge_down` alert reads.
+        let watched = crate::judge_watch::WatchedJudge::new(judge, store.clone());
+        observer = observer.with_judge(Arc::new(watched));
     }
     observer.recover().map_err(|error| error.to_string())?;
     Ok((bridge, observer))
