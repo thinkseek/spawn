@@ -780,6 +780,50 @@ time.sleep(900)' "$vanish/service.sock" &
     expect "the next gate judges" "$never_again" 'exit=0 {"verdict":"accepted"}'
     expect "and runs the objective again, never a cached result" "$(cat "$work/gate.out")" \
         '| base results from the cache: none; run on the base: 101.sh'
+    # The red check's base run (SPAWN_GATE_BASE_CHECK) whose sandbox never
+    # started: outside the job printers, the block reads the note itself,
+    # and it is the same fact in the base's tree, before the candidate is
+    # built. No objective: the base check's run is the gate's first on the
+    # base, where the hold holds it.
+    nscheck=$work/never-check
+    mkdir -p "$nscheck"
+    cp "$scenarios/protected" "$nscheck/"
+    printf '#!/bin/sh\nexit 0\n' >"$nscheck/check-red.sh"
+    vanish=$(mktemp -d "$work/vanish.XXXXXX")
+    python3 -c '
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen()
+time.sleep(900)' "$vanish/service.sock" &
+    vanish_listener=$!
+    background="$background $vanish_listener"
+    while [ ! -S "$vanish/service.sock" ]; do sleep 0.1; done
+    printf 'base-run\n' >"$hold"
+    (
+        held=0
+        until [ -s "$hold.held" ] || [ "$held" -ge 600 ]; do sleep 0.05; held=$((held + 1)); done
+        kill "$vanish_listener"
+        rm -rf "$vanish"
+        : >"$vanish"
+        rm -f "$hold"
+    ) &
+    vanish_watcher=$!
+    never_check=$(
+        export SPAWN_GATE_TEST_HOLD="$hold" XDG_CACHE_HOME="$work/caches/never-check" \
+            SPAWN_GATE_BASE_CHECK=check-red.sh
+        unset TMPDIR
+        judge "$good" "" "$nscheck"
+    )
+    wait "$vanish_watcher" 2>/dev/null || true
+    case "$(cat "$hold.held" 2>/dev/null)" in
+    */baseline) ;;
+    *) echo "FAIL the base-check hold held $(cat "$hold.held" 2>/dev/null), not the base's tree"; exit 1 ;;
+    esac
+    expect "a base check whose sandbox never started is a host fault: exit 6" "$never_check" \
+        'exit=6 {"host_fault":true,"scenario":"check-red.sh","on":"sandbox","runs":"never started"'
+    expect "in the base's tree" "$never_check" '"evidence":"sandbox_never_started","tree":"base"'
+    refuse "and no word of green" "$never_check" '"base_check"'
+    refuse "before the candidate is built" "$(cat "$work/gate.out")" '| == candidate: build'
+    rm -f "$vanish" "$hold.held"
 else
     echo "note: $vanish was not under a scanned directory (TMPDIR covers it): no mask, no hold"
 fi
