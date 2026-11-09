@@ -10,7 +10,7 @@ use serde_json::json;
 
 mod common;
 use common::{admin, store, url};
-use spawn_postgres::PostgresStore;
+use spawn_postgres::{PostgresStore, PushRequest};
 
 /// Every row of the three tables, in a stable order.
 fn tables(client: &mut Client) -> serde_json::Value {
@@ -3492,7 +3492,8 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
     };
 
     assert!(
-        refusal(store.source_push_request(source, &c1, &owner_ref(&c1))).contains("no mission"),
+        refusal(store.source_push_request(source, &c1, &owner_ref(&c1), &PushRequest::default()))
+            .contains("no mission"),
         "a source with no mission takes no request"
     );
     let on_source = mission_at(&store, source, "b0");
@@ -3527,14 +3528,19 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
             "refs/spawn-owner",
         ),
     ] {
-        let refused = refusal(store.source_push_request(bad_source, commit, &reference));
+        let refused = refusal(store.source_push_request(
+            bad_source,
+            commit,
+            &reference,
+            &PushRequest::default(),
+        ));
         assert!(refused.contains(why), "{bad_source} {commit}: {refused}");
     }
     let before = tables(&mut client);
 
     // The request: a record that folds nothing, pending until its outcome.
     let request = store
-        .source_push_request(source, &c1, &owner_ref(&c1))
+        .source_push_request(source, &c1, &owner_ref(&c1), &PushRequest::default())
         .expect("the owner's request");
     let recorded = record_of(&mut client, request);
     assert_eq!(recorded["type"], "source.push_requested");
@@ -3542,12 +3548,21 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
     assert_eq!(recorded["commit"], c1.as_str());
     assert_eq!(recorded["ref"], owner_ref(&c1).as_str());
     assert_eq!(recorded["by"], "human");
+    for key in ["gated", "urgent", "reason"] {
+        assert!(
+            recorded.get(key).is_none(),
+            "{key} only when given: {recorded}"
+        );
+    }
     assert_eq!(tables(&mut client), before, "a request folds nothing");
     let pending = store.source_pushes_pending().expect("pending");
     assert_eq!(pending.as_array().map(Vec::len), Some(1), "{pending}");
     assert_eq!(pending[0]["request"], json!(request));
     assert_eq!(pending[0]["source"], source);
     assert_eq!(pending[0]["commit"], c1.as_str());
+    assert_eq!(pending[0]["gated"], json!(false));
+    assert_eq!(pending[0]["urgent"], json!(false));
+    assert_eq!(pending[0]["reason"], json!(null));
     assert_eq!(store.source_push_outcome(request).expect("outcome"), None);
 
     // Refused: folds nothing, and is the request's only outcome.
@@ -3584,10 +3599,10 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
     // Applied: the move names the request, and moves the baselines at its
     // `from` on its source, not a halted one's, not another source's.
     let second = store
-        .source_push_request(source, &c2, &owner_ref(&c2))
+        .source_push_request(source, &c2, &owner_ref(&c2), &PushRequest::default())
         .expect("a second request");
     let third = store
-        .source_push_request(other, &c3, &owner_ref(&c3))
+        .source_push_request(other, &c3, &owner_ref(&c3), &PushRequest::default())
         .expect("a request on the other source");
     let pending = store.source_pushes_pending().expect("pending");
     let ids: Vec<i64> = pending
@@ -3670,6 +3685,97 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
             .is_err(),
         "the supervisor holds no landing"
     );
+}
+
+/// A gated owner's request (design-owner-push-between-gates.md) carries
+/// `gated`, `urgent` and the owner's `reason` on its record and in the
+/// pending list, each only when given; a reason over 2000 characters is
+/// refused. Its outcome carries the owner judging's `verdict` and `log`: a
+/// refusal with the gate's reason, a move naming the accepted verdict.
+#[test]
+fn a_gated_owner_request_and_its_judged_outcome_are_on_the_record() {
+    let (store, schema) = store("control_owner_gated");
+    let mut client = admin(&schema);
+    let source = "/tmp/owner-gated.git";
+    let (c1, c2) = ("4".repeat(40), "5".repeat(40));
+    let owner_ref = |commit: &str| format!("refs/spawn-owner/{commit}");
+    let mission = mission_at(&store, source, "b0");
+    let long = "x".repeat(2001);
+    assert!(
+        refusal(store.source_push_request(
+            source,
+            &c1,
+            &owner_ref(&c1),
+            &PushRequest {
+                gated: true,
+                urgent: false,
+                reason: Some(long),
+            },
+        ))
+        .contains("2000"),
+        "a reason is bounded"
+    );
+    let how = PushRequest {
+        gated: true,
+        urgent: true,
+        reason: Some("046 is red on main: the fix".to_string()),
+    };
+    let request = store
+        .source_push_request(source, &c1, &owner_ref(&c1), &how)
+        .expect("a gated request");
+    let recorded: serde_json::Value = client
+        .query_one(
+            "select kind -> 'detail' -> 'record' from spawn_events
+              where id = $1 and session_id = 'session_control'",
+            &[&request],
+        )
+        .expect("the request's event")
+        .get(0);
+    assert_eq!(recorded["gated"], json!(true), "{recorded}");
+    assert_eq!(recorded["urgent"], json!(true), "{recorded}");
+    assert_eq!(recorded["reason"], "046 is red on main: the fix");
+    let pending = store.source_pushes_pending().expect("pending");
+    assert_eq!(pending[0]["request"], json!(request));
+    assert_eq!(pending[0]["gated"], json!(true));
+    assert_eq!(pending[0]["urgent"], json!(true));
+    assert_eq!(pending[0]["reason"], "046 is red on main: the fix");
+
+    store
+        .integrator_record(&json!({"type": "source.push_refused", "request": request,
+            "reason": "the owner's gate rejected it: regression: 046.sh",
+            "verdict": "rejected", "log": "| == regression: 046.sh must still pass"}))
+        .expect("a refusal with the owner judging's verdict and log");
+    let outcome = store
+        .source_push_outcome(request)
+        .expect("outcome")
+        .expect("recorded");
+    assert_eq!(outcome["verdict"], "rejected");
+    assert_eq!(outcome["log"], "| == regression: 046.sh must still pass");
+
+    let gated_only = store
+        .source_push_request(
+            source,
+            &c2,
+            &owner_ref(&c2),
+            &PushRequest {
+                gated: true,
+                ..PushRequest::default()
+            },
+        )
+        .expect("a gated request");
+    store
+        .integrator_record(
+            &json!({"type": "source.moved", "source": source, "from": "b0",
+            "to": c2, "request": gated_only, "by": "human", "verdict": "accepted"}),
+        )
+        .expect("a move naming the accepted verdict");
+    let moved = store
+        .source_push_outcome(gated_only)
+        .expect("outcome")
+        .expect("recorded");
+    assert_eq!(moved["verdict"], "accepted");
+    assert_eq!(moved["missions"], json!([mission]));
+    assert!(moved.get("urgent").is_none());
 }
 
 /// The owner's landing holds the landing hold's lock: no one else takes it
