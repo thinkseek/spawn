@@ -23,15 +23,30 @@
 //!   `manifest.json` and the bundle's contents, full (the first of an ISO
 //!   week, or none full within 7 days, from the records) or incremental (its
 //!   base the newest `backup.bundled` record): a git bundle of every mission
-//!   source, whole or `--not` its base's heads, and the transcript archive's
-//!   files modified within `SPAWN_BACKUP_TRANSCRIPT_DAYS` (default 14),
-//!   whole or the bytes appended since the base's sizes.
+//!   source's branches and tags — exactly the refs the record names, never a
+//!   remote-tracking ref a mirror clone left (the live `supply-pa.git` has
+//!   `refs/remotes/github/main`) nor a pending `refs/spawn-owner/` push; a
+//!   source with no branches and no tags is recorded `empty`, and an
+//!   increment whose refs all point into its base records the `delta` that
+//!   changed (a tag added at a held commit, a branch removed), both with no
+//!   file in the archive; an increment's entry also names the refs its
+//!   bundle holds (`bundled`), since `--not` leaves out a ref the base has
+//!   — whole or `--not` its base's heads, and the transcript archive's
+//!   files modified
+//!   within `SPAWN_BACKUP_TRANSCRIPT_DAYS` (default 14), whole or the bytes
+//!   appended since the base's sizes. The record is a true description of the
+//!   archive: verify refuses a bundle that lists a ref its manifest does not
+//!   name, so the bundle may hold only what the manifest holds.
 //! - `spawn backup verify`, every day: the newest good dump fetched,
 //!   decrypted and checked against its record's sha256, restored into a
 //!   database of its own on `SPAWN_BACKUP_DRILL_DATABASE_URL` (never the
 //!   source, never one it did not create), its `spawn_events` and highest id
-//!   compared with the record's, and the database dropped again: exit 0 when
-//!   it restores to its record, 1 when it does not, 2 when it cannot run.
+//!   compared with the record's, and the database dropped again; then the
+//!   newest `backup.bundled` object fetched, decrypted, decompressed by its
+//!   magic and unpacked, its `manifest.json`, transcript files and every
+//!   repo's `git bundle` (heads listed; a full one verified alone) compared
+//!   with its record, so the sources and transcripts are proven to open too:
+//!   exit 0 when both pass, 1 when either does not, 2 when it cannot run.
 //!
 //! The bucket stays inside R2's free tier: `SPAWN_BACKUP_R2_LIMIT_MB`
 //! (default 10000) is 10,000,000,000 bytes, and nothing is ever written
@@ -42,10 +57,21 @@
 //! 8000) is the alert: the record says `over_alert` and the run says it on
 //! its output; objective 030 raises its own alert from the record.
 //!
+//! The bundle's tar is compressed before it is encrypted — zstd (`-3`) when
+//! the host has it, gzip when it does not, plain otherwise — and the key
+//! names what it holds (`<...>.tar.zst.gpg`, `.tar.gz.gpg`, `.tar.gpg`): on
+//! 2026-11-08 a real full bundle of 426 MB of transcripts and two sources
+//! was 90 MB as zstd and 437 MB as a plain tar. `SPAWN_BACKUP_PREFIX`
+//! (empty in the fleet) puts every object under a prefix, so a measurement
+//! or a test writes to a scratch place (`locktest/`) and never over a real
+//! backup; the records name the stored key, prefix included.
+//!
 //! Secrets come from files the owner made mode 600 and are never on a
 //! command line, in the output or in a record: the passphrase file goes to
 //! gpg by path, the R2 credentials to curl on stdin (`--config -`), and the
-//! database password to libpq through `PGPASSWORD`.
+//! database password to libpq through `PGPASSWORD`. A drop the plausibility
+//! check doubts is accepted once by the owner with
+//! `SPAWN_BACKUP_ACCEPT_DROP=1`, which still records the drop (`accepted`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -196,6 +222,11 @@ pub(crate) struct Settings {
     pub(crate) transcript_days: i64,
     pub(crate) limit_bytes: u64,
     pub(crate) alert_bytes: u64,
+    /// `SPAWN_BACKUP_PREFIX`: prepended to every object's key, for a run
+    /// that must not touch a real backup (a test writes under `locktest/`).
+    /// Empty in the fleet. The records name the stored key — prefix included
+    /// — so a restore reads exactly the object the run wrote.
+    pub(crate) prefix: String,
     pub(crate) drill_url: Option<String>,
 }
 
@@ -293,7 +324,41 @@ fn megabytes(name: &str, default: u64) -> Result<u64, String> {
     }
 }
 
+/// `SPAWN_BACKUP_PREFIX` as a key prefix: empty, or letters, digits, `.`,
+/// `_`, `-` and `/` ending in `/`; nothing that could leave the bucket's
+/// namespace (`..`, a leading `/`).
+fn prefix_value(text: Option<String>) -> Result<String, String> {
+    let Some(text) = text else {
+        return Ok(String::new());
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(String::new());
+    }
+    if text.starts_with('/')
+        || !text
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/'))
+        || text
+            .trim_end_matches('/')
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || !text.ends_with('/')
+    {
+        return Err(format!(
+            "SPAWN_BACKUP_PREFIX: {text:?} is not a key prefix (letters, digits, '.', '_', \
+             '-' and '/', ending in '/')"
+        ));
+    }
+    Ok(text.to_string())
+}
+
 impl Settings {
+    /// `key` as it is stored: under `SPAWN_BACKUP_PREFIX`, or as given.
+    fn stored(&self, key: &str) -> String {
+        format!("{}{key}", self.prefix)
+    }
+
     pub(crate) fn from_env(flags: &Flags) -> Result<Self, String> {
         let root = workspace_root(flags)
             .map(PathBuf::from)
@@ -320,6 +385,7 @@ impl Settings {
             access_key: needed("SPAWN_R2_ACCESS_KEY_ID")?,
             secret_key: needed("SPAWN_R2_SECRET_ACCESS_KEY")?,
         };
+        let prefix = prefix_value(env_value("SPAWN_BACKUP_PREFIX"))?;
         let limit_bytes = megabytes("SPAWN_BACKUP_R2_LIMIT_MB", DEFAULT_LIMIT_MB)?;
         let alert_bytes = megabytes("SPAWN_BACKUP_R2_ALERT_MB", DEFAULT_ALERT_MB)?;
         if alert_bytes > limit_bytes {
@@ -343,6 +409,7 @@ SPAWN_BACKUP_R2_LIMIT_MB ({limit_bytes} bytes)"
             transcript_days,
             limit_bytes,
             alert_bytes,
+            prefix,
             drill_url: env_value("SPAWN_BACKUP_DRILL_DATABASE_URL"),
         })
     }
@@ -815,7 +882,7 @@ fn dump(flags: &Flags) -> Result<i32, String> {
     let url = parse_pg_url(&crate::config::required_env("SPAWN_DATABASE_URL")?)?;
     let now_ms = store.now_ms().map_err(|error| error.to_string())?;
     let now = Stamp::at(now_ms);
-    let previous = dump_records(&store, now_ms)?;
+    let previous = dump_records(&store, &settings.prefix, now_ms)?;
     let prior: Vec<(Stamp, i64, u64, bool)> = previous
         .iter()
         .filter_map(|entry| {
@@ -872,9 +939,14 @@ fn dump(flags: &Flags) -> Result<i32, String> {
     let held = list_bucket(&settings)?.0;
     let mut written = 0u64;
     let upload_started = Instant::now();
-    match suspect(events, bytes, newest_good) {
+    // An intended drop (data deliberately removed) is accepted once by the
+    // owner, as `pg-backup.sh --accept-drop` did: the record still names the
+    // drop, under `accepted`, and the dump is stored as a good one.
+    let dropped = suspect(events, bytes, newest_good);
+    let accepted = dropped.is_some() && env_or("SPAWN_BACKUP_ACCEPT_DROP", "0") == "1";
+    match dropped.clone().filter(|_| !accepted) {
         Some(reason) => {
-            let key = format!("postgres/suspect/spawn-{}.dump.gpg", now.text());
+            let key = settings.stored(&format!("postgres/suspect/spawn-{}.dump.gpg", now.text()));
             if within_limit(held, written, stored_bytes, settings.limit_bytes) {
                 put_object(&settings, &key, &encrypted, &sha256, events)?;
                 written = written.saturating_add(stored_bytes);
@@ -886,7 +958,7 @@ fn dump(flags: &Flags) -> Result<i32, String> {
         }
         None => {
             for tier in tiers_for(now, &earlier) {
-                let key = tier.key(&now.text());
+                let key = settings.stored(&tier.key(&now.text()));
                 if !within_limit(held, written, stored_bytes, settings.limit_bytes) {
                     skipped.push(skip(tier.name(), held, written, stored_bytes, &settings));
                     continue;
@@ -919,8 +991,21 @@ fn dump(flags: &Flags) -> Result<i32, String> {
         "upload_ms": upload_ms,
         "duration_ms": i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
     });
+    if accepted {
+        eprintln!(
+            "spawn backup dump: accepted by SPAWN_BACKUP_ACCEPT_DROP: {}",
+            dropped.as_deref().unwrap_or_default()
+        );
+        suspect_reason = None;
+    }
     if let Some(reason) = &suspect_reason {
         record["suspect"] = json!(reason);
+    }
+    if accepted && let Some(target) = record.as_object_mut() {
+        target.insert(
+            "accepted".to_string(),
+            dropped.clone().map_or(Value::Null, Value::String),
+        );
     }
     store
         .backup_record(&record)
@@ -943,7 +1028,10 @@ fn dump(flags: &Flags) -> Result<i32, String> {
     if suspect_reason.is_some() {
         return Ok(3);
     }
-    if !keys.iter().any(|key| key.starts_with("postgres/hourly/")) {
+    if !keys
+        .iter()
+        .any(|key| key.starts_with(&settings.stored("postgres/hourly/")))
+    {
         return Ok(4);
     }
     Ok(0)
@@ -989,13 +1077,36 @@ fn record_refusal(verb: &str, reason: &str) {
     let _ = store.backup_record(&record);
 }
 
+/// Whether `record` (a `backup.dumped` or `backup.bundled`) is this run's
+/// to read: every key it names, with this run's `SPAWN_BACKUP_PREFIX`
+/// stripped, is in the backup namespace (`postgres/` or `bundles/`). A
+/// record from another prefix is not — a measurement's `locktest/...` never
+/// becomes the fleet's bundle base or the drill's subject, and the fleet's
+/// records never chain onto one. With no prefix, a record whose keys are
+/// not in the namespace is another prefix's and is left out.
+fn our_record(prefix: &str, record: &Value) -> bool {
+    let Some(keys) = record["keys"].as_array() else {
+        return false;
+    };
+    !keys.is_empty()
+        && keys.iter().all(|key| {
+            key.as_str()
+                .and_then(|key| key.strip_prefix(prefix))
+                .is_some_and(|key| key.starts_with("postgres/") || key.starts_with("bundles/"))
+        })
+}
+
 /// The earlier `backup.dumped` records, oldest first, with their event ids.
 struct DumpRecord {
     event_id: i64,
     record: Value,
 }
 
-fn dump_records(store: &PostgresStore, now_ms: i64) -> Result<Vec<DumpRecord>, String> {
+fn dump_records(
+    store: &PostgresStore,
+    prefix: &str,
+    now_ms: i64,
+) -> Result<Vec<DumpRecord>, String> {
     let records = store
         .backup_records(
             "backup.dumped",
@@ -1003,15 +1114,22 @@ fn dump_records(store: &PostgresStore, now_ms: i64) -> Result<Vec<DumpRecord>, S
             10_000,
         )
         .map_err(|error| error.to_string())?;
-    Ok(records
+    Ok(read_dump_records(prefix, &records))
+}
+
+/// The store's answer as this run reads it: its own prefix's records only,
+/// oldest first. Excludes `{event_id, record}` rows of other prefixes.
+fn read_dump_records(prefix: &str, records: &Value) -> Vec<DumpRecord> {
+    records
         .as_array()
         .into_iter()
         .flatten()
+        .filter(|entry| our_record(prefix, &entry["record"]))
         .map(|entry| DumpRecord {
             event_id: entry["event_id"].as_i64().unwrap_or_default(),
             record: entry["record"].clone(),
         })
-        .collect())
+        .collect()
 }
 
 /// `pg_dump -Fc` of the database, its password in the environment.
@@ -1240,6 +1358,86 @@ fn percent_encode(text: &str) -> String {
 
 /// Store one object, its ETag checked against the MD5 sent and its metadata
 /// naming the plaintext's sha256 and event count.
+/// The tar as it is stored: compressed with zstd when the host has it,
+/// else gzip, else as it is; and the extension that says which.
+fn compress_bundle(scratch: &Path, tar: &Path) -> Result<(PathBuf, &'static str), String> {
+    for (program, arguments, extension) in [
+        ("zstd", vec!["-q", "-3", "-f", "-o"], "tar.zst"),
+        ("gzip", vec!["-6", "-c", "-n"], "tar.gz"),
+    ] {
+        let out = scratch.join(extension);
+        let mut command = Command::new(program);
+        if program == "gzip" {
+            // gzip writes to stdout.
+            let file = File::create(&out).map_err(|error| format!("{}: {error}", out.display()))?;
+            command.args(&arguments).arg(tar).stdout(Stdio::from(file));
+        } else {
+            command.args(&arguments).arg(&out).arg(tar);
+        }
+        match command.output() {
+            Ok(run) if run.status.success() => return Ok((out, extension)),
+            // Not installed: the next one.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(run) => {
+                return Err(format!(
+                    "{program}: {}",
+                    String::from_utf8_lossy(&run.stderr).trim()
+                ));
+            }
+            Err(error) => return Err(format!("{program}: {error}")),
+        }
+    }
+    let plain = scratch.join("tar");
+    fs::copy(tar, &plain).map_err(|error| format!("{}: {error}", plain.display()))?;
+    Ok((plain, "tar"))
+}
+
+/// What the first bytes of a stored bundle say it is: `gzip`, `zstd`, or
+/// `plain` (the tar itself). The key's extension says the same; a restore
+/// trusts the magic.
+fn bundle_compression(magic: &[u8]) -> &'static str {
+    match magic {
+        [0x1f, 0x8b, ..] => "gzip",
+        [0x28, 0xb5, 0x2f, 0xfd, ..] => "zstd",
+        _ => "plain",
+    }
+}
+
+/// `archive` decompressed back to the tar it was made from, by its magic:
+/// what `compress_bundle` did, undone.
+fn decompress_bundle(scratch: &Path, archive: &Path) -> Result<(PathBuf, &'static str), String> {
+    let mut magic = Vec::with_capacity(4);
+    let file = File::open(archive).map_err(|error| format!("{}: {error}", archive.display()))?;
+    file.take(4)
+        .read_to_end(&mut magic)
+        .map_err(|error| format!("{}: {error}", archive.display()))?;
+    let compression = bundle_compression(&magic);
+    let tar = scratch.join("bundle.tar");
+    let program = match compression {
+        "gzip" => Some(("gzip", vec!["-dc"])),
+        "zstd" => Some(("zstd", vec!["-q", "-dc"])),
+        _ => None,
+    };
+    let Some((program, arguments)) = program else {
+        fs::copy(archive, &tar).map_err(|error| format!("{}: {error}", tar.display()))?;
+        return Ok((tar, compression));
+    };
+    let out = File::create(&tar).map_err(|error| format!("{}: {error}", tar.display()))?;
+    let run = Command::new(program)
+        .args(&arguments)
+        .arg(archive)
+        .stdout(Stdio::from(out))
+        .output()
+        .map_err(|error| format!("{program}: {error}"))?;
+    if !run.status.success() {
+        return Err(format!(
+            "{program}: {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        ));
+    }
+    Ok((tar, compression))
+}
+
 fn put_object(
     settings: &Settings,
     key: &str,
@@ -1282,7 +1480,11 @@ struct BundleRecord {
     record: Value,
 }
 
-fn bundle_records(store: &PostgresStore, now_ms: i64) -> Result<Vec<BundleRecord>, String> {
+fn bundle_records(
+    store: &PostgresStore,
+    prefix: &str,
+    now_ms: i64,
+) -> Result<Vec<BundleRecord>, String> {
     let records = store
         .backup_records(
             "backup.bundled",
@@ -1290,16 +1492,37 @@ fn bundle_records(store: &PostgresStore, now_ms: i64) -> Result<Vec<BundleRecord
             10_000,
         )
         .map_err(|error| error.to_string())?;
-    Ok(records
+    Ok(read_bundle_records(prefix, &records))
+}
+
+/// The store's answer as this run reads it: its own prefix's records only,
+/// oldest first — so a measurement's full bundle under `SPAWN_BACKUP_PREFIX`
+/// is never the fleet's base, and the fleet's never a measurement's.
+fn read_bundle_records(prefix: &str, records: &Value) -> Vec<BundleRecord> {
+    records
         .as_array()
         .into_iter()
         .flatten()
+        .filter(|entry| our_record(prefix, &entry["record"]))
         .map(|entry| BundleRecord {
             event_id: entry["event_id"].as_i64().unwrap_or_default(),
             at_ms: entry["at_ms"].as_i64().unwrap_or_default(),
             record: entry["record"].clone(),
         })
-        .collect())
+        .collect()
+}
+
+/// The earlier bundles as the full/increment decision reads them: when each
+/// ran, whether it was full, and its week's stamp from its own key.
+fn bundle_stamps(earlier: &[BundleRecord]) -> Vec<(Stamp, bool, i64)> {
+    earlier
+        .iter()
+        .filter_map(|entry| {
+            let key = entry.record["keys"].as_array()?.first()?.as_str()?;
+            let kind = entry.record["kind"].as_str()?;
+            Some((Stamp::parse(key)?, kind == "full", entry.at_ms))
+        })
+        .collect()
 }
 
 /// The files of the transcript archive modified within `days` days, relative
@@ -1436,16 +1659,9 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
     let store = open_store()?;
     let now_ms = store.now_ms().map_err(|error| error.to_string())?;
     let now = Stamp::at(now_ms);
-    let earlier = bundle_records(&store, now_ms)?;
+    let earlier = bundle_records(&store, &settings.prefix, now_ms)?;
     let base = earlier.last();
-    let stamps: Vec<(Stamp, bool, i64)> = earlier
-        .iter()
-        .filter_map(|entry| {
-            let key = entry.record["keys"].as_array()?.first()?.as_str()?;
-            let kind = entry.record["kind"].as_str()?;
-            Some((Stamp::parse(key)?, kind == "full", entry.at_ms))
-        })
-        .collect();
+    let stamps = bundle_stamps(&earlier);
     let full = full_bundle(now, &stamps, now_ms);
     let sources = store
         .mission_sources()
@@ -1501,6 +1717,22 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
             missing.push(source.to_string());
             continue;
         };
+        // A source with no branches and no tags has nothing of the mission in
+        // the archive, and `git bundle create` refuses to make an empty one:
+        // the record says so by name (`empty`) and the manifest names no file,
+        // so nothing is left to a git error, and a restore of it makes an
+        // empty repository.
+        if heads.is_empty() {
+            repos_record.push(json!({
+                "source": source, "file": Value::Null, "heads": {}, "refs": 0, "bytes": 0,
+                "unchanged": false, "empty": true,
+            }));
+            repos_manifest.push(json!({
+                "source": source, "file": Value::Null, "heads": {},
+                "unchanged": false, "empty": true,
+            }));
+            continue;
+        }
         let refs = heads.len();
         let base_repos = base
             .and_then(|base| base.record["repos"].as_array().cloned())
@@ -1510,23 +1742,6 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
             .find(|repo| repo["source"].as_str() == Some(source))
             .and_then(|repo| repo["heads"].as_object().cloned())
             .unwrap_or_default();
-        let unchanged = !full
-            && base.is_some()
-            && base_heads.len() == heads.len()
-            && heads.iter().all(|(name, commit)| {
-                base_heads.get(name).and_then(Value::as_str) == Some(commit.as_str())
-            });
-        if unchanged {
-            repos_record.push(json!({
-                "source": source, "heads": heads, "refs": refs, "bytes": 0, "unchanged": true,
-            }));
-            repos_manifest.push(json!({
-                "source": source, "file": Value::Null, "heads": heads, "unchanged": true,
-            }));
-            continue;
-        }
-        let name = source_name(source, &mut taken, index);
-        let file = scratch.join(format!("{name}.bundle"));
         let not: Vec<String> = if full {
             Vec::new()
         } else {
@@ -1537,20 +1752,107 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
                 .map(str::to_string)
                 .collect()
         };
+        // What changed against the base, by ref name: `added` (a ref the
+        // base did not have), `moved` (one both have at different commits)
+        // and `removed` (one the base had). An increment's record says it, so
+        // a reader need not diff two records to see what the day did; its
+        // `bundled` list says which of them the archive actually holds.
+        let delta = json!({
+            "added": heads
+                .keys()
+                .filter(|name| !base_heads.contains_key(name.as_str()))
+                .cloned()
+                .collect::<Vec<String>>(),
+            "moved": heads
+                .iter()
+                .filter(|(name, commit)| {
+                    base_heads
+                        .get(name.as_str())
+                        .and_then(Value::as_str)
+                        .is_some_and(|held| held != commit.as_str())
+                })
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<String>>(),
+            "removed": base_heads
+                .keys()
+                .filter(|name| !heads.contains_key(name.as_str()))
+                .cloned()
+                .collect::<Vec<String>>(),
+        });
+        let unchanged = !full
+            && base.is_some()
+            && base_heads.len() == heads.len()
+            && heads.iter().all(|(name, commit)| {
+                base_heads.get(name).and_then(Value::as_str) == Some(commit.as_str())
+            });
+        if unchanged {
+            repos_record.push(json!({
+                "source": source, "file": Value::Null, "heads": heads, "refs": refs,
+                "bytes": 0, "unchanged": true,
+            }));
+            repos_manifest.push(json!({
+                "source": source, "file": Value::Null, "heads": heads, "unchanged": true,
+            }));
+            continue;
+        }
+        // An increment whose refs all point into the base — a tag added at a
+        // commit the base already holds, a branch removed — would write no
+        // bytes, and `git bundle create` refuses to make an empty one. The
+        // run says it by name instead: the entry names the refs that changed
+        // (the delta) and no file, so a reader can tell "the source moved in
+        // a way that needs no bytes" from "the bundle failed".
+        if !full && !bundle_would_write(source, &not)? {
+            repos_record.push(json!({
+                "source": source, "file": Value::Null, "heads": heads, "refs": refs,
+                "bytes": 0, "unchanged": false, "delta": delta, "bundled": [],
+            }));
+            repos_manifest.push(json!({
+                "source": source, "file": Value::Null, "heads": heads, "unchanged": false,
+                "delta": delta, "bundled": [],
+            }));
+            continue;
+        }
+        let name = source_name(source, &mut taken, index);
+        let file = scratch.join(format!("{name}.bundle"));
         git_bundle(source, &file, &not)?;
+        // What the bundle actually holds. An increment says it by name:
+        // `--not` leaves out a ref whose tip the base has, so the manifest's
+        // `heads` is not the same as its ref list, and the drill compares the
+        // bundle with this rather than inferring it from the base.
+        let bundled: Vec<Value> = if full {
+            Vec::new()
+        } else {
+            bundle_refs(&file)?
+                .into_iter()
+                .map(|(commit, name)| json!({"commit": commit, "ref": name}))
+                .collect()
+        };
         let bytes = fs::metadata(&file)
             .map_err(|error| format!("{}: {error}", file.display()))?
             .len();
         let relative = format!("repos/{name}.bundle");
         fs::copy(&file, staging.join(&relative))
             .map_err(|error| format!("{}: {error}", file.display()))?;
-        repos_record.push(json!({
-            "source": source, "heads": heads, "refs": refs, "bytes": bytes,
-            "unchanged": false, "file": relative,
-        }));
-        repos_manifest.push(json!({
-            "source": source, "file": relative, "heads": heads, "unchanged": false,
-        }));
+        // A full bundle holds every head, so its entry needs no `bundled`;
+        // an increment's holds a subset and says which.
+        if full {
+            repos_record.push(json!({
+                "source": source, "file": relative, "heads": heads, "refs": refs,
+                "bytes": bytes, "unchanged": false,
+            }));
+            repos_manifest.push(json!({
+                "source": source, "file": relative, "heads": heads, "unchanged": false,
+            }));
+        } else {
+            repos_record.push(json!({
+                "source": source, "file": relative, "heads": heads, "refs": refs,
+                "bytes": bytes, "unchanged": false, "delta": delta, "bundled": bundled,
+            }));
+            repos_manifest.push(json!({
+                "source": source, "file": relative, "heads": heads, "unchanged": false,
+                "delta": delta, "bundled": bundled,
+            }));
+        }
     }
 
     let manifest = json!({
@@ -1582,24 +1884,33 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
     if !ok {
         return Err(format!("tar: {}", stderr.trim()));
     }
-    let bytes = fs::metadata(&tar)
-        .map_err(|error| format!("{}: {error}", tar.display()))?
+    // A tar of transcripts is mostly text: zstd (fast, and what the drill's
+    // other copies use) or gzip when there is no zstd; plain when neither.
+    // The stored key names what it holds, and a restore sniffs the magic
+    // anyway (objective 031's contract: plain, gzip or zstd).
+    let (archive, extension) = compress_bundle(&scratch.join(""), &tar)?;
+    let bytes = fs::metadata(&archive)
+        .map_err(|error| format!("{}: {error}", archive.display()))?
         .len();
-    let sha256 = sha256_file(&tar)?;
+    let sha256 = sha256_file(&archive)?;
     let encrypted = scratch.join("bundle.gpg");
-    encrypt(&settings, &tar, &encrypted)?;
+    encrypt(&settings, &archive, &encrypted)?;
     let stored_bytes = fs::metadata(&encrypted)
         .map_err(|error| format!("{}: {error}", encrypted.display()))?
         .len();
     let back = scratch.join("bundle.back");
     decrypt(&settings, &encrypted, &back)?;
     if sha256_file(&back)? != sha256 {
-        return Err("the encrypted bundle does not decrypt to the tar".to_string());
+        return Err("the encrypted bundle does not decrypt to the archive".to_string());
     }
 
     let held = list_bucket(&settings)?.0;
     let tier = if full { "full" } else { "incr" };
-    let key = format!("bundles/{}/spawn-bundle-{}.tar.gpg", tier, now.text());
+    let key = settings.stored(&format!(
+        "bundles/{}/spawn-bundle-{}.{extension}.gpg",
+        tier,
+        now.text()
+    ));
     let mut keys: Vec<String> = Vec::new();
     let mut skipped: Vec<Value> = Vec::new();
     let mut written = 0u64;
@@ -1686,13 +1997,19 @@ fn append_slice(source: &Path, target: &Path, offset: u64, size: u64) -> Result<
     Ok(())
 }
 
-/// A git bundle of every ref of `source`, but not `not`'s commits.
+/// A git bundle of `source`'s branches and tags, but not `not`'s commits:
+/// exactly the refs `heads_of` puts in the record, so the record describes
+/// everything the archive holds (and nothing else, which `verify` refuses).
+/// `--all` would also carry refs/remotes/* (live `supply-pa.git` has
+/// `refs/remotes/github/main` from the mirror clone it was seeded as) and any
+/// `refs/spawn-owner/*` request: neither is the mission's history, and a
+/// record that names neither could not describe a bundle that holds them.
 fn git_bundle(source: &str, file: &Path, not: &[String]) -> Result<(), String> {
     let mut command = crate::sources::controller_git();
     command
         .args(["-C", source, "bundle", "create"])
         .arg(file)
-        .arg("--all");
+        .args(["--branches", "--tags"]);
     if !not.is_empty() {
         command.arg("--not");
         for commit in not {
@@ -1706,6 +2023,61 @@ fn git_bundle(source: &str, file: &Path, not: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The refs a bundle file lists, `(commit, ref)` and no `HEAD`: what an
+/// increment's manifest records as `bundled`, so the archive says which refs
+/// it holds instead of a reader inferring them from the base.
+fn bundle_refs(file: &Path) -> Result<Vec<(String, String)>, String> {
+    let mut command = crate::sources::controller_git();
+    command.args(["bundle", "list-heads"]).arg(file);
+    let (ok, stdout, stderr) = output(command, "git bundle list-heads")?;
+    if !ok {
+        return Err(format!(
+            "git bundle list-heads {}: {}",
+            file.display(),
+            stderr.trim()
+        ));
+    }
+    Ok(stdout
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter(|(_, name)| *name != "HEAD")
+        .map(|(commit, name)| (commit.to_string(), name.to_string()))
+        .collect())
+}
+
+/// Whether a bundle of `source`'s branches and tags, but not `not`'s, would
+/// carry anything at all: when it would not (every ref points into the base)
+/// `git bundle create` refuses to make an empty bundle, and an increment says
+/// so by name before it asks (`bundle`). The object listing, not a commit
+/// count: an annotated tag at a commit the base already holds is an object
+/// outside it, and a bundle of just that tag is not empty.
+fn bundle_would_write(source: &str, not: &[String]) -> Result<bool, String> {
+    let mut command = crate::sources::controller_git();
+    command.args([
+        "-C",
+        source,
+        "rev-list",
+        "--objects",
+        "--max-count=1",
+        "--branches",
+        "--tags",
+    ]);
+    if !not.is_empty() {
+        command.arg("--not");
+        for commit in not {
+            command.arg(commit);
+        }
+    }
+    let (ok, stdout, stderr) = output(command, "git rev-list --objects")?;
+    if !ok {
+        return Err(format!(
+            "git rev-list --objects {source}: {}",
+            stderr.trim()
+        ));
+    }
+    Ok(stdout.lines().next().is_some())
+}
+
 /// What the drill restored and where, for its record.
 #[derive(Debug, Default, Clone)]
 struct Drilled {
@@ -1715,7 +2087,9 @@ struct Drilled {
 }
 
 /// `spawn backup verify`: the newest good dump restored into a database of
-/// its own and compared with its record.
+/// its own and compared with its record, then the newest bundle opened and
+/// compared with its own.
+#[allow(clippy::too_many_lines)]
 fn verify(flags: &Flags) -> Result<i32, String> {
     let started = Instant::now();
     let settings = match Settings::from_env(flags) {
@@ -1749,7 +2123,7 @@ fn verify(flags: &Flags) -> Result<i32, String> {
         return Ok(2);
     };
     let now_ms = store.now_ms().map_err(|error| error.to_string())?;
-    let dumps = dump_records(&store, now_ms)?;
+    let dumps = dump_records(&store, &settings.prefix, now_ms)?;
     let latest = dumps.iter().rev().find(|entry| {
         entry.record["suspect"].is_null()
             && entry.record["keys"]
@@ -1786,7 +2160,7 @@ fn verify(flags: &Flags) -> Result<i32, String> {
         "expected": expected,
     });
     let outcome = restore_and_compare(&settings, &drill_url, latest);
-    let (ok, reason, drilled) = match outcome {
+    let (mut ok, mut reason, drilled) = match outcome {
         Ok(drilled) => (true, String::new(), drilled),
         Err(RestoreError { reason, drilled }) => (false, reason, drilled),
     };
@@ -1798,6 +2172,24 @@ fn verify(flags: &Flags) -> Result<i32, String> {
             .map(|url| url.server())
             .unwrap_or_default()
     );
+    // The dump proves the database restores. The bundle — the sources and the
+    // transcripts — is the other half of what leaves the host, and the newest
+    // one is opened the same way: fetched, decrypted, decompressed by its
+    // magic, unpacked, its manifest and every repo's bundle opened, every
+    // transcript file it names counted. Checked only when the dump restored:
+    // a failed drill is already the day's verdict, and the reason names it.
+    if ok {
+        match verify_bundle(&settings, &store, now_ms) {
+            Ok(check) => record["bundle"] = check,
+            Err(error) => {
+                // A failed check says so itself: a reader that greps `.bundle.checked` alone must not
+                // read this as a pass (the record's top-level ok is false too).
+                record["bundle"] = json!({"checked": true, "ok": false, "reason": error.clone()});
+                ok = false;
+                reason = error;
+            }
+        }
+    }
     let code = if ok {
         record_verified(Some(&store), true, "", &record, &drilled, started);
         0
@@ -1807,16 +2199,287 @@ fn verify(flags: &Flags) -> Result<i32, String> {
     };
     if ok {
         println!(
-            "spawn backup verify: {} restored to its record ({} events, max id {}) into {}",
+            "spawn backup verify: {} restored to its record ({} events, max id {}) into {}; {}",
             key,
             record["events"],
             record["max_event_id"],
-            drilled.database.as_deref().unwrap_or("a scratch database")
+            drilled.database.as_deref().unwrap_or("a scratch database"),
+            match record["bundle"]["checked"].as_bool() {
+                Some(true) => format!(
+                    "the bundle {} opens ({} repos, {} transcript files)",
+                    record["bundle"]["key"].as_str().unwrap_or_default(),
+                    record["bundle"]["repos"].as_i64().unwrap_or_default(),
+                    record["bundle"]["transcripts"]["files"]
+                        .as_i64()
+                        .unwrap_or_default()
+                ),
+                _ => String::from("no bundle to open yet"),
+            }
         );
     } else {
         eprintln!("spawn backup verify: {reason}");
     }
     Ok(code)
+}
+
+/// The bundle half of the drill: the newest `backup.bundled` record with a
+/// key, fetched, checked against its record's sha256, decrypted,
+/// decompressed by its magic and unpacked; its `manifest.json` compared with
+/// the record (kind, transcript file count and bytes), every transcript file
+/// it names found at its recorded size, and every repo's `git bundle`
+/// opened — its heads listed, and for a full bundle verified alone (an
+/// increment's prerequisites are the base's commits, which a drill does not
+/// fetch). A store with no bundle yet says so and passes: there is nothing
+/// to open.
+#[allow(clippy::too_many_lines)]
+fn verify_bundle(settings: &Settings, store: &PostgresStore, now_ms: i64) -> Result<Value, String> {
+    let earlier = bundle_records(store, &settings.prefix, now_ms)?;
+    let Some(latest) = earlier.iter().rev().find(|entry| {
+        entry.record["keys"]
+            .as_array()
+            .is_some_and(|keys| !keys.is_empty())
+    }) else {
+        return Ok(json!({"checked": false, "reason": "no backup.bundled record with a key"}));
+    };
+    let key = latest.record["keys"][0].as_str().unwrap_or_default();
+    let expected_sha = latest.record["sha256"].as_str().unwrap_or_default();
+    let kind = latest.record["kind"].as_str().unwrap_or_default();
+    let Some((bytes, headers)) = get_object_bytes(settings, key)? else {
+        return Err(format!("the bucket does not hold the bundle {key}"));
+    };
+    if let Some(meta) = header_value(&headers, "x-amz-meta-sha256")
+        && meta != expected_sha
+    {
+        return Err(format!(
+            "the bundle's x-amz-meta-sha256 {meta} is not the record's {expected_sha}"
+        ));
+    }
+    let scratch = Scratch::new("verify-bundle")?;
+    let encrypted = scratch.join("bundle.gpg");
+    fs::write(&encrypted, &bytes).map_err(|error| format!("{}: {error}", encrypted.display()))?;
+    let raw = scratch.join("bundle.raw");
+    decrypt(settings, &encrypted, &raw)?;
+    let found = sha256_file(&raw)?;
+    if found != expected_sha {
+        return Err(format!(
+            "the bundle's sha256 {found} is not the record's {expected_sha}"
+        ));
+    }
+    let (tar, compression) = decompress_bundle(&scratch.join(""), &raw)?;
+    let unpacked = scratch.join("unpacked");
+    fs::create_dir_all(&unpacked).map_err(|error| format!("{}: {error}", unpacked.display()))?;
+    let (ok, _stdout, stderr) = output(
+        {
+            let mut command = Command::new("tar");
+            command.arg("-xf").arg(&tar).arg("-C").arg(&unpacked);
+            command
+        },
+        "tar -xf",
+    )?;
+    if !ok {
+        return Err(format!(
+            "the bundle {key} is no tar archive ({compression}): {}",
+            stderr.trim()
+        ));
+    }
+    let manifest_path = unpacked.join("manifest.json");
+    let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).map_err(|error| {
+        format!("the bundle {key} holds no manifest.json ({compression}): {error}")
+    })?)
+    .map_err(|error| format!("the bundle's manifest.json: {error}"))?;
+    let manifest_kind = manifest["kind"].as_str().unwrap_or_default();
+    if manifest_kind != kind {
+        return Err(format!(
+            "the bundle's manifest says {manifest_kind:?}; its record says {kind:?}"
+        ));
+    }
+    let entries = manifest["transcripts"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut files = 0i64;
+    let mut held = 0u64;
+    for entry in &entries {
+        let path = entry["path"].as_str().unwrap_or_default();
+        let want = entry["bytes"].as_u64().unwrap_or(0);
+        let size = fs::metadata(unpacked.join("transcripts").join(path))
+            .map_err(|_| format!("the bundle holds no transcripts/{path}"))?
+            .len();
+        if size != want {
+            return Err(format!(
+                "the bundle's transcripts/{path} is {size} bytes; its manifest says {want}"
+            ));
+        }
+        files += 1;
+        held = held.saturating_add(size);
+    }
+    let want_files = latest.record["transcripts"]["files"].as_i64().unwrap_or(-1);
+    let want_bytes = latest.record["transcripts"]["bytes"].as_u64().unwrap_or(0);
+    if files != want_files || held != want_bytes {
+        return Err(format!(
+            "the bundle holds {files} transcript files ({held} bytes); its record says {want_files} ({want_bytes})"
+        ));
+    }
+    let mut repos = 0i64;
+    let mut alone: Vec<String> = Vec::new();
+    // A full bundle carries everything it needs: an empty repository verifies
+    // it. An increment's prerequisites are its base's commits, which the
+    // drill does not fetch, so only its heads are opened.
+    let empty = scratch.join("empty.git");
+    if kind == "full" {
+        let (ok, _stdout, stderr) = output(
+            {
+                let mut command = crate::sources::controller_git();
+                command.args(["init", "-q", "--bare"]).arg(&empty);
+                command
+            },
+            "git init --bare",
+        )?;
+        if !ok {
+            return Err(format!("git init --bare: {}", stderr.trim()));
+        }
+    }
+    for repo in manifest["repos"].as_array().cloned().unwrap_or_default() {
+        let Some(file) = repo["file"].as_str() else {
+            continue; // unchanged since the base: nothing of it is in this bundle
+        };
+        let source = repo["source"].as_str().unwrap_or_default();
+        let named: Vec<(String, String)> = repo["heads"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(name, commit)| {
+                (
+                    commit.as_str().unwrap_or_default().to_string(),
+                    name.clone(),
+                )
+            })
+            .collect();
+        let bundle = unpacked.join(file);
+        let (ok, stdout, stderr) = output(
+            {
+                let mut command = crate::sources::controller_git();
+                command.args(["bundle", "list-heads"]).arg(&bundle);
+                command
+            },
+            "git bundle list-heads",
+        )?;
+        if !ok {
+            return Err(format!(
+                "{source}'s bundle in {key} does not open: {}",
+                stderr.trim()
+            ));
+        }
+        // `git bundle list-heads` prints the full refname, as the manifest
+        // records it (`refs/heads/...`, `refs/tags/...`), and HEAD beside it.
+        let listed: BTreeSet<(String, String)> = stdout
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .filter(|(_, name)| *name != "HEAD")
+            .map(|(commit, name)| (commit.to_string(), name.to_string()))
+            .collect();
+        let unknown: Vec<String> = listed
+            .iter()
+            .filter(|pair| !named.contains(*pair))
+            .map(|(commit, name)| format!("{name} at {commit}"))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "{source}'s bundle in {key} lists {} the manifest does not name",
+                unknown.join(", ")
+            ));
+        }
+        // A full bundle names every head. An increment's bundle lists only
+        // the refs whose tips the base does not hold (`--not` drops a ref
+        // that did not move, and one whose new commit the base already has),
+        // so its manifest says which refs it holds (`bundled`) and the bundle
+        // must list exactly those — not what a reader, or this drill, would
+        // infer from the base.
+        let mut required: Vec<(String, String)> = Vec::new();
+        if kind == "full" {
+            required.clone_from(&named);
+        } else {
+            required.extend(
+                repo["bundled"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| {
+                        Some((
+                            entry["commit"].as_str()?.to_string(),
+                            entry["ref"].as_str()?.to_string(),
+                        ))
+                    }),
+            );
+            // `bundled` is a subset of `heads`: a ref the bundle holds is one
+            // the source has, at the same commit.
+            let inconsistent: Vec<String> = required
+                .iter()
+                .filter(|pair| !named.contains(*pair))
+                .map(|(commit, name)| format!("{name} at {commit}"))
+                .collect();
+            if !inconsistent.is_empty() {
+                return Err(format!(
+                    "{source}'s manifest records as bundled {} not among its heads",
+                    inconsistent.join(", ")
+                ));
+            }
+            if required.is_empty() {
+                return Err(format!(
+                    "{source}'s bundle in {key} is an increment that holds no ref"
+                ));
+            }
+        }
+        let missing: Vec<String> = required
+            .iter()
+            .filter(|pair| !listed.contains(*pair))
+            .map(|(commit, name)| format!("{name} at {commit}"))
+            .collect();
+        if !missing.is_empty() || (listed.is_empty() && kind != "full") {
+            return Err(format!(
+                "{source}'s bundle in {key} does not list {}",
+                if missing.is_empty() {
+                    String::from("any head (an empty bundle)")
+                } else {
+                    missing.join(", ")
+                }
+            ));
+        }
+        if kind == "full" {
+            let (ok, _stdout, stderr) = output(
+                {
+                    let mut command = crate::sources::controller_git();
+                    command
+                        .arg("--git-dir")
+                        .arg(&empty)
+                        .args(["bundle", "verify", "-q"])
+                        .arg(&bundle);
+                    command
+                },
+                "git bundle verify",
+            )?;
+            if !ok {
+                return Err(format!(
+                    "{source}'s full bundle in {key} does not verify alone: {}",
+                    stderr.trim()
+                ));
+            }
+            alone.push(source.to_string());
+        }
+        repos += 1;
+    }
+    Ok(json!({
+        "checked": true,
+        "ok": true,
+        "key": key,
+        "bundled_event_id": latest.event_id,
+        "kind": kind,
+        "sha256": expected_sha,
+        "compression": compression,
+        "repos": repos,
+        "verified_alone": alone,
+        "transcripts": {"files": files, "bytes": held},
+    }))
 }
 
 /// A drill that failed, with what it had made when it did.
@@ -2154,6 +2817,7 @@ fn record_verified(
         "max_event_id": drilled.max_event_id,
         "database": drilled.database,
         "server": naming.get("server").cloned().unwrap_or(Value::Null),
+        "bundle": naming.get("bundle").cloned().unwrap_or(Value::Null),
         "duration_ms": i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
     });
     if record["server"].is_null()
@@ -2168,12 +2832,141 @@ fn record_verified(
 #[cfg(test)]
 mod tests {
     use super::{
-        Stamp, Tier, copy_events, full_bundle, md5_hex, parse_env_file, parse_listing,
-        parse_pg_url, server_major, suspect, tiers_for, transcript_offset, window_files,
-        within_limit, without_transaction_timeout,
+        Stamp, Tier, bundle_compression, bundle_stamps, copy_events, full_bundle, md5_hex,
+        parse_env_file, parse_listing, parse_pg_url, read_bundle_records, read_dump_records,
+        server_major, suspect, tiers_for, transcript_offset, window_files, within_limit,
+        without_transaction_timeout,
     };
+
+    /// `SPAWN_BACKUP_PREFIX` is a bucket prefix and nothing else: unset or
+    /// empty keeps the fleet's keys; a test's `locktest/` puts every object
+    /// under it; anything that could leave the namespace is refused.
+    #[test]
+    fn the_prefix_is_a_key_prefix_or_nothing() {
+        assert_eq!(super::prefix_value(None), Ok(String::new()));
+        assert_eq!(super::prefix_value(Some(String::new())), Ok(String::new()));
+        assert_eq!(super::prefix_value(Some("  ".into())), Ok(String::new()));
+        assert_eq!(
+            super::prefix_value(Some("locktest/".into())),
+            Ok("locktest/".into())
+        );
+        for bad in [
+            "locktest",
+            "/locktest/",
+            "a//b/",
+            "../x/",
+            "a/../b/",
+            "s3://x/",
+            "a b/",
+        ] {
+            assert!(
+                super::prefix_value(Some(bad.into())).is_err(),
+                "{bad:?} was accepted"
+            );
+        }
+    }
     use serde_json::json;
     use std::fs;
+
+    /// A stored bundle is read by its magic, not by its name: gzip's `1f 8b`,
+    /// zstd's `28 b5 2f fd`, and anything else is the tar itself.
+    #[test]
+    fn a_stored_bundle_is_read_by_its_magic() {
+        assert_eq!(bundle_compression(&[0x1f, 0x8b, 0x08, 0x00]), "gzip");
+        assert_eq!(bundle_compression(&[0x28, 0xb5, 0x2f, 0xfd]), "zstd");
+        assert_eq!(bundle_compression(b"repo/"), "plain");
+        assert_eq!(bundle_compression(&[0x28, 0xb5]), "plain");
+        assert_eq!(bundle_compression(&[]), "plain");
+    }
+
+    /// A full bundle under a measurement's `SPAWN_BACKUP_PREFIX` is not the
+    /// fleet's to read: with yesterday's scratch-prefix full in the store,
+    /// today's fleet run is still a *full* (there is no recent full of its
+    /// own to be an increment of) and its base names no key of the
+    /// measurement's. A run under `locktest/` sees only its own, the other
+    /// way round. The dump pick the drill makes is isolated the same way.
+    #[test]
+    fn a_scratch_prefix_full_is_never_anothers_base() {
+        let now_ms = 1_794_110_400_000i64; // 2026-11-08 04:00 UTC
+        let scratch_ms = now_ms - 86_400_000; // yesterday: the same ISO week
+        let fleet_ms = now_ms - 21 * 86_400_000;
+        let key = |prefix: &str, stamp: &str, full: bool| {
+            if full {
+                format!("{prefix}bundles/full/spawn-bundle-{stamp}.tar.zst.gpg")
+            } else {
+                format!("{prefix}postgres/hourly/spawn-{stamp}.dump.gpg")
+            }
+        };
+        let store_answer = json!([
+            {"event_id": 1, "at_ms": fleet_ms, "record": {
+                "type": "backup.bundled", "kind": "full",
+                "keys": [key("", "20261018-040000", true)],
+                "transcripts": {"sizes": {"a.jsonl": 5_000_000}},
+            }},
+            {"event_id": 2, "at_ms": scratch_ms, "record": {
+                "type": "backup.bundled", "kind": "full",
+                "keys": [key("locktest/", "20261107-040000", true)],
+                "transcripts": {"sizes": {"a.jsonl": 9_000_000}},
+            }},
+        ]);
+        let fleet = read_bundle_records("", &store_answer);
+        assert_eq!(fleet.len(), 1, "the scratch-prefix full was read");
+        assert_eq!(fleet[0].event_id, 1);
+        assert_eq!(
+            fleet
+                .last()
+                .and_then(|base| base.record["transcripts"]["sizes"]["a.jsonl"].as_u64()),
+            Some(5_000_000),
+            "the base is the fleet's own full"
+        );
+        assert!(
+            full_bundle(stamp("20261108-040000"), &bundle_stamps(&fleet), now_ms),
+            "today's fleet run chained onto the measurement's full"
+        );
+        // Unfiltered, the same store answer would have made it an increment.
+        let all: Vec<super::BundleRecord> = store_answer
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| super::BundleRecord {
+                event_id: entry["event_id"].as_i64().unwrap(),
+                at_ms: entry["at_ms"].as_i64().unwrap(),
+                record: entry["record"].clone(),
+            })
+            .collect();
+        assert!(
+            !full_bundle(stamp("20261108-040000"), &bundle_stamps(&all), now_ms),
+            "the fixture no longer shows what the filter prevents"
+        );
+
+        let scratch = read_bundle_records("locktest/", &store_answer);
+        assert_eq!(scratch.len(), 1);
+        assert_eq!(scratch[0].event_id, 2);
+        assert!(!full_bundle(
+            stamp("20261108-040000"),
+            &bundle_stamps(&scratch),
+            now_ms
+        ));
+
+        let dumps = json!([
+            {"event_id": 3, "at_ms": fleet_ms, "record": {
+                "type": "backup.dumped", "keys": [key("", "20261018-040000", false)],
+                "suspect": null,
+            }},
+            {"event_id": 4, "at_ms": scratch_ms, "record": {
+                "type": "backup.dumped", "keys": [key("locktest/", "20261107-040000", false)],
+                "suspect": null,
+            }},
+        ]);
+        let ids = |prefix: &str| {
+            read_dump_records(prefix, &dumps)
+                .into_iter()
+                .map(|entry| entry.event_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(""), vec![3]);
+        assert_eq!(ids("locktest/"), vec![4]);
+    }
 
     fn stamp(text: &str) -> Stamp {
         Stamp::parse(text).expect("a stamp")

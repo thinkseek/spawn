@@ -661,17 +661,21 @@ timers, the bucket's lifecycle and lock rules and the README are the owner's
 - `backup.bundled {kind, base_event_id, keys, tiers, skipped, sha256, bytes,
   stored_bytes, repos, missing, transcripts, held_bytes, written_bytes,
   alert_bytes, limit_bytes, over_alert, duration_ms}` — one encrypted tar
-  holding `manifest.json`, a git bundle of every mission source (whole, or
-  `--not` its base's heads) and the transcript archive's files of the last
-  `SPAWN_BACKUP_TRANSCRIPT_DAYS` (14) days, whole or the bytes appended
-  since its base's recorded sizes.
+  holding `manifest.json`, a git bundle of every mission source's branches
+  and tags (whole, or `--not` its base's heads; a source with none is
+  recorded `empty`, an increment records its `delta` (added, moved, removed
+  refs) and the `bundled` refs its bundle holds, and one that needs no bytes
+  has no file) and the transcript archive's files of the last
+  `SPAWN_BACKUP_TRANSCRIPT_DAYS` (14) days, whole or the bytes appended since
+  its base's recorded sizes.
 - `backup.verified {ok, reason, key, sha256, dumped_event_id, expected,
-  events, max_event_id, database, server, duration_ms}` — the restore drill:
-  the newest good dump fetched, decrypted, restored into a database of its
-  own on `SPAWN_BACKUP_DRILL_DATABASE_URL` (never the source), its events and
-  watermark compared with that record's (never with the live database), and
-  the database dropped. Exit 0 restores to the record; 1 does not; 2 cannot
-  run.
+  events, max_event_id, database, server, bundle, duration_ms}` — the restore
+  drill: the newest good dump fetched, decrypted, restored into a database of
+  its own on `SPAWN_BACKUP_DRILL_DATABASE_URL` (never the source), its events
+  and watermark compared with that record's (never with the live database),
+  the database dropped, and the newest bundle fetched, unpacked and compared
+  with its own record (`bundle`: `checked`, the key, kind, repos, verified
+  alone, transcripts). Exit 0 both pass; 1 either does not; 2 cannot run.
 
 Nothing is written past `SPAWN_BACKUP_R2_LIMIT_MB` (10,000,000,000 bytes,
 the free tier in decimal GB): every run lists the whole bucket under

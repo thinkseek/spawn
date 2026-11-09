@@ -8,6 +8,7 @@
 //! terminal. The host keeps no state, so it works the same in a new
 //! process.
 
+use std::collections::HashMap;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -105,6 +106,15 @@ impl TmuxHost {
 
 /// How long a `capture-pane` may take.
 const CAPTURE_LIMIT: Duration = Duration::from_secs(5);
+
+/// The fields [`runner_of`] reads, in its order.
+///
+/// The separator is a printable `|`, not a tab: tmux replaces a tab with `_`
+/// when its locale is not UTF-8 (`env -i tmux ... -F '#{a}\t#{b}'`), which
+/// would make every field one and every runner unreadable. A `|` inside the
+/// last field, a pane's start command, is read whole.
+const PANE_STATE: &str =
+    "#{pane_dead}|#{pane_dead_status}|#{pane_current_command}|#{pane_start_command}";
 
 /// The command that runs `words` (the program, then its arguments), with
 /// the controller's settings kept out of its environment.
@@ -236,7 +246,7 @@ fn launch_marker(terminal: &TerminalName) -> String {
 /// ([`TerminalHost::runner`]): the runner this host launched there, alive,
 /// or why not.
 fn runner_of(terminal: &TerminalName, line: &str) -> Runner {
-    let mut fields = line.splitn(4, '\t');
+    let mut fields = line.splitn(4, '|');
     let dead = fields.next().unwrap_or_default();
     let status = fields.next().unwrap_or_default();
     let current = fields.next().unwrap_or_default();
@@ -504,6 +514,23 @@ impl TerminalHost for TmuxHost {
         }
     }
 
+    /// Whether the server that holds every terminal is there. `list-sessions`
+    /// only asks: unlike `new-session` it never starts a server, so a
+    /// check after a host restart cannot make one appear and hide the fact
+    /// that every terminal died with it.
+    fn server_alive(&self) -> bool {
+        let Ok(run) = self.run(&["list-sessions".to_string()]) else {
+            return true;
+        };
+        match run.code {
+            // Exit 1 says no server answers, unless tmux said something
+            // else (a socket we may not open, a failing tmux): that says
+            // nothing about the terminals.
+            Some(1) if gone(&run.stderr) => false,
+            _ => true,
+        }
+    }
+
     /// `list-panes`, not `display-message`, which answers a target that is
     /// not there with empty fields and success.
     fn runner(
@@ -511,15 +538,13 @@ impl TerminalHost for TmuxHost {
         terminal: &TerminalName,
         _workspace: &WorkspaceId,
     ) -> Result<Runner, TerminalError> {
-        // One tmux call, as `has-session` was: what the Bridge asks of every
-        // live execution each pass costs no more than before.
+        // One tmux call, as `has-session` was.
         let run = self.run(&[
             "list-panes".to_string(),
             "-t".to_string(),
             Self::pane(terminal),
             "-F".to_string(),
-            "#{pane_dead}\t#{pane_dead_status}\t#{pane_current_command}\t#{pane_start_command}"
-                .to_string(),
+            PANE_STATE.to_string(),
         ])?;
         match run.code {
             Some(0) => {}
@@ -539,6 +564,53 @@ impl TerminalHost for TmuxHost {
             .lines()
             .next()
             .map_or(Runner::Gone, |line| runner_of(terminal, line)))
+    }
+
+    /// One `list-panes -a` for the whole fleet, not one per terminal: what a
+    /// Bridge pass costs when every execution is asked whether its runner
+    /// still runs. The sessions of other programs on the socket are read too
+    /// and ignored.
+    fn runners(
+        &self,
+        terminals: &[(TerminalName, WorkspaceId)],
+    ) -> Result<Vec<(TerminalName, Runner)>, TerminalError> {
+        let run = self.run(&[
+            "list-panes".to_string(),
+            "-a".to_string(),
+            "-F".to_string(),
+            format!("#{{session_name}}|{PANE_STATE}"),
+        ])?;
+        match run.code {
+            Some(0) => {}
+            // No server, no session: every terminal is gone.
+            Some(1) if gone(&run.stderr) => {
+                return Ok(terminals
+                    .iter()
+                    .map(|(terminal, _)| (terminal.clone(), Runner::Gone))
+                    .collect());
+            }
+            other => {
+                return Err(TerminalError(format!(
+                    "list-panes -a returned {other:?}: {}",
+                    run.stderr.trim()
+                )));
+            }
+        }
+        let mut states: HashMap<&str, &str> = HashMap::new();
+        for line in run.stdout.lines() {
+            let (session, state) = line.split_once('|').unwrap_or((line, ""));
+            // A session with more than one pane is the first one's.
+            states.entry(session).or_insert(state);
+        }
+        Ok(terminals
+            .iter()
+            .map(|(terminal, _)| {
+                let state = states
+                    .get(terminal.as_str())
+                    .map_or(Runner::Gone, |state| runner_of(terminal, state));
+                (terminal.clone(), state)
+            })
+            .collect())
     }
 
     fn capture_tail(
@@ -742,14 +814,18 @@ mod tests {
     #[test]
     fn a_pane_hosts_its_runner_only_when_this_host_launched_it_and_it_lives() {
         let terminal = TerminalName::new("spawn-exec_1").expect("valid terminal");
-        let launched = "0\t\tspawn\t/bin/sh -c \"set -a; . \\\"$0\\\"; exec \\\"$@\\\"\" \
+        let launched = "0||spawn|/bin/sh -c \"set -a; . \\\"$0\\\"; exec \\\"$@\\\"\" \
                         /run/user/1000/spawn-launch-spawn-exec_1-42-7.env /bin/spawn run -- claude";
         assert_eq!(runner_of(&terminal, launched), Runner::Running);
         // The same launch of another terminal is not this one's runner.
         let other = launched.replace("spawn-exec_1-", "spawn-exec_10-");
         assert!(matches!(runner_of(&terminal, &other), Runner::Untracked(_)));
+        // A start command that holds the separator is read whole: it is the
+        // last field, and the fields before it are unchanged.
+        let piped = launched.replace("/bin/spawn run", "/bin/spawn run | tee");
+        assert_eq!(runner_of(&terminal, &piped), Runner::Running);
         // A shell at its prompt, as a session restored after a restart is.
-        let Runner::Untracked(why) = runner_of(&terminal, "0\t\tbash\t") else {
+        let Runner::Untracked(why) = runner_of(&terminal, "0||bash|") else {
             panic!("a restored shell hosts no runner");
         };
         assert!(
@@ -757,9 +833,7 @@ mod tests {
             "{why}"
         );
         // A dead pane (remain-on-exit) hosts nothing, whatever it ran.
-        let dead = launched
-            .replacen('0', "1", 1)
-            .replacen("\t\t", "\t137\t", 1);
+        let dead = launched.replacen('0', "1", 1).replacen("||", "|137|", 1);
         let Runner::Untracked(why) = runner_of(&terminal, &dead) else {
             panic!("a dead pane hosts no runner");
         };

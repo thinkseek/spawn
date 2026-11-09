@@ -141,7 +141,20 @@ Claude Code 是唯一的引擎（`ENGINE` = `claude`）。`execution.started` �
 
 凭证：引擎以主机用户身份运行、处于 bypass 模式，内联 settings 的 `permissions.deny` 写入 `CREDENTIAL_DENY`（`bridge.rs`，2026-11-08 起：一个 fleet worker 读过 loop 的环境文件）。文件：`~/.local/share/spawn-rsi/*.env*`、`env.sh`、`backups/`、`fleet-pg/`，`~/.config/spawn/**`、`~/.config/cloudflare/**`、`~/.hermes/**`、整个 `~/.claude/**`（设置、登录、以及记录了会话打印过的一切的转录）和 `~/.claude.json`、`~/.ssh/**`、`~/.gnupg/**`、`/data/tmp/ccd/**`、`/data/tmp/ccd-pg/**`、`/var/tmp/spawn/**/*.sh`，各有 `Read(…)`、`Edit(…)` 规则；另有 `Bash(*…*)` 规则拒绝命令文本里写出这些路径或文件名的调用，以及替调用者读取凭证的程序（owner 在 `/var/tmp/spawn` 的辅助脚本——那里也是 fleet 的 `TMPDIR`，所以只拒 `*.sh`——以及任何 Spawn 检出里的 `deploy/hold.sh`、`deploy/deploy.sh`、`test-deploy.sh`、`cutover-controller.sh`、`deploy/backup`），，别的进程的环境（`*/environ*`、`ps …e`），以及按名字或模式杀进程（`pkill`、`killall`、`kill $(pgrep …)`、`pgrep … | kill`：会杀到别的 agent 和 gate 的进程，2026-11-08 一个 resident 的 `pkill -f 'cargo test'` 杀了一个 ccd 的测试；`kill <pid>` 保留，用来停自己的后台任务）。Claude Code 2.1.319 实测：deny 规则在 bypass 模式下照样生效；`Read` 规则拦住 Read/Grep/Glob 工具和 cat、head、tail、grep、sed、awk、cp、base64、od、`<` 重定向，拦不住 `source`、`.`、`less`、`xargs cat`、`bash -c`、python 的 `open()`，这些由 `Bash(*…*)` 规则拦住；`~/.claude/**` 全部拒绝时，引擎照常工作、写转录、读全局指令、`--resume` 照常（这些是它的内部读写，不是工具调用）。`spawn loop`、`spawn integrate`、`spawn serve` 启动时调用 `prctl(PR_SET_DUMPABLE, 0)`（`spawn_host::undumpable`）：同一用户的进程读不到它们的 `/proc/<pid>/environ`；它们 exec 的程序（引擎、gate、git）从 exec 起重新可转储。因此 `deploy.sh` 不再读集成器的 environ，改读集成器启动时写的 `~/.config/spawn/gate-env`（`SPAWN_GATE_ENV_FILE`，0600，首条记录是它的 pid）。仍然拦不住的：不写出路径的命令（变量拼接、通配、先 `cd` 再相对路径交给解释器）、读取命令没写出的文件的程序、gate 进程的环境（gate 由 exec 启动，可转储，带 gate 共用测试库的 URL），以及引擎自身环境里的变量（网关的 `ANTHROPIC_*` 来自用户 settings）。这是规则，不是边界；边界要靠 Claude Code 的 sandbox（Linux 上需要 bubblewrap 和 socat）。
 
-不注入 hook。新会话由 Bridge 用 `--session-id <uuid>` 命名并先记 `session.native_started`，恢复用 `--resume <uuid>`；Bridge 每个 tick 通过终端主机读取 `<Claude projects 目录>/<工作目录转义>/<uuid>.jsonl` 的新增整行（`SPAWN_CLAUDE_PROJECTS`），以引擎自带的 `uuid`、`tool_use_id` 作键去重。runner 把退出码写到 `SPAWN_EXIT_FILE`；终端里没有数据库登录。测试库例外：loop 设了 `SPAWN_FLEET_TEST_DATABASE_URL`（fleet 自己的测试服务器，`deploy/fleet-test-db.sh`、`spawn-fleet-test-db` 单元）时，引擎的环境里 `SPAWN_TEST_DATABASE_URL` 就是它，但只在核对通过之后（`BridgeConfig.launch_environment`，每次启动时询问）：fleet 的服务器和配置的其他服务器（loop 自己的 `SPAWN_TEST_DATABASE_URL`，即 gate 共用的测试服务器，以及 `SPAWN_DATABASE_URL`）都读得到 `system_identifier`，且 fleet 的与每个都不同。失败即关闭：读不到、写法相同或身份相同，这次启动就不给，原因在 loop 日志里每种说一次，下次启动再查；通过之后不再查。不设就没有测试库，绝不给 gate 的。每个任务的提示（`task_prompt` 和新任务的输入）在 brief 之后带 `CREDENTIALS_LINE` 和 `PROCESSES_LINE`（"Never kill a process you did not start; stop your own background jobs by their id."）两行，`CREDENTIALS_LINE`："Your test database is $SPAWN_TEST_DATABASE_URL; never read any credential file, never put a URL on a command line."
+不注入 hook。新会话由 Bridge 用 `--session-id <uuid>` 命名并先记 `session.native_started`，恢复用 `--resume <uuid>`；Bridge 监视 `<Claude projects 目录>/<工作目录转义>/<uuid>.jsonl`（`SPAWN_CLAUDE_PROJECTS`）和 runner 的退出文件，文件变了才读新增整行，以引擎自带的 `uuid`、`tool_use_id` 作键去重。runner 把退出码写到 `SPAWN_EXIT_FILE`；终端里没有数据库登录。测试库例外：loop 设了 `SPAWN_FLEET_TEST_DATABASE_URL`（fleet 自己的测试服务器，`deploy/fleet-test-db.sh`、`spawn-fleet-test-db` 单元）时，引擎的环境里 `SPAWN_TEST_DATABASE_URL` 就是它，但只在核对通过之后（`BridgeConfig.launch_environment`，每次启动时询问）：fleet 的服务器和配置的其他服务器（loop 自己的 `SPAWN_TEST_DATABASE_URL`，即 gate 共用的测试服务器，以及 `SPAWN_DATABASE_URL`）都读得到 `system_identifier`，且 fleet 的与每个都不同。失败即关闭：读不到、写法相同或身份相同，这次启动就不给，原因在 loop 日志里每种说一次，下次启动再查；通过之后不再查。不设就没有测试库，绝不给 gate 的。每个任务的提示（`task_prompt` 和新任务的输入）在 brief 之后带 `CREDENTIALS_LINE` 和 `PROCESSES_LINE`（"Never kill a process you did not start; stop your own background jobs by their id."）两行，`CREDENTIALS_LINE`："Your test database is $SPAWN_TEST_DATABASE_URL; never read any credential file, never put a URL on a command line."
+
+**Bridge 读什么，什么时候读。** 监视走 `FileWatch` 端口：Linux 上是 inotify（`spawn_host::InotifyWatch`），一个描述符、每个文件一条目录监视；路径还不存在时监视它上面最深的已存在目录，目录随引擎出现时监视跟着往下走（transcript 在 `<projects>/<工作目录转义>/`，退出文件在 `<工作区>/.spawn/`，两者都由引擎稍后创建）。设不了监视的执行（系统调用出错、文件系统不支持、`max_user_watches` 到顶）退回每个 pass 都读，并在循环输出里告警一次。读的偏移规则不变：只读整行，读到一半的行留到下一次变化或下一个 pass，绝不丢；一次 checkpoint 没提交的行同样留到下一个 pass。
+
+一个 pass 对空闲的 agent 不花钱。没有命令在飞（Bridge 拿着在等，`held`）、transcript 没有变化、屏幕知道得够新的执行，这个 pass 不抓屏、不读任何文件、也不为它单独问一次 runner（`list-panes`）。屏幕只在能改变决定时抓：
+
+| 何时 | 出处 |
+| --- | --- |
+| 会话上有命令在飞（Bridge 领取了还没完成；同一个 pass 领到的也算） | 投递等着它的读数 |
+| transcript 自上次增长以来静止满 `SPAWN_SCREEN_QUIET_MS`（默认 500 ms）而屏幕此后还没读过，之后的 pass 接着读，直到连续两次读数一致 | transcript 说不了的事：提示符回来了 |
+| 距上次抓屏满 `screen_refresh`（30 s）的兜底 | transcript 不动而屏幕变了：对话框、掉回 shell |
+| transcript 里刚读到一轮的结束（`turn.stopped`、`turn.failed`），而屏幕还没回到提示符：之后的 pass 接着读，直到某次读数接受输入（提示符回来了），或距这一轮的结束满 `screen_refresh` | 引擎在结束这一轮的那一行之后才画提示符；那份读数正是投递在等的，不能留给兜底 |
+
+忙碌的屏幕仍每 30 秒重记一次。兜底抓屏一个 pass 最多 `BACKSTOPS_PER_PASS` （2）个，同时到期的屏幕分摊到后面几个 pass：一个 pass 抓完整个舰队会把下一条命令挡在后面。“引擎还在不在”不靠每个执行的 `runner`：有监视时，`TerminalHost::runners` 一个 pass 问一次终端服务器（tmux 一次 `list-panes -a`，整个舰队一次调用），终端不在或不再托管本主机的 runner 的执行，下一个 pass 就按 `lost` 结束，和以前一样快；没有监视时（`spawn tick`、测试）仍然逐个问。引擎自己退出照旧由退出文件的变化在半秒级发现。因果（§14）：屏幕状态只从抓屏来、一轮的结束只从 transcript 的行来；没抓屏、transcript 没变化都不算状态，transcript 静止只说明什么时候该再看屏幕。
 
 启动参数超过 7 个时按 `Run { engine, native, prompt }` 结构体传引用，保持签名可读。
 
@@ -173,7 +186,7 @@ checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.commit
 
 ## 6. 屏尾判定
 
-Claude 以 `--ax-screen-reader` 运行，屏幕是唯一可靠的完成信号来源。会话记录给结构化事件；屏尾只判两件事：能否输入、是否被阻塞。Bridge 每个 tick 读屏，两次读数一致才记录，忙碌状态每 30 秒重记一次。
+Claude 以 `--ax-screen-reader` 运行，屏幕是唯一可靠的完成信号来源。会话记录给结构化事件；屏尾只判两件事：能否输入、是否被阻塞。Bridge 不是每个 tick 都读屏（§5）：会话上有命令在飞、transcript 静止满 `SPAWN_SCREEN_QUIET_MS`、transcript 刚读到一轮的结束而屏幕还没回到提示符（读到接受输入为止，最长 `screen_refresh`）、或距上次抓屏满 30 秒的兜底时才读，两次读数一致才记录；兜底读到的与已记录的一样时不重复记录，忙碌状态每 30 秒重记一次。一轮的结束先由 transcript 的行确定，提示符后由屏尾确认：两者都不是推断，各是自己的证据（§14）。
 
 | 常量 | 值 | 含义 |
 | --- | --- | --- |
@@ -390,6 +403,8 @@ Bridge、Observer、调度器（`deliver.rs`、`dispatch.rs`）、集成器（`i
 
 停滞的升级（`dispatch/stall.rs`，[fleet-architecture.md](fleet-architecture.md) §3 “Stalls”）同样守这条规则：每个未结任务所处的一步都从开始它的那条记录量起（控制记录的 id，或会话事实的 `session_seq`），年龄只用数据库的时钟（`spawn_now_ms()` 对 `recorded_at_ms`），从不凭“集成器最近没跑”之类的缺席推断；条目写明它量自哪条记录，标签里带着这条记录，所以每次停滞只升级一次，重启的 loop 算出同样的结果。
 
+`spawn loop` 的每一趟同样只依据记录与记录写明的时间（objective 23，[fleet-architecture.md](fleet-architecture.md) §3 “When the dispatcher's pass runs”）。每一趟读一次日志的水位线（`max(spawn_events.id)`，对主键的 index-only 读）；调度器的一步（dispatch facts、任务行、停滞事实、门禁与暂停记录、每个 resident 与 supervisor 的存活）只在水位线自上次运行以来移动过、或它自己的某个计时到点时运行，其余每一趟只有那一次水位线读。它的每一个计时都来自它读到的记录，不由循环数出来：投递的重试（`attempts()`：被拒后 `NOT_READY_RETRY_MS`，失败后 `retry_wait_ms()`）、停滞的界（从它站着的那条记录量起）、失败的 Stop 的重试、后台任务的界、取消通知与未写完报告的便条；算不出时间的计时就是现在，绝不更晚；已经到点的时间是这一步现在要做的，不是要等的。两趟之间它等 `LISTEN spawn_events`（`spawn_append_trusted` 已经在每次 append 时通知），超时取通过间隔与下一个到点时间的较早者：**通知只是提示，水位线才是记录**——一条通知结束等待，让变化比今天更早被处理；一条通知丢了最多多等一个间隔，因为下一趟照样读水位线，而没收到通知从不被读成“什么都没发生”。各步至多每个间隔跑一次（loop 一直以来的分辨率），所以一个间隔内的一串 append 是一趟的活；Bridge 对已提交命令的认领不被这个间隔挡住。Bridge 读每台引擎的屏幕与 transcript 不在这个时间表上：它们不由 append 宣告，所以每趟都读（§5）。
+
 集成器的门禁按任务组并发（每个任务组、每个来源同一时刻至多一个判定，全局至多 `--gates` 个用共享测试库的判定，默认 1；场景目录里有 `no-test-database` 的任务组拿不到测试库地址，不占名额）。每个判定在自己的线程里跑完取分支、门禁与落地，各自记下 `task.gated`、`task.landed`；主循环不读线程的返回值，只读日志。结束的线程只在一轮开始、读任务组之前回收，所以一轮看到的任务组快照不会早于任何已结束判定的记录；每一轮都给每个任务组走完停机、预算、落地与目标分派，不因别的任务组的门禁而等；只有落地会让同一来源的其余任务组等下一轮（落地移动了 main 与它们的基线）。在途判定的来源不做镜像上的事（落地、拉取、判定）。空出的门禁给等得最久的就绪任务：从它报告时起，或从它所在任务组上一次判定结束时起，取较晚者；任务组编号不决定先后。进程重启时门禁随进程一起被杀，没有记录，下一个集成器重新判定。
 
 门禁的主机故障同样守这条规则（objective 20，[fleet-architecture.md](fleet-architecture.md) §10.3）：check-tests.sh 在候选上失败时，集成器只依据记下的门禁输出里每条失败及其消息（记录的 `failures`），以及测试数据库日志里落在它自己量出的门禁时间窗内（前后各 1 秒）的崩溃行（记录的 `crash`），判定是主机的故障（`host_fault`）还是工作的（`rejected`），从不只凭拒绝理由的文字；之后的等待只依据记录里的 `due_ms`（记录自己的 `recorded_at_ms` 加退避，由存储写入），不凭进程内存或没有记录的时间。主机故障不计入任何停机规则，连续两次升级给 supervisor 一次。
@@ -397,6 +412,8 @@ Bridge、Observer、调度器（`deliver.rs`、`dispatch.rs`）、集成器（`i
 基线自己与自己不一致同样是主机的故障（objective 033，[fleet-architecture.md](fleet-architecture.md) §10.3）：门禁在跑任何候选代码之前先在基线上评判每个 objective 场景，未解决的结果要两次一致的运行；第一次退出 1、第二次退出 0，候选代码一行还没跑，基线是已经落地的代码，这说的是主机太忙或太不稳定，不是工作的问题。集成器只依据门禁记下的退出状态（4）和它自己写在 stdout 末尾的那一对行（记录里的 `scenario` 与 `exits`）判定，从不凭理由的文字、时间或场景名：记 `host_fault`（objective 020 的结论）加证据 `base_disagrees`，任务原地不动，两种证据共用同一条连续计数与退避；之后再判只依据记录里的 `due_ms`。它不升级（020 的第二条才升级），连续三条的第三条在记录里带 `alert`，由调度器的 digest 送给 supervisor 一次（`host gate-base-disagrees-<事件 id>`），任何数量都不停机。
 
 门禁之前先量主机，不靠门禁崩溃才知道主机没有余量（objective 018）：每次判定在候选构建之后、门禁启动之前，集成器按序量门禁 `TMPDIR` 的剩余空间（`SPAWN_GATE_MIN_FREE_GB`）、`MemAvailable`（`SPAWN_GATE_MIN_FREE_MEMORY_MB`）与测试数据库（连接，再跑一条强制并行的查询，各 10 秒内），第一项不够就不启动门禁，记 `no_room` 并写明 `check`、`measured` 与 `threshold`。判断只凭判定当时的测量和它的阈值；一次跑了 25 分钟、因测试库 `/dev/shm` 不足而崩溃的门禁，不再被读成候选的回归。
+
+执行的每一种结束同样受它约束（objective 28，[fleet-architecture.md](fleet-architecture.md) §3 “The recovery”）：一次 interruption（执行的结束、模型失败的一轮、执行活过来的一次数据库中断）的 cause 全部从记下的事实读出——runner 写在退出文件旁的信号（`9` 是 SIGKILL）、`execution.ended` 的退出码、transcript 里 API error 行的 event id 及其 `apiErrorStatus`/`error`、结束它的那条 Stop 的 command id、环境包络与磁盘读数、恢复时终端服务器的状态、loop 自己数出的失败轮次与窗口——每一条都写进记录的 `evidence`；优先级固定（stopped、budget、memory_limit、host_restart、disk_full、database_unavailable、model_auth、model_unavailable、context_exhausted、crashed、exited），同一个事实只记一次（记录写明它依据的 log 事件 id，重起的 loop 因此既不会重记也不会重发）。每条记录是一次性的控制记录 `execution.interrupted`（owner 写，`spawn_host_record`），它的 `attempt` 是该执行的第几次 interruption，于是 `recover-<execution>-<attempt>` 只指向这一次；revive 是一条命令，不早于 `due_ms` 发出，结果从命令队列读回。wait 只在观测到时解除，从不凭时间：重试的一轮得到模型回答、凭据文件变化、loop 第一次连上数据库、磁盘读数回到 floor——解除本身是一条 `execution.cleared` 记录，然后才是 revive。loop 不因数据库不可达而退出：只有“连不上”的失败不计入 `MAX_FAILURES`，引擎照跑，第一个成功的轮次补记 outage 的 interruption 并让 Bridge 补 checkpoint 引擎在这段时间写下的东西。
 
 写新代码时的检查：读另一个循环的产物时，问它覆盖的是哪一个 commit、哪一个会话位置、哪一个命令 id；读 `spawn_commands` 时区分成功、失败与尚未运行；超时只决定何时再看，不证明任何事；删掉一个生产者时，搜出它的每个读者。
 

@@ -7,19 +7,25 @@
 //! verdict: candidate code once wrote an accepted line to the gate's stdout
 //! through /proc and killed the gate. A gate that exits non-zero, or dies
 //! of a signal, is an abort whatever it printed, with one exception: exit
-//! [`NO_ROOM_EXIT`] *and* a no-room fact in the verdict file
-//! (`{"no_room":true,"free_kb":n,"min_gb":n,"tmpdir":"…"}`) means TMPDIR had
-//! no room to judge ([`GateFailure::NoRoom`]). The gate writes that file
-//! before any candidate code runs (scripts/disk.sh `gate_room`).
+//! [`NO_ROOM_EXIT`] *and* a no-room fact in the verdict file means the host
+//! was short of room ([`GateFailure::NoRoom`]): TMPDIR under the floor
+//! (`{"no_room":true,"free_kb":n,"min_gb":n,"tmpdir":"…"}`, written before
+//! any candidate code runs, scripts/disk.sh `gate_room`), or a scenario run
+//! that gave up waiting for one of the host's scenario slots
+//! (`{"no_room":true,"check":"host scenario slot","waited_ms":n,"budget":n}`,
+//! scripts/rsi/gate.sh "Host scenario slots"). `Shortfall` names the check,
+//! its measure and its threshold for either.
 //!
-//! A TMPDIR with no room at all may leave no fact: the gate cannot write
-//! its verdict file, or this process cannot create its private directory.
-//! Then this process measures the free space itself ([`judge`]'s `free_kb`,
-//! `df` in production): of the directory it could not create in, or of the
-//! gate's TMPDIR after an exit [`NO_ROOM_EXIT`] with no readable fact. It
-//! records [`GateFailure::NoRoom`] with its own measurement only when that is
-//! under the floor (SPAWN_GATE_MIN_FREE_GB, default 10). Otherwise the run is
-//! an abort, as is a fact with any other exit status.
+//! A TMPDIR with no room at all may leave no fact in the file: the gate
+//! cannot write it, or this process cannot create its private directory.
+//! The gate prints the fact as well, so the last JSON line of stdout is read
+//! first (a slot wait keeps its own shape); failing that, this process
+//! measures the free space itself ([`judge`]'s `free_kb`, `df` in
+//! production): of the directory it could not create in, or of the gate's
+//! TMPDIR after an exit [`NO_ROOM_EXIT`] with no readable fact. It records
+//! [`GateFailure::NoRoom`] with its own measurement only when that is under
+//! the floor (SPAWN_GATE_MIN_FREE_GB, default 10). Otherwise the run is an
+//! abort, as is a fact with any other exit status.
 //!
 //! **A host fault is no verdict either.** Exit [`HOST_FAULT_EXIT`] *and* a
 //! host-fault fact in the verdict file (`{"host_fault":true,"scenario",
@@ -106,6 +112,16 @@ pub(crate) const GATE_ENV: &[&str] = &[
     // only. A gate that gets no test database
     // ([`crate::integrate::NO_TEST_DATABASE`]) gets no server either.
     "SPAWN_GATE_JOBS",
+    // The host's scenario budget, every gate together (scripts/rsi/gate.sh,
+    // "Host scenario slots"): without it each gate's SPAWN_GATE_JOBS was
+    // the whole host's, and two gates doubled the scenario load.
+    "SPAWN_GATE_HOST_JOBS",
+    // The gate's build share (CARGO_BUILD_JOBS for its build hook and test
+    // listing, scripts/rsi/gate.sh): the owner's, when set; unset, a gate
+    // builds with cargo's default and a warm at 1. Who claims a slot first
+    // (SPAWN_GATE_SLOT_PRIORITY) is not passed: the integrator's gates are
+    // normal and its warms are `--base-only`, which is low by itself.
+    "SPAWN_GATE_BUILD_JOBS",
     "SPAWN_GATE_PG_IMAGE",
     "SPAWN_GATE_PG_BIN",
     // A tree's deps store (Supply PA's `gate/scenarios/build`, `bind` and
@@ -175,7 +191,12 @@ const MAX_DEFAULT_JOBS: usize = 8;
 /// SPAWN_GATE_JOBS when set; 1 for a gate on the shared test server
 /// (whose connections every agent's tests share, as gate.sh says); else
 /// the cores less those kept for the workers, divided among the gates that
-/// can run at once, at most 8. A gate starts only when its jobs, the
+/// can run at once, at most 8. That number is also the host's whole
+/// scenario budget ([`GATE_ENV`]'s SPAWN_GATE_HOST_JOBS, which gate.sh
+/// takes by default): every scenario run on the host, from every gate,
+/// holds one of them, so several gates share it instead of each running
+/// its own (2026-11-08: two gates' heavy scenarios at once starved a test
+/// past its wait and a task was rejected wrongly). A gate starts only when its jobs, the
 /// running gates' jobs and the cores kept for the workers fit within the
 /// cores, or when no gate runs ([`Cpu::fits`]); otherwise it waits for the
 /// next pass, as it waits for a gate slot: no record, no count. (2026-11-08:
@@ -341,6 +362,16 @@ pub(crate) struct Room {
     probe: std::sync::Arc<DatabaseProbe>,
 }
 
+/// A wait in one line: tenths of a second under a minute, tenths of a minute
+/// from there.
+pub(crate) fn spoken_ms(ms: u64) -> String {
+    if ms >= 60_000 {
+        format!("{}.{} min", ms / 60_000, (ms % 60_000) / 6_000)
+    } else {
+        format!("{}.{} s", ms / 1000, (ms % 1000) / 100)
+    }
+}
+
 /// What fell short before a gate: the check, what it measured, and the
 /// threshold it measured against.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -360,39 +391,49 @@ pub(crate) enum Shortfall {
         probe: String,
         error: String,
     },
+    /// A scenario run waited for one of the host's slots (scripts/rsi/gate.sh
+    /// "Host scenario slots") past its own bound: the wait and the budget it
+    /// waited against. A shortfall of the host's capacity, like the others:
+    /// not a verdict on the work, judged again later.
+    Slot { waited_ms: u64, budget: u64 },
 }
 
 impl Shortfall {
-    /// The check's name in the record: `disk`, `memory` or `database`.
+    /// The check's name in the record: `disk`, `memory`, `database` or
+    /// `host scenario slot`.
     pub(crate) fn check(&self) -> &'static str {
         match self {
             Self::Disk { .. } => "disk",
             Self::Memory { .. } => "memory",
             Self::Database { .. } => "database",
+            Self::Slot { .. } => "host scenario slot",
         }
     }
 
-    /// What the check measured: free KiB, available MiB, or the error.
+    /// What the check measured: free KiB, available MiB, the error, or the
+    /// wait in milliseconds.
     pub(crate) fn measured(&self) -> serde_json::Value {
         match self {
             Self::Disk { free_kb, .. } => (*free_kb).into(),
             Self::Memory { available_mb, .. } => (*available_mb).into(),
             Self::Database { error, .. } => error.as_str().into(),
+            Self::Slot { waited_ms, .. } => (*waited_ms).into(),
         }
     }
 
-    /// What it measured against: the floor in KiB, the floor in MiB, or
-    /// the probe it failed.
+    /// What it measured against: the floor in KiB, the floor in MiB, the
+    /// probe it failed, or the host's scenario budget.
     pub(crate) fn threshold(&self) -> serde_json::Value {
         match self {
             Self::Disk { min_gb, .. } => min_gb.saturating_mul(1_048_576).into(),
             Self::Memory { min_mb, .. } => (*min_mb).into(),
             Self::Database { probe, .. } => probe.as_str().into(),
+            Self::Slot { budget, .. } => (*budget).into(),
         }
     }
 
     /// The measure against its threshold, in one line for the log.
-    fn line(&self) -> String {
+    pub(crate) fn line(&self) -> String {
         match self {
             Self::Disk {
                 free_kb,
@@ -415,6 +456,10 @@ impl Shortfall {
                 probe,
                 error,
             } => format!("database: the test database ({server}) failed \"{probe}\": {error}"),
+            Self::Slot { waited_ms, budget } => format!(
+                "host scenario slot: waited {} for one of SPAWN_GATE_HOST_JOBS={budget}",
+                spoken_ms(*waited_ms)
+            ),
         }
     }
 }
@@ -698,6 +743,14 @@ pub(crate) struct Verdict {
     pub(crate) output: String,
 }
 
+/// One failing test of a red main, as the gate quotes it from the check's
+/// `FAILED <test>: <message>` lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RedFailure {
+    pub(crate) test: String,
+    pub(crate) message: String,
+}
+
 /// Why the gate produced no verdict.
 #[derive(Debug)]
 pub(crate) enum GateFailure {
@@ -708,15 +761,12 @@ pub(crate) enum GateFailure {
     /// The gate ran but gave no verdict to believe: a non-zero or signalled
     /// exit, or no verdict file. `log` is what it printed.
     Aborted { reason: String, log: String },
-    /// TMPDIR had less than SPAWN_GATE_MIN_FREE_GB free, so the gate did not
-    /// start. A fact about the host, not the work. It names what the gate
-    /// saw: free KiB, the floor in GiB, and the directory.
-    NoRoom {
-        free_kb: u64,
-        min_gb: u64,
-        tmpdir: String,
-        log: String,
-    },
+    /// The host was short of room, so the gate did not judge: TMPDIR under
+    /// SPAWN_GATE_MIN_FREE_GB (the gate did not start), or a scenario run
+    /// that waited for a host scenario slot past its bound (exit
+    /// [`NO_ROOM_EXIT`] with the slot fact). A fact about the host, not the
+    /// work. `short` names the check, its measure and its threshold.
+    NoRoom { short: Shortfall, log: String },
     /// The gate found a scenario failing where the candidate is not to
     /// blame (exit [`HOST_FAULT_EXIT`] with its fact): `scenario`, where it
     /// failed (`on`: `base`, or `candidate and base`), its runs' exits as
@@ -726,6 +776,21 @@ pub(crate) enum GateFailure {
         on: String,
         runs: String,
         reason: String,
+        /// For `on` `sandbox`, which tree's sandbox never started; None for
+        /// the other places.
+        tree: Option<SandboxTree>,
+        log: String,
+    },
+    /// Main is red on a check (exit [`HOST_FAULT_EXIT`] with the gate's
+    /// fact `on` `main`): it failed twice on the base with the same failing
+    /// tests, after failing twice on the candidate, or as the red check run
+    /// on the base before it (`SPAWN_GATE_BASE_CHECK`). A fact about the
+    /// source's main, not the work: `scenario` the check, `runs` its exits
+    /// as the gate says them, `failures` the tests both base runs failed.
+    MainRed {
+        scenario: String,
+        runs: String,
+        failures: Vec<RedFailure>,
         log: String,
     },
     /// The host cannot judge the objective's scenario at all (029's systemd
@@ -977,7 +1042,27 @@ pub(crate) fn judge(
     env: &[(String, String)],
     limit: Duration,
 ) -> Result<Verdict, GateFailure> {
-    judge_in(
+    judge_seeing_base_check(gate, repo, base, candidate, scenarios, scenario, env, limit).0
+}
+
+/// [`judge`], and the red check the gate found passing on the base before
+/// any candidate code ran (SPAWN_GATE_BASE_CHECK), whatever the gate's
+/// outcome: a verdict, a host fault on another check, no room, a scenario
+/// it cannot judge, an abort. The gate writes it to its verdict file as soon
+/// as it passes ([`seen_base_check`]), and only that file is believed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn judge_seeing_base_check(
+    gate: &Path,
+    repo: &Path,
+    base: &str,
+    candidate: &str,
+    scenarios: &Path,
+    scenario: Option<&Path>,
+    env: &[(String, String)],
+    limit: Duration,
+) -> (Result<Verdict, GateFailure>, Option<String>) {
+    let mut seen = None;
+    let judged = judge_in(
         &std::env::temp_dir(),
         &measured_free_kb,
         gate,
@@ -988,7 +1073,21 @@ pub(crate) fn judge(
         scenario,
         env,
         limit,
-    )
+        &mut seen,
+    );
+    (judged, seen)
+}
+
+/// The verdict file's `base_check` (a check's name, `check-<name>.sh`),
+/// whatever else it says: the gate writes it there first, and every fact
+/// it writes after keeps it.
+fn seen_base_check(file: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(file.trim()).ok()?;
+    value
+        .get("base_check")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| is_check_name(name))
+        .map(str::to_string)
 }
 
 /// [`judge`], with the private directory made under `parent` and free space
@@ -1005,6 +1104,7 @@ fn judge_in(
     scenario: Option<&Path>,
     env: &[(String, String)],
     limit: Duration,
+    seen: &mut Option<String>,
 ) -> Result<Verdict, GateFailure> {
     let floor = env_value(env, "SPAWN_GATE_MIN_FREE_GB")
         .map_or(Some(DEFAULT_MIN_FREE_GB), |text| text.parse::<u64>().ok());
@@ -1014,9 +1114,11 @@ fn judge_in(
         let min_gb = floor?;
         let free = free_kb(path)?;
         (free < min_gb.saturating_mul(1_048_576)).then(|| GateFailure::NoRoom {
-            free_kb: free,
-            min_gb,
-            tmpdir: path.display().to_string(),
+            short: Shortfall::Disk {
+                free_kb: free,
+                min_gb,
+                tmpdir: path.display().to_string(),
+            },
             log: format!(
                 "{log}! integrate: {why}; measured {free} KiB free in {}, under \
                  SPAWN_GATE_MIN_FREE_GB={min_gb}\n",
@@ -1050,7 +1152,14 @@ fn judge_in(
         .env_clear()
         .envs(env.iter().map(|(name, value)| (name, value)))
         .env("SPAWN_GATE_VERDICT", &verdict_path);
-    let run = match run_bounded(command, limit, directory.path()) {
+    let run = run_bounded(command, limit, directory.path());
+    // The base check is read before anything else of the run, so a gate the
+    // wall clock killed (a timeout) still says main passed it.
+    *seen = std::fs::read_to_string(&verdict_path)
+        .ok()
+        .as_deref()
+        .and_then(seen_base_check);
+    let run = match run {
         Ok(run) => run,
         Err(GateFailure::Failed(error)) => {
             return Err(short(
@@ -1065,8 +1174,19 @@ fn judge_in(
     let verdict = std::fs::read_to_string(&verdict_path).ok();
     match decide(&run, verdict.as_deref()) {
         // Exit 5 with no readable fact: the gate said "no room" but could
-        // not write it down. Measure; believe it only under the floor.
+        // not write it down. It also prints the fact, so read that before
+        // measuring: a slot wait keeps its own shape instead of passing for
+        // a disk shortfall, and one no disk measure could confirm.
         Err(GateFailure::Aborted { reason, log }) if run.status.code() == Some(NO_ROOM_EXIT) => {
+            if let Some(fact) = run
+                .stdout
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .and_then(no_room)
+            {
+                return Err(GateFailure::NoRoom { short: fact, log });
+            }
             Err(short(
                 &tmpdir,
                 &log,
@@ -1112,12 +1232,10 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
         log: record(&run.stdout),
     };
     if run.status.code() == Some(NO_ROOM_EXIT)
-        && let Some((free_kb, min_gb, tmpdir)) = verdict.and_then(no_room)
+        && let Some(short) = verdict.and_then(no_room)
     {
         return Err(GateFailure::NoRoom {
-            free_kb,
-            min_gb,
-            tmpdir,
+            short,
             log: record(&run.stdout),
         });
     }
@@ -1136,6 +1254,7 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
             on,
             runs,
             reason,
+            tree,
             ..
         }) = verdict.and_then(host_fault)
     {
@@ -1144,6 +1263,17 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
             on,
             runs,
             reason,
+            tree,
+            log: record(&run.stdout),
+        });
+    }
+    if run.status.code() == Some(HOST_FAULT_EXIT)
+        && let Some((scenario, runs, failures)) = verdict.and_then(main_red)
+    {
+        return Err(GateFailure::MainRed {
+            scenario,
+            runs,
+            failures,
             log: record(&run.stdout),
         });
     }
@@ -1190,6 +1320,15 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
     })
 }
 
+/// Whether `name` is a check's file name, `check-<name>.sh` with no path.
+fn is_check_name(name: &str) -> bool {
+    name.strip_prefix("check-")
+        .and_then(|rest| rest.strip_suffix(".sh"))
+        .is_some_and(|stem| !stem.is_empty())
+        && name.len() <= 100
+        && !name.contains('/')
+}
+
 /// The verdict's `flakes`: the names of checks (`check-<name>.sh`, no path)
 /// that failed once and passed again; anything else in the list is dropped.
 fn flakes(value: &serde_json::Value) -> Vec<String> {
@@ -1200,13 +1339,7 @@ fn flakes(value: &serde_json::Value) -> Vec<String> {
             names
                 .iter()
                 .filter_map(serde_json::Value::as_str)
-                .filter(|name| {
-                    name.strip_prefix("check-")
-                        .and_then(|rest| rest.strip_suffix(".sh"))
-                        .is_some_and(|stem| !stem.is_empty())
-                        && name.len() <= 100
-                        && !name.contains('/')
-                })
+                .filter(|name| is_check_name(name))
                 .map(str::to_string)
                 .collect()
         })
@@ -1215,7 +1348,7 @@ fn flakes(value: &serde_json::Value) -> Vec<String> {
 
 /// The no-room fact of a verdict file, `(free_kb, min_gb, tmpdir)`: one
 /// JSON line with `no_room` true, whole numbers and a directory.
-fn no_room(file: &str) -> Option<(u64, u64, String)> {
+fn no_room(file: &str) -> Option<Shortfall> {
     let line = file.trim();
     if line.contains('\n') {
         return None;
@@ -1224,15 +1357,72 @@ fn no_room(file: &str) -> Option<(u64, u64, String)> {
     if value.get("no_room")?.as_bool() != Some(true) || value.get("verdict").is_some() {
         return None;
     }
+    // A scenario run that gave up waiting for one of the host's slots: its
+    // own shape, so the record says `host scenario slot`, not `disk`.
+    if value.get("check").and_then(serde_json::Value::as_str) == Some("host scenario slot") {
+        return Some(Shortfall::Slot {
+            waited_ms: value.get("waited_ms")?.as_u64()?,
+            budget: value.get("budget")?.as_u64()?,
+        });
+    }
     let free_kb = value.get("free_kb")?.as_u64()?;
     let min_gb = value.get("min_gb")?.as_u64()?;
     let tmpdir = value.get("tmpdir")?.as_str()?;
-    (!tmpdir.is_empty()).then(|| (free_kb, min_gb, tmpdir.to_string()))
+    (!tmpdir.is_empty()).then(|| Shortfall::Disk {
+        free_kb,
+        min_gb,
+        tmpdir: tmpdir.to_string(),
+    })
 }
 
+/// Which tree a sandbox that never started was for (`tree` of the gate's
+/// fact, `on` `sandbox`): the candidate's counts toward the host-fault cap;
+/// the base's and the gate's own (the socket scan) come before any
+/// candidate code ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SandboxTree {
+    Candidate,
+    Base,
+    Gate,
+}
+
+impl SandboxTree {
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "candidate" => Some(Self::Candidate),
+            "base" => Some(Self::Base),
+            "gate" => Some(Self::Gate),
+            _ => None,
+        }
+    }
+
+    /// As the gate's fact and the record name it.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Candidate => "candidate",
+            Self::Base => "base",
+            Self::Gate => "gate",
+        }
+    }
+}
+
+/// The evidence of a gate's host fault whose sandbox never started its
+/// command (`on` `sandbox`): bwrap failed before the command ran, so its
+/// status was no answer of the scenario's (scripts/rsi/gate.sh).
+pub(crate) const SANDBOX_NEVER_STARTED: &str = "sandbox_never_started";
+
+/// The evidence of a gate's host fault whose own test server did not start
+/// (`on` `test server`, its `tree` which start: `gate`, the first, or
+/// `candidate`, the candidate phase's fresh one; gate.sh `start_server`):
+/// the host's, never the candidate's, so it never counts toward the task.
+pub(crate) const TEST_SERVER_NEVER_STARTED: &str = "test_server_never_started";
+
 /// The host-fault fact of a verdict file: one JSON line with `host_fault`
-/// true, a scenario, where it failed (`base` or `candidate and base`), its
-/// runs and a reason, and no verdict. Its `log` is left empty.
+/// true, a scenario, where it failed (`base`, `candidate and base`,
+/// `sandbox` with the evidence [`SANDBOX_NEVER_STARTED`], or `test server`
+/// with the evidence [`TEST_SERVER_NEVER_STARTED`] and a start of `gate` or
+/// `candidate`), its runs and a reason, and no verdict. Its `log` is left
+/// empty.
 fn host_fault(file: &str) -> Option<GateFailure> {
     let line = file.trim();
     if line.contains('\n') {
@@ -1244,14 +1434,77 @@ fn host_fault(file: &str) -> Option<GateFailure> {
     }
     let text = |name: &str| value.get(name)?.as_str().map(str::to_string);
     let scenario = text("scenario").filter(|scenario| !scenario.is_empty())?;
-    let on = text("on").filter(|on| on == "base" || on == "candidate and base")?;
+    // `sandbox`: a sandbox that never started its command (gate.sh "A
+    // sandbox that never started its command"), believed only with its
+    // evidence and the tree it never started in.
+    let tree = text("tree").as_deref().and_then(SandboxTree::parse);
+    let on = text("on").filter(|on| {
+        on == "base"
+            || on == "candidate and base"
+            || (on == "sandbox"
+                && text("evidence").as_deref() == Some(SANDBOX_NEVER_STARTED)
+                && tree.is_some())
+            || (on == "test server"
+                && text("evidence").as_deref() == Some(TEST_SERVER_NEVER_STARTED)
+                && matches!(tree, Some(SandboxTree::Gate | SandboxTree::Candidate)))
+    })?;
+    let tree = tree.filter(|_| on == "sandbox" || on == "test server");
     Some(GateFailure::HostFault {
         scenario,
         on,
         runs: text("runs").unwrap_or_default(),
         reason: text("reason").unwrap_or_default(),
+        tree,
         log: String::new(),
     })
+}
+
+/// The red-main fact of a verdict file: one JSON line with `host_fault`
+/// true, `on` `main`, a check's name, its runs and at least one failure
+/// (`{"test","message"}`, a test named), and no verdict: `(scenario, runs,
+/// failures)`.
+fn main_red(file: &str) -> Option<(String, String, Vec<RedFailure>)> {
+    let line = file.trim();
+    if line.contains('\n') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("host_fault")?.as_bool() != Some(true)
+        || value.get("verdict").is_some()
+        || value.get("on")?.as_str() != Some("main")
+    {
+        return None;
+    }
+    let scenario = value
+        .get("scenario")?
+        .as_str()
+        .filter(|name| is_check_name(name))?
+        .to_string();
+    let failures: Vec<RedFailure> = value
+        .get("failures")?
+        .as_array()?
+        .iter()
+        .filter_map(|failure| {
+            let test = failure.get("test")?.as_str()?.trim();
+            (!test.is_empty()).then(|| RedFailure {
+                test: test.to_string(),
+                message: failure
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .collect();
+    if failures.is_empty() {
+        return None;
+    }
+    let runs = value
+        .get("runs")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some((scenario, runs, failures))
 }
 
 /// The cannot-judge fact of a verdict file: one JSON line with
@@ -1287,10 +1540,18 @@ impl PrivateDirectory {
 
     fn create_in(parent: &Path) -> std::io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt as _;
+        // The clock alone is not a nonce: two tests that ask in the same
+        // nanosecond (the clock's own resolution under a loaded host) would
+        // name one directory and one of them would fail on `AlreadyExists`.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
-        let path = parent.join(format!("spawn-gate-{}-{nonce:x}", std::process::id()));
+        let path = parent.join(format!(
+            "spawn-gate-{}-{nonce:x}-{ordinal}",
+            std::process::id()
+        ));
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
         Ok(Self(path))
     }
@@ -1394,7 +1655,7 @@ pub(crate) fn count_scenarios(directory: &Path) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaseDisagrees, Cpu, GateFailure, PrivateDirectory, gate_env, judge, judge_in,
+        BaseDisagrees, Cpu, GateFailure, PrivateDirectory, Shortfall, gate_env, judge, judge_in,
         on_shared_server, run_bounded, withhold_owners_cluster, write_gate_env,
     };
     use std::path::{Path, PathBuf};
@@ -1688,6 +1949,34 @@ mod tests {
                 Duration::from_secs(20),
             )
         }
+
+        /// [`FakeGate::judge`], and the base check it saw
+        /// ([`super::judge_seeing_base_check`]).
+        fn judge_seeing(
+            &self,
+            env: &[(String, String)],
+        ) -> (Result<super::Verdict, GateFailure>, Option<String>) {
+            self.judge_seeing_within(env, Duration::from_secs(20))
+        }
+
+        /// [`FakeGate::judge_seeing`] with the gate's wall clock `limit`.
+        fn judge_seeing_within(
+            &self,
+            env: &[(String, String)],
+            limit: Duration,
+        ) -> (Result<super::Verdict, GateFailure>, Option<String>) {
+            let path = |name: &str| -> PathBuf { self.directory.path().join(name) };
+            super::judge_seeing_base_check(
+                &path("gate.sh"),
+                Path::new("/nonexistent/repo.git"),
+                "base",
+                "candidate",
+                &path("scenarios"),
+                None,
+                env,
+                limit,
+            )
+        }
     }
 
     impl FakeGate {
@@ -1711,6 +2000,7 @@ mod tests {
                 None,
                 env,
                 Duration::from_secs(20),
+                &mut None,
             )
         }
     }
@@ -1802,9 +2092,12 @@ mod tests {
             "echo 'gate: 2.0 GiB free' >&2\necho '{NO_ROOM_FACT}' >\"$SPAWN_GATE_VERDICT\"\nexit 5\n"
         ));
         let Err(GateFailure::NoRoom {
-            free_kb,
-            min_gb,
-            tmpdir,
+            short:
+                Shortfall::Disk {
+                    free_kb,
+                    min_gb,
+                    tmpdir,
+                },
             log,
         }) = gate.judge(&path_only())
         else {
@@ -1815,6 +2108,41 @@ mod tests {
             (2_097_152, 10, "/data/tmp")
         );
         assert!(log.contains("! gate: 2.0 GiB free"), "{log}");
+    }
+
+    /// A scenario run that gave up waiting for a host scenario slot: the
+    /// same no-room class, its own check, measure and threshold.
+    #[test]
+    fn exit_5_with_the_slot_fact_is_no_room_for_the_slot() {
+        let fact =
+            r#"{"no_room":true,"check":"host scenario slot","waited_ms":1800000,"budget":2}"#;
+        let gate = FakeGate::new(&format!("echo '{fact}' >\"$SPAWN_GATE_VERDICT\"\nexit 5\n"));
+        let Err(GateFailure::NoRoom {
+            short: Shortfall::Slot { waited_ms, budget },
+            ..
+        }) = gate.judge(&path_only())
+        else {
+            panic!("a slot wait is no room");
+        };
+        assert_eq!((waited_ms, budget), (1_800_000, 2));
+    }
+
+    /// The fact reached stdout but not the file (a full disk): the slot
+    /// shape survives the fallback, where a disk measure would be wrong.
+    #[test]
+    fn exit_5_with_the_fact_on_stdout_alone_keeps_its_slot_shape() {
+        let fact = r#"{"no_room":true,"check":"host scenario slot","waited_ms":2000,"budget":1}"#;
+        let gate = FakeGate::new(&format!("echo '{fact}'\nexit 5\n"));
+        // Room to spare by measure: the slot fact still decides.
+        let Err(GateFailure::NoRoom {
+            short: Shortfall::Slot { waited_ms, budget },
+            log,
+        }) = gate.judge_room(&path_only(), &std::env::temp_dir(), Some(u64::MAX))
+        else {
+            panic!("the printed fact keeps the slot shape");
+        };
+        assert_eq!((waited_ms, budget), (2_000, 1));
+        assert!(log.contains("host scenario slot"), "{log}");
     }
 
     #[test]
@@ -1850,9 +2178,12 @@ mod tests {
         let gate = FakeGate::new("exit 0\n");
         let full = Path::new("/nonexistent/full-tmp");
         let Err(GateFailure::NoRoom {
-            free_kb,
-            min_gb,
-            tmpdir,
+            short:
+                Shortfall::Disk {
+                    free_kb,
+                    min_gb,
+                    tmpdir,
+                },
             log,
         }) = gate.judge_room(&path_only(), full, Some(0))
         else {
@@ -1889,9 +2220,12 @@ mod tests {
             env
         };
         let Err(GateFailure::NoRoom {
-            free_kb,
-            min_gb,
-            tmpdir,
+            short:
+                Shortfall::Disk {
+                    free_kb,
+                    min_gb,
+                    tmpdir,
+                },
             log,
         }) = gate.judge_room(&env("4"), &parent, Some(0))
         else {
@@ -2172,6 +2506,111 @@ mod tests {
     const HOST_FAULT_FACT: &str = "{\"host_fault\":true,\"scenario\":\"012.sh\",\"on\":\"base\",\
          \"runs\":\"1, then 0\",\"reason\":\"012.sh exited 1, then 0 on the base\"}";
 
+    /// Main is red on a check: exit 6 with the gate's fact `on` `main`, a
+    /// check's name and its shared failures; believed only whole (a check's
+    /// name, a failure that names its test) and only with exit 6.
+    #[test]
+    fn exit_6_with_the_main_red_fact_is_main_red() {
+        let fact = "{\"host_fault\":true,\"scenario\":\"check-tests.sh\",\"on\":\"main\",\
+                    \"runs\":\"1, then 1 on the candidate; 1, then 1 on the base\",\
+                    \"reason\":\"r\",\"failures\":[{\"test\":\"api::tests::one\",\
+                    \"message\":\"assertion failed\"},{\"test\":\"\",\"message\":\"x\"}]}";
+        let gate = FakeGate::new(&format!(
+            "echo '| == base: check-tests.sh'\necho '{fact}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
+        ));
+        let Err(GateFailure::MainRed {
+            scenario,
+            runs,
+            failures,
+            log,
+        }) = gate.judge(&path_only())
+        else {
+            panic!("exit 6 with the red fact is main red");
+        };
+        assert_eq!(scenario, "check-tests.sh");
+        assert_eq!(runs, "1, then 1 on the candidate; 1, then 1 on the base");
+        assert_eq!(
+            failures,
+            [super::RedFailure {
+                test: "api::tests::one".to_string(),
+                message: "assertion failed".to_string()
+            }],
+            "a failure without its test is dropped"
+        );
+        assert!(log.contains("| == base: check-tests.sh"), "{log}");
+        for wrong in [
+            fact.replace("check-tests.sh", "011.sh"),
+            fact.replace(
+                "{\"test\":\"api::tests::one\",\"message\":\"assertion failed\"},",
+                "",
+            ),
+            fact.replace("\"on\":\"main\"", "\"on\":\"mainline\""),
+        ] {
+            let gate = FakeGate::new(&format!(
+                "echo '{wrong}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
+            ));
+            assert!(
+                !matches!(gate.judge(&path_only()), Err(GateFailure::MainRed { .. })),
+                "{wrong}"
+            );
+        }
+        let gate = FakeGate::new(&format!("echo '{fact}' >\"$SPAWN_GATE_VERDICT\"\nexit 0\n"));
+        assert!(
+            !matches!(gate.judge(&path_only()), Err(GateFailure::MainRed { .. })),
+            "only with exit 6"
+        );
+    }
+
+    /// A base check that passed is seen whatever the gate ends with: a host
+    /// fault on another check, an exit with no fact of its own after the
+    /// gate's first word of it, a verdict; only as a check's name.
+    #[test]
+    fn a_passing_base_check_is_seen_whatever_the_gate_ends_with() {
+        let fault = FakeGate::new(
+            "echo '{\"host_fault\":true,\"scenario\":\"check-e2e.sh\",\"on\":\"candidate and base\",\"runs\":\"1, then 1 on the candidate; 1, then 1 on the base\",\"reason\":\"r\",\"base_check\":\"check-tests.sh\"}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n",
+        );
+        let (judged, seen) = fault.judge_seeing(&path_only());
+        assert!(
+            matches!(judged, Err(GateFailure::HostFault { .. })),
+            "{judged:?}"
+        );
+        assert_eq!(seen.as_deref(), Some("check-tests.sh"));
+        let aborted = FakeGate::new(
+            "echo '{\"base_check\":\"check-tests.sh\",\"base\":\"b\",\"candidate\":\"c\"}' >\"$SPAWN_GATE_VERDICT\"\nexit 3\n",
+        );
+        let (judged, seen) = aborted.judge_seeing(&path_only());
+        assert!(
+            matches!(judged, Err(GateFailure::Aborted { .. })),
+            "{judged:?}"
+        );
+        assert_eq!(seen.as_deref(), Some("check-tests.sh"));
+        let accepted = FakeGate::new(
+            "echo '{\"verdict\":\"accepted\",\"base_check\":\"check-tests.sh\"}' >\"$SPAWN_GATE_VERDICT\"\n",
+        );
+        assert_eq!(
+            accepted.judge_seeing(&path_only()).1.as_deref(),
+            Some("check-tests.sh")
+        );
+        for other in ["../check-tests.sh", "011.sh", ""] {
+            let named_badly = FakeGate::new(&format!(
+                "echo '{{\"verdict\":\"rejected\",\"reason\":\"r\",\"base_check\":\"{other}\"}}' >\"$SPAWN_GATE_VERDICT\"\n"
+            ));
+            assert_eq!(named_badly.judge_seeing(&path_only()).1, None, "{other}");
+        }
+        let without = FakeGate::new("echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n");
+        assert_eq!(without.judge_seeing(&path_only()).1, None);
+        // The integrator's wall clock kills the gate after the base check
+        // passed: still seen.
+        let killed = FakeGate::new(
+            "echo '{\"base_check\":\"check-tests.sh\",\"base\":\"b\",\"candidate\":\"c\"}' >\"$SPAWN_GATE_VERDICT\"\nexec sleep 30\n",
+        );
+        let (judged, seen) = killed.judge_seeing_within(&path_only(), Duration::from_millis(500));
+        assert!(matches!(judged, Err(GateFailure::Timeout)), "{judged:?}");
+        assert_eq!(seen.as_deref(), Some("check-tests.sh"));
+        let none = FakeGate::new("exit 3\n");
+        assert_eq!(none.judge_seeing(&path_only()).1, None);
+    }
+
     #[test]
     fn exit_6_with_the_host_fault_fact_is_a_host_fault() {
         let gate = FakeGate::new(&format!(
@@ -2183,6 +2622,7 @@ mod tests {
             runs,
             reason,
             log,
+            ..
         }) = gate.judge(&path_only())
         else {
             panic!("exit 6 with its fact is a host fault");
@@ -2204,6 +2644,83 @@ mod tests {
             gate.judge(&path_only()),
             Err(GateFailure::HostFault { on, .. }) if on == "candidate and base"
         ));
+    }
+
+    /// A sandbox that never started its command (gate.sh): `on` `sandbox`,
+    /// believed with its evidence and only with it.
+    #[test]
+    fn a_sandbox_that_never_started_is_a_host_fault_with_its_evidence() {
+        let fact = HOST_FAULT_FACT
+            .replace("\"on\":\"base\"", "\"on\":\"sandbox\"")
+            .replace("\"runs\":\"1, then 0\"", "\"runs\":\"never started\"")
+            .replace(
+                '}',
+                ",\"evidence\":\"sandbox_never_started\",\"tree\":\"base\"}",
+            );
+        let gate = FakeGate::new(&format!("echo '{fact}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"));
+        assert!(matches!(
+            gate.judge(&path_only()),
+            Err(GateFailure::HostFault { on, runs, tree, .. })
+                if on == "sandbox" && runs == "never started" && tree == Some(super::SandboxTree::Base)
+        ));
+        for wrong in [
+            fact.replace(",\"evidence\":\"sandbox_never_started\"", ""),
+            fact.replace("sandbox_never_started", "gate"),
+            fact.replace(",\"tree\":\"base\"", ""),
+            fact.replace("\"tree\":\"base\"", "\"tree\":\"elsewhere\""),
+        ] {
+            let gate = FakeGate::new(&format!(
+                "echo '{wrong}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
+            ));
+            assert!(
+                matches!(gate.judge(&path_only()), Err(GateFailure::Aborted { .. })),
+                "{wrong}"
+            );
+        }
+    }
+
+    /// The gate's own test server that did not start (gate.sh
+    /// `start_server`): `on` `test server`, believed with its evidence and a
+    /// start of `gate` or `candidate`, and only with them.
+    #[test]
+    fn a_test_server_that_never_started_is_a_host_fault_with_its_evidence() {
+        let fact = HOST_FAULT_FACT
+            .replace("\"scenario\":\"012.sh\"", "\"scenario\":\"test server\"")
+            .replace("\"on\":\"base\"", "\"on\":\"test server\"")
+            .replace("\"runs\":\"1, then 0\"", "\"runs\":\"never started\"")
+            .replace(
+                '}',
+                ",\"evidence\":\"test_server_never_started\",\"tree\":\"candidate\"}",
+            );
+        for (tree, expected) in [
+            ("candidate", super::SandboxTree::Candidate),
+            ("gate", super::SandboxTree::Gate),
+        ] {
+            let fact = fact.replace("\"tree\":\"candidate\"", &format!("\"tree\":\"{tree}\""));
+            let gate = FakeGate::new(&format!("echo '{fact}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"));
+            assert!(
+                matches!(
+                    gate.judge(&path_only()),
+                    Err(GateFailure::HostFault { on, runs, tree, .. })
+                        if on == "test server" && runs == "never started" && tree == Some(expected)
+                ),
+                "{fact}"
+            );
+        }
+        for wrong in [
+            fact.replace(",\"evidence\":\"test_server_never_started\"", ""),
+            fact.replace("test_server_never_started", "sandbox_never_started"),
+            fact.replace(",\"tree\":\"candidate\"", ""),
+            fact.replace("\"tree\":\"candidate\"", "\"tree\":\"base\""),
+        ] {
+            let gate = FakeGate::new(&format!(
+                "echo '{wrong}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
+            ));
+            assert!(
+                matches!(gate.judge(&path_only()), Err(GateFailure::Aborted { .. })),
+                "{wrong}"
+            );
+        }
     }
 
     #[test]
@@ -2347,6 +2864,9 @@ mod tests {
             "SPAWN_TEST_DATABASE_URL" => Some("postgres://t:p@127.0.0.1:15434/spawn_test".into()),
             "SPAWN_GATE_MIN_FREE_GB" => Some("10".into()),
             "SPAWN_GATE_JOBS" => Some("4".into()),
+            "SPAWN_GATE_HOST_JOBS" => Some("2".into()),
+            "SPAWN_GATE_BUILD_JOBS" => Some("3".into()),
+            "SPAWN_GATE_SLOT_PRIORITY" => Some("low".into()),
             "SPAWN_GATE_PG_IMAGE" => Some("postgres:16-alpine".into()),
             "SPAWN_GATE_PG_BIN" => Some("/usr/lib/postgresql/16/bin".into()),
             "SUPPLY_PA_DEPS" => {
@@ -2370,6 +2890,8 @@ mod tests {
                 "SPAWN_TEST_DATABASE_URL",
                 "SPAWN_GATE_MIN_FREE_GB",
                 "SPAWN_GATE_JOBS",
+                "SPAWN_GATE_HOST_JOBS",
+                "SPAWN_GATE_BUILD_JOBS",
                 "SPAWN_GATE_PG_IMAGE",
                 "SPAWN_GATE_PG_BIN",
                 "SUPPLY_PA_DEPS"

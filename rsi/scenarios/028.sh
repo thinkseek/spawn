@@ -537,7 +537,9 @@ step() {
   id="toolu_${SPAWN_EXECUTION_ID}_$count"
   line "\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"$id\",\"name\":\"Bash\",\"input\":{}}],\"stop_reason\":\"tool_use\"}"
   printf 'work %s\n' "$n" >>work.txt
-  printf '%s %s\n' "$(date +%s%3N)" "$n" >"$BB_WORK/last-$agent"
+  # Atomically (a reader never sees it truncated: `>` empties the file before
+  # it writes, and working() read it empty once, exit 2 on the base, task 209).
+  printf '%s %s\n' "$(date +%s%3N)" "$n" >"$BB_WORK/last-$agent.$$" && mv -f "$BB_WORK/last-$agent.$$" "$BB_WORK/last-$agent"
   sleep 0.2
   line "\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"$id\",\"content\":\"ok\"}]}"
   sleep 0.8
@@ -752,8 +754,9 @@ revival_key() { # the command with the key `recover-<execution>-<attempt>`: `id|
 # The engine's first turn of an agent that started after a time:
 # `ms agent session execution native how lines valid`.
 turn_after() { awk -v a="$1" -v t="$2" '$2 == a && $1 > t { print; exit }' "$WORK/turns.log"; }
-last_line() { # the last line an agent's engine wrote: `ms n`
-    cat "$WORK/last-$1" 2>/dev/null || echo "0 0"
+last_line() { # the last line an agent's engine wrote: `ms n` ("0 0" before its first)
+    _l=$(cat "$WORK/last-$1" 2>/dev/null) || _l=""
+    case "$_l" in [0-9]*\ [0-9]*) echo "$_l" ;; *) echo "0 0" ;; esac
 }
 working() { # the agent's engine wrote a line within the last 3 s
     set -- "$(last_line "$1")"
@@ -993,7 +996,10 @@ session=$(get $label session)
 exec=$(get $label exec)
 failed_at=$(q "select min(recorded_at_ms) from spawn_events where session_id = '$session'
     and execution_id = '$exec' and event_name = 'turn.failed' and recorded_at_ms >= $t0")
-put $label written "$(last_line "$agent" | cut -d' ' -f2)"
+# `written` stays the snapshot's, taken with the fault: the turn that
+# follows must find every line the engine had written then. Reading it
+# here, tens of seconds on, would count the resumed session's own work
+# as lines it failed to find (task 202: "held 5 ... had written 47").
 record=$(interrupted "$exec" "$(get $label fault)")
 if [ -z "$record" ]; then
     measured_fail "(3) $agent's model answered 'prompt is too long' (turn.failed at ${failed_at:-never}), and no execution.interrupted names it: $(describe $label "$t0" "$(get $label command)")"
@@ -1017,7 +1023,10 @@ label=model
 agent=$(get $label agent)
 session=$(get $label session)
 exec=$(get $label exec)
-put $label written "$(last_line "$agent" | cut -d' ' -f2)"
+# `written` stays the snapshot's, taken with the fault: the turn that
+# follows must find every line the engine had written then. Reading it
+# here, tens of seconds on, would count the resumed session's own work
+# as lines it failed to find (task 202: "held 5 ... had written 47").
 records=$(records_of execution.interrupted "$exec" | awk -F'|' -v t="$(get $label fault)" '$1 >= t')
 first=$(printf '%s\n' "$records" | sed -n 1p)
 if [ -z "$first" ]; then
@@ -1067,7 +1076,10 @@ label=auth
 agent=$(get $label agent)
 session=$(get $label session)
 exec=$(get $label exec)
-put $label written "$(last_line "$agent" | cut -d' ' -f2)"
+# `written` stays the snapshot's, taken with the fault: the turn that
+# follows must find every line the engine had written then. Reading it
+# here, tens of seconds on, would count the resumed session's own work
+# as lines it failed to find (task 202: "held 5 ... had written 47").
 record=$(interrupted "$exec" "$(get $label fault)")
 if [ -z "$record" ]; then
     measured_fail "(5) $agent's turn failed with the model's 401 (login expired) and no execution.interrupted names it: $(describe $label "$t0" "$(get $label command)")"

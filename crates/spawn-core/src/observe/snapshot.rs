@@ -145,7 +145,7 @@ impl Snapshot {
                 self.open_tools.clear();
             }
             EventKind::JobStarted { .. } | EventKind::JobEnded { .. } => self.job(record),
-            EventKind::TurnFailed { error } => {
+            EventKind::TurnFailed { error, .. } => {
                 self.turn = Some(TurnFact::Failed);
                 self.last_error = Some(error.clone());
                 self.open_tools.clear();

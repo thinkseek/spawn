@@ -68,21 +68,22 @@ select jsonb_build_object(
 /// The control records after `$1`, oldest first, at most `$2`: what the loop
 /// has not looked at yet. `next` is the event id it continues from (the
 /// batch's last one, or `$1` when there was none).
+/// The batch is read once: `next` and `records` are that one read's last id
+/// and rows, not two reads of the control stream (the loop reads it on every
+/// pass it acts on).
 pub(crate) const CONTROL: &str = r"
+with batch as (
+  select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
+    from spawn_events e
+   where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+     and e.id > $1
+   order by e.id limit $2)
 select jsonb_build_object(
-  'next', coalesce((select max(x.id) from (
-      select e.id from spawn_events e
-       where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-         and e.id > $1
-       order by e.id limit $2) x), $1),
-  'records', coalesce((select jsonb_agg(jsonb_build_object(
-        'event_id', x.id, 'at_ms', x.recorded_at_ms, 'record', x.record)
-      order by x.id) from (
-      select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
-        from spawn_events e
-       where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-         and e.id > $1
-       order by e.id limit $2) x), '[]'::jsonb))";
+  'next', coalesce(max(b.id), $1),
+  'records', coalesce(jsonb_agg(jsonb_build_object(
+        'event_id', b.id, 'at_ms', b.recorded_at_ms, 'record', b.record)
+      order by b.id), '[]'::jsonb))
+from batch b";
 
 /// The records the alert conditions read, newest last, since `$1`: the ones
 /// objectives 028, 029, 031 and 033 define, and the halt and resume, so a
@@ -105,26 +106,35 @@ from (select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
 /// Every session's latest judgement, with the execution end after it (a
 /// stop clears a stuck alert). The Observer keeps the latest judgement
 /// covering the latest fact; the alert reads the same one.
+///
+/// Two reads of the log whatever the number of sessions: the judgements,
+/// and the first end after each of them, joined once. (The live log's ten
+/// judgements cost 21 scans a pass read as correlated subqueries, one per
+/// judgement and one per end.)
 pub(crate) const OBSERVATIONS: &str = r"
+with latest as (
+  select distinct on (e.session_id)
+         e.session_id, e.agent_id, e.id, e.recorded_at_ms,
+         e.kind -> 'detail' -> 'observation' as observation
+    from spawn_events e
+   where e.event_name = 'observation.recorded'
+   order by e.session_id, e.id desc),
+ended as (
+  select distinct on (e.session_id) e.session_id, e.id, e.kind
+    from spawn_events e
+    join latest l using (session_id)
+   where e.event_name = 'execution.ended' and e.id > l.id
+   order by e.session_id, e.id)
 select coalesce(jsonb_agg(jsonb_build_object(
       'session_id', o.session_id, 'agent_id', o.agent_id, 'event_id', o.id,
       'at_ms', o.recorded_at_ms, 'observation', o.observation,
       'ended_event', o.ended_event, 'ended_cause', o.ended_cause)
     order by o.session_id), '[]'::jsonb)
-from (select distinct on (e.session_id)
-             e.session_id, e.agent_id, e.id, e.recorded_at_ms,
-             e.kind -> 'detail' -> 'observation' as observation,
-             (select x.id from spawn_events x
-               where x.session_id = e.session_id and x.event_name = 'execution.ended'
-                 and x.id > e.id
-               order by x.id limit 1) as ended_event,
-             (select x.kind -> 'detail' ->> 'cause' from spawn_events x
-               where x.session_id = e.session_id and x.event_name = 'execution.ended'
-                 and x.id > e.id
-               order by x.id limit 1) as ended_cause
-        from spawn_events e
-       where e.event_name = 'observation.recorded'
-       order by e.session_id, e.id desc) o";
+from (select l.session_id, l.agent_id, l.id, l.recorded_at_ms, l.observation,
+             x.id as ended_event, x.kind -> 'detail' ->> 'cause' as ended_cause
+        from latest l
+        left join ended x using (session_id)
+       order by l.session_id) o";
 
 /// Commands that finished failed after `$1`, oldest first: a notice each,
 /// an owner's note excepted (the alert step skips those).
@@ -169,6 +179,35 @@ from (select 'fired' as transition, a.key, a.kind, a.subject,
              coalesce(a.cleared_evidence, '{}'::jsonb), a.notice
         from spawn_alerts a where a.cleared_event_id > $1) t
 limit $2";
+
+/// Whether an integrator runs, and the work that waits for one: `locked`,
+/// some backend holds the integrator's advisory lock on this store
+/// (`integrator_try_lock`: the two-key form, `$1` and the schema's
+/// `hashtext`, in this database); `waiting`, every reported task of a gated
+/// mission that is open or active, not halted, and whose source no owner
+/// holds now (a deploy restarting the integrator holds it, and so does an
+/// owner's push). pg_locks is no table: a reading with no waiting work
+/// scans nothing but the tasks' index.
+pub(crate) const INTEGRATOR: &str = r"
+select jsonb_build_object(
+  'now_ms', spawn_now_ms(),
+  'locked', exists (select 1 from pg_locks l
+                     where l.locktype = 'advisory' and l.granted
+                       and l.database = (select d.oid from pg_database d
+                                          where d.datname = current_database())
+                       and l.classid = $1::int4::oid
+                       and l.objid = hashtext(current_schema())::oid
+                       and l.objsubid = 2),
+  'waiting', coalesce((select jsonb_agg(jsonb_build_object('mission', m.id, 'task', k.id)
+                                        order by k.id)
+                         from mission_tasks k
+                         join mission_missions m on m.id = k.mission_id
+                        where k.state = 'reported' and m.gate is not null
+                          and m.state in ('open', 'active') and m.halted is null
+                          and not exists (select 1 from mission_source_holds h
+                                           where h.source = m.sources ->> 0
+                                             and h.expires_ms > spawn_now_ms())),
+                      '[]'::jsonb))";
 
 impl PostgresStore {
     /// Record an `alert.fired` or `alert.cleared` record (owner only).
@@ -220,6 +259,12 @@ impl PostgresStore {
     /// Commands that finished failed after `since_ms` ([`FAILED_COMMANDS`]).
     pub fn alert_failed_commands(&self, since_ms: i64) -> Result<Value, StoreError> {
         self.query_json(FAILED_COMMANDS, &[&since_ms])
+    }
+
+    /// Whether an integrator holds its lock, and the reported work that
+    /// waits for one ([`INTEGRATOR`]).
+    pub fn alert_integrator(&self) -> Result<Value, StoreError> {
+        self.query_json(INTEGRATOR, &[&crate::missions::INTEGRATOR_LOCK_KEY])
     }
 
     /// The alerts the window shows ([`ALERTS`]).

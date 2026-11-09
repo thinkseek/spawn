@@ -120,6 +120,7 @@ End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s)
 | `SPAWN_PROGRAM` | current binary, else `spawn` | `spawn` path used inside the terminal, in the commands the dispatcher submits, and in the supervisor's charter. When unset: the path of the running executable, or plain `spawn` if that path cannot be determined |
 | `SPAWN_JUDGE_URL` | unset | Jev judge service; without it the rules judge alone, and a case they cannot settle asks for attention |
 | `SPAWN_LOOP_INTERVAL_MS` | `500` | Pause between `spawn loop` passes |
+| `SPAWN_SCREEN_QUIET_MS` | `500` | How long a live execution's transcript must hold still before its pane is read for what the transcript cannot say (the prompt is back); shorter is readier sooner and costs more captures |
 | `SPAWN_INTEGRATE_GATES` | `1` | Gates `spawn integrate` runs at once, across missions (one per mission; `--gates` overrides it). More than 1 (up to 8) is refused unless `SPAWN_TEST_DATABASE_PER_GATE=1`: the gates share one test database server today |
 | `SPAWN_TEST_DATABASE_LOG` | unset | The test database server's log (`log_line_prefix` `%m [%p] `), read by `spawn integrate` for a crash during a gate: database errors then make a check-tests.sh failure a host fault (`host_fault`), not a rejection. Unset, only connection errors do |
 | `SPAWN_GATE_HOST_FAULT_BACKOFF_SECS` | `300` | Wait after the first host fault in a row before the task is judged again; doubled per host fault in a row, at most an hour |

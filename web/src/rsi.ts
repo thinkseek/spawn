@@ -11,8 +11,10 @@ import { labels } from "./label.ts";
 
 export type Direction = "lower" | "higher";
 
-/** `open` until solved (one-shot) or met (recurring, metric at target). */
-export type ObjectiveStatus = "open" | "solved" | "met";
+/** `open` until solved (one-shot) or met (recurring, metric at target);
+ * `owner` for an objective the owner judges outside the gate (backlog
+ * `"owner_judged": true`), which the fleet never assigns. */
+export type ObjectiveStatus = "open" | "solved" | "met" | "owner";
 
 /** One `task.gated` record of the control stream. */
 export interface GateVerdict {
@@ -246,7 +248,9 @@ function normalizeLanding(value: unknown): RsiLanding {
 }
 
 function objectiveStatus(value: unknown): ObjectiveStatus {
-  return value === "solved" || value === "met" ? value : "open";
+  return value === "solved" || value === "met" || value === "owner"
+    ? value
+    : "open";
 }
 
 function normalizeObjective(value: unknown): RsiObjective {

@@ -550,6 +550,29 @@ select coalesce(jsonb_agg(jsonb_build_object(
         and d.succeeded and jsonb_typeof(d.action -> 'tags') = 'array'
         and d.action -> 'tags' ? ('missions objective-yielded-' || x.id))";
 
+/// The objectives that closed solved on the base and the supervisor was not
+/// told of yet, oldest first: an `objective.solved` record of the
+/// integrator's (its `solved_on_base`: the objective's scenario passes at a
+/// base commit main already holds, so its task ends as a solved cancel and
+/// no task for it is assigned again) that no digest which reached the
+/// supervisor carried the tag `missions objective-solved-<event_id>` of.
+/// Each names its event, time, mission and the record's own fields
+/// (`objective`, `task`, `scenario`, `base`); the gate's `log` is left out.
+pub(crate) const OBJECTIVE_SOLVED_NEWS: &str = r"
+select coalesce(jsonb_agg(
+         ((e.kind -> 'detail' -> 'record') - 'log'::text)
+           || jsonb_build_object('event_id', e.id, 'at_ms', e.recorded_at_ms,
+                                 'mission', (e.kind -> 'detail' -> 'record' ->> 'id')::bigint)
+         order by e.session_seq), '[]'::jsonb)
+  from spawn_events e
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' = 'objective.solved'
+   and not exists (
+     select 1 from spawn_commands d
+      where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch'
+        and d.succeeded and jsonb_typeof(d.action -> 'tags') = 'array'
+        and d.action -> 'tags' ? ('missions objective-solved-' || e.id))";
+
 /// Gate verdicts on one objective's tasks, newest first, from the control
 /// stream: `[{task, verdict, reason, metric, at_ms}]`, `incompatible` (sent
 /// back because main moved, not a rejection) among them. `$1` mission,
@@ -618,7 +641,9 @@ select coalesce(jsonb_agg(jsonb_build_object(
 /// `base` (a scenario's harness error before any candidate code ran),
 /// objective 033's `base_disagrees`, or the `cannot_judge` a scenario says
 /// of a host that cannot judge it at all (029). Those count toward no halt,
-/// so they never count toward the cap either.
+/// so they never count toward the cap either. Nor does the gate's own test
+/// server that did not start (`on` `test server`), whichever start it was:
+/// no candidate code makes a server start.
 pub(crate) const TASK_HOST_FAULTS: &str = r"
 select count(*)
   from spawn_events e
@@ -627,9 +652,12 @@ select count(*)
    and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
    and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
    and e.kind -> 'detail' -> 'record' ->> 'revision' = $2
-   and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') <> 'base'
+   and e.kind -> 'detail' -> 'record' ->> 'base' = $3
+   and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') not in ('base', 'candidate and base', 'main', 'test server')
+   and not (coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') = 'sandbox'
+            and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'tree', '') <> 'candidate')
    and coalesce(e.kind -> 'detail' -> 'record' ->> 'evidence', '') not in
-       ('base_disagrees', 'cannot_judge')";
+       ('base_disagrees', 'cannot_judge', 'main_red')";
 
 /// The work an ephemeral objective task starts from: the newest earlier
 /// task of its objective that ended without landing (cancelled, aborted or
@@ -680,16 +708,24 @@ select coalesce((
 /// (`spawn_task_may_continue`) still lets go on, with that work: every task
 /// the integrator may judge, land, or hold to its budget, with the brief and
 /// the report a landing's message is written from. Each names `hold`, the
-/// active owner's hold on its source (or null), and each task `held_by`.
+/// active owner's hold on its source (or null), `red` its source's red main
+/// (`mission_source_reds`: main, scenario, since_ms, latest_ms, probed_ms; or
+/// null), and each task `held_by`.
 pub(crate) const GATED: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
   select m.id, m.state, m.gate, m.accept, m.budget, m.baseline, m.halted, m.scenario_floor,
+         spawn_now_ms() as now_ms,
          m.gate_rejections, m.gate_aborts, m.gate_room_task, m.gate_room_since_ms,
          m.gate_room_last_ms,
          m.gate_room_waits, m.gate_room_escalated, m.gate_host_faults, m.gate_host_task,
-         m.gate_host_due_ms, m.gate_base_disagrees, m.objectives, m.sources ->> 0 as source,
+         m.gate_host_due_ms, m.gate_base_disagrees, m.gate_rejection_objective,
+         m.objectives, m.sources ->> 0 as source,
          (select h.hold from mission_source_holds h where h.source = m.sources ->> 0) as hold,
+         (select jsonb_build_object('main', r.main, 'scenario', r.scenario,
+                                    'since_ms', r.since_ms, 'latest_ms', r.red_ms,
+                                    'probed_ms', r.probed_ms)
+            from mission_source_reds r where r.source = m.sources ->> 0) as red,
          (select max(e.recorded_at_ms) from spawn_events e
            where e.session_id = 'session_control' and e.event_name = 'control.recorded'
              and e.kind -> 'detail' -> 'record' ->> 'type' = 'mission.configured'
@@ -777,6 +813,32 @@ select coalesce(jsonb_agg((r - 'log') || jsonb_build_object('event_id', e.id,
    and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
    and e.kind -> 'detail' -> 'record' ->> 'escalate' = 'true'
    and not exists (select 1 from told where tag = 'host gate-host-fault-' || e.id)";
+
+/// The `source.main_red` records that start a red (`alert`: the first of
+/// the source's red, the store's) and the `source.main_green` records that
+/// end one, that the supervisor was not told of yet, oldest first, each with
+/// its `event_id` and `at_ms`. Told is a record, as for
+/// [`GATE_HOST_FAULT_ESCALATIONS`]: a digest that reached the supervisor
+/// carrying the tag `host main-red-<event_id>` or `host main-green-<event_id>`,
+/// however long ago.
+pub(crate) const MAIN_RED_NEWS: &str = r"
+with told as (
+  select distinct tag
+    from spawn_commands d
+   cross join lateral jsonb_array_elements_text(
+           case when jsonb_typeof(d.action -> 'tags') = 'array'
+                then d.action -> 'tags' else '[]'::jsonb end) tag
+   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
+)
+select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.recorded_at_ms)
+                          order by e.session_seq), '[]'::jsonb)
+  from spawn_events e
+ cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and ((r ->> 'type' = 'source.main_red' and r ->> 'alert' = 'true'
+         and not exists (select 1 from told where tag = 'host main-red-' || e.id))
+        or (r ->> 'type' = 'source.main_green'
+            and not exists (select 1 from told where tag = 'host main-green-' || e.id)))";
 
 /// The `host_fault` gate records whose base disagreed with itself and that
 /// carry `alert` (the mission's third such base in a row, objective 033),
@@ -1227,6 +1289,12 @@ impl PostgresStore {
         self.query_json(OBJECTIVE_YIELDS, &[])
     }
 
+    /// The objectives that closed solved on the base and were not told to the
+    /// supervisor yet ([`OBJECTIVE_SOLVED_NEWS`]).
+    pub fn objective_solved_news(&self) -> Result<Value, StoreError> {
+        self.query_json(OBJECTIVE_SOLVED_NEWS, &[])
+    }
+
     /// An objective mission's landed tasks, newest first.
     pub fn objective_landings(&self, mission: i64) -> Result<Value, StoreError> {
         self.query_json(OBJECTIVE_LANDINGS, &[&mission])
@@ -1449,6 +1517,12 @@ impl PostgresStore {
         self.query_json(GATE_BASE_DISAGREES_ALERTS, &[])
     }
 
+    /// The red mains that started and the ones that ended, not told to the
+    /// supervisor yet ([`MAIN_RED_NEWS`]).
+    pub fn main_red_news(&self) -> Result<Value, StoreError> {
+        self.query_json(MAIN_RED_NEWS, &[])
+    }
+
     /// The second overrun of an objective's chain that the supervisor was
     /// not told of yet ([`OVER_BUDGET_ESCALATIONS`]).
     pub fn over_budget_escalations(&self) -> Result<Value, StoreError> {
@@ -1643,7 +1717,7 @@ impl PostgresStore {
 
     /// Tasks the dispatcher has to deliver, watch or wind down.
     pub fn delivery_rows(&self) -> Result<Value, StoreError> {
-        self.query_json(DELIVERY_TASKS, &[])
+        self.query_json_prepared(DELIVERY_TASKS, &[])
     }
 
     /// The latest `source.moved` record, `{id, at_ms}`, or null
@@ -1655,23 +1729,23 @@ impl PostgresStore {
     /// Residents whose latest delivered task is cancelled, with the
     /// checkpoint it started from ([`CANCELLED_DELIVERIES`]).
     pub fn cancelled_deliveries(&self) -> Result<Value, StoreError> {
-        self.query_json(CANCELLED_DELIVERIES, &[])
+        self.query_json_prepared(CANCELLED_DELIVERIES, &[])
     }
 
     /// What the dispatcher measures stalls from ([`STALL_FACTS`]).
     pub fn stall_facts(&self) -> Result<Value, StoreError> {
-        self.query_json(STALL_FACTS, &[])
+        self.query_json_prepared(STALL_FACTS, &[])
     }
 
     /// Missions, reports, approvals and human messages for the digest.
     pub fn mission_news(&self) -> Result<Value, StoreError> {
-        self.query_json(MISSION_NEWS, &[])
+        self.query_json_prepared(MISSION_NEWS, &[])
     }
 
     /// Approved residents that have run before: the ones the liveness rule
     /// keeps, as (agent, session, charter).
     pub fn residents_to_keep(&self) -> Result<Vec<(String, String, String)>, StoreError> {
-        let rows = self.query(RESIDENTS_TO_KEEP, &[])?;
+        let rows = self.query_prepared(RESIDENTS_TO_KEEP, &[])?;
         Ok(rows
             .iter()
             .map(|row| (row.get(0), row.get(1), row.get(2)))
@@ -1680,7 +1754,7 @@ impl PostgresStore {
 
     /// Residents that are retired, for winding down their sessions.
     pub fn retired_residents(&self) -> Result<Vec<(String, String)>, StoreError> {
-        let rows = self.query(RETIRED_RESIDENTS, &[])?;
+        let rows = self.query_prepared(RETIRED_RESIDENTS, &[])?;
         Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
     }
 
@@ -1789,15 +1863,21 @@ impl PostgresStore {
     }
 
     /// How many `host_fault` gate verdicts task `task` has at its report
-    /// revision `revision`, but a base-only one (the gate's fact `on`
-    /// `base`, before any candidate code ran): read from its control
-    /// records by the record-id index. The integrator counts the next one
-    /// past its cap as an abort.
-    pub fn task_host_faults(&self, task: i64, revision: i64) -> Result<i64, StoreError> {
+    /// revision `revision` judged against main `base` (the record's `base`:
+    /// a fault on an older main says nothing of this one), but a base-only
+    /// one (the gate's fact `on` `base`, before any candidate code ran):
+    /// read from its control records by the record-id index. The integrator
+    /// counts the next one past its cap as an abort.
+    pub fn task_host_faults(
+        &self,
+        task: i64,
+        revision: i64,
+        base: &str,
+    ) -> Result<i64, StoreError> {
         Ok(self
             .query_one(
                 TASK_HOST_FAULTS,
-                &[&task.to_string(), &revision.to_string()],
+                &[&task.to_string(), &revision.to_string(), &base],
             )?
             .get(0))
     }

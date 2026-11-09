@@ -1,6 +1,8 @@
 [
-  {"id": "postgres-daily-14d", "enabled": true, "prefix": "postgres/daily/", "condition": {"type": "Age", "maxAgeSeconds": 1209600}},
-  {"id": "postgres-weekly-56d", "enabled": true, "prefix": "postgres/weekly/", "condition": {"type": "Age", "maxAgeSeconds": 4838400}},
-  {"id": "postgres-monthly-365d", "enabled": true, "prefix": "postgres/monthly/", "condition": {"type": "Age", "maxAgeSeconds": 31536000}},
+  {"id": "postgres-hourly-5h", "enabled": true, "prefix": "postgres/hourly/", "condition": {"type": "Age", "maxAgeSeconds": 18000}},
+  {"id": "postgres-daily-6d", "enabled": true, "prefix": "postgres/daily/", "condition": {"type": "Age", "maxAgeSeconds": 518400}},
+  {"id": "postgres-weekly-27d", "enabled": true, "prefix": "postgres/weekly/", "condition": {"type": "Age", "maxAgeSeconds": 2332800}},
+  {"id": "bundles-full-13d", "enabled": true, "prefix": "bundles/full/", "condition": {"type": "Age", "maxAgeSeconds": 1123200}},
+  {"id": "bundles-incr-13d", "enabled": true, "prefix": "bundles/incr/", "condition": {"type": "Age", "maxAgeSeconds": 1123200}},
   {"id": "locktest-1d", "enabled": true, "prefix": "locktest/", "condition": {"type": "Age", "maxAgeSeconds": 86400}}
 ]

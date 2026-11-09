@@ -149,6 +149,14 @@ fn launch(program: &str, arguments: &[&str], environment: &[(&str, &str)]) -> La
     }
 }
 
+/// Dead panes the test starts for one whose exit status the server records
+/// (see the dead-pane section: a server that never reaps its child records
+/// none), and how long one is waited for: the status is recorded the moment
+/// the child is reaped, so an attempt that has not seen it in seconds will
+/// never see it.
+const DEAD_PANE_ATTEMPTS: u32 = 6;
+const DEAD_PANE_WAIT: Duration = Duration::from_secs(5);
+
 /// What `runner` answers once it stops answering `Running` or `limit`
 /// passes.
 fn settled(host: &TmuxHost, limit: Duration) -> Runner {
@@ -216,26 +224,39 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
     // A dead pane kept by remain-on-exit: the runner exited (3) and the
     // session stays.
     server.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
-    host.start(&launch("/bin/sh", &["-c", "exit 3"], &[("A", "1")]))
-        .expect("start");
     // tmux marks the pane dead when its terminal closes, and records the
     // exit status when it reaps the process, a moment later on a loaded host
-    // ("exit status none" in between: an owner gate, 2026-11-07; and a gate
-    // running 34 test binaries two at a time starved the server past five
-    // seconds, 2026-11-08). Wait for the status, with room for a loaded host;
-    // a server that never records it still fails the assertion below.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let seen = loop {
-        let Runner::Untracked(seen) = settled(&host, Duration::from_secs(5)) else {
-            panic!("a dead pane hosts no runner");
-        };
-        if !seen.contains("exit status none") || Instant::now() > deadline {
-            break seen;
+    // ("exit status none" in between: an owner gate, 2026-11-07). Its server
+    // sometimes never reaps that child at all — a zombie, `pane_dead` 1 and
+    // no status for minutes on this host, 2026-11-08 — and a status it never
+    // recorded cannot be read. That is the terminal's doing, not the
+    // runner's, so the pane is started again for one the server reaps; the
+    // assertion below still holds every attempt to the same fact.
+    let mut seen = String::new();
+    for attempt in 1..=DEAD_PANE_ATTEMPTS {
+        host.start(&launch("/bin/sh", &["-c", "exit 3"], &[("A", "1")]))
+            .expect("start");
+        let deadline = Instant::now() + DEAD_PANE_WAIT;
+        loop {
+            let Runner::Untracked(why) = settled(&host, Duration::from_secs(5)) else {
+                panic!("a dead pane hosts no runner");
+            };
+            seen = why;
+            if !seen.contains("exit status none") || Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+        assert!(
+            host.is_alive(&terminal(), &workspace()).expect("alive"),
+            "a dead pane's session stays up"
+        );
+        if seen.contains("dead (exit status 3)") || attempt == DEAD_PANE_ATTEMPTS {
+            break;
+        }
+        host.terminate(&terminal(), &workspace()).expect("kill");
+    }
     assert!(seen.contains("dead (exit status 3)"), "{seen}");
-    assert!(host.is_alive(&terminal(), &workspace()).expect("alive"));
 }
 
 /// A launch right after the server's last terminal ended (the only

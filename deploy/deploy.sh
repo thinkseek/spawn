@@ -337,7 +337,7 @@ say "restarted; live at $head"
 # judges the rest itself; results are written whole or not at all. The log
 # is $live/gate-warm/<head>.log (logs older than a week go).
 warm_base_cache() {
-  local pid controller log assignment name keep=() cached
+  local pid controller log assignment name keep=() cached host_jobs="" slots_dir
   controller=$(readlink -f "$live/controllers/spawn") && [ -f "$controller/scripts/rsi/gate.sh" ] || {
     say "base cache: no controller at $live/controllers/spawn; not warmed"
     return 0
@@ -371,6 +371,26 @@ warm_base_cache() {
     pg_url_parse "$test_url" && test_server="$pg_url_host:$pg_url_port"
     if [ -n "$test_server" ] && [ "$test_server" != "$owner_server" ]; then
       keep+=("SPAWN_TEST_DATABASE_URL=$test_url")
+    fi
+  fi
+  # The host's scenario budget, stated once for every gate on this host: the
+  # integrator's own value, when its gate environment names one. The gates
+  # only read $home/.cache/spawn/gate-slots/host_jobs (scripts/rsi/gate.sh,
+  # "Host scenario slots"), so the number no longer depends on what
+  # SPAWN_GATE_JOBS happens to be for a hand-run gate, and a gate started
+  # with a larger value cannot exceed it. No value in the environment: the
+  # file is left as it is, never removed (the owner may have set one).
+  for assignment in "${keep[@]}"; do
+    case $assignment in SPAWN_GATE_HOST_JOBS=*) host_jobs=${assignment#*=} ;; esac
+  done
+  if [[ $host_jobs =~ ^[1-9][0-9]*$ ]]; then
+    slots_dir=$home/.cache/spawn/gate-slots
+    if mkdir -p "$slots_dir" && chmod 700 "$slots_dir" 2>/dev/null &&
+      printf '%s\n' "$host_jobs" >"$slots_dir/host_jobs.new" &&
+      mv -f "$slots_dir/host_jobs.new" "$slots_dir/host_jobs"; then
+      say "host scenario slots: $host_jobs (stated in $slots_dir/host_jobs)"
+    else
+      say "host scenario slots: could not write $slots_dir/host_jobs; gates fall back to SPAWN_GATE_HOST_JOBS"
     fi
   fi
   mkdir -p "$live/gate-warm"

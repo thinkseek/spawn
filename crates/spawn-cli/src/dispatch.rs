@@ -6,6 +6,14 @@
 //! 1. Rules over facts decide fixed cases: a lost execution is resumed once,
 //!    and a session whose resume failed is escalated, never resumed again by
 //!    rule (the one-resume rule, `worker::resume_lost`).
+//!
+//!    Every end its cause and its way back is the recovery's business
+//!    (`crate::recover`, docs/fleet-architecture.md §3.1): it records each
+//!    interruption with the facts it was told from and revives by one keyed
+//!    command, whatever the agent, and the one-resume rule gives way where
+//!    it has recorded one ([`Facts::recovered`]). What is left here is the
+//!    fallback for an end it has not recorded: a lost execution of an
+//!    ephemeral worker, resumed once and else escalated.
 //! 2. One guarded nudge: when Jev judged that a worker stopped at an idle
 //!    prompt without needing anyone (WAITING, confident, `needs_human` and
 //!    `stuck` low), it gets `continue` typed in, once per episode and at most
@@ -57,9 +65,25 @@
 //! [`Plan`] ([`decide_with`]), reads it from the store ([`read_plan`], which
 //! the UI's attention queue calls too: `GET /api/attention`) and submits it
 //! ([`step`]).
+//!
+//! When the step runs. A step is a decision over records: the facts, the
+//! mission rows, the control stream and the queue. It runs when the log's
+//! watermark has moved since it last ran (a record it decides from may be
+//! new), and otherwise only when a time one of those records names has come
+//! ([`Reading::due_ms`]): a delivery's retry (`deliver::attempts`: the
+//! wait after a refusal that typed nothing, or the doubling wait after a
+//! failure), a stall's bound ([`stall`], measured from the record the step
+//! stands on), a failed Stop's retry ([`stops`]), a background job's bound
+//! ([`jobs`]), a cancelled resident's notice, a report note refused before
+//! typing. Every time it returns is computed from a record — an attempt's
+//! `finished_at_ms`, a stall's record, a job's start — never counted by the
+//! loop, and one it cannot date is due now, never later. Nothing it decides
+//! depends on how often it ran: the same records and the same clock make
+//! the same orders, deliveries, escalations and digests, under the same
+//! keys and tags (docs/fleet-architecture.md §3, docs/design.md §14).
 
 mod charter;
-mod digest;
+pub(crate) mod digest;
 mod jobs;
 #[cfg(test)]
 mod resume_replay;
@@ -240,6 +264,11 @@ pub(crate) struct Facts {
     /// session's latest execution, which no resume was sent under.
     #[serde(default)]
     pub(crate) failed_resume: Option<FailedResume>,
+    /// The log's id of the recovery's `execution.interrupted` record for the
+    /// live execution: it revives the worker by its own rule, so the
+    /// one-resume ladder below gives way (crate::recover).
+    #[serde(default)]
+    pub(crate) recovered: Option<i64>,
     /// Every Stop and Discard sent into the session since its live
     /// execution started (none when it is not live), oldest first.
     #[serde(default)]
@@ -396,6 +425,13 @@ pub(crate) enum Why {
     /// scenario of the base exited 1 and then 0, before any candidate code
     /// ran ([`digest::base_disagrees_alerts`], objective 033).
     GateBaseDisagrees,
+    /// Main of a source is red on a check: it failed twice on the base with
+    /// the same failing tests, so its gates wait until main moves
+    /// ([`digest::main_red_news`], told once a red).
+    MainRed,
+    /// Main of a source that was red on a check passes it again
+    /// ([`digest::main_red_news`]).
+    MainGreen,
     /// An open task's step has not moved within its bound ([`stall`]).
     Stalled,
     /// The deployed charter could not be typed into the supervisor's pane:
@@ -412,6 +448,10 @@ pub(crate) enum Why {
     /// An objective ran out of attempts and its task yielded the slot to
     /// the next objective ([`digest::objective_yields`]).
     ObjectiveYielded,
+    /// An objective closed solved on the base: its scenario passed at a base
+    /// commit main already holds, so its task ended as a solved cancel, not
+    /// a rejection ([`digest::objective_solved`]).
+    ObjectiveSolved,
     /// A task that continued an overrun task went over its budget too
     /// ([`digest::over_budget_escalations`]): its objective is held until
     /// the mission is configured again.
@@ -425,8 +465,9 @@ impl Why {
     /// Whether an item of this kind is news rather than a condition: told
     /// once, it leaves nothing to resolve. A disk recovery, an approval, a
     /// human's message, a pair of host faults at the gate (the integrator
-    /// judges again on its own) and an expired hold (its landings resumed
-    /// on their own) are news. Every other item is a
+    /// judges again on its own), an expired hold (its landings resumed on
+    /// their own) and an objective closed solved on the base (nothing is
+    /// assigned for it again) are news. Every other item is a
     /// condition that holds while its facts do (a worker's state, a stall,
     /// a path still low on disk, a gate still without room): told, it stays
     /// in [`Plan::told`] until its facts change.
@@ -438,7 +479,10 @@ impl Why {
                 | Self::Human
                 | Self::GateHostFault
                 | Self::GateBaseDisagrees
+                | Self::MainRed
+                | Self::MainGreen
                 | Self::HoldExpired
+                | Self::ObjectiveSolved
         )
     }
 }
@@ -615,6 +659,20 @@ fn load_stalls(store: &PostgresStore) -> Result<stall::Stalls, String> {
         .map_err(|error| format!("stall facts: {error}"))
 }
 
+/// The records one read of the escalation lists returns, as their item
+/// builders take them; a read that fails fails the pass, as [`read_plan`]
+/// always did.
+fn records(
+    read: Result<serde_json::Value, spawn_core::port::StoreError>,
+    what: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    Ok(read
+        .map_err(|error| format!("{what}: {error}"))?
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
+}
+
 fn now_ms() -> i64 {
     spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
 }
@@ -643,6 +701,12 @@ pub(crate) struct Reading {
     pub(crate) plan: Plan,
     /// Log lines: what could not be read (a stall read that failed).
     pub(crate) lines: Vec<String>,
+    /// When the dispatcher's next step is due even if no record is written
+    /// meanwhile: the earliest retry, stall bound, Stop retry or job bound
+    /// the records this pass read name (`None`: no clock is waited for).
+    /// On this host's clock, and after this pass: a time already reached is
+    /// the step's to act on now, not a wait.
+    pub(crate) due_ms: Option<i64>,
 }
 
 /// The plan for this moment, reading only: the host's news (the disk items
@@ -674,59 +738,81 @@ pub(crate) fn read_plan(
     let mut lines = Vec::new();
     let now = now_ms();
     let mut host = disk(now);
-    host.extend(crate::disk::gate_room_escalations(
-        store
-            .gate_room_escalations()
-            .map_err(|error| format!("gate room records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::host_fault_escalations(
-        store
-            .gate_host_fault_escalations()
-            .map_err(|error| format!("gate host fault records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::base_disagrees_alerts(
-        store
-            .gate_base_disagrees_alerts()
-            .map_err(|error| format!("gate base disagreement records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::over_budget_escalations(
-        store
-            .over_budget_escalations()
-            .map_err(|error| format!("over budget records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::objective_yields(
-        store
-            .objective_yields()
-            .map_err(|error| format!("objective yield records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::objective_order(
-        store
-            .objective_backlogs()
-            .map_err(|error| format!("objective backlogs: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::hold_expiries(
-        store
-            .hold_expiries()
-            .map_err(|error| format!("source hold records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
+    host.extend(crate::disk::gate_room_escalations(&records(
+        store.gate_room_escalations(),
+        "gate room records",
+    )?));
+    host.extend(digest::host_fault_escalations(&records(
+        store.gate_host_fault_escalations(),
+        "gate host fault records",
+    )?));
+    host.extend(digest::base_disagrees_alerts(&records(
+        store.gate_base_disagrees_alerts(),
+        "gate base disagreement records",
+    )?));
+    host.extend(digest::main_red_news(&records(
+        store.main_red_news(),
+        "red main records",
+    )?));
+    host.extend(digest::over_budget_escalations(&records(
+        store.over_budget_escalations(),
+        "over budget records",
+    )?));
+    host.extend(digest::objective_yields(&records(
+        store.objective_yields(),
+        "objective yield records",
+    )?));
+    host.extend(digest::objective_solved(&records(
+        store.objective_solved_news(),
+        "objective solved records",
+    )?));
+    host.extend(digest::objective_order(&records(
+        store.objective_backlogs(),
+        "objective backlogs",
+    )?));
+    host.extend(digest::hold_expiries(&records(
+        store.hold_expiries(),
+        "source hold records",
+    )?));
+    // Every timer the records read here name: the times at which this step
+    // would decide something new even though nothing is appended meanwhile.
+    // A time already reached is no wait (the step acts on it now), so only
+    // later ones count.
+    let mut due: Option<i64> = None;
+    let mut soon = |at: i64| {
+        if at > now {
+            due = Some(due.map_or(at, |known: i64| known.min(at)));
+        }
+    };
+    if let Some(at) = deliver::next_due(&work, &rows, now) {
+        soon(at);
+    }
+    for facts in rows.iter().filter(|facts| is_worker(facts)) {
+        if let Some(at) = stops::next_due(facts) {
+            soon(at);
+        }
+        // A worker held back from its one nudge by the hourly limit is due
+        // when the oldest nudge of that hour leaves it.
+        if let Some(left) = worker::due_in(facts, now) {
+            soon(now.saturating_add(left));
+        }
+    }
     // A stall read that failed costs this pass its stall items, never its
     // deliveries: the next pass measures the same stalls again.
     match load_stalls(store) {
-        Ok(stalls) => host.extend(stall::items(&rows, &work, &stalls, bounds)),
+        Ok(stalls) => {
+            host.extend(stall::items(&rows, &work, &stalls, bounds));
+            // Stalls and jobs are measured on the database's clock, which
+            // `stalls.now_ms` names; the loop waits on its own. Only the
+            // interval between them is read from the database's.
+            let on_host = |at: i64| now.saturating_add(at.saturating_sub(stalls.now_ms));
+            if let Some(at) = stall::next_due(&rows, &work, &stalls, bounds) {
+                soon(on_host(at));
+            }
+            if let Some(at) = jobs::next_due(&rows, bounds.job) {
+                soon(on_host(at));
+            }
+        }
         Err(error) => lines.push(format!("dispatch: stalls: {error}")),
     }
     host.extend(jobs::items(&rows, bounds.job));
@@ -749,6 +835,7 @@ pub(crate) fn read_plan(
         work,
         plan,
         lines,
+        due_ms: due,
     })
 }
 
@@ -757,7 +844,8 @@ pub(crate) fn read_plan(
 /// [`deliver::collect_reports`]), then submit the plan ([`read_plan`]), with the
 /// stalls past their `bounds` among its escalations ([`stall`]), without
 /// its new executions while the disk is under its floor ([`crate::disk`]),
-/// delivering with `waits` ([`deliver::Waits`]). Returns log lines.
+/// delivering with `waits` ([`deliver::Waits`]). Returns log lines, and when
+/// the next step is due ([`Reading::due_ms`]).
 pub(crate) fn step(
     store: &std::sync::Arc<PostgresStore>,
     supervised: bool,
@@ -766,7 +854,7 @@ pub(crate) fn step(
     disk: &crate::disk::Monitor,
     bounds: &Bounds,
     waits: deliver::Waits,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Option<i64>), String> {
     let (mut rows, mut work) = load(store, waits)?;
     let mut lines = root.map_or_else(Vec::new, |root| {
         deliver::collect_reports(store, &work, &rows, root, now_ms())
@@ -779,6 +867,7 @@ pub(crate) fn step(
         work,
         mut plan,
         lines: read,
+        due_ms,
         ..
     } = read_plan(
         store,
@@ -873,7 +962,16 @@ pub(crate) fn step(
         submit(store, &principal, order)?;
         lines.push(line);
     }
-    Ok(lines)
+    // A `recovered` disk record stops being a digest item after its day
+    // without a record of its own: that moment is a time this step waits for.
+    let at = now_ms();
+    let due_ms = match disk.due_in(at) {
+        Some(left) if left > 0 => Some(due_ms.map_or(at.saturating_add(left), |due| {
+            due.min(at.saturating_add(left))
+        })),
+        _ => due_ms,
+    };
+    Ok((lines, due_ms))
 }
 
 /// Set aside the work of the cancelled task `task` before `order`, its
@@ -1124,6 +1222,7 @@ mod tests {
             checkpoint: None,
             charter: None,
             jobs: Vec::new(),
+            recovered: None,
         }
     }
 
@@ -1181,6 +1280,46 @@ mod tests {
         assert!(plan.pending.is_empty(), "{:?}", plan.pending);
     }
 
+    /// Nothing a step decides depends on how often it ran: given the same
+    /// records and the same clock, a pass over them makes the same plan — the
+    /// same orders under the same idempotency keys — whether the step ran on
+    /// every pass or only on the one that saw them first. A re-submission of
+    /// the same key writes nothing (`spawn_submit`'s `on conflict do
+    /// nothing`), so the two schedules order the same work.
+    #[test]
+    fn the_same_facts_make_the_same_plan_however_often_the_step_ran() {
+        let mut resident = worker(judged(SemanticState::Waiting, 0.9));
+        resident.session_id = "session_resident_core".to_string();
+        resident.agent_id = "agent_resident_core".to_string();
+        resident.dispatched = vec![Sent {
+            id: Some(31),
+            key: "deliver-25-0".to_string(),
+            text: None,
+            created_at_ms: NOW - 10_001,
+            finished_at_ms: Some(NOW - 10_000),
+            succeeded: Some(false),
+            error: Some("pane state Busy does not accept input".to_string()),
+        }];
+        let work = Work {
+            tasks: serde_json::from_value(serde_json::json!([{
+                "id": 25, "mission_id": 1, "kind": "resident",
+                "agent_id": "agent_resident_core", "session_id": "session_resident_core",
+                "brief": "brief 25", "state": "assigned", "revisions": 0,
+                "mission_text": "m", "resident": "core", "charter": "c",
+            }]))
+            .expect("task rows"),
+            ..Work::default()
+        };
+        // The record is 10 s old: its not-ready wait (5 s) is over, so this
+        // pass retries it. Run the step again on the same records and the
+        // same clock: the same key, the same plan.
+        let first = decide_with(&[resident.clone()], &work, &[], false, NOW, "spawn");
+        let second = decide_with(&[resident], &work, &[], false, NOW, "spawn");
+        assert_eq!(first, second, "the same records make the same plan");
+        assert_eq!(first.orders.len(), 1, "{:?}", first.orders);
+        assert_eq!(first.orders[0].key, "deliver-25-0-retry-1");
+    }
+
     /// The digest `order` reached the supervisor: the tags it filed are
     /// told, as the dispatcher's facts read them back.
     fn delivered(supervisor: &mut Facts, order: &super::Order) {
@@ -1229,6 +1368,7 @@ mod tests {
             checkpoint: None,
             charter: None,
             jobs: Vec::new(),
+            recovered: None,
         }
     }
 
@@ -1582,6 +1722,66 @@ mod tests {
         assert!(host.iter().all(|item| !item.line.contains('\n')));
     }
 
+    /// A sandbox that never started its command (evidence
+    /// `sandbox_never_started`) says so with bwrap's words and points at
+    /// bubblewrap on the host, not the scenario's harness.
+    #[test]
+    fn a_sandbox_that_never_started_is_said_with_bwraps_words() {
+        let records = [
+            serde_json::json!({"type": "task.gated", "verdict": "host_fault",
+            "id": 11, "event_id": 60, "mission": 6, "host_faults": 2, "escalate": true,
+            "evidence": "sandbox_never_started", "fact": {"scenario": "sh build",
+                "on": "sandbox", "runs": "never started",
+                "reason": "sandbox: sh build in /w/baseline never started (bwrap exited 1: \
+                           bwrap: Can't mount tmpfs on /run/x: No such file or directory)"},
+            "backoff_ms": 600_000, "due_ms": 1_793_930_000_000_i64}),
+        ];
+        let host = super::digest::host_fault_escalations(&records);
+        assert!(
+            host[0]
+                .line
+                .contains("the gate's sandbox never started sh build (sandbox: sh build in")
+                && host[0].line.contains("Can't mount tmpfs on /run/x")
+                && host[0].line.contains("that bubblewrap starts on this host")
+                && !host[0].line.contains("that scenario's harness"),
+            "{}",
+            host[0].line
+        );
+    }
+
+    /// The gate's own test server that did not start (evidence
+    /// `test_server_never_started`) says so with the server's words and
+    /// points at the server on the host, not at bubblewrap or a scenario.
+    #[test]
+    fn a_test_server_that_never_started_is_said_with_the_servers_words() {
+        let records = [
+            serde_json::json!({"type": "task.gated", "verdict": "host_fault",
+            "id": 12, "event_id": 61, "mission": 6, "host_faults": 2, "escalate": true,
+            "evidence": "test_server_never_started", "fact": {"scenario": "test server",
+                "on": "test server", "runs": "never started", "tree": "candidate",
+                "reason": "the candidate phase's fresh test server did not start: FATAL:  \
+                           could not create shared memory segment: a host fault, not a \
+                           verdict on the candidate"},
+            "backoff_ms": 600_000, "due_ms": 1_793_930_000_000_i64}),
+        ];
+        let host = super::digest::host_fault_escalations(&records);
+        assert!(
+            host[0]
+                .line
+                .contains("the gate's own test server never started (the candidate phase's")
+                && host[0]
+                    .line
+                    .contains("could not create shared memory segment")
+                && host[0]
+                    .line
+                    .contains("that the gate's test server starts on this host")
+                && !host[0].line.contains("bubblewrap")
+                && !host[0].line.contains("that scenario's harness"),
+            "{}",
+            host[0].line
+        );
+    }
+
     #[test]
     fn two_host_faults_in_a_row_reach_an_idle_supervisor_once() {
         let crash = "2026-11-06 01:46:58.017 UTC [1] LOG:  server process (PID 4242) was \
@@ -1668,29 +1868,56 @@ mod tests {
         );
     }
 
-    /// A record whose evidence is `cannot_judge` (029: no systemd user
-    /// manager in the sandbox) names the objective and says it is judged
-    /// outside the gate, never that the test database failed or that the
-    /// load should be checked. The second in a row still escalates.
+    /// A record whose evidence is `cannot_judge` names the objective and
+    /// quotes the scenario's own cause from the record (`cause`), never
+    /// another scenario's: 029's systemd user manager was once said of
+    /// Supply PA's 073, which needed a PostgreSQL server, and a supervisor
+    /// built task 208 on it. A record without a cause says the gate gave
+    /// none. Never that the test database failed or that the load should be
+    /// checked. The second in a row still escalates.
     #[test]
-    fn a_cannot_judge_host_fault_names_the_objective_judged_outside_the_gate() {
+    fn a_cannot_judge_host_fault_quotes_the_scenario_s_own_cause() {
+        let line_of = |record: serde_json::Value| {
+            let host = super::digest::host_fault_escalations(&[record]);
+            assert_eq!(host.len(), 1);
+            assert_eq!(host[0].why, Why::GateHostFault);
+            host[0].line.clone()
+        };
+        let cause_073 = "073: cannot judge: SPAWN_TEST_DATABASE_URL names no PostgreSQL server, \
+                         and the race needs two connections";
+        let line = line_of(
+            serde_json::json!({"type": "task.gated", "verdict": "host_fault",
+            "id": 205, "event_id": 62, "mission": 9, "host_faults": 2, "escalate": true,
+            "evidence": "cannot_judge", "scenario": "073.sh", "cause": cause_073,
+            "backoff_ms": 600_000, "due_ms": 1_793_930_000_000_i64}),
+        );
+        assert!(
+            line.contains(&format!(
+                "this host cannot judge the objective here (073.sh says: {cause_073})"
+            )),
+            "{line}"
+        );
+        assert!(!line.contains("systemd"), "never 029's cause: {line}");
+        assert!(!line.contains("mission 7"), "never 029's remedy: {line}");
+        assert!(
+            line.contains("Give the gate what the scenario says it lacks"),
+            "{line}"
+        );
+
         let record = serde_json::json!({"type": "task.gated", "verdict": "host_fault", "id": 11,
             "event_id": 61, "mission": 7, "host_faults": 2, "escalate": true,
             "evidence": "cannot_judge", "scenario": "029.sh",
             "backoff_ms": 600_000, "due_ms": 1_793_930_000_000_i64});
         let host = super::digest::host_fault_escalations(&[record]);
-        assert_eq!(host.len(), 1);
         assert_eq!(host[0].tag(), "host gate-host-fault-61");
-        assert_eq!(host[0].why, Why::GateHostFault);
         let line = &host[0].line;
         assert!(
-            line.contains("this host cannot judge the objective here (029.sh"),
-            "{line}"
+            line.contains(
+                "this host cannot judge the objective here (029.sh; the gate's log gives no cause)"
+            ),
+            "a record without a cause names none: {line}"
         );
-        assert!(
-            line.contains("judged outside the gate, by the owner (mission 7)"),
-            "{line}"
-        );
+        assert!(!line.contains("systemd"), "{line}");
         assert!(
             line.contains("nothing is counted and nothing halts"),
             "{line}"
@@ -1698,6 +1925,44 @@ mod tests {
         assert!(!line.contains("test database"), "{line}");
         assert!(!line.contains("load"), "{line}");
         assert!(!line.contains('\n'), "{line}");
+    }
+
+    /// An objective solved on the base (integrator `solved_on_base`) is news:
+    /// the digest names the mission, the objective and the task it ended, and
+    /// says it ended solved rather than rejected, reading every fact from the
+    /// record's own fields. One item per close, each its own line.
+    #[test]
+    fn an_objective_solved_on_the_base_is_news_naming_mission_objective_and_task() {
+        let record = serde_json::json!({"type": "objective.solved", "id": 4, "objective": 34,
+            "task": 201,
+            "scenario": "/home/o/.local/share/spawn-rsi/controllers/spawn/rsi/scenarios/034.sh",
+            "base": "f05915f5a98fa3cf6e3db78ce9a1a5ee14801f84",
+            "event_id": 109_278, "at_ms": 1_793_934_704_000_i64});
+        let items = super::digest::objective_solved(&[record]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tag(), "missions objective-solved-109278");
+        assert_eq!(items[0].why, Why::ObjectiveSolved);
+        let line = &items[0].line;
+        for part in [
+            "mission #4",
+            "objective 34",
+            "task #201",
+            "ended solved, not rejected",
+            "034.sh",
+            "at f05915f,",
+            "closed",
+        ] {
+            assert!(line.contains(part), "{part:?} in {line}");
+        }
+        assert!(
+            !line.contains("controllers/spawn"),
+            "the full path stays out: {line}"
+        );
+        assert!(!line.contains('\n'), "{line}");
+        assert!(
+            Why::ObjectiveSolved.is_news(),
+            "told once, nothing left to resolve"
+        );
     }
 
     /// Objective 33: three bases in a row that disagreed with themselves
