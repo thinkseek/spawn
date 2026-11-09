@@ -711,7 +711,7 @@ pub(crate) struct Mission {
     /// (`spawn_now_ms()`, in the same query): the gate's due times are the
     /// store's (`gate_room_last_ms` is its record's time, `gate_host_due_ms`
     /// that plus the backoff), so a wait is measured against it, never the
-    /// host's clock ([`gate_waits`]). Absent only in a mission built by hand.
+    /// host's clock ([`gate_wait`]). Absent only in a mission built by hand.
     #[serde(default)]
     pub(crate) now_ms: Option<i64>,
     /// The mission's current run of `host_fault` gate outcomes, folded by
@@ -1536,9 +1536,10 @@ struct Integrator {
     /// The store whose connection holds the integrator's lock, kept while
     /// a judging runs: its thread records through it.
     held: RefCell<Option<Arc<PostgresStore>>>,
-    /// Tasks already said to wait for a gate: said again only once they
-    /// have had one.
-    waiting: RefCell<std::collections::HashSet<i64>>,
+    /// The waits already said, by task and kind ([`Wait`]): each is said
+    /// once, when the task starts waiting, and again only after the task
+    /// has had a gate ([`Integrator::wait_over`]).
+    waiting: RefCell<std::collections::HashSet<(i64, Wait)>>,
     /// When each mission's last judging ended (this process's reading):
     /// its next task waits for a gate from then.
     last_judged: RefCell<std::collections::HashMap<i64, i64>>,
@@ -1831,6 +1832,26 @@ impl Integrator {
         }
     }
 
+    /// Whether `task`'s gate backs off this pass ([`gate_wait`]), saying
+    /// so when it starts to: the line is printed once, not on every pass
+    /// it goes on waiting, like every other wait.
+    fn backs_off(&self, mission: &Mission, task: &Task) -> Option<Said> {
+        let (kind, line) = gate_wait(mission, task)?;
+        if self.waiting.borrow_mut().insert((task.id, kind)) {
+            println!("{line}");
+            return Some(Said::Now);
+        }
+        Some(Said::Before)
+    }
+
+    /// `task` has a gate now: each of its waits is said again when it
+    /// starts again.
+    fn wait_over(&self, task: i64) {
+        self.waiting
+            .borrow_mut()
+            .retain(|(waiting, _)| *waiting != task);
+    }
+
     /// Whether `task`'s gate waits because main of `source` is red on a
     /// check and has not moved (`main` is the red one), said when it does.
     /// Once [`Self::red_probe_ms`] has passed since the last red gate or
@@ -1855,7 +1876,7 @@ impl Integrator {
         if now.saturating_sub(last) >= self.red_probe_ms {
             return RedHold::Probe;
         }
-        if self.waiting.borrow_mut().insert(task.id) {
+        if self.waiting.borrow_mut().insert((task.id, Wait::Red)) {
             println!(
                 "integrate: mission {}: main of {source} ({}) is red on {} for {}; task {} \
                  waits until main moves (or the next probe)",
@@ -2188,7 +2209,7 @@ impl Integrator {
             return Ok(false);
         }
         if let (Some((mirror, main)), Some(task)) = (judgeable, mission.ready()) {
-            if gate_waits(mission, task) {
+            if self.backs_off(mission, task).is_some() {
                 return Ok(false);
             }
             let red = self.red_holds(mission, source, &main, task);
@@ -2254,7 +2275,11 @@ impl Integrator {
                 .filter(|gate| gate.shares_server)
                 .count();
             if waits_for_gate(shares_server, running, self.gates) {
-                if self.waiting.borrow_mut().insert(candidate.task.id) {
+                if self
+                    .waiting
+                    .borrow_mut()
+                    .insert((candidate.task.id, Wait::Gate))
+                {
                     println!(
                         "integrate: mission {}: task {} waits for a gate ({running} of {} \
                          running)",
@@ -2270,7 +2295,11 @@ impl Integrator {
             if let (Some(cpu), Some(jobs)) = (&self.cpu, jobs) {
                 let busy: usize = self.running.borrow().iter().map(|gate| gate.jobs).sum();
                 if !cpu.fits(busy, jobs) {
-                    if self.waiting.borrow_mut().insert(candidate.task.id) {
+                    if self
+                        .waiting
+                        .borrow_mut()
+                        .insert((candidate.task.id, Wait::Cpu))
+                    {
                         println!(
                             "integrate: mission {}: task {} waits for CPU room: its gate's {jobs} \
                              jobs, the running gates' {busy} and the {} cores kept for the \
@@ -2281,7 +2310,7 @@ impl Integrator {
                     continue;
                 }
             }
-            self.waiting.borrow_mut().remove(&candidate.task.id);
+            self.wait_over(candidate.task.id);
             let mission = candidate.mission;
             if let Err(error) = self.start_judging(store, candidate, running, shares_server, jobs) {
                 eprintln!("integrate: mission {mission}: {error}");
@@ -4011,37 +4040,63 @@ fn database_now(store: &PostgresStore) -> Result<i64, String> {
     store.database_now_ms().map_err(|error| error.to_string())
 }
 
-/// Whether `task`'s gate waits this pass, said when it does: the gate had
-/// no room last time (it waits out the backoff, then tries), or its last run
-/// on it was a host fault (it waits until the recorded due time, then judges
-/// it again). The mission's other tasks wait behind it.
-fn gate_waits(mission: &Mission, task: &Task) -> bool {
+/// Whether `task`'s gate waits this pass, with its kind and the line that
+/// says why: the gate had no room last time (it waits out the backoff, then
+/// tries), or its last run on it was a host fault (it waits until the
+/// recorded due time, then judges it again). The mission's other tasks wait
+/// behind it. [`Integrator::backs_off`] says the line once.
+fn gate_wait(mission: &Mission, task: &Task) -> Option<(Wait, String)> {
     // One clock, the database's: the due times are its own. A mission read
     // without it (never from the store) waits for nothing.
-    let Some(now) = mission.now_ms else {
-        return false;
-    };
+    let now = mission.now_ms?;
     if let Some(wait) = room_wait(mission, task.id, now) {
-        println!(
-            "integrate: mission {}: the gate had no room; task {} is judged again in {}s",
-            mission.id,
-            task.id,
-            wait.as_secs()
-        );
-        return true;
+        return Some((
+            Wait::Room,
+            format!(
+                "integrate: mission {}: the gate had no room; task {} is judged again in {}s",
+                mission.id,
+                task.id,
+                wait.as_secs()
+            ),
+        ));
     }
-    if let Some(wait) = host_wait(mission, task.id, now) {
-        println!(
-            "integrate: mission {}: the gate's last run on task {} was a host fault ({} in a \
-             row); it is judged again in {}s",
-            mission.id,
-            task.id,
-            mission.gate_host_faults,
-            wait.as_millis().div_ceil(1000)
-        );
-        return true;
-    }
-    false
+    host_wait(mission, task.id, now).map(|wait| {
+        (
+            Wait::HostFault,
+            format!(
+                "integrate: mission {}: the gate's last run on task {} was a host fault ({} in \
+                 a row); it is judged again in {}s",
+                mission.id,
+                task.id,
+                mission.gate_host_faults,
+                wait.as_millis().div_ceil(1000)
+            ),
+        )
+    })
+}
+
+/// Why a task waits, for saying each wait once ([`Integrator::waiting`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Wait {
+    /// The gate had no room last time: its backoff.
+    Room,
+    /// The gate's last run on it was a host fault: until the due time.
+    HostFault,
+    /// Main of its source is red.
+    Red,
+    /// Every gate slot is taken.
+    Gate,
+    /// The CPU has no room for its gate.
+    Cpu,
+}
+
+/// Whether a wait was said this pass or before, for [`Integrator::backs_off`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Said {
+    /// It starts waiting: the line was printed.
+    Now,
+    /// It went on waiting: said when it started.
+    Before,
 }
 
 /// What [`land`] did.
@@ -7483,26 +7538,23 @@ mod host_fault_tests {
         let past = 1_000_000_000_000; // 2001-09-09, long before the host's now
         assert!(super::now_ms() > past + 60_000);
         assert!(
-            super::gate_waits(&at(past, past - 60_000), &task),
+            super::gate_wait(&at(past, past - 60_000), &task).is_some(),
             "the database's clock is before it"
         );
         assert!(
-            !super::gate_waits(&at(past, past), &task),
+            super::gate_wait(&at(past, past), &task).is_none(),
             "the database's clock is at it"
         );
         let future = 7_258_118_400_000; // 2200-01-01, after the host's now
         assert!(super::now_ms() < future);
         assert!(
-            !super::gate_waits(&at(future, future + 1), &task),
+            super::gate_wait(&at(future, future + 1), &task).is_none(),
             "the database's clock is past it"
         );
-        assert!(super::gate_waits(&at(future, future - 1), &task));
+        assert!(super::gate_wait(&at(future, future - 1), &task).is_some());
         // A mission read without the database's clock (never from the store)
         // waits for nothing.
-        assert!(!super::gate_waits(
-            &with_host_faults(1, Some(4), Some(future)),
-            &task
-        ));
+        assert!(super::gate_wait(&with_host_faults(1, Some(4), Some(future)), &task).is_none());
     }
 
     /// The task waits until the recorded due time, read from the mission's
@@ -10455,6 +10507,44 @@ mod database_tests {
                "failures": [{"test": "api::tests::one", "message": "Connection refused",
                              "class": "connection"}],
                "host_faults": faults, "backoff_ms": 300_000, "escalate": faults == 2})
+    }
+
+    /// Batch 11 (2), on the store: the host fault's backoff ("the gate's
+    /// last run on task N was a host fault … judged again in Ns") is said
+    /// once, when the task starts waiting, not on every pass it goes on
+    /// waiting; once the task has had a gate, its next wait is said again.
+    #[test]
+    fn a_host_faults_backoff_is_said_once_per_wait() {
+        let (base, source, scenarios, integrator) = world("host-fault-said", "exit 1\n");
+        let db = Db::new("host_fault_said");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        db.record(&host_fault_record(task, 0, 1));
+        let waiting = gated(&db, mission);
+        let said = || integrator.backs_off(&waiting, &waiting.tasks[0]);
+        assert!(
+            super::gate_wait(&waiting, &waiting.tasks[0])
+                .is_some_and(|(_, line)| line.contains("was a host fault (1 in a row)")),
+            "it waits out the recorded due time"
+        );
+        assert_eq!(said(), Some(super::Said::Now), "it starts waiting: said");
+        assert_eq!(said(), Some(super::Said::Before), "the next pass: quiet");
+        assert_eq!(said(), Some(super::Said::Before));
+        // Another task's wait is its own.
+        assert_eq!(integrator.waiting.borrow().len(), 1);
+        // It has its gate, which faults again: the new wait is said.
+        integrator.wait_over(task);
+        db.record(&host_fault_record(task, 0, 2));
+        let again = gated(&db, mission);
+        assert_eq!(
+            integrator.backs_off(&again, &again.tasks[0]),
+            Some(super::Said::Now)
+        );
+        assert_eq!(
+            integrator.backs_off(&again, &again.tasks[0]),
+            Some(super::Said::Before)
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Objective 20: a host fault between two rejections leaves the
