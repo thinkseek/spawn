@@ -35,8 +35,13 @@ export interface Span {
   end: number | null;
   state: SpanState;
   failed: boolean;
-  /** One-word reason shown beside a failed or ended span (cause, error). */
+  /** One-word reason shown beside a failed or ended span (cause, error):
+   * a failed tool's is `exit N` or its error's first line. */
   outcome: string | null;
+  /** A tool call's key input, as recorded on its `tool.started` (its
+   * command's first line, its file, its pattern); null on other spans and
+   * on calls recorded before calls carried one. */
+  summary: string | null;
   parentId: string | null;
   depth: number;
   childIds: string[];
@@ -141,6 +146,7 @@ export function deriveTrace(input: TimelineEvent[], now: number): Trace {
       state: "open",
       failed: false,
       outcome: null,
+      summary: null,
       parentId,
       depth: 0,
       childIds: [],
@@ -315,6 +321,7 @@ export function deriveTrace(input: TimelineEvent[], now: number): Trace {
         const id = text(event.detail, "tool_use_id");
         const name = text(event.detail, "tool_name") ?? "tool";
         const span = open("tool", name, event, toolParent(event));
+        span.summary = text(event.detail, "summary");
         if (!id) continue;
         const early = earlyToolEnds.shift(id);
         if (early) close(span, early);
@@ -405,7 +412,7 @@ function applyEnd(span: Span, event: TimelineEvent) {
   switch (event.event_name) {
     case "tool.failed":
       span.failed = true;
-      span.outcome = text(event.detail, "error") ?? "failed";
+      span.outcome = toolOutcome(text(event.detail, "error"));
       break;
     case "turn.failed":
       span.failed = true;
@@ -470,4 +477,112 @@ export function visibleSpans(trace: Trace, collapsed: Set<string>): Span[] {
     }
   }
   return out;
+}
+
+/** A failed tool call's outcome in a few words: Bash's "Exit code N" as
+ * `exit N`, else the first line of its error. The whole error stays on the
+ * event. */
+export function toolOutcome(error: string | null): string {
+  const first = error
+    ?.split("\n")
+    .map((line) => line.trim())
+    .find((line) => line !== "");
+  if (!first) return "failed";
+  const exit = /^(?:Error:\s*)?Exit code (\d+)\b/i.exec(first);
+  return exit ? `exit ${exit[1]}` : first;
+}
+
+const BASH_CHARS = 80;
+const PATH_TOOLS = new Set(["Edit", "MultiEdit", "Write", "Read", "NotebookEdit"]);
+
+/** A long path as its first directory, an ellipsis and its file:
+ * `crates/…/integrate.rs`. A Read's `:120-180` stays on the file. */
+export function shortPath(path: string): string {
+  const parts = path.split("/");
+  const named = parts.filter((part) => part !== "");
+  if (named.length <= 3) return path;
+  const lead = path.startsWith("/") ? `/${named[0]}` : named[0];
+  return `${lead}/…/${named[named.length - 1]}`;
+}
+
+/** A tool call's key input as its row shows it: a command without a
+ * leading `cd <dir> &&`, to its first 80 characters; a file path
+ * shortened. The full text is the row's title. */
+export function shortSummary(tool: string, summary: string): string {
+  if (PATH_TOOLS.has(tool)) return shortPath(summary);
+  if (tool !== "Bash") return summary;
+  // Most commands start in a directory: the row shows what runs there.
+  const command = summary.replace(LEADING_CD, "") || summary;
+  return command.length > BASH_CHARS ? `${command.slice(0, BASH_CHARS - 1)}…` : command;
+}
+
+/** `cd <dir> && ` or `cd <dir>; ` at the start of a command. */
+const LEADING_CD = /^cd\s+(?:"[^"]*"|'[^']*'|\S+)\s*(?:&&|;)\s*/;
+
+/** A span's row text: `Bash · cargo test -p spawn-cli` for a tool call
+ * with a summary, its label otherwise. */
+export function rowText(span: Span): string {
+  if (span.kind !== "tool" || !span.summary) return span.label;
+  return `${span.label} · ${shortSummary(span.label, span.summary)}`;
+}
+
+/** Two tool calls one row can stand for: the same tool with the same
+ * recorded input, under the same parent, ending the same way. Calls with
+ * no input recorded are not the same call, whatever their tool. */
+function sameCall(a: Span, b: Span): boolean {
+  return (
+    a.kind === "tool" &&
+    b.kind === "tool" &&
+    a.parentId === b.parentId &&
+    a.label === b.label &&
+    a.summary !== null &&
+    a.summary === b.summary &&
+    a.failed === b.failed &&
+    a.outcome === b.outcome &&
+    a.state !== "open" &&
+    b.state !== "open"
+  );
+}
+
+/** One visible row: a span, and the run of identical calls it stands for
+ * (`run[0]` is the span; a run of one is a plain row). */
+export interface SpanRow {
+  span: Span;
+  run: Span[];
+  /** The run is opened: its calls follow as their own rows. */
+  unfolded: boolean;
+}
+
+/** The visible spans with consecutive identical tool calls folded into one
+ * row (`Bash · git status ×6`). A run whose first span id is in `unfolded`
+ * keeps its row, then lists each call as its own row. An open call is never
+ * folded: it is the one running now. */
+export function foldRuns(spans: Span[], unfolded: Set<string>): SpanRow[] {
+  const rows: SpanRow[] = [];
+  for (let index = 0; index < spans.length; ) {
+    const span = spans[index];
+    let next = index + 1;
+    while (next < spans.length && sameCall(span, spans[next])) next += 1;
+    const run = spans.slice(index, next);
+    const open = run.length > 1 && unfolded.has(span.id);
+    rows.push({ span, run, unfolded: open });
+    if (open) for (const call of run.slice(1)) rows.push({ span: call, run: [call], unfolded: false });
+    index = next;
+  }
+  return rows;
+}
+
+/** A run's extent: its first start to its last end. */
+export function runEnd(run: Span[], now: number): number {
+  return Math.max(...run.map((span) => spanEnd(span, now)));
+}
+
+/** The last `count` tool rows of a stretch of a session's events, oldest
+ * first, identical calls folded (×N): what the agent page lists as its
+ * latest tool calls. */
+export function recentToolRows(events: TimelineEvent[], now: number, count = 8): SpanRow[] {
+  const tools = deriveTrace(events, now)
+    .spans.filter((span) => span.kind === "tool")
+    .sort((a, b) => a.start - b.start || logOrder(a) - logOrder(b));
+  return foldRuns(tools, new Set()).slice(-count);
 }

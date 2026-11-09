@@ -6,7 +6,7 @@ import type { ReactNode } from "react";
 import type { TimelineEvent } from "../../api";
 import { eventTone, fullText, pairs } from "../../eventFormat";
 import { clockTime, formatDuration } from "../../format";
-import { spanEnd, spanEvents } from "../../trace";
+import { rowText, runEnd, spanEnd, spanEvents } from "../../trace";
 import type { Span, Trace, TraceMarker } from "../../trace";
 import { cx } from "../ui";
 import { KIND_COLOR, KIND_LABEL } from "./style";
@@ -23,7 +23,7 @@ export function SpanDetail({
   onSelect,
   onZoom,
 }: {
-  row: { key: string; span: Span | null; markers: TraceMarker[] };
+  row: { key: string; span: Span | null; run: Span[]; unfolded: boolean; markers: TraceMarker[] };
   trace: Trace;
   now: number;
   selectedEvent: number | null;
@@ -33,9 +33,13 @@ export function SpanDetail({
   onZoom: (span: Span) => void;
 }) {
   const span = row.span;
-  const events: TimelineEvent[] = span
-    ? spanEvents(span)
-    : row.markers.map((marker) => marker.event);
+  // A folded run of identical calls owns every call's events.
+  const run = row.run.length > 1 && !row.unfolded ? row.run : null;
+  const events: TimelineEvent[] = run
+    ? run.flatMap(spanEvents)
+    : span
+      ? spanEvents(span)
+      : row.markers.map((marker) => marker.event);
 
   const listRef = useRef<HTMLOListElement>(null);
   useEffect(() => {
@@ -73,7 +77,8 @@ export function SpanDetail({
             {span ? KIND_LABEL[span.kind] : "Session"}
           </div>
           <h3 className="mt-1 truncate text-title-sm font-semibold text-foreground">
-            {span ? span.label : "Session events"}
+            {span ? rowText(span) : "Session events"}
+            {run && <span className="tnum font-normal text-muted-foreground"> ×{run.length}</span>}
           </h3>
           {ancestors.length > 0 && (
             <nav aria-label="Parents" className="mt-1 flex flex-wrap items-center gap-x-1 text-caption text-muted-foreground">
@@ -130,11 +135,34 @@ export function SpanDetail({
                 running
               </span>
             ) : (
-              clockTime(span.end)
+              clockTime(run ? runEnd(run, now) : span.end)
             )}
           </Field>
           {span.state !== "orphan" && (
-            <Field label="Duration">{formatDuration(spanEnd(span, now) - span.start)}</Field>
+            <Field label="Duration">
+              {formatDuration((run ? runEnd(run, now) : spanEnd(span, now)) - span.start)}
+              {run && <span className="text-muted-foreground"> · first start to last end</span>}
+            </Field>
+          )}
+          {span.summary && (
+            <Field label="Input">
+              <span className="font-mono text-caption break-all select-text">{span.summary}</span>
+            </Field>
+          )}
+          {run && (
+            <Field label="Calls">
+              <ol className="tnum space-y-0.5">
+                {run.map((call) => (
+                  <li key={call.id} className="text-caption">
+                    {clockTime(call.start)}
+                    <span className="text-muted-foreground">
+                      {" · "}
+                      {call.state === "orphan" ? "no start" : formatDuration(spanEnd(call, now) - call.start)}
+                    </span>
+                  </li>
+                ))}
+              </ol>
+            </Field>
           )}
           {span.outcome && (
             <Field label={span.failed ? "Failed" : "Outcome"}>

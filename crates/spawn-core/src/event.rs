@@ -327,6 +327,13 @@ pub enum EventKind {
         tool_name: String,
         /// Engine tool call identifier.
         tool_use_id: String,
+        /// The call's key input in a few words, for a person reading the
+        /// trace: a command's first line, a file path, a pattern
+        /// ([`crate::ingest::tool_summary`]). Credentials are redacted and it
+        /// is at most [`crate::ingest::TOOL_SUMMARY_CHARS`] characters. None
+        /// for a tool without one, and in every event recorded before it was.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
     },
     /// A tool call succeeded.
     #[serde(rename = "tool.completed")]
