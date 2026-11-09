@@ -723,7 +723,7 @@ while [ "$(now)" -lt "$deadline" ]; do
     sleep 1
 done
 expect_eq "$(digests_like "$tag")" 1 "(6) digests about the expired drain (told once)"
-expect_eq "$(digests_like 'host integrator-drain%')" 1 "(6) digests about drains (the completed one is none)"
+expect_eq "$(digests_like 'host integrator-drain-expired-%')" 1 "(6) digests about the expired drain"
 
 # --- (7) TERM still stops at once ----------------------------------------------------
 
