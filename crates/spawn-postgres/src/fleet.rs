@@ -62,6 +62,15 @@ from (
                         where o.session_id = s.session_id
                           and o.execution_id = s.execution_id and s.live
                         order by o.session_seq desc limit 1),
+      -- That call's key input in words (`tool.started`'s summary, redacted
+      -- when stored; null for a tool without one or an older event).
+      'current_tool_summary', (select e.kind -> 'detail' ->> 'summary'
+                        from agent_open_tools o
+                        join spawn_events e
+                          on e.session_id = o.session_id and e.session_seq = o.session_seq
+                        where o.session_id = s.session_id
+                          and o.execution_id = s.execution_id and s.live
+                        order by o.session_seq desc limit 1),
       -- The live execution's open background jobs, oldest first, with their
       -- age on the database's clock.
       'jobs', (select coalesce(jsonb_agg(jsonb_build_object(

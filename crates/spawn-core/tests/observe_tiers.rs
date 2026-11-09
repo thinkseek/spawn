@@ -187,6 +187,8 @@ fn rules_decide_settled_facts_without_a_model_call() {
         EventKind::ToolStarted {
             tool_name: "Bash".to_string(),
             tool_use_id: "t1".to_string(),
+            summary: None,
+            summary_whole: false,
         },
     );
 
@@ -441,6 +443,8 @@ fn a_tool_open_for_long_is_ambiguous() {
         EventKind::ToolStarted {
             tool_name: "Bash".to_string(),
             tool_use_id: "t1".to_string(),
+            summary: None,
+            summary_whole: false,
         },
     );
     fixture.clock.advance(Duration::from_mins(5));
@@ -462,6 +466,8 @@ fn a_hung_tool_under_a_busy_spinner_still_asks_for_attention() {
         EventKind::ToolStarted {
             tool_name: "Bash".to_string(),
             tool_use_id: "t1".to_string(),
+            summary: None,
+            summary_whole: false,
         },
     );
     // The pane keeps showing the spinner, so the Bridge records the busy
@@ -1019,6 +1025,8 @@ fn tool_started(store: &MemoryStore, id: &str) {
         EventKind::ToolStarted {
             tool_name: "Bash".to_string(),
             tool_use_id: id.to_string(),
+            summary: None,
+            summary_whole: false,
         },
     );
 }

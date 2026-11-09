@@ -122,6 +122,8 @@ fn the_board_dates_the_current_state_from_its_first_judgement_and_names_the_open
             EventKind::ToolStarted {
                 tool_name: "Bash".to_string(),
                 tool_use_id: "a".to_string(),
+                summary: Some("cargo test -p spawn-cli".to_string()),
+                summary_whole: false,
             },
         ),
         (
@@ -129,6 +131,8 @@ fn the_board_dates_the_current_state_from_its_first_judgement_and_names_the_open
             EventKind::ToolStarted {
                 tool_name: "Read".to_string(),
                 tool_use_id: "b".to_string(),
+                summary: None,
+                summary_whole: false,
             },
         ),
         (
@@ -149,6 +153,10 @@ fn the_board_dates_the_current_state_from_its_first_judgement_and_names_the_open
     assert_eq!(board["state_since_ms"], json!(times[3]));
     assert_eq!(board["live"], true);
     assert_eq!(board["activity"]["current_tool"], "Bash");
+    assert_eq!(
+        board["activity"]["current_tool_summary"], "cargo test -p spawn-cli",
+        "the open call's key input, from its tool.started"
+    );
     assert_eq!(board["activity"]["tool_calls"], 2);
     assert!(
         board.get("last_input").is_none(),
@@ -185,6 +193,7 @@ fn a_session_judged_one_state_only_is_in_it_since_its_first_judgement() {
     assert_eq!(board["state"], "WAITING");
     assert_eq!(board["state_since_ms"], json!(first));
     assert_eq!(board["activity"]["current_tool"], json!(null));
+    assert_eq!(board["activity"]["current_tool_summary"], json!(null));
 }
 
 #[test]

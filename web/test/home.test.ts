@@ -5,6 +5,7 @@ import type { Alert } from "../src/api.ts";
 import type { Attention } from "../src/attention.ts";
 import type { FleetAgent, FleetHealth } from "../src/fleet.ts";
 import {
+  currentToolText,
   actionableAlerts,
   agentName,
   agentsNow,
@@ -44,6 +45,7 @@ function agent(session: string, fields: Partial<FleetAgent> = {}): FleetAgent {
     task: null,
     activity: {
       current_tool: null,
+      current_tool_summary: null,
       jobs: [],
       last_event_name: "screen.observed",
       last_event_at_ms: NOW - MIN,
@@ -297,7 +299,7 @@ test("working now: live agents with a task or a running turn, each by its one na
     [
       agent("session_supervisor", { role: "supervisor", state: "WAITING" }),
       agent("session_worker_objective_222", { state: "WAITING" }),
-      agent("session_worker_objective_300", { state: "WORKING", activity: { ...agent("x").activity, current_tool: "Bash" } }),
+      agent("session_worker_objective_300", { state: "WORKING", activity: { ...agent("x").activity, current_tool: "Bash", current_tool_summary: "cargo test -p spawn-cli" } }),
       agent("session_worker_objective_100", { live: false, state: "WORKING" }),
     ],
     context,
@@ -305,7 +307,7 @@ test("working now: live agents with a task or a running turn, each by its one na
   assert.deepEqual(
     model.working.map((entry) => [entry.name, entry.doing]),
     [
-      ["agent_worker_objective_300", "running Bash"],
+      ["agent_worker_objective_300", "running Bash · cargo test -p spawn-cli"],
       ["worker · Supply PA T222", "gating"],
     ],
   );
@@ -449,4 +451,11 @@ test("the digest leaves out a moot alert (one about a session that has ended)", 
   const agents = [agent("session_old", { live: false })];
   const digest = digestToday(missions([]), [alert("s", "agent_stuck", "session_old", { fired_at_ms: NOW - HOUR })], NOW, agents);
   assert.equal(digest.alerts, 0);
+});
+
+test("an open tool reads as its key input; a call recorded without one reads as the tool alone", () => {
+  const base = agent("x").activity;
+  assert.equal(currentToolText({ ...base, current_tool: "Read", current_tool_summary: "web/src/home.ts:1-80" }), "Read · web/src/home.ts:1-80");
+  assert.equal(currentToolText({ ...base, current_tool: "Read", current_tool_summary: null }), "Read");
+  assert.equal(currentToolText({ ...base, current_tool: null, current_tool_summary: "stale" }), null);
 });
