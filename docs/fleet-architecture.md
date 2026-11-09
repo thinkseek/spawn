@@ -960,7 +960,8 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   `judge_down` (the model judge's watcher recorded `host.judge` `down`, two
   calls in a row failed after its last answer, and no `up` after it,
   `SPAWN_ALERT_JUDGE_DOWN_SECS` after the first failed (default 900): no
-  call answered since; one failure alone records nothing; clears at the
+  call answered since; one failure alone, or two more than 15 min apart,
+  records nothing; clears at the
   `up`, the first answer, with `failed_calls`; it rests
   on that record, never on how few judgements a judge that is down leaves:
   an open `agent_stuck` also shows when its session was last scored),

@@ -14,7 +14,8 @@
 //! failures this watcher counted since the `down`, or since its restart if
 //! it restarted while down). Nothing is recorded per call.
 //!
-//! One failure alone records nothing: the Observer retries a failed call
+//! One failure alone records nothing, nor do two more than
+//! [`IN_A_ROW_MS`] apart: the Observer retries a failed call
 //! only while its session stays ambiguous, and the judge is called a few
 //! times an hour, so a single 502 or a malformed answer followed by
 //! quiet would otherwise read as a judge answering nothing for as long as
@@ -26,11 +27,20 @@
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
-use spawn_core::observe::{JudgeError, JudgeInput, Judgement, StateJudge};
+use spawn_core::observe::{JudgeError, JudgeInput, Judgement, RETRY_MAX, StateJudge};
 use spawn_postgres::PostgresStore;
 
 /// The longest error text a `down` record keeps.
 const ERROR_CHARS: usize = 300;
+
+/// The longest gap between two failures that still makes them "in a row":
+/// the Observer's longest retry wait ([`RETRY_MAX`], 10 min) and 5 min of
+/// slack. A judge that is down is retried within it while any session
+/// stays ambiguous; two failures further apart (one session's, then hours
+/// later another's) say nothing about the time between them, so the later
+/// one starts a new count (rev-b on fb32d076).
+const IN_A_ROW_MS: i64 = 15 * 60 * 1000;
+const _: () = assert!(RETRY_MAX.as_millis() < IN_A_ROW_MS as u128);
 
 /// Where the watched judge stands, as recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +181,11 @@ impl StateJudge for WatchedJudge {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match (&result, *standing) {
             (Err(_), Standing::Up) => {
+                *standing = Standing::Failing { at_ms: now_ms() };
+            }
+            (Err(_), Standing::Failing { at_ms })
+                if now_ms().saturating_sub(at_ms) > IN_A_ROW_MS =>
+            {
                 *standing = Standing::Failing { at_ms: now_ms() };
             }
             (Err(error), Standing::Failing { at_ms }) => {
@@ -333,6 +348,33 @@ mod tests {
                 standing_of(&store.host_judge().expect("latest"), "jev"),
                 Standing::Up
             );
+        });
+    }
+
+    /// Two failures further apart than IN_A_ROW_MS are not in a row: the
+    /// later one starts a new count and records nothing; a failure inside
+    /// the window after it records the `down`, timed from the later one.
+    #[test]
+    fn failures_far_apart_are_not_in_a_row() {
+        in_schema("judge_gap", |store| {
+            let switch = Arc::new(Switch {
+                down: AtomicBool::new(true),
+            });
+            let watched = WatchedJudge::new(switch.clone(), store.clone());
+            let input = JudgeInput::default();
+            let long_ago = super::now_ms() - super::IN_A_ROW_MS - 1;
+            *watched.standing.lock().expect("standing") = Standing::Failing { at_ms: long_ago };
+            let before = super::now_ms();
+            assert!(watched.judge(&input).is_err());
+            assert!(
+                records(&store).is_empty(),
+                "the old failure is not in a row"
+            );
+            assert!(watched.judge(&input).is_err());
+            let down = records(&store);
+            assert_eq!(down.len(), 1, "{down:?}");
+            let first = down[0]["first_failed_ms"].as_i64().expect("first failure");
+            assert!(first >= before, "timed from the later failure: {first}");
         });
     }
 
