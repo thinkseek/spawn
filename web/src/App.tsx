@@ -1,8 +1,9 @@
 import { PanelRight } from "lucide-react";
 import { Suspense, lazy, useEffect, useMemo, useState } from "react";
 
-import { fetchAlerts, fetchAttention, fetchOverview, fetchSession, usePoll } from "./api";
-import type { PollResult, SessionDetail } from "./api";
+import { fetchAlerts, fetchAttention, fetchOverview, fetchSessionTail, usePoll } from "./api";
+import { PAGE_EVENTS } from "./sessionWindow";
+import type { PollResult, SessionTail } from "./api";
 import { markNeedsHuman, needsHuman } from "./attention";
 import { DetailsRail, RailContent } from "./components/DetailsRail";
 import { MobileNav, Sidebar } from "./components/Sidebar";
@@ -211,9 +212,9 @@ export default function App() {
 
   // The session poll runs only in the Sessions view.
   const sessionKey = view === "sessions" ? (selectedId ?? "none") : "hidden";
-  const session = usePoll<SessionDetail | null>(sessionKey, (signal) =>
+  const session = usePoll<SessionTail | null>(sessionKey, (signal) =>
     view === "sessions" && selectedId
-      ? fetchSession(selectedId, signal)
+      ? fetchSessionTail(selectedId, PAGE_EVENTS, signal)
       : Promise.resolve(null),
   );
 
@@ -365,7 +366,12 @@ export default function App() {
             {!selectedId ? (
               <Placeholder text="Waiting for a session." />
             ) : detail ? (
-              <Timeline key={selectedId} events={detail.timeline} />
+              <Timeline
+                key={selectedId}
+                sessionId={detail.session_id}
+                tail={detail.window}
+                executions={detail.executions}
+              />
             ) : (
               <Placeholder
                 text={

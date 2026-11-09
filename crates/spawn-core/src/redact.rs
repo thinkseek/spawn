@@ -12,12 +12,22 @@
 //! - API keys by their prefix: `sk-…`, `ghp_…` (and GitHub's other `gh?_`
 //!   tokens), `github_pat_…`, `AKIA…` (AWS access key ids);
 //! - `Bearer <token>`;
-//! - an `x-api-key` header's value;
+//! - a credential header's value: `Authorization:` and
+//!   `Proxy-Authorization:` whatever the scheme (`Basic …`, `token …`, a
+//!   raw value; the scheme word stays), `Cookie:`, and any header whose name
+//!   ends in `-token`, `-key`, `-secret` or `-password` (`x-api-key`,
+//!   `PRIVATE-TOKEN`, `X-Auth-Token`);
 //! - the password of a URL's userinfo, `scheme://user:pass@` (the user
-//!   stays);
-//! - the value of an assignment whose name ends in `PASSWORD`, `PASSWD`,
-//!   `TOKEN`, `SECRET` or `KEY`, any case (`PGPASSWORD=…`, `api_key=…`,
-//!   `--token=…`, `?token=…&`).
+//!   stays); a password may hold `@` or `/`: the userinfo ends at the last
+//!   `@` before the query;
+//! - the value of an assignment whose name ends in `TOKEN`, `SECRET`,
+//!   `KEY`, `AUTH`, `CREDENTIALS` or `COOKIE`, or holds `PASS` (so
+//!   `PASSWORD`, `PASSWD`) or `PWD`, any case (`PGPASSWORD=…`, `DB_PASS=…`, `api_key=…`,
+//!   `--token=…`, `?token=…&`);
+//! - a JSON string under such a key (`"token": "…"`, `"password": "…"`);
+//! - a credential flag's value: `-u`/`--user user:pass` (the user stays),
+//!   `--password v`, `sshpass -p v`, and `-pv` on a `mysql`/`mariadb`
+//!   command line.
 
 use serde_json::Value;
 
@@ -31,13 +41,16 @@ pub const REDACTED: &str = "[redacted]";
 pub fn redact(text: &str) -> String {
     let text = prefixed_keys(text);
     let text = bearer(&text);
-    let text = api_key_header(&text);
+    let text = headers(&text);
     let text = userinfo(&text);
+    let text = json_keys(&text);
+    let text = flags(&text);
     assignments(&text)
 }
 
 /// Redact the free-text fields of `kind`: engine and command errors,
-/// screen evidence, and the text an observation quotes. Identifiers,
+/// screen evidence, a tool call's summary of its input, and the text an
+/// observation quotes. Identifiers,
 /// paths and control records (which carry mission sources and prompts the
 /// folds read back) are left as they are.
 pub fn redact_event(kind: &mut EventKind) {
@@ -50,6 +63,19 @@ pub fn redact_event(kind: &mut EventKind) {
             error: Some(error), ..
         } => clean(error),
         EventKind::ScreenObserved { evidence, .. } => clean(evidence),
+        EventKind::ToolStarted {
+            summary: Some(summary),
+            summary_whole,
+            ..
+        } => {
+            // A summary the redactor changed is no longer the call's whole
+            // input: two calls with different secrets would read the same.
+            let before = summary.clone();
+            clean(summary);
+            if *summary != before {
+                *summary_whole = false;
+            }
+        }
         EventKind::ObservationRecorded { observation } => {
             if let Some(text) = observation.human_question.as_mut() {
                 clean(text);
@@ -174,29 +200,64 @@ fn value_end(bytes: &[u8], start: usize, stops: &[u8]) -> usize {
             .count()
 }
 
-/// `x-api-key: <value>` (or `=`), quoted or not: the name stays.
-fn api_key_header(text: &str) -> String {
+/// Is `name` (a header's, any case) one whose value is a credential?
+fn credential_header(name: &[u8]) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_slice(),
+        b"authorization" | b"proxy-authorization" | b"cookie"
+    ) || [&b"-token"[..], b"-key", b"-secret", b"-password"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+/// A credential header, `Name: value` (or `=`), quoted or not: the name
+/// stays, and so does an authorization's scheme word (`Basic`, `token`);
+/// the value goes. A `Bearer` token is already gone ([`bearer`]).
+fn headers(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
     while at < bytes.len() {
         let boundary = at == 0 || !word_byte(bytes[at - 1]);
-        if boundary && starts_with_ignoring_case(bytes, at, "x-api-key") {
-            let mut start = at + 9;
+        let name_len = bytes[at..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'-')
+            .count();
+        if boundary && name_len > 0 && credential_header(&bytes[at..at + name_len]) {
+            let mut start = at + name_len;
             let skip = |start: &mut usize, set: &[u8]| {
                 while bytes.get(*start).is_some_and(|byte| set.contains(byte)) {
                     *start += 1;
                 }
             };
             skip(&mut start, b" \t\"'");
-            if bytes
-                .get(start)
-                .is_some_and(|byte| *byte == b':' || *byte == b'=')
-            {
+            // A header's colon is followed by a space or a quote; a colon
+            // glued to its value is a URL's userinfo (`token:pass@`), which
+            // [`userinfo`] reads.
+            let separator = bytes.get(start).copied();
+            let spaced = bytes
+                .get(start + 1)
+                .is_some_and(|byte| b" \t\"'".contains(byte));
+            if separator == Some(b'=') || (separator == Some(b':') && spaced) {
                 start += 1;
                 skip(&mut start, b" \t\"'");
+                // `Basic <credentials>`: the scheme stays. A scheme is a
+                // word of letters followed by a space and more value.
+                let word = bytes[start..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_alphabetic())
+                    .count();
+                if word > 0
+                    && bytes.get(start + word) == Some(&b' ')
+                    && bytes
+                        .get(start + word + 1)
+                        .is_some_and(|byte| !byte.is_ascii_whitespace() && !b"\"'".contains(byte))
+                {
+                    start += word + 1;
+                }
                 let end = value_end(bytes, start, b"\"',;}");
-                if end > start {
+                if end > start && &bytes[start..end] != REDACTED.as_bytes() {
                     out.extend_from_slice(&bytes[at..start]);
                     out.extend_from_slice(REDACTED.as_bytes());
                     at = end;
@@ -204,13 +265,18 @@ fn api_key_header(text: &str) -> String {
                 }
             }
         }
-        out.push(bytes[at]);
-        at += 1;
+        // Past the whole name: a header name never starts inside one.
+        let step = name_len.max(1);
+        out.extend_from_slice(&bytes[at..at + step]);
+        at += step;
     }
     text_of(out)
 }
 
-/// `scheme://user:password@host`: the password goes, the user stays.
+/// `scheme://user:password@host`: the password goes, the user stays. A
+/// password may hold `@` or `/`, so the userinfo runs to the last `@`
+/// before the query or fragment; a `host:port/path@x` (digits up to the
+/// first `/`) is a port, not a password.
 fn userinfo(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -221,16 +287,164 @@ fn userinfo(text: &str) -> String {
             let end = start
                 + bytes[start..]
                     .iter()
-                    .take_while(|byte| !byte.is_ascii_whitespace() && !b"@/?#\"'<>".contains(byte))
+                    .take_while(|byte| !byte.is_ascii_whitespace() && !b"?#\"'<>`".contains(byte))
                     .count();
-            if bytes.get(end) == Some(&b'@')
-                && let Some(colon) = bytes[start..end].iter().position(|byte| *byte == b':')
-                && start + colon + 1 < end
+            let token = &bytes[start..end];
+            if let Some(last_at) = token.iter().rposition(|byte| *byte == b'@')
+                && let Some(colon) = token[..last_at].iter().position(|byte| *byte == b':')
+                && !token[..colon].contains(&b'/')
+                && colon + 1 < last_at
+                && !is_port(&token[colon + 1..last_at])
+                && &token[colon + 1..last_at] != REDACTED.as_bytes()
             {
                 out.extend_from_slice(&bytes[at..=start + colon]);
                 out.extend_from_slice(REDACTED.as_bytes());
                 out.push(b'@');
-                at = end + 1;
+                at = start + last_at + 1;
+                continue;
+            }
+        }
+        out.push(bytes[at]);
+        at += 1;
+    }
+    text_of(out)
+}
+
+/// `8080/…`: digits up to the first `/` (or the end) read as a port.
+fn is_port(after_colon: &[u8]) -> bool {
+    let digits = after_colon
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    digits > 0 && after_colon.get(digits).is_none_or(|byte| *byte == b'/')
+}
+
+/// Does an assignment's or a key's `name` say its value is a credential?
+fn secret_name(name: &[u8]) -> bool {
+    // `PASSWORD` and `PASSWD` hold `PASS` (below).
+    const ENDINGS: [&str; 6] = ["TOKEN", "SECRET", "KEY", "AUTH", "CREDENTIALS", "COOKIE"];
+    const WITHIN: [&str; 2] = ["PASS", "PWD"];
+    let upper = name.to_ascii_uppercase();
+    ENDINGS.iter().any(|word| upper.ends_with(word.as_bytes()))
+        || WITHIN.iter().any(|word| {
+            upper
+                .windows(word.len())
+                .any(|window| window == word.as_bytes())
+        })
+}
+
+/// `"token": "value"` in JSON: a string under a credential's key goes.
+fn json_keys(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'"' {
+            let name_len = bytes[at + 1..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(byte))
+                .count();
+            let close = at + 1 + name_len;
+            if name_len > 0 && bytes.get(close) == Some(&b'"') && secret_name(&bytes[at + 1..close])
+            {
+                let mut start = close + 1;
+                while bytes
+                    .get(start)
+                    .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+                {
+                    start += 1;
+                }
+                if bytes.get(start) == Some(&b':') {
+                    start += 1;
+                    while bytes
+                        .get(start)
+                        .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+                    {
+                        start += 1;
+                    }
+                    if bytes.get(start) == Some(&b'"') {
+                        let value = start + 1;
+                        let mut end = value;
+                        while end < bytes.len() && bytes[end] != b'"' {
+                            end += usize::from(bytes[end] == b'\\') + 1;
+                        }
+                        let end = end.min(bytes.len());
+                        if end > value && &bytes[value..end] != REDACTED.as_bytes() {
+                            out.extend_from_slice(&bytes[at..value]);
+                            out.extend_from_slice(REDACTED.as_bytes());
+                            at = end;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        out.push(bytes[at]);
+        at += 1;
+    }
+    text_of(out)
+}
+
+/// The token starting at `start`: up to whitespace or a closing quote.
+fn token_end(bytes: &[u8], start: usize) -> usize {
+    value_end(bytes, start, b"\"';&|")
+}
+
+/// Credential flags on a command line: `-u`/`--user user:pass` (the user
+/// stays), `--password v`, `sshpass -p v`, and `-pv` on a line that runs
+/// `mysql` or `mariadb` (there `-p` glued to a value is the password).
+fn flags(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let lower = text.to_ascii_lowercase();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    let mut line_start = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'\n' {
+            line_start = at + 1;
+        }
+        let boundary = at == 0 || bytes[at - 1].is_ascii_whitespace();
+        if boundary && bytes[at] == b'-' {
+            let flag_len = bytes[at..]
+                .iter()
+                .take_while(|byte| !byte.is_ascii_whitespace() && **byte != b'=')
+                .count();
+            let flag = &bytes[at..at + flag_len];
+            let line = &lower[line_start..at];
+            let next = |from: usize| -> Option<(usize, usize)> {
+                let gap = bytes[from..]
+                    .iter()
+                    .take_while(|byte| **byte == b' ' || **byte == b'=')
+                    .count();
+                let start = from + gap;
+                let start =
+                    start + usize::from(bytes.get(start).is_some_and(|byte| b"\"'".contains(byte)));
+                let end = token_end(bytes, start);
+                (gap > 0 && end > start).then_some((start, end))
+            };
+            // The span of the value to replace, if this flag carries one.
+            let secret: Option<(usize, usize)> = match flag {
+                b"-u" | b"--user" => next(at + flag_len).and_then(|(start, end)| {
+                    let colon = bytes[start..end].iter().position(|byte| *byte == b':')?;
+                    (start + colon + 1 < end).then_some((start + colon + 1, end))
+                }),
+                b"--password" | b"--passwd" => next(at + flag_len),
+                b"-p" if line.trim_end().ends_with("sshpass") => next(at + flag_len),
+                _ if flag.len() > 2
+                    && flag.starts_with(b"-p")
+                    && !flag.starts_with(b"--")
+                    && (line.contains("mysql") || line.contains("mariadb")) =>
+                {
+                    Some((at + 2, at + flag_len))
+                }
+                _ => None,
+            };
+            if let Some((start, end)) = secret
+                && &bytes[start..end] != REDACTED.as_bytes()
+            {
+                out.extend_from_slice(&bytes[at..start]);
+                out.extend_from_slice(REDACTED.as_bytes());
+                at = end;
                 continue;
             }
         }
@@ -242,7 +456,6 @@ fn userinfo(text: &str) -> String {
 
 /// `NAME=value` where the name ends in a secret's word: the value goes.
 fn assignments(text: &str) -> String {
-    const NAMES: [&str; 5] = ["PASSWORD", "PASSWD", "TOKEN", "SECRET", "KEY"];
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
@@ -253,11 +466,7 @@ fn assignments(text: &str) -> String {
                 .rposition(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_'))
                 .map_or(0, |before| before + 1);
             let name = &bytes[name_start..at];
-            let secret = NAMES.iter().any(|word| {
-                name.len() >= word.len()
-                    && name[name.len() - word.len()..].eq_ignore_ascii_case(word.as_bytes())
-            });
-            if secret {
+            if !name.is_empty() && secret_name(name) {
                 let quote = bytes
                     .get(at + 1)
                     .copied()
@@ -422,5 +631,196 @@ mod tests {
             finished,
             EventKind::CommandFinished { error: Some(error), .. } if !error.contains("p4ss")
         ));
+    }
+
+    /// The shapes rev-e's probe found reaching a stored tool summary
+    /// (review-ui-ia-tools.md), each with its own assertion so a pass that
+    /// loses one fails here.
+    #[test]
+    fn credential_headers_lose_their_values_whatever_the_scheme() {
+        let r = REDACTED;
+        assert_eq!(
+            redact("curl -H 'Authorization: Basic YWxpY2U6aHVudGVyMg==' https://x"),
+            format!("curl -H 'Authorization: Basic {r}' https://x")
+        );
+        assert_eq!(
+            redact("curl -H \"Authorization: s3cr3tR4wT0k3n\" https://x"),
+            format!("curl -H \"Authorization: {r}\" https://x")
+        );
+        assert_eq!(
+            redact("curl -H 'Authorization: token 0123456789abcdef0123' https://x"),
+            format!("curl -H 'Authorization: token {r}' https://x")
+        );
+        assert_eq!(
+            redact("Proxy-Authorization: Basic dTpw"),
+            format!("Proxy-Authorization: Basic {r}")
+        );
+        assert_eq!(
+            redact("curl -H 'PRIVATE-TOKEN: glpat-AbCdEf0123456789' https://x"),
+            format!("curl -H 'PRIVATE-TOKEN: {r}' https://x")
+        );
+        assert_eq!(
+            redact("curl -H 'X-Auth-Token: abcd1234efgh5678' https://x"),
+            format!("curl -H 'X-Auth-Token: {r}' https://x")
+        );
+        assert_eq!(redact("Cookie: sid=abc123"), format!("Cookie: {r}"));
+        assert_eq!(
+            redact("X-Client-Secret: q1w2e3"),
+            format!("X-Client-Secret: {r}")
+        );
+        assert_eq!(
+            redact("X-Db-Password: q1w2e3"),
+            format!("X-Db-Password: {r}")
+        );
+        // A header name in prose, a colon glued to a URL's userinfo, and
+        // other headers stay.
+        assert_eq!(
+            redact("Authorization failed: check it"),
+            "Authorization failed: check it"
+        );
+        assert_eq!(
+            redact("Content-Type: application/json"),
+            "Content-Type: application/json"
+        );
+        assert_eq!(redact("author: Ann"), "author: Ann");
+    }
+
+    #[test]
+    fn credential_flags_lose_their_values() {
+        let r = REDACTED;
+        assert_eq!(
+            redact("curl -u alice:hunter2pass https://api.example/v1"),
+            format!("curl -u alice:{r} https://api.example/v1")
+        );
+        assert_eq!(
+            redact("curl --user alice:hunter2pass https://x"),
+            format!("curl --user alice:{r} https://x")
+        );
+        assert_eq!(
+            redact("mysql --password hunter2pass -u root"),
+            format!("mysql --password {r} -u root")
+        );
+        assert_eq!(
+            redact("mysql -phunter2pass -u root"),
+            format!("mysql -p{r} -u root")
+        );
+        assert_eq!(
+            redact("mariadb -uroot -phunter2pass db"),
+            format!("mariadb -uroot -p{r} db")
+        );
+        assert_eq!(
+            redact("sshpass -p hunter2pass ssh host"),
+            format!("sshpass -p {r} ssh host")
+        );
+        // The same flags meaning something else stay: a user without a
+        // password, a port, a path, a parent directory.
+        for text in [
+            "curl -u alice https://x",
+            "ssh -p 2222 host",
+            "mkdir -p crates/x",
+            "cargo test -p spawn-cli",
+            "git log -p -3",
+            "ps -u ckl",
+        ] {
+            assert_eq!(redact(text), text);
+        }
+    }
+
+    #[test]
+    fn pass_and_pwd_names_and_json_keys_lose_their_values() {
+        let r = REDACTED;
+        assert_eq!(
+            redact("DB_PASS=hunter2pass ./run"),
+            format!("DB_PASS={r} ./run")
+        );
+        assert_eq!(
+            redact("PGPWD=hunter2pass ./run"),
+            format!("PGPWD={r} ./run")
+        );
+        assert_eq!(
+            redact("SMTP_PASSPHRASE=x ./run"),
+            format!("SMTP_PASSPHRASE={r} ./run")
+        );
+        assert_eq!(redact("GH_AUTH=abc ./run"), format!("GH_AUTH={r} ./run"));
+        assert_eq!(
+            redact("GCP_CREDENTIALS=abc ./run"),
+            format!("GCP_CREDENTIALS={r} ./run")
+        );
+        assert_eq!(
+            redact("SESSION_COOKIE=abc ./run"),
+            format!("SESSION_COOKIE={r} ./run")
+        );
+        assert_eq!(
+            redact("curl -d '{\"token\": \"abcdef123456\"}' https://x"),
+            format!("curl -d '{{\"token\": \"{r}\"}}' https://x")
+        );
+        assert_eq!(
+            redact(r#"{"password":"p\"w","user":"u"}"#),
+            format!(r#"{{"password":"{r}","user":"u"}}"#)
+        );
+        assert_eq!(
+            redact(r#"{"api_key": "k1", "client_secret": "s1"}"#),
+            format!(r#"{{"api_key": "{r}", "client_secret": "{r}"}}"#)
+        );
+        // Other keys and names stay.
+        assert_eq!(
+            redact(r#"{"tokens": 3, "user": "u", "path": "/x"}"#),
+            r#"{"tokens": 3, "user": "u", "path": "/x"}"#
+        );
+        assert_eq!(redact("RUST_LOG=debug ./run"), "RUST_LOG=debug ./run");
+    }
+
+    #[test]
+    fn a_urls_password_holding_an_at_or_a_slash_goes_whole() {
+        let r = REDACTED;
+        assert_eq!(
+            redact("psql postgres://spawn:hun@ter2pass@db/spawn"),
+            format!("psql postgres://spawn:{r}@db/spawn")
+        );
+        assert_eq!(
+            redact("psql postgres://spawn:hun/ter2pass@db/spawn"),
+            format!("psql postgres://spawn:{r}@db/spawn")
+        );
+        assert_eq!(
+            redact("DATABASE_URL=postgres://spawn:hunter2pass@db/spawn ./run"),
+            format!("DATABASE_URL=postgres://spawn:{r}@db/spawn ./run")
+        );
+        // A port, then an `@` in the path, is not a password.
+        assert_eq!(
+            redact("https://example.com:8080/a@b/c"),
+            "https://example.com:8080/a@b/c"
+        );
+        assert_eq!(
+            redact("https://example.com/a:b@c"),
+            "https://example.com/a:b@c"
+        );
+    }
+
+    #[test]
+    fn a_redacted_summary_is_no_longer_whole() {
+        let started = |summary: &str| EventKind::ToolStarted {
+            tool_name: "Bash".to_string(),
+            tool_use_id: "a".to_string(),
+            summary: Some(summary.to_string()),
+            summary_whole: true,
+        };
+        let mut secret = started("PGPASSWORD=s3cret psql");
+        redact_event(&mut secret);
+        assert_eq!(
+            secret,
+            EventKind::ToolStarted {
+                tool_name: "Bash".to_string(),
+                tool_use_id: "a".to_string(),
+                summary: Some(format!("PGPASSWORD={REDACTED} psql")),
+                summary_whole: false,
+            }
+        );
+        let mut plain = started("git status");
+        redact_event(&mut plain);
+        assert_eq!(
+            plain,
+            started("git status"),
+            "nothing to redact: still whole"
+        );
     }
 }

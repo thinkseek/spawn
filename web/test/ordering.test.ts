@@ -281,6 +281,7 @@ function agent(agentId: string, extra: Partial<FleetAgent> = {}, lastEvent: numb
     task: null,
     activity: {
       current_tool: null,
+      current_tool_summary: null,
       last_event_name: null,
       last_event_at_ms: lastEvent === null ? null : T0 + lastEvent * MIN,
       event_count: null,

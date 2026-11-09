@@ -5,6 +5,7 @@ import { FLEET_STATES, jobsText, onOwnJob, percent, stateLabelUpper } from "../.
 import { absoluteTitle } from "../../format";
 import type { AgentGroup, AgentGroupId, FleetContext, TaskRef } from "../../ordering";
 import { AGENT_GROUP_LABEL, heldTask, lastTask } from "../../ordering";
+import { currentToolText } from "../../home";
 import { useStoredChoice } from "../ViewToggle";
 import { Ago, Card, CardHeader, EmptyState, FOCUS_RING_INSET, GroupHeader, LabeledId, cx, sinceText } from "../ui";
 import { FleetStateDot, JudgeBadge } from "./bits";
@@ -19,8 +20,9 @@ export function doingNow(agent: FleetAgent): {
   at: number | null;
 } {
   const activity = agent.activity;
-  if (activity.current_tool) {
-    return { label: activity.current_tool, tool: true, job: false, at: activity.last_event_at_ms };
+  const tool = currentToolText(activity);
+  if (tool) {
+    return { label: tool, tool: true, job: false, at: activity.last_event_at_ms };
   }
   const jobs = onOwnJob(agent) ? jobsText(activity.jobs) : null;
   if (jobs) {
