@@ -1120,7 +1120,8 @@ pub(crate) const PUBLISHING_AGENTS: &str = "select a.agent_id,
 /// The owner's landing requests (`source.push_requested`, `spawn mission
 /// push`) that have no outcome yet (a `source.moved` or a
 /// `source.push_refused` naming them), oldest first: `[{request, source,
-/// commit, ref, at_ms}]`, `request` the request's event id. Read through the
+/// commit, ref, at_ms, gated, urgent, reason}]`, `request` the request's
+/// event id (`gated` and `urgent` false and `reason` null when not given). Read through the
 /// `spawn_events_source_push` index.
 pub(crate) const SOURCE_PUSHES_PENDING: &str = r"
 with owner as (
@@ -1131,7 +1132,10 @@ with owner as (
          in ('source.push_requested', 'source.push_refused', 'source.moved'))
 select coalesce(jsonb_agg(jsonb_build_object('request', q.id, 'source', q.r ->> 'source',
                                              'commit', q.r ->> 'commit', 'ref', q.r ->> 'ref',
-                                             'at_ms', q.recorded_at_ms)
+                                             'at_ms', q.recorded_at_ms,
+                                             'gated', coalesce((q.r ->> 'gated')::boolean, false),
+                                             'urgent', coalesce((q.r ->> 'urgent')::boolean, false),
+                                             'reason', q.r ->> 'reason')
                           order by q.session_seq), '[]'::jsonb)
   from owner q
  where q.r ->> 'type' = 'source.push_requested'
@@ -1150,6 +1154,19 @@ select e.kind -> 'detail' -> 'record' || jsonb_build_object('event_id', e.id,
    and e.kind -> 'detail' -> 'record' ->> 'request' = ($1::bigint)::text
  order by e.session_seq
  limit 1";
+
+/// How the integrator applies an owner's landing request
+/// ([`PostgresStore::source_push_request`]; design-owner-push-between-gates.md).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PushRequest {
+    /// Judged with the source's gate first, as a judging of its own between
+    /// the source's gates; otherwise applied as it is.
+    pub gated: bool,
+    /// First in line: the judging in flight on the source is stopped.
+    pub urgent: bool,
+    /// The owner's words, on the record.
+    pub reason: Option<String>,
+}
 
 // Delivery bookkeeping, run by the dispatcher as the owner.
 
@@ -1375,17 +1392,25 @@ impl PostgresStore {
     /// Ask for `commit` on `source`'s main (`spawn mission push`, owner
     /// only): the commit waits in the source at `reference`
     /// (`refs/spawn-owner/<commit>`). Records `source.push_requested` and
-    /// returns its event id; the integrator applies it.
+    /// returns its event id; the integrator applies it, as `how` says.
     pub fn source_push_request(
         &self,
         source: &str,
         commit: &str,
         reference: &str,
+        how: &PushRequest,
     ) -> Result<i64, StoreError> {
         Ok(self
             .query_one(
-                "select spawn_source_push_request($1, $2, $3)",
-                &[&source, &commit, &reference],
+                "select spawn_source_push_request($1, $2, $3, $4, $5, $6)",
+                &[
+                    &source,
+                    &commit,
+                    &reference,
+                    &how.gated,
+                    &how.urgent,
+                    &how.reason.as_deref(),
+                ],
             )?
             .get(0))
     }

@@ -204,6 +204,19 @@
 #                              ("main is red", the integrator sets it): its
 #                              verdict says `base_check` when it passes, and
 #                              two runs that fail alike are main_red (exit 6)
+#   SPAWN_GATE_RED_UNSOLVED    1: a check main is red on (it fails twice on
+#                              the base with the same failing tests) is
+#                              unsolved on the base, not a regression and no
+#                              stop, while the candidate's runs fail only
+#                              tests main's red runs fail: the gate says so
+#                              and judges the rest. A test the candidate
+#                              newly fails in it, or a run naming no failed
+#                              test, is a regression (new_failures).
+#                              The integrator sets it for an owner's gated
+#                              push only (design-owner-push-between-gates.md):
+#                              the regression rule holds for what the base
+#                              solves, and an owner's push during a red main
+#                              must not go ungated for it
 #   SPAWN_GATE_PG_IMAGE        the test server's docker image: the gate runs a
 #                              server of its own from it (GitHub issue #6),
 #                              and SPAWN_TEST_DATABASE_URL is not used
@@ -545,6 +558,27 @@ EOF_MAIN_RED
 # shared_failed <out> <out> <dest>: the `FAILED <test>: …` lines of the first
 # run whose test the second run failed too (check-tests.sh prints one per
 # failing test); <dest> empty when they share none. 0 when they share one.
+# new_failures <main-red> <out>...: for an owner's push
+# (SPAWN_GATE_RED_UNSOLVED), the tests the candidate's runs fail (`FAILED
+# <test>:`) that main's red runs do not, one a line, first seen first; a
+# candidate run with no FAILED line names nothing it failed, so it says so
+# (`(no FAILED line)`). Nothing when every candidate failure is main's own
+# (rev-b F1 on bfbda5cb: the red check was skipped whatever the candidate
+# broke inside it).
+new_failures() {
+    new_red=$1
+    shift
+    for new_out in "$@"; do
+        if ! grep -q '^FAILED ' "$new_out" 2>/dev/null; then
+            echo "(no FAILED line)"
+            continue
+        fi
+        awk '
+            FNR == NR { if ($1 == "FAILED") { t = $2; sub(/:$/, "", t); red[t] = 1 } next }
+            $1 == "FAILED" { t = $2; sub(/:$/, "", t); if (!(t in red)) print t }
+        ' "$new_red" "$new_out"
+    done | awk '!seen[$0]++'
+}
 shared_failed() {
     awk '
         FNR == NR { if ($1 == "FAILED") { t = $2; sub(/:$/, "", t); seen[t] = 1 } next }
@@ -3207,6 +3241,16 @@ candidate_job() {
                         shared_failed "$job/out.3" "$job/out.4" "$job/main-red"; then
                         job_say "| $(basename "$job_scenario") fails on the base twice with the same failing tests: main is red on it, no verdict on the candidate"
                         run_status=main_red
+                        # An owner's push: unsolved on the base only for the
+                        # tests main fails; one more the candidate fails is
+                        # its own regression.
+                        if [ "${SPAWN_GATE_RED_UNSOLVED-}" = 1 ]; then
+                            red_new=$(new_failures "$job/main-red" "$job/out.1" "$job/out.2")
+                            if [ -n "$red_new" ]; then
+                                job_say "| $(basename "$job_scenario"): the candidate fails what main's red runs do not ($(printf '%s' "$red_new" | tr '\n' ' ' | sed 's/ $//')): a regression"
+                                run_status=$again
+                            fi
+                        fi
                     else
                         rm -f "$job/main-red"
                         job_say "| $(basename "$job_scenario") fails on the base too ($on_base, then $on_base2): a host or harness fault, no verdict on the candidate"
@@ -3233,6 +3277,11 @@ decisive() {
     [ "$(cat "$1/result")" != 0 ] || return 1
     # A scenario the host cannot judge is no verdict either way (below).
     [ "$(cat "$1/result")" != 6 ] || return 1
+    # A check main is red on, for an owner's push (SPAWN_GATE_RED_UNSOLVED):
+    # unsolved on the base, the rest still judged.
+    if [ "$(cat "$1/result")" = main_red ] && [ "${SPAWN_GATE_RED_UNSOLVED-}" = 1 ]; then
+        return 1
+    fi
     [ -e "$1/task" ] || [ "$(cat "$1/result")" = error ] ||
         [ "$(base_result "$(cat "$1/scenario")")" != unsolved ]
 }
@@ -3274,6 +3323,11 @@ candidate_printed() {
             cannot_judge "$(basename "$printed_scenario")" "$printed_status"
         fi
         echo "| $(basename "$printed_scenario") cannot be judged here: not a regression"
+        run_stage "skipped|$printed_name" "$printed_ms"
+        return 0
+    fi
+    if [ "$printed_status" = main_red ] && [ "${SPAWN_GATE_RED_UNSOLVED-}" = 1 ]; then
+        echo "| $(basename "$printed_scenario") fails on the base twice with the same failing tests: main is red on it, so it is unsolved on the base (SPAWN_GATE_RED_UNSOLVED): not a regression"
         run_stage "skipped|$printed_name" "$printed_ms"
         return 0
     fi

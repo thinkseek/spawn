@@ -2838,7 +2838,16 @@ end $$;
 -- (`source.moved` naming it, or `source.push_refused`). Nothing else moves:
 -- no branch, no baseline, no gate. Returns the request's event id. The
 -- source is one a gate lands on: a directory on this host with a mission.
-create or replace function spawn_source_push_request(p_source text, p_commit text, p_ref text)
+-- `p_gated`: the integrator judges the landing with the source's gate
+-- first, as a judging of its own between the source's gates; `p_urgent`: it
+-- goes first and stops the judging in flight on the source
+-- (design-owner-push-between-gates.md); `p_reason`: the owner's words, on
+-- the record. Each is on the record only when given.
+drop function if exists spawn_source_push_request(text, text, text);
+create or replace function spawn_source_push_request(p_source text, p_commit text, p_ref text,
+                                                     p_gated boolean default false,
+                                                     p_urgent boolean default false,
+                                                     p_reason text default null)
 returns bigint language plpgsql security definer as $$
 begin
     perform pg_advisory_xact_lock(1399957335);
@@ -2861,9 +2870,18 @@ begin
     if p_ref is distinct from 'refs/spawn-owner/' || p_commit then
         raise exception 'the owner''s commit waits at refs/spawn-owner/%, not %', p_commit, p_ref;
     end if;
+    if length(coalesce(p_reason, '')) > 2000 then
+        raise exception 'the reason is at most 2000 characters';
+    end if;
     return spawn_control_record(jsonb_build_object(
         'type', 'source.push_requested', 'source', p_source, 'commit', p_commit,
-        'ref', p_ref, 'by', 'human'));
+        'ref', p_ref, 'by', 'human')
+        || case when coalesce(p_gated, false) then jsonb_build_object('gated', true)
+                else '{}'::jsonb end
+        || case when coalesce(p_urgent, false) then jsonb_build_object('urgent', true)
+                else '{}'::jsonb end
+        || case when coalesce(p_reason, '') <> '' then jsonb_build_object('reason', p_reason)
+                else '{}'::jsonb end);
 end $$;
 
 -- The integrator's hold on an owner's landing (owner only): the landing
@@ -3860,7 +3878,8 @@ begin
         'spawn_landing_hold(bigint)', 'spawn_landing_release()',
         'spawn_source_holdable(text)', 'spawn_source_hold_lock(text)',
         'spawn_source_hold(text, text, integer, text)', 'spawn_source_release(text)',
-        'spawn_source_push_request(text, text, text)', 'spawn_source_push_hold()'] loop
+        'spawn_source_push_request(text, text, text, boolean, boolean, text)',
+        'spawn_source_push_hold()'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
     end loop;
