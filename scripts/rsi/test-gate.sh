@@ -1808,11 +1808,27 @@ refuse "no run of the gate is left" "$(ps -eo args | grep -F 'sleep 29.25' | gre
 
 # 16c. A scenario on the serial list runs alone: each scenario marks itself
 # running in the tree, and one that sees a neighbour it must not have exits 2
-# (a harness error on the base: no verdict).
+# (a harness error on the base: no verdict). 072 and 073 meet: each leaves a
+# file, met.<its number>, it never removes and waits, up to 60 s, for the
+# other's, so
+# two runs the gate starts side by side overlap whatever the host's load
+# (rev-e: at load 12.8 on ce03a441 they did not), and two it runs one after
+# the other do not: the first waits the bound out alone. The files are not
+# named `<name>.sh`, which the base cache's key would follow ("the files
+# the scenario names"): neither's key holds the other's blob.
 alone=$work/alone
 mkdir -p "$alone"
 cp "$scenarios/protected" "$scenarios/build" "$alone/"
 for name in 071.sh 072.sh 073.sh; do
+    case $name in
+    072.sh) meet=073.sh ;;
+    073.sh) meet=072.sh ;;
+    *) meet="" ;;
+    esac
+    meet_lines=""
+    [ -z "$meet" ] || meet_lines="touch met.${name%.sh}
+waited=0 # meet
+while [ ! -e met.${meet%.sh} ] && [ \"\$waited\" -lt 600 ]; do sleep 0.1; waited=\$((waited + 1)); done # meet"
     cat >"$alone/$name" <<EOF
 #!/bin/sh
 check() {
@@ -1823,21 +1839,49 @@ check() {
         esac
     done
 }
+echo "$name started \$(date +%s%N)"
 touch running.$name
 check
+$meet_lines
 sleep 1
 check
 rm -f running.$name
+echo "$name ended \$(date +%s%N)"
 EOF
 done
+# stamp <name> <started|ended>: the time (ns) the base run of <name> printed,
+# read from its own block in the log.
+stamp() {
+    sed -n "/^| == base: $1\$/,/^| == base: $1: /s/^| $1 $2 \([0-9]*\)\$/\1/p" "$work/gate.out"
+}
+# intervals <a> <b>: "overlapped" if each base run started before the other
+# ended, "apart" if not, "unstamped" if a stamp is missing.
+intervals() {
+    a0=$(stamp "$1" started) a1=$(stamp "$1" ended) b0=$(stamp "$2" started) b1=$(stamp "$2" ended)
+    if [ -z "$a0" ] || [ -z "$a1" ] || [ -z "$b0" ] || [ -z "$b1" ]; then
+        echo unstamped
+    elif [ "$a0" -lt "$b1" ] && [ "$b0" -lt "$a1" ]; then
+        echo overlapped
+    else
+        echo apart
+    fi
+}
 printf '# run alone\n071.sh\n' >"$alone/serial"
 expect "a scenario on the serial list runs alone, on the base and the candidate" \
     "$(with_jobs 4 alone "$good" "$alone")" 'exit=0 {"verdict":"accepted"}'
-expect "the others ran side by side" "$([ "$(wall_of base)" -lt "$(own_of base)" ] && echo overlapped)" overlapped
+# Side by side, read from the runs' own stamps, not from a bound on the wall
+# clock (which failed once at load 12.8, on ce03a441), and certain by their
+# meeting (above).
+expect "the others ran side by side" "$(intervals 072.sh 073.sh)" overlapped
+expect "and 071 beside neither" "$(intervals 071.sh 072.sh) $(intervals 071.sh 073.sh)" 'apart apart'
 expect "the same results again: all from the cache" \
     "$(with_jobs 4 alone "$good" "$alone" >/dev/null; cat "$work/gate.out")" \
     '| base results from the cache: 071.sh 072.sh 073.sh; run on the base: none'
+# On the list, 072 runs alone and would wait out its meeting: it leaves its
+# file and no longer waits (its blob changes, and it is judged again in any
+# case; 073's key does not hold it).
 printf '072.sh\n' >>"$alone/serial"
+sed -i '/ # meet$/d' "$alone/072.sh"
 expect "one put on the list is judged again, alone" \
     "$(with_jobs 4 alone "$good" "$alone" >/dev/null; cat "$work/gate.out")" \
     '| base results from the cache: 071.sh 073.sh; run on the base: 072.sh'
