@@ -2757,6 +2757,11 @@ if [ -n "${SPAWN_GATE_BASE_CHECK-}" ]; then
             base_check_first=0
             job_run "$job" 1 "$work/baseline" "$base_check_file" || base_check_first=$?
             sed 's/^/| /' "$job/log.1" | tail -n 20
+            # Outside run_jobs, so no printer reads the job's note of a
+            # sandbox that never started (sandbox_never): read here, before
+            # the status, which then says nothing. The base's tree: a host
+            # fault before any candidate code ran (sandbox_fault).
+            if [ -s "$job/never-started" ]; then sandbox_fault "$job/never-started" "$base_check_name"; fi
             if [ -e "$job/slot-waited" ]; then
                 echo "| base check: no scenario slot for $base_check_name: neither red nor green"
             elif [ "$base_check_first" -eq 0 ]; then
@@ -2773,6 +2778,7 @@ if [ -n "${SPAWN_GATE_BASE_CHECK-}" ]; then
                 base_check_again=0
                 job_run "$job" 2 "$work/baseline" "$base_check_file" || base_check_again=$?
                 sed 's/^/| /' "$job/log.2" | tail -n 20
+                if [ -s "$job/never-started" ]; then sandbox_fault "$job/never-started" "$base_check_name"; fi
                 if [ ! -e "$job/slot-waited" ] && [ "$base_check_first" -eq 1 ] &&
                     [ "$base_check_again" -eq 1 ] &&
                     shared_failed "$job/out.1" "$job/out.2" "$job/main-red"; then
@@ -2782,6 +2788,10 @@ if [ -n "${SPAWN_GATE_BASE_CHECK-}" ]; then
             fi
         fi
         stage_close ok
+        # job_run made this job's note the gate's: the gate's own again, so
+        # what the sandbox fails to start from here on is noted where
+        # verdict() reads it.
+        sandbox_note=""
     fi
 fi
 
