@@ -569,6 +569,13 @@ At a turn-stopped-idle boundary:
    recovery generation. Release the publication pin only after that commit,
    then release the controller locks, process, workspace, and admission locks.
 
+A write that changes the captured tree before manifest CAS aborts publication
+through step 5's revalidation. A userspace write that remains pending throughout
+the process freeze and runs only after release is post-cutoff work: publication
+succeeds without it, and the immutable snapshot must not contain it. Only a
+later complete checkpoint can preserve that write. This is the unpublished-work
+loss window defined below, not a retroactive change to the committed checkpoint.
+
 A checkpoint is recoverable only after step 6. Publication is all-or-nothing:
 the existing archive warning alone is not a durable recovery guarantee. Any
 upload, sync, or verification failure leaves the previous manifest as the
@@ -689,8 +696,21 @@ Restore proceeds as follows:
    host.
 4. Establish a persistent provider fence for the old compute and for any prior
    replacement that is not explicitly adopted under the identity checks below.
-   Disable instance start/resume, isolate network and storage, revoke old
-   credentials, and terminate old database sessions. A one-time powered-off
+   Disable instance start/resume, isolate network, storage, and the old host's
+   secret-store access, revoke only old-host-exclusive credentials, and
+   terminate old database sessions. Preserve a shared currently authorized
+   service credential staged in step 2 when the provider fence prevents the old
+   host from using it; do not revoke the replacement's own version merely
+   because the old host also had a copy. Single-Session restore never revokes a
+   shared service credential. If policy requires its rotation, stop before
+   issuing or revoking a shared version and return
+   `shared_credential_rotation_requires_install_wide_rollout`. A separate
+   install-wide operation must stage a new version on every other authorized
+   consumer, switch and health-check those consumers, and revoke the old version
+   only after none of them uses it. Restart restore from step 2 afterward so it
+   resolves the newly authorized version. Current install-wide database logins
+   can be shared by every process, so this distinction is required
+   (`crates/spawn-postgres/src/lib.rs:264-318`). A one-time powered-off
    observation is not a fence. Maintain these controls until the old instance
    is destroyed or wiped. Recheck the selected generation, cutoff, and
    admission fence after the provider fence. If fencing cannot be established,
@@ -779,8 +799,21 @@ Restore proceeds as follows:
     older unclaimed commands remain queued and do not block it. No other command
     may be claimed or typed. Require its corresponding new `turn.stopped`, then
     run the existing report collection, acceptance, and applicable gate/land
-    logic in a target-scoped continuation
-    driver. Every such write carries the operation's epoch and phase; unrelated
+    logic in a target-scoped continuation driver. Finish the continuation Input
+    under the existing `Typing::Done` rule immediately after its `typed` step;
+    do not hold it open while waiting for the turn or report. Associate the
+    later `turn.stopped`, report, acceptance, gate, and land records by command
+    id and correlation marker. For the existing collector, pass a scoped
+    `Facts` view in which quarantined pre-existing commands do not contribute
+    to `open_command`. The finished continuation needs no exemption. Any other
+    unfinished command, including an unexpected operation command, still
+    contributes, and every other `report_due()` guard retains its existing
+    meaning. The normal fleet
+    `DISPATCH_FACTS` projection and the preserved command rows remain unchanged
+    (`crates/spawn-postgres/src/fleet.rs:220-249`,
+    `crates/spawn-cli/src/dispatch.rs:320-371`,
+    `crates/spawn-cli/src/deliver.rs:1682-1713`). Every such write carries the
+    operation's epoch and phase; unrelated
     tasks, reports, gates, and landings remain disabled. The driver must use the
     existing source/workspace locks and must not bypass the database admission
     fence or race an ordinary integrator for the target. Require the accepted
@@ -898,9 +931,9 @@ Each slice must preserve current single-host behavior.
    old execution-scoped recovery commands before Resume so none can act on the
    restored Execution. Reuse the existing mount and `Resume` path with a
    post-mount overlay/transcript hook and no-input trust-dialog handling. Add
-   the target-scoped continuation
-   driver for report collection, acceptance, and applicable gate/land. Keep
-   ordinary producers disabled until that continuation and uncertainty
+   the target-scoped continuation driver for report collection, acceptance, and
+   applicable gate/land, including its scoped report-eligibility `Facts` view.
+   Keep ordinary producers disabled until that continuation and uncertainty
    reconciliation succeed.
 6. **Pinned recovery image.** Include the Spawn binary, Claude Code, git,
    tmux, PostgreSQL client tools, relay scripts, and runtime dependencies.
@@ -910,7 +943,10 @@ Each slice must preserve current single-host behavior.
    version compatible with the recorded native Session. Configuration and
    secrets remain external.
 7. **Fenced failover.** Add persistent provider power/network/storage/credential
-   fencing and database-session termination before automatic restore. Fence or
+   fencing and database-session termination before automatic restore. Separate
+   old-host-exclusive credentials from shared service credentials. Preserve
+   shared credentials during single-Session restore and refuse uncoordinated
+   shared revocation; require a separate install-wide rollout first. Fence or
    adopt a previous replacement before takeover. Until then, recovery is
    operator-initiated and refuses to start when the old host may still be alive.
 
@@ -968,8 +1004,12 @@ A route or mission type is not covered until its own drill passes:
   current integrator does not support it;
 - pending and marker-less merges, an unannounced oversized file, local engine
   settings, and a durable schedule;
-- a scheduled/background write attempted during publication, which is either
-  included in the same cutoff or aborts that publication;
+- a scheduled/background write during publication has exactly one of three
+  outcomes: it completes before capture and is included; it changes the
+  captured tree before CAS and aborts publication; or it remains pending while
+  frozen and runs only after release. In the third case publication succeeds,
+  the committed snapshot lacks the write, and a later checkpoint is required
+  to preserve it;
 - two independently deployed mission/global-gate controllers at different
   commits, with either controller switching during publication; publication
   waits or retries without mixing gate, scenario, backlog, or dependency trees;
@@ -982,10 +1022,14 @@ A route or mission type is not covered until its own drill passes:
 - a separate unread suffix below 16 MiB whose unique native events are absent
   from the manifest cutoff and are ingested exactly once before the old final
   checkpoint and `execution.ended`;
-- a gated objective task that completes the scoped report, accept, gate, and
-  land continuation;
-- a queued command for another Session and an unclaimed target Input, report,
-  and pending merge, all unchanged until scoped continuation and handoff finish;
+- a gated objective with a pre-existing unclaimed target Input completes the
+  scoped report, accept, gate, and land continuation while that Input remains
+  queued and unchanged; the continuation Input finishes after `typed`, before
+  report collection, and its command id correlates the later turn and report;
+  the scoped report view excludes only quarantined pre-existing commands from
+  `open_command`, while the normal fleet view still reports them;
+- a queued command for another Session and a target report and pending merge,
+  all unchanged until scoped continuation and handoff finish;
 - old Execution Inputs interrupted after `waiting`, after `typing`, and after
   `typed` but before `command.finished`: the first fails untyped exactly once,
   the second fails `input_outcome_unknown` and blocks Resume pending
@@ -1006,6 +1050,14 @@ A route or mission type is not covered until its own drill passes:
   with currently authorized service credentials while the retained encryption
   key version still decrypts the old checkpoint. Deletion of that required key
   version must be denied.
+- no credential rotation between publication and restore: shared database and
+  relay credentials remain usable after fencing and pass replacement health
+  checks. Separately require shared-credential revocation during fencing:
+  restore returns `shared_credential_rotation_requires_install_wide_rollout`
+  before revoking the old version, and an unrelated host keeps authenticating.
+  After a coordinated install-wide rollout switches and health-checks every
+  other consumer, the old version can be revoked and a retry from step 2
+  resolves the new version;
 
 ### Measure and verify
 
