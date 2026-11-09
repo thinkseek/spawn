@@ -2068,12 +2068,48 @@ are per-agent uids or a mount per engine.
   commit `main` already holds was applied by an integrator that stopped
   before its record: it is recorded then, from the baseline its move began
   at. While a task landing on the source went out without its record, the
-  request waits for it. It waits for no gate: a judging of another mission
-  or source keeps running and lands by the usual rules, and one on the same
-  source finishes, its verdict is recorded as it comes, and its landing's
-  compare-and-swap finds `main` moved and records `stale`, so the task is
-  judged again against the new `main` (merged and gated again; never
-  discarded silently, never counted). So the owner's landing is a record
+  request waits for it. It never moves `main` under a gate of its source
+  (design-owner-push-between-gates.md, D1): while a judging of that
+  source is in flight the request waits (said once), and the pass that
+  reaps that judging applies it before any new gate starts, so the
+  judging's verdict is on the `main` it ran against, never `stale` because
+  of the owner (on 2026-11-09/10 seven Supply PA gates went stale under the
+  owner's pushes). A judging of another source keeps running and lands by
+  the usual rules. With `--gated` (and `--reason <text>`, on the request)
+  the request is judged before it lands, as a judging of its source
+  (design-owner-push-between-gates.md): step 0 checks it as above and the
+  integrator starts its owner judging ahead of the source's ready tasks,
+  never in place of a running judging and within the same caps
+  (`--gates`, the CPU share). The candidate is the commit when M is in its
+  history, else the owner's landing merge on M, built in the mirror; the
+  base is M; the scenarios are the candidate's own copy of the mission's
+  directory with `protected` emptied (the owner may change both), and no
+  red check runs on the base (an owner's push is how a red `main` is
+  fixed). A new contract's scenarios are unsolved on M (M has no such
+  code), so they are objectives nobody solved and the regression rule does
+  not apply to them: the gate does not reject the push for them, only for
+  its checks and the scenarios M solves. A check `main` is red on is
+  unsolved on M too: the owner's gate runs with `SPAWN_GATE_RED_UNSOLVED=1`
+  (gate.sh), which says it and judges the rest, so a push during a red
+  `main` is neither held nor refused for a red it did not cause (else it
+  would have to go ungated). Only the tests `main` fails are unsolved: a
+  test the candidate newly fails inside the red check, or a run of it that
+  names no failed test, is the push's regression. Accepted: under the landing lock, the
+  candidate is pushed to `main` with a lease on M, and `source.moved`
+  names `verdict` `accepted`. Rejected (or a candidate without the
+  mission's scenarios directory, `no_scenarios`): `source.push_refused`
+  with `verdict` and the gate's `log`; nothing moves and no mission counts
+  it. No verdict (the host's fault, an abort, which is a harness error, no
+  room, a gate that could not run): nothing is recorded, and the request is
+  judged again after the host-fault backoff. With `--urgent` (gated or
+  not; for a fix of a red `main`, D2) the request does not wait out a
+  task's judging in flight on its source: that judging is stopped (its
+  gate's process group killed, as at its wall clock) and records itself
+  discarded by the request, `task.gated` `stale` with `found` `discarded`,
+  the `request` and the owner's reason, counted nowhere; the task is
+  judged again on the new `main`, and the request is applied or judged at
+  the pass that reaps the stopped judging. An owner judging is never
+  stopped. So the owner's landing is a record
   (the request, then the outcome that names it), and the integrator acts on
   that record, never on a `main` that changed under it ([design.md](design.md)
   §14). `spawn mission moved` still records a move the owner made behind

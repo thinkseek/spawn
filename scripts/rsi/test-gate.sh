@@ -339,6 +339,58 @@ expect "naming the failing tests both base runs share" "$(cat "$integrator/verdi
     '"failures":[{"test":"lib::tests::adds","message":"assertion failed: 1 + 1 == 3"},{"test":"lib::tests::other","message":"boom"}]'
 expect "the log says main is red" "$(cat "$work/gate.out")" \
     'check-red.sh fails on the base twice with the same failing tests: main is red on it'
+# For an owner's push (SPAWN_GATE_RED_UNSOLVED=1, design-owner-push-between-
+# gates.md) the check main is red on is unsolved on the base, not a
+# regression and no stop: the push is accepted when the rest passes, and a
+# check the base solves still rejects it.
+expect "an owner's push: the red check is unsolved on the base, accepted" \
+    "$(export SPAWN_GATE_RED_UNSOLVED=1; judge "$good" "" "$red_scenarios")" 'exit=0 {"verdict":"accepted"'
+expect "and says why" "$(cat "$work/gate.out")" \
+    'check-red.sh fails on the base twice with the same failing tests: main is red on it, so it is unsolved on the base (SPAWN_GATE_RED_UNSOLVED): not a regression'
+red_and_broken=$work/red-and-broken
+cp -r "$red_scenarios" "$red_and_broken"
+printf '#!/bin/sh\n# Passes on the base, fails on the candidate: a regression.\n[ "$PWD" = "$SPAWN_BASELINE_TREE" ]\n' >"$red_and_broken/check-zz-candidate.sh"
+expect "an owner's push is still rejected for a check the base solves" \
+    "$(export SPAWN_GATE_RED_UNSOLVED=1; judge "$good" "" "$red_and_broken")" \
+    '"verdict":"rejected","reason":"regression: check-zz-candidate.sh fails on the candidate"'
+# Only the tests main fails are unsolved (rev-b F1 on bfbda5cb): a test the
+# candidate newly fails inside the red check is its regression, named, and
+# a candidate run that fails with no FAILED line names nothing: rejected.
+red_new=$work/red-new
+cp -r "$red_scenarios" "$red_new"
+cat >"$red_new/check-red.sh" <<'EOF'
+#!/bin/sh
+echo "FAILED lib::tests::adds: assertion failed: 1 + 1 == 3"
+echo "FAILED lib::tests::other: boom"
+if [ "$PWD" != "$SPAWN_BASELINE_TREE" ]; then echo "FAILED lib::tests::newly_broken: the push broke it"; fi
+exit 1
+EOF
+expect "an owner's push that breaks a test inside the red check is rejected" \
+    "$(export SPAWN_GATE_RED_UNSOLVED=1; judge "$good" "" "$red_new")" \
+    '"verdict":"rejected","reason":"regression: check-red.sh fails on the candidate"'
+expect "naming the test main does not fail" "$(cat "$work/gate.out")" \
+    "check-red.sh: the candidate fails what main's red runs do not (lib::tests::newly_broken): a regression"
+red_silent=$work/red-silent
+cp -r "$red_scenarios" "$red_silent"
+cat >"$red_silent/check-red.sh" <<'EOF'
+#!/bin/sh
+if [ "$PWD" != "$SPAWN_BASELINE_TREE" ]; then echo "it crashed before any test ran"; exit 1; fi
+echo "FAILED lib::tests::adds: assertion failed: 1 + 1 == 3"
+exit 1
+EOF
+expect "an owner's push whose run of the red check names no failed test is rejected" \
+    "$(export SPAWN_GATE_RED_UNSOLVED=1; judge "$good" "" "$red_silent")" \
+    '"verdict":"rejected","reason":"regression: check-red.sh fails on the candidate"'
+expect "and says so" "$(cat "$work/gate.out")" \
+    "check-red.sh: the candidate fails what main's red runs do not ((no FAILED line)): a regression"
+# The control (F2): beside the red check, an objective the base solves and
+# the candidate breaks is still a regression under SPAWN_GATE_RED_UNSOLVED.
+red_objective=$work/red-objective
+cp -r "$red_scenarios" "$red_objective"
+printf '#!/bin/sh\n# Solved on the base, broken by the candidate.\n[ "$PWD" = "$SPAWN_BASELINE_TREE" ]\n' >"$red_objective/081.sh"
+expect "an owner's push that breaks an objective the base solves is rejected beside the red check" \
+    "$(export SPAWN_GATE_RED_UNSOLVED=1; judge "$good" "" "$red_objective")" \
+    '"verdict":"rejected","reason":"regression: 081.sh fails on the candidate"'
 flaky_red=$work/red-flaky
 cp -r "$red_scenarios" "$flaky_red"
 cat >"$flaky_red/check-red.sh" <<'EOF'
