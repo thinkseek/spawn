@@ -99,8 +99,8 @@ export function diffStats(patch: string) {
 const SIGN = { add: "+", del: "−", ctx: " " } as const;
 
 const ROW_TONE = {
-  add: "bg-success/[0.09]",
-  del: "bg-destructive/[0.09]",
+  add: "bg-ok-tint",
+  del: "bg-fail-tint",
   ctx: "",
 } as const;
 
@@ -137,7 +137,7 @@ export function DiffView({ patch }: { patch: string }) {
           return (
             <div
               key={index}
-              className="flex bg-info/[0.07] text-info/80"
+              className="flex bg-info-tint text-info/80"
             >
               <span className="w-[6.5rem] shrink-0 border-r border-surface-border" />
               <span className="whitespace-pre px-3">{row.text}</span>

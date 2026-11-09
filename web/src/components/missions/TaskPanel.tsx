@@ -152,7 +152,7 @@ export function TaskPanel({
         )}
 
         {task.review_note && (
-          <section className="rounded-md bg-warning/[0.07] px-3 py-2">
+          <section className="rounded-md bg-wait-tint px-3 py-2">
             <div className="flex items-center gap-1.5 text-caption font-medium text-warning">
               <RotateCcw size={12} />
               Review note
