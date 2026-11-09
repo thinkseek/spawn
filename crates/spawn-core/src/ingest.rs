@@ -171,9 +171,9 @@ const WORD_MIX_CHARS: usize = 8;
 const SEGMENT_MIX_CHARS: usize = 16;
 
 /// Programs whose arguments are what they print, set or pass on (`echo`,
-/// `export`, `sudo`, `sshpass`): a summary keeps the program alone.
-const PROGRAM_ONLY: [&str; 10] = [
-    "echo", "printf", "read", "sudo", "su", "sshpass", "passwd", "export", "eval", "set",
+/// `export`, `sudo`, `sshpass`, `env`): a summary keeps the program alone.
+const PROGRAM_ONLY: [&str; 11] = [
+    "echo", "printf", "read", "sudo", "su", "sshpass", "passwd", "export", "eval", "set", "env",
 ];
 
 /// The characters a kept word never holds: a userinfo, an assignment, a
@@ -2141,6 +2141,10 @@ mod tests {
                 assert_eq!(bash(program), program, "{program} alone is whole");
             }
             assert_eq!(bash("/usr/bin/sudo systemctl restart x"), "/usr/bin/sudo …");
+            // rev-e on 69522339: `env`'s arguments are assignments and a
+            // program, as `sudo`'s are.
+            assert_eq!(bash("env hunter2 ls"), "env …");
+            assert_eq!(bash("env FOO=1 cargo test"), "env …");
             assert_eq!(bash("cd /w && echo hunter"), "echo …");
             assert_eq!(
                 bash("git status"),
