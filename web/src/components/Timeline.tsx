@@ -87,12 +87,32 @@ export function Timeline({
   };
 
   if (events.length === 0) {
+    // Nothing visible in what was read: more may lie before it (a long
+    // stretch of the observer's hidden events), so "Earlier" stays.
     return (
       <div className="grid min-h-0 flex-1 place-items-center">
-        <EmptyState
-          title="No events in this session"
-          hint="Events appear here as the agent's hooks report them."
-        />
+        <div className="flex flex-col items-center gap-3">
+          <EmptyState
+            title={earlier ? `No events from #${held.after + 1}` : "No events in this session"}
+            hint={
+              earlier
+                ? "The latest stretch holds only the observer's own events."
+                : "Events appear here as the agent's hooks report them."
+            }
+          />
+          {earlier && (
+            <button
+              type="button"
+              onClick={loadEarlier}
+              disabled={loading}
+              title={failed ?? undefined}
+              className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-caption text-muted-foreground hover:bg-surface-hover hover:text-foreground disabled:opacity-60"
+            >
+              <ChevronsUp size={13} />
+              {loading ? "Loading…" : failed ? "Retry earlier" : "Earlier"}
+            </button>
+          )}
+        </div>
       </div>
     );
   }

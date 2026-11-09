@@ -21,9 +21,13 @@ const window = (from: number, to: number): EventWindow => ({ events: span(from, 
  * `visible` keeps; the reader the server would be, counting its reads. */
 function session(count: number, visible: (seq: number) => boolean = () => true) {
   const reads: Array<[number, number]> = [];
+  // As the server reads: the first `limit` visible rows after `after`, so
+  // past a hidden stretch a read runs on beyond the span it asked for.
   const read = async (after: number, limit: number) => {
     reads.push([after, limit]);
-    return span(after + 1, Math.min(count, after + limit)).filter((entry) => visible(entry.session_seq));
+    return span(after + 1, count)
+      .filter((entry) => visible(entry.session_seq))
+      .slice(0, limit);
   };
   return { read, reads };
 }
@@ -103,4 +107,13 @@ test("an earlier read that finds nothing still moves the window's start, so it i
   // The next read goes on from there and finds the visible events.
   const again = await readBack(back, hiddenStretch.read, 300, 300);
   assert.ok(again.events.some((entry) => entry.session_seq === 1_000));
+});
+
+test("rows a read returns past the window's start are not counted as new: one read back brings a page of new events", async () => {
+  // 1..2000 visible, 2001..2290 hidden, 2291..2600 visible; held from 2301.
+  const mixed = session(2_600, (seq) => seq <= 2_000 || seq > 2_290);
+  const held: EventWindow = { events: span(2_301, 2_600), after: 2_300, through: 2_600 };
+  const back = await readBack(held, mixed.read, 300, 300);
+  const fresh = back.events.filter((entry) => entry.session_seq <= held.after);
+  assert.ok(fresh.length >= 300, `only ${fresh.length} new events`);
 });
