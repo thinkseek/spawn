@@ -647,9 +647,10 @@ if [ -e "$hold.held" ]; then
     expect "the sandbox it broke was started again, and said so" "$(cat "$work/gate.out")" \
         "| sandbox: $vanish went away between the mask check and bwrap's mount"
     rm -f "$hold.held"
-    # Any other bwrap failure stays a failure: here the masked path is
-    # still there, as a file where the directory was, so bwrap fails on it
-    # and the gate does not start the sandbox again.
+    # A regular file where the directory was holds no socket: as for a
+    # directory gone, the sandbox starts again without the mask, and says
+    # so (rev-b's 3d' did this beside a gate of another suite that had
+    # scanned its directory, 2026-11-09).
     vanish=$(mktemp -d "$work/vanish.XXXXXX")
     python3 -c '
 import socket, sys, time
@@ -668,13 +669,46 @@ time.sleep(900)' "$vanish/service.sock" &
         rm -f "$hold"
     ) &
     vanish_watcher=$!
+    as_file=$(
+        export SPAWN_GATE_TEST_HOLD="$hold"
+        unset TMPDIR
+        judge "$good"
+    )
+    wait "$vanish_watcher" 2>/dev/null || true
+    expect "a hidden socket directory replaced by a regular file mid-gate changes no verdict" "$as_file" \
+        'exit=0 {"verdict":"accepted"}'
+    expect "and the sandbox was started again, and said so" "$(cat "$work/gate.out")" \
+        "| sandbox: $vanish became a regular file between the mask check and bwrap's mount"
+    rm -f "$vanish" "$hold.held"
+    # Any other bwrap failure stays a failure: here the masked path is
+    # still there, as a FIFO where the directory was (neither gone nor a
+    # regular file), so bwrap fails on it and the gate does not start the
+    # sandbox again.
+    vanish=$(mktemp -d "$work/vanish.XXXXXX")
+    python3 -c '
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen()
+time.sleep(900)' "$vanish/service.sock" &
+    vanish_listener=$!
+    background="$background $vanish_listener"
+    while [ ! -S "$vanish/service.sock" ]; do sleep 0.1; done
+    : >"$hold"
+    (
+        held=0
+        until [ -e "$hold.held" ] || [ "$held" -ge 600 ]; do sleep 0.05; held=$((held + 1)); done
+        kill "$vanish_listener"
+        rm -rf "$vanish"
+        mkfifo "$vanish"
+        rm -f "$hold"
+    ) &
+    vanish_watcher=$!
     replaced=$(
         export SPAWN_GATE_TEST_HOLD="$hold"
         unset TMPDIR
         judge "$good"
     )
     wait "$vanish_watcher" 2>/dev/null || true
-    refuse "a mask path still there (a file now) is no race: no second start" \
+    refuse "a mask path still there (a FIFO now) is no race: no second start" \
         "$(cat "$work/gate.out")" "started again without it"
     refuse "and the gate does not pass it off as accepted" "$replaced" 'exit=0 {"verdict":"accepted"}'
     # A sandbox that never started its command is no verdict either way: a
@@ -732,7 +766,7 @@ time.sleep(900)' "$vanish/service.sock" &
     rm -rf "$vanish" "$hold" "$hold.held"
     # A base run whose sandbox never started writes no cache entry, and the
     # gate says the fact (exit 6, the base's tree): held at the base job's
-    # run (the hold file says `base-run`), the mask path made a file, so
+    # run (the hold file says `base-run`), the mask path made a FIFO, so
     # bwrap fails there. One objective, a cache of its own: the next gate
     # on it runs the objective again rather than read a false result.
     nsbase=$work/never-base
@@ -753,7 +787,7 @@ time.sleep(900)' "$vanish/service.sock" &
         until [ -s "$hold.held" ] || [ "$held" -ge 600 ]; do sleep 0.05; held=$((held + 1)); done
         kill "$vanish_listener"
         rm -rf "$vanish"
-        : >"$vanish"
+        mkfifo "$vanish"
         rm -f "$hold"
     ) &
     vanish_watcher=$!
@@ -803,7 +837,7 @@ time.sleep(900)' "$vanish/service.sock" &
         until [ -s "$hold.held" ] || [ "$held" -ge 600 ]; do sleep 0.05; held=$((held + 1)); done
         kill "$vanish_listener"
         rm -rf "$vanish"
-        : >"$vanish"
+        mkfifo "$vanish"
         rm -f "$hold"
     ) &
     vanish_watcher=$!

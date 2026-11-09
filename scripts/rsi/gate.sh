@@ -1261,14 +1261,23 @@ sandbox_once() {
 }
 
 # sandbox <tree> <command...>: `sandbox_once`, started once more when the
-# first one never ran the command because a path it was to mask went away
+# first one never ran the command because a path it was to mask changed
 # between the check and bwrap's mount (a host process's temporary socket
-# directory, removed in those milliseconds): bwrap's own message names that
-# path, and the path is gone now. Only then: any other failure of bwrap's,
-# or of the command, is the result as it is. The second start checks the
-# masks again, so it skips the path that went away. The retry is said on
-# stderr (the command's log) and in the gate's own output (`gate_times`),
-# so a host race is never silent, nor a verdict on the candidate.
+# directory, removed in those milliseconds, or replaced by a regular file):
+# bwrap's own message names that path, and the path is gone now or is a
+# regular file. A regular file holds no socket, so leaving it unmasked shows
+# nothing that a path gone would not; and candidate code can neither remove
+# a host path nor put a file there (the host is read-only in the sandbox).
+# Only then: any other failure of bwrap's (the path still a directory, a
+# symlink, a socket, a FIFO), or of the command, is the result as it is.
+# The second start checks the masks again, so it skips the path. The retry
+# is said on stderr (the command's log) and in the gate's own output
+# (`gate_times`), so a host race is never silent, nor a verdict on the
+# candidate. A gate's masks come from a scan of every socket the host shows
+# it, other gates' and suites' scratch under /data/tmp too, so this race
+# is with unrelated host activity (2026-11-09: rev-b's suite case 3d' put a
+# file where its socket directory was, and a gate of rev-f's suite that had
+# scanned it failed to start its sandbox).
 sandbox() {
     sandbox_rc=0
     sandbox_once "$@" || sandbox_rc=$?
@@ -1292,7 +1301,11 @@ sandbox_retry() {
         case "$sandbox_said" in
         *"$sandbox_path"*)
             if [ ! -e "$sandbox_path" ] && [ ! -L "$sandbox_path" ]; then
-                sandbox_gone=$sandbox_path
+                sandbox_gone=$sandbox_path sandbox_became="went away"
+                break
+            fi
+            if [ -f "$sandbox_path" ] && [ ! -L "$sandbox_path" ]; then
+                sandbox_gone=$sandbox_path sandbox_became="became a regular file"
                 break
             fi
             ;;
@@ -1300,7 +1313,7 @@ sandbox_retry() {
     done
     IFS=$sandbox_ifs
     [ -n "$sandbox_gone" ] || return "$sandbox_rc"
-    sandbox_line="sandbox: $sandbox_gone went away between the mask check and bwrap's mount (bwrap: $(printf '%s\n' "$sandbox_said" | head -n 1)); started again without it"
+    sandbox_line="sandbox: $sandbox_gone $sandbox_became between the mask check and bwrap's mount (bwrap: $(printf '%s\n' "$sandbox_said" | head -n 1)); started again without it"
     echo "$sandbox_line" >&2
     printf '%s\n' "$sandbox_line" >>"$work/sandbox-retries" 2>/dev/null || :
     sandbox_once "$@"
