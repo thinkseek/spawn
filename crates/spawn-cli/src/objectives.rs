@@ -724,11 +724,24 @@ pub(crate) struct Yield {
     pub(crate) objective: u32,
     /// The objective's failed attempts since its last yield, oldest first.
     pub(crate) failures: Vec<String>,
+    /// The mission's run of gate rejections when every one of them was a
+    /// task of this objective and the run reached the halt (the store's
+    /// `gate_rejection_objective`): the objective yields instead of the
+    /// mission halting. None when the yield is the failed attempts' alone.
+    pub(crate) rejections: Option<u32>,
 }
 
 impl Yield {
     /// The one line the record and the supervisor get.
     pub(crate) fn reason(&self) -> String {
+        if let Some(rejections) = self.rejections {
+            return format!(
+                "{rejections} gate rejections in a row, all objective {}'s tasks: task #{} \
+                 yields its slot to the next objective instead of halting the mission, its \
+                 work set aside",
+                self.objective, self.task
+            );
+        }
         format!(
             "objective {} had {} failed attempts since its last turn ({}); task #{} yields its \
              slot to the next objective, its work set aside",
@@ -746,6 +759,13 @@ impl Yield {
 /// now). A reported task waits for its gate, whose verdict settles it: it
 /// lands, or goes back to revise and yields then (task 106 of mission 4 had
 /// four failures when its fifth verdict was `accepted`).
+///
+/// A task of the objective that the mission's run of gate rejections names
+/// (`gate_rejection_objective`, every rejection of the run that
+/// objective's) yields too once the run reaches the halt, whatever `limit`
+/// is: three rejections of one objective say the objective is hard, not
+/// that the gate rejects everything, so it yields and the mission does not
+/// halt ([`crate::integrate::halt_reason`]).
 pub(crate) fn yields(
     mission: &Mission,
     attempts: &BTreeMap<u32, Attempts>,
@@ -763,11 +783,18 @@ pub(crate) fn yields(
         })
         .filter_map(|task| {
             let objective = task.objective?;
-            let tried = attempts.get(&objective)?;
-            (tried.failures.len() >= limit).then(|| Yield {
+            let failures = attempts
+                .get(&objective)
+                .map(|tried| tried.failures.clone())
+                .unwrap_or_default();
+            let rejections = (mission.gate_rejection_objective == Some(objective)
+                && mission.gate_rejections >= crate::integrate::HALT_AFTER)
+                .then_some(mission.gate_rejections);
+            (failures.len() >= limit || rejections.is_some()).then_some(Yield {
                 task: task.id,
                 objective,
-                failures: tried.failures.clone(),
+                failures,
+                rejections,
             })
         })
         .collect()
@@ -980,7 +1007,7 @@ pub(crate) fn assign_next(
             store,
             &json!({"type": "task.cancelled", "id": slot.task, "yielded": true,
                     "objective": slot.objective, "failures": slot.failures.len(),
-                    "limit": limit, "reason": reason}),
+                    "limit": limit, "rejections": slot.rejections, "reason": reason}),
         )?;
         println!("integrate: mission {}: {reason}", mission.id);
         yielded.insert(slot.task);
@@ -1634,6 +1661,32 @@ mod tests {
         // An objective with no failures is untouched at any limit.
         let healthy = mission(1, &[(200, 30, "revise")]);
         assert!(yields(&healthy, &tried, 1, &none).is_empty());
+
+        // Three gate rejections in a row, all objective 30's: it yields at
+        // any limit, with the run in its record's reason; two do not, nor a
+        // run that names another objective, nor its task under a gate.
+        let mut rejected = mission(1, &[(200, 30, "revise")]);
+        rejected.gate_rejections = 3;
+        rejected.gate_rejection_objective = Some(30);
+        let slots = yields(&rejected, &tried, 99, &none);
+        assert_eq!(slots.len(), 1);
+        assert_eq!((slots[0].task, slots[0].rejections), (200, Some(3)));
+        assert!(
+            slots[0]
+                .reason()
+                .starts_with("3 gate rejections in a row, all objective 30's tasks: task #200"),
+            "{}",
+            slots[0].reason()
+        );
+        assert!(yields(&rejected, &tried, 99, &BTreeSet::from([200])).is_empty());
+        rejected.gate_rejections = 2;
+        assert!(yields(&rejected, &tried, 99, &none).is_empty(), "two");
+        rejected.gate_rejections = 3;
+        rejected.gate_rejection_objective = Some(31);
+        assert!(
+            yields(&rejected, &tried, 99, &none).is_empty(),
+            "another's run"
+        );
     }
 
     /// Mission 4 as the live log had it at 2026-11-07 23:05:46, when task

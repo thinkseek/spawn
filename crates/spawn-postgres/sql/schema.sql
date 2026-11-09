@@ -1256,7 +1256,13 @@ create table if not exists mission_missions (
     -- other one does not. No verdict on the work, so it counts toward no
     -- halt. `no_room` and `stale` leave the run; every other verdict
     -- (020's host faults included), a landing and a resume end it.
-    gate_base_disagrees integer not null default 0
+    gate_base_disagrees integer not null default 0,
+    -- The objective of every rejection in the current run of
+    -- `gate_rejections`, or null: no run, a rejection of another objective
+    -- or of a task without one in it (design-halt-per-objective.md). A run
+    -- of one objective's tasks yields that objective instead of halting the
+    -- mission.
+    gate_rejection_objective integer
 );
 
 create table if not exists mission_residents (
@@ -1336,6 +1342,7 @@ alter table mission_missions add column if not exists gate_host_faults integer n
 alter table mission_missions add column if not exists gate_host_task bigint;
 alter table mission_missions add column if not exists gate_host_due_ms bigint;
 alter table mission_missions add column if not exists gate_base_disagrees integer not null default 0;
+alter table mission_missions add column if not exists gate_rejection_objective integer;
 alter table mission_tasks add column if not exists base text;
 alter table mission_tasks add column if not exists candidate text;
 alter table mission_tasks add column if not exists gate_log text;
@@ -1546,7 +1553,8 @@ begin
                                     gate_room_last_ms = null, gate_room_waits = 0,
                                     gate_room_escalated = false, gate_host_faults = 0,
                                     gate_host_task = null, gate_host_due_ms = null,
-                                    gate_base_disagrees = 0, updated_at_ms = p_at
+                                    gate_base_disagrees = 0, gate_rejection_objective = null,
+                                    updated_at_ms = p_at
          where id = v_id;
     when 'source.moved' then
         -- The owner moved a source's main on purpose: a deploy behind
@@ -1665,6 +1673,18 @@ begin
            set baseline = coalesce(baseline, p_record ->> 'base'),
                gate_rejections = case v_verdict when 'rejected' then gate_rejections + 1
                                                 when 'accepted' then 0 else gate_rejections end,
+               -- The run's objective: the first rejection's task's, kept
+               -- while every later one is a task of the same objective, null
+               -- once one is not (null stays null for the run).
+               gate_rejection_objective = case
+                   when v_verdict = 'rejected' and gate_rejections = 0
+                       then (select k.objective from mission_tasks k where k.id = v_id)
+                   when v_verdict = 'rejected'
+                       then case when gate_rejection_objective
+                                      = (select k.objective from mission_tasks k where k.id = v_id)
+                                 then gate_rejection_objective end
+                   when v_verdict = 'accepted' then null
+                   else gate_rejection_objective end,
                -- `no_room`: no room to judge (TMPDIR's free space, the
                -- host's memory or the test database, measured before the
                -- gate or by the gate's own floor), a fact about the host,
@@ -1804,6 +1824,17 @@ begin
         -- `by` names who cancelled (spawn_task_cancel_by), read by the
         -- scorecard, not by the fold.
         update mission_tasks set state = 'cancelled', updated_at_ms = p_at where id = v_id;
+        -- A cancel of a task of the objective every rejection of the
+        -- mission's run was ends that run, whoever cancels it: a yield
+        -- (either rule's: three rejections of one objective, or its failed
+        -- attempts), the owner's cancel, or the objective solved on the base.
+        -- The objective's work is set aside, so the next rejection starts a
+        -- run of its own and is not mixed with a run whose objective is gone.
+        update mission_missions m set gate_rejections = 0, gate_rejection_objective = null,
+                                      updated_at_ms = p_at
+          from mission_tasks k
+         where k.id = v_id and m.id = k.mission_id
+           and m.gate_rejection_objective = k.objective;
         -- A task that leaves the gate ends its run of `no_room`.
         update mission_missions set gate_room_task = null, gate_room_since_ms = null,
                                     gate_room_last_ms = null, gate_room_waits = 0,

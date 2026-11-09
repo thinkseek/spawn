@@ -1963,7 +1963,15 @@ are per-agent uids or a mount per engine.
 - **Halt rules,** per mission and read from the log:
   - three gate rejections in a row: `rejected` counts; `accepted` resets
     the count; `incompatible`, `conflict`, `stale`, `aborted`, `no_room`
-    and `host_fault` leave it (three `incompatible` in a row halt nothing);
+    and `host_fault` leave it (three `incompatible` in a row halt nothing).
+    In an objective mission, a run whose rejections are all one
+    objective's tasks (`gate_rejection_objective`) halts nothing: that
+    objective yields its slot instead, as one out of attempts does, with
+    `rejections` on its `task.cancelled`. Any cancel of a task of the
+    run's objective ends the run, whoever cancels it (that yield, the other
+    rule's, or the owner's), so a later rejection is not mixed with a run
+    whose objective is gone. A
+    run across two objectives, or with a task of none, halts;
   - three gate aborts in a row (`no_room` and `host_fault` are not aborts,
     and leave the count);
   - the scenario count below its floor (the most scenarios a gate run of
@@ -2190,7 +2198,8 @@ are per-agent uids or a mount per engine.
     no longer main lands as the merge by main's rules; two in-flight
     objectives on the same lines make the second a `conflict`.
   - Budgets apply per task, in active time from its delivery (§10.3); the halt rules stay per
-    mission (three rejections in a row from any of its tasks halt it), and
+    mission (three rejections in a row across its objectives halt it;
+    three of one objective's tasks yield that objective instead), and
     a halted mission gets no new task and no judging until a human resumes
     it.
   - The brief is the objective, the working rules, the work its earlier

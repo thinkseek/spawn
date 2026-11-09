@@ -37,7 +37,10 @@
 //!    judged again on the new main). The integrator is never stopped for an
 //!    owner's landing;
 //! 1. a halt rule that fired stops the mission's landings until a human
-//!    resumes it: three gate rejections in a row, three aborts in a row
+//!    resumes it: three gate rejections in a row (in an objective mission,
+//!    three of one objective's tasks yield that objective instead,
+//!    `objectives::yields`, and only a run across objectives halts), three
+//!    aborts in a row
 //!    (neither a `no_room` nor a `host_fault` counts toward either, and no
 //!    rule counts host faults: a halt needs a human), the
 //!    scenario count below its floor, a remote source (agents' branches
@@ -411,7 +414,7 @@ pub(crate) mod owner;
 mod warm;
 
 /// Rejections, or aborts, in a row that halt a mission.
-const HALT_AFTER: u32 = 3;
+pub(crate) const HALT_AFTER: u32 = 3;
 
 /// The wait before the first retry of a gate that had no room; it doubles
 /// with each `no_room` in a row, up to [`ROOM_BACKOFF_MAX`].
@@ -677,6 +680,13 @@ pub(crate) struct Mission {
     pub(crate) scenario_floor: u32,
     #[serde(default)]
     pub(crate) gate_rejections: u32,
+    /// The objective every rejection of the current `gate_rejections` run
+    /// was a task of, folded by the store; none when there is no run or the
+    /// run spans objectives (or a task without one). A run of one
+    /// objective's rejections yields that objective
+    /// ([`crate::objectives::yields`]) and does not halt the mission.
+    #[serde(default)]
+    pub(crate) gate_rejection_objective: Option<u32>,
     #[serde(default)]
     pub(crate) gate_aborts: u32,
     /// The mission's current run of `no_room` gate outcomes, folded by the
@@ -833,7 +843,11 @@ impl Mission {
 
 /// The halt rule that fires before anything is judged, if one does.
 pub(crate) fn halt_reason(mission: &Mission, scenarios: u32) -> Option<String> {
-    if mission.gate_rejections >= HALT_AFTER {
+    // Three rejections of one objective's tasks yield that objective
+    // (`objectives::yields`); only a run spanning objectives halts, or one
+    // in a mission without objectives to yield.
+    let yields = mission.gate_rejection_objective.is_some() && mission.objectives.is_some();
+    if mission.gate_rejections >= HALT_AFTER && !yields {
         return Some(format!(
             "{} gate rejections in a row",
             mission.gate_rejections
@@ -5753,6 +5767,14 @@ mod tests {
         assert!(halt_reason(&mission(0, 3, 0), 7).is_some_and(|r| r.contains("aborts")));
         assert!(halt_reason(&mission(0, 0, 7), 6).is_some_and(|r| r.contains("fell")));
         assert_eq!(halt_reason(&mission(0, 0, 0), 0), None, "no floor yet");
+        let mut one = mission(3, 0, 0);
+        one.gate_rejection_objective = Some(19);
+        assert!(
+            halt_reason(&one, 7).is_some_and(|r| r.contains("rejections")),
+            "no objectives to yield: it halts"
+        );
+        one.objectives = Some(json!({"backlog": "/b", "resident": "r"}));
+        assert_eq!(halt_reason(&one, 7), None, "objective 19 yields instead");
     }
 
     const MINUTE: i64 = 60_000;
@@ -8906,6 +8928,226 @@ mod database_tests {
         assert!(!fresh.contains("Earlier tasks"), "a first task has none");
 
         assert!(pass().is_empty(), "nothing more yields, no slot is free");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The run of gate rejections as the store folds it: its length and the
+    /// objective all of it was (`gate_rejection_objective`), or none.
+    fn rejection_run(db: &Db, mission: i64) -> (u32, Option<u32>) {
+        let row = snapshot(db, mission);
+        (row.gate_rejections, row.gate_rejection_objective)
+    }
+
+    /// The `task.cancelled` record of `task`, as the store keeps it.
+    fn cancel_record(db: &Db, task: i64) -> Value {
+        db.admin()
+            .query_one(
+                "select kind -> 'detail' -> 'record' from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = 'task.cancelled'
+                    and kind -> 'detail' -> 'record' ->> 'id' = $1::bigint::text",
+                &[&task],
+            )
+            .expect("the cancel")
+            .get(0)
+    }
+
+    /// Batch 11 (design-halt-per-objective.md), on the store: three gate
+    /// rejections in a row, all objective 19's task, halt nothing. The pass
+    /// yields 19 (worker stopped, `task.cancelled` with `yielded` and
+    /// `rejections` 3, the reason saying why) and gives the slot to 21; the
+    /// yield ends the run. 21's rejections then start a run of their own,
+    /// and a `stale` verdict between two of them neither counts nor names
+    /// another objective: the run is 2, still 21's.
+    #[test]
+    fn three_rejections_of_one_objective_yield_it_and_halt_nothing() {
+        let base = std::env::temp_dir().join(format!("spawn-db-halt-obj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let db = Db::new("halt_per_objective");
+        let mission = backlog_mission(&db, &base, "rh", &[19, 21], 1, None);
+        let none = std::collections::BTreeSet::new();
+        let pass = || {
+            crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
+                .expect("a pass")
+        };
+        pass();
+        let t19 = objective_task(&db, mission, 19).id;
+        sent_back(&db, t19, "rejected", 0, 2);
+        assert_eq!(rejection_run(&db, mission), (2, Some(19)));
+        sent_back(&db, t19, "rejected", 2, 1);
+        assert_eq!(rejection_run(&db, mission), (3, Some(19)));
+        assert_eq!(
+            super::halt_reason(&snapshot(&db, mission), 0),
+            None,
+            "one objective's rejections: no halt"
+        );
+
+        assert_eq!(pass().len(), 1, "21 takes the slot");
+        assert_eq!(task_state(&db, mission, t19), "cancelled");
+        yields_recorded(&db, &[t19]);
+        let cancel = cancel_record(&db, t19);
+        assert_eq!(cancel["rejections"], 3, "{cancel}");
+        assert_eq!(cancel["yielded"], true);
+        assert_eq!(
+            cancel["reason"].as_str(),
+            Some(
+                format!(
+                    "3 gate rejections in a row, all objective 19's tasks: task #{t19} yields \
+                     its slot to the next objective instead of halting the mission, its work \
+                     set aside"
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            rejection_run(&db, mission),
+            (0, None),
+            "the yield ends the run"
+        );
+        assert_eq!(db.mission(mission)["halted"], Value::Null);
+
+        let t21 = objective_task(&db, mission, 21).id;
+        sent_back(&db, t21, "rejected", 0, 1);
+        assert_eq!(
+            rejection_run(&db, mission),
+            (1, Some(21)),
+            "a run of its own"
+        );
+        db.store.task_delivered(t21, 2).expect("delivered");
+        assert!(db.store.task_reported(t21, "again").expect("reported"));
+        db.record(&json!({"type": "task.gated", "id": t21, "revision": 1,
+                          "verdict": "stale", "reason": "behind"}));
+        assert_eq!(
+            rejection_run(&db, mission),
+            (1, Some(21)),
+            "stale: counted nowhere"
+        );
+        db.record(&json!({"type": "task.gated", "id": t21, "revision": 1,
+                          "verdict": "rejected", "base": "b", "note": "a check failed"}));
+        assert_eq!(rejection_run(&db, mission), (2, Some(21)));
+        assert_eq!(super::halt_reason(&snapshot(&db, mission), 0), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// rev-e on 67877e62, on the store: three rejections of objective 19,
+    /// then the owner cancels 19's task directly (no yield). The cancel ends
+    /// the run as a yield does, so the next rejection, of 21, is a run of
+    /// its own (1, 21) and halts nothing: the run is never mixed with one
+    /// whose objective is gone.
+    #[test]
+    fn an_owners_cancel_of_the_runs_objective_ends_the_run() {
+        let base =
+            std::env::temp_dir().join(format!("spawn-db-halt-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let db = Db::new("halt_owner_cancel");
+        let mission = backlog_mission(&db, &base, "rc", &[19, 21], 2, None);
+        let none = std::collections::BTreeSet::new();
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none).expect("a pass");
+        let (t19, t21) = (
+            objective_task(&db, mission, 19).id,
+            objective_task(&db, mission, 21).id,
+        );
+        sent_back(&db, t19, "rejected", 0, 3);
+        assert_eq!(rejection_run(&db, mission), (3, Some(19)));
+        db.store.task_cancel(t19).expect("the owner cancels");
+        assert_eq!(task_state(&db, mission, t19), "cancelled");
+        assert_eq!(
+            rejection_run(&db, mission),
+            (0, None),
+            "the cancel ends the run"
+        );
+        sent_back(&db, t21, "rejected", 0, 1);
+        assert_eq!(rejection_run(&db, mission), (1, Some(21)));
+        assert_eq!(super::halt_reason(&snapshot(&db, mission), 0), None);
+        assert_eq!(db.mission(mission)["halted"], Value::Null);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// On the store: rejections of 19, 21, 19 span two objectives, so the
+    /// run names none and halts the mission as before; a yield of an
+    /// objective that is not the run's leaves the run; an acceptance ends
+    /// it; and a resume clears it.
+    #[test]
+    fn rejections_across_objectives_still_halt() {
+        let base = std::env::temp_dir().join(format!("spawn-db-halt-mixed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let db = Db::new("halt_mixed");
+        let mission = backlog_mission(&db, &base, "rm", &[19, 21], 2, None);
+        let none = std::collections::BTreeSet::new();
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none).expect("a pass");
+        let (t19, t21) = (
+            objective_task(&db, mission, 19).id,
+            objective_task(&db, mission, 21).id,
+        );
+        sent_back(&db, t19, "rejected", 0, 1);
+        assert_eq!(rejection_run(&db, mission), (1, Some(19)));
+        sent_back(&db, t21, "rejected", 0, 1);
+        assert_eq!(rejection_run(&db, mission), (2, None), "two objectives");
+        sent_back(&db, t19, "rejected", 1, 1);
+        assert_eq!(rejection_run(&db, mission), (3, None), "none stays none");
+        let row = snapshot(&db, mission);
+        assert!(
+            super::halt_reason(&row, 0).is_some_and(|r| r == "3 gate rejections in a row"),
+            "{:?}",
+            super::halt_reason(&row, 0)
+        );
+        let attempts = std::collections::BTreeMap::new();
+        assert!(
+            crate::objectives::yields(&row, &attempts, 99, &none).is_empty(),
+            "a mixed run yields nothing"
+        );
+        db.record(&json!({"type": "mission.halted", "id": mission,
+                          "reason": "3 gate rejections in a row"}));
+        db.store.mission_resume(mission).expect("resume");
+        assert_eq!(rejection_run(&db, mission), (0, None), "resume clears it");
+
+        // A run of 21's; 19 yields (an objective's own rule): the run stays.
+        sent_back(&db, t21, "rejected", 1, 2);
+        assert_eq!(rejection_run(&db, mission), (2, Some(21)));
+        db.record(
+            &json!({"type": "task.cancelled", "id": t19, "yielded": true,
+                          "objective": 19, "failures": 2, "limit": 3, "reason": "a test"}),
+        );
+        assert_eq!(
+            rejection_run(&db, mission),
+            (2, Some(21)),
+            "another objective's yield"
+        );
+        // An acceptance ends it.
+        db.store.task_delivered(t21, 4).expect("delivered");
+        assert!(db.store.task_reported(t21, "again").expect("reported"));
+        db.record(&json!({"type": "task.gated", "id": t21, "revision": 3,
+                          "verdict": "accepted", "base": "b"}));
+        assert_eq!(rejection_run(&db, mission), (0, None));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// On the store: a mission without objectives (its tasks have none)
+    /// halts on three rejections as before; the run names no objective.
+    #[test]
+    fn three_rejections_of_a_plain_mission_halt() {
+        let (base, source, scenarios, _) = world("halt-plain", "exit 1\n");
+        let db = Db::new("halt_plain");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        for revision in 0..3 {
+            if revision > 0 {
+                db.store
+                    .task_delivered(task, revision + 1)
+                    .expect("delivered");
+                assert!(db.store.task_reported(task, "again").expect("reported"));
+            }
+            db.record(
+                &json!({"type": "task.gated", "id": task, "revision": revision,
+                              "verdict": "rejected", "base": "b0", "note": "fails"}),
+            );
+        }
+        let after = gated(&db, mission);
+        assert_eq!(
+            (after.gate_rejections, after.gate_rejection_objective),
+            (3, None)
+        );
+        assert!(super::halt_reason(&after, 0).is_some_and(|r| r.contains("rejections")));
         let _ = std::fs::remove_dir_all(&base);
     }
 
