@@ -52,20 +52,15 @@ command -v bwrap >/dev/null 2>&1 || {
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/gate-runner-test.XXXXXX")
 runner_home=""
 badroot=""
-# A long root moves a job's scratch to /tmp/gate-runner/<job> (the socket
-# path limit); remember what was there, so only this test's jobs go.
-short_before=$(ls -A /tmp/gate-runner 2>/dev/null || true)
+# A long root moves a job's scratch to the short directory (the socket path
+# limit): this suite's own, so nothing of a real runner's is touched.
+export GATE_RUNNER_SHORT="$HOME/.grs-test-$$"
+short_before=""
 cleanup() {
     chmod -R u+w "$scratch" "$runner_home" 2>/dev/null || true
     rm -rf "$scratch" "$runner_home"
     [ -z "$badroot" ] || rm -rf "$badroot"
-    for job in $(ls -A /tmp/gate-runner 2>/dev/null || true); do
-        case " $short_before " in
-        *" $job "*) ;;
-        *) rm -rf "/tmp/gate-runner/$job" ;;
-        esac
-    done
-    rmdir /tmp/gate-runner 2>/dev/null || true
+    rm -rf "$GATE_RUNNER_SHORT"
 }
 trap cleanup EXIT
 
@@ -402,16 +397,16 @@ contains "and says so" "$scratch/dispatch.err" "names other commits"
 # 8d. Old job directories are pruned on preflight (a gate's own timeout is
 # hours, so nothing that old is running); fresh ones stay.
 mkdir -p "$runner_home/jobs/old-$$" "$runner_home/jobs/new-$$"
-mkdir -p "/tmp/gate-runner/old-$$" "/tmp/gate-runner/new-$$"
-touch -d '10 days ago' "$runner_home/jobs/old-$$" "/tmp/gate-runner/old-$$"
+mkdir -p "$GATE_RUNNER_SHORT/old-$$" "$GATE_RUNNER_SHORT/new-$$"
+touch -d '10 days ago' "$runner_home/jobs/old-$$" "$GATE_RUNNER_SHORT/old-$$"
 "$runner_home/bin/remote" preflight >"$scratch/preflight.out" 2>"$scratch/preflight.err"
 [ ! -e "$runner_home/jobs/old-$$" ] && pass "a job older than the keep days is pruned" ||
     fail "an old job survived"
 [ -d "$runner_home/jobs/new-$$" ] && pass "a fresh job stays" || fail "a fresh job was pruned"
-[ ! -e "/tmp/gate-runner/old-$$" ] && [ -d "/tmp/gate-runner/new-$$" ] &&
+[ ! -e "$GATE_RUNNER_SHORT/old-$$" ] && [ -d "$GATE_RUNNER_SHORT/new-$$" ] &&
     pass "and its short scratch, old and new" || fail "the short scratch did not follow"
 contains "and says what it pruned" "$scratch/preflight.err" "older than 7 days"
-rm -rf "$runner_home/jobs/new-$$" "/tmp/gate-runner/new-$$"
+rm -rf "$runner_home/jobs/new-$$" "$GATE_RUNNER_SHORT/new-$$"
 
 # 8e. A dispatch to a runner rooted where the gate's sandbox empties its
 # directories is refused, not run: its gate could not see the controller.
@@ -564,6 +559,28 @@ GATE_RUNNER_MIN_FREE_MEMORY_MB=99999999 dispatch "$runner_home" "$repo_git" "$ba
 expect "a runner under the memory floor is refused: exit 3" "$status" 3
 contains "and says by how much" "$scratch/dispatch.err" "under the floor of 99999999 MiB"
 nothing_ran "nothing was run on it"
+
+# 8o. A root too long for the gate's sockets puts the job's scratch in the
+# short directory, on the disk, never in /tmp (a tmpfs on OrbStack machines:
+# a gate's builds there are memory, and nested integrators find no room).
+longroot=$HOME/.cache/gate-runner-a-root-whose-path-is-long-enough-to-pass-the-socket-limit-$$
+GATE_RUNNER_ROOT=$longroot sh "$repo/deploy/gate-runner/setup.sh" --root "$longroot" --pg-bin "$pg_bin" \
+    --jobs 2 --min-free-gb 0 --nice 10 >"$scratch/setup4.out" 2>"$scratch/setup4.err" ||
+    { cat "$scratch/setup4.err" >&2; exit 1; }
+reset "$out"
+GATE_RUNNER_REMOTE_BIN=$longroot/bin/remote
+dispatch --keep "$longroot" "$repo_git" "$base" "$candidate" "$scen" "$out"
+GATE_RUNNER_REMOTE_BIN=$runner_home/bin/remote
+expect "a runner with a long root judges: the gate's 0" "$status" 0
+job=$(job_of "$out")
+attempt=$(jq -r '.attempts[-1].id' "$job/record.json")
+[ -n "$attempt" ] && [ -d "$GATE_RUNNER_SHORT/$attempt" ] && pass "its scratch was the short directory, on the disk" ||
+    fail "no scratch in $GATE_RUNNER_SHORT for attempt $attempt: $(ls -A "$GATE_RUNNER_SHORT" 2>/dev/null)"
+[ ! -e "/tmp/gate-runner/$attempt" ] && pass "and not /tmp/gate-runner" || fail "the scratch went to /tmp/gate-runner/$attempt"
+"$longroot/bin/remote" remove "$attempt" >/dev/null 2>&1 || true
+[ ! -e "$GATE_RUNNER_SHORT/$attempt" ] && pass "and removing the job removes its short scratch" ||
+    fail "the short scratch outlived its job"
+rm -rf "$longroot"
 
 # 9. --check: a runner whose helper is another version.
 cp "$runner_home/bin/remote" "$scratch/remote.orig"

@@ -81,9 +81,12 @@ until the PoC is measured and the owner says to switch.
   The shell's own `TMPDIR` is not one of them: the gate never runs with it.
   Keep the root short, too: a Unix socket path is at most 107 bytes, and
   the gate's own server puts one about 40 bytes below `TMPDIR`; a root
-  whose path is too long moves the job's scratch to `/tmp/gate-runner/<job>`
-  (and then the disk floor is measured on `/tmp`; where `/tmp` is a tmpfs,
-  the preflight's `tmp_fs`, that scratch is memory).
+  whose path is too long moves the job's scratch to `$HOME/.grs/<job>`
+  (`GATE_RUNNER_SHORT`): short, and on the disk. Never `/tmp`: where it is a
+  tmpfs (the preflight's `tmp_fs`; every OrbStack machine) a gate's builds
+  there are memory, and check-e2e.sh's nested integrator finds no room — a
+  host fault on every gate (measured on spawn-runner with a root 4 bytes too
+  long, 2026-11-09).
 - **Disk, as the machine's limit sees it**: `df` cannot see a limit that is
   a quota on a shared file system (an OrbStack `--disk` limit is a btrfs
   quota: `df` shows the whole shared disk). Give the limit to setup
