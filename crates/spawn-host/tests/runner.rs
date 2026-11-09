@@ -450,3 +450,39 @@ fn terminate_returns_once_the_runner_and_what_it_started_are_gone() {
         Runner::Gone
     );
 }
+
+/// Terminating a terminal that is gone touches no other: tmux reads a
+/// window target `=spawn-exec_1` that matches no session as a prefix
+/// (`spawn-exec_12`) or a window name, and a terminate that read the pane's
+/// pid so would have waited out spawn-exec_12's runner and killed it
+/// (rev-f on ca758b4b). The session form is exact.
+#[test]
+fn terminating_a_gone_terminal_leaves_one_whose_name_it_prefixes() {
+    let _exclusive = exclusive();
+    let server = Server::new("prefix");
+    server.tmux(&["new-session", "-d", "-s", "keep"]);
+    let marker = format!("spawn-exec-12-lives-{}", std::process::id());
+    server.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "spawn-exec_12",
+        "/bin/sh",
+        "-c",
+        "while :; do sleep 0.05; done",
+        &marker,
+    ]);
+    until_running(&marker);
+    let host = server
+        .host()
+        .with_terminate_waits(Duration::from_millis(300), Duration::from_millis(300));
+    assert_eq!(
+        host.runner(&terminal(), &workspace()).expect("runner"),
+        Runner::Gone,
+        "spawn-exec_1 is not there"
+    );
+    host.terminate(&terminal(), &workspace())
+        .expect("terminating a gone terminal is harmless");
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(running_with(&marker), "spawn-exec_12's runner still runs");
+}
