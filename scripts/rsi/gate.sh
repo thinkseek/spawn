@@ -3252,8 +3252,9 @@ stage_close ok
 # A fresh server for the candidate's runs: the base phase's runs leave the
 # server as they leave it, and a candidate run is to see what the next
 # gate's base run of this commit will see, a server only this tree's runs
-# have used (the seeds above). The same programs, the same password, the
-# same socket path the sandbox is given.
+# have used (the seeds above). The same programs, the same password (the
+# data of the gate's own copy of the template, gate-pg.sh), the same socket
+# path the sandbox is given.
 if [ -n "$gate_pg" ] && [ "$candidate_count" -gt 0 ]; then
     gate_pg_stop
     gate_pg_start "$work/pg.candidate" "$gate_jobs" || exit 3
