@@ -941,7 +941,12 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   `gate_room_escalated` differs, with `before` and `after`),
   `gate_base_disagrees` (objective 033's host fault with `alert`), and
   `command_failed` (a command that finished failed; an owner's note is not
-  news). Conditions: `task_undelivered` (assigned longer than
+  news). Conditions: `scenario_red` (a gate of the mission found main red
+  on a scenario, its `task.gated` record's `main_red_scenarios`: solved, as
+  the same scenario, on an ancestor of the base and unsolved on it, which
+  scripts/rsi/gate.sh reads from the solved index beside its base cache; one
+  per mission and scenario while red, cleared at the first later `accepted`
+  gating of the mission that does not name it), `task_undelivered` (assigned longer than
   `SPAWN_ALERT_UNDELIVERED_SECS`, default 300, while its agent holds no
   delivered or reported task), `mission_halted` (cleared at its
   `mission.resumed`), `postgres_crash` (a `terminated by signal`, `No space

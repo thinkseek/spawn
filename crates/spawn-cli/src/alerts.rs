@@ -42,6 +42,16 @@
 //!   person sent) excepted.
 //!
 //! Conditions:
+//! - `scenario_red`, `mission #<id>`, key
+//!   `scenario_red:<mission>:<scenario>:<the first task.gated naming it>`:
+//!   a gate of the mission found main red on the scenario (the record's
+//!   `main_red_scenarios`: solved, as the same scenario, on an ancestor of
+//!   the base, and unsolved on it; scripts/rsi/gate.sh, "Main red on a
+//!   scenario"), where an unsolved objective says nothing. Once per mission
+//!   and scenario while it stays red; clears at the first later `accepted`
+//!   gating of the mission that does not name it (an accepted gate judged
+//!   every scenario on the base; a rejection may come before the base, so
+//!   it clears nothing).
 //! - `task_undelivered`, `task #<id>`, key
 //!   `task_undelivered:<task>:<its task.assigned event>`: in `assigned`
 //!   longer than `SPAWN_ALERT_UNDELIVERED_SECS` (default 300) while its
@@ -392,6 +402,8 @@ pub(crate) struct Monitor {
     judge_down: HashMap<String, Pending>,
     /// An open (or pending) model-login alert key, by execution id.
     auth: HashMap<String, String>,
+    /// The open (or pending) `scenario_red` key, by mission and scenario.
+    red: HashMap<(i64, String), String>,
     /// The newest dump and bundle records.
     backups: BTreeMap<&'static str, Backup>,
     commands_after: i64,
@@ -425,6 +437,7 @@ impl Monitor {
             admitted: HashMap::new(),
             judge_down: HashMap::new(),
             auth: HashMap::new(),
+            red: HashMap::new(),
             backups: BTreeMap::new(),
             commands_after: 0,
             logs,
@@ -541,6 +554,7 @@ impl Monitor {
                 self.known.insert(key, row);
             }
         }
+        self.seed_red();
         let history = store
             .alert_history(now.saturating_sub(HISTORY_MS), HISTORY_LIMIT)
             .map_err(|error| error.to_string())?;
@@ -672,6 +686,84 @@ impl Monitor {
         }
     }
 
+    /// The open `scenario_red` alerts the store holds, by mission and
+    /// scenario: a main still red on a scenario stays one alert, however old
+    /// its first record is (the history read back on start is a week).
+    fn seed_red(&mut self) {
+        for (key, row) in &self.known {
+            if row.open() && row.kind == "scenario_red" {
+                let mission = row.evidence["mission"].as_i64();
+                let scenario = row.evidence["scenario"].as_str();
+                if let (Some(mission), Some(scenario)) = (mission, scenario) {
+                    self.red
+                        .insert((mission, scenario.to_string()), key.clone());
+                }
+            }
+        }
+    }
+
+    /// `scenario_red`: opened by a gating that names a scenario main is red
+    /// on, once per mission and scenario; cleared by a later accepted gating
+    /// of the mission that does not name it.
+    fn red_scenarios(
+        &mut self,
+        event_id: i64,
+        task: i64,
+        mission_id: i64,
+        record: &Value,
+        out: &mut Vec<Event>,
+    ) {
+        let named: Vec<String> = record["main_red_scenarios"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        for scenario in &named {
+            let at = (mission_id, scenario.clone());
+            if self.red.contains_key(&at) {
+                continue;
+            }
+            let key = format!("scenario_red:{mission_id}:{scenario}:{event_id}");
+            self.red.insert(at, key.clone());
+            out.push(Event::Fire {
+                key,
+                kind: "scenario_red",
+                subject: format!("mission #{mission_id}"),
+                evidence: json!({
+                    "mission": mission_id, "scenario": scenario, "task": task,
+                    "base": record["base"], "event_id": event_id,
+                }),
+                text: format!(
+                    "mission #{mission_id}: main is red on {scenario}: solved on an ancestor of \
+the base, unsolved on it (task #{task}'s gate)"
+                ),
+                notice: false,
+            });
+        }
+        if record["verdict"].as_str() != Some("accepted") {
+            return;
+        }
+        let green: Vec<(i64, String)> = self
+            .red
+            .keys()
+            .filter(|(mission, scenario)| *mission == mission_id && !named.contains(scenario))
+            .cloned()
+            .collect();
+        for at in green {
+            if let Some(key) = self.red.remove(&at) {
+                out.push(Event::Clear {
+                    key,
+                    evidence: json!({
+                        "event_id": event_id, "record": "task.gated", "task": task,
+                        "base": record["base"],
+                    }),
+                });
+            }
+        }
+    }
+
     /// A task record: its state notice, its mission's counters when it was
     /// gated, 033's notice, and the delivery bound's clearing.
     fn task_record(&mut self, event_id: i64, at_ms: i64, record: &Value, out: &mut Vec<Event>) {
@@ -776,6 +868,7 @@ impl Monitor {
                 });
             }
         }
+        self.red_scenarios(event_id, task, mission_id, record, out);
         if base_disagrees(record).is_some() {
             out.push(Event::Fire {
                 key: format!("gate_base_disagrees:{event_id}"),
@@ -2646,6 +2739,141 @@ mod tests {
         // And the open alert is still known, so a quiet re-reading of a
         // threshold does not fire it again.
         assert!(monitor.is_open("mission_halted:4:2"));
+    }
+
+    /// A `task.gated` of task 7 (mission 4), at the revision the integrator
+    /// writes (a rejection bumps the task's), naming the scenarios main is
+    /// red on.
+    fn red_gated(verdict: &str, revision: i64, red: &[&str]) -> Value {
+        let mut record = json!({"type": "task.gated", "id": 7, "verdict": verdict,
+                                "revision": revision, "base": "b"});
+        if !red.is_empty() {
+            record["main_red_scenarios"] = json!(red);
+        }
+        record
+    }
+
+    /// `scenario_red`: once per mission and scenario while red, even when
+    /// two gatings naming it are read in one batch; a rejection clears
+    /// nothing (it may come before the base phase), nor does another
+    /// mission's acceptance; an accepted gating that no longer names it
+    /// clears it, and only it.
+    #[test]
+    fn main_red_on_a_scenario_is_one_alert_until_an_accepted_gate_clears_it() {
+        let mut monitor = monitor();
+        feed(
+            &mut monitor,
+            10,
+            0,
+            json!({"type": "task.assigned", "id": 7, "mission_id": 4, "agent_id": "a"}),
+        );
+        let first = feed(&mut monitor, 11, 0, red_gated("accepted", 0, &["046.sh"]));
+        assert!(
+            fires(&first).contains(&"scenario_red:4:046.sh:11"),
+            "{first:?}"
+        );
+        // Not committed yet: the same batch reads a second gating.
+        let second = feed(
+            &mut monitor,
+            12,
+            0,
+            red_gated("rejected", 0, &["046.sh", "047.sh"]),
+        );
+        let red: Vec<&str> = fires(&second)
+            .into_iter()
+            .filter(|key| key.starts_with("scenario_red:"))
+            .collect();
+        assert_eq!(red, ["scenario_red:4:047.sh:12"], "{second:?}");
+        commit(&mut monitor, &first);
+        commit(&mut monitor, &second);
+        let Event::Fire {
+            evidence, notice, ..
+        } = first
+            .iter()
+            .find(|event| event.key() == "scenario_red:4:046.sh:11")
+            .expect("the fire")
+        else {
+            panic!("a fire")
+        };
+        assert!(!notice, "a condition, not a notice");
+        assert_eq!(evidence["scenario"], "046.sh");
+        assert_eq!(evidence["mission"], 4);
+        // Another mission's accepted gate is no word on mission 4's main.
+        feed(
+            &mut monitor,
+            30,
+            0,
+            json!({"type": "task.assigned", "id": 8, "mission_id": 5, "agent_id": "b"}),
+        );
+        let elsewhere = feed(
+            &mut monitor,
+            31,
+            0,
+            json!({"type": "task.gated", "id": 8, "verdict": "accepted", "revision": 0, "base": "c"}),
+        );
+        assert!(
+            !elsewhere
+                .iter()
+                .any(|event| matches!(event, Event::Clear { .. })),
+            "{elsewhere:?}"
+        );
+        let rejected = feed(&mut monitor, 13, 0, red_gated("rejected", 1, &[]));
+        assert!(
+            !rejected
+                .iter()
+                .any(|event| matches!(event, Event::Clear { .. })),
+            "{rejected:?}"
+        );
+        let accepted = feed(&mut monitor, 14, 0, red_gated("accepted", 2, &["047.sh"]));
+        let cleared: Vec<&str> = accepted
+            .iter()
+            .filter(|event| matches!(event, Event::Clear { .. }))
+            .map(Event::key)
+            .collect();
+        assert_eq!(cleared, ["scenario_red:4:046.sh:11"], "{accepted:?}");
+        commit(&mut monitor, &accepted);
+        assert!(monitor.is_open("scenario_red:4:047.sh:12"));
+    }
+
+    /// A restart that reads an open `scenario_red` back fires nothing again
+    /// for it, and still clears it at the accepted gating that no longer
+    /// names it.
+    #[test]
+    fn a_restart_keeps_main_red_one_alert() {
+        // The restart: the open alert read back, with its evidence.
+        let mut restarted = super::Monitor::with(settings());
+        restarted.known.insert(
+            "scenario_red:4:047.sh:12".to_string(),
+            Row {
+                kind: "scenario_red".to_string(),
+                subject: "mission #4".to_string(),
+                state: "open".to_string(),
+                evidence: json!({"mission": 4, "scenario": "047.sh"}),
+                fired_event_id: 12,
+                fired_at_ms: 0,
+            },
+        );
+        restarted.seed_red();
+        feed(
+            &mut restarted,
+            20,
+            0,
+            json!({"type": "task.assigned", "id": 7, "mission_id": 4, "agent_id": "a"}),
+        );
+        let again = feed(&mut restarted, 21, 0, red_gated("rejected", 0, &["047.sh"]));
+        assert!(
+            !fires(&again)
+                .iter()
+                .any(|key| key.starts_with("scenario_red:")),
+            "{again:?}"
+        );
+        let green = feed(&mut restarted, 22, 0, red_gated("accepted", 1, &[]));
+        assert!(
+            green
+                .iter()
+                .any(|event| matches!(event, Event::Clear { key, .. } if key == "scenario_red:4:047.sh:12")),
+            "{green:?}"
+        );
     }
 
     #[test]

@@ -739,6 +739,11 @@ pub(crate) struct Verdict {
     /// verdict's `flakes`: a flake, not a regression), in the log's order;
     /// only names of checks (`check-*.sh`) are kept.
     pub(crate) flakes: Vec<String>,
+    /// The scenarios main is red on (the verdict's `main_red_scenarios`):
+    /// solved, as the same scenario, on an ancestor of the base and unsolved
+    /// on it (scripts/rsi/gate.sh, "Main red on a scenario"), in the log's
+    /// order; only scenario file names (`<name>.sh`, not a check) are kept.
+    pub(crate) main_red_scenarios: Vec<String>,
     /// Everything the gate printed, stderr marked `! `, the verdict last.
     pub(crate) output: String,
 }
@@ -1316,6 +1321,7 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
         reason: text("reason").unwrap_or_else(|| "gate rejected the candidate".to_string()),
         metric: text("metric"),
         flakes: flakes(&value),
+        main_red_scenarios: main_red_scenarios(&value),
         output,
     })
 }
@@ -1344,6 +1350,35 @@ fn flakes(value: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The verdict's `main_red_scenarios`: scenario file names only (a name
+/// `<name>.sh` with no path that is not a check's), in order.
+fn main_red_scenarios(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("main_red_scenarios")
+        .and_then(serde_json::Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|name| is_scenario_name(name))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether `name` is a scenario's file name, `<name>.sh` with no path, and
+/// not a check's.
+fn is_scenario_name(name: &str) -> bool {
+    name.strip_suffix(".sh").is_some_and(|stem| {
+        !stem.is_empty()
+            && stem
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }) && name.len() <= 100
+        && !is_check_name(name)
 }
 
 /// The no-room fact of a verdict file, `(free_kb, min_gb, tmpdir)`: one
@@ -2027,6 +2062,34 @@ mod tests {
         assert_eq!(verdict.flakes, ["check-clippy.sh"]);
         let gate = FakeGate::new("echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n");
         assert!(gate.judge(&path_only()).expect("verdict").flakes.is_empty());
+    }
+
+    /// A verdict names the scenarios main is red on (`main_red_scenarios`):
+    /// scenario names only, never a check, a path or anything not a string;
+    /// a verdict without the key (every gate before it) names none.
+    #[test]
+    fn a_verdict_names_the_scenarios_main_is_red_on() {
+        let gate = FakeGate::new(
+            "echo '{\"verdict\":\"accepted\",\"main_red_scenarios\":[\"046.sh\",\"../x.sh\",\"check-tests.sh\",3,\"a b.sh\",\"071.sh\"]}' >\"$SPAWN_GATE_VERDICT\"\n",
+        );
+        let verdict = gate.judge(&path_only()).expect("verdict");
+        assert_eq!(verdict.main_red_scenarios, ["046.sh", "071.sh"]);
+        let gate = FakeGate::new(
+            "echo '{\"verdict\":\"rejected\",\"reason\":\"r\",\"main_red_scenarios\":[\"013.sh\"]}' >\"$SPAWN_GATE_VERDICT\"\n",
+        );
+        assert_eq!(
+            gate.judge(&path_only())
+                .expect("verdict")
+                .main_red_scenarios,
+            ["013.sh"]
+        );
+        let gate = FakeGate::new("echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n");
+        assert!(
+            gate.judge(&path_only())
+                .expect("verdict")
+                .main_red_scenarios
+                .is_empty()
+        );
     }
 
     #[test]
