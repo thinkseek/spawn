@@ -6,7 +6,7 @@
 // its minimum: 4.5:1 for text, 3:1 for marks, icons and the focus ring
 // (WCAG 2.2 AA, 1.4.3 and 1.4.11). vite.config.ts runs it at the start of
 // every build, so a token change that drops a pair under AA fails the build.
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 
 const THEMES = ["light", "dark"];
 // [text, background, minimum, role]
@@ -66,6 +66,20 @@ const PAIRS = [
   ["faint-foreground", "inset", 4.5, "metadata in an inset (bg-muted)"],
 ];
 
+// A terminal is dark in both themes: Terminal.tsx gives every terminal
+// surface data-theme="dark", so the page's text tokens inside it (a
+// header's title, tag and status) resolve in the dark theme whatever the
+// page's is. These are those tokens on the terminal's ground, read in the
+// dark theme; with the light page's tokens they fail, which is what an
+// unscoped terminal showed (the light theme's dark ink on a dark header).
+const TERMINAL_THEME = "dark";
+const TERMINAL_PAIRS = [
+  ["foreground", "terminal", 4.5, "a terminal's title"],
+  ["muted-foreground", "terminal", 4.5, "a terminal's tag"],
+  ["faint-foreground", "terminal", 4.5, "a terminal's status line"],
+  ["ok-ink", "terminal", 4.5, "a terminal's live badge"],
+];
+
 function oklchToSrgb(L, C, H) {
   const h = (H * Math.PI) / 180, a = C * Math.cos(h), b = C * Math.sin(h);
   const l_ = L + 0.3963377774 * a + 0.2158037573 * b;
@@ -106,7 +120,7 @@ const ratio = (a, b) => {
 const css = readFileSync(process.argv[2] ?? new URL("../src/styles/spawn.css", import.meta.url), "utf8");
 let failed = 0;
 const rules = [...css.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/([^{}]+)\{([^{}]*)\}/g)];
-for (const theme of THEMES) {
+const resolverFor = (theme) => {
   const tokens = {};
   for (const [, selector, block] of rules) {
     if (!selector.includes(`[data-theme="${theme}"]`)) continue;
@@ -118,8 +132,11 @@ for (const theme of THEMES) {
     const ref = /^var\(--([\w-]+)\)$/.exec(v);
     return ref && depth < 5 ? resolve(ref[1], depth + 1) : v;
   };
-  console.log(`\n${theme}`);
-  for (const [fg, bg, min, role] of PAIRS) {
+  return resolve;
+};
+const check = (heading, resolve, pairs) => {
+  console.log(`\n${heading}`);
+  for (const [fg, bg, min, role] of pairs) {
     const a = resolve(fg) && linear(resolve(fg)), b = resolve(bg) && linear(resolve(bg));
     if (!a || !b) { console.log(`  ?    ${fg} on ${bg}: missing`); failed++; continue; }
     const r = ratio(a.lin, b.lin);
@@ -127,6 +144,29 @@ for (const theme of THEMES) {
     if (!ok) failed++;
     console.log(`  ${ok ? "ok  " : "FAIL"} ${r.toFixed(2).padStart(5)}:1 (min ${min})  ${fg} on ${bg}  ${role}${a.out || b.out ? "  [out of sRGB gamut, clamped]" : ""}`);
   }
+};
+for (const theme of THEMES) check(theme, resolverFor(theme), PAIRS);
+check(`inside a terminal (the ${TERMINAL_THEME} theme, on either page)`, resolverFor(TERMINAL_THEME), TERMINAL_PAIRS);
+
+// And every terminal surface is scoped so: a component that paints
+// bg-terminal sets data-theme="dark" on it, as often as it paints it.
+const srcDir = new URL("../src/", import.meta.url);
+const tsx = (dir) =>
+  readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+    entry.isDirectory()
+      ? tsx(new URL(`${entry.name}/`, dir))
+      : entry.name.endsWith(".tsx") ? [new URL(entry.name, dir)] : [],
+  );
+console.log("\nterminal surfaces carry the dark theme");
+for (const file of tsx(srcDir)) {
+  const text = readFileSync(file, "utf8");
+  const painted = (text.match(/\bbg-terminal\b(?!-)/g) ?? []).length;
+  if (!painted) continue;
+  const scoped = (text.match(/data-theme="dark"/g) ?? []).length;
+  const ok = scoped >= painted;
+  if (!ok) failed++;
+  const name = file.pathname.slice(srcDir.pathname.length);
+  console.log(`  ${ok ? "ok  " : "FAIL"} ${name}: ${painted} bg-terminal, ${scoped} data-theme="dark"`);
 }
 console.log(failed ? `\n${failed} pair(s) below their minimum` : "\nevery pair meets its minimum");
 process.exit(failed ? 1 : 0);
