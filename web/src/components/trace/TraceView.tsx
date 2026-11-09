@@ -8,7 +8,7 @@ import { pairs } from "../../eventFormat";
 import { clockTime, formatDuration } from "../../format";
 import { fitDomain } from "../../timeWindow";
 import { chainOf, deriveTrace, foldRuns, rowText, runEnd, spanEnd, visibleSpans } from "../../trace";
-import type { Span, SpanKind, TraceMarker } from "../../trace";
+import type { KnownCommand, KnownExecution, Span, SpanKind, Trace, TraceMarker } from "../../trace";
 import { Overview } from "../timeaxis/Overview";
 import type { OverviewLine } from "../timeaxis/Overview";
 import {
@@ -63,14 +63,21 @@ interface Hover {
 
 export function TraceView({
   events,
+  executions,
+  commands,
   header,
 }: {
   events: TimelineEvent[];
+  executions: readonly KnownExecution[];
+  commands: ReadonlyMap<string, KnownCommand>;
   header: ReactNode;
 }) {
   const reduceMotion = useReducedMotion() ?? false;
   const gradientId = useId();
-  const trace = useMemo(() => deriveTrace(events, 0), [events]);
+  const trace = useMemo(
+    () => deriveTrace(events, 0, executions, commands),
+    [events, executions, commands],
+  );
 
   // Open spans run to now; the clock only ticks while one is open.
   const now = useNowWhile(trace.openCount > 0);
@@ -338,6 +345,7 @@ export function TraceView({
                 <RowLabel
                   key={row.key}
                   row={row}
+                  trace={trace}
                   top={index * ROW_H}
                   labelW={labelW}
                   hovered={hover?.rowKey === row.key}
@@ -382,6 +390,7 @@ export function TraceView({
                       <SpanBar
                         key={span.id}
                         span={span}
+                        labelled={row.unfolded || row.run.length === 1}
                         cy={index * ROW_H + ROW_H / 2}
                         px={px}
                         plotW={plotW}
@@ -435,6 +444,7 @@ export function TraceView({
         <Tooltip
           hover={hover}
           row={rows[rowIndex.get(hover.rowKey) ?? -1]}
+          trace={trace}
           now={now}
           flip={hover.x > (rootRef.current?.clientWidth ?? 0) - 340}
         />
@@ -494,6 +504,7 @@ function Legend() {
 
 function RowLabel({
   row,
+  trace,
   top,
   labelW,
   hovered,
@@ -505,6 +516,7 @@ function RowLabel({
   onSelect,
 }: {
   row: Row;
+  trace: Trace;
   top: number;
   labelW: number;
   hovered: boolean;
@@ -520,6 +532,10 @@ function RowLabel({
   const isRun = row.run.length > 1;
   const hasChildren = (span?.childIds.length ?? 0) > 0 || isRun;
   const shut = isRun ? !row.unfolded : collapsed;
+  // A folded run of commands is its sender and action: their texts differ.
+  const commandRun = isRun && !row.unfolded && span?.kind === "command";
+  const text = span ? (commandRun ? span.label : rowText(span, trace)) : "Session";
+  const last = row.run.at(-1);
   return (
     <div
       role="treeitem"
@@ -584,11 +600,16 @@ function RowLabel({
                 : "font-mono text-caption text-foreground/85",
             )}
           >
-            {span ? rowText(span) : "Session"}
+            {text}
           </span>
           {isRun && (
             <span className="tnum shrink-0 text-caption font-medium text-muted-foreground">
               ×{row.run.length}
+            </span>
+          )}
+          {commandRun && span && last && (
+            <span className="tnum shrink-0 text-caption text-faint-foreground">
+              {clockTime(span.start)}–{clockTime(last.start)}
             </span>
           )}
           {span?.failed && (
@@ -693,6 +714,7 @@ function SpanBar({
   now,
   gradientId,
   dimmed,
+  labelled = true,
 }: {
   span: Span;
   cy: number;
@@ -701,6 +723,9 @@ function SpanBar({
   now: number;
   gradientId: string;
   dimmed: boolean;
+  /** Its duration beside it: not for the calls of a folded run, whose
+   * labels would stack on one row. */
+  labelled?: boolean;
 }) {
   // A failed tool call is short: it turns red. A failed long span keeps its
   // kind and gets a red trailing end, so failure stays a small mark.
@@ -738,7 +763,8 @@ function SpanBar({
   const labelW = label.length * 6.2;
   let labelX: number | null = null;
   let anchor: "start" | "end" = "start";
-  if (x1 + 6 + labelW <= plotW) labelX = x1 + 6;
+  if (!labelled) labelX = null;
+  else if (x1 + 6 + labelW <= plotW) labelX = x1 + 6;
   else if (x0 - 6 - labelW >= 0) {
     labelX = x0 - 6;
     anchor = "end";
@@ -832,11 +858,13 @@ function Markers({
 function Tooltip({
   hover,
   row,
+  trace,
   now,
   flip,
 }: {
   hover: Hover;
   row: Row | undefined;
+  trace: Trace;
   now: number;
   flip: boolean;
 }) {
@@ -876,7 +904,9 @@ function Tooltip({
             className="size-2 shrink-0 rounded-full"
             style={{ background: KIND_COLOR[span.kind] }}
           />
-          <span className="max-w-72 truncate font-medium">{rowText(span)}</span>
+          <span className="max-w-72 truncate font-medium">
+            {folded && span.kind === "command" ? span.label : rowText(span, trace)}
+          </span>
           <span className="shrink-0 text-white/50">
             {folded ? `×${row.run.length} calls` : KIND_LABEL[span.kind].toLowerCase()}
           </span>

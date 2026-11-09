@@ -77,7 +77,7 @@ export function SpanDetail({
             {span ? KIND_LABEL[span.kind] : "Session"}
           </div>
           <h3 className="mt-1 truncate text-title-sm font-semibold text-foreground">
-            {span ? rowText(span) : "Session events"}
+            {span ? (run && span.kind === "command" ? span.label : rowText(span, trace)) : "Session events"}
             {run && <span className="tnum font-normal text-muted-foreground"> ×{run.length}</span>}
           </h3>
           {ancestors.length > 0 && (
@@ -159,6 +159,10 @@ export function SpanDetail({
                       {" · "}
                       {call.state === "orphan" ? "no start" : formatDuration(spanEnd(call, now) - call.start)}
                     </span>
+                    {/* A command run's texts differ: each says its own. */}
+                    {call.kind === "command" && call.summary && (
+                      <span className="block break-words text-foreground">{call.summary}</span>
+                    )}
                   </li>
                 ))}
               </ol>
