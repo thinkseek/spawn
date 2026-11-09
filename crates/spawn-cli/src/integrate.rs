@@ -38,7 +38,23 @@
 //!    starts, so the judging's verdict is on the main it ran against, never
 //!    `stale` because of the owner. A judging of another source goes on. A
 //!    judging in flight is never stopped, and the integrator is never
-//!    stopped for an owner's landing;
+//!    stopped for an owner's landing. A gated request (`spawn mission push
+//!    --gated`) is not applied here: it is an owner judging, a judging of its
+//!    source started ahead of the source's ready tasks (never in place of a
+//!    running judging, within the same caps): the mission's gate judges the
+//!    candidate (the owner's commit, or the owner's landing merge on M, built
+//!    in the mirror) against M with the candidate's own scenarios, `protected`
+//!    emptied, and no red check on the base. The regression rule holds only
+//!    for what M solves: a new contract's scenarios are unsolved on M, and so
+//!    is a check main is red on, for the tests main fails (the gate runs with
+//!    SPAWN_GATE_RED_UNSOLVED; a test the candidate newly fails in it is a
+//!    regression), so the push is not rejected or held for them, only for
+//!    the checks, tests and scenarios M solves. Accepted, main moves by a compare-and-swap push
+//!    under the landing hold and `source.moved` names the `verdict`;
+//!    rejected: `source.push_refused` with the `verdict` and the `log`,
+//!    counted by no mission; no verdict (the host's fault, an abort, no
+//!    room): nothing recorded, judged again after the host-fault backoff
+//!    ([`owner::Judged`]);
 //! 1. a halt rule that fired stops the mission's landings until a human
 //!    resumes it: three gate rejections in a row (in an objective mission,
 //!    three of one objective's tasks yield that objective instead,
@@ -1548,9 +1564,9 @@ struct Integrator {
     /// once, when the task starts waiting, and again only after the task
     /// has had a gate ([`Integrator::wait_over`]).
     waiting: RefCell<std::collections::HashSet<(i64, Wait)>>,
-    /// The owner's requests already said to wait for a judging in flight on
-    /// their source (step 0): each is said once.
-    owner_waits: RefCell<std::collections::HashSet<i64>>,
+    /// What step 0 keeps of the owner's requests between passes: the waits
+    /// already said, and the owner judgings' backoffs ([`owner::Kept`]).
+    owner: RefCell<owner::Kept>,
     /// When each mission's last judging ended (this process's reading):
     /// its next task waits for a gate from then.
     last_judged: RefCell<std::collections::HashMap<i64, i64>>,
@@ -1768,6 +1784,9 @@ struct Running {
     /// The scenarios its gate runs at once (SPAWN_GATE_JOBS as given), 0
     /// when the integrator does not share the cores ([`gate::Cpu`]).
     jobs: usize,
+    /// The owner's request this judging judges (an owner judging,
+    /// [`Integrator::start_owner`]); None for a task's.
+    owner: Option<i64>,
     handle: std::thread::JoinHandle<()>,
 }
 
@@ -1837,7 +1856,7 @@ impl Integrator {
             running: RefCell::new(Vec::new()),
             held: RefCell::new(None),
             waiting: RefCell::new(std::collections::HashSet::new()),
-            owner_waits: RefCell::new(std::collections::HashSet::new()),
+            owner: RefCell::new(owner::Kept::default()),
             last_judged: RefCell::new(std::collections::HashMap::new()),
             warms: RefCell::new(None),
             red_probe_ms: main_red_probe_ms(
@@ -2038,10 +2057,17 @@ impl Integrator {
         let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
         self.last_judged.borrow_mut().insert(gate.mission, now);
         if gate.handle.join().is_err() {
-            eprintln!(
-                "integrate: mission {}: the judging of task {} panicked; it is judged again",
-                gate.mission, gate.task
-            );
+            match gate.owner {
+                Some(request) => eprintln!(
+                    "integrate: the owner judging of request {request} on {} panicked; it is \
+                     judged again",
+                    gate.source
+                ),
+                None => eprintln!(
+                    "integrate: mission {}: the judging of task {} panicked; it is judged again",
+                    gate.mission, gate.task
+                ),
+            }
         }
     }
 
@@ -2072,13 +2098,15 @@ impl Integrator {
             .map(|gate| gate.source.clone())
             .collect();
         let mut owner_moved = Vec::new();
+        let mut owner_judge = Vec::new();
         let pending = owner::apply_pending(
             store,
             &mut owner_moved,
             &busy,
-            &mut self.owner_waits.borrow_mut(),
+            &mut self.owner.borrow_mut(),
+            &mut owner_judge,
         )?;
-        let steps = self.steps(store, &pending, &owner_moved);
+        let steps = self.steps(store, &pending, &owner_moved, owner_judge);
         self.poll_warm();
         steps
     }
@@ -2092,6 +2120,7 @@ impl Integrator {
         store: &Arc<PostgresStore>,
         pending: &std::collections::HashMap<String, i64>,
         owner_moved: &[(String, String)],
+        owner_judge: Vec<owner::Request>,
     ) -> Result<(), String> {
         let missions: Vec<Mission> =
             serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
@@ -2140,8 +2169,148 @@ impl Integrator {
             }),
             self.gates,
         );
+        // The gated owner's requests first (design-owner-push-between-gates.md):
+        // each takes its source's slot ahead of the source's ready tasks, never
+        // a running judging's, within the same caps. Not on a source a task
+        // landed on this pass: its main moved, and the next pass reads it.
+        for request in owner_judge {
+            if !moved.contains(&request.source) {
+                self.start_owner(store, &missions, request, at_once);
+            }
+        }
         self.start_ready(store, ready, at_once);
         Ok(())
+    }
+
+    /// Whether an owner judging fits the caps now: its jobs
+    /// ([`gate::Cpu::jobs_for`], None when the cores are not shared), or
+    /// what it waits for, `running` being the judgings on the shared test
+    /// server.
+    fn room_for_owner(
+        &self,
+        shares_server: bool,
+        running: usize,
+        at_once: usize,
+    ) -> Result<Option<usize>, String> {
+        if waits_for_gate(shares_server, running, self.gates) {
+            return Err(format!("a gate ({running} of {} running)", self.gates));
+        }
+        let jobs = self
+            .cpu
+            .as_ref()
+            .map(|cpu| cpu.jobs_for(shares_server, at_once));
+        if let (Some(cpu), Some(jobs)) = (&self.cpu, jobs) {
+            let busy: usize = self.running.borrow().iter().map(|gate| gate.jobs).sum();
+            if !cpu.fits(busy, jobs) {
+                return Err(format!(
+                    "CPU room: its gate's {jobs} jobs and the running gates' {busy}"
+                ));
+            }
+        }
+        Ok(jobs)
+    }
+
+    /// Start the owner judging of `request` (a gated owner's request step 0
+    /// handed over) when its source has no judging in flight and the caps
+    /// leave room, judged with the scenarios of the first mission on its
+    /// source that is not halted. Otherwise it stays pending, for a later
+    /// pass.
+    fn start_owner(
+        &self,
+        store: &Arc<PostgresStore>,
+        missions: &[Mission],
+        request: owner::Request,
+        at_once: usize,
+    ) {
+        let said = format!(
+            "integrate: the owner's landing of {} on {} (request {})",
+            request.commit, request.source, request.id
+        );
+        if self
+            .running
+            .borrow()
+            .iter()
+            .any(|gate| gate.source == request.source)
+        {
+            return;
+        }
+        let Some(mission) = missions.iter().find(|mission| {
+            mission.halted.is_none() && mission.source.as_deref() == Some(request.source.as_str())
+        }) else {
+            if self.owner.borrow_mut().said.insert(request.id) {
+                println!("{said} waits: no mission on its source that is not halted judges it");
+            }
+            return;
+        };
+        let mut gated = mission.clone();
+        gated.gate = pinned(Path::new(&mission.gate))
+            .to_string_lossy()
+            .into_owned();
+        let shares_server = needs_test_database(Path::new(&gated.gate))
+            && gate::on_shared_server(&self.judge.gate_env);
+        let running = self
+            .running
+            .borrow()
+            .iter()
+            .filter(|gate| gate.shares_server)
+            .count();
+        let jobs = match self.room_for_owner(shares_server, running, at_once) {
+            Ok(jobs) => jobs,
+            Err(wait) => {
+                if self.owner.borrow_mut().said.insert(request.id) {
+                    println!("{said} waits for {wait}");
+                }
+                return;
+            }
+        };
+        let mirror = match sources::ensure_mirror(&self.judge.root, Some(&request.source)) {
+            Ok(mirror) => mirror,
+            Err(error) => {
+                eprintln!("{said}: {error}");
+                return;
+            }
+        };
+        self.owner.borrow_mut().said.remove(&request.id);
+        let judge = self.judge.clone();
+        let backoff = Arc::clone(&self.owner.borrow().backoff);
+        let (store, source, id, mission_id, reason) = (
+            Arc::clone(store),
+            request.source.clone(),
+            request.id,
+            mission.id,
+            request.reason.clone(),
+        );
+        let handle = std::thread::Builder::new()
+            .name(format!("owner-gate-{id}"))
+            .spawn(move || {
+                let judged = judge.judge_owner(&store, &mirror, &gated, &request, jobs);
+                owner::judged(&said, id, &judged, &backoff, judge.host.backoff);
+            });
+        let handle = match handle {
+            Ok(handle) => handle,
+            Err(error) => {
+                eprintln!("integrate: start the owner judging of request {id}: {error}");
+                return;
+            }
+        };
+        println!(
+            "integrate: judging the owner's landing of request {id} on {source} ({} of {} \
+             gates){}",
+            running + usize::from(shares_server),
+            self.gates,
+            reason
+                .map(|reason| format!(": {reason}"))
+                .unwrap_or_default()
+        );
+        self.running.borrow_mut().push(Running {
+            mission: mission_id,
+            source,
+            task: 0,
+            shares_server,
+            jobs: jobs.unwrap_or(0),
+            owner: Some(id),
+            handle,
+        });
     }
 
     /// One mission's step. True when it landed a task (its source's main
@@ -2429,6 +2598,7 @@ impl Integrator {
             task: task_id,
             shares_server,
             jobs: jobs.unwrap_or(0),
+            owner: None,
             handle,
         });
         Ok(())
@@ -2542,6 +2712,30 @@ impl Integrator {
 }
 
 impl Judge {
+    /// The gate's environment for a judging with `scenarios`, given `jobs`:
+    /// the test server never the owner's, by identity, asked now (a socket
+    /// mount or a DNS name can change between gate runs); none at all for a
+    /// mission marked [`NO_TEST_DATABASE`]; SPAWN_GATE_JOBS the jobs it was
+    /// given room for, never its own default.
+    fn judging_env(&self, scenarios: &Path, jobs: Option<usize>) -> Vec<(String, String)> {
+        let owner = std::env::var("SPAWN_DATABASE_URL").ok();
+        let (mut gate_env, warning) =
+            gate::withhold_owners_cluster(&self.gate_env, owner.as_deref(), |url| {
+                spawn_postgres::cluster_identity(url).map_err(|error| error.to_string())
+            });
+        if !needs_test_database(scenarios) {
+            gate_env.retain(|(name, _)| !withheld_without_test_database(name));
+        }
+        if let Some(jobs) = jobs {
+            gate_env.retain(|(name, _)| name != "SPAWN_GATE_JOBS");
+            gate_env.push(("SPAWN_GATE_JOBS".to_string(), jobs.to_string()));
+        }
+        if let Some(warning) = warning {
+            eprintln!("integrate: {warning}");
+        }
+        gate_env
+    }
+
     /// The agent's pushed branch, fetched into the mirror, checked against
     /// the checkpoint the task's report names and the agent's latest
     /// checkpoint ([`report_freshness`]). A lagging push is fetched again for
@@ -2835,24 +3029,7 @@ impl Judge {
                 return gated("aborted", json!({ "reason": reason }));
             }
         }
-        // The test server must not be the owner's, by identity, asked now:
-        // a socket mount or a DNS name can change between gate runs.
-        let owner = std::env::var("SPAWN_DATABASE_URL").ok();
-        let (mut gate_env, warning) =
-            gate::withhold_owners_cluster(&self.gate_env, owner.as_deref(), |url| {
-                spawn_postgres::cluster_identity(url).map_err(|error| error.to_string())
-            });
-        if !needs_test_database(scenarios) {
-            gate_env.retain(|(name, _)| !withheld_without_test_database(name));
-        }
-        // The jobs this gate was given room for, never its own default.
-        if let Some(jobs) = jobs {
-            gate_env.retain(|(name, _)| name != "SPAWN_GATE_JOBS");
-            gate_env.push(("SPAWN_GATE_JOBS".to_string(), jobs.to_string()));
-        }
-        if let Some(warning) = warning {
-            eprintln!("integrate: {warning}");
-        }
+        let mut gate_env = self.judging_env(scenarios, jobs);
         // Main of the source is red on a check: the gate runs it on the base
         // before the candidate, so a main that is green on it again says so
         // (`base_check`) and one still red stops there (`main_red`).
@@ -11821,6 +11998,469 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&marks);
     }
 
+    /// The owner's commit with `files` (paths under the tree, directories
+    /// made), put in the source at its owner's ref, no branch moved.
+    fn owner_commit_files(
+        base: &Path,
+        source: &str,
+        files: &[(&str, &str)],
+        subject: &str,
+    ) -> String {
+        let clone = base.join(format!("owner-files-{}", subject.len()));
+        let clone_path = clone.to_string_lossy().to_string();
+        let _ = std::fs::remove_dir_all(&clone);
+        git(&["clone", "-q", source, &clone_path]).expect("the owner's clone");
+        for (file, text) in files {
+            let path = clone.join(file);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("directories");
+            std::fs::write(path, text).expect("write");
+        }
+        super::tests::commit_in(&clone_path, subject);
+        let commit = git(&["-C", &clone_path, "rev-parse", "HEAD"]).expect("the commit");
+        let reference = super::owner::owner_ref(&commit);
+        git(&[
+            "-C",
+            &clone_path,
+            "push",
+            "-q",
+            "origin",
+            &format!("{commit}:{reference}"),
+        ])
+        .expect("into the source, no branch");
+        commit
+    }
+
+    /// A gated owner's request, as `spawn mission push --gated` records it.
+    fn gated_request(db: &Db, source: &str, commit: &str, reason: &str) -> i64 {
+        db.store
+            .source_push_request(
+                source,
+                commit,
+                &super::owner::owner_ref(commit),
+                &spawn_postgres::PushRequest {
+                    gated: true,
+                    reason: Some(reason.to_string()),
+                    ..spawn_postgres::PushRequest::default()
+                },
+            )
+            .expect("the owner's gated request")
+    }
+
+    /// A gated owner's push (design-owner-push-between-gates.md) is a
+    /// judging of its source: requested while a task's gate runs, it starts
+    /// only after that gate, and ahead of the source's next ready task. Its
+    /// gate judges the owner's landing merge on the task's landing, with
+    /// the candidate's own scenarios and an empty protected list (D3), and
+    /// its acceptance moves main to that merge, `source.moved` naming the
+    /// verdict. The next task is judged on the new main after it.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_gated_owner_push_is_judged_after_the_running_gate_and_before_the_next_task() {
+        let marks = fresh_marks("spawn-owner-gated");
+        let release = Release(marks.clone());
+        let seen = marks.to_string_lossy().to_string();
+        let gate = gate_holding_then(
+            &marks,
+            &format!(
+                "echo \"$4\" >>'{seen}/scenarios-given'\n\
+                 cat \"$4/protected\" >>'{seen}/protected-seen'\n"
+            ),
+            "{\"verdict\":\"accepted\"}",
+            0,
+        );
+        let (base, source, scenarios, integrator) = world("owner-gated", &gate);
+        let db = Db::new("owner_gated");
+        let m0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        push_work(&base, &source, &agent, "work.txt");
+        let _ = std::fs::remove_file(marks.join("release"));
+        integrator.pass_on(&db.store).expect("a pass");
+        assert_eq!(wait_started(&marks, 1).len(), 1, "the task's gate started");
+
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[
+                ("scenarios/protected", "scenarios/\n"),
+                ("scenarios/check-contract.sh", "exit 0\n"),
+                ("CONTRACT.md", "v1\n"),
+            ],
+            "owner: the contract",
+        );
+        let request = gated_request(&db, &source, &commit, "the contract, v1");
+        let second = db.reported_task(mission, "w2");
+        let second_agent = agent_of(&db, mission, second);
+        push_work(&base, &source, &second_agent, "second.txt");
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass while the gate runs");
+        assert_eq!(
+            source_main(&source),
+            m0,
+            "nothing moves under the task's gate"
+        );
+        assert_eq!(
+            started(&marks).len(),
+            1,
+            "no other judging of the source starts"
+        );
+
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+        let landed = control_records(&db, "task.landed");
+        assert_eq!(landed.len(), 1, "{landed:?}");
+        let landing = landed[0]["to"].as_str().expect("the landing").to_string();
+
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass after the gate");
+        assert_eq!(
+            integrator
+                .running
+                .borrow()
+                .iter()
+                .map(|gate| gate.owner)
+                .collect::<Vec<_>>(),
+            vec![Some(request)],
+            "the owner's judging takes the source, not the second task's"
+        );
+        integrator.settle();
+        let judged = started(&marks);
+        assert_eq!(judged.len(), 2, "{judged:?}");
+        let moved = control_records(&db, "source.moved");
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(moved[0]["request"], json!(request));
+        assert_eq!(moved[0]["from"], landing.as_str());
+        assert_eq!(moved[0]["verdict"], "accepted");
+        let now = source_main(&source);
+        assert_eq!(moved[0]["to"], now.as_str());
+        assert_eq!(judged[1], now, "the owner's gate judged what landed");
+        assert_eq!(
+            git(&["--git-dir", &source, "rev-parse", &format!("{now}^1")]).expect("first parent"),
+            landing,
+            "the owner's landing merge is on the task's landing"
+        );
+        assert_eq!(
+            git(&["--git-dir", &source, "rev-parse", &format!("{now}^2")]).expect("second parent"),
+            commit
+        );
+        let given = std::fs::read_to_string(marks.join("scenarios-given")).expect("given");
+        let given: Vec<&str> = given.lines().collect();
+        assert_eq!(given.len(), 2, "{given:?}");
+        assert_ne!(
+            given[1],
+            scenarios.to_string_lossy(),
+            "the candidate's own scenarios"
+        );
+        assert!(Path::new(given[1]).ends_with("scenarios"), "{given:?}");
+        assert_eq!(
+            std::fs::read_to_string(marks.join("protected-seen")).expect("protected"),
+            "",
+            "the copy's protected list is empty"
+        );
+        assert!(
+            !Path::new(given[1]).exists(),
+            "the candidate's tree is removed after its gate"
+        );
+        assert!(verdicts(&db, second).is_empty(), "the second task waited");
+
+        integrator.pass_on(&db.store).expect("the next pass");
+        integrator.settle();
+        assert_eq!(verdicts(&db, second), vec!["accepted"]);
+        assert_eq!(started(&marks)[2].len(), 40);
+        assert_eq!(
+            git(&[
+                "--git-dir",
+                &source,
+                "rev-parse",
+                &format!("{}^1", source_main(&source))
+            ])
+            .expect("first parent"),
+            now,
+            "the second task landed on the owner's landing"
+        );
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
+    }
+
+    /// A gated owner's push its gate rejects records `source.push_refused`
+    /// with the verdict and the gate's log, and moves nothing; no mission
+    /// counts it.
+    #[test]
+    fn a_rejected_owner_judging_is_refused_and_moves_nothing() {
+        let gate = "echo '| == regression: 046.sh must still pass'\n\
+                    printf '{\"verdict\":\"rejected\",\"reason\":\"regression: 046.sh fails on the candidate\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+                    echo '{\"verdict\":\"rejected\",\"reason\":\"regression: 046.sh fails on the candidate\"}'\n";
+        let (base, source, scenarios, integrator) = world("owner-rejected", gate);
+        let db = Db::new("owner_rejected");
+        let m0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let before = gated(&db, mission);
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("BROKEN.md", "x\n")],
+            "owner: breaks 046",
+        );
+        let request = gated_request(&db, &source, &commit, "a change");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        assert_eq!(source_main(&source), m0, "nothing moves");
+        assert!(control_records(&db, "source.moved").is_empty());
+        let refused = control_records(&db, "source.push_refused");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["request"], json!(request));
+        assert_eq!(refused[0]["verdict"], "rejected");
+        assert_eq!(
+            refused[0]["reason"],
+            "the owner's gate rejected it: regression: 046.sh fails on the candidate"
+        );
+        assert!(
+            refused[0]["log"]
+                .as_str()
+                .is_some_and(|log| log.contains("046.sh must still pass")),
+            "{}",
+            refused[0]
+        );
+        let after = gated(&db, mission);
+        assert_eq!(
+            after.gate_rejections, before.gate_rejections,
+            "no mission counts it"
+        );
+        assert_eq!(after.gate_aborts, before.gate_aborts);
+        integrator.pass_on(&db.store).expect("the next pass");
+        integrator.settle();
+        assert_eq!(
+            control_records(&db, "source.push_refused").len(),
+            1,
+            "judged once"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An owner judging whose gate still ends `main_red` (a gate.sh without
+    /// SPAWN_GATE_RED_UNSOLVED, which otherwise judges the red check as
+    /// unsolved on the base and goes on) gets no verdict, not a refusal
+    /// (the lead, 2026-11-10): the push neither broke nor fixed main,
+    /// nothing is recorded, nothing moves, and it is judged again after its
+    /// backoff.
+    #[test]
+    fn an_owner_judging_on_a_red_main_it_does_not_fix_is_no_verdict() {
+        let gate = "printf '%s\\n' '{\"host_fault\":true,\"scenario\":\"check-tests.sh\",\"on\":\"main\",\"runs\":\"1, then 1 on the candidate; 1, then 1 on the base\",\"reason\":\"r\",\"failures\":[{\"test\":\"api::slice_11\",\"message\":\"expected 23 to be 21\"}]}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n";
+        let (base, source, scenarios, mut integrator) = world("owner-red", gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_mins(10),
+            cap: 3,
+        };
+        let db = Db::new("owner_red");
+        let m0 = source_main(&source);
+        db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("B.md", "b\n")],
+            "owner: unrelated to the red check",
+        );
+        let request = gated_request(&db, &source, &commit, "b");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        assert_eq!(source_main(&source), m0, "nothing moves");
+        assert!(
+            control_records(&db, "source.push_refused").is_empty(),
+            "not refused for a red it did not cause"
+        );
+        assert!(control_records(&db, "source.moved").is_empty());
+        let backoff = Arc::clone(&integrator.owner.borrow().backoff);
+        assert_eq!(
+            backoff
+                .lock()
+                .expect("backoff")
+                .get(&request)
+                .map(|(faults, _)| *faults),
+            Some(1),
+            "judged again after its backoff"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An owner judging whose gate aborts (a non-zero exit with no verdict
+    /// to believe: a harness error) records nothing and is judged again
+    /// after its backoff, as the host's other failures are (the lead,
+    /// 2026-11-10, rev-b's N1): never `source.push_refused`.
+    #[test]
+    fn an_aborted_owner_gate_is_no_verdict() {
+        let (base, source, scenarios, integrator) =
+            world("owner-aborted", "echo 'half a run'\nexit 1\n");
+        let db = Db::new("owner_aborted");
+        let m0 = source_main(&source);
+        db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("C.md", "c\n")],
+            "owner: c",
+        );
+        let request = gated_request(&db, &source, &commit, "c");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        assert_eq!(source_main(&source), m0, "nothing moves");
+        assert!(
+            control_records(&db, "source.push_refused").is_empty(),
+            "an abort is no refusal"
+        );
+        assert!(control_records(&db, "source.moved").is_empty());
+        let backoff = Arc::clone(&integrator.owner.borrow().backoff);
+        assert_eq!(
+            backoff
+                .lock()
+                .expect("backoff")
+                .get(&request)
+                .map(|(faults, _)| *faults),
+            Some(1),
+            "judged again after its backoff"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An owner's gate runs with SPAWN_GATE_RED_UNSOLVED=1 (the lead,
+    /// 2026-11-10, rev-b's N2): a check main is red on is unsolved on the
+    /// base, so the push is judged on the rest (test-gate.sh 5a'), never
+    /// held or refused for a red it did not cause. A task's gate runs
+    /// without it.
+    #[test]
+    fn an_owner_gate_judges_a_red_check_as_unsolved_on_the_base_and_a_task_gate_does_not() {
+        let marks = fresh_marks("spawn-owner-red-unsolved");
+        let seen = marks.to_string_lossy().to_string();
+        let gate = format!(
+            "echo \"${{SPAWN_GATE_RED_UNSOLVED:-unset}}\" >>'{seen}/red-unsolved'\n\
+             printf '%s\\n' '{{\"verdict\":\"accepted\"}}' >\"$SPAWN_GATE_VERDICT\"\n"
+        );
+        let (base, source, scenarios, integrator) = world("owner-red-unsolved", &gate);
+        let db = Db::new("owner_red_unsolved");
+        let mission = db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("D.md", "d\n")],
+            "owner: d",
+        );
+        gated_request(&db, &source, &commit, "d");
+        integrator.pass_on(&db.store).expect("the owner's judging");
+        integrator.settle();
+        assert_eq!(control_records(&db, "source.moved").len(), 1);
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        push_work(&base, &source, &agent, "work.txt");
+        integrator.pass_on(&db.store).expect("the task's judging");
+        integrator.settle();
+        assert_eq!(verdicts(&db, task), vec!["accepted"]);
+        assert_eq!(
+            std::fs::read_to_string(marks.join("red-unsolved")).expect("seen"),
+            "1\nunset\n",
+            "the owner's gate only"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
+    }
+
+    /// A gated owner's push whose candidate has no scenarios directory
+    /// where the mission's is cannot be judged by it: refused, verdict
+    /// `no_scenarios`, the owner's to fix; nothing moves.
+    #[test]
+    fn a_gated_owner_push_without_the_scenarios_directory_is_refused() {
+        let (base, source, scenarios, integrator) = world("owner-no-scenarios", "exit 0\n");
+        let db = Db::new("owner_no_scenarios");
+        let m0 = source_main(&source);
+        db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(&base, &source, &[("E.md", "e\n")], "owner: e");
+        let request = gated_request(&db, &source, &commit, "e");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        assert_eq!(source_main(&source), m0);
+        let refused = control_records(&db, "source.push_refused");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["request"], json!(request));
+        assert_eq!(refused[0]["verdict"], "no_scenarios");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An owner judging that finds no verdict (the host's fault) records
+    /// nothing: the request stays pending, is not judged again before its
+    /// backoff, and is judged again after it.
+    #[test]
+    fn an_owner_judging_with_no_verdict_stays_pending_until_its_backoff() {
+        let gate = format!(
+            "echo \"$3\" >>\"$(dirname \"$0\")/started\"\n\
+             printf '%s\\n' '{}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n",
+            "{\"host_fault\":true,\"scenario\":\"check-tests.sh\",\"on\":\"base\",\"runs\":\"1, then 1 on the base\",\"reason\":\"r\"}"
+        );
+        let (base, source, scenarios, mut integrator) = world("owner-no-verdict", &gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_mins(10),
+            cap: 3,
+        };
+        let db = Db::new("owner_no_verdict");
+        let m0 = source_main(&source);
+        db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("A.md", "a\n")],
+            "owner: a",
+        );
+        let request = gated_request(&db, &source, &commit, "a");
+        let runs = || {
+            std::fs::read_to_string(base.join("started"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        assert_eq!(runs(), 1);
+        assert_eq!(source_main(&source), m0);
+        assert!(control_records(&db, "source.moved").is_empty());
+        assert!(control_records(&db, "source.push_refused").is_empty());
+        let backoff = Arc::clone(&integrator.owner.borrow().backoff);
+        assert_eq!(
+            backoff
+                .lock()
+                .expect("backoff")
+                .get(&request)
+                .map(|(faults, _)| *faults),
+            Some(1)
+        );
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass in its backoff");
+        integrator.settle();
+        assert_eq!(runs(), 1, "not judged again inside its backoff");
+        backoff
+            .lock()
+            .expect("backoff")
+            .insert(request, (1, std::time::Instant::now()));
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass after its backoff");
+        integrator.settle();
+        assert_eq!(runs(), 2, "judged again after it");
+        assert_eq!(
+            backoff
+                .lock()
+                .expect("backoff")
+                .get(&request)
+                .map(|(faults, _)| *faults),
+            Some(2),
+            "the backoff grows"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A red main (design-main-red.md) is a fact about the main the gate
     /// judged against: when main moved while the gate ran, no
     /// `source.main_red` is written for a main that is no longer main, and
@@ -12485,6 +13125,7 @@ mod database_tests {
             task: 0,
             shares_server: false,
             jobs: 2,
+            owner: None,
             handle: std::thread::spawn(move || {
                 let _ = waiting.recv();
             }),
@@ -13318,7 +13959,12 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
     /// The owner's request for `commit` on `source`: its event id.
     fn owner_request(db: &Db, source: &str, commit: &str) -> i64 {
         db.store
-            .source_push_request(source, commit, &super::owner::owner_ref(commit))
+            .source_push_request(
+                source,
+                commit,
+                &super::owner::owner_ref(commit),
+                &spawn_postgres::PushRequest::default(),
+            )
             .expect("the owner's request")
     }
 
@@ -13539,7 +14185,9 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         let held = super::owner::pending_by_source(&db.store).expect("pending");
         assert_eq!(held.get(&source_a), Some(&request));
         assert_eq!(held.len(), 1);
-        integrator.steps(&db.store, &held, &[]).expect("the steps");
+        integrator
+            .steps(&db.store, &held, &[], Vec::new())
+            .expect("the steps");
         assert!(halted(&db, a).is_null(), "held: {}", halted(&db, a));
         assert!(
             halted(&db, b)

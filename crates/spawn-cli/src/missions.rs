@@ -38,16 +38,22 @@ const USAGE: &str = "usage:
       each with its title, plus the counts of solved and met
   spawn mission resume --id N
   spawn mission push --source <path> --commit <commit> [--repo <dir>] [--wait <seconds>]
+                     [--gated] [--reason <text>]
       (owner: land a commit on a mission source's main. <commit> is resolved in the git
        repository of the current directory (--repo: another), or is already in the source;
        it is put in the source at refs/spawn-owner/<hash>, no branch moves, and the request
        is recorded (source.push_requested): prints {request, source, commit}. The running
        integrator applies it between its own steps (on a held source too: a hold stops task
-       landings, not the owner's), under the landing lock: main moves to
-       the commit (a fast-forward) or to a merge of it, and one source.moved naming the
-       request moves the baselines; a conflict is source.push_refused. Nothing halts, no
-       gate is stopped, and spawn-integrate is never stopped for it. --wait: wait that long
-       for the outcome and print it; exit 0 applied, 1 refused, 3 still pending)
+       landings, not the owner's), never while a gate of the source runs (it waits for
+       that gate), under the landing lock: main moves to the commit (a fast-forward) or to
+       a merge of it, and one source.moved naming the request moves the baselines; a
+       conflict is source.push_refused. Nothing halts, and spawn-integrate is never
+       stopped for it. --gated: the source's gate judges the landing first, as a judging of
+       its own taken before the source's next task, with the commit's own scenarios: moved
+       when accepted, source.push_refused (with the gate's reason and log) when rejected,
+       pending again after a host fault or no room. --reason: the owner's words, on the
+       record. --wait: wait that long for
+       the outcome and print it; exit 0 applied, 1 refused, 3 still pending)
   spawn mission moved --source <path> --from <commit> --to <commit>   (owner: a deploy moved main)
       (recorded as source.moved for every deploy, also when no mission's baseline moves;
        after it every delivery whose retries are spent, having typed nothing, is tried once more)
@@ -197,6 +203,8 @@ fn split_mission(rest: &[String]) -> Result<(&str, Flags), String> {
     };
     let switches: &[&str] = if verb == "configure" {
         &CLEARING.map(|(switch, _, _)| switch)
+    } else if verb == "push" {
+        &["gated"]
     } else {
         &[]
     };
@@ -566,9 +574,16 @@ fn push(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<i32, Str
             .display()
             .to_string(),
     };
+    let how = spawn_postgres::PushRequest {
+        gated: flags.switch("gated"),
+        urgent: false,
+        reason: flags
+            .get("reason")
+            .filter(|reason| !reason.trim().is_empty()),
+    };
     let (commit, reference) = put_in_source(&source, &repo, &wanted)?;
     let request = store
-        .source_push_request(&source, &commit, &reference)
+        .source_push_request(&source, &commit, &reference, &how)
         .map_err(|error| error.to_string())?;
     let mut answer = json!({ "request": request, "source": source, "commit": commit });
     let Some(seconds) = wait else {
