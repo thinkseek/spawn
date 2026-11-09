@@ -8,11 +8,14 @@
 # immutable inputs (milestone M2, /var/tmp/spawn/sync/design-code-state-v2.md
 # and design-trusted-change-integration.md). Objective 035 (every verdict
 # binds its `inputs` and `env`) is a prerequisite: this scenario reads the
-# primary's `inputs` from its `task.gated`. The dispatcher is the
-# controller's own deploy/gate-runner.sh, as it is once the runner-env
-# change is in the controller tree; this scenario copies it, with
-# deploy/gate-runner/, into its controller tree and installs a fake runner
-# with its setup.sh, as deploy/test-gate-runner.sh does.
+# primary's `inputs` from its `task.gated`. In production the integrator
+# runs the controller's deploy/gate-runner.sh, outside any sandbox. Here the
+# dispatcher comes from the tree under judgement (the scenario's working
+# directory; the gate's sandbox does not show the controller's deploy/, and
+# deploy/ is protected, so it is the base's), as it is once the runner-env
+# change has landed; the scenario copies it, with deploy/gate-runner/, into
+# its own controller tree and installs a fake runner with its setup.sh, as
+# deploy/test-gate-runner.sh does. A tree without it is exit 2.
 #
 # Required: with SPAWN_GATE_SHADOW_RUNNER set (the runner's name for the
 # transport) and deploy/gate-runner.sh present in the controller (the
@@ -91,9 +94,14 @@ harness() {
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-# The dispatcher as the controller ships it (the runner-env change).
+# The dispatcher, from the tree under judgement (the gate runs every
+# scenario in it): the gate's sandbox binds only scripts/ (and
+# web/node_modules) of a controller under $HOME, so the controller's deploy/
+# is not visible here. deploy/ is a protected path, so the tree's equals its
+# base's: the dispatcher as the runner-env change put it there.
+tree=$(pwd)
 for file in deploy/gate-runner.sh deploy/gate-runner/remote.sh deploy/gate-runner/setup.sh; do
-    [ -f "$controller/$file" ] || harness "no $controller/$file: this controller has no gate runner to shadow on"
+    [ -f "$tree/$file" ] || harness "no $file in the tree under judgement ($tree): no gate runner to shadow on (the runner-env change is not in it)"
 done
 pg_bin=$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -n 1)
 [ -n "$pg_bin" ] && [ -x "$pg_bin/postgres" ] ||
@@ -234,8 +242,8 @@ printf '%s\n' "$controller_commit" >"$ctl/.controller"
 printf '#!/bin/sh\nexit 0\n' >"$gate/check-ok.sh"
 printf '# nothing protected\n' >"$gate/protected"
 printf 'a file in a subdirectory: part of the set\n' >"$gate/sub/notes"
-cp "$controller/deploy/gate-runner.sh" "$ctl/deploy/gate-runner.sh"
-cp "$controller/deploy/gate-runner/remote.sh" "$controller/deploy/gate-runner/setup.sh" "$ctl/deploy/gate-runner/"
+cp "$tree/deploy/gate-runner.sh" "$ctl/deploy/gate-runner.sh"
+cp "$tree/deploy/gate-runner/remote.sh" "$tree/deploy/gate-runner/setup.sh" "$ctl/deploy/gate-runner/"
 : >"$WORK/judged.log"
 : >"$WORK/runner.log"
 : >"$WORK/ssh.log"
