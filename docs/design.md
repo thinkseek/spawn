@@ -66,7 +66,7 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | `notice.typed` | 无；保留它以读取日志里已有的行（主线不再合入运行中的工作区） | through |
 | `notice.received` | 无；保留它以读取日志里已有的行 | 无 |
 | `notification.received` | 无；保留它以读取日志里已有的行 | notification_type |
-| `tool.started` | 会话记录 | tool_name、tool_use_id、summary（可选：调用的关键输入，如命令首行、文件路径、模式；凭证已脱敏，至多 160 字符） |
+| `tool.started` | 会话记录 | tool_name、tool_use_id、summary（可选：调用的关键输入，如命令首行、文件路径、模式，WebFetch 只记主机；凭证已脱敏，至多 160 字符）、summary_whole（可选，默认 false：summary 即调用的全部输入，未被脱敏或截断，界面只折叠这样的重复调用） |
 | `tool.completed` | 会话记录 | tool_use_id、duration_ms |
 | `tool.failed` | 会话记录 | tool_use_id、error |
 | `turn.stopped` | 会话记录（`turn_duration`、中断） | input_tokens、output_tokens |
@@ -90,7 +90,7 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 
 去重：`(session_id, source, source_event_id)` 唯一。Bridge 重读同一会话记录行返回既有记录，`inserted = false`。
 
-脱敏：日志保存的自由文本（`tool.failed`、`turn.failed`、`execution.end_stalled`、`command.finished` 的 error，`screen.observed` 的 evidence，`observation.recorded` 里 observation 的 human_question、attention_reason 与 evidence 中的字符串）在追加前经 `spawn_core::redact::redact_event` 处理：`sk-…`、`ghp_…`（及 GitHub 其他 `gh?_` token）、`github_pat_…`、`AKIA…` 形状的密钥，`Bearer <token>` 的 token，`x-api-key` 头的值，URL userinfo 里的密码（`scheme://user:[redacted]@`），以及名字以 `PASSWORD`、`PASSWD`、`TOKEN`、`SECRET`、`KEY` 结尾（不分大小写）的赋值的值，都换成 `[redacted]`。两个存储（PostgreSQL 与内存实现）都在 `append` 与 `finish` 里做，任何写入方都绕不过去；标识符、路径和 `control.recorded`（任务源 URL、提示词会被折叠读回）不动。
+脱敏：日志保存的自由文本（`tool.failed`、`turn.failed`、`execution.end_stalled`、`command.finished` 的 error，`screen.observed` 的 evidence，`tool.started` 的 summary，`observation.recorded` 里 observation 的 human_question、attention_reason 与 evidence 中的字符串）在追加前经 `spawn_core::redact::redact_event` 处理：`sk-…`、`ghp_…`（及 GitHub 其他 `gh?_` token）、`github_pat_…`、`AKIA…` 形状的密钥，`Bearer <token>` 的 token，凭证类请求头的值（`Authorization:`、`Proxy-Authorization:` 不论 scheme，`Basic`、`token` 等 scheme 词保留；`Cookie:`；名字以 `-token`、`-key`、`-secret`、`-password` 结尾的头，如 `x-api-key`、`PRIVATE-TOKEN`、`X-Auth-Token`），URL userinfo 里的密码（`scheme://user:[redacted]@`，密码可含 `@` 或 `/`，取查询串之前最后一个 `@`），名字以 `TOKEN`、`SECRET`、`KEY`、`AUTH`、`CREDENTIALS`、`COOKIE` 结尾或含 `PASS`（故含 `PASSWORD`、`PASSWD`）、`PWD`（不分大小写）的赋值的值与同名 JSON 键的字符串值，以及命令行的凭证参数（`-u`/`--user user:pass` 的密码、`--password v`、`sshpass -p v`、`mysql`/`mariadb` 行上的 `-pv`），都换成 `[redacted]`。脱敏改动了的 `tool.started` summary 不再算完整（`summary_whole` 置为 false）。两个存储（PostgreSQL 与内存实现）都在 `append` 与 `finish` 里做，任何写入方都绕不过去；标识符、路径和 `control.recorded`（任务源 URL、提示词会被折叠读回）不动。
 
 ## 4. 端口契约
 

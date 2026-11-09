@@ -85,6 +85,7 @@ fn events_round_trip_through_json() {
             tool_name: "Bash".to_string(),
             tool_use_id: "tool_1".to_string(),
             summary: None,
+            summary_whole: false,
         },
         EventKind::CommandAccepted {
             command_id: CommandId(7),
@@ -1141,6 +1142,7 @@ fn observer_writes_only_on_change() {
                 tool_name: "Bash".to_string(),
                 tool_use_id: "t1".to_string(),
                 summary: None,
+                summary_whole: false,
             },
         })
         .expect("append succeeds");

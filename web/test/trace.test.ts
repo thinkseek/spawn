@@ -384,6 +384,18 @@ test("a tool row reads as the tool and its key input; a call recorded without on
   assert.equal(shortSummary("Bash", "cd /data/tmp/ccd/wt && cargo test -p spawn-cli"), "cargo test -p spawn-cli");
   assert.equal(shortSummary("Bash", 'cd "/a b"; git status'), "git status");
   assert.equal(shortSummary("Bash", "cd /data/tmp"), "cd /data/tmp", "a bare cd is the command");
+  assert.equal(
+    shortSummary("Bash", "B=/home/ckl/.local/share/spawn-rsi/bin/spawn; $B tail --session x"),
+    "spawn tail --session x",
+    "a variable naming a program reads as the program",
+  );
+  assert.equal(shortSummary("Bash", "RUST_LOG=debug cargo run"), "cargo run");
+  assert.equal(
+    shortSummary("Bash", "U=$(grep ^X= ../../a.env | cut -d= -f2-); cargo build && echo $U"),
+    "cargo build && echo $U",
+  );
+  assert.equal(shortSummary("Bash", "cd /w && FOO='a b' ./run"), "./run");
+  assert.equal(shortSummary("Bash", "X=1"), "X=1", "an assignment alone is the command");
 });
 
 test("a failed tool's outcome is `exit N` or its error's first line", () => {
@@ -397,7 +409,7 @@ test("a failed tool's outcome is `exit N` or its error's first line", () => {
 test("consecutive identical calls fold into one row; different inputs, no input, a failure or an open call do not", () => {
   const call = (id: string, at: number, summary?: string, end = "tool.completed", detail: object = {}) =>
     [
-      ["tool.started", at, { tool_name: "Bash", tool_use_id: id, ...(summary ? { summary } : {}) }],
+      ["tool.started", at, { tool_name: "Bash", tool_use_id: id, ...(summary ? { summary, summary_whole: true } : {}) }],
       [end, at + 0.5, { tool_use_id: id, ...detail }],
     ] as Array<[string, number, unknown]>;
   const trace = deriveTrace(
@@ -442,9 +454,9 @@ test("consecutive identical calls fold into one row; different inputs, no input,
   assert.deepEqual(
     opened.slice(2, 5).map((row) => [row.span.startEvent?.detail, row.run.length, row.unfolded]),
     [
-      [{ tool_name: "Bash", tool_use_id: "a", summary: "git status" }, 3, true],
-      [{ tool_name: "Bash", tool_use_id: "b", summary: "git status" }, 1, false],
-      [{ tool_name: "Bash", tool_use_id: "c", summary: "git status" }, 1, false],
+      [{ tool_name: "Bash", tool_use_id: "a", summary: "git status", summary_whole: true }, 3, true],
+      [{ tool_name: "Bash", tool_use_id: "b", summary: "git status", summary_whole: true }, 1, false],
+      [{ tool_name: "Bash", tool_use_id: "c", summary: "git status", summary_whole: true }, 1, false],
     ],
   );
 });
@@ -457,9 +469,9 @@ test("the agent page's tool rows: the newest calls across turns, folded, oldest 
     ["tool.completed", 3, { tool_use_id: "a" }],
     ["turn.stopped", 4],
     ["message.received", 5],
-    ["tool.started", 6, { tool_name: "Bash", tool_use_id: "b", summary: "git status" }],
+    ["tool.started", 6, { tool_name: "Bash", tool_use_id: "b", summary: "git status", summary_whole: true }],
     ["tool.completed", 7, { tool_use_id: "b" }],
-    ["tool.started", 8, { tool_name: "Bash", tool_use_id: "c", summary: "git status" }],
+    ["tool.started", 8, { tool_name: "Bash", tool_use_id: "c", summary: "git status", summary_whole: true }],
     ["tool.completed", 9, { tool_use_id: "c" }],
     ["tool.started", 10, { tool_name: "Edit", tool_use_id: "d", summary: "b.rs" }],
   ]);
@@ -472,4 +484,32 @@ test("the agent page's tool rows: the newest calls across turns, folded, oldest 
     ],
   );
   assert.equal(recentToolRows(events, T0 + 20_000).length, 3);
+});
+
+test("calls whose summary leaves input out never fold: two Edits of one file, two heredocs with one first line", () => {
+  const trace = deriveTrace(
+    timeline([
+      ["execution.started", 0, { engine: "claude" }],
+      ["message.received", 1],
+      ["tool.started", 2, { tool_name: "Edit", tool_use_id: "a", summary: "crates/x.rs" }],
+      ["tool.completed", 3, { tool_use_id: "a" }],
+      ["tool.started", 4, { tool_name: "Edit", tool_use_id: "b", summary: "crates/x.rs" }],
+      ["tool.completed", 5, { tool_use_id: "b" }],
+      ["tool.started", 6, { tool_name: "Bash", tool_use_id: "c", summary: "python3 - <<'EOF' …" }],
+      ["tool.completed", 7, { tool_use_id: "c" }],
+      ["tool.started", 8, { tool_name: "Bash", tool_use_id: "d", summary: "python3 - <<'EOF' …" }],
+      ["tool.completed", 9, { tool_use_id: "d" }],
+      // Whole on one side only: still two calls.
+      ["tool.started", 10, { tool_name: "Bash", tool_use_id: "e", summary: "ls", summary_whole: true }],
+      ["tool.completed", 11, { tool_use_id: "e" }],
+      ["tool.started", 12, { tool_name: "Bash", tool_use_id: "f", summary: "ls" }],
+      ["tool.completed", 13, { tool_use_id: "f" }],
+    ]),
+    T0 + 20_000,
+  );
+  const rows = foldRuns(visibleSpans(trace, new Set()), new Set());
+  assert.deepEqual(
+    rows.filter((row) => row.span.kind === "tool").map((row) => row.run.length),
+    [1, 1, 1, 1, 1, 1],
+  );
 });

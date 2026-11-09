@@ -123,6 +123,7 @@ fn the_board_dates_the_current_state_from_its_first_judgement_and_names_the_open
                 tool_name: "Bash".to_string(),
                 tool_use_id: "a".to_string(),
                 summary: Some("cargo test -p spawn-cli".to_string()),
+                summary_whole: false,
             },
         ),
         (
@@ -131,6 +132,7 @@ fn the_board_dates_the_current_state_from_its_first_judgement_and_names_the_open
                 tool_name: "Read".to_string(),
                 tool_use_id: "b".to_string(),
                 summary: None,
+                summary_whole: false,
             },
         ),
         (

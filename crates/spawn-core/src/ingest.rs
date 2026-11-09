@@ -133,14 +133,60 @@ fn input_text<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
 /// A tool call's key input in a few words, read from its `input` by tool:
 /// Bash's command (its first line), the path an Edit, Write or Read works
 /// on (a Read with its line range), a Grep's pattern and where, a Glob's
-/// pattern, a Task's description, a fetched URL's host and path, a
-/// search's words, a todo list's length. None for any other tool or an
-/// input without the field. Credentials are redacted before the text is
-/// cut ([`crate::redact::redact`]: a cut first could leave half a token
-/// the redactor no longer knows), and the event's redaction runs again
-/// when it is stored.
+/// pattern, a Task's description, a fetched URL's host (never its path,
+/// which can be a token: a bot's, a webhook's), a search's words, a todo
+/// list's length. None for any other tool or an input without the field.
+/// Credentials are redacted before the text is cut
+/// ([`crate::redact::redact`]: a cut first could leave half a token the
+/// redactor no longer knows), and the event's redaction runs again when it
+/// is stored.
 pub fn tool_summary(tool: &str, input: Option<&Value>) -> Option<String> {
-    let input = input?;
+    let text = summary_text(tool, input?)?;
+    Some(summary_cut(&crate::redact::redact(&text)))
+}
+
+/// The input fields a tool's summary says in full: a call whose input has
+/// no other field is all in its summary. Bash's `description` and
+/// `timeout` do not change what runs.
+fn whole_fields(tool: &str, input: &Value) -> bool {
+    let allowed: &[&str] = match tool {
+        "Bash" => &["command", "description", "timeout"],
+        "Read" => &["file_path", "offset", "limit"],
+        "Glob" => &["pattern", "path"],
+        "Grep" if input.get("path").is_some() => &["pattern", "path"],
+        "Grep" => &["pattern", "glob"],
+        "WebSearch" => &["query"],
+        _ => return false,
+    };
+    input
+        .as_object()
+        .is_some_and(|fields| fields.keys().all(|key| allowed.contains(&key.as_str())))
+}
+
+/// Is a tool call's summary its whole input? Only when the summary leaves
+/// no field out ([`whole_fields`]), a command is one line (no heredoc, no
+/// continuation), and neither the redactor nor the cut changed the text:
+/// then two calls with the same summary are the same call. Edit, Write,
+/// Task, WebFetch and TodoWrite summaries never are.
+pub fn tool_summary_whole(tool: &str, input: Option<&Value>) -> bool {
+    let Some(input) = input else { return false };
+    let Some(text) = summary_text(tool, input) else {
+        return false;
+    };
+    if !whole_fields(tool, input) {
+        return false;
+    }
+    if tool == "Bash" {
+        let command = input_text(input, "command").unwrap_or_default();
+        if command.contains('\n') || command.contains("<<") || command.ends_with('\\') {
+            return false;
+        }
+    }
+    text.chars().count() <= TOOL_SUMMARY_CHARS && crate::redact::redact(&text) == text
+}
+
+/// A tool call's summary before redaction and the cut.
+fn summary_text(tool: &str, input: &Value) -> Option<String> {
     let text = match tool {
         "Bash" => {
             let command = input_text(input, "command")?;
@@ -190,16 +236,20 @@ pub fn tool_summary(tool: &str, input: Option<&Value>) -> Option<String> {
         },
         "Task" | "Agent" => input_text(input, "description")?.to_string(),
         "WebFetch" => {
-            // Host and path: the query, the fragment and any user:password@
-            // can carry a credential, and the page is enough.
-            let url = input_text(input, "url")?;
-            let page = url.split(['?', '#']).next().unwrap_or(url);
-            let page = page.split_once("://").map_or(page, |(_, rest)| rest);
-            let host_end = page.find('/').unwrap_or(page.len());
-            match page[..host_end].rfind('@') {
-                Some(at) => page[at + 1..].to_string(),
-                None => page.to_string(),
+            // The host alone: a path, a query or a user:password@ can carry
+            // a credential (a bot's token, a webhook's secret).
+            // The redactor first, while the scheme is there: a password
+            // holding `/` or `@` then cannot pass for the host.
+            let url = crate::redact::redact(input_text(input, "url")?);
+            let url = url.as_str();
+            let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            let host = host.split(':').next().unwrap_or(host);
+            if host.is_empty() {
+                return None;
             }
+            host.to_string()
         }
         "WebSearch" => input_text(input, "query")?.to_string(),
         "TodoWrite" => {
@@ -208,7 +258,7 @@ pub fn tool_summary(tool: &str, input: Option<&Value>) -> Option<String> {
         }
         _ => return None,
     };
-    Some(summary_cut(&crate::redact::redact(&text)))
+    Some(text)
 }
 
 fn block_type(block: &Value) -> Option<&str> {
@@ -623,6 +673,7 @@ pub fn claude_line(line: &str) -> Vec<Normalized> {
                         tool_name: name.to_string(),
                         tool_use_id: id.to_string(),
                         summary: tool_summary(name, block.get("input")),
+                        summary_whole: tool_summary_whole(name, block.get("input")),
                     },
                     format!("{id}:started"),
                 ))
@@ -1213,7 +1264,7 @@ mod tests {
 
     mod tool_summaries {
         use crate::event::EventKind;
-        use crate::ingest::{TOOL_SUMMARY_CHARS, claude_line, tool_summary};
+        use crate::ingest::{TOOL_SUMMARY_CHARS, claude_line, tool_summary, tool_summary_whole};
         use serde_json::json;
 
         fn summary(tool: &str, input: &serde_json::Value) -> Option<String> {
@@ -1235,6 +1286,51 @@ mod tests {
                 ),
                 "{kinds:?}"
             );
+        }
+
+        /// A fetched URL is kept as its host alone: a path, a query or a
+        /// userinfo can carry a credential.
+        #[test]
+        fn a_fetch_keeps_its_host_only() {
+            assert_eq!(
+                summary(
+                    "WebFetch",
+                    &json!({"url": "https://docs.rs/tokio/latest?token=abc#x"})
+                )
+                .as_deref(),
+                Some("docs.rs"),
+                "the host alone: no scheme, path, query or fragment"
+            );
+            assert_eq!(
+                summary(
+                    "WebFetch",
+                    &json!({"url": "https://bot:hunter2@example.com/a@b/c"})
+                )
+                .as_deref(),
+                Some("b"),
+                "an @ in the path after a userinfo is read as the userinfo's end: a wrong host, never a password"
+            );
+            // rev-e's probe: tokens in a path, and a password holding `/`.
+            for (url, host) in [
+                (
+                    "https://api.telegram.org/bot123456:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw/getMe",
+                    "api.telegram.org",
+                ),
+                (
+                    "https://hooks.slack.com/services/T000/B000/XXXXXXXXXXXXXXXXXXXXXXXX",
+                    "hooks.slack.com",
+                ),
+                ("https://u:pa/ss@example.com/x", "example.com"),
+                ("https://u:p@ss@example.com:8443/x", "example.com"),
+                ("u:hunter2pass@example.com/x", "example.com"),
+                ("https://example.com/a@b", "example.com"),
+            ] {
+                assert_eq!(
+                    summary("WebFetch", &json!({ "url": url })).as_deref(),
+                    Some(host),
+                    "{url}"
+                );
+            }
         }
 
         #[test]
@@ -1290,24 +1386,6 @@ mod tests {
             assert_eq!(
                 summary("Task", &json!({"description": "find the retry path"})).as_deref(),
                 Some("find the retry path")
-            );
-            assert_eq!(
-                summary(
-                    "WebFetch",
-                    &json!({"url": "https://docs.rs/tokio/latest?token=abc#x"})
-                )
-                .as_deref(),
-                Some("docs.rs/tokio/latest"),
-                "the scheme, query and fragment go"
-            );
-            assert_eq!(
-                summary(
-                    "WebFetch",
-                    &json!({"url": "https://bot:hunter2@example.com/a@b/c"})
-                )
-                .as_deref(),
-                Some("example.com/a@b/c"),
-                "credentials before the host go; an @ in the path stays"
             );
             assert_eq!(
                 summary("TodoWrite", &json!({"todos": [{}, {}, {}]})).as_deref(),
@@ -1367,6 +1445,152 @@ mod tests {
             );
             assert!(cut.ends_with('…'));
             assert!(!cut.contains("sk-aaaa"), "{cut}");
+        }
+
+        /// rev-e's probe (review-ui-ia-tools.md): every row's credential is
+        /// gone from the summary a Bash call stores.
+        #[test]
+        fn a_commands_credentials_of_every_probed_shape_go() {
+            let secrets = [
+                (
+                    "curl -u alice:hunter2pass https://api.example/v1",
+                    "hunter2pass",
+                ),
+                (
+                    "curl -H 'Authorization: Basic YWxpY2U6aHVudGVyMg==' https://x",
+                    "YWxpY2U6aHVudGVyMg",
+                ),
+                (
+                    "curl -H \"Authorization: s3cr3tR4wT0k3n\" https://x",
+                    "s3cr3tR4wT0k3n",
+                ),
+                (
+                    "curl -H 'Authorization: token 0123456789abcdef0123' https://x",
+                    "0123456789abcdef0123",
+                ),
+                (
+                    "curl -H 'PRIVATE-TOKEN: glpat-AbCdEf0123456789' https://x",
+                    "AbCdEf0123456789",
+                ),
+                (
+                    "curl -H 'X-Auth-Token: abcd1234efgh5678' https://x",
+                    "abcd1234efgh5678",
+                ),
+                ("mysql --password hunter2pass -u root", "hunter2pass"),
+                ("mysql -phunter2pass -u root", "hunter2pass"),
+                ("sshpass -p hunter2pass ssh host", "hunter2pass"),
+                ("DB_PASS=hunter2pass ./run", "hunter2pass"),
+                ("PGPWD=hunter2pass ./run", "hunter2pass"),
+                ("X_TOKEN=abcdef123456 ./run", "abcdef123456"),
+                (
+                    "DATABASE_URL=postgres://spawn:hunter2pass@db/spawn ./run",
+                    "hunter2pass",
+                ),
+                ("psql postgres://spawn:hun@ter2pass@db/spawn", "ter2pass"),
+                ("psql postgres://spawn:hun/ter2pass@db/spawn", "ter2pass"),
+                (
+                    "curl -d '{\"token\": \"abcdef123456\"}' https://x",
+                    "abcdef123456",
+                ),
+                ("cat > .env <<EOF\nTOKEN=abcdef123456\nEOF", "abcdef123456"),
+                (
+                    "curl -H \"Authorization: Bearer \\\n  abcdef0123456789abcdef\" https://x",
+                    "abcdef0123456789abcdef",
+                ),
+            ];
+            for (command, secret) in secrets {
+                let stored = summary("Bash", &json!({ "command": command })).unwrap_or_default();
+                assert!(!stored.contains(secret), "{command:?} stored {stored:?}");
+                assert!(!stored.is_empty(), "{command:?}");
+            }
+        }
+
+        /// A summary is whole only when it is the call's entire input: two
+        /// calls with the same whole summary are the same call.
+        #[test]
+        fn a_summary_is_whole_only_when_it_is_the_entire_input() {
+            let whole =
+                |tool: &str, input: serde_json::Value| tool_summary_whole(tool, Some(&input));
+            assert!(whole(
+                "Bash",
+                json!({"command": "git status", "description": "status"})
+            ));
+            assert!(whole(
+                "Read",
+                json!({"file_path": "a.rs", "offset": 10, "limit": 20})
+            ));
+            assert!(whole("Glob", json!({"pattern": "*.rs", "path": "crates"})));
+            assert!(whole(
+                "Grep",
+                json!({"pattern": "fn step", "path": "crates"})
+            ));
+            assert!(whole("WebSearch", json!({"query": "tokio select"})));
+
+            // rev-e's cases: two Edits of one file differ in what they
+            // change; two heredocs with one first line differ below it.
+            assert!(!whole(
+                "Edit",
+                json!({"file_path": "a.rs", "old_string": "x", "new_string": "y"})
+            ));
+            assert!(!whole(
+                "Write",
+                json!({"file_path": "a.rs", "content": "x"})
+            ));
+            assert!(!whole(
+                "Bash",
+                json!({"command": "python3 - <<'EOF'\nprint(1)\nEOF"})
+            ));
+            assert!(!whole("Bash", json!({"command": "cat <<EOF > a"})));
+            assert!(!whole("Bash", json!({"command": "make \\"})));
+            assert!(!whole("Bash", json!({"command": "echo a\necho b"})));
+            // A field the summary leaves out, a cut, a redaction.
+            assert!(!whole(
+                "Grep",
+                json!({"pattern": "x", "path": "p", "-i": true})
+            ));
+            assert!(!whole(
+                "Grep",
+                json!({"pattern": "x", "path": "p", "glob": "*.rs"})
+            ));
+            assert!(!whole("Read", json!({"file_path": "a.rs", "pages": "1-2"})));
+            assert!(!whole(
+                "Bash",
+                json!({"command": "ls", "run_in_background": true})
+            ));
+            assert!(!whole(
+                "Bash",
+                json!({"command": format!("echo {}", "x".repeat(200))})
+            ));
+            assert!(!whole("Bash", json!({"command": "PGPASSWORD=a psql"})));
+            assert!(!whole(
+                "Task",
+                json!({"description": "find it", "prompt": "p"})
+            ));
+            assert!(!whole("WebFetch", json!({"url": "https://docs.rs"})));
+            assert!(!whole("TodoWrite", json!({"todos": []})));
+            assert!(!tool_summary_whole("Bash", None));
+        }
+
+        /// The transcript line's call carries whether its summary is whole.
+        #[test]
+        fn a_tool_call_line_says_whether_its_summary_is_whole() {
+            let line = |command: &str| {
+                let input = json!({"command": command});
+                format!(
+                    r#"{{"type":"assistant","uuid":"a1","message":{{"content":[{{"type":"tool_use","id":"toolu_1","name":"Bash","input":{input}}}],"stop_reason":"tool_use"}}}}"#
+                )
+            };
+            for (command, expected) in [("git status", true), ("git status\ngit diff", false)] {
+                let events = claude_line(&line(command));
+                let started = events
+                    .iter()
+                    .find_map(|event| match &event.kind {
+                        EventKind::ToolStarted { summary_whole, .. } => Some(*summary_whole),
+                        _ => None,
+                    })
+                    .expect("a tool.started");
+                assert_eq!(started, expected, "{command:?}");
+            }
         }
     }
 }
