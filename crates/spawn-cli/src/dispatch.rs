@@ -1749,6 +1749,39 @@ mod tests {
         );
     }
 
+    /// The gate's own test server that did not start (evidence
+    /// `test_server_never_started`) says so with the server's words and
+    /// points at the server on the host, not at bubblewrap or a scenario.
+    #[test]
+    fn a_test_server_that_never_started_is_said_with_the_servers_words() {
+        let records = [
+            serde_json::json!({"type": "task.gated", "verdict": "host_fault",
+            "id": 12, "event_id": 61, "mission": 6, "host_faults": 2, "escalate": true,
+            "evidence": "test_server_never_started", "fact": {"scenario": "test server",
+                "on": "test server", "runs": "never started", "tree": "candidate",
+                "reason": "the candidate phase's fresh test server did not start: FATAL:  \
+                           could not create shared memory segment: a host fault, not a \
+                           verdict on the candidate"},
+            "backoff_ms": 600_000, "due_ms": 1_793_930_000_000_i64}),
+        ];
+        let host = super::digest::host_fault_escalations(&records);
+        assert!(
+            host[0]
+                .line
+                .contains("the gate's own test server never started (the candidate phase's")
+                && host[0]
+                    .line
+                    .contains("could not create shared memory segment")
+                && host[0]
+                    .line
+                    .contains("that the gate's test server starts on this host")
+                && !host[0].line.contains("bubblewrap")
+                && !host[0].line.contains("that scenario's harness"),
+            "{}",
+            host[0].line
+        );
+    }
+
     #[test]
     fn two_host_faults_in_a_row_reach_an_idle_supervisor_once() {
         let crash = "2026-11-06 01:46:58.017 UTC [1] LOG:  server process (PID 4242) was \

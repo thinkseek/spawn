@@ -188,10 +188,8 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                          gives no cause)"
                     ),
                 }
-            } else if record["evidence"] == crate::gate::SANDBOX_NEVER_STARTED {
-                let scenario = fact["scenario"].as_str().unwrap_or("a scenario");
-                let said = one_line(fact["reason"].as_str().unwrap_or_default(), 300);
-                format!("the gate's sandbox never started {scenario} ({said})")
+            } else if let Some(said) = never_started(&record["evidence"], fact) {
+                said
             } else if record["evidence"] == "gate" {
                 let scenario = fact["scenario"].as_str().unwrap_or("a scenario");
                 let runs = one_line(fact["runs"].as_str().unwrap_or_default(), 200);
@@ -253,6 +251,24 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
         .collect()
 }
 
+/// What a gate host fault that never started something says: its sandbox
+/// (`sandbox_never_started`) or the gate's own test server
+/// (`test_server_never_started`), with the gate's reason; `None` for
+/// another evidence.
+fn never_started(evidence: &Value, fact: &Value) -> Option<String> {
+    let said = one_line(fact["reason"].as_str().unwrap_or_default(), 300);
+    if evidence == crate::gate::SANDBOX_NEVER_STARTED {
+        let scenario = fact["scenario"].as_str().unwrap_or("a scenario");
+        Some(format!(
+            "the gate's sandbox never started {scenario} ({said})"
+        ))
+    } else if evidence == crate::gate::TEST_SERVER_NEVER_STARTED {
+        Some(format!("the gate's own test server never started ({said})"))
+    } else {
+        None
+    }
+}
+
 /// What a gate host fault's item asks the supervisor to do, by its
 /// evidence.
 fn host_fault_check(evidence: &Value) -> &'static str {
@@ -265,6 +281,9 @@ fn host_fault_check(evidence: &Value) -> &'static str {
     } else if evidence == crate::gate::SANDBOX_NEVER_STARTED {
         "Check that bubblewrap starts on this host (user namespaces, the paths it binds and \
          masks) or tell the owner."
+    } else if evidence == crate::gate::TEST_SERVER_NEVER_STARTED {
+        "Check that the gate's test server starts on this host (its memory, disk, \
+         SPAWN_GATE_PG_BIN or image, the server's FATAL line in the record) or tell the owner."
     } else if evidence == "gate" {
         "Check the host's load and that scenario's harness (its log in the gate output), or \
          tell the owner."

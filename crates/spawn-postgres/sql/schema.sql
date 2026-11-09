@@ -3091,12 +3091,16 @@ begin
     -- where); a sandbox that never started its command
     -- (`sandbox_never_started`: on `sandbox`, runs `never started`, what was
     -- to run, which may hold spaces, and the tree: `candidate`, `base` or
-    -- `gate`); and its backoff.
+    -- `gate`); the gate's own test server that did not start
+    -- (`test_server_never_started`: on `test server`, runs `never started`,
+    -- scenario `test server`, and which start as its tree: `gate` or
+    -- `candidate`); and its backoff.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
        and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log',
                                                           'base_disagrees', 'gate',
                                                           'cannot_judge',
-                                                          'sandbox_never_started', 'main_red')
+                                                          'sandbox_never_started', 'main_red',
+                                                          'test_server_never_started')
             or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
             or (p_record ->> 'evidence' in ('failures', 'server_log')
                 and (case when jsonb_typeof(p_record -> 'failures') = 'array'
@@ -3127,6 +3131,11 @@ begin
                      or p_record -> 'fact' ->> 'runs' is distinct from 'never started'
                      or coalesce(p_record -> 'fact' ->> 'tree', '') not in
                         ('candidate', 'base', 'gate')))
+            or (p_record ->> 'evidence' = 'test_server_never_started'
+                and (p_record -> 'fact' ->> 'scenario' is distinct from 'test server'
+                     or p_record -> 'fact' ->> 'on' is distinct from 'test server'
+                     or p_record -> 'fact' ->> 'runs' is distinct from 'never started'
+                     or coalesce(p_record -> 'fact' ->> 'tree', '') not in ('gate', 'candidate')))
             or (p_record ->> 'evidence' = 'main_red'
                 and (coalesce(p_record -> 'fact' ->> 'scenario', '') !~ '^check-[^/[:space:]]+\.sh$'
                      or p_record -> 'fact' ->> 'on' is distinct from 'main'
