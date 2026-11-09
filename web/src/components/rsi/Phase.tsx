@@ -13,21 +13,21 @@ export interface PhaseStyle {
 }
 
 const INFO: Omit<PhaseStyle, "pulse"> = {
-  badge: "bg-info/12 text-info ring-info/25",
+  badge: "bg-info-tint text-info ring-info/25",
   dot: "bg-info",
   bar: "bg-info",
   text: "text-info",
 };
 
 const WARNING: Omit<PhaseStyle, "pulse"> = {
-  badge: "bg-warning/12 text-warning ring-warning/25",
+  badge: "bg-wait-tint text-warning ring-warning/25",
   dot: "bg-warning",
   bar: "bg-warning",
   text: "text-warning",
 };
 
 const SUCCESS: PhaseStyle = {
-  badge: "bg-success/12 text-success ring-success/25",
+  badge: "bg-ok-tint text-success ring-success/25",
   dot: "bg-success",
   bar: "bg-success",
   text: "text-success",
@@ -35,7 +35,7 @@ const SUCCESS: PhaseStyle = {
 };
 
 const DESTRUCTIVE: PhaseStyle = {
-  badge: "bg-destructive/12 text-destructive ring-destructive/25",
+  badge: "bg-fail-tint text-destructive ring-destructive/25",
   dot: "bg-destructive",
   bar: "bg-destructive",
   text: "text-destructive",

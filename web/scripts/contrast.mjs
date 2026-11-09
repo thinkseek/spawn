@@ -60,6 +60,10 @@ const PAIRS = [
   ["primary-foreground", "primary", 4.5, "primary button label"],
   ["tooltip-foreground", "tooltip", 4.5, "tooltip text"],
   ["terminal-foreground", "terminal", 4.5, "terminal text"],
+  ["muted-foreground", "fail-tint", 4.5, "open-alerts band: alert text"],
+  ["faint-foreground", "fail-tint", 4.5, "open-alerts band: alert age"],
+  ["muted-foreground", "wait-tint", 4.5, "secondary text on an attention tint"],
+  ["faint-foreground", "inset", 4.5, "metadata in an inset (bg-muted)"],
 ];
 
 function oklchToSrgb(L, C, H) {
