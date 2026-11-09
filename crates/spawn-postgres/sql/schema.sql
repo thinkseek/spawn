@@ -3455,12 +3455,14 @@ create index if not exists spawn_events_objective_solved
 --   warning threshold (`low`) or came back (`recovered`). One record per
 --   crossing; the loop reads the latest per path back from the log after a
 --   restart.
--- - `host.judge`: the model judge (`judge`, its name) failed a call after
---   its last answer (`down`, with the call's `error`) or answered after
---   failing (`up`, with `failed_calls` since the `down`). One record per
---   crossing; the judge's watcher reads the latest per judge back after a
---   restart, and the alert step fires `judge_down` on a `down` with no `up`
---   after it for SPAWN_ALERT_JUDGE_DOWN_SECS.
+-- - `host.judge`: the model judge (`judge`, its name) failed two calls in
+--   a row after its last answer (`down`, with the latest call's `error` and
+--   `first_failed_ms`, when the first failed) or answered after that (`up`,
+--   with `failed_calls`, the failures its watcher counted since the `down`,
+--   or since the watcher's restart if it restarted while down). One record
+--   per crossing; the judge's watcher reads the latest per judge back after
+--   a restart, and the alert step fires `judge_down` on a `down` with no
+--   `up` after it SPAWN_ALERT_JUDGE_DOWN_SECS after its first failure.
 -- - `host.loop_started`: one `spawn loop` started, with its `boot_id` and
 --   `started_at_ms`. A restarted loop tells an execution whose end it found
 --   from one it watched fail by the records of the loops before it.
@@ -3500,8 +3502,9 @@ begin
             raise exception 'a host.judge record names its judge and a state down or up: %', p_record;
         end if;
         if p_record ->> 'state' = 'down'
-           and jsonb_typeof(p_record -> 'error') is distinct from 'string' then
-            raise exception 'a host.judge down record says the call''s error: %', p_record;
+           and (jsonb_typeof(p_record -> 'error') is distinct from 'string'
+                or jsonb_typeof(p_record -> 'first_failed_ms') is distinct from 'number') then
+            raise exception 'a host.judge down record says the call''s error and first_failed_ms: %', p_record;
         end if;
         if p_record ->> 'state' = 'up'
            and jsonb_typeof(p_record -> 'failed_calls') is distinct from 'number' then
