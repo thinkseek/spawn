@@ -21,10 +21,10 @@ import {
 import type { PlaceSpec } from "./layout";
 import type { SceneMark } from "./useShowFeed";
 
-const INK = "#eef0f3";
-const MUTED = "#c0c6ce";
-const FAINT = "#a3aab4";
-const GUIDE = "rgba(192, 198, 206, 0.12)";
+const INK = "var(--ink)";
+const MUTED = "var(--ink-2)";
+const FAINT = "var(--ink-3)";
+const GUIDE = "color-mix(in oklch, var(--ink-2) 14%, transparent)";
 
 /** The fixed links, drawn faint so the topology reads before anything
  * moves. */
@@ -110,7 +110,7 @@ function GithubRing() {
         cy={SOURCES.y}
         r={GITHUB_RADIUS}
         fill="none"
-        stroke="rgba(149, 156, 166, 0.14)"
+        stroke="color-mix(in oklch, var(--ink-3) 16%, transparent)"
         strokeDasharray="2 6"
       />
       <text x={SOURCES.x} y={SOURCES.y - GITHUB_RADIUS - 10} textAnchor="middle" fill={FAINT} fontSize={12}>
@@ -135,7 +135,7 @@ function PlaceNode({ place }: { place: PlaceSpec }) {
           width={big ? 26 : 14}
           height={big ? 26 : 14}
           rx={big ? 5 : 3}
-          fill={big ? "#363c46" : "#2e333c"}
+          fill={big ? "var(--selected)" : "var(--hover)"}
           stroke={big ? MUTED : "none"}
           strokeOpacity={0.35}
         />
@@ -176,9 +176,10 @@ function AgentNode({ agent, stage, reduced }: { agent: StageAgent; stage: Stage;
         cx={at.x}
         cy={at.y}
         r={radius}
-        initial={false}
-        animate={{ fill: agent.running ? "#d4d8de" : "#747b86" }}
-        transition={{ duration: 0.8 }}
+        style={{
+          fill: agent.running ? "var(--ink-2)" : "var(--idle-mark)",
+          transition: "fill 0.8s",
+        }}
       />
       <text
         x={at.x}

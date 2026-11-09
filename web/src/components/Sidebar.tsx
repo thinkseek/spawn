@@ -1,4 +1,4 @@
-import { Activity, BellRing, Gauge, LayoutGrid, Orbit, Rows3, Target, Waypoints } from "lucide-react";
+import { Activity, BellRing, Gauge, LayoutGrid, Monitor, Moon, Orbit, Rows3, Sun, Target, Waypoints } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { OverviewSession, RsiSummary, SessionState } from "../api";
@@ -6,6 +6,8 @@ import type { View } from "../App";
 import type { FleetAgent } from "../fleet";
 import { sessionState } from "../fleet";
 import { rsiPhase, sessionTaskLabel } from "../missions";
+import type { ThemeChoice } from "../theme";
+import { THEME_CHOICES, THEME_KEY, useTheme } from "../theme";
 import type { FleetContext } from "../ordering";
 import { AGENT_GROUP_LABEL, groupAgents, heldTask } from "../ordering";
 import { phaseStyle } from "./rsi/Phase";
@@ -47,7 +49,7 @@ interface SidebarProps {
 function Brand() {
   return (
     <div className="flex items-center gap-2.5">
-      <span className="grid size-7 place-items-center rounded-md border border-border-strong bg-gradient-to-b from-white/[0.10] to-white/[0.02] text-foreground">
+      <span className="grid size-7 place-items-center rounded-md border border-border-strong bg-surface text-foreground">
         <Orbit size={15} strokeWidth={2} />
       </span>
       <span className="text-body font-semibold tracking-tight text-foreground">
@@ -198,6 +200,7 @@ export function Sidebar({
         />
         <span className="truncate font-mono">{window.location.host}</span>
         <span className="ml-auto">{error ? "offline" : "online"}</span>
+        <ThemeSwitch />
       </div>
     </aside>
   );
@@ -476,5 +479,39 @@ export function MobileNav({
         ))}
       </div>
     </div>
+  );
+}
+
+const THEME_ICON = { system: Monitor, light: Sun, dark: Moon } as const;
+
+/** The page's theme: the system's, light or dark (src/theme.ts). */
+function ThemeSwitch() {
+  const [choice, choose] = useStoredChoice<ThemeChoice>(THEME_KEY, THEME_CHOICES, "system");
+  useTheme(choice);
+  return (
+    <span role="radiogroup" aria-label="Theme" className="flex items-center gap-px rounded-md p-px ring-1 ring-surface-border">
+      {THEME_CHOICES.map((option) => {
+        const Icon = THEME_ICON[option];
+        return (
+          <button
+            key={option}
+            type="button"
+            role="radio"
+            aria-checked={choice === option}
+            title={`Theme: ${option}`}
+            onClick={() => choose(option)}
+            className={cx(
+              "grid size-5 place-items-center rounded-[5px]",
+              FOCUS_RING_INSET,
+              choice === option
+                ? "bg-surface-selected text-foreground"
+                : "text-faint-foreground hover:text-muted-foreground",
+            )}
+          >
+            <Icon size={12} strokeWidth={2} />
+          </button>
+        );
+      })}
+    </span>
   );
 }

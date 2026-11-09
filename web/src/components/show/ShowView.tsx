@@ -162,7 +162,7 @@ function Segment<T extends string | number>({
           onClick={() => onChange(option)}
           className={cx(
             "rounded px-1.5 py-0.5 text-micro transition-colors",
-            option === value ? "bg-white/[0.07] text-foreground" : "text-faint-foreground hover:text-muted-foreground",
+            option === value ? "bg-foreground/[0.07] text-foreground" : "text-faint-foreground hover:text-muted-foreground",
           )}
         >
           {label(option)}
@@ -221,7 +221,7 @@ function TimeControl({
         )}
       </div>
       {mode === "replay" && (
-        <div className="h-px w-56 bg-white/[0.06]">
+        <div className="h-px w-56 bg-foreground/[0.06]">
           <motion.div className="h-px origin-left bg-muted-foreground/60" style={{ scaleX: progress }} />
         </div>
       )}
