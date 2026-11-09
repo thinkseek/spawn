@@ -248,7 +248,7 @@ function ObjectiveCard({ mission }: { mission: RsiMission }) {
             />
           </div>
           <div className="mt-auto pt-4">
-            <div className="relative h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
+            <div className="relative h-1.5 overflow-hidden rounded-full bg-foreground/[0.06]">
               {progress === null ? (
                 <div className="bg-hatch absolute inset-0" />
               ) : (
@@ -402,7 +402,7 @@ function TaskCard({
                       ? "bg-foreground/35"
                       : index === current
                         ? style?.bar
-                        : "bg-white/[0.07]",
+                        : "bg-foreground/[0.07]",
                   )}
                 />
               ))}
@@ -517,7 +517,7 @@ function Guard({
             key={index}
             className={cx(
               "h-3 w-1.5 rounded-sm",
-              index < value ? tone : "bg-white/[0.08]",
+              index < value ? tone : "bg-foreground/[0.08]",
             )}
           />
         ))}
