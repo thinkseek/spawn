@@ -618,6 +618,9 @@ supervisor's login may read it; only the owner writes it).
 
 ## Not built
 
+- **Cross-host Session recovery**: [the recovery proposal](session-recovery.md)
+  defines the required off-host state, consistency boundary, and timed restore
+  drill.
 - **Files over the cap**: they stay in the workspace only; nothing keeps
   them past an unmount.
 - **Streams as segments**: transcripts and gate logs as compressed segments
