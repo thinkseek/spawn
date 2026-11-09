@@ -561,6 +561,21 @@ expect "a runner under the memory floor is refused: exit 3" "$status" 3
 contains "and says by how much" "$scratch/dispatch.err" "under the floor of 99999999 MiB"
 nothing_ran "nothing was run on it"
 
+# 8p. A read-only scenario directory (a deployed controller is read-only):
+# the dispatch judges, and nothing is left behind here or on the runner.
+roscen=$scratch/scen-readonly
+cp -R "$scen" "$roscen"
+chmod -R a-w "$roscen"
+reset "$out"
+dispatch "$runner_home" "$repo_git" "$base" "$candidate" "$roscen" "$out"
+expect "a read-only scenario directory judges: the gate's 0" "$status" 0
+job=$(job_of "$out")
+attempt=$(jq -r '.attempts[-1].id' "$job/record.json")
+[ -n "$attempt" ] && [ ! -e "$runner_home/jobs/$attempt" ] && pass "and the runner's job is removed" ||
+    fail "the runner kept its job $attempt"
+lacks "and nothing failed to be removed here" "$scratch/dispatch.err" "cannot remove"
+chmod -R u+w "$roscen"
+
 # 8o. A root too long for the gate's sockets puts the job's scratch in the
 # short directory, on the disk, never in /tmp (a tmpfs on OrbStack machines:
 # a gate's builds there are memory, and nested integrators find no room).
