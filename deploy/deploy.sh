@@ -54,7 +54,8 @@
 #      code, not the owner's. Binary and UI are staged in $live (spawn.staged,
 #      web.staged), not installed; the export and anything still staged are
 #      removed on every exit;
-#   6. the integrator is stopped, main is read again (it must still be the
+#   6. the integrator is drained, then stopped (below, "Draining"), main is
+#      read again (it must still be the
 #      verdict's base), the staged binary migrates the schema, and only then
 #      binary and UI are installed: the replaced copies become spawn.prev and
 #      web.prev, unless the live copy already is this build (a deploy run
@@ -92,6 +93,25 @@
 # the deploy that holds the lock. A hold left by a deploy killed outright
 # expires on its own (SPAWN_SOURCE_HOLD_SECS, 3 h by default).
 #
+# Draining. Stopping the integrator used to kill every gate it ran, which
+# then started again from nothing (24 gates, 9.7 gate-hours in the 72 h to
+# 2026-11-09 19:00, every one of them a deploy's restart). When the installed
+# binary can drain (objective 037: its `spawn integrate` usage names
+# --drain; read from the binary, nothing is run to ask), and the integrator
+# is running, the deploy runs `spawn integrate --drain` first: the
+# integrator starts no gate, lets the running ones record their verdicts and
+# exits 0. The deploy waits at most SPAWN_DEPLOY_DRAIN_SECS (default 3600,
+# a whole number from 1 to 86400, refused before anything else otherwise),
+# then stops the unit at once either way: it restarts an integrator that
+# exited after RestartSec (10 s), and a stop in that wait cancels it. A
+# drain past the bound stops the gates still running, as a stop always did,
+# and is said, not a failure; a binary that cannot drain, or a drain that
+# fails, gets the plain stop, and the deploy says what it costs. Hold the
+# missions repo first (deploy/hold.sh, as for the owner gate): a Spawn task
+# landing during the drain moves main, and the deploy then stops (step 6).
+# Every other source's gates drain too; while draining, no new gate starts
+# anywhere, so the bound is also how long the fleet's queue waits.
+#
 # Rolling back. spawn.prev is the previous binary. Once the deployed binary
 # has written an event kind the previous one does not know (EventKind is a
 # closed enum: docs/upgrading.md, "Version-coupled boundaries"), the previous
@@ -106,6 +126,7 @@ missions=$live/missions/spawn.git
 pending=$live/deploy.pending
 target=${SPAWN_DEPLOY_TARGET:-${XDG_CACHE_HOME:-$HOME/.cache}/spawn/deploy-target}
 min_free_gb=${SPAWN_DEPLOY_MIN_FREE_GB:-10}
+drain_secs=${SPAWN_DEPLOY_DRAIN_SECS:-3600}
 repo=$(git rev-parse --show-toplevel)
 cd "$repo"
 # shellcheck source=deploy/backup/lib.sh
@@ -114,6 +135,10 @@ cd "$repo"
 . "$repo/scripts/sandbox.sh"
 
 say() { printf 'deploy: %s\n' "$*"; }
+
+# The drain's bound (header, "Draining"), checked before anything is done.
+[[ $drain_secs =~ ^[1-9][0-9]*$ ]] && [ "${#drain_secs}" -le 5 ] && [ "$drain_secs" -le 86400 ] ||
+  die "SPAWN_DEPLOY_DRAIN_SECS must be a whole number of seconds from 1 to 86400, not '$drain_secs'"
 
 # One deploy at a time: two would share the export directory, the pending
 # record and the services. The lock is released when this process exits.
@@ -178,6 +203,33 @@ set +a
 
 restart() { systemctl --user restart spawn-loop spawn-integrate spawn-serve; }
 
+# drain_supported: the installed binary has `spawn integrate --drain` (its
+# usage line names it). Read from the file: a binary without it must never
+# be run with --drain or sent SIGUSR1, whose default action ends a process.
+drain_supported() {
+  LC_ALL=C grep -aqE 'usage: spawn integrate [][a-z<> |-]*--drain' "$live/bin/spawn" 2>/dev/null
+}
+
+# stop_integrator: drain the integrator when its binary can (header,
+# "Draining"), then stop the unit at once. Its status is the stop's.
+stop_integrator() {
+  local code=0
+  if ! systemctl --user is-active --quiet spawn-integrate; then
+    :
+  elif drain_supported; then
+    say "draining spawn-integrate: no new gate starts; waiting up to $drain_secs s (SPAWN_DEPLOY_DRAIN_SECS) for the running gates to record their verdicts"
+    timeout --kill-after=30 "$drain_secs" "$live/bin/spawn" integrate --drain 2>&1 | sed 's/^/deploy:   /' || code=$?
+    case $code in
+    0) say "drained: every gate that was running recorded its verdict" ;;
+    124 | 137) say "the drain reached its bound ($drain_secs s): the gates still running stop with the integrator, unjudged" ;;
+    *) say "the drain failed (exit $code): stopping the integrator as before; its running gates are lost" ;;
+    esac
+  else
+    say "the installed binary cannot drain (no \`spawn integrate --drain\`): stopping the integrator; its running gates are lost"
+  fi
+  systemctl --user stop spawn-integrate
+}
+
 # complete_pending: finish a deploy that pushed main but did not record
 # `spawn mission moved` (it died in between). Run with the integrator
 # stopped. $pending holds "<main it replaced> <deployed head>".
@@ -225,7 +277,7 @@ install_build() {
 if [ -f "$pending" ]; then
   say "a deploy is pending ($(cat "$pending")); completing it"
   stopped=1 completing_at_start=1
-  systemctl --user stop spawn-integrate
+  stop_integrator
   complete_pending
   systemctl --user start spawn-integrate
   stopped=0 completing_at_start=0
@@ -289,7 +341,7 @@ cp -r "$export_dir/web-dist" "$live/web.staged"
 
 # From here on, a failure must not leave the integrator stopped (on_exit).
 stopped=1
-systemctl --user stop spawn-integrate
+stop_integrator
 # The integrator may have landed between the check above and its stop.
 [ "$(git --git-dir="$missions" rev-parse main)" = "$old" ] ||
   die "the missions main moved during the deploy: run the gate on the new main and deploy again"
