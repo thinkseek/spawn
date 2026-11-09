@@ -80,6 +80,13 @@ root=$(cd "$(dirname "$0")/.." && pwd -P) || {
     exit 3
 }
 config=$root/config
+# A job whose scratch path is too long for the gate's Unix sockets gets one
+# here instead: short, on the machine's disk, under $HOME like the root (the
+# gate's sandbox binds what it needs of a TMPDIR under $HOME). Never /tmp:
+# on OrbStack machines and many containers /tmp is a tmpfs, so a gate's
+# builds there are memory, and a nested integrator finds no room (measured on
+# spawn-runner, 2026-11-09: check-e2e.sh failed on base and candidate alike).
+short=${GATE_RUNNER_SHORT:-$HOME/.grs}
 jobs=$root/jobs
 cache=$root/cache
 work=$root/work
@@ -247,7 +254,7 @@ ensure_dirs() {
 prune_jobs() {
     [ "$cfg_keep_days" != 0 ] || return 0
     pruned=0
-    for dir in "$jobs"/* "$work"/* /tmp/gate-runner/*; do
+    for dir in "$jobs"/* "$work"/* "$short"/*; do
         [ -e "$dir" ] || [ -L "$dir" ] || continue
         [ -n "$(find "$dir" -maxdepth 0 -mtime "+$cfg_keep_days" 2>/dev/null)" ] || continue
         rm -rf "$dir"
@@ -393,11 +400,10 @@ run_job() {
     scratch=$work/$job
     # A Unix socket path is 107 bytes at most, and the gate's own server puts
     # one under TMPDIR (<scratch>/spawn-gate.XXXXXX/test-db/.s.PGSQL.5432,
-    # about 40 bytes more). A root whose path is too long gets /tmp for the
-    # job's scratch: a shorter path, at the price of the disk floor being
-    # measured on /tmp instead of the root's disk (README.md).
+    # about 40 bytes more). A root whose path is too long gets the short
+    # directory for the job's scratch (above: on disk, never /tmp).
     if [ $((${#scratch} + 40)) -gt 107 ]; then
-        scratch=/tmp/gate-runner/$job
+        scratch=$short/$job
     fi
     mkdir -p "$scratch"
     export PATH=$cfg_path
@@ -465,7 +471,7 @@ remove_job() { # <job> [force]
         echo "gate-runner: $1 has no result yet (out/exit): a gate may still be running there; not removed (remove $1 force to remove it anyway)" >&2
         exit 4
     fi
-    rm -rf "$jobs/$1" "$jobs/$1.partial" "$work/$1" "/tmp/gate-runner/$1"
+    rm -rf "$jobs/$1" "$jobs/$1.partial" "$work/$1" "$short/$1"
 }
 
 # registry_need: of the primary's registry listing on stdin, the paths this
