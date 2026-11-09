@@ -31,11 +31,14 @@
 //!    with none yet), so no baseline check of the pass sees a main the owner
 //!    moved. A conflict, a commit the source does not have or a
 //!    compare-and-swap that fails twice records `source.push_refused`
-//!    {request, reason}: nothing moves, nothing halts. It waits for no gate,
-//!    on that source or any other: a judging in flight is never stopped,
-//!    and one of the same source finds main moved when it lands (`stale`,
-//!    judged again on the new main). The integrator is never stopped for an
-//!    owner's landing;
+//!    {request, reason}: nothing moves, nothing halts. It never moves main
+//!    under a gate of its source (design-owner-push-between-gates.md, D1):
+//!    a request on a source with a judging in flight waits (said once), and
+//!    the pass that reaps that judging applies it before any new gate
+//!    starts, so the judging's verdict is on the main it ran against, never
+//!    `stale` because of the owner. A judging of another source goes on. A
+//!    judging in flight is never stopped, and the integrator is never
+//!    stopped for an owner's landing;
 //! 1. a halt rule that fired stops the mission's landings until a human
 //!    resumes it: three gate rejections in a row (in an objective mission,
 //!    three of one objective's tasks yield that objective instead,
@@ -369,11 +372,12 @@
 //! Every judging records its own outcome (`task.gated`, `task.landed`), as
 //! before; the pass reads those records, never the thread's result. An
 //! owner's landing (step 0) never touches a judging: one on another source
-//! goes on and lands by the usual rules; one on the same source finishes,
-//! its verdict is recorded as it comes, and when its landing's
-//! compare-and-swap finds main moved, [`land`] records `stale` and a later
-//! pass judges the task again against the new main (never discarded, never
-//! counted). A
+//! goes on and lands by the usual rules; one on the same source holds the
+//! owner's request until the pass that reaps it (D1 above). A main moved
+//! by anything else while a judging ran (`spawn mission moved`, a recorded
+//! move behind Spawn's back) still makes its landing's compare-and-swap
+//! fail: [`land`] records `stale` and a later pass judges the task again
+//! against the new main (never discarded, never counted). A
 //! finished thread is reaped only at the start of a pass, before the
 //! missions are read, so no pass acts on a snapshot older than a judging's
 //! records. A judging that panics before any record of its own is recorded
@@ -1544,6 +1548,9 @@ struct Integrator {
     /// once, when the task starts waiting, and again only after the task
     /// has had a gate ([`Integrator::wait_over`]).
     waiting: RefCell<std::collections::HashSet<(i64, Wait)>>,
+    /// The owner's requests already said to wait for a judging in flight on
+    /// their source (step 0): each is said once.
+    owner_waits: RefCell<std::collections::HashSet<i64>>,
     /// When each mission's last judging ended (this process's reading):
     /// its next task waits for a gate from then.
     last_judged: RefCell<std::collections::HashMap<i64, i64>>,
@@ -1830,6 +1837,7 @@ impl Integrator {
             running: RefCell::new(Vec::new()),
             held: RefCell::new(None),
             waiting: RefCell::new(std::collections::HashSet::new()),
+            owner_waits: RefCell::new(std::collections::HashSet::new()),
             last_judged: RefCell::new(std::collections::HashMap::new()),
             warms: RefCell::new(None),
             red_probe_ms: main_red_probe_ms(
@@ -2053,9 +2061,23 @@ impl Integrator {
         // Step 0: the owner's landings, applied before any mission's step
         // reads its source's main, so no baseline check sees a main the
         // owner moved without its record. A source whose request is still
-        // pending has its halts by baseline held this pass.
+        // pending has its halts by baseline held this pass. Never under a
+        // judging of the source (design-owner-push-between-gates.md, D1): a
+        // request on a source with a judging in flight waits for the pass
+        // after it, so no owner's landing moves main under a gate.
+        let busy: std::collections::HashSet<String> = self
+            .running
+            .borrow()
+            .iter()
+            .map(|gate| gate.source.clone())
+            .collect();
         let mut owner_moved = Vec::new();
-        let pending = owner::apply_pending(store, &mut owner_moved)?;
+        let pending = owner::apply_pending(
+            store,
+            &mut owner_moved,
+            &busy,
+            &mut self.owner_waits.borrow_mut(),
+        )?;
         let steps = self.steps(store, &pending, &owner_moved);
         self.poll_warm();
         steps
@@ -11726,6 +11748,79 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&marks);
     }
 
+    /// An owner's landing requested while a gate of its source runs moves
+    /// main only after that gate (design-owner-push-between-gates.md, D1):
+    /// a pass during the gate applies nothing, the task's verdict is its
+    /// own (`accepted`, landed on the main it was judged against, never
+    /// `stale`), and the next pass lands the owner's commit on the task's
+    /// landing. On a step 0 that applies every request at once, main moved
+    /// under the gate and the verdict came back `stale` (Supply PA tasks
+    /// 214, 218, 220, 222, 223, 226 and 227, 2026-11-09/10).
+    #[test]
+    fn an_owner_push_requested_while_a_gate_runs_moves_main_only_after_it() {
+        let marks = fresh_marks("spawn-owner-between");
+        let release = Release(marks.clone());
+        let gate = gate_holding_then(&marks, "", "{\"verdict\":\"accepted\"}", 0);
+        let (base, source, scenarios, integrator) = world("owner-between", &gate);
+        let db = Db::new("owner_between");
+        let m0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        push_work(&base, &source, &agent, "work.txt");
+        let _ = std::fs::remove_file(marks.join("release"));
+        integrator.pass_on(&db.store).expect("a pass");
+        assert_eq!(wait_started(&marks, 1).len(), 1, "the task's gate started");
+
+        let commit = owner_commit(&base, &source, "CONTRACT.md", "v1\n", "owner: the contract");
+        let request = owner_request(&db, &source, &commit);
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass while the gate runs");
+        assert_eq!(
+            source_main(&source),
+            m0,
+            "no owner's landing moves main under a gate of its source"
+        );
+        assert!(control_records(&db, "source.moved").is_empty());
+
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(
+            record["verdict"], "accepted",
+            "the task's own verdict: {record}"
+        );
+        let landed = control_records(&db, "task.landed");
+        assert_eq!(landed.len(), 1, "{landed:?}");
+        let landing = landed[0]["to"].as_str().expect("the landing").to_string();
+        assert_eq!(landed[0]["from"], m0.as_str());
+        assert_eq!(source_main(&source), landing);
+
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass after the gate");
+        let moved = control_records(&db, "source.moved");
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(moved[0]["request"], json!(request));
+        assert_eq!(moved[0]["from"], landing.as_str());
+        let now = source_main(&source);
+        assert_eq!(
+            git(&["-C", &source, "rev-parse", &format!("{now}^1")]).expect("first parent"),
+            landing,
+            "the owner's landing is on the task's"
+        );
+        assert_eq!(
+            db.mission(mission)["baseline"],
+            now.as_str(),
+            "the mission's baseline follows the owner's landing"
+        );
+        assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
+    }
+
     /// A red main (design-main-red.md) is a fact about the main the gate
     /// judged against: when main moved while the gate ran, no
     /// `source.main_red` is written for a main that is no longer main, and
@@ -13731,75 +13826,6 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         assert_eq!(moved[1]["from"], commit.as_str());
         assert_eq!(moved[1]["to"], commit.as_str());
         assert_eq!(source_main(&source), commit);
-        assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// A judging of the same source is running when the owner's landing is
-    /// applied: the landing does not wait for it, and it is not touched. Its
-    /// gate finishes and its verdict is recorded (`accepted`); its landing's
-    /// compare-and-swap finds main moved and records `stale` (the existing
-    /// rule), so the task is judged again against the owner's main and
-    /// lands on top of it. The mission had no baseline yet: the owner's move
-    /// gives it the new main, so the verdict judged against the old one
-    /// does not halt it.
-    #[test]
-    fn a_judging_of_the_same_source_finds_main_moved_and_is_judged_again() {
-        let marks = fresh_marks("spawn-db-owner-stale");
-        let _release = Release(marks.clone());
-        let (base, source, scenarios, integrator) = world("owner-stale", &holding_gate(&marks));
-        let db = Db::new("owner_stale");
-        let mission = db.gated_mission(&source, &scenarios);
-        let task = db.reported_task(mission, "w");
-        let pushed = push_work(&base, &source, &agent_of(&db, mission, task), "work.txt");
-        let b0 = source_main(&source);
-
-        integrator
-            .pass_on(&db.store)
-            .expect("the pass that starts the judging");
-        let first = wait_started(&marks, 1);
-        assert_eq!(first.len(), 1, "the gate started");
-        let commit = owner_commit(&base, &source, "CONTRACT.md", "v1\n", "owner: the contract");
-        let request = owner_request(&db, &source, &commit);
-        integrator
-            .pass_on(&db.store)
-            .expect("a pass while the gate runs");
-        assert_eq!(source_main(&source), commit, "applied while the gate runs");
-        let moved = control_records(&db, "source.moved");
-        assert_eq!(moved.len(), 1, "{moved:?}");
-        assert_eq!(moved[0]["request"], json!(request));
-        assert_eq!(moved[0]["from"], b0.as_str());
-        assert_eq!(moved[0]["without_baseline"], json!([mission]));
-        assert!(verdicts(&db, task).is_empty(), "the gate still runs");
-        assert_eq!(
-            integrator.running.borrow().len(),
-            1,
-            "the judging is untouched"
-        );
-
-        std::fs::write(marks.join("release"), "").expect("release");
-        integrator.settle();
-        assert_eq!(verdicts(&db, task), ["accepted", "stale"]);
-        assert_eq!(db.mission(mission)["tasks"][0]["state"], "reported");
-        assert_eq!(db.mission(mission)["baseline"], commit.as_str());
-
-        integrator
-            .pass_on(&db.store)
-            .expect("the pass that judges again");
-        integrator.settle();
-        assert_eq!(verdicts(&db, task), ["accepted", "stale", "accepted"]);
-        let second = started(&marks);
-        assert_eq!(second.len(), 2, "{second:?}");
-        assert_eq!(
-            parent(&[&source], &second[1], 1),
-            commit,
-            "judged again against the owner's main"
-        );
-        let main = source_main(&source);
-        assert_eq!(parent(&[&source], &main, 1), commit, "landed on top of it");
-        assert_eq!(parent(&[&source], &main, 2), pushed);
-        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
-        integrator.pass_on(&db.store).expect("a pass after");
         assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -2063,12 +2063,14 @@ are per-agent uids or a mount per engine.
   commit `main` already holds was applied by an integrator that stopped
   before its record: it is recorded then, from the baseline its move began
   at. While a task landing on the source went out without its record, the
-  request waits for it. It waits for no gate: a judging of another mission
-  or source keeps running and lands by the usual rules, and one on the same
-  source finishes, its verdict is recorded as it comes, and its landing's
-  compare-and-swap finds `main` moved and records `stale`, so the task is
-  judged again against the new `main` (merged and gated again; never
-  discarded silently, never counted). So the owner's landing is a record
+  request waits for it. It never moves `main` under a gate of its source
+  (design-owner-push-between-gates.md, D1): while a judging of that
+  source is in flight the request waits (said once), and the pass that
+  reaps that judging applies it before any new gate starts, so the
+  judging's verdict is on the `main` it ran against, never `stale` because
+  of the owner (on 2026-11-09/10 seven Supply PA gates went stale under the
+  owner's pushes). A judging of another source keeps running and lands by
+  the usual rules. So the owner's landing is a record
   (the request, then the outcome that names it), and the integrator acts on
   that record, never on a `main` that changed under it ([design.md](design.md)
   §14). `spawn mission moved` still records a move the owner made behind

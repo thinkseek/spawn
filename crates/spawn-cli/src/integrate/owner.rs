@@ -35,9 +35,11 @@
 //! before its record: it is recorded now, from where its move began
 //! ([`moved_from`]).
 //!
-//! It never waits for a gate: a judging of another source goes on, and one
-//! of the same source finishes and finds main moved when it lands (`stale`,
-//! judged again on the new main).
+//! It never moves main under a gate of its source
+//! (design-owner-push-between-gates.md, D1): a request whose source has a
+//! judging in flight waits, said once, and the pass that reaps that judging
+//! applies it before any new gate starts. A judging of another source goes
+//! on.
 
 use std::collections::{HashMap, HashSet};
 
@@ -114,8 +116,11 @@ pub(super) fn pending_by_source(store: &PostgresStore) -> Result<HashMap<String,
 pub(super) fn apply_pending(
     store: &PostgresStore,
     moved: &mut Vec<(String, String)>,
+    busy: &HashSet<String>,
+    waits_said: &mut HashSet<i64>,
 ) -> Result<HashMap<String, i64>, String> {
     let requests = pending(store)?;
+    waits_said.retain(|id| requests.iter().any(|request| request.id == *id));
     if requests.is_empty() {
         return Ok(HashMap::new());
     }
@@ -128,6 +133,15 @@ pub(super) fn apply_pending(
             "integrate: the owner's landing of {} on {} (request {})",
             request.commit, request.source, request.id
         );
+        // A judging of the source is in flight: main moves after it, never
+        // under it (its verdict would be stale), at the pass that reaps it.
+        if busy.contains(&request.source) {
+            if waits_said.insert(request.id) {
+                println!("{said} waits for the judging in flight on its source");
+            }
+            stuck.insert(request.source.clone());
+            continue;
+        }
         match apply(store, request) {
             Ok(Outcome::Applied { from, to }) => {
                 println!("{said}: main {from} -> {to}");
