@@ -875,6 +875,10 @@ pub(crate) fn brief(
         "\nWork only inside this workspace. Do not run git commands and do not create \
          commits: the host commits your workspace. Do not edit `rsi/`, `scripts/rsi/`, \
          `scripts/blackbox/` or `scripts/e2e.sh`: the gate refuses any change there. \
+         A crate new in your tree must carry `[lints]` with `workspace = true` (and \
+         nothing else under it) in its Cargo.toml: the gate refuses one without it, and \
+         any other change to the lint configuration (`[lints]` tables, clippy.toml, a \
+         crate-level `#![allow]`). \
          The gate builds your tree, runs this objective's scenario (it must fail on the \
          current main and pass on yours) and every other check (clippy, the tests, the \
          e2e, the black-box scenarios, the web build). If it rejects your work, you get \
@@ -1844,6 +1848,13 @@ mod tests {
         assert!(text.len() < 5000);
         let first = brief(&objective(59, false), None, &[], &[], None);
         assert!(!first.contains("Earlier tasks"), "a first task has none");
+        assert!(
+            first.contains(
+                "A crate new in your tree must carry `[lints]` with `workspace = true` (and \
+                 nothing else under it) in its Cargo.toml"
+            ),
+            "every brief carries the lint rule the gate holds a new crate to: {first}"
+        );
     }
 
     /// A yield ends an objective's count, and its next task starts afresh;
