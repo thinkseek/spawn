@@ -64,6 +64,11 @@
 #   toward no halt: nothing is rejected or aborted. Which objectives the
 #   gate cannot judge: deploy/systemd/README.md "Which objectives the gate
 #   cannot judge" lists them, 029 and why.
+# - one fact of the kind is the gate's own, not a scenario's: a base whose
+#   dependency graph does not resolve offline (the static checks, "the
+#   whole dependency graph"): the same fact with the scenario
+#   `dependencies`, any objective's; the candidate is never rejected for a
+#   graph its base cannot resolve here either.
 #
 # Exit-code contract for objective scenarios and the task scenario: 0 =
 # pass, 1 = an assertion failed, 6 = the host cannot judge it here (below: "A

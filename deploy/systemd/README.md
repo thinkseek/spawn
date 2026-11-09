@@ -291,3 +291,12 @@ toward no halt. The owner judges that objective outside the gate (mission
 
 A new objective of this kind says so in its scenario's header and adds a row
 here.
+
+One fact of the same kind comes from the gate itself, not from a scenario:
+`dependencies`. When a candidate's dependency graph does not resolve
+offline and its base's does not either, the host's cargo registry lacks a
+crate main needs (a runner never sent it, a pruned cache): the gate writes
+`{"cannot_judge":true,"scenario":"dependencies","runs":"1",...}` and exits
+6, and the integrator records it as above. It is any objective's, and it
+ends when the host gets the crate; a candidate whose base resolves is
+still rejected for its graph.
