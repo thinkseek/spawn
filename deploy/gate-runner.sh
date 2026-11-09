@@ -357,9 +357,18 @@ sync_registry() {
     [ "$status" = 0 ] || die "the runner could not list its registry (exit $status): $(head -n 2 "$need.err" 2>/dev/null | tr '\n' ' ')" 3
     count=$(wc -l <"$need")
     [ "$count" != 0 ] || return 0
+    # Only paths this host itself listed are sent, whatever the runner
+    # names: a runner that asks for another path (an absolute one, a `..`,
+    # ~/.config/spawn/spawn.env) is refused, and tar reads the list verbatim
+    # (never an option). Review w1 (mac-rev-1), finding 1.
+    own=$stage_dir/registry.own
+    (cd "$registry_src" && find . -type f -printf '%P\n') >"$own"
+    awk -v own="$own" 'BEGIN { while ((getline line < own) > 0) listed[line] = 1 }
+        ($0 in listed) { print; next } { bad++ } END { exit bad > 0 }' "$need" >"$need.listed" ||
+        die "the runner asked for $(($(wc -l <"$need") - $(wc -l <"$need.listed"))) path(s) this host's registry does not list; nothing sent" 3
     say "$prog: sending $count file(s) of the cargo registry the runner lacks"
     limit=$(stage_limit "$ship_timeout")
-    tar -cf - -C "$registry_src" -T "$need" |
+    tar -cf - -C "$registry_src" --verbatim-files-from -T "$need.listed" |
         ssh_limited "$limit" "$remote_bin registry-accept" 2>"$need.err" ||
         die "the registry files did not reach the runner: $(head -n 2 "$need.err" 2>/dev/null | tr '\n' ' ')" 3
     registry_missing "$need" || die "the runner could not list its registry after the send" 3

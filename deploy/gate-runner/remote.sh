@@ -500,10 +500,29 @@ registry_need() {
 registry_accept() {
     load_config
     mkdir -p "$cargo_home/registry"
-    tar -xf - -C "$cargo_home/registry" || {
+    # One accept at a time, and each file renamed into place whole: a gate
+    # reading a crate keeps the file it opened, and a second dispatch never
+    # writes into a file the first one's gate reads (review w1, finding 2).
+    # Staged beside the registry, so every rename stays on one file system;
+    # a crate's .cargo-ok marker goes in last.
+    exec 9>"$cargo_home/.gate-runner-registry.lock"
+    flock 9
+    stage=$(mktemp -d "$cargo_home/.gate-runner-registry.XXXXXX")
+    tar -xf - -C "$stage" || {
+        rm -rf "$stage"
         echo "gate-runner: the registry files did not arrive whole" >&2
         exit 2
     }
+    (cd "$stage" && find . -type f ! -name .cargo-ok -printf '%P\n'; cd "$stage" && find . -type f -name .cargo-ok -printf '%P\n') |
+        while IFS= read -r file; do
+            mkdir -p "$cargo_home/registry/$(dirname "$file")" &&
+                mv -f "$stage/$file" "$cargo_home/registry/$file" || exit 2
+        done || {
+        rm -rf "$stage"
+        echo "gate-runner: the registry files could not be put in place" >&2
+        exit 2
+    }
+    rm -rf "$stage"
 }
 
 case "${1-}" in

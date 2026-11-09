@@ -197,6 +197,11 @@ if [ "$action" = collect ] && [ "${STUB_TRUNCATE_COLLECT:-0}" = 1 ]; then
     exit 0
 fi
 status=0
+if [ "$action" = registry ] && [ -n "${STUB_REGISTRY_EXTRA:-}" ] && case $cmd in *registry-need*) true ;; *) false ;; esac; then
+    # A compromised runner: it names a path of its choosing too.
+    { sh -c "$cmd" || status=$?; printf '%s\n' "$STUB_REGISTRY_EXTRA"; }
+    exit "$status"
+fi
 sh -c "$cmd" || status=$?
 if [ "$action" = run ] && [ "${STUB_DROP_VERDICT:-0}" = 1 ]; then
     rm -f "$STUB_ROOT"/jobs/*/out/verdict 2>/dev/null || true
@@ -552,6 +557,38 @@ check_status=0
 GATE_RUNNER_REGISTRY=$regsrc "$repo/deploy/gate-runner.sh" --check "$runner_home" "$repo_git" "$base" "$keysscen" \
     >"$scratch/check.out" 2>"$scratch/check.err" || check_status=$?
 contains "--check reports the registry" "$scratch/check.out" "0 file(s) of this host's to send at dispatch"
+cp "$scratch/config.orig" "$runner_home/config"
+
+# 8m'. A runner that asks for a path this host's registry does not list
+# (a compromised one asking for a secret) gets nothing: exit 3.
+secret=$scratch/secret.env
+printf 'TOKEN=do-not-send\n' >"$secret"
+printf "GATE_RUNNER_CARGO_HOME='%s'\n" "$scratch/rcargo3" >>"$runner_home/config"
+mkdir -p "$scratch/rcargo3/registry"
+reset "$out"
+STUB_REGISTRY_EXTRA="$secret" GATE_RUNNER_REGISTRY=$regsrc dispatch "$runner_home" "$repo_git" "$base" "$candidate" "$scen" "$out"
+expect "a runner asking for a path not in this host's registry: exit 3" "$status" 3
+contains "and says so" "$scratch/dispatch.err" "does not list; nothing sent"
+[ -z "$(find "$scratch/rcargo3" -name secret.env)" ] && [ ! -e "$scratch/rcargo3/registry/index" ] &&
+    pass "and nothing reached the runner" || fail "files reached the runner: $(find "$scratch/rcargo3" -type f | head -3)"
+cp "$scratch/config.orig" "$runner_home/config"
+
+# 8m''. Two accepts at once leave every file whole, and no staging behind.
+mkdir -p "$scratch/rcargo4/registry"
+printf "GATE_RUNNER_CARGO_HOME='%s'\n" "$scratch/rcargo4" >>"$runner_home/config"
+big=$scratch/reg-big
+mkdir -p "$big/cache/z"
+head -c 4000000 /dev/urandom >"$big/cache/z/big.crate"
+( tar -cf - -C "$big" cache | sh "$runner_home/bin/remote" registry-accept ) &
+a1=$!
+( tar -cf - -C "$big" cache | sh "$runner_home/bin/remote" registry-accept ) &
+a2=$!
+wait "$a1"; s1=$?; wait "$a2"; s2=$?
+expect "two accepts at once both succeed" "$s1 $s2" "0 0"
+cmp -s "$big/cache/z/big.crate" "$scratch/rcargo4/registry/cache/z/big.crate" && pass "and the file is whole" ||
+    fail "the file is not whole"
+[ -z "$(find "$scratch/rcargo4" -maxdepth 1 -name '.gate-runner-registry.*' -type d)" ] && pass "and no staging is left" ||
+    fail "staging left behind"
 cp "$scratch/config.orig" "$runner_home/config"
 
 # 8n. A runner whose memory is under the floor is refused, before any ship.
