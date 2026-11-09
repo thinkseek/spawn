@@ -34,10 +34,21 @@ fn scrub(name: &std::ffi::OsStr) -> bool {
 const WIDTH: &str = "200";
 const HEIGHT: &str = "50";
 
+/// How long [`TerminalHost::terminate`] waits for a killed terminal's
+/// processes to exit after `kill-session` hangs their terminal up, and again
+/// after it sends the survivors SIGKILL.
+const HANGUP_WAIT: Duration = Duration::from_secs(5);
+const KILL_WAIT: Duration = Duration::from_secs(2);
+
+/// How often that wait looks.
+const GONE_POLL: Duration = Duration::from_millis(20);
+
 /// tmux host.
 pub struct TmuxHost {
     program: String,
     socket: Option<String>,
+    /// [`HANGUP_WAIT`] and [`KILL_WAIT`], shorter in a test.
+    waits: (Duration, Duration),
 }
 
 /// One finished tmux call.
@@ -59,7 +70,65 @@ impl TmuxHost {
         Self {
             program: program.to_string(),
             socket,
+            waits: (HANGUP_WAIT, KILL_WAIT),
         }
+    }
+
+    /// The same host, waiting `hangup` for a killed terminal's processes to
+    /// exit and `kill` after SIGKILL ([`TerminalHost::terminate`]).
+    #[must_use]
+    pub fn with_terminate_waits(mut self, hangup: Duration, kill: Duration) -> Self {
+        self.waits = (hangup, kill);
+        self
+    }
+
+    /// The pids of the terminal's panes: each the leader of the session its
+    /// runner and everything the runner started run in (tmux starts a pane
+    /// with `setsid`). Empty when the terminal is gone.
+    fn pane_pids(&self, terminal: &TerminalName) -> Result<Vec<u32>, TerminalError> {
+        let run = self.run(&[
+            "list-panes".to_string(),
+            "-s".to_string(),
+            "-t".to_string(),
+            Self::target(terminal),
+            "-F".to_string(),
+            "#{pane_pid}".to_string(),
+        ])?;
+        match run.code {
+            Some(0) => Ok(run
+                .stdout
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()),
+            Some(1) if gone(&run.stderr) => Ok(Vec::new()),
+            other => Err(TerminalError(format!(
+                "list-panes returned {other:?}: {}",
+                run.stderr.trim()
+            ))),
+        }
+    }
+
+    /// Wait until no process is left in the sessions `leaders` lead: within
+    /// the hang-up wait, then SIGKILL to what is left and the kill wait. An
+    /// error names what outlived both.
+    fn wait_gone(&self, terminal: &TerminalName, leaders: &[u32]) -> Result<(), TerminalError> {
+        let (hangup, kill) = self.waits;
+        if until_gone(leaders, hangup).is_empty() {
+            return Ok(());
+        }
+        for pid in session_members(leaders) {
+            if let Some(pid) = rustix::process::Pid::from_raw(pid.cast_signed()) {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
+        let left = until_gone(leaders, kill);
+        if left.is_empty() {
+            return Ok(());
+        }
+        Err(TerminalError(format!(
+            "{} process(es) of {terminal}'s runner outlived kill-session and SIGKILL: {left:?}",
+            left.len()
+        )))
     }
 
     fn words(&self, arguments: &[String]) -> Vec<String> {
@@ -102,6 +171,54 @@ impl TmuxHost {
     fn buffer(terminal: &TerminalName) -> String {
         format!("spawn-{}", terminal.as_str())
     }
+}
+
+/// The processes still in the sessions `leaders` lead once none is left or
+/// `limit` passes.
+fn until_gone(leaders: &[u32], limit: Duration) -> Vec<u32> {
+    let deadline = Instant::now() + limit;
+    loop {
+        let left = session_members(leaders);
+        if left.is_empty() || Instant::now() >= deadline {
+            return left;
+        }
+        std::thread::sleep(GONE_POLL);
+    }
+}
+
+/// The live processes (a zombie writes nothing) whose session is one of
+/// `leaders`, by `/proc/<pid>/stat`. A process that left the session
+/// (`setsid`) is not among them.
+fn session_members(leaders: &[u32]) -> Vec<u32> {
+    if leaders.is_empty() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut members: Vec<u32> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| session_of(&stat))
+                .is_some_and(|(state, session)| state != 'Z' && leaders.contains(&session))
+        })
+        .collect();
+    members.sort_unstable();
+    members
+}
+
+/// A `/proc/<pid>/stat` line's state and session: the fields after the
+/// command's closing parenthesis (a command can hold spaces and parentheses)
+/// are state, ppid, pgrp, session.
+fn session_of(stat: &str) -> Option<(char, u32)> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let session = fields.nth(2)?.parse().ok()?;
+    Some((state, session))
 }
 
 /// How long a `capture-pane` may take.
@@ -639,27 +756,32 @@ impl TerminalHost for TmuxHost {
         )))
     }
 
+    /// `kill-session`, then the wait until every process of the terminal's
+    /// runner has exited: kill-session returns once the session is gone,
+    /// while the runner and the engine it started are still exiting on the
+    /// hang-up, and can write to the workspace until they have. The caller
+    /// (the Bridge's end) takes its final checkpoint only after this returns
+    /// (rev-e, 028's lost line).
     fn terminate(
         &self,
         terminal: &TerminalName,
         _workspace: &WorkspaceId,
     ) -> Result<(), TerminalError> {
+        // Read before the kill: the session's processes are told by it.
+        let leaders = self.pane_pids(terminal)?;
         let run = self.run(&[
             "kill-session".to_string(),
             "-t".to_string(),
             Self::target(terminal),
         ])?;
-        if run.code == Some(0) {
-            return Ok(());
-        }
         // A terminal that is already gone is the desired end state.
-        if gone(&run.stderr) {
-            return Ok(());
+        if run.code != Some(0) && !gone(&run.stderr) {
+            return Err(TerminalError(format!(
+                "kill-session failed: {}",
+                run.stderr.trim()
+            )));
         }
-        Err(TerminalError(format!(
-            "kill-session failed: {}",
-            run.stderr.trim()
-        )))
+        self.wait_gone(terminal, &leaders)
     }
 
     fn read_from(

@@ -1272,3 +1272,118 @@ fn the_bridge_types_only_while_it_holds_the_workspace() {
         "the prompt and the input, each typed under the hold"
     );
 }
+
+/// The commits the Bridge recorded on the branch.
+fn branch_commits(store: &MemoryStore) -> usize {
+    events(store)
+        .into_iter()
+        .filter(|event| matches!(event.kind, EventKind::ArtifactCommitted { .. }))
+        .count()
+}
+
+/// An end whose engine writes to its workspace as it dies, between the
+/// hang-up and its exit (028: the fake engine's last `work n` line): the
+/// final checkpoint comes after the kill, so that write is committed and
+/// the workspace is unmounted with nothing in it. Before rev-e's fix the
+/// checkpoint came first, found nothing, and the unmount deleted the line.
+/// A stop, an exit (the runner wrote its status, its terminal not yet gone)
+/// and a lost runner (a terminal that hosts no runner of Spawn's) end alike.
+#[test]
+fn what_an_engine_writes_as_it_dies_is_in_its_final_checkpoint() {
+    let execution = ExecutionId::for_command(CommandId(1));
+    let terminal = TerminalName::for_execution(&execution);
+    let workspace = spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid");
+    for (how, cause) in [
+        ("stop", EndCause::Stopped),
+        ("exit", EndCause::Exited),
+        ("lost", EndCause::Lost),
+    ] {
+        let store = store();
+        let mut bridge = bridge(&store);
+        start(&store, None);
+        bridge.tick().expect("start");
+        store.write_as_it_dies(&terminal);
+        match how {
+            "stop" => submit(&store, "key_stop", CommandAction::Stop),
+            "exit" => store.append_file(
+                &format!("{}/.spawn/exit-{execution}", workspace.path()),
+                "0",
+            ),
+            _ => store.untrack(&terminal, "a shell restored at a prompt"),
+        }
+        bridge.tick().expect("the end");
+        assert_eq!(ended(&store), vec![cause], "{how}");
+        assert_eq!(
+            store.unmounted_dirty(),
+            Vec::new(),
+            "{how}: the dying write was unmounted uncommitted"
+        );
+        assert_eq!(
+            branch_commits(&store),
+            1,
+            "{how}: the dying write is committed"
+        );
+    }
+}
+
+/// A runner that outlives its kill is never checkpointed or unmounted: it
+/// may still write there. A kill blocks the Bridge's loop for its whole
+/// wait, so after one fails the next comes only after END_RETRY_MS: the
+/// ticks between kill nothing (rev-f on 204d1a1f). The end stalls after
+/// END_ATTEMPTS like a failing checkpoint, and once the runner is gone it
+/// checkpoints what it wrote and unmounts.
+#[test]
+fn a_runner_that_outlives_its_kill_holds_its_workspace_until_it_is_gone() {
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let execution = ExecutionId::for_command(CommandId(1));
+    let terminal = TerminalName::for_execution(&execution);
+    store.set_pane(&terminal, READY);
+    let mut bridge = bridge(&store).with_clock(clock.clone());
+    start(&store, None);
+    bridge.tick().expect("start");
+    store.write_as_it_dies(&terminal);
+    store.outlive_kills(&terminal, 20);
+    submit(&store, "key_stop", CommandAction::Stop);
+    bridge.tick().expect("the stop: one kill, outlived");
+    assert_eq!(store.terminates(), 1);
+    for _ in 0..5 {
+        bridge.tick().expect("within END_RETRY_MS");
+    }
+    clock.advance(std::time::Duration::from_secs(29));
+    bridge.tick().expect("still within it");
+    assert_eq!(store.terminates(), 1, "no kill again before END_RETRY_MS");
+    let wait = || clock.advance(std::time::Duration::from_secs(30));
+    let mut warned = Vec::new();
+    let mut ticks = 0;
+    while stalls(&store).is_empty() {
+        wait();
+        let report = bridge.tick().expect("an attempt");
+        warned.extend(report.warnings);
+        ticks += 1;
+        assert!(ticks < 60, "never stalls in {ticks} ticks: {warned:?}");
+    }
+    assert_eq!(store.terminates(), 20, "one kill per END_RETRY_MS");
+    assert_eq!(stalls(&store), vec![(EndCause::Stopped, 20)]);
+    assert!(
+        warned
+            .iter()
+            .any(|warning| warning.contains("THE RUNNER OUTLIVED ITS KILL 20 TIMES")),
+        "{warned:?}"
+    );
+    assert_eq!(commits(&store), 0, "no checkpoint while it may write");
+    assert_eq!(unmounts(&store), 0);
+    assert!(ended(&store).is_empty());
+
+    // A discard waits for the kill too: it cannot unmount under a runner.
+    submit(&store, "key_discard", CommandAction::Discard);
+    bridge.tick().expect("the discard waits");
+    assert_eq!(store.terminates(), 20, "a discard does not skip the wait");
+    assert_eq!(unmounts(&store), 0);
+
+    wait();
+    bridge.tick().expect("the kill takes");
+    assert_eq!(ended(&store), vec![EndCause::Stopped]);
+    assert_eq!(store.unmounted_dirty(), Vec::new());
+    assert_eq!(unmounts(&store), 1);
+}
