@@ -2880,11 +2880,7 @@ impl Judge {
                     Rejection::HeadNoRoom { short, log, head } => {
                         let mut extra =
                             no_room(mission, task.id, &short, &log, database_now(store)?);
-                        if let (Some(target), Some(head)) =
-                            (extra.as_object_mut(), head.as_object())
-                        {
-                            target.extend(head.clone());
-                        }
+                        extra = on_the_head(extra, &head, main, &verdict.reason);
                         gated("no_room", extra)
                     }
                     Rejection::HeadBaseDisagrees {
@@ -2905,20 +2901,12 @@ impl Judge {
                             backoff,
                             &log,
                         );
-                        if let (Some(target), Some(head)) =
-                            (extra.as_object_mut(), head.as_object())
-                        {
-                            target.extend(head.clone());
-                        }
+                        extra = on_the_head(extra, &head, main, &verdict.reason);
                         gated("host_fault", extra)
                     }
                     Rejection::HeadHostFault { failure, head } => {
                         let mut extra = self.gate_host_fault(mission, task.id, &failure);
-                        if let (Some(target), Some(head)) =
-                            (extra.as_object_mut(), head.as_object())
-                        {
-                            target.extend(head.clone());
-                        }
+                        extra = on_the_head(extra, &head, main, &verdict.reason);
                         gated("host_fault", extra)
                     }
                     Rejection::HeadCannotJudge {
@@ -2927,11 +2915,7 @@ impl Judge {
                         head,
                     } => {
                         let mut extra = self.cannot_judge(mission, task.id, &scenario, &log);
-                        if let (Some(target), Some(head)) =
-                            (extra.as_object_mut(), head.as_object())
-                        {
-                            target.extend(head.clone());
-                        }
+                        extra = on_the_head(extra, &head, main, &verdict.reason);
                         gated("host_fault", extra)
                     }
                 }
@@ -3438,6 +3422,32 @@ enum Rejection {
         log: String,
         head: Value,
     },
+}
+
+/// The record of a judging of the head alone ([`rejection`]) that gave no
+/// verdict (no room, a base that disagreed with itself, a host fault, a
+/// scenario the host cannot judge): `extra` with the head's fields
+/// (`candidate`, `head`, `head_base`) and a reason that says what it covers.
+/// Its log and fact are the head's run on `head_base`, the base the work was
+/// built on, and never the merge's on `main`: Supply PA's task 207
+/// (2026-11-09) recorded the head's run on a red head_base as "check-tests
+/// failed on the candidate and on the base" under main's commit, and read as
+/// main failing.
+fn on_the_head(mut extra: Value, head: &Value, main: &str, merged: &str) -> Value {
+    let short = |commit: &str| commit.get(..12).unwrap_or(commit).to_string();
+    let head_base = head["head_base"]
+        .as_str()
+        .map_or_else(|| "its base".to_string(), short);
+    let said = extra["reason"].as_str().unwrap_or_default().to_string();
+    extra["reason"] = json!(format!(
+        "the merge with main {} was rejected ({merged}); judging the work alone against the \
+         base it was built on, {head_base}, gave no verdict: {said}",
+        short(main)
+    ));
+    if let (Some(target), Some(head)) = (extra.as_object_mut(), head.as_object()) {
+        target.extend(head.clone());
+    }
+    extra
 }
 
 /// The record of a gate rejection: the reason, the gate's output and the
@@ -10945,6 +10955,122 @@ mod database_tests {
         );
         assert_eq!(gated(&db, mission).gate_aborts, 0);
         assert_eq!(gated(&db, mission).gate_host_faults, 4, "each one a run");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A gate that rejects a merge (`$3^2` exists) with check-tests.sh failing
+    /// on it, and gives the head alone, judged against the base it was built
+    /// on, the host fault `head_fault` (a verdict file's JSON) with exit 6.
+    fn head_alone_gate(head_fault: &str) -> String {
+        format!(
+            "if git --git-dir=\"$1\" rev-parse -q --verify \"$3^2\" >/dev/null; then\n\
+               echo ' FAIL  test/health.test.ts > shifts what the server stamps'\n\
+               printf '{{\"verdict\":\"rejected\",\"reason\":\"regression: check-tests.sh fails on the candidate\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+               exit 0\n\
+             fi\n\
+             echo '| == the head alone'\n\
+             printf '%s\\n' '{head_fault}' >\"$SPAWN_GATE_VERDICT\"\n\
+             exit 6\n"
+        )
+    }
+
+    /// The task's work, made on `on` (an older main) and pushed as
+    /// `spawn/<agent>`: one new file. The pushed commit.
+    fn push_work_on(base: &Path, source: &str, agent: &str, on: &str, file: &str) -> String {
+        let clone = base.join(format!("agent-on-{file}"));
+        let clone_path = clone.to_string_lossy().to_string();
+        git(&["clone", "-q", source, &clone_path]).expect("clone");
+        git(&["-C", &clone_path, "checkout", "-q", on]).expect("checkout the older main");
+        std::fs::write(clone.join(file), "work\n").expect("write");
+        super::tests::commit_in(&clone_path, "work");
+        git(&[
+            "-C",
+            &clone_path,
+            "push",
+            "-q",
+            "origin",
+            &format!("HEAD:refs/heads/spawn/{agent}"),
+        ])
+        .expect("push the agent's branch");
+        git(&["-C", &clone_path, "rev-parse", "HEAD"]).expect("work")
+    }
+
+    /// Supply PA's task 207 (2026-11-09): a rejected merge's head, judged
+    /// alone against the base it was built on, gave no verdict (a host
+    /// fault there). The record says so through the store: its reason names
+    /// the merge's rejection, the head's base and that the fault is the head's
+    /// run there, never a fault of main; `head` and `head_base` are on it; and
+    /// the supervisor's digest item, at the second in a row, says it was the
+    /// work alone on that base.
+    #[test]
+    fn a_head_judged_alone_without_a_verdict_says_it_was_the_head_on_its_base() {
+        let fault = "{\"host_fault\":true,\"scenario\":\"011.sh\",\"on\":\"base\",\"runs\":\"2\",\"reason\":\"a harness error\"}";
+        let (base, source, scenarios, mut integrator) =
+            world("head-alone-fault", &head_alone_gate(fault));
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_secs(1),
+            cap: 3,
+        };
+        let db = Db::new("head_alone_fault");
+        let m0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        let m1 = main_moves(&base, &source, "main.txt");
+        let head = push_work_on(&base, &source, &agent, &m0, "work.txt");
+        let mut due = None;
+        for _ in 0..2 {
+            if let Some(due) = due {
+                let left = due - super::now_ms();
+                if left > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        u64::try_from(left).unwrap_or(0) + 50,
+                    ));
+                }
+            }
+            integrator.pass_on(&db.store).expect("a pass");
+            integrator.settle();
+            due = last_verdict(&db).0["due_ms"].as_i64();
+        }
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["verdict"], "host_fault", "{record}");
+        assert_eq!(record["head"], head.as_str(), "{record}");
+        assert_eq!(record["head_base"], m0.as_str(), "{record}");
+        assert_eq!(record["base"], m1.as_str(), "the merge's base, as before");
+        let reason = record["reason"].as_str().expect("a reason");
+        for wanted in [
+            &format!("the merge with main {} was rejected", &m1[..12]),
+            "regression: check-tests.sh fails on the candidate",
+            &format!(
+                "judging the work alone against the base it was built on, {}, gave no verdict",
+                &m0[..12]
+            ),
+            "011.sh exited 2 on the base",
+        ] {
+            assert!(reason.contains(wanted), "{wanted:?} in {reason}");
+        }
+        assert_eq!(record["escalate"], true, "the second in a row: {record}");
+        let items = crate::dispatch::digest::host_fault_escalations(
+            db.store
+                .gate_host_fault_escalations()
+                .expect("escalations")
+                .as_array()
+                .expect("records"),
+        );
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(
+            items[0].line.contains(&format!(
+                "judging the work alone against the base it was built on ({}), after main \
+                 rejected the merge",
+                &m0[..12]
+            )),
+            "{}",
+            items[0].line
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

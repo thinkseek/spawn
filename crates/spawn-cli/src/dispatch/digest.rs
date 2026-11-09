@@ -222,6 +222,17 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
             } else {
                 format!("the test database's log shows a crash during the gate: {crash}")
             };
+            // The head's run alone on the base it was built on (integrate.rs
+            // `on_the_head`): its fault is that base's and the work's, never
+            // the merge's on main, and the item says so.
+            let evidence = match record["head_base"].as_str() {
+                Some(head_base) => format!(
+                    "judging the work alone against the base it was built on ({}), after main \
+                     rejected the merge, {evidence}",
+                    head_base.get(..12).unwrap_or(head_base)
+                ),
+                None => evidence,
+            };
             let due = record["due_ms"].as_i64().map_or_else(
                 || "after its backoff".to_string(),
                 |due| format!("at {}", crate::scorecard::time::format_rfc3339(due)),
