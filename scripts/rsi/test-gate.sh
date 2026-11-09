@@ -2015,6 +2015,88 @@ cp "$bin_scenarios/check-run.sh" "$bin_scenarios/095.sh"
 expect "a binary linked again mid-gate is not the one the scenarios run" \
     "$(with_jobs 4 bin "$good" "$bin_scenarios")" 'exit=0 {"verdict":"accepted"}'
 
+# 16g. Seeds from the accepting gate (design-gate-time.md §2): a candidate
+# run of an objective that completes with exit 0 is the candidate commit's
+# `solved` as a base. The next gate, on that commit as its base, reads it
+# from the cache and says whose it is. Never seeded: a run that fails (202,
+# unsolved on both), a check, an objective that reads SPAWN_BASELINE_TREE
+# (203), a run cut short (204, below). A changed scenario is another key.
+# These gates have no test database, so nothing is shared between runs.
+seedd=$work/seed-scenarios
+mkdir -p "$seedd"
+cp "$scenarios/protected" "$seedd/"
+printf '#!/bin/sh\nexit 0\n' >"$seedd/201.sh"
+printf '#!/bin/sh\nexit 1\n' >"$seedd/202.sh"
+printf '#!/bin/sh\n[ -n "$SPAWN_BASELINE_TREE" ]\n' >"$seedd/203.sh"
+printf '#!/bin/sh\n[ ! -e target/debug/spawn ] || [ -x target/debug/spawn ]\n' >"$seedd/205.sh"
+printf '#!/bin/sh\nexit 0\n' >"$seedd/check-ok.sh"
+expect "a gate whose candidate passes an objective" "$(with_jobs 2 seeds "$good" "$seedd")" \
+    'exit=0 {"verdict":"accepted"}'
+expect "seeds it for its candidate commit as a base" "$(cat "$work/gate.out")" \
+    "| 201.sh: solved on the candidate, seeded into the base cache for $(printf '%s' "$good" | cut -c1-12) as a base"
+expect "and says why one that reads SPAWN_BASELINE_TREE is not seeded" "$(cat "$work/gate.out")" \
+    '| base cache: 203.sh is not seeded: 203.sh reads SPAWN_BASELINE_TREE'
+expect "nor one that reads target/ (the listing's build, on the candidate)" "$(cat "$work/gate.out")" \
+    '| base cache: 205.sh is not seeded: 205.sh runs cargo or reads target/'
+refuse "a failing run seeds nothing" "$(cat "$work/gate.out")" '202.sh: solved on the candidate'
+refuse "nor does a check" "$(cat "$work/gate.out")" 'check-ok.sh: solved on the candidate'
+seed_cache=$work/caches/seeds/spawn/gate-base
+seeded_entry=$(grep -l "^seeded-by-gate $good at " "$seed_cache"/* 2>/dev/null | head -n 1)
+expect "the entry says whose seed it is" "$(cat "$seeded_entry" 2>/dev/null)" "seeded-by-gate $good at "
+# A result already in the entry (another gate's) is never overwritten.
+printf 'unsolved\n' >"$seeded_entry"
+with_jobs 2 seeds "$good" "$seedd" >/dev/null
+expect "an entry that holds a result is not overwritten by a seed" \
+    "$([ "$(cat "$seeded_entry")" = unsolved ] && echo kept)" kept
+refuse "and the gate seeds nothing there" "$(cat "$work/gate.out")" '201.sh: solved on the candidate'
+# A key whose lock another gate holds (it is judging that key) is not
+# seeded: the seed does not wait, and does not write beside it.
+rm -f "$seeded_entry"
+sh -c 'exec 9>>"$1" && flock 9 && exec sleep 120' holder "$seeded_entry.lock" &
+seed_holder=$!
+background="$background $seed_holder"
+while flock -n "$seeded_entry.lock" true; do sleep 0.1; done
+with_jobs 2 seeds "$good" "$seedd" >/dev/null
+kill "$seed_holder" 2>/dev/null || true
+expect "a key whose lock another gate holds is not seeded" \
+    "$([ ! -e "$seeded_entry" ] && echo absent)" absent
+refuse "and the gate says no seed there" "$(cat "$work/gate.out")" '201.sh: solved on the candidate'
+expect "once the lock is free, the seed is written again" \
+    "$(with_jobs 2 seeds "$good" "$seedd" >/dev/null; cat "$seeded_entry" 2>/dev/null)" "seeded-by-gate $good at "
+saved_base=$base
+base=$good
+branch seeded-next
+printf 'three\n' >"$seed/value"
+seeded_next=$(commit seeded-next)
+expect "the next gate, on that candidate as its base" "$(with_jobs 2 seeds "$seeded_next" "$seedd")" \
+    'exit=0 {"verdict":"accepted"}'
+expect "reads the seed, and says whose it is" "$(cat "$work/gate.out")" \
+    "| == base: 201.sh: solved (cached, seeded by the gate of $good at "
+expect "and runs the others on the base: no unsolved, no check, nothing that reads the old base or target/ was seeded" \
+    "$(cat "$work/gate.out")" '| base results from the cache: 201.sh; run on the base: 202.sh 203.sh 205.sh'
+seedd_changed=$work/seed-scenarios-changed
+cp -r "$seedd" "$seedd_changed"
+printf '#!/bin/sh\n# another blob\nexit 0\n' >"$seedd_changed/201.sh"
+expect "a changed scenario is another key: its seed is not read" \
+    "$(with_jobs 2 seeds "$seeded_next" "$seedd_changed" >/dev/null; cat "$work/gate.out")" \
+    '| base results from the cache: 202.sh 203.sh 205.sh; run on the base: 201.sh'
+# A run cut short: the task scenario fails at once on the candidate and
+# decides, and 204, beside it, is stopped before it can end.
+shortd=$work/seed-short
+mkdir -p "$shortd"
+cp "$scenarios/protected" "$shortd/"
+printf '#!/bin/sh\nsleep 4\nexit 0\n' >"$shortd/204.sh"
+printf '#!/bin/sh\nexit 1\n' >"$work/seed-task.sh"
+base=$saved_base
+expect "a gate decided early" "$(with_jobs 2 seed-short "$good" "$shortd" "$work/seed-task.sh")" \
+    '"reason":"scenario fails on the candidate"'
+refuse "seeds nothing from the run it stopped" "$(cat "$work/gate.out")" '204.sh: solved on the candidate'
+base=$good
+expect "and the next gate runs that objective on the base" \
+    "$(with_jobs 2 seed-short "$seeded_next" "$shortd" >/dev/null; cat "$work/gate.out")" \
+    '| base results from the cache: none; run on the base: 204.sh'
+base=$saved_base
+
 # 17. Base only (`--base-only`): the base phase alone, into the cache, with
 # no verdict; the next gate on that base takes every result from the cache.
 base_only() { # <scenarios>: the gate's exit status
@@ -2157,6 +2239,23 @@ EOF
            (export XDG_CACHE_HOME="$work/caches/own-$kind" SPAWN_GATE_JOBS=1; judge "$good" "" "$work/own-shared") >/dev/null
            cat "$work/gate.out")" \
         '| base results from the cache: none; run on the base: 101.sh'
+    # The candidate's runs get a fresh server, started after the base
+    # phase: what a base run leaves on its server a candidate run does not
+    # see, as the next gate's base run of the same commit will not
+    # (design-gate-time.md §2). 102 leaves a table on the base.
+    fresh=$work/own-fresh-$kind
+    mkdir -p "$fresh"
+    cp "$scenarios/protected" "$fresh/"
+    cat >"$fresh/102.sh" <<EOF
+#!/bin/sh
+$q_function
+if [ "\$(cat value)" = one ]; then q 'create table base_was_here (x int)'; exit 0; fi
+[ "\$(q "select to_regclass('public.base_was_here') is null")" = t ] || { echo "the base phase's table, on the candidate's server"; exit 1; }
+EOF
+    expect "$kind: the candidate's runs get a fresh server" "$(with_pg "$fresh")" 'exit=0 {"verdict":"accepted"}'
+    expect "$kind: the log says so" "$(cat "$work/gate.out")" "| test database: a fresh server for the candidate's runs, up in "
+    expect "$kind: and a gate on its own server seeds" "$(cat "$work/gate.out")" \
+        '| 102.sh: solved on the candidate, seeded into the base cache for '
     # A gate ended by a signal takes its server and its runs with it.
     printf '#!/bin/sh\n[ "$(cat value)" = one ] || sleep 29.75\n' >"$own/check-long.sh"
     rm -rf "$integrator"
