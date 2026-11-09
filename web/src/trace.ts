@@ -42,6 +42,9 @@ export interface Span {
    * command's first line, its file, its pattern); null on other spans and
    * on calls recorded before calls carried one. */
   summary: string | null;
+  /** The summary is the call's whole input (`summary_whole` on its
+   * `tool.started`): only such calls fold into a ×N run. */
+  summaryWhole: boolean;
   parentId: string | null;
   depth: number;
   childIds: string[];
@@ -147,6 +150,7 @@ export function deriveTrace(input: TimelineEvent[], now: number): Trace {
       failed: false,
       outcome: null,
       summary: null,
+      summaryWhole: false,
       parentId,
       depth: 0,
       childIds: [],
@@ -322,6 +326,7 @@ export function deriveTrace(input: TimelineEvent[], now: number): Trace {
         const name = text(event.detail, "tool_name") ?? "tool";
         const span = open("tool", name, event, toolParent(event));
         span.summary = text(event.detail, "summary");
+        span.summaryWhole = span.summary !== null && field(event.detail, "summary_whole") === true;
         if (!id) continue;
         const early = earlyToolEnds.shift(id);
         if (early) close(span, early);
@@ -505,19 +510,66 @@ export function shortPath(path: string): string {
   return `${lead}/…/${named[named.length - 1]}`;
 }
 
-/** A tool call's key input as its row shows it: a command without a
- * leading `cd <dir> &&`, to its first 80 characters; a file path
+/** A tool call's key input as its row shows it: a command without what
+ * only sets up for it (a leading `cd <dir> &&`, `NAME=value;` and
+ * `NAME=value cmd` assignments, a variable that names a program read as
+ * that program's name), to its first 80 characters; a file path
  * shortened. The full text is the row's title. */
 export function shortSummary(tool: string, summary: string): string {
   if (PATH_TOOLS.has(tool)) return shortPath(summary);
   if (tool !== "Bash") return summary;
-  // Most commands start in a directory: the row shows what runs there.
-  const command = summary.replace(LEADING_CD, "") || summary;
+  const command = commandProper(summary);
   return command.length > BASH_CHARS ? `${command.slice(0, BASH_CHARS - 1)}…` : command;
 }
 
-/** `cd <dir> && ` or `cd <dir>; ` at the start of a command. */
+/** `cd <dir>` followed by `&&` or `;`. */
 const LEADING_CD = /^cd\s+(?:"[^"]*"|'[^']*'|\S+)\s*(?:&&|;)\s*/;
+const NAME = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/** The length of a shell word's value at the start of `text`: a quoted
+ * string, a `$(…)` (balanced), or a run of non-blanks. */
+function valueLength(text: string): number {
+  if (text.startsWith("$(")) {
+    let depth = 0;
+    for (let index = 0; index < text.length; index += 1) {
+      if (text[index] === "(") depth += 1;
+      else if (text[index] === ")" && (depth -= 1) === 0) return index + 1;
+    }
+    return text.length;
+  }
+  const quote = text[0];
+  if (quote === '"' || quote === "'") {
+    const close = text.indexOf(quote, 1);
+    return close < 0 ? text.length : close + 1;
+  }
+  return /^[^\s;&|]*/.exec(text)?.[0].length ?? 0;
+}
+
+/** A command with its set-up taken off the front (see [`shortSummary`]). */
+export function commandProper(summary: string): string {
+  let rest = summary;
+  const programs = new Map<string, string>();
+  for (;;) {
+    const cd = LEADING_CD.exec(rest);
+    if (cd) {
+      rest = rest.slice(cd[0].length);
+      continue;
+    }
+    const name = NAME.exec(rest);
+    if (!name) break;
+    const value = rest.slice(name[0].length);
+    const length = valueLength(value);
+    const after = value.slice(length);
+    const separator = /^\s*(?:&&|;)\s*|^\s+/.exec(after);
+    if (!separator || after.slice(separator[0].length) === "") break;
+    const word = value.slice(0, length).replace(/^["']|["']$/g, "");
+    // `B=/path/to/spawn`: `$B` below reads as `spawn`.
+    if (/^[^\s$`]*\/[^\s$`/]+$/.test(word)) programs.set(name[0].slice(0, -1), word.slice(word.lastIndexOf("/") + 1));
+    rest = after.slice(separator[0].length);
+  }
+  if (rest === "") return summary;
+  return rest.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (whole, variable: string) => programs.get(variable) ?? whole);
+}
 
 /** A span's row text: `Bash · cargo test -p spawn-cli` for a tool call
  * with a summary, its label otherwise. */
@@ -527,15 +579,18 @@ export function rowText(span: Span): string {
 }
 
 /** Two tool calls one row can stand for: the same tool with the same
- * recorded input, under the same parent, ending the same way. Calls with
- * no input recorded are not the same call, whatever their tool. */
+ * whole input, under the same parent, ending the same way. A summary that
+ * leaves input out (an Edit's path, a heredoc's first line, a redacted or
+ * cut command) does not say two calls are the same, and neither does no
+ * summary at all. */
 function sameCall(a: Span, b: Span): boolean {
   return (
     a.kind === "tool" &&
     b.kind === "tool" &&
     a.parentId === b.parentId &&
     a.label === b.label &&
-    a.summary !== null &&
+    a.summaryWhole &&
+    b.summaryWhole &&
     a.summary === b.summary &&
     a.failed === b.failed &&
     a.outcome === b.outcome &&

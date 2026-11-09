@@ -334,6 +334,13 @@ pub enum EventKind {
         /// for a tool without one, and in every event recorded before it was.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
+        /// The summary is the call's whole input, unredacted and uncut (a
+        /// one-line command, a Read's file and range, a Glob): two calls
+        /// with the same summary are the same call, and a reader may fold
+        /// them (`×N`). False when the summary leaves input out, and in
+        /// every event recorded before it was.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        summary_whole: bool,
     },
     /// A tool call succeeded.
     #[serde(rename = "tool.completed")]
