@@ -77,7 +77,7 @@ export function RailContent({
                     {Math.round(observation.confidence * 100)}%
                   </span>
                 </div>
-                <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-white/[0.07]">
+                <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-foreground/[0.07]">
                   <div
                     className="h-full rounded-full bg-chart-line/70"
                     style={{

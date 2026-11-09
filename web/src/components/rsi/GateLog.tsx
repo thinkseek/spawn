@@ -66,7 +66,7 @@ export function GateLog({ log }: { log: string }) {
               className={cx(
                 "mx-4 my-2 flex items-center gap-3 rounded-md px-3 py-2 ring-1 ring-inset",
                 verdict.accepted
-                  ? "bg-success/10 text-success ring-success/25"
+                  ? "bg-ok-tint text-success ring-success/25"
                   : "bg-destructive/10 text-destructive ring-destructive/25",
               )}
             >
@@ -86,7 +86,7 @@ export function GateLog({ log }: { log: string }) {
         if (metric) {
           const change = percentChange(metric.baseline, metric.candidate);
           body = (
-            <span className="flex flex-wrap items-baseline gap-x-3 rounded bg-info/[0.09] px-2 py-0.5 ring-1 ring-info/20 ring-inset">
+            <span className="flex flex-wrap items-baseline gap-x-3 rounded bg-info-tint px-2 py-0.5 ring-1 ring-info/20 ring-inset">
               <span className="font-semibold text-info">METRIC</span>
               <span className="text-foreground">{metric.name}</span>
               <span className="tnum text-muted-foreground">

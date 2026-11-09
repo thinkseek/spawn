@@ -55,9 +55,12 @@ export function AlwaysOnAgents({
           hint="The supervisor and approved residents appear here once they start."
         />
       ) : (
-        <ul className="grid gap-px bg-surface-border md:grid-cols-2 xl:grid-cols-3">
+        <ul className="grid gap-3 p-3 md:grid-cols-2 xl:grid-cols-3">
           {agents.map((agent) => (
-            <li key={agent.session_id} className="min-w-0 bg-surface">
+            <li
+              key={agent.session_id}
+              className="min-w-0 overflow-hidden rounded-control bg-surface shadow-hairline transition-shadow hover:shadow-raised"
+            >
               <AlwaysOnTile
                 agent={agent}
                 context={context}
@@ -68,8 +71,11 @@ export function AlwaysOnAgents({
             </li>
           ))}
           {missing.map((entry) => (
-            <li key={`missing:${entry.role}:${entry.name}`} className="min-w-0 bg-surface">
-              <div className="h-full bg-warning/[0.05] px-4 py-3">
+            <li
+              key={`missing:${entry.role}:${entry.name}`}
+              className="min-w-0 overflow-hidden rounded-control bg-surface shadow-hairline"
+            >
+              <div className="h-full bg-wait-tint px-4 py-3">
               <div className="flex min-w-0 items-center gap-2">
                 <span aria-hidden="true" className="size-2 shrink-0 rounded-full bg-warning" />
                 <span className="shrink-0 text-label font-semibold text-foreground">
@@ -118,7 +124,7 @@ function AlwaysOnTile({
         "relative flex h-full w-full min-w-0 flex-col gap-2 px-4 py-3 text-left transition-colors",
         FOCUS_RING_INSET,
         selected ? "bg-surface-selected" : "hover:bg-surface-hover",
-        !agent.live && "bg-warning/[0.05]",
+        !agent.live && "bg-wait-tint",
       )}
     >
       {agent.attention && (

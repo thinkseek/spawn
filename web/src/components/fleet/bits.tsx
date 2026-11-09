@@ -17,7 +17,7 @@ export function JudgeBadge({
   const kind = judgeKind(judge);
   const style = {
     jev: {
-      className: "bg-jev/12 text-jev ring-jev/30",
+      className: "bg-judge-tint text-jev ring-jev/30",
       icon: <Sparkles size={11} />,
       label: "Jev",
       title: "Decided by Jev, the model judge",
