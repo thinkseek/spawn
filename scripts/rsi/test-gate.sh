@@ -1809,7 +1809,7 @@ normalized() {
     # so a wait for a slot (another gate on the host) failed the comparison.
     sed -E -e '/^\| (base|candidate) runs: /d' \
         -e '/^\| gate time: /d' -e '/^\| sockets hidden from the sandbox: /d' \
-        -e '/^\| host scenario slots: /d' \
+        -e '/^\| host scenario slots: /d' -e '/^\| [a-z]+ start order /d' \
         -e '/^\| waited [0-9.]+ s for host scenario slot /d' \
         -e '/^\| [a-z]+\.[0-9]+: (still )?waiting for a host scenario slot /d' \
         -e 's/[0-9]+ms/Nms/g' -e 's/[0-9]+ s\b/N s/g' "$work/gate.out"
@@ -1999,6 +1999,43 @@ expect "one put on the list is judged again, alone" \
 rm "$alone/serial"
 expect "the control: without the list, 071 meets its neighbours" \
     "$(with_jobs 4 alone-control "$good" "$alone")" 'exit=6 {"host_fault":true,'
+
+# 16h. The start order (cut B): the serial list first, then the task and
+# check-tests, then the rest longest first by the last completed runs'
+# times; the log and the verdict keep the scenario order. 061 is the
+# shortest and 062 the longest; 064 runs alone; 063 is the task.
+longest=$work/longest
+mkdir -p "$longest"
+cp "$scenarios/protected" "$scenarios/build" "$longest/"
+for run in 061:0.25 062:2.5 063:1.5 064:0.25; do
+    cat >"$longest/${run%%:*}.sh" <<EOF
+#!/bin/sh
+echo "${run%%:*} started \$(date +%s%N)"
+sleep ${run#*:}
+[ "${run%%:*}" != 063 ] || [ "\$(cat value)" != one ]
+EOF
+done
+printf '#!/bin/sh\nexit 0\n' >"$longest/check-tests.sh"
+printf '064.sh\n' >"$longest/serial"
+# started <name>: when the candidate run of <name> printed that it started.
+started() { sed -n "s/^| $1 started \([0-9]*\)\$/\1/p" "$work/gate.out" | tail -n 1; }
+expect "a first gate: no times yet" "$(with_jobs 2 longest "$good" "$longest" "$longest/063.sh")" \
+    'exit=0 {"verdict":"accepted"}'
+expect "its candidate runs start with the serial list, the task and check-tests, then in the scenario order" \
+    "$(cat "$work/gate.out")" \
+    "| candidate start order (serial list first, then the task and check-tests, then longest first by the last runs' times, 0 of 2 known): 064.sh 063.sh check-tests.sh 061.sh 062.sh"
+expect "the times are kept for the next gate, per phase" \
+    "$(cd "$work/caches/longest/spawn/gate-times/"* && ls | tr '\n' ' ')" \
+    'base.061.sh base.062.sh base.063.sh base.064.sh candidate.061.sh candidate.062.sh candidate.063.sh candidate.064.sh candidate.check-tests.sh '
+expect "the next gate starts the longest first" \
+    "$(with_jobs 2 longest "$good" "$longest" "$longest/063.sh" >/dev/null; cat "$work/gate.out")" \
+    "| candidate start order (serial list first, then the task and check-tests, then longest first by the last runs' times, 2 of 2 known): 064.sh 063.sh check-tests.sh 062.sh 061.sh"
+expect "062 started before 061" "$([ "$(started 062)" -lt "$(started 061)" ] && echo before)" before
+expect "and the log keeps the scenario order" \
+    "$(grep -E '^\| == regression: 06[12]\.sh must still pass$' "$work/gate.out" | tr '\n' '/')" \
+    '| == regression: 061.sh must still pass/| == regression: 062.sh must still pass/'
+expect "one at a time, the scenario order and no line" \
+    "$(with_jobs 1 longest "$good" "$longest" "$longest/063.sh" >/dev/null; grep -c 'start order' "$work/gate.out")" 0
 
 # 16d. The base phase ends before any candidate code runs: each base run
 # leaves a mark in the base tree, and each candidate run wants all of them.
