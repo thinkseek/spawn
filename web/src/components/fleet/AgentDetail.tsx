@@ -5,7 +5,8 @@ import {
   Send,
   Sparkles,
 } from "lucide-react";
-import { useState } from "react";
+import { useId, useState } from "react";
+import type { KeyboardEvent, ReactNode } from "react";
 
 import { usePoll } from "../../api";
 import type {
@@ -29,8 +30,8 @@ import {
 } from "../../fleet";
 import { clockTime, formatDuration, relativeTime } from "../../format";
 import { freshAt } from "../../validated";
-import { LiveBadge, TerminalBlock, TerminalPanel } from "../Terminal";
-import { Ago, Button, Card, CardHeader, Drawer, EmptyState, cx } from "../ui";
+import { LiveBadge, TerminalPanel } from "../Terminal";
+import { Ago, Button, Card, CardHeader, Drawer, EmptyState, FOCUS_RING, cx } from "../ui";
 import {
   Fact,
   FleetStateBadge,
@@ -64,6 +65,12 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
   );
   // A judgement picked from the history; null follows the latest.
   const [pinnedSeq, setPinnedSeq] = useState<number | null>(null);
+  // The one screen card's view: the pane now, or the screen a judgement saw.
+  const [screenView, setScreenView] = useState<ScreenView>("live");
+  const backToLatest = () => {
+    setPinnedSeq(null);
+    setScreenView("live");
+  };
   const pinned =
     pinnedSeq == null
       ? null
@@ -123,33 +130,48 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
     >
       <div className="min-h-0 flex-1 overflow-y-auto bg-app-shell">
         <AgentSummary agent={agent} />
-        <div className="border-b border-surface-border bg-page-canvas px-4 py-2.5 sm:px-5">
-          <InputBox
-            sessionId={sessionId}
-            to={agent.agent_id || sessionId}
-            stopped={!agent.live}
-            commands={commands.data}
-          />
-        </div>
         <div className="grid gap-3 p-3 sm:p-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
           <div className="flex min-w-0 flex-col gap-3">
+            {/* Read and type in one place: the screen, then the input. */}
+            <div className="flex min-w-0 flex-col gap-2">
+              <AgentScreen
+                sessionId={sessionId}
+                view={screenView}
+                onView={setScreenView}
+                judged={{
+                  text: shown.judgement?.evidence?.screen_tail ?? null,
+                  judged: shown.judgement !== null,
+                  seq: shown.seq,
+                  at: shown.at,
+                }}
+              />
+              <div className="rounded-card bg-surface px-3 py-2.5 shadow-card">
+                <InputBox
+                  sessionId={sessionId}
+                  to={agent.agent_id || sessionId}
+                  stopped={!agent.live}
+                  commands={commands.data}
+                />
+              </div>
+            </div>
             <JevPanel
               judgement={shown.judgement}
               at={shown.at}
               seq={shown.seq}
               pinned={pinned !== null}
-              onBackToLatest={() => setPinnedSeq(null)}
+              onBackToLatest={backToLatest}
             />
           </div>
           <div className="flex min-w-0 flex-col gap-3">
-            <LivePane sessionId={sessionId} />
             <JudgementHistory
               records={judgements.data}
               error={judgements.error}
               selectedSeq={pinned ? pinnedSeq : null}
-              onSelect={(seq) =>
-                setPinnedSeq((current) => (current === seq ? null : seq))
-              }
+              onSelect={(seq) => {
+                const next = pinnedSeq === seq ? null : seq;
+                setPinnedSeq(next);
+                setScreenView(next === null ? "live" : "judged");
+              }}
             />
             <CommandList records={commands.data} error={commands.error} />
           </div>
@@ -495,11 +517,11 @@ function JevPanel({
                 </p>
               </div>
             )}
-            {evidence.screen_tail ? (
-              <TerminalBlock text={evidence.screen_tail} maxHeight="22rem" tail />
-            ) : (
-              <p className="text-caption text-faint-foreground">No screen captured.</p>
-            )}
+            <p className="text-caption text-faint-foreground">
+              {evidence.screen_tail
+                ? "The screen it saw: \u201cAs judged\u201d on the terminal card."
+                : "No screen captured."}
+            </p>
           </div>
         )}
       </div>
@@ -515,7 +537,24 @@ function formatFactMs(value: string): string {
 // ---------------------------------------------------------------------------
 // Live pane
 
-function LivePane({ sessionId }: { sessionId: string }) {
+type ScreenView = "live" | "judged";
+
+/**
+ * The agent's tmux pane, once: "Live" is the 3 s capture (not stored), and
+ * "As judged" is the screen tail stored with the judgement shown beside it
+ * (the latest, or the one pinned from the history).
+ */
+function AgentScreen({
+  sessionId,
+  view,
+  onView,
+  judged,
+}: {
+  sessionId: string;
+  view: ScreenView;
+  onView: (view: ScreenView) => void;
+  judged: { text: string | null; judged: boolean; seq: number | null; at: number | null };
+}) {
   const pane = usePoll(
     `pane:${sessionId}`,
     (signal) => fetchAgentPane(sessionId, signal),
@@ -523,33 +562,105 @@ function LivePane({ sessionId }: { sessionId: string }) {
     { checked: true },
   );
   const data = pane.data;
+  const live = view === "live";
+  const ids = useId();
+  const tabId = (target: ScreenView) => `${ids}-tab-${target}`;
+  const panelId = `${ids}-panel`;
+  const order: ScreenView[] = ["live", "judged"];
+  // Tabs: arrow keys, Home and End move between them and select (the
+  // selected tab is the one in the page's tab order).
+  const onTabKey = (event: KeyboardEvent<HTMLDivElement>) => {
+    const at = order.indexOf(view);
+    const next =
+      event.key === "ArrowRight"
+        ? order[(at + 1) % order.length]
+        : event.key === "ArrowLeft"
+          ? order[(at + order.length - 1) % order.length]
+          : event.key === "Home"
+            ? order[0]
+            : event.key === "End"
+              ? order[order.length - 1]
+              : null;
+    if (!next) return;
+    event.preventDefault();
+    onView(next);
+    document.getElementById(tabId(next))?.focus();
+  };
+  const tab = (target: ScreenView, label: ReactNode, title?: string) => (
+    <button
+      type="button"
+      role="tab"
+      id={tabId(target)}
+      aria-selected={view === target}
+      aria-controls={panelId}
+      tabIndex={view === target ? 0 : -1}
+      title={title}
+      onClick={() => onView(target)}
+      className={cx(
+        "inline-flex h-6 shrink-0 items-center gap-1 rounded-chip px-2 text-caption transition-colors",
+        FOCUS_RING,
+        view === target
+          ? "bg-white/[0.1] font-medium text-terminal-foreground"
+          : "text-terminal-foreground/60 hover:bg-white/[0.05] hover:text-terminal-foreground",
+      )}
+    >
+      {label}
+    </button>
+  );
   return (
     <TerminalPanel
       className="h-[26rem]"
-      title="Live peek"
-      tag={data?.terminal}
-      text={data?.text ?? ""}
+      title={<span className="sr-only">Screen</span>}
+      tabs={
+        <div
+          role="tablist"
+          aria-label="Screen"
+          onKeyDown={onTabKey}
+          className="flex shrink-0 items-center gap-1"
+        >
+          {tab("live", "Live", data?.terminal ? `tmux ${data.terminal}` : undefined)}
+          {tab(
+            "judged",
+            <span className="tnum whitespace-nowrap">
+              As judged · seq {judged.seq ?? "\u2014"}
+              {judged.at ? <> · {relativeTime(judged.at)}</> : null}
+            </span>,
+          )}
+        </div>
+      }
+      panel={{ id: panelId, labelledBy: tabId(view) }}
+      text={live ? (data?.text ?? "") : (judged.text ?? "")}
       placeholder={
-        pane.error
-          ? `Could not read the pane: ${pane.error}`
-          : data
-            ? data.live
-              ? "The pane is empty."
-              : "No terminal is running for this agent."
-            : "Connecting…"
+        live
+          ? pane.error
+            ? `Could not read the pane: ${pane.error}`
+            : data
+              ? data.live
+                ? "The pane is empty."
+                : "No terminal is running for this agent."
+              : "Connecting\u2026"
+          : judged.judged
+            ? "No screen was captured with this judgement."
+            : "Not judged yet."
       }
       status={
-        <>
-          <span className="hidden text-micro text-faint-foreground sm:inline">
-            tmux capture, not stored
-          </span>
-          {data?.captured_at_ms ? (
-            <span className="tnum text-caption text-faint-foreground">
-              {relativeTime(freshAt(data.captured_at_ms, pane.checkedAt))}
+        live ? (
+          <>
+            <span className="hidden text-micro text-faint-foreground sm:inline">
+              tmux capture, not stored
             </span>
-          ) : null}
-          <LiveBadge live={data?.live === true} known={data !== null} />
-        </>
+            {data?.captured_at_ms ? (
+              <span className="tnum text-caption text-faint-foreground">
+                {relativeTime(freshAt(data.captured_at_ms, pane.checkedAt))}
+              </span>
+            ) : null}
+            <LiveBadge live={data?.live === true} known={data !== null} />
+          </>
+        ) : (
+          <span className="hidden text-micro text-faint-foreground sm:inline">
+            stored with the judgement
+          </span>
+        )
       }
     />
   );
