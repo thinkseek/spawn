@@ -25,7 +25,13 @@
 # deploy; a deploy run again keeps its rollback copies; a deploy failing
 # after its push completes it on exit; a pending deploy that main has moved
 # past stops the deploy; deploy/hold.sh holds the missions repo at its main,
-# and the deploy releases that hold on success and on failure.
+# and the deploy releases that hold on success and on failure; the drain
+# (objective 037): a binary that can drain is drained before the stop, and
+# the stop follows within the unit's restart delay; a binary that cannot is
+# never asked (no --drain, no SIGUSR1); a drain past SPAWN_DEPLOY_DRAIN_SECS
+# or one that fails falls back to the stop and the deploy goes on; an
+# integrator not running is not asked; a bad SPAWN_DEPLOY_DRAIN_SECS is
+# refused before anything is done.
 #
 # TEST_DEPLOY_SCRIPT=<path> runs that deploy script instead of the
 # checkout's deploy/deploy.sh (to show which checks fail without a fix).
@@ -81,6 +87,9 @@ cat >"$scratch/fakebin/systemctl" <<'EOF'
 # This host has no spawn-model-relay unit (the README installs relays by
 # hand): systemctl says so with status 5, as it does for "Unit not found".
 echo "$*" >>"$SYSTEMCTL_LOG"
+[ -z "${SYSTEMCTL_TIMES-}" ] || echo "$(date +%s.%N) $*" >>"$SYSTEMCTL_TIMES"
+# FAKE_INTEGRATOR_INACTIVE: the integrator unit is not running.
+case "$*" in "--user is-active --quiet spawn-integrate") [ -z "${FAKE_INTEGRATOR_INACTIVE-}" ] || exit 3 ;; esac
 case "${SYSTEMCTL_FAIL-}" in "$*="*) exit "${SYSTEMCTL_FAIL##*=}" ;; esac
 case "$*" in "--user try-restart spawn-model-relay") exit 5 ;; esac
 EOF
@@ -306,6 +315,106 @@ check "refused (status $status)" [ "$status" -ne 0 ]
 check "says main is elsewhere, once" [ "$(grep -c "is pending, but the missions main is $head" "$out")" -eq 1 ]
 check "deploy.pending stays" [ "$(cat "$live/deploy.pending")" = "$base $other" ]
 check "the integrator is not left stopped" grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$SYSTEMCTL_LOG"
+
+echo "== the drain (objective 037)"
+rm -f "$live/deploy.pending"
+export SPAWN_CALLS=$scratch/spawn-calls.log DRAINED_AT=$scratch/drained-at SYSTEMCTL_TIMES=$scratch/systemctl-times.log
+# installed <capable|old>: the installed binary behind a shim that logs its
+# calls; "capable" also names --drain in its usage, as a binary with
+# objective 037 does, and plays its drain (FAKE_DRAIN: "" a gate that
+# records its verdict in FAKE_GATE_SECS, fail, hang).
+installed() {
+  cp "$live/bin/spawn" "$scratch/real-spawn"
+  if [ "$1" = capable ]; then
+    cat >"$live/bin/spawn" <<EOF
+#!/bin/sh
+# usage: spawn integrate [--once | --drain] [--root <dir>] [--gates <n>]
+echo "\$*" >>"\$SPAWN_CALLS"
+if [ "\${1-} \${2-}" = "integrate --drain" ]; then
+  case "\${FAKE_DRAIN-}" in
+  fail) echo "integrate: no integrator to drain" >&2; exit 1 ;;
+  hang) exec sleep 600 ;;
+  esac
+  echo "integrate: asked integrator 4242 to drain; waiting for it to end"
+  sleep "\${FAKE_GATE_SECS:-2}"
+  date +%s.%N >"\$DRAINED_AT"
+  exit 0
+fi
+exec "$scratch/real-spawn" "\$@"
+EOF
+  else
+    printf '#!/bin/sh\necho "$*" >>"$SPAWN_CALLS"\nexec "%s" "$@"\n' "$scratch/real-spawn" >"$live/bin/spawn"
+  fi
+  chmod 755 "$live/bin/spawn"
+  : >"$SPAWN_CALLS"
+  : >"$SYSTEMCTL_LOG"
+  : >"$SYSTEMCTL_TIMES"
+  rm -f "$DRAINED_AT"
+  git --git-dir="$missions" update-ref refs/heads/main "$base"
+  verdict_over "$base"
+}
+stop_at() { awk '$2 == "--user" && $3 == "stop" && $4 == "spawn-integrate" { print $1; exit }' "$SYSTEMCTL_TIMES"; }
+
+echo "-- a binary that drains, with a gate running"
+installed capable
+deploy FAKE_GATE_SECS=3
+check "succeeded (status $status)" [ "$status" -eq 0 ]
+check "asked the integrator to drain, once" [ "$(grep -cx -- "integrate --drain" "$SPAWN_CALLS")" -eq 1 ]
+check "said what it waits for" grep -q "draining spawn-integrate: no new gate starts; waiting up to 3600 s" "$out"
+check "passed the drain's own words on" grep -q "deploy:   integrate: asked integrator 4242 to drain" "$out"
+check "said it drained" grep -q "drained: every gate that was running recorded its verdict" "$out"
+drained=$(cat "$DRAINED_AT" 2>/dev/null || echo 0); stopped_at=$(stop_at)
+check "stopped the unit after the drain ended, within its 10 s restart delay ($drained -> ${stopped_at:-none})" \
+  awk -v d="$drained" -v s="${stopped_at:-0}" 'BEGIN { exit !(s >= d && s - d < 10) }'
+check "main moved to HEAD" [ "$(main)" = "$head" ]
+check "the services restarted" grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$SYSTEMCTL_LOG"
+
+echo "-- a binary that cannot drain"
+installed old
+deploy
+check "succeeded (status $status)" [ "$status" -eq 0 ]
+check "never ran --drain (so no SIGUSR1 reached anything)" bash -c '! grep -q -- "--drain" "$1"' _ "$SPAWN_CALLS"
+check "says the stop loses the running gates" grep -q "the installed binary cannot drain" "$out"
+check "stopped the integrator" grep -qx -- "--user stop spawn-integrate" "$SYSTEMCTL_LOG"
+check "main moved to HEAD" [ "$(main)" = "$head" ]
+
+echo "-- a drain past its bound"
+installed capable
+start=$(date +%s)
+deploy FAKE_DRAIN=hang SPAWN_DEPLOY_DRAIN_SECS=2
+check "succeeded (status $status)" [ "$status" -eq 0 ]
+check "said the bound was reached" grep -q "the drain reached its bound (2 s)" "$out"
+check "stopped the integrator" grep -qx -- "--user stop spawn-integrate" "$SYSTEMCTL_LOG"
+check "waited the bound, not the drain's 600 s ($(($(date +%s) - start)) s in all)" [ $(($(date +%s) - start)) -lt 300 ]
+check "main moved to HEAD" [ "$(main)" = "$head" ]
+
+echo "-- a drain that fails"
+installed capable
+deploy FAKE_DRAIN=fail
+check "succeeded (status $status)" [ "$status" -eq 0 ]
+check "said the drain failed and it stops as before" grep -q "the drain failed (exit 1): stopping the integrator as before" "$out"
+check "stopped the integrator" grep -qx -- "--user stop spawn-integrate" "$SYSTEMCTL_LOG"
+check "main moved to HEAD" [ "$(main)" = "$head" ]
+
+echo "-- an integrator that is not running"
+installed capable
+deploy FAKE_INTEGRATOR_INACTIVE=1
+check "succeeded (status $status)" [ "$status" -eq 0 ]
+check "asked nothing to drain" bash -c '! grep -q -- "--drain" "$1"' _ "$SPAWN_CALLS"
+check "main moved to HEAD" [ "$(main)" = "$head" ]
+
+echo "-- a bad SPAWN_DEPLOY_DRAIN_SECS"
+installed capable
+backups_before=$(ls "$live/backups" | wc -l)
+for bad in 0 abc 86401 1.5 -3 999999999999999999999; do
+  : >"$SYSTEMCTL_LOG"
+  deploy SPAWN_DEPLOY_DRAIN_SECS="$bad"
+  check "'$bad' refused (status $status)" [ "$status" -ne 0 ]
+  check "'$bad': says why" grep -q "SPAWN_DEPLOY_DRAIN_SECS must be a whole number of seconds from 1 to 86400" "$out"
+  check "'$bad': before touching a service" [ ! -s "$SYSTEMCTL_LOG" ]
+done
+check "before any backup" [ "$(ls "$live/backups" | wc -l)" -eq "$backups_before" ]
+check "main did not move" [ "$(main)" = "$base" ]
 
 echo
 if [ "$failures" -eq 0 ]; then echo "test-deploy: all passed"; else echo "test-deploy: $failures failed"; exit 1; fi
