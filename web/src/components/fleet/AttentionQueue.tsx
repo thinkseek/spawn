@@ -275,7 +275,7 @@ function Queue({
           </span>
         ) : (
           <span
-            className="tnum rounded bg-warning/15 px-1.5 py-px text-micro font-medium text-warning"
+            className="tnum rounded bg-wait-tint px-1.5 py-px text-micro font-medium text-warning"
             title="What the dispatcher raised, told to the supervisor or not, and what the supervisor asks"
           >
             {groups.count}
@@ -652,7 +652,7 @@ function JudgementQueue({
           {queue.length > 0 ? "Judges ask for attention" : "No judge asks for attention"}
         </h2>
         {queue.length > 0 && (
-          <span className="tnum rounded bg-warning/15 px-1.5 py-px text-micro font-medium text-warning">
+          <span className="tnum rounded bg-wait-tint px-1.5 py-px text-micro font-medium text-warning">
             {queue.length}
           </span>
         )}

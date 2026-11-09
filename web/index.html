@@ -3,9 +3,23 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="theme-color" content="#0a0b0d" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="light dark" />
     <title>Spawn</title>
+    <script>
+      /* The theme before the first paint (src/theme.ts keeps it current):
+         the stored choice, or the system's scheme. */
+      (function () {
+        var choice = "system";
+        try {
+          choice = localStorage.getItem("spawn.theme") || "system";
+        } catch (e) {}
+        var dark =
+          choice === "dark" ||
+          (choice !== "light" &&
+            !(window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches));
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

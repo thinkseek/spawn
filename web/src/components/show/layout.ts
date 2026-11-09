@@ -131,15 +131,16 @@ export function routePath(route: NodeKey[], stage: Stage): string | null {
 /** Seconds a mark takes: longer paths a little slower, never sluggish. */
 export const travelSeconds = scaleLinear().domain([0, 1400]).range([1.1, 3.2]).clamp(true);
 
-/** Mark colours: the trace kinds' slots (spawn.css --trace-*, stepped for
- * the dimmed canvas), one per kind of work, and a quiet neutral for plain
- * log appends. */
+/** Mark colours: the trace kinds' slots (spawn.css --trace-*, muted and
+ * stepped per theme), one per kind of work, the attention mark for a
+ * landing, and a quiet neutral for plain log appends. CSS variables, so the
+ * scene follows the theme. */
 export const TONE_COLOR: Record<Tone, string> = {
-  commit: "#4a93ea",
-  command: "#e7703a",
-  task: "#22ab7b",
-  landing: "#c98500",
-  trace: "#7d848e",
+  commit: "var(--trace-execution)",
+  command: "var(--trace-turn)",
+  task: "var(--trace-tool)",
+  landing: "var(--wait-mark)",
+  trace: "var(--trace-command)",
 };
 
 export const TONE_LABEL: Record<Tone, string> = {
@@ -151,4 +152,4 @@ export const TONE_LABEL: Record<Tone, string> = {
 };
 
 /** Status colours, reserved for the gate's verdict and always labelled. */
-export const VERDICT_COLOR = { accepted: "#0ca30c", rejected: "#d03b3b" } as const;
+export const VERDICT_COLOR = { accepted: "var(--ok-mark)", rejected: "var(--fail-mark)" } as const;

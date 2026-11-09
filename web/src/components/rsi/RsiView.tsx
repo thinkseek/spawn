@@ -13,7 +13,7 @@ import {
   metricPoints,
   openTask,
 } from "../../rsi";
-import { Button, Card, CardHeader, Eyebrow, LiveStatus, PageHeader, cx } from "../ui";
+import { Button, Card, CardHeader, Eyebrow, FOCUS_RING, LiveStatus, PageHeader, chip, cx } from "../ui";
 import { AgentPane } from "./AgentPane";
 import { ObjectiveName } from "./ObjectiveName";
 import { ChartLegend, MetricChart } from "./MetricChart";
@@ -59,7 +59,7 @@ export function RsiView({ onOpenSession }: RsiViewProps) {
         }
       >
         {data && data.missions.length > 1 && (
-          <div className="flex rounded-lg border border-surface-border bg-surface p-0.5">
+          <div className="flex gap-1.5">
             {data.missions.map((entry) => (
               <button
                 key={entry.id}
@@ -70,12 +70,7 @@ export function RsiView({ onOpenSession }: RsiViewProps) {
                   setChosenObjective(null);
                 }}
                 aria-current={entry.id === mission?.id ? "true" : undefined}
-                className={cx(
-                  "tnum h-6 rounded-md px-2 text-caption font-medium",
-                  entry.id === mission?.id
-                    ? "bg-surface-selected text-foreground"
-                    : "text-muted-foreground",
-                )}
+                className={cx("tnum", chip(entry.id === mission?.id), FOCUS_RING)}
               >
                 #{entry.id}
               </button>
@@ -100,7 +95,7 @@ export function RsiView({ onOpenSession }: RsiViewProps) {
       </PageHeader>
 
       {mission?.halted && (
-        <div className="flex shrink-0 items-start gap-3 border-b border-destructive/30 bg-destructive/12 px-4 py-3 sm:px-5">
+        <div className="flex shrink-0 items-start gap-3 border-b border-destructive/30 bg-fail-tint px-4 py-3 sm:px-5">
           <OctagonAlert size={18} className="mt-0.5 shrink-0 text-destructive" />
           <div className="min-w-0">
             <div className="text-body font-semibold text-destructive">
@@ -248,7 +243,7 @@ function ObjectiveCard({ mission }: { mission: RsiMission }) {
             />
           </div>
           <div className="mt-auto pt-4">
-            <div className="relative h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
+            <div className="relative h-1.5 overflow-hidden rounded-full bg-foreground/[0.06]">
               {progress === null ? (
                 <div className="bg-hatch absolute inset-0" />
               ) : (
@@ -402,7 +397,7 @@ function TaskCard({
                       ? "bg-foreground/35"
                       : index === current
                         ? style?.bar
-                        : "bg-white/[0.07]",
+                        : "bg-foreground/[0.07]",
                   )}
                 />
               ))}
@@ -435,7 +430,7 @@ function GuardsCard({
     <Card
       className={cx(
         "flex flex-col p-4",
-        halted && "border-destructive/40 bg-destructive/[0.06]",
+        halted && "border-destructive/40 bg-fail-tint",
       )}
     >
       <div className="flex items-center gap-2">
@@ -517,7 +512,7 @@ function Guard({
             key={index}
             className={cx(
               "h-3 w-1.5 rounded-sm",
-              index < value ? tone : "bg-white/[0.08]",
+              index < value ? tone : "bg-foreground/[0.08]",
             )}
           />
         ))}
@@ -530,10 +525,10 @@ function Guard({
 }
 
 const STATUS_STYLE: Record<RsiObjective["status"], string> = {
-  open: "bg-info/12 text-info ring-info/25",
-  solved: "bg-success/12 text-success ring-success/25",
-  met: "bg-success/12 text-success ring-success/25",
-  owner: "bg-warning/12 text-warning ring-warning/25",
+  open: "bg-info-tint text-info ring-info/25",
+  solved: "bg-ok-tint text-success ring-success/25",
+  met: "bg-ok-tint text-success ring-success/25",
+  owner: "bg-wait-tint text-warning ring-warning/25",
 };
 
 function StatusPill({ status }: { status: RsiObjective["status"] }) {
