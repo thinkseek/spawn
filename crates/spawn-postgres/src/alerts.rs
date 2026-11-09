@@ -103,12 +103,23 @@ from (select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
        order by e.id
        limit $2) x";
 
-/// Every session's latest judgement, with the execution end after it (a
-/// stop clears a stuck alert). The Observer keeps the latest judgement
-/// covering the latest fact; the alert reads the same one.
+/// Every session's latest judgement, with its execution's end when the
+/// session's current execution has ended (an end clears a stuck alert,
+/// whatever its cause). The Observer keeps the latest judgement covering
+/// the latest fact; the alert reads the same one.
+///
+/// The end is the session's latest `execution.started` or `execution.ended`
+/// when that is an end, not an end after the latest judgement: the Observer
+/// judges once more after every end (a rules judgement with no `stuck`), so
+/// an end is never after the latest judgement of a session that ended. A
+/// later `execution.started` (a resume) means the end is not current. Only
+/// the Bridge's `execution.ended` is an end, as the store's own fold has it
+/// (schema.sql: "a runner's exit report is no end"): a runner's late report
+/// of an older execution, after the resume's start, would otherwise read a
+/// live session as ended.
 ///
 /// Two reads of the log whatever the number of sessions: the judgements,
-/// and the first end after each of them, joined once. (The live log's ten
+/// and each session's latest start or end, joined once. (The live log's ten
 /// judgements cost 21 scans a pass read as correlated subqueries, one per
 /// judgement and one per end.)
 pub(crate) const OBSERVATIONS: &str = r"
@@ -119,21 +130,24 @@ with latest as (
     from spawn_events e
    where e.event_name = 'observation.recorded'
    order by e.session_id, e.id desc),
-ended as (
-  select distinct on (e.session_id) e.session_id, e.id, e.kind
+current as (
+  select distinct on (e.session_id) e.session_id, e.id, e.event_name, e.kind
     from spawn_events e
     join latest l using (session_id)
-   where e.event_name = 'execution.ended' and e.id > l.id
-   order by e.session_id, e.id)
+   where (e.event_name = 'execution.started'
+          or (e.event_name = 'execution.ended' and e.source = 'bridge'))
+   order by e.session_id, e.id desc)
 select coalesce(jsonb_agg(jsonb_build_object(
       'session_id', o.session_id, 'agent_id', o.agent_id, 'event_id', o.id,
       'at_ms', o.recorded_at_ms, 'observation', o.observation,
       'ended_event', o.ended_event, 'ended_cause', o.ended_cause)
     order by o.session_id), '[]'::jsonb)
 from (select l.session_id, l.agent_id, l.id, l.recorded_at_ms, l.observation,
-             x.id as ended_event, x.kind -> 'detail' ->> 'cause' as ended_cause
+             case when x.event_name = 'execution.ended' then x.id end as ended_event,
+             case when x.event_name = 'execution.ended'
+                  then x.kind -> 'detail' ->> 'cause' end as ended_cause
         from latest l
-        left join ended x using (session_id)
+        left join current x using (session_id)
        order by l.session_id) o";
 
 /// Commands that finished failed after `$1`, oldest first: a notice each,
