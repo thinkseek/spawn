@@ -44,7 +44,9 @@ mkdir "$backups/spawn-20261101-000000.dump"          # a directory, not a dump
 # The gate's base cache: entries used lately stay, one untouched for 20
 # days goes, and so does an unfinished write that old; a file not named
 # like an entry, and a directory named like one, stay.
-cache=$work/cache/spawn/gate-base
+# Under a dot directory, as the default ~/.cache is: a match on the whole
+# path once took every server template there for a half-made one.
+cache=$work/.cache/spawn/gate-base
 mkdir -p "$cache"
 hex=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 stale() { touch -h -d '20 days ago' "$@"; }
@@ -58,8 +60,25 @@ stale "$cache/notes"
 mkdir "$cache/d$(printf '%s' "$hex" | cut -c2-)"
 stale "$cache/d$(printf '%s' "$hex" | cut -c2-)"
 
+# The private test servers' templates: one a gate started from lately
+# stays, one no gate started from for 20 days goes with its lock, one a gate
+# is making (no `ready`) stays; a half-made one older than a day goes, a
+# fresh one stays.
+servers=$work/.cache/spawn/gate-pg
+mkdir -p "$servers"
+for t in a b c; do
+    mkdir "$servers/$t$(printf '%s' "$hex" | cut -c2-)"
+    touch "$servers/$t$(printf '%s' "$hex" | cut -c2-).lock"
+done
+touch "$servers/a$(printf '%s' "$hex" | cut -c2-)/ready"
+touch "$servers/b$(printf '%s' "$hex" | cut -c2-)/ready"
+stale "$servers/b$(printf '%s' "$hex" | cut -c2-)/ready" "$servers/b$(printf '%s' "$hex" | cut -c2-)"
+stale "$servers/a$(printf '%s' "$hex" | cut -c2-)" "$servers/c$(printf '%s' "$hex" | cut -c2-)"
+mkdir "$servers/.d$(printf '%s' "$hex" | cut -c2-).Ab12Cd" "$servers/.e$(printf '%s' "$hex" | cut -c2-).Ef34Gh"
+stale "$servers/.d$(printf '%s' "$hex" | cut -c2-).Ab12Cd"
+
 run() {
-    env TMPDIR="$tmp" SPAWN_BACKUP_DIR="$backups" XDG_CACHE_HOME="$work/cache" "$@" \
+    env TMPDIR="$tmp" SPAWN_BACKUP_DIR="$backups" XDG_CACHE_HOME="$work/.cache" "$@" \
         sh "$maintenance" >"$work/out" 2>&1
 }
 listing() { (cd "$1" && ls -A | LC_ALL=C sort | tr '\n' ' '); }
@@ -78,11 +97,13 @@ expect() {
 before_tmp=$(listing "$tmp")
 before_backups=$(listing "$backups")
 before_cache=$(listing "$cache")
+before_servers=$(listing "$servers")
 run SPAWN_MAINTENANCE_DRY_RUN=1
 expect "a dry run deletes nothing in TMPDIR" "$(listing "$tmp")" "$before_tmp"
 expect "nor in the backups" "$(listing "$backups")" "$before_backups"
 expect "nor in the base cache" "$(listing "$cache")" "$before_cache"
-expect "it says what would go" "$(grep -c 'would remove' "$work/out")" "5"
+expect "nor in the servers' templates" "$(listing "$servers")" "$before_servers"
+expect "it says what would go" "$(grep -c 'would remove' "$work/out")" "7"
 
 status=0
 run || status=$?
@@ -96,6 +117,9 @@ expect "the newest five deploy dumps stay, and every other file" "$(listing "$ba
 expect "base cache entries no gate used for 14 days go, and nothing else" "$(listing "$cache")" \
     "a$(printf '%s' "$hex" | cut -c2-) d$(printf '%s' "$hex" | cut -c2-) notes "
 expect "a recently used entry is intact" "$(cat "$cache/a$(printf '%s' "$hex" | cut -c2-)")" "solved"
+expect "a template a gate started from lately stays, under a dot directory too" "$(listing "$servers")" \
+    ".e$(printf '%s' "$hex" | cut -c2-).Ef34Gh a$(printf '%s' "$hex" | cut -c2-) a$(printf '%s' "$hex" | cut -c2-).lock c$(printf '%s' "$hex" | cut -c2-) c$(printf '%s' "$hex" | cut -c2-).lock "
+expect "with its ready" "$(listing "$servers/a$(printf '%s' "$hex" | cut -c2-)")" "ready "
 
 after_backups=$(listing "$backups")
 run || status=$?
