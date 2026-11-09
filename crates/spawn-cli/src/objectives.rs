@@ -145,6 +145,14 @@ pub(crate) struct Task {
     /// The objectives it comes after (`"after": [..]`): it is not assigned
     /// while one of them is open ([`choose`]).
     pub(crate) after: Vec<u32>,
+    /// The owner judges it, outside the gate (`"owner_judged": true`): it is
+    /// never assigned to the fleet ([`choose`], [`next_open`]), and the
+    /// fleet's board shows it as the owner's. It still counts as open for
+    /// [`ordered`]: a dependent objective waits until it is solved, since
+    /// the owner's work is what its dependents build on. It stays open
+    /// here until it lands in this mission (a landing is the only thing
+    /// this backlog's openness reads).
+    pub(crate) owner_judged: bool,
 }
 
 impl Task {
@@ -243,6 +251,15 @@ pub(crate) fn load_backlog(directory: &Path) -> Result<Vec<Task>, String> {
             unit: text_field("unit").unwrap_or_default(),
             lower_is_better: text_field("direction").as_deref() != Some("higher"),
             target: value.get("target").and_then(serde_json::Value::as_f64),
+            // A boolean and nothing else: an absent field is the fleet's,
+            // and `null` is refused like any other non-boolean (a flag that
+            // json tools leave unset is not a statement about the owner).
+            owner_judged: match value.get("owner_judged") {
+                None => false,
+                Some(flag) => flag.as_bool().ok_or_else(|| {
+                    format!("{}: `owner_judged` is not true or false", path.display())
+                })?,
+            },
             after: match value.get("after") {
                 None | Some(serde_json::Value::Null) => Vec::new(),
                 Some(after) => after
@@ -326,7 +343,7 @@ pub(crate) fn landed_value(task: &Task, landings: &[Landing]) -> Option<f64> {
 /// or an `objective.solved`: the objective's scenario passed at a base commit
 /// main already holds), or a recurring one whose latest landed metric misses
 /// its target.
-fn is_open(task: &Task, landings: &[Landing]) -> bool {
+pub(crate) fn is_open(task: &Task, landings: &[Landing]) -> bool {
     if task.recurring {
         !landed_value(task, landings).is_some_and(|value| task.meets(value))
     } else {
@@ -357,10 +374,17 @@ pub(crate) fn one_shot(mission: &Mission, objective: u32) -> bool {
         .is_some_and(|task| !task.recurring)
 }
 
-/// The lowest open objective: what one free slot gets with nothing in flight.
+/// Whether the fleet may be given `task`: open, and not the owner's to
+/// judge.
+fn assignable(task: &Task, landings: &[Landing]) -> bool {
+    is_open(task, landings) && !task.owner_judged
+}
+
+/// The lowest open objective the fleet may be given: what one free slot
+/// gets with nothing in flight. An owner-judged objective is never it.
 #[cfg(test)]
 pub(crate) fn next_open<'a>(backlog: &'a [Task], landings: &[Landing]) -> Option<&'a Task> {
-    backlog.iter().find(|task| is_open(task, landings))
+    backlog.iter().find(|task| assignable(task, landings))
 }
 
 /// Whether every objective `task` comes after is solved: not open in
@@ -494,10 +518,11 @@ fn components(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
     found
 }
 
-/// The objectives that fill `free` slots: the open ones without a task in
-/// flight (`in_flight`) whose `after` objectives are solved, fewest attempts
-/// first (yields, then failed attempts since the last yield, then the
-/// lowest id), at most `free` of them.
+/// The objectives that fill `free` slots: the open ones the fleet may be
+/// given ([`assignable`]: an owner-judged objective is never one) without a
+/// task in flight (`in_flight`) whose `after` objectives are solved, fewest
+/// attempts first (yields, then failed attempts since the last yield, then
+/// the lowest id), at most `free` of them.
 pub(crate) fn choose<'a>(
     backlog: &'a [Task],
     landings: &[Landing],
@@ -509,7 +534,7 @@ pub(crate) fn choose<'a>(
     let mut open: Vec<&Task> = backlog
         .iter()
         .filter(|task| {
-            is_open(task, landings)
+            assignable(task, landings)
                 && !in_flight.contains(&task.id)
                 && !held.contains(&task.id)
                 && ordered(task, backlog, landings)
@@ -699,11 +724,24 @@ pub(crate) struct Yield {
     pub(crate) objective: u32,
     /// The objective's failed attempts since its last yield, oldest first.
     pub(crate) failures: Vec<String>,
+    /// The mission's run of gate rejections when every one of them was a
+    /// task of this objective and the run reached the halt (the store's
+    /// `gate_rejection_objective`): the objective yields instead of the
+    /// mission halting. None when the yield is the failed attempts' alone.
+    pub(crate) rejections: Option<u32>,
 }
 
 impl Yield {
     /// The one line the record and the supervisor get.
     pub(crate) fn reason(&self) -> String {
+        if let Some(rejections) = self.rejections {
+            return format!(
+                "{rejections} gate rejections in a row, all objective {}'s tasks: task #{} \
+                 yields its slot to the next objective instead of halting the mission, its \
+                 work set aside",
+                self.objective, self.task
+            );
+        }
         format!(
             "objective {} had {} failed attempts since its last turn ({}); task #{} yields its \
              slot to the next objective, its work set aside",
@@ -721,6 +759,13 @@ impl Yield {
 /// now). A reported task waits for its gate, whose verdict settles it: it
 /// lands, or goes back to revise and yields then (task 106 of mission 4 had
 /// four failures when its fifth verdict was `accepted`).
+///
+/// A task of the objective that the mission's run of gate rejections names
+/// (`gate_rejection_objective`, every rejection of the run that
+/// objective's) yields too once the run reaches the halt, whatever `limit`
+/// is: three rejections of one objective say the objective is hard, not
+/// that the gate rejects everything, so it yields and the mission does not
+/// halt ([`crate::integrate::halt_reason`]).
 pub(crate) fn yields(
     mission: &Mission,
     attempts: &BTreeMap<u32, Attempts>,
@@ -738,11 +783,18 @@ pub(crate) fn yields(
         })
         .filter_map(|task| {
             let objective = task.objective?;
-            let tried = attempts.get(&objective)?;
-            (tried.failures.len() >= limit).then(|| Yield {
+            let failures = attempts
+                .get(&objective)
+                .map(|tried| tried.failures.clone())
+                .unwrap_or_default();
+            let rejections = (mission.gate_rejection_objective == Some(objective)
+                && mission.gate_rejections >= crate::integrate::HALT_AFTER)
+                .then_some(mission.gate_rejections);
+            (failures.len() >= limit || rejections.is_some()).then_some(Yield {
                 task: task.id,
                 objective,
-                failures: tried.failures.clone(),
+                failures,
+                rejections,
             })
         })
         .collect()
@@ -955,7 +1007,7 @@ pub(crate) fn assign_next(
             store,
             &json!({"type": "task.cancelled", "id": slot.task, "yielded": true,
                     "objective": slot.objective, "failures": slot.failures.len(),
-                    "limit": limit, "reason": reason}),
+                    "limit": limit, "rejections": slot.rejections, "reason": reason}),
         )?;
         println!("integrate: mission {}: {reason}", mission.id);
         yielded.insert(slot.task);
@@ -1103,6 +1155,7 @@ mod tests {
             lower_is_better: true,
             target: recurring.then_some(1100.0),
             after: Vec::new(),
+            owner_judged: false,
         }
     }
 
@@ -1608,6 +1661,32 @@ mod tests {
         // An objective with no failures is untouched at any limit.
         let healthy = mission(1, &[(200, 30, "revise")]);
         assert!(yields(&healthy, &tried, 1, &none).is_empty());
+
+        // Three gate rejections in a row, all objective 30's: it yields at
+        // any limit, with the run in its record's reason; two do not, nor a
+        // run that names another objective, nor its task under a gate.
+        let mut rejected = mission(1, &[(200, 30, "revise")]);
+        rejected.gate_rejections = 3;
+        rejected.gate_rejection_objective = Some(30);
+        let slots = yields(&rejected, &tried, 99, &none);
+        assert_eq!(slots.len(), 1);
+        assert_eq!((slots[0].task, slots[0].rejections), (200, Some(3)));
+        assert!(
+            slots[0]
+                .reason()
+                .starts_with("3 gate rejections in a row, all objective 30's tasks: task #200"),
+            "{}",
+            slots[0].reason()
+        );
+        assert!(yields(&rejected, &tried, 99, &BTreeSet::from([200])).is_empty());
+        rejected.gate_rejections = 2;
+        assert!(yields(&rejected, &tried, 99, &none).is_empty(), "two");
+        rejected.gate_rejections = 3;
+        rejected.gate_rejection_objective = Some(31);
+        assert!(
+            yields(&rejected, &tried, 99, &none).is_empty(),
+            "another's run"
+        );
     }
 
     /// Mission 4 as the live log had it at 2026-11-07 23:05:46, when task
@@ -1883,6 +1962,103 @@ mod tests {
         )
         .expect("write");
         assert!(load_backlog(&dir).is_err(), "not a list of ids");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An owner-judged objective is never assigned: not by `choose` (even
+    /// with a free slot and nothing in flight), not as `next_open`; it still
+    /// counts as open, so an objective after it waits, and a mission whose
+    /// only unsolved objective is the owner's gets no task at all.
+    #[test]
+    fn an_owner_judged_objective_is_never_assigned() {
+        let mut owner = objective(1, false);
+        owner.owner_judged = true;
+        let backlog = [owner, objective(2, false)];
+        assert_eq!(next_open(&backlog, &[]).map(|task| task.id), Some(2));
+        assert_eq!(
+            ids(&choose(
+                &backlog,
+                &[],
+                &BTreeSet::new(),
+                &untried(),
+                &BTreeSet::new(),
+                5
+            )),
+            [2],
+            "the fleet's slots skip the owner's objective"
+        );
+        // The mission's only unsolved objective being the owner's assigns
+        // nothing, as does one whose dependents all wait on it.
+        let owner_only = [backlog[0].clone()];
+        assert!(next_open(&owner_only, &[]).is_none());
+        assert!(
+            choose(
+                &owner_only,
+                &[],
+                &BTreeSet::new(),
+                &untried(),
+                &BTreeSet::new(),
+                5
+            )
+            .is_empty()
+        );
+        let mut dependent = objective(3, false);
+        dependent.after = vec![1];
+        assert!(
+            choose(
+                &[backlog[0].clone(), dependent.clone()],
+                &[],
+                &BTreeSet::new(),
+                &untried(),
+                &BTreeSet::new(),
+                5
+            )
+            .is_empty(),
+            "an objective after the owner's waits until it is solved"
+        );
+        // Solved (landed), the owner's objective no longer holds its
+        // dependent.
+        let landed = [landing(1, None)];
+        assert_eq!(
+            ids(&choose(
+                &[backlog[0].clone(), dependent],
+                &landed,
+                &BTreeSet::new(),
+                &untried(),
+                &BTreeSet::new(),
+                5
+            )),
+            [3]
+        );
+    }
+
+    /// `owner_judged` is read from the file; anything but a boolean is
+    /// refused rather than read as true or false.
+    #[test]
+    fn the_backlog_reads_owner_judged_and_refuses_another_value() {
+        let dir = std::env::temp_dir().join(format!("spawn-backlog-owner-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("029.json"),
+            r#"{"id": 29, "prompt": "p", "owner_judged": true}"#,
+        )
+        .expect("write");
+        std::fs::write(dir.join("030.json"), r#"{"id": 30, "prompt": "p"}"#).expect("write");
+        let read = load_backlog(&dir).expect("valid");
+        assert!(read[0].owner_judged);
+        assert!(!read[1].owner_judged, "absent is the fleet's");
+        std::fs::write(
+            dir.join("030.json"),
+            r#"{"id": 30, "prompt": "p", "owner_judged": "yes"}"#,
+        )
+        .expect("write");
+        assert!(load_backlog(&dir).is_err(), "not a boolean");
+        std::fs::write(
+            dir.join("030.json"),
+            r#"{"id": 30, "prompt": "p", "owner_judged": null}"#,
+        )
+        .expect("write");
+        assert!(load_backlog(&dir).is_err(), "null is not a boolean either");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

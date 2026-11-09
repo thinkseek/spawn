@@ -156,7 +156,9 @@ spawn fleet
 | `SPAWN_JUDGE_URL` | 未设 | 判定服务根地址，未设时用内置规则 |
 | `SPAWN_WORKER` | `spawn-worker` | 租约中的 worker 名 |
 | `SPAWN_LOOP_INTERVAL_MS` | `500` | `spawn loop` 两轮之间的间隔 |
+| `SPAWN_SCREEN_QUIET_MS` | `500` | 活跃执行的会话记录要静止多久才读一次屏（读的是会话记录说不了的：提示符回来了）。越短越早知道就绪，抓屏也越多 |
 | `SPAWN_DELIVERY_RETRY_SECS` | `60` | 投递失败（什么也没打进去）后第一次计数重试前的等待（整秒，不是非负整数时在 loop 日志里警告并用默认值），之后每次加倍，至多 30 分钟；共重试 3 次（窗格未就绪的前 10 次拒绝不计） |
+| `SPAWN_DELIVERY_NOT_READY_MS` | `5000` | 投递因窗格未就绪被拒（什么也没打进去）后再试前的等待（毫秒，至少 100；不是这样的整数时在 loop 日志里警告并用默认值）。只决定何时再试，不改次数：前 10 次这样的拒绝始终不计。免计的是次数而不是时长，所以窗格在拒绝开始计数前得到的宽限约为 10 倍这个等待（默认约 50 秒，019 的 500 毫秒约 5 秒，下限约 1 秒）；更慢的窗格随后付计数重试的退避 |
 | `SPAWN_REISSUE_AFTER_SECS` | `300` | 首次投递的重试用尽、且没有一次可能打进去时，从最后一次尝试结束到重发（取消并重新分派一次，`spawn_task_reissue`）的等待（整秒，同上）。给一次部署修好主机的时间；部署后（`source.moved`）每个用尽的投递会立即再试一次 |
 | `SPAWN_STALL_DELIVERY_SECS` | `600` | 停滞上限（整秒，下同；不是非负整数时在 loop 日志里警告并用默认值）：待投递的任务多久没送达就升级给 supervisor。远长于第一次重试（60 s）和工人结束一轮所需的时间 |
 | `SPAWN_STALL_ACTIVITY_SECS` | `900` | 已投递的任务，会话多久没有新事实就升级。一次长构建或测试可以几分钟不写任何东西；工人回合已结束、而它启动的后台任务（会话记录里的 `job.started` 没有 `job.ended`）仍开着时算作活动，不升级 |
@@ -169,6 +171,8 @@ spawn fleet
 | `SPAWN_GATE` | `scripts/rsi/gate.sh` | `spawn integrate` 的门禁脚本，输出一行 JSON 判定；线上指向控制器（部署的提交树）`~/.local/share/spawn-rsi/controllers/spawn/scripts/rsi/gate.sh`，从不指向所有者的检出：所有者的改动部署后才生效 |
 | `SPAWN_INTEGRATE_GATES` | `1` | `spawn integrate` 同时跑的门禁数（跨任务组；每个任务组至多一个；`--gates` 优先）。大于 1（至多 8）须设 `SPAWN_TEST_DATABASE_PER_GATE=1`：门禁目前共用一个测试数据库服务器。场景目录里有 `no-test-database` 文件的任务组（如 Supply PA，测试用 PGlite）拿不到测试库地址，其判定不占这个名额，可与 Spawn 的门禁并行 |
 | `SPAWN_GATE_JOBS` | 未设 | 每个门禁同时跑的场景数（大于等于 1 的整数）。`spawn integrate` 总是把每个门禁的值传给 gate.sh：设了就用它；未设时，共用测试服务器的门禁为 1，其他门禁为（核数 − `SPAWN_GATE_WORKER_CORES`）÷ 能同时跑的门禁数（每个源一个，共用服务器的至多 `--gates`），至多 8。手跑 gate.sh 时未设则为 min(8, 核数/2) |
+| `SPAWN_GATE_HOST_JOBS` | 未设 | 整台主机的场景预算（大于等于 1 的整数）：每个门禁的每一次场景运行都先在 `$HOME/.cache/spawn/gate-slots` 下用 flock 领一个槽位，所有门禁合计不超过这个数。优先看主机自己的陈述文件 `$HOME/.cache/spawn/gate-slots/host_jobs`（部署从集成器的门禁环境写入，所有者可手改；它优先于本变量，所以手跑的门禁带别的值也抬高不了上限）；没有文件时用本变量，再没有则等于 `SPAWN_GATE_JOBS`（所有者设了的话），否则等于手跑 gate.sh 的默认值 min(8, 核数/2)。槽位在 gate.sh 内领取，谁起的门禁（集成器的、手跑的、部署预热的）都算同一份预算，不需要任何配置；进程结束（被杀也算）时内核释放锁，所以不丢槽位。等待中的运行会先打印 "waiting for a host scenario slot"，随后在自己的块里记录等了多久、拿到第几个槽位。构建钩子、测试清单（tests: what cargo runs）和快照不占槽位（每个门禁各一次，门禁本来就不多） |
+| `SPAWN_GATE_SLOT_WAIT_SECS` | `1800` | 一次场景运行为等主机的场景槽位最多等多久（整秒，从 1 起）。到点后门禁说“现在没有地方判定”（exit 5），把 `{"no_room":true,"check":"host scenario slot","waited_ms","budget"}` 写进 verdict 文件（也打印到 stdout，写入失败时集成器读最后一行），然后退出，这个场景不启动；任务按 `no_room` 的 backoff（5 分钟起，每次加倍，至多 40 分钟）再判，2 小时后升级一次。要短于集成的门禁墙钟（`SPAWN_GATE_WALL_CLOCK_MINUTES`，默认 120 分钟）；`spawn integrate` 不传它，测试用它把 30 分钟缩成秒 |
 | `SPAWN_GATE_WORKER_CORES` | 核数的四分之一（至少 1） | 给工人和主机留的核数（0 到核数 − 1 的整数，其他值使 `spawn integrate` 不启动并报出变量名）。门禁只在它的场景数 + 正在跑的门禁的场景数 + 这个数不超过核数时才开始（没有门禁在跑时总能开始），否则下一趟再试，不记录、不算失败 |
 | `SPAWN_TEST_DATABASE_LOG` | 未设 | 测试数据库服务器的日志（`log_line_prefix` `%m [%p] `）；`spawn integrate` 读它找门禁期间的崩溃：有崩溃时数据库错误也让 check-tests.sh 的失败算主机故障（`host_fault`）而非拒绝。未设时只有连接错误算 |
 | `SPAWN_GATE_HOST_FAULT_BACKOFF_SECS` | `300` | 连续第一次主机故障后，任务等多久再判；每多一次连续主机故障加倍，至多一小时 |

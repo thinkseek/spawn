@@ -309,8 +309,10 @@ it, on the same ladder.
   a deterministic **policy** that maps (facts, observation) to an action.
   Jev never chooses the action; its judgement is one input, and only within
   the limits of §2.1:
-  1. *Facts and rules* decide fixed cases: a lost execution is resumed
-     once (the one-resume rule, below).
+  1. *Facts and rules* decide fixed cases: every end of an execution is
+     classified and given its way back (the recovery, below); where the
+     recovery has not recorded an interruption, a lost execution is still
+     resumed once (the one-resume rule, the fallback).
   2. *A guarded nudge*: when the agent stopped without asking anything
      (Jev: WAITING, `needs_human` low, confidence high) and its task is not
      done, type `continue`, once per episode, rate-limited per agent.
@@ -353,6 +355,33 @@ it, on the same ladder.
   that failed is reported as failed) is news until it was told, however
   long that takes.
 
+  **When the dispatcher's pass runs.** The loop acts on records and on the
+  times records name, never on the clock. Every pass reads the log's
+  watermark (`max(spawn_events.id)`, one index-only read of its primary
+  key); the dispatcher's step — the facts, the mission rows, the stall
+  facts, the gate and hold records, the liveness of every resident and of
+  the supervisor — runs when that watermark has moved since it last ran, or
+  when one of its own timers is due, and on an idle fleet it runs not at all.
+  Its timers are all computed from the records it read, never counted:
+  a delivery's retry (`deliver.rs` `attempts()`: `NOT_READY_RETRY_MS`, 5 s,
+  after a refusal that typed nothing, `retry_wait_ms()` — a minute doubling,
+  at most 30 — after a failure), a stall's bound from the record it stands
+  on (`dispatch/stall.rs`), a failed Stop's retry (`dispatch/stops.rs`), a
+  background job's bound (`dispatch/jobs.rs`), a cancelled resident's notice
+  and a report note refused before typing. A due time the step cannot date
+  is due now, never later; a time already reached is the step's to act on
+  now, not a wait. Between passes the loop waits on `LISTEN spawn_events`
+  (the append's own notify) with a timeout of the earlier of the pass
+  interval and the next due time, so a change ends the wait at once and a
+  notification lost costs one interval at most: the notification is a hint,
+  the watermark is the record (§14 of design.md). The steps run at most once
+  a pass interval — the resolution the loop always had — so a burst of
+  appends inside one interval is one pass's work, while the Bridge's claim
+  of a submitted command is not held behind that interval. The Bridge's
+  reading of each engine's screen and transcript is not on this schedule:
+  neither is announced by an append, so it runs every pass (§5 of
+  design.md).
+
   **The one-resume rule.** A lost worker execution is resumed once
   (`dispatch-resume-<execution>`); once that resume has failed, the session
   is escalated (`resume failed`) and never resumed again by rule, until one
@@ -384,6 +413,82 @@ it, on the same ladder.
   every 20 s for ten minutes.) The facts are `failed_resume` and
   `resumed_young` in `dispatch_facts`; the rule is `resume_lost` in
   `dispatch/worker.rs`.
+
+  **The recovery: every way an execution ends is classified.** An
+  execution ends in many ways, and how it is brought back used to depend on
+  who kept it and how it ended; nothing recorded why. Now one rule
+  (`crate::recover`, in the loop before the dispatcher and the liveness
+  rule) reads every ending from recorded facts, records it once, and takes
+  its way back:
+
+  | Cause | Told from | Path | The numbers |
+  | --- | --- | --- | --- |
+  | `exited` | the end's exit status 0 | `resume` | due at once |
+  | `crashed` | a non-zero exit status, the signal the runner wrote beside it (9 for a SIGKILL), or a terminal gone while its server lives | `resume` | due at once; a resume's backoff doubles per failed one: 10, 20, 40, 80 … up to 640 s |
+  | `memory_limit` | the engine's resource envelope killed it (objective 029) | `resume` | as a crash |
+  | `host_restart` | the end found while the terminal server is gone, so every terminal in it died | `resume` | as a crash |
+  | `disk_full` | the workspace's filesystem read under `SPAWN_DISK_FLOOR_GB` at the end | `wait` | probed every `SPAWN_RECOVER_PROBE_SECS` (10 s); revived within one probe of room |
+  | `database_unavailable` | two or more passes of the loop that could not reach the database while the execution ran | `wait` | cleared at the first pass that gets through |
+  | `model_auth` | an API error line with status 401 or 403, `authentication_failed`, or a text holding `/login` | `wait` | probed every 10 s; cleared when the credentials file changes, one retry every `SPAWN_RECOVER_AUTH_RETRY_SECS` (1800 s) while it does not |
+  | `model_unavailable` | an API error line with status 529, 503, 500, 429 or none, or error `overloaded`, `rate_limit`, `server_error` | `wait` | retried after `SPAWN_RECOVER_MODEL_BACKOFF_SECS` (60 s) doubling per failed turn, capped at 4 x it, or at `retry_at_ms` when the text names when an account is available again |
+  | `context_exhausted` | an API error line whose text holds `Prompt is too long` | `handoff` | due at once: a Stop with its final checkpoint, then a new native session in the same workspace and branch |
+  | `budget` | the integrator's Stop of a task over its budget (objective 026) | `handoff` | as a context's |
+  | `stopped` | a Stop or Discard from a person, the supervisor, a cancelled task or a retirement | `final` | never revived |
+
+  When several hold the first in that order wins: a person's Stop before the
+  budget, a memory kill before a host restart, a full disk before a database
+  outage, a model login before a model outage before a context, a crash
+  before a clean exit. A Stop that is part of a revival (a handoff's) is no
+  interruption of its own.
+
+  Each interruption is one control record, written by the owner only
+  (`spawn_host_record`): `{"type": "execution.interrupted", "agent_id",
+  "session_id", "execution_id", "cause", "evidence", "path", "attempt",
+  "due_ms"}`. `attempt` counts the interruptions of that execution, so its
+  revival's key `recover-<execution>-<attempt>` names this one and no other;
+  `due_ms` is when the revival is due (null on `final`). The record names
+  the fact it rests on, so a restarted loop finds nothing to record twice
+  and revives nothing twice. The revival is one command — `resume` for a
+  resume path and a wait whose execution ended, `input` into a live engine,
+  `start` for a handoff — submitted as `spawn-liveness`, no earlier than
+  its `due_ms`. A wait clears on an observation, never on time: a model
+  answer to a retried turn, a changed credentials file, the loop's first
+  pass that reaches the database, or a free-space reading at the floor; its
+  clear is one `execution.cleared` record
+  (`{"execution_id", "session_id", "cause", "evidence", "waited_ms"}`) and
+  then the revival. A wait never counts toward the handoff.
+
+  A resume fails when its execution ends within 60 s of its start before it
+  made progress (no tool call completed and no turn ended after it started);
+  a revival that made progress succeeded, whatever ends it later. After
+  three failed resumes in a row the next interruption hands off instead, its
+  evidence naming `resumes_failed`. No path discards the workspace or the
+  checkpointed work: an ending execution's final checkpoint is taken as
+  before, a handoff stops first and starts on the same branch, a wait
+  leaves the engine or its workspace as it is, and a final path keeps the
+  branch.
+
+  One rule for every agent: the supervisor, the residents, and the ephemeral
+  workers that hold a delivered task (an idle worker with no open task is
+  not revived). Where the recovery has recorded an interruption, the
+  liveness rule (`supervise.rs`) starts nothing and the dispatcher's
+  one-resume rule revives nothing: they keep their own jobs (the charter,
+  the digest, the mission rows). The code is `crates/spawn-cli/src/recover.rs`;
+  the facts `spawn_postgres::RECOVERY_FACTS`, which reads the end's status
+  and signal, the transcript's API error lines by event id, the Stops sent
+  into the execution, its progress and the interruptions and revivals
+  already recorded.
+
+  **The loop outlives its database.** A pass that failed only because the
+  database could not be reached (`StoreError::Unreachable`) does not count
+  toward `MAX_FAILURES`: the loop keeps passing on its backoff (at most 30
+  intervals), builds the Bridge and the Observer again when the database
+  answers, and the engines run on untouched. At the first pass that gets
+  through, the recovery records the outage's interruptions
+  (`database_unavailable`, with its window, its failed passes and one line
+  of the error), clears them at once (that pass *is* the observation) and
+  the Bridge checkpoints what the engines wrote meanwhile. Every other
+  failure counts as before.
 
   **Deliveries that never reached their worker.** A delivery whose retries
   are spent on a host fault typed nothing (every attempt was refused before
@@ -631,10 +736,14 @@ the system. Its continuity is a design requirement, not a best effort:
 | Threat | What keeps the session |
 | --- | --- |
 | `spawn loop` restarts or is replaced | The engine runs in tmux outside the loop's lifetime (`KillMode=process`); the next loop recovers the execution from the log and keeps observing it |
-| The engine process exits or crashes | A **liveness rule** (control layer, facts only, no model): no live execution means `resume` with the recorded native session id, with backoff; a revival whose engine is lost or exits non-zero within a minute counts as a failed one, and only an execution that stayed up starts the count over |
-| The machine reboots | tmux is gone, so the execution is `Lost`; the same rule resumes it from the native transcript |
+| The engine process exits or crashes | The **recovery** (control layer, facts only, no model): the end is an `exited` or `crashed` interruption — a signal, a non-zero status or a terminal gone while its server lives — recorded once and `resume`d in the same native session at once, then after 10, 20, 40, 80 … s as resumes fail, capped at 640 s. A resume whose execution ends within a minute before any progress failed; three in a row hand off |
+| The machine reboots | tmux is gone, so every terminal in it died: the recovery records `host_restart` and resumes each execution by its key, within one pass of the loop's start |
+| The model API is overloaded, rate limited or unreachable, or the login expired | No execution ends: Claude Code writes its API error line and waits at its prompt. The recovery records `model_unavailable` or `model_auth` as the interruption and `wait`s: a retry after 60 s doubling to 4 minutes (or at the time a 429's text names), a probe of the credentials file every 10 s and one retry every 30 minutes while it does not change. The wait clears on the model's answer or the changed file, and the same native session goes on |
+| The context window is spent | `Prompt is too long` in an API error line: `context_exhausted`, and the handoff path below |
+| The engine's resource envelope kills it, or the disk fills | `memory_limit` (objective 029) resumes at once; `disk_full` waits until a reading of the workspace's filesystem is at or above `SPAWN_DISK_FLOOR_GB` |
+| Spawn's database is unreachable | The loop does not exit: only passes that could not reach it are not failed ones, the engines run on, and at the first pass that gets through the recovery records `database_unavailable` for each execution that lived through it, clears it, and the Bridge checkpoints what the engines wrote meanwhile |
 | A transcript Claude Code deleted | The resume puts it back from the transcript archive (`<root>/.transcripts`, copied at turn ends and execution ends; docs/storage.md, "The transcript archive"); one gone with no copy fails the resume instead of starting blank under the old id |
-| The native session cannot be resumed (transcript lost with no copy, resume fails three times) | `start` a fresh native session inside the same Spawn session, with a handoff prompt rebuilt from the log: mission, open worker tasks, recent escalations and decisions |
+| The native session cannot be resumed (transcript lost with no copy, resume fails three times, or there is none) | `start` a fresh native session inside the same Spawn session, on the same workspace and branch, with a handoff prompt rebuilt from the log: mission, open worker tasks, recent escalations and decisions, the interruption and the branch head |
 | The context window fills | Claude Code compacts on its own; the handoff path above is the fallback when it cannot |
 | A deploy changes its charter | Each new native session's start records the hash of the charter it gives; when the native session that runs holds another (after a loop restart, a resume or a compaction), the dispatcher types the new charter in at its next idle prompt, once, by record (§3, the supervisor) |
 | The supervisor hangs or loops | Its own observations (rules, then Jev) flag `stuck`; that goes to a human, never to an automatic stop |
@@ -659,7 +768,7 @@ input of a mission.
 | --- | --- | --- | --- |
 | Intake | human (or a standing source) | puts a mission in the inbox: `spawn mission add`, typing to the supervisor, answering a worker | bypass the record: every human input is a stored command with principal `human` |
 | Decision | supervisor | accepts a mission, splits it into tasks, routes each task to a resident or a fresh ephemeral worker, accepts or rejects reports, closes the mission | type into panes itself, but for a nudge or a `continue` after a transient model API error |
-| Delivery | dispatcher (rules) | delivers assigned tasks, one at a time per worker (a task typed into a live worker is preceded by a merge of `main` into its idle workspace, and its text says what the merge did: [storage.md](storage.md), "Main into a workspace"; a task is delivered when the command that carries it succeeds; a failed one, which typed nothing, is retried under `<key>-retry-<n>` with a doubling wait (`SPAWN_DELIVERY_RETRY_SECS`, 60 s first), 3 times; then a first delivery is re-issued (cancelled and assigned again, once) and any other is escalated, and after each deploy every spent delivery is tried once more (§3, "Deliveries that never reached their worker"); a refusal because the pane was not ready yet (`does not accept input`, refused before typing) is no failed attempt and goes again after 5 s, counted only past 10 of them; one that may have typed the task is escalated at once and never re-issued; a delivery that never reached the worker is not its last delivery, so its retry is not held back by itself); resumes, nudges, collects reports, wakes the supervisor with digests | choose who does what |
+| Delivery | dispatcher (rules) | delivers assigned tasks, one at a time per worker (a task typed into a live worker is preceded by a merge of `main` into its idle workspace, and its text says what the merge did: [storage.md](storage.md), "Main into a workspace"; a task is delivered when the command that carries it succeeds; a failed one, which typed nothing, is retried under `<key>-retry-<n>` with a doubling wait (`SPAWN_DELIVERY_RETRY_SECS`, 60 s first), 3 times; then a first delivery is re-issued (cancelled and assigned again, once) and any other is escalated, and after each deploy every spent delivery is tried once more (§3, "Deliveries that never reached their worker"); a refusal because the pane was not ready yet (`does not accept input`, refused before typing) is no failed attempt and goes again after `SPAWN_DELIVERY_NOT_READY_MS` (5 s), counted only past 10 of them; one that may have typed the task is escalated at once and never re-issued; a delivery that never reached the worker is not its last delivery, so its retry is not held back by itself); resumes, nudges, collects reports, wakes the supervisor with digests | choose who does what |
 | Execution | workers | do one task, end with a report | take work from anywhere but their assignment |
 
 **Two kinds of worker.**
@@ -851,7 +960,13 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   `SPAWN_ALERT_BACKUP_DUMP_MAX_AGE_SECS`, default 7200, or bundle older than
   `SPAWN_ALERT_BACKUP_BUNDLE_MAX_AGE_SECS`, default 93600; no record at all
   is no alert), `backup_budget` (objective 031's `over_alert`), `drill_failed`
-  (a `backup.verified` with `ok` false) and `model_auth` (objective 028's
+  (a `backup.verified` with `ok` false), `integrator_down` (no backend
+  holds the integrator's lock in `pg_locks` at every reading for
+  `SPAWN_ALERT_INTEGRATOR_DOWN_SECS`, default 300, longer than a deploy's
+  restart, while a gated mission that is open or active, not halted, and on
+  a source no owner holds has a reported task; cleared at the first reading
+  that finds the lock held; the lock is read only while such a task is in
+  the step's fold or the alert is open) and `model_auth` (objective 028's
   `execution.interrupted` with cause `model_auth`). Each fires once per
   occurrence and clears with the record or reading that cleared it; a
   threshold of `0` disables its check.
@@ -1129,10 +1244,25 @@ judges every landing, RSI or fleet. It exports both commits to temporary
 directories and judges the candidate with the controller's scenarios, never
 the tree's own:
 
-- it refuses changes to the paths in `<scenarios>/protected` (`rsi/`,
-  `scripts/rsi/`, `scripts/blackbox/`, `scripts/e2e.sh`), any build-time code
+- it refuses changes to any path in `<scenarios>/protected` (one prefix per
+  line, `#` comments, a line `!<prefix>` excepting paths under it; the
+  deployed list, `rsi/scenarios/protected`, protects `rsi/`, `scripts/`,
+  `deploy/`, `web/` but `web/src/` and `web/index.html`, `rust-toolchain`,
+  `rust-toolchain.toml` and `.cargo/` — everything that runs as the owner
+  outside the sandbox or that judges the candidate, which no candidate may
+  edit), any build-time code
   (`build.rs`, `.cargo/`, a `build` key in a Cargo.toml), any change to lint
-  configuration, and fewer runnable tests than the base;
+  configuration, fewer runnable tests than the base, and the loss of a base
+  test by name. The owner retires a test with the feature it removed by
+  naming it in `<scenarios>/retired-tests` (one name per line, `#` comments,
+  kept out of the base cache's key), which the gate reads on the host from
+  the scenarios directory it was given: for a mission gate,
+  `rsi/scenarios/retired-tests`, so a retirement there is a commit to the
+  mission's scenarios directory — a landing and a deploy of its own, not a
+  supervisor-side edit; for the owner's gate, a copy of the scenarios
+  directory the owner keeps in the checkout — `rsi/.gate-owner`, kept out of
+  the tree by `.gitignore` — with `retired-tests` beside that copy's own
+  `protected`, which is where the list has actually been used;
 - `<scenarios>/build` builds each tree;
 - when a task has a scenario, that scenario must fail on the base (exit 1)
   and pass on the candidate;
@@ -1186,10 +1316,16 @@ the tree's own:
   same uid outside the sandbox can (the same-uid limit).
 - **Exit status.** The gate exits 0 with a verdict. It exits 5 when it has
   no room to judge now: `TMPDIR` has less than `SPAWN_GATE_MIN_FREE_GB`
-  free (`scripts/disk.sh` `gate_room`). In that case it first writes the
-  fact `{"no_room":true,"free_kb","min_gb","tmpdir"}` to the verdict file,
-  before any scratch is made or any candidate code runs. On a disk with no
-  room at all, that write may fail, and the gate still exits 5. The
+  free (`scripts/disk.sh` `gate_room`), or a scenario run waited past its
+  bound (`SPAWN_GATE_SLOT_WAIT_SECS`, 30 minutes by default) for one of the
+  host's scenario slots (§10.2 "Host scenario slots"). In the first case
+  it first writes the fact `{"no_room":true,"free_kb","min_gb","tmpdir"}`
+  to the verdict file, before any scratch is made or any candidate code
+  runs; in the second, `{"no_room":true,"check":"host scenario slot",
+  "waited_ms","budget"}`, and no scenario of that run starts. On a disk
+  with no room at all, that write may fail, and the gate still exits 5; it
+  also prints the fact, and the integrator reads the last JSON line of
+  stdout before measuring, so a slot wait keeps its own check. The
   integrator reads `no_room` from exit 5 together with the fact (`gate.rs`).
   Without a readable fact, it measures the free space itself (`df`), and it
   records `no_room` with its own measurement only when that is under the
@@ -1208,7 +1344,11 @@ the tree's own:
   fact: `host_fault` with the evidence `cannot_judge`, never a rejection and
   never an abort (§10.3). Exit 6 with neither fact is an abort, as is any
   other status: exit 3 (no bwrap, a missing bind directory, an unreadable
-  `TMPDIR`, a floor that is not whole GiB), exit 4 (a run the gate lost:
+  `TMPDIR`, a floor that is not whole GiB, the gate's own tree under `/tmp`,
+  `/run` or `/var/tmp` — itself or below it — or under the host's `TMPDIR`
+  when that is not `/tmp`, all of which it refuses up front so that no base
+  key is computed from scripts the sandbox empties), exit 4 (a run the gate
+  lost:
   ended without a result),
   a timeout or a signal. The integrator measures the same floor, free
   memory and the test database itself before it starts the gate (§10.3,
@@ -1233,10 +1373,15 @@ tree: its `pnpm install` output, which git does not hold, at
 `~/.local/share/spawn-rsi/deps/<name>/<sha256 of the lockfile>` (read-only;
 `deploy/controller.sh deps` installs one, `update` does it when the
 lockfile's is missing, and a switch keeps the previous controller's tree and
-any tree an agent's workspace still links to, removing the rest). It is
+any tree an agent's workspace still links to, and any a process still uses,
+removing the rest, and points
+`<live>/deps/<name>/current` at the current one). It is
 never the owner's checkout, whose `node_modules` every agent may write. The
 gate binds the store read-only into its sandbox, and engines and gates read
-it through `SUPPLY_PA_DEPS` (deploy/systemd/README.md "The controller").
+it through `SUPPLY_PA_DEPS` in `spawn.env`, the literal path of `current`
+(unset, they use that pointer as they do anyway; set it only once a
+controller's tree and its pointer exist, since a path to no tree fails every
+engine's and gate's build) (deploy/systemd/README.md "The controller").
 Read-only is a boundary against accidents, not agents: the same uid can
 hardlink a store file and write it; boundaries against a deliberate agent
 are per-agent uids or a mount per engine.
@@ -1403,8 +1548,23 @@ are per-agent uids or a mount per engine.
      before recording anything: the same gate, scenarios and task scenario,
      base `head_base` = `git merge-base <head> <main>` (the `main` the head
      last took in), candidate the pushed head. The head passes: the verdict
-     is `incompatible` (below). The head fails too: `rejected`. The head's
-     run gives no verdict: `aborted` (or `no_room`), naming the head. When
+     is `incompatible` (below). The head fails too: `rejected`. The head
+     fails a check on `head_base` as well (the gate's `candidate and base`,
+     or a red main there): that base cannot judge it, and the merge's
+     rejection stands, `rejected` and counted, with the merge's reason, log
+     and note, `head_verdict` `unjudged`, a `head_reason` naming the check
+     and `head_base`, and a note saying the work alone could not be judged
+     there; never a host fault, which retried would find that base failing
+     each time. The head's
+     run gives no verdict otherwise: `aborted` (or `no_room`, or a host fault),
+     naming the head. Such a record's log and fact are the head's run on
+     `head_base`, never the merge's on `main`: it carries `head` and
+     `head_base`, its reason begins "the merge with main <main> was rejected
+     (<reason>); judging the work alone against the base it was built on,
+     <head_base>, gave no verdict:", and the supervisor's digest item says
+     the work was judged alone on that base (Supply PA's task 207,
+     2026-11-09, read as main failing check-tests while its head_base was
+     the red main). When
      the head contains `main`, a rejection of C is a rejection and no second
      run happens. The decision rests on two recorded verdicts on named
      commits, never on the text of a reason or on timing. The second run
@@ -1414,8 +1574,9 @@ are per-agent uids or a mount per engine.
      git moves. A check before the gate that fell short (step 3), or a gate
      that had no room (exit 5 with its fact, §10.2), is gated `no_room`. This
      is no verdict on the work. The task stays where it was, and the record
-     names `check` (`disk`, `memory` or `database`; the gate's own floor is
-     `disk`), `measured` and `threshold` (free KiB and the floor in KiB, with
+     names `check` (`disk`, `memory`, `database` or `host scenario slot`;
+     the gate's own floor is `disk`, and a slot wait is the host's scenario
+     budget), `measured` and `threshold` (free KiB and the floor in KiB, with
      `free_kb`, `min_gb` and `tmpdir`; available MiB and the floor in MiB;
      the error and the probe it failed, with `server` as
      host:port/database or the socket directory, never the URL's password),
@@ -1575,17 +1736,97 @@ are per-agent uids or a mount per engine.
      base-only fault of either evidence never counts toward
      `SPAWN_GATE_HOST_FAULT_CAP` and is never capped (§10.3).
      A task's report revision has at most `SPAWN_GATE_HOST_FAULT_CAP` (3 by
-     default) host faults judged after the candidate ran (either kind: the
-     test database's, or the gate's own with `on` `candidate and base`),
-     counted from its `task.gated` records: the next one at that revision
-     is recorded `aborted` instead, its reason saying so and the fault kept
-     under `host_fault`, so it counts toward the abort halt. A host fault is
-     no verdict on the work, but one that keeps recurring on the same work
-     may be the work's doing (a check's base run follows candidate code on
-     the shared test server), and an uncounted one would hold the task for
-     ever. A base-only fault (the gate's fact `on` `base`, or the base's own
-     disagreement) comes before any candidate code and counts toward no
-     halt, so it neither counts toward the cap nor is ever capped.
+     default) host faults judged after the candidate ran (the test
+     database's) against the same main, counted from its `task.gated`
+     records whose `base` is the main being judged now (a fault on an
+     older main says nothing of this one: Supply PA's task 207 had its
+     01:45 fault on fcf5e1e still counted at 08:32; a head judged alone is
+     recorded under main and counts there). The trade-off: every move of
+     main starts the count again, so on a busy source a candidate that
+     breaks the test server is capped only while main holds still; the
+     escalation at the second host fault in a row still tells the
+     supervisor. Every `host_fault` record names its `base` (the live
+     store's 10 of 10, 2026-11-09), so none is left uncounted. The next
+     one at that revision on that main is recorded `aborted` instead, its reason saying so and
+     the fault kept under `host_fault`, so it counts toward the abort halt.
+     A host fault is no verdict on the work, but one that keeps recurring on
+     the same work may be the work's doing (candidate code leaving the test
+     server broken for what runs after it), and an uncounted one would hold
+     the task for ever. A base-only fault (the gate's fact `on` `base`, or
+     the base's own disagreement) comes before any candidate code and
+     counts toward no halt, so it neither counts toward the cap nor is ever
+     capped. Nor does a check that failed on the candidate and on the base
+     (`on` `candidate and base`): main fails it without the candidate, and
+     counting it made a red main (Supply PA's check-tests, 2026-11-09
+     00:48-03:42) cap every task's next gate as an abort, feeding the abort
+     halt for a fault in no candidate.
+     **Main is red** when a check fails twice on the candidate and then
+     twice on the base, both base runs exit 1, and their `FAILED <test>:`
+     lines share at least one test (the rule "an unsolved result needs two
+     runs that agree", in one gate). The gate states it with its own fact,
+     exit 6 (`{"host_fault":true,"scenario","on":"main","runs","failures":
+     [{"test","message"}]}`, gate.rs `GateFailure::MainRed`). A base whose
+     second run passes, or whose two runs share no failing test, stays `on`
+     `candidate and base`. The integrator believes it only when some shared
+     failure is classed the work's (host.rs `classify`), none is a
+     connection or database error (a broken test server fails main and
+     candidate alike, so a shared {assertion, connection refused} is the
+     host's), and the test server's log shows no crash in the gate's window;
+     otherwise it is a `candidate and base` host fault, as before (`base`
+     when the base check below found it, before any candidate ran). A red is
+     one record per source,
+     `source.main_red` (`main`, `scenario`, `failures` with their class),
+     the first of its red carrying `alert`; the store keeps one row per
+     source (`mission_source_reds`: one row per source, whatever the check;
+     a later red, on the same main or a later one, moves `main` on and
+     keeps `since_ms`, with no new alert, and a red on a second check
+     replaces the first's `scenario`) and GATED gives each mission its
+     source's `red`. The task's gate is recorded `host_fault` with evidence
+     `main_red` and `fact.on` `main`: no backoff, no run of host faults, no
+     escalation, never counted toward the cap or a halt.
+     While the source's fetched main is the red one, its gates wait: a
+     ready task stays `reported`, no `task.gated` is written, and the
+     integrator says so once. Each `SPAWN_GATE_MAIN_RED_PROBE_MS` (an hour
+     by default) after the last red or probe, one gate runs anyway, a probe
+     (`source.main_probe`, written as its gate starts, so a ready task that
+     gets no gate that pass spends none; the store refuses one that is not
+     due, and the gate then does not start; `probe` on its `task.gated`), so
+     a candidate that fixes main is not starved. While a source is red, every gate on it is given
+     `SPAWN_GATE_BASE_CHECK=<check>`: the gate builds the base first and
+     runs that check on it twice before the candidate. A pass is written to
+     the verdict file at once and kept in every fact the gate writes after
+     (`base_check`), so the integrator records `source.main_green` whatever
+     the gate ends with (a verdict, a host fault on another check, no room,
+     an abort); it deletes the row (with the red's `since_ms`), and the
+     gate goes on judging the candidate as usual. A mission on the source
+     whose scenarios have no such check cannot run it ("not run"): it waits
+     like the others, until main moves or another mission's gate finds main
+     green. Two failures that
+     agree are the red again, before the candidate is built. A main that
+     moved lifts the hold at once (the next gate runs, with the base check).
+     The supervisor's digest tells a red once (its `alert`) and a green
+     once.
+
+     **A verdict on a main that moved is `stale`.** When the gate ends with
+     anything but `accepted` (rejected, conflict, incompatible, a host
+     fault, no room, an abort, a judging that panicked), the integrator
+     reads the source's main once (`git ls-remote`). If it is no longer the
+     base the gate judged, the task is gated `stale` with what the gate
+     found (`found`), main then (`base`) and now (`main_now`) and the
+     found verdict's reason, and judged again on the new main. Nothing is
+     counted: no rejection, no abort, no host fault toward
+     `SPAWN_GATE_HOST_FAULT_CAP` or its run, no room count, and no
+     `source.main_red` for a main that is no longer main. A read that
+     fails records the verdict as found, with the read's error as
+     `main_read` (main was never checked): it fails toward the behaviour
+     before the check, where judging again on an unknown main could loop.
+     Stale has no bound of its own; it is bounded in practice, since one
+     gate runs per source and only landings, owner pushes and moves the
+     owner records move main. Supply PA's mission 6 (2026-11-09):
+     a gate started on ab21a25, main moved to 513a34e at 09:00:35, and at
+     09:20:54 its host fault, capped as the third abort in a row, halted
+     the mission. An `accepted` keeps step 6's compare-and-swap as its
+     guard;
   6. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate
@@ -1728,7 +1969,15 @@ are per-agent uids or a mount per engine.
 - **Halt rules,** per mission and read from the log:
   - three gate rejections in a row: `rejected` counts; `accepted` resets
     the count; `incompatible`, `conflict`, `stale`, `aborted`, `no_room`
-    and `host_fault` leave it (three `incompatible` in a row halt nothing);
+    and `host_fault` leave it (three `incompatible` in a row halt nothing).
+    In an objective mission, a run whose rejections are all one
+    objective's tasks (`gate_rejection_objective`) halts nothing: that
+    objective yields its slot instead, as one out of attempts does, with
+    `rejections` on its `task.cancelled`. Any cancel of a task of the
+    run's objective ends the run, whoever cancels it (that yield, the other
+    rule's, or the owner's), so a later rejection is not mixed with a run
+    whose objective is gone. A
+    run across two objectives, or with a task of none, halts;
   - three gate aborts in a row (`no_room` and `host_fault` are not aborts,
     and leave the count);
   - the scenario count below its floor (the most scenarios a gate run of
@@ -1882,6 +2131,31 @@ are per-agent uids or a mount per engine.
     tasks kept failing held mission 4's three slots for a day (an abort was
     followed by a new task for the same objective five seconds later), and
     objectives 025 to 034 were never assigned.
+  - **The owner's own objectives are never assigned** (`"owner_judged":
+    true` in a backlog file; `rsi/backlog/029.json` is one: its scenario
+    needs a systemd user manager, which the gate's sandbox has none of). The
+    integrator leaves them out when it fills slots and when it names the
+    next objective, so such an objective costs no resident, no task and no
+    retry loop (before this, a host fault with evidence `cannot_judge`
+    re-issued it every backoff, forever). For order it still counts as open:
+    an objective that comes `after` it waits until it is solved (the
+    owner's work is what its dependents build on), and the backlog's order
+    check reads it as any other. It stays open in its mission until it
+    lands there (openness reads landings only), which is why the owner
+    sees it listed rather than solved. That makes a dependent in another
+    mission wait forever: 029's work lands in mission 7, so mission 4's
+    029 never closes, and an `after: [29]` written into mission 4's
+    backlog could never be satisfied. The order check would not see it
+    either (029 is in the graph and open, so nothing looks wrong): a
+    dependency is on a landing in the same mission. `spawn mission objectives` lists the
+    owner-judged and the fleet's open objectives apart for every objective
+    mission, and the board shows such an objective with status `owner`
+    (`owner_judged: true`), its landings as any other's. A task for such an
+    objective that is somehow in flight is judged as any other: the
+    `cannot_judge` host fault and its backoff are unchanged (this is
+    prevention, not a new verdict). The field is read by `load_backlog`;
+    a value that is not a boolean (`null` included) is refused, never read
+    as true or false.
   - **An objective already solved on the base.** A one-shot objective is
     solved once a task for it lands (below); it is also solved when its
     scenario passes at a base commit main already holds, because then no
@@ -1906,8 +2180,12 @@ are per-agent uids or a mount per engine.
   - **Named order.** A backlog objective may name the objectives it comes
     after (`"after": [28]` in its JSON, versioned with the backlog): it is
     not assigned while one of them is open (one the backlog does not hold
-    must have landed). Only 032 names one (after 028, whose wait paths its
-    soak exercises); the owner's preferred order of 028-033 stays prose,
+    must have landed). The dependency is on a landing in this mission
+    (openness reads the mission's own landings): an objective whose work
+    lands elsewhere is never seen solved here, so a dependency on one
+    waits forever, and the order check cannot see that (the objective is
+    in the graph and open). Only 032 names one (after 028, whose wait paths
+    its soak exercises); the owner's preferred order of 028-033 stays prose,
     since those prompts say each may be solved before or with the others.
   - Who gets which task: the resident takes a task whenever it has none
     open in the mission; every other task goes to a new per-task worker
@@ -1926,7 +2204,8 @@ are per-agent uids or a mount per engine.
     no longer main lands as the merge by main's rules; two in-flight
     objectives on the same lines make the second a `conflict`.
   - Budgets apply per task, in active time from its delivery (§10.3); the halt rules stay per
-    mission (three rejections in a row from any of its tasks halt it), and
+    mission (three rejections in a row across its objectives halt it;
+    three of one objective's tasks yield that objective instead), and
     a halted mission gets no new task and no judging until a human resumes
     it.
   - The brief is the objective, the working rules, the work its earlier
@@ -2052,7 +2331,62 @@ are per-agent uids or a mount per engine.
   jobs it gave). A setting that does not parse stops the integrator from
   starting, naming it. On 2026-11-08, with `SPAWN_GATE_PG_BIN` set, each
   gate took half of the 9 cores; two or three gates and the workers made a
-  load of 18-20, and task 172's gate failed on its base. Each judging records its own verdict and landing, which the next
+  load of 18-20, and task 172's gate failed on its base. **Host scenario
+  slots.** The jobs above bound one gate; the host's whole scenario budget
+  is separate and `scripts/rsi/gate.sh` takes it itself: every scenario
+  run, from every gate, first takes one of the host's slots. The number is
+  the host's own statement in `$HOME/.cache/spawn/gate-slots/host_jobs`,
+  which the deploy writes from the integrator's gate environment and the
+  owner may edit; without it, `SPAWN_GATE_HOST_JOBS`, then the gate's
+  `SPAWN_GATE_JOBS`, then the hand-run default min(8, cores/2). The file
+  outranks the environment so a hand-run shell cannot raise the cap, and a
+  gate started with a larger value cannot exceed it; the gate only reads
+  the file. The slots themselves are files under
+  `$HOME/.cache/spawn/gate-slots`, locked by flock on an fd of the run's own
+  subshell. The claim is in the gate, not here, so an integrator's gate, an
+  owner's hand-run and the deploy's base-cache warm-up share one budget
+  with nothing to configure; the fd's close releases a slot, so a killed
+  gate loses none, and a gate with two runs holds two slots (one each). A
+  waiting run says so while it waits ("waiting for a host scenario slot"),
+  and its block then records how long it waited and the slot it took, the
+  way the room no-room fact records disk. The build hook, the test listing
+  and the snapshot take no slot (one each per gate, and gates are few). Without the budget, on 2026-11-08 an owner
+  gate plus a fleet gate, and after the deploy a warm-up plus a fleet gate,
+  ran four heavy scenarios on 9 cores, and two tests with real-clock
+  windows — `a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it`
+  (a dead tmux pane's exit status unrecorded after 30 s) and
+  `dispatch::resume_replay::a_resume_that_succeeded_and_died_young` — failed
+  under it and rejected tasks 183, 184 and others.
+  **The base warm after a landing.** A gate judges against main, so after
+  every landing the next gate on that source had no base results cached and
+  judged the base again (36% of 54 gates' time on 2026-11-08; 1158 s for
+  the first gate after one landing). So the integrator warms it: after a
+  `task.landed` (recorded in the judging's thread and handed to the main
+  thread) and after an owner's `source.moved`, it starts one
+  `gate.sh --base-only <mirror> <new main> <scenarios>` in the background,
+  never waited for, its exit decides nothing (its log is
+  `~/.cache/spawn/gate-warm/<commit>.log`, its line in the integrator's
+  output). One at a time: a warm main moved past is abandoned (TERM, then
+  KILL after 10 s), what it finished stays cached for its commit, and a
+  commit is warmed once. A `--base-only` run is the lowest claimant of the
+  host's slots: it takes one only when no gate is waiting for one (a demand
+  lock beside the slots), runs one job, and builds with
+  `CARGO_BUILD_JOBS=1`, so its whole footprint is at most one slot no gate
+  wanted and one compiler job; a gate that arrives while it holds a slot
+  waits out that one job, two runs at most (no preemption), and shares the base results
+  through the base cache's per-key locks. It cannot outlive the integrator
+  unaccounted for: it runs under `setpriv --pdeathsig TERM`, in the
+  integrator's process tree and cgroup, and a starting integrator stops a
+  predecessor's warm only when `gate-warm/warm.pid` still names it (this
+  user, the recorded start time, `gate.sh --base-only` of the recorded
+  commit). `SPAWN_INTEGRATE_WARM=0` turns it off. The deploy's own warm-up
+  is the same `--base-only` run and claims as low. A warm's build hook
+  and test listing build at `CARGO_BUILD_JOBS=1` inside the sandbox; any
+  other gate builds with cargo's own default unless the owner sets
+  `SPAWN_GATE_BUILD_JOBS`. A warm takes its slot before a base entry's
+  lock, and that lock only without waiting (busy: another gate judges the
+  key, and the warm skips it), so a gate never waits on a key a warm holds
+  while the warm waits for a slot. Each judging records its own verdict and landing, which the next
   pass reads; finished judgings are reaped before a pass reads the
   missions. A judging that panics before any record of its own is
   recorded `aborted` with the reason, so the three-aborts halt bounds a

@@ -6,6 +6,7 @@ members = [
     "crates/spawn-jev",
     "crates/spawn-host",
     "crates/spawn-cli",
+    "crates/spawn-kdf",
 ]
 
 [workspace.package]
@@ -20,12 +21,16 @@ spawn-core = { path = "crates/spawn-core" }
 spawn-postgres = { path = "crates/spawn-postgres" }
 spawn-jev = { path = "crates/spawn-jev" }
 spawn-host = { path = "crates/spawn-host" }
+spawn-kdf = { path = "crates/spawn-kdf" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 # Blocking client: Spawn has no async code path, so no runtime is linked.
 postgres = { version = "0.19", default-features = false, features = ["with-serde_json-1"] }
 postgres-protocol = { version = "0.6", default-features = false }
+# Already linked through the driver; its fallible iterators are how the
+# `LISTEN spawn_events` connection waits for a notification with a timeout.
+fallible-iterator = "0.2"
 # Already linked through the driver's SCRAM login; derive the role passwords
 # (PBKDF2-HMAC-SHA256).
 sha2 = "0.11"
@@ -50,6 +55,11 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.postgres-protocol]
+opt-level = 3
+
+# The restricted logins' 600 000 PBKDF2 rounds (crates/spawn-kdf): about
+# 1 s per login unoptimised, the floor of every database test binary.
+[profile.dev.package.spawn-kdf]
 opt-level = 3
 
 [profile.test]

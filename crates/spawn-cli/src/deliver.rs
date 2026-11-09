@@ -155,8 +155,13 @@ const REISSUE_AFTER_MS: i64 = 5 * 60_000;
 
 /// Wait before a delivery refused because the pane was not ready
 /// ([`PANE_NOT_READY`]) is tried again: nothing was typed, and the pane is
-/// usually a moment from ready.
+/// usually a moment from ready. The default of
+/// `SPAWN_DELIVERY_NOT_READY_MS` ([`Waits::not_ready_ms`]).
 const NOT_READY_RETRY_MS: i64 = 5_000;
+
+/// The shortest `SPAWN_DELIVERY_NOT_READY_MS` taken: below it a typo (`5`)
+/// would retry a pane as fast as the loop turns.
+const NOT_READY_MIN_MS: i64 = 100;
 
 /// Refusals for a pane not ready that are not counted as failed attempts;
 /// past them each counts like any failure, so a pane that never shows its
@@ -181,9 +186,12 @@ fn backoff(base_ms: i64, failures: usize) -> i64 {
     base_ms.saturating_mul(1_i64 << doublings).min(RETRY_MAX_MS)
 }
 
-/// The dispatcher's two delivery waits, settings `spawn loop` reads from
+/// The dispatcher's three delivery waits, settings `spawn loop` reads from
 /// its environment ([`Waits::from_env`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Each is a wait in milliseconds, and the name says the unit: the
+// environment's own differ (seconds for two, milliseconds for one).
+#[allow(clippy::struct_field_names)]
 pub(crate) struct Waits {
     /// Before the first counted retry of a failed delivery
     /// (`SPAWN_DELIVERY_RETRY_SECS`, default 60): it doubles with every
@@ -192,6 +200,15 @@ pub(crate) struct Waits {
     /// After the last attempt of a spent first delivery, before its
     /// re-issue (`SPAWN_REISSUE_AFTER_SECS`, default 300).
     pub(crate) reissue_after_ms: i64,
+    /// After a refusal because the pane was not ready, before the next try
+    /// (`SPAWN_DELIVERY_NOT_READY_MS`, milliseconds, at least
+    /// [`NOT_READY_MIN_MS`], default [`NOT_READY_RETRY_MS`]). It says when,
+    /// never how many: [`NOT_READY_FREE`] refusals stay free whatever it is.
+    /// The free refusals are counted, not timed, so the grace a pane gets
+    /// before refusals count is about `NOT_READY_FREE` times this wait (50 s
+    /// at the default, 5 s at 019's 500 ms, 1 s at the floor); a pane slower
+    /// than that pays the counted backoff (`SPAWN_DELIVERY_RETRY_SECS`).
+    pub(crate) not_ready_ms: i64,
 }
 
 impl Default for Waits {
@@ -199,6 +216,7 @@ impl Default for Waits {
         Self {
             retry_ms: RETRY_MS,
             reissue_after_ms: REISSUE_AFTER_MS,
+            not_ready_ms: NOT_READY_RETRY_MS,
         }
     }
 }
@@ -230,9 +248,26 @@ impl Waits {
                 }
             }
         };
+        let retry_ms = millis("SPAWN_DELIVERY_RETRY_SECS", RETRY_MS);
+        let reissue_after_ms = millis("SPAWN_REISSUE_AFTER_SECS", REISSUE_AFTER_MS);
+        // In milliseconds: a pane is often ready in well under a second.
+        let not_ready_ms = match lookup("SPAWN_DELIVERY_NOT_READY_MS") {
+            None => NOT_READY_RETRY_MS,
+            Some(text) => match text.trim().parse::<i64>() {
+                Ok(ms) if ms >= NOT_READY_MIN_MS => ms,
+                _ => {
+                    warnings.push(format!(
+                        "SPAWN_DELIVERY_NOT_READY_MS={text:?} is not a whole number of \
+                         milliseconds from {NOT_READY_MIN_MS}; using {NOT_READY_RETRY_MS}"
+                    ));
+                    NOT_READY_RETRY_MS
+                }
+            },
+        };
         let waits = Self {
-            retry_ms: millis("SPAWN_DELIVERY_RETRY_SECS", RETRY_MS),
-            reissue_after_ms: millis("SPAWN_REISSUE_AFTER_SECS", REISSUE_AFTER_MS),
+            retry_ms,
+            reissue_after_ms,
+            not_ready_ms,
         };
         (waits, warnings)
     }
@@ -743,6 +778,99 @@ fn attempt_records(task: &TaskRow, facts: &Facts) -> Vec<Attempt> {
         .collect()
 }
 
+/// When the mission layer's next step is due, from the rows and facts this
+/// pass decided with: the earliest retry that is not due yet
+/// ([`Attempts::Retry`]), a cancelled resident's notice after its wait
+/// ([`cancel_order`]), or a report note refused before typing
+/// ([`note_retry`]). On this host's clock, the one those waits are compared
+/// against. `None`: nothing here waits for a clock.
+pub(crate) fn next_due(work: &Work, rows: &[Facts], now_ms: i64) -> Option<i64> {
+    let facts: BTreeMap<&str, &Facts> = rows
+        .iter()
+        .map(|facts| (facts.session_id.as_str(), facts))
+        .collect();
+    let mut due: Option<i64> = None;
+    // A time already reached is not a wait: this pass either acted on it or
+    // found the worker not ready for it, and either way the records that
+    // change that are what moves the watermark.
+    let mut soon = |at: i64| {
+        if at > now_ms {
+            due = Some(due.map_or(at, |known: i64| known.min(at)));
+        }
+    };
+    let next = next_up(work);
+    for task in &work.tasks {
+        if !matches!(task.state, TaskState::Assigned | TaskState::Revise)
+            || !next.contains(&task.id)
+        {
+            continue;
+        }
+        let Some(found) = facts.get(task.session_id.as_str()).copied() else {
+            continue;
+        };
+        if let Attempts::Retry { due_ms, .. } = attempts(&work.waits, task, found) {
+            soon(due_ms);
+        }
+    }
+    for cancelled in work.cancelled.iter().filter(|cancelled| !cancelled.told) {
+        let Some(found) = facts.get(cancelled.session_id.as_str()).copied() else {
+            continue;
+        };
+        if found.open_command || found.stopping() || found.live {
+            continue;
+        }
+        let prefix = cancelled.notice_prefix();
+        let tries: Vec<&crate::dispatch::Sent> = found
+            .dispatched
+            .iter()
+            .filter(|sent| sent.key.starts_with(&prefix))
+            .collect();
+        if let Some(last) = tries.last()
+            && last.succeeded == Some(false)
+        {
+            let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
+            soon(finished.saturating_add(retry_wait_ms(tries.len())));
+        }
+    }
+    for found in rows {
+        for tries in notes(&found.dispatched).into_values() {
+            let Some(last) = tries.last() else {
+                continue;
+            };
+            if crate::dispatch::reached_with(last.succeeded, last.error.as_deref())
+                || tries.len() > NOT_READY_FREE
+            {
+                continue;
+            }
+            let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
+            soon(finished.saturating_add(work.waits.not_ready_ms));
+        }
+    }
+    due
+}
+
+/// The report notes among the commands the dispatcher sent into one session,
+/// by the note's own key, each with its attempts oldest first
+/// ([`note_retry`]).
+fn notes(sent: &[crate::dispatch::Sent]) -> BTreeMap<&str, Vec<&crate::dispatch::Sent>> {
+    let mut notes: BTreeMap<&str, Vec<&crate::dispatch::Sent>> = BTreeMap::new();
+    for command in sent {
+        let key = match command.key.rsplit_once("-retry-") {
+            Some((base, number))
+                if !number.is_empty()
+                    && number.bytes().all(|byte| byte.is_ascii_digit())
+                    && base.starts_with(UNFINISHED_KEY) =>
+            {
+                base
+            }
+            _ if command.key.starts_with(UNFINISHED_KEY) => command.key.as_str(),
+            _ => continue,
+        };
+        notes.entry(key).or_default().push(command);
+    }
+    notes
+}
+
 /// Where a waiting task's current delivery stands, from its attempts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Attempts {
@@ -865,7 +993,7 @@ fn judge_attempts(waits: &Waits, sent: &[&crate::dispatch::Sent]) -> Attempts {
     if not_ready(last) && refusals <= NOT_READY_FREE {
         return Attempts::Retry {
             number: sent.len(),
-            due_ms: finished.saturating_add(NOT_READY_RETRY_MS),
+            due_ms: finished.saturating_add(waits.not_ready_ms),
         };
     }
     if failures > DELIVERY_RETRIES {
@@ -1593,7 +1721,7 @@ pub(crate) fn collect_reports(
         }
         let markers = unfinished::markers(&report);
         if !markers.is_empty() {
-            match refuse_unfinished(store, task, facts, &report, &markers, now_ms) {
+            match refuse_unfinished(store, task, facts, &report, &markers, &work.waits, now_ms) {
                 Ok(line) => lines.extend(line),
                 Err(error) => lines.push(format!(
                     "deliver: task #{} unfinished report: {error}",
@@ -1664,6 +1792,7 @@ fn refuse_unfinished(
     facts: &Facts,
     report: &str,
     markers: &[unfinished::Marker],
+    waits: &Waits,
     now_ms: i64,
 ) -> Result<Option<String>, String> {
     let error = |error: spawn_core::port::StoreError| error.to_string();
@@ -1673,7 +1802,7 @@ fn refuse_unfinished(
         .report_unfinished_recorded(task.id, &digest)
         .map_err(error)?
     {
-        let Some(retry) = note_retry(&key, facts, now_ms) else {
+        let Some(retry) = note_retry(&key, facts, waits, now_ms) else {
             return Ok(None);
         };
         send_note(store, task, &retry, unfinished_note(task.id, markers))?;
@@ -1707,7 +1836,7 @@ fn refuse_unfinished(
 /// [`NOT_READY_RETRY_MS`] has passed since: `<key>-retry-<n>`, at most
 /// [`NOT_READY_FREE`] times. None when the note reached the worker or may
 /// have, is in flight, or its tries are spent.
-fn note_retry(key: &str, facts: &Facts, now_ms: i64) -> Option<String> {
+fn note_retry(key: &str, facts: &Facts, waits: &Waits, now_ms: i64) -> Option<String> {
     let retry = format!("{key}-retry-");
     let attempts: Vec<&Sent> = facts
         .dispatched
@@ -1721,7 +1850,7 @@ fn note_retry(key: &str, facts: &Facts, now_ms: i64) -> Option<String> {
         return None;
     }
     let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
-    (now_ms >= finished.saturating_add(NOT_READY_RETRY_MS))
+    (now_ms >= finished.saturating_add(waits.not_ready_ms))
         .then(|| format!("{retry}{}", attempts.len()))
 }
 
@@ -1756,9 +1885,10 @@ fn send_note(
 #[cfg(test)]
 mod tests {
     use super::{
-        CREDENTIALS_LINE, Cancelled, DELIVERY_RETRIES, News, PROCESSES_LINE, REPORT, TaskRow, Work,
-        delivered, delivery_mark, mark_delivery, new_report, news_items, notice_task, put_aside,
-        report_contract, report_due, task_prompt, typed,
+        CREDENTIALS_LINE, Cancelled, DELIVERY_RETRIES, NOT_READY_RETRY_MS, News, PROCESSES_LINE,
+        REPORT, TaskRow, Work, delivered, delivery_mark, mark_delivery, new_report, news_items,
+        next_due, notice_task, put_aside, report_contract, report_due, retry_wait_ms, task_prompt,
+        typed,
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
@@ -1826,6 +1956,7 @@ mod tests {
             checkpoint: None,
             charter: None,
             jobs: Vec::new(),
+            recovered: None,
         }
     }
 
@@ -2093,6 +2224,7 @@ mod tests {
         // The stop runs: nothing else goes to the session meanwhile.
         let stopping = Facts {
             open_command: true,
+            recovered: None,
             ..worker(true, true)
         };
         assert!(orders(&work, &[stopping]).is_empty());
@@ -2113,6 +2245,7 @@ mod tests {
         // Submitted: nothing more while it runs, and the task still waits.
         let mut resuming = Facts {
             open_command: true,
+            recovered: None,
             ..stopped
         };
         resuming.dispatched.push(Sent {
@@ -3115,36 +3248,41 @@ mod tests {
 
     #[test]
     fn a_note_refused_untyped_goes_again_after_its_wait_and_one_that_reached_does_not() {
-        use super::{NOT_READY_FREE, NOT_READY_RETRY_MS, note_retry};
+        use super::{NOT_READY_FREE, NOT_READY_RETRY_MS, Waits, note_retry};
         use spawn_core::bridge::{MAY_HAVE_TYPED, PANE_NOT_READY};
         let key = "report-unfinished-7-0-00000000000000ab";
         let mut facts = worker(true, true);
         assert_eq!(
-            note_retry(key, &facts, 0),
+            note_retry(key, &facts, &Waits::default(), 0),
             None,
             "never sent: nothing to retry"
         );
         let refused = format!("pane state Busy {PANE_NOT_READY}");
         facts.dispatched = vec![note_sent(key, 1_000, Some(&refused))];
         assert_eq!(
-            note_retry(key, &facts, 1_000 + NOT_READY_RETRY_MS - 1),
+            note_retry(
+                key,
+                &facts,
+                &Waits::default(),
+                1_000 + NOT_READY_RETRY_MS - 1
+            ),
             None,
             "its wait has not passed"
         );
         assert_eq!(
-            note_retry(key, &facts, 1_000 + NOT_READY_RETRY_MS).as_deref(),
+            note_retry(key, &facts, &Waits::default(), 1_000 + NOT_READY_RETRY_MS).as_deref(),
             Some("report-unfinished-7-0-00000000000000ab-retry-1")
         );
         facts.dispatched = vec![note_sent(key, 1_000, None)];
         assert_eq!(
-            note_retry(key, &facts, i64::MAX / 2),
+            note_retry(key, &facts, &Waits::default(), i64::MAX / 2),
             None,
             "typed: told once"
         );
         let maybe = format!("the text {MAY_HAVE_TYPED}");
         facts.dispatched = vec![note_sent(key, 1_000, Some(&maybe))];
         assert_eq!(
-            note_retry(key, &facts, i64::MAX / 2),
+            note_retry(key, &facts, &Waits::default(), i64::MAX / 2),
             None,
             "may have been typed"
         );
@@ -3159,7 +3297,7 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            note_retry(key, &facts, i64::MAX / 2),
+            note_retry(key, &facts, &Waits::default(), i64::MAX / 2),
             None,
             "its tries are spent"
         );
@@ -3169,7 +3307,7 @@ mod tests {
             Some(&refused),
         )];
         assert_eq!(
-            note_retry(key, &facts, i64::MAX / 2),
+            note_retry(key, &facts, &Waits::default(), i64::MAX / 2),
             None,
             "another content's note"
         );
@@ -3496,6 +3634,7 @@ PENDING_ISSUES\n";
         super::Waits {
             retry_ms: 2_000,
             reissue_after_ms: 10_000,
+            ..super::Waits::default()
         }
     }
 
@@ -3549,6 +3688,83 @@ PENDING_ISSUES\n";
         assert!(
             warnings[0].contains("SPAWN_REISSUE_AFTER_SECS"),
             "{warnings:?}"
+        );
+    }
+
+    /// The wait after a refusal for a pane not ready is
+    /// `SPAWN_DELIVERY_NOT_READY_MS`, in milliseconds, from 100; anything
+    /// else warns and keeps 5 s. It moves when the next try is due, never
+    /// how many refusals are free.
+    #[test]
+    fn the_not_ready_wait_is_read_in_milliseconds_from_its_floor() {
+        let read = |value: &str| {
+            let value = value.to_string();
+            super::Waits::read(move |name| {
+                (name == "SPAWN_DELIVERY_NOT_READY_MS").then(|| value.clone())
+            })
+        };
+        let (waits, warnings) = read("500");
+        assert_eq!(waits.not_ready_ms, 500);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(read(" 100 ").0.not_ready_ms, 100, "the floor itself");
+        for bad in ["99", "5", "0", "-500", "0.5", "soon"] {
+            let (waits, warnings) = read(bad);
+            assert_eq!(waits.not_ready_ms, 5_000, "{bad}: the default holds");
+            assert_eq!(warnings.len(), 1, "{bad}");
+            assert!(
+                warnings[0].contains("SPAWN_DELIVERY_NOT_READY_MS")
+                    && warnings[0].contains("milliseconds from 100"),
+                "{warnings:?}"
+            );
+        }
+    }
+
+    /// A delivery and a note refused for a pane not ready go again
+    /// `not_ready_ms` after, whatever it is set to; the refusals free of
+    /// count stay [`super::NOT_READY_FREE`].
+    #[test]
+    fn a_refusal_goes_again_after_the_not_ready_wait_it_is_given() {
+        use spawn_core::bridge::PANE_NOT_READY;
+        let waits = super::Waits {
+            not_ready_ms: 500,
+            ..super::Waits::default()
+        };
+        let refused = format!("pane state Busy {PANE_NOT_READY}");
+        let first = sent(7, "deliver-3-0", 10_000, Some(&refused));
+        assert!(matches!(
+            super::judge_attempts(&waits, &[&first]),
+            super::Attempts::Retry { due_ms: 10_500, .. }
+        ));
+        let key = "report-unfinished-7-0-00000000000000ab";
+        let mut facts = worker(true, true);
+        facts.dispatched = vec![note_sent(key, 1_000, Some(&refused))];
+        assert_eq!(super::note_retry(key, &facts, &waits, 1_499), None);
+        assert_eq!(
+            super::note_retry(key, &facts, &waits, 1_500).as_deref(),
+            Some("report-unfinished-7-0-00000000000000ab-retry-1")
+        );
+        // Spent after the same count as at 5 s.
+        let mut all: Vec<Sent> = Vec::new();
+        for n in 0..=super::NOT_READY_FREE {
+            let attempt = if n == 0 {
+                "deliver-3-0".to_string()
+            } else {
+                format!("deliver-3-0-retry-{n}")
+            };
+            let id = 100 + i64::try_from(n).expect("small");
+            all.push(sent(id, &attempt, 10_000 + id, Some(&refused)));
+        }
+        // One past the free refusals: a counted retry, due by the counted
+        // wait under either not-ready wait.
+        let refs: Vec<&Sent> = all.iter().collect();
+        let due = |waits: &super::Waits| match super::judge_attempts(waits, &refs) {
+            super::Attempts::Retry { due_ms, .. } => due_ms,
+            _ => panic!("one counted failure is retried"),
+        };
+        assert_eq!(due(&waits), due(&super::Waits::default()));
+        assert_ne!(
+            due(&waits),
+            all.last().and_then(|s| s.finished_at_ms).expect("finished") + 500
         );
     }
 
@@ -3810,5 +4026,89 @@ PENDING_ISSUES\n";
         );
         assert!(super::orders(&tasks, &rows, 60_000).is_empty());
         assert_eq!(super::reissues(&tasks, &rows, 60_000).len(), 1);
+    }
+
+    /// The timers the mission layer waits for are the waits its own rules
+    /// name: a delivery refused because the pane was not ready goes again
+    /// after [`NOT_READY_RETRY_MS`], one that failed after `retry_wait_ms` of
+    /// its failures, and neither is waited for once it is due (the step acts
+    /// on it then) or when its retries are spent.
+    #[test]
+    fn a_waiting_delivery_is_due_at_the_end_of_its_own_wait() {
+        let mut refused = worker(true, true);
+        refused.dispatched = vec![sent(
+            30,
+            "deliver-7-0",
+            100_000,
+            Some("pane state Busy does not accept input"),
+        )];
+        let tasks = Work {
+            tasks: vec![task(7, TaskState::Assigned, "resident")],
+            ..Work::default()
+        };
+        assert_eq!(
+            next_due(&tasks, &[refused.clone()], 100_000),
+            Some(100_000 + NOT_READY_RETRY_MS),
+            "a refusal before typing waits the not-ready wait"
+        );
+        assert_eq!(
+            next_due(&tasks, &[refused], 100_000 + NOT_READY_RETRY_MS),
+            None,
+            "a wait already over is the step's to act on now"
+        );
+
+        let mut failed = worker(true, true);
+        failed.dispatched = vec![sent(31, "deliver-7-0", 500_000, Some("terminal gone"))];
+        assert_eq!(
+            next_due(&tasks, &[failed.clone()], 500_000),
+            Some(500_000 + retry_wait_ms(1)),
+            "a failed attempt waits its doubling wait"
+        );
+        failed.dispatched.push(sent(
+            32,
+            "deliver-7-0-retry-1",
+            700_000,
+            Some("terminal gone"),
+        ));
+        assert_eq!(
+            next_due(&tasks, &[failed], 700_000),
+            Some(700_000 + retry_wait_ms(2)),
+            "each failure after the first waits twice as long"
+        );
+    }
+
+    /// Nothing waits while nothing can be retried: an attempt in flight, one
+    /// that got through, a worker with a command in flight, and a delivery
+    /// the step is about to send for the first time.
+    #[test]
+    fn a_delivery_with_nothing_to_retry_waits_for_no_time() {
+        let tasks = Work {
+            tasks: vec![task(7, TaskState::Assigned, "resident")],
+            ..Work::default()
+        };
+        let mut fresh = worker(true, true);
+        fresh.dispatched = Vec::new();
+        assert_eq!(next_due(&tasks, &[fresh.clone()], 0), None, "its first try");
+        let mut through = worker(true, true);
+        through.dispatched = vec![sent(30, "deliver-7-0", 100_000, None)];
+        assert_eq!(
+            next_due(&tasks, &[through], 100_000),
+            None,
+            "it got through"
+        );
+        let mut busy = worker(true, true);
+        busy.open_command = true;
+        busy.dispatched = vec![sent(
+            31,
+            "deliver-7-0",
+            100_000,
+            Some("pane state Busy does not accept input"),
+        )];
+        assert_eq!(
+            next_due(&tasks, &[busy], 100_000),
+            Some(100_000 + NOT_READY_RETRY_MS),
+            "a command in flight holds the retry, but its end is an event: the wait is still \
+             the one the attempt names"
+        );
     }
 }

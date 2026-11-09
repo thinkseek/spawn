@@ -26,9 +26,11 @@ use postgres::{Client, NoTls, Row};
 use spawn_core::port::StoreError;
 
 /// SQL: whether the `agent_executions` row aliased `$x` died young: it
-/// ended lost or with a non-zero exit within a minute of its start. An
-/// engine that launches and dies at once is a failed revival, whatever its
-/// command's outcome says.
+/// ended lost or with a non-zero exit within a minute of its start, before
+/// it made any progress (no tool call completed and no turn ended after it
+/// started). An engine that launches and dies at once is a failed revival,
+/// whatever its command's outcome says; one that worked before a fault took
+/// it is not, and is revived at once (objective 032's soak).
 macro_rules! died_young {
     ($x:literal) => {
         concat!(
@@ -40,7 +42,12 @@ macro_rules! died_young {
             $x,
             ".cause = 'lost' or coalesce(",
             $x,
-            ".exit_code, 0) <> 0))"
+            ".exit_code, 0) <> 0) and not exists (select 1 from spawn_events p \
+             where p.session_id = ",
+            $x,
+            ".session_id and p.execution_id = ",
+            $x,
+            ".execution_id and p.event_name in ('tool.completed', 'turn.stopped')))"
         )
     };
 }
@@ -79,14 +86,17 @@ mod fleet;
 mod gateway;
 mod host;
 mod missions;
+mod recovery;
 mod row;
 mod scorecard;
 mod sessions;
+mod wake;
 
 pub use missions::{ActivityEvent, LandingHold};
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
 };
+pub use wake::Listener;
 
 /// Schema installed by [`PostgresStore::migrate`].
 const SCHEMA: &str = include_str!("../sql/schema.sql");
@@ -100,6 +110,16 @@ fn backend(error: &postgres::Error) -> StoreError {
             | &postgres::error::SqlState::EXCLUSION_VIOLATION => {
                 StoreError::Rejected(db.message().to_string())
             }
+            // The server is going away, or coming back (a restart: an
+            // administrator's shutdown, a crash's, a server that cannot
+            // serve connections yet). The work is not at fault; the loop
+            // waits for the database instead of ending (crate::port's
+            // `is_unreachable`, objective 032).
+            &postgres::error::SqlState::ADMIN_SHUTDOWN
+            | &postgres::error::SqlState::CRASH_SHUTDOWN
+            | &postgres::error::SqlState::CANNOT_CONNECT_NOW => {
+                StoreError::Unreachable(db.message().to_string())
+            }
             _ => StoreError::Backend(format!(
                 "{} ({}) {}",
                 db.message(),
@@ -108,7 +128,11 @@ fn backend(error: &postgres::Error) -> StoreError {
             )),
         };
     }
-    StoreError::Backend(error.to_string())
+    // No server-side error: the server did not answer (a connection cut, a
+    // refused connect, a timeout). The work is not at fault, and the loop
+    // waits for the database instead of ending (crate::port's
+    // `is_unreachable`).
+    StoreError::Unreachable(error.to_string())
 }
 
 /// PostgreSQL store.
@@ -120,6 +144,10 @@ pub struct PostgresStore {
     /// The URL this store connected with, for the server-wide migration
     /// lock ([`PostgresStore::migrate`]).
     url: String,
+    /// The statements this connection has prepared, by the SQL they were
+    /// prepared from: the loop's fixed reads are parsed and planned once and
+    /// reused, not once per pass ([`PostgresStore::query_prepared`]).
+    prepared: Mutex<std::collections::HashMap<&'static str, postgres::Statement>>,
 }
 
 /// The restricted logins, by their base name; each database has its own
@@ -173,6 +201,7 @@ impl PostgresStore {
             client: Mutex::new(client),
             password: url_password(url),
             url: url.to_string(),
+            prepared: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -420,22 +449,13 @@ fn role_password(owner_password: &str, salt: &str, role: &str) -> String {
 }
 
 fn pbkdf2_hex(owner_password: &str, salt: &str, role: &str) -> String {
-    use hmac::{Hmac, KeyInit, Mac};
-    let keyed = Hmac::<sha2::Sha256>::new_from_slice(owner_password.as_bytes())
-        .expect("HMAC takes a key of any length");
-    let mut round = keyed.clone();
-    round.update(format!("spawn-login-v2\0{salt}\0{role}").as_bytes());
-    round.update(&1u32.to_be_bytes());
-    let mut previous = round.finalize().into_bytes();
-    let mut output = previous;
-    for _ in 1..ROLE_PASSWORD_ROUNDS {
-        let mut round = keyed.clone();
-        round.update(&previous);
-        previous = round.finalize().into_bytes();
-        for (out, byte) in output.iter_mut().zip(previous.iter()) {
-            *out ^= byte;
-        }
-    }
+    // The derivation itself is spawn-kdf's, compiled optimised in debug
+    // builds too; its output is pinned (`the_login_passwords_are_the_ones_installs_have`).
+    let output = spawn_kdf::pbkdf2_sha256(
+        owner_password.as_bytes(),
+        format!("spawn-login-v2\0{salt}\0{role}").as_bytes(),
+        ROLE_PASSWORD_ROUNDS,
+    );
     output.iter().fold(String::new(), |mut hex, byte| {
         use std::fmt::Write as _;
         let _ = write!(hex, "{byte:02x}");
@@ -708,6 +728,65 @@ impl PostgresStore {
         Ok(self.query_one(sql, params)?.get(0))
     }
 
+    /// A fixed statement, prepared on this connection the first time and
+    /// reused after: the loop runs the same reads on every pass, and parsing
+    /// and planning them again each time is work with no decision in it.
+    /// `sql` is `'static` so the statement cache is keyed by the SQL text
+    /// this build ships, never by a string built at run time.
+    fn query_prepared(
+        &self,
+        sql: &'static str,
+        params: &Params<'_>,
+    ) -> Result<Vec<Row>, StoreError> {
+        let mut client = self.lock();
+        let mut prepared = self
+            .prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let statement = if let Some(statement) = prepared.get(sql) {
+            statement.clone()
+        } else {
+            let statement = client.prepare(sql).map_err(|error| backend(&error))?;
+            prepared.insert(sql, statement.clone());
+            statement
+        };
+        drop(prepared);
+        client
+            .query(&statement, params)
+            .map_err(|error| backend(&error))
+    }
+
+    /// One row from a fixed statement (prepared once, [`Self::query_prepared`]).
+    fn query_one_prepared(
+        &self,
+        sql: &'static str,
+        params: &Params<'_>,
+    ) -> Result<Row, StoreError> {
+        let mut rows = self.query_prepared(sql, params)?;
+        rows.pop().ok_or_else(|| {
+            StoreError::Backend(format!("a prepared statement returned no row: {sql}"))
+        })
+    }
+
+    /// The single `jsonb` value of a fixed statement (prepared once,
+    /// [`Self::query_prepared`]).
+    fn query_json_prepared(
+        &self,
+        sql: &'static str,
+        params: &Params<'_>,
+    ) -> Result<serde_json::Value, StoreError> {
+        Ok(self.query_one_prepared(sql, params)?.get(0))
+    }
+
+    /// [`Self::query_json`] for a query that may return no row.
+    fn query_opt_json(
+        &self,
+        sql: &str,
+        params: &Params<'_>,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        Ok(self.query_opt(sql, params)?.map(|row| row.get(0)))
+    }
+
     /// Rows changed.
     fn execute(&self, sql: &str, params: &Params<'_>) -> Result<u64, StoreError> {
         self.lock()
@@ -719,6 +798,46 @@ impl PostgresStore {
 #[cfg(test)]
 mod tests {
     use super::{login_url, role_password, role_url, url_password};
+
+    /// The restricted logins' passwords are byte for byte what every install
+    /// already has (computed by the derivation as it was at 554a4bd4, before
+    /// spawn-kdf): a different one would set new passwords at the next
+    /// migration and lock the fleet's other processes out of its database.
+    /// The last case is a login as an install names it
+    /// (`spawn_login_role('spawn_supervisor')` in database `spawn`).
+    #[test]
+    fn the_login_passwords_are_the_ones_installs_have() {
+        for (owner, salt, role, password) in [
+            (
+                "owner",
+                "ab".repeat(32),
+                "spawn_reader_db",
+                "f4e769b999554a01831a49183a5a9ffe13646043436172744f18a3fed9cc7185",
+            ),
+            (
+                "",
+                "00".to_string(),
+                "spawn_human_x",
+                "b06e99b80df3e38614f43f508ccd574abe465cfad207b8f37bbf23b6313b5798",
+            ),
+            (
+                "p\u{e4}ssw\u{f6}rd with spaces",
+                "cd".repeat(32),
+                "spawn_supervisor_spawn_test",
+                "b369a5c6b48d61eab9515eebe860416ee78c572573d7f450db8171e28804ddad",
+            ),
+            (
+                "fleet-owner-secret",
+                "0123456789abcdef".repeat(4),
+                "spawn_supervisor_spawn",
+                "2b9dc89a75cd2e38bf9d10f7272d67a6c698e8e1fa53fd4ae8498d40f66a3b6a",
+            ),
+        ] {
+            // role_password, the path a migration takes (cached), and
+            // through it pbkdf2_hex.
+            assert_eq!(role_password(owner, &salt, role), password, "{role}");
+        }
+    }
 
     /// A dashboard reader gives up on a slow statement (audit M2): the
     /// timeout is its connection's, not the server's. Needs

@@ -498,6 +498,12 @@ pub fn claude_line(line: &str) -> Vec<Normalized> {
             vec![keyed(
                 EventKind::TurnFailed {
                     error: text_of(content),
+                    // Claude Code 2.1 tags the line with the failed
+                    // request's status and its own error class; older
+                    // engines write neither, and the recovery reads the
+                    // text (crate::bridge's `EndCause` note).
+                    status: value.get("apiErrorStatus").and_then(Value::as_i64),
+                    error_kind: field("error").map(str::to_string),
                 },
                 uuid.to_string(),
             )]
@@ -699,7 +705,22 @@ mod tests {
         assert_eq!(
             claude_line(&error)[0].kind,
             EventKind::TurnFailed {
-                error: "API Error: 529 overloaded".into()
+                error: "API Error: 529 overloaded".into(),
+                status: None,
+                error_kind: None,
+            }
+        );
+        // Claude Code 2.1's line: the engine's own tags are kept, so a
+        // recovery can tell a model outage from an expired login.
+        let tagged = format!(
+            r#"{{"type":"assistant","uuid":"a3",{AT},"isApiErrorMessage":true,"error":"rate_limit","apiErrorStatus":429,"message":{{"content":[{{"type":"text","text":"API Error: 429 quota"}}]}}}}"#
+        );
+        assert_eq!(
+            claude_line(&tagged)[0].kind,
+            EventKind::TurnFailed {
+                error: "API Error: 429 quota".into(),
+                status: Some(429),
+                error_kind: Some("rate_limit".into()),
             }
         );
     }

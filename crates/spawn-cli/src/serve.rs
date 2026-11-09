@@ -1091,7 +1091,8 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 ///       "id": 2, "title": "...", "prompt": "...", "recurring": true,
 ///       "metric": "ingest_total_ns" | null, "unit": "ns",
 ///       "direction": "lower" | "higher", "target": 1100 | null,
-///       "status": "open" | "solved" | "met",
+///       "owner_judged": false,            // the owner judges it, not the fleet
+///       "status": "open" | "solved" | "met" | "owner",
 ///       "current": 1021 | null,           // latest landed metric value
 ///       "tasks": [10, 14],                // task ids for this objective
 ///       "landings": [{                    // landed tasks, oldest first
@@ -1156,7 +1157,7 @@ fn objective_missions(store: &spawn_postgres::PostgresStore) -> Result<Vec<Value
 
 /// One mission row with `backlog`, `backlog_error`, `objectives` and
 /// `next_objective` added.
-fn with_objectives(mut mission: Value) -> Value {
+pub(crate) fn with_objectives(mut mission: Value) -> Value {
     let backlog = mission
         .pointer("/objectives/backlog")
         .and_then(Value::as_str)
@@ -1214,7 +1215,11 @@ fn objective_json(objective: &Task, tasks: &[Value]) -> Value {
         })
         .collect();
     let current = landed_value(objective, &landings);
-    let status = if objective.recurring {
+    let status = if objective.owner_judged {
+        // The owner's, not the fleet's: it is never assigned, and
+        // `next_objective` below (which reads status "open") never names it.
+        "owner"
+    } else if objective.recurring {
         if current.is_some_and(|value| objective.meets(value)) {
             "met"
         } else {
@@ -1255,6 +1260,7 @@ fn objective_json(objective: &Task, tasks: &[Value]) -> Value {
         "unit": objective.unit,
         "direction": if objective.lower_is_better { "lower" } else { "higher" },
         "target": objective.target,
+        "owner_judged": objective.owner_judged,
         "status": status,
         "current": current,
         "tasks": mine.iter().map(|task| task["id"].clone()).collect::<Vec<_>>(),
@@ -1311,6 +1317,9 @@ fn rsi_summary(mission: &Value) -> Value {
             "open": count("open"),
             "solved": count("solved"),
             "met": count("met"),
+            // The owner's own objectives, which the fleet never assigns
+            // (backlog `owner_judged`).
+            "owner_judged": count("owner"),
         },
     })
 }
@@ -1776,6 +1785,7 @@ mod tests {
         log_window, objective_json, objective_prompt, open_network_request, open_networks,
         owner_uid, peer_uid, proc_sockets, rsi_objective, rsi_summary, same_origin, same_secret,
         serve_requests, server_hosts, tokenless_request, typed_text, with_last_gates,
+        with_objectives,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -2553,6 +2563,7 @@ mod tests {
             lower_is_better: true,
             target: recurring.then_some(1100.0),
             after: Vec::new(),
+            owner_judged: false,
         }
     }
 
@@ -2602,6 +2613,58 @@ mod tests {
         let untouched = objective_json(&objective(3, false), &tasks);
         assert_eq!(untouched["status"], "open");
         assert_eq!(untouched["landings"], json!([]));
+    }
+
+    /// An owner-judged objective is shown as the owner's, and is never what
+    /// the mission assigns next.
+    #[test]
+    fn an_owner_judged_objective_is_the_owners_on_the_board() {
+        let mut owner = objective(1, false);
+        owner.owner_judged = true;
+        // The rows as the board builds them, and then through a real
+        // backlog directory below.
+        let owner_row = objective_json(&owner, &[]);
+        let fleet_row = objective_json(&objective(2, false), &[]);
+        assert_eq!(objective_json(&objective(1, false), &[])["status"], "open");
+        assert_eq!(owner_row["status"], "owner");
+        assert_eq!(owner_row["owner_judged"], true);
+        assert_eq!(fleet_row["status"], "open");
+        assert_eq!(fleet_row["owner_judged"], false);
+        // `next_objective` is the first "open" row: the owner's is not it.
+        let rows = [owner_row, fleet_row];
+        let next = rows
+            .iter()
+            .find(|row| row["status"] == "open")
+            .map(|row| row["id"].clone());
+        assert_eq!(next, Some(json!(2)));
+        // Through the mission's own backlog: the owner's objective is shown
+        // as the owner's and is not what the mission assigns next.
+        let dir = std::env::temp_dir().join(format!("spawn-board-owner-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("029.json"),
+            r#"{"id": 29, "title": "the owner's", "prompt": "p", "owner_judged": true}"#,
+        )
+        .expect("write");
+        std::fs::write(
+            dir.join("030.json"),
+            r#"{"id": 30, "title": "the fleet's", "prompt": "p"}"#,
+        )
+        .expect("write");
+        let board = with_objectives(json!({
+            "id": 4,
+            "objectives": {"backlog": dir.to_str()},
+            "tasks": [],
+        }));
+        assert_eq!(board["backlog_error"], json!(null));
+        assert_eq!(board["next_objective"], json!(30), "not the owner's");
+        let rows = board["objectives"].as_array().expect("rows");
+        assert_eq!(rows[0]["id"], json!(29));
+        assert_eq!(rows[0]["status"], "owner");
+        assert_eq!(rows[0]["owner_judged"], json!(true));
+        assert_eq!(rows[1]["status"], "open");
+        assert_eq!(rows[1]["owner_judged"], json!(false));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3110,7 +3173,7 @@ mod tests {
         assert_eq!(summary["open_task"]["last_verdict"], "rejected");
         assert_eq!(
             summary["objectives"],
-            json!({"open": 1, "solved": 1, "met": 1})
+            json!({"open": 1, "solved": 1, "met": 1, "owner_judged": 0})
         );
     }
 

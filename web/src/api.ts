@@ -41,7 +41,13 @@ export interface RsiSummary {
   resident_session: string | null;
   next_objective: number | null;
   open_task: RsiOpenTask | null;
-  objectives: { open: number; solved: number; met: number };
+  objectives: {
+    open: number;
+    solved: number;
+    met: number;
+    /** The owner's own objectives, which the fleet never assigns. */
+    owner_judged: number;
+  };
 }
 
 export interface Overview {
@@ -197,6 +203,7 @@ function normalizeRsi(value: unknown): RsiSummary | null {
       open: number(counts.open),
       solved: number(counts.solved),
       met: number(counts.met),
+      owner_judged: number(counts.owner_judged),
     },
   };
 }

@@ -28,6 +28,7 @@ use spawn_core::observation::{Confidence, Observation, SemanticState};
 use spawn_core::observe::Observer;
 use spawn_core::port::{CommandQueue, EventLog};
 use spawn_core::time::SystemClock;
+use spawn_postgres::PostgresStore;
 
 mod common;
 use common::{admin, store, url};
@@ -199,7 +200,7 @@ fn two_commands_of_a_session_are_never_leased_at_once_when_their_submissions_rac
     // A submission starts and waits for it, in a transaction it keeps open.
     let (submitted_tx, submitted) = std::sync::mpsc::channel::<(i32, Option<i64>)>();
     let (commit_tx, commit) = std::sync::mpsc::channel::<()>();
-    let waiter_schema = schema.clone();
+    let waiter_schema = schema.to_string();
     let waiter_submit = submit("key_waiter");
     let waiter = std::thread::spawn(move || {
         let mut client = admin(&waiter_schema);
@@ -425,6 +426,7 @@ fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
     let ended = |cause| EventKind::ExecutionEnded {
         cause,
         exit_code: Some(0),
+        signal: None,
         evidence: None,
     };
     let row = |label: &str| {
@@ -550,6 +552,7 @@ fn two_connections_racing_to_start_one_session_record_one_execution() {
             EventKind::ExecutionEnded {
                 cause: EndCause::Lost,
                 exit_code: None,
+                signal: None,
                 evidence: None,
             },
         ))
@@ -599,6 +602,7 @@ fn open_tools_are_started_minus_finished_in_live_executions() {
             EventKind::ExecutionEnded {
                 cause: EndCause::Exited,
                 exit_code: Some(0),
+                signal: None,
                 evidence: None,
             },
         ))
@@ -1323,7 +1327,7 @@ fn public_holds_only_the_gateway_the_readers_and_pure_helpers() {
               cross join lateral aclexplode(o.acl) a
               where a.grantee = 0
               order by 1",
-            &[&schema],
+            &[&&*schema],
         )
         .expect("read the access lists")
         .iter()
@@ -1362,7 +1366,7 @@ fn view_columns_match_the_snapshot() {
                from information_schema.columns
               where table_schema = $1 and table_name like 'agent\\_%'
               group by table_name order by table_name",
-            &[&schema],
+            &[&&*schema],
         )
         .expect("information_schema answers");
     let actual: Vec<String> = rows
@@ -1372,7 +1376,7 @@ fn view_columns_match_the_snapshot() {
     let expected = [
         "agent_artifacts: session_id text, agent_id text, execution_id text, project text, branch text, commit_id text, reason text, session_seq bigint, recorded_at_ms bigint",
         "agent_commands: id bigint, agent_id text, session_id text, idempotency_key text, action jsonb, created_at_ms bigint",
-        "agent_executions: session_id text, agent_id text, execution_id text, engine text, terminal text, workspace text, started_at_ms bigint, cause text, exit_code integer, ended_at_ms bigint, exit_reported boolean, duration_ms bigint, command_id bigint",
+        "agent_executions: session_id text, agent_id text, execution_id text, engine text, terminal text, workspace text, started_at_ms bigint, cause text, exit_code integer, ended_at_ms bigint, exit_reported boolean, duration_ms bigint, command_id bigint, signal integer, evidence text",
         "agent_freshness: session_id text, agent_id text, last_session_seq bigint, last_event_id bigint, last_event_at_ms bigint, event_count bigint",
         "agent_judgements: session_id text, session_seq bigint, event_id bigint, agent_id text, state text, reason text, based_on_seq bigint, observation jsonb, recorded_at_ms bigint",
         "agent_lineage: session_id text, agent_id text, ancestor_session_id text, depth integer",
@@ -1695,6 +1699,7 @@ impl Worker<'_> {
             EventKind::ExecutionEnded {
                 cause: EndCause::Stopped,
                 exit_code: None,
+                signal: None,
                 evidence: None,
             },
         );
@@ -2303,6 +2308,7 @@ fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
                     EventKind::ExecutionEnded {
                         cause: EndCause::Stopped,
                         exit_code: None,
+                        signal: None,
                         evidence: None,
                     },
                 )
@@ -2909,6 +2915,7 @@ fn m15_a_revival_that_dies_at_once_counts_as_a_failure() {
                 EventKind::ExecutionEnded {
                     cause: EndCause::Lost,
                     exit_code: None,
+                    signal: None,
                     evidence: None,
                 },
             ))
@@ -2977,6 +2984,158 @@ fn m15_a_revival_that_dies_at_once_counts_as_a_failure() {
     );
 }
 
+/// Objective 032: a revival that made progress before a fault took it is no
+/// failed revival, though it ended lost within the grace minute — its
+/// command succeeded and its engine worked. The liveness rule counts none
+/// of them, so it revives at once instead of backing off; revivals that
+/// never got to work are still failures.
+#[test]
+fn a_revival_that_worked_before_it_was_lost_is_not_a_failure() {
+    let (store, _schema) = store("revival_progress");
+    let reviver = "spawn-supervise";
+    let run = |number: u64, command: CommandId, worked: bool| {
+        let execution = ExecutionId::new(format!("exec_{number}")).expect("valid execution");
+        store
+            .append(lifecycle(
+                &execution,
+                Source::Bridge,
+                &format!("exec_{number}:started"),
+                EventKind::ExecutionStarted {
+                    engine: ENGINE.to_string(),
+                    workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+                    command_id: command,
+                    fork: None,
+                    model: ModelProfile::Default,
+                    transcript_from: None,
+                },
+            ))
+            .expect("started");
+        if worked {
+            store
+                .append(lifecycle(
+                    &execution,
+                    Source::Bridge,
+                    &format!("exec_{number}:tool"),
+                    EventKind::ToolCompleted {
+                        tool_use_id: format!("toolu_{number}"),
+                        duration_ms: Some(5),
+                    },
+                ))
+                .expect("progress");
+        }
+        store
+            .append(lifecycle(
+                &execution,
+                Source::Bridge,
+                &format!("exec_{number}:ended"),
+                EventKind::ExecutionEnded {
+                    cause: EndCause::Lost,
+                    exit_code: None,
+                    signal: None,
+                    evidence: None,
+                },
+            ))
+            .expect("ended");
+    };
+    let revive = |key: &str| {
+        let command = store
+            .submit(
+                &Principal::new(reviver).expect("valid principal"),
+                &Submission {
+                    action: CommandAction::Resume {
+                        prompt: None,
+                        model: None,
+                    },
+                    ..start(session(), key)
+                },
+            )
+            .expect("submit");
+        let claimed = store
+            .claim("bridge", Duration::from_mins(1))
+            .expect("claim")
+            .expect("the resume");
+        store
+            .finish(&claimed, &Outcome::Succeeded)
+            .expect("the engine launched");
+        command
+    };
+    let first = store
+        .submit(
+            &Principal::new("human").expect("valid"),
+            &start(session(), "first"),
+        )
+        .expect("submit");
+    let claimed = store
+        .claim("bridge", Duration::from_mins(1))
+        .expect("claim")
+        .expect("start");
+    store.finish(&claimed, &Outcome::Succeeded).expect("finish");
+    run(1, first, false);
+    // Three revivals that each worked a unit, then were lost: none failed.
+    for attempt in 2..=4 {
+        let command = revive(&format!("revive-{attempt}"));
+        run(attempt, command, true);
+    }
+    let facts = store.liveness_facts(&session(), reviver).expect("facts");
+    assert_eq!(
+        facts.failures, 0,
+        "a revival that worked is no failed revival; counted {}",
+        facts.failures
+    );
+    // Revivals after it that never got to work are failures.
+    for attempt in 5..=6 {
+        let command = revive(&format!("revive-{attempt}"));
+        run(attempt, command, false);
+    }
+    let facts = store.liveness_facts(&session(), reviver).expect("facts");
+    assert_eq!(
+        facts.failures, 2,
+        "revivals that never worked are failures; counted {}",
+        facts.failures
+    );
+}
+
+/// Objective 032: a database restart breaks the store's connection. The
+/// pass that meets it says so (`Unreachable`: the loop paces it and never
+/// ends on it), and the loop's next pass opens a store of its own, which
+/// reads the log again — the loop does not keep a dead connection.
+#[test]
+fn a_restarted_databases_broken_connection_is_unreachable_and_a_fresh_store_reads() {
+    let (_, schema) = store("restart_reopens");
+    let name = format!("spawn_test_restart_{}", std::process::id());
+    let url = url();
+    let separator = if url.contains('?') { '&' } else { '?' };
+    let named = format!("{url}{separator}application_name={name}");
+    let store = PostgresStore::connect_in_schema(&named, &schema).expect("connect");
+    assert!(
+        store.watermark().is_ok(),
+        "the connection works before the restart"
+    );
+    // The restart, as the database's own end of the connection: this
+    // store's backend is terminated, and only it (the name is this test's).
+    let ended = admin(&schema)
+        .execute(
+            "select pg_terminate_backend(pid) from pg_stat_activity
+              where application_name = $1 and pid <> pg_backend_pid()",
+            &[&name],
+        )
+        .expect("terminate the store's backend");
+    assert_eq!(ended, 1, "one backend of this test's");
+    let error = store
+        .watermark()
+        .expect_err("a closed connection says the database is unreachable");
+    assert!(
+        spawn_core::port::is_unreachable(&error.to_string()),
+        "the loop paces an unreachable pass instead of ending: {error}"
+    );
+    // The loop's next pass: a store of its own, on a live connection.
+    let fresh = PostgresStore::connect_in_schema(&named, &schema).expect("reconnect");
+    assert!(
+        fresh.watermark().is_ok(),
+        "a fresh store reads the log again after the restart"
+    );
+}
+
 /// The dispatcher's facts count a resume whose engine was lost again within
 /// the grace minute (`resumed_young`), until an execution stays up.
 #[test]
@@ -3003,6 +3162,7 @@ fn dispatch_facts_count_resumes_lost_again_at_once() {
                 EventKind::ExecutionEnded {
                     cause: EndCause::Lost,
                     exit_code: None,
+                    signal: None,
                     evidence: None,
                 },
             ),
@@ -3142,6 +3302,7 @@ fn dispatch_facts_name_the_resume_lost_before_its_engine_became_ready() {
             EventKind::ExecutionEnded {
                 cause: EndCause::Lost,
                 exit_code: None,
+                signal: None,
                 evidence: Some(evidence.to_string()),
             },
         );

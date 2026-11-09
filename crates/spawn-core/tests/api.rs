@@ -91,6 +91,7 @@ fn events_round_trip_through_json() {
         EventKind::ExecutionEnded {
             cause: EndCause::Exited,
             exit_code: Some(0),
+            signal: None,
             evidence: None,
         },
     ];
@@ -224,6 +225,11 @@ fn screen_reads_the_tail_not_the_history() {
     // also shows an empty box.
     assert!(!read_claude_screen(BUSY).state.accepts_input());
     assert!(read_claude_screen(READY).state.accepts_input());
+    // An engine that printed an error is at its prompt, and the work goes on
+    // when text arrives: its nudge gets in (objective 032's relay outage).
+    let failed = "you: work\nAPI Error: 529 {\"type\":\"error\"}\n\n❯ ";
+    assert_eq!(read_claude_screen(failed).state, ScreenState::Error);
+    assert!(read_claude_screen(failed).state.accepts_input());
 
     // A stale spinner outside the tail window must not decide the state.
     let mut history = String::from("✽ Effecting… (27m 12s)\n");

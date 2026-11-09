@@ -35,6 +35,24 @@ pub enum StoreError {
     /// The backend failed.
     #[error("storage backend failure: {0}")]
     Backend(String),
+    /// The database could not be reached: no server answered, the
+    /// connection was cut, or the connect itself failed. It is not a
+    /// verdict on the work: the engines run on, and the loop that reads the
+    /// store waits for it instead of ending ([`UNREACHABLE`]).
+    #[error("{UNREACHABLE}: {0}")]
+    Unreachable(String),
+}
+
+/// The prefix of every [`StoreError::Unreachable`]: what a caller holding
+/// only the error's text reads to tell "the database is not there" from
+/// "the database said no" (`is_unreachable`).
+pub const UNREACHABLE: &str = "database unreachable";
+
+/// Whether an error's text is a [`StoreError::Unreachable`]: the store
+/// could not be reached, so the pass that failed says nothing about the
+/// fleet and must be retried rather than counted as a failed one.
+pub fn is_unreachable(error: &str) -> bool {
+    error.contains(UNREACHABLE)
 }
 
 /// Append-only event log with per-session and global order.
@@ -485,6 +503,16 @@ pub trait TerminalHost: Send + Sync {
         workspace: &WorkspaceId,
     ) -> Result<bool, TerminalError>;
 
+    /// Whether the terminal server that holds the terminals is there. A
+    /// host whose terminals share one server (tmux) that has gone took
+    /// every terminal in it with it, which is how a host restart is told
+    /// from one terminal that vanished ([`crate::event::EndCause`], and the
+    /// recovery's `host_restart`). A host that cannot tell answers true:
+    /// an execution then reads as crashed, never as a host restart.
+    fn server_alive(&self) -> bool {
+        true
+    }
+
     /// Whether the terminal hosts the runner this host started in it
     /// ([`Self::start`]), alive: what the Bridge asks before it calls an
     /// execution running or types into it. A terminal of that name can
@@ -503,6 +531,22 @@ pub trait TerminalHost: Send + Sync {
         } else {
             Runner::Gone
         })
+    }
+
+    /// [`Self::runner`] for a whole fleet in one call, in the order given: a
+    /// host that can ask its terminal server once for every pane does, so a
+    /// pass over a fleet costs one call and not one per terminal. Each
+    /// terminal not there is [`Runner::Gone`]; an error says nothing about
+    /// any of them. The default asks [`Self::runner`] for each.
+    fn runners(
+        &self,
+        terminals: &[(TerminalName, WorkspaceId)],
+    ) -> Result<Vec<(TerminalName, Runner)>, TerminalError> {
+        let mut states = Vec::with_capacity(terminals.len());
+        for (terminal, workspace) in terminals {
+            states.push((terminal.clone(), self.runner(terminal, workspace)?));
+        }
+        Ok(states)
     }
 
     /// Last `lines` lines of the terminal screen, newest last.
@@ -545,6 +589,38 @@ pub trait TerminalHost: Send + Sync {
         terminal: &TerminalName,
         workspace: &WorkspaceId,
     ) -> Result<(), TerminalError>;
+}
+
+/// Why a watch could not be set: the platform has none, the filesystem does
+/// not support one, or the platform's watch limit is reached.
+#[derive(Debug, Error)]
+#[error("watch: {0}")]
+pub struct WatchError(pub String);
+
+/// A change watch on files a running engine writes (its transcript and the
+/// exit status its runner leaves), so the Bridge reads a file when it
+/// changed instead of on every pass.
+///
+/// The watch names no process and holds nothing of the Bridge's state: a
+/// key is a name the caller chooses, and every path watched under it is the
+/// caller's interest. A path that does not exist yet may be watched,
+/// including one whose parent directory does not exist yet: what is watched
+/// then is the deepest directory above it that does, and the watch moves
+/// down as the directories appear.
+pub trait FileWatch: Send + Sync + std::fmt::Debug {
+    /// Watch `path` for `key`: a change to it (a write, a creation, a
+    /// removal, a replacement) is reported by the next [`Self::drain`].
+    /// Watching a path twice under one key changes nothing. A path that
+    /// cannot be watched is an error, and the caller reads that file on
+    /// every pass instead.
+    fn watch(&self, key: &str, path: &str) -> Result<(), WatchError>;
+
+    /// Watch nothing more for `key`, and forget every change it reported
+    /// that no [`Self::drain`] took yet.
+    fn unwatch(&self, key: &str);
+
+    /// The keys whose paths changed since the last call, each at most once.
+    fn drain(&self) -> Vec<String>;
 }
 
 /// Transcript archive failure.

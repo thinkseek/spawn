@@ -1,10 +1,11 @@
 [Unit]
-Description=Spawn: daily PostgreSQL backup to R2
+Description=Spawn: hourly PostgreSQL backup to R2
 
 [Timer]
-# Local time; a run missed while the host was off happens at the next boot.
-OnCalendar=*-*-* 03:30:00
-RandomizedDelaySec=45min
+# Every hour, at :00 with up to 5 minutes of jitter (a dump takes seconds;
+# the jitter keeps runs apart when several hosts share a proxy).
+OnCalendar=*-*-* *:00:00
+RandomizedDelaySec=5min
 Persistent=true
 
 [Install]

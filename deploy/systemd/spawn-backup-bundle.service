@@ -1,0 +1,25 @@
+[Unit]
+Description=Spawn: daily encrypted bundle of the mission sources and the transcript archive to Cloudflare R2 (deploy/backup)
+After=spawn-backup.service
+# Retry a failed run (proxy or network down) twice, 15 minutes apart:
+# a run at 04:00 that fails and succeeds at 04:15 still bundles the day.
+StartLimitIntervalSec=2h
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/share/spawn-rsi/bin/spawn backup bundle
+EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
+Environment=SPAWN_WORKSPACE_ROOT=%h/.local/share/spawn-rsi/ws
+Environment=PATH=%h/.local/share/spawn-rsi/bin:/usr/local/bin:/usr/bin:/bin
+Environment=no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
+Restart=on-failure
+RestartSec=15min
+# 2 = the settings were refused (a retry changes nothing); a failed run's
+# exit 1 is the record's and a retry's: `systemctl --user --failed` names it.
+RestartPreventExitStatus=2
+# git bundle of two repositories and a tar of a day of transcripts: slower
+# than a dump, still minutes.
+TimeoutStartSec=1h
+Nice=15
+IOSchedulingClass=idle
