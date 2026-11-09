@@ -10509,6 +10509,122 @@ mod database_tests {
                "host_faults": faults, "backoff_ms": 300_000, "escalate": faults == 2})
     }
 
+    /// The integrator-down alerts on this store, as `spawn alerts` has them:
+    /// `(key, state)`, oldest first.
+    fn integrator_alerts(db: &Db) -> Vec<(String, String)> {
+        db.store
+            .alerts(0)
+            .expect("the alerts")
+            .as_array()
+            .expect("alerts")
+            .iter()
+            .filter(|row| row["kind"] == "integrator_down")
+            .map(|row| {
+                (
+                    row["key"].as_str().unwrap_or_default().to_string(),
+                    row["state"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Batch 11 (3), on the store: a gated mission's reported task waits
+    /// while no integrator holds its lock. The loop's alert step fires
+    /// `integrator_down` once the lock has been free at every reading for
+    /// the bound, once (not again while it is open), and clears it at the
+    /// first reading that finds the lock held. A source an owner holds (a
+    /// deploy restarting the integrator) and a halted mission are no work
+    /// waiting: nothing fires for them, however long.
+    #[test]
+    fn the_integrator_down_alert_fires_once_and_clears_when_it_runs_again() {
+        let (base, source, scenarios, _) = world("integrator-down", "exit 0\n");
+        let db = Db::new("integrator_down");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let (mut settings, _) = crate::alerts::Settings::from_env();
+        settings.check_ms = 1;
+        settings.integrator_down_ms = 300;
+        settings.memory_low_mb = 0;
+        settings.tmpfs_high_mb = 0;
+        settings.test_log = None;
+        settings.live_log = None;
+        let mut monitor = crate::alerts::Monitor::with(settings);
+        let mut check = || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            monitor.check(&db.store).expect("a check");
+        };
+        let past_the_bound = || std::thread::sleep(std::time::Duration::from_millis(400));
+
+        // An owner holds the source: no work waits, however long.
+        db.admin()
+            .execute(
+                "insert into mission_source_holds (source, hold, main, by, reason, held_at_ms,
+                                                   expires_ms)
+                 values ($1, 1, $2, 'deploy', 'restart', spawn_now_ms(),
+                         spawn_now_ms() + 600000)",
+                &[&source, &"a".repeat(40)],
+            )
+            .expect("a hold");
+        check();
+        past_the_bound();
+        check();
+        assert_eq!(integrator_alerts(&db), [], "a held source");
+        db.admin()
+            .execute("delete from mission_source_holds", &[])
+            .expect("released");
+        // A halted mission: the same.
+        db.record(&json!({"type": "mission.halted", "id": mission, "reason": "a test"}));
+        check();
+        past_the_bound();
+        check();
+        assert_eq!(integrator_alerts(&db), [], "a halted mission");
+        db.store.mission_resume(mission).expect("resume");
+
+        check();
+        assert_eq!(integrator_alerts(&db), [], "not yet: the bound starts");
+        past_the_bound();
+        check();
+        let fired = integrator_alerts(&db);
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        assert_eq!(fired[0].1, "open");
+        let row = db
+            .store
+            .alerts(0)
+            .expect("the alerts")
+            .as_array()
+            .expect("alerts")
+            .iter()
+            .find(|row| row["kind"] == "integrator_down")
+            .cloned()
+            .expect("the alert");
+        assert_eq!(row["subject"], "spawn-integrate");
+        assert_eq!(
+            row["evidence"]["waiting"],
+            json!([{"mission": mission, "task": task}])
+        );
+        let text = row["text"].as_str().unwrap_or_default();
+        assert!(
+            text.starts_with("spawn-integrate is not running: no integrator has held its lock")
+                && text.contains(&format!(
+                    "1 reported task waits for a gate (task #{task} of mission #{mission})"
+                )),
+            "{text}"
+        );
+        past_the_bound();
+        check();
+        assert_eq!(integrator_alerts(&db), fired, "once while it is open");
+
+        // It runs again: the lock is held, the alert clears.
+        assert!(db.store.integrator_try_lock().expect("the lock"));
+        check();
+        let cleared = integrator_alerts(&db);
+        assert_eq!(cleared, [(fired[0].0.clone(), "cleared".to_string())]);
+        past_the_bound();
+        check();
+        assert_eq!(integrator_alerts(&db).len(), 1, "held: nothing fires");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Batch 11 (2), on the store: the host fault's backoff ("the gate's
     /// last run on task N was a host fault … judged again in Ns") is said
     /// once, when the task starts waiting, not on every pass it goes on

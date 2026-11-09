@@ -960,7 +960,13 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   `SPAWN_ALERT_BACKUP_DUMP_MAX_AGE_SECS`, default 7200, or bundle older than
   `SPAWN_ALERT_BACKUP_BUNDLE_MAX_AGE_SECS`, default 93600; no record at all
   is no alert), `backup_budget` (objective 031's `over_alert`), `drill_failed`
-  (a `backup.verified` with `ok` false) and `model_auth` (objective 028's
+  (a `backup.verified` with `ok` false), `integrator_down` (no backend
+  holds the integrator's lock in `pg_locks` at every reading for
+  `SPAWN_ALERT_INTEGRATOR_DOWN_SECS`, default 300, longer than a deploy's
+  restart, while a gated mission that is open or active, not halted, and on
+  a source no owner holds has a reported task; cleared at the first reading
+  that finds the lock held; the lock is read only while such a task is in
+  the step's fold or the alert is open) and `model_auth` (objective 028's
   `execution.interrupted` with cause `model_auth`). Each fires once per
   occurrence and clears with the record or reading that cleared it; a
   threshold of `0` disables its check.
