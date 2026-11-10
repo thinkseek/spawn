@@ -80,6 +80,7 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::ObjectiveSolved => "an objective closed: solved on the base (not a rejection)",
         Why::ObjectiveOrder => "a backlog names an order no task can meet",
         Why::OverBudget => "a task went over its budget twice",
+        Why::DrainExpired => "the integrator's drain reached its bound (gates stopped)",
     }
 }
 
@@ -766,6 +767,53 @@ pub(crate) fn hold_expiries(records: &[Value]) -> Vec<Escalation> {
                      the owner.",
                     time(record["held_at_ms"].as_i64()),
                     time(record["expires_ms"].as_i64()),
+                ),
+                since_ms: record["at_ms"].as_i64(),
+            })
+        })
+        .collect()
+}
+
+/// The digest items for `records`, the integrator's
+/// `integrator.drain_expired` records no delivered digest told yet
+/// (`PostgresStore::drain_expiries`): one each, of session `host`, id
+/// `integrator-drain-expired-<event id>`, naming each task whose gate the
+/// bound stopped as `task #<id>`. Told once: a digest that reached the
+/// supervisor with its tag means it was told.
+pub(crate) fn drain_expiries(records: &[Value]) -> Vec<Escalation> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let id = record["event_id"].as_i64()?;
+            let bound = record["bound_s"].as_i64().map_or_else(
+                || "its bound".to_string(),
+                |secs| format!("its bound of {secs} s (SPAWN_INTEGRATE_DRAIN_SECS)"),
+            );
+            let tasks: Vec<String> = record["gates"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|task| task.as_i64().map(|task| format!("task #{task}")))
+                .collect();
+            let stopped = if tasks.is_empty() {
+                "no gate was running; nothing was lost".to_string()
+            } else {
+                format!(
+                    "it stopped the gate{} of {}, which recorded no verdict: the next \
+                     integrator judges {} again from nothing",
+                    if tasks.len() == 1 { "" } else { "s" },
+                    tasks.join(", "),
+                    if tasks.len() == 1 { "it" } else { "them" },
+                )
+            };
+            Some(Escalation {
+                session_id: HOST_SESSION.to_string(),
+                id: format!("integrator-drain-expired-{id}"),
+                why: Why::DrainExpired,
+                line: format!(
+                    "the integrator was asked to drain and reached {bound} before its gates \
+                     ended (record {id}): {stopped}. A longer bound keeps such gates; tell the \
+                     owner if this repeats."
                 ),
                 since_ms: record["at_ms"].as_i64(),
             })
