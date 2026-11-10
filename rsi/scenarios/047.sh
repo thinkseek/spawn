@@ -15,8 +15,11 @@
 # `/api/scorecard`) says `settling: true` while the archive may lack a call
 # some execution made before the window's end (its transcript, as Spawn
 # last knew it, held lines before that end that are not archived, or Spawn
-# has not read it since that end) and `settling: false` once it cannot; an
-# execution that is idle, or ended, holds no window open.
+# has not read it since that end) and `settling: false` once it cannot. Live
+# or ended, an execution holds a window open exactly while lines it wrote
+# before the window's end are not archived: one that is idle, or ended,
+# with everything archived holds none open, and the Bridge goes on trying
+# an ended execution's copy until it is made.
 # web/src/settling.ts's `settlingNote(card)` says it in words on the
 # scorecard page.
 #
@@ -40,12 +43,15 @@
 #       (three readings), while the window to U0, a second taken before
 #       `held`'s turn began, reads the live tokens before U0 and `settling`
 #       false at each reading (only a call before a window's end holds it
-#       open); the scenario checks the plain file is untouched. Once it is
-#       removed, within 20 s the window
-#       reads the live tokens before U2 and `settling` false.
-#   (3) the window of (1) still reads what it settled at. With every turn
-#       ended, a window to the current second reads the live tokens and
-#       `settling` false within 15 s.
+#       open). Then `held`'s task is cancelled mid-turn and its execution
+#       ends, its archive still held: the window to U2 still reads
+#       `settling` true and fewer tokens, at three readings over 6 s. The
+#       scenario checks the plain file is untouched. Once it is removed,
+#       within 20 s the window reads the live tokens before U2 and
+#       `settling` false.
+#   (3) the window of (1) still reads what it settled at. With `long`'s
+#       turn ended (and `held`'s execution), a window to the current second
+#       reads the live tokens and `settling` false within 15 s.
 #   (4) the page's words: web/src/settling.ts's `settlingNote(card)`: null
 #       for a card that is not settling; "Still settling: a turn that was
 #       running at the window's end may add to its cost." for one that is.
@@ -547,12 +553,30 @@ for i in 1 2 3; do
         fail "(2) the window to $(iso "$u0"), which ended before held's turn began, reads [tokens settling] [$reading] while held's archive is held; it holds $want0 tokens and is settled: only a call before a window's end holds it open"
     sleep 2
 done
+# held's execution ends, mid-turn, while its archive is still held: what it
+# wrote before U2 is not archived, so the window stays open.
+capture "$SPAWN_BIN" task cancel --id "$(q "select id from mission_tasks where agent_id = '$(get held agent)'")"
+[ "$status" -eq 0 ] || harness "task cancel (held) failed: $(err)"
+deadline=$(($(date +%s) + 30))
+until [ "$(q "select count(*) from agent_executions where agent_id = '$(get held agent)' and ended_at_ms is null")" = 0 ]; do
+    [ "$(date +%s)" -lt "$deadline" ] || harness "held's execution did not end within 30 s of its task's cancel"
+    sleep 0.5
+done
+sleep 3
+for i in 1 2 3; do
+    reading=$(card "$u2")
+    [ "${reading#* }" = true ] ||
+        fail "(2) held's execution ended with its calls before $(iso "$u2") unarchived (its archive is held) and the window to it reads [tokens settling] [$reading]; an ended execution with unarchived lines before a window's end keeps it settling"
+    [ "${reading%% *}" -lt "$want2" ] ||
+        harness "the window to $(iso "$u2") reads $reading after held ended with its archive held; the hold did not hold"
+    sleep 2
+done
 [ -f "$archive/$(get held agent)" ] && [ "$(cat "$archive/$(get held agent)")" = "held by the scenario: no archive here" ] ||
     harness "held's archive path was changed while it was held"
 rm -f "$archive/$(get held agent)"
 until_card "$u2" "$want2" false 20 ||
-    fail "(2) held's archive is back and the window to $(iso "$u2") reads [tokens settling] [$reading] 20 s on; the live transcripts hold $want2 tokens before it, settled"
-note "(2) held's archive held: settling; back: $want2 tokens, settled"
+    fail "(2) held's archive path is free again, its execution ended, and the window to $(iso "$u2") reads [tokens settling] [$reading] 20 s on; the live transcripts hold $want2 tokens before it, settled: an ended execution's copy is tried again until it is made"
+note "(2) held's archive held: settling, live and after it ended; freed: $want2 tokens, settled"
 
 # --- (3) settled stays settled; idle executions settle a window ---------------------------------
 
@@ -560,17 +584,15 @@ reading=$(card "$u1")
 [ "$reading" = "$want false" ] ||
     fail "(3) the window to $(iso "$u1"), settled at $want tokens in (1), now reads [$reading]"
 deadline=$(($(date +%s) + 120))
-for label in $labels; do
-    until idle "$label"; do
-        [ "$(date +%s)" -lt "$deadline" ] || harness "$label's long turn did not end within 120 s"
-        sleep 0.5
-    done
+until idle long; do
+    [ "$(date +%s)" -lt "$deadline" ] || harness "long's long turn did not end within 120 s"
+    sleep 0.5
 done
 sleep 2
 u3=$(second_now)
 want3=$(live_total "$u3")
 until_card "$u3" "$want3" false 15 ||
-    fail "(3) every turn has ended and the window to $(iso "$u3") reads [tokens settling] [$reading] 15 s on; the live transcripts hold $want3 tokens before it, settled (an idle execution holds no window open)"
+    fail "(3) long's turn has ended, held's execution too, and the window to $(iso "$u3") reads [tokens settling] [$reading] 15 s on; the live transcripts hold $want3 tokens before it, settled (an idle execution holds no window open)"
 note "(3) a settled window stays settled; with every turn ended a window settles: $want3 tokens"
 
 # --- (4) the page's words ----------------------------------------------------------------
