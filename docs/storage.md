@@ -251,8 +251,15 @@ commit with a key no agent holds cannot hang or fail a test.
   checkpoint first, a line it wrote after the checkpoint was deleted by the
   unmount (028's stop, 2026-11-09). Now nothing it writes can land after
   the final checkpoint. Every end goes this way: a stop, an exit, a lost
-  runner, an abandoned start. A process that left the runner's session
-  (`setsid`) is not waited for. A runner that outlives the kill and the
+  runner, an abandoned start. A session that vanished on its own (tmux
+  died, or the session was killed outside the Bridge) is waited for too:
+  the host records the pane's leader pid and start time at start (a
+  private file per tmux program and socket under `$XDG_RUNTIME_DIR`), and
+  the kill reads the session from it when no pane is left, so a runner
+  still exiting, or one that ignores the hang-up, is waited for or killed
+  before the checkpoint (backlog P6). A record whose pid now belongs to a
+  process that started at another time names nothing. A process that left
+  the runner's session (`setsid`) is not waited for. A runner that outlives the kill and the
   SIGKILL fails the attempt: no checkpoint and no unmount while it may still
   write, and the attempt counts toward the stall below like a failed
   checkpoint (`execution.end_stalled`'s `error` then names the kill). The
