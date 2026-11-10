@@ -73,6 +73,11 @@
 #   toward no halt: nothing is rejected or aborted. Which objectives the
 #   gate cannot judge: deploy/systemd/README.md "Which objectives the gate
 #   cannot judge" lists them, 029 and why.
+# - one fact of the kind is the gate's own, not a scenario's: a base whose
+#   dependency graph does not resolve offline (the static checks, "the
+#   whole dependency graph"): the same fact with the scenario
+#   `dependencies`, any objective's; the candidate is never rejected for a
+#   graph its base cannot resolve here either.
 #
 # Exit-code contract for objective scenarios and the task scenario: 0 =
 # pass, 1 = an assertion failed, 6 = the host cannot judge it here (below: "A
@@ -2331,6 +2336,20 @@ if [ -f "$work/candidate/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
     : >"$work/build-time.base"
     if ! local_build_time "$work/candidate" "$work/candidate" >"$work/build-time.candidate"; then
         sed 's/^/| metadata: /' "$work/metadata.log" | tail -n 20
+        # Only a candidate whose base resolves here is rejected for it. A
+        # base that does not resolve either says this host's registry lacks
+        # a crate main needs (a runner never sent it, a pruned cache): a
+        # fact about the host, never a verdict on the work (exit 6,
+        # `cannot_judge`; the integrator judges again after its backoff).
+        if [ -f "$work/baseline/Cargo.toml" ] && {
+            mkdir -p "$work/base-metadata"
+            ! local_build_time "$work/base-metadata" "$work/baseline" >/dev/null
+        }; then
+            echo "| dependencies: cannot judge: the base's dependency graph does not resolve offline" \
+                "on this host either (its cargo registry lacks a crate the base needs)"
+            [ -z "$base_only" ] || exit 4
+            cannot_judge dependencies 1
+        fi
         verdict rejected "candidate's dependency graph does not resolve offline"
         exit 0
     fi
