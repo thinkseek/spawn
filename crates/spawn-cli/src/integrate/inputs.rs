@@ -141,7 +141,9 @@ pub(super) fn env_here(log: Option<&str>) -> Value {
 pub(super) fn unequal(one: &Value, other: &Value) -> Vec<&'static str> {
     FIELDS
         .into_iter()
-        .filter(|field| one.get(*field).unwrap_or(&Value::Null) != other.get(*field).unwrap_or(&Value::Null))
+        .filter(|field| {
+            one.get(*field).unwrap_or(&Value::Null) != other.get(*field).unwrap_or(&Value::Null)
+        })
         .collect()
 }
 
@@ -217,7 +219,10 @@ mod tests {
     fn the_toolchain_is_the_first_such_line_or_none() {
         let log = "| == setup\n| base cache: toolchain rustc 1 cargo 1  \n| base cache: toolchain other\n";
         assert_eq!(toolchain_of(log).as_deref(), Some("rustc 1 cargo 1"));
-        assert_eq!(toolchain_of("! | base cache: toolchain x\n").as_deref(), Some("x"));
+        assert_eq!(
+            toolchain_of("! | base cache: toolchain x\n").as_deref(),
+            Some("x")
+        );
         assert_eq!(toolchain_of("| == setup\nno verdict\n"), None);
     }
 
@@ -229,7 +234,13 @@ mod tests {
         let mut other = one.clone();
         other["scenarios_sha256"] = json!("t");
         other["controller"] = json!("c");
-        assert_eq!(unequal(&one, &other), vec!["controller", "scenarios_sha256"]);
-        assert_eq!(unequal(&one, &json!({})), vec!["base", "candidate", "scenarios_sha256"]);
+        assert_eq!(
+            unequal(&one, &other),
+            vec!["controller", "scenarios_sha256"]
+        );
+        assert_eq!(
+            unequal(&one, &json!({})),
+            vec!["base", "candidate", "scenarios_sha256"]
+        );
     }
 }

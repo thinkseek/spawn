@@ -73,7 +73,10 @@ pub(super) struct Settings {
 
 /// The settings from [`RUNNER_ENV`] and [`EVERY_ENV`]'s texts: None when no
 /// runner is named; an error for an EVERY that is not a whole number from 1.
-pub(super) fn settings(runner: Option<&str>, every: Option<&str>) -> Result<Option<Settings>, String> {
+pub(super) fn settings(
+    runner: Option<&str>,
+    every: Option<&str>,
+) -> Result<Option<Settings>, String> {
     let Some(runner) = runner.map(str::trim).filter(|runner| !runner.is_empty()) else {
         return Ok(None);
     };
@@ -198,7 +201,7 @@ impl Shadows {
     pub(super) fn offer(&mut self, want: Want) {
         self.offered += 1;
         let task = want.task;
-        if self.offered % self.settings.every != 0 {
+        if !self.offered.is_multiple_of(self.settings.every) {
             println!(
                 "integrate: task {task}: verdict not shadowed (every {}-th is)",
                 self.settings.every
@@ -234,11 +237,17 @@ impl Shadows {
             return Err(format!("no {}", dispatcher.display()));
         }
         let base = want.inputs["base"].as_str().unwrap_or_default().to_string();
-        let candidate = want.inputs["candidate"].as_str().unwrap_or_default().to_string();
+        let candidate = want.inputs["candidate"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         self.started += 1;
-        let work = self
-            .dir
-            .join(format!("{}-{}-{}", want.task, std::process::id(), self.started));
+        let work = self.dir.join(format!(
+            "{}-{}-{}",
+            want.task,
+            std::process::id(),
+            self.started
+        ));
         remove_tree(&work);
         std::fs::create_dir_all(&work).map_err(|error| format!("{}: {error}", work.display()))?;
         let started = (|| {
@@ -350,7 +359,7 @@ impl Shadows {
         let _ = std::fs::remove_file(self.dir.join(PID_FILE));
         let exit = status
             .code()
-            .map_or_else(|| status.signal().map_or(-1, |signal| 128 + signal), |code| code);
+            .unwrap_or_else(|| status.signal().map_or(-1, |signal| 128 + signal));
         let record = record_of(
             &shadow.want,
             &self.settings.runner,
@@ -524,7 +533,9 @@ pub(super) fn record_of(
     out: &Path,
 ) -> Value {
     let job = job_dir(out);
-    let placed = job.as_ref().and_then(|job| read_json(&job.join("record.json")));
+    let placed = job
+        .as_ref()
+        .and_then(|job| read_json(&job.join("record.json")));
     let result = match placed.as_ref().and_then(|placed| placed["result"].as_str()) {
         Some(result) => json!(result),
         None if placed.is_none() && exit == REFUSED_EXIT => json!("refused"),
@@ -546,7 +557,9 @@ pub(super) fn record_of(
         .and_then(|placed| placed["host"].as_str().map(str::to_string));
     let unequal = inputs::unequal(given, &want.inputs);
     let agrees = match &verdict {
-        Some(verdict) if unequal.is_empty() && matches!(want.verdict.as_str(), "accepted" | "rejected") => {
+        Some(verdict)
+            if unequal.is_empty() && matches!(want.verdict.as_str(), "accepted" | "rejected") =>
+        {
             json!(*verdict == want.verdict)
         }
         _ => Value::Null,
@@ -625,11 +638,18 @@ mod tests {
         std::fs::create_dir_all(&job).unwrap();
         std::fs::write(
             job.join("record.json"),
-            format!("{}\n", json!({"job": "222222222222-abc", "host": "runner-host", "result": result})),
+            format!(
+                "{}\n",
+                json!({"job": "222222222222-abc", "host": "runner-host", "result": result})
+            ),
         )
         .unwrap();
         if let Some(verdict) = verdict {
-            std::fs::write(job.join("verdict.json"), format!("{}\n", json!({"verdict": verdict}))).unwrap();
+            std::fs::write(
+                job.join("verdict.json"),
+                format!("{}\n", json!({"verdict": verdict})),
+            )
+            .unwrap();
         }
         std::fs::write(job.join("gate.log"), log).unwrap();
     }
@@ -640,7 +660,10 @@ mod tests {
         assert_eq!(settings(Some(" "), None).unwrap(), None);
         assert_eq!(
             settings(Some("bb-runner"), None).unwrap(),
-            Some(Settings { runner: "bb-runner".into(), every: 1 })
+            Some(Settings {
+                runner: "bb-runner".into(),
+                every: 1
+            })
         );
         assert_eq!(settings(Some("r"), Some("3")).unwrap().unwrap().every, 3);
         assert!(settings(Some("r"), Some("0")).is_err());
@@ -659,8 +682,18 @@ mod tests {
         assert!(Want::of(&record("accepted", env.clone()), at, at).is_some());
         assert!(Want::of(&record("rejected", env.clone()), at, at).is_some());
         assert!(Want::of(&record("accepted", Value::Null), at, at).is_none());
-        for other in ["conflict", "incompatible", "aborted", "stale", "no_room", "host_fault"] {
-            assert!(Want::of(&record(other, env.clone()), at, at).is_none(), "{other}");
+        for other in [
+            "conflict",
+            "incompatible",
+            "aborted",
+            "stale",
+            "no_room",
+            "host_fault",
+        ] {
+            assert!(
+                Want::of(&record(other, env.clone()), at, at).is_none(),
+                "{other}"
+            );
         }
     }
 
@@ -668,7 +701,12 @@ mod tests {
     fn equal_inputs_compare_the_verdicts_and_unequal_ones_never_do() {
         let dir = Scratch::new("record");
         let out = dir.0.join("out");
-        place(&out, "verdict", Some("rejected"), "| == setup\n| base cache: toolchain rustc r\n");
+        place(
+            &out,
+            "verdict",
+            Some("rejected"),
+            "| == setup\n| base cache: toolchain rustc r\n",
+        );
         let primary = primary_inputs(&dir.0, None);
         let wanted = want(7, "accepted", primary.clone(), &dir.0);
         let record = record_of(&wanted, "bb", &primary, 0, 12, &out);
@@ -679,7 +717,10 @@ mod tests {
         assert_eq!(record["primary"], "accepted");
         assert_eq!(record["unequal"], json!([]));
         assert_eq!(record["agrees"], json!(false));
-        assert_eq!(record["env"], json!({"host": "runner-host", "toolchain": "rustc r", "runner": "bb"}));
+        assert_eq!(
+            record["env"],
+            json!({"host": "runner-host", "toolchain": "rustc r", "runner": "bb"})
+        );
         assert_eq!(record["primary_env"]["toolchain"], "rustc p");
         assert_eq!(record["base"], BASE);
         assert_eq!(record["seconds"], 12);
@@ -691,7 +732,10 @@ mod tests {
         assert_eq!(record["agrees"], Value::Null);
 
         let agreeing = want(7, "rejected", primary.clone(), &dir.0);
-        assert_eq!(record_of(&agreeing, "bb", &primary, 0, 1, &out)["agrees"], json!(true));
+        assert_eq!(
+            record_of(&agreeing, "bb", &primary, 0, 1, &out)["agrees"],
+            json!(true)
+        );
     }
 
     #[test]
@@ -706,7 +750,10 @@ mod tests {
         assert_eq!(refused["verdict"], Value::Null);
         assert_eq!(refused["agrees"], Value::Null);
         assert_eq!(refused["env"]["toolchain"], Value::Null);
-        assert_eq!(record_of(&wanted, "bb", &primary, 2, 1, &out)["result"], Value::Null);
+        assert_eq!(
+            record_of(&wanted, "bb", &primary, 2, 1, &out)["result"],
+            Value::Null
+        );
         place(&out, "transport", None, "");
         let transport = record_of(&wanted, "bb", &primary, 2, 1, &out);
         assert_eq!(transport["result"], "transport");
@@ -720,7 +767,11 @@ mod tests {
         std::fs::create_dir_all(ctl.join("rsi/scenarios")).unwrap();
         std::fs::create_dir_all(ctl.join("deploy")).unwrap();
         std::fs::write(ctl.join("rsi/scenarios/check-ok.sh"), "exit 0\n").unwrap();
-        std::fs::write(ctl.join(".controller"), "0123456789abcdef0123456789abcdef01234567\n").unwrap();
+        std::fs::write(
+            ctl.join(".controller"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
         let notes = dir.join("notes");
         let hold = dir.join("hold");
         std::fs::write(
@@ -762,14 +813,27 @@ mod tests {
         let marker = Some("0123456789abcdef0123456789abcdef01234567");
         std::fs::write(dir.0.join("hold"), "").unwrap();
         let mut shadows = Shadows::new(
-            Settings { runner: "bb".into(), every: 1 },
+            Settings {
+                runner: "bb".into(),
+                every: 1,
+            },
             dir.0.join("shadow"),
         );
-        shadows.offer(want(1, "accepted", primary_inputs(&scenarios, marker), &scenarios));
+        shadows.offer(want(
+            1,
+            "accepted",
+            primary_inputs(&scenarios, marker),
+            &scenarios,
+        ));
         assert_eq!(shadows.running_task(), Some(1));
         assert!(dir.0.join("shadow").join(PID_FILE).is_file());
         // Skipped while one runs, never queued.
-        shadows.offer(want(2, "accepted", primary_inputs(&scenarios, marker), &scenarios));
+        shadows.offer(want(
+            2,
+            "accepted",
+            primary_inputs(&scenarios, marker),
+            &scenarios,
+        ));
         assert_eq!(shadows.running_task(), Some(1));
         // The gate directory changes after the snapshot: the runner got the
         // set as it was when the shadow started.
@@ -797,7 +861,12 @@ mod tests {
         assert!(!dir.0.join("shadow").join(PID_FILE).exists());
         super::remove_tree(&ended.work);
         // The next verdict is shadowed again, and sees the new set.
-        shadows.offer(want(3, "accepted", primary_inputs(&dir.0, marker), &scenarios));
+        shadows.offer(want(
+            3,
+            "accepted",
+            primary_inputs(&dir.0, marker),
+            &scenarios,
+        ));
         let ended = wait_ended(&mut shadows);
         assert_eq!(ended.record["unequal"], json!(["scenarios_sha256"]));
         assert_eq!(ended.record["agrees"], Value::Null);
@@ -813,20 +882,43 @@ mod tests {
         let ctl = controller(&dir.0, "rejected");
         let scenarios = ctl.join("rsi/scenarios");
         let mut shadows = Shadows::new(
-            Settings { runner: "bb".into(), every: 2 },
+            Settings {
+                runner: "bb".into(),
+                every: 2,
+            },
             dir.0.join("shadow"),
         );
-        shadows.offer(want(1, "accepted", primary_inputs(&scenarios, None), &scenarios));
+        shadows.offer(want(
+            1,
+            "accepted",
+            primary_inputs(&scenarios, None),
+            &scenarios,
+        ));
         assert_eq!(shadows.running_task(), None);
-        shadows.offer(want(2, "accepted", primary_inputs(&scenarios, None), &scenarios));
+        shadows.offer(want(
+            2,
+            "accepted",
+            primary_inputs(&scenarios, None),
+            &scenarios,
+        ));
         assert_eq!(shadows.running_task(), Some(2));
         let ended = wait_ended(&mut shadows);
         // The primary's controller was unknown, the runner's is named.
         assert_eq!(ended.record["unequal"], json!(["controller"]));
         assert_eq!(ended.record["agrees"], Value::Null);
         std::fs::remove_file(ctl.join("deploy/gate-runner.sh")).unwrap();
-        shadows.offer(want(3, "accepted", primary_inputs(&scenarios, None), &scenarios));
-        shadows.offer(want(4, "accepted", primary_inputs(&scenarios, None), &scenarios));
+        shadows.offer(want(
+            3,
+            "accepted",
+            primary_inputs(&scenarios, None),
+            &scenarios,
+        ));
+        shadows.offer(want(
+            4,
+            "accepted",
+            primary_inputs(&scenarios, None),
+            &scenarios,
+        ));
         assert_eq!(shadows.running_task(), None);
     }
 
@@ -837,15 +929,26 @@ mod tests {
         let scenarios = ctl.join("rsi/scenarios");
         std::fs::write(dir.0.join("hold"), "").unwrap();
         let mut shadows = Shadows::new(
-            Settings { runner: "bb".into(), every: 1 },
+            Settings {
+                runner: "bb".into(),
+                every: 1,
+            },
             dir.0.join("shadow"),
         );
-        shadows.offer(want(1, "accepted", primary_inputs(&scenarios, None), &scenarios));
+        shadows.offer(want(
+            1,
+            "accepted",
+            primary_inputs(&scenarios, None),
+            &scenarios,
+        ));
         assert_eq!(shadows.running_task(), Some(1));
         shadows.stop("the test");
         assert_eq!(shadows.running_task(), None);
         assert!(shadows.poll().is_none());
-        let left: Vec<_> = std::fs::read_dir(dir.0.join("shadow")).unwrap().flatten().collect();
+        let left: Vec<_> = std::fs::read_dir(dir.0.join("shadow"))
+            .unwrap()
+            .flatten()
+            .collect();
         assert!(left.is_empty(), "{left:?}");
     }
 }
