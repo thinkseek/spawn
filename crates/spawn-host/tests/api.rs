@@ -791,3 +791,48 @@ fn tmux_is_installed() {
         .expect("tmux is installed on the test machine");
     assert!(status.success());
 }
+
+/// The terminal server is told by its identity (pid and start time), never
+/// by whether something answers: a server started again after the first is
+/// gone answers under another identity, and a call that only asks never
+/// starts one (objective 44).
+#[test]
+fn a_terminal_server_is_told_by_its_identity_and_asking_never_starts_one() {
+    use spawn_core::port::ServerSeen;
+    let _exclusive = exclusive();
+    let tmux = isolated_tmux("server");
+    let host = TmuxHost::local(&tmux.program);
+    assert_eq!(host.server(), ServerSeen::Gone);
+    assert!(!host.server_alive());
+    // Asking twice started nothing.
+    assert_eq!(host.server(), ServerSeen::Gone);
+
+    let name = terminal("server-first");
+    start_session(&host, &launch(&name)).expect("start the first server");
+    let ServerSeen::Answers(Some(first)) = host.server() else {
+        panic!("a running tmux names its server: {:?}", host.server());
+    };
+    assert!(host.server_alive());
+    assert!(first.pid > 0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_millis();
+    let started = u128::try_from(first.started_at_ms).expect("a start after the epoch");
+    assert!(started <= now_ms && now_ms - started < 60_000, "{first:?}");
+    // The same server, asked again, is the same.
+    assert_eq!(host.server(), ServerSeen::Answers(Some(first)));
+
+    // The server goes, as a host restart takes it; a new one starts.
+    let _ = Command::new("tmux")
+        .args(["-L", &tmux.socket, "kill-server"])
+        .status();
+    assert_eq!(host.server(), ServerSeen::Gone);
+    let again = terminal("server-second");
+    start_session(&host, &launch(&again)).expect("start a new server");
+    let ServerSeen::Answers(Some(second)) = host.server() else {
+        panic!("the new tmux names its server: {:?}", host.server());
+    };
+    assert_ne!(second, first, "a new server is another server");
+    host.terminate(&again, &workspace()).expect("clean up");
+}
