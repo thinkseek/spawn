@@ -404,7 +404,7 @@ pub(super) fn exited_unreaped(pid: u32) -> bool {
         .is_none_or(|state| state == "Z" || state == "X")
 }
 
-fn signal_group(group: u32, signal: &str) {
+pub(super) fn signal_group(group: u32, signal: &str) {
     let _ = Command::new("kill")
         .args([&format!("-{signal}"), "--", &format!("-{group}")])
         .stdout(Stdio::null())
@@ -412,7 +412,7 @@ fn signal_group(group: u32, signal: &str) {
         .status();
 }
 
-fn setpriv_available() -> bool {
+pub(super) fn setpriv_available() -> bool {
     Command::new("setpriv")
         .arg("--help")
         .stdout(Stdio::null())
