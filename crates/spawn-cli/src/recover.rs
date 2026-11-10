@@ -470,6 +470,35 @@ pub(crate) enum Moved {
     },
 }
 
+/// The evidence of a `restarted` or `reassigned` end: the Stop that ended
+/// it (its command, principal, action and key) and what moved the work
+/// (the task and its `n`; the task, the new one and its worker's session,
+/// `to_session`).
+fn moved_evidence(facts: &Facts<'_>, evidence: &mut Map<String, Value>) {
+    if let Some(stop) = facts.stop {
+        evidence.insert("command_id".to_string(), json!(stop.command_id));
+        evidence.insert("principal".to_string(), json!(stop.principal));
+        evidence.insert("command".to_string(), json!(stop.action));
+        evidence.insert("key".to_string(), json!(stop.key));
+    }
+    match &facts.moved {
+        Some(Moved::Restarted { task, n }) => {
+            evidence.insert("task".to_string(), json!(task));
+            evidence.insert("n".to_string(), json!(n));
+        }
+        Some(Moved::Reassigned {
+            task,
+            to_task,
+            to_session,
+        }) => {
+            evidence.insert("task".to_string(), json!(task));
+            evidence.insert("to_task".to_string(), json!(to_task));
+            evidence.insert("to_session".to_string(), json!(to_session));
+        }
+        None => {}
+    }
+}
+
 /// The restart or reassign that ended an execution of `session`, from its
 /// Stops (`stops`, oldest first) and the mission rows: the latest Stop that
 /// may have stopped it, the recovery's own aside, is the dispatcher's
@@ -1687,30 +1716,7 @@ impl One<'_> {
                     evidence.insert("task_cancelled".to_string(), json!(true));
                 }
             }
-            Cause::Restarted | Cause::Reassigned => {
-                if let Some(stop) = facts.stop {
-                    evidence.insert("command_id".to_string(), json!(stop.command_id));
-                    evidence.insert("principal".to_string(), json!(stop.principal));
-                    evidence.insert("command".to_string(), json!(stop.action));
-                    evidence.insert("key".to_string(), json!(stop.key));
-                }
-                match &facts.moved {
-                    Some(Moved::Restarted { task, n }) => {
-                        evidence.insert("task".to_string(), json!(task));
-                        evidence.insert("n".to_string(), json!(n));
-                    }
-                    Some(Moved::Reassigned {
-                        task,
-                        to_task,
-                        to_session,
-                    }) => {
-                        evidence.insert("task".to_string(), json!(task));
-                        evidence.insert("to_task".to_string(), json!(to_task));
-                        evidence.insert("to_session".to_string(), json!(to_session));
-                    }
-                    None => {}
-                }
-            }
+            Cause::Restarted | Cause::Reassigned => moved_evidence(facts, &mut evidence),
             Cause::Budget => {
                 if let Some(over) = self.row.over_budget.as_ref() {
                     evidence.insert("event_id".to_string(), over["event_id"].clone());
@@ -3428,7 +3434,10 @@ mod tests {
             ),
             None
         );
-        assert_eq!(moved(&[restart.clone()], "session_worker_b_8", &work), None);
+        assert_eq!(
+            moved(std::slice::from_ref(&restart), "session_worker_b_8", &work),
+            None
+        );
         // A later person's Stop is the one that ended it.
         assert_eq!(
             moved(
