@@ -1343,6 +1343,85 @@ fn set_record_times(client: &mut Client, task: i64, base: i64, seconds: &[i64]) 
     }
 }
 
+/// Objective 035: a verdict's `class`, `inputs` and `env` are folded like
+/// any record's fields (the counts and states move as before), shown on the
+/// task's stages and its last gate; a record without them (from before)
+/// still folds and reads with none; a class that is not the verdict's is
+/// refused.
+#[test]
+fn a_verdicts_class_inputs_and_env_fold_and_show_and_old_records_still_read() {
+    let (store, schema) = store("control_binding");
+    let mission = store
+        .mission_add("Bound", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(mission, Some("/controller/rsi/scenarios"), "gate", None, None)
+        .expect("configure");
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    let inputs = json!({"base": "b1", "candidate": "c1",
+                        "controller": "0123456789abcdef0123456789abcdef01234567",
+                        "scenarios_sha256": "ab", "scenario": null});
+    let env = json!({"host": "judge", "toolchain": null, "runner": null});
+    // An abort: infrastructure, counted as an abort as before.
+    store
+        .integrator_record(&json!({"type": "task.gated", "id": task, "revision": 0,
+            "verdict": "aborted", "base": "b1", "reason": "a gate that died",
+            "class": "infrastructure", "inputs": inputs, "env": env}))
+        .expect("an abort with its binding");
+    // A rejection from before this change: no class, no inputs, no env.
+    store
+        .integrator_record(&json!({"type": "task.gated", "id": task, "revision": 0,
+            "verdict": "rejected", "base": "b1", "note": "fails"}))
+        .expect("an old record still folds");
+    let mut client = admin(&schema);
+    let rejections: i32 = client
+        .query_one("select gate_rejections from mission_missions where id = $1", &[&mission])
+        .expect("mission")
+        .get(0);
+    assert_eq!(rejections, 1, "the counts move as before");
+    // A class that is not the verdict's is refused.
+    let wrong = store.integrator_record(&json!({"type": "task.gated", "id": task,
+        "revision": 1, "verdict": "host_fault", "class": "code", "evidence": "cannot_judge",
+        "scenario": "029.sh", "backoff_secs": 1}));
+    assert!(wrong.is_err(), "a host fault is never a statement about the code");
+    let gated: Vec<serde_json::Value> = store
+        .task_stages(task)
+        .expect("stages")
+        .as_array()
+        .expect("a list")
+        .iter()
+        .filter(|stage| stage["stage"] == "gated")
+        .cloned()
+        .collect();
+    assert_eq!(gated.len(), 2, "{gated:?}");
+    assert_eq!(gated[0]["class"], "infrastructure");
+    assert_eq!(gated[0]["inputs"], inputs, "nulls inside kept");
+    assert_eq!(gated[0]["env"], env);
+    for name in ["class", "inputs", "env"] {
+        assert!(gated[1].get(name).is_none(), "an old record shows no {name}: {}", gated[1]);
+    }
+    // The last gate is the old rejection: it reads with none of them.
+    let last = &store.last_gates().expect("last gates")[task.to_string()];
+    assert_eq!(last["verdict"], "rejected");
+    assert!(last.get("class").is_none(), "{last}");
+    // A refold reads the same.
+    refold(&mut client);
+    store
+        .integrator_record(&json!({"type": "task.gated", "id": task, "revision": 1,
+            "verdict": "stale", "class": "superseded",
+            "inputs": {"base": "b2", "candidate": null, "controller": null,
+                       "scenarios_sha256": null, "scenario": null}, "env": null}))
+        .expect("a stale verdict, superseded");
+    let last = &store.last_gates().expect("last gates")[task.to_string()];
+    assert_eq!(last["class"], "superseded");
+    assert_eq!(last["inputs"]["base"], "b2");
+    assert!(last["env"].is_null() && last.get("env").is_some(), "{last}");
+}
+
 #[test]
 fn a_tasks_stages_are_its_records_in_order_with_the_time_each_took() {
     let (store, schema) = store("control_stages");
