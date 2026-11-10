@@ -299,7 +299,11 @@ export default function App() {
       ) : view === "rsi" ? (
         <RsiView onOpenSession={openTimeline} />
       ) : view === "alerts" ? (
-        <AlertsView />
+        <AlertsView
+          agents={fleetPoll.data?.agents ?? null}
+          nameOf={(session) => pollNames.get(session) ?? null}
+          onShowHome={() => setView("fleet")}
+        />
       ) : view === "scorecard" ? (
         <ScorecardView missions={missions.data} />
       ) : view === "show" ? (
