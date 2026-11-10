@@ -58,7 +58,16 @@
 #       message reads as before (state, times, `taken`), `deaf`'s alert is
 #       the one open alert (not fired again), `refuse`'s stays cleared; a
 #       new input to `take` is tracked to `answered`.
-#   (6) the page's words: web/src/messages.ts's `messageLine(command)`:
+#   (6) before the change: two inputs into `take` that an older Spawn typed
+#       (seeded into the log before the loop starts: commands, their
+#       Bridge `typing` and `typed` steps and the engine's
+#       `message.received`, recorded 10 min and 1 h ago, text with no
+#       marker) read `typed`, `not_taken` false, and no `message_not_taken`
+#       names either: after (4) and again after (5)'s restart.
+#   (7) the session ends: `deaf`'s task is cancelled (its worker stopped);
+#       its message's alert is cleared within 30 s and stays in
+#       /api/alerts as cleared.
+#   (8) the page's words: web/src/messages.ts's `messageLine(command)`:
 #       null for a command with no message; "not typed yet", "typed, not
 #       taken yet"; "not taken (never typed)", "not taken (typed)" once
 #       `not_taken`; "taken in <d>", "taken in <d> · answered in <d>" (taken
@@ -66,7 +75,7 @@
 #       " · taken 2×" (the count) when taken more than once; <d> is "<1 s",
 #       "<n> s" under a minute, "<n> min" under an hour, "<n> h", rounded
 #       down. Given the answers of (1)-(4) and fixed cases. messages.ts and
-#       its imports must load with node alone; one that does not fails (6).
+#       its imports must load with node alone; one that does not fails (8).
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -77,7 +86,7 @@
 # Runs inside the gate's sandbox (scripts/rsi/gate.sh): needs SPAWN_BIN,
 # SPAWN_TEST_DATABASE_URL, tmux, jq, curl and node; creates and drops its
 # own database, uses a private tmux socket, loopback only. Every wait is
-# bounded in time. On a passing tree it takes about 45 s.
+# bounded in time. On a passing tree it takes about a minute.
 set -eu
 
 asserted=""
@@ -450,6 +459,16 @@ alerts() { # <command id>: its message_not_taken alerts, `state` a line each
         | unique_by(.key) | .[] | .state' "$WORK/alerts.json"
 }
 
+old_quiet() { # <when>: the seeded older inputs are no untaken messages
+    commands take
+    for id in $old_ids; do
+        [ "$(m take "$id" '.message | .state == "typed" and .not_taken == false and .taken_at_ms == null')" = true ] ||
+            fail "(6) $1: input $id, typed by an older Spawn with no marker, reads $(m take "$id" '.message | tostring'); typed, not not_taken"
+        [ -z "$(alerts "$id")" ] ||
+            fail "(6) $1: input $id, typed by an older Spawn with no marker, has message_not_taken alerts [$(alerts "$id" | tr '\n' ' ')]"
+    done
+}
+
 # --- the agents ----------------------------------------------------------------
 
 capture "$SPAWN_BIN" mission add --text "045 messages"
@@ -462,9 +481,52 @@ for label in $labels; do
         --brief "Do the 045 task: answer each message."
     [ "$status" -eq 0 ] || harness "task assign ($label) failed: $(err)"
     task=$(q "select max(id) from mission_tasks where mission_id = $mission")
+    put "$label" task "$task"
     put "$label" agent "$(q "select agent_id from mission_tasks where id = $task")"
     put "$label" session "$(q "select session_id from mission_tasks where id = $task")"
 done
+
+# What an older Spawn left in the log (6): two inputs into take, typed by
+# a Bridge that typed no marker, received by the engine, 10 min and 1 h ago.
+cat >"$WORK/seed.sql" <<SQL
+\\set ON_ERROR_STOP 1
+begin;
+create function pg_temp.event(at_ms bigint, src text, key text, kind jsonb) returns void
+language sql as \$\$
+    insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id,
+                              kind, session_seq, recorded_at_ms)
+    values ('$(get take agent)', '$(get take session)', null, src, key, kind,
+            coalesce((select max(session_seq) from spawn_events
+                       where session_id = '$(get take session)'), 0) + 1, at_ms) \$\$;
+create function pg_temp.old(k text, text_ text, ago_ms bigint) returns void
+language plpgsql as \$\$
+declare
+    v_id bigint;
+    v_at bigint := spawn_now_ms() - ago_ms;
+begin
+    insert into spawn_commands (principal, idempotency_key, agent_id, session_id, action, state,
+                                succeeded, error, created_at_ms, finished_at_ms)
+    values ('bb-person', k, '$(get take agent)', '$(get take session)',
+            jsonb_build_object('type', 'input', 'text', text_), 'finished', true, null,
+            v_at, v_at + 1000)
+    returning id into v_id;
+    perform pg_temp.event(v_at + 200, 'bridge', 'cmd_' || v_id || ':typing',
+        jsonb_build_object('name', 'command.step',
+                           'detail', jsonb_build_object('command_id', v_id, 'step', 'typing')));
+    perform pg_temp.event(v_at + 300, 'bridge', 'cmd_' || v_id || ':typed',
+        jsonb_build_object('name', 'command.step',
+                           'detail', jsonb_build_object('command_id', v_id, 'step', 'typed')));
+    perform pg_temp.event(v_at + 1500, 'claude', k || '-line',
+        jsonb_build_object('name', 'message.received'));
+end \$\$;
+select pg_temp.old('bb-old-1h', 'BB:PING from an older Spawn, an hour ago', 3600000);
+select pg_temp.old('bb-old-10m', 'BB:PING from an older Spawn, ten minutes ago', 600000);
+commit;
+SQL
+capture psql -d "$SPAWN_DB_NAME" -q -f "$WORK/seed.sql"
+[ "$status" -eq 0 ] || harness "seeding the older inputs failed: $(err)"
+old_ids=$(q "select string_agg(id::text, ' ' order by id) from spawn_commands where idempotency_key like 'bb-old-%'")
+[ "$(echo "$old_ids" | wc -w)" -eq 2 ] || harness "the seeded older inputs are not two commands: [$old_ids]"
 
 start_loop
 start_serve
@@ -482,7 +544,7 @@ note "every worker took its task"
 # --- (1) taken and answered, by id ----------------------------------------------------
 
 commands take
-start_id=$(jq -r '[.[] | select(.message != null) | .command_id] | min // empty' "$WORK/commands-take.json")
+start_id=$(jq -r '[.[] | select(.message != null and .action == "start") | .command_id] | min // empty' "$WORK/commands-take.json")
 [ -n "$start_id" ] || fail "(1) no command into worker take has a message (its task was typed into it): $(jq -c '[.[] | {command_id, action, message}]' "$WORK/commands-take.json" | head -c 400)"
 until_message take "$start_id" '.state == "answered" and .taken == 1' 20 ||
     fail "(1) the task typed into take is not answered, taken once: $(m take "$start_id" '.message | tostring')"
@@ -546,6 +608,8 @@ until_message twice "$twice_id" '.state == "answered"' 30 ||
 [ "$(m twice "$twice_id" '.message.taken')" = 2 ] ||
     fail "(4) the input to twice reached its transcript twice and reads taken $(m twice "$twice_id" '.message.taken'), not 2: $(m twice "$twice_id" '.message | tostring')"
 note "(4) twice: taken 2"
+old_quiet "before the restart"
+note "(6) the inputs from before the change: typed, not not_taken, no alert"
 
 # --- (5) restarts ----------------------------------------------------------------
 
@@ -578,10 +642,22 @@ after=$(send take bb-ping-3 "BB:PING after the restart")
 until_message take "$after" '.state == "answered" and .taken == 1' 30 ||
     fail "(5) an input to take after the restart is not answered, taken once, within 30 s: $(m take "$after" '.message | tostring')"
 note "(5) a restart changed no message and fired no alert again; a new input was tracked"
+old_quiet "after the restart"
+note "(6) after the restart too"
 
-# --- (6) the page's words ----------------------------------------------------------------
+# --- (7) the session ends ----------------------------------------------------------------
 
-[ -f "$tree/web/src/messages.ts" ] || fail "(6) there is no web/src/messages.ts"
+capture "$SPAWN_BIN" task cancel --id "$(get deaf task)"
+[ "$status" -eq 0 ] || harness "task cancel (deaf) failed: $(err)"
+deadline=$(($(date +%s) + 30))
+until [ "$(alerts "$deaf_id" | tr '\n' ' ')" = "cleared " ] || [ "$(date +%s)" -ge "$deadline" ]; do sleep 0.5; done
+[ "$(alerts "$deaf_id" | tr '\n' ' ')" = "cleared " ] ||
+    fail "(7) deaf's task was cancelled and its worker stopped; its untaken message's alert is [$(alerts "$deaf_id" | tr '\n' ' ')], not cleared within 30 s"
+note "(7) deaf's session ended: its message's alert cleared"
+
+# --- (8) the page's words ----------------------------------------------------------------
+
+[ -f "$tree/web/src/messages.ts" ] || fail "(8) there is no web/src/messages.ts"
 cat >"$WORK/messages.test.mjs" <<'TEST'
 // A command's message in words, as web/src/messages.ts's messageLine says it.
 import assert from "node:assert/strict";
@@ -624,11 +700,11 @@ TEST
 if ! BB_TREE=$tree BB_WORK=$WORK BB_FIRST=$first BB_DEAF=$deaf_id BB_REFUSE=$refuse_id BB_TWICE=$twice_id \
     node --test "$WORK/messages.test.mjs" >"$WORK/messages.out" 2>&1; then
     if grep -q "ERR_MODULE_NOT_FOUND\|SyntaxError\|ERR_UNKNOWN_FILE_EXTENSION\|ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX" "$WORK/messages.out"; then
-        fail "(6) web/src/messages.ts does not load with node alone (relative .ts imports, import type for types, no packages, erasable TypeScript only): $(grep -m 3 'Error' "$WORK/messages.out" | tr '\n' ' ')"
+        fail "(8) web/src/messages.ts does not load with node alone (relative .ts imports, import type for types, no packages, erasable TypeScript only): $(grep -m 3 'Error' "$WORK/messages.out" | tr '\n' ' ')"
     fi
-    fail "(6) the page's words: $(grep -E 'AssertionError|expected|actual|is not a function|command ' "$WORK/messages.out" | head -n 6 | tr '\n' ' ')"
+    fail "(8) the page's words: $(grep -E 'AssertionError|expected|actual|is not a function|command ' "$WORK/messages.out" | head -n 6 | tr '\n' ' ')"
 fi
-note "(6) the page says each message in words"
+note "(8) the page says each message in words"
 
 note "every message tracked by its id: typed, taken, answered; the untaken and the doubled said; nothing twice across a restart"
 exit 0
