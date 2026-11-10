@@ -219,6 +219,27 @@
 # an owner's push changes it. It is in no base cache key: it decides which
 # scenarios run, never what one of them says.
 #
+# A known failure first (the owner, 2026-11-10: "Don't repeat expensive
+# gates when the same unresolved failure is likely to occur"; the gate
+# above took 39 minutes to say what the gate before it had said). The
+# regression whose failure last ended a gate of these scenarios, as a
+# candidate failure, a validator defect or unstable, is on record beside
+# the base cache (`gate-solved/<root commit>/.known-failure.<a hash of the
+# scenarios' names>`: written by the gate alone, and under the tmpfs that
+# hides the solved index from the sandbox). The next gate judges it first:
+# it is the first of the candidate's jobs, started before the serial list
+# and alone, as a scenario on that list is, and its block is the first
+# printed. Alone, because a regression that fails waits for the gate's
+# other runs to end before the base's run of it ("Three classes of a
+# failing regression"): with none started, a failure that is still there
+# is found in that scenario's own runs and, as a candidate failure, ends
+# the gate at once; a gate it passes in has run one scenario by itself.
+# The one thing that changes is
+# which failure is named when two scenarios fail: the known one, not the
+# first in the scenario order. A run of it that passes removes the record,
+# and the order is the scenario order again. A gate in which nothing ever
+# failed has no record.
+#
 # What is never cached (GitHub issue #29). The exit code is the whole
 # contract: an entry is written for exit 0, for exit 1 twice and for exit
 # 6, and for nothing else. A run that could not judge (the server it
@@ -941,6 +962,28 @@ if [ -n "$solved_root" ] && mkdir -p "$solved_base/$solved_root" 2>/dev/null; th
     solved_dir=$solved_base/$solved_root
 fi
 red_scenarios=""
+# A known failure first (see the header): the record, per repository and
+# set of scenario names, in the solved index's directory, which the sandbox
+# never sees; and the scenario it names, when these scenarios still have it.
+known_failure_file=""
+known_failure=""
+if [ -n "$solved_dir" ]; then
+    known_failure_file=$solved_dir/.known-failure.$(cd "$scenarios" && ls | grep '\.sh$' | LC_ALL=C sort |
+        sha256sum | cut -c1-16)
+    known_failure=$(sed -n '1p' "$known_failure_file" 2>/dev/null) || known_failure=""
+    case "$known_failure" in
+    */* | '') known_failure="" ;;
+    *) [ -f "$scenarios/$known_failure" ] || known_failure="" ;;
+    esac
+fi
+# known_failure_note <scenario>: on record for the next gate. One that
+# cannot be written costs the next gate its order, not this one its answer.
+known_failure_note() {
+    [ -n "$known_failure_file" ] || return 0
+    if ! { basename "$1" >"$known_failure_file.$$" && mv -f -- "$known_failure_file.$$" "$known_failure_file"; } 2>/dev/null; then
+        rm -f -- "$known_failure_file.$$" 2>/dev/null || :
+    fi
+}
 # The controller's checkout, as the checks locate it (two levels above the
 # scenarios directory).
 controller=$(cd "$scenarios/../.." && pwd)
@@ -2317,7 +2360,11 @@ job_order() {
     : >"$work/order.$1"
     while [ "$jo_i" -le "$2" ]; do
         jo_job=$jobs_dir/$1.$jo_i
-        if [ -e "$jo_job/alone" ]; then
+        if [ -e "$jo_job/first" ]; then
+            # A known failure first: before the serial list too, and
+            # alone like them (its job has both marks).
+            jo_group=-1 jo_ms=0
+        elif [ -e "$jo_job/alone" ]; then
             jo_group=0 jo_ms=0
         elif [ -e "$jo_job/head" ]; then
             jo_group=1 jo_ms=0
@@ -2331,7 +2378,7 @@ job_order() {
             fi
             [ -n "$jo_ms" ] || jo_ms=999999999999
         fi
-        [ "$gate_jobs" -gt 1 ] || jo_group=0 jo_ms=0
+        [ "$gate_jobs" -gt 1 ] || [ "$jo_group" -lt 0 ] || jo_group=0 jo_ms=0
         printf '%s %s %s\n' "$jo_group" "$jo_ms" "$jo_i" >>"$work/order.$1"
         jo_i=$((jo_i + 1))
     done
@@ -4142,6 +4189,7 @@ candidate_printed() {
         # never accept it (the header).
         printed_runs=$(cat "$1/runs" 2>/dev/null)
         validator_defects="${validator_defects:+$validator_defects,}\"$(json_string "$(basename "$printed_scenario")")\""
+        known_failure_note "$printed_scenario"
         if [ -n "$owner_candidate" ]; then
             echo "| $(basename "$printed_scenario") fails on the candidate and on the base, run now ($printed_runs): validator defect (fails on the base too, under the same conditions), not a rejection; the owner's candidate is judged on the rest, and the verdict names it"
             run_stage "validator_defect|$printed_name" "$printed_ms"
@@ -4156,6 +4204,7 @@ candidate_printed() {
     fi
     if [ "$printed_status" = unstable ]; then
         printed_runs=$(cat "$1/runs" 2>/dev/null)
+        known_failure_note "$printed_scenario"
         run_stage "cannot_judge|$(cat "$1/last")" "$printed_ms"
         phase_time candidate
         echo "| $(basename "$printed_scenario") failed one of three runs on the candidate and the base passes it ($printed_runs): unstable on the candidate, neither a pass nor a candidate failure: infrastructure (cannot judge), no verdict"
@@ -4209,8 +4258,13 @@ candidate_printed() {
         fi
         run_stage "rejected|$printed_name" "$printed_ms"
         phase_time candidate
+        known_failure_note "$printed_scenario"
         verdict rejected "regression: $(basename "$printed_scenario") fails on the candidate"
         exit 0
+    fi
+    # A known failure that passes is known no longer.
+    if [ -e "$1/first" ] && [ -n "$known_failure_file" ]; then
+        rm -f -- "$known_failure_file" 2>/dev/null || :
     fi
     run_stage "ok|$printed_name" "$printed_ms"
 }
@@ -4443,6 +4497,19 @@ seed() {
     rm -f "$seed_entry.seed.$$" 2>/dev/null || :
     exec 8>&-
 }
+# A known failure first (see the header): the first job, before the task's
+# own. Not when it is the task's scenario (judged by its own rules, and at
+# the head already), nor when no gate runs it as a regression any more.
+known_first=""
+if [ -n "$known_failure" ] && [ "$scenarios/$known_failure" != "$scenario" ] &&
+    ! not_a_regression "$scenarios/$known_failure" && ! is_quarantined "$scenarios/$known_failure"; then
+    known_first=$scenarios/$known_failure
+    echo "| known failure first: $known_failure ended the last gate of these scenarios that it failed in ($known_failure_file): judged first"
+    add_candidate_job "$known_first" "regression: $known_failure must still pass" regression
+    : >"$job/first"
+    : >"$job/alone"
+    [ "$known_failure" != check-tests.sh ] || tests_queued=1
+fi
 if [ -n "$scenario" ]; then
     add_candidate_job "$scenario" "candidate: $(basename "$scenario") must pass"
     : >"$job/task"
@@ -4451,6 +4518,7 @@ fi
 for other in "$scenarios"/check-tests.sh "$scenarios"/*.sh; do
     [ -f "$other" ] || continue
     [ "$other" = "$scenario" ] && continue
+    [ "$other" = "$known_first" ] && continue
     [ "$other" = "$scenarios/check-tests.sh" ] && [ -n "${tests_queued-}" ] && continue
     [ "$other" = "$scenarios/check-tests.sh" ] && tests_queued=1
     not_a_regression "$other" && continue
