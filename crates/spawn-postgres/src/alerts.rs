@@ -378,10 +378,7 @@ impl PostgresStore {
         open: &[i64],
         since_ms: i64,
     ) -> Result<Value, StoreError> {
-        self.query_json_prepared(
-            MESSAGES_SINCE,
-            &[&bound_ms, &after, &due, &open, &since_ms],
-        )
+        self.query_json_prepared(MESSAGES_SINCE, &[&bound_ms, &after, &due, &open, &since_ms])
     }
 
     /// Commands that finished failed after `since_ms` ([`FAILED_COMMANDS`]).
