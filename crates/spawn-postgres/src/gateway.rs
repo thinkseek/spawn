@@ -74,10 +74,6 @@ pub(crate) const HUMAN_INPUT: &str = "select spawn_human_input($1, $2, $3)";
 /// execution. `$1` session, `$2` idempotency key, `$3` the key's name.
 pub(crate) const HUMAN_KEY: &str = "select spawn_human_key($1, $2, $3)";
 
-<<<<<<< 02abfa3630110740eb4e62ec42a69c0ad6a01d8e
-/// What became of a person's write from the page, an input or a key
-/// ([`PostgresStore::submit_human_input`], [`PostgresStore::submit_human_key`]).
-=======
 /// A person's restart or reassign from the agent page, through
 /// `spawn_human_task`: `{task, session_id, agent_id}`, the task and worker
 /// that now carry the work, or SQLSTATE 55000 when the session holds no
@@ -96,8 +92,8 @@ pub enum HumanTask {
     Refused(String),
 }
 
-/// What became of a person's key ([`PostgresStore::submit_human_key`]).
->>>>>>> 7125d2b7facd18acdf324fa1432965f6d184d227
+/// What became of a person's write from the page, an input or a key
+/// ([`PostgresStore::submit_human_input`], [`PostgresStore::submit_human_key`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HumanWrite {
     /// The command that carries it (a new one, or the one an earlier call
