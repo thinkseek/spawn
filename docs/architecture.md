@@ -156,6 +156,7 @@ spawn fleet
 | `SPAWN_JUDGE_URL` | 未设 | 判定服务根地址，未设时用内置规则 |
 | `SPAWN_WORKER` | `spawn-worker` | 租约中的 worker 名 |
 | `SPAWN_LOOP_INTERVAL_MS` | `500` | `spawn loop` 两轮之间的间隔 |
+| `SPAWN_MODEL_PRICES` | 内置价目表 | 各模型每百万 token 的美元价格，`{"<模型>": {"input", "output", "cache_write", "cache_read"}}`，每项为不小于 0 的数：每次模型调用在记录时按它定价（Cost 页、`GET /api/cost`、任务的 `--daily-usd` 日预算）。未定价的模型只计 token、不计费用（记为 unpriced）。设置后整体替换内置表（docs/fleet-architecture.md §3.5）；不是这样的对象时 `spawn loop` 和 `spawn serve` 启动即退出 |
 | `SPAWN_SCREEN_QUIET_MS` | `500` | 活跃执行的会话记录要静止多久才读一次屏（读的是会话记录说不了的：提示符回来了）。越短越早知道就绪，抓屏也越多 |
 | `SPAWN_DELIVERY_RETRY_SECS` | `60` | 投递失败（什么也没打进去）后第一次计数重试前的等待（整秒，不是非负整数时在 loop 日志里警告并用默认值），之后每次加倍，至多 30 分钟；共重试 3 次（窗格未就绪的前 10 次拒绝不计） |
 | `SPAWN_DELIVERY_NOT_READY_MS` | `5000` | 投递因窗格未就绪被拒（什么也没打进去）后再试前的等待（毫秒，至少 100；不是这样的整数时在 loop 日志里警告并用默认值）。只决定何时再试，不改次数：前 10 次这样的拒绝始终不计。免计的是次数而不是时长，所以窗格在拒绝开始计数前得到的宽限约为 10 倍这个等待（默认约 50 秒，019 的 500 毫秒约 5 秒，下限约 1 秒）；更慢的窗格随后付计数重试的退避 |
