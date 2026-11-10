@@ -968,6 +968,62 @@ pub fn claude_line(line: &str) -> Vec<Normalized> {
     }
 }
 
+/// The model usage an assistant line of a Claude Code transcript carries:
+/// a line of `type` `assistant` with `message.id`, `message.usage` and a
+/// readable `timestamp` (the model `unknown` when `message.model` is
+/// missing). Claude Code writes one line per content block, each repeating
+/// the id, the model and the usage: the key is the message id with its four
+/// counts, so an identical repeat appends nothing, and a line whose usage
+/// grew is one more event, which the cost step folds into the same message
+/// (crate spawn-cli's `cost`: once per message id, its largest usage, its
+/// earliest time). A usage of four zeros (the engine's own synthetic
+/// messages) costs nothing and gives none. A sub-agent's line
+/// (`isSidechain`) is a model call too, and counts.
+pub fn claude_usage(line: &str) -> Option<Normalized> {
+    // Most lines carry no usage: skip them unparsed.
+    if !line.contains("\"usage\"") {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let message = value.get("message")?;
+    let id = message
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())?;
+    let usage = message.get("usage")?;
+    let at_ms = utc_ms(value.get("timestamp").and_then(Value::as_str)?)?;
+    let count = |name: &str| usage.get(name).and_then(Value::as_u64).unwrap_or(0);
+    let (input, output, cache_write, cache_read) = (
+        count("input_tokens"),
+        count("output_tokens"),
+        count("cache_creation_input_tokens"),
+        count("cache_read_input_tokens"),
+    );
+    if input == 0 && output == 0 && cache_write == 0 && cache_read == 0 {
+        return None;
+    }
+    let model = message
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+        .unwrap_or("unknown");
+    Some(keyed(
+        EventKind::ModelUsage {
+            message_id: id.to_string(),
+            model: model.to_string(),
+            at_ms,
+            input_tokens: input,
+            output_tokens: output,
+            cache_write_tokens: cache_write,
+            cache_read_tokens: cache_read,
+        },
+        format!("usage:{id}:{input}:{output}:{cache_write}:{cache_read}"),
+    ))
+}
+
 /// The engine version a Claude Code transcript line names (its `version`
 /// field). Like [`claude_line`], the caller reads only the execution's part
 /// of the file.
