@@ -81,6 +81,7 @@ macro_rules! lost_before_ready {
 
 mod alerts;
 mod command_queue;
+mod cost;
 mod event_log;
 mod fleet;
 mod gateway;
@@ -92,7 +93,11 @@ mod scorecard;
 mod sessions;
 mod wake;
 
+<<<<<<< 02abfa3630110740eb4e62ec42a69c0ad6a01d8e
+pub use gateway::{HumanInput, HumanKey, HumanWrite};
+=======
 pub use gateway::{HumanKey, HumanTask};
+>>>>>>> 7125d2b7facd18acdf324fa1432965f6d184d227
 pub use missions::{ActivityEvent, LandingHold, PushRequest};
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
