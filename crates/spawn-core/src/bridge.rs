@@ -465,6 +465,8 @@ impl Default for Archiving {
 struct EndedArchive {
     progress: ArchiveProgress,
     error: Option<String>,
+    /// The record as last written, if it was.
+    written: Option<ArchiveProgress>,
 }
 
 /// How much earlier than a read of a transcript Spawn takes it to be known:
@@ -1323,6 +1325,7 @@ impl Bridge {
                             .or_insert(EndedArchive {
                                 progress,
                                 error: None,
+                                written: None,
                             });
                     }
                 }
@@ -3308,6 +3311,7 @@ impl Bridge {
                 .insert(
                     (agent_id.clone(), progress.native.clone()),
                     EndedArchive {
+                        written: Some(progress.clone()),
                         progress,
                         error: state.error.clone(),
                     },
@@ -3329,7 +3333,7 @@ impl Bridge {
         (archived, behind_ms, known_ms): (&mut Option<u64>, &mut Option<i64>, &mut Option<i64>),
     ) -> Option<String> {
         let read_at = self.clock.now().0.saturating_sub(ARCHIVE_SLACK_MS);
-        let mut known = |known_ms: &mut Option<i64>| {
+        let known = |known_ms: &mut Option<i64>| {
             *known_ms = Some(known_ms.map_or(read_at, |was| was.max(read_at)));
         };
         match transcripts::archive_to(
@@ -3424,12 +3428,24 @@ impl Bridge {
                 progress.live = false;
                 progress.known_ms = known.unwrap_or(i64::MIN);
                 progress.behind_ms = unknown_behind(progress.behind_ms, known, false);
-                let put = archive.put_progress(progress, true);
-                if let Err(put) = &put {
-                    report.warnings.push(format!(
+                // A copy that keeps failing writes its record once.
+                let unchanged = entry.written.as_ref().is_some_and(|written| {
+                    ArchiveProgress {
+                        known_ms: written.known_ms,
+                        ..progress.clone()
+                    } == *written
+                });
+                let put = if unchanged {
+                    Ok(())
+                } else {
+                    archive.put_progress(progress, true)
+                };
+                match &put {
+                    Ok(()) => entry.written = Some(progress.clone()),
+                    Err(put) => report.warnings.push(format!(
                         "{}: record the transcript archive's progress: {put}",
                         progress.session
-                    ));
+                    )),
                 }
                 put.is_ok() && progress.behind_ms.is_none()
             };
@@ -3483,6 +3499,7 @@ impl Bridge {
                 list.insert(
                     (record.agent.clone(), record.native.clone()),
                     EndedArchive {
+                        written: Some(record.clone()),
                         progress: record,
                         error: None,
                     },
