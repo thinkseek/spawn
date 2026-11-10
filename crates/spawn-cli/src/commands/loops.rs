@@ -894,6 +894,7 @@ mod tests {
             &mut schedule.dispatch,
             &mut schedule.residents,
             &mut schedule.alive,
+            &mut schedule.cost,
             &mut schedule.alerts,
         ] {
             step.ran(watermark, None);
