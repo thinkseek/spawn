@@ -26,12 +26,21 @@
 //!   database, a free-space reading at or above the floor. Clearing is one
 //!   `execution.cleared` record and then the revival — an `input` into the
 //!   live engine, or a resume if the execution ended. A wait never counts
-//!   toward the handoff.
-//! - `final` (stopped): never revived.
+//!   toward the handoff. A model wait whose engine *ended* is resumed at
+//!   most `SPAWN_RECOVER_MODEL_RETRIES` (3) times in a row with no model
+//!   answer between ([`model_resumes`]); its next such end is recorded
+//!   `model_unavailable` on the `final` path, with `retries` in its
+//!   evidence.
+//! - `final` (stopped, model_error): never revived. `model_error` is the
+//!   engine's own end after a request the model refused for good (a 400
+//!   that is not an exhausted context, a 404, a 413), with no progress
+//!   since ([`refused`]). The dispatcher tells the supervisor of every
+//!   final model record once (`dispatch::digest::model_finals`).
 //!
 //! The cause is read from recorded facts, in this precedence: stopped,
 //! budget, memory_limit, host_restart, disk_full, database_unavailable,
-//! model_auth, model_unavailable, context_exhausted, crashed, exited. Each
+//! model_auth, model_unavailable, context_exhausted, model_error, crashed,
+//! exited. Each
 //! is named in the record's evidence ([`classify`], [`model_cause`]).
 //!
 //! Every revival is one command keyed `recover-<execution>-<attempt>`, the
