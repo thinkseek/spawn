@@ -236,4 +236,33 @@ mod tests {
         busy.open_command = true;
         assert_eq!(next_due(&busy), None, "a command is in flight");
     }
+
+    /// A restart's or a reassign's Stop that cannot end the execution is
+    /// escalated naming the restart or the reassign and its task, and is
+    /// then spent: a reassigned task waits for it no longer.
+    #[test]
+    fn a_failed_restart_or_reassign_stop_is_escalated_naming_it() {
+        use super::{pursue, spent};
+        use crate::dispatch::worker::Decision;
+        for (key, words) in [
+            ("restart-7-1-stop", "task #7 was restarted"),
+            ("reassign-7-stop", "task #7 was reassigned to a fresh worker"),
+        ] {
+            let mut stops: Vec<StopSent> = (0..=DELIVERY_RETRIES)
+                .map(|n| {
+                    let n = i64::try_from(n).expect("a handful of retries");
+                    stop(n, 100_000 + n * 1000, Some(false))
+                })
+                .collect();
+            stops[0].key = key.to_string();
+            let facts = stopping(stops);
+            assert!(spent(&facts));
+            let Decision::Escalate(escalation) = pursue(&facts, 1_000_000) else {
+                panic!("escalated");
+            };
+            assert!(escalation.line.contains(words), "{}", escalation.line);
+        }
+        assert!(!spent(&stopping(vec![stop(1, 100_000, Some(false))])));
+        assert!(!spent(&stopping(Vec::new())));
+    }
 }

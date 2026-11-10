@@ -3345,4 +3345,120 @@ mod tests {
             worked.progress
         ));
     }
+
+    /// Mission rows with task 7 of `session_worker_a_7` delivered and
+    /// restarted once, and task 8 of `session_worker_b_8` reassigned as
+    /// task 9 of `session_worker_b_9`.
+    fn moved_work() -> crate::deliver::Work {
+        let row = |id: i64, session: &str, state: &str| -> crate::deliver::TaskRow {
+            serde_json::from_value(json!({
+                "id": id, "mission_id": 1, "kind": "ephemeral",
+                "agent_id": session.replace("session_", "agent_"), "session_id": session,
+                "brief": "b", "state": state,
+            }))
+            .expect("a task row")
+        };
+        let mut restarted = row(7, "session_worker_a_7", "delivered");
+        restarted.restart = Some(crate::deliver::Restart {
+            n: 1,
+            execution_id: Some("exec_a".to_string()),
+            by: Some("human".to_string()),
+            reason: None,
+        });
+        let mut old = row(8, "session_worker_b_8", "cancelled");
+        old.reassigned_as = Some(9);
+        old.reassigned_to_session = Some("session_worker_b_9".to_string());
+        crate::deliver::Work {
+            tasks: vec![restarted, old, row(9, "session_worker_b_9", "assigned")],
+            ..crate::deliver::Work::default()
+        }
+    }
+
+    fn dispatcher_stop(key: &str, command_id: i64) -> Stop {
+        Stop {
+            principal: "spawn-dispatch".to_string(),
+            ..stop(key, command_id)
+        }
+    }
+
+    /// The cause `restarted` or `reassigned` comes from the record the
+    /// dispatcher's own Stop names, never from a key alone: the same key
+    /// from anyone else, or one no record gives, is `stopped`.
+    #[test]
+    fn a_restart_or_reassign_is_told_from_its_record_and_the_dispatchers_stop() {
+        use super::{Moved, moved};
+        let work = moved_work();
+        let restart = dispatcher_stop("restart-7-1-stop", 40);
+        assert_eq!(
+            moved(std::slice::from_ref(&restart), "session_worker_a_7", &work),
+            Some(Moved::Restarted { task: 7, n: 1 })
+        );
+        let reassign = dispatcher_stop("reassign-8-stop", 41);
+        assert_eq!(
+            moved(std::slice::from_ref(&reassign), "session_worker_b_8", &work),
+            Some(Moved::Reassigned {
+                task: 8,
+                to_task: 9,
+                to_session: Some("session_worker_b_9".to_string()),
+            })
+        );
+        // A retry of the dispatcher's Stop carries its purpose.
+        let retry = dispatcher_stop("stop-exec_b-retry-1", 42);
+        assert!(matches!(
+            moved(&[reassign.clone(), retry], "session_worker_b_8", &work),
+            Some(Moved::Reassigned { task: 8, .. })
+        ));
+        // A person's Stop with the dispatcher's key is a person's.
+        assert_eq!(moved(&[stop("restart-7-1-stop", 43)], "session_worker_a_7", &work), None);
+        // A restart no record gives (another n), or another session's.
+        assert_eq!(
+            moved(&[dispatcher_stop("restart-7-2-stop", 44)], "session_worker_a_7", &work),
+            None
+        );
+        assert_eq!(moved(&[restart.clone()], "session_worker_b_8", &work), None);
+        // A later person's Stop is the one that ended it.
+        assert_eq!(
+            moved(&[restart.clone(), stop("bb-stop", 45)], "session_worker_a_7", &work),
+            None
+        );
+
+        let ended = end("stopped", None, None);
+        let told = Facts {
+            stop: Some(&restart),
+            moved: moved(std::slice::from_ref(&restart), "session_worker_a_7", &work),
+            ..facts(Some(&ended))
+        };
+        assert_eq!(classify(&told), Cause::Restarted);
+        assert_eq!(way(Cause::Restarted, true, 0).0, Path::Final);
+        let reassigned = Facts {
+            stop: Some(&reassign),
+            moved: moved(std::slice::from_ref(&reassign), "session_worker_b_8", &work),
+            ..facts(Some(&ended))
+        };
+        assert_eq!(classify(&reassigned), Cause::Reassigned);
+        assert_eq!(way(Cause::Reassigned, true, 0).0, Path::Final);
+        assert_eq!(
+            classify(&Facts {
+                stop: Some(&restart),
+                ..facts(Some(&ended))
+            }),
+            Cause::Stopped,
+            "without the record it is a Stop like any other"
+        );
+        assert_eq!(Cause::from_name("restarted"), Some(Cause::Restarted));
+        assert_eq!(Cause::from_name("reassigned"), Some(Cause::Reassigned));
+    }
+
+    /// The recovery keeps a reassigned ephemeral worker (to record its end)
+    /// but never revives it.
+    #[test]
+    fn a_reassigned_worker_is_kept_to_record_its_end_and_never_revived() {
+        let work = moved_work();
+        let none = std::collections::BTreeMap::new();
+        assert!(super::kept("agent_worker_b_8", "session_worker_b_8", &work, &none));
+        assert!(super::reassigned_away("session_worker_b_8", &work));
+        assert!(!super::reassigned_away("session_worker_a_7", &work));
+        assert!(super::kept("agent_worker_a_7", "session_worker_a_7", &work, &none));
+        assert!(!super::kept("agent_worker_b_9", "session_worker_b_9", &work, &none));
+    }
 }
