@@ -556,12 +556,12 @@ function shortAge(ms: number): string {
   return hours < 48 ? `${hours} h` : `${Math.round(hours / 24)} d`;
 }
 
-/** The header line: "3 in flight · 13 landed today · last rejected 2 h ago
+/** The header line: "3 in flight · 13 landed in 24 h · last rejected 2 h ago
  * (T221): 051.sh fails on the candidate"; a quiet mission's says so. */
 export function laneTodayText(today: LaneToday, now: number): string {
   const parts: string[] = [];
   if (today.inFlight > 0) parts.push(`${today.inFlight} in flight`);
-  parts.push(today.landed > 0 ? `${today.landed} landed today` : "nothing landed today");
+  parts.push(today.landed > 0 ? `${today.landed} landed in 24 h` : "nothing landed in 24 h");
   if (today.lastBack) {
     const back = today.lastBack;
     // Its first line, clipped: a gate's reason can run to a whole log.
@@ -594,4 +594,22 @@ export function holdText(hold: { expires_ms: number | null; waiting: readonly nu
   }
   if (hold.waiting.length > 0) parts.push(`${hold.waiting.length} task${hold.waiting.length === 1 ? "" : "s"} waiting`);
   return parts.join(" · ");
+}
+
+/** A held source's title: its line, its reason, who took it and when, and
+ * the main it was taken at (what the removed held-sources card showed). */
+export function holdTitle(
+  hold: { expires_ms: number | null; waiting: readonly number[]; reason: string | null; by: string | null; held_at_ms: number | null; main: string | null },
+  now: number,
+): string {
+  const lines = [holdText(hold, now)];
+  if (hold.reason) lines.push(hold.reason);
+  const taken = [
+    hold.by ? `taken by ${hold.by}` : "taken",
+    hold.held_at_ms !== null ? `${shortAge(Math.max(0, now - hold.held_at_ms))} ago` : null,
+    hold.main ? `at main ${hold.main.slice(0, 12)}` : null,
+  ].filter(Boolean);
+  if (taken.length > 1) lines.push(taken.join(" "));
+  if (hold.waiting.length > 0) lines.push(`waiting: ${hold.waiting.map((task) => `T${task}`).join(", ")}`);
+  return lines.join("\n");
 }
