@@ -36,7 +36,7 @@ import { clockTime, formatDuration, relativeTime } from "../../format";
 import { commandSummary, foldCommands, inputAt, inputLeads, principalWords } from "../../commands";
 import { doingWords } from "../../home";
 import { forHowLong, historyClock, judgementLine, judgementRuns, judgementSpeaks, runLabel, summaryTask } from "../../agentPage";
-import type { JudgementRun } from "../../agentPage";
+import type { HeldTask, JudgementRun } from "../../agentPage";
 import { recentToolRows, rowText, runEnd } from "../../trace";
 import { freshAt } from "../../validated";
 import { LiveBadge, TerminalPanel } from "../Terminal";
@@ -63,7 +63,7 @@ interface AgentDetailProps {
   name?: string | null;
   /** The task its name goes by (home.ts `nameTask`): the summary's line
    * when no person's input leads. */
-  held?: { task_id: number | null; title: string | null } | null;
+  held?: HeldTask | null;
   onClose: () => void;
   onOpenTimeline: (sessionId: string) => void;
 }
@@ -263,7 +263,7 @@ function AgentSummary({
   commands,
 }: {
   agent: FleetAgent;
-  held: { task_id: number | null; title: string | null } | null;
+  held: HeldTask | null;
   commands: CommandRecord[] | null;
 }) {
   // A worker's task when it holds no person's input: "T247 · Cost you can see".
