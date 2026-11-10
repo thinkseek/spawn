@@ -12,10 +12,12 @@ import { clampDomain, panDomain, zoomDomain } from "../../timeWindow";
 import type { Domain } from "../../timeWindow";
 
 /** What the window follows: the whole extent, the live end with a fixed
- * width, or a fixed range. */
+ * width, everything from a fixed start to the live end (a run still going,
+ * whose start stays in view as it grows), or a fixed range. */
 export type Follow =
   | { mode: "fit" }
   | { mode: "tail"; width: number }
+  | { mode: "since"; from: number }
   | { mode: "fixed"; domain: Domain };
 
 /** Pointer travel that turns a press into a drag. */
@@ -37,6 +39,8 @@ export interface TimeWindow {
   /** Glide to a range with some air around it. */
   zoomTo: (from: number, to: number) => void;
   fit: () => void;
+  /** Show `from` to the live end, and keep following that end. */
+  since: (from: number) => void;
   stop: () => void;
   /** Latest values, for native listeners. */
   latest: RefObject<{ domain: Domain; extent: Domain; scale: number }>;
@@ -52,6 +56,9 @@ export function useTimeWindow(
     if (follow.mode === "fit") return extent;
     if (follow.mode === "tail") {
       return clampDomain({ from: extent.to - follow.width, to: extent.to }, extent);
+    }
+    if (follow.mode === "since") {
+      return clampDomain({ from: Math.max(extent.from, follow.from), to: extent.to }, extent);
     }
     return clampDomain(follow.domain, extent);
   }, [follow, extent]);
@@ -112,6 +119,10 @@ export function useTimeWindow(
     [glideTo],
   );
   const fit = useCallback(() => glideTo(latest.current.extent), [glideTo]);
+  const since = useCallback((from: number) => {
+    glide.current?.stop();
+    setFollow({ mode: "since", from });
+  }, []);
 
   return {
     domain,
@@ -124,6 +135,7 @@ export function useTimeWindow(
     zoomBy,
     zoomTo,
     fit,
+    since,
     stop,
     latest,
   };

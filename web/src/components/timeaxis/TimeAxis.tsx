@@ -111,7 +111,10 @@ export function BreakBands({ breaks, height }: { breaks: BreakMark[]; height: nu
             fill="var(--muted)"
             opacity={0.55}
           />
-          {[mark.x0, mark.x1].map((x, index) => (
+          {/* Dashed edges only where the band is wide enough to read as
+              one: a run of narrow breaks (a session's hours between
+              bursts) stays a quiet tint, not a field of dashes. */}
+          {(mark.x1 - mark.x0 >= 12 ? [mark.x0, mark.x1] : []).map((x, index) => (
             <line
               key={index}
               x1={x}
@@ -270,17 +273,21 @@ export function IconButton({
   label,
   onClick,
   active = false,
+  pressed,
   children,
 }: {
   label: string;
   onClick: () => void;
   active?: boolean;
+  /** For a toggle: its state, as aria-pressed. */
+  pressed?: boolean;
   children: ReactNode;
 }) {
   return (
     <button
       type="button"
       aria-label={label}
+      aria-pressed={pressed}
       title={label}
       onClick={onClick}
       className={cx(
