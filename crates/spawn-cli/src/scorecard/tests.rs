@@ -655,6 +655,27 @@ fn autonomy_counts_the_owners_interventions() {
 }
 
 #[test]
+fn an_overrun_closes_its_task_as_an_abort_does() {
+    let mut story = Story::default();
+    story.mission(1, true);
+    // Task 1 runs over its budget at 2 h; a person's cancellation after
+    // that closes nothing, so the same objective again is no reassignment.
+    story
+        .assign(at(0), 1, 1, Some(7), "spawn-integrate")
+        .task(1, "task.over_budget", at(2))
+        .cancelled(at(3), 1, Some("human"))
+        .assign(at(4), 2, 1, Some(7), "spawn-integrate")
+        .task(2, "task.landed", at(6));
+    let history = story.history();
+    let counted = counts(&history, Scope::Fleet, window_hours(0, 24));
+    let throughput = dimension(&counted, None, "throughput");
+    assert_eq!(throughput["open_hours"], json!(4.0), "0-2 and 4-6");
+    assert_eq!(throughput["landed"], json!(1));
+    let autonomy = dimension(&counted, None, "autonomy");
+    assert_eq!(autonomy["interventions"], json!(0));
+}
+
+#[test]
 fn reliability_counts_failures_of_the_machinery() {
     let mut story = Story::default();
     story.mission(1, true);
