@@ -63,8 +63,11 @@ export function commandSummary(action: string, text: string | null): string | nu
   return commandGist(text);
 }
 
-/** `Dispatcher → input`: who sent it and what it is. */
-export function commandHead(principal: string, action: string): string {
+/** `Dispatcher → input`: who sent it and what it is. An input given `to`
+ * (the name of the agent it went to) names that agent instead: `You →
+ * supervisor`, so a session's page reads as a conversation. */
+export function commandHead(principal: string, action: string, to?: string | null): string {
+  if (action === "input" && to) return `${principalWords(principal)} → ${to}`;
   return `${principalWords(principal)} → ${action}`;
 }
 
