@@ -88,7 +88,7 @@ export interface Execution {
   duration_ms: number | null;
   /** The execution of the same session a restart's resume replaced
    * (`spawn task restart`, the page's Restart); null otherwise. */
-  restart_of: string | null;
+  restart_of?: string | null;
 }
 
 /** One end of a reassign (`spawn task reassign`, the page's Reassign): a
@@ -130,10 +130,10 @@ export interface SessionDetail {
   executions: Execution[];
   /** The task this session's task was reassigned to, and its worker's
    * session; null when none was. */
-  reassigned_to: TaskLink | null;
+  reassigned_to?: TaskLink | null;
   /** The task this session's task took over, and its old worker's
    * session; null when it took over none. */
-  reassigned_from: TaskLink | null;
+  reassigned_from?: TaskLink | null;
   open_tools: OpenTool[];
   freshness: Freshness | null;
   timeline: TimelineEvent[];
