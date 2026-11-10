@@ -1176,11 +1176,12 @@ fn judge_in(
     if let Some(scenario) = scenario {
         command.arg(scenario);
     }
-    command
-        .env_clear()
-        .envs(env.iter().map(|(name, value)| (name, value)))
-        .env("SPAWN_GATE_VERDICT", &verdict_path);
-    let run = run_bounded(command, limit, directory.path());
+    let mut gate_env = env.to_vec();
+    gate_env.push((
+        "SPAWN_GATE_VERDICT".to_string(),
+        verdict_path.to_string_lossy().into_owned(),
+    ));
+    let run = run_gate(&command, &gate_env, limit, directory.path());
     // The base check is read before anything else of the run, so a gate the
     // wall clock killed (a timeout) still says main passed it.
     *seen = std::fs::read_to_string(&verdict_path)
@@ -1237,6 +1238,25 @@ fn env_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
 /// [`decide`] reads; a fact with none is read as this one.
 pub(crate) const FACT_VERSION: u64 = 1;
 
+/// Why the verdict file's fact is one this integrator cannot read: its
+/// version (gate.sh writes `"v":1` first) is another than [`FACT_VERSION`].
+/// A gate may be read by a newer integrator than the one that started it,
+/// never by one that does not know what it wrote; no version is the gate
+/// before versions, read as v1.
+fn unread_version(verdict: Option<&str>) -> Option<String> {
+    let version = verdict
+        .map(str::trim)
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())?
+        .get("v")
+        .cloned()?;
+    (version != serde_json::json!(FACT_VERSION)).then(|| {
+        format!(
+            "the gate wrote a fact of version {version}; this integrator reads version \
+             {FACT_VERSION} (and facts with none)"
+        )
+    })
+}
+
 /// The verdict of a finished gate run: the verdict file's, only after a
 /// clean exit.
 ///
@@ -1249,6 +1269,7 @@ pub(crate) const FACT_VERSION: u64 = 1;
 /// an abort with the whole record, the gate's stdout then its stderr marked
 /// `! `: the pair with any other exit, a base run that exited 2 or `1, then
 /// 2`, and a nested gate's line (`| | …`) in a scenario's log.
+#[allow(clippy::too_many_lines)] // one ordered list of the gate's outcomes
 fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
     // The record: stdout, then stderr marked `! ` so no line of it can pass
     // for a verdict or a section header. An abort keeps all of it.
@@ -1263,20 +1284,8 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
         reason,
         log: record(&run.stdout),
     };
-    // The fact's version (gate.sh writes `"v":1` first): a gate may be read
-    // by a newer integrator than the one that started it, never by one that
-    // does not know what it wrote. No version is the gate before versions,
-    // read as v1.
-    if let Some(version) = verdict
-        .map(str::trim)
-        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .and_then(|value| value.get("v").cloned())
-        && version != serde_json::json!(FACT_VERSION)
-    {
-        return Err(aborted(format!(
-            "the gate wrote a fact of version {version}; this integrator reads version \
-             {FACT_VERSION} (and facts with none)"
-        )));
+    if let Some(reason) = unread_version(verdict) {
+        return Err(aborted(reason));
     }
     if run.status.code() == Some(NO_ROOM_EXIT)
         && let Some(short) = verdict.and_then(no_room)
@@ -1926,6 +1935,131 @@ pub(crate) fn run_bounded(
         status,
         stdout: std::fs::read_to_string(&out_path).unwrap_or_default(),
         stderr: std::fs::read_to_string(&err_path).unwrap_or_default(),
+    })
+}
+
+/// The gate's runner (gate v2 step 2, design-gate-survives-restart.md D2):
+/// it runs the gate with the environment in `<dir>/env` (read, then
+/// removed: never on a command line), the gate's stdout and stderr into
+/// `<dir>/stdout` and `<dir>/stderr`, and when the gate exits it writes its
+/// status to `<dir>/status`, whole or not at all. So a gate's outcome is
+/// files, which whoever reaps it reads, not pipes that only the process that
+/// started it holds. Written by the integrator into the judging's directory:
+/// never candidate code.
+const RUNNER: &str = r#"# spawn's gate runner: <dir> <program> [<argument> ...]
+# Its own names begin spawn_runner_, which no environment name may (env_file).
+spawn_runner_dir=$1
+shift
+set -a
+. "$spawn_runner_dir/env"
+set +a
+rm -f -- "$spawn_runner_dir/env"
+spawn_runner_status=0
+"$@" </dev/null >"$spawn_runner_dir/stdout" 2>"$spawn_runner_dir/stderr" || spawn_runner_status=$?
+printf '%s\n' "$spawn_runner_status" >"$spawn_runner_dir/status.tmp" &&
+    mv -f -- "$spawn_runner_dir/status.tmp" "$spawn_runner_dir/status"
+"#;
+
+/// `env` as a file the runner sources: `NAME='value'` a line, a quote in a
+/// value as `'\''`. A name that is no shell name is refused, and so is one
+/// of the runner's own (`spawn_runner_…`), which the file would overwrite.
+fn env_file(env: &[(String, String)]) -> Result<String, String> {
+    let mut text = String::new();
+    for (name, value) in env {
+        let shell_name = name
+            .chars()
+            .next()
+            .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+            && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric());
+        if !shell_name {
+            return Err(format!(
+                "the gate's environment names {name:?}, no shell name"
+            ));
+        }
+        if name.starts_with("spawn_runner_") {
+            return Err(format!(
+                "the gate's environment names {name:?}, one of the runner's own names"
+            ));
+        }
+        let _ = writeln!(text, "{name}='{}'", value.replace('\'', "'\\''"));
+    }
+    Ok(text)
+}
+
+/// The gate's status as the runner wrote it: an exit code, or 128 + N for a
+/// gate a signal N ended (the shell's `$?`; the gate itself exits 0 to 7).
+fn status_from(text: &str) -> Option<ExitStatus> {
+    use std::os::unix::process::ExitStatusExt as _;
+    let code: i32 = text.trim().parse().ok()?;
+    Some(match code {
+        0..=128 => ExitStatus::from_raw(code << 8),
+        129..=192 => ExitStatus::from_raw(code - 128),
+        _ => return None,
+    })
+}
+
+/// Run the gate (`command`'s program and arguments) through [`RUNNER`] in
+/// `directory`, a child of this process in its own group, bounded by
+/// `limit` and this thread's stop as [`run_bounded`] is; its outcome is read
+/// from the files the runner wrote. A runner that wrote no status (it was
+/// killed, or could not run the gate) is the runner's failure: its own
+/// status and output, an abort.
+fn run_gate(
+    command: &Command,
+    env: &[(String, String)],
+    limit: Duration,
+    directory: &Path,
+) -> Result<Run, GateFailure> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let write = |name: &str, text: &str| -> Result<(), GateFailure> {
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join(name))
+            .and_then(|mut file| file.write_all(text.as_bytes()))
+            .map_err(|error| failed(&error))
+    };
+    write(
+        "env",
+        &env_file(env).map_err(|reason| GateFailure::Aborted {
+            reason,
+            log: String::new(),
+        })?,
+    )?;
+    write("run.sh", RUNNER)?;
+    let own = directory.join("runner");
+    std::fs::create_dir(&own).map_err(|error| failed(&error))?;
+    let mut runner = Command::new("/bin/sh");
+    runner
+        .arg(directory.join("run.sh"))
+        .arg(directory)
+        .arg(command.get_program())
+        .args(command.get_args())
+        .env_clear();
+    let ran = run_bounded(runner, limit, &own)?;
+    let status = std::fs::read_to_string(directory.join("status"))
+        .ok()
+        .as_deref()
+        .and_then(status_from);
+    let read = |name: &str| std::fs::read_to_string(directory.join(name)).unwrap_or_default();
+    Ok(match status {
+        Some(status) => Run {
+            status,
+            stdout: read("stdout"),
+            stderr: read("stderr"),
+        },
+        None => Run {
+            status: ran.status,
+            stdout: read("stdout"),
+            stderr: format!(
+                "{}{}gate runner: the gate's status was not written ({})\n",
+                read("stderr"),
+                ran.stderr,
+                ran.status
+            ),
+        },
     })
 }
 
@@ -3247,6 +3381,79 @@ mod tests {
     /// gate.sh `cannot_judge`): the same exit 6, the other key.
     const CANNOT_JUDGE_FACT: &str =
         "{\"cannot_judge\":true,\"scenario\":\"029.sh\",\"runs\":\"6\"}";
+
+    /// The gate runs through the runner (gate v2 step 2): its environment
+    /// reaches it whole (a quote, a dollar, a space) from a file the runner
+    /// removes, never from the runner's command line; its outcome is the
+    /// files the runner wrote. A runner that dies before it writes the
+    /// status is an abort that says so, never a verdict.
+    #[test]
+    fn the_gate_runs_through_the_runner_and_its_outcome_is_files() {
+        let tricky = "it's \"q\" $HOME a\\b";
+        let gate = FakeGate::new(
+            "[ \"$TRICKY\" = \"$EXPECTED\" ] || { echo \"got [$TRICKY]\" >&2; exit 3; }\n\
+             d=$(dirname \"$SPAWN_GATE_VERDICT\")\n\
+             [ ! -e \"$d/env\" ] || { echo 'the env file is still there' >&2; exit 3; }\n\
+             ! tr '\\0' ' ' </proc/$PPID/cmdline | grep -q TRICKY || { echo 'on the command line' >&2; exit 3; }\n\
+             echo '{\"v\":1,\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n",
+        );
+        let mut env = path_only();
+        env.push(("TRICKY".to_string(), tricky.to_string()));
+        env.push(("EXPECTED".to_string(), tricky.to_string()));
+        let verdict = gate.judge(&env).expect("a verdict");
+        assert!(verdict.accepted);
+
+        let gate = FakeGate::new("echo 'its last words'\nkill -KILL $PPID\nsleep 0.2\n");
+        let Err(GateFailure::Aborted { reason, log }) = gate.judge(&path_only()) else {
+            panic!("a runner that died is no verdict");
+        };
+        assert!(
+            log.contains("the gate's status was not written"),
+            "{reason}: {log}"
+        );
+        assert!(log.contains("its last words"), "{log}");
+
+        let bad = vec![("NOT-A-NAME".to_string(), "x".to_string())];
+        assert!(matches!(
+            FakeGate::new("exit 0\n").judge(&bad),
+            Err(GateFailure::Aborted { .. })
+        ));
+
+        // Lower-case names are the gate's own: the runner's files stay where
+        // they are, and the gate sees the values it was given.
+        let gate = FakeGate::new(
+            "[ \"$d\" = /nowhere ] && [ \"$status\" = kept ] || { echo \"got [$d] [$status]\" >&2; exit 3; }\n\
+             echo '{\"v\":1,\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n",
+        );
+        let mut env = path_only();
+        env.push(("d".to_string(), "/nowhere".to_string()));
+        env.push(("status".to_string(), "kept".to_string()));
+        let verdict = gate.judge(&env);
+        assert!(
+            verdict.as_ref().is_ok_and(|verdict| verdict.accepted),
+            "{verdict:?}"
+        );
+        // The runner's own names are refused.
+        let mut env = path_only();
+        env.push(("spawn_runner_dir".to_string(), "/nowhere".to_string()));
+        let refused = FakeGate::new("exit 0\n").judge(&env);
+        assert!(
+            matches!(&refused, Err(GateFailure::Aborted { reason, .. })
+                     if reason.contains("one of the runner's own names")),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_status_is_an_exit_code_or_a_signal() {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(super::status_from("0\n").and_then(|s| s.code()), Some(0));
+        assert_eq!(super::status_from("6").and_then(|s| s.code()), Some(6));
+        assert_eq!(super::status_from("137").and_then(|s| s.signal()), Some(9));
+        assert_eq!(super::status_from(""), None);
+        assert_eq!(super::status_from("x"), None);
+        assert_eq!(super::status_from("300"), None);
+    }
 
     /// A fact's version: v1 and none are read alike, whatever the fact;
     /// another version is an abort that names it, never a verdict.
