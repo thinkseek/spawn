@@ -2041,15 +2041,15 @@ impl Integrator {
         let Some(shadows) = shadows.as_mut() else {
             return;
         };
-        shadows.record_ended(|record| {
-            record(store, record)?;
+        shadows.record_ended(|shadowed| {
+            record(store, shadowed)?;
             println!(
                 "integrate: task {} shadowed on {}: {} (the primary's {}), agrees {}",
-                record["id"],
-                record["runner"].as_str().unwrap_or_default(),
-                record["verdict"].as_str().unwrap_or("no verdict"),
-                record["primary"].as_str().unwrap_or_default(),
-                record["agrees"]
+                shadowed["id"],
+                shadowed["runner"].as_str().unwrap_or_default(),
+                shadowed["verdict"].as_str().unwrap_or("no verdict"),
+                shadowed["primary"].as_str().unwrap_or_default(),
+                shadowed["agrees"]
             );
             Ok(())
         });
