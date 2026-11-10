@@ -87,6 +87,7 @@ harness() {
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
 
+tree=$(pwd)
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
@@ -376,7 +377,8 @@ done
 
 # --- (4) the page's adapter, under node alone -------------------------------------------
 
-tree=$controller
+# The adapter under judgement is the tree's, the candidate's (the gate runs a scenario from it), never
+# the controller's: the controller is main's copy, which holds no adapter until 043 lands (task 249, 2026-11-11).
 cat >"$WORK/adapter.test.mjs" <<'NODE'
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
