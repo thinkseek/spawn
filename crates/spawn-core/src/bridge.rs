@@ -2940,8 +2940,9 @@ impl Bridge {
         }
     }
 
-    /// Text into the engine's input box, at most once: the text is staged
-    /// first (no key goes), the intent recorded before the keys go and the
+    /// Text into the engine's input box, at most once, ending with the
+    /// command's marker ([`crate::message`], recorded `message.typed`): the
+    /// text is staged first (no key goes), the intent recorded before the keys go and the
     /// completion after, so a retried command or a restarted Bridge can tell
     /// whether it was typed. A staging refused is [`Untyped::Refused`] with
     /// nothing recorded: nothing was typed, and that is what the log says.
@@ -2962,6 +2963,10 @@ impl Bridge {
         } else {
             format!("{}\n\n{text}", notices.join("\n\n"))
         };
+        // The message's id, on a line of its own after the whole text: the
+        // transcript line that holds it is the message taken
+        // ([`crate::message`]).
+        let text = crate::message::marked(&text, claimed.command_id);
         let typed = {
             // A merge of main into the workspace waits while this types,
             // and once it gets the workspace it finds the `typed` step
@@ -2974,6 +2979,19 @@ impl Bridge {
             {
                 return Ok(Err(Untyped::Refused(error)));
             }
+            // The text about to be typed carries the marker: the record that
+            // tells this command's message from one an older Spawn typed
+            // without it, which no `message.taken` can ever name.
+            self.append(
+                &claimed.agent_id,
+                &claimed.session_id,
+                Some(&active.execution_id),
+                Source::Bridge,
+                Some(format!("{}:message", claimed.command_id)),
+                EventKind::MessageTyped {
+                    command_id: claimed.command_id,
+                },
+            )?;
             self.step(
                 claimed,
                 Some(&active.execution_id),
