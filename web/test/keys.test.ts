@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { commandSummary, commandWords } from "../src/commands.ts";
-import { KEY_NAMES, armHint, keyHint, keyLabel, keyName, panelKey } from "../src/keys.ts";
+import { KEY_NAMES, armHint, clickArms, keyHint, keyLabel, keyName, panelKey } from "../src/keys.ts";
 import type { KeyPress } from "../src/keys.ts";
 
 const press = (key: string, over: Partial<KeyPress> = {}): KeyPress => ({
@@ -56,6 +56,16 @@ test("Enter arms only as a plain press on the panel itself", () => {
   assert.equal(panelKey(press("Enter", { armed: false, repeat: true })), null);
   assert.equal(panelKey(press("Enter", { armed: false, ctrlKey: true })), null);
   assert.equal(panelKey(press("Enter", { armed: false, isComposing: true })), null);
+});
+
+test("only a plain click inside the text that selected nothing arms the panel", () => {
+  const click = { button: 0, modified: false, selected: false, inside: true };
+  assert.equal(clickArms(click), true);
+  assert.equal(clickArms({ ...click, selected: true }), false, "a drag that selected text to copy");
+  assert.equal(clickArms({ ...click, inside: false }), false, "on the scrollbar");
+  assert.equal(clickArms({ ...click, button: 1 }), false, "the middle button");
+  assert.equal(clickArms({ ...click, button: 2 }), false, "the context menu");
+  assert.equal(clickArms({ ...click, modified: true }), false, "Shift extends a selection; Ctrl, Alt, Meta are shortcuts");
 });
 
 test("keys read as the page shows them, in the hint and in command rows", () => {

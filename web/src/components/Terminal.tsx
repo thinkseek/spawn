@@ -1,8 +1,8 @@
 import { ArrowDown, SquareTerminal } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { KeyboardEvent, ReactNode } from "react";
+import type { KeyboardEvent, MouseEvent, ReactNode } from "react";
 
-import { armHint, keyHint, panelKey } from "../keys";
+import { armHint, clickArms, keyHint, panelKey } from "../keys";
 import type { KeyName } from "../keys";
 import { cx } from "./ui";
 
@@ -78,6 +78,21 @@ interface TerminalPanelProps {
   keys?: { to: string; onKey: (name: KeyName) => void; feedback?: ReactNode };
 }
 
+/** What `clickArms` reads of a click on the panel. */
+function clickOf(event: MouseEvent<HTMLDivElement>) {
+  const element = event.currentTarget;
+  const box = element.getBoundingClientRect();
+  // The client area: inside the border, without the scrollbars.
+  const x = event.clientX - box.left - element.clientLeft;
+  const y = event.clientY - box.top - element.clientTop;
+  return {
+    button: event.button,
+    modified: event.ctrlKey || event.altKey || event.metaKey || event.shiftKey,
+    selected: !(window.getSelection()?.isCollapsed ?? true),
+    inside: x >= 0 && y >= 0 && x < element.clientWidth && y < element.clientHeight,
+  };
+}
+
 /**
  * A live terminal: dark, mono, comfortable leading, and it follows the
  * bottom unless the reader scrolls up, in which case a "Follow output"
@@ -99,12 +114,13 @@ export function TerminalPanel({
   const [following, setFollowing] = useState(true);
   const [focused, setFocused] = useState(false);
   const [armed, setArmed] = useState(false);
-  const hasKeys = keys !== undefined;
-  // Keys taken away (the agent stopped, the page may no longer write):
-  // disarm, so their return does not find the panel armed.
+  // The keys taken away (the agent stopped, the page may no longer write),
+  // or going to another agent: disarm, so neither their return nor the new
+  // agent finds the panel armed by a click meant for the old one.
+  const keysTo = keys?.to;
   useEffect(() => {
-    if (!hasKeys) setArmed(false);
-  }, [hasKeys]);
+    setArmed(false);
+  }, [keysTo]);
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (!keys) return;
     const effect = panelKey({
@@ -171,10 +187,11 @@ export function TerminalPanel({
         aria-description={keys ? (armed ? keyHint(keys.to) : armHint(keys.to)) : undefined}
         onKeyDown={keys ? onKeyDown : undefined}
         onFocus={keys ? (event) => event.target === event.currentTarget && setFocused(true) : undefined}
-        // A deliberate click into the screen arms it: the primary button,
-        // not a scroll-wheel press or a context menu. It focuses the panel
-        // too (its nearest focusable ancestor), so text selection still works.
-        onPointerDown={keys ? (event) => event.button === 0 && setArmed(true) : undefined}
+        // A deliberate click into the screen arms it (keys.ts clickArms): a
+        // plain primary click inside the text, not on the scrollbar, that
+        // selected nothing. A drag that selects text to copy does not, so
+        // the Esc after it still closes the drawer.
+        onClick={keys ? (event) => clickArms(clickOf(event)) && setArmed(true) : undefined}
         // Focus leaving the panel, a click outside it included, disarms.
         onBlur={
           keys

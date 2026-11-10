@@ -1094,10 +1094,12 @@ execution is 409 with the reason, recording nothing. The page sends a key
 only while the terminal panel itself has focus and is armed, never from a
 text box, with a modifier or on auto-repeat (`web/src/keys.ts`). Focus alone
 arms nothing (backlog P11): a reader who tabs into the panel, or presses Esc
-to close the drawer, sends no key. A primary-button click into the panel, or
-Enter on the focused panel, arms it; armed, it is outlined and says "Keys on
-· Keys go to <agent>". Blur, a click outside included, disarms it, and while
-it is not armed Esc closes the drawer and the arrows scroll.
+to close the drawer, sends no key. A plain primary click inside the text
+that selected nothing, or Enter on the focused panel, arms it; a scrollbar
+drag or selecting text to copy does not, so the Esc after a copy still closes
+the drawer. Armed, it is outlined and says "Keys on · Keys go to <agent>".
+Blur (a click outside included) or the keys going to another agent disarms
+it, and while it is not armed Esc closes the drawer and the arrows scroll.
 
 `/api/missions` and `/api/rsi` send what the lists show: a task's brief,
 report and review note come as their first lines with their whole length
