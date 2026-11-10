@@ -1590,12 +1590,6 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let cpu = gate::Cpu::from_env(|name| std::env::var(name).ok(), cores)
         .map_err(|error| format!("{error}\n{USAGE}"))?;
-    // Judging directories an earlier integrator left (it stopped before
-    // its cleanup): their gates died with it (integrate/judging.rs).
-    let swept = judging::sweep(&root);
-    if swept > 0 {
-        println!("integrate: removed {swept} judging directories an earlier integrator left");
-    }
     // Gates in units of their own when a user manager answers (gate v2 step
     // 2: they outlive a restart); else as children, which a restart stops.
     let units = gate::units_available();
@@ -1924,6 +1918,33 @@ struct Judge {
     /// [`gate::units_available`] at the start), else as this process's
     /// children.
     units: bool,
+    /// The judging this clone takes over from an earlier integrator (D5,
+    /// [`Integrator::adopt`]); None for one it starts.
+    adopted: Option<Adopted>,
+}
+
+/// What an adopted judging judges, as its `judging.json` says: the
+/// candidate and branch its gate runs on, and when that gate started (the
+/// test server's crash window opens there).
+#[derive(Clone, Debug)]
+struct Adopted {
+    candidate: String,
+    branch: String,
+    started_ms: i64,
+}
+
+/// A left judging to adopt ([`Integrator::adoption`]): what its thread
+/// judges, and its gate's private directory.
+struct Adoption {
+    mission: Mission,
+    task: Task,
+    source: String,
+    main: String,
+    count: u32,
+    shares_server: bool,
+    jobs: Option<usize>,
+    gate: PathBuf,
+    adopted: Adopted,
 }
 
 /// The stop of one judging in flight: an owner's urgent landing on its
@@ -2132,6 +2153,9 @@ struct Running {
     stop: Arc<Stop>,
     /// Its halt, for a drain past its bound ([`gate::Halt`]).
     halt: Arc<gate::Halt>,
+    /// Its judging's id (integrate/judging.rs): a judging directory no
+    /// Running names is one an earlier integrator left ([`Integrator::adopt`]).
+    judging: String,
     handle: std::thread::JoinHandle<()>,
 }
 
@@ -2198,6 +2222,7 @@ impl Integrator {
                 shadowed: Arc::new(std::sync::Mutex::new(Vec::new())),
                 stop: None,
                 units: false,
+                adopted: None,
             },
             gates,
             cpu: None,
@@ -2720,6 +2745,9 @@ impl Integrator {
         let missions: Vec<Mission> =
             serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
                 .map_err(|error| format!("gated missions: {error}"))?;
+        // The judgings an earlier integrator left: their gates are taken
+        // over before any mission's step, so none is judged again (D5).
+        self.adopt(store, &missions);
         // The owner's landings of step 0 are warmed for the scenarios of
         // the first mission on their source that is not halted.
         for (source, to) in owner_moved {
@@ -2794,6 +2822,185 @@ impl Integrator {
             }
         }
         self.start_ready(store, ready, at_once);
+        Ok(())
+    }
+
+    /// Take over the judgings an earlier integrator left (gate v2 step 2,
+    /// design-gate-survives-restart.md D5): every judging directory no
+    /// judging of this integrator owns. One whose gate has a runner
+    /// (`runner.json`) is adopted: a judging thread of its own, which waits
+    /// for that gate instead of starting one (still running, done, or gone
+    /// without its status: abandoned), and records as any judging does; it
+    /// holds its slot until it ends, whatever `--gates` says now. One with
+    /// no gate (its integrator stopped before or after it), one whose task
+    /// no longer waits for it at that revision, an owner's judging (judged
+    /// again from its request), and one this integrator cannot read are
+    /// abandoned: their units stopped, their directories removed.
+    fn adopt(&self, store: &Arc<PostgresStore>, missions: &[Mission]) {
+        let owned: std::collections::HashSet<String> = self
+            .running
+            .borrow()
+            .iter()
+            .map(|gate| gate.judging.clone())
+            .collect();
+        for left in judging::left(&self.judge.root, &owned) {
+            let id = left.judging.id().to_string();
+            match Self::adoption(missions, &left) {
+                Ok(Some(adopted)) => {
+                    if let Err(error) = self.start_adopted(store, left, adopted) {
+                        eprintln!("integrate: adopt judging {id}: {error}");
+                    }
+                }
+                Ok(None) => left.judging.abandon(),
+                Err(why) => {
+                    println!("integrate: judging {id} left by an earlier integrator: {why}");
+                    left.judging.abandon();
+                }
+            }
+        }
+    }
+
+    /// What adopting `left` takes, `None` when it has no gate to adopt (its
+    /// task, untouched, is judged as any other), or why it is not adopted.
+    fn adoption(missions: &[Mission], left: &judging::Left) -> Result<Option<Adoption>, String> {
+        let Some(gate) = &left.gate else {
+            return Ok(None);
+        };
+        let described = left
+            .described
+            .as_ref()
+            .ok_or("its judging.json cannot be read; its gate is stopped")?;
+        let version = described["version"].as_u64();
+        if version != Some(judging::VERSION) {
+            return Err(format!(
+                "its judging.json is version {version:?}, this integrator reads {}; its gate is \
+                 stopped",
+                judging::VERSION
+            ));
+        }
+        if described["kind"] != "task" {
+            return Err(
+                "an owner's judging is judged again from its request; its gate is stopped"
+                    .to_string(),
+            );
+        }
+        let field = |name: &str| {
+            described[name].as_str().map(str::to_string).ok_or(format!(
+                "its judging.json names no {name}; its gate is stopped"
+            ))
+        };
+        let number = |name: &str| {
+            described[name].as_i64().ok_or(format!(
+                "its judging.json names no {name}; its gate is stopped"
+            ))
+        };
+        let (mission_id, task_id) = (number("mission")?, number("task")?);
+        let Some(mission) = missions.iter().find(|mission| mission.id == mission_id) else {
+            return Err(format!("mission {mission_id} is gone; its gate is stopped"));
+        };
+        let revision = number("revision")?;
+        let Some(task) = mission.tasks.iter().find(|task| {
+            task.id == task_id
+                && task.state == TaskState::Reported
+                && i64::from(task.revisions) == revision
+        }) else {
+            return Err(format!(
+                "task {task_id} no longer waits for this judging (revision {revision}); its gate \
+                 is stopped"
+            ));
+        };
+        let started_ms = gate::UnitRun::read(gate).map_or_else(now_ms, |run| run.started_ms);
+        let mut gated = mission.clone();
+        gated.gate = field("scenarios")?;
+        Ok(Some(Adoption {
+            mission: gated,
+            task: task.clone(),
+            source: field("source")?,
+            main: field("base")?,
+            count: u32::try_from(number("count")?).unwrap_or(0),
+            shares_server: described["shares_server"].as_bool().unwrap_or(true),
+            jobs: described["jobs"]
+                .as_u64()
+                .and_then(|jobs| usize::try_from(jobs).ok()),
+            gate: gate.clone(),
+            adopted: Adopted {
+                candidate: field("candidate")?,
+                branch: field("branch")?,
+                started_ms,
+            },
+        }))
+    }
+
+    /// Start the judging thread of an adopted judging, as
+    /// [`Self::start_judging`] does for a new one.
+    fn start_adopted(
+        &self,
+        store: &Arc<PostgresStore>,
+        left: judging::Left,
+        adoption: Adoption,
+    ) -> Result<(), String> {
+        let Adoption {
+            mission,
+            task,
+            source,
+            main,
+            count,
+            shares_server,
+            jobs,
+            gate,
+            adopted,
+        } = adoption;
+        let mirror = sources::ensure_mirror(&self.judge.root, Some(&source))
+            .map_err(|error| error.to_string())?;
+        let mut judge = self.judge.clone();
+        let stop = Arc::new(Stop::default());
+        judge.stop = Some(Arc::clone(&stop));
+        judge.adopted = Some(adopted);
+        let (task_id, mission_id) = (task.id, mission.id);
+        let judging = left.judging;
+        let judging_id = judging.id().to_string();
+        let (store, source_owned) = (Arc::clone(store), source.clone());
+        let halt = Arc::new(gate::Halt::default());
+        let thread_halt = Arc::clone(&halt);
+        let handle = std::thread::Builder::new()
+            .name(format!("gate-{task_id}"))
+            .spawn(move || {
+                gate::halt_with(thread_halt);
+                if let Some(stop) = &judge.stop {
+                    gate::stop_with(Arc::clone(&stop.flag));
+                }
+                judging.run_adopted(gate, || {
+                    judged_or_aborted(&store, &task, &main, mission_id, || {
+                        judge.judge(
+                            &store,
+                            &mirror,
+                            &source_owned,
+                            &main,
+                            &mission,
+                            count,
+                            &task,
+                            jobs,
+                        )
+                    });
+                });
+            })
+            .map_err(|error| format!("start the adopted judging of task {task_id}: {error}"))?;
+        println!(
+            "integrate: mission {mission_id}: adopted the judging of task {task_id} ({judging_id}) \
+             an earlier integrator left: its gate is not started again"
+        );
+        self.running.borrow_mut().push(Running {
+            mission: mission_id,
+            source,
+            task: task_id,
+            shares_server,
+            jobs: jobs.unwrap_or(0),
+            owner: None,
+            stop,
+            halt,
+            judging: judging_id,
+            handle,
+        });
         Ok(())
     }
 
@@ -2911,6 +3118,7 @@ impl Integrator {
         };
         let halt = Arc::new(gate::Halt::default());
         let thread_halt = Arc::clone(&halt);
+        let judging_id = judging.id().to_string();
         let handle = std::thread::Builder::new()
             .name(format!("owner-gate-{id}"))
             .spawn(move || {
@@ -2945,6 +3153,7 @@ impl Integrator {
             owner: Some(id),
             stop: Arc::new(Stop::default()),
             halt,
+            judging: judging_id,
             handle,
         });
     }
@@ -3204,10 +3413,12 @@ impl Integrator {
             &json!({"kind": "task", "mission": mission_id, "task": task_id,
                     "revision": task.revisions, "source": source, "base": main,
                     "count": count, "shares_server": shares_server, "jobs": jobs,
-                    "gate": pinned(&self.judge.gate)}),
+                    "gate": pinned(&self.judge.gate), "scenarios": gated.gate,
+                    "probe": probe}),
             self.judge.units,
         )
         .map_err(|error| format!("start the judging of task {task_id}: {error}"))?;
+        let judging_id = judging.id().to_string();
         let (store, source_owned) = (Arc::clone(store), source.clone());
         let halt = Arc::new(gate::Halt::default());
         let thread_halt = Arc::clone(&halt);
@@ -3256,6 +3467,7 @@ impl Integrator {
             owner: None,
             stop,
             halt,
+            judging: judging_id,
             handle,
         });
         Ok(())
@@ -3465,6 +3677,22 @@ impl Judge {
         task: &Task,
         jobs: Option<usize>,
     ) -> Result<bool, String> {
+        // An adopted judging's branch was read when its gate started.
+        if let Some(adopted) = &self.adopted {
+            return self
+                .judge_pushed(
+                    store,
+                    mirror,
+                    source,
+                    main,
+                    mission,
+                    count,
+                    task,
+                    Some(&adopted.branch),
+                    jobs,
+                )
+                .map(|()| true);
+        }
         let branch = match Self::pushed_candidate(store, mirror, source, task)? {
             Freshness::Fresh(branch) => Some(branch),
             Freshness::Nothing => None,
@@ -3682,33 +3910,7 @@ impl Judge {
         let Some(branch) = branch.map(str::to_string) else {
             return rejected("the worker has no branch to land", "");
         };
-        // A merge of main whose markers are not resolved is not judged: the
-        // markers could land, and a file rewritten instead of resolved would
-        // revert main.
-        let marked = repo
-            .conflict_markers(main, &branch)
-            .map_err(|error| error.to_string())?;
-        if let Some(note) = markers_note(repo.has_pending_merge(&task.agent_id), &marked) {
-            // Markers of an earlier merge, still in the branch: the
-            // worker has them to resolve.
-            return gated("conflict", json!({ "note": note, "merge": "pending" }));
-        }
-        let message = landing_message(task, &branch);
-        let Some(candidate) = landing_candidate(&mirror_path, main, &branch, &message)? else {
-            // The worker cannot merge main itself: merge it into the
-            // workspace now, while the worker waits for this verdict, so
-            // the note names what it has to resolve.
-            let merge = main_merge::merge_main(store, &self.root, &task.agent_id, &task.session_id);
-            println!(
-                "integrate: task {}: main into its workspace: {merge:?}",
-                task.id
-            );
-            return gated(
-                "conflict",
-                json!({"note": main_merge::conflict_note(main, &merge), "merge": merge.kind()}),
-            );
-        };
-        known.replace(inputs::known(Some(main), Some(&candidate)));
+        let scenario = task_scenario(scenarios, task.scenario.as_deref());
         let tree_of = |commit: &str| {
             git(&[
                 "--git-dir",
@@ -3717,53 +3919,92 @@ impl Judge {
                 &format!("{commit}^{{tree}}"),
             ])
         };
-        // A candidate equal to main in an objective mission is not judged
-        // here: the gate's base check answers what it means before it builds
-        // anything (a scenario that passes on the base is the objective
-        // solved there, not a failed task; a scenario that fails there is a
-        // rejection like any other). Mission 4's task 182 was rejected three
-        // times for "the work changes nothing on main" when the owner batch
-        // had already landed the behaviour, and the third halted the mission.
-        if tree_of(&candidate)? == tree_of(main)? && task.objective.is_none() {
-            return rejected("the work changes nothing on main", "");
-        }
-        let patch = repo
-            .patch_between(main, &candidate)
-            .map_err(|error| error.to_string())?;
-        if patch.len() > MAX_PATCH_BYTES {
-            return rejected("the patch is larger than 1 MiB", "");
-        }
-
-        let scenario = task_scenario(scenarios, task.scenario.as_deref());
-        // The host's room, measured now, before any gate starts: a gate
-        // must never be how the integrator learns the host had none. A gate
-        // that gets no test database has none to probe.
-        let room = if needs_test_database(scenarios) {
-            self.room.clone()
+        // An adopted judging (gate v2 step 2, D5) judges the candidate its
+        // gate already runs on, as judging.json names it: the checks before
+        // a gate were made when it started, and the candidate, a merge made
+        // then, would not come out the same.
+        let candidate = if let Some(adopted) = &self.adopted {
+            known.replace(inputs::known(Some(main), Some(&adopted.candidate)));
+            adopted.candidate.clone()
         } else {
-            self.room.without_test_database()
-        };
-        match room.check(&self.gate_env) {
-            Ok(checks) => println!(
-                "integrate: task {}: room to judge: {}",
-                task.id,
-                checks.lines().collect::<Vec<_>>().join("; ")
-            ),
-            Err(RoomFailure::Short { short, log }) => {
+            // A merge of main whose markers are not resolved is not judged: the
+            // markers could land, and a file rewritten instead of resolved would
+            // revert main.
+            let marked = repo
+                .conflict_markers(main, &branch)
+                .map_err(|error| error.to_string())?;
+            if let Some(note) = markers_note(repo.has_pending_merge(&task.agent_id), &marked) {
+                // Markers of an earlier merge, still in the branch: the
+                // worker has them to resolve.
+                return gated("conflict", json!({ "note": note, "merge": "pending" }));
+            }
+            let message = landing_message(task, &branch);
+            let Some(candidate) = landing_candidate(&mirror_path, main, &branch, &message)? else {
+                // The worker cannot merge main itself: merge it into the
+                // workspace now, while the worker waits for this verdict, so
+                // the note names what it has to resolve.
+                let merge =
+                    main_merge::merge_main(store, &self.root, &task.agent_id, &task.session_id);
                 println!(
-                    "integrate: task {}: no room to judge now ({}); the gate does not run",
-                    task.id,
-                    short.check()
+                    "integrate: task {}: main into its workspace: {merge:?}",
+                    task.id
                 );
                 return gated(
-                    "no_room",
-                    short_of_room(mission, task.id, &short, &log, database_now(store)?),
+                    "conflict",
+                    json!({"note": main_merge::conflict_note(main, &merge), "merge": merge.kind()}),
                 );
+            };
+            known.replace(inputs::known(Some(main), Some(&candidate)));
+            // A candidate equal to main in an objective mission is not judged
+            // here: the gate's base check answers what it means before it builds
+            // anything (a scenario that passes on the base is the objective
+            // solved there, not a failed task; a scenario that fails there is a
+            // rejection like any other). Mission 4's task 182 was rejected three
+            // times for "the work changes nothing on main" when the owner batch
+            // had already landed the behaviour, and the third halted the mission.
+            if tree_of(&candidate)? == tree_of(main)? && task.objective.is_none() {
+                return rejected("the work changes nothing on main", "");
             }
-            Err(RoomFailure::Bad(reason)) => {
-                return gated("aborted", json!({ "reason": reason }));
+            let patch = repo
+                .patch_between(main, &candidate)
+                .map_err(|error| error.to_string())?;
+            if patch.len() > MAX_PATCH_BYTES {
+                return rejected("the patch is larger than 1 MiB", "");
             }
-        }
+            // The host's room, measured now, before any gate starts: a gate
+            // must never be how the integrator learns the host had none. A gate
+            // that gets no test database has none to probe.
+            let room = if needs_test_database(scenarios) {
+                self.room.clone()
+            } else {
+                self.room.without_test_database()
+            };
+            match room.check(&self.gate_env) {
+                Ok(checks) => println!(
+                    "integrate: task {}: room to judge: {}",
+                    task.id,
+                    checks.lines().collect::<Vec<_>>().join("; ")
+                ),
+                Err(RoomFailure::Short { short, log }) => {
+                    println!(
+                        "integrate: task {}: no room to judge now ({}); the gate does not run",
+                        task.id,
+                        short.check()
+                    );
+                    return gated(
+                        "no_room",
+                        short_of_room(mission, task.id, &short, &log, database_now(store)?),
+                    );
+                }
+                Err(RoomFailure::Bad(reason)) => {
+                    return gated("aborted", json!({ "reason": reason }));
+                }
+            }
+            // What a later integrator needs to adopt this judging's gate,
+            // written before it starts.
+            judging::describe(&json!({"candidate": candidate, "branch": branch}))?;
+            candidate
+        };
         let mut gate_env = self.judging_env(scenarios, jobs);
         // Main of the source is red on a check: the gate runs it on the base
         // before the candidate, so a main that is green on it again says so
@@ -3805,8 +4046,12 @@ impl Judge {
         // host faults, and the test server's log says nothing about it.
         let test_database = needs_test_database(scenarios);
         // The candidate's gate run, measured: a crash in the test
-        // database's log counts only inside this window.
-        let started = now_ms();
+        // database's log counts only inside this window (an adopted gate's
+        // from when it started).
+        let started = self
+            .adopted
+            .as_ref()
+            .map_or_else(now_ms, |adopted| adopted.started_ms);
         let given = inputs::read(main, &candidate, scenarios, scenario.as_deref());
         bound.replace(Some((given.clone(), Value::Null)));
         let (judged, base_check) = gate::judge_seeing_base_check(
@@ -3821,6 +4066,16 @@ impl Judge {
         );
         let ended = now_ms();
         bound.replace(Some((given, inputs::env_here(gate_log(&judged)))));
+        // The candidate's gate has ended: any gate this judging runs after
+        // it (a rejection's head re-judging) is not the candidate's, and a
+        // later integrator must not adopt it as that (rev-e G1): it
+        // abandons the judging instead ([`judging::left`]).
+        if let Err(error) = judging::describe(&json!({"candidate_judged": true})) {
+            eprintln!(
+                "integrate: task {}: note its candidate judged: {error}",
+                task.id
+            );
+        }
         if let Ok(verdict) = &judged {
             flakes.replace(verdict.flakes.clone());
             red_scenarios.replace(verdict.main_red_scenarios.clone());
@@ -4076,6 +4331,16 @@ impl Judge {
                 extra["candidate"] = json!(candidate);
                 gated("host_fault", extra)
             }
+            // An adopted gate the integrator that started it reaped (D4):
+            // its outcome is that one's, recorded once, by it.
+            Err(GateFailure::Reaped) => {
+                println!(
+                    "integrate: task {}: the integrator that started its gate read the gate's \
+                     status and reaped it: nothing more recorded here",
+                    task.id
+                );
+                Ok(())
+            }
             Err(failure) => gated("aborted", aborted(&failure)),
         }
     }
@@ -4175,7 +4440,9 @@ fn judged_or_aborted(
 fn gate_log(judged: &Result<gate::Verdict, GateFailure>) -> Option<&str> {
     match judged {
         Ok(verdict) => Some(&verdict.output),
-        Err(GateFailure::Timeout | GateFailure::Failed(_)) => None,
+        // Reaped (gate v2 step 2): the integrator that started it read it;
+        // this judging read nothing.
+        Err(GateFailure::Timeout | GateFailure::Failed(_) | GateFailure::Reaped) => None,
         Err(
             GateFailure::Aborted { log, .. }
             | GateFailure::NoRoom { log, .. }
@@ -4876,6 +5143,7 @@ fn rejection(
 fn aborted(failure: &GateFailure) -> Value {
     match failure {
         GateFailure::Timeout => json!({"reason": "the gate exceeded its wall clock"}),
+        GateFailure::Reaped => json!({"reason": "the integrator that started the gate reaped it"}),
         GateFailure::Failed(error) => json!({"reason": format!("the gate failed: {error}")}),
         GateFailure::Aborted { reason, log } => {
             json!({"reason": format!("the gate failed: {reason}"), "log": log})
@@ -9254,6 +9522,23 @@ mod database_tests {
         }
     }
 
+    /// Stops this test process's gate units when a test ends, a failed one
+    /// too: a unit outlives the test that started it (gate v2 step 2).
+    struct StopUnits;
+
+    impl Drop for StopUnits {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("systemctl")
+                .args([
+                    "--user",
+                    "stop",
+                    &format!("spawn-gate-{}-*", std::process::id()),
+                ])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
     fn started(marks: &Path) -> Vec<String> {
         std::fs::read_to_string(marks.join("started"))
             .unwrap_or_default()
@@ -11557,6 +11842,326 @@ mod database_tests {
         integrator.settle();
         let after = db.mission(mission);
         assert_eq!(after["tasks"][0]["state"], "landed", "{after}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Gate v2 step 2 (6b, D5 and D4): a second integrator on the same root
+    /// adopts the judging the first one runs, as a restarted integrator
+    /// adopts what its predecessor left: it starts no gate of its own and
+    /// takes over the running one. Released, the gate's outcome is
+    /// recorded once (the store returns the first to the other reaper) and
+    /// lands once, and nothing of the judging is left. Skipped where no
+    /// systemd user manager answers.
+    #[test]
+    fn a_gate_left_running_is_adopted_judged_once_and_lands_once() {
+        if !crate::gate::units_available() {
+            eprintln!("no systemd user manager answers here: not tried");
+            return;
+        }
+        let marks = std::env::temp_dir().join(format!("spawn-adopt-marks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&marks);
+        std::fs::create_dir_all(&marks).expect("marks");
+        let _release = Release(marks.clone());
+        let _units = StopUnits;
+        let (base, source, scenarios, first) = world("adopt", &holding_gate(&marks));
+        let first = first.with_units(true);
+        let second = Integrator::new(
+            base.join("host"),
+            first.judge.gate.clone(),
+            test_gate_env(),
+            room_to_spare(),
+            super::DEFAULT_GATES,
+        )
+        .with_units(true);
+        let db = Db::new("adopt_gate");
+        let mission = db.gated_mission(&source, &scenarios);
+        db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+
+        first
+            .pass_on(&db.store)
+            .expect("the first integrator's pass");
+        wait_started(&marks, 1);
+        // The other integrator's passes take the judging over and start no
+        // gate of their own.
+        for _ in 0..3 {
+            second
+                .pass_on(&db.store)
+                .expect("the second integrator's pass");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(started(&marks).len(), 1, "no second gate");
+        assert_eq!(
+            second.running.borrow().len(),
+            1,
+            "the second runs the adopted judging"
+        );
+        assert_eq!(
+            second.running.borrow()[0].judging,
+            first.running.borrow()[0].judging,
+            "the same judging"
+        );
+        std::fs::write(marks.join("release"), "").expect("release");
+        first.settle();
+        second.settle();
+        let after = db.mission(mission);
+        assert_eq!(after["tasks"][0]["state"], "landed", "{after}");
+        let gated = control_records(&db, "task.gated");
+        let landed = control_records(&db, "task.landed");
+        assert_eq!((gated.len(), landed.len()), (1, 1), "{gated:?} {landed:?}");
+        assert_eq!(gated[0]["verdict"], "accepted");
+        assert_eq!(landed[0]["judging"], gated[0]["judging"]);
+        let judgings = base.join("host").join(super::judging::DIRECTORY);
+        assert_eq!(
+            std::fs::read_dir(&judgings).expect("judgings").count(),
+            0,
+            "nothing left"
+        );
+        assert_eq!(started(&marks).len(), 1, "the gate ran once");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
+    }
+
+    /// A judging an earlier integrator left, made by hand as it leaves one:
+    /// its description, and (`gate`) a private directory whose runner is a
+    /// process gone now and that wrote no status.
+    fn left_judging(
+        root: &Path,
+        db: &Db,
+        mission: i64,
+        task: i64,
+        source: &str,
+        candidate: &str,
+        gate: bool,
+    ) -> PathBuf {
+        std::fs::create_dir_all(root).expect("the root");
+        let judging = super::judging::Judging::create(
+            root,
+            &json!({"kind": "task", "mission": mission, "task": task, "revision": 0,
+                    "source": source, "base": source_main(source), "count": 0,
+                    "shares_server": false, "jobs": null, "gate": "/nonexistent/gate.sh",
+                    "scenarios": db.mission(mission)["gate"], "probe": false,
+                    "candidate": candidate, "branch": candidate}),
+            true,
+        )
+        .expect("a judging");
+        let directory = judging.directory().to_path_buf();
+        if gate {
+            let private = directory.join(format!("spawn-gate-{}-left-1", std::process::id()));
+            std::fs::create_dir(&private).expect("private");
+            let mut child = std::process::Command::new("true").spawn().expect("true");
+            let gone = spawn_host::process::ProcessId::of(child.id());
+            child.wait().expect("gone");
+            std::fs::write(
+                private.join("runner.json"),
+                json!({"unit": format!("spawn-gate-{}-left-1.service", std::process::id()),
+                       "runner": gone.record(), "started_ms": super::now_ms(),
+                       "limit_s": 7200})
+                .to_string(),
+            )
+            .expect("runner.json");
+            std::fs::write(private.join("stdout"), "| the gate ran a while\n").expect("stdout");
+        }
+        directory
+    }
+
+    /// [`left_judging`] whose gate ended while no integrator ran: its
+    /// verdict accepted and its status written.
+    fn left_accepted(
+        root: &Path,
+        db: &Db,
+        mission: i64,
+        task: i64,
+        source: &str,
+        candidate: &str,
+    ) -> PathBuf {
+        let directory = left_judging(root, db, mission, task, source, candidate, true);
+        let private = directory.join(format!("spawn-gate-{}-left-1", std::process::id()));
+        std::fs::write(
+            private.join("verdict"),
+            "{\"v\":1,\"verdict\":\"accepted\"}\n",
+        )
+        .expect("verdict");
+        std::fs::write(private.join("status"), "0\n").expect("status");
+        directory
+    }
+
+    /// Gate v2 step 2 (6b, D5): main moved while no integrator ran (an
+    /// owner's push). The left gate accepted the candidate on the old main:
+    /// adopted, its acceptance is recorded and its landing finds main moved,
+    /// `stale`, counted nowhere, the task judged again, and nothing lands;
+    /// on a main that did not move, the same left gate lands.
+    #[test]
+    fn an_adopted_verdict_on_a_main_that_moved_is_stale_and_lands_nothing() {
+        let (base, source, scenarios, integrator) = world("adopt-moved", "exit 1\n");
+        let db = Db::new("adopt_moved");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        let pushed = push_work(&base, &source, &agent, "work.txt");
+        let left = left_accepted(&base.join("host"), &db, mission, task, &source, &pushed);
+        // The owner's push while no integrator ran.
+        let owner = push_work(&base, &source, "owner", "owner.txt");
+        git(&[
+            "--git-dir",
+            &source,
+            "update-ref",
+            "refs/heads/main",
+            &owner,
+        ])
+        .expect("main moves");
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass that adopts it");
+        integrator.settle();
+        // Accepted as the gate found it, then stale when its landing finds
+        // main elsewhere (an acceptance keeps the landing's compare-and-swap
+        // as its guard), both naming the judging.
+        let gated = control_records(&db, "task.gated");
+        let verdicts: Vec<&str> = gated.iter().filter_map(|r| r["verdict"].as_str()).collect();
+        assert_eq!(verdicts, ["accepted", "stale"], "{gated:?}");
+        assert_eq!(gated[1]["judging"], gated[0]["judging"]);
+        assert_eq!(
+            db.mission(mission)["tasks"][0]["state"],
+            "reported",
+            "judged again"
+        );
+        assert_eq!(
+            source_main(&source),
+            owner,
+            "nothing landed over the owner's push"
+        );
+        assert!(control_records(&db, "task.landed").is_empty());
+        assert!(!left.exists());
+        let _ = std::fs::remove_dir_all(&base);
+
+        // The same, main untouched: it lands, once, naming the judging.
+        let (base, source, scenarios, integrator) = world("adopt-lands", "exit 1\n");
+        let db = Db::new("adopt_lands");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        let pushed = push_work(&base, &source, &agent, "work.txt");
+        let left = left_accepted(&base.join("host"), &db, mission, task, &source, &pushed);
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass that adopts it");
+        integrator.settle();
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        let landed = control_records(&db, "task.landed");
+        assert_eq!(landed.len(), 1);
+        assert_eq!(
+            landed[0]["judging"],
+            json!(left.file_name().and_then(|name| name.to_str()).expect("id"))
+        );
+        assert_eq!(source_main(&source), pushed, "the adopted candidate landed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Gate v2 step 2 (6b, D6): a left judging whose gate's runner is gone
+    /// without the gate's status (the host rebooted, the unit was killed) is
+    /// adopted and recorded as a host fault, evidence `abandoned`, naming
+    /// it; nothing lands, no gate starts, the task waits for its backoff,
+    /// and the judging's directory goes.
+    #[test]
+    fn an_adopted_gate_whose_runner_is_gone_is_abandoned_not_judged() {
+        let marks =
+            std::env::temp_dir().join(format!("spawn-abandon-marks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&marks);
+        std::fs::create_dir_all(&marks).expect("marks");
+        let _release = Release(marks.clone());
+        let (base, source, scenarios, integrator) = world("abandon", &holding_gate(&marks));
+        let db = Db::new("abandon_gate");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        let pushed = push_work(&base, &source, &agent, "work.txt");
+        let main = source_main(&source);
+        let left = left_judging(
+            &base.join("host"),
+            &db,
+            mission,
+            task,
+            &source,
+            &pushed,
+            true,
+        );
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass that adopts it");
+        integrator.settle();
+        let gated = control_records(&db, "task.gated");
+        assert_eq!(gated.len(), 1, "{gated:?}");
+        assert_eq!(gated[0]["verdict"], "host_fault", "{}", gated[0]);
+        assert_eq!(gated[0]["evidence"], crate::gate::ABANDONED);
+        assert_eq!(
+            gated[0]["judging"],
+            json!(left.file_name().and_then(|name| name.to_str()).expect("id"))
+        );
+        assert!(
+            gated[0]["log"]
+                .as_str()
+                .is_some_and(|log| log.contains("the gate ran a while")),
+            "the gate's output is its log: {}",
+            gated[0]
+        );
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "reported");
+        assert_eq!(source_main(&source), main, "nothing landed");
+        assert!(started(&marks).is_empty(), "no gate started");
+        assert!(!left.exists(), "the judging's directory is gone");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
+    }
+
+    /// Gate v2 step 2 (6b): a left judging with no gate in it (its
+    /// integrator stopped before the gate started, or after its records) is
+    /// removed, and its task is judged as any other.
+    #[test]
+    fn a_left_judging_without_a_gate_is_removed_and_its_task_judged_anew() {
+        let gate = "printf '{\"verdict\":\"accepted\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+                    echo '{\"verdict\":\"accepted\"}'\n";
+        let (base, source, scenarios, integrator) = world("left-empty", gate);
+        let db = Db::new("left_empty");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        let pushed = push_work(&base, &source, &agent, "work.txt");
+        let left = left_judging(
+            &base.join("host"),
+            &db,
+            mission,
+            task,
+            &source,
+            &pushed,
+            false,
+        );
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        assert!(!left.exists(), "removed");
+        let gated = control_records(&db, "task.gated");
+        assert_eq!(gated.len(), 1, "{gated:?}");
+        assert_ne!(
+            gated[0]["judging"],
+            json!(left.file_name().and_then(|name| name.to_str()).expect("id")),
+            "judged by a judging of its own"
+        );
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -14162,6 +14767,48 @@ mod database_tests {
         git(&["-C", &clone_path, "rev-parse", "HEAD"]).expect("work")
     }
 
+    /// A judging's description says its candidate was judged once the
+    /// candidate's gate has ended, before any later gate of it starts (a
+    /// rejection's head re-judging), so an integrator that finds the later
+    /// gate left running never adopts it as the candidate's (rev-e G1,
+    /// [`judging::left`]).
+    #[test]
+    fn a_judging_says_its_candidate_was_judged_before_its_head_is_judged_alone() {
+        let marks = fresh_marks("spawn-candidate-judged");
+        let seen = marks.to_string_lossy().to_string();
+        let gate = format!(
+            "described=\"$(dirname \"$(dirname \"$SPAWN_GATE_VERDICT\")\")/judging.json\"\n\
+             if grep -q '\"candidate_judged\":true' \"$described\"; then said=judged; else said=not; fi\n\
+             if git --git-dir=\"$1\" rev-parse -q --verify \"$3^2\" >/dev/null; then\n\
+               echo \"merge $said\" >>'{seen}/said'\n\
+               printf '{{\"verdict\":\"rejected\",\"reason\":\"regression: 011.sh fails\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+               exit 0\n\
+             fi\n\
+             echo \"head $said\" >>'{seen}/said'\n\
+             printf '{{\"verdict\":\"rejected\",\"reason\":\"regression: 011.sh fails\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n"
+        );
+        let (base, source, scenarios, integrator) = world("candidate-judged", &gate);
+        let db = Db::new("candidate_judged");
+        let m0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        main_moves(&base, &source, "main.txt");
+        push_work_on(&base, &source, &agent, &m0, "work.txt");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        assert_eq!(
+            std::fs::read_to_string(marks.join("said")).expect("said"),
+            "merge not\nhead judged\n",
+            "the merge is the candidate's gate; the head's comes after it is said"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
+    }
+
     /// Supply PA's task 207 (2026-11-09): a rejected merge's head, judged
     /// alone against the base it was built on, gave no verdict (a host
     /// fault there). The record says so through the store: its reason names
@@ -14728,6 +15375,7 @@ mod database_tests {
             owner: None,
             stop: std::sync::Arc::new(super::Stop::default()),
             halt: std::sync::Arc::new(crate::gate::Halt::default()),
+            judging: String::new(),
             handle: std::thread::spawn(move || {
                 let _ = waiting.recv();
             }),

@@ -809,6 +809,11 @@ pub(crate) enum GateFailure {
         defects: Vec<String>,
         log: String,
     },
+    /// An adopted gate whose directory went while it was waited for: the
+    /// integrator that started it read its status and reaped it (gate v2
+    /// step 2, D4), so its outcome is that one's to record, and this
+    /// judging records nothing.
+    Reaped,
     /// Main is red on a check (exit [`HOST_FAULT_EXIT`] with the gate's
     /// fact `on` `main`): it failed twice on the base with the same failing
     /// tests, after failing twice on the candidate, or as the red check run
@@ -1157,7 +1162,15 @@ fn judge_in(
             ),
         })
     };
-    let directory = match PrivateDirectory::create_in(parent) {
+    // A judging adopted from an earlier integrator (gate v2 step 2, D5)
+    // takes over the gate that one left running, once: its private
+    // directory, its verdict file and its unit.
+    let adopted = crate::integrate::judging::take_adopted();
+    let adopting = adopted.is_some();
+    let directory = match adopted.map_or_else(
+        || PrivateDirectory::create_in(parent),
+        |path| Ok(PrivateDirectory(path)),
+    ) {
         Ok(directory) => directory,
         Err(error) => {
             return Err(short(
@@ -1184,7 +1197,11 @@ fn judge_in(
         "SPAWN_GATE_VERDICT".to_string(),
         verdict_path.to_string_lossy().into_owned(),
     ));
-    let run = run_gate(&command, &gate_env, limit, directory.path());
+    let run = if adopting {
+        adopt_gate(directory.path())
+    } else {
+        run_gate(&command, &gate_env, limit, directory.path())
+    };
     // The base check is read before anything else of the run, so a gate the
     // wall clock killed (a timeout) still says main passed it.
     *seen = std::fs::read_to_string(&verdict_path)
@@ -2049,12 +2066,18 @@ fn run_gate(
     } else {
         run_bounded(runner, limit, &own)?
     };
+    Ok(outcome(directory, &ran))
+}
+
+/// The gate's run as its runner left it in `directory`: its status, stdout
+/// and stderr; with no status, the runner's (`ran`) and a line saying so.
+fn outcome(directory: &Path, ran: &Run) -> Run {
     let status = std::fs::read_to_string(directory.join("status"))
         .ok()
         .as_deref()
         .and_then(status_from);
     let read = |name: &str| std::fs::read_to_string(directory.join(name)).unwrap_or_default();
-    Ok(match status {
+    match status {
         Some(status) => Run {
             status,
             stdout: read("stdout"),
@@ -2070,7 +2093,30 @@ fn run_gate(
                 ran.status
             ),
         },
-    })
+    }
+}
+
+/// Take over the gate an earlier integrator started in `directory` (its
+/// unit, `runner.json`): wait for it as [`run_unit`] does, then read what
+/// it wrote. A gate already done is read at once; a runner gone without a
+/// status is abandoned ([`wait_unit`]).
+fn adopt_gate(directory: &Path) -> Result<Run, GateFailure> {
+    use std::os::unix::process::ExitStatusExt as _;
+    let run = UnitRun::read(directory).ok_or_else(|| {
+        GateFailure::Failed(format!(
+            "the adopted gate in {} names no unit",
+            directory.display()
+        ))
+    })?;
+    wait_unit(&run, directory)?;
+    Ok(outcome(
+        directory,
+        &Run {
+            status: ExitStatus::from_raw(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+    ))
 }
 
 /// The evidence of a gate whose runner ended without writing the gate's
@@ -2261,13 +2307,26 @@ pub(crate) fn wait_unit(run: &UnitRun, directory: &Path) -> Result<(), GateFailu
                 log: std::fs::read_to_string(directory.join("stdout")).unwrap_or_default(),
             });
         }
-        let gone = run.runner.as_ref().is_none_or(|runner| !runner.alive());
+        // The runner recorded, else the unit's main process now: a
+        // runner.json read before its writer named the pid (the first
+        // write names the unit alone), or a pid systemd had not reported
+        // yet, is not a runner gone while the unit still runs.
+        let gone = !run
+            .runner
+            .as_ref()
+            .is_some_and(spawn_host::process::ProcessId::alive)
+            && !unit_main(&run.unit).is_some_and(|runner| runner.alive());
         if gone {
             // The runner's last act is the status's rename: give one in
             // flight a moment before calling it gone.
             std::thread::sleep(Duration::from_millis(300));
             if status.exists() {
                 return Ok(());
+            }
+            // Its directory gone: whoever started the gate read its status
+            // and removed it. Nothing was abandoned.
+            if !directory.exists() {
+                return Err(GateFailure::Reaped);
             }
             stop_unit(&run.unit);
             if now_ms().saturating_sub(run.started_ms) >= limit_ms.saturating_sub(1000) {
@@ -3686,6 +3745,75 @@ mod tests {
     /// (abandoned), never an abort or a verdict; its wall clock is a
     /// timeout; a stop on its thread stops the unit and everything in it;
     /// and no unit is left behind.
+    /// A gate whose runner is gone: with its directory still there and no
+    /// status, abandoned (a host fault `on` `runner`); with its directory
+    /// gone, reaped by the integrator that started it, which read the
+    /// status and recorded the outcome, so the adopter records nothing.
+    #[test]
+    fn a_gone_runner_is_abandoned_unless_its_directory_was_reaped() {
+        let directory =
+            std::env::temp_dir().join(format!("spawn-unit-reaped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("directory");
+        let run = super::UnitRun {
+            unit: format!("spawn-gate-never-{}.service", std::process::id()),
+            runner: None,
+            started_ms: super::now_ms(),
+            limit_s: 60,
+        };
+        let abandoned = super::wait_unit(&run, &directory);
+        assert!(
+            matches!(&abandoned, Err(GateFailure::HostFault { on, .. }) if on == "runner"),
+            "{abandoned:?}"
+        );
+        std::fs::remove_dir_all(&directory).expect("reap it");
+        let reaped = super::wait_unit(&run, &directory);
+        assert!(matches!(reaped, Err(GateFailure::Reaped)), "{reaped:?}");
+    }
+
+    /// A runner.json read before its writer named the runner (its first
+    /// write names the unit alone) is no runner gone: while the unit runs,
+    /// its main process is the runner, and the gate's status is waited for.
+    #[test]
+    fn a_unit_whose_runner_is_not_named_yet_is_waited_for() {
+        if !super::units_available() {
+            eprintln!("no systemd user manager answers here: the unit gate is not tried");
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("spawn-unit-unnamed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("directory");
+        let unit = super::unit_name(&directory);
+        let started = Command::new("systemd-run")
+            .args([
+                "--user",
+                "--quiet",
+                "--collect",
+                &format!("--unit={unit}"),
+                "--",
+                "/bin/sh",
+                "-c",
+                "sleep 1.5; echo 0 >\"$0/status.tmp\"; mv \"$0/status.tmp\" \"$0/status\"",
+            ])
+            .arg(&directory)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("systemd-run");
+        assert!(started.success(), "the unit started");
+        let run = super::UnitRun {
+            unit: unit.clone(),
+            runner: None,
+            started_ms: super::now_ms(),
+            limit_s: 60,
+        };
+        let waited = super::wait_unit(&run, &directory);
+        super::stop_unit(&unit);
+        assert!(waited.is_ok(), "the status was waited for: {waited:?}");
+        assert!(directory.join("status").exists());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     #[test]
     fn a_gate_in_a_unit_ends_with_its_files_and_leaves_no_unit() {
         if !super::units_available() {

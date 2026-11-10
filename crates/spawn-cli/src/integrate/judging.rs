@@ -16,11 +16,21 @@
 //! reap a gate an earlier one started without recording it twice.
 //!
 //! Order of a reap (D4): read the gate's files, decide, record, and only
-//! then remove the directory. In this commit the gate is still the
-//! integrator's child and dies with it, so nothing outlives a restart: the
-//! directory is removed when the judging's thread ends, whatever it
-//! recorded, and a start removes any left behind ([`sweep`]). Adoption
-//! (D5) replaces both.
+//! then remove the directory: when the judging's thread ends ([`Judging::run`],
+//! which first stops any unit of its gates that wrote no status).
+//! Two reapers of one gate (an adopter beside the integrator that started
+//! it) record it once: an adopter that finds the gate's directory gone
+//! when its runner ends records nothing (`GateFailure::Reaped`), and the
+//! store returns a judging's first verdict to any later one, `abandoned` too.
+//!
+//! A gate in a unit (crate::gate's `run_unit`) outlives the integrator that
+//! started it. The next one finds its judging among the [`left`] ones at
+//! each pass and adopts it (integrate.rs `Integrator::adopt`, D5): a
+//! judging thread whose first gate waits on the running one
+//! ([`Judging::run_adopted`], [`take_adopted`]) instead of starting
+//! another. A left judging with no gate in it, or one no one adopts, is
+//! abandoned ([`Judging::abandon`]): its units stopped, its directory
+//! removed.
 
 use std::cell::RefCell;
 use std::io::{Read as _, Write as _};
@@ -84,7 +94,6 @@ impl Judging {
         Ok(judging)
     }
 
-    #[cfg(test)]
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
@@ -92,6 +101,23 @@ impl Judging {
     #[cfg(test)]
     pub(crate) fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    /// Stop the units of its gates still running, and remove it: a judging
+    /// left behind that no one adopts.
+    pub(crate) fn abandon(&self) {
+        stop_units(&self.directory);
+        self.remove();
+    }
+
+    /// [`Judging::run`] for a judging an earlier integrator left (D5): the
+    /// first gate `body` runs adopts the one running in `gate` (its private
+    /// directory) instead of starting another ([`take_adopted`]).
+    pub(crate) fn run_adopted<T>(&self, gate: PathBuf, body: impl FnOnce() -> T) -> T {
+        ADOPTED.with(|adopted| *adopted.borrow_mut() = Some(gate));
+        let result = self.run(body);
+        ADOPTED.with(|adopted| adopted.borrow_mut().take());
+        result
     }
 
     fn write_description(&self, described: &Value) -> Result<(), String> {
@@ -149,6 +175,115 @@ thread_local! {
     /// The judging this thread runs ([`Judging::run`]); None on the main
     /// thread's passes and in every test that runs a gate directly.
     static CURRENT: RefCell<Option<Judging>> = const { RefCell::new(None) };
+    /// The gate an adopted judging takes over ([`Judging::run_adopted`]),
+    /// until its first gate takes it.
+    static ADOPTED: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// The private directory of the gate this thread's judging adopts, once:
+/// the first gate it runs waits on that one (gate.rs `judge_in`); every
+/// later one starts its own.
+pub(crate) fn take_adopted() -> Option<PathBuf> {
+    ADOPTED.with(|adopted| adopted.borrow_mut().take())
+}
+
+/// Add `more`'s keys to the description (`judging.json`) of the judging
+/// this thread runs, written whole: what a later integrator needs to adopt
+/// its gate (the candidate and the branch it judges), before that gate
+/// starts. Nothing outside a judging.
+pub(crate) fn describe(more: &Value) -> Result<(), String> {
+    let Some(judging) = CURRENT.with(|current| current.borrow().clone()) else {
+        return Ok(());
+    };
+    let path = judging.directory.join("judging.json");
+    let mut described: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .ok_or_else(|| format!("read {}", path.display()))?;
+    if let (Some(target), Some(more)) = (described.as_object_mut(), more.as_object()) {
+        target.extend(more.clone());
+    }
+    let _ = std::fs::remove_file(judging.directory.join("judging.json.tmp"));
+    judging.write_description(&described)
+}
+
+/// A judging an earlier integrator left under `<root>/judgings`: it, what
+/// its `judging.json` says (None when it cannot be read), and the private
+/// directory of its gate that has a runner (`runner.json`), if any.
+pub(crate) struct Left {
+    pub(crate) judging: Judging,
+    pub(crate) described: Option<Value>,
+    pub(crate) gate: Option<PathBuf>,
+}
+
+/// The judgings under `root` that are not `owned` (by id: the ones this
+/// integrator runs), oldest first.
+pub(crate) fn left(root: &Path, owned: &std::collections::HashSet<String>) -> Vec<Left> {
+    let Ok(entries) = std::fs::read_dir(root.join(DIRECTORY)) else {
+        return Vec::new();
+    };
+    let mut found: Vec<Left> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| {
+            let id = entry.file_name().to_str()?.to_string();
+            (is_id(&id) && !owned.contains(&id)).then_some((id, entry.path()))
+        })
+        .map(|(id, directory)| {
+            let described = std::fs::read_to_string(directory.join("judging.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+            let units = described
+                .as_ref()
+                .and_then(|value| value.get("units"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            // The candidate's gate, the one gate an adopter may wait on: the
+            // only one with a runner, while judging.json does not say the
+            // candidate was judged. Once it was, a gate still running is a
+            // later one of the judging's (a rejection's head re-judging, on
+            // another base), which no adopter resumes (rev-e G1): no gate,
+            // so the judging is abandoned, its units stopped, and the task
+            // judged anew. Two gates with runners say the same.
+            let judged = described
+                .as_ref()
+                .and_then(|value| value.get("candidate_judged"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let gates: Vec<PathBuf> = std::fs::read_dir(&directory)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|entry| entry.path())
+                        .filter(|path| path.join("runner.json").is_file())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let gate = match gates.as_slice() {
+                [gate] if !judged => Some(gate.clone()),
+                _ => None,
+            };
+            Left {
+                judging: Judging {
+                    id,
+                    directory,
+                    units,
+                },
+                described,
+                gate,
+            }
+        })
+        .collect();
+    found.sort_by(|a, b| a.judging.id.cmp(&b.judging.id));
+    found
+}
+
+/// A judging id as [`new_id`] makes them, or longer: lower-case hex.
+fn is_id(name: &str) -> bool {
+    name.len() >= 16
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// The directory of the judging this thread runs, where its gates make
@@ -242,33 +377,6 @@ fn stop_units(directory: &Path) {
             crate::gate::stop_unit(&run.unit);
         }
     }
-}
-
-/// Remove every judging directory under `root`, at the integrator's start:
-/// in this commit a gate never outlives the integrator that started it, so
-/// any left behind is one whose integrator stopped before its cleanup. The
-/// number removed.
-pub(crate) fn sweep(root: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(root.join(DIRECTORY)) else {
-        return 0;
-    };
-    let mut removed = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let is_judging = name
-            .to_str()
-            .is_some_and(|name| name.len() >= 16 && name.bytes().all(|b| b.is_ascii_hexdigit()));
-        if is_judging && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            // Its gates may still run in their units: stopped first.
-            stop_units(&path);
-            match std::fs::remove_dir_all(&path) {
-                Ok(()) => removed += 1,
-                Err(error) => eprintln!("integrate: remove {}: {error}", path.display()),
-            }
-        }
-    }
-    removed
 }
 
 #[cfg(test)]
@@ -378,21 +486,22 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("clean");
     }
 
-    /// A gate left running in its unit by an integrator that stopped
-    /// (commit 6a: no adoption yet) is stopped by the sweep before its
-    /// directory goes, so nothing writes into a directory that is gone.
+    /// A left judging no one adopts (its task moved on, an owner's, one
+    /// this integrator cannot read) is abandoned: its gate's unit is stopped
+    /// before its directory goes, so nothing writes into a directory that is
+    /// gone.
     #[test]
-    fn a_start_stops_a_left_gates_unit_before_it_removes_its_directory() {
+    fn abandoning_a_left_judging_stops_its_gates_unit_first() {
         if !crate::gate::units_available() {
             eprintln!("no systemd user manager answers here: not tried");
             return;
         }
-        let root = root("sweep-unit");
+        let root = root("abandon-unit");
         let left = Judging::create(&root, &json!({}), true).expect("create");
         let private = left.directory().join("spawn-gate-test");
         std::fs::create_dir(&private).expect("private");
         let unit = format!(
-            "spawn-gate-sweep-{}-{}.service",
+            "spawn-gate-left-{}-{}.service",
             std::process::id(),
             new_id().expect("id")
         );
@@ -421,23 +530,101 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim() == "active"
         };
         assert!(active(&unit), "the left gate runs");
-        assert_eq!(sweep(&root), 1);
+        let found = left_judgings(&root);
+        assert_eq!(found.len(), 1);
+        found[0].judging.abandon();
         assert!(!active(&unit), "its unit was stopped");
         assert!(!left.directory().exists());
         std::fs::remove_dir_all(&root).expect("clean");
     }
 
+    fn left_judgings(root: &Path) -> Vec<Left> {
+        left(root, &std::collections::HashSet::new())
+    }
+
+    /// The judgings left under a root: every judging directory but the ones
+    /// this integrator owns, oldest first, each with what it says and its
+    /// gate that has a runner; anything else there is no judging.
     #[test]
-    fn a_start_sweeps_judging_directories_and_nothing_else() {
-        let root = root("sweep");
-        let left = Judging::create(&root, &json!({}), false).expect("create");
-        std::fs::write(left.directory().join("status"), "0\n").expect("status");
-        let other = root.join(DIRECTORY).join("notes");
-        std::fs::create_dir(&other).expect("other");
-        assert_eq!(sweep(&root), 1);
-        assert!(!left.directory().exists());
-        assert!(other.exists(), "not a judging's: kept");
-        assert_eq!(sweep(&root.join("none")), 0);
+    fn the_left_judgings_are_the_ones_not_owned_with_their_gates() {
+        let root = root("left");
+        let older = Judging::create(&root, &json!({"kind": "task", "task": 1}), true).expect("one");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let newer =
+            Judging::create(&root, &json!({"kind": "task", "task": 2}), false).expect("two");
+        let owned = Judging::create(&root, &json!({}), false).expect("owned");
+        let gate = newer.directory().join("spawn-gate-x");
+        std::fs::create_dir(&gate).expect("gate");
+        std::fs::write(gate.join("runner.json"), "{}").expect("runner");
+        std::fs::create_dir(older.directory().join("spawn-gate-no-runner")).expect("no runner");
+        std::fs::create_dir(root.join(DIRECTORY).join("notes")).expect("other");
+        let found = left(&root, &[owned.id().to_string()].into_iter().collect());
+        let ids: Vec<&str> = found.iter().map(|left| left.judging.id()).collect();
+        assert_eq!(
+            ids,
+            vec![older.id(), newer.id()],
+            "oldest first, the owned one left out"
+        );
+        assert_eq!(found[0].gate, None, "a gate with no runner is none");
+        assert_eq!(found[1].gate.as_deref(), Some(gate.as_path()));
+        assert_eq!(
+            found[0].described.as_ref().map(|d| d["task"].clone()),
+            Some(json!(1))
+        );
+        assert!(found[0].judging.units && !found[1].judging.units);
+        assert!(left(&root.join("none"), &std::collections::HashSet::new()).is_empty());
+        std::fs::remove_dir_all(&root).expect("clean");
+    }
+
+    /// rev-e G1: a judging that ran two gates (its candidate's, then a
+    /// rejection's head re-judging) has no gate an adopter may resume,
+    /// whichever the directory lists first; nor has one whose description
+    /// says the candidate was judged, though one gate runs. Only a
+    /// judging's one gate, before its candidate was judged, is adopted.
+    #[test]
+    fn a_judging_past_its_candidates_gate_has_no_gate_to_adopt() {
+        let root = root("left-g1");
+        let gate_in = |judging: &Judging, name: &str| {
+            let gate = judging.directory().join(name);
+            std::fs::create_dir(&gate).expect("gate");
+            std::fs::write(gate.join("runner.json"), "{}").expect("runner");
+            gate
+        };
+        // Both listing orders: the candidate's gate named to sort first,
+        // then last.
+        for (first, second) in [("a-candidate", "z-head"), ("a-head", "z-candidate")] {
+            let two = Judging::create(&root, &json!({"kind": "task"}), true).expect("two gates");
+            gate_in(&two, first);
+            gate_in(&two, second);
+            let found = left(&root, &std::collections::HashSet::new());
+            let found = found
+                .iter()
+                .find(|left| left.judging.id() == two.id())
+                .expect("left");
+            assert_eq!(
+                found.gate, None,
+                "{first}, {second}: two gates, none adopted"
+            );
+            two.remove();
+        }
+        let judged = Judging::create(
+            &root,
+            &json!({"kind": "task", "candidate_judged": true}),
+            true,
+        )
+        .expect("judged");
+        gate_in(&judged, "head");
+        let one = Judging::create(&root, &json!({"kind": "task"}), true).expect("one");
+        let candidate = gate_in(&one, "candidate");
+        let found = left(&root, &std::collections::HashSet::new());
+        let gate_of = |id: &str| {
+            found
+                .iter()
+                .find(|left| left.judging.id() == id)
+                .and_then(|left| left.gate.clone())
+        };
+        assert_eq!(gate_of(judged.id()), None, "past its candidate's gate");
+        assert_eq!(gate_of(one.id()), Some(candidate), "its candidate's gate");
         std::fs::remove_dir_all(&root).expect("clean");
     }
 }
