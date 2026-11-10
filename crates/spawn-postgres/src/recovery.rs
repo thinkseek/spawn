@@ -267,7 +267,46 @@ select exists (
      and r.kind -> 'detail' -> 'record' ->> 'type' = 'execution.interrupted'
      and r.kind -> 'detail' -> 'record' ->> 'session_id' = $1)";
 
+/// The recovery's final model records the supervisor was not told of yet,
+/// oldest first: every `execution.interrupted` on the `final` path whose
+/// cause is `model_error` (a request the model will never accept) or
+/// `model_unavailable` (a transient error's retries spent), as `{event_id,
+/// at_ms, session_id, agent_id, execution_id, cause, status, error, text,
+/// retries}`. Told is a record, as for the integrator's expired holds: a
+/// digest that reached the supervisor carrying the tag
+/// `<session> model-<execution_id>`, however long ago.
+pub(crate) const MODEL_FINALS: &str = r"
+with told as (
+  select distinct tag
+    from spawn_commands d
+   cross join lateral jsonb_array_elements_text(
+           case when jsonb_typeof(d.action -> 'tags') = 'array'
+                then d.action -> 'tags' else '[]'::jsonb end) tag
+   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
+)
+select coalesce(jsonb_agg(jsonb_build_object(
+         'event_id', e.id, 'at_ms', e.recorded_at_ms,
+         'session_id', x.r ->> 'session_id', 'agent_id', x.r ->> 'agent_id',
+         'execution_id', x.r ->> 'execution_id', 'cause', x.r ->> 'cause',
+         'status', x.r -> 'evidence' -> 'status', 'error', x.r -> 'evidence' -> 'error',
+         'text', x.r -> 'evidence' -> 'text', 'retries', x.r -> 'evidence' -> 'retries')
+         order by e.id), '[]'::jsonb)
+  from spawn_events e
+ cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' = 'execution.interrupted'
+   and x.r ->> 'path' = 'final'
+   and x.r ->> 'cause' in ('model_error', 'model_unavailable')
+   and not exists (select 1 from told
+                    where tag = (x.r ->> 'session_id') || ' model-' || (x.r ->> 'execution_id'))";
+
 impl PostgresStore {
+    /// The final model records not told to the supervisor yet
+    /// ([`MODEL_FINALS`]).
+    pub fn model_finals(&self) -> Result<Value, StoreError> {
+        self.query_json(MODEL_FINALS, &[])
+    }
+
     /// The sessions the recovery looks at ([`RECOVERY_SESSIONS`]).
     pub fn recovery_sessions(&self) -> Result<Value, StoreError> {
         self.query_json(RECOVERY_SESSIONS, &[&RECENT_MS])
