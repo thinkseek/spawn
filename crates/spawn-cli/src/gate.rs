@@ -1781,12 +1781,18 @@ pub(crate) fn run_bounded(
                 kill_group();
                 let _ = child.kill();
                 let _ = child.wait();
+                if let Some(halt) = &halt {
+                    halt.note(None);
+                }
                 return Err(GateFailure::Timeout);
             }
             Ok(None) if stopped() => {
                 kill_group();
                 let _ = child.kill();
                 let _ = child.wait();
+                if let Some(halt) = &halt {
+                    halt.note(None);
+                }
                 return Err(GateFailure::Aborted {
                     reason: STOPPED.to_string(),
                     log: std::fs::read_to_string(&out_path).unwrap_or_default(),
