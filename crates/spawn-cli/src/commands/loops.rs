@@ -22,6 +22,9 @@
 //! - the liveness rule ([`supervise::keep_residents`],
 //!   [`supervise::keep_alive`]), which waits for the end of a failed
 //!   revival's backoff;
+//! - the cost step ([`cost::record`]), which folds the Bridge's
+//!   `model.usage` records into each message's priced cost, and waits for
+//!   nothing but them;
 //! - the alerts ([`alerts::Monitor::check`]), which waits for its next host
 //!   reading (`SPAWN_ALERT_CHECK_SECS`, 30 s) or a bound's due time.
 //!
@@ -54,7 +57,7 @@ use crate::config::{
     env_value, loop_interval, open_store, spawn_program, supervised, workspace_root,
 };
 use crate::runtime::runtime;
-use crate::{alerts, disk, dispatch, supervise};
+use crate::{alerts, cost, disk, dispatch, supervise};
 
 /// Most intervals a failing loop waits before its next pass.
 const MAX_BACKOFF_INTERVALS: u32 = 30;
@@ -258,6 +261,7 @@ struct Schedule {
     dispatch: Step,
     residents: Step,
     alive: Step,
+    cost: Step,
     alerts: Step,
 }
 
@@ -270,12 +274,13 @@ impl Schedule {
             dispatch: Step::new(),
             residents: Step::new(),
             alive: Step::new(),
+            cost: Step::new(),
             alerts: Step::new(),
         }
     }
 
     /// Every step, for the rules that hold for all of them.
-    fn steps(&self) -> [&Step; 7] {
+    fn steps(&self) -> [&Step; 8] {
         [
             &self.bridge,
             &self.observer,
@@ -283,6 +288,7 @@ impl Schedule {
             &self.dispatch,
             &self.residents,
             &self.alive,
+            &self.cost,
             &self.alerts,
         ]
     }
@@ -410,6 +416,9 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     warnings.extend(more);
     let (alerting, more) = alerts::Monitor::from_env();
     warnings.extend(more);
+    // A price the loop cannot read would record every cost wrong: it stops
+    // here, naming the setting.
+    let prices = cost::Prices::from_env()?;
     for warning in &warnings {
         eprintln!("spawn loop warning: {warning}");
     }
@@ -434,6 +443,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         bounds,
         waits,
         alerting,
+        prices,
         interval: loop_interval(),
         steps_at: None,
     };
@@ -488,6 +498,9 @@ struct Fleet<'a> {
     /// whether this pass has anything to do, on the same watermark and
     /// due-time rule as the other steps.
     alerting: alerts::Monitor,
+    /// The prices the cost step records each model call at
+    /// (`SPAWN_MODEL_PRICES`, read once at start).
+    prices: cost::Prices,
     interval: Duration,
     /// When the steps last ran over the store. They run at most once a pass
     /// interval, which is the resolution the loop always had: a burst of
@@ -702,6 +715,17 @@ impl Fleet<'_> {
                 }
                 Err(error) => Fleet::fail(errors, "supervise", &error),
             }
+        }
+        // The cost step before the alerts, so a budget's reading sees the
+        // calls recorded so far. Only the Bridge's records give it work; it
+        // never fails a pass: an error is said and tried again at the next
+        // change of the log.
+        if self.schedule.cost.runs(watermark, now) {
+            match cost::record(open, &self.prices) {
+                Ok(line) => lines.extend(line),
+                Err(error) => lines.push(error),
+            }
+            self.schedule.cost.ran(watermark, None);
         }
         // The alerts never fail a pass either: an error is said and tried
         // again at the next check, like the disk watch's.
