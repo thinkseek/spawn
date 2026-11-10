@@ -63,9 +63,11 @@
 # after `first`'s resume started a new terminal server, is recorded cause
 # `crashed` (evidence: its terminal is gone, no exit status), not
 # `host_restart`. It passes once whether an execution's terminal server is
-# gone is told from the server that ran it (for example its pid and start
-# time against the execution's start), not from whether some server answers
-# when the end is processed.
+# gone is told from the server that ran it (for example its start time
+# against the execution's, allowing for the launch: an execution is
+# recorded before its terminal, which may start the server, starts), not
+# from whether some server answers when the end is processed. A comparison
+# that does not allow for the launch fails (3) in some runs (1 in 3 here).
 # Runs inside the gate's sandbox (scripts/rsi/gate.sh): needs SPAWN_BIN,
 # SPAWN_TEST_DATABASE_URL, tmux and jq; creates and drops its own database,
 # uses a private tmux socket, loopback only. Every wait is bounded in time.
