@@ -1120,9 +1120,39 @@ next command and who sent it, the end of the execution) follows it in the
 same log. Nothing exports these episodes or replays them through the rules
 (§9).
 
-The ladder metrics in the UI (decisions per tier, escalations, human
-decisions per agent-hour over the last 24 h) are computed from the log by
-`spawn serve`.
+Four views derive the experience from the log and the command queue, one
+row per item with its time (`at_ms`), readable by the reader (`spawn
+serve`) and the supervisor (`crates/spawn-postgres/sql/schema.sql`):
+
+- `spawn_decisions` (`at_ms`, `tier`, `session_id`, `agent_id`, `source`):
+  every judgement, tier `rules` when the rules judged and `model`
+  otherwise, and every command at its creation, by its principal:
+  `dispatcher` (`spawn-dispatch`), `supervisor` (`spawn_supervisor`),
+  `human` (`human`, `spawn`), `liveness` (`spawn-liveness`), any other
+  principal its own tier.
+- `spawn_interventions` (`at_ms`, `kind`, ...): the owner's interventions
+  exactly as the scorecard's autonomy counts them (docs/design.md §15):
+  `command`, `resume`, `owner_task`, `cancel_reassign`.
+- `spawn_outcomes` (`at_ms`, `outcome`, `task_id`, `mission_id`, `by`):
+  each task's closing record: `landed`, `accepted` (by review, on a mission
+  without a gate), `cancelled`, `aborted`, `over_budget`.
+- `spawn_escalations` (`at_ms`, `tag`, `command_id`): each distinct tag of
+  the dispatcher's inputs into the supervisor (`Escalation::tag`), once, at
+  the first command that carried it.
+
+`GET /api/scorecard/fleet?window=24h|7d|30d|90d[&until=<RFC 3339>]`
+counts them over `[until - window, until)` (`until` defaults to the
+database's now; any other window is 400): the ladder by tier, agent-hours
+(every execution's running time in the window) and human decisions per
+agent-hour, escalations, interventions by kind, outcomes, landings per day,
+the judgements as `/api/fleet`'s last hour counts them, and each mission
+open in the window with its idle hours (its hours open less the union of
+its tasks' open intervals; `idle` past half). Ratios and hours are rounded
+to 3 decimals as the scorecard rounds (`crates/spawn-postgres/src/
+experience.rs`). The Scorecard's "How the fleet decides" reads it for the
+page's window (`web/src/fleetDecisions.ts`, `decisionsFromApi`);
+`/api/fleet`'s 24 h ladder and human decisions per agent-hour read the
+same view.
 
 ## 5. Interface
 
@@ -1141,8 +1171,8 @@ read is 405): `/api/overview`, `/api/fleet` (with
 `/api/fleet/<session>/judgements` and `/commands`, each command with
 `waiting` once the Bridge holds it for the agent's turn), `/api/attention`,
 `/api/missions`, `/api/events`, `/api/session/<id>`, `/api/pane/<id>`,
-`/api/rsi` (with `/api/rsi/task/<id>` and `/api/rsi/pane`) and
-`/api/scorecard` (`crates/spawn-cli/src/serve.rs`; the answer of
+`/api/rsi` (with `/api/rsi/task/<id>` and `/api/rsi/pane`),
+`/api/scorecard` and `/api/scorecard/fleet` (§4) (`crates/spawn-cli/src/serve.rs`; the answer of
 `/api/attention` is documented in `crates/spawn-cli/src/serve/attention.rs`).
 
 It writes two things. The first is a person's input to a session, `POST
@@ -1294,9 +1324,9 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
 
 ## 9. Not built
 
-- **Experience views in SQL** (`decisions`, `outcomes`, `interventions`)
-  and outcome labels: the log holds what followed each judgement, but
-  nothing derives, exports or replays the episodes.
+- **Outcome labels and episode export:** the experience views (§4) count
+  decisions, interventions, outcomes and escalations, but nothing labels a
+  judgement with what followed it, exports the episodes or replays them.
 - **RSI objectives over the corpus**, judged by black-box replay through the
   candidate's `spawn` binary on a corpus snapshot the candidate cannot edit:
   rules coverage (share of episodes decided by rules up, agreement with the
@@ -1311,7 +1341,6 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
   transient API error is the recovery's (§3.1): bounded for an engine that
   ended, unbounded for one at its prompt; telling the supervisor after N
   live retries is not built.
-- **Ladder health over long periods.** The UI's figures cover the last 24 h.
 - **The backlog, scenarios and gate versioned with the source**
   (docs/storage.md).
 - **The Review point in code** (§1.1). Review sessions are run by the lead
