@@ -501,7 +501,7 @@ pub(crate) const SESSION_COMMANDS: &str =
                                          where w.session_id = k.session_id and w.source = 'bridge'
                                            and w.source_event_id = 'cmd_' || k.id || ':waiting')
                                   as waiting,
-                                spawn_command_message(k.id, k.session_id, k.action, k.state,
+                                spawn_command_message(k.id, k.session_id, k.action, k.state, k.succeeded,
                                                       k.created_at_ms, k.finished_at_ms, $3,
                                                       m.marked_from, m.now_ms)
                                   - 'tracked' - 'due_ms' - 'typed' - 'ended' as message

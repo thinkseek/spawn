@@ -4256,16 +4256,19 @@ $$;
 -- - `not_taken`: no `message.taken` names it, it is tracked, and its bound
 --   has passed. Tracked: the Bridge recorded `message.typed` for it (the
 --   text it typed carried the marker; the bound runs from the command's
---   creation), or nothing of it was ever typed (no `typing` step) and it
---   was still open, or finished, after the first marking loop started (the
---   bound runs from the later of its creation and that start). A command an
+--   creation), or nothing of it was ever typed (no `typing` step), it did
+--   not finish failed (the Bridge refused it before typing: its sender is
+--   told, and a loop's sends it again as a new command), and it was still
+--   open, or finished, after the first marking loop started (the bound runs
+--   from the later of its creation and that start). A command an
 --   older Spawn typed has `typing` and no `message.typed`: never not taken.
 -- - `typed`: whether the Bridge recorded it typed; `ended`: the session ended
 --   with it (what the alert clears on): the execution it was typed into, or
 --   its own start's, ended; or, never typed or started, it finished while no
 --   execution that is still live ran.
 create or replace function spawn_command_message(p_id bigint, p_session text, p_action jsonb,
-                                                 p_state text, p_created bigint,
+                                                 p_state text, p_succeeded boolean,
+                                                 p_created bigint,
                                                  p_finished bigint, p_bound_ms bigint,
                                                  p_marked_from bigint, p_now bigint)
 returns jsonb language plpgsql stable as $$
@@ -4316,7 +4319,8 @@ begin
           and not exists (select 1 from spawn_events e
                            where e.session_id = p_session and e.source = 'bridge'
                              and e.source_event_id = 'cmd_' || p_id || ':typing')
-          and (p_finished is null or p_finished >= p_marked_from) then
+          and (p_finished is null or p_finished >= p_marked_from)
+          and p_succeeded is not false then
         v_tracked := true;
         v_from := greatest(p_created, p_marked_from);
     else
@@ -4368,14 +4372,14 @@ end $$;
 -- nobody else is handed a function over the log. Each runs with its
 -- caller's rights.
 revoke execute on function spawn_messages_marked_from() from public;
-revoke execute on function spawn_command_message(bigint, text, jsonb, text, bigint, bigint,
-                                                 bigint, bigint, bigint) from public;
+revoke execute on function spawn_command_message(bigint, text, jsonb, text, boolean, bigint,
+                                                 bigint, bigint, bigint, bigint) from public;
 do $$
 begin
     execute format('grant execute on function spawn_messages_marked_from() to %I',
                    spawn_login_role('spawn_reader'));
     execute format('grant execute on function spawn_command_message(bigint, text, jsonb, text, '
-                   'bigint, bigint, bigint, bigint, bigint) to %I',
+                   'boolean, bigint, bigint, bigint, bigint, bigint) to %I',
                    spawn_login_role('spawn_reader'));
 end
 $$;
