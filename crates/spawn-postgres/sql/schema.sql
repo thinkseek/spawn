@@ -1432,7 +1432,11 @@ create table if not exists mission_tasks (
     -- The task this one continues (its `task.assigned` names it): the
     -- objective's task after one that went over its budget keeps that
     -- task's work (`task.over_budget`, docs/fleet-architecture.md §10.4).
-    continues       bigint
+    continues       bigint,
+    -- The task this one takes over (its `task.assigned` names it): a
+    -- delivered task moved to a fresh worker whose branch starts from the
+    -- old worker's last checkpoint (`spawn_task_reassign`).
+    reassign_of     bigint
 );
 
 -- Columns added since the first shape of these tables (see spawn_grants).
@@ -1468,6 +1472,7 @@ alter table mission_tasks add column if not exists model text not null default '
 alter table mission_tasks add column if not exists held_by bigint;
 alter table mission_tasks add column if not exists reissue_of bigint;
 alter table mission_tasks add column if not exists continues bigint;
+alter table mission_tasks add column if not exists reassign_of bigint;
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
@@ -1733,8 +1738,8 @@ end $$;
 
 -- Who may call the mission functions: the owner (humans' CLI, the
 -- controller) and the supervisor's login; not the reader's, and not the web
--- page's typing login (`human`, which may only call `spawn_human_input` and
--- `spawn_human_key`).
+-- page's typing login (`human`, which may only call `spawn_human_input`,
+-- `spawn_human_key` and `spawn_human_task`).
 create or replace function spawn_mission_caller() returns text
 language sql stable as $$
     select case when x.p is null or x.p in ('spawn_reader', 'human') then null
@@ -1820,13 +1825,13 @@ begin
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
                                    created_by, objective, scenario, model, reissue_of,
-                                   continues, created_at_ms, updated_at_ms)
+                                   continues, reassign_of, created_at_ms, updated_at_ms)
         values (v_id, (p_record ->> 'mission_id')::bigint, p_record ->> 'kind',
                 p_record ->> 'agent_id', p_record ->> 'session_id', p_record ->> 'brief',
                 p_record ->> 'created_by', (p_record ->> 'objective')::integer,
                 p_record ->> 'scenario', coalesce(p_record ->> 'model', 'default'),
                 (p_record ->> 'reissue_of')::bigint, (p_record ->> 'continues')::bigint,
-                p_at, p_at);
+                (p_record ->> 'reassign_of')::bigint, p_at, p_at);
         update mission_missions set state = 'active', updated_at_ms = p_at
          where id = (p_record ->> 'mission_id')::bigint and state = 'open';
     when 'mission.configured' then
@@ -2211,6 +2216,12 @@ begin
         -- The wait an interruption opened is over: what showed the cause
         -- gone and how long it held. Read from the log, folded into no
         -- table (spawn_host_record).
+        null;
+    when 'task.restarted' then
+        -- A delivered task's worker is given a fresh execution of its own
+        -- native session (spawn_task_restart): the dispatcher stops the
+        -- running one and resumes the session, reading the record from the
+        -- log. The task stays delivered, so nothing is folded.
         null;
     when 'task.report_unfinished' then
         -- A report still a draft, not taken (spawn_task_report_unfinished):
@@ -2767,6 +2778,177 @@ begin
         'objective', v_old.objective, 'scenario', v_old.scenario, 'reissue_of', p_task)));
     return v_id;
 end $$;
+
+-- Restart and reassign (docs/fleet-architecture.md §9, "Restart and
+-- reassign"): a delivered task's worker that stalled is given a fresh
+-- execution, or its task a fresh worker, keeping what it did. Both take a
+-- `delivered` task only; any other (or an unknown one) is refused with its
+-- state named (SQLSTATE 55000), and nothing is recorded. `p_by` is who asks,
+-- as a `task.cancelled` names it (spawn_task_cancel_by; `human` for the page,
+-- spawn_human_restart). Each returns `{task, session_id, agent_id}`: the
+-- task and the worker that now carry the work. The `_as` functions are
+-- called by the checked ones below, never granted to a login.
+--
+-- A restart records `task.restarted` {task, session_id, agent_id,
+-- execution_id (the running one, else null), by, reason, n (from 1, per
+-- task)}; the dispatcher stops that execution (`restart-<task>-<n>-stop`, a
+-- Stop: its final checkpoint kept) and, once its end is recorded, resumes
+-- the same native session (`restart-<task>-<n>`). The recovery records that
+-- end `restarted`, `final`.
+create or replace function spawn_task_restart_as(p_task bigint, p_reason text, p_by text)
+returns jsonb language plpgsql security definer as $$
+declare
+    v_task mission_tasks%rowtype;
+    v_execution text;
+    v_n bigint;
+begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
+    select * into v_task from mission_tasks where id = p_task;
+    if v_task.id is null then
+        raise exception 'task % does not exist: there is nothing to restart', p_task
+            using errcode = '55000';
+    end if;
+    if v_task.state <> 'delivered' then
+        raise exception 'task % is %, not delivered: only a delivered task''s worker is restarted',
+            p_task, v_task.state using errcode = '55000';
+    end if;
+    select s.execution_id into v_execution
+      from agent_status s where s.session_id = v_task.session_id and s.live;
+    select count(*) + 1 into v_n
+      from spawn_events e
+     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+       and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.restarted'
+       and e.kind -> 'detail' -> 'record' ->> 'task' = p_task::text;
+    perform spawn_control_record(jsonb_build_object(
+        'type', 'task.restarted', 'task', p_task, 'session_id', v_task.session_id,
+        'agent_id', v_task.agent_id, 'execution_id', v_execution, 'by', p_by,
+        'reason', nullif(btrim(coalesce(p_reason, '')), ''), 'n', v_n));
+    return jsonb_build_object('task', p_task, 'session_id', v_task.session_id,
+                              'agent_id', v_task.agent_id);
+end $$;
+
+-- A reassign, in one transaction as the re-issue does (spawn_task_reissue):
+-- the old task's `task.cancelled` names `by`, `reason` and `reassigned_as`
+-- (the new task); the new task's `task.assigned` names `reassign_of` (the
+-- old) and copies its mission, brief, model, objective, scenario and
+-- `created_by`, kind `ephemeral`, with a fresh worker named after the old
+-- one's label (`agent_worker_<label>_<new id>`; a resident's name is its
+-- label). The dispatcher stops the old worker (`reassign-<task>-stop`, its
+-- final checkpoint kept), delivers the new task once it has ended, and its
+-- branch starts from the old worker's last checkpoint (OBJECTIVE_FORK).
+create or replace function spawn_task_reassign_as(p_task bigint, p_reason text, p_by text)
+returns jsonb language plpgsql security definer as $$
+declare
+    v_old mission_tasks%rowtype;
+    v_id bigint;
+    v_agent text;
+    v_session text;
+    v_label text;
+begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
+    select * into v_old from mission_tasks where id = p_task;
+    if v_old.id is null then
+        raise exception 'task % does not exist: there is nothing to reassign', p_task
+            using errcode = '55000';
+    end if;
+    if v_old.state <> 'delivered' then
+        raise exception 'task % is %, not delivered: only a delivered task is reassigned',
+            p_task, v_old.state using errcode = '55000';
+    end if;
+    if not exists (select 1 from mission_missions
+                    where id = v_old.mission_id and state in ('open', 'active'))
+       or not spawn_task_may_move(p_task, 'cancelled') then
+        raise exception 'task % may not be assigned again (its mission or worker is closed)',
+            p_task using errcode = '55000';
+    end if;
+    v_id := nextval(pg_get_serial_sequence('mission_tasks', 'id'));
+    v_label := coalesce(substring(v_old.agent_id from '^agent_worker_(.+)_[0-9]+$'),
+                        (select r.name from mission_residents r where r.agent_id = v_old.agent_id),
+                        'task');
+    v_label := trim(both '_' from left(regexp_replace(lower(v_label), '[^a-z0-9]+', '_', 'g'), 20));
+    if v_label = '' then v_label := 'task'; end if;
+    v_agent := format('agent_worker_%s_%s', v_label, v_id);
+    v_session := format('session_worker_%s_%s', v_label, v_id);
+    perform spawn_control_record(jsonb_strip_nulls(jsonb_build_object(
+        'type', 'task.cancelled', 'id', p_task, 'by', p_by,
+        'reason', nullif(btrim(coalesce(p_reason, '')), ''), 'reassigned_as', v_id)));
+    perform spawn_control_record(jsonb_strip_nulls(jsonb_build_object(
+        'type', 'task.assigned', 'id', v_id, 'mission_id', v_old.mission_id,
+        'kind', 'ephemeral', 'agent_id', v_agent, 'session_id', v_session,
+        'brief', v_old.brief, 'model', v_old.model, 'created_by', v_old.created_by,
+        'objective', v_old.objective, 'scenario', v_old.scenario, 'reassign_of', p_task)));
+    return jsonb_build_object('task', v_id, 'session_id', v_session, 'agent_id', v_agent);
+end $$;
+
+-- The checked restart and reassign of the owner (the CLI) and the
+-- supervisor's login: `by` as spawn_task_cancel_by names the caller.
+create or replace function spawn_task_restart(p_task bigint, p_reason text)
+returns jsonb language plpgsql security definer as $$
+begin
+    if spawn_mission_caller() is null then
+        raise exception '% may not restart tasks', session_user using errcode = '42501';
+    end if;
+    return spawn_task_restart_as(p_task, p_reason, spawn_task_cancel_by());
+end $$;
+
+create or replace function spawn_task_reassign(p_task bigint, p_reason text)
+returns jsonb language plpgsql security definer as $$
+begin
+    if spawn_mission_caller() is null then
+        raise exception '% may not reassign tasks', session_user using errcode = '42501';
+    end if;
+    return spawn_task_reassign_as(p_task, p_reason, spawn_task_cancel_by());
+end $$;
+
+-- A person's restart or reassign from the agent page (`spawn serve`, `POST
+-- /api/session/<id>/restart` and `/reassign`): the delivered task of
+-- session `p_session` (its latest), restarted or reassigned with `by`
+-- `human`. A session that holds no delivered task is refused (SQLSTATE
+-- 55000, which the page answers 409) and nothing is recorded. Only the
+-- `spawn_human` login may call it, beside `spawn_human_input` and
+-- `spawn_human_key`; it may call no other mission function. `p_action` is
+-- `restart` or `reassign`; the reason is at most 2000 bytes.
+create or replace function spawn_human_task(p_session text, p_action text, p_reason text)
+returns jsonb language plpgsql security definer as $$
+declare
+    v_task bigint;
+begin
+    if spawn_principal() is distinct from 'human' then
+        raise exception '% may not restart or reassign as a person (only the spawn_human login does)',
+            session_user using errcode = '42501';
+    end if;
+    if p_action is null or p_action not in ('restart', 'reassign') then
+        raise exception 'a person restarts or reassigns, not %', coalesce(p_action, 'null')
+            using errcode = '22023';
+    end if;
+    if octet_length(coalesce(p_reason, '')) > 2000 then
+        raise exception 'a reason is at most 2000 bytes, not %', octet_length(p_reason)
+            using errcode = '22023';
+    end if;
+    select k.id into v_task from mission_tasks k
+     where k.session_id = p_session and k.state = 'delivered'
+     order by k.id desc limit 1;
+    if v_task is null then
+        raise exception '% holds no delivered task: there is nothing to %', p_session, p_action
+            using errcode = '55000';
+    end if;
+    if p_action = 'restart' then
+        return spawn_task_restart_as(v_task, p_reason, 'human');
+    end if;
+    return spawn_task_reassign_as(v_task, p_reason, 'human');
+end $$;
+
+do $$
+begin
+    execute format('alter function spawn_human_task(text, text, text) set search_path = %I, pg_temp',
+                   current_schema());
+    execute 'revoke execute on function spawn_human_task(text, text, text) from public';
+    execute format('grant execute on function spawn_human_task(text, text, text) to %I',
+                   spawn_login_role('spawn_human'));
+end
+$$;
 
 -- A resident starts only after a human approves it.
 create or replace function spawn_resident_propose(p_name text, p_charter text)
@@ -3930,7 +4112,8 @@ begin
         if v_cause is null or v_cause not in (
                'exited', 'crashed', 'memory_limit', 'context_exhausted',
                'model_unavailable', 'model_auth', 'model_error', 'host_restart',
-               'database_unavailable', 'disk_full', 'budget', 'stopped') then
+               'database_unavailable', 'disk_full', 'budget', 'stopped', 'restarted',
+               'reassigned') then
             raise exception 'not an interruption cause: %', v_cause
                 using errcode = '22023';
         end if;
@@ -4234,6 +4417,8 @@ begin
         'spawn_task_assign(bigint, text, text, text, text)',
         'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_task_reissue(bigint, jsonb)',
+        'spawn_task_restart(bigint, text)', 'spawn_task_reassign(bigint, text)',
+        'spawn_task_restart_as(bigint, text, text)', 'spawn_task_reassign_as(bigint, text, text)',
         'spawn_resident_propose(text, text)',
         'spawn_resident_retire(text)', 'spawn_resident_approve(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
@@ -4261,7 +4446,8 @@ begin
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
         'spawn_task_assign(bigint, text, text, text, text)',
         'spawn_task_review(bigint, boolean, text, integer)',
-        'spawn_task_cancel(bigint)', 'spawn_resident_propose(text, text)',
+        'spawn_task_cancel(bigint)', 'spawn_task_restart(bigint, text)',
+        'spawn_task_reassign(bigint, text)', 'spawn_resident_propose(text, text)',
         'spawn_resident_retire(text)', 'spawn_task_stages(bigint)'] loop
         execute format('grant execute on function %s to %I', v_function,
                        spawn_login_role('spawn_supervisor'));
