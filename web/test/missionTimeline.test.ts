@@ -4,6 +4,14 @@ import { test } from "node:test";
 import type { Mission, MissionTask, TaskStage } from "../src/missions.ts";
 import {
   deriveMissionTimeline,
+  earlierLabel,
+  groupEnd,
+  holdText,
+  holdTitle,
+  laneLifetimeText,
+  laneToday,
+  laneTodayText,
+  splitEarlier,
   filterLanes,
   hasBars,
   isLive,
@@ -449,4 +457,100 @@ test("names and states", () => {
   assert.equal(missionName({ id: 9, text: null }), "Mission 9");
   assert.equal(laneState({ state: "dropped", halted: null }), "closed");
   assert.equal(laneState({ state: "done", halted: "x" }), "halted");
+});
+
+/** A bar for the split: only its key and end matter. */
+const ended = (key: string, end: number | null) => ({ key, end }) as unknown as import("../src/missionTimeline.ts").TaskBar;
+const group = (key: string, end: number | null, attempts: Array<number | null> = []) => ({
+  key,
+  item: ended(key, end),
+  earlier: attempts.map((at, index) => ({ item: ended(`${key}-${index}`, at) })),
+});
+
+test("a group ends with its last bar, and is open while any bar is", () => {
+  assert.equal(groupEnd(group("a", T0 + 5 * MIN)), T0 + 5 * MIN);
+  assert.equal(groupEnd(group("a", T0 + 5 * MIN, [T0 + 9 * MIN])), T0 + 9 * MIN, "an attempt that ended later");
+  assert.equal(groupEnd(group("a", null, [T0])), null);
+  assert.equal(groupEnd(group("a", T0, [null])), null);
+});
+
+test("groups that ended before the window's edge fold away; open, late and kept ones stay", () => {
+  const cut = T0 + 60 * MIN;
+  const groups = [
+    group("old", T0 + 10 * MIN),
+    group("open", null),
+    group("late", T0 + 90 * MIN),
+    group("edge", cut, []),
+    group("retried", T0 + 20 * MIN, [T0 + 70 * MIN]),
+    group("older", T0 + 30 * MIN),
+    group("selected", T0 + 5 * MIN),
+  ];
+  const split = splitEarlier(groups, cut, (entry) => entry.key === "selected");
+  assert.deepEqual(split.current.map((entry) => entry.key), ["open", "late", "edge", "retried", "selected"]);
+  assert.deepEqual(split.earlier.map((entry) => entry.key), ["old", "older"], "in their order");
+  assert.equal(split.last, T0 + 30 * MIN);
+  const none = splitEarlier(groups, null, () => false);
+  assert.equal(none.earlier.length, 0, "a window that reaches back to the first task folds nothing");
+  assert.equal(none.last, null);
+});
+
+test("the folded row names the count and the window's edge, with the weekday on another day", () => {
+  const now = new Date(2026, 10, 10, 15, 30).getTime();
+  assert.equal(earlierLabel(1, new Date(2026, 10, 10, 9, 5).getTime(), now), "1 task ended before 09:05");
+  assert.equal(earlierLabel(25, new Date(2026, 10, 9, 18, 0).getTime(), now), "25 tasks ended before Mon 18:00");
+});
+
+/** A bar for the header: its label, outcome, end and verdicts. */
+const dayBar = (label: string, outcome: string, end: number | null, verdicts: Array<{ at: number; verdict: string; sentBack: boolean; reason?: string }> = []) =>
+  ({
+    label,
+    outcome,
+    end,
+    verdicts: verdicts.map((verdict) => ({ by: "gated", attempt: 1, reason: null, ...verdict })),
+  }) as unknown as import("../src/missionTimeline.ts").TaskBar;
+
+test("a mission's header says its day: in flight, landed today, the last send-back of the day with its reason", () => {
+  const now = T0 + 48 * 60 * MIN;
+  const lane = {
+    bars: [
+      dayBar("T1", "open", null),
+      dayBar("T2", "open", null, [{ at: now - 120 * MIN, verdict: "rejected", sentBack: true, reason: "051.sh fails on the candidate" }]),
+      dayBar("T3", "landed", now - 60 * MIN, [{ at: now - 90 * MIN, verdict: "accepted", sentBack: false }]),
+      dayBar("T4", "accepted", now - 23 * 60 * MIN),
+      dayBar("T5", "landed", now - 25 * 60 * MIN, [{ at: now - 26 * 60 * MIN, verdict: "conflict", sentBack: true }]),
+      dayBar("T6", "cancelled", now - 10 * MIN),
+    ],
+  };
+  const today = laneToday(lane, now);
+  assert.deepEqual([today.inFlight, today.landed], [2, 2], "T5 landed yesterday");
+  assert.equal(today.lastBack?.task, "T2", "T5's conflict is yesterday's");
+  assert.equal(laneTodayText(today, now), "2 in flight · 2 landed in 24 h · last rejected 2 h ago (T2): 051.sh fails on the candidate");
+  assert.equal(laneTodayText(laneToday({ bars: [dayBar("T5", "landed", now - 25 * 60 * MIN)] }, now), now), "nothing landed in 24 h");
+  const long = laneToday({ bars: [dayBar("T7", "open", null, [{ at: now - 5 * MIN, verdict: "incompatible", sentBack: true, reason: `${"x".repeat(150)}\nthe log` }])] }, now);
+  assert.equal(laneTodayText(long, now), `1 in flight · nothing landed in 24 h · last incompatible 5 min ago (T7): ${"x".repeat(99)}…`, "a long reason: its first line, clipped");
+  const old = laneToday({ bars: [dayBar("T5", "landed", now - 25 * 60 * MIN, [{ at: now - 26 * 60 * MIN, verdict: "conflict", sentBack: true }])] }, now);
+  assert.equal(old.lastBack, null, "a send-back from yesterday is not today's");
+  const two = laneToday({ bars: [
+    dayBar("T8", "open", null, [{ at: now - 3 * 60 * MIN, verdict: "rejected", sentBack: true, reason: "older" }]),
+    dayBar("T9", "open", null, [{ at: now - 30 * MIN, verdict: "conflict", sentBack: true, reason: "newer" }]),
+  ] }, now);
+  assert.equal(two.lastBack?.task, "T9", "the latest send-back, wherever its bar sits");
+  const lines = laneToday({ bars: [dayBar("T10", "open", null, [{ at: now - MIN, verdict: "rejected", sentBack: true, reason: "  short line \nsecond line" }])] }, now);
+  assert.equal(laneTodayText(lines, now), "1 in flight · nothing landed in 24 h · last rejected 1 min ago (T10): short line", "only the reason's first line");
+});
+
+test("the lifetime totals and a held source read as words", () => {
+  assert.equal(laneLifetimeText({ total: 97, landed: 85, open: 3, sentBack: 14, cancelled: 9 }), "97 tasks in all · 85 landed · 3 open · 14 sent back · 9 cancelled");
+  assert.equal(laneLifetimeText({ total: 1, landed: 0, open: 1, sentBack: 0, cancelled: 0 }), "1 task in all · 1 open");
+  const now = T0;
+  assert.equal(holdText({ expires_ms: now + 145 * MIN, waiting: [221] }, now), "source held · expires in 2 h · 1 task waiting");
+  assert.equal(holdText({ expires_ms: now - MIN, waiting: [] }, now), "source held · expired");
+  assert.equal(holdText({ expires_ms: null, waiting: [1, 2] }, now), "source held · 2 tasks waiting");
+});
+
+test("a held source's title keeps what the card showed: reason, who took it and when, its main", () => {
+  const now = T0;
+  const hold = { expires_ms: now + 145 * MIN, waiting: [221, 222], reason: "release freeze", by: "human", held_at_ms: now - 60 * MIN, main: "0123456789abcdef0123" };
+  assert.equal(holdTitle(hold, now), "source held · expires in 2 h · 2 tasks waiting\nrelease freeze\ntaken by human 1 h ago at main 0123456789ab\nwaiting: T221, T222");
+  assert.equal(holdTitle({ ...hold, reason: null, by: null, held_at_ms: null, main: null, waiting: [] }, now), "source held · expires in 2 h");
 });

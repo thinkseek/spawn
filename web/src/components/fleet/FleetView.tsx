@@ -2,17 +2,18 @@ import { useMemo, useState } from "react";
 import { ChevronRight } from "lucide-react";
 
 import type { Alert, PollResult } from "../../api";
+import { fetchAlertsSince, usePoll } from "../../api";
 import type { Attention } from "../../attention";
 import type { Fleet } from "../../fleet";
 import { relativeTime } from "../../format";
 import type { NeedItem } from "../../home";
-import { agentsNow, digestToday, latestNotes, missionsToday, needsSummary } from "../../home";
+import { agentNames, agentsNow, alertsSpanMs, digestSince, digestWindow, latestNotes, missionsToday, needsSummary } from "../../home";
 import type { Missions } from "../../missions";
 import type { FleetContext } from "../../ordering";
 import { groupAgents, missingAlwaysOn, residentName, usualEngine } from "../../ordering";
 import { useNow } from "../rsi/Phase";
 import { FOCUS_RING_INSET, LiveStatus, PageHeader, cx } from "../ui";
-import { AgentsNowCard, DigestCard, MissionsTodayCard, NeedsYou, SupervisorNotes } from "../home/Home";
+import { AgentsNowCard, DigestCard, MissionsTodayCard, NeedsYou, SupervisorNotes, useAway } from "../home/Home";
 import { AgentDetail } from "./AgentDetail";
 import { AlwaysOnAgents, uptimeMs } from "./AlwaysOnAgents";
 import { FleetBoard } from "./FleetBoard";
@@ -69,6 +70,8 @@ export function FleetView({
   const updated = data?.health.generated_at_ms ?? null;
   const agents = data?.agents;
   const groups = useMemo(() => groupAgents(agents ?? [], context), [agents, context]);
+  // One name per agent (design §4.5), the sidebar's and home's.
+  const names = useMemo(() => agentNames(agents ?? [], context), [agents, context]);
   // Who the box at the top types to: the dispatcher's supervisor, else the
   // board's, else the one Spawn starts.
   const onBoard = agents?.find((agent) => agent.role === "supervisor") ?? null;
@@ -93,6 +96,13 @@ export function FleetView({
   };
 
   const now = Date.now();
+  // What happened while the reader was away: at least the last 24 h (design §3 Q4).
+  const away = useAway();
+  const digestSpan = digestWindow(now, away?.from ?? null);
+  // The alerts as far back as the digest reads (the shared poll holds the
+  // server's 24 h); slow, since news of days ago does not move by the second.
+  const span = alertsSpanMs(now, digestSpan.since);
+  const digestAlerts = usePoll(`alerts:since:${span}`, (signal) => fetchAlertsSince(span, signal), 60_000);
 
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-page-canvas">
@@ -144,7 +154,10 @@ export function FleetView({
                 />
               }
             />
-            <DigestCard digest={digestToday(missions, alerts, now, agents ?? null)} />
+            <DigestCard
+              digest={digestSince(missions, digestAlerts.data ?? alerts, now, digestSpan.since, agents ?? null, digestSpan.away)}
+              back={away?.at ?? null}
+            />
             <button
               type="button"
               onClick={() => setDetailsOpen((value) => !value)}
@@ -193,6 +206,7 @@ export function FleetView({
         <AgentDetail
           key={selected.session_id}
           agent={selected}
+          name={names.get(selected.session_id) ?? null}
           onClose={() => onSelect(null)}
           onOpenTimeline={onOpenTimeline}
         />

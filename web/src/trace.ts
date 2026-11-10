@@ -14,7 +14,7 @@
  * becomes an orphan span, drawn as a zero-length mark at the end's time. */
 
 import type { TimelineEvent } from "./api";
-import { commandGist, commandHead } from "./commands.ts";
+import { commandHead, commandSummary } from "./commands.ts";
 
 export type SpanKind = "command" | "execution" | "turn" | "tool";
 
@@ -224,6 +224,8 @@ export function deriveTrace(
   const pendingTools = new Pending<Span>();
   const earlyToolEnds = new Pending<TimelineEvent>();
   const pendingCommands = new Pending<Span>();
+  // Each command span's id, for what a key went ahead of.
+  const pendingIds = new Map<Span, string>();
   const earlyCommandEnds = new Pending<TimelineEvent>();
   const earlyExecutionEnds = new Map<string, TimelineEvent>();
 
@@ -307,8 +309,19 @@ export function deriveTrace(
         // In words when the commands endpoint knows it (§4.3).
         const known = commands.get(id);
         const span = open("command", known ? commandHead(known.principal, known.action) : `command ${id}`, event, null);
-        if (known) span.summary = commandGist(known.text);
+        if (known) span.summary = commandSummary(known.action, known.text);
+        // A key never waits for the turn (backlog P1): one sent while inputs
+        // still wait goes ahead of them, and the row says so.
+        if (known?.action === "key") {
+          const ahead = pendingCommands
+            .values()
+            .filter((pending) => commands.get(pendingIds.get(pending) ?? "")?.action === "input").length;
+          if (ahead > 0) {
+            span.summary = `${span.summary ?? "key"} · ahead of ${ahead} waiting input${ahead === 1 ? "" : "s"}`;
+          }
+        }
         commandSpan.set(id, span);
+        pendingIds.set(span, id);
         const early = earlyCommandEnds.shift(id);
         if (early) close(span, early);
         else pendingCommands.push(id, span);

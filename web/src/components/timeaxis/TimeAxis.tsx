@@ -89,7 +89,8 @@ export function useBreaks(domain: Domain, plotW: number, fold: TimeFold): BreakM
     return fold.breaks
       .map((item) => ({
         x0: (item.at - domain.from) * k,
-        x1: (item.at + fold.keep - domain.from) * k,
+        // A gap is squeezed to min(gap, keep): its band is no wider.
+        x1: (item.at + Math.min(fold.keep, item.to - item.from) - domain.from) * k,
         label: breakLabel(item),
         key: item.from,
       }))
@@ -111,7 +112,10 @@ export function BreakBands({ breaks, height }: { breaks: BreakMark[]; height: nu
             fill="var(--muted)"
             opacity={0.55}
           />
-          {[mark.x0, mark.x1].map((x, index) => (
+          {/* Dashed edges only where the band is wide enough to read as
+              one: a run of narrow breaks (a session's hours between
+              bursts) stays a quiet tint, not a field of dashes. */}
+          {(mark.x1 - mark.x0 >= 12 ? [mark.x0, mark.x1] : []).map((x, index) => (
             <line
               key={index}
               x1={x}
@@ -270,17 +274,21 @@ export function IconButton({
   label,
   onClick,
   active = false,
+  pressed,
   children,
 }: {
   label: string;
   onClick: () => void;
   active?: boolean;
+  /** For a toggle: its state, as aria-pressed. */
+  pressed?: boolean;
   children: ReactNode;
 }) {
   return (
     <button
       type="button"
       aria-label={label}
+      aria-pressed={pressed}
       title={label}
       onClick={onClick}
       className={cx(
@@ -294,7 +302,16 @@ export function IconButton({
 }
 
 /** −, + and fit, with the gesture hint on wide screens. */
-export function ZoomControls({ view, fitLabel }: { view: TimeWindow; fitLabel: string }) {
+export function ZoomControls({
+  view,
+  fitLabel,
+  children,
+}: {
+  view: TimeWindow;
+  fitLabel: string;
+  /** More windows, beside the fit (the missions' Today). */
+  children?: ReactNode;
+}) {
   return (
     <div className="ml-auto flex shrink-0 items-center gap-1">
       <span className="mr-2 hidden text-caption text-faint-foreground 2xl:inline">
@@ -306,6 +323,7 @@ export function ZoomControls({ view, fitLabel }: { view: TimeWindow; fitLabel: s
       <IconButton label="Zoom in (+)" onClick={() => view.zoomBy(0.5)}>
         <Plus size={13} />
       </IconButton>
+      {children}
       <IconButton label={`${fitLabel} (0)`} onClick={view.fit} active={view.follow.mode === "fit"}>
         <Maximize2 size={12} />
       </IconButton>

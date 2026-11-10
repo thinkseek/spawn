@@ -461,3 +461,155 @@ export function phaseAt(bar: TaskBar, at: number, now: number): Segment | null {
   }
   return null;
 }
+
+/** A row group that `splitEarlier` reads: a task's bar and its earlier
+ * attempts (ordering.ts TaskGroup over bars). */
+interface BarGroup {
+  item: TaskBar;
+  earlier: ReadonlyArray<{ item: TaskBar }>;
+}
+
+/** When a group's last bar ended, or null while any of its bars is open. */
+export function groupEnd(group: BarGroup): number | null {
+  let end = group.item.end;
+  if (end === null) return null;
+  for (const attempt of group.earlier) {
+    if (attempt.item.end === null) return null;
+    end = Math.max(end, attempt.item.end);
+  }
+  return end;
+}
+
+/**
+ * Backlog P10: a section's groups split at the window's left edge `cut`.
+ * Under a window that starts after them (Today, a zoom), groups whose every
+ * bar ended before `cut` show no bar, so the timeline folds them into one
+ * "N ended before" row. A group stays when `keep` says so (it holds the
+ * selected task), and an open group always stays. `cut` null splits
+ * nothing (the window reaches back to the first task). `last` is when the
+ * latest of the earlier groups ended.
+ */
+export function splitEarlier<G extends BarGroup>(
+  groups: readonly G[],
+  cut: number | null,
+  keep: (group: G) => boolean,
+): { current: G[]; earlier: G[]; last: number | null } {
+  const current: G[] = [];
+  const earlier: G[] = [];
+  let last: number | null = null;
+  for (const group of groups) {
+    const end = groupEnd(group);
+    if (cut !== null && end !== null && end < cut && !keep(group)) {
+      earlier.push(group);
+      last = last === null ? end : Math.max(last, end);
+    } else current.push(group);
+  }
+  return { current, earlier, last };
+}
+
+/** The folded row's words: "3 tasks ended before 18:00", with the weekday
+ * when the edge is not on `now`'s day ("before Mon 18:00"). */
+export function earlierLabel(count: number, cut: number, now: number): string {
+  const edge = new Date(cut);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const clock = `${pad(edge.getHours())}:${pad(edge.getMinutes())}`;
+  const sameDay = edge.toDateString() === new Date(now).toDateString();
+  const day = sameDay ? "" : `${edge.toLocaleDateString("en", { weekday: "short" })} `;
+  return `${count} task${count === 1 ? "" : "s"} ended before ${day}${clock}`;
+}
+
+/** A mission's day, for its header (design §2.3): what is in flight, what
+ * landed in the last `day`, and the latest send-back in it with its reason. */
+export interface LaneToday {
+  inFlight: number;
+  landed: number;
+  lastBack: (VerdictMark & { task: string }) | null;
+}
+
+export const LANE_DAY_MS = 24 * 3_600_000;
+
+export function laneToday(lane: Pick<Lane, "bars">, now: number, day = LANE_DAY_MS): LaneToday {
+  const since = now - day;
+  let inFlight = 0;
+  let landed = 0;
+  let lastBack: LaneToday["lastBack"] = null;
+  for (const bar of lane.bars) {
+    if (bar.outcome === "open") inFlight += 1;
+    if ((bar.outcome === "landed" || bar.outcome === "accepted") && bar.end !== null && bar.end >= since) landed += 1;
+    for (const verdict of bar.verdicts) {
+      if (!verdict.sentBack || verdict.at < since) continue;
+      if (!lastBack || verdict.at > lastBack.at) lastBack = { ...verdict, task: bar.label };
+    }
+  }
+  return { inFlight, landed, lastBack };
+}
+
+/** The most of a send-back's reason a header line shows (the rest is in
+ * its title and the task's panel). */
+const REASON_CHARS = 100;
+
+/** "5 min", "3 h", "2 d": an age a header line can hold. */
+function shortAge(ms: number): string {
+  const minutes = Math.max(0, Math.round(ms / 60_000));
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.round(minutes / 60);
+  return hours < 48 ? `${hours} h` : `${Math.round(hours / 24)} d`;
+}
+
+/** The header line: "3 in flight · 13 landed in 24 h · last rejected 2 h ago
+ * (T221): 051.sh fails on the candidate"; a quiet mission's says so. */
+export function laneTodayText(today: LaneToday, now: number): string {
+  const parts: string[] = [];
+  if (today.inFlight > 0) parts.push(`${today.inFlight} in flight`);
+  parts.push(today.landed > 0 ? `${today.landed} landed in 24 h` : "nothing landed in 24 h");
+  if (today.lastBack) {
+    const back = today.lastBack;
+    // Its first line, clipped: a gate's reason can run to a whole log.
+    const first = back.reason?.split("\n")[0].trim() ?? "";
+    const why = first ? `: ${first.length > REASON_CHARS ? `${first.slice(0, REASON_CHARS - 1).trimEnd()}…` : first}` : "";
+    parts.push(`last ${back.verdict} ${shortAge(now - back.at)} ago (${back.task})${why}`);
+  }
+  return parts.join(" · ");
+}
+
+/** The lifetime totals, which the header's title holds. */
+export function laneLifetimeText(counts: LaneCounts): string {
+  return [
+    `${counts.total} task${counts.total === 1 ? "" : "s"} in all`,
+    counts.landed > 0 ? `${counts.landed} landed` : null,
+    counts.open > 0 ? `${counts.open} open` : null,
+    counts.sentBack > 0 ? `${counts.sentBack} sent back` : null,
+    counts.cancelled > 0 ? `${counts.cancelled} cancelled` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+/** A held source on its mission's header: "source held · expires in 2 h ·
+ * 1 task waiting". */
+export function holdText(hold: { expires_ms: number | null; waiting: readonly number[] }, now: number): string {
+  const parts = ["source held"];
+  if (hold.expires_ms !== null) {
+    parts.push(hold.expires_ms <= now ? "expired" : `expires in ${shortAge(hold.expires_ms - now)}`);
+  }
+  if (hold.waiting.length > 0) parts.push(`${hold.waiting.length} task${hold.waiting.length === 1 ? "" : "s"} waiting`);
+  return parts.join(" · ");
+}
+
+/** A held source's title: its line, its reason, who took it and when, and
+ * the main it was taken at (what the removed held-sources card showed). */
+export function holdTitle(
+  hold: { expires_ms: number | null; waiting: readonly number[]; reason: string | null; by: string | null; held_at_ms: number | null; main: string | null },
+  now: number,
+): string {
+  const lines = [holdText(hold, now)];
+  if (hold.reason) lines.push(hold.reason);
+  const taken = [
+    hold.by ? `taken by ${hold.by}` : "taken",
+    hold.held_at_ms !== null ? `${shortAge(Math.max(0, now - hold.held_at_ms))} ago` : null,
+    hold.main ? `at main ${hold.main.slice(0, 12)}` : null,
+  ].filter(Boolean);
+  if (taken.length > 1) lines.push(taken.join(" "));
+  if (hold.waiting.length > 0) lines.push(`waiting: ${hold.waiting.map((task) => `T${task}`).join(", ")}`);
+  return lines.join("\n");
+}

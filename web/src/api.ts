@@ -433,9 +433,29 @@ export async function postInput(
   body: Record<string, unknown>,
   signal?: AbortSignal,
 ): Promise<{ status: number | null; body: unknown }> {
+  return postWrite(sessionId, "input", body, signal);
+}
+
+/** `POST /api/session/<id>/key` with `{name, key}`: a person's named key
+ * (backlog P1), a command of its own, with the input's guards. 409 when the
+ * session runs no execution, with the reason. */
+export async function postKey(
+  sessionId: string,
+  body: { name: string; key: string },
+  signal?: AbortSignal,
+): Promise<{ status: number | null; body: unknown }> {
+  return postWrite(sessionId, "key", body, signal);
+}
+
+async function postWrite(
+  sessionId: string,
+  path: "input" | "key",
+  body: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<{ status: number | null; body: unknown }> {
   let response: Response;
   try {
-    response = await fetch(`/api/session/${encodeURIComponent(sessionId)}/input`, {
+    response = await fetch(`/api/session/${encodeURIComponent(sessionId)}/${path}`, {
       method: "POST",
       signal,
       cache: "no-store",
@@ -459,6 +479,12 @@ export async function postInput(
  * array `spawn alerts --once --json` answers. */
 export async function fetchAlerts(signal: AbortSignal): Promise<Alert[]> {
   return readApi("/api/alerts", signal, normalizeAlerts);
+}
+
+/** The same, over the last `spanMs` (the server's window is 24 h unless
+ * asked): home's digest reads as far back as the reader was away. */
+export async function fetchAlertsSince(spanMs: number, signal: AbortSignal): Promise<Alert[]> {
+  return readApi(`/api/alerts?since=${Math.max(1, Math.round(spanMs))}`, signal, normalizeAlerts);
 }
 
 export async function fetchSession(

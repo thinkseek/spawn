@@ -44,7 +44,9 @@
 #   (4) model: the model answers a worker 529 for 10 s: cause
 #       `model_unavailable` (evidence: status 529), path `wait`; the j-th
 #       failure in a row due no sooner than 2 x 2^(j-1) s (at most 8 s, the
-#       cap of 4 x the base) after its record
+#       cap of 4 x the base) after the failed turn it records (its
+#       evidence's event: the backoff runs from the failure, not from when
+#       the loop got round to writing the record)
 #       (each failed retry a record of its own, each retry sent by its key,
 #       not before it is due); at most 4 requests in the 10 s; an
 #       `execution.cleared`; the same native session works again within
@@ -1039,6 +1041,12 @@ else
         measured_fail "(4) $agent's interruption is not model_unavailable, path wait, status 529: $json"
     # The j-th failure in a row is retried after the backoff (2 s, doubled
     # per failed retry, at most 4 x 2 s), by the command its attempt names.
+    # The backoff runs from the failed turn the record names (its evidence's
+    # event_id), as recover.rs computes due_ms: the failure's time, or the
+    # pass's clock if later, plus the backoff. The record itself is written
+    # later in that pass, how much later depends on the host's load (0.3 s
+    # and 3.3 s seen at load 15 to 28), so measuring from the record's own
+    # time failed correct backoffs under load (owner gate, batch 18).
     j=0
     while IFS='|' read -r at body; do
         [ -n "$at" ] || continue
@@ -1048,8 +1056,18 @@ else
         due=$(printf '%s' "$body" | jq -r '.due_ms // 0')
         step=$((1 << (j - 1)))
         [ "$step" -le 4 ] || step=4
-        [ "$due" -ge $((at + 1800 * step)) ] ||
-            measured_fail "(4) $agent's retry $j is due $(secs $((due - at))) s after its record; the backoff is $((2 * step)) s"
+        turn=$(printf '%s' "$body" | jq -r '.evidence.event_id // empty')
+        case "$turn" in
+        '' | *[!0-9]*) turn_at="" ;;
+        *) turn_at=$(sql "select recorded_at_ms from spawn_events
+                             where id = $turn and event_name = 'turn.failed'") ;;
+        esac
+        if [ -z "$turn_at" ]; then
+            measured_fail "(4) $agent's retry $j names no turn.failed as its evidence: $body"
+        else
+            [ "$due" -ge $((turn_at + 2000 * step)) ] ||
+                measured_fail "(4) $agent's retry $j is due $(secs $((due - turn_at))) s after its failed turn (event $turn); the backoff is $((2 * step)) s"
+        fi
         sent=$(revival_key "$session" "$exec" "$k")
         if [ -n "$sent" ]; then
             [ "$(printf '%s' "$sent" | cut -d'|' -f3)" -ge $((due - 500)) ] ||

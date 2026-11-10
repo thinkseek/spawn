@@ -596,6 +596,42 @@ test("command rows say who sent what; same-sender runs fold, a command that star
   );
 });
 
+test("a key row says who pressed which key, and that it went ahead of the inputs still waiting", () => {
+  const commands = new Map([
+    ["1", { principal: "human", action: "input", text: "please rebase" }],
+    ["2", { principal: "human", action: "key", text: "escape" }],
+    ["3", { principal: "spawn_supervisor", action: "key", text: "down" }],
+  ]);
+  const trace = deriveTrace(
+    timeline([
+      // The input waits for the turn (accepted, not finished)…
+      ["command.accepted", 1, { command_id: 1 }, "cli", null],
+      // …and the person's Esc, sent after it, is pressed at once.
+      ["command.accepted", 2, { command_id: 2 }, "cli", null],
+      ["command.finished", 2.2, { command_id: 2, succeeded: true }, "cli", null],
+      ["command.finished", 4, { command_id: 1, succeeded: true }, "cli", null],
+      // The supervisor's key, with nothing waiting.
+      ["command.accepted", 5, { command_id: 3 }, "cli", null],
+      ["command.finished", 5.2, { command_id: 3, succeeded: true }, "cli", null],
+    ]),
+    T0 + 20_000,
+    [],
+    commands,
+  );
+  const rows = foldRuns(visibleSpans(trace, new Set()), new Set());
+  assert.deepEqual(
+    rows.map((row) => rowText(row.span, trace)),
+    [
+      "You → input · please rebase",
+      "You → key · Esc · ahead of 1 waiting input",
+      "Supervisor → key · ↓",
+    ],
+  );
+  // The order is on the axis too: the key's bar ends inside the input's.
+  const [input, esc] = [rows[0].span, rows[1].span];
+  assert.ok(esc.start > input.start && (esc.end ?? 0) < (input.end ?? 0));
+});
+
 test("a turn row counts its tools", () => {
   const trace = deriveTrace(
     timeline([
