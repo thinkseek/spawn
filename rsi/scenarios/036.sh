@@ -15,7 +15,10 @@
 # deploy/ is protected, so it is the base's), as it is once the runner-env
 # change has landed; the scenario copies it, with deploy/gate-runner/, into
 # its own controller tree and installs a fake runner with its setup.sh, as
-# deploy/test-gate-runner.sh does. A tree without it is exit 2.
+# deploy/test-gate-runner.sh does. A tree without it cannot shadow: exit 1,
+# unsolved (the base of the owner gate that lands the runner-env change with
+# this objective is such a tree; deploy/ is protected, so no task candidate
+# can remove it once landed).
 #
 # Required: with SPAWN_GATE_SHADOW_RUNNER set (the runner's name for the
 # transport) and deploy/gate-runner.sh present in the controller (the
@@ -101,7 +104,10 @@ controller=$(cd "$(dirname "$0")/../.." && pwd)
 # base's: the dispatcher as the runner-env change put it there.
 tree=$(pwd)
 for file in deploy/gate-runner.sh deploy/gate-runner/remote.sh deploy/gate-runner/setup.sh; do
-    [ -f "$tree/$file" ] || harness "no $file in the tree under judgement ($tree): no gate runner to shadow on (the runner-env change is not in it)"
+    if [ ! -f "$tree/$file" ]; then
+        echo "036: FAIL: no $file in the tree under judgement ($tree): no gate runner to shadow on (the runner-env change is not in it)" >&2
+        exit 1
+    fi
 done
 pg_bin=$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -n 1)
 [ -n "$pg_bin" ] && [ -x "$pg_bin/postgres" ] ||
