@@ -20,7 +20,7 @@ use crate::id::{
 };
 use crate::port::{
     ArchiveError, BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch, ForkFrom, Hold,
-    Launch, READ_LIMIT, Runner, StoreError, TerminalError, TerminalHost, TranscriptArchive,
+    Launch, READ_LIMIT, Runner, ServerSeen, StoreError, TerminalError, TerminalHost, TranscriptArchive,
     WatchError, WorkspaceError, WorkspaceStore,
 };
 use crate::time::{Clock, Timestamp};
@@ -89,6 +89,9 @@ struct State {
     /// all fail, as a record the log can never take would.
     branch_records_refused: HashSet<SessionId>,
     terminals: HashSet<TerminalName>,
+    /// What [`TerminalHost::server`] answers; unset, a host that cannot
+    /// tell ([`MemoryStore::set_terminal_server`]).
+    terminal_server: Option<ServerSeen>,
     /// Terminals that are there but host no runner ([`MemoryStore::untrack`]),
     /// with what the host saw.
     untracked: HashMap<TerminalName, String>,
@@ -213,6 +216,12 @@ impl MemoryStore {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// What the terminal server answers from now on
+    /// ([`TerminalHost::server`]). Test helper.
+    pub fn set_terminal_server(&self, seen: ServerSeen) {
+        self.lock().terminal_server = Some(seen);
     }
 
     /// Replace the visible pane of a terminal. Test helper.
@@ -765,6 +774,12 @@ fn base_commit() -> CommitId {
 }
 
 impl TerminalHost for MemoryStore {
+    fn server(&self) -> ServerSeen {
+        self.lock()
+            .terminal_server
+            .unwrap_or(ServerSeen::Answers(None))
+    }
+
     fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
         let mut state = self.lock();
         if state.terminals.contains(&launch.terminal) {
