@@ -1146,7 +1146,14 @@ on conflict (principal, agent_id) do nothing;
 -- the session's turn (crates/spawn-core/src/bridge.rs). The agent is the one
 -- the session belongs to (`spawn_agent_sessions`): the caller cannot pair a
 -- session with another agent. Returns the command, or null when no agent
--- has used the session. Only the `spawn_human` login may call it, and it may
+-- has used the session. An input needs a running engine (objective 040): a
+-- session with no live execution (it never ran one, or its latest ended) is
+-- refused here with the reason (SQLSTATE 55000, which the page answers 409),
+-- and records no command, so the person learns at once that it went nowhere;
+-- a repeated key returns its first command even if the session stopped
+-- since. (`spawn submit` is unchanged: it records the command, and the
+-- Bridge fails it with the same reason.) Only the `spawn_human` login may
+-- call it, and it may
 -- call nothing else: it reads nothing (no grant), appends no event, and
 -- submits no other action and as no other principal. The text is what a
 -- person types: not blank, at most 8192 bytes (serve.rs `MAX_INPUT_TEXT`),
@@ -1156,6 +1163,7 @@ create or replace function spawn_human_input(p_session text, p_key text, p_text 
 returns bigint language plpgsql security definer as $$
 declare
     v_agent text;
+    v_first bigint;
 begin
     if spawn_principal() is distinct from 'human' then
         raise exception '% may not type as a person (only the spawn_human login does)',
@@ -1179,6 +1187,15 @@ begin
     select s.agent_id into v_agent from spawn_agent_sessions s where s.session_id = p_session;
     if v_agent is null then
         return null;
+    end if;
+    select c.id into v_first from spawn_commands c
+     where c.principal = 'human' and c.idempotency_key = p_key;
+    if v_first is not null then
+        return v_first;
+    end if;
+    if not exists (select 1 from agent_status a where a.session_id = p_session and a.live) then
+        raise exception '% runs no execution: an input needs a running engine; resume the session',
+            p_session using errcode = '55000';
     end if;
     return (select s.out_id
               from spawn_submit('human', p_key, v_agent, p_session,
