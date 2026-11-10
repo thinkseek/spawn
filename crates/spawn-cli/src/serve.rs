@@ -125,6 +125,9 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
             .unwrap_or_else(|| env_or("SPAWN_WEB_DIR", "web/dist")),
     );
     let token = access_token(&address, env_value("SPAWN_SERVE_TOKEN"))?;
+    // The loop records costs at these prices; a page served beside a setting
+    // that cannot be read would show figures nobody can trust, so it stops.
+    crate::cost::Prices::from_env()?;
     let open = open_networks(env_value("SPAWN_SERVE_OPEN_NETWORKS").as_deref())?;
     let server = Server::http(&address).map_err(|error| format!("listen {address}: {error}"))?;
     let guard = match (&token, open.is_empty()) {
@@ -716,6 +719,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/events" => Box::new(move || events(query)),
         "/api/scorecard" => Box::new(move || scorecard(query)),
         "/api/alerts" => Box::new(move || alerts(query)),
+        "/api/cost" => Box::new(move || cost(query)),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
                 Box::new(move || session(id, query))
@@ -1784,6 +1788,20 @@ fn alerts(query: &str) -> Result<Value, String> {
         .map(|text| percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad since {text}")))
         .transpose()?;
     crate::alerts::window(&store, since.as_deref())
+}
+
+/// `/api/cost?window=24h|7d` (24h when absent; any other window is the
+/// caller's mistake, 400): what the model calls timed in [now minus the
+/// window, now) cost, per model, mission, task, agent and execution
+/// (crate::cost), read through the reader login.
+fn cost(query: &str) -> Result<Value, String> {
+    let asked = parameter(query, "window")
+        .map(|text| percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad window {text}")))
+        .transpose()?;
+    let (name, length_ms) =
+        crate::cost::window_of(asked.as_deref()).map_err(|error| format!("{BAD_REQUEST}{error}"))?;
+    let store = open_store()?;
+    crate::cost::window(&store, name, length_ms)
 }
 
 /// A query parameter's value with its `%XX` escapes decoded (a `+` stays a
