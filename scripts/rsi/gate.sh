@@ -321,6 +321,13 @@ repo=$1
 baseline=$2
 candidate=$3
 scenarios=$4
+# Without its trailing slashes ("dir/", as a hand run may type it): every
+# scenario's path below is "$scenarios"/<name>, and the main-red index is
+# written only for a scenario whose dirname is $scenarios, which "dir//071.sh"
+# (dirname "dir") never was, so red never fired on such a run.
+while [ "${#scenarios}" -gt 1 ] && [ "${scenarios%/}" != "$scenarios" ]; do
+    scenarios=${scenarios%/}
+done
 scenario=${5-}
 
 if ! command -v bwrap >/dev/null 2>&1; then
