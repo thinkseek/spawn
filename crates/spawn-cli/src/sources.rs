@@ -21,7 +21,8 @@
 //! ([`crate::push::shared`]). Its queue is in memory: a process that ends
 //! cleanly pushes what waits ([`Drop`] of the store the Bridge runs on), a
 //! new one queues again the branch of every agent with an open task
-//! ([`MissionWorkspaces::republish`]), and the integrator pushes again a
+//! ([`MissionWorkspaces::republish`]; a source that is away then is queued
+//! too and retried until it is back), and the integrator pushes again a
 //! branch whose recorded checkpoint the source still lacks
 //! ([`push_recorded`]), so a push lost with a killed process is made after
 //! the restart. A one-shot store (a merge of main, a set-aside;
@@ -384,7 +385,11 @@ pub(crate) fn ensure_mirror(root: &Path, source: Option<&str>) -> Result<PathBuf
 /// Queue a push of each `(agent, source)` branch that this host's mirror
 /// of a source receiving branches holds, on `pusher_of(source)`. A branch
 /// the source already has is pushed as a no-op; one it lacks, or has
-/// behind, is published. Returns how many were queued.
+/// behind, is published. A source that is not there now ([`host_directory`])
+/// is queued too: this runs once, so a source left out here would stay
+/// without its branches until the next restart, and the pusher retries a
+/// failed push, at most every five minutes, until the source is back.
+/// Returns how many were queued.
 fn republish(
     root: &Path,
     agents: &[(String, Option<String>)],
@@ -392,7 +397,7 @@ fn republish(
 ) -> usize {
     let mut queued = 0;
     for (agent, source) in agents {
-        let Some(source) = source.as_deref().filter(|source| receives_branches(source)) else {
+        let Some(source) = source.as_deref().filter(|source| host_directory(source)) else {
             continue;
         };
         let mirror = root.join(".sources").join(mirror_name(source));
@@ -488,6 +493,16 @@ fn has_branch(repo: &Path, branch: &str) -> bool {
 pub(crate) fn receives_branches(source: &str) -> bool {
     let path = Path::new(source);
     !source.contains("://") && path.is_absolute() && path.is_dir()
+}
+
+/// Whether `source` is the kind that receives branches, there now or not:
+/// a path on this host that is a directory or, for now, nothing (a volume
+/// not mounted, a directory being moved). Its branches are still owed: a
+/// push queued for it fails and is retried with the pusher's growing pause
+/// until the source is back ([`crate::push`]).
+fn host_directory(source: &str) -> bool {
+    let path = Path::new(source);
+    !source.contains("://") && path.is_absolute() && (path.is_dir() || !path.exists())
 }
 
 /// The source's `spawn/<agent>` (what this host's pusher published), fetched
@@ -816,6 +831,89 @@ mod tests {
             fetch_pushed_into(&mirror, &source, "agent_x", landing).expect("fetched"),
             Some(head)
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// GitHub #16 item 6: a source that is away when the process starts (an
+    /// unmounted volume) is still owed its branches. They are queued, the
+    /// pusher's failed pushes wait their pause, and the push is made once
+    /// the source is back, with no restart.
+    #[test]
+    fn a_source_away_at_the_restart_is_published_when_it_is_back() {
+        let base = std::env::temp_dir().join(format!("spawn-sources-away-{}", std::process::id()));
+        let (source, mirror, host) = published_source(&base);
+        let root = base.join("host");
+        let landing = "refs/spawn-integrate/agent_x";
+        // A checkpoint the killed process never pushed, and the source gone.
+        let head = checkpoint(&host, "agent_x", "two.txt");
+        let away = format!("{source}.away");
+        std::fs::rename(&source, &away).expect("the source goes away");
+        assert!(!receives_branches(&source), "not there now");
+
+        // The next process: every push it makes is told to the test.
+        let (told, results) = std::sync::mpsc::channel();
+        let told = std::sync::Mutex::new(told);
+        let pusher = std::sync::Arc::new(Pusher::with(
+            Box::new(move |mirror, source, branch| {
+                let pushed = crate::push::push_branch(mirror, source, branch);
+                let _ = told
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .send(pushed.clone());
+                pushed
+            }),
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(20),
+        ));
+        let agents = [("agent_x".to_string(), Some(source.clone()))];
+        assert_eq!(
+            super::republish(&root, &agents, |_| std::sync::Arc::clone(&pusher)),
+            1,
+            "queued though the source is away"
+        );
+        let limit = std::time::Duration::from_mins(1);
+        assert!(
+            matches!(results.recv_timeout(limit), Ok(Pushed::Failed(_))),
+            "the push fails while the source is away"
+        );
+        assert!(pusher.waiting(&mirror, "agent_x"), "and waits its retry");
+
+        std::fs::rename(&away, &source).expect("the source is back");
+        assert!(
+            pusher.settled(&mirror, "agent_x", limit),
+            "retried until done"
+        );
+        assert_eq!(
+            fetch_pushed_into(&mirror, &source, "agent_x", landing).expect("fetched"),
+            Some(head)
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// What is queued at a restart: a path on this host, there or not, and
+    /// nothing else.
+    #[test]
+    fn a_restart_queues_only_a_host_path_that_is_a_directory_or_missing() {
+        let base = std::env::temp_dir().join(format!("spawn-sources-kind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("directory");
+        let file = base.join("source.bundle");
+        std::fs::write(&file, "not a directory").expect("write");
+        assert!(super::host_directory(&base.to_string_lossy()));
+        assert!(super::host_directory(
+            &base.join("unmounted.git").to_string_lossy()
+        ));
+        assert!(
+            !super::host_directory(&file.to_string_lossy()),
+            "a file never receives branches"
+        );
+        assert!(!super::host_directory("https://github.com/acme/widget.git"));
+        assert!(!super::host_directory("git@github.com:acme/widget.git"));
+        assert!(!super::host_directory(
+            "ssh://git@github.com/acme/widget.git"
+        ));
+        assert!(!super::host_directory("file:///srv/widget.git"));
+        assert!(!super::host_directory("relative/dir"));
         let _ = std::fs::remove_dir_all(&base);
     }
 
