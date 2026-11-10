@@ -1031,31 +1031,54 @@ function useAgentKeys(
  * then session id), which its title shows. The summary below shows the
  * session id in full. */
 function CopyIds({ agentId, sessionId }: { agentId: string; sessionId: string }) {
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState<"copied" | "failed" | null>(null);
   const ids = [agentId, sessionId].filter(Boolean).join(" ");
   return (
     <span className="inline-flex shrink-0 items-center">
       <button
         type="button"
         onClick={() => {
-          void navigator.clipboard?.writeText(ids).then(
-            () => {
-              setCopied(true);
-              window.setTimeout(() => setCopied(false), 1_500);
-            },
-            () => setCopied(false),
-          );
+          const show = (state: "copied" | "failed") => {
+            setCopied(state);
+            window.setTimeout(() => setCopied(null), 1_500);
+          };
+          // The clipboard API needs a secure context (https or localhost);
+          // over plain http the older copy command is tried, and a failure
+          // says so.
+          if (navigator.clipboard) {
+            void navigator.clipboard.writeText(ids).then(() => show("copied"), () => show("failed"));
+          } else show(copyByCommand(ids) ? "copied" : "failed");
         }}
-        title={`Copy the ids: ${ids}`}
+        title={copied === "failed" ? `Could not copy; select them: ${ids}` : `Copy the ids: ${ids}`}
         aria-label="Copy the agent and session ids"
         className={cx(
           "inline-flex h-6 shrink-0 items-center gap-1 rounded-chip px-1 text-micro text-faint-foreground hover:bg-surface-hover hover:text-foreground",
           FOCUS_RING,
         )}
       >
-        {copied ? <Check size={11} aria-hidden="true" /> : <Copy size={11} aria-hidden="true" />}
-        {copied ? <span>Copied</span> : null}
+        {copied === "copied" ? <Check size={11} aria-hidden="true" /> : <Copy size={11} aria-hidden="true" />}
+        {copied === "copied" ? <span>Copied</span> : copied === "failed" ? <span className="text-destructive">Not copied</span> : null}
       </button>
     </span>
   );
+}
+
+/** Copy text without the clipboard API (plain http): a hidden textarea and
+ * the copy command. Whether it worked. */
+function copyByCommand(text: string): boolean {
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "");
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  let done = false;
+  try {
+    done = document.execCommand("copy");
+  } catch {
+    done = false;
+  }
+  area.remove();
+  return done;
 }

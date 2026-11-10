@@ -119,24 +119,32 @@ export interface PagePress {
   inText: boolean;
   /** Focus is on an armed terminal panel (P11): its keys are the agent's. */
   armed: boolean;
+  /** A modal dialog is open (the agent drawer, aria-modal): the search sits
+   * under its backdrop, so focus must not leave the dialog for it. */
+  modal: boolean;
 }
 
 /** "/" focuses the sidebar's search (one name, design §4.5), unless the
- * reader is typing (a text box) or the terminal panel is armed, and never
- * with a modifier (the browser's and the page's shortcuts). */
+ * reader is typing (a text box), the terminal panel is armed, or a modal
+ * dialog is open (the search is under its backdrop), and never with a
+ * modifier (the browser's and the page's shortcuts). */
 export function slashFocusesSearch(press: PagePress): boolean {
   if (press.key !== "/") return false;
   if (press.ctrlKey || press.altKey || press.metaKey) return false;
-  return !press.inText && !press.armed;
+  return !press.inText && !press.armed && !press.modal;
 }
 
-/** Where focus is, as `slashFocusesSearch` reads it. */
-export function focusOf(element: Element | null): { inText: boolean; armed: boolean } {
-  if (!element) return { inText: false, armed: false };
+/** Where focus is, and whether a modal dialog is open, as
+ * `slashFocusesSearch` reads them. */
+export function focusOf(element: Element | null, page: Pick<Document, "querySelector"> = document): { inText: boolean; armed: boolean; modal: boolean } {
+  // Any open modal counts, wherever focus is (it can rest on the body).
+  const modal = page.querySelector('[aria-modal="true"]') !== null;
+  if (!element) return { inText: false, armed: false, modal };
   const tag = element.tagName;
   const editable = (element as HTMLElement).isContentEditable === true;
   return {
     inText: tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || editable,
     armed: element.closest('[data-keys="armed"]') !== null,
+    modal,
   };
 }

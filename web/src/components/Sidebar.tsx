@@ -355,7 +355,8 @@ function GroupedSessions({
                         sessionId={agent.session_id}
                         agentId={agent.agent_id}
                         name={nameOf(agent)}
-                        line={named?.title ?? agent.task_title}
+                        // A task it no longer holds is its last one, and says so.
+                        line={named && named !== held ? (named.title ? `last: ${named.title}` : null) : (named?.title ?? agent.task_title)}
                         state={recorded.dot}
                         // Ended outside the Ended group is news: the
                         // recorded label says it ("Ended").
