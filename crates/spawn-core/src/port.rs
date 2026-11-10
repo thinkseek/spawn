@@ -718,4 +718,18 @@ pub trait TranscriptArchive: Send + Sync {
         at: u64,
         bytes: &[u8],
     ) -> Result<(), ArchiveError>;
+
+    /// Record where the archive stands with one native session
+    /// ([`crate::transcripts::ArchiveProgress`]), in place of what was
+    /// recorded for it before; `durable` makes it survive a crash of the
+    /// host (an ended execution's, which is not written again).
+    fn put_progress(
+        &self,
+        progress: &crate::transcripts::ArchiveProgress,
+        durable: bool,
+    ) -> Result<(), ArchiveError>;
+
+    /// Every native session's latest [`Self::put_progress`]. One that
+    /// cannot be read is left out.
+    fn progress(&self) -> Result<Vec<crate::transcripts::ArchiveProgress>, ArchiveError>;
 }
