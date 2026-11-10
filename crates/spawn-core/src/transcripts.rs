@@ -199,19 +199,14 @@ pub fn first_line_ms(
         // The line began before what was read: its time is not known.
         None => return Ok(Some(i64::MIN)),
     };
-    let mut lines = bytes[from..].split(|byte| *byte == b'\n');
-    // The line `offset` falls in, if it began before: read whole or not
-    // at all, it decides.
-    let at = lines
-        .by_ref()
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            serde_json::from_slice::<serde_json::Value>(line)
-                .ok()
-                .and_then(|line| line.get("timestamp")?.as_str().and_then(parse_rfc3339_ms))
-        })
-        .find(Option::is_some)
-        .flatten();
+    // From the start of the line `offset` falls in, if it began before.
+    let at = bytes[from..].split(|byte| *byte == b'\n').find_map(|line| {
+        serde_json::from_slice::<serde_json::Value>(line)
+            .ok()?
+            .get("timestamp")?
+            .as_str()
+            .and_then(parse_rfc3339_ms)
+    });
     Ok(Some(at.unwrap_or(i64::MIN)))
 }
 
