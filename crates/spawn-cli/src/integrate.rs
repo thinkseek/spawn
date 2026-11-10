@@ -435,7 +435,9 @@ use crate::{Flags, env_or, open_store};
 use crate::{main_merge, objectives, sources};
 
 mod host;
+mod inputs;
 pub(crate) mod owner;
+mod shadow;
 mod warm;
 
 /// Rejections, or aborts, in a row that halt a mission.
@@ -1509,6 +1511,23 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         Ok(None) => println!("integrate: {WARM_ENV}=0: no base warm after a landing"),
         Err(error) => eprintln!("integrate: {error}; no base warm after a landing"),
     }
+    // The shadow judging on a gate runner (shadow.rs), when one is named;
+    // its directory is the integrator's own, beside the mirrors.
+    match shadow::settings(
+        crate::config::env_value(shadow::RUNNER_ENV).as_deref(),
+        crate::config::env_value(shadow::EVERY_ENV).as_deref(),
+    ) {
+        Ok(Some(settings)) => {
+            println!(
+                "integrate: judged verdicts are shadowed on {} (every {}-th)",
+                settings.runner, settings.every
+            );
+            let dir = integrator.judge.root.join(".shadow");
+            integrator = integrator.with_shadow(settings, dir);
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!("integrate: {error}; no shadow judging"),
+    }
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
@@ -1579,6 +1598,9 @@ struct Integrator {
     /// cache to the gates and the deploy (tests, and a warm directory that
     /// cannot be named).
     warms: RefCell<Option<warm::Warms>>,
+    /// The shadow judging of verdicts on a gate runner ([`shadow`]); None
+    /// when no runner is named (`SPAWN_GATE_SHADOW_RUNNER`).
+    shadows: RefCell<Option<shadow::Shadows>>,
     /// While a source's main is red, how long after the last red gate or
     /// probe one more gate on it runs anyway, a probe
     /// (`SPAWN_GATE_MAIN_RED_PROBE_MS`, [`main_red_probe_ms`]).
@@ -1624,6 +1646,10 @@ struct Judge {
     /// warm ([`Integrator::poll_warm`]): a thread cannot start the warm
     /// itself (its parent-death signal follows the thread that spawned it).
     landed: Arc<std::sync::Mutex<Vec<warm::Want>>>,
+    /// The verdicts the judging threads recorded that a runner may judge
+    /// again, for the main thread's shadow ([`Integrator::poll_shadow`]):
+    /// as for the warm, a thread cannot start it itself.
+    shadowed: Arc<std::sync::Mutex<Vec<shadow::Want>>>,
     /// The stop of the judging this clone runs (set on its thread's clone,
     /// [`Integrator::start_judging`]); None on the main thread's.
     stop: Option<Arc<Stop>>,
@@ -1896,6 +1922,7 @@ impl Integrator {
                 host: HostSettings::from_env(),
                 room: host_room,
                 landed: Arc::new(std::sync::Mutex::new(Vec::new())),
+                shadowed: Arc::new(std::sync::Mutex::new(Vec::new())),
                 stop: None,
             },
             gates,
@@ -1906,6 +1933,7 @@ impl Integrator {
             owner: RefCell::new(owner::Kept::default()),
             last_judged: RefCell::new(std::collections::HashMap::new()),
             warms: RefCell::new(None),
+            shadows: RefCell::new(None),
             red_probe_ms: main_red_probe_ms(
                 crate::config::env_value("SPAWN_GATE_MAIN_RED_PROBE_MS").as_deref(),
             ),
@@ -1984,6 +2012,50 @@ impl Integrator {
         warms.take_over();
         *self.warms.borrow_mut() = Some(warms);
         self
+    }
+
+    /// This integrator shadowing judged verdicts on a gate runner, its
+    /// scratch and pid file in `dir`; a shadow a predecessor left there is
+    /// stopped first ([`shadow::Shadows::take_over`]).
+    fn with_shadow(self, settings: shadow::Settings, dir: PathBuf) -> Self {
+        let shadows = shadow::Shadows::new(settings, dir);
+        shadows.take_over();
+        *self.shadows.borrow_mut() = Some(shadows);
+        self
+    }
+
+    /// The pass's shadow, after its gates were given out: the one that
+    /// ended is recorded (once: its directory is removed when the record is
+    /// written, and a record that could not be written is tried again at
+    /// the next pass), then the verdicts recorded since the last pass are
+    /// offered, in order (one runs at a time: the others are skipped).
+    /// Nothing here touches a task, a landing or a count.
+    fn poll_shadow(&self, store: &PostgresStore) {
+        let wanted: Vec<shadow::Want> = self
+            .judge
+            .shadowed
+            .lock()
+            .map(|mut wanted| wanted.drain(..).collect())
+            .unwrap_or_default();
+        let mut shadows = self.shadows.borrow_mut();
+        let Some(shadows) = shadows.as_mut() else {
+            return;
+        };
+        shadows.record_ended(|record| {
+            record(store, record)?;
+            println!(
+                "integrate: task {} shadowed on {}: {} (the primary's {}), agrees {}",
+                record["id"],
+                record["runner"].as_str().unwrap_or_default(),
+                record["verdict"].as_str().unwrap_or("no verdict"),
+                record["primary"].as_str().unwrap_or_default(),
+                record["agrees"]
+            );
+            Ok(())
+        });
+        for want in wanted {
+            shadows.offer(want);
+        }
     }
 
     /// Main of `source` is `commit` now: warm it for the gates that judge
@@ -2158,6 +2230,7 @@ impl Integrator {
         self.stop_for(&urgent);
         let steps = self.steps(store, &pending, &owner_moved, owner_judge);
         self.poll_warm();
+        self.poll_shadow(store);
         steps
     }
 
