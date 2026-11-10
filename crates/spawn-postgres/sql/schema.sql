@@ -4278,6 +4278,252 @@ insert into spawn_grants (principal, agent_id, scope) values
     ('spawn_supervisor', 'agent_resident_*', 'all')
 on conflict (principal, agent_id) do nothing;
 
+-- The experience views (docs/fleet-architecture.md §4): what the fleet
+-- decided, where the owner stepped in, how each task closed and what the
+-- dispatcher escalated, one row per item with its time (`at_ms`), all
+-- derived from the log and the command queue. `/api/scorecard/fleet` and
+-- `/api/fleet`'s ladder count them over a window (since <= at_ms < until);
+-- the scorecard's autonomy (docs/design.md §15) counts the same
+-- interventions and its throughput the same landings.
+
+-- The control stream, one row per record in stream order, with the numbers
+-- the views below read parsed once (a number or a numeric string, as the
+-- scorecard reads them; anything else is null). A `legacy.imported` row
+-- (from before the control stream) lends its row's fields.
+create or replace view spawn_control_stream as
+select e.session_seq as seq,
+       e.recorded_at_ms as at_ms,
+       x.r ->> 'type' as type,
+       case when x.r ->> 'type' = 'legacy.imported' then x.r ->> 'table' end as legacy_table,
+       case when n.id ~ '^\s*-?[0-9]{1,18}\s*$' then btrim(n.id, E' \t\r\n')::bigint end as id,
+       case when n.mission_id ~ '^\s*-?[0-9]{1,18}\s*$'
+            then btrim(n.mission_id, E' \t\r\n')::bigint end as mission_id,
+       case when n.objective ~ '^\s*-?[0-9]{1,18}\s*$'
+            then btrim(n.objective, E' \t\r\n')::bigint end as objective,
+       x.r as record
+  from spawn_events e
+ cross join lateral (select e.kind -> 'detail' -> 'record' as r offset 0) x
+ cross join lateral (
+   select case when jsonb_typeof(v.id) in ('number', 'string') then v.id #>> '{}' end as id,
+          case when jsonb_typeof(v.mission_id) in ('number', 'string')
+               then v.mission_id #>> '{}' end as mission_id,
+          case when jsonb_typeof(v.objective) in ('number', 'string')
+               then v.objective #>> '{}' end as objective
+     from (select coalesce(x.r -> 'id', x.r -> 'row' -> 'id') as id,
+                  coalesce(x.r -> 'mission_id', x.r -> 'row' -> 'mission_id') as mission_id,
+                  coalesce(x.r -> 'objective', x.r -> 'row' -> 'objective') as objective) v) n
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded';
+
+-- Each mission's settings as the stream sets them: a `mission.added` starts
+-- ungated and accepted by review, a `mission.configured` (or a legacy
+-- mission row) sets its gate and its `accept`. A record reads the latest
+-- one before it.
+create or replace view spawn_mission_settings as
+select c.seq,
+       c.at_ms,
+       c.id as mission_id,
+       c.type <> 'mission.added'
+         and coalesce(jsonb_typeof(coalesce(c.record -> 'gate', c.record -> 'row' -> 'gate'))
+                      <> 'null', false) as gated,
+       c.type = 'mission.added'
+         or coalesce(case when jsonb_typeof(a.accept) = 'string' then a.accept #>> '{}' end,
+                     'review') = 'review' as review
+  from spawn_control_stream c
+ cross join lateral (
+   select coalesce(c.record -> 'accept', c.record -> 'row' -> 'accept') as accept) a
+ where c.id is not null
+   and (c.type in ('mission.added', 'mission.configured')
+        or (c.type = 'legacy.imported' and c.legacy_table = 'mission_missions'));
+
+-- Each task from its assignment to its close: the first record that closes
+-- it after its assignment (`task.landed`; `task.reviewed` accepted on a
+-- mission without a gate then; `task.cancelled`; `task.aborted`;
+-- `task.over_budget`), or, for a legacy row closed before the stream, that
+-- row's close (no outcome). `closed_at_ms` is null while it is open.
+create or replace view spawn_task_spans as
+with
+  stream as materialized (
+    select c.seq, c.at_ms, c.type, c.legacy_table, c.id, c.mission_id, c.objective, c.record
+      from spawn_control_stream c
+     where c.id is not null
+       and (c.type in ('task.assigned', 'task.landed', 'task.reviewed', 'task.cancelled',
+                       'task.aborted', 'task.over_budget')
+            or (c.type = 'legacy.imported' and c.legacy_table = 'mission_tasks'))),
+  settings as materialized (select s.seq, s.mission_id, s.gated from spawn_mission_settings s),
+  assigned as (
+    select distinct on (c.id) c.id as task_id, c.mission_id, c.seq as assigned_seq,
+           case when c.type = 'legacy.imported'
+                     and jsonb_typeof(c.record -> 'row' -> 'created_at_ms') = 'number'
+                then (c.record -> 'row' ->> 'created_at_ms')::bigint
+                else c.at_ms end as assigned_at_ms,
+           c.type = 'legacy.imported' as legacy, c.record
+      from stream c
+     where c.mission_id is not null
+       and c.type in ('task.assigned', 'legacy.imported')
+     order by c.id, c.seq),
+  gated as (
+    select a.*, coalesce((select s.gated from settings s
+                           where s.mission_id = a.mission_id and s.seq < a.assigned_seq
+                           order by s.seq desc limit 1), false) as gated_then
+      from assigned a)
+select a.task_id,
+       a.mission_id,
+       a.assigned_seq,
+       a.assigned_at_ms,
+       k.seq as closed_seq,
+       k.at_ms as closed_at_ms,
+       k.outcome,
+       k.closed_by
+  from gated a
+  left join lateral (
+    select u.seq, u.at_ms, u.outcome, u.closed_by
+      from (
+        -- A legacy row closed when it was imported.
+        select a.assigned_seq as seq,
+               case when jsonb_typeof(a.record -> 'row' -> 'updated_at_ms') = 'number'
+                    then (a.record -> 'row' ->> 'updated_at_ms')::bigint end as at_ms,
+               null::text as outcome, null::text as closed_by
+         where a.legacy
+           and (a.record -> 'row' ->> 'state' in ('cancelled', 'landed')
+                or (a.record -> 'row' ->> 'state' = 'accepted' and not a.gated_then))
+        union all
+        select c.seq, c.at_ms,
+               case c.type when 'task.landed' then 'landed' when 'task.reviewed' then 'accepted'
+                           when 'task.cancelled' then 'cancelled'
+                           when 'task.aborted' then 'aborted'
+                           else 'over_budget' end,
+               case when jsonb_typeof(c.record -> 'by') = 'string' then c.record ->> 'by' end
+          from stream c
+         where c.id = a.task_id and c.seq > a.assigned_seq
+           and (c.type in ('task.landed', 'task.cancelled', 'task.aborted', 'task.over_budget')
+                or (c.type = 'task.reviewed'
+                    and c.record -> 'accepted' in ('true'::jsonb, '"true"'::jsonb, '"t"'::jsonb)
+                    and not coalesce((select s.gated from settings s
+                                       where s.mission_id = a.mission_id and s.seq < c.seq
+                                       order by s.seq desc limit 1), false)))) u
+     order by u.seq
+     limit 1) k on true;
+
+-- Every decision, at its time, by its tier on the ladder: each judgement
+-- (`rules` when the rules judged, else `model`) and each command at its
+-- creation, by its principal (`dispatcher`, `supervisor`, `human` for the
+-- board's and the CLI's, `liveness`; any other principal is its own tier).
+-- `source` says which (`judgement` or `command`), `actor` the judge or the
+-- principal.
+create or replace view spawn_decisions as
+select j.recorded_at_ms as at_ms,
+       case when j.observation ->> 'judge' = 'rules' then 'rules' else 'model' end as tier,
+       j.session_id,
+       j.agent_id,
+       'judgement'::text as source,
+       j.observation ->> 'judge' as actor,
+       j.event_id,
+       null::bigint as command_id
+  from agent_judgements j
+union all
+select c.created_at_ms,
+       case c.principal when 'spawn-dispatch' then 'dispatcher'
+                        when 'spawn_supervisor' then 'supervisor'
+                        when 'human' then 'human'
+                        when 'spawn' then 'human'
+                        when 'spawn-liveness' then 'liveness'
+                        else c.principal end,
+       c.session_id,
+       c.agent_id,
+       'command',
+       c.principal,
+       null,
+       c.id
+  from spawn_commands c;
+
+-- The owner's interventions (docs/design.md §15, autonomy): (a) a command
+-- of the board or the CLI (`human`, `spawn`) at its creation; (b) a
+-- `mission.resumed`; (c) an owner task, a `task.assigned` by `human` on a
+-- mission a review accepts then; (d) a cancel-and-reassign: a person's
+-- `task.cancelled` (`by` absent or `human`) of an open task, at the first
+-- later assignment in its mission of the same objective (or, without one,
+-- the same brief). A loop's cancellation is no intervention.
+create or replace view spawn_interventions as
+with
+  stream as materialized (
+    select c.seq, c.at_ms, c.type, c.id, c.mission_id, c.objective, c.record
+      from spawn_control_stream c
+     where c.id is not null and c.type in ('mission.resumed', 'task.assigned',
+                                           'task.cancelled', 'legacy.imported')),
+  settings as materialized (select s.seq, s.mission_id, s.review from spawn_mission_settings s)
+select c.created_at_ms as at_ms,
+       'command'::text as kind,
+       null::bigint as mission_id,
+       null::bigint as task_id,
+       c.id as command_id
+  from spawn_commands c
+ where c.principal in ('human', 'spawn')
+union all
+select r.at_ms, 'resume', r.id, null, null
+  from stream r
+ where r.type = 'mission.resumed'
+union all
+select a.at_ms, 'owner_task', a.mission_id, a.id, null
+  from stream a
+ where a.type = 'task.assigned' and a.mission_id is not null
+   and a.record -> 'created_by' = '"human"'::jsonb
+   and coalesce((select s.review from settings s
+                   where s.mission_id = a.mission_id and s.seq < a.seq
+                   order by s.seq desc limit 1), true)
+union all
+select n.at_ms, 'cancel_reassign', n.mission_id, n.id, null
+  from spawn_task_spans k
+  join stream x on x.seq = k.closed_seq and x.type = 'task.cancelled'
+  join stream o on o.seq = k.assigned_seq
+ cross join lateral (
+   select n.at_ms, n.mission_id, n.id
+     from stream n
+    where n.type = 'task.assigned' and n.seq > x.seq and n.mission_id = k.mission_id
+      and case when o.objective is not null then n.objective = o.objective
+               else coalesce(o.record ->> 'brief', o.record -> 'row' ->> 'brief') is not null
+                    and n.record ->> 'brief'
+                        = coalesce(o.record ->> 'brief', o.record -> 'row' ->> 'brief') end
+    order by n.seq
+    limit 1) n
+ where k.outcome = 'cancelled'
+   and (jsonb_typeof(x.record -> 'by') is distinct from 'string' or x.record ->> 'by' = 'human');
+
+-- How each task closed, at its closing record: `landed`, `accepted` (by
+-- review, on a mission without a gate), `cancelled` (`by` who), `aborted`
+-- or `over_budget`. A landing as the scorecard's throughput counts it is a
+-- `landed` or an `accepted`.
+create or replace view spawn_outcomes as
+select k.closed_at_ms as at_ms,
+       k.outcome,
+       k.task_id,
+       k.mission_id,
+       k.closed_by as "by"
+  from spawn_task_spans k
+ where k.outcome is not null;
+
+-- What the dispatcher escalated to the supervisor: each distinct tag
+-- (`<session> <escalation>`, dispatch.rs `Escalation::tag`) of its inputs
+-- into the supervisor, once, at the first command that carried it.
+create or replace view spawn_escalations as
+select distinct on (t.tag) c.created_at_ms as at_ms, t.tag, c.id as command_id
+  from spawn_commands c
+ cross join lateral jsonb_array_elements_text(
+         case when jsonb_typeof(c.action -> 'tags') = 'array' then c.action -> 'tags'
+              else '[]'::jsonb end) t(tag)
+ where c.principal = 'spawn-dispatch' and c.session_id = 'session_supervisor'
+   and c.action ->> 'type' = 'input'
+ order by t.tag, c.created_at_ms, c.id;
+
+-- The reader (`spawn serve`) and the supervisor read them.
+do $$
+begin
+    execute format('grant select on spawn_control_stream, spawn_mission_settings, '
+                   'spawn_task_spans, spawn_decisions, spawn_interventions, spawn_outcomes, '
+                   'spawn_escalations to %I, %I',
+                   spawn_login_role('spawn_reader'), spawn_login_role('spawn_supervisor'));
+end
+$$;
+
 -- `spawn serve` connects with this login. It reads every table and writes
 -- nothing, so the dashboard cannot change the log or the queue even if it is
 -- tricked into running a query. Its password is set like the supervisor's.
