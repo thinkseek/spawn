@@ -4317,7 +4317,10 @@ PENDING_ISSUES\n";
         );
         let mut stopping = running.clone();
         stopping.stops = vec![stop_sent(40, "restart-7-1-stop", None)];
-        assert!(orders(&work, &[stopping]).is_empty(), "the Stop is under way");
+        assert!(
+            orders(&work, &[stopping]).is_empty(),
+            "the Stop is under way"
+        );
         let mut ended = worker(false, false);
         ended.end_cause = Some("stopped".to_string());
         assert!(
@@ -4341,9 +4344,12 @@ PENDING_ISSUES\n";
         assert!(prompt.contains("stalled on a hung tool"), "{prompt}");
         assert!(prompt.contains("asked by human"), "{prompt}");
         // Sent once: the resume's key is never sent again.
-        ended
-            .dispatched
-            .push(sent(60, "restart-7-1", 100, Some("pane never became ready")));
+        ended.dispatched.push(sent(
+            60,
+            "restart-7-1",
+            100,
+            Some("pane never became ready"),
+        ));
         assert!(orders(&work, &[ended]).is_empty(), "once");
     }
 
@@ -4386,12 +4392,21 @@ PENDING_ISSUES\n";
         running.agent_id = "agent_worker_moved_7".to_string();
         running.session_id = "session_worker_moved_7".to_string();
         let keys = |rows: &[Facts]| -> Vec<String> {
-            orders(&work, rows).into_iter().map(|order| order.key).collect()
+            orders(&work, rows)
+                .into_iter()
+                .map(|order| order.key)
+                .collect()
         };
-        assert_eq!(keys(std::slice::from_ref(&running)), vec!["reassign-7-stop"]);
+        assert_eq!(
+            keys(std::slice::from_ref(&running)),
+            vec!["reassign-7-stop"]
+        );
         let mut stopping = running.clone();
         stopping.stops = vec![stop_sent(40, "reassign-7-stop", Some(false))];
-        assert!(keys(std::slice::from_ref(&stopping)).is_empty(), "the old worker still runs");
+        assert!(
+            keys(std::slice::from_ref(&stopping)).is_empty(),
+            "the old worker still runs"
+        );
         stopping.stops = (0..=DELIVERY_RETRIES)
             .map(|n| {
                 let n = i64::try_from(n).expect("a handful");

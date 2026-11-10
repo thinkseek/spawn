@@ -54,11 +54,15 @@ fn refusal<T: std::fmt::Debug>(result: Result<T, spawn_core::port::StoreError>) 
 
 /// A mission with one ephemeral task (`label`), delivered.
 fn delivered(store: &PostgresStore, label: &str) -> (i64, i64) {
-    let mission = store
-        .mission_add("Work", &json!([]), "human")
-        .expect("add");
+    let mission = store.mission_add("Work", &json!([]), "human").expect("add");
     let task = store
-        .task_assign(mission, "ephemeral", label, "Do the work and report.", "cheap")
+        .task_assign(
+            mission,
+            "ephemeral",
+            label,
+            "Do the work and report.",
+            "cheap",
+        )
         .expect("assign");
     store.task_delivered(task, 1).expect("delivered");
     (mission, task)
@@ -68,9 +72,7 @@ fn delivered(store: &PostgresStore, label: &str) -> (i64, i64) {
 fn a_restart_is_recorded_per_task_and_only_for_a_delivered_task() {
     let (store, schema) = store("restart_records");
     let mut client = admin(&schema);
-    let mission = store
-        .mission_add("Work", &json!([]), "human")
-        .expect("add");
+    let mission = store.mission_add("Work", &json!([]), "human").expect("add");
     let task = store
         .task_assign(mission, "ephemeral", "restarted", "Do it.", "default")
         .expect("assign");
@@ -117,7 +119,9 @@ fn a_restart_is_recorded_per_task_and_only_for_a_delivered_task() {
         .expect("the task's row");
     assert_eq!(row["restart"]["n"], 2);
 
-    store.task_reported(task, "## Outcome\ndone").expect("reported");
+    store
+        .task_reported(task, "## Outcome\ndone")
+        .expect("reported");
     let error = refusal(store.task_restart(task, Some("again")));
     assert!(error.contains("is reported, not delivered"), "{error}");
     let error = refusal(store.task_restart(task + 1000, Some("again")));
@@ -275,7 +279,10 @@ fn the_page_restarts_and_reassigns_through_its_own_function_alone() {
         panic!("the supervisor holds no delivered task");
     };
     assert!(why.contains("holds no delivered task"), "{why}");
-    assert!(page.human_task(&session, "stop", None).is_err(), "a closed set of actions");
+    assert!(
+        page.human_task(&session, "stop", None).is_err(),
+        "a closed set of actions"
+    );
     assert_eq!(records(&mut client, "task.restarted").len(), 1);
 
     // The page's login calls no other mission function; the owner does not

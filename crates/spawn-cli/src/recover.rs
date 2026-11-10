@@ -519,13 +519,19 @@ pub(crate) fn moved(stops: &[Stop], session: &str, work: &Work) -> Option<Moved>
         .ok()?;
     let from_rows = work.tasks.iter().find_map(|row| {
         (row.id == task && row.session_id == session)
-            .then(|| row.reassigned_as.zip(Some(row.reassigned_to_session.clone())))
+            .then(|| {
+                row.reassigned_as
+                    .zip(Some(row.reassigned_to_session.clone()))
+            })
             .flatten()
     });
     let from_cancelled = || {
         work.cancelled.iter().find_map(|row| {
             (row.id == task && row.session_id == session)
-                .then(|| row.reassigned_as.zip(Some(row.reassigned_to_session.clone())))
+                .then(|| {
+                    row.reassigned_as
+                        .zip(Some(row.reassigned_to_session.clone()))
+                })
                 .flatten()
         })
     };
@@ -3409,16 +3415,27 @@ mod tests {
             Some(Moved::Reassigned { task: 8, .. })
         ));
         // A person's Stop with the dispatcher's key is a person's.
-        assert_eq!(moved(&[stop("restart-7-1-stop", 43)], "session_worker_a_7", &work), None);
+        assert_eq!(
+            moved(&[stop("restart-7-1-stop", 43)], "session_worker_a_7", &work),
+            None
+        );
         // A restart no record gives (another n), or another session's.
         assert_eq!(
-            moved(&[dispatcher_stop("restart-7-2-stop", 44)], "session_worker_a_7", &work),
+            moved(
+                &[dispatcher_stop("restart-7-2-stop", 44)],
+                "session_worker_a_7",
+                &work
+            ),
             None
         );
         assert_eq!(moved(&[restart.clone()], "session_worker_b_8", &work), None);
         // A later person's Stop is the one that ended it.
         assert_eq!(
-            moved(&[restart.clone(), stop("bb-stop", 45)], "session_worker_a_7", &work),
+            moved(
+                &[restart.clone(), stop("bb-stop", 45)],
+                "session_worker_a_7",
+                &work
+            ),
             None
         );
 
@@ -3455,10 +3472,25 @@ mod tests {
     fn a_reassigned_worker_is_kept_to_record_its_end_and_never_revived() {
         let work = moved_work();
         let none = std::collections::BTreeMap::new();
-        assert!(super::kept("agent_worker_b_8", "session_worker_b_8", &work, &none));
+        assert!(super::kept(
+            "agent_worker_b_8",
+            "session_worker_b_8",
+            &work,
+            &none
+        ));
         assert!(super::reassigned_away("session_worker_b_8", &work));
         assert!(!super::reassigned_away("session_worker_a_7", &work));
-        assert!(super::kept("agent_worker_a_7", "session_worker_a_7", &work, &none));
-        assert!(!super::kept("agent_worker_b_9", "session_worker_b_9", &work, &none));
+        assert!(super::kept(
+            "agent_worker_a_7",
+            "session_worker_a_7",
+            &work,
+            &none
+        ));
+        assert!(!super::kept(
+            "agent_worker_b_9",
+            "session_worker_b_9",
+            &work,
+            &none
+        ));
     }
 }
