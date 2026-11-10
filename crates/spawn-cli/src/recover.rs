@@ -26,12 +26,21 @@
 //!   database, a free-space reading at or above the floor. Clearing is one
 //!   `execution.cleared` record and then the revival — an `input` into the
 //!   live engine, or a resume if the execution ended. A wait never counts
-//!   toward the handoff.
-//! - `final` (stopped): never revived.
+//!   toward the handoff. A model wait whose engine *ended* is resumed at
+//!   most `SPAWN_RECOVER_MODEL_RETRIES` (3) times in a row with no model
+//!   answer between ([`model_resumes`]); its next such end is recorded
+//!   `model_unavailable` on the `final` path, with `retries` in its
+//!   evidence.
+//! - `final` (stopped, model_error): never revived. `model_error` is the
+//!   engine's own end after a request the model refused for good (a 400
+//!   that is not an exhausted context, a 404, a 413), with no progress
+//!   since ([`refused`]). The dispatcher tells the supervisor of every
+//!   final model record once (`dispatch::digest::model_finals`).
 //!
 //! The cause is read from recorded facts, in this precedence: stopped,
 //! budget, memory_limit, host_restart, disk_full, database_unavailable,
-//! model_auth, model_unavailable, context_exhausted, crashed, exited. Each
+//! model_auth, model_unavailable, context_exhausted, model_error, crashed,
+//! exited. Each
 //! is named in the record's evidence ([`classify`], [`model_cause`]).
 //!
 //! Every revival is one command keyed `recover-<execution>-<attempt>`, the
@@ -103,7 +112,15 @@ pub(crate) struct Config {
     /// How often an open wait re-reads its cause (the credentials file, the
     /// free space): `SPAWN_RECOVER_PROBE_SECS`, default 10.
     pub(crate) probe: i64,
+    /// Resumes in a row of an execution that ended on a transient model
+    /// error, with no model answer in between, before the next such end is
+    /// final and told to the supervisor: `SPAWN_RECOVER_MODEL_RETRIES`,
+    /// default 3, from 1 to [`MODEL_RETRIES_MAX`].
+    pub(crate) model_retries: u32,
 }
+
+/// The most `SPAWN_RECOVER_MODEL_RETRIES` may be.
+pub(crate) const MODEL_RETRIES_MAX: u32 = 20;
 
 impl Default for Config {
     fn default() -> Self {
@@ -112,12 +129,16 @@ impl Default for Config {
             model_backoff: 60_000,
             auth_retry: 1_800_000,
             probe: 10_000,
+            model_retries: 3,
         }
     }
 }
 
 impl Config {
-    pub(crate) fn from_env() -> Self {
+    /// The settings, as the loop's environment names them. A
+    /// `SPAWN_RECOVER_MODEL_RETRIES` that is not a whole number from 1 to
+    /// [`MODEL_RETRIES_MAX`] is refused: the loop does not start.
+    pub(crate) fn from_env() -> Result<Self, String> {
         let seconds = |name: &str, fallback: i64| {
             crate::config::env_value(name)
                 .and_then(|text| text.trim().parse::<i64>().ok())
@@ -125,13 +146,34 @@ impl Config {
                 .unwrap_or(fallback)
                 .saturating_mul(1000)
         };
-        Self {
+        Ok(Self {
             resume_backoff: seconds("SPAWN_RECOVER_BACKOFF_SECS", 10),
             model_backoff: seconds("SPAWN_RECOVER_MODEL_BACKOFF_SECS", 60),
             auth_retry: seconds("SPAWN_RECOVER_AUTH_RETRY_SECS", 1800),
             probe: seconds("SPAWN_RECOVER_PROBE_SECS", 10),
-        }
+            model_retries: model_retries(
+                crate::config::env_value("SPAWN_RECOVER_MODEL_RETRIES").as_deref(),
+            )?,
+        })
     }
+}
+
+/// `SPAWN_RECOVER_MODEL_RETRIES` read: unset is the default (3); anything
+/// but a whole number from 1 to [`MODEL_RETRIES_MAX`] is refused.
+pub(crate) fn model_retries(value: Option<&str>) -> Result<u32, String> {
+    let Some(text) = value else {
+        return Ok(Config::default().model_retries);
+    };
+    text.trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|retries| (1..=MODEL_RETRIES_MAX).contains(retries))
+        .ok_or_else(|| {
+            format!(
+                "SPAWN_RECOVER_MODEL_RETRIES must be a whole number from 1 to \
+                 {MODEL_RETRIES_MAX}, not {text:?}"
+            )
+        })
 }
 
 /// One cause of an interruption: the whole vocabulary, and the only one the
@@ -144,6 +186,10 @@ pub(crate) enum Cause {
     ContextExhausted,
     ModelUnavailable,
     ModelAuth,
+    /// The model refused the request in a way no retry changes (a 400 of
+    /// another kind than an exhausted context, a 404, a 413): the engine
+    /// ended after it with no progress.
+    ModelError,
     HostRestart,
     DatabaseUnavailable,
     DiskFull,
@@ -160,6 +206,7 @@ impl Cause {
             Self::ContextExhausted => "context_exhausted",
             Self::ModelUnavailable => "model_unavailable",
             Self::ModelAuth => "model_auth",
+            Self::ModelError => "model_error",
             Self::HostRestart => "host_restart",
             Self::DatabaseUnavailable => "database_unavailable",
             Self::DiskFull => "disk_full",
@@ -177,7 +224,7 @@ impl Cause {
             | Self::ModelAuth
             | Self::DatabaseUnavailable
             | Self::DiskFull => Path::Wait,
-            Self::Stopped => Path::Final,
+            Self::ModelError | Self::Stopped => Path::Final,
         }
     }
 }
@@ -254,6 +301,35 @@ impl Turn {
             return Some(Cause::ModelUnavailable);
         }
         None
+    }
+
+    /// Whether the model refused the request in a way no retry changes:
+    /// neither transient, nor a login, nor an exhausted context (a 400 of
+    /// another kind, a 404, a 413). The engine may wait at its prompt after
+    /// it (no interruption: the agent can go on another way); an engine that
+    /// ended after it, with no progress since, is a `model_error` end.
+    pub(crate) fn model_error(&self) -> bool {
+        self.cause().is_none()
+    }
+
+    /// The evidence of an interruption told from this turn: its event,
+    /// status, error tag and text.
+    pub(crate) fn evidence(&self) -> Map<String, Value> {
+        let mut evidence = Map::new();
+        evidence.insert("event_id".to_string(), json!(self.event_id));
+        evidence.insert(
+            "status".to_string(),
+            self.status.map_or(Value::Null, |status| json!(status)),
+        );
+        evidence.insert(
+            "error".to_string(),
+            self.error_kind.clone().map_or(Value::Null, Value::String),
+        );
+        evidence.insert(
+            "text".to_string(),
+            json!(crate::deliver::one_line(&self.text, 600)),
+        );
+        evidence
     }
 }
 
@@ -358,6 +434,9 @@ pub(crate) struct Facts<'a> {
     pub(crate) disk: Option<&'a disk::Reading>,
     /// The database outage the execution lived through.
     pub(crate) outage: Option<&'a Outage>,
+    /// The failed turn the engine ended after, with no progress since, when
+    /// the model refused it for good ([`Turn::model_error`]).
+    pub(crate) model_error: Option<&'a Turn>,
     /// Whether the session is a retired resident, or its task cancelled:
     /// how a `stopped` end came about, in its evidence.
     pub(crate) retired: bool,
@@ -387,6 +466,11 @@ pub(crate) fn classify(facts: &Facts<'_>) -> Cause {
     }
     if facts.outage.is_some() {
         return Cause::DatabaseUnavailable;
+    }
+    // The engine's own end after a request the model will never accept:
+    // resuming it sends the same request again.
+    if facts.model_error.is_some() && end.cause != "lost" {
+        return Cause::ModelError;
     }
     // A signal, a non-zero code, or a terminal gone while its server lived:
     // the engine did not exit by itself.
@@ -471,6 +555,35 @@ pub(crate) fn model_due(base_ms: i64, j: u32, at_ms: i64, retry_at_ms: Option<i6
     let pause = base_ms.saturating_mul(i64::from(step.min(MODEL_CAP)));
     let due = at_ms.saturating_add(pause);
     retry_at_ms.map_or(due, |named| named.max(due))
+}
+
+/// How many resumes in a row the execution `current` stands at, each of an
+/// execution that ended on a transient model error with no model answer in
+/// between: from `current` back, every execution a revival started
+/// ([`KEY_PREFIX`]) that made no progress, whose predecessor's latest
+/// interruption was `model_unavailable`. A revived execution that made
+/// progress, or one a person or the supervisor started, ends the run.
+pub(crate) fn model_resumes(executions: &[Executed], current: &str) -> u32 {
+    let Some(mut at) = executions
+        .iter()
+        .position(|execution| execution.id == current)
+    else {
+        return 0;
+    };
+    let mut resumes = 0_u32;
+    while at > 0 {
+        let execution = &executions[at];
+        let before = &executions[at - 1];
+        if !execution.key.starts_with(KEY_PREFIX)
+            || execution.progress
+            || before.last_cause.as_deref() != Some(Cause::ModelUnavailable.name())
+        {
+            break;
+        }
+        resumes = resumes.saturating_add(1);
+        at -= 1;
+    }
+    resumes
 }
 
 /// Whether an open login wait may retry: only when the credentials file
@@ -742,6 +855,11 @@ pub(crate) struct Executed {
     /// with [`KEY_PREFIX`].
     #[serde(default)]
     pub(crate) key: String,
+    /// The cause of the latest interruption the recovery recorded for it,
+    /// if any: an execution that ended on a transient model error reads
+    /// `model_unavailable` ([`model_resumes`]).
+    #[serde(default)]
+    pub(crate) last_cause: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1107,6 +1225,21 @@ impl One<'_> {
             .find(|stop| !stop.ours() && stop.reached())
     }
 
+    /// The failed turn the engine ended after when the model refused it for
+    /// good, with no progress since ([`refused`]).
+    fn refused_turn(&self, end: &End) -> Option<&Turn> {
+        let after = self
+            .interruptions()
+            .last()
+            .map_or(0, |record| record.fact_event_id());
+        refused(
+            &self.row.turns,
+            self.row.progress.event_id,
+            after,
+            (end.event_id > 0).then_some(end.event_id),
+        )
+    }
+
     /// A free-space reading of the workspace's filesystem, taken now: on
     /// the workspace itself while its mount is there, else on the root that
     /// holds every workspace (the same filesystem, on this host).
@@ -1277,20 +1410,7 @@ impl One<'_> {
         let Some(cause) = turn.cause() else {
             return Ok(());
         };
-        let mut evidence = Map::new();
-        evidence.insert("event_id".to_string(), json!(turn.event_id));
-        evidence.insert(
-            "status".to_string(),
-            turn.status.map_or(Value::Null, |status| json!(status)),
-        );
-        evidence.insert(
-            "error".to_string(),
-            turn.error_kind.clone().map_or(Value::Null, Value::String),
-        );
-        evidence.insert(
-            "text".to_string(),
-            json!(crate::deliver::one_line(&turn.text, 600)),
-        );
+        let mut evidence = turn.evidence();
         let mut due = self.now_ms;
         match cause {
             Cause::ModelUnavailable => {
@@ -1403,6 +1523,7 @@ impl One<'_> {
             outage: None,
             retired: self.retired.contains(&self.row.session_id),
             task_cancelled: false,
+            model_error: self.refused_turn(end),
         };
         let cause = classify(&facts);
         let mut evidence = self.end_evidence(cause, end, &facts);
@@ -1507,6 +1628,17 @@ impl One<'_> {
                     "exit_code".to_string(),
                     end.exit_code.map_or(Value::Null, |code| json!(code)),
                 );
+            }
+            Cause::ModelError => {
+                if let Some(turn) = facts.model_error {
+                    evidence = turn.evidence();
+                }
+                if let Some(code) = end.exit_code {
+                    evidence.insert("exit_code".to_string(), json!(code));
+                }
+                if let Some(signal) = end.signal {
+                    evidence.insert("signal".to_string(), json!(signal));
+                }
             }
             Cause::ContextExhausted
             | Cause::ModelUnavailable
@@ -1629,6 +1761,11 @@ impl One<'_> {
         let Some(cause) = Cause::from_name(last.cause().unwrap_or_default()) else {
             return Ok(());
         };
+        // A wait made final (a transient model error's retries spent) is
+        // never revived, whatever its cause's own path.
+        if last.path() == Some(Path::Final.name()) {
+            return Ok(());
+        }
         match cause.path() {
             Path::Final => Ok(()),
             Path::Wait => self.wait_path(&last, cause),
@@ -1660,6 +1797,15 @@ impl One<'_> {
                     self.clear(last, cause, evidence)?;
                     return self.revive(last, cause, true);
                 }
+                // An engine that ended on it is resumed a bounded number
+                // of times in a row; past that, its end is final and the
+                // supervisor is told (the dispatcher's digest).
+                if !self.live() && !self.revived(last) {
+                    let resumes = model_resumes(&self.row.executions, &self.execution().id);
+                    if resumes >= self.config.model_retries {
+                        return self.retries_spent(last, resumes);
+                    }
+                }
                 self.revive(last, cause, false)
             }
             Cause::ModelAuth => {
@@ -1684,6 +1830,68 @@ impl One<'_> {
             Cause::DatabaseUnavailable => self.revive(last, cause, true),
             _ => Ok(()),
         }
+    }
+
+    /// Whether the terminal host says the execution's runner is no longer
+    /// there (its pane dead or gone); a host that cannot tell says nothing.
+    fn runner_gone(&self) -> bool {
+        let execution = self.execution();
+        let (Ok(id), Ok(workspace)) = (
+            spawn_core::id::ExecutionId::new(execution.id.as_str()),
+            spawn_core::id::WorkspaceId::new(
+                execution.workspace.unwrap_or_else(|| "0:/".to_string()),
+            ),
+        ) else {
+            return false;
+        };
+        let terminal = spawn_core::id::TerminalName::for_execution(&id);
+        matches!(
+            self.terminals.runner(&terminal, &workspace),
+            Ok(spawn_core::port::Runner::Gone | spawn_core::port::Runner::Untracked(_))
+        )
+    }
+
+    /// Whether the revival of `last` was already submitted (its key, or a
+    /// retry of it).
+    fn revived(&self, last: &Recorded) -> bool {
+        let key = self.key_prefix(last);
+        self.row
+            .commands
+            .iter()
+            .any(|sent| sent.key == key || sent.key.starts_with(&format!("{key}-")))
+    }
+
+    /// The end of an execution whose transient model error was retried
+    /// `resumes` times in a row already: recorded once, `model_unavailable`
+    /// on the final path, with the failed turn and the setting, and never
+    /// revived (a person or the supervisor may resume it).
+    fn retries_spent(&mut self, last: &Recorded, resumes: u32) -> Result<(), String> {
+        let execution = self.execution();
+        let mut evidence = Map::new();
+        for field in ["event_id", "status", "error", "text"] {
+            evidence.insert(field.to_string(), last.record["evidence"][field].clone());
+        }
+        evidence.insert("retries".to_string(), json!(self.config.model_retries));
+        evidence.insert("resumes".to_string(), json!(resumes));
+        if let Some(code) = execution.exit_code {
+            evidence.insert("exit_code".to_string(), json!(code));
+        }
+        if let Some(signal) = execution.signal {
+            evidence.insert("signal".to_string(), json!(signal));
+        }
+        let fact = execution
+            .end_event_id
+            .unwrap_or(0)
+            .max(last.fact_event_id());
+        self.record(
+            Cause::ModelUnavailable,
+            evidence,
+            fact,
+            Path::Final,
+            None,
+            "its engine ended on a transient model error again and its retries are spent",
+        )?;
+        Ok(())
     }
 
     /// Whether the credentials file changed since the interruption read it;
@@ -1829,6 +2037,14 @@ impl One<'_> {
             // An execution that ran through the database outage needs no
             // revival of its own: the loop caught up with it.
             if cause == Cause::DatabaseUnavailable {
+                return Ok(());
+            }
+            // An engine that ended on the model's error is no longer at its
+            // prompt, though the Bridge has not recorded its end yet: typing
+            // into it would fail, and its end is the resume's (bounded) to
+            // answer. The end's record moves the log, and the step runs
+            // again.
+            if cause == Cause::ModelUnavailable && self.runner_gone() {
                 return Ok(());
             }
             self.submit(
@@ -2066,6 +2282,24 @@ fn describe(record: &Recorded) -> String {
     }
 }
 
+/// The failed turn an execution's end is told from when the model refused
+/// it for good: the latest failed turn after `after` (the fact of the latest
+/// interruption) and before the end (`end_event_id`, when known), if it is
+/// a model error ([`Turn::model_error`]) and nothing made progress after it
+/// (`progress_event_id`: the latest tool call or turn end).
+pub(crate) fn refused(
+    turns: &[Turn],
+    progress_event_id: i64,
+    after: i64,
+    end_event_id: Option<i64>,
+) -> Option<&Turn> {
+    let turn = turns
+        .iter()
+        .rev()
+        .find(|turn| turn.event_id > after && end_event_id.is_none_or(|end| turn.event_id < end))?;
+    (turn.model_error() && progress_event_id < turn.event_id).then_some(turn)
+}
+
 /// The next fact of `execution` that no interruption explains, in log
 /// order: the first failed turn or failed tool call after the latest one
 /// recorded, or the end.
@@ -2145,6 +2379,7 @@ impl Cause {
             Self::ContextExhausted,
             Self::ModelUnavailable,
             Self::ModelAuth,
+            Self::ModelError,
             Self::HostRestart,
             Self::DatabaseUnavailable,
             Self::DiskFull,
@@ -2161,7 +2396,8 @@ mod tests {
     use super::{
         Cause, Config, Credentials, End, Executed, Execution, Facts, Outage, Path, Recorded,
         Recovery, Sent, Stop, ToolFailure, Turn, auth_retry_due, classify, counts_as_failure,
-        disk_cleared, key, model_due, pending, resume_due, resume_failed, retry_at, way,
+        disk_cleared, key, model_due, model_resumes, model_retries, pending, refused, resume_due,
+        resume_failed, retry_at, way,
     };
     use serde_json::json;
 
@@ -2796,6 +3032,153 @@ mod tests {
         assert_eq!(defaults.model_backoff, 60_000);
         assert_eq!(defaults.auth_retry, 1_800_000);
         assert_eq!(defaults.probe, 10_000);
+        assert_eq!(defaults.model_retries, 3);
+    }
+
+    /// Objective 39: SPAWN_RECOVER_MODEL_RETRIES is a whole number from 1
+    /// to 20, 3 when unset; anything else is refused, naming the setting.
+    #[test]
+    fn the_model_retries_setting_is_a_whole_number_from_1_to_20() {
+        assert_eq!(model_retries(None), Ok(3));
+        assert_eq!(model_retries(Some("1")), Ok(1));
+        assert_eq!(model_retries(Some("2")), Ok(2));
+        assert_eq!(model_retries(Some(" 20 ")), Ok(20));
+        for bad in ["0", "21", "-1", "two", "2.5", ""] {
+            let refused = model_retries(Some(bad)).expect_err(bad);
+            assert!(
+                refused.contains("SPAWN_RECOVER_MODEL_RETRIES"),
+                "{bad}: {refused}"
+            );
+        }
+    }
+
+    /// Objective 39: a request the model refuses for good (neither
+    /// transient, nor a login, nor an exhausted context) is a model error;
+    /// the engine's own end after it, with no progress since, is
+    /// `model_error` on the final path, below a person's Stop.
+    #[test]
+    fn an_end_after_a_refused_request_is_a_final_model_error() {
+        let invalid = turn(
+            Some(400),
+            Some("invalid_request"),
+            "API Error: 400 unexpected tool_use_id found in tool_result blocks",
+        );
+        assert!(invalid.model_error());
+        assert!(turn(Some(404), None, "API Error: 404 model not found").model_error());
+        assert!(turn(Some(413), None, "API Error: 413 request too large").model_error());
+        for transient in [
+            turn(Some(529), Some("overloaded"), "API Error: 529"),
+            turn(Some(500), None, "API Error: 500"),
+            turn(None, Some("rate_limit"), "API Error: rate limited"),
+            turn(Some(401), Some("authentication_failed"), "API Error: 401"),
+            turn(Some(400), None, "Prompt is too long"),
+        ] {
+            assert!(!transient.model_error(), "{transient:?}");
+        }
+        assert_eq!(Cause::ModelError.name(), "model_error");
+        assert_eq!(Cause::ModelError.path(), Path::Final);
+        assert_eq!(Cause::from_name("model_error"), Some(Cause::ModelError));
+
+        // The latest failed turn before the end, with no progress after it.
+        let turns = [invalid.clone()];
+        assert_eq!(refused(&turns, 0, 0, Some(90)), Some(&invalid));
+        assert_eq!(refused(&turns, 49, 0, Some(90)), Some(&invalid));
+        assert_eq!(refused(&turns, 60, 0, None), None, "progress after it");
+        assert_eq!(refused(&turns, 0, 50, None), None, "already recorded");
+        assert_eq!(refused(&turns, 0, 0, Some(40)), None, "after the end");
+        let later = Turn {
+            event_id: 70,
+            ..turn(Some(529), Some("overloaded"), "API Error: 529")
+        };
+        assert_eq!(
+            refused(&[invalid.clone(), later], 0, 0, None),
+            None,
+            "a transient failure after it is the latest"
+        );
+
+        let nonzero = end("exited", Some(1), None);
+        let after_refusal = Facts {
+            model_error: Some(&invalid),
+            ..facts(Some(&nonzero))
+        };
+        assert_eq!(classify(&after_refusal), Cause::ModelError);
+        let clean = end("exited", Some(0), None);
+        assert_eq!(
+            classify(&Facts {
+                model_error: Some(&invalid),
+                ..facts(Some(&clean))
+            }),
+            Cause::ModelError
+        );
+        let stopped = stop("bb-stop-1", 7);
+        assert_eq!(
+            classify(&Facts {
+                stop: Some(&stopped),
+                ..after_refusal
+            }),
+            Cause::Stopped,
+            "a person's Stop outranks every model cause"
+        );
+        assert_eq!(classify(&facts(Some(&nonzero))), Cause::Crashed);
+        let (path, _) = way(Cause::ModelError, true, 0);
+        assert_eq!(path, Path::Final);
+    }
+
+    fn executed(id: &str, key: &str, progress: bool, last_cause: Option<&str>) -> Executed {
+        Executed {
+            id: id.to_string(),
+            started_at_ms: 0,
+            ended_at_ms: Some(5_000),
+            duration_ms: Some(5_000),
+            progress,
+            key: key.to_string(),
+            last_cause: last_cause.map(str::to_string),
+        }
+    }
+
+    /// Objective 39: the resumes in a row of an execution that ended on a
+    /// transient model error are counted back from the current execution
+    /// across the session's executions; a revived execution that made
+    /// progress, or one a person started, ends the run.
+    #[test]
+    fn model_resumes_count_the_run_of_revivals_after_transient_ends() {
+        let unavailable = Some("model_unavailable");
+        let chain = [
+            executed("exec_1", "dispatch-task-7", false, unavailable),
+            executed("exec_2", "recover-exec_1-1", false, unavailable),
+            executed("exec_3", "recover-exec_2-1", false, unavailable),
+        ];
+        assert_eq!(model_resumes(&chain, "exec_1"), 0);
+        assert_eq!(model_resumes(&chain, "exec_2"), 1);
+        assert_eq!(model_resumes(&chain, "exec_3"), 2);
+        assert_eq!(model_resumes(&chain, "exec_9"), 0, "an unknown execution");
+        // A retry of a failed revival is a revival too.
+        let retried = [
+            executed("exec_1", "dispatch-task-7", false, unavailable),
+            executed("exec_2", "recover-exec_1-1-r1", false, unavailable),
+        ];
+        assert_eq!(model_resumes(&retried, "exec_2"), 1);
+        // A revived execution that made progress resets the count.
+        let answered = [
+            executed("exec_1", "dispatch-task-7", false, unavailable),
+            executed("exec_2", "recover-exec_1-1", true, unavailable),
+            executed("exec_3", "recover-exec_2-1", false, unavailable),
+        ];
+        assert_eq!(model_resumes(&answered, "exec_3"), 1);
+        assert_eq!(model_resumes(&answered, "exec_2"), 0);
+        // A resume by a person starts a new run.
+        let by_person = [
+            executed("exec_1", "recover-exec_0-1", false, unavailable),
+            executed("exec_2", "bb-resume-1", false, unavailable),
+            executed("exec_3", "recover-exec_2-1", false, unavailable),
+        ];
+        assert_eq!(model_resumes(&by_person, "exec_3"), 1);
+        // A crash's resume is no model retry.
+        let crashed = [
+            executed("exec_1", "dispatch-task-7", false, Some("crashed")),
+            executed("exec_2", "recover-exec_1-1", false, unavailable),
+        ];
+        assert_eq!(model_resumes(&crashed, "exec_2"), 0);
     }
 
     #[test]
@@ -2807,6 +3190,7 @@ mod tests {
             duration_ms: Some(3_000),
             progress: false,
             key: "recover-exec_1-1".to_string(),
+            last_cause: None,
         };
         assert!(resume_failed(
             young.ended_at_ms.map(|ended| ended - young.started_at_ms),
