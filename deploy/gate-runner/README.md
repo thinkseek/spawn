@@ -36,7 +36,11 @@ until the PoC is measured and the owner says to switch.
   own programs in `SPAWN_GATE_PG_BIN` form (`/usr/lib/postgresql/16/bin`).
   A runner never uses a shared test database and never receives one's URL.
 - **git, tar, gzip, sha256sum, jq, nice**, GNU coreutils' **timeout** (8.5 or
-  later, for `--kill-after`), `nproc`, and a POSIX shell.
+  later, for `--kill-after`), util-linux's **flock** (the helper's
+  `registry-accept` takes a lock, so two dispatches never write the cargo
+  registry at once; the gate takes its own for the host's scenario slots),
+  `nproc`, and a POSIX shell. `setup.sh` and the dispatcher refuse a runner
+  without flock (exit 3, naming it).
 - **Disk**: the gate's floor (`SPAWN_GATE_MIN_FREE_GB`, default 10) in the
   runner root's TMPDIR, plus one scenario's scratch. The private server is
   copied from its template per gate (about 40 MB), and the build is the same
@@ -62,7 +66,15 @@ until the PoC is measured and the owner says to switch.
   and the runner lacks makes the runner reject work the primary accepts —
   as a verdict, not a host fault. The dispatcher sends the runner whatever
   files of its registry the runner lacks before every job (only those; it
-  never deletes there). **Not** the primary's cargo config: a
+  never deletes there). **The registry must be on the same file system as
+  its `$CARGO_HOME`** (`GATE_RUNNER_CARGO_HOME`, default `~/.cargo`): the
+  helper stages what it receives in the cargo home and renames each file
+  into place, and a rename is atomic only within one file system. With the
+  registry (or its `index`, `cache`, `src`) mounted or symlinked elsewhere,
+  `mv` would copy and a running gate could read half a crate, so the
+  preflight reports it (`registry_fs=other (<directory>)`), `--check` fails
+  it, the dispatcher refuses the runner (exit 3) and `registry-accept`
+  accepts nothing. **Not** the primary's cargo config: a
   `rustc-wrapper` it names (the primary's `kache`) must be on the runner's
   gate `PATH`, or every build fails; the dispatcher refuses a runner whose
   config names a wrapper it lacks.
@@ -163,11 +175,15 @@ deploy/gate-runner.sh --check <runner> <source.git> <base> <scenarios>
 ```
 
 It reports what the runner has — helper version, git/tar/gzip/sha256sum/
-nice/timeout/bwrap, rustc/cargo/node/psql/python3/jq (a missing one is a
-failure), the private server, free disk against the floor, isolation from
-the host, the cores and memory a gate gets, the cargo wrapper, how many
-registry files the next dispatch would send, the UI's lockfile against the
-controller's — and then asks the
+nice/timeout/flock/bwrap, rustc/cargo/node/psql/python3/jq (a missing one is
+a failure), the private server, free disk against the floor, isolation from
+the host, the cores and memory a gate gets, the cargo wrapper, whether the
+registry is on its cargo home's file system and how many files of this
+host's it lacks, the UI's lockfile against the
+controller's — and then, with the runner ready, sends those registry files
+as a dispatch does (the key run's static checks need every crate: without
+them a fresh runner fails the keys for a cause the report does not name)
+and asks the
 question the base cache depends on: **does the runner compute the same
 base-cache key this host does?** It ships the archive, runs
 `gate.sh --base-keys` on the runner and the same script here, and compares
@@ -191,7 +207,14 @@ Exit 0: compatible. 1: not. 3: the runner could not be asked.
 keys <job> <seconds> | collect <job> | remove <job> | registry-need |
 registry-accept`. `registry-need` reads the primary's registry listing
 (`<path>\t<size>`) and prints what the runner lacks; `registry-accept`
-unpacks those files, adding and replacing only. `accept` takes the
+unpacks those files, adding and replacing only: one accept at a time (a
+flock on `$CARGO_HOME/.gate-runner-registry.lock`), into a staging directory
+`$CARGO_HOME/.gate-runner-registry.<random>`, then each file renamed into
+place, so a gate that has a crate open keeps the file it opened and one
+that opens it finds a whole file. An accept that is killed leaves its
+staging directory; the next accept removes it once it holds the lock (a
+staging directory exists only while its accept holds the lock, so none
+found then is in use). `accept` takes the
 job's tar.gz on stdin and installs it whole or not at all; `collect` writes
 a MANIFEST of sha256s and the result files as one tar.gz on stdout; the
 dispatcher verifies the manifest before it believes anything. The runner's

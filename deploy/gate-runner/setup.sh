@@ -73,7 +73,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-for tool in git tar gzip sha256sum nice timeout bwrap nproc; do
+for tool in git tar gzip sha256sum nice timeout flock bwrap nproc; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool is required (deploy/gate-runner/README.md)"
 done
 case "$(timeout --version 2>&1 | head -n 1)" in

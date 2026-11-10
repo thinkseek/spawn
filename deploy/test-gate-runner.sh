@@ -15,7 +15,11 @@
 # retry succeeding; a retry that succeeds after the connection dies in the
 # run; retry exhaustion (transport failure on every attempt); and --check:
 # equal base-cache keys, a helper of another version, and a toolchain that
-# computes different keys.
+# computes different keys; the registry (8m-8t): the sync, a path the primary
+# did not list, two accepts at once, a reader that holds a crate open or
+# opens it during an accept, the staging a killed accept left, a runner
+# without flock, a registry on another file system than its cargo home, and
+# --check sending the registry before it asks for keys.
 #
 # The stub's knobs, read from the dispatcher's environment (it is spawned
 # there): STUB_FAIL_SHIP, STUB_FAIL_RUN, STUB_FAIL_COLLECT (fail that many
@@ -52,6 +56,7 @@ command -v bwrap >/dev/null 2>&1 || {
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/gate-runner-test.XXXXXX")
 runner_home=""
 badroot=""
+otherfs=""
 # A long root moves a job's scratch to the short directory (the socket path
 # limit): this suite's own, so nothing of a real runner's is touched.
 export GATE_RUNNER_SHORT="$HOME/.grs-test-$$"
@@ -60,6 +65,7 @@ cleanup() {
     chmod -R u+w "$scratch" "$runner_home" 2>/dev/null || true
     rm -rf "$scratch" "$runner_home"
     [ -z "$badroot" ] || rm -rf "$badroot"
+    [ -z "$otherfs" ] || rm -rf "$otherfs"
     rm -rf "$GATE_RUNNER_SHORT"
 }
 trap cleanup EXIT
@@ -556,7 +562,7 @@ lacks "in step, nothing is sent" "$scratch/dispatch.out" "sending"
 check_status=0
 GATE_RUNNER_REGISTRY=$regsrc "$repo/deploy/gate-runner.sh" --check "$runner_home" "$repo_git" "$base" "$keysscen" \
     >"$scratch/check.out" 2>"$scratch/check.err" || check_status=$?
-contains "--check reports the registry" "$scratch/check.out" "0 file(s) of this host's to send at dispatch"
+contains "--check reports the registry" "$scratch/check.out" "0 file(s) of this host's to send"
 cp "$scratch/config.orig" "$runner_home/config"
 
 # 8m'. A runner that asks for a path this host's registry does not list
@@ -589,6 +595,164 @@ cmp -s "$big/cache/z/big.crate" "$scratch/rcargo4/registry/cache/z/big.crate" &&
     fail "the file is not whole"
 [ -z "$(find "$scratch/rcargo4" -maxdepth 1 -name '.gate-runner-registry.*' -type d)" ] && pass "and no staging is left" ||
     fail "staging left behind"
+cp "$scratch/config.orig" "$runner_home/config"
+
+# 8q. A reader and an accept. A gate that has a crate open reads the file it
+# opened, whole; one that opens the crate while the accept is under way finds
+# a whole file, the old one or the new, never part of one (the accept renames
+# each file into place; unpacked under its final name, the crate is half
+# there for as long as its bytes arrive). The accept here is held: its stream
+# stops halfway until the readers have read. The staging a killed accept left
+# is removed by it, and a second accept started meanwhile waits for the lock:
+# it removes nothing of the first's, and both succeed.
+mkdir -p "$scratch/rcargo5/registry/cache/z" "$scratch/rcargo5/.gate-runner-registry.killed/cache/z"
+printf 'half\n' >"$scratch/rcargo5/.gate-runner-registry.killed/cache/z/half.crate"
+printf "GATE_RUNNER_CARGO_HOME='%s'\n" "$scratch/rcargo5" >>"$runner_home/config"
+newer=$scratch/reg-newer
+mkdir -p "$newer/cache/z"
+head -c 4000000 /dev/urandom >"$newer/cache/z/big.crate"
+crate=$scratch/rcargo5/registry/cache/z/big.crate
+cp "$big/cache/z/big.crate" "$crate"
+sum_of() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+old_sum=$(sum_of "$big/cache/z/big.crate")
+new_sum=$(sum_of "$newer/cache/z/big.crate")
+tar -cf "$scratch/newer.tar" -C "$newer" cache
+rm -f "$scratch/accept-done" "$scratch/accept-go"
+( exec 3<"$crate" && while [ ! -e "$scratch/accept-done" ]; do sleep 0.1; done && sha256sum <&3 | cut -d' ' -f1 >"$scratch/held.sum" ) &
+holder=$!
+sleep 0.3
+( { head -c 2000000 "$scratch/newer.tar"; while [ ! -e "$scratch/accept-go" ]; do sleep 0.1; done
+    tail -c +2000001 "$scratch/newer.tar"; } |
+    sh "$runner_home/bin/remote" registry-accept 2>"$scratch/accept-slow.err" ) &
+a1=$!
+# Until the accept holds the lock and has its own staging (the killed
+# accept's is gone by then); 60 s at most.
+staging_seen=0
+for _ in $(seq 300); do
+    staging_seen=$(find "$scratch/rcargo5" -maxdepth 1 -name '.gate-runner-registry.*' -type d | wc -l)
+    [ "$staging_seen" != 1 ] || [ -e "$scratch/rcargo5/.gate-runner-registry.killed" ] || break
+    sleep 0.2
+done
+[ ! -e "$scratch/rcargo5/.gate-runner-registry.killed" ] && killed_gone=yes || killed_gone=no
+( tar -cf - -C "$regsrc" index | sh "$runner_home/bin/remote" registry-accept 2>"$scratch/accept-second.err" ) &
+a2=$!
+seen_old=0 seen_new=0 seen_part=0 reads=0
+while kill -0 "$a1" 2>/dev/null; do
+    case "$(sum_of "$crate")" in
+    "$old_sum") seen_old=$((seen_old + 1)) ;;
+    "$new_sum") seen_new=$((seen_new + 1)) ;;
+    *) seen_part=$((seen_part + 1)) ;;
+    esac
+    reads=$((reads + 1))
+    # Ten reads with half the stream in, then the rest may come.
+    [ "$reads" -lt 10 ] || touch "$scratch/accept-go"
+    sleep 0.2
+done
+touch "$scratch/accept-go"
+s1=0; wait "$a1" || s1=$?
+s2=0; wait "$a2" || s2=$?
+touch "$scratch/accept-done"
+wait "$holder" || true
+expect "a slow accept, and a second one started during it, both succeed" "$s1 $s2" "0 0"
+expect "the accept's staging was there while it ran, the killed accept's gone" "$staging_seen $killed_gone" "1 yes"
+contains "and the accept says it removed the killed accept's staging" "$scratch/accept-slow.err" ".gate-runner-registry.killed, the staging of an accept that was killed"
+expect "a reader opening the crate during the accept never read part of a file ($seen_old whole old, $seen_new whole new)" "$seen_part" 0
+[ "$seen_old" -ge 1 ] && pass "and it did read during the accept" || fail "no read happened during the accept: the case proves nothing"
+expect "a reader that held the crate open read the whole file it opened" "$(cat "$scratch/held.sum" 2>/dev/null)" "$old_sum"
+expect "afterwards the crate is the new one, whole" "$(sum_of "$crate")" "$new_sum"
+cmp -s "$regsrc/index/x/one" "$scratch/rcargo5/registry/index/x/one" && pass "and the second accept's file is in place" ||
+    fail "the second accept's file is missing"
+[ -z "$(find "$scratch/rcargo5" -maxdepth 1 -name '.gate-runner-registry.*' -type d)" ] && pass "and no staging is left" ||
+    fail "staging left behind"
+cp "$scratch/config.orig" "$runner_home/config"
+
+# 8r. A runner without flock is refused at the preflight, with that reason:
+# its registry-accept could not take its lock. A `flock` that does not work
+# stands in for a missing one (the preflight reports no version either way).
+mkdir -p "$scratch/noflock" "$scratch/rcargo6"
+printf '#!/bin/sh\nexit 1\n' >"$scratch/noflock/flock"
+chmod 755 "$scratch/noflock/flock"
+PATH="$scratch/noflock:$PATH" "$runner_home/bin/remote" preflight >"$scratch/preflight.out" 2>/dev/null
+expect "the preflight reports no flock" "$(sed -n 's/^flock=//p' "$scratch/preflight.out")" ""
+contains "and reports the one this host has otherwise" "$scratch/setup.out" "flock=flock from util-linux"
+reset "$out"
+PATH="$scratch/noflock:$PATH" dispatch "$runner_home" "$repo_git" "$base" "$candidate" "$scen" "$out"
+expect "a runner without flock is refused: exit 3" "$status" 3
+contains "and says why" "$scratch/dispatch.err" "the runner lacks flock (util-linux): its registry-accept takes a lock"
+nothing_ran "nothing was run on it"
+check_status=0
+PATH="$scratch/noflock:$PATH" "$repo/deploy/gate-runner.sh" --check "$runner_home" "$repo_git" "$base" "$keysscen" \
+    >"$scratch/check.out" 2>"$scratch/check.err" || check_status=$?
+expect "--check on a runner without flock: exit 1" "$check_status" 1
+contains "and flock is a failure" "$scratch/check.out" "flock        FAIL"
+printf "GATE_RUNNER_CARGO_HOME='%s'\n" "$scratch/rcargo6" >>"$runner_home/config"
+accept_status=0
+tar -cf - -C "$regsrc" index | PATH="$scratch/noflock:$PATH" sh "$runner_home/bin/remote" registry-accept \
+    2>"$scratch/accept.err" || accept_status=$?
+expect "an accept that cannot lock accepts nothing: exit 2" "$accept_status" 2
+contains "and says flock is required" "$scratch/accept.err" "flock, of util-linux, is required"
+[ ! -e "$scratch/rcargo6/registry/index" ] && pass "and nothing reached the registry" || fail "files reached the registry without the lock"
+cp "$scratch/config.orig" "$runner_home/config"
+
+# 8s. A registry on another file system than its cargo home (here a symlink
+# out of it): a rename into place would be a copy, so the preflight reports
+# it, a dispatch that has a registry to send is refused, --check fails it,
+# and an accept accepts nothing.
+otherfs=""
+for candidate_fs in /dev/shm /tmp; do
+    [ -d "$candidate_fs" ] && [ -w "$candidate_fs" ] || continue
+    [ "$(stat -c %d "$candidate_fs")" != "$(stat -c %d "$scratch")" ] || continue
+    otherfs=$(mktemp -d "$candidate_fs/gate-runner-test-registry.XXXXXX")
+    break
+done
+if [ -z "$otherfs" ]; then
+    fail "no second file system (/dev/shm, /tmp) to put a registry on"
+else
+    mkdir -p "$scratch/rcargo7"
+    ln -s "$otherfs" "$scratch/rcargo7/registry"
+    printf "GATE_RUNNER_CARGO_HOME='%s'\n" "$scratch/rcargo7" >>"$runner_home/config"
+    "$runner_home/bin/remote" preflight >"$scratch/preflight.out" 2>/dev/null
+    expect "the preflight reports the registry on another file system" \
+        "$(sed -n 's/^registry_fs=//p' "$scratch/preflight.out")" "other ($scratch/rcargo7/registry)"
+    reset "$out"
+    GATE_RUNNER_REGISTRY=$regsrc dispatch "$runner_home" "$repo_git" "$base" "$candidate" "$scen" "$out"
+    expect "a runner whose registry is on another file system is refused: exit 3" "$status" 3
+    contains "and says why" "$scratch/dispatch.err" "is not on the file system of its cargo home $scratch/rcargo7"
+    nothing_ran "nothing was run on it"
+    check_status=0
+    GATE_RUNNER_REGISTRY=$regsrc "$repo/deploy/gate-runner.sh" --check "$runner_home" "$repo_git" "$base" "$keysscen" \
+        >"$scratch/check.out" 2>"$scratch/check.err" || check_status=$?
+    expect "--check on it: exit 1" "$check_status" 1
+    contains "with the registry a failure" "$scratch/check.out" "registry     FAIL not on the file system of its cargo home"
+    accept_status=0
+    tar -cf - -C "$regsrc" index | sh "$runner_home/bin/remote" registry-accept 2>"$scratch/accept.err" || accept_status=$?
+    expect "an accept there accepts nothing: exit 2" "$accept_status" 2
+    [ -z "$(ls -A "$otherfs")" ] && pass "and nothing was copied across" || fail "files were copied to the other file system"
+    rm -rf "$otherfs"
+    cp "$scratch/config.orig" "$runner_home/config"
+fi
+for home in rcargo2 rcargo-none-yet; do
+    printf "GATE_RUNNER_CARGO_HOME='%s'\n" "$scratch/$home" >>"$runner_home/config"
+    "$runner_home/bin/remote" preflight >"$scratch/preflight.out" 2>/dev/null
+    expect "a registry in its cargo home, or none yet ($home): the same file system" \
+        "$(sed -n 's/^registry_fs=//p' "$scratch/preflight.out")" same
+    cp "$scratch/config.orig" "$runner_home/config"
+done
+
+# 8t. --check sends the registry before it asks for keys, as a dispatch does:
+# a fresh runner's key run needs every crate (its static checks).
+mkdir -p "$scratch/rcargo8"
+printf "GATE_RUNNER_CARGO_HOME='%s'\n" "$scratch/rcargo8" >>"$runner_home/config"
+reset "$out"
+check_status=0
+GATE_RUNNER_REGISTRY=$regsrc "$repo/deploy/gate-runner.sh" --check "$runner_home" "$repo_git" "$base" "$keysscen" \
+    >"$scratch/check.out" 2>"$scratch/check.err" || check_status=$?
+contains "--check reports what the fresh runner lacks" "$scratch/check.out" "2 file(s) of this host's to send"
+contains "and sends it" "$scratch/check.out" "sending 2 file(s) of the cargo registry"
+diff -r "$regsrc" "$scratch/rcargo8/registry" >/dev/null && pass "the runner's registry is this host's after the check" ||
+    fail "the runner's registry differs from this host's after --check"
+[ -f "$STUB_COUNT_DIR/keys" ] && pass "and then the keys were asked" ||
+    fail "the keys were not asked after the send: $(tail -n 3 "$scratch/check.out" "$scratch/check.err" | tr '\n' ' ')"
 cp "$scratch/config.orig" "$runner_home/config"
 
 # 8n. A runner whose memory is under the floor is refused, before any ship.
