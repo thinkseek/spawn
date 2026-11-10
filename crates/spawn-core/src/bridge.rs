@@ -117,7 +117,7 @@ use crate::port::{
 };
 use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
 use crate::time::{Clock, SystemClock};
-use crate::transcripts;
+use crate::transcripts::{self, ArchiveProgress};
 
 /// Final checkpoints an ending execution tries on consecutive ticks before
 /// its end counts as stalled: the terminal is killed, the workspace stays
@@ -422,7 +422,59 @@ struct Follow {
     /// execution (the terminal gone, or there and hosting no runner): the
     /// end record's `evidence`.
     evidence: Option<String>,
+    /// Where the transcript archive stands with its transcript.
+    archiving: Archiving,
 }
+
+/// How far the archive has an execution's transcript ([`Bridge::keep_archive`]),
+/// as written to its progress record ([`ArchiveProgress`]).
+#[derive(Debug, Clone)]
+struct Archiving {
+    /// The transcript may hold bytes the archive lacks (it was read
+    /// growing, or a copy failed): a copy is made on this pass.
+    due: bool,
+    /// The length of the latest copy after the last copy that succeeded.
+    archived: Option<u64>,
+    /// The time of the first line the archive lacks, after a copy failed.
+    behind_ms: Option<i64>,
+    /// Until when the transcript is known ([`ArchiveProgress::known_ms`]).
+    known_ms: Option<i64>,
+    /// The record last written.
+    written: Option<ArchiveProgress>,
+    /// The last copy's failure, warned when it changes.
+    error: Option<String>,
+}
+
+impl Default for Archiving {
+    fn default() -> Self {
+        Self {
+            // Nothing is known of the file yet: the first pass copies.
+            due: true,
+            archived: None,
+            behind_ms: None,
+            known_ms: None,
+            written: None,
+            error: None,
+        }
+    }
+}
+
+/// An ended execution whose transcript the archive may still lack
+/// ([`Bridge::archive_ended`]): its last record, and the copy's last failure.
+#[derive(Debug, Clone)]
+struct EndedArchive {
+    progress: ArchiveProgress,
+    error: Option<String>,
+}
+
+/// How much earlier than a read of a transcript Spawn takes it to be known:
+/// a line is stamped before it is written, and the watch tells of a write a
+/// moment after it.
+pub const ARCHIVE_SLACK_MS: i64 = 2_000;
+
+/// How often a live execution's progress record is written again when only
+/// the time it is known until moved.
+pub const PROGRESS_REFRESH_MS: i64 = 2_000;
 
 /// A kill of an execution's terminal running on a thread of its own
 /// ([`Bridge::kill`]): its result and how long it waited, once it is done.
@@ -747,6 +799,14 @@ pub struct Bridge {
     warned: std::sync::Mutex<HashMap<SessionId, HashSet<String>>>,
     /// Where the engines' transcripts are copied ([`crate::transcripts`]).
     transcripts: Option<Arc<dyn TranscriptArchive>>,
+    /// Ended executions whose transcripts the archive may lack, per agent
+    /// and native session: copied again on every pass until the copy is
+    /// made. Rebuilt after a restart from the progress records
+    /// ([`Bridge::recover`]): never only in memory.
+    ended_archives: std::sync::Mutex<BTreeMap<(AgentId, String), EndedArchive>>,
+    /// When this pass began, by the Bridge's clock: a transcript the watch
+    /// says nothing of is known unchanged until then.
+    pass_started: i64,
     /// The latest claim of each input this Bridge left waiting, so that an
     /// execution's end fails them in the same tick. Only a shortcut: a
     /// restarted Bridge, which has none, fails them when it claims them
@@ -854,6 +914,8 @@ impl Bridge {
             unrecorded_commits: std::sync::Mutex::default(),
             warned: std::sync::Mutex::default(),
             transcripts: None,
+            ended_archives: std::sync::Mutex::default(),
+            pass_started: i64::MIN,
             held: HashMap::new(),
             touched: HashSet::new(),
             backstops: std::sync::atomic::AtomicUsize::new(0),
@@ -863,8 +925,9 @@ impl Bridge {
         }
     }
 
-    /// Copy every engine's transcript into `archive` at turn ends and
-    /// execution ends, and restore a missing one from it before a resume.
+    /// Copy every engine's transcript into `archive` on the passes it grew,
+    /// at turn ends and execution ends, and restore a missing one from it
+    /// before a resume.
     #[must_use]
     pub fn with_transcript_archive(mut self, archive: Arc<dyn TranscriptArchive>) -> Self {
         self.transcripts = Some(archive);
@@ -911,6 +974,7 @@ impl Bridge {
         self.cursor = GlobalPosition(0);
         self.sessions.clear();
         self.catch_up()?;
+        self.recover_archives();
         self.rederive_unrecorded();
         self.release_orphan_mounts()?;
         Ok(())
@@ -1233,10 +1297,34 @@ impl Bridge {
                 }
             }
             EventKind::ExecutionEnded { .. } if current && event.source == Source::Bridge => {
-                if let Some(active) = view.active.take()
-                    && let Some(watch) = &self.config.watch
-                {
-                    watch.unwatch(&watch_key(&active.execution_id));
+                if let Some(active) = view.active.take() {
+                    if let Some(watch) = &self.config.watch {
+                        watch.unwatch(&watch_key(&active.execution_id));
+                    }
+                    // However it ended, what its transcript holds is
+                    // copied, and its record says it ended: on the next
+                    // pass, and every pass after until the copy is made.
+                    if let (Some(native), Some(_)) = (view.native.clone(), &self.transcripts) {
+                        let progress = ArchiveProgress {
+                            agent: view.agent_id.clone(),
+                            native: native.clone(),
+                            session: event.session_id.clone(),
+                            execution: active.execution_id.clone(),
+                            workspace: active.workspace.clone(),
+                            live: false,
+                            known_ms: i64::MIN,
+                            archived: active.follow.archiving.archived,
+                            behind_ms: active.follow.archiving.behind_ms,
+                        };
+                        self.ended_archives
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .entry((view.agent_id.clone(), native))
+                            .or_insert(EndedArchive {
+                                progress,
+                                error: None,
+                            });
+                    }
                 }
             }
             // An exit report of an old runner (engine-sourced; runners now
@@ -1298,6 +1386,7 @@ impl Bridge {
     }
 
     fn act(&mut self, report: &mut TickReport) -> Result<(), StoreError> {
+        self.pass_started = self.clock.now().0;
         // Sessions with no running execution have no `advance` to do it.
         self.flush_unrecorded(report);
         let running: Vec<(SessionId, AgentId, Option<String>, Active)> = self
@@ -1350,6 +1439,7 @@ impl Bridge {
                 self.fail_waiting(&session, cause)?;
             }
         }
+        self.archive_ended(report);
         Ok(())
     }
 
@@ -1414,17 +1504,18 @@ impl Bridge {
         if let Some(ending) = end {
             // What the engine wrote last comes before its end.
             self.follow_output(agent_id, session, native, active, report)?;
+            self.keep_archive(agent_id, session, active, true, report);
             return self.end(agent_id, session, active, ending, false, report);
         }
         if let Some(reason) = active.checkpoint {
             // A commit that failed was reported; the checkpoint stays due.
             if self.checkpoint(agent_id, session, active, reason, report)? {
                 active.checkpoint = None;
-                if reason == CheckpointReason::TurnStopped {
-                    self.archive_transcript(agent_id, session, active, report);
-                }
             }
         }
+        // What the engine wrote is in the archive within a pass, a running
+        // turn's model calls too, not only at the turn's end.
+        self.keep_archive(agent_id, session, active, true, report);
         if active.follow.stale.is_some() {
             return self.end(
                 agent_id,
@@ -1561,6 +1652,8 @@ impl Bridge {
                 return Ok(());
             }
             Err(error) => {
+                // Nothing is known of what it holds: the archive reads it.
+                active.follow.archiving.due = true;
                 if !active.follow.warned {
                     active.follow.warned = true;
                     report
@@ -1573,8 +1666,10 @@ impl Bridge {
             }
         };
         if !bytes.is_empty() {
-            // The transcript grew: its screen is looked at once it holds
-            // still, not while it is being written.
+            // The transcript grew: the archive copies it on this pass.
+            active.follow.archiving.due = true;
+            // Its screen is looked at once it holds still, not while it is
+            // being written.
             active.follow.unread_since = Some(self.clock.now().0);
             active.follow.due_at = None;
         }
@@ -2029,7 +2124,8 @@ impl Bridge {
             return self.end_failed(agent_id, session, active, (true, error), report);
         }
         // The transcript is whole now, and a container's copy goes next.
-        self.archive_transcript(agent_id, session, active, report);
+        // A copy that fails is made on a later pass ([`Self::archive_ended`]).
+        self.keep_archive(agent_id, session, active, false, report);
         self.append(
             agent_id,
             session,
@@ -3131,33 +3227,267 @@ impl Bridge {
     }
 
     /// Copy what the engine appended to its transcript into the archive,
-    /// if there is one. A failure is warned; the next copy tries again.
-    fn archive_transcript(
+    /// if there is one, and record where the archive stands
+    /// ([`ArchiveProgress`]). A copy is made when the transcript was read
+    /// growing on this pass, a copy failed before, or the execution is
+    /// ending (`live` false); otherwise nothing was added and the
+    /// transcript is only known unchanged until this pass. A failure is
+    /// warned when it changes, and the copy is made again next pass; the
+    /// record then says from when the archive lacks lines.
+    fn keep_archive(
         &self,
         agent_id: &AgentId,
         session: &SessionId,
-        active: &Active,
+        active: &mut Active,
+        live: bool,
         report: &mut TickReport,
     ) {
         let native = self
             .sessions
             .get(session)
-            .and_then(|view| view.native.as_deref());
+            .and_then(|view| view.native.clone());
         let (Some(archive), Some(native)) = (self.transcripts.as_deref(), native) else {
             return;
         };
-        let path = transcript_path(&self.config.claude_projects, &active.workspace, native);
-        if let Err(error) = transcripts::archive(
+        let path = transcript_path(&self.config.claude_projects, &active.workspace, &native);
+        let state = &mut active.follow.archiving;
+        if state.due || !live {
+            let error = self.copy_transcript(
+                archive,
+                agent_id,
+                &native,
+                &active.workspace,
+                &path,
+                (&mut state.archived, &mut state.behind_ms, &mut state.known_ms),
+            );
+            state.due = error.is_some();
+            if let Some(error) = &error
+                && state.error.as_ref() != Some(error)
+            {
+                report
+                    .warnings
+                    .push(format!("{session}: archive the transcript: {error}"));
+            }
+            state.error = error;
+        } else {
+            // Nothing was added: read empty, or the watch told of no write.
+            let known = self.pass_started.saturating_sub(ARCHIVE_SLACK_MS);
+            state.known_ms = Some(state.known_ms.map_or(known, |was| was.max(known)));
+        }
+        let progress = ArchiveProgress {
+            agent: agent_id.clone(),
+            native,
+            session: session.clone(),
+            execution: active.execution_id.clone(),
+            workspace: active.workspace.clone(),
+            live,
+            known_ms: state.known_ms.unwrap_or(i64::MIN),
+            archived: state.archived,
+            behind_ms: unknown_behind(state.behind_ms, state.known_ms, live),
+        };
+        let fresh = state.written.as_ref().is_some_and(|written| {
+            ArchiveProgress {
+                known_ms: written.known_ms,
+                ..progress.clone()
+            } == *written
+                && progress.known_ms.saturating_sub(written.known_ms) < PROGRESS_REFRESH_MS
+        });
+        if fresh && live {
+            return;
+        }
+        match archive.put_progress(&progress, !live) {
+            Ok(()) => state.written = Some(progress.clone()),
+            Err(error) => report
+                .warnings
+                .push(format!("{session}: record the transcript archive's progress: {error}")),
+        }
+        if !live && progress.behind_ms.is_some() {
+            self.ended_archives
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    (agent_id.clone(), progress.native.clone()),
+                    EndedArchive {
+                        progress,
+                        error: state.error.clone(),
+                    },
+                );
+        }
+    }
+
+    /// One copy of the transcript at `path` into the archive: on success the
+    /// archive's length and nothing behind, known until the read; on
+    /// failure the time of the first line the archive lacks, if the
+    /// transcript can be read. The copy's failure, if it failed.
+    fn copy_transcript(
+        &self,
+        archive: &dyn TranscriptArchive,
+        agent_id: &AgentId,
+        native: &str,
+        workspace: &WorkspaceId,
+        path: &str,
+        (archived, behind_ms, known_ms): (&mut Option<u64>, &mut Option<i64>, &mut Option<i64>),
+    ) -> Option<String> {
+        let read_at = self.clock.now().0.saturating_sub(ARCHIVE_SLACK_MS);
+        let mut known = |known_ms: &mut Option<i64>| {
+            *known_ms = Some(known_ms.map_or(read_at, |was| was.max(read_at)));
+        };
+        match transcripts::archive_to(
             self.terminals.as_ref(),
             archive,
-            &active.workspace,
-            &path,
+            workspace,
+            path,
             agent_id,
             native,
         ) {
-            report
-                .warnings
-                .push(format!("{session}: archive the transcript: {error}"));
+            Ok(done) => {
+                if done.length.is_some() {
+                    *archived = done.length;
+                }
+                *behind_ms = None;
+                known(known_ms);
+                None
+            }
+            Err(error) => {
+                // The first line it lacks stays the first while nothing more
+                // is archived: read once.
+                if behind_ms.is_none() {
+                    match transcripts::first_line_ms(
+                        self.terminals.as_ref(),
+                        workspace,
+                        path,
+                        archived.unwrap_or(0),
+                    ) {
+                        Ok(at) => {
+                            *behind_ms = at;
+                            known(known_ms);
+                        }
+                        Err(_) => return Some(error),
+                    }
+                } else {
+                    known(known_ms);
+                }
+                Some(error)
+            }
+        }
+    }
+
+    /// The ended executions whose transcripts the archive may lack, copied
+    /// again: each copy made is recorded (its record says it ended, nothing
+    /// behind) and the execution leaves the list; one that fails is warned
+    /// when its failure changes and stays for the next pass. A native
+    /// session a live execution runs again is that execution's to copy.
+    fn archive_ended(&self, report: &mut TickReport) {
+        let Some(archive) = self.transcripts.as_deref() else {
+            return;
+        };
+        let ended: Vec<((AgentId, String), EndedArchive)> = self
+            .ended_archives
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        for (key, mut entry) in ended {
+            let live = self.sessions.values().any(|view| {
+                view.active.is_some()
+                    && view.agent_id == key.0
+                    && view.native.as_deref() == Some(key.1.as_str())
+            });
+            let progress = &mut entry.progress;
+            let done = if live {
+                true
+            } else {
+                let path = transcript_path(
+                    &self.config.claude_projects,
+                    &progress.workspace,
+                    &progress.native,
+                );
+                let mut known = (progress.known_ms != i64::MIN).then_some(progress.known_ms);
+                let error = self.copy_transcript(
+                    archive,
+                    &progress.agent,
+                    &progress.native,
+                    &progress.workspace,
+                    &path,
+                    (&mut progress.archived, &mut progress.behind_ms, &mut known),
+                );
+                if let Some(error) = &error
+                    && entry.error.as_ref() != Some(error)
+                {
+                    report.warnings.push(format!(
+                        "{}: archive the transcript of ended {}: {error}",
+                        progress.session, progress.execution
+                    ));
+                }
+                entry.error = error;
+                progress.live = false;
+                progress.known_ms = known.unwrap_or(i64::MIN);
+                progress.behind_ms = unknown_behind(progress.behind_ms, known, false);
+                let put = archive.put_progress(progress, true);
+                if let Err(put) = &put {
+                    report.warnings.push(format!(
+                        "{}: record the transcript archive's progress: {put}",
+                        progress.session
+                    ));
+                }
+                put.is_ok() && progress.behind_ms.is_none()
+            };
+            let mut list = self
+                .ended_archives
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if done {
+                list.remove(&key);
+            } else {
+                list.insert(key, entry);
+            }
+        }
+    }
+
+    /// After a restart, where the archive stood is read back from its
+    /// progress records: a live execution's copy goes on from its length,
+    /// and an ended one whose record is not settled (it says the archive
+    /// lacks lines, or that it was live, its end unrecorded there) is
+    /// copied again until the copy is made ([`Self::archive_ended`]).
+    fn recover_archives(&mut self) {
+        let mut list = self
+            .ended_archives
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // What folding the whole log put there is every end ever: the
+        // records say which of them are not settled.
+        list.clear();
+        let Some(archive) = self.transcripts.as_deref() else {
+            return;
+        };
+        let records = match archive.progress() {
+            Ok(records) => records,
+            Err(error) => {
+                eprintln!("spawn: the transcript archive's progress: {error}");
+                return;
+            }
+        };
+        for record in records {
+            let running = self.sessions.values_mut().find_map(|view| {
+                (view.agent_id == record.agent
+                    && view.native.as_deref() == Some(record.native.as_str()))
+                .then_some(view.active.as_mut())
+                .flatten()
+            });
+            if let Some(active) = running {
+                active.follow.archiving.archived = record.archived;
+                continue;
+            }
+            if record.live || record.behind_ms.is_some() {
+                list.insert(
+                    (record.agent.clone(), record.native.clone()),
+                    EndedArchive {
+                        progress: record,
+                        error: None,
+                    },
+                );
+            }
         }
     }
 
@@ -4267,6 +4597,16 @@ pub fn claude_session_id(execution: &ExecutionId) -> String {
 /// in `workspace`: its projects directory, one directory per working
 /// directory with every character but ASCII letters and digits replaced by
 /// `-`, one file per session.
+/// What a record says is behind: a transcript never known (no read of it
+/// succeeded) of an execution that ended is taken as lacking everything,
+/// since no later read will tell (a live one says so by its `known_ms`).
+fn unknown_behind(behind_ms: Option<i64>, known_ms: Option<i64>, live: bool) -> Option<i64> {
+    if known_ms.is_none() && !live {
+        return Some(behind_ms.unwrap_or(i64::MIN));
+    }
+    behind_ms
+}
+
 pub fn transcript_path(projects: &str, workspace: &WorkspaceId, native: &str) -> String {
     let directory: String = workspace
         .path()
