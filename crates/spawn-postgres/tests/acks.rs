@@ -105,7 +105,12 @@ fn an_ack_is_recorded_once_and_only_for_the_panes_own_message() {
         "bb-3",
         &json!({"type": "key", "key": "enter"}),
     );
-    let bare_start = command(&mut client, "agent_worker_a_1", "bb-4", &json!({"type": "start"}));
+    let bare_start = command(
+        &mut client,
+        "agent_worker_a_1",
+        "bb-4",
+        &json!({"type": "start"}),
+    );
     let delivery = command(
         &mut client,
         "agent_worker_a_1",
@@ -129,7 +134,12 @@ fn an_ack_is_recorded_once_and_only_for_the_panes_own_message() {
         }
     );
     let again = store
-        .record_ack("agent_worker_a_1", mine, "declined", Some("changed my mind"))
+        .record_ack(
+            "agent_worker_a_1",
+            mine,
+            "declined",
+            Some("changed my mind"),
+        )
         .expect("the second ack reads");
     assert_eq!(again, AckRecord::Answered, "the first ack stands");
     let read = message(&mut client, mine);
@@ -156,7 +166,12 @@ fn an_ack_is_recorded_once_and_only_for_the_panes_own_message() {
 
     // The other agent answers its own, declined with a why.
     assert!(matches!(
-        store.record_ack("agent_worker_b_2", theirs, "declined", Some("busy elsewhere")),
+        store.record_ack(
+            "agent_worker_b_2",
+            theirs,
+            "declined",
+            Some("busy elsewhere")
+        ),
         Ok(AckRecord::Recorded { .. })
     ));
     assert_eq!(
