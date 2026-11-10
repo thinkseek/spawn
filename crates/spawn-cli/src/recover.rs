@@ -195,6 +195,12 @@ pub(crate) enum Cause {
     DiskFull,
     Budget,
     Stopped,
+    /// A restart's Stop ended it (`spawn task restart`): the dispatcher,
+    /// not the recovery, resumes the session.
+    Restarted,
+    /// A reassign's Stop ended it (`spawn task reassign`): its task went to
+    /// a fresh worker, and nothing revives this one.
+    Reassigned,
 }
 
 impl Cause {
@@ -212,6 +218,8 @@ impl Cause {
             Self::DiskFull => "disk_full",
             Self::Budget => "budget",
             Self::Stopped => "stopped",
+            Self::Restarted => "restarted",
+            Self::Reassigned => "reassigned",
         }
     }
 
@@ -224,7 +232,7 @@ impl Cause {
             | Self::ModelAuth
             | Self::DatabaseUnavailable
             | Self::DiskFull => Path::Wait,
-            Self::ModelError | Self::Stopped => Path::Final,
+            Self::ModelError | Self::Stopped | Self::Restarted | Self::Reassigned => Path::Final,
         }
     }
 }
@@ -441,6 +449,92 @@ pub(crate) struct Facts<'a> {
     /// how a `stopped` end came about, in its evidence.
     pub(crate) retired: bool,
     pub(crate) task_cancelled: bool,
+    /// The Stop that ended it was a restart's or a reassign's, the
+    /// dispatcher's own, as its record names it ([`moved`]).
+    pub(crate) moved: Option<Moved>,
+}
+
+/// What a restart or a reassign did to an execution: its Stop, the
+/// dispatcher's own, keyed as the record gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Moved {
+    /// `restart-<task>-<n>-stop`, of the task's latest `task.restarted`
+    /// (`n`).
+    Restarted { task: i64, n: i64 },
+    /// `reassign-<task>-stop`, of the task whose `task.cancelled` names
+    /// `reassigned_as` (`to_task`), whose worker runs in `to_session`.
+    Reassigned {
+        task: i64,
+        to_task: i64,
+        to_session: Option<String>,
+    },
+}
+
+/// The restart or reassign that ended an execution of `session`, from its
+/// Stops (`stops`, oldest first) and the mission rows: the latest Stop that
+/// may have stopped it, the recovery's own aside, is the dispatcher's
+/// (principal `spawn-dispatch`), keyed by a restart of the task's latest
+/// `task.restarted` or by the reassign its `task.cancelled` names; a retry
+/// of the dispatcher's Stop (`stop-<execution>-retry-<n>`) carries the
+/// purpose of the first Stop it retries. A Stop from anyone else, whatever
+/// its key, is none: that end is `stopped`.
+pub(crate) fn moved(stops: &[Stop], session: &str, work: &Work) -> Option<Moved> {
+    let dispatcher = crate::dispatch::DISPATCHER;
+    let last = stops
+        .iter()
+        .rev()
+        .find(|stop| !stop.ours() && stop.reached())?;
+    if last.principal != dispatcher {
+        return None;
+    }
+    let stop = if last.key.starts_with("stop-") {
+        stops
+            .iter()
+            .find(|stop| stop.principal == dispatcher && !stop.key.starts_with("stop-"))?
+    } else {
+        last
+    };
+    if let Some((task, n)) = stop
+        .key
+        .strip_prefix("restart-")
+        .and_then(|rest| rest.strip_suffix("-stop"))
+        .and_then(|rest| rest.split_once('-'))
+    {
+        let (task, n) = (task.parse::<i64>().ok()?, n.parse::<i64>().ok()?);
+        return work
+            .tasks
+            .iter()
+            .any(|row| {
+                row.id == task
+                    && row.session_id == session
+                    && row.restart.as_ref().is_some_and(|restart| restart.n == n)
+            })
+            .then_some(Moved::Restarted { task, n });
+    }
+    let task = stop
+        .key
+        .strip_prefix("reassign-")
+        .and_then(|rest| rest.strip_suffix("-stop"))?
+        .parse::<i64>()
+        .ok()?;
+    let from_rows = work.tasks.iter().find_map(|row| {
+        (row.id == task && row.session_id == session)
+            .then(|| row.reassigned_as.zip(Some(row.reassigned_to_session.clone())))
+            .flatten()
+    });
+    let from_cancelled = || {
+        work.cancelled.iter().find_map(|row| {
+            (row.id == task && row.session_id == session)
+                .then(|| row.reassigned_as.zip(Some(row.reassigned_to_session.clone())))
+                .flatten()
+        })
+    };
+    let (to_task, to_session) = from_rows.or_else(from_cancelled)?;
+    Some(Moved::Reassigned {
+        task,
+        to_task,
+        to_session,
+    })
 }
 
 /// The cause of an execution's end, its facts given. The first that holds
@@ -449,6 +543,11 @@ pub(crate) struct Facts<'a> {
 /// a signal before a clean exit.
 pub(crate) fn classify(facts: &Facts<'_>) -> Cause {
     let end = facts.end.cloned().unwrap_or_default();
+    match (&facts.moved, facts.stop) {
+        (Some(Moved::Restarted { .. }), Some(_)) => return Cause::Restarted,
+        (Some(Moved::Reassigned { .. }), Some(_)) => return Cause::Reassigned,
+        _ => {}
+    }
     if facts.stop.is_some() || end.cause == "stopped" {
         return Cause::Stopped;
     }
@@ -1098,9 +1197,19 @@ fn kept(agent: &str, session: &str, work: &Work, residents: &BTreeMap<String, St
         return true;
     }
     agent.starts_with("agent_worker_")
-        && work.tasks.iter().any(|task| {
+        && (work.tasks.iter().any(|task| {
             task.session_id == session && task.state == spawn_core::mission::TaskState::Delivered
-        })
+        }) || reassigned_away(session, work))
+}
+
+/// Whether `session` is an ephemeral worker whose task was reassigned
+/// (`spawn task reassign`): the recovery records its end (`reassigned`, by
+/// the reassign's Stop) and never revives it, whatever earlier record it
+/// has: its task went to a fresh worker.
+fn reassigned_away(session: &str, work: &Work) -> bool {
+    work.tasks.iter().any(|task| {
+        task.session_id == session && task.kind == "ephemeral" && task.reassigned_as.is_some()
+    })
 }
 
 /// The host's boot id (`/proc/sys/kernel/random/boot_id`), or `unknown` on a
@@ -1150,6 +1259,10 @@ impl One<'_> {
         }
         if let Some(fact) = self.next_fact() {
             self.interrupt(fact)?;
+        }
+        // A worker whose task went to a fresh one is never revived.
+        if reassigned_away(&self.row.session_id, self.work) {
+            return Ok(());
         }
         self.resume_path()
     }
@@ -1524,6 +1637,7 @@ impl One<'_> {
             retired: self.retired.contains(&self.row.session_id),
             task_cancelled: false,
             model_error: self.refused_turn(end),
+            moved: moved(&self.row.stops, &self.row.session_id, self.work),
         };
         let cause = classify(&facts);
         let mut evidence = self.end_evidence(cause, end, &facts);
@@ -1565,6 +1679,30 @@ impl One<'_> {
                 }
                 if facts.task_cancelled {
                     evidence.insert("task_cancelled".to_string(), json!(true));
+                }
+            }
+            Cause::Restarted | Cause::Reassigned => {
+                if let Some(stop) = facts.stop {
+                    evidence.insert("command_id".to_string(), json!(stop.command_id));
+                    evidence.insert("principal".to_string(), json!(stop.principal));
+                    evidence.insert("command".to_string(), json!(stop.action));
+                    evidence.insert("key".to_string(), json!(stop.key));
+                }
+                match &facts.moved {
+                    Some(Moved::Restarted { task, n }) => {
+                        evidence.insert("task".to_string(), json!(task));
+                        evidence.insert("n".to_string(), json!(n));
+                    }
+                    Some(Moved::Reassigned {
+                        task,
+                        to_task,
+                        to_session,
+                    }) => {
+                        evidence.insert("task".to_string(), json!(task));
+                        evidence.insert("to_task".to_string(), json!(to_task));
+                        evidence.insert("to_session".to_string(), json!(to_session));
+                    }
+                    None => {}
                 }
             }
             Cause::Budget => {
@@ -2385,6 +2523,8 @@ impl Cause {
             Self::DiskFull,
             Self::Budget,
             Self::Stopped,
+            Self::Restarted,
+            Self::Reassigned,
         ]
         .into_iter()
         .find(|cause| cause.name() == name)
