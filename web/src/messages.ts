@@ -70,10 +70,18 @@ export function messageDuration(ms: number): string {
 
 /** The words for a command's message, null when it has none. Taken: how
  * long after the command was created; answered: how long after it was
- * taken; the count when more than one line took it. */
+ * taken; the count when more than one line took it; then the agent's
+ * answer, when it gave one. */
 export function messageLine(command: MessageCommand): string | null {
   const message = command.message;
   if (!message) return null;
+  const said = lifecycle(command, message);
+  const acted = actedWords(message.acted);
+  return acted ? `${said} · ${acted}` : said;
+}
+
+/** What 045 says of a message: its lifecycle. */
+function lifecycle(command: MessageCommand, message: CommandMessage): string {
   if (message.taken_at_ms === null || message.taken_at_ms === undefined || message.taken < 1) {
     const typed = message.typed_at_ms !== null && message.typed_at_ms !== undefined;
     if (message.not_taken) return typed ? "not taken (typed)" : "not taken (never typed)";
@@ -84,7 +92,5 @@ export function messageLine(command: MessageCommand): string | null {
     parts.push(`answered in ${messageDuration(message.answered_at_ms - message.taken_at_ms)}`);
   }
   if (message.taken > 1) parts.push(`taken ${message.taken}×`);
-  const acted = actedWords(message.acted);
-  if (acted) parts.push(acted);
   return parts.join(" · ");
 }
