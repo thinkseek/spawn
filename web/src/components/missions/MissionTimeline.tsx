@@ -1,4 +1,4 @@
-import { Ban, CalendarClock, Check, ChevronRight, FoldHorizontal, OctagonAlert, RotateCcw } from "lucide-react";
+import { Ban, CalendarClock, Check, ChevronRight, CircleHelp, FoldHorizontal, Lock, OctagonAlert, RotateCcw } from "lucide-react";
 import { AnimatePresence, useReducedMotion } from "motion/react";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, MouseEvent, PointerEvent, ReactNode } from "react";
@@ -11,7 +11,12 @@ import {
   earlierLabel,
   filterLanes,
   hasBars,
+  holdText,
+  holdTitle,
   isLive,
+  laneLifetimeText,
+  laneToday,
+  laneTodayText,
   phaseAt,
   splitEarlier,
 } from "../../missionTimeline";
@@ -23,6 +28,7 @@ import type {
   VerdictMark,
   VerdictReasons,
 } from "../../missionTimeline";
+import type { SourceHold } from "../../attention";
 import type { Mission } from "../../missions";
 import type { TaskSection } from "../../ordering";
 import { SECTION_LABEL, groupTasks, missionClass, taskTitle } from "../../ordering";
@@ -46,6 +52,7 @@ import {
 } from "../timeaxis/TimeAxis";
 import {
   useDragPan,
+  useNowEvery,
   useNowWhile,
   useTimeWindow,
   useWheelZoom,
@@ -130,6 +137,7 @@ export function MissionTimeline({
   compact = false,
   onSelectTask,
   selectedTask = null,
+  holds = [],
 }: {
   missions: readonly Mission[];
   header: ReactNode;
@@ -137,6 +145,8 @@ export function MissionTimeline({
   compact?: boolean;
   onSelectTask?: (task: number) => void;
   selectedTask?: number | null;
+  /** The owner's holds on sources: a held one shows on its mission's row. */
+  holds?: readonly SourceHold[];
 }) {
   const reduceMotion = useReducedMotion() ?? false;
   const ids = useId();
@@ -145,6 +155,10 @@ export function MissionTimeline({
   const all = useMemo(() => deriveMissionTimeline(missions, Date.now(), reasons), [missions, reasons]);
   const live = isLive(all);
   const now = useNowWhile(live);
+  // The headers' words ("in 24 h", "2 h ago", "expires in") age on a quiet
+  // page too: their own clock ticks each minute whether or not a bar is open.
+  const minute = useNowEvery(60_000);
+  const clock = Math.max(now, minute);
   // Ordering and extent depend on now only through open bars.
   const timeline = useMemo(
     () => (all.openCount > 0 ? deriveMissionTimeline(missions, now, reasons) : all),
@@ -168,6 +182,7 @@ export function MissionTimeline({
   };
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [hover, setHover] = useState<Hover | null>(null);
+  const [legendOpen, setLegendOpen] = useState(false);
   // The window's left edge once it rests (real time), or null while the
   // window reaches back to the first task; and the folded rows the reader
   // opened, by section key (P10).
@@ -510,7 +525,24 @@ export function MissionTimeline({
     <div ref={rootRef} className="relative flex min-h-0 flex-1 flex-col">
       <div className="flex min-h-11 shrink-0 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2 sm:px-5">
         {header}
-        {!empty && <Legend />}
+        {/* The phases' colours are read once: behind a "?" (design §2.3). */}
+        {!empty && (
+          <button
+            type="button"
+            aria-expanded={legendOpen}
+            aria-label="What the colours mean"
+            title="What the colours mean"
+            onClick={() => setLegendOpen((open) => !open)}
+            className={cx(
+              "inline-flex size-7 items-center justify-center rounded-md text-faint-foreground hover:bg-surface-hover hover:text-foreground",
+              legendOpen && "text-foreground",
+              FOCUS_RING,
+            )}
+          >
+            <CircleHelp size={14} />
+          </button>
+        )}
+        {!empty && legendOpen && <Legend />}
         {!empty && (
           <div className="ml-auto flex items-center gap-1">
             {fold !== LINEAR || folding === "off" ? (
@@ -722,6 +754,8 @@ export function MissionTimeline({
                         <LaneLabel
                           key={row.key}
                           row={row}
+                          now={clock}
+                          hold={holds.find((hold) => hold.hold === row.lane.mission.hold) ?? null}
                           collapsed={row.folded}
                           onToggle={() => toggleFold(row.key, row.folded)}
                         />
@@ -780,7 +814,7 @@ function scrollIntoView(element: HTMLElement | null, top: number, height: number
 
 function Legend() {
   return (
-    <ul className="hidden min-w-0 flex-wrap items-center gap-x-3 gap-y-1 md:flex" aria-label="Phases">
+    <ul className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1" aria-label="Phases">
       {PHASE_LEGEND.map((entry) => (
         <li key={entry.label} className="flex items-center gap-1.5 text-caption text-muted-foreground">
           <span
@@ -1008,16 +1042,24 @@ const LANE_STATE: Record<Lane["state"], { label: string; dot: string; text: stri
 
 function LaneLabel({
   row,
+  now,
+  hold,
   collapsed,
   onToggle,
 }: {
   row: Extract<Row, { kind: "lane" }>;
+  now: number;
+  /** Its source's hold, when the owner holds it. */
+  hold: SourceHold | null;
   collapsed: boolean;
   onToggle: () => void;
 }) {
   const { lane } = row;
   const state = LANE_STATE[lane.state];
-  const counts = lane.counts;
+  // Its day, not its lifetime (design §2.3); the totals are in the title.
+  const day = laneToday(lane, now);
+  const today = laneTodayText(day, now);
+  const lifetime = laneLifetimeText(lane.counts);
   return (
     <div
       role="treeitem"
@@ -1057,15 +1099,18 @@ function LaneLabel({
             </span>
           )}
         </span>
-        <span className="tnum hidden shrink-0 text-caption text-faint-foreground sm:inline">
-          {lane.mission.gate ? `accept ${lane.mission.accept === "gate" ? "gate" : "review → gate"}` : "review"}
-          {" · "}
-          {counts.total} task{counts.total === 1 ? "" : "s"}
-          {counts.landed > 0 && ` · ${counts.landed} landed`}
-          {counts.open > 0 && ` · ${counts.open} open`}
-          {counts.sentBack > 0 && ` · ${counts.sentBack} sent back`}
-          {counts.cancelled > 0 && ` · ${counts.cancelled} cancelled`}
+        <span
+          className="tnum hidden min-w-0 truncate text-caption text-muted-foreground sm:inline"
+          title={`${today}${day.lastBack?.reason ? `\n\n${day.lastBack.reason}\n` : ""}\n${lifetime}\naccepted by ${lane.mission.gate ? (lane.mission.accept === "gate" ? "the gate" : "review, then the gate") : "review"}`}
+        >
+          {today}
         </span>
+        {hold && (
+          <span className="flex shrink-0 items-center gap-1 text-caption text-warning" title={holdTitle(hold, now)}>
+            <Lock size={11} aria-hidden="true" />
+            {holdText(hold, now)}
+          </span>
+        )}
       </button>
     </div>
   );
