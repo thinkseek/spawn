@@ -1838,7 +1838,9 @@ impl One<'_> {
         let execution = self.execution();
         let (Ok(id), Ok(workspace)) = (
             spawn_core::id::ExecutionId::new(execution.id.as_str()),
-            spawn_core::id::WorkspaceId::new(execution.workspace.unwrap_or_default()),
+            spawn_core::id::WorkspaceId::new(
+                execution.workspace.unwrap_or_else(|| "0:/".to_string()),
+            ),
         ) else {
             return false;
         };
