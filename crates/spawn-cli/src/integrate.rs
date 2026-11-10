@@ -15140,4 +15140,186 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// The types of the integrator's records after `after` (an event id),
+    /// in log order, with the task each names (its `id`).
+    fn record_types_after(db: &Db, after: i64) -> Vec<(String, Option<i64>)> {
+        db.admin()
+            .query(
+                "select kind -> 'detail' -> 'record' ->> 'type',
+                        (kind -> 'detail' -> 'record' ->> 'id')::bigint
+                   from spawn_events
+                  where session_id = 'session_control' and id > $1
+                    and event_name = 'control.recorded'
+                  order by session_seq",
+                &[&after],
+            )
+            .expect("records")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
+    fn last_event(db: &Db) -> i64 {
+        db.admin()
+            .query_one("select coalesce(max(id), 0) from spawn_events", &[])
+            .expect("last event")
+            .get(0)
+    }
+
+    /// A drain (objective 37): task A's gate runs when it is asked;
+    /// `integrator.draining` names [A] and the bound. Task B, reported on
+    /// another source meanwhile, gets no gate through any number of passes,
+    /// although a gate is free, and the drain is not over while A's runs.
+    /// Released, A is accepted and lands, and the pass after records
+    /// `integrator.drained`, after the landing; B is still `reported`.
+    #[test]
+    fn a_drain_lets_the_running_gate_land_and_starts_none() {
+        let marks = fresh_marks("spawn-db-drain-marks");
+        let _release = Release(marks.clone());
+        let (base_a, source_a, scenarios, mut integrator) =
+            world("drain-a", &holding_gate(&marks));
+        integrator.gates = 2;
+        let (base_b, source_b, _, _) = world("drain-b", "exit 1\n");
+        let db = Db::new("drain");
+        let a = db.gated_mission(&source_a, &scenarios);
+        let b = db.gated_mission(&source_b, &scenarios);
+        let a_task = db.reported_task(a, "a1");
+        push_work(&base_a, &source_a, &agent_of(&db, a, a_task), "a1.txt");
+        integrator.pass_on(&db.store).expect("the first pass");
+        assert_eq!(wait_started(&marks, 1).len(), 1, "A's gate runs");
+        let mark = last_event(&db);
+
+        integrator.begin_drain(Some(&db.store), 7200);
+        assert!(integrator.draining());
+        assert_eq!(
+            control_records(&db, "integrator.draining"),
+            vec![json!({"type": "integrator.draining", "gates": [a_task], "bound_s": 7200})]
+        );
+        let b_task = db.reported_task(b, "b1");
+        push_work(&base_b, &source_b, &agent_of(&db, b, b_task), "b1.txt");
+        for _ in 0..3 {
+            integrator.pass_on(&db.store).expect("a pass while draining");
+            assert!(
+                !integrator.drained(Some(&db.store), true),
+                "not drained while A's gate runs"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(started(&marks).len(), 1, "no gate starts while draining");
+
+        std::fs::write(marks.join("release"), "").expect("release");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            integrator.reap();
+            integrator.pass_on(&db.store).expect("a pass");
+            if integrator.drained(Some(&db.store), true) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never drained: {:?}",
+                record_types_after(&db, mark)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let records = record_types_after(&db, mark);
+        let at = |kind: &str, task: Option<i64>| {
+            records
+                .iter()
+                .position(|(seen, id)| seen == kind && *id == task)
+                .unwrap_or_else(|| panic!("no {kind} in {records:?}"))
+        };
+        assert!(at("task.landed", Some(a_task)) < at("integrator.drained", None));
+        assert!(
+            !records
+                .iter()
+                .any(|(kind, id)| *id == Some(b_task) && kind.starts_with("task.gated")),
+            "no verdict on B: {records:?}"
+        );
+        assert_eq!(db.mission(a)["tasks"][0]["state"], "landed");
+        assert_eq!(db.mission(b)["tasks"][0]["state"], "reported");
+        assert_eq!(started(&marks).len(), 1, "B never had a gate");
+        assert_eq!(
+            control_records(&db, "integrator.drained"),
+            vec![json!({"type": "integrator.drained", "bound_s": 7200})]
+        );
+        for base in [base_a, base_b, marks] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// A drain at its bound: the gate still running is stopped (its process
+    /// gone), `integrator.drain_expired` names its task and the bound, and
+    /// nothing is recorded for the stopped gate: no verdict, the task still
+    /// `reported` for the next integrator.
+    #[test]
+    fn a_drain_at_its_bound_stops_the_gate_and_records_nothing_for_it() {
+        let marks = fresh_marks("spawn-db-drain-bound-marks");
+        let _release = Release(marks.clone());
+        let gate = format!(
+            "echo $$ >'{}/pid'\n{}",
+            marks.to_string_lossy(),
+            holding_gate(&marks)
+        );
+        let (base, source, scenarios, integrator) = world("drain-bound", &gate);
+        let db = Db::new("drain_bound");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w1");
+        push_work(&base, &source, &agent_of(&db, mission, task), "w1.txt");
+        integrator.pass_on(&db.store).expect("the first pass");
+        assert_eq!(wait_started(&marks, 1).len(), 1, "the gate runs");
+        let pid: u32 = std::fs::read_to_string(marks.join("pid"))
+            .expect("the gate's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+
+        integrator.begin_drain(Some(&db.store), 1);
+        let now = std::time::Instant::now();
+        assert!(!integrator.drain_expired(now));
+        assert!(integrator.drain_expired(now + std::time::Duration::from_secs(2)));
+        integrator.expire_drain(Some(&db.store));
+        assert_eq!(
+            control_records(&db, "integrator.drain_expired"),
+            vec![json!({"type": "integrator.drain_expired", "gates": [task], "bound_s": 1})]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !super::warm::exited_unreaped(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(super::warm::exited_unreaped(pid), "the gate {pid} is gone");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        assert!(control_records(&db, "task.gated").is_empty(), "no verdict");
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "reported");
+        assert!(control_records(&db, "integrator.drained").is_empty());
+        for path in [base, marks] {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+
+    /// The store takes the integrator's drain records only as they are
+    /// specified: a bound from 1 to 86400 s, and the gates (but drained's)
+    /// as task numbers.
+    #[test]
+    fn the_store_takes_drain_records_as_specified() {
+        let db = Db::new("drain_records");
+        for good in [
+            json!({"type": "integrator.draining", "gates": [], "bound_s": 7200}),
+            json!({"type": "integrator.drained", "bound_s": 1}),
+            json!({"type": "integrator.drain_expired", "gates": [4, 9], "bound_s": 86400}),
+        ] {
+            db.store.integrator_record(&good).expect("taken");
+        }
+        for bad in [
+            json!({"type": "integrator.draining", "gates": ["4"], "bound_s": 7200}),
+            json!({"type": "integrator.draining", "bound_s": 7200}),
+            json!({"type": "integrator.drained", "bound_s": 0}),
+            json!({"type": "integrator.drain_expired", "gates": [4], "bound_s": 86401}),
+            json!({"type": "integrator.drain_expired", "gates": [4]}),
+            json!({"type": "integrator.stopped", "gates": [], "bound_s": 5}),
+        ] {
+            assert!(db.store.integrator_record(&bad).is_err(), "refused: {bad}");
+        }
+    }
 }
