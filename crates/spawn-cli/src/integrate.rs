@@ -635,7 +635,7 @@ const PUSH_POLL: Duration = Duration::from_millis(500);
 /// Who the integrator's commands come from.
 const PRINCIPAL: &str = "spawn-integrate";
 
-const USAGE: &str = "usage: spawn integrate [--once] [--root <dir>] [--gates <n>]";
+const USAGE: &str = "usage: spawn integrate [--once | --drain] [--root <dir>] [--gates <n>]";
 
 /// Gates that run at once, across missions, unless `--gates` or
 /// `SPAWN_INTEGRATE_GATES` says otherwise. One: concurrent gates share one
@@ -1449,19 +1449,35 @@ pub(crate) fn source_head(source: &str) -> Result<(String, String), String> {
     Ok((branch, commit))
 }
 
-/// `spawn integrate [--once]`: pass after pass, or one.
+/// `spawn integrate [--once]`: pass after pass, or one. `spawn integrate
+/// --drain`: ask the integrator running with the same root to drain
+/// ([`request_drain`]).
 pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     let once = rest.iter().any(|word| word == "--once");
+    let drain = rest.iter().any(|word| word == "--drain");
+    if once && drain {
+        return Err(format!("--once and --drain do not go together\n{USAGE}"));
+    }
     let valued: Vec<String> = rest
         .iter()
-        .filter(|word| *word != "--once")
+        .filter(|word| *word != "--once" && *word != "--drain")
         .cloned()
         .collect();
     let flags = Flags::parse(&valued).map_err(|error| format!("{error}\n{USAGE}"))?;
-    crate::config::require_git()?;
     let root = workspace_root(&flags)
         .map(PathBuf::from)
         .ok_or_else(|| format!("--root or SPAWN_WORKSPACE_ROOT is required\n{USAGE}"))?;
+    if drain {
+        return request_drain(&root);
+    }
+    // The drain's bound is checked before anything is judged or recorded.
+    let drain_bound = drain_secs(crate::config::env_value(DRAIN_ENV).as_deref())?;
+    // A drain request (SIGUSR1, `spawn integrate --drain`) from now on: its
+    // default action would end the process like TERM.
+    let drain_asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&drain_asked))
+        .map_err(|error| format!("cannot take drain requests (SIGUSR1): {error}"))?;
+    crate::config::require_git()?;
     // Resolved against the working directory: the gate must not resolve
     // inside the tree it judges.
     let gate = std::path::absolute(env_or("SPAWN_GATE", "scripts/rsi/gate.sh"))
@@ -1512,23 +1528,162 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
+    if !once {
+        write_pid_file(&root);
+    }
+    let interval = loop_interval().max(Duration::from_secs(5));
     loop {
+        if !once && drain_asked.load(std::sync::atomic::Ordering::SeqCst) {
+            integrator.begin_drain(drain_bound);
+        }
         let pass = integrator.pass();
         if once {
             // One pass, and the gates it started run to their records.
             integrator.settle();
         }
-        if let Err(error) = pass {
+        if let Err(error) = &pass {
             eprintln!("integrate: {error}");
             if once {
-                return Err(error);
+                return pass.map(|()| 0);
             }
         }
         if once {
             return Ok(0);
         }
-        std::thread::sleep(loop_interval().max(Duration::from_secs(5)));
+        if integrator.drained(pass.is_ok()) {
+            return Ok(0);
+        }
+        // Between passes, a drain request is taken at once and a drain's
+        // bound is kept to the second.
+        let next = std::time::Instant::now() + interval;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= next
+                || (drain_asked.load(std::sync::atomic::Ordering::SeqCst)
+                    && !integrator.draining())
+            {
+                break;
+            }
+            if integrator.drain_expired(now) {
+                integrator.expire_drain();
+                return Ok(0);
+            }
+            std::thread::sleep((next - now).min(Duration::from_millis(200)));
+        }
+        if integrator.drain_expired(std::time::Instant::now()) {
+            integrator.expire_drain();
+            return Ok(0);
+        }
     }
+}
+
+/// The drain's bound: `SPAWN_INTEGRATE_DRAIN_SECS`, seconds counted from
+/// the `integrator.draining` record.
+const DRAIN_ENV: &str = "SPAWN_INTEGRATE_DRAIN_SECS";
+
+/// The drain's bound when [`DRAIN_ENV`] is unset: two hours, past the
+/// longest gate seen (101 minutes).
+const DRAIN_DEFAULT_SECS: u64 = 7200;
+
+/// The longest drain [`DRAIN_ENV`] allows: a day.
+const DRAIN_MAX_SECS: u64 = 86_400;
+
+/// [`DRAIN_ENV`] from its text: a whole number of seconds from 1 to
+/// [`DRAIN_MAX_SECS`], unset the default; anything else refuses to start.
+pub(crate) fn drain_secs(text: Option<&str>) -> Result<u64, String> {
+    let Some(text) = text else {
+        return Ok(DRAIN_DEFAULT_SECS);
+    };
+    let trimmed = text.trim();
+    trimmed
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| trimmed.parse::<u64>().ok())
+        .flatten()
+        .filter(|secs| (1..=DRAIN_MAX_SECS).contains(secs))
+        .ok_or_else(|| {
+            format!(
+                "{DRAIN_ENV} is a whole number of seconds from 1 to {DRAIN_MAX_SECS}, not \
+                 '{text}'; the integrator does not start"
+            )
+        })
+}
+
+/// The integrator's pid file in its root: its pid and start time, for
+/// `spawn integrate --drain` with the same root ([`request_drain`]).
+const PID_FILE: &str = "integrate.pid";
+
+/// Write this process's [`PID_FILE`] under `root`; a failure is said, and
+/// only `--drain` misses it (SIGUSR1 still drains).
+fn write_pid_file(root: &Path) {
+    let pid = std::process::id();
+    let written = warm::start_ticks(pid)
+        .ok_or_else(|| "cannot read this process's start time".to_string())
+        .and_then(|ticks| {
+            std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
+            let path = root.join(PID_FILE);
+            let fresh = root.join(format!("{PID_FILE}.{pid}"));
+            std::fs::write(&fresh, format!("{pid} {ticks}\n")).map_err(|error| error.to_string())?;
+            std::fs::rename(&fresh, &path).map_err(|error| error.to_string())
+        });
+    if let Err(error) = written {
+        eprintln!(
+            "integrate: {}: {error}; `spawn integrate --drain` cannot find this integrator \
+             (SIGUSR1 still drains it)",
+            root.join(PID_FILE).display()
+        );
+    }
+}
+
+/// A pid file's pid and start time.
+fn read_pid_file(text: &str) -> Option<(u32, u64)> {
+    let mut words = text.split_whitespace();
+    let pid = words.next()?.parse().ok()?;
+    let ticks = words.next()?.parse().ok()?;
+    words.next().is_none().then_some((pid, ticks))
+}
+
+/// Whether the process `pid` that started at `ticks` still runs: not gone,
+/// not a zombie, and not another process under a pid used again.
+fn still_runs(pid: u32, ticks: u64) -> bool {
+    warm::start_ticks(pid) == Some(ticks) && !warm::exited_unreaped(pid)
+}
+
+/// `spawn integrate --drain`: send a drain request (SIGUSR1) to the
+/// integrator whose [`PID_FILE`] is under `root`, then wait until that
+/// process is gone (it exits once drained, or at its bound), and exit 0.
+fn request_drain(root: &Path) -> Result<i32, String> {
+    let path = root.join(PID_FILE);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("no integrator runs under {}: {error}", root.display()))?;
+    let (pid, ticks) = read_pid_file(&text)
+        .ok_or_else(|| format!("{} is not an integrator's pid file", path.display()))?;
+    if !still_runs(pid, ticks) {
+        return Err(format!(
+            "no integrator runs under {}: process {pid} ({}) is gone",
+            root.display(),
+            path.display()
+        ));
+    }
+    let sent = std::process::Command::new("kill")
+        .args(["-USR1", &pid.to_string()])
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|error| format!("kill -USR1 {pid}: {error}"))?;
+    if !sent.status.success() && still_runs(pid, ticks) {
+        return Err(format!(
+            "kill -USR1 {pid}: {}",
+            String::from_utf8_lossy(&sent.stderr).trim()
+        ));
+    }
+    println!(
+        "integrate: asked the integrator (pid {pid}) to drain; waiting until it is gone"
+    );
+    while still_runs(pid, ticks) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    println!("integrate: the integrator (pid {pid}) is gone");
+    Ok(0)
 }
 
 /// `SPAWN_INTEGRATE_WARM=0` turns the base warm after each landing off
