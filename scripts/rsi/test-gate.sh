@@ -2085,16 +2085,17 @@ refuse "no run of the gate is left" "$(gone_within 30 'sleep 120.25')" 'sleep'
 alone=$work/alone
 mkdir -p "$alone"
 cp "$scenarios/protected" "$scenarios/build" "$alone/"
-for name in 071.sh 072.sh 073.sh; do
-    case $name in
-    072.sh) meet=073.sh ;;
-    073.sh) meet=072.sh ;;
-    *) meet="" ;;
-    esac
-    meet_lines=""
-    [ -z "$meet" ] || meet_lines="touch met.${name%.sh}
-waited=0 # meet
+# alone_scenario <name> [<the one it meets>]. One that meets leaves its file
+# before its first check, so a run that check ends (exit 2) has still come
+# to the meeting, and the other does not wait its bound out for it.
+alone_scenario() {
+    name=$1 meet=${2-}
+    meet_file="" meet_wait=""
+    if [ -n "$meet" ]; then
+        meet_file="touch met.${name%.sh}"
+        meet_wait="waited=0 # meet
 while [ ! -e met.${meet%.sh} ] && [ \"\$waited\" -lt 600 ]; do sleep 0.1; waited=\$((waited + 1)); done # meet"
+    fi
     cat >"$alone/$name" <<EOF
 #!/bin/sh
 check() {
@@ -2107,14 +2108,18 @@ check() {
 }
 echo "$name started \$(date +%s%N)"
 touch running.$name
+$meet_file
 check
-$meet_lines
+$meet_wait
 sleep 1
 check
 rm -f running.$name
 echo "$name ended \$(date +%s%N)"
 EOF
-done
+}
+alone_scenario 071.sh
+alone_scenario 072.sh 073.sh
+alone_scenario 073.sh 072.sh
 # stamp <name> <started|ended>: the time (ns) the base run of <name> printed,
 # read from its own block in the log.
 stamp() {
@@ -2152,6 +2157,15 @@ expect "one put on the list is judged again, alone" \
     "$(with_jobs 4 alone "$good" "$alone" >/dev/null; cat "$work/gate.out")" \
     '| base results from the cache: 071.sh 073.sh; run on the base: 072.sh'
 rm "$alone/serial"
+# The control must find 071 beside a neighbour, and 071's own second or so
+# did not make it so: with the three sandboxes started more than that apart
+# (load), 071 had come and gone before 072 or 073 ran, each check saw
+# nobody, and the control was accepted (the race of 17b's 12 s, GitHub
+# issue #38). So here 071 and 073 meet as 072 and 073 did above: each
+# leaves its file and waits, up to 60 s, for the other's, and the first of
+# them to check after that finds the other still running.
+alone_scenario 071.sh 073.sh
+alone_scenario 073.sh 071.sh
 expect "the control: without the list, 071 meets its neighbours" \
     "$(with_jobs 4 alone-control "$good" "$alone")" 'exit=6 {"host_fault":true,'
 
@@ -2251,8 +2265,23 @@ printf '#!/bin/sh\necho relinked\n' >target/debug/spawn.new
 chmod 755 target/debug/spawn.new
 mv target/debug/spawn.new target/debug/spawn
 EOF
-printf '#!/bin/sh\nsleep 2\n[ "$("$SPAWN_BIN")" = built ] || { echo "ran $SPAWN_BIN: $("$SPAWN_BIN")"; exit 1; }\n' \
-    >"$bin_scenarios/check-run.sh"
+# On the candidate, where check-relink runs beside it, a run waits (up to
+# 60 s) until the binary has been linked again before it runs SPAWN_BIN: it
+# slept 2 s for that, and under load ran before the link, when there was
+# nothing to tell apart and the case passed whatever the gate did (GitHub
+# issue #38). One that never sees the link says so (exit 2): no verdict.
+cat >"$bin_scenarios/check-run.sh" <<'EOF'
+#!/bin/sh
+if [ "$(cat value)" != one ]; then
+    n=0
+    until [ "$(target/debug/spawn 2>/dev/null)" = relinked ] || [ "$n" -ge 600 ]; do
+        sleep 0.1
+        n=$((n + 1))
+    done
+    [ "$n" -lt 600 ] || { echo "target/debug/spawn was never linked again: nothing to test"; exit 2; }
+fi
+[ "$("$SPAWN_BIN")" = built ] || { echo "ran $SPAWN_BIN: $("$SPAWN_BIN")"; exit 1; }
+EOF
 cp "$bin_scenarios/check-run.sh" "$bin_scenarios/095.sh"
 expect "a binary linked again mid-gate is not the one the scenarios run" \
     "$(with_jobs 4 bin "$good" "$bin_scenarios")" 'exit=0 {"verdict":"accepted"}'
