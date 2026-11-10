@@ -726,6 +726,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/missions" => Box::new(missions),
         "/api/events" => Box::new(move || events(query)),
         "/api/scorecard" => Box::new(move || scorecard(query)),
+        "/api/scorecard/fleet" => Box::new(move || scorecard_fleet(query)),
         "/api/alerts" => Box::new(move || alerts(query)),
         "/api/cost" => Box::new(move || cost(query)),
         _ => {
@@ -1792,6 +1793,57 @@ fn scorecard(query: &str) -> Result<Value, String> {
             crate::scorecard::Failure::Record(error) => error,
         }
     })
+}
+
+/// The windows `/api/scorecard/fleet` answers (the Scorecard's toggle,
+/// web/src/scorecard.ts `WINDOW_PRESETS`), each with its length in ms.
+const FLEET_WINDOWS: [(&str, i64); 4] = [
+    ("24h", crate::scorecard::time::DAY_MS),
+    ("7d", 7 * crate::scorecard::time::DAY_MS),
+    ("30d", 30 * crate::scorecard::time::DAY_MS),
+    ("90d", 90 * crate::scorecard::time::DAY_MS),
+];
+
+/// The window `[since, until)` that `/api/scorecard/fleet`'s `window` and
+/// `until` name, `now` giving the end when `until` is not given (the
+/// database's clock, read only then); a window it does not know, or an
+/// `until` that is no RFC 3339 time, is the caller's mistake.
+fn fleet_window(
+    query: &str,
+    now: impl FnOnce() -> Result<i64, String>,
+) -> Result<(&'static str, i64, i64), String> {
+    let asked = parameter(query, "window").unwrap_or("");
+    let (window, length) = FLEET_WINDOWS
+        .iter()
+        .copied()
+        .find(|(name, _)| *name == asked)
+        .ok_or_else(|| {
+            format!("{BAD_REQUEST}window {asked}: one of 24h, 7d, 30d or 90d")
+        })?;
+    let until = match parameter(query, "until").filter(|text| !text.is_empty()) {
+        None => now()?,
+        Some(text) => percent_decoded(text)
+            .as_deref()
+            .and_then(crate::scorecard::time::parse_rfc3339)
+            .ok_or_else(|| {
+                format!("{BAD_REQUEST}until {text}: not an RFC 3339 time (2026-10-02T00:00:00Z)")
+            })?,
+    };
+    Ok((window, until - length, until))
+}
+
+/// `/api/scorecard/fleet?window=24h|7d|30d|90d[&until=<RFC 3339>]`: how the
+/// fleet decided and did over `[until - window, until)` (`until` defaults to
+/// now), counted from the experience views (spawn-postgres, `experience`):
+/// the decision ladder, agent-hours and human decisions per agent-hour,
+/// escalations, interventions, outcomes, landings per day, judgements and
+/// each open mission's idle hours.
+fn scorecard_fleet(query: &str) -> Result<Value, String> {
+    let store = open_store()?;
+    let (window, since, until) = fleet_window(query, || store.database_now_ms().map_err(err))?;
+    let mut answer = store.fleet_experience(since, until).map_err(err)?;
+    answer["window"] = json!(window);
+    Ok(answer)
 }
 
 /// `/api/alerts?since=`: exactly the JSON array of `spawn alerts --once
