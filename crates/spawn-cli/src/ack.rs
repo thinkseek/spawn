@@ -51,14 +51,15 @@ pub(crate) struct Ack {
 /// why (the words after the outcome, joined by spaces), required for a
 /// decline.
 pub(crate) fn parse(words: &[String]) -> Result<Ack, String> {
-    let (id, rest) = words
+    let (text, rest) = words
         .split_first()
         .ok_or_else(|| format!("no message id; {USAGE}"))?;
-    let command_id = id
+    // Digits as an id prints them: `007` or `+7` is no id.
+    let command_id = text
         .parse::<i64>()
         .ok()
-        .filter(|id| *id > 0 && id.to_string() == *id_text(id))
-        .ok_or_else(|| format!("{id}: not a message id (a command id, a number); {USAGE}"))?;
+        .filter(|id| *id > 0 && id.to_string() == *text)
+        .ok_or_else(|| format!("{text}: not a message id (a command id, a number); {USAGE}"))?;
     let (outcome, why) = rest
         .split_first()
         .ok_or_else(|| format!("no outcome (done or declined); {USAGE}"))?;
@@ -76,12 +77,6 @@ pub(crate) fn parse(words: &[String]) -> Result<Ack, String> {
         outcome: outcome.clone(),
         why,
     })
-}
-
-/// The id as given, for the round trip check in [`parse`] (`007` or `+7`
-/// is not an id).
-fn id_text(id: &String) -> &String {
-    id
 }
 
 /// The workspace of the pane this runs in, from what the pane was given at
