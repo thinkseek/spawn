@@ -3,14 +3,16 @@
 //!
 //! What Spawn types into an engine for a command (an input, a start or a
 //! resume with a prompt) is a message, and its id is the command's. The text
-//! the Bridge types ends with the command's marker, `[spawn message #<id>]`:
-//! on a line of its own after a text of several lines (the workspace notices
-//! before the text are part of the same message), and at the end of a text
-//! of one line, after a space, so a one-line message stays one line: a pane
-//! that reads a paste without bracketed paste takes each line break as
-//! Enter, and would submit the marker as a second prompt. The engine's transcript keeps the
-//! line it was given, so the transcript's user line that holds the marker is
-//! the message taken (`message.taken`, crate::ingest), whatever its text: two
+//! the Bridge types ends with the command's marker, `[spawn message #<id>]`,
+//! on a line of its own after the text (the workspace notices before the
+//! text are part of the same message). One exception: a text of one line
+//! typed into a pane whose program reads keys raw
+//! ([`crate::port::TerminalHost::reads_lines`] false) carries it at the end
+//! of that line, after a space, since such a program, unless it asked for a
+//! bracketed paste, takes each pasted line break as Enter and would submit
+//! the marker as a prompt of its own. The engine's transcript keeps what it
+//! was given, so the transcript's user line that holds the marker is the
+//! message taken (`message.taken`, crate::ingest), whatever its text: two
 //! messages with the same text are told apart by their ids, never by the
 //! text or the order.
 
@@ -24,13 +26,14 @@ pub fn marker(command: CommandId) -> String {
     format!("{OPEN}{}]", command.0)
 }
 
-/// `text` as the Bridge types it for `command`: the text, then its marker,
-/// on a line of its own when the text has several, else after a space.
-pub fn marked(text: &str, command: CommandId) -> String {
-    if text.contains('\n') {
-        format!("{text}\n\n{}", marker(command))
-    } else {
+/// `text` as the Bridge types it for `command`: the text, then its marker on
+/// a line of its own; after a space when `one_line` (the pane reads keys
+/// raw) and the text is one line.
+pub fn marked(text: &str, command: CommandId, one_line: bool) -> String {
+    if one_line && !text.contains('\n') {
         format!("{text} {}", marker(command))
+    } else {
+        format!("{text}\n\n{}", marker(command))
     }
 }
 
@@ -60,11 +63,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_marked_text_ends_with_its_marker_and_one_line_stays_one_line() {
-        let text = marked("notice\n\ndo the task", CommandId(42));
-        assert_eq!(text, "notice\n\ndo the task\n\n[spawn message #42]");
+    fn a_marked_text_ends_with_its_marker_on_its_own_line_or_one_lines_end() {
+        let text = marked("do the task", CommandId(42), false);
+        assert_eq!(text, "do the task\n\n[spawn message #42]");
         assert_eq!(markers(&text), [CommandId(42)]);
-        let line = marked("do the task", CommandId(7));
+        let several = marked("notice\n\ndo the task", CommandId(43), true);
+        assert_eq!(several, "notice\n\ndo the task\n\n[spawn message #43]");
+        let line = marked("do the task", CommandId(7), true);
         assert_eq!(line, "do the task [spawn message #7]");
         assert_eq!(markers(&line), [CommandId(7)]);
     }

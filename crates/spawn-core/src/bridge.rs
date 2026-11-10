@@ -2964,8 +2964,14 @@ impl Bridge {
             format!("{}\n\n{text}", notices.join("\n\n"))
         };
         // The message's id, at the end of the whole text: the transcript
-        // line that holds it is the message taken ([`crate::message`]).
-        let text = crate::message::marked(&text, claimed.command_id);
+        // line that holds it is the message taken ([`crate::message`]). On
+        // the text's own line only for a one-line text into a pane that
+        // reads keys raw.
+        let one_line = !text.contains('\n')
+            && !self
+                .terminals
+                .reads_lines(&active.terminal(), &active.workspace);
+        let text = crate::message::marked(&text, claimed.command_id, one_line);
         let typed = {
             // A merge of main into the workspace waits while this types,
             // and once it gets the workspace it finds the `typed` step
