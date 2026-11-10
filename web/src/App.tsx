@@ -5,10 +5,12 @@ import { fetchAlerts, fetchAttention, fetchOverview, fetchSessionTail, usePoll }
 import { PAGE_EVENTS } from "./sessionWindow";
 import type { PollResult, SessionTail } from "./api";
 import { markNeedsHuman, needsHuman } from "./attention";
+import { inputTarget } from "./commands";
 import { DetailsRail, ExecutionSummary, RailContent } from "./components/DetailsRail";
 import { MobileNav, Sidebar } from "./components/Sidebar";
 import { Timeline } from "./components/Timeline";
 import { AlertsView, OpenAlerts } from "./components/alerts/AlertsView";
+import { CostView } from "./components/cost/CostView";
 import { FleetView } from "./components/fleet/FleetView";
 import { MissionsView } from "./components/missions/MissionsView";
 import { RsiView } from "./components/rsi/RsiView";
@@ -33,6 +35,7 @@ export type View =
   | "rsi"
   | "alerts"
   | "scorecard"
+  | "cost"
   | "show"
   | "sessions";
 
@@ -49,6 +52,7 @@ function routeFromHash(): Route {
   if (hash.startsWith("#/missions")) return { view: "missions", agent: null };
   if (hash.startsWith("#/alerts")) return { view: "alerts", agent: null };
   if (hash.startsWith("#/scorecard")) return { view: "scorecard", agent: null };
+  if (hash.startsWith("#/cost")) return { view: "cost", agent: null };
   if (hash.startsWith("#/show")) return { view: "show", agent: null };
   const match = /^#\/fleet\/(.+)$/.exec(hash);
   let agent: string | null = null;
@@ -71,6 +75,7 @@ function hashFor(route: Route): string {
   if (route.view === "missions") return "#/missions";
   if (route.view === "alerts") return "#/alerts";
   if (route.view === "scorecard") return "#/scorecard";
+  if (route.view === "cost") return "#/cost";
   // The Show view keeps its options (`?present`, `?replay`) in its hash.
   if (route.view === "show") {
     return window.location.hash.startsWith("#/show") ? window.location.hash : "#/show";
@@ -251,6 +256,7 @@ export default function App() {
         onShowRsi={() => setView("rsi")}
         onShowAlerts={() => setView("alerts")}
         onShowScorecard={() => setView("scorecard")}
+        onShowCost={() => setView("cost")}
         onShowShow={() => setView("show")}
         onShowSessions={() => setView("sessions")}
       />
@@ -269,6 +275,7 @@ export default function App() {
         onShowAlerts={() => setView("alerts")}
         openAlerts={openAlerts}
         onShowScorecard={() => setView("scorecard")}
+        onShowCost={() => setView("cost")}
         onShowShow={() => setView("show")}
         onShowSessions={() => setView("sessions")}
         onSelect={(id) => {
@@ -306,6 +313,8 @@ export default function App() {
         />
       ) : view === "scorecard" ? (
         <ScorecardView missions={missions.data} />
+      ) : view === "cost" ? (
+        <CostView />
       ) : view === "show" ? (
         <Suspense fallback={<div className="flex-1 bg-page-canvas" />}>
           <ShowView fleet={fleet} present={false} />
@@ -380,9 +389,13 @@ export default function App() {
                 sessionId={detail.session_id}
                 tail={detail.window}
                 executions={detail.executions}
+<<<<<<< 02abfa3630110740eb4e62ec42a69c0ad6a01d8e
+                to={inputTarget(detail.session_id, pollNames.get(detail.session_id) ?? null, detail.agent_id)}
+=======
                 reassignedTo={detail.reassigned_to}
                 reassignedFrom={detail.reassigned_from}
                 onOpenSession={setSelectedId}
+>>>>>>> 7125d2b7facd18acdf324fa1432965f6d184d227
               />
             ) : (
               <Placeholder

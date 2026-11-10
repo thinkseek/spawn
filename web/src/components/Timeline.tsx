@@ -38,19 +38,29 @@ export function Timeline({
   sessionId,
   tail,
   executions,
+<<<<<<< 02abfa3630110740eb4e62ec42a69c0ad6a01d8e
+  to = null,
+=======
   reassignedTo = null,
   reassignedFrom = null,
   onOpenSession,
+>>>>>>> 7125d2b7facd18acdf324fa1432965f6d184d227
 }: {
   sessionId: string;
   tail: EventWindow;
   executions: Execution[];
+<<<<<<< 02abfa3630110740eb4e62ec42a69c0ad6a01d8e
+  /** Who the session's inputs go to (`supervisor`): the trace reads a
+   * person's input as `You → supervisor` ([`inputTarget`]). */
+  to?: string | null;
+=======
   /** The task this session's task was reassigned to (old to new). */
   reassignedTo?: TaskLink | null;
   /** The task this session's task took over (new to old). */
   reassignedFrom?: TaskLink | null;
   /** Open another session's timeline (a reassign's other end). */
   onOpenSession?: (sessionId: string) => void;
+>>>>>>> 7125d2b7facd18acdf324fa1432965f6d184d227
 }) {
   const [mode, choose] = useStoredChoice<Mode>("spawn.timeline.mode", MODES, "trace");
   const [held, setHeld] = useState<EventWindow>(tail);
@@ -147,7 +157,7 @@ export function Timeline({
   );
   return mode === "trace" ? (
     <Suspense fallback={<div className="min-h-0 flex-1" />}>
-      <TraceView events={events} executions={executions} commands={commands} header={toggle} />
+      <TraceView events={events} executions={executions} commands={commands} to={to} header={toggle} />
     </Suspense>
   ) : (
     <EventList events={events} header={toggle} />
