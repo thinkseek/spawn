@@ -1011,6 +1011,7 @@ fn no_verdict(failure: crate::gate::GateFailure) -> String {
         GateFailure::Aborted { reason, .. } => format!("the owner's gate aborted: {reason}"),
         GateFailure::MainRed { scenario, .. } => format!("main is red on {scenario}"),
         GateFailure::Timeout => "the gate ran past its wall clock".to_string(),
+        GateFailure::Reaped => "the integrator that started the gate reaped it".to_string(),
         GateFailure::Failed(error) => format!("the gate could not start: {error}"),
         GateFailure::NoRoom { short, .. } => format!("no room to judge ({})", short.check()),
         GateFailure::HostFault {
