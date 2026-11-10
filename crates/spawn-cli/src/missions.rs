@@ -848,6 +848,25 @@ mod tests {
     }
 
     #[test]
+    fn configure_sets_and_clears_a_daily_budget_in_dollars() {
+        assert_eq!(
+            configure(&["--id", "4", "--daily-usd", "0.50"]),
+            Ok(json!({"budget": {"daily_usd": 0.5}}))
+        );
+        assert_eq!(
+            configure(&["--id", "4", "--no-daily-usd"]),
+            Ok(json!({"budget": {"daily_usd": null}}))
+        );
+        for bad in ["0", "-1", "abc", "1e3", "0.000", ".", "1.2.3"] {
+            let refused = configure(&["--id", "4", "--daily-usd", bad]).expect_err(bad);
+            assert!(refused.contains("--daily-usd"), "{bad}: {refused}");
+        }
+        let refused = configure(&["--id", "4", "--daily-usd", "2", "--no-daily-usd"])
+            .expect_err("both");
+        assert!(refused.contains("--no-daily-usd and --daily-usd"), "{refused}");
+    }
+
+    #[test]
     fn configure_clears_only_what_its_switches_name() {
         assert_eq!(
             configure(&["--id", "4", "--no-minutes", "--no-workers"]),
