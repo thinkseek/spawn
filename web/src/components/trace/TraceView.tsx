@@ -71,18 +71,21 @@ export function TraceView({
   events,
   executions,
   commands,
+  to = null,
   header,
 }: {
   events: TimelineEvent[];
   executions: readonly KnownExecution[];
   commands: ReadonlyMap<string, KnownCommand>;
+  /** The session's agent name: a person's input reads `You → <to>`. */
+  to?: string | null;
   header: ReactNode;
 }) {
   const reduceMotion = useReducedMotion() ?? false;
   const gradientId = useId();
   const trace = useMemo(
-    () => deriveTrace(events, 0, executions, commands),
-    [events, executions, commands],
+    () => deriveTrace(events, 0, executions, commands, to),
+    [events, executions, commands, to],
   );
 
   // Open spans run to now; the clock only ticks while one is open.
