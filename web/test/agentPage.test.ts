@@ -68,3 +68,32 @@ test("the summary says for how long", () => {
   assert.equal(forHowLong(null, now), null);
   assert.equal(forHowLong(now + MIN, now), null, "a clock ahead says nothing");
 });
+
+test("a worker's summary names its task: live's shape has no input, only task_title", async () => {
+  const { summaryTask, taskLine } = await import("../src/agentPage.ts");
+  const held = { task_id: 247, title: "Cost you can see" };
+  // /api/fleet for worker T247 on 99565e2a: task null, task_title set.
+  assert.deepEqual(summaryTask({ task: null, task_title: "Cost you can see" }, held), { task: "T247 · Cost you can see" });
+  assert.deepEqual(summaryTask({ task: "", task_title: "Cost you can see" }, held), { task: "T247 · Cost you can see" });
+  assert.deepEqual(summaryTask({ task: "  ", task_title: "Cost you can see" }, null), { task: "Cost you can see" }, "missions not read yet");
+  assert.deepEqual(summaryTask({ task: "Owner note: act on it", task_title: "Talk to the supervisor" }, held), { input: "Owner note: act on it" }, "a person's input leads");
+  assert.equal(summaryTask({ task: null, task_title: null }, null), null, "No task recorded.");
+  assert.equal(taskLine({ task_id: 12, title: null }, null), "T12");
+  assert.equal(taskLine({ task_id: 12, title: "  " }, "From fleet"), "T12", "a blank title is no title");
+  assert.equal(taskLine({ task_id: null, title: null }, "From fleet"), "From fleet");
+});
+
+test("a history time carries its day when it is not today's", async () => {
+  const { historyClock } = await import("../src/agentPage.ts");
+  const hms = (ms: number | null) => (ms === null ? "—" : new Date(ms).toTimeString().slice(0, 8));
+  const now = new Date(2026, 10, 10, 21, 0, 0).getTime(); // Tue Nov 10, local
+  assert.equal(historyClock(new Date(2026, 10, 10, 0, 0, 1).getTime(), now, hms), "00:00:01", "today: the clock alone");
+  assert.equal(historyClock(new Date(2026, 10, 9, 23, 59, 59).getTime(), now, hms), "Mon 23:59:59", "yesterday");
+  assert.equal(historyClock(new Date(2026, 10, 4, 18, 43, 20).getTime(), now, hms), "Wed 18:43:20", "six days back");
+  assert.equal(historyClock(new Date(2026, 10, 3, 18, 43, 20).getTime(), now, hms), "Nov 3 18:43:20", "a week back: its date");
+  assert.equal(historyClock(null, now, hms), "—");
+  const run = (at: number) => ({ session_seq: at, recorded_at_ms: at, observation: { judge: "rules", state: "WORKING", reason: null, rules_state: null, attention: null } });
+  const { judgementRuns, runLabel } = await import("../src/agentPage.ts");
+  const across = judgementRuns([run(new Date(2026, 10, 10, 0, 5).getTime()), run(new Date(2026, 10, 9, 23, 55).getTime())]);
+  assert.equal(runLabel(across[0], (ms) => historyClock(ms, now, hms)), "Rules · Working ×2, Mon 23:55:00–00:05:00");
+});

@@ -35,7 +35,7 @@ import {
 import { clockTime, formatDuration, relativeTime } from "../../format";
 import { commandSummary, foldCommands, inputAt, inputLeads, principalWords } from "../../commands";
 import { doingWords } from "../../home";
-import { forHowLong, judgementLine, judgementRuns, judgementSpeaks, runLabel } from "../../agentPage";
+import { forHowLong, historyClock, judgementLine, judgementRuns, judgementSpeaks, runLabel, summaryTask } from "../../agentPage";
 import type { JudgementRun } from "../../agentPage";
 import { recentToolRows, rowText, runEnd } from "../../trace";
 import { freshAt } from "../../validated";
@@ -61,12 +61,15 @@ interface AgentDetailProps {
   /** Its one name (design §4.5, home.ts agentNames); the ids stay beside
    * it to copy. */
   name?: string | null;
+  /** The task its name goes by (home.ts `nameTask`): the summary's line
+   * when no person's input leads. */
+  held?: { task_id: number | null; title: string | null } | null;
   onClose: () => void;
   onOpenTimeline: (sessionId: string) => void;
 }
 
 /** Slide-over with everything about one agent; its polls stop on close. */
-export function AgentDetail({ agent, name = null, onClose, onOpenTimeline }: AgentDetailProps) {
+export function AgentDetail({ agent, name = null, held = null, onClose, onOpenTimeline }: AgentDetailProps) {
   const sessionId = agent.session_id;
   // Who the page names, in the header, the keys line and the input box.
   const shownName = name ?? (agent.agent_id || sessionId);
@@ -152,7 +155,7 @@ export function AgentDetail({ agent, name = null, onClose, onOpenTimeline }: Age
       }
     >
       <div className="min-h-0 flex-1 overflow-y-auto bg-app-shell">
-        <AgentSummary agent={agent} commands={commands.data} />
+        <AgentSummary agent={agent} held={held} commands={commands.data} />
         <div className="grid gap-3 p-3 sm:p-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
           <div className="flex min-w-0 flex-col gap-3">
             <RecentTools session={tail.data} error={tail.error} />
@@ -254,7 +257,18 @@ function RecentTools({ session, error }: { session: SessionDetail | null; error:
   );
 }
 
-function AgentSummary({ agent, commands }: { agent: FleetAgent; commands: CommandRecord[] | null }) {
+function AgentSummary({
+  agent,
+  held,
+  commands,
+}: {
+  agent: FleetAgent;
+  held: { task_id: number | null; title: string | null } | null;
+  commands: CommandRecord[] | null;
+}) {
+  // A worker's task when it holds no person's input: "T247 · Cost you can see".
+  const shown = summaryTask(agent, held);
+  const line = shown && "task" in shown ? shown.task : null;
   const now = doingNow(agent);
   const since = forHowLong(agent.state_since_ms, Date.now());
   const activity = agent.activity;
@@ -287,6 +301,8 @@ function AgentSummary({ agent, commands }: { agent: FleetAgent; commands: Comman
             </span>
           </summary>
         </details>
+      ) : line ? (
+        <p className="line-clamp-2 text-label text-foreground">{line}</p>
       ) : (
         <p className="text-label text-faint-foreground">No task recorded.</p>
       )}
@@ -878,7 +894,7 @@ function HistoryRow({
         disabled={seq == null}
         onClick={() => seq != null && onSelect(seq)}
         className={cx(
-          "grid w-full grid-cols-[4.25rem_4.75rem_6.5rem_2.75rem_minmax(0,1fr)] items-center gap-2 px-4 py-1.5 text-left text-caption transition-colors",
+          "grid w-full grid-cols-[5.75rem_4.75rem_6.5rem_2.75rem_minmax(0,1fr)] items-center gap-2 px-4 py-1.5 text-left text-caption transition-colors",
           seq != null && seq === selectedSeq
             ? "bg-judge-tint"
             : "hover:bg-surface-hover",
@@ -888,7 +904,7 @@ function HistoryRow({
           className="tnum text-muted-foreground"
           title={record.recorded_at_ms ? new Date(record.recorded_at_ms).toLocaleString() : undefined}
         >
-          {clockTime(record.recorded_at_ms)}
+          {historyClock(record.recorded_at_ms, Date.now(), clockTime)}
         </span>
         <span>
           <JudgeBadge judge={o.judge} />
@@ -940,7 +956,7 @@ function HistoryRun({
         className={cx("flex w-full items-center gap-2 px-4 py-1.5 text-left text-caption hover:bg-surface-hover", FOCUS_RING)}
       >
         <FleetStateDot state={first.state} size="sm" />
-        <span className="tnum min-w-0 flex-1 truncate text-foreground">{runLabel(run, clockTime)}</span>
+        <span className="tnum min-w-0 flex-1 truncate text-foreground">{runLabel(run, (ms) => historyClock(ms, Date.now(), clockTime))}</span>
         <span className="shrink-0 text-faint-foreground">{shown ? "fold" : "open"}</span>
       </button>
       {shown && (
