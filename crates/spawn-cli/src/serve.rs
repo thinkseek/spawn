@@ -1,6 +1,5 @@
-//! HTTP API and static files for the observer UI: reads, and a person's
-//! writes: an input to a session, a key, and a restart or a reassign of a
-//! stalled worker.
+//! HTTP API and static files for the observer UI: reads, and two writes, a
+//! person's input to a session and a person's key.
 //!
 //! Every read goes through the same store methods the CLI uses, as the
 //! read-only `spawn_reader` login, so a defect in a read cannot change
@@ -47,23 +46,6 @@
 //! the turn: the Bridge sends it at once. A session no agent has used is
 //! 404; one that runs no execution is 409 with the reason, and so is an
 //! idempotency key another request used; no command is made.
-//!
-//! A person may also restart or reassign a stalled worker from its agent
-//! page: `POST /api/session/<id>/restart` and `POST
-//! /api/session/<id>/reassign` with `{"reason": "..."}` (at most
-//! [`MAX_REASON`] bytes, no control character), through `spawn_human_task`
-//! (the `spawn_human` login's third function), with the input's guards. The
-//! session's delivered task is restarted (`task.restarted`, the dispatcher
-//! stops the running execution and resumes its native session) or reassigned
-//! (cancelled and assigned again to a fresh worker whose branch starts from
-//! the old one's last checkpoint), `by` `human`. It answers 202 with
-//! `{"task", "session_id", "agent_id", "principal": "human"}`, the task and
-//! the worker that now carry the work, or 409 with the reason for a session
-//! that holds no delivered task, and nothing is recorded. `GET
-//! /api/session/<id>` links old and new: each execution's `restart_of` (the
-//! execution of the same session a restart's resume replaced, else null),
-//! and the session's `reassigned_to` and `reassigned_from` (`{"task",
-//! "session_id"}` or null).
 //!
 //! Reading is still worth guarding: `/api/pane/<id>` shows any live pane.
 //! `serve` binds 127.0.0.1 unless told otherwise, and on any other address
@@ -702,14 +684,6 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
         {
             return key(request, id, access, shared);
         }
-        for action in ["restart", "reassign"] {
-            if let Some(id) = path
-                .strip_prefix("/api/session/")
-                .and_then(|rest| rest.strip_suffix(&format!("/{action}")))
-            {
-                return moved(request, id, action, access, shared);
-            }
-        }
         if !matches!(request.method(), Method::Get | Method::Head) {
             return request
                 .respond(not_allowed("GET"))
@@ -752,7 +726,6 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/missions" => Box::new(missions),
         "/api/events" => Box::new(move || events(query)),
         "/api/scorecard" => Box::new(move || scorecard(query)),
-        "/api/scorecard/fleet" => Box::new(move || scorecard_fleet(query)),
         "/api/alerts" => Box::new(move || alerts(query)),
         "/api/cost" => Box::new(move || cost(query)),
         _ => {
@@ -1016,98 +989,6 @@ fn pressed(
         Ok(spawn_postgres::HumanKey::NotRunning(why) | spawn_postgres::HumanKey::KeyUsed(why)) => {
             Err((409, why))
         }
-        Err(error) => Err((500, error.to_string())),
-    }
-}
-
-/// `POST /api/session/<id>/restart` and `/reassign`, past the read guard
-/// (`access`): a person restarts the delivered task of session `id`, or
-/// reassigns it to a fresh worker (module doc).
-fn moved(
-    mut request: Request,
-    id: &str,
-    action: &str,
-    access: Access,
-    shared: &Shared,
-) -> Result<(), String> {
-    if *request.method() != Method::Post {
-        return request
-            .respond(not_allowed("POST"))
-            .map_err(|error| error.to_string());
-    }
-    let (status, body) = match move_task(&mut request, id, action, access, shared) {
-        Ok(answer) => answer,
-        Err((status, error)) => (status, json!({ "error": error })),
-    };
-    request
-        .respond(json_response(status, &body))
-        .map_err(|error| error.to_string())
-}
-
-/// The body of `POST /api/session/<id>/restart` and `/reassign`: why, and
-/// nothing else.
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MoveBody {
-    #[serde(default)]
-    reason: Option<String>,
-}
-
-/// Longest reason a person gives for a restart or a reassign, in bytes
-/// (`spawn_human_task`).
-const MAX_REASON: usize = 2000;
-
-/// The checks of a person's restart or reassign after its method, then the
-/// record: `(202, {task, session_id, agent_id, principal})` of the task and
-/// worker that now carry the work, or `(status, why)` when refused. A
-/// session that holds no delivered task is 409 with the store's reason, and
-/// nothing is recorded.
-fn move_task(
-    request: &mut Request,
-    id: &str,
-    action: &str,
-    access: Access,
-    shared: &Shared,
-) -> Result<(u16, Value), (u16, String)> {
-    let what = if action == "restart" {
-        "a restart"
-    } else {
-        "a reassign"
-    };
-    let (body, _) = write_body(request, access, shared, what)?;
-    let body: MoveBody = serde_json::from_slice(&body)
-        .map_err(|error| (400, format!("{BAD_REQUEST}the body is not {what}: {error}")))?;
-    let session = session_id(id).map_err(|error| (400, error))?;
-    let reason = body
-        .reason
-        .map(|reason| reason.trim().to_string())
-        .filter(|reason| !reason.is_empty());
-    if let Some(reason) = &reason {
-        if reason.len() > MAX_REASON {
-            return Err((
-                400,
-                format!(
-                    "{BAD_REQUEST}the reason is {} bytes; at most {MAX_REASON}",
-                    reason.len()
-                ),
-            ));
-        }
-        if reason.chars().any(char::is_control) {
-            return Err((
-                400,
-                format!("{BAD_REQUEST}the reason holds a control character"),
-            ));
-        }
-    }
-    let store = writer(shared).map_err(|error| (500, error))?;
-    match store.human_task(&session, action, reason.as_deref()) {
-        Ok(spawn_postgres::HumanTask::Moved(mut moved)) => {
-            if let Some(fields) = moved.as_object_mut() {
-                fields.insert("principal".to_string(), json!("human"));
-            }
-            Ok((202, moved))
-        }
-        Ok(spawn_postgres::HumanTask::Refused(why)) => Err((409, why)),
         Err(error) => Err((500, error.to_string())),
     }
 }
@@ -1745,9 +1626,6 @@ fn session(id: &str, query: &str) -> Result<Value, String> {
         .min(MAX_LIMIT);
     let store = open_store()?;
     let state = store.state(&session).map_err(|error| error.to_string())?;
-    let links = store
-        .session_links(session.as_str())
-        .map_err(|error| error.to_string())?;
     let executions: Vec<Value> = store
         .executions(&session)
         .map_err(|error| error.to_string())?
@@ -1763,7 +1641,6 @@ fn session(id: &str, query: &str) -> Result<Value, String> {
                 "exit_code": row.exit_code,
                 "exit_reported": row.exit_reported,
                 "duration_ms": row.duration_ms,
-                "restart_of": links["restart_of"][row.execution_id.as_str()].clone(),
             })
         })
         .collect();
@@ -1816,8 +1693,6 @@ fn session(id: &str, query: &str) -> Result<Value, String> {
             "recorded_at_ms": state.recorded_at.0,
         })),
         "executions": executions,
-        "reassigned_to": links["reassigned_to"].clone(),
-        "reassigned_from": links["reassigned_from"].clone(),
         "open_tools": open_tools,
         "freshness": freshness,
         "timeline": timeline,
@@ -1917,55 +1792,6 @@ fn scorecard(query: &str) -> Result<Value, String> {
             crate::scorecard::Failure::Record(error) => error,
         }
     })
-}
-
-/// The windows `/api/scorecard/fleet` answers (the Scorecard's toggle,
-/// web/src/scorecard.ts `WINDOW_PRESETS`), each with its length in ms.
-const FLEET_WINDOWS: [(&str, i64); 4] = [
-    ("24h", crate::scorecard::time::DAY_MS),
-    ("7d", 7 * crate::scorecard::time::DAY_MS),
-    ("30d", 30 * crate::scorecard::time::DAY_MS),
-    ("90d", 90 * crate::scorecard::time::DAY_MS),
-];
-
-/// The window `[since, until)` that `/api/scorecard/fleet`'s `window` and
-/// `until` name, `now` giving the end when `until` is not given (the
-/// database's clock, read only then); a window it does not know, or an
-/// `until` that is no RFC 3339 time, is the caller's mistake.
-fn fleet_window(
-    query: &str,
-    now: impl FnOnce() -> Result<i64, String>,
-) -> Result<(&'static str, i64, i64), String> {
-    let asked = parameter(query, "window").unwrap_or("");
-    let (window, length) = FLEET_WINDOWS
-        .iter()
-        .copied()
-        .find(|(name, _)| *name == asked)
-        .ok_or_else(|| format!("{BAD_REQUEST}window {asked}: one of 24h, 7d, 30d or 90d"))?;
-    let until = match parameter(query, "until").filter(|text| !text.is_empty()) {
-        None => now()?,
-        Some(text) => percent_decoded(text)
-            .as_deref()
-            .and_then(crate::scorecard::time::parse_rfc3339)
-            .ok_or_else(|| {
-                format!("{BAD_REQUEST}until {text}: not an RFC 3339 time (2026-10-02T00:00:00Z)")
-            })?,
-    };
-    Ok((window, until - length, until))
-}
-
-/// `/api/scorecard/fleet?window=24h|7d|30d|90d[&until=<RFC 3339>]`: how the
-/// fleet decided and did over `[until - window, until)` (`until` defaults to
-/// now), counted from the experience views (spawn-postgres, `experience`):
-/// the decision ladder, agent-hours and human decisions per agent-hour,
-/// escalations, interventions, outcomes, landings per day, judgements and
-/// each open mission's idle hours.
-fn scorecard_fleet(query: &str) -> Result<Value, String> {
-    let store = open_store()?;
-    let (window, since, until) = fleet_window(query, || store.database_now_ms().map_err(err))?;
-    let mut answer = store.fleet_experience(since, until).map_err(err)?;
-    answer["window"] = json!(window);
-    Ok(answer)
 }
 
 /// `/api/alerts?since=`: exactly the JSON array of `spawn alerts --once
@@ -2093,10 +1919,10 @@ mod tests {
 
     use super::{
         Arc, BAD_REQUEST, DEFAULT_LIMIT, LogStart, MAX_INPUT_BODY, MAX_INPUT_TEXT, MAX_LIMIT,
-        ProcSocket, Shared, access_token, fleet_window, handle, is_json, is_loopback,
-        local_exemption, log_window, objective_json, objective_prompt, open_network_request,
-        open_networks, owner_uid, peer_uid, proc_sockets, rsi_objective, rsi_summary, same_origin,
-        same_secret, serve_requests, server_hosts, tokenless_request, typed_text, with_last_gates,
+        ProcSocket, Shared, access_token, handle, is_json, is_loopback, local_exemption,
+        log_window, objective_json, objective_prompt, open_network_request, open_networks,
+        owner_uid, peer_uid, proc_sockets, rsi_objective, rsi_summary, same_origin, same_secret,
+        serve_requests, server_hosts, tokenless_request, typed_text, with_last_gates,
         with_objectives,
     };
     use crate::objectives::Task;
@@ -2625,56 +2451,6 @@ mod tests {
         assert_eq!(reached.body["error"], "SPAWN_DATABASE_URL is not set");
     }
 
-    /// The restart and reassign paths have the input's guards (POST only,
-    /// the page's Origin without the token, JSON), and a body of a reason
-    /// alone, at most 2000 bytes with no control character. Past every
-    /// guard each reaches the database (here none: 500).
-    #[test]
-    fn the_restart_and_reassign_paths_have_the_inputs_guards_and_a_reason_alone() {
-        for path in [
-            "/api/session/session_worker_a_7/restart",
-            "/api/session/session_worker_a_7/reassign",
-        ] {
-            let get = exchange(
-                Some("secret"),
-                "",
-                None,
-                &format!(
-                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\n\
-                     Authorization: Bearer secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                ),
-            );
-            refused(&get, 405, "GET");
-            let body = r#"{"reason":"stalled on a hung tool"}"#;
-            let named = "Host: 127.0.0.1:PORT\r\nContent-Type: application/json\r\n";
-            refused(
-                &post(None, "", None, path, named, body),
-                403,
-                "no token and no Origin",
-            );
-            let text = "Host: 127.0.0.1:PORT\r\nAuthorization: Bearer secret\r\n\
-                        Content-Type: text/plain\r\n";
-            refused(
-                &post(Some("secret"), "", None, path, text, body),
-                415,
-                "not JSON",
-            );
-            let long = format!(r#"{{"reason":"{}"}}"#, "x".repeat(2001));
-            for (bad, why) in [
-                ("not json", "not JSON"),
-                (r#"{"reason":"x","task":7}"#, "a task"),
-                (r#"{"reason":"x","type":"stop"}"#, "an action type"),
-                (r#"{"reason":"a\u001bb"}"#, "a control character"),
-                (long.as_str(), "too long"),
-            ] {
-                refused(&post(Some("secret"), "", None, path, SCRIPT, bad), 400, why);
-            }
-            let reached = post(Some("secret"), "", None, path, SCRIPT, body);
-            assert_eq!(reached.status, 500, "{reached:?}");
-            assert_eq!(reached.body["error"], "SPAWN_DATABASE_URL is not set");
-        }
-    }
-
     /// Who may write past the guards: the token's holder from anywhere, the
     /// page itself on an open network, and, with no token set, the owner's
     /// own client. Each reaches the database (here none: 500).
@@ -2855,88 +2631,6 @@ mod tests {
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
-    }
-
-    #[test]
-    fn the_fleet_window_is_one_it_knows_ending_at_until_or_now() {
-        const DAY: i64 = 86_400_000;
-        let until = crate::scorecard::time::parse_rfc3339("2026-10-31T00:00:00Z").expect("a time");
-        let unused = || -> Result<i64, String> { panic!("until is given: now is not read") };
-        assert_eq!(
-            fleet_window("window=7d&until=2026-10-31T00:00:00Z", unused),
-            Ok(("7d", until - 7 * DAY, until))
-        );
-        assert_eq!(
-            fleet_window("until=2026-10-31T00%3A00%3A00Z&window=90d", unused),
-            Ok(("90d", until - 90 * DAY, until)),
-            "a percent-encoded until"
-        );
-        assert_eq!(
-            fleet_window("window=24h", || Ok(until)),
-            Ok(("24h", until - DAY, until)),
-            "until defaults to now"
-        );
-        assert_eq!(
-            fleet_window("window=30d&until=", || Ok(until)),
-            Ok(("30d", until - 30 * DAY, until))
-        );
-        for bad in ["window=2d", "", "window=7D", "window=7d&until=yesterday"] {
-            let refused = fleet_window(bad, || Ok(until)).expect_err(bad);
-            assert!(refused.starts_with(BAD_REQUEST), "{bad}: {refused}");
-        }
-    }
-
-    /// `/api/scorecard/fleet`'s interventions and landings are what `spawn
-    /// scorecard` counts as autonomy's interventions and throughput's
-    /// landings, over the same window: one definition of each.
-    #[test]
-    fn the_fleet_windows_interventions_and_landings_are_the_scorecards() {
-        in_test_schema(|owner, store| {
-            let mut client =
-                postgres::Client::connect(owner, postgres::NoTls).expect("the owner connects");
-            client
-                .batch_execute(&format!(
-                    "begin; {} commit;",
-                    include_str!("../../spawn-postgres/tests/experience-history.sql")
-                ))
-                .expect("the history seeds");
-            let root = std::env::temp_dir().join(format!(
-                "spawn-serve-fleet-{}-{}",
-                std::process::id(),
-                super::now_ms()
-            ));
-            let hour: i64 = 3_600_000;
-            let b = 1_700_006_400_000;
-            for (since, until) in [(b, b + 100 * hour), (b + 24 * hour, b + 72 * hour)] {
-                let asked = crate::scorecard::Query {
-                    mission: None,
-                    since: Some(crate::scorecard::time::format_rfc3339(since)),
-                    until: Some(crate::scorecard::time::format_rfc3339(until)),
-                };
-                let card = crate::scorecard::measure(store, Some(&root), &asked)
-                    .expect("the scorecard measures");
-                let fleet = &card["scopes"][0]["dimensions"];
-                assert_eq!(card["scopes"][0]["scope"], json!("fleet"));
-                let answer = store
-                    .fleet_experience(since, until)
-                    .expect("the window's figures");
-                assert_eq!(
-                    answer["interventions"]["total"], fleet["autonomy"]["interventions"],
-                    "[{since}, {until}): {answer}"
-                );
-                assert_eq!(
-                    answer["interventions"]["by_kind"], fleet["autonomy"]["by_kind"],
-                    "[{since}, {until})"
-                );
-                let landings = answer["outcomes"]["landed"].as_i64().expect("a count")
-                    + answer["outcomes"]["accepted"].as_i64().expect("a count");
-                assert_eq!(
-                    json!(landings),
-                    fleet["throughput"]["landed"],
-                    "[{since}, {until})"
-                );
-            }
-        });
     }
 
     /// The supervisor's session starts an execution, as the Bridge records it.

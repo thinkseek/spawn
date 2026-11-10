@@ -95,7 +95,6 @@ pub(crate) use digest::{OPENING as DIGEST_OPENING, heading};
 #[cfg(test)]
 pub(crate) use jobs::items as job_items;
 pub(crate) use stall::Bounds;
-pub(crate) use stops::spent as stop_spent;
 pub(crate) use worker::reached_with;
 
 use std::collections::BTreeSet;
@@ -1118,7 +1117,7 @@ pub(crate) fn fork_before_within(
 ) -> Result<Option<String>, String> {
     use crate::main_merge::Fork;
     use std::fmt::Write as _;
-    let CommandAction::Start { prompt, from, .. } = &mut order.action else {
+    let CommandAction::Start { prompt, .. } = &mut order.action else {
         return Ok(None);
     };
     let Some(task) = order.task else {
@@ -1159,17 +1158,6 @@ pub(crate) fn fork_before_within(
             Ok(Some(format!(
                 "deliver: task #{task}: task #{}'s checkpoint {} holds nothing main lacks; it \
                  starts from main",
-                prior.task, prior.commit
-            )))
-        }
-        // A reassigned task of a mission without a source: its branch is
-        // made by the Bridge, at the old worker's last checkpoint.
-        Ok(Fork::NoSource) if prior.reassign => {
-            *from = Some(prior.commit.clone());
-            prompt.push_str("\n\n");
-            prompt.push_str(&crate::main_merge::reassign_note(&prior));
-            Ok(Some(format!(
-                "deliver: task #{task} starts from task #{}'s last checkpoint {}",
                 prior.task, prior.commit
             )))
         }

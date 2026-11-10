@@ -271,10 +271,6 @@ pub(crate) fn merge_main(
 pub(crate) struct PriorWork {
     pub(crate) task: i64,
     pub(crate) commit: String,
-    /// The task it is: the one the new task was reassigned from
-    /// (`spawn_task_reassign`), not an objective's earlier task.
-    #[serde(default)]
-    pub(crate) reassign: bool,
 }
 
 /// Create `agent`'s branch at `prior`'s checkpoint and merge main into it,
@@ -469,18 +465,6 @@ pub(crate) fn fork_failed_note(prior: &PriorWork, error: &str, head: Option<&str
             prior.task
         ),
     }
-}
-
-/// What a reassigned task whose branch the Bridge makes at `prior`'s last
-/// checkpoint (a mission without a source) is told at its start.
-pub(crate) fn reassign_note(prior: &PriorWork) -> String {
-    format!(
-        "This task was reassigned to you from task #{task}, whose worker stopped before it was \
-         done. Your workspace already contains that worker's work (its last checkpoint, commit \
-         {commit}): continue it; do not redo it.",
-        task = prior.task,
-        commit = prior.commit
-    )
 }
 
 /// What a task forked from `prior`'s work is told at its start.
@@ -1649,8 +1633,6 @@ mod tests {
             reason: None,
             yielded: false,
             yield_reason: None,
-            reassigned_as: None,
-            reassigned_to_session: None,
         };
         let recorded = || {
             let mut client =

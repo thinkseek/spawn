@@ -6,7 +6,7 @@ import { sessionReader, usePoll } from "../api";
 import { fetchCommands } from "../fleet";
 import type { CommandRecord } from "../fleet";
 import type { KnownCommand } from "../trace";
-import type { Execution, TaskLink, TimelineEvent } from "../api";
+import type { Execution, TimelineEvent } from "../api";
 import { hasEarlier, joinTail, mergeEvents, readBack } from "../sessionWindow";
 import type { EventWindow } from "../sessionWindow";
 import { eventTone, fullText, pairs } from "../eventFormat";
@@ -39,9 +39,6 @@ export function Timeline({
   tail,
   executions,
   to = null,
-  reassignedTo = null,
-  reassignedFrom = null,
-  onOpenSession,
 }: {
   sessionId: string;
   tail: EventWindow;
@@ -49,12 +46,6 @@ export function Timeline({
   /** Who the session's inputs go to (`supervisor`): the trace reads a
    * person's input as `You → supervisor` ([`inputTarget`]). */
   to?: string | null;
-  /** The task this session's task was reassigned to (old to new). */
-  reassignedTo?: TaskLink | null;
-  /** The task this session's task took over (new to old). */
-  reassignedFrom?: TaskLink | null;
-  /** Open another session's timeline (a reassign's other end). */
-  onOpenSession?: (sessionId: string) => void;
 }) {
   const [mode, choose] = useStoredChoice<Mode>("spawn.timeline.mode", MODES, "trace");
   const [held, setHeld] = useState<EventWindow>(tail);
@@ -134,7 +125,6 @@ export function Timeline({
   const toggle = (
     <>
       <ViewToggle label="Timeline view" options={MODE_OPTIONS} value={mode} onChange={choose} />
-      <ReassignLinks to={reassignedTo} from={reassignedFrom} onOpen={onOpenSession} />
       {earlier && (
         <button
           type="button"
@@ -155,41 +145,6 @@ export function Timeline({
     </Suspense>
   ) : (
     <EventList events={events} header={toggle} />
-  );
-}
-
-/** A reassign's two ends, as links between the old worker's trace and the
- * new one's: "reassigned to task #N" on the old, "took over task #M" on the
- * new (`spawn task reassign`, the agent page's Reassign). */
-function ReassignLinks({
-  to,
-  from,
-  onOpen,
-}: {
-  to: TaskLink | null;
-  from: TaskLink | null;
-  onOpen?: (sessionId: string) => void;
-}) {
-  const links = [
-    to ? { link: to, words: `Reassigned to task #${to.task}` } : null,
-    from ? { link: from, words: `Took over task #${from.task}` } : null,
-  ].filter((entry): entry is { link: TaskLink; words: string } => entry !== null);
-  if (links.length === 0) return null;
-  return (
-    <>
-      {links.map(({ link, words }) => (
-        <button
-          key={words}
-          type="button"
-          disabled={!onOpen}
-          onClick={() => onOpen?.(link.session_id)}
-          title={`Open ${link.session_id}`}
-          className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-caption text-muted-foreground hover:bg-surface-hover hover:text-foreground disabled:opacity-60"
-        >
-          {words} · {link.session_id}
-        </button>
-      ))}
-    </>
   );
 }
 

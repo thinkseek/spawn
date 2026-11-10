@@ -390,9 +390,6 @@ export default function App() {
                 tail={detail.window}
                 executions={detail.executions}
                 to={inputTarget(detail.session_id, pollNames.get(detail.session_id) ?? null, detail.agent_id)}
-                reassignedTo={detail.reassigned_to}
-                reassignedFrom={detail.reassigned_from}
-                onOpenSession={setSelectedId}
               />
             ) : (
               <Placeholder

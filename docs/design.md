@@ -440,8 +440,7 @@ Times are a record's `recorded_at_ms`; an event belongs to a window or day when 
 
 **定义没说死的地方，这样读：**
 
-- 一个任务只落地一次（第一条落地记录）；关闭之后的记录不再落地、不再关闭它。`task.aborted` 和 `task.over_budget`（超预算中止，折叠成 `cancelled`）也是一次取消：它关闭任务，也算重试链里“取消过的一次尝试”，但它是集成器的，不是人的干预。
-- 同样的干预和落地也由经验视图逐条给出（`spawn_interventions`、`spawn_outcomes` 的 `landed` 加 `accepted`；docs/fleet-architecture.md §4），`GET /api/scorecard/fleet` 按窗口数它们：与本节的 autonomy 和 throughput 是同一个定义。
+- 一个任务只落地一次（第一条落地记录）；关闭之后的记录不再落地、不再关闭它。`task.aborted`（超预算中止，折叠成 `cancelled`）也是一次取消：它关闭任务，也算重试链里“取消过的一次尝试”，但它是集成器的，不是人的干预。
 - 重新指派的前导时间：一个目标在本 mission 里上一次落地之前的尝试属于那次落地，不属于这一次（循环的目标每轮从自己的第一次尝试量起）。
 - 一个会话上同时开着几个任务时（常驻工人的队列），命令归最早指派的那个（投递按最早的先送）。
 - 取消再指派：每个人的取消，配它之后（按流的顺序）在同一 mission 里第一个同目标（或无目标时同 brief）的指派，各算一次。
