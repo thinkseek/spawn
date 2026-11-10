@@ -1868,7 +1868,7 @@ pub(crate) fn host_name() -> Option<String> {
 /// Where a gate run judged: this host's name, the toolchain the run printed
 /// ([`toolchain_of`]) and the runner (null: a gate run on this host;
 /// milestone M2 names a remote runner here).
-pub(crate) fn run_env(toolchain: Option<String>) -> serde_json::Value {
+pub(crate) fn run_env(toolchain: Option<&str>) -> serde_json::Value {
     serde_json::json!({"host": host_name(), "toolchain": toolchain, "runner": null})
 }
 
@@ -3762,10 +3762,11 @@ mod room_tests {
 #[cfg(test)]
 mod binding_tests {
     use super::{
-        GateFailure, Verdict, controller_commit, known_inputs, printed, run_env, run_inputs,
+        GateFailure, Verdict, controller_commit, hex, known_inputs, printed, run_env, run_inputs,
         scenarios_sha256, toolchain_of,
     };
     use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
     use std::path::PathBuf;
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -3787,19 +3788,16 @@ mod binding_tests {
         (ctl, gate)
     }
 
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-
     /// The digest as the contract spells it, from (path, content) pairs
     /// already in bytewise order.
     fn spelled(files: &[(&str, &str)]) -> String {
         let mut listing = String::new();
         for (path, content) in files {
-            listing.push_str(&format!(
-                "{}  {path}\n",
+            let _ = writeln!(
+                listing,
+                "{}  {path}",
                 hex(&Sha256::digest(content.as_bytes()))
-            ));
+            );
         }
         hex(&Sha256::digest(listing.as_bytes()))
     }
