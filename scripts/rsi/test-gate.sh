@@ -3370,4 +3370,22 @@ expect "and sees it empty" "$(cat "$work/gate.out")" '| index holds: .'
 refuse "never what main solved" "$(cat "$work/gate.out")" 'index holds: 07'
 git -C "$seed" checkout -q main 2>/dev/null || git -C "$seed" checkout -q -B main "$base"
 
+# 25. A task-only scenario (`# rsi: task-only`, 029: a gate cannot judge it)
+# is run only as its own task's scenario: 081 passes on the base and fails
+# on the candidate, which would be a regression, yet it is neither run on
+# the base for another gate nor as a regression, so the candidate is
+# accepted; as the task's scenario, 082 is run as any task scenario (fails
+# on the base, passes on the candidate).
+only=$work/task-only
+mkdir -p "$only"
+cp "$scenarios/build" "$scenarios/protected" "$only/"
+printf '#!/bin/sh\n# rsi: task-only\n[ "$PWD" = "$SPAWN_BASELINE_TREE" ]\n' >"$only/081.sh"
+printf '#!/bin/sh\n# rsi: task-only\n[ "$(cat value)" = two ] || exit 1\n' >"$only/082.sh"
+expect "a task-only scenario the candidate fails is no regression: accepted" \
+    "$(judge "$good" "" "$only")" 'exit=0 {"verdict":"accepted"'
+refuse "nor run on the base or the candidate" "$(cat "$work/gate.out")" '081.sh'
+expect "as its own task's scenario it is judged: accepted" \
+    "$(judge "$good" "$only/082.sh" "$only")" 'exit=0 {"verdict":"accepted"'
+expect "run as the task's" "$(cat "$work/gate.out")" 'candidate: 082.sh must pass'
+
 echo "gate: all cases pass"
