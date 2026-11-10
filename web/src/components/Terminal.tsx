@@ -1,8 +1,8 @@
 import { ArrowDown, SquareTerminal } from "lucide-react";
-import { useLayoutEffect, useRef, useState } from "react";
-import type { KeyboardEvent, ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import type { KeyboardEvent, MouseEvent, ReactNode } from "react";
 
-import { keyName } from "../keys";
+import { armHint, clickArms, keyHint, panelKey } from "../keys";
 import type { KeyName } from "../keys";
 import { cx } from "./ui";
 
@@ -70,11 +70,27 @@ interface TerminalPanelProps {
   /** Shown instead of the body while `text` is empty. */
   placeholder: string;
   className?: string;
-  /** Named keys for the agent (backlog P1): while the body itself has
-   * focus, Esc, the arrows, Enter, Y and N go to `onKey`, and `hint` (and
-   * `feedback`, the last key's fate) shows under it. Never from a text box,
-   * with a modifier, or on auto-repeat (keys.ts). */
-  keys?: { hint: string; onKey: (name: KeyName) => void; feedback?: ReactNode };
+  /** Named keys for the agent `to` (backlog P1, P11): once a click (or
+   * Enter) has armed the focused body, Esc, the arrows, Enter, Y and N go to
+   * `onKey`; the panel is outlined and says so, and `feedback` (the last
+   * key's fate) shows under it. Focus alone arms nothing, and blur disarms.
+   * Never from a text box, with a modifier, or on auto-repeat (keys.ts). */
+  keys?: { to: string; onKey: (name: KeyName) => void; feedback?: ReactNode };
+}
+
+/** What `clickArms` reads of a click on the panel. */
+function clickOf(event: MouseEvent<HTMLDivElement>) {
+  const element = event.currentTarget;
+  const box = element.getBoundingClientRect();
+  // The client area: inside the border, without the scrollbars.
+  const x = event.clientX - box.left - element.clientLeft;
+  const y = event.clientY - box.top - element.clientTop;
+  return {
+    button: event.button,
+    modified: event.ctrlKey || event.altKey || event.metaKey || event.shiftKey,
+    selected: !(window.getSelection()?.isCollapsed ?? true),
+    inside: x >= 0 && y >= 0 && x < element.clientWidth && y < element.clientHeight,
+  };
 }
 
 /**
@@ -97,9 +113,17 @@ export function TerminalPanel({
   const pinned = useRef(true);
   const [following, setFollowing] = useState(true);
   const [focused, setFocused] = useState(false);
+  const [armed, setArmed] = useState(false);
+  // The keys taken away (the agent stopped, the page may no longer write),
+  // or going to another agent: disarm, so neither their return nor the new
+  // agent finds the panel armed by a click meant for the old one.
+  const keysTo = keys?.to;
+  useEffect(() => {
+    setArmed(false);
+  }, [keysTo]);
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (!keys) return;
-    const name = keyName({
+    const effect = panelKey({
       key: event.key,
       ctrlKey: event.ctrlKey,
       altKey: event.altKey,
@@ -107,14 +131,18 @@ export function TerminalPanel({
       repeat: event.repeat,
       isComposing: event.nativeEvent.isComposing,
       onPanel: event.target === event.currentTarget,
+      armed,
     });
-    if (!name) return;
-    // The arrows would scroll the panel, Enter could submit a form, and Esc
-    // would close the drawer around it (its listener is on window): the key
-    // is the agent's.
+    // Not armed, Esc and the arrows are the page's: the drawer closes, the
+    // panel scrolls.
+    if (!effect) return;
+    // Armed, the arrows would scroll the panel, Enter could submit a form,
+    // and Esc would close the drawer around it (its listener is on window):
+    // the key is the agent's. Enter that arms is not sent.
     event.preventDefault();
     event.stopPropagation();
-    keys.onKey(name);
+    if ("arm" in effect) setArmed(true);
+    else keys.onKey(effect.send);
   };
 
   useLayoutEffect(() => {
@@ -156,10 +184,24 @@ export function TerminalPanel({
         aria-labelledby={panel?.labelledBy}
         tabIndex={panel || keys ? 0 : undefined}
         aria-keyshortcuts={keys ? "Escape ArrowUp ArrowDown ArrowLeft ArrowRight Enter Y N" : undefined}
-        aria-description={keys?.hint}
+        aria-description={keys ? (armed ? keyHint(keys.to) : armHint(keys.to)) : undefined}
         onKeyDown={keys ? onKeyDown : undefined}
         onFocus={keys ? (event) => event.target === event.currentTarget && setFocused(true) : undefined}
-        onBlur={keys ? () => setFocused(false) : undefined}
+        // A deliberate click into the screen arms it (keys.ts clickArms): a
+        // plain primary click inside the text, not on the scrollbar, that
+        // selected nothing. A drag that selects text to copy does not, so
+        // the Esc after it still closes the drawer.
+        onClick={keys ? (event) => clickArms(clickOf(event)) && setArmed(true) : undefined}
+        // Focus leaving the panel, a click outside it included, disarms.
+        onBlur={
+          keys
+            ? (event) => {
+                if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+                setFocused(false);
+                setArmed(false);
+              }
+            : undefined
+        }
         onScroll={(event) => {
           const element = event.currentTarget;
           const atBottom =
@@ -168,7 +210,19 @@ export function TerminalPanel({
           pinned.current = atBottom;
           if (atBottom !== following) setFollowing(atBottom);
         }}
-        className="min-h-0 flex-1 overflow-auto px-4 py-3 font-mono text-[12px] leading-5 text-terminal-foreground"
+        data-keys={keys ? (armed ? "armed" : "off") : undefined}
+        className={cx(
+          "min-h-0 flex-1 overflow-auto px-4 py-3 font-mono text-[12px] leading-5 text-terminal-foreground",
+          // Focused but not armed: a dim dashed outline (it reads, it sends
+          // nothing). Armed: a solid outline in the info tone, beside the
+          // "Keys on" line naming the agent the keys go to. Armed implies
+          // focus (blur disarms), so both sets are `focus:` and replace the
+          // browser's own ring.
+          keys &&
+            (armed
+              ? "focus:outline-2 focus:-outline-offset-2 focus:outline-solid focus:outline-info"
+              : "focus:outline-1 focus:-outline-offset-2 focus:outline-dashed focus:outline-white/30"),
+        )}
       >
         {text ? (
           <TerminalLines text={text} />
@@ -184,7 +238,16 @@ export function TerminalPanel({
           aria-live="polite"
           className="flex h-7 shrink-0 items-center gap-3 border-t border-white/[0.06] bg-white/[0.02] px-4 text-caption"
         >
-          {focused ? <span className="truncate text-muted-foreground">{keys.hint}</span> : null}
+          {focused && armed ? (
+            <span className="flex min-w-0 items-center gap-2">
+              <span className="shrink-0 rounded bg-info/15 px-1.5 py-px text-micro font-medium text-info ring-1 ring-inset ring-info/30">
+                Keys on
+              </span>
+              <span className="truncate text-foreground">{keyHint(keys.to)}</span>
+            </span>
+          ) : focused ? (
+            <span className="truncate text-muted-foreground">{armHint(keys.to)}</span>
+          ) : null}
           {keys.feedback ? <span className="ml-auto shrink-0 truncate">{keys.feedback}</span> : null}
         </div>
       ) : null}

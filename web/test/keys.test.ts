@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { commandSummary, commandWords } from "../src/commands.ts";
-import { KEY_NAMES, keyHint, keyLabel, keyName } from "../src/keys.ts";
+import { KEY_NAMES, armHint, clickArms, keyHint, keyLabel, keyName, panelKey } from "../src/keys.ts";
 import type { KeyPress } from "../src/keys.ts";
 
 const press = (key: string, over: Partial<KeyPress> = {}): KeyPress => ({
@@ -12,6 +12,7 @@ const press = (key: string, over: Partial<KeyPress> = {}): KeyPress => ({
   metaKey: false,
   repeat: false,
   onPanel: true,
+  armed: true,
   ...over,
 });
 
@@ -36,9 +37,41 @@ test("a key goes only from the panel itself, with no modifier, and never on auto
   assert.equal(keyName(press("Enter", { isComposing: true })), null, "an input method's Enter");
 });
 
+test("focus alone sends nothing: Esc and the arrows stay the page's until the panel is armed", () => {
+  for (const key of ["Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "y", "n"]) {
+    assert.equal(panelKey(press(key, { armed: false })), null, key);
+    assert.equal(keyName(press(key, { armed: false })), null, key);
+  }
+  // Enter on the focused panel is the keyboard's click: it arms, and is not sent.
+  assert.deepEqual(panelKey(press("Enter", { armed: false })), { arm: true });
+  assert.equal(keyName(press("Enter", { armed: false })), null);
+  // Armed, Enter is the agent's.
+  assert.deepEqual(panelKey(press("Enter")), { send: "enter" });
+  assert.deepEqual(panelKey(press("Escape")), { send: "escape" });
+  assert.equal(panelKey(press("a")), null, "armed, a key outside the set is still the page's");
+});
+
+test("Enter arms only as a plain press on the panel itself", () => {
+  assert.equal(panelKey(press("Enter", { armed: false, onPanel: false })), null, "a text box's Enter");
+  assert.equal(panelKey(press("Enter", { armed: false, repeat: true })), null);
+  assert.equal(panelKey(press("Enter", { armed: false, ctrlKey: true })), null);
+  assert.equal(panelKey(press("Enter", { armed: false, isComposing: true })), null);
+});
+
+test("only a plain click inside the text that selected nothing arms the panel", () => {
+  const click = { button: 0, modified: false, selected: false, inside: true };
+  assert.equal(clickArms(click), true);
+  assert.equal(clickArms({ ...click, selected: true }), false, "a drag that selected text to copy");
+  assert.equal(clickArms({ ...click, inside: false }), false, "on the scrollbar");
+  assert.equal(clickArms({ ...click, button: 1 }), false, "the middle button");
+  assert.equal(clickArms({ ...click, button: 2 }), false, "the context menu");
+  assert.equal(clickArms({ ...click, modified: true }), false, "Shift extends a selection; Ctrl, Alt, Meta are shortcuts");
+});
+
 test("keys read as the page shows them, in the hint and in command rows", () => {
   assert.deepEqual(KEY_NAMES.map(keyLabel), ["Esc", "↑", "↓", "←", "→", "Enter", "Y", "N"]);
   assert.equal(keyHint("agent_worker_a"), "Keys go to agent_worker_a: Esc ↑ ↓ ← → Enter Y N");
+  assert.equal(armHint("agent_worker_a"), "Click the screen or press Enter to send keys to agent_worker_a");
   assert.equal(commandSummary("key", "escape"), "Esc");
   assert.equal(commandSummary("key", "f9"), "f9", "a name the page does not know shows as it is");
   assert.equal(commandSummary("input", "escape"), "escape", "text is text");
