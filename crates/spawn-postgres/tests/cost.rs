@@ -101,62 +101,42 @@ fn entry<'a>(answer: &'a Value, list: &str, key: &str, id: &Value) -> &'a Value 
         .unwrap_or_else(|| panic!("no {key} {id} in {list}: {answer}"))
 }
 
-#[test]
-fn each_message_counts_once_for_its_task_priced_when_recorded() {
-    let (store, _schema) = store("cost_record");
+/// A mission with one ephemeral worker's task: the mission, the task and
+/// the worker's names (`spawn_task_assign`).
+fn one_task(store: &PostgresStore) -> (i64, i64, Worker) {
     let mission = store
         .mission_add("Work", &json!(["/tmp/source.git"]), "human")
         .expect("add");
     let task = store
         .task_assign(mission, "ephemeral", "w1", "brief", "default")
         .expect("assign");
-    // An ephemeral worker's names (`spawn_task_assign`).
     let worker = Worker {
         agent: format!("agent_worker_w1_{task}"),
         session: format!("session_worker_w1_{task}"),
     };
+    (mission, task, worker)
+}
+
+#[test]
+fn each_message_counts_once_for_its_task_priced_when_recorded() {
+    let (store, _schema) = store("cost_record");
+    let (mission, task, worker) = one_task(&store);
     let now = store.database_now_ms().expect("now");
     started(&store, &worker, 1);
-    // Two lines of one message (the same usage: one event), and a later
-    // line whose usage grew: the message counts its largest usage, once.
-    usage(
-        &store,
-        &worker,
-        1,
-        ("msg_1", "model-x", now),
-        [1000, 2000, 10_000, 50_000],
-    );
-    usage(
-        &store,
-        &worker,
-        1,
-        ("msg_1", "model-x", now),
-        [1000, 2000, 10_000, 50_000],
-    );
-    usage(
-        &store,
-        &worker,
-        1,
-        ("msg_1", "model-x", now + 5),
-        [1000, 4000, 10_000, 50_000],
-    );
-    // Timed three days ago, before the task was assigned: still the task's.
-    usage(
-        &store,
-        &worker,
-        1,
-        ("msg_2", "model-x", now - 3 * DAY_MS),
-        [1_000_000, 0, 0, 0],
-    );
-    // A model with no price: its tokens, no cost.
-    usage(
-        &store,
-        &worker,
-        1,
-        ("msg_3", "model-z", now),
-        [5000, 500, 0, 0],
-    );
-
+    let lines: [(&str, &str, i64, [u64; 4]); 5] = [
+        // Two lines of one message (the same usage: one event), and a later
+        // line whose usage grew: the message counts its largest usage, once.
+        ("msg_1", "model-x", now, [1000, 2000, 10_000, 50_000]),
+        ("msg_1", "model-x", now, [1000, 2000, 10_000, 50_000]),
+        ("msg_1", "model-x", now + 5, [1000, 4000, 10_000, 50_000]),
+        // Timed three days ago, before the task was assigned: the task's.
+        ("msg_2", "model-x", now - 3 * DAY_MS, [1_000_000, 0, 0, 0]),
+        // A model with no price: its tokens, no cost.
+        ("msg_3", "model-z", now, [5000, 500, 0, 0]),
+    ];
+    for (id, model, at, counts) in lines {
+        usage(&store, &worker, 1, (id, model, at), counts);
+    }
     assert_eq!(store.cost_record(&prices(3.0)).expect("record"), 3);
     // Read again, and again at other prices: nothing changes.
     assert_eq!(store.cost_record(&prices(3.0)).expect("record"), 0);
@@ -176,19 +156,13 @@ fn each_message_counts_once_for_its_task_priced_when_recorded() {
     near(
         &by_task["usd"],
         3.1155,
-        "the task, the message before it included",
+        "the task, the early message included",
     );
     assert_eq!(by_task["mission"], mission);
-    near(
-        &entry(&week, "missions", "mission", &json!(mission))["usd"],
-        3.1155,
-        "the mission",
-    );
-    near(
-        &entry(&week, "agents", "agent", &json!(worker.agent))["usd"],
-        3.1155,
-        "the agent",
-    );
+    let by_mission = entry(&week, "missions", "mission", &json!(mission));
+    near(&by_mission["usd"], 3.1155, "the mission");
+    let by_agent = entry(&week, "agents", "agent", &json!(worker.agent));
+    near(&by_agent["usd"], 3.1155, "the agent");
     let z = entry(&week, "models", "model", &json!("model-z"));
     assert_eq!(z["usd"], Value::Null, "an unpriced model has no cost: {z}");
     let execution = entry(&week, "executions", "execution", &json!("exec_1"));
@@ -199,7 +173,7 @@ fn each_message_counts_once_for_its_task_priced_when_recorded() {
     near(
         &day["total"]["usd"],
         0.1155,
-        "the day leaves out the message of 3 days ago",
+        "the day leaves out the early message",
     );
 
     // New spending is priced at the prices of its recording.
@@ -213,28 +187,39 @@ fn each_message_counts_once_for_its_task_priced_when_recorded() {
     assert_eq!(store.cost_record(&prices(6.0)).expect("record"), 1);
     let day = store.cost_window(now - DAY_MS, now + 1000).expect("window");
     near(&day["total"]["usd"], 0.7155, "msg_4 at $6 a million");
+}
 
-    // The daily budget: a positive amount, read with the day's spend.
-    let refused = store.mission_configure(
-        mission,
-        None,
-        "review",
-        Some(&json!({"daily_usd": 0})),
-        None,
+#[test]
+fn a_daily_budget_is_an_amount_above_zero_read_with_the_days_spend() {
+    let (store, _schema) = store("cost_budget");
+    let (mission, _task, worker) = one_task(&store);
+    let now = store.database_now_ms().expect("now");
+    started(&store, &worker, 1);
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_1", "model-x", now),
+        [100_000, 10_000, 0, 0],
     );
-    assert!(refused.is_err(), "a budget of $0 is refused");
-    store
-        .mission_configure(
+    store.cost_record(&prices(3.0)).expect("record");
+    let budget = |usd: Value| {
+        store.mission_configure(
             mission,
             None,
             "review",
-            Some(&json!({"daily_usd": 0.5})),
+            Some(&json!({"daily_usd": usd})),
             None,
         )
-        .expect("configure");
+    };
+    assert!(budget(json!(0)).is_err(), "a budget of $0 is refused");
+    assert!(budget(json!("1")).is_err(), "a budget is a number");
+    budget(json!(0.5)).expect("configure");
     let budgets = store.cost_budgets(now - 1000, now + 1000).expect("budgets");
-    let budget = &budgets[0];
-    assert_eq!(budget["mission"], mission);
-    near(&budget["budget_usd"], 0.5, "the budget");
-    near(&budget["spent_usd"], 0.7155, "the day's spend");
+    assert_eq!(budgets[0]["mission"], mission);
+    near(&budgets[0]["budget_usd"], 0.5, "the budget");
+    near(&budgets[0]["spent_usd"], 0.45, "the day's spend");
+    // Before the day: nothing spent.
+    let earlier = store.cost_budgets(now - 2000, now - 1000).expect("budgets");
+    near(&earlier[0]["spent_usd"], 0.0, "no spend before the message");
 }
