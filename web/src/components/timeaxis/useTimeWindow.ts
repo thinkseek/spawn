@@ -247,6 +247,25 @@ export function useNowWhile(live: boolean): number {
   return now;
 }
 
+/** The time, taken every `ms` whatever else happens, and again when the page
+ * shows after being hidden (a background tab's timers are throttled). */
+export function useNowEvery(ms: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const tick = () => setNow(Date.now());
+    const timer = window.setInterval(tick, ms);
+    const shown = () => {
+      if (document.visibilityState === "visible") tick();
+    };
+    document.addEventListener("visibilitychange", shown);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", shown);
+    };
+  }, [ms]);
+  return now;
+}
+
 /** The width of an element, kept current. */
 export function useWidth(ref: RefObject<HTMLElement | null>): number {
   const [width, setWidth] = useState(0);
