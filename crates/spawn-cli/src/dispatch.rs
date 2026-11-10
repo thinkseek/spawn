@@ -479,6 +479,11 @@ pub(crate) enum Why {
     /// running, which recorded nothing ([`digest::drain_expiries`]): their
     /// tasks are judged again from nothing by the next integrator.
     DrainExpired,
+    /// A worker's engine ended on the model's error and the recovery will
+    /// not revive it: a request the model never accepts (`model_error`), or
+    /// a transient error whose retries are spent (`model_unavailable`)
+    /// ([`digest::model_finals`], told once).
+    ModelFinal,
 }
 
 impl Why {
@@ -488,7 +493,8 @@ impl Why {
     /// judges again on its own), an expired hold (its landings resumed on
     /// their own), an objective closed solved on the base (nothing is
     /// assigned for it again) and an expired drain (its gates run again
-    /// under the next integrator) are news. Every other item is a
+    /// under the next integrator) are news, as is a final model record (the
+    /// recovery decided; the supervisor acts on it or not). Every other item is a
     /// condition that holds while its facts do (a worker's state, a stall,
     /// a path still low on disk, a gate still without room): told, it stays
     /// in [`Plan::told`] until its facts change.
@@ -508,6 +514,7 @@ impl Why {
                 | Self::HoldExpired
                 | Self::ObjectiveSolved
                 | Self::DrainExpired
+                | Self::ModelFinal
         )
     }
 }
@@ -748,61 +755,66 @@ pub(crate) struct Reading {
 /// ([`read_plan`]): each is said once.
 static ORDER_LOGGED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
 
-/// The items the store's records raise for the host, in the order the
-/// supervisor is told them: the gate's room and host faults, its base
-/// disagreements, a red main, a source away, shadow verdicts, budgets,
-/// objective yields, solves and order, and hold and drain expiries.
-fn record_news(store: &PostgresStore) -> Result<Vec<Escalation>, String> {
-    let mut news = Vec::new();
-    news.extend(crate::disk::gate_room_escalations(&records(
+/// The digest items the host's and the integrator's records name, each read
+/// once a pass ([`read_plan`]): the gate's room, host faults and base
+/// disagreements, red and green mains, sources away, shadow verdicts, overruns, objective
+/// yields, closes and orders, expired holds and drains, and the recovery's
+/// final model records.
+fn record_items(store: &PostgresStore) -> Result<Vec<Escalation>, String> {
+    let mut host = Vec::new();
+    host.extend(crate::disk::gate_room_escalations(&records(
         store.gate_room_escalations(),
         "gate room records",
     )?));
-    news.extend(digest::host_fault_escalations(&records(
+    host.extend(digest::host_fault_escalations(&records(
         store.gate_host_fault_escalations(),
         "gate host fault records",
     )?));
-    news.extend(digest::base_disagrees_alerts(&records(
+    host.extend(digest::base_disagrees_alerts(&records(
         store.gate_base_disagrees_alerts(),
         "gate base disagreement records",
     )?));
-    news.extend(digest::main_red_news(&records(
+    host.extend(digest::main_red_news(&records(
         store.main_red_news(),
         "red main records",
     )?));
-    news.extend(digest::source_away_news(&records(
+    host.extend(digest::source_away_news(&records(
         store.source_away_news(),
         "source away records",
     )?));
-    news.extend(digest::shadow_disagreements(&records(
+    host.extend(digest::shadow_disagreements(&records(
         store.shadow_disagreements(),
         "shadow verdict records",
     )?));
-    news.extend(digest::over_budget_escalations(&records(
+    host.extend(digest::over_budget_escalations(&records(
         store.over_budget_escalations(),
         "over budget records",
     )?));
-    news.extend(digest::objective_yields(&records(
+    host.extend(digest::objective_yields(&records(
         store.objective_yields(),
         "objective yield records",
     )?));
-    news.extend(digest::objective_solved(&records(
+    host.extend(digest::objective_solved(&records(
         store.objective_solved_news(),
         "objective solved records",
     )?));
-    news.extend(digest::objective_order(&records(
+    host.extend(digest::objective_order(&records(
         store.objective_backlogs(),
         "objective backlogs",
     )?));
-    news.extend(digest::hold_expiries(&records(
+    host.extend(digest::hold_expiries(&records(
         store.hold_expiries(),
         "source hold records",
     )?));
-    news.extend(digest::drain_expiries(&records(
+    host.extend(digest::drain_expiries(&records(
         store.drain_expiries(),
         "integrator drain records",
     )?));
-    Ok(news)
+    host.extend(digest::model_finals(&records(
+        store.model_finals(),
+        "final model records",
+    )?));
+    Ok(host)
 }
 
 /// One function for both, so the queue a person reads is the dispatcher's
@@ -820,7 +832,7 @@ pub(crate) fn read_plan(
     let mut lines = Vec::new();
     let now = now_ms();
     let mut host = disk(now);
-    host.extend(record_news(store)?);
+    host.extend(record_items(store)?);
     // Every timer the records read here name: the times at which this step
     // would decide something new even though nothing is appended meanwhile.
     // A time already reached is no wait (the step acts on it now), so only
@@ -2402,6 +2414,73 @@ mod tests {
             text.lines()
                 .any(|line| line.contains("/srv/missions/supply-pa.git")),
             "each expiry keeps its own line: {text}"
+        );
+        let mut supervisor = idle_supervisor();
+        delivered(&mut supervisor, &plan.orders[0]);
+        let plan = decide_with(&[supervisor], &Work::default(), &items, true, NOW, "spawn");
+        assert!(
+            plan.orders.is_empty() && plan.pending.is_empty() && plan.told.is_empty(),
+            "told once, and resolved by the telling"
+        );
+    }
+
+    /// Objective 39: a final model record reaches an idle supervisor once,
+    /// as an item of the worker's session tagged `<session>
+    /// model-<execution>`, naming the session, the execution, the cause and
+    /// the status or the retries; news, never repeated once told.
+    #[test]
+    fn a_final_model_record_reaches_an_idle_supervisor_once() {
+        let records = [
+            serde_json::json!({"event_id": 40, "at_ms": 1_793_930_021_000_i64,
+                "session_id": "session_worker_a", "agent_id": "agent_worker_a",
+                "execution_id": "exec_a1", "cause": "model_error", "status": 400,
+                "error": "invalid_request",
+                "text": "API Error: 400 unexpected tool_use_id\nfound", "retries": null}),
+            serde_json::json!({"event_id": 52, "at_ms": 1_793_930_031_000_i64,
+                "session_id": "session_worker_b", "agent_id": "agent_worker_b",
+                "execution_id": "exec_b3", "cause": "model_unavailable", "status": 529,
+                "error": "overloaded", "text": "API Error: 529 Overloaded", "retries": 2}),
+        ];
+        let items = super::digest::model_finals(&records);
+        let tags: Vec<String> = items.iter().map(Escalation::tag).collect();
+        assert_eq!(
+            tags,
+            [
+                "session_worker_a model-exec_a1",
+                "session_worker_b model-exec_b3"
+            ]
+        );
+        assert!(items.iter().all(|item| item.why == Why::ModelFinal));
+        assert!(Why::ModelFinal.is_news());
+        assert_eq!(items[0].since_ms, Some(1_793_930_021_000));
+        for part in ["session_worker_a", "exec_a1", "model_error", "status 400"] {
+            assert!(items[0].line.contains(part), "{part}: {}", items[0].line);
+        }
+        for part in [
+            "session_worker_b",
+            "exec_b3",
+            "model_unavailable",
+            "after 2 retries",
+        ] {
+            assert!(items[1].line.contains(part), "{part}: {}", items[1].line);
+        }
+        assert!(items.iter().all(|item| !item.line.contains('\n')));
+        assert!(
+            super::digest::model_finals(&[serde_json::json!({"cause": "model_error"})]).is_empty(),
+            "a record without its session and execution is no item"
+        );
+
+        let rows = [idle_supervisor()];
+        let plan = decide_with(&rows, &Work::default(), &items, true, NOW, "spawn");
+        let CommandAction::Input { tags, .. } = &plan.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert_eq!(
+            tags,
+            &[
+                "session_worker_a model-exec_a1",
+                "session_worker_b model-exec_b3"
+            ]
         );
         let mut supervisor = idle_supervisor();
         delivered(&mut supervisor, &plan.orders[0]);
