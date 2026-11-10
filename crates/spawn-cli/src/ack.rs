@@ -393,6 +393,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The loop reads each agent's acks from its own workspace: one of its
+    /// own message is recorded, and the file goes; one of another agent's
+    /// message, even written in that agent's name, records nothing; a
+    /// second records nothing.
+    #[test]
+    fn the_loop_records_an_ack_from_the_workspace_that_holds_it() {
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+        let schema = format!("spawn_test_{}_{nanos:x}_acks", std::process::id());
+        let store = PostgresStore::connect_in_schema(&url, &schema).expect("connect and migrate");
+        let root = std::env::temp_dir().join(format!("spawn-acks-{}-{nanos:x}", std::process::id()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let separator = if url.contains('?') { '&' } else { '?' };
+            let owner = format!("{url}{separator}options=-csearch_path%3D{schema}");
+            let mut client =
+                postgres::Client::connect(&owner, postgres::NoTls).expect("the owner connects");
+            let mut submit = |agent: &str, key: &str| -> i64 {
+                client
+                    .query_one(
+                        "insert into spawn_commands (principal, idempotency_key, agent_id,
+                                                     session_id, action, state, succeeded,
+                                                     created_at_ms, finished_at_ms)
+                         values ('bb', $1, $2, replace($2, 'agent_', 'session_'),
+                                 '{\"type\":\"input\",\"text\":\"x\"}', 'finished', true,
+                                 spawn_now_ms(), spawn_now_ms())
+                         returning id",
+                        &[&key, &agent],
+                    )
+                    .expect("a command")
+                    .get(0)
+            };
+            let mine = submit("agent_worker_a_1", "bb-a");
+            let theirs = submit("agent_worker_b_2", "bb-b");
+            let a = root.join("agent_worker_a_1");
+            std::fs::create_dir_all(&a).expect("a's workspace");
+            for ack in [
+                format!("{mine} done"),
+                format!("{theirs} done"),
+                format!("{mine} declined too late"),
+            ] {
+                write(&a, &parse(&words(&ack)).expect("an ack")).expect("written");
+            }
+            let rows: Vec<Facts> = serde_json::from_value(serde_json::json!([
+                {"session_id": "session_worker_a_1", "agent_id": "agent_worker_a_1"},
+                {"session_id": "session_worker_b_2", "agent_id": "agent_worker_b_2"},
+            ]))
+            .expect("facts");
+            let lines = collect(&store, &rows, &root);
+            assert_eq!(lines.len(), 3, "{lines:?}");
+            assert!(lines[0].contains(&format!("message #{mine} done by agent_worker_a_1")));
+            assert!(lines[1].contains("recorded nothing"), "{lines:?}");
+            assert!(lines[2].contains("answered before"), "{lines:?}");
+            assert_eq!(
+                agent_files::list(&a, &TreePath::from(ACKS)).expect("listed"),
+                Vec::<Vec<u8>>::new(),
+                "every ack read is gone"
+            );
+            let acted: Vec<(String, serde_json::Value)> = client
+                .query(
+                    "select session_id, kind -> 'detail' from spawn_events
+                      where event_name = 'message.acted'",
+                    &[],
+                )
+                .expect("read")
+                .iter()
+                .map(|row| (row.get(0), row.get(1)))
+                .collect();
+            assert_eq!(
+                acted,
+                vec![(
+                    "session_worker_a_1".to_string(),
+                    serde_json::json!({"command_id": mine, "outcome": "done", "why": null})
+                )]
+            );
+            assert!(collect(&store, &rows, &root).is_empty(), "nothing left to read");
+        }));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = postgres::Client::connect(&url, postgres::NoTls)
+            .and_then(|mut client| client.batch_execute(&format!("drop schema {schema} cascade")));
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     #[test]
     fn a_reports_outcome_answers_its_delivery() {
         assert_eq!(
