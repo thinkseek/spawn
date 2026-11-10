@@ -1300,23 +1300,9 @@ impl Bridge {
             }
             EventKind::ExecutionEnded { .. } if current && event.source == Source::Bridge => {
                 if let Some(active) = view.active.take() {
-                    if let Some(watch) = &self.config.watch {
-                        watch.unwatch(&watch_key(&active.execution_id));
-                    }
-                    // However it ended, what its transcript holds is
-                    // copied, and its record says it ended: on the next
-                    // pass, and every pass after until the copy is made.
-                    if self.transcripts.is_some()
-                        && let Some(native) = view.native.clone()
-                    {
-                        note_ended(
-                            &self.ended_archives,
-                            &view.agent_id,
-                            native,
-                            &event.session_id,
-                            &active,
-                        );
-                    }
+                    let archives = self.transcripts.is_some().then_some(&self.ended_archives);
+                    let watch = self.config.watch.as_deref();
+                    ended(watch, archives, view, &event.session_id, &active);
                 }
             }
             // An exit report of an old runner (engine-sourced; runners now
@@ -4603,17 +4589,26 @@ pub fn claude_session_id(execution: &ExecutionId) -> String {
     )
 }
 
-/// An execution that ended, to be copied on the next pass and recorded as
-/// ended ([`Bridge::archive_ended`]), unless an end already put it there.
-fn note_ended(
-    list: &std::sync::Mutex<BTreeMap<(AgentId, String), EndedArchive>>,
-    agent: &AgentId,
-    native: String,
+/// An execution that ended, as the log says: its files are no longer
+/// watched, and with an archive it is copied on the next pass and recorded
+/// as ended ([`Bridge::archive_ended`]), on every pass until the copy is
+/// made, however it ended (an end that already put it there keeps its
+/// own).
+fn ended(
+    watch: Option<&dyn FileWatch>,
+    archives: Option<&std::sync::Mutex<BTreeMap<(AgentId, String), EndedArchive>>>,
+    view: &SessionView,
     session: &SessionId,
     active: &Active,
 ) {
+    if let Some(watch) = watch {
+        watch.unwatch(&watch_key(&active.execution_id));
+    }
+    let (Some(list), Some(native)) = (archives, view.native.clone()) else {
+        return;
+    };
     let progress = ArchiveProgress {
-        agent: agent.clone(),
+        agent: view.agent_id.clone(),
         native: native.clone(),
         session: session.clone(),
         execution: active.execution_id.clone(),
@@ -4625,7 +4620,7 @@ fn note_ended(
     };
     list.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry((agent.clone(), native))
+        .entry((view.agent_id.clone(), native))
         .or_insert(EndedArchive {
             progress,
             error: None,
