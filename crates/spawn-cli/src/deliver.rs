@@ -4270,4 +4270,162 @@ PENDING_ISSUES\n";
              the one the attempt names"
         );
     }
+
+    /// Task 7, delivered to an ephemeral worker, with its first restart
+    /// asked for while execution `exec_3` ran.
+    fn restarted(execution: Option<&str>) -> TaskRow {
+        let mut one = task(7, TaskState::Delivered, "ephemeral");
+        one.restart = Some(super::Restart {
+            n: 1,
+            execution_id: execution.map(str::to_string),
+            by: Some("human".to_string()),
+            reason: Some("stalled on a hung tool".to_string()),
+        });
+        one
+    }
+
+    fn stop_sent(id: i64, key: &str, succeeded: Option<bool>) -> crate::dispatch::StopSent {
+        crate::dispatch::StopSent {
+            id,
+            key: key.to_string(),
+            principal: "spawn-dispatch".to_string(),
+            action: "stop".to_string(),
+            created_at_ms: 1,
+            finished_at_ms: succeeded.map(|_| 2),
+            succeeded,
+            error: (succeeded == Some(false)).then(|| "kill-session refused".to_string()),
+        }
+    }
+
+    /// A restart stops the execution it names, once; while the Stop is
+    /// under way nothing else is sent; once the execution ended and the
+    /// recovery recorded that end, the same session is resumed, once, with
+    /// a prompt naming the restart and its reason.
+    #[test]
+    fn a_restart_stops_the_running_execution_then_resumes_its_session_once_its_end_is_recorded() {
+        let work = work(vec![restarted(Some("exec_3"))]);
+        let running = worker(true, false);
+        assert_eq!(
+            orders(&work, std::slice::from_ref(&running)),
+            vec![Order {
+                agent_id: running.agent_id.clone(),
+                session_id: running.session_id.clone(),
+                key: "restart-7-1-stop".to_string(),
+                action: CommandAction::Stop,
+                task: None,
+            }]
+        );
+        let mut stopping = running.clone();
+        stopping.stops = vec![stop_sent(40, "restart-7-1-stop", None)];
+        assert!(orders(&work, &[stopping]).is_empty(), "the Stop is under way");
+        let mut ended = worker(false, false);
+        ended.end_cause = Some("stopped".to_string());
+        assert!(
+            orders(&work, std::slice::from_ref(&ended)).is_empty(),
+            "its end is the recovery's to record first"
+        );
+        ended.recovered = Some(55);
+        let resumed = orders(&work, std::slice::from_ref(&ended));
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].key, "restart-7-1");
+        assert_eq!(resumed[0].task, None, "a restart delivers nothing new");
+        let CommandAction::Resume {
+            prompt: Some(prompt),
+            model,
+        } = &resumed[0].action
+        else {
+            panic!("a resume: {:?}", resumed[0].action);
+        };
+        assert_eq!(*model, Some(ModelProfile::Default));
+        assert!(prompt.contains("Task #7 restarted"), "{prompt}");
+        assert!(prompt.contains("stalled on a hung tool"), "{prompt}");
+        assert!(prompt.contains("asked by human"), "{prompt}");
+        // Sent once: the resume's key is never sent again.
+        ended
+            .dispatched
+            .push(sent(60, "restart-7-1", 100, Some("pane never became ready")));
+        assert!(orders(&work, &[ended]).is_empty(), "once");
+    }
+
+    /// A worker that no longer ran when its restart was asked for is
+    /// resumed at once; one resumed by someone since is left alone.
+    #[test]
+    fn a_restart_of_a_worker_that_no_longer_ran_resumes_it_at_once() {
+        let work = work(vec![restarted(None)]);
+        let ended = worker(false, false);
+        let resumed = orders(&work, &[ended]);
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].key, "restart-7-1");
+        assert!(matches!(resumed[0].action, CommandAction::Resume { .. }));
+        assert!(
+            orders(&work, &[worker(true, false)]).is_empty(),
+            "an execution that started after the restart is not stopped"
+        );
+    }
+
+    /// A reassigned task's old worker is stopped under the reassign's key
+    /// (not the routine retire), and the new task waits for that worker's
+    /// end; a Stop pursued and escalated after its retries holds it no
+    /// longer.
+    #[test]
+    fn a_reassigned_task_waits_for_the_old_worker_to_end_unless_its_stop_is_spent() {
+        let mut old = task(7, TaskState::Cancelled, "ephemeral");
+        old.agent_id = "agent_worker_moved_7".to_string();
+        old.session_id = "session_worker_moved_7".to_string();
+        old.reassigned_as = Some(8);
+        old.reassigned_to_session = Some("session_worker_moved_8".to_string());
+        let mut new = task(8, TaskState::Assigned, "ephemeral");
+        new.agent_id = "agent_worker_moved_8".to_string();
+        new.session_id = "session_worker_moved_8".to_string();
+        new.resident = None;
+        new.charter = None;
+        new.reassign_of = Some(7);
+        new.reassign_from_session = Some("session_worker_moved_7".to_string());
+        let work = work(vec![old, new]);
+        let mut running = worker(true, false);
+        running.agent_id = "agent_worker_moved_7".to_string();
+        running.session_id = "session_worker_moved_7".to_string();
+        let keys = |rows: &[Facts]| -> Vec<String> {
+            orders(&work, rows).into_iter().map(|order| order.key).collect()
+        };
+        assert_eq!(keys(std::slice::from_ref(&running)), vec!["reassign-7-stop"]);
+        let mut stopping = running.clone();
+        stopping.stops = vec![stop_sent(40, "reassign-7-stop", Some(false))];
+        assert!(keys(std::slice::from_ref(&stopping)).is_empty(), "the old worker still runs");
+        stopping.stops = (0..=DELIVERY_RETRIES)
+            .map(|n| {
+                let n = i64::try_from(n).expect("a handful");
+                stop_sent(40 + n, "reassign-7-stop", Some(false))
+            })
+            .collect();
+        assert_eq!(
+            keys(&[stopping]),
+            vec!["deliver-8-0"],
+            "its Stop spent and escalated: the new task goes without waiting further"
+        );
+        let mut ended = running;
+        ended.live = false;
+        let delivered = orders(&work, &[ended]);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].key, "deliver-8-0");
+        assert_eq!(delivered[0].session_id, "session_worker_moved_8");
+        assert!(matches!(delivered[0].action, CommandAction::Start { .. }));
+    }
+
+    /// A resident whose task was reassigned is stopped under the reassign's
+    /// key, then told (its task went to a fresh worker).
+    #[test]
+    fn a_reassigned_residents_stop_and_notice_name_the_reassign() {
+        let mut moved = cancelled(false);
+        moved.reassigned_as = Some(8);
+        moved.reassigned_to_session = Some("session_worker_core_8".to_string());
+        let work = Work {
+            cancelled: vec![moved.clone()],
+            ..Work::default()
+        };
+        let stops = orders(&work, &[worker(true, false)]);
+        assert_eq!(stops.len(), 1);
+        assert_eq!(stops[0].key, "reassign-7-stop");
+        assert!(super::cancel_notice(&moved).contains("reassigned to a fresh worker as task #8"));
+    }
 }
