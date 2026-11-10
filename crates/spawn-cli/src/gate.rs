@@ -2120,7 +2120,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("spawn-halt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
-        let (running, marker, returned) = (dir.join("running"), dir.join("marker"), dir.join("returned"));
+        let (running, marker, returned) = (
+            dir.join("running"),
+            dir.join("marker"),
+            dir.join("returned"),
+        );
         let halt = std::sync::Arc::new(super::Halt::default());
         let thread_halt = std::sync::Arc::clone(&halt);
         let script = format!(

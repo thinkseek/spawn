@@ -2158,7 +2158,11 @@ mod tests {
             item.line
         );
         assert!(item.line.contains("7200 s"), "{}", item.line);
-        assert!(items[1].line.contains("no gate was running"), "{}", items[1].line);
+        assert!(
+            items[1].line.contains("no gate was running"),
+            "{}",
+            items[1].line
+        );
         assert!(
             super::digest::drain_expiries(&[serde_json::json!({"gates": [1]})]).is_empty(),
             "no event id, no item"
