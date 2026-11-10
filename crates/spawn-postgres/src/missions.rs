@@ -840,6 +840,33 @@ select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.r
         or (r ->> 'type' = 'source.main_green'
             and not exists (select 1 from told where tag = 'host main-green-' || e.id)))";
 
+/// The `source_away` alerts' records (P12) the supervisor was not told of
+/// yet, oldest first, each with its `event_id` and `at_ms`: an
+/// `alert.fired` (a source of a mission is not a directory on this host)
+/// and an `alert.cleared` (it is back, or no longer watched). Told is a
+/// record, as for [`MAIN_RED_NEWS`]: a digest that reached the supervisor
+/// carrying the tag `host source-away-<event_id>` or
+/// `host source-back-<event_id>`, however long ago.
+pub(crate) const SOURCE_AWAY_NEWS: &str = r"
+with told as (
+  select distinct tag
+    from spawn_commands d
+   cross join lateral jsonb_array_elements_text(
+           case when jsonb_typeof(d.action -> 'tags') = 'array'
+                then d.action -> 'tags' else '[]'::jsonb end) tag
+   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
+)
+select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.recorded_at_ms)
+                          order by e.session_seq), '[]'::jsonb)
+  from spawn_events e
+ cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and r ->> 'kind' = 'source_away'
+   and ((r ->> 'type' = 'alert.fired'
+         and not exists (select 1 from told where tag = 'host source-away-' || e.id))
+        or (r ->> 'type' = 'alert.cleared'
+            and not exists (select 1 from told where tag = 'host source-back-' || e.id)))";
+
 /// The `host_fault` gate records whose base disagreed with itself and that
 /// carry `alert` (the mission's third such base in a row, objective 033),
 /// and that the supervisor was not told of yet, oldest first, each with its
@@ -1637,6 +1664,12 @@ impl PostgresStore {
     /// supervisor yet ([`MAIN_RED_NEWS`]).
     pub fn main_red_news(&self) -> Result<Value, StoreError> {
         self.query_json(MAIN_RED_NEWS, &[])
+    }
+
+    /// The sources away from this host and back, not told to the supervisor
+    /// yet ([`SOURCE_AWAY_NEWS`]).
+    pub fn source_away_news(&self) -> Result<Value, StoreError> {
+        self.query_json(SOURCE_AWAY_NEWS, &[])
     }
 
     /// The second overrun of an objective's chain that the supervisor was
