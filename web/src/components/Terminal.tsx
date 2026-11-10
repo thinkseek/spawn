@@ -1,7 +1,9 @@
 import { ArrowDown, SquareTerminal } from "lucide-react";
 import { useLayoutEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import type { KeyboardEvent, ReactNode } from "react";
 
+import { keyName } from "../keys";
+import type { KeyName } from "../keys";
 import { cx } from "./ui";
 
 /** Light emphasis for Claude Code's screen-reader transcript. */
@@ -68,6 +70,11 @@ interface TerminalPanelProps {
   /** Shown instead of the body while `text` is empty. */
   placeholder: string;
   className?: string;
+  /** Named keys for the agent (backlog P1): while the body itself has
+   * focus, Esc, the arrows, Enter, Y and N go to `onKey`, and `hint` (and
+   * `feedback`, the last key's fate) shows under it. Never from a text box,
+   * with a modifier, or on auto-repeat (keys.ts). */
+  keys?: { hint: string; onKey: (name: KeyName) => void; feedback?: ReactNode };
 }
 
 /**
@@ -84,10 +91,31 @@ export function TerminalPanel({
   text,
   placeholder,
   className,
+  keys,
 }: TerminalPanelProps) {
   const scroller = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
   const [following, setFollowing] = useState(true);
+  const [focused, setFocused] = useState(false);
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (!keys) return;
+    const name = keyName({
+      key: event.key,
+      ctrlKey: event.ctrlKey,
+      altKey: event.altKey,
+      metaKey: event.metaKey,
+      repeat: event.repeat,
+      isComposing: event.nativeEvent.isComposing,
+      onPanel: event.target === event.currentTarget,
+    });
+    if (!name) return;
+    // The arrows would scroll the panel, Enter could submit a form, and Esc
+    // would close the drawer around it (its listener is on window): the key
+    // is the agent's.
+    event.preventDefault();
+    event.stopPropagation();
+    keys.onKey(name);
+  };
 
   useLayoutEffect(() => {
     const element = scroller.current;
@@ -126,7 +154,12 @@ export function TerminalPanel({
         id={panel?.id}
         role={panel ? "tabpanel" : undefined}
         aria-labelledby={panel?.labelledBy}
-        tabIndex={panel ? 0 : undefined}
+        tabIndex={panel || keys ? 0 : undefined}
+        aria-keyshortcuts={keys ? "Escape ArrowUp ArrowDown ArrowLeft ArrowRight Enter Y N" : undefined}
+        aria-description={keys?.hint}
+        onKeyDown={keys ? onKeyDown : undefined}
+        onFocus={keys ? (event) => event.target === event.currentTarget && setFocused(true) : undefined}
+        onBlur={keys ? () => setFocused(false) : undefined}
         onScroll={(event) => {
           const element = event.currentTarget;
           const atBottom =
@@ -145,6 +178,16 @@ export function TerminalPanel({
           </div>
         )}
       </div>
+
+      {keys && (focused || keys.feedback) ? (
+        <div
+          aria-live="polite"
+          className="flex h-7 shrink-0 items-center gap-3 border-t border-white/[0.06] bg-white/[0.02] px-4 text-caption"
+        >
+          {focused ? <span className="truncate text-muted-foreground">{keys.hint}</span> : null}
+          {keys.feedback ? <span className="ml-auto shrink-0 truncate">{keys.feedback}</span> : null}
+        </div>
+      ) : null}
 
       {!following && text && (
         <button
