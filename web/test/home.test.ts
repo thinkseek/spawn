@@ -7,7 +7,6 @@ import type { FleetAgent, FleetHealth } from "../src/fleet.ts";
 import {
   currentToolText,
   actionableAlerts,
-  alertTitle,
   agentMatches,
   agentName,
   agentNames,
