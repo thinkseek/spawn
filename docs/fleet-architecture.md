@@ -1002,8 +1002,14 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   restart, while a gated mission that is open or active, not halted, and on
   a source no owner holds has a reported task; cleared at the first reading
   that finds the lock held; the lock is read only while such a task is in
-  the step's fold or the alert is open) and `model_auth` (objective 028's
-  `execution.interrupted` with cause `model_auth`). Each fires once per
+  the step's fold or the alert is open), `model_auth` (objective 028's
+  `execution.interrupted` with cause `model_auth`) and `cost_budget`
+  (subject `mission #<id>`, key `cost_budget:<mission>:<UTC day>`: at a
+  reading, the mission's cost of the model calls timed in the current UTC
+  day has reached its `budget.daily_usd` (§3.5); once per mission and day,
+  whatever restarts and however much more it spends; clears when the day
+  ends, or at a reading that finds the budget removed or raised above the
+  day's spend). Each fires once per
   occurrence and clears with the record or reading that cleared it; a
   threshold of `0` disables its check.
 - **When.** A record-borne alert is recorded within one pass of its record; a
@@ -1028,6 +1034,56 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   cleared it; nothing rests on the step's memory, on absence, or on time
   without a record. Evidence never holds a secret: no database URL with its
   password, no environment, process names without their arguments.
+
+### 3.5 Cost: what the model calls cost
+
+The engine writes each model call's usage to its transcript; Spawn records
+it per execution and prices it (objective 041;
+`crates/spawn-cli/src/cost.rs`):
+
+- **Recorded per execution.** The Bridge appends a `model.usage` event for
+  each assistant line of an execution's transcript that carries
+  `message.id`, `message.usage` and a `timestamp` (`ingest::claude_usage`),
+  keyed by the message id and its four counts, so the lines Claude Code
+  writes per content block append one event. The loop's cost step folds
+  them into `spawn_cost_messages` (`spawn_cost_record`, owner only): a
+  message counts once per id, with the largest usage of its lines, at its
+  earliest line's time, under its model (input, output, cache creation as
+  `cache_write`, cache read), for the execution whose transcript held it,
+  its agent, the task the agent held then (its latest task assigned at or
+  before the message's time; a message timed before any, the latest
+  assigned at or before the execution started; none: no task, as the
+  supervisor's) and that task's mission. A restarted loop counts no message
+  twice and loses none: the rows are the record, and the fold reads the
+  events again from ten minutes before the newest it folded.
+- **Priced when recorded.** `SPAWN_MODEL_PRICES` is a JSON object from model
+  name to `{"input", "output", "cache_write", "cache_read"}`, US dollars per
+  million tokens, each a number not below zero; a message costs each count
+  times its rate over a million, in exact decimals, and keeps that cost
+  (and the rates it was priced at) when the prices change later. A model the
+  setting does not price counts its tokens and no cost (`usd` null; its
+  tokens are unpriced, never $0). Unset, a built-in table prices Anthropic's
+  first-party list prices of 2026-11 (input, output, cache write, cache read
+  per million): `claude-fable-5-2` 8, 40, 10, 0.20; `claude-opus-5-5` 4,
+  20, 5, 0.20; `claude-sonnet-5-5` 2, 10, 2.50, 0.10; `claude-opus-4-8`,
+  `-4-7`, `-4-6` 5, 25, 6.25, 0.50; `claude-sonnet-4-6`, `-4-5` 3, 15,
+  3.75, 0.30; `claude-haiku-4-5` 1, 5, 1.25, 0.10. Set, the setting replaces
+  the table whole. A value that is not such an object stops `spawn loop`
+  and `spawn serve` at start, naming the setting.
+- **Served and shown.** `GET /api/cost?window=24h|7d` (24h when absent; any
+  other window 400) answers the messages timed in [now minus the window,
+  now) on the database's clock: `{window, since_ms, until_ms, total, models,
+  missions, tasks, agents, executions}`, each with its `usd` (the exact sum;
+  0 for an entry of unpriced use only, null for an unpriced model), its
+  `tokens` and its `unpriced_tokens`. The dashboard's Cost page (sidebar)
+  shows the total and each mission, task and agent over 24 h and 7 d
+  (`web/src/cost.ts`): to the cent, a cost that is not zero never as $0.00
+  ("<$0.01"), use only on an unpriced model as "unpriced", and any unpriced
+  use marked.
+- **A daily budget.** `spawn mission configure --id <mission> --daily-usd
+  <amount>` records `budget.daily_usd` (`--no-daily-usd` clears it); the
+  alerts step raises `cost_budget` once the mission's spend of the UTC day
+  reaches it (§3.4).
 
 ## 4. Experience
 
