@@ -5,7 +5,7 @@ import { fetchAlerts, fetchAttention, fetchOverview, fetchSessionTail, usePoll }
 import { PAGE_EVENTS } from "./sessionWindow";
 import type { PollResult, SessionTail } from "./api";
 import { markNeedsHuman, needsHuman } from "./attention";
-import { DetailsRail, RailContent } from "./components/DetailsRail";
+import { DetailsRail, ExecutionSummary, RailContent } from "./components/DetailsRail";
 import { MobileNav, Sidebar } from "./components/Sidebar";
 import { StateBadge } from "./components/StateDot";
 import { Timeline } from "./components/Timeline";
@@ -333,6 +333,7 @@ export default function App() {
                   ? `last ${relativeTime(freshness.last_event_at_ms)}`
                   : "no events yet"}
               </span>
+              <ExecutionSummary detail={detail} className="hidden md:inline-flex" />
               <LiveStatus error={error} label="" />
               <Button
                 onClick={() => setRailOpen(true)}
@@ -404,6 +405,7 @@ export default function App() {
                   rsi={rsi}
                   detail={detail}
                   observation={observation}
+                  withExecution
                 />
               </div>
             </Drawer>

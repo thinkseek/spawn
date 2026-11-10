@@ -1,7 +1,7 @@
 import { Eye, GitBranch, Terminal, Wrench } from "lucide-react";
 import type { ReactNode } from "react";
 
-import type { Observation, RsiSummary, SessionDetail } from "../api";
+import type { Execution, Observation, RsiSummary, SessionDetail } from "../api";
 import { formatDuration, relativeTime } from "../format";
 import { Card, CardHeader, cx } from "./ui";
 
@@ -10,6 +10,57 @@ interface DetailsRailProps {
   detail: SessionDetail | null;
   observation: Observation | null;
   className?: string;
+}
+
+/** The session's latest execution, the one its header and drawer name. */
+export function latestExecution(detail: SessionDetail | null): Execution | null {
+  if (!detail) return null;
+  return (
+    [...detail.executions].sort((left, right) => right.started_at_ms - left.started_at_ms)[0] ??
+    null
+  );
+}
+
+/** The latest execution in one line, for the session's header
+ * (design-ui-information.md §2.6: the Execution card collapsed into it):
+ * "claude · running 12m" or "claude · exited 0 · 3m · stopped". The id and
+ * the start time are on hover. */
+export function ExecutionSummary({
+  detail,
+  className,
+}: {
+  detail: SessionDetail | null;
+  className?: string;
+}) {
+  const execution = latestExecution(detail);
+  if (!execution) return null;
+  const running = execution.ended_at_ms === null;
+  const parts: ReactNode[] = [execution.engine || "execution"];
+  if (running) {
+    parts.push(
+      <span key="running" className="text-success">
+        running {formatDuration(Date.now() - execution.started_at_ms)}
+      </span>,
+    );
+  } else {
+    parts.push(execution.exit_code === null ? "no exit code" : `exited ${execution.exit_code}`);
+    parts.push(formatDuration(execution.duration_ms));
+    if (execution.cause) parts.push(execution.cause);
+  }
+  return (
+    <span
+      className={cx("tnum inline-flex items-center gap-1.5 text-caption text-muted-foreground", className)}
+      title={`${execution.execution_id} · started ${relativeTime(execution.started_at_ms)}`}
+    >
+      <Terminal size={12} aria-hidden="true" className="shrink-0 text-faint-foreground" />
+      {parts.map((part, index) => (
+        <span key={index} className="inline-flex items-center gap-1.5">
+          {index > 0 && <span className="text-faint-foreground">·</span>}
+          {part}
+        </span>
+      ))}
+    </span>
+  );
 }
 
 /** Side panel of the Sessions view; also rendered inside a drawer on phones. */
@@ -31,17 +82,22 @@ export function DetailsRail({
   );
 }
 
+/** The rail's cards (design-ui-information.md §2.6: one useful card at a
+ * time): the judgment always; the open tools only while some are open; the
+ * RSI card only on the resident's own trace. The execution is in the
+ * header (ExecutionSummary); `withExecution` puts it here instead, for the
+ * phone drawer, whose header has no room for it. */
 export function RailContent({
   rsi,
   detail,
   observation,
-}: Omit<DetailsRailProps, "className">) {
-  const execution = detail
-    ? ([...detail.executions].sort(
-        (left, right) => right.started_at_ms - left.started_at_ms,
-      )[0] ?? null)
-    : null;
+  withExecution = false,
+}: Omit<DetailsRailProps, "className"> & { withExecution?: boolean }) {
   const tools = detail?.open_tools ?? [];
+  const residentRsi =
+    rsi && detail && rsi.resident_session !== null && rsi.resident_session === detail.session_id
+      ? rsi
+      : null;
 
   return (
     <>
@@ -102,128 +158,86 @@ export function RailContent({
         </div>
       </Card>
 
-      <Card>
-        <CardHeader
-          icon={<Terminal size={14} />}
-          title="Execution"
-          meta={
-            execution && (
-              <span className="font-mono text-micro text-faint-foreground">
-                {execution.execution_id}
-              </span>
-            )
-          }
-        />
-        <div className="space-y-2 p-4">
-          {execution ? (
-            <>
-              <Field label="Engine" value={execution.engine || "—"} />
-              <Field
-                label="Started"
-                value={relativeTime(execution.started_at_ms)}
-              />
-              <Field
-                label="Duration"
-                value={
-                  execution.ended_at_ms === null ? (
-                    <span className="text-success">running</span>
-                  ) : (
-                    formatDuration(execution.duration_ms)
-                  )
-                }
-              />
-              <Field label="Cause" value={execution.cause ?? "—"} />
-              <Field
-                label="Exit code"
-                value={
-                  execution.exit_code === null
-                    ? "—"
-                    : String(execution.exit_code)
-                }
-              />
-            </>
-          ) : (
-            <Empty text="No executions yet." />
-          )}
-        </div>
-      </Card>
-
-      <Card>
-        <CardHeader
-          icon={<Wrench size={14} />}
-          title="Open tools"
-          meta={tools.length > 0 && <span className="tnum">{tools.length}</span>}
-        />
-        <div className="p-3">
-          {tools.length === 0 ? (
-            <Empty text="No tools waiting." />
-          ) : (
-            <div className="space-y-1.5">
-              {tools.map((tool) => (
-                <div
-                  key={`${tool.tool_use_id}-${tool.session_seq}`}
-                  className="rounded-md border border-surface-border bg-page-canvas px-2.5 py-1.5"
-                >
-                  <div className="flex items-center gap-2">
-                    <span className="size-1.5 animate-spawn-pulse rounded-full bg-warning" />
-                    <span className="text-label font-medium text-foreground">
-                      {tool.tool_name}
-                    </span>
-                    <span className="tnum ml-auto font-mono text-micro text-faint-foreground">
-                      seq {tool.session_seq}
-                    </span>
-                  </div>
-                  <div
-                    className="mt-0.5 truncate font-mono text-micro text-muted-foreground"
-                    title={tool.tool_use_id}
-                  >
-                    {tool.tool_use_id}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </Card>
-
-      {rsi && (
+      {withExecution && latestExecution(detail) && (
         <Card>
-          <CardHeader icon={<GitBranch size={14} />} title={`RSI · mission #${rsi.mission}`} />
+          <div className="px-4 py-3">
+            <ExecutionSummary detail={detail} />
+          </div>
+        </Card>
+      )}
+
+      {tools.length > 0 && (
+        <Card>
+          <CardHeader
+            icon={<Wrench size={14} />}
+            title="Open tools"
+            meta={<span className="tnum">{tools.length}</span>}
+          />
+          <div className="space-y-1.5 p-3">
+            {tools.map((tool) => (
+              <div
+                key={`${tool.tool_use_id}-${tool.session_seq}`}
+                className="rounded-md border border-surface-border bg-page-canvas px-2.5 py-1.5"
+              >
+                <div className="flex items-center gap-2">
+                  <span className="size-1.5 animate-spawn-pulse rounded-full bg-warning" />
+                  <span className="text-label font-medium text-foreground">
+                    {tool.tool_name}
+                  </span>
+                  <span className="tnum ml-auto font-mono text-micro text-faint-foreground">
+                    seq {tool.session_seq}
+                  </span>
+                </div>
+                <div
+                  className="mt-0.5 truncate font-mono text-micro text-muted-foreground"
+                  title={tool.tool_use_id}
+                >
+                  {tool.tool_use_id}
+                </div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {residentRsi && (
+        <Card>
+          <CardHeader icon={<GitBranch size={14} />} title={`RSI · mission #${residentRsi.mission}`} />
           <div className="space-y-2 p-4">
             <Field
               label="Baseline"
               value={
                 <span className="font-mono">
-                  {rsi.baseline ? rsi.baseline.slice(0, 8) : "—"}
+                  {residentRsi.baseline ? residentRsi.baseline.slice(0, 8) : "—"}
                 </span>
               }
             />
-            <Field label="Halted" value={rsi.halted ?? "no"} />
+            <Field label="Halted" value={residentRsi.halted ?? "no"} />
             <Field
               label="Task"
               value={
-                rsi.open_task
-                  ? `#${rsi.open_task.id} · ${rsi.open_task.state}`
+                residentRsi.open_task
+                  ? `#${residentRsi.open_task.id} · ${residentRsi.open_task.state}`
                   : "—"
               }
             />
-            {rsi.open_task && (
+            {residentRsi.open_task && (
               <Field
                 label="Objective"
                 value={
-                  rsi.open_task.objective !== null
-                    ? String(rsi.open_task.objective)
+                  residentRsi.open_task.objective !== null
+                    ? String(residentRsi.open_task.objective)
                     : "—"
                 }
               />
             )}
             <Field
               label="Last verdict"
-              value={rsi.open_task?.last_verdict ?? "—"}
+              value={residentRsi.open_task?.last_verdict ?? "—"}
             />
             <Field
               label="Objectives"
-              value={`${rsi.objectives.open} open · ${rsi.objectives.solved} solved · ${rsi.objectives.met} met · ${rsi.objectives.owner_judged} owner-judged`}
+              value={`${residentRsi.objectives.open} open · ${residentRsi.objectives.solved} solved · ${residentRsi.objectives.met} met · ${residentRsi.objectives.owner_judged} owner-judged`}
             />
           </div>
         </Card>
