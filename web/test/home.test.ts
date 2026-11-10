@@ -14,7 +14,11 @@ import {
   agentsNow,
   alertMoot,
   alertStale,
+  awayFrom,
+  digestBand,
+  digestSince,
   digestToday,
+  digestWindow,
   latestNotes,
   liveAlerts,
   missionsToday,
@@ -348,7 +352,7 @@ test("the supervisor's notes: at most two from the last 6 hours, the rest counte
   assert.deepEqual(latestNotes(null, NOW), { shown: [], more: 0 });
 });
 
-test("today's digest: landings, send-backs and alerts of the last 24 h, newest first; notices are left out", () => {
+test("today's digest: one line per task, and alerts, of the last 24 h, newest first; task notices are left out", () => {
   const landedStage = (at: number) => ({ stage: "landed", verdict: null, at_ms: at, took_ms: null }) as MissionTask["stages"][number];
   const sentBack = { stage: "gated", verdict: "conflict", at_ms: NOW - 2 * HOUR, took_ms: null } as MissionTask["stages"][number];
   const digest = digestToday(
@@ -365,11 +369,13 @@ test("today's digest: landings, send-backs and alerts of the last 24 h, newest f
     NOW,
   );
   assert.deepEqual([digest.landed, digest.sentBack, digest.alerts], [1, 1, 1]);
+  // One line per task: T219's send-back is part of its landing's story.
   assert.deepEqual(
     digest.entries.map((entry) => entry.kind),
-    ["landed", "sent back", "alert"],
+    ["landed", "alert"],
   );
-  assert.match(digest.entries[2].text, /\(cleared\)$/);
+  assert.match(digest.entries[0].text, /^Supply PA · T219 .*: landed after 1 gate, sent back 1× on the way$/);
+  assert.match(digest.entries[1].text, /\(cleared\)$/);
 });
 
 test("a dispatcher stall reads as one line; another line keeps its first clause; the whole text is kept for expanding", () => {
@@ -525,4 +531,84 @@ test("the search matches every word, case aside, in the name, the ids, the T-num
     assert.equal(agentMatches(query, fields), true, query);
   }
   for (const query of ["T221", "supply truck", "rsi"]) assert.equal(agentMatches(query, fields), false, query);
+});
+
+test("the reader was away from the last time the page was seen, if 30 min or more ago", () => {
+  assert.equal(awayFrom(null, NOW), null, "a first visit");
+  assert.equal(awayFrom(NOW - 10 * MIN, NOW), null, "a reload, a short break");
+  assert.equal(awayFrom(NOW - 30 * MIN, NOW), NOW - 30 * MIN);
+  assert.equal(awayFrom(NOW - 3 * HOUR, NOW), NOW - 3 * HOUR);
+  assert.equal(awayFrom(NOW + MIN, NOW), null, "a clock that went back");
+  assert.equal(awayFrom(Number.NaN, NOW), null);
+});
+
+test("the digest window is since the reader went away, at least 24 h, at most 7 days", () => {
+  assert.deepEqual(digestWindow(NOW, null), { since: NOW - 24 * HOUR, away: false });
+  assert.deepEqual(digestWindow(NOW, NOW - 3 * HOUR), { since: NOW - 24 * HOUR, away: false }, "under the floor: today");
+  assert.deepEqual(digestWindow(NOW, NOW - 24 * HOUR), { since: NOW - 24 * HOUR, away: false }, "at the floor");
+  assert.deepEqual(digestWindow(NOW, NOW - 50 * HOUR), { since: NOW - 50 * HOUR, away: true });
+  assert.deepEqual(digestWindow(NOW, NOW - 30 * 24 * HOUR), { since: NOW - 7 * 24 * HOUR, away: true }, "capped");
+});
+
+test("each task's day is one line: landed after its gates, sent back and where it is now, stopped, or moved", () => {
+  const stage = (name: string, at: number, verdict: string | null = null) => ({ stage: name, verdict, at_ms: at, took_ms: null }) as MissionTask["stages"][number];
+  const since = NOW - 24 * HOUR;
+  const supply = mission(6, "Supply PA", [
+    task(1, "landed", { task_title: "two gates", stages: [stage("assigned", NOW - 40 * HOUR), stage("gated", NOW - 30 * HOUR, "rejected"), stage("gated", NOW - 2 * HOUR, "accepted"), stage("landed", NOW - HOUR)] } as Partial<MissionTask>),
+    task(2, "reported", { task_title: "sent back twice", stages: [stage("gated", NOW - 5 * HOUR, "rejected"), stage("gated", NOW - 3 * HOUR, "conflict"), stage("reported", NOW - 2 * HOUR)] } as Partial<MissionTask>),
+    task(3, "cancelled", { task_title: "stopped", stages: [stage("assigned", NOW - 6 * HOUR), stage("cancelled", NOW - 4 * HOUR)] } as Partial<MissionTask>),
+    task(4, "delivered", { task_title: "new", stages: [stage("assigned", NOW - 20 * MIN), stage("delivered", NOW - 19 * MIN)] } as Partial<MissionTask>),
+    task(5, "landed", { task_title: "old", stages: [stage("landed", NOW - 30 * HOUR)] } as Partial<MissionTask>),
+  ]);
+  const digest = digestSince(missions([supply]), [], NOW, since);
+  const byTask = new Map(digest.entries.map((entry) => [entry.text.split(" ")[3], entry]));
+  assert.equal(byTask.get("T1")?.text, "Supply PA · T1 two gates: landed after 2 gates");
+  assert.equal(byTask.get("T1")?.kind, "landed");
+  assert.equal(byTask.get("T2")?.text, "Supply PA · T2 sent back twice: sent back 2× (rejected, conflict); now gating");
+  assert.equal(byTask.get("T3")?.text, "Supply PA · T3 stopped: cancelled");
+  assert.equal(byTask.get("T3")?.kind, "stopped");
+  assert.equal(byTask.get("T4")?.text, "Supply PA · T4 new: started; now delivered");
+  assert.equal(byTask.has("T5"), false, "nothing in the window");
+  assert.deepEqual([digest.landed, digest.sentBack], [1, 2]);
+  assert.equal(digest.entries[0].text.includes("T4"), true, "newest first");
+});
+
+test("a mission's halt, resume or end is a line; a counter moving is not", () => {
+  const rsi = mission(4, "Spawn RSI", []);
+  const change = (key: string, at: number, before: object, after: object) =>
+    alert(key, "mission_state", "mission #4", { state: "notice", fired_at_ms: at, evidence: { mission: 4, before, after } });
+  const base = { state: "active", halted: null, gate_rejections: 0 };
+  const digest = digestSince(
+    missions([rsi]),
+    [
+      change("c", NOW - 4 * HOUR, base, { ...base, gate_rejections: 1 }),
+      change("h", NOW - 3 * HOUR, base, { ...base, halted: "3 rejections" }),
+      change("r", NOW - 2 * HOUR, { ...base, halted: "3 rejections" }, base),
+      change("d", NOW - HOUR + MIN, base, { ...base, state: "done" }),
+      alert("t", "task_state", "task #9", { state: "notice", fired_at_ms: NOW - HOUR }),
+      // A task notice is never read, whatever its evidence holds: the missions tell the task.
+      alert("t2", "task_state", "task #9", { state: "notice", fired_at_ms: NOW - HOUR, evidence: { mission: 4, before: { state: "reported" }, after: { state: "landing" } } }),
+    ],
+    NOW,
+    NOW - 24 * HOUR,
+  );
+  assert.deepEqual(digest.entries.map((entry) => entry.text), ["Spawn RSI: done", "Spawn RSI: resumed", "Spawn RSI: halted (3 rejections)"]);
+  assert.ok(digest.entries.every((entry) => entry.kind === "mission"));
+  assert.equal(digest.alerts, 0, "a notice is not an alert");
+});
+
+test("lines are grouped by when: last hour, earlier today, yesterday, then the day", () => {
+  const now = new Date(2026, 10, 10, 15, 0).getTime();
+  assert.equal(digestBand(now - 20 * MIN, now), "Last hour");
+  assert.equal(digestBand(new Date(2026, 10, 10, 9, 0).getTime(), now), "Earlier today");
+  assert.equal(digestBand(new Date(2026, 10, 9, 23, 0).getTime(), now), "Yesterday");
+  assert.equal(digestBand(new Date(2026, 10, 7, 12, 0).getTime(), now), "Sat, Nov 7");
+  const stage = (at: number) => ({ stage: "landed", verdict: null, at_ms: at, took_ms: null }) as MissionTask["stages"][number];
+  const digest = digestSince(
+    missions([mission(6, "Supply PA", [task(1, "landed", { stages: [stage(now - 10 * MIN)] }), task(2, "landed", { stages: [stage(now - 5 * HOUR)] }), task(3, "landed", { stages: [stage(now - 6 * HOUR)] })])]),
+    [],
+    now,
+    now - 24 * HOUR,
+  );
+  assert.deepEqual(digest.bands.map((band) => [band.label, band.entries.length]), [["Last hour", 1], ["Earlier today", 2]]);
 });

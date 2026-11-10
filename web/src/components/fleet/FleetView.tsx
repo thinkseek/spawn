@@ -6,13 +6,13 @@ import type { Attention } from "../../attention";
 import type { Fleet } from "../../fleet";
 import { relativeTime } from "../../format";
 import type { NeedItem } from "../../home";
-import { agentNames, agentsNow, digestToday, latestNotes, missionsToday, needsSummary } from "../../home";
+import { agentNames, agentsNow, digestSince, digestWindow, latestNotes, missionsToday, needsSummary } from "../../home";
 import type { Missions } from "../../missions";
 import type { FleetContext } from "../../ordering";
 import { groupAgents, missingAlwaysOn, residentName, usualEngine } from "../../ordering";
 import { useNow } from "../rsi/Phase";
 import { FOCUS_RING_INSET, LiveStatus, PageHeader, cx } from "../ui";
-import { AgentsNowCard, DigestCard, MissionsTodayCard, NeedsYou, SupervisorNotes } from "../home/Home";
+import { AgentsNowCard, DigestCard, MissionsTodayCard, NeedsYou, SupervisorNotes, useAway } from "../home/Home";
 import { AgentDetail } from "./AgentDetail";
 import { AlwaysOnAgents, uptimeMs } from "./AlwaysOnAgents";
 import { FleetBoard } from "./FleetBoard";
@@ -95,6 +95,9 @@ export function FleetView({
   };
 
   const now = Date.now();
+  // What happened while the reader was away: at least the last 24 h (design §3 Q4).
+  const away = useAway();
+  const digestSpan = digestWindow(now, away);
 
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-page-canvas">
@@ -146,7 +149,7 @@ export function FleetView({
                 />
               }
             />
-            <DigestCard digest={digestToday(missions, alerts, now, agents ?? null)} />
+            <DigestCard digest={digestSince(missions, alerts, now, digestSpan.since, agents ?? null, digestSpan.away)} now={now} />
             <button
               type="button"
               onClick={() => setDetailsOpen((value) => !value)}
