@@ -13788,6 +13788,7 @@ mod database_tests {
             jobs: 2,
             owner: None,
             stop: std::sync::Arc::new(super::Stop::default()),
+            halt: std::sync::Arc::new(crate::gate::Halt::default()),
             handle: std::thread::spawn(move || {
                 let _ = waiting.recv();
             }),
