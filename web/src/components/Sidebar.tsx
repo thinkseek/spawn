@@ -1,4 +1,4 @@
-import { Activity, BellRing, Gauge, House, Monitor, Moon, Orbit, Rows3, Search, Sun, Target, Waypoints, X } from "lucide-react";
+import { Activity, BellRing, CircleDollarSign, Gauge, House, Monitor, Moon, Orbit, Rows3, Search, Sun, Target, Waypoints, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
