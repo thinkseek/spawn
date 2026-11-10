@@ -192,7 +192,8 @@ select jsonb_build_object(
 /// someone other than the dispatcher, or a task it delivered), whether a command is in flight, the
 /// model profile of its latest execution, what the dispatcher already sent
 /// there in the last day, and however old what a decision still rests on:
-/// its deliveries (a delivery is confirmed from its command), the nudges of
+/// its deliveries (a delivery is confirmed from its command), its restarts'
+/// Stops and resumes (`restart-<task>-<n>[-stop]`, each sent once), the nudges of
 /// the current episode and the resume of the current execution (an old one
 /// is not "not sent"); the tags of every input it delivered there
 /// (`told`: the escalations its digests carried, however long ago);
