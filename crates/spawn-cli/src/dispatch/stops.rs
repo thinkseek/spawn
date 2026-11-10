@@ -32,7 +32,17 @@ use crate::deliver::{DELIVERY_RETRIES, one_line, retry_wait_ms};
 fn purpose(first: &StopSent) -> String {
     let task = |rest: &str| rest.split('-').next().and_then(|id| id.parse::<i64>().ok());
     let named = |prefix: &str| first.key.strip_prefix(prefix).and_then(task);
-    if let Some(id) = named("switch-model-") {
+    if let Some(id) = named("restart-") {
+        format!(
+            "task #{id} was restarted (a fresh execution of its worker's session), so its running \
+             execution is stopped first; the restart resumes it once it has ended"
+        )
+    } else if let Some(id) = named("reassign-") {
+        format!(
+            "task #{id} was reassigned to a fresh worker, so its old worker is stopped; the new \
+             task is delivered from the old worker's last recorded checkpoint"
+        )
+    } else if let Some(id) = named("switch-model-") {
         format!("task #{id} waits for it to stop, to resume it on the task's model profile")
     } else if let Some(id) = named("retire-task-") {
         format!("task #{id} is closed, so its worker is stopped")
@@ -43,6 +53,24 @@ fn purpose(first: &StopSent) -> String {
     } else {
         format!("`{}` asked to stop it", first.principal)
     }
+}
+
+/// Whether a live worker's Stop is spent: the latest failed and its retries
+/// are spent, so it was escalated ([`pursue`]) and no more are sent. A
+/// reassigned task waits for its old worker's end no longer then
+/// (`deliver::reassign_held`).
+pub(crate) fn spent(facts: &Facts) -> bool {
+    let Some(last) = facts.stops.last() else {
+        return false;
+    };
+    facts.stopping()
+        && last.succeeded == Some(false)
+        && facts
+            .stops
+            .iter()
+            .filter(|stop| stop.succeeded == Some(false))
+            .count()
+            > DELIVERY_RETRIES
 }
 
 /// The pursuit of a live worker's failed stop: its retry once due, or the

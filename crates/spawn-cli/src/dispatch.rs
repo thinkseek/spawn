@@ -95,6 +95,7 @@ pub(crate) use digest::{OPENING as DIGEST_OPENING, heading};
 #[cfg(test)]
 pub(crate) use jobs::items as job_items;
 pub(crate) use stall::Bounds;
+pub(crate) use stops::spent as stop_spent;
 pub(crate) use worker::reached_with;
 
 use std::collections::BTreeSet;
