@@ -237,3 +237,70 @@ fn a_final_model_record_is_read_until_a_digest_tells_it() {
     assert_eq!(finals.as_array().map(Vec::len), Some(1), "{finals}");
     assert_eq!(finals[0]["execution_id"], "exec_s");
 }
+
+/// The recovery reads the terminal server an execution's terminal started
+/// on (`execution.terminal_started`, the Bridge's record after the start)
+/// with the execution's facts: the server that ran it, which a host restart
+/// is told by (objective 44). An execution with none recorded reads null.
+#[test]
+fn the_facts_name_the_terminal_server_the_execution_started_on() {
+    use spawn_core::event::{ENGINE, EventKind, ModelProfile, NewEvent, Source};
+    use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, WorkspaceId};
+    use spawn_core::port::{EventLog, TerminalServer};
+
+    let (store, _schema) = store("recovery_server");
+    let session = SessionId::new("session_worker_server").expect("valid session");
+    let append = |execution: u64, key: &str, kind: EventKind| {
+        store
+            .append(NewEvent {
+                agent_id: AgentId::new("agent_worker_server").expect("valid agent"),
+                session_id: session.clone(),
+                execution_id: Some(ExecutionId::for_command(CommandId(execution))),
+                source: Source::Bridge,
+                source_event_id: Some(key.to_string()),
+                kind,
+            })
+            .expect("append");
+    };
+    let started = |execution: u64| EventKind::ExecutionStarted {
+        engine: ENGINE.to_string(),
+        workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+        command_id: CommandId(execution),
+        fork: None,
+        model: ModelProfile::Default,
+        transcript_from: None,
+    };
+    let server = TerminalServer {
+        pid: 812,
+        started_at_ms: 1_794_330_336_000,
+    };
+    append(1, "exec_1:started", started(1));
+    append(
+        1,
+        "exec_1:terminal_started",
+        EventKind::TerminalStarted { server },
+    );
+    let facts = store.recovery_facts(&session).expect("read the facts");
+    assert_eq!(facts["execution"]["id"], "exec_1");
+    let read: TerminalServer =
+        serde_json::from_value(facts["execution"]["terminal_server"].clone())
+            .expect("the server as recorded");
+    assert_eq!(read, server);
+
+    // The next execution, with no record of its server (one started before
+    // it was kept): null, never the earlier execution's.
+    append(
+        1,
+        "exec_1:ended",
+        EventKind::ExecutionEnded {
+            cause: spawn_core::event::EndCause::Lost,
+            exit_code: None,
+            signal: None,
+            evidence: None,
+        },
+    );
+    append(2, "exec_2:started", started(2));
+    let facts = store.recovery_facts(&session).expect("read the facts");
+    assert_eq!(facts["execution"]["id"], "exec_2");
+    assert_eq!(facts["execution"]["terminal_server"], Value::Null);
+}
