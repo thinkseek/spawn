@@ -435,6 +435,12 @@ it, on the same ladder.
   | `context_exhausted` | an API error line whose text holds `Prompt is too long` | `handoff` | due at once: a Stop with its final checkpoint, then a new native session in the same workspace and branch |
   | `budget` | the integrator's Stop of a task over its budget (objective 026) | `handoff` | as a context's |
   | `stopped` | a Stop or Discard from a person, the supervisor, a cancelled task or a retirement | `final` | never revived |
+  | `restarted` | the dispatcher's own Stop (`spawn-dispatch`) keyed `restart-<task>-<n>-stop` by the task's latest `task.restarted` (or a retry of it) | `final` | never revived by the recovery: the restart's own resume (`restart-<task>-<n>`) follows, once this end is recorded |
+  | `reassigned` | the dispatcher's own Stop keyed `reassign-<task>-stop` of a task whose `task.cancelled` names `reassigned_as` (or a retry of it); evidence `to_session`, the new worker's | `final` | never revived; the worker's task went to a fresh one |
+
+  The cause `restarted` or `reassigned` is read from the record, never from
+  a key alone: a Stop from anyone but the dispatcher is `stopped`, whatever
+  its key.
 
   When several hold the first in that order wins: a person's Stop before the
   budget, a memory kill before a host restart, a full disk before a database
@@ -1228,7 +1234,8 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
 - **A write endpoint in the UI** (an input box to the supervisor). Humans
   act with `spawn submit --principal human`.
 - **More dispatcher rules:** stopping a COMPLETED one-shot task (it
-  escalates), and the actions `restart` and `reassign`. Retrying after a
+  escalates). (`restart` and `reassign` are built: §3.2, "Restart and
+  reassign".) Retrying after a
   transient API error is the recovery's (§3.1): bounded for an engine that
   ended, unbounded for one at its prompt; telling the supervisor after N
   live retries is not built.
