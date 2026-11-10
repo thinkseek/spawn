@@ -442,6 +442,27 @@ pub struct Launch {
     pub environment: Vec<(String, String)>,
 }
 
+/// One terminal server, told as a process is: its pid and when it started
+/// (wall clock, in ms). Two readings name the same server when both are
+/// equal; a pid alone is reused, after a reboot first of all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct TerminalServer {
+    /// The server's process id.
+    pub pid: u32,
+    /// When it started, ms since the epoch (tmux keeps whole seconds).
+    pub started_at_ms: i64,
+}
+
+/// What [`TerminalHost::server`] saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerSeen {
+    /// No terminal server answers: every terminal is gone with it.
+    Gone,
+    /// A server answers (or the host cannot tell that none does), and is
+    /// this one when the host can tell which.
+    Answers(Option<TerminalServer>),
+}
+
 /// What a terminal hosts ([`TerminalHost::runner`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Runner {
@@ -521,7 +542,20 @@ pub trait TerminalHost: Send + Sync {
     /// recovery's `host_restart`). A host that cannot tell answers true:
     /// an execution then reads as crashed, never as a host restart.
     fn server_alive(&self) -> bool {
-        true
+        !matches!(self.server(), ServerSeen::Gone)
+    }
+
+    /// The terminal server that answers now, and which one it is: a server
+    /// is told from another as a process is, by its pid and when it
+    /// started, never by whether something answers. A server that answered
+    /// when an execution's terminal started and answers now under another
+    /// identity is a new one: the one that ran the execution is gone, and
+    /// every terminal with it (the recovery's `host_restart`, whatever
+    /// started the new server since). A host that cannot tell answers
+    /// [`ServerSeen::Answers`] with no identity: an execution then reads as
+    /// crashed, never as a host restart it cannot show.
+    fn server(&self) -> ServerSeen {
+        ServerSeen::Answers(None)
     }
 
     /// Whether the terminal hosts the runner this host started in it
