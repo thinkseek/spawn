@@ -4878,22 +4878,25 @@ connections\n";
             store
                 .host_record(&json!({"type": "host.messages_marked", "started_at_ms": 1}))
                 .expect("the first marking loop");
-            // The older Spawn's input finished; then one the Bridge refused
-            // before typing it, which a loop sends again as a new command.
             finish(store, old, &Outcome::Succeeded);
+            // The first message the transcript holds: from then on the
+            // session's messages are tracked.
+            let answered = input(store, session, "answered", "same text");
+            typed(store, session, MSG_EXECUTION, answered, true);
+            taken(store, session, MSG_EXECUTION, "u1", answered.0);
+            taken(store, session, MSG_EXECUTION, "u1-again", answered.0);
+            turn_ended(store, session, MSG_EXECUTION, "t1");
+            finish(store, answered, &Outcome::Succeeded);
+            // One the Bridge refused before typing it, which a loop sends
+            // again as a new command.
             let refused = input(store, session, "refused", "same text");
             finish(
                 store,
                 refused,
                 &Outcome::Failed("pane state Busy does not accept input".to_string()),
             );
-            let answered = input(store, session, "answered", "same text");
             let deaf = input(store, session, "deaf", "same text");
             let untyped = input(store, session, "untyped", "same text");
-            typed(store, session, MSG_EXECUTION, answered, true);
-            taken(store, session, MSG_EXECUTION, "u1", answered.0);
-            taken(store, session, MSG_EXECUTION, "u1-again", answered.0);
-            turn_ended(store, session, MSG_EXECUTION, "t1");
             typed(store, session, MSG_EXECUTION, deaf, true);
             Messages {
                 worker,
@@ -5090,12 +5093,10 @@ connections\n";
                 store
                     .host_record(&json!({"type": "host.messages_marked", "started_at_ms": 1}))
                     .expect("the first marking loop");
-                // Its task, typed and taken: the transcript keeps markers.
+                // Its task, typed: until the transcript holds a marker, the
+                // session's silence says nothing.
                 let task = input(store, session, "task", "hello");
                 typed(store, session, execution, task, true);
-                let deaf = input(store, session, "deaf", "hello");
-                typed(store, session, execution, deaf, true);
-                // Before any taking the session's silence says nothing.
                 let silent = store
                     .commands_json(&format!("session_{session}"), 10, 0)
                     .expect("the commands");
@@ -5108,6 +5109,9 @@ connections\n";
                     "{silent}"
                 );
                 taken(store, session, execution, "u0", task.0);
+                // The next input is tracked, and the engine never takes it.
+                let deaf = input(store, session, "deaf", "hello");
+                typed(store, session, execution, deaf, true);
                 let key = format!("message_not_taken:{}", deaf.0);
                 let rows = |store: &PostgresStore| {
                     store.alert_rows().expect("the alerts")["rows"]
