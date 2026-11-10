@@ -293,6 +293,35 @@ impl Turn {
         }
         None
     }
+
+    /// Whether the model refused the request in a way no retry changes:
+    /// neither transient, nor a login, nor an exhausted context (a 400 of
+    /// another kind, a 404, a 413). The engine may wait at its prompt after
+    /// it (no interruption: the agent can go on another way); an engine that
+    /// ended after it, with no progress since, is a `model_error` end.
+    pub(crate) fn model_error(&self) -> bool {
+        self.cause().is_none()
+    }
+
+    /// The evidence of an interruption told from this turn: its event,
+    /// status, error tag and text.
+    pub(crate) fn evidence(&self) -> Map<String, Value> {
+        let mut evidence = Map::new();
+        evidence.insert("event_id".to_string(), json!(self.event_id));
+        evidence.insert(
+            "status".to_string(),
+            self.status.map_or(Value::Null, |status| json!(status)),
+        );
+        evidence.insert(
+            "error".to_string(),
+            self.error_kind.clone().map_or(Value::Null, Value::String),
+        );
+        evidence.insert(
+            "text".to_string(),
+            json!(crate::deliver::one_line(&self.text, 600)),
+        );
+        evidence
+    }
 }
 
 /// A tool call that failed, with the engine's error text (`tool.failed`).
@@ -396,6 +425,9 @@ pub(crate) struct Facts<'a> {
     pub(crate) disk: Option<&'a disk::Reading>,
     /// The database outage the execution lived through.
     pub(crate) outage: Option<&'a Outage>,
+    /// The failed turn the engine ended after, with no progress since, when
+    /// the model refused it for good ([`Turn::model_error`]).
+    pub(crate) model_error: Option<&'a Turn>,
     /// Whether the session is a retired resident, or its task cancelled:
     /// how a `stopped` end came about, in its evidence.
     pub(crate) retired: bool,
@@ -425,6 +457,11 @@ pub(crate) fn classify(facts: &Facts<'_>) -> Cause {
     }
     if facts.outage.is_some() {
         return Cause::DatabaseUnavailable;
+    }
+    // The engine's own end after a request the model will never accept:
+    // resuming it sends the same request again.
+    if facts.model_error.is_some() && end.cause != "lost" {
+        return Cause::ModelError;
     }
     // A signal, a non-zero code, or a terminal gone while its server lived:
     // the engine did not exit by itself.
@@ -1315,20 +1352,7 @@ impl One<'_> {
         let Some(cause) = turn.cause() else {
             return Ok(());
         };
-        let mut evidence = Map::new();
-        evidence.insert("event_id".to_string(), json!(turn.event_id));
-        evidence.insert(
-            "status".to_string(),
-            turn.status.map_or(Value::Null, |status| json!(status)),
-        );
-        evidence.insert(
-            "error".to_string(),
-            turn.error_kind.clone().map_or(Value::Null, Value::String),
-        );
-        evidence.insert(
-            "text".to_string(),
-            json!(crate::deliver::one_line(&turn.text, 600)),
-        );
+        let mut evidence = turn.evidence();
         let mut due = self.now_ms;
         match cause {
             Cause::ModelUnavailable => {
@@ -1441,6 +1465,7 @@ impl One<'_> {
             outage: None,
             retired: self.retired.contains(&self.row.session_id),
             task_cancelled: false,
+            model_error: self.refused_turn(end),
         };
         let cause = classify(&facts);
         let mut evidence = self.end_evidence(cause, end, &facts);
@@ -1545,6 +1570,17 @@ impl One<'_> {
                     "exit_code".to_string(),
                     end.exit_code.map_or(Value::Null, |code| json!(code)),
                 );
+            }
+            Cause::ModelError => {
+                if let Some(turn) = facts.model_error {
+                    evidence = turn.evidence();
+                }
+                if let Some(code) = end.exit_code {
+                    evidence.insert("exit_code".to_string(), json!(code));
+                }
+                if let Some(signal) = end.signal {
+                    evidence.insert("signal".to_string(), json!(signal));
+                }
             }
             Cause::ContextExhausted
             | Cause::ModelUnavailable
