@@ -889,18 +889,21 @@ fn typed(
     let text = typed_text(body.text).map_err(|error| (400, format!("{BAD_REQUEST}{error}")))?;
     let store = writer(shared).map_err(|error| (500, error))?;
     match store.submit_human_input(&session, &key, &text) {
-        Ok(Some(command)) => Ok((
+        Ok(spawn_postgres::HumanInput::Submitted(command)) => Ok((
             202,
             json!({ "command_id": command.0, "session_id": session.as_str(),
                     "principal": "human" }),
         )),
-        Ok(None) => Err((
+        Ok(spawn_postgres::HumanInput::NoAgent) => Err((
             404,
             format!(
                 "no agent has used {}: there is nothing to type into",
                 session.as_str()
             ),
         )),
+        // Nothing runs: refused with the store's reason, before any command
+        // is made (objective 040), so the person learns it at once.
+        Ok(spawn_postgres::HumanInput::NotRunning(why)) => Err((409, why)),
         Err(error) => Err((500, error.to_string())),
     }
 }
