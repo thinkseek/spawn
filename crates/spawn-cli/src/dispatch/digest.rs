@@ -857,13 +857,16 @@ pub(crate) fn model_finals(records: &[Value]) -> Vec<Escalation> {
             let session = record["session_id"].as_str()?;
             let execution = record["execution_id"].as_str()?;
             let cause = record["cause"].as_str()?;
-            let status = record["status"]
-                .as_i64()
-                .map_or_else(|| "no status".to_string(), |status| format!("status {status}"));
+            let status = record["status"].as_i64().map_or_else(
+                || "no status".to_string(),
+                |status| format!("status {status}"),
+            );
             let text = record["text"]
                 .as_str()
                 .filter(|text| !text.is_empty())
-                .map_or_else(String::new, |text| format!(" (\"{}\")", one_line(text, 200)));
+                .map_or_else(String::new, |text| {
+                    format!(" (\"{}\")", one_line(text, 200))
+                });
             let line = if cause == "model_unavailable" {
                 let retries = record["retries"]
                     .as_u64()

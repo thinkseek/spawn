@@ -2343,6 +2343,73 @@ mod tests {
         );
     }
 
+    /// Objective 39: a final model record reaches an idle supervisor once,
+    /// as an item of the worker's session tagged `<session>
+    /// model-<execution>`, naming the session, the execution, the cause and
+    /// the status or the retries; news, never repeated once told.
+    #[test]
+    fn a_final_model_record_reaches_an_idle_supervisor_once() {
+        let records = [
+            serde_json::json!({"event_id": 40, "at_ms": 1_793_930_021_000_i64,
+                "session_id": "session_worker_a", "agent_id": "agent_worker_a",
+                "execution_id": "exec_a1", "cause": "model_error", "status": 400,
+                "error": "invalid_request",
+                "text": "API Error: 400 unexpected tool_use_id\nfound", "retries": null}),
+            serde_json::json!({"event_id": 52, "at_ms": 1_793_930_031_000_i64,
+                "session_id": "session_worker_b", "agent_id": "agent_worker_b",
+                "execution_id": "exec_b3", "cause": "model_unavailable", "status": 529,
+                "error": "overloaded", "text": "API Error: 529 Overloaded", "retries": 2}),
+        ];
+        let items = super::digest::model_finals(&records);
+        let tags: Vec<String> = items.iter().map(Escalation::tag).collect();
+        assert_eq!(
+            tags,
+            [
+                "session_worker_a model-exec_a1",
+                "session_worker_b model-exec_b3"
+            ]
+        );
+        assert!(items.iter().all(|item| item.why == Why::ModelFinal));
+        assert!(Why::ModelFinal.is_news());
+        assert_eq!(items[0].since_ms, Some(1_793_930_021_000));
+        for part in ["session_worker_a", "exec_a1", "model_error", "status 400"] {
+            assert!(items[0].line.contains(part), "{part}: {}", items[0].line);
+        }
+        for part in [
+            "session_worker_b",
+            "exec_b3",
+            "model_unavailable",
+            "after 2 retries",
+        ] {
+            assert!(items[1].line.contains(part), "{part}: {}", items[1].line);
+        }
+        assert!(items.iter().all(|item| !item.line.contains('\n')));
+        assert!(
+            super::digest::model_finals(&[serde_json::json!({"cause": "model_error"})]).is_empty(),
+            "a record without its session and execution is no item"
+        );
+
+        let rows = [idle_supervisor()];
+        let plan = decide_with(&rows, &Work::default(), &items, true, NOW, "spawn");
+        let CommandAction::Input { tags, .. } = &plan.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert_eq!(
+            tags,
+            &[
+                "session_worker_a model-exec_a1",
+                "session_worker_b model-exec_b3"
+            ]
+        );
+        let mut supervisor = idle_supervisor();
+        delivered(&mut supervisor, &plan.orders[0]);
+        let plan = decide_with(&[supervisor], &Work::default(), &items, true, NOW, "spawn");
+        assert!(
+            plan.orders.is_empty() && plan.pending.is_empty() && plan.told.is_empty(),
+            "told once, and resolved by the telling"
+        );
+    }
+
     #[test]
     fn a_busy_or_absent_supervisor_leaves_escalations_pending() {
         let mut blocked = judged(SemanticState::Blocked, 0.8);

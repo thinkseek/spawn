@@ -1841,10 +1841,7 @@ impl One<'_> {
         let execution = self.execution();
         let mut evidence = Map::new();
         for field in ["event_id", "status", "error", "text"] {
-            evidence.insert(
-                field.to_string(),
-                last.record["evidence"][field].clone(),
-            );
+            evidence.insert(field.to_string(), last.record["evidence"][field].clone());
         }
         evidence.insert("retries".to_string(), json!(self.config.model_retries));
         evidence.insert("resumes".to_string(), json!(resumes));
@@ -2260,9 +2257,10 @@ pub(crate) fn refused(
     after: i64,
     end_event_id: Option<i64>,
 ) -> Option<&Turn> {
-    let turn = turns.iter().rev().find(|turn| {
-        turn.event_id > after && end_event_id.is_none_or(|end| turn.event_id < end)
-    })?;
+    let turn = turns
+        .iter()
+        .rev()
+        .find(|turn| turn.event_id > after && end_event_id.is_none_or(|end| turn.event_id < end))?;
     (turn.model_error() && progress_event_id < turn.event_id).then_some(turn)
 }
 
@@ -2362,8 +2360,8 @@ mod tests {
     use super::{
         Cause, Config, Credentials, End, Executed, Execution, Facts, Outage, Path, Recorded,
         Recovery, Sent, Stop, ToolFailure, Turn, auth_retry_due, classify, counts_as_failure,
-        disk_cleared, key, model_due, model_resumes, model_retries, pending, refused,
-        resume_due, resume_failed, retry_at, way,
+        disk_cleared, key, model_due, model_resumes, model_retries, pending, refused, resume_due,
+        resume_failed, retry_at, way,
     };
     use serde_json::json;
 
