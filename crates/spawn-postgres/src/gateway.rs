@@ -84,6 +84,31 @@ pub enum HumanKey {
     /// The session runs no execution, in the store's words: a key needs a
     /// running engine. No command was made.
     NotRunning(String),
+    /// The idempotency key is another request's (another session, another
+    /// key name, or an input), in the store's words. No command was made.
+    KeyUsed(String),
+}
+
+/// What became of a person's input ([`PostgresStore::submit_human_input`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HumanInput {
+    /// The command that types it (a new one, or the one an earlier call
+    /// with this idempotency key, session and text made).
+    Submitted(CommandId),
+    /// No agent has used the session: there is nothing to type into.
+    NoAgent,
+    /// The idempotency key is another request's (another session, other
+    /// text, or a key), in the store's words. No command was made.
+    KeyUsed(String),
+}
+
+/// The store's words when `error` is its refusal of an idempotency key
+/// another request used (`spawn_human_replay`, SQLSTATE 23505).
+fn key_used(error: &postgres::Error) -> Option<String> {
+    error
+        .as_db_error()
+        .filter(|db| *db.code() == postgres::error::SqlState::UNIQUE_VIOLATION)
+        .map(|db| db.message().to_string())
 }
 
 impl PostgresStore {
@@ -126,17 +151,13 @@ impl PostgresStore {
 
     /// Type `text` into `session` as a person, through `spawn_human_input`:
     /// the input `spawn submit --principal human` would submit to the
-    /// session's agent, with the same idempotency rule (a repeated `key`
-    /// returns the first command). Only a store connected as the
-    /// `spawn_human` login may call it (`role_url(owner, "spawn_human")`);
-    /// that login can do nothing else. `None` when no agent has used the
-    /// session.
     /// Press `key` in `session` as a person, through `spawn_human_key`:
     /// the key command `spawn submit --principal human` would submit to the
     /// session's agent, with the same idempotency rule. Only a store
     /// connected as the `spawn_human` login may call it. A session that
     /// runs no execution is refused ([`HumanKey::NotRunning`]) and nothing
-    /// is recorded.
+    /// is recorded; so is an idempotency key another request used
+    /// ([`HumanKey::KeyUsed`]).
     pub fn submit_human_key(
         &self,
         session: &SessionId,
@@ -162,19 +183,38 @@ impl PostgresStore {
                     .map_or_else(String::new, |db| db.message().to_string());
                 Ok(HumanKey::NotRunning(message))
             }
-            Err(error) => Err(crate::backend(&error)),
+            Err(error) => key_used(&error)
+                .map(HumanKey::KeyUsed)
+                .ok_or_else(|| crate::backend(&error)),
         }
     }
 
+    /// Type `text` into `session` as a person, through `spawn_human_input`:
+    /// the input `spawn submit --principal human` would submit to the
+    /// session's agent, with the same idempotency rule (a repeated `key`
+    /// returns the first command) for the same session and text only: a
+    /// `key` another session's input used, or other text, is refused
+    /// ([`HumanInput::KeyUsed`]) and nothing is recorded. Only a store
+    /// connected as the `spawn_human` login may call it (`role_url(owner,
+    /// "spawn_human")`); that login can do nothing else.
     pub fn submit_human_input(
         &self,
         session: &SessionId,
         key: &IdempotencyKey,
         text: &str,
-    ) -> Result<Option<CommandId>, StoreError> {
-        let row = self.query_one(HUMAN_INPUT, &[&session.as_str(), &key.as_str(), &text])?;
-        Ok(row
-            .get::<_, Option<i64>>(0)
-            .map(|id| CommandId(id.unsigned_abs())))
+    ) -> Result<HumanInput, StoreError> {
+        let answer = self
+            .lock()
+            .query_one(HUMAN_INPUT, &[&session.as_str(), &key.as_str(), &text]);
+        match answer {
+            Ok(row) => Ok(row
+                .get::<_, Option<i64>>(0)
+                .map_or(HumanInput::NoAgent, |id| {
+                    HumanInput::Submitted(CommandId(id.unsigned_abs()))
+                })),
+            Err(error) => key_used(&error)
+                .map(HumanInput::KeyUsed)
+                .ok_or_else(|| crate::backend(&error)),
+        }
     }
 }

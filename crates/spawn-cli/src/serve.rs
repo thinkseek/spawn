@@ -10,8 +10,9 @@
 //! header instead): the input `spawn submit --principal human --agent <the
 //! session's agent> --session <id> --key <key> --action
 //! '{"type":"input","text":...}'` makes, with the same idempotency rule, so
-//! a retried POST types once; like every person's input it waits for the
-//! session's turn. It answers 202 with the command, which
+//! a retried POST types once (the same session and text: a key another
+//! session's input used, or other text, is 409 and nothing is made, GitHub
+//! #16 item 8); like every person's input it waits for the session's turn. It answers 202 with the command, which
 //! `/api/fleet/<id>/commands` then follows. It runs as the `spawn_human`
 //! login, whose rights are `spawn_human_input` and `spawn_human_key`
 //! (crates/spawn-postgres/sql/schema.sql): it submits no other action, reads
@@ -36,8 +37,8 @@
 //! rule. The name is one of escape, up, down, left, right, enter, y, n (400
 //! otherwise). A key is its own action, never text, and does not wait for
 //! the turn: the Bridge sends it at once. A session no agent has used is
-//! 404; one that runs no execution is 409 with the reason, and no command
-//! is made.
+//! 404; one that runs no execution is 409 with the reason, and so is an
+//! idempotency key another request used; no command is made.
 //!
 //! Reading is still worth guarding: `/api/pane/<id>` shows any live pane.
 //! `serve` binds 127.0.0.1 unless told otherwise, and on any other address
@@ -889,12 +890,13 @@ fn typed(
     let text = typed_text(body.text).map_err(|error| (400, format!("{BAD_REQUEST}{error}")))?;
     let store = writer(shared).map_err(|error| (500, error))?;
     match store.submit_human_input(&session, &key, &text) {
-        Ok(Some(command)) => Ok((
+        Ok(spawn_postgres::HumanInput::Submitted(command)) => Ok((
             202,
             json!({ "command_id": command.0, "session_id": session.as_str(),
                     "principal": "human" }),
         )),
-        Ok(None) => Err((
+        Ok(spawn_postgres::HumanInput::KeyUsed(why)) => Err((409, why)),
+        Ok(spawn_postgres::HumanInput::NoAgent) => Err((
             404,
             format!(
                 "no agent has used {}: there is nothing to type into",
@@ -968,7 +970,9 @@ fn pressed(
                 session.as_str()
             ),
         )),
-        Ok(spawn_postgres::HumanKey::NotRunning(why)) => Err((409, why)),
+        Ok(spawn_postgres::HumanKey::NotRunning(why) | spawn_postgres::HumanKey::KeyUsed(why)) => {
+            Err((409, why))
+        }
         Err(error) => Err((500, error.to_string())),
     }
 }
@@ -2636,6 +2640,23 @@ mod tests {
             assert_eq!(listed[0]["text"], "Stop objective_87 and report.\nThanks");
             assert_eq!(listed[0]["state"], "pending");
             assert_eq!(listed[0]["waiting"], false);
+
+            // The key is that message's: other text under it is refused,
+            // not answered with the first command (GitHub #16 item 8).
+            let other = to(
+                Some("secret"),
+                "",
+                SCRIPT,
+                INPUT,
+                r#"{"text":"Something else","key":"page-1"}"#,
+            );
+            assert_eq!(other.status, 409, "{other:?}");
+            assert_eq!(
+                other.body["error"],
+                "idempotency key 'page-1' was already used for another input or key: send \
+                 this one with a new key"
+            );
+            assert_eq!(commands().as_array().map(Vec::len), Some(1));
 
             // The key in a header, from the page of an open network.
             let page_with_key = format!("{PAGE}Idempotency-Key: page-2\r\n");

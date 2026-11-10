@@ -213,11 +213,13 @@ select jsonb_build_object(
 /// `turn.stopped`, `turn.failed`) is a turn's end; the Bridge records a
 /// turn's checkpoint before its end, so `checkpoint`, the agent's latest
 /// `artifact.committed`, read in the same statement, is then that turn's
-/// (or a later one). `jobs`: the live execution's open background jobs
+/// (or a later one). `turn_seq` is that latest turn event's session
+/// position: a judgement based on an earlier one is not of the turn that
+/// ended (the attention view shows no question from it). `jobs`: the live execution's open background jobs
 /// (`agent_open_jobs`), oldest first, each with the id of its
 /// `job.started` and its age on the database's clock.
 ///
-/// Four of those — `evidence_seq`, `turn_ended`, `checkpoint`, `model` — are
+/// Four of those — `evidence_seq`, `turn_ended` (with `turn_seq`), `checkpoint`, `model` — are
 /// one row per session or per agent over the log, so they are read once for
 /// the whole fleet and joined, not once per session: the dispatcher reads
 /// these facts on every pass it acts on, and four scans of the log do the
@@ -253,6 +255,7 @@ from (
     p.observation_at_ms,
     ev.evidence_seq,
     coalesce(tn.ended, false) as turn_ended,
+    tn.seq as turn_seq,
     ck.commit as checkpoint,
     coalesce(jb.jobs, '[]'::jsonb) as jobs,
     ep.id as episode,
@@ -401,7 +404,8 @@ from (
   left join (
     select distinct on (e.session_id, e.execution_id)
            e.session_id, e.execution_id,
-           e.event_name in ('turn.stopped', 'turn.failed') as ended
+           e.event_name in ('turn.stopped', 'turn.failed') as ended,
+           e.session_seq as seq
       from spawn_events e
      where e.event_name in ('message.received', 'turn.stopped', 'turn.failed')
      order by e.session_id, e.execution_id, e.session_seq desc) tn
