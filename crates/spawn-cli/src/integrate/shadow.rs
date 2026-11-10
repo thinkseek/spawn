@@ -236,11 +236,6 @@ impl Shadows {
         if !dispatcher.is_file() {
             return Err(format!("no {}", dispatcher.display()));
         }
-        let base = want.inputs["base"].as_str().unwrap_or_default().to_string();
-        let candidate = want.inputs["candidate"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
         self.started += 1;
         let work = self.dir.join(format!(
             "{}-{}-{}",
@@ -250,68 +245,7 @@ impl Shadows {
         ));
         remove_tree(&work);
         std::fs::create_dir_all(&work).map_err(|error| format!("{}: {error}", work.display()))?;
-        let started = (|| {
-            // The controller, read as the shadow starts; the set, a snapshot
-            // read once: what the dispatcher packs is this copy.
-            let controller_commit = inputs::controller_commit(&controller);
-            let snapshot = work.join("scenarios");
-            let copied = Command::new("cp")
-                .arg("-R")
-                .arg("--")
-                .arg(&want.scenarios)
-                .arg(&snapshot)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .output()
-                .map_err(|error| format!("cannot run cp: {error}"))?;
-            if !copied.status.success() {
-                return Err(format!(
-                    "cannot copy {}: {}",
-                    want.scenarios.display(),
-                    String::from_utf8_lossy(&copied.stderr).trim()
-                ));
-            }
-            let given = json!({
-                "base": base,
-                "candidate": candidate,
-                "controller": controller_commit,
-                "scenarios_sha256": inputs::scenarios_sha256(&snapshot),
-                "scenario": null,
-            });
-            let out = work.join("out");
-            std::fs::create_dir_all(&out).map_err(|error| format!("{}: {error}", out.display()))?;
-            let log = work.join("dispatch.log");
-            let stdout = std::fs::File::create(&log)
-                .map_err(|error| format!("{}: {error}", log.display()))?;
-            let stderr = stdout
-                .try_clone()
-                .map_err(|error| format!("{}: {error}", log.display()))?;
-            let mut command = if setpriv_available() {
-                let mut command = Command::new("setpriv");
-                command.args(["--pdeathsig", "TERM", "bash"]);
-                command
-            } else {
-                Command::new("bash")
-            };
-            command
-                .arg(&dispatcher)
-                .arg(&self.settings.runner)
-                .arg(&want.repo)
-                .arg(&base)
-                .arg(&candidate)
-                .arg(&snapshot)
-                .arg(&out)
-                .stdin(Stdio::null())
-                .stdout(stdout)
-                .stderr(stderr)
-                .process_group(0);
-            let child = command
-                .spawn()
-                .map_err(|error| format!("cannot run {}: {error}", dispatcher.display()))?;
-            Ok((child, given))
-        })();
-        let (child, given) = match started {
+        let (child, given) = match self.launch(&want, &controller, &dispatcher, &work) {
             Ok(started) => started,
             Err(error) => {
                 remove_tree(&work);
@@ -337,6 +271,78 @@ impl Shadows {
             work,
             given,
         })
+    }
+
+    /// Snapshot the gate directory into `work`, read what the runner is
+    /// given, and start the dispatcher on it: the child and those `inputs`.
+    fn launch(
+        &self,
+        want: &Want,
+        controller: &Path,
+        dispatcher: &Path,
+        work: &Path,
+    ) -> Result<(Child, Value), String> {
+        let base = want.inputs["base"].as_str().unwrap_or_default();
+        let candidate = want.inputs["candidate"].as_str().unwrap_or_default();
+        // The controller, read as the shadow starts; the set, a snapshot
+        // read once: what the dispatcher packs is this copy.
+        let controller_commit = inputs::controller_commit(controller);
+        let snapshot = work.join("scenarios");
+        let copied = Command::new("cp")
+            .arg("-R")
+            .arg("--")
+            .arg(&want.scenarios)
+            .arg(&snapshot)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| format!("cannot run cp: {error}"))?;
+        if !copied.status.success() {
+            return Err(format!(
+                "cannot copy {}: {}",
+                want.scenarios.display(),
+                String::from_utf8_lossy(&copied.stderr).trim()
+            ));
+        }
+        let given = json!({
+            "base": base,
+            "candidate": candidate,
+            "controller": controller_commit,
+            "scenarios_sha256": inputs::scenarios_sha256(&snapshot),
+            "scenario": null,
+        });
+        let out = work.join("out");
+        std::fs::create_dir_all(&out).map_err(|error| format!("{}: {error}", out.display()))?;
+        let log = work.join("dispatch.log");
+        let stdout =
+            std::fs::File::create(&log).map_err(|error| format!("{}: {error}", log.display()))?;
+        let stderr = stdout
+            .try_clone()
+            .map_err(|error| format!("{}: {error}", log.display()))?;
+        let mut command = if setpriv_available() {
+            let mut command = Command::new("setpriv");
+            command.args(["--pdeathsig", "TERM", "bash"]);
+            command
+        } else {
+            Command::new("bash")
+        };
+        command
+            .arg(dispatcher)
+            .arg(&self.settings.runner)
+            .arg(&want.repo)
+            .arg(base)
+            .arg(candidate)
+            .arg(&snapshot)
+            .arg(&out)
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
+            .process_group(0);
+        let child = command
+            .spawn()
+            .map_err(|error| format!("cannot run {}: {error}", dispatcher.display()))?;
+        Ok((child, given))
     }
 
     /// The shadow that ended since the last call, with its record; None
