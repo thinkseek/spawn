@@ -4259,7 +4259,7 @@ $$;
 --   was still open, or finished, after the first marking loop started (the
 --   bound runs from the later of its creation and that start). A command an
 --   older Spawn typed has `typing` and no `message.typed`: never not taken.
--- - `typed`: whether any typing of it began; `ended`: the session ended
+-- - `typed`: whether the Bridge recorded it typed; `ended`: the session ended
 --   with it (what the alert clears on): the execution it was typed into, or
 --   its own start's, ended; or, never typed or started, it finished while no
 --   execution that is still live ran, or it is an input waiting with none.
@@ -4358,7 +4358,7 @@ begin
         'not_taken', v_taken = 0 and v_tracked and p_now - v_from >= p_bound_ms,
         'tracked', v_tracked,
         'due_ms', case when v_tracked and v_taken = 0 then v_from + p_bound_ms end,
-        'typed', v_typing_exec is not null or v_typed_at is not null,
+        'typed', v_typed_at is not null,
         'ended', v_ended);
 end $$;
 
