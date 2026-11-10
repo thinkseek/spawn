@@ -2446,9 +2446,100 @@ mod tests {
         Cause, Config, Credentials, End, Executed, Execution, Facts, Outage, Path, Recorded,
         Recovery, Sent, Stop, ToolFailure, Turn, auth_retry_due, classify, counts_as_failure,
         disk_cleared, key, model_due, model_resumes, model_retries, pending, refused, resume_due,
-        resume_failed, retry_at, way,
+        resume_failed, retry_at, server_gone, way,
     };
     use serde_json::json;
+    use spawn_core::port::{ServerSeen, TerminalServer};
+
+    /// A host restart is the server that ran the execution gone, told by
+    /// its identity, whatever answers when the end is read and whatever
+    /// order the ends are read in (objective 44).
+    #[test]
+    fn a_terminal_server_is_gone_when_the_one_that_ran_the_execution_is_gone() {
+        // The server before the restart, and the one the first resume
+        // started after it, 3.5 s into its launch.
+        let before = TerminalServer {
+            pid: 812,
+            started_at_ms: 1_000_000,
+        };
+        let after = TerminalServer {
+            pid: 812,
+            started_at_ms: 9_000_000,
+        };
+        // Recorded at 5_000_000, before the restart; ran on `before`.
+        let recorded = 5_000_000;
+        // (a) No server answers: gone.
+        assert!(server_gone(Some(&before), recorded, ServerSeen::Gone));
+        assert!(server_gone(None, recorded, ServerSeen::Gone));
+        // (a) Another server answers (a resume started it): gone, read
+        // before or after that resume alike. The same pid is not the
+        // same server.
+        assert!(server_gone(
+            Some(&before),
+            recorded,
+            ServerSeen::Answers(Some(after))
+        ));
+        let other_pid = TerminalServer {
+            pid: 813,
+            ..before
+        };
+        assert!(server_gone(
+            Some(&before),
+            recorded,
+            ServerSeen::Answers(Some(other_pid))
+        ));
+        // (b) The server that ran it answers: not gone, a crash. Also for an
+        // execution recorded before the slow launch that started its
+        // server: its server is younger than its record, and is its own.
+        assert!(!server_gone(
+            Some(&before),
+            recorded,
+            ServerSeen::Answers(Some(before))
+        ));
+        let resumed_at = after.started_at_ms - 3_500;
+        assert!(!server_gone(
+            Some(&after),
+            resumed_at,
+            ServerSeen::Answers(Some(after))
+        ));
+        // (c) No identity recorded (before this change, or a failed
+        // write): gone when the answering server started after the record,
+        // not gone when it started before.
+        assert!(server_gone(None, recorded, ServerSeen::Answers(Some(after))));
+        assert!(!server_gone(
+            None,
+            recorded,
+            ServerSeen::Answers(Some(before))
+        ));
+        // A host that cannot tell which server answers keeps today's rule:
+        // a crash, never a restart it cannot show.
+        assert!(!server_gone(Some(&before), recorded, ServerSeen::Answers(None)));
+        assert!(!server_gone(None, recorded, ServerSeen::Answers(None)));
+    }
+
+    #[test]
+    fn an_execution_reads_the_server_its_terminal_started_on() {
+        let row: Execution = serde_json::from_value(json!({
+            "id": "exec_7",
+            "started_at_ms": 1_000,
+            "terminal_server": {"pid": 812, "started_at_ms": 2_000},
+        }))
+        .expect("an execution with its server");
+        assert_eq!(
+            row.terminal_server,
+            Some(TerminalServer {
+                pid: 812,
+                started_at_ms: 2_000,
+            })
+        );
+        let old: Execution = serde_json::from_value(json!({
+            "id": "exec_7",
+            "started_at_ms": 1_000,
+            "terminal_server": null,
+        }))
+        .expect("an execution from before the record");
+        assert_eq!(old.terminal_server, None);
+    }
 
     /// The loop's next pass reads again although the log did not move only
     /// while a wait is open, a revival is pending or an outage is pending:
