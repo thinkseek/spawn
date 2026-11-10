@@ -3766,7 +3766,7 @@ mod binding_tests {
         scenarios_sha256, toolchain_of,
     };
     use sha2::{Digest, Sha256};
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -3897,6 +3897,5 @@ mod binding_tests {
         let env = run_env(None);
         assert!(env["toolchain"].is_null() && env["runner"].is_null(), "{env}");
         assert!(env["host"].as_str().is_some_and(|host| !host.is_empty()), "{env}");
-        let _ = Path::new("");
     }
 }
