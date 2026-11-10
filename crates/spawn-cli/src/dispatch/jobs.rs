@@ -184,6 +184,7 @@ mod tests {
             observation_at_ms: Some(NOW - 1_000),
             evidence_seq: Some(20),
             turn_ended: true,
+            turn_seq: None,
             checkpoint: None,
             episode: Some(7),
             open_command: false,

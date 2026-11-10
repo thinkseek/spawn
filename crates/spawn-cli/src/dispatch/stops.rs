@@ -134,6 +134,7 @@ mod tests {
             observation_at_ms: None,
             evidence_seq: None,
             turn_ended: false,
+            turn_seq: None,
             checkpoint: None,
             episode: None,
             open_command: false,

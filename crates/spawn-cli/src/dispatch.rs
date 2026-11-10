@@ -227,6 +227,12 @@ pub(crate) struct Facts {
     /// The Bridge records a turn's checkpoint before its end.
     #[serde(default)]
     pub(crate) turn_ended: bool,
+    /// Session position of that latest turn event: of the turn's end once
+    /// `turn_ended`. A judgement based on an earlier position was made
+    /// before this turn ended: it is an earlier turn's, or of this turn
+    /// while it ran.
+    #[serde(default)]
+    pub(crate) turn_seq: Option<u64>,
     /// The commit of the agent's latest `artifact.committed`, read with the
     /// rest of these facts: once `turn_ended`, the checkpoint of the turn
     /// that ended (or a later one).
@@ -1238,6 +1244,7 @@ mod tests {
             resumed_young: 0,
             failed_resume: None,
             turn_ended: true,
+            turn_seq: None,
             checkpoint: None,
             charter: None,
             jobs: Vec::new(),
@@ -1384,6 +1391,7 @@ mod tests {
             resumed_young: 0,
             failed_resume: None,
             turn_ended: true,
+            turn_seq: None,
             checkpoint: None,
             charter: None,
             jobs: Vec::new(),

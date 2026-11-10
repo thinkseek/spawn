@@ -1953,6 +1953,7 @@ mod tests {
             resumed_young: 0,
             failed_resume: None,
             turn_ended: idle,
+            turn_seq: None,
             checkpoint: None,
             charter: None,
             jobs: Vec::new(),

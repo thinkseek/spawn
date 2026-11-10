@@ -283,6 +283,7 @@ mod tests {
             failed_resume: None,
             stops: Vec::new(),
             turn_ended: true,
+            turn_seq: None,
             checkpoint: None,
             charter: Some(Records {
                 start: Some(40),
