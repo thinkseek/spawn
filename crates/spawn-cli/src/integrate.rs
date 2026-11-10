@@ -1529,7 +1529,7 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
     if !once {
-        write_pid_file(&root);
+        write_pid_file(&integrator.judge.root.clone());
     }
     let interval = loop_interval().max(Duration::from_secs(5));
     loop {
@@ -1738,6 +1738,23 @@ struct Integrator {
     /// probe one more gate on it runs anyway, a probe
     /// (`SPAWN_GATE_MAIN_RED_PROBE_MS`, [`main_red_probe_ms`]).
     red_probe_ms: i64,
+    /// The drain asked of this integrator, once asked ([`Drain`]).
+    drain: RefCell<Option<Drain>>,
+    /// Whether the last pass left a landing to act on: a mission with a
+    /// task to land that landed it (its source moved: the next pass reads
+    /// it again), failed, or was not visited. A drain ends only after a
+    /// pass with none.
+    unlanded: std::cell::Cell<bool>,
+}
+
+/// A drain: no gate, owner judging or base warm starts any more; the
+/// passes go on until no judging of this integrator runs and what they
+/// recorded was acted on, then `integrator.drained` and exit 0; at the
+/// bound, `integrator.drain_expired` ([`Integrator::expire_drain`]).
+struct Drain {
+    /// When the bound is counted from: the `integrator.draining` record.
+    since: std::time::Instant,
+    bound_s: u64,
 }
 
 /// How long a source red on a check waits between probe gates by default:
@@ -1988,6 +2005,8 @@ struct Running {
     owner: Option<i64>,
     /// Its stop, for an owner's urgent landing on its source ([`Stop`]).
     stop: Arc<Stop>,
+    /// Its halt, for a drain past its bound ([`gate::Halt`]).
+    halt: Arc<gate::Halt>,
     handle: std::thread::JoinHandle<()>,
 }
 
@@ -2064,7 +2083,139 @@ impl Integrator {
             red_probe_ms: main_red_probe_ms(
                 crate::config::env_value("SPAWN_GATE_MAIN_RED_PROBE_MS").as_deref(),
             ),
+            drain: RefCell::new(None),
+            unlanded: std::cell::Cell::new(false),
         }
+    }
+
+    /// Whether this integrator drains.
+    fn draining(&self) -> bool {
+        self.drain.borrow().is_some()
+    }
+
+    /// The task judgings in flight, by task: what a drain record names.
+    fn gate_tasks(&self) -> Vec<i64> {
+        let mut tasks: Vec<i64> = self
+            .running
+            .borrow()
+            .iter()
+            .filter(|gate| gate.owner.is_none())
+            .map(|gate| gate.task)
+            .collect();
+        tasks.sort_unstable();
+        tasks.dedup();
+        tasks
+    }
+
+    /// Record an integrator's own record (`integrator.*`), through the store
+    /// its judgings use when one runs; false when it could not be recorded
+    /// (said).
+    fn record_own(&self, record: &Value) -> bool {
+        let held = self.held.borrow().clone();
+        let store = match held {
+            Some(store) => store,
+            None => match open_store() {
+                Ok(store) => Arc::new(store),
+                Err(error) => {
+                    eprintln!("integrate: cannot record {record}: {error}");
+                    return false;
+                }
+            },
+        };
+        match store.integrator_record(record) {
+            Ok(_) => true,
+            Err(error) => {
+                eprintln!("integrate: cannot record {record}: {error}");
+                false
+            }
+        }
+    }
+
+    /// Begin the drain a request asked for (once): `integrator.draining`
+    /// names the task judgings in flight and the bound, counted from now.
+    /// From then on no gate, owner judging or base warm starts.
+    fn begin_drain(&self, bound_s: u64) {
+        if self.draining() {
+            return;
+        }
+        self.reap();
+        let gates = self.gate_tasks();
+        let owners = self
+            .running
+            .borrow()
+            .iter()
+            .filter(|gate| gate.owner.is_some())
+            .count();
+        self.record_own(&json!({
+            "type": "integrator.draining", "gates": gates, "bound_s": bound_s,
+        }));
+        *self.drain.borrow_mut() = Some(Drain {
+            since: std::time::Instant::now(),
+            bound_s,
+        });
+        println!(
+            "integrate: draining: no gate starts any more; {} task gate{} and {owners} owner \
+             judging{} run to their records and landings, then the integrator exits (at most \
+             {bound_s} s)",
+            gates.len(),
+            if gates.len() == 1 { "" } else { "s" },
+            if owners == 1 { "" } else { "s" },
+        );
+    }
+
+    /// Whether the drain is over after a pass (`pass_ok`: it ran): no
+    /// judging of this integrator runs and the pass left no landing to act
+    /// on. Then `integrator.drained` is recorded, and the caller exits.
+    fn drained(&self, pass_ok: bool) -> bool {
+        if !self.draining() || !pass_ok || self.unlanded.get() {
+            return false;
+        }
+        self.reap();
+        if !self.running.borrow().is_empty() {
+            return false;
+        }
+        let bound_s = self.drain.borrow().as_ref().map_or(0, |drain| drain.bound_s);
+        if !self.record_own(&json!({"type": "integrator.drained", "bound_s": bound_s})) {
+            return false;
+        }
+        println!("integrate: drained: every gate it ran recorded and landed; exiting");
+        true
+    }
+
+    /// Whether the drain has reached its bound at `now`.
+    fn drain_expired(&self, now: std::time::Instant) -> bool {
+        self.drain.borrow().as_ref().is_some_and(|drain| {
+            now.saturating_duration_since(drain.since) >= Duration::from_secs(drain.bound_s)
+        })
+    }
+
+    /// The drain's bound: the gates still running are halted (their
+    /// process groups killed, as a gate past its time limit is, and their
+    /// threads record nothing: [`gate::Halt`]), `integrator.drain_expired`
+    /// names their tasks, and the caller exits.
+    fn expire_drain(&self) {
+        self.reap();
+        let gates = self.gate_tasks();
+        for gate in self.running.borrow().iter() {
+            gate.halt.halt();
+        }
+        let bound_s = self.drain.borrow().as_ref().map_or(0, |drain| drain.bound_s);
+        self.record_own(&json!({
+            "type": "integrator.drain_expired", "gates": gates, "bound_s": bound_s,
+        }));
+        println!(
+            "integrate: the drain reached its bound of {bound_s} s: the gates of {} stopped, \
+             nothing recorded for them; exiting",
+            if gates.is_empty() {
+                "no task".to_string()
+            } else {
+                gates
+                    .iter()
+                    .map(|task| format!("task {task}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        );
     }
 
     /// Whether `task`'s gate backs off this pass ([`gate_wait`]), saying
@@ -2165,6 +2316,11 @@ impl Integrator {
             .lock()
             .map(|mut landed| landed.drain(..).collect())
             .unwrap_or_default();
+        // A drain starts no warm: the next integrator's gates warm their
+        // base themselves.
+        if self.draining() {
+            return;
+        }
         let mut warms = self.warms.borrow_mut();
         let Some(warms) = warms.as_mut() else {
             return;
@@ -2202,6 +2358,7 @@ impl Integrator {
     }
 
     fn pass(&self) -> Result<(), String> {
+        self.unlanded.set(false);
         self.reap();
         // A store per pass while no gate runs: the advisory lock belongs to
         // the connection, and is released with it. While one runs, its
@@ -2370,17 +2527,32 @@ impl Integrator {
         let mut ready = Vec::new();
         for mission in &missions {
             let source = mission.source.clone();
+            // A task to land that this pass does not land for good (not
+            // visited, landed or gone stale so the source moved, or an
+            // error) is left for the next pass: a drain waits for it.
+            let landing = mission.halted.is_none() && mission.landing().is_some();
             if source.as_ref().is_some_and(|source| moved.contains(source)) {
+                if landing {
+                    self.unlanded.set(true);
+                }
                 continue;
             }
             match self.mission(store, &missions, mission, pending, &mut ready) {
                 Ok(true) => {
+                    if landing {
+                        self.unlanded.set(true);
+                    }
                     if let Some(source) = source {
                         moved.insert(source);
                     }
                 }
                 Ok(false) => {}
-                Err(error) => eprintln!("integrate: mission {}: {error}", mission.id),
+                Err(error) => {
+                    if landing {
+                        self.unlanded.set(true);
+                    }
+                    eprintln!("integrate: mission {}: {error}", mission.id);
+                }
             }
         }
         ready.retain(|candidate: &Ready| !moved.contains(&candidate.source));
@@ -2399,6 +2571,11 @@ impl Integrator {
         // each takes its source's slot ahead of the source's ready tasks, never
         // a running judging's, within the same caps. Not on a source a task
         // landed on this pass: its main moved, and the next pass reads it.
+        // A drain starts no judging: the ready tasks and the gated owner's
+        // requests wait for the next integrator.
+        if self.draining() {
+            return Ok(());
+        }
         for request in owner_judge {
             if !moved.contains(&request.source) {
                 self.start_owner(store, &missions, request, at_once);
@@ -2506,9 +2683,12 @@ impl Integrator {
             mission.id,
             request.reason.clone(),
         );
+        let halt = Arc::new(gate::Halt::default());
+        let thread_halt = Arc::clone(&halt);
         let handle = std::thread::Builder::new()
             .name(format!("owner-gate-{id}"))
             .spawn(move || {
+                gate::halt_with(thread_halt);
                 let judged = judge.judge_owner(&store, &mirror, &gated, &request, jobs);
                 owner::judged(&said, id, &judged, &backoff, judge.host.backoff);
             });
@@ -2536,6 +2716,7 @@ impl Integrator {
             jobs: jobs.unwrap_or(0),
             owner: Some(id),
             stop: Arc::new(Stop::default()),
+            halt,
             handle,
         });
     }
@@ -2791,9 +2972,12 @@ impl Integrator {
         judge.stop = Some(Arc::clone(&stop));
         let task_id = task.id;
         let (store, source_owned) = (Arc::clone(store), source.clone());
+        let halt = Arc::new(gate::Halt::default());
+        let thread_halt = Arc::clone(&halt);
         let handle = std::thread::Builder::new()
             .name(format!("gate-{task_id}"))
             .spawn(move || {
+                gate::halt_with(thread_halt);
                 if let Some(stop) = &judge.stop {
                     gate::stop_with(Arc::clone(&stop.flag));
                 }
@@ -2832,6 +3016,7 @@ impl Integrator {
             jobs: jobs.unwrap_or(0),
             owner: None,
             stop,
+            halt,
             handle,
         });
         Ok(())
