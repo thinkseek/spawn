@@ -3023,6 +3023,10 @@ impl Judge {
         // first; the error when it could not be read.
         let moved: std::cell::OnceCell<Result<Option<String>, String>> = std::cell::OnceCell::new();
         let main_now = || moved.get_or_init(|| main_moved(source, main)).clone();
+        // What the candidate's gate run judged and where (objective 035's
+        // `inputs` and `env`, [`inputs`]), carried on the record of the
+        // verdict it gave: set as that run starts (`env` once it ended).
+        let bound: std::cell::RefCell<Option<(Value, Value)>> = std::cell::RefCell::new(None);
         let gated = |verdict: &str, extra: Value| -> Result<(), String> {
             // Stopped for an owner's urgent landing (D2): whatever the gate
             // found but an acceptance (which lands as usual), the judging is
@@ -3122,8 +3126,20 @@ impl Judge {
             if let Some(error) = unread {
                 record_value["main_read"] = json!(error);
             }
+            if let Some((inputs, env)) = bound.borrow().as_ref() {
+                record_value["inputs"] = inputs.clone();
+                record_value["env"] = env.clone();
+            }
             record(store, &record_value)?;
             println!("integrate: task {} gated: {verdict}", task.id);
+            // A verdict a gate run gave may be judged again on a runner,
+            // beside it ([`shadow`]): offered to the main thread, never
+            // waited for.
+            if let Some(want) = shadow::Want::of(&record_value, mirror, scenarios)
+                && let Ok(mut shadowed) = self.shadowed.lock()
+            {
+                shadowed.push(want);
+            }
             Ok(())
         };
         let rejected = |reason: &str, log: &str| gated("rejected", rejected_fields(reason, log));
@@ -3248,6 +3264,8 @@ impl Judge {
         // The candidate's gate run, measured: a crash in the test
         // database's log counts only inside this window.
         let started = now_ms();
+        let given = inputs::read(main, &candidate, scenarios, scenario.as_deref());
+        bound.replace(Some((given.clone(), Value::Null)));
         let (judged, base_check) = gate::judge_seeing_base_check(
             &gate_path,
             mirror,
@@ -3259,6 +3277,7 @@ impl Judge {
             gate_wall_clock(),
         );
         let ended = now_ms();
+        bound.replace(Some((given, inputs::env_here(gate_log(&judged)))));
         if let Ok(verdict) = &judged {
             flakes.replace(verdict.flakes.clone());
             red_scenarios.replace(verdict.main_red_scenarios.clone());
@@ -3597,6 +3616,23 @@ fn judged_or_aborted(
             "integrate: mission {mission}: task {}: record the abort: {error}",
             task.id
         ),
+    }
+}
+
+/// What a gate run printed, whatever it ended with; None for a gate that
+/// never ran (it could not start, or ran past its wall clock).
+fn gate_log(judged: &Result<gate::Verdict, GateFailure>) -> Option<&str> {
+    match judged {
+        Ok(verdict) => Some(&verdict.output),
+        Err(GateFailure::Timeout | GateFailure::Failed(_)) => None,
+        Err(
+            GateFailure::Aborted { log, .. }
+            | GateFailure::NoRoom { log, .. }
+            | GateFailure::HostFault { log, .. }
+            | GateFailure::MainRed { log, .. }
+            | GateFailure::CannotJudge { log, .. }
+            | GateFailure::BaseDisagrees { log, .. },
+        ) => Some(log),
     }
 }
 
