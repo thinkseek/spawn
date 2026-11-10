@@ -2,11 +2,12 @@ import { useMemo, useState } from "react";
 import { ChevronRight } from "lucide-react";
 
 import type { Alert, PollResult } from "../../api";
+import { fetchAlertsSince, usePoll } from "../../api";
 import type { Attention } from "../../attention";
 import type { Fleet } from "../../fleet";
 import { relativeTime } from "../../format";
 import type { NeedItem } from "../../home";
-import { agentNames, agentsNow, digestSince, digestWindow, latestNotes, missionsToday, needsSummary } from "../../home";
+import { agentNames, agentsNow, alertsSpanMs, digestSince, digestWindow, latestNotes, missionsToday, needsSummary } from "../../home";
 import type { Missions } from "../../missions";
 import type { FleetContext } from "../../ordering";
 import { groupAgents, missingAlwaysOn, residentName, usualEngine } from "../../ordering";
@@ -97,7 +98,11 @@ export function FleetView({
   const now = Date.now();
   // What happened while the reader was away: at least the last 24 h (design §3 Q4).
   const away = useAway();
-  const digestSpan = digestWindow(now, away);
+  const digestSpan = digestWindow(now, away?.from ?? null);
+  // The alerts as far back as the digest reads (the shared poll holds the
+  // server's 24 h); slow, since news of days ago does not move by the second.
+  const span = alertsSpanMs(now, digestSpan.since);
+  const digestAlerts = usePoll(`alerts:since:${span}`, (signal) => fetchAlertsSince(span, signal), 60_000);
 
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-page-canvas">
@@ -149,7 +154,10 @@ export function FleetView({
                 />
               }
             />
-            <DigestCard digest={digestSince(missions, alerts, now, digestSpan.since, agents ?? null, digestSpan.away)} now={now} />
+            <DigestCard
+              digest={digestSince(missions, digestAlerts.data ?? alerts, now, digestSpan.since, agents ?? null, digestSpan.away)}
+              back={away?.at ?? null}
+            />
             <button
               type="button"
               onClick={() => setDetailsOpen((value) => !value)}

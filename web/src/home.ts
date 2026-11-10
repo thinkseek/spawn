@@ -619,6 +619,14 @@ export function digestWindow(now: number, away: number | null): { since: number;
   return { since: Math.max(away, now - DIGEST_CAP_MS), away: true };
 }
 
+/** How far back the digest asks for alerts (`/api/alerts?since=`): its
+ * window, in whole hours rounded up (so the poll's key changes at most once
+ * an hour), and never under the server's own 24 h. */
+export function alertsSpanMs(now: number, since: number): number {
+  const hours = Math.ceil(Math.max(0, now - since) / 3_600_000);
+  return Math.max(hours * 3_600_000, DIGEST_FLOOR_MS);
+}
+
 export type DigestKind = "landed" | "sent back" | "stopped" | "moved" | "mission" | "alert";
 
 export interface DigestEntry {

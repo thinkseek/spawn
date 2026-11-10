@@ -14,6 +14,7 @@ import {
   agentsNow,
   alertMoot,
   alertStale,
+  alertsSpanMs,
   awayFrom,
   digestBand,
   digestSince,
@@ -611,4 +612,21 @@ test("lines are grouped by when: last hour, earlier today, yesterday, then the d
     now - 24 * HOUR,
   );
   assert.deepEqual(digest.bands.map((band) => [band.label, band.entries.length]), [["Last hour", 1], ["Earlier today", 2]]);
+});
+
+test("the digest asks for alerts as far back as it reads, in whole hours, never under 24 h", () => {
+  assert.equal(alertsSpanMs(NOW, NOW - 24 * HOUR), 24 * HOUR);
+  assert.equal(alertsSpanMs(NOW, NOW - 3 * HOUR), 24 * HOUR, "the server's own window at least");
+  assert.equal(alertsSpanMs(NOW, NOW - 50 * HOUR - MIN), 51 * HOUR, "rounded up");
+  assert.equal(alertsSpanMs(NOW, NOW - 7 * 24 * HOUR), 7 * 24 * HOUR);
+});
+
+test("a 3-day digest holds an alert that fired and cleared 2 days ago (rev-f F1)", () => {
+  const cleared = alert("j", "judge_down", "jev", { state: "cleared", fired_at_ms: NOW - 48 * HOUR, cleared_at_ms: NOW - 47 * HOUR });
+  const away = digestSince(missions([]), [cleared], NOW, NOW - 72 * HOUR, null, true);
+  assert.equal(away.alerts, 1);
+  assert.equal(away.entries[0].text, "The model judge answers no call · jev (cleared)");
+  assert.deepEqual(away.bands.map((band) => band.entries.length), [1]);
+  // The last 24 h does not.
+  assert.equal(digestSince(missions([]), [cleared], NOW, NOW - 24 * HOUR).alerts, 0);
 });

@@ -481,6 +481,12 @@ export async function fetchAlerts(signal: AbortSignal): Promise<Alert[]> {
   return readApi("/api/alerts", signal, normalizeAlerts);
 }
 
+/** The same, over the last `spanMs` (the server's window is 24 h unless
+ * asked): home's digest reads as far back as the reader was away. */
+export async function fetchAlertsSince(spanMs: number, signal: AbortSignal): Promise<Alert[]> {
+  return readApi(`/api/alerts?since=${Math.max(1, Math.round(spanMs))}`, signal, normalizeAlerts);
+}
+
 export async function fetchSession(
   id: string,
   signal: AbortSignal,

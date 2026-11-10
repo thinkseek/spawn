@@ -306,34 +306,51 @@ function writeSeen(at: number) {
   }
 }
 
+/** An absence: when the reader went away, and when they came back. */
+export interface Away {
+  from: number;
+  at: number;
+}
+
 /**
  * When the reader went away (design §3 Q4): the last time the page was
- * seen, if that was 30 min or more before it was opened or shown again;
- * else null. "Seen" is kept in the browser: every minute while the page is
- * visible, and as it is hidden or closed.
+ * seen, if that was 30 min or more before it was opened, shown or focused
+ * again; else null. "Seen" is kept in the browser: each minute while the
+ * page is visible and has focus (a tab merely left open elsewhere is not
+ * the reader looking), and as it is hidden or closed.
  */
-export function useAway(): number | null {
-  const [away, setAway] = useState<number | null>(() => awayFrom(readSeen(), Date.now()));
+export function useAway(): Away | null {
+  const [away, setAway] = useState<Away | null>(() => {
+    const now = Date.now();
+    const from = awayFrom(readSeen(), now);
+    return from === null ? null : { from, at: now };
+  });
   useEffect(() => {
+    const looking = () => document.visibilityState === "visible" && document.hasFocus();
     const seen = () => writeSeen(Date.now());
-    const onVisibility = () => {
-      if (document.visibilityState === "hidden") {
-        seen();
-        return;
-      }
-      const from = awayFrom(readSeen(), Date.now());
-      if (from !== null) setAway(from);
+    const back = () => {
+      const now = Date.now();
+      const from = awayFrom(readSeen(), now);
+      if (from !== null) setAway({ from, at: now });
       seen();
     };
-    if (document.visibilityState === "visible") seen();
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") seen();
+      else if (looking()) back();
+    };
+    if (looking()) seen();
     const timer = window.setInterval(() => {
-      if (document.visibilityState === "visible") seen();
+      if (looking()) seen();
     }, 60_000);
     document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("focus", back);
+    window.addEventListener("blur", seen);
     window.addEventListener("pagehide", seen);
     return () => {
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("focus", back);
+      window.removeEventListener("blur", seen);
       window.removeEventListener("pagehide", seen);
     };
   }, []);
@@ -361,9 +378,11 @@ function awaySpan(ms: number): string {
 /** What happened while the reader was away (at least the last 24 h): one
  * line per task, mission change and alert, grouped by when. Folded to its
  * counts; the task notices themselves are on the Alerts page. */
-export function DigestCard({ digest, now }: { digest: Digest; now: number }) {
+export function DigestCard({ digest, back }: { digest: Digest; back: number | null }) {
   const [open, setOpen] = useState(false);
-  const title = digest.away ? `Since you were away · ${awaySpan(now - digest.since_ms)}` : "Today";
+  // How long the reader was away, said as of their return: it does not grow
+  // while they read.
+  const title = digest.away ? `Since you were away · ${awaySpan((back ?? Date.now()) - digest.since_ms)}` : "Today";
   return (
     <Card>
       <button
