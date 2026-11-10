@@ -10,11 +10,13 @@
 use std::time::Duration;
 
 use postgres::error::SqlState;
-use spawn_core::command::{CommandAction, Submission};
-use spawn_core::event::{CommandStep, EventKind, NewEvent, Source};
-use spawn_core::id::{AgentId, CommandId, IdempotencyKey, Principal, SessionId};
+use spawn_core::command::{CommandAction, NamedKey, Submission};
+use spawn_core::event::{CommandStep, ENGINE, EventKind, ModelProfile, NewEvent, Source};
+use spawn_core::id::{
+    AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, WorkspaceId,
+};
 use spawn_core::port::{CommandQueue, EventLog};
-use spawn_postgres::{PostgresStore, role_url};
+use spawn_postgres::{HumanInput, HumanKey, PostgresStore, role_url};
 
 mod common;
 use common::{admin, schema_url, store};
@@ -86,10 +88,12 @@ fn a_persons_input_from_the_page_is_the_command_spawn_submit_makes() {
     seen(&store);
     let page = human(&schema);
     let text = "Stop objective_87, then report.\nThanks";
-    let id = page
+    let HumanInput::Submitted(id) = page
         .submit_human_input(&session(), &key("web-1"), text)
         .expect("typed")
-        .expect("the session has an agent");
+    else {
+        panic!("the session has an agent");
+    };
 
     let action = CommandAction::Input {
         text: text.to_string(),
@@ -112,7 +116,7 @@ fn a_persons_input_from_the_page_is_the_command_spawn_submit_makes() {
     assert_eq!(
         page.submit_human_input(&session(), &key("web-1"), text)
             .expect("retried"),
-        Some(id)
+        HumanInput::Submitted(id)
     );
     // The same rule as `spawn submit --principal human --key web-1`: one
     // principal, one key, one command.
@@ -135,7 +139,7 @@ fn a_persons_input_from_the_page_is_the_command_spawn_submit_makes() {
     assert_eq!(
         page.submit_human_input(&unknown, &key("web-2"), "hello")
             .expect("answered"),
-        None
+        HumanInput::NoAgent
     );
     assert_eq!(commands(&schema).len(), 1);
 
@@ -169,6 +173,108 @@ fn a_persons_input_from_the_page_is_the_command_spawn_submit_makes() {
         .expect("the Bridge's waiting step");
     assert_eq!(shown(&store)[0]["waiting"], true);
     assert_eq!(shown(&store)[0]["state"], "pending");
+}
+
+/// GitHub #16 item 8: a key one session's input used, sent for another
+/// session, with other text or as a named key, is not that command again
+/// (it was: `session_b` was answered with `session_supervisor`'s command 1
+/// and got nothing). It is refused in the store's words, nothing is
+/// recorded, and the first command is untouched; the request that made it
+/// still gets it back, and the second session types under a key of its own.
+#[test]
+fn a_key_used_for_one_session_is_refused_for_another() {
+    let (store, schema) = store("human_input_cross");
+    seen(&store);
+    let other = SessionId::new("session_b").expect("valid session");
+    store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_b").expect("valid agent"),
+            session_id: other.clone(),
+            execution_id: Some(ExecutionId::new("exec_b").expect("valid execution")),
+            source: Source::Bridge,
+            source_event_id: Some("exec_b:started".to_string()),
+            kind: EventKind::ExecutionStarted {
+                engine: ENGINE.to_string(),
+                workspace: WorkspaceId::new("1:/workspaces/b").expect("valid workspace"),
+                command_id: CommandId(1),
+                fork: None,
+                model: ModelProfile::Default,
+                transcript_from: None,
+            },
+        })
+        .expect("append");
+    let page = human(&schema);
+    let first = page
+        .submit_human_input(&session(), &key("shared-key"), "for A")
+        .expect("typed");
+    assert!(matches!(first, HumanInput::Submitted(_)), "{first:?}");
+    let used = "idempotency key 'shared-key' was already used for another input or key: send \
+                this one with a new key";
+    assert_eq!(
+        page.submit_human_input(&other, &key("shared-key"), "for B")
+            .expect("answered"),
+        HumanInput::KeyUsed(used.to_string()),
+        "another session's key"
+    );
+    assert_eq!(
+        page.submit_human_input(&session(), &key("shared-key"), "for A, changed")
+            .expect("answered"),
+        HumanInput::KeyUsed(used.to_string()),
+        "the same session, other text"
+    );
+    assert_eq!(
+        page.submit_human_key(&other, &key("shared-key"), NamedKey::Enter)
+            .expect("answered"),
+        HumanKey::KeyUsed(used.to_string()),
+        "an input's key is no named key's"
+    );
+    let rows = commands(&schema);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].3, SESSION);
+    assert_eq!(rows[0].4["text"], "for A");
+
+    // The request that made it still gets its command, and a session that
+    // was refused types under a key of its own.
+    assert_eq!(
+        page.submit_human_input(&session(), &key("shared-key"), "for A")
+            .expect("retried"),
+        first
+    );
+    let own = page
+        .submit_human_input(&other, &key("key-b"), "for B")
+        .expect("typed");
+    assert!(matches!(own, HumanInput::Submitted(_)) && own != first);
+
+    // A named key's idempotency key is its session's and its name's too.
+    let HumanKey::Submitted(pressed) = page
+        .submit_human_key(&other, &key("key-k"), NamedKey::Down)
+        .expect("pressed")
+    else {
+        panic!("session_b runs an execution");
+    };
+    assert_eq!(
+        page.submit_human_key(&other, &key("key-k"), NamedKey::Up)
+            .expect("answered"),
+        HumanKey::KeyUsed(used.replace("shared-key", "key-k")),
+        "the same session, another name"
+    );
+    assert_eq!(
+        page.submit_human_input(&session(), &key("key-k"), "down")
+            .expect("answered"),
+        HumanInput::KeyUsed(used.replace("shared-key", "key-k")),
+        "a named key's key is no input's"
+    );
+    assert_eq!(
+        page.submit_human_key(&other, &key("key-k"), NamedKey::Down)
+            .expect("retried"),
+        HumanKey::Submitted(pressed)
+    );
+    let rows = commands(&schema);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(
+        (rows[1].3.as_str(), &rows[1].4["text"]),
+        ("session_b", &serde_json::json!("for B"))
+    );
 }
 
 /// What `spawn_human_input` refuses, whoever calls it: blank text, text

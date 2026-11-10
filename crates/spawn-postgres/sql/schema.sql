@@ -1137,12 +1137,42 @@ insert into spawn_grants (principal, agent_id, scope) values
     ('spawn_supervisor', 'agent_worker_*', 'all')
 on conflict (principal, agent_id) do nothing;
 
+-- A person's idempotency key answers with its first command only for the
+-- request that made it: the same session and the same action (GitHub #16
+-- item 8). `spawn_submit` returns the command of `(principal, key)` whatever
+-- session and action it was made for, so a key one session's input used,
+-- sent again for another session or with other text, was answered with that
+-- first command: the page read success and the second session got nothing.
+-- `p_id` is the command `spawn_submit` returned (or the one found) for
+-- `p_key`: returned when it is this request's, refused otherwise with
+-- SQLSTATE 23505, which the page answers 409, and nothing is recorded. The
+-- refusal names no session and no text: the `spawn_human` login reads
+-- nothing. Checked after `spawn_submit`, under its lock, so two first uses
+-- of one key that race are told apart too. No row changes: commands made
+-- before this keep their keys and replay as before for their own request.
+create or replace function spawn_human_replay(p_id bigint, p_key text, p_session text,
+                                              p_action jsonb)
+returns bigint language plpgsql as $$
+begin
+    if not exists (select 1 from spawn_commands c
+                    where c.id = p_id and c.principal = 'human'
+                      and c.session_id = p_session and c.action = p_action) then
+        raise exception 'idempotency key % was already used for another input or key: send this one with a new key',
+            quote_literal(p_key) using errcode = '23505';
+    end if;
+    return p_id;
+end $$;
+
+revoke execute on function spawn_human_replay(bigint, text, text, jsonb) from public;
+
 -- A person's input from the web page (`spawn serve`, `POST
 -- /api/session/<id>/input`): the command `spawn submit --principal human
 -- --agent <the session's agent> --session <id> --key <key> --action
 -- '{"type":"input","text":<text>}'` makes, through the same `spawn_submit`
 -- with the same idempotency rule (a repeated key of `human` returns the
--- first command and makes none). Like every input of a person it waits for
+-- first command and makes none), for the same session and text only: the
+-- key of another session's input, or of other text, is refused
+-- (`spawn_human_replay`, SQLSTATE 23505). Like every input of a person it waits for
 -- the session's turn (crates/spawn-core/src/bridge.rs). The agent is the one
 -- the session belongs to (`spawn_agent_sessions`): the caller cannot pair a
 -- session with another agent. Returns the command, or null when no agent
@@ -1156,6 +1186,7 @@ create or replace function spawn_human_input(p_session text, p_key text, p_text 
 returns bigint language plpgsql security definer as $$
 declare
     v_agent text;
+    v_action jsonb;
 begin
     if spawn_principal() is distinct from 'human' then
         raise exception '% may not type as a person (only the spawn_human login does)',
@@ -1180,9 +1211,9 @@ begin
     if v_agent is null then
         return null;
     end if;
-    return (select s.out_id
-              from spawn_submit('human', p_key, v_agent, p_session,
-                                jsonb_build_object('type', 'input', 'text', p_text)) s);
+    v_action := jsonb_build_object('type', 'input', 'text', p_text);
+    return (select spawn_human_replay(s.out_id, p_key, p_session, v_action)
+              from spawn_submit('human', p_key, v_agent, p_session, v_action) s);
 end $$;
 
 do $$
@@ -1205,7 +1236,9 @@ $$;
 -- the session. A key needs a running engine: a session with no live
 -- execution is refused here with the reason (SQLSTATE 55000, which the page
 -- answers 409), and records no command, since nothing reached an agent; a
--- repeated key returns its first command even if the session stopped since.
+-- repeated key returns its first command even if the session stopped since,
+-- for the same session and name only (`spawn_human_replay`, SQLSTATE 23505
+-- otherwise).
 -- (The Bridge still fails, on the record, a key that loses the race against
 -- the execution's end.) Only the `spawn_human` login may call it, beside
 -- `spawn_human_input`.
@@ -1214,6 +1247,7 @@ returns bigint language plpgsql security definer as $$
 declare
     v_agent text;
     v_first bigint;
+    v_action jsonb;
 begin
     if spawn_principal() is distinct from 'human' then
         raise exception '% may not press keys as a person (only the spawn_human login does)',
@@ -1233,16 +1267,16 @@ begin
     end if;
     select c.id into v_first from spawn_commands c
      where c.principal = 'human' and c.idempotency_key = p_key;
+    v_action := jsonb_build_object('type', 'key', 'key', p_name);
     if v_first is not null then
-        return v_first;
+        return spawn_human_replay(v_first, p_key, p_session, v_action);
     end if;
     if not exists (select 1 from agent_status a where a.session_id = p_session and a.live) then
         raise exception '% runs no execution: a key needs a running engine; resume the session',
             p_session using errcode = '55000';
     end if;
-    return (select s.out_id
-              from spawn_submit('human', p_key, v_agent, p_session,
-                                jsonb_build_object('type', 'key', 'key', p_name)) s);
+    return (select spawn_human_replay(s.out_id, p_key, p_session, v_action)
+              from spawn_submit('human', p_key, v_agent, p_session, v_action) s);
 end $$;
 
 do $$

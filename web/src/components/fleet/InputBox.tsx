@@ -15,12 +15,15 @@ import { fetchCommands } from "../../fleet";
 import { clockTime } from "../../format";
 import type { CommandState, Progress, Sent, Writable } from "../../input";
 import {
+  keepsKey,
   newKey,
   probeVerdict,
   progress,
   sendAnswer,
+  serialPoll,
   settled,
   textProblem,
+  withOutcomes,
   withSent,
 } from "../../input";
 import { cx } from "../ui";
@@ -37,6 +40,9 @@ const MAX_HEIGHT = 200;
  * when this page may not type. A view that already polls the session's
  * commands passes its reading (`commands`), so the box and that view never
  * disagree; without it the box reads them itself while a message is open.
+ * Either reading is the session's latest few commands: what a message ended
+ * as is kept on it, so it stays typed when newer commands push its own off
+ * that list.
  */
 export function InputBox({
   sessionId,
@@ -65,6 +71,9 @@ export function InputBox({
   const [problem, setProblem] = useState<string | null>(null);
   const own = useCommandsWhile(sessionId, sent, shared === undefined);
   const commands = shared === undefined ? own : shared;
+  useEffect(() => {
+    setSent((list) => withOutcomes(list, commands));
+  }, [commands]);
   const area = useRef<HTMLTextAreaElement>(null);
   const id = useId();
 
@@ -101,7 +110,8 @@ export function InputBox({
       setRetry(null);
     } else {
       setSent((list) => withSent(list, { ...entry, error: verdict.error }));
-      setRetry({ text: body, key });
+      // A key the server holds for another message is not tried again.
+      setRetry(keepsKey(verdict.status) ? { text: body, key } : null);
       if (verdict.status === 401 || verdict.status === 403) setRefusedBy(verdict.error);
     }
     setSending(false);
@@ -211,7 +221,9 @@ export function useWritable(sessionId: string): Writable {
 }
 
 /** The session's commands, read every 2 s while a message in `sent` is
- * not settled and `enabled`; the last reading otherwise. */
+ * not settled and `enabled`; the last reading otherwise. One request at a
+ * time, and no answer taken after the reading stopped ([`serialPoll`]): a
+ * read may take the server ten seconds. */
 function useCommandsWhile(
   sessionId: string,
   sent: readonly Sent[],
@@ -221,18 +233,14 @@ function useCommandsWhile(
   const open = enabled && sent.some((entry) => !settled(progress(entry, commands)));
   useEffect(() => {
     if (!open) return;
-    const controller = new AbortController();
-    const read = async () => {
-      try {
-        setCommands(await fetchCommands(sessionId, controller.signal, 20));
-      } catch {
-        // Keep the last reading; the next one may succeed.
-      }
-    };
-    void read();
-    const timer = window.setInterval(() => void read(), 2_000);
+    const poll = serialPoll(
+      (signal) => fetchCommands(sessionId, signal, 20),
+      (read: CommandState[]) => setCommands(read),
+    );
+    void poll.tick();
+    const timer = window.setInterval(() => void poll.tick(), 2_000);
     return () => {
-      controller.abort();
+      poll.stop();
       window.clearInterval(timer);
     };
   }, [open, sessionId]);

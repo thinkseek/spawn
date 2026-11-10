@@ -1083,6 +1083,10 @@ and, with no token set at all, a client socket the owner's uid holds;
 `Content-Type: application/json` (415), which no form can send without a
 preflight; a body of at most 16 KiB (413); a key and a text a person types:
 not blank, at most 8 KiB, no control character but tab and line ends (400).
+A key answers with its first command only for the request that made it (the
+same session and text, or key name): sent for another session or with other
+content it is 409, makes no command, and the page takes a new key
+(`spawn_human_replay`).
 
 The second is a person's named key, `POST /api/session/<id>/key` with
 `{"name", "key"}` (§3, "Named keys never wait"): the command `spawn submit
