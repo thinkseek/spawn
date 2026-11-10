@@ -1379,7 +1379,11 @@ create table if not exists mission_tasks (
     -- The task this one continues (its `task.assigned` names it): the
     -- objective's task after one that went over its budget keeps that
     -- task's work (`task.over_budget`, docs/fleet-architecture.md §10.4).
-    continues       bigint
+    continues       bigint,
+    -- The task this one takes over (its `task.assigned` names it): a
+    -- delivered task moved to a fresh worker whose branch starts from the
+    -- old worker's last checkpoint (`spawn_task_reassign`).
+    reassign_of     bigint
 );
 
 -- Columns added since the first shape of these tables (see spawn_grants).
@@ -1415,6 +1419,7 @@ alter table mission_tasks add column if not exists model text not null default '
 alter table mission_tasks add column if not exists held_by bigint;
 alter table mission_tasks add column if not exists reissue_of bigint;
 alter table mission_tasks add column if not exists continues bigint;
+alter table mission_tasks add column if not exists reassign_of bigint;
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
@@ -1600,13 +1605,13 @@ begin
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
                                    created_by, objective, scenario, model, reissue_of,
-                                   continues, created_at_ms, updated_at_ms)
+                                   continues, reassign_of, created_at_ms, updated_at_ms)
         values (v_id, (p_record ->> 'mission_id')::bigint, p_record ->> 'kind',
                 p_record ->> 'agent_id', p_record ->> 'session_id', p_record ->> 'brief',
                 p_record ->> 'created_by', (p_record ->> 'objective')::integer,
                 p_record ->> 'scenario', coalesce(p_record ->> 'model', 'default'),
                 (p_record ->> 'reissue_of')::bigint, (p_record ->> 'continues')::bigint,
-                p_at, p_at);
+                (p_record ->> 'reassign_of')::bigint, p_at, p_at);
         update mission_missions set state = 'active', updated_at_ms = p_at
          where id = (p_record ->> 'mission_id')::bigint and state = 'open';
     when 'mission.configured' then
@@ -1991,6 +1996,12 @@ begin
         -- The wait an interruption opened is over: what showed the cause
         -- gone and how long it held. Read from the log, folded into no
         -- table (spawn_host_record).
+        null;
+    when 'task.restarted' then
+        -- A delivered task's worker is given a fresh execution of its own
+        -- native session (spawn_task_restart): the dispatcher stops the
+        -- running one and resumes the session, reading the record from the
+        -- log. The task stays delivered, so nothing is folded.
         null;
     when 'task.report_unfinished' then
         -- A report still a draft, not taken (spawn_task_report_unfinished):
@@ -3689,7 +3700,8 @@ begin
         if v_cause is null or v_cause not in (
                'exited', 'crashed', 'memory_limit', 'context_exhausted',
                'model_unavailable', 'model_auth', 'model_error', 'host_restart',
-               'database_unavailable', 'disk_full', 'budget', 'stopped') then
+               'database_unavailable', 'disk_full', 'budget', 'stopped', 'restarted',
+               'reassigned') then
             raise exception 'not an interruption cause: %', v_cause
                 using errcode = '22023';
         end if;
