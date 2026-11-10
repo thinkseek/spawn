@@ -36,8 +36,13 @@ pub(crate) const CLOCK: &str = "select coalesce(max(id), 0), spawn_now_ms() from
 /// and the open alerts' `$4` whose session recorded a `message.taken` or an
 /// `execution.ended` at or after `$5` (what clears one).
 pub(crate) const MESSAGES_SINCE: &str = r"
-with candidates as (
-  select k.* from spawn_commands k where k.id > $2
+with fresh as (select k.* from spawn_commands k where k.id > $2),
+candidates as (
+  -- A session whose transcript never held a marker tracks nothing
+  -- (`spawn_command_message`): its new commands are not read further.
+  select k.* from fresh k
+   where exists (select 1 from spawn_events e
+                  where e.session_id = k.session_id and e.event_name = 'message.taken')
   union
   select k.* from spawn_commands k where cardinality($3::bigint[]) > 0 and k.id = any($3)
   union
@@ -48,7 +53,7 @@ with candidates as (
                              and e.recorded_at_ms >= $5))
 select jsonb_build_object(
   'now_ms', spawn_now_ms(),
-  'max_id', greatest($2, coalesce((select max(id) from candidates), $2)),
+  'max_id', greatest($2, coalesce((select max(id) from fresh), $2)),
   'messages', coalesce((select jsonb_agg(x.row order by x.id) from (
       select k.id, jsonb_build_object(
                'command_id', k.id, 'agent_id', k.agent_id, 'session_id', k.session_id,
