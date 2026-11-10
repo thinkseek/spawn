@@ -31,7 +31,15 @@
 # Bridge then asks each terminal on its own). An error says nothing about a
 # terminal, so the Bridge leaves that execution as it is until the hold is
 # lifted: the order of the two ends is fixed, without timing. The hold
-# changes nothing true of the terminal: it died with the server.
+# changes nothing true of the terminal: it died with the server. While
+# `slow-start` exists and no server answers, the wrapper waits 3.5 s before
+# a `new-session` (the call that starts a server), as a launch on a loaded
+# host may: the Bridge records an execution before it starts its terminal,
+# so the server `first`'s resume starts is younger than that execution's
+# record by more than 2 s (the harness checks it, exit 2 otherwise), and a
+# rule that compares the server's start with the record's time, with any
+# margin under that, reads the server that runs the resumed execution as
+# gone.
 # SPAWN_RECOVER_BACKOFF_SECS=2. Checked:
 #   (1) the host restarts: the loop is stopped as systemd stops it (SIGTERM,
 #       its pass finished), the terminal server is killed with both engines
@@ -41,18 +49,20 @@
 #       `recover-<execution>-<attempt>`; its engine works again in its own
 #       native session within 20 s of the loop's start, with every line it
 #       had written. Then a new terminal server answers (the resume started
-#       it), and `second`'s execution has no recorded end and no
-#       interruption (the harness checks the hold held: exit 2 otherwise).
+#       it, 3.5 s into its launch), and `second`'s execution has no recorded
+#       end and no interruption (the harness checks the hold held: exit 2
+#       otherwise).
 #   (2) the second end: the hold is lifted. `second`: an
 #       `execution.interrupted`, cause `host_restart` (evidence:
 #       terminal_server `gone`), path `resume`, its resume by key, its engine
 #       working again in its own native session within 20 s of the hold's
 #       end, with every line.
 #   (3) a crash is still a crash: with the new server running, `first`'s
-#       resumed engine is killed (SIGKILL): its execution is recorded cause
-#       `crashed`, path `resume`, never `host_restart` (the server that ran it
-#       still answers), and its engine works again within 20 s, with every
-#       line.
+#       resumed engine (the execution recorded before the slow launch that
+#       started the server) is killed (SIGKILL): its execution is recorded
+#       cause `crashed`, path `resume`, never `host_restart` (the server that
+#       ran it still answers), and its engine works again within 20 s, with
+#       every line.
 #   (4) no work lost: each worker's branch holds work.txt as `work 1..n`.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
@@ -63,11 +73,12 @@
 # after `first`'s resume started a new terminal server, is recorded cause
 # `crashed` (evidence: its terminal is gone, no exit status), not
 # `host_restart`. It passes once whether an execution's terminal server is
-# gone is told from the server that ran it (for example its start time
-# against the execution's, allowing for the launch: an execution is
-# recorded before its terminal, which may start the server, starts), not
-# from whether some server answers when the end is processed. A comparison
-# that does not allow for the launch fails (3) in some runs (1 in 3 here).
+# gone is told from the server that ran it (its identity read when the
+# execution's terminal started, or compared with an event recorded after
+# that start), not from whether some server answers when the end is
+# processed, nor from the execution's record time: a comparison of the
+# server's start with the record, with or without a margin of 2 s, fails
+# (3) on every run.
 # Runs inside the gate's sandbox (scripts/rsi/gate.sh): needs SPAWN_BIN,
 # SPAWN_TEST_DATABASE_URL, tmux and jq; creates and drops its own database,
 # uses a private tmux socket, loopback only. Every wait is bounded in time.
@@ -289,12 +300,21 @@ done
 ENGINE
 chmod 755 "$WORK/claude"
 
-# Spawn's tmux, on the private socket. While `hold` names a terminal, a call
+# Spawn's tmux, on the private socket. While `slow-start` exists, a
+# `new-session` while no server answers waits 3.5 s first. While `hold` names a terminal, a call
 # that names it (as a target `=<terminal>:`, `=<terminal>`, or its paste
 # buffer `spawn-<terminal>`) and `list-panes -a` exit 3, as a server that
 # cannot answer: the Bridge leaves that execution as it is.
 cat >"$WORK/tmux" <<EOF
 #!/bin/sh
+if [ -f '$WORK/slow-start' ]; then
+    for arg in "\$@"; do
+        if [ "\$arg" = new-session ] && ! '$real_tmux' -L '$SPAWN_TMUX_SOCKET' list-sessions >/dev/null 2>&1; then
+            sleep 3.5
+            break
+        fi
+    done
+fi
 if [ -s '$WORK/hold' ]; then
     held=\$(cat '$WORK/hold')
     all=""
@@ -536,6 +556,7 @@ restart=$(now_ms)
 # then the terminal server dies with every engine in it.
 stop_loop
 printf 'spawn-%s\n' "$(get second exec)" >"$WORK/hold"
+: >"$WORK/slow-start"
 "$real_tmux" -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
 sleep 2
 server_answers && harness "the terminal server still answers after it was killed"
@@ -550,6 +571,15 @@ server_answers || harness "no terminal server answers after first's resume"
     harness "second's end was recorded while its terminal was held: the order is not the one under test"
 [ -z "$(interrupted "$(get second exec)")" ] ||
     harness "second's execution was interrupted while its terminal was held"
+rm -f "$WORK/slow-start"
+# The slow launch held: the new server started more than 2 s after the
+# record of the execution it runs (first's resumed one).
+resumed_exec=$(live_exec "$(get first session)")
+resumed_at=$(q "select started_at_ms from agent_executions where execution_id = '$resumed_exec'")
+server_at=$("$real_tmux" -L "$SPAWN_TMUX_SOCKET" display-message -p '#{start_time}' 2>/dev/null || true)
+[ -n "$resumed_at" ] && [ -n "$server_at" ] && [ "$((server_at * 1000))" -gt "$((resumed_at + 2000))" ] ||
+    harness "the new server (start ${server_at:-?} s) is not more than 2 s younger than $resumed_exec's record (${resumed_at:-?} ms): the slow launch did not hold"
+note "(1) the new server started $(secs $((server_at * 1000 - resumed_at))) s (whole seconds) after $resumed_exec's record"
 
 # --- (2) the second end, with a new server up ---------------------------------------------
 
