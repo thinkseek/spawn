@@ -19,6 +19,19 @@
 //! the notice names both commits. The set-aside is recorded as the agent's
 //! checkpoint (`artifact.committed`, reason `set_aside`, key
 //! `set-aside:<task>`, so it is done once) and published like any.
+//!
+//! The branch moves before the record, as for every commit. When the append
+//! fails the dispatcher holds the notice and tries again on a later pass:
+//! the store answers that pass with the set-aside it already made while it
+//! is still the branch head (the message below names the task), so it is
+//! recorded and pushed then. Should a checkpoint land on top before that
+//! pass (a late write of the stopped worker), the pass sets that aside too,
+//! with a commit of its own, and records that one: the first stays in the
+//! branch's history without a record.
+//!
+//! A file the checkpoints leave out (over the size cap, a special file) is
+//! in no commit: the set-aside leaves it in the workspace, and the notice
+//! says so ([`note`]).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -26,7 +39,7 @@ use std::sync::Arc;
 use spawn_core::event::{ArtifactRef, CheckpointReason, EventKind, NewEvent, Source};
 use spawn_core::id::{AgentId, BranchName, CommitId, SessionId};
 use spawn_core::port::{EventLog, SetAside, WorkspaceStore};
-use spawn_host::GitWorkspace;
+use spawn_host::{GitWorkspace, SET_ASIDE_FILES};
 use spawn_postgres::PostgresStore;
 
 use crate::deliver::Cancelled;
@@ -49,10 +62,13 @@ pub(crate) fn note(task: i64, done: &Done) -> String {
         Done::SetAside { commit, kept } => format!(
             "Its work was set aside, not lost: commit {kept} on your branch holds it, and \
              commit {commit} on top of it returned your workspace to the checkpoint task #{task} \
-             started from. None of it is in your workspace now; do not redo it."
+             started from. None of it is in your workspace now, except files a checkpoint \
+             leaves out (over the size cap, or not regular files): those are on no branch and \
+             stay where they are, and one that was in the way of a file of that checkpoint is \
+             under `{SET_ASIDE_FILES}/{kept}/`. Do not redo the work."
         ),
         Done::Nothing => {
-            format!("Task #{task} changed nothing in your workspace, so nothing was set aside.")
+            format!("Task #{task} changed nothing a checkpoint holds, so nothing was set aside.")
         }
         Done::NoBranch => String::new(),
     }
@@ -104,6 +120,7 @@ pub(crate) fn set_aside(
         .map_err(|error| format!("set aside the work of task #{}: {error}", cancelled.id))?
     {
         SetAside::Unchanged => Done::Nothing,
+        // Made now, or by a pass whose record failed.
         SetAside::Created {
             commit,
             kept,
@@ -182,6 +199,7 @@ mod tests {
         assert!(text.contains("beef"), "{text}");
         assert!(text.contains("c0ffee"), "{text}");
         assert!(text.contains("task #7"), "{text}");
+        assert!(text.contains(".spawn/set-aside/beef/"), "{text}");
         assert!(note(7, &Done::Nothing).contains("nothing was set aside"));
         assert!(note(7, &Done::NoBranch).is_empty());
     }
