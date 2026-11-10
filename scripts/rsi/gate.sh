@@ -4,6 +4,7 @@
 #
 # usage: gate.sh <bare-repo> <base-commit> <candidate-commit> <scenarios-dir> [<scenario>]
 #        gate.sh --base-only <bare-repo> <base-commit> <scenarios-dir>
+#        gate.sh --base-keys <bare-repo> <base-commit> <scenarios-dir>
 #
 # Exports both commits to temporary directories and judges the candidate
 # with the controller's scenarios, never the trees' own: a candidate cannot
@@ -72,6 +73,11 @@
 #   toward no halt: nothing is rejected or aborted. Which objectives the
 #   gate cannot judge: deploy/systemd/README.md "Which objectives the gate
 #   cannot judge" lists them, 029 and why.
+# - one fact of the kind is the gate's own, not a scenario's: a base whose
+#   dependency graph does not resolve offline (the static checks, "the
+#   whole dependency graph"): the same fact with the scenario
+#   `dependencies`, any objective's; the candidate is never rejected for a
+#   graph its base cannot resolve here either.
 #
 # Exit-code contract for objective scenarios and the task scenario: 0 =
 # pass, 1 = an assertion failed, 6 = the host cannot judge it here (below: "A
@@ -247,6 +253,15 @@
 # written, whatever SPAWN_GATE_VERDICT says), 4 on a harness error, 3 as
 # below.
 #
+# Base keys (`--base-keys`): the base-phase cache key of every objective
+# this gate would judge, one `key <scenario> <sha256>` line each, printed
+# after the same setup a gate makes (the exports, the socket scan, and the
+# toolchain probe inside the sandbox, whose log lines precede the keys),
+# with no build, no scenario run and no verdict. Two hosts compute the same
+# key exactly when a base result taken on one is a cache hit on the other:
+# deploy/gate-runner.sh --check compares a runner's keys with this host's
+# before any gate is shipped there. Exit 0, 3 as below.
+#
 # Exit status: 0 with a verdict. 5 means no room to judge now: TMPDIR has
 # less than SPAWN_GATE_MIN_FREE_GB free (scripts/disk.sh gate_room). The
 # gate exits before it makes any scratch or runs any candidate code, after
@@ -317,6 +332,22 @@ if [ "${1-}" = --base-only ]; then
         exit 3
     fi
     base_only=1
+    set -- "$1" "$2" "$2" "$3"
+    unset SPAWN_GATE_VERDICT
+fi
+
+# Base keys (`gate.sh --base-keys <bare-repo> <base-commit> <scenarios-dir>`):
+# the key every objective's base result would be cached under, printed and
+# nothing run (deploy/gate-runner.sh --check). The candidate is the base,
+# as in --base-only.
+base_keys_only=""
+if [ "${1-}" = --base-keys ]; then
+    shift
+    if [ $# -ne 3 ]; then
+        echo "usage: gate.sh --base-keys <bare-repo> <base-commit> <scenarios-dir>" >&2
+        exit 3
+    fi
+    base_keys_only=1
     set -- "$1" "$2" "$2" "$3"
     unset SPAWN_GATE_VERDICT
 fi
@@ -2305,6 +2336,20 @@ if [ -f "$work/candidate/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
     : >"$work/build-time.base"
     if ! local_build_time "$work/candidate" "$work/candidate" >"$work/build-time.candidate"; then
         sed 's/^/| metadata: /' "$work/metadata.log" | tail -n 20
+        # Only a candidate whose base resolves here is rejected for it. A
+        # base that does not resolve either says this host's registry lacks
+        # a crate main needs (a runner never sent it, a pruned cache): a
+        # fact about the host, never a verdict on the work (exit 6,
+        # `cannot_judge`; the integrator judges again after its backoff).
+        if [ -f "$work/baseline/Cargo.toml" ] && {
+            mkdir -p "$work/base-metadata"
+            ! local_build_time "$work/base-metadata" "$work/baseline" >/dev/null
+        }; then
+            echo "| dependencies: cannot judge: the base's dependency graph does not resolve offline" \
+                "on this host either (its cargo registry lacks a crate the base needs)"
+            [ -z "$base_only" ] || exit 4
+            cannot_judge dependencies 1
+        fi
         verdict rejected "candidate's dependency graph does not resolve offline"
         exit 0
     fi
@@ -3010,6 +3055,7 @@ not_a_regression() {
 # The base phase: every objective's key (and its result, when the cache
 # has it), then one build of the base for those it has not, then their runs.
 : >"$work/base-results"
+: >"$work/base-keys"
 from_cache=""
 run_on_base=""
 skipped_on_base=""
@@ -3026,7 +3072,11 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
     printf '%s\n' "$objective" >>"$work/base-results.seen"
     objective_name=$(basename "$objective")
     toolchain
-    entry=$base_cache/$(objective_key "$base_commit" "$toolchain_key" "$objective")
+    key=$(objective_key "$base_commit" "$toolchain_key" "$objective")
+    entry=$base_cache/$key
+    if [ -n "$base_keys_only" ]; then
+        printf 'key %s %s\n' "$objective_name" "$key" >>"$work/base-keys"
+    fi
     base_count=$((base_count + 1))
     job=$jobs_dir/base.$base_count
     mkdir "$job"
@@ -3055,6 +3105,13 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
         base_misses=$((base_misses + 1))
     fi
 done
+# Base keys: the keys the base phase would use, and nothing else. The
+# timing line is the trap's; a reader of the keys gets them alone.
+if [ -n "$base_keys_only" ]; then
+    times_said=1
+    LC_ALL=C sort "$work/base-keys"
+    exit 0
+fi
 if [ "$base_misses" -gt 0 ]; then
     section "base: build"
     if ! build "$work/baseline"; then
