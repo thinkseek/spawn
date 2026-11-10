@@ -4912,7 +4912,7 @@ connections\n";
         fn finish(store: &PostgresStore, command: CommandId, outcome: &Outcome) {
             use spawn_core::port::CommandQueue;
             let claimed = store
-                .claim("tester", std::time::Duration::from_secs(60))
+                .claim("tester", std::time::Duration::from_mins(1))
                 .expect("claim")
                 .expect("a command");
             assert_eq!(claimed.command_id, command);
