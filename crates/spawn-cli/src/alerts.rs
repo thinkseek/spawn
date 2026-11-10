@@ -237,6 +237,8 @@ pub(crate) struct Settings {
     pub(crate) admission_ms: i64,
     /// How long the model judge may answer no call.
     pub(crate) judge_down_ms: i64,
+    /// How long a message may go untaken (SPAWN_MESSAGE_TAKEN_SECS).
+    pub(crate) message_taken_ms: i64,
     /// The dump's and the bundle's schedules, with room for one late run.
     pub(crate) dump_max_age_ms: i64,
     pub(crate) bundle_max_age_ms: i64,
@@ -290,6 +292,13 @@ impl Settings {
             undelivered_ms: secs("SPAWN_ALERT_UNDELIVERED_SECS", 300, &mut warnings),
             admission_ms: secs("SPAWN_ALERT_ADMISSION_SECS", 600, &mut warnings),
             judge_down_ms: secs("SPAWN_ALERT_JUDGE_DOWN_SECS", 900, &mut warnings),
+            message_taken_ms: {
+                let (bound, warning) = crate::config::message_taken_bound(
+                    env_value("SPAWN_MESSAGE_TAKEN_SECS").as_deref(),
+                );
+                warnings.extend(warning);
+                bound
+            },
             dump_max_age_ms: secs("SPAWN_ALERT_BACKUP_DUMP_MAX_AGE_SECS", 7200, &mut warnings),
             bundle_max_age_ms: secs(
                 "SPAWN_ALERT_BACKUP_BUNDLE_MAX_AGE_SECS",
@@ -463,6 +472,9 @@ pub(crate) struct Monitor {
     /// reading in a row, so a path that comes and goes does not flap). A
     /// restart forgets them: its first reading starts the count again.
     away_once: BTreeMap<(i64, String), i64>,
+    /// When the earliest tracked message not taken yet reaches its bound,
+    /// as the last reading of the messages found (`message_not_taken`).
+    messages_due: Option<i64>,
 }
 
 impl Monitor {
@@ -496,6 +508,7 @@ impl Monitor {
             logs,
             unlocked_since: None,
             away_once: BTreeMap::new(),
+            messages_due: None,
         }
     }
 
@@ -543,6 +556,11 @@ impl Monitor {
                 .map_err(|error| error.to_string())?;
             self.commands(&commands, &mut events);
             self.commands_after = now.saturating_sub(1000);
+        }
+        // The messages are read at each reading and when one falls due: a
+        // message is said not taken within one check of its bound.
+        if reading_due || self.messages_due.is_some_and(|due| now >= due) {
+            self.read_messages(store, &mut events, &mut lines);
         }
         if reading_due {
             self.next_reading_ms = now.saturating_add(self.settings.check_ms);
@@ -630,6 +648,12 @@ impl Monitor {
             .alert_failed_commands(self.commands_after)
             .map_err(|error| error.to_string())?;
         self.commands(&commands, &mut events);
+        // The messages, read back as they stand: an alert the store holds
+        // fires nothing again, and one due while the loop was down fires.
+        let messages = store
+            .alert_messages(self.settings.message_taken_ms, &self.open_messages())
+            .map_err(|error| error.to_string())?;
+        self.messages(&messages, &mut events);
         self.watermark = store.alert_clock().map_err(|error| error.to_string())?.0;
         for log in &mut self.logs {
             let open = self
@@ -1410,6 +1434,101 @@ times in a row)",
         }
     }
 
+    /// The commands of the open `message_not_taken` alerts.
+    fn open_messages(&self) -> Vec<i64> {
+        self.known
+            .iter()
+            .filter(|(_, row)| row.open() && row.kind == "message_not_taken")
+            .filter_map(|(key, _)| key.strip_prefix("message_not_taken:")?.parse().ok())
+            .collect()
+    }
+
+    /// Read the messages ([`PostgresStore::alert_messages`]) and decide.
+    /// An error is said and read again at the next check.
+    fn read_messages(
+        &mut self,
+        store: &PostgresStore,
+        out: &mut Vec<Event>,
+        lines: &mut Vec<String>,
+    ) {
+        match store.alert_messages(self.settings.message_taken_ms, &self.open_messages()) {
+            Ok(messages) => self.messages(&messages, out),
+            Err(error) => lines.push(format!("alerts: messages: {error}")),
+        }
+    }
+
+    /// `message_not_taken`: a tracked message no `message.taken` names past
+    /// its bound, its session not ended with it, fires once; an open one
+    /// clears once it is taken, or once its session ended with it untaken.
+    /// The next bound is the earliest of those not due yet.
+    fn messages(&mut self, messages: &Value, out: &mut Vec<Event>) {
+        let mut next: Option<i64> = None;
+        for message in messages["waiting"].as_array().into_iter().flatten() {
+            let Some(id) = message["command_id"].as_i64() else {
+                continue;
+            };
+            let key = format!("message_not_taken:{id}");
+            if self.known.contains_key(&key) {
+                continue;
+            }
+            if message["not_taken"].as_bool() != Some(true) {
+                if let Some(due) = message["due_ms"].as_i64() {
+                    next = Some(next.map_or(due, |next| next.min(due)));
+                }
+                continue;
+            }
+            let typed = message["typed"].as_bool() == Some(true);
+            let agent = message["agent_id"].as_str().unwrap_or_default();
+            let action = message["action"].as_str().unwrap_or("input");
+            let secs = self.settings.message_taken_ms / 1000;
+            out.push(Event::Fire {
+                key,
+                kind: "message_not_taken",
+                subject: message["session_id"].as_str().unwrap_or_default().to_string(),
+                evidence: json!({
+                    "command": id, "agent_id": agent, "session_id": message["session_id"],
+                    "action": action, "typed": typed,
+                    "recorded_at_ms": message["created_at_ms"],
+                    "bound_ms": self.settings.message_taken_ms,
+                }),
+                text: if typed {
+                    format!(
+                        "{agent} has not taken message #{id} (its {action}): typed, and no \
+                         transcript line holds its marker {secs} s after it was sent"
+                    )
+                } else {
+                    format!(
+                        "{agent} has not taken message #{id} (its {action}): never typed \
+                         {secs} s after it was sent"
+                    )
+                },
+                notice: false,
+            });
+        }
+        for message in messages["open"].as_array().into_iter().flatten() {
+            let Some(id) = message["command_id"].as_i64() else {
+                continue;
+            };
+            let key = format!("message_not_taken:{id}");
+            if !self.is_open(&key) {
+                continue;
+            }
+            let taken = message["taken"].as_i64().unwrap_or_default();
+            if taken > 0 {
+                out.push(Event::Clear {
+                    key,
+                    evidence: json!({"taken": taken, "taken_at_ms": message["taken_at_ms"]}),
+                });
+            } else if message["ended"].as_bool() != Some(false) {
+                out.push(Event::Clear {
+                    key,
+                    evidence: json!({"ended": true, "state": message["state"]}),
+                });
+            }
+        }
+        self.messages_due = next;
+    }
+
     /// The model judge's `down` records that reached their bound
     /// (`judge_down`), once each.
     fn judge_bounds(&self, now: i64, out: &mut Vec<Event>) {
@@ -2150,6 +2269,9 @@ times in a row)",
                 next = next.min(log.last_match_ms.saturating_add(self.settings.quiet_ms));
             }
         }
+        if let Some(due) = self.messages_due {
+            next = next.min(due);
+        }
         self.next_bound_ms = (next != i64::MAX).then_some(next);
     }
 
@@ -2886,6 +3008,7 @@ mod tests {
             undelivered_ms: 300_000,
             admission_ms: 600_000,
             judge_down_ms: 900_000,
+            message_taken_ms: 120_000,
             dump_max_age_ms: 7_200_000,
             bundle_max_age_ms: 93_600_000,
             memory_low_mb: 4096,
