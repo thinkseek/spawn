@@ -186,7 +186,13 @@ commit with a key no agent holds cannot hang or fail a test.
   a mount exports the workspace afresh, so the store records the copies
   (`main`'s commit and the files) under `<root>/.main-copies/<agent>`, and
   every mount (a resume after an engine was lost, a host restart) puts them
-  back until the branch contains that `main`. An agent with no workspace on
+  back until the branch contains that `main`. The record follows `main`: a
+  start's or resume's clean-only merge that finds the unmounted branch in
+  conflict with a newer `main` rewrites an open record for that `main` (or
+  removes it when markers would show the conflict), so the mount after it
+  restores the versions the conflict is with. A version git cannot read or
+  a copy that cannot be written is a failure of the merge or the mount,
+  never a file `main` does not have, and no record is written for it. An agent with no workspace on
   the integrator's host gets no merge, and its note says so.
 - **Work set aside**: a resident keeps its branch from task to task, so the
   work of a task cancelled while it was delivered (by `spawn task cancel`,

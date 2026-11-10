@@ -153,12 +153,14 @@ pub(crate) fn into_workspace_when(
             files,
             marked: false,
         }) => {
-            // The store copied main's versions and recorded which.
-            let copied = GitWorkspace::new(mirror, root)
-                .main_copies(agent)
-                .map(|(_, copied)| copied)
-                .unwrap_or_default();
-            Merge::Unmarked { files, copied }
+            // The store copied main's versions and recorded which; without
+            // the record no file is known to be one main does not have.
+            match GitWorkspace::new(mirror, root).main_copies(agent) {
+                Some((_, copied)) => Merge::Unmarked { files, copied },
+                None => Merge::Failed(format!(
+                    "the record of main's copies for {agent} cannot be read"
+                )),
+            }
         }
         Err(WorkspaceError::Refused { code, message }) if code == MERGE_WAITS => {
             Merge::Busy(message)
