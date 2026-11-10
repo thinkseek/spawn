@@ -39,6 +39,10 @@
 #   the base is not an objective nobody solved: main is red on it, said
 #   ("main red: <name>") and listed in the verdict (`main_red_scenarios`),
 #   and still no verdict on the candidate ("Main red on a scenario" below).
+#   One the base solved that fails on the candidate is run again and
+#   compared with the base, run now ("Three classes of a failing
+#   regression" below): rejected only as a candidate failure. One on the
+#   owner's `quarantined` list is not run at all, and named.
 #   `check-*` scenarios are invariants and always must pass. A check that
 #   fails on the candidate is run again there; one that fails twice is run
 #   on the base: passing there, it is a regression (rejected); failing there
@@ -102,7 +106,9 @@
 # scenario that cannot be judged here"), anything else = a harness error (a
 # missing tool, an unreachable database, a timeout kill). Each is judged on
 # the base BEFORE any candidate code runs, since both share the test server
-# and a candidate could otherwise sabotage the base's run: 0 = solved, 1
+# and a candidate could otherwise sabotage the base's run (the one base run
+# that comes later, of a regression that failed, accepts nothing for a
+# task's candidate: "Three classes of a failing regression"): 0 = solved, 1
 # (twice, from two runs that agree) = unsolved, 6 = cannot_judge (cached: the
 # host's answer does not change), anything else is a host fault (exit 6 with
 # its fact in the verdict file, no verdict: the integrator records
@@ -131,6 +137,87 @@
 # writes "unsolved" for an objective under the current key lets a candidate
 # that breaks that objective land. Closing that needs the gate under a uid
 # agents do not have.
+#
+# Three classes of a failing regression (the owner, 2026-11-10: "a clear
+# separation between candidate failures, test defects, and infrastructure
+# failures. A broken validator should not automatically reject valid
+# product work"; an owner gate had run 39 minutes and rejected valid work
+# on 028, whose timing check failed on main itself at that load, against a
+# base result cached from a quiet host hours earlier). One failing run of a
+# numbered scenario the base solved used to be the rejection. Now such a
+# run is judged as a failing check is ("Checks run twice" below), in its
+# own slot and only when it fails, so a gate in which nothing fails pays
+# nothing:
+# - it runs again on the candidate;
+# - then on the base, now, in this gate (never the cached result, which
+#   says what the base did on the host as it was then), up to twice: a run
+#   that exits 1 settles that the base fails it too, a second run follows a
+#   pass;
+# - failing twice on the candidate and passing twice on the base: a
+#   candidate failure, rejected with the reason it always had;
+# - failing once and then passing on the candidate, the base passing twice:
+#   a third run on the candidate. Two failures of three: a candidate
+#   failure, rejected. One of three: unstable on the candidate, which is
+#   neither a pass nor a failure: the gate states `cannot_judge` for the
+#   scenario (exit 6, its `reason` "unstable on the candidate: ..."),
+#   judged again after the integrator's backoff. Never accepted on it: a
+#   candidate that brought a race in would slip through;
+# - the base failing a run (exit 1): a validator defect. The scenario fails
+#   on the base too, under the same conditions, so it is no evidence
+#   against the candidate, and never a rejection. What it is instead
+#   depends on whose candidate it is, because this base run comes after
+#   candidate code ran, on the test server both share and beside the
+#   candidate's other runs: a candidate that breaks the scenario and can
+#   make the base's late run fail as well (by what it leaves on the server,
+#   or by the load of its own binary in the runs next door: 028 is
+#   load-sensitive) would turn its own regression into a validator's
+#   defect. So, as for a check, a late base run may spare a task's
+#   candidate a rejection and may never accept it: the gate ends with the
+#   fact (exit 6, `host_fault`, `on` `candidate and base`, `evidence`
+#   `validator_defect`, `validator_defects` naming the scenario), judged
+#   again after the backoff. For the owner's own candidate
+#   (SPAWN_GATE_OWNER_CANDIDATE=1, the integrator's to set for an owner's
+#   push: the owner does not sabotage the owner's gate) the gate goes on,
+#   judges every other scenario, and its verdict names the defective
+#   validators (`"validator_defects":["028.sh"]`): accepted, if nothing
+#   else rejects;
+# - a base run that exits neither 0 nor 1, or a base that cannot be built:
+#   infrastructure, no verdict (exit 6, `host_fault`, `on` `candidate and
+#   base`), as for a check.
+# The log says the class in these words: "candidate failure", "validator
+# defect (fails on the base too, under the same conditions)",
+# "infrastructure (cannot judge)". The task's own scenario keeps its rules
+# (it must fail on the base and pass on the candidate), and a scenario the
+# base did not solve is no regression, as before.
+#
+# The base's run after the candidate's is kept apart from what the
+# candidate touched (the owner, 2026-11-10: "base and candidate tests
+# should have isolated state to prevent cross-contamination"). It starts
+# once the scenario's candidate runs have ended, their sandboxes and every
+# process in them gone; with nothing else of this gate beside it (it asks
+# run_jobs to be alone, as a scenario on the serial list is, so the
+# candidate's other runs are not its load); in a sandbox of its own, like
+# every run (a fresh /tmp, an empty $HOME); on the base's tree, which a
+# candidate's run sees read-only; and on a test server no candidate run
+# used: a second server of the gate's own, started for these runs from the
+# gate's copy of the template, as the candidate phase's was, and stopped
+# after them. A gate on a shared server (SPAWN_TEST_DATABASE_URL and no
+# server of its own) cannot have that last part, so there a base that
+# fails after the candidate ran is evidence of nothing: infrastructure, no
+# verdict, for the owner's candidate too, and the log says why. The
+# isolation is defence in depth: it does not change who may be accepted on
+# a late base run.
+#
+# A validator the owner knows is broken: `<scenarios-dir>/quarantined`, a
+# list like `serial` (a file name a line, `#` for a comment). A scenario on
+# it is not run as a regression, nor judged on the base for one; the log
+# and the verdict name it in every gate (`"quarantined":["028.sh"]`), so it
+# cannot be forgotten there. Without the list a validator defect would give
+# every task's candidate no verdict for as long as the validator stays
+# broken. The task's own scenario is never skipped by it. The list is the
+# controller's, and the tree's copy lies under the protected paths, so only
+# an owner's push changes it. It is in no base cache key: it decides which
+# scenarios run, never what one of them says.
 #
 # What is never cached (GitHub issue #29). The exit code is the whole
 # contract: an entry is written for exit 0, for exit 1 twice and for exit
@@ -321,6 +408,16 @@
 #                              the regression rule holds for what the base
 #                              solves, and an owner's push during a red main
 #                              must not go ungated for it
+#   SPAWN_GATE_OWNER_CANDIDATE 1: the candidate is the owner's own push, so a
+#                              validator defect ("Three classes of a failing
+#                              regression") does not end the gate: the rest
+#                              is judged and the verdict names the validator.
+#                              Unset or 0, a task's candidate: no verdict on
+#                              a validator defect (exit 6). The integrator's
+#                              to set, for an owner's gated push only;
+#                              SPAWN_GATE_RED_UNSOLVED says nothing of it
+#                              (that one is about a check main is red on).
+#                              spawn integrate does not pass it yet
 #   SPAWN_GATE_PG_IMAGE        the test server's docker image: the gate runs a
 #                              server of its own from it (GitHub issue #6),
 #                              and SPAWN_TEST_DATABASE_URL is not used
@@ -570,6 +667,8 @@ EOF
 metric=""
 flakes=""
 reused=""
+validator_defects=""
+quarantined=""
 
 # JSON string body: backslash, quote and tab escaped, newlines as \n, other
 # control characters dropped.
@@ -600,6 +699,12 @@ verdict() {
     # The regressions not run on the candidate: the base's result, reused
     # ("Results reused from the base"), in the scenario order.
     [ -n "${reused-}" ] && json="$json,\"reused\":[$reused]"
+    # The validators that fail on the base too, run again in this gate
+    # ("Three classes of a failing regression"): an owner's candidate is
+    # judged without them, and they are named.
+    [ -n "${validator_defects-}" ] && json="$json,\"validator_defects\":[$validator_defects]"
+    # The regressions the owner's `quarantined` list kept from running.
+    [ -n "${quarantined-}" ] && json="$json,\"quarantined\":[$quarantined]"
     # The check main was red on (SPAWN_GATE_BASE_CHECK), when it passed on
     # this base before any candidate code ran: main is green on it again,
     # whatever this gate ends with (gate.rs reads it from any fact).
@@ -642,6 +747,9 @@ host_fault() {
     json="$json,\"runs\":\"$(json_string "$3")\",\"reason\":\"$(json_string "$4")\""
     [ -z "${5-}" ] || json="$json,\"evidence\":\"$5\""
     [ -z "${6-}" ] || json="$json,\"tree\":\"$6\""
+    # A validator defect that ends a task's gate ("Three classes of a
+    # failing regression"), and any an owner's gate met before this fact.
+    [ -n "${validator_defects-}" ] && json="$json,\"validator_defects\":[$validator_defects]"
     # The check main was red on (SPAWN_GATE_BASE_CHECK), when it passed on
     # this base before any candidate code ran: main is green on it again,
     # whatever this gate ends with (gate.rs reads it from any fact).
@@ -733,7 +841,7 @@ shared_failed() {
     [ -s "$3" ]
 }
 
-# cannot_judge <scenario> <runs> [<prerequisite>]: the scenario says this
+# cannot_judge <scenario> <runs> [<prerequisite> [<reason>]]: the scenario says this
 # host cannot judge it here (029: no systemd user manager in the sandbox),
 # or the host lacks a <prerequisite> it declares ("Preflight"), so the gate
 # states that as the fact and exits 6, no verdict: `{"cannot_judge":true,
@@ -748,6 +856,9 @@ cannot_judge() {
     json="{\"v\":1,\"cannot_judge\":true,\"scenario\":\"$(json_string "$1")\""
     json="$json,\"runs\":\"$(json_string "$2")\""
     [ -z "${3-}" ] || json="$json,\"prerequisite\":\"$(json_string "$3")\""
+    # Why, when it is the gate that says so and not the scenario: a
+    # regression unstable on the candidate.
+    [ -z "${4-}" ] || json="$json,\"reason\":\"$(json_string "$4")\""
     # The check main was red on (SPAWN_GATE_BASE_CHECK), when it passed on
     # this base before any candidate code ran: main is green on it again,
     # whatever this gate ends with (gate.rs reads it from any fact).
@@ -1017,6 +1128,17 @@ if [ -n "$gate_build_jobs" ]; then
     esac
 fi
 [ -z "$base_only" ] || gate_build_jobs=1
+# Whose candidate it is ("Three classes of a failing regression"): the
+# owner's own with SPAWN_GATE_OWNER_CANDIDATE=1, else a task's.
+owner_candidate=""
+case "${SPAWN_GATE_OWNER_CANDIDATE-}" in
+'' | 0) ;;
+1) owner_candidate=1 ;;
+*)
+    echo "gate: SPAWN_GATE_OWNER_CANDIDATE is 0 or 1, not '$SPAWN_GATE_OWNER_CANDIDATE'" >&2
+    exit 3
+    ;;
+esac
 # Whether a regression's result may be taken from the base ("Results reused
 # from the base"): unless SPAWN_GATE_REUSE=0.
 gate_reuse=${SPAWN_GATE_REUSE-}
@@ -1184,6 +1306,7 @@ gate_remove_work() {
 }
 trap 'stage_close aborted; gate_times; gate_stop_children; gate_remove_work' EXIT
 db_socket=""
+sandbox_db_socket=""
 db_forward=""
 sandbox_db_url=""
 # start_server <dir> <tree>: the gate's own server, its files in <dir>;
@@ -1434,7 +1557,10 @@ sandbox_once() {
     IFS=$old_ifs
     set -- "$@" --ro-bind "$scenarios" "$scenarios"
     [ -n "$scenario" ] && set -- "$@" --ro-bind "$scenario" "$scenario"
-    [ -n "$db_socket" ] && set -- "$@" --ro-bind "$db_socket" "$db_socket"
+    # The socket of the gate's server, or of the one a regression's base
+    # run after the candidate's is given (candidate_job), at the one path
+    # the sandbox's URL names.
+    [ -n "$db_socket" ] && set -- "$@" --ro-bind "${sandbox_db_socket:-$db_socket}" "$db_socket"
     if [ "$tree" != "$work/baseline" ] && [ -d "$work/baseline" ]; then
         set -- "$@" --ro-bind "$work/baseline" "$work/baseline"
     fi
@@ -2121,6 +2247,18 @@ fi
 runs_alone() {
     [ -n "$serial_list" ] && printf '%s\n' "$serial_list" | grep -qxF -- "$(basename "$1")"
 }
+# The owner's list of validators known to be broken (see the header: "A
+# validator the owner knows is broken"), read as `serial` is.
+quarantine_list=""
+if [ -f "$scenarios/quarantined" ]; then
+    quarantine_list=$(grep -v '^#' "$scenarios/quarantined" | grep . || true)
+fi
+# is_quarantined <scenario>: 0 when the list names it and it is not the
+# task's own scenario, which no list skips.
+is_quarantined() {
+    [ -n "$quarantine_list" ] && [ "$1" != "$scenario" ] &&
+        printf '%s\n' "$quarantine_list" | grep -qxF -- "$(basename "$1")"
+}
 
 # The order runs start in (design-gate-time.md, cut B). The log and the
 # verdict keep the scenario order (above); only the start order changes,
@@ -2316,6 +2454,34 @@ run_jobs() {
                 rj_running="$rj_running $rj_i"
             fi
         done
+        # A run that asks to be alone part-way (<job>/alone.asked: a
+        # regression's base run after the candidate's, candidate_job): no
+        # job starts while it waits or runs, as for one on the serial
+        # list, and it is let go (<job>/alone.now) once nothing else of
+        # the gate runs: every other job has ended, or waits to be alone
+        # itself. It stays alone until its job ends.
+        if [ -z "$rj_alone" ]; then
+            for rj_i in $rj_running; do
+                rj_job=$jobs_dir/$rj_phase.$rj_i
+                if [ -e "$rj_job/alone.asked" ] && [ ! -e "$rj_job/alone.now" ]; then
+                    rj_alone=$rj_i
+                    break
+                fi
+            done
+        fi
+        if [ -n "$rj_alone" ] && [ -e "$jobs_dir/$rj_phase.$rj_alone/alone.asked" ] &&
+            [ ! -e "$jobs_dir/$rj_phase.$rj_alone/alone.now" ]; then
+            rj_beside=""
+            for rj_i in $rj_running; do
+                [ "$rj_i" != "$rj_alone" ] || continue
+                rj_job=$jobs_dir/$rj_phase.$rj_i
+                [ -e "$rj_job/alone.asked" ] && [ ! -e "$rj_job/alone.now" ] || rj_beside=1
+            done
+            if [ -z "$rj_beside" ]; then
+                : >"$jobs_dir/$rj_phase.$rj_alone/alone.now"
+                rj_changed=1
+            fi
+        fi
         while [ "$rj_print" -le "$jobs_stop" ] && [ -e "$jobs_dir/$rj_phase.$rj_print/result" ]; do
             "$rj_printed" "$jobs_dir/$rj_phase.$rj_print" "$rj_print"
             rj_print=$((rj_print + 1))
@@ -2764,7 +2930,7 @@ fi
 # - the gate: this file's blob and that of the URL parser it sources (it
 #   shapes the sandbox's database URL);
 # - the scenarios directory's other files, but its scenarios and the lists
-#   only the gate reads (`protected`, `retired-tests`, `serial`): the build hook, the
+#   only the gate reads (`protected`, `retired-tests`, `serial`, `quarantined`): the build hook, the
 #   `bind` list's text, helpers a scenario runs from beside it;
 # - each directory the `bind` list names, by a fingerprint of what is
 #   installed there: the blobs of its `.modules.yaml` and `.pnpm/lock.yaml`
@@ -2818,7 +2984,8 @@ blob() { git hash-object --no-filters -- "$1"; }
 gate_key="gate $(blob "$0")"
 [ -f "$(dirname "$0")/../pg-url.sh" ] && gate_key="$gate_key $(blob "$(dirname "$0")/../pg-url.sh")"
 [ -f "$(dirname "$0")/gate-pg.sh" ] && gate_key="$gate_key $(blob "$(dirname "$0")/gate-pg.sh")"
-scenarios_key=$(cd "$scenarios" && find . -type f ! -path './protected' ! -path './retired-tests' ! -path './serial' |
+scenarios_key=$(cd "$scenarios" && find . -type f ! -path './protected' ! -path './retired-tests' ! -path './serial' \
+    ! -path './quarantined' |
     grep -vE '^\./[^/]*\.sh$' | LC_ALL=C sort |
     while IFS= read -r file; do printf '%s %s\n' "$(blob "$file")" "$file"; done |
     sha256sum | cut -d' ' -f1)
@@ -3275,6 +3442,7 @@ if [ -z "$base_keys_only" ]; then
         [ -f "$needy" ] || continue
         if [ "$needy" != "$scenario" ]; then
             not_a_regression "$needy" && continue
+            is_quarantined "$needy" && continue
             if [ -n "$base_only" ]; then
                 case "$(basename "$needy")" in *[!0-9].sh | .sh) continue ;; esac
             fi
@@ -3367,6 +3535,7 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
     if [ "$objective" != "$scenario" ]; then
         case "$(basename "$objective")" in *[!0-9].sh | .sh) continue ;; esac
         not_a_regression "$objective" && continue
+        is_quarantined "$objective" && continue
     fi
     grep -qxF "$objective" "$work/base-results.seen" 2>/dev/null && continue
     printf '%s\n' "$objective" >>"$work/base-results.seen"
@@ -3664,7 +3833,10 @@ fi
 # slot; failing twice, it is run once on the base, built for it if the base
 # phase did not (every base result cached). The base run comes after
 # candidate code ran on the shared test server, so it can only spare the
-# candidate a rejection by aborting the gate, never accept it:
+# candidate a rejection by aborting the gate, never accept it (the owner's
+# own candidate apart, for a numbered scenario: "Three classes of a failing
+# regression" in the header, whose runs are the block after the check's
+# below):
 # - passes the second time: a flake, not a regression (said in the log);
 # - fails twice, passes on the base: a regression, rejected as before;
 # - fails twice and on the base: no verdict on the candidate, a host or
@@ -3758,6 +3930,122 @@ candidate_job() {
             fi
         fi
     fi
+    # Three classes of a failing regression (see the header): a numbered
+    # scenario the base solved, failing as a regression. Its runs, each
+    # with its stage line; what they mean is the printer's to say and to
+    # act on (candidate_printed), from the job's result: the candidate's
+    # last failing status (a candidate failure), `defect`, `unstable`, or
+    # `abort` with <job>/infrastructure.
+    if [ -z "$is_check" ] && [ ! -e "$job/task" ] && [ "$run_status" -ne 0 ] && [ "$run_status" -ne 6 ] &&
+        [ "$(base_result "$job_scenario")" = solved ]; then
+        job_name=$(basename "$job_scenario")
+        job_stage "$(($(stage_now) - run_at))" "exit $run_status" "$run_name"
+        job_say "| == $run_name (again: a failing regression runs twice)"
+        run_at=$(stage_now)
+        again=0
+        job_run "$job" 2 "$work/candidate" "$job_scenario" || again=$?
+        [ ! -e "$job/slot-waited" ] || return 0
+        job_output 2
+        again_ms=$(($(stage_now) - run_at))
+        job_stage "$again_ms" "exit $again" "$run_name (again)"
+        on_candidate="$run_status, then $again"
+        failed=1 third=0
+        [ "$again" -eq 0 ] || failed=2
+        base_name="base: $job_name (it failed on the candidate: does the base pass it now?)"
+        # Alone from here to the job's end (run_jobs): the base's run is
+        # beside nothing else of this gate, least of all the candidate's
+        # other runs, whose load is the candidate's to make.
+        : >"$job/alone.asked"
+        until [ -e "$job/alone.now" ]; do sleep 0.2; done
+        job_say "| == $base_name"
+        run_at=$(stage_now)
+        # A test server no candidate run used, for the base's runs: a
+        # second server of the gate's own, from the gate's copy of the
+        # template (gate_pg_start, as the candidate phase's fresh one), in
+        # this job's directory. The gate's server was never this
+        # subshell's: its pid is forgotten first, so nothing here stops it.
+        late_pg=""
+        if ! base_ready; then
+            printf '%s\n' "$on_candidate on the candidate; the base does not build" >"$job/runs"
+            echo "the base cannot be built to run it" >"$job/infrastructure"
+            run_status=abort
+        elif [ -n "$gate_pg" ] && ! {
+            gate_pg_pid=""
+            gate_pg_start "$job/pg.base" 1
+        }; then
+            gate_pg_stop
+            printf '%s\n' "$on_candidate on the candidate; no run on the base" >"$job/runs"
+            echo "the test server of its own for the base's run did not start" >"$job/infrastructure"
+            run_status=abort
+        else
+            if [ -n "$gate_pg" ]; then
+                late_pg=1
+                sandbox_db_socket=$gate_pg_socket
+                job_say "| test database: a server of their own for the base's runs of $job_name, which no candidate run used, up in $gate_pg_ms ms"
+            fi
+            # The base, now: a run that exits 1 settles it, a pass is run
+            # once more.
+            on_base=0
+            job_run "$job" 3 "$work/baseline" "$job_scenario" || on_base=$?
+            [ ! -e "$job/slot-waited" ] || return 0
+            job_output 3
+            job_stage "$(($(stage_now) - run_at))" "exit $on_base" "$base_name"
+            base_runs=$on_base
+            if [ "$on_base" -eq 0 ]; then
+                job_say "| == $base_name (again)"
+                run_at=$(stage_now)
+                job_run "$job" 4 "$work/baseline" "$job_scenario" || on_base=$?
+                [ ! -e "$job/slot-waited" ] || return 0
+                job_output 4
+                job_stage "$(($(stage_now) - run_at))" "exit $on_base" "$base_name (again)"
+                base_runs="0, then $on_base"
+            fi
+            if [ -n "$late_pg" ]; then
+                gate_pg_stop
+                sandbox_db_socket=""
+            fi
+            if [ "$on_base" -eq 0 ] && [ "$failed" -eq 1 ]; then
+                # Failed, then passed, and the base passes: the third run
+                # on the candidate says whether it fails more often than
+                # not.
+                job_say "| == $run_name (a third run: it failed once and passed once)"
+                run_at=$(stage_now)
+                job_run "$job" 5 "$work/candidate" "$job_scenario" || third=$?
+                [ ! -e "$job/slot-waited" ] || return 0
+                job_output 5
+                job_stage "$(($(stage_now) - run_at))" "exit $third" "$run_name (a third run)"
+                on_candidate="$on_candidate, then $third"
+                [ "$third" -eq 0 ] || failed=2
+            fi
+            printf '%s\n' "$on_candidate on the candidate; $base_runs on the base, run now" >"$job/runs"
+            case "$on_base" in
+            0)
+                if [ "$failed" -ge 2 ]; then
+                    job_say "| $job_name fails on the candidate ($on_candidate) and passes on the base, run now ($base_runs): candidate failure"
+                    # The status of its last failing run.
+                    [ "$again" -eq 0 ] || run_status=$again
+                    [ "${third:-0}" -eq 0 ] || run_status=$third
+                else
+                    run_status=unstable
+                fi
+                ;;
+            1)
+                run_status=defect
+                # On a shared test server the base's run saw what the
+                # candidate's runs left there: no evidence either way.
+                if [ -z "$gate_pg" ] && [ -n "$db_socket" ]; then
+                    echo "it fails on the base too, run now, but on the test server the candidate's runs used (a shared one: the gate has no server of its own, SPAWN_GATE_PG_BIN or SPAWN_GATE_PG_IMAGE), where the base's failure may be the candidate's doing" >"$job/infrastructure"
+                    run_status=abort
+                fi
+                ;;
+            *)
+                echo "its run on the base exited $on_base, neither 0 nor 1" >"$job/infrastructure"
+                run_status=abort
+                ;;
+            esac
+        fi
+        run_name=$base_name
+    fi
     # The last run's time; a check that failed twice has a stage line for
     # each of its runs already, so its verdict's line adds none.
     if [ -n "${again_ms-}" ]; then
@@ -3777,6 +4065,12 @@ decisive() {
     # A check main is red on, for an owner's push (SPAWN_GATE_RED_UNSOLVED):
     # unsolved on the base, the rest still judged.
     if [ "$(cat "$1/result")" = main_red ] && [ "${SPAWN_GATE_RED_UNSOLVED-}" = 1 ]; then
+        return 1
+    fi
+    # A validator defect, for the owner's own candidate: the rest is still
+    # judged ("Three classes of a failing regression"). For a task's it is
+    # the gate's answer, no verdict.
+    if [ "$(cat "$1/result")" = defect ] && [ -n "$owner_candidate" ]; then
         return 1
     fi
     [ -e "$1/task" ] || [ "$(cat "$1/result")" = error ] ||
@@ -3840,6 +4134,43 @@ candidate_printed() {
         phase_time candidate
         echo "| $(basename "$printed_scenario") fails on the base twice with the same failing tests: main is red on it, no verdict"
         main_red "$(basename "$printed_scenario")" "$(cat "$1/runs" 2>/dev/null)" "$1/main-red"
+    fi
+    if [ "$printed_status" = defect ]; then
+        # The validator fails on the base too, run now: no evidence against
+        # the candidate. The owner's own candidate is judged on the rest;
+        # a task's gets no verdict, since a base run after its code ran may
+        # never accept it (the header).
+        printed_runs=$(cat "$1/runs" 2>/dev/null)
+        validator_defects="${validator_defects:+$validator_defects,}\"$(json_string "$(basename "$printed_scenario")")\""
+        if [ -n "$owner_candidate" ]; then
+            echo "| $(basename "$printed_scenario") fails on the candidate and on the base, run now ($printed_runs): validator defect (fails on the base too, under the same conditions), not a rejection; the owner's candidate is judged on the rest, and the verdict names it"
+            run_stage "validator_defect|$printed_name" "$printed_ms"
+            return 0
+        fi
+        run_stage "host_fault|$(cat "$1/last")" "$printed_ms"
+        phase_time candidate
+        echo "| $(basename "$printed_scenario") fails on the candidate and on the base, run now ($printed_runs): validator defect (fails on the base too, under the same conditions), not a rejection; no verdict on a task's candidate from a base run that came after its code ran"
+        host_fault "$(basename "$printed_scenario")" "candidate and base" "$printed_runs" \
+            "validator defect: $(basename "$printed_scenario") fails on the base too, run now under the same conditions ($printed_runs): not a verdict on the candidate, and never a rejection" \
+            validator_defect
+    fi
+    if [ "$printed_status" = unstable ]; then
+        printed_runs=$(cat "$1/runs" 2>/dev/null)
+        run_stage "cannot_judge|$(cat "$1/last")" "$printed_ms"
+        phase_time candidate
+        echo "| $(basename "$printed_scenario") failed one of three runs on the candidate and the base passes it ($printed_runs): unstable on the candidate, neither a pass nor a candidate failure: infrastructure (cannot judge), no verdict"
+        # In the words the integrator quotes as the cause (cannot_judge_cause).
+        echo "| $(basename "$printed_scenario" .sh): cannot judge: unstable on the candidate ($printed_runs)"
+        cannot_judge "$(basename "$printed_scenario")" "$printed_runs" "" \
+            "unstable on the candidate: it failed one of three runs there and the base passes it ($printed_runs)"
+    fi
+    if [ "$printed_status" = abort ] && [ -s "$1/infrastructure" ]; then
+        printed_runs=$(cat "$1/runs" 2>/dev/null)
+        run_stage "host_fault|$(cat "$1/last")" "$printed_ms"
+        phase_time candidate
+        echo "| $(basename "$printed_scenario") failed on the candidate and $(cat "$1/infrastructure") ($printed_runs): infrastructure (cannot judge), no verdict"
+        host_fault "$(basename "$printed_scenario")" "candidate and base" "$printed_runs" \
+            "$(basename "$printed_scenario") failed on the candidate and $(cat "$1/infrastructure") ($printed_runs): a host or harness fault, not a verdict on the candidate"
     fi
     if [ "$printed_status" = abort ]; then
         run_stage "host_fault|$(cat "$1/last")" "$printed_ms"
@@ -3961,6 +4292,7 @@ same_in_commits() {
 # reads is run all the same (nothing for one that declares nothing: it is
 # simply run). Every doubt is a run.
 reused_names=""
+quarantined_names=""
 reuse_plan() {
     reuse_why="" reuse_not=""
     reuse_reads=$(declared reads "$1")
@@ -4122,9 +4454,16 @@ for other in "$scenarios"/check-tests.sh "$scenarios"/*.sh; do
     [ "$other" = "$scenarios/check-tests.sh" ] && [ -n "${tests_queued-}" ] && continue
     [ "$other" = "$scenarios/check-tests.sh" ] && tests_queued=1
     not_a_regression "$other" && continue
+    if is_quarantined "$other"; then
+        quarantined="${quarantined:+$quarantined,}\"$(json_string "$(basename "$other")")\""
+        quarantined_names="$quarantined_names $(basename "$other")"
+        continue
+    fi
     add_candidate_job "$other" "regression: $(basename "$other") must still pass" regression
     [ "$other" != "$scenarios/check-tests.sh" ] || : >"$job/head"
 done
+[ -z "$quarantined_names" ] ||
+    echo "| quarantined by the owner's list ($scenarios/quarantined), not run as a regression and named in the verdict:$quarantined_names"
 [ -z "$reused_names" ] ||
     echo "| reused from the base, not run on the candidate:$reused_names (SPAWN_GATE_REUSE=0 runs them)"
 stage_close ok
