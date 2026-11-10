@@ -592,7 +592,7 @@ test("twelve gone: five named, the rest counted, all in full", () => {
   const got = item({ missions: [halted(7, { event: 70, reason: "the scenarios fell from 40 to 28", at_ms: now - 60000, gone })], holds: [] }, 7);
   assert.deepEqual(got.resume, { mission: 7, halt: 70 });
   for (const name of gone.slice(0, 5)) assert.ok(got.detail.includes(name), `detail lacks ${name}: ${got.detail}`);
-  assert.ok(!got.detail.includes("006.sh"), `detail names more than five: ${got.detail}`);
+  assert.ok(!got.detail.includes(gone[5]), `detail names more than five: ${got.detail}`);
   assert.ok(got.detail.includes("and 7 more"), `detail does not count the rest: ${got.detail}`);
   for (const name of gone) assert.ok((got.full ?? "").includes(name), `full lacks ${name}: ${got.full}`);
 });
