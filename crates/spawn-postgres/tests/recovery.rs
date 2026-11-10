@@ -234,10 +234,6 @@ fn a_final_model_record_is_read_until_a_digest_tells_it() {
         )
         .expect("a digest that told it");
     let finals = store.model_finals().expect("the final model records");
-    assert_eq!(
-        finals.as_array().map(|list| list.len()),
-        Some(1),
-        "{finals}"
-    );
+    assert_eq!(finals.as_array().map(Vec::len), Some(1), "{finals}");
     assert_eq!(finals[0]["execution_id"], "exec_s");
 }
