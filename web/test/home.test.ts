@@ -48,6 +48,8 @@ function agent(session: string, fields: Partial<FleetAgent> = {}): FleetAgent {
       current_tool_summary: null,
       jobs: [],
       last_event_name: "screen.observed",
+      turn_open: null,
+      turn_at_ms: null,
       last_event_at_ms: NOW - MIN,
       event_count: 10,
       tool_calls: 3,

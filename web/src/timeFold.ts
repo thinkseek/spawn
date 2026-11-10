@@ -105,6 +105,22 @@ export function foldIdle(
   return { fold, unfold, breaks, keep, blocks };
 }
 
+/** Whether two folds map every time alike. A fold's mapping is its breaks
+ * (each idle stretch's real ends) and `keep`, nothing else: its first
+ * block's start and its last block's end move no time, so a live trace's
+ * fold, rebuilt each second as its last block grows toward now, is the
+ * same map until a break or the band width changes (rev-f F4). With no
+ * break, any fold is the identity. */
+export function sameFoldMap(a: TimeFold, b: TimeFold): boolean {
+  if (a === b) return true;
+  if (a.breaks.length === 0 && b.breaks.length === 0) return true;
+  return (
+    a.keep === b.keep &&
+    a.breaks.length === b.breaks.length &&
+    a.breaks.every((item, index) => item.from === b.breaks[index].from && item.to === b.breaks[index].to)
+  );
+}
+
 /** How long a break stands for, as a short label: "5h 12m idle". */
 export function breakLabel(item: Break): string {
   const minutes = Math.round((item.to - item.from) / 60_000);

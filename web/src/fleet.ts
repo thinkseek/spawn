@@ -72,6 +72,15 @@ export interface Activity {
   jobs: BackgroundJob[];
   last_event_name: string | null;
   last_event_at_ms: number | null;
+  /** Whether the live execution's current turn is open, as the server
+   * reads it from the turn's own start and end records (fleet.rs
+   * `turn_open`): true from `message.received` to `turn.stopped` or
+   * `turn.failed`, false once it ended or before any began; null with no
+   * live execution. What the execution records after the turn ended (a
+   * checkpoint, a notification) leaves it false. */
+  turn_open: boolean | null;
+  /** When that latest turn record was written. */
+  turn_at_ms: number | null;
   event_count: number | null;
   tool_calls: number | null;
   executions: number | null;
@@ -358,6 +367,8 @@ function normalizeAgent(value: unknown): FleetAgent | null {
       jobs: normalizeJobs(activity.jobs),
       last_event_name: optionalText(activity.last_event_name),
       last_event_at_ms: optionalNumber(activity.last_event_at_ms),
+      turn_open: optionalBool(activity.turn_open),
+      turn_at_ms: optionalNumber(activity.turn_at_ms),
       event_count: optionalNumber(activity.event_count),
       tool_calls: optionalNumber(activity.tool_calls),
       executions: optionalNumber(activity.executions),

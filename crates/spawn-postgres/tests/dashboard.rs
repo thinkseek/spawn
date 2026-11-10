@@ -7,8 +7,12 @@
 //! A real database is required (`SPAWN_TEST_DATABASE_URL`).
 
 use serde_json::{Value, json};
-use spawn_core::event::{ENGINE, EventKind, ModelProfile, NewEvent, SessionSeq, Source};
-use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, WorkspaceId};
+use spawn_core::event::{
+    ArtifactRef, CheckpointReason, ENGINE, EventKind, ModelProfile, NewEvent, SessionSeq, Source,
+};
+use spawn_core::id::{
+    AgentId, BranchName, CommandId, CommitId, ExecutionId, SessionId, WorkspaceId,
+};
 use spawn_core::observation::{Confidence, Observation, SemanticState};
 use spawn_core::port::EventLog;
 
@@ -172,6 +176,119 @@ fn the_board_dates_the_current_state_from_its_first_judgement_and_names_the_open
     assert_eq!(health["ladder_24h"]["rules"], 0);
     assert_eq!(health["ladder_24h"]["model"], 5);
     assert_eq!(health["live"], 1);
+}
+
+fn started() -> EventKind {
+    EventKind::ExecutionStarted {
+        engine: ENGINE.to_string(),
+        workspace: WorkspaceId::new("1:/workspaces/1").expect("valid workspace"),
+        command_id: CommandId(1),
+        fork: None,
+        model: ModelProfile::Default,
+        transcript_from: None,
+    }
+}
+
+fn failed() -> EventKind {
+    EventKind::TurnFailed {
+        error: "overloaded".to_string(),
+        status: Some(529),
+        error_kind: None,
+    }
+}
+
+#[test]
+fn the_board_reads_the_live_turn_open_from_its_start_and_end_records_only() {
+    let (store, schema) = store("board_turn");
+    let execution = ExecutionId::new("exec_turn").expect("valid execution");
+    let board = |store: &spawn_postgres::PostgresStore| {
+        row(&store.fleet_board().expect("the board reads"))["activity"].clone()
+    };
+    let append = |key: &str, source: Source, kind: EventKind| {
+        store
+            .append(event(Some(&execution), source, Some(key), kind))
+            .expect("append succeeds");
+    };
+    append("started", Source::Bridge, started());
+    let activity = board(&store);
+    assert_eq!(activity["turn_open"], false, "no turn began: {activity}");
+    assert_eq!(activity["turn_at_ms"], Value::Null);
+
+    append("m1", Source::Claude, EventKind::MessageReceived);
+    let received: i64 = admin(&schema)
+        .query_one(
+            "select recorded_at_ms from spawn_events where event_name = 'message.received'",
+            &[],
+        )
+        .expect("the turn's start")
+        .get(0);
+    let activity = board(&store);
+    assert_eq!(activity["turn_open"], true, "a turn began: {activity}");
+    assert_eq!(activity["turn_at_ms"], json!(received));
+
+    append(
+        "t1",
+        Source::Claude,
+        EventKind::ToolStarted {
+            tool_name: "Bash".to_string(),
+            tool_use_id: "t1".to_string(),
+            summary: None,
+            summary_whole: false,
+        },
+    );
+    assert_eq!(board(&store)["turn_open"], true, "a tool inside the turn");
+
+    append(
+        "s1",
+        Source::Claude,
+        EventKind::TurnStopped {
+            input_tokens: None,
+            output_tokens: None,
+        },
+    );
+    assert_eq!(board(&store)["turn_open"], false, "the turn stopped");
+
+    // What the execution records after its turn ended does not reopen it:
+    // the Bridge's checkpoint of the turn's work (bridge.rs, rev-f F5) and
+    // the engine's own notice that it waits for input.
+    append(
+        "c1",
+        Source::Bridge,
+        EventKind::ArtifactCommitted {
+            reason: CheckpointReason::TurnStopped,
+            artifact: ArtifactRef {
+                project: "missions".to_string(),
+                branch: BranchName::new("agent_board").expect("valid branch"),
+                commit: CommitId::new(format!("{:040x}", 7)).expect("valid commit"),
+            },
+            files: Vec::new(),
+        },
+    );
+    let activity = board(&store);
+    assert_eq!(activity["last_event_name"], "artifact.committed");
+    assert_eq!(
+        activity["turn_open"], false,
+        "a checkpoint after the stop: {activity}"
+    );
+    append(
+        "n1",
+        Source::Claude,
+        EventKind::NotificationReceived {
+            notification_type: "idle_prompt".to_string(),
+        },
+    );
+    let activity = board(&store);
+    assert_eq!(activity["last_event_name"], "notification.received");
+    assert_eq!(
+        activity["turn_open"], false,
+        "a notice after the stop: {activity}"
+    );
+
+    append("f1", Source::Claude, failed());
+    append("m2", Source::Claude, EventKind::MessageReceived);
+    assert_eq!(board(&store)["turn_open"], true, "the next turn began");
+    append("f2", Source::Claude, failed());
+    assert_eq!(board(&store)["turn_open"], false, "a failed turn is over");
 }
 
 #[test]
