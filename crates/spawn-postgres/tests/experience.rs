@@ -79,7 +79,13 @@ fn the_views_derive_decisions_interventions_outcomes_and_escalations_from_the_lo
         vec![
             (hours(20), "accepted".into(), 1, 1, None),
             (hours(30), "landed".into(), 2, 2, None),
-            (hours(35), "cancelled".into(), 3, 1, Some("spawn-dispatch".into())),
+            (
+                hours(35),
+                "cancelled".into(),
+                3,
+                1,
+                Some("spawn-dispatch".into())
+            ),
             (hours(45), "cancelled".into(), 5, 1, None),
             (hours(60), "over_budget".into(), 6, 1, None),
             (hours(62), "aborted".into(), 7, 1, None),
@@ -235,7 +241,11 @@ fn the_fleets_24_hour_ladder_reads_the_decisions_view() {
         .expect("seed the day");
     let health = store.fleet_health().expect("the health reads");
     let ladder = &health["ladder_24h"];
-    assert_eq!(ladder["human"], json!(2), "the board's and the CLI's: {ladder}");
+    assert_eq!(
+        ladder["human"],
+        json!(2),
+        "the board's and the CLI's: {ladder}"
+    );
     assert_eq!(ladder["dispatcher"], json!(1));
     assert_eq!(ladder["rules"], json!(0));
     assert_eq!(
@@ -246,5 +256,8 @@ fn the_fleets_24_hour_ladder_reads_the_decisions_view() {
     let rate = health["human_per_agent_hour"]
         .as_f64()
         .expect("a rate with an execution running");
-    assert!((rate - 1.0).abs() < 0.01, "two in about two agent-hours: {rate}");
+    assert!(
+        (rate - 1.0).abs() < 0.01,
+        "two in about two agent-hours: {rate}"
+    );
 }
