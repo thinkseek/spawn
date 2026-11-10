@@ -38,6 +38,19 @@
 # physical path too: with $SPAWN_LIVE under a symlink (/home -> /data00/home)
 # the path as given matches nothing there. When /proc cannot be read, or the
 # directory cannot be resolved, it is kept: nothing shows it is unused.
+# A controller a judging names is kept too (gate v2 step 2, commit 7): a
+# gate runs in a systemd unit of its own and outlives the integrator that
+# started it, and one judging may run a second gate after the first (a
+# rejection's head judged alone) from the gate.sh its judging.json pinned
+# when it began (`gate`, a physical path), with the scenarios it pinned then
+# (`scenarios`, a physical path, maybe another controller's: Supply's lie in
+# the supply-pa controller, which a Supply push cleans). Between the two no
+# process need hold the directory, so /proc cannot say it is used: every
+# $SPAWN_WORKSPACE_ROOT/judgings/*/judging.json is read, and a controller
+# whose directory holds a named gate or scenarios stays until that judging is
+# gone. A
+# judging.json that cannot be read keeps every controller (nothing shows the
+# one it names is unused) and is said.
 #
 # A commit with a pnpm-lock.yaml at its root also has a deps store: the
 # dependencies its tree runs on, which git does not hold. `deps` installs one
@@ -131,6 +144,32 @@ in_use() {
   hit=$(find /proc/[0-9]*/cwd /proc/[0-9]*/root /proc/[0-9]*/fd -maxdepth 1 \
     \( -lname "$physical" -o -lname "$physical/*" -o -lname "$1" -o -lname "$1/*" \) -print -quit 2>/dev/null) || true
   [ -n "$hit" ]
+}
+
+# judged <directory>: a judging under $SPAWN_WORKSPACE_ROOT/judgings names a
+# gate or scenarios inside it (the header), or a judging.json there cannot be
+# read; the reason in $judged_why. Without the variable or the directory, none.
+judged() {
+  local physical file named path
+  judged_why=""
+  [ -n "${SPAWN_WORKSPACE_ROOT-}" ] && [ -d "$SPAWN_WORKSPACE_ROOT/judgings" ] || return 1
+  physical=$(readlink -f "$1" 2>/dev/null) || physical=$1
+  for file in "$SPAWN_WORKSPACE_ROOT"/judgings/*/judging.json; do
+    [ -e "$file" ] || continue
+    if ! named=$(jq -er '"gate \(.gate // "")", "scenarios \(.scenarios // "")"' "$file" 2>/dev/null); then
+      judged_why="$file cannot be read, so it may name it"
+      return 0
+    fi
+    while read -r what path; do
+      case $path in
+      "$physical"/* | "$1"/* | "$physical" | "$1")
+        judged_why="the judging $(basename "$(dirname "$file")") runs its $what from it"
+        return 0
+        ;;
+      esac
+    done <<<"$named"
+  done
+  return 1
 }
 
 copy_modules() { # copy_modules <source> <destination>
@@ -365,6 +404,10 @@ cleanup() {
     [ "$base" = "$keep_current" ] || [ "$base" = "$keep_prev" ] && continue
     if in_use "$entry"; then
       say "kept $base: a process still uses it"
+      continue
+    fi
+    if judged "$entry"; then
+      say "kept $base: $judged_why"
       continue
     fi
     remove_tree "$entry"
