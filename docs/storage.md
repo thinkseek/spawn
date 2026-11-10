@@ -218,12 +218,18 @@ commit with a key no agent holds cannot hang or fail a test.
   once) and pushed like any checkpoint. The branch moves before the record:
   when the append fails, the next pass asks the store again, which answers
   with the set-aside already at the branch head (its message names the
-  task) and writes nothing, so that pass records and pushes it. A merge
-  pending its markers is set aside with the work. A file the checkpoints
-  leave out (over the cap, or a special file where the branch holds a file:
-  "Files over the cap") is on no branch; the set-aside removes it from a
-  mounted directory, as an unmount would, so the next task finds none of
-  them and none is in the way of the start's file.
+  task) and writes nothing, so that pass records and pushes it (a
+  checkpoint that landed on top meanwhile is set aside by a set-aside of
+  its own, and that one is recorded). A merge pending its markers is set
+  aside with the work. A file the checkpoints leave out (over the cap, or
+  special: "Files over the cap") is in no commit, and nothing says which
+  task made it: a set-aside leaves it in a mounted directory where it is,
+  and the notice says such files stay. Only one at a path the start's tree
+  holds a file at makes way, because the two-tree move would refuse: a file
+  over the cap is moved, never deleted, to
+  `.spawn/set-aside/<the commit that keeps the work>/<path>` (in the
+  workspace only, like any file over the cap), and a special file, which
+  holds nothing, is removed.
 - **A merge that loses the branch race**: when another writer moved the
   branch between the merge's directory update and its compare-and-swap,
   the directory follows the head that won by the same two-tree update

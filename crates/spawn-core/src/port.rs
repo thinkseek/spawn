@@ -384,10 +384,12 @@ pub trait WorkspaceStore: Send + Sync {
     /// records the set-aside: asked again with the same `message` while the
     /// branch head is that set-aside, the store answers the same
     /// [`SetAside::Created`] and writes nothing, so a record that failed is
-    /// made by the retry. What the workspace's checkpoints leave out (a file
-    /// over the size cap, a special file where the branch holds a file) is
-    /// removed from a mounted workspace: it is on no branch, and must not
-    /// stay for the next task.
+    /// made by the retry (a checkpoint taken on top of it meanwhile is set
+    /// aside by a set-aside of its own). What the workspace's checkpoints
+    /// leave out (a file over the size cap, a special file) is in no commit
+    /// and stays in a mounted workspace as it is; only one in the way of a
+    /// file of `start` makes way for it, and a file over the cap is then
+    /// moved aside inside the workspace, never deleted.
     fn set_aside(
         &self,
         branch: &BranchName,
