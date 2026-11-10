@@ -41,7 +41,20 @@
 # the deploy, with the services restarted and the hold released; a pending
 # deploy is completed after a plain stop, never a drain; an
 # integrator not running is not asked; a bad SPAWN_DEPLOY_DRAIN_SECS is
-# refused before anything is done, and says the owner's hold stays.
+# refused before anything is done, and says the owner's hold stays; the
+# mirror (SPAWN_DEPLOY_MIRROR, a local
+# bare repo): without one nothing is pushed or said; a mirror behind is
+# fast-forwarded to the deployed main, after the restart and the hold's
+# release, and gets no tag even with push.followTags set; a mirror that
+# diverged keeps its main and the deploy names both
+# commits; a mirror that is not there, and one that never answers (bounded
+# by SPAWN_DEPLOY_MIRROR_SECS), are one line each; none of them changes the
+# deploy's status; an empty value in the environment turns off the mirror
+# spawn.env names; a deploy that failed publishes nothing, even with main
+# moved; a bad SPAWN_DEPLOY_MIRROR_SECS is refused before anything is done;
+# a mirror that carries a credential (in its URL, in the URL of the remote
+# it names, or after url.*.insteadOf) is refused before anything is done,
+# and the credential reaches neither the output nor any git command line.
 #
 # TEST_DEPLOY_SCRIPT=<path> runs that deploy script instead of the
 # checkout's deploy/deploy.sh (to show which checks fail without a fix).
@@ -109,7 +122,9 @@ real_git=$(command -v git)
 cat >"$scratch/fakebin/git" <<EOF
 #!/bin/sh
 # DEPLOY_TEST_AFTER_PUSH=kill: the deploy dies outright right after its push
-# (no trap runs); =fail: the push "fails" after it landed.
+# (no trap runs); =fail: the push "fails" after it landed. GIT_ARGV_LOG=<file>:
+# every git command line of the deploy, one per line.
+[ -z "\${GIT_ARGV_LOG-}" ] || echo "\$*" >>"\$GIT_ARGV_LOG"
 if [ "\${1-}" = push ] && [ -n "\${DEPLOY_TEST_AFTER_PUSH-}" ]; then
   "$real_git" "\$@" || exit
   case \$DEPLOY_TEST_AFTER_PUSH in
@@ -551,6 +566,161 @@ check "the owner's hold stays (hold $held)" [ "$(missions_hold)" = "$held" ]
 spawn_live mission release --source "$missions" >/dev/null
 check "before any backup" [ "$(ls "$live/backups" | wc -l)" -eq "$backups_before" ]
 check "main did not move" [ "$(main)" = "$base" ]
+
+echo "== the mirror (SPAWN_DEPLOY_MIRROR)"
+# The real binary again, without the drain's shim; no integrator to drain.
+cp "$scratch/real-spawn" "$live/bin/spawn"
+export FAKE_INTEGRATOR_INACTIVE=1
+mirror=$scratch/mirror.git
+git init -q --bare "$mirror"
+mirror_main() { git --git-dir="$mirror" rev-parse refs/heads/main; }
+# mirror_at <commit>: the mirror's main is that commit, main is the base
+# again with a verdict over it.
+mirror_at() {
+  git -C "$checkout" push -q -f "$mirror" "$1:refs/heads/main"
+  git --git-dir="$missions" update-ref refs/heads/main "$base"
+  verdict_over "$base"
+  : >"$SYSTEMCTL_LOG"
+}
+# said_before <text> <text>: the deploy's output holds the first, on a line
+# before the second.
+said_before() {
+  local first second
+  first=$(grep -nF -- "$1" "$out" | head -n 1 | cut -d: -f1)
+  second=$(grep -nF -- "$2" "$out" | head -n 1 | cut -d: -f1)
+  [ -n "$first" ] && [ -n "$second" ] && [ "$first" -lt "$second" ]
+}
+# A git-remote-hang first in PATH: a mirror "hang::<any>" never answers.
+printf '#!/bin/sh\nexec sleep 611\n' >"$scratch/fakebin/git-remote-hang"
+chmod 755 "$scratch/fakebin/git-remote-hang"
+
+echo "-- no mirror set"
+mirror_at "$base"
+deploy
+check "succeeded (status $status)" [ "$status" -eq 0 ]
+check "main moved to HEAD" [ "$(main)" = "$head" ]
+check "nothing was pushed to the mirror" [ "$(mirror_main)" = "$base" ]
+check "nothing is said of a mirror" bash -c '! grep -qi mirror "$1"' _ "$out"
+
+echo "-- a mirror behind the deployed main"
+mirror_at "$base"
+hold_missions
+held=$(missions_hold)
+check "held (hold ${held:-none})" [ -n "$held" ]
+# An annotated tag on HEAD, and a configuration that pushes such tags along.
+git --git-dir="$missions" -c user.name=test -c user.email=test@localhost tag -a -m "test-deploy" deployed-test "$head"
+git --git-dir="$missions" config push.followTags true
+deploy SPAWN_DEPLOY_MIRROR="$mirror"
+git --git-dir="$missions" config --unset push.followTags
+git --git-dir="$missions" tag -d deployed-test >/dev/null
+check "succeeded (status $status)" [ "$status" -eq 0 ]
+check "the mirror's main is HEAD" [ "$(mirror_main)" = "$head" ]
+check "the mirror got main alone: no tag, with push.followTags set" \
+  [ "$(git --git-dir="$mirror" for-each-ref --format='%(refname)')" = refs/heads/main ]
+check "says so" grep -q "published main $head to the mirror $mirror" "$out"
+check "after the restart" said_before "restarted; live at $head" "published main $head"
+check "and after the hold's release" said_before "released the owner's hold $held on $missions" "published main $head"
+
+echo "-- a mirror that diverged (the mirror named in spawn.env)"
+fork=$(git -C "$checkout" -c user.name=test -c user.email=test@localhost \
+  commit-tree "$base^{tree}" -p "$base" -m "pushed to the mirror by hand")
+mirror_at "$fork"
+cp -p "$live/spawn.env" "$scratch/spawn.env.orig"
+printf 'SPAWN_DEPLOY_MIRROR=%q\n' "$mirror" >>"$live/spawn.env"
+deploy
+check "the deploy still succeeded (status $status)" [ "$status" -eq 0 ]
+check "main moved to HEAD" [ "$(main)" = "$head" ]
+check "the services restarted" grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$SYSTEMCTL_LOG"
+check "the mirror keeps its main" [ "$(mirror_main)" = "$fork" ]
+check "says the mirror refused, naming both commits" \
+  grep -q "the mirror $mirror refused main $head: its main is $fork, which $head does not contain; never forced" "$out"
+check "in one line" [ "$(grep -c mirror "$out")" -eq 1 ]
+
+echo "-- an empty SPAWN_DEPLOY_MIRROR in the environment, over spawn.env's"
+mirror_at "$base"
+deploy SPAWN_DEPLOY_MIRROR=
+check "succeeded (status $status)" [ "$status" -eq 0 ]
+check "nothing was pushed to the mirror" [ "$(mirror_main)" = "$base" ]
+check "nothing is said of a mirror" bash -c '! grep -qi mirror "$1"' _ "$out"
+cp -p "$scratch/spawn.env.orig" "$live/spawn.env"
+
+echo "-- a mirror that is not there"
+mirror_at "$base"
+deploy SPAWN_DEPLOY_MIRROR="$scratch/no-such-mirror.git"
+check "the deploy still succeeded (status $status)" [ "$status" -eq 0 ]
+check "main moved to HEAD" [ "$(main)" = "$head" ]
+check "says it could not publish" \
+  grep -q "could not publish main $head to the mirror $scratch/no-such-mirror.git (git push exit " "$out"
+check "in one line" [ "$(grep -c mirror "$out")" -eq 1 ]
+
+echo "-- a mirror that never answers"
+mirror_at "$base"
+start=$(date +%s)
+deploy SPAWN_DEPLOY_MIRROR=hang::mirror SPAWN_DEPLOY_MIRROR_SECS=3
+check "the deploy still succeeded (status $status)" [ "$status" -eq 0 ]
+check "main moved to HEAD" [ "$(main)" = "$head" ]
+check "says the bound was reached" \
+  grep -q "the mirror hang::mirror did not take main $head within 3 s (SPAWN_DEPLOY_MIRROR_SECS)" "$out"
+check "in one line" [ "$(grep -c mirror "$out")" -eq 1 ]
+check "waited the bound, not the mirror's 611 s ($(($(date +%s) - start)) s in all)" [ $(($(date +%s) - start)) -lt 300 ]
+check "the push is not left running" bash -c '! pgrep -u "$(id -u)" -fx "sleep 611" >/dev/null'
+
+echo "-- a deploy that failed, with main moved"
+mirror_at "$base"
+deploy SPAWN_DEPLOY_MIRROR="$mirror" DEPLOY_TEST_AFTER_PUSH=fail
+check "failed (status $status)" [ "$status" -ne 0 ]
+check "main moved to HEAD" [ "$(main)" = "$head" ]
+check "nothing was pushed to the mirror" [ "$(mirror_main)" = "$base" ]
+check "nothing is said of a mirror" bash -c '! grep -qi mirror "$1"' _ "$out"
+
+echo "-- a bad SPAWN_DEPLOY_MIRROR_SECS"
+mirror_at "$base"
+for bad in 0 61 abc; do
+  deploy SPAWN_DEPLOY_MIRROR="$mirror" SPAWN_DEPLOY_MIRROR_SECS="$bad"
+  check "'$bad' refused (status $status)" [ "$status" -ne 0 ]
+  check "'$bad': says why" grep -q "SPAWN_DEPLOY_MIRROR_SECS must be a whole number of seconds from 1 to 60" "$out"
+  check "'$bad': before touching a service" [ ! -s "$SYSTEMCTL_LOG" ]
+done
+check "main did not move" [ "$(main)" = "$base" ]
+check "nothing was pushed to the mirror" [ "$(mirror_main)" = "$base" ]
+
+echo "-- a mirror that carries a credential"
+mirror_at "$base"
+export GIT_ARGV_LOG=$scratch/git-argv.log
+secret=FAKEs3cretT0ken
+git --git-dir="$missions" remote add leaky "https://$secret@127.0.0.1:1/x.git"
+git --git-dir="$missions" remote add leaky-push "$mirror"
+git --git-dir="$missions" config remote.leaky-push.pushurl "ssh://deploy:$secret@127.0.0.1:1/x.git"
+backups_before=$(ls "$live/backups" | wc -l)
+# <what>|<SPAWN_DEPLOY_MIRROR>|<the refusal's words>[|<a git configuration, key=value>]
+for refused in "a password in an https URL|https://user:$secret@127.0.0.1:1/x.git|SPAWN_DEPLOY_MIRROR is a URL that carries a credential" \
+  "a token as the user of an HTTPS URL|HTTPS://$secret@127.0.0.1:1/x.git|SPAWN_DEPLOY_MIRROR is a URL that carries a credential" \
+  "a password in an ssh URL|ssh://git:$secret@127.0.0.1:1/x.git|SPAWN_DEPLOY_MIRROR is a URL that carries a credential" \
+  "a password behind a transport prefix|hang::https://user:$secret@127.0.0.1:1/x.git|SPAWN_DEPLOY_MIRROR is a URL that carries a credential" \
+  "a remote whose URL carries a token|leaky|the mirror leaky (SPAWN_DEPLOY_MIRROR) is pushed to a URL that carries a credential" \
+  "a remote whose pushurl carries a password|leaky-push|the mirror leaky-push (SPAWN_DEPLOY_MIRROR) is pushed to a URL that carries a credential" \
+  "a URL that url.*.insteadOf rewrites to one with a token|https://127.0.0.1:1/x.git|the mirror https://127.0.0.1:1/x.git (SPAWN_DEPLOY_MIRROR) is pushed to a URL that carries a credential|url.https://$secret@127.0.0.1:1/.insteadOf=https://127.0.0.1:1/"; do
+  IFS='|' read -r what value words config <<<"$refused"
+  [ -z "$config" ] || git --git-dir="$missions" config "${config%%=*}" "${config#*=}"
+  : >"$SYSTEMCTL_LOG"
+  : >"$GIT_ARGV_LOG"
+  deploy SPAWN_DEPLOY_MIRROR="$value"
+  [ -z "$config" ] || git --git-dir="$missions" config --unset "${config%%=*}"
+  check "$what: refused (status $status)" [ "$status" -ne 0 ]
+  check "$what: says why, and where the credential goes" \
+    bash -c 'grep -F -- "$2" "$1" | grep -q "credential helper (gh auth setup-git) or use a deploy key over ssh"' _ "$out" "$words"
+  check "$what: the credential is not in the output" bash -c '! grep -qF -- "$2" "$1"' _ "$out" "$secret"
+  check "$what: nor on any git command line (of $(wc -l <"$GIT_ARGV_LOG"))" \
+    bash -c '[ -s "$1" ] && ! grep -qF -- "$2" "$1"' _ "$GIT_ARGV_LOG" "$secret"
+  check "$what: no push ran" bash -c '! grep -q "^push \| push " "$1"' _ "$GIT_ARGV_LOG"
+  check "$what: before touching a service" [ ! -s "$SYSTEMCTL_LOG" ]
+done
+unset GIT_ARGV_LOG
+git --git-dir="$missions" remote remove leaky
+git --git-dir="$missions" remote remove leaky-push
+check "before any backup" [ "$(ls "$live/backups" | wc -l)" -eq "$backups_before" ]
+check "main did not move" [ "$(main)" = "$base" ]
+check "nothing was pushed to the mirror" [ "$(mirror_main)" = "$base" ]
 
 echo
 if [ "$failures" -eq 0 ]; then echo "test-deploy: all passed"; else echo "test-deploy: $failures failed"; exit 1; fi

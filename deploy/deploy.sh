@@ -83,7 +83,10 @@
 #      the background (see warm_base_cache); then each relay whose script
 #      changed gets it and a try-restart; a relay unit that is not installed
 #      is skipped, any other relay failure is reported after the deploy is
-#      live.
+#      live;
+#   8. with SPAWN_DEPLOY_MIRROR set, the deployed main is published to the
+#      mirror (below, "The mirror"): the one step that never stops the
+#      deploy, or fails it.
 # Any failure after the integrator stopped completes a pending deploy (when
 # main is its head) and restarts the services before the deploy exits (with
 # whatever binary is installed by then: the previous one, unless the failure
@@ -103,8 +106,9 @@
 # A release with no hold records nothing, and a release that fails is said,
 # never the deploy's failure. A deploy refused by the lock leaves the hold to
 # the deploy that holds the lock, and so does one refused for its
-# SPAWN_DEPLOY_DRAIN_SECS: that check comes before the lock, so the hold may
-# be a running deploy's, and the refusal says the hold stays. A hold left by
+# SPAWN_DEPLOY_DRAIN_SECS or SPAWN_DEPLOY_MIRROR_SECS: those checks come
+# before the lock, so the hold may be a running deploy's, and the refusal
+# says the hold stays. A hold left by
 # a deploy killed outright expires on its own (SPAWN_SOURCE_HOLD_SECS, 3 h by
 # default).
 #
@@ -138,6 +142,41 @@
 # the deploy says what it costs. A deploy killed outright leaves the
 # integrator stopped, so there is rarely a gate to lose there.
 #
+# The mirror. With SPAWN_DEPLOY_MIRROR set (a URL, or a remote of the
+# missions repo; in the environment or in $live/spawn.env, the environment's
+# value first, and an empty one there means no mirror for that deploy), a
+# deploy that succeeded publishes the main it deployed: `git push
+# --no-follow-tags <mirror> <head>:refs/heads/main` from the missions repo,
+# a plain push, never forced, so the mirror's main only ever moves forward,
+# and main alone: no tag goes with it, whatever push.followTags says. It is
+# the last thing
+# a deploy does: on exit, after the services restarted and the owner's hold
+# was released, so it delays neither (the deploy lock is held until it
+# ends), and only when the deploy exits 0. A deploy that failed publishes
+# nothing, nor does one that is live with a relay not restarted; the next
+# deploy's push carries their commits too. A mirror whose main HEAD does not
+# contain (someone pushed there) refuses the push, and the deploy names both
+# commits; that, a mirror out of reach, a push without a credential, and a
+# push not done within SPAWN_DEPLOY_MIRROR_SECS (default 60, a whole number
+# from 1 to 60, refused before anything else otherwise) are one line on
+# stderr each, never the deploy's failure: its exit status stays 0. The
+# deploy holds no credential and names no URL of its own: the push
+# authenticates as any `git push` of this user does (an ssh key, a
+# credential helper), and never asks for one (GIT_TERMINAL_PROMPT=0, no
+# stdin). Unset: nothing is published, and nothing is said.
+# The credential never goes in the URL: git hands a URL to its helpers as an
+# argument (`git push`, `git remote-https`), where every process on the host
+# reads it from /proc for as long as the push runs. So a mirror that carries
+# one is refused, before the backup and before any service is touched,
+# without the URL being printed or given to any command: an http(s) URL with
+# any user part (a token is often the user alone), any other URL with a
+# user:password (ssh://git@host/... and git@host:... stay), and a remote, or
+# a URL after git's url.<base>.insteadOf and pushInsteadOf, that resolves to
+# such a URL. Put the credential in a credential helper (`gh auth
+# setup-git`) or use a deploy key over ssh. Unlike a push that fails, this
+# refusal is the deploy's (as a bad SPAWN_DEPLOY_MIRROR_SECS is): an empty
+# SPAWN_DEPLOY_MIRROR in the environment deploys without the mirror.
+#
 # Rolling back. spawn.prev is the previous binary. Once the deployed binary
 # has written an event kind the previous one does not know (EventKind is a
 # closed enum: docs/upgrading.md, "Version-coupled boundaries"), the previous
@@ -153,6 +192,7 @@ pending=$live/deploy.pending
 target=${SPAWN_DEPLOY_TARGET:-${XDG_CACHE_HOME:-$HOME/.cache}/spawn/deploy-target}
 min_free_gb=${SPAWN_DEPLOY_MIN_FREE_GB:-10}
 drain_secs=${SPAWN_DEPLOY_DRAIN_SECS:-3600}
+mirror_secs=${SPAWN_DEPLOY_MIRROR_SECS:-60}
 repo=$(git rev-parse --show-toplevel)
 cd "$repo"
 # shellcheck source=deploy/backup/lib.sh
@@ -165,6 +205,9 @@ say() { printf 'deploy: %s\n' "$*"; }
 # The drain's bound (header, "Draining"), checked before anything is done.
 [[ $drain_secs =~ ^[1-9][0-9]*$ ]] && [ "${#drain_secs}" -le 5 ] && [ "$drain_secs" -le 86400 ] ||
   die "SPAWN_DEPLOY_DRAIN_SECS must be a whole number of seconds from 1 to 86400, not '$drain_secs'; nothing was done, and an owner's hold on $missions stays held (deploy again, or: spawn mission release --source $missions)"
+# The mirror's bound (header, "The mirror"), checked as early.
+[[ $mirror_secs =~ ^[1-9][0-9]?$ ]] && [ "$mirror_secs" -le 60 ] ||
+  die "SPAWN_DEPLOY_MIRROR_SECS must be a whole number of seconds from 1 to 60, not '$mirror_secs'; nothing was done, and an owner's hold on $missions stays held (deploy again, or: spawn mission release --source $missions)"
 
 # One deploy at a time: two would share the export directory, the pending
 # record and the services. The lock is released when this process exits.
@@ -190,9 +233,47 @@ release_hold() {
   return 0
 }
 
+# publish_mirror: the deployed main to the mirror, if one is set (header,
+# "The mirror"). A plain push from the missions repo, never forced: a mirror
+# whose main HEAD does not contain refuses it. Never fails, and never waits
+# past $mirror_secs: the push and, after a refusal, the question what the
+# mirror's main is share that bound. Whatever goes wrong is one line.
+publish_mirror() {
+  [ -n "${mirror-}" ] || return 0
+  local shown out code=0 theirs="" left start=$SECONDS
+  # A URL's user stays out of the deploy's output (one with a password was
+  # refused at the start: mirror_credential).
+  shown=$(printf '%s' "$mirror" | sed -E 's#^([A-Za-z0-9+.-]+://)[^/]*@#\1#') || shown="(SPAWN_DEPLOY_MIRROR)"
+  # --no-follow-tags: main and nothing else, whatever push.followTags says.
+  out=$(LC_ALL=C GIT_TERMINAL_PROMPT=0 timeout --kill-after=5 "$mirror_secs" \
+    git --git-dir="$missions" push -q --no-follow-tags "$mirror" "$head:refs/heads/main" 2>&1 </dev/null) || code=$?
+  case $code in
+  0) say "published main $head to the mirror $shown" ;;
+  124 | 137)
+    printf 'deploy: the mirror %s did not take main %s within %s s (SPAWN_DEPLOY_MIRROR_SECS); not published, the deploy is live\n' \
+      "$shown" "$head" "$mirror_secs" >&2
+    ;;
+  *)
+    if [[ $out == *"[rejected]"* ]]; then
+      # git's own refusal of a push that is no fast-forward.
+      left=$((mirror_secs - (SECONDS - start)))
+      [ "$left" -ge 1 ] && theirs=$(GIT_TERMINAL_PROMPT=0 timeout --kill-after=5 "$left" \
+        git --git-dir="$missions" ls-remote "$mirror" refs/heads/main 2>/dev/null </dev/null | cut -f1) || theirs=""
+      printf 'deploy: the mirror %s refused main %s: its main is %s, which %s does not contain; never forced, so not published (the deploy is live): bring the two together by hand\n' \
+        "$shown" "$head" "${theirs:-not known (it did not answer)}" "$head" >&2
+    else
+      printf 'deploy: could not publish main %s to the mirror %s (git push exit %s: %s); the deploy is live\n' \
+        "$head" "$shown" "$code" "$(printf '%s' "${out//"$mirror"/$shown}" | head -c 300 | tr '\n' ' ')" >&2
+    fi
+    ;;
+  esac
+  return 0
+}
+
 # Every exit from here on: the export goes; after a failure with the
 # integrator stopped, a pending deploy is completed and the services
-# restart; then the owner's hold on the missions repo is released.
+# restart; then the owner's hold on the missions repo is released; last,
+# after a deploy that succeeded, its main is published to the mirror.
 export_dir=${TMPDIR:-/tmp}/spawn-deploy-export-$(id -u)
 stopped=0
 completing_at_start=0
@@ -205,6 +286,8 @@ on_exit() {
     restart || printf "deploy: the restart failed too: systemctl --user status spawn-integrate\n" >&2
   fi
   release_hold
+  # "|| true": nothing in it can become the deploy's status.
+  [ "$status" -ne 0 ] || publish_mirror || true
 }
 trap on_exit EXIT
 
@@ -226,10 +309,51 @@ for dir in "${TMPDIR:-/tmp}" "$target"; do
     die "$dir has ${free} GB free, the deploy needs $min_free_gb (SPAWN_DEPLOY_MIN_FREE_GB): free some space first"
 done
 
+# The mirror (header, "The mirror"): the environment's value, an empty one
+# too, before spawn.env's.
+mirror_env=${SPAWN_DEPLOY_MIRROR+set} mirror=${SPAWN_DEPLOY_MIRROR-}
 set -a
 # shellcheck disable=SC1091
 . "$live/spawn.env"
 set +a
+[ -n "$mirror_env" ] || mirror=${SPAWN_DEPLOY_MIRROR-}
+
+# mirror_credential <url>: the URL carries a credential (header, "The
+# mirror"): an http(s) URL with any user part, any other <scheme>:// URL
+# with a user:password. A transport prefix (<helper>::) is looked through;
+# a path, and scp's git@host:path, carry none.
+mirror_credential() {
+  local url=$1 scheme authority
+  while [[ $url =~ ^[A-Za-z0-9+.-]+::(.*)$ ]]; do url=${BASH_REMATCH[1]}; done
+  [[ $url =~ ^([A-Za-z][A-Za-z0-9+.-]*)://([^/]*) ]] || return 1
+  scheme=${BASH_REMATCH[1],,} authority=${BASH_REMATCH[2]}
+  [[ $authority == *@* ]] || return 1
+  case $scheme in http | https) return 0 ;; esac
+  [[ ${authority%@*} == *:* ]]
+}
+# The mirror is refused when it carries one, before anything is done. The
+# text first, so such a URL is never an argument, not even here; then what
+# git would push to: the remote's URLs when it names a remote of the
+# missions repo (as git rewrites them), else the URL under every
+# url.<base>.insteadOf and pushInsteadOf whose prefix it starts with (git
+# takes the longest; any one that would add a credential refuses). Nothing
+# here prints a URL.
+if [ -n "$mirror" ]; then
+  mirror_fix="put the credential in a credential helper (gh auth setup-git) or use a deploy key over ssh, never in the URL (git passes a URL to its helpers as an argument, readable in /proc by every process on this host); SPAWN_DEPLOY_MIRROR= (empty) in the environment deploys without the mirror"
+  case $mirror in -*) die "SPAWN_DEPLOY_MIRROR starts with '-': name a URL or a remote of $missions" ;; esac
+  ! mirror_credential "$mirror" ||
+    die "SPAWN_DEPLOY_MIRROR is a URL that carries a credential (not printed); nothing was deployed: $mirror_fix"
+  mirror_urls=$(git --git-dir="$missions" remote get-url --push --all -- "$mirror" 2>/dev/null) ||
+    mirror_urls=$(git --git-dir="$missions" config --get-regexp '^url\..*\.(pushinsteadof|insteadof)$' 2>/dev/null |
+      while read -r mirror_key mirror_prefix; do
+        mirror_key=${mirror_key#url.}
+        case $mirror in "$mirror_prefix"*) printf '%s\n' "${mirror_key%.*}${mirror#"$mirror_prefix"}" ;; esac
+      done) || mirror_urls=""
+  while IFS= read -r mirror_url; do
+    ! mirror_credential "$mirror_url" ||
+      die "the mirror $mirror (SPAWN_DEPLOY_MIRROR) is pushed to a URL that carries a credential (not printed; see remote.*.url, remote.*.pushurl and url.*.insteadOf in git's configuration); nothing was deployed: $mirror_fix"
+  done <<<"$mirror_urls"
+fi
 
 restart() { systemctl --user restart spawn-loop spawn-integrate spawn-serve; }
 
