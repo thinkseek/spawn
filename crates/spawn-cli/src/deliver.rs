@@ -463,6 +463,10 @@ pub(crate) struct Cancelled {
     /// An abort's reason for yielding as well (`yield_reason`).
     #[serde(default)]
     pub(crate) yield_reason: Option<String>,
+    /// The task it was reassigned as (`spawn_task_reassign`): its worker is
+    /// stopped under the reassign's key ([`reassign_stop_key`]).
+    #[serde(default)]
+    pub(crate) reassigned_as: Option<i64>,
 }
 
 impl Cancelled {
@@ -504,7 +508,10 @@ pub(crate) fn cancel_notice(cancelled: &Cancelled) -> String {
             " by the integrator, to yield its objective's slot ({})",
             one_line(reason, 400)
         ),
-        _ => String::new(),
+        _ => match cancelled.reassigned_as {
+            Some(new) => format!(", and reassigned to a fresh worker as task #{new}"),
+            None => String::new(),
+        },
     };
     let by = match cancelled.yield_reason.as_deref() {
         Some(why)
@@ -1489,7 +1496,12 @@ fn cancel_order(cancelled: &Cancelled, facts: &Facts, now_ms: i64) -> Option<Ord
     };
     if facts.live {
         let execution = facts.execution_id.as_deref().unwrap_or("none");
-        let key = format!("cancel-stop-{}-{execution}", cancelled.id);
+        let key = match cancelled.reassigned_as {
+            Some(_) if facts.sent(&reassign_stop_key(cancelled.id)).is_none() => {
+                reassign_stop_key(cancelled.id)
+            }
+            _ => format!("cancel-stop-{}-{execution}", cancelled.id),
+        };
         return Some(cancelled.command(key, CommandAction::Stop));
     }
     if !due {
