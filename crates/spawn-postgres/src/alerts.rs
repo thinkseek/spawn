@@ -24,6 +24,60 @@ pub(crate) const MISSION_SOURCES: &str = "select coalesce(jsonb_agg(jsonb_build_
 /// an idle pass costs the loop one statement (objective 023).
 pub(crate) const CLOCK: &str = "select coalesce(max(id), 0), spawn_now_ms() from spawn_events";
 
+/// The messages the `message_not_taken` alert reads (objective 045;
+/// `spawn_command_message`), on the database's clock (`now_ms`), with `$1`
+/// the bound in milliseconds (SPAWN_MESSAGE_TAKEN_SECS):
+/// - `waiting`: each tracked message no `message.taken` names whose session
+///   has not ended with it, with its `due_ms` and whether it is `not_taken`
+///   now. Only the commands that can be one are read: those of each live
+///   session from its execution's own start on (an input typed into that
+///   execution came after it; one before it was typed into an execution
+///   that ended, or failed), and the unfinished ones.
+/// - `open`: the messages of the commands `$2` (the open alerts'), each with
+///   `taken` and `ended`, what clears an alert.
+pub(crate) const MESSAGES: &str = r"
+with m as (select spawn_messages_marked_from() as marked_from, spawn_now_ms() as now_ms
+           offset 0),
+live as (
+  select l.session_id, l.from_command
+    from spawn_session_state t
+    cross join lateral (
+      select s.session_id, (s.kind -> 'detail' ->> 'command_id')::bigint as from_command,
+             s.execution_id
+        from spawn_events s
+       where s.session_id = t.session_id and s.event_name = 'execution.started'
+       order by s.id desc limit 1) l
+   where not exists (select 1 from spawn_events x
+                      where x.session_id = l.session_id and x.event_name = 'execution.ended'
+                        and x.source = 'bridge' and x.execution_id = l.execution_id)),
+candidates as (
+  select k.* from spawn_commands k join live l
+      on k.session_id = l.session_id and k.id >= l.from_command
+  union
+  select k.* from spawn_commands k where k.state <> 'finished'),
+waiting as (
+  select k.id, k.agent_id, k.session_id, k.action ->> 'type' as action, k.created_at_ms,
+         spawn_command_message(k, $1, m.marked_from, m.now_ms) as message
+    from candidates k, m)
+select jsonb_build_object(
+  'now_ms', (select now_ms from m),
+  'waiting', coalesce((select jsonb_agg(jsonb_build_object(
+        'command_id', w.id, 'agent_id', w.agent_id, 'session_id', w.session_id,
+        'action', w.action, 'created_at_ms', w.created_at_ms,
+        'due_ms', w.message -> 'due_ms', 'not_taken', w.message -> 'not_taken',
+        'typed', w.message -> 'typed', 'state', w.message -> 'state') order by w.id)
+      from waiting w
+     where w.message is not null and (w.message ->> 'tracked')::boolean
+       and (w.message ->> 'taken')::bigint = 0 and not (w.message ->> 'ended')::boolean),
+    '[]'::jsonb),
+  'open', coalesce((select jsonb_agg(jsonb_build_object(
+        'command_id', k.id, 'taken', x.message -> 'taken',
+        'taken_at_ms', x.message -> 'taken_at_ms', 'state', x.message -> 'state',
+        'ended', coalesce(x.message -> 'ended', 'true'::jsonb)) order by k.id)
+      from spawn_commands k, m,
+           lateral (select spawn_command_message(k, $1, m.marked_from, m.now_ms) as message) x
+     where k.id = any($2)), '[]'::jsonb))";
+
 /// The database's clock alone, the one every bound is measured by.
 pub(crate) const NOW: &str = "select spawn_now_ms()";
 
@@ -280,6 +334,13 @@ impl PostgresStore {
     /// Every session's latest judgement ([`OBSERVATIONS`]).
     pub fn alert_observations(&self) -> Result<Value, StoreError> {
         self.query_json(OBSERVATIONS, &[])
+    }
+
+    /// The messages the `message_not_taken` alert reads ([`MESSAGES`]):
+    /// `bound_ms` is SPAWN_MESSAGE_TAKEN_SECS, `open` the commands of the
+    /// open alerts.
+    pub fn alert_messages(&self, bound_ms: i64, open: &[i64]) -> Result<Value, StoreError> {
+        self.query_json(MESSAGES, &[&bound_ms, &open])
     }
 
     /// Commands that finished failed after `since_ms` ([`FAILED_COMMANDS`]).
