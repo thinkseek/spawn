@@ -31,6 +31,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use serde_json::{Value, json};
+use spawn_core::port::TranscriptArchive as _;
 use spawn_postgres::PostgresStore;
 
 use history::{Facts, History};
@@ -164,12 +165,27 @@ pub(crate) fn measure(
     )
     .map_err(|error| Failure::Record(format!("the record's facts: {error}")))?;
     let previous_since = window.since - (window.until - window.since);
-    let messages =
-        transcripts::read_archive(&root.join(spawn_host::TRANSCRIPT_DIRECTORY), previous_since)
-            .map_err(Failure::Record)?;
+    let archive = root.join(spawn_host::TRANSCRIPT_DIRECTORY);
+    // Where the archive stands is read before the archive: a copy recorded
+    // as made is in what is read after it.
+    let progress = spawn_host::LocalTranscriptArchive::new(&archive)
+        .progress()
+        .map_err(|error| Failure::Record(error.to_string()))?;
+    let messages = transcripts::read_archive(&archive, previous_since).map_err(Failure::Record)?;
     let mut history = History::from_record(&facts, &messages);
     history.clip(previous_since, window.until);
-    card(&history, window, mission)
+    let mut card = card(&history, window, mission)?;
+    settle(&mut card, spawn_core::transcripts::settling(&progress, window.until));
+    Ok(card)
+}
+
+/// Say whether the card's window is still settling: the archive may lack a
+/// model call some execution made before the window's end, so its cost may
+/// still grow (`spawn_core::transcripts::ArchiveProgress::holds_open`).
+fn settle(card: &mut Value, settling: bool) {
+    if let Some(card) = card.as_object_mut() {
+        card.insert("settling".to_string(), Value::Bool(settling));
+    }
 }
 
 /// The scorecard of `history` over `window`: the fleet and every mission
@@ -482,8 +498,13 @@ fn days_table(days: &[Value]) -> String {
 pub(crate) fn text(card: &Value) -> String {
     let at = |key: &str| card.get(key).and_then(Value::as_i64).unwrap_or(0);
     let min_n = card.get("min_n").cloned().unwrap_or(Value::Null);
+    let settling = if card.get("settling").and_then(Value::as_bool) == Some(true) {
+        "; settling: a turn running at the window's end may add to its cost"
+    } else {
+        ""
+    };
     let mut out = format!(
-        "spawn scorecard {} to {} (previous window from {}); minimum n {}\n",
+        "spawn scorecard {} to {} (previous window from {}); minimum n {}{settling}\n",
         format_rfc3339(at("since_ms")),
         format_rfc3339(at("until_ms")),
         format_rfc3339(at("previous_since_ms")),
