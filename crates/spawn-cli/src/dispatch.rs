@@ -742,6 +742,63 @@ pub(crate) struct Reading {
 /// ([`read_plan`]): each is said once.
 static ORDER_LOGGED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
 
+/// The items the store's records raise for the host, in the order the
+/// supervisor is told them: the gate's room and host faults, its base
+/// disagreements, a red main, a source away, shadow verdicts, budgets,
+/// objective yields, solves and order, and hold and drain expiries.
+fn record_news(store: &PostgresStore) -> Result<Vec<Escalation>, String> {
+    let mut news = Vec::new();
+    news.extend(crate::disk::gate_room_escalations(&records(
+        store.gate_room_escalations(),
+        "gate room records",
+    )?));
+    news.extend(digest::host_fault_escalations(&records(
+        store.gate_host_fault_escalations(),
+        "gate host fault records",
+    )?));
+    news.extend(digest::base_disagrees_alerts(&records(
+        store.gate_base_disagrees_alerts(),
+        "gate base disagreement records",
+    )?));
+    news.extend(digest::main_red_news(&records(
+        store.main_red_news(),
+        "red main records",
+    )?));
+    news.extend(digest::source_away_news(&records(
+        store.source_away_news(),
+        "source away records",
+    )?));
+    news.extend(digest::shadow_disagreements(&records(
+        store.shadow_disagreements(),
+        "shadow verdict records",
+    )?));
+    news.extend(digest::over_budget_escalations(&records(
+        store.over_budget_escalations(),
+        "over budget records",
+    )?));
+    news.extend(digest::objective_yields(&records(
+        store.objective_yields(),
+        "objective yield records",
+    )?));
+    news.extend(digest::objective_solved(&records(
+        store.objective_solved_news(),
+        "objective solved records",
+    )?));
+    news.extend(digest::objective_order(&records(
+        store.objective_backlogs(),
+        "objective backlogs",
+    )?));
+    news.extend(digest::hold_expiries(&records(
+        store.hold_expiries(),
+        "source hold records",
+    )?));
+    news.extend(digest::drain_expiries(&records(
+        store.drain_expiries(),
+        "integrator drain records",
+    )?));
+    Ok(news)
+}
+
 /// One function for both, so the queue a person reads is the dispatcher's
 /// own.
 pub(crate) fn read_plan(
@@ -757,54 +814,7 @@ pub(crate) fn read_plan(
     let mut lines = Vec::new();
     let now = now_ms();
     let mut host = disk(now);
-    host.extend(crate::disk::gate_room_escalations(&records(
-        store.gate_room_escalations(),
-        "gate room records",
-    )?));
-    host.extend(digest::host_fault_escalations(&records(
-        store.gate_host_fault_escalations(),
-        "gate host fault records",
-    )?));
-    host.extend(digest::base_disagrees_alerts(&records(
-        store.gate_base_disagrees_alerts(),
-        "gate base disagreement records",
-    )?));
-    host.extend(digest::main_red_news(&records(
-        store.main_red_news(),
-        "red main records",
-    )?));
-    host.extend(digest::source_away_news(&records(
-        store.source_away_news(),
-        "source away records",
-    )?));
-    host.extend(digest::shadow_disagreements(&records(
-        store.shadow_disagreements(),
-        "shadow verdict records",
-    )?));
-    host.extend(digest::over_budget_escalations(&records(
-        store.over_budget_escalations(),
-        "over budget records",
-    )?));
-    host.extend(digest::objective_yields(&records(
-        store.objective_yields(),
-        "objective yield records",
-    )?));
-    host.extend(digest::objective_solved(&records(
-        store.objective_solved_news(),
-        "objective solved records",
-    )?));
-    host.extend(digest::objective_order(&records(
-        store.objective_backlogs(),
-        "objective backlogs",
-    )?));
-    host.extend(digest::hold_expiries(&records(
-        store.hold_expiries(),
-        "source hold records",
-    )?));
-    host.extend(digest::drain_expiries(&records(
-        store.drain_expiries(),
-        "integrator drain records",
-    )?));
+    host.extend(record_news(store)?);
     // Every timer the records read here name: the times at which this step
     // would decide something new even though nothing is appended meanwhile.
     // A time already reached is no wait (the step acts on it now), so only
