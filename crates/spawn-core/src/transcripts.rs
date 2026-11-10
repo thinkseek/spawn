@@ -364,8 +364,8 @@ mod tests {
     use super::{
         ArchiveProgress, archive, archive_to, first_line_ms, parse_rfc3339_ms, restore, settling,
     };
-    use crate::id::{ExecutionId, SessionId};
     use crate::id::{AgentId, WorkspaceId};
+    use crate::id::{ExecutionId, SessionId};
     use crate::memory::MemoryStore;
     use crate::port::{READ_LIMIT, TerminalHost, TranscriptArchive};
     use crate::time::SystemClock;
@@ -452,7 +452,11 @@ mod tests {
     #[test]
     fn the_first_line_the_archive_lacks_is_read_from_its_start() {
         let (store, _, workspace) = setup();
-        assert_eq!(first_line_ms(&store, &workspace, PATH, 0), Ok(None), "no file");
+        assert_eq!(
+            first_line_ms(&store, &workspace, PATH, 0),
+            Ok(None),
+            "no file"
+        );
         let one = "{\"timestamp\":\"1970-01-01T00:00:01.000Z\"}\n";
         let two = "{\"type\":\"summary\"}\n{\"timestamp\":\"1970-01-01T00:00:02.000Z\"}\n";
         store.append_file(PATH, one);
@@ -461,7 +465,10 @@ mod tests {
         let first = u64::try_from(one.len()).expect("fits");
         assert_eq!(first_line_ms(&store, &workspace, PATH, 0), Ok(Some(1_000)));
         // A line with no time is passed over for the next that has one.
-        assert_eq!(first_line_ms(&store, &workspace, PATH, first), Ok(Some(2_000)));
+        assert_eq!(
+            first_line_ms(&store, &workspace, PATH, first),
+            Ok(Some(2_000))
+        );
         // An offset inside a line: that line, whose end is not archived.
         assert_eq!(first_line_ms(&store, &workspace, PATH, 5), Ok(Some(1_000)));
         assert_eq!(first_line_ms(&store, &workspace, PATH, length), Ok(None));
