@@ -14841,4 +14841,155 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// Objective 036, through the store: an accepted verdict a gate run gave
+    /// carries what it judged (`inputs`, `env`), lands, and is judged again
+    /// beside it on the runner the controller's dispatcher names. The runner
+    /// rejects it: the task stays landed, nothing is counted, the record
+    /// says the two disagree on equal inputs, and the supervisor's digest
+    /// has one item for it until a delivered digest tells it. A verdict on
+    /// another scenario set is recorded without a comparison and is no news.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_shadow_judges_a_copy_beside_the_verdict_and_decides_nothing() {
+        let gate = "echo '| == setup'\n\
+                    echo '| base cache: toolchain primary-tc'\n\
+                    printf '{\"verdict\":\"accepted\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+        let (base, source, _, integrator) = world("shadow", gate);
+        let ctl = base.join("ctl");
+        let scenarios = ctl.join("rsi").join("scenarios");
+        std::fs::create_dir_all(&scenarios).expect("scenarios");
+        std::fs::create_dir_all(ctl.join("deploy")).expect("deploy");
+        std::fs::write(scenarios.join("check-ok.sh"), "exit 0\n").expect("a check");
+        let marker = "0123456789abcdef0123456789abcdef01234567";
+        std::fs::write(ctl.join(".controller"), format!("{marker}\n")).expect("marker");
+        // The runner's dispatcher: it notes its arguments, places a
+        // rejection naming the runner's toolchain, and exits 0.
+        let notes = base.join("dispatched");
+        std::fs::write(
+            ctl.join("deploy/gate-runner.sh"),
+            format!(
+                "printf '%s\\n' \"$@\" >>'{notes}'\n\
+                 job=\"$6/$(printf %s \"$4\" | cut -c1-12)-x\"\n\
+                 mkdir -p \"$job\"\n\
+                 printf '{{\"result\":\"verdict\",\"host\":\"runner-host\"}}\\n' >\"$job/record.json\"\n\
+                 printf '{{\"verdict\":\"rejected\"}}\\n' >\"$job/verdict.json\"\n\
+                 printf '| base cache: toolchain runner-tc\\n' >\"$job/gate.log\"\n",
+                notes = notes.display()
+            ),
+        )
+        .expect("dispatcher");
+        let shadow_dir = base.join("shadow");
+        let integrator = integrator.with_shadow(
+            super::shadow::Settings {
+                runner: "bb-runner".to_string(),
+                every: 1,
+            },
+            shadow_dir.clone(),
+        );
+        let db = Db::new("shadow");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        push_work(&base, &source, &agent_of(&db, mission, task), "work.txt");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        let (gated_record, _, _) = last_verdict(&db);
+        assert_eq!(gated_record["verdict"], "accepted", "{gated_record}");
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        let given = &gated_record["inputs"];
+        assert_eq!(given["base"], gated_record["base"]);
+        assert_eq!(given["candidate"], gated_record["candidate"]);
+        assert_eq!(given["controller"], marker);
+        assert_eq!(
+            given["scenarios_sha256"],
+            json!(super::inputs::scenarios_sha256(&scenarios))
+        );
+        assert_eq!(given["scenario"], Value::Null);
+        assert_eq!(gated_record["env"]["toolchain"], "primary-tc");
+        assert_eq!(gated_record["env"]["runner"], Value::Null);
+
+        let shadows = || control_records(&db, "task.shadow_gated");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while shadows().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no shadow record within 30 s"
+            );
+            integrator.pass_on(&db.store).expect("a pass");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let record = shadows()[0].clone();
+        assert_eq!(record["id"], task);
+        assert_eq!(record["runner"], "bb-runner");
+        assert_eq!(record["result"], "verdict");
+        assert_eq!(record["verdict"], "rejected");
+        assert_eq!(record["primary"], "accepted");
+        assert_eq!(record["exit"], 0);
+        assert_eq!(record["inputs"], *given, "{record}");
+        assert_eq!(record["unequal"], json!([]));
+        assert_eq!(record["agrees"], json!(false));
+        assert_eq!(record["env"]["toolchain"], "runner-tc");
+        assert_eq!(record["env"]["host"], "runner-host");
+        assert_eq!(record["primary_env"], gated_record["env"]);
+        let dispatched = std::fs::read_to_string(&notes).expect("the dispatcher ran");
+        let arguments: Vec<&str> = dispatched.lines().collect();
+        assert_eq!(arguments[0], "bb-runner");
+        assert_eq!(Some(arguments[2]), given["base"].as_str());
+        assert_eq!(Some(arguments[3]), given["candidate"].as_str());
+        // The shadow decided nothing, and its directory is gone.
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        let after = gated(&db, mission);
+        assert_eq!(after.gate_rejections, 0);
+        assert_eq!(after.gate_aborts, 0);
+        let left: Vec<_> = std::fs::read_dir(&shadow_dir)
+            .expect("the shadow directory")
+            .flatten()
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        // Told once: an item of its own until a digest carrying its tag is
+        // delivered.
+        let items = crate::dispatch::digest::shadow_disagreements(
+            db.store
+                .shadow_disagreements()
+                .expect("disagreements")
+                .as_array()
+                .expect("a list"),
+        );
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].why, crate::dispatch::Why::ShadowDisagrees);
+        assert!(items[0].why.is_news());
+        let line = &items[0].line;
+        assert!(
+            line.contains(&format!("#{task} "))
+                && line.contains("shadow")
+                && line.contains("bb-runner")
+                && line.contains("accepted")
+                && line.contains("rejected")
+                && line.contains("primary-tc")
+                && line.contains("runner-tc"),
+            "{line}"
+        );
+        // More passes record nothing more.
+        integrator.pass_on(&db.store).expect("a pass");
+        assert_eq!(shadows().len(), 1);
+
+        // A record that compared nothing is never news, and the store takes
+        // no `agrees` on unequal inputs.
+        let mut unequal = record.clone();
+        unequal["unequal"] = json!(["scenarios_sha256"]);
+        unequal["agrees"] = Value::Null;
+        db.record(&unequal);
+        unequal["agrees"] = json!(false);
+        assert!(db.store.integrator_record(&unequal).is_err());
+        assert_eq!(
+            db.store
+                .shadow_disagreements()
+                .expect("disagreements")
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
