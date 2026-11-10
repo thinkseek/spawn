@@ -483,9 +483,15 @@ pub(crate) struct Monitor {
     /// reading in a row, so a path that comes and goes does not flap). A
     /// restart forgets them: its first reading starts the count again.
     away_once: BTreeMap<(i64, String), i64>,
-    /// When the earliest tracked message not taken yet reaches its bound,
-    /// as the last reading of the messages found (`message_not_taken`).
+    /// When the earliest pending message reaches its bound, as the last
+    /// reading of the messages found (`message_not_taken`).
     messages_due: Option<i64>,
+    /// The newest command the messages' reading has seen: the next reads
+    /// the commands after it.
+    messages_after: i64,
+    /// The tracked messages not taken, not alerted and whose session has not
+    /// ended with them, read again until one of those changes.
+    pending: BTreeSet<i64>,
 }
 
 impl Monitor {
@@ -520,6 +526,8 @@ impl Monitor {
             unlocked_since: None,
             away_once: BTreeMap::new(),
             messages_due: None,
+            messages_after: 0,
+            pending: BTreeSet::new(),
         }
     }
 
@@ -538,6 +546,7 @@ impl Monitor {
             return Ok(lines);
         }
         let mut events = Vec::new();
+        let moved = watermark > self.watermark;
         if watermark > self.watermark {
             let batch = store
                 .alert_control(self.watermark, BATCH)
@@ -568,9 +577,11 @@ impl Monitor {
             self.commands(&commands, &mut events);
             self.commands_after = now.saturating_sub(1000);
         }
-        // The messages are read at each reading and when one falls due: a
-        // message is said not taken within one check of its bound.
-        if reading_due || self.messages_due.is_some_and(|due| now >= due) {
+        // The messages are read when the log moved (a new command, a typing,
+        // a taking, an end all append) and when a pending one falls due:
+        // the new commands and the pending ones only, so an idle pass reads
+        // nothing (objective 023).
+        if moved || self.messages_due.is_some_and(|due| now >= due) {
             self.read_messages(store, &mut events, &mut lines);
         }
         if reading_due {
@@ -662,7 +673,7 @@ impl Monitor {
         // The messages, read back as they stand: an alert the store holds
         // fires nothing again, and one due while the loop was down fires.
         let messages = store
-            .alert_messages(self.settings.message_taken_ms, &self.open_messages())
+            .alert_messages_all(self.settings.message_taken_ms, &self.open_messages())
             .map_err(|error| error.to_string())?;
         self.messages(&messages, &mut events);
         self.watermark = store.alert_clock().map_err(|error| error.to_string())?.0;
@@ -1454,15 +1465,19 @@ times in a row)",
             .collect()
     }
 
-    /// Read the messages ([`PostgresStore::alert_messages`]) and decide.
-    /// An error is said and read again at the next check.
+    /// Read the commands after the last one seen, the pending messages and
+    /// the open alerts' ([`PostgresStore::alert_messages_since`]), and
+    /// decide. An error is said and read again at the next pass.
     fn read_messages(
         &mut self,
         store: &PostgresStore,
         out: &mut Vec<Event>,
         lines: &mut Vec<String>,
     ) {
-        match store.alert_messages(self.settings.message_taken_ms, &self.open_messages()) {
+        let mut ids = self.open_messages();
+        ids.extend(self.pending.iter().copied());
+        match store.alert_messages_since(self.settings.message_taken_ms, self.messages_after, &ids)
+        {
             Ok(messages) => self.messages(&messages, out),
             Err(error) => lines.push(format!("alerts: messages: {error}")),
         }
@@ -1471,21 +1486,42 @@ times in a row)",
     /// `message_not_taken`: a tracked message no `message.taken` names past
     /// its bound, its session not ended with it, fires once; an open one
     /// clears once it is taken, or once its session ended with it untaken.
-    /// The next bound is the earliest of those not due yet.
+    /// One not due yet is pending, read again until it is taken, ends or
+    /// fires; the next bound is the earliest pending one's.
     fn messages(&mut self, messages: &Value, out: &mut Vec<Event>) {
-        let mut next: Option<i64> = None;
-        for message in messages["waiting"].as_array().into_iter().flatten() {
+        for message in messages["messages"].as_array().into_iter().flatten() {
             let Some(id) = message["command_id"].as_i64() else {
                 continue;
             };
             let key = format!("message_not_taken:{id}");
+            let taken = message["taken"].as_i64().unwrap_or_default();
+            let ended = message["ended"].as_bool() != Some(false);
             if self.known.contains_key(&key) {
+                self.pending.remove(&id);
+                if !self.is_open(&key) {
+                    continue;
+                }
+                if taken > 0 {
+                    out.push(Event::Clear {
+                        key,
+                        evidence: json!({"taken": taken, "taken_at_ms": message["taken_at_ms"]}),
+                    });
+                } else if ended {
+                    out.push(Event::Clear {
+                        key,
+                        evidence: json!({"ended": true, "state": message["state"]}),
+                    });
+                }
                 continue;
             }
+            if message["tracked"].as_bool() != Some(true) || taken > 0 || ended {
+                self.pending.remove(&id);
+                continue;
+            }
+            // Pending until its alert is in the store: a fire the store
+            // refused for an error is tried again.
+            self.pending.insert(id);
             if message["not_taken"].as_bool() != Some(true) {
-                if let Some(due) = message["due_ms"].as_i64() {
-                    next = Some(next.map_or(due, |next| next.min(due)));
-                }
                 continue;
             }
             let typed = message["typed"].as_bool() == Some(true);
@@ -1519,28 +1555,22 @@ times in a row)",
                 notice: false,
             });
         }
-        for message in messages["open"].as_array().into_iter().flatten() {
-            let Some(id) = message["command_id"].as_i64() else {
-                continue;
-            };
-            let key = format!("message_not_taken:{id}");
-            if !self.is_open(&key) {
-                continue;
-            }
-            let taken = message["taken"].as_i64().unwrap_or_default();
-            if taken > 0 {
-                out.push(Event::Clear {
-                    key,
-                    evidence: json!({"taken": taken, "taken_at_ms": message["taken_at_ms"]}),
-                });
-            } else if message["ended"].as_bool() != Some(false) {
-                out.push(Event::Clear {
-                    key,
-                    evidence: json!({"ended": true, "state": message["state"]}),
-                });
-            }
+        if let Some(max) = messages["max_id"].as_i64() {
+            self.messages_after = self.messages_after.max(max);
         }
-        self.messages_due = next;
+        // The earliest bound of a pending message not due yet.
+        self.messages_due = messages["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|message| {
+                message["command_id"]
+                    .as_i64()
+                    .is_some_and(|id| self.pending.contains(&id))
+                    && message["not_taken"].as_bool() != Some(true)
+            })
+            .filter_map(|message| message["due_ms"].as_i64())
+            .min();
     }
 
     /// The model judge's `down` records that reached their bound
