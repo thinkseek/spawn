@@ -80,10 +80,11 @@ test("keys read as the page shows them, in the hint and in command rows", () => 
 });
 
 test("/ focuses the search, unless the reader is typing or the terminal panel is armed", () => {
-  const press = { key: "/", ctrlKey: false, altKey: false, metaKey: false, inText: false, armed: false };
+  const press = { key: "/", ctrlKey: false, altKey: false, metaKey: false, inText: false, armed: false, modal: false };
   assert.equal(slashFocusesSearch(press), true);
   assert.equal(slashFocusesSearch({ ...press, inText: true }), false, "in a text box, / is a character");
   assert.equal(slashFocusesSearch({ ...press, armed: true }), false, "armed, the keys are the agent's (P11)");
+  assert.equal(slashFocusesSearch({ ...press, modal: true }), false, "a modal drawer is open: focus stays in it");
   assert.equal(slashFocusesSearch({ ...press, ctrlKey: true }), false);
   assert.equal(slashFocusesSearch({ ...press, metaKey: true }), false);
   assert.equal(slashFocusesSearch({ ...press, altKey: true }), false);
