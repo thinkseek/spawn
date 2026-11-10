@@ -68,9 +68,10 @@
 //!   is ready to accept connections` line after it, or after
 //!   `SPAWN_ALERT_PG_QUIET_SECS` (default 900) with no such line.
 //! - `source_away`, `mission #<id>`, key `source_away:<mission>:<reading
-//!   ms>`, evidence its `source`: at a reading, a source of an open or active
-//!   mission that is a path on this host (absolute) is not a
-//!   directory: an unmounted volume, a moved checkout. Its agents' branches
+//!   ms>`, evidence its `source`: at two readings in a row, a source of an
+//!   open or active mission that is a path on this host (absolute) is not a
+//!   directory: an unmounted volume, a moved checkout (one reading only
+//!   notes it, so a path that comes and goes does not flap). Its agents' branches
 //!   are not published to it until it is back (the pusher retries, and says
 //!   so only once, in its log: fix-core-b item 6). One per mission and
 //!   source while it is away; clears at the first reading that finds the
@@ -421,6 +422,11 @@ pub(crate) struct Monitor {
     /// The first reading of the current run that found no integrator
     /// holding its lock while reported work waited (`integrator_down`).
     unlocked_since: Option<i64>,
+    /// The (mission, source) pairs the last reading found away with no
+    /// alert yet, and when it did (`source_away` fires on the second
+    /// reading in a row, so a path that comes and goes does not flap). A
+    /// restart forgets them: its first reading starts the count again.
+    away_once: BTreeMap<(i64, String), i64>,
 }
 
 impl Monitor {
@@ -452,6 +458,7 @@ impl Monitor {
             commands_after: 0,
             logs,
             unlocked_since: None,
+            away_once: BTreeMap::new(),
         }
     }
 
@@ -1400,10 +1407,11 @@ times in a row)",
     }
 
     /// What a reading of `watched` (mission, source) decides, given what is
-    /// a directory: fire for each source away with none open, clear each
-    /// open one whose source is back or no longer watched.
+    /// a directory: fire for each source away at this reading and the one
+    /// before with none open, clear each open one whose source is back or
+    /// no longer watched.
     fn source_events(
-        &self,
+        &mut self,
         watched: &BTreeSet<(i64, String)>,
         present: impl Fn(&str) -> bool,
         now: i64,
@@ -1437,15 +1445,22 @@ times in a row)",
                 open.insert(entry);
             }
         }
+        let mut away = BTreeMap::new();
         for (mission, source) in watched {
-            if open.contains(&(*mission, source.clone())) || present(source) {
+            let entry = (*mission, source.clone());
+            if open.contains(&entry) || present(source) {
                 continue;
             }
+            // The first reading that finds it away only notes it.
+            let Some(since) = self.away_once.get(&entry).copied() else {
+                away.insert(entry, now);
+                continue;
+            };
             out.push(Event::Fire {
                 key: format!("source_away:{mission}:{now}"),
                 kind: "source_away",
                 subject: format!("mission #{mission}"),
-                evidence: json!({"source": source, "present": false}),
+                evidence: json!({"source": source, "present": false, "away_since_ms": since}),
                 text: format!(
                     "{source} is not a directory on this host: mission #{mission}'s \
                      branches are not published to it until it is back"
@@ -1453,6 +1468,7 @@ times in a row)",
                 notice: false,
             });
         }
+        self.away_once = away;
         out
     }
 
@@ -3048,6 +3064,8 @@ mod tests {
         ]
         .into();
         let gone = |path: &str| !path.starts_with("/mnt/vol");
+        // The first reading that finds them away only notes it.
+        assert!(monitor.source_events(&watched, gone, 500).is_empty());
         let first = monitor.source_events(&watched, gone, 1000);
         assert_eq!(fires(&first), ["source_away:4:1000", "source_away:6:1000"]);
         let Event::Fire {
@@ -3062,6 +3080,10 @@ mod tests {
         };
         assert_eq!(subject, "mission #4");
         assert_eq!(evidence["source"], "/mnt/vol/a.git");
+        assert_eq!(
+            evidence["away_since_ms"], 500,
+            "since the first reading that found it"
+        );
         assert!(
             text.contains("/mnt/vol/a.git is not a directory") && !notice,
             "{text}"
@@ -3080,7 +3102,8 @@ mod tests {
         };
         assert_eq!(evidence["present"], true);
         commit(&mut monitor, &back);
-        // Away again: a new occurrence, a new key.
+        // Away again: a new occurrence, a new key, after two readings again.
+        assert!(monitor.source_events(&watched, gone, 3500).is_empty());
         let again = monitor.source_events(&watched, gone, 4000);
         assert_eq!(fires(&again), ["source_away:4:4000", "source_away:6:4000"]);
         commit(&mut monitor, &again);
@@ -3100,6 +3123,36 @@ mod tests {
             panic!("a clear: {closed:?}");
         };
         assert_eq!(evidence["reason"], "no longer watched");
+    }
+
+    /// rev-f's N2: a path that is away at one reading and back at the next,
+    /// again and again, fires nothing; one away at two readings in a row
+    /// fires once.
+    #[test]
+    fn a_source_that_comes_and_goes_does_not_flap() {
+        let mut flapping = monitor();
+        let watched: BTreeSet<(i64, String)> = [(4, "/mnt/vol/a.git".to_string())].into();
+        for reading in 0..6 {
+            let away = reading % 2 == 0;
+            let events = flapping.source_events(&watched, |_| !away, reading * 1000);
+            assert!(events.is_empty(), "reading {reading}: {events:?}");
+        }
+        assert!(flapping.source_events(&watched, |_| false, 6000).is_empty());
+        let fired = flapping.source_events(&watched, |_| false, 7000);
+        assert_eq!(fires(&fired), ["source_away:4:7000"]);
+        // Unwatched in between: the count starts again.
+        let mut other = monitor();
+        assert!(other.source_events(&watched, |_| false, 0).is_empty());
+        assert!(
+            other
+                .source_events(&BTreeSet::new(), |_| false, 1000)
+                .is_empty()
+        );
+        assert!(other.source_events(&watched, |_| false, 2000).is_empty());
+        assert_eq!(
+            fires(&other.source_events(&watched, |_| false, 3000)),
+            ["source_away:4:3000"]
+        );
     }
 
     #[test]
