@@ -8,15 +8,10 @@ import type { AnimationPlaybackControls } from "motion/react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
 
-import { clampDomain, panDomain, zoomDomain } from "../../timeWindow";
-import type { Domain } from "../../timeWindow";
+import { clampDomain, panDomain, refollow, zoomDomain } from "../../timeWindow";
+import type { Domain, Follow } from "../../timeWindow";
 
-/** What the window follows: the whole extent, the live end with a fixed
- * width, or a fixed range. */
-export type Follow =
-  | { mode: "fit" }
-  | { mode: "tail"; width: number }
-  | { mode: "fixed"; domain: Domain };
+export type { Follow } from "../../timeWindow";
 
 /** Pointer travel that turns a press into a drag. */
 export const DRAG_PX = 3;
@@ -37,6 +32,11 @@ export interface TimeWindow {
   /** Glide to a range with some air around it. */
   zoomTo: (from: number, to: number) => void;
   fit: () => void;
+  /** Show `from` to the live end, and keep following that end. */
+  since: (from: number) => void;
+  /** The axis changed under the window (a new fold): `map` takes an old
+   * axis time to the new axis time of the same real moment (refollow). */
+  refold: (map: (time: number) => number) => void;
   stop: () => void;
   /** Latest values, for native listeners. */
   latest: RefObject<{ domain: Domain; extent: Domain; scale: number }>;
@@ -52,6 +52,9 @@ export function useTimeWindow(
     if (follow.mode === "fit") return extent;
     if (follow.mode === "tail") {
       return clampDomain({ from: extent.to - follow.width, to: extent.to }, extent);
+    }
+    if (follow.mode === "since") {
+      return clampDomain({ from: Math.max(extent.from, follow.from), to: extent.to }, extent);
     }
     return clampDomain(follow.domain, extent);
   }, [follow, extent]);
@@ -74,23 +77,32 @@ export function useTimeWindow(
   }, []);
 
   const glide = useRef<AnimationPlaybackControls | null>(null);
+  // The running glide's two windows, read on each frame, so a refold can
+  // move them to the new axis and the glide still lands where it meant to.
+  const glideEnds = useRef<{ from: Domain; target: Domain } | null>(null);
   const stop = useCallback(() => glide.current?.stop(), []);
   const glideTo = useCallback(
     (target: Domain) => {
       glide.current?.stop();
-      const from = latest.current.domain;
       if (reduceMotion) {
         setDomain(target);
         return;
       }
+      const ends = { from: latest.current.domain, target };
+      glideEnds.current = ends;
       glide.current = animate(0, 1, {
         duration: 0.32,
         ease: [0.2, 0.8, 0.2, 1],
-        onUpdate: (t) =>
+        onUpdate: (t) => {
+          const { from, target: to } = ends;
           setDomain({
-            from: from.from + (target.from - from.from) * t,
-            to: from.to + (target.to - from.to) * t,
-          }),
+            from: from.from + (to.from - from.from) * t,
+            to: from.to + (to.to - from.to) * t,
+          });
+        },
+        onComplete: () => {
+          if (glideEnds.current === ends) glideEnds.current = null;
+        },
       });
     },
     [reduceMotion, setDomain],
@@ -112,6 +124,20 @@ export function useTimeWindow(
     [glideTo],
   );
   const fit = useCallback(() => glideTo(latest.current.extent), [glideTo]);
+  const since = useCallback((from: number) => {
+    glide.current?.stop();
+    setFollow({ mode: "since", from });
+  }, []);
+  // A glide in flight is moved to the new axis, not stopped (rev-f F4).
+  const refold = useCallback((map: (time: number) => number) => {
+    const ends = glideEnds.current;
+    if (ends) {
+      const moved = (domain: Domain) => ({ from: map(domain.from), to: map(domain.to) });
+      ends.from = moved(ends.from);
+      ends.target = moved(ends.target);
+    }
+    setFollow((current) => refollow(current, map));
+  }, []);
 
   return {
     domain,
@@ -124,6 +150,8 @@ export function useTimeWindow(
     zoomBy,
     zoomTo,
     fit,
+    since,
+    refold,
     stop,
     latest,
   };

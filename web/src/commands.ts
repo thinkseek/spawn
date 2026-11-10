@@ -43,6 +43,26 @@ export function commandGist(text: string | null): string | null {
   return lines[0];
 }
 
+/** A named key as the page shows it (backlog P1): the key command's text
+ * is its name (`escape`, `up`, …). */
+export const KEY_LABEL: Record<string, string> = {
+  escape: "Esc",
+  up: "↑",
+  down: "↓",
+  left: "←",
+  right: "→",
+  enter: "Enter",
+  y: "Y",
+  n: "N",
+};
+
+/** What a command says in one line: a key command its key (`Esc`), any
+ * other its text's gist ([`commandGist`]). */
+export function commandSummary(action: string, text: string | null): string | null {
+  if (action === "key") return text ? (KEY_LABEL[text] ?? text) : null;
+  return commandGist(text);
+}
+
 /** `Dispatcher → input`: who sent it and what it is. */
 export function commandHead(principal: string, action: string): string {
   return `${principalWords(principal)} → ${action}`;
@@ -50,7 +70,7 @@ export function commandHead(principal: string, action: string): string {
 
 /** A command's row: `Dispatcher → input · <gist>`. */
 export function commandWords(principal: string, action: string, text: string | null): string {
-  const gist = commandGist(text);
+  const gist = commandSummary(action, text);
   return gist ? `${commandHead(principal, action)} · ${gist}` : commandHead(principal, action);
 }
 

@@ -7,7 +7,10 @@ import type { FleetAgent, FleetHealth } from "../src/fleet.ts";
 import {
   currentToolText,
   actionableAlerts,
+  agentMatches,
   agentName,
+  agentNames,
+  agentSearchFields,
   agentsNow,
   alertMoot,
   alertStale,
@@ -48,6 +51,8 @@ function agent(session: string, fields: Partial<FleetAgent> = {}): FleetAgent {
       current_tool_summary: null,
       jobs: [],
       last_event_name: "screen.observed",
+      turn_open: null,
+      turn_at_ms: null,
       last_event_at_ms: NOW - MIN,
       event_count: 10,
       tool_calls: 3,
@@ -458,4 +463,66 @@ test("an open tool reads as its key input; a call recorded without one reads as 
   assert.equal(currentToolText({ ...base, current_tool: "Read", current_tool_summary: "web/src/home.ts:1-80" }), "Read · web/src/home.ts:1-80");
   assert.equal(currentToolText({ ...base, current_tool: "Read", current_tool_summary: null }), "Read");
   assert.equal(currentToolText({ ...base, current_tool: null, current_tool_summary: "stale" }), null);
+});
+
+test("every agent has one name, its worker's from its open task, else its latest", () => {
+  const supply = mission(6, "Supply PA", [
+    task(222, "working", { session_id: "session_worker_objective_239", agent_id: "agent_worker_objective_239", task_title: "holds on a cart" } as Partial<MissionTask>),
+    task(220, "landed", { session_id: "session_worker_objective_101", agent_id: "agent_worker_objective_101" }),
+  ]);
+  const context = fleetContext(missions([supply]));
+  const names = agentNames(
+    [
+      agent("session_supervisor", { role: "supervisor" }),
+      agent("session_worker_objective_239"),
+      agent("session_worker_objective_101", { live: false }),
+      agent("session_smoke_transcript", { live: false }),
+    ],
+    context,
+  );
+  assert.equal(names.get("session_supervisor"), "supervisor");
+  assert.equal(names.get("session_worker_objective_239"), "worker · Supply PA T222");
+  assert.equal(names.get("session_worker_objective_101"), "worker · Supply PA T220", "an ended worker, by its latest task");
+  assert.equal(names.get("session_smoke_transcript"), "agent_smoke_transcript", "no task: its id");
+});
+
+test("two workers on one task (a reassign) keep apart: the T-number and a short suffix from the session id", () => {
+  const supply = mission(6, "Supply PA", [
+    task(222, "working", { session_id: "session_worker_objective_244", agent_id: "agent_worker_objective_244" }),
+    task(222, "cancelled", { session_id: "session_worker_objective_239", agent_id: "agent_worker_objective_239" }),
+  ]);
+  const context = fleetContext(missions([supply]));
+  const pair = [agent("session_worker_objective_244"), agent("session_worker_objective_239", { live: false })];
+  const names = agentNames(pair, context);
+  assert.equal(names.get("session_worker_objective_244"), "worker · Supply PA T222 · 244");
+  assert.equal(names.get("session_worker_objective_239"), "worker · Supply PA T222 · 239");
+  // Last words alike: the last six characters.
+  const alike = agentNames([agent("session_a_x", { agent_id: "agent_same" }), agent("session_b_x", { agent_id: "agent_same" })], fleetContext(missions([])));
+  assert.equal(alike.get("session_a_x"), "agent_same · on_a_x");
+  assert.equal(alike.get("session_b_x"), "agent_same · on_b_x");
+  // Unique across the board, whatever collides.
+  const many = agentNames([...pair, agent("session_worker_objective_239b", { live: false, agent_id: "agent_worker_objective_239" })], context);
+  assert.equal(new Set(many.values()).size, 3, [...many.values()].join(" / "));
+});
+
+test("home's agents now use the board's unique names", () => {
+  const supply = mission(6, "Supply PA", [
+    task(222, "working", { session_id: "session_worker_objective_244", agent_id: "agent_worker_objective_244" }),
+    task(222, "working", { session_id: "session_worker_objective_239", agent_id: "agent_worker_objective_239" }),
+  ]);
+  const model = agentsNow([agent("session_worker_objective_244"), agent("session_worker_objective_239")], fleetContext(missions([supply])));
+  assert.deepEqual(model.working.map((row) => row.name), ["worker · Supply PA T222 · 239", "worker · Supply PA T222 · 244"]);
+});
+
+test("the search matches every word, case aside, in the name, the ids, the T-number, the title or the mission", () => {
+  const supply = mission(6, "Supply PA", [
+    task(220, "landed", { session_id: "session_worker_objective_101", agent_id: "agent_worker_objective_101", task_title: "Holds on a cart" } as Partial<MissionTask>),
+  ]);
+  const context = fleetContext(missions([supply]));
+  const ended = agent("session_worker_objective_101", { live: false });
+  const fields = agentSearchFields(ended, context, "worker · Supply PA T220");
+  for (const query of ["t220", "T220", "supply cart", "objective_101", "agent_worker", "  worker   holds ", ""]) {
+    assert.equal(agentMatches(query, fields), true, query);
+  }
+  for (const query of ["T221", "supply truck", "rsi"]) assert.equal(agentMatches(query, fields), false, query);
 });
