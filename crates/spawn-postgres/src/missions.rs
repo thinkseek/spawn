@@ -695,7 +695,7 @@ select count(*)
 pub(crate) const OBJECTIVE_FORK: &str = r"
 select coalesce((
   select jsonb_build_object('task', p.id, 'commit', c.commit,
-                            'reassign', p.id = k.reassign_of is true)
+                            'reassign', (p.id = k.reassign_of) is true)
     from mission_tasks k
     join mission_tasks p on p.mission_id = k.mission_id
                         and (p.id = k.reassign_of or p.objective = k.objective)
@@ -728,6 +728,52 @@ select coalesce((
                     and a.kind -> 'detail' ->> 'reason'
                         in ('tool_completed', 'turn_stopped', 'execution_ended'))
    order by (p.id = k.reassign_of) is true desc, p.id desc limit 1), 'null'::jsonb)";
+
+/// What replaced what in one session (`GET /api/session/<id>`), as
+/// `{restart_of, reassigned_to, reassigned_from}`:
+///
+/// - `restart_of`: for each execution a restart's resume started (the
+///   dispatcher's command keyed `restart-<task>-<n>`), the execution of the
+///   same session it replaced: the one that `task.restarted` record names,
+///   else the session's execution before it; an object by execution id;
+/// - `reassigned_to`: `{task, session_id}` of the task this session's
+///   latest reassigned task went to, and its worker's session, or null;
+/// - `reassigned_from`: `{task, session_id}` of the task this session's
+///   latest task took over, and its worker's session, or null.
+///
+/// `$1` the session.
+pub(crate) const SESSION_LINKS: &str = r"
+select jsonb_build_object(
+  'restart_of', (
+    select coalesce(jsonb_object_agg(e.execution_id, coalesce(r.execution_id, p.execution_id)),
+                    '{}'::jsonb)
+      from agent_executions e
+      join spawn_commands c on c.id = e.command_id
+       and c.principal = 'spawn-dispatch' and c.idempotency_key ~ '^restart-[0-9]+-[0-9]+$'
+      left join lateral (
+        select x.kind -> 'detail' -> 'record' ->> 'execution_id' as execution_id
+          from spawn_events x
+         where x.session_id = 'session_control' and x.event_name = 'control.recorded'
+           and x.kind -> 'detail' -> 'record' ->> 'type' = 'task.restarted'
+           and x.kind -> 'detail' -> 'record' ->> 'task' = split_part(c.idempotency_key, '-', 2)
+           and x.kind -> 'detail' -> 'record' ->> 'n' = split_part(c.idempotency_key, '-', 3)
+         order by x.session_seq desc limit 1) r on true
+      left join lateral (
+        select b.execution_id from agent_executions b
+         where b.session_id = e.session_id
+           and (b.started_at_ms, b.execution_id) < (e.started_at_ms, e.execution_id)
+         order by b.started_at_ms desc, b.execution_id desc limit 1) p on true
+     where e.session_id = $1),
+  'reassigned_to', (
+    select jsonb_build_object('task', n.id, 'session_id', n.session_id)
+      from mission_tasks o join mission_tasks n on n.reassign_of = o.id
+     where o.session_id = $1
+     order by n.id desc limit 1),
+  'reassigned_from', (
+    select jsonb_build_object('task', o.id, 'session_id', o.session_id)
+      from mission_tasks n join mission_tasks o on o.id = n.reassign_of
+     where n.session_id = $1
+     order by n.id desc limit 1))";
 
 /// Missions with a gate that are open, or closed with work the closure rule
 /// (`spawn_task_may_continue`) still lets go on, with that work: every task
@@ -1815,6 +1861,12 @@ impl PostgresStore {
         Ok(self
             .query_one("select spawn_task_reissue($1, $2)", &[&task, attempts])?
             .get(0))
+    }
+
+    /// What replaced what in `session`: the executions restarts started,
+    /// and the reassigns to and from it ([`SESSION_LINKS`]).
+    pub fn session_links(&self, session: &str) -> Result<Value, StoreError> {
+        self.query_json(SESSION_LINKS, &[&session])
     }
 
     /// Restart `task`'s worker (`spawn task restart`, the owner and the
