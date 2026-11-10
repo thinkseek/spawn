@@ -1116,11 +1116,14 @@ A message's id is its command's id, carried end to end:
   after the text (the workspace notices typed before the text are part of
   the same message; `crates/spawn-core/src/message.rs`, the Bridge's
   `type_once`). A one-line text carries it at the end of its line instead,
-  after a space, when it is a start's or a resume's prompt (typed as the
-  engine comes up) or goes into a pane whose program reads keys raw (its tty
-  has `-icanon`, which the tmux host reads with `stty -a`): such a program,
-  unless it asked for a bracketed paste, takes each pasted line break as
-  Enter, and the marker would be a prompt of its own. Every typing carries it: an input, and a start's or a
+  after a space, whatever the pane reads: a program that reads keys raw (its
+  tty has `-icanon`), unless it asked for a bracketed paste, takes each
+  pasted line break as Enter, and one that reads lines submits each pasted
+  line, so a marker on a line of its own would be a prompt of its own, and
+  the engine could act on the text, or exit, before the Bridge's Enter
+  (regression 003 under load; rev-e's analysis of 2026-11-11). The answer
+  line (objective 046, below) follows the marker the same way: after a
+  space on a one-line text, so the paste stays one line. Every typing carries it: an input, and a start's or a
   resume's prompt. The Bridge records `message.typed` (keyed
   `cmd_<id>:message`) once the marked text is staged and before its
   `typing` step: the record that says this command's text carried the
@@ -1193,7 +1196,8 @@ A message's id is its command's id, carried end to end:
   says which: `spawn ack <command id> done|declined [<why>]`, run in its
   own pane (a why is required for `declined`: the words after the outcome;
   optional for `done`). The marker is followed by one line that tells it
-  so (`message.rs`'s `answer_line`: `spawn ack <id> done`, or `spawn ack
+  so (after a space, on the same line, for a text of one line;
+  `message.rs`'s `answer_line`: `spawn ack <id> done`, or `spawn ack
   <id> declined <why>`, and that a task's delivery is answered by its
   report). The pane has no database login, and the ack needs none: it is
   a file, written whole (hidden, then renamed) into the workspace the

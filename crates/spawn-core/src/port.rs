@@ -501,9 +501,9 @@ pub trait TerminalHost: Send + Sync {
     /// Whether the terminal's program reads its input a line at a time
     /// (canonical mode), so a line break in a paste is one more line of the
     /// same input; false when it reads keys raw and takes a line break it is
-    /// not told is pasted as Enter. True when the host cannot tell. The
-    /// Bridge puts a message's marker ([`crate::message`]) on a line of its
-    /// own when this is true.
+    /// not told is pasted as Enter. True when the host cannot tell. Where the
+    /// Bridge puts a message's marker ([`crate::message`]) no longer depends
+    /// on it: a one-line text carries it on its line either way.
     fn reads_lines(&self, _terminal: &TerminalName, _workspace: &WorkspaceId) -> bool {
         true
     }
