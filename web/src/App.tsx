@@ -380,6 +380,9 @@ export default function App() {
                 sessionId={detail.session_id}
                 tail={detail.window}
                 executions={detail.executions}
+                reassignedTo={detail.reassigned_to}
+                reassignedFrom={detail.reassigned_from}
+                onOpenSession={setSelectedId}
               />
             ) : (
               <Placeholder
