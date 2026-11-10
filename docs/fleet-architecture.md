@@ -1282,10 +1282,15 @@ the tree's own:
 - `<scenarios>/build` builds each tree;
 - when a task has a scenario, that scenario must fail on the base (exit 1)
   and pass on the candidate;
-- every other scenario must pass on the candidate, except ratchet scenarios
-  and objective scenarios (`<digits>.sh`) the base fails too. The checks are
-  scenarios: `check-clippy`, `check-tests`, `check-e2e`, `check-blackbox`,
-  `check-web`. The halt rule on the scenario count (§10.3) protects them.
+- every other scenario must pass on the candidate, except ratchet scenarios,
+  task-only scenarios (`# rsi: task-only`: run only as their own task's
+  scenario, never on the base for another gate nor as a regression; 029,
+  which no gate's sandbox can judge) and objective scenarios (`<digits>.sh`)
+  the base fails too. The checks are scenarios, among them `check-clippy`,
+  `check-tests`, `check-e2e`, `check-blackbox`, `check-web` and
+  `check-model-relay` (the relay in front of stub upstreams: the route by
+  model, the model mapping, a stream asked for again before its first
+  event, the cut signal, the body cap). The halt rule on the scenario count (§10.3) protects them.
   check-tests runs first among the regressions (the most often decisive,
   so its failure stops the rest early);
 - a check that fails on the candidate is run again there, as an
