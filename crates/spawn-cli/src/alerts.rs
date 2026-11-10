@@ -3545,9 +3545,18 @@ mod tests {
 
     /// A restart that reads an open `message_not_taken` alert back: the
     /// message, still not taken, fires nothing again; taken, it clears,
-    /// once; and a message not due yet sets the step's next bound.
+    /// once. A message not due yet is pending, sets the step's next bound,
+    /// and fires once at it.
     #[test]
     fn a_restart_keeps_a_message_not_taken_one_alert() {
+        let message = |id: i64, due: i64, not_taken: bool, taken: i64| {
+            json!({"command_id": id, "agent_id": "agent_worker_a",
+                   "session_id": "session_worker_a", "action": "input",
+                   "created_at_ms": due - 120_000, "due_ms": due, "tracked": true,
+                   "not_taken": not_taken, "typed": true, "taken": taken,
+                   "taken_at_ms": if taken > 0 { json!(due) } else { Value::Null },
+                   "ended": false, "state": if taken > 0 { "taken" } else { "typed" }})
+        };
         let mut restarted = super::Monitor::with(settings());
         restarted.known.insert(
             "message_not_taken:41".to_string(),
@@ -3561,43 +3570,33 @@ mod tests {
             },
         );
         assert_eq!(restarted.open_messages(), [41]);
-        let still = json!({
-            "now_ms": 500_000,
-            "waiting": [
-                {"command_id": 41, "agent_id": "agent_worker_a", "session_id": "session_worker_a",
-                 "action": "input", "created_at_ms": 1000, "due_ms": 121_000,
-                 "not_taken": true, "typed": true, "state": "typed"},
-                {"command_id": 42, "agent_id": "agent_worker_a", "session_id": "session_worker_a",
-                 "action": "input", "created_at_ms": 490_000, "due_ms": 610_000,
-                 "not_taken": false, "typed": true, "state": "typed"}
-            ],
-            "open": [{"command_id": 41, "taken": 0, "taken_at_ms": null, "state": "typed",
-                      "ended": false}]
-        });
+        let still = json!({"now_ms": 500_000, "max_id": 42, "messages": [
+            message(41, 121_000, true, 0), message(42, 610_000, false, 0)]});
         let mut out = Vec::new();
         restarted.messages(&still, &mut out);
         assert!(decided(&restarted, out).is_empty(), "not fired again");
         assert_eq!(restarted.messages_due, Some(610_000));
+        assert_eq!(restarted.messages_after, 42);
+        assert_eq!(restarted.pending.iter().copied().collect::<Vec<_>>(), [42]);
         restarted.plan(500_000);
         assert_eq!(restarted.next_bound_ms, Some(610_000));
 
-        let taken = json!({
-            "now_ms": 501_000, "waiting": [],
-            "open": [{"command_id": 41, "taken": 1, "taken_at_ms": 500_500, "state": "taken",
-                      "ended": false}]
-        });
+        let due = json!({"now_ms": 610_000, "max_id": 42, "messages": [
+            message(41, 121_000, true, 1), message(42, 610_000, true, 0)]});
         let mut out = Vec::new();
-        restarted.messages(&taken, &mut out);
-        let cleared = decided(&restarted, out);
+        restarted.messages(&due, &mut out);
+        let events = decided(&restarted, out);
         assert!(
-            matches!(&cleared[..], [Event::Clear { key, evidence }]
-                if key == "message_not_taken:41" && evidence["taken"] == 1),
-            "{cleared:?}"
+            matches!(&events[..], [Event::Clear { key, evidence }, Event::Fire { key: fired, .. }]
+                if key == "message_not_taken:41" && evidence["taken"] == 1
+                    && fired == "message_not_taken:42"),
+            "{events:?}"
         );
-        commit(&mut restarted, &cleared);
+        commit(&mut restarted, &events);
         let mut out = Vec::new();
-        restarted.messages(&taken, &mut out);
-        assert!(decided(&restarted, out).is_empty(), "cleared once");
+        restarted.messages(&due, &mut out);
+        assert!(decided(&restarted, out).is_empty(), "each once");
+        assert!(restarted.pending.is_empty());
         assert_eq!(restarted.messages_due, None);
     }
 
@@ -4814,12 +4813,13 @@ connections\n";
             Monitor::with(settings)
         }
 
+        /// The step's own reading of the messages: the commands after the
+        /// last it saw, its pending messages and its open alerts'.
         fn read(monitor: &mut Monitor, store: &PostgresStore) -> Vec<Event> {
-            let messages = store
-                .alert_messages(monitor.settings.message_taken_ms, &monitor.open_messages())
-                .expect("the messages");
             let mut out = Vec::new();
-            monitor.messages(&messages, &mut out);
+            let mut lines = Vec::new();
+            monitor.read_messages(store, &mut out, &mut lines);
+            assert!(lines.is_empty(), "{lines:?}");
             decided(monitor, out)
         }
 
