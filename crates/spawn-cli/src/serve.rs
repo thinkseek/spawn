@@ -2731,9 +2731,9 @@ mod tests {
                 std::process::id(),
                 super::now_ms()
             ));
-            const HOUR: i64 = 3_600_000;
+            let hour: i64 = 3_600_000;
             let b = 1_700_006_400_000;
-            for (since, until) in [(b, b + 100 * HOUR), (b + 24 * HOUR, b + 72 * HOUR)] {
+            for (since, until) in [(b, b + 100 * hour), (b + 24 * hour, b + 72 * hour)] {
                 let asked = crate::scorecard::Query {
                     mission: None,
                     since: Some(crate::scorecard::time::format_rfc3339(since)),
