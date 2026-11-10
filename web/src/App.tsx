@@ -380,6 +380,7 @@ export default function App() {
                 sessionId={detail.session_id}
                 tail={detail.window}
                 executions={detail.executions}
+                to={inputTarget(detail.session_id, pollNames.get(detail.session_id) ?? null, detail.agent_id)}
               />
             ) : (
               <Placeholder
