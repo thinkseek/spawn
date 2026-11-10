@@ -4180,7 +4180,7 @@ begin
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
         'spawn_alert_record(jsonb)', 'spawn_backup_record(jsonb)',
-        'spawn_cost_record(jsonb)',
+        'spawn_cost_record(jsonb)', 'spawn_cost_usd(jsonb, bigint, bigint, bigint, bigint)',
         'spawn_objective_assign(bigint, integer, text, text, bigint)', 'spawn_task_stages(bigint)',
         'spawn_landing_hold(bigint)', 'spawn_landing_release()',
         'spawn_source_holdable(text)', 'spawn_source_hold_lock(text)',
