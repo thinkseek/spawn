@@ -390,6 +390,15 @@
 //!   the workers made a load of 18-20, and task 172's gate failed on its
 //!   base.)
 //!
+//! A verdict a gate run gave binds what it judged and where (`inputs`:
+//! base, candidate, controller commit, scenario-set digest, task scenario;
+//! `env`: host, toolchain, runner; [`inputs`]). With
+//! `SPAWN_GATE_SHADOW_RUNNER` set, an `accepted` or `rejected` one is judged
+//! again on that gate runner in the background, and its end is recorded
+//! beside it (`task.shadow_gated`, [`shadow`]); it never decides or delays
+//! anything, and a disagreement on equal inputs is told to the supervisor
+//! once.
+//!
 //! Every judging records its own outcome (`task.gated`, `task.landed`), as
 //! before; the pass reads those records, never the thread's result. An
 //! owner's landing (step 0) never touches a judging: one on another source
@@ -435,7 +444,9 @@ use crate::{Flags, env_or, open_store};
 use crate::{main_merge, objectives, sources};
 
 mod host;
+mod inputs;
 pub(crate) mod owner;
+mod shadow;
 mod warm;
 
 /// Rejections, or aborts, in a row that halt a mission.
@@ -1509,6 +1520,23 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         Ok(None) => println!("integrate: {WARM_ENV}=0: no base warm after a landing"),
         Err(error) => eprintln!("integrate: {error}; no base warm after a landing"),
     }
+    // The shadow judging on a gate runner (shadow.rs), when one is named;
+    // its directory is the integrator's own, beside the mirrors.
+    match shadow::settings(
+        crate::config::env_value(shadow::RUNNER_ENV).as_deref(),
+        crate::config::env_value(shadow::EVERY_ENV).as_deref(),
+    ) {
+        Ok(Some(settings)) => {
+            println!(
+                "integrate: judged verdicts are shadowed on {} (every {}-th)",
+                settings.runner, settings.every
+            );
+            let dir = integrator.judge.root.join(".shadow");
+            integrator = integrator.with_shadow(settings, dir);
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!("integrate: {error}; no shadow judging"),
+    }
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
@@ -1579,6 +1607,9 @@ struct Integrator {
     /// cache to the gates and the deploy (tests, and a warm directory that
     /// cannot be named).
     warms: RefCell<Option<warm::Warms>>,
+    /// The shadow judging of verdicts on a gate runner ([`shadow`]); None
+    /// when no runner is named (`SPAWN_GATE_SHADOW_RUNNER`).
+    shadows: RefCell<Option<shadow::Shadows>>,
     /// While a source's main is red, how long after the last red gate or
     /// probe one more gate on it runs anyway, a probe
     /// (`SPAWN_GATE_MAIN_RED_PROBE_MS`, [`main_red_probe_ms`]).
@@ -1624,6 +1655,10 @@ struct Judge {
     /// warm ([`Integrator::poll_warm`]): a thread cannot start the warm
     /// itself (its parent-death signal follows the thread that spawned it).
     landed: Arc<std::sync::Mutex<Vec<warm::Want>>>,
+    /// The verdicts the judging threads recorded that a runner may judge
+    /// again, for the main thread's shadow ([`Integrator::poll_shadow`]):
+    /// as for the warm, a thread cannot start it itself.
+    shadowed: Arc<std::sync::Mutex<Vec<shadow::Want>>>,
     /// The stop of the judging this clone runs (set on its thread's clone,
     /// [`Integrator::start_judging`]); None on the main thread's.
     stop: Option<Arc<Stop>>,
@@ -1896,6 +1931,7 @@ impl Integrator {
                 host: HostSettings::from_env(),
                 room: host_room,
                 landed: Arc::new(std::sync::Mutex::new(Vec::new())),
+                shadowed: Arc::new(std::sync::Mutex::new(Vec::new())),
                 stop: None,
             },
             gates,
@@ -1906,6 +1942,7 @@ impl Integrator {
             owner: RefCell::new(owner::Kept::default()),
             last_judged: RefCell::new(std::collections::HashMap::new()),
             warms: RefCell::new(None),
+            shadows: RefCell::new(None),
             red_probe_ms: main_red_probe_ms(
                 crate::config::env_value("SPAWN_GATE_MAIN_RED_PROBE_MS").as_deref(),
             ),
@@ -1984,6 +2021,50 @@ impl Integrator {
         warms.take_over();
         *self.warms.borrow_mut() = Some(warms);
         self
+    }
+
+    /// This integrator shadowing judged verdicts on a gate runner, its
+    /// scratch and pid file in `dir`; a shadow a predecessor left there is
+    /// stopped first ([`shadow::Shadows::take_over`]).
+    fn with_shadow(self, settings: shadow::Settings, dir: PathBuf) -> Self {
+        let shadows = shadow::Shadows::new(settings, dir);
+        shadows.take_over();
+        *self.shadows.borrow_mut() = Some(shadows);
+        self
+    }
+
+    /// The pass's shadow, after its gates were given out: the one that
+    /// ended is recorded (once: its directory is removed when the record is
+    /// written, and a record that could not be written is tried again at
+    /// the next pass), then the verdicts recorded since the last pass are
+    /// offered, in order (one runs at a time: the others are skipped).
+    /// Nothing here touches a task, a landing or a count.
+    fn poll_shadow(&self, store: &PostgresStore) {
+        let wanted: Vec<shadow::Want> = self
+            .judge
+            .shadowed
+            .lock()
+            .map(|mut wanted| wanted.drain(..).collect())
+            .unwrap_or_default();
+        let mut shadows = self.shadows.borrow_mut();
+        let Some(shadows) = shadows.as_mut() else {
+            return;
+        };
+        shadows.record_ended(|shadowed| {
+            record(store, shadowed)?;
+            println!(
+                "integrate: task {} shadowed on {}: {} (the primary's {}), agrees {}",
+                shadowed["id"],
+                shadowed["runner"].as_str().unwrap_or_default(),
+                shadowed["verdict"].as_str().unwrap_or("no verdict"),
+                shadowed["primary"].as_str().unwrap_or_default(),
+                shadowed["agrees"]
+            );
+            Ok(())
+        });
+        for want in wanted {
+            shadows.offer(want);
+        }
     }
 
     /// Main of `source` is `commit` now: warm it for the gates that judge
@@ -2158,6 +2239,7 @@ impl Integrator {
         self.stop_for(&urgent);
         let steps = self.steps(store, &pending, &owner_moved, owner_judge);
         self.poll_warm();
+        self.poll_shadow(store);
         steps
     }
 
@@ -2950,6 +3032,10 @@ impl Judge {
         // first; the error when it could not be read.
         let moved: std::cell::OnceCell<Result<Option<String>, String>> = std::cell::OnceCell::new();
         let main_now = || moved.get_or_init(|| main_moved(source, main)).clone();
+        // What the candidate's gate run judged and where (objective 035's
+        // `inputs` and `env`, [`inputs`]), carried on the record of the
+        // verdict it gave: set as that run starts (`env` once it ended).
+        let bound: std::cell::RefCell<Option<(Value, Value)>> = std::cell::RefCell::new(None);
         let gated = |verdict: &str, extra: Value| -> Result<(), String> {
             // Stopped for an owner's urgent landing (D2): whatever the gate
             // found but an acceptance (which lands as usual), the judging is
@@ -3049,8 +3135,20 @@ impl Judge {
             if let Some(error) = unread {
                 record_value["main_read"] = json!(error);
             }
+            if let Some((inputs, env)) = bound.borrow().as_ref() {
+                record_value["inputs"] = inputs.clone();
+                record_value["env"] = env.clone();
+            }
             record(store, &record_value)?;
             println!("integrate: task {} gated: {verdict}", task.id);
+            // A verdict a gate run gave may be judged again on a runner,
+            // beside it ([`shadow`]): offered to the main thread, never
+            // waited for.
+            if let Some(want) = shadow::Want::of(&record_value, mirror, scenarios)
+                && let Ok(mut shadowed) = self.shadowed.lock()
+            {
+                shadowed.push(want);
+            }
             Ok(())
         };
         let rejected = |reason: &str, log: &str| gated("rejected", rejected_fields(reason, log));
@@ -3175,6 +3273,8 @@ impl Judge {
         // The candidate's gate run, measured: a crash in the test
         // database's log counts only inside this window.
         let started = now_ms();
+        let given = inputs::read(main, &candidate, scenarios, scenario.as_deref());
+        bound.replace(Some((given.clone(), Value::Null)));
         let (judged, base_check) = gate::judge_seeing_base_check(
             &gate_path,
             mirror,
@@ -3186,6 +3286,7 @@ impl Judge {
             gate_wall_clock(),
         );
         let ended = now_ms();
+        bound.replace(Some((given, inputs::env_here(gate_log(&judged)))));
         if let Ok(verdict) = &judged {
             flakes.replace(verdict.flakes.clone());
             red_scenarios.replace(verdict.main_red_scenarios.clone());
@@ -3524,6 +3625,23 @@ fn judged_or_aborted(
             "integrate: mission {mission}: task {}: record the abort: {error}",
             task.id
         ),
+    }
+}
+
+/// What a gate run printed, whatever it ended with; None for a gate that
+/// never ran (it could not start, or ran past its wall clock).
+fn gate_log(judged: &Result<gate::Verdict, GateFailure>) -> Option<&str> {
+    match judged {
+        Ok(verdict) => Some(&verdict.output),
+        Err(GateFailure::Timeout | GateFailure::Failed(_)) => None,
+        Err(
+            GateFailure::Aborted { log, .. }
+            | GateFailure::NoRoom { log, .. }
+            | GateFailure::HostFault { log, .. }
+            | GateFailure::MainRed { log, .. }
+            | GateFailure::CannotJudge { log, .. }
+            | GateFailure::BaseDisagrees { log, .. },
+        ) => Some(log),
     }
 }
 
@@ -14730,6 +14848,157 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         assert_eq!(moved[1]["to"], commit.as_str());
         assert_eq!(source_main(&source), commit);
         assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Objective 036, through the store: an accepted verdict a gate run gave
+    /// carries what it judged (`inputs`, `env`), lands, and is judged again
+    /// beside it on the runner the controller's dispatcher names. The runner
+    /// rejects it: the task stays landed, nothing is counted, the record
+    /// says the two disagree on equal inputs, and the supervisor's digest
+    /// has one item for it until a delivered digest tells it. A verdict on
+    /// another scenario set is recorded without a comparison and is no news.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_shadow_judges_a_copy_beside_the_verdict_and_decides_nothing() {
+        let gate = "echo '| == setup'\n\
+                    echo '| base cache: toolchain primary-tc'\n\
+                    printf '{\"verdict\":\"accepted\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+        let (base, source, _, integrator) = world("shadow", gate);
+        let ctl = base.join("ctl");
+        let scenarios = ctl.join("rsi").join("scenarios");
+        std::fs::create_dir_all(&scenarios).expect("scenarios");
+        std::fs::create_dir_all(ctl.join("deploy")).expect("deploy");
+        std::fs::write(scenarios.join("check-ok.sh"), "exit 0\n").expect("a check");
+        let marker = "0123456789abcdef0123456789abcdef01234567";
+        std::fs::write(ctl.join(".controller"), format!("{marker}\n")).expect("marker");
+        // The runner's dispatcher: it notes its arguments, places a
+        // rejection naming the runner's toolchain, and exits 0.
+        let notes = base.join("dispatched");
+        std::fs::write(
+            ctl.join("deploy/gate-runner.sh"),
+            format!(
+                "printf '%s\\n' \"$@\" >>'{notes}'\n\
+                 job=\"$6/$(printf %s \"$4\" | cut -c1-12)-x\"\n\
+                 mkdir -p \"$job\"\n\
+                 printf '{{\"result\":\"verdict\",\"host\":\"runner-host\"}}\\n' >\"$job/record.json\"\n\
+                 printf '{{\"verdict\":\"rejected\"}}\\n' >\"$job/verdict.json\"\n\
+                 printf '| base cache: toolchain runner-tc\\n' >\"$job/gate.log\"\n",
+                notes = notes.display()
+            ),
+        )
+        .expect("dispatcher");
+        let shadow_dir = base.join("shadow");
+        let integrator = integrator.with_shadow(
+            super::shadow::Settings {
+                runner: "bb-runner".to_string(),
+                every: 1,
+            },
+            shadow_dir.clone(),
+        );
+        let db = Db::new("shadow");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        push_work(&base, &source, &agent_of(&db, mission, task), "work.txt");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        let (gated_record, _, _) = last_verdict(&db);
+        assert_eq!(gated_record["verdict"], "accepted", "{gated_record}");
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        let given = &gated_record["inputs"];
+        assert_eq!(given["base"], gated_record["base"]);
+        assert_eq!(given["candidate"], gated_record["candidate"]);
+        assert_eq!(given["controller"], marker);
+        assert_eq!(
+            given["scenarios_sha256"],
+            json!(super::inputs::scenarios_sha256(&scenarios))
+        );
+        assert_eq!(given["scenario"], Value::Null);
+        assert_eq!(gated_record["env"]["toolchain"], "primary-tc");
+        assert_eq!(gated_record["env"]["runner"], Value::Null);
+
+        let shadows = || control_records(&db, "task.shadow_gated");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while shadows().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no shadow record within 30 s"
+            );
+            integrator.pass_on(&db.store).expect("a pass");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let record = shadows()[0].clone();
+        assert_eq!(record["id"], task);
+        assert_eq!(record["runner"], "bb-runner");
+        assert_eq!(record["result"], "verdict");
+        assert_eq!(record["verdict"], "rejected");
+        assert_eq!(record["primary"], "accepted");
+        assert_eq!(record["exit"], 0);
+        assert_eq!(record["inputs"], *given, "{record}");
+        assert_eq!(record["unequal"], json!([]));
+        assert_eq!(record["agrees"], json!(false));
+        assert_eq!(record["env"]["toolchain"], "runner-tc");
+        assert_eq!(record["env"]["host"], "runner-host");
+        assert_eq!(record["primary_env"], gated_record["env"]);
+        let dispatched = std::fs::read_to_string(&notes).expect("the dispatcher ran");
+        let arguments: Vec<&str> = dispatched.lines().collect();
+        assert_eq!(arguments[0], "bb-runner");
+        assert_eq!(Some(arguments[2]), given["base"].as_str());
+        assert_eq!(Some(arguments[3]), given["candidate"].as_str());
+        // The shadow decided nothing, and its directory is gone.
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        let after = gated(&db, mission);
+        assert_eq!(after.gate_rejections, 0);
+        assert_eq!(after.gate_aborts, 0);
+        let left: Vec<_> = std::fs::read_dir(&shadow_dir)
+            .expect("the shadow directory")
+            .flatten()
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        // Told once: an item of its own until a digest carrying its tag is
+        // delivered.
+        let items = crate::dispatch::digest::shadow_disagreements(
+            db.store
+                .shadow_disagreements()
+                .expect("disagreements")
+                .as_array()
+                .expect("a list"),
+        );
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].why, crate::dispatch::Why::ShadowDisagrees);
+        assert!(items[0].why.is_news());
+        let line = &items[0].line;
+        assert!(
+            line.contains(&format!("#{task} "))
+                && line.contains("shadow")
+                && line.contains("bb-runner")
+                && line.contains("accepted")
+                && line.contains("rejected")
+                && line.contains("primary-tc")
+                && line.contains("runner-tc"),
+            "{line}"
+        );
+        // More passes record nothing more.
+        integrator.pass_on(&db.store).expect("a pass");
+        assert_eq!(shadows().len(), 1);
+
+        // A record that compared nothing is never news, and the store takes
+        // no `agrees` on unequal inputs.
+        let mut unequal = record.clone();
+        unequal["unequal"] = json!(["scenarios_sha256"]);
+        unequal["agrees"] = Value::Null;
+        db.record(&unequal);
+        unequal["agrees"] = json!(false);
+        assert!(db.store.integrator_record(&unequal).is_err());
+        assert_eq!(
+            db.store
+                .shadow_disagreements()
+                .expect("disagreements")
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
         let _ = std::fs::remove_dir_all(&base);
     }
 }
