@@ -556,7 +556,20 @@ fn bridge_starts_an_execution_and_types_the_prompt() {
         pane.contains("list the files [spawn message #1]"),
         "prompt reached the pane with its marker: {pane}"
     );
+    assert!(
+        pane.contains("spawn ack 1 done"),
+        "the marker is followed by how to answer it: {pane}"
+    );
     assert_eq!(bridge.session_count(), 1);
+    // The pane is told its workspace, where `spawn ack` leaves an answer
+    // for the loop: no login, and not the shell's current directory.
+    let launch = store.launches().pop().expect("a launch");
+    let workspace = launch
+        .environment
+        .iter()
+        .find(|(name, _)| name == "SPAWN_WORKSPACE")
+        .map(|(_, value)| value.clone());
+    assert_eq!(workspace.as_deref(), Some(launch.workspace.path()));
 }
 
 #[test]
