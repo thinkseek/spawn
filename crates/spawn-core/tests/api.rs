@@ -543,6 +543,7 @@ fn bridge_starts_an_execution_and_types_the_prompt() {
             "execution.started",
             "session.native_started",
             "screen.observed",
+            "message.typed",
             "command.step",
             "command.step",
             "command.finished",
@@ -552,8 +553,8 @@ fn bridge_starts_an_execution_and_types_the_prompt() {
         .capture_tail(&terminal, &any_workspace(), 40)
         .expect("pane exists");
     assert!(
-        pane.contains("list the files"),
-        "prompt reached the pane: {pane}"
+        pane.contains("list the files\n\n[spawn message #1]"),
+        "prompt reached the pane with its marker: {pane}"
     );
     assert_eq!(bridge.session_count(), 1);
 }
