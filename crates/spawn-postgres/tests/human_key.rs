@@ -180,7 +180,7 @@ fn a_persons_key_from_the_page_is_the_key_command_spawn_submit_makes() {
 
     // The session's commands show it as a key, its text the key's name: the
     // trace and the agent page read "You → key · escape".
-    let shown = store.commands_json(SESSION, 10).expect("commands");
+    let shown = store.commands_json(SESSION, 10, 120_000).expect("commands");
     assert_eq!(shown[0]["action"], "key");
     assert_eq!(shown[0]["text"], "escape");
     assert_eq!(shown[0]["principal"], "human");
