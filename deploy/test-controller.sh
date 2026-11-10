@@ -10,7 +10,9 @@
 # the same loop over unlink-then-symlink does); a process holding the previous
 # controller (a running script, a working directory, an open file) keeps
 # reading that commit's files across two switches, and its controller is
-# kept while it runs and removed at the next switch after; only the current
+# kept while it runs and removed at the next switch after, also when the
+# live directory is reached through a symlink (/proc names physical paths:
+# issue #16, item 2); only the current
 # and previous controllers remain otherwise; a leftover half build is
 # removed; build and switch run again change nothing.
 #
@@ -162,6 +164,46 @@ check "the running script finished as A's: $(tr '\n' ' ' <"$scratch/gate.out")" 
   [ "$(cat "$scratch/gate.out")" = "$(printf 'ran A\nA')" ]
 check "the working directory still read A's scenarios" [ "$(cat "$scratch/cwd.out")" = A ]
 check "the open file still read A's" [ "$(cat "$scratch/fd.out")" = A ]
+
+echo "== a live directory under a symlink (/home -> /data00/home)"
+# Everything names the live directory through the symlink, as on a host
+# whose /home is one: the controller script, and the three holders, which
+# enter by that path and never resolve the root (the script is pinned to
+# its commit's directory, as the gate pins it, by the path under the
+# symlink). /proc shows their working directory and files under the
+# physical directory.
+mkdir -p "$scratch/data00/live"
+ln -s data00 "$scratch/home"
+linked=$scratch/home/live
+lctl() { SPAWN_LIVE=$linked bash "$script" "$@"; }
+lctl update spawn "$git_dir" "$A" "$modules" 2>/dev/null >/dev/null
+sh "$linked/controllers/spawn-$A/scripts/gate.sh" "$scratch/go-linked" >"$scratch/gate-linked.out" 2>&1 &
+gate=$!
+holders+=("$gate")
+(cd "$linked/controllers/spawn/rsi/scenarios" && while [ ! -e "$scratch/go-linked" ]; do sleep 0.1; done && cat which >"$scratch/cwd-linked.out") &
+holders+=($!)
+held_cwd=$!
+(exec 3<"$linked/controllers/spawn/rsi/scenarios/which" && while [ ! -e "$scratch/go-linked" ]; do sleep 0.1; done && cat <&3 >"$scratch/fd-linked.out") &
+holders+=($!)
+held_fd=$!
+sleep 0.5
+check "/proc names the physical path, not the one the holder entered by ($(readlink "/proc/$held_cwd/cwd"))" \
+  [ "$(readlink "/proc/$held_cwd/cwd")" = "$(readlink -f "$scratch/data00")/live/controllers/spawn-$A/rsi/scenarios" ]
+lctl update spawn "$git_dir" "$B" "$modules" 2>/dev/null >/dev/null
+lctl update spawn "$git_dir" "$C" "$modules" 2>"$scratch/err" >/dev/null
+check "two switches later spawn is C" [ "$(cat "$linked/controllers/spawn/rsi/scenarios/which")" = C ]
+check "A, neither current nor previous, is kept: it is in use" [ -d "$linked/controllers/spawn-$A" ]
+check "says so" grep -q "kept spawn-$A: a process still uses it" "$scratch/err"
+touch "$scratch/go-linked"
+wait "$gate" "$held_cwd" "$held_fd"
+holders=()
+check "the running script finished as A's: $(tr '\n' ' ' <"$scratch/gate-linked.out")" \
+  [ "$(cat "$scratch/gate-linked.out")" = "$(printf 'ran A\nA')" ]
+check "the working directory still read A's scenarios" [ "$(cat "$scratch/cwd-linked.out")" = A ]
+check "the open file still read A's" [ "$(cat "$scratch/fd-linked.out")" = A ]
+lctl update spawn "$git_dir" "$D" "$modules" 2>"$scratch/err" >/dev/null
+check "A, no longer used, is removed at the next switch" [ ! -e "$linked/controllers/spawn-$A" ]
+check "B, which nothing uses, is removed" [ ! -e "$linked/controllers/spawn-$B" ]
 
 echo "== the cleanup"
 mkdir -p "$dir/.spawn-$B.tmp.XXXXXX/rsi" # a build killed halfway
