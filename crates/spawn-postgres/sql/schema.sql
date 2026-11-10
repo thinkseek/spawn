@@ -3746,9 +3746,7 @@ returns jsonb language sql stable security definer as $$
     select coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
                'stage', substr(s.type, 6), 'verdict', s.verdict, 'at_ms', s.at_ms,
                'took_ms', s.at_ms - s.previous_ms))
-               || coalesce((select jsonb_object_agg(b.key, b.value)
-                              from jsonb_each(s.binding) b), '{}'::jsonb)
-               order by s.seq), '[]'::jsonb)
+               || s.binding order by s.seq), '[]'::jsonb)
       from (select e.session_seq as seq, r.record ->> 'type' as type,
                    case when r.record ->> 'type' = 'task.gated' then
                      r.record - array(select k from jsonb_object_keys(r.record) k
