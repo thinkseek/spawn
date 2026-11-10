@@ -2067,6 +2067,11 @@ mod tests {
             model: ModelProfile::Default,
             reissue_of: None,
             reissued_attempts: None,
+            reassign_of: None,
+            reassign_from_session: None,
+            reassigned_as: None,
+            reassigned_to_session: None,
+            restart: None,
         }
     }
 
@@ -3183,6 +3188,8 @@ mod tests {
             reason: None,
             yielded: false,
             yield_reason: None,
+            reassigned_as: None,
+            reassigned_to_session: None,
         }
     }
 

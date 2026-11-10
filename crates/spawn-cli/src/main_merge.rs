@@ -1649,6 +1649,8 @@ mod tests {
             reason: None,
             yielded: false,
             yield_reason: None,
+            reassigned_as: None,
+            reassigned_to_session: None,
         };
         let recorded = || {
             let mut client =
