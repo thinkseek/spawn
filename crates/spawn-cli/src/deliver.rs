@@ -339,6 +339,54 @@ pub(crate) struct TaskRow {
     /// `task.cancelled` record keeps them.
     #[serde(default)]
     pub(crate) reissued_attempts: Option<Vec<Attempt>>,
+    /// The task this one takes over (`spawn_task_reassign`): it is
+    /// delivered once that task's worker has ended ([`reassign_held`]).
+    #[serde(default)]
+    pub(crate) reassign_of: Option<i64>,
+    /// The session of that task's worker.
+    #[serde(default)]
+    pub(crate) reassign_from_session: Option<String>,
+    /// The task this one was reassigned as: its worker is stopped under
+    /// the reassign's key, not retired.
+    #[serde(default)]
+    pub(crate) reassigned_as: Option<i64>,
+    /// The session of the worker of that task.
+    #[serde(default)]
+    pub(crate) reassigned_to_session: Option<String>,
+    /// A delivered task's latest restart (`task.restarted`).
+    #[serde(default)]
+    pub(crate) restart: Option<Restart>,
+}
+
+/// A delivered task's latest restart, as its `task.restarted` record names
+/// it ([`restart_order`]).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct Restart {
+    /// The restart's number for its task, from 1.
+    pub(crate) n: i64,
+    /// The execution that ran when it was asked for, if any.
+    #[serde(default)]
+    pub(crate) execution_id: Option<String>,
+    #[serde(default)]
+    pub(crate) by: Option<String>,
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
+}
+
+/// The key of the Stop a restart sends: `restart-<task>-<n>-stop`.
+pub(crate) fn restart_stop_key(task: i64, n: i64) -> String {
+    format!("restart-{task}-{n}-stop")
+}
+
+/// The key of the resume a restart sends: `restart-<task>-<n>`.
+pub(crate) fn restart_key(task: i64, n: i64) -> String {
+    format!("restart-{task}-{n}")
+}
+
+/// The key of the Stop a reassign sends to the old worker:
+/// `reassign-<task>-stop`, `task` the old task.
+pub(crate) fn reassign_stop_key(task: i64) -> String {
+    format!("reassign-{task}-stop")
 }
 
 impl TaskRow {
@@ -418,6 +466,13 @@ pub(crate) struct Cancelled {
     /// An abort's reason for yielding as well (`yield_reason`).
     #[serde(default)]
     pub(crate) yield_reason: Option<String>,
+    /// The task it was reassigned as (`spawn_task_reassign`): its worker is
+    /// stopped under the reassign's key ([`reassign_stop_key`]).
+    #[serde(default)]
+    pub(crate) reassigned_as: Option<i64>,
+    /// The session of the worker of that task.
+    #[serde(default)]
+    pub(crate) reassigned_to_session: Option<String>,
 }
 
 impl Cancelled {
@@ -459,7 +514,10 @@ pub(crate) fn cancel_notice(cancelled: &Cancelled) -> String {
             " by the integrator, to yield its objective's slot ({})",
             one_line(reason, 400)
         ),
-        _ => String::new(),
+        _ => match cancelled.reassigned_as {
+            Some(new) => format!(", and reassigned to a fresh worker as task #{new}"),
+            None => String::new(),
+        },
     };
     let by = match cancelled.yield_reason.as_deref() {
         Some(why)
@@ -1256,7 +1314,7 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
         let found = facts.get(session).copied();
         match task.state {
             TaskState::Assigned | TaskState::Revise => {
-                if !next.contains(&task.id) {
+                if !next.contains(&task.id) || reassign_held(task, &facts) {
                     continue;
                 }
                 let attempts =
@@ -1285,18 +1343,27 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
                 let settled = found.is_some_and(|facts| last_delivery_closed(work, facts));
                 orders.extend(delivery(task, found, settled, key));
             }
+            TaskState::Delivered => {
+                if let (Some(restart), Some(facts)) = (&task.restart, found) {
+                    orders.extend(restart_order(task, restart, facts));
+                }
+            }
             // A finished ephemeral worker is stopped, once: a stop that
-            // fails is pursued from then on ([`crate::dispatch`]).
+            // fails is pursued from then on ([`crate::dispatch`]). A
+            // reassigned task's worker is stopped under the reassign's key,
+            // so the recovery records its end `reassigned`.
             _ if task.is_finished()
                 && task.kind == "ephemeral"
                 && found.is_some_and(|facts| facts.live_and_free() && !facts.stopping()) =>
             {
-                let key = format!("retire-task-{}", task.id);
+                let key = match task.reassigned_as {
+                    Some(_) => reassign_stop_key(task.id),
+                    None => format!("retire-task-{}", task.id),
+                };
                 orders.push(task.command(key, CommandAction::Stop));
             }
             TaskState::Accepted
             | TaskState::Cancelled
-            | TaskState::Delivered
             | TaskState::Reported
             | TaskState::Landing
             | TaskState::Landed => {}
@@ -1327,6 +1394,84 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
     orders
 }
 
+/// Whether the reassigned task `task` waits for the worker of the task it
+/// takes over: that worker still runs, and its Stop is not spent (a Stop
+/// pursued and escalated after its retries, `dispatch::stops`, holds the
+/// new task no longer: it starts from the old worker's last recorded
+/// checkpoint, so the task is never left with nobody carrying it).
+fn reassign_held(task: &TaskRow, facts: &BTreeMap<&str, &Facts>) -> bool {
+    let Some(old) = task.reassign_from_session.as_deref() else {
+        return false;
+    };
+    task.reassign_of.is_some()
+        && facts
+            .get(old)
+            .is_some_and(|old| old.live && !crate::dispatch::stop_spent(old))
+}
+
+/// The next step of a delivered task's latest restart ([`Restart`]), its
+/// worker's facts given: the running execution is stopped
+/// ([`restart_stop_key`], once; a Stop that fails is pursued and escalated
+/// by `dispatch::stops`), and once it has ended and the recovery has
+/// recorded that end, the same native session is resumed
+/// ([`restart_key`], once) with a prompt naming the restart and its reason.
+/// A worker that no longer ran when the restart was asked for is resumed at
+/// once.
+fn restart_order(task: &TaskRow, restart: &Restart, facts: &Facts) -> Option<Order> {
+    let resume = restart_key(task.id, restart.n);
+    if facts.sent(&resume).is_some() || facts.open_command {
+        return None;
+    }
+    if facts.live {
+        let stop = restart_stop_key(task.id, restart.n);
+        // Under way (pursued if it failed), or done and the worker runs
+        // again by someone else's command: nothing more here.
+        if facts.stopping() || facts.sent(&stop).is_some() {
+            return None;
+        }
+        // An execution that started after the restart was asked for (a
+        // worker that did not run then, resumed since) is not stopped.
+        restart.execution_id.as_ref()?;
+        return Some(task.command(stop, CommandAction::Stop));
+    }
+    // The stopped execution's end is the recovery's to record first: it
+    // reads only a session's latest execution.
+    if restart.execution_id.is_some()
+        && restart.execution_id == facts.execution_id
+        && facts.recovered.is_none()
+    {
+        return None;
+    }
+    facts.execution_id.as_ref()?;
+    Some(task.command(
+        resume,
+        CommandAction::Resume {
+            prompt: Some(restart_prompt(task, restart)),
+            model: Some(task.model),
+        },
+    ))
+}
+
+/// What a restarted worker is told when its session is resumed: the
+/// restart, who asked and why, and that its workspace is as it left it.
+pub(crate) fn restart_prompt(task: &TaskRow, restart: &Restart) -> String {
+    let by = restart.by.as_deref().unwrap_or("the owner");
+    let reason = restart
+        .reason
+        .as_deref()
+        .map_or_else(|| "no reason given".to_string(), |text| one_line(text, 500));
+    format!(
+        "[Task #{id} restarted — this is the same task, not a new one]\nSpawn restarted your \
+engine (restart {n} of task #{id}, asked by {by}: {reason}). Your previous execution was stopped \
+and its work checkpointed; your workspace and this conversation are as you left them. Check \
+where you were (a command that hung may have to be run differently) and continue task #{id} \
+of mission #{mission}. When it is done, write `{REPORT}` as the task asked, once.",
+        id = task.id,
+        n = restart.n,
+        mission = task.mission_id,
+    )
+}
+
 /// The next step for a resident not yet told that its latest task was
 /// cancelled: a live one is stopped (once per execution; a stop that fails is
 /// pursued by [`crate::dispatch`]), one that no longer runs is resumed with
@@ -1355,7 +1500,12 @@ fn cancel_order(cancelled: &Cancelled, facts: &Facts, now_ms: i64) -> Option<Ord
     };
     if facts.live {
         let execution = facts.execution_id.as_deref().unwrap_or("none");
-        let key = format!("cancel-stop-{}-{execution}", cancelled.id);
+        let key = match cancelled.reassigned_as {
+            Some(_) if facts.sent(&reassign_stop_key(cancelled.id)).is_none() => {
+                reassign_stop_key(cancelled.id)
+            }
+            _ => format!("cancel-stop-{}-{execution}", cancelled.id),
+        };
         return Some(cancelled.command(key, CommandAction::Stop));
     }
     if !due {
@@ -1915,6 +2065,11 @@ mod tests {
             model: ModelProfile::Default,
             reissue_of: None,
             reissued_attempts: None,
+            reassign_of: None,
+            reassign_from_session: None,
+            reassigned_as: None,
+            reassigned_to_session: None,
+            restart: None,
         }
     }
 
@@ -3032,6 +3187,8 @@ mod tests {
             reason: None,
             yielded: false,
             yield_reason: None,
+            reassigned_as: None,
+            reassigned_to_session: None,
         }
     }
 
@@ -4111,5 +4268,178 @@ PENDING_ISSUES\n";
             "a command in flight holds the retry, but its end is an event: the wait is still \
              the one the attempt names"
         );
+    }
+
+    /// Task 7, delivered to an ephemeral worker, with its first restart
+    /// asked for while execution `exec_3` ran.
+    fn restarted(execution: Option<&str>) -> TaskRow {
+        let mut one = task(7, TaskState::Delivered, "ephemeral");
+        one.restart = Some(super::Restart {
+            n: 1,
+            execution_id: execution.map(str::to_string),
+            by: Some("human".to_string()),
+            reason: Some("stalled on a hung tool".to_string()),
+        });
+        one
+    }
+
+    fn stop_sent(id: i64, key: &str, succeeded: Option<bool>) -> crate::dispatch::StopSent {
+        crate::dispatch::StopSent {
+            id,
+            key: key.to_string(),
+            principal: "spawn-dispatch".to_string(),
+            action: "stop".to_string(),
+            created_at_ms: 1,
+            finished_at_ms: succeeded.map(|_| 2),
+            succeeded,
+            error: (succeeded == Some(false)).then(|| "kill-session refused".to_string()),
+        }
+    }
+
+    /// A restart stops the execution it names, once; while the Stop is
+    /// under way nothing else is sent; once the execution ended and the
+    /// recovery recorded that end, the same session is resumed, once, with
+    /// a prompt naming the restart and its reason.
+    #[test]
+    fn a_restart_stops_the_running_execution_then_resumes_its_session_once_its_end_is_recorded() {
+        let work = work(vec![restarted(Some("exec_3"))]);
+        let running = worker(true, false);
+        assert_eq!(
+            orders(&work, std::slice::from_ref(&running)),
+            vec![Order {
+                agent_id: running.agent_id.clone(),
+                session_id: running.session_id.clone(),
+                key: "restart-7-1-stop".to_string(),
+                action: CommandAction::Stop,
+                task: None,
+            }]
+        );
+        let mut stopping = running.clone();
+        stopping.stops = vec![stop_sent(40, "restart-7-1-stop", None)];
+        assert!(
+            orders(&work, &[stopping]).is_empty(),
+            "the Stop is under way"
+        );
+        let mut ended = worker(false, false);
+        ended.end_cause = Some("stopped".to_string());
+        assert!(
+            orders(&work, std::slice::from_ref(&ended)).is_empty(),
+            "its end is the recovery's to record first"
+        );
+        ended.recovered = Some(55);
+        let resumed = orders(&work, std::slice::from_ref(&ended));
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].key, "restart-7-1");
+        assert_eq!(resumed[0].task, None, "a restart delivers nothing new");
+        let CommandAction::Resume {
+            prompt: Some(prompt),
+            model,
+        } = &resumed[0].action
+        else {
+            panic!("a resume: {:?}", resumed[0].action);
+        };
+        assert_eq!(*model, Some(ModelProfile::Default));
+        assert!(prompt.contains("Task #7 restarted"), "{prompt}");
+        assert!(prompt.contains("stalled on a hung tool"), "{prompt}");
+        assert!(prompt.contains("asked by human"), "{prompt}");
+        // Sent once: the resume's key is never sent again.
+        ended.dispatched.push(sent(
+            60,
+            "restart-7-1",
+            100,
+            Some("pane never became ready"),
+        ));
+        assert!(orders(&work, &[ended]).is_empty(), "once");
+    }
+
+    /// A worker that no longer ran when its restart was asked for is
+    /// resumed at once; one resumed by someone since is left alone.
+    #[test]
+    fn a_restart_of_a_worker_that_no_longer_ran_resumes_it_at_once() {
+        let work = work(vec![restarted(None)]);
+        let ended = worker(false, false);
+        let resumed = orders(&work, &[ended]);
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].key, "restart-7-1");
+        assert!(matches!(resumed[0].action, CommandAction::Resume { .. }));
+        assert!(
+            orders(&work, &[worker(true, false)]).is_empty(),
+            "an execution that started after the restart is not stopped"
+        );
+    }
+
+    /// A reassigned task's old worker is stopped under the reassign's key
+    /// (not the routine retire), and the new task waits for that worker's
+    /// end; a Stop pursued and escalated after its retries holds it no
+    /// longer.
+    #[test]
+    fn a_reassigned_task_waits_for_the_old_worker_to_end_unless_its_stop_is_spent() {
+        let mut old = task(7, TaskState::Cancelled, "ephemeral");
+        old.agent_id = "agent_worker_moved_7".to_string();
+        old.session_id = "session_worker_moved_7".to_string();
+        old.reassigned_as = Some(8);
+        old.reassigned_to_session = Some("session_worker_moved_8".to_string());
+        let mut new = task(8, TaskState::Assigned, "ephemeral");
+        new.agent_id = "agent_worker_moved_8".to_string();
+        new.session_id = "session_worker_moved_8".to_string();
+        new.resident = None;
+        new.charter = None;
+        new.reassign_of = Some(7);
+        new.reassign_from_session = Some("session_worker_moved_7".to_string());
+        let work = work(vec![old, new]);
+        let mut running = worker(true, false);
+        running.agent_id = "agent_worker_moved_7".to_string();
+        running.session_id = "session_worker_moved_7".to_string();
+        let keys = |rows: &[Facts]| -> Vec<String> {
+            orders(&work, rows)
+                .into_iter()
+                .map(|order| order.key)
+                .collect()
+        };
+        assert_eq!(
+            keys(std::slice::from_ref(&running)),
+            vec!["reassign-7-stop"]
+        );
+        let mut stopping = running.clone();
+        stopping.stops = vec![stop_sent(40, "reassign-7-stop", Some(false))];
+        assert!(
+            keys(std::slice::from_ref(&stopping)).is_empty(),
+            "the old worker still runs"
+        );
+        stopping.stops = (0..=DELIVERY_RETRIES)
+            .map(|n| {
+                let n = i64::try_from(n).expect("a handful");
+                stop_sent(40 + n, "reassign-7-stop", Some(false))
+            })
+            .collect();
+        assert_eq!(
+            keys(&[stopping]),
+            vec!["deliver-8-0"],
+            "its Stop spent and escalated: the new task goes without waiting further"
+        );
+        let mut ended = running;
+        ended.live = false;
+        let delivered = orders(&work, &[ended]);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].key, "deliver-8-0");
+        assert_eq!(delivered[0].session_id, "session_worker_moved_8");
+        assert!(matches!(delivered[0].action, CommandAction::Start { .. }));
+    }
+
+    /// A resident whose task was reassigned is stopped under the reassign's
+    /// key, then told (its task went to a fresh worker).
+    #[test]
+    fn a_reassigned_residents_stop_and_notice_name_the_reassign() {
+        let mut moved = cancelled(false);
+        moved.reassigned_as = Some(8);
+        moved.reassigned_to_session = Some("session_worker_core_8".to_string());
+        let work = Work {
+            cancelled: vec![moved.clone()],
+            ..Work::default()
+        };
+        let stops = orders(&work, &[worker(true, false)]);
+        assert_eq!(stops.len(), 1);
+        assert_eq!(stops[0].key, "reassign-7-stop");
+        assert!(super::cancel_notice(&moved).contains("reassigned to a fresh worker as task #8"));
     }
 }
