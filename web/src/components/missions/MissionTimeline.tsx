@@ -221,13 +221,16 @@ export function MissionTimeline({
         y += SECTION_H;
         if (sectionFolded) continue;
         // Tasks that ended before the window show no bar: they fold into
-        // one row at the section's end (its oldest), unless it holds the
-        // selected task. Opened, they follow it, dimmed.
-        const split = splitEarlier(groups, edge, (group) =>
-          holdsSelection([group.item, ...group.earlier.map((attempt) => attempt.item)]),
-        );
+        // one row at the section's end (its oldest). Opened, they follow it,
+        // dimmed. While it is closed, a group holding the selected task stays
+        // out of it (its row and panel stay in view); once it is open, the
+        // selection keeps its place among the dimmed rows, so a click never
+        // moves a row and the arrows walk them all.
         const earlierKey = `${sectionKey}:earlier`;
         const opened = earlierShown.has(earlierKey);
+        const split = splitEarlier(groups, edge, (group) =>
+          !opened && holdsSelection([group.item, ...group.earlier.map((attempt) => attempt.item)]),
+        );
         const pushGroups = (from: typeof groups, dim: boolean) => {
           for (const group of from) {
             list.push({
