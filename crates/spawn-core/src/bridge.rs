@@ -4593,10 +4593,6 @@ pub fn claude_session_id(execution: &ExecutionId) -> String {
     )
 }
 
-/// Where Claude Code writes the transcript of `native` for an engine started
-/// in `workspace`: its projects directory, one directory per working
-/// directory with every character but ASCII letters and digits replaced by
-/// `-`, one file per session.
 /// What a record says is behind: a transcript never known (no read of it
 /// succeeded) of an execution that ended is taken as lacking everything,
 /// since no later read will tell (a live one says so by its `known_ms`).
@@ -4607,6 +4603,10 @@ fn unknown_behind(behind_ms: Option<i64>, known_ms: Option<i64>, live: bool) -> 
     behind_ms
 }
 
+/// Where Claude Code writes the transcript of `native` for an engine started
+/// in `workspace`: its projects directory, one directory per working
+/// directory with every character but ASCII letters and digits replaced by
+/// `-`, one file per session.
 pub fn transcript_path(projects: &str, workspace: &WorkspaceId, native: &str) -> String {
     let directory: String = workspace
         .path()
