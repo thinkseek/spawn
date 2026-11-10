@@ -1155,6 +1155,8 @@ pub(crate) fn gate_host_fault_fields(
         format!("the gate's sandbox never started {scenario} ({reason})")
     } else if on == "test server" {
         format!("the gate's own test server never started ({reason})")
+    } else if on == "runner" {
+        format!("the gate was abandoned: {reason}")
     } else {
         format!("{scenario} failed on the candidate and on the base ({runs})")
     };
@@ -1164,6 +1166,8 @@ pub(crate) fn gate_host_fault_fields(
         gate::SANDBOX_NEVER_STARTED
     } else if on == "test server" {
         gate::TEST_SERVER_NEVER_STARTED
+    } else if on == "runner" {
+        gate::ABANDONED
     } else {
         "gate"
     };
@@ -1592,7 +1596,22 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     if swept > 0 {
         println!("integrate: removed {swept} judging directories an earlier integrator left");
     }
-    let mut integrator = Integrator::new(root, gate, gate_env, host_room, gates).with_cpu(cpu);
+    // Gates in units of their own when a user manager answers (gate v2 step
+    // 2: they outlive a restart); else as children, which a restart stops.
+    let units = gate::units_available();
+    if units {
+        println!(
+            "integrate: gates run in systemd user units (spawn-gate-*): a restart does not stop them"
+        );
+    } else {
+        println!(
+            "integrate: no systemd user manager answers: gates run as this process's children, \
+             and a restart stops them"
+        );
+    }
+    let mut integrator = Integrator::new(root, gate, gate_env, host_room, gates)
+        .with_cpu(cpu)
+        .with_units(units);
     // The base warm after each landing (warm.rs), unless the owner turned
     // it off; its logs and pid file under the user's cache, beside the base
     // cache it fills.
@@ -1901,6 +1920,10 @@ struct Judge {
     /// The stop of the judging this clone runs (set on its thread's clone,
     /// [`Integrator::start_judging`]); None on the main thread's.
     stop: Option<Arc<Stop>>,
+    /// Gates run in units of their own (gate v2 step 2,
+    /// [`gate::units_available`] at the start), else as this process's
+    /// children.
+    units: bool,
 }
 
 /// The stop of one judging in flight: an owner's urgent landing on its
@@ -2174,6 +2197,7 @@ impl Integrator {
                 landed: Arc::new(std::sync::Mutex::new(Vec::new())),
                 shadowed: Arc::new(std::sync::Mutex::new(Vec::new())),
                 stop: None,
+                units: false,
             },
             gates,
             cpu: None,
@@ -2345,6 +2369,13 @@ impl Integrator {
                     .join(", ")
             }
         );
+    }
+
+    /// Run gates in units of their own (gate v2 step 2): a restart of the
+    /// integrator no longer stops them.
+    fn with_units(mut self, units: bool) -> Self {
+        self.judge.units = units;
+        self
     }
 
     /// Whether `task`'s gate backs off this pass ([`gate_wait`]), saying
@@ -2870,6 +2901,7 @@ impl Integrator {
             &json!({"kind": "owner", "mission": mission_id, "request": id, "source": source,
                     "shares_server": shares_server, "jobs": jobs,
                     "gate": pinned(&self.judge.gate)}),
+            self.judge.units,
         ) {
             Ok(judging) => judging,
             Err(error) => {
@@ -3173,6 +3205,7 @@ impl Integrator {
                     "revision": task.revisions, "source": source, "base": main,
                     "count": count, "shares_server": shares_server, "jobs": jobs,
                     "gate": pinned(&self.judge.gate)}),
+            self.judge.units,
         )
         .map_err(|error| format!("start the judging of task {task_id}: {error}"))?;
         let (store, source_owned) = (Arc::clone(store), source.clone());
@@ -11496,6 +11529,37 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Gate v2 step 2 (6a): with gates in units, a judged task's gate runs
+    /// in a transient unit of the user's manager (its cgroup says so), and
+    /// the task lands as from a child's gate (skipped where no manager
+    /// answers).
+    #[test]
+    fn a_gate_in_a_unit_judges_and_lands_as_a_childs_does() {
+        if !crate::gate::units_available() {
+            eprintln!("no systemd user manager answers here: not tried");
+            return;
+        }
+        let gate = "if [ \"$1\" = --base-only ]; then exit 0; fi\n\
+                    grep -q 'spawn-gate-' /proc/self/cgroup || { echo 'not in a unit' >&2; exit 3; }\n\
+                    printf '{\"verdict\":\"accepted\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+                    echo '{\"verdict\":\"accepted\"}'\n";
+        let (base, source, scenarios, integrator) = world("unit-gate", gate);
+        let integrator = integrator.with_units(true);
+        let db = Db::new("unit_gate");
+        let mission = db.gated_mission(&source, &scenarios);
+        db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        integrator.pass_on(&db.store).expect("the judging's pass");
+        integrator.settle();
+        let after = db.mission(mission);
+        assert_eq!(after["tasks"][0]["state"], "landed", "{after}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Audit #10: the integrator's verdict names the revision it judged. A
     /// task sent back once by the gate is reported again (revision 1); the
     /// stub gate accepts, and the verdict for revision 1 lands it.
@@ -12202,6 +12266,47 @@ mod database_tests {
             reason.starts_with("host fault: the gate's sandbox never started sh build (sandbox: ")
                 && reason.contains("Can't chdir"),
             "{reason}"
+        );
+    }
+
+    /// A gate whose runner ended without its status (gate v2 step 2, D6:
+    /// gate.rs `wait_unit`) is recorded with evidence `abandoned`, through
+    /// the store; it is a host fault the candidate may cause (an OOM), so it
+    /// counts toward the cap, never a verdict.
+    #[test]
+    fn an_abandoned_gate_is_a_host_fault_that_counts_toward_the_cap() {
+        let failure = crate::gate::GateFailure::HostFault {
+            scenario: "gate".to_string(),
+            on: "runner".to_string(),
+            runs: "no status".to_string(),
+            reason: "the gate's runner (spawn-gate-1-2-3.service) ended without writing the \
+                     gate's status: a reboot, an OOM kill or a stop from outside"
+                .to_string(),
+            tree: None,
+            log: "its last words\n".to_string(),
+        };
+        let fields = super::gate_host_fault_fields(&failure, 1, std::time::Duration::from_mins(1));
+        assert_eq!(fields["evidence"], crate::gate::ABANDONED);
+        assert_eq!(fields["fact"]["on"], "runner");
+        let reason = fields["reason"].as_str().expect("a reason");
+        assert!(
+            reason.starts_with("host fault: the gate was abandoned: "),
+            "{reason}"
+        );
+        assert!(!super::base_only_fault(&fields), "counted toward the cap");
+        let db = Db::new("abandoned_gate");
+        let mission = db.gated_mission("/srv/abandoned", Path::new("/scenarios"));
+        let task = db.reported_task(mission, "w");
+        let mut record = json!({"type": "task.gated", "id": task, "revision": 0,
+                                "verdict": "host_fault", "base": "b0"});
+        if let (Some(target), Some(extra)) = (record.as_object_mut(), fields.as_object()) {
+            target.extend(extra.clone());
+        }
+        db.record(&record);
+        assert_eq!(
+            db.mission(mission)["tasks"][0]["state"],
+            "reported",
+            "no verdict"
         );
     }
 

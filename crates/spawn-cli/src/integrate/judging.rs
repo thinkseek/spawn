@@ -49,6 +49,9 @@ const OUTCOMES: [&str; 4] = [
 pub(crate) struct Judging {
     id: String,
     directory: PathBuf,
+    /// Its gates run in units of their own ([`crate::gate`]'s `run_unit`),
+    /// which outlive the integrator; else as its children.
+    units: bool,
 }
 
 impl Judging {
@@ -56,15 +59,19 @@ impl Judging {
     /// `<root>/judgings`), and `judging.json` holding `what` with its
     /// version, id and start time, written whole (a temporary file renamed
     /// over it).
-    pub(crate) fn create(root: &Path, what: &Value) -> Result<Self, String> {
+    pub(crate) fn create(root: &Path, what: &Value, units: bool) -> Result<Self, String> {
         let id = new_id()?;
         let parent = root.join(DIRECTORY);
         make_private(&parent, true)?;
         let directory = parent.join(&id);
         make_private(&directory, false)?;
-        let judging = Self { id, directory };
+        let judging = Self {
+            id,
+            directory,
+            units,
+        };
         let mut described = json!({"version": VERSION, "id": judging.id,
-                                   "started_ms": super::now_ms()});
+                                   "started_ms": super::now_ms(), "units": units});
         if let (Some(target), Some(what)) = (described.as_object_mut(), what.as_object()) {
             for (key, value) in what {
                 target.entry(key.clone()).or_insert_with(|| value.clone());
@@ -126,6 +133,9 @@ impl Judging {
         impl Drop for Done<'_> {
             fn drop(&mut self) {
                 CURRENT.with(|current| current.borrow_mut().take());
+                // A gate still running in its unit (the judging ended
+                // without waiting for it: an error, a panic) goes first.
+                stop_units(&self.0.directory);
                 self.0.remove();
             }
         }
@@ -150,6 +160,17 @@ pub(crate) fn directory() -> Option<PathBuf> {
             .borrow()
             .as_ref()
             .map(|judging| judging.directory.clone())
+    })
+}
+
+/// Whether the judging this thread runs starts its gates in units of their
+/// own; false outside one.
+pub(crate) fn units() -> bool {
+    CURRENT.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .is_some_and(|judging| judging.units)
     })
 }
 
@@ -206,6 +227,23 @@ fn make_private(path: &Path, existing: bool) -> Result<(), String> {
     }
 }
 
+/// Stop the unit of every gate in the judging directory `directory` that
+/// has not written its status (`<private>/runner.json` names its unit).
+fn stop_units(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let private = entry.path();
+        if private.join("status").exists() {
+            continue;
+        }
+        if let Some(run) = crate::gate::UnitRun::read(&private) {
+            crate::gate::stop_unit(&run.unit);
+        }
+    }
+}
+
 /// Remove every judging directory under `root`, at the integrator's start:
 /// in this commit a gate never outlives the integrator that started it, so
 /// any left behind is one whose integrator stopped before its cleanup. The
@@ -222,6 +260,8 @@ pub(crate) fn sweep(root: &Path) -> usize {
             .to_str()
             .is_some_and(|name| name.len() >= 16 && name.bytes().all(|b| b.is_ascii_hexdigit()));
         if is_judging && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            // Its gates may still run in their units: stopped first.
+            stop_units(&path);
             match std::fs::remove_dir_all(&path) {
                 Ok(()) => removed += 1,
                 Err(error) => eprintln!("integrate: remove {}: {error}", path.display()),
@@ -249,8 +289,12 @@ mod tests {
     fn a_judging_has_a_private_directory_and_its_description_whole() {
         use std::os::unix::fs::PermissionsExt as _;
         let root = root("create");
-        let judging = Judging::create(&root, &json!({"kind": "task", "task": 7, "id": "not this"}))
-            .expect("create");
+        let judging = Judging::create(
+            &root,
+            &json!({"kind": "task", "task": 7, "id": "not this"}),
+            false,
+        )
+        .expect("create");
         assert_eq!(judging.id().len(), 28);
         assert!(
             judging
@@ -276,7 +320,7 @@ mod tests {
         assert_eq!(described["task"], json!(7));
         assert!(described["started_ms"].as_i64().is_some_and(|at| at > 0));
         assert!(!judging.directory().join("judging.json.tmp").exists());
-        let other = Judging::create(&root, &json!({})).expect("another");
+        let other = Judging::create(&root, &json!({}), false).expect("another");
         assert_ne!(other.id(), judging.id());
         std::fs::remove_dir_all(&root).expect("clean");
     }
@@ -288,7 +332,7 @@ mod tests {
         std::fs::create_dir(root.join(DIRECTORY)).expect("parent");
         std::fs::set_permissions(root.join(DIRECTORY), std::fs::Permissions::from_mode(0o755))
             .expect("chmod");
-        let error = Judging::create(&root, &json!({})).expect_err("refused");
+        let error = Judging::create(&root, &json!({}), false).expect_err("refused");
         assert!(error.contains("no access for others"), "{error}");
         std::fs::remove_dir_all(&root).expect("clean");
     }
@@ -296,7 +340,7 @@ mod tests {
     #[test]
     fn records_written_inside_a_judging_name_it_and_its_directory_goes_with_it() {
         let root = root("run");
-        let judging = Judging::create(&root, &json!({})).expect("create");
+        let judging = Judging::create(&root, &json!({}), false).expect("create");
         let gated = json!({"type": "task.gated", "id": 1});
         assert_eq!(*named(&gated), gated, "outside a judging: as it is");
         assert_eq!(directory(), None);
@@ -323,7 +367,7 @@ mod tests {
         assert_eq!(directory(), None);
         assert_eq!(*named(&gated), gated);
         // A panic inside ends it too.
-        let judging = Judging::create(&root, &json!({})).expect("create");
+        let judging = Judging::create(&root, &json!({}), false).expect("create");
         let dir = judging.directory().to_path_buf();
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             judging.run(|| panic!("inside"));
@@ -334,10 +378,59 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("clean");
     }
 
+    /// A gate left running in its unit by an integrator that stopped
+    /// (commit 6a: no adoption yet) is stopped by the sweep before its
+    /// directory goes, so nothing writes into a directory that is gone.
+    #[test]
+    fn a_start_stops_a_left_gates_unit_before_it_removes_its_directory() {
+        if !crate::gate::units_available() {
+            eprintln!("no systemd user manager answers here: not tried");
+            return;
+        }
+        let root = root("sweep-unit");
+        let left = Judging::create(&root, &json!({}), true).expect("create");
+        let private = left.directory().join("spawn-gate-test");
+        std::fs::create_dir(&private).expect("private");
+        let unit = format!(
+            "spawn-gate-sweep-{}-{}.service",
+            std::process::id(),
+            new_id().expect("id")
+        );
+        let started = std::process::Command::new("systemd-run")
+            .args([
+                "--user",
+                "--quiet",
+                "--collect",
+                &format!("--unit={unit}"),
+                "sleep",
+                "300",
+            ])
+            .status()
+            .expect("systemd-run");
+        assert!(started.success());
+        std::fs::write(
+            private.join("runner.json"),
+            json!({"unit": unit, "runner": null, "started_ms": 1, "limit_s": 300}).to_string(),
+        )
+        .expect("runner.json");
+        let active = |unit: &str| {
+            let out = std::process::Command::new("systemctl")
+                .args(["--user", "is-active", unit])
+                .output()
+                .expect("systemctl");
+            String::from_utf8_lossy(&out.stdout).trim() == "active"
+        };
+        assert!(active(&unit), "the left gate runs");
+        assert_eq!(sweep(&root), 1);
+        assert!(!active(&unit), "its unit was stopped");
+        assert!(!left.directory().exists());
+        std::fs::remove_dir_all(&root).expect("clean");
+    }
+
     #[test]
     fn a_start_sweeps_judging_directories_and_nothing_else() {
         let root = root("sweep");
-        let left = Judging::create(&root, &json!({})).expect("create");
+        let left = Judging::create(&root, &json!({}), false).expect("create");
         std::fs::write(left.directory().join("status"), "0\n").expect("status");
         let other = root.join(DIRECTORY).join("notes");
         std::fs::create_dir(&other).expect("other");

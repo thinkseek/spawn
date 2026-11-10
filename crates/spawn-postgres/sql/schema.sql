@@ -3760,14 +3760,16 @@ begin
     -- and base`, a scenario, and `validator_defects` naming at least one
     -- script, `<name>.sh`: a regression failing on the candidate and on the
     -- base, run again now, gate.sh's "Three classes of a failing
-    -- regression"); and its backoff.
+    -- regression"); a gate whose runner ended without its status
+    -- (`abandoned`: on `runner`, runs `no status`; gate v2 step 2, D6); and
+    -- its backoff.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
        and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log',
                                                           'base_disagrees', 'gate',
                                                           'cannot_judge',
                                                           'sandbox_never_started', 'main_red',
                                                           'test_server_never_started',
-                                                          'validator_defect')
+                                                          'validator_defect', 'abandoned')
             or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
             or (p_record ->> 'evidence' in ('failures', 'server_log')
                 and (case when jsonb_typeof(p_record -> 'failures') = 'array'
@@ -3812,6 +3814,9 @@ begin
                      or p_record -> 'fact' ->> 'on' is distinct from 'test server'
                      or p_record -> 'fact' ->> 'runs' is distinct from 'never started'
                      or coalesce(p_record -> 'fact' ->> 'tree', '') not in ('gate', 'candidate')))
+            or (p_record ->> 'evidence' = 'abandoned'
+                and (p_record -> 'fact' ->> 'on' is distinct from 'runner'
+                     or p_record -> 'fact' ->> 'runs' is distinct from 'no status'))
             or (p_record ->> 'evidence' = 'main_red'
                 and (coalesce(p_record -> 'fact' ->> 'scenario', '') !~ '^check-[^/[:space:]]+\.sh$'
                      or p_record -> 'fact' ->> 'on' is distinct from 'main'
