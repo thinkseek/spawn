@@ -6,11 +6,13 @@ import {
   deriveMissionTimeline,
   earlierLabel,
   groupEnd,
+  headerLane,
   holdText,
   holdTitle,
   laneLifetimeText,
   laneToday,
   laneTodayText,
+  titleReason,
   splitEarlier,
   filterLanes,
   hasBars,
@@ -451,6 +453,27 @@ test("filters: by mission keeps the lane; by state drops lanes left empty", () =
   assert.deepEqual(filterLanes(lanes, null, "cancelled"), []);
 });
 
+test("a filtered row's header still tells the mission's whole day (rev-f F1)", () => {
+  const a = mission(6, [
+    task(16, "landed", [["assigned", 0], ["landed", 7]]),
+    task(17, "delivered", [["assigned", 8], ["delivered", 9]]),
+  ]);
+  const now = T0 + 20 * MIN;
+  const { lanes } = deriveMissionTimeline([a], now);
+  for (const state of ["open", "landed"] as const) {
+    const [shown] = filterLanes(lanes, null, state);
+    assert.equal(shown.bars.length, 1, `the ${state} filter leaves one bar on the row`);
+    const day = laneToday(headerLane(lanes, shown), now);
+    assert.deepEqual([day.inFlight, day.landed], [1, 1], `under the ${state} filter`);
+  }
+});
+
+test("a title clips a reason only past 2,000 characters", () => {
+  assert.equal(titleReason("short"), "short");
+  assert.equal(titleReason("x".repeat(2000)), "x".repeat(2000));
+  assert.equal(titleReason("x".repeat(5000)), `${"x".repeat(1999)}…`);
+});
+
 test("names and states", () => {
   assert.equal(missionName({ id: 6, text: "Supply PA: give every provider…" }), "Supply PA");
   assert.equal(missionName({ id: 4, text: "Make the gate faster. Then more." }), "Make the gate faster");
@@ -553,4 +576,5 @@ test("a held source's title keeps what the card showed: reason, who took it and 
   const hold = { expires_ms: now + 145 * MIN, waiting: [221, 222], reason: "release freeze", by: "human", held_at_ms: now - 60 * MIN, main: "0123456789abcdef0123" };
   assert.equal(holdTitle(hold, now), "source held · expires in 2 h · 2 tasks waiting\nrelease freeze\ntaken by human 1 h ago at main 0123456789ab\nwaiting: T221, T222");
   assert.equal(holdTitle({ ...hold, reason: null, by: null, held_at_ms: null, main: null, waiting: [] }, now), "source held · expires in 2 h");
+  assert.equal(holdTitle({ ...hold, reason: null, held_at_ms: null, main: null, waiting: [] }, now), "source held · expires in 2 h\ntaken by human", "who took it, when that is all it knows");
 });

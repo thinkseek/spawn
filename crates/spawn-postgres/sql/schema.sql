@@ -2013,6 +2013,10 @@ begin
         -- commit not in the source, main moving under it twice): main and
         -- every baseline stay where they were.
         null;
+    when 'integrator.draining', 'integrator.drained', 'integrator.drain_expired' then
+        -- The integrator's drain (spawn_integrator_record): read from the
+        -- log, folded into no table.
+        null;
     when 'objective.solved' then
         -- The objective's scenario passes at a base commit main already
         -- holds, so no task of it can change anything: the assignment rule
@@ -2990,7 +2994,9 @@ begin
                                       'source.moved', 'source.push_refused',
                                       'task.over_budget', 'objective.solved',
                                       'source.main_red', 'source.main_probe',
-                                      'source.main_green', 'task.shadow_gated') then
+                                      'source.main_green', 'task.shadow_gated',
+                                      'integrator.draining', 'integrator.drained',
+                                      'integrator.drain_expired') then
         raise exception 'the integrator does not record %', p_record ->> 'type';
     end if;
     -- A shadow verdict (spawn-cli integrate/shadow.rs): a gate runner judged
@@ -3010,6 +3016,23 @@ begin
                and jsonb_array_length(p_record -> 'unequal') > 0) then
             raise exception 'a task.shadow_gated names its task, runner, inputs and unequal, and agrees only on equal inputs: %',
                             p_record;
+        end if;
+        return spawn_control_record(p_record);
+    end if;
+    -- The integrator's own drain (`spawn integrate --drain`, SIGUSR1): its
+    -- start names the tasks whose gates run and its bound; its end, drained
+    -- (every gate recorded and landed) or expired at the bound (naming the
+    -- tasks whose gates it stopped, which record nothing). Folded into no
+    -- table: the dispatcher tells the supervisor of an expired drain.
+    if p_record ->> 'type' like 'integrator.%' then
+        if jsonb_typeof(p_record -> 'bound_s') is distinct from 'number'
+           or (p_record ->> 'bound_s')::numeric not between 1 and 86400
+           or (p_record ->> 'type' <> 'integrator.drained'
+               and (jsonb_typeof(p_record -> 'gates') is distinct from 'array'
+                    or exists (select 1 from jsonb_array_elements(p_record -> 'gates') g
+                                where jsonb_typeof(g) is distinct from 'number'))) then
+            raise exception 'an % names its bound_s (1 to 86400) and, but drained, its gates (task numbers): %',
+                            p_record ->> 'type', p_record;
         end if;
         return spawn_control_record(p_record);
     end if;
@@ -3203,6 +3226,20 @@ begin
        and p_record ->> 'verdict' not in ('accepted', 'rejected', 'conflict', 'incompatible',
                                           'aborted', 'stale', 'no_room', 'host_fault') then
         raise exception 'unknown gate verdict %', p_record ->> 'verdict';
+    end if;
+    -- A verdict says what it is about (objective 035): `code` for one on the
+    -- work, `infrastructure` for one the host could not judge, `superseded`
+    -- for `stale`. A record from before this change names none; one that
+    -- names a class names its verdict's, never another.
+    if p_record ->> 'type' = 'task.gated' and p_record ? 'class'
+       and p_record ->> 'class' is distinct from (
+           case when p_record ->> 'verdict' in ('accepted', 'rejected', 'conflict', 'incompatible')
+                     then 'code'
+                when p_record ->> 'verdict' in ('aborted', 'host_fault', 'no_room')
+                     then 'infrastructure'
+                when p_record ->> 'verdict' = 'stale' then 'superseded' end) then
+        raise exception 'a % verdict is not of class %', p_record ->> 'verdict',
+                        p_record ->> 'class';
     end if;
     -- A host fault names its evidence (§14): the failures the gate printed,
     -- each the host's, and, when the test database's log decided it, the
@@ -3813,10 +3850,18 @@ create index if not exists spawn_events_gate_base_disagrees
 -- supervisor's login, which may not read `spawn_events`, reads it too.
 create or replace function spawn_task_stages(p_task bigint)
 returns jsonb language sql stable security definer as $$
+    -- A verdict's `class`, `inputs` and `env` (objective 035) as recorded,
+    -- their nulls kept (a controller that was unknown, a run that printed
+    -- no toolchain); a record from before them shows none.
     select coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
                'stage', substr(s.type, 6), 'verdict', s.verdict, 'at_ms', s.at_ms,
-               'took_ms', s.at_ms - s.previous_ms)) order by s.seq), '[]'::jsonb)
+               'took_ms', s.at_ms - s.previous_ms))
+               || s.binding order by s.seq), '[]'::jsonb)
       from (select e.session_seq as seq, r.record ->> 'type' as type,
+                   case when r.record ->> 'type' = 'task.gated' then
+                     r.record - array(select k from jsonb_object_keys(r.record) k
+                                       where k not in ('class', 'inputs', 'env', 'head_inputs'))
+                   else '{}'::jsonb end as binding,
                    case r.record ->> 'type'
                      when 'task.gated' then r.record ->> 'verdict'
                      when 'task.reviewed' then

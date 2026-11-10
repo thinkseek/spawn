@@ -118,6 +118,12 @@ fn runtime_pathspecs(magic: &str) -> Vec<OsString> {
 /// ([`GitWorkspace::restore_main_copies`]).
 pub const MAIN_COPIES: &str = ".spawn/main";
 
+/// Where a set-aside moves a file over the cap that was in the way of a
+/// file of the tree it returns the workspace to, under the commit that
+/// keeps the rest of the work: `.spawn/set-aside/<commit>/<path>`. Like
+/// [`MAIN_COPIES`], under `.spawn/`, which no checkpoint takes.
+pub const SET_ASIDE_FILES: &str = ".spawn/set-aside";
+
 /// First field of the record of main's copies ([`GitWorkspace::main_copies`]).
 const COPIES_TAG: &str = "main-copies";
 
@@ -1237,15 +1243,19 @@ impl WorkspaceStore for GitWorkspace {
         }
         // A pending merge stays only when the branch carries its markers.
         self.settle_pending(branch.as_str());
+        // `.spawn/` is never committed: main's copies for an open conflict
+        // markers cannot show come back from their record, into the staged
+        // tree, so a copy that fails fails the mount like any other step.
+        if let Err(error) = self.restore_main_copies(branch.as_str(), &staged) {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(error);
+        }
         if let Err(error) = self.replace_workspace(branch.as_str(), &staged, &directory) {
             let _ = std::fs::remove_dir_all(&staged);
             return Err(error);
         }
         // A fresh export is the branch head: nothing stale is left.
         self.clear_stale(branch.as_str());
-        // `.spawn/` is never committed: main's copies for an open conflict
-        // markers cannot show come back from their record.
-        self.restore_main_copies(branch.as_str(), &directory);
 
         WorkspaceId::new(format!("{branch}:{}", directory.display()))
             .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
@@ -1524,11 +1534,7 @@ impl GitWorkspace {
         match output.status.code() {
             Some(0) => {}
             Some(1) => {
-                // Only a conflict in a file's lines is shown by markers; a
-                // listing without any conflict kind is not trusted.
-                let mut conflicts = kinds.iter().filter(|kind| kind.starts_with("CONFLICT"));
-                let marked = conflicts.clone().next().is_some()
-                    && conflicts.all(|kind| kind == "CONFLICT (contents)");
+                let marked = shown_by_markers(&kinds);
                 if marked {
                     self.update_directory(&branch, &directory, &head_tree, &merged)?;
                     if let Err(error) = self.write_pending(&branch, &main, &head, &files) {
@@ -1587,6 +1593,19 @@ impl GitWorkspace {
     /// way a merge of main does; only then does the branch move, by
     /// compare-and-swap. `start` must be an ancestor of the head: no foreign
     /// tree is ever written. `None` is where the branch forked from `main`.
+    ///
+    /// The files that commit leaves out (over the cap, special) are on no
+    /// branch and in no commit, and nothing says which task made one: they
+    /// stay where they are, as ignored files do. Only one at a path `start`
+    /// holds a file at is in the way of the two-tree move, which would
+    /// refuse; that one alone makes way ([`Self::make_way_for_start`]): a
+    /// file over the cap is moved under [`SET_ASIDE_FILES`], never deleted,
+    /// and a special file, which holds nothing, is removed.
+    ///
+    /// The branch moves before the caller records the set-aside, so a
+    /// caller whose record failed asks again: a head that is this
+    /// set-aside already ([`Self::set_aside_made`]) is answered as when it
+    /// was made, and nothing is written.
     fn set_aside_since(
         &self,
         branch: &str,
@@ -1622,7 +1641,8 @@ impl GitWorkspace {
             let _ = std::fs::remove_file(&index);
             let tree = self.tree_of(&directory, &index, branch, &head);
             let _ = std::fs::remove_file(&index);
-            let (tree, _) = tree?;
+            let (tree, oversized) = tree?;
+            let special = self.special_files_at(&directory, &[&start])?;
             if tree != self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])? {
                 let kept_message = format!(
                     "spawn: the workspace of {branch} as it was, kept before its work is set aside"
@@ -1637,10 +1657,17 @@ impl GitWorkspace {
                     })?;
                 head = kept;
             }
+            // Everything else the directory held is committed now.
+            self.make_way_for_start(branch, &directory, &start, &head, &oversized, &special)?;
         }
         let head_tree = self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])?;
         let start_tree = self.git_output(&["rev-parse", &format!("{start}^{{tree}}")])?;
         if head_tree == start_tree {
+            if head != start
+                && let Some(made) = self.set_aside_made(&head, &start_tree, message)?
+            {
+                return Ok(made);
+            }
             return Ok(SetAside::Unchanged);
         }
         let changed = self.git_listing(&[
@@ -1675,10 +1702,118 @@ impl GitWorkspace {
         })
     }
 
+    /// Before a set-aside moves `directory` to `start`'s tree: what the
+    /// commit `kept` left out and `start` holds a file at makes way for
+    /// that file. A file over the cap (`oversized`) is in no commit, so it
+    /// is moved, bytes untouched, to [`SET_ASIDE_FILES`] under `kept` (one
+    /// place per set-aside: nothing moved earlier is overwritten); a
+    /// special file (`special`, at such paths only) is removed. Every other
+    /// file over the cap stays where it is, whichever task made it, and is
+    /// recorded as a checkpoint records it, so its agent is told of it.
+    fn make_way_for_start(
+        &self,
+        branch: &str,
+        directory: &Path,
+        start: &str,
+        kept: &str,
+        oversized: &[(TreePath, u64)],
+        special: &[TreePath],
+    ) -> Result<(), WorkspaceError> {
+        let unavailable = |error: crate::agent_files::AgentFileError| {
+            WorkspaceError::Unavailable(format!(
+                "make way for the files of {start} in the workspace of {branch}: {error}"
+            ))
+        };
+        let in_the_way = self.blobs_in(&[start.to_string()], oversized)?;
+        let mut stay = Vec::new();
+        for (path, size) in oversized {
+            if !in_the_way.contains(path) {
+                stay.push((path.clone(), *size));
+                continue;
+            }
+            let mut aside = format!("{SET_ASIDE_FILES}/{kept}/").into_bytes();
+            aside.extend_from_slice(path.as_bytes());
+            crate::agent_files::rename_within(directory, path, &TreePath::from_bytes(aside))
+                .map_err(unavailable)?;
+        }
+        for path in special {
+            crate::agent_files::remove(directory, path).map_err(unavailable)?;
+        }
+        self.record_oversized(branch, &stay);
+        Ok(())
+    }
+
+    /// The paths one of `commits` holds a file at where `directory` holds
+    /// something git cannot add (a FIFO, a socket, a device). git lists such
+    /// an entry only at a path its index holds ([`Self::left_out_files`]),
+    /// and a set-aside's index is fresh.
+    fn special_files_at(
+        &self,
+        directory: &Path,
+        commits: &[&str],
+    ) -> Result<Vec<TreePath>, WorkspaceError> {
+        let mut special = Vec::new();
+        for commit in commits {
+            let listed =
+                self.git_listing(&["ls-tree", "-r", "-z", "--name-only", "--full-tree", commit])?;
+            for path in listed_paths(&listed) {
+                let Ok(metadata) = std::fs::symlink_metadata(directory.join(path.as_path())) else {
+                    continue;
+                };
+                let kind = metadata.file_type();
+                if !kind.is_file() && !kind.is_symlink() && !kind.is_dir() {
+                    special.push(path);
+                }
+            }
+        }
+        special.sort();
+        special.dedup();
+        Ok(special)
+    }
+
+    /// The set-aside `head` is, when an earlier call with this `message`
+    /// made it: a commit with one parent (the work kept), `message`, and
+    /// the start's tree, which its parent's is not. The caller's `message`
+    /// names its task, so another task's set-aside is not this one.
+    fn set_aside_made(
+        &self,
+        head: &str,
+        start_tree: &str,
+        message: &str,
+    ) -> Result<Option<SetAside>, WorkspaceError> {
+        let parents = self.git_output(&["rev-list", "--parents", "-n", "1", head])?;
+        let &[_, kept] = parents.split_whitespace().collect::<Vec<_>>().as_slice() else {
+            return Ok(None);
+        };
+        let kept_tree = self.git_output(&["rev-parse", &format!("{kept}^{{tree}}")])?;
+        if kept_tree == start_tree
+            || self.git_output(&["show", "-s", "--format=%B", head, "--"])? != message.trim()
+        {
+            return Ok(None);
+        }
+        let changed = self.git_listing(&[
+            "diff-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            &kept_tree,
+            start_tree,
+        ])?;
+        Ok(Some(SetAside::Created {
+            commit: CommitId::new(head.to_string())
+                .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
+            kept: CommitId::new(kept.to_string())
+                .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
+            files: shown_paths(&listed_paths(&changed)),
+        }))
+    }
+
     /// Merge `main` into `branch`, which is not mounted, only when the merge
     /// is clean ([`WorkspaceStore::merge_main_clean`]): no directory is
     /// touched; the branch moves by compare-and-swap. Any conflict leaves
-    /// the branch as it is.
+    /// the branch as it is, and brings an open record of main's copies to
+    /// the `main` it is with ([`Self::follow_main_copies`]): the mount that
+    /// comes next restores from it.
     fn merge_main_into_branch(&self, branch: &str) -> Result<BaseMerge, WorkspaceError> {
         let _lock = self.lock_branch(branch)?;
         // A merge on top would hide what the mount refuses.
@@ -1706,10 +1841,11 @@ impl GitWorkspace {
             .stdin(Stdio::null())
             .output()
             .map_err(|error| WorkspaceError::Unavailable(format!("run {}: {error}", self.git)))?;
-        let (merged, files, _) = merge_tree_output(&output.stdout);
+        let (merged, files, kinds) = merge_tree_output(&output.stdout);
         match output.status.code() {
             Some(0) => {}
             Some(1) => {
+                self.follow_main_copies(branch, &main, &files, shown_by_markers(&kinds))?;
                 return Ok(BaseMerge::Conflicted {
                     files: shown_paths(&files),
                     marked: false,
@@ -2084,26 +2220,42 @@ impl GitWorkspace {
         let _ = std::fs::remove_file(self.copies_path(branch));
     }
 
-    /// Main's version of `path` at `main`, if main has it as a file.
-    fn mains_version(&self, main: &str, path: &TreePath) -> Option<Vec<u8>> {
-        let mut spec = OsString::from(format!("{main}:"));
-        spec.push(OsStr::from_bytes(path.as_bytes()));
-        let output = self
-            .command()
-            .arg("cat-file")
-            .arg("blob")
-            .arg(spec)
-            .stdin(Stdio::null())
-            .output()
-            .ok()?;
-        output.status.success().then_some(output.stdout)
+    /// Main's version of `path` at `main`; `None` when main has no file
+    /// there. Only git's own answer is an absence: a listing or a blob git
+    /// cannot read is an error, or the note would tell the worker to delete
+    /// a file main holds.
+    fn mains_version(
+        &self,
+        main: &str,
+        path: &TreePath,
+    ) -> Result<Option<Vec<u8>>, WorkspaceError> {
+        let mut arguments: Vec<OsString> = ["ls-tree", "-z", "--full-tree", main, "--"]
+            .map(OsString::from)
+            .into();
+        arguments.push(path.pathspec("literal"));
+        let listed = self.git_listing(&arguments)?;
+        // `<mode> blob <id>\t<path>`
+        let blob = nul_fields(&listed)
+            .filter_map(tree_entry)
+            .filter(|(_, entry)| entry == path)
+            .find_map(|(meta, _)| {
+                let mut fields = meta.split_whitespace().skip(1);
+                (fields.next() == Some("blob"))
+                    .then(|| fields.next())
+                    .flatten()
+            });
+        let Some(blob) = blob else {
+            return Ok(None);
+        };
+        self.git_listing(&["cat-file", "blob", blob]).map(Some)
     }
 
     /// Write main's version of each of `files` that main has into
     /// [`MAIN_COPIES`] in `directory`, then record what was copied, atomically,
     /// so a mount can put the copies back ([`Self::restore_main_copies`]).
-    /// A record that cannot be written fails the merge: the note would
-    /// promise copies a remount loses.
+    /// A copy or a record that cannot be written fails the merge, and
+    /// nothing is recorded: the note would promise copies that are not
+    /// there, or call a file whose copy failed one main does not have.
     fn copy_mains_versions(
         &self,
         branch: &str,
@@ -2111,10 +2263,23 @@ impl GitWorkspace {
         main: &str,
         files: &[TreePath],
     ) -> Result<(), WorkspaceError> {
-        let copied: Vec<&TreePath> = files
-            .iter()
-            .filter(|file| self.copy_mains_version(directory, main, file))
-            .collect();
+        let mut copied = Vec::new();
+        for file in files {
+            if self.copy_mains_version(directory, main, file)? {
+                copied.push(file);
+            }
+        }
+        self.record_main_copies(branch, main, &copied)
+    }
+
+    /// Record, atomically, that `copied` are main's copies of `branch` at
+    /// `main` ([`Self::copies_path`]).
+    fn record_main_copies(
+        &self,
+        branch: &str,
+        main: &str,
+        copied: &[&TreePath],
+    ) -> Result<(), WorkspaceError> {
         let path = self.copies_path(branch);
         let unavailable = |what: &str, error: std::io::Error| {
             WorkspaceError::Unavailable(format!("{what} {}: {error}", path.display()))
@@ -2133,37 +2298,82 @@ impl GitWorkspace {
     }
 
     /// Copy main's version of `file` at `main` into [`MAIN_COPIES`] in
-    /// `directory` (never through a symlink the agent put there); whether it
-    /// was copied.
-    fn copy_mains_version(&self, directory: &Path, main: &str, file: &TreePath) -> bool {
-        let Some(bytes) = self.mains_version(main, file) else {
-            return false;
+    /// `directory` (never through a symlink the agent put there); `false`
+    /// when main has no such file. A version that cannot be read or
+    /// written is an error.
+    fn copy_mains_version(
+        &self,
+        directory: &Path,
+        main: &str,
+        file: &TreePath,
+    ) -> Result<bool, WorkspaceError> {
+        let Some(bytes) = self.mains_version(main, file)? else {
+            return Ok(false);
         };
         let mut copy = format!("{MAIN_COPIES}/").into_bytes();
         copy.extend_from_slice(file.as_bytes());
-        crate::agent_files::replace_with(directory, &TreePath::from_bytes(copy), &bytes).is_ok()
+        crate::agent_files::replace_with(directory, &TreePath::from_bytes(copy), &bytes)
+            .map(|()| true)
+            .map_err(|error| {
+                WorkspaceError::Unavailable(format!("copy main's version of {file}: {error}"))
+            })
+    }
+
+    /// A branch that is not mounted conflicts with `main` in `files`
+    /// (`marked`: markers would show all of it). A record of main's copies
+    /// made at an earlier `main` is not this conflict's: left as it is, the
+    /// next mount would put back that main's versions while every note
+    /// speaks of this one. So an open record follows the conflict: it names
+    /// `main` and those of `files` main has, or goes when markers would
+    /// show the conflict (the merge into the mounted workspace writes
+    /// them). A branch without a record gets none: nothing told its worker
+    /// of copies. The old record goes before anything can fail.
+    fn follow_main_copies(
+        &self,
+        branch: &str,
+        main: &str,
+        files: &[TreePath],
+        marked: bool,
+    ) -> Result<(), WorkspaceError> {
+        let Some((recorded, _)) = self.read_main_copies(branch) else {
+            return Ok(());
+        };
+        if recorded != main || marked {
+            self.clear_main_copies(branch);
+        }
+        if marked {
+            return Ok(());
+        }
+        let mut copied = Vec::new();
+        for file in files {
+            if self.mains_version(main, file)?.is_some() {
+                copied.push(file);
+            }
+        }
+        self.record_main_copies(branch, main, &copied)
     }
 
     /// At a mount: put main's copies of the branch's open conflict markers
-    /// cannot show back into the fresh `directory`, from their record, so
-    /// the note that names them still holds after the workspace was
-    /// exported again (an engine lost, a host restart, a resume). A branch
-    /// that contains the recorded main has no such conflict any more: the
-    /// record goes.
-    fn restore_main_copies(&self, branch: &str, directory: &Path) {
+    /// cannot show into the fresh `directory`, from their record, so the
+    /// note that names them still holds after the workspace was exported
+    /// again (an engine lost, a host restart, a resume). A branch that
+    /// contains the recorded main has no such conflict any more: the record
+    /// goes. A copy that cannot be made is an error: the note names it.
+    fn restore_main_copies(&self, branch: &str, directory: &Path) -> Result<(), WorkspaceError> {
         let Some((main, files)) = self.read_main_copies(branch) else {
-            return;
+            return Ok(());
         };
         let contained = self
             .commit_id_of(&format!("refs/heads/{branch}"))
             .and_then(|head| self.is_ancestor(&main, &head));
         if matches!(contained, Ok(true)) {
             self.clear_main_copies(branch);
-            return;
+            return Ok(());
         }
         for file in &files {
-            self.copy_mains_version(directory, &main, file);
+            self.copy_mains_version(directory, &main, file)?;
         }
+        Ok(())
     }
 
     /// When a workspace's directory goes (unmount) or is exported afresh
@@ -2311,6 +2521,14 @@ fn tree_entry(entry: &[u8]) -> Option<(&str, TreePath)> {
     let tab = entry.iter().position(|byte| *byte == b'\t')?;
     let meta = std::str::from_utf8(&entry[..tab]).ok()?;
     Some((meta, TreePath::from_bytes(&entry[tab + 1..])))
+}
+
+/// Whether markers show every conflict of a merge whose message kinds are
+/// `kinds` ([`merge_tree_output`]). Only a conflict in a file's lines is
+/// shown by markers; a listing without any conflict kind is not trusted.
+fn shown_by_markers(kinds: &[String]) -> bool {
+    let mut conflicts = kinds.iter().filter(|kind| kind.starts_with("CONFLICT"));
+    conflicts.clone().next().is_some() && conflicts.all(|kind| kind == "CONFLICT (contents)")
 }
 
 /// The tree, the conflicted paths and the message kinds (`Auto-merging`,
@@ -3085,6 +3303,206 @@ mod tests {
         assert!(!directory.exists());
         let tree = |commit: &str| git(&repo, &["rev-parse", &format!("{commit}^{{tree}}")]);
         assert_eq!(tree("agent_a"), tree(&start));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// GitHub #16 item 1: a set-aside moves the branch before its caller
+    /// records it, so a caller whose record failed asks again. The set-aside
+    /// is on the branch already (its tree is the start's): it is answered
+    /// again, the same commits and files, mounted or not, and no second
+    /// commit is made. Another task's set-aside finds nothing to set aside.
+    #[test]
+    fn a_set_aside_asked_again_is_the_one_already_on_the_branch() {
+        use spawn_core::port::SetAside;
+        let (store, workspace, base, start, work) = worked("set-aside-again");
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        let message = "spawn: set aside task #7";
+        let first = store
+            .set_aside(&branch, Some(&start), message)
+            .expect("set aside");
+        let SetAside::Created { commit, kept, .. } = &first else {
+            panic!("the work differs from the start");
+        };
+        assert_eq!(kept.as_str(), work);
+        let repo = base.join("repo");
+        assert_eq!(
+            store
+                .set_aside(&branch, Some(&start), message)
+                .expect("asked again"),
+            first,
+            "the retry is answered with the set-aside it made"
+        );
+        store.unmount(&workspace).expect("unmount");
+        assert_eq!(
+            store
+                .set_aside(&branch, Some(&start), message)
+                .expect("asked again, not mounted"),
+            first
+        );
+        assert_eq!(
+            git(&repo, &["rev-parse", "agent_a"]),
+            commit.as_str(),
+            "no second commit"
+        );
+        assert_eq!(
+            store
+                .set_aside(&branch, Some(&start), "spawn: set aside task #8")
+                .expect("another task's"),
+            SetAside::Unchanged
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// GitHub #16 item 1, review fix-core-a F1: a file the checkpoints leave
+    /// out (one over the cap, a FIFO) is in no commit, so a set-aside never
+    /// deletes one that holds anything: it stays where it is, byte for
+    /// byte, and the agent is told of it as after any checkpoint. Only one
+    /// at a path the start's tree holds a file at makes way, or the
+    /// two-tree move would refuse every pass: a file over the cap is moved
+    /// under `.spawn/set-aside/<the commit that keeps the work>/`, a FIFO
+    /// is removed, and the start's file comes back.
+    #[test]
+    fn a_set_aside_deletes_no_file_the_checkpoints_left_out() {
+        use spawn_core::port::SetAside;
+        let (checkout, store, workspace, base) = capped("set-aside-left-out");
+        let directory = PathBuf::from(workspace.path());
+        std::fs::write(directory.join("data.bin"), "small\n").expect("write");
+        let Commit::Created(start) = store.commit(&workspace, "start").expect("commit") else {
+            panic!("a change");
+        };
+        let over = vec![2u8; (1 << 20) + 1];
+        std::fs::write(directory.join("work.txt"), "mine\n").expect("write");
+        std::fs::write(directory.join("over.bin"), &over).expect("write");
+        std::fs::write(directory.join("pipe"), "a file first\n").expect("write");
+        store.commit(&workspace, "work").expect("commit");
+        let fifo = |name: &str| {
+            std::fs::remove_file(directory.join(name)).expect("remove");
+            let made = Command::new("mkfifo")
+                .arg(directory.join(name))
+                .status()
+                .expect("mkfifo");
+            assert!(made.success());
+        };
+        fifo("pipe");
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        let SetAside::Created { kept, .. } = store
+            .set_aside(&branch, Some(start.as_str()), "spawn: set aside task #7")
+            .expect("set aside")
+        else {
+            panic!("the work differs from the start");
+        };
+        assert_eq!(
+            git(&checkout, &["ls-tree", "--name-only", kept.as_str()]),
+            "README.md\ndata.bin\nwork.txt",
+            "the work kept is what a checkpoint holds"
+        );
+        assert!(!directory.join("work.txt").exists());
+        assert_eq!(
+            std::fs::read(directory.join("over.bin")).expect("over the cap"),
+            over,
+            "in no commit, so it stays"
+        );
+        assert!(
+            std::fs::symlink_metadata(directory.join("pipe")).is_ok(),
+            "a FIFO in no one's way stays"
+        );
+        assert!(!directory.join(super::SET_ASIDE_FILES).exists());
+        let notices = store.notices(&workspace);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].starts_with("over.bin (2 MiB)"), "{notices:?}");
+
+        // A file of the start's tree that grew past the cap is left out of
+        // the commit that keeps the work, and is in the start's way.
+        let grown = vec![3u8; (1 << 20) + 1];
+        std::fs::write(directory.join("data.bin"), &grown).expect("write");
+        let SetAside::Created { kept, .. } = store
+            .set_aside(&branch, Some(start.as_str()), "spawn: set aside task #8")
+            .expect("set aside")
+        else {
+            panic!("the work differs from the start");
+        };
+        assert_eq!(
+            std::fs::read_to_string(directory.join("data.bin")).expect("the start's file"),
+            "small\n"
+        );
+        assert_eq!(
+            std::fs::read(
+                directory
+                    .join(super::SET_ASIDE_FILES)
+                    .join(kept.as_str())
+                    .join("data.bin")
+            )
+            .expect("moved, not deleted"),
+            grown
+        );
+        assert_eq!(
+            std::fs::read(directory.join("over.bin")).expect("stays"),
+            over
+        );
+        fifo("data.bin");
+        assert!(matches!(
+            store.set_aside(&branch, Some(start.as_str()), "spawn: set aside task #9"),
+            Ok(SetAside::Created { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(directory.join("data.bin")).expect("the start's file"),
+            "small\n"
+        );
+
+        // Nothing but a file over the cap: nothing to set aside, and it stays.
+        assert_eq!(
+            store
+                .set_aside(&branch, Some(start.as_str()), "spawn: set aside task #10")
+                .expect("set aside"),
+            SetAside::Unchanged
+        );
+        assert_eq!(
+            std::fs::read(directory.join("over.bin")).expect("stays"),
+            over
+        );
+        assert_eq!(
+            store.commit(&workspace, "after").expect("commit"),
+            Commit::Unchanged,
+            "what was moved under .spawn/ is in no checkpoint"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Review fix-core-a F1 (rev-g): a file over the cap that an earlier,
+    /// finished task of the same resident left in its mounted workspace is
+    /// in no commit. The set-aside of a later, cancelled task leaves it
+    /// where it is, byte for byte.
+    #[test]
+    fn a_set_aside_keeps_an_earlier_tasks_file_over_the_cap() {
+        use spawn_core::port::SetAside;
+        let (_checkout, store, workspace, base) = capped("set-aside-earlier-over-cap");
+        let directory = PathBuf::from(workspace.path());
+        // Task 6 (finished, not cancelled): a dataset over the cap, plus work.
+        let dataset = vec![4u8; (1 << 20) + 1];
+        std::fs::write(directory.join("dataset.bin"), &dataset).expect("write");
+        std::fs::write(directory.join("six.txt"), "task 6\n").expect("write");
+        let Commit::Created(start) = store.commit(&workspace, "task 6 done").expect("commit")
+        else {
+            panic!("a change");
+        };
+        // Task 7 starts from there, works, and is cancelled.
+        std::fs::write(directory.join("seven.txt"), "task 7\n").expect("write");
+        store.commit(&workspace, "task 7 work").expect("commit");
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        let made = store
+            .set_aside(&branch, Some(start.as_str()), "spawn: set aside task #7")
+            .expect("set aside");
+        assert!(matches!(made, SetAside::Created { .. }));
+        assert!(!directory.join("seven.txt").exists());
+        assert!(
+            directory.join("six.txt").exists(),
+            "task 6's committed work stays"
+        );
+        assert_eq!(
+            std::fs::read(directory.join("dataset.bin")).expect("task 6's file over the cap"),
+            dataset,
+            "not task 7's work, and in no commit"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

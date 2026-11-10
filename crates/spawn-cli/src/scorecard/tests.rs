@@ -721,6 +721,29 @@ fn reliability_counts_failures_of_the_machinery() {
     assert_eq!(marks(Kind::Stall), vec![at(7), at(8)]);
 }
 
+/// GitHub #16 item 3: a failure is a fact of the moment the command
+/// finished, so a window that ended before it does not hold it, and the
+/// window it finished in does.
+#[test]
+fn a_failed_command_counts_in_the_window_it_finished_in() {
+    let mut story = Story::default();
+    story.mission(1, true);
+    story.assign(at(1), 6, 1, Some(13), "spawn-integrate");
+    // Created half a second before hour 24, finished half a second after.
+    story.failed("dispatch-resume-1", "session_6", at(24) - 500, "lost");
+    let history = story.history();
+    let failed = |since: i64, until: i64| {
+        dimension(
+            &counts(&history, Scope::Mission(1), window_hours(since, until)),
+            None,
+            "reliability",
+        )["by_kind"]["failed_command"]
+            .clone()
+    };
+    assert_eq!(failed(0, 24), json!(0), "not yet failed in this window");
+    assert_eq!(failed(24, 48), json!(1), "failed in this one");
+}
+
 #[test]
 fn a_delivery_is_spent_only_as_attempts_judges_it() {
     let spent = |attempts: &[(Option<bool>, Option<&str>)]| -> bool {

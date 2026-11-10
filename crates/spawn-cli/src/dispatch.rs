@@ -463,6 +463,10 @@ pub(crate) enum Why {
     /// An objective mission's backlog names an order that cannot be met
     /// ([`digest::objective_order`]): a condition until the backlog changes.
     ObjectiveOrder,
+    /// The integrator's drain reached its bound and stopped the gates still
+    /// running, which recorded nothing ([`digest::drain_expiries`]): their
+    /// tasks are judged again from nothing by the next integrator.
+    DrainExpired,
     /// A worker's engine ended on the model's error and the recovery will
     /// not revive it: a request the model never accepts (`model_error`), or
     /// a transient error whose retries are spent (`model_unavailable`)
@@ -475,8 +479,9 @@ impl Why {
     /// once, it leaves nothing to resolve. A disk recovery, an approval, a
     /// human's message, a pair of host faults at the gate (the integrator
     /// judges again on its own), an expired hold (its landings resumed on
-    /// their own) and an objective closed solved on the base (nothing is
-    /// assigned for it again) are news, as is a final model record (the
+    /// their own), an objective closed solved on the base (nothing is
+    /// assigned for it again) and an expired drain (its gates run again
+    /// under the next integrator) are news, as is a final model record (the
     /// recovery decided; the supervisor acts on it or not). Every other item is a
     /// condition that holds while its facts do (a worker's state, a stall,
     /// a path still low on disk, a gate still without room): told, it stays
@@ -494,6 +499,7 @@ impl Why {
                 | Self::ShadowDisagrees
                 | Self::HoldExpired
                 | Self::ObjectiveSolved
+                | Self::DrainExpired
                 | Self::ModelFinal
         )
     }
@@ -789,6 +795,10 @@ pub(crate) fn read_plan(
     host.extend(digest::hold_expiries(&records(
         store.hold_expiries(),
         "source hold records",
+    )?));
+    host.extend(digest::drain_expiries(&records(
+        store.drain_expiries(),
+        "integrator drain records",
     )?));
     host.extend(digest::model_finals(&records(
         store.model_finals(),
@@ -2139,6 +2149,46 @@ mod tests {
     /// an idle supervisor once, as an item of `missions` tagged
     /// `missions objective-yielded-<event id>`, its line naming the mission
     /// and the record's reason; two yields keep a line each.
+    /// An expired drain is one item of session `host`, tagged
+    /// `host integrator-drain-expired-<event id>`, news (told once), its
+    /// line naming each stopped task as `task #<id>` and the bound; a
+    /// record without its event id is no item.
+    #[test]
+    fn an_expired_drain_reaches_the_supervisor_once_naming_its_tasks() {
+        let records = [
+            serde_json::json!({
+                "event_id": 4410, "at_ms": 1_794_063_948_000_i64,
+                "type": "integrator.drain_expired", "gates": [212, 215], "bound_s": 7200,
+            }),
+            serde_json::json!({
+                "event_id": 4420, "type": "integrator.drain_expired", "gates": [],
+                "bound_s": 3,
+            }),
+        ];
+        let items = super::digest::drain_expiries(&records);
+        assert_eq!(items.len(), 2);
+        let item = &items[0];
+        assert_eq!(item.tag(), "host integrator-drain-expired-4410");
+        assert_eq!(item.why, Why::DrainExpired);
+        assert!(Why::DrainExpired.is_news());
+        assert_eq!(item.since_ms, Some(1_794_063_948_000));
+        assert!(
+            item.line.contains("task #212") && item.line.contains("task #215"),
+            "{}",
+            item.line
+        );
+        assert!(item.line.contains("7200 s"), "{}", item.line);
+        assert!(
+            items[1].line.contains("no gate was running"),
+            "{}",
+            items[1].line
+        );
+        assert!(
+            super::digest::drain_expiries(&[serde_json::json!({"gates": [1]})]).is_empty(),
+            "no event id, no item"
+        );
+    }
+
     /// A second overrun of an objective's chain is one digest item, tagging
     /// the overrun's record, naming both tasks, and holding the objective.
     #[test]
