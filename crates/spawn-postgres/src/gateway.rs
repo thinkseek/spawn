@@ -208,20 +208,6 @@ impl PostgresStore {
         human_write(answer)
     }
 
-<<<<<<< ea3a2e9f4fcf687a4d0248cc86d13167ffa24686
-    /// Type `text` into `session` as a person, through `spawn_human_input`:
-    /// the input `spawn submit --principal human` would submit to the
-    /// session's agent, with the same idempotency rule (a repeated `key`
-    /// returns the first command) for the same session and text only: a
-    /// `key` another session's input used, or other text, is refused
-    /// ([`HumanInput::KeyUsed`]) and nothing is recorded. Only a store
-    /// connected as the `spawn_human` login may call it (`role_url(owner,
-    /// "spawn_human")`); that login can do nothing else.
-    /// [`HumanInput::NoAgent`] when no agent has used the session; a session
-    /// that runs no execution is refused ([`HumanInput::NotRunning`]) and
-    /// nothing is recorded, though a repeated key still returns its first
-    /// command (objective 040).
-=======
     /// Restart (`restart`) or reassign (`reassign`) the delivered task of
     /// `session` as a person, through `spawn_human_task`, with `by` `human`.
     /// Only a store connected as the `spawn_human` login may call it. A
@@ -252,7 +238,18 @@ impl PostgresStore {
         }
     }
 
->>>>>>> 1f63c6306f7e6c7bedfe0d4c3d245ad659496a31
+    /// Type `text` into `session` as a person, through `spawn_human_input`:
+    /// the input `spawn submit --principal human` would submit to the
+    /// session's agent, with the same idempotency rule (a repeated `key`
+    /// returns the first command) for the same session and text only: a
+    /// `key` another session's input used, or other text, is refused
+    /// ([`HumanInput::KeyUsed`]) and nothing is recorded. Only a store
+    /// connected as the `spawn_human` login may call it (`role_url(owner,
+    /// "spawn_human")`); that login can do nothing else.
+    /// [`HumanInput::NoAgent`] when no agent has used the session; a session
+    /// that runs no execution is refused ([`HumanInput::NotRunning`]) and
+    /// nothing is recorded, though a repeated key still returns its first
+    /// command (objective 040).
     pub fn submit_human_input(
         &self,
         session: &SessionId,
