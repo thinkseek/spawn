@@ -150,6 +150,15 @@
 //!   read only while the step's fold has a reported task of a mission that
 //!   is open and not halted, or this alert is open: an idle loop reads
 //!   nothing more (objective 023).
+//! - `cost_budget`, `mission #<id>`, key `cost_budget:<mission>:<the UTC
+//!   day, YYYY-MM-DD>`: at a reading (every `SPAWN_ALERT_CHECK_SECS`), the
+//!   mission's cost of the model calls timed in the current UTC day
+//!   (crate::cost, priced when recorded) has reached its daily budget
+//!   (`budget.daily_usd`, `spawn mission configure --daily-usd`). Once per
+//!   mission and day, whatever restarts and however much more it spends;
+//!   clears when the day ends, or at a reading that finds the budget removed
+//!   or above the day's spend. A mission with no daily budget, or under it,
+//!   raises none. It rests on the readings of the recorded costs.
 //! - `model_auth`, the session id, key
 //!   `model_auth:<its execution.interrupted>`: an `execution.interrupted`
 //!   (028) with cause `model_auth`; clears at that execution's
@@ -178,6 +187,15 @@ use crate::config::{env_value, open_store};
 /// The Observer's own attention threshold: a `stuck` judgement at or above
 /// it says the agent loops or makes no progress.
 pub(crate) const LIKELY: f64 = 0.5;
+
+/// A day in milliseconds: the daily budget's day is the UTC day.
+const DAY_MS: i64 = 86_400_000;
+
+/// The UTC day of `ms`, `YYYY-MM-DD`.
+fn utc_day(ms: i64) -> String {
+    let (year, month, day, ..) = civil(ms);
+    format!("{year:04}-{month:02}-{day:02}")
+}
 
 /// The integrator-down alert's subject: the unit that runs the integrator.
 const INTEGRATOR: &str = "spawn-integrate";
@@ -531,6 +549,7 @@ impl Monitor {
             self.read_host(now, &mut events, &mut lines);
             self.read_integrator(store, now, &mut events, &mut lines);
             self.read_sources(store, now, &mut events, &mut lines);
+            self.read_budgets(store, now, &mut events, &mut lines);
         }
         self.bounds(now, &mut events);
         self.flush(store, now, &events, &mut lines);
@@ -1733,6 +1752,85 @@ times in a row)",
             ),
             notice: false,
         });
+    }
+
+    /// The daily budgets' reading (`cost_budget`): each budgeted mission's
+    /// spend of the UTC day so far, on the database's clock.
+    fn read_budgets(
+        &mut self,
+        store: &PostgresStore,
+        now: i64,
+        out: &mut Vec<Event>,
+        lines: &mut Vec<String>,
+    ) {
+        let day_start = now - now.rem_euclid(DAY_MS);
+        match store.cost_budgets(day_start, now.saturating_add(1)) {
+            Ok(reading) => self.budgets(now, &reading, out),
+            Err(error) => lines.push(format!("alerts: the daily budgets: {error}")),
+        }
+    }
+
+    /// One reading of the daily budgets (`[{mission, budget_usd,
+    /// spent_usd}]`): fire for a mission whose day's spend reached its
+    /// budget, once a day; clear an open one of another day, of a mission
+    /// with no budget now, or of one back under it.
+    fn budgets(&mut self, now: i64, reading: &Value, out: &mut Vec<Event>) {
+        let day = utc_day(now);
+        let rows = reading.as_array().map_or(&[][..], Vec::as_slice);
+        let mut over: HashMap<String, (f64, f64)> = HashMap::new();
+        let mut read: HashMap<String, (f64, f64)> = HashMap::new();
+        for row in rows {
+            let (Some(mission), Some(budget)) =
+                (row["mission"].as_i64(), row["budget_usd"].as_f64())
+            else {
+                continue;
+            };
+            let spent = row["spent_usd"].as_f64().unwrap_or_default();
+            let subject = format!("mission #{mission}");
+            read.insert(subject.clone(), (spent, budget));
+            if budget > 0.0 && spent >= budget {
+                over.insert(subject.clone(), (spent, budget));
+                let key = format!("cost_budget:{mission}:{day}");
+                if !self.known.contains_key(&key) {
+                    out.push(Event::Fire {
+                        key,
+                        kind: "cost_budget",
+                        subject: subject.clone(),
+                        evidence: json!({
+                            "day": day, "spent_usd": spent, "budget_usd": budget,
+                            "reading_ms": now,
+                        }),
+                        text: format!(
+                            "{subject} spent {} today (UTC), over its {} daily budget",
+                            crate::cost::dollars(spent),
+                            crate::cost::dollars(budget)
+                        ),
+                        notice: false,
+                    });
+                }
+            }
+        }
+        let open: Vec<(String, String)> = self
+            .known
+            .iter()
+            .filter(|(_, row)| row.open() && row.kind == "cost_budget")
+            .map(|(key, row)| (key.clone(), row.subject.clone()))
+            .collect();
+        for (key, subject) in open {
+            let today = key.ends_with(&format!(":{day}"));
+            if today && over.contains_key(&subject) {
+                continue;
+            }
+            let evidence = match read.get(&subject) {
+                _ if !today => json!({"day": day, "reading_ms": now, "why": "the day ended"}),
+                Some((spent, budget)) => json!({
+                    "day": day, "spent_usd": spent, "budget_usd": budget, "reading_ms": now,
+                    "why": "under the daily budget",
+                }),
+                None => json!({"day": day, "reading_ms": now, "why": "no daily budget"}),
+            };
+            out.push(Event::Clear { key, evidence });
+        }
     }
 
     fn read_memory(&mut self, now: i64, out: &mut Vec<Event>, lines: &mut Vec<String>) {
@@ -3709,6 +3807,73 @@ connections\n";
         let mut later = Vec::new();
         monitor.bounds(1000 + 2 * 7_200_000, &mut later);
         assert_eq!(fires(&later), ["backup_stale:dump:21"]);
+    }
+
+    #[test]
+    fn a_missions_daily_budget_alerts_once_a_day_and_clears_with_the_day_or_the_budget() {
+        let mut monitor = monitor();
+        // 2026-11-10 12:00 UTC.
+        let noon = 1_794_312_000_000_i64;
+        let reading = |spent: f64, budget: f64| {
+            json!([{"mission": 4, "budget_usd": budget, "spent_usd": spent},
+                   {"mission": 5, "budget_usd": 1.0, "spent_usd": 0.06}])
+        };
+        let read = |monitor: &mut Monitor, now: i64, value: Value| {
+            let mut out = Vec::new();
+            monitor.budgets(now, &value, &mut out);
+            let out = decided(monitor, out);
+            commit(monitor, &out);
+            out
+        };
+        assert!(
+            read(&mut monitor, noon, reading(0.4855, 0.5)).is_empty(),
+            "under: none"
+        );
+        let fired = read(&mut monitor, noon + 2000, reading(0.9355, 0.5));
+        assert_eq!(fires(&fired), ["cost_budget:4:2026-11-10"]);
+        let Event::Fire {
+            subject,
+            text,
+            evidence,
+            ..
+        } = &fired[0]
+        else {
+            panic!("a fire");
+        };
+        assert_eq!(subject, "mission #4");
+        assert_eq!(
+            text,
+            "mission #4 spent $0.94 today (UTC), over its $0.50 daily budget"
+        );
+        assert_eq!(evidence["day"], "2026-11-10");
+        // More spending the same day: nothing more.
+        assert!(read(&mut monitor, noon + 4000, reading(1.2355, 0.5)).is_empty());
+        // The budget raised above the spend clears it, and the day's key is
+        // spent: going over again that day fires nothing.
+        let raised = read(&mut monitor, noon + 6000, reading(1.2355, 2.0));
+        assert!(
+            matches!(&raised[..], [Event::Clear { key, .. }] if key == "cost_budget:4:2026-11-10")
+        );
+        assert!(read(&mut monitor, noon + 8000, reading(2.5, 2.0)).is_empty());
+        // The next UTC day is a new occurrence.
+        let tomorrow = noon + super::DAY_MS;
+        let next = read(&mut monitor, tomorrow, reading(0.6, 0.5));
+        assert_eq!(fires(&next), ["cost_budget:4:2026-11-11"]);
+        // Its day over: cleared at the next day's first reading.
+        let after = read(&mut monitor, tomorrow + super::DAY_MS, reading(0.1, 0.5));
+        assert!(
+            matches!(&after[..], [Event::Clear { key, .. }] if key == "cost_budget:4:2026-11-11")
+        );
+        // A budget removed clears its open alert.
+        let third = tomorrow + super::DAY_MS + 1000;
+        assert_eq!(
+            fires(&read(&mut monitor, third, reading(0.7, 0.5))),
+            ["cost_budget:4:2026-11-12"]
+        );
+        let removed = read(&mut monitor, third + 1000, json!([]));
+        assert!(
+            matches!(&removed[..], [Event::Clear { key, .. }] if key == "cost_budget:4:2026-11-12")
+        );
     }
 
     #[test]
