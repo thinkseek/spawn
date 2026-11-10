@@ -899,11 +899,6 @@ pub(crate) fn read_plan(
     })
 }
 
-/// Whether this process's dispatcher has looked at every report for an
-/// unanswered delivery once ([`crate::ack::report_answers`]); later passes
-/// look at the last day's.
-static REPORTS_ANSWERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// Run one dispatcher step against the store: collect reports from idle
 /// workers under `root` (a draft is not taken: its worker is told instead,
 /// [`deliver::collect_reports`]), then submit the plan ([`read_plan`]), with the
@@ -928,17 +923,9 @@ pub(crate) fn step(
         // Collecting a report changed a task's state.
         (rows, work) = load(store, waits)?;
     }
-    // The agents' answers to their messages (`spawn ack`, from their
-    // workspaces) and the reports' answers to their deliveries: recorded
-    // once each, changing no task and nothing this pass decides.
-    if let Some(root) = root {
-        lines.extend(crate::ack::collect(store, &rows, root));
-    }
-    lines.extend(crate::ack::report_answers(
-        store,
-        !REPORTS_ANSWERED.swap(true, std::sync::atomic::Ordering::Relaxed),
-        now_ms(),
-    ));
+    // The agents' answers to their messages and the reports' answers to
+    // their deliveries: changing no task and nothing this pass decides.
+    lines.extend(crate::ack::answers(store, &rows, root, now_ms()));
     let Reading {
         work,
         mut plan,
