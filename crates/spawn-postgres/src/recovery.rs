@@ -7,7 +7,8 @@
 //! exit status or signal ([`crate::PostgresStore::recovery_facts`]'s
 //! `execution`), the transcript's API error line by its event id (`turns`),
 //! the command that stopped it (`stops`), the free space a reading took, the
-//! terminal server's state at recovery (the host's, not here) and the
+//! terminal server the execution ran on (recorded) and the one that answers
+//! at recovery (the host's, not here), and the
 //! interruptions and revivals already in the log (`records`, `commands`).
 //! A restarted loop reads the same facts and reaches the same decisions.
 
@@ -74,8 +75,10 @@ select exists (
 /// One session's facts, as `recovery_facts` returns them. `$1` session.
 ///
 /// - `execution`: the session's latest execution — its id, start, end, the
-///   end's `cause`, `exit_code`, `signal` and `evidence`, its workspace —
-///   or null for a session that never ran.
+///   end's `cause`, `exit_code`, `signal` and `evidence`, its workspace, the
+///   terminal server its terminal started on (`terminal_server`, from its
+///   `execution.terminal_started`; null when none was recorded) — or null
+///   for a session that never ran.
 /// - `native_session_id`: the native session its latest
 ///   `session.native_started` names, which a resume resumes.
 /// - `turns`: every `turn.failed` of the execution, oldest first, with the
@@ -204,6 +207,12 @@ select jsonb_build_object(
                   'evidence', x.evidence,
                   'workspace', x.workspace,
                   'command_id', x.command_id,
+                  'terminal_server', (select e.kind -> 'detail' -> 'server'
+                                        from spawn_events e
+                                       where e.session_id = $1
+                                         and e.execution_id = x.execution_id
+                                         and e.event_name = 'execution.terminal_started'
+                                       order by e.id desc limit 1),
                   'end_event_id', (select e.id from spawn_events e
                                     where e.session_id = $1
                                       and e.execution_id = x.execution_id
