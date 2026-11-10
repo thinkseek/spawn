@@ -26,7 +26,7 @@ mod audit;
 pub use git::test_git_command;
 pub use git::{
     DEFAULT_MAX_FILE_MB, ENGINE_RUNTIME_FILES, GitWorkspace, LARGE_FILE_TRAILER, MAIN_COPIES,
-    git_command, has_conflict_block, has_conflict_block_sized, max_file_bytes,
+    SET_ASIDE_FILES, git_command, has_conflict_block, has_conflict_block_sized, max_file_bytes,
     names_files_outside_git,
 };
 pub use process::{current_uid, undumpable};

@@ -127,6 +127,19 @@ pub(super) fn read(
     })
 }
 
+/// The `inputs` of a record no gate ran for (`stale`, a conflict found
+/// before the gate, a `no_room` from the integrator's own room check): what
+/// is known, `base` and the candidate when there is one, the rest null.
+pub(super) fn known(base: Option<&str>, candidate: Option<&str>) -> Value {
+    json!({
+        "base": base,
+        "candidate": candidate,
+        "controller": null,
+        "scenarios_sha256": null,
+        "scenario": null,
+    })
+}
+
 /// The `env` of a gate run on this host whose output is `log`.
 pub(super) fn env_here(log: Option<&str>) -> Value {
     json!({
