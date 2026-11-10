@@ -132,6 +132,30 @@
 # that breaks that objective land. Closing that needs the gate under a uid
 # agents do not have.
 #
+# What is never cached (GitHub issue #29). The exit code is the whole
+# contract: an entry is written for exit 0, for exit 1 twice and for exit
+# 6, and for nothing else. A run that could not judge (the server it
+# started gave no answer, a connection closed under it, a tool or a
+# database missing, a kill) is a harness error, any other code: on the base
+# it writes no entry and ends the gate with its fact (`host_fault`), so the
+# next gate judges the objective again. Exit 1 is therefore the scenario's
+# statement that it asserted and the tree failed, and a scenario must keep
+# it for that. One that exits 1 for a transport error has said "unsolved",
+# and two such runs are an entry every later gate on that base believes:
+# the objective is no regression for any of them, unguarded until main
+# moves (Supply PA's 015, 043 and 057, 2026-11-09: "fetch failed: other
+# side closed", a keep-alive race, which the drivers' harness reported as
+# a failed assertion; a candidate that broke 057 was accepted). The gate
+# does not guess it from what a run prints: the words are the tree's to
+# print too, a tree whose server closes its connections is a tree that
+# fails, and a pattern loose enough to catch the next transport error would
+# take a real failure for one and judge nothing. What tells them apart is
+# known where the request is made, so the scenario's harness says it, by
+# its exit code. Nor is a run the gate itself lost an exit 1: one that left
+# no status (its subshell killed before it wrote one, its job's directory
+# gone) used to read as 1, and twice as `unsolved`; job_run returns 4 for
+# it and says so in the run's block.
+#
 # Results reused from the base (GitHub issue #48). A candidate that changes
 # no crate builds the base's `spawn` again, byte for byte, and a scenario
 # that only drives that binary then says on the candidate what it said on
@@ -253,6 +277,11 @@
 #                              waits between its mask check and bwrap (it creates
 #                              <file>.held first); spawn integrate never
 #                              passes it
+#   SPAWN_GATE_TEST_LOST_RUN   the suite's seam: a scenario's file name; the
+#                              status of each of its runs is dropped once the
+#                              run has ended, as a killed subshell leaves it
+#                              ("What is never cached"); spawn integrate
+#                              never passes it
 #   SPAWN_GATE_SLOT_PRIORITY   normal or low: who claims a slot first ("Host
 #                              scenario slots"); default low for --base-only
 #                              (a warm), normal for every other gate
@@ -1981,7 +2010,20 @@ job_run() {
         } | tee "$1/out.$2"
     } >"$1/log.$2" 2>&1
     [ -n "$slot_kept" ] || slot_release
-    return "$(cat "$1/status.$2" 2>/dev/null || echo 1)"
+    # The suite's seam (SPAWN_GATE_TEST_LOST_RUN): this run's status, gone.
+    [ "${SPAWN_GATE_TEST_LOST_RUN-}" != "$(basename "$4")" ] || rm -f "$1/status.$2"
+    # A run that left no status is one the gate lost, not one that exited
+    # 1: that is the scenario's "an assertion failed", and two of them on
+    # the base are a cached `unsolved` ("What is never cached"). 4 is no
+    # scenario's code for anything, so the base's job aborts on it and
+    # nothing is written; the block says what happened, since no scenario
+    # exited 4.
+    if ! grep -qxE '[0-9]+' "$1/status.$2" 2>/dev/null; then
+        echo "gate: the run of $(basename "$4") left no status: the gate lost it (not an exit of the scenario's)" \
+            >>"$1/log.$2" 2>/dev/null || :
+        return 4
+    fi
+    return "$(cat "$1/status.$2")"
 }
 # The job's block, written by the job ($job, $job_part): text, and a stage
 # line between two texts.
@@ -2731,7 +2773,9 @@ fi
 #   `python3 -V`, `jq --version`, and the test server's
 #   `server_version_num`, asked over its socket.
 # An entry is written only here, after a completed base run, and only
-# "solved" or "unsolved"; an entry that cannot be read, or holds anything
+# "solved" or "unsolved" (or `cannot_judge`, exit 6), each by the scenario's
+# own exit code and never for a harness error or a run the gate lost ("What
+# is never cached"); an entry that cannot be read, or holds anything
 # else, is a miss, judged again and rewritten. Candidate runs are never
 # cached. A hit touches its entry: spawn-maintenance removes entries no
 # gate used for 14 days (scripts/maintenance.sh). The log says which
