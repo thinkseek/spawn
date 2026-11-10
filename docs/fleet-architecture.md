@@ -878,6 +878,42 @@ keeps no state for this either: `spawn_events`, `spawn_commands` and their
 keys (`cancel-stop-<task>-<execution>`, `cancel-notice-<task>-<n>`,
 `set-aside:<task>`) say what was done.
 
+**Restart and reassign.** A worker that stalls (busy, no fact for
+`SPAWN_STALL_ACTIVITY_SECS`, escalated under "stalled") is given a fresh
+execution, or its task a fresh worker, without losing its work, by the
+owner or the supervisor (`spawn task restart --id N [--reason <text>]`,
+`spawn task reassign --id N [--reason <text>]`, the store's
+`spawn_task_restart` and `spawn_task_reassign`), or by a person from the
+agent page (`POST /api/session/<id>/restart` and `/reassign`, `by` `human`,
+through `spawn_human_task`). Each takes a `delivered` task only, refuses any
+other naming its state (nothing recorded or sent), and prints `{task,
+session_id, agent_id}`: the task and the worker that now carry the work.
+
+- *Restart.* `task.restarted` {task, session_id, execution_id (the running
+  one, if any), by, reason, n (from 1, per task)}. The dispatcher stops that
+  execution (a Stop keyed `restart-<task>-<n>-stop`: its final checkpoint
+  is kept), the recovery records its end `restarted` `final`, and the
+  dispatcher then resumes the same native session on the same workspace,
+  once (`restart-<task>-<n>`), with a prompt naming the restart and its
+  reason. A worker that no longer ran is resumed at once. `GET
+  /api/session/<id>` names, on the execution the resume started, the one it
+  replaced (`restart_of`).
+- *Reassign.* In one transaction, as the re-issue: the old task's
+  `task.cancelled` names `by`, `reason` and `reassigned_as`; the new task's
+  `task.assigned` names `reassign_of` and copies its mission, brief, model,
+  objective, scenario and `created_by`, kind `ephemeral`, with a fresh
+  worker (`agent_worker_<label>_<new id>`). The old worker is stopped under
+  `reassign-<task>-stop` (not the routine retire), its end recorded
+  `reassigned` `final` with evidence `to_session`, never revived. The new
+  task is delivered once the old worker has ended, its branch starting from
+  the old worker's last checkpoint (not a set-aside), as an objective's
+  fork does; a mission without a source names that commit as the Start's
+  `from`. A Stop of the old worker that fails is pursued and escalated
+  (`dispatch::stops`, its line naming the reassign); once escalated, the
+  new task goes without waiting further, from the last recorded checkpoint.
+  `GET /api/session/<id>` links the two: `reassigned_to` on the old
+  session, `reassigned_from` on the new, each `{task, session_id}`.
+
 **Storage.** Missions, tasks and the resident roster are the `mission_*`
 tables, folded from the control stream (§10.1): a mission has its text,
 origin, sources, state and landing settings; a task has its mission, brief,
