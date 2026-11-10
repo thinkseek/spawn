@@ -95,6 +95,26 @@ export function sendAnswer(status: number | null, body: unknown): SendAnswer {
   return { ok: false, error: refusal(status, body), status };
 }
 
+/** The server's answer to a restart or a reassign (`POST
+ * /api/session/<id>/restart`, `/reassign`): the task and the worker's
+ * session that now carry the work, or why it was refused (409: the session
+ * holds no delivered task). */
+export type MoveAnswer =
+  | { ok: true; task: number; session_id: string }
+  | { ok: false; error: string; status: number | null };
+
+export function moveAnswer(status: number | null, body: unknown): MoveAnswer {
+  const answer = object(body);
+  if (
+    status === 202 &&
+    typeof answer.task === "number" &&
+    typeof answer.session_id === "string"
+  ) {
+    return { ok: true, task: answer.task, session_id: answer.session_id };
+  }
+  return { ok: false, error: refusal(status, body), status };
+}
+
 /** One message this page sent (or tried to). */
 export interface Sent {
   /** Its idempotency key: sending it again is the same command. */
