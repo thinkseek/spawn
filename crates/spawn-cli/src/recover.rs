@@ -144,6 +144,10 @@ pub(crate) enum Cause {
     ContextExhausted,
     ModelUnavailable,
     ModelAuth,
+    /// The model refused the request in a way no retry changes (a 400 of
+    /// another kind than an exhausted context, a 404, a 413): the engine
+    /// ended after it with no progress.
+    ModelError,
     HostRestart,
     DatabaseUnavailable,
     DiskFull,
@@ -160,6 +164,7 @@ impl Cause {
             Self::ContextExhausted => "context_exhausted",
             Self::ModelUnavailable => "model_unavailable",
             Self::ModelAuth => "model_auth",
+            Self::ModelError => "model_error",
             Self::HostRestart => "host_restart",
             Self::DatabaseUnavailable => "database_unavailable",
             Self::DiskFull => "disk_full",
@@ -177,7 +182,7 @@ impl Cause {
             | Self::ModelAuth
             | Self::DatabaseUnavailable
             | Self::DiskFull => Path::Wait,
-            Self::Stopped => Path::Final,
+            Self::ModelError | Self::Stopped => Path::Final,
         }
     }
 }
@@ -2145,6 +2150,7 @@ impl Cause {
             Self::ContextExhausted,
             Self::ModelUnavailable,
             Self::ModelAuth,
+            Self::ModelError,
             Self::HostRestart,
             Self::DatabaseUnavailable,
             Self::DiskFull,
