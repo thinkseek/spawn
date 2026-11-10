@@ -30,15 +30,22 @@ pub(crate) const CLOCK: &str = "select coalesce(max(id), 0), spawn_now_ms() from
 /// read command that types a message, with its agent, session, action,
 /// creation and `spawn_command_message`'s facts (`tracked`, `taken`,
 /// `not_taken`, `due_ms`, `typed`, `ended`, `state`). `$1` the bound in
-/// milliseconds (SPAWN_MESSAGE_TAKEN_SECS). This one reads the commands after
-/// `$2` and those of `$3` (the step's pending messages and open alerts): what
-/// the step reads when the log moved, a couple of index scans when nothing
-/// is new (objective 023).
+/// milliseconds (SPAWN_MESSAGE_TAKEN_SECS). This one reads what the step
+/// needs when the log moved, a scan or two when nothing is new (objective
+/// 023): the commands after `$2`; the pending messages `$3` that fell due;
+/// and the open alerts' `$4` whose session recorded a `message.taken` or an
+/// `execution.ended` at or after `$5` (what clears one).
 pub(crate) const MESSAGES_SINCE: &str = r"
 with candidates as (
   select k.* from spawn_commands k where k.id > $2
   union
-  select k.* from spawn_commands k where cardinality($3::bigint[]) > 0 and k.id = any($3))
+  select k.* from spawn_commands k where cardinality($3::bigint[]) > 0 and k.id = any($3)
+  union
+  select k.* from spawn_commands k
+   where cardinality($4::bigint[]) > 0 and k.id = any($4)
+     and k.session_id in (select e.session_id from spawn_events e
+                           where e.event_name in ('message.taken', 'execution.ended')
+                             and e.recorded_at_ms >= $5))
 select jsonb_build_object(
   'now_ms', spawn_now_ms(),
   'max_id', greatest($2, coalesce((select max(id) from candidates), $2)),
@@ -360,15 +367,21 @@ impl PostgresStore {
         self.query_json(MESSAGES_ALL, &[&bound_ms, &open])
     }
 
-    /// The messages of the commands after `after` and of `ids`
-    /// ([`MESSAGES_SINCE`]).
+    /// The messages of the commands after `after`, of the pending `due`
+    /// ones, and of the `open` alerts' whose session took a message or
+    /// ended an execution at or after `since_ms` ([`MESSAGES_SINCE`]).
     pub fn alert_messages_since(
         &self,
         bound_ms: i64,
         after: i64,
-        ids: &[i64],
+        due: &[i64],
+        open: &[i64],
+        since_ms: i64,
     ) -> Result<Value, StoreError> {
-        self.query_json_prepared(MESSAGES_SINCE, &[&bound_ms, &after, &ids])
+        self.query_json_prepared(
+            MESSAGES_SINCE,
+            &[&bound_ms, &after, &due, &open, &since_ms],
+        )
     }
 
     /// Commands that finished failed after `since_ms` ([`FAILED_COMMANDS`]).
