@@ -2941,8 +2941,9 @@ impl Bridge {
         }
     }
 
-    /// Text into the engine's input box, at most once: the text is staged
-    /// first (no key goes), the intent recorded before the keys go and the
+    /// Text into the engine's input box, at most once, ending with the
+    /// command's marker ([`crate::message`], recorded `message.typed`): the
+    /// text is staged first (no key goes), the intent recorded before the keys go and the
     /// completion after, so a retried command or a restarted Bridge can tell
     /// whether it was typed. A staging refused is [`Untyped::Refused`] with
     /// nothing recorded: nothing was typed, and that is what the log says.
@@ -2963,6 +2964,16 @@ impl Bridge {
         } else {
             format!("{}\n\n{text}", notices.join("\n\n"))
         };
+        // The message's id, at the end of the whole text: the transcript
+        // line that holds it is the message taken ([`crate::message`]). On
+        // the line of a one-line text that starts an engine (a start's or a
+        // resume's prompt) or goes into a pane that reads keys raw.
+        let one_line = !text.contains('\n')
+            && (!matches!(claimed.action(), Ok(CommandAction::Input { .. }))
+                || !self
+                    .terminals
+                    .reads_lines(&active.terminal(), &active.workspace));
+        let text = crate::message::marked(&text, claimed.command_id, one_line);
         let typed = {
             // A merge of main into the workspace waits while this types,
             // and once it gets the workspace it finds the `typed` step
@@ -2975,6 +2986,19 @@ impl Bridge {
             {
                 return Ok(Err(Untyped::Refused(error)));
             }
+            // The text about to be typed carries the marker: the record that
+            // tells this command's message from one an older Spawn typed
+            // without it, which no `message.taken` can ever name.
+            self.append(
+                &claimed.agent_id,
+                &claimed.session_id,
+                Some(&active.execution_id),
+                Source::Bridge,
+                Some(format!("{}:message", claimed.command_id)),
+                EventKind::MessageTyped {
+                    command_id: claimed.command_id,
+                },
+            )?;
             self.step(
                 claimed,
                 Some(&active.execution_id),

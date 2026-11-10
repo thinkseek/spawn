@@ -4,6 +4,7 @@
 
 import type { SessionState } from "./api";
 import type { Labels } from "./label.ts";
+import type { CommandMessage } from "./messages.ts";
 import { labels } from "./label.ts";
 import { readApi } from "./api";
 import type { GateRoom, Memory } from "./resources";
@@ -182,6 +183,9 @@ export interface CommandRecord {
   /** The Bridge holds it for the agent's turn (an input that waits); false
    * from an older server, which does not say. */
   waiting: boolean;
+  /** What became of the text it typed, by its id (messages.ts); null for a
+   * command that types nothing, and from an older server. */
+  message: CommandMessage | null;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -494,8 +498,21 @@ export function normalizeCommands(value: unknown): CommandRecord[] {
       created_at_ms: optionalNumber(raw.created_at_ms),
       finished_at_ms: optionalNumber(raw.finished_at_ms),
       waiting: raw.waiting === true,
+      message: normalizeMessage(raw.message),
     };
   });
+}
+
+function normalizeMessage(value: unknown): CommandMessage | null {
+  if (!isObject(value)) return null;
+  return {
+    state: text(value.state, "recorded"),
+    typed_at_ms: optionalNumber(value.typed_at_ms),
+    taken_at_ms: optionalNumber(value.taken_at_ms),
+    answered_at_ms: optionalNumber(value.answered_at_ms),
+    taken: optionalNumber(value.taken) ?? 0,
+    not_taken: value.not_taken === true,
+  };
 }
 
 const sessionPath = (id: string) => encodeURIComponent(id);

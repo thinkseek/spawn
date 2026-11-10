@@ -274,8 +274,25 @@ impl Rig {
             .collect()
     }
 
+    /// What was typed, each text without the marker it must end with
+    /// (`[spawn message #<command>]`, on a line of its own).
     fn typed(&self) -> Vec<String> {
-        self.host.typed.lock().expect("typed").clone()
+        self.host
+            .typed
+            .lock()
+            .expect("typed")
+            .iter()
+            .map(|text| {
+                let (body, marker) = text
+                    .rsplit_once("\n\n")
+                    .unwrap_or_else(|| panic!("{text:?} ends with no marker line"));
+                assert!(
+                    marker.starts_with("[spawn message #") && marker.ends_with(']'),
+                    "{text:?} ends with no marker"
+                );
+                body.to_string()
+            })
+            .collect()
     }
 
     fn press(&self, principal: &str, key: &str, named: NamedKey) {

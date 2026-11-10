@@ -160,5 +160,6 @@ Rolling back to `spawn.prev` is safe only until the deployed binary writes an
 event kind the previous one lacks (boundary 1 above): from then on the
 previous binary cannot decode the log. For example, a binary whose
 `EventKind` lacks `execution.end_stalled`, `notice.typed` or
-`notice.received` halts on the first one in the log (and one whose
+`notice.received` halts on the first one in the log, as one that lacks
+`message.typed` or `message.taken` (objective 045) does (and one whose
 `CommandAction` lacks `discard` fails that command); roll forward instead.
