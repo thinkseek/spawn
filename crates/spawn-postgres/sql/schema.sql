@@ -3651,7 +3651,7 @@ begin
         -- them is the only one that may write them.
         if v_cause is null or v_cause not in (
                'exited', 'crashed', 'memory_limit', 'context_exhausted',
-               'model_unavailable', 'model_auth', 'host_restart',
+               'model_unavailable', 'model_auth', 'model_error', 'host_restart',
                'database_unavailable', 'disk_full', 'budget', 'stopped') then
             raise exception 'not an interruption cause: %', v_cause
                 using errcode = '22023';
