@@ -1150,7 +1150,11 @@ A message's id is its command's id, carried end to end:
   pane that refused every paste). Which messages are tracked is read per
   command from the Bridge's own records, never by age or by when the schema
   was upgraded. A command whose text carried the marker has `message.typed`,
-  and its bound runs from its creation. A command an older Spawn typed has
+  and its bound runs from its creation. Nothing is tracked in a session whose
+  transcript has never held a marker (no `message.taken` in it at all): an
+  engine, or a stand-in, that does not keep the prompt it is given says
+  nothing by its silence; from its first taking on, every message of the
+  session is. A command an older Spawn typed has
   its `typing` step and no `message.typed`: no `message.taken` can ever name
   it, and it is never not taken, whenever it was typed — deploy.sh stops
   only the integrator before `init-db`, so the old loop types on, without
