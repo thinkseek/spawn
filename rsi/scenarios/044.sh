@@ -40,11 +40,14 @@
 # rule that compares the server's start with the record's time, with any
 # margin under that, reads the server that runs the resumed execution as
 # gone.
+# The loop has its own XDG_RUNTIME_DIR (0700, under the scenario's
+# directory), which the restart empties, as a reboot empties
+# /run/user/<uid>: what a host keeps there does not survive it.
 # SPAWN_RECOVER_BACKOFF_SECS=2. Checked:
 #   (1) the host restarts: the loop is stopped as systemd stops it (SIGTERM,
 #       its pass finished), the terminal server is killed with both engines
-#       in it, the hold is put on `second`'s terminal, and the loop starts 2 s
-#       later. `first`: an `execution.interrupted`, cause `host_restart`
+#       in it, the runtime directory is emptied, the hold is put on
+#       `second`'s terminal, and the loop starts 2 s later. `first`: an `execution.interrupted`, cause `host_restart`
 #       (evidence: terminal_server `gone`), path `resume`; its resume by key
 #       `recover-<execution>-<attempt>`; its engine works again in its own
 #       native session within 20 s of the loop's start, with every line it
@@ -78,7 +81,10 @@
 # that start), not from whether some server answers when the end is
 # processed, nor from the execution's record time: a comparison of the
 # server's start with the record, with or without a margin of 2 s, fails
-# (3) on every run.
+# (3) on every run. An identity kept only where a reboot empties it (the
+# runtime directory) is not there for `second` at (2): an execution with no
+# recorded identity is gone when the answering server started after its
+# record; one read as not gone fails (2).
 # Runs inside the gate's sandbox (scripts/rsi/gate.sh): needs SPAWN_BIN,
 # SPAWN_TEST_DATABASE_URL, tmux and jq; creates and drops its own database,
 # uses a private tmux socket, loopback only. Every wait is bounded in time.
@@ -374,6 +380,10 @@ BB_WORK=$WORK
 SPAWN_TMUX_PROGRAM=$WORK/tmux
 SPAWN_WORKER=worker-bb
 SPAWN_RECOVER_BACKOFF_SECS=2
+# The loop's own runtime directory, emptied at the restart as a reboot does.
+XDG_RUNTIME_DIR=$WORK/run
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export XDG_RUNTIME_DIR
 # No stall is under test.
 SPAWN_STALL_ACTIVITY_SECS=1800
 SPAWN_STALL_DELIVERY_SECS=1800
@@ -558,6 +568,8 @@ stop_loop
 printf 'spawn-%s\n' "$(get second exec)" >"$WORK/hold"
 : >"$WORK/slow-start"
 "$real_tmux" -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+find "$XDG_RUNTIME_DIR" -mindepth 1 -delete
+[ -z "$(ls -A "$XDG_RUNTIME_DIR")" ] || harness "the runtime directory is not empty after the restart"
 sleep 2
 server_answers && harness "the terminal server still answers after it was killed"
 for label in $labels; do put "$label" written "$(last_line "$(get "$label" agent)" | cut -d' ' -f2)"; done
