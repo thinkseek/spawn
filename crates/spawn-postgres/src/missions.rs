@@ -1792,6 +1792,28 @@ impl PostgresStore {
             .get(0))
     }
 
+    /// Restart `task`'s worker (`spawn task restart`, the owner and the
+    /// supervisor): `task.restarted` names the running execution, the
+    /// reason and `n`; the dispatcher stops and resumes it. Only a delivered
+    /// task; any other is refused, its state named. Returns `{task,
+    /// session_id, agent_id}`.
+    pub fn task_restart(&self, task: i64, reason: Option<&str>) -> Result<Value, StoreError> {
+        Ok(self
+            .query_one("select spawn_task_restart($1, $2)", &[&task, &reason])?
+            .get(0))
+    }
+
+    /// Reassign `task` to a fresh worker (`spawn task reassign`, the owner
+    /// and the supervisor): cancelled naming `reassigned_as`, assigned again
+    /// naming `reassign_of`, in one transaction. Only a delivered task; any
+    /// other is refused, its state named. Returns `{task, session_id,
+    /// agent_id}` of the new task.
+    pub fn task_reassign(&self, task: i64, reason: Option<&str>) -> Result<Value, StoreError> {
+        Ok(self
+            .query_one("select spawn_task_reassign($1, $2)", &[&task, &reason])?
+            .get(0))
+    }
+
     /// Propose a resident (or revise a pending proposal).
     pub fn resident_propose(&self, name: &str, charter: &str) -> Result<(), StoreError> {
         self.execute("select spawn_resident_propose($1, $2)", &[&name, &charter])?;
