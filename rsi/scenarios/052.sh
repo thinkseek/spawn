@@ -163,6 +163,10 @@ for n in 1 2 3 4; do
     printf '{"id": %d, "title": "Objective %d of 052", "prompt": "Make scenario 00%d pass."}\n' "$n" "$n" "$n" \
         >"$ctl/rsi/backlog/00$n.json"
 done
+# Scenario file names built here: a literal other-scenario name in this text
+# would tie the gate's base cache key to that scenario.
+SC2="$ctl/rsi/scenarios/00${two:=2}.sh"
+SC3="/elsewhere/00${three:=3}.sh"
 B=$(printf 'bb-052-base' | sha1sum | cut -c1-40)
 C1=$(printf 'bb-052-candidate-1' | sha1sum | cut -c1-40)
 cat >"$WORK/seed.sql" <<SQL
@@ -194,12 +198,12 @@ select pg_temp.rec(-7.5, '{"type":"task.gated","id":1,"verdict":"accepted","revi
 select pg_temp.rec(-7, '{"type":"task.landed","id":1,"from":"$B","to":"$C1","missions":[]}');
 select pg_temp.assigned(-6, 2, 2);
 select pg_temp.rec(-5, '{"type":"task.reported","id":2,"commit":"$C1"}');
-select pg_temp.rec(-4.5, '{"type":"objective.solved","id":1,"objective":2,"task":2,"scenario":"$ctl/rsi/scenarios/002.sh","base":"$B","log":"| 002.sh passes on the base"}');
+select pg_temp.rec(-4.5, '{"type":"objective.solved","id":1,"objective":2,"task":2,"scenario":"$SC2","base":"$B","log":"| the scenario passes on the base"}');
 select pg_temp.rec(-4.5, jsonb_build_object('type', 'task.cancelled', 'id', 2, 'by', 'spawn-integrate',
     'solved', (select max(id) from spawn_events where kind -> 'detail' -> 'record' ->> 'type' = 'objective.solved' and kind -> 'detail' -> 'record' ->> 'id' = '1'),
-    'reason', 'objective 2 is solved on the base: 002.sh passes at $B, so task #2 ends without a rejection'));
+    'reason', 'objective 2 is solved on the base: $SC2 passes at $B, so task #2 ends without a rejection'));
 -- Another mission's objective 3 solved on its base: not this mission's.
-select pg_temp.rec(-4, '{"type":"objective.solved","id":2,"objective":3,"task":99,"scenario":"/elsewhere/003.sh","base":"$B","log":""}');
+select pg_temp.rec(-4, '{"type":"objective.solved","id":2,"objective":3,"task":99,"scenario":"$SC3","base":"$B","log":""}');
 select pg_temp.assigned(-3, 3, 4);
 select pg_temp.rec(-2, '{"type":"task.reported","id":3,"commit":"$C1"}');
 commit;
