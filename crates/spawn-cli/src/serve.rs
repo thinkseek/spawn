@@ -1687,11 +1687,7 @@ fn fleet_session(rest: &str, query: &str) -> Result<Value, String> {
     match what {
         "judgements" => store.judgements_json(session.as_str(), limit).map_err(err),
         "commands" => store
-            .commands_json(
-                session.as_str(),
-                limit,
-                crate::config::message_taken_ms(),
-            )
+            .commands_json(session.as_str(), limit, crate::config::message_taken_ms())
             .map_err(err),
         other => Err(format!("{BAD_REQUEST}unknown fleet view {other}")),
     }
