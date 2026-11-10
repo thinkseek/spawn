@@ -2362,7 +2362,8 @@ mod tests {
     use super::{
         Cause, Config, Credentials, End, Executed, Execution, Facts, Outage, Path, Recorded,
         Recovery, Sent, Stop, ToolFailure, Turn, auth_retry_due, classify, counts_as_failure,
-        disk_cleared, key, model_due, pending, resume_due, resume_failed, retry_at, way,
+        disk_cleared, key, model_due, model_resumes, model_retries, pending, refused,
+        resume_due, resume_failed, retry_at, way,
     };
     use serde_json::json;
 
@@ -2997,6 +2998,153 @@ mod tests {
         assert_eq!(defaults.model_backoff, 60_000);
         assert_eq!(defaults.auth_retry, 1_800_000);
         assert_eq!(defaults.probe, 10_000);
+        assert_eq!(defaults.model_retries, 3);
+    }
+
+    /// Objective 39: SPAWN_RECOVER_MODEL_RETRIES is a whole number from 1
+    /// to 20, 3 when unset; anything else is refused, naming the setting.
+    #[test]
+    fn the_model_retries_setting_is_a_whole_number_from_1_to_20() {
+        assert_eq!(model_retries(None), Ok(3));
+        assert_eq!(model_retries(Some("1")), Ok(1));
+        assert_eq!(model_retries(Some("2")), Ok(2));
+        assert_eq!(model_retries(Some(" 20 ")), Ok(20));
+        for bad in ["0", "21", "-1", "two", "2.5", ""] {
+            let refused = model_retries(Some(bad)).expect_err(bad);
+            assert!(
+                refused.contains("SPAWN_RECOVER_MODEL_RETRIES"),
+                "{bad}: {refused}"
+            );
+        }
+    }
+
+    /// Objective 39: a request the model refuses for good (neither
+    /// transient, nor a login, nor an exhausted context) is a model error;
+    /// the engine's own end after it, with no progress since, is
+    /// `model_error` on the final path, below a person's Stop.
+    #[test]
+    fn an_end_after_a_refused_request_is_a_final_model_error() {
+        let invalid = turn(
+            Some(400),
+            Some("invalid_request"),
+            "API Error: 400 unexpected tool_use_id found in tool_result blocks",
+        );
+        assert!(invalid.model_error());
+        assert!(turn(Some(404), None, "API Error: 404 model not found").model_error());
+        assert!(turn(Some(413), None, "API Error: 413 request too large").model_error());
+        for transient in [
+            turn(Some(529), Some("overloaded"), "API Error: 529"),
+            turn(Some(500), None, "API Error: 500"),
+            turn(None, Some("rate_limit"), "API Error: rate limited"),
+            turn(Some(401), Some("authentication_failed"), "API Error: 401"),
+            turn(Some(400), None, "Prompt is too long"),
+        ] {
+            assert!(!transient.model_error(), "{transient:?}");
+        }
+        assert_eq!(Cause::ModelError.name(), "model_error");
+        assert_eq!(Cause::ModelError.path(), Path::Final);
+        assert_eq!(Cause::from_name("model_error"), Some(Cause::ModelError));
+
+        // The latest failed turn before the end, with no progress after it.
+        let turns = [invalid.clone()];
+        assert_eq!(refused(&turns, 0, 0, Some(90)), Some(&invalid));
+        assert_eq!(refused(&turns, 49, 0, Some(90)), Some(&invalid));
+        assert_eq!(refused(&turns, 60, 0, None), None, "progress after it");
+        assert_eq!(refused(&turns, 0, 50, None), None, "already recorded");
+        assert_eq!(refused(&turns, 0, 0, Some(40)), None, "after the end");
+        let later = Turn {
+            event_id: 70,
+            ..turn(Some(529), Some("overloaded"), "API Error: 529")
+        };
+        assert_eq!(
+            refused(&[invalid.clone(), later], 0, 0, None),
+            None,
+            "a transient failure after it is the latest"
+        );
+
+        let nonzero = end("exited", Some(1), None);
+        let after_refusal = Facts {
+            model_error: Some(&invalid),
+            ..facts(Some(&nonzero))
+        };
+        assert_eq!(classify(&after_refusal), Cause::ModelError);
+        let clean = end("exited", Some(0), None);
+        assert_eq!(
+            classify(&Facts {
+                model_error: Some(&invalid),
+                ..facts(Some(&clean))
+            }),
+            Cause::ModelError
+        );
+        let stopped = stop("bb-stop-1", 7);
+        assert_eq!(
+            classify(&Facts {
+                stop: Some(&stopped),
+                ..after_refusal
+            }),
+            Cause::Stopped,
+            "a person's Stop outranks every model cause"
+        );
+        assert_eq!(classify(&facts(Some(&nonzero))), Cause::Crashed);
+        let (path, _) = way(Cause::ModelError, true, 0);
+        assert_eq!(path, Path::Final);
+    }
+
+    fn executed(id: &str, key: &str, progress: bool, last_cause: Option<&str>) -> Executed {
+        Executed {
+            id: id.to_string(),
+            started_at_ms: 0,
+            ended_at_ms: Some(5_000),
+            duration_ms: Some(5_000),
+            progress,
+            key: key.to_string(),
+            last_cause: last_cause.map(str::to_string),
+        }
+    }
+
+    /// Objective 39: the resumes in a row of an execution that ended on a
+    /// transient model error are counted back from the current execution
+    /// across the session's executions; a revived execution that made
+    /// progress, or one a person started, ends the run.
+    #[test]
+    fn model_resumes_count_the_run_of_revivals_after_transient_ends() {
+        let unavailable = Some("model_unavailable");
+        let chain = [
+            executed("exec_1", "dispatch-task-7", false, unavailable),
+            executed("exec_2", "recover-exec_1-1", false, unavailable),
+            executed("exec_3", "recover-exec_2-1", false, unavailable),
+        ];
+        assert_eq!(model_resumes(&chain, "exec_1"), 0);
+        assert_eq!(model_resumes(&chain, "exec_2"), 1);
+        assert_eq!(model_resumes(&chain, "exec_3"), 2);
+        assert_eq!(model_resumes(&chain, "exec_9"), 0, "an unknown execution");
+        // A retry of a failed revival is a revival too.
+        let retried = [
+            executed("exec_1", "dispatch-task-7", false, unavailable),
+            executed("exec_2", "recover-exec_1-1-r1", false, unavailable),
+        ];
+        assert_eq!(model_resumes(&retried, "exec_2"), 1);
+        // A revived execution that made progress resets the count.
+        let answered = [
+            executed("exec_1", "dispatch-task-7", false, unavailable),
+            executed("exec_2", "recover-exec_1-1", true, unavailable),
+            executed("exec_3", "recover-exec_2-1", false, unavailable),
+        ];
+        assert_eq!(model_resumes(&answered, "exec_3"), 1);
+        assert_eq!(model_resumes(&answered, "exec_2"), 0);
+        // A resume by a person starts a new run.
+        let by_person = [
+            executed("exec_1", "recover-exec_0-1", false, unavailable),
+            executed("exec_2", "bb-resume-1", false, unavailable),
+            executed("exec_3", "recover-exec_2-1", false, unavailable),
+        ];
+        assert_eq!(model_resumes(&by_person, "exec_3"), 1);
+        // A crash's resume is no model retry.
+        let crashed = [
+            executed("exec_1", "dispatch-task-7", false, Some("crashed")),
+            executed("exec_2", "recover-exec_1-1", false, unavailable),
+        ];
+        assert_eq!(model_resumes(&crashed, "exec_2"), 0);
     }
 
     #[test]
@@ -3008,6 +3156,7 @@ mod tests {
             duration_ms: Some(3_000),
             progress: false,
             key: "recover-exec_1-1".to_string(),
+            last_cause: None,
         };
         assert!(resume_failed(
             young.ended_at_ms.map(|ended| ended - young.started_at_ms),
