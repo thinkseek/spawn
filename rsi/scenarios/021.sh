@@ -2,9 +2,11 @@
 # Black box: an owner's push to a mission source is one command, recorded
 # as an event and applied by the integrator between its own steps, for that
 # source only. The integrator is never stopped: gates of other missions and
-# other sources keep running, nothing halts, and a gate running on the same
-# source finishes and is judged `stale` by the existing rule (judged again
-# on the new main), never thrown away silently.
+# other sources keep running, and nothing halts. A gate running on the same
+# source is never moved under (design-owner-push-between-gates.md, D1): the
+# push waits for it, said once, its verdict is on the main it judged (never
+# `stale` because of the owner), and the push lands after it, on its
+# landing.
 #
 # A real loop (`spawn loop`: the Bridge, its pusher, the dispatcher, no
 # model judge, no supervisor) runs two residents on a fake engine: `alpha`
@@ -29,14 +31,19 @@
 #       two more passes too). Alpha's gate process is still alive, alpha has
 #       no gate record yet, the integrator is the same process. Released,
 #       alpha's gate ends `accepted`, once, and alpha lands on SA.
-#   (2) the same source: beta's second task (beta2.txt) is judged on SB, its
-#       gate held; the owner pushes a second commit to SB. Within 30 s, while
-#       that gate runs, SB's main is the owner's second commit (a
-#       `source.moved` naming the request), B not halted. Released, the gate
-#       finishes: its verdict is `accepted`, then the landing finds main
-#       moved and records `stale` (the existing rule), and beta2 is judged
-#       again, against the owner's second commit, accepted and landed on top
-#       of it. B is never halted; the integrator is the same process.
+#   (2) the same source (D1): beta's second task (beta2.txt) is judged on
+#       SB, its gate held; the owner pushes a second commit to SB. The
+#       integrator says the request waits for the judging in flight on its
+#       source, once; then SB's main is still the main beta2's gate judged,
+#       no `source.moved` names the request, B not halted. Released, the
+#       gate's verdict is `accepted`, once (never `stale`: main did not move
+#       under it), and beta2 lands on the main it was judged against; then,
+#       within 30 s, the owner's request is applied on beta2's landing: a
+#       `source.moved` naming it, `from` beta2's landing, SB's main the
+#       owner's landing merge (first parent beta2's landing, second the
+#       owner's commit), holding beta2.txt, and B's baseline that main. One
+#       gate of beta2 ran. B is never halted; the integrator is the same
+#       process.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -51,6 +58,11 @@
 # integrator applies it at its next step for that source, moving main and
 # the baselines with one `source.moved`, without halting and without
 # touching any running gate.
+#
+# Fails with 1 at (2) on 763deaa5 (batch 15, before D1): the integrator
+# applies the request while beta2's gate runs on SB ("SB's main is the
+# owner's second commit while beta2's gate ran"), and beta2's verdict comes
+# back `stale`.
 # Runs inside the gate's sandbox (scripts/rsi/gate.sh): needs SPAWN_BIN and
 # SPAWN_TEST_DATABASE_URL, creates and drops its own database, uses a
 # private tmux socket, no network. Every wait is bounded in time.
@@ -90,9 +102,20 @@ database_made=""
 loop_pid=""
 integrate_pid=""
 cleanup() {
-    # Released, so a held gate ends on its own.
+    # Released, so a held gate ends on its own, and stopped by the pid it
+    # wrote: $WORK goes below before its next poll could see the release,
+    # and killing the integrator leaves its gate (a failed run left one
+    # polling its removed release file for 600 s). Only a gate still held
+    # has a pid file: it removes it once released.
     : >"$WORK/release-alpha" 2>/dev/null || true
     : >"$WORK/release-beta2" 2>/dev/null || true
+    for held in "$WORK"/gate-alpha.pid "$WORK"/gate-beta2.pid; do
+        [ -s "$held" ] || continue
+        held_pid=$(cat "$held")
+        # Only this run's fake gate, never a pid since reused.
+        tr '\0' ' ' <"/proc/$held_pid/cmdline" 2>/dev/null | grep -qF "$WORK/fake-gate.sh" &&
+            kill "$held_pid" 2>/dev/null || true
+    done
     for pid in "$integrate_pid" "$loop_pid"; do
         if [ -n "$pid" ]; then
             kill "$pid" 2>/dev/null || true
@@ -218,6 +241,9 @@ if [ "\$name" != other ]; then
         sleep 0.5
         waited=\$((waited + 1))
     done
+    # Released: no longer held, so the cleanup has no pid of it to kill (a
+    # pid kept past its gate could be any process by then).
+    rm -f '$WORK/gate-'\$name.pid
 fi
 echo "| build: ok"
 printf '%s end %s %s %s\n' "\$(date +%s)" "\$name" "\$2" "\$3" >>'$WORK/judged.log'
@@ -479,35 +505,68 @@ assert_eq "$(gate_records "$t_alpha")" accepted "(1) alpha's gate records"
 assert_eq "$(grep -c " start alpha " "$WORK/judged.log" || true)" 1 "(1) alpha's gate runs"
 no_halt "(1) after alpha landed"
 
-# --- (2) an owner push to SB while beta's gate runs on SB --------------------------------
+# --- (2) an owner push to SB while beta's gate runs on SB (D1) --------------------------
 
 t_beta2=$(assign "$mission_b" beta beta2.txt)
 wait_gate beta2 "(2)"
 first_base=$(grep " start beta2 " "$WORK/judged.log" | head -n 1 | cut -d' ' -f4)
 owner_push "the supply contract, amended" "(2)"
-deadline=$(($(now) + 30))
-until [ "$(applied "$request")" -gt 0 ]; do
-    if [ "$(now)" -ge "$deadline" ]; then
-        fail "(2) the owner's push (request $request) was not applied within 30 s while beta2's gate ran on SB: SB's main is $(main_of "$sb") (integrate: $(log_tail))"
+# A pass sees the request and leaves it waiting: its line, once (300 s: a
+# guard against a hang only).
+waits="(request $request) waits for the judging in flight on its source"
+deadline=$(($(now) + 300))
+until grep -qF "$waits" "$WORK/integrate.log"; do
+    if [ "$(applied "$request")" -gt 0 ]; then
+        fail "(2) the owner's push (request $request) was applied while beta2's gate ran on SB: SB's main is $(main_of "$sb"), the main beta2's gate judged $first_base"
     fi
+    [ "$(now)" -lt "$deadline" ] ||
+        harness "(2) no pass said the owner's push (request $request) waits within 300 s (integrate: $(log_tail))"
+    integrator_alive || fail "(2) the integrator exited: $(log_tail)"
     no_halt "(2) while the owner's push waited"
     sleep 0.5
 done
-assert_eq "$(main_of "$sb")" "$commit" "(2) SB's main after the owner's second landing"
+assert_eq "$(applied "$request")" 0 "(2) a source.moved for the owner's push while beta2's gate runs"
+assert_eq "$(main_of "$sb")" "$first_base" "(2) SB's main while beta2's gate runs (the main it judged)"
 assert_eq "$(gate_records "$t_beta2")" "" "(2) beta2's gate records while its gate runs"
+no_halt "(2) while beta2's gate runs"
 integrator_alive || fail "(2) the integrator is not running after the owner's push: $(log_tail)"
 : >"$WORK/release-beta2"
 wait_state "$t_beta2" landed 120 "(2)"
-assert_eq "$(gate_records "$t_beta2")" "accepted stale accepted" \
-    "(2) beta2's gate records (the held gate's verdict, the stale landing, the gate again on the new main)"
-second_base=$(grep " start beta2 " "$WORK/judged.log" | sed -n 2p | cut -d' ' -f4)
-assert_eq "$first_base" "$(field "$moved" to)" "(2) the base of beta2's first gate"
-assert_eq "$second_base" "$commit" "(2) the base of beta2's second gate (the owner's second commit)"
-git --git-dir="$sb" merge-base --is-ancestor "$commit" main ||
-    fail "(2) SB's main after beta2 landed does not hold the owner's second commit"
+assert_eq "$(gate_records "$t_beta2")" accepted \
+    "(2) beta2's gate records (its own verdict, on the main it judged: never stale)"
+assert_eq "$(grep -c " start beta2 " "$WORK/judged.log" || true)" 1 "(2) beta2's gate runs"
+landing=$(q "select kind -> 'detail' -> 'record' ->> 'to' from spawn_events
+              where session_id = 'session_control'
+                and kind -> 'detail' -> 'record' ->> 'type' = 'task.landed'
+                and kind -> 'detail' -> 'record' ->> 'id' = '$t_beta2'")
+[ -n "$landing" ] || fail "(2) beta2 is landed but no task.landed names it"
+assert_eq "$(q "select kind -> 'detail' -> 'record' ->> 'from' from spawn_events
+               where session_id = 'session_control'
+                 and kind -> 'detail' -> 'record' ->> 'type' = 'task.landed'
+                 and kind -> 'detail' -> 'record' ->> 'id' = '$t_beta2'")" \
+    "$first_base" "(2) beta2 landed on the main its gate judged"
+deadline=$(($(now) + 30))
+until [ "$(applied "$request")" -gt 0 ]; do
+    if [ "$(now)" -ge "$deadline" ]; then
+        fail "(2) the owner's push (request $request) was not applied within 30 s of beta2's landing: SB's main is $(main_of "$sb") (integrate: $(log_tail))"
+    fi
+    no_halt "(2) while the owner's push waited for its pass"
+    sleep 0.5
+done
+moved2=$(applied "$request")
+assert_eq "$(field "$moved2" from)" "$landing" "(2) the source.moved record's from (beta2's landing)"
+assert_eq "$(field "$moved2" to)" "$(main_of "$sb")" "(2) the source.moved record's to (SB's main)"
+assert_eq "$(git --git-dir="$sb" rev-parse main^1)" "$landing" \
+    "(2) the first parent of SB's main (beta2's landing)"
+assert_eq "$(git --git-dir="$sb" rev-parse main^2)" "$commit" \
+    "(2) the second parent of SB's main (the owner's second commit)"
 git --git-dir="$sb" cat-file -e main:beta2.txt || fail "(2) SB's main does not hold beta2.txt"
-no_halt "(2) after beta2 landed"
+assert_eq "$(baseline "$mission_b")" "$(main_of "$sb")" "(2) mission B's baseline after the owner's landing"
+assert_eq "$(grep -cF "$waits" "$WORK/integrate.log" || true)" 1 "(2) the owner's push said to wait"
+# Two more passes (the integrator sleeps 5 s between them) see the new main.
+sleep 12
+no_halt "(2) after the owner's landing"
 integrator_alive || fail "(2) the integrator is not running at the end: $(log_tail)"
 
-echo "021: the owner's pushes were recorded and applied by the running integrator: another source's gate survived, the same source's gate finished and was judged again, nothing halted"
+echo "021: the owner's pushes were recorded and applied by the running integrator: another source's gate survived, the same source's push waited for its gate and landed after it, nothing halted"
 exit 0
