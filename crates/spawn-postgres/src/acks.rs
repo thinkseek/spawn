@@ -12,7 +12,6 @@
 //! [`PostgresStore::report_answers`] reads the reports whose delivery has
 //! no answer yet.
 
-use serde_json::Value;
 use spawn_core::event::{EventKind, NewEvent, Source};
 use spawn_core::id::{AgentId, CommandId, SessionId};
 use spawn_core::port::{EventLog, StoreError};
@@ -170,7 +169,7 @@ impl PostgresStore {
         outcome: &str,
         why: Option<&str>,
     ) -> Result<AckRecord, StoreError> {
-        let invalid = |error: spawn_core::id::IdError| StoreError::Corrupt(error.to_string());
+        let invalid = |error: spawn_core::id::InvalidLabel| StoreError::Corrupt(error.to_string());
         let appended = self.append(NewEvent {
             agent_id: AgentId::new(agent).map_err(invalid)?,
             session_id: SessionId::new(session).map_err(invalid)?,
@@ -191,9 +190,4 @@ impl PostgresStore {
             AckRecord::Answered
         })
     }
-}
-
-/// The detail of a recorded answer, as `message.acted` holds it.
-pub fn acted_detail(outcome: &str, why: Option<&str>) -> Value {
-    serde_json::json!({"outcome": outcome, "why": why})
 }

@@ -79,6 +79,7 @@ macro_rules! lost_before_ready {
     };
 }
 
+mod acks;
 mod alerts;
 mod command_queue;
 mod cost;
@@ -93,6 +94,7 @@ mod scorecard;
 mod sessions;
 mod wake;
 
+pub use acks::{AckRecord, ReportAnswer};
 pub use gateway::{HumanInput, HumanKey, HumanTask, HumanWrite};
 pub use missions::{ActivityEvent, LandingHold, PushRequest};
 pub use sessions::{
