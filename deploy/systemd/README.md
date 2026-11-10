@@ -283,7 +283,9 @@ on the candidate it is skipped as a regression, and an objective-29 task is
 never rejected or aborted for it: the integrator records a `host_fault`
 with the evidence `cannot_judge`, retried after the backoff and counted
 toward no halt. The owner judges that objective outside the gate (mission
-7).
+7), and marks its scenario `# rsi: task-only`, so the gate runs it only as
+its own task's scenario, never on the base for another gate nor as a
+regression (scripts/rsi/gate.sh).
 
 | Objective | Scenario | Why the gate cannot judge it |
 | --- | --- | --- |
