@@ -179,11 +179,7 @@ impl TranscriptArchive for LocalTranscriptArchive {
         let directory = path.parent().unwrap_or(&self.progress).to_path_buf();
         std::fs::create_dir_all(&directory)
             .map_err(|error| failed("create", &directory, &error))?;
-        let temporary = directory.join(format!(
-            ".{}.{}.tmp",
-            progress.native,
-            std::process::id()
-        ));
+        let temporary = directory.join(format!(".{}.{}.tmp", progress.native, std::process::id()));
         let written = File::create(&temporary).and_then(|mut file| {
             file.write_all(progress.to_json().as_bytes())?;
             file.write_all(b"\n")?;
@@ -298,10 +294,15 @@ mod tests {
         archive.put_progress(&record, true).expect("put again");
         assert_eq!(archive.progress().expect("read"), vec![record.clone()]);
         assert!(
-            base.join(".transcripts-progress/agent_local/0b7c1d2e-0000-4000-8000-000000000001.json")
-                .is_file()
+            base.join(
+                ".transcripts-progress/agent_local/0b7c1d2e-0000-4000-8000-000000000001.json"
+            )
+            .is_file()
         );
-        assert!(!base.join(".transcripts").exists(), "the archive holds no record");
+        assert!(
+            !base.join(".transcripts").exists(),
+            "the archive holds no record"
+        );
         // Something that is not a record is left out.
         std::fs::write(base.join(".transcripts-progress/agent_local/x.json"), b"{").expect("write");
         assert_eq!(archive.progress().expect("read"), vec![record]);

@@ -175,7 +175,10 @@ pub(crate) fn measure(
     let mut history = History::from_record(&facts, &messages);
     history.clip(previous_since, window.until);
     let mut card = card(&history, window, mission)?;
-    settle(&mut card, spawn_core::transcripts::settling(&progress, window.until));
+    settle(
+        &mut card,
+        spawn_core::transcripts::settling(&progress, window.until),
+    );
     Ok(card)
 }
 

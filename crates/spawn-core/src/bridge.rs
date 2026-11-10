@@ -3261,7 +3261,11 @@ impl Bridge {
                 &native,
                 &active.workspace,
                 &path,
-                (&mut state.archived, &mut state.behind_ms, &mut state.known_ms),
+                (
+                    &mut state.archived,
+                    &mut state.behind_ms,
+                    &mut state.known_ms,
+                ),
             );
             state.due = error.is_some();
             if let Some(error) = &error
@@ -3300,9 +3304,9 @@ impl Bridge {
         }
         match archive.put_progress(&progress, !live) {
             Ok(()) => state.written = Some(progress.clone()),
-            Err(error) => report
-                .warnings
-                .push(format!("{session}: record the transcript archive's progress: {error}")),
+            Err(error) => report.warnings.push(format!(
+                "{session}: record the transcript archive's progress: {error}"
+            )),
         }
         if !live && progress.behind_ms.is_some() {
             self.ended_archives
@@ -5201,8 +5205,12 @@ mod tests {
         /// What the archive holds of the session's transcript.
         fn archived(&self) -> String {
             let native = self.progress().native;
-            let copies = crate::port::TranscriptArchive::copies(self.store.as_ref(), &Self::agent(), &native)
-                .expect("copies");
+            let copies = crate::port::TranscriptArchive::copies(
+                self.store.as_ref(),
+                &Self::agent(),
+                &native,
+            )
+            .expect("copies");
             copies
                 .iter()
                 .enumerate()
@@ -5233,7 +5241,10 @@ mod tests {
         let first = call_line("c1", 18);
         world.engine_writes(&first);
         world.tick();
-        assert!(world.archived().contains(&first), "the call is archived mid-turn");
+        assert!(
+            world.archived().contains(&first),
+            "the call is archived mid-turn"
+        );
         let progress = world.progress();
         assert!(progress.live);
         assert_eq!(progress.behind_ms, None);
@@ -5278,13 +5289,22 @@ mod tests {
             "{warnings:?}"
         );
         assert!(
-            !world.tick().iter().any(|warning| warning.contains("archive the transcript")),
+            !world
+                .tick()
+                .iter()
+                .any(|warning| warning.contains("archive the transcript")),
             "the same failure is warned once"
         );
         let progress = world.progress();
         assert_eq!(progress.behind_ms, Some(19_000));
-        assert!(world.settling(19_500), "a call before the end is not archived");
-        assert!(!world.settling(18_500), "a call after the end holds nothing open");
+        assert!(
+            world.settling(19_500),
+            "a call before the end is not archived"
+        );
+        assert!(
+            !world.settling(18_500),
+            "a call after the end holds nothing open"
+        );
         // The execution ends, its transcript still not archived.
         world.store.untrack(
             &TerminalName::for_execution(&ExecutionId::for_command(CommandId(1))),
@@ -5306,7 +5326,10 @@ mod tests {
         world.tick();
         assert!(world.archived().contains("msg_c1"));
         assert!(!world.settling(19_500), "{:?}", world.progress());
-        assert!(!world.settling(i64::MAX), "an ended execution, all archived");
+        assert!(
+            !world.settling(i64::MAX),
+            "an ended execution, all archived"
+        );
         assert!(world.bridge.ended_archives.lock().expect("lock").is_empty());
     }
 
