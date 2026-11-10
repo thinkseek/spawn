@@ -1233,6 +1233,10 @@ fn env_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
+/// The version of the facts gate.sh writes (`"v":1`, first in each), the one
+/// [`decide`] reads; a fact with none is read as this one.
+pub(crate) const FACT_VERSION: u64 = 1;
+
 /// The verdict of a finished gate run: the verdict file's, only after a
 /// clean exit.
 ///
@@ -1259,6 +1263,21 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
         reason,
         log: record(&run.stdout),
     };
+    // The fact's version (gate.sh writes `"v":1` first): a gate may be read
+    // by a newer integrator than the one that started it, never by one that
+    // does not know what it wrote. No version is the gate before versions,
+    // read as v1.
+    if let Some(version) = verdict
+        .map(str::trim)
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .and_then(|value| value.get("v").cloned())
+        && version != serde_json::json!(FACT_VERSION)
+    {
+        return Err(aborted(format!(
+            "the gate wrote a fact of version {version}; this integrator reads version \
+             {FACT_VERSION} (and facts with none)"
+        )));
+    }
     if run.status.code() == Some(NO_ROOM_EXIT)
         && let Some(short) = verdict.and_then(no_room)
     {
@@ -3228,6 +3247,36 @@ mod tests {
     /// gate.sh `cannot_judge`): the same exit 6, the other key.
     const CANNOT_JUDGE_FACT: &str =
         "{\"cannot_judge\":true,\"scenario\":\"029.sh\",\"runs\":\"6\"}";
+
+    /// A fact's version: v1 and none are read alike, whatever the fact;
+    /// another version is an abort that names it, never a verdict.
+    #[test]
+    fn a_fact_of_version_1_or_none_is_read_and_another_is_an_abort() {
+        for verdict in [
+            "{\"verdict\":\"accepted\"}",
+            "{\"v\":1,\"verdict\":\"accepted\"}",
+        ] {
+            let gate = FakeGate::new(&format!(
+                "echo '{verdict}' >\"$SPAWN_GATE_VERDICT\"\necho '{verdict}'\n"
+            ));
+            let verdict = gate.judge(&path_only()).expect("a verdict");
+            assert!(verdict.accepted);
+        }
+        let versioned = CANNOT_JUDGE_FACT.replacen('{', "{\"v\":1,", 1);
+        let gate = FakeGate::new(&format!(
+            "echo '{versioned}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
+        ));
+        assert!(matches!(
+            gate.judge(&path_only()),
+            Err(GateFailure::CannotJudge { .. })
+        ));
+        let gate =
+            FakeGate::new("echo '{\"v\":2,\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n");
+        let Err(GateFailure::Aborted { reason, .. }) = gate.judge(&path_only()) else {
+            panic!("version 2 is no verdict");
+        };
+        assert!(reason.contains("version 2"), "{reason}");
+    }
 
     #[test]
     fn exit_6_with_the_cannot_judge_fact_is_no_verdict() {
