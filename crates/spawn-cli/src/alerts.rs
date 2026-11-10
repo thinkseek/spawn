@@ -3208,6 +3208,55 @@ connections\n";
     }
 
     #[test]
+    fn a_missions_daily_budget_alerts_once_a_day_and_clears_with_the_day_or_the_budget() {
+        let mut monitor = monitor();
+        // 2026-11-10 12:00 UTC.
+        let noon = 1_794_312_000_000_i64;
+        let reading = |spent: f64, budget: f64| {
+            json!([{"mission": 4, "budget_usd": budget, "spent_usd": spent},
+                   {"mission": 5, "budget_usd": 1.0, "spent_usd": 0.06}])
+        };
+        let mut read = |monitor: &mut Monitor, now: i64, value: Value| {
+            let mut out = Vec::new();
+            monitor.budgets(now, &value, &mut out);
+            let out = decided(monitor, out);
+            commit(monitor, &out);
+            out
+        };
+        assert!(read(&mut monitor, noon, reading(0.4855, 0.5)).is_empty(), "under: none");
+        let fired = read(&mut monitor, noon + 2000, reading(0.9355, 0.5));
+        assert_eq!(fires(&fired), ["cost_budget:4:2026-11-10"]);
+        let Event::Fire {
+            subject, text, evidence, ..
+        } = &fired[0]
+        else {
+            panic!("a fire");
+        };
+        assert_eq!(subject, "mission #4");
+        assert_eq!(text, "mission #4 spent $0.94 today (UTC), over its $0.50 daily budget");
+        assert_eq!(evidence["day"], "2026-11-10");
+        // More spending the same day: nothing more.
+        assert!(read(&mut monitor, noon + 4000, reading(1.2355, 0.5)).is_empty());
+        // The budget raised above the spend clears it, and the day's key is
+        // spent: going over again that day fires nothing.
+        let raised = read(&mut monitor, noon + 6000, reading(1.2355, 2.0));
+        assert!(matches!(&raised[..], [Event::Clear { key, .. }] if key == "cost_budget:4:2026-11-10"));
+        assert!(read(&mut monitor, noon + 8000, reading(2.5, 2.0)).is_empty());
+        // The next UTC day is a new occurrence.
+        let tomorrow = noon + DAY_MS;
+        let next = read(&mut monitor, tomorrow, reading(0.6, 0.5));
+        assert_eq!(fires(&next), ["cost_budget:4:2026-11-11"]);
+        // Its day over: cleared at the next day's first reading.
+        let after = read(&mut monitor, tomorrow + DAY_MS, reading(0.1, 0.5));
+        assert!(matches!(&after[..], [Event::Clear { key, .. }] if key == "cost_budget:4:2026-11-11"));
+        // A budget removed clears its open alert.
+        let third = tomorrow + DAY_MS + 1000;
+        assert_eq!(fires(&read(&mut monitor, third, reading(0.7, 0.5))), ["cost_budget:4:2026-11-12"]);
+        let removed = read(&mut monitor, third + 1000, json!([]));
+        assert!(matches!(&removed[..], [Event::Clear { key, .. }] if key == "cost_budget:4:2026-11-12"));
+    }
+
+    #[test]
     fn a_budget_over_alert_fires_once_and_clears_under_it() {
         let mut monitor = monitor();
         let over = feed(
