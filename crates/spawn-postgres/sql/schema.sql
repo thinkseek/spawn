@@ -4243,7 +4243,8 @@ language sql stable as $$
        and e.kind -> 'detail' -> 'record' ->> 'type' = 'host.messages_marked'
 $$;
 
--- The message of command `p` (null for one that types nothing: a key, a
+-- The message of command `p_id` (its session, action, state, creation and
+-- finish; null for one that types nothing: a key, a
 -- stop, a discard, a start or resume with no prompt), at `p_now`, its bound
 -- `p_bound_ms` (SPAWN_MESSAGE_TAKEN_SECS) and the first marking loop's start
 -- `p_marked_from`:
@@ -4263,11 +4264,13 @@ $$;
 --   with it (what the alert clears on): the execution it was typed into, or
 --   its own start's, ended; or, never typed or started, it finished while no
 --   execution that is still live ran, or it is an input waiting with none.
-create or replace function spawn_command_message(p spawn_commands, p_bound_ms bigint,
+create or replace function spawn_command_message(p_id bigint, p_session text, p_action jsonb,
+                                                 p_state text, p_created bigint,
+                                                 p_finished bigint, p_bound_ms bigint,
                                                  p_marked_from bigint, p_now bigint)
 returns jsonb language plpgsql stable as $$
 declare
-    v_type text := p.action ->> 'type';
+    v_type text := p_action ->> 'type';
     v_typed_at bigint;
     v_typing_exec text;
     v_marked boolean;
@@ -4283,39 +4286,39 @@ declare
     v_live_since bigint;
 begin
     if not (v_type = 'input'
-            or (v_type in ('start', 'resume') and coalesce(p.action ->> 'prompt', '') <> '')) then
+            or (v_type in ('start', 'resume') and coalesce(p_action ->> 'prompt', '') <> '')) then
         return null;
     end if;
     select min(e.recorded_at_ms) into v_typed_at from spawn_events e
-     where e.session_id = p.session_id and e.source = 'bridge'
-       and e.source_event_id = 'cmd_' || p.id || ':typed';
+     where e.session_id = p_session and e.source = 'bridge'
+       and e.source_event_id = 'cmd_' || p_id || ':typed';
     select e.execution_id into v_typing_exec from spawn_events e
-     where e.session_id = p.session_id and e.source = 'bridge'
-       and e.source_event_id in ('cmd_' || p.id || ':typing', 'cmd_' || p.id || ':message')
+     where e.session_id = p_session and e.source = 'bridge'
+       and e.source_event_id in ('cmd_' || p_id || ':typing', 'cmd_' || p_id || ':message')
      order by e.id limit 1;
     v_marked := exists (select 1 from spawn_events e
-                         where e.session_id = p.session_id and e.source = 'bridge'
-                           and e.source_event_id = 'cmd_' || p.id || ':message');
+                         where e.session_id = p_session and e.source = 'bridge'
+                           and e.source_event_id = 'cmd_' || p_id || ':message');
     select count(*), min(e.id) into v_taken, v_taken_id from spawn_events e
-     where e.session_id = p.session_id and e.event_name = 'message.taken'
-       and (e.kind -> 'detail' ->> 'command_id')::bigint = p.id;
+     where e.session_id = p_session and e.event_name = 'message.taken'
+       and (e.kind -> 'detail' ->> 'command_id')::bigint = p_id;
     if v_taken_id is not null then
         select e.recorded_at_ms into v_taken_at from spawn_events e where e.id = v_taken_id;
         select e.recorded_at_ms into v_answered_at from spawn_events e
-         where e.session_id = p.session_id and e.event_name in ('turn.stopped', 'turn.failed')
+         where e.session_id = p_session and e.event_name in ('turn.stopped', 'turn.failed')
            and e.id > v_taken_id
          order by e.id limit 1;
     end if;
     if v_marked then
         v_tracked := true;
-        v_from := p.created_at_ms;
+        v_from := p_created;
     elsif v_typing_exec is null and p_marked_from is not null
           and not exists (select 1 from spawn_events e
-                           where e.session_id = p.session_id and e.source = 'bridge'
-                             and e.source_event_id = 'cmd_' || p.id || ':typing')
-          and (p.finished_at_ms is null or p.finished_at_ms >= p_marked_from) then
+                           where e.session_id = p_session and e.source = 'bridge'
+                             and e.source_event_id = 'cmd_' || p_id || ':typing')
+          and (p_finished is null or p_finished >= p_marked_from) then
         v_tracked := true;
-        v_from := greatest(p.created_at_ms, p_marked_from);
+        v_from := greatest(p_created, p_marked_from);
     else
         v_tracked := false;
     end if;
@@ -4323,26 +4326,26 @@ begin
     -- own start's, ended.
     if v_type in ('start', 'resume') then
         select e.execution_id into v_own_exec from spawn_events e
-         where e.session_id = p.session_id and e.event_name = 'execution.started'
-           and (e.kind -> 'detail' ->> 'command_id')::bigint = p.id
+         where e.session_id = p_session and e.event_name = 'execution.started'
+           and (e.kind -> 'detail' ->> 'command_id')::bigint = p_id
          order by e.id limit 1;
     end if;
     v_exec := coalesce(v_typing_exec, v_own_exec);
     if v_exec is not null then
         v_ended := exists (select 1 from spawn_events e
-                            where e.session_id = p.session_id and e.event_name = 'execution.ended'
+                            where e.session_id = p_session and e.event_name = 'execution.ended'
                               and e.source = 'bridge' and e.execution_id = v_exec);
     else
         -- The session's live execution: its latest start, with no end.
         select s.recorded_at_ms into v_live_since from spawn_events s
-         where s.session_id = p.session_id and s.event_name = 'execution.started'
+         where s.session_id = p_session and s.event_name = 'execution.started'
            and not exists (select 1 from spawn_events x
                             where x.session_id = s.session_id and x.event_name = 'execution.ended'
                               and x.source = 'bridge' and x.execution_id = s.execution_id)
          order by s.id desc limit 1;
         v_ended := case
-            when p.state = 'finished' then
-                v_live_since is null or v_live_since > coalesce(p.finished_at_ms, p_now)
+            when p_state = 'finished' then
+                v_live_since is null or v_live_since > coalesce(p_finished, p_now)
             when v_type = 'input' then v_live_since is null
             else false end;
     end if;
@@ -4366,14 +4369,15 @@ end $$;
 -- nobody else is handed a function over the log. Each runs with its
 -- caller's rights.
 revoke execute on function spawn_messages_marked_from() from public;
-revoke execute on function spawn_command_message(spawn_commands, bigint, bigint, bigint)
-    from public;
+revoke execute on function spawn_command_message(bigint, text, jsonb, text, bigint, bigint,
+                                                 bigint, bigint, bigint) from public;
 do $$
 begin
     execute format('grant execute on function spawn_messages_marked_from() to %I',
                    spawn_login_role('spawn_reader'));
-    execute format('grant execute on function spawn_command_message(spawn_commands, bigint, '
-                   'bigint, bigint) to %I', spawn_login_role('spawn_reader'));
+    execute format('grant execute on function spawn_command_message(bigint, text, jsonb, text, '
+                   'bigint, bigint, bigint, bigint, bigint) to %I',
+                   spawn_login_role('spawn_reader'));
 end
 $$;
 

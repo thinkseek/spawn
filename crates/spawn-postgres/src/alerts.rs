@@ -57,7 +57,8 @@ candidates as (
   select k.* from spawn_commands k where k.state <> 'finished'),
 waiting as (
   select k.id, k.agent_id, k.session_id, k.action ->> 'type' as action, k.created_at_ms,
-         spawn_command_message(k, $1, m.marked_from, m.now_ms) as message
+         spawn_command_message(k.id, k.session_id, k.action, k.state,
+                               k.created_at_ms, k.finished_at_ms, $1, m.marked_from, m.now_ms) as message
     from candidates k, m)
 select jsonb_build_object(
   'now_ms', (select now_ms from m),
@@ -75,7 +76,8 @@ select jsonb_build_object(
         'taken_at_ms', x.message -> 'taken_at_ms', 'state', x.message -> 'state',
         'ended', coalesce(x.message -> 'ended', 'true'::jsonb)) order by k.id)
       from spawn_commands k, m,
-           lateral (select spawn_command_message(k, $1, m.marked_from, m.now_ms) as message) x
+           lateral (select spawn_command_message(k.id, k.session_id, k.action, k.state,
+                               k.created_at_ms, k.finished_at_ms, $1, m.marked_from, m.now_ms) as message) x
      where k.id = any($2)), '[]'::jsonb))";
 
 /// The database's clock alone, the one every bound is measured by.
