@@ -4,6 +4,10 @@
 #
 # Exit codes (scripts/rsi/gate.sh): 0 pass, 1 the assertion failed, 2 a
 # harness error (no binary to run).
+#
+# What a run reads of the tree under test, all of it (scripts/rsi/gate.sh
+# "Results reused from the base"): `spawn version` and nothing else.
+# reads: binary
 set -eu
 [ -x "${SPAWN_BIN:-}" ] || {
     echo "001: harness: SPAWN_BIN is not an executable" >&2
