@@ -283,8 +283,8 @@ impl Rig {
     /// (`[spawn message #<command>]`), then the line that says how to answer
     /// it: both after a space, on the text's own line, when the text is one
     /// line; the marker on a line of its own after a blank line, and the
-    /// answer on the next, when it is several. This host's pane reads lines
-    /// (the default), so a one-line input is one line here too.
+    /// answer on the next, when it is several. The place does not depend on
+    /// what the pane reads.
     fn typed(&self) -> Vec<String> {
         self.typed_raw()
             .iter()
@@ -374,8 +374,7 @@ fn an_input_to_a_busy_pane_waits_then_is_typed_once_the_pane_is_ready() {
 /// engine takes it at the Bridge's Enter, marker and answer and all. On a
 /// line of its own the marker (and the answer line) made the paste several
 /// submissions, the text taken before the Enter (003, rev-e's
-/// analysis-003-flake.md). A text of several lines still ends with the
-/// marker on a line of its own.
+/// analysis-003-flake.md).
 #[test]
 fn a_one_line_input_into_a_pane_that_reads_lines_carries_its_marker_on_its_line() {
     let mut rig = Rig::new(Duration::ZERO);
@@ -390,17 +389,25 @@ fn a_one_line_input_into_a_pane_that_reads_lines_carries_its_marker_on_its_line(
     );
     // One line, so the pane takes the paste as one submission, at the Enter.
     assert!(!rig.typed_raw()[0].contains('\n'));
+}
 
-    rig.turn();
+/// An input of several lines ends with its marker on a line of its own,
+/// after a blank line, and the answer line on the next: the text's own line
+/// breaks are lines whatever the marker does, and the marker stays apart
+/// from the last of them.
+#[test]
+fn an_input_of_several_lines_carries_its_marker_on_a_line_of_its_own() {
+    let mut rig = Rig::new(Duration::ZERO);
+    rig.pane(READY);
     rig.say("human", "note-two", "first line\nsecond line");
     rig.tick();
-    assert_eq!(rig.finished(3), Some((true, String::new())));
+    assert_eq!(rig.finished(2), Some((true, String::new())));
     assert_eq!(
-        rig.typed_raw()[1],
-        format!(
-            "first line\nsecond line\n\n[spawn message #3]\n{}",
-            spawn_core::message::answer_line(CommandId(3))
-        )
+        rig.typed_raw(),
+        [format!(
+            "first line\nsecond line\n\n[spawn message #2]\n{}",
+            spawn_core::message::answer_line(CommandId(2))
+        )]
     );
 }
 
