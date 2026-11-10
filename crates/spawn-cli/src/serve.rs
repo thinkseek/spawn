@@ -1974,8 +1974,8 @@ mod tests {
         ProcSocket, Shared, access_token, handle, is_json, is_loopback, local_exemption,
         log_window, objective_json, objective_prompt, open_network_request, open_networks,
         owner_uid, peer_uid, proc_sockets, rsi_objective, rsi_summary, same_origin, same_secret,
-        serve_requests, server_hosts, tokenless_request, typed_text, with_last_gates,
-        with_objectives,
+        fleet_window, serve_requests, server_hosts, tokenless_request, typed_text,
+        with_last_gates, with_objectives,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -2683,6 +2683,88 @@ mod tests {
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    #[test]
+    fn the_fleet_window_is_one_it_knows_ending_at_until_or_now() {
+        const DAY: i64 = 86_400_000;
+        let until = crate::scorecard::time::parse_rfc3339("2026-10-31T00:00:00Z").expect("a time");
+        let unused = || -> Result<i64, String> { panic!("until is given: now is not read") };
+        assert_eq!(
+            fleet_window("window=7d&until=2026-10-31T00:00:00Z", unused),
+            Ok(("7d", until - 7 * DAY, until))
+        );
+        assert_eq!(
+            fleet_window("until=2026-10-31T00%3A00%3A00Z&window=90d", unused),
+            Ok(("90d", until - 90 * DAY, until)),
+            "a percent-encoded until"
+        );
+        assert_eq!(
+            fleet_window("window=24h", || Ok(until)),
+            Ok(("24h", until - DAY, until)),
+            "until defaults to now"
+        );
+        assert_eq!(
+            fleet_window("window=30d&until=", || Ok(until)),
+            Ok(("30d", until - 30 * DAY, until))
+        );
+        for bad in ["window=2d", "", "window=7D", "window=7d&until=yesterday"] {
+            let refused = fleet_window(bad, || Ok(until)).expect_err(bad);
+            assert!(refused.starts_with(BAD_REQUEST), "{bad}: {refused}");
+        }
+    }
+
+    /// `/api/scorecard/fleet`'s interventions and landings are what `spawn
+    /// scorecard` counts as autonomy's interventions and throughput's
+    /// landings, over the same window: one definition of each.
+    #[test]
+    fn the_fleet_windows_interventions_and_landings_are_the_scorecards() {
+        in_test_schema(|owner, store| {
+            let mut client =
+                postgres::Client::connect(owner, postgres::NoTls).expect("the owner connects");
+            client
+                .batch_execute(&format!(
+                    "begin; {} commit;",
+                    include_str!("../../spawn-postgres/tests/experience-history.sql")
+                ))
+                .expect("the history seeds");
+            let root = std::env::temp_dir().join(format!(
+                "spawn-serve-fleet-{}-{}",
+                std::process::id(),
+                super::now_ms()
+            ));
+            const HOUR: i64 = 3_600_000;
+            let b = 1_700_006_400_000;
+            for (since, until) in [(b, b + 100 * HOUR), (b + 24 * HOUR, b + 72 * HOUR)] {
+                let asked = crate::scorecard::Query {
+                    mission: None,
+                    since: Some(crate::scorecard::time::format_rfc3339(since)),
+                    until: Some(crate::scorecard::time::format_rfc3339(until)),
+                };
+                let card = crate::scorecard::measure(store, Some(&root), &asked)
+                    .expect("the scorecard measures");
+                let fleet = &card["scopes"][0]["dimensions"];
+                assert_eq!(card["scopes"][0]["scope"], json!("fleet"));
+                let answer = store
+                    .fleet_experience(since, until)
+                    .expect("the window's figures");
+                assert_eq!(
+                    answer["interventions"]["total"], fleet["autonomy"]["interventions"],
+                    "[{since}, {until}): {answer}"
+                );
+                assert_eq!(
+                    answer["interventions"]["by_kind"], fleet["autonomy"]["by_kind"],
+                    "[{since}, {until})"
+                );
+                let landings = answer["outcomes"]["landed"].as_i64().expect("a count")
+                    + answer["outcomes"]["accepted"].as_i64().expect("a count");
+                assert_eq!(
+                    json!(landings),
+                    fleet["throughput"]["landed"],
+                    "[{since}, {until})"
+                );
+            }
+        });
     }
 
     /// The supervisor's session starts an execution, as the Bridge records it.
