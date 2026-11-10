@@ -86,6 +86,16 @@ export interface Execution {
   exit_code: number | null;
   exit_reported: boolean;
   duration_ms: number | null;
+  /** The execution of the same session a restart's resume replaced
+   * (`spawn task restart`, the page's Restart); null otherwise. */
+  restart_of: string | null;
+}
+
+/** One end of a reassign (`spawn task reassign`, the page's Reassign): a
+ * task and the session of its worker. */
+export interface TaskLink {
+  task: number;
+  session_id: string;
 }
 
 export interface OpenTool {
@@ -118,6 +128,12 @@ export interface SessionDetail {
   state: SessionState;
   session_seq: number;
   executions: Execution[];
+  /** The task this session's task was reassigned to, and its worker's
+   * session; null when none was. */
+  reassigned_to: TaskLink | null;
+  /** The task this session's task took over, and its old worker's
+   * session; null when it took over none. */
+  reassigned_from: TaskLink | null;
   open_tools: OpenTool[];
   freshness: Freshness | null;
   timeline: TimelineEvent[];
@@ -264,6 +280,14 @@ export function normalizeAlerts(value: unknown): Alert[] {
   });
 }
 
+/** A reassign's `{task, session_id}`, or null for anything else. */
+function taskLink(value: unknown): TaskLink | null {
+  const link = object(value);
+  const task = optionalNumber(link.task);
+  const session = optionalText(link.session_id);
+  return task !== null && session ? { task, session_id: session } : null;
+}
+
 export function normalizeSession(value: unknown): SessionDetail {
   const raw = object(value);
   // The stated contract puts state fields at the top level; the current
@@ -291,8 +315,11 @@ export function normalizeSession(value: unknown): SessionDetail {
         exit_code: optionalNumber(execution.exit_code),
         exit_reported: execution.exit_reported === true,
         duration_ms: optionalNumber(execution.duration_ms),
+        restart_of: optionalText(execution.restart_of),
       };
     }),
+    reassigned_to: taskLink(raw.reassigned_to),
+    reassigned_from: taskLink(raw.reassigned_from),
     open_tools: list(raw.open_tools).map((entry) => {
       const tool = object(entry);
       return {
@@ -447,9 +474,24 @@ export async function postKey(
   return postWrite(sessionId, "key", body, signal);
 }
 
+/** `POST /api/session/<id>/restart` or `/reassign` with `{reason}`: a
+ * person restarts the session's delivered task (a fresh execution of its
+ * own session, its work kept) or reassigns it to a fresh worker whose
+ * branch starts from this one's work. 202 with `{task, session_id,
+ * agent_id, principal}`, the task and worker that now carry the work; 409
+ * with the reason when the session holds no delivered task. */
+export async function postTaskMove(
+  sessionId: string,
+  action: "restart" | "reassign",
+  body: { reason: string },
+  signal?: AbortSignal,
+): Promise<{ status: number | null; body: unknown }> {
+  return postWrite(sessionId, action, body, signal);
+}
+
 async function postWrite(
   sessionId: string,
-  path: "input" | "key",
+  path: "input" | "key" | "restart" | "reassign",
   body: Record<string, unknown>,
   signal?: AbortSignal,
 ): Promise<{ status: number | null; body: unknown }> {
