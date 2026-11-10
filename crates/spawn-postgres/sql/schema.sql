@@ -2201,6 +2201,12 @@ begin
            set state = 'cleared', cleared_event_id = p_event, cleared_at_ms = p_at,
                cleared_evidence = coalesce(p_record -> 'evidence', '{}'::jsonb)
          where key = p_record ->> 'key';
+    when 'host.messages_marked' then
+        -- The first `spawn loop` whose Bridge types each message's marker
+        -- started (spawn_host_record writes one, once): a command never
+        -- typed is a message whose taking is tracked from then on
+        -- (spawn_command_message). Read from the log, folded into no table.
+        null;
     when 'host.loop_started' then
         -- `spawn loop` started (its boot id and start time): the recovery
         -- reads it to tell an execution whose end this loop found after a
@@ -4050,6 +4056,10 @@ create index if not exists spawn_events_objective_solved
 --   per crossing; the judge's watcher reads the latest per judge back after
 --   a restart, and the alert step fires `judge_down` on a `down` with no
 --   `up` after it SPAWN_ALERT_JUDGE_DOWN_SECS after its first failure.
+-- - `host.messages_marked`: the first `spawn loop` whose Bridge types each
+--   message's marker started (`started_at_ms`). Written once: a later
+--   start writes nothing and gets the first record's id back. A command
+--   never typed is a tracked message from then on (spawn_command_message).
 -- - `host.loop_started`: one `spawn loop` started, with its `boot_id` and
 --   `started_at_ms`. A restarted loop tells an execution whose end it found
 --   from one it watched fail by the records of the loops before it.
@@ -4096,6 +4106,19 @@ begin
         if p_record ->> 'state' = 'up'
            and jsonb_typeof(p_record -> 'failed_calls') is distinct from 'number' then
             raise exception 'a host.judge up record counts failed_calls: %', p_record;
+        end if;
+    elsif v_type = 'host.messages_marked' then
+        if jsonb_typeof(p_record -> 'started_at_ms') is distinct from 'number' then
+            raise exception 'a host.messages_marked record has started_at_ms: %', p_record;
+        end if;
+        -- The first such loop is what it says: a later start records
+        -- nothing and answers the first record.
+        if exists (select 1 from spawn_events
+                    where session_id = 'session_control' and event_name = 'control.recorded'
+                      and kind -> 'detail' -> 'record' ->> 'type' = 'host.messages_marked') then
+            return (select min(id) from spawn_events
+                     where session_id = 'session_control' and event_name = 'control.recorded'
+                       and kind -> 'detail' -> 'record' ->> 'type' = 'host.messages_marked');
         end if;
     elsif v_type = 'host.loop_started' then
         if p_record ->> 'boot_id' is null
@@ -4198,6 +4221,180 @@ begin
     end if;
     return spawn_control_record(p_record);
 end $$;
+
+-- Messages (objective 045; docs/fleet-architecture.md §3.4, "Messages"):
+-- what the Bridge types for a command (an input, a start or a resume with a
+-- prompt) ends with its marker, `[spawn message #<id>]`, and the transcript
+-- line that holds it is the message taken (`message.taken`, detail
+-- `command_id`, from the engine's transcript). A command's message is read
+-- by its id from the records alone, never by its text or its order.
+
+-- Each `message.taken` by session and command.
+create index if not exists spawn_events_message_taken
+    on spawn_events (session_id, ((kind -> 'detail' ->> 'command_id')::bigint), id)
+    where event_name = 'message.taken';
+
+-- When the first loop that types markers started (`host.messages_marked`),
+-- null before any did.
+create or replace function spawn_messages_marked_from() returns bigint
+language sql stable as $$
+    select min(e.recorded_at_ms) from spawn_events e
+     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+       and e.kind -> 'detail' -> 'record' ->> 'type' = 'host.messages_marked'
+$$;
+
+-- The message of command `p_id` (its session, action, state, creation and
+-- finish; null for one that types nothing: a key, a
+-- stop, a discard, a start or resume with no prompt), at `p_now`, its bound
+-- `p_bound_ms` (SPAWN_MESSAGE_TAKEN_SECS) and the first marking loop's start
+-- `p_marked_from`:
+-- - `typed_at_ms`: the Bridge's `typed` step; `taken_at_ms`: the first
+--   `message.taken` naming it, `taken` how many name it; `answered_at_ms`:
+--   the session's first `turn.stopped` or `turn.failed` after that first
+--   `message.taken`. `state` is `answered`, else `taken`, else `typed`, else
+--   `recorded`. Times are the records' (`recorded_at_ms`).
+-- - `not_taken`: no `message.taken` names it, it is tracked, and its bound
+--   has passed. Tracked: the Bridge recorded `message.typed` for it (the
+--   text it typed carried the marker; the bound runs from the command's
+--   creation), or nothing of it was ever typed (no `typing` step), it did
+--   not finish failed (the Bridge refused it before typing: its sender is
+--   told, and a loop's sends it again as a new command), and it was still
+--   open, or finished, after the first marking loop started (the bound runs
+--   from the later of its creation and that start). A command an
+--   older Spawn typed has `typing` and no `message.typed`: never not taken.
+--   Nothing is tracked that was sent while its session's transcript had
+--   held no marker (no `message.taken` recorded at or before its creation):
+--   an engine that does not keep the prompt it is given says nothing by its
+--   silence.
+-- - `typed`: whether the Bridge recorded it typed; `ended`: the session ended
+--   with it (what the alert clears on): the execution it was typed into, or
+--   its own start's, ended; or, never typed or started, it finished while no
+--   execution that is still live ran.
+create or replace function spawn_command_message(p_id bigint, p_session text, p_action jsonb,
+                                                 p_state text, p_succeeded boolean,
+                                                 p_created bigint,
+                                                 p_finished bigint, p_bound_ms bigint,
+                                                 p_marked_from bigint, p_now bigint)
+returns jsonb language plpgsql stable as $$
+declare
+    v_type text := p_action ->> 'type';
+    v_typed_at bigint;
+    v_typing_exec text;
+    v_marked boolean;
+    v_taken bigint;
+    v_taken_id bigint;
+    v_taken_at bigint;
+    v_answered_at bigint;
+    v_own_exec text;
+    v_exec text;
+    v_tracked boolean;
+    v_from bigint;
+    v_ended boolean;
+    v_live_since bigint;
+begin
+    if not (v_type = 'input'
+            or (v_type in ('start', 'resume') and coalesce(p_action ->> 'prompt', '') <> '')) then
+        return null;
+    end if;
+    select min(e.recorded_at_ms) into v_typed_at from spawn_events e
+     where e.session_id = p_session and e.source = 'bridge'
+       and e.source_event_id = 'cmd_' || p_id || ':typed';
+    select e.execution_id into v_typing_exec from spawn_events e
+     where e.session_id = p_session and e.source = 'bridge'
+       and e.source_event_id in ('cmd_' || p_id || ':typing', 'cmd_' || p_id || ':message')
+     order by e.id limit 1;
+    v_marked := exists (select 1 from spawn_events e
+                         where e.session_id = p_session and e.source = 'bridge'
+                           and e.source_event_id = 'cmd_' || p_id || ':message');
+    select count(*), min(e.id) into v_taken, v_taken_id from spawn_events e
+     where e.session_id = p_session and e.event_name = 'message.taken'
+       and (e.kind -> 'detail' ->> 'command_id')::bigint = p_id;
+    if v_taken_id is not null then
+        select e.recorded_at_ms into v_taken_at from spawn_events e where e.id = v_taken_id;
+        select e.recorded_at_ms into v_answered_at from spawn_events e
+         where e.session_id = p_session and e.event_name in ('turn.stopped', 'turn.failed')
+           and e.id > v_taken_id
+         order by e.id limit 1;
+    end if;
+    if not exists (select 1 from spawn_events e
+                    where e.session_id = p_session and e.event_name = 'message.taken'
+                      and e.recorded_at_ms <= p_created) then
+        -- The session's transcript had held no marker when it was sent:
+        -- its engine (or a stand-in) may not keep the prompt it is given,
+        -- and its silence says nothing. Fixed when it is sent, so a later
+        -- taking changes no earlier message.
+        v_tracked := false;
+    elsif v_marked then
+        v_tracked := true;
+        v_from := p_created;
+    elsif v_typing_exec is null and p_marked_from is not null
+          and not exists (select 1 from spawn_events e
+                           where e.session_id = p_session and e.source = 'bridge'
+                             and e.source_event_id = 'cmd_' || p_id || ':typing')
+          and (p_finished is null or p_finished >= p_marked_from)
+          and p_succeeded is not false then
+        v_tracked := true;
+        v_from := greatest(p_created, p_marked_from);
+    else
+        v_tracked := false;
+    end if;
+    -- The session ended with it: the execution it was typed into, or its
+    -- own start's, ended.
+    if v_type in ('start', 'resume') then
+        select e.execution_id into v_own_exec from spawn_events e
+         where e.session_id = p_session and e.event_name = 'execution.started'
+           and (e.kind -> 'detail' ->> 'command_id')::bigint = p_id
+         order by e.id limit 1;
+    end if;
+    v_exec := coalesce(v_typing_exec, v_own_exec);
+    if v_exec is not null then
+        v_ended := exists (select 1 from spawn_events e
+                            where e.session_id = p_session and e.event_name = 'execution.ended'
+                              and e.source = 'bridge' and e.execution_id = v_exec);
+    else
+        -- The session's live execution: its latest start, with no end.
+        select s.recorded_at_ms into v_live_since from spawn_events s
+         where s.session_id = p_session and s.event_name = 'execution.started'
+           and not exists (select 1 from spawn_events x
+                            where x.session_id = s.session_id and x.event_name = 'execution.ended'
+                              and x.source = 'bridge' and x.execution_id = s.execution_id)
+         order by s.id desc limit 1;
+        -- An unfinished one has not ended: the Bridge finishes it, and a
+        -- start or resume before it may give it an execution yet.
+        v_ended := p_state = 'finished'
+                   and (v_live_since is null or v_live_since > coalesce(p_finished, p_now));
+    end if;
+    return jsonb_build_object(
+        'state', case when v_answered_at is not null then 'answered'
+                      when v_taken_at is not null then 'taken'
+                      when v_typed_at is not null then 'typed'
+                      else 'recorded' end,
+        'typed_at_ms', v_typed_at,
+        'taken_at_ms', v_taken_at,
+        'answered_at_ms', v_answered_at,
+        'taken', v_taken,
+        'not_taken', v_taken = 0 and v_tracked and p_now - v_from >= p_bound_ms,
+        'tracked', v_tracked,
+        'due_ms', case when v_tracked and v_taken = 0 then v_from + p_bound_ms end,
+        'typed', v_typed_at is not null,
+        'ended', v_ended);
+end $$;
+
+-- The owner (the loop) and `spawn serve`'s reader login read messages;
+-- nobody else is handed a function over the log. Each runs with its
+-- caller's rights.
+revoke execute on function spawn_messages_marked_from() from public;
+revoke execute on function spawn_command_message(bigint, text, jsonb, text, boolean, bigint,
+                                                 bigint, bigint, bigint, bigint) from public;
+do $$
+begin
+    execute format('grant execute on function spawn_messages_marked_from() to %I',
+                   spawn_login_role('spawn_reader'));
+    execute format('grant execute on function spawn_command_message(bigint, text, jsonb, text, '
+                   'boolean, bigint, bigint, bigint, bigint, bigint) to %I',
+                   spawn_login_role('spawn_reader'));
+end
+$$;
 
 -- The backup records: the loop's `spawn backup dump|bundle|verify` writes
 -- them through `spawn_backup_record` (owner only); each names what a copy

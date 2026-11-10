@@ -1077,7 +1077,7 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   day has reached its `budget.daily_usd` (§3.5); once per mission and day,
   whatever restarts and however much more it spends; clears when the day
   ends, or at a reading that finds the budget removed or raised above the
-  day's spend). Each fires once per
+  day's spend), and `message_not_taken` (below, "Messages"). Each fires once per
   occurrence and clears with the record or reading that cleared it; a
   threshold of `0` disables its check.
 - **When.** A record-borne alert is recorded within one pass of its record; a
@@ -1102,6 +1102,93 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   cleared it; nothing rests on the step's memory, on absence, or on time
   without a record. Evidence never holds a secret: no database URL with its
   password, no environment, process names without their arguments.
+
+#### Messages: each one tracked by its id (objective 045)
+
+What Spawn types into an agent's engine for a command is a message: a
+person's input, the dispatcher's task, a send-back or a digest, a
+supervisor's nudge (an `input`, or a `start` or `resume` with a prompt). A
+command that types nothing (a key, a stop, a start with no prompt) has none.
+A message's id is its command's id, carried end to end:
+
+- **The marker.** The text the Bridge types for a command ends with the
+  command's marker, `[spawn message #<command id>]`, on a line of its own
+  after the text (the workspace notices typed before the text are part of
+  the same message; `crates/spawn-core/src/message.rs`, the Bridge's
+  `type_once`). A one-line text carries it at the end of its line instead,
+  after a space, when it is a start's or a resume's prompt (typed as the
+  engine comes up) or goes into a pane whose program reads keys raw (its tty
+  has `-icanon`, which the tmux host reads with `stty -a`): such a program,
+  unless it asked for a bracketed paste, takes each pasted line break as
+  Enter, and the marker would be a prompt of its own. Every typing carries it: an input, and a start's or a
+  resume's prompt. The Bridge records `message.typed` (keyed
+  `cmd_<id>:message`) once the marked text is staged and before its
+  `typing` step: the record that says this command's text carried the
+  marker. The order the Bridge types in, the wait between inputs, and what a
+  refused or unknown typing does are as before.
+- **Taken.** The engine's transcript keeps the line it was given. A user
+  line of the transcript (not a tool result) that holds a marker is that
+  message taken: one `message.taken {command_id}` per marker, keyed by the
+  line's uuid and the id (`<uuid>:taken:<id>`), so a line read again after
+  any restart records nothing, a line with two markers takes both, and an
+  engine that wrote its line twice took it twice. The `message.received`
+  the line is stays as it was.
+- **The lifecycle, from records only.** `GET /api/fleet/<session>/commands`
+  gives each command a `message` (`spawn_command_message` in the schema),
+  null for a command that types nothing: `{state, typed_at_ms, taken_at_ms,
+  answered_at_ms, taken, not_taken}`. `typed_at_ms` is the Bridge's `typed`
+  step; `taken_at_ms` the first `message.taken` naming it, `taken` how many
+  name it; `answered_at_ms` the session's first `turn.stopped` or
+  `turn.failed` after that first `message.taken`. `state` is `answered`,
+  else `taken`, else `typed`, else `recorded`. Two messages with the same
+  text are two ids, each read by its own: never by the text or the order.
+  Times are the records' `recorded_at_ms`, on the database's clock. The
+  agent page says each in words beside its command (`web/src/messages.ts`:
+  "typed, not taken yet", "not taken (typed)", "taken in 2 s · answered in 4
+  min · taken 2×").
+- **Not taken.** `not_taken` is true while no `message.taken` names a message
+  and it was recorded `SPAWN_MESSAGE_TAKEN_SECS` ago or more (default 120;
+  whole seconds; a value that is not one is warned of once and the default
+  used): typed and never taken (a pane that dropped it), or never typed (a
+  pane that refused every paste). Which messages are tracked is read per
+  command from the Bridge's own records, never by age or by when the schema
+  was upgraded. A command whose text carried the marker has `message.typed`,
+  and its bound runs from its creation. Nothing is tracked that was sent while
+  its session's transcript had held no marker (no `message.taken` recorded
+  at or before the command's creation): an engine, or a stand-in, that does
+  not keep the prompt it is given says nothing by its silence; every message
+  sent after the session's first taking is tracked. So a session's very
+  first message (a worker's task) is read (taken, answered) but never said
+  not taken. A command an older Spawn typed has
+  its `typing` step and no `message.typed`: no `message.taken` can ever name
+  it, and it is never not taken, whenever it was typed — deploy.sh stops
+  only the integrator before `init-db`, so the old loop types on, without
+  markers, after the upgrade until the deploy restarts it. A command never
+  typed (no `typing` step) that finished failed is none either: the Bridge
+  refused it before typing, its sender is told (`command_failed`), and a
+  loop sends it again as a new command. Any other command never typed is
+  told by when a loop that types markers first started: each loop's Bridge records `host.messages_marked` when it is
+  built, and the store keeps the first alone. A never-typed command still
+  open at that start or after it, or finished after it, is tracked, its
+  bound running from the later of its creation and that start; one that
+  finished before it was the older Spawn's to type, and is not.
+- **The alert.** The alerts step raises `message_not_taken` (subject the
+  session, key `message_not_taken:<command id>`, evidence the command, the
+  agent, the session and whether it was typed) once per message when it
+  becomes not taken while its session has not ended with it; it clears when
+  the message is taken, or when the session ends with it untaken (the
+  execution it was typed into, or its own start's, ended; a never-typed one
+  finished while no live execution ran). On start the step reads every
+  message that can be one (each live session's commands from its
+  execution's own start on, and every unfinished command) and its open
+  alerts back from the store, so a restart fires none again and loses none;
+  then, when the log moved, only the commands new since, the pending
+  messages that fell due, and the open alerts whose session took a message
+  or ended an execution since (an idle pass reads next to nothing, objective
+  023). An open one reaches
+  `/api/alerts` and Home's Needs you, which names the agent and the message.
+  Out of scope (objective 046): an agent's explicit acknowledgement, what a
+  reply says, and retrying a message not taken.
 
 ### 3.5 Cost: what the model calls cost
 

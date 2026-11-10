@@ -159,6 +159,20 @@
 //!   clears when the day ends, or at a reading that finds the budget removed
 //!   or above the day's spend. A mission with no daily budget, or under it,
 //!   raises none. It rests on the readings of the recorded costs.
+//! - `message_not_taken`, the session id, key `message_not_taken:<command>`,
+//!   evidence the command, agent, session and whether it was typed
+//!   (objective 045): a message (what the Bridge types for a command, with
+//!   its marker) that no `message.taken` names `SPAWN_MESSAGE_TAKEN_SECS`
+//!   (default 120) after it was recorded (`spawn_command_message`): typed
+//!   and never taken, or never typed. A command an older Spawn typed carries
+//!   no marker (no `message.typed`) and is never one, nor is one sent while
+//!   its session's transcript had held no marker yet. Once per message;
+//!   clears when it is taken, or when its session ends with it untaken (the
+//!   execution it was typed into, or its own start's, ended). A message
+//!   whose session ended first fires nothing. Read on start (every message
+//!   that can be one, and the open alerts), then when the log moved (the
+//!   new commands, the pending messages due, the open alerts whose session
+//!   took a message or ended since) and when a pending one falls due.
 //! - `model_auth`, the session id, key
 //!   `model_auth:<its execution.interrupted>`: an `execution.interrupted`
 //!   (028) with cause `model_auth`; clears at that execution's
@@ -211,6 +225,11 @@ const HISTORY_LIMIT: i64 = 5_000;
 /// How far back a restarted loop looks for commands that finished failed.
 const COMMAND_LOOKBACK_MS: i64 = 600_000;
 
+/// How far before the last reading of the messages the next looks for a
+/// taking or an end: an append that committed after that reading may carry
+/// an earlier time.
+const MESSAGES_MARGIN_MS: i64 = 60_000;
+
 /// On start, the last part of a log is read, not all of it.
 const LOG_TAIL_BYTES: u64 = 1024 * 1024;
 /// The most one reading takes from a log that grew a lot.
@@ -237,6 +256,8 @@ pub(crate) struct Settings {
     pub(crate) admission_ms: i64,
     /// How long the model judge may answer no call.
     pub(crate) judge_down_ms: i64,
+    /// How long a message may go untaken (SPAWN_MESSAGE_TAKEN_SECS).
+    pub(crate) message_taken_ms: i64,
     /// The dump's and the bundle's schedules, with room for one late run.
     pub(crate) dump_max_age_ms: i64,
     pub(crate) bundle_max_age_ms: i64,
@@ -290,6 +311,13 @@ impl Settings {
             undelivered_ms: secs("SPAWN_ALERT_UNDELIVERED_SECS", 300, &mut warnings),
             admission_ms: secs("SPAWN_ALERT_ADMISSION_SECS", 600, &mut warnings),
             judge_down_ms: secs("SPAWN_ALERT_JUDGE_DOWN_SECS", 900, &mut warnings),
+            message_taken_ms: {
+                let (bound, warning) = crate::config::message_taken_bound(
+                    env_value("SPAWN_MESSAGE_TAKEN_SECS").as_deref(),
+                );
+                warnings.extend(warning);
+                bound
+            },
             dump_max_age_ms: secs("SPAWN_ALERT_BACKUP_DUMP_MAX_AGE_SECS", 7200, &mut warnings),
             bundle_max_age_ms: secs(
                 "SPAWN_ALERT_BACKUP_BUNDLE_MAX_AGE_SECS",
@@ -463,6 +491,20 @@ pub(crate) struct Monitor {
     /// reading in a row, so a path that comes and goes does not flap). A
     /// restart forgets them: its first reading starts the count again.
     away_once: BTreeMap<(i64, String), i64>,
+    /// When the earliest pending message reaches its bound, as the last
+    /// reading of the messages found (`message_not_taken`).
+    messages_due: Option<i64>,
+    /// The newest command the messages' reading has seen: the next reads
+    /// the commands after it.
+    messages_after: i64,
+    /// The tracked messages not taken, not alerted and whose session had not
+    /// ended with them when last read, by the time each falls due: read
+    /// again then.
+    pending: BTreeMap<i64, i64>,
+    /// From when the next reading looks for a `message.taken` or an
+    /// `execution.ended` that may clear an open alert: the last reading's
+    /// time, less a margin for an append that committed late.
+    messages_since: i64,
 }
 
 impl Monitor {
@@ -496,6 +538,10 @@ impl Monitor {
             logs,
             unlocked_since: None,
             away_once: BTreeMap::new(),
+            messages_due: None,
+            messages_after: 0,
+            pending: BTreeMap::new(),
+            messages_since: 0,
         }
     }
 
@@ -514,6 +560,7 @@ impl Monitor {
             return Ok(lines);
         }
         let mut events = Vec::new();
+        let moved = watermark > self.watermark;
         if watermark > self.watermark {
             let batch = store
                 .alert_control(self.watermark, BATCH)
@@ -543,6 +590,14 @@ impl Monitor {
                 .map_err(|error| error.to_string())?;
             self.commands(&commands, &mut events);
             self.commands_after = now.saturating_sub(1000);
+        }
+        // The messages are read when the log moved (a new command, a taking,
+        // an end all append) and when a pending one falls due: the new
+        // commands, the pending ones due, and the open alerts' whose session
+        // took a message or ended since, so an idle pass reads next to
+        // nothing (objective 023).
+        if moved || self.messages_due.is_some_and(|due| now >= due) {
+            self.read_messages(store, now, &mut events, &mut lines);
         }
         if reading_due {
             self.next_reading_ms = now.saturating_add(self.settings.check_ms);
@@ -630,6 +685,12 @@ impl Monitor {
             .alert_failed_commands(self.commands_after)
             .map_err(|error| error.to_string())?;
         self.commands(&commands, &mut events);
+        // The messages, read back as they stand: an alert the store holds
+        // fires nothing again, and one due while the loop was down fires.
+        let messages = store
+            .alert_messages_all(self.settings.message_taken_ms, &self.open_messages())
+            .map_err(|error| error.to_string())?;
+        self.messages(&messages, &mut events);
         self.watermark = store.alert_clock().map_err(|error| error.to_string())?.0;
         for log in &mut self.logs {
             let open = self
@@ -1410,6 +1471,128 @@ times in a row)",
         }
     }
 
+    /// The commands of the open `message_not_taken` alerts.
+    fn open_messages(&self) -> Vec<i64> {
+        self.known
+            .iter()
+            .filter(|(_, row)| row.open() && row.kind == "message_not_taken")
+            .filter_map(|(key, _)| key.strip_prefix("message_not_taken:")?.parse().ok())
+            .collect()
+    }
+
+    /// Read the commands after the last one seen, the pending messages due
+    /// at `now`, and the open alerts' that may have cleared
+    /// ([`PostgresStore::alert_messages_since`]), and decide. An error is
+    /// said and read again at the next pass.
+    fn read_messages(
+        &mut self,
+        store: &PostgresStore,
+        now: i64,
+        out: &mut Vec<Event>,
+        lines: &mut Vec<String>,
+    ) {
+        let due: Vec<i64> = self
+            .pending
+            .iter()
+            .filter(|(_, due)| **due <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        match store.alert_messages_since(
+            self.settings.message_taken_ms,
+            self.messages_after,
+            &due,
+            &self.open_messages(),
+            self.messages_since,
+        ) {
+            Ok(messages) => self.messages(&messages, out),
+            Err(error) => lines.push(format!("alerts: messages: {error}")),
+        }
+    }
+
+    /// `message_not_taken`: a tracked message no `message.taken` names past
+    /// its bound, its session not ended with it, fires once; an open one
+    /// clears once it is taken, or once its session ended with it untaken.
+    /// One not due yet is pending, read again until it is taken, ends or
+    /// fires; the next bound is the earliest pending one's.
+    fn messages(&mut self, messages: &Value, out: &mut Vec<Event>) {
+        for message in messages["messages"].as_array().into_iter().flatten() {
+            let Some(id) = message["command_id"].as_i64() else {
+                continue;
+            };
+            let key = format!("message_not_taken:{id}");
+            let taken = message["taken"].as_i64().unwrap_or_default();
+            let ended = message["ended"].as_bool() != Some(false);
+            if self.known.contains_key(&key) {
+                self.pending.remove(&id);
+                if !self.is_open(&key) {
+                    continue;
+                }
+                if taken > 0 {
+                    out.push(Event::Clear {
+                        key,
+                        evidence: json!({"taken": taken, "taken_at_ms": message["taken_at_ms"]}),
+                    });
+                } else if ended {
+                    out.push(Event::Clear {
+                        key,
+                        evidence: json!({"ended": true, "state": message["state"]}),
+                    });
+                }
+                continue;
+            }
+            if message["tracked"].as_bool() != Some(true) || taken > 0 || ended {
+                self.pending.remove(&id);
+                continue;
+            }
+            // Pending until its alert is in the store: a fire the store
+            // refused for an error is tried again at the next reading.
+            let now = messages["now_ms"].as_i64().unwrap_or_default();
+            let due = message["due_ms"].as_i64().unwrap_or(now);
+            if message["not_taken"].as_bool() != Some(true) {
+                self.pending.insert(id, due);
+                continue;
+            }
+            self.pending.insert(id, now);
+            let typed = message["typed"].as_bool() == Some(true);
+            let agent = message["agent_id"].as_str().unwrap_or_default();
+            let action = message["action"].as_str().unwrap_or("input");
+            let secs = self.settings.message_taken_ms / 1000;
+            out.push(Event::Fire {
+                key,
+                kind: "message_not_taken",
+                subject: message["session_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                evidence: json!({
+                    "command": id, "agent_id": agent, "session_id": message["session_id"],
+                    "action": action, "typed": typed,
+                    "recorded_at_ms": message["created_at_ms"],
+                    "bound_ms": self.settings.message_taken_ms,
+                }),
+                text: if typed {
+                    format!(
+                        "{agent} has not taken message #{id} (its {action}): typed, and no \
+                         transcript line holds its marker {secs} s after it was sent"
+                    )
+                } else {
+                    format!(
+                        "{agent} has not taken message #{id} (its {action}): never typed \
+                         {secs} s after it was sent"
+                    )
+                },
+                notice: false,
+            });
+        }
+        if let Some(max) = messages["max_id"].as_i64() {
+            self.messages_after = self.messages_after.max(max);
+        }
+        if let Some(now) = messages["now_ms"].as_i64() {
+            self.messages_since = now.saturating_sub(MESSAGES_MARGIN_MS);
+        }
+        self.messages_due = self.pending.values().copied().min();
+    }
+
     /// The model judge's `down` records that reached their bound
     /// (`judge_down`), once each.
     fn judge_bounds(&self, now: i64, out: &mut Vec<Event>) {
@@ -2150,6 +2333,9 @@ times in a row)",
                 next = next.min(log.last_match_ms.saturating_add(self.settings.quiet_ms));
             }
         }
+        if let Some(due) = self.messages_due {
+            next = next.min(due);
+        }
         self.next_bound_ms = (next != i64::MAX).then_some(next);
     }
 
@@ -2886,6 +3072,7 @@ mod tests {
             undelivered_ms: 300_000,
             admission_ms: 600_000,
             judge_down_ms: 900_000,
+            message_taken_ms: 120_000,
             dump_max_age_ms: 7_200_000,
             bundle_max_age_ms: 93_600_000,
             memory_low_mb: 4096,
@@ -3374,6 +3561,71 @@ mod tests {
                 .any(|event| matches!(event, Event::Clear { key, .. } if key == "scenario_red:4:047.sh:12")),
             "{green:?}"
         );
+    }
+
+    /// A restart that reads an open `message_not_taken` alert back: the
+    /// message, still not taken, fires nothing again; taken, it clears,
+    /// once. A message not due yet is pending, sets the step's next bound,
+    /// and fires once at it.
+    #[test]
+    fn a_restart_keeps_a_message_not_taken_one_alert() {
+        let message = |id: i64, due: i64, not_taken: bool, taken: i64| {
+            json!({"command_id": id, "agent_id": "agent_worker_a",
+                   "session_id": "session_worker_a", "action": "input",
+                   "created_at_ms": due - 120_000, "due_ms": due, "tracked": true,
+                   "not_taken": not_taken, "typed": true, "taken": taken,
+                   "taken_at_ms": if taken > 0 { json!(due) } else { Value::Null },
+                   "ended": false, "state": if taken > 0 { "taken" } else { "typed" }})
+        };
+        let mut restarted = super::Monitor::with(settings());
+        restarted.known.insert(
+            "message_not_taken:41".to_string(),
+            Row {
+                kind: "message_not_taken".to_string(),
+                subject: "session_worker_a".to_string(),
+                state: "open".to_string(),
+                evidence: json!({"command": 41, "typed": true}),
+                fired_event_id: 12,
+                fired_at_ms: 0,
+            },
+        );
+        assert_eq!(restarted.open_messages(), [41]);
+        let still = json!({"now_ms": 500_000, "max_id": 42, "messages": [
+            message(41, 121_000, true, 0), message(42, 610_000, false, 0)]});
+        let mut out = Vec::new();
+        restarted.messages(&still, &mut out);
+        assert!(decided(&restarted, out).is_empty(), "not fired again");
+        assert_eq!(restarted.messages_due, Some(610_000));
+        assert_eq!(restarted.messages_after, 42);
+        assert_eq!(
+            restarted
+                .pending
+                .iter()
+                .map(|(id, due)| (*id, *due))
+                .collect::<Vec<_>>(),
+            [(42, 610_000)]
+        );
+        assert_eq!(restarted.messages_since, 440_000);
+        restarted.plan(500_000);
+        assert_eq!(restarted.next_bound_ms, Some(610_000));
+
+        let due = json!({"now_ms": 610_000, "max_id": 42, "messages": [
+            message(41, 121_000, true, 1), message(42, 610_000, true, 0)]});
+        let mut out = Vec::new();
+        restarted.messages(&due, &mut out);
+        let events = decided(&restarted, out);
+        assert!(
+            matches!(&events[..], [Event::Clear { key, evidence }, Event::Fire { key: fired, .. }]
+                if key == "message_not_taken:41" && evidence["taken"] == 1
+                    && fired == "message_not_taken:42"),
+            "{events:?}"
+        );
+        commit(&mut restarted, &events);
+        let mut out = Vec::new();
+        restarted.messages(&due, &mut out);
+        assert!(decided(&restarted, out).is_empty(), "each once");
+        assert!(restarted.pending.is_empty());
+        assert_eq!(restarted.messages_due, None);
     }
 
     /// A restart that reads open `validator_defect` alerts back (rev-b F1),
@@ -4047,6 +4299,7 @@ connections\n";
         use super::super::{Event, Monitor};
         use super::{commit, decided, fires, monitor};
         use serde_json::{Value, json};
+        use spawn_core::command::Outcome;
         use spawn_core::event::{
             ENGINE, EndCause, EventKind, ModelProfile, NewEvent, SessionSeq, Source,
         };
@@ -4465,6 +4718,427 @@ connections\n";
                     cleared_by(&observe(&mut monitor, store)),
                     [(key, json!({"event_id": end, "cause": "exited"}))]
                 );
+            });
+        }
+
+        /// One record with the key its producer gives it.
+        fn keyed(
+            store: &PostgresStore,
+            session: &str,
+            execution: &str,
+            source: Source,
+            key: &str,
+            kind: EventKind,
+        ) -> i64 {
+            let appended = store
+                .append(NewEvent {
+                    agent_id: AgentId::new(format!("agent_{session}")).expect("valid"),
+                    session_id: SessionId::new(format!("session_{session}")).expect("valid"),
+                    execution_id: Some(ExecutionId::new(execution.to_string()).expect("valid")),
+                    source,
+                    source_event_id: Some(key.to_string()),
+                    kind,
+                })
+                .expect("append succeeds");
+            i64::try_from(appended.record.position.0).expect("an id")
+        }
+
+        /// A person's input into `session` (`key` its idempotency key).
+        fn input(store: &PostgresStore, session: &str, key: &str, text: &str) -> CommandId {
+            use spawn_core::command::{CommandAction, Submission};
+            use spawn_core::id::{IdempotencyKey, Principal};
+            use spawn_core::port::CommandQueue;
+            store
+                .submit(
+                    &Principal::new("human").expect("principal"),
+                    &Submission {
+                        agent_id: AgentId::new(format!("agent_{session}")).expect("agent"),
+                        session_id: SessionId::new(format!("session_{session}")).expect("session"),
+                        idempotency_key: IdempotencyKey::new(key).expect("key"),
+                        action: CommandAction::Input {
+                            text: text.to_string(),
+                            tags: Vec::new(),
+                        },
+                    },
+                )
+                .expect("submit")
+        }
+
+        /// The Bridge's records of typing `command` into `execution`:
+        /// `message.typed` when the text carried the marker, then `typing`
+        /// and `typed`.
+        fn typed(
+            store: &PostgresStore,
+            session: &str,
+            execution: &str,
+            command: CommandId,
+            marked: bool,
+        ) {
+            use spawn_core::event::CommandStep;
+            let id = command.0;
+            if marked {
+                keyed(
+                    store,
+                    session,
+                    execution,
+                    Source::Bridge,
+                    &format!("cmd_{id}:message"),
+                    EventKind::MessageTyped {
+                        command_id: command,
+                    },
+                );
+            }
+            for (step, name) in [
+                (CommandStep::Typing, "typing"),
+                (CommandStep::Typed, "typed"),
+            ] {
+                keyed(
+                    store,
+                    session,
+                    execution,
+                    Source::Bridge,
+                    &format!("cmd_{id}:{name}"),
+                    EventKind::CommandStepped {
+                        command_id: command,
+                        step,
+                        workspace: None,
+                    },
+                );
+            }
+        }
+
+        /// The transcript's line `line` took `command`.
+        fn taken(store: &PostgresStore, session: &str, execution: &str, line: &str, id: u64) {
+            keyed(
+                store,
+                session,
+                execution,
+                Source::Claude,
+                &format!("{line}:taken:{id}"),
+                EventKind::MessageTaken {
+                    command_id: CommandId(id),
+                },
+            );
+        }
+
+        fn turn_ended(store: &PostgresStore, session: &str, execution: &str, line: &str) -> i64 {
+            keyed(
+                store,
+                session,
+                execution,
+                Source::Claude,
+                line,
+                EventKind::TurnStopped {
+                    input_tokens: None,
+                    output_tokens: None,
+                },
+            )
+        }
+
+        /// A monitor whose messages are due at once.
+        fn prompt_monitor() -> Monitor {
+            let mut settings = super::settings();
+            settings.message_taken_ms = 0;
+            Monitor::with(settings)
+        }
+
+        /// The step's own reading of the messages: the commands after the
+        /// last it saw, its pending messages and its open alerts'.
+        fn read(monitor: &mut Monitor, store: &PostgresStore) -> Vec<Event> {
+            let mut out = Vec::new();
+            let mut lines = Vec::new();
+            let now = store.now_ms().expect("the clock");
+            monitor.read_messages(store, now, &mut out, &mut lines);
+            assert!(lines.is_empty(), "{lines:?}");
+            decided(monitor, out)
+        }
+
+        /// The commands of one session, as an older Spawn and this one left
+        /// them: `old`, typed with no marker before any loop typed markers;
+        /// `answered`, taken twice and answered after its first taking;
+        /// `deaf`, typed and never taken; `untyped`, never typed. All four
+        /// carry the same text.
+        struct Messages {
+            worker: Session,
+            old: CommandId,
+            answered: CommandId,
+            deaf: CommandId,
+            untyped: CommandId,
+            refused: CommandId,
+        }
+
+        const MSG_EXECUTION: &str = "exec_msg_1";
+
+        fn messages_world(store: &PostgresStore) -> Messages {
+            let session = "msg";
+            let mut worker = Session::new(session);
+            let old = input(store, session, "old", "same text");
+            worker.started(store);
+            typed(store, session, MSG_EXECUTION, old, false);
+            store
+                .host_record(&json!({"type": "host.messages_marked", "started_at_ms": 1}))
+                .expect("the first marking loop");
+            finish(store, old, &Outcome::Succeeded);
+            // The first message the transcript holds: from then on the
+            // session's messages are tracked.
+            let answered = input(store, session, "answered", "same text");
+            typed(store, session, MSG_EXECUTION, answered, true);
+            taken(store, session, MSG_EXECUTION, "u1", answered.0);
+            taken(store, session, MSG_EXECUTION, "u1-again", answered.0);
+            turn_ended(store, session, MSG_EXECUTION, "t1");
+            finish(store, answered, &Outcome::Succeeded);
+            // One the Bridge refused before typing it, which a loop sends
+            // again as a new command.
+            let refused = input(store, session, "refused", "same text");
+            finish(
+                store,
+                refused,
+                &Outcome::Failed("pane state Busy does not accept input".to_string()),
+            );
+            let deaf = input(store, session, "deaf", "same text");
+            let untyped = input(store, session, "untyped", "same text");
+            typed(store, session, MSG_EXECUTION, deaf, true);
+            Messages {
+                worker,
+                old,
+                answered,
+                deaf,
+                untyped,
+                refused,
+            }
+        }
+
+        /// Claim `command` (the oldest unfinished one) and finish it.
+        fn finish(store: &PostgresStore, command: CommandId, outcome: &Outcome) {
+            use spawn_core::port::CommandQueue;
+            let claimed = store
+                .claim("tester", std::time::Duration::from_mins(1))
+                .expect("claim")
+                .expect("a command");
+            assert_eq!(claimed.command_id, command);
+            store.finish(&claimed, outcome).expect("finish");
+        }
+
+        /// Each command's message read by its id from the records, by the
+        /// commands API: answered and taken twice; typed and not taken; never
+        /// typed and not taken; an older Spawn's, typed and never not taken.
+        /// The first marking loop's record is written once.
+        #[test]
+        fn each_command_reads_its_message_by_its_id() {
+            in_schema("messages_read", |store| {
+                let world = messages_world(store);
+                let again = store
+                    .host_record(&json!({"type": "host.messages_marked", "started_at_ms": 2}))
+                    .expect("a later loop");
+                let first = store
+                    .host_record(&json!({"type": "host.messages_marked", "started_at_ms": 3}))
+                    .expect("and another");
+                assert_eq!(first, again, "the first record stands");
+                let commands = store
+                    .commands_json("session_msg", 50, 0)
+                    .expect("the commands");
+                let message = |id: CommandId| {
+                    commands
+                        .as_array()
+                        .expect("an array")
+                        .iter()
+                        .find(|command| command["command_id"] == json!(id.0))
+                        .expect("the command")["message"]
+                        .clone()
+                };
+                let answer = message(world.answered);
+                assert_eq!(answer["state"], "answered", "{answer}");
+                assert_eq!(answer["taken"], 2);
+                assert_eq!(answer["not_taken"], false);
+                assert!(answer["typed_at_ms"].as_i64() <= answer["taken_at_ms"].as_i64());
+                assert!(answer["taken_at_ms"].as_i64() <= answer["answered_at_ms"].as_i64());
+                let mut names: Vec<String> = answer
+                    .as_object()
+                    .map(|fields| fields.keys().cloned().collect())
+                    .unwrap_or_default();
+                names.sort_unstable();
+                assert_eq!(
+                    names,
+                    [
+                        "answered_at_ms",
+                        "not_taken",
+                        "state",
+                        "taken",
+                        "taken_at_ms",
+                        "typed_at_ms"
+                    ]
+                );
+                let deaf = message(world.deaf);
+                assert_eq!(
+                    (&deaf["state"], &deaf["not_taken"], &deaf["taken"]),
+                    (&json!("typed"), &json!(true), &json!(0)),
+                    "{deaf}"
+                );
+                assert_eq!(deaf["answered_at_ms"], Value::Null);
+                let never = message(world.untyped);
+                assert_eq!(
+                    (&never["state"], &never["not_taken"], &never["typed_at_ms"]),
+                    (&json!("recorded"), &json!(true), &Value::Null),
+                    "{never}"
+                );
+                let refused = message(world.refused);
+                assert_eq!(
+                    (&refused["state"], &refused["not_taken"]),
+                    (&json!("recorded"), &json!(false)),
+                    "one refused before typing is no message not taken: {refused}"
+                );
+                let older = message(world.old);
+                assert_eq!(
+                    (&older["state"], &older["not_taken"]),
+                    (&json!("typed"), &json!(false)),
+                    "an older Spawn's input is never not taken: {older}"
+                );
+                // Within its bound, none is not taken yet.
+                let patient = store
+                    .commands_json("session_msg", 50, 3_600_000)
+                    .expect("the commands");
+                assert!(
+                    patient
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .all(|command| command["message"]["not_taken"] == false),
+                    "{patient}"
+                );
+            });
+        }
+
+        /// The alert fires for the two not taken (whether typed in its
+        /// evidence), once; the one taken later clears, and the session's
+        /// end clears the other; a fresh step then fires nothing.
+        #[test]
+        fn a_message_not_taken_is_one_alert_until_taken_or_its_session_ends() {
+            in_schema("messages_alert", |store| {
+                let mut world = messages_world(store);
+                let (deaf, untyped) = (world.deaf, world.untyped);
+                let mut monitor = prompt_monitor();
+                let fired = read(&mut monitor, store);
+                assert_eq!(
+                    fires(&fired),
+                    [
+                        format!("message_not_taken:{}", deaf.0),
+                        format!("message_not_taken:{}", untyped.0)
+                    ]
+                );
+                let evidence = |id: CommandId| {
+                    fired
+                        .iter()
+                        .find_map(|event| match event {
+                            Event::Fire {
+                                key,
+                                evidence,
+                                subject,
+                                ..
+                            } if *key == format!("message_not_taken:{}", id.0) => {
+                                Some((subject.clone(), evidence.clone()))
+                            }
+                            _ => None,
+                        })
+                        .expect("its alert")
+                };
+                let (subject, deaf_evidence) = evidence(deaf);
+                assert_eq!(subject, "session_msg");
+                assert_eq!(deaf_evidence["command"], json!(deaf.0));
+                assert_eq!(deaf_evidence["agent_id"], "agent_msg");
+                assert_eq!(deaf_evidence["typed"], true);
+                assert_eq!(evidence(untyped).1["typed"], false);
+                commit(&mut monitor, &fired);
+                assert!(read(&mut monitor, store).is_empty(), "once");
+
+                // The untyped one is typed and taken: its alert clears.
+                typed(store, "msg", MSG_EXECUTION, untyped, true);
+                taken(store, "msg", MSG_EXECUTION, "u2", untyped.0);
+                let cleared = read(&mut monitor, store);
+                assert!(
+                    matches!(&cleared[..], [Event::Clear { key, evidence }]
+                        if *key == format!("message_not_taken:{}", untyped.0)
+                            && evidence["taken"] == 1),
+                    "{cleared:?}"
+                );
+                commit(&mut monitor, &cleared);
+
+                // The session ends with the deaf one untaken: it clears.
+                world.worker.ended(store, EndCause::Stopped);
+                let ended = read(&mut monitor, store);
+                assert!(
+                    matches!(&ended[..], [Event::Clear { key, evidence }]
+                        if *key == format!("message_not_taken:{}", deaf.0)
+                            && evidence["ended"] == true),
+                    "{ended:?}"
+                );
+                commit(&mut monitor, &ended);
+                assert!(read(&mut monitor, store).is_empty());
+                // A fresh step finds nothing to fire for an ended session.
+                assert!(read(&mut prompt_monitor(), store).is_empty());
+            });
+        }
+
+        /// The loop's own pass, twice, the second a restarted loop (a
+        /// session whose transcript held no marker yet tracks nothing): the
+        /// first records the alert of a message never taken, the restarted
+        /// one reads it back on start, fires nothing again, and clears it
+        /// when the message is taken.
+        #[test]
+        fn a_restarted_loop_reads_its_message_alert_back_and_clears_it_once() {
+            in_schema("messages_restart", |store| {
+                let session = "msg_restart";
+                let mut worker = Session::new(session);
+                worker.started(store);
+                let execution = "exec_msg_restart_1";
+                store
+                    .host_record(&json!({"type": "host.messages_marked", "started_at_ms": 1}))
+                    .expect("the first marking loop");
+                // Its task, typed: until the transcript holds a marker, the
+                // session's silence says nothing.
+                let task = input(store, session, "task", "hello");
+                typed(store, session, execution, task, true);
+                let silent = store
+                    .commands_json(&format!("session_{session}"), 10, 0)
+                    .expect("the commands");
+                assert!(
+                    silent
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .all(|command| command["message"]["not_taken"] == false),
+                    "{silent}"
+                );
+                taken(store, session, execution, "u0", task.0);
+                // The next input is tracked, and the engine never takes it.
+                let deaf = input(store, session, "deaf", "hello");
+                typed(store, session, execution, deaf, true);
+                let key = format!("message_not_taken:{}", deaf.0);
+                let rows = |store: &PostgresStore| {
+                    store.alert_rows().expect("the alerts")["rows"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|row| row["key"] == json!(key))
+                        .map(|row| row["state"].as_str().unwrap_or_default().to_string())
+                        .collect::<Vec<_>>()
+                };
+
+                let mut first = prompt_monitor();
+                first.check(store).expect("a pass");
+                assert_eq!(rows(store), ["open"]);
+
+                let mut restarted = prompt_monitor();
+                restarted.check(store).expect("a restarted pass");
+                assert!(restarted.is_open(&key), "read back on start");
+                assert_eq!(rows(store), ["open"], "not fired again");
+
+                taken(store, session, execution, "u1", deaf.0);
+                restarted.next_reading_ms = 0;
+                restarted.check(store).expect("a pass");
+                assert_eq!(rows(store), ["cleared"]);
+                restarted.next_reading_ms = 0;
+                restarted.check(store).expect("a pass");
+                assert_eq!(rows(store), ["cleared"], "cleared once");
             });
         }
     }
