@@ -615,8 +615,10 @@ impl History {
                 });
             }
             if command.succeeded == Some(false) {
+                // At its finish: the failure is recorded then, not when the
+                // command was created.
                 marks.push(Mark {
-                    at,
+                    at: command.finished_at_ms.unwrap_or(at),
                     mission,
                     kind: Kind::FailedCommand,
                 });

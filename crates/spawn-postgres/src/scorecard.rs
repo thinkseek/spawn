@@ -71,13 +71,19 @@ select jsonb_build_object(
              'session_id', c.session_id,
              'action', c.action ->> 'type',
              'created_at_ms', c.created_at_ms,
-             'finished_at_ms', c.finished_at_ms,
-             'succeeded', c.succeeded,
-             'error', case when c.succeeded is false and c.principal = 'spawn-dispatch'
+             'finished_at_ms', r.finished_at_ms,
+             'succeeded', r.succeeded,
+             'error', case when r.succeeded is false and c.principal = 'spawn-dispatch'
                                 and c.idempotency_key like 'deliver-%' then c.error end,
              'stalls', t.stalls))
              order by c.id), '[]'::jsonb)
       from spawn_commands c
+     -- A command's result is a fact of the moment it finished: one that
+     -- finished at or after `$1` is unfinished in these facts, so the same
+     -- `$1` answers the same rows whenever it is asked.
+     cross join lateral (
+       select case when c.finished_at_ms < $1 then c.finished_at_ms end as finished_at_ms,
+              case when c.finished_at_ms < $1 then c.succeeded end as succeeded) r
      cross join lateral (
        select case when c.principal = 'spawn-dispatch' and c.action ->> 'type' = 'input'
                         and jsonb_typeof(c.action -> 'tags') = 'array'
@@ -87,7 +93,7 @@ select jsonb_build_object(
                           where g.tag ~ '(^| )stall-[0-9]+-[a-z_]+-[0-9]+$') end as stalls) t
      where c.created_at_ms < $1
        and (c.principal in ('human', 'spawn')
-            or c.succeeded is false
+            or r.succeeded is false
             or (c.principal = 'spawn-dispatch'
                 and (c.idempotency_key like 'deliver-%' or t.stalls is not null)))))";
 
@@ -104,6 +110,9 @@ impl PostgresStore {
     /// one, the dispatcher's deliveries (`deliver-<task>-<revision>` and their
     /// retries; `error` only on a failed one) and its digests that carry a
     /// stall tag (`stalls`: those tags, `<session> stall-<task>-<step>-<n>`).
+    /// A command is in them from its creation and its result (`succeeded`,
+    /// `finished_at_ms`, `error`) from its finish: one created before
+    /// `until_ms` that finished later is unfinished here.
     pub fn scorecard_facts(&self, until_ms: i64) -> Result<Value, StoreError> {
         self.query_json(FACTS, &[&until_ms])
     }
