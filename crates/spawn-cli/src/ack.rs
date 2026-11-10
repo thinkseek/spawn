@@ -307,6 +307,25 @@ pub(crate) fn report_answers(store: &PostgresStore, first: bool, now_ms: i64) ->
     lines
 }
 
+/// Whether this process has looked at every report for an unanswered
+/// delivery once ([`report_answers`]); later passes look at the last day's.
+static REPORTS_ANSWERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// One dispatcher pass's answers: the acks waiting in the workspaces under
+/// `root` ([`collect`]; none without a root) and the reports' answers to
+/// their deliveries ([`report_answers`]), each recorded once. Log lines.
+pub(crate) fn answers(
+    store: &PostgresStore,
+    rows: &[Facts],
+    root: Option<&Path>,
+    now_ms: i64,
+) -> Vec<String> {
+    let mut lines = root.map_or_else(Vec::new, |root| collect(store, rows, root));
+    let first = !REPORTS_ANSWERED.swap(true, std::sync::atomic::Ordering::Relaxed);
+    lines.extend(report_answers(store, first, now_ms));
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
