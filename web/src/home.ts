@@ -304,6 +304,7 @@ const ALERT_TITLES: Record<string, string> = {
   backup_stale: "A backup is late",
   source_away: "A mission's source is not a directory on this host",
   validator_defect: "A validator fails on main too",
+  message_not_taken: "A message was not taken",
 };
 
 export function alertTitle(alert: Pick<Alert, "kind" | "subject">, named: string | null = null): string {
