@@ -4960,6 +4960,8 @@ connections\n";
                 assert_eq!(
                     names,
                     [
+                        "acted",
+                        "acted_at_ms",
                         "answered_at_ms",
                         "not_taken",
                         "state",
@@ -4968,6 +4970,7 @@ connections\n";
                         "typed_at_ms"
                     ]
                 );
+                assert_eq!(answer["acted"], Value::Null, "never acked: {answer}");
                 let deaf = message(world.deaf);
                 assert_eq!(
                     (&deaf["state"], &deaf["not_taken"], &deaf["taken"]),
