@@ -8,12 +8,15 @@ import { test } from "node:test";
 import {
   MAX_INPUT_TEXT,
   commandState,
+  keepsKey,
   newKey,
   probeVerdict,
   progress,
   sendAnswer,
+  serialPoll,
   settled,
   textProblem,
+  withOutcomes,
   withSent,
 } from "../src/input.ts";
 import type { CommandState, Sent } from "../src/input.ts";
@@ -144,4 +147,86 @@ test("a command listed by an older server reads as not waiting", () => {
   });
   assert.equal(commandState({ command_id: 3, waiting: true }).waiting, true);
   assert.equal(commandState(null).command_id, null);
+});
+
+// GitHub #16 item 8. The commands read are the session's latest few; a
+// message typed long ago is no longer among them.
+test("a typed message stays typed when newer commands push its own off the list", () => {
+  const typed = command({ state: "finished", succeeded: true, finished_at_ms: 9 });
+  const newer = Array.from({ length: 20 }, (_, index) => command({ command_id: 2000 + index }));
+  let list = withOutcomes([sent()], [typed]);
+  assert.deepEqual(progress(list[0], [typed]), { stage: "typed", command_id: 1950, at_ms: 9 });
+  const later = progress(list[0], newer);
+  assert.deepEqual(later, { stage: "typed", command_id: 1950, at_ms: 9 }, "not queued again");
+  assert.equal(settled(later), true, "the box stops reading");
+
+  const failed = command({ state: "finished", succeeded: false, error: "no execution" });
+  list = withOutcomes([sent()], [failed]);
+  assert.deepEqual(progress(list[0], newer), { stage: "failed", command_id: 1950, error: "no execution" });
+
+  // Nothing ended: the same array (no new render), and nothing recorded.
+  const open = [sent(), sent({ key: "b", command_id: null })];
+  assert.equal(withOutcomes(open, [command({ waiting: true })]), open);
+  assert.equal(withOutcomes(open, null), open);
+  assert.equal(withOutcomes(list, newer), list, "recorded once");
+  // A command never seen to end and not listed is still queued, and a
+  // listing wins over what was recorded.
+  assert.deepEqual(progress(sent(), newer), { stage: "queued", command_id: 1950 });
+  assert.equal(progress(list[0], [typed]).stage, "typed");
+  // A resend (the same key) starts over.
+  assert.equal(withSent(list, sent({ command_id: null }))[0].outcome, undefined);
+});
+
+test("readings never overlap, and one that was superseded is dropped", async () => {
+  const taken: string[] = [];
+  const asked: { answer: (value: string) => void; fail: () => void; signal: AbortSignal }[] = [];
+  const read = (signal: AbortSignal) =>
+    new Promise<string>((resolve, reject) => {
+      asked.push({ answer: resolve, fail: () => reject(new Error("HTTP 500")), signal });
+    });
+  const poll = serialPoll(read, (value: string) => taken.push(value));
+  const first = poll.tick();
+  // The server is slow: five more ticks pass before it answers.
+  await Promise.all([poll.tick(), poll.tick(), poll.tick(), poll.tick(), poll.tick()]);
+  assert.equal(asked.length, 1, "one request out at a time");
+  asked[0].answer("first");
+  await first;
+  assert.deepEqual(taken, ["first"]);
+
+  // A failed reading keeps the last one, and the next tick reads again.
+  const second = poll.tick();
+  asked[1].fail();
+  await second;
+  assert.deepEqual(taken, ["first"]);
+  const third = poll.tick();
+  asked[2].answer("third");
+  await third;
+  assert.deepEqual(taken, ["first", "third"]);
+
+  // Stopped while a request is out (the box reads another session now):
+  // its answer is not taken, its request is aborted, and it reads no more.
+  const late = poll.tick();
+  poll.stop();
+  assert.equal(asked[3].signal.aborted, true);
+  asked[3].answer("late");
+  await late;
+  await poll.tick();
+  assert.deepEqual(taken, ["first", "third"]);
+  assert.equal(asked.length, 4);
+});
+
+test("a key the server holds for another message is not sent again", () => {
+  assert.equal(keepsKey(null), true, "not reached: the same key, so it types once");
+  assert.equal(keepsKey(500), true);
+  assert.equal(keepsKey(403), true);
+  assert.equal(keepsKey(409), false);
+  assert.match(
+    (() => {
+      const answer = sendAnswer(409, {
+        error: "idempotency key 'k' was already used for another input or key: send this one with a new key",
+      });
+      return answer.ok ? "" : answer.error;
+    })(),
+    /already used for another input/,
+  );
 });
