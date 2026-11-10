@@ -13530,7 +13530,7 @@ mod database_tests {
         let mission = db.gated_mission(&source, &scenarios);
         let one = db.reported_task(mission, "w1");
         push_work(&base, &source, &agent_of(&db, mission, one), "one.txt");
-        let digest_one = crate::gate::scenarios_sha256(&scenarios).expect("a digest");
+        let digest_one = super::inputs::scenarios_sha256(&scenarios).expect("a digest");
         integrator.pass_on(&db.store).expect("a pass");
         integrator.settle();
         let rejected = last_gated(&db);
@@ -13544,7 +13544,7 @@ mod database_tests {
         assert_eq!(rejected["inputs"]["controller"], first);
         assert_eq!(rejected["inputs"]["scenarios_sha256"], digest_one.as_str());
         assert!(rejected["inputs"]["scenario"].is_null(), "{rejected}");
-        assert_eq!(rejected["env"]["host"], json!(crate::gate::host_name()));
+        assert_eq!(rejected["env"]["host"], json!(super::inputs::host_name()));
         assert_eq!(rejected["env"]["toolchain"], "rustc 1.95.0-test");
         assert!(rejected["env"]["runner"].is_null(), "{rejected}");
         assert!(
@@ -13555,7 +13555,7 @@ mod database_tests {
         // Between the runs: the marker names another commit, a file joins.
         std::fs::write(base.join("ctl/.controller"), format!("{second}\n")).expect("the marker");
         std::fs::write(scenarios.join("check-two.sh"), "exit 0\n").expect("another check");
-        let digest_two = crate::gate::scenarios_sha256(&scenarios).expect("a digest");
+        let digest_two = super::inputs::scenarios_sha256(&scenarios).expect("a digest");
         assert_ne!(digest_two, digest_one);
         let two = db.reported_task(mission, "w2");
         push_work(&base, &source, &agent_of(&db, mission, two), "two.txt");
@@ -13581,7 +13581,7 @@ mod database_tests {
             aborted["env"]["toolchain"].is_null(),
             "printed none: {aborted}"
         );
-        assert_eq!(aborted["env"]["host"], json!(crate::gate::host_name()));
+        assert_eq!(aborted["env"]["host"], json!(super::inputs::host_name()));
         let after = gated(&db, mission);
         assert_eq!((after.gate_rejections, after.gate_aborts), (1, 1));
 
@@ -13592,7 +13592,8 @@ mod database_tests {
                 Some(text) => std::fs::write(base.join("ctl/.controller"), text).expect("write"),
             }
             assert_eq!(
-                crate::gate::controller_commit(&scenarios),
+                super::inputs::controller_of(&scenarios)
+                    .and_then(|dir| super::inputs::controller_commit(&dir)),
                 None,
                 "{marker:?}"
             );
@@ -13673,7 +13674,7 @@ mod database_tests {
         super::record(
             &db.store,
             &json!({"type": "task.gated", "id": task, "revision": 0, "verdict": "stale",
-                    "reason": "behind", "inputs": crate::inputs::known(Some(&main), None),
+                    "reason": "behind", "inputs": super::inputs::known(Some(&main), None),
                     "env": null}),
         )
         .expect("recorded");
