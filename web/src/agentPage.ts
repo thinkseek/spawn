@@ -117,3 +117,49 @@ export function forHowLong(since: number | null, now: number): string | null {
   if (hours < 48) return `for ${hours} h`;
   return `for ${Math.floor(hours / 24)} d`;
 }
+
+/** What a held task reads as in the summary when the agent has no input of
+ * a person's (`task`): "T247 · Cost you can see", its title alone when no
+ * task id is known, null when there is none. `held` is the task the agent's
+ * name goes by (home.ts `nameTask`); `taskTitle` is /api/fleet's
+ * `task_title`, which a worker carries even before /api/missions answers. */
+export function taskLine(
+  held: { task_id: number | null; title: string | null } | null,
+  taskTitle: string | null,
+): string | null {
+  const title = (held?.title ?? taskTitle ?? "").trim() || null;
+  const id = held?.task_id ?? null;
+  if (id === null) return title;
+  return title ? `T${id} · ${title}` : `T${id}`;
+}
+
+/** What the summary leads with: the person's input the agent holds
+ * (/api/fleet `task`, a resident's or the supervisor's note), else the task
+ * it works on ([`taskLine`]), else nothing ("No task recorded."). A worker
+ * has no input: its `task` is null or empty, its task is `task_title`. */
+export function summaryTask(
+  agent: { task: string | null; task_title: string | null },
+  held: { task_id: number | null; title: string | null } | null,
+): { input: string } | { task: string } | null {
+  if (agent.task && agent.task.trim() !== "") return { input: agent.task };
+  const line = taskLine(held, agent.task_title);
+  return line ? { task: line } : null;
+}
+
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** A history time, in local time: `clock`'s alone on `now`'s day, with its
+ * weekday within the last six days ("Mon 18:43:20"), with its date before
+ * that ("Nov 3 18:43:20"), so a history across midnight reads in order.
+ * `clock` formats the time of day (format.ts `clockTime`). */
+export function historyClock(ms: number | null, now: number, clock: (ms: number | null) => string): string {
+  if (ms === null || !Number.isFinite(ms)) return clock(ms);
+  const at = new Date(ms);
+  const today = new Date(now);
+  const startOf = (date: Date) => new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  const days = Math.round((startOf(today) - startOf(at)) / 86_400_000);
+  if (days === 0) return clock(ms);
+  if (days > 0 && days < 7) return `${WEEKDAYS[at.getDay()]} ${clock(ms)}`;
+  return `${MONTHS[at.getMonth()]} ${at.getDate()} ${clock(ms)}`;
+}
