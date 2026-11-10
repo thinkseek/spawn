@@ -13436,28 +13436,31 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A push the pusher has not caught up with is `stale`: nothing was
-    /// judged, so no environment, and the inputs say only what is known.
+    /// A `stale` verdict judged nothing: its record, as the integrator
+    /// writes it ([`super::record`]), has no environment and says only what
+    /// is known; the store takes it and its class.
     #[test]
     fn a_stale_verdict_has_no_environment() {
-        let (base, source, _, mut integrator) = world("binding-stale", NOTING_GATE);
+        let (base, source, _, _) = world("binding-stale", NOTING_GATE);
         let scenarios = controller_tree(&base, "0123456789abcdef0123456789abcdef01234567");
         let db = Db::new("binding_stale");
         let mission = db.gated_mission(&source, &scenarios);
         let task = db.reported_task(mission, "w");
-        // Reported, but the agent's branch was never pushed: nothing to
-        // land is a rejection, so push one and then move main under it
-        // in the record's view by recording the landing stale directly.
-        let _ = (task, &mut integrator);
-        let record = super::bound(&json!({"type": "task.gated", "id": task, "revision": 0,
-            "verdict": "stale", "reason": "behind",
-            "inputs": crate::gate::known_inputs(Some(&source_main(&source)), None), "env": null}));
-        db.record(&record);
+        let main = source_main(&source);
+        super::record(
+            &db.store,
+            &json!({"type": "task.gated", "id": task, "revision": 0, "verdict": "stale",
+                    "reason": "behind", "inputs": crate::gate::known_inputs(Some(&main), None),
+                    "env": null}),
+        )
+        .expect("recorded");
         let stored = last_gated(&db);
         assert_eq!(stored["class"], "superseded");
         assert!(stored["env"].is_null() && stored.get("env").is_some(), "{stored}");
-        assert_eq!(stored["inputs"]["base"], source_main(&source).as_str());
-        assert!(stored["inputs"]["controller"].is_null(), "{stored}");
+        assert_eq!(stored["inputs"]["base"], main.as_str());
+        for name in ["candidate", "controller", "scenarios_sha256", "scenario"] {
+            assert!(stored["inputs"][name].is_null(), "{name}: {stored}");
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
