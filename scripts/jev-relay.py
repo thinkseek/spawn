@@ -14,12 +14,21 @@ Environment:
   TYPESAFE_BASE_URL     default https://api.typesafe.ai
   JEV_RELAY_ADDRESS     default 127.0.0.1:8790; a bare port (":8790" or
                         "8790") means host 127.0.0.1
+  JEV_RELAY_TIMEOUT_SECS  default 12: the whole hosted call, connect to the
+                        last byte; past it the relay answers 502 itself. It
+                        stays under the judge client's timeout (spawn-jev
+                        `JevConfig`, 15 s), so the client reads that 502
+                        and its reason instead of hanging up first (which
+                        left every 502 a BrokenPipe in this log). Measured
+                        2026-11-07..10: 500 answers, p99 3.5 s, max 8.5 s.
   https_proxy           honored; the hosted API answers 451 from some regions
 """
 
 import json
 import os
+import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -31,9 +40,93 @@ HOST, _, PORT = os.environ.get("JEV_RELAY_ADDRESS", "127.0.0.1:8790").rpartition
 # An empty host would bind every interface; a bare port means loopback.
 HOST = HOST or "127.0.0.1"
 PATH = "/v1/systemone"
-TIMEOUT = 20
+DEFAULT_TIMEOUT_SECS = 12
+
+
+def timeout_from(text):
+    """JEV_RELAY_TIMEOUT_SECS as seconds (1 to 300), or None when it is not
+    one: the relay then refuses to start rather than guess."""
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    return value if 1 <= value <= 300 else None
+
+
+TIMEOUT = timeout_from(os.environ.get("JEV_RELAY_TIMEOUT_SECS", str(DEFAULT_TIMEOUT_SECS)))
+# How much of an error's text the log keeps, on one line.
+ERROR_CHARS = 300
 # A judgement request is a few kilobytes of evidence; refuse anything larger.
 MAX_BODY = 256 * 1024
+
+
+def error_text(payload):
+    """An error's text for the log: one line, at most ERROR_CHARS, with the
+    key and any bearer token taken out. Never a header: only the body or
+    the exception's own words reach it."""
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8", "replace")
+    text = " ".join(str(payload).split())
+    if KEY:
+        text = text.replace(KEY, "[key]")
+    text = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", text)
+    return text[:ERROR_CHARS]
+
+
+def forward(body):
+    """POST `body` to the hosted API: (status, payload, error), `error` the
+    reason of a failure the relay itself answers 502 for, else None."""
+    request = urllib.request.Request(
+        BASE + PATH,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {KEY}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            return response.status, response.read(), None
+    except urllib.error.HTTPError as error:
+        # Its status stands even when its body cannot be read (cut short,
+        # reset, timed out): the reason then says so.
+        try:
+            return error.code, error.read(), None
+        except Exception as cut:  # noqa: BLE001 - any failure of that read
+            reason = (
+                f"relay: the hosted API answered {error.code} and its body could not be read "
+                f"({error_text(cut) or type(cut).__name__})"
+            )
+            return error.code, json.dumps({"error": reason}).encode(), reason
+    except Exception as error:  # network, TLS, a socket timeout
+        reason = f"relay: {error_text(error) or type(error).__name__}"
+        return 502, json.dumps({"error": reason}).encode(), reason
+
+
+def forward_caught(body):
+    """forward(), whatever it raises: a worker that died would leave call()
+    to report the deadline, a false reason, at once."""
+    try:
+        return forward(body)
+    except Exception as error:  # noqa: BLE001 - the worker must always answer
+        reason = f"relay: {type(error).__name__}: {error_text(error)}"
+        return 502, json.dumps({"error": reason}).encode(), reason
+
+
+def call(body):
+    """forward() within TIMEOUT for the whole call. urlopen's timeout bounds
+    each socket operation, so an upstream that sends a byte now and then
+    could hold the relay far longer; past the deadline the relay answers
+    502 and leaves the call to end on its own (a daemon thread)."""
+    result = []
+    worker = threading.Thread(target=lambda: result.append(forward_caught(body)), daemon=True)
+    worker.start()
+    worker.join(TIMEOUT)
+    if result:
+        return result[0]
+    reason = f"relay: the hosted API did not answer within {TIMEOUT:g} s"
+    return 502, json.dumps({"error": reason}).encode(), reason
 
 
 class Relay(BaseHTTPRequestHandler):
@@ -69,27 +162,21 @@ class Relay(BaseHTTPRequestHandler):
         if len(body) != length:
             self._reply(400, b'{"error":"body is shorter than Content-Length"}')
             return
-        request = urllib.request.Request(
-            BASE + PATH,
-            data=body,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {KEY}",
-            },
-        )
         started = time.monotonic()
-        try:
-            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-                status, payload = response.status, response.read()
-        except urllib.error.HTTPError as error:
-            status, payload = error.code, error.read()
-        except Exception as error:  # network, TLS, timeout
-            status = 502
-            payload = json.dumps({"error": f"relay: {error}"}).encode()
+        status, payload, reason = call(body)
         elapsed = (time.monotonic() - started) * 1000
-        sys.stderr.write(f"jev-relay: {status} {elapsed:.0f}ms {len(body)}B\n")
-        self._reply(status, payload)
+        line = f"jev-relay: {status} {elapsed:.0f}ms {len(body)}B"
+        if status >= 400:
+            # Every failure says why: the relay's own reason, or the hosted
+            # API's answer (its body, never its headers).
+            line += f": {reason or error_text(payload) or '(no body)'}"
+        sys.stderr.write(line + "\n")
+        try:
+            self._reply(status, payload)
+        except (BrokenPipeError, ConnectionResetError):
+            sys.stderr.write(
+                f"jev-relay: the client hung up before the {status} after {elapsed:.0f}ms\n"
+            )
 
     def log_message(self, *_args):
         pass
@@ -113,11 +200,15 @@ def main():
     not_dumpable()  # its environment holds the key
     if not KEY:
         sys.exit("jev-relay: TYPESAFE_API_KEY is not set")
+    if TIMEOUT is None:
+        sys.exit("jev-relay: JEV_RELAY_TIMEOUT_SECS must be a number of seconds from 1 to 300")
     # Whoever reaches the relay spends the key, so it serves loopback only.
     if HOST not in ("127.0.0.1", "::1", "[::1]", "localhost"):
         sys.exit(f"jev-relay: refusing to listen on {HOST}; use 127.0.0.1")
     server = ThreadingHTTPServer((HOST, int(PORT)), Relay)
-    sys.stderr.write(f"jev-relay: http://{HOST}:{PORT}{PATH} -> {BASE}{PATH}\n")
+    sys.stderr.write(
+        f"jev-relay: http://{HOST}:{PORT}{PATH} -> {BASE}{PATH} (timeout {TIMEOUT:g} s)\n"
+    )
     server.serve_forever()
 
 

@@ -168,18 +168,28 @@ pub fn parse_reply(body: &str) -> Result<Judgement, JudgeError> {
 pub struct JevConfig {
     /// Base URL, without a trailing slash.
     pub base_url: String,
-    /// Whole request timeout.
+    /// The timeout of each connect, write and read
+    /// ([`JevConfig::DEFAULT_TIMEOUT`] unless set).
     pub timeout: Duration,
     /// Model named in every request.
     pub model: String,
 }
 
 impl JevConfig {
+    /// The client's timeout: longer than the relay's whole call
+    /// (`scripts/jev-relay.py`, `DEFAULT_TIMEOUT_SECS`, 12 s), so a relay that
+    /// gives up on the hosted API answers 502 with its reason before this
+    /// client stops reading. With 10 s here and 20 s there, the client hung
+    /// up first and every 502 ended as a BrokenPipe in the relay's log, its
+    /// reason lost (2026-11-07..10: 309 of 349). The relay's slowest
+    /// answer then was 8.5 s.
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+
     /// Configuration for one base URL.
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            timeout: Duration::from_secs(10),
+            timeout: Self::DEFAULT_TIMEOUT,
             model: DEFAULT_MODEL.to_string(),
         }
     }
