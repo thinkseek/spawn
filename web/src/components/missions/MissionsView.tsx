@@ -122,7 +122,7 @@ export function MissionsBody({ data }: { data: Missions }) {
           </div>
         )}
         {/* A held source is one line on its mission's row; home's "Needs
-            you" carries it when it is near expiry or a task waits. */}
+            you" carries it while a task waits behind it. */}
         {data.missions.length === 0 ? (
           <div className="flex flex-col">
             <div className="px-4 pt-2 sm:px-5">{toggle}</div>

@@ -12,6 +12,7 @@ import {
   filterLanes,
   hasBars,
   holdText,
+  holdTitle,
   isLive,
   laneLifetimeText,
   laneToday,
@@ -51,6 +52,7 @@ import {
 } from "../timeaxis/TimeAxis";
 import {
   useDragPan,
+  useNowEvery,
   useNowWhile,
   useTimeWindow,
   useWheelZoom,
@@ -153,6 +155,10 @@ export function MissionTimeline({
   const all = useMemo(() => deriveMissionTimeline(missions, Date.now(), reasons), [missions, reasons]);
   const live = isLive(all);
   const now = useNowWhile(live);
+  // The headers' words ("in 24 h", "2 h ago", "expires in") age on a quiet
+  // page too: their own clock ticks each minute whether or not a bar is open.
+  const minute = useNowEvery(60_000);
+  const clock = Math.max(now, minute);
   // Ordering and extent depend on now only through open bars.
   const timeline = useMemo(
     () => (all.openCount > 0 ? deriveMissionTimeline(missions, now, reasons) : all),
@@ -748,7 +754,7 @@ export function MissionTimeline({
                         <LaneLabel
                           key={row.key}
                           row={row}
-                          now={now}
+                          now={clock}
                           hold={holds.find((hold) => hold.hold === row.lane.mission.hold) ?? null}
                           collapsed={row.folded}
                           onToggle={() => toggleFold(row.key, row.folded)}
@@ -1100,7 +1106,7 @@ function LaneLabel({
           {today}
         </span>
         {hold && (
-          <span className="flex shrink-0 items-center gap-1 text-caption text-warning" title={hold.reason ? `${holdText(hold, now)}: ${hold.reason}` : holdText(hold, now)}>
+          <span className="flex shrink-0 items-center gap-1 text-caption text-warning" title={holdTitle(hold, now)}>
             <Lock size={11} aria-hidden="true" />
             {holdText(hold, now)}
           </span>

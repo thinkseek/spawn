@@ -7,6 +7,7 @@ import {
   earlierLabel,
   groupEnd,
   holdText,
+  holdTitle,
   laneLifetimeText,
   laneToday,
   laneTodayText,
@@ -523,10 +524,10 @@ test("a mission's header says its day: in flight, landed today, the last send-ba
   const today = laneToday(lane, now);
   assert.deepEqual([today.inFlight, today.landed], [2, 2], "T5 landed yesterday");
   assert.equal(today.lastBack?.task, "T2", "T5's conflict is yesterday's");
-  assert.equal(laneTodayText(today, now), "2 in flight · 2 landed today · last rejected 2 h ago (T2): 051.sh fails on the candidate");
-  assert.equal(laneTodayText(laneToday({ bars: [dayBar("T5", "landed", now - 25 * 60 * MIN)] }, now), now), "nothing landed today");
+  assert.equal(laneTodayText(today, now), "2 in flight · 2 landed in 24 h · last rejected 2 h ago (T2): 051.sh fails on the candidate");
+  assert.equal(laneTodayText(laneToday({ bars: [dayBar("T5", "landed", now - 25 * 60 * MIN)] }, now), now), "nothing landed in 24 h");
   const long = laneToday({ bars: [dayBar("T7", "open", null, [{ at: now - 5 * MIN, verdict: "incompatible", sentBack: true, reason: `${"x".repeat(150)}\nthe log` }])] }, now);
-  assert.equal(laneTodayText(long, now), `1 in flight · nothing landed today · last incompatible 5 min ago (T7): ${"x".repeat(99)}…`, "a long reason: its first line, clipped");
+  assert.equal(laneTodayText(long, now), `1 in flight · nothing landed in 24 h · last incompatible 5 min ago (T7): ${"x".repeat(99)}…`, "a long reason: its first line, clipped");
   const old = laneToday({ bars: [dayBar("T5", "landed", now - 25 * 60 * MIN, [{ at: now - 26 * 60 * MIN, verdict: "conflict", sentBack: true }])] }, now);
   assert.equal(old.lastBack, null, "a send-back from yesterday is not today's");
   const two = laneToday({ bars: [
@@ -535,7 +536,7 @@ test("a mission's header says its day: in flight, landed today, the last send-ba
   ] }, now);
   assert.equal(two.lastBack?.task, "T9", "the latest send-back, wherever its bar sits");
   const lines = laneToday({ bars: [dayBar("T10", "open", null, [{ at: now - MIN, verdict: "rejected", sentBack: true, reason: "  short line \nsecond line" }])] }, now);
-  assert.equal(laneTodayText(lines, now), "1 in flight · nothing landed today · last rejected 1 min ago (T10): short line", "only the reason's first line");
+  assert.equal(laneTodayText(lines, now), "1 in flight · nothing landed in 24 h · last rejected 1 min ago (T10): short line", "only the reason's first line");
 });
 
 test("the lifetime totals and a held source read as words", () => {
@@ -545,4 +546,11 @@ test("the lifetime totals and a held source read as words", () => {
   assert.equal(holdText({ expires_ms: now + 145 * MIN, waiting: [221] }, now), "source held · expires in 2 h · 1 task waiting");
   assert.equal(holdText({ expires_ms: now - MIN, waiting: [] }, now), "source held · expired");
   assert.equal(holdText({ expires_ms: null, waiting: [1, 2] }, now), "source held · 2 tasks waiting");
+});
+
+test("a held source's title keeps what the card showed: reason, who took it and when, its main", () => {
+  const now = T0;
+  const hold = { expires_ms: now + 145 * MIN, waiting: [221, 222], reason: "release freeze", by: "human", held_at_ms: now - 60 * MIN, main: "0123456789abcdef0123" };
+  assert.equal(holdTitle(hold, now), "source held · expires in 2 h · 2 tasks waiting\nrelease freeze\ntaken by human 1 h ago at main 0123456789ab\nwaiting: T221, T222");
+  assert.equal(holdTitle({ ...hold, reason: null, by: null, held_at_ms: null, main: null, waiting: [] }, now), "source held · expires in 2 h");
 });
