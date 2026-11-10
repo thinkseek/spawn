@@ -12,7 +12,13 @@
 //! '{"type":"input","text":...}'` makes, with the same idempotency rule, so
 //! a retried POST types once; like every person's input it waits for the
 //! session's turn. It answers 202 with the command, which
-//! `/api/fleet/<id>/commands` then follows. It runs as the `spawn_human`
+//! `/api/fleet/<id>/commands` then follows. A session no agent has used is
+//! 404; one that runs no execution (it never ran one, or its latest ended)
+//! is 409 with the reason ("<session> runs no execution: an input needs a
+//! running engine; resume the session"), and no command is made, so the
+//! person learns at once that nothing would read it (objective 040; `spawn
+//! submit` still records such an input, which the Bridge fails with the
+//! same words). It runs as the `spawn_human`
 //! login, whose rights are `spawn_human_input` and `spawn_human_key`
 //! (crates/spawn-postgres/sql/schema.sql): it submits no other action, reads
 //! nothing and appends no event. `{"probe": true}` in place of a text passes
