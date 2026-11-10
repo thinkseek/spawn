@@ -78,6 +78,24 @@
 #   whole dependency graph"): the same fact with the scenario
 #   `dependencies`, any objective's; the candidate is never rejected for a
 #   graph its base cannot resolve here either.
+# - and one is asked before anything runs: a prerequisite a scenario or check
+#   declares (`# needs: ...`) that the sandbox does not show ("Preflight"
+#   below): the same fact, with the scenario that declared it and the
+#   `prerequisite` it lacks.
+#
+# Preflight. A scenario or check says what it needs of the host on lines
+# `# needs: <prerequisite> ...`, which the gate reads without running it:
+# `controller:<path>` (a path under the controller's checkout, a trailing
+# `/` for a directory), `tool:<name>` (a program on PATH) or an absolute
+# path. The gate asks for all of them in one sandbox, the view every
+# scenario gets, after the static checks and before the base's build or any
+# scenario: one that is missing ends the gate at once, exit 6 with
+# {"cannot_judge":true,"scenario":"<name>","prerequisite":"<what>"}, where
+# the scenario itself would have failed for it only when its turn came (an
+# owner gate, 2026-11-10: check-web.sh found no node_modules in 11 ms, 55
+# minutes in). Only what the host owes the scenario is declared: a file the
+# tree under test may lack is that tree's result, never a prerequisite
+# (036's dispatcher files: a tree without them is unsolved).
 #
 # Exit-code contract for objective scenarios and the task scenario: 0 =
 # pass, 1 = an assertion failed, 6 = the host cannot judge it here (below: "A
@@ -639,18 +657,21 @@ shared_failed() {
     [ -s "$3" ]
 }
 
-# cannot_judge <scenario> <runs>: the scenario says this host cannot judge it
-# here (029: no systemd user manager in the sandbox), so the gate states that
-# as the fact and exits 6, no verdict: `{"cannot_judge":true,"scenario",
-# "runs","base","candidate"}`. Exit 6 is the host-fault exit too; the fact's
-# key says which one this is (gate.rs `cannot_judge`, `host_fault`), and the
-# integrator records the evidence `cannot_judge` for it.
+# cannot_judge <scenario> <runs> [<prerequisite>]: the scenario says this
+# host cannot judge it here (029: no systemd user manager in the sandbox),
+# or the host lacks a <prerequisite> it declares ("Preflight"), so the gate
+# states that as the fact and exits 6, no verdict: `{"cannot_judge":true,
+# "scenario","runs"[,"prerequisite"],"base","candidate"}`. Exit 6 is the
+# host-fault exit too; the fact's key says which one this is (gate.rs
+# `cannot_judge`, `host_fault`), and the integrator records the evidence
+# `cannot_judge` for it.
 cannot_judge() {
     stage_close cannot_judge
     gate_times
     stage_emit gate cannot_judge "$(($(stage_now) - gate_started))" total
     json="{\"cannot_judge\":true,\"scenario\":\"$(json_string "$1")\""
     json="$json,\"runs\":\"$(json_string "$2")\""
+    [ -z "${3-}" ] || json="$json,\"prerequisite\":\"$(json_string "$3")\""
     # The check main was red on (SPAWN_GATE_BASE_CHECK), when it passed on
     # this base before any candidate code ran: main is green on it again,
     # whatever this gate ends with (gate.rs reads it from any fact).
@@ -3051,6 +3072,90 @@ objective_key() {
 not_a_regression() {
     grep -qE '^# rsi: (ratchet|task-only)' "$1"
 }
+
+# Preflight (see the header). declared <word> <file>: the words of the
+# file's `# <word>: ...` lines, one per line. A comment, so the gate reads
+# it and never runs the file; anywhere in it, like `# rsi: ratchet`.
+declared() {
+    sed -n "s/^# $1:[[:space:]]*//p" "$2" | tr -s ' \t' '\n\n' | grep . || true
+}
+# Every scenario this gate would run (a warm: the objectives alone), with
+# what it declares: `<scenario> <prerequisite>` a line. A word that is none
+# of the three forms is the owner's to correct (exit 3), like a `bind` line
+# that names no directory: the gate does not guess what was meant.
+: >"$work/needs"
+if [ -z "$base_keys_only" ]; then
+    for needy in ${scenario:+"$scenario"} "$scenarios"/*.sh; do
+        [ -f "$needy" ] || continue
+        if [ "$needy" != "$scenario" ]; then
+            not_a_regression "$needy" && continue
+            if [ -n "$base_only" ]; then
+                case "$(basename "$needy")" in *[!0-9].sh | .sh) continue ;; esac
+            fi
+        fi
+        for need in $(declared needs "$needy"); do
+            case "$need" in
+            *[!A-Za-z0-9_./:+@-]* | tool: | controller: | tool:*/* | controller:/* | *..*) need_form="" ;;
+            tool:* | controller:* | /*) need_form=1 ;;
+            *) need_form="" ;;
+            esac
+            if [ -z "$need_form" ]; then
+                echo "gate: $needy: \`# needs: $need\` is not controller:<path>, tool:<name> or an absolute path" >&2
+                exit 3
+            fi
+            printf '%s %s\n' "$(basename "$needy")" "$need" >>"$work/needs"
+        done
+    done
+fi
+if [ -s "$work/needs" ]; then
+    # One sandbox for all of them, an empty directory its tree: what it
+    # shows of the host is what a scenario's sandbox shows (the same binds
+    # and masks; a scenario's adds only the trees). The words hold no
+    # blank and no pattern character (above), so they are passed as they
+    # are.
+    mkdir "$work/preflight"
+    preflight_rc=0
+    # shellcheck disable=SC2016,SC2046 # expanded inside the sandbox; one word each
+    sandbox "$work/preflight" sh -c '
+        controller=$1
+        shift
+        for need in "$@"; do
+            case "$need" in
+            tool:*) command -v "${need#tool:}" >/dev/null 2>&1 || echo "$need" ;;
+            controller:*) [ -e "$controller/${need#controller:}" ] || echo "$need" ;;
+            *) [ -e "$need" ] || echo "$need" ;;
+            esac
+        done' preflight "$controller" $(cut -d' ' -f2 "$work/needs" | LC_ALL=C sort -u) \
+        >"$work/needs.missing" 2>"$work/needs.log" || preflight_rc=$?
+    # A preflight that never ran found nothing missing.
+    if [ -s "$work/sandbox-never-started" ]; then sandbox_fault "$work/sandbox-never-started" preflight; fi
+    if [ "$preflight_rc" -ne 0 ]; then
+        sed 's/^/| preflight: /' "$work/needs.log" | tail -n 5
+        echo "gate: the preflight could not ask for the scenarios' prerequisites (exit $preflight_rc)" >&2
+        exit 3
+    fi
+    # Each scenario and what it lacks, in the scenario order; the fact
+    # names the first.
+    awk 'FNR == NR { missing[$0] = 1; next } $2 in missing' "$work/needs.missing" "$work/needs" \
+        >"$work/needs.lacking"
+    if [ -s "$work/needs.lacking" ]; then
+        while read -r needy need; do
+            case "$need" in
+            controller:*) need_where=" ($controller/${need#controller:})" ;;
+            *) need_where="" ;;
+            esac
+            echo "| preflight: $needy needs $need$need_where, which the sandbox does not show"
+        done <"$work/needs.lacking"
+        echo "| preflight: a prerequisite is missing on this host: no build and no scenario was started;" \
+            "a fact about the host, not a verdict on the candidate"
+        [ -z "$base_only" ] || exit 4
+        read -r needy need <"$work/needs.lacking"
+        cannot_judge "$needy" "none: a prerequisite is missing" "$need"
+    fi
+    echo "| preflight: nothing missing (prerequisites declared:" \
+        "$(cut -d' ' -f2 "$work/needs" | LC_ALL=C sort -u | grep -c .), by scenarios:" \
+        "$(cut -d' ' -f1 "$work/needs" | LC_ALL=C sort -u | grep -c .))"
+fi
 
 # The base phase: every objective's key (and its result, when the cache
 # has it), then one build of the base for those it has not, then their runs.
