@@ -1,6 +1,6 @@
-import { Ban, Check, ChevronRight, FoldHorizontal, OctagonAlert, RotateCcw } from "lucide-react";
+import { Ban, CalendarClock, Check, ChevronRight, FoldHorizontal, OctagonAlert, RotateCcw } from "lucide-react";
 import { AnimatePresence, useReducedMotion } from "motion/react";
-import { useCallback, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, MouseEvent, PointerEvent, ReactNode } from "react";
 
 import { clockTime, formatDuration } from "../../format";
@@ -24,14 +24,16 @@ import type {
 import type { Mission } from "../../missions";
 import type { TaskSection } from "../../ordering";
 import { SECTION_LABEL, groupTasks, missionClass, taskTitle } from "../../ordering";
-import { LINEAR, foldIdle } from "../../timeFold";
-import { fitDomain } from "../../timeWindow";
+import { TODAY_MS } from "../../home";
+import { LINEAR, foldIdleSteady, sameFoldMap } from "../../timeFold";
+import { fitDomain, todayWindow } from "../../timeWindow";
 import { Overview } from "../timeaxis/Overview";
 import type { OverviewLine } from "../timeaxis/Overview";
 import {
   AxisRow,
   BreakBands,
   FloatingTip,
+  IconButton,
   Gridlines,
   LiveTail,
   NowLine,
@@ -246,7 +248,7 @@ export function MissionTimeline({
   const [folding, setFolding] = useStoredChoice("spawn.missions.fold", ["on", "off"] as const, "on");
   const fold = useMemo(() => {
     if (folding === "off") return LINEAR;
-    return foldIdle(shown.bars.map((bar) => [bar.start, bar.end ?? shown.end] as const));
+    return foldIdleSteady(shown.bars.map((bar) => [bar.start, bar.end ?? shown.end] as const));
   }, [folding, shown]);
   const extent = useMemo(
     () => fitDomain({ start: fold.fold(shown.start), end: fold.fold(shown.end) }),
@@ -267,6 +269,32 @@ export function MissionTimeline({
   const pan = useDragPan(view);
   const ticks = useTicks(domain, plotW, fold);
   const breaks = useBreaks(domain, plotW, fold);
+  // The window is kept on the folded axis; when the fold's map changes (the
+  // Linear toggle, a filter, a new break or band width), move it to the
+  // same real times on the new one, before the frame is drawn (as the
+  // session trace does).
+  const shownFold = useRef(fold);
+  const { refold, since } = view;
+  useLayoutEffect(() => {
+    const old = shownFold.current;
+    if (sameFoldMap(old, fold)) return;
+    shownFold.current = fold;
+    refold((time) => fold.fold(old.unfold(time)));
+  }, [fold, refold]);
+  // Today, the last 24 h (design §4.4): the first window, and the Today
+  // button's (t). Fit (0) widens to every task.
+  const today = useCallback(() => {
+    const win = todayWindow(fold.fold, shown, Date.now(), TODAY_MS);
+    if (win.mode === "since") since(win.from);
+    else view.fit();
+  }, [fold, shown, since, view]);
+  const opened = useRef(false);
+  useLayoutEffect(() => {
+    if (opened.current || plotW <= 0 || shown.bars.length === 0) return;
+    opened.current = true;
+    const win = todayWindow(fold.fold, shown, Date.now(), TODAY_MS);
+    if (win.mode === "since") since(win.from);
+  }, [plotW, shown, fold, since]);
 
   const overviewLines = useMemo<OverviewLine[]>(() => {
     const bars = shown.bars;
@@ -386,6 +414,9 @@ export function MissionTimeline({
       case "0":
         view.fit();
         break;
+      case "t":
+        today();
+        break;
     }
   };
 
@@ -422,7 +453,15 @@ export function MissionTimeline({
                 {folding === "on" ? "Idle folded" : "Linear"}
               </button>
             ) : null}
-            <ZoomControls view={view} fitLabel="Fit every task" />
+            <ZoomControls view={view} fitLabel="Fit every task">
+              <IconButton
+                label="Today: the last 24 h, following the live end (t)"
+                onClick={today}
+                active={view.follow.mode === "since"}
+              >
+                <CalendarClock size={13} />
+              </IconButton>
+            </ZoomControls>
           </div>
         )}
       </div>

@@ -302,7 +302,16 @@ export function IconButton({
 }
 
 /** −, + and fit, with the gesture hint on wide screens. */
-export function ZoomControls({ view, fitLabel }: { view: TimeWindow; fitLabel: string }) {
+export function ZoomControls({
+  view,
+  fitLabel,
+  children,
+}: {
+  view: TimeWindow;
+  fitLabel: string;
+  /** More windows, beside the fit (the missions' Today). */
+  children?: ReactNode;
+}) {
   return (
     <div className="ml-auto flex shrink-0 items-center gap-1">
       <span className="mr-2 hidden text-caption text-faint-foreground 2xl:inline">
@@ -314,6 +323,7 @@ export function ZoomControls({ view, fitLabel }: { view: TimeWindow; fitLabel: s
       <IconButton label="Zoom in (+)" onClick={() => view.zoomBy(0.5)}>
         <Plus size={13} />
       </IconButton>
+      {children}
       <IconButton label={`${fitLabel} (0)`} onClick={view.fit} active={view.follow.mode === "fit"}>
         <Maximize2 size={12} />
       </IconButton>

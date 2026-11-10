@@ -105,6 +105,21 @@ export function foldIdle(
   return { fold, unfold, breaks, keep, blocks };
 }
 
+/** foldIdle with its band width rounded down to a power of two (from its
+ * own 3% of the active time): the missions timeline's fold. An open bar
+ * grows the active time each second, and a keep that followed it would
+ * move every folded time after the first break each second; rounded, it
+ * holds until the active time doubles (the window follows when it moves,
+ * refollow). A `keep` given is used as it is. */
+export function foldIdleSteady(
+  intervals: ReadonlyArray<readonly [number, number]>,
+  options: { minGap?: number; keep?: number } = {},
+): TimeFold {
+  const first = foldIdle(intervals, options);
+  if (first.breaks.length === 0 || options.keep !== undefined) return first;
+  return foldIdle(intervals, { ...options, keep: 2 ** Math.floor(Math.log2(Math.max(first.keep, 1))) });
+}
+
 /** Whether two folds map every time alike. A fold's mapping is its breaks
  * (each idle stretch's real ends) and `keep`, nothing else: its first
  * block's start and its last block's end move no time, so a live trace's
