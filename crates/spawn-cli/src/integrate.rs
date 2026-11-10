@@ -1533,8 +1533,11 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     }
     let interval = loop_interval().max(Duration::from_secs(5));
     loop {
-        if !once && drain_asked.load(std::sync::atomic::Ordering::SeqCst) {
-            integrator.begin_drain(drain_bound);
+        if !once
+            && drain_asked.load(std::sync::atomic::Ordering::SeqCst)
+            && !integrator.draining()
+        {
+            integrator.begin_drain(integrator.own_store().as_deref(), drain_bound);
         }
         let pass = integrator.pass();
         if once {
@@ -1550,7 +1553,9 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         if once {
             return Ok(0);
         }
-        if integrator.drained(pass.is_ok()) {
+        if integrator.draining()
+            && integrator.drained(integrator.own_store().as_deref(), pass.is_ok())
+        {
             return Ok(0);
         }
         // Between passes, a drain request is taken at once and a drain's
@@ -1565,13 +1570,13 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
                 break;
             }
             if integrator.drain_expired(now) {
-                integrator.expire_drain();
+                integrator.expire_drain(integrator.own_store().as_deref());
                 return Ok(0);
             }
             std::thread::sleep((next - now).min(Duration::from_millis(200)));
         }
         if integrator.drain_expired(std::time::Instant::now()) {
-            integrator.expire_drain();
+            integrator.expire_drain(integrator.own_store().as_deref());
             return Ok(0);
         }
     }
@@ -2107,20 +2112,28 @@ impl Integrator {
         tasks
     }
 
-    /// Record an integrator's own record (`integrator.*`), through the store
-    /// its judgings use when one runs; false when it could not be recorded
-    /// (said).
-    fn record_own(&self, record: &Value) -> bool {
-        let held = self.held.borrow().clone();
-        let store = match held {
-            Some(store) => store,
-            None => match open_store() {
-                Ok(store) => Arc::new(store),
-                Err(error) => {
-                    eprintln!("integrate: cannot record {record}: {error}");
-                    return false;
-                }
-            },
+    /// The store the integrator's own records go through: the one its
+    /// judgings use while one runs, else a new connection; None when none
+    /// can be opened (said).
+    fn own_store(&self) -> Option<Arc<PostgresStore>> {
+        if let Some(store) = self.held.borrow().clone() {
+            return Some(store);
+        }
+        match open_store() {
+            Ok(store) => Some(Arc::new(store)),
+            Err(error) => {
+                eprintln!("integrate: no store for the integrator's own records: {error}");
+                None
+            }
+        }
+    }
+
+    /// Record one of the integrator's own records (`integrator.*`); false
+    /// when it could not be recorded (said).
+    fn record_own(store: Option<&PostgresStore>, record: &Value) -> bool {
+        let Some(store) = store else {
+            eprintln!("integrate: cannot record {record}: no store");
+            return false;
         };
         match store.integrator_record(record) {
             Ok(_) => true,
@@ -2134,7 +2147,7 @@ impl Integrator {
     /// Begin the drain a request asked for (once): `integrator.draining`
     /// names the task judgings in flight and the bound, counted from now.
     /// From then on no gate, owner judging or base warm starts.
-    fn begin_drain(&self, bound_s: u64) {
+    fn begin_drain(&self, store: Option<&PostgresStore>, bound_s: u64) {
         if self.draining() {
             return;
         }
@@ -2146,7 +2159,7 @@ impl Integrator {
             .iter()
             .filter(|gate| gate.owner.is_some())
             .count();
-        self.record_own(&json!({
+        Self::record_own(store, &json!({
             "type": "integrator.draining", "gates": gates, "bound_s": bound_s,
         }));
         *self.drain.borrow_mut() = Some(Drain {
@@ -2166,7 +2179,7 @@ impl Integrator {
     /// Whether the drain is over after a pass (`pass_ok`: it ran): no
     /// judging of this integrator runs and the pass left no landing to act
     /// on. Then `integrator.drained` is recorded, and the caller exits.
-    fn drained(&self, pass_ok: bool) -> bool {
+    fn drained(&self, store: Option<&PostgresStore>, pass_ok: bool) -> bool {
         if !self.draining() || !pass_ok || self.unlanded.get() {
             return false;
         }
@@ -2175,7 +2188,7 @@ impl Integrator {
             return false;
         }
         let bound_s = self.drain.borrow().as_ref().map_or(0, |drain| drain.bound_s);
-        if !self.record_own(&json!({"type": "integrator.drained", "bound_s": bound_s})) {
+        if !Self::record_own(store, &json!({"type": "integrator.drained", "bound_s": bound_s})) {
             return false;
         }
         println!("integrate: drained: every gate it ran recorded and landed; exiting");
@@ -2193,14 +2206,14 @@ impl Integrator {
     /// process groups killed, as a gate past its time limit is, and their
     /// threads record nothing: [`gate::Halt`]), `integrator.drain_expired`
     /// names their tasks, and the caller exits.
-    fn expire_drain(&self) {
+    fn expire_drain(&self, store: Option<&PostgresStore>) {
         self.reap();
         let gates = self.gate_tasks();
         for gate in self.running.borrow().iter() {
             gate.halt.halt();
         }
         let bound_s = self.drain.borrow().as_ref().map_or(0, |drain| drain.bound_s);
-        self.record_own(&json!({
+        Self::record_own(store, &json!({
             "type": "integrator.drain_expired", "gates": gates, "bound_s": bound_s,
         }));
         println!(
@@ -2440,6 +2453,7 @@ impl Integrator {
 
     /// One pass over every gated mission, holding the integrator's lock.
     fn pass_on(&self, store: &Arc<PostgresStore>) -> Result<(), String> {
+        self.unlanded.set(false);
         // A hold past its bound ends by its record, before any mission's
         // step: nothing lands on its source until then.
         expire_holds(store)?;
