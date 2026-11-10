@@ -62,7 +62,7 @@ select jsonb_build_object(
        and x.r ->> 'type' in ('mission.added', 'mission.configured', 'mission.resumed',
                               'task.assigned', 'task.delivered', 'task.gated', 'task.landed',
                               'task.reviewed', 'task.cancelled', 'task.aborted',
-                              'legacy.imported')),
+                              'task.over_budget', 'legacy.imported')),
   'commands', (
     select coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
              'id', c.id,

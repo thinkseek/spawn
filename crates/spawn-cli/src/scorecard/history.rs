@@ -351,7 +351,8 @@ impl Fold {
                     self.landed(task, record.at);
                 }
             }
-            "task.cancelled" | "task.aborted" => {
+            // An overrun (`task.over_budget`) closes its task as an abort does.
+            "task.cancelled" | "task.aborted" | "task.over_budget" => {
                 let Some(task) = id.and_then(|id| self.history.tasks.get_mut(&id)) else {
                     return;
                 };
