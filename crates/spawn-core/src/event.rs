@@ -341,6 +341,20 @@ pub enum EventKind {
         /// The command the marker names.
         command_id: CommandId,
     },
+    /// The agent answered a message by its id (`spawn ack <id>
+    /// done|declined [<why>]` in its own pane, read by the loop from its
+    /// workspace), or a task's report answered the message that delivered
+    /// it. In the message's session, keyed `<id>:acted`: the first answer
+    /// stands, a later one records nothing.
+    #[serde(rename = "message.acted")]
+    MessageActed {
+        /// The command whose message was answered.
+        command_id: CommandId,
+        /// `done` or `declined`.
+        outcome: String,
+        /// Why, required for `declined`; none for a plain `done`.
+        why: Option<String>,
+    },
     /// The engine asked for attention, for example a permission prompt.
     #[serde(rename = "notification.received")]
     NotificationReceived {
@@ -641,6 +655,7 @@ impl EventKind {
             Self::NoticeReceived => "notice.received",
             Self::MessageTyped { .. } => "message.typed",
             Self::MessageTaken { .. } => "message.taken",
+            Self::MessageActed { .. } => "message.acted",
             Self::NotificationReceived { .. } => "notification.received",
             Self::ToolStarted { .. } => "tool.started",
             Self::ToolCompleted { .. } => "tool.completed",
