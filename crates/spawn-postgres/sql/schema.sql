@@ -1510,6 +1510,159 @@ select a.key,
 from spawn_alerts a
 where a.kind = 'agent_stuck' and a.state = 'open';
 
+-- What the fleet's model calls cost (objective 041; docs/fleet-architecture.md
+-- §3.5): one row per assistant message (the engine's `message.id`), folded by
+-- the loop's cost step (`spawn_cost_record`) from the Bridge's `model.usage`
+-- events. A message counts once whatever repeats it (its lines, a copy, a
+-- restarted loop's read): its largest usage, at its earliest line's time,
+-- under its model, for the execution whose transcript first held it, that
+-- execution's agent, the task the agent held at the message's time (its
+-- latest task assigned at or before it; a message timed before any of them,
+-- the latest assigned at or before the execution started; none: no task)
+-- and that task's mission. `usd` is priced when the row is recorded, by the
+-- rates `rates` names (US dollars per million tokens, SPAWN_MODEL_PRICES):
+-- a later price leaves it as it is. Null: the model had no price, and its
+-- tokens count as unpriced, never as $0.
+create table if not exists spawn_cost_messages (
+    message_id         text    primary key,
+    execution_id       text    not null,
+    agent_id           text    not null,
+    session_id         text    not null,
+    task_id            bigint,
+    mission_id         bigint,
+    model              text    not null,
+    at_ms              bigint  not null,
+    input_tokens       bigint  not null,
+    output_tokens      bigint  not null,
+    cache_write_tokens bigint  not null,
+    cache_read_tokens  bigint  not null,
+    usd                numeric,
+    rates              jsonb,
+    -- The newest `model.usage` event folded into the row, and its time: where
+    -- the next fold starts reading (less a margin for a late commit).
+    event_id           bigint  not null,
+    event_at_ms        bigint  not null,
+    recorded_at_ms     bigint  not null
+);
+
+create index if not exists spawn_cost_messages_time on spawn_cost_messages (at_ms);
+create index if not exists spawn_cost_messages_mission on spawn_cost_messages (mission_id, at_ms);
+create index if not exists spawn_cost_messages_event on spawn_cost_messages (event_at_ms);
+
+-- One message's cost at `p_rates` (`{input, output, cache_write, cache_read}`,
+-- US dollars per million tokens): each count times its rate over a million,
+-- exact. Null when the model has no rates.
+create or replace function spawn_cost_usd(p_rates jsonb, p_input bigint, p_output bigint,
+                                          p_cache_write bigint, p_cache_read bigint)
+returns numeric language sql immutable as $$
+    select case when jsonb_typeof(p_rates) = 'object' then
+        (p_input * (p_rates ->> 'input')::numeric
+         + p_output * (p_rates ->> 'output')::numeric
+         + p_cache_write * (p_rates ->> 'cache_write')::numeric
+         + p_cache_read * (p_rates ->> 'cache_read')::numeric) / 1000000 end
+$$;
+
+-- The loop's cost step (owner only): fold the `model.usage` events not yet
+-- folded into `spawn_cost_messages`, pricing each new message by `p_prices`
+-- (`{<model>: {input, output, cache_write, cache_read}}`). It reads the
+-- events from ten minutes before the newest one already folded, so an event
+-- committed late is still read; one read again changes nothing (a message is
+-- rewritten only by a larger usage, repriced then, or an earlier time).
+-- Returns how many messages it recorded or changed.
+create or replace function spawn_cost_record(p_prices jsonb)
+returns integer language plpgsql security definer as $$
+declare
+    v_since bigint;
+    v_count integer;
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not record costs', session_user using errcode = '42501';
+    end if;
+    if jsonb_typeof(p_prices) is distinct from 'object' then
+        raise exception 'the prices are a JSON object, not %', p_prices;
+    end if;
+    select coalesce(max(event_at_ms), 0) - 600000 into v_since from spawn_cost_messages;
+    with fresh as (
+        select e.id, e.recorded_at_ms, e.agent_id, e.session_id, e.execution_id,
+               d ->> 'message_id' as message_id, d ->> 'model' as model,
+               (d ->> 'at_ms')::bigint as at_ms,
+               array[(d ->> 'input_tokens')::bigint, (d ->> 'output_tokens')::bigint,
+                     (d ->> 'cache_write_tokens')::bigint,
+                     (d ->> 'cache_read_tokens')::bigint] as counts
+          from spawn_events e
+         cross join lateral (select e.kind -> 'detail' as d offset 0) x
+         where e.event_name = 'model.usage' and e.recorded_at_ms >= v_since
+           and e.execution_id is not null and nullif(d ->> 'message_id', '') is not null
+    ), messages as (
+        select f.message_id,
+               (array_agg(f.execution_id order by f.id))[1] as execution_id,
+               (array_agg(f.agent_id order by f.id))[1] as agent_id,
+               (array_agg(f.session_id order by f.id))[1] as session_id,
+               (array_agg(f.model order by f.at_ms, f.id))[1] as model,
+               min(f.at_ms) as at_ms,
+               (array_agg(f.counts order by f.counts[1] + f.counts[2] + f.counts[3]
+                                            + f.counts[4] desc, f.id))[1] as counts,
+               max(f.id) as event_id, max(f.recorded_at_ms) as event_at_ms
+          from fresh f
+         group by f.message_id
+    ), changed as (
+        select m.*
+          from messages m
+          left join spawn_cost_messages c on c.message_id = m.message_id
+         where c.message_id is null
+            or m.counts[1] + m.counts[2] + m.counts[3] + m.counts[4]
+               > c.input_tokens + c.output_tokens + c.cache_write_tokens + c.cache_read_tokens
+            or m.at_ms < c.at_ms
+    ), placed as (
+        select m.*, t.task_id, k.mission_id, p_prices -> m.model as rates
+          from changed m
+         cross join lateral (
+               select coalesce(
+                   (select k.id from mission_tasks k
+                     where k.agent_id = m.agent_id and k.created_at_ms <= m.at_ms
+                     order by k.created_at_ms desc, k.id desc limit 1),
+                   (select k.id from mission_tasks k
+                     where k.agent_id = m.agent_id
+                       and k.created_at_ms <= (
+                           select min(s.recorded_at_ms) from spawn_events s
+                            where s.session_id = m.session_id
+                              and s.event_name = 'execution.started'
+                              and s.execution_id = m.execution_id)
+                     order by k.created_at_ms desc, k.id desc limit 1)) as task_id) t
+          left join mission_tasks k on k.id = t.task_id
+    )
+    insert into spawn_cost_messages as c
+        (message_id, execution_id, agent_id, session_id, task_id, mission_id, model, at_ms,
+         input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, usd, rates,
+         event_id, event_at_ms, recorded_at_ms)
+    select p.message_id, p.execution_id, p.agent_id, p.session_id, p.task_id, p.mission_id,
+           p.model, p.at_ms, p.counts[1], p.counts[2], p.counts[3], p.counts[4],
+           spawn_cost_usd(p.rates, p.counts[1], p.counts[2], p.counts[3], p.counts[4]),
+           p.rates, p.event_id, p.event_at_ms, spawn_now_ms()
+      from placed p
+    on conflict (message_id) do update set
+        at_ms = least(c.at_ms, excluded.at_ms),
+        event_id = greatest(c.event_id, excluded.event_id),
+        event_at_ms = greatest(c.event_at_ms, excluded.event_at_ms),
+        (input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, usd, rates,
+         recorded_at_ms) =
+            (select case when larger then excluded.input_tokens else c.input_tokens end,
+                    case when larger then excluded.output_tokens else c.output_tokens end,
+                    case when larger then excluded.cache_write_tokens
+                         else c.cache_write_tokens end,
+                    case when larger then excluded.cache_read_tokens
+                         else c.cache_read_tokens end,
+                    case when larger then excluded.usd else c.usd end,
+                    case when larger then excluded.rates else c.rates end,
+                    case when larger then excluded.recorded_at_ms else c.recorded_at_ms end
+               from (select excluded.input_tokens + excluded.output_tokens
+                            + excluded.cache_write_tokens + excluded.cache_read_tokens
+                            > c.input_tokens + c.output_tokens + c.cache_write_tokens
+                              + c.cache_read_tokens as larger) l);
+    get diagnostics v_count = row_count;
+    return v_count;
+end $$;
+
 
 -- Who may call the mission functions: the owner (humans' CLI, the
 -- controller) and the supervisor's login; not the reader's, and not the web
@@ -2636,6 +2789,13 @@ begin
     end if;
     if p_objectives is not null and p_gate is null then
         raise exception 'objectives need a gate to land on';
+    end if;
+    -- A daily budget in money (objective 041): US dollars, above zero.
+    if p_budget ? 'daily_usd'
+       and (jsonb_typeof(p_budget -> 'daily_usd') is distinct from 'number'
+            or (p_budget ->> 'daily_usd')::numeric <= 0) then
+        raise exception 'a mission''s daily_usd is an amount of US dollars above zero, not %',
+            p_budget -> 'daily_usd';
     end if;
     -- The worker limit: how many objective tasks may be in flight at once.
     if p_objectives ? 'workers'
@@ -4006,6 +4166,7 @@ begin
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
         'spawn_alert_record(jsonb)', 'spawn_backup_record(jsonb)',
+        'spawn_cost_record(jsonb)',
         'spawn_objective_assign(bigint, integer, text, text, bigint)', 'spawn_task_stages(bigint)',
         'spawn_landing_hold(bigint)', 'spawn_landing_release()',
         'spawn_source_holdable(text)', 'spawn_source_hold_lock(text)',
