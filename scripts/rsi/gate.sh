@@ -197,6 +197,12 @@
 # verdict carries it as "metric" (the controller reads the metric from the
 # verdict only).
 #
+# Every fact the gate writes (a verdict, host_fault, main red, cannot_judge,
+# no_room) begins with its version, `{"v":1,`: a gate outlives the
+# integrator that started it (gate v2 step 2), so the one that reads it may
+# be newer. A new key is added, never renamed; a change of meaning is v2,
+# which a reader that knows only v1 refuses as an abort (gate.rs).
+#
 # The sandbox. Everything the candidate controls runs inside bubblewrap
 # (`bwrap`, required): the build hook, the scenarios and the checks, and
 # `cargo metadata` on the candidate's manifests. Inside it the root is
@@ -350,7 +356,7 @@
 # less than SPAWN_GATE_MIN_FREE_GB free (scripts/disk.sh gate_room). The
 # gate exits before it makes any scratch or runs any candidate code, after
 # it writes one JSON line to SPAWN_GATE_VERDICT:
-#   {"no_room":true,"free_kb":<n>,"min_gb":<n>,"tmpdir":"<dir>"}
+#   {"v":1,"no_room":true,"free_kb":<n>,"min_gb":<n>,"tmpdir":"<dir>"}
 # When that write fails (no room at all), it still exits 5. The integrator
 # records `no_room` from that exit status with that file, or, with no
 # readable file, from its own measure of TMPDIR under the floor (gate.rs). It is no verdict and does not count toward a mission's halt.
@@ -464,7 +470,7 @@ case $room in
     # it (no candidate code has run), and a status of its own. A disk with
     # no room at all may refuse the write: the status stays 5, and the
     # integrator measures the free space itself.
-    no_room_json=$(printf '{"no_room":true,"free_kb":%s,"min_gb":%s,"tmpdir":"%s"}' \
+    no_room_json=$(printf '{"v":1,"no_room":true,"free_kb":%s,"min_gb":%s,"tmpdir":"%s"}' \
         "$disk_free" "$disk_min_gb" \
         "$(printf '%s' "$disk_dir" | tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')")
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
@@ -585,7 +591,7 @@ verdict() {
     if [ "$1" = accepted ]; then stage_close ok; else stage_close "$1"; fi
     gate_times
     stage_emit gate "$1" "$(($(stage_now) - gate_started))" total
-    json="{\"verdict\":\"$1\""
+    json="{\"v\":1,\"verdict\":\"$1\""
     [ -n "${2-}" ] && json="$json,\"reason\":\"$(json_string "$2")\""
     [ -n "$metric" ] && json="$json,\"metric\":\"$(json_string "$metric")\""
     # The checks that failed once and passed again on the candidate (a
@@ -632,7 +638,7 @@ host_fault() {
     stage_close host_fault
     gate_times
     stage_emit gate host_fault "$(($(stage_now) - gate_started))" total
-    json="{\"host_fault\":true,\"scenario\":\"$(json_string "$1")\",\"on\":\"$2\""
+    json="{\"v\":1,\"host_fault\":true,\"scenario\":\"$(json_string "$1")\",\"on\":\"$2\""
     json="$json,\"runs\":\"$(json_string "$3")\",\"reason\":\"$(json_string "$4")\""
     [ -z "${5-}" ] || json="$json,\"evidence\":\"$5\""
     [ -z "${6-}" ] || json="$json,\"tree\":\"$6\""
@@ -677,7 +683,7 @@ main_red() {
     done <<EOF_MAIN_RED
 $(head -n 20 "$3")
 EOF_MAIN_RED
-    json="{\"host_fault\":true,\"scenario\":\"$(json_string "$1")\",\"on\":\"main\""
+    json="{\"v\":1,\"host_fault\":true,\"scenario\":\"$(json_string "$1")\",\"on\":\"main\""
     json="$json,\"runs\":\"$(json_string "$2")\""
     json="$json,\"reason\":\"$(json_string "$1 fails on the base twice ($2), with the same failing tests: main is red on it, not a verdict on the candidate")\""
     json="$json,\"failures\":[$main_red_list]"
@@ -739,7 +745,7 @@ cannot_judge() {
     stage_close cannot_judge
     gate_times
     stage_emit gate cannot_judge "$(($(stage_now) - gate_started))" total
-    json="{\"cannot_judge\":true,\"scenario\":\"$(json_string "$1")\""
+    json="{\"v\":1,\"cannot_judge\":true,\"scenario\":\"$(json_string "$1")\""
     json="$json,\"runs\":\"$(json_string "$2")\""
     [ -z "${3-}" ] || json="$json,\"prerequisite\":\"$(json_string "$3")\""
     # The check main was red on (SPAWN_GATE_BASE_CHECK), when it passed on
@@ -1401,7 +1407,16 @@ sandbox_once() {
     set -- "$@" --tmpfs "$work" --tmpfs "$base_cache"
     [ ! -d "${solved_base-}" ] || set -- "$@" --tmpfs "$solved_base"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
-        set -- "$@" --tmpfs "$(dirname "$SPAWN_GATE_VERDICT")"
+        verdict_dir=$(dirname "$SPAWN_GATE_VERDICT")
+        # Under an integrator's judgings (gate v2 step 2:
+        # <root>/judgings/<id>/<private>/verdict) every judging is hidden,
+        # the other gates' with their environment files as well as this
+        # one's; elsewhere, the verdict's own directory.
+        judgings=$(dirname "$(dirname "$verdict_dir")")
+        case $judgings in
+        */judgings) set -- "$@" --tmpfs "$judgings" ;;
+        *) set -- "$@" --tmpfs "$verdict_dir" ;;
+        esac
     fi
     set -- "$@" --tmpfs "$HOME"
     old_ifs=$IFS
@@ -1937,7 +1952,7 @@ slot_no_room() {
     gate_times
     stage_emit gate no_room "$(($(stage_now) - gate_started))" total
     echo "| $(basename "$slot_name"): gave up waiting for a host scenario slot after $(spoken_wait "$slot_gave") ($slot_busy)"
-    json="{\"no_room\":true,\"check\":\"host scenario slot\",\"waited_ms\":$slot_gave,\"budget\":$gate_slots"
+    json="{\"v\":1,\"no_room\":true,\"check\":\"host scenario slot\",\"waited_ms\":$slot_gave,\"budget\":$gate_slots"
     json="$json,\"scenario\":\"$(json_string "$(basename "$slot_name")")\""
     # The check main was red on (SPAWN_GATE_BASE_CHECK), when it passed on
     # this base before any candidate code ran: main is green on it again,

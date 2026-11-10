@@ -169,7 +169,9 @@ judge() {
     echo "exit=$status $(without_commits 2>/dev/null <"$integrator/verdict" || true)"
 }
 without_commits() {
-    sed -E 's/,"base":"[0-9a-f]+","candidate":"[0-9a-f]+"\}$/}/'
+    # The fact's version (`"v":1`, first) and its commits are said once,
+    # below; every other expectation reads the rest.
+    sed -E -e 's/^\{"v":1,/{/' -e 's/,"base":"[0-9a-f]+","candidate":"[0-9a-f]+"\}$/}/'
 }
 expect() {
     case "$2" in
@@ -196,6 +198,7 @@ printf 'two\n' >"$seed/value"
 good=$(commit good)
 expect "red then green lands" "$(judge "$good" "$scenarios/007.sh")" 'exit=0 {"verdict":"accepted"}'
 expect "the verdict file and stdout agree" "$(tail -n 1 "$work/gate.out" | without_commits)" '{"verdict":"accepted"}'
+expect "every fact begins with its version" "$(cat "$integrator/verdict")" '{"v":1,"verdict":"accepted",'
 expect "the verdict names the commits it judged, resolved" "$(cat "$integrator/verdict")" \
     "\"base\":\"$base\",\"candidate\":\"$good\"}"
 expect "a ref is resolved to its commit" \
@@ -216,7 +219,7 @@ expect "a TMPDIR without room stops the gate with its own status" \
 expect "the reason names the floor and TMPDIR" "$(cat "$integrator/verdict")" \
     "\"min_gb\":1000000000,\"tmpdir\":\"$roomless\"}"
 expect "and the free space, in KiB" \
-    "$(grep -Ec '^\{"no_room":true,"free_kb":[0-9]+,"min_gb"' "$integrator/verdict")" 1
+    "$(grep -Ec '^\{"v":1,"no_room":true,"free_kb":[0-9]+,"min_gb"' "$integrator/verdict")" 1
 refuse "with no verdict" "$(cat "$integrator/verdict")" '"verdict"'
 expect "a verdict file that cannot be written still exits 5" \
     "exit=$(export TMPDIR="$roomless" SPAWN_GATE_MIN_FREE_GB=1000000000
@@ -1718,7 +1721,7 @@ JUDGE
 expect "a task scenario that cannot be judged here is no verdict" \
     "$(judge "$good" "$unjudged_task/012.sh" "$unjudged_task")" 'exit=6 '
 expect "the gate states the fact" "$(cat "$integrator/verdict")" \
-    '{"cannot_judge":true,"scenario":"012.sh","runs":"6"'
+    '{"v":1,"cannot_judge":true,"scenario":"012.sh","runs":"6"'
 refuse "never a verdict" "$(cat "$integrator/verdict")" 'verdict'
 unset SPAWN_TEST_DATABASE_URL
 
@@ -3526,7 +3529,7 @@ expect "and says it as a scenario would, the form the integrator quotes as the c
 refuse "nothing was built" "$(cat "$work/gate.out")" '| == base: build'
 refuse "no scenario ran on the base" "$(cat "$work/gate.out")" '| == base: 301.sh'
 refuse "nor on the candidate" "$(cat "$work/gate.out")" ' ran'
-expect "the stdout's last line is the fact too" "$(tail -n 1 "$work/gate.out")" '{"cannot_judge":true,"scenario":"check-needy.sh"'
+expect "the stdout's last line is the fact too" "$(tail -n 1 "$work/gate.out")" '{"v":1,"cannot_judge":true,"scenario":"check-needy.sh"'
 expect "a warm (--base-only) runs objectives only: the check's prerequisite is not its business" \
     "$(SPAWN_GATE_VERDICT=$integrator/verdict sh "$gate" --base-only "$repo" "$base" "$pre" >"$work/gate.out" 2>&1 && echo exit=0 || echo "exit=$?")" 'exit=0'
 mkdir -p "$pre_controller/web/node_modules"
