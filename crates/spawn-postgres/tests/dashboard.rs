@@ -8,7 +8,8 @@
 
 use serde_json::{Value, json};
 use spawn_core::event::{
-    ArtifactRef, CheckpointReason, ENGINE, EventKind, ModelProfile, NewEvent, SessionSeq, Source,
+    ArtifactRef, CheckpointReason, ENGINE, EndCause, EventKind, ModelProfile, NewEvent, SessionSeq,
+    Source,
 };
 use spawn_core::id::{
     AgentId, BranchName, CommandId, CommitId, ExecutionId, SessionId, WorkspaceId,
@@ -289,6 +290,53 @@ fn the_board_reads_the_live_turn_open_from_its_start_and_end_records_only() {
     assert_eq!(board(&store)["turn_open"], true, "the next turn began");
     append("f2", Source::Claude, failed());
     assert_eq!(board(&store)["turn_open"], false, "a failed turn is over");
+}
+
+#[test]
+fn a_turn_its_execution_left_open_is_not_the_next_executions_turn() {
+    // An execution killed mid-turn leaves its message.received as the
+    // session's latest turn record; the resumed one waits for its first
+    // prompt (rev-f T1 on 770c4b0d).
+    let (store, _schema) = store("board_turn_resumed");
+    let killed = ExecutionId::new("exec_killed").expect("valid execution");
+    let resumed = ExecutionId::new("exec_resumed").expect("valid execution");
+    let append = |execution: &ExecutionId, key: &str, source: Source, kind: EventKind| {
+        store
+            .append(event(Some(execution), source, Some(key), kind))
+            .expect("append succeeds");
+    };
+    append(&killed, "k:started", Source::Bridge, started());
+    append(&killed, "k:m1", Source::Claude, EventKind::MessageReceived);
+    let board = row(&store.fleet_board().expect("the board reads"));
+    assert_eq!(board["activity"]["turn_open"], true, "mid-turn: {board}");
+    append(
+        &killed,
+        "k:ended",
+        Source::Bridge,
+        EventKind::ExecutionEnded {
+            cause: EndCause::Stopped,
+            exit_code: None,
+            signal: Some(9),
+            evidence: None,
+        },
+    );
+    let board = row(&store.fleet_board().expect("the board reads"));
+    assert_eq!(board["live"], false);
+    assert_eq!(
+        board["activity"]["turn_open"],
+        Value::Null,
+        "no live execution"
+    );
+    assert_eq!(board["activity"]["turn_at_ms"], Value::Null);
+    append(&resumed, "r:started", Source::Bridge, started());
+    let board = row(&store.fleet_board().expect("the board reads"));
+    assert_eq!(board["live"], true);
+    assert_eq!(board["execution_id"], "exec_resumed");
+    assert_eq!(
+        board["activity"]["turn_open"], false,
+        "its own turn has not begun: {board}"
+    );
+    assert_eq!(board["activity"]["turn_at_ms"], Value::Null);
 }
 
 #[test]
