@@ -321,6 +321,26 @@ pub enum EventKind {
     /// the engine: the notice the Bridge typed last was delivered.
     #[serde(rename = "notice.received")]
     NoticeReceived,
+    /// The Bridge typed a command's text with its marker
+    /// ([`crate::bridge::message_marker`]): the command is a message whose
+    /// taking the transcript says. Written after the text is staged and
+    /// before its `typing` step, keyed `cmd_<id>:message`, and only by a
+    /// Bridge that types the marker: a command typed by an older Spawn has
+    /// none, and is never read as a message not taken.
+    #[serde(rename = "message.typed")]
+    MessageTyped {
+        /// The command whose text carried the marker.
+        command_id: CommandId,
+    },
+    /// A transcript's user line (a prompt, not a tool result) held the
+    /// marker of a command: the engine took that message. Keyed by the
+    /// line and the command, so a line read again records nothing; a line
+    /// written twice is two. Beside the line's `message.received`.
+    #[serde(rename = "message.taken")]
+    MessageTaken {
+        /// The command the marker names.
+        command_id: CommandId,
+    },
     /// The engine asked for attention, for example a permission prompt.
     #[serde(rename = "notification.received")]
     NotificationReceived {
@@ -606,6 +626,8 @@ impl EventKind {
             Self::MessageReceived => "message.received",
             Self::NoticeTyped { .. } => "notice.typed",
             Self::NoticeReceived => "notice.received",
+            Self::MessageTyped { .. } => "message.typed",
+            Self::MessageTaken { .. } => "message.taken",
             Self::NotificationReceived { .. } => "notification.received",
             Self::ToolStarted { .. } => "tool.started",
             Self::ToolCompleted { .. } => "tool.completed",
