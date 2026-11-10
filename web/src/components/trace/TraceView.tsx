@@ -10,7 +10,7 @@ import { LINEAR } from "../../timeFold";
 import { fitDomain } from "../../timeWindow";
 import { chainOf, deriveTrace, foldRuns, rowText, runEnd, spanEnd, visibleSpans } from "../../trace";
 import type { KnownCommand, KnownExecution, Span, SpanKind, Trace, TraceMarker } from "../../trace";
-import { fitExecution, spanCounts, traceFold } from "../../traceWindow";
+import { fitExecution, runWindow, spanCounts, traceFold } from "../../traceWindow";
 import { useStoredChoice } from "../ViewToggle";
 import { Overview } from "../timeaxis/Overview";
 import type { OverviewLine } from "../timeaxis/Overview";
@@ -150,16 +150,23 @@ export function TraceView({
         view.fit();
         return;
       }
-      if (run.end === null) {
-        const from = fold.fold(run.start);
-        const pad = Math.max((fold.fold(traceEnd) - from) * 0.05, 500);
-        view.since(from - pad);
-      } else {
-        view.zoomTo(fold.fold(run.start), fold.fold(run.end));
-      }
+      const target = runWindow(run, fold, traceEnd);
+      if (target.mode === "since") view.since(target.from);
+      else if (target.mode === "fixed") view.glideTo(target.domain);
     },
     [trace, fold, traceEnd, view],
   );
+  // The window is kept on the folded axis; when the fold changes (the Linear
+  // toggle, a live session's new break or band width), move it to the same
+  // real times on the new one, before the frame is drawn.
+  const shownFold = useRef(fold);
+  const { refold } = view;
+  useLayoutEffect(() => {
+    const old = shownFold.current;
+    if (old === fold) return;
+    shownFold.current = fold;
+    refold((time) => fold.fold(old.unfold(time)));
+  }, [fold, refold]);
   // The first window fits the current execution (§4.4), not the session's
   // lifetime: once, when the trace has one and the plot has a width.
   const fitted = useRef(false);
