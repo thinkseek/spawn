@@ -14,6 +14,7 @@ import {
   agentsNow,
   alertMoot,
   alertStale,
+  alertTitle,
   alertsSpanMs,
   awayFrom,
   digestBand,
@@ -629,4 +630,11 @@ test("a 3-day digest holds an alert that fired and cleared 2 days ago (rev-f F1)
   assert.deepEqual(away.bands.map((band) => band.entries.length), [1]);
   // The last 24 h does not.
   assert.equal(digestSince(missions([]), [cleared], NOW, NOW - 24 * HOUR).alerts, 0);
+});
+
+test("a validator that fails on main too has its own title in Needs you", () => {
+  assert.equal(
+    alertTitle({ kind: "validator_defect", subject: "mission #4" }),
+    "A validator fails on main too · mission #4",
+  );
 });

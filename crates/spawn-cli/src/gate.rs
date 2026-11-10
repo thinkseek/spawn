@@ -744,6 +744,14 @@ pub(crate) struct Verdict {
     /// on it (scripts/rsi/gate.sh, "Main red on a scenario"), in the log's
     /// order; only scenario file names (`<name>.sh`, not a check) are kept.
     pub(crate) main_red_scenarios: Vec<String>,
+    /// The validators that fail on the base too, run again in this gate
+    /// (the verdict's `validator_defects`, scripts/rsi/gate.sh "Three
+    /// classes of a failing regression"): an owner's candidate is judged
+    /// without them, and they are named. Script file names only.
+    pub(crate) validator_defects: Vec<String>,
+    /// The regressions the owner's `quarantined` list kept from running
+    /// (the verdict's `quarantined`). Script file names only.
+    pub(crate) quarantined: Vec<String>,
     /// Everything the gate printed, stderr marked `! `, the verdict last.
     pub(crate) output: String,
 }
@@ -784,6 +792,21 @@ pub(crate) enum GateFailure {
         /// For `on` `sandbox`, which tree's sandbox never started; None for
         /// the other places.
         tree: Option<SandboxTree>,
+        log: String,
+    },
+    /// A regression that fails on the candidate and on the base, run again
+    /// in this gate after the candidate's runs (exit [`HOST_FAULT_EXIT`]
+    /// with a host fault `on` `candidate and base`, evidence
+    /// [`VALIDATOR_DEFECT`]): the validator's defect, no evidence against
+    /// the candidate and never a rejection; for a task's candidate, no
+    /// verdict (scripts/rsi/gate.sh, "Three classes of a failing
+    /// regression"). `defects` names the scenarios, `runs` their exits as
+    /// the gate says them.
+    ValidatorDefect {
+        scenario: String,
+        runs: String,
+        reason: String,
+        defects: Vec<String>,
         log: String,
     },
     /// Main is red on a check (exit [`HOST_FAULT_EXIT`] with the gate's
@@ -1254,41 +1277,9 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
         });
     }
     if run.status.code() == Some(HOST_FAULT_EXIT)
-        && let Some(GateFailure::HostFault {
-            scenario,
-            on,
-            runs,
-            reason,
-            tree,
-            ..
-        }) = verdict.and_then(host_fault)
+        && let Some(fact) = verdict.and_then(|file| host_fact(file, record(&run.stdout)))
     {
-        return Err(GateFailure::HostFault {
-            scenario,
-            on,
-            runs,
-            reason,
-            tree,
-            log: record(&run.stdout),
-        });
-    }
-    if run.status.code() == Some(HOST_FAULT_EXIT)
-        && let Some((scenario, runs, failures)) = verdict.and_then(main_red)
-    {
-        return Err(GateFailure::MainRed {
-            scenario,
-            runs,
-            failures,
-            log: record(&run.stdout),
-        });
-    }
-    if run.status.code() == Some(HOST_FAULT_EXIT)
-        && let Some(scenario) = verdict.and_then(cannot_judge)
-    {
-        return Err(GateFailure::CannotJudge {
-            scenario,
-            log: record(&run.stdout),
-        });
+        return Err(fact);
     }
     if !run.status.success() {
         return Err(aborted(format!("the gate ended with {}", run.status)));
@@ -1322,6 +1313,8 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
         metric: text("metric"),
         flakes: flakes(&value),
         main_red_scenarios: main_red_scenarios(&value),
+        validator_defects: script_names(&value, "validator_defects"),
+        quarantined: script_names(&value, "quarantined"),
         output,
     })
 }
@@ -1346,6 +1339,23 @@ fn flakes(value: &serde_json::Value) -> Vec<String> {
                 .iter()
                 .filter_map(serde_json::Value::as_str)
                 .filter(|name| is_check_name(name))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A fact's list `key` of script file names (a scenario's or a check's,
+/// `<name>.sh` with no path), in order; anything else in it is dropped.
+fn script_names(value: &serde_json::Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|name| is_scenario_name(name) || is_check_name(name))
                 .map(str::to_string)
                 .collect()
         })
@@ -1451,6 +1461,85 @@ pub(crate) const SANDBOX_NEVER_STARTED: &str = "sandbox_never_started";
 /// `candidate`, the candidate phase's fresh one; gate.sh `start_server`):
 /// the host's, never the candidate's, so it never counts toward the task.
 pub(crate) const TEST_SERVER_NEVER_STARTED: &str = "test_server_never_started";
+
+/// The fact an exit [`HOST_FAULT_EXIT`] states in its verdict file, as the
+/// failure it is, with the gate's `log`: a validator's defect, a host fault,
+/// a red main, a scenario this host cannot judge; None for no such fact.
+fn host_fact(file: &str, log: String) -> Option<GateFailure> {
+    if let Some((scenario, runs, reason, defects)) = validator_defect(file) {
+        return Some(GateFailure::ValidatorDefect {
+            scenario,
+            runs,
+            reason,
+            defects,
+            log,
+        });
+    }
+    if let Some(GateFailure::HostFault {
+        scenario,
+        on,
+        runs,
+        reason,
+        tree,
+        ..
+    }) = host_fault(file)
+    {
+        return Some(GateFailure::HostFault {
+            scenario,
+            on,
+            runs,
+            reason,
+            tree,
+            log,
+        });
+    }
+    if let Some((scenario, runs, failures)) = main_red(file) {
+        return Some(GateFailure::MainRed {
+            scenario,
+            runs,
+            failures,
+            log,
+        });
+    }
+    cannot_judge(file).map(|scenario| GateFailure::CannotJudge { scenario, log })
+}
+
+/// The evidence of a gate's host fault that is a validator's defect: a
+/// regression failing on the candidate and on the base, run again now
+/// (scripts/rsi/gate.sh, "Three classes of a failing regression").
+pub(crate) const VALIDATOR_DEFECT: &str = "validator_defect";
+
+/// The validator-defect fact of a verdict file: a host fault `on`
+/// `candidate and base` with the evidence [`VALIDATOR_DEFECT`] and at least
+/// one scenario in `validator_defects`, no verdict: `(scenario, runs,
+/// reason, defects)`. Without the list it is no validator defect, and is
+/// read as the host fault it otherwise is.
+fn validator_defect(file: &str) -> Option<(String, String, String, Vec<String>)> {
+    let line = file.trim();
+    if line.contains('\n') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("host_fault")?.as_bool() != Some(true)
+        || value.get("verdict").is_some()
+        || value.get("on")?.as_str() != Some("candidate and base")
+        || value.get("evidence")?.as_str() != Some(VALIDATOR_DEFECT)
+    {
+        return None;
+    }
+    let defects = script_names(&value, "validator_defects");
+    if defects.is_empty() {
+        return None;
+    }
+    let text = |name: &str| value.get(name)?.as_str().map(str::to_string);
+    let scenario = text("scenario").filter(|scenario| !scenario.is_empty())?;
+    Some((
+        scenario,
+        text("runs").unwrap_or_default(),
+        text("reason").unwrap_or_default(),
+        defects,
+    ))
+}
 
 /// The host-fault fact of a verdict file: one JSON line with `host_fault`
 /// true, a scenario, where it failed (`base`, `candidate and base`,
@@ -2357,6 +2446,53 @@ mod tests {
                 .expect("verdict")
                 .main_red_scenarios
                 .is_empty()
+        );
+    }
+
+    /// A verdict names its validator defects and the quarantined
+    /// regressions (gate.sh, "Three classes of a failing regression"):
+    /// script names only, a check's too; a fact on the candidate and the base
+    /// with the evidence `validator_defect` and a list is a validator defect,
+    /// and without the list the host fault it otherwise is.
+    #[test]
+    fn a_verdict_and_a_fact_name_the_validator_defects() {
+        let gate = FakeGate::new(
+            "echo '{\"verdict\":\"accepted\",\"validator_defects\":[\"028.sh\",\"../x.sh\",3],\"quarantined\":[\"check-web.sh\",\"a b.sh\",\"031.sh\"]}' >\"$SPAWN_GATE_VERDICT\"\n",
+        );
+        let verdict = gate.judge(&path_only()).expect("verdict");
+        assert_eq!(verdict.validator_defects, ["028.sh"]);
+        assert_eq!(verdict.quarantined, ["check-web.sh", "031.sh"]);
+        let fact = |list: &str| {
+            format!(
+                "echo '{{\"v\":1,\"host_fault\":true,\"scenario\":\"028.sh\",\"on\":\"candidate and base\",\"runs\":\"1, then 1\",\"reason\":\"r\",\"evidence\":\"validator_defect\"{list}}}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
+            )
+        };
+        let judged =
+            FakeGate::new(&fact(",\"validator_defects\":[\"028.sh\"]")).judge(&path_only());
+        let Err(GateFailure::ValidatorDefect {
+            scenario,
+            runs,
+            defects,
+            ..
+        }) = judged
+        else {
+            panic!("a validator defect: {judged:?}");
+        };
+        assert_eq!((scenario.as_str(), runs.as_str()), ("028.sh", "1, then 1"));
+        assert_eq!(defects, ["028.sh"]);
+        let judged = FakeGate::new(&fact("")).judge(&path_only());
+        assert!(
+            matches!(&judged, Err(GateFailure::HostFault { on, .. }) if on == "candidate and base"),
+            "{judged:?}"
+        );
+        // Only on the candidate and the base: a fact on the base alone with
+        // that evidence and a list is the base's host fault (rev-b N4).
+        let on_base = fact(",\"validator_defects\":[\"028.sh\"]")
+            .replace("\"on\":\"candidate and base\"", "\"on\":\"base\"");
+        let judged = FakeGate::new(&on_base).judge(&path_only());
+        assert!(
+            matches!(&judged, Err(GateFailure::HostFault { on, .. }) if on == "base"),
+            "{judged:?}"
         );
     }
 

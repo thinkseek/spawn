@@ -302,6 +302,7 @@ const ALERT_TITLES: Record<string, string> = {
   task_undelivered: "A task was never delivered",
   admission_wait: "Work waits for room",
   backup_stale: "A backup is late",
+  validator_defect: "A validator fails on main too",
 };
 
 export function alertTitle(alert: Pick<Alert, "kind" | "subject">, named: string | null = null): string {

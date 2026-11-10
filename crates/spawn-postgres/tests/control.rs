@@ -4243,3 +4243,71 @@ fn an_objective_solved_is_news_until_a_digest_tells_it() {
         "told once"
     );
 }
+
+/// A validator's defect (review-fix-gate.md, gate.sh's "Three classes of a
+/// failing regression") is a host fault of its own shape: evidence
+/// `validator_defect`, `on` `candidate and base`, and the scenarios it names
+/// (`validator_defects`, at least one, each `<name>.sh`). It counts as a
+/// host fault, never a rejection or an abort; another shape is refused.
+#[test]
+fn a_validator_defect_is_a_host_fault_of_its_own_shape() {
+    let (store, schema) = store("control_validator_defect");
+    let mission = store
+        .mission_add("Gated", &json!(["/srv/validator.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(mission, Some("/scenarios"), "gate", None, None)
+        .expect("configure");
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    let defect = |change: &dyn Fn(&mut serde_json::Value)| {
+        let mut record = json!({"type": "task.gated", "id": task, "revision": 0,
+                                "verdict": "host_fault", "base": "b1", "candidate": "c1",
+                                "reason": "validator defect: 028.sh fails on the base too",
+                                "evidence": "validator_defect",
+                                "validator_defects": ["028.sh"],
+                                "fact": {"scenario": "028.sh", "on": "candidate and base",
+                                         "runs": "1, then 1; 1", "reason": "r"},
+                                "host_faults": 1, "backoff_ms": 60_000, "escalate": false});
+        change(&mut record);
+        record
+    };
+    for (what, change) in [
+        (
+            "no list",
+            &(|r: &mut serde_json::Value| {
+                r.as_object_mut().map(|o| o.remove("validator_defects"));
+            }) as &dyn Fn(&mut serde_json::Value),
+        ),
+        ("an empty list", &|r| r["validator_defects"] = json!([])),
+        ("a path", &|r| r["validator_defects"] = json!(["../028.sh"])),
+        ("not a name", &|r| r["validator_defects"] = json!([28])),
+        ("on the base", &|r| r["fact"]["on"] = json!("base")),
+        ("no scenario", &|r| r["fact"]["scenario"] = json!("")),
+    ] {
+        let error = store
+            .integrator_record(&defect(change))
+            .expect_err(what)
+            .to_string();
+        assert!(
+            error.contains("a host_fault verdict names"),
+            "{what}: {error}"
+        );
+    }
+    store
+        .integrator_record(&defect(&|_| {}))
+        .expect("a validator defect");
+    let mut client = admin(&schema);
+    let row = client
+        .query_one(
+            "select gate_host_faults, gate_aborts, gate_rejections from mission_missions
+              where id = $1",
+            &[&mission],
+        )
+        .expect("the mission");
+    let counts: (i32, i32, i32) = (row.get(0), row.get(1), row.get(2));
+    assert_eq!(counts, (1, 0, 0), "a host fault, nothing else");
+}
