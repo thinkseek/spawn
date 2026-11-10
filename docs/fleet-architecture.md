@@ -724,7 +724,7 @@ it, on the same ladder.
 - **Named keys never wait** (backlog P1). A key command
   (`{"type":"key","key":<name>}`, the name one of escape, up, down, left,
   right, enter, y, n) presses one key in the agent's pane: from the page's
-  terminal panel while it has focus, or `spawn submit`. It is its own
+  terminal panel once a click has armed it (P11), or `spawn submit`. It is its own
   action, never text, so it never waits for the turn: Esc exists to
   interrupt a busy turn and the others answer a dialog, the very states in
   which text waits. The Bridge presses it at once, in any pane state, so
@@ -1091,8 +1091,15 @@ The second is a person's named key, `POST /api/session/<id>/key` with
 guards and idempotency rule. The name is one of the set (400 otherwise, the
 refusal naming it); a session no agent has used is 404, and one that runs no
 execution is 409 with the reason, recording nothing. The page sends a key
-only while the terminal panel itself has focus, never from a text box, with
-a modifier or on auto-repeat (`web/src/keys.ts`).
+only while the terminal panel itself has focus and is armed, never from a
+text box, with a modifier or on auto-repeat (`web/src/keys.ts`). Focus alone
+arms nothing (backlog P11): a reader who tabs into the panel, or presses Esc
+to close the drawer, sends no key. A plain primary click inside the text
+that selected nothing, or Enter on the focused panel, arms it; a scrollbar
+drag or selecting text to copy does not, so the Esc after a copy still closes
+the drawer. Armed, it is outlined and says "Keys on · Keys go to <agent>".
+Blur (a click outside included) or the keys going to another agent disarms
+it, and while it is not armed Esc closes the drawer and the arrows scroll.
 
 `/api/missions` and `/api/rsi` send what the lists show: a task's brief,
 report and review note come as their first lines with their whole length
