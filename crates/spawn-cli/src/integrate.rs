@@ -425,7 +425,8 @@
 //! the integrator by its pid file `<root>/integrate.pid`, sends it the
 //! signal and waits until that process is gone) records
 //! `integrator.draining` {`gates`: the tasks whose gates run, `bound_s`}.
-//! From then on no gate, owner judging or base warm starts; the passes go
+//! From then on no gate, owner judging, shadow judging or base warm
+//! starts; the passes go
 //! on otherwise (holds, step 0's owner landings, budgets, assignments, the
 //! landing of a verdict that arrives). Once no judging of its runs and a
 //! pass left no landing to act on (a task to land that landed, went stale
@@ -2417,6 +2418,12 @@ impl Integrator {
             );
             Ok(())
         });
+        // A drain starts no background judging: the verdicts recorded
+        // meanwhile are not shadowed (one already running is recorded when
+        // it ends, or ends with the integrator).
+        if self.draining() {
+            return;
+        }
         for want in wanted {
             shadows.offer(want);
         }
