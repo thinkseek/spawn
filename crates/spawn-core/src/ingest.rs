@@ -1035,7 +1035,53 @@ pub fn claude_version(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{claude_line, claude_version, utc_ms};
+    use super::{claude_line, claude_usage, claude_version, utc_ms};
+
+    #[test]
+    fn an_assistant_messages_usage_is_one_event_per_message_and_usage() {
+        let line = |block: &str, output: u64| {
+            format!(
+                r#"{{"type":"assistant","uuid":"{block}","timestamp":"2026-11-04T05:46:12.345Z","message":{{"id":"msg_1","model":"claude-opus-5-5","content":[{{"type":"text","text":"{block}"}}],"usage":{{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":{output}}}}}}}"#
+            )
+        };
+        let first = claude_usage(&line("a", 5)).expect("a usage");
+        assert_eq!(
+            first.kind,
+            EventKind::ModelUsage {
+                message_id: "msg_1".into(),
+                model: "claude-opus-5-5".into(),
+                at_ms: 1_793_771_172_345,
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_write_tokens: 20,
+                cache_read_tokens: 30,
+            }
+        );
+        // The second content block repeats the message: the same key, so
+        // the log appends it once.
+        let second = claude_usage(&line("b", 5)).expect("a usage");
+        assert_eq!(first.source_event_id, second.source_event_id);
+        // A later line whose usage grew is another event of the message.
+        let grown = claude_usage(&line("c", 9)).expect("a usage");
+        assert_ne!(first.source_event_id, grown.source_event_id);
+        // No usage, no id, no time, all zeros, another type: nothing.
+        for other in [
+            r#"{"type":"assistant","timestamp":"2026-11-04T05:46:12Z","message":{"id":"m","content":[]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-11-04T05:46:12Z","message":{"usage":{"input_tokens":1}}}"#,
+            r#"{"type":"assistant","message":{"id":"m","usage":{"input_tokens":1}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-11-04T05:46:12Z","message":{"id":"m","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0}}}"#,
+            r#"{"type":"user","timestamp":"2026-11-04T05:46:12Z","message":{"id":"m","usage":{"input_tokens":1}}}"#,
+            "not json \"usage\"",
+        ] {
+            assert_eq!(claude_usage(other), None, "{other}");
+        }
+        // No model named: counted under `unknown`.
+        let unnamed = claude_usage(
+            r#"{"type":"assistant","timestamp":"2026-11-04T05:46:12Z","message":{"id":"m","usage":{"output_tokens":3}}}"#,
+        )
+        .expect("a usage");
+        assert!(matches!(unnamed.kind, EventKind::ModelUsage { ref model, .. } if model == "unknown"));
+    }
 
     #[test]
     fn a_line_names_the_engine_version_it_was_written_by() {
