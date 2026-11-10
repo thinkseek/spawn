@@ -86,6 +86,12 @@ harness() {
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
 
 controller=$(cd "$(dirname "$0")/../.." && pwd)
+# The tree under test: the gate runs a scenario from the candidate's tree,
+# and $controller is the deployed controller's copy, which lacks the
+# candidate's web/src until it lands.
+tree=$(pwd)
+[ -f "$tree/web/package.json" ] && [ -d "$tree/web/src" ] ||
+    harness "run from the tree under test: no web/src under $tree"
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
 for tool in psql tmux git jq od bash sed grep awk date sort curl node sha1sum; do
@@ -599,7 +605,7 @@ test("a mission that is not halted: no item", () => {
   assert.equal(item({ missions: [{ id: 9, mission_name: "m9", halted: null, halt: null, updated_at_ms: now, state: "open", tasks: [] }], holds: [] }, 9), undefined);
 });
 EOF
-if ! BB_TREE=$controller BB_MISSIONS=$WORK/missions-halted.json BB_MISSION=$mission BB_HALT=$halt BB_REASON=$reason \
+if ! BB_TREE=$tree BB_MISSIONS=$WORK/missions-halted.json BB_MISSION=$mission BB_HALT=$halt BB_REASON=$reason \
     node --test "$WORK/needs.test.mjs" >"$WORK/needs.out" 2>&1; then
     fail "(2) web/src/home.ts's needsYou, under node alone: $(grep -E 'not ok|AssertionError|Error|expected|actual|lacks|names|count' "$WORK/needs.out" | head -n 8 | tr '\n' ' ' | head -c 900)"
 fi
