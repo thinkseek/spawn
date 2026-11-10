@@ -297,3 +297,52 @@ fn an_abandoned_gate_is_a_host_fault_of_its_own_shape() {
                                           "runs": "no status", "reason": "OOM"})))
         .expect("abandoned");
 }
+
+/// A judging whose verdict is recorded has no `abandoned` after it: the
+/// integrator that read the gate's status recorded the verdict and removed
+/// the judging's directory, so another that adopted the same gate finds its
+/// runner gone and no status. Its host fault returns the verdict, and the
+/// task stays as the verdict left it. A judging with no verdict yet records
+/// its `abandoned`.
+#[test]
+fn a_judgings_verdict_stands_over_a_later_abandoned() {
+    let (store, schema) = store("judging_verdict_then_abandoned");
+    let mut client = admin(&schema);
+    let task = reported_task(&store, "/srv/verdict-abandoned");
+    let accepted = json!({"type": "task.gated", "id": task, "revision": 0, "verdict": "accepted",
+                          "base": MAIN, "candidate": "c1", "judging": JUDGING});
+    let abandoned = |judging: &str| {
+        json!({"type": "task.gated", "id": task, "revision": 0, "verdict": "host_fault",
+               "base": MAIN, "evidence": "abandoned", "backoff_ms": 60_000,
+               "fact": {"scenario": "gate", "on": "runner", "runs": "no status",
+                        "reason": "gone"},
+               "judging": judging})
+    };
+    let verdict = store.integrator_record(&accepted).expect("accepted");
+    assert_eq!(
+        store
+            .integrator_record(&abandoned(JUDGING))
+            .expect("abandoned after it"),
+        verdict,
+        "the verdict is returned"
+    );
+    let gated = recorded(&mut client, "task.gated", JUDGING);
+    assert_eq!(gated.len(), 1, "{gated:?}");
+    assert_eq!(gated[0].1["verdict"], "accepted");
+    let host_faults: i32 = client
+        .query_one(
+            "select gate_host_faults from mission_missions m
+               join mission_tasks t on t.mission_id = m.id where t.id = $1",
+            &[&task],
+        )
+        .expect("the mission")
+        .get(0);
+    assert_eq!(host_faults, 0, "no host fault counted");
+
+    let other = "0193a2b4c5d6e7f80123456789abcde0";
+    let fault = store
+        .integrator_record(&abandoned(other))
+        .expect("abandoned with no verdict");
+    assert_ne!(fault, verdict);
+    assert_eq!(recorded(&mut client, "task.gated", other).len(), 1);
+}
