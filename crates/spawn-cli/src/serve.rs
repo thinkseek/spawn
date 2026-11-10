@@ -2541,6 +2541,56 @@ mod tests {
         assert_eq!(reached.body["error"], "SPAWN_DATABASE_URL is not set");
     }
 
+    /// The restart and reassign paths have the input's guards (POST only,
+    /// the page's Origin without the token, JSON), and a body of a reason
+    /// alone, at most 2000 bytes with no control character. Past every
+    /// guard each reaches the database (here none: 500).
+    #[test]
+    fn the_restart_and_reassign_paths_have_the_inputs_guards_and_a_reason_alone() {
+        for path in [
+            "/api/session/session_worker_a_7/restart",
+            "/api/session/session_worker_a_7/reassign",
+        ] {
+            let get = exchange(
+                Some("secret"),
+                "",
+                None,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\n\
+                     Authorization: Bearer secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                ),
+            );
+            refused(&get, 405, "GET");
+            let body = r#"{"reason":"stalled on a hung tool"}"#;
+            let named = "Host: 127.0.0.1:PORT\r\nContent-Type: application/json\r\n";
+            refused(
+                &post(None, "", None, path, named, body),
+                403,
+                "no token and no Origin",
+            );
+            let text = "Host: 127.0.0.1:PORT\r\nAuthorization: Bearer secret\r\n\
+                        Content-Type: text/plain\r\n";
+            refused(
+                &post(Some("secret"), "", None, path, text, body),
+                415,
+                "not JSON",
+            );
+            let long = format!(r#"{{"reason":"{}"}}"#, "x".repeat(2001));
+            for (bad, why) in [
+                ("not json", "not JSON"),
+                (r#"{"reason":"x","task":7}"#, "a task"),
+                (r#"{"reason":"x","type":"stop"}"#, "an action type"),
+                (r#"{"reason":"a\u001bb"}"#, "a control character"),
+                (long.as_str(), "too long"),
+            ] {
+                refused(&post(Some("secret"), "", None, path, SCRIPT, bad), 400, why);
+            }
+            let reached = post(Some("secret"), "", None, path, SCRIPT, body);
+            assert_eq!(reached.status, 500, "{reached:?}");
+            assert_eq!(reached.body["error"], "SPAWN_DATABASE_URL is not set");
+        }
+    }
+
     /// Who may write past the guards: the token's holder from anywhere, the
     /// page itself on an open network, and, with no token set, the owner's
     /// own client. Each reaches the database (here none: 500).
