@@ -187,3 +187,57 @@ fn the_record_function_refuses_a_cause_or_a_path_it_does_not_know() {
     );
     assert!(records(&mut client, "execution.cleared").is_empty());
 }
+
+/// Objective 39: `model_error` is a cause the record function accepts, and
+/// every final model record (`model_error`, or `model_unavailable` with its
+/// retries spent) is read by the dispatcher until a digest carrying its tag
+/// `<session> model-<execution>` reached the supervisor: told once.
+#[test]
+fn a_final_model_record_is_read_until_a_digest_tells_it() {
+    let (store, schema) = store("recovery_model_finals");
+    let mut client = admin(&schema);
+    let mut refused = interruption("exec_r", "model_error", "final", &Value::Null);
+    refused["evidence"] = json!({"event_id": 11, "status": 400, "error": "invalid_request",
+                                 "text": "API Error: 400 invalid"});
+    let mut spent = interruption("exec_s", "model_unavailable", "final", &Value::Null);
+    spent["evidence"] = json!({"event_id": 12, "status": 529, "error": "overloaded",
+                               "text": "API Error: 529", "retries": 2});
+    for record in [
+        &refused,
+        &spent,
+        // Neither a wait nor another cause's final record is told.
+        &interruption("exec_w", "model_unavailable", "wait", &json!(2_000)),
+        &interruption("exec_x", "stopped", "final", &Value::Null),
+    ] {
+        client
+            .query_one("select spawn_host_record($1)", &[record])
+            .expect("the owner records it");
+    }
+    let finals = store.model_finals().expect("the final model records");
+    let finals = finals.as_array().expect("a list");
+    assert_eq!(finals.len(), 2, "{finals:?}");
+    assert_eq!(finals[0]["execution_id"], "exec_r");
+    assert_eq!(finals[0]["cause"], "model_error");
+    assert_eq!(finals[0]["status"], 400);
+    assert_eq!(finals[0]["session_id"], "session_worker_recovery");
+    assert_eq!(finals[1]["execution_id"], "exec_s");
+    assert_eq!(finals[1]["retries"], 2);
+    client
+        .execute(
+            "insert into spawn_commands (principal, idempotency_key, agent_id, session_id, action,
+                                         state, succeeded, created_at_ms)
+             values ('spawn-dispatch', 'digest-1', 'agent_supervisor', 'session_supervisor',
+                     jsonb_build_object('type', 'input', 'text', 'x',
+                                        'tags', jsonb_build_array($1::text)),
+                     'finished', true, 1)",
+            &[&"session_worker_recovery model-exec_r"],
+        )
+        .expect("a digest that told it");
+    let finals = store.model_finals().expect("the final model records");
+    assert_eq!(
+        finals.as_array().map(|list| list.len()),
+        Some(1),
+        "{finals}"
+    );
+    assert_eq!(finals[0]["execution_id"], "exec_s");
+}
