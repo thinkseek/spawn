@@ -1586,31 +1586,32 @@ begin
         select e.id, e.recorded_at_ms, e.agent_id, e.session_id, e.execution_id,
                d ->> 'message_id' as message_id, d ->> 'model' as model,
                (d ->> 'at_ms')::bigint as at_ms,
-               array[(d ->> 'input_tokens')::bigint, (d ->> 'output_tokens')::bigint,
-                     (d ->> 'cache_write_tokens')::bigint,
-                     (d ->> 'cache_read_tokens')::bigint] as counts
+               (d ->> 'input_tokens')::bigint as i, (d ->> 'output_tokens')::bigint as o,
+               (d ->> 'cache_write_tokens')::bigint as w,
+               (d ->> 'cache_read_tokens')::bigint as r
           from spawn_events e
          cross join lateral (select e.kind -> 'detail' as d offset 0) x
          where e.event_name = 'model.usage' and e.recorded_at_ms >= v_since
            and e.execution_id is not null and nullif(d ->> 'message_id', '') is not null
     ), messages as (
-        select f.message_id,
-               (array_agg(f.execution_id order by f.id))[1] as execution_id,
-               (array_agg(f.agent_id order by f.id))[1] as agent_id,
-               (array_agg(f.session_id order by f.id))[1] as session_id,
-               (array_agg(f.model order by f.at_ms, f.id))[1] as model,
-               min(f.at_ms) as at_ms,
-               (array_agg(f.counts order by f.counts[1] + f.counts[2] + f.counts[3]
-                                            + f.counts[4] desc, f.id))[1] as counts,
-               max(f.id) as event_id, max(f.recorded_at_ms) as event_at_ms
-          from fresh f
-         group by f.message_id
+        -- The execution whose transcript held it first, its earliest line's
+        -- time and model, its largest usage.
+        select b.message_id, f.execution_id, f.agent_id, f.session_id, t.model, t.at_ms,
+               b.i, b.o, b.w, b.r, g.event_id, g.event_at_ms
+          from (select distinct on (message_id) message_id, i, o, w, r
+                  from fresh order by message_id, i + o + w + r desc, id) b
+          join (select distinct on (message_id) message_id, execution_id, agent_id, session_id
+                  from fresh order by message_id, id) f using (message_id)
+          join (select distinct on (message_id) message_id, model, at_ms
+                  from fresh order by message_id, at_ms, id) t using (message_id)
+          join (select message_id, max(id) as event_id, max(recorded_at_ms) as event_at_ms
+                  from fresh group by message_id) g using (message_id)
     ), changed as (
         select m.*
           from messages m
           left join spawn_cost_messages c on c.message_id = m.message_id
          where c.message_id is null
-            or m.counts[1] + m.counts[2] + m.counts[3] + m.counts[4]
+            or m.i + m.o + m.w + m.r
                > c.input_tokens + c.output_tokens + c.cache_write_tokens + c.cache_read_tokens
             or m.at_ms < c.at_ms
     ), placed as (
@@ -1636,8 +1637,8 @@ begin
          input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, usd, rates,
          event_id, event_at_ms, recorded_at_ms)
     select p.message_id, p.execution_id, p.agent_id, p.session_id, p.task_id, p.mission_id,
-           p.model, p.at_ms, p.counts[1], p.counts[2], p.counts[3], p.counts[4],
-           spawn_cost_usd(p.rates, p.counts[1], p.counts[2], p.counts[3], p.counts[4]),
+           p.model, p.at_ms, p.i, p.o, p.w, p.r,
+           spawn_cost_usd(p.rates, p.i, p.o, p.w, p.r),
            p.rates, p.event_id, p.event_at_ms, spawn_now_ms()
       from placed p
     on conflict (message_id) do update set
