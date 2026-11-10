@@ -119,13 +119,43 @@ fn each_message_counts_once_for_its_task_priced_when_recorded() {
     started(&store, &worker, 1);
     // Two lines of one message (the same usage: one event), and a later
     // line whose usage grew: the message counts its largest usage, once.
-    usage(&store, &worker, 1, ("msg_1", "model-x", now), [1000, 2000, 10_000, 50_000]);
-    usage(&store, &worker, 1, ("msg_1", "model-x", now), [1000, 2000, 10_000, 50_000]);
-    usage(&store, &worker, 1, ("msg_1", "model-x", now + 5), [1000, 4000, 10_000, 50_000]);
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_1", "model-x", now),
+        [1000, 2000, 10_000, 50_000],
+    );
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_1", "model-x", now),
+        [1000, 2000, 10_000, 50_000],
+    );
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_1", "model-x", now + 5),
+        [1000, 4000, 10_000, 50_000],
+    );
     // Timed three days ago, before the task was assigned: still the task's.
-    usage(&store, &worker, 1, ("msg_2", "model-x", now - 3 * DAY_MS), [1_000_000, 0, 0, 0]);
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_2", "model-x", now - 3 * DAY_MS),
+        [1_000_000, 0, 0, 0],
+    );
     // A model with no price: its tokens, no cost.
-    usage(&store, &worker, 1, ("msg_3", "model-z", now), [5000, 500, 0, 0]);
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_3", "model-z", now),
+        [5000, 500, 0, 0],
+    );
 
     assert_eq!(store.cost_record(&prices(3.0)).expect("record"), 3);
     // Read again, and again at other prices: nothing changes.
@@ -143,10 +173,22 @@ fn each_message_counts_once_for_its_task_priced_when_recorded() {
     );
     assert_eq!(week["total"]["unpriced_tokens"], 5500);
     let by_task = entry(&week, "tasks", "task", &json!(task));
-    near(&by_task["usd"], 3.1155, "the task, the message before it included");
+    near(
+        &by_task["usd"],
+        3.1155,
+        "the task, the message before it included",
+    );
     assert_eq!(by_task["mission"], mission);
-    near(&entry(&week, "missions", "mission", &json!(mission))["usd"], 3.1155, "the mission");
-    near(&entry(&week, "agents", "agent", &json!(worker.agent))["usd"], 3.1155, "the agent");
+    near(
+        &entry(&week, "missions", "mission", &json!(mission))["usd"],
+        3.1155,
+        "the mission",
+    );
+    near(
+        &entry(&week, "agents", "agent", &json!(worker.agent))["usd"],
+        3.1155,
+        "the agent",
+    );
     let z = entry(&week, "models", "model", &json!("model-z"));
     assert_eq!(z["usd"], Value::Null, "an unpriced model has no cost: {z}");
     let execution = entry(&week, "executions", "execution", &json!("exec_1"));
@@ -154,19 +196,41 @@ fn each_message_counts_once_for_its_task_priced_when_recorded() {
     assert_eq!(execution["unpriced_tokens"], 5500);
 
     let day = store.cost_window(now - DAY_MS, now + 1000).expect("window");
-    near(&day["total"]["usd"], 0.1155, "the day leaves out the message of 3 days ago");
+    near(
+        &day["total"]["usd"],
+        0.1155,
+        "the day leaves out the message of 3 days ago",
+    );
 
     // New spending is priced at the prices of its recording.
-    usage(&store, &worker, 1, ("msg_4", "model-x", now + 10), [100_000, 0, 0, 0]);
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_4", "model-x", now + 10),
+        [100_000, 0, 0, 0],
+    );
     assert_eq!(store.cost_record(&prices(6.0)).expect("record"), 1);
     let day = store.cost_window(now - DAY_MS, now + 1000).expect("window");
     near(&day["total"]["usd"], 0.7155, "msg_4 at $6 a million");
 
     // The daily budget: a positive amount, read with the day's spend.
-    let refused = store.mission_configure(mission, None, "review", Some(&json!({"daily_usd": 0})), None);
+    let refused = store.mission_configure(
+        mission,
+        None,
+        "review",
+        Some(&json!({"daily_usd": 0})),
+        None,
+    );
     assert!(refused.is_err(), "a budget of $0 is refused");
     store
-        .mission_configure(mission, None, "review", Some(&json!({"daily_usd": 0.5})), None)
+        .mission_configure(
+            mission,
+            None,
+            "review",
+            Some(&json!({"daily_usd": 0.5})),
+            None,
+        )
         .expect("configure");
     let budgets = store.cost_budgets(now - 1000, now + 1000).expect("budgets");
     let budget = &budgets[0];

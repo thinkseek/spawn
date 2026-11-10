@@ -79,11 +79,11 @@ impl Prices {
     /// four rates, each a number not below zero, and nothing else.
     pub(crate) fn parse(text: &str) -> Result<Self, String> {
         let bad = |why: String| format!("{SETTING}: {why}");
-        let value: Value = serde_json::from_str(text)
-            .map_err(|error| bad(format!("not JSON ({error})")))?;
+        let value: Value =
+            serde_json::from_str(text).map_err(|error| bad(format!("not JSON ({error})")))?;
         let Value::Object(models) = &value else {
             return Err(bad(
-                "not a JSON object from model name to its rates".to_string(),
+                "not a JSON object from model name to its rates".to_string()
             ));
         };
         for (model, price) in models {
@@ -109,14 +109,10 @@ impl Prices {
                 match rate.as_f64() {
                     Some(number) if number.is_finite() && number >= 0.0 => {}
                     Some(_) => {
-                        return Err(bad(format!(
-                            "{model}'s {name} rate {rate} is below zero"
-                        )));
+                        return Err(bad(format!("{model}'s {name} rate {rate} is below zero")));
                     }
                     None => {
-                        return Err(bad(format!(
-                            "{model}'s {name} rate {rate} is not a number"
-                        )));
+                        return Err(bad(format!("{model}'s {name} rate {rate} is not a number")));
                     }
                 }
             }
@@ -216,7 +212,9 @@ mod tests {
             .usd("bb-model-x", [1000, 2000, 10_000, 50_000])
             .expect("priced");
         assert!((x - 0.0855).abs() < 1e-12, "{x}");
-        let y = prices.usd("bb-model-y", [200_000, 40_000, 0, 0]).expect("priced");
+        let y = prices
+            .usd("bb-model-y", [200_000, 40_000, 0, 0])
+            .expect("priced");
         assert!((y - 0.4).abs() < 1e-12, "{y}");
         assert_eq!(prices.usd("bb-model-z", [5000, 500, 0, 0]), None);
     }
@@ -247,7 +245,11 @@ mod tests {
         let built_in = Prices::built_in();
         let text = built_in.as_value().to_string();
         assert_eq!(Prices::parse(&text).expect("valid"), built_in);
-        assert!(built_in.usd("claude-opus-5-5", [1_000_000, 0, 0, 0]).is_some());
+        assert!(
+            built_in
+                .usd("claude-opus-5-5", [1_000_000, 0, 0, 0])
+                .is_some()
+        );
     }
 
     #[test]

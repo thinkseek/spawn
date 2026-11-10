@@ -311,7 +311,9 @@ fn dollars(flags: &Flags) -> Result<Option<f64>, String> {
         return Ok(None);
     };
     let decimal = !text.is_empty()
-        && text.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.')
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
         && text.bytes().filter(|byte| *byte == b'.').count() <= 1
         && text.bytes().any(|byte| byte.is_ascii_digit());
     match text.parse::<f64>() {
@@ -861,9 +863,12 @@ mod tests {
             let refused = configure(&["--id", "4", "--daily-usd", bad]).expect_err(bad);
             assert!(refused.contains("--daily-usd"), "{bad}: {refused}");
         }
-        let refused = configure(&["--id", "4", "--daily-usd", "2", "--no-daily-usd"])
-            .expect_err("both");
-        assert!(refused.contains("--no-daily-usd and --daily-usd"), "{refused}");
+        let refused =
+            configure(&["--id", "4", "--daily-usd", "2", "--no-daily-usd"]).expect_err("both");
+        assert!(
+            refused.contains("--no-daily-usd and --daily-usd"),
+            "{refused}"
+        );
     }
 
     #[test]
