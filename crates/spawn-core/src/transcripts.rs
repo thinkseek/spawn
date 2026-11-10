@@ -173,27 +173,45 @@ pub fn archive_to(
     }
 }
 
-/// The time of the first line of the transcript at `path` from byte
-/// `offset` on that carries one (`timestamp`, RFC 3339): `None` when the
-/// file holds nothing there, `i64::MIN` when what it holds has no time
-/// that reads (a reader must take it as earlier than anything).
+/// The time of the first line of the transcript at `path` that is not
+/// whole before byte `offset` (`timestamp`, RFC 3339; the line `offset`
+/// falls inside counts, as its end is not archived): `None` when the file
+/// holds nothing from `offset` on, `i64::MIN` when what it holds has no
+/// time that reads (a reader must take it as earlier than anything).
 pub fn first_line_ms(
     host: &dyn TerminalHost,
     workspace: &WorkspaceId,
     path: &str,
     offset: u64,
 ) -> Result<Option<i64>, String> {
+    let start = offset.saturating_sub(OVERLAP);
     let bytes = host
-        .read_from(workspace, path, offset)
+        .read_from(workspace, path, start)
         .map_err(|error| format!("read {path}: {error}"))?
         .unwrap_or_default();
-    if bytes.is_empty() {
+    let cut = usize::try_from(offset - start).unwrap_or(usize::MAX);
+    if bytes.len() <= cut {
         return Ok(None);
     }
-    let at = bytes
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
-        .find_map(|line| line.get("timestamp")?.as_str().and_then(parse_rfc3339_ms));
+    let from = match bytes[..cut].iter().rposition(|byte| *byte == b'\n') {
+        Some(newline) => newline + 1,
+        None if start == 0 => 0,
+        // The line began before what was read: its time is not known.
+        None => return Ok(Some(i64::MIN)),
+    };
+    let mut lines = bytes[from..].split(|byte| *byte == b'\n');
+    // The line `offset` falls in, if it began before: read whole or not
+    // at all, it decides.
+    let at = lines
+        .by_ref()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_slice::<serde_json::Value>(line)
+                .ok()
+                .and_then(|line| line.get("timestamp")?.as_str().and_then(parse_rfc3339_ms))
+        })
+        .find(Option::is_some)
+        .flatten();
     Ok(Some(at.unwrap_or(i64::MIN)))
 }
 
