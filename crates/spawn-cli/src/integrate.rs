@@ -3239,7 +3239,9 @@ impl Judge {
         );
         let ended = now_ms();
         env.replace(gate::run_env(
-            gate::printed(&judged).and_then(gate::toolchain_of),
+            gate::printed(&judged)
+                .and_then(gate::toolchain_of)
+                .as_deref(),
         ));
         if let Ok(verdict) = &judged {
             flakes.replace(verdict.flakes.clone());
@@ -13436,7 +13438,7 @@ mod database_tests {
                       exit 0\n\
                     fi\n\
                     printf '{\"verdict\":\"accepted\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
-        let (base, source, _, mut integrator) = world("binding-head", gate);
+        let (base, source, _, integrator) = world("binding-head", gate);
         let commit = "0123456789abcdef0123456789abcdef01234567";
         let scenarios = controller_tree(&base, commit);
         let db = Db::new("binding_head");
