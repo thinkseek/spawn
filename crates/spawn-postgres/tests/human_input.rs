@@ -204,7 +204,8 @@ fn a_persons_input_from_the_page_is_the_command_spawn_submit_makes() {
     assert_eq!(claimed.principal, "human");
 
     // The session's commands say whether it waits for the turn.
-    let shown = |store: &PostgresStore| store.commands_json(SESSION, 10, 120_000).expect("commands");
+    let shown =
+        |store: &PostgresStore| store.commands_json(SESSION, 10, 120_000).expect("commands");
     assert_eq!(shown(&store)[0]["waiting"], false);
     assert_eq!(shown(&store)[0]["principal"], "human");
     assert_eq!(shown(&store)[0]["text"], text);
