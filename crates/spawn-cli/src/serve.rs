@@ -673,6 +673,14 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
         {
             return key(request, id, access, shared);
         }
+        for action in ["restart", "reassign"] {
+            if let Some(id) = path
+                .strip_prefix("/api/session/")
+                .and_then(|rest| rest.strip_suffix(&format!("/{action}")))
+            {
+                return moved(request, id, action, access, shared);
+            }
+        }
         if !matches!(request.method(), Method::Get | Method::Head) {
             return request
                 .respond(not_allowed("GET"))
@@ -969,6 +977,98 @@ fn pressed(
             ),
         )),
         Ok(spawn_postgres::HumanKey::NotRunning(why)) => Err((409, why)),
+        Err(error) => Err((500, error.to_string())),
+    }
+}
+
+/// `POST /api/session/<id>/restart` and `/reassign`, past the read guard
+/// (`access`): a person restarts the delivered task of session `id`, or
+/// reassigns it to a fresh worker (module doc).
+fn moved(
+    mut request: Request,
+    id: &str,
+    action: &str,
+    access: Access,
+    shared: &Shared,
+) -> Result<(), String> {
+    if *request.method() != Method::Post {
+        return request
+            .respond(not_allowed("POST"))
+            .map_err(|error| error.to_string());
+    }
+    let (status, body) = match move_task(&mut request, id, action, access, shared) {
+        Ok(answer) => answer,
+        Err((status, error)) => (status, json!({ "error": error })),
+    };
+    request
+        .respond(json_response(status, &body))
+        .map_err(|error| error.to_string())
+}
+
+/// The body of `POST /api/session/<id>/restart` and `/reassign`: why, and
+/// nothing else.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MoveBody {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Longest reason a person gives for a restart or a reassign, in bytes
+/// (`spawn_human_task`).
+const MAX_REASON: usize = 2000;
+
+/// The checks of a person's restart or reassign after its method, then the
+/// record: `(202, {task, session_id, agent_id, principal})` of the task and
+/// worker that now carry the work, or `(status, why)` when refused. A
+/// session that holds no delivered task is 409 with the store's reason, and
+/// nothing is recorded.
+fn move_task(
+    request: &mut Request,
+    id: &str,
+    action: &str,
+    access: Access,
+    shared: &Shared,
+) -> Result<(u16, Value), (u16, String)> {
+    let what = if action == "restart" {
+        "a restart"
+    } else {
+        "a reassign"
+    };
+    let (body, _) = write_body(request, access, shared, what)?;
+    let body: MoveBody = serde_json::from_slice(&body)
+        .map_err(|error| (400, format!("{BAD_REQUEST}the body is not {what}: {error}")))?;
+    let session = session_id(id).map_err(|error| (400, error))?;
+    let reason = body
+        .reason
+        .map(|reason| reason.trim().to_string())
+        .filter(|reason| !reason.is_empty());
+    if let Some(reason) = &reason {
+        if reason.len() > MAX_REASON {
+            return Err((
+                400,
+                format!(
+                    "{BAD_REQUEST}the reason is {} bytes; at most {MAX_REASON}",
+                    reason.len()
+                ),
+            ));
+        }
+        if reason.chars().any(char::is_control) {
+            return Err((
+                400,
+                format!("{BAD_REQUEST}the reason holds a control character"),
+            ));
+        }
+    }
+    let store = writer(shared).map_err(|error| (500, error))?;
+    match store.human_task(&session, action, reason.as_deref()) {
+        Ok(spawn_postgres::HumanTask::Moved(mut moved)) => {
+            if let Some(fields) = moved.as_object_mut() {
+                fields.insert("principal".to_string(), json!("human"));
+            }
+            Ok((202, moved))
+        }
+        Ok(spawn_postgres::HumanTask::Refused(why)) => Err((409, why)),
         Err(error) => Err((500, error.to_string())),
     }
 }
@@ -1606,6 +1706,9 @@ fn session(id: &str, query: &str) -> Result<Value, String> {
         .min(MAX_LIMIT);
     let store = open_store()?;
     let state = store.state(&session).map_err(|error| error.to_string())?;
+    let links = store
+        .session_links(session.as_str())
+        .map_err(|error| error.to_string())?;
     let executions: Vec<Value> = store
         .executions(&session)
         .map_err(|error| error.to_string())?
@@ -1621,6 +1724,7 @@ fn session(id: &str, query: &str) -> Result<Value, String> {
                 "exit_code": row.exit_code,
                 "exit_reported": row.exit_reported,
                 "duration_ms": row.duration_ms,
+                "restart_of": links["restart_of"][row.execution_id.as_str()].clone(),
             })
         })
         .collect();
@@ -1673,6 +1777,8 @@ fn session(id: &str, query: &str) -> Result<Value, String> {
             "recorded_at_ms": state.recorded_at.0,
         })),
         "executions": executions,
+        "reassigned_to": links["reassigned_to"].clone(),
+        "reassigned_from": links["reassigned_from"].clone(),
         "open_tools": open_tools,
         "freshness": freshness,
         "timeline": timeline,
