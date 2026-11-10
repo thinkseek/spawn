@@ -42,6 +42,12 @@
 //! model_auth, model_unavailable, context_exhausted, model_error, crashed,
 //! exited. Each
 //! is named in the record's evidence ([`classify`], [`model_cause`]).
+//! A host restart is the terminal server that ran the execution gone: none
+//! answers, or the one that answers is another, told by the identity the
+//! Bridge recorded when the execution's terminal started
+//! (`execution.terminal_started`), not by whether something answers when the
+//! end is read: the first resume after a reboot starts a new server, and the
+//! ends read after it are the restart's all the same ([`server_gone`]).
 //!
 //! Every revival is one command keyed `recover-<execution>-<attempt>`, the
 //! interruption it answers, submitted no earlier than its `due_ms`; its
@@ -65,7 +71,7 @@ use serde_json::{Map, Value, json};
 use spawn_core::command::CommandAction;
 use spawn_core::event::ENGINE;
 use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
-use spawn_core::port::{CommandQueue, TerminalHost};
+use spawn_core::port::{CommandQueue, ServerSeen, TerminalHost, TerminalServer};
 use spawn_postgres::PostgresStore;
 
 use crate::deliver::{self, Work};
@@ -426,8 +432,8 @@ pub(crate) struct Facts<'a> {
     pub(crate) over_budget: Option<&'a Value>,
     /// The execution's resource envelope killed it (objective 029's facts).
     pub(crate) memory: Option<&'a Value>,
-    /// The terminal server that held every terminal is gone: a host
-    /// restart took the execution with it.
+    /// The terminal server that ran the execution is gone ([`server_gone`]):
+    /// a host restart took the execution with it.
     pub(crate) terminal_server_gone: bool,
     /// A free-space reading of the workspace's filesystem under the floor,
     /// taken at the end.
@@ -441,6 +447,39 @@ pub(crate) struct Facts<'a> {
     /// how a `stopped` end came about, in its evidence.
     pub(crate) retired: bool,
     pub(crate) task_cancelled: bool,
+}
+
+/// Whether the terminal server that ran an execution is gone, `now` being
+/// the server that answers (or none). A server is told as a process is, by
+/// when it started, never by whether something answers: after a host
+/// restart the first resume starts a new server, and an end processed after
+/// it must read as the restart all the same, whatever the order of the ends.
+///
+/// - No server answers: gone.
+/// - The execution's server was recorded when its terminal started
+///   (`ran_on`): gone when the one that answers is another. Never the
+///   execution's record time: its terminal's start may be what started the
+///   server, a whole launch after the record.
+/// - None was recorded (an execution started before it was kept, or whose
+///   record failed): gone when the answering server started after the
+///   execution's record (`recorded_at_ms`): that server is not the one it
+///   ran on, which started before it (a host restart's survivors started
+///   before the boot).
+/// - A host that cannot tell which server answers: not gone (today's
+///   rule), so an end reads as a crash, never as a restart it cannot show.
+pub(crate) fn server_gone(
+    ran_on: Option<&TerminalServer>,
+    recorded_at_ms: i64,
+    now: ServerSeen,
+) -> bool {
+    match now {
+        ServerSeen::Gone => true,
+        ServerSeen::Answers(None) => false,
+        ServerSeen::Answers(Some(answers)) => match ran_on {
+            Some(ran) => *ran != answers,
+            None => answers.started_at_ms > recorded_at_ms,
+        },
+    }
 }
 
 /// The cause of an execution's end, its facts given. The first that holds
@@ -729,6 +768,11 @@ pub(crate) struct Execution {
     pub(crate) workspace: Option<String>,
     #[serde(default)]
     pub(crate) end_event_id: Option<i64>,
+    /// The terminal server its terminal started on, as the Bridge recorded
+    /// it (`execution.terminal_started`): none for an execution started
+    /// before it was kept, or whose record failed.
+    #[serde(default)]
+    pub(crate) terminal_server: Option<TerminalServer>,
 }
 
 impl Execution {
@@ -1513,12 +1557,17 @@ impl One<'_> {
             .as_ref()
             .filter(|reading| reading.free < Self::floor_bytes())
             .cloned();
+        let execution = self.execution();
         let facts = Facts {
             end: Some(end),
             stop: self.last_stop(),
             over_budget: self.row.over_budget.as_ref(),
             memory: None,
-            terminal_server_gone: !self.terminals.server_alive(),
+            terminal_server_gone: server_gone(
+                execution.terminal_server.as_ref(),
+                execution.started_at_ms,
+                self.terminals.server(),
+            ),
             disk: below.as_ref(),
             outage: None,
             retired: self.retired.contains(&self.row.session_id),
@@ -2731,6 +2780,7 @@ mod tests {
             evidence: None,
             workspace: None,
             end_event_id: ended.map(|_| 90),
+            terminal_server: None,
         }
     }
 
