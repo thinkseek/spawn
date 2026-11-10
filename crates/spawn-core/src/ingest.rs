@@ -831,9 +831,27 @@ fn tool_jobs(value: &Value, blocks: &[Value]) -> Vec<Normalized> {
 /// prompt that is the engine's notification about a background job also
 /// ends the jobs it reports, before the turn it starts.
 fn user_text(content: &Value, uuid: &str) -> Vec<Normalized> {
-    let mut events = job_ends(&whole_text(content));
+    let text = whole_text(content);
+    let mut events = job_ends(&text);
     events.extend(user_turn(content, uuid));
+    events.extend(taken(&text, uuid));
     events
+}
+
+/// The messages a user line took: one `message.taken` for each command
+/// whose marker it holds ([`crate::message`]), keyed by the line and the
+/// command, so a line read again records nothing and a line the engine
+/// wrote twice (two lines) is taken twice.
+fn taken(text: &str, uuid: &str) -> Vec<Normalized> {
+    crate::message::markers(text)
+        .into_iter()
+        .map(|command_id| {
+            keyed(
+                EventKind::MessageTaken { command_id },
+                format!("{uuid}:taken:{}", command_id.0),
+            )
+        })
+        .collect()
 }
 
 /// The turn a user line that is not a tool result starts or stops.
@@ -863,7 +881,9 @@ fn user_turn(content: &Value, uuid: &str) -> Vec<Normalized> {
 /// from the transcript's length when the execution started), never by the
 /// time a line claims: that time is written by the engine.
 ///
-/// - a prompt (a user line that is not a tool result) starts a turn;
+/// - a prompt (a user line that is not a tool result) starts a turn; one
+///   that holds a message's marker took that message (`message.taken`,
+///   [`crate::message`]);
 /// - each `tool_use` block of an assistant line starts a tool, and each
 ///   `tool_result` block of a user line ends one, failed when `is_error`;
 /// - `system`/`turn_duration`, written when a turn ends, and an interrupt
