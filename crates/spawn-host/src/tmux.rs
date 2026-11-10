@@ -789,6 +789,13 @@ impl TerminalHost for TmuxHost {
         self.wait_gone(terminal, &leaders)
     }
 
+    /// The kill waits until the session's processes are gone (seconds:
+    /// idle median 1.26 s, max 2.4 s at load 20; a bounded wait of up to
+    /// 7 s): the Bridge runs it off its loop.
+    fn terminate_waits(&self) -> bool {
+        true
+    }
+
     fn read_from(
         &self,
         workspace: &WorkspaceId,

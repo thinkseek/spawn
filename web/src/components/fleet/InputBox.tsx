@@ -185,7 +185,7 @@ export function InputBox({
 
 /** Whether this page may type into `sessionId`: the probe's answer, asked
  * again every 30 s while it is not yes. */
-function useWritable(sessionId: string): Writable {
+export function useWritable(sessionId: string): Writable {
   const [writable, setWritable] = useState<Writable>({ state: "checking" });
   useEffect(() => {
     const controller = new AbortController();

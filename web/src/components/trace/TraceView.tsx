@@ -1,25 +1,31 @@
-import { AlertTriangle, ChevronRight } from "lucide-react";
+import { AlertTriangle, ChevronRight, Crosshair, FoldHorizontal } from "lucide-react";
 import { AnimatePresence, useReducedMotion } from "motion/react";
-import { useCallback, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, MouseEvent, PointerEvent, ReactNode } from "react";
 
 import type { TimelineEvent } from "../../api";
 import { pairs } from "../../eventFormat";
 import { clockTime, formatDuration } from "../../format";
+import { LINEAR, sameFoldMap } from "../../timeFold";
 import { fitDomain } from "../../timeWindow";
 import { chainOf, deriveTrace, foldRuns, rowText, runEnd, spanEnd, visibleSpans } from "../../trace";
 import type { KnownCommand, KnownExecution, Span, SpanKind, Trace, TraceMarker } from "../../trace";
+import { fitExecution, runWindow, spanCounts, traceFold } from "../../traceWindow";
+import { useStoredChoice } from "../ViewToggle";
 import { Overview } from "../timeaxis/Overview";
 import type { OverviewLine } from "../timeaxis/Overview";
 import {
   AxisRow,
+  BreakBands,
   FloatingTip,
+  IconButton,
   Gridlines,
   LIVE_TAIL_PX,
   LiveTail,
   NowLine,
   TailGradient,
   ZoomControls,
+  useBreaks,
   useTicks,
 } from "../timeaxis/TimeAxis";
 import {
@@ -82,9 +88,24 @@ export function TraceView({
   // Open spans run to now; the clock only ticks while one is open.
   const now = useNowWhile(trace.openCount > 0);
   const traceEnd = trace.openCount > 0 ? Math.max(trace.end, now) : trace.end;
+  // Geometry.
+  const rootRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const rowsRef = useRef<HTMLDivElement>(null);
+  const width = useWidth(scrollRef);
+  const labelW = width < 640 ? 150 : 264;
+  const plotW = Math.max(0, width - labelW - 20);
+
+  // Idle gaps of 10 min or more fold into marked breaks (§4.4), as on the
+  // missions timeline; the reader can switch to a linear axis.
+  const [folding, setFolding] = useStoredChoice("spawn.trace.fold", ["on", "off"] as const, "on");
+  const fold = useMemo(
+    () => (folding === "off" ? LINEAR : traceFold(trace, traceEnd, { plotW })),
+    [folding, trace, traceEnd, plotW],
+  );
   const extent = useMemo(
-    () => fitDomain({ start: trace.start, end: traceEnd }),
-    [trace.start, traceEnd],
+    () => fitDomain({ start: fold.fold(trace.start), end: fold.fold(traceEnd) }),
+    [fold, trace.start, traceEnd],
   );
 
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
@@ -109,21 +130,53 @@ export function TraceView({
     [rows],
   );
 
-  // Geometry.
-  const rootRef = useRef<HTMLDivElement>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const rowsRef = useRef<HTMLDivElement>(null);
-  const width = useWidth(scrollRef);
-  const labelW = width < 640 ? 150 : 264;
-  const plotW = Math.max(0, width - labelW - 20);
   const view = useTimeWindow(extent, plotW, reduceMotion);
-  const { domain, px, glideTo, zoomBy } = view;
+  const { domain, glideTo, zoomBy } = view;
+  const viewPx = view.px;
+  // Real time to plot x, through the fold.
+  const px = useCallback((time: number) => viewPx(fold.fold(time)), [viewPx, fold]);
   useWheelZoom(scrollRef, view, labelW);
   const pan = useDragPan(view);
   const zoomToSpan = useCallback(
-    (span: Span) => view.zoomTo(span.start, spanEnd(span, view.latest.current.extent.to)),
-    [view],
+    (span: Span) => view.zoomTo(fold.fold(span.start), fold.fold(spanEnd(span, traceEnd))),
+    [view, fold, traceEnd],
   );
+  // Fit an execution: from its start to the live end while it runs (its
+  // start stays in view as it grows), else its whole span with some air.
+  const fitRun = useCallback(
+    (key: string | null) => {
+      const run = fitExecution(trace, key);
+      if (!run) {
+        view.fit();
+        return;
+      }
+      const target = runWindow(run, fold, traceEnd);
+      if (target.mode === "since") view.since(target.from);
+      else if (target.mode === "fixed") view.glideTo(target.domain);
+    },
+    [trace, fold, traceEnd, view],
+  );
+  // The window is kept on the folded axis; when the fold's map changes (the
+  // Linear toggle, a live session's new break or band width), move it to
+  // the same real times on the new one, before the frame is drawn. Only
+  // then: a live trace rebuilds its fold every second with the same map
+  // (sameFoldMap), and moving nothing each tick is what it should do.
+  const shownFold = useRef(fold);
+  const { refold } = view;
+  useLayoutEffect(() => {
+    const old = shownFold.current;
+    if (sameFoldMap(old, fold)) return;
+    shownFold.current = fold;
+    refold((time) => fold.fold(old.unfold(time)));
+  }, [fold, refold]);
+  // The first window fits the current execution (§4.4), not the session's
+  // lifetime: once, when the trace has one and the plot has a width.
+  const fitted = useRef(false);
+  useEffect(() => {
+    if (fitted.current || plotW <= 0 || !fitExecution(trace)) return;
+    fitted.current = true;
+    fitRun(null);
+  }, [trace, plotW, fitRun]);
 
   // Stick to the newest rows while the reader is at the bottom.
   const stickToBottom = useRef(true);
@@ -242,6 +295,9 @@ export function TraceView({
       case "0":
         glideTo(extent);
         break;
+      case "e":
+        fitRun(selected);
+        break;
     }
   };
 
@@ -255,17 +311,18 @@ export function TraceView({
     [trace, focusKey],
   );
 
-  const ticks = useTicks(domain, plotW);
+  const ticks = useTicks(domain, plotW, fold);
+  const breaks = useBreaks(domain, plotW, fold);
   const overviewLines = useMemo<OverviewLine[]>(() => {
     const count = Math.max(trace.spans.length - 1, 1);
     return trace.spans.map((span, index) => ({
       id: span.id,
-      from: span.start,
-      to: spanEnd(span, traceEnd),
+      from: fold.fold(span.start),
+      to: fold.fold(spanEnd(span, traceEnd)),
       y: trace.spans.length === 1 ? 0.5 : index / count,
       color: span.failed && span.kind === "tool" ? "var(--destructive)" : KIND_COLOR[span.kind],
     }));
-  }, [trace, traceEnd]);
+  }, [trace, traceEnd, fold]);
 
   const height = rows.length * ROW_H;
   const selectedRow = selected ? rows[rowIndex.get(selected) ?? -1] : undefined;
@@ -276,7 +333,35 @@ export function TraceView({
       <div className="flex h-11 shrink-0 items-center gap-3 px-4 sm:px-5">
         {header}
         <Legend />
-        <ZoomControls view={view} fitLabel="Fit the whole session" />
+        <div className="ml-auto flex shrink-0 items-center gap-1">
+          {fold !== LINEAR || folding === "off" ? (
+            <IconButton
+              label={
+                folding === "on"
+                  ? "Idle folded: stretches of 10 min or more with nothing happening are marked breaks; click for a linear axis"
+                  : "Linear axis; click to fold idle stretches into breaks"
+              }
+              active={folding === "on"}
+              pressed={folding === "on"}
+              onClick={() => setFolding(folding === "on" ? "off" : "on")}
+            >
+              <FoldHorizontal size={13} />
+            </IconButton>
+          ) : null}
+          {fitExecution(trace) && (
+            <IconButton
+              label={
+                selected
+                  ? "Fit the selected span's execution (e)"
+                  : "Fit the current execution (e)"
+              }
+              onClick={() => fitRun(selected)}
+            >
+              <Crosshair size={13} />
+            </IconButton>
+          )}
+          <ZoomControls view={view} fitLabel="Fit the whole session" />
+        </div>
       </div>
 
       <div className="flex shrink-0 items-stretch px-4 sm:px-5">
@@ -287,10 +372,7 @@ export function TraceView({
           <span className="tnum text-muted-foreground">
             {formatDuration(traceEnd - trace.start)}
           </span>
-          <span className="tnum truncate text-faint-foreground">
-            {trace.spans.length} spans
-            {trace.openCount > 0 && ` · ${trace.openCount} running`}
-          </span>
+          <span className="tnum truncate text-faint-foreground">{spanCounts(trace)}</span>
         </div>
         <Overview
           lines={overviewLines}
@@ -304,7 +386,7 @@ export function TraceView({
 
       <div className="relative flex min-h-0 flex-1">
         <div className="flex min-w-0 flex-1 flex-col">
-          <AxisRow ticks={ticks} labelW={labelW} plotW={plotW} caption="Span" />
+          <AxisRow ticks={ticks} breaks={breaks} labelW={labelW} plotW={plotW} caption="Span" />
 
           <div
             ref={scrollRef}
@@ -374,6 +456,7 @@ export function TraceView({
                   </clipPath>
                 </defs>
                 <g clipPath={`url(#${gradientId}-plot)`}>
+                  <BreakBands breaks={breaks} height={height} />
                   <Gridlines ticks={ticks} height={height} />
                   <NowLine x={nowX} height={height} plotW={plotW} />
                   <Connectors
@@ -485,7 +568,7 @@ function Legend() {
   return (
     <ul className="hidden items-center gap-3 md:flex" aria-label="Span kinds">
       {KIND_ORDER.map((kind) => (
-        <li key={kind} className="flex items-center gap-1.5 text-caption text-muted-foreground">
+        <li key={kind} className="flex items-center gap-1.5 whitespace-nowrap text-caption text-muted-foreground">
           <span
             aria-hidden="true"
             className="h-1.5 w-3 rounded-full"

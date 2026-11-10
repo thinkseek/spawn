@@ -1,5 +1,5 @@
-//! HTTP API and static files for the observer UI: reads, and one write, a
-//! person's input to a session.
+//! HTTP API and static files for the observer UI: reads, and two writes, a
+//! person's input to a session and a person's key.
 //!
 //! Every read goes through the same store methods the CLI uses, as the
 //! read-only `spawn_reader` login, so a defect in a read cannot change
@@ -13,7 +13,7 @@
 //! a retried POST types once; like every person's input it waits for the
 //! session's turn. It answers 202 with the command, which
 //! `/api/fleet/<id>/commands` then follows. It runs as the `spawn_human`
-//! login, whose one right is `spawn_human_input`
+//! login, whose rights are `spawn_human_input` and `spawn_human_key`
 //! (crates/spawn-postgres/sql/schema.sql): it submits no other action, reads
 //! nothing and appends no event. `{"probe": true}` in place of a text passes
 //! every guard and writes nothing: the page asks it before it offers its
@@ -28,6 +28,16 @@
 //! [`MAX_INPUT_BODY`] bytes, 413 otherwise; then a key and a text a person
 //! types (not blank, at most [`MAX_INPUT_TEXT`] bytes, no control character
 //! but tab and line ends), 400 otherwise.
+//!
+//! The other write is `POST /api/session/<id>/key` with `{"name":
+//! "escape", "key": "<idempotency key>"}` (backlog P1): the key command
+//! `spawn submit --principal human ... --action '{"type":"key","key":...}'`
+//! makes, through `spawn_human_key`, with the same guards and idempotency
+//! rule. The name is one of escape, up, down, left, right, enter, y, n (400
+//! otherwise). A key is its own action, never text, and does not wait for
+//! the turn: the Bridge sends it at once. A session no agent has used is
+//! 404; one that runs no execution is 409 with the reason, and no command
+//! is made.
 //!
 //! Reading is still worth guarding: `/api/pane/<id>` shows any live pane.
 //! `serve` binds 127.0.0.1 unless told otherwise, and on any other address
@@ -64,6 +74,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
+use spawn_core::command::NamedKey;
 use spawn_core::event::{GlobalPosition, SessionSeq};
 use spawn_core::id::{IdempotencyKey, SessionId};
 use tiny_http::{Header, Method, Request, Response, Server};
@@ -656,6 +667,12 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
         {
             return input(request, id, access, shared);
         }
+        if let Some(id) = path
+            .strip_prefix("/api/session/")
+            .and_then(|rest| rest.strip_suffix("/key"))
+        {
+            return key(request, id, access, shared);
+        }
         if !matches!(request.method(), Method::Get | Method::Head) {
             return request
                 .respond(not_allowed("GET"))
@@ -780,17 +797,20 @@ struct InputBody {
 
 /// The checks of a person's input after its method, then the probe's answer
 /// or the submission: `(status, answer)`, or `(status, why)` when refused.
-fn typed(
+/// The guards every person's write passes after its method (module doc),
+/// in order, then its body and its `Idempotency-Key` header. `what` names
+/// the write in the refusals ("an input", "a key").
+fn write_body(
     request: &mut Request,
-    id: &str,
     access: Access,
     shared: &Shared,
-) -> Result<(u16, Value), (u16, String)> {
+    what: &str,
+) -> Result<(Vec<u8>, Option<String>), (u16, String)> {
     if !access.token {
         if !same_origin(header(request, "Host"), header(request, "Origin")) {
             return Err((
                 403,
-                "forbidden: an input without the token needs this page's own Origin".to_string(),
+                format!("forbidden: {what} without the token needs this page's own Origin"),
             ));
         }
         if shared.token.is_none() && !owners_client(request.remote_addr().copied(), shared.port) {
@@ -805,11 +825,45 @@ fn typed(
     if !is_json(header(request, "Content-Type")) {
         return Err((
             415,
-            "an input is a JSON body (Content-Type: application/json)".to_string(),
+            format!("{what} is a JSON body (Content-Type: application/json)"),
         ));
     }
     let header_key = header(request, "Idempotency-Key").map(str::to_string);
     let body = read_body(request)?;
+    Ok((body, header_key))
+}
+
+/// A write's idempotency key, from its body or its `Idempotency-Key`
+/// header (the same when both), so a retried POST makes one command.
+fn idempotency(
+    body: Option<String>,
+    header: Option<String>,
+    what: &str,
+) -> Result<IdempotencyKey, (u16, String)> {
+    match (body, header) {
+        (Some(body), Some(header)) if body != header => Err((
+            400,
+            format!("{BAD_REQUEST}the key and the Idempotency-Key header differ"),
+        )),
+        (Some(key), _) | (None, Some(key)) => IdempotencyKey::new(key)
+            .map_err(|error| (400, format!("{BAD_REQUEST}the key: {error}"))),
+        (None, None) => Err((
+            400,
+            format!(
+                "{BAD_REQUEST}{what} needs an idempotency key (\"key\", or an \
+                 Idempotency-Key header), so that a retried POST makes one command"
+            ),
+        )),
+    }
+}
+
+fn typed(
+    request: &mut Request,
+    id: &str,
+    access: Access,
+    shared: &Shared,
+) -> Result<(u16, Value), (u16, String)> {
+    let (body, header_key) = write_body(request, access, shared, "an input")?;
     let body: InputBody = serde_json::from_slice(&body).map_err(|error| {
         (
             400,
@@ -831,25 +885,7 @@ fn typed(
                     "max_text_bytes": MAX_INPUT_TEXT }),
         ));
     }
-    let key = match (body.key, header_key) {
-        (Some(body), Some(header)) if body != header => {
-            return Err((
-                400,
-                format!("{BAD_REQUEST}the key and the Idempotency-Key header differ"),
-            ));
-        }
-        (Some(key), _) | (None, Some(key)) => IdempotencyKey::new(key)
-            .map_err(|error| (400, format!("{BAD_REQUEST}the key: {error}")))?,
-        (None, None) => {
-            return Err((
-                400,
-                format!(
-                    "{BAD_REQUEST}an input needs an idempotency key (\"key\", or an \
-                     Idempotency-Key header), so that a retried POST types once"
-                ),
-            ));
-        }
-    };
+    let key = idempotency(body.key, header_key, "an input")?;
     let text = typed_text(body.text).map_err(|error| (400, format!("{BAD_REQUEST}{error}")))?;
     let store = writer(shared).map_err(|error| (500, error))?;
     match store.submit_human_input(&session, &key, &text) {
@@ -865,6 +901,74 @@ fn typed(
                 session.as_str()
             ),
         )),
+        Err(error) => Err((500, error.to_string())),
+    }
+}
+
+/// `POST /api/session/<id>/key`, past the read guard (`access`): a
+/// person's named key for session `id` (module doc, backlog P1).
+fn key(mut request: Request, id: &str, access: Access, shared: &Shared) -> Result<(), String> {
+    if *request.method() != Method::Post {
+        return request
+            .respond(not_allowed("POST"))
+            .map_err(|error| error.to_string());
+    }
+    let (status, body) = match pressed(&mut request, id, access, shared) {
+        Ok(answer) => answer,
+        Err((status, error)) => (status, json!({ "error": error })),
+    };
+    request
+        .respond(json_response(status, &body))
+        .map_err(|error| error.to_string())
+}
+
+/// The body of `POST /api/session/<id>/key`: the key's name (`escape`,
+/// `up`, `down`, `left`, `right`, `enter`, `y`, `n`) and the idempotency
+/// key. Nothing else: no text, no action type, no agent, no principal.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+}
+
+/// The checks of a person's key after its method, then the submission:
+/// `(status, answer)`, or `(status, why)` when refused. A session no agent
+/// has used is 404; one that runs no execution is 409 with the store's
+/// reason, and no command is made.
+fn pressed(
+    request: &mut Request,
+    id: &str,
+    access: Access,
+    shared: &Shared,
+) -> Result<(u16, Value), (u16, String)> {
+    let (body, header_key) = write_body(request, access, shared, "a key")?;
+    let body: KeyBody = serde_json::from_slice(&body)
+        .map_err(|error| (400, format!("{BAD_REQUEST}the body is not a key: {error}")))?;
+    let session = session_id(id).map_err(|error| (400, error))?;
+    let key = idempotency(body.key, header_key, "a key")?;
+    let name = body
+        .name
+        .ok_or_else(|| (400, format!("{BAD_REQUEST}a key needs a name")))?;
+    let name =
+        NamedKey::from_name(&name).map_err(|error| (400, format!("{BAD_REQUEST}{error}")))?;
+    let store = writer(shared).map_err(|error| (500, error))?;
+    match store.submit_human_key(&session, &key, name) {
+        Ok(spawn_postgres::HumanKey::Submitted(command)) => Ok((
+            202,
+            json!({ "command_id": command.0, "session_id": session.as_str(),
+                    "principal": "human", "key": name.name() }),
+        )),
+        Ok(spawn_postgres::HumanKey::NoAgent) => Err((
+            404,
+            format!(
+                "no agent has used {}: there is nothing to press keys into",
+                session.as_str()
+            ),
+        )),
+        Ok(spawn_postgres::HumanKey::NotRunning(why)) => Err((409, why)),
         Err(error) => Err((500, error.to_string())),
     }
 }
@@ -2250,6 +2354,69 @@ mod tests {
         );
     }
 
+    const KEY: &str = "/api/session/session_supervisor/key";
+
+    /// The key path has the input's guards (POST only, the page's Origin
+    /// without the token, JSON), and its body is a name of the closed set
+    /// and an idempotency key, nothing else: no text, no action type.
+    /// Past every guard it reaches the database (here none: 500).
+    #[test]
+    fn a_keys_path_has_the_inputs_guards_and_a_name_of_the_set() {
+        let get = exchange(
+            Some("secret"),
+            "",
+            None,
+            &format!(
+                "GET {KEY} HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\n\
+                 Authorization: Bearer secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        refused(&get, 405, "GET");
+        let body = r#"{"name":"escape","key":"k-1"}"#;
+        let named = "Host: 127.0.0.1:PORT\r\nContent-Type: application/json\r\n";
+        let no_origin = post(None, "", None, KEY, named, body);
+        refused(&no_origin, 403, "no token and no Origin");
+        let text =
+            "Host: 127.0.0.1:PORT\r\nAuthorization: Bearer secret\r\nContent-Type: text/plain\r\n";
+        refused(
+            &post(Some("secret"), "", None, KEY, text, body),
+            415,
+            "not JSON",
+        );
+        for (bad, why) in [
+            ("not json", "not JSON"),
+            (r#"{"name":"escape"}"#, "no idempotency key"),
+            (r#"{"key":"k"}"#, "no name"),
+            (r#"{"name":"f1","key":"k"}"#, "a key outside the set"),
+            (r#"{"name":"Escape","key":"k"}"#, "names are exact"),
+            (r#"{"name":"escape","key":"k","text":"x"}"#, "a text"),
+            (
+                r#"{"name":"escape","key":"k","type":"stop"}"#,
+                "an action type",
+            ),
+            (r#"{"name":"escape","key":""}"#, "an empty key"),
+        ] {
+            refused(&post(Some("secret"), "", None, KEY, SCRIPT, bad), 400, why);
+        }
+        let f1 = post(
+            Some("secret"),
+            "",
+            None,
+            KEY,
+            SCRIPT,
+            r#"{"name":"f1","key":"k"}"#,
+        );
+        assert!(
+            f1.body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains(r#"key "f1" is not one of escape, up"#)),
+            "the refusal names the key: {f1:?}"
+        );
+        let reached = post(Some("secret"), "", None, KEY, SCRIPT, body);
+        assert_eq!(reached.status, 500, "{reached:?}");
+        assert_eq!(reached.body["error"], "SPAWN_DATABASE_URL is not set");
+    }
+
     /// Who may write past the guards: the token's holder from anywhere, the
     /// page itself on an open network, and, with no token set, the owner's
     /// own client. Each reaches the database (here none: 500).
@@ -2500,6 +2667,86 @@ mod tests {
             let listed = listed.as_array().expect("a list");
             assert!(listed.iter().all(|command| command["principal"] == "human"));
             assert_eq!(listed.len(), if owner_known() { 3 } else { 2 });
+        });
+    }
+
+    /// A person's key end to end through the handler into the test
+    /// database: refused 409 with the reason while the session runs no
+    /// execution (and nothing recorded), then the key command `spawn submit
+    /// --principal human` makes, once for a retried POST; 404 for a session
+    /// no agent has used.
+    #[test]
+    fn a_persons_key_reaches_the_test_database_once_and_only_into_a_running_engine() {
+        in_test_schema(|owner, store| {
+            let commands = || {
+                store
+                    .commands_json("session_supervisor", 50)
+                    .expect("commands")
+            };
+            let to = |path: &str, body: &str| {
+                post(
+                    Some("secret"),
+                    "",
+                    Some(owner.to_string()),
+                    path,
+                    SCRIPT,
+                    body,
+                )
+            };
+            let stopped = to(KEY, r#"{"name":"escape","key":"key-1"}"#);
+            assert_eq!(stopped.status, 409, "{stopped:?}");
+            assert_eq!(
+                stopped.body["error"],
+                "session_supervisor runs no execution: a key needs a running engine; resume \
+                 the session"
+            );
+            assert_eq!(commands(), json!([]), "a refused key records nothing");
+
+            spawn_core::port::EventLog::append(
+                store,
+                spawn_core::event::NewEvent {
+                    agent_id: spawn_core::id::AgentId::new("agent_supervisor")
+                        .expect("valid agent"),
+                    session_id: spawn_core::id::SessionId::new("session_supervisor")
+                        .expect("valid session"),
+                    execution_id: Some(
+                        spawn_core::id::ExecutionId::new("exec_key").expect("valid execution"),
+                    ),
+                    source: spawn_core::event::Source::Bridge,
+                    source_event_id: Some("exec_key:started".to_string()),
+                    kind: spawn_core::event::EventKind::ExecutionStarted {
+                        engine: spawn_core::event::ENGINE.to_string(),
+                        workspace: spawn_core::id::WorkspaceId::new("1:/workspaces/1")
+                            .expect("valid workspace"),
+                        command_id: spawn_core::id::CommandId(1),
+                        fork: None,
+                        model: spawn_core::event::ModelProfile::Default,
+                        transcript_from: None,
+                    },
+                },
+            )
+            .expect("an execution starts");
+            let body = r#"{"name":"down","key":"key-2"}"#;
+            let first = to(KEY, body);
+            assert_eq!(first.status, 202, "{first:?}");
+            assert_eq!(first.body["principal"], "human");
+            assert_eq!(first.body["key"], "down");
+            let id = first.body["command_id"].as_u64().expect("a command");
+            let again = to(KEY, body);
+            assert_eq!(
+                again.body["command_id"], id,
+                "a retried POST makes one command"
+            );
+            let listed = commands();
+            assert_eq!(listed.as_array().map(Vec::len), Some(1), "{listed}");
+            assert_eq!(listed[0]["action"], "key");
+            assert_eq!(listed[0]["text"], "down");
+            assert_eq!(listed[0]["principal"], "human");
+            let unknown = to(
+                "/api/session/session_never_seen/key",
+                r#"{"name":"up","key":"key-3"}"#,
+            );
+            assert_eq!(unknown.status, 404, "{unknown:?}");
         });
     }
 
