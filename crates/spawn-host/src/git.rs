@@ -1237,15 +1237,19 @@ impl WorkspaceStore for GitWorkspace {
         }
         // A pending merge stays only when the branch carries its markers.
         self.settle_pending(branch.as_str());
+        // `.spawn/` is never committed: main's copies for an open conflict
+        // markers cannot show come back from their record, into the staged
+        // tree, so a copy that fails fails the mount like any other step.
+        if let Err(error) = self.restore_main_copies(branch.as_str(), &staged) {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(error);
+        }
         if let Err(error) = self.replace_workspace(branch.as_str(), &staged, &directory) {
             let _ = std::fs::remove_dir_all(&staged);
             return Err(error);
         }
         // A fresh export is the branch head: nothing stale is left.
         self.clear_stale(branch.as_str());
-        // `.spawn/` is never committed: main's copies for an open conflict
-        // markers cannot show come back from their record.
-        self.restore_main_copies(branch.as_str(), &directory);
 
         WorkspaceId::new(format!("{branch}:{}", directory.display()))
             .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
@@ -1524,11 +1528,7 @@ impl GitWorkspace {
         match output.status.code() {
             Some(0) => {}
             Some(1) => {
-                // Only a conflict in a file's lines is shown by markers; a
-                // listing without any conflict kind is not trusted.
-                let mut conflicts = kinds.iter().filter(|kind| kind.starts_with("CONFLICT"));
-                let marked = conflicts.clone().next().is_some()
-                    && conflicts.all(|kind| kind == "CONFLICT (contents)");
+                let marked = shown_by_markers(&kinds);
                 if marked {
                     self.update_directory(&branch, &directory, &head_tree, &merged)?;
                     if let Err(error) = self.write_pending(&branch, &main, &head, &files) {
@@ -1769,7 +1769,9 @@ impl GitWorkspace {
     /// Merge `main` into `branch`, which is not mounted, only when the merge
     /// is clean ([`WorkspaceStore::merge_main_clean`]): no directory is
     /// touched; the branch moves by compare-and-swap. Any conflict leaves
-    /// the branch as it is.
+    /// the branch as it is, and brings an open record of main's copies to
+    /// the `main` it is with ([`Self::follow_main_copies`]): the mount that
+    /// comes next restores from it.
     fn merge_main_into_branch(&self, branch: &str) -> Result<BaseMerge, WorkspaceError> {
         let _lock = self.lock_branch(branch)?;
         // A merge on top would hide what the mount refuses.
@@ -1797,10 +1799,11 @@ impl GitWorkspace {
             .stdin(Stdio::null())
             .output()
             .map_err(|error| WorkspaceError::Unavailable(format!("run {}: {error}", self.git)))?;
-        let (merged, files, _) = merge_tree_output(&output.stdout);
+        let (merged, files, kinds) = merge_tree_output(&output.stdout);
         match output.status.code() {
             Some(0) => {}
             Some(1) => {
+                self.follow_main_copies(branch, &main, &files, shown_by_markers(&kinds))?;
                 return Ok(BaseMerge::Conflicted {
                     files: shown_paths(&files),
                     marked: false,
@@ -2175,26 +2178,42 @@ impl GitWorkspace {
         let _ = std::fs::remove_file(self.copies_path(branch));
     }
 
-    /// Main's version of `path` at `main`, if main has it as a file.
-    fn mains_version(&self, main: &str, path: &TreePath) -> Option<Vec<u8>> {
-        let mut spec = OsString::from(format!("{main}:"));
-        spec.push(OsStr::from_bytes(path.as_bytes()));
-        let output = self
-            .command()
-            .arg("cat-file")
-            .arg("blob")
-            .arg(spec)
-            .stdin(Stdio::null())
-            .output()
-            .ok()?;
-        output.status.success().then_some(output.stdout)
+    /// Main's version of `path` at `main`; `None` when main has no file
+    /// there. Only git's own answer is an absence: a listing or a blob git
+    /// cannot read is an error, or the note would tell the worker to delete
+    /// a file main holds.
+    fn mains_version(
+        &self,
+        main: &str,
+        path: &TreePath,
+    ) -> Result<Option<Vec<u8>>, WorkspaceError> {
+        let mut arguments: Vec<OsString> = ["ls-tree", "-z", "--full-tree", main, "--"]
+            .map(OsString::from)
+            .into();
+        arguments.push(path.pathspec("literal"));
+        let listed = self.git_listing(&arguments)?;
+        // `<mode> blob <id>\t<path>`
+        let blob = nul_fields(&listed)
+            .filter_map(tree_entry)
+            .filter(|(_, entry)| entry == path)
+            .find_map(|(meta, _)| {
+                let mut fields = meta.split_whitespace().skip(1);
+                (fields.next() == Some("blob"))
+                    .then(|| fields.next())
+                    .flatten()
+            });
+        let Some(blob) = blob else {
+            return Ok(None);
+        };
+        self.git_listing(&["cat-file", "blob", blob]).map(Some)
     }
 
     /// Write main's version of each of `files` that main has into
     /// [`MAIN_COPIES`] in `directory`, then record what was copied, atomically,
     /// so a mount can put the copies back ([`Self::restore_main_copies`]).
-    /// A record that cannot be written fails the merge: the note would
-    /// promise copies a remount loses.
+    /// A copy or a record that cannot be written fails the merge, and
+    /// nothing is recorded: the note would promise copies that are not
+    /// there, or call a file whose copy failed one main does not have.
     fn copy_mains_versions(
         &self,
         branch: &str,
@@ -2202,10 +2221,23 @@ impl GitWorkspace {
         main: &str,
         files: &[TreePath],
     ) -> Result<(), WorkspaceError> {
-        let copied: Vec<&TreePath> = files
-            .iter()
-            .filter(|file| self.copy_mains_version(directory, main, file))
-            .collect();
+        let mut copied = Vec::new();
+        for file in files {
+            if self.copy_mains_version(directory, main, file)? {
+                copied.push(file);
+            }
+        }
+        self.record_main_copies(branch, main, &copied)
+    }
+
+    /// Record, atomically, that `copied` are main's copies of `branch` at
+    /// `main` ([`Self::copies_path`]).
+    fn record_main_copies(
+        &self,
+        branch: &str,
+        main: &str,
+        copied: &[&TreePath],
+    ) -> Result<(), WorkspaceError> {
         let path = self.copies_path(branch);
         let unavailable = |what: &str, error: std::io::Error| {
             WorkspaceError::Unavailable(format!("{what} {}: {error}", path.display()))
@@ -2224,37 +2256,82 @@ impl GitWorkspace {
     }
 
     /// Copy main's version of `file` at `main` into [`MAIN_COPIES`] in
-    /// `directory` (never through a symlink the agent put there); whether it
-    /// was copied.
-    fn copy_mains_version(&self, directory: &Path, main: &str, file: &TreePath) -> bool {
-        let Some(bytes) = self.mains_version(main, file) else {
-            return false;
+    /// `directory` (never through a symlink the agent put there); `false`
+    /// when main has no such file. A version that cannot be read or
+    /// written is an error.
+    fn copy_mains_version(
+        &self,
+        directory: &Path,
+        main: &str,
+        file: &TreePath,
+    ) -> Result<bool, WorkspaceError> {
+        let Some(bytes) = self.mains_version(main, file)? else {
+            return Ok(false);
         };
         let mut copy = format!("{MAIN_COPIES}/").into_bytes();
         copy.extend_from_slice(file.as_bytes());
-        crate::agent_files::replace_with(directory, &TreePath::from_bytes(copy), &bytes).is_ok()
+        crate::agent_files::replace_with(directory, &TreePath::from_bytes(copy), &bytes)
+            .map(|()| true)
+            .map_err(|error| {
+                WorkspaceError::Unavailable(format!("copy main's version of {file}: {error}"))
+            })
+    }
+
+    /// A branch that is not mounted conflicts with `main` in `files`
+    /// (`marked`: markers would show all of it). A record of main's copies
+    /// made at an earlier `main` is not this conflict's: left as it is, the
+    /// next mount would put back that main's versions while every note
+    /// speaks of this one. So an open record follows the conflict: it names
+    /// `main` and those of `files` main has, or goes when markers would
+    /// show the conflict (the merge into the mounted workspace writes
+    /// them). A branch without a record gets none: nothing told its worker
+    /// of copies. The old record goes before anything can fail.
+    fn follow_main_copies(
+        &self,
+        branch: &str,
+        main: &str,
+        files: &[TreePath],
+        marked: bool,
+    ) -> Result<(), WorkspaceError> {
+        let Some((recorded, _)) = self.read_main_copies(branch) else {
+            return Ok(());
+        };
+        if recorded != main || marked {
+            self.clear_main_copies(branch);
+        }
+        if marked {
+            return Ok(());
+        }
+        let mut copied = Vec::new();
+        for file in files {
+            if self.mains_version(main, file)?.is_some() {
+                copied.push(file);
+            }
+        }
+        self.record_main_copies(branch, main, &copied)
     }
 
     /// At a mount: put main's copies of the branch's open conflict markers
-    /// cannot show back into the fresh `directory`, from their record, so
-    /// the note that names them still holds after the workspace was
-    /// exported again (an engine lost, a host restart, a resume). A branch
-    /// that contains the recorded main has no such conflict any more: the
-    /// record goes.
-    fn restore_main_copies(&self, branch: &str, directory: &Path) {
+    /// cannot show into the fresh `directory`, from their record, so the
+    /// note that names them still holds after the workspace was exported
+    /// again (an engine lost, a host restart, a resume). A branch that
+    /// contains the recorded main has no such conflict any more: the record
+    /// goes. A copy that cannot be made is an error: the note names it.
+    fn restore_main_copies(&self, branch: &str, directory: &Path) -> Result<(), WorkspaceError> {
         let Some((main, files)) = self.read_main_copies(branch) else {
-            return;
+            return Ok(());
         };
         let contained = self
             .commit_id_of(&format!("refs/heads/{branch}"))
             .and_then(|head| self.is_ancestor(&main, &head));
         if matches!(contained, Ok(true)) {
             self.clear_main_copies(branch);
-            return;
+            return Ok(());
         }
         for file in &files {
-            self.copy_mains_version(directory, &main, file);
+            self.copy_mains_version(directory, &main, file)?;
         }
+        Ok(())
     }
 
     /// When a workspace's directory goes (unmount) or is exported afresh
@@ -2402,6 +2479,14 @@ fn tree_entry(entry: &[u8]) -> Option<(&str, TreePath)> {
     let tab = entry.iter().position(|byte| *byte == b'\t')?;
     let meta = std::str::from_utf8(&entry[..tab]).ok()?;
     Some((meta, TreePath::from_bytes(&entry[tab + 1..])))
+}
+
+/// Whether markers show every conflict of a merge whose message kinds are
+/// `kinds` ([`merge_tree_output`]). Only a conflict in a file's lines is
+/// shown by markers; a listing without any conflict kind is not trusted.
+fn shown_by_markers(kinds: &[String]) -> bool {
+    let mut conflicts = kinds.iter().filter(|kind| kind.starts_with("CONFLICT"));
+    conflicts.clone().next().is_some() && conflicts.all(|kind| kind == "CONFLICT (contents)")
 }
 
 /// The tree, the conflicted paths and the message kinds (`Auto-merging`,
