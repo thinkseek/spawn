@@ -81,6 +81,7 @@ macro_rules! lost_before_ready {
 
 mod alerts;
 mod command_queue;
+mod cost;
 mod event_log;
 mod fleet;
 mod gateway;
