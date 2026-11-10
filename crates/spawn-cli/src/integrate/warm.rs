@@ -395,7 +395,7 @@ pub(super) fn stat_start_ticks(stat: &str) -> Option<u64> {
 /// Whether our child `pid` has exited and waits to be reaped (a zombie),
 /// read from `/proc/<pid>/stat` without reaping it. Unreadable counts as
 /// exited: a child not yet reaped always has the file.
-fn exited_unreaped(pid: u32) -> bool {
+pub(super) fn exited_unreaped(pid: u32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return true;
     };
