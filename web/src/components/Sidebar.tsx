@@ -1,9 +1,12 @@
-import { Activity, BellRing, Gauge, House, Monitor, Moon, Orbit, Rows3, Sun, Target, Waypoints } from "lucide-react";
+import { Activity, BellRing, Gauge, House, Monitor, Moon, Orbit, Rows3, Search, Sun, Target, Waypoints, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import type { OverviewSession, RsiSummary, SessionState } from "../api";
 import type { View } from "../App";
 import type { FleetAgent } from "../fleet";
+import { agentMatches, agentNames, agentSearchFields, nameTask } from "../home";
+import { focusOf, slashFocusesSearch } from "../keys";
 import { rsiPhase, sessionTaskLabel } from "../missions";
 import type { ThemeChoice } from "../theme";
 import { THEME_CHOICES, THEME_KEY, useTheme } from "../theme";
@@ -78,6 +81,23 @@ export function Sidebar({
   onSelect,
 }: SidebarProps) {
   const phase = rsiPhase(rsi);
+  const [query, setQuery] = useState("");
+  const search = useRef<HTMLInputElement>(null);
+  // "/" focuses the search (design §4.5), unless the reader is typing or the
+  // terminal panel is armed: then the key is theirs, or the agent's (P11).
+  useEffect(() => {
+    if (!agents) return;
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      const press = { key: event.key, ctrlKey: event.ctrlKey, altKey: event.altKey, metaKey: event.metaKey, ...focusOf(document.activeElement) };
+      if (!slashFocusesSearch(press) || !search.current || search.current.offsetParent === null) return;
+      event.preventDefault();
+      search.current.focus();
+      search.current.select();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [agents]);
   return (
     <aside className="hidden w-60 shrink-0 flex-col border-r border-sidebar-border bg-sidebar md:flex">
       <div className="flex h-12 shrink-0 items-center px-4">
@@ -155,6 +175,56 @@ export function Sidebar({
         </span>
       </div>
 
+      {agents && agents.length > 0 && (
+        <div className="relative shrink-0 px-2 pb-2">
+          <Search size={13} aria-hidden="true" className="pointer-events-none absolute top-1/2 left-4.5 -translate-y-1/2 text-faint-foreground" />
+          <input
+            ref={search}
+            type="search"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              // Esc clears the query; with none, it leaves the box. It never
+              // reaches a drawer's Esc while it clears.
+              if (event.key !== "Escape") return;
+              if (query) {
+                event.stopPropagation();
+                event.preventDefault();
+                setQuery("");
+              } else event.currentTarget.blur();
+            }}
+            placeholder="Find an agent, task or id"
+            aria-label="Find a session: by agent name, task number or title, mission, or id"
+            aria-keyshortcuts="/"
+            className={cx(
+              "h-8 w-full rounded-control border border-sidebar-border bg-surface pr-7 pl-7.5 text-label text-foreground placeholder:text-faint-foreground",
+              "[&::-webkit-search-cancel-button]:hidden",
+              FOCUS_RING_INSET,
+            )}
+          />
+          {query ? (
+            <button
+              type="button"
+              onClick={() => {
+                setQuery("");
+                search.current?.focus();
+              }}
+              aria-label="Clear the search"
+              className="absolute top-1/2 right-3.5 grid size-5 -translate-y-1/2 place-items-center rounded text-faint-foreground hover:text-foreground"
+            >
+              <X size={12} aria-hidden="true" />
+            </button>
+          ) : (
+            <kbd
+              aria-hidden="true"
+              className="pointer-events-none absolute top-1/2 right-3.5 -translate-y-1/2 rounded border border-sidebar-border px-1 font-mono text-micro text-faint-foreground"
+            >
+              /
+            </kbd>
+          )}
+        </div>
+      )}
+
       <nav
         aria-label="Sessions"
         className="min-h-0 flex-1 overflow-y-auto px-2 pb-3"
@@ -165,6 +235,7 @@ export function Sidebar({
             context={context}
             sessions={sessions}
             selectedId={selectedId}
+            query={query}
             onSelect={onSelect}
           />
         ) : sessions.length === 0 ? (
@@ -215,24 +286,43 @@ function GroupedSessions({
   context,
   sessions,
   selectedId,
+  query,
   onSelect,
 }: {
   agents: FleetAgent[];
   context: FleetContext;
   sessions: OverviewSession[];
   selectedId: string | null;
+  /** The search: only matching agents show, in every group, Ended open. */
+  query: string;
   onSelect: (sessionId: string) => void;
 }) {
   const [ended, setEnded] = useStoredChoice("spawn.sidebar.ended", ["open", "closed"] as const, "closed");
+  const names = useMemo(() => agentNames(agents, context), [agents, context]);
   if (agents.length === 0) {
     return <p className="px-2 py-4 text-caption text-faint-foreground">No sessions yet.</p>;
   }
   const observed = new Map(sessions.map((session) => [session.session_id, session]));
+  const searching = query.trim() !== "";
+  const nameOf = (agent: FleetAgent) => names.get(agent.session_id) ?? (agent.agent_id || agent.session_id);
+  const groups = groupAgents(agents, context).map((group) => ({
+    ...group,
+    agents: searching
+      ? group.agents.filter((agent) => agentMatches(query, agentSearchFields(agent, context, nameOf(agent))))
+      : group.agents,
+  }));
+  if (searching && groups.every((group) => group.agents.length === 0)) {
+    return (
+      <p className="px-2 py-4 text-caption text-faint-foreground">
+        No session matches “{query.trim()}”.
+      </p>
+    );
+  }
   return (
     <div className="space-y-3">
-      {groupAgents(agents, context).map((group) => {
+      {groups.map((group) => {
         if (group.agents.length === 0) return null;
-        const folds = group.id === "ended";
+        const folds = group.id === "ended" && !searching;
         const open = !folds || ended === "open";
         return (
           <section key={group.id} aria-label={AGENT_GROUP_LABEL[group.id]}>
@@ -248,6 +338,7 @@ function GroupedSessions({
               <ul className="space-y-px">
                 {group.agents.filter((agent) => open || agent.session_id === selectedId).map((agent) => {
                   const held = heldTask(agent, context);
+                  const named = nameTask(agent, context);
                   // What the log records (running, waiting, ended), never
                   // the judge's word, which can lag it: the header and the
                   // trace say the same (recordedState).
@@ -263,6 +354,8 @@ function GroupedSessions({
                       <SessionRow
                         sessionId={agent.session_id}
                         agentId={agent.agent_id}
+                        name={nameOf(agent)}
+                        line={named?.title ?? agent.task_title}
                         state={recorded.dot}
                         // Ended outside the Ended group is news: the
                         // recorded label says it ("Ended").
@@ -291,6 +384,8 @@ function GroupedSessions({
 function SessionRow({
   sessionId,
   agentId,
+  name = null,
+  line = null,
   state,
   label,
   at,
@@ -301,6 +396,10 @@ function SessionRow({
 }: {
   sessionId: string;
   agentId: string;
+  /** The agent's one name (design §4.5); without it, its id leads. */
+  name?: string | null;
+  /** What it works on, in words: its task's title. */
+  line?: string | null;
   state: SessionState;
   label: string;
   at: number | null;
@@ -314,7 +413,7 @@ function SessionRow({
       type="button"
       onClick={() => onSelect(sessionId)}
       aria-current={selected ? "true" : undefined}
-      title={[agentId || sessionId, sessionId, task].filter(Boolean).join("\n")}
+      title={[name, agentId || sessionId, sessionId, task ?? line].filter(Boolean).join("\n")}
       className={cx(
         "relative block w-full min-w-0 rounded-control px-2.5 py-1.5 text-left transition-colors",
         FOCUS_RING_INSET,
@@ -328,11 +427,15 @@ function SessionRow({
         />
       )}
       <span className="flex min-w-0 items-center gap-1.5">
-        <MiddleId
-          id={agentId || "unknown agent"}
-          title={false}
-          className="text-label font-medium text-foreground"
-        />
+        {name ? (
+          <span className="min-w-0 truncate text-label font-medium text-foreground">{name}</span>
+        ) : (
+          <MiddleId
+            id={agentId || "unknown agent"}
+            title={false}
+            className="text-label font-medium text-foreground"
+          />
+        )}
         {attention && (
           <span className="ml-auto flex shrink-0 text-warning" title="Escalated">
             <BellRing size={11} aria-hidden="true" />
@@ -346,11 +449,17 @@ function SessionRow({
         <span aria-hidden="true" className="shrink-0 text-faint-foreground">·</span>
         <Ago ms={at} className="shrink-0" />
       </span>
-      <MiddleId
-        id={sessionId}
-        title={false}
-        className="mt-px font-mono text-micro text-faint-foreground"
-      />
+      {name ? (
+        // The ids are in the title (and on the agent page); the row says
+        // what the agent works on.
+        line ? <span className="mt-px block truncate text-micro text-faint-foreground">{line}</span> : null
+      ) : (
+        <MiddleId
+          id={sessionId}
+          title={false}
+          className="mt-px font-mono text-micro text-faint-foreground"
+        />
+      )}
     </button>
   );
 }

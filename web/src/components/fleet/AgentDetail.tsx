@@ -1,7 +1,9 @@
 import {
   AlertTriangle,
   ArrowRight,
+  Check,
   CircleAlert,
+  Copy,
   History,
   Send,
   Sparkles,
@@ -54,13 +56,18 @@ import type { KeyName } from "../../keys";
 
 interface AgentDetailProps {
   agent: FleetAgent;
+  /** Its one name (design §4.5, home.ts agentNames); the ids stay beside
+   * it to copy. */
+  name?: string | null;
   onClose: () => void;
   onOpenTimeline: (sessionId: string) => void;
 }
 
 /** Slide-over with everything about one agent; its polls stop on close. */
-export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps) {
+export function AgentDetail({ agent, name = null, onClose, onOpenTimeline }: AgentDetailProps) {
   const sessionId = agent.session_id;
+  // Who the page names, in the header, the keys line and the input box.
+  const shownName = name ?? (agent.agent_id || sessionId);
   const judgements = usePoll<JudgementRecord[]>(
     `judgements:${sessionId}`,
     (signal) => fetchJudgements(sessionId, signal),
@@ -111,16 +118,17 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
         <>
           <FleetStateDot state={agent.state} />
           <h2
-            className="min-w-0 truncate text-title-sm font-semibold text-foreground"
-            title={agent.label ?? undefined}
+            className="min-w-0 shrink-0 truncate text-title-sm font-semibold text-foreground"
+            title={[shownName, agent.label].filter(Boolean).join("\n")}
           >
-            {agent.label ?? (agent.agent_id || sessionId)}
+            {name ?? agent.label ?? (agent.agent_id || sessionId)}
           </h2>
-          {agent.label && (
-            <span className="min-w-0 shrink truncate select-all font-mono text-micro text-faint-foreground">
-              {agent.agent_id || sessionId}
+          {name && agent.label && (
+            <span className="min-w-0 shrink truncate text-caption text-muted-foreground" title={agent.label}>
+              {agent.label}
             </span>
           )}
+          <CopyIds agentId={agent.agent_id} sessionId={sessionId} />
           <RoleBadge role={agent.role} />
           <FleetStateBadge state={agent.state} />
           <LiveBadge live={agent.live} />
@@ -150,7 +158,7 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
             <div className="flex min-w-0 flex-col gap-2">
               <AgentScreen
                 sessionId={sessionId}
-                keysTo={agent.live ? agent.agent_id || sessionId : null}
+                keysTo={agent.live ? shownName : null}
                 view={screenView}
                 onView={setScreenView}
                 judged={{
@@ -163,7 +171,7 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
               <div className="rounded-card bg-surface px-3 py-2.5 shadow-card">
                 <InputBox
                   sessionId={sessionId}
-                  to={agent.agent_id || sessionId}
+                  to={shownName}
                   stopped={!agent.live}
                   commands={commands.data}
                 />
@@ -1017,4 +1025,37 @@ function useAgentKeys(
       <span className={last.ok ? "text-muted-foreground" : "text-destructive"}>{last.text}</span>
     ) : undefined,
   };
+}
+
+/** The agent's ids, beside its name: a button that copies both (agent id,
+ * then session id), which its title shows. The summary below shows the
+ * session id in full. */
+function CopyIds({ agentId, sessionId }: { agentId: string; sessionId: string }) {
+  const [copied, setCopied] = useState(false);
+  const ids = [agentId, sessionId].filter(Boolean).join(" ");
+  return (
+    <span className="inline-flex shrink-0 items-center">
+      <button
+        type="button"
+        onClick={() => {
+          void navigator.clipboard?.writeText(ids).then(
+            () => {
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1_500);
+            },
+            () => setCopied(false),
+          );
+        }}
+        title={`Copy the ids: ${ids}`}
+        aria-label="Copy the agent and session ids"
+        className={cx(
+          "inline-flex h-6 shrink-0 items-center gap-1 rounded-chip px-1 text-micro text-faint-foreground hover:bg-surface-hover hover:text-foreground",
+          FOCUS_RING,
+        )}
+      >
+        {copied ? <Check size={11} aria-hidden="true" /> : <Copy size={11} aria-hidden="true" />}
+        {copied ? <span>Copied</span> : null}
+      </button>
+    </span>
+  );
 }

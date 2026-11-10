@@ -20,7 +20,7 @@ import { relativeTime } from "./format";
 import type { Missions } from "./missions";
 import { fetchMissions } from "./missions";
 import { fleetContext, missingAlwaysOn } from "./ordering";
-import { actionableAlerts, agentName, needsYou } from "./home";
+import { actionableAlerts, agentNames, needsYou } from "./home";
 
 // Its own chunk: Motion and d3 load only when the Show view opens.
 const ShowView = lazy(() =>
@@ -154,6 +154,8 @@ export default function App() {
   // /api/attention fails, both go on with the missions, alerts and host;
   // at a hold's 30-minute edge, both cross it together on the minute).
   const minute = useMinute();
+  // One name per agent (design §4.5), unique across the board.
+  const pollNames = useMemo(() => agentNames(fleetPoll.data?.agents ?? [], context), [fleetPoll.data, context]);
   const needItems = useMemo(
     () =>
       needsYou({
@@ -164,12 +166,9 @@ export default function App() {
         health: fleetPoll.data?.health ?? null,
         missingAlwaysOn: missing.length,
         now: minute,
-        nameOf: (session) => {
-          const agent = fleetPoll.data?.agents.find((entry) => entry.session_id === session);
-          return agent ? agentName(agent, context) : null;
-        },
+        nameOf: (session) => pollNames.get(session) ?? null,
       }),
-    [attention.data, missions.data, alerts.data, fleetPoll.data, missing, minute, context],
+    [attention.data, missions.data, alerts.data, fleetPoll.data, missing, minute, pollNames],
   );
   const humanCount = {
     count: needItems.filter((item) => item.tone === "act").length,
@@ -227,6 +226,7 @@ export default function App() {
   const error = overview.error ?? session.error;
   const agentId = detail?.agent_id || summary?.agent_id || null;
   const sessionId = detail?.session_id ?? selectedId;
+  const sessionName = sessionId ? (pollNames.get(sessionId) ?? null) : null;
   const rsi = overview.data?.rsi ?? null;
   const observation = summary?.observation ?? null;
 
@@ -312,11 +312,14 @@ export default function App() {
             <PageHeader
               title={
                 <>
-                  <h1 className="min-w-0 truncate text-body font-semibold text-foreground">
-                    {agentId ?? sessionId ?? "No session selected"}
+                  <h1
+                    className="min-w-0 truncate text-body font-semibold text-foreground"
+                    title={[sessionName, agentId, sessionId].filter(Boolean).join("\n") || undefined}
+                  >
+                    {sessionName ?? agentId ?? sessionId ?? "No session selected"}
                   </h1>
-                  {sessionId && agentId && (
-                    <span className="hidden truncate rounded bg-muted px-1.5 py-px font-mono text-micro text-muted-foreground sm:inline">
+                  {sessionId && (sessionName || agentId) && (
+                    <span className="hidden truncate rounded bg-muted px-1.5 py-px font-mono text-micro text-muted-foreground select-all sm:inline">
                       {sessionId}
                     </span>
                   )}
@@ -359,7 +362,7 @@ export default function App() {
                         : "text-muted-foreground"
                     }`}
                   >
-                    {entry.agent_id || entry.session_id}
+                    {pollNames.get(entry.session_id) ?? (entry.agent_id || entry.session_id)}
                   </button>
                 ))}
               </div>

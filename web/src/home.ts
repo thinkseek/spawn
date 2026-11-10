@@ -458,6 +458,69 @@ export function agentName(agent: FleetAgent, context: FleetContext, task: TaskRe
   return agent.agent_id || agent.session_id;
 }
 
+/** The task an agent's name and second line go by: the one it holds, and
+ * for a worker that holds none (it ended, or its task closed), its latest.
+ * A resident without an open task goes by its own name instead. */
+export function nameTask(agent: FleetAgent, context: FleetContext): TaskRef | null {
+  const held = heldTask(agent, context);
+  if (held || agent.role === "supervisor" || residentName(agent, context)) return held;
+  return context.lastTasks.get(agent.session_id) ?? (agent.agent_id ? context.lastTasks.get(agent.agent_id) : undefined) ?? null;
+}
+
+/**
+ * Every agent's one name (design §4.5), unique across the board: the
+ * sidebar, home, the agent page, the trace and alerts all read this map, by
+ * session id. Two agents can share a name (two workers on one task after a
+ * reassign, or an ended worker and its successor): each then carries a
+ * short suffix from its session id, the id's last word where those differ
+ * ("worker · Supply PA T222 · 239"), else its last six characters.
+ */
+export function agentNames(agents: readonly FleetAgent[], context: FleetContext): Map<string, string> {
+  const base = new Map<string, string>();
+  const bySame = new Map<string, FleetAgent[]>();
+  for (const agent of agents) {
+    const name = agentName(agent, context, nameTask(agent, context));
+    base.set(agent.session_id, name);
+    const same = bySame.get(name);
+    if (same) same.push(agent);
+    else bySame.set(name, [agent]);
+  }
+  const names = new Map(base);
+  for (const [name, same] of bySame) {
+    if (same.length < 2) continue;
+    const word = (agent: FleetAgent) => agent.session_id.split(/[_\-.]/).filter(Boolean).pop() ?? agent.session_id;
+    const tail = (agent: FleetAgent) => agent.session_id.slice(-6);
+    const words = same.map(word);
+    const tails = same.map(tail);
+    const suffixes = new Set(words).size === same.length ? words : new Set(tails).size === same.length ? tails : same.map((agent) => agent.session_id);
+    same.forEach((agent, index) => names.set(agent.session_id, `${name} · ${suffixes[index]}`));
+  }
+  return names;
+}
+
+/** Whether an agent's row matches the sidebar's search: every word of the
+ * query (case aside) is in its name (which carries its task's T-number),
+ * its ids, its task's title, or its mission. An empty query matches every
+ * agent. */
+export function agentMatches(query: string, fields: ReadonlyArray<string | null | undefined>): boolean {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return true;
+  const text = fields.filter(Boolean).join(" \n ").toLowerCase();
+  return words.every((word) => text.includes(word));
+}
+
+/** What a row is searched by: `agentMatches`'s fields for an agent. */
+export function agentSearchFields(agent: FleetAgent, context: FleetContext, name: string): string[] {
+  const task = nameTask(agent, context);
+  return [
+    name,
+    agent.agent_id,
+    agent.session_id,
+    task?.title ?? agent.task_title,
+    task?.mission_name ?? agent.mission_name,
+  ].filter((field): field is string => typeof field === "string" && field !== "");
+}
+
 const STATE_WORDS: Record<string, string> = {
   WORKING: "working",
   WAITING: "waiting at its prompt",
@@ -489,11 +552,13 @@ export function doingWords(agent: FleetAgent, task: TaskRef | null): string {
 export function agentsNow(agents: readonly FleetAgent[] | null, context: FleetContext): AgentsNow {
   const working: WorkingAgent[] = [];
   const idle: AgentsNow["idle"] = [];
+  // The board's one names (unique across it), as the sidebar shows them.
+  const names = agentNames(agents ?? [], context);
   for (const agent of agents ?? []) {
     if (!agent.live) continue;
     const task = heldTask(agent, context);
     const busy = task !== null || agent.state === "WORKING" || agent.activity.current_tool !== null || agent.activity.jobs.length > 0;
-    const name = agentName(agent, context, task);
+    const name = names.get(agent.session_id) ?? agentName(agent, context, task);
     if (!busy) {
       idle.push({ session_id: agent.session_id, name, since_ms: agent.state_since_ms });
       continue;
