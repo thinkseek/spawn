@@ -43,25 +43,16 @@ impl LocalTranscriptArchive {
 
     /// The progress record of `native`.
     fn progress_file(&self, agent: &AgentId, native: &str) -> Result<PathBuf, ArchiveError> {
-        let copy = self.file(agent, native, 0)?;
-        let name = format!("{native}.json");
-        Ok(self.progress.join(agent.as_str()).join(name)).inspect(|_| drop(copy))
+        plain_names(agent, native)?;
+        Ok(self
+            .progress
+            .join(agent.as_str())
+            .join(format!("{native}.json")))
     }
 
-    /// The file of copy `copy` of `native`. A native id names a file, so it
-    /// is held to letters, digits, `-` and `_` (Claude Code's are UUIDs).
+    /// The file of copy `copy` of `native` ([`plain_names`]).
     fn file(&self, agent: &AgentId, native: &str, copy: usize) -> Result<PathBuf, ArchiveError> {
-        let plain = |text: &str| {
-            !text.is_empty()
-                && text
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-        };
-        if !plain(native) || !plain(agent.as_str()) {
-            return Err(ArchiveError(format!(
-                "{agent}/{native} does not name an archive file"
-            )));
-        }
+        plain_names(agent, native)?;
         let name = if copy == 0 {
             format!("{native}.jsonl")
         } else {
@@ -69,6 +60,23 @@ impl LocalTranscriptArchive {
         };
         Ok(self.root.join(agent.as_str()).join(name))
     }
+}
+
+/// A native id names a file, so it is held to letters, digits, `-` and `_`
+/// (Claude Code's are UUIDs), and so is the agent.
+fn plain_names(agent: &AgentId, native: &str) -> Result<(), ArchiveError> {
+    let plain = |text: &str| {
+        !text.is_empty()
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    };
+    if !plain(native) || !plain(agent.as_str()) {
+        return Err(ArchiveError(format!(
+            "{agent}/{native} does not name an archive file"
+        )));
+    }
+    Ok(())
 }
 
 fn failed(what: &str, path: &Path, error: &std::io::Error) -> ArchiveError {
