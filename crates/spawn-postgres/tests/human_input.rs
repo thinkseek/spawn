@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use postgres::error::SqlState;
 use spawn_core::command::{CommandAction, NamedKey, Submission};
-use spawn_core::event::{CommandStep, ENGINE, EventKind, ModelProfile, NewEvent, Source};
+use spawn_core::event::{CommandStep, ENGINE, EndCause, EventKind, ModelProfile, NewEvent, Source};
 use spawn_core::id::{
     AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, WorkspaceId,
 };
@@ -44,6 +44,58 @@ fn seen(store: &PostgresStore) {
             kind: EventKind::MessageReceived,
         })
         .expect("append");
+}
+
+/// One of the session's executions, recorded as the Bridge records it.
+fn bridge(store: &PostgresStore, event_key: &str, kind: EventKind) {
+    store
+        .append(NewEvent {
+            agent_id: AgentId::new(AGENT).expect("valid agent"),
+            session_id: session(),
+            execution_id: Some(ExecutionId::new("exec_input").expect("valid execution")),
+            source: Source::Bridge,
+            source_event_id: Some(event_key.to_string()),
+            kind,
+        })
+        .expect("append");
+}
+
+/// The session's execution starts: it runs an engine to type into.
+fn start(store: &PostgresStore) {
+    bridge(
+        store,
+        "exec_input:started",
+        EventKind::ExecutionStarted {
+            engine: ENGINE.to_string(),
+            workspace: WorkspaceId::new("1:/workspaces/1").expect("valid workspace"),
+            command_id: CommandId(1),
+            fork: None,
+            model: ModelProfile::Default,
+            transcript_from: None,
+        },
+    );
+}
+
+/// The session's execution ends.
+fn end(store: &PostgresStore) {
+    bridge(
+        store,
+        "exec_input:ended",
+        EventKind::ExecutionEnded {
+            cause: EndCause::Stopped,
+            exit_code: Some(0),
+            signal: None,
+            evidence: None,
+        },
+    );
+}
+
+/// The command a typed input made (the session runs an execution).
+fn submitted(answer: HumanInput) -> CommandId {
+    match answer {
+        HumanInput::Submitted(id) => id,
+        other => panic!("not typed: {other:?}"),
+    }
 }
 
 /// A store connected as this database's `spawn_human` login, in `schema`.
@@ -86,14 +138,13 @@ fn commands(schema: &str) -> Vec<(String, String, String, String, serde_json::Va
 fn a_persons_input_from_the_page_is_the_command_spawn_submit_makes() {
     let (store, schema) = store("human_input");
     seen(&store);
+    start(&store);
     let page = human(&schema);
     let text = "Stop objective_87, then report.\nThanks";
-    let HumanInput::Submitted(id) = page
-        .submit_human_input(&session(), &key("web-1"), text)
-        .expect("typed")
-    else {
-        panic!("the session has an agent");
-    };
+    let id = submitted(
+        page.submit_human_input(&session(), &key("web-1"), text)
+            .expect("typed"),
+    );
 
     let action = CommandAction::Input {
         text: text.to_string(),
@@ -185,6 +236,7 @@ fn a_persons_input_from_the_page_is_the_command_spawn_submit_makes() {
 fn a_key_used_for_one_session_is_refused_for_another() {
     let (store, schema) = store("human_input_cross");
     seen(&store);
+    start(&store);
     let other = SessionId::new("session_b").expect("valid session");
     store
         .append(NewEvent {
@@ -277,6 +329,67 @@ fn a_key_used_for_one_session_is_refused_for_another() {
     );
 }
 
+/// Objective 040: an input needs a running engine. Refused while the
+/// session runs nothing, before its first execution and after its last,
+/// with the store's reason, and recorded nowhere; the CLI's path (`spawn
+/// submit --principal human`) still records it. An input the page already
+/// sent keeps its command after the session stopped.
+#[test]
+fn an_input_to_a_session_that_runs_nothing_is_refused_and_records_nothing() {
+    let (store, schema) = store("human_input_stopped");
+    seen(&store);
+    let page = human(&schema);
+    let refused = page
+        .submit_human_input(&session(), &key("web-i1"), "hello")
+        .expect("answered");
+    assert_eq!(
+        refused,
+        HumanInput::NotRunning(
+            "session_supervisor runs no execution: an input needs a running engine; resume \
+             the session"
+                .to_string()
+        )
+    );
+    assert!(commands(&schema).is_empty(), "nothing recorded");
+
+    start(&store);
+    let sent = submitted(
+        page.submit_human_input(&session(), &key("web-i2"), "while it runs")
+            .expect("typed"),
+    );
+    end(&store);
+    assert!(matches!(
+        page.submit_human_input(&session(), &key("web-i3"), "after its end")
+            .expect("answered"),
+        HumanInput::NotRunning(_)
+    ));
+    assert_eq!(
+        page.submit_human_input(&session(), &key("web-i2"), "while it runs")
+            .expect("retried"),
+        HumanInput::Submitted(sent),
+        "a retry of an input already sent returns its command"
+    );
+    assert_eq!(commands(&schema).len(), 1);
+
+    // `spawn submit --principal human` is unchanged: it records the input,
+    // for the Bridge to fail with its reason.
+    store
+        .submit(
+            &Principal::new("human").expect("valid principal"),
+            &Submission {
+                agent_id: AgentId::new(AGENT).expect("valid agent"),
+                session_id: session(),
+                idempotency_key: key("cli-i4"),
+                action: CommandAction::Input {
+                    text: "by the shell".to_string(),
+                    tags: Vec::new(),
+                },
+            },
+        )
+        .expect("the CLI records it");
+    assert_eq!(commands(&schema).len(), 2);
+}
+
 /// What `spawn_human_input` refuses, whoever calls it: blank text, text
 /// over 8192 bytes, a control character a terminal would read as a key, no
 /// key; and every caller but the `spawn_human` login.
@@ -284,6 +397,7 @@ fn a_key_used_for_one_session_is_refused_for_another() {
 fn only_the_human_login_types_and_only_what_a_person_types() {
     let (store, schema) = store("human_input_refused");
     seen(&store);
+    start(&store);
     let mut page = postgres::Client::connect(
         &role_url(&schema_url(&schema), "spawn_human").expect("the login's URL"),
         postgres::NoTls,

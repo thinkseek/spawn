@@ -12,8 +12,15 @@
 //! '{"type":"input","text":...}'` makes, with the same idempotency rule, so
 //! a retried POST types once (the same session and text: a key another
 //! session's input used, or other text, is 409 and nothing is made, GitHub
-//! #16 item 8); like every person's input it waits for the session's turn. It answers 202 with the command, which
-//! `/api/fleet/<id>/commands` then follows. It runs as the `spawn_human`
+//! #16 item 8); like every person's input it waits for the session's turn.
+//! It answers 202 with the command, which `/api/fleet/<id>/commands` then
+//! follows. A session no agent has used is
+//! 404; one that runs no execution (it never ran one, or its latest ended)
+//! is 409 with the reason ("<session> runs no execution: an input needs a
+//! running engine; resume the session"), and no command is made, so the
+//! person learns at once that nothing would read it (objective 040; `spawn
+//! submit` still records such an input, which the Bridge fails with the
+//! same words). It runs as the `spawn_human`
 //! login, whose rights are `spawn_human_input` and `spawn_human_key`
 //! (crates/spawn-postgres/sql/schema.sql): it submits no other action, reads
 //! nothing and appends no event. `{"probe": true}` in place of a text passes
@@ -895,7 +902,6 @@ fn typed(
             json!({ "command_id": command.0, "session_id": session.as_str(),
                     "principal": "human" }),
         )),
-        Ok(spawn_postgres::HumanInput::KeyUsed(why)) => Err((409, why)),
         Ok(spawn_postgres::HumanInput::NoAgent) => Err((
             404,
             format!(
@@ -903,6 +909,12 @@ fn typed(
                 session.as_str()
             ),
         )),
+        // Nothing runs: refused with the store's reason, before any command
+        // is made (objective 040), so the person learns it at once. A key
+        // another request used is refused the same way (#16 item 8).
+        Ok(
+            spawn_postgres::HumanInput::NotRunning(why) | spawn_postgres::HumanInput::KeyUsed(why),
+        ) => Err((409, why)),
         Err(error) => Err((500, error.to_string())),
     }
 }
@@ -2603,9 +2615,38 @@ mod tests {
         }
     }
 
+    /// The supervisor's session starts an execution, as the Bridge records it.
+    fn execution_starts(store: &spawn_postgres::PostgresStore) {
+        spawn_core::port::EventLog::append(
+            store,
+            spawn_core::event::NewEvent {
+                agent_id: spawn_core::id::AgentId::new("agent_supervisor").expect("valid agent"),
+                session_id: spawn_core::id::SessionId::new("session_supervisor")
+                    .expect("valid session"),
+                execution_id: Some(
+                    spawn_core::id::ExecutionId::new("exec_key").expect("valid execution"),
+                ),
+                source: spawn_core::event::Source::Bridge,
+                source_event_id: Some("exec_key:started".to_string()),
+                kind: spawn_core::event::EventKind::ExecutionStarted {
+                    engine: spawn_core::event::ENGINE.to_string(),
+                    workspace: spawn_core::id::WorkspaceId::new("1:/workspaces/1")
+                        .expect("valid workspace"),
+                    command_id: spawn_core::id::CommandId(1),
+                    fork: None,
+                    model: spawn_core::event::ModelProfile::Default,
+                    transcript_from: None,
+                },
+            },
+        )
+        .expect("an execution starts");
+    }
+
     /// The accepted case, end to end through the handler into the test
-    /// database: the probe writes nothing, an input is the command `spawn
-    /// submit --principal human` makes, and a retried POST types once.
+    /// database: the probe writes nothing; an input to a session that runs
+    /// no execution is refused 409 with the reason and records nothing
+    /// (objective 040); once it runs, an input is the command `spawn submit
+    /// --principal human` makes, and a retried POST types once.
     #[test]
     fn a_persons_input_reaches_the_test_database_once() {
         in_test_schema(|owner, store| {
@@ -2622,6 +2663,23 @@ mod tests {
             assert_eq!(probe.body["writable"], true);
             assert_eq!(probe.body["max_text_bytes"], MAX_INPUT_TEXT);
             assert_eq!(commands(), json!([]), "a probe writes nothing");
+
+            // Nothing runs yet: refused with the reason, nothing recorded.
+            let stopped = to(
+                Some("secret"),
+                "",
+                SCRIPT,
+                INPUT,
+                r#"{"text":"anyone there?","key":"page-0"}"#,
+            );
+            assert_eq!(stopped.status, 409, "{stopped:?}");
+            assert_eq!(
+                stopped.body["error"],
+                "session_supervisor runs no execution: an input needs a running engine; \
+                 resume the session"
+            );
+            assert_eq!(commands(), json!([]), "a refused input records nothing");
+            execution_starts(store);
 
             let body = r#"{"text":"Stop objective_87 and report.\nThanks","key":"page-1"}"#;
             let first = to(Some("secret"), "", SCRIPT, INPUT, body);
@@ -2723,30 +2781,7 @@ mod tests {
             );
             assert_eq!(commands(), json!([]), "a refused key records nothing");
 
-            spawn_core::port::EventLog::append(
-                store,
-                spawn_core::event::NewEvent {
-                    agent_id: spawn_core::id::AgentId::new("agent_supervisor")
-                        .expect("valid agent"),
-                    session_id: spawn_core::id::SessionId::new("session_supervisor")
-                        .expect("valid session"),
-                    execution_id: Some(
-                        spawn_core::id::ExecutionId::new("exec_key").expect("valid execution"),
-                    ),
-                    source: spawn_core::event::Source::Bridge,
-                    source_event_id: Some("exec_key:started".to_string()),
-                    kind: spawn_core::event::EventKind::ExecutionStarted {
-                        engine: spawn_core::event::ENGINE.to_string(),
-                        workspace: spawn_core::id::WorkspaceId::new("1:/workspaces/1")
-                            .expect("valid workspace"),
-                        command_id: spawn_core::id::CommandId(1),
-                        fork: None,
-                        model: spawn_core::event::ModelProfile::Default,
-                        transcript_from: None,
-                    },
-                },
-            )
-            .expect("an execution starts");
+            execution_starts(store);
             let body = r#"{"name":"down","key":"key-2"}"#;
             let first = to(KEY, body);
             assert_eq!(first.status, 202, "{first:?}");

@@ -1176,7 +1176,14 @@ revoke execute on function spawn_human_replay(bigint, text, text, jsonb) from pu
 -- the session's turn (crates/spawn-core/src/bridge.rs). The agent is the one
 -- the session belongs to (`spawn_agent_sessions`): the caller cannot pair a
 -- session with another agent. Returns the command, or null when no agent
--- has used the session. Only the `spawn_human` login may call it, and it may
+-- has used the session. An input needs a running engine (objective 040): a
+-- session with no live execution (it never ran one, or its latest ended) is
+-- refused here with the reason (SQLSTATE 55000, which the page answers 409),
+-- and records no command, so the person learns at once that it went nowhere;
+-- a repeated key returns its first command even if the session stopped
+-- since. (`spawn submit` is unchanged: it records the command, and the
+-- Bridge fails it with the same reason.) Only the `spawn_human` login may
+-- call it, and it may
 -- call nothing else: it reads nothing (no grant), appends no event, and
 -- submits no other action and as no other principal. The text is what a
 -- person types: not blank, at most 8192 bytes (serve.rs `MAX_INPUT_TEXT`),
@@ -1187,6 +1194,7 @@ returns bigint language plpgsql security definer as $$
 declare
     v_agent text;
     v_action jsonb;
+    v_first bigint;
 begin
     if spawn_principal() is distinct from 'human' then
         raise exception '% may not type as a person (only the spawn_human login does)',
@@ -1212,6 +1220,17 @@ begin
         return null;
     end if;
     v_action := jsonb_build_object('type', 'input', 'text', p_text);
+    -- A repeated key returns its first command even if the session stopped
+    -- since (objective 040), for the same session and text only (#16 item 8).
+    select c.id into v_first from spawn_commands c
+     where c.principal = 'human' and c.idempotency_key = p_key;
+    if v_first is not null then
+        return spawn_human_replay(v_first, p_key, p_session, v_action);
+    end if;
+    if not exists (select 1 from agent_status a where a.session_id = p_session and a.live) then
+        raise exception '% runs no execution: an input needs a running engine; resume the session',
+            p_session using errcode = '55000';
+    end if;
     return (select spawn_human_replay(s.out_id, p_key, p_session, v_action)
               from spawn_submit('human', p_key, v_agent, p_session, v_action) s);
 end $$;
