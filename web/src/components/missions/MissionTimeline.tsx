@@ -11,12 +11,14 @@ import {
   earlierLabel,
   filterLanes,
   hasBars,
+  headerLane,
   holdText,
   holdTitle,
   isLive,
   laneLifetimeText,
   laneToday,
   laneTodayText,
+  titleReason,
   phaseAt,
   splitEarlier,
 } from "../../missionTimeline";
@@ -754,6 +756,7 @@ export function MissionTimeline({
                         <LaneLabel
                           key={row.key}
                           row={row}
+                          whole={headerLane(timeline.lanes, row.lane)}
                           now={clock}
                           hold={holds.find((hold) => hold.hold === row.lane.mission.hold) ?? null}
                           collapsed={row.folded}
@@ -1042,12 +1045,16 @@ const LANE_STATE: Record<Lane["state"], { label: string; dot: string; text: stri
 
 function LaneLabel({
   row,
+  whole,
   now,
   hold,
   collapsed,
   onToggle,
 }: {
   row: Extract<Row, { kind: "lane" }>;
+  /** The mission's whole lane: a state filter thins `row.lane`'s bars, and
+   * the header tells the mission's day, not the filter's. */
+  whole: Lane;
   now: number;
   /** Its source's hold, when the owner holds it. */
   hold: SourceHold | null;
@@ -1057,7 +1064,7 @@ function LaneLabel({
   const { lane } = row;
   const state = LANE_STATE[lane.state];
   // Its day, not its lifetime (design §2.3); the totals are in the title.
-  const day = laneToday(lane, now);
+  const day = laneToday(whole, now);
   const today = laneTodayText(day, now);
   const lifetime = laneLifetimeText(lane.counts);
   return (
@@ -1101,7 +1108,7 @@ function LaneLabel({
         </span>
         <span
           className="tnum hidden min-w-0 truncate text-caption text-muted-foreground sm:inline"
-          title={`${today}${day.lastBack?.reason ? `\n\n${day.lastBack.reason}\n` : ""}\n${lifetime}\naccepted by ${lane.mission.gate ? (lane.mission.accept === "gate" ? "the gate" : "review, then the gate") : "review"}`}
+          title={`${today}${day.lastBack?.reason ? `\n\n${titleReason(day.lastBack.reason)}\n` : ""}\n${lifetime}\naccepted by ${lane.mission.gate ? (lane.mission.accept === "gate" ? "the gate" : "review, then the gate") : "review"}`}
         >
           {today}
         </span>

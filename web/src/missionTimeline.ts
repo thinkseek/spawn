@@ -613,3 +613,20 @@ export function holdTitle(
   if (hold.waiting.length > 0) lines.push(`waiting: ${hold.waiting.map((task) => `T${task}`).join(", ")}`);
   return lines.join("\n");
 }
+
+/** The lane a header tells the day of: the mission's whole lane, whatever
+ * bars a state filter left on the row (rows come from `filterLanes`; the
+ * header's counts, like the lifetime ones, are the mission's). */
+export function headerLane(all: readonly Lane[], shown: Lane): Lane {
+  return all.find((lane) => lane.key === shown.key) ?? shown;
+}
+
+/** The most of a send-back's reason a title holds: a gate's reason can be a
+ * whole log. */
+export const TITLE_REASON_CHARS = 2000;
+
+/** A reason for a title: whole up to TITLE_REASON_CHARS, else clipped with
+ * "…". */
+export function titleReason(reason: string): string {
+  return reason.length > TITLE_REASON_CHARS ? `${reason.slice(0, TITLE_REASON_CHARS - 1)}…` : reason;
+}
