@@ -176,3 +176,84 @@ fn only_the_owner_records_alerts() {
         "the supervisor reads when the session was scored: {stuck}"
     );
 }
+
+/// P12: the `source_away` reading lists the open and active missions'
+/// sources, and the dispatcher's news holds each `source_away` record (fired
+/// and cleared, nothing of another kind) until a digest carries its tag.
+#[test]
+fn the_sources_away_are_listed_and_are_news_until_told() {
+    let (store, schema) = store("alerts_source_away");
+    let mut client = admin(&schema);
+    let open = store
+        .mission_add(
+            "open",
+            &json!(["/srv/open.git", "https://example.com/x.git"]),
+            "human",
+        )
+        .expect("add");
+    let done = store
+        .mission_add("done", &json!(["/srv/done.git"]), "human")
+        .expect("add");
+    client
+        .execute(
+            "update mission_missions set state = 'done' where id = $1",
+            &[&done],
+        )
+        .expect("close one");
+    assert_eq!(
+        store.alert_mission_sources().expect("sources"),
+        json!([{"mission": open, "sources": ["/srv/open.git", "https://example.com/x.git"]}]),
+        "the open mission only, every source as recorded"
+    );
+
+    let subject = format!("mission #{open}");
+    let away = json!({
+        "type": "alert.fired", "key": "source_away:1:100", "kind": "source_away",
+        "subject": subject, "evidence": {"source": "/srv/open.git", "present": false},
+        "text": "/srv/open.git is not a directory on this host", "notice": false,
+    });
+    let fired_id = store.alert_record(&away).expect("fire");
+    store
+        .alert_record(&fired("memory_low:1", false))
+        .expect("another kind");
+    let back = json!({
+        "type": "alert.cleared", "key": "source_away:1:100", "kind": "source_away",
+        "subject": subject, "evidence": {"source": "/srv/open.git", "present": true},
+    });
+    let cleared_id = store.alert_record(&back).expect("clear");
+    let news = store.source_away_news().expect("news");
+    let seen: Vec<(Value, Value)> = news
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|record| (record["type"].clone(), record["event_id"].clone()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (json!("alert.fired"), json!(fired_id)),
+            (json!("alert.cleared"), json!(cleared_id))
+        ],
+        "both records, oldest first, nothing of memory_low: {news}"
+    );
+    assert_eq!(news[0]["evidence"]["source"], "/srv/open.git");
+    assert!(news[0]["at_ms"].is_i64());
+
+    client
+        .execute(
+            "insert into spawn_commands (principal, idempotency_key, agent_id, session_id, action,
+                                         state, succeeded, created_at_ms)
+             values ('spawn-dispatch', 'digest-1', 'agent_supervisor', 'session_supervisor',
+                     jsonb_build_object('type', 'input', 'text', 'x',
+                                        'tags', jsonb_build_array($1::text)),
+                     'finished', true, 1)",
+            &[&format!("host source-away-{fired_id}")],
+        )
+        .expect("a digest that told the first");
+    let news = store.source_away_news().expect("news");
+    assert_eq!(news.as_array().map(Vec::len), Some(1), "{news}");
+    assert_eq!(
+        news[0]["event_id"], cleared_id,
+        "only the end is left to tell"
+    );
+}

@@ -2096,6 +2096,92 @@ fn the_attention_view_reads_when_each_tag_was_first_told() {
     );
 }
 
+/// GitHub #16 item 9: the dispatcher's facts say where the live execution's
+/// latest turn event is in the session (`turn_seq`), so a reader can tell a
+/// judgement of the turn that ended from one of an earlier turn. A turn is
+/// judged, a person answers, the answer's turn ends: the latest judgement
+/// is then based before `turn_seq` until the Observer judges again.
+#[test]
+fn the_facts_place_the_latest_turn_so_an_earlier_turns_judgement_is_told_apart() {
+    let (store, _schema) = store("turn_seq");
+    let execution = ExecutionId::new("exec_1").expect("valid execution");
+    // The supervisor's session: the facts read it and the workers'.
+    let of_supervisor = |event: NewEvent| NewEvent {
+        agent_id: AgentId::new("agent_supervisor").expect("valid agent"),
+        session_id: SessionId::new("session_supervisor").expect("valid session"),
+        ..event
+    };
+    let turn = |key: &str, kind: EventKind| {
+        store
+            .append(of_supervisor(lifecycle(
+                &execution,
+                Source::Claude,
+                key,
+                kind,
+            )))
+            .expect("append")
+            .record
+            .session_seq
+            .0
+    };
+    let stopped = || EventKind::TurnStopped {
+        input_tokens: None,
+        output_tokens: None,
+    };
+    let row = || store.dispatch_facts().expect("facts")[0].clone();
+    let based_on = |row: &serde_json::Value| row["observation"]["based_on_seq"].clone();
+
+    store
+        .append(of_supervisor(lifecycle(
+            &execution,
+            Source::Bridge,
+            "exec_1:started",
+            EventKind::ExecutionStarted {
+                engine: ENGINE.to_string(),
+                workspace: WorkspaceId::new("1:/workspaces/1").expect("valid workspace"),
+                command_id: CommandId(1),
+                fork: None,
+                model: ModelProfile::Default,
+                transcript_from: None,
+            },
+        )))
+        .expect("an execution starts");
+    assert!(row()["turn_seq"].is_null(), "no turn yet");
+    turn("message-1", EventKind::MessageReceived);
+    let asked = turn("turn-1", stopped());
+    // The Observer judges the turn that ended.
+    store
+        .append(of_supervisor(observed(asked)))
+        .expect("judged");
+    let facts = row();
+    assert_eq!(facts["turn_ended"], true);
+    assert_eq!(facts["turn_seq"], asked);
+    assert_eq!(
+        based_on(&facts),
+        asked,
+        "the judgement is of this turn: {facts}"
+    );
+
+    // A person answers: a new turn runs, then ends, not judged yet.
+    let answer = turn("message-2", EventKind::MessageReceived);
+    let facts = row();
+    assert_eq!(facts["turn_ended"], false);
+    assert_eq!(facts["turn_seq"], answer);
+    let ended = turn("turn-2", stopped());
+    let facts = row();
+    assert_eq!(facts["turn_ended"], true);
+    assert_eq!(facts["turn_seq"], ended);
+    assert!(
+        based_on(&facts).as_u64() < Some(ended),
+        "the latest judgement is the earlier turn's: {facts}"
+    );
+    store
+        .append(of_supervisor(observed(ended)))
+        .expect("judged again");
+    let facts = row();
+    assert_eq!(based_on(&facts), facts["turn_seq"]);
+}
+
 /// The attention view reads where the supervisor's engine writes its
 /// transcript (the latest `session.native_started` that names one) and when
 /// its latest turn ended, whether a turn started since or not.

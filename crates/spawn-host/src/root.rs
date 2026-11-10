@@ -17,34 +17,53 @@
 //! configured, by a version that did not resolve it, still name the same
 //! directory; [`legacy_workspace`] says where it is now.
 
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// `path` with every symlink in it resolved, as `realpath` gives it, also
-/// when it does not exist yet: the longest prefix that exists is resolved
-/// and the rest appended as given. A relative path is taken from the
-/// current directory. Called where a root is configured, never per use.
+/// when it does not exist yet: what exists is resolved, and the rest is
+/// appended with its `.` and `..` taken out (`realpath -m`), a `..` after a
+/// missing name removing that name. That is the path the kernel gives the
+/// process once the directories are made (`<base>/missing/../workspaces` is
+/// `<base>/workspaces`), so the name does not depend on whether the root
+/// existed when it was configured. A `..` never climbs above the file
+/// system's root. A relative path is taken from the current directory.
+/// Called where a root is configured, never per use.
 pub fn canonical_root(path: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir().map_or_else(|_| path.to_path_buf(), |here| here.join(path))
     };
-    let mut existing = absolute.as_path();
-    let mut missing: Vec<&OsStr> = Vec::new();
-    loop {
-        if let Ok(mut resolved) = std::fs::canonicalize(existing) {
-            resolved.extend(missing.iter().rev());
-            return resolved;
-        }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                missing.push(name);
-                existing = parent;
+    let mut resolved = PathBuf::new();
+    // Names at the end of `resolved` that do not exist: nothing under them
+    // does either, so they are kept as given.
+    let mut missing = 0_usize;
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // `resolved` holds no symlink (resolved, or missing), so
+                // its parent is the directory above. No current directory
+                // to start from: the `..` stays.
+                if resolved.pop() {
+                    missing = missing.saturating_sub(1);
+                } else if !resolved.has_root() {
+                    resolved.push(component);
+                }
             }
-            _ => return absolute,
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                resolved.push(component);
+                if missing > 0 {
+                    missing += 1;
+                } else if let Ok(real) = std::fs::canonicalize(&resolved) {
+                    resolved = real;
+                } else if matches!(component, Component::Normal(_)) {
+                    missing = 1;
+                }
+            }
         }
     }
+    resolved
 }
 
 /// Where the workspace directory `directory` of `branch` is under the
@@ -87,6 +106,44 @@ mod tests {
         );
         // A resolved root is its own resolution.
         assert_eq!(canonical_root(&base.join("real/ws")), base.join("real/ws"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// GitHub #16 item 10: a root whose missing part holds `..` (`<base>/
+    /// missing/../workspaces`, `missing` absent). The kernel resolves the
+    /// `..` once the directories exist, so the engine's working directory is
+    /// `<base>/workspaces`; the root must say the same, or the Bridge
+    /// watches a transcript no engine writes.
+    #[test]
+    fn a_missing_part_with_dot_dot_resolves_as_the_kernel_will() {
+        let base = scratch("dotdot");
+        let expected = base.join("real/workspaces");
+        assert_eq!(
+            canonical_root(&base.join("link/missing/../workspaces")),
+            expected
+        );
+        assert_eq!(
+            canonical_root(&base.join("real/missing/deeper/../../workspaces/./")),
+            expected
+        );
+        // Back out of the missing part into what exists: resolved again,
+        // through a symlink too.
+        assert_eq!(
+            canonical_root(&base.join("real/missing/../../link/ws/later")),
+            base.join("real/ws/later")
+        );
+        // The identity is the one the process has after the root is made.
+        let configured = base.join("link/absent/../made/ws");
+        let root = canonical_root(&configured);
+        std::fs::create_dir_all(base.join("link/absent")).expect("absent");
+        std::fs::create_dir_all(&configured).expect("the root");
+        assert_eq!(std::fs::canonicalize(&configured).expect("made"), root);
+        assert_eq!(root, base.join("real/made/ws"));
+        // Nothing climbs above the file system's root.
+        assert_eq!(
+            canonical_root(std::path::Path::new("/../../spawn-root-none/../x")),
+            std::path::Path::new("/x")
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -7,7 +7,7 @@ import type { Attention } from "../../attention";
 import type { Fleet } from "../../fleet";
 import { relativeTime } from "../../format";
 import type { NeedItem } from "../../home";
-import { agentNames, agentsNow, alertsSpanMs, digestSince, digestWindow, latestNotes, missionsToday, needsSummary } from "../../home";
+import { agentNames, agentsNow, nameTask, alertsSpanMs, digestSince, digestWindow, latestNotes, missionsToday, needsSummary } from "../../home";
 import type { Missions } from "../../missions";
 import type { FleetContext } from "../../ordering";
 import { groupAgents, missingAlwaysOn, residentName, usualEngine } from "../../ordering";
@@ -207,6 +207,7 @@ export function FleetView({
           key={selected.session_id}
           agent={selected}
           name={names.get(selected.session_id) ?? null}
+          held={nameTask(selected, context)}
           onClose={() => onSelect(null)}
           onOpenTimeline={onOpenTimeline}
         />

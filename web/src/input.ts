@@ -95,6 +95,14 @@ export function sendAnswer(status: number | null, body: unknown): SendAnswer {
   return { ok: false, error: refusal(status, body), status };
 }
 
+<<<<<<< ea3a2e9f4fcf687a4d0248cc86d13167ffa24686
+/** Whether a message not taken keeps its key for the next try, by the
+ * refusal's status. It does (sent again unchanged, it types once), except
+ * after 409: the server holds that key for another message (another
+ * session's, or other text), so the same key would be refused for good. */
+export function keepsKey(status: number | null): boolean {
+  return status !== 409;
+=======
 /** The server's answer to a restart or a reassign (`POST
  * /api/session/<id>/restart`, `/reassign`): the task and the worker's
  * session that now carry the work, or why it was refused (409: the session
@@ -113,6 +121,7 @@ export function moveAnswer(status: number | null, body: unknown): MoveAnswer {
     return { ok: true, task: answer.task, session_id: answer.session_id };
   }
   return { ok: false, error: refusal(status, body), status };
+>>>>>>> 1f63c6306f7e6c7bedfe0d4c3d245ad659496a31
 }
 
 /** One message this page sent (or tried to). */
@@ -125,6 +134,10 @@ export interface Sent {
   command_id: number | null;
   /** Why it was not taken, when it was not. */
   error: string | null;
+  /** What became of it, once nothing more will ([`withOutcomes`]): the
+   * commands read are the session's latest few, and a command that newer
+   * ones pushed off that list is still typed (or failed). */
+  outcome?: Progress;
 }
 
 /** A command of the session, as `/api/fleet/<id>/commands` lists it. */
@@ -147,14 +160,15 @@ export type Progress =
   | { stage: "typed"; command_id: number; at_ms: number | null }
   | { stage: "failed"; command_id: number; error: string };
 
-/** `sent`'s progress, from the session's `commands` (null while unread). A
- * command not listed yet is queued. */
+/** `sent`'s progress, from the session's `commands` (null while unread: its
+ * latest few, newest first). A command not listed is what it was last seen
+ * to end as (`outcome`), else queued: not listed yet. */
 export function progress(sent: Sent, commands: readonly CommandState[] | null): Progress {
   if (sent.error !== null) return { stage: "refused", error: sent.error };
   const id = sent.command_id;
   if (id === null) return { stage: "sending" };
   const command = commands?.find((entry) => entry.command_id === id);
-  if (!command) return { stage: "queued", command_id: id };
+  if (!command) return sent.outcome ?? { stage: "queued", command_id: id };
   if (command.state === "finished") {
     return command.succeeded === true
       ? { stage: "typed", command_id: id, at_ms: command.finished_at_ms }
@@ -166,6 +180,57 @@ export function progress(sent: Sent, commands: readonly CommandState[] | null): 
 /** Whether nothing more will happen to it. */
 export function settled(state: Progress): boolean {
   return state.stage === "typed" || state.stage === "failed" || state.stage === "refused";
+}
+
+/** `sent` with what became of each message recorded on it (`outcome`) once
+ * `commands` shows its command typed or failed: a later reading that no
+ * longer lists the command (newer ones took its place) does not turn it
+ * back into queued. The same array when nothing new ended. */
+export function withOutcomes(sent: Sent[], commands: readonly CommandState[] | null): Sent[] {
+  let changed = false;
+  const next = sent.map((entry) => {
+    if (entry.command_id === null || entry.outcome) return entry;
+    const state = progress(entry, commands);
+    if (state.stage !== "typed" && state.stage !== "failed") return entry;
+    changed = true;
+    return { ...entry, outcome: state };
+  });
+  return changed ? next : sent;
+}
+
+/** A reader asked again and again (`tick`) that never has two requests out
+ * and never hands on a reading it was not asked for any more: a tick while
+ * a request is out starts none (a slow server would otherwise answer
+ * several at once, an old answer after a newer one), and after `stop`
+ * (the box is gone, or reads another session) the answer of the request
+ * still out is dropped and its request aborted. A request that fails keeps
+ * the last reading; the next tick may succeed. */
+export function serialPoll<T>(
+  read: (signal: AbortSignal) => Promise<T>,
+  take: (value: T) => void,
+): { tick: () => Promise<void>; stop: () => void } {
+  let inFlight = false;
+  let stopped = false;
+  let controller: AbortController | null = null;
+  return {
+    tick: async () => {
+      if (inFlight || stopped) return;
+      inFlight = true;
+      controller = new AbortController();
+      try {
+        const value = await read(controller.signal);
+        if (!stopped) take(value);
+      } catch {
+        // Keep the last reading.
+      } finally {
+        inFlight = false;
+      }
+    },
+    stop: () => {
+      stopped = true;
+      controller?.abort();
+    },
+  };
 }
 
 /** `sent` with `entry` first: a resend (the same key) replaces its earlier
