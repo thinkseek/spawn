@@ -5,7 +5,7 @@
 //! monotonic, and one session never holds two live leases. The shared
 //! conformance suite in [`crate::contract`] runs against both.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -273,6 +273,18 @@ impl MemoryStore {
     /// rewrites or truncates it would. Test helper.
     pub fn replace_file(&self, path: &str, bytes: &[u8]) {
         self.lock().files.insert(path.to_string(), bytes.to_vec());
+    }
+
+    /// Make the transcript archive of `agent` refuse (`true`) or take
+    /// (`false`) every read and write, as an archive directory that is a
+    /// plain file, or a full disk, would. Test helper.
+    pub fn hold_archive(&self, agent: &AgentId, held: bool) {
+        let mut state = self.lock();
+        if held {
+            state.archive_held.insert(agent.clone());
+        } else {
+            state.archive_held.remove(agent);
+        }
     }
 
     /// Delete a file the terminal host can read, as Claude Code's cleanup
@@ -964,8 +976,11 @@ fn stale_refusal() -> WorkspaceError {
 
 impl TranscriptArchive for MemoryStore {
     fn copies(&self, agent: &AgentId, native: &str) -> Result<Vec<u64>, ArchiveError> {
-        Ok(self
-            .lock()
+        let state = self.lock();
+        if state.archive_held.contains(agent) {
+            return Err(ArchiveError(format!("the archive of {agent} is held")));
+        }
+        Ok(state
             .transcripts
             .get(&(agent.clone(), native.to_string()))
             .map(|copies| {
