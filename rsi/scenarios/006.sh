@@ -29,85 +29,13 @@
 # uses a private tmux socket, no network. Every wait is bounded in time.
 set -eu
 
-asserted=""
-harness() {
-    echo "006: harness: $*" >&2
-    exit 2
-}
-
-[ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
-[ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
-
-controller=$(cd "$(dirname "$0")/../.." && pwd)
-[ -f "$controller/scripts/blackbox/assertions.sh" ] ||
-    harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed; do
-    command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
-done
-
-WORK=$(mktemp -d) || harness "mktemp failed"
-# Not $$ alone: the gate's PID namespace makes it the same small number.
-run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
-SPAWN_DB_NAME="bb_006_switch_$run"
-SPAWN_TMUX_SOCKET="bb-006-$run"
-SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
-
-# shellcheck source=scripts/pg-url.sh
-. "$controller/scripts/pg-url.sh"
-pg_url_export "$SPAWN_TEST_DATABASE_URL" ||
-    harness "SPAWN_TEST_DATABASE_URL is not a single-host postgres:// URL"
-server_url=$(pg_url_server "$SPAWN_TEST_DATABASE_URL")
-
-database_made=""
-loop_pid=""
-cleanup() {
-    if [ -n "$loop_pid" ]; then
-        kill "$loop_pid" 2>/dev/null || true
-        wait "$loop_pid" 2>/dev/null || true
-    fi
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-    rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SPAWN_TMUX_SOCKET"
-    if [ -n "$database_made" ]; then
-        # The database and the logins init-db made for it.
-        sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
-    fi
-    chmod -R u+rwX "$WORK" 2>/dev/null || true
-    rm -rf "$WORK"
-}
-finish() {
-    rc=$?
-    trap - EXIT
-    if [ "$rc" -ne 0 ] && [ -s "$WORK/loop.log" ]; then
-        echo "006: the loop's last lines:" >&2
-        tail -n 15 "$WORK/loop.log" >&2
-    fi
-    cleanup
-    if [ "$rc" -eq 0 ]; then exit 0; fi
-    if [ "$rc" -eq 1 ] && [ -n "$asserted" ]; then exit 1; fi
-    [ "$rc" -eq 2 ] || echo "006: harness: unexpected exit $rc" >&2
-    exit 2
-}
-trap finish EXIT
-trap 'exit 130' INT TERM
-
-# Logins of this scenario's databases that a run killed before its cleanup
-# left behind (scripts/blackbox/scenario-db.sh): this prefix only.
-sh "$controller/scripts/blackbox/scenario-db.sh" sweep "${SPAWN_DB_NAME%"$run"}" >/dev/null 2>&1 || true
-psql -d postgres -tA -c "create database $SPAWN_DB_NAME" >/dev/null 2>&1 ||
-    harness "cannot create the scenario database"
-database_made=1
-
-. "$controller/scripts/blackbox/assertions.sh"
-
-fail() {
-    if ! psql -d "$SPAWN_DB_NAME" -tA -c 'select 1' >/dev/null 2>&1; then
-        harness "the database is unreachable (while checking: $*)"
-    fi
-    asserted=1
-    echo "blackbox: $*" >&2
-    exit 1
-}
+PHASE=006
+PHASE_DB=switch
+PHASE_LOOP_TAIL=15
+# The preamble every scenario shares: its exit contract, its own database
+# and tmux socket, its cleanup, `fail` and the assertions.
+# shellcheck source=scripts/blackbox/phase.sh
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/blackbox/phase.sh"
 
 # --- the world ----------------------------------------------------------------
 

@@ -566,6 +566,76 @@ fn tool_event(execution: &ExecutionId, key: &str, kind: EventKind) -> NewEvent {
     lifecycle(execution, Source::Claude, key, kind)
 }
 
+/// A tool call's summary goes through the real store as the event's detail,
+/// which the session API and the trace read; the store redacts it again
+/// (event_log's redact_event), so a summary written with a credential in it
+/// is stored without; an event without a summary reads as before.
+#[test]
+fn a_tool_calls_summary_is_stored_redacted_and_read_back() {
+    let (store, _schema) = store("tool_summary");
+    let execution = ExecutionId::new("exec_1").expect("valid execution");
+    store
+        .append(tool_event(
+            &execution,
+            "a:start",
+            EventKind::ToolStarted {
+                tool_name: "Bash".to_string(),
+                tool_use_id: "a".to_string(),
+                summary: Some("PGPASSWORD=s3cret psql -h db".to_string()),
+                // A writer's claim the store's redaction makes untrue.
+                summary_whole: true,
+            },
+        ))
+        .expect("append succeeds");
+    store
+        .append(tool_event(
+            &execution,
+            "b:start",
+            EventKind::ToolStarted {
+                tool_name: "ScheduleWakeup".to_string(),
+                tool_use_id: "b".to_string(),
+                summary: None,
+                summary_whole: false,
+            },
+        ))
+        .expect("append succeeds");
+    store
+        .append(tool_event(
+            &execution,
+            "c:start",
+            EventKind::ToolStarted {
+                tool_name: "Bash".to_string(),
+                tool_use_id: "c".to_string(),
+                summary: Some("git status".to_string()),
+                summary_whole: true,
+            },
+        ))
+        .expect("append succeeds");
+    let timeline = store
+        .timeline(&session(), SessionSeq(0), 100)
+        .expect("timeline read");
+    let started: Vec<&serde_json::Value> = timeline
+        .iter()
+        .filter(|entry| entry.event_name == "tool.started")
+        .filter_map(|entry| entry.detail.as_ref())
+        .collect();
+    assert_eq!(started.len(), 3, "{timeline:?}");
+    assert_eq!(started[0]["tool_name"], "Bash");
+    assert_eq!(started[0]["summary"], "PGPASSWORD=[redacted] psql -h db");
+    assert!(
+        started[0].get("summary_whole").is_none(),
+        "a redacted summary is not whole: {}",
+        started[0]
+    );
+    assert!(
+        started[1].get("summary").is_none() && started[1].get("summary_whole").is_none(),
+        "no summary, no keys: {}",
+        started[1]
+    );
+    assert_eq!(started[2]["summary"], "git status");
+    assert_eq!(started[2]["summary_whole"], true, "{}", started[2]);
+}
+
 #[test]
 fn open_tools_are_started_minus_finished_in_live_executions() {
     let (store, _schema) = store("open_tools");
@@ -573,6 +643,8 @@ fn open_tools_are_started_minus_finished_in_live_executions() {
     let started = |id: &str| EventKind::ToolStarted {
         tool_name: "Bash".to_string(),
         tool_use_id: id.to_string(),
+        summary: None,
+        summary_whole: false,
     };
     store
         .append(tool_event(&execution, "a:start", started("a")))

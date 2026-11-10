@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   ArrowRight,
   CircleAlert,
   History,
@@ -8,7 +9,8 @@ import {
 import { useId, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
 
-import { usePoll } from "../../api";
+import { fetchSessionTail, usePoll } from "../../api";
+import type { SessionDetail } from "../../api";
 import type {
   CommandRecord,
   FleetAgent,
@@ -29,6 +31,9 @@ import {
   stateLabelUpper,
 } from "../../fleet";
 import { clockTime, formatDuration, relativeTime } from "../../format";
+import { commandGist, foldCommands, inputAt, inputLeads, principalWords } from "../../commands";
+import { doingWords } from "../../home";
+import { recentToolRows, rowText, runEnd } from "../../trace";
 import { freshAt } from "../../validated";
 import { LiveBadge, TerminalPanel } from "../Terminal";
 import { Ago, Button, Card, CardHeader, Drawer, EmptyState, FOCUS_RING, cx } from "../ui";
@@ -61,6 +66,11 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
   const commands = usePoll<CommandRecord[]>(
     `commands:${sessionId}`,
     (signal) => fetchCommands(sessionId, signal),
+    5_000,
+  );
+  const tail = usePoll<SessionDetail>(
+    `tail:${sessionId}`,
+    (signal) => fetchSessionTail(sessionId, TAIL_EVENTS, signal),
     5_000,
   );
   // A judgement picked from the history; null follows the latest.
@@ -129,9 +139,10 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
       }
     >
       <div className="min-h-0 flex-1 overflow-y-auto bg-app-shell">
-        <AgentSummary agent={agent} />
+        <AgentSummary agent={agent} commands={commands.data} />
         <div className="grid gap-3 p-3 sm:p-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
           <div className="flex min-w-0 flex-col gap-3">
+            <RecentTools session={tail.data} error={tail.error} />
             {/* Read and type in one place: the screen, then the input. */}
             <div className="flex min-w-0 flex-col gap-2">
               <AgentScreen
@@ -181,12 +192,79 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
   );
 }
 
-function AgentSummary({ agent }: { agent: FleetAgent }) {
+/** How many of the session's newest events the tool rows are read from. */
+const TAIL_EVENTS = 200;
+const TOOL_ROWS = 8;
+
+/** The agent's latest tool calls in words (`Bash · cargo test ×3`), newest
+ * last, each with its duration and, when it failed, its outcome. */
+function RecentTools({ session, error }: { session: SessionDetail | null; error: string | null }) {
+  const now = Date.now();
+  const rows = session ? recentToolRows(session.timeline, now, TOOL_ROWS) : [];
+  return (
+    <Card>
+      <CardHeader title="Latest tool calls" />
+      {rows.length === 0 ? (
+        <p className="px-4 pb-3 text-caption text-faint-foreground">
+          {error ? `Could not read the session: ${error}` : session ? "No tool calls in its latest events." : "Loading…"}
+        </p>
+      ) : (
+        <ol className="px-2 pb-2">
+          {rows.map(({ span, run }) => (
+            <li
+              key={span.id}
+              className="flex items-center gap-2 rounded-md px-2 py-1 text-caption"
+              title={span.summary ? `${span.label} · ${span.summary}` : span.label}
+            >
+              <span className="tnum w-16 shrink-0 text-faint-foreground">{clockTime(span.start)}</span>
+              <span className="min-w-0 truncate font-mono text-foreground/85">{rowText(span)}</span>
+              {run.length > 1 && <span className="tnum shrink-0 font-medium text-muted-foreground">×{run.length}</span>}
+              {span.failed && (
+                <span className="flex min-w-0 shrink items-center gap-1 text-muted-foreground">
+                  <AlertTriangle size={11} className="shrink-0 text-destructive" aria-label="Failed" />
+                  <span className="truncate">{span.outcome}</span>
+                </span>
+              )}
+              <span className="tnum ml-auto shrink-0 pl-2 text-faint-foreground">
+                {span.state === "open"
+                  ? `running · ${formatDuration(now - span.start)}`
+                  : span.state === "orphan"
+                    ? "no start"
+                    : formatDuration(runEnd(run, now) - span.start)}
+              </span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </Card>
+  );
+}
+
+function AgentSummary({ agent, commands }: { agent: FleetAgent; commands: CommandRecord[] | null }) {
   const now = doingNow(agent);
   const activity = agent.activity;
+  // A standing agent's input leads while fresh (UI note §4.6); an older
+  // one folds under its age, so a two-day-old note is not its headline.
+  const at = agent.task && commands ? inputAt(agent.task, commands) : null;
+  const leads = !agent.task || !commands || inputLeads(agent.role, at, Date.now());
   return (
     <div className="border-b border-surface-border bg-page-canvas px-4 py-3 sm:px-5">
-      {agent.task ? (
+      {agent.task && !leads ? (
+        <details className="group">
+          <summary
+            className="cursor-pointer list-none text-caption text-muted-foreground"
+            title="Inputs to a standing agent lead its page for 6 hours"
+          >
+            <span className="font-medium">Older input</span>
+            {" · "}
+            {at !== null ? relativeTime(at) : "before the latest commands"}
+            <span className="mt-0.5 line-clamp-1 text-faint-foreground group-open:hidden">
+              {agent.task.split("\n")[0]}
+            </span>
+          </summary>
+          <p className="mt-1 whitespace-pre-wrap text-caption text-foreground">{agent.task}</p>
+        </details>
+      ) : agent.task ? (
         <details className="group">
           <summary className="cursor-pointer list-none text-label text-foreground">
             <span className="line-clamp-2 whitespace-pre-wrap group-open:line-clamp-none">
@@ -198,10 +276,10 @@ function AgentSummary({ agent }: { agent: FleetAgent }) {
         <p className="text-label text-faint-foreground">No task recorded.</p>
       )}
       <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4 lg:grid-cols-8">
-        <Fact label="Doing now" mono>
-          <span className="inline-flex items-center gap-1">
+        <Fact label="Doing now">
+          <span className="inline-flex min-w-0 items-center gap-1" title={now.label}>
             <DoingIcon now={now} size={11} />
-            {now.label}
+            <span className="truncate">{doingWords(agent, null)}</span>
           </span>
         </Fact>
         <Fact label="Last event"><Ago ms={activity.last_event_at_ms} /></Fact>
@@ -755,13 +833,6 @@ function JudgementHistory({
   );
 }
 
-const PRINCIPAL_LABEL: Record<string, string> = {
-  human: "Human",
-  spawn_supervisor: "Supervisor",
-  "spawn-dispatch": "Dispatcher",
-  "spawn-liveness": "Liveness",
-  spawn: "Spawn",
-};
 
 function PrincipalBadge({ principal }: { principal: string }) {
   const human = principal === "human";
@@ -777,7 +848,7 @@ function PrincipalBadge({ principal }: { principal: string }) {
             : "bg-muted text-muted-foreground ring-surface-border",
       )}
     >
-      {PRINCIPAL_LABEL[principal] ?? principal}
+      {principalWords(principal)}
     </span>
   );
 }
@@ -809,6 +880,11 @@ function CommandList({
   records: CommandRecord[] | null;
   error: string | null;
 }) {
+  // Runs of one sender's one action fold (`Dispatcher → input ×6`); their
+  // texts differ, and the run opens to list each (UI note §4.3).
+  const [open, setOpen] = useState<Set<string>>(() => new Set());
+  const runs = records ? foldCommands(records) : [];
+  const keyOf = (record: CommandRecord, index: number) => String(record.command_id ?? `i${index}`);
   return (
     <Card className="flex flex-col overflow-hidden">
       <CardHeader icon={<Send size={14} />} title="Commands into this agent" />
@@ -820,49 +896,87 @@ function CommandList({
         <EmptyState title="No commands yet" />
       ) : (
         <ul className="max-h-[22rem] divide-y divide-surface-border overflow-y-auto">
-          {records.map((record, index) => (
-            <li key={record.command_id ?? `i${index}`} className="px-4 py-2">
-              <div className="flex flex-wrap items-center gap-2 text-caption">
-                <span
-                  className="tnum text-muted-foreground"
-                  title={record.created_at_ms ? new Date(record.created_at_ms).toLocaleString() : undefined}
+          {runs.map((run, index) => {
+            const key = keyOf(run.first, index);
+            if (run.items.length === 1) return <CommandItem key={key} record={run.first} />;
+            const opened = open.has(key);
+            // Newest first: the run spans its last item's time to its first's.
+            const from = run.items.at(-1)?.created_at_ms ?? null;
+            const to = run.first.created_at_ms;
+            return (
+              <li key={key}>
+                <button
+                  type="button"
+                  aria-expanded={opened}
+                  onClick={() =>
+                    setOpen((current) => {
+                      const next = new Set(current);
+                      if (next.has(key)) next.delete(key);
+                      else next.add(key);
+                      return next;
+                    })
+                  }
+                  className="flex w-full flex-wrap items-center gap-2 px-4 py-2 text-left text-caption hover:bg-surface-hover"
                 >
-                  {clockTime(record.created_at_ms)}
-                </span>
-                <PrincipalBadge principal={record.principal} />
-                <span className="font-mono text-foreground">{record.action}</span>
-                <CommandOutcome record={record} />
-                {record.created_at_ms != null && record.finished_at_ms != null && (
-                  <span className="tnum text-faint-foreground">
-                    {formatDuration(record.finished_at_ms - record.created_at_ms)}
+                  <span className="tnum text-muted-foreground">
+                    {clockTime(from)}–{clockTime(to)}
                   </span>
+                  <PrincipalBadge principal={run.first.principal} />
+                  <span className="font-mono text-foreground">{run.first.action}</span>
+                  <span className="tnum font-medium text-muted-foreground">×{run.items.length}</span>
+                  <span className="ml-auto text-faint-foreground">{opened ? "fold" : "list them"}</span>
+                </button>
+                {opened && (
+                  <ul className="divide-y divide-surface-border border-t border-surface-border bg-surface-hover/40">
+                    {run.items.map((record, at) => (
+                      <CommandItem key={keyOf(record, at)} record={record} />
+                    ))}
+                  </ul>
                 )}
-                {record.command_id != null && (
-                  <span className="tnum ml-auto font-mono text-micro text-faint-foreground">
-                    #{record.command_id}
-                  </span>
-                )}
-              </div>
-              {record.error && (
-                <p className="mt-1 text-caption text-destructive">{record.error}</p>
-              )}
-              {record.text && (
-                <details className="group mt-1">
-                  <summary className="cursor-pointer list-none text-caption text-muted-foreground">
-                    <span className="line-clamp-1 group-open:hidden">
-                      {record.text.replace(/\s+/g, " ")}
-                    </span>
-                  </summary>
-                  <p className="whitespace-pre-wrap text-caption text-foreground">
-                    {record.text}
-                  </p>
-                </details>
-              )}
-            </li>
-          ))}
+              </li>
+            );
+          })}
         </ul>
       )}
     </Card>
+  );
+}
+
+/** One command: when, who, what, how it ended, and what its text says
+ * (a digest's items, not its header); the whole text opens below. */
+function CommandItem({ record }: { record: CommandRecord }) {
+  const gist = commandGist(record.text);
+  return (
+    <li className="px-4 py-2">
+      <div className="flex flex-wrap items-center gap-2 text-caption">
+        <span
+          className="tnum text-muted-foreground"
+          title={record.created_at_ms ? new Date(record.created_at_ms).toLocaleString() : undefined}
+        >
+          {clockTime(record.created_at_ms)}
+        </span>
+        <PrincipalBadge principal={record.principal} />
+        <span className="font-mono text-foreground">{record.action}</span>
+        <CommandOutcome record={record} />
+        {record.created_at_ms != null && record.finished_at_ms != null && (
+          <span className="tnum text-faint-foreground">
+            {formatDuration(record.finished_at_ms - record.created_at_ms)}
+          </span>
+        )}
+        {record.command_id != null && (
+          <span className="tnum ml-auto font-mono text-micro text-faint-foreground">#{record.command_id}</span>
+        )}
+      </div>
+      {record.error && <p className="mt-1 text-caption text-destructive">{record.error}</p>}
+      {record.text && (
+        <details className="group mt-1">
+          <summary className="cursor-pointer list-none text-caption text-muted-foreground">
+            <span className="line-clamp-1 group-open:hidden">{gist}</span>
+          </summary>
+          <p className="whitespace-pre-wrap text-caption text-foreground">{record.text}</p>
+        </details>
+      )}
+    </li>
   );
 }
 

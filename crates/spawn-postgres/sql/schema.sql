@@ -1437,6 +1437,19 @@ create table if not exists spawn_alerts (
 
 create index if not exists spawn_alerts_time on spawn_alerts (fired_at_ms);
 
+-- When each open agent_stuck alert's session was last scored (its latest
+-- judgement carrying `stuck`): the alerts window's `scored_at_ms`, so a
+-- score that stands while the judge is down shows its age. A view, read
+-- with its owner's rights: a login that may read the alerts (the
+-- supervisor's `spawn alerts`) reads it without any grant on spawn_events.
+create or replace view spawn_alert_scores as
+select a.key,
+       (select max(e.recorded_at_ms) from spawn_events e
+         where e.session_id = a.subject and e.event_name = 'observation.recorded'
+           and e.kind -> 'detail' -> 'observation' ? 'stuck') as scored_at_ms
+from spawn_alerts a
+where a.kind = 'agent_stuck' and a.state = 'open';
+
 
 -- Who may call the mission functions: the owner (humans' CLI, the
 -- controller) and the supervisor's login; not the reader's, and not the web
@@ -1863,6 +1876,11 @@ begin
     when 'host.disk' then
         -- A fact about this host's free disk (spawn loop, crate disk.rs):
         -- read from the log, folded into no table.
+        null;
+    when 'host.judge' then
+        -- The model judge's calls began failing (`down`) or answered again
+        -- (`up`): one record per crossing (spawn loop, crate judge_watch.rs),
+        -- read from the log by the alert step, folded into no table.
         null;
     when 'alert.fired' then
         -- An alert's one occurrence (spawn loop, crate alerts.rs): one row
@@ -2820,7 +2838,16 @@ end $$;
 -- (`source.moved` naming it, or `source.push_refused`). Nothing else moves:
 -- no branch, no baseline, no gate. Returns the request's event id. The
 -- source is one a gate lands on: a directory on this host with a mission.
-create or replace function spawn_source_push_request(p_source text, p_commit text, p_ref text)
+-- `p_gated`: the integrator judges the landing with the source's gate
+-- first, as a judging of its own between the source's gates; `p_urgent`: it
+-- goes first and stops the judging in flight on the source
+-- (design-owner-push-between-gates.md); `p_reason`: the owner's words, on
+-- the record. Each is on the record only when given.
+drop function if exists spawn_source_push_request(text, text, text);
+create or replace function spawn_source_push_request(p_source text, p_commit text, p_ref text,
+                                                     p_gated boolean default false,
+                                                     p_urgent boolean default false,
+                                                     p_reason text default null)
 returns bigint language plpgsql security definer as $$
 begin
     perform pg_advisory_xact_lock(1399957335);
@@ -2843,9 +2870,18 @@ begin
     if p_ref is distinct from 'refs/spawn-owner/' || p_commit then
         raise exception 'the owner''s commit waits at refs/spawn-owner/%, not %', p_commit, p_ref;
     end if;
+    if length(coalesce(p_reason, '')) > 2000 then
+        raise exception 'the reason is at most 2000 characters';
+    end if;
     return spawn_control_record(jsonb_build_object(
         'type', 'source.push_requested', 'source', p_source, 'commit', p_commit,
-        'ref', p_ref, 'by', 'human'));
+        'ref', p_ref, 'by', 'human')
+        || case when coalesce(p_gated, false) then jsonb_build_object('gated', true)
+                else '{}'::jsonb end
+        || case when coalesce(p_urgent, false) then jsonb_build_object('urgent', true)
+                else '{}'::jsonb end
+        || case when coalesce(p_reason, '') <> '' then jsonb_build_object('reason', p_reason)
+                else '{}'::jsonb end);
 end $$;
 
 -- The integrator's hold on an owner's landing (owner only): the landing
@@ -3459,6 +3495,14 @@ create index if not exists spawn_events_objective_solved
 --   warning threshold (`low`) or came back (`recovered`). One record per
 --   crossing; the loop reads the latest per path back from the log after a
 --   restart.
+-- - `host.judge`: the model judge (`judge`, its name) failed two calls in
+--   a row after its last answer (`down`, with the latest call's `error` and
+--   `first_failed_ms`, when the first failed) or answered after that (`up`,
+--   with `failed_calls`, the failures its watcher counted since the `down`,
+--   or since the watcher's restart if it restarted while down). One record
+--   per crossing; the judge's watcher reads the latest per judge back after
+--   a restart, and the alert step fires `judge_down` on a `down` with no
+--   `up` after it SPAWN_ALERT_JUDGE_DOWN_SECS after its first failure.
 -- - `host.loop_started`: one `spawn loop` started, with its `boot_id` and
 --   `started_at_ms`. A restarted loop tells an execution whose end it found
 --   from one it watched fail by the records of the loops before it.
@@ -3491,6 +3535,20 @@ begin
         if p_record ->> 'state' not in ('low', 'recovered') or p_record ->> 'path' is null
            or jsonb_typeof(p_record -> 'free_bytes') is distinct from 'number' then
             raise exception 'a host.disk record has a path, free_bytes and state low or recovered: %', p_record;
+        end if;
+    elsif v_type = 'host.judge' then
+        if p_record ->> 'judge' is null or p_record ->> 'state' is null
+           or p_record ->> 'state' not in ('down', 'up') then
+            raise exception 'a host.judge record names its judge and a state down or up: %', p_record;
+        end if;
+        if p_record ->> 'state' = 'down'
+           and (jsonb_typeof(p_record -> 'error') is distinct from 'string'
+                or jsonb_typeof(p_record -> 'first_failed_ms') is distinct from 'number') then
+            raise exception 'a host.judge down record says the call''s error and first_failed_ms: %', p_record;
+        end if;
+        if p_record ->> 'state' = 'up'
+           and jsonb_typeof(p_record -> 'failed_calls') is distinct from 'number' then
+            raise exception 'a host.judge up record counts failed_calls: %', p_record;
         end if;
     elsif v_type = 'host.loop_started' then
         if p_record ->> 'boot_id' is null
@@ -3820,7 +3878,8 @@ begin
         'spawn_landing_hold(bigint)', 'spawn_landing_release()',
         'spawn_source_holdable(text)', 'spawn_source_hold_lock(text)',
         'spawn_source_hold(text, text, integer, text)', 'spawn_source_release(text)',
-        'spawn_source_push_request(text, text, text)', 'spawn_source_push_hold()'] loop
+        'spawn_source_push_request(text, text, text, boolean, boolean, text)',
+        'spawn_source_push_hold()'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
     end loop;
@@ -3834,7 +3893,8 @@ begin
                        spawn_login_role('spawn_supervisor'));
     end loop;
     execute format('grant select on mission_missions, mission_residents, mission_tasks, '
-                   'mission_source_holds, mission_source_reds, spawn_alerts to %I',
+                   'mission_source_holds, mission_source_reds, spawn_alerts, '
+                   'spawn_alert_scores to %I',
                    spawn_login_role('spawn_supervisor'));
 end
 $$;

@@ -42,6 +42,16 @@
 //!   person sent) excepted.
 //!
 //! Conditions:
+//! - `scenario_red`, `mission #<id>`, key
+//!   `scenario_red:<mission>:<scenario>:<the first task.gated naming it>`:
+//!   a gate of the mission found main red on the scenario (the record's
+//!   `main_red_scenarios`: solved, as the same scenario, on an ancestor of
+//!   the base, and unsolved on it; scripts/rsi/gate.sh, "Main red on a
+//!   scenario"), where an unsolved objective says nothing. Once per mission
+//!   and scenario while it stays red; clears at the first later `accepted`
+//!   gating of the mission that does not name it (an accepted gate judged
+//!   every scenario on the base; a rejection may come before the base, so
+//!   it clears nothing).
 //! - `task_undelivered`, `task #<id>`, key
 //!   `task_undelivered:<task>:<its task.assigned event>`: in `assigned`
 //!   longer than `SPAWN_ALERT_UNDELIVERED_SECS` (default 300) while its
@@ -69,8 +79,20 @@
 //! - `agent_stuck`, the session id, key `agent_stuck:<session>:<its
 //!   observation>`: the session's latest `observation.recorded` says `stuck`
 //!   at or above [`LIKELY`] (0.5), whatever the dispatcher does with it; a
-//!   later observation still stuck fires nothing; clears when the latest
-//!   one is under 0.5 or its execution ended by a stop.
+//!   later observation still stuck fires nothing, and a session whose
+//!   current execution has ended fires nothing; clears when the latest
+//!   one is under 0.5, or when the session's current execution has ended,
+//!   whatever the cause (stopped, exited, lost), with that end as evidence.
+//! - `judge_down`, the judge's name (`jev`), key `judge_down:<its
+//!   host.judge down event>`: the model judge's watcher recorded `down` (two
+//!   calls in a row failed after its last answer, crate judge_watch.rs) and
+//!   no `up` after it, `SPAWN_ALERT_JUDGE_DOWN_SECS` (default 900) after the
+//!   first of them failed (`first_failed_ms`): no call answered since. It
+//!   rests on that record, not on the absence of judgements (a judge that
+//!   is down writes few: the Observer records a failure once, not each
+//!   retry). Clears at the `up` record, the first call answered, with its
+//!   `failed_calls`; an `up` whose `down` is older than the history (a loop
+//!   restarted during a week-long outage) clears the judge's open alert.
 //! - `admission_wait`, an execution's `agent_id` or a gate's `task #<id>`,
 //!   key `admission_wait:<its admission.waiting event>`: an
 //!   `admission.waiting` (029) older than `SPAWN_ALERT_ADMISSION_SECS`
@@ -169,6 +191,8 @@ pub(crate) struct Settings {
     pub(crate) undelivered_ms: i64,
     /// How long an admission may wait.
     pub(crate) admission_ms: i64,
+    /// How long the model judge may answer no call.
+    pub(crate) judge_down_ms: i64,
     /// The dump's and the bundle's schedules, with room for one late run.
     pub(crate) dump_max_age_ms: i64,
     pub(crate) bundle_max_age_ms: i64,
@@ -221,6 +245,7 @@ impl Settings {
             check_ms: secs("SPAWN_ALERT_CHECK_SECS", 30, &mut warnings).max(1),
             undelivered_ms: secs("SPAWN_ALERT_UNDELIVERED_SECS", 300, &mut warnings),
             admission_ms: secs("SPAWN_ALERT_ADMISSION_SECS", 600, &mut warnings),
+            judge_down_ms: secs("SPAWN_ALERT_JUDGE_DOWN_SECS", 900, &mut warnings),
             dump_max_age_ms: secs("SPAWN_ALERT_BACKUP_DUMP_MAX_AGE_SECS", 7200, &mut warnings),
             bundle_max_age_ms: secs(
                 "SPAWN_ALERT_BACKUP_BUNDLE_MAX_AGE_SECS",
@@ -373,8 +398,12 @@ pub(crate) struct Monitor {
     missions: HashMap<i64, Mission>,
     /// The pending admission waits, by kind and agent or task.
     admitted: HashMap<String, Pending>,
+    /// The model judge's `down` records with no `up` after them, by judge.
+    judge_down: HashMap<String, Pending>,
     /// An open (or pending) model-login alert key, by execution id.
     auth: HashMap<String, String>,
+    /// The open (or pending) `scenario_red` key, by mission and scenario.
+    red: HashMap<(i64, String), String>,
     /// The newest dump and bundle records.
     backups: BTreeMap<&'static str, Backup>,
     commands_after: i64,
@@ -406,7 +435,9 @@ impl Monitor {
             tasks: HashMap::new(),
             missions: HashMap::new(),
             admitted: HashMap::new(),
+            judge_down: HashMap::new(),
             auth: HashMap::new(),
+            red: HashMap::new(),
             backups: BTreeMap::new(),
             commands_after: 0,
             logs,
@@ -523,6 +554,7 @@ impl Monitor {
                 self.known.insert(key, row);
             }
         }
+        self.seed_red();
         let history = store
             .alert_history(now.saturating_sub(HISTORY_MS), HISTORY_LIMIT)
             .map_err(|error| error.to_string())?;
@@ -586,6 +618,7 @@ impl Monitor {
             "execution.interrupted" | "execution.cleared" => {
                 self.auth_record(event_id, record, out);
             }
+            "host.judge" => self.judge_record(event_id, at_ms, record, out),
             _ => {}
         }
     }
@@ -650,6 +683,84 @@ impl Monitor {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The open `scenario_red` alerts the store holds, by mission and
+    /// scenario: a main still red on a scenario stays one alert, however old
+    /// its first record is (the history read back on start is a week).
+    fn seed_red(&mut self) {
+        for (key, row) in &self.known {
+            if row.open() && row.kind == "scenario_red" {
+                let mission = row.evidence["mission"].as_i64();
+                let scenario = row.evidence["scenario"].as_str();
+                if let (Some(mission), Some(scenario)) = (mission, scenario) {
+                    self.red
+                        .insert((mission, scenario.to_string()), key.clone());
+                }
+            }
+        }
+    }
+
+    /// `scenario_red`: opened by a gating that names a scenario main is red
+    /// on, once per mission and scenario; cleared by a later accepted gating
+    /// of the mission that does not name it.
+    fn red_scenarios(
+        &mut self,
+        event_id: i64,
+        task: i64,
+        mission_id: i64,
+        record: &Value,
+        out: &mut Vec<Event>,
+    ) {
+        let named: Vec<String> = record["main_red_scenarios"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        for scenario in &named {
+            let at = (mission_id, scenario.clone());
+            if self.red.contains_key(&at) {
+                continue;
+            }
+            let key = format!("scenario_red:{mission_id}:{scenario}:{event_id}");
+            self.red.insert(at, key.clone());
+            out.push(Event::Fire {
+                key,
+                kind: "scenario_red",
+                subject: format!("mission #{mission_id}"),
+                evidence: json!({
+                    "mission": mission_id, "scenario": scenario, "task": task,
+                    "base": record["base"], "event_id": event_id,
+                }),
+                text: format!(
+                    "mission #{mission_id}: main is red on {scenario}: solved on an ancestor of \
+the base, unsolved on it (task #{task}'s gate)"
+                ),
+                notice: false,
+            });
+        }
+        if record["verdict"].as_str() != Some("accepted") {
+            return;
+        }
+        let green: Vec<(i64, String)> = self
+            .red
+            .keys()
+            .filter(|(mission, scenario)| *mission == mission_id && !named.contains(scenario))
+            .cloned()
+            .collect();
+        for at in green {
+            if let Some(key) = self.red.remove(&at) {
+                out.push(Event::Clear {
+                    key,
+                    evidence: json!({
+                        "event_id": event_id, "record": "task.gated", "task": task,
+                        "base": record["base"],
+                    }),
+                });
+            }
         }
     }
 
@@ -757,6 +868,7 @@ impl Monitor {
                 });
             }
         }
+        self.red_scenarios(event_id, task, mission_id, record, out);
         if base_disagrees(record).is_some() {
             out.push(Event::Fire {
                 key: format!("gate_base_disagrees:{event_id}"),
@@ -832,6 +944,54 @@ times in a row)",
                             "waited_ms": record["waited_ms"], "event_id": event_id,
                         }),
                     });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The model judge's crossing: a `down` waits for its bound, an `up`
+    /// clears it (or forgets the `down` before it fired).
+    fn judge_record(&mut self, event_id: i64, at_ms: i64, record: &Value, out: &mut Vec<Event>) {
+        let judge = record["judge"].as_str().unwrap_or("judge").to_string();
+        match record["state"].as_str() {
+            Some("down") => {
+                // A second `down` with no `up` between keeps the first: the
+                // judge has answered nothing since it.
+                // The bound runs from the first failed call, when known.
+                let first = record["first_failed_ms"]
+                    .as_i64()
+                    .unwrap_or(at_ms)
+                    .min(at_ms);
+                self.judge_down.entry(judge.clone()).or_insert(Pending {
+                    event_id,
+                    at_ms: first,
+                    subject: judge,
+                    evidence: json!({"error": scrub(record["error"].as_str().unwrap_or_default())}),
+                });
+            }
+            Some("up") => {
+                if let Some(pending) = self.judge_down.remove(&judge) {
+                    out.push(Event::Clear {
+                        key: format!("judge_down:{}", pending.event_id),
+                        evidence: json!({
+                            "event_id": event_id,
+                            "failed_calls": record["failed_calls"],
+                            "down_ms": at_ms.saturating_sub(pending.at_ms),
+                        }),
+                    });
+                } else {
+                    // Its `down` fell out of the history: the open alert
+                    // still clears, without a span.
+                    for key in self.open_keys("judge_down", &judge) {
+                        out.push(Event::Clear {
+                            key,
+                            evidence: json!({
+                                "event_id": event_id,
+                                "failed_calls": record["failed_calls"],
+                            }),
+                        });
+                    }
                 }
             }
             _ => {}
@@ -965,7 +1125,11 @@ times in a row)",
     }
 
     /// Every session's latest judgement: a stuck one fires once, a calm one
-    /// clears, and so does a stop.
+    /// clears, and so does the end of the session's current execution,
+    /// whatever its cause. An ended session fires nothing: the Observer
+    /// judges once more after every end, so a judgement can be newer than
+    /// the end it follows, and a restart that reads an old stuck judgement
+    /// of a session that has ended must not open it again.
     fn observe(&mut self, observations: &Value, out: &mut Vec<Event>) {
         for observation in observations.as_array().into_iter().flatten() {
             let session = observation["session_id"]
@@ -976,8 +1140,18 @@ times in a row)",
             let judgement = &observation["observation"];
             let stuck = judgement["stuck"].as_f64();
             let open = self.open_keys("agent_stuck", &session);
-            let stopped = observation["ended_cause"].as_str() == Some("stopped");
-            if open.is_empty() && stuck.is_some_and(|stuck| stuck >= LIKELY) {
+            let ended = observation["ended_event"].as_i64();
+            if let Some(ended) = ended {
+                for key in open {
+                    out.push(Event::Clear {
+                        key,
+                        evidence: json!({
+                            "event_id": ended,
+                            "cause": observation["ended_cause"],
+                        }),
+                    });
+                }
+            } else if open.is_empty() && stuck.is_some_and(|stuck| stuck >= LIKELY) {
                 out.push(Event::Fire {
                     key: format!("agent_stuck:{session}:{event_id}"),
                     kind: "agent_stuck",
@@ -994,18 +1168,6 @@ times in a row)",
                     ),
                     notice: false,
                 });
-                continue;
-            }
-            if stopped {
-                for key in open {
-                    out.push(Event::Clear {
-                        key,
-                        evidence: json!({
-                            "event_id": observation["ended_event"],
-                            "execution": "stopped",
-                        }),
-                    });
-                }
             } else if stuck.is_some_and(|stuck| stuck < LIKELY) {
                 for key in open {
                     out.push(Event::Clear {
@@ -1044,8 +1206,39 @@ times in a row)",
         }
     }
 
+    /// The model judge's `down` records that reached their bound
+    /// (`judge_down`), once each.
+    fn judge_bounds(&self, now: i64, out: &mut Vec<Event>) {
+        for pending in self.judge_down.values() {
+            let due = pending.at_ms.saturating_add(self.settings.judge_down_ms);
+            let key = format!("judge_down:{}", pending.event_id);
+            if now < due || self.known.contains_key(&key) {
+                continue;
+            }
+            let error = pending.evidence["error"].as_str().unwrap_or_default();
+            out.push(Event::Fire {
+                key,
+                kind: "judge_down",
+                subject: pending.subject.clone(),
+                evidence: json!({
+                    "judge": pending.subject, "error": error,
+                    "down_ms": now.saturating_sub(pending.at_ms),
+                    "threshold_ms": self.settings.judge_down_ms,
+                    "event_id": pending.event_id,
+                }),
+                text: format!(
+                    "the model judge {} failed two calls in a row, the first {} s ago, \
+                     and has answered none since: {error}",
+                    pending.subject,
+                    now.saturating_sub(pending.at_ms) / 1000
+                ),
+                notice: false,
+            });
+        }
+    }
+
     /// The bounds that fall due: an undelivered task, an admission's wait, a
-    /// backup's age, a crash line gone quiet.
+    /// judge that answers nothing, a backup's age, a crash line gone quiet.
     fn bounds(&mut self, now: i64, out: &mut Vec<Event>) {
         for (id, task) in &self.tasks {
             let Some(assigned) = task.assigned_event else {
@@ -1110,6 +1303,7 @@ times in a row)",
                 notice: false,
             });
         }
+        self.judge_bounds(now, out);
         for (subject, max_age) in [
             ("dump", self.settings.dump_max_age_ms),
             ("bundle", self.settings.bundle_max_age_ms),
@@ -1560,6 +1754,14 @@ times in a row)",
                 .contains_key(&format!("admission_wait:{}", pending.event_id))
             {
                 next = next.min(pending.at_ms.saturating_add(self.settings.admission_ms));
+            }
+        }
+        for pending in self.judge_down.values() {
+            if !self
+                .known
+                .contains_key(&format!("judge_down:{}", pending.event_id))
+            {
+                next = next.min(pending.at_ms.saturating_add(self.settings.judge_down_ms));
             }
         }
         for (subject, max_age) in [
@@ -2067,7 +2269,7 @@ pub(crate) fn time_text(ms: i64) -> String {
 
 /// A password in a URL is a secret: evidence never holds one. `scheme://
 /// user:password@host` becomes `scheme://user:***@host`.
-fn scrub(text: &str) -> String {
+pub(crate) fn scrub(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(index) = rest.find("://") {
@@ -2209,7 +2411,9 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
 }
 
 /// One alert as a line for a person: its state, kind, subject, time and
-/// text.
+/// text; an open `agent_stuck` also says when the session was last scored
+/// (`scored_at_ms`, read with the window): a judge that has been down
+/// since leaves the alert on an old score.
 fn line(alert: &Value) -> String {
     let state = alert["state"].as_str().unwrap_or("open");
     let at = alert
@@ -2217,8 +2421,12 @@ fn line(alert: &Value) -> String {
         .and_then(Value::as_i64)
         .or_else(|| alert["fired_at_ms"].as_i64())
         .unwrap_or_default();
+    let scored = alert["scored_at_ms"]
+        .as_i64()
+        .map(|scored| format!(" (last scored {})", time_text(scored)))
+        .unwrap_or_default();
     format!(
-        "{state} {} {} {} {}",
+        "{state} {} {} {} {}{scored}",
         alert["kind"].as_str().unwrap_or("alert"),
         alert["subject"].as_str().unwrap_or(""),
         time_text(at),
@@ -2277,6 +2485,7 @@ mod tests {
             check_ms: 30_000,
             undelivered_ms: 300_000,
             admission_ms: 600_000,
+            judge_down_ms: 900_000,
             dump_max_age_ms: 7_200_000,
             bundle_max_age_ms: 93_600_000,
             memory_low_mb: 4096,
@@ -2530,6 +2739,141 @@ mod tests {
         // And the open alert is still known, so a quiet re-reading of a
         // threshold does not fire it again.
         assert!(monitor.is_open("mission_halted:4:2"));
+    }
+
+    /// A `task.gated` of task 7 (mission 4), at the revision the integrator
+    /// writes (a rejection bumps the task's), naming the scenarios main is
+    /// red on.
+    fn red_gated(verdict: &str, revision: i64, red: &[&str]) -> Value {
+        let mut record = json!({"type": "task.gated", "id": 7, "verdict": verdict,
+                                "revision": revision, "base": "b"});
+        if !red.is_empty() {
+            record["main_red_scenarios"] = json!(red);
+        }
+        record
+    }
+
+    /// `scenario_red`: once per mission and scenario while red, even when
+    /// two gatings naming it are read in one batch; a rejection clears
+    /// nothing (it may come before the base phase), nor does another
+    /// mission's acceptance; an accepted gating that no longer names it
+    /// clears it, and only it.
+    #[test]
+    fn main_red_on_a_scenario_is_one_alert_until_an_accepted_gate_clears_it() {
+        let mut monitor = monitor();
+        feed(
+            &mut monitor,
+            10,
+            0,
+            json!({"type": "task.assigned", "id": 7, "mission_id": 4, "agent_id": "a"}),
+        );
+        let first = feed(&mut monitor, 11, 0, red_gated("accepted", 0, &["046.sh"]));
+        assert!(
+            fires(&first).contains(&"scenario_red:4:046.sh:11"),
+            "{first:?}"
+        );
+        // Not committed yet: the same batch reads a second gating.
+        let second = feed(
+            &mut monitor,
+            12,
+            0,
+            red_gated("rejected", 0, &["046.sh", "047.sh"]),
+        );
+        let red: Vec<&str> = fires(&second)
+            .into_iter()
+            .filter(|key| key.starts_with("scenario_red:"))
+            .collect();
+        assert_eq!(red, ["scenario_red:4:047.sh:12"], "{second:?}");
+        commit(&mut monitor, &first);
+        commit(&mut monitor, &second);
+        let Event::Fire {
+            evidence, notice, ..
+        } = first
+            .iter()
+            .find(|event| event.key() == "scenario_red:4:046.sh:11")
+            .expect("the fire")
+        else {
+            panic!("a fire")
+        };
+        assert!(!notice, "a condition, not a notice");
+        assert_eq!(evidence["scenario"], "046.sh");
+        assert_eq!(evidence["mission"], 4);
+        // Another mission's accepted gate is no word on mission 4's main.
+        feed(
+            &mut monitor,
+            30,
+            0,
+            json!({"type": "task.assigned", "id": 8, "mission_id": 5, "agent_id": "b"}),
+        );
+        let elsewhere = feed(
+            &mut monitor,
+            31,
+            0,
+            json!({"type": "task.gated", "id": 8, "verdict": "accepted", "revision": 0, "base": "c"}),
+        );
+        assert!(
+            !elsewhere
+                .iter()
+                .any(|event| matches!(event, Event::Clear { .. })),
+            "{elsewhere:?}"
+        );
+        let rejected = feed(&mut monitor, 13, 0, red_gated("rejected", 1, &[]));
+        assert!(
+            !rejected
+                .iter()
+                .any(|event| matches!(event, Event::Clear { .. })),
+            "{rejected:?}"
+        );
+        let accepted = feed(&mut monitor, 14, 0, red_gated("accepted", 2, &["047.sh"]));
+        let cleared: Vec<&str> = accepted
+            .iter()
+            .filter(|event| matches!(event, Event::Clear { .. }))
+            .map(Event::key)
+            .collect();
+        assert_eq!(cleared, ["scenario_red:4:046.sh:11"], "{accepted:?}");
+        commit(&mut monitor, &accepted);
+        assert!(monitor.is_open("scenario_red:4:047.sh:12"));
+    }
+
+    /// A restart that reads an open `scenario_red` back fires nothing again
+    /// for it, and still clears it at the accepted gating that no longer
+    /// names it.
+    #[test]
+    fn a_restart_keeps_main_red_one_alert() {
+        // The restart: the open alert read back, with its evidence.
+        let mut restarted = super::Monitor::with(settings());
+        restarted.known.insert(
+            "scenario_red:4:047.sh:12".to_string(),
+            Row {
+                kind: "scenario_red".to_string(),
+                subject: "mission #4".to_string(),
+                state: "open".to_string(),
+                evidence: json!({"mission": 4, "scenario": "047.sh"}),
+                fired_event_id: 12,
+                fired_at_ms: 0,
+            },
+        );
+        restarted.seed_red();
+        feed(
+            &mut restarted,
+            20,
+            0,
+            json!({"type": "task.assigned", "id": 7, "mission_id": 4, "agent_id": "a"}),
+        );
+        let again = feed(&mut restarted, 21, 0, red_gated("rejected", 0, &["047.sh"]));
+        assert!(
+            !fires(&again)
+                .iter()
+                .any(|key| key.starts_with("scenario_red:")),
+            "{again:?}"
+        );
+        let green = feed(&mut restarted, 22, 0, red_gated("accepted", 1, &[]));
+        assert!(
+            green
+                .iter()
+                .any(|event| matches!(event, Event::Clear { key, .. } if key == "scenario_red:4:047.sh:12")),
+            "{green:?}"
+        );
     }
 
     #[test]
@@ -2927,6 +3271,436 @@ connections\n";
         let cleared = decided(&monitor, cleared);
         assert!(matches!(&cleared[0], Event::Clear { evidence, .. }
             if evidence["stuck"] == 0.05 && evidence["event_id"] == 62));
+    }
+
+    /// The stuck alert against the real store: the session's events are
+    /// appended to a schema of its own in the test database
+    /// (`SPAWN_TEST_DATABASE_URL`, never the live one) and read back by
+    /// `alert_observations`, as the loop's step reads them.
+    mod through_the_store {
+        use super::super::{Event, Monitor};
+        use super::{commit, decided, fires, monitor};
+        use serde_json::{Value, json};
+        use spawn_core::event::{
+            ENGINE, EndCause, EventKind, ModelProfile, NewEvent, SessionSeq, Source,
+        };
+        use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, WorkspaceId};
+        use spawn_core::observation::{Confidence, Observation, SemanticState};
+        use spawn_core::port::EventLog;
+        use spawn_postgres::PostgresStore;
+
+        /// Run `case` on a migrated schema of its own, dropped afterwards.
+        fn in_schema(name: &str, case: impl FnOnce(&PostgresStore)) {
+            let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+                "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+            );
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.subsec_nanos());
+            let schema = format!("spawn_test_{}_{nanos:x}_{name}", std::process::id());
+            let store = PostgresStore::connect_in_schema(&url, &schema)
+                .expect("a schema of its own, migrated");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| case(&store)));
+            drop(store);
+            let _ = postgres::Client::connect(&url, postgres::NoTls).and_then(|mut client| {
+                client.batch_execute(&format!("drop schema {schema} cascade"))
+            });
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
+
+        /// One worker session's records, appended in order; each start
+        /// begins an execution of its own (`exec_<name>_<n>`), as the
+        /// Bridge's do.
+        struct Session {
+            name: &'static str,
+            next: u64,
+            execution: u32,
+        }
+
+        impl Session {
+            fn new(name: &'static str) -> Self {
+                Self {
+                    name,
+                    next: 0,
+                    execution: 0,
+                }
+            }
+
+            fn append(&mut self, store: &PostgresStore, source: Source, kind: EventKind) -> i64 {
+                let execution = self.execution;
+                self.append_to(store, execution, source, kind)
+            }
+
+            /// A record of execution `n` of this session.
+            fn append_to(
+                &mut self,
+                store: &PostgresStore,
+                n: u32,
+                source: Source,
+                kind: EventKind,
+            ) -> i64 {
+                self.next += 1;
+                let execution = ExecutionId::new(format!("exec_{}_{n}", self.name)).expect("valid");
+                let appended = store
+                    .append(NewEvent {
+                        agent_id: AgentId::new(format!("agent_{}", self.name)).expect("valid"),
+                        session_id: SessionId::new(format!("session_{}", self.name))
+                            .expect("valid"),
+                        execution_id: Some(execution),
+                        source,
+                        source_event_id: Some(format!("{}:{}", self.name, self.next)),
+                        kind,
+                    })
+                    .expect("append succeeds");
+                i64::try_from(appended.record.position.0).expect("an id")
+            }
+
+            fn started(&mut self, store: &PostgresStore) -> i64 {
+                self.execution += 1;
+                self.append(
+                    store,
+                    Source::Bridge,
+                    EventKind::ExecutionStarted {
+                        engine: ENGINE.to_string(),
+                        workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+                        command_id: CommandId(1),
+                        fork: None,
+                        model: ModelProfile::Default,
+                        transcript_from: None,
+                    },
+                )
+            }
+
+            fn ended(&mut self, store: &PostgresStore, cause: EndCause) -> i64 {
+                self.append(
+                    store,
+                    Source::Bridge,
+                    EventKind::ExecutionEnded {
+                        cause,
+                        exit_code: None,
+                        signal: None,
+                        evidence: None,
+                    },
+                )
+            }
+
+            /// A judgement: the model judge's with a `stuck` score, or the
+            /// rules' (no `stuck`), as the Observer records after an end.
+            fn judged(&mut self, store: &PostgresStore, stuck: Option<f64>) -> i64 {
+                let mut observation = Observation::basic(
+                    if stuck.is_some() {
+                        SemanticState::Unknown
+                    } else {
+                        SemanticState::Completed
+                    },
+                    None,
+                    SessionSeq(self.next),
+                    Confidence::new(1.0).expect("valid confidence"),
+                    if stuck.is_some() { "jev" } else { "rules" },
+                );
+                observation.stuck = stuck;
+                self.append(
+                    store,
+                    Source::Observer,
+                    EventKind::ObservationRecorded { observation },
+                )
+            }
+        }
+
+        fn observe(monitor: &mut Monitor, store: &PostgresStore) -> Vec<Event> {
+            let observations: Value = store.alert_observations().expect("the judgements");
+            let mut out = Vec::new();
+            monitor.observe(&observations, &mut out);
+            decided(monitor, out)
+        }
+
+        fn cleared_by(events: &[Event]) -> Vec<(String, Value)> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Clear { key, evidence } => Some((key.clone(), evidence.clone())),
+                    Event::Fire { .. } => None,
+                })
+                .collect()
+        }
+
+        /// 106's shape on the live log: stuck, stopped, then the rules'
+        /// COMPLETED judgement with no `stuck` after the end. The end is the
+        /// session's current state, so it clears, with the end's id; and a
+        /// lost execution clears the same way, its cause named.
+        #[test]
+        fn a_stuck_alert_clears_at_its_executions_end_whatever_judgement_follows() {
+            in_schema("stuck_end", |store| {
+                let mut monitor = monitor();
+                let mut stopped = Session::new("worker_stop");
+                let mut lost = Session::new("worker_lost");
+                stopped.started(store);
+                lost.started(store);
+                let stuck = stopped.judged(store, Some(0.64));
+                let stuck_lost = lost.judged(store, Some(0.7));
+                let fired = observe(&mut monitor, store);
+                assert_eq!(
+                    fires(&fired),
+                    [
+                        format!("agent_stuck:session_worker_lost:{stuck_lost}"),
+                        format!("agent_stuck:session_worker_stop:{stuck}"),
+                    ]
+                );
+                commit(&mut monitor, &fired);
+
+                let end = stopped.ended(store, EndCause::Stopped);
+                let end_lost = lost.ended(store, EndCause::Lost);
+                stopped.judged(store, None);
+                lost.judged(store, None);
+                let cleared = observe(&mut monitor, store);
+                assert_eq!(
+                    cleared_by(&cleared),
+                    [
+                        (
+                            format!("agent_stuck:session_worker_lost:{stuck_lost}"),
+                            json!({"event_id": end_lost, "cause": "lost"})
+                        ),
+                        (
+                            format!("agent_stuck:session_worker_stop:{stuck}"),
+                            json!({"event_id": end, "cause": "stopped"})
+                        ),
+                    ]
+                );
+                commit(&mut monitor, &cleared);
+                assert!(observe(&mut monitor, store).is_empty(), "cleared once");
+            });
+        }
+
+        /// An end and then a start (a resume, as the supervisor's lost
+        /// execution and the next): the end is not current, so a stuck
+        /// alert of the new execution stays open, and an unscored judgement
+        /// changes nothing.
+        #[test]
+        fn an_end_followed_by_a_start_clears_nothing() {
+            in_schema("stuck_resume", |store| {
+                let mut monitor = monitor();
+                let mut session = Session::new("supervisor");
+                session.started(store);
+                session.ended(store, EndCause::Lost);
+                session.started(store);
+                let stuck = session.judged(store, Some(0.52));
+                let fired = observe(&mut monitor, store);
+                assert_eq!(
+                    fires(&fired),
+                    [format!("agent_stuck:session_supervisor:{stuck}")]
+                );
+                commit(&mut monitor, &fired);
+                session.judged(store, None);
+                assert!(observe(&mut monitor, store).is_empty(), "nothing clears");
+            });
+        }
+
+        /// A runner's late report of the older execution's end, recorded
+        /// after the resume's start (only old logs hold one: bridge.rs), is
+        /// no end: the store counts the Bridge's alone (schema.sql's "a
+        /// runner's exit report is no end"). The live execution's stuck
+        /// judgement fires, and nothing clears it. rev-f's probe on
+        /// 4897d444, which read that report as the current end.
+        #[test]
+        fn a_runners_late_end_report_of_an_older_execution_is_no_end() {
+            in_schema("stuck_late_report", |store| {
+                let mut monitor = monitor();
+                let mut session = Session::new("late");
+                session.started(store);
+                session.ended(store, EndCause::Lost);
+                session.started(store);
+                session.append_to(
+                    store,
+                    1,
+                    Source::Claude,
+                    EventKind::ExecutionEnded {
+                        cause: EndCause::Exited,
+                        exit_code: Some(0),
+                        signal: None,
+                        evidence: None,
+                    },
+                );
+                let stuck = session.judged(store, Some(0.8));
+                let fired = observe(&mut monitor, store);
+                assert_eq!(fires(&fired), [format!("agent_stuck:session_late:{stuck}")]);
+                commit(&mut monitor, &fired);
+                session.judged(store, None);
+                assert!(observe(&mut monitor, store).is_empty(), "nothing clears it");
+            });
+        }
+
+        /// The model judge's `down` record (crate judge_watch.rs), read back
+        /// through the store's history as a restarted loop reads it: no
+        /// alert before SPAWN_ALERT_JUDGE_DOWN_SECS after its first failed
+        /// call (30 s before the record), `judge_down` at it, once, and its
+        /// `up` record, read as the next pass reads the control stream,
+        /// clears it with `failed_calls`. A loop whose history no longer
+        /// holds the `down` (restarted a week into the outage) clears the
+        /// open alert at the `up` all the same.
+        #[test]
+        fn a_judge_down_for_its_bound_fires_once_and_its_up_clears_it() {
+            in_schema("judge_down", |store| {
+                let mut monitor = monitor();
+                let first = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(0))
+                    - 30_000;
+                let down = store
+                    .host_record(&json!({"type": "host.judge", "judge": "jev",
+                                         "state": "down", "error": "judge unavailable: 502",
+                                         "first_failed_ms": first}))
+                    .expect("record down");
+                let history = store.alert_history(0, 100).expect("history");
+                let mut fed = Vec::new();
+                for entry in history.as_array().into_iter().flatten() {
+                    monitor.feed(
+                        entry["event_id"].as_i64().unwrap_or_default(),
+                        entry["at_ms"].as_i64().unwrap_or_default(),
+                        &entry["record"],
+                        &mut fed,
+                    );
+                }
+                assert!(fed.is_empty(), "a down is not yet an alert");
+                assert!(history[0]["at_ms"].as_i64().is_some_and(|at| at > first));
+                let at = first;
+                let mut early = Vec::new();
+                monitor.bounds(at + 899_999, &mut early);
+                assert!(early.is_empty(), "never before its bound");
+                let mut due = Vec::new();
+                monitor.bounds(at + 900_000, &mut due);
+                let key = format!("judge_down:{down}");
+                assert_eq!(fires(&due), [key.as_str()]);
+                let Event::Fire {
+                    subject,
+                    evidence,
+                    text,
+                    ..
+                } = &due[0]
+                else {
+                    panic!("a fire");
+                };
+                assert_eq!(subject, "jev");
+                assert_eq!(evidence["down_ms"], 900_000);
+                assert_eq!(evidence["error"], "judge unavailable: 502");
+                assert!(
+                    text.contains("failed two calls in a row, the first 900 s ago"),
+                    "{text}"
+                );
+                let recorded = decided(&monitor, due);
+                commit(&mut monitor, &recorded);
+                let mut restarted = super::monitor();
+                commit(&mut restarted, &recorded);
+                let mut again = Vec::new();
+                monitor.bounds(at + 1_800_000, &mut again);
+                assert!(decided(&monitor, again).is_empty(), "once per occurrence");
+
+                let up = store
+                    .host_record(&json!({"type": "host.judge", "judge": "jev",
+                                         "state": "up", "failed_calls": 41}))
+                    .expect("record up");
+                let batch = store.alert_control(down, 100).expect("the control stream");
+                let mut cleared = Vec::new();
+                for entry in batch["records"].as_array().into_iter().flatten() {
+                    monitor.feed(
+                        entry["event_id"].as_i64().unwrap_or_default(),
+                        entry["at_ms"].as_i64().unwrap_or_default(),
+                        &entry["record"],
+                        &mut cleared,
+                    );
+                }
+                let cleared = cleared_by(&decided(&monitor, cleared));
+                assert_eq!(cleared.len(), 1, "{cleared:?}");
+                assert_eq!(cleared[0].0, key);
+                assert_eq!(cleared[0].1["event_id"], up);
+                assert_eq!(cleared[0].1["failed_calls"], 41);
+                assert!(
+                    cleared[0].1["down_ms"]
+                        .as_i64()
+                        .is_some_and(|ms| ms >= 30_000)
+                );
+
+                let mut orphan = Vec::new();
+                for entry in batch["records"].as_array().into_iter().flatten() {
+                    restarted.feed(
+                        entry["event_id"].as_i64().unwrap_or_default(),
+                        entry["at_ms"].as_i64().unwrap_or_default(),
+                        &entry["record"],
+                        &mut orphan,
+                    );
+                }
+                let orphan = cleared_by(&decided(&restarted, orphan));
+                assert_eq!(orphan.len(), 1, "the up with no down known: {orphan:?}");
+                assert_eq!(orphan[0].0, key);
+                assert_eq!(orphan[0].1["event_id"], up);
+            });
+        }
+
+        /// An open agent_stuck says when its session was last scored, read
+        /// with the window: an unscored judgement after it (a judge that is
+        /// down) leaves that time where it was.
+        #[test]
+        fn an_open_stuck_alert_carries_the_time_of_its_sessions_last_score() {
+            in_schema("stuck_scored_at", |store| {
+                let mut session = Session::new("scored");
+                session.started(store);
+                let stuck = session.judged(store, Some(0.7));
+                let scored_at = store.alert_observations().expect("the judgements")[0]["at_ms"]
+                    .as_i64()
+                    .expect("its time");
+                store
+                    .alert_record(&json!({
+                        "type": "alert.fired", "key": format!("agent_stuck:session_scored:{stuck}"),
+                        "kind": "agent_stuck", "subject": "session_scored",
+                        "evidence": {"stuck": 0.7, "event_id": stuck},
+                        "text": "session_scored is stuck (0.70): UNKNOWN", "notice": false,
+                    }))
+                    .expect("fire");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                session.judged(store, None);
+                let window = store.alerts(0).expect("the window");
+                assert_eq!(window[0]["scored_at_ms"], scored_at, "{window}");
+                assert!(super::super::line(&window[0]).contains("(last scored "));
+            });
+        }
+
+        /// A loop that starts after the session ended, its latest scored
+        /// judgement stuck: nothing fires. And an alert already open on a
+        /// judgement made after the end (one fired before this rule) clears
+        /// at that end.
+        #[test]
+        fn an_ended_session_fires_nothing_and_its_open_alert_clears() {
+            in_schema("stuck_ended", |store| {
+                let mut session = Session::new("worker_done");
+                session.started(store);
+                let end = session.ended(store, EndCause::Exited);
+                let stuck = session.judged(store, Some(0.9));
+                let mut fresh = monitor();
+                assert!(
+                    observe(&mut fresh, store).is_empty(),
+                    "an ended session fires nothing"
+                );
+
+                let key = format!("agent_stuck:session_worker_done:{stuck}");
+                let mut monitor = monitor();
+                commit(
+                    &mut monitor,
+                    &[Event::Fire {
+                        key: key.clone(),
+                        kind: "agent_stuck",
+                        subject: "session_worker_done".to_string(),
+                        evidence: json!({}),
+                        text: String::new(),
+                        notice: false,
+                    }],
+                );
+                assert_eq!(
+                    cleared_by(&observe(&mut monitor, store)),
+                    [(key, json!({"event_id": end, "cause": "exited"}))]
+                );
+            });
+        }
     }
 
     #[test]

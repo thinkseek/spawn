@@ -95,7 +95,11 @@ export function TerminalPanel({
   }, [text]);
 
   return (
+    // A terminal is dark in both themes, so it carries the dark theme: its
+    // title, tag, status and buttons take the dark tokens (contrast.mjs
+    // checks those), not the light page's dark ink on a dark ground.
     <section
+      data-theme="dark"
       className={cx(
         "relative flex min-h-0 flex-col overflow-hidden rounded-lg border border-surface-border bg-terminal",
         className,
@@ -183,6 +187,7 @@ export function TerminalBlock({
   return (
     <div
       ref={scroller}
+      data-theme="dark"
       className={cx(
         "overflow-auto rounded-md border border-surface-border bg-terminal px-3 py-2.5 font-mono text-[12px] leading-5 text-terminal-foreground",
         className,

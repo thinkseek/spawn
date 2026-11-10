@@ -4,6 +4,7 @@
 #
 # usage: gate.sh <bare-repo> <base-commit> <candidate-commit> <scenarios-dir> [<scenario>]
 #        gate.sh --base-only <bare-repo> <base-commit> <scenarios-dir>
+#        gate.sh --base-keys <bare-repo> <base-commit> <scenarios-dir>
 #
 # Exports both commits to temporary directories and judges the candidate
 # with the controller's scenarios, never the trees' own: a candidate cannot
@@ -28,9 +29,16 @@
 #   on the candidate.
 # - Every other scenario in the directory must pass on the candidate, except
 #   ratchet scenarios (a line `# rsi: ratchet`), which compare against the
-#   base and so fail on any tree that did not improve, and objective
+#   base and so fail on any tree that did not improve, task-only scenarios
+#   (a line `# rsi: task-only`), which a gate cannot judge and which are run
+#   only as their own task's scenario, never on the base for another gate
+#   nor as a regression (029: the sandbox has no systemd user manager), and objective
 #   scenarios (`<digits>.sh`) the base fails too: an objective nobody has
-#   solved yet is not a regression, and must not block unrelated work.
+#   solved yet is not a regression, and must not block unrelated work. One
+#   the base fails that was solved, with all else that decides it the same, on an ancestor of
+#   the base is not an objective nobody solved: main is red on it, said
+#   ("main red: <name>") and listed in the verdict (`main_red_scenarios`),
+#   and still no verdict on the candidate ("Main red on a scenario" below).
 #   `check-*` scenarios are invariants and always must pass. A check that
 #   fails on the candidate is run again there; one that fails twice is run
 #   on the base: passing there, it is a regression (rejected); failing there
@@ -53,8 +61,9 @@
 # about the host, never as a result:
 # - on the base, the result is `cannot_judge`, recorded in the base cache
 #   like solved and unsolved (one run: the host says the same every time); a
-#   gate on a tree for another objective is therefore not stopped by it
-#   (029 is a regression in every Spawn gate's set);
+#   gate on a tree for another objective is therefore not stopped by it (an
+#   unmarked scenario that does this; 029 itself is task-only, above, and so
+#   never in another gate's set);
 # - on the candidate, a regression whose scenario exits 6 is skipped
 #   ("| <name> cannot be judged here: not a regression"), and a *task*
 #   scenario that exits 6 makes the gate write {"cannot_judge":true,
@@ -64,6 +73,11 @@
 #   toward no halt: nothing is rejected or aborted. Which objectives the
 #   gate cannot judge: deploy/systemd/README.md "Which objectives the gate
 #   cannot judge" lists them, 029 and why.
+# - one fact of the kind is the gate's own, not a scenario's: a base whose
+#   dependency graph does not resolve offline (the static checks, "the
+#   whole dependency graph"): the same fact with the scenario
+#   `dependencies`, any objective's; the candidate is never rejected for a
+#   graph its base cannot resolve here either.
 #
 # Exit-code contract for objective scenarios and the task scenario: 0 =
 # pass, 1 = an assertion failed, 6 = the host cannot judge it here (below: "A
@@ -204,6 +218,19 @@
 #                              ("main is red", the integrator sets it): its
 #                              verdict says `base_check` when it passes, and
 #                              two runs that fail alike are main_red (exit 6)
+#   SPAWN_GATE_RED_UNSOLVED    1: a check main is red on (it fails twice on
+#                              the base with the same failing tests) is
+#                              unsolved on the base, not a regression and no
+#                              stop, while the candidate's runs fail only
+#                              tests main's red runs fail: the gate says so
+#                              and judges the rest. A test the candidate
+#                              newly fails in it, or a run naming no failed
+#                              test, is a regression (new_failures).
+#                              The integrator sets it for an owner's gated
+#                              push only (design-owner-push-between-gates.md):
+#                              the regression rule holds for what the base
+#                              solves, and an owner's push during a red main
+#                              must not go ungated for it
 #   SPAWN_GATE_PG_IMAGE        the test server's docker image: the gate runs a
 #                              server of its own from it (GitHub issue #6),
 #                              and SPAWN_TEST_DATABASE_URL is not used
@@ -225,6 +252,15 @@
 # footprint is at most one slot no gate is waiting for and one compiler job. Exit 0 with no verdict (none is
 # written, whatever SPAWN_GATE_VERDICT says), 4 on a harness error, 3 as
 # below.
+#
+# Base keys (`--base-keys`): the base-phase cache key of every objective
+# this gate would judge, one `key <scenario> <sha256>` line each, printed
+# after the same setup a gate makes (the exports, the socket scan, and the
+# toolchain probe inside the sandbox, whose log lines precede the keys),
+# with no build, no scenario run and no verdict. Two hosts compute the same
+# key exactly when a base result taken on one is a cache hit on the other:
+# deploy/gate-runner.sh --check compares a runner's keys with this host's
+# before any gate is shipped there. Exit 0, 3 as below.
 #
 # Exit status: 0 with a verdict. 5 means no room to judge now: TMPDIR has
 # less than SPAWN_GATE_MIN_FREE_GB free (scripts/disk.sh gate_room). The
@@ -300,10 +336,33 @@ if [ "${1-}" = --base-only ]; then
     unset SPAWN_GATE_VERDICT
 fi
 
+# Base keys (`gate.sh --base-keys <bare-repo> <base-commit> <scenarios-dir>`):
+# the key every objective's base result would be cached under, printed and
+# nothing run (deploy/gate-runner.sh --check). The candidate is the base,
+# as in --base-only.
+base_keys_only=""
+if [ "${1-}" = --base-keys ]; then
+    shift
+    if [ $# -ne 3 ]; then
+        echo "usage: gate.sh --base-keys <bare-repo> <base-commit> <scenarios-dir>" >&2
+        exit 3
+    fi
+    base_keys_only=1
+    set -- "$1" "$2" "$2" "$3"
+    unset SPAWN_GATE_VERDICT
+fi
+
 repo=$1
 baseline=$2
 candidate=$3
 scenarios=$4
+# Without its trailing slashes ("dir/", as a hand run may type it): every
+# scenario's path below is "$scenarios"/<name>, and the main-red index is
+# written only for a scenario whose dirname is $scenarios, which "dir//071.sh"
+# (dirname "dir") never was, so red never fired on such a run.
+while [ "${#scenarios}" -gt 1 ] && [ "${scenarios%/}" != "$scenarios" ]; do
+    scenarios=${scenarios%/}
+done
 scenario=${5-}
 
 if ! command -v bwrap >/dev/null 2>&1; then
@@ -451,6 +510,8 @@ verdict() {
     # this base before any candidate code ran: main is green on it again,
     # whatever this gate ends with (gate.rs reads it from any fact).
     [ -n "${base_check_passed-}" ] && json="$json,\"base_check\":\"$base_check_passed\""
+    # The scenarios main is red on ("Main red on a scenario").
+    [ -n "${red_scenarios-}" ] && json="$json,\"main_red_scenarios\":[${red_scenarios#,}]"
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
@@ -491,6 +552,8 @@ host_fault() {
     # this base before any candidate code ran: main is green on it again,
     # whatever this gate ends with (gate.rs reads it from any fact).
     [ -n "${base_check_passed-}" ] && json="$json,\"base_check\":\"$base_check_passed\""
+    # The scenarios main is red on ("Main red on a scenario").
+    [ -n "${red_scenarios-}" ] && json="$json,\"main_red_scenarios\":[${red_scenarios#,}]"
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
@@ -534,6 +597,8 @@ EOF_MAIN_RED
     # this base before any candidate code ran: main is green on it again,
     # whatever this gate ends with (gate.rs reads it from any fact).
     [ -n "${base_check_passed-}" ] && json="$json,\"base_check\":\"$base_check_passed\""
+    # The scenarios main is red on ("Main red on a scenario").
+    [ -n "${red_scenarios-}" ] && json="$json,\"main_red_scenarios\":[${red_scenarios#,}]"
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
@@ -545,6 +610,27 @@ EOF_MAIN_RED
 # shared_failed <out> <out> <dest>: the `FAILED <test>: …` lines of the first
 # run whose test the second run failed too (check-tests.sh prints one per
 # failing test); <dest> empty when they share none. 0 when they share one.
+# new_failures <main-red> <out>...: for an owner's push
+# (SPAWN_GATE_RED_UNSOLVED), the tests the candidate's runs fail (`FAILED
+# <test>:`) that main's red runs do not, one a line, first seen first; a
+# candidate run with no FAILED line names nothing it failed, so it says so
+# (`(no FAILED line)`). Nothing when every candidate failure is main's own
+# (rev-b F1 on bfbda5cb: the red check was skipped whatever the candidate
+# broke inside it).
+new_failures() {
+    new_red=$1
+    shift
+    for new_out in "$@"; do
+        if ! grep -q '^FAILED ' "$new_out" 2>/dev/null; then
+            echo "(no FAILED line)"
+            continue
+        fi
+        awk '
+            FNR == NR { if ($1 == "FAILED") { t = $2; sub(/:$/, "", t); red[t] = 1 } next }
+            $1 == "FAILED" { t = $2; sub(/:$/, "", t); if (!(t in red)) print t }
+        ' "$new_red" "$new_out"
+    done | awk '!seen[$0]++'
+}
 shared_failed() {
     awk '
         FNR == NR { if ($1 == "FAILED") { t = $2; sub(/:$/, "", t); seen[t] = 1 } next }
@@ -569,6 +655,8 @@ cannot_judge() {
     # this base before any candidate code ran: main is green on it again,
     # whatever this gate ends with (gate.rs reads it from any fact).
     [ -n "${base_check_passed-}" ] && json="$json,\"base_check\":\"$base_check_passed\""
+    # The scenarios main is red on ("Main red on a scenario").
+    [ -n "${red_scenarios-}" ] && json="$json,\"main_red_scenarios\":[${red_scenarios#,}]"
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
@@ -615,6 +703,36 @@ base_cache=${XDG_CACHE_HOME:-$HOME/.cache}/spawn/gate-base
 mkdir -p "$base_cache"
 chmod 700 "$base_cache"
 base_cache=$(cd "$base_cache" && pwd -P)
+# Main red on a scenario (046's lesson: from 62516f9 Supply PA's 046 failed
+# on main, and every gate read it as "unsolved on the base", an objective
+# not yet met, so nothing guarded it). Beside the base cache, the base
+# commits of this repository on which each scenario was solved, with what
+# else decided that result (the scenario's base cache key without the
+# commit: its blob, the gate, the toolchain, the scenarios directory's other
+# files, the binds, the files it names), newest last, at most 50 a
+# scenario: `gate-solved/<root>/<name>`,
+# the repository named by its root commit, so another project's 046.sh is
+# another file. A scenario unsolved on this base that was solved, with the
+# same key, on one of this base's ancestors was broken by something that
+# landed or was pushed since: main is red on it. The gate says so ("main
+# red: <name>") and the verdict lists it (`main_red_scenarios`), where an unsolved
+# objective says neither; the candidate is judged as before (main's failure
+# is not the candidate's). The index is not the base cache: spawn-
+# maintenance's expiry of entries leaves it; it holds at most 50 lines a
+# scenario. The base cache's entries cannot say it: their
+# key holds the base commit, and nothing there says which commits were
+# main.
+solved_root=$(git --git-dir="$repo" rev-list --max-parents=0 "$base_commit" 2>/dev/null | LC_ALL=C sort | head -n 1)
+# Beside the base cache, not in it (its entries are the files directly in
+# it), and hidden from the sandbox the same way (a tmpfs over it, below).
+solved_base=$(dirname "$base_cache")/gate-solved
+solved_dir=""
+if [ -n "$solved_root" ] && mkdir -p "$solved_base/$solved_root" 2>/dev/null; then
+    chmod 700 "$solved_base"
+    solved_base=$(cd "$solved_base" && pwd -P)
+    solved_dir=$solved_base/$solved_root
+fi
+red_scenarios=""
 # The controller's checkout, as the checks locate it (two levels above the
 # scenarios directory).
 controller=$(cd "$scenarios/../.." && pwd)
@@ -1179,6 +1297,7 @@ sandbox_once() {
     *) [ -d "$TMPDIR" ] && set -- "$@" --tmpfs "$TMPDIR" ;;
     esac
     set -- "$@" --tmpfs "$work" --tmpfs "$base_cache"
+    [ ! -d "${solved_base-}" ] || set -- "$@" --tmpfs "$solved_base"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         set -- "$@" --tmpfs "$(dirname "$SPAWN_GATE_VERDICT")"
     fi
@@ -1722,6 +1841,8 @@ slot_no_room() {
     # this base before any candidate code ran: main is green on it again,
     # whatever this gate ends with (gate.rs reads it from any fact).
     [ -n "${base_check_passed-}" ] && json="$json,\"base_check\":\"$base_check_passed\""
+    # The scenarios main is red on ("Main red on a scenario").
+    [ -n "${red_scenarios-}" ] && json="$json,\"main_red_scenarios\":[${red_scenarios#,}]"
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT" 2>/dev/null || :
@@ -1859,6 +1980,93 @@ runs_alone() {
     [ -n "$serial_list" ] && printf '%s\n' "$serial_list" | grep -qxF -- "$(basename "$1")"
 }
 
+# The order runs start in (design-gate-time.md, cut B). The log and the
+# verdict keep the scenario order (above); only the start order changes,
+# and only with more than one run at a time: the runs on the serial list
+# first, one by one, while nothing else runs (together, not scattered
+# between the others, where each would wait for the runs before it to end
+# and leave slots idle); then the job's own task and check-tests (`head`:
+# the candidate's runs that decide most often); then the rest, longest
+# first by the time the scenario's last completed run took in that phase,
+# a scenario with no time yet first among them. The longest runs no longer
+# start last and leave one slot busy alone at the end: on Spawn's measured
+# phases about 80 s each (sim2.py). The times are the host's, under
+# ${XDG_CACHE_HOME:-~/.cache}/spawn/gate-times/<the repository's root
+# commit>/<phase>.<scenario>: one number, milliseconds, written after a run
+# that completed (exit 0, solved or unsolved), read by the next gate of the
+# same repository; never in a base cache key: the order changes no result.
+# What it costs: a failure late in the scenario order may be found later,
+# and a run's neighbours change (what `serial` is for).
+gate_times_dir=""
+# job_times_dir: the repository's directory of times, made once.
+job_times_dir() {
+    if [ -z "$gate_times_dir" ]; then
+        jt_root=$(git --git-dir="$repo" rev-list --max-parents=0 "$base_commit" 2>/dev/null | LC_ALL=C sort | head -n 1)
+        gate_times_dir=${XDG_CACHE_HOME:-$HOME/.cache}/spawn/gate-times/${jt_root:-unknown}
+        mkdir -p "$gate_times_dir" 2>/dev/null || :
+    fi
+    printf '%s' "$gate_times_dir"
+}
+# job_time <phase> <scenario name>: its last completed run's milliseconds,
+# or nothing.
+job_time() {
+    jt_held=$(cat "$(job_times_dir)/$1.$2" 2>/dev/null) || jt_held=""
+    case "$jt_held" in '' | *[!0-9]*) ;; *) printf '%s' "$jt_held" ;; esac
+}
+# job_time_note <phase> <job>: the time of a job that completed, for the
+# next gate's order. Its runs' stage times added (an objective's two base
+# runs are one job, run in one slot), and a candidate run's last (`ms`, its
+# stage line said when it is printed).
+job_time_note() {
+    case "$(cat "$2/result" 2>/dev/null)" in 0 | solved | unsolved) ;; *) return 0 ;; esac
+    [ ! -e "$2/slot-waited" ] && [ ! -s "$2/never-started" ] || return 0
+    jn_ms=$(awk '$1 == "stage" { ms += $2 } END { print ms + 0 }' "$2/events" 2>/dev/null) || return 0
+    jn_last=$(cat "$2/ms" 2>/dev/null) || jn_last=0
+    case "$jn_last" in '' | *[!0-9]*) jn_last=0 ;; esac
+    jn_ms=$((jn_ms + jn_last))
+    [ "${jn_ms:-0}" -gt 0 ] 2>/dev/null || return 0
+    jn_file=$(job_times_dir)/$1.$(basename "$(cat "$2/scenario")")
+    printf '%s\n' "$jn_ms" >"$jn_file.$$" 2>/dev/null && mv -f "$jn_file.$$" "$jn_file" 2>/dev/null ||
+        rm -f "$jn_file.$$" 2>/dev/null || :
+}
+# job_order <phase> <count>: the start order of $jobs_dir/<phase>.1 ..
+# <count> (above), their numbers in jo_order; said in the log when it is
+# not the scenario order.
+job_order() {
+    jo_i=1 jo_known=0 jo_rest=0
+    : >"$work/order.$1"
+    while [ "$jo_i" -le "$2" ]; do
+        jo_job=$jobs_dir/$1.$jo_i
+        if [ -e "$jo_job/alone" ]; then
+            jo_group=0 jo_ms=0
+        elif [ -e "$jo_job/head" ]; then
+            jo_group=1 jo_ms=0
+        else
+            jo_group=2
+            jo_ms=$(job_time "$1" "$(basename "$(cat "$jo_job/scenario")")")
+            # A result already (a cache hit) never starts: not counted.
+            if [ ! -e "$jo_job/result" ]; then
+                jo_rest=$((jo_rest + 1))
+                [ -z "$jo_ms" ] || jo_known=$((jo_known + 1))
+            fi
+            [ -n "$jo_ms" ] || jo_ms=999999999999
+        fi
+        [ "$gate_jobs" -gt 1 ] || jo_group=0 jo_ms=0
+        printf '%s %s %s\n' "$jo_group" "$jo_ms" "$jo_i" >>"$work/order.$1"
+        jo_i=$((jo_i + 1))
+    done
+    jo_order=$(sort -k1,1n -k2,2nr -k3,3n "$work/order.$1" | awk '{ printf "%s%s", sep, $3; sep = " " }')
+    if [ "$jo_order" != "$(seq -s ' ' 1 "$2")" ] && [ "$2" -gt 0 ]; then
+        jo_names=""
+        for jo_i in $jo_order; do
+            [ ! -e "$jobs_dir/$1.$jo_i/result" ] || continue
+            jo_names="$jo_names $(basename "$(cat "$jobs_dir/$1.$jo_i/scenario")")"
+        done
+        [ -z "$jo_names" ] ||
+            echo "| $1 start order (serial list first, then the task and check-tests, then longest first by the last runs' times, $jo_known of $jo_rest known):$jo_names"
+    fi
+}
+
 # run_jobs <phase> <count> <start> <finished> <printed>: the jobs
 # $jobs_dir/<phase>.1 .. <count>, $gate_jobs at a time, in order. A job with
 # a result already (a cache hit) is not started. <start> <job> runs one, in
@@ -1868,20 +2076,31 @@ runs_alone() {
 run_jobs() {
     rj_phase=$1 rj_count=$2 rj_start=$3 rj_finished=$4 rj_printed=$5
     jobs_stop=$rj_count
-    rj_next=1 rj_print=1 rj_running="" rj_busy=0 rj_alone=""
+    rj_print=1 rj_running="" rj_busy=0 rj_alone=""
+    job_order "$rj_phase" "$rj_count"
+    rj_pending=$jo_order
     while [ "$rj_print" -le "$jobs_stop" ]; do
         rj_changed=""
-        while [ "$rj_next" -le "$jobs_stop" ] && [ -z "$rj_alone" ]; do
+        rj_left="" rj_blocked=""
+        for rj_next in $rj_pending; do
+            # Past the first decisive run in the scenario order: never needed.
+            [ "$rj_next" -le "$jobs_stop" ] || continue
             rj_job=$jobs_dir/$rj_phase.$rj_next
-            if [ -e "$rj_job/result" ]; then
-                rj_next=$((rj_next + 1))
+            [ ! -e "$rj_job/result" ] || continue
+            # In order: one that cannot start yet holds back every one after it.
+            if [ -n "$rj_blocked" ] || [ -n "$rj_alone" ]; then
+                rj_left="$rj_left $rj_next"
                 continue
             fi
             if [ -e "$rj_job/alone" ]; then
-                [ "$rj_busy" -eq 0 ] || break
+                if [ "$rj_busy" -ne 0 ]; then
+                    rj_blocked=1 rj_left="$rj_left $rj_next"
+                    continue
+                fi
                 rj_alone=$rj_next
             elif [ "$rj_busy" -ge "$gate_jobs" ]; then
-                break
+                rj_blocked=1 rj_left="$rj_left $rj_next"
+                continue
             fi
             # The gate's traps are not the job's; a failure inside it is
             # its result (`error`), never a silent end.
@@ -1899,9 +2118,9 @@ run_jobs() {
             phase_started=$((phase_started + 1))
             rj_running="$rj_running $rj_next"
             rj_busy=$((rj_busy + 1))
-            rj_next=$((rj_next + 1))
             rj_changed=1
         done
+        rj_pending=$rj_left
         rj_still=""
         for rj_i in $rj_running; do
             rj_job=$jobs_dir/$rj_phase.$rj_i
@@ -1936,6 +2155,7 @@ run_jobs() {
             fi
             if [ -e "$rj_job/result" ]; then
                 "$rj_finished" "$rj_job" "$rj_i"
+                job_time_note "$rj_phase" "$rj_job"
                 [ "$rj_alone" != "$rj_i" ] || rj_alone=""
                 rj_busy=$((rj_busy - 1))
                 rj_changed=1
@@ -2116,6 +2336,20 @@ if [ -f "$work/candidate/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
     : >"$work/build-time.base"
     if ! local_build_time "$work/candidate" "$work/candidate" >"$work/build-time.candidate"; then
         sed 's/^/| metadata: /' "$work/metadata.log" | tail -n 20
+        # Only a candidate whose base resolves here is rejected for it. A
+        # base that does not resolve either says this host's registry lacks
+        # a crate main needs (a runner never sent it, a pruned cache): a
+        # fact about the host, never a verdict on the work (exit 6,
+        # `cannot_judge`; the integrator judges again after its backoff).
+        if [ -f "$work/baseline/Cargo.toml" ] && {
+            mkdir -p "$work/base-metadata"
+            ! local_build_time "$work/base-metadata" "$work/baseline" >/dev/null
+        }; then
+            echo "| dependencies: cannot judge: the base's dependency graph does not resolve offline" \
+                "on this host either (its cargo registry lacks a crate the base needs)"
+            [ -z "$base_only" ] || exit 4
+            cannot_judge dependencies 1
+        fi
         verdict rejected "candidate's dependency graph does not resolve offline"
         exit 0
     fi
@@ -2752,6 +2986,51 @@ base_printed() {
         ;;
     esac
     printf '%s|%s\n' "$result" "$(cat "$1/scenario")" >>"$work/base-results"
+    case "$result" in
+    solved) solved_note "$(cat "$1/scenario")" "$(cat "$1/solved-key" 2>/dev/null)" ;;
+    unsolved)
+        red_at=$(main_red_of "$(cat "$1/scenario")" "$(cat "$1/solved-key" 2>/dev/null)")
+        if [ -n "$red_at" ]; then
+            echo "| main red: $printed_name was solved on $(printf '%s' "$red_at" | cut -c1-12)," \
+                "an ancestor of this base, by this very scenario, and is unsolved on the base" \
+                "$(printf '%s' "$base_commit" | cut -c1-12): something that landed or was pushed since broke it"
+            red_scenarios="$red_scenarios,\"$(json_string "$printed_name")\""
+        fi
+        ;;
+    esac
+}
+# solved_note <scenario> <key>: this base solved it, on record for
+# main_red_of ("Main red on a scenario"), with what decided the result but
+# the base (<key>: objective_key without the commit). Nothing without a key
+# (a task scenario outside the scenarios directory). Once per base and key;
+# the oldest lines go past 50. Written whole and renamed, so a reader never
+# sees half a file; two gates writing at once lose a line at worst, never
+# the file.
+solved_note() {
+    [ -n "$solved_dir" ] && [ -n "$2" ] || return 0
+    solved_file=$solved_dir/$(basename "$1")
+    solved_line="$base_commit $2"
+    grep -qxF -- "$solved_line" "$solved_file" 2>/dev/null && return 0
+    if ! { { tail -n 49 "$solved_file" 2>/dev/null || :; printf '%s\n' "$solved_line"; } >"$solved_file.$$" &&
+        mv -f -- "$solved_file.$$" "$solved_file"; } 2>/dev/null; then
+        rm -f -- "$solved_file.$$"
+    fi
+}
+# main_red_of <scenario> <key>: the newest ancestor of this base (not the
+# base itself) on which the scenario was solved with everything else that
+# decides its result the same (<key>: the scenario's blob, the gate, the
+# toolchain, the scenarios directory's other files, the binds, the files it
+# names); nothing when there is none, or without a key.
+main_red_of() {
+    [ -n "$solved_dir" ] && [ -n "$2" ] && [ -f "$solved_dir/$(basename "$1")" ] || return 0
+    red_key=$2
+    tac -- "$solved_dir/$(basename "$1")" | while read -r red_commit red_was; do
+        [ "$red_was" = "$red_key" ] && [ "$red_commit" != "$base_commit" ] || continue
+        if git --git-dir="$repo" merge-base --is-ancestor "$red_commit" "$base_commit" 2>/dev/null; then
+            printf '%s\n' "$red_commit"
+            break
+        fi
+    done
 }
 
 # objective_key <commit> <toolchain key> <objective>: the key of the
@@ -2766,9 +3045,17 @@ objective_key() {
     } | sha256sum | cut -d' ' -f1
 }
 
+# not_a_regression <scenario>: 0 for a scenario no gate runs but as its own
+# task's: a ratchet (`# rsi: ratchet`, it compares against the base) or a
+# task-only one (`# rsi: task-only`, a gate cannot judge it: see the header).
+not_a_regression() {
+    grep -qE '^# rsi: (ratchet|task-only)' "$1"
+}
+
 # The base phase: every objective's key (and its result, when the cache
 # has it), then one build of the base for those it has not, then their runs.
 : >"$work/base-results"
+: >"$work/base-keys"
 from_cache=""
 run_on_base=""
 skipped_on_base=""
@@ -2779,18 +3066,29 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
     [ -f "$objective" ] || continue
     if [ "$objective" != "$scenario" ]; then
         case "$(basename "$objective")" in *[!0-9].sh | .sh) continue ;; esac
-        grep -q '^# rsi: ratchet' "$objective" && continue
+        not_a_regression "$objective" && continue
     fi
     grep -qxF "$objective" "$work/base-results.seen" 2>/dev/null && continue
     printf '%s\n' "$objective" >>"$work/base-results.seen"
     objective_name=$(basename "$objective")
     toolchain
-    entry=$base_cache/$(objective_key "$base_commit" "$toolchain_key" "$objective")
+    key=$(objective_key "$base_commit" "$toolchain_key" "$objective")
+    entry=$base_cache/$key
+    if [ -n "$base_keys_only" ]; then
+        printf 'key %s %s\n' "$objective_name" "$key" >>"$work/base-keys"
+    fi
     base_count=$((base_count + 1))
     job=$jobs_dir/base.$base_count
     mkdir "$job"
     printf '%s\n' "$objective" >"$job/scenario"
     printf '%s\n' "$entry" >"$job/entry"
+    # What decides the result but the base ("Main red on a scenario"): the
+    # same key with no commit in it. Only the scenarios directory's own:
+    # a task scenario kept elsewhere is judged by its own task's gates only,
+    # so no other gate could ever see it green again.
+    if [ "$(dirname "$objective")" = "$scenarios" ]; then
+        objective_key - "$toolchain_key" "$objective" >"$job/solved-key"
+    fi
     if runs_alone "$objective"; then : >"$job/alone"; fi
     result=$(entry_result "$entry")
     if [ -z "$result" ] && { [ -e "$entry" ] || [ -L "$entry" ]; }; then
@@ -2807,6 +3105,13 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
         base_misses=$((base_misses + 1))
     fi
 done
+# Base keys: the keys the base phase would use, and nothing else. The
+# timing line is the trap's; a reader of the keys gets them alone.
+if [ -n "$base_keys_only" ]; then
+    times_said=1
+    LC_ALL=C sort "$work/base-keys"
+    exit 0
+fi
 if [ "$base_misses" -gt 0 ]; then
     section "base: build"
     if ! build "$work/baseline"; then
@@ -3017,7 +3322,20 @@ if [ -f "$work/baseline/Cargo.toml" ] && [ -f "$work/candidate/Cargo.toml" ]; th
     fi
     if [ -n "$dropped" ]; then
         echo "| base tests the candidate does not run by name: $(printf '%s\n' "$dropped" | head -n 20 | tr '\n' ' ')"
-        verdict rejected "candidate drops or renames base tests ($(printf '%s\n' "$dropped" | grep -c .): $(printf '%s\n' "$dropped" | head -n 3 | tr '\n' ' ' | sed 's/ $//'))"
+        # A retired-tests line that is a dropped test's last path component
+        # only names nothing: the match is the whole name as cargo lists it
+        # (batch 16: `a_judging_…` for `integrate::database_tests::a_judging_…`).
+        near_miss=""
+        if [ -s "$work/tests.retired" ]; then
+            near_miss=$(printf '%s\n' "$dropped" | awk -F'::' '
+                FNR == NR { if (index($0, "::") == 0) bare[$0] = 1; next }
+                NF > 1 && ($NF in bare) { print $NF " names " $0 " only by its last component" }
+            ' "$work/tests.retired" - | head -n 3)
+        fi
+        if [ -n "$near_miss" ]; then
+            printf '%s\n' "$near_miss" | sed 's/^/| retired-tests: /; s/$/: write the whole name, as cargo lists it/'
+        fi
+        verdict rejected "candidate drops or renames base tests ($(printf '%s\n' "$dropped" | grep -c .): $(printf '%s\n' "$dropped" | head -n 3 | tr '\n' ' ' | sed 's/ $//'))${near_miss:+; retired-tests names it by its last component only: write the whole name, as cargo lists it}"
         exit 0
     fi
 fi
@@ -3108,6 +3426,16 @@ candidate_job() {
                         shared_failed "$job/out.3" "$job/out.4" "$job/main-red"; then
                         job_say "| $(basename "$job_scenario") fails on the base twice with the same failing tests: main is red on it, no verdict on the candidate"
                         run_status=main_red
+                        # An owner's push: unsolved on the base only for the
+                        # tests main fails; one more the candidate fails is
+                        # its own regression.
+                        if [ "${SPAWN_GATE_RED_UNSOLVED-}" = 1 ]; then
+                            red_new=$(new_failures "$job/main-red" "$job/out.1" "$job/out.2")
+                            if [ -n "$red_new" ]; then
+                                job_say "| $(basename "$job_scenario"): the candidate fails what main's red runs do not ($(printf '%s' "$red_new" | tr '\n' ' ' | sed 's/ $//')): a regression"
+                                run_status=$again
+                            fi
+                        fi
                     else
                         rm -f "$job/main-red"
                         job_say "| $(basename "$job_scenario") fails on the base too ($on_base, then $on_base2): a host or harness fault, no verdict on the candidate"
@@ -3134,6 +3462,11 @@ decisive() {
     [ "$(cat "$1/result")" != 0 ] || return 1
     # A scenario the host cannot judge is no verdict either way (below).
     [ "$(cat "$1/result")" != 6 ] || return 1
+    # A check main is red on, for an owner's push (SPAWN_GATE_RED_UNSOLVED):
+    # unsolved on the base, the rest still judged.
+    if [ "$(cat "$1/result")" = main_red ] && [ "${SPAWN_GATE_RED_UNSOLVED-}" = 1 ]; then
+        return 1
+    fi
     [ -e "$1/task" ] || [ "$(cat "$1/result")" = error ] ||
         [ "$(base_result "$(cat "$1/scenario")")" != unsolved ]
 }
@@ -3178,6 +3511,11 @@ candidate_printed() {
         run_stage "skipped|$printed_name" "$printed_ms"
         return 0
     fi
+    if [ "$printed_status" = main_red ] && [ "${SPAWN_GATE_RED_UNSOLVED-}" = 1 ]; then
+        echo "| $(basename "$printed_scenario") fails on the base twice with the same failing tests: main is red on it, so it is unsolved on the base (SPAWN_GATE_RED_UNSOLVED): not a regression"
+        run_stage "skipped|$printed_name" "$printed_ms"
+        return 0
+    fi
     if [ "$printed_status" = main_red ]; then
         run_stage "host_fault|$(cat "$1/last")" "$printed_ms"
         phase_time candidate
@@ -3211,7 +3549,11 @@ candidate_printed() {
         # An objective scenario is a regression only if the base solved it,
         # as judged before any candidate code ran.
         if [ "$(base_result "$printed_scenario")" = unsolved ]; then
-            echo "| $(basename "$printed_scenario") fails on the base too: an unsolved objective, not a regression"
+            case "$red_scenarios," in
+            *",\"$(json_string "$(basename "$printed_scenario")")\","*)
+                echo "| $(basename "$printed_scenario") fails on the base too: main is red on it (above), not a verdict on the candidate" ;;
+            *) echo "| $(basename "$printed_scenario") fails on the base too: an unsolved objective, not a regression" ;;
+            esac
             run_stage "unsolved|$printed_name" "$printed_ms"
             return 0
         fi
@@ -3317,14 +3659,16 @@ seed() {
 if [ -n "$scenario" ]; then
     add_candidate_job "$scenario" "candidate: $(basename "$scenario") must pass"
     : >"$job/task"
+    : >"$job/head"
 fi
 for other in "$scenarios"/check-tests.sh "$scenarios"/*.sh; do
     [ -f "$other" ] || continue
     [ "$other" = "$scenario" ] && continue
     [ "$other" = "$scenarios/check-tests.sh" ] && [ -n "${tests_queued-}" ] && continue
     [ "$other" = "$scenarios/check-tests.sh" ] && tests_queued=1
-    grep -q '^# rsi: ratchet' "$other" && continue
+    not_a_regression "$other" && continue
     add_candidate_job "$other" "regression: $(basename "$other") must still pass"
+    [ "$other" != "$scenarios/check-tests.sh" ] || : >"$job/head"
 done
 stage_close ok
 # A fresh server for the candidate's runs: the base phase's runs leave the
