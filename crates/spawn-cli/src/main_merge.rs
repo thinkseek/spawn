@@ -471,7 +471,8 @@ pub(crate) fn fork_failed_note(prior: &PriorWork, error: &str, head: Option<&str
     }
 }
 
-/// What a task forked from `prior`'s work is told at its start.
+/// What a reassigned task whose branch the Bridge makes at `prior`'s last
+/// checkpoint (a mission without a source) is told at its start.
 pub(crate) fn reassign_note(prior: &PriorWork) -> String {
     format!(
         "This task was reassigned to you from task #{task}, whose worker stopped before it was \
@@ -482,8 +483,7 @@ pub(crate) fn reassign_note(prior: &PriorWork) -> String {
     )
 }
 
-/// What the Start of a task forked from `prior` says about it, `merge`
-/// being what merging main into the fork did.
+/// What a task forked from `prior`'s work is told at its start.
 pub(crate) fn fork_note(prior: &PriorWork, merge: &Merge) -> String {
     let opening = format!(
         "Your workspace already contains task #{}'s work (its last checkpoint, commit {}), not \
