@@ -207,6 +207,21 @@ line() {
     >>"$transcript"
 }
 log() { printf '%s %s %s\n' "$1" "$(date +%s.%N)" "$2" >>"$BB_WORK/engine.log"; }
+# readline <seconds>: a whole typed line in $typed (0), or none yet (1).
+# bash's `read -t` keeps what it read of a line when it times out (a paste
+# that straddles the timeout): that part is held in $partial and joined to
+# the rest of the line on the next call, never dropped.
+partial=
+readline() {
+  chunk=
+  if IFS= read -r -t "$1" chunk; then
+    typed=$partial$chunk
+    partial=
+    return 0
+  fi
+  partial=$partial$chunk
+  return 1
+}
 tool() {
   line "\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"$1\",\"name\":\"Bash\",\"input\":{}}]}"
   line "\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"$1\",\"content\":\"ok\"}]}"
@@ -225,7 +240,7 @@ run_turn() {
       printf '\n✻ Churning… (esc to interrupt)\n❯ '
       next=$(($(date +%s) + 2))
     fi
-    if IFS= read -r -t 0.5 typed; then
+    if readline 0.5; then
       log during "$typed"
     fi
   done
@@ -237,7 +252,7 @@ pending=0
 job=
 turns=0
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if readline 1; then
     log got "$typed"
     printf 'you: %s\n' "$typed"
     if [ "$pending" = 0 ]; then
@@ -248,7 +263,8 @@ while :; do
     *"BB:BUSY "*) [ -n "$job" ] || job="busy ${typed#*BB:BUSY }" ;;
     *"BB:NOTE "*) [ -n "$job" ] || job="note ${typed#*BB:NOTE }" ;;
     esac
-  elif [ "$pending" = 1 ]; then
+  elif [ "$pending" = 1 ] && [ -z "$partial" ]; then
+    # Quiet, and no line half read: the turn starts.
     turns=$((turns + 1))
     set -- ${job:-note other}
     case "$1" in
