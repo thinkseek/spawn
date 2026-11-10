@@ -246,7 +246,10 @@ mod tests {
         use crate::dispatch::worker::Decision;
         for (key, words) in [
             ("restart-7-1-stop", "task #7 was restarted"),
-            ("reassign-7-stop", "task #7 was reassigned to a fresh worker"),
+            (
+                "reassign-7-stop",
+                "task #7 was reassigned to a fresh worker",
+            ),
         ] {
             let mut stops: Vec<StopSent> = (0..=DELIVERY_RETRIES)
                 .map(|n| {
