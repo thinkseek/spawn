@@ -154,6 +154,8 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
     // The loop records costs at these prices; a page served beside a setting
     // that cannot be read would show figures nobody can trust, so it stops.
     crate::cost::Prices::from_env()?;
+    // Read once, here, so a bad value is warned of at start.
+    crate::config::message_taken_ms();
     let open = open_networks(env_value("SPAWN_SERVE_OPEN_NETWORKS").as_deref())?;
     let server = Server::http(&address).map_err(|error| format!("listen {address}: {error}"))?;
     let guard = match (&token, open.is_empty()) {

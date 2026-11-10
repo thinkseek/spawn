@@ -166,6 +166,20 @@ pub(crate) fn loop_interval() -> std::time::Duration {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_message_bound_is_whole_seconds_and_a_bad_value_is_the_default_said() {
+        use super::message_taken_bound;
+        assert_eq!(message_taken_bound(None), (120_000, None));
+        assert_eq!(message_taken_bound(Some("6")), (6_000, None));
+        assert_eq!(message_taken_bound(Some(" 0 ")), (0, None));
+        for bad in ["1.5", "-3", "two", "6s"] {
+            let (bound, warning) = message_taken_bound(Some(bad));
+            assert_eq!(bound, 120_000, "{bad}");
+            let warning = warning.expect("a bad value is said");
+            assert!(warning.contains("SPAWN_MESSAGE_TAKEN_SECS"), "{warning}");
+        }
+    }
+
     use super::*;
 
     #[test]
