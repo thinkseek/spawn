@@ -60,8 +60,9 @@
 # about the host, never as a result:
 # - on the base, the result is `cannot_judge`, recorded in the base cache
 #   like solved and unsolved (one run: the host says the same every time); a
-#   gate on a tree for another objective is therefore not stopped by it
-#   (029 is a regression in every Spawn gate's set);
+#   gate on a tree for another objective is therefore not stopped by it (an
+#   unmarked scenario that does this; 029 itself is task-only, above, and so
+#   never in another gate's set);
 # - on the candidate, a regression whose scenario exits 6 is skipped
 #   ("| <name> cannot be judged here: not a regression"), and a *task*
 #   scenario that exits 6 makes the gate write {"cannot_judge":true,
