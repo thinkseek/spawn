@@ -1700,6 +1700,15 @@ fn park_for_good() -> ! {
     }
 }
 
+/// A halted gate: its whole group killed, its leader reaped, and its
+/// thread parked for good.
+fn halt_child(child: &mut std::process::Child, group: u32) -> ! {
+    kill_group(group);
+    let _ = child.kill();
+    let _ = child.wait();
+    park_for_good()
+}
+
 fn kill_group(group: u32) {
     let _ = Command::new("kill")
         .args(["-KILL", "--", &format!("-{group}")])
@@ -1756,24 +1765,18 @@ pub(crate) fn run_bounded(
     let kill_group = || kill_group(group);
     // A halt that came before the group was noted kills it here; one that
     // comes after kills it itself ([`Halt::halt`]).
-    let halted = |child: &mut std::process::Child| {
-        kill_group();
-        let _ = child.kill();
-        let _ = child.wait();
-        park_for_good()
-    };
     if halt.as_ref().is_some_and(|halt| halt.note(Some(group))) {
-        halted(&mut child);
+        halt_child(&mut child, group);
     }
     let deadline = Instant::now() + limit;
     let status = loop {
         match child.try_wait() {
             Ok(Some(_)) if halt.as_ref().is_some_and(|halt| halt.halted()) => {
-                halted(&mut child);
+                halt_child(&mut child, group);
             }
             Ok(Some(status)) => break status,
             Ok(None) if halt.as_ref().is_some_and(|halt| halt.halted()) => {
-                halted(&mut child);
+                halt_child(&mut child, group);
             }
             Ok(None) if Instant::now() >= deadline => {
                 kill_group();
