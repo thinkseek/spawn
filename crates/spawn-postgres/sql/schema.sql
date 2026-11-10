@@ -2994,8 +2994,9 @@ begin
                                       'source.moved', 'source.push_refused',
                                       'task.over_budget', 'objective.solved',
                                       'source.main_red', 'source.main_probe',
-<<<<<<< 13fc93a710e08f44036aad7336afe9ddee076a00
-                                      'source.main_green', 'task.shadow_gated') then
+                                      'source.main_green', 'task.shadow_gated',
+                                      'integrator.draining', 'integrator.drained',
+                                      'integrator.drain_expired') then
         raise exception 'the integrator does not record %', p_record ->> 'type';
     end if;
     -- A shadow verdict (spawn-cli integrate/shadow.rs): a gate runner judged
@@ -3015,10 +3016,8 @@ begin
                and jsonb_array_length(p_record -> 'unequal') > 0) then
             raise exception 'a task.shadow_gated names its task, runner, inputs and unequal, and agrees only on equal inputs: %',
                             p_record;
-=======
-                                      'source.main_green', 'integrator.draining',
-                                      'integrator.drained', 'integrator.drain_expired') then
-        raise exception 'the integrator does not record %', p_record ->> 'type';
+        end if;
+        return spawn_control_record(p_record);
     end if;
     -- The integrator's own drain (`spawn integrate --drain`, SIGUSR1): its
     -- start names the tasks whose gates run and its bound; its end, drained
@@ -3034,7 +3033,6 @@ begin
                                 where jsonb_typeof(g) is distinct from 'number'))) then
             raise exception 'an % names its bound_s (1 to 86400) and, but drained, its gates (task numbers): %',
                             p_record ->> 'type', p_record;
->>>>>>> a960df16b193e91541a59af43db3845ad7cc569b
         end if;
         return spawn_control_record(p_record);
     end if;
