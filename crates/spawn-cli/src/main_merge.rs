@@ -1603,6 +1603,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// GitHub #16 item 1: the set-aside moves the branch before it is
+    /// recorded. An append that fails (here the log refuses the session)
+    /// leaves the set-aside commit without its `artifact.committed`; the
+    /// dispatcher's next pass finds the branch at the start's tree, and
+    /// records that set-aside all the same, once.
+    #[test]
+    fn a_set_aside_whose_record_failed_is_recorded_by_the_next_pass() {
+        use crate::set_aside::{Done, set_aside};
+        let db = Db::new("set_aside_retry");
+        let (base, source, root, mirror, store) = world("set-aside-retry");
+        let (agent, session) = db.task_on(&source, "set-aside-retry");
+        let workspace = agent_with_work(&store, &agent, |directory| {
+            std::fs::write(directory.join("work.txt"), "cancelled\n").expect("write");
+        });
+        store.unmount(&workspace).expect("its execution ended");
+        let work = head(&mirror, &agent);
+        let cancelled = |session: &str| crate::deliver::Cancelled {
+            id: 7,
+            mission_id: 1,
+            agent_id: agent.clone(),
+            session_id: session.to_string(),
+            start: None,
+            set_aside: None,
+            told: false,
+            closed_by: Some("task.cancelled".to_string()),
+            reason: None,
+            yielded: false,
+            yield_reason: None,
+        };
+        let recorded = || {
+            let mut client =
+                postgres::Client::connect(&db.url, postgres::NoTls).expect("connection");
+            client
+                .batch_execute(&format!("set search_path to {}", db.schema))
+                .expect("schema");
+            client
+                .query(
+                    "select kind -> 'detail' -> 'artifact' ->> 'commit' from spawn_events
+                      where source_event_id = 'set-aside:7'",
+                    &[],
+                )
+                .expect("the records")
+                .iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect::<Vec<_>>()
+        };
+        let error = set_aside(&db.store, &root, &cancelled("session_of_another"))
+            .expect_err("the append is refused");
+        assert!(error.contains("record the set-aside of task #7"), "{error}");
+        let aside = head(&mirror, &agent);
+        assert_ne!(aside, work, "the branch moved before the record");
+        assert!(recorded().is_empty());
+
+        let done = set_aside(&db.store, &root, &cancelled(&session)).expect("the next pass");
+        assert_eq!(
+            done,
+            Done::SetAside {
+                commit: aside.clone(),
+                kept: work,
+            }
+        );
+        assert_eq!(recorded(), std::slice::from_ref(&aside));
+        // And a pass after that (the dispatcher then reads it back) adds none.
+        set_aside(&db.store, &root, &cancelled(&session)).expect("again");
+        assert_eq!(recorded(), std::slice::from_ref(&aside));
+        assert_eq!(head(&mirror, &agent), aside, "no second commit");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// rev-e on a114a9e: a fork that fails every pass. Its first failure is
     /// recorded once (`task.fork_failed`, with the error); the Start waits
     /// until that record is the give-up bound old, then goes without the

@@ -1587,6 +1587,18 @@ impl GitWorkspace {
     /// way a merge of main does; only then does the branch move, by
     /// compare-and-swap. `start` must be an ancestor of the head: no foreign
     /// tree is ever written. `None` is where the branch forked from `main`.
+    ///
+    /// The files that commit leaves out (over the cap, or special at a path
+    /// the branch holds a file at: [`Self::special_files_at`]) are on no
+    /// branch, so the two-tree move would leave them where they are: they
+    /// are removed from the directory, as the unmount of a stopped worker
+    /// removes them (docs/storage.md, "Files over the cap"), so the next
+    /// task finds none of them and none is in the way of `start`'s file.
+    ///
+    /// The branch moves before the caller records the set-aside, so a
+    /// caller whose record failed asks again: a head that is this
+    /// set-aside already ([`Self::set_aside_made`]) is answered as when it
+    /// was made, and nothing is written.
     fn set_aside_since(
         &self,
         branch: &str,
@@ -1622,7 +1634,8 @@ impl GitWorkspace {
             let _ = std::fs::remove_file(&index);
             let tree = self.tree_of(&directory, &index, branch, &head);
             let _ = std::fs::remove_file(&index);
-            let (tree, _) = tree?;
+            let (tree, oversized) = tree?;
+            let special = self.special_files_at(&directory, &[&head, &start])?;
             if tree != self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])? {
                 let kept_message = format!(
                     "spawn: the workspace of {branch} as it was, kept before its work is set aside"
@@ -1637,10 +1650,23 @@ impl GitWorkspace {
                     })?;
                 head = kept;
             }
+            // Everything else the directory held is committed now.
+            for path in oversized.iter().map(|(path, _)| path).chain(&special) {
+                crate::agent_files::remove(&directory, path).map_err(|error| {
+                    WorkspaceError::Unavailable(format!(
+                        "remove what the checkpoints of {branch} left out: {error}"
+                    ))
+                })?;
+            }
         }
         let head_tree = self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])?;
         let start_tree = self.git_output(&["rev-parse", &format!("{start}^{{tree}}")])?;
         if head_tree == start_tree {
+            if head != start
+                && let Some(made) = self.set_aside_made(&head, &start_tree, message)?
+            {
+                return Ok(made);
+            }
             return Ok(SetAside::Unchanged);
         }
         let changed = self.git_listing(&[
@@ -1673,6 +1699,71 @@ impl GitWorkspace {
                 .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
             files,
         })
+    }
+
+    /// The paths one of `commits` holds a file at where `directory` holds
+    /// something git cannot add (a FIFO, a socket, a device). git lists such
+    /// an entry only at a path its index holds ([`Self::left_out_files`]),
+    /// and a set-aside's index is fresh.
+    fn special_files_at(
+        &self,
+        directory: &Path,
+        commits: &[&str],
+    ) -> Result<Vec<TreePath>, WorkspaceError> {
+        let mut special = Vec::new();
+        for commit in commits {
+            let listed =
+                self.git_listing(&["ls-tree", "-r", "-z", "--name-only", "--full-tree", commit])?;
+            for path in listed_paths(&listed) {
+                let Ok(metadata) = std::fs::symlink_metadata(directory.join(path.as_path())) else {
+                    continue;
+                };
+                let kind = metadata.file_type();
+                if !kind.is_file() && !kind.is_symlink() && !kind.is_dir() {
+                    special.push(path);
+                }
+            }
+        }
+        special.sort();
+        special.dedup();
+        Ok(special)
+    }
+
+    /// The set-aside `head` is, when an earlier call with this `message`
+    /// made it: a commit with one parent (the work kept), `message`, and
+    /// the start's tree, which its parent's is not. The caller's `message`
+    /// names its task, so another task's set-aside is not this one.
+    fn set_aside_made(
+        &self,
+        head: &str,
+        start_tree: &str,
+        message: &str,
+    ) -> Result<Option<SetAside>, WorkspaceError> {
+        let parents = self.git_output(&["rev-list", "--parents", "-n", "1", head])?;
+        let &[_, kept] = parents.split_whitespace().collect::<Vec<_>>().as_slice() else {
+            return Ok(None);
+        };
+        let kept_tree = self.git_output(&["rev-parse", &format!("{kept}^{{tree}}")])?;
+        if kept_tree == start_tree
+            || self.git_output(&["show", "-s", "--format=%B", head, "--"])? != message.trim()
+        {
+            return Ok(None);
+        }
+        let changed = self.git_listing(&[
+            "diff-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            &kept_tree,
+            start_tree,
+        ])?;
+        Ok(Some(SetAside::Created {
+            commit: CommitId::new(head.to_string())
+                .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
+            kept: CommitId::new(kept.to_string())
+                .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
+            files: shown_paths(&listed_paths(&changed)),
+        }))
     }
 
     /// Merge `main` into `branch`, which is not mounted, only when the merge
@@ -3085,6 +3176,138 @@ mod tests {
         assert!(!directory.exists());
         let tree = |commit: &str| git(&repo, &["rev-parse", &format!("{commit}^{{tree}}")]);
         assert_eq!(tree("agent_a"), tree(&start));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// GitHub #16 item 1: a set-aside moves the branch before its caller
+    /// records it, so a caller whose record failed asks again. The set-aside
+    /// is on the branch already (its tree is the start's): it is answered
+    /// again, the same commits and files, mounted or not, and no second
+    /// commit is made. Another task's set-aside finds nothing to set aside.
+    #[test]
+    fn a_set_aside_asked_again_is_the_one_already_on_the_branch() {
+        use spawn_core::port::SetAside;
+        let (store, workspace, base, start, work) = worked("set-aside-again");
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        let message = "spawn: set aside task #7";
+        let first = store
+            .set_aside(&branch, Some(&start), message)
+            .expect("set aside");
+        let SetAside::Created { commit, kept, .. } = &first else {
+            panic!("the work differs from the start");
+        };
+        assert_eq!(kept.as_str(), work);
+        let repo = base.join("repo");
+        assert_eq!(
+            store
+                .set_aside(&branch, Some(&start), message)
+                .expect("asked again"),
+            first,
+            "the retry is answered with the set-aside it made"
+        );
+        store.unmount(&workspace).expect("unmount");
+        assert_eq!(
+            store
+                .set_aside(&branch, Some(&start), message)
+                .expect("asked again, not mounted"),
+            first
+        );
+        assert_eq!(
+            git(&repo, &["rev-parse", "agent_a"]),
+            commit.as_str(),
+            "no second commit"
+        );
+        assert_eq!(
+            store
+                .set_aside(&branch, Some(&start), "spawn: set aside task #8")
+                .expect("another task's"),
+            SetAside::Unchanged
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// GitHub #16 item 1: a file the checkpoints leave out (one over the
+    /// cap, a FIFO where the branch holds a file) is on no branch, so the
+    /// two-tree move to the start's tree does not take it away. A set-aside
+    /// removes it, as the unmount of a stopped worker would: nothing of the
+    /// cancelled task stays for the next one, and the start's file at such
+    /// a path comes back. A task that left nothing else is `Unchanged`, and
+    /// its file goes too.
+    #[test]
+    fn a_set_aside_leaves_no_file_the_checkpoints_left_out() {
+        use spawn_core::port::SetAside;
+        let (checkout, store, workspace, base) = capped("set-aside-left-out");
+        let directory = PathBuf::from(workspace.path());
+        std::fs::write(directory.join("data.bin"), "small\n").expect("write");
+        let Commit::Created(start) = store.commit(&workspace, "start").expect("commit") else {
+            panic!("a change");
+        };
+        std::fs::write(directory.join("work.txt"), "mine\n").expect("write");
+        std::fs::write(directory.join("over.bin"), vec![2u8; (1 << 20) + 1]).expect("write");
+        std::fs::write(directory.join("pipe"), "a file first\n").expect("write");
+        store.commit(&workspace, "work").expect("commit");
+        let fifo = |name: &str| {
+            std::fs::remove_file(directory.join(name)).expect("remove");
+            let made = Command::new("mkfifo")
+                .arg(directory.join(name))
+                .status()
+                .expect("mkfifo");
+            assert!(made.success());
+        };
+        fifo("pipe");
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        let SetAside::Created { kept, .. } = store
+            .set_aside(&branch, Some(start.as_str()), "spawn: set aside task #7")
+            .expect("set aside")
+        else {
+            panic!("the work differs from the start");
+        };
+        assert_eq!(
+            git(&checkout, &["ls-tree", "--name-only", kept.as_str()]),
+            "README.md\ndata.bin\nwork.txt",
+            "the work kept is what a checkpoint holds"
+        );
+        assert!(!directory.join("work.txt").exists());
+        assert!(!directory.join("over.bin").exists(), "over the cap");
+        assert!(
+            std::fs::symlink_metadata(directory.join("pipe")).is_err(),
+            "a FIFO"
+        );
+        assert_eq!(
+            store.commit(&workspace, "next").expect("commit"),
+            Commit::Unchanged,
+            "the workspace is the branch head"
+        );
+
+        // A file of the start's tree that grew past the cap is left out of
+        // the commit that keeps the work, and is not in the start's way.
+        std::fs::write(directory.join("data.bin"), vec![3u8; (1 << 20) + 1]).expect("write");
+        assert!(matches!(
+            store.set_aside(&branch, Some(start.as_str()), "spawn: set aside task #8"),
+            Ok(SetAside::Created { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(directory.join("data.bin")).expect("the start's file"),
+            "small\n"
+        );
+        fifo("data.bin");
+        assert!(matches!(
+            store.set_aside(&branch, Some(start.as_str()), "spawn: set aside task #9"),
+            Ok(SetAside::Created { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(directory.join("data.bin")).expect("the start's file"),
+            "small\n"
+        );
+
+        std::fs::write(directory.join("over.bin"), vec![2u8; (1 << 20) + 1]).expect("write");
+        assert_eq!(
+            store
+                .set_aside(&branch, Some(start.as_str()), "spawn: set aside task #10")
+                .expect("set aside"),
+            SetAside::Unchanged
+        );
+        assert!(!directory.join("over.bin").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 

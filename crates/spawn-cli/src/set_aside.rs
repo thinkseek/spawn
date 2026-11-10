@@ -19,6 +19,12 @@
 //! the notice names both commits. The set-aside is recorded as the agent's
 //! checkpoint (`artifact.committed`, reason `set_aside`, key
 //! `set-aside:<task>`, so it is done once) and published like any.
+//!
+//! The branch moves before the record, as for every commit. When the append
+//! fails the dispatcher holds the notice and tries again on a later pass:
+//! the store answers that pass with the set-aside it already made (the
+//! message below names the task), so it is recorded and pushed then, and
+//! never made twice.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -104,6 +110,7 @@ pub(crate) fn set_aside(
         .map_err(|error| format!("set aside the work of task #{}: {error}", cancelled.id))?
     {
         SetAside::Unchanged => Done::Nothing,
+        // Made now, or by a pass whose record failed.
         SetAside::Created {
             commit,
             kept,
