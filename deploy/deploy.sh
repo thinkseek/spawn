@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Deploy the checked-out commit to the live fleet on this host.
 #
-#   deploy/deploy.sh <verdict-file>   # build, install, move missions main, restart
+#   deploy/deploy.sh <verdict-file>            # build, install, move missions main, restart
+#   deploy/deploy.sh --landed <outcome-file>   # build, install, restart: main already moved
 #
 # The live system runs only what a deploy installed: the binary and UI in
 # $live, and the controller ($live/controllers/spawn, deploy/controller.sh),
@@ -26,6 +27,16 @@
 # verdict file is only as trustworthy as the gate run that wrote it: a
 # same-uid process could forge one too, so run the gate yourself, read its
 # output, and keep this checkout where agents cannot write.
+#
+# --landed <outcome-file>: HEAD already landed on the missions main by the
+# owner's gated push (`spawn mission push --gated --wait`, whose output is the
+# file; design-owner-push-between-gates.md): the integrator judged it between
+# gates and moved main itself. The deploy refuses unless the outcome is
+# applied, a `source.moved` with verdict accepted, on this missions repo, to
+# HEAD, and the missions main is still HEAD; it then pushes nothing and
+# records no move (the integrator's source.moved did), and builds, installs
+# and restarts as below. The file is trusted as a verdict file is: written by
+# the owner's own `spawn mission push`, in a checkout agents cannot write.
 #
 # Steps, each one stops the deploy on failure:
 #   1. no other deploy runs (flock on $live/deploy.lock), and there is room:
@@ -157,10 +168,14 @@ on_exit() {
 }
 trap on_exit EXIT
 
-[ $# -eq 1 ] || die "usage: deploy/deploy.sh <verdict-file> (see the header)"
+landed=""
+[ "${1-}" = --landed ] && { landed=1; shift; }
+[ $# -eq 1 ] || die "usage: deploy/deploy.sh <verdict-file> | --landed <outcome-file> (see the header)"
 verdict_file=$1
-[ -f "$verdict_file" ] || die "no verdict file $verdict_file"
+[ -f "$verdict_file" ] || die "no ${landed:+outcome}${landed:-verdict} file $verdict_file"
 field() { jq -er --arg name "$1" '.[$name] // empty | strings' "$verdict_file"; }
+# outcome_field <name>: a field of the outcome record of a --landed file.
+outcome_field() { jq -er --arg name "$1" '.outcome[$name] // empty | strings' "$verdict_file"; }
 
 # The disk guard: a build that fills the disk takes the live fleet's
 # database and logs down with it.
@@ -234,12 +249,29 @@ fi
 [ -z "$(git status --porcelain --untracked-files=no)" ] || die "the tree has uncommitted changes"
 head=$(git rev-parse HEAD)
 old=$(git --git-dir="$missions" rev-parse main)
-verdict=$(field verdict) || die "$verdict_file holds no verdict"
-candidate=$(field candidate) || die "$verdict_file names no candidate: run the gate again"
-base=$(field base) || die "$verdict_file names no base: run the gate again"
-[ "$verdict" = accepted ] || die "the gate's verdict is $verdict, not accepted"
-[ "$candidate" = "$head" ] || die "the verdict is for $candidate, HEAD is $head"
-[ "$base" = "$old" ] || die "the verdict judged against $base, the missions main is $old: run the gate again"
+if [ -n "$landed" ]; then
+  # The owner's gated push landed HEAD (see the header): main moved already.
+  state=$(field state) || die "$verdict_file holds no push state"
+  [ "$state" = applied ] || die "the owner's push is $state, not applied"
+  [ "$(outcome_field type)" = source.moved ] || die "$verdict_file's outcome is no source.moved"
+  [ "$(outcome_field verdict)" = accepted ] ||
+    die "the owner's push landed without a gate's acceptance (verdict $(outcome_field verdict || echo none)): deploy with a verdict file"
+  moved_source=$(outcome_field source) || die "$verdict_file's outcome names no source"
+  [ "$(readlink -f "$moved_source")" = "$(readlink -f "$missions")" ] ||
+    die "the owner's push landed on $moved_source, not on $missions"
+  landed_to=$(outcome_field to) || die "$verdict_file's outcome names no commit"
+  [ "$landed_to" = "$head" ] || die "the owner's push landed $landed_to, HEAD is $head: check it out (git merge --ff-only $landed_to)"
+  [ "$old" = "$head" ] ||
+    die "the missions main is $old, not the landed $head: main moved since the landing; push and deploy again"
+  say "HEAD $head landed by the owner's gated push (request $(jq -r '.request // "?"' "$verdict_file")): no push, no move to record"
+else
+  verdict=$(field verdict) || die "$verdict_file holds no verdict"
+  candidate=$(field candidate) || die "$verdict_file names no candidate: run the gate again"
+  base=$(field base) || die "$verdict_file names no base: run the gate again"
+  [ "$verdict" = accepted ] || die "the gate's verdict is $verdict, not accepted"
+  [ "$candidate" = "$head" ] || die "the verdict is for $candidate, HEAD is $head"
+  [ "$base" = "$old" ] || die "the verdict judged against $base, the missions main is $old: run the gate again"
+fi
 git cat-file -e "$old^{commit}" 2>/dev/null || git fetch -q "$missions" main
 git merge-base --is-ancestor "$old" "$head" ||
   die "HEAD does not contain the missions main $old: merge it first"

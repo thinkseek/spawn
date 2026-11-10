@@ -11,7 +11,8 @@
 # real build. A fake `systemctl` first in PATH only logs; a `git` wrapper
 # breaks a deploy right after its push. The deploy runs from a clone of HEAD
 # (commit first) with untracked files planted in it, and builds into the
-# real deploy target directory (~/.cache/spawn/deploy-target, incremental).
+# real deploy target directory (~/.cache/spawn/deploy-target, incremental;
+# SPAWN_DEPLOY_TARGET names another).
 #
 # Covered: the disk guard; the deploy lock; a HEAD tracking files under
 # node_modules/ is refused; the sandbox has no network and no $HOME; an
@@ -25,7 +26,10 @@
 # deploy; a deploy run again keeps its rollback copies; a deploy failing
 # after its push completes it on exit; a pending deploy that main has moved
 # past stops the deploy; deploy/hold.sh holds the missions repo at its main,
-# and the deploy releases that hold on success and on failure.
+# and the deploy releases that hold on success and on failure; --landed
+# deploys a HEAD the owner's gated push already landed (no push, no move),
+# and refuses an outcome that is not an accepted landing of HEAD on this
+# missions repo, or a main that moved since.
 #
 # TEST_DEPLOY_SCRIPT=<path> runs that deploy script instead of the
 # checkout's deploy/deploy.sh (to show which checks fail without a fix).
@@ -44,7 +48,9 @@ check() { # check <description> <command...>
   if "$@"; then pass "$what"; else fail "$what"; fi
 }
 
-test_url_file=$HOME/.config/spawn/test-database.url
+# SPAWN_DEPLOY_TEST_URL_FILE names another file holding the test server's URL
+# (a reviewer's own server; the file, never the URL, goes in the environment).
+test_url_file=${SPAWN_DEPLOY_TEST_URL_FILE:-$HOME/.config/spawn/test-database.url}
 [ -f "$test_url_file" ] || die "no $test_url_file"
 test_url=$(cat "$test_url_file")
 case $test_url in *:15433/*) die "the test URL names port 15433, the live database" ;; esac
@@ -146,11 +152,12 @@ hold_missions() {
 # deploy [ENV=VALUE...]: run deploy.sh in $deploy_from (default the
 # checkout); output in $out, status in $status.
 deploy_from=$checkout
+landed=""
 deploy() {
   out=$scratch/deploy.out
   set +e
   (cd "$deploy_from" && env SPAWN_LIVE="$live" TMPDIR="$scratch/tmp" PATH="$scratch/fakebin:$PATH" "$@" \
-    bash "${TEST_DEPLOY_SCRIPT:-deploy/deploy.sh}" "$verdict") >"$out" 2>&1
+    bash "${TEST_DEPLOY_SCRIPT:-deploy/deploy.sh}" ${landed:+--landed} "$verdict") >"$out" 2>&1
   status=$?
   set -e
   sed 's/^/  | /' "$out"
@@ -306,6 +313,49 @@ check "refused (status $status)" [ "$status" -ne 0 ]
 check "says main is elsewhere, once" [ "$(grep -c "is pending, but the missions main is $head" "$out")" -eq 1 ]
 check "deploy.pending stays" [ "$(cat "$live/deploy.pending")" = "$base $other" ]
 check "the integrator is not left stopped" grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$SYSTEMCTL_LOG"
+
+echo "== --landed: a HEAD the owner's gated push landed"
+rm -f "$live/deploy.pending"
+# outcome <state> <type> <verdict> <to> [source]: what `spawn mission push
+# --gated --wait` prints, for the deploy to read.
+outcome() {
+  jq -n --arg st "$1" --arg ty "$2" --arg v "$3" --arg to "$4" --arg src "${5:-$missions}" --arg b "$base" \
+    '{request: 7, source: $src, commit: $to, state: $st,
+      outcome: {type: $ty, source: $src, from: $b, to: $to, request: 7, by: "human", verdict: $v}}' >"$verdict"
+}
+landed=1
+check "main is HEAD, as the landing left it" [ "$(main)" = "$head" ]
+for refused in "refused source.push_refused rejected $head|the owner's push is refused, not applied" \
+  "applied source.moved accepted $base|the owner's push landed $base, HEAD is $head" \
+  "applied source.moved none $head|landed without a gate's acceptance" \
+  "applied source.moved accepted $head $scratch/elsewhere.git|not on $missions"; do
+  set -- ${refused%%|*}
+  outcome "$@"
+  : >"$SYSTEMCTL_LOG"
+  backups=$(ls "$live/backups" | wc -l)
+  deploy
+  check "refused: ${refused#*|} (status $status)" [ "$status" -ne 0 ]
+  check "says so" grep -qF -- "${refused#*|}" "$out"
+  check "before any backup" [ "$(ls "$live/backups" | wc -l)" -eq "$backups" ]
+  check "before touching a service" [ ! -s "$SYSTEMCTL_LOG" ]
+done
+outcome applied source.moved accepted "$head"
+git --git-dir="$missions" update-ref refs/heads/main "$base"
+: >"$SYSTEMCTL_LOG"
+deploy
+check "refused when main is not the landed HEAD (status $status)" [ "$status" -ne 0 ]
+check "says main moved since the landing" grep -q "the missions main is $base, not the landed $head" "$out"
+check "before touching a service" [ ! -s "$SYSTEMCTL_LOG" ]
+git --git-dir="$missions" update-ref refs/heads/main "$head"
+: >"$SYSTEMCTL_LOG"
+deploy
+check "an accepted landing of HEAD deploys (status $status)" [ "$status" -eq 0 ]
+check "says it was landed by the owner's gated push" grep -q "landed by the owner's gated push (request 7): no push, no move to record" "$out"
+check "main stays HEAD" [ "$(main)" = "$head" ]
+check "nothing is pending" [ ! -e "$live/deploy.pending" ]
+check "the controller is HEAD's" [ "$(readlink "$live/controllers/spawn")" = "spawn-$head" ]
+check "the services restarted" grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$SYSTEMCTL_LOG"
+landed=""
 
 echo
 if [ "$failures" -eq 0 ]; then echo "test-deploy: all passed"; else echo "test-deploy: $failures failed"; exit 1; fi
