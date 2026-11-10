@@ -294,6 +294,7 @@ fn an_input_to_a_session_that_runs_nothing_is_refused_and_records_nothing() {
 fn only_the_human_login_types_and_only_what_a_person_types() {
     let (store, schema) = store("human_input_refused");
     seen(&store);
+    start(&store);
     let mut page = postgres::Client::connect(
         &role_url(&schema_url(&schema), "spawn_human").expect("the login's URL"),
         postgres::NoTls,
