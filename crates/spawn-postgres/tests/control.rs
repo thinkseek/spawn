@@ -1408,8 +1408,10 @@ fn a_verdicts_class_inputs_and_env_fold_and_show_and_old_records_still_read() {
     let last = &store.last_gates().expect("last gates")[task.to_string()];
     assert_eq!(last["verdict"], "rejected");
     assert!(last.get("class").is_none(), "{last}");
-    // A refold reads the same.
+    // A refold reads the same; the task comes back for its next verdict.
     refold(&mut client);
+    store.task_delivered(task, 2).expect("delivered again");
+    assert!(store.task_reported(task, "fixed").expect("reported again"));
     store
         .integrator_record(&json!({"type": "task.gated", "id": task, "revision": 1,
             "verdict": "stale", "class": "superseded",
