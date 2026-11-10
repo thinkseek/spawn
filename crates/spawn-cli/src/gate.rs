@@ -1771,13 +1771,12 @@ pub(crate) fn run_bounded(
     let deadline = Instant::now() + limit;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) if halt.as_ref().is_some_and(|halt| halt.halted()) => {
+            // Halted: whether the gate still ran or the kill just ended
+            // it, nothing of it is returned.
+            Ok(_) if halt.as_ref().is_some_and(|halt| halt.halted()) => {
                 halt_child(&mut child, group);
             }
             Ok(Some(status)) => break status,
-            Ok(None) if halt.as_ref().is_some_and(|halt| halt.halted()) => {
-                halt_child(&mut child, group);
-            }
             Ok(None) if Instant::now() >= deadline => {
                 kill_group();
                 let _ = child.kill();
@@ -1796,6 +1795,9 @@ pub(crate) fn run_bounded(
             Ok(None) => std::thread::sleep(Duration::from_millis(200)),
             Err(error) => {
                 kill_group();
+                if let Some(halt) = &halt {
+                    halt.note(None);
+                }
                 return Err(failed(&error));
             }
         }
