@@ -21,6 +21,25 @@ select coalesce(jsonb_agg(row_to_json(t) order by t.id), '[]'::jsonb)
 from (
   select k.id, k.mission_id, k.kind, k.agent_id, k.session_id, k.brief, k.state,
          k.revisions, k.review_note, k.delivered_at_ms, k.model, k.reissue_of,
+         k.reassign_of,
+         (select o.session_id from mission_tasks o where o.id = k.reassign_of)
+           as reassign_from_session,
+         (select n.id from mission_tasks n where n.reassign_of = k.id order by n.id limit 1)
+           as reassigned_as,
+         -- A delivered task's latest restart (`task.restarted`): the
+         -- dispatcher stops the execution it names and resumes the session.
+         case when k.state = 'delivered' then
+           (select jsonb_build_object(
+                     'n', (e.kind -> 'detail' -> 'record' ->> 'n')::bigint,
+                     'execution_id', e.kind -> 'detail' -> 'record' ->> 'execution_id',
+                     'by', e.kind -> 'detail' -> 'record' ->> 'by',
+                     'reason', e.kind -> 'detail' -> 'record' ->> 'reason')
+              from spawn_events e
+             where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+               and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.restarted'
+               and e.kind -> 'detail' -> 'record' ->> 'task' = k.id::text
+             order by e.session_seq desc limit 1)
+         end as restart,
          case when k.reissue_of is not null then
            (select e.kind -> 'detail' -> 'record' -> 'attempts' from spawn_events e
              where e.session_id = 'session_control' and e.event_name = 'control.recorded'
@@ -669,12 +688,17 @@ select count(*)
 /// or its own set-aside, whichever comes first (a resident's set-aside, and
 /// the merge of main on top of it for its next delivery, hold none of the
 /// work: rev-e on a114a9e, objective 55's task 149). spawn-cli checks in
-/// git that the commit holds changes of its own. `$1` the task.
+/// git that the commit holds changes of its own. A reassigned task (its
+/// `reassign_of`, `spawn_task_reassign`), objective or not, starts from the
+/// task it takes over, before any other: `reassign` is then true. `$1` the
+/// task.
 pub(crate) const OBJECTIVE_FORK: &str = r"
 select coalesce((
-  select jsonb_build_object('task', p.id, 'commit', c.commit)
+  select jsonb_build_object('task', p.id, 'commit', c.commit,
+                            'reassign', p.id = k.reassign_of is true)
     from mission_tasks k
-    join mission_tasks p on p.mission_id = k.mission_id and p.objective = k.objective
+    join mission_tasks p on p.mission_id = k.mission_id
+                        and (p.id = k.reassign_of or p.objective = k.objective)
                         and p.id < k.id and p.state = 'cancelled'
    cross join lateral (
      -- A resident's window ends at its task's set-aside: what is recorded
@@ -696,13 +720,14 @@ select coalesce((
         and a.recorded_at_ms >= p.created_at_ms and a.recorded_at_ms < w.until
         and a.kind -> 'detail' ->> 'reason' is distinct from 'set_aside'
       order by a.id desc limit 1) c
-   where k.id = $1 and k.kind = 'ephemeral' and k.objective is not null
+   where k.id = $1 and k.kind = 'ephemeral'
+     and (k.objective is not null or k.reassign_of is not null)
      and exists (select 1 from spawn_events a
                   where a.session_id = p.session_id and a.event_name = 'artifact.committed'
                     and a.recorded_at_ms >= p.created_at_ms and a.recorded_at_ms < w.until
                     and a.kind -> 'detail' ->> 'reason'
                         in ('tool_completed', 'turn_stopped', 'execution_ended'))
-   order by p.id desc limit 1), 'null'::jsonb)";
+   order by (p.id = k.reassign_of) is true desc, p.id desc limit 1), 'null'::jsonb)";
 
 /// Missions with a gate that are open, or closed with work the closure rule
 /// (`spawn_task_may_continue`) still lets go on, with that work: every task
