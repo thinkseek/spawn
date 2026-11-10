@@ -1958,6 +1958,12 @@ begin
         -- reads this record as a landing (OBJECTIVE_LANDINGS), and the task
         -- it ends is cancelled on it. Folded into no table.
         null;
+    when 'task.shadow_gated' then
+        -- A gate runner's judging of a copy of what the primary judged
+        -- (spawn-cli integrate/shadow.rs), beside the primary's verdict: it
+        -- decides nothing, so it changes no task, landing, halt or count.
+        -- Read from the log (the supervisor's digest), folded into no table.
+        null;
     when 'legacy.imported' then
         -- A row from before the control stream, as it was.
         case p_record ->> 'table'
@@ -2923,8 +2929,28 @@ begin
                                       'source.moved', 'source.push_refused',
                                       'task.over_budget', 'objective.solved',
                                       'source.main_red', 'source.main_probe',
-                                      'source.main_green') then
+                                      'source.main_green', 'task.shadow_gated') then
         raise exception 'the integrator does not record %', p_record ->> 'type';
+    end if;
+    -- A shadow verdict (spawn-cli integrate/shadow.rs): a gate runner judged
+    -- a copy of what the primary judged, on the inputs it names. It is
+    -- beside the verdict, never part of it: whatever the task's state now
+    -- (it has usually landed), it moves nothing. It names its task, its
+    -- runner, its inputs and the fields unlike the primary's, and compares
+    -- the two verdicts (`agrees`) only on equal inputs.
+    if p_record ->> 'type' = 'task.shadow_gated' then
+        if jsonb_typeof(p_record -> 'id') is distinct from 'number'
+           or not exists (select 1 from mission_tasks where id = (p_record ->> 'id')::bigint)
+           or coalesce(p_record ->> 'runner', '') = ''
+           or jsonb_typeof(p_record -> 'inputs') is distinct from 'object'
+           or jsonb_typeof(p_record -> 'unequal') is distinct from 'array'
+           or coalesce(jsonb_typeof(p_record -> 'agrees'), 'absent') not in ('boolean', 'null')
+           or (jsonb_typeof(p_record -> 'agrees') = 'boolean'
+               and jsonb_array_length(p_record -> 'unequal') > 0) then
+            raise exception 'a task.shadow_gated names its task, runner, inputs and unequal, and agrees only on equal inputs: %',
+                            p_record;
+        end if;
+        return spawn_control_record(p_record);
     end if;
     -- Main of a source red on a check (docs/fleet-architecture.md §10.3,
     -- "Main is red"): a red names its source, main, check and the shared
