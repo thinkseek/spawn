@@ -168,8 +168,10 @@
 //!   no marker (no `message.typed`) and is never one. Once per message;
 //!   clears when it is taken, or when its session ends with it untaken (the
 //!   execution it was typed into, or its own start's, ended). A message
-//!   whose session ended first fires nothing. Read at each check and when a
-//!   message falls due, and on start, from the store.
+//!   whose session ended first fires nothing. Read on start (every message
+//!   that can be one, and the open alerts), then when the log moved (the
+//!   new commands, the pending messages due, the open alerts whose session
+//!   took a message or ended since) and when a pending one falls due.
 //! - `model_auth`, the session id, key
 //!   `model_auth:<its execution.interrupted>`: an `execution.interrupted`
 //!   (028) with cause `model_auth`; clears at that execution's

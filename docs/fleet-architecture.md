@@ -1167,11 +1167,14 @@ A message's id is its command's id, carried end to end:
   becomes not taken while its session has not ended with it; it clears when
   the message is taken, or when the session ends with it untaken (the
   execution it was typed into, or its own start's, ended; a never-typed one
-  finished while no live execution ran). The step reads the messages that
-  can be one (each live session's commands from its execution's own start
-  on, and every unfinished command) at each `SPAWN_ALERT_CHECK_SECS` reading,
-  when one falls due, and on start; the open alerts are read back from the
-  store, so a restart fires none again and loses none. An open one reaches
+  finished while no live execution ran). On start the step reads every
+  message that can be one (each live session's commands from its
+  execution's own start on, and every unfinished command) and its open
+  alerts back from the store, so a restart fires none again and loses none;
+  then, when the log moved, only the commands new since, the pending
+  messages that fell due, and the open alerts whose session took a message
+  or ended an execution since (an idle pass reads next to nothing, objective
+  023). An open one reaches
   `/api/alerts` and Home's Needs you, which names the agent and the message.
   Out of scope (objective 046): an agent's explicit acknowledgement, what a
   reply says, and retrying a message not taken.
