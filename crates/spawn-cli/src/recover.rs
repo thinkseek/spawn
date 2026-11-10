@@ -1832,6 +1832,23 @@ impl One<'_> {
         }
     }
 
+    /// Whether the terminal host says the execution's runner is no longer
+    /// there (its pane dead or gone); a host that cannot tell says nothing.
+    fn runner_gone(&self) -> bool {
+        let execution = self.execution();
+        let (Ok(id), Ok(workspace)) = (
+            spawn_core::id::ExecutionId::new(execution.id.as_str()),
+            spawn_core::id::WorkspaceId::new(execution.workspace.unwrap_or_default()),
+        ) else {
+            return false;
+        };
+        let terminal = spawn_core::id::TerminalName::for_execution(&id);
+        matches!(
+            self.terminals.runner(&terminal, &workspace),
+            Ok(spawn_core::port::Runner::Gone | spawn_core::port::Runner::Untracked(_))
+        )
+    }
+
     /// Whether the revival of `last` was already submitted (its key, or a
     /// retry of it).
     fn revived(&self, last: &Recorded) -> bool {
@@ -2018,6 +2035,14 @@ impl One<'_> {
             // An execution that ran through the database outage needs no
             // revival of its own: the loop caught up with it.
             if cause == Cause::DatabaseUnavailable {
+                return Ok(());
+            }
+            // An engine that ended on the model's error is no longer at its
+            // prompt, though the Bridge has not recorded its end yet: typing
+            // into it would fail, and its end is the resume's (bounded) to
+            // answer. The end's record moves the log, and the step runs
+            // again.
+            if cause == Cause::ModelUnavailable && self.runner_gone() {
                 return Ok(());
             }
             self.submit(
