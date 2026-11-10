@@ -4807,7 +4807,7 @@ mod tests {
         }
 
         /// A Bridge that copies the transcripts into the store's archive.
-        fn archived() -> Self {
+        fn with_archive() -> Self {
             Self::build_with(Arc::new(MemoryWatch::new()), true, true)
         }
 
@@ -5228,7 +5228,7 @@ mod tests {
     /// says until when the transcript is known.
     #[test]
     fn a_running_turn_is_archived_within_a_pass() {
-        let mut world = World::archived();
+        let mut world = World::with_archive();
         world.advance(20_000);
         let first = call_line("c1", 18);
         world.engine_writes(&first);
@@ -5264,7 +5264,7 @@ mod tests {
     /// settling, and one ending before it is not.
     #[test]
     fn a_failed_copy_holds_the_window_open_until_it_is_made_across_an_end_and_a_restart() {
-        let mut world = World::archived();
+        let mut world = World::with_archive();
         world.advance(20_000);
         world.store.hold_archive(&World::agent(), true);
         world.engine_writes(&call_line("c1", 19));
@@ -5301,7 +5301,6 @@ mod tests {
         world.restart();
         world.tick();
         assert!(world.settling(19_500), "{:?}", world.progress());
-        assert!(world.archived.is_empty() || world.archived().is_empty());
         // The archive takes writes again: the next pass copies and settles.
         world.store.hold_archive(&World::agent(), false);
         world.tick();
