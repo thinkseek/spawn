@@ -361,7 +361,10 @@ pub fn read_from_transcript(event: &NewEvent) -> bool {
 mod tests {
     use std::sync::Arc;
 
-    use super::{archive, restore};
+    use super::{
+        ArchiveProgress, archive, archive_to, first_line_ms, parse_rfc3339_ms, restore, settling,
+    };
+    use crate::id::{ExecutionId, SessionId};
     use crate::id::{AgentId, WorkspaceId};
     use crate::memory::MemoryStore;
     use crate::port::{READ_LIMIT, TerminalHost, TranscriptArchive};
@@ -406,6 +409,102 @@ mod tests {
             copies(&store, &agent),
             vec![b"{\"a\":1}\n{\"b\":2}\n{\"c\"".to_vec()]
         );
+    }
+
+    #[test]
+    fn a_copy_says_how_long_the_archive_is_after_it() {
+        let (store, agent, workspace) = setup();
+        let copy = |store: &MemoryStore| {
+            archive_to(store, store, &workspace, PATH, &agent, "n1").expect("archive")
+        };
+        assert_eq!(copy(&store).length, None, "nothing archived, no file");
+        store.append_file(PATH, "{\"a\":1}\n");
+        assert_eq!(copy(&store).length, Some(8));
+        let again = copy(&store);
+        assert_eq!((again.copied, again.length), (0, Some(8)));
+    }
+
+    #[test]
+    fn rfc3339_times_read_as_epoch_milliseconds() {
+        assert_eq!(parse_rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339_ms("1970-01-01T00:00:01.5Z"), Some(1_500));
+        assert_eq!(
+            parse_rfc3339_ms("2026-11-10T08:15:30.123Z"),
+            Some(1_793_520_000_000 + 8 * 3_600_000 + 15 * 60_000 + 30_123 - 6 * 86_400_000)
+                .filter(|_| false)
+                .or(parse_rfc3339_ms("2026-11-10T09:15:30.123+01:00"))
+        );
+        assert_eq!(
+            parse_rfc3339_ms("2000-03-01T00:00:00.000Z"),
+            Some(951_868_800_000)
+        );
+        assert_eq!(
+            parse_rfc3339_ms("2024-02-29T23:59:59.999999Z"),
+            Some(1_709_251_199_999)
+        );
+        assert_eq!(parse_rfc3339_ms("2024-02-29"), None);
+        assert_eq!(parse_rfc3339_ms("2024-13-01T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339_ms("not a time at all, no"), None);
+    }
+
+    #[test]
+    fn the_first_line_the_archive_lacks_is_read_from_its_start() {
+        let (store, _, workspace) = setup();
+        assert_eq!(first_line_ms(&store, &workspace, PATH, 0), Ok(None), "no file");
+        let one = "{\"timestamp\":\"1970-01-01T00:00:01.000Z\"}\n";
+        let two = "{\"type\":\"summary\"}\n{\"timestamp\":\"1970-01-01T00:00:02.000Z\"}\n";
+        store.append_file(PATH, one);
+        store.append_file(PATH, two);
+        let length = u64::try_from(one.len() + two.len()).expect("fits");
+        let first = u64::try_from(one.len()).expect("fits");
+        assert_eq!(first_line_ms(&store, &workspace, PATH, 0), Ok(Some(1_000)));
+        // A line with no time is passed over for the next that has one.
+        assert_eq!(first_line_ms(&store, &workspace, PATH, first), Ok(Some(2_000)));
+        // An offset inside a line: that line, whose end is not archived.
+        assert_eq!(first_line_ms(&store, &workspace, PATH, 5), Ok(Some(1_000)));
+        assert_eq!(first_line_ms(&store, &workspace, PATH, length), Ok(None));
+        // What holds no time that reads is earlier than anything.
+        store.append_file(PATH, "{\"half");
+        assert_eq!(
+            first_line_ms(&store, &workspace, PATH, length),
+            Ok(Some(i64::MIN))
+        );
+    }
+
+    fn record(live: bool, known_ms: i64, behind_ms: Option<i64>) -> ArchiveProgress {
+        ArchiveProgress {
+            agent: AgentId::new("agent_one").expect("agent"),
+            native: "n1".to_string(),
+            session: SessionId::new("session_one").expect("session"),
+            execution: ExecutionId::new("exec_1").expect("execution"),
+            workspace: WorkspaceId::new("w:/w").expect("workspace"),
+            live,
+            known_ms,
+            archived: Some(10),
+            behind_ms,
+        }
+    }
+
+    #[test]
+    fn a_window_settles_once_nothing_before_its_end_can_be_missing() {
+        // Live, all archived, known until 100: windows to 100 have settled.
+        let idle = record(true, 100, None);
+        assert!(!idle.holds_open(100));
+        assert!(idle.holds_open(101), "not known since the window's end");
+        // Ended with everything archived: holds nothing open, ever.
+        assert!(!record(false, 100, None).holds_open(i64::MAX));
+        // A line from 50 on not archived, live or ended: open past 50.
+        for live in [true, false] {
+            let behind = record(live, 100, Some(50));
+            assert!(!behind.holds_open(50), "a call after the end holds nothing");
+            assert!(behind.holds_open(51));
+        }
+        assert!(!settling(&[], 1_000));
+        assert!(settling(&[idle.clone(), record(false, 0, Some(10))], 20));
+        assert!(!settling(&[idle.clone(), record(false, 0, Some(10))], 10));
+        let json = idle.to_json();
+        assert_eq!(ArchiveProgress::from_json(json.as_bytes()), Some(idle));
+        assert_eq!(ArchiveProgress::from_json(b"{\"live\":"), None);
     }
 
     #[test]
