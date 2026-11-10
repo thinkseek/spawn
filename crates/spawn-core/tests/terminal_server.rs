@@ -139,15 +139,8 @@ fn a_started_terminal_records_the_server_it_runs_on_after_the_execution() {
         .iter()
         .map(|event| event.kind.name())
         .filter(|name| name.starts_with("execution."))
-        .map(|name| match name {
-            "execution.started" => "started",
-            "execution.terminal_started" => "terminal_started",
-            _ => "other",
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
         .collect();
-    assert_eq!(names, ["started", "terminal_started"]);
+    assert_eq!(names, ["execution.started", "execution.terminal_started"]);
 }
 
 #[test]
