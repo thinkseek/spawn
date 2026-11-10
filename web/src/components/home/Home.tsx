@@ -1,10 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { ArrowRight, Bot, CircleAlert, CircleCheck, Copy, Flag, History, Info, MessageSquareText, Target } from "lucide-react";
 
 import { relativeTime } from "../../format";
 import type { AgentsNow, Digest, MissionsToday, NeedItem, NotesShown } from "../../home";
-import { needsSummary } from "../../home";
+import { awayFrom, needsSummary } from "../../home";
 import { Card, CardHeader, FOCUS_RING, FOCUS_RING_INSET, cx, sinceText } from "../ui";
 
 // The home page's sections (design-ui-information.md §3, layout A): what
@@ -286,44 +286,147 @@ export function SupervisorNotes({
   );
 }
 
+/** Where the page keeps when it was last seen (the browser's own storage). */
+const SEEN_KEY = "spawn.seen";
+
+function readSeen(): number | null {
+  try {
+    const value = Number(window.localStorage.getItem(SEEN_KEY));
+    return Number.isFinite(value) && value > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeSeen(at: number) {
+  try {
+    window.localStorage.setItem(SEEN_KEY, String(at));
+  } catch {
+    // A browser that keeps nothing: the digest stays "Today".
+  }
+}
+
+/** An absence: when the reader went away, and when they came back. */
+export interface Away {
+  from: number;
+  at: number;
+}
+
+/**
+ * When the reader went away (design §3 Q4): the last time the page was
+ * seen, if that was 30 min or more before it was opened, shown or focused
+ * again; else null. "Seen" is kept in the browser: each minute while the
+ * page is visible and has focus (a tab merely left open elsewhere is not
+ * the reader looking), and as it is hidden or closed.
+ */
+export function useAway(): Away | null {
+  const [away, setAway] = useState<Away | null>(() => {
+    const now = Date.now();
+    const from = awayFrom(readSeen(), now);
+    return from === null ? null : { from, at: now };
+  });
+  useEffect(() => {
+    const looking = () => document.visibilityState === "visible" && document.hasFocus();
+    const seen = () => writeSeen(Date.now());
+    const back = () => {
+      const now = Date.now();
+      const from = awayFrom(readSeen(), now);
+      if (from !== null) setAway({ from, at: now });
+      seen();
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") seen();
+      else if (looking()) back();
+    };
+    if (looking()) seen();
+    const timer = window.setInterval(() => {
+      if (looking()) seen();
+    }, 60_000);
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("focus", back);
+    window.addEventListener("blur", seen);
+    window.addEventListener("pagehide", seen);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("focus", back);
+      window.removeEventListener("blur", seen);
+      window.removeEventListener("pagehide", seen);
+    };
+  }, []);
+  return away;
+}
+
 const DIGEST_TONE: Record<string, string> = {
   landed: "text-success",
   "sent back": "text-warning",
+  stopped: "text-muted-foreground",
+  moved: "text-muted-foreground",
+  mission: "text-info",
   alert: "text-destructive",
 };
 
-export function DigestCard({ digest }: { digest: Digest }) {
+/** "2 d 4 h", "31 h": how long the reader was away, in a header's words. */
+function awaySpan(ms: number): string {
+  const hours = Math.round(ms / 3_600_000);
+  if (hours < 48) return `${hours} h`;
+  const days = Math.floor(hours / 24);
+  const rest = hours % 24;
+  return rest ? `${days} d ${rest} h` : `${days} d`;
+}
+
+/** What happened while the reader was away (at least the last 24 h): one
+ * line per task, mission change and alert, grouped by when. Folded to its
+ * counts; the task notices themselves are on the Alerts page. */
+export function DigestCard({ digest, back }: { digest: Digest; back: number | null }) {
   const [open, setOpen] = useState(false);
+  // How long the reader was away, said as of their return: it does not grow
+  // while they read.
+  const title = digest.away ? `Since you were away · ${awaySpan((back ?? Date.now()) - digest.since_ms)}` : "Today";
   return (
     <Card>
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
+        title={digest.away ? `Since ${new Date(digest.since_ms).toLocaleString()}, when this page was last seen` : "The last 24 hours"}
         className={cx("flex h-10 w-full items-center gap-2 px-4 text-left hover:bg-surface-hover", FOCUS_RING_INSET, open && "border-b border-surface-border")}
       >
         <History size={14} className="shrink-0 text-faint-foreground" aria-hidden="true" />
-        <span className="text-label font-medium text-foreground">Today</span>
-        <span className="tnum text-caption text-muted-foreground">
+        <span className="shrink-0 text-label font-medium text-foreground">{title}</span>
+        <span className="tnum min-w-0 truncate text-caption text-muted-foreground">
           {digest.landed} landed · {digest.sentBack} sent back · {digest.alerts} alert{digest.alerts === 1 ? "" : "s"}
         </span>
-        <span className="ml-auto text-caption text-muted-foreground">{open ? "Hide" : "Show"}</span>
+        <span className="ml-auto shrink-0 text-caption text-muted-foreground">{open ? "Hide" : "Show"}</span>
       </button>
-      {open && (
-        <ul className="max-h-80 divide-y divide-surface-border overflow-y-auto">
-          {digest.entries.map((entry, index) => (
-            <li key={`${entry.at_ms}-${index}`} className="flex min-w-0 items-baseline gap-3 px-4 py-1.5 text-caption">
-              <span className="tnum w-16 shrink-0 text-faint-foreground">
-                {new Date(entry.at_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-              </span>
-              <span className={cx("w-20 shrink-0 font-medium", DIGEST_TONE[entry.kind])}>{entry.kind}</span>
-              <span className="min-w-0 flex-1 truncate text-foreground" title={entry.text}>
-                {entry.text}
-              </span>
-            </li>
-          ))}
-        </ul>
-      )}
+      {open &&
+        (digest.bands.length === 0 ? (
+          <p className="px-4 py-3 text-caption text-faint-foreground">Nothing happened in this window.</p>
+        ) : (
+          <div className="max-h-96 overflow-y-auto">
+            {digest.bands.map((band) => (
+              <section key={band.label} aria-label={band.label}>
+                <h3 className="sticky top-0 bg-surface px-4 pt-2.5 pb-1 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">
+                  {band.label}
+                  <span className="tnum ml-1.5 font-normal tracking-normal">{band.entries.length}</span>
+                </h3>
+                <ul className="divide-y divide-surface-border">
+                  {band.entries.map((entry, index) => (
+                    <li key={`${entry.at_ms}-${index}`} className="flex min-w-0 items-baseline gap-3 px-4 py-1.5 text-caption">
+                      <span className="tnum w-16 shrink-0 whitespace-nowrap text-faint-foreground">
+                        {new Date(entry.at_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                      </span>
+                      <span className={cx("w-16 shrink-0 font-medium", DIGEST_TONE[entry.kind])}>{entry.kind}</span>
+                      <span className="min-w-0 flex-1 truncate text-foreground" title={entry.text}>
+                        {entry.text}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ))}
+          </div>
+        ))}
     </Card>
   );
 }
