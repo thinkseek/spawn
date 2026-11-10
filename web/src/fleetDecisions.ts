@@ -186,7 +186,7 @@ export function decisionsFromApi(answer: unknown): DecisionWindow {
       window,
       counts,
       extra,
-      total: Object.values(counts).reduce((sum, n) => sum + n, 0) + extra.reduce((sum, [, n]) => sum + n, 0),
+      total: Object.values(counts).reduce((sum, n) => sum + n, 0),
       humanPerAgentHour: optionalCount(raw.human_per_agent_hour),
       agentHours: optionalCount(raw.agent_hours),
       toolCallsPerHour: null,
