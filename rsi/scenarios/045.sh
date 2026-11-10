@@ -58,12 +58,14 @@
 #       message reads as before (state, times, `taken`), `deaf`'s alert is
 #       the one open alert (not fired again), `refuse`'s stays cleared; a
 #       new input to `take` is tracked to `answered`.
-#   (6) before the change: two inputs into `take` that an older Spawn typed
-#       (seeded into the log before the loop starts: commands, their
-#       Bridge `typing` and `typed` steps and the engine's
-#       `message.received`, recorded 10 min and 1 h ago, text with no
-#       marker) read `typed`, `not_taken` false, and no `message_not_taken`
-#       names either: after (4) and again after (5)'s restart.
+#   (6) before the change: three inputs into `take` that an older Spawn
+#       typed (seeded into the log after init-db, before the loop starts:
+#       commands, their Bridge `typing` and `typed` steps and the engine's
+#       `message.received`, text with no marker), recorded 1 h and 10 min
+#       before the upgrade and one just after it, as the old loop, which a
+#       deploy stops only after init-db, types on: each reads `typed`,
+#       `not_taken` false, and no `message_not_taken` names any, after (4)
+#       and again after (5)'s restart.
 #   (7) the session ends: `deaf`'s task is cancelled (its worker stopped);
 #       its message's alert is cleared within 30 s and stays in
 #       /api/alerts as cleared.
@@ -486,8 +488,11 @@ for label in $labels; do
     put "$label" session "$(q "select session_id from mission_tasks where id = $task")"
 done
 
-# What an older Spawn left in the log (6): two inputs into take, typed by
-# a Bridge that typed no marker, received by the engine, 10 min and 1 h ago.
+# What an older Spawn left in the log (6): three inputs into take, typed by
+# a Bridge that typed no marker, received by the engine: 1 h and 10 min
+# before this upgrade (init-db above), and one after it, as the old loop
+# types on until the deploy restarts it (deploy.sh stops only the
+# integrator before init-db).
 cat >"$WORK/seed.sql" <<SQL
 \\set ON_ERROR_STOP 1
 begin;
@@ -521,12 +526,13 @@ begin
 end \$\$;
 select pg_temp.old('bb-old-1h', 'BB:PING from an older Spawn, an hour ago', 3600000);
 select pg_temp.old('bb-old-10m', 'BB:PING from an older Spawn, ten minutes ago', 600000);
+select pg_temp.old('bb-old-after', 'BB:PING from the old loop after the upgrade', 0);
 commit;
 SQL
 capture psql -d "$SPAWN_DB_NAME" -q -f "$WORK/seed.sql"
 [ "$status" -eq 0 ] || harness "seeding the older inputs failed: $(err)"
 old_ids=$(q "select string_agg(id::text, ' ' order by id) from spawn_commands where idempotency_key like 'bb-old-%'")
-[ "$(echo "$old_ids" | wc -w)" -eq 2 ] || harness "the seeded older inputs are not two commands: [$old_ids]"
+[ "$(echo "$old_ids" | wc -w)" -eq 3 ] || harness "the seeded older inputs are not three commands: [$old_ids]"
 
 start_loop
 start_serve
