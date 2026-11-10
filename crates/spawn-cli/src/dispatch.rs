@@ -923,6 +923,9 @@ pub(crate) fn step(
         // Collecting a report changed a task's state.
         (rows, work) = load(store, waits)?;
     }
+    // The agents' answers to their messages and the reports' answers to
+    // their deliveries: changing no task and nothing this pass decides.
+    lines.extend(crate::ack::answers(store, &rows, root, now_ms()));
     let Reading {
         work,
         mut plan,

@@ -8,13 +8,23 @@
  * types nothing. The agent page says it beside the command:
  * "not typed yet", "typed, not taken yet", "not taken (never typed)",
  * "not taken (typed)", "taken in 2 s · answered in 4 min · taken 2×".
+ * An answer by the agent (objective 046: `spawn ack <id> done|declined
+ * <why>`, or the report of the task the message delivered) follows:
+ * " · done", " · declined: <why>".
  *
  * Pure, and loads with node alone (no imports): the black-box scenario
  * runs it as it is. */
 
 /** A command's message as the commands API gives it. */
+/** The agent's answer to a message: done, or declined and why. */
+export interface MessageActed {
+  outcome: "done" | "declined" | string;
+  /** Why; null for a done with none. */
+  why: string | null;
+}
+
 export interface CommandMessage {
-  state: "recorded" | "typed" | "taken" | "answered" | string;
+  state: "recorded" | "typed" | "taken" | "answered" | "acted" | string;
   typed_at_ms: number | null;
   taken_at_ms: number | null;
   answered_at_ms: number | null;
@@ -22,6 +32,24 @@ export interface CommandMessage {
   taken: number;
   /** Not taken within its bound (SPAWN_MESSAGE_TAKEN_SECS). */
   not_taken: boolean;
+  /** Its answer, null until the agent answered (an older server has none). */
+  acted?: MessageActed | null;
+  acted_at_ms?: number | null;
+}
+
+/** The longest why said whole; a longer one is cut to one less, and "…". */
+const WHY_CHARS = 80;
+
+/** The answer in words: "done", "declined: <why>" (a why longer than 80
+ * characters cut to its first 79 and "…"); null when none. */
+export function actedWords(acted: MessageActed | null | undefined): string | null {
+  if (!acted) return null;
+  if (acted.outcome !== "declined") return acted.outcome;
+  const why = (acted.why ?? "").trim();
+  if (why === "") return "declined";
+  const chars = Array.from(why);
+  const shown = chars.length > WHY_CHARS ? `${chars.slice(0, WHY_CHARS - 1).join("")}…` : why;
+  return `declined: ${shown}`;
 }
 
 /** What `messageLine` reads of a command. */
@@ -42,10 +70,18 @@ export function messageDuration(ms: number): string {
 
 /** The words for a command's message, null when it has none. Taken: how
  * long after the command was created; answered: how long after it was
- * taken; the count when more than one line took it. */
+ * taken; the count when more than one line took it; then the agent's
+ * answer, when it gave one. */
 export function messageLine(command: MessageCommand): string | null {
   const message = command.message;
   if (!message) return null;
+  const said = lifecycle(command, message);
+  const acted = actedWords(message.acted);
+  return acted ? `${said} · ${acted}` : said;
+}
+
+/** What 045 says of a message: its lifecycle. */
+function lifecycle(command: MessageCommand, message: CommandMessage): string {
   if (message.taken_at_ms === null || message.taken_at_ms === undefined || message.taken < 1) {
     const typed = message.typed_at_ms !== null && message.typed_at_ms !== undefined;
     if (message.not_taken) return typed ? "not taken (typed)" : "not taken (never typed)";

@@ -3839,6 +3839,13 @@ impl Bridge {
         // The runner writes the exit status where the Bridge reads it: the
         // pane needs no login of its own.
         environment.push(("SPAWN_EXIT_FILE".to_string(), exit_file(active)));
+        // Where the agent's answers to its messages go (`spawn ack`): its
+        // workspace, which the loop reads, whatever directory its shell is
+        // in. No login either.
+        environment.push((
+            "SPAWN_WORKSPACE".to_string(),
+            active.workspace.path().to_string(),
+        ));
         Launch {
             terminal: active.terminal(),
             workspace: active.workspace.clone(),
