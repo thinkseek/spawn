@@ -390,6 +390,18 @@
 //!   the workers made a load of 18-20, and task 172's gate failed on its
 //!   base.)
 //!
+//! **Every verdict binds what it judged and where** (objective 035). Each
+//! `task.gated` names its `class` ([`verdict_class`]: `code` for a verdict
+//! on the work, `infrastructure` for one the host could not judge,
+//! `superseded` for `stale`). One a gate run decided carries that run's
+//! `inputs` (the base and candidate the gate was given, the controller's
+//! `.controller` commit and the gate directory's digest, both read just
+//! before that gate started, and the task's scenario) and `env` (this
+//! host, the toolchain line the run printed, the runner: null here)
+//! ([`crate::gate::run_inputs`], [`crate::gate::run_env`]); a head judged
+//! alone adds `head_inputs`. A record no gate ran for has `env` null and
+//! the inputs it knows. Nothing is decided from them.
+//!
 //! Every judging records its own outcome (`task.gated`, `task.landed`), as
 //! before; the pass reads those records, never the thread's result. An
 //! owner's landing (step 0) never touches a judging: one on another source
@@ -4889,8 +4901,7 @@ fn bound(value: &Value) -> Value {
         value["class"] = json!(class);
     }
     if value.get("inputs").is_none() {
-        value["inputs"] =
-            gate::known_inputs(value["base"].as_str(), value["candidate"].as_str());
+        value["inputs"] = gate::known_inputs(value["base"].as_str(), value["candidate"].as_str());
     }
     if value.get("env").is_none() {
         value["env"] = Value::Null;
@@ -13303,7 +13314,10 @@ mod database_tests {
         assert_eq!(super::verdict_class(""), None);
         // A record no gate ran for: what it knows, no environment.
         let stale = super::bound(&json!({"type": "task.gated", "verdict": "stale", "base": "b"}));
-        assert!(stale["env"].is_null() && stale.get("env").is_some(), "{stale}");
+        assert!(
+            stale["env"].is_null() && stale.get("env").is_some(),
+            "{stale}"
+        );
         assert_eq!(stale["inputs"]["base"], "b");
         for name in ["candidate", "controller", "scenarios_sha256", "scenario"] {
             assert!(stale["inputs"][name].is_null(), "{name}: {stale}");
@@ -13311,7 +13325,10 @@ mod database_tests {
         // A record that says what it judged keeps it; others go as they are.
         let gated = super::bound(&json!({"type": "task.gated", "verdict": "accepted",
                                           "inputs": {"base": "x"}, "env": {"host": "h"}}));
-        assert_eq!((&gated["inputs"]["base"], &gated["env"]["host"]), (&json!("x"), &json!("h")));
+        assert_eq!(
+            (&gated["inputs"]["base"], &gated["env"]["host"]),
+            (&json!("x"), &json!("h"))
+        );
         let landed = json!({"type": "task.landed", "id": 1});
         assert_eq!(super::bound(&landed), landed);
     }
@@ -13354,7 +13371,10 @@ mod database_tests {
         assert_eq!(rejected["env"]["host"], json!(crate::gate::host_name()));
         assert_eq!(rejected["env"]["toolchain"], "rustc 1.95.0-test");
         assert!(rejected["env"]["runner"].is_null(), "{rejected}");
-        assert!(rejected.get("head_inputs").is_none(), "no head run: {rejected}");
+        assert!(
+            rejected.get("head_inputs").is_none(),
+            "no head run: {rejected}"
+        );
 
         // Between the runs: the marker names another commit, a file joins.
         std::fs::write(base.join("ctl/.controller"), format!("{second}\n")).expect("the marker");
@@ -13368,13 +13388,23 @@ mod database_tests {
         let aborted = last_gated(&db);
         let runs = noted_args(&base);
         assert_eq!(runs.len(), 2, "{runs:?}");
-        assert_eq!((&aborted["id"], &aborted["verdict"]), (&json!(two), &json!("aborted")), "{aborted}");
+        assert_eq!(
+            (&aborted["id"], &aborted["verdict"]),
+            (&json!(two), &json!("aborted")),
+            "{aborted}"
+        );
         assert_eq!(aborted["class"], "infrastructure");
         assert_eq!(aborted["inputs"]["base"], runs[1].0.as_str());
         assert_eq!(aborted["inputs"]["candidate"], runs[1].1.as_str());
-        assert_eq!(aborted["inputs"]["controller"], second, "read per run, not remembered");
+        assert_eq!(
+            aborted["inputs"]["controller"], second,
+            "read per run, not remembered"
+        );
         assert_eq!(aborted["inputs"]["scenarios_sha256"], digest_two.as_str());
-        assert!(aborted["env"]["toolchain"].is_null(), "printed none: {aborted}");
+        assert!(
+            aborted["env"]["toolchain"].is_null(),
+            "printed none: {aborted}"
+        );
         assert_eq!(aborted["env"]["host"], json!(crate::gate::host_name()));
         let after = gated(&db, mission);
         assert_eq!((after.gate_rejections, after.gate_aborts), (1, 1));
@@ -13385,7 +13415,11 @@ mod database_tests {
                 None => std::fs::remove_file(base.join("ctl/.controller")).expect("remove"),
                 Some(text) => std::fs::write(base.join("ctl/.controller"), text).expect("write"),
             }
-            assert_eq!(crate::gate::controller_commit(&scenarios), None, "{marker:?}");
+            assert_eq!(
+                crate::gate::controller_commit(&scenarios),
+                None,
+                "{marker:?}"
+            );
         }
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -13421,12 +13455,25 @@ mod database_tests {
         assert_eq!(runs.len(), 2, "the merge, then the head alone: {runs:?}");
         assert_eq!(record["inputs"]["base"], m1.as_str());
         assert_eq!(record["inputs"]["candidate"], runs[0].1.as_str());
-        assert_eq!(record["inputs"]["candidate"], record["candidate"], "{record}");
+        assert_eq!(
+            record["inputs"]["candidate"], record["candidate"],
+            "{record}"
+        );
         assert_eq!(record["inputs"]["controller"], commit);
-        assert_eq!(record["head_inputs"]["base"], m0.as_str(), "its base is head_base");
-        assert_eq!(record["head_inputs"]["base"], record["head_base"], "{record}");
+        assert_eq!(
+            record["head_inputs"]["base"],
+            m0.as_str(),
+            "its base is head_base"
+        );
+        assert_eq!(
+            record["head_inputs"]["base"], record["head_base"],
+            "{record}"
+        );
         assert_eq!(record["head_inputs"]["candidate"], head.as_str());
-        assert_eq!((runs[1].0.as_str(), runs[1].1.as_str()), (m0.as_str(), head.as_str()));
+        assert_eq!(
+            (runs[1].0.as_str(), runs[1].1.as_str()),
+            (m0.as_str(), head.as_str())
+        );
         assert_eq!(record["head_inputs"]["controller"], commit);
         assert_eq!(
             record["head_inputs"]["scenarios_sha256"],
@@ -13456,7 +13503,10 @@ mod database_tests {
         .expect("recorded");
         let stored = last_gated(&db);
         assert_eq!(stored["class"], "superseded");
-        assert!(stored["env"].is_null() && stored.get("env").is_some(), "{stored}");
+        assert!(
+            stored["env"].is_null() && stored.get("env").is_some(),
+            "{stored}"
+        );
         assert_eq!(stored["inputs"]["base"], main.as_str());
         for name in ["candidate", "controller", "scenarios_sha256", "scenario"] {
             assert!(stored["inputs"][name].is_null(), "{name}: {stored}");

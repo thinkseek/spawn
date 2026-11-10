@@ -3796,7 +3796,10 @@ mod binding_tests {
     fn spelled(files: &[(&str, &str)]) -> String {
         let mut listing = String::new();
         for (path, content) in files {
-            listing.push_str(&format!("{}  {path}\n", hex(&Sha256::digest(content.as_bytes()))));
+            listing.push_str(&format!(
+                "{}  {path}\n",
+                hex(&Sha256::digest(content.as_bytes()))
+            ));
         }
         hex(&Sha256::digest(listing.as_bytes()))
     }
@@ -3811,12 +3814,23 @@ mod binding_tests {
         let other = "fedcba9876543210fedcba9876543210fedcba98";
         std::fs::write(ctl.join(".controller"), format!("{other}\n")).expect("marker");
         assert_eq!(controller_commit(&gate).as_deref(), Some(other));
-        for malformed in ["", "main\n", "0123456789abcdef\n", &format!("{COMMIT}0\n"), &format!(" {COMMIT}\n"), "g123456789abcdef0123456789abcdef01234567\n"] {
+        for malformed in [
+            "",
+            "main\n",
+            "0123456789abcdef\n",
+            &format!("{COMMIT}0\n"),
+            &format!(" {COMMIT}\n"),
+            "g123456789abcdef0123456789abcdef01234567\n",
+        ] {
             std::fs::write(ctl.join(".controller"), malformed).expect("marker");
             assert_eq!(controller_commit(&gate), None, "{malformed:?} is no commit");
         }
         std::fs::remove_file(ctl.join(".controller")).expect("remove");
-        assert_eq!(controller_commit(&gate), None, "removed: null, not the last read");
+        assert_eq!(
+            controller_commit(&gate),
+            None,
+            "removed: null, not the last read"
+        );
         let _ = std::fs::remove_dir_all(ctl.parent().expect("root"));
     }
 
@@ -3832,7 +3846,12 @@ mod binding_tests {
         let first = scenarios_sha256(&gate).expect("a digest");
         assert_eq!(
             first,
-            spelled(&[("B.sh", "upper"), ("a.sh", "a"), ("b.sh", "b"), ("sub/notes", "n")])
+            spelled(&[
+                ("B.sh", "upper"),
+                ("a.sh", "a"),
+                ("b.sh", "b"),
+                ("sub/notes", "n")
+            ])
         );
         // A subdirectory's file counts.
         std::fs::write(gate.join("sub/notes"), "changed").expect("notes");
@@ -3876,14 +3895,27 @@ mod binding_tests {
     fn the_toolchain_is_the_first_setup_line_or_null() {
         let printed_setup = "| == setup\n| base cache: toolchain rustc 1.95 cargo 1.95\n\
                              | base cache: toolchain later\n";
-        assert_eq!(toolchain_of(printed_setup).as_deref(), Some("rustc 1.95 cargo 1.95"));
-        assert_eq!(toolchain_of("! gate: SPAWN_GATE_MIN_FREE_GB is a whole number\n"), None);
-        assert_eq!(toolchain_of("! | base cache: toolchain stderr\n| | base cache: toolchain nested\n"), None);
+        assert_eq!(
+            toolchain_of(printed_setup).as_deref(),
+            Some("rustc 1.95 cargo 1.95")
+        );
+        assert_eq!(
+            toolchain_of("! gate: SPAWN_GATE_MIN_FREE_GB is a whole number\n"),
+            None
+        );
+        assert_eq!(
+            toolchain_of("! | base cache: toolchain stderr\n| | base cache: toolchain nested\n"),
+            None
+        );
         let aborted = Err(GateFailure::Aborted {
             reason: "exit 3".to_string(),
             log: "! gate: bad setting\n".to_string(),
         });
-        assert_eq!(printed(&aborted).and_then(toolchain_of), None, "a run that printed none");
+        assert_eq!(
+            printed(&aborted).and_then(toolchain_of),
+            None,
+            "a run that printed none"
+        );
         assert!(printed(&Err(GateFailure::Timeout)).is_none());
         let accepted: Result<Verdict, GateFailure> = Ok(Verdict {
             accepted: true,
@@ -3893,9 +3925,18 @@ mod binding_tests {
             main_red_scenarios: Vec::new(),
             output: printed_setup.to_string(),
         });
-        assert_eq!(printed(&accepted).and_then(toolchain_of).as_deref(), Some("rustc 1.95 cargo 1.95"));
+        assert_eq!(
+            printed(&accepted).and_then(toolchain_of).as_deref(),
+            Some("rustc 1.95 cargo 1.95")
+        );
         let env = run_env(None);
-        assert!(env["toolchain"].is_null() && env["runner"].is_null(), "{env}");
-        assert!(env["host"].as_str().is_some_and(|host| !host.is_empty()), "{env}");
+        assert!(
+            env["toolchain"].is_null() && env["runner"].is_null(),
+            "{env}"
+        );
+        assert!(
+            env["host"].as_str().is_some_and(|host| !host.is_empty()),
+            "{env}"
+        );
     }
 }
