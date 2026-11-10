@@ -19,7 +19,7 @@
 # or ended, an execution holds a window open exactly while lines it wrote
 # before the window's end are not archived: one that is idle, or ended,
 # with everything archived holds none open, and the Bridge goes on trying
-# an ended execution's copy until it is made.
+# an ended execution's copy until it is made, across its own restarts.
 # web/src/settling.ts's `settlingNote(card)` says it in words on the
 # scorecard page.
 #
@@ -45,8 +45,10 @@
 #       false at each reading (only a call before a window's end holds it
 #       open). Then `held`'s task is cancelled mid-turn and its execution
 #       ends, its archive still held: the window to U2 still reads
-#       `settling` true and fewer tokens, at three readings over 6 s. The
-#       scenario checks the plain file is untouched. Once it is removed,
+#       `settling` true and fewer tokens, at three readings over 6 s; the
+#       loop is restarted, the path still held, and the window still reads
+#       `settling` true 5 s on. The scenario checks the plain file is
+#       untouched. Once it is removed,
 #       within 20 s the window reads the live tokens before U2 and
 #       `settling` false.
 #   (3) the window of (1) still reads what it settled at. With `long`'s
@@ -571,12 +573,20 @@ for i in 1 2 3; do
         harness "the window to $(iso "$u2") reads $reading after held ended with its archive held; the hold did not hold"
     sleep 2
 done
+# The loop restarts (as every deploy restarts it) with the path still held:
+# what it must still copy is the log's and the disk's, not its memory's.
+stop_loop
+start_loop
+sleep 5
+reading=$(card "$u2")
+[ "${reading#* }" = true ] ||
+    fail "(2) after a restart of the loop, held's lines before $(iso "$u2") still unarchived, the window to it reads [tokens settling] [$reading]; it is settling"
 [ -f "$archive/$(get held agent)" ] && [ "$(cat "$archive/$(get held agent)")" = "held by the scenario: no archive here" ] ||
     harness "held's archive path was changed while it was held"
 rm -f "$archive/$(get held agent)"
 until_card "$u2" "$want2" false 20 ||
-    fail "(2) held's archive path is free again, its execution ended, and the window to $(iso "$u2") reads [tokens settling] [$reading] 20 s on; the live transcripts hold $want2 tokens before it, settled: an ended execution's copy is tried again until it is made"
-note "(2) held's archive held: settling, live and after it ended; freed: $want2 tokens, settled"
+    fail "(2) held's archive path is free again, its execution ended before a restart of the loop, and the window to $(iso "$u2") reads [tokens settling] [$reading] 20 s on; the live transcripts hold $want2 tokens before it, settled: an ended execution's copy is tried again until it is made, across a restart"
+note "(2) held's archive held: settling, live, after it ended and across a restart; freed: $want2 tokens, settled"
 
 # --- (3) settled stays settled; idle executions settle a window ---------------------------------
 
