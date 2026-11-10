@@ -5074,7 +5074,8 @@ connections\n";
             });
         }
 
-        /// The loop's own pass, twice, the second a restarted loop: the
+        /// The loop's own pass, twice, the second a restarted loop (a
+        /// session whose transcript held no marker yet tracks nothing): the
         /// first records the alert of a message never taken, the restarted
         /// one reads it back on start, fires nothing again, and clears it
         /// when the message is taken.
@@ -5088,8 +5089,24 @@ connections\n";
                 store
                     .host_record(&json!({"type": "host.messages_marked", "started_at_ms": 1}))
                     .expect("the first marking loop");
+                // Its task, typed and taken: the transcript keeps markers.
+                let task = input(store, session, "task", "hello");
+                typed(store, session, execution, task, true);
                 let deaf = input(store, session, "deaf", "hello");
                 typed(store, session, execution, deaf, true);
+                // Before any taking the session's silence says nothing.
+                let silent = store
+                    .commands_json(&format!("session_{session}"), 10, 0)
+                    .expect("the commands");
+                assert!(
+                    silent
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .all(|command| command["message"]["not_taken"] == false),
+                    "{silent}"
+                );
+                taken(store, session, execution, "u0", task.0);
                 let key = format!("message_not_taken:{}", deaf.0);
                 let rows = |store: &PostgresStore| {
                     store.alert_rows().expect("the alerts")["rows"]
