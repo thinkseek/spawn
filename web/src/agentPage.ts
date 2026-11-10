@@ -120,17 +120,28 @@ export function forHowLong(since: number | null, now: number): string | null {
 
 /** What a held task reads as in the summary when the agent has no input of
  * a person's (`task`): "T247 · Cost you can see", its title alone when no
- * task id is known, null when there is none. `held` is the task the agent's
+ * task id is known, null when there is none. A task that is no longer open
+ * (the worker ended, or its task landed, was cancelled or reassigned) is
+ * its last one, not one it holds: "Last task: T247 · Cost you can see
+ * (landed)", with the task's state in words (`label`). `held` is the task the agent's
  * name goes by (home.ts `nameTask`); `taskTitle` is /api/fleet's
  * `task_title`, which a worker carries even before /api/missions answers. */
-export function taskLine(
-  held: { task_id: number | null; title: string | null } | null,
-  taskTitle: string | null,
-): string | null {
+export function taskLine(held: HeldTask | null, taskTitle: string | null): string | null {
   const title = (held?.title ?? taskTitle ?? "").trim() || null;
   const id = held?.task_id ?? null;
-  if (id === null) return title;
-  return title ? `T${id} · ${title}` : `T${id}`;
+  const line = id === null ? title : title ? `T${id} · ${title}` : `T${id}`;
+  if (line === null || held?.open !== false) return line;
+  return `Last task: ${line}${held.label ? ` (${held.label})` : ""}`;
+}
+
+/** What these rules read of a task (ordering.ts `TaskRef`). */
+export interface HeldTask {
+  task_id: number | null;
+  title: string | null;
+  /** False once the task is closed; unset is taken as open. */
+  open?: boolean;
+  /** The task's state in words: "landed", "cancelled". */
+  label?: string;
 }
 
 /** What the summary leads with: the person's input the agent holds
@@ -139,7 +150,7 @@ export function taskLine(
  * has no input: its `task` is null or empty, its task is `task_title`. */
 export function summaryTask(
   agent: { task: string | null; task_title: string | null },
-  held: { task_id: number | null; title: string | null } | null,
+  held: HeldTask | null,
 ): { input: string } | { task: string } | null {
   if (agent.task && agent.task.trim() !== "") return { input: agent.task };
   const line = taskLine(held, agent.task_title);

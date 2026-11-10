@@ -83,6 +83,16 @@ test("a worker's summary names its task: live's shape has no input, only task_ti
   assert.equal(taskLine({ task_id: null, title: null }, "From fleet"), "From fleet");
 });
 
+test("a closed task is the worker's last one, not one it holds (rev-e T1)", async () => {
+  const { summaryTask, taskLine } = await import("../src/agentPage.ts");
+  // An ended worker whose T247 landed: home.ts nameTask gives its latest task, open false.
+  const landed = { task_id: 247, title: "Cost you can see", open: false, label: "landed" };
+  assert.deepEqual(summaryTask({ task: null, task_title: null }, landed), { task: "Last task: T247 · Cost you can see (landed)" });
+  assert.equal(taskLine({ ...landed, label: "cancelled" }, null), "Last task: T247 · Cost you can see (cancelled)");
+  assert.equal(taskLine({ task_id: 247, title: "Cost you can see", open: true, label: "gating" }, null), "T247 · Cost you can see", "an open task is held");
+  assert.equal(taskLine({ task_id: 9, title: null, open: false, label: "" }, null), "Last task: T9");
+});
+
 test("a history time carries its day when it is not today's", async () => {
   const { historyClock } = await import("../src/agentPage.ts");
   const hms = (ms: number | null) => (ms === null ? "—" : new Date(ms).toTimeString().slice(0, 8));
