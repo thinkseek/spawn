@@ -7,9 +7,12 @@
  *
  * Armed (backlog P11): focus alone sends nothing, so a reader who tabs into
  * the panel, or presses Esc to close the drawer, sends no key to the agent.
- * A deliberate click into the panel arms it, and so does Enter on the
- * focused panel (the keyboard's click); the panel then shows that keys go to
- * the agent. Blur, or a click outside, disarms it. While it is not armed,
+ * A deliberate click into the panel arms it (clickArms: a plain primary
+ * click inside the text that selected nothing, so neither a scrollbar drag
+ * nor selecting text to copy arms it), and so does Enter on the focused
+ * panel (the keyboard's click); the panel then shows that keys go to the
+ * agent. Blur, a click outside, or the keys going to another agent disarms
+ * it. While it is not armed,
  * Esc closes the drawer and the arrows scroll, as on any page. Pure, tested
  * in web/test/keys.test.ts. */
 
@@ -62,6 +65,26 @@ export function panelKey(press: KeyPress): PanelKey {
   if (!press.armed) return press.key === "Enter" ? { arm: true } : null;
   const name = BY_EVENT_KEY[press.key];
   return name ? { send: name } : null;
+}
+
+/** What `clickArms` reads of a click on the panel. */
+export interface PanelClick {
+  /** `MouseEvent.button`: 0 is the primary button. */
+  button: number;
+  /** Ctrl, Alt, Meta or Shift was held (Shift extends a selection). */
+  modified: boolean;
+  /** The page has a selection after the click: it was a drag that selected
+   * text (or a double click that selected a word), not a plain click. */
+  selected: boolean;
+  /** The click fell inside the panel's client area, not on its scrollbar
+   * (or border). */
+  inside: boolean;
+}
+
+/** A click that arms the panel: a plain primary click inside the text that
+ * selected nothing. */
+export function clickArms(click: PanelClick): boolean {
+  return click.button === 0 && !click.modified && !click.selected && click.inside;
 }
 
 /** The named key a keydown sends, or null when it sends none. */
