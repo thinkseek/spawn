@@ -272,6 +272,7 @@ from (
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and (c.created_at_ms > spawn_now_ms() - 86400000
              or c.idempotency_key like 'deliver-%'
+             or starts_with(c.idempotency_key, 'restart-')
              or c.idempotency_key = 'dispatch-resume-' || coalesce(s.execution_id, 'none')
              or c.idempotency_key = 'dispatch-nudge-' || s.session_id || '-' || coalesce(ep.id, 0)
              or starts_with(c.idempotency_key,
