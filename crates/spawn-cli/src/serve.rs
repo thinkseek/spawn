@@ -2608,9 +2608,38 @@ mod tests {
         }
     }
 
+    /// The supervisor's session starts an execution, as the Bridge records it.
+    fn execution_starts(store: &spawn_postgres::PostgresStore) {
+        spawn_core::port::EventLog::append(
+            store,
+            spawn_core::event::NewEvent {
+                agent_id: spawn_core::id::AgentId::new("agent_supervisor").expect("valid agent"),
+                session_id: spawn_core::id::SessionId::new("session_supervisor")
+                    .expect("valid session"),
+                execution_id: Some(
+                    spawn_core::id::ExecutionId::new("exec_key").expect("valid execution"),
+                ),
+                source: spawn_core::event::Source::Bridge,
+                source_event_id: Some("exec_key:started".to_string()),
+                kind: spawn_core::event::EventKind::ExecutionStarted {
+                    engine: spawn_core::event::ENGINE.to_string(),
+                    workspace: spawn_core::id::WorkspaceId::new("1:/workspaces/1")
+                        .expect("valid workspace"),
+                    command_id: spawn_core::id::CommandId(1),
+                    fork: None,
+                    model: spawn_core::event::ModelProfile::Default,
+                    transcript_from: None,
+                },
+            },
+        )
+        .expect("an execution starts");
+    }
+
     /// The accepted case, end to end through the handler into the test
-    /// database: the probe writes nothing, an input is the command `spawn
-    /// submit --principal human` makes, and a retried POST types once.
+    /// database: the probe writes nothing; an input to a session that runs
+    /// no execution is refused 409 with the reason and records nothing
+    /// (objective 040); once it runs, an input is the command `spawn submit
+    /// --principal human` makes, and a retried POST types once.
     #[test]
     fn a_persons_input_reaches_the_test_database_once() {
         in_test_schema(|owner, store| {
@@ -2627,6 +2656,23 @@ mod tests {
             assert_eq!(probe.body["writable"], true);
             assert_eq!(probe.body["max_text_bytes"], MAX_INPUT_TEXT);
             assert_eq!(commands(), json!([]), "a probe writes nothing");
+
+            // Nothing runs yet: refused with the reason, nothing recorded.
+            let stopped = to(
+                Some("secret"),
+                "",
+                SCRIPT,
+                INPUT,
+                r#"{"text":"anyone there?","key":"page-0"}"#,
+            );
+            assert_eq!(stopped.status, 409, "{stopped:?}");
+            assert_eq!(
+                stopped.body["error"],
+                "session_supervisor runs no execution: an input needs a running engine; \
+                 resume the session"
+            );
+            assert_eq!(commands(), json!([]), "a refused input records nothing");
+            execution_starts(store);
 
             let body = r#"{"text":"Stop objective_87 and report.\nThanks","key":"page-1"}"#;
             let first = to(Some("secret"), "", SCRIPT, INPUT, body);
@@ -2711,30 +2757,7 @@ mod tests {
             );
             assert_eq!(commands(), json!([]), "a refused key records nothing");
 
-            spawn_core::port::EventLog::append(
-                store,
-                spawn_core::event::NewEvent {
-                    agent_id: spawn_core::id::AgentId::new("agent_supervisor")
-                        .expect("valid agent"),
-                    session_id: spawn_core::id::SessionId::new("session_supervisor")
-                        .expect("valid session"),
-                    execution_id: Some(
-                        spawn_core::id::ExecutionId::new("exec_key").expect("valid execution"),
-                    ),
-                    source: spawn_core::event::Source::Bridge,
-                    source_event_id: Some("exec_key:started".to_string()),
-                    kind: spawn_core::event::EventKind::ExecutionStarted {
-                        engine: spawn_core::event::ENGINE.to_string(),
-                        workspace: spawn_core::id::WorkspaceId::new("1:/workspaces/1")
-                            .expect("valid workspace"),
-                        command_id: spawn_core::id::CommandId(1),
-                        fork: None,
-                        model: spawn_core::event::ModelProfile::Default,
-                        transcript_from: None,
-                    },
-                },
-            )
-            .expect("an execution starts");
+            execution_starts(store);
             let body = r#"{"name":"down","key":"key-2"}"#;
             let first = to(KEY, body);
             assert_eq!(first.status, 202, "{first:?}");
