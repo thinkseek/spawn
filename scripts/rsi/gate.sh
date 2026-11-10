@@ -3247,7 +3247,20 @@ if [ -f "$work/baseline/Cargo.toml" ] && [ -f "$work/candidate/Cargo.toml" ]; th
     fi
     if [ -n "$dropped" ]; then
         echo "| base tests the candidate does not run by name: $(printf '%s\n' "$dropped" | head -n 20 | tr '\n' ' ')"
-        verdict rejected "candidate drops or renames base tests ($(printf '%s\n' "$dropped" | grep -c .): $(printf '%s\n' "$dropped" | head -n 3 | tr '\n' ' ' | sed 's/ $//'))"
+        # A retired-tests line that is a dropped test's last path component
+        # only names nothing: the match is the whole name as cargo lists it
+        # (batch 16: `a_judging_…` for `integrate::database_tests::a_judging_…`).
+        near_miss=""
+        if [ -s "$work/tests.retired" ]; then
+            near_miss=$(printf '%s\n' "$dropped" | awk -F'::' '
+                FNR == NR { if (index($0, "::") == 0) bare[$0] = 1; next }
+                NF > 1 && ($NF in bare) { print $NF " names " $0 " only by its last component" }
+            ' "$work/tests.retired" - | head -n 3)
+        fi
+        if [ -n "$near_miss" ]; then
+            printf '%s\n' "$near_miss" | sed 's/^/| retired-tests: /; s/$/: write the whole name, as cargo lists it/'
+        fi
+        verdict rejected "candidate drops or renames base tests ($(printf '%s\n' "$dropped" | grep -c .): $(printf '%s\n' "$dropped" | head -n 3 | tr '\n' ' ' | sed 's/ $//'))${near_miss:+; retired-tests names it by its last component only: write the whole name, as cargo lists it}"
         exit 0
     fi
 fi
