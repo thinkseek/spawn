@@ -422,9 +422,32 @@
 //! `aborted` ([`judged_or_aborted`]), so the three-aborts halt bounds a bug.
 //! One that returns an error records nothing, as before threads: the error
 //! is the operator's to read (a git that cannot run a merge is the host's,
-//! not the work's; objective 008), and a later pass judges the task again. A restart mid-gate behaves as before: the process (and the
-//! gate under it) dies before any record, so the next integrator judges the
-//! task again.
+//! not the work's; objective 008), and a later pass judges the task again.
+//! TERM stops the process at once, as before: the gate under it dies
+//! before any record, and the next integrator judges the task again from
+//! nothing.
+//!
+//! **A drain finishes what the integrator started** (objective 37: a deploy
+//! restart cost a running gate, 22-40 minutes each). A drain request
+//! (SIGUSR1, or `spawn integrate --drain` with the same root, which finds
+//! the integrator by its pid file `<root>/integrate.pid`, sends it the
+//! signal and waits until that process is gone) records
+//! `integrator.draining` {`gates`: the tasks whose gates run, `bound_s`}.
+//! From then on no gate, owner judging, shadow judging or base warm
+//! starts; the passes go
+//! on otherwise (holds, step 0's owner landings, budgets, assignments, the
+//! landing of a verdict that arrives). Once no judging of its runs and a
+//! pass left no landing to act on (a task to land that landed, went stale
+//! or failed is acted on by the next pass; one behind the owner's hold
+//! waits for the hold, not for the drain), it records `integrator.drained`
+//! and exits 0. `SPAWN_INTEGRATE_DRAIN_SECS` (default 7200, a whole number
+//! from 1 to 86400, anything else refused at start) bounds it, counted from
+//! the draining record: at the bound the gates still running are halted
+//! ([`gate::Halt`]: their process groups killed, as a gate past its time
+//! limit is, and their threads record nothing), `integrator.drain_expired`
+//! names their tasks and the integrator exits 0; the dispatcher tells the
+//! supervisor once (`dispatch::digest::drain_expiries`). So nothing the
+//! integrator starts outlives it, as warm.rs requires.
 //!
 //! Like the dispatcher, it keeps no state of its own beyond the gates it is
 //! running: the control stream says what was judged and landed. An advisory
@@ -654,7 +677,7 @@ const PUSH_POLL: Duration = Duration::from_millis(500);
 /// Who the integrator's commands come from.
 const PRINCIPAL: &str = "spawn-integrate";
 
-const USAGE: &str = "usage: spawn integrate [--once] [--root <dir>] [--gates <n>]";
+const USAGE: &str = "usage: spawn integrate [--once | --drain] [--root <dir>] [--gates <n>]";
 
 /// Gates that run at once, across missions, unless `--gates` or
 /// `SPAWN_INTEGRATE_GATES` says otherwise. One: concurrent gates share one
@@ -1468,19 +1491,35 @@ pub(crate) fn source_head(source: &str) -> Result<(String, String), String> {
     Ok((branch, commit))
 }
 
-/// `spawn integrate [--once]`: pass after pass, or one.
+/// `spawn integrate [--once]`: pass after pass, or one. `spawn integrate
+/// --drain`: ask the integrator running with the same root to drain
+/// ([`request_drain`]).
 pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     let once = rest.iter().any(|word| word == "--once");
+    let drain = rest.iter().any(|word| word == "--drain");
+    if once && drain {
+        return Err(format!("--once and --drain do not go together\n{USAGE}"));
+    }
     let valued: Vec<String> = rest
         .iter()
-        .filter(|word| *word != "--once")
+        .filter(|word| *word != "--once" && *word != "--drain")
         .cloned()
         .collect();
     let flags = Flags::parse(&valued).map_err(|error| format!("{error}\n{USAGE}"))?;
-    crate::config::require_git()?;
     let root = workspace_root(&flags)
         .map(PathBuf::from)
         .ok_or_else(|| format!("--root or SPAWN_WORKSPACE_ROOT is required\n{USAGE}"))?;
+    if drain {
+        return request_drain(&root);
+    }
+    // The drain's bound is checked before anything is judged or recorded.
+    let drain_bound = drain_secs(crate::config::env_value(DRAIN_ENV).as_deref())?;
+    // A drain request (SIGUSR1, `spawn integrate --drain`) from now on: its
+    // default action would end the process like TERM.
+    let drain_asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&drain_asked))
+        .map_err(|error| format!("cannot take drain requests (SIGUSR1): {error}"))?;
+    crate::config::require_git()?;
     // Resolved against the working directory: the gate must not resolve
     // inside the tree it judges.
     let gate = std::path::absolute(env_or("SPAWN_GATE", "scripts/rsi/gate.sh"))
@@ -1548,23 +1587,164 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
-    loop {
+    if once {
         let pass = integrator.pass();
-        if once {
-            // One pass, and the gates it started run to their records.
-            integrator.settle();
+        // One pass, and the gates it started run to their records.
+        integrator.settle();
+        return pass
+            .map(|()| 0)
+            .inspect_err(|error| eprintln!("integrate: {error}"));
+    }
+    write_pid_file(&integrator.judge.root);
+    run_passes(&integrator, &drain_asked, drain_bound)
+}
+
+/// Pass after pass, until a drain asked by `drain_asked` ends (drained, or
+/// at its bound of `drain_bound` seconds): then Ok(0). TERM ends the
+/// process at once, wherever it is.
+fn run_passes(
+    integrator: &Integrator,
+    drain_asked: &std::sync::atomic::AtomicBool,
+    drain_bound: u64,
+) -> Result<i32, String> {
+    let asked = || drain_asked.load(std::sync::atomic::Ordering::SeqCst);
+    let interval = loop_interval().max(Duration::from_secs(5));
+    loop {
+        if asked() && !integrator.draining() {
+            integrator.begin_drain(integrator.own_store().as_deref(), drain_bound);
         }
-        if let Err(error) = pass {
+        let pass = integrator.pass();
+        if let Err(error) = &pass {
             eprintln!("integrate: {error}");
-            if once {
-                return Err(error);
-            }
         }
-        if once {
+        if integrator.draining()
+            && integrator.drained(integrator.own_store().as_deref(), pass.is_ok())
+        {
             return Ok(0);
         }
-        std::thread::sleep(loop_interval().max(Duration::from_secs(5)));
+        // Between passes, a drain request is taken at once and a drain's
+        // bound is kept to the fifth of a second.
+        let next = std::time::Instant::now() + interval;
+        loop {
+            let now = std::time::Instant::now();
+            if integrator.drain_expired(now) {
+                integrator.expire_drain(integrator.own_store().as_deref());
+                return Ok(0);
+            }
+            if now >= next || (asked() && !integrator.draining()) {
+                break;
+            }
+            std::thread::sleep((next - now).min(Duration::from_millis(200)));
+        }
     }
+}
+
+/// The drain's bound: `SPAWN_INTEGRATE_DRAIN_SECS`, seconds counted from
+/// the `integrator.draining` record.
+const DRAIN_ENV: &str = "SPAWN_INTEGRATE_DRAIN_SECS";
+
+/// The drain's bound when [`DRAIN_ENV`] is unset: two hours, past the
+/// longest gate seen (101 minutes).
+const DRAIN_DEFAULT_SECS: u64 = 7200;
+
+/// The longest drain [`DRAIN_ENV`] allows: a day.
+const DRAIN_MAX_SECS: u64 = 86_400;
+
+/// [`DRAIN_ENV`] from its text: a whole number of seconds from 1 to
+/// [`DRAIN_MAX_SECS`], unset the default; anything else refuses to start.
+pub(crate) fn drain_secs(text: Option<&str>) -> Result<u64, String> {
+    let Some(text) = text else {
+        return Ok(DRAIN_DEFAULT_SECS);
+    };
+    let trimmed = text.trim();
+    trimmed
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| trimmed.parse::<u64>().ok())
+        .flatten()
+        .filter(|secs| (1..=DRAIN_MAX_SECS).contains(secs))
+        .ok_or_else(|| {
+            format!(
+                "{DRAIN_ENV} is a whole number of seconds from 1 to {DRAIN_MAX_SECS}, not \
+                 '{text}'; the integrator does not start"
+            )
+        })
+}
+
+/// The integrator's pid file in its root: its pid and start time, for
+/// `spawn integrate --drain` with the same root ([`request_drain`]).
+const PID_FILE: &str = "integrate.pid";
+
+/// Write this process's [`PID_FILE`] under `root`; a failure is said, and
+/// only `--drain` misses it (SIGUSR1 still drains).
+fn write_pid_file(root: &Path) {
+    let pid = std::process::id();
+    let written = warm::start_ticks(pid)
+        .ok_or_else(|| "cannot read this process's start time".to_string())
+        .and_then(|ticks| {
+            std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
+            let path = root.join(PID_FILE);
+            let fresh = root.join(format!("{PID_FILE}.{pid}"));
+            std::fs::write(&fresh, format!("{pid} {ticks}\n"))
+                .map_err(|error| error.to_string())?;
+            std::fs::rename(&fresh, &path).map_err(|error| error.to_string())
+        });
+    if let Err(error) = written {
+        eprintln!(
+            "integrate: {}: {error}; `spawn integrate --drain` cannot find this integrator \
+             (SIGUSR1 still drains it)",
+            root.join(PID_FILE).display()
+        );
+    }
+}
+
+/// A pid file's pid and start time.
+fn read_pid_file(text: &str) -> Option<(u32, u64)> {
+    let mut words = text.split_whitespace();
+    let pid = words.next()?.parse().ok()?;
+    let ticks = words.next()?.parse().ok()?;
+    words.next().is_none().then_some((pid, ticks))
+}
+
+/// Whether the process `pid` that started at `ticks` still runs: not gone,
+/// not a zombie, and not another process under a pid used again.
+fn still_runs(pid: u32, ticks: u64) -> bool {
+    warm::start_ticks(pid) == Some(ticks) && !warm::exited_unreaped(pid)
+}
+
+/// `spawn integrate --drain`: send a drain request (SIGUSR1) to the
+/// integrator whose [`PID_FILE`] is under `root`, then wait until that
+/// process is gone (it exits once drained, or at its bound), and exit 0.
+fn request_drain(root: &Path) -> Result<i32, String> {
+    let path = root.join(PID_FILE);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("no integrator runs under {}: {error}", root.display()))?;
+    let (pid, ticks) = read_pid_file(&text)
+        .ok_or_else(|| format!("{} is not an integrator's pid file", path.display()))?;
+    if !still_runs(pid, ticks) {
+        return Err(format!(
+            "no integrator runs under {}: process {pid} ({}) is gone",
+            root.display(),
+            path.display()
+        ));
+    }
+    let sent = std::process::Command::new("kill")
+        .args(["-USR1", &pid.to_string()])
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|error| format!("kill -USR1 {pid}: {error}"))?;
+    if !sent.status.success() && still_runs(pid, ticks) {
+        return Err(format!(
+            "kill -USR1 {pid}: {}",
+            String::from_utf8_lossy(&sent.stderr).trim()
+        ));
+    }
+    println!("integrate: asked the integrator (pid {pid}) to drain; waiting until it is gone");
+    while still_runs(pid, ticks) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    println!("integrate: the integrator (pid {pid}) is gone");
+    Ok(0)
 }
 
 /// `SPAWN_INTEGRATE_WARM=0` turns the base warm after each landing off
@@ -1622,6 +1802,23 @@ struct Integrator {
     /// probe one more gate on it runs anyway, a probe
     /// (`SPAWN_GATE_MAIN_RED_PROBE_MS`, [`main_red_probe_ms`]).
     red_probe_ms: i64,
+    /// The drain asked of this integrator, once asked ([`Drain`]).
+    drain: RefCell<Option<Drain>>,
+    /// Whether the last pass left a landing to act on: a mission with a
+    /// task to land that landed it (its source moved: the next pass reads
+    /// it again), failed, or was not visited. A drain ends only after a
+    /// pass with none.
+    unlanded: std::cell::Cell<bool>,
+}
+
+/// A drain: no gate, owner judging or base warm starts any more; the
+/// passes go on until no judging of this integrator runs and what they
+/// recorded was acted on, then `integrator.drained` and exit 0; at the
+/// bound, `integrator.drain_expired` ([`Integrator::expire_drain`]).
+struct Drain {
+    /// When the bound is counted from: the `integrator.draining` record.
+    since: std::time::Instant,
+    bound_s: u64,
 }
 
 /// How long a source red on a check waits between probe gates by default:
@@ -1876,6 +2073,8 @@ struct Running {
     owner: Option<i64>,
     /// Its stop, for an owner's urgent landing on its source ([`Stop`]).
     stop: Arc<Stop>,
+    /// Its halt, for a drain past its bound ([`gate::Halt`]).
+    halt: Arc<gate::Halt>,
     handle: std::thread::JoinHandle<()>,
 }
 
@@ -1954,7 +2153,164 @@ impl Integrator {
             red_probe_ms: main_red_probe_ms(
                 crate::config::env_value("SPAWN_GATE_MAIN_RED_PROBE_MS").as_deref(),
             ),
+            drain: RefCell::new(None),
+            unlanded: std::cell::Cell::new(false),
         }
+    }
+
+    /// Whether this integrator drains.
+    fn draining(&self) -> bool {
+        self.drain.borrow().is_some()
+    }
+
+    /// The task judgings in flight, by task: what a drain record names.
+    fn gate_tasks(&self) -> Vec<i64> {
+        let mut tasks: Vec<i64> = self
+            .running
+            .borrow()
+            .iter()
+            .filter(|gate| gate.owner.is_none())
+            .map(|gate| gate.task)
+            .collect();
+        tasks.sort_unstable();
+        tasks.dedup();
+        tasks
+    }
+
+    /// The store the integrator's own records go through: the one its
+    /// judgings use while one runs, else a new connection; None when none
+    /// can be opened (said).
+    fn own_store(&self) -> Option<Arc<PostgresStore>> {
+        if let Some(store) = self.held.borrow().clone() {
+            return Some(store);
+        }
+        match open_store() {
+            Ok(store) => Some(Arc::new(store)),
+            Err(error) => {
+                eprintln!("integrate: no store for the integrator's own records: {error}");
+                None
+            }
+        }
+    }
+
+    /// Record one of the integrator's own records (`integrator.*`); false
+    /// when it could not be recorded (said).
+    fn record_own(store: Option<&PostgresStore>, record: &Value) -> bool {
+        let Some(store) = store else {
+            eprintln!("integrate: cannot record {record}: no store");
+            return false;
+        };
+        match store.integrator_record(record) {
+            Ok(_) => true,
+            Err(error) => {
+                eprintln!("integrate: cannot record {record}: {error}");
+                false
+            }
+        }
+    }
+
+    /// Begin the drain a request asked for (once): `integrator.draining`
+    /// names the task judgings in flight and the bound, counted from now.
+    /// From then on no gate, owner judging or base warm starts.
+    fn begin_drain(&self, store: Option<&PostgresStore>, bound_s: u64) {
+        if self.draining() {
+            return;
+        }
+        self.reap();
+        let gates = self.gate_tasks();
+        let owners = self
+            .running
+            .borrow()
+            .iter()
+            .filter(|gate| gate.owner.is_some())
+            .count();
+        Self::record_own(
+            store,
+            &json!({
+                "type": "integrator.draining", "gates": gates, "bound_s": bound_s,
+            }),
+        );
+        *self.drain.borrow_mut() = Some(Drain {
+            since: std::time::Instant::now(),
+            bound_s,
+        });
+        println!(
+            "integrate: draining: no gate starts any more; {} task gate{} and {owners} owner \
+             judging{} run to their records and landings, then the integrator exits (at most \
+             {bound_s} s)",
+            gates.len(),
+            if gates.len() == 1 { "" } else { "s" },
+            if owners == 1 { "" } else { "s" },
+        );
+    }
+
+    /// Whether the drain is over after a pass (`pass_ok`: it ran): no
+    /// judging of this integrator runs and the pass left no landing to act
+    /// on. Then `integrator.drained` is recorded, and the caller exits.
+    fn drained(&self, store: Option<&PostgresStore>, pass_ok: bool) -> bool {
+        if !self.draining() || !pass_ok || self.unlanded.get() {
+            return false;
+        }
+        self.reap();
+        if !self.running.borrow().is_empty() {
+            return false;
+        }
+        let bound_s = self
+            .drain
+            .borrow()
+            .as_ref()
+            .map_or(0, |drain| drain.bound_s);
+        if !Self::record_own(
+            store,
+            &json!({"type": "integrator.drained", "bound_s": bound_s}),
+        ) {
+            return false;
+        }
+        println!("integrate: drained: every gate it ran recorded and landed; exiting");
+        true
+    }
+
+    /// Whether the drain has reached its bound at `now`.
+    fn drain_expired(&self, now: std::time::Instant) -> bool {
+        self.drain.borrow().as_ref().is_some_and(|drain| {
+            now.saturating_duration_since(drain.since) >= Duration::from_secs(drain.bound_s)
+        })
+    }
+
+    /// The drain's bound: the gates still running are halted (their
+    /// process groups killed, as a gate past its time limit is, and their
+    /// threads record nothing: [`gate::Halt`]), `integrator.drain_expired`
+    /// names their tasks, and the caller exits.
+    fn expire_drain(&self, store: Option<&PostgresStore>) {
+        self.reap();
+        let gates = self.gate_tasks();
+        for gate in self.running.borrow().iter() {
+            gate.halt.halt();
+        }
+        let bound_s = self
+            .drain
+            .borrow()
+            .as_ref()
+            .map_or(0, |drain| drain.bound_s);
+        Self::record_own(
+            store,
+            &json!({
+                "type": "integrator.drain_expired", "gates": gates, "bound_s": bound_s,
+            }),
+        );
+        println!(
+            "integrate: the drain reached its bound of {bound_s} s: the gates of {} stopped, \
+             nothing recorded for them; exiting",
+            if gates.is_empty() {
+                "no task".to_string()
+            } else {
+                gates
+                    .iter()
+                    .map(|task| format!("task {task}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        );
     }
 
     /// Whether `task`'s gate backs off this pass ([`gate_wait`]), saying
@@ -2070,6 +2426,12 @@ impl Integrator {
             );
             Ok(())
         });
+        // A drain starts no background judging: the verdicts recorded
+        // meanwhile are not shadowed (one already running is recorded when
+        // it ends, or ends with the integrator).
+        if self.draining() {
+            return;
+        }
         for want in wanted {
             shadows.offer(want);
         }
@@ -2099,6 +2461,11 @@ impl Integrator {
             .lock()
             .map(|mut landed| landed.drain(..).collect())
             .unwrap_or_default();
+        // A drain starts no warm: the next integrator's gates warm their
+        // base themselves.
+        if self.draining() {
+            return;
+        }
         let mut warms = self.warms.borrow_mut();
         let Some(warms) = warms.as_mut() else {
             return;
@@ -2136,6 +2503,7 @@ impl Integrator {
     }
 
     fn pass(&self) -> Result<(), String> {
+        self.unlanded.set(false);
         self.reap();
         // A store per pass while no gate runs: the advisory lock belongs to
         // the connection, and is released with it. While one runs, its
@@ -2217,6 +2585,7 @@ impl Integrator {
 
     /// One pass over every gated mission, holding the integrator's lock.
     fn pass_on(&self, store: &Arc<PostgresStore>) -> Result<(), String> {
+        self.unlanded.set(false);
         // A hold past its bound ends by its record, before any mission's
         // step: nothing lands on its source until then.
         expire_holds(store)?;
@@ -2305,17 +2674,32 @@ impl Integrator {
         let mut ready = Vec::new();
         for mission in &missions {
             let source = mission.source.clone();
+            // A task to land that this pass does not land for good (not
+            // visited, landed or gone stale so the source moved, or an
+            // error) is left for the next pass: a drain waits for it.
+            let landing = mission.halted.is_none() && mission.landing().is_some();
             if source.as_ref().is_some_and(|source| moved.contains(source)) {
+                if landing {
+                    self.unlanded.set(true);
+                }
                 continue;
             }
             match self.mission(store, &missions, mission, pending, &mut ready) {
                 Ok(true) => {
+                    if landing {
+                        self.unlanded.set(true);
+                    }
                     if let Some(source) = source {
                         moved.insert(source);
                     }
                 }
                 Ok(false) => {}
-                Err(error) => eprintln!("integrate: mission {}: {error}", mission.id),
+                Err(error) => {
+                    if landing {
+                        self.unlanded.set(true);
+                    }
+                    eprintln!("integrate: mission {}: {error}", mission.id);
+                }
             }
         }
         ready.retain(|candidate: &Ready| !moved.contains(&candidate.source));
@@ -2334,6 +2718,11 @@ impl Integrator {
         // each takes its source's slot ahead of the source's ready tasks, never
         // a running judging's, within the same caps. Not on a source a task
         // landed on this pass: its main moved, and the next pass reads it.
+        // A drain starts no judging: the ready tasks and the gated owner's
+        // requests wait for the next integrator.
+        if self.draining() {
+            return Ok(());
+        }
         for request in owner_judge {
             if !moved.contains(&request.source) {
                 self.start_owner(store, &missions, request, at_once);
@@ -2441,9 +2830,12 @@ impl Integrator {
             mission.id,
             request.reason.clone(),
         );
+        let halt = Arc::new(gate::Halt::default());
+        let thread_halt = Arc::clone(&halt);
         let handle = std::thread::Builder::new()
             .name(format!("owner-gate-{id}"))
             .spawn(move || {
+                gate::halt_with(thread_halt);
                 let judged = judge.judge_owner(&store, &mirror, &gated, &request, jobs);
                 owner::judged(&said, id, &judged, &backoff, judge.host.backoff);
             });
@@ -2471,6 +2863,7 @@ impl Integrator {
             jobs: jobs.unwrap_or(0),
             owner: Some(id),
             stop: Arc::new(Stop::default()),
+            halt,
             handle,
         });
     }
@@ -2726,9 +3119,12 @@ impl Integrator {
         judge.stop = Some(Arc::clone(&stop));
         let task_id = task.id;
         let (store, source_owned) = (Arc::clone(store), source.clone());
+        let halt = Arc::new(gate::Halt::default());
+        let thread_halt = Arc::clone(&halt);
         let handle = std::thread::Builder::new()
             .name(format!("gate-{task_id}"))
             .spawn(move || {
+                gate::halt_with(thread_halt);
                 if let Some(stop) = &judge.stop {
                     gate::stop_with(Arc::clone(&stop.flag));
                 }
@@ -2767,6 +3163,7 @@ impl Integrator {
             jobs: jobs.unwrap_or(0),
             owner: None,
             stop,
+            halt,
             handle,
         });
         Ok(())
@@ -5160,6 +5557,70 @@ mod tests {
     };
     use crate::gate::{GateFailure, Shortfall};
     use serde_json::json;
+
+    /// SPAWN_INTEGRATE_DRAIN_SECS: unset is two hours; a whole number of
+    /// seconds from 1 to a day is taken; anything else refuses to start,
+    /// naming the variable.
+    #[test]
+    fn the_drain_bound_is_a_whole_number_of_seconds_up_to_a_day() {
+        assert_eq!(super::drain_secs(None), Ok(7200));
+        assert_eq!(super::drain_secs(Some("3")), Ok(3));
+        assert_eq!(super::drain_secs(Some(" 600 ")), Ok(600));
+        assert_eq!(super::drain_secs(Some("86400")), Ok(86_400));
+        for bad in [
+            "0",
+            "86401",
+            "x",
+            "1.5",
+            "-5",
+            "+5",
+            "",
+            " ",
+            "1e3",
+            "99999999999999999999",
+        ] {
+            let error = super::drain_secs(Some(bad)).expect_err(bad);
+            assert!(error.contains("SPAWN_INTEGRATE_DRAIN_SECS"), "{error}");
+        }
+    }
+
+    /// The integrator's pid file is its pid and start time, nothing else.
+    #[test]
+    fn a_pid_file_names_a_pid_and_its_start_time() {
+        assert_eq!(super::read_pid_file("4242 991\n"), Some((4242, 991)));
+        assert_eq!(super::read_pid_file("4242\n"), None);
+        assert_eq!(super::read_pid_file("4242 991 7\n"), None);
+        assert_eq!(super::read_pid_file("x 991\n"), None);
+        assert_eq!(super::read_pid_file(""), None);
+    }
+
+    /// `spawn integrate --drain` finds the integrator by its pid file: this
+    /// process runs, a start time that is not its own (a pid used again)
+    /// is gone, and a root without the file has no integrator.
+    #[test]
+    fn a_drain_request_needs_the_running_integrator_of_its_root() {
+        let pid = std::process::id();
+        let ticks = super::warm::start_ticks(pid).expect("start time");
+        assert!(super::still_runs(pid, ticks));
+        assert!(!super::still_runs(pid, ticks + 1));
+        let root = std::env::temp_dir().join(format!("spawn-drain-root-{pid}"));
+        let _ = std::fs::remove_dir_all(&root);
+        let error = super::request_drain(&root).expect_err("no pid file");
+        assert!(error.contains("no integrator runs"), "{error}");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join(super::PID_FILE), format!("{pid} {}\n", ticks + 1))
+            .expect("pid file");
+        let error = super::request_drain(&root).expect_err("gone");
+        assert!(error.contains("is gone"), "{error}");
+        super::write_pid_file(&root);
+        assert_eq!(
+            super::read_pid_file(
+                &std::fs::read_to_string(root.join(super::PID_FILE)).expect("written")
+            ),
+            Some((pid, ticks))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn disk_short(free_kb: u64, min_gb: u64, tmpdir: &str) -> Shortfall {
         Shortfall::Disk {
@@ -13914,6 +14375,7 @@ mod database_tests {
             jobs: 2,
             owner: None,
             stop: std::sync::Arc::new(super::Stop::default()),
+            halt: std::sync::Arc::new(crate::gate::Halt::default()),
             handle: std::thread::spawn(move || {
                 let _ = waiting.recv();
             }),
@@ -15415,5 +15877,188 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         );
         assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The types of the integrator's records after `after` (an event id),
+    /// in log order, with the task each names (its `id`).
+    fn record_types_after(db: &Db, after: i64) -> Vec<(String, Option<i64>)> {
+        db.admin()
+            .query(
+                "select kind -> 'detail' -> 'record' ->> 'type',
+                        (kind -> 'detail' -> 'record' ->> 'id')::bigint
+                   from spawn_events
+                  where session_id = 'session_control' and id > $1
+                    and event_name = 'control.recorded'
+                  order by session_seq",
+                &[&after],
+            )
+            .expect("records")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
+    fn last_event(db: &Db) -> i64 {
+        db.admin()
+            .query_one("select coalesce(max(id), 0) from spawn_events", &[])
+            .expect("last event")
+            .get(0)
+    }
+
+    /// A drain (objective 37): task A's gate runs when it is asked;
+    /// `integrator.draining` names [A] and the bound. Task B, reported on
+    /// another source meanwhile, gets no gate through any number of passes,
+    /// although a gate is free, and the drain is not over while A's runs.
+    /// Released, A is accepted and lands, and the pass after records
+    /// `integrator.drained`, after the landing; B is still `reported`.
+    #[test]
+    fn a_drain_lets_the_running_gate_land_and_starts_none() {
+        let marks = fresh_marks("spawn-db-drain-marks");
+        let _release = Release(marks.clone());
+        let (base_a, source_a, scenarios, mut integrator) = world("drain-a", &holding_gate(&marks));
+        integrator.gates = 2;
+        let (base_b, source_b, _, _) = world("drain-b", "exit 1\n");
+        let db = Db::new("drain");
+        let a = db.gated_mission(&source_a, &scenarios);
+        let b = db.gated_mission(&source_b, &scenarios);
+        let a_task = db.reported_task(a, "a1");
+        push_work(&base_a, &source_a, &agent_of(&db, a, a_task), "a1.txt");
+        integrator.pass_on(&db.store).expect("the first pass");
+        assert_eq!(wait_started(&marks, 1).len(), 1, "A's gate runs");
+        let mark = last_event(&db);
+
+        integrator.begin_drain(Some(&db.store), 7200);
+        assert!(integrator.draining());
+        assert_eq!(
+            control_records(&db, "integrator.draining"),
+            vec![json!({"type": "integrator.draining", "gates": [a_task], "bound_s": 7200})]
+        );
+        let b_task = db.reported_task(b, "b1");
+        push_work(&base_b, &source_b, &agent_of(&db, b, b_task), "b1.txt");
+        for _ in 0..3 {
+            integrator
+                .pass_on(&db.store)
+                .expect("a pass while draining");
+            assert!(
+                !integrator.drained(Some(&db.store), true),
+                "not drained while A's gate runs"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(started(&marks).len(), 1, "no gate starts while draining");
+
+        std::fs::write(marks.join("release"), "").expect("release");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+        loop {
+            integrator.reap();
+            integrator.pass_on(&db.store).expect("a pass");
+            if integrator.drained(Some(&db.store), true) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never drained: {:?}",
+                record_types_after(&db, mark)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let records = record_types_after(&db, mark);
+        let at = |kind: &str, task: Option<i64>| {
+            records
+                .iter()
+                .position(|(seen, id)| seen == kind && *id == task)
+                .unwrap_or_else(|| panic!("no {kind} in {records:?}"))
+        };
+        assert!(at("task.landed", Some(a_task)) < at("integrator.drained", None));
+        assert!(
+            !records
+                .iter()
+                .any(|(kind, id)| *id == Some(b_task) && kind.starts_with("task.gated")),
+            "no verdict on B: {records:?}"
+        );
+        assert_eq!(db.mission(a)["tasks"][0]["state"], "landed");
+        assert_eq!(db.mission(b)["tasks"][0]["state"], "reported");
+        assert_eq!(started(&marks).len(), 1, "B never had a gate");
+        assert_eq!(
+            control_records(&db, "integrator.drained"),
+            vec![json!({"type": "integrator.drained", "bound_s": 7200})]
+        );
+        for base in [base_a, base_b, marks] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// A drain at its bound: the gate still running is stopped (its process
+    /// gone), `integrator.drain_expired` names its task and the bound, and
+    /// nothing is recorded for the stopped gate: no verdict, the task still
+    /// `reported` for the next integrator.
+    #[test]
+    fn a_drain_at_its_bound_stops_the_gate_and_records_nothing_for_it() {
+        let marks = fresh_marks("spawn-db-drain-bound-marks");
+        let _release = Release(marks.clone());
+        let gate = format!(
+            "echo $$ >'{}/pid'\n{}",
+            marks.to_string_lossy(),
+            holding_gate(&marks)
+        );
+        let (base, source, scenarios, integrator) = world("drain-bound", &gate);
+        let db = Db::new("drain_bound");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w1");
+        push_work(&base, &source, &agent_of(&db, mission, task), "w1.txt");
+        integrator.pass_on(&db.store).expect("the first pass");
+        assert_eq!(wait_started(&marks, 1).len(), 1, "the gate runs");
+        let pid: u32 = std::fs::read_to_string(marks.join("pid"))
+            .expect("the gate's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+
+        integrator.begin_drain(Some(&db.store), 1);
+        let now = std::time::Instant::now();
+        assert!(!integrator.drain_expired(now));
+        assert!(integrator.drain_expired(now + std::time::Duration::from_secs(2)));
+        integrator.expire_drain(Some(&db.store));
+        assert_eq!(
+            control_records(&db, "integrator.drain_expired"),
+            vec![json!({"type": "integrator.drain_expired", "gates": [task], "bound_s": 1})]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !super::warm::exited_unreaped(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(super::warm::exited_unreaped(pid), "the gate {pid} is gone");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        assert!(control_records(&db, "task.gated").is_empty(), "no verdict");
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "reported");
+        assert!(control_records(&db, "integrator.drained").is_empty());
+        for path in [base, marks] {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+
+    /// The store takes the integrator's drain records only as they are
+    /// specified: a bound from 1 to 86400 s, and the gates (but drained's)
+    /// as task numbers.
+    #[test]
+    fn the_store_takes_drain_records_as_specified() {
+        let db = Db::new("drain_records");
+        for good in [
+            json!({"type": "integrator.draining", "gates": [], "bound_s": 7200}),
+            json!({"type": "integrator.drained", "bound_s": 1}),
+            json!({"type": "integrator.drain_expired", "gates": [4, 9], "bound_s": 86400}),
+        ] {
+            db.store.integrator_record(&good).expect("taken");
+        }
+        for bad in [
+            json!({"type": "integrator.draining", "gates": ["4"], "bound_s": 7200}),
+            json!({"type": "integrator.draining", "bound_s": 7200}),
+            json!({"type": "integrator.drained", "bound_s": 0}),
+            json!({"type": "integrator.drain_expired", "gates": [4], "bound_s": 86401}),
+            json!({"type": "integrator.drain_expired", "gates": [4]}),
+            json!({"type": "integrator.stopped", "gates": [], "bound_s": 5}),
+        ] {
+            assert!(db.store.integrator_record(&bad).is_err(), "refused: {bad}");
+        }
     }
 }
