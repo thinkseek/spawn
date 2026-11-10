@@ -312,7 +312,7 @@ export default function App() {
           onShowHome={() => setView("fleet")}
         />
       ) : view === "scorecard" ? (
-        <ScorecardView missions={missions.data} />
+        <ScorecardView missions={missions.data} health={fleetPoll.data?.health ?? null} />
       ) : view === "cost" ? (
         <CostView />
       ) : view === "show" ? (

@@ -774,16 +774,17 @@ impl super::Judge {
         let _ = std::fs::remove_dir_all(&work);
         match judged {
             Ok(verdict) => verdict,
-            Err(Ok(_log)) => {
-                self.land_owner(store, mirror, mission, request, &branch, &main, &candidate)
-            }
+            Err(Ok(extra)) => self.land_owner(
+                store, mirror, mission, request, &branch, &main, &candidate, &extra,
+            ),
             Err(Err(error)) => Judged::NoVerdict(error),
         }
     }
 
     /// The gate run of an owner judging: `Ok` with what it ended with when
-    /// that is not an acceptance, `Err(Ok(log))` when the gate accepted
-    /// `candidate` on `main`, `Err(Err(_))` when it could not be run.
+    /// that is not an acceptance, `Err(Ok(extra))` when the gate accepted
+    /// `candidate` on `main` (the fields its `source.moved` adds:
+    /// [`accepted_extra`]), `Err(Err(_))` when it could not be run.
     #[allow(clippy::too_many_arguments)]
     fn judge_owner_candidate(
         &self,
@@ -795,7 +796,7 @@ impl super::Judge {
         main: &str,
         candidate: &str,
         work: &std::path::Path,
-    ) -> Result<Judged, Result<String, String>> {
+    ) -> Result<Judged, Result<serde_json::Value, String>> {
         use crate::gate::RoomFailure;
         let mirror_path = mirror.to_string_lossy().to_string();
         // A candidate without the mission's scenarios directory cannot be
@@ -847,6 +848,13 @@ impl super::Judge {
         let mut gate_env = self.judging_env(&scenarios, jobs);
         gate_env.retain(|(name, _)| name != "SPAWN_GATE_RED_UNSOLVED");
         gate_env.push(("SPAWN_GATE_RED_UNSOLVED".to_string(), "1".to_string()));
+        // The owner's own candidate (gate.sh's "Three classes of a failing
+        // regression"): a validator that fails on the base too does not end
+        // the gate; the rest is judged and the verdict names it, carried on
+        // the `source.moved` and raised as an alert (alerts.rs
+        // `validator_defect`).
+        gate_env.retain(|(name, _)| name != "SPAWN_GATE_OWNER_CANDIDATE");
+        gate_env.push(("SPAWN_GATE_OWNER_CANDIDATE".to_string(), "1".to_string()));
         let started = super::now_ms();
         let judged = crate::gate::judge(
             &super::pinned(&self.gate),
@@ -868,7 +876,7 @@ impl super::Judge {
             ))
         };
         match judged {
-            Ok(verdict) if verdict.accepted => Err(Ok(verdict.output)),
+            Ok(verdict) if verdict.accepted => Err(Ok(accepted_extra(&verdict))),
             Ok(verdict)
                 if test_database
                     && let Some(fault) =
@@ -904,6 +912,7 @@ impl super::Judge {
         branch: &str,
         main: &str,
         candidate: &str,
+        extra: &serde_json::Value,
     ) -> Judged {
         let source = request.source.as_str();
         let mirror_path = mirror.to_string_lossy().to_string();
@@ -943,13 +952,7 @@ impl super::Judge {
             "refs/heads/main",
             candidate,
         ]);
-        if let Err(error) = moved_with(
-            store,
-            request,
-            main,
-            candidate,
-            &json!({"verdict": "accepted"}),
-        ) {
+        if let Err(error) = moved_with(store, request, main, candidate, extra) {
             // Main moved: the next pass finds the commit in main and
             // records the move from where it began ([`moved_from`]).
             return Judged::Again(format!("record the move: {error}"));
@@ -966,6 +969,21 @@ impl super::Judge {
             to: candidate.to_string(),
         }
     }
+}
+
+/// The fields an accepted owner judging's `source.moved` adds: its verdict,
+/// and the validators the gate judged it without, failing on the base too
+/// (`validator_defects`), or that the owner's list kept from running
+/// (`quarantined`), when there are any.
+fn accepted_extra(verdict: &crate::gate::Verdict) -> serde_json::Value {
+    let mut extra = json!({"verdict": "accepted"});
+    if !verdict.validator_defects.is_empty() {
+        extra["validator_defects"] = json!(verdict.validator_defects);
+    }
+    if !verdict.quarantined.is_empty() {
+        extra["quarantined"] = json!(verdict.quarantined);
+    }
+    extra
 }
 
 /// Record `request`'s refusal by its owner judging.
@@ -999,6 +1017,10 @@ fn no_verdict(failure: crate::gate::GateFailure) -> String {
             scenario, reason, ..
         } => format!("the host's fault on {scenario}: {reason}"),
         GateFailure::CannotJudge { scenario, .. } => format!("the host cannot judge {scenario}"),
+        GateFailure::ValidatorDefect { defects, .. } => format!(
+            "a validator defect on {} (no verdict: the gate judged it as a task's)",
+            defects.join(", ")
+        ),
         GateFailure::BaseDisagrees { scenario, .. } => {
             format!("the base disagreed with itself on {scenario}")
         }

@@ -684,7 +684,9 @@ it, on the same ladder.
   and submits, marks and collects nothing. The queue shows, top to bottom:
   what the supervisor asks ("The supervisor asks"), when its turn ended at
   its prompt judged BLOCKED or WAITING with `needs_human` at least 0.5 (or
-  with a `HUMAN:` line), in its own words from its transcript: its last
+  with a `HUMAN:` line; the judgement of that turn, based on its end or
+  later, never an earlier turn's, so an answered question does not come
+  back when the answer's turn ends), in its own words from its transcript: its last
   `HUMAN:` line not answered since, or else its reply's last paragraph, in
   at most three lines, the whole reply on request; right under it, always
   there whether it asks or not, the box to type to the supervisor; then the
@@ -1015,7 +1017,14 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   the same scenario, on an ancestor of the base and unsolved on it, which
   scripts/rsi/gate.sh reads from the solved index beside its base cache; one
   per mission and scenario while red, cleared at the first later `accepted`
-  gating of the mission that does not name it), `task_undelivered` (assigned longer than
+  gating of the mission that does not name it), `validator_defect` (a
+  regression that fails on the base too, run again in the gate: from a
+  task's `host_fault` with evidence `validator_defect`, cleared at the
+  mission's next `accepted` or `rejected` gating; or from an owner's
+  accepted landing whose `source.moved` names it in `validator_defects`, for
+  each mission it moved, cleared only once a gate of the mission names it
+  `quarantined`, since a later gate that does not name it may have read it
+  unsolved on the base rather than passed), `task_undelivered` (assigned longer than
   `SPAWN_ALERT_UNDELIVERED_SECS`, default 300, while its agent holds no
   delivered or reported task), `mission_halted` (cleared at its
   `mission.resumed`), `postgres_crash` (a `terminated by signal`, `No space
@@ -1026,7 +1035,17 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   `SPAWN_ALERT_MEMORY_OK_MB`, default 8192), `tmpfs_high` (the used space of
   the filesystem holding `SPAWN_ALERT_TMPFS_PATH`, default `/tmp`, over
   `SPAWN_ALERT_TMPFS_HIGH_MB`, default 8000; clears under
-  `SPAWN_ALERT_TMPFS_OK_MB`, default 6000), `agent_stuck` (the session's
+  `SPAWN_ALERT_TMPFS_OK_MB`, default 6000), `source_away` (`mission #<id>`,
+  at two readings in a row: a source of an open or active mission that is a
+  path on this host is not a directory, an unmounted volume or a moved
+  checkout, so its agents' branches are not published to it until it is
+  back; one reading only notes it, so a path that comes and goes does not
+  flap, and a restart starts the count again; evidence `away_since_ms`, the
+  first of the two readings; one per mission
+  and source while away, cleared at the first reading that finds it, or once
+  the mission no longer has it or is no longer open or active; the
+  supervisor's digest tells each and its end, `host source-away-<event>` and
+  `host source-back-<event>`), `agent_stuck` (the session's
   latest judgement at or above the Observer's 0.5, whatever the dispatcher
   does with it; clears under 0.5, or when the session's current execution
   has ended, whatever the cause, with the Bridge's `execution.ended` as
@@ -1188,6 +1207,10 @@ and, with no token set at all, a client socket the owner's uid holds;
 `Content-Type: application/json` (415), which no form can send without a
 preflight; a body of at most 16 KiB (413); a key and a text a person types:
 not blank, at most 8 KiB, no control character but tab and line ends (400).
+A key answers with its first command only for the request that made it (the
+same session and text, or key name): sent for another session or with other
+content it is 409, makes no command, and the page takes a new key
+(`spawn_human_replay`).
 
 The second is a person's named key, `POST /api/session/<id>/key` with
 `{"name", "key"}` (§3, "Named keys never wait"): the command `spawn submit
@@ -2297,9 +2320,14 @@ are per-agent uids or a mount per engine.
   `main` is neither held nor refused for a red it did not cause (else it
   would have to go ungated). Only the tests `main` fails are unsolved: a
   test the candidate newly fails inside the red check, or a run of it that
-  names no failed test, is the push's regression. Accepted: under the landing lock, the
+  names no failed test, is the push's regression. The owner's gate also
+  runs with `SPAWN_GATE_OWNER_CANDIDATE=1`: a regression that fails on M
+  too, run again after the candidate's runs, is a validator's defect, not
+  the push's, and the gate judges the rest (a task's gate gives no verdict
+  then, a `host_fault` with evidence `validator_defect`). Accepted: under the landing lock, the
   candidate is pushed to `main` with a lease on M, and `source.moved`
-  names `verdict` `accepted`. Rejected (or a candidate without the
+  names `verdict` `accepted`, with the gate's `validator_defects` and
+  `quarantined` when it names any (the `validator_defect` alert). Rejected (or a candidate without the
   mission's scenarios directory, `no_scenarios`): `source.push_refused`
   with `verdict` and the gate's `log`; nothing moves and no mission counts
   it. No verdict (the host's fault, an abort, which is a harness error, no

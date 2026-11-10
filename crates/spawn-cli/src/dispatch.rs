@@ -228,6 +228,12 @@ pub(crate) struct Facts {
     /// The Bridge records a turn's checkpoint before its end.
     #[serde(default)]
     pub(crate) turn_ended: bool,
+    /// Session position of that latest turn event: of the turn's end once
+    /// `turn_ended`. A judgement based on an earlier position was made
+    /// before this turn ended: it is an earlier turn's, or of this turn
+    /// while it ran.
+    #[serde(default)]
+    pub(crate) turn_seq: Option<u64>,
     /// The commit of the agent's latest `artifact.committed`, read with the
     /// rest of these facts: once `turn_ended`, the checkpoint of the turn
     /// that ended (or a later one).
@@ -433,6 +439,12 @@ pub(crate) enum Why {
     /// Main of a source that was red on a check passes it again
     /// ([`digest::main_red_news`]).
     MainGreen,
+    /// A mission's source is not a directory on this host: its branches are
+    /// not published to it ([`digest::source_away_news`], told once).
+    SourceAway,
+    /// A mission's source that was away is back, or no longer watched
+    /// ([`digest::source_away_news`]).
+    SourceBack,
     /// A gate runner judged a copy of a verdict on the same inputs and
     /// disagreed with the primary ([`digest::shadow_disagreements`], told
     /// once): it decided nothing.
@@ -497,6 +509,8 @@ impl Why {
                 | Self::GateBaseDisagrees
                 | Self::MainRed
                 | Self::MainGreen
+                | Self::SourceAway
+                | Self::SourceBack
                 | Self::ShadowDisagrees
                 | Self::HoldExpired
                 | Self::ObjectiveSolved
@@ -744,7 +758,7 @@ static ORDER_LOGGED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(
 
 /// The digest items the host's and the integrator's records name, each read
 /// once a pass ([`read_plan`]): the gate's room, host faults and base
-/// disagreements, red and green mains, shadow verdicts, overruns, objective
+/// disagreements, red and green mains, sources away, shadow verdicts, overruns, objective
 /// yields, closes and orders, expired holds and drains, and the recovery's
 /// final model records.
 fn record_items(store: &PostgresStore) -> Result<Vec<Escalation>, String> {
@@ -764,6 +778,10 @@ fn record_items(store: &PostgresStore) -> Result<Vec<Escalation>, String> {
     host.extend(digest::main_red_news(&records(
         store.main_red_news(),
         "red main records",
+    )?));
+    host.extend(digest::source_away_news(&records(
+        store.source_away_news(),
+        "source away records",
     )?));
     host.extend(digest::shadow_disagreements(&records(
         store.shadow_disagreements(),
@@ -1272,6 +1290,7 @@ mod tests {
             resumed_young: 0,
             failed_resume: None,
             turn_ended: true,
+            turn_seq: None,
             checkpoint: None,
             charter: None,
             jobs: Vec::new(),
@@ -1418,6 +1437,7 @@ mod tests {
             resumed_young: 0,
             failed_resume: None,
             turn_ended: true,
+            turn_seq: None,
             checkpoint: None,
             charter: None,
             jobs: Vec::new(),
