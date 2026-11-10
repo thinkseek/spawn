@@ -112,7 +112,8 @@ use crate::ingest::{claude_line, claude_usage, claude_version};
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
     BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch, Launch, READ_LIMIT, Runner,
-    StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError, WorkspaceStore,
+    ServerSeen, StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError,
+    WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
 use crate::time::{Clock, SystemClock};
@@ -2750,7 +2751,7 @@ impl Bridge {
                 return Err(error);
             }
         }
-        self.launch_and_prompt(claimed, &active, native, &settings, prompt)
+        self.launch_and_prompt(claimed, &active, native, &settings, prompt, report)
     }
 
     /// A retried Start or Resume whose execution the log already records
@@ -2940,8 +2941,9 @@ impl Bridge {
         }
     }
 
-    /// Text into the engine's input box, at most once: the text is staged
-    /// first (no key goes), the intent recorded before the keys go and the
+    /// Text into the engine's input box, at most once, ending with the
+    /// command's marker ([`crate::message`], recorded `message.typed`): the
+    /// text is staged first (no key goes), the intent recorded before the keys go and the
     /// completion after, so a retried command or a restarted Bridge can tell
     /// whether it was typed. A staging refused is [`Untyped::Refused`] with
     /// nothing recorded: nothing was typed, and that is what the log says.
@@ -2962,6 +2964,16 @@ impl Bridge {
         } else {
             format!("{}\n\n{text}", notices.join("\n\n"))
         };
+        // The message's id, at the end of the whole text: the transcript
+        // line that holds it is the message taken ([`crate::message`]). On
+        // the line of a one-line text that starts an engine (a start's or a
+        // resume's prompt) or goes into a pane that reads keys raw.
+        let one_line = !text.contains('\n')
+            && (!matches!(claimed.action(), Ok(CommandAction::Input { .. }))
+                || !self
+                    .terminals
+                    .reads_lines(&active.terminal(), &active.workspace));
+        let text = crate::message::marked(&text, claimed.command_id, one_line);
         let typed = {
             // A merge of main into the workspace waits while this types,
             // and once it gets the workspace it finds the `typed` step
@@ -2974,6 +2986,19 @@ impl Bridge {
             {
                 return Ok(Err(Untyped::Refused(error)));
             }
+            // The text about to be typed carries the marker: the record that
+            // tells this command's message from one an older Spawn typed
+            // without it, which no `message.taken` can ever name.
+            self.append(
+                &claimed.agent_id,
+                &claimed.session_id,
+                Some(&active.execution_id),
+                Source::Bridge,
+                Some(format!("{}:message", claimed.command_id)),
+                EventKind::MessageTyped {
+                    command_id: claimed.command_id,
+                },
+            )?;
             self.step(
                 claimed,
                 Some(&active.execution_id),
@@ -3020,6 +3045,7 @@ impl Bridge {
         native: Option<&str>,
         settings: &str,
         prompt: &str,
+        report: &mut TickReport,
     ) -> Result<Outcome, StoreError> {
         let fresh = self.name_session(claimed, native, active)?;
         let launch = self.launch(
@@ -3034,10 +3060,46 @@ impl Bridge {
         if let Err(error) = self.terminals.start(&launch) {
             return self.abandon(claimed, active, format!("start terminal: {error}"), true);
         }
+        self.record_terminal_server(claimed, active, report);
         if prompt.is_empty() {
             return Ok(Outcome::Succeeded);
         }
         self.prompt_engine(claimed, active, prompt)
+    }
+
+    /// Record the terminal server the execution's terminal just started on
+    /// (`execution.terminal_started`): the server that runs it, told by its
+    /// identity, which the recovery compares with the one that answers when
+    /// the execution ends. Read after the start, which may be what started
+    /// the server. A host that cannot tell its server records nothing; a
+    /// server gone already, or a record that failed, is warned once, naming
+    /// the execution: the recovery then reads the server's start against
+    /// the execution's record.
+    fn record_terminal_server(&self, claimed: &Claimed, active: &Active, report: &mut TickReport) {
+        let server = match self.terminals.server() {
+            ServerSeen::Answers(Some(server)) => server,
+            ServerSeen::Answers(None) => return,
+            ServerSeen::Gone => {
+                report.warnings.push(format!(
+                    "{}: {}: record its terminal server: no terminal server answers after its start",
+                    claimed.session_id, active.execution_id
+                ));
+                return;
+            }
+        };
+        if let Err(error) = self.append(
+            &claimed.agent_id,
+            &claimed.session_id,
+            Some(&active.execution_id),
+            Source::Bridge,
+            Some(format!("{}:terminal_started", active.execution_id)),
+            EventKind::TerminalStarted { server },
+        ) {
+            report.warnings.push(format!(
+                "{}: {}: record its terminal server (pid {}, started at {} ms): {error}",
+                claimed.session_id, active.execution_id, server.pid, server.started_at_ms
+            ));
+        }
     }
 
     /// Type a started engine's prompt, answering the engine's trust dialog

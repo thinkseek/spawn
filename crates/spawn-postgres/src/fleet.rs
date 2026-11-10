@@ -482,7 +482,12 @@ pub(crate) const SESSION_JUDGEMENTS: &str =
 /// `waiting`: whether the Bridge recorded the command's `command.step`
 /// `waiting` (keyed `cmd_<id>:waiting`): an unfinished input that waits for
 /// the session's turn, or a finished one that waited before it was typed.
-/// `$1` session, `$2` limit.
+/// `message`: what became of the text it typed, by its id
+/// (`spawn_command_message`: `{state, typed_at_ms, taken_at_ms,
+/// answered_at_ms, taken, not_taken}`, null for a command that types
+/// nothing), on the database's clock.
+/// `$1` session, `$2` limit, `$3` the bound of a message not taken
+/// (SPAWN_MESSAGE_TAKEN_SECS) in milliseconds.
 pub(crate) const SESSION_COMMANDS: &str =
     "select coalesce(jsonb_agg(row_to_json(c) order by c.command_id desc), '[]'::jsonb)
                    from (select k.id as command_id, k.principal, k.action ->> 'type' as action,
@@ -492,8 +497,15 @@ pub(crate) const SESSION_COMMANDS: &str =
                                 exists (select 1 from spawn_events w
                                          where w.session_id = k.session_id and w.source = 'bridge'
                                            and w.source_event_id = 'cmd_' || k.id || ':waiting')
-                                  as waiting
-                           from spawn_commands k where k.session_id = $1
+                                  as waiting,
+                                spawn_command_message(k.id, k.session_id, k.action, k.state, k.succeeded,
+                                                      k.created_at_ms, k.finished_at_ms, $3,
+                                                      m.marked_from, m.now_ms)
+                                  - 'tracked' - 'due_ms' - 'typed' - 'ended' as message
+                           from spawn_commands k,
+                                (select spawn_messages_marked_from() as marked_from,
+                                        spawn_now_ms() as now_ms offset 0) m
+                          where k.session_id = $1
                           order by k.id desc limit $2) c";
 
 /// The files main's merges into a session's branch changed that no
@@ -600,7 +612,14 @@ impl PostgresStore {
     }
 
     /// Commands into one session, newest first, with who sent them.
-    pub fn commands_json(&self, session: &str, limit: u32) -> Result<Value, StoreError> {
-        self.query_json(SESSION_COMMANDS, &[&session, &i64::from(limit)])
+    /// `bound_ms`: how long a message may go untaken
+    /// (SPAWN_MESSAGE_TAKEN_SECS, read by `spawn serve`).
+    pub fn commands_json(
+        &self,
+        session: &str,
+        limit: u32,
+        bound_ms: i64,
+    ) -> Result<Value, StoreError> {
+        self.query_json(SESSION_COMMANDS, &[&session, &i64::from(limit), &bound_ms])
     }
 }

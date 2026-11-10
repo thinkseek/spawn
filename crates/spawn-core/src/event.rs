@@ -321,6 +321,26 @@ pub enum EventKind {
     /// the engine: the notice the Bridge typed last was delivered.
     #[serde(rename = "notice.received")]
     NoticeReceived,
+    /// The Bridge typed a command's text with its marker
+    /// ([`crate::bridge::message_marker`]): the command is a message whose
+    /// taking the transcript says. Written after the text is staged and
+    /// before its `typing` step, keyed `cmd_<id>:message`, and only by a
+    /// Bridge that types the marker: a command typed by an older Spawn has
+    /// none, and is never read as a message not taken.
+    #[serde(rename = "message.typed")]
+    MessageTyped {
+        /// The command whose text carried the marker.
+        command_id: CommandId,
+    },
+    /// A transcript's user line (a prompt, not a tool result) held the
+    /// marker of a command: the engine took that message. Keyed by the
+    /// line and the command, so a line read again records nothing; a line
+    /// written twice is two. Beside the line's `message.received`.
+    #[serde(rename = "message.taken")]
+    MessageTaken {
+        /// The command the marker names.
+        command_id: CommandId,
+    },
     /// The engine asked for attention, for example a permission prompt.
     #[serde(rename = "notification.received")]
     NotificationReceived {
@@ -470,6 +490,19 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transcript_from: Option<u64>,
     },
+    /// The execution's terminal started, on this terminal server: the
+    /// server that ran the execution, by its identity
+    /// ([`crate::port::TerminalServer`]). Recorded after the start, since
+    /// the start may be what started the server. The recovery tells a host
+    /// restart by it: the execution's server is gone when none answers or
+    /// the one that answers is another (crate `spawn-cli`'s `recover`).
+    /// Left out by a host that cannot tell its server, and by executions
+    /// started before it was kept.
+    #[serde(rename = "execution.terminal_started")]
+    TerminalStarted {
+        /// The terminal server.
+        server: crate::port::TerminalServer,
+    },
     /// The execution ended.
     #[serde(rename = "execution.ended")]
     ExecutionEnded {
@@ -606,6 +639,8 @@ impl EventKind {
             Self::MessageReceived => "message.received",
             Self::NoticeTyped { .. } => "notice.typed",
             Self::NoticeReceived => "notice.received",
+            Self::MessageTyped { .. } => "message.typed",
+            Self::MessageTaken { .. } => "message.taken",
             Self::NotificationReceived { .. } => "notification.received",
             Self::ToolStarted { .. } => "tool.started",
             Self::ToolCompleted { .. } => "tool.completed",
@@ -616,6 +651,7 @@ impl EventKind {
             Self::JobStarted { .. } => "job.started",
             Self::JobEnded { .. } => "job.ended",
             Self::ExecutionStarted { .. } => "execution.started",
+            Self::TerminalStarted { .. } => "execution.terminal_started",
             Self::ExecutionEnded { .. } => "execution.ended",
             Self::ExecutionEndStalled { .. } => "execution.end_stalled",
             Self::ExecutionUnmounting => "execution.unmounting",

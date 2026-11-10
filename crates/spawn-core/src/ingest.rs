@@ -831,9 +831,27 @@ fn tool_jobs(value: &Value, blocks: &[Value]) -> Vec<Normalized> {
 /// prompt that is the engine's notification about a background job also
 /// ends the jobs it reports, before the turn it starts.
 fn user_text(content: &Value, uuid: &str) -> Vec<Normalized> {
-    let mut events = job_ends(&whole_text(content));
+    let text = whole_text(content);
+    let mut events = job_ends(&text);
     events.extend(user_turn(content, uuid));
+    events.extend(taken(&text, uuid));
     events
+}
+
+/// The messages a user line took: one `message.taken` for each command
+/// whose marker it holds ([`crate::message`]), keyed by the line and the
+/// command, so a line read again records nothing and a line the engine
+/// wrote twice (two lines) is taken twice.
+fn taken(text: &str, uuid: &str) -> Vec<Normalized> {
+    crate::message::markers(text)
+        .into_iter()
+        .map(|command_id| {
+            keyed(
+                EventKind::MessageTaken { command_id },
+                format!("{uuid}:taken:{}", command_id.0),
+            )
+        })
+        .collect()
 }
 
 /// The turn a user line that is not a tool result starts or stops.
@@ -863,7 +881,9 @@ fn user_turn(content: &Value, uuid: &str) -> Vec<Normalized> {
 /// from the transcript's length when the execution started), never by the
 /// time a line claims: that time is written by the engine.
 ///
-/// - a prompt (a user line that is not a tool result) starts a turn;
+/// - a prompt (a user line that is not a tool result) starts a turn; one
+///   that holds a message's marker took that message (`message.taken`,
+///   [`crate::message`]);
 /// - each `tool_use` block of an assistant line starts a tool, and each
 ///   `tool_result` block of a user line ends one, failed when `is_error`;
 /// - `system`/`turn_duration`, written when a turn ends, and an interrupt
@@ -1182,6 +1202,46 @@ mod tests {
     }
 
     const AT: &str = r#""timestamp":"2026-11-04T05:46:12.345Z""#;
+
+    #[test]
+    fn a_prompt_with_markers_takes_each_message_by_its_line_and_id() {
+        let prompt = format!(
+            r#"{{"type":"user","uuid":"u1",{AT},"message":{{"role":"user","content":"notice\n\nfix it\n\n[spawn message #12]"}}}}"#
+        );
+        assert_eq!(
+            kinds(&prompt),
+            vec![
+                ("message.received".into(), Some("u1".into())),
+                ("message.taken".into(), Some("u1:taken:12".into())),
+            ]
+        );
+        assert_eq!(
+            claude_line(&prompt)[1].kind,
+            EventKind::MessageTaken {
+                command_id: crate::id::CommandId(12)
+            }
+        );
+        // Two inputs in one prompt: both taken, each once.
+        let two = format!(
+            r#"{{"type":"user","uuid":"u2",{AT},"message":{{"content":[{{"type":"text","text":"a\n\n[spawn message #3]"}},{{"type":"text","text":"b\n\n[spawn message #4]"}}]}}}}"#
+        );
+        assert_eq!(
+            kinds(&two),
+            vec![
+                ("message.received".into(), Some("u2".into())),
+                ("message.taken".into(), Some("u2:taken:3".into())),
+                ("message.taken".into(), Some("u2:taken:4".into())),
+            ]
+        );
+        // A tool result that quotes a marker took nothing.
+        let quoted = format!(
+            r#"{{"type":"user","uuid":"u3",{AT},"message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":"[spawn message #12]"}}]}}}}"#
+        );
+        assert_eq!(
+            kinds(&quoted),
+            vec![("tool.completed".into(), Some("toolu_1:completed".into()))]
+        );
+    }
 
     #[test]
     fn a_transcript_gives_the_turn_and_its_tools() {

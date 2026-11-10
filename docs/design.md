@@ -63,6 +63,8 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | `session.native_ended` | 无；保留它以读取日志里已有的行 | reason |
 | `session.linked` | Bridge | parent_session_id |
 | `message.received` | 会话记录（transcript） | 无 |
+| `message.typed` | Bridge（它打字的文本末尾带该命令的标记 `[spawn message #<id>]` 时，暂存之后、`typing` 之前记一次，键 `cmd_<id>:message`；旧版本 Spawn 打的字没有它） | command_id |
+| `message.taken` | 会话记录（不是工具结果的用户行里有某命令的标记：该消息被引擎接收；每个标记一条，键 `<行 uuid>:taken:<id>`） | command_id |
 | `notice.typed` | 无；保留它以读取日志里已有的行（主线不再合入运行中的工作区） | through |
 | `notice.received` | 无；保留它以读取日志里已有的行 | 无 |
 | `notification.received` | 无；保留它以读取日志里已有的行 | notification_type |

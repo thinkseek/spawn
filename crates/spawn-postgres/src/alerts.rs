@@ -24,6 +24,89 @@ pub(crate) const MISSION_SOURCES: &str = "select coalesce(jsonb_agg(jsonb_build_
 /// an idle pass costs the loop one statement (objective 023).
 pub(crate) const CLOCK: &str = "select coalesce(max(id), 0), spawn_now_ms() from spawn_events";
 
+/// The messages the `message_not_taken` alert reads (objective 045;
+/// `spawn_command_message`), on the database's clock: `{now_ms, max_id,
+/// messages}`, `max_id` the newest command read (or `$2`), `messages` each
+/// read command that types a message, with its agent, session, action,
+/// creation and `spawn_command_message`'s facts (`tracked`, `taken`,
+/// `not_taken`, `due_ms`, `typed`, `ended`, `state`). `$1` the bound in
+/// milliseconds (SPAWN_MESSAGE_TAKEN_SECS). This one reads what the step
+/// needs when the log moved, a scan or two when nothing is new (objective
+/// 023): the commands after `$2`; the pending messages `$3` that fell due;
+/// and the open alerts' `$4` whose session recorded a `message.taken` or an
+/// `execution.ended` at or after `$5` (what clears one).
+pub(crate) const MESSAGES_SINCE: &str = r"
+with fresh as (select k.* from spawn_commands k where k.id > $2),
+candidates as (
+  -- A session whose transcript never held a marker tracks nothing
+  -- (`spawn_command_message`): its new commands are not read further.
+  select k.* from fresh k
+   where exists (select 1 from spawn_events e
+                  where e.session_id = k.session_id and e.event_name = 'message.taken')
+  union
+  select k.* from spawn_commands k where cardinality($3::bigint[]) > 0 and k.id = any($3)
+  union
+  select k.* from spawn_commands k
+   where cardinality($4::bigint[]) > 0 and k.id = any($4)
+     and k.session_id in (select e.session_id from spawn_events e
+                           where e.event_name in ('message.taken', 'execution.ended')
+                             and e.recorded_at_ms >= $5))
+select jsonb_build_object(
+  'now_ms', spawn_now_ms(),
+  'max_id', greatest($2, coalesce((select max(id) from fresh), $2)),
+  'messages', coalesce((select jsonb_agg(x.row order by x.id) from (
+      select k.id, jsonb_build_object(
+               'command_id', k.id, 'agent_id', k.agent_id, 'session_id', k.session_id,
+               'action', k.action ->> 'type', 'created_at_ms', k.created_at_ms) || m.message as row
+        from candidates k
+        cross join lateral (
+          select spawn_command_message(k.id, k.session_id, k.action, k.state, k.succeeded,
+                                       k.created_at_ms, k.finished_at_ms, $1,
+                                       (select spawn_messages_marked_from()),
+                                       spawn_now_ms()) as message) m
+       where m.message is not null) x), '[]'::jsonb))";
+
+/// [`MESSAGES_SINCE`] as the step's start reads them: every command that
+/// can be a message not taken (each live session's commands from its
+/// execution's own start on: an input typed into that execution came after
+/// it, one before it was typed into an execution that ended or failed; and
+/// every unfinished command), with those of `$2` (the open alerts'), and the
+/// newest command id.
+pub(crate) const MESSAGES_ALL: &str = r"
+with live as (
+  select l.session_id, l.from_command
+    from spawn_session_state t
+    cross join lateral (
+      select s.session_id, (s.kind -> 'detail' ->> 'command_id')::bigint as from_command,
+             s.execution_id
+        from spawn_events s
+       where s.session_id = t.session_id and s.event_name = 'execution.started'
+       order by s.id desc limit 1) l
+   where not exists (select 1 from spawn_events x
+                      where x.session_id = l.session_id and x.event_name = 'execution.ended'
+                        and x.source = 'bridge' and x.execution_id = l.execution_id)),
+candidates as (
+  select k.* from spawn_commands k join live l
+      on k.session_id = l.session_id and k.id >= l.from_command
+  union
+  select k.* from spawn_commands k where k.state <> 'finished'
+  union
+  select k.* from spawn_commands k where k.id = any($2))
+select jsonb_build_object(
+  'now_ms', spawn_now_ms(),
+  'max_id', coalesce((select max(id) from spawn_commands), 0),
+  'messages', coalesce((select jsonb_agg(x.row order by x.id) from (
+      select k.id, jsonb_build_object(
+               'command_id', k.id, 'agent_id', k.agent_id, 'session_id', k.session_id,
+               'action', k.action ->> 'type', 'created_at_ms', k.created_at_ms) || m.message as row
+        from candidates k
+        cross join lateral (
+          select spawn_command_message(k.id, k.session_id, k.action, k.state, k.succeeded,
+                                       k.created_at_ms, k.finished_at_ms, $1,
+                                       (select spawn_messages_marked_from()),
+                                       spawn_now_ms()) as message) m
+       where m.message is not null) x), '[]'::jsonb))";
+
 /// The database's clock alone, the one every bound is measured by.
 pub(crate) const NOW: &str = "select spawn_now_ms()";
 
@@ -280,6 +363,27 @@ impl PostgresStore {
     /// Every session's latest judgement ([`OBSERVATIONS`]).
     pub fn alert_observations(&self) -> Result<Value, StoreError> {
         self.query_json(OBSERVATIONS, &[])
+    }
+
+    /// The messages the `message_not_taken` alert's start reads
+    /// ([`MESSAGES_ALL`]): `bound_ms` is SPAWN_MESSAGE_TAKEN_SECS, `open` the
+    /// commands of the open alerts.
+    pub fn alert_messages_all(&self, bound_ms: i64, open: &[i64]) -> Result<Value, StoreError> {
+        self.query_json(MESSAGES_ALL, &[&bound_ms, &open])
+    }
+
+    /// The messages of the commands after `after`, of the pending `due`
+    /// ones, and of the `open` alerts' whose session took a message or
+    /// ended an execution at or after `since_ms` ([`MESSAGES_SINCE`]).
+    pub fn alert_messages_since(
+        &self,
+        bound_ms: i64,
+        after: i64,
+        due: &[i64],
+        open: &[i64],
+        since_ms: i64,
+    ) -> Result<Value, StoreError> {
+        self.query_json_prepared(MESSAGES_SINCE, &[&bound_ms, &after, &due, &open, &since_ms])
     }
 
     /// Commands that finished failed after `since_ms` ([`FAILED_COMMANDS`]).
