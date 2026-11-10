@@ -4,13 +4,13 @@ import type { ReactNode } from "react";
 import type { OverviewSession, RsiSummary, SessionState } from "../api";
 import type { View } from "../App";
 import type { FleetAgent } from "../fleet";
-import { sessionState } from "../fleet";
 import { rsiPhase, sessionTaskLabel } from "../missions";
 import type { ThemeChoice } from "../theme";
 import { THEME_CHOICES, THEME_KEY, useTheme } from "../theme";
 import type { FleetContext } from "../ordering";
 import { AGENT_GROUP_LABEL, groupAgents, heldTask } from "../ordering";
 import { phaseStyle } from "./rsi/Phase";
+import { recordedState } from "../recordedState";
 import { StateDot, stateLabel } from "./StateDot";
 import { useStoredChoice } from "./ViewToggle";
 import { Ago, FOCUS_RING_INSET, GroupHeader, MiddleId, cx } from "./ui";
@@ -248,25 +248,25 @@ function GroupedSessions({
               <ul className="space-y-px">
                 {group.agents.filter((agent) => open || agent.session_id === selectedId).map((agent) => {
                   const held = heldTask(agent, context);
-                  const state = sessionState(agent.state);
+                  // What the log records (running, waiting, ended), never
+                  // the judge's word, which can lag it: the header and the
+                  // trace say the same (recordedState).
+                  const recorded = recordedState(agent);
                   const label =
                     held && AT_THE_GATE.has(held.label)
                       ? `Task ${held.label}`
-                      : stateLabel(state);
+                      : recorded.label;
                   const at =
-                    agent.live || agent.ended_at_ms === null
-                      ? (agent.activity.last_event_at_ms ??
-                        observed.get(agent.session_id)?.recorded_at_ms ??
-                        null)
-                      : agent.ended_at_ms;
+                    recorded.since ?? observed.get(agent.session_id)?.recorded_at_ms ?? null;
                   return (
                     <li key={agent.session_id}>
                       <SessionRow
                         sessionId={agent.session_id}
                         agentId={agent.agent_id}
-                        state={state}
-                        // Ended outside the Ended group is news: say it.
-                        label={agent.live || group.id === "ended" ? label : `${label}, ended`}
+                        state={recorded.dot}
+                        // Ended outside the Ended group is news: the
+                        // recorded label says it ("Ended").
+                        label={label}
                         at={at}
                         attention={agent.attention}
                         task={held ? `T${held.task_id ?? "?"} ${held.label}${held.title ? ` · ${held.title}` : ""}` : null}

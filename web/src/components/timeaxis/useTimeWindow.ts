@@ -8,17 +8,10 @@ import type { AnimationPlaybackControls } from "motion/react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
 
-import { clampDomain, panDomain, zoomDomain } from "../../timeWindow";
-import type { Domain } from "../../timeWindow";
+import { clampDomain, panDomain, refollow, zoomDomain } from "../../timeWindow";
+import type { Domain, Follow } from "../../timeWindow";
 
-/** What the window follows: the whole extent, the live end with a fixed
- * width, everything from a fixed start to the live end (a run still going,
- * whose start stays in view as it grows), or a fixed range. */
-export type Follow =
-  | { mode: "fit" }
-  | { mode: "tail"; width: number }
-  | { mode: "since"; from: number }
-  | { mode: "fixed"; domain: Domain };
+export type { Follow } from "../../timeWindow";
 
 /** Pointer travel that turns a press into a drag. */
 export const DRAG_PX = 3;
@@ -41,6 +34,9 @@ export interface TimeWindow {
   fit: () => void;
   /** Show `from` to the live end, and keep following that end. */
   since: (from: number) => void;
+  /** The axis changed under the window (a new fold): `map` takes an old
+   * axis time to the new axis time of the same real moment (refollow). */
+  refold: (map: (time: number) => number) => void;
   stop: () => void;
   /** Latest values, for native listeners. */
   latest: RefObject<{ domain: Domain; extent: Domain; scale: number }>;
@@ -123,6 +119,10 @@ export function useTimeWindow(
     glide.current?.stop();
     setFollow({ mode: "since", from });
   }, []);
+  const refold = useCallback((map: (time: number) => number) => {
+    glide.current?.stop();
+    setFollow((current) => refollow(current, map));
+  }, []);
 
   return {
     domain,
@@ -136,6 +136,7 @@ export function useTimeWindow(
     zoomTo,
     fit,
     since,
+    refold,
     stop,
     latest,
   };

@@ -5,6 +5,7 @@
 
 import { foldIdle } from "./timeFold.ts";
 import type { TimeFold } from "./timeFold.ts";
+import type { Follow } from "./timeWindow.ts";
 import { spanEnd } from "./trace.ts";
 import type { Span, Trace } from "./trace.ts";
 
@@ -38,7 +39,7 @@ export function traceFold(
   for (const marker of trace.markers) intervals.push([marker.at, marker.at]);
   const first = foldIdle(intervals, { minGap });
   if (!options.plotW || first.breaks.length === 0) return first;
-  return foldIdle(intervals, { minGap, keep: breakKeep(first, options.plotW) });
+  return foldIdle(intervals, { minGap, keep: breakKeep(first, options.plotW, minGap) });
 }
 
 /** Each break's folded width (§4.4: a fixed band, at most 24 px), in ms
@@ -47,10 +48,13 @@ export function traceFold(
  * width in ms of the active time (the missions timeline's 3%) would let the
  * breaks take the axis. All the breaks together take at most 30% of it.
  * Rounded down to a power of two, so the width holds while a live session
- * grows (each change of it moves every folded time, and a window the reader
- * set with them): a band is 12 to 24 px wide. */
+ * grows (each change of it moves every folded time; the window follows
+ * them, refollow): a band is 12 to 24 px wide. And never wider than
+ * `minGap`, the shortest gap that folds (rev-f F2): a gap is squeezed to
+ * min(gap, keep), so a keep past it would draw a band wider than its gap,
+ * over the activity after it (a 200 px phone plot, hours of activity). */
 export const BREAK_PX = 24;
-export function breakKeep(fold: TimeFold, plotW: number): number {
+export function breakKeep(fold: TimeFold, plotW: number, minGap = TRACE_MIN_GAP_MS): number {
   const count = fold.breaks.length;
   const active = Math.max(
     fold.blocks.reduce((sum, block) => sum + (block.to - block.from), 0),
@@ -59,7 +63,7 @@ export function breakKeep(fold: TimeFold, plotW: number): number {
   const px = Math.min(BREAK_PX, (plotW * 0.3) / count);
   // keep / (active + count * keep) = px / plotW
   const exact = (px * active) / Math.max(plotW - count * px, 1);
-  return 2 ** Math.floor(Math.log2(Math.max(exact, 1)));
+  return 2 ** Math.floor(Math.log2(Math.max(Math.min(exact, minGap), 1)));
 }
 
 /** The execution span a window fits: the selected span's own execution
@@ -80,6 +84,24 @@ export function fitExecution(trace: Trace, selectedId: string | null = null): Sp
     if (span.end === null && (!open || span.start >= open.start)) open = span;
   }
   return open ?? last;
+}
+
+/** The air before and after a fitted run, in real time: 5% of it, at most
+ * a minute. Real, not folded: a pad taken on the folded axis lands inside
+ * the break before the run and stands for hours of it, which a linear axis
+ * (the toggle, refollow) would then show. */
+export function runPad(from: number, to: number): number {
+  return Math.min(Math.max((to - from) * 0.05, 0), 60_000);
+}
+
+/** The window that fits `run` on the axis of `fold` (§4.4): a running one
+ * from just before its start to the live end, followed; a finished one
+ * whole, with a little air. `end` is the live end (now while it runs). */
+export function runWindow(run: Span, fold: TimeFold, end: number): Follow {
+  const until = spanEnd(run, end);
+  const pad = runPad(run.start, until);
+  if (run.end === null) return { mode: "since", from: fold.fold(run.start - pad) };
+  return { mode: "fixed", domain: { from: fold.fold(run.start - pad), to: fold.fold(until + pad) } };
 }
 
 /** "2 running · 125 done": the spans still open first, the rest after. */

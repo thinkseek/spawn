@@ -2,8 +2,18 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { TimelineEvent } from "../src/api.ts";
+import { LINEAR } from "../src/timeFold.ts";
+import { refollow } from "../src/timeWindow.ts";
+import type { Follow } from "../src/timeWindow.ts";
 import { deriveTrace } from "../src/trace.ts";
-import { BREAK_PX, TRACE_MIN_GAP_MS, fitExecution, spanCounts, traceFold } from "../src/traceWindow.ts";
+import {
+  BREAK_PX,
+  TRACE_MIN_GAP_MS,
+  fitExecution,
+  runWindow,
+  spanCounts,
+  traceFold,
+} from "../src/traceWindow.ts";
 
 const T0 = 1_780_000_000_000;
 const S = 1000;
@@ -200,6 +210,71 @@ test("with a plot width each break is a band of 12 to 24 px, all of them at most
   assert.equal(traceFold(more, more.end, { plotW }).keep, many.keep);
   // Without a width, the fold is the missions one (keep at least 2 min).
   assert.ok(traceFold(busy, busy.end).keep >= 2 * M);
+});
+
+test("a window keeps its real times when the fold changes (rev-f F1)", () => {
+  const trace = twoRuns(true);
+  const run = fitExecution(trace);
+  assert.ok(run);
+  const fold = traceFold(trace, T0 + 6 * H, { plotW: 800 });
+  // The default fit of the open run, then the Linear toggle: still from
+  // just before the run (at most a minute), not hours before it (the
+  // folded number read as a real time).
+  const fitted = runWindow(run, fold, T0 + 6 * H);
+  assert.equal(fitted.mode, "since");
+  const linear = refollow(fitted, (time) => LINEAR.fold(fold.unfold(time)));
+  assert.equal(linear.mode, "since");
+  const from = linear.mode === "since" ? linear.from : 0;
+  assert.ok(from <= run.start && from >= run.start - 60 * S - 1, `${(run.start - from) / S} s before the run`);
+  // A finished run fits whole, with the same real air on both sides.
+  const done = twoRuns(false);
+  const last = fitExecution(done);
+  assert.ok(last && last.end !== null);
+  const doneFold = traceFold(done, done.end, { plotW: 800 });
+  const whole = refollow(runWindow(last, doneFold, done.end), (time) => LINEAR.fold(doneFold.unfold(time)));
+  assert.equal(whole.mode, "fixed");
+  if (whole.mode === "fixed") {
+    assert.ok(whole.domain.from <= last.start && whole.domain.from >= last.start - 60 * S - 1);
+    assert.ok(whole.domain.to >= last.end && whole.domain.to <= last.end + 60 * S + 1);
+  }
+
+  // A zoomed window on a live session whose band width changes (here a
+  // narrower plot): the same real moments before and after.
+  const other = traceFold(trace, T0 + 6 * H, { plotW: 300 });
+  assert.notEqual(other.keep, fold.keep);
+  const zoomed: Follow = {
+    mode: "fixed",
+    domain: { from: fold.fold(T0 + 2 * S), to: fold.fold(T0 + 5 * H + 2 * S) },
+  };
+  const moved = refollow(zoomed, (time) => other.fold(fold.unfold(time)));
+  assert.equal(moved.mode, "fixed");
+  if (moved.mode === "fixed") {
+    assert.ok(Math.abs(other.unfold(moved.domain.from) - (T0 + 2 * S)) < 1);
+    assert.ok(Math.abs(other.unfold(moved.domain.to) - (T0 + 5 * H + 2 * S)) < 1);
+  }
+  // Fit and tail follow the extent and keep as they are.
+  assert.deepEqual(refollow({ mode: "fit" }, () => 0), { mode: "fit" });
+  assert.deepEqual(refollow({ mode: "tail", width: 5 }, () => 0), { mode: "tail", width: 5 });
+});
+
+test("a break is never wider than the shortest gap that folds (rev-f F2)", () => {
+  // Three hours of activity (a call every 5 min), a 12 min gap, then a
+  // 20 min tool call, on a 200 px phone plot.
+  const rows: Array<[string, number, unknown?, string?]> = [];
+  for (let index = 0; index <= 36; index += 1) {
+    rows.push(["tool.started", index * 5 * M, { tool_name: "Bash", tool_use_id: `t${index}` }, ""]);
+    rows.push(["tool.completed", index * 5 * M + S, { tool_use_id: `t${index}` }, ""]);
+  }
+  const after = 3 * H + S + 12 * M;
+  rows.push(["tool.started", after, { tool_name: "Bash", tool_use_id: "long" }, ""]);
+  rows.push(["tool.completed", after + 20 * M, { tool_use_id: "long" }, ""]);
+  const trace = deriveTrace(timeline(rows), T0 + after + 20 * M);
+  const fold = traceFold(trace, trace.end, { plotW: 200 });
+  assert.equal(fold.breaks.length, 1);
+  assert.ok(fold.keep <= TRACE_MIN_GAP_MS, `keep ${fold.keep / M} min`);
+  // The band ends at or before the long call's start.
+  const item = fold.breaks[0];
+  assert.ok(item.at + Math.min(fold.keep, item.to - item.from) <= fold.fold(T0 + after) + 1);
 });
 
 test("counts say what is running first, then what is done", () => {

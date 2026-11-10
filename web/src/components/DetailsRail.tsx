@@ -2,7 +2,8 @@ import { Eye, GitBranch, Terminal, Wrench } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { Execution, Observation, RsiSummary, SessionDetail } from "../api";
-import { formatDuration, relativeTime } from "../format";
+import { executionFields, executionLine } from "../executionFacts";
+import { relativeTime } from "../format";
 import { Card, CardHeader, cx } from "./ui";
 
 interface DetailsRailProps {
@@ -24,7 +25,7 @@ export function latestExecution(detail: SessionDetail | null): Execution | null 
 /** The latest execution in one line, for the session's header
  * (design-ui-information.md §2.6: the Execution card collapsed into it):
  * "claude · running 12m" or "claude · exited 0 · 3m · stopped". The id and
- * the start time are on hover. */
+ * the start are on hover here, and fields in the phone drawer. */
 export function ExecutionSummary({
   detail,
   className,
@@ -35,18 +36,7 @@ export function ExecutionSummary({
   const execution = latestExecution(detail);
   if (!execution) return null;
   const running = execution.ended_at_ms === null;
-  const parts: ReactNode[] = [execution.engine || "execution"];
-  if (running) {
-    parts.push(
-      <span key="running" className="text-success">
-        running {formatDuration(Date.now() - execution.started_at_ms)}
-      </span>,
-    );
-  } else {
-    parts.push(execution.exit_code === null ? "no exit code" : `exited ${execution.exit_code}`);
-    parts.push(formatDuration(execution.duration_ms));
-    if (execution.cause) parts.push(execution.cause);
-  }
+  const parts = executionLine(execution, Date.now());
   return (
     <span
       className={cx("tnum inline-flex items-center gap-1.5 text-caption text-muted-foreground", className)}
@@ -56,7 +46,7 @@ export function ExecutionSummary({
       {parts.map((part, index) => (
         <span key={index} className="inline-flex items-center gap-1.5">
           {index > 0 && <span className="text-faint-foreground">·</span>}
-          {part}
+          <span className={running && index === 1 ? "text-success" : undefined}>{part}</span>
         </span>
       ))}
     </span>
@@ -94,6 +84,7 @@ export function RailContent({
   withExecution = false,
 }: Omit<DetailsRailProps, "className"> & { withExecution?: boolean }) {
   const tools = detail?.open_tools ?? [];
+  const execution = withExecution ? latestExecution(detail) : null;
   const residentRsi =
     rsi && detail && rsi.resident_session !== null && rsi.resident_session === detail.session_id
       ? rsi
@@ -158,10 +149,17 @@ export function RailContent({
         </div>
       </Card>
 
-      {withExecution && latestExecution(detail) && (
+      {withExecution && execution && (
         <Card>
-          <div className="px-4 py-3">
-            <ExecutionSummary detail={detail} />
+          <CardHeader icon={<Terminal size={14} />} title="Execution" />
+          <div className="space-y-2 p-4">
+            {executionFields(execution, Date.now()).map(([label, value]) => (
+              <Field
+                key={label}
+                label={label}
+                value={label === "Execution" ? <span className="font-mono">{value}</span> : value}
+              />
+            ))}
           </div>
         </Card>
       )}

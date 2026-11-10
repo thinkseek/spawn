@@ -89,7 +89,8 @@ export function useBreaks(domain: Domain, plotW: number, fold: TimeFold): BreakM
     return fold.breaks
       .map((item) => ({
         x0: (item.at - domain.from) * k,
-        x1: (item.at + fold.keep - domain.from) * k,
+        // A gap is squeezed to min(gap, keep): its band is no wider.
+        x1: (item.at + Math.min(fold.keep, item.to - item.from) - domain.from) * k,
         label: breakLabel(item),
         key: item.from,
       }))
