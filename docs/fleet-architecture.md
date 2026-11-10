@@ -1187,8 +1187,54 @@ A message's id is its command's id, carried end to end:
   or ended an execution since (an idle pass reads next to nothing, objective
   023). An open one reaches
   `/api/alerts` and Home's Needs you, which names the agent and the message.
-  Out of scope (objective 046): an agent's explicit acknowledgement, what a
-  reply says, and retrying a message not taken.
+  Out of scope: what a reply says, and retrying a message not taken.
+- **Acted: the agent's own answer (objective 046).** Answered says the turn
+  a message started ended, not that the agent did what it asked. The agent
+  says which: `spawn ack <command id> done|declined [<why>]`, run in its
+  own pane (a why is required for `declined`: the words after the outcome;
+  optional for `done`). The marker is followed by one line that tells it
+  so (`message.rs`'s `answer_line`: `spawn ack <id> done`, or `spawn ack
+  <id> declined <why>`, and that a task's delivery is answered by its
+  report). The pane has no database login, and the ack needs none: it is
+  a file, written whole (hidden, then renamed) into the workspace the
+  pane was launched in, `$SPAWN_WORKSPACE/.spawn/acks/` (the Bridge sets
+  `SPAWN_WORKSPACE` beside `SPAWN_AGENT_ID`, `SPAWN_SESSION_ID` and
+  `SPAWN_EXECUTION_ID`; never the shell's current directory, so an ack
+  from a subdirectory lands there too; `.spawn/` is in no checkpoint).
+  `spawn ack` exits 0 once the file is in place, and non-zero, saying why
+  and writing nothing, for a missing or non-numeric id, an outcome other
+  than done or declined, a decline with no why, or outside an agent's pane
+  (no `SPAWN_WORKSPACE`, or one that is not the agent's workspace under the
+  loop's root). On every dispatcher pass the loop reads each agent's acks
+  from its workspace the safe way (`agent_files`: no symlink followed),
+  oldest first (`crates/spawn-cli/src/ack.rs`), records each and removes
+  it; an ack made while the loop is down waits there until it is back.
+  Whose ack it is, is the workspace's: it counts only for a message into
+  that agent's session, never by an id it carries, so setting
+  `SPAWN_SESSION_ID` to another worker's session, or writing an ack file by
+  hand, answers nothing of another agent's. An ack of another session's
+  message, an unknown id, a command that types nothing, or a task's
+  delivery records nothing, and the loop's log says so. Recorded:
+  `message.acted {command_id, outcome, why}` in the message's session,
+  keyed `<id>:acted`, so the first answer stands and a later one records
+  nothing, whatever restarts (`crates/spawn-postgres/src/acks.rs`).
+- **A report answers its delivery.** A task's report answers the message
+  that delivered it (the command the task's latest `task.delivered` before
+  the report names): an Outcome of done is `done`; blocked or failed is
+  `declined`, the Outcome line its why. It is recorded from the
+  `task.reported` record, once (the same key), on the next pass after the
+  report is taken; a loop's first pass reads every report, so one taken
+  just before a stop is answered once it is back. Only a tracked message
+  (the Bridge typed its marker) is answered.
+- **Read.** The commands API's `message` gains `acted` (`{outcome, why}`,
+  null until answered; `why` null for a done with none) and `acted_at_ms`;
+  `state` is `acted` once answered, whatever else. The agent page appends
+  it to what it says of the message: " · done", " · declined: <why>" (a why
+  over 80 characters cut to its first 79 and "…"). A message never
+  answered is no alert. The lifecycle above, its alert, the report's rules
+  and the dispatcher's order are unchanged; `message.acted` is no fact
+  about the engine for the dispatcher's judgements, as the storage records
+  are not.
 
 ### 3.5 Cost: what the model calls cost
 
