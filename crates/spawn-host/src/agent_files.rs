@@ -373,7 +373,9 @@ impl HeldDirectory {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentFileError, create_new, open_regular, read_regular, remove, rename_within};
+    use super::{
+        AgentFileError, create_new, list, open_regular, read_regular, remove, rename_within,
+    };
     use crate::tree_path::TreePath;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -398,6 +400,35 @@ mod tests {
                 .expect("mkfifo")
                 .success()
         );
+    }
+
+    #[test]
+    fn a_directory_is_listed_by_name_and_never_through_a_symlink() {
+        let base = scratch("list");
+        let ws = base.join("ws");
+        assert_eq!(list(&ws, &path(".spawn/acks")), Ok(Vec::new()), "none yet");
+        std::fs::create_dir_all(ws.join(".spawn/acks")).expect("mkdir");
+        std::fs::write(ws.join(".spawn/acks/b.json"), "{}").expect("write");
+        std::fs::write(ws.join(".spawn/acks/a.json"), "{}").expect("write");
+        let mut names = list(&ws, &path(".spawn/acks")).expect("listed");
+        names.sort();
+        assert_eq!(names, vec![b"a.json".to_vec(), b"b.json".to_vec()]);
+
+        // A symlink in place of the directory, or of a parent, is refused.
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("mkdir");
+        std::fs::write(elsewhere.join("x.json"), "{}").expect("write");
+        std::fs::remove_dir_all(ws.join(".spawn/acks")).expect("rm");
+        std::os::unix::fs::symlink(&elsewhere, ws.join(".spawn/acks")).expect("symlink");
+        assert!(matches!(
+            list(&ws, &path(".spawn/acks")),
+            Err(AgentFileError::NotRegular(_))
+        ));
+        std::fs::remove_file(ws.join(".spawn/acks")).expect("rm");
+        std::fs::remove_dir_all(ws.join(".spawn")).expect("rm");
+        std::os::unix::fs::symlink(&base, ws.join(".spawn")).expect("symlink");
+        assert!(list(&ws, &path(".spawn/acks")).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
