@@ -1218,3 +1218,31 @@ fn clipping_the_history_to_both_windows_changes_no_number() {
         card(&whole, window_hours(0, 48), None)
     );
 }
+
+/// Objective 47 (b): the card says whether its window is still settling,
+/// and the text form says so on its header line.
+#[test]
+fn a_settling_window_says_so_in_its_json_and_on_its_header_line() {
+    let history = small_card_story().history();
+    let mut settled = card(&history, window_hours(0, 48), None).expect("a card");
+    super::settle(&mut settled, false);
+    assert_eq!(settled["settling"], serde_json::Value::Bool(false));
+    let header = |card: &serde_json::Value| text(card).lines().next().map(str::to_string);
+    assert!(
+        !header(&settled).unwrap_or_default().contains("settling"),
+        "{:?}",
+        header(&settled)
+    );
+    let mut open = card(&history, window_hours(0, 48), None).expect("a card");
+    super::settle(&mut open, true);
+    assert_eq!(open["settling"], serde_json::Value::Bool(true));
+    assert!(
+        header(&open).unwrap_or_default().contains("settling"),
+        "{:?}",
+        header(&open)
+    );
+    // The figures are the same: settling says only that they may grow.
+    let mut figures = open.clone();
+    figures["settling"] = serde_json::Value::Bool(false);
+    assert_eq!(figures, settled);
+}
