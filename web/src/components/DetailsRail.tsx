@@ -237,7 +237,8 @@ export function RailContent({
             />
             <Field
               label="Objectives"
-              value={`${residentRsi.objectives.open} open · ${residentRsi.objectives.solved} solved · ${residentRsi.objectives.met} met · ${residentRsi.objectives.owner_judged} owner-judged`}
+              wrap
+              value={`${residentRsi.objectives.open} open · ${residentRsi.objectives.solved} solved · ${residentRsi.objectives.met} met · ${residentRsi.objectives.owner_judged} owner`}
             />
           </div>
         </Card>
@@ -246,11 +247,18 @@ export function RailContent({
   );
 }
 
-function Field({ label, value }: { label: string; value: ReactNode }) {
+/** A label and its value on one line; `wrap` lets a long value (a list of
+ * counts) take more lines instead of being cut off. */
+function Field({ label, value, wrap = false }: { label: string; value: ReactNode; wrap?: boolean }) {
   return (
     <div className="flex items-baseline justify-between gap-3">
       <span className="shrink-0 text-label text-muted-foreground">{label}</span>
-      <span className="min-w-0 truncate text-right text-label text-foreground">
+      <span
+        className={cx(
+          "min-w-0 text-right text-label text-foreground",
+          wrap ? "text-pretty" : "truncate",
+        )}
+      >
         {value}
       </span>
     </div>
