@@ -2362,7 +2362,10 @@ cp "$scenarios/protected" "$shortd/"
 shortd_release=$shortd/release
 rm -f "$shortd_release"
 releases="$releases $shortd_release"
-printf '#!/bin/sh\nn=0\nwhile [ ! -e %s ] && [ "$n" -lt 6000 ]; do sleep 0.1; n=$((n + 1)); done\nexit 0\n' \
+# On the base (value is one) it ends at once: it waited there as well, and
+# nothing lets it go before the gate has ended, so every run of the suite
+# spent the whole 600 s bound in this one base run.
+printf '#!/bin/sh\n[ "$(cat value)" != one ] || exit 0\nn=0\nwhile [ ! -e %s ] && [ "$n" -lt 6000 ]; do sleep 0.1; n=$((n + 1)); done\nexit 0\n' \
     "$shortd_release" >"$shortd/204.sh"
 printf '#!/bin/sh\nexit 1\n' >"$work/seed-task.sh"
 base=$saved_base
