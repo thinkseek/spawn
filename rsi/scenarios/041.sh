@@ -36,17 +36,20 @@
 #         ($3.00: in 7 d, not in 24 h, not today). $0.4855 in 24 h, $3.4855
 #         in 7 d.
 #     a2: x 100000 in, 10000 out ($0.45).
-#     a3 (after the alert): y 50000 in ($0.05).
+#     a3 (after the restart with bb-model-x's rates doubled, below): x 50000
+#         in ($0.30 at the new rates, $0.15 at the old).
 #   mission B, budget $1.00 a day:
 #     b1: x 10000 in, 2000 out ($0.06).
 #     b2: y 100 in, 10 out ($0.00015); z 5000 in, 500 out (not priced).
+#     b3: z 3000 in, 300 out (not priced: it ran on no priced model).
 # Checked:
 #   (1) per execution: after a1, b1 and b2 report, `GET /api/cost?window=7d`
 #       lists a1's execution with its four token counts and $3.4855, each
 #       repeated message counted once, by model (x $3.0855, y $0.40), the
 #       message timed before its task was assigned counted for that task; b2's
 #       execution costs $0.00015 and lists bb-model-z with its 5500 tokens
-#       and no cost (`usd` null), and the answer counts them unpriced.
+#       and no cost (`usd` null); b3's costs $0 with its 3300 tokens unpriced;
+#       the answer counts 8800 tokens unpriced.
 #   (2) the budget: the daily budgets set with `spawn mission configure
 #       --daily-usd` (A $0.50, B $1.00); while A has spent $0.4855 today
 #       ($3.4855 in 7 d: the budget is the day's), 10 s of readings raise no
@@ -61,15 +64,19 @@
 #       answer, shows the total and each mission, task and agent to the
 #       cent ("$1.00", "#A" "$0.94", "T<a1>" "$0.49"; 7 d "$4.00", "$3.94",
 #       "$3.49"), and b2's cost, which is not zero, as "<$0.01", never
-#       "$0.00". cost.ts and its imports must load with node alone; one that
-#       does not fails (4).
-#   (5) once only: a3 spends more in A, and the loop is restarted: still
-#       exactly one `cost_budget` alert for A and none for B, 10 s after
-#       each; the totals add a3's $0.05 once and nothing else (a restarted
-#       loop counts no message twice).
-#   (6) the setting is checked: `spawn loop` with SPAWN_MODEL_PRICES not
-#       JSON, or pricing a model at a negative rate, exits non-zero within
-#       15 s, naming the setting.
+#       "$0.00"; b3's row, which ran only on an unpriced model, reads
+#       "unpriced" (never "$0.00"), and the rows with unpriced use (b2, b3,
+#       the total) are marked so. cost.ts and its imports must load with node
+#       alone; one that does not fails (4).
+#   (5) priced when recorded, once only: the loop and serve are restarted
+#       with bb-model-x's rates doubled; 10 s later the totals are what they
+#       were (a message keeps the price it was recorded at, and a restarted
+#       loop counts no message twice); then a3 spends $0.30 in A at the new
+#       rates: still exactly one `cost_budget` alert for A and none for B,
+#       and the totals add a3's $0.30 once and nothing else.
+#   (6) the setting is checked: `spawn loop` and `spawn serve` with
+#       SPAWN_MODEL_PRICES not JSON, or pricing a model at a negative rate,
+#       exit non-zero within 15 s, naming the setting.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -446,22 +453,30 @@ for name in A B; do
     eval "mission_$name=\$id"
 done
 
-start_loop
 web=$WORK/web
 mkdir -p "$web"
 printf '<!doctype html><title>spawn</title>\n' >"$web/index.html"
-"$SPAWN_BIN" serve --address "127.0.0.1:0" --web "$web" >"$WORK/serve.log" 2>&1 &
-serve_pid=$!
-port=""
-i=0
-while [ "$i" -lt 100 ]; do
-    i=$((i + 1))
-    port=$(sed -n 's#^serve: http://[^ ]*:\([0-9][0-9]*\) .*#\1#p' "$WORK/serve.log" 2>/dev/null | head -n 1)
-    [ -n "$port" ] && break
-    sleep 0.1
-done
-[ -n "$port" ] || harness "serve did not start: $(head -c 400 "$WORK/serve.log")"
-base="http://127.0.0.1:$port"
+start_serve() {
+    "$SPAWN_BIN" serve --address "127.0.0.1:0" --web "$web" >"$WORK/serve.log" 2>&1 &
+    serve_pid=$!
+    port=""
+    i=0
+    while [ "$i" -lt 100 ]; do
+        i=$((i + 1))
+        port=$(sed -n 's#^serve: http://[^ ]*:\([0-9][0-9]*\) .*#\1#p' "$WORK/serve.log" 2>/dev/null | head -n 1)
+        [ -n "$port" ] && break
+        sleep 0.1
+    done
+    [ -n "$port" ] || harness "serve did not start: $(head -c 400 "$WORK/serve.log")"
+    base="http://127.0.0.1:$port"
+}
+stop_serve() {
+    kill "$serve_pid" 2>/dev/null || true
+    wait "$serve_pid" 2>/dev/null || true
+    serve_pid=""
+}
+start_loop
+start_serve
 code=$(get /api/missions "$WORK/missions.json")
 [ "$code" = 200 ] || harness "GET /api/missions answered $code: $(head -c 300 "$WORK/missions.json")"
 
@@ -471,7 +486,8 @@ bb-model-x 1000000 0 0 0 259200"
 assign b1 "$mission_B" "bb-model-x 10000 2000 0 0 0"
 assign b2 "$mission_B" "bb-model-y 100 10 0 0 0
 bb-model-z 5000 500 0 0 0"
-for label in a1 b1 b2; do
+assign b3 "$mission_B" "bb-model-z 3000 300 0 0 0"
+for label in a1 b1 b2 b3; do
     eval "task=\$task_$label"
     wait_until 150 reported "$task" ||
         harness "the task of worker $label was not reported within 150 s ($(q "select state from mission_tasks where id = $task"))"
@@ -504,7 +520,15 @@ b2_z=$(j 7d "[.executions[] | select(.agent == \"$agent_b2\") | .models[] | sele
 assert_eq "$(printf '%s' "$b2_z" | jq -r '.usd')" null "(1) the cost of b2's bb-model-z, a model SPAWN_MODEL_PRICES does not price"
 assert_eq "$(printf '%s' "$b2_z" | jq -r '.tokens | .input + .output + .cache_write + .cache_read')" 5500 "(1) b2's bb-model-z tokens"
 assert_usd "$(j 7d "[.executions[] | select(.agent == \"$agent_b2\") | .usd] | add")" 0.00015 "(1) b2's execution's cost (the priced model only)"
-assert_eq "$(j 7d '.total.unpriced_tokens')" 5500 "(1) the answer's unpriced tokens"
+unpriced_b3() { [ "$(j 7d "[.executions[]? | select(.agent == \"$agent_b3\") | .unpriced_tokens] | add")" = 3300 ]; }
+cost 7d "(1)"
+if ! unpriced_b3; then
+    sleep 10
+    cost 7d "(1)"
+fi
+assert_eq "$(j 7d "[.executions[] | select(.agent == \"$agent_b3\") | .unpriced_tokens] | add")" 3300 "(1) b3's unpriced tokens"
+assert_usd "$(j 7d "[.executions[] | select(.agent == \"$agent_b3\") | .usd] | add")" 0 "(1) the cost of b3's execution, on an unpriced model only"
+assert_eq "$(j 7d '.total.unpriced_tokens')" 8800 "(1) the answer's unpriced tokens"
 
 # --- (2) the budget ------------------------------------------------------------------
 
@@ -552,7 +576,7 @@ for row in \
     "24h missions mission $mission_B 0.06015" "7d missions mission $mission_B 0.06015" \
     "24h tasks task $task_a1 0.4855" "7d tasks task $task_a1 3.4855" \
     "24h tasks task $task_a2 0.45" "7d tasks task $task_a2 0.45" \
-    "24h tasks task $task_b1 0.06" "24h tasks task $task_b2 0.00015" \
+    "24h tasks task $task_b1 0.06" "24h tasks task $task_b2 0.00015" "24h tasks task $task_b3 0" \
     "24h agents agent $agent_a1 0.4855" "7d agents agent $agent_a1 3.4855" "24h agents agent $agent_a2 0.45" \
     "24h agents agent $agent_b1 0.06" "24h agents agent $agent_b2 0.00015" \
     "24h models model bb-model-x 0.5955" "7d models model bb-model-x 3.5955" \
@@ -562,8 +586,8 @@ for row in \
 done
 assert_eq "$(usd_of 24h models model bb-model-z)" null "(3) the 24 h cost of bb-model-z, not priced"
 assert_eq "$(j 24h '.total.tokens | [.input, .output, .cache_write, .cache_read] | map(tostring) | join(" ")')" \
-    "316100 54510 10000 50000" "(3) the 24 h tokens, input output cache_write cache_read"
-assert_eq "$(j 7d '.total.tokens.input')" 1316100 "(3) the 7 d input tokens"
+    "319100 54810 10000 50000" "(3) the 24 h tokens, input output cache_write cache_read"
+assert_eq "$(j 7d '.total.tokens.input')" 1319100 "(3) the 7 d input tokens"
 assert_eq "$(j 24h "[.tasks[] | select(.task == $task_a2) | .mission][0] | tostring")" "$mission_A" "(3) the mission of a2's task"
 assert_eq "$(j 7d "[.tasks[] | select(.task == $task_a1) | .mission][0] | tostring")" "$mission_A" "(3) the mission of a1's task"
 
@@ -581,11 +605,12 @@ import { pathToFileURL } from "node:url";
 const env = process.env;
 const { costView } = await import(pathToFileURL(`${env.BB_TREE}/web/src/cost.ts`).href);
 const answer = (window) => JSON.parse(readFileSync(`${env.BB_WORK}/cost-${window}.json`, "utf8"));
-const row = (rows, key) => {
+const one = (rows, key) => {
   const found = rows.filter((entry) => entry.key === key);
   assert.equal(found.length, 1, `one row ${key} in ${JSON.stringify(rows)}`);
-  return found[0].usd;
+  return found[0];
 };
+const row = (rows, key) => one(rows, key).usd;
 
 test("the page shows the 24 h cost to the cent, and a cost under a cent as <$0.01", () => {
   const view = costView(answer("24h"));
@@ -597,6 +622,12 @@ test("the page shows the 24 h cost to the cent, and a cost under a cent as <$0.0
   assert.equal(row(view.tasks, `T${env.BB_TB2}`), "<$0.01", "b2's task: not zero, so never $0.00");
   assert.equal(row(view.agents, env.BB_AA1), "$0.49", "a1");
   assert.equal(row(view.agents, env.BB_AB2), "<$0.01", "b2");
+  assert.equal(row(view.tasks, `T${env.BB_TB3}`), "unpriced", "b3's task, on an unpriced model only: never $0.00");
+  assert.equal(row(view.agents, env.BB_AB3), "unpriced", "b3");
+  assert.equal(one(view.tasks, `T${env.BB_TB3}`).unpriced, true, "b3's task is marked unpriced");
+  assert.equal(one(view.tasks, `T${env.BB_TB2}`).unpriced, true, "b2's task, part unpriced, is marked so");
+  assert.equal(one(view.tasks, `T${env.BB_TA1}`).unpriced, false, "a1's task, all priced, is not");
+  assert.equal(view.unpriced, true, "the total has unpriced use");
 });
 
 test("and the 7 d cost", () => {
@@ -609,7 +640,7 @@ test("and the 7 d cost", () => {
 });
 TEST
 if ! BB_TREE=$tree BB_WORK=$WORK BB_MA=$mission_A BB_MB=$mission_B BB_TA1=$task_a1 BB_TA2=$task_a2 \
-    BB_TB2=$task_b2 BB_AA1=$agent_a1 BB_AB2=$agent_b2 \
+    BB_TB2=$task_b2 BB_AA1=$agent_a1 BB_AB2=$agent_b2 BB_TB3=$task_b3 BB_AB3=$agent_b3 \
     node --test "$WORK/cost.test.mjs" >"$WORK/cost.out" 2>&1; then
     if grep -q "ERR_MODULE_NOT_FOUND\|SyntaxError\|ERR_UNKNOWN_FILE_EXTENSION\|ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX" "$WORK/cost.out"; then
         fail "(4) web/src/cost.ts does not load with node alone (relative .ts imports, import type for types, no packages, erasable TypeScript only): $(grep -m 3 'Error' "$WORK/cost.out" | tr '\n' ' ')"
@@ -619,46 +650,61 @@ fi
 
 # --- (5) once only -------------------------------------------------------------------------
 
-assign a3 "$mission_A" "bb-model-y 50000 0 0 0 0"
-wait_until 150 reported "$task_a3" ||
-    harness "the task of worker a3 was not reported within 150 s ($(q "select state from mission_tasks where id = $task_a3"))"
-wait_until 30 costs "$task_a3" 0.05 ||
-    fail "(5) a3's task does not cost \$0.05 within 30 s of its report: $(task_usd "$task_a3")"
-sleep 10
-same_day
-assert_eq "$(alerts_for "$mission_A")" 1 "(5) cost_budget alerts for mission A after it spent more"
+# bb-model-x's rates doubled; bb-model-y's as they were.
 stop_loop
+stop_serve
+SPAWN_MODEL_PRICES='{"bb-model-x":{"input":6,"output":30,"cache_write":7.5,"cache_read":0.6},"bb-model-y":{"input":1,"output":5,"cache_write":1.25,"cache_read":0.1}}'
 start_loop
-sleep 15
-same_day
-assert_eq "$(alerts_for "$mission_A")" 1 "(5) cost_budget alerts for mission A after the loop restarted"
-assert_eq "$(alerts_for "$mission_B")" 0 "(5) cost_budget alerts for mission B after the loop restarted"
+start_serve
+sleep 10
 cost 24h "(5)"
 cost 7d "(5)"
-assert_usd "$(j 24h .total.usd)" 1.04565 "(5) the 24 h total after a3 and the restart (a3's \$0.05 once, nothing twice)"
-assert_usd "$(j 7d .total.usd)" 4.04565 "(5) the 7 d total after a3 and the restart"
-assert_usd "$(usd_of 24h missions mission "$mission_A")" 0.9855 "(5) mission A's 24 h cost after the restart"
+assert_usd "$(j 24h .total.usd)" 0.99565 "(5) the 24 h total after the restart with new prices (each message keeps the price it was recorded at; none counted twice)"
+assert_usd "$(j 7d .total.usd)" 3.99565 "(5) the 7 d total after the restart with new prices"
+assert_usd "$(usd_of 7d tasks task "$task_a1")" 3.4855 "(5) a1's 7 d cost after the restart with new prices"
+assign a3 "$mission_A" "bb-model-x 50000 0 0 0 0"
+wait_until 150 reported "$task_a3" ||
+    harness "the task of worker a3 was not reported within 150 s ($(q "select state from mission_tasks where id = $task_a3"))"
+wait_until 30 costs "$task_a3" 0.30 ||
+    fail "(5) a3's task does not cost \$0.30 (bb-model-x at the new rates) within 30 s of its report: $(task_usd "$task_a3")"
+sleep 10
+same_day
+assert_eq "$(alerts_for "$mission_A")" 1 "(5) cost_budget alerts for mission A after the restart and more spending"
+assert_eq "$(alerts_for "$mission_B")" 0 "(5) cost_budget alerts for mission B after the restart"
+cost 24h "(5)"
+cost 7d "(5)"
+assert_usd "$(j 24h .total.usd)" 1.29565 "(5) the 24 h total after a3 (its \$0.30 once, nothing else)"
+assert_usd "$(j 7d .total.usd)" 4.29565 "(5) the 7 d total after a3"
+assert_usd "$(usd_of 24h missions mission "$mission_A")" 1.2355 "(5) mission A's 24 h cost after a3"
 assert_eq "$(j 24h '.total.tokens | [.input, .output, .cache_write, .cache_read] | map(tostring) | join(" ")')" \
-    "366100 54510 10000 50000" "(5) the 24 h tokens after the restart"
+    "369100 54810 10000 50000" "(5) the 24 h tokens after a3"
 
 # --- (6) the setting is checked --------------------------------------------------------------
 
 stop_loop
-for bad in 'not json' '{"bb-model-x":{"input":-1,"output":15,"cache_write":3.75,"cache_read":0.3}}'; do
-    SPAWN_MODEL_PRICES=$bad "$SPAWN_BIN" loop --repo "$repo" --root "$SPAWN_WORKSPACE_ROOT" >"$WORK/bad.log" 2>&1 &
+stop_serve
+for case in "loop:not json" 'loop:{"bb-model-x":{"input":-1,"output":15,"cache_write":3.75,"cache_read":0.3}}' \
+    "serve:not json" 'serve:{"bb-model-x":{"input":-1,"output":15,"cache_write":3.75,"cache_read":0.3}}'; do
+    which=${case%%:*}
+    bad=${case#*:}
+    if [ "$which" = loop ]; then
+        SPAWN_MODEL_PRICES=$bad "$SPAWN_BIN" loop --repo "$repo" --root "$SPAWN_WORKSPACE_ROOT" >"$WORK/bad.log" 2>&1 &
+    else
+        SPAWN_MODEL_PRICES=$bad "$SPAWN_BIN" serve --address "127.0.0.1:0" --web "$web" >"$WORK/bad.log" 2>&1 &
+    fi
     bad_pid=$!
     gone() { ! kill -0 "$bad_pid" 2>/dev/null; }
     if ! wait_until 15 gone; then
         kill "$bad_pid" 2>/dev/null || true
         wait "$bad_pid" 2>/dev/null || true
-        fail "(6) spawn loop with SPAWN_MODEL_PRICES='$bad' still runs after 15 s"
+        fail "(6) spawn $which with SPAWN_MODEL_PRICES='$bad' still runs after 15 s"
     fi
     rc=0
     wait "$bad_pid" || rc=$?
-    [ "$rc" -ne 0 ] || fail "(6) spawn loop with SPAWN_MODEL_PRICES='$bad' exited 0"
+    [ "$rc" -ne 0 ] || fail "(6) spawn $which with SPAWN_MODEL_PRICES='$bad' exited 0"
     grep -q SPAWN_MODEL_PRICES "$WORK/bad.log" ||
-        fail "(6) spawn loop with SPAWN_MODEL_PRICES='$bad' did not name the setting: $(head -c 300 "$WORK/bad.log")"
+        fail "(6) spawn $which with SPAWN_MODEL_PRICES='$bad' did not name the setting: $(head -c 300 "$WORK/bad.log")"
 done
 
-echo "041: each execution's usage is recorded once per message and priced by model; the API and the page give the cost per mission, task and agent over 24 h and 7 d to the cent; a mission over its daily budget raised one alert, still one after more spending and a restart"
+echo "041: each execution's usage is recorded once per message and priced by model when recorded; the API and the page give the cost per mission, task and agent over 24 h and 7 d to the cent, unpriced use marked, never \$0.00; a mission over its daily budget raised one alert, still one after a restart and more spending"
 exit 0
