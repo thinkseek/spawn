@@ -489,10 +489,10 @@ const TEST_DATABASE_LOG: &str = "SPAWN_TEST_DATABASE_LOG";
 /// default. The gate grows with every objective whose scenario it runs (an
 /// unsolved one runs twice on the base), so the bound is a setting: on
 /// 2026-11-06 a fixed 45 minutes aborted a healthy gate still in its
-/// regression phase, and three such aborts halt a mission. Keep it below the
-/// scratch age at which spawn-maintenance removes a gate's leftovers
-/// (SPAWN_MAINTENANCE_SCRATCH_AGE_MIN, 180 in
-/// deploy/systemd/spawn-maintenance.service), or a live gate's scratch could go.
+/// regression phase, and three such aborts halt a mission. spawn-maintenance
+/// keeps the scratch of a gate that runs, whatever this is (the gate's own
+/// record in its scratch, scripts/disk.sh); a scratch without that record
+/// goes by its age, which scripts/maintenance.sh never takes under this.
 fn gate_wall_clock() -> Duration {
     wall_clock_minutes(crate::config::env_value("SPAWN_GATE_WALL_CLOCK_MINUTES").as_deref())
 }

@@ -1,14 +1,22 @@
 #!/bin/sh
 # Tests of scripts/maintenance.sh on a throwaway TMPDIR and backups
-# directory: it removes only what Spawn made, and only what is old enough.
-# Prints one line per case and exits non-zero on the first failure.
+# directory: it removes only what Spawn made, and only what is old enough;
+# of the gate's scratch, only what its gate has left: a scratch whose gate
+# runs stays however old, one whose gate is gone goes however fresh (the
+# gate's record in it: pid, start time, boot), and one a process still has
+# open stays. Prints one line per case and exits non-zero on the first
+# failure.
 #
 # usage: scripts/test-maintenance.sh
 set -eu
 
 maintenance=$(cd "$(dirname "$0")" && pwd)/maintenance.sh
+# shellcheck source=scripts/disk.sh
+. "$(dirname "$0")/disk.sh"
 work=$(mktemp -d)
-trap 'chmod -R u+w "$work" 2>/dev/null; rm -rf "$work"' EXIT
+holders=""
+# shellcheck disable=SC2086 # the holders' pids, split
+trap 'kill $holders 2>/dev/null || :; chmod -R u+w "$work" 2>/dev/null; rm -rf "$work"' EXIT
 
 tmp=$work/tmp
 backups=$work/backups
@@ -28,6 +36,42 @@ echo y >"$tmp/spawn-gate.fil123"                     # a file, not a directory
 old "$tmp/spawn-gate.fil123"
 ln -s "$elsewhere" "$tmp/spawn-gate.lnk123"          # a symlink is not followed
 old "$tmp/spawn-gate.lnk123"
+
+# The gate's own record in its scratch (disk.sh, gate_scratch): the scratch
+# of a gate that runs stays, two days old as it is (a gate may run longer
+# than any age: issue #16, item 4); the scratch of a gate that is gone goes,
+# made a moment ago; so does one whose pid now belongs to another process
+# (another start time), and one from before a reboot. A record that does not
+# read as one, or from another pid namespace, proves nothing: by age, as a
+# scratch without one. A scratch whose gate is gone but in which a process
+# still has a file open stays.
+identity=$(proc_identity)
+sleep 600 &
+gate_pid=$!
+holders="$holders $gate_pid"
+record() { # <scratch> <pid> <start time> [<boot id and pid namespace>]
+    mkdir -p "$tmp/$1"
+    printf '%s %s %s\n' "$2" "$3" "${4:-$identity}" >"$tmp/$1/$GATE_SCRATCH_OWNER"
+}
+( : ) &
+dead_pid=$!
+wait "$dead_pid"
+record spawn-gate.live01 "$gate_pid" "$(proc_start "$gate_pid")"     # its gate runs
+old "$tmp/spawn-gate.live01"
+record spawn-gate.dead01 "$dead_pid" 12345                          # its gate is gone
+record spawn-gate.reuse1 "$gate_pid" "$(($(proc_start "$gate_pid") - 1))" # the pid is another process's now
+record spawn-gate.boot01 "$gate_pid" "$(proc_start "$gate_pid")" "00000000-0000-0000-0000-000000000000 ${identity#* }"
+record spawn-gate.junk01 "not a" record                             # no record: fresh, so it stays
+record spawn-gate.junk02 "not a" record                             # no record: old, so it goes
+old "$tmp/spawn-gate.junk02"
+record spawn-gate.ns0001 "$dead_pid" 12345 "${identity% *} pid:[1]" # another pid namespace: fresh, stays
+record spawn-gate.held01 "$dead_pid" 12345                          # gone, but a process has a file open in it
+echo log >"$tmp/spawn-gate.held01/log"
+( exec 3<"$tmp/spawn-gate.held01/log" && exec sleep 600 ) &
+holders="$holders $!"
+own=$(TMPDIR="$tmp" gate_scratch)                                   # this shell's, as a gate makes it
+old "$own"
+sleep 0.3
 
 # Backups: seven deploy dumps, pg-backup's own, and the owner's files.
 for ts in 20261101-010101 20261102-010101 20261103-010101 20261104-010101 \
@@ -103,13 +147,17 @@ expect "a dry run deletes nothing in TMPDIR" "$(listing "$tmp")" "$before_tmp"
 expect "nor in the backups" "$(listing "$backups")" "$before_backups"
 expect "nor in the base cache" "$(listing "$cache")" "$before_cache"
 expect "nor in the servers' templates" "$(listing "$servers")" "$before_servers"
-expect "it says what would go" "$(grep -c 'would remove' "$work/out")" "7"
+expect "it says what would go" "$(grep -c 'would remove' "$work/out")" "11"
+expect "gate_scratch records the shell that asked" "$(cat "$own/$GATE_SCRATCH_OWNER")" "$$ $(proc_start $$) $identity"
+expect "and that record proves it runs" "$(gate_scratch_owner "$own")" "alive"
 
 status=0
 run || status=$?
 expect "a run succeeds" "$status" "0"
-expect "only the old gate scratch directory goes" "$(listing "$tmp")" \
-    "other-project spawn-gate-other spawn-gate.def456 spawn-gate.fil123 spawn-gate.lnk123 spawn-gate.toolong1 "
+expect "only the old gate scratch directory goes, and those whose gate is gone" "$(listing "$tmp")" \
+    "other-project spawn-gate-other ${own##*/} spawn-gate.def456 spawn-gate.fil123 spawn-gate.held01 spawn-gate.junk01 spawn-gate.live01 spawn-gate.lnk123 spawn-gate.ns0001 spawn-gate.toolong1 "
+expect "it counts the scratch whose gate runs" "$(grep -c 'kept 2 whose gate runs' "$work/out")" "1"
+expect "and names the one a process still uses" "$(grep -c "kept $tmp/spawn-gate.held01: its gate is gone, but a process still uses it" "$work/out")" "1"
 expect "a symlink's target is untouched" "$(listing "$elsewhere")" "keep "
 expect "the newest five deploy dumps stay, and every other file" "$(listing "$backups")" \
     "missions-20261104T1126.sql pg-backup.state spawn-20261101-000000.dump spawn-20261101-010101.dump.gpg spawn-20261103-010101.dump spawn-20261104-010101.dump spawn-20261104T1401 spawn-20261105-010101.dump spawn-20261106-010101.dump spawn-20261107-010101.dump spawn-auto-20261101-000000.dump spawn-auto-20261102-000000.dump spawn-full-20261104T1216.dump "
@@ -124,6 +172,28 @@ expect "with its ready" "$(listing "$servers/a$(printf '%s' "$hex" | cut -c2-)")
 after_backups=$(listing "$backups")
 run || status=$?
 expect "a second run removes nothing more" "$(listing "$backups")" "$after_backups"
+
+# The age is for a scratch without a record only, and never under the
+# gate's wall clock: at the unit's old 180 minutes the live gate's scratch,
+# two days old, still stays; a scratch without a record that is 4 hours old
+# goes at 180, and stays when a gate may run 300.
+mkdir "$tmp/spawn-gate.four01"
+touch -d '4 hours ago' "$tmp/spawn-gate.four01"
+run SPAWN_MAINTENANCE_SCRATCH_AGE_MIN=180 SPAWN_GATE_WALL_CLOCK_MINUTES=300
+expect "a scratch without a record stays for as long as a gate may run" \
+    "$(listing "$tmp" | tr ' ' '\n' | grep -c -e 'spawn-gate.four01' -e 'spawn-gate.live01')" "2"
+run SPAWN_MAINTENANCE_SCRATCH_AGE_MIN=180
+expect "past the age it goes, and a running gate's scratch stays at any age" \
+    "$(listing "$tmp" | tr ' ' '\n' | grep -e 'spawn-gate.four01' -e 'spawn-gate.live01' | tr '\n' ' ')" "spawn-gate.live01 "
+# shellcheck disable=SC2086
+kill $holders 2>/dev/null || true
+# shellcheck disable=SC2086
+wait $holders 2>/dev/null || true
+holders=""
+run
+expect "once the gate and the holder are gone, their scratch goes" \
+    "$(listing "$tmp" | tr ' ' '\n' | grep -c -e 'spawn-gate.live01' -e 'spawn-gate.held01' || true)" "0"
+expect "this shell's own scratch stays: it runs" "$(ls -d "$own")" "$own"
 
 status=0
 run SPAWN_MAINTENANCE_SCRATCH_AGE_MIN=old SPAWN_MAINTENANCE_KEEP_DUMPS=2 || status=$?
