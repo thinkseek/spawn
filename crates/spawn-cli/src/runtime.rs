@@ -54,6 +54,18 @@ pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
     let transcripts = spawn_host::LocalTranscriptArchive::new(
         std::path::Path::new(&root).join(spawn_host::TRANSCRIPT_DIRECTORY),
     );
+    // This Bridge types each message's marker: the first loop that did
+    // is recorded once (`host.messages_marked`), from when a command never
+    // typed is a message whose taking is tracked (crate::alerts,
+    // `message_not_taken`). A login that may not record it types the
+    // markers all the same.
+    let marked = serde_json::json!({
+        "type": "host.messages_marked",
+        "started_at_ms": store.now_ms().unwrap_or_default(),
+    });
+    if let Err(error) = store.host_record(&marked) {
+        eprintln!("spawn: host.messages_marked: {error}");
+    }
     let mut bridge = Bridge::new(
         Arc::clone(&log),
         queue,

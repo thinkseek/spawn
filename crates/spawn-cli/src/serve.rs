@@ -154,6 +154,8 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
     // The loop records costs at these prices; a page served beside a setting
     // that cannot be read would show figures nobody can trust, so it stops.
     crate::cost::Prices::from_env()?;
+    // Read once, here, so a bad value is warned of at start.
+    crate::config::message_taken_ms();
     let open = open_networks(env_value("SPAWN_SERVE_OPEN_NETWORKS").as_deref())?;
     let server = Server::http(&address).map_err(|error| format!("listen {address}: {error}"))?;
     let guard = match (&token, open.is_empty()) {
@@ -1684,7 +1686,9 @@ fn fleet_session(rest: &str, query: &str) -> Result<Value, String> {
     let store = open_store()?;
     match what {
         "judgements" => store.judgements_json(session.as_str(), limit).map_err(err),
-        "commands" => store.commands_json(session.as_str(), limit).map_err(err),
+        "commands" => store
+            .commands_json(session.as_str(), limit, crate::config::message_taken_ms())
+            .map_err(err),
         other => Err(format!("{BAD_REQUEST}unknown fleet view {other}")),
     }
 }
@@ -2844,7 +2848,7 @@ mod tests {
         in_test_schema(|owner, store| {
             let commands = || {
                 store
-                    .commands_json("session_supervisor", 50)
+                    .commands_json("session_supervisor", 50, 120_000)
                     .expect("commands")
             };
             let to = |token, open, headers: &str, path: &str, body: &str| {
@@ -2951,7 +2955,7 @@ mod tests {
         in_test_schema(|owner, store| {
             let commands = || {
                 store
-                    .commands_json("session_supervisor", 50)
+                    .commands_json("session_supervisor", 50, 120_000)
                     .expect("commands")
             };
             let to = |path: &str, body: &str| {

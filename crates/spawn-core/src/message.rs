@@ -1,0 +1,89 @@
+//! A message into an agent, tracked by its id (docs/fleet-architecture.md
+//! §3.4, "Messages").
+//!
+//! What Spawn types into an engine for a command (an input, a start or a
+//! resume with a prompt) is a message, and its id is the command's. The text
+//! the Bridge types ends with the command's marker, `[spawn message #<id>]`,
+//! on a line of its own after the text (the workspace notices before the
+//! text are part of the same message). A text of one line carries it at the
+//! end of that line instead, after a space, when it is a start's or a
+//! resume's prompt (typed as the engine comes up) or goes into a pane whose
+//! program reads keys raw ([`crate::port::TerminalHost::reads_lines`]
+//! false): such a program, unless it asked for a bracketed paste, takes each
+//! pasted line break as Enter, and would take the marker as a prompt of its
+//! own. The engine's transcript keeps what it
+//! was given, so the transcript's user line that holds the marker is the
+//! message taken (`message.taken`, crate::ingest), whatever its text: two
+//! messages with the same text are told apart by their ids, never by the
+//! text or the order.
+
+use crate::id::CommandId;
+
+/// What opens a marker.
+const OPEN: &str = "[spawn message #";
+
+/// The marker of `command`: `[spawn message #<id>]`.
+pub fn marker(command: CommandId) -> String {
+    format!("{OPEN}{}]", command.0)
+}
+
+/// `text` as the Bridge types it for `command`: the text, then its marker on
+/// a line of its own; after a space when `one_line` (a prompt that starts
+/// an engine, or a pane that reads keys raw) and the text is one line.
+pub fn marked(text: &str, command: CommandId, one_line: bool) -> String {
+    if one_line && !text.contains('\n') {
+        format!("{text} {}", marker(command))
+    } else {
+        format!("{text}\n\n{}", marker(command))
+    }
+}
+
+/// The commands whose markers `text` holds, in the order they appear, each
+/// once.
+pub fn markers(text: &str) -> Vec<CommandId> {
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(OPEN) {
+        rest = &rest[at + OPEN.len()..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0
+            && rest[digits..].starts_with(']')
+            && let Ok(id) = rest[..digits].parse::<u64>()
+        {
+            let id = CommandId(id);
+            if !found.contains(&id) {
+                found.push(id);
+            }
+        }
+    }
+    found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_marked_text_ends_with_its_marker_on_its_own_line_or_one_lines_end() {
+        let text = marked("do the task", CommandId(42), false);
+        assert_eq!(text, "do the task\n\n[spawn message #42]");
+        assert_eq!(markers(&text), [CommandId(42)]);
+        let several = marked("notice\n\ndo the task", CommandId(43), true);
+        assert_eq!(several, "notice\n\ndo the task\n\n[spawn message #43]");
+        let line = marked("do the task", CommandId(7), true);
+        assert_eq!(line, "do the task [spawn message #7]");
+        assert_eq!(markers(&line), [CommandId(7)]);
+    }
+
+    #[test]
+    fn markers_are_read_by_id_and_a_malformed_one_is_none() {
+        assert_eq!(markers("no marker here"), []);
+        assert_eq!(markers("[spawn message #]"), []);
+        assert_eq!(markers("[spawn message #12"), []);
+        assert_eq!(markers("[spawn message #x1]"), []);
+        assert_eq!(
+            markers("a\n[spawn message #7]\nb\n[spawn message #9] [spawn message #7]"),
+            [CommandId(7), CommandId(9)]
+        );
+    }
+}

@@ -10,6 +10,7 @@ pub mod id;
 pub mod ingest;
 #[cfg(feature = "testing")]
 pub mod memory;
+pub mod message;
 pub mod mission;
 pub mod observation;
 pub mod observe;

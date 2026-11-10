@@ -34,6 +34,7 @@ import {
 } from "../../fleet";
 import { clockTime, formatDuration, relativeTime } from "../../format";
 import { commandSummary, foldCommands, inputAt, inputLeads, principalWords } from "../../commands";
+import { messageLine } from "../../messages.ts";
 import { doingWords } from "../../home";
 import { forHowLong, historyClock, judgementLine, judgementRuns, judgementSpeaks, runLabel, summaryTask } from "../../agentPage";
 import type { HeldTask, JudgementRun } from "../../agentPage";
@@ -1208,6 +1209,7 @@ function CommandList({
  * (a digest's items, not its header); the whole text opens below. */
 function CommandItem({ record }: { record: CommandRecord }) {
   const gist = commandSummary(record.action, record.text);
+  const line = messageLine(record);
   return (
     <li className="px-4 py-2">
       <div className="flex flex-wrap items-center gap-2 text-caption">
@@ -1220,6 +1222,14 @@ function CommandItem({ record }: { record: CommandRecord }) {
         <PrincipalBadge principal={record.principal} />
         <span className="font-mono text-foreground">{record.action}</span>
         <CommandOutcome record={record} />
+        {line && (
+          <span
+            className={record.message?.not_taken ? "text-warning" : "text-faint-foreground"}
+            title="The message this command typed, by its id: typed, taken by the engine, answered"
+          >
+            {line}
+          </span>
+        )}
         {record.created_at_ms != null && record.finished_at_ms != null && (
           <span className="tnum text-faint-foreground">
             {formatDuration(record.finished_at_ms - record.created_at_ms)}

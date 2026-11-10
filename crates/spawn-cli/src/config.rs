@@ -13,6 +13,48 @@ pub(crate) fn env_value(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+/// How long a message may go untaken before it is said not taken
+/// (objective 045): `SPAWN_MESSAGE_TAKEN_SECS`, whole seconds, default
+/// [`MESSAGE_TAKEN_SECS`].
+pub(crate) const MESSAGE_TAKEN_SECS: u64 = 120;
+
+/// The bound `text` (`SPAWN_MESSAGE_TAKEN_SECS`) sets, in milliseconds, and
+/// the warning a value that is no whole number of seconds gets (the default
+/// is used).
+pub(crate) fn message_taken_bound(text: Option<&str>) -> (i64, Option<String>) {
+    let default = MESSAGE_TAKEN_SECS.saturating_mul(1000).cast_signed();
+    let Some(text) = text else {
+        return (default, None);
+    };
+    match text.trim().parse::<u64>() {
+        Ok(secs) => (
+            i64::try_from(secs.saturating_mul(1000)).unwrap_or(i64::MAX),
+            None,
+        ),
+        Err(_) => (
+            default,
+            Some(format!(
+                "SPAWN_MESSAGE_TAKEN_SECS: {text:?} is not a whole number of seconds; using \
+                 {MESSAGE_TAKEN_SECS}"
+            )),
+        ),
+    }
+}
+
+/// The bound of a message not taken, from the environment, read once per
+/// process: a bad value is warned of once.
+pub(crate) fn message_taken_ms() -> i64 {
+    static BOUND: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *BOUND.get_or_init(|| {
+        let (bound, warning) =
+            message_taken_bound(env_value("SPAWN_MESSAGE_TAKEN_SECS").as_deref());
+        if let Some(warning) = warning {
+            eprintln!("spawn warning: {warning}");
+        }
+        bound
+    })
+}
+
 pub(crate) fn env_or(name: &str, fallback: &str) -> String {
     env_value(name).unwrap_or_else(|| fallback.to_string())
 }
@@ -127,6 +169,20 @@ pub(crate) fn loop_interval() -> std::time::Duration {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_message_bound_is_whole_seconds_and_a_bad_value_is_the_default_said() {
+        use super::message_taken_bound;
+        assert_eq!(message_taken_bound(None), (120_000, None));
+        assert_eq!(message_taken_bound(Some("6")), (6_000, None));
+        assert_eq!(message_taken_bound(Some(" 0 ")), (0, None));
+        for bad in ["1.5", "-3", "two", "6s"] {
+            let (bound, warning) = message_taken_bound(Some(bad));
+            assert_eq!(bound, 120_000, "{bad}");
+            let warning = warning.expect("a bad value is said");
+            assert!(warning.contains("SPAWN_MESSAGE_TAKEN_SECS"), "{warning}");
+        }
+    }
+
     use super::*;
 
     #[test]
