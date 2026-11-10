@@ -1363,7 +1363,15 @@ the tree's own:
   stops no landing; on the candidate a regression that exits 6 is skipped,
   never passed or failed, and the task scenario that exits 6 states the
   fact: `host_fault` with the evidence `cannot_judge`, never a rejection and
-  never an abort (§10.3). Exit 6 with neither fact is an abort, as is any
+  never an abort (§10.3). The gate states the same fact itself, in its
+  first seconds, when the sandbox lacks a prerequisite a scenario or check
+  declares (a line `# needs: controller:<path>`, `tool:<name>` or an
+  absolute path, read without running the file; `check-web` declares the
+  controller's `web/node_modules/`): all of them are asked for in one
+  sandbox after the static checks, before the base's build and any
+  scenario, and a missing one is `cannot_judge` with the scenario and the
+  `prerequisite` (gate.sh "Preflight"). A file the tree under test may lack
+  is that tree's result, never a prerequisite. Exit 6 with neither fact is an abort, as is any
   other status: exit 3 (no bwrap, a missing bind directory, an unreadable
   `TMPDIR`, a floor that is not whole GiB, the gate's own tree under `/tmp`,
   `/run` or `/var/tmp` — itself or below it — or under the host's `TMPDIR`

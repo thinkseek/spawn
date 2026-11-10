@@ -3454,4 +3454,67 @@ expect "as its own task's scenario it is judged: accepted" \
     "$(judge "$good" "$only/082.sh" "$only")" 'exit=0 {"verdict":"accepted"'
 expect "run as the task's" "$(cat "$work/gate.out")" 'candidate: 082.sh must pass'
 
+# 26. Preflight (GitHub issue #47): a scenario or check declares what it
+# needs of the host (`# needs: controller:<path>`, `tool:<name>`, an absolute
+# path), and the gate asks for all of it in one sandbox before the base's
+# build and before any scenario: a missing one is `cannot_judge` (exit 6)
+# naming the scenario and the prerequisite, in seconds, where the check
+# itself would have failed for it at the end of the gate (an owner gate,
+# 2026-11-10: check-web.sh, no node_modules, 11 ms, 55 minutes in). The
+# controller is under $HOME here, as a real one is: the sandbox shows of it
+# only `scripts` and `web/node_modules`, so a path that is on the host and
+# not in the sandbox is missing too.
+pre_controller=$HOME/pre-controller
+pre=$pre_controller/rsi/scenarios
+mkdir -p "$pre" "$pre_controller/web/elsewhere"
+cp "$scenarios/build" "$scenarios/protected" "$pre/"
+printf '#!/bin/sh\necho "301 ran"\n[ -f built ]\n' >"$pre/301.sh"
+cat >"$pre/check-needy.sh" <<'EOF_NEEDY'
+#!/bin/sh
+# What it needs of the host:
+# needs: controller:web/node_modules/ tool:sh
+# needs: /bin
+echo "check-needy ran"
+[ -d "$(dirname "$0")/../../web/node_modules" ]
+EOF_NEEDY
+started=$(date +%s)
+expect "a missing prerequisite is no verdict: cannot_judge, naming the scenario and the prerequisite" \
+    "$(judge "$good" "" "$pre")" \
+    'exit=6 {"cannot_judge":true,"scenario":"check-needy.sh","runs":"none: a prerequisite is missing","prerequisite":"controller:web/node_modules/"}'
+expect "in seconds, not after the scenarios" \
+    "$([ $(($(date +%s) - started)) -lt 30 ] && echo quick) ($(($(date +%s) - started)) s)" quick
+expect "the log names both and where it looked" "$(cat "$work/gate.out")" \
+    "| preflight: check-needy.sh needs controller:web/node_modules/ ($pre_controller/web/node_modules/), which the sandbox does not show"
+refuse "nothing was built" "$(cat "$work/gate.out")" '| == base: build'
+refuse "no scenario ran on the base" "$(cat "$work/gate.out")" '| == base: 301.sh'
+refuse "nor on the candidate" "$(cat "$work/gate.out")" ' ran'
+expect "the stdout's last line is the fact too" "$(tail -n 1 "$work/gate.out")" '{"cannot_judge":true,"scenario":"check-needy.sh"'
+expect "a warm (--base-only) runs objectives only: the check's prerequisite is not its business" \
+    "$(SPAWN_GATE_VERDICT=$integrator/verdict sh "$gate" --base-only "$repo" "$base" "$pre" >"$work/gate.out" 2>&1 && echo exit=0 || echo "exit=$?")" 'exit=0'
+mkdir -p "$pre_controller/web/node_modules"
+expect "with the prerequisite there the gate judges as before" "$(judge "$good" "" "$pre")" \
+    'exit=0 {"verdict":"accepted"}'
+expect "and says the preflight found nothing missing" "$(cat "$work/gate.out")" \
+    '| preflight: nothing missing (prerequisites declared: 3, by scenarios: 1)'
+expect "the check ran" "$(cat "$work/gate.out")" '| check-needy ran'
+# On the host and not in the sandbox: missing, as the scenario would find it.
+sed -i 's|^# needs: /bin$|# needs: controller:web/elsewhere/|' "$pre/check-needy.sh"
+expect "a path the host has and the sandbox does not show is missing" "$(judge "$good" "" "$pre")" \
+    'exit=6 {"cannot_judge":true,"scenario":"check-needy.sh","runs":"none: a prerequisite is missing","prerequisite":"controller:web/elsewhere/"}'
+sed -i 's|^# needs: controller:web/elsewhere/$|# needs: tool:no-such-tool-of-the-gate|' "$pre/check-needy.sh"
+expect "a tool that is not on PATH is missing" "$(judge "$good" "" "$pre")" \
+    '"prerequisite":"tool:no-such-tool-of-the-gate"}'
+# An objective's prerequisite stops a warm too: no verdict file, exit 4.
+printf '#!/bin/sh\n# needs: tool:no-such-tool-of-the-gate\n[ -f built ]\n' >"$pre/302.sh"
+expect "an objective's missing prerequisite ends a warm (exit 4)" \
+    "$(SPAWN_GATE_VERDICT=$integrator/verdict sh "$gate" --base-only "$repo" "$base" "$pre" >"$work/gate.out" 2>&1 && echo exit=0 || echo "exit=$?")" 'exit=4'
+expect "which says what is missing" "$(cat "$work/gate.out")" \
+    '| preflight: 302.sh needs tool:no-such-tool-of-the-gate, which the sandbox does not show'
+rm -f "$pre/302.sh"
+# A word the gate cannot read is the owner's to correct, never guessed at.
+sed -i 's|^# needs: tool:no-such-tool-of-the-gate$|# needs: web/node_modules|' "$pre/check-needy.sh"
+expect "a prerequisite in no known form is an abort (exit 3)" "$(judge "$good" "" "$pre")" 'exit=3 '
+expect "which names the line" "$(cat "$work/gate.out")" \
+    '`# needs: web/node_modules` is not controller:<path>, tool:<name> or an absolute path'
+
 echo "gate: all cases pass"
