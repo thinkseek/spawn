@@ -702,7 +702,7 @@ select count(*)
 pub(crate) const OBJECTIVE_FORK: &str = r"
 select coalesce((
   select jsonb_build_object('task', p.id, 'commit', c.commit)
-         || case when p.id = k.reassign_of then '{"reassign": true}'::jsonb
+         || case when p.id = k.reassign_of then jsonb_build_object('reassign', true)
                  else '{}'::jsonb end
     from mission_tasks k
     join mission_tasks p on p.mission_id = k.mission_id
