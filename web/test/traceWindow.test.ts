@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { TimelineEvent } from "../src/api.ts";
-import { LINEAR } from "../src/timeFold.ts";
+import { foldIdle, LINEAR, sameFoldMap } from "../src/timeFold.ts";
 import { refollow } from "../src/timeWindow.ts";
 import type { Follow } from "../src/timeWindow.ts";
 import { deriveTrace } from "../src/trace.ts";
@@ -280,4 +280,42 @@ test("a break is never wider than the shortest gap that folds (rev-f F2)", () =>
 test("counts say what is running first, then what is done", () => {
   assert.equal(spanCounts(twoRuns(true)), "3 running · 3 done");
   assert.equal(spanCounts(twoRuns(false)), "6 done");
+});
+
+test("a live fold rebuilt a tick later is the same map; a new break or band width is not (rev-f F4)", () => {
+  // Two bursts of tool work an hour apart, the last one still running.
+  const intervals = (end: number) => [
+    [T0, T0 + M],
+    [T0 + H, end],
+  ] as const;
+  const tick = foldIdle(intervals(T0 + H + 5 * S), { minGap: TRACE_MIN_GAP_MS, keep: 2 ** 16 });
+  const next = foldIdle(intervals(T0 + H + 6_000), { minGap: TRACE_MIN_GAP_MS, keep: 2 ** 16 });
+  assert.notEqual(tick, next);
+  assert.ok(sameFoldMap(tick, next), "only the live end moved");
+  for (const time of [T0 - 1, T0 + 30_000, T0 + 30 * M, T0 + H + 5_500]) {
+    assert.equal(next.fold(time), tick.fold(time), "and it maps every time alike");
+  }
+  const halved = foldIdle(intervals(T0 + H + 6_000), { minGap: TRACE_MIN_GAP_MS, keep: 2 ** 15 });
+  assert.ok(!sameFoldMap(tick, halved), "a new band width moves the times after the break");
+  const another = foldIdle([...intervals(T0 + 3 * H), [T0 + 3 * H + 20 * M, T0 + 3 * H + 21 * M]], {
+    minGap: TRACE_MIN_GAP_MS,
+    keep: 2 ** 16,
+  });
+  assert.ok(!sameFoldMap(tick, another), "a new break moves them");
+  // One break, the same keep, but moved: its end (the second burst later),
+  // or its start (the first burst longer).
+  const later = foldIdle([[T0, T0 + M], [T0 + 2 * H, T0 + 2 * H + 6 * S]], { minGap: TRACE_MIN_GAP_MS, keep: 2 ** 16 });
+  assert.ok(!sameFoldMap(tick, later), "a break that ends later");
+  const longer = foldIdle([[T0, T0 + 2 * M], [T0 + H, T0 + H + 6 * S]], { minGap: TRACE_MIN_GAP_MS, keep: 2 ** 16 });
+  assert.ok(!sameFoldMap(tick, longer), "a break that starts later");
+  // The trace's own fold, as TraceView builds it each second while a tool
+  // runs: same map tick to tick, so the window is not refolded.
+  const live = twoRuns(true);
+  const at = (end: number) => traceFold(live, end, { plotW: 800 });
+  assert.ok(sameFoldMap(at(T0 + 5 * H + 10 * S), at(T0 + 5 * H + 11 * S)));
+  assert.equal(at(T0 + 5 * H + 10 * S).breaks.length, 1);
+  // With no break every fold is the identity, LINEAR included.
+  assert.ok(sameFoldMap(LINEAR, foldIdle([[T0, T0 + 1_000]])));
+  assert.ok(sameFoldMap(LINEAR, { ...LINEAR, keep: 2 ** 16 }), "whatever its keep");
+  assert.ok(!sameFoldMap(LINEAR, tick));
 });

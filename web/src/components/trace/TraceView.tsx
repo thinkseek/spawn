@@ -6,7 +6,7 @@ import type { KeyboardEvent, MouseEvent, PointerEvent, ReactNode } from "react";
 import type { TimelineEvent } from "../../api";
 import { pairs } from "../../eventFormat";
 import { clockTime, formatDuration } from "../../format";
-import { LINEAR } from "../../timeFold";
+import { LINEAR, sameFoldMap } from "../../timeFold";
 import { fitDomain } from "../../timeWindow";
 import { chainOf, deriveTrace, foldRuns, rowText, runEnd, spanEnd, visibleSpans } from "../../trace";
 import type { KnownCommand, KnownExecution, Span, SpanKind, Trace, TraceMarker } from "../../trace";
@@ -156,14 +156,16 @@ export function TraceView({
     },
     [trace, fold, traceEnd, view],
   );
-  // The window is kept on the folded axis; when the fold changes (the Linear
-  // toggle, a live session's new break or band width), move it to the same
-  // real times on the new one, before the frame is drawn.
+  // The window is kept on the folded axis; when the fold's map changes (the
+  // Linear toggle, a live session's new break or band width), move it to
+  // the same real times on the new one, before the frame is drawn. Only
+  // then: a live trace rebuilds its fold every second with the same map
+  // (sameFoldMap), and moving nothing each tick is what it should do.
   const shownFold = useRef(fold);
   const { refold } = view;
   useLayoutEffect(() => {
     const old = shownFold.current;
-    if (old === fold) return;
+    if (sameFoldMap(old, fold)) return;
     shownFold.current = fold;
     refold((time) => fold.fold(old.unfold(time)));
   }, [fold, refold]);

@@ -77,23 +77,32 @@ export function useTimeWindow(
   }, []);
 
   const glide = useRef<AnimationPlaybackControls | null>(null);
+  // The running glide's two windows, read on each frame, so a refold can
+  // move them to the new axis and the glide still lands where it meant to.
+  const glideEnds = useRef<{ from: Domain; target: Domain } | null>(null);
   const stop = useCallback(() => glide.current?.stop(), []);
   const glideTo = useCallback(
     (target: Domain) => {
       glide.current?.stop();
-      const from = latest.current.domain;
       if (reduceMotion) {
         setDomain(target);
         return;
       }
+      const ends = { from: latest.current.domain, target };
+      glideEnds.current = ends;
       glide.current = animate(0, 1, {
         duration: 0.32,
         ease: [0.2, 0.8, 0.2, 1],
-        onUpdate: (t) =>
+        onUpdate: (t) => {
+          const { from, target: to } = ends;
           setDomain({
-            from: from.from + (target.from - from.from) * t,
-            to: from.to + (target.to - from.to) * t,
-          }),
+            from: from.from + (to.from - from.from) * t,
+            to: from.to + (to.to - from.to) * t,
+          });
+        },
+        onComplete: () => {
+          if (glideEnds.current === ends) glideEnds.current = null;
+        },
       });
     },
     [reduceMotion, setDomain],
@@ -119,8 +128,14 @@ export function useTimeWindow(
     glide.current?.stop();
     setFollow({ mode: "since", from });
   }, []);
+  // A glide in flight is moved to the new axis, not stopped (rev-f F4).
   const refold = useCallback((map: (time: number) => number) => {
-    glide.current?.stop();
+    const ends = glideEnds.current;
+    if (ends) {
+      const moved = (domain: Domain) => ({ from: map(domain.from), to: map(domain.to) });
+      ends.from = moved(ends.from);
+      ends.target = moved(ends.target);
+    }
     setFollow((current) => refollow(current, map));
   }, []);
 
