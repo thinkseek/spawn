@@ -158,7 +158,8 @@
 #   candidate that edits a scenario is run on it all the same);
 # - it is not on the `serial` list (a load-sensitive result is that run's
 #   own), not the task's scenario, not a check, and neither it nor a file
-#   it names reads SPAWN_BASELINE_TREE, runs cargo or reads target/.
+#   it names reads SPAWN_BASELINE_TREE, runs cargo or reads target/, by
+#   that name or as CARGO_TARGET_DIR or the directory of SPAWN_BIN.
 # SPAWN_GATE_REUSE=0 turns it off: every regression is run.
 #
 # A tree that is not Spawn names its owner-installed inputs (dependencies the
@@ -3271,6 +3272,14 @@ if [ -s "$work/needs" ]; then
             *) need_where="" ;;
             esac
             echo "| preflight: $needy needs $need$need_where, which the sandbox does not show"
+            # And once more as a scenario says it, which is the only form
+            # the integrator quotes as the cause (integrate.rs
+            # cannot_judge_cause: a line outside any block that begins
+            # with the scenario's name up to its first dot and says "cannot
+            # judge"). Without it the record read "the gate's log gives no
+            # cause", the kind that sent task 208's supervisor after a
+            # cause nobody had seen (rev-f N1 on gate-fast).
+            echo "| ${needy%%.*}: cannot judge here: the sandbox does not show $need$need_where"
         done <"$work/needs.lacking"
         echo "| preflight: a prerequisite is missing on this host: no build and no scenario was started;" \
             "a fact about the host, not a verdict on the candidate"
@@ -3968,7 +3977,12 @@ reuse_plan() {
     # What no declaration can make reusable, read off the text of the
     # scenario and every file it names, as a seed's is (seed_plan): on the
     # candidate SPAWN_BASELINE_TREE is another tree than the one under test,
-    # and cargo and target/ are another build than `spawn`.
+    # and cargo and target/ are another build than `spawn`. Here the
+    # build's directory is refused by its other names too, which the seed's
+    # words miss (`cargo` is not CARGO, and neither holds `target/`):
+    # CARGO_TARGET_DIR, which every run is given, and the directory of
+    # SPAWN_BIN. A false `# reads: binary` on a scenario that runs another
+    # binary of the tree would get past the belt by either (rev-f N2).
     depends_on "$1" >/dev/null
     while IFS= read -r reuse_file; do
         [ -f "$reuse_file" ] || continue
@@ -3978,6 +3992,10 @@ reuse_plan() {
         fi
         if grep -qE '(^|[^A-Za-z0-9_])cargo([^A-Za-z0-9_-]|$)|target/' -- "$reuse_file"; then
             reuse_not="${reuse_file#"$scenarios"/} runs cargo or reads target/"
+            return 0
+        fi
+        if grep -qE 'CARGO_TARGET_DIR|dirname[^|;&]*SPAWN_BIN' -- "$reuse_file"; then
+            reuse_not="${reuse_file#"$scenarios"/} names the build's directory (CARGO_TARGET_DIR, or SPAWN_BIN's)"
             return 0
         fi
     done <"$work/deps.files"

@@ -3485,6 +3485,12 @@ expect "in seconds, not after the scenarios" \
     "$([ $(($(date +%s) - started)) -lt 30 ] && echo quick) ($(($(date +%s) - started)) s)" quick
 expect "the log names both and where it looked" "$(cat "$work/gate.out")" \
     "| preflight: check-needy.sh needs controller:web/node_modules/ ($pre_controller/web/node_modules/), which the sandbox does not show"
+# The integrator quotes a cause only from a line that begins with the
+# scenario's name less `.sh` and says "cannot judge" (integrate.rs
+# cannot_judge_cause); the preflight's own lines begin with `preflight:`,
+# and the record then said the gate's log gave no cause (rev-f N1).
+expect "and says it as a scenario would, the form the integrator quotes as the cause" "$(cat "$work/gate.out")" \
+    "| check-needy: cannot judge here: the sandbox does not show controller:web/node_modules/ ($pre_controller/web/node_modules/)"
 refuse "nothing was built" "$(cat "$work/gate.out")" '| == base: build'
 refuse "no scenario ran on the base" "$(cat "$work/gate.out")" '| == base: 301.sh'
 refuse "nor on the candidate" "$(cat "$work/gate.out")" ' ran'
@@ -3510,6 +3516,8 @@ expect "an objective's missing prerequisite ends a warm (exit 4)" \
     "$(SPAWN_GATE_VERDICT=$integrator/verdict sh "$gate" --base-only "$repo" "$base" "$pre" >"$work/gate.out" 2>&1 && echo exit=0 || echo "exit=$?")" 'exit=4'
 expect "which says what is missing" "$(cat "$work/gate.out")" \
     '| preflight: 302.sh needs tool:no-such-tool-of-the-gate, which the sandbox does not show'
+expect "in the scenario's own name too" "$(cat "$work/gate.out")" \
+    '| 302: cannot judge here: the sandbox does not show tool:no-such-tool-of-the-gate'
 rm -f "$pre/302.sh"
 # A word the gate cannot read is the owner's to correct, never guessed at.
 sed -i 's|^# needs: tool:no-such-tool-of-the-gate$|# needs: web/node_modules|' "$pre/check-needy.sh"
@@ -3525,7 +3533,9 @@ expect "which names the line" "$(cat "$work/gate.out")" \
 # `spawn` from src/main.txt, so a candidate that leaves that file alone
 # builds the base's binary. 401 reads the binary alone, 402 a document too,
 # 403 declares nothing, 404 is on the serial list, 405 is unsolved on the
-# base, and the check has no result on the base at all.
+# base, and the check has no result on the base at all. 406 and 407 declare
+# the binary and name the build's directory, where a tree's other binaries
+# are, as CARGO_TARGET_DIR and as the directory of SPAWN_BIN.
 reuse_controller=$work/reuse
 rdir=$reuse_controller/rsi/scenarios
 mkdir -p "$rdir"
@@ -3549,6 +3559,8 @@ reuse_scenario 402 '# reads: binary docs/guide.md' '[ -n "$("$SPAWN_BIN")" ] && 
 reuse_scenario 403 ''
 reuse_scenario 404 '# reads: binary'
 reuse_scenario 405 '# reads: binary' 'exit 1'
+reuse_scenario 406 '# reads: binary' '[ -n "$("$SPAWN_BIN")" ] && [ ! -e "$CARGO_TARGET_DIR/debug/other" ]'
+reuse_scenario 407 '# reads: binary' '[ -n "$("$SPAWN_BIN")" ] && [ ! -e "$(dirname "$SPAWN_BIN")/other" ]'
 reuse_scenario check-declared '# reads: binary'
 printf '404.sh\n' >"$rdir/serial"
 git -C "$seed" checkout -q -B reuse-a "$base"
@@ -3595,15 +3607,21 @@ expect "and the log says why" "$reuse_log" \
     '| 404.sh declares what it reads and is run all the same: it is on the serial list'
 expect "one the base did not solve is run" "$reuse_log" \
     '| 405.sh declares what it reads and is run all the same: the base did not solve it (unsolved)'
+expect "one that names CARGO_TARGET_DIR is run, whatever it declares (rev-f N2)" "$reuse_log" \
+    "| 406.sh declares what it reads and is run all the same: 406.sh names the build's directory (CARGO_TARGET_DIR, or SPAWN_BIN's)"
+expect "and so is one that names the directory of SPAWN_BIN" "$reuse_log" \
+    "| 407.sh declares what it reads and is run all the same: 407.sh names the build's directory (CARGO_TARGET_DIR, or SPAWN_BIN's)"
+expect "both ran" "$(printf '%s\n' "$reuse_log" | grep -cE '^\| 40[67] ran in candidate$')" 2
 expect "a check has no result on the base: run" "$reuse_log" \
     '| check-declared.sh declares what it reads and is run all the same: only an objective (<digits>.sh) has a result on the base'
 expect "a reused result has a stage line of its own" "$reuse_log" \
     '| stage gate reused 0ms regression: 401.sh must still pass'
 refuse "a reused result seeds nothing: only a run writes an entry" "$reuse_log" '401.sh: solved on the candidate'
 expect "a run does" "$reuse_log" '| 403.sh: solved on the candidate, seeded'
-# Four the base solved (401 to 404), two the candidate's runs seeded (403, 404).
+# Six the base solved (401 to 404, 406, 407), four the candidate's runs
+# seeded (403, 404, 406, 407).
 expect "every solved entry names the binary its run ran" \
-    "$(cat "$reuse_cache"/* 2>/dev/null | grep -cE '^binary [0-9a-f]{64}$') of $(cat "$reuse_cache"/* 2>/dev/null | grep -c '^solved$')" '6 of 6'
+    "$(cat "$reuse_cache"/* 2>/dev/null | grep -cE '^binary [0-9a-f]{64}$') of $(cat "$reuse_cache"/* 2>/dev/null | grep -c '^solved$')" '10 of 10'
 # The base read whole from the cache: no base build, and the binary the
 # entries name is still what the candidate's is compared with.
 expect "with the base's results all cached, the same reuse" \
