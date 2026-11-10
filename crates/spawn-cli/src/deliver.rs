@@ -1431,9 +1431,7 @@ fn restart_order(task: &TaskRow, restart: &Restart, facts: &Facts) -> Option<Ord
         }
         // An execution that started after the restart was asked for (a
         // worker that did not run then, resumed since) is not stopped.
-        if restart.execution_id.is_none() {
-            return None;
-        }
+        restart.execution_id.as_ref()?;
         return Some(task.command(stop, CommandAction::Stop));
     }
     // The stopped execution's end is the recovery's to record first: it
