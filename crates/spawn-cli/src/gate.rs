@@ -2041,7 +2041,14 @@ fn run_gate(
         .arg(command.get_program())
         .args(command.get_args())
         .env_clear();
-    let ran = run_bounded(runner, limit, &own)?;
+    // In a unit of its own when the judging runs gates that way (gate v2
+    // step 2: a restart of the integrator no longer reaches it), else this
+    // process's child as before.
+    let ran = if crate::integrate::judging::units() {
+        run_unit(&runner, limit, directory)?
+    } else {
+        run_bounded(runner, limit, &own)?
+    };
     let status = std::fs::read_to_string(directory.join("status"))
         .ok()
         .as_deref()
@@ -2064,6 +2071,231 @@ fn run_gate(
             ),
         },
     })
+}
+
+/// The evidence of a gate whose runner ended without writing the gate's
+/// status (`on` `runner`; design-gate-survives-restart.md D6): a reboot, an
+/// OOM kill of its unit, a stop from outside. No verdict is guessed from
+/// what the gate printed: a host fault, judged again after the backoff, and
+/// counted toward the cap (an OOM may be the candidate's).
+pub(crate) const ABANDONED: &str = "abandoned";
+
+/// Whether this host runs gates in units of their own: a systemd user
+/// manager answers (`systemctl --user is-system-running` says running,
+/// degraded, starting or initializing). Read once, at the integrator's
+/// start.
+pub(crate) fn units_available() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-system-running"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .is_some_and(|said| {
+            matches!(
+                said.trim(),
+                "running" | "degraded" | "starting" | "initializing"
+            )
+        })
+}
+
+/// The unit a gate run in `directory` runs in: its private directory's name
+/// (`spawn-gate-<pid>-<nonce>-<n>`, unique on this host).
+pub(crate) fn unit_name(directory: &Path) -> String {
+    format!(
+        "{}.service",
+        directory
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    )
+}
+
+/// Stop a gate's unit, and everything in it (`KillMode=control-group`).
+pub(crate) fn stop_unit(unit: &str) {
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", "--", unit])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// The main process of `unit` while it runs.
+fn unit_main(unit: &str) -> Option<spawn_host::process::ProcessId> {
+    let out = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "--property=MainPID",
+            "--value",
+            "--",
+            unit,
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    (pid > 0).then(|| spawn_host::process::ProcessId::of(pid))
+}
+
+/// What `<directory>/runner` says of a gate's unit: its name, its main
+/// process (pid and start time, P6's rule), when it started and its wall
+/// clock; written when the unit starts, read by whoever waits on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnitRun {
+    pub(crate) unit: String,
+    pub(crate) runner: Option<spawn_host::process::ProcessId>,
+    pub(crate) started_ms: i64,
+    pub(crate) limit_s: u64,
+}
+
+impl UnitRun {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({"unit": self.unit,
+                           "runner": self.runner.as_ref().map(spawn_host::process::ProcessId::record),
+                           "started_ms": self.started_ms, "limit_s": self.limit_s})
+    }
+
+    pub(crate) fn read(directory: &Path) -> Option<Self> {
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(directory.join("runner.json")).ok()?)
+                .ok()?;
+        Some(Self {
+            unit: value.get("unit")?.as_str()?.to_string(),
+            runner: value
+                .get("runner")
+                .and_then(serde_json::Value::as_str)
+                .and_then(spawn_host::process::ProcessId::parse),
+            started_ms: value.get("started_ms")?.as_i64()?,
+            limit_s: value.get("limit_s")?.as_u64()?,
+        })
+    }
+}
+
+fn now_ms() -> i64 {
+    spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
+}
+
+/// Run `runner` (the runner and its arguments) in a transient unit of the
+/// user's systemd manager, `systemd-run --user --unit=<unit_name>`, bounded
+/// by `limit` (`RuntimeMaxSec=`, so the bound holds whoever waits) and this
+/// thread's stop (the unit is stopped). Its outcome is the runner's files:
+/// `<directory>/status` is the one sign the gate is done. Waits for it
+/// ([`wait_unit`]); the returned status is the runner's success, its own
+/// output nothing (the runner's is in the journal).
+fn run_unit(runner: &Command, limit: Duration, directory: &Path) -> Result<Run, GateFailure> {
+    use std::os::unix::process::ExitStatusExt as _;
+    if stopped() {
+        return Err(GateFailure::Aborted {
+            reason: STOPPED.to_string(),
+            log: String::new(),
+        });
+    }
+    let unit = unit_name(directory);
+    let limit_s = limit.as_secs().max(1);
+    let started_ms = now_ms();
+    // Named before it starts, so a reader that finds the directory finds
+    // the unit too.
+    let mut run = UnitRun {
+        unit: unit.clone(),
+        runner: None,
+        started_ms,
+        limit_s,
+    };
+    write_whole(&directory.join("runner.json"), &run.json()).map_err(|error| failed(&error))?;
+    let out = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--quiet",
+            "--collect",
+            "--same-dir",
+            &format!("--unit={unit}"),
+            "--property=KillMode=control-group",
+            &format!("--property=RuntimeMaxSec={limit_s}"),
+            "--",
+            // The gate's environment is its file alone, as a child's is
+            // (env_clear): not the user manager's (INVOCATION_ID, the bus).
+            "/usr/bin/env",
+            "-i",
+        ])
+        .arg(runner.get_program())
+        .args(runner.get_args())
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| failed(&error))?;
+    if !out.status.success() {
+        return Err(GateFailure::Failed(format!(
+            "systemd-run {unit}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    run.runner = unit_main(&unit);
+    write_whole(&directory.join("runner.json"), &run.json()).map_err(|error| failed(&error))?;
+    wait_unit(&run, directory)?;
+    Ok(Run {
+        status: ExitStatus::from_raw(0),
+        stdout: String::new(),
+        stderr: String::new(),
+    })
+}
+
+/// Wait for the gate in `run`'s unit to write its status into `directory`.
+/// This thread's stop stops the unit (an abort that says so, with what the
+/// gate printed). A runner gone with no status: past its wall clock, a
+/// timeout (the unit's `RuntimeMaxSec=` stopped it); before, abandoned
+/// ([`ABANDONED`]: a host fault, `on` `runner`).
+pub(crate) fn wait_unit(run: &UnitRun, directory: &Path) -> Result<(), GateFailure> {
+    let status = directory.join("status");
+    let limit_ms = i64::try_from(run.limit_s.saturating_mul(1000)).unwrap_or(i64::MAX);
+    loop {
+        if status.exists() {
+            return Ok(());
+        }
+        if stopped() {
+            stop_unit(&run.unit);
+            return Err(GateFailure::Aborted {
+                reason: STOPPED.to_string(),
+                log: std::fs::read_to_string(directory.join("stdout")).unwrap_or_default(),
+            });
+        }
+        let gone = run.runner.as_ref().is_none_or(|runner| !runner.alive());
+        if gone {
+            // The runner's last act is the status's rename: give one in
+            // flight a moment before calling it gone.
+            std::thread::sleep(Duration::from_millis(300));
+            if status.exists() {
+                return Ok(());
+            }
+            stop_unit(&run.unit);
+            if now_ms().saturating_sub(run.started_ms) >= limit_ms.saturating_sub(1000) {
+                return Err(GateFailure::Timeout);
+            }
+            let log = std::fs::read_to_string(directory.join("stdout")).unwrap_or_default();
+            return Err(GateFailure::HostFault {
+                scenario: "gate".to_string(),
+                on: "runner".to_string(),
+                runs: "no status".to_string(),
+                reason: format!(
+                    "the gate's runner ({}) ended without writing the gate's status: a reboot, \
+                     an OOM kill or a stop from outside",
+                    run.unit
+                ),
+                tree: None,
+                log,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Write `value` to `path` whole: a temporary file renamed over it.
+fn write_whole(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, format!("{value}\n"))?;
+    std::fs::rename(&temporary, path)
 }
 
 /// Scenario files in the controller's checkout.
@@ -3445,6 +3677,103 @@ mod tests {
                      if reason.contains("one of the runner's own names")),
             "{refused:?}"
         );
+    }
+
+    /// Gate v2 step 2: a judging that runs gates in units runs each in a
+    /// transient unit of the user's systemd manager (here when one answers;
+    /// said and skipped otherwise). Its outcome is the runner's files, as a
+    /// child's is; its runner killed is a host fault `on` `runner`
+    /// (abandoned), never an abort or a verdict; its wall clock is a
+    /// timeout; a stop on its thread stops the unit and everything in it;
+    /// and no unit is left behind.
+    #[test]
+    fn a_gate_in_a_unit_ends_with_its_files_and_leaves_no_unit() {
+        if !super::units_available() {
+            eprintln!("no systemd user manager answers here: the unit gate is not tried");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("spawn-units-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let judging =
+            crate::integrate::judging::Judging::create(&root, &serde_json::json!({}), true)
+                .expect("a judging");
+        let note_unit = |result: &Result<super::Verdict, GateFailure>| format!("{result:?}");
+        judging.run(|| {
+            let accepted = FakeGate::new(
+                "grep -q 'spawn-gate-' /proc/self/cgroup || { echo 'not in a unit' >&2; exit 3; }\n\
+                 [ -z \"${INVOCATION_ID-}\" ] || { echo 'the manager environment' >&2; exit 3; }\n\
+                 echo 'judged' \n\
+                 echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n",
+            )
+            .judge(&path_only());
+            let said = note_unit(&accepted);
+            let verdict = accepted.expect(&said);
+            assert!(verdict.accepted, "{said}");
+            assert!(verdict.output.contains("judged"), "its stdout: {said}");
+
+            let killed = FakeGate::new("echo 'its last words'\nkill -KILL $PPID\nsleep 5\n")
+                .judge(&path_only());
+            let said = note_unit(&killed);
+            let Err(GateFailure::HostFault { on, runs, log, .. }) = killed else {
+                panic!("a runner killed is abandoned, a host fault: {said}");
+            };
+            assert_eq!((on.as_str(), runs.as_str()), ("runner", "no status"));
+            assert!(log.contains("its last words"), "{log}");
+
+            let gate = FakeGate::new("sleep 60\n");
+            let (late, _) = gate.judge_seeing_within(&path_only(), Duration::from_secs(2));
+            let said = note_unit(&late);
+            assert!(matches!(late, Err(GateFailure::Timeout)), "{said}");
+        });
+        // A stop on the thread stops the unit, and what it started.
+        let marker = root.join("marker");
+        let running = root.join("running");
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_flag = std::sync::Arc::clone(&flag);
+        let body = format!(
+            "(sleep 3; touch {}) & touch {}; sleep 60\n",
+            marker.display(),
+            running.display()
+        );
+        let stopping =
+            crate::integrate::judging::Judging::create(&root, &serde_json::json!({}), true)
+                .expect("a judging");
+        let gate = std::thread::spawn(move || {
+            super::stop_with(thread_flag);
+            stopping.run(|| FakeGate::new(&body).judge(&path_only()))
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !running.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(running.exists(), "the gate started");
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let stopped = gate.join().expect("the gate's thread");
+        assert!(
+            matches!(&stopped, Err(GateFailure::Aborted { reason, .. }) if reason == super::STOPPED),
+            "{stopped:?}"
+        );
+        std::thread::sleep(Duration::from_secs(4));
+        assert!(
+            !marker.exists(),
+            "what the gate started was stopped with its unit"
+        );
+        // No unit of this test's gates is left (their names hold its pid).
+        let left = Command::new("systemctl")
+            .args([
+                "--user",
+                "list-units",
+                "--all",
+                "--plain",
+                "--no-legend",
+                &format!("spawn-gate-{}-*", std::process::id()),
+            ])
+            .output()
+            .expect("systemctl");
+        let left = String::from_utf8_lossy(&left.stdout).trim().to_string();
+        assert!(left.is_empty(), "units left: {left}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

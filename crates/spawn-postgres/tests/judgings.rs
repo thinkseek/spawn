@@ -265,3 +265,35 @@ fn a_judging_records_accepted_then_stale_each_once() {
     );
     assert_eq!(recorded(&mut client, "task.gated", JUDGING).len(), 2);
 }
+
+/// A gate whose runner ended without the gate's status (gate v2 step 2,
+/// D6) is a host fault with evidence `abandoned`, `on` `runner`, runs `no
+/// status`; another shape of it is refused.
+#[test]
+fn an_abandoned_gate_is_a_host_fault_of_its_own_shape() {
+    let (store, _schema) = store("judging_abandoned");
+    let task = reported_task(&store, "/srv/abandoned");
+    let fault = |fact: Value| {
+        json!({"type": "task.gated", "id": task, "revision": 0, "verdict": "host_fault",
+               "base": MAIN, "evidence": "abandoned", "backoff_ms": 60_000,
+               "fact": fact, "judging": JUDGING})
+    };
+    for wrong in [
+        json!({"scenario": "gate", "on": "candidate and base", "runs": "no status"}),
+        json!({"scenario": "gate", "on": "runner", "runs": "1 1"}),
+        json!({"scenario": "gate"}),
+    ] {
+        let error = store
+            .integrator_record(&fault(wrong.clone()))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            error.contains("a host_fault verdict names"),
+            "{wrong}: {error}"
+        );
+    }
+    store
+        .integrator_record(&fault(json!({"scenario": "gate", "on": "runner",
+                                          "runs": "no status", "reason": "OOM"})))
+        .expect("abandoned");
+}
