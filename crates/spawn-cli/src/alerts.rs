@@ -159,6 +159,17 @@
 //!   clears when the day ends, or at a reading that finds the budget removed
 //!   or above the day's spend. A mission with no daily budget, or under it,
 //!   raises none. It rests on the readings of the recorded costs.
+//! - `message_not_taken`, the session id, key `message_not_taken:<command>`,
+//!   evidence the command, agent, session and whether it was typed
+//!   (objective 045): a message (what the Bridge types for a command, with
+//!   its marker) that no `message.taken` names `SPAWN_MESSAGE_TAKEN_SECS`
+//!   (default 120) after it was recorded (`spawn_command_message`): typed
+//!   and never taken, or never typed. A command an older Spawn typed carries
+//!   no marker (no `message.typed`) and is never one. Once per message;
+//!   clears when it is taken, or when its session ends with it untaken (the
+//!   execution it was typed into, or its own start's, ended). A message
+//!   whose session ended first fires nothing. Read at each check and when a
+//!   message falls due, and on start, from the store.
 //! - `model_auth`, the session id, key
 //!   `model_auth:<its execution.interrupted>`: an `execution.interrupted`
 //!   (028) with cause `model_auth`; clears at that execution's
