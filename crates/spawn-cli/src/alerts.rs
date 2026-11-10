@@ -1509,7 +1509,8 @@ times in a row)",
         let mut over: HashMap<String, (f64, f64)> = HashMap::new();
         let mut read: HashMap<String, (f64, f64)> = HashMap::new();
         for row in rows {
-            let (Some(mission), Some(budget)) = (row["mission"].as_i64(), row["budget_usd"].as_f64())
+            let (Some(mission), Some(budget)) =
+                (row["mission"].as_i64(), row["budget_usd"].as_f64())
             else {
                 continue;
             };
@@ -3223,24 +3224,35 @@ connections\n";
             commit(monitor, &out);
             out
         };
-        assert!(read(&mut monitor, noon, reading(0.4855, 0.5)).is_empty(), "under: none");
+        assert!(
+            read(&mut monitor, noon, reading(0.4855, 0.5)).is_empty(),
+            "under: none"
+        );
         let fired = read(&mut monitor, noon + 2000, reading(0.9355, 0.5));
         assert_eq!(fires(&fired), ["cost_budget:4:2026-11-10"]);
         let Event::Fire {
-            subject, text, evidence, ..
+            subject,
+            text,
+            evidence,
+            ..
         } = &fired[0]
         else {
             panic!("a fire");
         };
         assert_eq!(subject, "mission #4");
-        assert_eq!(text, "mission #4 spent $0.94 today (UTC), over its $0.50 daily budget");
+        assert_eq!(
+            text,
+            "mission #4 spent $0.94 today (UTC), over its $0.50 daily budget"
+        );
         assert_eq!(evidence["day"], "2026-11-10");
         // More spending the same day: nothing more.
         assert!(read(&mut monitor, noon + 4000, reading(1.2355, 0.5)).is_empty());
         // The budget raised above the spend clears it, and the day's key is
         // spent: going over again that day fires nothing.
         let raised = read(&mut monitor, noon + 6000, reading(1.2355, 2.0));
-        assert!(matches!(&raised[..], [Event::Clear { key, .. }] if key == "cost_budget:4:2026-11-10"));
+        assert!(
+            matches!(&raised[..], [Event::Clear { key, .. }] if key == "cost_budget:4:2026-11-10")
+        );
         assert!(read(&mut monitor, noon + 8000, reading(2.5, 2.0)).is_empty());
         // The next UTC day is a new occurrence.
         let tomorrow = noon + super::DAY_MS;
@@ -3248,12 +3260,19 @@ connections\n";
         assert_eq!(fires(&next), ["cost_budget:4:2026-11-11"]);
         // Its day over: cleared at the next day's first reading.
         let after = read(&mut monitor, tomorrow + super::DAY_MS, reading(0.1, 0.5));
-        assert!(matches!(&after[..], [Event::Clear { key, .. }] if key == "cost_budget:4:2026-11-11"));
+        assert!(
+            matches!(&after[..], [Event::Clear { key, .. }] if key == "cost_budget:4:2026-11-11")
+        );
         // A budget removed clears its open alert.
         let third = tomorrow + super::DAY_MS + 1000;
-        assert_eq!(fires(&read(&mut monitor, third, reading(0.7, 0.5))), ["cost_budget:4:2026-11-12"]);
+        assert_eq!(
+            fires(&read(&mut monitor, third, reading(0.7, 0.5))),
+            ["cost_budget:4:2026-11-12"]
+        );
         let removed = read(&mut monitor, third + 1000, json!([]));
-        assert!(matches!(&removed[..], [Event::Clear { key, .. }] if key == "cost_budget:4:2026-11-12"));
+        assert!(
+            matches!(&removed[..], [Event::Clear { key, .. }] if key == "cost_budget:4:2026-11-12")
+        );
     }
 
     #[test]

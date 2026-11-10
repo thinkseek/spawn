@@ -1798,8 +1798,8 @@ fn cost(query: &str) -> Result<Value, String> {
     let asked = parameter(query, "window")
         .map(|text| percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad window {text}")))
         .transpose()?;
-    let (name, length_ms) =
-        crate::cost::window_of(asked.as_deref()).map_err(|error| format!("{BAD_REQUEST}{error}"))?;
+    let (name, length_ms) = crate::cost::window_of(asked.as_deref())
+        .map_err(|error| format!("{BAD_REQUEST}{error}"))?;
     let store = open_store()?;
     crate::cost::window(&store, name, length_ms)
 }

@@ -1080,7 +1080,9 @@ mod tests {
             r#"{"type":"assistant","timestamp":"2026-11-04T05:46:12Z","message":{"id":"m","usage":{"output_tokens":3}}}"#,
         )
         .expect("a usage");
-        assert!(matches!(unnamed.kind, EventKind::ModelUsage { ref model, .. } if model == "unknown"));
+        assert!(
+            matches!(unnamed.kind, EventKind::ModelUsage { ref model, .. } if model == "unknown")
+        );
     }
 
     #[test]
