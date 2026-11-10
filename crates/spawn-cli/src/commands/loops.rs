@@ -70,10 +70,28 @@ fn backoff(interval: std::time::Duration, failures: u32) -> std::time::Duration 
     interval.saturating_mul(failures.clamp(1, MAX_BACKOFF_INTERVALS))
 }
 
-/// `spawn tick`: one Bridge and Observer pass.
+/// How long `spawn tick` goes on ticking for an end whose kill waits off
+/// the Bridge's loop: longer than a host's kill takes at its bound (tmux:
+/// 7 s) plus a waiting command's retry (1 s by default).
+const TICK_ENDS_LIMIT: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// `spawn tick`: one Bridge and Observer pass. A command whose end waits for
+/// its kill, which runs off the Bridge's loop (backlog P7), would finish
+/// only at a later pass; this one-shot pass ticks the Bridge again, every
+/// 50 ms, until no end waits (at most [`TICK_ENDS_LIMIT`]), so a stop it
+/// claims is finished when it returns, as before the kill left the loop.
 pub(crate) fn tick(flags: &Flags) -> Result<i32, String> {
     let (mut bridge, mut observer) = runtime(flags)?;
-    let report = bridge.tick().map_err(|error| error.to_string())?;
+    let mut report = bridge.tick().map_err(|error| error.to_string())?;
+    let deadline = std::time::Instant::now() + TICK_ENDS_LIMIT;
+    while bridge.ends_pending() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Its commands are the first pass's claimed again (a waiting stop),
+        // not new ones: `commands=` says what this tick was given.
+        let more = bridge.tick().map_err(|error| error.to_string())?;
+        report.warnings.extend(more.warnings);
+        report.notes.extend(more.notes);
+    }
     for warning in &report.warnings {
         eprintln!("spawn tick warning: {warning}");
     }

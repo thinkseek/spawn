@@ -509,3 +509,28 @@ fn a_bridge_dropped_while_its_kill_waits_waits_for_it() {
         "and soon after it"
     );
 }
+
+/// `ends_pending` says whether a later tick still has an end to finish: a
+/// kill under way, and after it a stop that waits to be claimed again with
+/// its end already done by a tick's own pass. A one-shot `spawn tick` ticks
+/// until it is false, so a stop it claimed is finished when it returns
+/// (003 under load, rev-f on 283a5482).
+#[test]
+fn ends_pending_holds_until_the_waiting_stop_is_finished() {
+    let mut rig = Rig::with_retry(Duration::from_secs(1));
+    assert!(!rig.bridge.ends_pending(), "nothing ends yet");
+    rig.submit("key_stop", CommandAction::Stop);
+    rig.tick();
+    assert!(rig.bridge.ends_pending(), "the kill is under way");
+    rig.host.release(Release::Gone);
+    rig.tick_until(Rig::ended);
+    assert_eq!(rig.finished(2), None, "the stop still waits for its claim");
+    assert!(
+        rig.bridge.ends_pending(),
+        "the end is done, the stop that asked for it is not"
+    );
+    rig.clock.advance(Duration::from_secs(2));
+    rig.tick_until(|rig| rig.finished(2).is_some());
+    assert_eq!(rig.finished(2), Some((true, String::new())));
+    assert!(!rig.bridge.ends_pending(), "nothing is left to finish");
+}

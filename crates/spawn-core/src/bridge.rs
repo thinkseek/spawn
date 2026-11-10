@@ -882,6 +882,29 @@ impl Bridge {
         self.sessions.len()
     }
 
+    /// Whether an execution's end waits for its kill, run off the loop
+    /// ([`Bridge::kill`]): the end, and the stop that asked for it, finish
+    /// at a later tick. A one-shot caller (`spawn tick`) ticks again until
+    /// none does, so it finishes what it claimed, as the loop does over its
+    /// next passes.
+    pub fn ends_pending(&self) -> bool {
+        // A stop or discard left waiting for its end: the end may be done
+        // already (a tick's own pass reads the kill), while the command is
+        // claimed again only after `input_wait_retry`.
+        let stop_waits = self.held.values().any(|claimed| {
+            matches!(
+                claimed.action(),
+                Ok(CommandAction::Stop | CommandAction::Discard)
+            )
+        });
+        stop_waits
+            || self.sessions.values().any(|view| {
+                view.active
+                    .as_ref()
+                    .is_some_and(|active| active.follow.killing.is_some())
+            })
+    }
+
     /// Rebuild state from the whole log.
     pub fn recover(&mut self) -> Result<(), StoreError> {
         self.cursor = GlobalPosition(0);
