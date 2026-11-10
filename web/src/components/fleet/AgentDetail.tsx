@@ -11,7 +11,7 @@ import {
 import { useId, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
 
-import { fetchSessionTail, postKey, postTaskMove, usePoll } from "../../api";
+import { fetchSessionTail, postKey, usePoll } from "../../api";
 import type { SessionDetail } from "../../api";
 import type {
   CommandRecord,
@@ -52,7 +52,7 @@ import {
 } from "./bits";
 import { DoingIcon, doingNow } from "./FleetBoard";
 import { InputBox, useWritable } from "./InputBox";
-import { moveAnswer, newKey, sendAnswer } from "../../input";
+import { newKey, sendAnswer } from "../../input";
 import { keyLabel } from "../../keys";
 import type { KeyName } from "../../keys";
 
@@ -156,9 +156,6 @@ export function AgentDetail({ agent, name = null, held = null, onClose, onOpenTi
     >
       <div className="min-h-0 flex-1 overflow-y-auto bg-app-shell">
         <AgentSummary agent={agent} held={held} commands={commands.data} />
-        {agent.role === "worker" && (
-          <WorkerMoves sessionId={sessionId} to={shownName} onOpenTimeline={onOpenTimeline} />
-        )}
         <div className="grid gap-3 p-3 sm:p-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
           <div className="flex min-w-0 flex-col gap-3">
             <RecentTools session={tail.data} error={tail.error} />
@@ -209,129 +206,6 @@ export function AgentDetail({ agent, name = null, held = null, onClose, onOpenTi
         </div>
       </div>
     </Drawer>
-  );
-}
-
-type Move = "restart" | "reassign";
-
-const MOVE_WORDS: Record<Move, { button: string; hint: string; done: string }> = {
-  restart: {
-    button: "Restart",
-    hint: "Stop its running execution (its work is checkpointed) and resume the same session on the same workspace.",
-    done: "Restarted",
-  },
-  reassign: {
-    button: "Reassign",
-    hint: "Cancel its task and give it to a fresh worker whose branch starts from this worker's work.",
-    done: "Reassigned as",
-  },
-};
-
-/** A stalled worker's two ways back, each asking for a reason: Restart (a
- * fresh execution of its own session, its work kept) and Reassign (its task
- * to a fresh worker on its branch). Either answers with the task and the
- * worker that now carry the work, or why not (409: no delivered task). */
-function WorkerMoves({
-  sessionId,
-  to,
-  onOpenTimeline,
-}: {
-  sessionId: string;
-  to: string;
-  onOpenTimeline: (sessionId: string) => void;
-}) {
-  const reasonId = useId();
-  const [asking, setAsking] = useState<Move | null>(null);
-  const [reason, setReason] = useState("");
-  const [sending, setSending] = useState(false);
-  const [last, setLast] = useState<
-    { ok: true; move: Move; task: number; session_id: string } | { ok: false; text: string } | null
-  >(null);
-  const send = (move: Move) => {
-    if (sending) return;
-    setSending(true);
-    void postTaskMove(sessionId, move, { reason: reason.trim() }).then((reply) => {
-      const answer = moveAnswer(reply.status, reply.body);
-      setSending(false);
-      if (answer.ok) {
-        setLast({ ok: true, move, task: answer.task, session_id: answer.session_id });
-        setAsking(null);
-        setReason("");
-      } else {
-        setLast({ ok: false, text: answer.error });
-      }
-    });
-  };
-  return (
-    <div className="flex flex-col gap-2 border-b border-surface-border bg-page-canvas px-4 py-2 sm:px-5">
-      <div className="flex flex-wrap items-center gap-2 text-caption">
-        <span className="text-faint-foreground">Stalled?</span>
-        {(["restart", "reassign"] as const).map((move) => (
-          <Button
-            key={move}
-            onClick={() => {
-              setAsking(asking === move ? null : move);
-              setLast(null);
-            }}
-            title={MOVE_WORDS[move].hint}
-            className={asking === move ? "text-foreground" : undefined}
-          >
-            {MOVE_WORDS[move].button}
-          </Button>
-        ))}
-        {last?.ok === true && (
-          <span className="text-muted-foreground">
-            {MOVE_WORDS[last.move].done} task #{last.task}
-            {last.session_id !== sessionId && (
-              <>
-                {" · "}
-                <button
-                  type="button"
-                  className="underline decoration-dotted hover:text-foreground"
-                  onClick={() => onOpenTimeline(last.session_id)}
-                >
-                  {last.session_id}
-                </button>
-              </>
-            )}
-          </span>
-        )}
-        {last?.ok === false && <span className="text-destructive">{last.text}</span>}
-      </div>
-      {asking && (
-        <form
-          className="flex flex-wrap items-center gap-2"
-          onSubmit={(event) => {
-            event.preventDefault();
-            send(asking);
-          }}
-        >
-          <label htmlFor={reasonId} className="text-caption text-muted-foreground">
-            Why {asking} {to}?
-          </label>
-          <input
-            id={reasonId}
-            value={reason}
-            maxLength={2000}
-            autoFocus
-            onChange={(event) => setReason(event.target.value)}
-            placeholder="The reason, recorded with it"
-            className={cx(
-              "h-7 min-w-0 flex-1 rounded-control bg-surface px-2 text-caption text-foreground shadow-hairline",
-              FOCUS_RING,
-            )}
-          />
-          <button
-            type="submit"
-            disabled={sending || reason.trim() === ""}
-            className="inline-flex h-7 shrink-0 items-center rounded-control bg-surface px-2.5 text-caption font-medium text-foreground shadow-hairline hover:bg-surface-hover disabled:opacity-60"
-          >
-            {sending ? "Sending…" : MOVE_WORDS[asking].button}
-          </button>
-          <Button onClick={() => setAsking(null)}>Cancel</Button>
-        </form>
-      )}
-    </div>
   );
 }
 

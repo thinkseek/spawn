@@ -32,17 +32,7 @@ use crate::deliver::{DELIVERY_RETRIES, one_line, retry_wait_ms};
 fn purpose(first: &StopSent) -> String {
     let task = |rest: &str| rest.split('-').next().and_then(|id| id.parse::<i64>().ok());
     let named = |prefix: &str| first.key.strip_prefix(prefix).and_then(task);
-    if let Some(id) = named("restart-") {
-        format!(
-            "task #{id} was restarted (a fresh execution of its worker's session), so its running \
-             execution is stopped first; the restart resumes it once it has ended"
-        )
-    } else if let Some(id) = named("reassign-") {
-        format!(
-            "task #{id} was reassigned to a fresh worker, so its old worker is stopped; the new \
-             task is delivered from the old worker's last recorded checkpoint"
-        )
-    } else if let Some(id) = named("switch-model-") {
+    if let Some(id) = named("switch-model-") {
         format!("task #{id} waits for it to stop, to resume it on the task's model profile")
     } else if let Some(id) = named("retire-task-") {
         format!("task #{id} is closed, so its worker is stopped")
@@ -53,24 +43,6 @@ fn purpose(first: &StopSent) -> String {
     } else {
         format!("`{}` asked to stop it", first.principal)
     }
-}
-
-/// Whether a live worker's Stop is spent: the latest failed and its retries
-/// are spent, so it was escalated ([`pursue`]) and no more are sent. A
-/// reassigned task waits for its old worker's end no longer then
-/// (`deliver::reassign_held`).
-pub(crate) fn spent(facts: &Facts) -> bool {
-    let Some(last) = facts.stops.last() else {
-        return false;
-    };
-    facts.stopping()
-        && last.succeeded == Some(false)
-        && facts
-            .stops
-            .iter()
-            .filter(|stop| stop.succeeded == Some(false))
-            .count()
-            > DELIVERY_RETRIES
 }
 
 /// The pursuit of a live worker's failed stop: its retry once due, or the
@@ -236,37 +208,5 @@ mod tests {
         let mut busy = stopping(vec![stop(1, 100_000, Some(false))]);
         busy.open_command = true;
         assert_eq!(next_due(&busy), None, "a command is in flight");
-    }
-
-    /// A restart's or a reassign's Stop that cannot end the execution is
-    /// escalated naming the restart or the reassign and its task, and is
-    /// then spent: a reassigned task waits for it no longer.
-    #[test]
-    fn a_failed_restart_or_reassign_stop_is_escalated_naming_it() {
-        use super::{pursue, spent};
-        use crate::dispatch::worker::Decision;
-        for (key, words) in [
-            ("restart-7-1-stop", "task #7 was restarted"),
-            (
-                "reassign-7-stop",
-                "task #7 was reassigned to a fresh worker",
-            ),
-        ] {
-            let mut stops: Vec<StopSent> = (0..=DELIVERY_RETRIES)
-                .map(|n| {
-                    let n = i64::try_from(n).expect("a handful of retries");
-                    stop(n, 100_000 + n * 1000, Some(false))
-                })
-                .collect();
-            stops[0].key = key.to_string();
-            let facts = stopping(stops);
-            assert!(spent(&facts));
-            let Decision::Escalate(escalation) = pursue(&facts, 1_000_000) else {
-                panic!("escalated");
-            };
-            assert!(escalation.line.contains(words), "{}", escalation.line);
-        }
-        assert!(!spent(&stopping(vec![stop(1, 100_000, Some(false))])));
-        assert!(!spent(&stopping(Vec::new())));
     }
 }

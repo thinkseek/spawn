@@ -435,12 +435,6 @@ it, on the same ladder.
   | `context_exhausted` | an API error line whose text holds `Prompt is too long` | `handoff` | due at once: a Stop with its final checkpoint, then a new native session in the same workspace and branch |
   | `budget` | the integrator's Stop of a task over its budget (objective 026) | `handoff` | as a context's |
   | `stopped` | a Stop or Discard from a person, the supervisor, a cancelled task or a retirement | `final` | never revived |
-  | `restarted` | the dispatcher's own Stop (`spawn-dispatch`) keyed `restart-<task>-<n>-stop` by the task's latest `task.restarted` (or a retry of it) | `final` | never revived by the recovery: the restart's own resume (`restart-<task>-<n>`) follows, once this end is recorded |
-  | `reassigned` | the dispatcher's own Stop keyed `reassign-<task>-stop` of a task whose `task.cancelled` names `reassigned_as` (or a retry of it); evidence `to_session`, the new worker's | `final` | never revived; the worker's task went to a fresh one |
-
-  The cause `restarted` or `reassigned` is read from the record, never from
-  a key alone: a Stop from anyone but the dispatcher is `stopped`, whatever
-  its key.
 
   When several hold the first in that order wins: a person's Stop before the
   budget, a memory kill before a host restart, a full disk before a database
@@ -880,42 +874,6 @@ keeps no state for this either: `spawn_events`, `spawn_commands` and their
 keys (`cancel-stop-<task>-<execution>`, `cancel-notice-<task>-<n>`,
 `set-aside:<task>`) say what was done.
 
-**Restart and reassign.** A worker that stalls (busy, no fact for
-`SPAWN_STALL_ACTIVITY_SECS`, escalated under "stalled") is given a fresh
-execution, or its task a fresh worker, without losing its work, by the
-owner or the supervisor (`spawn task restart --id N [--reason <text>]`,
-`spawn task reassign --id N [--reason <text>]`, the store's
-`spawn_task_restart` and `spawn_task_reassign`), or by a person from the
-agent page (`POST /api/session/<id>/restart` and `/reassign`, `by` `human`,
-through `spawn_human_task`). Each takes a `delivered` task only, refuses any
-other naming its state (nothing recorded or sent), and prints `{task,
-session_id, agent_id}`: the task and the worker that now carry the work.
-
-- *Restart.* `task.restarted` {task, session_id, execution_id (the running
-  one, if any), by, reason, n (from 1, per task)}. The dispatcher stops that
-  execution (a Stop keyed `restart-<task>-<n>-stop`: its final checkpoint
-  is kept), the recovery records its end `restarted` `final`, and the
-  dispatcher then resumes the same native session on the same workspace,
-  once (`restart-<task>-<n>`), with a prompt naming the restart and its
-  reason. A worker that no longer ran is resumed at once. `GET
-  /api/session/<id>` names, on the execution the resume started, the one it
-  replaced (`restart_of`).
-- *Reassign.* In one transaction, as the re-issue: the old task's
-  `task.cancelled` names `by`, `reason` and `reassigned_as`; the new task's
-  `task.assigned` names `reassign_of` and copies its mission, brief, model,
-  objective, scenario and `created_by`, kind `ephemeral`, with a fresh
-  worker (`agent_worker_<label>_<new id>`). The old worker is stopped under
-  `reassign-<task>-stop` (not the routine retire), its end recorded
-  `reassigned` `final` with evidence `to_session`, never revived. The new
-  task is delivered once the old worker has ended, its branch starting from
-  the old worker's last checkpoint (not a set-aside), as an objective's
-  fork does; a mission without a source names that commit as the Start's
-  `from`. A Stop of the old worker that fails is pursued and escalated
-  (`dispatch::stops`, its line naming the reassign); once escalated, the
-  new task goes without waiting further, from the last recorded checkpoint.
-  `GET /api/session/<id>` links the two: `reassigned_to` on the old
-  session, `reassigned_from` on the new, each `{task, session_id}`.
-
 **Storage.** Missions, tasks and the resident roster are the `mission_*`
 tables, folded from the control stream (§10.1): a mission has its text,
 origin, sources, state and landing settings; a task has its mission, brief,
@@ -1162,39 +1120,9 @@ next command and who sent it, the end of the execution) follows it in the
 same log. Nothing exports these episodes or replays them through the rules
 (§9).
 
-Four views derive the experience from the log and the command queue, one
-row per item with its time (`at_ms`), readable by the reader (`spawn
-serve`) and the supervisor (`crates/spawn-postgres/sql/schema.sql`):
-
-- `spawn_decisions` (`at_ms`, `tier`, `session_id`, `agent_id`, `source`):
-  every judgement, tier `rules` when the rules judged and `model`
-  otherwise, and every command at its creation, by its principal:
-  `dispatcher` (`spawn-dispatch`), `supervisor` (`spawn_supervisor`),
-  `human` (`human`, `spawn`), `liveness` (`spawn-liveness`), any other
-  principal its own tier.
-- `spawn_interventions` (`at_ms`, `kind`, ...): the owner's interventions
-  exactly as the scorecard's autonomy counts them (docs/design.md §15):
-  `command`, `resume`, `owner_task`, `cancel_reassign`.
-- `spawn_outcomes` (`at_ms`, `outcome`, `task_id`, `mission_id`, `by`):
-  each task's closing record: `landed`, `accepted` (by review, on a mission
-  without a gate), `cancelled`, `aborted`, `over_budget`.
-- `spawn_escalations` (`at_ms`, `tag`, `command_id`): each distinct tag of
-  the dispatcher's inputs into the supervisor (`Escalation::tag`), once, at
-  the first command that carried it.
-
-`GET /api/scorecard/fleet?window=24h|7d|30d|90d[&until=<RFC 3339>]`
-counts them over `[until - window, until)` (`until` defaults to the
-database's now; any other window is 400): the ladder by tier, agent-hours
-(every execution's running time in the window) and human decisions per
-agent-hour, escalations, interventions by kind, outcomes, landings per day,
-the judgements as `/api/fleet`'s last hour counts them, and each mission
-open in the window with its idle hours (its hours open less the union of
-its tasks' open intervals; `idle` past half). Ratios and hours are rounded
-to 3 decimals as the scorecard rounds (`crates/spawn-postgres/src/
-experience.rs`). The Scorecard's "How the fleet decides" reads it for the
-page's window (`web/src/fleetDecisions.ts`, `decisionsFromApi`);
-`/api/fleet`'s 24 h ladder and human decisions per agent-hour read the
-same view.
+The ladder metrics in the UI (decisions per tier, escalations, human
+decisions per agent-hour over the last 24 h) are computed from the log by
+`spawn serve`.
 
 ## 5. Interface
 
@@ -1213,8 +1141,8 @@ read is 405): `/api/overview`, `/api/fleet` (with
 `/api/fleet/<session>/judgements` and `/commands`, each command with
 `waiting` once the Bridge holds it for the agent's turn), `/api/attention`,
 `/api/missions`, `/api/events`, `/api/session/<id>`, `/api/pane/<id>`,
-`/api/rsi` (with `/api/rsi/task/<id>` and `/api/rsi/pane`),
-`/api/scorecard` and `/api/scorecard/fleet` (§4) (`crates/spawn-cli/src/serve.rs`; the answer of
+`/api/rsi` (with `/api/rsi/task/<id>` and `/api/rsi/pane`) and
+`/api/scorecard` (`crates/spawn-cli/src/serve.rs`; the answer of
 `/api/attention` is documented in `crates/spawn-cli/src/serve/attention.rs`).
 
 It writes two things. The first is a person's input to a session, `POST
@@ -1366,9 +1294,9 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
 
 ## 9. Not built
 
-- **Outcome labels and episode export:** the experience views (§4) count
-  decisions, interventions, outcomes and escalations, but nothing labels a
-  judgement with what followed it, exports the episodes or replays them.
+- **Experience views in SQL** (`decisions`, `outcomes`, `interventions`)
+  and outcome labels: the log holds what followed each judgement, but
+  nothing derives, exports or replays the episodes.
 - **RSI objectives over the corpus**, judged by black-box replay through the
   candidate's `spawn` binary on a corpus snapshot the candidate cannot edit:
   rules coverage (share of episodes decided by rules up, agreement with the
@@ -1379,11 +1307,11 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
 - **A write endpoint in the UI** (an input box to the supervisor). Humans
   act with `spawn submit --principal human`.
 - **More dispatcher rules:** stopping a COMPLETED one-shot task (it
-  escalates). (`restart` and `reassign` are built: §3.2, "Restart and
-  reassign".) Retrying after a
+  escalates), and the actions `restart` and `reassign`. Retrying after a
   transient API error is the recovery's (§3.1): bounded for an engine that
   ended, unbounded for one at its prompt; telling the supervisor after N
   live retries is not built.
+- **Ladder health over long periods.** The UI's figures cover the last 24 h.
 - **The backlog, scenarios and gate versioned with the source**
   (docs/storage.md).
 - **The Review point in code** (§1.1). Review sessions are run by the lead

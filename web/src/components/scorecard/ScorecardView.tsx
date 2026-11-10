@@ -1,10 +1,9 @@
 import { CalendarDays, Gauge, OctagonAlert, Target } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
-import { readApi, usePoll } from "../../api";
+import { usePoll } from "../../api";
 import type { FleetHealth } from "../../fleet";
-import { decisionsFromApi, decisionsFromHealth } from "../../fleetDecisions";
-import type { DecisionWindow } from "../../fleetDecisions";
+import { decisionsFromHealth } from "../../fleetDecisions";
 import { absoluteTitle, localDateTime, relativeTime } from "../../format";
 import type { Missions } from "../../missions";
 import { isQuietScope, orderScopes } from "../../ordering";
@@ -62,8 +61,7 @@ interface Loaded {
  * How the fleet and each mission did over a window: throughput, lead time,
  * first-pass quality, rework, autonomy, reliability, cost and gate time,
  * each against the previous window of the same length. Strictly read-only:
- * the only requests are GET /api/scorecard, GET /api/scorecard/fleet (how
- * the fleet decides over the same window) and GET /api/missions (polled by
+ * the only requests are GET /api/scorecard (and GET /api/missions, polled by
  * App, for the missions' titles and order).
  */
 export function ScorecardView({
@@ -91,14 +89,6 @@ export function ScorecardView({
     POLL_MS,
   );
   const data = scorecard.data?.card ?? null;
-  // How the fleet decides over the window the toggle picks; until it is
-  // read (or when it cannot be), the health's last 24 h.
-  const decided = usePoll<DecisionWindow>(
-    `scorecard-fleet-${since}`,
-    (signal) => readApi(`/api/scorecard/fleet?window=${since}`, signal, decisionsFromApi),
-    POLL_MS,
-  );
-  const decisions = decided.data ?? (health ? decisionsFromHealth(health) : null);
 
   const titles = useMemo(() => {
     const out = new Map<number, string>();
@@ -203,7 +193,7 @@ export function ScorecardView({
               </div>
             )}
             <WindowCard card={data} />
-            <FleetDecisions decisions={decisions} />
+            <FleetDecisions decisions={health ? decisionsFromHealth(health) : null} />
             {scopes.length === 0 ? (
               <Card>
                 <EmptyState

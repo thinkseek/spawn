@@ -1432,11 +1432,7 @@ create table if not exists mission_tasks (
     -- The task this one continues (its `task.assigned` names it): the
     -- objective's task after one that went over its budget keeps that
     -- task's work (`task.over_budget`, docs/fleet-architecture.md §10.4).
-    continues       bigint,
-    -- The task this one takes over (its `task.assigned` names it): a
-    -- delivered task moved to a fresh worker whose branch starts from the
-    -- old worker's last checkpoint (`spawn_task_reassign`).
-    reassign_of     bigint
+    continues       bigint
 );
 
 -- Columns added since the first shape of these tables (see spawn_grants).
@@ -1472,7 +1468,6 @@ alter table mission_tasks add column if not exists model text not null default '
 alter table mission_tasks add column if not exists held_by bigint;
 alter table mission_tasks add column if not exists reissue_of bigint;
 alter table mission_tasks add column if not exists continues bigint;
-alter table mission_tasks add column if not exists reassign_of bigint;
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
@@ -1738,8 +1733,8 @@ end $$;
 
 -- Who may call the mission functions: the owner (humans' CLI, the
 -- controller) and the supervisor's login; not the reader's, and not the web
--- page's typing login (`human`, which may only call `spawn_human_input`,
--- `spawn_human_key` and `spawn_human_task`).
+-- page's typing login (`human`, which may only call `spawn_human_input` and
+-- `spawn_human_key`).
 create or replace function spawn_mission_caller() returns text
 language sql stable as $$
     select case when x.p is null or x.p in ('spawn_reader', 'human') then null
@@ -1825,13 +1820,13 @@ begin
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
                                    created_by, objective, scenario, model, reissue_of,
-                                   continues, reassign_of, created_at_ms, updated_at_ms)
+                                   continues, created_at_ms, updated_at_ms)
         values (v_id, (p_record ->> 'mission_id')::bigint, p_record ->> 'kind',
                 p_record ->> 'agent_id', p_record ->> 'session_id', p_record ->> 'brief',
                 p_record ->> 'created_by', (p_record ->> 'objective')::integer,
                 p_record ->> 'scenario', coalesce(p_record ->> 'model', 'default'),
                 (p_record ->> 'reissue_of')::bigint, (p_record ->> 'continues')::bigint,
-                (p_record ->> 'reassign_of')::bigint, p_at, p_at);
+                p_at, p_at);
         update mission_missions set state = 'active', updated_at_ms = p_at
          where id = (p_record ->> 'mission_id')::bigint and state = 'open';
     when 'mission.configured' then
@@ -2216,12 +2211,6 @@ begin
         -- The wait an interruption opened is over: what showed the cause
         -- gone and how long it held. Read from the log, folded into no
         -- table (spawn_host_record).
-        null;
-    when 'task.restarted' then
-        -- A delivered task's worker is given a fresh execution of its own
-        -- native session (spawn_task_restart): the dispatcher stops the
-        -- running one and resumes the session, reading the record from the
-        -- log. The task stays delivered, so nothing is folded.
         null;
     when 'task.report_unfinished' then
         -- A report still a draft, not taken (spawn_task_report_unfinished):
@@ -2778,177 +2767,6 @@ begin
         'objective', v_old.objective, 'scenario', v_old.scenario, 'reissue_of', p_task)));
     return v_id;
 end $$;
-
--- Restart and reassign (docs/fleet-architecture.md §9, "Restart and
--- reassign"): a delivered task's worker that stalled is given a fresh
--- execution, or its task a fresh worker, keeping what it did. Both take a
--- `delivered` task only; any other (or an unknown one) is refused with its
--- state named (SQLSTATE 55000), and nothing is recorded. `p_by` is who asks,
--- as a `task.cancelled` names it (spawn_task_cancel_by; `human` for the page,
--- spawn_human_restart). Each returns `{task, session_id, agent_id}`: the
--- task and the worker that now carry the work. The `_as` functions are
--- called by the checked ones below, never granted to a login.
---
--- A restart records `task.restarted` {task, session_id, agent_id,
--- execution_id (the running one, else null), by, reason, n (from 1, per
--- task)}; the dispatcher stops that execution (`restart-<task>-<n>-stop`, a
--- Stop: its final checkpoint kept) and, once its end is recorded, resumes
--- the same native session (`restart-<task>-<n>`). The recovery records that
--- end `restarted`, `final`.
-create or replace function spawn_task_restart_as(p_task bigint, p_reason text, p_by text)
-returns jsonb language plpgsql security definer as $$
-declare
-    v_task mission_tasks%rowtype;
-    v_execution text;
-    v_n bigint;
-begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
-    select * into v_task from mission_tasks where id = p_task;
-    if v_task.id is null then
-        raise exception 'task % does not exist: there is nothing to restart', p_task
-            using errcode = '55000';
-    end if;
-    if v_task.state <> 'delivered' then
-        raise exception 'task % is %, not delivered: only a delivered task''s worker is restarted',
-            p_task, v_task.state using errcode = '55000';
-    end if;
-    select s.execution_id into v_execution
-      from agent_status s where s.session_id = v_task.session_id and s.live;
-    select count(*) + 1 into v_n
-      from spawn_events e
-     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-       and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.restarted'
-       and e.kind -> 'detail' -> 'record' ->> 'task' = p_task::text;
-    perform spawn_control_record(jsonb_build_object(
-        'type', 'task.restarted', 'task', p_task, 'session_id', v_task.session_id,
-        'agent_id', v_task.agent_id, 'execution_id', v_execution, 'by', p_by,
-        'reason', nullif(btrim(coalesce(p_reason, '')), ''), 'n', v_n));
-    return jsonb_build_object('task', p_task, 'session_id', v_task.session_id,
-                              'agent_id', v_task.agent_id);
-end $$;
-
--- A reassign, in one transaction as the re-issue does (spawn_task_reissue):
--- the old task's `task.cancelled` names `by`, `reason` and `reassigned_as`
--- (the new task); the new task's `task.assigned` names `reassign_of` (the
--- old) and copies its mission, brief, model, objective, scenario and
--- `created_by`, kind `ephemeral`, with a fresh worker named after the old
--- one's label (`agent_worker_<label>_<new id>`; a resident's name is its
--- label). The dispatcher stops the old worker (`reassign-<task>-stop`, its
--- final checkpoint kept), delivers the new task once it has ended, and its
--- branch starts from the old worker's last checkpoint (OBJECTIVE_FORK).
-create or replace function spawn_task_reassign_as(p_task bigint, p_reason text, p_by text)
-returns jsonb language plpgsql security definer as $$
-declare
-    v_old mission_tasks%rowtype;
-    v_id bigint;
-    v_agent text;
-    v_session text;
-    v_label text;
-begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
-    select * into v_old from mission_tasks where id = p_task;
-    if v_old.id is null then
-        raise exception 'task % does not exist: there is nothing to reassign', p_task
-            using errcode = '55000';
-    end if;
-    if v_old.state <> 'delivered' then
-        raise exception 'task % is %, not delivered: only a delivered task is reassigned',
-            p_task, v_old.state using errcode = '55000';
-    end if;
-    if not exists (select 1 from mission_missions
-                    where id = v_old.mission_id and state in ('open', 'active'))
-       or not spawn_task_may_move(p_task, 'cancelled') then
-        raise exception 'task % may not be assigned again (its mission or worker is closed)',
-            p_task using errcode = '55000';
-    end if;
-    v_id := nextval(pg_get_serial_sequence('mission_tasks', 'id'));
-    v_label := coalesce(substring(v_old.agent_id from '^agent_worker_(.+)_[0-9]+$'),
-                        (select r.name from mission_residents r where r.agent_id = v_old.agent_id),
-                        'task');
-    v_label := trim(both '_' from left(regexp_replace(lower(v_label), '[^a-z0-9]+', '_', 'g'), 20));
-    if v_label = '' then v_label := 'task'; end if;
-    v_agent := format('agent_worker_%s_%s', v_label, v_id);
-    v_session := format('session_worker_%s_%s', v_label, v_id);
-    perform spawn_control_record(jsonb_strip_nulls(jsonb_build_object(
-        'type', 'task.cancelled', 'id', p_task, 'by', p_by,
-        'reason', nullif(btrim(coalesce(p_reason, '')), ''), 'reassigned_as', v_id)));
-    perform spawn_control_record(jsonb_strip_nulls(jsonb_build_object(
-        'type', 'task.assigned', 'id', v_id, 'mission_id', v_old.mission_id,
-        'kind', 'ephemeral', 'agent_id', v_agent, 'session_id', v_session,
-        'brief', v_old.brief, 'model', v_old.model, 'created_by', v_old.created_by,
-        'objective', v_old.objective, 'scenario', v_old.scenario, 'reassign_of', p_task)));
-    return jsonb_build_object('task', v_id, 'session_id', v_session, 'agent_id', v_agent);
-end $$;
-
--- The checked restart and reassign of the owner (the CLI) and the
--- supervisor's login: `by` as spawn_task_cancel_by names the caller.
-create or replace function spawn_task_restart(p_task bigint, p_reason text)
-returns jsonb language plpgsql security definer as $$
-begin
-    if spawn_mission_caller() is null then
-        raise exception '% may not restart tasks', session_user using errcode = '42501';
-    end if;
-    return spawn_task_restart_as(p_task, p_reason, spawn_task_cancel_by());
-end $$;
-
-create or replace function spawn_task_reassign(p_task bigint, p_reason text)
-returns jsonb language plpgsql security definer as $$
-begin
-    if spawn_mission_caller() is null then
-        raise exception '% may not reassign tasks', session_user using errcode = '42501';
-    end if;
-    return spawn_task_reassign_as(p_task, p_reason, spawn_task_cancel_by());
-end $$;
-
--- A person's restart or reassign from the agent page (`spawn serve`, `POST
--- /api/session/<id>/restart` and `/reassign`): the delivered task of
--- session `p_session` (its latest), restarted or reassigned with `by`
--- `human`. A session that holds no delivered task is refused (SQLSTATE
--- 55000, which the page answers 409) and nothing is recorded. Only the
--- `spawn_human` login may call it, beside `spawn_human_input` and
--- `spawn_human_key`; it may call no other mission function. `p_action` is
--- `restart` or `reassign`; the reason is at most 2000 bytes.
-create or replace function spawn_human_task(p_session text, p_action text, p_reason text)
-returns jsonb language plpgsql security definer as $$
-declare
-    v_task bigint;
-begin
-    if spawn_principal() is distinct from 'human' then
-        raise exception '% may not restart or reassign as a person (only the spawn_human login does)',
-            session_user using errcode = '42501';
-    end if;
-    if p_action is null or p_action not in ('restart', 'reassign') then
-        raise exception 'a person restarts or reassigns, not %', coalesce(p_action, 'null')
-            using errcode = '22023';
-    end if;
-    if octet_length(coalesce(p_reason, '')) > 2000 then
-        raise exception 'a reason is at most 2000 bytes, not %', octet_length(p_reason)
-            using errcode = '22023';
-    end if;
-    select k.id into v_task from mission_tasks k
-     where k.session_id = p_session and k.state = 'delivered'
-     order by k.id desc limit 1;
-    if v_task is null then
-        raise exception '% holds no delivered task: there is nothing to %', p_session, p_action
-            using errcode = '55000';
-    end if;
-    if p_action = 'restart' then
-        return spawn_task_restart_as(v_task, p_reason, 'human');
-    end if;
-    return spawn_task_reassign_as(v_task, p_reason, 'human');
-end $$;
-
-do $$
-begin
-    execute format('alter function spawn_human_task(text, text, text) set search_path = %I, pg_temp',
-                   current_schema());
-    execute 'revoke execute on function spawn_human_task(text, text, text) from public';
-    execute format('grant execute on function spawn_human_task(text, text, text) to %I',
-                   spawn_login_role('spawn_human'));
-end
-$$;
 
 -- A resident starts only after a human approves it.
 create or replace function spawn_resident_propose(p_name text, p_charter text)
@@ -4112,8 +3930,7 @@ begin
         if v_cause is null or v_cause not in (
                'exited', 'crashed', 'memory_limit', 'context_exhausted',
                'model_unavailable', 'model_auth', 'model_error', 'host_restart',
-               'database_unavailable', 'disk_full', 'budget', 'stopped', 'restarted',
-               'reassigned') then
+               'database_unavailable', 'disk_full', 'budget', 'stopped') then
             raise exception 'not an interruption cause: %', v_cause
                 using errcode = '22023';
         end if;
@@ -4417,8 +4234,6 @@ begin
         'spawn_task_assign(bigint, text, text, text, text)',
         'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_task_reissue(bigint, jsonb)',
-        'spawn_task_restart(bigint, text)', 'spawn_task_reassign(bigint, text)',
-        'spawn_task_restart_as(bigint, text, text)', 'spawn_task_reassign_as(bigint, text, text)',
         'spawn_resident_propose(text, text)',
         'spawn_resident_retire(text)', 'spawn_resident_approve(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
@@ -4446,8 +4261,7 @@ begin
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
         'spawn_task_assign(bigint, text, text, text, text)',
         'spawn_task_review(bigint, boolean, text, integer)',
-        'spawn_task_cancel(bigint)', 'spawn_task_restart(bigint, text)',
-        'spawn_task_reassign(bigint, text)', 'spawn_resident_propose(text, text)',
+        'spawn_task_cancel(bigint)', 'spawn_resident_propose(text, text)',
         'spawn_resident_retire(text)', 'spawn_task_stages(bigint)'] loop
         execute format('grant execute on function %s to %I', v_function,
                        spawn_login_role('spawn_supervisor'));
@@ -4463,252 +4277,6 @@ $$;
 insert into spawn_grants (principal, agent_id, scope) values
     ('spawn_supervisor', 'agent_resident_*', 'all')
 on conflict (principal, agent_id) do nothing;
-
--- The experience views (docs/fleet-architecture.md §4): what the fleet
--- decided, where the owner stepped in, how each task closed and what the
--- dispatcher escalated, one row per item with its time (`at_ms`), all
--- derived from the log and the command queue. `/api/scorecard/fleet` and
--- `/api/fleet`'s ladder count them over a window (since <= at_ms < until);
--- the scorecard's autonomy (docs/design.md §15) counts the same
--- interventions and its throughput the same landings.
-
--- The control stream, one row per record in stream order, with the numbers
--- the views below read parsed once (a number or a numeric string, as the
--- scorecard reads them; anything else is null). A `legacy.imported` row
--- (from before the control stream) lends its row's fields.
-create or replace view spawn_control_stream as
-select e.session_seq as seq,
-       e.recorded_at_ms as at_ms,
-       x.r ->> 'type' as type,
-       case when x.r ->> 'type' = 'legacy.imported' then x.r ->> 'table' end as legacy_table,
-       case when n.id ~ '^\s*-?[0-9]{1,18}\s*$' then btrim(n.id, E' \t\r\n')::bigint end as id,
-       case when n.mission_id ~ '^\s*-?[0-9]{1,18}\s*$'
-            then btrim(n.mission_id, E' \t\r\n')::bigint end as mission_id,
-       case when n.objective ~ '^\s*-?[0-9]{1,18}\s*$'
-            then btrim(n.objective, E' \t\r\n')::bigint end as objective,
-       x.r as record
-  from spawn_events e
- cross join lateral (select e.kind -> 'detail' -> 'record' as r offset 0) x
- cross join lateral (
-   select case when jsonb_typeof(v.id) in ('number', 'string') then v.id #>> '{}' end as id,
-          case when jsonb_typeof(v.mission_id) in ('number', 'string')
-               then v.mission_id #>> '{}' end as mission_id,
-          case when jsonb_typeof(v.objective) in ('number', 'string')
-               then v.objective #>> '{}' end as objective
-     from (select coalesce(x.r -> 'id', x.r -> 'row' -> 'id') as id,
-                  coalesce(x.r -> 'mission_id', x.r -> 'row' -> 'mission_id') as mission_id,
-                  coalesce(x.r -> 'objective', x.r -> 'row' -> 'objective') as objective) v) n
- where e.session_id = 'session_control' and e.event_name = 'control.recorded';
-
--- Each mission's settings as the stream sets them: a `mission.added` starts
--- ungated and accepted by review, a `mission.configured` (or a legacy
--- mission row) sets its gate and its `accept`. A record reads the latest
--- one before it.
-create or replace view spawn_mission_settings as
-select c.seq,
-       c.at_ms,
-       c.id as mission_id,
-       c.type <> 'mission.added'
-         and coalesce(jsonb_typeof(coalesce(c.record -> 'gate', c.record -> 'row' -> 'gate'))
-                      <> 'null', false) as gated,
-       c.type = 'mission.added'
-         or coalesce(case when jsonb_typeof(a.accept) = 'string' then a.accept #>> '{}' end,
-                     'review') = 'review' as review
-  from spawn_control_stream c
- cross join lateral (
-   select coalesce(c.record -> 'accept', c.record -> 'row' -> 'accept') as accept) a
- where c.id is not null
-   and (c.type in ('mission.added', 'mission.configured')
-        or (c.type = 'legacy.imported' and c.legacy_table = 'mission_missions'));
-
--- Each task from its assignment to its close: the first record that closes
--- it after its assignment (`task.landed`; `task.reviewed` accepted on a
--- mission without a gate then; `task.cancelled`; `task.aborted`;
--- `task.over_budget`), or, for a legacy row closed before the stream, that
--- row's close (no outcome). `closed_at_ms` is null while it is open.
-create or replace view spawn_task_spans as
-with
-  stream as materialized (
-    select c.seq, c.at_ms, c.type, c.legacy_table, c.id, c.mission_id, c.objective, c.record
-      from spawn_control_stream c
-     where c.id is not null
-       and (c.type in ('task.assigned', 'task.landed', 'task.reviewed', 'task.cancelled',
-                       'task.aborted', 'task.over_budget')
-            or (c.type = 'legacy.imported' and c.legacy_table = 'mission_tasks'))),
-  settings as materialized (select s.seq, s.mission_id, s.gated from spawn_mission_settings s),
-  assigned as (
-    select distinct on (c.id) c.id as task_id, c.mission_id, c.seq as assigned_seq,
-           case when c.type = 'legacy.imported'
-                     and jsonb_typeof(c.record -> 'row' -> 'created_at_ms') = 'number'
-                then (c.record -> 'row' ->> 'created_at_ms')::bigint
-                else c.at_ms end as assigned_at_ms,
-           c.type = 'legacy.imported' as legacy, c.record
-      from stream c
-     where c.mission_id is not null
-       and c.type in ('task.assigned', 'legacy.imported')
-     order by c.id, c.seq),
-  gated as (
-    select a.*, coalesce((select s.gated from settings s
-                           where s.mission_id = a.mission_id and s.seq < a.assigned_seq
-                           order by s.seq desc limit 1), false) as gated_then
-      from assigned a)
-select a.task_id,
-       a.mission_id,
-       a.assigned_seq,
-       a.assigned_at_ms,
-       k.seq as closed_seq,
-       k.at_ms as closed_at_ms,
-       k.outcome,
-       k.closed_by
-  from gated a
-  left join lateral (
-    select u.seq, u.at_ms, u.outcome, u.closed_by
-      from (
-        -- A legacy row closed when it was imported.
-        select a.assigned_seq as seq,
-               case when jsonb_typeof(a.record -> 'row' -> 'updated_at_ms') = 'number'
-                    then (a.record -> 'row' ->> 'updated_at_ms')::bigint end as at_ms,
-               null::text as outcome, null::text as closed_by
-         where a.legacy
-           and (a.record -> 'row' ->> 'state' in ('cancelled', 'landed')
-                or (a.record -> 'row' ->> 'state' = 'accepted' and not a.gated_then))
-        union all
-        select c.seq, c.at_ms,
-               case c.type when 'task.landed' then 'landed' when 'task.reviewed' then 'accepted'
-                           when 'task.cancelled' then 'cancelled'
-                           when 'task.aborted' then 'aborted'
-                           else 'over_budget' end,
-               case when jsonb_typeof(c.record -> 'by') = 'string' then c.record ->> 'by' end
-          from stream c
-         where c.id = a.task_id and c.seq > a.assigned_seq
-           and (c.type in ('task.landed', 'task.cancelled', 'task.aborted', 'task.over_budget')
-                or (c.type = 'task.reviewed'
-                    and c.record -> 'accepted' in ('true'::jsonb, '"true"'::jsonb, '"t"'::jsonb)
-                    and not coalesce((select s.gated from settings s
-                                       where s.mission_id = a.mission_id and s.seq < c.seq
-                                       order by s.seq desc limit 1), false)))) u
-     order by u.seq
-     limit 1) k on true;
-
--- Every decision, at its time, by its tier on the ladder: each judgement
--- (`rules` when the rules judged, else `model`) and each command at its
--- creation, by its principal (`dispatcher`, `supervisor`, `human` for the
--- board's and the CLI's, `liveness`; any other principal is its own tier).
--- `source` says which (`judgement` or `command`), `actor` the judge or the
--- principal.
-create or replace view spawn_decisions as
-select j.recorded_at_ms as at_ms,
-       case when j.observation ->> 'judge' = 'rules' then 'rules' else 'model' end as tier,
-       j.session_id,
-       j.agent_id,
-       'judgement'::text as source,
-       j.observation ->> 'judge' as actor,
-       j.event_id,
-       null::bigint as command_id
-  from agent_judgements j
-union all
-select c.created_at_ms,
-       case c.principal when 'spawn-dispatch' then 'dispatcher'
-                        when 'spawn_supervisor' then 'supervisor'
-                        when 'human' then 'human'
-                        when 'spawn' then 'human'
-                        when 'spawn-liveness' then 'liveness'
-                        else c.principal end,
-       c.session_id,
-       c.agent_id,
-       'command',
-       c.principal,
-       null,
-       c.id
-  from spawn_commands c;
-
--- The owner's interventions (docs/design.md §15, autonomy): (a) a command
--- of the board or the CLI (`human`, `spawn`) at its creation; (b) a
--- `mission.resumed`; (c) an owner task, a `task.assigned` by `human` on a
--- mission a review accepts then; (d) a cancel-and-reassign: a person's
--- `task.cancelled` (`by` absent or `human`) of an open task, at the first
--- later assignment in its mission of the same objective (or, without one,
--- the same brief). A loop's cancellation is no intervention.
-create or replace view spawn_interventions as
-with
-  stream as materialized (
-    select c.seq, c.at_ms, c.type, c.id, c.mission_id, c.objective, c.record
-      from spawn_control_stream c
-     where c.id is not null and c.type in ('mission.resumed', 'task.assigned',
-                                           'task.cancelled', 'legacy.imported')),
-  settings as materialized (select s.seq, s.mission_id, s.review from spawn_mission_settings s)
-select c.created_at_ms as at_ms,
-       'command'::text as kind,
-       null::bigint as mission_id,
-       null::bigint as task_id,
-       c.id as command_id
-  from spawn_commands c
- where c.principal in ('human', 'spawn')
-union all
-select r.at_ms, 'resume', r.id, null, null
-  from stream r
- where r.type = 'mission.resumed'
-union all
-select a.at_ms, 'owner_task', a.mission_id, a.id, null
-  from stream a
- where a.type = 'task.assigned' and a.mission_id is not null
-   and a.record -> 'created_by' = '"human"'::jsonb
-   and coalesce((select s.review from settings s
-                   where s.mission_id = a.mission_id and s.seq < a.seq
-                   order by s.seq desc limit 1), true)
-union all
-select n.at_ms, 'cancel_reassign', n.mission_id, n.id, null
-  from spawn_task_spans k
-  join stream x on x.seq = k.closed_seq and x.type = 'task.cancelled'
-  join stream o on o.seq = k.assigned_seq
- cross join lateral (
-   select n.at_ms, n.mission_id, n.id
-     from stream n
-    where n.type = 'task.assigned' and n.seq > x.seq and n.mission_id = k.mission_id
-      and case when o.objective is not null then n.objective = o.objective
-               else coalesce(o.record ->> 'brief', o.record -> 'row' ->> 'brief') is not null
-                    and n.record ->> 'brief'
-                        = coalesce(o.record ->> 'brief', o.record -> 'row' ->> 'brief') end
-    order by n.seq
-    limit 1) n
- where k.outcome = 'cancelled'
-   and (jsonb_typeof(x.record -> 'by') is distinct from 'string' or x.record ->> 'by' = 'human');
-
--- How each task closed, at its closing record: `landed`, `accepted` (by
--- review, on a mission without a gate), `cancelled` (`by` who), `aborted`
--- or `over_budget`. A landing as the scorecard's throughput counts it is a
--- `landed` or an `accepted`.
-create or replace view spawn_outcomes as
-select k.closed_at_ms as at_ms,
-       k.outcome,
-       k.task_id,
-       k.mission_id,
-       k.closed_by as "by"
-  from spawn_task_spans k
- where k.outcome is not null;
-
--- What the dispatcher escalated to the supervisor: each distinct tag
--- (`<session> <escalation>`, dispatch.rs `Escalation::tag`) of its inputs
--- into the supervisor, once, at the first command that carried it.
-create or replace view spawn_escalations as
-select distinct on (t.tag) c.created_at_ms as at_ms, t.tag, c.id as command_id
-  from spawn_commands c
- cross join lateral jsonb_array_elements_text(
-         case when jsonb_typeof(c.action -> 'tags') = 'array' then c.action -> 'tags'
-              else '[]'::jsonb end) t(tag)
- where c.principal = 'spawn-dispatch' and c.session_id = 'session_supervisor'
-   and c.action ->> 'type' = 'input'
- order by t.tag, c.created_at_ms, c.id;
-
--- The reader (`spawn serve`) and the supervisor read them.
-do $$
-begin
-    execute format('grant select on spawn_control_stream, spawn_mission_settings, '
-                   'spawn_task_spans, spawn_decisions, spawn_interventions, spawn_outcomes, '
-                   'spawn_escalations to %I, %I',
-                   spawn_login_role('spawn_reader'), spawn_login_role('spawn_supervisor'));
-end
-$$;
 
 -- `spawn serve` connects with this login. It reads every table and writes
 -- nothing, so the dashboard cannot change the log or the queue even if it is

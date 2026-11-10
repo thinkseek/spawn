@@ -181,7 +181,6 @@ pub(super) fn shared(path: &str) -> bool {
             | "/api/rsi"
             | "/api/rsi/pane"
             | "/api/scorecard"
-            | "/api/scorecard/fleet"
     ) || path
         .strip_prefix("/api/pane/")
         .is_some_and(|id| !id.is_empty())
