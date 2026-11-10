@@ -1684,7 +1684,13 @@ fn fleet_session(rest: &str, query: &str) -> Result<Value, String> {
     let store = open_store()?;
     match what {
         "judgements" => store.judgements_json(session.as_str(), limit).map_err(err),
-        "commands" => store.commands_json(session.as_str(), limit).map_err(err),
+        "commands" => store
+            .commands_json(
+                session.as_str(),
+                limit,
+                crate::config::message_taken_ms(),
+            )
+            .map_err(err),
         other => Err(format!("{BAD_REQUEST}unknown fleet view {other}")),
     }
 }
@@ -2844,7 +2850,7 @@ mod tests {
         in_test_schema(|owner, store| {
             let commands = || {
                 store
-                    .commands_json("session_supervisor", 50)
+                    .commands_json("session_supervisor", 50, 120_000)
                     .expect("commands")
             };
             let to = |token, open, headers: &str, path: &str, body: &str| {
@@ -2951,7 +2957,7 @@ mod tests {
         in_test_schema(|owner, store| {
             let commands = || {
                 store
-                    .commands_json("session_supervisor", 50)
+                    .commands_json("session_supervisor", 50, 120_000)
                     .expect("commands")
             };
             let to = |path: &str, body: &str| {
