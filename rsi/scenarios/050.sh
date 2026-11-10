@@ -26,7 +26,9 @@
 #   backup.verified: V1 ok -4, V2 failed -1.
 # Checked:
 #   (1) the loop's first start: mission_halted on "second", backup_stale on
-#       D2 and drill_failed on V2 are open.
+#       D2 and drill_failed on V2 are open. The first halt is not open: its
+#       resume (-2) is in the same history, so it never fired, or it fired
+#       and was cleared naming that resume.
 #   (2) the loop is stopped and started: 10 s on (five readings), the three
 #       are still open, each still uncleared in the store. Then again, once
 #       more.
@@ -34,18 +36,26 @@
 #       resume --id 1` (a real resume) clears the halt; a dump D3 now clears
 #       backup_stale; a drill V3 ok now clears drill_failed.
 #   (4) a further restart fires none of them again and clears nothing else.
+#   (5) while the loop is down: mission #1 halted ("third") and resumed, a
+#       drill V4 failed and V5 ok. At the next start neither the halt's nor
+#       V4's alert is open (never fired, or cleared naming the resume / V5).
+#       A loop that crashed or was stopped while the integrator halted a
+#       mission and the owner resumed it from the CLI meets this history.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
 # error exits 2, never 1.
 #
-# Fails with 1 at (2) on the live main (ea3a2e9f): after the restart the
-# halt's alert is cleared by the -2 resume. It passes once an alert clears
-# only on evidence recorded after the record it fired on.
+# Fails with 1 at (1) on the live main (ea3a2e9f): the first halt stays open
+# though its resume is in the history the start read (the start feeds every
+# record before it records any alert, so the resume finds nothing open).
+# With that alone fixed it fails at (2): after the restart the three alerts
+# are cleared on the -2 resume, D1 and V1. It passes once an alert clears on
+# a record after the one it fired on, and only on such a record, whether or
+# not both are in what one start reads.
 # Runs inside the gate's sandbox (scripts/rsi/gate.sh): needs SPAWN_BIN and
 # SPAWN_TEST_DATABASE_URL, creates and drops its own database, uses a
 # private tmux socket, no network. Every wait is bounded in time.
-
 
 set -eu
 
@@ -400,6 +410,7 @@ task_usd() {
 costs() { near "$(task_usd "$1")" "$2"; }
 alerts_for() { q "select count(*) from spawn_alerts where kind = 'cost_budget' and subject = 'mission #$1'"; }
 
+
 note() { echo "050: $*" >&2; }
 
 # --- the records --------------------------------------------------------------------
@@ -452,13 +463,25 @@ K_D2="backup_stale:dump:$d2"
 K_V2="drill_failed:$v2"
 opened() { [ "$(state "$K_H2")" = open ] && [ "$(state "$K_D2")" = open ] && [ "$(state "$K_V2")" = open ]; }
 three() { echo "halt $(state "$K_H2"), backup_stale $(state "$K_D2"), drill_failed $(state "$K_V2")"; }
+# settled <label> <key> <the later record>: an alert whose firing record and a
+# later clearing record were both in what a start read is not open: never
+# fired, or fired and cleared naming that later record.
+settled() {
+    st=$(state "$2")
+    case "$st" in
+    none) ;;
+    cleared) assert_eq "$(cleared_by "$2")" "$3" "$1 the record $2 cleared on" ;;
+    *) fail "$1 $2 is '$st' (cleared on '$(cleared_by "$2")'): its firing record and the later record $3 that clears it were both in what the loop's start read, so it must not be open" ;;
+    esac
+}
 
 # --- (1) the first start ----------------------------------------------------------
 
 start_loop
 wait_until 30 opened ||
     fail "(1) 30 s after the loop's first start the alerts read [$(three)]: each should be open (the halt of $h1/$h2, the dump $d2 older than its 2 h, the failed drill $v2)"
-note "(1) first start: the second halt, the stale dump and the failed drill are open"
+settled "(1) first start:" "$K_H1" "$r1"
+note "(1) first start: the second halt, the stale dump and the failed drill are open; the first halt, resumed at $r1, is not"
 
 # --- (2) restarts --------------------------------------------------------------------
 
@@ -495,5 +518,21 @@ sleep 10
 assert_eq "$(q "select count(*) || ' ' || count(*) filter (where state = 'open') from spawn_alerts where kind in ('mission_halted', 'backup_stale', 'drill_failed')")" \
     "$before" "(4) the alerts of the three kinds (all, open) after a further restart"
 
-echo "050: an alert clears only on a record after the one it fired on, at a first start and after restarts; later evidence clears each"
+note "(4) a further restart: nothing fired again, nothing else cleared"
+
+# --- (5) a halt and its resume while the loop is down ---------------------------------
+
+stop_loop
+h3=$(rec 0 '{"type":"mission.halted","id":1,"reason":"third"}')
+r3=$(rec 0 '{"type":"mission.resumed","id":1}')
+v4=$(rec 0 "$(verified v4 false)")
+v5=$(rec 0 "$(verified v5 true)")
+refold
+start_loop
+sleep 10
+settled "(5) a halt and its resume written while the loop was down:" "mission_halted:1:$h3" "$r3"
+settled "(5) a failed drill and a good one written while the loop was down:" "drill_failed:$v4" "$v5"
+note "(5) a halt resumed and a drill failed then passed while the loop was down: neither is open at the next start"
+
+echo "050: an alert clears only on a record after the one it fired on, at a first start and after restarts, and when both an alert's record and its clearing record came while the loop was down; later evidence clears each"
 exit 0
