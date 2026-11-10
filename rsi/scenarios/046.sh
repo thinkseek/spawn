@@ -31,7 +31,9 @@
 # text with BB:DECLINE; for BB:BAD <n>: `maybe` (refused), `declined` with no
 # why (refused), `done` for message <n> (another session's), then `done`;
 # for BB:AGAIN: `done`, then `declined "changed my mind"`; for BB:LATE:
-# `done` 8 s after the prompt. `silent` takes and answers, never acks.
+# `done` 8 s after the prompt; for BB:SUBDIR: `done` from a subdirectory
+# of its workspace; for BB:FORGE <n> <session>: `done` for message <n>
+# with SPAWN_SESSION_ID set to <session> (another worker's), then `done`. `silent` takes and answers, never acks.
 # `report` writes its report (Outcome done) on its task; `block` writes one
 # with Outcome "blocked: bb has no access to the data". Inputs come from a
 # person (`spawn submit`, principal bb-person). Checked:
@@ -42,7 +44,11 @@
 #       forms exit non-zero, `silent`'s message stays unacted, the message
 #       itself reads done; for BB:AGAIN it reads done (the first ack), not
 #       declined; acker's own task delivery, which its engine acked too,
-#       stays unacted.
+#       stays unacted. An ack run from a subdirectory of the workspace is
+#       recorded (done within 20 s). An ack of silent's message run in
+#       acker's pane with SPAWN_SESSION_ID set to silent's session records
+#       nothing on it: whose ack it is is where it was made, never an id
+#       it carries.
 #   (3) never acked: `silent`'s message is answered, `acted` null, state
 #       `answered`, 10 s after it was answered.
 #   (4) a report answers its task: `reporter`'s delivery reads {done};
@@ -274,6 +280,13 @@ act() { # <the prompt's text>: what the mode does with it
       ack "$id" declined "changed my mind"
       ;;
     *BB:LATE*) (sleep 8; ack "$id" done) </dev/null >/dev/null 2>&1 & ;;
+    *BB:SUBDIR*) (mkdir -p bb-sub && cd bb-sub && ack "$id" done) ;;
+    *BB:FORGE*)
+      # Another worker's message, acked with that worker's session named.
+      forged=$(printf '%s\n' "$1" | sed -n 's/.*BB:FORGE \([0-9][0-9]*\) \([A-Za-z0-9_.-]*\).*/\1 \2/p' | head -n 1)
+      SPAWN_SESSION_ID=${forged#* } ack "${forged%% *}" done
+      ack "$id" done
+      ;;
     *) ack "$id" done ;;
     esac
     ;;
@@ -548,7 +561,21 @@ acted_ok acker "$again" '.acted.outcome == "done"' ||
 [ -n "$(ack_rc "$(get acker start)_done")" ] || harness "acker's engine never acked its task's delivery $(get acker start)"
 acted_ok acker "$(get acker start)" '.acted == null' ||
     fail "(2) acker's task delivery $(get acker start), which a report answers, reads $(show acker "$(get acker start)") after \`spawn ack $(get acker start) done\`"
-note "(2) the bad acks refused; another session's, a second, and a task delivery's ack recorded nothing"
+sub=$(send acker bb-sub "BB:SUBDIR")
+until_message acker "$sub" '.acted != null' 20 ||
+    fail "(2) acker ran \`spawn ack $sub done\` from a subdirectory of its workspace (exit $(ack_rc "${sub}_done")) and the message is not acted within 20 s: $(show acker "$sub")"
+acted_ok acker "$sub" '.acted.outcome == "done"' ||
+    fail "(2) acker's message $sub, acked done from a subdirectory, reads $(show acker "$sub")"
+forge=$(send acker bb-forge "BB:FORGE $quiet $(get silent session)")
+until_message acker "$forge" '.acted != null' 20 ||
+    fail "(2) acker's message $forge is not acted within 20 s: $(show acker "$forge")"
+[ "$(grep -c " ${quiet}_done:" "$WORK/ack.out")" -ge 2 ] ||
+    harness "acker's engine never acked $quiet with silent's session named"
+sleep 3
+commands silent
+acted_ok silent "$quiet" '.acted == null and .state == "answered"' ||
+    fail "(2) silent's message $quiet was acked from acker's pane with SPAWN_SESSION_ID=$(get silent session) and reads $(show silent "$quiet"); an ack is the pane's, whatever session it names"
+note "(2) the bad acks refused; another session's (named or not), a second, and a task delivery's ack recorded nothing; one from a subdirectory recorded"
 
 # --- (3) never acked ----------------------------------------------------------------
 
