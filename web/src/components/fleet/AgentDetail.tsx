@@ -155,14 +155,10 @@ export function AgentDetail({ agent, name = null, held = null, onClose, onOpenTi
       }
     >
       <div className="min-h-0 flex-1 overflow-y-auto bg-app-shell">
-<<<<<<< ea3a2e9f4fcf687a4d0248cc86d13167ffa24686
         <AgentSummary agent={agent} held={held} commands={commands.data} />
-=======
-        <AgentSummary agent={agent} commands={commands.data} />
         {agent.role === "worker" && (
           <WorkerMoves sessionId={sessionId} to={shownName} onOpenTimeline={onOpenTimeline} />
         )}
->>>>>>> 1f63c6306f7e6c7bedfe0d4c3d245ad659496a31
         <div className="grid gap-3 p-3 sm:p-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
           <div className="flex min-w-0 flex-col gap-3">
             <RecentTools session={tail.data} error={tail.error} />

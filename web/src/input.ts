@@ -95,14 +95,14 @@ export function sendAnswer(status: number | null, body: unknown): SendAnswer {
   return { ok: false, error: refusal(status, body), status };
 }
 
-<<<<<<< ea3a2e9f4fcf687a4d0248cc86d13167ffa24686
 /** Whether a message not taken keeps its key for the next try, by the
  * refusal's status. It does (sent again unchanged, it types once), except
  * after 409: the server holds that key for another message (another
  * session's, or other text), so the same key would be refused for good. */
 export function keepsKey(status: number | null): boolean {
   return status !== 409;
-=======
+}
+
 /** The server's answer to a restart or a reassign (`POST
  * /api/session/<id>/restart`, `/reassign`): the task and the worker's
  * session that now carry the work, or why it was refused (409: the session
@@ -121,7 +121,6 @@ export function moveAnswer(status: number | null, body: unknown): MoveAnswer {
     return { ok: true, task: answer.task, session_id: answer.session_id };
   }
   return { ok: false, error: refusal(status, body), status };
->>>>>>> 1f63c6306f7e6c7bedfe0d4c3d245ad659496a31
 }
 
 /** One message this page sent (or tried to). */
