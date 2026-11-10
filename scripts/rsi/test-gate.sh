@@ -1856,6 +1856,28 @@ expect "one the candidate edits is refused" "$(judge_rust "$macro_edited")" \
     'a local proc-macro or build script outside the workspace: evil'
 rust_base=$saved_rust_base
 
+# 14b. A dependency graph that does not resolve offline: a candidate's
+# whose base resolves here is rejected; one whose base does not resolve
+# either is the host's registry lacking a crate (a runner never sent it), a
+# fact about the host (exit 6, `cannot_judge`), never a rejection of the
+# work. The crate is one no registry here has; the lockfile is not updated.
+rust_branch rust-unresolved
+printf '\n[dependencies]\nno-such-crate-anywhere = "1"\n' >>"$seed/Cargo.toml"
+unresolved=$(commit rust-unresolved)
+expect "a candidate whose base resolves is rejected for its graph" "$(judge_rust "$unresolved")" \
+    '{"verdict":"rejected","reason":"candidate'"'"'s dependency graph does not resolve offline"}'
+saved_rust_base=$rust_base
+rust_base=$unresolved
+rust_branch rust-unresolved-base
+printf 'a change on a base that does not resolve\n' >"$seed/notes.txt"
+on_unresolved=$(commit rust-unresolved-base)
+expect "one whose base does not resolve either cannot be judged here" "$(judge_rust "$on_unresolved")" \
+    'exit=6 {"cannot_judge":true,"scenario":"dependencies","runs":"1"}'
+refuse "and is no verdict" "$(cat "$integrator/verdict")" '"verdict"'
+expect "the gate says why, for the integrator's record" "$(cat "$work/gate.out")" \
+    '| dependencies: cannot judge: the base'"'"'s dependency graph does not resolve offline on this host either'
+rust_base=$saved_rust_base
+
 # 6. A reason with a quote stays valid JSON.
 quoted_scenarios=$work/quoted
 cp -r "$scenarios" "$quoted_scenarios"
@@ -2347,6 +2369,41 @@ expect "base only takes three arguments" \
     "exit=$(sh "$gate" --base-only "$repo" "$base" >/dev/null 2>&1 || echo $?)" 'exit=3'
 expect "a harness error in base only is exit 4" \
     "$(export SPAWN_GATE_JOBS=4 XDG_CACHE_HOME="$work/caches/warm-abort"; base_only "$abort")" 'exit=4'
+
+# 17c. Base keys (`--base-keys`): the key each objective's base result is
+# cached under, printed with nothing built or run, and the same key the
+# base-only run above wrote its entry as. deploy/gate-runner.sh --check
+# compares two hosts' keys before shipping gates between them.
+base_keys() { # <scenarios>: the gate's exit status
+    status=0
+    SPAWN_GATE_VERDICT=$integrator/verdict sh "$gate" --base-keys "$repo" "$base" "$1" \
+        >"$work/base-keys.out" 2>&1 || status=$?
+    echo "exit=$status"
+}
+# A directory of its own, as the judge above had: the case before this one
+# judged a gate into $integrator after its own check.
+rm -rf "$integrator"
+mkdir -m 700 "$integrator"
+expect "base keys: exit 0" "$(base_keys "$par")" 'exit=0'
+expect "one key line per objective" \
+    "$(grep -c '^key [0-9]*\.sh [0-9a-f]\{64\}$' "$work/base-keys.out")" 4
+expect "the objectives the base phase judges" \
+    "$(sed -n 's/^key \([0-9]*\.sh\) .*/\1/p' "$work/base-keys.out" | tr '\n' ' ')" \
+    '051.sh 052.sh 053.sh 054.sh '
+refuse "nothing built or run" "$(cat "$work/base-keys.out")" '| == '
+refuse "and no verdict, whatever SPAWN_GATE_VERDICT says" "$(ls -A "$integrator")" 'verdict'
+expect "the key is the entry the base-only run wrote" \
+    "$(sed -n 's/^key 051\.sh \([0-9a-f]\{64\}\)$/\1/p' "$work/base-keys.out" |
+        while IFS= read -r key; do [ -f "$work/caches/warm/spawn/gate-base/$key" ] && echo found; done)" \
+    found
+grep '^key ' "$work/base-keys.out" >"$work/keys.first"
+XDG_CACHE_HOME="$work/caches/keys-again" sh "$gate" --base-keys "$repo" "$base" "$par" \
+    >"$work/base-keys.again" 2>&1 || true
+grep '^key ' "$work/base-keys.again" >"$work/keys.again"
+expect "the same host computes the same keys again" \
+    "$(cmp -s "$work/keys.first" "$work/keys.again" && echo same)" same
+expect "base keys takes three arguments" \
+    "exit=$(sh "$gate" --base-keys "$repo" "$base" >/dev/null 2>&1 || echo $?)" 'exit=3'
 
 # 17b. A gate that starts while a base-only run judges the same key waits
 # for its result instead of judging it again (the key's lock).
