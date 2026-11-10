@@ -7,7 +7,6 @@ import type { PollResult, SessionTail } from "./api";
 import { markNeedsHuman, needsHuman } from "./attention";
 import { DetailsRail, ExecutionSummary, RailContent } from "./components/DetailsRail";
 import { MobileNav, Sidebar } from "./components/Sidebar";
-import { StateBadge } from "./components/StateDot";
 import { Timeline } from "./components/Timeline";
 import { AlertsView, OpenAlerts } from "./components/alerts/AlertsView";
 import { FleetView } from "./components/fleet/FleetView";
@@ -224,7 +223,6 @@ export default function App() {
   const summary =
     overview.data?.sessions.find((entry) => entry.session_id === selectedId) ??
     null;
-  const state = detail?.state ?? summary?.state ?? "unknown";
   const freshness = detail?.freshness ?? null;
   const error = overview.error ?? session.error;
   const agentId = detail?.agent_id || summary?.agent_id || null;
@@ -322,7 +320,10 @@ export default function App() {
                       {sessionId}
                     </span>
                   )}
-                  {sessionId && <StateBadge state={state} />}
+                  {/* No judged state here: the header says what is
+                      recorded (the execution, ExecutionSummary), and the
+                      judgement, which can lag it ("Completed" beside a
+                      running execution), is in the Observation card. */}
                 </>
               }
             >
