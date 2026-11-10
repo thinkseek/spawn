@@ -696,12 +696,14 @@ select count(*)
 /// work: rev-e on a114a9e, objective 55's task 149). spawn-cli checks in
 /// git that the commit holds changes of its own. A reassigned task (its
 /// `reassign_of`, `spawn_task_reassign`), objective or not, starts from the
-/// task it takes over, before any other: `reassign` is then true. `$1` the
+/// task it takes over, before any other: `reassign` is then true (absent
+/// otherwise). `$1` the
 /// task.
 pub(crate) const OBJECTIVE_FORK: &str = r"
 select coalesce((
-  select jsonb_build_object('task', p.id, 'commit', c.commit,
-                            'reassign', (p.id = k.reassign_of) is true)
+  select jsonb_build_object('task', p.id, 'commit', c.commit)
+         || case when p.id = k.reassign_of then '{"reassign": true}'::jsonb
+                 else '{}'::jsonb end
     from mission_tasks k
     join mission_tasks p on p.mission_id = k.mission_id
                         and (p.id = k.reassign_of or p.objective = k.objective)
