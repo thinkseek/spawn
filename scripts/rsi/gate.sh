@@ -28,7 +28,10 @@
 #   on the candidate.
 # - Every other scenario in the directory must pass on the candidate, except
 #   ratchet scenarios (a line `# rsi: ratchet`), which compare against the
-#   base and so fail on any tree that did not improve, and objective
+#   base and so fail on any tree that did not improve, task-only scenarios
+#   (a line `# rsi: task-only`), which a gate cannot judge and which are run
+#   only as their own task's scenario, never on the base for another gate
+#   nor as a regression (029: the sandbox has no systemd user manager), and objective
 #   scenarios (`<digits>.sh`) the base fails too: an objective nobody has
 #   solved yet is not a regression, and must not block unrelated work. One
 #   the base fails that was solved, with all else that decides it the same, on an ancestor of
@@ -2996,6 +2999,13 @@ objective_key() {
     } | sha256sum | cut -d' ' -f1
 }
 
+# not_a_regression <scenario>: 0 for a scenario no gate runs but as its own
+# task's: a ratchet (`# rsi: ratchet`, it compares against the base) or a
+# task-only one (`# rsi: task-only`, a gate cannot judge it: see the header).
+not_a_regression() {
+    grep -qE '^# rsi: (ratchet|task-only)' "$1"
+}
+
 # The base phase: every objective's key (and its result, when the cache
 # has it), then one build of the base for those it has not, then their runs.
 : >"$work/base-results"
@@ -3009,7 +3019,7 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
     [ -f "$objective" ] || continue
     if [ "$objective" != "$scenario" ]; then
         case "$(basename "$objective")" in *[!0-9].sh | .sh) continue ;; esac
-        grep -q '^# rsi: ratchet' "$objective" && continue
+        not_a_regression "$objective" && continue
     fi
     grep -qxF "$objective" "$work/base-results.seen" 2>/dev/null && continue
     printf '%s\n' "$objective" >>"$work/base-results.seen"
@@ -3585,7 +3595,7 @@ for other in "$scenarios"/check-tests.sh "$scenarios"/*.sh; do
     [ "$other" = "$scenario" ] && continue
     [ "$other" = "$scenarios/check-tests.sh" ] && [ -n "${tests_queued-}" ] && continue
     [ "$other" = "$scenarios/check-tests.sh" ] && tests_queued=1
-    grep -q '^# rsi: ratchet' "$other" && continue
+    not_a_regression "$other" && continue
     add_candidate_job "$other" "regression: $(basename "$other") must still pass"
     [ "$other" != "$scenarios/check-tests.sh" ] || : >"$job/head"
 done
