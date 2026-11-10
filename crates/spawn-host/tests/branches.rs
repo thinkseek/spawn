@@ -1191,3 +1191,132 @@ fn mains_copies_come_back_at_every_mount_until_main_is_in() {
     fixture.store.mount(&branch).expect("mount");
     assert!(!directory.join(&copy).exists());
 }
+
+/// GitHub #16 item 5: main moves again while the conflict is open and the
+/// workspace is not mounted. The resume's clean-only merge finds the
+/// conflict with the new main, so the mount after it puts back that main's
+/// versions, not the ones recorded at the first conflict. A conflict that
+/// markers can show by then has no copies: the next merge into the
+/// workspace writes markers.
+#[test]
+fn mains_copies_at_a_mount_are_of_the_main_the_conflict_is_with() {
+    let fixture = Fixture::new(
+        "copies-main-moves",
+        &[("README.md", "base\n"), ("notes.txt", "notes\n")],
+    );
+    let (branch, workspace, directory) = fixture.mount("agent_a");
+    fs::remove_file(directory.join("notes.txt")).expect("delete");
+    fixture.work(&workspace, &[("README.md", "mine\n")]);
+    let first = fixture.land(&[("notes.txt", "notes, revised\n")]);
+    assert!(matches!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Conflicted { marked: false, .. }
+    ));
+    assert_eq!(
+        fixture.store.main_copies("agent_a"),
+        Some((first, vec!["notes.txt".to_string()]))
+    );
+    fixture.store.unmount(&workspace).expect("unmount");
+
+    let second = fixture.land(&[("notes.txt", "notes, revised twice\n")]);
+    assert_eq!(
+        fixture.store.merge_main_clean(&branch).expect("merge"),
+        BaseMerge::Conflicted {
+            files: vec!["notes.txt".to_string()],
+            marked: false,
+        }
+    );
+    let workspace = fixture.store.mount(&branch).expect("mount");
+    let copy = format!("{}/notes.txt", spawn_host::MAIN_COPIES);
+    assert_eq!(
+        read(&directory, &copy),
+        "notes, revised twice\n",
+        "the copy is of the main the conflict is with"
+    );
+    assert_eq!(
+        fixture.store.main_copies("agent_a"),
+        Some((second, vec!["notes.txt".to_string()]))
+    );
+    fixture.store.unmount(&workspace).expect("unmount");
+
+    // Main deletes the file too and changes README.md: the conflict left
+    // is in a file's lines.
+    git(&fixture.checkout, &["rm", "-q", "notes.txt"]);
+    fixture.land(&[("README.md", "theirs\n")]);
+    assert_eq!(
+        fixture.store.merge_main_clean(&branch).expect("merge"),
+        BaseMerge::Conflicted {
+            files: vec!["README.md".to_string()],
+            marked: false,
+        }
+    );
+    fixture.store.mount(&branch).expect("mount");
+    assert!(
+        !directory.join(&copy).exists(),
+        "no copy of a file main lacks"
+    );
+    assert_eq!(fixture.store.main_copies("agent_a"), None);
+}
+
+/// GitHub #16 item 5: a copy of main's version that cannot be read from git
+/// or written into the workspace is a failure, not a file main does not
+/// have: the merge (or the mount) fails and records nothing, so no note
+/// tells the worker to delete a file main holds.
+#[test]
+fn a_copy_of_mains_version_that_fails_is_not_a_file_main_lacks() {
+    let fixture = Fixture::new(
+        "copies-fail",
+        &[("README.md", "base\n"), ("notes.txt", "notes\n")],
+    );
+    let (branch, workspace, directory) = fixture.mount("agent_a");
+    fs::remove_file(directory.join("notes.txt")).expect("delete");
+    fixture.work(&workspace, &[("work.txt", "mine\n")]);
+    let main = fixture.land(&[("notes.txt", "notes, revised\n")]);
+    let copy = format!("{}/notes.txt", spawn_host::MAIN_COPIES);
+
+    // The write: `.spawn` is a symlink the agent made, never written through.
+    let elsewhere = fixture.checkout.join("../elsewhere");
+    fs::create_dir_all(&elsewhere).expect("a directory outside the workspace");
+    std::os::unix::fs::symlink(&elsewhere, directory.join(".spawn")).expect("symlink");
+    let merged = fixture.store.merge_base(&workspace);
+    assert!(merged.is_err(), "the copy was not written: {merged:?}");
+    assert_eq!(fixture.store.main_copies("agent_a"), None);
+    assert!(!elsewhere.join("main").exists());
+    fs::remove_file(directory.join(".spawn")).expect("remove the symlink");
+
+    // The read: main's blob cannot be read.
+    let blob = git(&fixture.checkout, &["rev-parse", "main:notes.txt"]);
+    let object = fixture
+        .checkout
+        .join(".git/objects")
+        .join(&blob[..2])
+        .join(&blob[2..]);
+    let kept = object.with_extension("kept");
+    fs::rename(&object, &kept).expect("lose the blob");
+    let merged = fixture.store.merge_base(&workspace);
+    assert!(merged.is_err(), "main's version was not read: {merged:?}");
+    assert_eq!(fixture.store.main_copies("agent_a"), None);
+
+    // With the blob back the merge copies it; a mount that cannot read it
+    // again fails and leaves the workspace as it was.
+    fs::rename(&kept, &object).expect("the blob is back");
+    assert!(matches!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Conflicted { marked: false, .. }
+    ));
+    assert_eq!(
+        fixture.store.main_copies("agent_a"),
+        Some((main, vec!["notes.txt".to_string()]))
+    );
+    fs::write(directory.join("unsaved.txt"), "unsaved\n").expect("write");
+    fs::rename(&object, &kept).expect("lose the blob");
+    let mounted = fixture.store.mount(&branch);
+    assert!(mounted.is_err(), "the copy is not back: {mounted:?}");
+    assert!(
+        directory.join("unsaved.txt").exists(),
+        "the workspace stays"
+    );
+    fs::rename(&kept, &object).expect("the blob is back");
+    fixture.store.mount(&branch).expect("mount");
+    assert_eq!(read(&directory, &copy), "notes, revised\n");
+}

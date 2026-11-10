@@ -534,3 +534,21 @@ fn ends_pending_holds_until_the_waiting_stop_is_finished() {
     assert_eq!(rig.finished(2), Some((true, String::new())));
     assert!(!rig.bridge.ends_pending(), "nothing is left to finish");
 }
+
+/// An end no command asked for (its runner gone) whose kill waits is
+/// pending too: `ends_pending` reads the kill under way, not only a waiting
+/// stop (rev-e's note 1 on 56835de3).
+#[test]
+fn an_end_no_command_asked_for_is_pending_while_its_kill_waits() {
+    let mut rig = Rig::new();
+    rig.store.untrack(&terminal(), "a shell prompt, restored");
+    rig.tick();
+    assert_eq!(rig.kills(), 1, "the lost runner's end kills its terminal");
+    assert!(
+        rig.bridge.ends_pending(),
+        "no stop is held, and the end waits for its kill"
+    );
+    rig.host.release(Release::Gone);
+    rig.tick_until(Rig::ended);
+    assert!(!rig.bridge.ends_pending(), "the end is done");
+}

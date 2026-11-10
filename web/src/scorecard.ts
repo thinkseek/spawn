@@ -5,6 +5,9 @@
 // stays a thin layer over them.
 
 import { readApi } from "./api";
+import { formatCost, formatDecimal, modelCostText } from "./scorecardFormat.ts";
+
+export { formatDecimal };
 
 // ---------------------------------------------------------------------------
 // Types: exactly the JSON the server answers.
@@ -348,12 +351,6 @@ export function notEnoughText(n: number, minN: number): string {
   return `not enough data (n ${n}, minimum ${minN})`;
 }
 
-/** A plain number with at most `digits` decimals, grouped: 2,033.333. */
-export function formatDecimal(value: number | null, digits = 3): string {
-  if (value === null || !Number.isFinite(value)) return "—";
-  return value.toLocaleString("en-US", { maximumFractionDigits: digits });
-}
-
 /** Milliseconds as hours, the unit the titles spell out: "5.00 h". */
 export function formatHours(ms: number | null): string {
   if (ms === null || !Number.isFinite(ms)) return "—";
@@ -387,7 +384,8 @@ export function msTitle(ms: number | null): string {
 }
 
 /** A dimension's value in its unit. Durations as a span, first-pass as a
- * percentage, cost as whole tokens, the rest as decimals. */
+ * percentage, cost as whole tokens (decimals below one token), the rest as
+ * decimals. */
 export function formatValue(key: DimensionKey, value: number | null): string {
   if (value === null || !Number.isFinite(value)) return "—";
   switch (key) {
@@ -399,7 +397,7 @@ export function formatValue(key: DimensionKey, value: number | null): string {
     case "throughput":
       return `${formatDecimal(value, 3)}/h`;
     case "cost":
-      return formatDecimal(value, 0);
+      return formatCost(value);
     case "rework":
     case "autonomy":
     case "reliability":
@@ -605,9 +603,7 @@ export function dimensionParts(
           title: "by model",
           parts: Object.entries(d.by_model).map(([model, entry]) => ({
             label: model,
-            value: `${formatDecimal(entry.tokens, 0)} tokens · ${
-              entry.per_landed === null ? "—" : formatDecimal(entry.per_landed, 0)
-            } per landing`,
+            value: modelCostText(entry.tokens, entry.per_landed),
             title:
               entry.per_landed === null
                 ? `${model}: ${entry.tokens} tokens`

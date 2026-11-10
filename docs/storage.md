@@ -186,7 +186,13 @@ commit with a key no agent holds cannot hang or fail a test.
   a mount exports the workspace afresh, so the store records the copies
   (`main`'s commit and the files) under `<root>/.main-copies/<agent>`, and
   every mount (a resume after an engine was lost, a host restart) puts them
-  back until the branch contains that `main`. An agent with no workspace on
+  back until the branch contains that `main`. The record follows `main`: a
+  start's or resume's clean-only merge that finds the unmounted branch in
+  conflict with a newer `main` rewrites an open record for that `main` (or
+  removes it when markers would show the conflict), so the mount after it
+  restores the versions the conflict is with. A version git cannot read or
+  a copy that cannot be written is a failure of the merge or the mount,
+  never a file `main` does not have, and no record is written for it. An agent with no workspace on
   the integrator's host gets no merge, and its note says so.
 - **Work set aside**: a resident keeps its branch from task to task, so the
   work of a task cancelled while it was delivered (by `spawn task cancel`,
@@ -209,8 +215,21 @@ commit with a key no agent holds cannot hang or fail a test.
   is lost: the work is the set-aside commit's parent, and the worker's
   notice names both commits. The set-aside is recorded as
   `artifact.committed` (`set_aside`, key `set-aside:<task>`, so it is made
-  once) and pushed like any checkpoint. A merge pending its markers is set
-  aside with the work.
+  once) and pushed like any checkpoint. The branch moves before the record:
+  when the append fails, the next pass asks the store again, which answers
+  with the set-aside already at the branch head (its message names the
+  task) and writes nothing, so that pass records and pushes it (a
+  checkpoint that landed on top meanwhile is set aside by a set-aside of
+  its own, and that one is recorded). A merge pending its markers is set
+  aside with the work. A file the checkpoints leave out (over the cap, or
+  special: "Files over the cap") is in no commit, and nothing says which
+  task made it: a set-aside leaves it in a mounted directory where it is,
+  and the notice says such files stay. Only one at a path the start's tree
+  holds a file at makes way, because the two-tree move would refuse: a file
+  over the cap is moved, never deleted, to
+  `.spawn/set-aside/<the commit that keeps the work>/<path>` (in the
+  workspace only, like any file over the cap), and a special file, which
+  holds nothing, is removed.
 - **A merge that loses the branch race**: when another writer moved the
   branch between the merge's directory update and its compare-and-swap,
   the directory follows the head that won by the same two-tree update
@@ -251,8 +270,15 @@ commit with a key no agent holds cannot hang or fail a test.
   checkpoint first, a line it wrote after the checkpoint was deleted by the
   unmount (028's stop, 2026-11-09). Now nothing it writes can land after
   the final checkpoint. Every end goes this way: a stop, an exit, a lost
-  runner, an abandoned start. A process that left the runner's session
-  (`setsid`) is not waited for. A runner that outlives the kill and the
+  runner, an abandoned start. A session that vanished on its own (tmux
+  died, or the session was killed outside the Bridge) is waited for too:
+  the host records the pane's leader pid and start time at start (a
+  private file per tmux program and socket under `$XDG_RUNTIME_DIR`), and
+  the kill reads the session from it when no pane is left, so a runner
+  still exiting, or one that ignores the hang-up, is waited for or killed
+  before the checkpoint (backlog P6). A record whose pid now belongs to a
+  process that started at another time names nothing. A process that left
+  the runner's session (`setsid`) is not waited for. A runner that outlives the kill and the
   SIGKILL fails the attempt: no checkpoint and no unmount while it may still
   write, and the attempt counts toward the stall below like a failed
   checkpoint (`execution.end_stalled`'s `error` then names the kill). The
@@ -583,7 +609,11 @@ state and wedges nothing:
   floor_bytes}`, and once as `state: "recovered"` when it is back 1 GiB above
   the threshold (so a path at the threshold does not flap). The latest
   record per path is read back from the log on start, so a restart records
-  nothing twice. A path's latest record reaches the supervisor's digest
+  nothing twice. A path the loop no longer watches (the workspace root or
+  `TMPDIR` changed) is never read again, so a `low` record it left is closed
+  by the loop at its first check with `state: "recovered", reason:
+  "unwatched"` and the old record's numbers: its condition ends for every
+  reader of the log, and it is not told as a recovery. A path's latest record reaches the supervisor's digest
   once: a `low` one ("disk space on this host") is a condition, kept in the
   dispatcher's plan (and the attention queue) as told and unresolved until
   the path's `recovered` record replaces it, however long that takes; a
