@@ -38,10 +38,14 @@ export function Timeline({
   sessionId,
   tail,
   executions,
+  to = null,
 }: {
   sessionId: string;
   tail: EventWindow;
   executions: Execution[];
+  /** Who the session's inputs go to (`supervisor`): the trace reads a
+   * person's input as `You → supervisor` ([`inputTarget`]). */
+  to?: string | null;
 }) {
   const [mode, choose] = useStoredChoice<Mode>("spawn.timeline.mode", MODES, "trace");
   const [held, setHeld] = useState<EventWindow>(tail);
@@ -137,7 +141,7 @@ export function Timeline({
   );
   return mode === "trace" ? (
     <Suspense fallback={<div className="min-h-0 flex-1" />}>
-      <TraceView events={events} executions={executions} commands={commands} header={toggle} />
+      <TraceView events={events} executions={executions} commands={commands} to={to} header={toggle} />
     </Suspense>
   ) : (
     <EventList events={events} header={toggle} />
