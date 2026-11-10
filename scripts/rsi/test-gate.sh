@@ -1856,6 +1856,28 @@ expect "one the candidate edits is refused" "$(judge_rust "$macro_edited")" \
     'a local proc-macro or build script outside the workspace: evil'
 rust_base=$saved_rust_base
 
+# 14b. A dependency graph that does not resolve offline: a candidate's
+# whose base resolves here is rejected; one whose base does not resolve
+# either is the host's registry lacking a crate (a runner never sent it), a
+# fact about the host (exit 6, `cannot_judge`), never a rejection of the
+# work. The crate is one no registry here has; the lockfile is not updated.
+rust_branch rust-unresolved
+printf '\n[dependencies]\nno-such-crate-anywhere = "1"\n' >>"$seed/Cargo.toml"
+unresolved=$(commit rust-unresolved)
+expect "a candidate whose base resolves is rejected for its graph" "$(judge_rust "$unresolved")" \
+    '{"verdict":"rejected","reason":"candidate'"'"'s dependency graph does not resolve offline"}'
+saved_rust_base=$rust_base
+rust_base=$unresolved
+rust_branch rust-unresolved-base
+printf 'a change on a base that does not resolve\n' >"$seed/notes.txt"
+on_unresolved=$(commit rust-unresolved-base)
+expect "one whose base does not resolve either cannot be judged here" "$(judge_rust "$on_unresolved")" \
+    'exit=6 {"cannot_judge":true,"scenario":"dependencies","runs":"1"}'
+refuse "and is no verdict" "$(cat "$integrator/verdict")" '"verdict"'
+expect "the gate says why, for the integrator's record" "$(cat "$work/gate.out")" \
+    '| dependencies: cannot judge: the base'"'"'s dependency graph does not resolve offline on this host either'
+rust_base=$saved_rust_base
+
 # 6. A reason with a quote stays valid JSON.
 quoted_scenarios=$work/quoted
 cp -r "$scenarios" "$quoted_scenarios"
