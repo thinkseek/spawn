@@ -718,6 +718,32 @@ impl TerminalHost for TmuxHost {
         Ok(())
     }
 
+    /// The pane's tty, as tmux names it, read with `stty -a`: a program
+    /// that cleared `icanon` (a raw-mode reader) does not read lines. Any
+    /// failure to tell is "reads lines".
+    fn reads_lines(&self, terminal: &TerminalName, _workspace: &WorkspaceId) -> bool {
+        let words = vec![
+            "display-message".to_string(),
+            "-p".to_string(),
+            "-t".to_string(),
+            Self::pane(terminal),
+            "#{pane_tty}".to_string(),
+        ];
+        let Ok(run) = self.run_within(&words, Duration::from_secs(5)) else {
+            return true;
+        };
+        let tty = run.stdout.trim();
+        if run.code != Some(0) || tty.is_empty() {
+            return true;
+        }
+        match Command::new("stty").arg("-F").arg(tty).arg("-a").output() {
+            Ok(out) if out.status.success() => !String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .any(|word| word == "-icanon"),
+            _ => true,
+        }
+    }
+
     fn submit_staged(
         &self,
         terminal: &TerminalName,
