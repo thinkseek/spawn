@@ -100,7 +100,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::command::{Claimed, CommandAction, Outcome};
+use crate::command::{Claimed, CommandAction, NamedKey, Outcome};
 use crate::event::{
     ArtifactRef, CheckpointReason, CommandStep, ENGINE, EndCause, EventKind, EventRecord, Fork,
     GlobalPosition, ModelProfile, NewEvent, Source,
@@ -517,6 +517,20 @@ struct Steps {
     typing_at: Option<GlobalPosition>,
     /// The typing succeeded.
     typed: bool,
+    /// How far the command's key went (a key command's steps).
+    press: Press,
+}
+
+/// How far a key command's key went, by its steps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Press {
+    /// Nothing recorded: the key is due.
+    #[default]
+    Due,
+    /// `pressing` recorded and no `pressed`: it may have reached the pane.
+    Pressing,
+    /// `pressed`: it was sent.
+    Pressed,
 }
 
 /// What a retried command's typing comes to ([`SessionView::typing`]).
@@ -558,6 +572,14 @@ impl SessionView {
                             .waiting
                             .insert(*command_id, event.execution_id.clone());
                     }
+                    // A key's steps say nothing of the session's inputs:
+                    // no input was typed, and none waits for an answer.
+                    CommandStep::Pressing => {
+                        if steps.press == Press::Due {
+                            steps.press = Press::Pressing;
+                        }
+                    }
+                    CommandStep::Pressed => steps.press = Press::Pressed,
                 }
             }
             EventKind::CommandFinished { command_id, .. } => {
@@ -2184,10 +2206,15 @@ impl Bridge {
         claimed: &Claimed,
         report: &mut TickReport,
     ) -> Result<Handled, StoreError> {
-        let Ok(action) = claimed.action() else {
-            return Ok(Handled::Finished(Outcome::Failed(
-                "stored action is not valid".to_string(),
-            )));
+        let action = match claimed.action() {
+            Ok(action) => action,
+            // The parse error names what is wrong (a key outside the set
+            // names the key).
+            Err(error) => {
+                return Ok(Handled::Finished(Outcome::Failed(format!(
+                    "stored action is not valid: {error}"
+                ))));
+            }
         };
         // What a command appends comes after the session's waiting commit
         // records. While the log refuses them the command is not handled
@@ -2198,7 +2225,8 @@ impl Bridge {
         let settled = match &action {
             CommandAction::Start { .. }
             | CommandAction::Resume { .. }
-            | CommandAction::Input { .. } => self.settle(claimed, report)?,
+            | CommandAction::Input { .. }
+            | CommandAction::Key { .. } => self.settle(claimed, report)?,
             CommandAction::Stop | CommandAction::Discard => None,
         };
         match (&action, settled) {
@@ -2209,6 +2237,11 @@ impl Bridge {
             (CommandAction::Input { .. }, Some(Settled::Ended(what))) => {
                 return Ok(Handled::Finished(Outcome::Failed(format!(
                     "{what}; an input needs a running engine: resume the session"
+                ))));
+            }
+            (CommandAction::Key { .. }, Some(Settled::Ended(what))) => {
+                return Ok(Handled::Finished(Outcome::Failed(format!(
+                    "{what}; a key needs a running engine: resume the session"
                 ))));
             }
             // A start or resume goes on, on a session that runs nothing.
@@ -2236,6 +2269,7 @@ impl Bridge {
                 report,
             ),
             CommandAction::Input { text, .. } => return self.input(claimed, &text),
+            CommandAction::Key { key } => self.press(claimed, key),
             CommandAction::Stop => self.stop(claimed, false, report),
             CommandAction::Discard => self.stop(claimed, true, report),
             CommandAction::Resume { prompt, model } => {
@@ -2611,6 +2645,8 @@ impl Bridge {
             CommandStep::Typing => "typing",
             CommandStep::Typed => "typed",
             CommandStep::Waiting => "waiting",
+            CommandStep::Pressing => "pressing",
+            CommandStep::Pressed => "pressed",
         };
         self.append(
             &claimed.agent_id,
@@ -2624,6 +2660,67 @@ impl Bridge {
                 workspace: workspace.cloned(),
             },
         )
+    }
+
+    /// A key command: its key pressed in the running engine's pane, at
+    /// once and in any pane state, at most once. Unlike an input it never
+    /// waits: Esc interrupts a busy turn, and the arrows, Enter, Y and N
+    /// answer a dialog, the very states in which text waits. So it may
+    /// overtake an input sent before it that still waits. Handling is
+    /// serial, and an input's typing (stage, paste, Enter) is one call
+    /// ([`Self::type_once`]), so a key lands before or after it, never
+    /// between its paste and its Enter. The intent is recorded before the
+    /// key goes (`pressing`) and the send after (`pressed`): a retried key
+    /// whose `pressing` has no `pressed` is not sent again.
+    fn press(&mut self, claimed: &Claimed, key: NamedKey) -> Result<Outcome, StoreError> {
+        let Some(active) = self.running(&claimed.session_id) else {
+            return Ok(Outcome::Failed(format!(
+                "{} runs no execution: a key needs a running engine; resume the session",
+                claimed.session_id
+            )));
+        };
+        match self.recorded_steps(claimed).press {
+            Press::Due => {}
+            Press::Pressed => return Ok(Outcome::Succeeded),
+            Press::Pressing => {
+                return Ok(Outcome::Failed(format!(
+                    "the key {} may have reached the pane before the Bridge stopped; it is \
+                     not sent again",
+                    key.name()
+                )));
+            }
+        }
+        self.step(
+            claimed,
+            Some(&active.execution_id),
+            CommandStep::Pressing,
+            None,
+        )?;
+        match self
+            .terminals
+            .send_keys(&active.terminal(), &active.workspace, &[key.tmux()])
+        {
+            Ok(()) => {
+                self.step(
+                    claimed,
+                    Some(&active.execution_id),
+                    CommandStep::Pressed,
+                    None,
+                )?;
+                Ok(Outcome::Succeeded)
+            }
+            Err(error) => {
+                let gone = if self.terminal_gone(&active) {
+                    "; the terminal is gone"
+                } else {
+                    ""
+                };
+                Ok(Outcome::Failed(format!(
+                    "press {}: {error}{gone}",
+                    key.name()
+                )))
+            }
+        }
     }
 
     /// Text into the engine's input box, at most once: the text is staged
