@@ -157,6 +157,8 @@ pub(super) struct Shadows {
     /// Shadows started so far (each its own directory).
     started: u64,
     running: Option<Shadow>,
+    /// A shadow that ended whose record could not be written yet.
+    unrecorded: Option<Ended>,
 }
 
 impl Shadows {
@@ -167,6 +169,26 @@ impl Shadows {
             offered: 0,
             started: 0,
             running: None,
+            unrecorded: None,
+        }
+    }
+
+    /// Write the record of the shadow that ended ([`Self::poll`]) with
+    /// `write`, once: its directory is removed when it is written; one that
+    /// could not be is kept and written at the next call.
+    pub(super) fn record_ended(&mut self, write: impl Fn(&Value) -> Result<(), String>) {
+        let Some(ended) = self.unrecorded.take().or_else(|| self.poll()) else {
+            return;
+        };
+        match write(&ended.record) {
+            Ok(()) => remove_tree(&ended.work),
+            Err(error) => {
+                eprintln!(
+                    "integrate: task {}'s shadow record: {error}; tried again at the next pass",
+                    ended.record["id"]
+                );
+                self.unrecorded = Some(ended);
+            }
         }
     }
 
