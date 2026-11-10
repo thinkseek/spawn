@@ -741,21 +741,13 @@ pub(crate) struct Reading {
 /// ([`read_plan`]): each is said once.
 static ORDER_LOGGED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
 
-/// One function for both, so the queue a person reads is the dispatcher's
-/// own.
-pub(crate) fn read_plan(
-    store: &PostgresStore,
-    loaded: (Vec<Facts>, Work),
-    disk: impl FnOnce(i64) -> Vec<Escalation>,
-    bounds: &Bounds,
-    supervised: bool,
-    spawn: &str,
-    deployed: Option<&Charter>,
-) -> Result<Reading, String> {
-    let (rows, work) = loaded;
-    let mut lines = Vec::new();
-    let now = now_ms();
-    let mut host = disk(now);
+/// The digest items the host's and the integrator's records name, each read
+/// once a pass ([`read_plan`]): the gate's room, host faults and base
+/// disagreements, red and green mains, shadow verdicts, overruns, objective
+/// yields, closes and orders, expired holds and drains, and the recovery's
+/// final model records.
+fn record_items(store: &PostgresStore) -> Result<Vec<Escalation>, String> {
+    let mut host = Vec::new();
     host.extend(crate::disk::gate_room_escalations(&records(
         store.gate_room_escalations(),
         "gate room records",
@@ -804,6 +796,25 @@ pub(crate) fn read_plan(
         store.model_finals(),
         "final model records",
     )?));
+    Ok(host)
+}
+
+/// One function for both, so the queue a person reads is the dispatcher's
+/// own.
+pub(crate) fn read_plan(
+    store: &PostgresStore,
+    loaded: (Vec<Facts>, Work),
+    disk: impl FnOnce(i64) -> Vec<Escalation>,
+    bounds: &Bounds,
+    supervised: bool,
+    spawn: &str,
+    deployed: Option<&Charter>,
+) -> Result<Reading, String> {
+    let (rows, work) = loaded;
+    let mut lines = Vec::new();
+    let now = now_ms();
+    let mut host = disk(now);
+    host.extend(record_items(store)?);
     // Every timer the records read here name: the times at which this step
     // would decide something new even though nothing is appended meanwhile.
     // A time already reached is no wait (the step acts on it now), so only
