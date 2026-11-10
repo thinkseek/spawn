@@ -553,4 +553,5 @@ test("a held source's title keeps what the card showed: reason, who took it and 
   const hold = { expires_ms: now + 145 * MIN, waiting: [221, 222], reason: "release freeze", by: "human", held_at_ms: now - 60 * MIN, main: "0123456789abcdef0123" };
   assert.equal(holdTitle(hold, now), "source held · expires in 2 h · 2 tasks waiting\nrelease freeze\ntaken by human 1 h ago at main 0123456789ab\nwaiting: T221, T222");
   assert.equal(holdTitle({ ...hold, reason: null, by: null, held_at_ms: null, main: null, waiting: [] }, now), "source held · expires in 2 h");
+  assert.equal(holdTitle({ ...hold, reason: null, held_at_ms: null, main: null, waiting: [] }, now), "source held · expires in 2 h\ntaken by human", "who took it, when that is all it knows");
 });

@@ -609,7 +609,7 @@ export function holdTitle(
     hold.held_at_ms !== null ? `${shortAge(Math.max(0, now - hold.held_at_ms))} ago` : null,
     hold.main ? `at main ${hold.main.slice(0, 12)}` : null,
   ].filter(Boolean);
-  if (taken.length > 1) lines.push(taken.join(" "));
+  if (hold.by || hold.held_at_ms !== null || hold.main) lines.push(taken.join(" "));
   if (hold.waiting.length > 0) lines.push(`waiting: ${hold.waiting.map((task) => `T${task}`).join(", ")}`);
   return lines.join("\n");
 }
