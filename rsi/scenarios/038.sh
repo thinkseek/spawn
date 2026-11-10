@@ -298,7 +298,9 @@ while :; do
     next_tool=$((now + 2))
   fi
   c=
-  if IFS= read -r -s -n 1 -d '' -t 0.3 c; then
+  # bash's `read -t` keeps a byte it read as the timeout fired: such a byte
+  # is input like any other (an Esc dropped here never reached the engine).
+  if IFS= read -r -s -n 1 -d '' -t 0.3 c || [ -n "$c" ]; then
     quiet=0
     case "$c" in
     $'\e')
