@@ -1343,9 +1343,54 @@ the tree's own:
   rejection into a host fault, never into an acceptance. (2026-11-07: one e2e
   run that failed under load rejected task 127's 85-minute gate; the same
   tree passes it.)
+- a numbered scenario the base solved that fails on the candidate is
+  judged the same way before it is called a regression (gate.sh "Three
+  classes of a failing regression"; the owner, 2026-11-10, after an owner
+  gate rejected valid work on 028, which failed on main itself at that
+  load): it runs again on the candidate, then on the base, now and never
+  from the cache, once its candidate runs have ended, with nothing else of
+  the gate beside it and on a test server no candidate run used (a second
+  server of the gate's own, from its template). The base passing twice:
+  two failures on the candidate (of two, or of three after a pass) are a
+  candidate failure, rejected with the reason it always had; one failure
+  of three is unstable on the candidate, `cannot_judge` (exit 6), never
+  accepted. The base failing a run: a validator defect, never a
+  rejection. A task's candidate then gets no verdict (exit 6, `host_fault`
+  with the evidence `validator_defect` and the key `validator_defects`),
+  because a base run that follows candidate code may spare a rejection and
+  never accept; the owner's own candidate (`SPAWN_GATE_OWNER_CANDIDATE=1`,
+  which spawn integrate does not pass yet) is judged on the rest and its
+  verdict names the validators (`validator_defects`). On a shared test
+  server a base that fails after the candidate ran is no evidence for
+  either: a host fault. The integrator reads neither new key yet: a
+  task's validator defect is recorded as the host fault it is, with the
+  gate's reason.
+- `<scenarios>/quarantined` (a list like `serial`; the owner's, the tree's
+  copy under the protected paths, in no base cache key) names validators
+  the owner knows are broken: not run as regressions, nor judged on the
+  base for one, and named in every gate's log and verdict (`quarantined`).
+  The task's own scenario is never skipped by it.
+- the regression that last ended a gate of the same scenarios (a candidate
+  failure, a validator defect, unstable) is judged first by the next gate,
+  before the serial list and alone, until a run of it passes (gate.sh "A
+  known failure first"; the record is beside the base cache,
+  `gate-solved/<root commit>/.known-failure.<hash of the scenarios'
+  names>`, hidden from the sandbox): a failure that is still there costs
+  that scenario's own runs, not the gate.
 - everything the candidate controls runs in a bubblewrap sandbox (docs/rsi.md
   §4). The verdict is one JSON line that names the base and candidate
   commits it judged; the integrator believes only the verdict file it owns.
+- a regression's result may be the base's, not a run (gate.sh "Results
+  reused from the base", GitHub issue #48): a scenario that declares what
+  a run reads of the tree (`# reads: binary [<path> ...]`; 001, 007 and
+  027 so far) is not run on the candidate when the candidate's `spawn` has
+  the sha256 of the binary the base's `solved` was taken on (the hash is in
+  the base cache entry, written by the run that earned the result), the
+  paths it declares and the tree's own copy of the scenario are the same in
+  both trees, and it is not on the `serial` list. The log says so per
+  scenario with the reason, the verdict names them (`reused`), a reused
+  result seeds no cache entry, and a scenario that declares nothing is
+  always run. `SPAWN_GATE_REUSE=0` runs everything.
 - objective results on the base (solved, unsolved after two runs that
   agree, or `cannot_judge` when the scenario says the host cannot judge it,
   one run) are cached outside the sandbox, keyed by everything that decides
@@ -1400,7 +1445,15 @@ the tree's own:
   stops no landing; on the candidate a regression that exits 6 is skipped,
   never passed or failed, and the task scenario that exits 6 states the
   fact: `host_fault` with the evidence `cannot_judge`, never a rejection and
-  never an abort (§10.3). Exit 6 with neither fact is an abort, as is any
+  never an abort (§10.3). The gate states the same fact itself, in its
+  first seconds, when the sandbox lacks a prerequisite a scenario or check
+  declares (a line `# needs: controller:<path>`, `tool:<name>` or an
+  absolute path, read without running the file; `check-web` declares the
+  controller's `web/node_modules/`): all of them are asked for in one
+  sandbox after the static checks, before the base's build and any
+  scenario, and a missing one is `cannot_judge` with the scenario and the
+  `prerequisite` (gate.sh "Preflight"). A file the tree under test may lack
+  is that tree's result, never a prerequisite. Exit 6 with neither fact is an abort, as is any
   other status: exit 3 (no bwrap, a missing bind directory, an unreadable
   `TMPDIR`, a floor that is not whole GiB, the gate's own tree under `/tmp`,
   `/run` or `/var/tmp` — itself or below it — or under the host's `TMPDIR`
