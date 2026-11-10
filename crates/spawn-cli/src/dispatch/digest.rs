@@ -69,6 +69,8 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::GateBaseDisagrees => "the base disagreed with itself at the gate (the host's)",
         Why::MainRed => "a source's main is red on a check (its gates wait)",
         Why::MainGreen => "a source's main is green again",
+        Why::SourceAway => "a mission's source is not a directory on this host (its branches wait)",
+        Why::SourceBack => "a mission's source is back on this host",
         Why::ShadowDisagrees => {
             "a gate runner's shadow verdict disagreed with the primary's (it decided nothing)"
         }
@@ -81,6 +83,7 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::ObjectiveOrder => "a backlog names an order no task can meet",
         Why::OverBudget => "a task went over its budget twice",
         Why::DrainExpired => "the integrator's drain reached its bound (gates stopped)",
+        Why::ModelFinal => "the model's error ended a worker's engine for good (not revived)",
     }
 }
 
@@ -109,6 +112,7 @@ fn lines(pending: &[Escalation]) -> Vec<(Line<'_>, Vec<String>)> {
                 && item.why != Why::ObjectiveYielded
                 && item.why != Why::ObjectiveSolved
                 && item.why != Why::ObjectiveOrder
+                && item.why != Why::ModelFinal
                 && line.first.session_id == item.session_id
                 && line.first.why == item.why
         }) {
@@ -343,6 +347,49 @@ pub(crate) fn base_disagrees_alerts(records: &[Value]) -> Vec<Escalation> {
                 ),
                 since_ms: record["at_ms"].as_i64(),
             })
+        })
+        .collect()
+}
+
+/// The supervisor's news of a mission's source away from this host and
+/// back (P12): one item per `source_away` alert record not told yet
+/// (the store's `source_away_news`), tagged `host source-away-<event_id>` or
+/// `host source-back-<event_id>`.
+pub(crate) fn source_away_news(records: &[Value]) -> Vec<Escalation> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let id = record["event_id"].as_i64()?;
+            let subject = record["subject"].as_str().unwrap_or("a mission");
+            let source = record["evidence"]["source"].as_str().unwrap_or("its source");
+            match record["type"].as_str()? {
+                "alert.fired" => Some(Escalation {
+                    session_id: HOST_SESSION.to_string(),
+                    id: format!("source-away-{id}"),
+                    why: Why::SourceAway,
+                    line: format!(
+                        "{subject}'s source {source} is not a directory on this host: its \
+                         agents' branches are not published to it until it is back. Check \
+                         the mount or the path; Spawn retries on its own."
+                    ),
+                    since_ms: record["at_ms"].as_i64(),
+                }),
+                "alert.cleared" => {
+                    let gone = record["evidence"]["reason"].as_str() == Some("no longer watched");
+                    Some(Escalation {
+                        session_id: HOST_SESSION.to_string(),
+                        id: format!("source-back-{id}"),
+                        why: Why::SourceBack,
+                        line: if gone {
+                            format!("{subject} no longer has {source} as an open source: its away alert is closed.")
+                        } else {
+                            format!("{subject}'s source {source} is back on this host: its branches are published again.")
+                        },
+                        since_ms: record["at_ms"].as_i64(),
+                    })
+                }
+                _ => None,
+            }
         })
         .collect()
 }
@@ -887,4 +934,108 @@ pub(super) fn order(supervisor: &Facts, pending: &[Escalation], spawn: &str) -> 
         },
         task: None,
     })
+}
+
+/// The digest items for `records`, the recovery's final model records that
+/// no delivered digest told yet (`PostgresStore::model_finals`). Each is an
+/// item of the worker's session, id `model-<execution id>`, naming the
+/// session, the execution, the cause and either the refused request's
+/// status (and its text) or the retries spent. No time window: a record
+/// stays an item until a digest carrying its tag (`<session>
+/// model-<execution id>`) reaches the supervisor, so it is told once.
+pub(crate) fn model_finals(records: &[Value]) -> Vec<Escalation> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let session = record["session_id"].as_str()?;
+            let execution = record["execution_id"].as_str()?;
+            let cause = record["cause"].as_str()?;
+            let status = record["status"].as_i64().map_or_else(
+                || "no status".to_string(),
+                |status| format!("status {status}"),
+            );
+            let text = record["text"]
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .map_or_else(String::new, |text| {
+                    format!(" (\"{}\")", one_line(text, 200))
+                });
+            let line = if cause == "model_unavailable" {
+                let retries = record["retries"]
+                    .as_u64()
+                    .map_or_else(|| "its".to_string(), |retries| retries.to_string());
+                format!(
+                    "session {session}: execution {execution} ended on the model's transient \
+                     error again ({cause}, {status}){text} after {retries} retries in a row \
+                     (SPAWN_RECOVER_MODEL_RETRIES): Spawn will not resume it. Resume it once \
+                     the model answers, or reassign its task."
+                )
+            } else {
+                format!(
+                    "session {session}: execution {execution} ended on a request the model \
+                     refused ({cause}, {status}){text}: Spawn will not retry it, the same \
+                     request fails the same way. Look at the session, then resume it with \
+                     another instruction or reassign its task."
+                )
+            };
+            Some(Escalation {
+                session_id: session.to_string(),
+                id: format!("model-{execution}"),
+                why: Why::ModelFinal,
+                line,
+                since_ms: record["at_ms"].as_i64(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn a_source_away_and_its_end_are_told_to_the_supervisor() {
+        let records = [
+            json!({"type": "alert.fired", "event_id": 11, "at_ms": 5, "kind": "source_away",
+                   "subject": "mission #4", "evidence": {"source": "/mnt/vol/a.git"}}),
+            json!({"type": "alert.cleared", "event_id": 12, "at_ms": 6, "kind": "source_away",
+                   "subject": "mission #4",
+                   "evidence": {"source": "/mnt/vol/a.git", "present": true}}),
+            json!({"type": "alert.cleared", "event_id": 13, "at_ms": 7, "kind": "source_away",
+                   "subject": "mission #6",
+                   "evidence": {"source": "/srv/b.git", "reason": "no longer watched"}}),
+        ];
+        let news = source_away_news(&records);
+        assert_eq!(
+            news.iter()
+                .map(|item| (item.id.as_str(), item.why))
+                .collect::<Vec<_>>(),
+            [
+                ("source-away-11", Why::SourceAway),
+                ("source-back-12", Why::SourceBack),
+                ("source-back-13", Why::SourceBack)
+            ]
+        );
+        assert!(news.iter().all(|item| item.session_id == HOST_SESSION));
+        assert!(
+            news[0]
+                .line
+                .starts_with("mission #4's source /mnt/vol/a.git is not a directory"),
+            "{}",
+            news[0].line
+        );
+        assert!(
+            news[1].line.contains("is back on this host"),
+            "{}",
+            news[1].line
+        );
+        assert!(
+            news[2].line.contains("no longer has /srv/b.git"),
+            "{}",
+            news[2].line
+        );
+        assert!(Why::SourceAway.is_news() && Why::SourceBack.is_news());
+    }
 }

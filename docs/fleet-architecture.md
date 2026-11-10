@@ -430,15 +430,22 @@ it, on the same ladder.
   | `disk_full` | the workspace's filesystem read under `SPAWN_DISK_FLOOR_GB` at the end | `wait` | probed every `SPAWN_RECOVER_PROBE_SECS` (10 s); revived within one probe of room |
   | `database_unavailable` | two or more passes of the loop that could not reach the database while the execution ran | `wait` | cleared at the first pass that gets through |
   | `model_auth` | an API error line with status 401 or 403, `authentication_failed`, or a text holding `/login` | `wait` | probed every 10 s; cleared when the credentials file changes, one retry every `SPAWN_RECOVER_AUTH_RETRY_SECS` (1800 s) while it does not |
-  | `model_unavailable` | an API error line with status 529, 503, 500, 429 or none, or error `overloaded`, `rate_limit`, `server_error` | `wait` | retried after `SPAWN_RECOVER_MODEL_BACKOFF_SECS` (60 s) doubling per failed turn, capped at 4 x it, or at `retry_at_ms` when the text names when an account is available again |
+  | `model_unavailable` | an API error line with status 529, 503, 500, 429 or none, or error `overloaded`, `rate_limit`, `server_error` | `wait` | retried after `SPAWN_RECOVER_MODEL_BACKOFF_SECS` (60 s) doubling per failed turn, capped at 4 x it, or at `retry_at_ms` when the text names when an account is available again. An engine that *ended* after it is resumed in the same native session after the backoff at most `SPAWN_RECOVER_MODEL_RETRIES` (3, from 1 to 20; another value stops the loop at its start) times in a row with no model answer between (a revived execution that made progress resets the count); its next such end is `model_unavailable` on `final` (evidence: `retries`), never revived, and told to the supervisor once. An engine at its prompt is retried without this bound |
+  | `model_error` | the engine's own end after an API error line that is none of the above (a 400 that is not `Prompt is too long`, a 404, a 413), with no progress after it | `final` | never revived (the same request fails the same way); told to the supervisor once |
   | `context_exhausted` | an API error line whose text holds `Prompt is too long` | `handoff` | due at once: a Stop with its final checkpoint, then a new native session in the same workspace and branch |
   | `budget` | the integrator's Stop of a task over its budget (objective 026) | `handoff` | as a context's |
   | `stopped` | a Stop or Discard from a person, the supervisor, a cancelled task or a retirement | `final` | never revived |
 
   When several hold the first in that order wins: a person's Stop before the
   budget, a memory kill before a host restart, a full disk before a database
-  outage, a model login before a model outage before a context, a crash
-  before a clean exit. A Stop that is part of a revival (a handoff's) is no
+  outage, a model login before a model outage before a context, a request
+  the model refused before a crash, a crash before a clean exit.
+
+  The dispatcher tells the supervisor of each final model record once
+  (`model_unavailable` with its retries spent, `model_error`): one digest
+  item of the worker's session, tagged `<session> model-<execution>`,
+  naming the session, the execution, the cause and the status or the
+  retries. It is news: told, it is never repeated. A Stop that is part of a revival (a handoff's) is no
   interruption of its own.
 
   Each interruption is one control record, written by the owner only
@@ -671,7 +678,9 @@ it, on the same ladder.
   and submits, marks and collects nothing. The queue shows, top to bottom:
   what the supervisor asks ("The supervisor asks"), when its turn ended at
   its prompt judged BLOCKED or WAITING with `needs_human` at least 0.5 (or
-  with a `HUMAN:` line), in its own words from its transcript: its last
+  with a `HUMAN:` line; the judgement of that turn, based on its end or
+  later, never an earlier turn's, so an answered question does not come
+  back when the answer's turn ends), in its own words from its transcript: its last
   `HUMAN:` line not answered since, or else its reply's last paragraph, in
   at most three lines, the whole reply on request; right under it, always
   there whether it asks or not, the box to type to the supervisor; then the
@@ -758,7 +767,7 @@ the system. Its continuity is a design requirement, not a best effort:
 | `spawn loop` restarts or is replaced | The engine runs in tmux outside the loop's lifetime (`KillMode=process`); the next loop recovers the execution from the log and keeps observing it |
 | The engine process exits or crashes | The **recovery** (control layer, facts only, no model): the end is an `exited` or `crashed` interruption — a signal, a non-zero status or a terminal gone while its server lives — recorded once and `resume`d in the same native session at once, then after 10, 20, 40, 80 … s as resumes fail, capped at 640 s. A resume whose execution ends within a minute before any progress failed; three in a row hand off |
 | The machine reboots | tmux is gone, so every terminal in it died: the recovery records `host_restart` and resumes each execution by its key, within one pass of the loop's start |
-| The model API is overloaded, rate limited or unreachable, or the login expired | No execution ends: Claude Code writes its API error line and waits at its prompt. The recovery records `model_unavailable` or `model_auth` as the interruption and `wait`s: a retry after 60 s doubling to 4 minutes (or at the time a 429's text names), a probe of the credentials file every 10 s and one retry every 30 minutes while it does not change. The wait clears on the model's answer or the changed file, and the same native session goes on |
+| The model API is overloaded, rate limited or unreachable, or the login expired | No execution ends: Claude Code writes its API error line and waits at its prompt. The recovery records `model_unavailable` or `model_auth` as the interruption and `wait`s: a retry after 60 s doubling to 4 minutes (or at the time a 429's text names), a probe of the credentials file every 10 s and one retry every 30 minutes while it does not change. The wait clears on the model's answer or the changed file, and the same native session goes on. An engine that ends after the error is resumed after the backoff at most `SPAWN_RECOVER_MODEL_RETRIES` (3) times in a row, then the supervisor is told; one that ends after a request the model will never accept (`model_error`) is never revived, and the supervisor is told |
 | The context window is spent | `Prompt is too long` in an API error line: `context_exhausted`, and the handoff path below |
 | The engine's resource envelope kills it, or the disk fills | `memory_limit` (objective 029) resumes at once; `disk_full` waits until a reading of the workspace's filesystem is at or above `SPAWN_DISK_FLOOR_GB` |
 | Spawn's database is unreachable | The loop does not exit: only passes that could not reach it are not failed ones, the engines run on, and at the first pass that gets through the recovery records `database_unavailable` for each execution that lived through it, clears it, and the Bridge checkpoints what the engines wrote meanwhile |
@@ -966,7 +975,14 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   the same scenario, on an ancestor of the base and unsolved on it, which
   scripts/rsi/gate.sh reads from the solved index beside its base cache; one
   per mission and scenario while red, cleared at the first later `accepted`
-  gating of the mission that does not name it), `task_undelivered` (assigned longer than
+  gating of the mission that does not name it), `validator_defect` (a
+  regression that fails on the base too, run again in the gate: from a
+  task's `host_fault` with evidence `validator_defect`, cleared at the
+  mission's next `accepted` or `rejected` gating; or from an owner's
+  accepted landing whose `source.moved` names it in `validator_defects`, for
+  each mission it moved, cleared only once a gate of the mission names it
+  `quarantined`, since a later gate that does not name it may have read it
+  unsolved on the base rather than passed), `task_undelivered` (assigned longer than
   `SPAWN_ALERT_UNDELIVERED_SECS`, default 300, while its agent holds no
   delivered or reported task), `mission_halted` (cleared at its
   `mission.resumed`), `postgres_crash` (a `terminated by signal`, `No space
@@ -977,7 +993,17 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   `SPAWN_ALERT_MEMORY_OK_MB`, default 8192), `tmpfs_high` (the used space of
   the filesystem holding `SPAWN_ALERT_TMPFS_PATH`, default `/tmp`, over
   `SPAWN_ALERT_TMPFS_HIGH_MB`, default 8000; clears under
-  `SPAWN_ALERT_TMPFS_OK_MB`, default 6000), `agent_stuck` (the session's
+  `SPAWN_ALERT_TMPFS_OK_MB`, default 6000), `source_away` (`mission #<id>`,
+  at two readings in a row: a source of an open or active mission that is a
+  path on this host is not a directory, an unmounted volume or a moved
+  checkout, so its agents' branches are not published to it until it is
+  back; one reading only notes it, so a path that comes and goes does not
+  flap, and a restart starts the count again; evidence `away_since_ms`, the
+  first of the two readings; one per mission
+  and source while away, cleared at the first reading that finds it, or once
+  the mission no longer has it or is no longer open or active; the
+  supervisor's digest tells each and its end, `host source-away-<event>` and
+  `host source-back-<event>`), `agent_stuck` (the session's
   latest judgement at or above the Observer's 0.5, whatever the dispatcher
   does with it; clears under 0.5, or when the session's current execution
   has ended, whatever the cause, with the Bridge's `execution.ended` as
@@ -1002,8 +1028,14 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   restart, while a gated mission that is open or active, not halted, and on
   a source no owner holds has a reported task; cleared at the first reading
   that finds the lock held; the lock is read only while such a task is in
-  the step's fold or the alert is open) and `model_auth` (objective 028's
-  `execution.interrupted` with cause `model_auth`). Each fires once per
+  the step's fold or the alert is open), `model_auth` (objective 028's
+  `execution.interrupted` with cause `model_auth`) and `cost_budget`
+  (subject `mission #<id>`, key `cost_budget:<mission>:<UTC day>`: at a
+  reading, the mission's cost of the model calls timed in the current UTC
+  day has reached its `budget.daily_usd` (§3.5); once per mission and day,
+  whatever restarts and however much more it spends; clears when the day
+  ends, or at a reading that finds the budget removed or raised above the
+  day's spend). Each fires once per
   occurrence and clears with the record or reading that cleared it; a
   threshold of `0` disables its check.
 - **When.** A record-borne alert is recorded within one pass of its record; a
@@ -1028,6 +1060,56 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   cleared it; nothing rests on the step's memory, on absence, or on time
   without a record. Evidence never holds a secret: no database URL with its
   password, no environment, process names without their arguments.
+
+### 3.5 Cost: what the model calls cost
+
+The engine writes each model call's usage to its transcript; Spawn records
+it per execution and prices it (objective 041;
+`crates/spawn-cli/src/cost.rs`):
+
+- **Recorded per execution.** The Bridge appends a `model.usage` event for
+  each assistant line of an execution's transcript that carries
+  `message.id`, `message.usage` and a `timestamp` (`ingest::claude_usage`),
+  keyed by the message id and its four counts, so the lines Claude Code
+  writes per content block append one event. The loop's cost step folds
+  them into `spawn_cost_messages` (`spawn_cost_record`, owner only): a
+  message counts once per id, with the largest usage of its lines, at its
+  earliest line's time, under its model (input, output, cache creation as
+  `cache_write`, cache read), for the execution whose transcript held it,
+  its agent, the task the agent held then (its latest task assigned at or
+  before the message's time; a message timed before any, the latest
+  assigned at or before the execution started; none: no task, as the
+  supervisor's) and that task's mission. A restarted loop counts no message
+  twice and loses none: the rows are the record, and the fold reads the
+  events again from ten minutes before the newest it folded.
+- **Priced when recorded.** `SPAWN_MODEL_PRICES` is a JSON object from model
+  name to `{"input", "output", "cache_write", "cache_read"}`, US dollars per
+  million tokens, each a number not below zero; a message costs each count
+  times its rate over a million, in exact decimals, and keeps that cost
+  (and the rates it was priced at) when the prices change later. A model the
+  setting does not price counts its tokens and no cost (`usd` null; its
+  tokens are unpriced, never $0). Unset, a built-in table prices Anthropic's
+  first-party list prices of 2026-11 (input, output, cache write, cache read
+  per million): `claude-fable-5-2` 8, 40, 10, 0.20; `claude-opus-5-5` 4,
+  20, 5, 0.20; `claude-sonnet-5-5` 2, 10, 2.50, 0.10; `claude-opus-4-8`,
+  `-4-7`, `-4-6` 5, 25, 6.25, 0.50; `claude-sonnet-4-6`, `-4-5` 3, 15,
+  3.75, 0.30; `claude-haiku-4-5` 1, 5, 1.25, 0.10. Set, the setting replaces
+  the table whole. A value that is not such an object stops `spawn loop`
+  and `spawn serve` at start, naming the setting.
+- **Served and shown.** `GET /api/cost?window=24h|7d` (24h when absent; any
+  other window 400) answers the messages timed in [now minus the window,
+  now) on the database's clock: `{window, since_ms, until_ms, total, models,
+  missions, tasks, agents, executions}`, each with its `usd` (the exact sum;
+  0 for an entry of unpriced use only, null for an unpriced model), its
+  `tokens` and its `unpriced_tokens`. The dashboard's Cost page (sidebar)
+  shows the total and each mission, task and agent over 24 h and 7 d
+  (`web/src/cost.ts`): to the cent, a cost that is not zero never as $0.00
+  ("<$0.01"), use only on an unpriced model as "unpriced", and any unpriced
+  use marked.
+- **A daily budget.** `spawn mission configure --id <mission> --daily-usd
+  <amount>` records `budget.daily_usd` (`--no-daily-usd` clears it); the
+  alerts step raises `cost_budget` once the mission's spend of the UTC day
+  reaches it (§3.4).
 
 ## 4. Experience
 
@@ -1083,6 +1165,10 @@ and, with no token set at all, a client socket the owner's uid holds;
 `Content-Type: application/json` (415), which no form can send without a
 preflight; a body of at most 16 KiB (413); a key and a text a person types:
 not blank, at most 8 KiB, no control character but tab and line ends (400).
+A key answers with its first command only for the request that made it (the
+same session and text, or key name): sent for another session or with other
+content it is 409, makes no command, and the page takes a new key
+(`spawn_human_replay`).
 
 The second is a person's named key, `POST /api/session/<id>/key` with
 `{"name", "key"}` (§3, "Named keys never wait"): the command `spawn submit
@@ -1220,9 +1306,11 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
   on live runs. Nothing replays the playbook over recorded episodes.
 - **A write endpoint in the UI** (an input box to the supervisor). Humans
   act with `spawn submit --principal human`.
-- **More dispatcher rules:** stopping a COMPLETED one-shot task and
-  retrying after a transient API error (both escalate), and the actions
-  `restart` and `reassign`.
+- **More dispatcher rules:** stopping a COMPLETED one-shot task (it
+  escalates), and the actions `restart` and `reassign`. Retrying after a
+  transient API error is the recovery's (§3.1): bounded for an engine that
+  ended, unbounded for one at its prompt; telling the supervisor after N
+  live retries is not built.
 - **Ladder health over long periods.** The UI's figures cover the last 24 h.
 - **The backlog, scenarios and gate versioned with the source**
   (docs/storage.md).
@@ -1343,9 +1431,54 @@ the tree's own:
   rejection into a host fault, never into an acceptance. (2026-11-07: one e2e
   run that failed under load rejected task 127's 85-minute gate; the same
   tree passes it.)
+- a numbered scenario the base solved that fails on the candidate is
+  judged the same way before it is called a regression (gate.sh "Three
+  classes of a failing regression"; the owner, 2026-11-10, after an owner
+  gate rejected valid work on 028, which failed on main itself at that
+  load): it runs again on the candidate, then on the base, now and never
+  from the cache, once its candidate runs have ended, with nothing else of
+  the gate beside it and on a test server no candidate run used (a second
+  server of the gate's own, from its template). The base passing twice:
+  two failures on the candidate (of two, or of three after a pass) are a
+  candidate failure, rejected with the reason it always had; one failure
+  of three is unstable on the candidate, `cannot_judge` (exit 6), never
+  accepted. The base failing a run: a validator defect, never a
+  rejection. A task's candidate then gets no verdict (exit 6, `host_fault`
+  with the evidence `validator_defect` and the key `validator_defects`),
+  because a base run that follows candidate code may spare a rejection and
+  never accept; the owner's own candidate (`SPAWN_GATE_OWNER_CANDIDATE=1`,
+  which spawn integrate does not pass yet) is judged on the rest and its
+  verdict names the validators (`validator_defects`). On a shared test
+  server a base that fails after the candidate ran is no evidence for
+  either: a host fault. The integrator reads neither new key yet: a
+  task's validator defect is recorded as the host fault it is, with the
+  gate's reason.
+- `<scenarios>/quarantined` (a list like `serial`; the owner's, the tree's
+  copy under the protected paths, in no base cache key) names validators
+  the owner knows are broken: not run as regressions, nor judged on the
+  base for one, and named in every gate's log and verdict (`quarantined`).
+  The task's own scenario is never skipped by it.
+- the regression that last ended a gate of the same scenarios (a candidate
+  failure, a validator defect, unstable) is judged first by the next gate,
+  before the serial list and alone, until a run of it passes (gate.sh "A
+  known failure first"; the record is beside the base cache,
+  `gate-solved/<root commit>/.known-failure.<hash of the scenarios'
+  names>`, hidden from the sandbox): a failure that is still there costs
+  that scenario's own runs, not the gate.
 - everything the candidate controls runs in a bubblewrap sandbox (docs/rsi.md
   §4). The verdict is one JSON line that names the base and candidate
   commits it judged; the integrator believes only the verdict file it owns.
+- a regression's result may be the base's, not a run (gate.sh "Results
+  reused from the base", GitHub issue #48): a scenario that declares what
+  a run reads of the tree (`# reads: binary [<path> ...]`; 001, 007 and
+  027 so far) is not run on the candidate when the candidate's `spawn` has
+  the sha256 of the binary the base's `solved` was taken on (the hash is in
+  the base cache entry, written by the run that earned the result), the
+  paths it declares and the tree's own copy of the scenario are the same in
+  both trees, and it is not on the `serial` list. The log says so per
+  scenario with the reason, the verdict names them (`reused`), a reused
+  result seeds no cache entry, and a scenario that declares nothing is
+  always run. `SPAWN_GATE_REUSE=0` runs everything.
 - objective results on the base (solved, unsolved after two runs that
   agree, or `cannot_judge` when the scenario says the host cannot judge it,
   one run) are cached outside the sandbox, keyed by everything that decides
@@ -1400,7 +1533,15 @@ the tree's own:
   stops no landing; on the candidate a regression that exits 6 is skipped,
   never passed or failed, and the task scenario that exits 6 states the
   fact: `host_fault` with the evidence `cannot_judge`, never a rejection and
-  never an abort (§10.3). Exit 6 with neither fact is an abort, as is any
+  never an abort (§10.3). The gate states the same fact itself, in its
+  first seconds, when the sandbox lacks a prerequisite a scenario or check
+  declares (a line `# needs: controller:<path>`, `tool:<name>` or an
+  absolute path, read without running the file; `check-web` declares the
+  controller's `web/node_modules/`): all of them are asked for in one
+  sandbox after the static checks, before the base's build and any
+  scenario, and a missing one is `cannot_judge` with the scenario and the
+  `prerequisite` (gate.sh "Preflight"). A file the tree under test may lack
+  is that tree's result, never a prerequisite. Exit 6 with neither fact is an abort, as is any
   other status: exit 3 (no bwrap, a missing bind directory, an unreadable
   `TMPDIR`, a floor that is not whole GiB, the gate's own tree under `/tmp`,
   `/run` or `/var/tmp` — itself or below it — or under the host's `TMPDIR`
@@ -2136,9 +2277,14 @@ are per-agent uids or a mount per engine.
   `main` is neither held nor refused for a red it did not cause (else it
   would have to go ungated). Only the tests `main` fails are unsolved: a
   test the candidate newly fails inside the red check, or a run of it that
-  names no failed test, is the push's regression. Accepted: under the landing lock, the
+  names no failed test, is the push's regression. The owner's gate also
+  runs with `SPAWN_GATE_OWNER_CANDIDATE=1`: a regression that fails on M
+  too, run again after the candidate's runs, is a validator's defect, not
+  the push's, and the gate judges the rest (a task's gate gives no verdict
+  then, a `host_fault` with evidence `validator_defect`). Accepted: under the landing lock, the
   candidate is pushed to `main` with a lease on M, and `source.moved`
-  names `verdict` `accepted`. Rejected (or a candidate without the
+  names `verdict` `accepted`, with the gate's `validator_defects` and
+  `quarantined` when it names any (the `validator_defect` alert). Rejected (or a candidate without the
   mission's scenarios directory, `no_scenarios`): `source.push_refused`
   with `verdict` and the gate's `log`; nothing moves and no mission counts
   it. No verdict (the host's fault, an abort, which is a harness error, no

@@ -1,4 +1,3 @@
-import { ChevronRight } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { DiskPlace, FleetHealth, LadderStep } from "../../fleet";
@@ -7,7 +6,7 @@ import type { GateRoom, Memory } from "../../resources";
 import { memoryBar, waitingGates } from "../../resources";
 import { cx } from "../ui";
 
-const LADDER: Array<{
+export const LADDER: Array<{
   step: LadderStep | "liveness";
   label: string;
   bar: string;
@@ -45,13 +44,13 @@ const LADDER: Array<{
   },
 ];
 
-const LIVENESS = {
+export const LIVENESS = {
   label: "Liveness",
   bar: "bg-faint-foreground",
   hint: "Engines restarted automatically by the liveness check",
 };
 
-function Cell({
+export function Cell({
   label,
   children,
   className,
@@ -70,7 +69,7 @@ function Cell({
   );
 }
 
-function Stat({
+export function Stat({
   label,
   value,
   tone,
@@ -252,7 +251,7 @@ function GateRoomList({ rows }: { rows: GateRoom[] | null }) {
   );
 }
 
-function formatRate(value: number | null): string {
+export function formatRate(value: number | null): string {
   if (value == null) return "—";
   if (value === 0) return "0";
   if (value < 0.01) return value.toFixed(3);
@@ -269,7 +268,7 @@ export interface Liveness {
   shortest: { name: string; ms: number; since: number } | null;
 }
 
-const HUMAN_RATE_HINT =
+export const HUMAN_RATE_HINT =
   "Human per agent-hour: decisions that needed a person (the ladder's human step) in the last 24 h, divided by the hours agents ran in that time. Lower is better; 0 means the fleet ran without anyone.";
 
 export function HealthStrip({
@@ -279,27 +278,13 @@ export function HealthStrip({
   health: FleetHealth;
   liveness: Liveness;
 }) {
-  const lastHour = health.last_hour;
-  const jev = lastHour.by_judge.jev ?? 0;
-  const rules = lastHour.by_judge.rules ?? 0;
-  const judged = Math.max(
-    lastHour.judgements,
-    Object.values(lastHour.by_judge).reduce((sum, n) => sum + n, 0),
-  );
-  const other = Math.max(0, judged - jev - rules);
-  const jevShare = judged > 0 ? jev / judged : null;
-
-  const ladderTotal =
-    LADDER.reduce((sum, entry) => sum + health.ladder_24h[entry.step], 0) +
-    health.ladder_24h.liveness;
-  const humanRate = health.human_per_agent_hour;
   const restarts = health.ladder_24h.liveness;
   const down = liveness.total - liveness.up;
 
   return (
     <section
       aria-label="Fleet health"
-      className="grid shrink-0 grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.25fr)_minmax(0,1.2fr)_minmax(0,1.75fr)]"
+      className="grid shrink-0 grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.25fr)]"
     >
       <Cell label="Liveness">
         <div className="flex items-baseline gap-2">
@@ -369,171 +354,6 @@ export function HealthStrip({
         </div>
       </Cell>
 
-      <Cell label="Judgements · last hour">
-        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-caption">
-          <span className="tnum text-title-sm font-semibold text-foreground">
-            {judged}
-          </span>
-          <Stat
-            label="Jev share"
-            value={jevShare == null ? "—" : `${Math.round(jevShare * 100)}%`}
-            tone="text-jev"
-          />
-          <Stat
-            label="Jev p50"
-            value={
-              lastHour.model_latency_p50_ms == null
-                ? "—"
-                : formatDuration(lastHour.model_latency_p50_ms)
-            }
-          />
-        </div>
-        <div
-          className="mt-2 flex h-1.5 overflow-hidden rounded-full bg-muted"
-          title={`rules ${rules} · Jev ${jev}${other ? ` · other ${other}` : ""}`}
-        >
-          {judged > 0 && (
-            <>
-              <div
-                className="h-full bg-muted-foreground/70"
-                style={{ width: `${(rules / judged) * 100}%` }}
-              />
-              <div
-                className="h-full bg-jev"
-                style={{ width: `${(jev / judged) * 100}%` }}
-              />
-              <div
-                className="h-full bg-faint-foreground/50"
-                style={{ width: `${(other / judged) * 100}%` }}
-              />
-            </>
-          )}
-        </div>
-        <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-caption">
-          <Stat label="rules" value={rules} />
-          <Stat label="Jev" value={jev} tone="text-jev" />
-          <Stat
-            label="Jev unreachable"
-            value={lastHour.judge_unavailable}
-            tone={lastHour.judge_unavailable > 0 ? "text-warning" : undefined}
-            title="Judgements where Jev could not be reached and the rules' guess stood"
-          />
-          <Stat
-            label="disagreed"
-            value={lastHour.disagreements}
-            title="Jev's final state differed from the rules' guess"
-          />
-        </div>
-      </Cell>
-
-      <Cell
-        label={
-          <span className="flex items-center gap-2">
-            Decision ladder · 24h
-            <span className="ml-auto flex gap-3 normal-case tracking-normal">
-              <Stat label="tool calls/h" value={lastHour.tool_calls} />
-              <Stat
-                label="failures/h"
-                value={lastHour.failures}
-                tone={lastHour.failures > 0 ? "text-destructive" : undefined}
-              />
-            </span>
-          </span>
-        }
-        className="sm:col-span-2 xl:col-span-1"
-      >
-        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5" title={HUMAN_RATE_HINT}>
-          <span
-            className={cx(
-              "tnum text-title-sm leading-none font-semibold",
-              humanRate == null
-                ? "text-faint-foreground"
-                : humanRate === 0
-                  ? "text-success"
-                  : "text-warning",
-            )}
-          >
-            {formatRate(humanRate)}
-          </span>
-          <span className="cursor-help whitespace-nowrap text-caption text-muted-foreground underline decoration-dotted underline-offset-2">
-            human per agent-hour
-          </span>
-          <span className="tnum ml-auto whitespace-nowrap text-caption text-faint-foreground">
-            {health.ladder_24h.human} human ·{" "}
-            {health.agent_hours_24h == null ? "—" : health.agent_hours_24h.toFixed(1)} agent-h
-          </span>
-        </div>
-        <div className="mt-2 flex h-1.5 gap-px overflow-hidden rounded-full bg-muted">
-          {ladderTotal > 0 &&
-            [...LADDER, { ...LIVENESS, step: "liveness" as const }].map(
-              (entry) => {
-                const count = health.ladder_24h[entry.step];
-                if (count <= 0) return null;
-                return (
-                  <div
-                    key={entry.step}
-                    title={`${entry.label}: ${count}`}
-                    className={cx("h-full min-w-[3px]", entry.bar)}
-                    style={{ flexGrow: count, flexBasis: 0 }}
-                  />
-                );
-              },
-            )}
-        </div>
-        <ol className="mt-2 flex flex-wrap items-center gap-x-1 gap-y-1 text-caption">
-          {LADDER.map((entry, index) => {
-            const count = health.ladder_24h[entry.step];
-            const isHuman = entry.step === "human";
-            return (
-              <li
-                key={entry.step}
-                className="inline-flex items-center gap-1"
-                title={entry.hint}
-              >
-                {index > 0 && (
-                  <ChevronRight
-                    size={12}
-                    aria-hidden="true"
-                    className="shrink-0 text-faint-foreground"
-                  />
-                )}
-                <span
-                  className={cx("size-1.5 shrink-0 rounded-full", entry.bar)}
-                />
-                <span
-                  className={cx(
-                    "text-muted-foreground",
-                    isHuman && count > 0 && "text-warning",
-                  )}
-                >
-                  {entry.label}
-                </span>
-                <span
-                  className={cx(
-                    "tnum font-medium",
-                    count === 0
-                      ? "text-faint-foreground"
-                      : isHuman
-                        ? "text-warning"
-                        : "text-foreground",
-                  )}
-                >
-                  {count}
-                </span>
-              </li>
-            );
-          })}
-        </ol>
-        {health.ladder_extra.length > 0 && (
-          <div className="mt-1 flex flex-wrap gap-x-3 text-micro text-faint-foreground">
-            {health.ladder_extra.map(([name, count]) => (
-              <span key={name}>
-                <span className="tnum text-muted-foreground">{count}</span> {name}
-              </span>
-            ))}
-          </div>
-        )}
-      </Cell>
     </section>
   );
 }

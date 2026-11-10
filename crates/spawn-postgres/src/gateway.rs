@@ -86,6 +86,18 @@ pub enum HumanWrite {
     /// The session runs no execution, in the store's words: an input or a
     /// key needs a running engine. No command was made.
     NotRunning(String),
+    /// The idempotency key is another request's (another session, another
+    /// key name, or an input), in the store's words. No command was made.
+    KeyUsed(String),
+}
+
+/// The store's words when `error` is its refusal of an idempotency key
+/// another request used (`spawn_human_replay`, SQLSTATE 23505).
+fn key_used(error: &postgres::Error) -> Option<String> {
+    error
+        .as_db_error()
+        .filter(|db| *db.code() == postgres::error::SqlState::UNIQUE_VIOLATION)
+        .map(|db| db.message().to_string())
 }
 
 /// What became of a person's key ([`HumanWrite`]).
@@ -95,8 +107,9 @@ pub type HumanKey = HumanWrite;
 pub type HumanInput = HumanWrite;
 
 /// The answer of `spawn_human_input` or `spawn_human_key`: its command, none
-/// for a session no agent has used, or the refusal of a session that runs
-/// no execution (SQLSTATE 55000, its message the reason).
+/// for a session no agent has used, the refusal of a session that runs
+/// no execution (SQLSTATE 55000, its message the reason), or the refusal of
+/// an idempotency key another request used (SQLSTATE 23505).
 fn human_write(answer: Result<postgres::Row, postgres::Error>) -> Result<HumanWrite, StoreError> {
     match answer {
         Ok(row) => Ok(row
@@ -114,7 +127,9 @@ fn human_write(answer: Result<postgres::Row, postgres::Error>) -> Result<HumanWr
                 .map_or_else(String::new, |db| db.message().to_string());
             Ok(HumanWrite::NotRunning(message))
         }
-        Err(error) => Err(crate::backend(&error)),
+        Err(error) => key_used(&error)
+            .map(HumanWrite::KeyUsed)
+            .ok_or_else(|| crate::backend(&error)),
     }
 }
 
@@ -156,20 +171,13 @@ impl PostgresStore {
         Ok(CommandId(row.get::<_, i64>(0).unsigned_abs()))
     }
 
-    /// Type `text` into `session` as a person, through `spawn_human_input`:
-    /// the input `spawn submit --principal human` would submit to the
-    /// session's agent, with the same idempotency rule (a repeated `key`
-    /// returns the first command). Only a store connected as the
-    /// `spawn_human` login may call it (`role_url(owner, "spawn_human")`);
-    /// that login can do nothing else. [`HumanWrite::NoAgent`] when no
-    /// agent has used the session; a session that runs no execution is
-    /// refused ([`HumanWrite::NotRunning`]) and nothing is recorded.
     /// Press `key` in `session` as a person, through `spawn_human_key`:
     /// the key command `spawn submit --principal human` would submit to the
     /// session's agent, with the same idempotency rule. Only a store
     /// connected as the `spawn_human` login may call it. A session that
     /// runs no execution is refused ([`HumanKey::NotRunning`]) and nothing
-    /// is recorded.
+    /// is recorded; so is an idempotency key another request used
+    /// ([`HumanKey::KeyUsed`]).
     pub fn submit_human_key(
         &self,
         session: &SessionId,
@@ -182,6 +190,18 @@ impl PostgresStore {
         human_write(answer)
     }
 
+    /// Type `text` into `session` as a person, through `spawn_human_input`:
+    /// the input `spawn submit --principal human` would submit to the
+    /// session's agent, with the same idempotency rule (a repeated `key`
+    /// returns the first command) for the same session and text only: a
+    /// `key` another session's input used, or other text, is refused
+    /// ([`HumanInput::KeyUsed`]) and nothing is recorded. Only a store
+    /// connected as the `spawn_human` login may call it (`role_url(owner,
+    /// "spawn_human")`); that login can do nothing else.
+    /// [`HumanInput::NoAgent`] when no agent has used the session; a session
+    /// that runs no execution is refused ([`HumanInput::NotRunning`]) and
+    /// nothing is recorded, though a repeated key still returns its first
+    /// command (objective 040).
     pub fn submit_human_input(
         &self,
         session: &SessionId,

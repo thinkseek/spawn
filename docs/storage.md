@@ -632,9 +632,13 @@ state and wedges nothing:
 - **Routine cleanup**, daily, by `spawn-maintenance.timer`
   (`scripts/maintenance.sh`, [install](../deploy/systemd/README.md#disk-room)):
   the gate's scratch directories (exactly
-  `spawn-gate.` plus six characters, a directory, owned by this user, not
-  modified for a day: a gate removes its own on exit and is killed after 45
-  minutes, so these are left by a killed gate); and deploy.sh's
+  `spawn-gate.` plus six characters, a directory, owned by this user, whose
+  gate is gone: a gate removes its own on exit, and records its pid, start
+  time and boot in it, so one whose process no longer runs was left by a
+  killed gate and one whose process runs stays, however old; a scratch
+  without that record goes when not modified for a day, or for the gate's
+  wall clock when that is longer; none goes while a process still has a
+  file open in it); and deploy.sh's
   `spawn-YYYYMMDD-HHMMSS.dump` files in the backups directory beyond the
   newest 5. `pg-backup.sh` rotates its own `spawn-auto-*.dump`; every other
   file is left alone. A dry run (`SPAWN_MAINTENANCE_DRY_RUN=1`) prints what
