@@ -13241,6 +13241,226 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    // --- objective 035: every verdict binds what it judged and where -------
+
+    /// A controller tree under `base` (`<base>/ctl`, its gate directory
+    /// `<base>/ctl/rsi/scenarios` holding one check), its `.controller`
+    /// naming `commit`: the gate directory.
+    fn controller_tree(base: &Path, commit: &str) -> PathBuf {
+        let scenarios = base.join("ctl/rsi/scenarios");
+        std::fs::create_dir_all(&scenarios).expect("the gate directory");
+        std::fs::write(scenarios.join("check-ok.sh"), "exit 0\n").expect("a check");
+        std::fs::write(base.join("ctl/.controller"), format!("{commit}\n")).expect("the marker");
+        scenarios
+    }
+
+    /// The gate's arguments, run by run: `(base, candidate)`.
+    fn noted_args(base: &Path) -> Vec<(String, String)> {
+        std::fs::read_to_string(base.join("args"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                Some((words.next()?.to_string(), words.next()?.to_string()))
+            })
+            .collect()
+    }
+
+    /// Notes `$2 $3` beside itself, then: its first run prints its setup's
+    /// toolchain line and rejects; every later one ends before any setup
+    /// (exit 3, an abort).
+    const BINDING_GATE: &str = "dir=$(dirname \"$0\")\n\
+        printf '%s %s\\n' \"$2\" \"$3\" >>\"$dir/args\"\n\
+        if [ \"$(wc -l <\"$dir/args\")\" -eq 1 ]; then\n\
+          echo '| == setup'\n\
+          echo '| base cache: toolchain rustc 1.95.0-test'\n\
+          printf '{\"verdict\":\"rejected\",\"reason\":\"fails\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+          exit 0\n\
+        fi\n\
+        echo 'gate: a bad setting' >&2\n\
+        exit 3\n";
+
+    /// Every verdict has its class: four about the code, three about the
+    /// infrastructure (every host fault's evidence alike), `stale`
+    /// superseded; nothing else gets one.
+    #[test]
+    fn every_verdict_has_its_class() {
+        for (verdict, class) in [
+            ("accepted", "code"),
+            ("rejected", "code"),
+            ("conflict", "code"),
+            ("incompatible", "code"),
+            ("aborted", "infrastructure"),
+            ("host_fault", "infrastructure"),
+            ("no_room", "infrastructure"),
+            ("stale", "superseded"),
+        ] {
+            assert_eq!(super::verdict_class(verdict), Some(class), "{verdict}");
+            let bound = super::bound(&json!({"type": "task.gated", "verdict": verdict}));
+            assert_eq!(bound["class"], class, "{bound}");
+        }
+        assert_eq!(super::verdict_class("solved"), None);
+        assert_eq!(super::verdict_class(""), None);
+        // A record no gate ran for: what it knows, no environment.
+        let stale = super::bound(&json!({"type": "task.gated", "verdict": "stale", "base": "b"}));
+        assert!(stale["env"].is_null() && stale.get("env").is_some(), "{stale}");
+        assert_eq!(stale["inputs"]["base"], "b");
+        for name in ["candidate", "controller", "scenarios_sha256", "scenario"] {
+            assert!(stale["inputs"][name].is_null(), "{name}: {stale}");
+        }
+        // A record that says what it judged keeps it; others go as they are.
+        let gated = super::bound(&json!({"type": "task.gated", "verdict": "accepted",
+                                          "inputs": {"base": "x"}, "env": {"host": "h"}}));
+        assert_eq!((&gated["inputs"]["base"], &gated["env"]["host"]), (&json!("x"), &json!("h")));
+        let landed = json!({"type": "task.landed", "id": 1});
+        assert_eq!(super::bound(&landed), landed);
+    }
+
+    /// Two judgings by one integrator: each verdict's `inputs` are exactly
+    /// the gate's arguments, with the controller and the scenario set read
+    /// when that gate started (a marker changed and a file added between
+    /// them are seen); its `env` names this host and the toolchain its run
+    /// printed, null for a run that printed none; the rejection is `code`,
+    /// the abort `infrastructure`, and the counts move as before.
+    #[test]
+    fn each_verdict_binds_the_inputs_and_environment_of_its_own_run() {
+        let (base, source, _, mut integrator) = world("binding-runs", BINDING_GATE);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_secs(1),
+            cap: 3,
+        };
+        let first = "0123456789abcdef0123456789abcdef01234567";
+        let second = "fedcba9876543210fedcba9876543210fedcba98";
+        let scenarios = controller_tree(&base, first);
+        let db = Db::new("binding_runs");
+        let mission = db.gated_mission(&source, &scenarios);
+        let one = db.reported_task(mission, "w1");
+        push_work(&base, &source, &agent_of(&db, mission, one), "one.txt");
+        let digest_one = crate::gate::scenarios_sha256(&scenarios).expect("a digest");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        let rejected = last_gated(&db);
+        let runs = noted_args(&base);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(rejected["verdict"], "rejected", "{rejected}");
+        assert_eq!(rejected["class"], "code");
+        assert_eq!(rejected["inputs"]["base"], runs[0].0.as_str());
+        assert_eq!(rejected["inputs"]["candidate"], runs[0].1.as_str());
+        assert_eq!(rejected["inputs"]["base"], rejected["base"], "{rejected}");
+        assert_eq!(rejected["inputs"]["controller"], first);
+        assert_eq!(rejected["inputs"]["scenarios_sha256"], digest_one.as_str());
+        assert!(rejected["inputs"]["scenario"].is_null(), "{rejected}");
+        assert_eq!(rejected["env"]["host"], json!(crate::gate::host_name()));
+        assert_eq!(rejected["env"]["toolchain"], "rustc 1.95.0-test");
+        assert!(rejected["env"]["runner"].is_null(), "{rejected}");
+        assert!(rejected.get("head_inputs").is_none(), "no head run: {rejected}");
+
+        // Between the runs: the marker names another commit, a file joins.
+        std::fs::write(base.join("ctl/.controller"), format!("{second}\n")).expect("the marker");
+        std::fs::write(scenarios.join("check-two.sh"), "exit 0\n").expect("another check");
+        let digest_two = crate::gate::scenarios_sha256(&scenarios).expect("a digest");
+        assert_ne!(digest_two, digest_one);
+        let two = db.reported_task(mission, "w2");
+        push_work(&base, &source, &agent_of(&db, mission, two), "two.txt");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        let aborted = last_gated(&db);
+        let runs = noted_args(&base);
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert_eq!((&aborted["id"], &aborted["verdict"]), (&json!(two), &json!("aborted")), "{aborted}");
+        assert_eq!(aborted["class"], "infrastructure");
+        assert_eq!(aborted["inputs"]["base"], runs[1].0.as_str());
+        assert_eq!(aborted["inputs"]["candidate"], runs[1].1.as_str());
+        assert_eq!(aborted["inputs"]["controller"], second, "read per run, not remembered");
+        assert_eq!(aborted["inputs"]["scenarios_sha256"], digest_two.as_str());
+        assert!(aborted["env"]["toolchain"].is_null(), "printed none: {aborted}");
+        assert_eq!(aborted["env"]["host"], json!(crate::gate::host_name()));
+        let after = gated(&db, mission);
+        assert_eq!((after.gate_rejections, after.gate_aborts), (1, 1));
+
+        // A marker gone, then a malformed one: null, never the last commit.
+        for marker in [None, Some("not a commit\n")] {
+            match marker {
+                None => std::fs::remove_file(base.join("ctl/.controller")).expect("remove"),
+                Some(text) => std::fs::write(base.join("ctl/.controller"), text).expect("write"),
+            }
+            assert_eq!(crate::gate::controller_commit(&scenarios), None, "{marker:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A merge the gate rejects whose head passes alone is `incompatible`:
+    /// its record binds the merge's run (`inputs`, `env`) and the head's
+    /// (`head_inputs`, based on `head_base`).
+    #[test]
+    fn an_incompatible_verdict_binds_the_head_run_too() {
+        let gate = "printf '%s %s\\n' \"$2\" \"$3\" >>\"$(dirname \"$0\")/args\"\n\
+                    echo '| base cache: toolchain rustc 1.95.0-test'\n\
+                    if git --git-dir=\"$1\" rev-parse -q --verify \"$3^2\" >/dev/null; then\n\
+                      printf '{\"verdict\":\"rejected\",\"reason\":\"fails merged\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+                      exit 0\n\
+                    fi\n\
+                    printf '{\"verdict\":\"accepted\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+        let (base, source, _, mut integrator) = world("binding-head", gate);
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let scenarios = controller_tree(&base, commit);
+        let db = Db::new("binding_head");
+        let m0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        let m1 = main_moves(&base, &source, "main.txt");
+        let head = push_work_on(&base, &source, &agent, &m0, "work.txt");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        let record = last_gated(&db);
+        let runs = noted_args(&base);
+        assert_eq!(record["verdict"], "incompatible", "{record}");
+        assert_eq!(record["class"], "code");
+        assert_eq!(runs.len(), 2, "the merge, then the head alone: {runs:?}");
+        assert_eq!(record["inputs"]["base"], m1.as_str());
+        assert_eq!(record["inputs"]["candidate"], runs[0].1.as_str());
+        assert_eq!(record["inputs"]["candidate"], record["candidate"], "{record}");
+        assert_eq!(record["inputs"]["controller"], commit);
+        assert_eq!(record["head_inputs"]["base"], m0.as_str(), "its base is head_base");
+        assert_eq!(record["head_inputs"]["base"], record["head_base"], "{record}");
+        assert_eq!(record["head_inputs"]["candidate"], head.as_str());
+        assert_eq!((runs[1].0.as_str(), runs[1].1.as_str()), (m0.as_str(), head.as_str()));
+        assert_eq!(record["head_inputs"]["controller"], commit);
+        assert_eq!(
+            record["head_inputs"]["scenarios_sha256"],
+            record["inputs"]["scenarios_sha256"]
+        );
+        assert_eq!(record["env"]["toolchain"], "rustc 1.95.0-test");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A push the pusher has not caught up with is `stale`: nothing was
+    /// judged, so no environment, and the inputs say only what is known.
+    #[test]
+    fn a_stale_verdict_has_no_environment() {
+        let (base, source, _, mut integrator) = world("binding-stale", NOTING_GATE);
+        let scenarios = controller_tree(&base, "0123456789abcdef0123456789abcdef01234567");
+        let db = Db::new("binding_stale");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        // Reported, but the agent's branch was never pushed: nothing to
+        // land is a rejection, so push one and then move main under it
+        // in the record's view by recording the landing stale directly.
+        let _ = (task, &mut integrator);
+        let record = super::bound(&json!({"type": "task.gated", "id": task, "revision": 0,
+            "verdict": "stale", "reason": "behind",
+            "inputs": crate::gate::known_inputs(Some(&source_main(&source)), None), "env": null}));
+        db.record(&record);
+        let stored = last_gated(&db);
+        assert_eq!(stored["class"], "superseded");
+        assert!(stored["env"].is_null() && stored.get("env").is_some(), "{stored}");
+        assert_eq!(stored["inputs"]["base"], source_main(&source).as_str());
+        assert!(stored["inputs"]["controller"].is_null(), "{stored}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The other half of task 207: the head alone fails the check on its own
     /// base too (that base was a red main), so it cannot be judged there. The
     /// merge's rejection stands, through the store: `rejected`, counted, with
