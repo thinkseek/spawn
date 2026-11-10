@@ -314,6 +314,38 @@ test("a live fold rebuilt a tick later is the same map; a new break or band widt
   const at = (end: number) => traceFold(live, end, { plotW: 800 });
   assert.ok(sameFoldMap(at(T0 + 5 * H + 10 * S), at(T0 + 5 * H + 11 * S)));
   assert.equal(at(T0 + 5 * H + 10 * S).breaks.length, 1);
+  // A waiting session: its turn open since an hour ago, nothing recorded
+  // since, so its live end is now alone after a break that grows with the
+  // clock. Still the same map, and no time before the band or now moves.
+  const waiting = deriveTrace(
+    timeline([
+      ["execution.started", 0, { engine: "claude" }],
+      ["message.received", S],
+      ["tool.started", 2 * S, { tool_name: "Bash", tool_use_id: "w" }],
+      ["tool.completed", 3 * S, { tool_use_id: "w" }],
+    ]),
+    T0 + H,
+  );
+  const now = (end: number) => traceFold(waiting, end, { plotW: 800 });
+  const [h, h1] = [now(T0 + H), now(T0 + H + S)];
+  assert.equal(h.breaks.length, 1);
+  assert.equal(h.breaks[0].to, T0 + H, "the break ends at now");
+  assert.ok(sameFoldMap(h, h1), "the clock moved only the live end");
+  assert.equal(h1.fold(T0 + 2 * S), h.fold(T0 + 2 * S));
+  assert.equal(h1.fold(T0 + H + S), h.fold(T0 + H), "now stays where it was on the axis");
+  // But a last break that ends at a record, not at now, moved for real.
+  const recorded = foldIdle([[T0, T0 + M], [T0 + H, T0 + H]], { minGap: TRACE_MIN_GAP_MS, keep: 2 ** 16 });
+  const recordedLater = foldIdle([[T0, T0 + M], [T0 + H, T0 + H + S]], { minGap: TRACE_MIN_GAP_MS, keep: 2 ** 16 });
+  assert.ok(sameFoldMap(recorded, recordedLater), "the same break, a longer last block");
+  const movedBreak = foldIdle([[T0, T0 + M], [T0 + H + S, T0 + H + S]], { minGap: TRACE_MIN_GAP_MS, keep: 2 ** 16 });
+  assert.ok(sameFoldMap(recorded, movedBreak), "two live instants: the band before now grew");
+  // Both end at a live instant, but an earlier break moved: not the same.
+  const earlier = (from: number) =>
+    foldIdle([[T0, T0 + M], [T0 + from, T0 + H + M], [T0 + 3 * H, T0 + 3 * H]], {
+      minGap: TRACE_MIN_GAP_MS,
+      keep: 2 ** 16,
+    });
+  assert.ok(!sameFoldMap(earlier(H), earlier(H + S)), "only the last break may end at a moving now");
   // With no break every fold is the identity, LINEAR included.
   assert.ok(sameFoldMap(LINEAR, foldIdle([[T0, T0 + 1_000]])));
   assert.ok(sameFoldMap(LINEAR, { ...LINEAR, keep: 2 ** 16 }), "whatever its keep");
