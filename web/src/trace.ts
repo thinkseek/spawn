@@ -135,6 +135,47 @@ export interface KnownExecution {
   started_at_ms: number;
   ended_at_ms: number | null;
   cause: string | null;
+  /** The execution of the same session a restart's resume replaced. */
+  restart_of?: string | null;
+}
+
+/** What replaced what among a session's executions: for each one a
+ * restart's resume started, the execution it replaced (`of`), and for that
+ * one, the execution that replaced it (`by`). */
+export interface RestartLink {
+  of: string | null;
+  by: string | null;
+}
+
+export function restartLinks(executions: readonly KnownExecution[]): Map<string, RestartLink> {
+  const links = new Map<string, RestartLink>();
+  const at = (id: string) => {
+    const link = links.get(id) ?? { of: null, by: null };
+    links.set(id, link);
+    return link;
+  };
+  for (const execution of executions) {
+    if (!execution.restart_of) continue;
+    at(execution.execution_id).of = execution.restart_of;
+    at(execution.restart_of).by = execution.execution_id;
+  }
+  return links;
+}
+
+/** An execution id short enough for a label: its last 8 characters. */
+function shortExecution(id: string): string {
+  return id.length > 12 ? `…${id.slice(-8)}` : id;
+}
+
+/** The words an execution span's label gains from a restart: `restart of
+ * …` on the new one, `restarted as …` on the one it replaced. */
+export function restartWords(link: RestartLink | undefined): string | null {
+  if (!link) return null;
+  const words = [
+    link.of ? `restart of ${shortExecution(link.of)}` : null,
+    link.by ? `restarted as ${shortExecution(link.by)}` : null,
+  ].filter((word): word is string => word !== null);
+  return words.length > 0 ? words.join(" · ") : null;
 }
 
 /** Spans from a window of a session's events. `executions` (the session's
@@ -450,6 +491,15 @@ export function deriveTrace(
   }
   for (const event of earlyExecutionEnds.values()) {
     orphan("execution", "execution", event, null);
+  }
+
+  // A restart links its executions: each span says what it replaced and
+  // what replaced it.
+  const restarts = restartLinks(executions);
+  for (const span of spans) {
+    if (span.kind !== "execution" || !span.executionId) continue;
+    const words = restartWords(restarts.get(span.executionId));
+    if (words) span.label = `${span.label} · ${words}`;
   }
 
   // Tie children to parents, depth, display order.
