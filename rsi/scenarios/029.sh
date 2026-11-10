@@ -92,6 +92,17 @@
 # $XDG_RUNTIME_DIR) are named after its run and removed at its end; it never
 # touches another unit.
 #
+# rsi: task-only
+# Out of the regression set (the lead, 2026-11-10, design-gate-minimal-spawn.md
+# Q2): no gate has ever judged it (every run printed cannot_judge, and each
+# was a per-gate cost that could not pass), so the gate runs it only as an
+# objective-29 task's own scenario, never on the base for another gate nor
+# as a regression (scripts/rsi/gate.sh, `# rsi: task-only`). What would
+# make a gate able to judge it: running this scenario outside bwrap under
+# the owner's user manager, or a sandbox that binds the user bus and a
+# delegated cgroup subtree (memory controller enabled). Until then the owner
+# judges it, as §10.4 says for owner-judged objectives.
+#
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 6 this host cannot judge it (no systemd user manager
 # that delegates the memory controller, no cgroup v2 tree: the gate's

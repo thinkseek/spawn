@@ -3301,6 +3301,12 @@ expect "the candidate's failure of it is main's" "$(cat "$work/gate.out")" \
     '| 071.sh fails on the base too: main is red on it (above), not a verdict on the candidate'
 refuse "never called an unsolved objective" "$(cat "$work/gate.out")" 'an unsolved objective, not a regression'
 expect "and the candidate is judged as before: accepted" "$red_out" 'exit=0 {"verdict":"accepted"'
+# The scenarios directory with a trailing slash, as a hand run may type it:
+# the same directory, still red (before, "dir//071.sh" had dirname "dir",
+# not "dir/", so no index key was written and red never fired).
+red_out=$(export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$red_cache"; base=$red_b; judge "$red_c" "" "$red/")
+expect "the scenarios directory given with a trailing slash: still main red" "$red_out" \
+    '"main_red_scenarios":["071.sh"]'
 red_out=$(export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$red_cache"; base=$red_side; judge "$red_side_c" "" "$red")
 refuse "a branch that never had A: not red" "$red_out" 'main_red_scenarios'
 expect "an unsolved objective there" "$(cat "$work/gate.out")" \
@@ -3372,5 +3378,23 @@ expect "a scenario that looks into the index: accepted" \
 expect "and sees it empty" "$(cat "$work/gate.out")" '| index holds: .'
 refuse "never what main solved" "$(cat "$work/gate.out")" 'index holds: 07'
 git -C "$seed" checkout -q main 2>/dev/null || git -C "$seed" checkout -q -B main "$base"
+
+# 25. A task-only scenario (`# rsi: task-only`, 029: a gate cannot judge it)
+# is run only as its own task's scenario: 081 passes on the base and fails
+# on the candidate, which would be a regression, yet it is neither run on
+# the base for another gate nor as a regression, so the candidate is
+# accepted; as the task's scenario, 082 is run as any task scenario (fails
+# on the base, passes on the candidate).
+only=$work/task-only
+mkdir -p "$only"
+cp "$scenarios/build" "$scenarios/protected" "$only/"
+printf '#!/bin/sh\n# rsi: task-only\n[ "$PWD" = "$SPAWN_BASELINE_TREE" ]\n' >"$only/081.sh"
+printf '#!/bin/sh\n# rsi: task-only\n[ "$(cat value)" = two ] || exit 1\n' >"$only/082.sh"
+expect "a task-only scenario the candidate fails is no regression: accepted" \
+    "$(judge "$good" "" "$only")" 'exit=0 {"verdict":"accepted"'
+refuse "nor run on the base or the candidate" "$(cat "$work/gate.out")" '081.sh'
+expect "as its own task's scenario it is judged: accepted" \
+    "$(judge "$good" "$only/082.sh" "$only")" 'exit=0 {"verdict":"accepted"'
+expect "run as the task's" "$(cat "$work/gate.out")" 'candidate: 082.sh must pass'
 
 echo "gate: all cases pass"
