@@ -470,6 +470,19 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transcript_from: Option<u64>,
     },
+    /// The execution's terminal started, on this terminal server: the
+    /// server that ran the execution, by its identity
+    /// ([`crate::port::TerminalServer`]). Recorded after the start, since
+    /// the start may be what started the server. The recovery tells a host
+    /// restart by it: the execution's server is gone when none answers or
+    /// the one that answers is another (crate `spawn-cli`'s `recover`).
+    /// Left out by a host that cannot tell its server, and by executions
+    /// started before it was kept.
+    #[serde(rename = "execution.terminal_started")]
+    TerminalStarted {
+        /// The terminal server.
+        server: crate::port::TerminalServer,
+    },
     /// The execution ended.
     #[serde(rename = "execution.ended")]
     ExecutionEnded {
@@ -616,6 +629,7 @@ impl EventKind {
             Self::JobStarted { .. } => "job.started",
             Self::JobEnded { .. } => "job.ended",
             Self::ExecutionStarted { .. } => "execution.started",
+            Self::TerminalStarted { .. } => "execution.terminal_started",
             Self::ExecutionEnded { .. } => "execution.ended",
             Self::ExecutionEndStalled { .. } => "execution.end_stalled",
             Self::ExecutionUnmounting => "execution.unmounting",
