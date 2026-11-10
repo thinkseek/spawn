@@ -98,7 +98,8 @@ select exists (
 ///   with its outcome: what a restarted loop reads to know what it sent.
 /// - `executions`: every execution of the session, oldest first — when it
 ///   ran, how long, the key of the command that started it, and whether it
-///   made progress (a tool call completed or a turn ended). The resume rule
+///   made progress (a tool call completed or a turn ended), and the cause of
+///   the latest interruption recorded for it (`last_cause`). The resume rule
 ///   counts the ones a revival started that died young ([`crate
 ///   `spawn-cli::recover`'s `resume_failed`]).
 /// - `head`: the commit of the agent's latest `artifact.committed`, which a
@@ -179,7 +180,14 @@ with x as (
             'progress', exists (select 1 from spawn_events p
                                  where p.session_id = $1
                                    and p.execution_id = e.execution_id
-                                   and p.event_name in ('tool.completed', 'turn.stopped')))
+                                   and p.event_name in ('tool.completed', 'turn.stopped')),
+            'last_cause', (select r.kind -> 'detail' -> 'record' ->> 'cause'
+                             from spawn_events r
+                            where r.session_id = 'session_control'
+                              and r.event_name = 'control.recorded'
+                              and r.kind -> 'detail' -> 'record' ->> 'type' = 'execution.interrupted'
+                              and r.kind -> 'detail' -> 'record' ->> 'execution_id' = e.execution_id
+                            order by r.id desc limit 1))
             order by e.started_at_ms, e.execution_id), '[]'::jsonb) as list
     from ex e
 )

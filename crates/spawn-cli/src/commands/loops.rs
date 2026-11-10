@@ -404,6 +404,8 @@ impl Pace {
 /// database could not be reached is [`Pace`]d, never counted: the engines
 /// run on untouched, and the loop outlives the outage.
 pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
+    // A recovery setting out of its range runs nothing.
+    let config = crate::recover::Config::from_env()?;
     let stopping = stop_on_signal()?;
     let (bounds, mut warnings) = dispatch::Bounds::from_env();
     let (waits, more) = crate::deliver::Waits::from_env();
@@ -427,7 +429,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         workspace_root: root,
         disk: monitor,
         terminals: crate::config::terminal_host(),
-        config: crate::recover::Config::from_env(),
+        config,
         recovery: crate::recover::Recovery::new(),
         pace: Pace::default(),
         pause: loop_interval(),
