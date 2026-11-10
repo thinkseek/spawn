@@ -927,7 +927,9 @@ select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.r
    and not exists (select 1 from told where tag = 'host over-budget-' || e.id)";
 
 /// The last `task.gated` record of every task, keyed by task id:
-/// `{"<id>": {verdict, reason, metric, candidate, at_ms}}`. Kept out of
+/// `{"<id>": {verdict, reason, metric, candidate, at_ms}}`, with the
+/// verdict's `class`, `inputs` and `env` (objective 035) when it names them
+/// (a record from before them has none). Kept out of
 /// [`MISSION_BOARD`]: the supervisor's login reads the board and may not
 /// read `spawn_events`.
 pub(crate) const LAST_GATES: &str = r"
@@ -935,7 +937,9 @@ select coalesce(jsonb_object_agg(z.task, z.gate), '{}'::jsonb)
   from (select distinct on (r ->> 'id') r ->> 'id' as task,
                jsonb_build_object('verdict', r ->> 'verdict', 'reason', r ->> 'reason',
                                   'metric', r ->> 'metric', 'candidate', r ->> 'candidate',
-                                  'at_ms', e.recorded_at_ms) as gate
+                                  'at_ms', e.recorded_at_ms)
+               || (r - array(select k from jsonb_object_keys(r) k
+                              where k not in ('class', 'inputs', 'env', 'head_inputs'))) as gate
           from spawn_events e
          cross join lateral (select e.kind -> 'detail' -> 'record' as r) g
          where e.session_id = 'session_control' and e.event_name = 'control.recorded'
