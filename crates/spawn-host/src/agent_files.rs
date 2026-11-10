@@ -238,6 +238,34 @@ pub fn remove(top: &Path, relative: &TreePath) -> Result<(), AgentFileError> {
     }
 }
 
+/// The names of the entries of the directory `relative` under `top`, the
+/// directory and its parents walked without following a symlink (module
+/// docs); `.` and `..` are left out, and nothing is said of what an entry
+/// is: open each the safe way ([`open_regular`]). Empty when the directory,
+/// or one above it, does not exist.
+pub fn list(top: &Path, relative: &TreePath) -> Result<Vec<Vec<u8>>, AgentFileError> {
+    checked(relative)?;
+    let Some(parent) = parent(top, relative)? else {
+        return Ok(Vec::new());
+    };
+    let Some(directory) = parent
+        .existing_child(relative.file_name())
+        .map_err(AgentFileError::NotRegular)?
+    else {
+        return Ok(Vec::new());
+    };
+    let shown = directory.shown().to_path_buf();
+    let failed = |error: Errno| AgentFileError::Failed(format!("list {}: {error}", shown.display()));
+    let mut names = Vec::new();
+    for entry in rustix::fs::Dir::read_from(directory.descriptor()).map_err(failed)? {
+        let name = entry.map_err(failed)?.file_name().to_bytes().to_vec();
+        if name != b"." && name != b".." {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
 /// A directory of a workspace held open by its descriptor. Every entry
 /// below it is reached through the descriptor (`openat`, `mkdirat`,
 /// `renameat`, `unlinkat`), never by a path from the top, so a component
