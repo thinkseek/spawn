@@ -129,7 +129,7 @@ fn a_windows_figures_count_the_views() {
                "liveness": 1})
     );
     assert_eq!(answer["ladder_extra"], json!([["spawn-integrate", 1]]));
-    assert_eq!(answer["agent_hours"], json!(30.0));
+    assert_eq!(answer["agent_hours"], json!(30));
     assert_eq!(answer["human_per_agent_hour"], json!(0.067));
     assert_eq!(answer["escalations"], json!(3));
     assert_eq!(
@@ -146,13 +146,13 @@ fn a_windows_figures_count_the_views() {
     assert_eq!(
         answer["judgements"],
         json!({"total": 4, "by_judge": {"jev": 2, "rules": 1, "unknown": 1},
-               "judge_unavailable": 1, "disagreements": 1, "model_latency_p50_ms": 200.0})
+               "judge_unavailable": 1, "disagreements": 1, "model_latency_p50_ms": 200})
     );
     assert_eq!(
         answer["missions"],
         json!([
-            {"mission": 1, "text": "busy", "hours": 99.0, "idle_hours": 21.0, "idle": false},
-            {"mission": 2, "text": "gated", "hours": 78.0, "idle_hours": 60.0, "idle": true},
+            {"mission": 1, "text": "busy", "hours": 99, "idle_hours": 21, "idle": false},
+            {"mission": 2, "text": "gated", "hours": 78, "idle_hours": 60, "idle": true},
         ])
     );
 
@@ -160,7 +160,7 @@ fn a_windows_figures_count_the_views() {
     let empty = store
         .fleet_experience(B - 200 * HOUR_MS, B - 100 * HOUR_MS)
         .expect("an empty window reads");
-    assert_eq!(empty["agent_hours"], json!(0.0));
+    assert_eq!(empty["agent_hours"], json!(0));
     assert_eq!(empty["human_per_agent_hour"], Value::Null);
     assert_eq!(empty["judgements"]["model_latency_p50_ms"], Value::Null);
     assert_eq!(empty["interventions"]["total"], json!(0));
@@ -174,9 +174,9 @@ fn a_windows_figures_count_the_views() {
         .expect("the first day reads");
     assert_eq!(
         day["missions"][1],
-        json!({"mission": 2, "text": "gated", "hours": 22.0, "idle_hours": 10.0, "idle": false})
+        json!({"mission": 2, "text": "gated", "hours": 22, "idle_hours": 10, "idle": false})
     );
-    assert_eq!(day["agent_hours"], json!(20.0));
+    assert_eq!(day["agent_hours"], json!(20));
 }
 
 #[test]
