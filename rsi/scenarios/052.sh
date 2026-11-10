@@ -7,6 +7,9 @@
 # it again. The views do not read that record: /api/rsi, /api/overview's
 # RSI summary and `spawn mission objectives` count only landed tasks, so
 # the objective stays "open" and is named the next one to be assigned.
+# And `next_objective` ("what the integrator assigns next") is the first
+# open row, while the integrator skips objectives with a task in flight and
+# puts those that yielded behind the others (crate::objectives::choose).
 # On the live fleet, mission 4's objective 34 was recorded solved on the
 # base at 2026-11-08 10:51 UTC (event 109278, task 201). On 11-11 the RSI
 # page still showed it open and as `next_objective`, while the integrator
@@ -16,26 +19,32 @@
 # `objective.solved` record in its mission is "solved", as a landing makes
 # it, in every view built from the backlog; its row names the record
 # (`solved_on_base`: {event, task, base}, null for every other objective);
-# `next_objective` and the counts follow.
+# the counts follow; and `next_objective` is the objective the integrator's
+# own choice would assign next (solved, in flight, held and owner-judged
+# objectives left out, yields and failed attempts ordered, `after` obeyed).
 #
 # The scenario seeds a fresh database with no loop, as 043 and 049 do:
 # control records written as the store holds them and folded by
 # spawn_control_refold(). One objective mission (accept gate) whose backlog
-# holds objectives 1 to 4, hours before now:
+# holds objectives 1 to 5, hours before now:
 #   task 1 (objective 1): assigned -9, reported -8, gated accepted -7.5,
 #     landed -7.
 #   task 2 (objective 2): assigned -6, reported -5; objective.solved
 #     (task 2, base B) -4.5; task.cancelled naming it -4.5.
 #   another mission (2): objective.solved for its objective 3 -4.
-#   task 3 (objective 4): assigned -3, reported -2 (in flight).
-#   objective 3: never assigned.
+#   task 4 (objective 4): assigned -4, rejected three times, cancelled
+#     `yielded` -3.3 (one yield).
+#   task 3 (objective 3): assigned -3, reported -2 (in flight).
+#   objective 5: never assigned.
 # Checked:
-#   (1) /api/rsi: statuses solved, solved, open, open; objective 2's
+#   (1) /api/rsi: statuses solved, solved, open, open, open; objective 2's
 #       `solved_on_base` names the record, task 2 and B, and every other
-#       row's is null; `next_objective` 3.
-#   (2) /api/overview's rsi summary: open 2, solved 2, next_objective 3.
-#   (3) `spawn mission objectives --mission 1`: open [3, 4], solved 2,
-#       next_objective 3.
+#       row's is null.
+#   (2) /api/rsi `next_objective` 5: not 2 (solved), not 3 (in flight), not
+#       4 (it yielded, 5 never did).
+#   (3) /api/overview's rsi summary: open 3, solved 2, next_objective 5.
+#   (4) `spawn mission objectives --mission 1`: open [3, 4, 5], solved 2,
+#       next_objective 5.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -159,7 +168,7 @@ expect_eq() { # <got> <want> <what>
 
 ctl=$WORK/ctl
 mkdir -p "$ctl/rsi/backlog" "$ctl/rsi/scenarios"
-for n in 1 2 3 4; do
+for n in 1 2 3 4 5; do
     printf '{"id": %d, "title": "Objective %d of 052", "prompt": "Make scenario 00%d pass."}\n' "$n" "$n" "$n" \
         >"$ctl/rsi/backlog/00$n.json"
 done
@@ -204,8 +213,19 @@ select pg_temp.rec(-4.5, jsonb_build_object('type', 'task.cancelled', 'id', 2, '
     'reason', 'objective 2 is solved on the base: $SC2 passes at $B, so task #2 ends without a rejection'));
 -- Another mission's objective 3 solved on its base: not this mission's.
 select pg_temp.rec(-4, '{"type":"objective.solved","id":2,"objective":3,"task":99,"scenario":"$SC3","base":"$B","log":""}');
-select pg_temp.assigned(-3, 3, 4);
+-- Objective 3 in flight: assigned and reported, its gate not run yet.
+select pg_temp.assigned(-3, 3, 3);
 select pg_temp.rec(-2, '{"type":"task.reported","id":3,"commit":"$C1"}');
+-- Objective 4 failed three times and its task yielded the slot: it waits
+-- behind the objectives that never yielded.
+select pg_temp.assigned(-4, 4, 4);
+select pg_temp.rec(-3.9, '{"type":"task.reported","id":4,"commit":"$C1"}');
+select pg_temp.rec(-3.8, '{"type":"task.gated","id":4,"verdict":"rejected","revision":0,"base":"$B","scenarios":4,"reason":"the scenario fails on the candidate"}');
+select pg_temp.rec(-3.7, '{"type":"task.reported","id":4,"commit":"$C1"}');
+select pg_temp.rec(-3.6, '{"type":"task.gated","id":4,"verdict":"rejected","revision":1,"base":"$B","scenarios":4,"reason":"the scenario fails on the candidate"}');
+select pg_temp.rec(-3.5, '{"type":"task.reported","id":4,"commit":"$C1"}');
+select pg_temp.rec(-3.4, '{"type":"task.gated","id":4,"verdict":"rejected","revision":2,"base":"$B","scenarios":4,"reason":"the scenario fails on the candidate"}');
+select pg_temp.rec(-3.3, '{"type":"task.cancelled","id":4,"yielded":true,"objective":4,"failures":3,"limit":3,"rejections":3,"reason":"objective 4 yields its slot after 3 failed attempts","by":"spawn-integrate"}');
 commit;
 select spawn_control_refold();
 SQL
@@ -214,7 +234,7 @@ capture psql -d "$SPAWN_DB_NAME" -q -f "$WORK/seed.sql"
 solved=$(scalar "select max(id) from spawn_events where kind -> 'detail' -> 'record' ->> 'type' = 'objective.solved' and kind -> 'detail' -> 'record' ->> 'id' = '1'")
 [ -n "$solved" ] || harness "no objective.solved record was seeded"
 tasks=$(scalar "select string_agg(id || ':' || state || ':' || coalesce(objective::text, '-'), ' ' order by id) from mission_tasks")
-[ "$tasks" = "1:landed:1 2:cancelled:2 3:reported:4" ] || harness "the seed folded to tasks [$tasks]"
+[ "$tasks" = "1:landed:1 2:cancelled:2 3:reported:3 4:cancelled:4" ] || harness "the seed folded to tasks [$tasks]"
 [ "$(scalar "select objectives ->> 'backlog' from mission_missions where id = 1")" = "$ctl/rsi/backlog" ] ||
     harness "mission 1 did not fold as an objective mission"
 
@@ -241,34 +261,38 @@ get() { # <path> <file>: the status code
 code=$(get /api/rsi "$WORK/api.json")
 [ "$code" = 200 ] || harness "GET /api/rsi answered $code"
 row() { jq -c --argjson id "$1" "[.missions[] | select(.id == 1) | .objectives[] | select(.id == \$id)][0] | $2" "$WORK/api.json"; }
-expect_eq "$(jq -c '[.missions[] | select(.id == 1) | .objectives[] | .status]' "$WORK/api.json")" '["solved","solved","open","open"]' \
-    "(1) /api/rsi: the statuses of objectives 1 to 4 (2 was recorded solved on the base, event $solved)"
+expect_eq "$(jq -c '[.missions[] | select(.id == 1) | .objectives[] | .status]' "$WORK/api.json")" '["solved","solved","open","open","open"]' \
+    "(1) /api/rsi: the statuses of objectives 1 to 5 (2 was recorded solved on the base, event $solved)"
 expect_eq "$(row 2 '.solved_on_base // "none"')" "{\"base\":\"$B\",\"event\":$solved,\"task\":2}" \
     "(1) /api/rsi: objective 2's solved_on_base (the record that solved it)"
-for n in 1 3 4; do
+for n in 1 3 4 5; do
     expect_eq "$(row "$n" 'if has("solved_on_base") then .solved_on_base else "absent" end')" null \
         "(1) /api/rsi: objective $n's solved_on_base (no such record)"
 done
-expect_eq "$(jq -c '[.missions[] | select(.id == 1) | .next_objective][0]' "$WORK/api.json")" 3 \
-    "(1) /api/rsi: next_objective (1 landed, 2 solved on the base, 3 never assigned: another mission's objective 3 solved on its base is not this one)"
-note "(1) /api/rsi: objective 2 solved on the base by event $solved; next_objective 3"
+note "(1) /api/rsi: objective 2 solved on the base by event $solved; another mission's record solves nothing here"
 
-# --- (2) /api/overview ------------------------------------------------------------------
+# --- (2) next_objective is the integrator's own choice -------------------------------------
+
+expect_eq "$(jq -c '[.missions[] | select(.id == 1) | .next_objective][0]' "$WORK/api.json")" 5 \
+    "(2) /api/rsi: next_objective, what the integrator assigns next (1 landed, 2 solved on the base, 3 has a task in flight, 4 yielded once and waits behind 5, which never yielded)"
+note "(2) /api/rsi: next_objective 5 (not 2, solved; not 3, in flight; not 4, yielded)"
+
+# --- (3) /api/overview ------------------------------------------------------------------
 
 code=$(get /api/overview "$WORK/api.json")
 [ "$code" = 200 ] || harness "GET /api/overview answered $code"
-expect_eq "$(jq -c '.rsi | [.objectives.open, .objectives.solved, .next_objective]' "$WORK/api.json")" '[2,2,3]' \
-    "(2) /api/overview's rsi summary: [open, solved, next_objective]"
-note "(2) /api/overview: open 2, solved 2, next 3"
+expect_eq "$(jq -c '.rsi | [.objectives.open, .objectives.solved, .next_objective]' "$WORK/api.json")" '[3,2,5]' \
+    "(3) /api/overview's rsi summary: [open, solved, next_objective]"
+note "(3) /api/overview: open 3, solved 2, next 5"
 
-# --- (3) spawn mission objectives --------------------------------------------------------
+# --- (4) spawn mission objectives --------------------------------------------------------
 
 capture "$SPAWN_BIN" mission objectives --mission 1
 [ "$status" -eq 0 ] || harness "spawn mission objectives exited $status: $(err)"
 cp "$WORK/out.txt" "$WORK/api.json"
-expect_eq "$(jq -c '.[0] | [[.open[].id], .solved, .next_objective]' "$WORK/out.txt" 2>/dev/null || echo unreadable)" '[[3,4],2,3]' \
-    "(3) spawn mission objectives --mission 1: [open ids, solved, next_objective]"
-note "(3) spawn mission objectives: open [3, 4], solved 2, next 3"
+expect_eq "$(jq -c '.[0] | [[.open[].id], .solved, .next_objective]' "$WORK/out.txt" 2>/dev/null || echo unreadable)" '[[3,4,5],2,5]' \
+    "(4) spawn mission objectives --mission 1: [open ids, solved, next_objective]"
+note "(4) spawn mission objectives: open [3, 4, 5], solved 2, next 5"
 
-echo "052: an objective solved on the base reads as solved in every view of the backlog, naming its record"
+echo "052: an objective solved on the base reads as solved in every view of the backlog, naming its record, and next_objective is the integrator's own choice"
 exit 0
