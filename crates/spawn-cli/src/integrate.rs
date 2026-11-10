@@ -15381,7 +15381,6 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         let _ = std::fs::remove_dir_all(&base);
     }
 
-<<<<<<< 13fc93a710e08f44036aad7336afe9ddee076a00
     /// Objective 036, through the store: an accepted verdict a gate run gave
     /// carries what it judged (`inputs`, `env`), lands, and is judged again
     /// beside it on the runner the controller's dispatcher names. The runner
@@ -15531,7 +15530,8 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         );
         assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
         let _ = std::fs::remove_dir_all(&base);
-=======
+    }
+
     /// The types of the integrator's records after `after` (an event id),
     /// in log order, with the task each names (its `id`).
     fn record_types_after(db: &Db, after: i64) -> Vec<(String, Option<i64>)> {
@@ -15713,6 +15713,5 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         ] {
             assert!(db.store.integrator_record(&bad).is_err(), "refused: {bad}");
         }
->>>>>>> a960df16b193e91541a59af43db3845ad7cc569b
     }
 }
