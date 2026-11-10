@@ -10,6 +10,10 @@ use serde_json::{Value, json};
 
 mod common;
 use common::{admin, schema_url, store};
+use spawn_core::event::{EventKind, NewEvent, SessionSeq, Source};
+use spawn_core::id::{AgentId, SessionId};
+use spawn_core::observation::{Confidence, Observation, SemanticState};
+use spawn_core::port::EventLog;
 use spawn_postgres::{PostgresStore, role_url};
 
 fn alert(client: &mut Client, key: &str) -> Value {
@@ -116,10 +120,37 @@ fn a_notice_is_recorded_once_and_never_clears() {
 }
 
 /// The records are the owner's: a restricted login may read the table (the
-/// supervisor's `spawn alerts`) and may not record an alert.
+/// supervisor's `spawn alerts`) and may not record an alert. Its read
+/// carries an open agent_stuck alert's `scored_at_ms`, through a view: the
+/// login has no grant on spawn_events (batch 14's pg failure, rev-e's
+/// judge-down read the table directly).
 #[test]
 fn only_the_owner_records_alerts() {
-    let (_store, schema) = store("alerts_owner");
+    let (store, schema) = store("alerts_owner");
+    let mut observation = Observation::basic(
+        SemanticState::Unknown,
+        None,
+        SessionSeq(1),
+        Confidence::new(1.0).expect("valid confidence"),
+        "jev",
+    );
+    observation.stuck = Some(0.9);
+    store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_one").expect("valid agent"),
+            session_id: SessionId::new("session_stuck").expect("valid session"),
+            execution_id: None,
+            source: Source::Observer,
+            source_event_id: None,
+            kind: EventKind::ObservationRecorded { observation },
+        })
+        .expect("a scored judgement");
+    store
+        .alert_record(&json!({
+            "type": "alert.fired", "key": "agent_stuck:session_stuck:1", "kind": "agent_stuck",
+            "subject": "session_stuck", "evidence": {}, "text": "stuck", "notice": false,
+        }))
+        .expect("fire");
     let login = role_url(&schema_url(&schema), "spawn_supervisor").expect("the login's URL");
     let supervisor = PostgresStore::connect(&login).expect("log in");
     let refused = supervisor
@@ -134,5 +165,14 @@ fn only_the_owner_records_alerts() {
         "{refused}"
     );
     let alerts = supervisor.alerts(0).expect("read the alerts");
-    assert!(alerts.is_array(), "{alerts}");
+    let stuck = alerts
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|alert| alert["kind"] == "agent_stuck")
+        .unwrap_or_else(|| panic!("the stuck alert: {alerts}"));
+    assert!(
+        stuck["scored_at_ms"].as_i64().is_some_and(|at| at > 0),
+        "the supervisor reads when the session was scored: {stuck}"
+    );
 }

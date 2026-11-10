@@ -1,6 +1,7 @@
 //! Facts about this host in the control stream: `host.disk` records, one
 //! per crossing of the loop's free-space threshold (docs/storage.md, "Disk
-//! room").
+//! room"), and `host.judge` records, one per crossing of the model judge
+//! between failing and answering.
 
 use serde_json::Value;
 use spawn_core::port::StoreError;
@@ -21,8 +22,25 @@ from (
    order by e.kind -> 'detail' -> 'record' ->> 'path', e.session_seq desc
 ) d";
 
+/// The latest `host.judge` record of every judge, each with the `event_id`
+/// and `at_ms` of its event, ordered by judge: where a restarted watcher of
+/// the model judge stands (`down` or `up`).
+pub(crate) const HOST_JUDGE: &str = r"
+select coalesce(jsonb_agg(j.record order by j.record ->> 'judge'), '[]'::jsonb)
+from (
+  select distinct on (e.kind -> 'detail' -> 'record' ->> 'judge')
+         (e.kind -> 'detail' -> 'record')
+           || jsonb_build_object('event_id', e.id, 'at_ms', e.recorded_at_ms) as record
+    from spawn_events e
+   where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+     and e.kind -> 'detail' -> 'record' ->> 'type' = 'host.judge'
+   order by e.kind -> 'detail' -> 'record' ->> 'judge', e.session_seq desc
+) j";
+
 impl PostgresStore {
-    /// Record a `host.disk` record (owner only). Returns the event's id.
+    /// Record a host fact through `spawn_host_record` (owner only):
+    /// `host.disk`, `host.judge`, and the recovery's records. Returns the
+    /// event's id.
     pub fn host_record(&self, record: &Value) -> Result<i64, StoreError> {
         Ok(self
             .query_one("select spawn_host_record($1)", &[record])?
@@ -32,6 +50,11 @@ impl PostgresStore {
     /// The latest `host.disk` record of every path ([`HOST_DISK`]).
     pub fn host_disk(&self) -> Result<Value, StoreError> {
         self.query_json(HOST_DISK, &[])
+    }
+
+    /// The latest `host.judge` record of every judge ([`HOST_JUDGE`]).
+    pub fn host_judge(&self) -> Result<Value, StoreError> {
+        self.query_json(HOST_JUDGE, &[])
     }
 }
 

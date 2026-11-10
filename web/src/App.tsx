@@ -1,8 +1,9 @@
 import { PanelRight } from "lucide-react";
 import { Suspense, lazy, useEffect, useMemo, useState } from "react";
 
-import { fetchAlerts, fetchAttention, fetchOverview, fetchSession, usePoll } from "./api";
-import type { PollResult, SessionDetail } from "./api";
+import { fetchAlerts, fetchAttention, fetchOverview, fetchSessionTail, usePoll } from "./api";
+import { PAGE_EVENTS } from "./sessionWindow";
+import type { PollResult, SessionTail } from "./api";
 import { markNeedsHuman, needsHuman } from "./attention";
 import { DetailsRail, RailContent } from "./components/DetailsRail";
 import { MobileNav, Sidebar } from "./components/Sidebar";
@@ -19,7 +20,8 @@ import { fetchFleet } from "./fleet";
 import { relativeTime } from "./format";
 import type { Missions } from "./missions";
 import { fetchMissions } from "./missions";
-import { fleetContext } from "./ordering";
+import { fleetContext, missingAlwaysOn } from "./ordering";
+import { actionableAlerts, agentName, needsYou } from "./home";
 
 // Its own chunk: Motion and d3 load only when the Show view opens.
 const ShowView = lazy(() =>
@@ -87,6 +89,17 @@ function presenting(): boolean {
   );
 }
 
+/** The time, to the minute: what "Needs you" is computed at, so its
+ * time-bound items (a hold's expiry) move once a minute, not each render. */
+function useMinute(): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  return now;
+}
+
 export default function App() {
   const overview = usePoll("overview", fetchOverview);
   // Both polled in every view: the sidebar shows what is escalated, which is
@@ -96,9 +109,6 @@ export default function App() {
   // The alerts Spawn raised, on every page: the open ones are a strip at the
   // top, and the Alerts view shows the window.
   const alerts = usePoll("alerts", fetchAlerts, 5_000);
-  const openAlerts = (alerts.data ?? []).filter(
-    (alert) => alert.state === "open",
-  ).length;
   const needs = useMemo(
     () => (attention.data ? needsHuman(attention.data) : null),
     [attention.data],
@@ -112,10 +122,14 @@ export default function App() {
     [fleetPoll.data, needs],
   );
   const fleet: PollResult<Fleet> = { data: fleetData, error: fleetPoll.error };
-  const humanCount = {
-    count: needs?.count ?? null,
-    error: attention.data ? null : attention.error,
-  };
+  // The open alerts to act on: one about a session that has ended is moot,
+  // and a stuck one not scored since it fired is stale; neither is in the
+  // band nor counted (home.ts; design-ui-information.md §4.6).
+  const applying = useMemo(
+    () => actionableAlerts(alerts.data, fleetPoll.data?.agents ?? null),
+    [alerts.data, fleetPoll.data],
+  );
+  const openAlerts = applying.length;
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [railOpen, setRailOpen] = useState(false);
   // The fleet view is the landing page; the hash keeps the view (and the
@@ -130,6 +144,38 @@ export default function App() {
     view === "missions" ? 5_000 : 15_000,
   );
   const context = useMemo(() => fleetContext(missions.data), [missions.data]);
+  // The Home badge counts what needs the owner's action: the home page's
+  // "Needs you" items to act on, nothing it only reports.
+  const missing = useMemo(
+    () => missingAlwaysOn(fleetPoll.data?.agents ?? [], context),
+    [fleetPoll.data, context],
+  );
+  // "Needs you" is computed here, once: the Home card lists these items and
+  // the Home badge counts their actions, so the two never disagree (when
+  // /api/attention fails, both go on with the missions, alerts and host;
+  // at a hold's 30-minute edge, both cross it together on the minute).
+  const minute = useMinute();
+  const needItems = useMemo(
+    () =>
+      needsYou({
+        attention: attention.data,
+        missions: missions.data,
+        alerts: alerts.data,
+        agents: fleetPoll.data?.agents ?? null,
+        health: fleetPoll.data?.health ?? null,
+        missingAlwaysOn: missing.length,
+        now: minute,
+        nameOf: (session) => {
+          const agent = fleetPoll.data?.agents.find((entry) => entry.session_id === session);
+          return agent ? agentName(agent, context) : null;
+        },
+      }),
+    [attention.data, missions.data, alerts.data, fleetPoll.data, missing, minute, context],
+  );
+  const humanCount = {
+    count: needItems.filter((item) => item.tone === "act").length,
+    error: attention.data ? null : attention.error,
+  };
   const setView = (next: View) => setRoute({ view: next, agent: null });
 
   useEffect(() => {
@@ -166,9 +212,9 @@ export default function App() {
 
   // The session poll runs only in the Sessions view.
   const sessionKey = view === "sessions" ? (selectedId ?? "none") : "hidden";
-  const session = usePoll<SessionDetail | null>(sessionKey, (signal) =>
+  const session = usePoll<SessionTail | null>(sessionKey, (signal) =>
     view === "sessions" && selectedId
-      ? fetchSession(selectedId, signal)
+      ? fetchSessionTail(selectedId, PAGE_EVENTS, signal)
       : Promise.resolve(null),
   );
 
@@ -234,12 +280,18 @@ export default function App() {
       />
 
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-      <OpenAlerts alerts={alerts} onOpen={() => setView("alerts")} />
+      {view !== "fleet" && (
+        <OpenAlerts alerts={applying} onOpen={() => setView("alerts")} />
+      )}
       {view === "fleet" ? (
         <FleetView
           fleet={fleet}
           attention={attention}
           context={context}
+          missions={missions.data}
+          alerts={alerts.data}
+          needs={needItems}
+          onShowMissions={() => setView("missions")}
           selectedId={route.agent}
           onSelect={(agent) => setRoute({ view: "fleet", agent })}
           onOpenTimeline={openTimeline}
@@ -314,7 +366,12 @@ export default function App() {
             {!selectedId ? (
               <Placeholder text="Waiting for a session." />
             ) : detail ? (
-              <Timeline key={selectedId} events={detail.timeline} />
+              <Timeline
+                key={selectedId}
+                sessionId={detail.session_id}
+                tail={detail.window}
+                executions={detail.executions}
+              />
             ) : (
               <Placeholder
                 text={

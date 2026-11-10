@@ -371,3 +371,118 @@ fn a_launch_is_asked_again_only_of_a_server_that_left() {
     );
     assert_eq!(environment_files(), before, "an environment file was left");
 }
+
+/// Wait until a process holding `marker` runs, then a moment for its shell
+/// to have set its trap.
+fn until_running(marker: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !running_with(marker) {
+        assert!(Instant::now() < deadline, "{marker} never ran");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+}
+
+/// Whether a live process's command line holds `marker`.
+fn running_with(marker: &str) -> bool {
+    fs::read_dir("/proc")
+        .expect("/proc")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().parse::<u32>().is_ok())
+        .any(|entry| {
+            let stat = fs::read_to_string(entry.path().join("stat")).unwrap_or_default();
+            let zombie = stat
+                .rfind(')')
+                .is_some_and(|at| stat[at + 1..].trim_start().starts_with('Z'));
+            !zombie
+                && fs::read(entry.path().join("cmdline"))
+                    .is_ok_and(|line| String::from_utf8_lossy(&line).contains(marker))
+        })
+}
+
+/// `terminate` returns only once the runner and what it started have
+/// exited: kill-session returns as soon as the session is gone, while the
+/// runner is still exiting on the hang-up and writing (028's stop lost the
+/// line its engine wrote then, rev-e). A runner that writes as it dies has
+/// written when `terminate` returns; one that ignores the hang-up is killed
+/// after the wait, and gone when it returns.
+#[test]
+fn terminate_returns_once_the_runner_and_what_it_started_are_gone() {
+    let _exclusive = exclusive();
+    let server = Server::new("terminate");
+    server.tmux(&["new-session", "-d", "-s", "keep"]);
+    let host = server
+        .host()
+        .with_terminate_waits(Duration::from_secs(5), Duration::from_secs(2));
+    let late = server.directory.join("late");
+    let marker = format!("spawn-dies-writing-{}", std::process::id());
+    let script = format!(
+        "trap 'sleep 0.3; echo late >> {}; exit 0' HUP; while :; do sleep 0.05; done",
+        late.display()
+    );
+    host.start(&launch("/bin/sh", &["-c", &script, &marker], &[]))
+        .expect("start");
+    until_running(&marker);
+    host.terminate(&terminal(), &workspace()).expect("kill");
+    assert_eq!(
+        fs::read_to_string(&late).unwrap_or_default(),
+        "late\n",
+        "terminate returned before the runner wrote as it died"
+    );
+    assert!(!running_with(&marker), "the runner is gone");
+
+    // One that ignores the hang-up: SIGKILL after the wait.
+    let host = host.with_terminate_waits(Duration::from_millis(300), Duration::from_secs(2));
+    let marker = format!("spawn-ignores-hangup-{}", std::process::id());
+    host.start(&launch(
+        "/bin/sh",
+        &["-c", "trap '' HUP; while :; do sleep 0.05; done", &marker],
+        &[],
+    ))
+    .expect("start");
+    until_running(&marker);
+    let started = Instant::now();
+    host.terminate(&terminal(), &workspace()).expect("killed");
+    assert!(started.elapsed() >= Duration::from_millis(300), "it waited");
+    assert!(!running_with(&marker), "killed, and gone");
+    assert_eq!(
+        host.runner(&terminal(), &workspace()).expect("runner"),
+        Runner::Gone
+    );
+}
+
+/// Terminating a terminal that is gone touches no other: tmux reads a
+/// window target `=spawn-exec_1` that matches no session as a prefix
+/// (`spawn-exec_12`) or a window name, and a terminate that read the pane's
+/// pid so would have waited out spawn-exec_12's runner and killed it
+/// (rev-f on ca758b4b). The session form is exact.
+#[test]
+fn terminating_a_gone_terminal_leaves_one_whose_name_it_prefixes() {
+    let _exclusive = exclusive();
+    let server = Server::new("prefix");
+    server.tmux(&["new-session", "-d", "-s", "keep"]);
+    let marker = format!("spawn-exec-12-lives-{}", std::process::id());
+    server.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "spawn-exec_12",
+        "/bin/sh",
+        "-c",
+        "while :; do sleep 0.05; done",
+        &marker,
+    ]);
+    until_running(&marker);
+    let host = server
+        .host()
+        .with_terminate_waits(Duration::from_millis(300), Duration::from_millis(300));
+    assert_eq!(
+        host.runner(&terminal(), &workspace()).expect("runner"),
+        Runner::Gone,
+        "spawn-exec_1 is not there"
+    );
+    host.terminate(&terminal(), &workspace())
+        .expect("terminating a gone terminal is harmless");
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(running_with(&marker), "spawn-exec_12's runner still runs");
+}

@@ -1,7 +1,6 @@
 import { BellRing } from "lucide-react";
-import { useState } from "react";
 
-import type { Alert, PollResult } from "../../api";
+import type { Alert } from "../../api";
 import { fetchAlerts, usePoll } from "../../api";
 import { absoluteTitle, localDateTime, relativeTime } from "../../format";
 import { LiveStatus, PageHeader, cx } from "../ui";
@@ -54,6 +53,11 @@ function AlertRow({ alert }: { alert: Alert }) {
         </span>
       </div>
       <p className="mt-1 text-caption text-foreground">{alert.text}</p>
+      {alert.scored_at_ms != null && (
+        <p className="tnum mt-0.5 text-micro text-muted-foreground" title={absoluteTitle(alert.scored_at_ms)}>
+          last scored {relativeTime(alert.scored_at_ms)}
+        </p>
+      )}
       <Evidence label="evidence" value={alert.evidence} />
       {alert.state === "cleared" && <Evidence label="cleared by" value={alert.cleared_evidence} />}
     </li>
@@ -125,42 +129,30 @@ export function AlertsView() {
 }
 
 /** The open alerts on every page: kind, subject, since when, the text. */
-export function OpenAlerts({ alerts, onOpen }: { alerts: PollResult<Alert[]>; onOpen: () => void }) {
-  const [expanded, setExpanded] = useState(true);
-  const open = (alerts.data ?? []).filter((alert) => alert.state === "open");
-  if (open.length === 0) return null;
-  const shown = expanded ? open : open.slice(0, 1);
+/** The open alerts that still apply, on every page but Home (whose "Needs
+ * you" lists them with what to do): one line, the newest, and a count. An
+ * alert about a session that has ended never reaches it (home.ts
+ * liveAlerts). */
+export function OpenAlerts({ alerts, onOpen }: { alerts: Alert[]; onOpen: () => void }) {
+  if (alerts.length === 0) return null;
+  const newest = alerts.reduce((latest, alert) => (alert.fired_at_ms > latest.fired_at_ms ? alert : latest));
   return (
     <div className="shrink-0 border-b border-surface-border bg-fail-tint px-3 py-1.5">
-      <div className="flex items-center gap-2 text-micro">
-        <button
-          type="button"
-          onClick={() => setExpanded((value) => !value)}
-          className="shrink-0 rounded px-1 font-medium text-destructive"
-          title={expanded ? "Show only the first" : "Show every open alert"}
-        >
-          {open.length} open alert{open.length === 1 ? "" : "s"}
-        </button>
-        <ul className="flex min-w-0 flex-wrap gap-x-3 gap-y-1">
-          {shown.map((alert) => (
-            <li key={alert.key} className="min-w-0 truncate text-muted-foreground">
-              <span className="font-mono text-foreground">{alert.kind}</span>{" "}
-              <span>{alert.subject}</span>{" "}
-              <span className="tnum text-faint-foreground">
-                since {relativeTime(alert.fired_at_ms)}
-              </span>{" "}
-              <span className="text-foreground">{alert.text}</span>
-            </li>
-          ))}
-        </ul>
-        <button
-          type="button"
-          onClick={onOpen}
-          className="ml-auto shrink-0 rounded px-1 text-caption font-medium text-foreground underline-offset-2 hover:underline"
-        >
-          Alerts
-        </button>
-      </div>
+      <button
+        type="button"
+        onClick={onOpen}
+        className="flex w-full min-w-0 items-center gap-2 text-left text-micro"
+        title="Open the Alerts page"
+      >
+        <span className="shrink-0 font-medium text-destructive">
+          {alerts.length} open alert{alerts.length === 1 ? "" : "s"}
+        </span>
+        <span className="min-w-0 truncate text-muted-foreground">
+          <span className="text-foreground">{newest.text}</span>{" "}
+          <span className="tnum text-faint-foreground">since {relativeTime(newest.fired_at_ms)}</span>
+        </span>
+        <span className="ml-auto shrink-0 text-caption font-medium text-foreground">Alerts</span>
+      </button>
     </div>
   );
 }

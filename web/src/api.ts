@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { normalizeAttention, type Attention } from "./attention";
 import { chooseToken, type TokenChoice } from "./token";
 import { pageHidden, Validated } from "./validated";
+import { readTail } from "./sessionWindow.ts";
+import type { EventWindow, PageReader } from "./sessionWindow.ts";
 
 export type SessionState =
   "working" | "waiting" | "blocked" | "completed" | "unknown";
@@ -70,6 +72,9 @@ export interface Alert {
   cleared_at_ms: number | null;
   cleared_evidence: unknown;
   text: string;
+  /** An open agent_stuck's session's last scored judgement (the score it
+   * stands on may be hours old while the judge is down); null otherwise. */
+  scored_at_ms?: number | null;
 }
 
 export interface Execution {
@@ -462,6 +467,40 @@ export async function fetchSession(
 ): Promise<SessionDetail> {
   const url = `/api/session/${encodeURIComponent(id)}?after=0&limit=300`;
   return readApi(url, signal, normalizeSession);
+}
+
+/** A session's state and its newest events as a window (sessionWindow.ts):
+ * one read for the session's latest sequence number (an `after` past any
+ * event answers its state with an empty timeline), then the newest `count`
+ * sequence numbers, read back further while the observer's hidden events
+ * leave it short. `timeline` is the window's events. No endpoint of its
+ * own: /api/session pages forward from `after`. */
+export interface SessionTail extends SessionDetail {
+  window: EventWindow;
+}
+
+export async function fetchSessionTail(
+  id: string,
+  count: number,
+  signal: AbortSignal,
+): Promise<SessionTail> {
+  const base = `/api/session/${encodeURIComponent(id)}`;
+  const head = await readApi(`${base}?after=${Number.MAX_SAFE_INTEGER}&limit=1`, signal, normalizeSession);
+  const latest = Math.max(head.session_seq, head.freshness?.last_session_seq ?? 0);
+  const window = await readTail(latest, sessionReader(id, signal), count, count);
+  return { ...head, timeline: window.events, window };
+}
+
+/** Read `limit` sequence numbers of a session after `after`. */
+export function sessionReader(id: string, signal: AbortSignal): PageReader {
+  return async (after, limit) =>
+    (
+      await readApi(
+        `/api/session/${encodeURIComponent(id)}?after=${after}&limit=${limit}`,
+        signal,
+        normalizeSession,
+      )
+    ).timeline;
 }
 
 export interface PollResult<T> {

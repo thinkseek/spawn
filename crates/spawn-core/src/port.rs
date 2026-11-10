@@ -583,7 +583,11 @@ pub trait TerminalHost: Send + Sync {
         bytes: &[u8],
     ) -> Result<bool, TerminalError>;
 
-    /// Kill the terminal and its process. A missing terminal is not an error.
+    /// Kill the terminal and its process, and return only once the runner
+    /// and every process it started have exited, so nothing of the engine's
+    /// can write to the workspace after it (the Bridge's final checkpoint
+    /// comes next). A process that outlives a bounded wait and a kill is an
+    /// error. A missing terminal is not an error.
     fn terminate(
         &self,
         terminal: &TerminalName,

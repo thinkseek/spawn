@@ -739,6 +739,11 @@ pub(crate) struct Verdict {
     /// verdict's `flakes`: a flake, not a regression), in the log's order;
     /// only names of checks (`check-*.sh`) are kept.
     pub(crate) flakes: Vec<String>,
+    /// The scenarios main is red on (the verdict's `main_red_scenarios`):
+    /// solved, as the same scenario, on an ancestor of the base and unsolved
+    /// on it (scripts/rsi/gate.sh, "Main red on a scenario"), in the log's
+    /// order; only scenario file names (`<name>.sh`, not a check) are kept.
+    pub(crate) main_red_scenarios: Vec<String>,
     /// Everything the gate printed, stderr marked `! `, the verdict last.
     pub(crate) output: String,
 }
@@ -1316,6 +1321,7 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
         reason: text("reason").unwrap_or_else(|| "gate rejected the candidate".to_string()),
         metric: text("metric"),
         flakes: flakes(&value),
+        main_red_scenarios: main_red_scenarios(&value),
         output,
     })
 }
@@ -1344,6 +1350,35 @@ fn flakes(value: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The verdict's `main_red_scenarios`: scenario file names only (a name
+/// `<name>.sh` with no path that is not a check's), in order.
+fn main_red_scenarios(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("main_red_scenarios")
+        .and_then(serde_json::Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|name| is_scenario_name(name))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether `name` is a scenario's file name, `<name>.sh` with no path, and
+/// not a check's.
+fn is_scenario_name(name: &str) -> bool {
+    name.strip_suffix(".sh").is_some_and(|stem| {
+        !stem.is_empty()
+            && stem
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }) && name.len() <= 100
+        && !is_check_name(name)
 }
 
 /// The no-room fact of a verdict file, `(free_kb, min_gb, tmpdir)`: one
@@ -1575,6 +1610,33 @@ pub(crate) struct Run {
     pub(crate) stderr: String,
 }
 
+thread_local! {
+    /// This thread's stop: set ([`stop_with`]) on a judging's thread, so an
+    /// owner's urgent landing (design-owner-push-between-gates.md, D2) can
+    /// stop the gate it runs, and any gate it would start after.
+    static STOP: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The reason of the abort a stopped gate ends with ([`stop_with`]).
+pub(crate) const STOPPED: &str = "the gate was stopped (an owner's urgent landing)";
+
+/// Every gate this thread runs from now on is stopped (its group killed,
+/// [`GateFailure::Aborted`] with [`STOPPED`]) once `flag` is set; a gate
+/// it would start after that does not start.
+pub(crate) fn stop_with(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    STOP.with(|stop| *stop.borrow_mut() = Some(flag));
+}
+
+/// Whether this thread's gates are to stop.
+fn stopped() -> bool {
+    STOP.with(|stop| {
+        stop.borrow()
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+    })
+}
+
 /// Run a command with a wall clock and no stdin, its stdout and stderr in
 /// files in `directory`.
 ///
@@ -1590,6 +1652,12 @@ pub(crate) fn run_bounded(
 ) -> Result<Run, GateFailure> {
     use std::os::unix::process::CommandExt as _;
 
+    if stopped() {
+        return Err(GateFailure::Aborted {
+            reason: STOPPED.to_string(),
+            log: String::new(),
+        });
+    }
     let out_path = directory.join("stdout");
     let err_path = directory.join("stderr");
     let stdout = std::fs::File::create(&out_path).map_err(|error| failed(&error))?;
@@ -1617,6 +1685,15 @@ pub(crate) fn run_bounded(
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(GateFailure::Timeout);
+            }
+            Ok(None) if stopped() => {
+                kill_group();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(GateFailure::Aborted {
+                    reason: STOPPED.to_string(),
+                    log: std::fs::read_to_string(&out_path).unwrap_or_default(),
+                });
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(200)),
             Err(error) => {
@@ -1923,6 +2000,48 @@ mod tests {
         assert!(!marker.exists(), "the background child died with the gate");
     }
 
+    /// A stop on the gate's thread (an owner's urgent landing,
+    /// [`super::stop_with`]) kills the whole group, as a timeout does, and
+    /// is an abort with [`super::STOPPED`]; a gate that thread would start
+    /// after it does not start.
+    #[test]
+    fn a_stop_kills_the_whole_group_and_starts_no_gate_after() {
+        let dir = std::env::temp_dir().join(format!("spawn-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let (running, marker, after) = (dir.join("running"), dir.join("marker"), dir.join("after"));
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_flag = std::sync::Arc::clone(&flag);
+        let script = format!(
+            "(sleep 2; touch {}) & touch {}; sleep 60",
+            marker.display(),
+            running.display()
+        );
+        let second = format!("touch {}", after.display());
+        let gate = std::thread::spawn(move || {
+            super::stop_with(thread_flag);
+            let first = bounded(&script, Duration::from_mins(5));
+            let second = bounded(&second, Duration::from_mins(5));
+            (first, second)
+        });
+        let deadline = Instant::now() + Duration::from_mins(5);
+        while !running.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(running.exists(), "the gate started");
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (first, second) = gate.join().expect("the gate's thread");
+        assert!(
+            matches!(&first, Err(GateFailure::Aborted { reason, .. }) if reason == super::STOPPED),
+            "{first:?}"
+        );
+        assert!(matches!(second, Err(GateFailure::Aborted { .. })));
+        assert!(!after.exists(), "no gate starts on a stopped thread");
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(!marker.exists(), "the background child died with the gate");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A stand-in gate: `body` runs as the gate script, with the usual
     /// arguments.
     struct FakeGate {
@@ -2027,6 +2146,34 @@ mod tests {
         assert_eq!(verdict.flakes, ["check-clippy.sh"]);
         let gate = FakeGate::new("echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n");
         assert!(gate.judge(&path_only()).expect("verdict").flakes.is_empty());
+    }
+
+    /// A verdict names the scenarios main is red on (`main_red_scenarios`):
+    /// scenario names only, never a check, a path or anything not a string;
+    /// a verdict without the key (every gate before it) names none.
+    #[test]
+    fn a_verdict_names_the_scenarios_main_is_red_on() {
+        let gate = FakeGate::new(
+            "echo '{\"verdict\":\"accepted\",\"main_red_scenarios\":[\"046.sh\",\"../x.sh\",\"check-tests.sh\",3,\"a b.sh\",\"071.sh\"]}' >\"$SPAWN_GATE_VERDICT\"\n",
+        );
+        let verdict = gate.judge(&path_only()).expect("verdict");
+        assert_eq!(verdict.main_red_scenarios, ["046.sh", "071.sh"]);
+        let gate = FakeGate::new(
+            "echo '{\"verdict\":\"rejected\",\"reason\":\"r\",\"main_red_scenarios\":[\"013.sh\"]}' >\"$SPAWN_GATE_VERDICT\"\n",
+        );
+        assert_eq!(
+            gate.judge(&path_only())
+                .expect("verdict")
+                .main_red_scenarios,
+            ["013.sh"]
+        );
+        let gate = FakeGate::new("echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n");
+        assert!(
+            gate.judge(&path_only())
+                .expect("verdict")
+                .main_red_scenarios
+                .is_empty()
+        );
     }
 
     #[test]

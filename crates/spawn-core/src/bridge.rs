@@ -399,6 +399,11 @@ struct Follow {
     /// When the end's final checkpoint was last tried, by the Bridge's
     /// clock: a stalled end retries every [`END_RETRY_MS`].
     end_tried_at: Option<i64>,
+    /// When the end's kill last failed (the runner outlived it), by the
+    /// Bridge's clock: the kill blocks the Bridge's loop for its whole wait
+    /// (TerminalHost::terminate), so it is tried again only after
+    /// [`END_RETRY_MS`], discard or not (rev-f on 204d1a1f).
+    kill_failed_at: Option<i64>,
     /// The workspace answered [`WORKSPACE_STALE`] with this message: it
     /// cannot checkpoint to its branch again, and its state is kept off it,
     /// so the execution is ended (and its workspace unmounted) instead of
@@ -1777,18 +1782,28 @@ impl Bridge {
         Ok(())
     }
 
-    /// Final checkpoint, kill, unmount, then `execution.ended`. Returns
-    /// false when the final checkpoint failed or the terminal could not be
-    /// killed; the execution then stays active, its workspace mounted, and
-    /// the next tick tries the same end again.
+    /// Kill, final checkpoint, unmount, then `execution.ended`. Returns
+    /// false when the terminal's runner outlived its kill or the final
+    /// checkpoint failed; the execution then stays active, its workspace
+    /// mounted, and the next tick tries the same end again.
+    ///
+    /// The kill comes first, and returns only once the runner and every
+    /// process it started have exited ([`TerminalHost::terminate`]): an
+    /// engine that is stopped writes until it is gone, and a checkpoint
+    /// taken before that missed its last writes, which the unmount then
+    /// deleted (028's stop, a line written after the checkpoint lost). So
+    /// nothing the engine wrote can land after the final checkpoint. Every
+    /// end takes this way: a stop, an exit (the engine gone, what it left
+    /// running not), a lost runner and an abandoned start.
     ///
     /// A failed final checkpoint never leads to an unmount: its workspace
-    /// holds the only copy of what the execution did not commit. After
-    /// [`END_ATTEMPTS`] failures the end is stalled: the terminal is killed,
-    /// `execution.end_stalled` is recorded and warned once, and the
-    /// checkpoint is retried every [`END_RETRY_MS`] until it commits. Only
-    /// `discard` (a person's or the supervisor's decision) unmounts a
-    /// workspace whose final checkpoint failed.
+    /// holds the only copy of what the execution did not commit; nor does a
+    /// runner that outlived its kill, which may still write there. After
+    /// [`END_ATTEMPTS`] failures of either the end is stalled:
+    /// `execution.end_stalled` is recorded and warned once, and the end is
+    /// retried every [`END_RETRY_MS`] until it gets through. Only `discard`
+    /// (a person's or the supervisor's decision) unmounts a workspace whose
+    /// final checkpoint failed, and only once its runner is gone.
     fn end(
         &self,
         agent_id: &AgentId,
@@ -1803,16 +1818,21 @@ impl Bridge {
         // The checkpoint and the terminal are behind an end that recorded
         // its unmount: what is left is the unmount and the record.
         if active.unmounting {
+            if self.kill_waits(active) {
+                return Ok(false);
+            }
             // A restart may find the engine's terminal still there.
             if let Err(error) = self
                 .terminals
                 .terminate(&active.terminal(), &active.workspace)
             {
+                active.follow.kill_failed_at = Some(self.clock.now().0);
                 report
                     .warnings
                     .push(format!("terminate {}: {error}", active.terminal()));
                 return Ok(false);
             }
+            active.follow.kill_failed_at = None;
             return self.finish_end(agent_id, session, active, ending, report);
         }
         // A checkpoint whose record waits is recorded before the end.
@@ -1834,7 +1854,25 @@ impl Bridge {
         {
             return Ok(false);
         }
+        // A runner that outlived its last kill: the next waits, so a runner
+        // that will not die holds the loop once per END_RETRY_MS, not every
+        // tick.
+        if self.kill_waits(active) {
+            return Ok(false);
+        }
         active.follow.end_tried_at = Some(now);
+        // The runner first, gone with everything it started: what the engine
+        // writes as it dies is in the checkpoint below.
+        if let Err(error) = self
+            .terminals
+            .terminate(&active.terminal(), &active.workspace)
+        {
+            active.follow.kill_failed_at = Some(now);
+            let error = format!("terminate {}: {error}", active.terminal());
+            report.warnings.push(error.clone());
+            return self.end_failed(agent_id, session, active, (false, error), report);
+        }
+        active.follow.kill_failed_at = None;
         let committed = self.checkpoint(
             agent_id,
             session,
@@ -1850,26 +1888,7 @@ impl Bridge {
             ));
         } else if !committed {
             let error = report.warnings.last().cloned().unwrap_or_default();
-            active.follow.end_failures = active.follow.end_failures.saturating_add(1);
-            let failures = active.follow.end_failures;
-            if failures < END_ATTEMPTS {
-                report.warnings.push(format!(
-                    "{session}: final checkpoint failed ({failures} of {END_ATTEMPTS}); the \
-                     workspace stays mounted and the end is tried again"
-                ));
-            } else if failures == END_ATTEMPTS {
-                self.stall(agent_id, session, active, error, report)?;
-            }
-            return Ok(false);
-        }
-        if let Err(error) = self
-            .terminals
-            .terminate(&active.terminal(), &active.workspace)
-        {
-            report
-                .warnings
-                .push(format!("terminate {}: {error}", active.terminal()));
-            return Ok(false);
+            return self.end_failed(agent_id, session, active, (true, error), report);
         }
         // The transcript is whole now, and a container's copy goes next.
         self.archive_transcript(agent_id, session, active, report);
@@ -1924,32 +1943,75 @@ impl Bridge {
         Ok(true)
     }
 
-    /// The end's final checkpoint failed [`END_ATTEMPTS`] times: kill the
-    /// terminal (the engine's work is all in the workspace, which stays),
-    /// record `execution.end_stalled` and warn, once.
+    /// Whether the end's last kill failed within [`END_RETRY_MS`]: the next
+    /// kill waits for it.
+    fn kill_waits(&self, active: &Active) -> bool {
+        let now = self.clock.now().0;
+        active
+            .follow
+            .kill_failed_at
+            .is_some_and(|at| now.saturating_sub(at) < END_RETRY_MS)
+    }
+
+    /// One end attempt failed, at its kill (`checkpoint` false: the runner
+    /// outlived it) or at its final checkpoint: counted, said, and at
+    /// [`END_ATTEMPTS`] the end is stalled. The workspace stays mounted.
+    fn end_failed(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        active: &mut Active,
+        failure: (bool, String),
+        report: &mut TickReport,
+    ) -> Result<bool, StoreError> {
+        let (checkpoint, error) = failure;
+        active.follow.end_failures = active.follow.end_failures.saturating_add(1);
+        let failures = active.follow.end_failures;
+        let what = if checkpoint {
+            "final checkpoint failed"
+        } else {
+            "the runner outlived its kill"
+        };
+        if failures < END_ATTEMPTS {
+            report.warnings.push(format!(
+                "{session}: {what} ({failures} of {END_ATTEMPTS}); the workspace stays mounted \
+                 and the end is tried again"
+            ));
+        } else if failures == END_ATTEMPTS {
+            self.stall(agent_id, session, active, (checkpoint, error), report)?;
+        }
+        Ok(false)
+    }
+
+    /// The end failed [`END_ATTEMPTS`] times (its final checkpoint, or its
+    /// kill, which the runner outlived): record `execution.end_stalled` and
+    /// warn, once. The workspace stays, with all of the engine's work.
     fn stall(
         &self,
         agent_id: &AgentId,
         session: &SessionId,
         active: &Active,
-        error: String,
+        failure: (bool, String),
         report: &mut TickReport,
     ) -> Result<(), StoreError> {
-        if let Err(error) = self
-            .terminals
-            .terminate(&active.terminal(), &active.workspace)
-        {
-            report
-                .warnings
-                .push(format!("terminate {}: {error}", active.terminal()));
-        }
-        report.warnings.push(format!(
-            "{session}: FINAL CHECKPOINT FAILED {END_ATTEMPTS} TIMES; the terminal is down, \
-             {} STAYS MOUNTED with everything it holds and the checkpoint is retried every \
-             {} s. Fix the cause ({error}); a discard command gives the uncommitted work up",
-            active.workspace,
-            END_RETRY_MS / 1000
-        ));
+        let (checkpoint, error) = failure;
+        report.warnings.push(if checkpoint {
+            format!(
+                "{session}: FINAL CHECKPOINT FAILED {END_ATTEMPTS} TIMES; the terminal is down, \
+                 {} STAYS MOUNTED with everything it holds and the checkpoint is retried every \
+                 {} s. Fix the cause ({error}); a discard command gives the uncommitted work up",
+                active.workspace,
+                END_RETRY_MS / 1000
+            )
+        } else {
+            format!(
+                "{session}: THE RUNNER OUTLIVED ITS KILL {END_ATTEMPTS} TIMES; {} STAYS MOUNTED \
+                 and is not checkpointed while something of the engine's may still write there; \
+                 the kill is retried every {} s. Find what keeps running ({error})",
+                active.workspace,
+                END_RETRY_MS / 1000
+            )
+        });
         let (cause, exit_code, _) = active.reported_end.unwrap_or((EndCause::Lost, None, None));
         self.append(
             agent_id,
@@ -2317,6 +2379,7 @@ impl Bridge {
             held.reported_end = active.reported_end;
             held.follow.end_failures = active.follow.end_failures;
             held.follow.end_tried_at = active.follow.end_tried_at;
+            held.follow.kill_failed_at = active.follow.kill_failed_at;
             held.follow.evidence = active.follow.evidence;
         }
         report.warnings.insert(
@@ -2953,6 +3016,7 @@ impl Bridge {
                 held.reported_end = ending.reported_end;
                 held.follow.end_failures = ending.follow.end_failures;
                 held.follow.end_tried_at = ending.follow.end_tried_at;
+                held.follow.kill_failed_at = ending.follow.kill_failed_at;
                 held.follow.evidence = ending.follow.evidence;
             }
         }
@@ -3462,6 +3526,7 @@ impl Bridge {
             held.reported_end = active.reported_end;
             held.follow.end_failures = active.follow.end_failures;
             held.follow.end_tried_at = active.follow.end_tried_at;
+            held.follow.kill_failed_at = active.follow.kill_failed_at;
             held.follow.evidence = active.follow.evidence;
         }
         if report.warnings.is_empty() {

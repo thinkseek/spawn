@@ -327,6 +327,20 @@ pub enum EventKind {
         tool_name: String,
         /// Engine tool call identifier.
         tool_use_id: String,
+        /// The call's key input in a few words, for a person reading the
+        /// trace: a command's first line, a file path, a pattern
+        /// ([`crate::ingest::tool_summary`]). Credentials are redacted and it
+        /// is at most [`crate::ingest::TOOL_SUMMARY_CHARS`] characters. None
+        /// for a tool without one, and in every event recorded before it was.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        /// The summary is the call's whole input, unredacted and uncut (a
+        /// one-line command, a Read's file and range, a Glob): two calls
+        /// with the same summary are the same call, and a reader may fold
+        /// them (`×N`). False when the summary leaves input out, and in
+        /// every event recorded before it was.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        summary_whole: bool,
     },
     /// A tool call succeeded.
     #[serde(rename = "tool.completed")]
@@ -466,10 +480,11 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace: Option<WorkspaceId>,
     },
-    /// The final checkpoint of an ending execution kept failing: the
-    /// terminal is down, the workspace stays mounted with everything it
-    /// holds, and the Bridge retries the checkpoint at a slow interval until
-    /// it commits or a `discard` command gives the work up. Written once per
+    /// The end of an execution kept failing: its final checkpoint, or its
+    /// kill, which the runner outlived (`error` says which). The workspace
+    /// stays mounted with everything it holds, and the Bridge retries the
+    /// end at a slow interval until it gets through or a `discard` command
+    /// gives the work up. Written once per
     /// execution; it asks for attention until `execution.ended`.
     #[serde(rename = "execution.end_stalled")]
     ExecutionEndStalled {
@@ -477,7 +492,8 @@ pub enum EventKind {
         cause: EndCause,
         /// Process exit code when the OS reported one.
         exit_code: Option<i32>,
-        /// Final checkpoints that failed so far.
+        /// End attempts that failed so far (final checkpoints, or kills the
+        /// runner outlived).
         failures: u32,
         /// The last failure.
         error: String,

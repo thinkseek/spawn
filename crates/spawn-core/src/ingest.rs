@@ -107,6 +107,425 @@ pub fn utc_ms(text: &str) -> Option<i64> {
     Some((((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis - offset_ms)
 }
 
+/// The longest summary a `tool.started` keeps.
+pub const TOOL_SUMMARY_CHARS: usize = 160;
+
+/// `text` shortened to [`TOOL_SUMMARY_CHARS`] characters, an ellipsis
+/// marking a cut.
+fn summary_cut(text: &str) -> String {
+    if text.chars().count() <= TOOL_SUMMARY_CHARS {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(TOOL_SUMMARY_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
+/// A string field of a tool call's input, trimmed and not empty.
+fn input_text<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+/// A tool call's key input in a few words, read from its `input` by tool,
+/// held to words that cannot be a credential ([`plain_word`]): the store
+/// must never keep a secret, and a list of secret shapes is never complete.
+///
+/// - Bash: the leading words of its first command, after its set-up (`cd
+///   <dir> &&`, `NAME=value;`), at most [`COMMAND_WORDS`], stopping at the
+///   first flag, the first word holding `@ : = ' " ` $ \`, the first long
+///   mix of letters and digits, and the command's end (`&&`, `|`, `;`):
+///   `cargo test -p spawn-cli` keeps `cargo test …`. A variable the set-up
+///   gave a program's path reads as that program (`$B` after
+///   `B=/…/bin/spawn` is `spawn`).
+/// - Edit, MultiEdit, Write, NotebookEdit, Read: the file's path up to its
+///   first segment that is not a plain word (a Read with its line range).
+/// - Grep: its pattern, when every word of it is plain, and where; Glob:
+///   its pattern and where, bounded like a path.
+/// - Task: its description's first words; WebSearch: its query's; both
+///   bounded like a command.
+/// - WebFetch: the URL's host alone, never its path (a bot's token, a
+///   webhook's secret).
+/// - TodoWrite: the count of its items.
+///
+/// None for any other tool or an input without the field. The redactor
+/// still runs on what is kept, then the cut to [`TOOL_SUMMARY_CHARS`], and
+/// the event's redaction runs again when it is stored.
+pub fn tool_summary(tool: &str, input: Option<&Value>) -> Option<String> {
+    let (text, _) = summary_text(tool, input?)?;
+    Some(summary_cut(&crate::redact::redact(&text)))
+}
+
+/// The most words a summary keeps of a command, a description or a query.
+pub const COMMAND_WORDS: usize = 4;
+
+/// A word at least this long that mixes letters and digits can be a token.
+const WORD_MIX_CHARS: usize = 8;
+
+/// A path's segment (or a host's label) at least this long that mixes
+/// letters and digits can be a token; shorter mixed segments are file and
+/// crate names (`x86_64`, `sha256sum`, `spawn-v2`).
+const SEGMENT_MIX_CHARS: usize = 16;
+
+/// Programs whose arguments are what they print, set or pass on (`echo`,
+/// `export`, `sudo`, `sshpass`, `env`): a summary keeps the program alone.
+const PROGRAM_ONLY: [&str; 11] = [
+    "echo", "printf", "read", "sudo", "su", "sshpass", "passwd", "export", "eval", "set", "env",
+];
+
+/// The characters a kept word never holds: a userinfo, an assignment, a
+/// quote, an expansion.
+const NEVER_KEPT: &str = "@:='\"`$\\";
+
+/// What a summary puts where it left words out.
+const MORE: &str = "…";
+
+fn mixes_letters_and_digits(word: &str) -> bool {
+    word.chars().any(|c| c.is_ascii_alphabetic()) && word.chars().any(|c| c.is_ascii_digit())
+}
+
+fn short_or_unmixed(part: &str, limit: usize) -> bool {
+    part.chars().count() < limit || !mixes_letters_and_digits(part)
+}
+
+/// Can `word` be stored? Not a flag (the word after a flag may be its
+/// value, and `-pSECRET` is both), not a word holding any of
+/// [`NEVER_KEPT`], and not a mix of letters and digits [`WORD_MIX_CHARS`]
+/// long or longer (a token), except in a path, whose segments are held to
+/// [`SEGMENT_MIX_CHARS`].
+///
+/// What this lets through, by design: a word shorter than
+/// [`WORD_MIX_CHARS`], or all letters, or all digits, in a positional slot
+/// among a command's first words (`git checkout abc1234`, `mysql app`). A
+/// secret of that shape there would be stored; the bound narrows what a
+/// secret can look like, it does not read meaning.
+fn plain_word(word: &str) -> bool {
+    if word.is_empty() || word.starts_with('-') {
+        return false;
+    }
+    if word.chars().any(|c| NEVER_KEPT.contains(c)) {
+        return false;
+    }
+    if word.contains('/') {
+        word.split('/')
+            .all(|segment| short_or_unmixed(segment, SEGMENT_MIX_CHARS))
+    } else {
+        short_or_unmixed(word, WORD_MIX_CHARS)
+    }
+}
+
+/// Can a path's segment be stored? As a word, but held to
+/// [`SEGMENT_MIX_CHARS`].
+fn plain_segment(segment: &str) -> bool {
+    !segment.starts_with('-')
+        && !segment.chars().any(|c| NEVER_KEPT.contains(c))
+        && short_or_unmixed(segment, SEGMENT_MIX_CHARS)
+}
+
+/// Can a host be stored? Like a path: no flag, nothing of [`NEVER_KEPT`],
+/// each label short or unmixed (`ec2-54-12-1-2.compute.amazonaws.com`).
+fn plain_host(host: &str) -> bool {
+    !host.is_empty()
+        && !host.starts_with('-')
+        && !host.chars().any(|c| NEVER_KEPT.contains(c))
+        && host
+            .split('.')
+            .all(|label| short_or_unmixed(label, SEGMENT_MIX_CHARS))
+}
+
+/// Up to `most` leading plain words of `text`, and whether that is all of
+/// it (nothing left out, no `…`).
+fn plain_words(text: &str, most: usize) -> (String, bool) {
+    let mut kept = Vec::new();
+    let mut words = text.split_whitespace().peekable();
+    while let Some(word) = words.peek() {
+        if kept.len() == most || !plain_word(word) {
+            break;
+        }
+        kept.push(*word);
+        words.next();
+    }
+    let complete = words.peek().is_none();
+    (with_more(&kept.join(" "), !complete), complete)
+}
+
+fn with_more(kept: &str, more: bool) -> String {
+    match (kept.is_empty(), more) {
+        (true, _) => MORE.to_string(),
+        (false, true) => format!("{kept} {MORE}"),
+        (false, false) => kept.to_string(),
+    }
+}
+
+/// A path up to its first segment that is not a plain word, and whether
+/// that is all of it.
+fn plain_path(path: &str) -> (String, bool) {
+    let mut kept = Vec::new();
+    for (index, segment) in path.split('/').enumerate() {
+        // The empty segment of a leading `/` (or of `//`) is no word.
+        if !(segment.is_empty() || plain_segment(segment)) {
+            let lead = kept.join("/");
+            let shown = if index == 0 {
+                MORE.to_string()
+            } else {
+                format!("{lead}/{MORE}")
+            };
+            return (shown, false);
+        }
+        kept.push(segment);
+    }
+    (path.to_string(), true)
+}
+
+/// The length of a shell value at the start of `text`: a quoted string, a
+/// `$(…)` (balanced), or a run of non-blanks.
+fn shell_value_len(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    match bytes.first() {
+        Some(b'$') if bytes.get(1) == Some(&b'(') => {
+            let mut depth = 0usize;
+            for (index, byte) in bytes.iter().enumerate() {
+                match byte {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return index + 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            bytes.len()
+        }
+        Some(quote @ (b'"' | b'\'')) => bytes[1..]
+            .iter()
+            .position(|byte| byte == quote)
+            .map_or(bytes.len(), |close| close + 2),
+        _ => bytes
+            .iter()
+            .position(|byte| byte.is_ascii_whitespace() || b";&|".contains(byte))
+            .unwrap_or(bytes.len()),
+    }
+}
+
+/// A command line's set-up taken off its front: `cd <dir>` and
+/// `NAME=value` followed by `&&`, `;` or (for an assignment) a blank. The
+/// rest, the programs the set-up named (`B=/…/spawn` gives `B` → `spawn`),
+/// and whether anything was taken.
+fn without_setup(line: &str) -> (&str, Vec<(String, String)>, bool) {
+    let mut rest = line.trim_start();
+    let mut programs = Vec::new();
+    let mut dropped = false;
+    loop {
+        let (taken, after) = if let Some(dir) = rest.strip_prefix("cd ") {
+            let dir = dir.trim_start();
+            let len = shell_value_len(dir);
+            (None, &dir[len..])
+        } else {
+            let name_len = rest
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                .count();
+            if name_len == 0
+                || rest.as_bytes()[0].is_ascii_digit()
+                || rest.as_bytes().get(name_len) != Some(&b'=')
+            {
+                break;
+            }
+            let value = &rest[name_len + 1..];
+            let len = shell_value_len(value);
+            (Some((&rest[..name_len], &value[..len])), &value[len..])
+        };
+        let trimmed = after.trim_start();
+        let next = if let Some(next) = trimmed.strip_prefix("&&") {
+            next
+        } else if let Some(next) = trimmed.strip_prefix(';') {
+            next
+        } else if taken.is_some() && trimmed.len() < after.len() {
+            // `NAME=value cmd`: an assignment for one command.
+            trimmed
+        } else {
+            break;
+        };
+        if next.trim().is_empty() {
+            break;
+        }
+        if let Some((name, value)) = taken
+            && value.contains('/')
+            && !value.contains(['"', '\'', '$', '`'])
+            && let Some(program) = value.rsplit('/').next()
+            && !program.is_empty()
+        {
+            programs.push((name.to_string(), program.to_string()));
+        }
+        rest = next.trim_start();
+        dropped = true;
+    }
+    (rest, programs, dropped)
+}
+
+/// A Bash command's summary: see [`tool_summary`]. Whether it is the
+/// whole command: one line, no set-up taken off, nothing left out.
+fn command_summary(command: &str) -> (String, bool) {
+    let mut lines = command
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let Some(first) = lines.next() else {
+        return (MORE.to_string(), false);
+    };
+    let one_line = lines.next().is_none();
+    let (rest, programs, dropped) = without_setup(first);
+    let mut kept: Vec<String> = Vec::new();
+    let mut words = rest.split_whitespace().peekable();
+    while let Some(word) = words.peek() {
+        if kept.len() == COMMAND_WORDS {
+            break;
+        }
+        // `echo`, `export`, `sudo` …: the program alone.
+        if let Some(program) = kept.first()
+            && PROGRAM_ONLY.contains(&program.rsplit('/').next().unwrap_or(program))
+        {
+            break;
+        }
+        // The command ends at an operator; what follows is another one.
+        if word.contains([';', '|', '&', '<', '>', '(', ')', '#']) {
+            break;
+        }
+        let variable = word
+            .strip_prefix("${")
+            .and_then(|name| name.strip_suffix('}'))
+            .or_else(|| word.strip_prefix('$'));
+        let word = match variable.and_then(|name| programs.iter().find(|(known, _)| known == name))
+        {
+            Some((_, program)) => program.as_str(),
+            None => word,
+        };
+        if !plain_word(word) {
+            break;
+        }
+        kept.push(word.to_string());
+        words.next();
+    }
+    let left_out = words.peek().is_some();
+    let whole = one_line && !dropped && !left_out && kept.join(" ") == rest.trim();
+    (with_more(&kept.join(" "), left_out || !one_line), whole)
+}
+
+/// The input fields a tool's summary says in full: a call whose input has
+/// no other field is all in its summary. Bash's `description` and
+/// `timeout` do not change what runs.
+fn whole_fields(tool: &str, input: &Value) -> bool {
+    let allowed: &[&str] = match tool {
+        "Bash" => &["command", "description", "timeout"],
+        "Read" => &["file_path", "offset", "limit"],
+        "Glob" => &["pattern", "path"],
+        "Grep" if input.get("path").is_some() => &["pattern", "path"],
+        "Grep" => &["pattern", "glob"],
+        "WebSearch" => &["query"],
+        _ => return false,
+    };
+    input
+        .as_object()
+        .is_some_and(|fields| fields.keys().all(|key| allowed.contains(&key.as_str())))
+}
+
+/// Is a tool call's summary its whole input? Only when the summary leaves
+/// no field out ([`whole_fields`]), no word of it was left out (a command's
+/// set-up included), and neither the redactor nor the cut changed it: then
+/// two calls with the same summary are the same call. Edit, Write, Task,
+/// WebFetch and TodoWrite summaries never are.
+pub fn tool_summary_whole(tool: &str, input: Option<&Value>) -> bool {
+    let Some(input) = input else { return false };
+    let Some((text, complete)) = summary_text(tool, input) else {
+        return false;
+    };
+    complete
+        && whole_fields(tool, input)
+        && text.chars().count() <= TOOL_SUMMARY_CHARS
+        && crate::redact::redact(&text) == text
+}
+
+/// A tool call's summary before redaction and the cut, and whether it is
+/// all of what it reads (no word or segment left out).
+fn summary_text(tool: &str, input: &Value) -> Option<(String, bool)> {
+    let summary = match tool {
+        "Bash" => command_summary(input_text(input, "command")?),
+        "Edit" | "MultiEdit" | "Write" => plain_path(input_text(input, "file_path")?),
+        "NotebookEdit" => plain_path(input_text(input, "notebook_path")?),
+        "Read" => {
+            let (path, complete) = plain_path(input_text(input, "file_path")?);
+            let offset = input.get("offset").and_then(Value::as_u64);
+            let limit = input.get("limit").and_then(Value::as_u64);
+            let range = match (offset, limit) {
+                (Some(offset), Some(limit)) => format!(
+                    ":{offset}-{}",
+                    offset.saturating_add(limit).saturating_sub(1)
+                ),
+                (Some(offset), None) => format!(":{offset}-"),
+                (None, Some(limit)) => format!(":1-{limit}"),
+                (None, None) => String::new(),
+            };
+            (format!("{path}{range}"), complete)
+        }
+        "Grep" => {
+            let pattern = input_text(input, "pattern")?;
+            let plain = pattern.split_whitespace().all(plain_word);
+            let shown = if plain {
+                format!("\"{pattern}\"")
+            } else {
+                MORE.to_string()
+            };
+            match input_text(input, "path").or_else(|| input_text(input, "glob")) {
+                Some(place) => {
+                    let (place, complete) = plain_path(place);
+                    (format!("{shown} in {place}"), plain && complete)
+                }
+                None => (shown, plain),
+            }
+        }
+        "Glob" => {
+            let (pattern, pattern_whole) = plain_path(input_text(input, "pattern")?);
+            match input_text(input, "path") {
+                Some(path) => {
+                    let (path, path_whole) = plain_path(path);
+                    (format!("{pattern} in {path}"), pattern_whole && path_whole)
+                }
+                None => (pattern, pattern_whole),
+            }
+        }
+        "Task" | "Agent" => plain_words(input_text(input, "description")?, 2 * COMMAND_WORDS),
+        "WebFetch" => {
+            // The redactor first, while the scheme is there: a password
+            // holding `/` or `@` then cannot pass for the host.
+            let url = crate::redact::redact(input_text(input, "url")?);
+            let url = url.as_str();
+            let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            let host = host.split(':').next().unwrap_or(host);
+            if !plain_host(host) {
+                return None;
+            }
+            (host.to_string(), false)
+        }
+        "WebSearch" => plain_words(input_text(input, "query")?, 2 * COMMAND_WORDS),
+        "TodoWrite" => {
+            let items = input.get("todos").and_then(Value::as_array)?.len();
+            (
+                format!("{items} item{}", if items == 1 { "" } else { "s" }),
+                false,
+            )
+        }
+        _ => return None,
+    };
+    Some(summary)
+}
+
 fn block_type(block: &Value) -> Option<&str> {
     block.get("type").and_then(Value::as_str)
 }
@@ -518,6 +937,8 @@ pub fn claude_line(line: &str) -> Vec<Normalized> {
                     EventKind::ToolStarted {
                         tool_name: name.to_string(),
                         tool_use_id: id.to_string(),
+                        summary: tool_summary(name, block.get("input")),
+                        summary_whole: tool_summary_whole(name, block.get("input")),
                     },
                     format!("{id}:started"),
                 ))
@@ -1103,6 +1524,633 @@ mod tests {
                 "",
             );
             assert_eq!(jobs(&monitor), [started("bv41gl0hm", JobKind::Monitor)]);
+        }
+    }
+
+    mod tool_summaries {
+        use crate::event::EventKind;
+        use crate::ingest::{TOOL_SUMMARY_CHARS, claude_line, tool_summary, tool_summary_whole};
+        use serde_json::json;
+
+        fn summary(tool: &str, input: &serde_json::Value) -> Option<String> {
+            tool_summary(tool, Some(input))
+        }
+
+        /// A transcript line's tool call carries its key input as the
+        /// event's `summary`.
+        #[test]
+        fn a_tool_call_line_carries_its_summary() {
+            let line = r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test -p spawn-cli\necho done","description":"run the tests"}}],"stop_reason":"tool_use"}}"#;
+            let events = claude_line(line);
+            let kinds: Vec<&EventKind> = events.iter().map(|normalized| &normalized.kind).collect();
+            assert!(
+                matches!(
+                    kinds.as_slice(),
+                    [EventKind::ToolStarted { tool_name, summary: Some(summary), .. }]
+                        if tool_name == "Bash" && summary == "cargo test …"
+                ),
+                "{kinds:?}"
+            );
+        }
+
+        /// A fetched URL is kept as its host alone: a path, a query or a
+        /// userinfo can carry a credential.
+        #[test]
+        fn a_fetch_keeps_its_host_only() {
+            assert_eq!(
+                summary(
+                    "WebFetch",
+                    &json!({"url": "https://docs.rs/tokio/latest?token=abc#x"})
+                )
+                .as_deref(),
+                Some("docs.rs"),
+                "the host alone: no scheme, path, query or fragment"
+            );
+            assert_eq!(
+                summary(
+                    "WebFetch",
+                    &json!({"url": "https://bot:hunter2@example.com/a@b/c"})
+                )
+                .as_deref(),
+                Some("b"),
+                "an @ in the path after a userinfo is read as the userinfo's end: a wrong host, never a password"
+            );
+            // rev-e's probe: tokens in a path, and a password holding `/`.
+            for (url, host) in [
+                (
+                    "https://api.telegram.org/bot123456:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw/getMe",
+                    "api.telegram.org",
+                ),
+                (
+                    "https://hooks.slack.com/services/T000/B000/XXXXXXXXXXXXXXXXXXXXXXXX",
+                    "hooks.slack.com",
+                ),
+                ("https://u:pa/ss@example.com/x", "example.com"),
+                ("https://u:p@ss@example.com:8443/x", "example.com"),
+                ("u:hunter2pass@example.com/x", "example.com"),
+                ("https://example.com/a@b", "example.com"),
+            ] {
+                assert_eq!(
+                    summary("WebFetch", &json!({ "url": url })).as_deref(),
+                    Some(host),
+                    "{url}"
+                );
+            }
+        }
+
+        #[test]
+        fn each_tool_says_its_key_input() {
+            assert_eq!(
+                summary("Bash", &json!({"command": "  git status  "})).as_deref(),
+                Some("git status")
+            );
+            assert_eq!(
+                summary(
+                    "Edit",
+                    &json!({"file_path": "crates/spawn-cli/src/integrate.rs", "old_string": "a"})
+                )
+                .as_deref(),
+                Some("crates/spawn-cli/src/integrate.rs")
+            );
+            assert_eq!(
+                summary("Write", &json!({"file_path": ".spawn/report.md"})).as_deref(),
+                Some(".spawn/report.md")
+            );
+            assert_eq!(
+                summary(
+                    "Read",
+                    &json!({"file_path": "docs/protocol.md", "offset": 120, "limit": 61})
+                )
+                .as_deref(),
+                Some("docs/protocol.md:120-180")
+            );
+            assert_eq!(
+                summary("Read", &json!({"file_path": "a.rs", "limit": 40})).as_deref(),
+                Some("a.rs:1-40")
+            );
+            assert_eq!(
+                summary("Read", &json!({"file_path": "a.rs"})).as_deref(),
+                Some("a.rs")
+            );
+            assert_eq!(
+                summary(
+                    "Grep",
+                    &json!({"pattern": "fn step", "path": "crates/spawn-cli"})
+                )
+                .as_deref(),
+                Some("\"fn step\" in crates/spawn-cli")
+            );
+            assert_eq!(
+                summary("Grep", &json!({"pattern": "x", "glob": "*.rs"})).as_deref(),
+                Some("\"x\" in *.rs")
+            );
+            assert_eq!(
+                summary("Glob", &json!({"pattern": "rsi/scenarios/0*.sh"})).as_deref(),
+                Some("rsi/scenarios/0*.sh")
+            );
+            assert_eq!(
+                summary("Task", &json!({"description": "find the retry path"})).as_deref(),
+                Some("find the retry path")
+            );
+            assert_eq!(
+                summary("TodoWrite", &json!({"todos": [{}, {}, {}]})).as_deref(),
+                Some("3 items")
+            );
+            assert_eq!(
+                summary("ScheduleWakeup", &json!({"delaySeconds": 60})),
+                None,
+                "a tool with no key input"
+            );
+            assert_eq!(summary("Bash", &json!({"description": "no command"})), None);
+            assert_eq!(tool_summary("Bash", None), None);
+        }
+
+        /// A command's credentials never reach the summary: an assignment's
+        /// value, a bearer token, a URL's password, an API key.
+        #[test]
+        fn a_summary_loses_the_credentials_a_command_carries() {
+            assert_eq!(
+                summary(
+                    "Bash",
+                    &json!({"command": "PGPASSWORD=s3cret psql -h db -U spawn"})
+                )
+                .as_deref(),
+                Some("psql …"),
+                "the set-up goes and the words stop at the first flag"
+            );
+            let curl = summary(
+                "Bash",
+                &json!({"command": "curl -H \"Authorization: Bearer abcdef0123456789abcdef\" https://api.example/v1"}),
+            )
+            .unwrap_or_default();
+            assert!(!curl.contains("abcdef0123456789abcdef"), "{curl}");
+            let url = summary(
+                "Bash",
+                &json!({"command": "psql postgres://spawn:pa55w0rd@db:5432/spawn"}),
+            )
+            .unwrap_or_default();
+            assert!(!url.contains("pa55w0rd"), "{url}");
+            let key = summary(
+                "Bash",
+                &json!({"command": "export X=sk-0123456789abcdefghij; run"}),
+            )
+            .unwrap_or_default();
+            assert!(!key.contains("sk-0123456789abcdefghij"), "{key}");
+        }
+
+        /// The redaction runs before the cut: a key that the cut would split
+        /// is gone whole, and a long summary is at most the limit.
+        #[test]
+        fn a_long_summary_is_cut_after_its_credentials_go() {
+            let command = format!("{} sk-{}", "x".repeat(150), "a".repeat(30));
+            let cut = summary("Bash", &json!({ "command": command })).unwrap_or_default();
+            assert!(
+                cut.chars().count() <= TOOL_SUMMARY_CHARS,
+                "{}",
+                cut.chars().count()
+            );
+            assert!(cut.ends_with('…'));
+            assert!(!cut.contains("sk-aaaa"), "{cut}");
+        }
+
+        /// rev-e's probe (review-ui-ia-tools.md): every row's credential is
+        /// gone from the summary a Bash call stores.
+        #[test]
+        fn a_commands_credentials_of_every_probed_shape_go() {
+            let secrets = [
+                (
+                    "curl -u alice:hunter2pass https://api.example/v1",
+                    "hunter2pass",
+                ),
+                (
+                    "curl -H 'Authorization: Basic YWxpY2U6aHVudGVyMg==' https://x",
+                    "YWxpY2U6aHVudGVyMg",
+                ),
+                (
+                    "curl -H \"Authorization: s3cr3tR4wT0k3n\" https://x",
+                    "s3cr3tR4wT0k3n",
+                ),
+                (
+                    "curl -H 'Authorization: token 0123456789abcdef0123' https://x",
+                    "0123456789abcdef0123",
+                ),
+                (
+                    "curl -H 'PRIVATE-TOKEN: glpat-AbCdEf0123456789' https://x",
+                    "AbCdEf0123456789",
+                ),
+                (
+                    "curl -H 'X-Auth-Token: abcd1234efgh5678' https://x",
+                    "abcd1234efgh5678",
+                ),
+                ("mysql --password hunter2pass -u root", "hunter2pass"),
+                ("mysql -phunter2pass -u root", "hunter2pass"),
+                ("sshpass -p hunter2pass ssh host", "hunter2pass"),
+                ("DB_PASS=hunter2pass ./run", "hunter2pass"),
+                ("PGPWD=hunter2pass ./run", "hunter2pass"),
+                ("X_TOKEN=abcdef123456 ./run", "abcdef123456"),
+                (
+                    "DATABASE_URL=postgres://spawn:hunter2pass@db/spawn ./run",
+                    "hunter2pass",
+                ),
+                ("psql postgres://spawn:hun@ter2pass@db/spawn", "ter2pass"),
+                ("psql postgres://spawn:hun/ter2pass@db/spawn", "ter2pass"),
+                (
+                    "curl -d '{\"token\": \"abcdef123456\"}' https://x",
+                    "abcdef123456",
+                ),
+                ("cat > .env <<EOF\nTOKEN=abcdef123456\nEOF", "abcdef123456"),
+                (
+                    "curl -H \"Authorization: Bearer \\\n  abcdef0123456789abcdef\" https://x",
+                    "abcdef0123456789abcdef",
+                ),
+            ];
+            for (command, secret) in secrets {
+                let stored = summary("Bash", &json!({ "command": command })).unwrap_or_default();
+                assert!(!stored.contains(secret), "{command:?} stored {stored:?}");
+                assert!(!stored.is_empty(), "{command:?}");
+            }
+        }
+
+        /// A summary is whole only when it is the call's entire input: two
+        /// calls with the same whole summary are the same call.
+        #[test]
+        fn a_summary_is_whole_only_when_it_is_the_entire_input() {
+            let whole =
+                |tool: &str, input: serde_json::Value| tool_summary_whole(tool, Some(&input));
+            assert!(whole(
+                "Bash",
+                json!({"command": "git status", "description": "status"})
+            ));
+            assert!(whole(
+                "Read",
+                json!({"file_path": "a.rs", "offset": 10, "limit": 20})
+            ));
+            assert!(whole("Glob", json!({"pattern": "*.rs", "path": "crates"})));
+            assert!(whole(
+                "Grep",
+                json!({"pattern": "fn step", "path": "crates"})
+            ));
+            assert!(whole("WebSearch", json!({"query": "tokio select"})));
+
+            // rev-e's cases: two Edits of one file differ in what they
+            // change; two heredocs with one first line differ below it.
+            assert!(!whole(
+                "Edit",
+                json!({"file_path": "a.rs", "old_string": "x", "new_string": "y"})
+            ));
+            assert!(!whole(
+                "Write",
+                json!({"file_path": "a.rs", "content": "x"})
+            ));
+            assert!(!whole(
+                "Bash",
+                json!({"command": "python3 - <<'EOF'\nprint(1)\nEOF"})
+            ));
+            assert!(!whole("Bash", json!({"command": "cat <<EOF > a"})));
+            assert!(!whole("Bash", json!({"command": "make \\"})));
+            assert!(!whole("Bash", json!({"command": "echo a\necho b"})));
+            // A field the summary leaves out, a cut, a redaction.
+            assert!(!whole(
+                "Grep",
+                json!({"pattern": "x", "path": "p", "-i": true})
+            ));
+            assert!(!whole(
+                "Grep",
+                json!({"pattern": "x", "path": "p", "glob": "*.rs"})
+            ));
+            assert!(!whole("Read", json!({"file_path": "a.rs", "pages": "1-2"})));
+            assert!(!whole(
+                "Bash",
+                json!({"command": "ls", "run_in_background": true})
+            ));
+            assert!(!whole(
+                "Bash",
+                json!({"command": format!("echo {}", "x".repeat(200))})
+            ));
+            assert!(!whole("Bash", json!({"command": "PGPASSWORD=a psql"})));
+            // Plain words the redactor still rewrites: the summary is not
+            // the input any more.
+            assert!(!whole(
+                "Bash",
+                json!({"command": "cat sk-abcdefghijklmnopqrst"})
+            ));
+            assert!(!whole(
+                "Task",
+                json!({"description": "find it", "prompt": "p"})
+            ));
+            assert!(!whole("WebFetch", json!({"url": "https://docs.rs"})));
+            assert!(!whole("TodoWrite", json!({"todos": []})));
+            assert!(!tool_summary_whole("Bash", None));
+        }
+
+        /// The transcript line's call carries whether its summary is whole.
+        #[test]
+        fn a_tool_call_line_says_whether_its_summary_is_whole() {
+            let line = |command: &str| {
+                let input = json!({"command": command});
+                format!(
+                    r#"{{"type":"assistant","uuid":"a1","message":{{"content":[{{"type":"tool_use","id":"toolu_1","name":"Bash","input":{input}}}],"stop_reason":"tool_use"}}}}"#
+                )
+            };
+            for (command, expected) in [("git status", true), ("git status\ngit diff", false)] {
+                let events = claude_line(&line(command));
+                let started = events
+                    .iter()
+                    .find_map(|event| match &event.kind {
+                        EventKind::ToolStarted { summary_whole, .. } => Some(*summary_whole),
+                        _ => None,
+                    })
+                    .expect("a tool.started");
+                assert_eq!(started, expected, "{command:?}");
+            }
+        }
+
+        /// The lead's bound (structural, not a list of shapes): a command
+        /// keeps its leading plain words, at most four.
+        #[test]
+        fn a_command_keeps_its_leading_plain_words_only() {
+            let bash =
+                |command: &str| summary("Bash", &json!({ "command": command })).unwrap_or_default();
+            assert_eq!(bash("cargo test -p spawn-cli"), "cargo test …");
+            assert_eq!(bash("git clone https://T@x"), "git clone …");
+            assert_eq!(
+                bash("B=/home/ckl/.local/share/spawn-rsi/bin/spawn; $B tail --session x"),
+                "spawn tail …"
+            );
+            assert_eq!(bash("cd /w && cargo build --release"), "cargo build …");
+            assert_eq!(bash("RUST_LOG=debug cargo run"), "cargo run");
+            assert_eq!(bash("git status"), "git status");
+            assert_eq!(bash("ls crates/spawn-core/src"), "ls crates/spawn-core/src");
+            assert_eq!(bash("make a b c d e"), "make a b c …", "four words at most");
+            assert_eq!(
+                bash("git diff | head"),
+                "git diff …",
+                "the command ends at a pipe"
+            );
+            assert_eq!(
+                bash("git status\ngit diff"),
+                "git status …",
+                "the first line only"
+            );
+            assert_eq!(bash("python3 - <<'EOF'\nprint(1)\nEOF"), "python3 …");
+            assert_eq!(
+                bash("cat a1b2c3d4e5f6g7h8i9"),
+                "cat …",
+                "a long mix of letters and digits"
+            );
+            assert_eq!(
+                bash("cat abcdefghijklmnopqrstu"),
+                "cat abcdefghijklmnopqrstu",
+                "a long word"
+            );
+            assert_eq!(bash("$SECRET_CMD run"), "…", "nothing plain to keep");
+            // Each never-kept character on its own, in a word short enough
+            // that no other rule stops it.
+            for c in ['@', ':', '=', '\'', '"', '`', '$', '\\'] {
+                let word = format!("ab{c}cd");
+                assert_eq!(bash(&format!("git {word} x")), "git …", "{word:?}");
+            }
+            assert_eq!(
+                bash("cat target/debug/build/x-0123456789abcdef01/out"),
+                "cat …",
+                "a path with a long mixed segment"
+            );
+            // Paths, patterns and descriptions are bounded the same way.
+            assert_eq!(
+                summary("Read", &json!({"file_path": "/a/tok0123456789abcdef/b.rs"})).as_deref(),
+                Some("/a/…")
+            );
+            assert_eq!(
+                summary("Grep", &json!({"pattern": "token=", "path": "crates"})).as_deref(),
+                Some("… in crates")
+            );
+            assert_eq!(
+                summary(
+                    "Task",
+                    &json!({"description": "use key a1b2c3d4e5f6g7h8i9 here"})
+                )
+                .as_deref(),
+                Some("use key …")
+            );
+            assert_eq!(
+                summary(
+                    "WebSearch",
+                    &json!({"query": "why does sk1a2b3c4d5e6f7g8h9 fail"})
+                )
+                .as_deref(),
+                Some("why does …")
+            );
+        }
+
+        /// Every probe of rev-e's two rounds (review-ui-ia-tools.md): the
+        /// secret is not in the summary, by construction.
+        #[test]
+        fn every_probed_secret_is_out_of_the_summary() {
+            let bash =
+                |command: &str| summary("Bash", &json!({ "command": command })).unwrap_or_default();
+            let fetch = |url: &str| summary("WebFetch", &json!({ "url": url })).unwrap_or_default();
+            for (stored, secret) in [
+                (
+                    bash("curl -H 'Authorization:Basic YWxpY2U6aHVudGVyMg==' https://x"),
+                    "YWxpY2U6aHVudGVyMg",
+                ),
+                (
+                    bash("curl -H 'Authorization: abcdefSECRETxyz' -H 'Accept: a' https://x"),
+                    "SECRET",
+                ),
+                (bash("http GET x Authorization:abcdefSECRETxyz"), "SECRET"),
+                (
+                    bash("curl -H 'Cookie: theme=dark; sessionid=abc123SECRET' https://x"),
+                    "SECRET",
+                ),
+                (bash("curl -b 'sessionid=abc123SECRET' https://x"), "SECRET"),
+                (
+                    bash("curl -H 'apikey: eyJhbGciOiJIUzI1NiJ9SECRET' https://x"),
+                    "SECRET",
+                ),
+                (
+                    bash("docker login -u alice -p hunter2pass registry.example"),
+                    "hunter2pass",
+                ),
+                (bash("vault login --token hunter2pass"), "hunter2pass"),
+                (bash("tool --api-key hunter2pass run"), "hunter2pass"),
+                (bash("az login --client-secret hunter2pass"), "hunter2pass"),
+                (bash("curl -ualice:hunter2pass https://x"), "hunter2pass"),
+                (
+                    bash("curl --user=alice:hunter2pass https://x"),
+                    "hunter2pass",
+                ),
+                (
+                    bash("git clone https://abcdef0123SECRETtoken@github.com/o/r"),
+                    "SECRET",
+                ),
+                (
+                    bash("cd db && mysql -u root -phunter2pass app"),
+                    "hunter2pass",
+                ),
+                (bash("PGPASSWORD=hunter2pass psql"), "hunter2pass"),
+                (
+                    fetch("https://abcdef0123SECRETtoken@example.com/x"),
+                    "SECRET",
+                ),
+            ] {
+                assert!(!stored.contains(secret), "{stored:?} holds {secret:?}");
+            }
+            // A host that is itself token-shaped is not kept either.
+            assert_eq!(
+                summary(
+                    "WebFetch",
+                    &json!({"url": "https://k7a1b2c3d4e5f6g7h8x9.example/x"})
+                ),
+                None
+            );
+            // The same flags meaning something else: still no more than the
+            // words before them.
+            assert_eq!(bash("ssh -p 2222 host"), "ssh …");
+            assert_eq!(bash("PASSPORT_DIR=/tmp ./run"), "./run");
+        }
+
+        /// Fuzz, seeded: a secret-shaped token put in any argument position
+        /// of a command, or any segment of a path, never reaches the summary.
+        #[test]
+        fn a_token_in_any_position_never_reaches_the_summary() {
+            const ALNUM: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            const SPECIAL: &[u8] = b"@:='\"`$\\";
+            let words = [
+                "git", "curl", "run", "x", "status", "push", "origin", "main", "a/b", "-v",
+                "./tool",
+            ];
+            let mut state: u64 = 0x5eed_2026_1109;
+            // A number below `below`, from a fixed-seed generator.
+            let mut pick = move |below: usize| -> usize {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                usize::try_from(state >> 33).expect("31 bits fit") % below
+            };
+            for round in 0..2_000 {
+                // A token: a long mix of letters and digits, or a word
+                // holding one of the never-kept characters.
+                let len = 16 + pick(24);
+                let mut token: Vec<u8> = (0..len).map(|_| ALNUM[pick(ALNUM.len())]).collect();
+                token[0] = b'k';
+                token[1] = b'7';
+                if round % 2 == 1 {
+                    let at = 2 + pick(len - 2);
+                    token[at] = SPECIAL[pick(SPECIAL.len())];
+                }
+                let token = String::from_utf8(token).expect("ascii");
+                let count = 1 + pick(6);
+                let mut argv: Vec<String> = (0..count)
+                    .map(|_| words[pick(words.len())].to_string())
+                    .collect();
+                argv.insert(pick(count + 1), token.clone());
+                let command = argv.join(" ");
+                let stored = summary("Bash", &json!({ "command": command })).unwrap_or_default();
+                // The token's letters-and-digits stretches are what a
+                // secret is; none of length 8 or more may be stored.
+                for piece in token
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .filter(|piece| piece.len() >= 8)
+                {
+                    assert!(!stored.contains(piece), "{command:?} stored {stored:?}");
+                }
+                // A description or a query is prose: the same token pasted
+                // anywhere in it is not stored either.
+                let prose = argv.join(" ");
+                for (tool, field) in [("Task", "description"), ("WebSearch", "query")] {
+                    let stored = summary(tool, &json!({ field: prose })).unwrap_or_default();
+                    for piece in token
+                        .split(|c: char| !c.is_ascii_alphanumeric())
+                        .filter(|piece| piece.len() >= 8)
+                    {
+                        assert!(
+                            !stored.contains(piece),
+                            "{tool} {prose:?} stored {stored:?}"
+                        );
+                    }
+                }
+                let path = format!("/w/{}/f.rs", argv.join("/"));
+                let read = summary("Read", &json!({ "file_path": path })).unwrap_or_default();
+                for piece in token
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .filter(|piece| piece.len() >= 8)
+                {
+                    assert!(!read.contains(piece), "{path:?} stored {read:?}");
+                }
+            }
+        }
+
+        /// The lead's narrowing on 04a816cc: a letters-and-digits mix of 8
+        /// stops a command (a path's segments keep the 16 rule), and what a
+        /// command is left to keep after it is written down.
+        #[test]
+        fn a_mix_of_eight_stops_a_word_and_a_path_segment_keeps_sixteen() {
+            let bash =
+                |command: &str| summary("Bash", &json!({ "command": command })).unwrap_or_default();
+            assert_eq!(bash("git checkout ab12cd34"), "git checkout …");
+            assert_eq!(bash("mysql app hunter22 x"), "mysql app …");
+            // A path's segment of 8 to 15 mixed characters is a name.
+            assert_eq!(bash("ls crates/ab12cd34ef/x"), "ls crates/ab12cd34ef/x");
+            assert_eq!(bash("ls crates/ab12cd34ef56gh78/x"), "ls …");
+            assert_eq!(
+                summary("Read", &json!({"file_path": "a/sha256sum/v2x86x64/b.rs"})).as_deref(),
+                Some("a/sha256sum/v2x86x64/b.rs")
+            );
+            assert_eq!(
+                summary(
+                    "WebFetch",
+                    &json!({"url": "https://ec2-54-12-1-2.compute.amazonaws.com/x"})
+                )
+                .as_deref(),
+                Some("ec2-54-12-1-2.compute.amazonaws.com")
+            );
+            // A path's segment is held to the never-kept characters and
+            // the flag rule as a word is, however short.
+            for segment in [
+                "ab@cd", "u:pw", "k=v", "a'b", "a\"b", "a`b", "$X", "a\\b", "-p",
+            ] {
+                assert_eq!(
+                    summary("Read", &json!({"file_path": format!("/a/{segment}/b.rs")})).as_deref(),
+                    Some("/a/…"),
+                    "{segment:?}"
+                );
+            }
+            // The residual, by design: shorter than 8, or unmixed, in a
+            // positional slot, is kept.
+            assert_eq!(bash("git checkout abc1234"), "git checkout abc1234");
+            assert_eq!(bash("mysql app hunter"), "mysql app hunter");
+            assert_eq!(bash("cat 12345678901234567890"), "cat 12345678901234567890");
+        }
+
+        /// Programs whose arguments are what they print, set or pass on
+        /// keep the program word alone.
+        #[test]
+        fn a_program_that_passes_its_arguments_on_keeps_its_name_only() {
+            let bash =
+                |command: &str| summary("Bash", &json!({ "command": command })).unwrap_or_default();
+            for program in [
+                "echo", "printf", "read", "sudo", "su", "sshpass", "passwd", "export", "eval",
+                "set",
+            ] {
+                assert_eq!(
+                    bash(&format!("{program} hunter x")),
+                    format!("{program} …"),
+                    "{program}"
+                );
+                assert_eq!(bash(program), program, "{program} alone is whole");
+            }
+            assert_eq!(bash("/usr/bin/sudo systemctl restart x"), "/usr/bin/sudo …");
+            // rev-e on 69522339: `env`'s arguments are assignments and a
+            // program, as `sudo`'s are.
+            assert_eq!(bash("env hunter2 ls"), "env …");
+            assert_eq!(bash("env FOO=1 cargo test"), "env …");
+            assert_eq!(bash("cd /w && echo hunter"), "echo …");
+            assert_eq!(
+                bash("git status"),
+                "git status",
+                "other programs keep their words"
+            );
         }
     }
 }

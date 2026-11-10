@@ -92,7 +92,7 @@ mod scorecard;
 mod sessions;
 mod wake;
 
-pub use missions::{ActivityEvent, LandingHold};
+pub use missions::{ActivityEvent, LandingHold, PushRequest};
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
 };

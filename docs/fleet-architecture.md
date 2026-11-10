@@ -941,7 +941,12 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   `gate_room_escalated` differs, with `before` and `after`),
   `gate_base_disagrees` (objective 033's host fault with `alert`), and
   `command_failed` (a command that finished failed; an owner's note is not
-  news). Conditions: `task_undelivered` (assigned longer than
+  news). Conditions: `scenario_red` (a gate of the mission found main red
+  on a scenario, its `task.gated` record's `main_red_scenarios`: solved, as
+  the same scenario, on an ancestor of the base and unsolved on it, which
+  scripts/rsi/gate.sh reads from the solved index beside its base cache; one
+  per mission and scenario while red, cleared at the first later `accepted`
+  gating of the mission that does not name it), `task_undelivered` (assigned longer than
   `SPAWN_ALERT_UNDELIVERED_SECS`, default 300, while its agent holds no
   delivered or reported task), `mission_halted` (cleared at its
   `mission.resumed`), `postgres_crash` (a `terminated by signal`, `No space
@@ -954,7 +959,18 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   `SPAWN_ALERT_TMPFS_HIGH_MB`, default 8000; clears under
   `SPAWN_ALERT_TMPFS_OK_MB`, default 6000), `agent_stuck` (the session's
   latest judgement at or above the Observer's 0.5, whatever the dispatcher
-  does with it), `admission_wait` (objective 029's record older than
+  does with it; clears under 0.5, or when the session's current execution
+  has ended, whatever the cause, with the Bridge's `execution.ended` as
+  evidence; a session whose current execution has ended fires none),
+  `judge_down` (the model judge's watcher recorded `host.judge` `down`, two
+  calls in a row failed after its last answer, and no `up` after it,
+  `SPAWN_ALERT_JUDGE_DOWN_SECS` after the first failed (default 900): no
+  call answered since; one failure alone, or two more than 15 min apart,
+  records nothing; clears at the
+  `up`, the first answer, with `failed_calls`; it rests
+  on that record, never on how few judgements a judge that is down leaves:
+  an open `agent_stuck` also shows when its session was last scored),
+  `admission_wait` (objective 029's record older than
   `SPAWN_ALERT_ADMISSION_SECS`, default 600, with no admission after it),
   `backup_stale` (the newest dump older than
   `SPAWN_ALERT_BACKUP_DUMP_MAX_AGE_SECS`, default 7200, or bundle older than
@@ -1197,7 +1213,7 @@ controller. Missions, tasks, residents and landings are events in
   `task.delivered`, `task.report_unfinished`, `task.reported`,
   `task.reviewed`, `task.cancelled`, `task.gated`, `task.held`, `task.landed`,
   `task.aborted`, `task.over_budget`, `resident.proposed`, `resident.approved`,
-  `resident.retired`, `legacy.imported`, `host.disk`,
+  `resident.retired`, `legacy.imported`, `host.disk`, `host.judge`,
   `source.push_requested`, `source.push_refused` (§10.3, "The owner's
   landings"), and the loop's alerts: `alert.fired` and `alert.cleared`
   (§3.4, folded into `spawn_alerts`).
@@ -1224,8 +1240,8 @@ controller. Missions, tasks, residents and landings are events in
   owner's landings: `source.moved` naming a `request`,
   `source.push_refused`), `source.moved` (`spawn mission moved`), the
   owner's `source.push_requested` (`spawn mission push`; folded into no
-  table, nor is `source.push_refused`), the loop's `host.disk` (through
-  `spawn_host_record`; folded into no table,
+  table, nor is `source.push_refused`), the loop's `host.disk` and the
+  judge watcher's `host.judge` (through `spawn_host_record`; folded into no table,
   [storage.md](storage.md#disk-room)) and the loop's `alert.fired` and
   `alert.cleared` (through `spawn_alert_record`, §3.4) need the owner's
   login. The
@@ -1266,10 +1282,15 @@ the tree's own:
 - `<scenarios>/build` builds each tree;
 - when a task has a scenario, that scenario must fail on the base (exit 1)
   and pass on the candidate;
-- every other scenario must pass on the candidate, except ratchet scenarios
-  and objective scenarios (`<digits>.sh`) the base fails too. The checks are
-  scenarios: `check-clippy`, `check-tests`, `check-e2e`, `check-blackbox`,
-  `check-web`. The halt rule on the scenario count (§10.3) protects them.
+- every other scenario must pass on the candidate, except ratchet scenarios,
+  task-only scenarios (`# rsi: task-only`: run only as their own task's
+  scenario, never on the base for another gate nor as a regression; 029,
+  which no gate's sandbox can judge) and objective scenarios (`<digits>.sh`)
+  the base fails too. The checks are scenarios, among them `check-clippy`,
+  `check-tests`, `check-e2e`, `check-blackbox`, `check-web` and
+  `check-model-relay` (the relay in front of stub upstreams: the route by
+  model, the model mapping, a stream asked for again before its first
+  event, the cut signal, the body cap). The halt rule on the scenario count (§10.3) protects them.
   check-tests runs first among the regressions (the most often decisive,
   so its failure stops the rest early);
 - a check that fails on the candidate is run again there, as an
@@ -2052,12 +2073,48 @@ are per-agent uids or a mount per engine.
   commit `main` already holds was applied by an integrator that stopped
   before its record: it is recorded then, from the baseline its move began
   at. While a task landing on the source went out without its record, the
-  request waits for it. It waits for no gate: a judging of another mission
-  or source keeps running and lands by the usual rules, and one on the same
-  source finishes, its verdict is recorded as it comes, and its landing's
-  compare-and-swap finds `main` moved and records `stale`, so the task is
-  judged again against the new `main` (merged and gated again; never
-  discarded silently, never counted). So the owner's landing is a record
+  request waits for it. It never moves `main` under a gate of its source
+  (design-owner-push-between-gates.md, D1): while a judging of that
+  source is in flight the request waits (said once), and the pass that
+  reaps that judging applies it before any new gate starts, so the
+  judging's verdict is on the `main` it ran against, never `stale` because
+  of the owner (on 2026-11-09/10 seven Supply PA gates went stale under the
+  owner's pushes). A judging of another source keeps running and lands by
+  the usual rules. With `--gated` (and `--reason <text>`, on the request)
+  the request is judged before it lands, as a judging of its source
+  (design-owner-push-between-gates.md): step 0 checks it as above and the
+  integrator starts its owner judging ahead of the source's ready tasks,
+  never in place of a running judging and within the same caps
+  (`--gates`, the CPU share). The candidate is the commit when M is in its
+  history, else the owner's landing merge on M, built in the mirror; the
+  base is M; the scenarios are the candidate's own copy of the mission's
+  directory with `protected` emptied (the owner may change both), and no
+  red check runs on the base (an owner's push is how a red `main` is
+  fixed). A new contract's scenarios are unsolved on M (M has no such
+  code), so they are objectives nobody solved and the regression rule does
+  not apply to them: the gate does not reject the push for them, only for
+  its checks and the scenarios M solves. A check `main` is red on is
+  unsolved on M too: the owner's gate runs with `SPAWN_GATE_RED_UNSOLVED=1`
+  (gate.sh), which says it and judges the rest, so a push during a red
+  `main` is neither held nor refused for a red it did not cause (else it
+  would have to go ungated). Only the tests `main` fails are unsolved: a
+  test the candidate newly fails inside the red check, or a run of it that
+  names no failed test, is the push's regression. Accepted: under the landing lock, the
+  candidate is pushed to `main` with a lease on M, and `source.moved`
+  names `verdict` `accepted`. Rejected (or a candidate without the
+  mission's scenarios directory, `no_scenarios`): `source.push_refused`
+  with `verdict` and the gate's `log`; nothing moves and no mission counts
+  it. No verdict (the host's fault, an abort, which is a harness error, no
+  room, a gate that could not run): nothing is recorded, and the request is
+  judged again after the host-fault backoff. With `--urgent` (gated or
+  not; for a fix of a red `main`, D2) the request does not wait out a
+  task's judging in flight on its source: that judging is stopped (its
+  gate's process group killed, as at its wall clock) and records itself
+  discarded by the request, `task.gated` `stale` with `found` `discarded`,
+  the `request` and the owner's reason, counted nowhere; the task is
+  judged again on the new `main`, and the request is applied or judged at
+  the pass that reaps the stopped judging. An owner judging is never
+  stopped. So the owner's landing is a record
   (the request, then the outcome that names it), and the integrator acts on
   that record, never on a `main` that changed under it ([design.md](design.md)
   §14). `spawn mission moved` still records a move the owner made behind

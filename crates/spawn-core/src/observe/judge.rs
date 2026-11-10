@@ -30,9 +30,9 @@ pub struct JudgeInput {
     pub engine: Option<String>,
     /// Whether an execution is running.
     pub execution_active: bool,
-    /// The end under way whose final checkpoint keeps failing
-    /// (`execution.end_stalled`): its terminal is down and its workspace
-    /// stays mounted until the checkpoint commits or someone discards it.
+    /// The end under way whose final checkpoint (or the kill of its
+    /// runner) keeps failing (`execution.end_stalled`): its workspace stays
+    /// mounted until the end gets through or someone discards it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stalled_end: Option<EndCause>,
     /// How the latest execution ended.
