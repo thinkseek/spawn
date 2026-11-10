@@ -235,7 +235,19 @@ commit with a key no agent holds cannot hang or fail a test.
   (`TerminalHost::terminate`; the tmux host reads the pane's pid, the
   leader of the session its runner runs in, before `kill-session`, waits up
   to 5 s for that session's processes to exit, sends what is left SIGKILL
-  and waits 2 s more). A stopped engine writes until it is gone: with the
+  and waits 2 s more). That wait runs on a thread of its own, off the
+  Bridge's serial loop (`TerminalHost::terminate_waits`, backlog P7): the
+  end is pending, not failed, until the kill is done, each tick reading it
+  (50 ms in line first, so a terminal already gone ends in the same tick;
+  a Bridge that goes away, the loop's exit or a Bridge built again after a
+  store outage, first waits up to 10 s for its kills still under way, since
+  a kill abandoned mid-wait is never waited for again);
+  meanwhile the stop, and any other command to that session but a
+  discard, waits and is claimed again (an input then fails once the end is
+  done, never typed into the dying terminal; a start or resume goes on),
+  and the loop serves every other session. Each kill's wait is logged
+  (`spawn loop: <session>: the kill of <terminal> waited N ms for its
+  processes`). A stopped engine writes until it is gone: with the
   checkpoint first, a line it wrote after the checkpoint was deleted by the
   unmount (028's stop, 2026-11-09). Now nothing it writes can land after
   the final checkpoint. Every end goes this way: a stop, an exit, a lost

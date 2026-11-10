@@ -610,6 +610,88 @@ fn candidate_scenarios(
     Ok(copy)
 }
 
+/// The installed controller's `web/node_modules`, copied into the
+/// candidate's `tree` before its gate starts: git holds no node_modules, and
+/// the scenarios of an owner judging are the candidate's own, so a check
+/// that builds the UI (Spawn's check-web.sh, `$controller/web/node_modules`)
+/// found none in the tree and failed on the candidate and on the base alike:
+/// a host fault, retried every backoff, never judged (lead-mac, 2026-11-10).
+/// The gate binds that directory into its sandbox only when it is there at
+/// its setup, so the copy is made here, with the tree, on every judging.
+///
+/// As deploy/controller.sh copies it into a controller: a real directory,
+/// never a symlink (a gate's tree must not reach the controller's files), a
+/// reflink where the filesystem has them, else hardlinks, else a full copy;
+/// and only when the dependencies it was installed from
+/// (`.pnpm/lock.yaml`) are the candidate's `web/pnpm-lock.yaml`, never
+/// judging the UI with other dependencies than the candidate names.
+///
+/// `Ok(None)`: copied, or nothing to copy (the controller has none, the
+/// candidate has no `web/` or tracks its own node_modules). `Ok(Some(why))`:
+/// not copied, and why. `Err`: the copy failed (the host's).
+pub(super) fn controller_modules(
+    controller: &std::path::Path,
+    tree: &std::path::Path,
+) -> Result<Option<String>, String> {
+    let source = controller.join("web/node_modules");
+    let Ok(source) = std::fs::canonicalize(&source) else {
+        return Ok(None);
+    };
+    let web = tree.join("web");
+    let target = web.join("node_modules");
+    if !source.is_dir() || !web.is_dir() || std::fs::symlink_metadata(&target).is_ok() {
+        return Ok(None);
+    }
+    if let Ok(installed) = std::fs::read(source.join(".pnpm/lock.yaml"))
+        && std::fs::read(web.join("pnpm-lock.yaml")).ok().as_deref() != Some(&installed[..])
+    {
+        return Ok(Some(format!(
+            "web/node_modules not given to the candidate's tree: {} was installed from \
+             another lockfile than its web/pnpm-lock.yaml",
+            source.display()
+        )));
+    }
+    let temporary = web.join(".node_modules.copy");
+    let _ = std::fs::remove_dir_all(&temporary);
+    let copied = [&["-a", "--reflink=always"][..], &["-al"][..], &["-a"][..]]
+        .iter()
+        .any(|flags| {
+            let done = std::process::Command::new("cp")
+                .args(*flags)
+                .arg(&source)
+                .arg(&temporary)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !done {
+                let _ = std::fs::remove_dir_all(&temporary);
+            }
+            done
+        });
+    if !copied {
+        return Err(format!(
+            "copy {} into the candidate's tree failed",
+            source.display()
+        ));
+    }
+    std::fs::rename(&temporary, &target).map_err(|error| {
+        let _ = std::fs::remove_dir_all(&temporary);
+        format!("{}: {error}", target.display())
+    })?;
+    Ok(None)
+}
+
+/// The controller whose scenarios directory is `gate`, where `inside` is
+/// that directory's path in the tree (`rsi/scenarios`): `gate`, resolved
+/// once, without those components.
+fn controller_of(gate: &std::path::Path, inside: &str) -> std::path::PathBuf {
+    let mut controller = super::pinned(gate);
+    for _ in inside.split('/').filter(|part| !part.is_empty()) {
+        controller.pop();
+    }
+    controller
+}
+
 impl super::Judge {
     /// An owner judging (design-owner-push-between-gates.md): `request`, a
     /// gated owner's request on `mission`'s source, judged by the mission's
@@ -737,6 +819,12 @@ impl super::Judge {
             Ok(scenarios) => scenarios,
             Err(error) => return Err(Err(error)),
         };
+        let controller = controller_of(std::path::Path::new(&mission.gate), &inside);
+        match controller_modules(&controller, &work.join("tree")) {
+            Ok(None) => {}
+            Ok(Some(why)) => println!("integrate: owner request {}: {why}", request.id),
+            Err(error) => return Err(Err(error)),
+        }
         let test_database = super::needs_test_database(&scenarios);
         let room = if test_database {
             self.room.clone()

@@ -283,6 +283,8 @@ function agent(agentId: string, extra: Partial<FleetAgent> = {}, lastEvent: numb
       current_tool: null,
       current_tool_summary: null,
       last_event_name: null,
+      turn_open: null,
+      turn_at_ms: null,
       last_event_at_ms: lastEvent === null ? null : T0 + lastEvent * MIN,
       event_count: null,
       tool_calls: null,

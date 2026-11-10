@@ -69,6 +69,9 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::GateBaseDisagrees => "the base disagreed with itself at the gate (the host's)",
         Why::MainRed => "a source's main is red on a check (its gates wait)",
         Why::MainGreen => "a source's main is green again",
+        Why::ShadowDisagrees => {
+            "a gate runner's shadow verdict disagreed with the primary's (it decided nothing)"
+        }
         Why::Stalled => "stalled",
         Why::Charter => "new charter not typed",
         Why::BackgroundJob => "background job past its bound",
@@ -405,6 +408,70 @@ pub(crate) fn main_red_news(records: &[Value]) -> Vec<Escalation> {
                      blame: the gates on {source} wait until main moves (a probe gate each \
                      SPAWN_GATE_MAIN_RED_PROBE_MS, an hour by default), nothing is counted and \
                      nothing halts. Fix main, or tell the owner."
+                ),
+                since_ms: record["at_ms"].as_i64(),
+            })
+        })
+        .collect()
+}
+
+/// One side's `env` as one phrase: its host, toolchain and runner, each
+/// only when named.
+fn env_phrase(env: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(host) = env["host"].as_str() {
+        parts.push(format!("host {host}"));
+    }
+    if let Some(runner) = env["runner"].as_str() {
+        parts.push(format!("runner {runner}"));
+    }
+    parts.push(env["toolchain"].as_str().map_or_else(
+        || "toolchain unknown".to_string(),
+        |toolchain| format!("toolchain {}", one_line(toolchain, 200)),
+    ));
+    parts.join(", ")
+}
+
+/// The digest items for `records`, the shadow verdicts that disagreed with
+/// the primary's on the same inputs (`task.shadow_gated` with `agrees`
+/// false) that no delivered digest told yet
+/// (`PostgresStore::shadow_disagreements`). Each is item
+/// `shadow-disagrees-<event id>` of session `host`, told once: the task, the
+/// runner, both verdicts, the commits and both environments. It decided
+/// nothing (the primary's verdict stands); it is what milestone M3 must
+/// have explained before a runner may decide a landing.
+pub(crate) fn shadow_disagreements(records: &[Value]) -> Vec<Escalation> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let id = record["event_id"].as_i64()?;
+            let task = record["id"].as_i64()?;
+            if record["agrees"].as_bool() != Some(false) {
+                return None;
+            }
+            let runner = record["runner"].as_str().unwrap_or("the runner");
+            let mission = record["mission"]
+                .as_i64()
+                .map_or_else(|| "its mission".to_string(), |id| format!("mission {id}"));
+            let short = |field: &str| {
+                let commit = record[field].as_str().unwrap_or("?");
+                commit.get(..12).unwrap_or(commit).to_string()
+            };
+            let primary = record["primary"].as_str().unwrap_or("no verdict");
+            let shadow = record["verdict"].as_str().unwrap_or("no verdict");
+            Some(Escalation {
+                session_id: HOST_SESSION.to_string(),
+                id: format!("shadow-disagrees-{id}"),
+                why: Why::ShadowDisagrees,
+                line: format!(
+                    "task #{task} of {mission}: the shadow judging on {runner} disagreed with \
+                     the primary on the same inputs ({} -> {}): the primary {primary} it \
+                     ({}), the runner {shadow} it ({}). The primary's verdict stands; \
+                     explain the difference before a runner decides any landing.",
+                    short("base"),
+                    short("candidate"),
+                    env_phrase(&record["primary_env"]),
+                    env_phrase(&record["env"]),
                 ),
                 since_ms: record["at_ms"].as_i64(),
             })

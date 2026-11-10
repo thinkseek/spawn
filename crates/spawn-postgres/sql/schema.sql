@@ -486,8 +486,8 @@ create or replace function spawn_claim(
     -- One command per session at a time: nothing earlier in the session
     -- may be unfinished, but an input that waits for its turn (the Bridge
     -- recorded its `command.step` `waiting`, keyed `cmd_<id>:waiting`): it
-    -- holds nothing behind it. A stop, a discard or a resume behind it is
-    -- handled at once, and an input behind it is claimed and kept behind it
+    -- holds nothing behind it. A stop, a discard, a resume or a key behind
+    -- it is handled at once, and an input behind it is claimed and kept behind it
     -- by the Bridge (typed after it, or refused while it waits). An
     -- unfinished input that does not wait still holds everything. "Earlier"
     -- is id order, which is commit order because `spawn_submit` takes its id
@@ -1195,6 +1195,66 @@ begin
 end
 $$;
 
+-- A person's key from the web page (`spawn serve`, `POST
+-- /api/session/<id>/key`, backlog P1): the command `spawn submit --principal
+-- human --agent <the session's agent> --session <id> --key <key> --action
+-- '{"type":"key","key":<name>}'` makes, through the same `spawn_submit` with
+-- the same idempotency rule, as its own action type and never text. The name
+-- is one of the closed set (spawn-core's `NamedKey`): escape, up, down, left,
+-- right, enter, y, n. Returns the command, or null when no agent has used
+-- the session. A key needs a running engine: a session with no live
+-- execution is refused here with the reason (SQLSTATE 55000, which the page
+-- answers 409), and records no command, since nothing reached an agent; a
+-- repeated key returns its first command even if the session stopped since.
+-- (The Bridge still fails, on the record, a key that loses the race against
+-- the execution's end.) Only the `spawn_human` login may call it, beside
+-- `spawn_human_input`.
+create or replace function spawn_human_key(p_session text, p_key text, p_name text)
+returns bigint language plpgsql security definer as $$
+declare
+    v_agent text;
+    v_first bigint;
+begin
+    if spawn_principal() is distinct from 'human' then
+        raise exception '% may not press keys as a person (only the spawn_human login does)',
+            session_user using errcode = '42501';
+    end if;
+    if coalesce(p_key, '') = '' or octet_length(p_key) > 256 or p_key ~ '[[:cntrl:]]' then
+        raise exception 'a key needs an idempotency key of 1 to 256 bytes, no control character'
+            using errcode = '22023';
+    end if;
+    if p_name is null or p_name not in ('escape', 'up', 'down', 'left', 'right', 'enter', 'y', 'n') then
+        raise exception 'key % is not one of escape, up, down, left, right, enter, y, n',
+            coalesce(quote_literal(p_name), 'null') using errcode = '22023';
+    end if;
+    select s.agent_id into v_agent from spawn_agent_sessions s where s.session_id = p_session;
+    if v_agent is null then
+        return null;
+    end if;
+    select c.id into v_first from spawn_commands c
+     where c.principal = 'human' and c.idempotency_key = p_key;
+    if v_first is not null then
+        return v_first;
+    end if;
+    if not exists (select 1 from agent_status a where a.session_id = p_session and a.live) then
+        raise exception '% runs no execution: a key needs a running engine; resume the session',
+            p_session using errcode = '55000';
+    end if;
+    return (select s.out_id
+              from spawn_submit('human', p_key, v_agent, p_session,
+                                jsonb_build_object('type', 'key', 'key', p_name)) s);
+end $$;
+
+do $$
+begin
+    execute format('alter function spawn_human_key(text, text, text) set search_path = %I, pg_temp',
+                   current_schema());
+    execute 'revoke execute on function spawn_human_key(text, text, text) from public';
+    execute format('grant execute on function spawn_human_key(text, text, text) to %I',
+                   spawn_login_role('spawn_human'));
+end
+$$;
+
 -- Missions, tasks and residents (docs/fleet-architecture.md §3.2).
 --
 -- These tables are the fold of the control stream (§10.1 and
@@ -1453,7 +1513,8 @@ where a.kind = 'agent_stuck' and a.state = 'open';
 
 -- Who may call the mission functions: the owner (humans' CLI, the
 -- controller) and the supervisor's login; not the reader's, and not the web
--- page's typing login (`human`, which may only call `spawn_human_input`).
+-- page's typing login (`human`, which may only call `spawn_human_input` and
+-- `spawn_human_key`).
 create or replace function spawn_mission_caller() returns text
 language sql stable as $$
     select case when x.p is null or x.p in ('spawn_reader', 'human') then null
@@ -1957,6 +2018,12 @@ begin
         -- holds, so no task of it can change anything: the assignment rule
         -- reads this record as a landing (OBJECTIVE_LANDINGS), and the task
         -- it ends is cancelled on it. Folded into no table.
+        null;
+    when 'task.shadow_gated' then
+        -- A gate runner's judging of a copy of what the primary judged
+        -- (spawn-cli integrate/shadow.rs), beside the primary's verdict: it
+        -- decides nothing, so it changes no task, landing, halt or count.
+        -- Read from the log (the supervisor's digest), folded into no table.
         null;
     when 'legacy.imported' then
         -- A row from before the control stream, as it was.
@@ -2923,8 +2990,28 @@ begin
                                       'source.moved', 'source.push_refused',
                                       'task.over_budget', 'objective.solved',
                                       'source.main_red', 'source.main_probe',
-                                      'source.main_green') then
+                                      'source.main_green', 'task.shadow_gated') then
         raise exception 'the integrator does not record %', p_record ->> 'type';
+    end if;
+    -- A shadow verdict (spawn-cli integrate/shadow.rs): a gate runner judged
+    -- a copy of what the primary judged, on the inputs it names. It is
+    -- beside the verdict, never part of it: whatever the task's state now
+    -- (it has usually landed), it moves nothing. It names its task, its
+    -- runner, its inputs and the fields unlike the primary's, and compares
+    -- the two verdicts (`agrees`) only on equal inputs.
+    if p_record ->> 'type' = 'task.shadow_gated' then
+        if jsonb_typeof(p_record -> 'id') is distinct from 'number'
+           or not exists (select 1 from mission_tasks where id = (p_record ->> 'id')::bigint)
+           or coalesce(p_record ->> 'runner', '') = ''
+           or jsonb_typeof(p_record -> 'inputs') is distinct from 'object'
+           or jsonb_typeof(p_record -> 'unequal') is distinct from 'array'
+           or coalesce(jsonb_typeof(p_record -> 'agrees'), 'absent') not in ('boolean', 'null')
+           or (jsonb_typeof(p_record -> 'agrees') = 'boolean'
+               and jsonb_array_length(p_record -> 'unequal') > 0) then
+            raise exception 'a task.shadow_gated names its task, runner, inputs and unequal, and agrees only on equal inputs: %',
+                            p_record;
+        end if;
+        return spawn_control_record(p_record);
     end if;
     -- Main of a source red on a check (docs/fleet-architecture.md §10.3,
     -- "Main is red"): a red names its source, main, check and the shared

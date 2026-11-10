@@ -433,9 +433,29 @@ export async function postInput(
   body: Record<string, unknown>,
   signal?: AbortSignal,
 ): Promise<{ status: number | null; body: unknown }> {
+  return postWrite(sessionId, "input", body, signal);
+}
+
+/** `POST /api/session/<id>/key` with `{name, key}`: a person's named key
+ * (backlog P1), a command of its own, with the input's guards. 409 when the
+ * session runs no execution, with the reason. */
+export async function postKey(
+  sessionId: string,
+  body: { name: string; key: string },
+  signal?: AbortSignal,
+): Promise<{ status: number | null; body: unknown }> {
+  return postWrite(sessionId, "key", body, signal);
+}
+
+async function postWrite(
+  sessionId: string,
+  path: "input" | "key",
+  body: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<{ status: number | null; body: unknown }> {
   let response: Response;
   try {
-    response = await fetch(`/api/session/${encodeURIComponent(sessionId)}/input`, {
+    response = await fetch(`/api/session/${encodeURIComponent(sessionId)}/${path}`, {
       method: "POST",
       signal,
       cache: "no-store",

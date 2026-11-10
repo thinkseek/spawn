@@ -105,6 +105,54 @@ export function foldIdle(
   return { fold, unfold, breaks, keep, blocks };
 }
 
+/** foldIdle with its band width rounded down to a power of two (from its
+ * own 3% of the active time): the missions timeline's fold. An open bar
+ * grows the active time each second, and a keep that followed it would
+ * move every folded time after the first break each second; rounded, it
+ * holds until the active time doubles (the window follows when it moves,
+ * refollow). A `keep` given is used as it is. */
+export function foldIdleSteady(
+  intervals: ReadonlyArray<readonly [number, number]>,
+  options: { minGap?: number; keep?: number } = {},
+): TimeFold {
+  const first = foldIdle(intervals, options);
+  if (first.breaks.length === 0 || options.keep !== undefined) return first;
+  return foldIdle(intervals, { ...options, keep: 2 ** Math.floor(Math.log2(Math.max(first.keep, 1))) });
+}
+
+/** Whether two folds map every time alike. A fold's mapping is its breaks
+ * (each idle stretch's real ends) and `keep`, nothing else: its first
+ * block's start and its last block's end move no time, so a live trace's
+ * fold, rebuilt each second as its last block grows toward now, is the
+ * same map until a break or the band width changes (rev-f F4). With no
+ * break, any fold is the identity.
+ *
+ * One more case is the same: a live end that is only now, after an idle
+ * stretch (a waiting session's open turn, its last record an hour ago).
+ * Its last block is that instant alone, and the break before it ends at
+ * now, so it grows with the clock. Every gap that breaks is at least
+ * minGap, never shorter than `keep`, so it folds to `keep` exactly, and
+ * the times after it move by just what it grew: none moves before the
+ * band, now stays where it was on the axis, and only real times inside
+ * the 12–24 px band slide, which no window shows apart. */
+export function sameFoldMap(a: TimeFold, b: TimeFold): boolean {
+  if (a === b) return true;
+  if (a.breaks.length === 0 && b.breaks.length === 0) return true;
+  if (a.keep !== b.keep || a.breaks.length !== b.breaks.length) return false;
+  const last = a.breaks.length - 1;
+  return a.breaks.every(
+    (item, index) =>
+      item.from === b.breaks[index].from &&
+      (item.to === b.breaks[index].to || (index === last && liveInstant(a) && liveInstant(b))),
+  );
+}
+
+/** The fold's last block is one instant (so its last break ends there). */
+function liveInstant(fold: TimeFold): boolean {
+  const block = fold.blocks.at(-1);
+  return !!block && block.from === block.to;
+}
+
 /** How long a break stands for, as a short label: "5h 12m idle". */
 export function breakLabel(item: Break): string {
   const minutes = Math.round((item.to - item.from) / 60_000);
