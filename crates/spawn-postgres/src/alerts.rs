@@ -55,7 +55,7 @@ select jsonb_build_object(
                'action', k.action ->> 'type', 'created_at_ms', k.created_at_ms) || m.message as row
         from candidates k
         cross join lateral (
-          select spawn_command_message(k.id, k.session_id, k.action, k.state,
+          select spawn_command_message(k.id, k.session_id, k.action, k.state, k.succeeded,
                                        k.created_at_ms, k.finished_at_ms, $1,
                                        (select spawn_messages_marked_from()),
                                        spawn_now_ms()) as message) m
@@ -96,7 +96,7 @@ select jsonb_build_object(
                'action', k.action ->> 'type', 'created_at_ms', k.created_at_ms) || m.message as row
         from candidates k
         cross join lateral (
-          select spawn_command_message(k.id, k.session_id, k.action, k.state,
+          select spawn_command_message(k.id, k.session_id, k.action, k.state, k.succeeded,
                                        k.created_at_ms, k.finished_at_ms, $1,
                                        (select spawn_messages_marked_from()),
                                        spawn_now_ms()) as message) m
