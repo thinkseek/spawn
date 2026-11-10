@@ -115,26 +115,26 @@ from (
 pub(crate) const FLEET_HEALTH: &str = r"
 with
   now as (select spawn_now_ms() as ms),
-  -- The day's judgements carry only their judge (the ladder counts them);
-  -- the hour's carry the whole judgement. Both read their window by time
-  -- (spawn_events_name_time).
-  judged as (
-    select j.observation ->> 'judge' as judge
-      from agent_judgements j, now
-     where j.recorded_at_ms > now.ms - 86400000),
+  -- The day's decision ladder, from the experience view
+  -- (`spawn_decisions`) over [now - 24 h, now), as `/api/scorecard/fleet`
+  -- counts it; the hour's judgements carry the whole judgement, read by
+  -- time (spawn_events_name_time).
+  ladder as (
+    select d.tier, count(*) as n
+      from spawn_decisions d, now
+     where d.at_ms >= now.ms - 86400000 and d.at_ms < now.ms
+     group by d.tier),
   hour as (
     select j.observation
       from agent_judgements j, now
      where j.recorded_at_ms > now.ms - 3600000),
-  commands as (
-    select c.principal, c.created_at_ms from spawn_commands c, now
-     where c.created_at_ms > now.ms - 86400000),
+  -- Every execution's running time in the day, as `/api/scorecard/fleet`
+  -- counts its agent-hours.
   live_ms as (
-    select coalesce(sum(greatest(0,
-             least(coalesce(x.ended_at_ms, now.ms), now.ms)
-             - greatest(x.started_at_ms, now.ms - 86400000))), 0)::float8 as ms
+    select coalesce(sum(least(coalesce(x.ended_at_ms, now.ms), now.ms)
+                        - greatest(x.started_at_ms, now.ms - 86400000)), 0)::float8 as ms
       from agent_executions x, now
-     where coalesce(x.ended_at_ms, now.ms) > now.ms - 86400000),
+     where x.started_at_ms < now.ms and coalesce(x.ended_at_ms, now.ms) > now.ms - 86400000),
   events as (
     select e.event_name from spawn_events e, now
      where e.event_name in ('tool.started', 'tool.failed', 'turn.failed')
@@ -173,17 +173,14 @@ select jsonb_build_object(
     'tool_calls', (select count(*) from events where event_name = 'tool.started'),
     'failures', (select count(*) from events where event_name in ('tool.failed', 'turn.failed'))
   ),
-  'ladder_24h', jsonb_build_object(
-    'rules', (select count(*) from judged where judge = 'rules'),
-    'model', (select count(*) from judged where judge <> 'rules'),
-    'dispatcher', (select count(*) from commands where principal = 'spawn-dispatch'),
-    'supervisor', (select count(*) from commands where principal = 'spawn_supervisor'),
-    'liveness', (select count(*) from commands where principal = 'spawn-liveness'),
-    'human', (select count(*) from commands where principal = 'human')
-  ),
+  -- Every tier, the known ones at 0 when none decided; a tier beyond them
+  -- (another principal's commands) is a key of its own.
+  'ladder_24h', jsonb_build_object('rules', 0, 'model', 0, 'dispatcher', 0, 'supervisor', 0,
+                                   'liveness', 0, 'human', 0)
+                || (select coalesce(jsonb_object_agg(tier, n), '{}'::jsonb) from ladder),
   'agent_hours_24h', (select ms / 3600000.0 from live_ms),
   'human_per_agent_hour', (select case when ms > 0
-                              then (select count(*) from commands where principal = 'human')
+                              then coalesce((select n from ladder where tier = 'human'), 0)
                                    / (ms / 3600000.0) end from live_ms)
 )";
 
