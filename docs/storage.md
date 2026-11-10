@@ -590,7 +590,11 @@ state and wedges nothing:
   floor_bytes}`, and once as `state: "recovered"` when it is back 1 GiB above
   the threshold (so a path at the threshold does not flap). The latest
   record per path is read back from the log on start, so a restart records
-  nothing twice. A path's latest record reaches the supervisor's digest
+  nothing twice. A path the loop no longer watches (the workspace root or
+  `TMPDIR` changed) is never read again, so a `low` record it left is closed
+  by the loop at its first check with `state: "recovered", reason:
+  "unwatched"` and the old record's numbers: its condition ends for every
+  reader of the log, and it is not told as a recovery. A path's latest record reaches the supervisor's digest
   once: a `low` one ("disk space on this host") is a condition, kept in the
   dispatcher's plan (and the attention queue) as told and unresolved until
   the path's `recovered` record replaces it, however long that takes; a

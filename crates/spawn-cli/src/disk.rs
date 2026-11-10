@@ -7,7 +7,11 @@
 //! record with state `low`, and once more as `recovered` when it is back
 //! [`RECOVERY_MARGIN`] above that, so a path hovering at the threshold does
 //! not flap. The latest record per path is read back from the log on start,
-//! so a restart records nothing twice. The supervisor's digest carries each
+//! so a restart records nothing twice. A path that is no longer one of the
+//! two (the root or `TMPDIR` changed) is never read again: a `low` record
+//! it left is closed at the first check with a `recovered` record whose
+//! `reason` is `unwatched` ([`Monitor::unwatched`]), which is no news. The
+//! supervisor's digest carries each
 //! path's latest record once ([`escalations`]): a `low` one is a condition
 //! ([`Why::Disk`]) that holds until a `recovered` record replaces it, told
 //! or not; a `recovered` one is news ([`Why::DiskRecovered`]) for a day, and
@@ -44,6 +48,11 @@ pub(crate) const RECOVERY_MARGIN: u64 = GIB;
 /// nobody was told of within a day is stale. A `low` record has no window:
 /// it holds until its path recovers.
 const RECOVERY_NEWS_MS: i64 = 86_400_000;
+
+/// The `reason` of a `recovered` record that closes the `low` record of a
+/// path the loop no longer watches ([`Monitor::unwatched`]): nothing was
+/// read there, so it is not news of room ([`escalations`]).
+const UNWATCHED: &str = "unwatched";
 
 /// The thresholds, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,7 +200,9 @@ pub(crate) fn hold_new_executions(orders: &mut Vec<Order>) -> usize {
 /// `PostgresStore::host_disk` returns them): a `low` record, whatever its
 /// age, since its path has not recovered ([`Why::Disk`], a condition); a
 /// `recovered` one of the last [`RECOVERY_NEWS_MS`] ([`Why::DiskRecovered`],
-/// news: once told, [`crate::dispatch::decide_with`] drops it).
+/// news: once told, [`crate::dispatch::decide_with`] drops it). A `low`
+/// record whose path the loop stopped watching is closed by the loop
+/// ([`Monitor::unwatched`]), and that closing record is no item.
 pub(crate) fn escalations(records: &[Value], now_ms: i64) -> Vec<Escalation> {
     records
         .iter()
@@ -211,6 +222,9 @@ no new executions start; free space (old workspaces, build output) or tell the o
                         gib(record["floor_bytes"].as_u64().unwrap_or_default()),
                     ),
                 ),
+                // Closed because its path is no longer watched: no room
+                // was read there, so there is nothing to tell.
+                "recovered" if record["reason"] == UNWATCHED => return None,
                 "recovered" if now_ms - at_ms < RECOVERY_NEWS_MS => (
                     Why::DiskRecovered,
                     format!("{label} {path} has {free} free again"),
@@ -391,16 +405,24 @@ impl Monitor {
         }
         let (readings, mut lines) = read(&self.places);
         let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
-        for record in self.observe(readings) {
+        // A low record of a path no longer watched is closed; one that
+        // could not be written is made again at the next check.
+        let mut records = self.unwatched();
+        records.extend(self.observe(readings));
+        for record in records {
             let id = store
                 .host_record(&record)
                 .map_err(|error| format!("disk record: {error}"))?;
-            lines.push(format!(
-                "disk: {} {} {} free",
-                record["path"].as_str().unwrap_or_default(),
-                record["state"].as_str().unwrap_or_default(),
-                gib(record["free_bytes"].as_u64().unwrap_or_default())
-            ));
+            let path = record["path"].as_str().unwrap_or_default();
+            lines.push(if record["reason"] == UNWATCHED {
+                format!("disk: {path} is no longer watched: its low record is closed")
+            } else {
+                format!(
+                    "disk: {path} {} {} free",
+                    record["state"].as_str().unwrap_or_default(),
+                    gib(record["free_bytes"].as_u64().unwrap_or_default())
+                )
+            });
             self.remember(record, id, now);
         }
         Ok(lines)
@@ -416,6 +438,38 @@ impl Monitor {
             .collect();
         self.readings = readings;
         records
+    }
+
+    /// The records that close the `low` records of paths this loop does not
+    /// watch (the workspace root or `TMPDIR` changed since): no reading of
+    /// such a path is ever taken again, so nothing else would replace its
+    /// `low` record and its item would stand forever. Each is a `recovered`
+    /// record with `reason` [`UNWATCHED`] and the old record's numbers,
+    /// which nothing read anew. Once written and remembered, none is made
+    /// again.
+    pub(crate) fn unwatched(&self) -> Vec<Value> {
+        self.records
+            .iter()
+            .flatten()
+            .filter(|record| record["state"] == "low")
+            .filter(|record| {
+                !self.places.iter().any(|place| {
+                    record["path"].as_str() == Some(place.path.display().to_string().as_str())
+                })
+            })
+            .map(|record| {
+                json!({
+                    "type": "host.disk",
+                    "label": record["label"],
+                    "path": record["path"],
+                    "state": "recovered",
+                    "reason": UNWATCHED,
+                    "free_bytes": record["free_bytes"].as_u64().unwrap_or_default(),
+                    "warn_bytes": record["warn_bytes"],
+                    "floor_bytes": record["floor_bytes"],
+                })
+            })
+            .collect()
     }
 
     /// Whether the latest record of `path` says it is low.
@@ -559,6 +613,135 @@ mod tests {
         assert_eq!(recovered[0]["state"], "recovered");
         assert_eq!(recovered[0]["free_bytes"], json!(30 * GIB));
         assert_eq!(recovered[0]["warn_bytes"], json!(20 * GIB));
+    }
+
+    /// GitHub #16 item 7: the workspace root or `TMPDIR` changed while a
+    /// path was low. Nothing reads the old path again, so no `recovered`
+    /// record would ever replace its `low` one: the monitor closes it.
+    #[test]
+    fn a_low_record_of_a_path_no_longer_watched_is_closed_and_is_no_item() {
+        let low = |path: &str| {
+            json!({"type": "host.disk", "label": "workspace", "path": path, "state": "low",
+                   "free_bytes": 5 * GIB, "warn_bytes": 20 * GIB, "floor_bytes": 2 * GIB})
+        };
+        let ids = |monitor: &Monitor| -> Vec<String> {
+            monitor
+                .escalations(1000)
+                .into_iter()
+                .map(|item| item.id)
+                .collect()
+        };
+        let mut monitor = Monitor::with(vec![place("/ws")], THRESHOLDS);
+        monitor.remember(low("/old"), 3, 10);
+        monitor.remember(low("/ws"), 4, 20);
+        monitor.remember(
+            json!({"type": "host.disk", "label": "tmpdir", "path": "/gone", "state": "recovered",
+                   "free_bytes": 30 * GIB}),
+            5,
+            30,
+        );
+
+        let closing = monitor.unwatched();
+        assert_eq!(
+            closing,
+            [
+                json!({"type": "host.disk", "label": "workspace", "path": "/old",
+                       "state": "recovered", "reason": "unwatched", "free_bytes": 5 * GIB,
+                       "warn_bytes": 20 * GIB, "floor_bytes": 2 * GIB})
+            ],
+            "only the low record of the path not watched"
+        );
+        for record in closing {
+            monitor.remember(record, 6, 40);
+        }
+        assert_eq!(
+            ids(&monitor),
+            ["disk-4", "disk-5"],
+            "the watched path is still low; a recovery that was read stays news"
+        );
+        assert!(monitor.unwatched().is_empty(), "closed once");
+        // Whoever reads the log (the attention queue) sees it closed too,
+        // and not as a recovery to tell: nothing was read there.
+        assert!(
+            escalations(
+                &[
+                    json!({"type": "host.disk", "label": "workspace", "path": "/old",
+                         "state": "recovered", "reason": "unwatched", "free_bytes": 5 * GIB,
+                         "event_id": 6, "at_ms": 40})
+                ],
+                1000
+            )
+            .is_empty()
+        );
+    }
+
+    /// A path closed as unwatched and watched again later starts over: low
+    /// is recorded again when it is.
+    #[test]
+    fn a_path_watched_again_after_it_was_closed_is_recorded_low_again() {
+        let mut monitor = Monitor::with(vec![place("/old")], THRESHOLDS);
+        monitor.remember(
+            json!({"type": "host.disk", "label": "workspace", "path": "/old",
+                   "state": "recovered", "reason": "unwatched", "free_bytes": GIB}),
+            6,
+            40,
+        );
+        assert!(monitor.unwatched().is_empty());
+        let records = monitor.observe(vec![reading("/old", GIB)]);
+        assert_eq!(records[0]["state"], "low");
+        assert_eq!(records[0].get("reason"), None);
+    }
+
+    /// The same against the real store, as the loop's check runs it: the
+    /// closing record is written, so the latest record of the removed path
+    /// in the log is no longer `low` for any reader.
+    #[test]
+    fn the_check_closes_a_removed_paths_low_record_in_the_log() {
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+        let schema = format!("spawn_test_{}_{nanos:x}_disk_unwatched", std::process::id());
+        let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
+            .expect("a schema of its own, migrated");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let low = store
+                .host_record(&json!({"type": "host.disk", "label": "workspace",
+                    "path": "/removed/workspaces", "state": "low", "free_bytes": 5 * GIB,
+                    "warn_bytes": 20 * GIB, "floor_bytes": 2 * GIB}))
+                .expect("the old root was low");
+            // The loop restarts with another root, which has room.
+            let roomy = Thresholds { warn: 0, floor: 0 };
+            let mut monitor = Monitor::with(vec![place("/")], roomy);
+            let lines = monitor.check(&store).expect("checked");
+            assert_eq!(
+                lines,
+                ["disk: /removed/workspaces is no longer watched: its low record is closed"]
+            );
+            assert!(monitor.escalations(i64::MAX).is_empty());
+            let latest = store.host_disk().expect("the log");
+            assert_eq!(latest.as_array().map(Vec::len), Some(1));
+            assert_eq!(latest[0]["path"], "/removed/workspaces");
+            assert_eq!(latest[0]["state"], "recovered");
+            assert_eq!(latest[0]["reason"], "unwatched");
+            assert!(latest[0]["event_id"].as_i64().is_some_and(|id| id > low));
+            assert!(
+                escalations(latest.as_array().expect("records"), i64::MAX).is_empty(),
+                "no item for a reader of the log"
+            );
+            // The next loop finds it closed and writes nothing more.
+            let mut next = Monitor::with(vec![place("/")], roomy);
+            assert!(next.check(&store).expect("checked").is_empty());
+            assert_eq!(store.host_disk().expect("the log"), latest);
+        }));
+        drop(store);
+        let _ = postgres::Client::connect(&url, postgres::NoTls)
+            .and_then(|mut client| client.batch_execute(&format!("drop schema {schema} cascade")));
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[test]

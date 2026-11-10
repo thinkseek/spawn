@@ -46,7 +46,7 @@ fn command(
     } else {
         "pending"
     };
-    let finished = succeeded.map(|_| created + 1000);
+    let finished = succeeded.map(|_| created + 50);
     client
         .execute(
             "insert into spawn_commands (principal, idempotency_key, agent_id, session_id, action,
@@ -345,7 +345,7 @@ fn the_facts_hold_the_commands_a_measure_reads() {
     assert_eq!(find("board-1")["action"], "input");
     assert_eq!(find("board-1")["session_id"], "session_resident_r1");
     assert_eq!(find("board-1")["created_at_ms"], 100);
-    assert_eq!(find("board-1")["finished_at_ms"], 1100);
+    assert_eq!(find("board-1")["finished_at_ms"], 150);
     assert_eq!(find("board-1")["succeeded"], true);
     assert_eq!(find("cli-stop-1")["succeeded"], false);
     assert_eq!(
@@ -360,6 +360,81 @@ fn the_facts_hold_the_commands_a_measure_reads() {
         find("digest-a")["stalls"],
         json!(["session_resident_r1 stall-9-activity-1"]),
         "only the stall tags"
+    );
+}
+
+/// GitHub #16 item 3: a fixed window's facts are those recorded before its
+/// end. A command created inside the window that finishes after it reads as
+/// unfinished there, whenever the window is asked for.
+#[test]
+fn a_command_finishing_after_the_window_leaves_its_facts_unchanged() {
+    let (store, schema) = store("scorecard_fixed_window");
+    let mut client = admin(&schema);
+    let input = json!({"type": "input", "text": "go"});
+    let start = json!({"type": "start", "engine": "claude", "prompt": "Task #6"});
+    command(&mut client, "human", "board-1", &input, None, None, 100);
+    command(
+        &mut client,
+        "spawn_supervisor",
+        "s-1",
+        &input,
+        None,
+        None,
+        200,
+    );
+    command(
+        &mut client,
+        "spawn-dispatch",
+        "deliver-6-0",
+        &start,
+        None,
+        None,
+        300,
+    );
+    let before = store.scorecard_facts(1000).expect("the facts");
+    assert_eq!(
+        before["commands"]
+            .as_array()
+            .expect("commands")
+            .iter()
+            .map(|command| command["key"].as_str().expect("a key"))
+            .collect::<Vec<_>>(),
+        ["board-1", "deliver-6-0"]
+    );
+    // All three finish at 1500, after the window's end.
+    client
+        .execute(
+            "update spawn_commands
+                set state = 'finished', finished_at_ms = 1500,
+                    succeeded = (idempotency_key = 'board-1'),
+                    error = case when idempotency_key <> 'board-1' then 'lost' end",
+            &[],
+        )
+        .expect("finish the commands");
+    let after = store.scorecard_facts(1000).expect("the facts");
+    assert_eq!(
+        serde_json::to_string(&after).expect("json"),
+        serde_json::to_string(&before).expect("json"),
+        "the same window gives the same bytes"
+    );
+    // A window that ends after the results holds them.
+    let later = store.scorecard_facts(1501).expect("the facts");
+    let find = |key: &str| {
+        later["commands"]
+            .as_array()
+            .expect("commands")
+            .iter()
+            .find(|command| command["key"] == key)
+            .expect("the command")
+    };
+    assert_eq!(find("board-1")["succeeded"], true);
+    assert_eq!(find("board-1")["finished_at_ms"], 1500);
+    assert_eq!(find("s-1")["succeeded"], false);
+    assert_eq!(find("deliver-6-0")["error"], "lost");
+    // The end is exclusive: a result at the end itself is after the window.
+    assert_eq!(
+        serde_json::to_string(&store.scorecard_facts(1500).expect("the facts")).expect("json"),
+        serde_json::to_string(&before).expect("json")
     );
 }
 
