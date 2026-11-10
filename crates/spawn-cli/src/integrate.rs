@@ -12500,6 +12500,81 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// An owner judging's tree gets the installed controller's
+    /// web/node_modules, a real directory made before its gate starts (the
+    /// gate binds it only when it is there at its setup), so a check that
+    /// builds the UI judges the owner's push instead of failing on both
+    /// sides as a host fault (lead-mac, 2026-11-10). Only when the candidate
+    /// names the dependencies it was installed from (web/pnpm-lock.yaml).
+    #[test]
+    fn an_owner_judgings_tree_gets_the_controllers_web_node_modules() {
+        let (base, source, scenarios, integrator) = world("owner-modules", "");
+        let seen = base.join("modules-seen");
+        let gate = format!(
+            "m=\"$4/../web/node_modules\"\n\
+             if [ -d \"$m\" ] && [ ! -L \"$m\" ] && [ -f \"$m/pkg/index.js\" ]; then echo copied; \
+             else echo none; fi >>'{seen}'\n\
+             printf '%s\\n' '{{\"verdict\":\"accepted\"}}' >\"$SPAWN_GATE_VERDICT\"\n",
+            seen = seen.display()
+        );
+        std::fs::write(base.join("gate.sh"), gate).expect("gate");
+        let modules = base.join("web/node_modules");
+        std::fs::create_dir_all(modules.join(".pnpm")).expect("modules");
+        std::fs::create_dir_all(modules.join("pkg")).expect("modules");
+        std::fs::write(modules.join(".pnpm/lock.yaml"), "lock v1\n").expect("lock");
+        std::fs::write(modules.join("pkg/index.js"), "x\n").expect("pkg");
+        let db = Db::new("owner_modules");
+        db.gated_mission(&source, &scenarios);
+        let seen_lines = || {
+            std::fs::read_to_string(&seen)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[
+                ("scenarios/protected", ""),
+                ("web/package.json", "{}\n"),
+                ("web/pnpm-lock.yaml", "lock v1\n"),
+            ],
+            "owner: the ui",
+        );
+        gated_request(&db, &source, &commit, "the ui");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        assert_eq!(
+            seen_lines(),
+            vec!["copied"],
+            "the gate found the copy at its start"
+        );
+        assert_eq!(
+            control_records(&db, "source.moved").len(),
+            1,
+            "judged, and landed"
+        );
+
+        // Other dependencies than the installed ones: not given.
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("web/pnpm-lock.yaml", "lock v2, other dependencies\n")],
+            "owner: new dependencies",
+        );
+        gated_request(&db, &source, &commit, "new dependencies");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        assert_eq!(seen_lines(), vec!["copied", "none"]);
+        assert!(
+            std::fs::symlink_metadata(modules.join("pkg/index.js")).is_ok(),
+            "the controller's own is untouched"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// An owner judging that finds no verdict (the host's fault) records
     /// nothing: the request stays pending, is not judged again before its
     /// backoff, and is judged again after it.
