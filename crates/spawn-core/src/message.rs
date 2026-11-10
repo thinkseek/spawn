@@ -11,7 +11,8 @@
 //! program reads keys raw ([`crate::port::TerminalHost::reads_lines`]
 //! false): such a program, unless it asked for a bracketed paste, takes each
 //! pasted line break as Enter, and would take the marker as a prompt of its
-//! own. The engine's transcript keeps what it
+//! own. After the marker comes one line that says how to answer the
+//! message ([`answer_line`], objective 046). The engine's transcript keeps what it
 //! was given, so the transcript's user line that holds the marker is the
 //! message taken (`message.taken`, crate::ingest), whatever its text: two
 //! messages with the same text are told apart by their ids, never by the
@@ -27,14 +28,27 @@ pub fn marker(command: CommandId) -> String {
     format!("{OPEN}{}]", command.0)
 }
 
+/// How the agent answers the message `command` (objective 046): one line
+/// after the marker. `spawn ack` records the answer from the agent's own
+/// pane; a task's delivery is answered by the task's report instead.
+pub fn answer_line(command: CommandId) -> String {
+    let id = command.0;
+    format!(
+        "(Answer this message by its id: `spawn ack {id} done`, or `spawn ack {id} declined \
+         <why>`; if it delivers a task, your report answers it.)"
+    )
+}
+
 /// `text` as the Bridge types it for `command`: the text, then its marker on
-/// a line of its own; after a space when `one_line` (a prompt that starts
-/// an engine, or a pane that reads keys raw) and the text is one line.
+/// a line of its own, then the line that says how to answer it
+/// ([`answer_line`]); after a space each when `one_line` (a prompt that
+/// starts an engine, or a pane that reads keys raw) and the text is one
+/// line.
 pub fn marked(text: &str, command: CommandId, one_line: bool) -> String {
     if one_line && !text.contains('\n') {
-        format!("{text} {}", marker(command))
+        format!("{text} {} {}", marker(command), answer_line(command))
     } else {
-        format!("{text}\n\n{}", marker(command))
+        format!("{text}\n\n{}\n{}", marker(command), answer_line(command))
     }
 }
 
@@ -66,13 +80,35 @@ mod tests {
     #[test]
     fn a_marked_text_ends_with_its_marker_on_its_own_line_or_one_lines_end() {
         let text = marked("do the task", CommandId(42), false);
-        assert_eq!(text, "do the task\n\n[spawn message #42]");
+        assert_eq!(
+            text,
+            format!("do the task\n\n[spawn message #42]\n{}", answer_line(CommandId(42)))
+        );
         assert_eq!(markers(&text), [CommandId(42)]);
         let several = marked("notice\n\ndo the task", CommandId(43), true);
-        assert_eq!(several, "notice\n\ndo the task\n\n[spawn message #43]");
+        assert_eq!(
+            several,
+            format!(
+                "notice\n\ndo the task\n\n[spawn message #43]\n{}",
+                answer_line(CommandId(43))
+            )
+        );
         let line = marked("do the task", CommandId(7), true);
-        assert_eq!(line, "do the task [spawn message #7]");
+        assert_eq!(
+            line,
+            format!("do the task [spawn message #7] {}", answer_line(CommandId(7)))
+        );
         assert_eq!(markers(&line), [CommandId(7)]);
+    }
+
+    #[test]
+    fn the_answer_line_names_the_ack_by_id_and_no_other_marker() {
+        let line = answer_line(CommandId(42));
+        assert!(!line.contains('\n'), "one line: {line}");
+        assert!(line.contains("`spawn ack 42 done`"), "{line}");
+        assert!(line.contains("`spawn ack 42 declined <why>`"), "{line}");
+        assert!(line.contains("report answers it"), "{line}");
+        assert_eq!(markers(&line), [], "the line holds no marker of its own");
     }
 
     #[test]
