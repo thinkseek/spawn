@@ -1459,6 +1459,24 @@ mod tests {
     }
 
     #[test]
+    fn a_server_is_named_by_its_pid_and_start_time() {
+        let named = super::server_identity("2283540 1794330336\n2283540 1794330336\n");
+        assert_eq!(
+            named,
+            Some(spawn_core::port::TerminalServer {
+                pid: 2_283_540,
+                started_at_ms: 1_794_330_336_000,
+            })
+        );
+        // No session left, or a tmux that does not know the formats: no
+        // identity, never a made-up one.
+        assert_eq!(super::server_identity(""), None);
+        assert_eq!(super::server_identity(" \n"), None);
+        assert_eq!(super::server_identity("2283540\n"), None);
+        assert_eq!(super::server_identity("#{pid} #{start_time}\n"), None);
+    }
+
+    #[test]
     fn a_start_time_is_read_past_a_command_with_parentheses() {
         let stat = "42 (a) (b c) S 1 42 42 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 987654 0 0";
         assert_eq!(super::start_time_of(stat), Some(987_654));
