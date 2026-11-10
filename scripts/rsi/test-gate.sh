@@ -3292,6 +3292,12 @@ expect "the candidate's failure of it is main's" "$(cat "$work/gate.out")" \
     '| 071.sh fails on the base too: main is red on it (above), not a verdict on the candidate'
 refuse "never called an unsolved objective" "$(cat "$work/gate.out")" 'an unsolved objective, not a regression'
 expect "and the candidate is judged as before: accepted" "$red_out" 'exit=0 {"verdict":"accepted"'
+# The scenarios directory with a trailing slash, as a hand run may type it:
+# the same directory, still red (before, "dir//071.sh" had dirname "dir",
+# not "dir/", so no index key was written and red never fired).
+red_out=$(export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$red_cache"; base=$red_b; judge "$red_c" "" "$red/")
+expect "the scenarios directory given with a trailing slash: still main red" "$red_out" \
+    '"main_red_scenarios":["071.sh"]'
 red_out=$(export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$red_cache"; base=$red_side; judge "$red_side_c" "" "$red")
 refuse "a branch that never had A: not red" "$red_out" 'main_red_scenarios'
 expect "an unsolved objective there" "$(cat "$work/gate.out")" \
