@@ -1370,6 +1370,13 @@ the tree's own:
   the owner knows are broken: not run as regressions, nor judged on the
   base for one, and named in every gate's log and verdict (`quarantined`).
   The task's own scenario is never skipped by it.
+- the regression that last ended a gate of the same scenarios (a candidate
+  failure, a validator defect, unstable) is judged first by the next gate,
+  before the serial list and alone, until a run of it passes (gate.sh "A
+  known failure first"; the record is beside the base cache,
+  `gate-solved/<root commit>/.known-failure.<hash of the scenarios'
+  names>`, hidden from the sandbox): a failure that is still there costs
+  that scenario's own runs, not the gate.
 - everything the candidate controls runs in a bubblewrap sandbox (docs/rsi.md
   §4). The verdict is one JSON line that names the base and candidate
   commits it judged; the integrator believes only the verdict file it owns.

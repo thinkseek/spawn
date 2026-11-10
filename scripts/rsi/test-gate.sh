@@ -4096,4 +4096,41 @@ git -C "$seed" checkout -q main 2>/dev/null || git -C "$seed" checkout -q -B mai
 expect "a candidate that writes the tree's list is refused: the scenarios are protected paths" \
     "$(judge "$quarantine_self" "$listed/007.sh" "$listed")" 'candidate touches protected paths'
 
+# 31. A known failure first (the owner, 2026-11-10: a gate took 39 minutes
+# to say what the gate before it had said). The regression that last ended
+# a gate of these scenarios is on record beside the base cache, and the
+# next gate judges it first: its job and its block before every other,
+# whatever the scenario order, so a failure that is still there ends the
+# gate before the rest is printed. 783, the last in the order, fails on a
+# tree whose value is three.
+known=$work/known
+mkdir -p "$known"
+cp "$scenarios/protected" "$scenarios/build" "$known/"
+printf '#!/bin/sh\necho "781 ran in $(basename "$PWD")"\n' >"$known/781.sh"
+cp "$known/781.sh" "$known/782.sh"
+sed -i 's/781/782/' "$known/782.sh"
+printf '#!/bin/sh\necho "783 ran in $(basename "$PWD")"\n[ "$(cat value)" != three ]\n' >"$known/783.sh"
+# first_block: the first regression block of the gate's log.
+first_block() { grep -m 1 '^| == regression: ' "$work/gate.out"; }
+expect "a first gate rejects at the failing scenario, in the scenario order" \
+    "$(with_jobs 2 known "$breaks" "$known")" 'regression: 783.sh fails on the candidate'
+refuse "with no known failure yet" "$(cat "$work/gate.out")" 'known failure first'
+expect "the blocks before it were printed" "$(first_block)" '| == regression: 781.sh must still pass'
+expect "the failure is on record beside the base cache" \
+    "$(cat "$work/caches/known/spawn/gate-solved"/*/.known-failure.* 2>/dev/null)" '783.sh'
+expect "the next gate rejects on it again" \
+    "$(with_jobs 2 known "$breaks" "$known")" 'regression: 783.sh fails on the candidate'
+expect "and says it judged the known failure first" "$(cat "$work/gate.out")" \
+    '| known failure first: 783.sh ended the last gate of these scenarios that it failed in'
+expect "its block is the first" "$(first_block)" '| == regression: 783.sh must still pass'
+refuse "and the gate ended on it, before the others' blocks" "$(cat "$work/gate.out")" '| == regression: 781.sh'
+expect "a candidate that passes it is judged on it first, and accepted" \
+    "$(with_jobs 2 known "$good" "$known")" 'exit=0 {"verdict":"accepted"}'
+expect "first, as the record said" "$(first_block)" '| == regression: 783.sh must still pass'
+expect "and the run that passed removed the record" \
+    "$(ls -A "$work/caches/known/spawn/gate-solved"/*/ | grep -c 'known-failure' || true)" 0
+expect "so the gate after it is in the scenario order again" \
+    "$(with_jobs 2 known "$good" "$known" >/dev/null; first_block)" '| == regression: 781.sh must still pass'
+refuse "with nothing said of a known failure" "$(cat "$work/gate.out")" 'known failure first'
+
 echo "gate: all cases pass"
