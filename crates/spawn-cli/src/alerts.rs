@@ -3216,7 +3216,7 @@ connections\n";
             json!([{"mission": 4, "budget_usd": budget, "spent_usd": spent},
                    {"mission": 5, "budget_usd": 1.0, "spent_usd": 0.06}])
         };
-        let mut read = |monitor: &mut Monitor, now: i64, value: Value| {
+        let read = |monitor: &mut Monitor, now: i64, value: Value| {
             let mut out = Vec::new();
             monitor.budgets(now, &value, &mut out);
             let out = decided(monitor, out);
