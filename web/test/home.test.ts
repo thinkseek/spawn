@@ -7,6 +7,7 @@ import type { FleetAgent, FleetHealth } from "../src/fleet.ts";
 import {
   currentToolText,
   actionableAlerts,
+  alertTitle,
   agentMatches,
   agentName,
   agentNames,
@@ -629,4 +630,11 @@ test("a 3-day digest holds an alert that fired and cleared 2 days ago (rev-f F1)
   assert.deepEqual(away.bands.map((band) => band.entries.length), [1]);
   // The last 24 h does not.
   assert.equal(digestSince(missions([]), [cleared], NOW, NOW - 24 * HOUR).alerts, 0);
+});
+
+test("a source away from this host has its own title in Needs you (P12)", () => {
+  assert.equal(
+    alertTitle({ kind: "source_away", subject: "mission #4" }),
+    "A mission's source is not a directory on this host · mission #4",
+  );
 });

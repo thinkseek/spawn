@@ -69,6 +69,8 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::GateBaseDisagrees => "the base disagreed with itself at the gate (the host's)",
         Why::MainRed => "a source's main is red on a check (its gates wait)",
         Why::MainGreen => "a source's main is green again",
+        Why::SourceAway => "a mission's source is not a directory on this host (its branches wait)",
+        Why::SourceBack => "a mission's source is back on this host",
         Why::ShadowDisagrees => {
             "a gate runner's shadow verdict disagreed with the primary's (it decided nothing)"
         }
@@ -342,6 +344,49 @@ pub(crate) fn base_disagrees_alerts(records: &[Value]) -> Vec<Escalation> {
                 ),
                 since_ms: record["at_ms"].as_i64(),
             })
+        })
+        .collect()
+}
+
+/// The supervisor's news of a mission's source away from this host and
+/// back (P12): one item per `source_away` alert record not told yet
+/// (the store's `source_away_news`), tagged `host source-away-<event_id>` or
+/// `host source-back-<event_id>`.
+pub(crate) fn source_away_news(records: &[Value]) -> Vec<Escalation> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let id = record["event_id"].as_i64()?;
+            let subject = record["subject"].as_str().unwrap_or("a mission");
+            let source = record["evidence"]["source"].as_str().unwrap_or("its source");
+            match record["type"].as_str()? {
+                "alert.fired" => Some(Escalation {
+                    session_id: HOST_SESSION.to_string(),
+                    id: format!("source-away-{id}"),
+                    why: Why::SourceAway,
+                    line: format!(
+                        "{subject}'s source {source} is not a directory on this host: its \
+                         agents' branches are not published to it until it is back. Check \
+                         the mount or the path; Spawn retries on its own."
+                    ),
+                    since_ms: record["at_ms"].as_i64(),
+                }),
+                "alert.cleared" => {
+                    let gone = record["evidence"]["reason"].as_str() == Some("no longer watched");
+                    Some(Escalation {
+                        session_id: HOST_SESSION.to_string(),
+                        id: format!("source-back-{id}"),
+                        why: Why::SourceBack,
+                        line: if gone {
+                            format!("{subject} no longer has {source} as an open source: its away alert is closed.")
+                        } else {
+                            format!("{subject}'s source {source} is back on this host: its branches are published again.")
+                        },
+                        since_ms: record["at_ms"].as_i64(),
+                    })
+                }
+                _ => None,
+            }
         })
         .collect()
 }
@@ -839,4 +884,55 @@ pub(super) fn order(supervisor: &Facts, pending: &[Escalation], spawn: &str) -> 
         },
         task: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn a_source_away_and_its_end_are_told_to_the_supervisor() {
+        let records = [
+            json!({"type": "alert.fired", "event_id": 11, "at_ms": 5, "kind": "source_away",
+                   "subject": "mission #4", "evidence": {"source": "/mnt/vol/a.git"}}),
+            json!({"type": "alert.cleared", "event_id": 12, "at_ms": 6, "kind": "source_away",
+                   "subject": "mission #4",
+                   "evidence": {"source": "/mnt/vol/a.git", "present": true}}),
+            json!({"type": "alert.cleared", "event_id": 13, "at_ms": 7, "kind": "source_away",
+                   "subject": "mission #6",
+                   "evidence": {"source": "/srv/b.git", "reason": "no longer watched"}}),
+        ];
+        let news = source_away_news(&records);
+        assert_eq!(
+            news.iter()
+                .map(|item| (item.id.as_str(), item.why))
+                .collect::<Vec<_>>(),
+            [
+                ("source-away-11", Why::SourceAway),
+                ("source-back-12", Why::SourceBack),
+                ("source-back-13", Why::SourceBack)
+            ]
+        );
+        assert!(news.iter().all(|item| item.session_id == HOST_SESSION));
+        assert!(
+            news[0]
+                .line
+                .starts_with("mission #4's source /mnt/vol/a.git is not a directory"),
+            "{}",
+            news[0].line
+        );
+        assert!(
+            news[1].line.contains("is back on this host"),
+            "{}",
+            news[1].line
+        );
+        assert!(
+            news[2].line.contains("no longer has /srv/b.git"),
+            "{}",
+            news[2].line
+        );
+        assert!(Why::SourceAway.is_news() && Why::SourceBack.is_news());
+    }
 }
