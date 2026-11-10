@@ -275,7 +275,7 @@ impl Rig {
     }
 
     /// What was typed, each text without the marker it must end with
-    /// (`[spawn message #<command>]`, on a line of its own).
+    /// (`[spawn message #<command>]`: after a space on a one-line text).
     fn typed(&self) -> Vec<String> {
         self.host
             .typed
@@ -284,10 +284,10 @@ impl Rig {
             .iter()
             .map(|text| {
                 let (body, marker) = text
-                    .rsplit_once("\n\n")
-                    .unwrap_or_else(|| panic!("{text:?} ends with no marker line"));
+                    .rsplit_once(" [spawn message #")
+                    .unwrap_or_else(|| panic!("{text:?} ends with no marker"));
                 assert!(
-                    marker.starts_with("[spawn message #") && marker.ends_with(']'),
+                    !body.contains('\n') && marker.ends_with(']'),
                     "{text:?} ends with no marker"
                 );
                 body.to_string()
