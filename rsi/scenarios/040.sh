@@ -26,7 +26,9 @@
 #       `GET /api/fleet/<id>/commands` serve them, and the agent's name,
 #       `supervisor`), has a command span labelled `You → supervisor` for
 #       each of the two inputs, whose summary is its text, and after each a
-#       turn span (the supervisor's answer, in the same view).
+#       turn span (the supervisor's answer, in the same view). trace.ts
+#       and its imports must load with node alone; one that does not fails
+#       here.
 #   (3) refused when stopped: once a person stops the supervisor, the
 #       page's input answers 409 with a reason that says it runs no
 #       execution, and records no command; one sent with `spawn submit
@@ -448,8 +450,11 @@ test("a person's input to the supervisor reads `You → supervisor`, and its ans
 TEST
 if ! BB_TREE=$tree BB_WORK=$WORK BB_PAGE_TEXT=$page_text BB_CLI_TEXT=$cli_text \
     node --test "$WORK/trace.test.mjs" >"$WORK/trace.out" 2>&1; then
-    if grep -q "ERR_MODULE_NOT_FOUND\|SyntaxError\|ERR_UNKNOWN_FILE_EXTENSION" "$WORK/trace.out"; then
-        harness "the trace check could not load web/src/trace.ts: $(grep -m 3 'Error' "$WORK/trace.out" | tr '\n' ' ')"
+    # web/src/trace.ts and what it imports must load with node alone (the
+    # objective says so): one that does not is the candidate's, not the
+    # harness's.
+    if grep -q "ERR_MODULE_NOT_FOUND\|SyntaxError\|ERR_UNKNOWN_FILE_EXTENSION\|ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX" "$WORK/trace.out"; then
+        fail "(2) web/src/trace.ts does not load with node alone (relative .ts imports, import type for types, no packages, erasable TypeScript only): $(grep -m 3 'Error' "$WORK/trace.out" | tr '\n' ' ')"
     fi
     fail "(2) the supervisor page's trace: $(grep -E 'AssertionError|no command span|label|no turn span|expected|actual' "$WORK/trace.out" | head -n 6 | tr '\n' ' ')"
 fi
