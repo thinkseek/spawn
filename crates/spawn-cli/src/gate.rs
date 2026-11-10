@@ -2111,6 +2111,75 @@ mod tests {
         assert!(!marker.exists(), "the background child died with the gate");
     }
 
+    /// A halt (a drain past its bound, [`super::Halt`]) kills the running
+    /// gate's whole group before it returns, and the thread that ran it
+    /// never returns from it (so nothing is recorded for it); a thread
+    /// halted before its gate starts starts none.
+    #[test]
+    fn a_halt_kills_the_whole_group_and_returns_nothing() {
+        let dir = std::env::temp_dir().join(format!("spawn-halt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let (running, marker, returned) = (dir.join("running"), dir.join("marker"), dir.join("returned"));
+        let halt = std::sync::Arc::new(super::Halt::default());
+        let thread_halt = std::sync::Arc::clone(&halt);
+        let script = format!(
+            "(sleep 2; touch {}) & echo $$ >{}; sleep 60",
+            marker.display(),
+            running.display()
+        );
+        let returned_mark = returned.clone();
+        // Never joined: a halted gate's thread parks for good.
+        let _gate = std::thread::spawn(move || {
+            super::halt_with(thread_halt);
+            let _ = bounded(&script, Duration::from_mins(5));
+            std::fs::write(returned_mark, "").expect("mark");
+        });
+        let deadline = Instant::now() + Duration::from_mins(5);
+        while std::fs::read_to_string(&running).map_or(true, |text| text.trim().is_empty())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let group: u32 = std::fs::read_to_string(&running)
+            .expect("the gate started")
+            .trim()
+            .parse()
+            .expect("its pid");
+        halt.halt();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let gone = |pid: u32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+                stat.rfind(')')
+                    .and_then(|end| stat[end + 1..].split_whitespace().next())
+                    .is_none_or(|state| state == "Z" || state == "X")
+            })
+        };
+        while !gone(group) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(gone(group), "the gate's leader is gone");
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(!marker.exists(), "the background child died with the gate");
+        assert!(!returned.exists(), "a halted gate returns nothing");
+
+        // Halted before it starts: no gate runs, and nothing returns.
+        let after = dir.join("after");
+        let after_returned = dir.join("after-returned");
+        let (script, mark) = (format!("touch {}", after.display()), after_returned.clone());
+        let early = std::sync::Arc::new(super::Halt::default());
+        early.halt();
+        let _late = std::thread::spawn(move || {
+            super::halt_with(early);
+            let _ = bounded(&script, Duration::from_mins(5));
+            std::fs::write(mark, "").expect("mark");
+        });
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(!after.exists(), "no gate starts on a halted thread");
+        assert!(!after_returned.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A stop on the gate's thread (an owner's urgent landing,
     /// [`super::stop_with`]) kills the whole group, as a timeout does, and
     /// is an abort with [`super::STOPPED`]; a gate that thread would start
