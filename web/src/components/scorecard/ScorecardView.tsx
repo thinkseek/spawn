@@ -2,6 +2,8 @@ import { CalendarDays, Gauge, OctagonAlert, Target } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 import { usePoll } from "../../api";
+import type { FleetHealth } from "../../fleet";
+import { decisionsFromHealth } from "../../fleetDecisions";
 import { absoluteTitle, localDateTime, relativeTime } from "../../format";
 import type { Missions } from "../../missions";
 import { isQuietScope, orderScopes } from "../../ordering";
@@ -36,6 +38,7 @@ import { useNow } from "../rsi/Phase";
 import { Card, CardHeader, EmptyState, LiveStatus, PageHeader, cx } from "../ui";
 import { ViewToggle, useStoredChoice } from "../ViewToggle";
 import type { ViewOption } from "../ViewToggle";
+import { FleetDecisions } from "./FleetDecisions";
 
 const POLL_MS = 60_000;
 
@@ -61,7 +64,14 @@ interface Loaded {
  * the only requests are GET /api/scorecard (and GET /api/missions, polled by
  * App, for the missions' titles and order).
  */
-export function ScorecardView({ missions }: { missions: Missions | null }) {
+export function ScorecardView({
+  missions,
+  health,
+}: {
+  missions: Missions | null;
+  /** /api/fleet's health (App polls it): the judgements and the ladder. */
+  health: FleetHealth | null;
+}) {
   useNow(10_000);
   const [since, chooseSince] = useStoredChoice<WindowPreset>(
     "spawn.scorecard.window",
@@ -183,6 +193,7 @@ export function ScorecardView({ missions }: { missions: Missions | null }) {
               </div>
             )}
             <WindowCard card={data} />
+            <FleetDecisions decisions={health ? decisionsFromHealth(health) : null} />
             {scopes.length === 0 ? (
               <Card>
                 <EmptyState
@@ -288,12 +299,14 @@ function WindowCard({ card }: { card: Scorecard }) {
         <Fact label="Until">
           <WindowTime ms={card.until_ms} />
         </Fact>
-        <Fact label="Previous window since">
-          <WindowTime
-            ms={card.previous_since_ms}
-            note="the previous window runs up to this window's start"
-          />
-        </Fact>
+        {card.previous_since_ms !== null && (
+          <Fact label="Previous window since">
+            <WindowTime
+              ms={card.previous_since_ms}
+              note="the previous window runs up to this window's start"
+            />
+          </Fact>
+        )}
         <Fact label="Minimum n">
           <span
             className="tnum"
@@ -473,15 +486,18 @@ function DimensionTile({
           n {dimension.n}
         </span>
         <span>{directionLabel(dimension.better)}</span>
-        <span className="tnum">
-          previous{" "}
-          <span
-            className="text-foreground"
-            title={rawTitle(dimKey, dimension.previous) || undefined}
-          >
-            {previous}
+        {/* No previous window, no "previous —" (design §2.8). */}
+        {dimension.previous !== null && (
+          <span className="tnum">
+            previous{" "}
+            <span
+              className="text-foreground"
+              title={rawTitle(dimKey, dimension.previous) || undefined}
+            >
+              {previous}
+            </span>
           </span>
-        </span>
+        )}
       </div>
 
       <div className="space-y-1.5 border-t border-surface-border pt-2">
@@ -498,15 +514,18 @@ function DimensionTile({
                   <div
                     key={part.label}
                     className={cx(
-                      "flex min-w-0 items-baseline gap-2 text-caption",
+                      // A long value ("3,123,319,774 tokens · 16,882,810 per
+                      // landing") wraps under its label, which keeps its
+                      // width: the model's name is the row's point (§2.8).
+                      "flex min-w-0 flex-wrap items-baseline gap-x-2 text-caption",
                       group.title && "pl-2",
                     )}
                   >
-                    <dt className="min-w-0 truncate text-muted-foreground" title={part.title ?? part.label}>
+                    <dt className="max-w-full shrink-0 truncate text-muted-foreground" title={part.title ?? part.label}>
                       {part.label}
                     </dt>
                     <dd
-                      className="tnum ml-auto shrink-0 text-right text-foreground"
+                      className="tnum ml-auto min-w-0 max-w-full truncate text-right text-foreground"
                       title={part.title}
                     >
                       {part.value}
