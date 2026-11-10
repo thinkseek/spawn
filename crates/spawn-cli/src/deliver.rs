@@ -1454,15 +1454,12 @@ pub(crate) fn restart_prompt(task: &TaskRow, restart: &Restart) -> String {
 engine (restart {n} of task #{id}, asked by {by}: {reason}). Your previous execution was stopped \
 and its work checkpointed; your workspace and this conversation are as you left them. Check \
 where you were (a command that hung may have to be run differently) and continue task #{id} \
-of mission #{mission}. {REPORT_REMINDER}",
+of mission #{mission}. When it is done, write `{REPORT}` as the task asked, once.",
         id = task.id,
         n = restart.n,
         mission = task.mission_id,
     )
 }
-
-/// The reminder a restarted worker gets about its report.
-const REPORT_REMINDER: &str = "When it is done, write `.spawn/report.md` as the task asked, once.";
 
 /// The next step for a resident not yet told that its latest task was
 /// cancelled: a live one is stopped (once per execution; a stop that fails is
