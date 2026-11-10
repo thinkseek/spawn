@@ -1529,7 +1529,7 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
     if !once {
-        write_pid_file(&integrator.judge.root.clone());
+        write_pid_file(&integrator.judge.root);
     }
     let interval = loop_interval().max(Duration::from_secs(5));
     loop {

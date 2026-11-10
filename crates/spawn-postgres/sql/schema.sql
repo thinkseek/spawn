@@ -1952,6 +1952,10 @@ begin
         -- commit not in the source, main moving under it twice): main and
         -- every baseline stay where they were.
         null;
+    when 'integrator.draining', 'integrator.drained', 'integrator.drain_expired' then
+        -- The integrator's drain (spawn_integrator_record): read from the
+        -- log, folded into no table.
+        null;
     when 'objective.solved' then
         -- The objective's scenario passes at a base commit main already
         -- holds, so no task of it can change anything: the assignment rule
@@ -2923,8 +2927,26 @@ begin
                                       'source.moved', 'source.push_refused',
                                       'task.over_budget', 'objective.solved',
                                       'source.main_red', 'source.main_probe',
-                                      'source.main_green') then
+                                      'source.main_green', 'integrator.draining',
+                                      'integrator.drained', 'integrator.drain_expired') then
         raise exception 'the integrator does not record %', p_record ->> 'type';
+    end if;
+    -- The integrator's own drain (`spawn integrate --drain`, SIGUSR1): its
+    -- start names the tasks whose gates run and its bound; its end, drained
+    -- (every gate recorded and landed) or expired at the bound (naming the
+    -- tasks whose gates it stopped, which record nothing). Folded into no
+    -- table: the dispatcher tells the supervisor of an expired drain.
+    if p_record ->> 'type' like 'integrator.%' then
+        if jsonb_typeof(p_record -> 'bound_s') is distinct from 'number'
+           or (p_record ->> 'bound_s')::numeric not between 1 and 86400
+           or (p_record ->> 'type' <> 'integrator.drained'
+               and (jsonb_typeof(p_record -> 'gates') is distinct from 'array'
+                    or exists (select 1 from jsonb_array_elements(p_record -> 'gates') g
+                                where jsonb_typeof(g) is distinct from 'number'))) then
+            raise exception 'an % names its bound_s (1 to 86400) and, but drained, its gates (task numbers): %',
+                            p_record ->> 'type', p_record;
+        end if;
+        return spawn_control_record(p_record);
     end if;
     -- Main of a source red on a check (docs/fleet-architecture.md §10.3,
     -- "Main is red"): a red names its source, main, check and the shared
