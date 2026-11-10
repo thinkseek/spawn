@@ -1343,6 +1343,33 @@ the tree's own:
   rejection into a host fault, never into an acceptance. (2026-11-07: one e2e
   run that failed under load rejected task 127's 85-minute gate; the same
   tree passes it.)
+- a numbered scenario the base solved that fails on the candidate is
+  judged the same way before it is called a regression (gate.sh "Three
+  classes of a failing regression"; the owner, 2026-11-10, after an owner
+  gate rejected valid work on 028, which failed on main itself at that
+  load): it runs again on the candidate, then on the base, now and never
+  from the cache, once its candidate runs have ended, with nothing else of
+  the gate beside it and on a test server no candidate run used (a second
+  server of the gate's own, from its template). The base passing twice:
+  two failures on the candidate (of two, or of three after a pass) are a
+  candidate failure, rejected with the reason it always had; one failure
+  of three is unstable on the candidate, `cannot_judge` (exit 6), never
+  accepted. The base failing a run: a validator defect, never a
+  rejection. A task's candidate then gets no verdict (exit 6, `host_fault`
+  with the evidence `validator_defect` and the key `validator_defects`),
+  because a base run that follows candidate code may spare a rejection and
+  never accept; the owner's own candidate (`SPAWN_GATE_OWNER_CANDIDATE=1`,
+  which spawn integrate does not pass yet) is judged on the rest and its
+  verdict names the validators (`validator_defects`). On a shared test
+  server a base that fails after the candidate ran is no evidence for
+  either: a host fault. The integrator reads neither new key yet: a
+  task's validator defect is recorded as the host fault it is, with the
+  gate's reason.
+- `<scenarios>/quarantined` (a list like `serial`; the owner's, the tree's
+  copy under the protected paths, in no base cache key) names validators
+  the owner knows are broken: not run as regressions, nor judged on the
+  base for one, and named in every gate's log and verdict (`quarantined`).
+  The task's own scenario is never skipped by it.
 - everything the candidate controls runs in a bubblewrap sandbox (docs/rsi.md
   §4). The verdict is one JSON line that names the base and candidate
   commits it judged; the integrator believes only the verdict file it owns.
