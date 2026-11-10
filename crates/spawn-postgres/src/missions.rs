@@ -26,6 +26,8 @@ from (
            as reassign_from_session,
          (select n.id from mission_tasks n where n.reassign_of = k.id order by n.id limit 1)
            as reassigned_as,
+         (select n.session_id from mission_tasks n where n.reassign_of = k.id order by n.id limit 1)
+           as reassigned_to_session,
          -- A delivered task's latest restart (`task.restarted`): the
          -- dispatcher stops the execution it names and resumes the session.
          case when k.state = 'delivered' then
@@ -114,7 +116,9 @@ from (
          last.type as closed_by, last.reason, last.yield_reason,
          coalesce(last.yielded, false) as yielded,
          (select n.id from mission_tasks n where n.reassign_of = k.id order by n.id limit 1)
-           as reassigned_as
+           as reassigned_as,
+         (select n.session_id from mission_tasks n where n.reassign_of = k.id order by n.id limit 1)
+           as reassigned_to_session
     from latest k
     left join lateral (
       select e.id, (e.kind -> 'detail' -> 'record' ->> 'command_id')::bigint as command_id

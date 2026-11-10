@@ -350,6 +350,9 @@ pub(crate) struct TaskRow {
     /// the reassign's key, not retired.
     #[serde(default)]
     pub(crate) reassigned_as: Option<i64>,
+    /// The session of the worker of that task.
+    #[serde(default)]
+    pub(crate) reassigned_to_session: Option<String>,
     /// A delivered task's latest restart (`task.restarted`).
     #[serde(default)]
     pub(crate) restart: Option<Restart>,
@@ -467,6 +470,9 @@ pub(crate) struct Cancelled {
     /// stopped under the reassign's key ([`reassign_stop_key`]).
     #[serde(default)]
     pub(crate) reassigned_as: Option<i64>,
+    /// The session of the worker of that task.
+    #[serde(default)]
+    pub(crate) reassigned_to_session: Option<String>,
 }
 
 impl Cancelled {
