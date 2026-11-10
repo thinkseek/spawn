@@ -39,7 +39,10 @@
 #   remote registry-accept              unpack a tar of registry files from
 #                                       stdin into this machine's registry
 #                                       (adds and replaces, never deletes: a
-#                                       running gate binds it read-only)
+#                                       running gate binds it read-only), one
+#                                       accept at a time (flock), each file
+#                                       renamed into place whole; the staging
+#                                       a killed accept left is removed
 #
 # <job> is letters, digits, '.', '_' and '-' (deploy/gate-runner.sh makes
 # one per attempt). The root is the directory two levels above this file.
@@ -72,7 +75,8 @@
 # move /sys/fs/cgroup, /proc/meminfo and /proc/mounts, for tests only.
 #
 # POSIX sh. Requires: git, tar, gzip, sha256sum, nice, timeout (coreutils
-# >= 8.5, for --kill-after), and docker or a PostgreSQL bin directory.
+# >= 8.5, for --kill-after), flock (util-linux: registry-accept's lock), and
+# docker or a PostgreSQL bin directory.
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd -P) || {
@@ -233,6 +237,27 @@ cargo_wrapper() {
     fi
 }
 
+# registry_fs: "same" when the registry is on the file system of the cargo
+# home, where registry-accept stages what it receives: it renames each file
+# into place, and a rename puts a whole file there only within one file
+# system (across two, mv copies, and a gate could open half a crate). Else
+# "other (<the directory that is elsewhere>)": the registry itself or a
+# directory one or two levels into it (index, cache, src and each
+# registry's own under them), a mount point or a symlink out of the cargo
+# home. A registry not made yet is made in the cargo home: same.
+registry_fs() {
+    home_dev=$(stat -L -c %d "$cargo_home" 2>/dev/null) || home_dev=""
+    for dir in "$cargo_home/registry" "$cargo_home/registry"/* "$cargo_home/registry"/*/*; do
+        [ -d "$dir" ] || continue
+        dev=$(stat -L -c %d "$dir" 2>/dev/null) || dev=""
+        [ -n "$dev" ] && [ "$dev" = "$home_dev" ] || {
+            echo "other ($dir)"
+            return 0
+        }
+    done
+    echo same
+}
+
 # registry_list <dir>: `<path>\t<size>` of every file under a registry.
 registry_list() {
     [ ! -d "$1" ] || (cd "$1" && find . -type f -printf '%P\t%s\n')
@@ -290,6 +315,7 @@ preflight() {
     tool sha256sum sha256sum --version
     tool nice nice --version
     tool timeout timeout --version
+    tool flock flock --version
     tool bwrap bwrap --version
     tool docker docker --version
     tool rustc rustc -Vv
@@ -313,6 +339,7 @@ preflight() {
     printf 'tmp_fs=%s\n' "$(df -PT /tmp 2>/dev/null | awk 'NR == 2 { print $2 }')"
     printf 'cargo_home=%s\n' "$cargo_home"
     printf 'cargo_wrapper=%s\n' "$(cargo_wrapper)"
+    printf 'registry_fs=%s\n' "$(registry_fs)"
     printf 'pg_image=%s\n' "$cfg_pg_image"
     printf 'pg_bin=%s\n' "$cfg_pg_bin"
     printf 'disk_root=%s\n' "$root"
@@ -503,10 +530,28 @@ registry_accept() {
     # One accept at a time, and each file renamed into place whole: a gate
     # reading a crate keeps the file it opened, and a second dispatch never
     # writes into a file the first one's gate reads (review w1, finding 2).
-    # Staged beside the registry, so every rename stays on one file system;
-    # a crate's .cargo-ok marker goes in last.
+    # Staged beside the registry, so every rename stays on one file system
+    # (refused when the registry is on another: mv would copy, and a gate
+    # could open half a file); a crate's .cargo-ok marker goes in last.
+    fs=$(registry_fs)
+    [ "$fs" = same ] || {
+        echo "gate-runner: the registry is not on the file system of its cargo home $cargo_home: $fs; its files could not be renamed into place whole" >&2
+        exit 2
+    }
     exec 9>"$cargo_home/.gate-runner-registry.lock"
-    flock 9
+    flock 9 || {
+        echo "gate-runner: cannot lock $cargo_home/.gate-runner-registry.lock (flock, of util-linux, is required): nothing accepted" >&2
+        exit 2
+    }
+    # What an accept that was killed left behind. A staging directory is made
+    # and removed with the lock held, so any that is here now, with the lock
+    # ours, belongs to no accept that still runs (one that waits for the lock
+    # has made none yet).
+    for dir in "$cargo_home"/.gate-runner-registry.*; do
+        [ -d "$dir" ] && [ ! -L "$dir" ] || continue
+        rm -rf "$dir"
+        echo "gate-runner: removed $dir, the staging of an accept that was killed" >&2
+    done
     stage=$(mktemp -d "$cargo_home/.gate-runner-registry.XXXXXX")
     tar -xf - -C "$stage" || {
         rm -rf "$stage"
