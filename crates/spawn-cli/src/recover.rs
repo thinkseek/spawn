@@ -2479,10 +2479,7 @@ mod tests {
             recorded,
             ServerSeen::Answers(Some(after))
         ));
-        let other_pid = TerminalServer {
-            pid: 813,
-            ..before
-        };
+        let other_pid = TerminalServer { pid: 813, ..before };
         assert!(server_gone(
             Some(&before),
             recorded,
@@ -2505,7 +2502,11 @@ mod tests {
         // (c) No identity recorded (before this change, or a failed
         // write): gone when the answering server started after the record,
         // not gone when it started before.
-        assert!(server_gone(None, recorded, ServerSeen::Answers(Some(after))));
+        assert!(server_gone(
+            None,
+            recorded,
+            ServerSeen::Answers(Some(after))
+        ));
         assert!(!server_gone(
             None,
             recorded,
@@ -2513,7 +2514,11 @@ mod tests {
         ));
         // A host that cannot tell which server answers keeps today's rule:
         // a crash, never a restart it cannot show.
-        assert!(!server_gone(Some(&before), recorded, ServerSeen::Answers(None)));
+        assert!(!server_gone(
+            Some(&before),
+            recorded,
+            ServerSeen::Answers(None)
+        ));
         assert!(!server_gone(None, recorded, ServerSeen::Answers(None)));
     }
 

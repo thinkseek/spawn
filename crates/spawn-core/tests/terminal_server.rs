@@ -11,9 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use spawn_core::bridge::{Bridge, BridgeConfig, TickReport};
 use spawn_core::command::{CommandAction, Submission};
-use spawn_core::event::{
-    Appended, ENGINE, EventKind, EventRecord, GlobalPosition, NewEvent,
-};
+use spawn_core::event::{Appended, ENGINE, EventKind, EventRecord, GlobalPosition, NewEvent};
 use spawn_core::id::{
     AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
 };
