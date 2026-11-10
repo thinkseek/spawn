@@ -65,7 +65,11 @@
 # rustc-wrapper it does not have, or whose memory is under the floor; and it
 # sends the runner whatever files of this host's cargo registry it lacks (the
 # gate builds offline from the registry: a crate missing there is a rejection
-# here of work this host accepts).
+# here of work this host accepts). The runner puts them in place under a
+# lock, each renamed whole from a staging directory in its cargo home: a
+# runner without flock, or (when a registry is to be sent) one whose registry
+# is on another file system than its cargo home, is refused too (exit 3).
+# `--check` sends the registry as a dispatch does, before it asks for keys.
 #
 # Nothing here needs the live fleet: the runner gets its own server, its
 # own scratch and no database URL (a URL never goes on a command line, and
@@ -313,6 +317,20 @@ require_runner() {
     there=$(pv "$report" version)
     [ "$there" = "$local_remote_sha" ] ||
         die "the runner's helper is another version ($there, this tree's $local_remote_sha): rerun deploy/gate-runner/setup.sh there" 3
+    # After the version: a helper that predates the report of flock is
+    # another version, and is told so above.
+    case "$(pv "$report" flock)" in
+    "" | missing | unreadable)
+        die "the runner lacks flock (util-linux): its registry-accept takes a lock, so that two dispatches never write its cargo registry at once (deploy/gate-runner/README.md)" 3
+        ;;
+    esac
+    if [ -n "$registry_src" ]; then
+        case "$(pv "$report" registry_fs)" in
+        same) ;;
+        "") die "the runner reports no registry_fs (its helper predates the check)" 3 ;;
+        *) die "the runner's cargo registry is not on the file system of its cargo home $(pv "$report" cargo_home): $(pv "$report" registry_fs); the registry files it lacks could not be renamed into place whole, and a gate there could read half a crate" 3 ;;
+        esac
+    fi
     # The environment the gate judges in (the header): not the host's
     # files, no build that cannot start, room in memory.
     case "$(pv "$report" host_shares)" in
@@ -501,7 +519,7 @@ if [ "$check" = 1 ]; then
     "") report "root" FAIL "the runner reports no root" ;;
     *) report "root" ok "$(pv "$reportlines" root)" ;;
     esac
-    for name in git tar gzip sha256sum nice timeout bwrap; do
+    for name in git tar gzip sha256sum nice timeout flock bwrap; do
         value=$(pv "$reportlines" "$name")
         case $value in "" | missing | unreadable) report "$name" FAIL "missing" ;; *) report "$name" ok "$value" ;; esac
     done
@@ -547,11 +565,16 @@ if [ "$check" = 1 ]; then
     *) report "cargo" ok "rustc-wrapper $(pv "$reportlines" cargo_wrapper), home $(pv "$reportlines" cargo_home)" ;;
     esac
     if [ -n "$registry_src" ] && [ -d "$registry_src" ]; then
-        if registry_missing "$stage_dir/registry.need"; then
-            report "registry" ok "$(wc -l <"$stage_dir/registry.need") file(s) of this host's to send at dispatch"
-        else
-            report "registry" FAIL "the runner could not list its registry: $(head -n 1 "$stage_dir/registry.need.err" 2>/dev/null)"
-        fi
+        case "$(pv "$reportlines" registry_fs)" in
+        same)
+            if registry_missing "$stage_dir/registry.need"; then
+                report "registry" ok "$(wc -l <"$stage_dir/registry.need") file(s) of this host's to send (sent below, before the keys are asked)"
+            else
+                report "registry" FAIL "the runner could not list its registry: $(head -n 1 "$stage_dir/registry.need.err" 2>/dev/null)"
+            fi
+            ;;
+        *) report "registry" FAIL "not on the file system of its cargo home $(pv "$reportlines" cargo_home): $(pv "$reportlines" registry_fs) (files could not be renamed into place whole)" ;;
+        esac
     fi
     controller_lock=""
     [ ! -f "$controller/web/pnpm-lock.yaml" ] ||
@@ -576,6 +599,12 @@ if [ "$check" = 1 ]; then
         say "$prog: the runner is not ready (above); not asking it for keys"
         exit 1
     fi
+
+    # The registry first, as before a dispatch: `gate.sh --base-keys` runs
+    # the static checks, whose `cargo metadata --offline` needs every crate,
+    # so a fresh runner would fail the keys below for a cause the report
+    # does not name (review w1, finding 3). A sync that fails is exit 3.
+    sync_registry
 
     # The keys: the runner's from the shipped gate, this host's from the
     # same script under the gate environment the integrator gives a gate
