@@ -635,6 +635,6 @@ test("a 3-day digest holds an alert that fired and cleared 2 days ago (rev-f F1)
 test("a source away from this host has its own title in Needs you (P12)", () => {
   assert.equal(
     alertTitle({ kind: "source_away", subject: "mission #4" }),
-    "A mission's source is missing on this host · mission #4",
+    "A mission's source is not a directory on this host · mission #4",
   );
 });
