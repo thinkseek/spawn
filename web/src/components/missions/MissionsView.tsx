@@ -121,11 +121,8 @@ export function MissionsBody({ data }: { data: Missions }) {
             <ApprovalQueue residents={data.residents} />
           </div>
         )}
-        {data.holds.length > 0 && (
-          <div className="shrink-0 px-3 pt-3 sm:px-4 sm:pt-4">
-            <SourceHolds data={data} />
-          </div>
-        )}
+        {/* A held source is one line on its mission's row; home's "Needs
+            you" carries it while a task waits behind it. */}
         {data.missions.length === 0 ? (
           <div className="flex flex-col">
             <div className="px-4 pt-2 sm:px-5">{toggle}</div>
@@ -137,7 +134,7 @@ export function MissionsBody({ data }: { data: Missions }) {
           </div>
         ) : (
           <Suspense fallback={<div className="min-h-0 flex-1" />}>
-            <MissionTimeline missions={data.missions} header={toggle} />
+            <MissionTimeline missions={data.missions} header={toggle} holds={data.holds} />
           </Suspense>
         )}
       </div>

@@ -92,6 +92,7 @@ mod scorecard;
 mod sessions;
 mod wake;
 
+pub use gateway::HumanKey;
 pub use missions::{ActivityEvent, LandingHold, PushRequest};
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,

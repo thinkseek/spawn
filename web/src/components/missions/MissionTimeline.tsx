@@ -1,6 +1,6 @@
-import { Ban, Check, ChevronRight, FoldHorizontal, OctagonAlert, RotateCcw } from "lucide-react";
+import { Ban, CalendarClock, Check, ChevronRight, CircleHelp, FoldHorizontal, Lock, OctagonAlert, RotateCcw } from "lucide-react";
 import { AnimatePresence, useReducedMotion } from "motion/react";
-import { useCallback, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, MouseEvent, PointerEvent, ReactNode } from "react";
 
 import { clockTime, formatDuration } from "../../format";
@@ -8,10 +8,17 @@ import {
   PHASE_LABEL,
   STATE_FILTERS,
   deriveMissionTimeline,
+  earlierLabel,
   filterLanes,
   hasBars,
+  holdText,
+  holdTitle,
   isLive,
+  laneLifetimeText,
+  laneToday,
+  laneTodayText,
   phaseAt,
+  splitEarlier,
 } from "../../missionTimeline";
 import type {
   Lane,
@@ -21,17 +28,20 @@ import type {
   VerdictMark,
   VerdictReasons,
 } from "../../missionTimeline";
+import type { SourceHold } from "../../attention";
 import type { Mission } from "../../missions";
 import type { TaskSection } from "../../ordering";
 import { SECTION_LABEL, groupTasks, missionClass, taskTitle } from "../../ordering";
-import { LINEAR, foldIdle } from "../../timeFold";
-import { fitDomain } from "../../timeWindow";
+import { TODAY_MS } from "../../home";
+import { LINEAR, foldIdleSteady, sameFoldMap } from "../../timeFold";
+import { fitDomain, todayWindow } from "../../timeWindow";
 import { Overview } from "../timeaxis/Overview";
 import type { OverviewLine } from "../timeaxis/Overview";
 import {
   AxisRow,
   BreakBands,
   FloatingTip,
+  IconButton,
   Gridlines,
   LiveTail,
   NowLine,
@@ -42,6 +52,7 @@ import {
 } from "../timeaxis/TimeAxis";
 import {
   useDragPan,
+  useNowEvery,
   useNowWhile,
   useTimeWindow,
   useWheelZoom,
@@ -56,6 +67,9 @@ const LANE_H = 40;
 const SECTION_H = 24;
 const ROW_H = 34;
 const ATTEMPT_H = 28;
+/** How long the window rests before the rows fold to its edge (P10): a pan
+ * or a zoom in progress never moves rows under the pointer. */
+const EDGE_SETTLE_MS = 150;
 const BAR_H = 14;
 const RADIUS = 4;
 /** Gap between a bar's segments, in the surface colour. */
@@ -87,6 +101,20 @@ type Row =
       outcome: string | null;
       /** Attempts at the row's objective, this one included. */
       retries: number;
+      /** It ended before the window (P10), shown on the reader's ask: dimmed. */
+      dim: boolean;
+    }
+  | {
+      /** The section's tasks that ended before the window, folded (P10). */
+      kind: "earlier";
+      key: string;
+      lane: Lane;
+      count: number;
+      label: string;
+      y: number;
+      h: number;
+      /** The reader opened it: the tasks follow, dimmed. */
+      shown: boolean;
     };
 
 interface Hover {
@@ -109,6 +137,7 @@ export function MissionTimeline({
   compact = false,
   onSelectTask,
   selectedTask = null,
+  holds = [],
 }: {
   missions: readonly Mission[];
   header: ReactNode;
@@ -116,6 +145,8 @@ export function MissionTimeline({
   compact?: boolean;
   onSelectTask?: (task: number) => void;
   selectedTask?: number | null;
+  /** The owner's holds on sources: a held one shows on its mission's row. */
+  holds?: readonly SourceHold[];
 }) {
   const reduceMotion = useReducedMotion() ?? false;
   const ids = useId();
@@ -124,6 +155,10 @@ export function MissionTimeline({
   const all = useMemo(() => deriveMissionTimeline(missions, Date.now(), reasons), [missions, reasons]);
   const live = isLive(all);
   const now = useNowWhile(live);
+  // The headers' words ("in 24 h", "2 h ago", "expires in") age on a quiet
+  // page too: their own clock ticks each minute whether or not a bar is open.
+  const minute = useNowEvery(60_000);
+  const clock = Math.max(now, minute);
   // Ordering and extent depend on now only through open bars.
   const timeline = useMemo(
     () => (all.openCount > 0 ? deriveMissionTimeline(missions, now, reasons) : all),
@@ -147,6 +182,12 @@ export function MissionTimeline({
   };
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [hover, setHover] = useState<Hover | null>(null);
+  const [legendOpen, setLegendOpen] = useState(false);
+  // The window's left edge once it rests (real time), or null while the
+  // window reaches back to the first task; and the folded rows the reader
+  // opened, by section key (P10).
+  const [edge, setEdge] = useState<number | null>(null);
+  const [earlierShown, setEarlierShown] = useState<ReadonlySet<string>>(() => new Set());
 
   const lanes = useMemo(
     () => filterLanes(timeline.lanes, missionFilter, stateFilter),
@@ -194,40 +235,70 @@ export function MissionTimeline({
         });
         y += SECTION_H;
         if (sectionFolded) continue;
-        for (const group of groups) {
-          list.push({
-            kind: "task",
-            key: group.item.key,
-            lane,
-            bar: group.item,
-            y,
-            h: ROW_H,
-            depth: 0,
-            title: taskTitle(group.task, { missionName: lane.name }),
-            outcome: null,
-            retries: group.earlier.length + 1,
-          });
-          y += ROW_H;
-          for (const attempt of group.earlier) {
+        // Tasks that ended before the window show no bar: they fold into
+        // one row at the section's end (its oldest). Opened, they follow it,
+        // dimmed. While it is closed, a group holding the selected task stays
+        // out of it (its row and panel stay in view); once it is open, the
+        // selection keeps its place among the dimmed rows, so a click never
+        // moves a row and the arrows walk them all.
+        const earlierKey = `${sectionKey}:earlier`;
+        const opened = earlierShown.has(earlierKey);
+        const split = splitEarlier(groups, edge, (group) =>
+          !opened && holdsSelection([group.item, ...group.earlier.map((attempt) => attempt.item)]),
+        );
+        const pushGroups = (from: typeof groups, dim: boolean) => {
+          for (const group of from) {
             list.push({
               kind: "task",
-              key: attempt.item.key,
+              key: group.item.key,
               lane,
-              bar: attempt.item,
+              bar: group.item,
               y,
-              h: ATTEMPT_H,
-              depth: 1,
-              title: null,
-              outcome: attempt.outcome,
-              retries: 1,
+              h: ROW_H,
+              depth: 0,
+              title: taskTitle(group.task, { missionName: lane.name }),
+              outcome: null,
+              retries: group.earlier.length + 1,
+              dim,
             });
-            y += ATTEMPT_H;
+            y += ROW_H;
+            for (const attempt of group.earlier) {
+              list.push({
+                kind: "task",
+                key: attempt.item.key,
+                lane,
+                bar: attempt.item,
+                y,
+                h: ATTEMPT_H,
+                depth: 1,
+                title: null,
+                outcome: attempt.outcome,
+                retries: 1,
+                dim,
+              });
+              y += ATTEMPT_H;
+            }
           }
+        };
+        pushGroups(split.current, false);
+        if (split.earlier.length > 0 && edge !== null) {
+          list.push({
+            kind: "earlier",
+            key: earlierKey,
+            lane,
+            count: split.earlier.length,
+            label: earlierLabel(split.earlier.length, edge, Date.now()),
+            y,
+            h: ATTEMPT_H,
+            shown: opened,
+          });
+          y += ATTEMPT_H;
+          if (opened) pushGroups(split.earlier, true);
         }
       }
     }
     return { list, height: y };
-  }, [lanes, folded, compact]);
+  }, [lanes, folded, compact, edge, earlierShown, holdsSelection]);
 
   // The axis spans what the filters show, so one mission fills the width.
   const shown = useMemo(() => {
@@ -246,7 +317,7 @@ export function MissionTimeline({
   const [folding, setFolding] = useStoredChoice("spawn.missions.fold", ["on", "off"] as const, "on");
   const fold = useMemo(() => {
     if (folding === "off") return LINEAR;
-    return foldIdle(shown.bars.map((bar) => [bar.start, bar.end ?? shown.end] as const));
+    return foldIdleSteady(shown.bars.map((bar) => [bar.start, bar.end ?? shown.end] as const));
   }, [folding, shown]);
   const extent = useMemo(
     () => fitDomain({ start: fold.fold(shown.start), end: fold.fold(shown.end) }),
@@ -265,8 +336,49 @@ export function MissionTimeline({
   const px = useCallback((time: number) => viewPx(fold.fold(time)), [viewPx, fold]);
   useWheelZoom(scrollRef, view, labelW);
   const pan = useDragPan(view);
+  // The rows fold to the window's left edge once it rests (P10). A window
+  // that reaches back to the first task folds nothing.
+  const leftEdge = fold.unfold(domain.from);
+  const edgeTarget = leftEdge > shown.start ? leftEdge : null;
+  useEffect(() => {
+    // `pan.dragging` reads a ref (no render marks a drag's end), so the
+    // timer asks it when it fires, and waits again while a drag is held.
+    let timer: ReturnType<typeof setTimeout>;
+    const settle = () => {
+      if (pan.dragging) timer = setTimeout(settle, EDGE_SETTLE_MS);
+      else setEdge(edgeTarget);
+    };
+    timer = setTimeout(settle, EDGE_SETTLE_MS);
+    return () => clearTimeout(timer);
+  }, [edgeTarget, pan]);
   const ticks = useTicks(domain, plotW, fold);
   const breaks = useBreaks(domain, plotW, fold);
+  // The window is kept on the folded axis; when the fold's map changes (the
+  // Linear toggle, a filter, a new break or band width), move it to the
+  // same real times on the new one, before the frame is drawn (as the
+  // session trace does).
+  const shownFold = useRef(fold);
+  const { refold, since } = view;
+  useLayoutEffect(() => {
+    const old = shownFold.current;
+    if (sameFoldMap(old, fold)) return;
+    shownFold.current = fold;
+    refold((time) => fold.fold(old.unfold(time)));
+  }, [fold, refold]);
+  // Today, the last 24 h (design §4.4): the first window, and the Today
+  // button's (t). Fit (0) widens to every task.
+  const today = useCallback(() => {
+    const win = todayWindow(fold.fold, shown, Date.now(), TODAY_MS);
+    if (win.mode === "since") since(win.from);
+    else view.fit();
+  }, [fold, shown, since, view]);
+  const opened = useRef(false);
+  useLayoutEffect(() => {
+    if (opened.current || plotW <= 0 || shown.bars.length === 0) return;
+    opened.current = true;
+    const win = todayWindow(fold.fold, shown, Date.now(), TODAY_MS);
+    if (win.mode === "since") since(win.from);
+  }, [plotW, shown, fold, since]);
 
   const overviewLines = useMemo<OverviewLine[]>(() => {
     const bars = shown.bars;
@@ -291,6 +403,10 @@ export function MissionTimeline({
   const zoomToBar = (bar: TaskBar) =>
     view.zoomTo(fold.fold(bar.start), fold.fold(bar.end ?? now));
   const choose = (row: Row) => {
+    if (row.kind === "earlier") {
+      toggleEarlier(row.key);
+      return;
+    }
     if (row.kind !== "task") {
       toggleFold(row.key, row.folded);
       return;
@@ -301,6 +417,12 @@ export function MissionTimeline({
   };
   const toggleFold = (key: string, wasFolded: boolean) =>
     setFolds((current) => new Map(current).set(key, !wasFolded));
+  const toggleEarlier = (key: string) =>
+    setEarlierShown((current) => {
+      const next = new Set(current);
+      if (!next.delete(key)) next.add(key);
+      return next;
+    });
 
   const locate = (event: PointerEvent | MouseEvent) => {
     const rect = rowsRef.current!.getBoundingClientRect();
@@ -386,6 +508,9 @@ export function MissionTimeline({
       case "0":
         view.fit();
         break;
+      case "t":
+        today();
+        break;
     }
   };
 
@@ -400,7 +525,24 @@ export function MissionTimeline({
     <div ref={rootRef} className="relative flex min-h-0 flex-1 flex-col">
       <div className="flex min-h-11 shrink-0 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2 sm:px-5">
         {header}
-        {!empty && <Legend />}
+        {/* The phases' colours are read once: behind a "?" (design §2.3). */}
+        {!empty && (
+          <button
+            type="button"
+            aria-expanded={legendOpen}
+            aria-label="What the colours mean"
+            title="What the colours mean"
+            onClick={() => setLegendOpen((open) => !open)}
+            className={cx(
+              "inline-flex size-7 items-center justify-center rounded-md text-faint-foreground hover:bg-surface-hover hover:text-foreground",
+              legendOpen && "text-foreground",
+              FOCUS_RING,
+            )}
+          >
+            <CircleHelp size={14} />
+          </button>
+        )}
+        {!empty && legendOpen && <Legend />}
         {!empty && (
           <div className="ml-auto flex items-center gap-1">
             {fold !== LINEAR || folding === "off" ? (
@@ -422,7 +564,15 @@ export function MissionTimeline({
                 {folding === "on" ? "Idle folded" : "Linear"}
               </button>
             ) : null}
-            <ZoomControls view={view} fitLabel="Fit every task" />
+            <ZoomControls view={view} fitLabel="Fit every task">
+              <IconButton
+                label="Today: the last 24 h, following the live end (t)"
+                onClick={today}
+                active={view.follow.mode === "since"}
+              >
+                <CalendarClock size={13} />
+              </IconButton>
+            </ZoomControls>
           </div>
         )}
       </div>
@@ -518,7 +668,16 @@ export function MissionTimeline({
                     style={{ height: rows.height }}
                   >
                     {rows.list.map((row) =>
-                      row.kind === "lane" ? null : row.kind === "section" ? (
+                      row.kind === "lane" ? null : row.kind === "earlier" ? (
+                        <EarlierRowLabel
+                          key={row.key}
+                          row={row}
+                          labelW={labelW}
+                          short={labelW < 200}
+                          onSurface={compact}
+                          onToggle={() => toggleEarlier(row.key)}
+                        />
+                      ) : row.kind === "section" ? (
                         <SectionRowLabel
                           key={row.key}
                           row={row}
@@ -572,17 +731,18 @@ export function MissionTimeline({
                         {rows.list.map((row) =>
                           row.kind === "lane" ? (
                             <LaneBand key={row.key} row={row} px={px} now={now} />
-                          ) : row.kind === "section" ? null : (
-                            <Bar
-                              key={row.key}
-                              bar={row.bar}
-                              cy={row.y + row.h / 2 + (row.depth === 0 ? 3 : 1)}
-                              px={px}
-                              plotW={plotW}
-                              now={now}
-                              ids={ids}
-                              hovered={hover?.key === row.key ? hover.verdict : null}
-                            />
+                          ) : row.kind === "section" || row.kind === "earlier" ? null : (
+                            <g key={row.key} opacity={row.dim ? 0.45 : undefined}>
+                              <Bar
+                                bar={row.bar}
+                                cy={row.y + row.h / 2 + (row.depth === 0 ? 3 : 1)}
+                                px={px}
+                                plotW={plotW}
+                                now={now}
+                                ids={ids}
+                                hovered={hover?.key === row.key ? hover.verdict : null}
+                              />
+                            </g>
                           ),
                         )}
                       </g>
@@ -594,6 +754,8 @@ export function MissionTimeline({
                         <LaneLabel
                           key={row.key}
                           row={row}
+                          now={clock}
+                          hold={holds.find((hold) => hold.hold === row.lane.mission.hold) ?? null}
                           collapsed={row.folded}
                           onToggle={() => toggleFold(row.key, row.folded)}
                         />
@@ -652,7 +814,7 @@ function scrollIntoView(element: HTMLElement | null, top: number, height: number
 
 function Legend() {
   return (
-    <ul className="hidden min-w-0 flex-wrap items-center gap-x-3 gap-y-1 md:flex" aria-label="Phases">
+    <ul className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1" aria-label="Phases">
       {PHASE_LEGEND.map((entry) => (
         <li key={entry.label} className="flex items-center gap-1.5 text-caption text-muted-foreground">
           <span
@@ -777,6 +939,56 @@ const SECTION_SHORT: Record<TaskSection, string> = {
   cancelled: "Cancelled",
 };
 
+/** The folded row of a section's tasks that ended before the window (P10):
+ * "25 tasks ended before Mon 18:00"; a click shows them, dimmed, below it,
+ * and another folds them again. */
+function EarlierRowLabel({
+  row,
+  labelW,
+  short,
+  onSurface,
+  onToggle,
+}: {
+  row: Extract<Row, { kind: "earlier" }>;
+  labelW: number;
+  /** A narrow label column (a phone): "28 earlier", the whole words in the
+   * title and the accessible name. */
+  short: boolean;
+  onSurface: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div
+      role="treeitem"
+      aria-level={3}
+      aria-expanded={row.shown}
+      className="pointer-events-none absolute inset-x-0 flex items-center pl-9"
+      style={{ top: row.y, height: row.h }}
+      onPointerDown={(event) => event.stopPropagation()}
+    >
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-label={row.label}
+        title={`${row.label}: ${row.shown ? "fold them again" : "show them, dimmed; Fit (0) shows their bars"}`}
+        className={cx(
+          "pointer-events-auto inline-flex min-w-0 items-center gap-1.5 rounded px-1 text-micro text-faint-foreground hover:text-foreground",
+          onSurface ? "bg-surface" : "bg-page-canvas",
+          FOCUS_RING,
+        )}
+        style={{ maxWidth: Math.max(0, labelW - 44) }}
+      >
+        <ChevronRight
+          size={11}
+          aria-hidden="true"
+          className={cx("shrink-0 transition-transform duration-150 motion-reduce:transition-none", row.shown && "rotate-90")}
+        />
+        <span className="tnum truncate">{short ? `${row.count} earlier` : row.label}</span>
+      </button>
+    </div>
+  );
+}
+
 function SectionRowLabel({
   row,
   short,
@@ -830,16 +1042,24 @@ const LANE_STATE: Record<Lane["state"], { label: string; dot: string; text: stri
 
 function LaneLabel({
   row,
+  now,
+  hold,
   collapsed,
   onToggle,
 }: {
   row: Extract<Row, { kind: "lane" }>;
+  now: number;
+  /** Its source's hold, when the owner holds it. */
+  hold: SourceHold | null;
   collapsed: boolean;
   onToggle: () => void;
 }) {
   const { lane } = row;
   const state = LANE_STATE[lane.state];
-  const counts = lane.counts;
+  // Its day, not its lifetime (design §2.3); the totals are in the title.
+  const day = laneToday(lane, now);
+  const today = laneTodayText(day, now);
+  const lifetime = laneLifetimeText(lane.counts);
   return (
     <div
       role="treeitem"
@@ -879,15 +1099,18 @@ function LaneLabel({
             </span>
           )}
         </span>
-        <span className="tnum hidden shrink-0 text-caption text-faint-foreground sm:inline">
-          {lane.mission.gate ? `accept ${lane.mission.accept === "gate" ? "gate" : "review → gate"}` : "review"}
-          {" · "}
-          {counts.total} task{counts.total === 1 ? "" : "s"}
-          {counts.landed > 0 && ` · ${counts.landed} landed`}
-          {counts.open > 0 && ` · ${counts.open} open`}
-          {counts.sentBack > 0 && ` · ${counts.sentBack} sent back`}
-          {counts.cancelled > 0 && ` · ${counts.cancelled} cancelled`}
+        <span
+          className="tnum hidden min-w-0 truncate text-caption text-muted-foreground sm:inline"
+          title={`${today}${day.lastBack?.reason ? `\n\n${day.lastBack.reason}\n` : ""}\n${lifetime}\naccepted by ${lane.mission.gate ? (lane.mission.accept === "gate" ? "the gate" : "review, then the gate") : "review"}`}
+        >
+          {today}
         </span>
+        {hold && (
+          <span className="flex shrink-0 items-center gap-1 text-caption text-warning" title={holdTitle(hold, now)}>
+            <Lock size={11} aria-hidden="true" />
+            {holdText(hold, now)}
+          </span>
+        )}
       </button>
     </div>
   );
@@ -927,6 +1150,8 @@ function TaskLabel({
       className={cx(
         "absolute inset-x-0 flex items-center transition-colors duration-150 motion-reduce:transition-none",
         selected ? "bg-surface-selected" : hovered ? "bg-surface-hover" : "",
+        // Ended before the window, shown on the reader's ask (P10).
+        row.dim && "opacity-55",
       )}
       style={{ top: row.y, height: row.h }}
     >

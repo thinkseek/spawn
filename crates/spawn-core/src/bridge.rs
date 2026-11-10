@@ -100,7 +100,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::command::{Claimed, CommandAction, Outcome};
+use crate::command::{Claimed, CommandAction, NamedKey, Outcome};
 use crate::event::{
     ArtifactRef, CheckpointReason, CommandStep, ENGINE, EndCause, EventKind, EventRecord, Fork,
     GlobalPosition, ModelProfile, NewEvent, Source,
@@ -400,10 +400,15 @@ struct Follow {
     /// clock: a stalled end retries every [`END_RETRY_MS`].
     end_tried_at: Option<i64>,
     /// When the end's kill last failed (the runner outlived it), by the
-    /// Bridge's clock: the kill blocks the Bridge's loop for its whole wait
-    /// (TerminalHost::terminate), so it is tried again only after
+    /// Bridge's clock: a kill waits up to its bound for the runner's
+    /// processes (TerminalHost::terminate), so it is tried again only after
     /// [`END_RETRY_MS`], discard or not (rev-f on 204d1a1f).
     kill_failed_at: Option<i64>,
+    /// The end's kill, running off the Bridge's loop while it waits for the
+    /// engine's processes to exit ([`TerminalHost::terminate_waits`]):
+    /// each end attempt reads whether it is done; until then the end is
+    /// pending, which is no failure.
+    killing: Option<Killing>,
     /// The workspace answered [`WORKSPACE_STALE`] with this message: it
     /// cannot checkpoint to its branch again, and its state is kept off it,
     /// so the execution is ended (and its workspace unmounted) instead of
@@ -417,6 +422,27 @@ struct Follow {
     /// end record's `evidence`.
     evidence: Option<String>,
 }
+
+/// A kill of an execution's terminal running on a thread of its own
+/// ([`Bridge::kill`]): its result and how long it waited, once it is done.
+#[derive(Clone)]
+struct Killing {
+    done: Arc<(std::sync::Mutex<Option<Killed>>, std::sync::Condvar)>,
+}
+
+/// A kill's result and its wait.
+type Killed = (Result<(), TerminalError>, std::time::Duration);
+
+impl std::fmt::Debug for Killing {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Killing")
+    }
+}
+
+/// How long an end waits in line for a kill run off the loop before it
+/// leaves it running and goes on: a terminal already gone (its processes
+/// exited) is done well within it, so its end finishes in the same tick.
+const KILL_IN_LINE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The watch on an execution's files ([`FileWatch`]).
 #[derive(Debug, Clone)]
@@ -517,6 +543,20 @@ struct Steps {
     typing_at: Option<GlobalPosition>,
     /// The typing succeeded.
     typed: bool,
+    /// How far the command's key went (a key command's steps).
+    press: Press,
+}
+
+/// How far a key command's key went, by its steps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Press {
+    /// Nothing recorded: the key is due.
+    #[default]
+    Due,
+    /// `pressing` recorded and no `pressed`: it may have reached the pane.
+    Pressing,
+    /// `pressed`: it was sent.
+    Pressed,
 }
 
 /// What a retried command's typing comes to ([`SessionView::typing`]).
@@ -558,6 +598,14 @@ impl SessionView {
                             .waiting
                             .insert(*command_id, event.execution_id.clone());
                     }
+                    // A key's steps say nothing of the session's inputs:
+                    // no input was typed, and none waits for an answer.
+                    CommandStep::Pressing => {
+                        if steps.press == Press::Due {
+                            steps.press = Press::Pressing;
+                        }
+                    }
+                    CommandStep::Pressed => steps.press = Press::Pressed,
                 }
             }
             EventKind::CommandFinished { command_id, .. } => {
@@ -673,6 +721,9 @@ pub struct TickReport {
     pub commands: usize,
     /// Non-fatal problems, for example a failed commit.
     pub warnings: Vec<String>,
+    /// What the Bridge measured and says for the log, not a problem: how
+    /// long each end's kill waited for the engine's processes to exit.
+    pub notes: Vec<String>,
 }
 
 /// Agent Bridge.
@@ -711,6 +762,52 @@ pub struct Bridge {
     /// killed terminal is then seen on the next pass without a tmux call per
     /// agent. `None` asks each terminal when the execution is advanced.
     runners: Option<HashMap<TerminalName, Runner>>,
+    /// The threads of the kills run off the loop ([`Bridge::kill`]), until
+    /// they are done: a Bridge that goes away (the loop's clean exit, a
+    /// Bridge built again after a store outage) waits for them on drop,
+    /// up to [`KILL_DRAIN`]. A kill abandoned mid-wait is lost for good: the
+    /// host reads the session's processes once, before it kills the
+    /// session, so a later kill of the same terminal finds it gone and
+    /// waits for nothing (rev-e on 471e29d8).
+    kill_threads: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Notes of a report the tick does not see ([`Bridge::abandon`] ends
+    /// on a report of its own): given to the tick's report at the end of
+    /// [`Bridge::work`].
+    stray_notes: Vec<String>,
+}
+
+/// How long a Bridge that goes away waits for its kills still under way
+/// ([`Bridge::kill_threads`]): longer than a host's kill takes at its bound
+/// (tmux: 5 s for the session's processes, SIGKILL, 2 s more).
+const KILL_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl Drop for Bridge {
+    fn drop(&mut self) {
+        let threads = std::mem::take(
+            &mut *self
+                .kill_threads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let deadline = std::time::Instant::now() + KILL_DRAIN;
+        let mut left = 0;
+        for thread in threads {
+            while !thread.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            } else {
+                left += 1;
+            }
+        }
+        if left > 0 {
+            eprintln!(
+                "bridge: {left} kill(s) still waiting for their processes after {} s; left running",
+                KILL_DRAIN.as_secs()
+            );
+        }
+    }
 }
 
 /// What [`Bridge::settle`] did with an open execution no runner runs.
@@ -720,6 +817,10 @@ enum Settled {
     /// Its end could not finish this tick (its final checkpoint failed): it
     /// stays due, and the command fails with why.
     Ending(String),
+    /// Its end waits for its kill, off the loop ([`Bridge::kill`]): the
+    /// command waits too, and is claimed again after
+    /// [`BridgeConfig::input_wait_retry`].
+    Pending,
 }
 
 /// What handling a claimed command came to.
@@ -756,6 +857,8 @@ impl Bridge {
             touched: HashSet::new(),
             backstops: std::sync::atomic::AtomicUsize::new(0),
             runners: None,
+            kill_threads: std::sync::Mutex::new(Vec::new()),
+            stray_notes: Vec::new(),
         }
     }
 
@@ -777,6 +880,29 @@ impl Bridge {
     /// Sessions the Bridge tracks.
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Whether an execution's end waits for its kill, run off the loop
+    /// ([`Bridge::kill`]): the end, and the stop that asked for it, finish
+    /// at a later tick. A one-shot caller (`spawn tick`) ticks again until
+    /// none does, so it finishes what it claimed, as the loop does over its
+    /// next passes.
+    pub fn ends_pending(&self) -> bool {
+        // A stop or discard left waiting for its end: the end may be done
+        // already (a tick's own pass reads the kill), while the command is
+        // claimed again only after `input_wait_retry`.
+        let stop_waits = self.held.values().any(|claimed| {
+            matches!(
+                claimed.action(),
+                Ok(CommandAction::Stop | CommandAction::Discard)
+            )
+        });
+        stop_waits
+            || self.sessions.values().any(|view| {
+                view.active
+                    .as_ref()
+                    .is_some_and(|active| active.follow.killing.is_some())
+            })
     }
 
     /// Rebuild state from the whole log.
@@ -999,6 +1125,7 @@ impl Bridge {
                 self.queue.release(claimed, self.config.input_wait_retry)?;
             }
         }
+        report.notes.append(&mut self.stray_notes);
         let left = report.commands >= self.config.max_commands_per_tick;
         Ok((report, left))
     }
@@ -1785,7 +1912,10 @@ impl Bridge {
     /// Kill, final checkpoint, unmount, then `execution.ended`. Returns
     /// false when the terminal's runner outlived its kill or the final
     /// checkpoint failed; the execution then stays active, its workspace
-    /// mounted, and the next tick tries the same end again.
+    /// mounted, and the next tick tries the same end again. It is false too
+    /// while the kill still waits off the loop for the engine's processes
+    /// ([`Self::kill`]; `active.follow.killing` is then set): the end is
+    /// pending, not failed, and the next attempt goes on from it.
     ///
     /// The kill comes first, and returns only once the runner and every
     /// process it started have exited ([`TerminalHost::terminate`]): an
@@ -1822,10 +1952,10 @@ impl Bridge {
                 return Ok(false);
             }
             // A restart may find the engine's terminal still there.
-            if let Err(error) = self
-                .terminals
-                .terminate(&active.terminal(), &active.workspace)
-            {
+            let Some(killed) = self.kill(session, active, report) else {
+                return Ok(false);
+            };
+            if let Err(error) = killed {
                 active.follow.kill_failed_at = Some(self.clock.now().0);
                 report
                     .warnings
@@ -1855,18 +1985,20 @@ impl Bridge {
             return Ok(false);
         }
         // A runner that outlived its last kill: the next waits, so a runner
-        // that will not die holds the loop once per END_RETRY_MS, not every
-        // tick.
+        // that will not die is killed (and waited for, off the loop) once
+        // per END_RETRY_MS, not every tick.
         if self.kill_waits(active) {
             return Ok(false);
         }
         active.follow.end_tried_at = Some(now);
         // The runner first, gone with everything it started: what the engine
-        // writes as it dies is in the checkpoint below.
-        if let Err(error) = self
-            .terminals
-            .terminate(&active.terminal(), &active.workspace)
-        {
+        // writes as it dies is in the checkpoint below. A kill still waiting
+        // for its processes leaves the end pending (no failure): the next
+        // attempt reads it.
+        let Some(killed) = self.kill(session, active, report) else {
+            return Ok(false);
+        };
+        if let Err(error) = killed {
             active.follow.kill_failed_at = Some(now);
             let error = format!("terminate {}: {error}", active.terminal());
             report.warnings.push(error.clone());
@@ -1941,6 +2073,86 @@ impl Bridge {
             },
         )?;
         Ok(true)
+    }
+
+    /// Kill `active`'s terminal ([`TerminalHost::terminate`]): its result,
+    /// or `None` while it still waits for the engine's processes to exit.
+    ///
+    /// A host whose kill waits (tmux: until every process of the session is
+    /// gone, up to its bound) has it run on a thread of its own, so the
+    /// Bridge's loop goes on with every other session meanwhile (P7: the
+    /// loop is serial, and a stop held it up to 7 s). The end waits for it
+    /// in line for [`KILL_IN_LINE`] only, and otherwise reads it again at
+    /// its next attempt (`active.follow.killing`), each tick. Each kill's
+    /// wait goes in the tick's notes: how long ends take, measured live.
+    fn kill(
+        &self,
+        session: &SessionId,
+        active: &mut Active,
+        report: &mut TickReport,
+    ) -> Option<Result<(), TerminalError>> {
+        let terminal = active.terminal();
+        let (result, waited) = if self.terminals.terminate_waits() {
+            // A kill already under way is read without waiting: it had its
+            // time in line when it started.
+            let pending = active.follow.killing.take();
+            let in_line = if pending.is_some() {
+                std::time::Duration::ZERO
+            } else {
+                KILL_IN_LINE
+            };
+            let killing = pending.unwrap_or_else(|| {
+                let killing = Killing {
+                    done: Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())),
+                };
+                let done = Arc::clone(&killing.done);
+                let terminals = Arc::clone(&self.terminals);
+                let (name, workspace) = (terminal.clone(), active.workspace.clone());
+                let thread = std::thread::spawn(move || {
+                    let started = std::time::Instant::now();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        terminals.terminate(&name, &workspace)
+                    }))
+                    .unwrap_or_else(|_| Err(TerminalError("the kill panicked".to_string())));
+                    let (slot, ready) = &*done;
+                    *slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some((result, started.elapsed()));
+                    ready.notify_all();
+                });
+                let mut threads = self
+                    .kill_threads
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                threads.retain(|thread| !thread.is_finished());
+                threads.push(thread);
+                killing
+            });
+            let (slot, ready) = &*killing.done;
+            let guard = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (mut guard, _) = ready
+                .wait_timeout_while(guard, in_line, |slot| slot.is_none())
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(killed) = guard.take() else {
+                drop(guard);
+                active.follow.killing = Some(killing);
+                return None;
+            };
+            killed
+        } else {
+            let started = std::time::Instant::now();
+            let result = self.terminals.terminate(&terminal, &active.workspace);
+            (result, started.elapsed())
+        };
+        report.notes.push(format!(
+            "{session}: the kill of {terminal} waited {} ms for its processes{}",
+            waited.as_millis(),
+            if result.is_ok() { "" } else { ", and failed" }
+        ));
+        Some(result)
     }
 
     /// Whether the end's last kill failed within [`END_RETRY_MS`]: the next
@@ -2184,31 +2396,56 @@ impl Bridge {
         claimed: &Claimed,
         report: &mut TickReport,
     ) -> Result<Handled, StoreError> {
-        let Ok(action) = claimed.action() else {
-            return Ok(Handled::Finished(Outcome::Failed(
-                "stored action is not valid".to_string(),
-            )));
+        let action = match claimed.action() {
+            Ok(action) => action,
+            // The parse error names what is wrong (a key outside the set
+            // names the key).
+            Err(error) => {
+                return Ok(Handled::Finished(Outcome::Failed(format!(
+                    "stored action is not valid: {error}"
+                ))));
+            }
         };
         // What a command appends comes after the session's waiting commit
         // records. While the log refuses them the command is not handled
         // (the error ends the tick; the lease brings the command back).
         self.record_unrecorded_commit(&claimed.session_id)?;
+        // An end whose kill still waits off the loop (Self::kill): every
+        // command but a stop or a discard waits for it, claimed again after
+        // `input_wait_retry`, and meets the session as the end leaves it:
+        // an input is never typed into a terminal being killed (it fails
+        // once the end is done, as every waiting input does), and a start or
+        // a resume goes on once nothing runs.
+        if !matches!(action, CommandAction::Stop | CommandAction::Discard)
+            && self
+                .running(&claimed.session_id)
+                .is_some_and(|active| active.follow.killing.is_some())
+        {
+            return Ok(Handled::Waiting);
+        }
         // An execution the log holds open that nothing runs any more is
         // ended first, so the command meets the session as it is.
         let settled = match &action {
             CommandAction::Start { .. }
             | CommandAction::Resume { .. }
-            | CommandAction::Input { .. } => self.settle(claimed, report)?,
+            | CommandAction::Input { .. }
+            | CommandAction::Key { .. } => self.settle(claimed, report)?,
             CommandAction::Stop | CommandAction::Discard => None,
         };
         match (&action, settled) {
             (_, None) => {}
+            (_, Some(Settled::Pending)) => return Ok(Handled::Waiting),
             (_, Some(Settled::Ending(why))) => {
                 return Ok(Handled::Finished(Outcome::Failed(why)));
             }
             (CommandAction::Input { .. }, Some(Settled::Ended(what))) => {
                 return Ok(Handled::Finished(Outcome::Failed(format!(
                     "{what}; an input needs a running engine: resume the session"
+                ))));
+            }
+            (CommandAction::Key { .. }, Some(Settled::Ended(what))) => {
+                return Ok(Handled::Finished(Outcome::Failed(format!(
+                    "{what}; a key needs a running engine: resume the session"
                 ))));
             }
             // A start or resume goes on, on a session that runs nothing.
@@ -2236,8 +2473,9 @@ impl Bridge {
                 report,
             ),
             CommandAction::Input { text, .. } => return self.input(claimed, &text),
-            CommandAction::Stop => self.stop(claimed, false, report),
-            CommandAction::Discard => self.stop(claimed, true, report),
+            CommandAction::Key { key } => self.press(claimed, key),
+            CommandAction::Stop => return self.stop(claimed, false, report),
+            CommandAction::Discard => return self.stop(claimed, true, report),
             CommandAction::Resume { prompt, model } => {
                 self.resume(claimed, prompt.as_deref(), model, report)
             }
@@ -2357,6 +2595,7 @@ impl Bridge {
             &mut report,
         )?;
         self.catch_up()?;
+        tick.notes.append(&mut report.notes);
         if ended {
             // The command being handled is finished by the tick, with its
             // own outcome; every other input waiting on the execution fails.
@@ -2371,6 +2610,7 @@ impl Bridge {
             ))));
         }
         // Its end stays due: each tick tries it again, as a stop's.
+        let pending = active.follow.killing.is_some();
         if let Some(held) = self
             .sessions
             .get_mut(&claimed.session_id)
@@ -2380,7 +2620,13 @@ impl Bridge {
             held.follow.end_failures = active.follow.end_failures;
             held.follow.end_tried_at = active.follow.end_tried_at;
             held.follow.kill_failed_at = active.follow.kill_failed_at;
+            held.follow.killing.clone_from(&active.follow.killing);
             held.follow.evidence = active.follow.evidence;
+        }
+        if pending {
+            // Its kill still waits for the engine's processes: no failure.
+            tick.warnings.append(&mut report.warnings);
+            return Ok(Some(Settled::Pending));
         }
         report.warnings.insert(
             0,
@@ -2611,6 +2857,8 @@ impl Bridge {
             CommandStep::Typing => "typing",
             CommandStep::Typed => "typed",
             CommandStep::Waiting => "waiting",
+            CommandStep::Pressing => "pressing",
+            CommandStep::Pressed => "pressed",
         };
         self.append(
             &claimed.agent_id,
@@ -2624,6 +2872,67 @@ impl Bridge {
                 workspace: workspace.cloned(),
             },
         )
+    }
+
+    /// A key command: its key pressed in the running engine's pane, at
+    /// once and in any pane state, at most once. Unlike an input it never
+    /// waits: Esc interrupts a busy turn, and the arrows, Enter, Y and N
+    /// answer a dialog, the very states in which text waits. So it may
+    /// overtake an input sent before it that still waits. Handling is
+    /// serial, and an input's typing (stage, paste, Enter) is one call
+    /// ([`Self::type_once`]), so a key lands before or after it, never
+    /// between its paste and its Enter. The intent is recorded before the
+    /// key goes (`pressing`) and the send after (`pressed`): a retried key
+    /// whose `pressing` has no `pressed` is not sent again.
+    fn press(&mut self, claimed: &Claimed, key: NamedKey) -> Result<Outcome, StoreError> {
+        let Some(active) = self.running(&claimed.session_id) else {
+            return Ok(Outcome::Failed(format!(
+                "{} runs no execution: a key needs a running engine; resume the session",
+                claimed.session_id
+            )));
+        };
+        match self.recorded_steps(claimed).press {
+            Press::Due => {}
+            Press::Pressed => return Ok(Outcome::Succeeded),
+            Press::Pressing => {
+                return Ok(Outcome::Failed(format!(
+                    "the key {} may have reached the pane before the Bridge stopped; it is \
+                     not sent again",
+                    key.name()
+                )));
+            }
+        }
+        self.step(
+            claimed,
+            Some(&active.execution_id),
+            CommandStep::Pressing,
+            None,
+        )?;
+        match self
+            .terminals
+            .send_keys(&active.terminal(), &active.workspace, &[key.tmux()])
+        {
+            Ok(()) => {
+                self.step(
+                    claimed,
+                    Some(&active.execution_id),
+                    CommandStep::Pressed,
+                    None,
+                )?;
+                Ok(Outcome::Succeeded)
+            }
+            Err(error) => {
+                let gone = if self.terminal_gone(&active) {
+                    "; the terminal is gone"
+                } else {
+                    ""
+                };
+                Ok(Outcome::Failed(format!(
+                    "press {}: {error}{gone}",
+                    key.name()
+                )))
+            }
+        }
     }
 
     /// Text into the engine's input box, at most once: the text is staged
@@ -3017,9 +3326,11 @@ impl Bridge {
                 held.follow.end_failures = ending.follow.end_failures;
                 held.follow.end_tried_at = ending.follow.end_tried_at;
                 held.follow.kill_failed_at = ending.follow.kill_failed_at;
+                held.follow.killing.clone_from(&ending.follow.killing);
                 held.follow.evidence = ending.follow.evidence;
             }
         }
+        self.stray_notes.append(&mut report.notes);
         report.warnings.insert(0, why);
         Ok(Outcome::Failed(report.warnings.join("; ")))
     }
@@ -3439,7 +3750,10 @@ impl Bridge {
 
     /// Fail every input of `session` this Bridge left waiting, now that its
     /// execution has ended (`cause`): none of them was typed. One claimed by
-    /// someone else since is failed when it is claimed next.
+    /// someone else since is failed when it is claimed next. A command of
+    /// another kind left waiting for the end's kill (a stop, a start or a
+    /// resume: [`Settled::Pending`]) is not failed: claimed again, it meets
+    /// the session as the end left it (a stop then succeeds).
     fn fail_waiting(
         &mut self,
         session: &SessionId,
@@ -3449,6 +3763,7 @@ impl Bridge {
             .held
             .iter()
             .filter(|(_, claimed)| &claimed.session_id == session)
+            .filter(|(_, claimed)| matches!(claimed.action(), Ok(CommandAction::Input { .. })))
             .map(|(id, _)| *id)
             .collect();
         for id in mine {
@@ -3473,11 +3788,13 @@ impl Bridge {
         claimed: &Claimed,
         discard: bool,
         tick: &mut TickReport,
-    ) -> Result<Outcome, StoreError> {
+    ) -> Result<Handled, StoreError> {
         // No execution open in the log: no end to wait for. One the log
         // holds open is ended here even when this Bridge's view had lost it.
+        // So a stop that waited for its kill succeeds here once its end is
+        // done.
         let Some(mut active) = self.open(claimed, tick)? else {
-            return Ok(Outcome::Succeeded);
+            return Ok(Handled::Finished(Outcome::Succeeded));
         };
         let mut report = TickReport::default();
         // A stop of an end already under way keeps its cause.
@@ -3510,12 +3827,13 @@ impl Bridge {
             &mut report,
         )?;
         self.catch_up()?;
+        tick.notes.append(&mut report.notes);
         if ended {
             // What waited for a turn of this execution is never typed.
             self.fail_waiting(&claimed.session_id, Some(cause))?;
             // A discard that lost work says so in the tick's report too.
             tick.warnings.append(&mut report.warnings);
-            return Ok(Outcome::Succeeded);
+            return Ok(Handled::Finished(Outcome::Succeeded));
         }
         // The stop stays due: each tick tries the same end again.
         if let Some(held) = self
@@ -3527,7 +3845,15 @@ impl Bridge {
             held.follow.end_failures = active.follow.end_failures;
             held.follow.end_tried_at = active.follow.end_tried_at;
             held.follow.kill_failed_at = active.follow.kill_failed_at;
+            held.follow.killing.clone_from(&active.follow.killing);
             held.follow.evidence = active.follow.evidence;
+        }
+        if active.follow.killing.is_some() {
+            // Its kill still waits for the engine's processes, off the loop:
+            // the stop waits, claimed again after `input_wait_retry`, and
+            // succeeds once the end that the ticks go on with is done.
+            tick.warnings.append(&mut report.warnings);
+            return Ok(Handled::Waiting);
         }
         if report.warnings.is_empty() {
             report.warnings.push(format!(
@@ -3537,7 +3863,9 @@ impl Bridge {
                 END_RETRY_MS / 1000
             ));
         }
-        Ok(Outcome::Failed(report.warnings.join("; ")))
+        Ok(Handled::Finished(Outcome::Failed(
+            report.warnings.join("; "),
+        )))
     }
 
     fn resume(

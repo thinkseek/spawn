@@ -49,6 +49,9 @@ pub struct TmuxHost {
     socket: Option<String>,
     /// [`HANGUP_WAIT`] and [`KILL_WAIT`], shorter in a test.
     waits: (Duration, Duration),
+    /// Where the leaders directory goes instead of `$XDG_RUNTIME_DIR`
+    /// ([`TmuxHost::with_leaders_under`]): a test's own.
+    leaders_base: Option<std::path::PathBuf>,
 }
 
 /// One finished tmux call.
@@ -71,6 +74,7 @@ impl TmuxHost {
             program: program.to_string(),
             socket,
             waits: (HANGUP_WAIT, KILL_WAIT),
+            leaders_base: None,
         }
     }
 
@@ -79,6 +83,15 @@ impl TmuxHost {
     #[must_use]
     pub fn with_terminate_waits(mut self, hangup: Duration, kill: Duration) -> Self {
         self.waits = (hangup, kill);
+        self
+    }
+
+    /// The same host, recording its terminals' pane leaders under `base`
+    /// instead of `$XDG_RUNTIME_DIR` (a test's private directory; the same
+    /// checks apply).
+    #[must_use]
+    pub fn with_leaders_under(mut self, base: std::path::PathBuf) -> Self {
+        self.leaders_base = Some(base);
         self
     }
 
@@ -134,6 +147,102 @@ impl TmuxHost {
             "{} process(es) of {terminal}'s runner outlived kill-session and SIGKILL: {left:?}",
             left.len()
         )))
+    }
+
+    /// Where this host records its terminals' pane leaders: a private
+    /// directory per tmux this host runs (its program and socket), so a
+    /// host on another server (a test's, the live fleet's) never reads the
+    /// record of a terminal of the same name there. Stable across a
+    /// restart and a new binary: the name is an FNV-1a hash of the words.
+    ///
+    /// Only under `$XDG_RUNTIME_DIR`, and only while it and both levels
+    /// below it are directories of this user that no one else may enter
+    /// ([`private_to_us`]): a record names a session that terminate
+    /// SIGKILLs, so a directory another user could write (a shared /tmp,
+    /// one pre-made 0777 or a symlink to theirs) must never be read or
+    /// written (rev-b on b279f33c). None without it: the pane alone, as
+    /// before P6. `create` makes the two levels (0700) when missing.
+    fn leaders_directory(&self, create: bool) -> Option<std::path::PathBuf> {
+        let base = self
+            .leaders_base
+            .clone()
+            .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from))?;
+        self.leaders_directory_in(&base, create)
+    }
+
+    fn leaders_directory_in(
+        &self,
+        base: &std::path::Path,
+        create: bool,
+    ) -> Option<std::path::PathBuf> {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for word in self.words(&[]) {
+            for byte in word.bytes().chain([0]) {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        let user = base.join(format!(
+            "spawn-leaders-{}",
+            rustix::process::getuid().as_raw()
+        ));
+        let directory = user.join(format!("{hash:016x}"));
+        if !private_to_us(base) {
+            return None;
+        }
+        for level in [&user, &directory] {
+            if create {
+                use std::os::unix::fs::DirBuilderExt;
+                let _ = std::fs::DirBuilder::new().mode(0o700).create(level);
+            }
+            if !private_to_us(level) {
+                return None;
+            }
+        }
+        Some(directory)
+    }
+
+    /// Record `leader`, the pane's pid, with its start time, for
+    /// [`Self::recorded_leader`]. Best effort: a terminal whose leader is
+    /// not recorded is terminated as before, by its pane alone.
+    fn record_leader(&self, terminal: &TerminalName, leader: u32) {
+        if let Some(directory) = self.leaders_directory(true) {
+            record_leader_in(&directory, terminal, leader);
+        }
+    }
+
+    /// The pane leader recorded at the terminal's start, when it still
+    /// names the terminal's session. A session is told by its leader's pid
+    /// (`session_members`), and the kernel gives no new process that pid
+    /// while any process is in the session, the leader included. So:
+    /// - no process has the pid: whatever is left of the session is the
+    ///   terminal's (or nothing is);
+    /// - the process with the pid started when the leader did: it is the
+    ///   leader;
+    /// - it started at another time (or the record does not say when the
+    ///   leader started): the pid was given anew, so nothing of the
+    ///   terminal's session is left, and the record names nothing.
+    fn recorded_leader(&self, terminal: &TerminalName) -> Option<u32> {
+        let text =
+            std::fs::read_to_string(self.leaders_directory(false)?.join(terminal.as_str())).ok()?;
+        let mut words = text.split_whitespace();
+        let leader: u32 = words.next()?.parse().ok()?;
+        let started: u64 = words.next()?.parse().ok()?;
+        if leader <= 1 {
+            return None;
+        }
+        match start_time(leader) {
+            None => Some(leader),
+            Some(now) if started != 0 && now == started => Some(leader),
+            Some(_) => None,
+        }
+    }
+
+    /// Remove the terminal's record, once its processes are gone.
+    fn forget_leader(&self, terminal: &TerminalName) {
+        if let Some(directory) = self.leaders_directory(false) {
+            let _ = std::fs::remove_file(directory.join(terminal.as_str()));
+        }
     }
 
     fn words(&self, arguments: &[String]) -> Vec<String> {
@@ -224,6 +333,57 @@ fn session_of(stat: &str) -> Option<(char, u32)> {
     let state = fields.next()?.chars().next()?;
     let session = fields.nth(2)?.parse().ok()?;
     Some((state, session))
+}
+
+/// [`TmuxHost::record_leader`] into `directory`, already checked.
+fn record_leader_in(directory: &std::path::Path, terminal: &TerminalName, leader: u32) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Unknown (0) when the leader is already gone: then the record
+    // stands for its session's members only (`recorded_leader`).
+    let started = start_time(leader).unwrap_or(0);
+    let path = directory.join(terminal.as_str());
+    let temporary = directory.join(format!(".{}.{}", terminal.as_str(), std::process::id()));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)
+        .and_then(|mut file| writeln!(file, "{leader} {started}"))
+        .and_then(|()| std::fs::rename(&temporary, &path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+}
+
+/// Whether `path` is a directory (not a symlink) of this user that no one
+/// else may enter or write: mode & 0o077 == 0.
+#[allow(clippy::verbose_bit_mask)] // `& 0o077 == 0` reads as the mode it means
+fn private_to_us(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).is_ok_and(|meta| {
+        meta.is_dir()
+            && meta.uid() == rustix::process::getuid().as_raw()
+            && meta.mode() & 0o077 == 0
+    })
+}
+
+/// The process's start time (`/proc/<pid>/stat`'s 22nd field, in clock
+/// ticks since boot), or `None` when there is no such process.
+fn start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    start_time_of(&stat)
+}
+
+/// A `/proc/<pid>/stat` line's start time: the 20th field after the
+/// command's closing parenthesis (state is the first).
+fn start_time_of(stat: &str) -> Option<u64> {
+    stat[stat.rfind(')')? + 1..]
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
 }
 
 /// How long a `capture-pane` may take.
@@ -449,6 +609,11 @@ impl TmuxHost {
         let mut arguments = vec![
             "new-session".to_string(),
             "-d".to_string(),
+            // The pane's pid, the leader of the session the runner runs in,
+            // recorded for terminate (`record_leader`).
+            "-P".to_string(),
+            "-F".to_string(),
+            "#{pane_pid}".to_string(),
             "-s".to_string(),
             launch.terminal.as_str().to_string(),
             "-x".to_string(),
@@ -504,6 +669,14 @@ impl TerminalHost for TmuxHost {
             break run;
         };
         if run.code == Some(0) {
+            if let Some(leader) = run
+                .stdout
+                .lines()
+                .next()
+                .and_then(|line| line.trim().parse().ok())
+            {
+                self.record_leader(&launch.terminal, leader);
+            }
             return Ok(());
         }
         let stderr = run.stderr.trim();
@@ -773,7 +946,16 @@ impl TerminalHost for TmuxHost {
         _workspace: &WorkspaceId,
     ) -> Result<(), TerminalError> {
         // Read before the kill: the session's processes are told by it.
-        let leaders = self.pane_pids(terminal)?;
+        // With the leader recorded at start: a session that vanished on its
+        // own (tmux died, or the session ended outside kill-session) has no
+        // pane to read, while its runner and engine may still be exiting,
+        // or ignore the hang-up altogether (backlog P6).
+        let mut leaders = self.pane_pids(terminal)?;
+        if let Some(recorded) = self.recorded_leader(terminal)
+            && !leaders.contains(&recorded)
+        {
+            leaders.push(recorded);
+        }
         let run = self.run(&[
             "kill-session".to_string(),
             "-t".to_string(),
@@ -786,7 +968,16 @@ impl TerminalHost for TmuxHost {
                 run.stderr.trim()
             )));
         }
-        self.wait_gone(terminal, &leaders)
+        self.wait_gone(terminal, &leaders)?;
+        self.forget_leader(terminal);
+        Ok(())
+    }
+
+    /// The kill waits until the session's processes are gone (seconds:
+    /// idle median 1.26 s, max 2.4 s at load 20; a bounded wait of up to
+    /// 7 s): the Bridge runs it off its loop.
+    fn terminate_waits(&self) -> bool {
+        true
     }
 
     fn read_from(
@@ -1119,5 +1310,139 @@ mod tests {
         );
         assert!(read_in_workspace(&workspace, "link/exit-2", 0).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A record names the terminal's session only while it can: the leader
+    /// itself (same start time), or a pid no process has (what is left of
+    /// the session is the terminal's); never a pid given anew, nor one whose
+    /// start was not recorded and that a process has now. Hosts on other
+    /// tmux programs or sockets never read it, and terminate forgets it.
+    #[test]
+    fn a_recorded_leader_names_only_the_terminal_s_own_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("spawn-p6-leaders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir(&base).expect("base");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).expect("0700");
+        let host = super::TmuxHost::on_socket("tmux", Some(format!("p6-{}", std::process::id())))
+            .with_leaders_under(base.clone());
+        let other =
+            super::TmuxHost::on_socket("tmux", Some(format!("p6-other-{}", std::process::id())))
+                .with_leaders_under(base.clone());
+        let terminal = TerminalName::new("spawn-exec_p6").expect("valid terminal");
+        let write = |text: &str| {
+            let directory = host.leaders_directory(true).expect("a private directory");
+            std::fs::write(directory.join(terminal.as_str()), text).expect("record");
+        };
+        let me = std::process::id();
+        let started = super::start_time(me).expect("my start time");
+
+        host.record_leader(&terminal, me);
+        assert_eq!(
+            host.recorded_leader(&terminal),
+            Some(me),
+            "the leader itself"
+        );
+        assert_eq!(
+            other.recorded_leader(&terminal),
+            None,
+            "another host's record"
+        );
+
+        write(&format!("{me} {}\n", started + 1));
+        assert_eq!(host.recorded_leader(&terminal), None, "a pid given anew");
+        write(&format!("{me} 0\n"));
+        assert_eq!(
+            host.recorded_leader(&terminal),
+            None,
+            "a start not recorded"
+        );
+
+        let mut child = std::process::Command::new("true").spawn().expect("true");
+        let gone = child.id();
+        child.wait().expect("reaped");
+        write(&format!("{gone} 12345\n"));
+        assert_eq!(
+            host.recorded_leader(&terminal),
+            Some(gone),
+            "no process has it"
+        );
+
+        for bad in ["", "x 1\n", "1 5\n", "0 5\n", "7\n"] {
+            write(bad);
+            assert_eq!(host.recorded_leader(&terminal), None, "{bad:?}");
+        }
+        host.forget_leader(&terminal);
+        assert_eq!(host.recorded_leader(&terminal), None, "forgotten");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A leaders directory anyone else could write is never read or
+    /// written: the base, or a level below it, open to others or a symlink
+    /// (another user could plant a record naming one of our sessions, which
+    /// terminate SIGKILLs; rev-b on b279f33c).
+    #[test]
+    fn a_leaders_directory_others_could_write_is_never_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &std::path::Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        };
+        let scratch = std::env::temp_dir().join(format!("spawn-p6-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        let terminal = TerminalName::new("spawn-exec_p6").expect("valid terminal");
+        let me = std::process::id();
+
+        // The base open to others.
+        let base = scratch.join("open-base");
+        std::fs::create_dir(&base).expect("base");
+        mode(&base, 0o777);
+        let host = super::TmuxHost::local("tmux").with_leaders_under(base.clone());
+        assert_eq!(host.leaders_directory(true), None);
+        host.record_leader(&terminal, me);
+        assert_eq!(host.recorded_leader(&terminal), None);
+
+        // A private base, its per-user level pre-made 0777 by someone else.
+        let base = scratch.join("private-base");
+        std::fs::create_dir(&base).expect("base");
+        mode(&base, 0o700);
+        let host = super::TmuxHost::local("tmux").with_leaders_under(base.clone());
+        let user = base.join(format!(
+            "spawn-leaders-{}",
+            rustix::process::getuid().as_raw()
+        ));
+        std::fs::create_dir(&user).expect("planted");
+        mode(&user, 0o777);
+        assert_eq!(host.leaders_directory(true), None);
+        host.record_leader(&terminal, me);
+        assert_eq!(host.recorded_leader(&terminal), None);
+
+        // The per-user level a symlink to a directory of "theirs".
+        std::fs::remove_dir(&user).expect("unplant");
+        let theirs = scratch.join("theirs");
+        std::fs::create_dir(&theirs).expect("theirs");
+        mode(&theirs, 0o700);
+        std::os::unix::fs::symlink(&theirs, &user).expect("symlink");
+        assert_eq!(host.leaders_directory(true), None);
+        host.record_leader(&terminal, me);
+        assert_eq!(host.recorded_leader(&terminal), None);
+        assert_eq!(
+            std::fs::read_dir(&theirs).expect("theirs").count(),
+            0,
+            "nothing written there"
+        );
+
+        // No base at all: nothing.
+        std::fs::remove_file(&user).expect("unlink");
+        let host = super::TmuxHost::local("tmux").with_leaders_under(scratch.join("missing"));
+        assert_eq!(host.leaders_directory(true), None);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn a_start_time_is_read_past_a_command_with_parentheses() {
+        let stat = "42 (a) (b c) S 1 42 42 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 987654 0 0";
+        assert_eq!(super::start_time_of(stat), Some(987_654));
+        assert_eq!(super::start_time_of("42 (x) S 1"), None);
     }
 }

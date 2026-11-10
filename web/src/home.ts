@@ -304,7 +304,7 @@ const ALERT_TITLES: Record<string, string> = {
   backup_stale: "A backup is late",
 };
 
-function alertTitle(alert: Pick<Alert, "kind" | "subject">, named: string | null = null): string {
+export function alertTitle(alert: Pick<Alert, "kind" | "subject">, named: string | null = null): string {
   const title = ALERT_TITLES[alert.kind] ?? alert.kind.replaceAll("_", " ");
   return `${title} · ${named ?? alert.subject}`;
 }
@@ -458,6 +458,69 @@ export function agentName(agent: FleetAgent, context: FleetContext, task: TaskRe
   return agent.agent_id || agent.session_id;
 }
 
+/** The task an agent's name and second line go by: the one it holds, and
+ * for a worker that holds none (it ended, or its task closed), its latest.
+ * A resident without an open task goes by its own name instead. */
+export function nameTask(agent: FleetAgent, context: FleetContext): TaskRef | null {
+  const held = heldTask(agent, context);
+  if (held || agent.role === "supervisor" || residentName(agent, context)) return held;
+  return context.lastTasks.get(agent.session_id) ?? (agent.agent_id ? context.lastTasks.get(agent.agent_id) : undefined) ?? null;
+}
+
+/**
+ * Every agent's one name (design §4.5), unique across the board: the
+ * sidebar, home, the agent page, the trace and alerts all read this map, by
+ * session id. Two agents can share a name (two workers on one task after a
+ * reassign, or an ended worker and its successor): each then carries a
+ * short suffix from its session id, the id's last word where those differ
+ * ("worker · Supply PA T222 · 239"), else its last six characters.
+ */
+export function agentNames(agents: readonly FleetAgent[], context: FleetContext): Map<string, string> {
+  const base = new Map<string, string>();
+  const bySame = new Map<string, FleetAgent[]>();
+  for (const agent of agents) {
+    const name = agentName(agent, context, nameTask(agent, context));
+    base.set(agent.session_id, name);
+    const same = bySame.get(name);
+    if (same) same.push(agent);
+    else bySame.set(name, [agent]);
+  }
+  const names = new Map(base);
+  for (const [name, same] of bySame) {
+    if (same.length < 2) continue;
+    const word = (agent: FleetAgent) => agent.session_id.split(/[_\-.]/).filter(Boolean).pop() ?? agent.session_id;
+    const tail = (agent: FleetAgent) => agent.session_id.slice(-6);
+    const words = same.map(word);
+    const tails = same.map(tail);
+    const suffixes = new Set(words).size === same.length ? words : new Set(tails).size === same.length ? tails : same.map((agent) => agent.session_id);
+    same.forEach((agent, index) => names.set(agent.session_id, `${name} · ${suffixes[index]}`));
+  }
+  return names;
+}
+
+/** Whether an agent's row matches the sidebar's search: every word of the
+ * query (case aside) is in its name (which carries its task's T-number),
+ * its ids, its task's title, or its mission. An empty query matches every
+ * agent. */
+export function agentMatches(query: string, fields: ReadonlyArray<string | null | undefined>): boolean {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return true;
+  const text = fields.filter(Boolean).join(" \n ").toLowerCase();
+  return words.every((word) => text.includes(word));
+}
+
+/** What a row is searched by: `agentMatches`'s fields for an agent. */
+export function agentSearchFields(agent: FleetAgent, context: FleetContext, name: string): string[] {
+  const task = nameTask(agent, context);
+  return [
+    name,
+    agent.agent_id,
+    agent.session_id,
+    task?.title ?? agent.task_title,
+    task?.mission_name ?? agent.mission_name,
+  ].filter((field): field is string => typeof field === "string" && field !== "");
+}
+
 const STATE_WORDS: Record<string, string> = {
   WORKING: "working",
   WAITING: "waiting at its prompt",
@@ -489,11 +552,13 @@ export function doingWords(agent: FleetAgent, task: TaskRef | null): string {
 export function agentsNow(agents: readonly FleetAgent[] | null, context: FleetContext): AgentsNow {
   const working: WorkingAgent[] = [];
   const idle: AgentsNow["idle"] = [];
+  // The board's one names (unique across it), as the sidebar shows them.
+  const names = agentNames(agents ?? [], context);
   for (const agent of agents ?? []) {
     if (!agent.live) continue;
     const task = heldTask(agent, context);
     const busy = task !== null || agent.state === "WORKING" || agent.activity.current_tool !== null || agent.activity.jobs.length > 0;
-    const name = agentName(agent, context, task);
+    const name = names.get(agent.session_id) ?? agentName(agent, context, task);
     if (!busy) {
       idle.push({ session_id: agent.session_id, name, since_ms: agent.state_since_ms });
       continue;
@@ -528,55 +593,195 @@ export function latestNotes(attention: Attention | null, now: number): NotesShow
 }
 
 // ---------------------------------------------------------------------------
-// Today, as a digest
+// The digest: what happened while you were away (design §3 Q4, §2.9)
+
+/** The shortest digest window, and the longest. */
+export const DIGEST_FLOOR_MS = TODAY_MS;
+export const DIGEST_CAP_MS = 7 * TODAY_MS;
+/** How long the page must have been hidden or closed to count as away. */
+export const AWAY_GAP_MS = 30 * 60_000;
+
+/** When the reader went away, from the last time the page was seen (stored
+ * in the browser): that time, if it is at least `AWAY_GAP_MS` ago, else
+ * null (they never left, or this is their first visit). */
+export function awayFrom(lastSeen: number | null, now: number): number | null {
+  if (lastSeen === null || !Number.isFinite(lastSeen) || lastSeen > now) return null;
+  return now - lastSeen >= AWAY_GAP_MS ? lastSeen : null;
+}
+
+/** The digest's window: since the reader went away, never less than the
+ * last 24 h (a quick reload never empties it) and never more than 7 days.
+ * `away` says the absence was longer than the floor, so the card says
+ * "Since you were away" and not "Today". */
+export function digestWindow(now: number, away: number | null): { since: number; away: boolean } {
+  const floor = now - DIGEST_FLOOR_MS;
+  if (away === null || away >= floor) return { since: floor, away: false };
+  return { since: Math.max(away, now - DIGEST_CAP_MS), away: true };
+}
+
+/** How far back the digest asks for alerts (`/api/alerts?since=`): its
+ * window, in whole hours rounded up (so the poll's key changes at most once
+ * an hour), and never under the server's own 24 h. */
+export function alertsSpanMs(now: number, since: number): number {
+  const hours = Math.ceil(Math.max(0, now - since) / 3_600_000);
+  return Math.max(hours * 3_600_000, DIGEST_FLOOR_MS);
+}
+
+export type DigestKind = "landed" | "sent back" | "stopped" | "moved" | "mission" | "alert";
 
 export interface DigestEntry {
   at_ms: number;
-  kind: "landed" | "sent back" | "alert";
+  kind: DigestKind;
   text: string;
 }
 
-export interface Digest {
-  landed: number;
-  sentBack: number;
-  alerts: number;
+export interface DigestBand {
+  /** "Last hour", "Earlier today", "Yesterday", "Mon". */
+  label: string;
   /** Newest first. */
   entries: DigestEntry[];
 }
 
+export interface Digest {
+  since_ms: number;
+  /** The window starts where the reader went away (more than 24 h ago). */
+  away: boolean;
+  /** Tasks landed (or accepted) in the window. */
+  landed: number;
+  /** Send-backs in the window (a task sent back twice counts twice). */
+  sentBack: number;
+  alerts: number;
+  /** Newest first, every line. */
+  entries: DigestEntry[];
+  /** The same lines by when (newest band first). */
+  bands: DigestBand[];
+}
+
+/** One task's day in a line: what it came to in the window, said once. */
+function taskStory(task: MissionTask, mission: Mission, since: number): { at: number; kind: DigestKind; story: string; landed: boolean; backs: number } | null {
+  const inWindow = task.stages.filter((stage) => stage.at_ms !== null && stage.at_ms >= since);
+  if (inWindow.length === 0) return null;
+  const at = Math.max(...inWindow.map((stage) => stage.at_ms ?? 0));
+  const runs = (stage: string) => task.stages.filter((entry) => entry.stage === stage).length;
+  const times = (count: number, word: string) => `${count} ${word}${count === 1 ? "" : "s"}`;
+  const backs = sendBacks(task).filter((back) => back.at_ms >= since);
+  const landed = landedAt(task, mission);
+  if (landed !== null && landed >= since) {
+    const gates = runs("gated");
+    const reviews = runs("reviewed");
+    const after = gates > 0 ? ` after ${times(gates, "gate")}` : reviews > 0 ? ` after ${times(reviews, "review")}` : "";
+    const word = task.state === "accepted" ? "accepted" : "landed";
+    return { at, kind: "landed", story: `${word}${after}${backs.length ? `, sent back ${backs.length}× on the way` : ""}`, landed: true, backs: backs.length };
+  }
+  const label = taskStateLabel(task, mission);
+  if (task.state === "cancelled" && inWindow.some((stage) => stage.stage === "cancelled" || stage.stage === "aborted")) {
+    return { at, kind: "stopped", story: label, landed: false, backs: backs.length };
+  }
+  if (backs.length > 0) {
+    const verdicts = [...new Set(backs.map((back) => back.verdict))].join(", ");
+    const now = isOpenTask(task, mission) ? `; now ${label}` : `; ${label}`;
+    return { at, kind: "sent back", story: `sent back${backs.length > 1 ? ` ${backs.length}×` : ""} (${verdicts})${now}`, landed: false, backs: backs.length };
+  }
+  const started = inWindow.some((stage) => stage.stage === "assigned");
+  return { at, kind: "moved", story: started ? `started; now ${label}` : `now ${label}`, landed: false, backs: 0 };
+}
+
+/** A mission's own change, from its notice: only a change of state or of
+ * its halt (a counter moving is not news). */
+function missionChange(alert: Alert, names: ReadonlyMap<number, string>): string | null {
+  const evidence = alert.evidence as {
+    mission?: unknown;
+    before?: { state?: unknown; halted?: unknown } | null;
+    after?: { state?: unknown; halted?: unknown } | null;
+  } | null;
+  const before = evidence?.before ?? null;
+  const after = evidence?.after ?? null;
+  if (!after) return null;
+  const id = typeof evidence?.mission === "number" ? evidence.mission : null;
+  const name = (id !== null ? names.get(id) : undefined) ?? alert.subject;
+  const halted = after.halted ?? null;
+  if ((before?.halted ?? null) !== halted) {
+    return halted ? `${name}: halted${typeof halted === "string" ? ` (${halted})` : ""}` : `${name}: resumed`;
+  }
+  if (before?.state !== after.state && typeof after.state === "string") return `${name}: ${after.state}`;
+  return null;
+}
+
+/** The band a time falls in, seen from `now` (local days). */
+export function digestBand(at: number, now: number): string {
+  if (now - at < 3_600_000) return "Last hour";
+  const midnight = new Date(now);
+  midnight.setHours(0, 0, 0, 0);
+  const today = midnight.getTime();
+  if (at >= today) return "Earlier today";
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (at >= yesterday.getTime()) return "Yesterday";
+  return new Date(at).toLocaleDateString("en", { weekday: "short", day: "numeric", month: "short" });
+}
+
+/**
+ * What happened since `since`, for a reader who was away: one line per task
+ * (its day: landed after 2 gates, sent back and now gating, cancelled), one
+ * per mission halted, resumed or ended, and one per alert raised, grouped
+ * by when. A moot alert (an ended session's) is not news. Task notices are
+ * not read: the missions say the same, by task.
+ */
+export function digestSince(
+  missions: Missions | null,
+  alerts: readonly Alert[] | null,
+  now: number,
+  since: number,
+  agents: readonly FleetAgent[] | null = null,
+  away = false,
+): Digest {
+  const entries: DigestEntry[] = [];
+  let landed = 0;
+  let sentBack = 0;
+  const names = new Map<number, string>();
+  for (const mission of missions?.missions ?? []) {
+    const name = missionName(mission);
+    if (mission.id !== null) names.set(mission.id, name);
+    if (!isActiveMission(mission) && (mission.updated_at_ms ?? 0) < since) continue;
+    for (const task of mission.tasks) {
+      const story = taskStory(task, mission, since);
+      if (!story) continue;
+      if (story.landed) landed += 1;
+      sentBack += story.backs;
+      const title = task.task_title ?? `task #${task.id}`;
+      entries.push({ at_ms: story.at, kind: story.kind, text: `${name} · T${task.id} ${title}: ${story.story}` });
+    }
+  }
+  let alertCount = 0;
+  for (const alert of alerts ?? []) {
+    if (alert.fired_at_ms < since) continue;
+    if (alert.state === "notice") {
+      if (alert.kind !== "mission_state") continue;
+      const change = missionChange(alert, names);
+      if (change) entries.push({ at_ms: alert.fired_at_ms, kind: "mission", text: change });
+      continue;
+    }
+    if (alertMoot(alert, agents)) continue;
+    alertCount += 1;
+    entries.push({ at_ms: alert.fired_at_ms, kind: "alert", text: `${alertTitle(alert)}${alert.state === "cleared" ? " (cleared)" : ""}` });
+  }
+  entries.sort((left, right) => right.at_ms - left.at_ms);
+  const bands: DigestBand[] = [];
+  for (const entry of entries) {
+    const label = digestBand(entry.at_ms, now);
+    const last = bands[bands.length - 1];
+    if (last && last.label === label) last.entries.push(entry);
+    else bands.push({ label, entries: [entry] });
+  }
+  return { since_ms: since, away, landed, sentBack, alerts: alertCount, entries, bands };
+}
+
+/** The last 24 h (the digest's floor), as home showed it before P-digest. */
 export function digestToday(
   missions: Missions | null,
   alerts: readonly Alert[] | null,
   now: number,
   agents: readonly FleetAgent[] | null = null,
 ): Digest {
-  const since = now - TODAY_MS;
-  const entries: DigestEntry[] = [];
-  for (const mission of missions?.missions ?? []) {
-    if (!isActiveMission(mission) && (mission.updated_at_ms ?? 0) < since) continue;
-    const name = missionName(mission);
-    for (const task of mission.tasks) {
-      const title = task.task_title ?? `task #${task.id}`;
-      const landed = landedAt(task, mission);
-      if (landed !== null && landed >= since) {
-        entries.push({ at_ms: landed, kind: "landed", text: `${name} · T${task.id} ${title}` });
-      }
-      for (const back of sendBacks(task)) {
-        if (back.at_ms < since) continue;
-        entries.push({ at_ms: back.at_ms, kind: "sent back", text: `${name} · T${task.id} ${title} · ${back.verdict}` });
-      }
-    }
-  }
-  for (const alert of alerts ?? []) {
-    // A moot alert (an ended session's) is not news of the day either.
-    if (alert.state === "notice" || alert.fired_at_ms < since || alertMoot(alert, agents)) continue;
-    entries.push({ at_ms: alert.fired_at_ms, kind: "alert", text: `${alertTitle(alert)}${alert.state === "cleared" ? " (cleared)" : ""}` });
-  }
-  entries.sort((left, right) => right.at_ms - left.at_ms);
-  return {
-    landed: entries.filter((entry) => entry.kind === "landed").length,
-    sentBack: entries.filter((entry) => entry.kind === "sent back").length,
-    alerts: entries.filter((entry) => entry.kind === "alert").length,
-    entries,
-  };
+  return digestSince(missions, alerts, now, now - TODAY_MS, agents);
 }

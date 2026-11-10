@@ -2,13 +2,15 @@
 //! 015): recorded `waiting`, typed when the pane reads ready, oldest first,
 //! at most once, and failed with the reason when the session's execution
 //! ends first. Inputs of Spawn's own loops keep their contract: refused at
-//! once while the pane is not ready.
+//! once while the pane is not ready. A key command (backlog P1) never
+//! waits: it is pressed at once, overtaking a waiting input, at most once,
+//! and leaves the inputs' order and answers alone.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use spawn_core::bridge::{Bridge, BridgeConfig, MAY_HAVE_TYPED, PANE_NOT_READY};
-use spawn_core::command::{CommandAction, Submission};
+use spawn_core::command::{CommandAction, NamedKey, Submission};
 use spawn_core::event::{CommandStep, ENGINE, EventKind, GlobalPosition, NewEvent, Source};
 use spawn_core::id::{
     AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
@@ -21,11 +23,13 @@ use spawn_core::time::{ManualClock, Timestamp};
 const READY: &str = "❯ \n  deepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 249 tok/s";
 const BUSY: &str = "✻ Churning… (esc to interrupt)\n❯ ";
 
-/// The memory terminal, keeping every text that was submitted.
+/// The memory terminal, keeping every text that was submitted and every
+/// key that was sent.
 struct Recording {
     inner: Arc<MemoryStore>,
     typed: Mutex<Vec<String>>,
     staged: Mutex<Option<String>>,
+    keys: Mutex<Vec<String>>,
 }
 
 impl TerminalHost for Recording {
@@ -60,7 +64,12 @@ impl TerminalHost for Recording {
         workspace: &WorkspaceId,
         keys: &[&str],
     ) -> Result<(), TerminalError> {
-        self.inner.send_keys(terminal, workspace, keys)
+        self.inner.send_keys(terminal, workspace, keys)?;
+        self.keys
+            .lock()
+            .expect("keys")
+            .extend(keys.iter().map(|key| (*key).to_string()));
+        Ok(())
     }
 
     fn is_alive(
@@ -134,6 +143,7 @@ impl Rig {
             inner: store.clone(),
             typed: Mutex::default(),
             staged: Mutex::default(),
+            keys: Mutex::default(),
         });
         let mut config = BridgeConfig::new("tester");
         config.ready_interval = Duration::ZERO;
@@ -266,6 +276,14 @@ impl Rig {
 
     fn typed(&self) -> Vec<String> {
         self.host.typed.lock().expect("typed").clone()
+    }
+
+    fn press(&self, principal: &str, key: &str, named: NamedKey) {
+        self.submit(principal, key, CommandAction::Key { key: named });
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.host.keys.lock().expect("keys").clone()
     }
 }
 
@@ -466,4 +484,108 @@ fn a_waiting_input_with_typing_and_no_typed_fails_as_may_have_typed() {
     assert!(!succeeded);
     assert!(error.contains(MAY_HAVE_TYPED), "{error}");
     assert!(rig.typed().is_empty(), "never typed again");
+}
+
+/// A key is pressed at once in a busy pane, where an input waits: an Esc
+/// sent after a person's waiting input overtakes it, with its own steps,
+/// and the input is still typed once the pane reads ready (the key typed
+/// nothing and answered nothing).
+#[test]
+fn a_key_is_pressed_at_once_in_a_busy_pane_and_overtakes_a_waiting_input() {
+    let mut rig = Rig::new(Duration::ZERO);
+    rig.pane(BUSY);
+    rig.say("human", "note-one", "the note");
+    rig.tick();
+    assert_eq!(rig.steps(2), [CommandStep::Waiting]);
+    rig.press("human", "key-esc", NamedKey::Escape);
+    rig.tick();
+    assert_eq!(
+        rig.finished(3),
+        Some((true, String::new())),
+        "the key, at once"
+    );
+    assert_eq!(rig.steps(3), [CommandStep::Pressing, CommandStep::Pressed]);
+    assert_eq!(rig.keys(), ["Escape"]);
+    assert_eq!(rig.finished(2), None, "the input still waits");
+    assert!(rig.typed().is_empty());
+
+    rig.pane(READY);
+    rig.tick();
+    assert_eq!(rig.finished(2), Some((true, String::new())));
+    assert_eq!(rig.typed(), ["the note"]);
+    assert_eq!(rig.keys(), ["Escape"], "pressed once");
+}
+
+/// A key leaves the inputs' rule alone: an input sent right after a key on
+/// a ready pane is typed at once. Had the key recorded `typed`, the input
+/// would wait for an answer (a turn) that a key never starts.
+#[test]
+fn a_key_does_not_hold_the_input_after_it() {
+    let mut rig = Rig::new(Duration::ZERO);
+    rig.press("human", "key-down", NamedKey::Down);
+    rig.press("human", "key-enter", NamedKey::Enter);
+    rig.pane(READY);
+    rig.say("human", "note-one", "after the keys");
+    for _ in 0..3 {
+        rig.tick();
+        rig.pane(READY);
+    }
+    assert_eq!(rig.keys(), ["Down", "Enter"], "in the order sent");
+    assert_eq!(rig.finished(2), Some((true, String::new())));
+    assert_eq!(rig.finished(3), Some((true, String::new())));
+    assert_eq!(rig.finished(4), Some((true, String::new())));
+    assert_eq!(rig.steps(4), [CommandStep::Typing, CommandStep::Typed]);
+    assert_eq!(rig.typed(), ["after the keys"]);
+}
+
+/// At most once: a key whose `pressing` was recorded and whose `pressed`
+/// was not (the Bridge stopped between) is not sent again; it fails saying
+/// it may have reached the pane.
+#[test]
+fn a_key_that_may_have_been_pressed_is_not_pressed_again() {
+    let mut rig = Rig::new(Duration::ZERO);
+    rig.press("human", "key-y", NamedKey::Y);
+    rig.store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_one").expect("valid agent"),
+            session_id: SessionId::new("session_one").expect("valid session"),
+            execution_id: Some(ExecutionId::for_command(CommandId(1))),
+            source: Source::Bridge,
+            source_event_id: Some("2:pressing".to_string()),
+            kind: EventKind::CommandStepped {
+                command_id: CommandId(2),
+                step: CommandStep::Pressing,
+                workspace: None,
+            },
+        })
+        .expect("append");
+    rig.restart();
+    rig.tick();
+    let (ok, error) = rig.finished(2).expect("finished");
+    assert!(!ok);
+    assert!(
+        error.contains("the key y may have reached the pane"),
+        "{error}"
+    );
+    assert!(rig.keys().is_empty(), "not sent again");
+}
+
+/// A key for a session that runs nothing fails with the reason and
+/// presses nothing.
+#[test]
+fn a_key_for_a_stopped_session_fails_with_the_reason() {
+    let mut rig = Rig::new(Duration::ZERO);
+    rig.submit("human", "stop", CommandAction::Stop);
+    rig.tick();
+    assert!(rig.finished(2).is_some_and(|(ok, _)| ok), "the stop");
+    rig.press("spawn_supervisor", "key-esc", NamedKey::Escape);
+    rig.tick();
+    let (ok, error) = rig.finished(3).expect("finished");
+    assert!(!ok);
+    assert!(
+        error.contains("session_one runs no execution: a key needs a running engine"),
+        "{error}"
+    );
+    assert!(rig.steps(3).is_empty());
+    assert!(rig.keys().is_empty());
 }
