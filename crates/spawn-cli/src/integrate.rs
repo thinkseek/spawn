@@ -1550,28 +1550,35 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
-    if !once {
-        write_pid_file(&integrator.judge.root);
+    if once {
+        let pass = integrator.pass();
+        // One pass, and the gates it started run to their records.
+        integrator.settle();
+        return pass
+            .map(|()| 0)
+            .inspect_err(|error| eprintln!("integrate: {error}"));
     }
+    write_pid_file(&integrator.judge.root);
+    run_passes(&integrator, &drain_asked, drain_bound)
+}
+
+/// Pass after pass, until a drain asked by `drain_asked` ends (drained, or
+/// at its bound of `drain_bound` seconds): then Ok(0). TERM ends the
+/// process at once, wherever it is.
+fn run_passes(
+    integrator: &Integrator,
+    drain_asked: &std::sync::atomic::AtomicBool,
+    drain_bound: u64,
+) -> Result<i32, String> {
+    let asked = || drain_asked.load(std::sync::atomic::Ordering::SeqCst);
     let interval = loop_interval().max(Duration::from_secs(5));
     loop {
-        if !once && drain_asked.load(std::sync::atomic::Ordering::SeqCst) && !integrator.draining()
-        {
+        if asked() && !integrator.draining() {
             integrator.begin_drain(integrator.own_store().as_deref(), drain_bound);
         }
         let pass = integrator.pass();
-        if once {
-            // One pass, and the gates it started run to their records.
-            integrator.settle();
-        }
         if let Err(error) = &pass {
             eprintln!("integrate: {error}");
-            if once {
-                return pass.map(|()| 0);
-            }
-        }
-        if once {
-            return Ok(0);
         }
         if integrator.draining()
             && integrator.drained(integrator.own_store().as_deref(), pass.is_ok())
@@ -1579,24 +1586,18 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
             return Ok(0);
         }
         // Between passes, a drain request is taken at once and a drain's
-        // bound is kept to the second.
+        // bound is kept to the fifth of a second.
         let next = std::time::Instant::now() + interval;
         loop {
             let now = std::time::Instant::now();
-            if now >= next
-                || (drain_asked.load(std::sync::atomic::Ordering::SeqCst) && !integrator.draining())
-            {
-                break;
-            }
             if integrator.drain_expired(now) {
                 integrator.expire_drain(integrator.own_store().as_deref());
                 return Ok(0);
             }
+            if now >= next || (asked() && !integrator.draining()) {
+                break;
+            }
             std::thread::sleep((next - now).min(Duration::from_millis(200)));
-        }
-        if integrator.drain_expired(std::time::Instant::now()) {
-            integrator.expire_drain(integrator.own_store().as_deref());
-            return Ok(0);
         }
     }
 }
