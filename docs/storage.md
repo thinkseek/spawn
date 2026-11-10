@@ -209,8 +209,15 @@ commit with a key no agent holds cannot hang or fail a test.
   is lost: the work is the set-aside commit's parent, and the worker's
   notice names both commits. The set-aside is recorded as
   `artifact.committed` (`set_aside`, key `set-aside:<task>`, so it is made
-  once) and pushed like any checkpoint. A merge pending its markers is set
-  aside with the work.
+  once) and pushed like any checkpoint. The branch moves before the record:
+  when the append fails, the next pass asks the store again, which answers
+  with the set-aside already at the branch head (its message names the
+  task) and writes nothing, so that pass records and pushes it. A merge
+  pending its markers is set aside with the work. A file the checkpoints
+  leave out (over the cap, or a special file where the branch holds a file:
+  "Files over the cap") is on no branch; the set-aside removes it from a
+  mounted directory, as an unmount would, so the next task finds none of
+  them and none is in the way of the start's file.
 - **A merge that loses the branch race**: when another writer moved the
   branch between the merge's directory update and its compare-and-swap,
   the directory follows the head that won by the same two-tree update

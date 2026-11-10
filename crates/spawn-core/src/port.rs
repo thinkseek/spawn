@@ -379,6 +379,15 @@ pub trait WorkspaceStore: Send + Sync {
     /// compare-and-swap) and the workspace follows it. The work stays in the
     /// branch's history ([`SetAside::Created`]'s `kept`). A store without
     /// branches has nothing to set aside.
+    ///
+    /// `message` names the task, and the branch moves before the caller
+    /// records the set-aside: asked again with the same `message` while the
+    /// branch head is that set-aside, the store answers the same
+    /// [`SetAside::Created`] and writes nothing, so a record that failed is
+    /// made by the retry. What the workspace's checkpoints leave out (a file
+    /// over the size cap, a special file where the branch holds a file) is
+    /// removed from a mounted workspace: it is on no branch, and must not
+    /// stay for the next task.
     fn set_aside(
         &self,
         branch: &BranchName,
