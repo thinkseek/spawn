@@ -108,7 +108,7 @@ use crate::event::{
 use crate::id::{
     AgentId, BranchName, CommandId, CommitId, ExecutionId, SessionId, TerminalName, WorkspaceId,
 };
-use crate::ingest::{claude_line, claude_version};
+use crate::ingest::{claude_line, claude_usage, claude_version};
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
     BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch, Launch, READ_LIMIT, Runner,
@@ -1596,7 +1596,12 @@ impl Bridge {
             let start = read;
             read += line.len() + 1;
             let line = String::from_utf8_lossy(line);
-            let events = claude_line(&line);
+            let mut events = claude_line(&line);
+            // A model call's usage, for the cost step: before the line's
+            // other events, so a turn's end follows its last call's usage.
+            if let Some(usage) = claude_usage(&line) {
+                events.insert(0, usage);
+            }
             // A turn's checkpoint is part of the turn's end: the workspace
             // is committed (and its `artifact.committed` recorded) before
             // the `turn.stopped` or `turn.failed` that ends it, so whoever

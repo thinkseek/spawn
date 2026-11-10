@@ -968,6 +968,62 @@ pub fn claude_line(line: &str) -> Vec<Normalized> {
     }
 }
 
+/// The model usage an assistant line of a Claude Code transcript carries:
+/// a line of `type` `assistant` with `message.id`, `message.usage` and a
+/// readable `timestamp` (the model `unknown` when `message.model` is
+/// missing). Claude Code writes one line per content block, each repeating
+/// the id, the model and the usage: the key is the message id with its four
+/// counts, so an identical repeat appends nothing, and a line whose usage
+/// grew is one more event, which the cost step folds into the same message
+/// (crate spawn-cli's `cost`: once per message id, its largest usage, its
+/// earliest time). A usage of four zeros (the engine's own synthetic
+/// messages) costs nothing and gives none. A sub-agent's line
+/// (`isSidechain`) is a model call too, and counts.
+pub fn claude_usage(line: &str) -> Option<Normalized> {
+    // Most lines carry no usage: skip them unparsed.
+    if !line.contains("\"usage\"") {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let message = value.get("message")?;
+    let id = message
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())?;
+    let usage = message.get("usage")?;
+    let at_ms = utc_ms(value.get("timestamp").and_then(Value::as_str)?)?;
+    let count = |name: &str| usage.get(name).and_then(Value::as_u64).unwrap_or(0);
+    let (input, output, cache_write, cache_read) = (
+        count("input_tokens"),
+        count("output_tokens"),
+        count("cache_creation_input_tokens"),
+        count("cache_read_input_tokens"),
+    );
+    if input == 0 && output == 0 && cache_write == 0 && cache_read == 0 {
+        return None;
+    }
+    let model = message
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+        .unwrap_or("unknown");
+    Some(keyed(
+        EventKind::ModelUsage {
+            message_id: id.to_string(),
+            model: model.to_string(),
+            at_ms,
+            input_tokens: input,
+            output_tokens: output,
+            cache_write_tokens: cache_write,
+            cache_read_tokens: cache_read,
+        },
+        format!("usage:{id}:{input}:{output}:{cache_write}:{cache_read}"),
+    ))
+}
+
 /// The engine version a Claude Code transcript line names (its `version`
 /// field). Like [`claude_line`], the caller reads only the execution's part
 /// of the file.
@@ -979,7 +1035,55 @@ pub fn claude_version(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{claude_line, claude_version, utc_ms};
+    use super::{claude_line, claude_usage, claude_version, utc_ms};
+
+    #[test]
+    fn an_assistant_messages_usage_is_one_event_per_message_and_usage() {
+        let line = |block: &str, output: u64| {
+            format!(
+                r#"{{"type":"assistant","uuid":"{block}","timestamp":"2026-11-04T05:46:12.345Z","message":{{"id":"msg_1","model":"claude-opus-5-5","content":[{{"type":"text","text":"{block}"}}],"usage":{{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":{output}}}}}}}"#
+            )
+        };
+        let first = claude_usage(&line("a", 5)).expect("a usage");
+        assert_eq!(
+            first.kind,
+            EventKind::ModelUsage {
+                message_id: "msg_1".into(),
+                model: "claude-opus-5-5".into(),
+                at_ms: 1_793_771_172_345,
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_write_tokens: 20,
+                cache_read_tokens: 30,
+            }
+        );
+        // The second content block repeats the message: the same key, so
+        // the log appends it once.
+        let second = claude_usage(&line("b", 5)).expect("a usage");
+        assert_eq!(first.source_event_id, second.source_event_id);
+        // A later line whose usage grew is another event of the message.
+        let grown = claude_usage(&line("c", 9)).expect("a usage");
+        assert_ne!(first.source_event_id, grown.source_event_id);
+        // No usage, no id, no time, all zeros, another type: nothing.
+        for other in [
+            r#"{"type":"assistant","timestamp":"2026-11-04T05:46:12Z","message":{"id":"m","content":[]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-11-04T05:46:12Z","message":{"usage":{"input_tokens":1}}}"#,
+            r#"{"type":"assistant","message":{"id":"m","usage":{"input_tokens":1}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-11-04T05:46:12Z","message":{"id":"m","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0}}}"#,
+            r#"{"type":"user","timestamp":"2026-11-04T05:46:12Z","message":{"id":"m","usage":{"input_tokens":1}}}"#,
+            "not json \"usage\"",
+        ] {
+            assert_eq!(claude_usage(other), None, "{other}");
+        }
+        // No model named: counted under `unknown`.
+        let unnamed = claude_usage(
+            r#"{"type":"assistant","timestamp":"2026-11-04T05:46:12Z","message":{"id":"m","usage":{"output_tokens":3}}}"#,
+        )
+        .expect("a usage");
+        assert!(
+            matches!(unnamed.kind, EventKind::ModelUsage { ref model, .. } if model == "unknown")
+        );
+    }
 
     #[test]
     fn a_line_names_the_engine_version_it_was_written_by() {

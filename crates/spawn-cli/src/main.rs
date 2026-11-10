@@ -34,6 +34,7 @@ mod backup;
 mod commands;
 mod config;
 mod context;
+mod cost;
 mod deliver;
 mod disk;
 mod dispatch;
