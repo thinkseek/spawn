@@ -44,6 +44,7 @@ interface SidebarProps {
   onShowRsi: () => void;
   onShowAlerts: () => void;
   onShowScorecard: () => void;
+  onShowCost: () => void;
   onShowShow: () => void;
   onShowSessions: () => void;
   onSelect: (sessionId: string) => void;
@@ -77,6 +78,7 @@ export function Sidebar({
   onShowRsi,
   onShowAlerts,
   onShowScorecard,
+  onShowCost,
   onShowShow,
   onSelect,
 }: SidebarProps) {
@@ -159,6 +161,12 @@ export function Sidebar({
           onClick={onShowScorecard}
           icon={<Gauge size={15} />}
           label="Scorecard"
+        />
+        <NavItem
+          active={view === "cost"}
+          onClick={onShowCost}
+          icon={<CircleDollarSign size={15} />}
+          label="Cost"
         />
         <NavItem
           active={view === "show"}
@@ -536,6 +544,7 @@ export function MobileNav({
   onShowRsi,
   onShowAlerts,
   onShowScorecard,
+  onShowCost,
   onShowShow,
   onShowSessions,
 }: Pick<
@@ -548,6 +557,7 @@ export function MobileNav({
   | "openAlerts"
   | "onShowAlerts"
   | "onShowScorecard"
+  | "onShowCost"
   | "onShowShow"
   | "onShowSessions"
 >) {
@@ -562,6 +572,7 @@ export function MobileNav({
             ["rsi", "RSI", <Activity key="a" size={13} />, onShowRsi],
             ["alerts", "Alerts", <BellRing key="b" size={13} />, onShowAlerts],
             ["scorecard", "Score", <Gauge key="g" size={13} />, onShowScorecard],
+            ["cost", "Cost", <CircleDollarSign key="c" size={13} />, onShowCost],
             ["show", "Show", <Waypoints key="w" size={13} />, onShowShow],
             ["sessions", "Sessions", <Rows3 key="s" size={13} />, onShowSessions],
           ] as const
