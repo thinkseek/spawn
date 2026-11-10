@@ -4262,6 +4262,9 @@ $$;
 --   open, or finished, after the first marking loop started (the bound runs
 --   from the later of its creation and that start). A command an
 --   older Spawn typed has `typing` and no `message.typed`: never not taken.
+--   Nothing is tracked in a session whose transcript has never held a
+--   marker (no `message.taken` at all): an engine that does not keep the
+--   prompt it is given says nothing by its silence.
 -- - `typed`: whether the Bridge recorded it typed; `ended`: the session ended
 --   with it (what the alert clears on): the execution it was typed into, or
 --   its own start's, ended; or, never typed or started, it finished while no
@@ -4312,7 +4315,13 @@ begin
            and e.id > v_taken_id
          order by e.id limit 1;
     end if;
-    if v_marked then
+    if not exists (select 1 from spawn_events e
+                    where e.session_id = p_session and e.event_name = 'message.taken') then
+        -- The session's transcript has never held a marker: its engine (or
+        -- a stand-in) does not keep the prompt it is given, and its silence
+        -- says nothing about any message.
+        v_tracked := false;
+    elsif v_marked then
         v_tracked := true;
         v_from := p_created;
     elsif v_typing_exec is null and p_marked_from is not null
