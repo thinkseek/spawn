@@ -3653,6 +3653,55 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
     assert_eq!(pending.as_array().map(Vec::len), Some(1), "{pending}");
     assert_eq!(pending[0]["request"], json!(third));
 
+    // `spawn mission pushes`: one source's requests, newest first, each with
+    // the state `push --wait` would say and its outcome record.
+    let listed = store.source_pushes(source, None, 20).expect("pushes");
+    let rows = listed.as_array().expect("a list");
+    let seen: Vec<(i64, &str)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row["request"].as_i64().unwrap_or(0),
+                row["state"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [(second, "applied"), (request, "refused")],
+        "newest first, this source only: {listed}"
+    );
+    assert_eq!(rows[0]["commit"], c2.as_str());
+    assert_eq!(rows[0]["ref"], owner_ref(&c2).as_str());
+    assert_eq!(rows[0]["gated"], json!(false));
+    assert_eq!(rows[0]["outcome"]["type"], "source.moved");
+    assert_eq!(rows[0]["outcome"]["event_id"], json!(moved));
+    assert_eq!(rows[0]["outcome"]["to"], "n1");
+    assert_eq!(rows[1]["outcome"]["type"], "source.push_refused");
+    assert_eq!(rows[1]["outcome"]["event_id"], json!(refused));
+    assert_eq!(rows[1]["outcome"]["reason"], "conflict");
+    let elsewhere_listed = store.source_pushes(other, None, 20).expect("pushes");
+    assert_eq!(elsewhere_listed.as_array().map(Vec::len), Some(1));
+    assert_eq!(elsewhere_listed[0]["request"], json!(third));
+    assert_eq!(elsewhere_listed[0]["state"], "pending");
+    assert_eq!(elsewhere_listed[0]["outcome"], json!(null));
+    let only_c1 = store
+        .source_pushes(source, Some(&c1[..12]), 20)
+        .expect("pushes");
+    assert_eq!(only_c1.as_array().map(Vec::len), Some(1), "{only_c1}");
+    assert_eq!(only_c1[0]["request"], json!(request));
+    let only_c3_here = store.source_pushes(source, Some(&c3), 20).expect("pushes");
+    assert_eq!(only_c3_here, json!([]), "another source's commit");
+    let newest = store.source_pushes(source, None, 1).expect("pushes");
+    assert_eq!(newest.as_array().map(Vec::len), Some(1));
+    assert_eq!(newest[0]["request"], json!(second));
+    assert_eq!(
+        store
+            .source_pushes("/no/such/source", None, 20)
+            .expect("pushes"),
+        json!([])
+    );
+
     let live = tables(&mut client);
     refold(&mut client);
     assert_eq!(

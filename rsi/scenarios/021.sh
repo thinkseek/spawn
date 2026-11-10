@@ -42,7 +42,9 @@
 #       `source.moved` naming it, `from` beta2's landing, SB's main the
 #       owner's landing merge (first parent beta2's landing, second the
 #       owner's commit), holding beta2.txt, and B's baseline that main. One
-#       gate of beta2 ran. B is never halted; the integrator is the same
+#       gate of beta2 ran. `spawn mission pushes --source SB --commit
+#       <commit>` lists the request, `pending` while it waits and `applied`
+#       with its source.moved once landed. B is never halted; the integrator is the same
 #       process.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
@@ -62,7 +64,8 @@
 # Fails with 1 at (2) on 763deaa5 (batch 15, before D1): the integrator
 # applies the request while beta2's gate runs on SB ("SB's main is the
 # owner's second commit while beta2's gate ran"), and beta2's verdict comes
-# back `stale`.
+# back `stale`. Fails with 1 at (2) on 09c5c1bc (batch 17's base): there
+# is no `spawn mission pushes`.
 # Runs inside the gate's sandbox (scripts/rsi/gate.sh): needs SPAWN_BIN and
 # SPAWN_TEST_DATABASE_URL, creates and drops its own database, uses a
 # private tmux socket, no network. Every wait is bounded in time.
@@ -430,6 +433,19 @@ owner_push() {
         source.push_requested "$2 the record of request $request"
 }
 
+# `spawn mission pushes --source <SB> --commit <commit>`, as the owner checks
+# a push: sets `pushed` to the state of request $request in it (one row of
+# it, newest first), `pushed_outcome` to its outcome's event id.
+owner_pushes() {
+    capture "$SPAWN_BIN" mission pushes --source "$sb" --commit "$commit"
+    [ "$status" -eq 0 ] ||
+        fail "$1 \`spawn mission pushes --source <SB> --commit $commit\` exited $status: $(err | head -c 300)"
+    pushed=$(jq -r --argjson r "$request" \
+        'if length == 1 and .[0].request == $r then .[0].state else "rows \(map(.request))" end' \
+        "$WORK/out.txt" 2>/dev/null) || fail "$1 \`spawn mission pushes\` printed no list: $(out | head -c 300)"
+    pushed_outcome=$(jq -r '.[0].outcome.event_id // empty' "$WORK/out.txt")
+}
+
 # --- two missions, two sources ------------------------------------------------------
 
 for name in alpha beta; do
@@ -526,6 +542,9 @@ until grep -qF "$waits" "$WORK/integrate.log"; do
     sleep 0.5
 done
 assert_eq "$(applied "$request")" 0 "(2) a source.moved for the owner's push while beta2's gate runs"
+owner_pushes "(2) while beta2's gate runs"
+assert_eq "$pushed" pending "(2) the owner's push in \`spawn mission pushes\` while it waits"
+assert_eq "$pushed_outcome" "" "(2) the waiting push's outcome in \`spawn mission pushes\`"
 assert_eq "$(main_of "$sb")" "$first_base" "(2) SB's main while beta2's gate runs (the main it judged)"
 assert_eq "$(gate_records "$t_beta2")" "" "(2) beta2's gate records while its gate runs"
 no_halt "(2) while beta2's gate runs"
@@ -554,6 +573,13 @@ until [ "$(applied "$request")" -gt 0 ]; do
     sleep 0.5
 done
 moved2=$(applied "$request")
+owner_pushes "(2) after the owner's landing"
+assert_eq "$pushed" applied "(2) the owner's push in \`spawn mission pushes\` once landed"
+assert_eq "$pushed_outcome" "$(q "select id from spawn_events
+                                  where session_id = 'session_control'
+                                    and kind -> 'detail' -> 'record' ->> 'type' = 'source.moved'
+                                    and kind -> 'detail' -> 'record' ->> 'request' = '$request'")" \
+    "(2) the landed push's outcome in \`spawn mission pushes\` (its source.moved)"
 assert_eq "$(field "$moved2" from)" "$landing" "(2) the source.moved record's from (beta2's landing)"
 assert_eq "$(field "$moved2" to)" "$(main_of "$sb")" "(2) the source.moved record's to (SB's main)"
 assert_eq "$(git --git-dir="$sb" rev-parse main^1)" "$landing" \
