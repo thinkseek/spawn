@@ -3517,4 +3517,171 @@ expect "a prerequisite in no known form is an abort (exit 3)" "$(judge "$good" "
 expect "which names the line" "$(cat "$work/gate.out")" \
     '`# needs: web/node_modules` is not controller:<path>, tool:<name> or an absolute path'
 
+# 27. Results reused from the base (GitHub issue #48): a regression whose
+# scenario declares what a run reads of the tree (`# reads: binary
+# [<path> ...]`) is not run on the candidate when the candidate's `spawn`
+# is, byte for byte, the binary the base's solved result was taken on, and
+# what it reads is the same in both trees. The build hook here writes a
+# `spawn` from src/main.txt, so a candidate that leaves that file alone
+# builds the base's binary. 401 reads the binary alone, 402 a document too,
+# 403 declares nothing, 404 is on the serial list, 405 is unsolved on the
+# base, and the check has no result on the base at all.
+reuse_controller=$work/reuse
+rdir=$reuse_controller/rsi/scenarios
+mkdir -p "$rdir"
+cp "$scenarios/protected" "$rdir/"
+cat >"$rdir/build" <<'EOF_REUSE'
+#!/bin/sh
+mkdir -p target/debug
+{ printf '#!/bin/sh\n'; printf 'echo "%s"\n' "$(cat src/main.txt)"; } >target/debug/spawn
+chmod 755 target/debug/spawn
+EOF_REUSE
+reuse_scenario() { # <name> <declaration or nothing> [<more commands>]
+    {
+        printf '#!/bin/sh\n'
+        [ -z "$2" ] || printf '%s\n' "$2"
+        printf 'echo "%s ran in $(basename "$PWD")"\n' "$1"
+        printf '%s\n' "${3:-[ -n \"\$(\"\$SPAWN_BIN\")\" ]}"
+    } >"$rdir/$1.sh"
+}
+reuse_scenario 401 '# reads: binary'
+reuse_scenario 402 '# reads: binary docs/guide.md' '[ -n "$("$SPAWN_BIN")" ] && [ -s docs/guide.md ]'
+reuse_scenario 403 ''
+reuse_scenario 404 '# reads: binary'
+reuse_scenario 405 '# reads: binary' 'exit 1'
+reuse_scenario check-declared '# reads: binary'
+printf '404.sh\n' >"$rdir/serial"
+git -C "$seed" checkout -q -B reuse-a "$base"
+mkdir -p "$seed/src" "$seed/docs" "$seed/rsi/scenarios"
+printf 'v1\n' >"$seed/src/main.txt"
+printf 'a guide\n' >"$seed/docs/guide.md"
+printf 'notes\n' >"$seed/docs/notes.md"
+cp "$rdir/401.sh" "$seed/rsi/scenarios/401.sh"
+reuse_a=$(commit reuse-a)
+reuse_candidate() { # <name> <file> <content>: a candidate on reuse-a; prints its commit
+    git -C "$seed" checkout -q -B "$1" "${4:-$reuse_a}"
+    printf '%s\n' "$3" >"$seed/$2"
+    commit "$1"
+}
+reuse_docs=$(reuse_candidate reuse-docs docs/notes.md 'other notes')
+reuse_crate=$(reuse_candidate reuse-crate src/main.txt 'v2')
+reuse_broken=$(reuse_candidate reuse-broken src/main.txt '')
+reuse_copy=$(reuse_candidate reuse-copy rsi/scenarios/401.sh '# another 401')
+reuse_guide=$(reuse_candidate reuse-guide docs/guide.md 'another guide')
+reuse_judge() { # <base> <candidate> [VAR=value]
+    (
+        export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$work/caches/reuse" ${3:+"$3"}
+        base=$1
+        judge "$2" "" "$rdir"
+    )
+}
+reuse_cache=$work/caches/reuse/spawn/gate-base
+expect "a candidate that builds the base's binary: the declared scenarios are not run, and the verdict names them" \
+    "$(reuse_judge "$reuse_a" "$reuse_docs")" 'exit=0 {"verdict":"accepted","reused":["401.sh","402.sh"]}'
+reuse_log=$(cat "$work/gate.out")
+expect "the log says so per scenario, and why" "$reuse_log" \
+    "| == regression: 401.sh must still pass: not run, the base's result (solved) is reused: it declares that a run reads only this of the tree: binary; the candidate's spawn is the binary the base's result was taken on, byte for byte (sha256 "
+expect "where the base's result is from" "$reuse_log" "the base's result is a run in this gate; the scenario and the paths it reads are the same in both trees"
+expect "the paths one declares are in the reason" "$reuse_log" \
+    'reused: it declares that a run reads only this of the tree: binary docs/guide.md;'
+expect "and once for all" "$reuse_log" \
+    '| reused from the base, not run on the candidate: 401.sh 402.sh (SPAWN_GATE_REUSE=0 runs them)'
+expect "the base ran them" "$reuse_log" '| 401 ran in baseline'
+refuse "the candidate did not run 401" "$reuse_log" '| 401 ran in candidate'
+refuse "nor 402" "$reuse_log" '| 402 ran in candidate'
+expect "a scenario that declares nothing is run" "$reuse_log" '| 403 ran in candidate'
+expect "one on the serial list is run, whatever it declares" "$reuse_log" '| 404 ran in candidate'
+expect "and the log says why" "$reuse_log" \
+    '| 404.sh declares what it reads and is run all the same: it is on the serial list'
+expect "one the base did not solve is run" "$reuse_log" \
+    '| 405.sh declares what it reads and is run all the same: the base did not solve it (unsolved)'
+expect "a check has no result on the base: run" "$reuse_log" \
+    '| check-declared.sh declares what it reads and is run all the same: only an objective (<digits>.sh) has a result on the base'
+expect "a reused result has a stage line of its own" "$reuse_log" \
+    '| stage gate reused 0ms regression: 401.sh must still pass'
+refuse "a reused result seeds nothing: only a run writes an entry" "$reuse_log" '401.sh: solved on the candidate'
+expect "a run does" "$reuse_log" '| 403.sh: solved on the candidate, seeded'
+# Four the base solved (401 to 404), two the candidate's runs seeded (403, 404).
+expect "every solved entry names the binary its run ran" \
+    "$(cat "$reuse_cache"/* 2>/dev/null | grep -cE '^binary [0-9a-f]{64}$') of $(cat "$reuse_cache"/* 2>/dev/null | grep -c '^solved$')" '6 of 6'
+# The base read whole from the cache: no base build, and the binary the
+# entries name is still what the candidate's is compared with.
+expect "with the base's results all cached, the same reuse" \
+    "$(reuse_judge "$reuse_a" "$reuse_docs")" 'exit=0 {"verdict":"accepted","reused":["401.sh","402.sh"]}'
+refuse "the base was not built for it" "$(cat "$work/gate.out")" '| == base: build'
+expect "the reason says the result is the cache's" "$(cat "$work/gate.out")" \
+    "the base's result is an entry of the base cache, which a run wrote;"
+expect "the switch turns it off: everything is run" \
+    "$(reuse_judge "$reuse_a" "$reuse_docs" SPAWN_GATE_REUSE=0)" 'exit=0 {"verdict":"accepted"}'
+expect "401 ran" "$(cat "$work/gate.out")" '| 401 ran in candidate'
+expect "402 ran" "$(cat "$work/gate.out")" '| 402 ran in candidate'
+expect "and the log says it is the switch" "$(cat "$work/gate.out")" \
+    '| 401.sh declares what it reads and is run all the same: SPAWN_GATE_REUSE=0'
+expect "a switch that is neither 0 nor 1 is an abort (exit 3)" \
+    "$(reuse_judge "$reuse_a" "$reuse_docs" SPAWN_GATE_REUSE=maybe)" 'exit=3 '
+# One byte of the crate: another binary, so nothing is reused.
+expect "a candidate that changes the binary: accepted, nothing reused" \
+    "$(reuse_judge "$reuse_a" "$reuse_crate")" 'exit=0 {"verdict":"accepted"}'
+reuse_log=$(cat "$work/gate.out")
+expect "401 ran on it" "$reuse_log" '| 401 ran in candidate'
+expect "402 ran on it" "$reuse_log" '| 402 ran in candidate'
+expect "and the log says the binaries differ" "$reuse_log" \
+    "| 401.sh declares what it reads and is run all the same: the candidate's spawn (sha256 "
+refuse "nothing is said to be reused" "$reuse_log" '| reused from the base'
+expect "a candidate that breaks the binary is still a regression of a declared scenario" \
+    "$(reuse_judge "$reuse_a" "$reuse_broken")" \
+    'exit=0 {"verdict":"rejected","reason":"regression: 401.sh fails on the candidate"}'
+# The scenario's own file, changed in the candidate's tree: that scenario
+# is run; the other declared one is still reused.
+expect "a candidate that changes the scenario's file: that one is run" \
+    "$(reuse_judge "$reuse_a" "$reuse_copy")" 'exit=0 {"verdict":"accepted","reused":["402.sh"]}'
+expect "401 ran" "$(cat "$work/gate.out")" '| 401 ran in candidate'
+expect "and the log says why" "$(cat "$work/gate.out")" \
+    '| 401.sh declares what it reads and is run all the same: the candidate changes rsi/scenarios/401.sh'
+expect "a candidate that changes a path a scenario reads: that one is run" \
+    "$(reuse_judge "$reuse_a" "$reuse_guide")" 'exit=0 {"verdict":"accepted","reused":["401.sh"]}'
+expect "402 ran" "$(cat "$work/gate.out")" '| 402 ran in candidate'
+expect "and the log names the path" "$(cat "$work/gate.out")" \
+    '| 402.sh declares what it reads and is run all the same: docs/guide.md, which it reads, differs between the base and the candidate'
+# A seeded entry is a run's too (the candidate's, in the gate that accepted
+# it): the gate of reuse-crate ran 401 and 402 on that commit, so a
+# candidate on it that builds the same binary reuses them.
+reuse_next=$(reuse_candidate reuse-next docs/notes.md 'more notes' "$reuse_crate")
+expect "a result seeded by a candidate's run is reused on the next base" \
+    "$(reuse_judge "$reuse_crate" "$reuse_next")" 'exit=0 {"verdict":"accepted","reused":["401.sh","402.sh"]}'
+expect "the base's result was the seed" "$(cat "$work/gate.out")" \
+    "| == base: 401.sh: solved (cached, seeded by the gate of $reuse_crate at "
+refuse "401 did not run on the candidate" "$(cat "$work/gate.out")" '| 401 ran in candidate'
+# The controller's scenario changed since the entry was written: another
+# key, so the base runs it again, and what is reused is that run's result,
+# never one another version of the scenario earned.
+printf '# a comment more\n' >>"$rdir/401.sh"
+expect "a scenario the controller changed is run again on the base" \
+    "$(reuse_judge "$reuse_a" "$reuse_docs")" 'exit=0 {"verdict":"accepted","reused":["401.sh","402.sh"]}'
+reuse_log=$(cat "$work/gate.out")
+expect "run there" "$reuse_log" '| 401 ran in baseline'
+expect "and that run's result is the one reused" "$reuse_log" \
+    "| == regression: 401.sh must still pass: not run, the base's result (solved) is reused"
+# An entry that names no binary (another gate's, an older one's): the gate
+# does not guess what it was taken on.
+for entry in "$reuse_cache"/*; do
+    case "$entry" in *.lock) continue ;; esac
+    if grep -q '^binary ' "$entry"; then sed -i '/^binary /d' "$entry"; fi
+done
+expect "an entry that names no binary is believed and never reused from" \
+    "$(reuse_judge "$reuse_a" "$reuse_docs")" 'exit=0 {"verdict":"accepted"}'
+expect "the log says so" "$(cat "$work/gate.out")" \
+    "| 401.sh declares what it reads and is run all the same: the base's result names no binary it was taken on"
+expect "and 401 ran" "$(cat "$work/gate.out")" '| 401 ran in candidate'
+# A binary line that is not whole makes the entry a miss, judged again.
+for entry in "$reuse_cache"/*; do
+    case "$entry" in *.lock) continue ;; esac
+    [ "$(cat "$entry")" != solved ] || printf 'solved\nbinary abc\n' >"$entry"
+done
+expect "an entry whose binary line is not a sha256 is a miss" \
+    "$(reuse_judge "$reuse_a" "$reuse_docs")" 'exit=0 {"verdict":"accepted","reused":["401.sh","402.sh"]}'
+expect "judged again on the base" "$(cat "$work/gate.out")" \
+    '| == base: 401.sh: its cache entry cannot be read; judged again'
+git -C "$seed" checkout -q main 2>/dev/null || git -C "$seed" checkout -q -B main "$base"
+
 echo "gate: all cases pass"

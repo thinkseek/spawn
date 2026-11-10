@@ -132,6 +132,35 @@
 # that breaks that objective land. Closing that needs the gate under a uid
 # agents do not have.
 #
+# Results reused from the base (GitHub issue #48). A candidate that changes
+# no crate builds the base's `spawn` again, byte for byte, and a scenario
+# that only drives that binary then says on the candidate what it said on
+# the base. Such a regression is not run: the base's `solved` is the
+# candidate's, said in the log per scenario with the reason, and named in
+# the verdict (`"reused":["007.sh",...]`), so a verdict still says which
+# results were runs. Only when all of this holds ("reuse_plan" below), and
+# anything else is a run:
+# - the scenario opts in: a line `# reads: binary [<path> ...]` says what a
+#   run of it reads of the tree under test, all of it: `binary` (SPAWN_BIN)
+#   and paths inside the tree. One that declares nothing is never reused;
+# - the candidate's `spawn` (target/gate/spawn, hashed as the build hook
+#   left it, before anything else ran in the tree) has the sha256 of the
+#   binary the base's result was taken on. That hash is in the base cache
+#   entry (`binary <sha256>`, written with the result by the run that
+#   earned it), so a base phase read whole from the cache still knows it;
+#   an entry without one is never reused from;
+# - the base's result is `solved`, by a run in this gate or an entry a run
+#   wrote (a base run, or a candidate run's seed); a reused result seeds
+#   nothing, so no result is ever two reuses away from a run;
+# - every path it declares is the same in both commits and in both
+#   exported trees, and the tree's own copy of the scenario is the same in
+#   both commits (the run would use the controller's, as always: a
+#   candidate that edits a scenario is run on it all the same);
+# - it is not on the `serial` list (a load-sensitive result is that run's
+#   own), not the task's scenario, not a check, and neither it nor a file
+#   it names reads SPAWN_BASELINE_TREE, runs cargo or reads target/.
+# SPAWN_GATE_REUSE=0 turns it off: every regression is run.
+#
 # A tree that is not Spawn names its owner-installed inputs (dependencies the
 # sandbox cannot download) in `<scenarios-dir>/bind`: absolute directories
 # under $HOME, bound read-only at the same path.
@@ -230,6 +259,13 @@
 #                              test listing, inside the sandbox (whole number
 #                              from 1); unset by default (cargo's own, every
 #                              core), and 1 for --base-only, whatever is set
+#   SPAWN_GATE_REUSE           0: no regression's result is taken from the
+#                              base ("Results reused from the base"), all
+#                              are run; default 1. On by default because a
+#                              scenario is reused only when the owner
+#                              declared what it reads (`# reads:`), so with
+#                              no declaration nothing changes; spawn
+#                              integrate does not pass it
 #   SPAWN_GATE_BASE_CHECK      a check's file name (check-<name>.sh, one of
 #                              the scenarios): run on the base before the
 #                              candidate, the main a source was red on
@@ -497,6 +533,7 @@ EOF
 
 metric=""
 flakes=""
+reused=""
 
 # JSON string body: backslash, quote and tab escaped, newlines as \n, other
 # control characters dropped.
@@ -524,6 +561,9 @@ verdict() {
     # The checks that failed once and passed again on the candidate (a
     # flake, not a regression), in the log's order.
     [ -n "${flakes-}" ] && json="$json,\"flakes\":[$flakes]"
+    # The regressions not run on the candidate: the base's result, reused
+    # ("Results reused from the base"), in the scenario order.
+    [ -n "${reused-}" ] && json="$json,\"reused\":[$reused]"
     # The check main was red on (SPAWN_GATE_BASE_CHECK), when it passed on
     # this base before any candidate code ran: main is green on it again,
     # whatever this gate ends with (gate.rs reads it from any fact).
@@ -941,6 +981,17 @@ if [ -n "$gate_build_jobs" ]; then
     esac
 fi
 [ -z "$base_only" ] || gate_build_jobs=1
+# Whether a regression's result may be taken from the base ("Results reused
+# from the base"): unless SPAWN_GATE_REUSE=0.
+gate_reuse=${SPAWN_GATE_REUSE-}
+case "$gate_reuse" in
+'' | 1) gate_reuse=1 ;;
+0) ;;
+*)
+    echo "gate: SPAWN_GATE_REUSE is 0 or 1, not '$gate_reuse'" >&2
+    exit 3
+    ;;
+esac
 # The host's scenario budget (see "Host scenario slots"): SPAWN_GATE_HOST_JOBS,
 # else the value every gate is given (SPAWN_GATE_JOBS) when the owner set
 # it, else the same default one gate takes. Without flock, or a writable
@@ -1992,6 +2043,18 @@ spawn_bin() {
     fi
 }
 
+# binary_hash <tree>: the sha256 of the binary the tree's scenarios run, the
+# copy snapshot_bin made (target/gate/spawn), or nothing: a tree whose build
+# made no `spawn`, or a path that is no plain file. Read by the gate itself,
+# outside the sandbox. It is what "the same binary" means for a result
+# reused from the base: the build hook builds `spawn` alone (`cargo build
+# --bin spawn`), SPAWN_BIN is this copy, and a scenario that runs anything
+# else of target/ may not declare `# reads: binary`.
+binary_hash() {
+    [ -f "$1/target/gate/spawn" ] && [ ! -L "$1/target/gate/spawn" ] || return 0
+    sha256sum <"$1/target/gate/spawn" 2>/dev/null | cut -d' ' -f1
+}
+
 serial_list=""
 if [ -f "$scenarios/serial" ]; then
     serial_list=$(grep -v '^#' "$scenarios/serial" | grep . || true)
@@ -2671,7 +2734,11 @@ fi
 # else, is a miss, judged again and rewritten. Candidate runs are never
 # cached. A hit touches its entry: spawn-maintenance removes entries no
 # gate used for 14 days (scripts/maintenance.sh). The log says which
-# results came from the cache.
+# results came from the cache. A `solved` entry also names the binary the
+# run that wrote it ran, on its last line (`binary <sha256>`: binary_hash,
+# taken after the build and found the same after the run), when the tree
+# built one: not in the key, which is known before any build, but beside
+# the result, for "Results reused from the base".
 #
 # - whether the scenario runs alone (the `serial` list): a scenario put on
 #   it because it collides with its neighbours is judged again, alone;
@@ -2808,26 +2875,56 @@ toolchain_server() {
         printf 'server unreachable: psql exit %s%s' "${tc_status:-unknown}" "${tc_said:+ ($tc_said)}"
     fi
 }
-# entry_result <entry>: solved, unsolved or cannot_judge (see "A scenario
+# entry_read <entry>: solved, unsolved or cannot_judge (see "A scenario
 # that cannot be judged here"), as the entry holds it; nothing for an entry
 # that is missing, unreadable, or holds anything else. A seeded entry
 # ("Seeds from the accepting gate", below) is `solved` and a second line,
-# `seeded-by-gate <candidate commit> at <UTC time>`, and nothing else.
-entry_result() {
-    entry_held=""
+# `seeded-by-gate <candidate commit> at <UTC time>`. A solved entry of either
+# kind may end with `binary <sha256>`, the binary its run ran ("The base
+# cache"), and then this prints `solved <sha256>`: one read of the file, so
+# the result and the binary are never two entries'. Nothing else.
+entry_read() {
+    entry_held="" entry_bin=""
     if [ -e "$1" ] || [ -L "$1" ]; then
         entry_held=$(cat -- "$1" 2>/dev/null) || entry_held=""
     fi
-    case "$entry_held" in
-    solved | unsolved | cannot_judge) printf '%s' "$entry_held" ;;
-    "solved
-seeded-by-gate "*)
-        [ "$(printf '%s\n' "$entry_held" | wc -l)" -eq 2 ] &&
-            printf '%s\n' "$entry_held" | sed -n 2p |
-            grep -qE '^seeded-by-gate [0-9a-f]{40} at [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' &&
-            printf solved
+    entry_last=${entry_held##*
+}
+    case "$entry_last" in
+    "binary "*)
+        # Only whole, last, and under a solved result.
+        if [ "$entry_last" != "$entry_held" ] &&
+            printf '%s\n' "$entry_last" | grep -qE '^binary [0-9a-f]{64}$'; then
+            entry_bin=" ${entry_last#binary }"
+            entry_held=${entry_held%
+*}
+            case "$entry_held" in
+            solved | "solved
+seeded-by-gate "*) ;;
+            *) entry_held="" ;;
+            esac
+        else
+            entry_held=""
+        fi
         ;;
     esac
+    case "$entry_held" in
+    solved) printf 'solved%s' "$entry_bin" ;;
+    unsolved | cannot_judge) printf '%s' "$entry_held" ;;
+    "solved
+seeded-by-gate "*)
+        if [ "$(printf '%s\n' "$entry_held" | wc -l)" -eq 2 ] &&
+            printf '%s\n' "$entry_held" | sed -n 2p |
+            grep -qE '^seeded-by-gate [0-9a-f]{40} at [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'; then
+            printf 'solved%s' "$entry_bin"
+        fi
+        ;;
+    esac
+}
+# entry_result <entry>: the result alone.
+entry_result() {
+    entry_said=$(entry_read "$1")
+    printf '%s' "${entry_said%% *}"
 }
 # entry_origin <entry>: the seed line of a seeded entry, or nothing.
 entry_origin() {
@@ -2869,14 +2966,14 @@ base_job() {
                 # A whole gate needs the result: it waits for the key
                 # holding no slot, and reads the entry the other gate left.
                 flock 8
-                result=$(entry_result "$entry")
+                base_job_read
                 [ -z "$result" ] || break
                 flock -u 8
             done
         else
             flock 8
         fi
-        [ -n "$result" ] || result=$(entry_result "$entry")
+        [ -n "$result" ] || base_job_read
         if [ -n "$result" ]; then
             base_job_release
             touch -c -- "$entry" 2>/dev/null || :
@@ -2936,8 +3033,21 @@ base_job() {
         base_job_release
         return 0
     fi
+    # A solved result names the binary it was taken on ("The base cache"):
+    # the base's `spawn` as its build left it, when it is that still. One
+    # that changed under the run (the tree is the run's to write) is named
+    # by nothing, so nothing is reused from this result.
+    entry_text=$result
+    if [ "$result" = solved ]; then
+        base_bin=$(cat "$work/base-binary" 2>/dev/null) || base_bin=""
+        if [ -n "$base_bin" ] && [ "$(binary_hash "$work/baseline")" = "$base_bin" ]; then
+            entry_text="solved
+binary $base_bin"
+            printf '%s\n' "$base_bin" >"$job/binary"
+        fi
+    fi
     if [ -d "$entry" ] && [ ! -L "$entry" ]; then rm -rf -- "$entry"; fi
-    if ! { printf '%s\n' "$result" >"$entry.$$" && mv -fT -- "$entry.$$" "$entry"; } 2>/dev/null; then
+    if ! { printf '%s\n' "$entry_text" >"$entry.$$" && mv -fT -- "$entry.$$" "$entry"; } 2>/dev/null; then
         rm -f -- "$entry.$$"
         job_say "| base cache: could not write the entry of $name"
     fi
@@ -2945,6 +3055,13 @@ base_job() {
     job_stage "$(($(stage_now) - run_at))" "$result" "$run_name"
     job_done "$result"
     base_job_release
+}
+# base_job_read: the entry's result (`result`), and the binary a solved one
+# names, kept in <job>/binary for base_printed.
+base_job_read() {
+    base_held=$(entry_read "$entry")
+    result=${base_held%% *}
+    case "$base_held" in "solved "*) printf '%s\n' "${base_held#solved }" >"$job/binary" ;; esac
 }
 # base_never_started: the run's sandbox never started its command
 # (sandbox_never): no result, so no cache entry; base_printed states the
@@ -2978,10 +3095,12 @@ base_printed() {
     cached)
         from_cache="$from_cache $printed_name"
         result=$3
+        base_how="an entry of the base cache, which a run wrote"
         ;;
     solved | unsolved | cannot_judge)
         run_on_base="$run_on_base $printed_name"
         result=$2
+        base_how="a run in this gate"
         ;;
     skipped)
         # A warm's key another gate was judging (base_job): that gate
@@ -3008,7 +3127,14 @@ base_printed() {
     esac
     printf '%s|%s\n' "$result" "$(cat "$1/scenario")" >>"$work/base-results"
     case "$result" in
-    solved) solved_note "$(cat "$1/scenario")" "$(cat "$1/solved-key" 2>/dev/null)" ;;
+    solved)
+        solved_note "$(cat "$1/scenario")" "$(cat "$1/solved-key" 2>/dev/null)"
+        # The binary this result was taken on and where the result is from,
+        # for a reuse of it on the candidate (reuse_plan).
+        if [ -s "$1/binary" ]; then
+            printf '%s|%s|%s\n' "$(cat "$1/binary")" "$base_how" "$(cat "$1/scenario")" >>"$work/base-binaries"
+        fi
+        ;;
     unsolved)
         red_at=$(main_red_of "$(cat "$1/scenario")" "$(cat "$1/solved-key" 2>/dev/null)")
         if [ -n "$red_at" ]; then
@@ -3160,6 +3286,7 @@ fi
 # The base phase: every objective's key (and its result, when the cache
 # has it), then one build of the base for those it has not, then their runs.
 : >"$work/base-results"
+: >"$work/base-binaries"
 : >"$work/base-keys"
 from_cache=""
 run_on_base=""
@@ -3195,7 +3322,8 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
         objective_key - "$toolchain_key" "$objective" >"$job/solved-key"
     fi
     if runs_alone "$objective"; then : >"$job/alone"; fi
-    result=$(entry_result "$entry")
+    held=$(entry_read "$entry")
+    result=${held%% *}
     if [ -z "$result" ] && { [ -e "$entry" ] || [ -L "$entry" ]; }; then
         echo "| == base: $objective_name: its cache entry cannot be read; judged again" >"$job/text.0"
     fi
@@ -3206,6 +3334,8 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
         echo "| == base: $objective_name: $result (cached${origin:+, $origin})" >"$job/text.0"
         printf 'text %s\n' "$job/text.0" >"$job/events"
         echo "cached $result" >"$job/result"
+        # The binary a solved entry names (entry_read), for base_printed.
+        case "$held" in "solved "*) printf '%s\n' "${held#solved }" >"$job/binary" ;; esac
     else
         base_misses=$((base_misses + 1))
     fi
@@ -3227,6 +3357,9 @@ if [ "$base_misses" -gt 0 ]; then
         echo "gate: cannot copy the base's spawn for its scenarios" >&2
         exit 3
     fi
+    # What the base's runs run, hashed before the first of them (base_job
+    # writes it beside each solved result).
+    binary_hash "$work/baseline" >"$work/base-binary"
     : >"$work/base-built"
     stage_close ok
 fi
@@ -3357,6 +3490,12 @@ if ! snapshot_bin "$work/candidate"; then
     echo "gate: cannot copy the candidate's spawn for its scenarios" >&2
     exit 3
 fi
+# What the candidate's build made, hashed now: the build hook runs no code of
+# the candidate's (build scripts and proc-macros are refused above), and
+# everything after this does (the test listing runs its test binaries, in a
+# tree they may write). A reuse of the base's results stands on this hash,
+# never on what the file holds later.
+candidate_binary=$(binary_hash "$work/candidate")
 
 # runnable_tests <writable dir> <tree> <target dir> <names file>: how many
 # tests cargo runs in the tree, from inside the sandbox: libtest's
@@ -3585,6 +3724,13 @@ candidate_printed() {
     if [ -s "$1/flake" ]; then
         flakes="${flakes:+$flakes,}\"$(json_string "$(cat "$1/flake")")\""
     fi
+    # A result reused from the base (add_candidate_job): no run, so no
+    # run's stage line and nothing to judge; named in the verdict.
+    if [ -e "$1/reused" ]; then
+        reused="${reused:+$reused,}\"$(json_string "$(basename "$(cat "$1/scenario")")")\""
+        stage_emit gate reused 0 "$(cat "$1/section")"
+        return 0
+    fi
     printed_name=$(cat "$1/section")
     printed_ms=$(cat "$1/ms" 2>/dev/null || echo 0)
     printed_status=$(cat "$1/result")
@@ -3709,14 +3855,133 @@ if [ -z "$base_only" ]; then
     fi
 fi
 candidate_count=0
-add_candidate_job() { # <scenario> <section>
+add_candidate_job() { # <scenario> <section> [regression]
     candidate_count=$((candidate_count + 1))
     job=$jobs_dir/candidate.$candidate_count
     mkdir "$job"
     printf '%s\n' "$1" >"$job/scenario"
     printf '%s\n' "$2" >"$job/section"
     if runs_alone "$1"; then : >"$job/alone"; fi
+    # A regression whose result is the base's ("Results reused from the
+    # base"): its job is done before the phase starts, as a base result
+    # read from the cache is (run_jobs starts no job that has a result), and
+    # its block says what was reused and why. It seeds nothing: only a run
+    # writes a cache entry.
+    if [ "${3-}" = regression ]; then
+        reuse_plan "$1"
+        if [ -n "$reuse_why" ]; then
+            printf '%s\n' "$reuse_why" >"$job/reused"
+            echo "| == $2: not run, the base's result (solved) is reused: $reuse_why" >"$job/text.0"
+            printf 'text %s\n' "$job/text.0" >"$job/events"
+            echo 0 >"$job/result"
+            reused_names="$reused_names $(basename "$1")"
+            return 0
+        fi
+        [ -z "$reuse_not" ] || echo "| $(basename "$1") declares what it reads and is run all the same: $reuse_not"
+    fi
     seed_plan "$1"
+}
+# same_in_commits <path>: 0 when the base and the candidate commits hold the
+# same object at <path> of the tree, or neither holds one.
+same_in_commits() {
+    [ "$(git --git-dir="$repo" rev-parse --verify --quiet "$base_commit:$1" 2>/dev/null || echo none)" = \
+        "$(git --git-dir="$repo" rev-parse --verify --quiet "$candidate_commit:$1" 2>/dev/null || echo none)" ]
+}
+# reuse_plan <scenario>: whether this regression's result is the base's
+# ("Results reused from the base"). Sets reuse_why, the reason as the log
+# says it, when it is; else reuse_not, why a scenario that declares what it
+# reads is run all the same (nothing for one that declares nothing: it is
+# simply run). Every doubt is a run.
+reused_names=""
+reuse_plan() {
+    reuse_why="" reuse_not=""
+    reuse_reads=$(declared reads "$1")
+    [ -n "$reuse_reads" ] || return 0
+    if [ "$gate_reuse" = 0 ]; then
+        reuse_not="SPAWN_GATE_REUSE=0"
+        return 0
+    fi
+    # An objective of the scenarios directory: nothing else has a result
+    # on the base.
+    reuse_name=$(basename "$1")
+    case "$reuse_name" in
+    *[!0-9].sh | .sh)
+        reuse_not="only an objective (<digits>.sh) has a result on the base"
+        return 0
+        ;;
+    esac
+    if [ "$(dirname "$1")" != "$scenarios" ] || [ "$1" = "$scenario" ]; then
+        reuse_not="it is not a regression of the scenarios directory"
+        return 0
+    fi
+    if runs_alone "$1"; then
+        reuse_not="it is on the serial list (load-sensitive: a result there is that run's own)"
+        return 0
+    fi
+    reuse_base=$(base_result "$1")
+    if [ "$reuse_base" != solved ]; then
+        reuse_not="the base did not solve it ($reuse_base)"
+        return 0
+    fi
+    reuse_held=$(awk -F'|' -v want="$1" '$3 == want { print $1 "|" $2; exit }' "$work/base-binaries")
+    if [ -z "$reuse_held" ]; then
+        reuse_not="the base's result names no binary it was taken on"
+        return 0
+    fi
+    if [ -z "$candidate_binary" ]; then
+        reuse_not="the candidate's build made no target/gate/spawn"
+        return 0
+    fi
+    if [ "${reuse_held%%|*}" != "$candidate_binary" ]; then
+        reuse_not="the candidate's spawn (sha256 $(printf '%s' "$candidate_binary" | cut -c1-12)) is not the one the base's result was taken on ($(printf '%s' "${reuse_held%%|*}" | cut -c1-12))"
+        return 0
+    fi
+    # What it declares: `binary`, and paths inside the tree, which must be
+    # the same in both commits and in both trees as they are now. A word
+    # that is neither is not guessed at.
+    for reuse_read in $reuse_reads; do
+        [ "$reuse_read" != binary ] || continue
+        case "$reuse_read" in
+        *[!A-Za-z0-9_./+@-]* | /* | -* | . | ./* | */. | */./* | *..* | target | target/* | */)
+            reuse_not="its \`# reads: $reuse_read\` is neither \`binary\` nor a path inside the tree (target/ is no such path)"
+            return 0
+            ;;
+        esac
+        if ! same_in_commits "$reuse_read"; then
+            reuse_not="$reuse_read, which it reads, differs between the base and the candidate"
+            return 0
+        fi
+        if { [ -e "$work/baseline/$reuse_read" ] || [ -L "$work/baseline/$reuse_read" ] ||
+            [ -e "$work/candidate/$reuse_read" ] || [ -L "$work/candidate/$reuse_read" ]; } &&
+            ! diff -rq --no-dereference -- "$work/baseline/$reuse_read" "$work/candidate/$reuse_read" >/dev/null 2>&1; then
+            reuse_not="$reuse_read, which it reads, differs between the base's tree and the candidate's as they are now"
+            return 0
+        fi
+    done
+    # The tree's own copy of the scenario (the controller's place in the
+    # tree): a candidate that changes it is run on it.
+    reuse_copy=${scenarios#"$controller"/}/$reuse_name
+    if ! same_in_commits "$reuse_copy"; then
+        reuse_not="the candidate changes $reuse_copy"
+        return 0
+    fi
+    # What no declaration can make reusable, read off the text of the
+    # scenario and every file it names, as a seed's is (seed_plan): on the
+    # candidate SPAWN_BASELINE_TREE is another tree than the one under test,
+    # and cargo and target/ are another build than `spawn`.
+    depends_on "$1" >/dev/null
+    while IFS= read -r reuse_file; do
+        [ -f "$reuse_file" ] || continue
+        if grep -q 'SPAWN_BASELINE_TREE' -- "$reuse_file"; then
+            reuse_not="${reuse_file#"$scenarios"/} reads SPAWN_BASELINE_TREE"
+            return 0
+        fi
+        if grep -qE '(^|[^A-Za-z0-9_])cargo([^A-Za-z0-9_-]|$)|target/' -- "$reuse_file"; then
+            reuse_not="${reuse_file#"$scenarios"/} runs cargo or reads target/"
+            return 0
+        fi
+    done <"$work/deps.files"
+    reuse_why="it declares that a run reads only this of the tree: $(printf '%s' "$reuse_reads" | tr '\n' ' '); the candidate's spawn is the binary the base's result was taken on, byte for byte (sha256 $(printf '%s' "$candidate_binary" | cut -c1-12)); the base's result is ${reuse_held#*|}; the scenario and the paths it reads are the same in both trees"
 }
 # seed_plan <scenario>: $job/seed-entry, the entry a passing first run of
 # the scenario seeds, when it may (above).
@@ -3752,9 +4017,17 @@ seed() {
     [ -z "$(entry_result "$seed_entry")" ] || return 0
     command -v flock >/dev/null 2>&1 || return 0
     { command exec 8>>"$seed_entry.lock"; } 2>/dev/null || return 0
+    # The binary the run ran, named as a base run names it ("The base
+    # cache"): the candidate's `spawn` as its build left it, when it is that
+    # still after the run.
+    seed_bin=""
+    if [ -n "$candidate_binary" ] && [ "$(binary_hash "$work/candidate")" = "$candidate_binary" ]; then
+        seed_bin="binary $candidate_binary"
+    fi
     if flock -n 8 && [ -z "$(entry_result "$seed_entry")" ] &&
-        printf 'solved\nseeded-by-gate %s at %s\n' "$candidate_commit" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            >"$seed_entry.seed.$$" 2>/dev/null &&
+        printf 'solved\nseeded-by-gate %s at %s\n%s' "$candidate_commit" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "${seed_bin:+$seed_bin
+}" >"$seed_entry.seed.$$" 2>/dev/null &&
         mv -f "$seed_entry.seed.$$" "$seed_entry" 2>/dev/null; then
         job_say "| $(basename "$job_scenario"): solved on the candidate, seeded into the base cache for $(printf '%s' "$candidate_commit" | cut -c1-12) as a base"
     fi
@@ -3772,9 +4045,11 @@ for other in "$scenarios"/check-tests.sh "$scenarios"/*.sh; do
     [ "$other" = "$scenarios/check-tests.sh" ] && [ -n "${tests_queued-}" ] && continue
     [ "$other" = "$scenarios/check-tests.sh" ] && tests_queued=1
     not_a_regression "$other" && continue
-    add_candidate_job "$other" "regression: $(basename "$other") must still pass"
+    add_candidate_job "$other" "regression: $(basename "$other") must still pass" regression
     [ "$other" != "$scenarios/check-tests.sh" ] || : >"$job/head"
 done
+[ -z "$reused_names" ] ||
+    echo "| reused from the base, not run on the candidate:$reused_names (SPAWN_GATE_REUSE=0 runs them)"
 stage_close ok
 # A fresh server for the candidate's runs: the base phase's runs leave the
 # server as they leave it, and a candidate run is to see what the next

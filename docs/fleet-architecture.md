@@ -1309,6 +1309,17 @@ the tree's own:
 - everything the candidate controls runs in a bubblewrap sandbox (docs/rsi.md
   §4). The verdict is one JSON line that names the base and candidate
   commits it judged; the integrator believes only the verdict file it owns.
+- a regression's result may be the base's, not a run (gate.sh "Results
+  reused from the base", GitHub issue #48): a scenario that declares what
+  a run reads of the tree (`# reads: binary [<path> ...]`; 001, 007 and
+  027 so far) is not run on the candidate when the candidate's `spawn` has
+  the sha256 of the binary the base's `solved` was taken on (the hash is in
+  the base cache entry, written by the run that earned the result), the
+  paths it declares and the tree's own copy of the scenario are the same in
+  both trees, and it is not on the `serial` list. The log says so per
+  scenario with the reason, the verdict names them (`reused`), a reused
+  result seeds no cache entry, and a scenario that declares nothing is
+  always run. `SPAWN_GATE_REUSE=0` runs everything.
 - objective results on the base (solved, unsolved after two runs that
   agree, or `cannot_judge` when the scenario says the host cannot judge it,
   one run) are cached outside the sandbox, keyed by everything that decides
