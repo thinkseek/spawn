@@ -1306,27 +1306,16 @@ impl Bridge {
                     // However it ended, what its transcript holds is
                     // copied, and its record says it ended: on the next
                     // pass, and every pass after until the copy is made.
-                    if let (Some(native), Some(_)) = (view.native.clone(), &self.transcripts) {
-                        let progress = ArchiveProgress {
-                            agent: view.agent_id.clone(),
-                            native: native.clone(),
-                            session: event.session_id.clone(),
-                            execution: active.execution_id.clone(),
-                            workspace: active.workspace.clone(),
-                            live: false,
-                            known_ms: i64::MIN,
-                            archived: active.follow.archiving.archived,
-                            behind_ms: active.follow.archiving.behind_ms,
-                        };
-                        self.ended_archives
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .entry((view.agent_id.clone(), native))
-                            .or_insert(EndedArchive {
-                                progress,
-                                error: None,
-                                written: None,
-                            });
+                    if self.transcripts.is_some()
+                        && let Some(native) = view.native.clone()
+                    {
+                        note_ended(
+                            &self.ended_archives,
+                            &view.agent_id,
+                            native,
+                            &event.session_id,
+                            &active,
+                        );
                     }
                 }
             }
@@ -4612,6 +4601,36 @@ pub fn claude_session_id(execution: &ExecutionId) -> String {
         low >> 48,
         low & 0xffff_ffff_ffff
     )
+}
+
+/// An execution that ended, to be copied on the next pass and recorded as
+/// ended ([`Bridge::archive_ended`]), unless an end already put it there.
+fn note_ended(
+    list: &std::sync::Mutex<BTreeMap<(AgentId, String), EndedArchive>>,
+    agent: &AgentId,
+    native: String,
+    session: &SessionId,
+    active: &Active,
+) {
+    let progress = ArchiveProgress {
+        agent: agent.clone(),
+        native: native.clone(),
+        session: session.clone(),
+        execution: active.execution_id.clone(),
+        workspace: active.workspace.clone(),
+        live: false,
+        known_ms: i64::MIN,
+        archived: active.follow.archiving.archived,
+        behind_ms: active.follow.archiving.behind_ms,
+    };
+    list.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry((agent.clone(), native))
+        .or_insert(EndedArchive {
+            progress,
+            error: None,
+            written: None,
+        });
 }
 
 /// What a record says is behind: a transcript never known (no read of it
