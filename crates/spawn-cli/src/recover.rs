@@ -103,7 +103,15 @@ pub(crate) struct Config {
     /// How often an open wait re-reads its cause (the credentials file, the
     /// free space): `SPAWN_RECOVER_PROBE_SECS`, default 10.
     pub(crate) probe: i64,
+    /// Resumes in a row of an execution that ended on a transient model
+    /// error, with no model answer in between, before the next such end is
+    /// final and told to the supervisor: `SPAWN_RECOVER_MODEL_RETRIES`,
+    /// default 3, from 1 to [`MODEL_RETRIES_MAX`].
+    pub(crate) model_retries: u32,
 }
+
+/// The most `SPAWN_RECOVER_MODEL_RETRIES` may be.
+pub(crate) const MODEL_RETRIES_MAX: u32 = 20;
 
 impl Default for Config {
     fn default() -> Self {
@@ -112,12 +120,16 @@ impl Default for Config {
             model_backoff: 60_000,
             auth_retry: 1_800_000,
             probe: 10_000,
+            model_retries: 3,
         }
     }
 }
 
 impl Config {
-    pub(crate) fn from_env() -> Self {
+    /// The settings, as the loop's environment names them. A
+    /// `SPAWN_RECOVER_MODEL_RETRIES` that is not a whole number from 1 to
+    /// [`MODEL_RETRIES_MAX`] is refused: the loop does not start.
+    pub(crate) fn from_env() -> Result<Self, String> {
         let seconds = |name: &str, fallback: i64| {
             crate::config::env_value(name)
                 .and_then(|text| text.trim().parse::<i64>().ok())
@@ -125,13 +137,34 @@ impl Config {
                 .unwrap_or(fallback)
                 .saturating_mul(1000)
         };
-        Self {
+        Ok(Self {
             resume_backoff: seconds("SPAWN_RECOVER_BACKOFF_SECS", 10),
             model_backoff: seconds("SPAWN_RECOVER_MODEL_BACKOFF_SECS", 60),
             auth_retry: seconds("SPAWN_RECOVER_AUTH_RETRY_SECS", 1800),
             probe: seconds("SPAWN_RECOVER_PROBE_SECS", 10),
-        }
+            model_retries: model_retries(
+                crate::config::env_value("SPAWN_RECOVER_MODEL_RETRIES").as_deref(),
+            )?,
+        })
     }
+}
+
+/// `SPAWN_RECOVER_MODEL_RETRIES` read: unset is the default (3); anything
+/// but a whole number from 1 to [`MODEL_RETRIES_MAX`] is refused.
+pub(crate) fn model_retries(value: Option<&str>) -> Result<u32, String> {
+    let Some(text) = value else {
+        return Ok(Config::default().model_retries);
+    };
+    text.trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|retries| (1..=MODEL_RETRIES_MAX).contains(retries))
+        .ok_or_else(|| {
+            format!(
+                "SPAWN_RECOVER_MODEL_RETRIES must be a whole number from 1 to \
+                 {MODEL_RETRIES_MAX}, not {text:?}"
+            )
+        })
 }
 
 /// One cause of an interruption: the whole vocabulary, and the only one the
