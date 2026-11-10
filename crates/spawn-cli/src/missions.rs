@@ -84,6 +84,14 @@ const USAGE: &str = "usage:
   spawn task cancel --id N
       (a delivered task's resident is stopped at once, its work set aside on its branch,
        and it is told before its next task; an ephemeral worker is stopped)
+  spawn task restart --id N [--reason <text>]
+      (a delivered task's worker gets a fresh execution: its running one is stopped, its final
+       checkpoint kept, and its native session resumed on its workspace. Prints the task and
+       worker that carry the work; any task not delivered is refused, naming its state)
+  spawn task reassign --id N [--reason <text>]
+      (a delivered task moves to a fresh ephemeral worker whose branch starts from the old
+       worker's last checkpoint: the task is cancelled, a new one assigned, the old worker
+       stopped. Prints the new task and its worker; any task not delivered is refused)
   spawn task stages --id N   (each stage with its verdict, time, and how long since the one before)
   spawn resident propose --name <name> --charter <text>
   spawn resident approve --name <name>
@@ -784,6 +792,16 @@ pub(crate) fn task(rest: &[String]) -> Result<i32, String> {
             let task = id(&flags, "id")?;
             store.task_cancel(task).map_err(err)?;
             print(&json!({ "task": task, "cancelled": true }));
+        }
+        "restart" => {
+            let task = id(&flags, "id")?;
+            let reason = flags.get("reason");
+            print(&store.task_restart(task, reason.as_deref()).map_err(err)?);
+        }
+        "reassign" => {
+            let task = id(&flags, "id")?;
+            let reason = flags.get("reason");
+            print(&store.task_reassign(task, reason.as_deref()).map_err(err)?);
         }
         "stages" => print(&store.task_stages(id(&flags, "id")?).map_err(err)?),
         _ => return Err(USAGE.to_string()),
