@@ -35,6 +35,8 @@ import {
 import { clockTime, formatDuration, relativeTime } from "../../format";
 import { commandSummary, foldCommands, inputAt, inputLeads, principalWords } from "../../commands";
 import { doingWords } from "../../home";
+import { forHowLong, judgementLine, judgementRuns, judgementSpeaks, runLabel } from "../../agentPage";
+import type { JudgementRun } from "../../agentPage";
 import { recentToolRows, rowText, runEnd } from "../../trace";
 import { freshAt } from "../../validated";
 import { LiveBadge, TerminalPanel } from "../Terminal";
@@ -254,6 +256,7 @@ function RecentTools({ session, error }: { session: SessionDetail | null; error:
 
 function AgentSummary({ agent, commands }: { agent: FleetAgent; commands: CommandRecord[] | null }) {
   const now = doingNow(agent);
+  const since = forHowLong(agent.state_since_ms, Date.now());
   const activity = agent.activity;
   // A standing agent's input leads while fresh (UI note §4.6); an older
   // one folds under its age, so a two-day-old note is not its headline.
@@ -287,32 +290,44 @@ function AgentSummary({ agent, commands }: { agent: FleetAgent; commands: Comman
       ) : (
         <p className="text-label text-faint-foreground">No task recorded.</p>
       )}
-      <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4 lg:grid-cols-8">
-        <Fact label="Doing now">
-          <span className="inline-flex min-w-0 items-center gap-1" title={now.label}>
-            <DoingIcon now={now} size={11} />
-            <span className="truncate">{doingWords(agent, null)}</span>
+      {/* What it does and for how long (design §2.5); the rest on demand. */}
+      <p className="mt-3 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-label">
+        <span className="inline-flex min-w-0 items-center gap-1.5 text-foreground" title={now.label}>
+          <DoingIcon now={now} size={12} />
+          <span className="truncate">{doingWords(agent, null)}</span>
+        </span>
+        {since && (
+          <span className="tnum text-muted-foreground" title={agent.state_since_ms ? new Date(agent.state_since_ms).toLocaleString() : undefined}>
+            {since}
           </span>
-        </Fact>
-        <Fact label="Last event"><Ago ms={activity.last_event_at_ms} /></Fact>
-        <Fact label="In state since"><Ago ms={agent.state_since_ms} /></Fact>
-        <Fact label="Engine · execution" mono>
-          {[agent.engine, agent.execution_id].filter(Boolean).join(" · ") || "—"}
-        </Fact>
-        <Fact label="Started">{clockTime(agent.started_at_ms)}</Fact>
-        <Fact label="Ended">
-          {agent.ended_at_ms ? clockTime(agent.ended_at_ms) : agent.live ? "running" : "—"}
-        </Fact>
-        <Fact label="Events · tools · execs">
-          <span className="tnum">
-            {activity.event_count ?? "—"} · {activity.tool_calls ?? "—"} ·{" "}
-            {activity.executions ?? "—"}
-          </span>
-        </Fact>
-        <Fact label="Session" mono>
-          {agent.session_id}
-        </Fact>
-      </div>
+        )}
+      </p>
+      <details className="group/facts mt-1.5">
+        <summary className="w-fit cursor-pointer list-none text-caption text-faint-foreground hover:text-muted-foreground">
+          <span className="group-open/facts:hidden">Details</span>
+          <span className="hidden group-open/facts:inline">Hide details</span>
+        </summary>
+        <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4 lg:grid-cols-7">
+          <Fact label="Last event"><Ago ms={activity.last_event_at_ms} /></Fact>
+          <Fact label="In state since"><Ago ms={agent.state_since_ms} /></Fact>
+          <Fact label="Engine · execution" mono>
+            {[agent.engine, agent.execution_id].filter(Boolean).join(" · ") || "—"}
+          </Fact>
+          <Fact label="Started">{clockTime(agent.started_at_ms)}</Fact>
+          <Fact label="Ended">
+            {agent.ended_at_ms ? clockTime(agent.ended_at_ms) : agent.live ? "running" : "—"}
+          </Fact>
+          <Fact label="Events · tools · execs">
+            <span className="tnum">
+              {activity.event_count ?? "—"} · {activity.tool_calls ?? "—"} ·{" "}
+              {activity.executions ?? "—"}
+            </span>
+          </Fact>
+          <Fact label="Session" mono>
+            {agent.session_id}
+          </Fact>
+        </div>
+      </details>
     </div>
   );
 }
@@ -333,6 +348,7 @@ function JevPanel({
   pinned: boolean;
   onBackToLatest: () => void;
 }) {
+  const [opened, setOpened] = useState(false);
   if (!judgement) {
     return (
       <Card>
@@ -350,6 +366,27 @@ function JevPanel({
   const unavailable = judgement.reason === "JUDGE_UNAVAILABLE";
   const evidence = judgement.evidence;
 
+  // One line unless it says what the rules did not (design §2.5): a
+  // judgement that agrees, and asks for nothing, is not worth a card.
+  if (!pinned && !opened && !judgementSpeaks(judgement)) {
+    return (
+      <Card>
+        <button
+          type="button"
+          aria-expanded={false}
+          onClick={() => setOpened(true)}
+          title="The full judgement: its reason, its facts and Jev's distribution"
+          className={cx("flex w-full items-center gap-2 px-4 py-2.5 text-left text-caption hover:bg-surface-hover", FOCUS_RING)}
+        >
+          <Sparkles size={14} className={cx("shrink-0", kind === "jev" ? "text-jev" : "text-muted-foreground")} />
+          <span className="min-w-0 flex-1 truncate text-foreground">{judgementLine(judgement, reasonText)}</span>
+          <Ago ms={at} />
+          <span className="shrink-0 text-faint-foreground">details</span>
+        </button>
+      </Card>
+    );
+  }
+
   return (
     <Card className={cx(pinned && "ring-1 ring-jev/40")}>
       <CardHeader
@@ -357,6 +394,16 @@ function JevPanel({
         title={pinned ? `Judgement at seq ${seq ?? "—"}` : "Latest judgement"}
         meta={
           <>
+            {opened && !pinned && !judgementSpeaks(judgement) && (
+              <button
+                type="button"
+                aria-expanded={true}
+                onClick={() => setOpened(false)}
+                className="rounded px-1.5 py-0.5 text-caption font-medium text-muted-foreground hover:bg-surface-hover"
+              >
+                Less
+              </button>
+            )}
             {pinned && (
               <button
                 type="button"
@@ -783,7 +830,7 @@ function JudgementHistory({
         meta={
           records && (
             <span className="text-faint-foreground">
-              newest first · click to inspect
+              newest first · repeats folded · click to inspect
             </span>
           )
         }
@@ -796,60 +843,116 @@ function JudgementHistory({
         <EmptyState title="No judgements yet" />
       ) : (
         <ul className="max-h-[20rem] divide-y divide-surface-border overflow-y-auto">
-          {records.map((record, index) => {
-            const o = record.observation;
-            const seq = record.session_seq;
-            const disagree = o.rules_state != null && o.rules_state !== o.state;
-            return (
-              <li key={`${seq ?? "x"}-${index}`}>
-                <button
-                  type="button"
-                  disabled={seq == null}
-                  onClick={() => seq != null && onSelect(seq)}
-                  className={cx(
-                    "grid w-full grid-cols-[4.25rem_4.75rem_6.5rem_2.75rem_minmax(0,1fr)] items-center gap-2 px-4 py-1.5 text-left text-caption transition-colors",
-                    seq != null && seq === selectedSeq
-                      ? "bg-judge-tint"
-                      : "hover:bg-surface-hover",
-                  )}
-                >
-                  <span
-                    className="tnum text-muted-foreground"
-                    title={record.recorded_at_ms ? new Date(record.recorded_at_ms).toLocaleString() : undefined}
-                  >
-                    {clockTime(record.recorded_at_ms)}
-                  </span>
-                  <span>
-                    <JudgeBadge judge={o.judge} />
-                  </span>
-                  <span className="flex items-center gap-1.5">
-                    <FleetStateDot state={o.state} size="sm" />
-                    <span className="text-foreground">{stateLabelUpper(o.state)}</span>
-                  </span>
-                  <span className="tnum text-right text-muted-foreground">
-                    {percent(o.confidence)}
-                  </span>
-                  <span className="min-w-0 truncate text-faint-foreground">
-                    {[
-                      disagree && o.rules_state
-                        ? `rules: ${stateLabelUpper(o.rules_state).toLowerCase()}`
-                        : null,
-                      ambiguityText(o.ambiguity),
-                      reasonText(o.reason),
-                    ]
-                      .filter(Boolean)
-                      .join(" · ")}
-                  </span>
-                </button>
-              </li>
-            );
-          })}
+          {judgementRuns(records).map((run, index) =>
+            run.records.length === 1 ? (
+              <HistoryRow key={`${run.records[0].session_seq ?? "x"}-${index}`} record={run.records[0]} selectedSeq={selectedSeq} onSelect={onSelect} />
+            ) : (
+              <HistoryRun key={`${run.records[0].session_seq ?? "x"}-${index}`} run={run} selectedSeq={selectedSeq} onSelect={onSelect} />
+            ),
+          )}
         </ul>
       )}
     </Card>
   );
 }
 
+
+/** One judgement of the history: its time, judge, state, confidence and
+ * what it rests on; click to pin it. */
+function HistoryRow({
+  record,
+  selectedSeq,
+  onSelect,
+}: {
+  record: JudgementRecord;
+  selectedSeq: number | null;
+  onSelect: (seq: number) => void;
+}) {
+  const o = record.observation;
+  const seq = record.session_seq;
+  const disagree = o.rules_state != null && o.rules_state !== o.state;
+  return (
+    <li>
+      <button
+        type="button"
+        disabled={seq == null}
+        onClick={() => seq != null && onSelect(seq)}
+        className={cx(
+          "grid w-full grid-cols-[4.25rem_4.75rem_6.5rem_2.75rem_minmax(0,1fr)] items-center gap-2 px-4 py-1.5 text-left text-caption transition-colors",
+          seq != null && seq === selectedSeq
+            ? "bg-judge-tint"
+            : "hover:bg-surface-hover",
+        )}
+      >
+        <span
+          className="tnum text-muted-foreground"
+          title={record.recorded_at_ms ? new Date(record.recorded_at_ms).toLocaleString() : undefined}
+        >
+          {clockTime(record.recorded_at_ms)}
+        </span>
+        <span>
+          <JudgeBadge judge={o.judge} />
+        </span>
+        <span className="flex items-center gap-1.5">
+          <FleetStateDot state={o.state} size="sm" />
+          <span className="text-foreground">{stateLabelUpper(o.state)}</span>
+        </span>
+        <span className="tnum text-right text-muted-foreground">
+          {percent(o.confidence)}
+        </span>
+        <span className="min-w-0 truncate text-faint-foreground">
+          {[
+            disagree && o.rules_state
+              ? `rules: ${stateLabelUpper(o.rules_state).toLowerCase()}`
+              : null,
+            ambiguityText(o.ambiguity),
+            reasonText(o.reason),
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        </span>
+      </button>
+    </li>
+  );
+}
+
+/** Consecutive judgements that say the same thing, as one line
+ * ("Rules · Working ×9, 16:37–16:45", design §2.5); open, its records. */
+function HistoryRun({
+  run,
+  selectedSeq,
+  onSelect,
+}: {
+  run: JudgementRun<JudgementRecord>;
+  selectedSeq: number | null;
+  onSelect: (seq: number) => void;
+}) {
+  const holds = run.records.some((record) => record.session_seq != null && record.session_seq === selectedSeq);
+  const [open, setOpen] = useState(false);
+  const shown = open || holds;
+  const first = run.records[0].observation;
+  return (
+    <li>
+      <button
+        type="button"
+        aria-expanded={shown}
+        onClick={() => setOpen(!shown)}
+        className={cx("flex w-full items-center gap-2 px-4 py-1.5 text-left text-caption hover:bg-surface-hover", FOCUS_RING)}
+      >
+        <FleetStateDot state={first.state} size="sm" />
+        <span className="tnum min-w-0 flex-1 truncate text-foreground">{runLabel(run, clockTime)}</span>
+        <span className="shrink-0 text-faint-foreground">{shown ? "fold" : "open"}</span>
+      </button>
+      {shown && (
+        <ul className="divide-y divide-surface-border bg-surface-raised/40">
+          {run.records.map((record, index) => (
+            <HistoryRow key={`${record.session_seq ?? "x"}-${index}`} record={record} selectedSeq={selectedSeq} onSelect={onSelect} />
+          ))}
+        </ul>
+      )}
+    </li>
+  );
+}
 
 function PrincipalBadge({ principal }: { principal: string }) {
   const human = principal === "human";
