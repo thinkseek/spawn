@@ -3117,6 +3117,20 @@ begin
                                           'aborted', 'stale', 'no_room', 'host_fault') then
         raise exception 'unknown gate verdict %', p_record ->> 'verdict';
     end if;
+    -- A verdict says what it is about (objective 035): `code` for one on the
+    -- work, `infrastructure` for one the host could not judge, `superseded`
+    -- for `stale`. A record from before this change names none; one that
+    -- names a class names its verdict's, never another.
+    if p_record ->> 'type' = 'task.gated' and p_record ? 'class'
+       and p_record ->> 'class' is distinct from (
+           case when p_record ->> 'verdict' in ('accepted', 'rejected', 'conflict', 'incompatible')
+                     then 'code'
+                when p_record ->> 'verdict' in ('aborted', 'host_fault', 'no_room')
+                     then 'infrastructure'
+                when p_record ->> 'verdict' = 'stale' then 'superseded' end) then
+        raise exception 'a % verdict is not of class %', p_record ->> 'verdict',
+                        p_record ->> 'class';
+    end if;
     -- A host fault names its evidence (§14): the failures the gate printed,
     -- each the host's, and, when the test database's log decided it, the
     -- crash lines stamped inside the gate's window (`failures`,
@@ -3726,10 +3740,20 @@ create index if not exists spawn_events_gate_base_disagrees
 -- supervisor's login, which may not read `spawn_events`, reads it too.
 create or replace function spawn_task_stages(p_task bigint)
 returns jsonb language sql stable security definer as $$
+    -- A verdict's `class`, `inputs` and `env` (objective 035) as recorded,
+    -- their nulls kept (a controller that was unknown, a run that printed
+    -- no toolchain); a record from before them shows none.
     select coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
                'stage', substr(s.type, 6), 'verdict', s.verdict, 'at_ms', s.at_ms,
-               'took_ms', s.at_ms - s.previous_ms)) order by s.seq), '[]'::jsonb)
+               'took_ms', s.at_ms - s.previous_ms))
+               || coalesce((select jsonb_object_agg(b.key, b.value)
+                              from jsonb_each(s.binding) b), '{}'::jsonb)
+               order by s.seq), '[]'::jsonb)
       from (select e.session_seq as seq, r.record ->> 'type' as type,
+                   case when r.record ->> 'type' = 'task.gated' then
+                     r.record - array(select k from jsonb_object_keys(r.record) k
+                                       where k not in ('class', 'inputs', 'env', 'head_inputs'))
+                   else '{}'::jsonb end as binding,
                    case r.record ->> 'type'
                      when 'task.gated' then r.record ->> 'verdict'
                      when 'task.reviewed' then
