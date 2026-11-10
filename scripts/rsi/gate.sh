@@ -214,7 +214,9 @@
 # and the verdict name it in every gate (`"quarantined":["028.sh"]`), so it
 # cannot be forgotten there. Without the list a validator defect would give
 # every task's candidate no verdict for as long as the validator stays
-# broken. The task's own scenario is never skipped by it. The list is the
+# broken. The price: while a scenario is listed, nothing catches a candidate
+# that breaks it, and unlisting it may find main red. The task's own
+# scenario is never skipped by it. The list is the
 # controller's, and the tree's copy lies under the protected paths, so only
 # an owner's push changes it. It is in no base cache key: it decides which
 # scenarios run, never what one of them says.
