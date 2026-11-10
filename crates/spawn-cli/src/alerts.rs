@@ -3594,7 +3594,15 @@ mod tests {
         assert!(decided(&restarted, out).is_empty(), "not fired again");
         assert_eq!(restarted.messages_due, Some(610_000));
         assert_eq!(restarted.messages_after, 42);
-        assert_eq!(restarted.pending.iter().copied().collect::<Vec<_>>(), [42]);
+        assert_eq!(
+            restarted
+                .pending
+                .iter()
+                .map(|(id, due)| (*id, *due))
+                .collect::<Vec<_>>(),
+            [(42, 610_000)]
+        );
+        assert_eq!(restarted.messages_since, 440_000);
         restarted.plan(500_000);
         assert_eq!(restarted.next_bound_ms, Some(610_000));
 
@@ -4835,7 +4843,8 @@ connections\n";
         fn read(monitor: &mut Monitor, store: &PostgresStore) -> Vec<Event> {
             let mut out = Vec::new();
             let mut lines = Vec::new();
-            monitor.read_messages(store, &mut out, &mut lines);
+            let now = store.now_ms().expect("the clock");
+            monitor.read_messages(store, now, &mut out, &mut lines);
             assert!(lines.is_empty(), "{lines:?}");
             decided(monitor, out)
         }
