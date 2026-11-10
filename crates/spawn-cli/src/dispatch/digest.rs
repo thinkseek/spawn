@@ -69,7 +69,7 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::GateBaseDisagrees => "the base disagreed with itself at the gate (the host's)",
         Why::MainRed => "a source's main is red on a check (its gates wait)",
         Why::MainGreen => "a source's main is green again",
-        Why::SourceAway => "a mission's source is missing on this host (its branches wait)",
+        Why::SourceAway => "a mission's source is not a directory on this host (its branches wait)",
         Why::SourceBack => "a mission's source is back on this host",
         Why::ShadowDisagrees => {
             "a gate runner's shadow verdict disagreed with the primary's (it decided nothing)"
