@@ -926,6 +926,26 @@ select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.r
    and e.kind -> 'detail' -> 'record' ->> 'chain' = 'true'
    and not exists (select 1 from told where tag = 'host over-budget-' || e.id)";
 
+/// The integrator's expired drains (`integrator.drain_expired`) no
+/// delivered supervisor digest names yet (its tag `host
+/// integrator-drain-expired-<event id>`), each with its event id and time.
+pub(crate) const DRAIN_EXPIRIES: &str = r"
+with told as (
+  select distinct tag
+    from spawn_commands d
+   cross join lateral jsonb_array_elements_text(
+           case when jsonb_typeof(d.action -> 'tags') = 'array'
+                then d.action -> 'tags' else '[]'::jsonb end) tag
+   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
+)
+select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.recorded_at_ms)
+                          order by e.session_seq), '[]'::jsonb)
+  from spawn_events e
+ cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' = 'integrator.drain_expired'
+   and not exists (select 1 from told where tag = 'host integrator-drain-expired-' || e.id)";
+
 /// The last `task.gated` record of every task, keyed by task id:
 /// `{"<id>": {verdict, reason, metric, candidate, at_ms}}`, with the
 /// verdict's `class`, `inputs` and `env` (objective 035) when it names them
@@ -1647,6 +1667,12 @@ impl PostgresStore {
     /// not told of yet ([`OVER_BUDGET_ESCALATIONS`]).
     pub fn over_budget_escalations(&self) -> Result<Value, StoreError> {
         self.query_json(OVER_BUDGET_ESCALATIONS, &[])
+    }
+
+    /// The integrator's expired drains not told to the supervisor yet
+    /// ([`DRAIN_EXPIRIES`]).
+    pub fn drain_expiries(&self) -> Result<Value, StoreError> {
+        self.query_json(DRAIN_EXPIRIES, &[])
     }
 
     /// The `source.hold_expired` records not told to the supervisor yet,
