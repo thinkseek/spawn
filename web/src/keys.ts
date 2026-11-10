@@ -1,9 +1,16 @@
 /* Named keys for an agent (backlog P1): Esc, the arrows, Enter, Y and N,
  * sent from the terminal panel as recorded commands of their own
  * (`POST /api/session/<id>/key`), never as text. A key goes only while the
- * terminal panel itself has focus: never from a text box, never with Ctrl,
- * Alt or Meta (the browser's and the page's shortcuts), and never an
- * auto-repeat (a held arrow would queue a command per repeat). Pure, tested
+ * terminal panel itself has focus and is armed: never from a text box,
+ * never with Ctrl, Alt or Meta (the browser's and the page's shortcuts), and
+ * never an auto-repeat (a held arrow would queue a command per repeat).
+ *
+ * Armed (backlog P11): focus alone sends nothing, so a reader who tabs into
+ * the panel, or presses Esc to close the drawer, sends no key to the agent.
+ * A deliberate click into the panel arms it, and so does Enter on the
+ * focused panel (the keyboard's click); the panel then shows that keys go to
+ * the agent. Blur, or a click outside, disarms it. While it is not armed,
+ * Esc closes the drawer and the arrows scroll, as on any page. Pure, tested
  * in web/test/keys.test.ts. */
 
 import { KEY_LABEL } from "./commands.ts";
@@ -40,13 +47,27 @@ export interface KeyPress {
   onPanel: boolean;
   /** A composition (an input method) is in progress. */
   isComposing?: boolean;
+  /** The panel was armed by a click (or Enter) since it took focus. */
+  armed: boolean;
+}
+
+/** What a keydown on the panel does: send a named key, arm the panel, or
+ * nothing (the page has it: Esc closes the drawer, an arrow scrolls). */
+export type PanelKey = { send: KeyName } | { arm: true } | null;
+
+/** The keydown's effect on the panel (see the module comment). */
+export function panelKey(press: KeyPress): PanelKey {
+  if (!press.onPanel || press.repeat || press.isComposing) return null;
+  if (press.ctrlKey || press.altKey || press.metaKey) return null;
+  if (!press.armed) return press.key === "Enter" ? { arm: true } : null;
+  const name = BY_EVENT_KEY[press.key];
+  return name ? { send: name } : null;
 }
 
 /** The named key a keydown sends, or null when it sends none. */
 export function keyName(press: KeyPress): KeyName | null {
-  if (!press.onPanel || press.repeat || press.isComposing) return null;
-  if (press.ctrlKey || press.altKey || press.metaKey) return null;
-  return BY_EVENT_KEY[press.key] ?? null;
+  const effect = panelKey(press);
+  return effect && "send" in effect ? effect.send : null;
 }
 
 /** The key as the page shows it: `Esc`, `↑`, `Enter`, `Y`. */
@@ -54,7 +75,12 @@ export function keyLabel(name: KeyName): string {
   return KEY_LABEL[name] ?? name;
 }
 
-/** The hint under a focused panel. */
+/** The line under an armed panel. */
 export function keyHint(to: string): string {
   return `Keys go to ${to}: ${KEY_NAMES.map(keyLabel).join(" ")}`;
+}
+
+/** The line under a focused panel that is not armed. */
+export function armHint(to: string): string {
+  return `Click the screen or press Enter to send keys to ${to}`;
 }

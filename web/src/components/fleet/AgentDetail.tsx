@@ -49,7 +49,7 @@ import {
 import { DoingIcon, doingNow } from "./FleetBoard";
 import { InputBox, useWritable } from "./InputBox";
 import { newKey, sendAnswer } from "../../input";
-import { keyHint, keyLabel } from "../../keys";
+import { keyLabel } from "../../keys";
 import type { KeyName } from "../../keys";
 
 interface AgentDetailProps {
@@ -998,7 +998,7 @@ function CommandItem({ record }: { record: CommandRecord }) {
 function useAgentKeys(
   sessionId: string,
   to: string | null,
-): { hint: string; onKey: (name: KeyName) => void; feedback?: ReactNode } | null {
+): { to: string; onKey: (name: KeyName) => void; feedback?: ReactNode } | null {
   const writable = useWritable(sessionId);
   const [last, setLast] = useState<{ ok: boolean; text: string } | null>(null);
   if (!to || writable.state !== "yes") return null;
@@ -1011,7 +1011,7 @@ function useAgentKeys(
     });
   };
   return {
-    hint: keyHint(to),
+    to,
     onKey,
     feedback: last ? (
       <span className={last.ok ? "text-muted-foreground" : "text-destructive"}>{last.text}</span>
