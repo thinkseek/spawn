@@ -110,14 +110,10 @@ fn each_message_counts_once_for_its_task_priced_when_recorded() {
     let task = store
         .task_assign(mission, "ephemeral", "w1", "brief", "default")
         .expect("assign");
-    let tasks = store.mission_tasks(Some(mission)).expect("tasks");
-    let row = tasks
-        .as_array()
-        .and_then(|rows| rows.iter().find(|row| row["id"] == task))
-        .expect("the task");
+    // An ephemeral worker's names (`spawn_task_assign`).
     let worker = Worker {
-        agent: row["agent_id"].as_str().expect("agent").to_string(),
-        session: row["session_id"].as_str().expect("session").to_string(),
+        agent: format!("agent_worker_w1_{task}"),
+        session: format!("session_worker_w1_{task}"),
     };
     let now = store.database_now_ms().expect("now");
     started(&store, &worker, 1);
