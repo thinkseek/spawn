@@ -2487,6 +2487,17 @@ are per-agent uids or a mount per engine.
   bug. One that returns an error records nothing: the error is shown to
   the operator and a later pass judges again (a git that cannot run a
   merge is the host's problem, not the work's: objective 008).
-  A restart mid-gate kills the gate with the process (no record), and the
-  next integrator judges the task again. One integrator per database: its
+  TERM kills the gate with the process (no record), and the next
+  integrator judges the task again from nothing. A drain does not: a
+  drain request (SIGUSR1, or `spawn integrate --drain` with the same
+  root, which waits until that integrator is gone) records
+  `integrator.draining` {`gates`, `bound_s`}, starts no gate, owner
+  judging or base warm from then on, keeps its passes going otherwise,
+  and once its gates recorded and their accepted tasks landed records
+  `integrator.drained` and exits 0. At `SPAWN_INTEGRATE_DRAIN_SECS`
+  (default 7200, from the draining record) it kills the gates still
+  running (their process groups; nothing is recorded for them), records
+  `integrator.drain_expired` naming their tasks, exits 0, and the
+  dispatcher tells the supervisor once (`host
+  integrator-drain-expired-<event id>`). One integrator per database: its
   advisory lock belongs to the connection, kept while any gate runs.
