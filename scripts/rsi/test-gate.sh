@@ -169,7 +169,9 @@ judge() {
     echo "exit=$status $(without_commits 2>/dev/null <"$integrator/verdict" || true)"
 }
 without_commits() {
-    sed -E 's/,"base":"[0-9a-f]+","candidate":"[0-9a-f]+"\}$/}/'
+    # The fact's version (`"v":1`, first) and its commits are said once,
+    # below; every other expectation reads the rest.
+    sed -E -e 's/^\{"v":1,/{/' -e 's/,"base":"[0-9a-f]+","candidate":"[0-9a-f]+"\}$/}/'
 }
 expect() {
     case "$2" in
@@ -196,6 +198,7 @@ printf 'two\n' >"$seed/value"
 good=$(commit good)
 expect "red then green lands" "$(judge "$good" "$scenarios/007.sh")" 'exit=0 {"verdict":"accepted"}'
 expect "the verdict file and stdout agree" "$(tail -n 1 "$work/gate.out" | without_commits)" '{"verdict":"accepted"}'
+expect "every fact begins with its version" "$(cat "$integrator/verdict")" '{"v":1,"verdict":"accepted",'
 expect "the verdict names the commits it judged, resolved" "$(cat "$integrator/verdict")" \
     "\"base\":\"$base\",\"candidate\":\"$good\"}"
 expect "a ref is resolved to its commit" \
@@ -216,7 +219,7 @@ expect "a TMPDIR without room stops the gate with its own status" \
 expect "the reason names the floor and TMPDIR" "$(cat "$integrator/verdict")" \
     "\"min_gb\":1000000000,\"tmpdir\":\"$roomless\"}"
 expect "and the free space, in KiB" \
-    "$(grep -Ec '^\{"no_room":true,"free_kb":[0-9]+,"min_gb"' "$integrator/verdict")" 1
+    "$(grep -Ec '^\{"v":1,"no_room":true,"free_kb":[0-9]+,"min_gb"' "$integrator/verdict")" 1
 refuse "with no verdict" "$(cat "$integrator/verdict")" '"verdict"'
 expect "a verdict file that cannot be written still exits 5" \
     "exit=$(export TMPDIR="$roomless" SPAWN_GATE_MIN_FREE_GB=1000000000
@@ -1368,8 +1371,17 @@ sh '$objectives/server-client' break >/dev/null
 EOF
 sabotage=$(commit sabotage)
 server fix >/dev/null
-expect "a candidate that breaks the server cannot make a solved objective unsolved" \
-    "$(judge "$sabotage" "" "$objectives")" 'regression: 011.sh fails on the candidate'
+# 011 then fails on the candidate (the harness's exit 2, and the tree's
+# value besides), and the base's run of it now, on the server the candidate
+# broke, cannot run either: on a shared test server that is evidence of
+# nothing, so no verdict ("Three classes of a failing regression": with a
+# server of the gate's own the base's run has one the candidate never
+# touched, and this candidate is rejected, case 18). Never accepted: the
+# objective stays solved on the base, as judged before the candidate built.
+expect "a candidate that breaks the server cannot make a solved objective unsolved: no verdict on a shared server" \
+    "$(judge "$sabotage" "" "$objectives")" \
+    'exit=6 {"host_fault":true,"scenario":"011.sh","on":"candidate and base","runs":"2, then 2 on the candidate; 2 on the base, run now"'
+refuse "and it is never accepted" "$(cat "$integrator/verdict")" '"verdict"'
 expect "the base was judged before the candidate built" \
     "$(sed -n '/== candidate: build/q;p' "$work/gate.out")" '| == base: 011.sh: solved'
 
@@ -1718,7 +1730,7 @@ JUDGE
 expect "a task scenario that cannot be judged here is no verdict" \
     "$(judge "$good" "$unjudged_task/012.sh" "$unjudged_task")" 'exit=6 '
 expect "the gate states the fact" "$(cat "$integrator/verdict")" \
-    '{"cannot_judge":true,"scenario":"012.sh","runs":"6"'
+    '{"v":1,"cannot_judge":true,"scenario":"012.sh","runs":"6"'
 refuse "never a verdict" "$(cat "$integrator/verdict")" 'verdict'
 unset SPAWN_TEST_DATABASE_URL
 
@@ -2039,7 +2051,11 @@ gone_within() {
 # scenario order is the verdict, whichever ended first, and the runs after
 # it stop. 062 fails slowly, 063 at once, 064 would run for 120 s, far
 # longer than any load stretches the rest (the bounds below are 100 s and
-# 60 s: 29 s, the old length, left a load-45 gate 4 s of slack).
+# 60 s: 29 s, the old length, left a load-45 gate 4 s of slack). The three
+# are checks: a check's runs after its failure (again, then on the base)
+# go on beside the gate's other runs, where a numbered scenario that fails
+# waits for those to end before the base's run of it ("Three classes of a
+# failing regression", case 29), and would wait out 064.
 pfail=$work/parallel-fail
 mkdir -p "$pfail"
 cp "$scenarios/protected" "$scenarios/build" "$pfail/"
@@ -2047,12 +2063,12 @@ on_candidate() { # <name> <the candidate's commands>: passes on the base
     printf '#!/bin/sh\n[ "$(cat value)" = one ] && exit 0\n%s\n' "$2" >"$pfail/$1"
 }
 on_candidate 061.sh 'sleep 2'
-on_candidate 062.sh 'sleep 3; echo "062 failed"; exit 1'
-on_candidate 063.sh 'echo "063 failed"; exit 1'
-on_candidate 064.sh 'sleep 120.25'
+on_candidate check-062.sh 'sleep 3; echo "062 failed"; exit 1'
+on_candidate check-063.sh 'echo "063 failed"; exit 1'
+on_candidate check-064.sh 'sleep 120.25'
 started=$(date +%s)
 expect "the first failure in order is the verdict, not the first to end" \
-    "$(with_jobs 4 pfail "$good" "$pfail")" '"reason":"regression: 062.sh fails on the candidate"'
+    "$(with_jobs 4 pfail "$good" "$pfail")" '"reason":"regression: check-062.sh fails on the candidate"'
 outer=$(($(date +%s) - started))
 # The candidate phase's own wall clock, not the gate's: its setup (the
 # exports, the socket scan, the build) took 22 s of a 26 s gate at load 17
@@ -2067,8 +2083,8 @@ expect "the verdict came at the failure, not after the runs after it" \
 gate_total=$(sed -n 's/^| gate time: .*total \([0-9]*\) s$/\1/p' "$work/gate.out")
 expect "the runs after it were stopped, not waited for" \
     "$([ -n "$gate_total" ] && [ $((outer - gate_total)) -lt 60 ] && echo early) (outer $outer s, gate total ${gate_total:-none} s)" early
-refuse "and their blocks are not printed" "$(cat "$work/gate.out")" '== regression: 063.sh'
-refuse "nor is anything after them" "$(cat "$work/gate.out")" '== regression: 064.sh'
+refuse "and their blocks are not printed" "$(cat "$work/gate.out")" '== regression: check-063.sh'
+refuse "nor is anything after them" "$(cat "$work/gate.out")" '== regression: check-064.sh'
 expect "the blocks before it are" "$(cat "$work/gate.out")" '| == regression: 061.sh must still pass'
 refuse "no run of the gate is left" "$(gone_within 30 'sleep 120.25')" 'sleep'
 
@@ -2085,16 +2101,17 @@ refuse "no run of the gate is left" "$(gone_within 30 'sleep 120.25')" 'sleep'
 alone=$work/alone
 mkdir -p "$alone"
 cp "$scenarios/protected" "$scenarios/build" "$alone/"
-for name in 071.sh 072.sh 073.sh; do
-    case $name in
-    072.sh) meet=073.sh ;;
-    073.sh) meet=072.sh ;;
-    *) meet="" ;;
-    esac
-    meet_lines=""
-    [ -z "$meet" ] || meet_lines="touch met.${name%.sh}
-waited=0 # meet
+# alone_scenario <name> [<the one it meets>]. One that meets leaves its file
+# before its first check, so a run that check ends (exit 2) has still come
+# to the meeting, and the other does not wait its bound out for it.
+alone_scenario() {
+    name=$1 meet=${2-}
+    meet_file="" meet_wait=""
+    if [ -n "$meet" ]; then
+        meet_file="touch met.${name%.sh}"
+        meet_wait="waited=0 # meet
 while [ ! -e met.${meet%.sh} ] && [ \"\$waited\" -lt 600 ]; do sleep 0.1; waited=\$((waited + 1)); done # meet"
+    fi
     cat >"$alone/$name" <<EOF
 #!/bin/sh
 check() {
@@ -2107,14 +2124,18 @@ check() {
 }
 echo "$name started \$(date +%s%N)"
 touch running.$name
+$meet_file
 check
-$meet_lines
+$meet_wait
 sleep 1
 check
 rm -f running.$name
 echo "$name ended \$(date +%s%N)"
 EOF
-done
+}
+alone_scenario 071.sh
+alone_scenario 072.sh 073.sh
+alone_scenario 073.sh 072.sh
 # stamp <name> <started|ended>: the time (ns) the base run of <name> printed,
 # read from its own block in the log.
 stamp() {
@@ -2152,6 +2173,15 @@ expect "one put on the list is judged again, alone" \
     "$(with_jobs 4 alone "$good" "$alone" >/dev/null; cat "$work/gate.out")" \
     '| base results from the cache: 071.sh 073.sh; run on the base: 072.sh'
 rm "$alone/serial"
+# The control must find 071 beside a neighbour, and 071's own second or so
+# did not make it so: with the three sandboxes started more than that apart
+# (load), 071 had come and gone before 072 or 073 ran, each check saw
+# nobody, and the control was accepted (the race of 17b's 12 s, GitHub
+# issue #38). So here 071 and 073 meet as 072 and 073 did above: each
+# leaves its file and waits, up to 60 s, for the other's, and the first of
+# them to check after that finds the other still running.
+alone_scenario 071.sh 073.sh
+alone_scenario 073.sh 071.sh
 expect "the control: without the list, 071 meets its neighbours" \
     "$(with_jobs 4 alone-control "$good" "$alone")" 'exit=6 {"host_fault":true,'
 
@@ -2251,8 +2281,23 @@ printf '#!/bin/sh\necho relinked\n' >target/debug/spawn.new
 chmod 755 target/debug/spawn.new
 mv target/debug/spawn.new target/debug/spawn
 EOF
-printf '#!/bin/sh\nsleep 2\n[ "$("$SPAWN_BIN")" = built ] || { echo "ran $SPAWN_BIN: $("$SPAWN_BIN")"; exit 1; }\n' \
-    >"$bin_scenarios/check-run.sh"
+# On the candidate, where check-relink runs beside it, a run waits (up to
+# 60 s) until the binary has been linked again before it runs SPAWN_BIN: it
+# slept 2 s for that, and under load ran before the link, when there was
+# nothing to tell apart and the case passed whatever the gate did (GitHub
+# issue #38). One that never sees the link says so (exit 2): no verdict.
+cat >"$bin_scenarios/check-run.sh" <<'EOF'
+#!/bin/sh
+if [ "$(cat value)" != one ]; then
+    n=0
+    until [ "$(target/debug/spawn 2>/dev/null)" = relinked ] || [ "$n" -ge 600 ]; do
+        sleep 0.1
+        n=$((n + 1))
+    done
+    [ "$n" -lt 600 ] || { echo "target/debug/spawn was never linked again: nothing to test"; exit 2; }
+fi
+[ "$("$SPAWN_BIN")" = built ] || { echo "ran $SPAWN_BIN: $("$SPAWN_BIN")"; exit 1; }
+EOF
 cp "$bin_scenarios/check-run.sh" "$bin_scenarios/095.sh"
 expect "a binary linked again mid-gate is not the one the scenarios run" \
     "$(with_jobs 4 bin "$good" "$bin_scenarios")" 'exit=0 {"verdict":"accepted"}'
@@ -2333,7 +2378,10 @@ cp "$scenarios/protected" "$shortd/"
 shortd_release=$shortd/release
 rm -f "$shortd_release"
 releases="$releases $shortd_release"
-printf '#!/bin/sh\nn=0\nwhile [ ! -e %s ] && [ "$n" -lt 6000 ]; do sleep 0.1; n=$((n + 1)); done\nexit 0\n' \
+# On the base (value is one) it ends at once: it waited there as well, and
+# nothing lets it go before the gate has ended, so every run of the suite
+# spent the whole 600 s bound in this one base run.
+printf '#!/bin/sh\n[ "$(cat value)" != one ] || exit 0\nn=0\nwhile [ ! -e %s ] && [ "$n" -lt 6000 ]; do sleep 0.1; n=$((n + 1)); done\nexit 0\n' \
     "$shortd_release" >"$shortd/204.sh"
 printf '#!/bin/sh\nexit 1\n' >"$work/seed-task.sh"
 base=$saved_base
@@ -2623,6 +2671,59 @@ EOF
     refuse "$kind: was remade with a new password" "$(cat "$templates"/*/password)" "$first_password"
     expect "$kind: and the candidate's server took the sandbox's" "$(cat "$work/gate.out")" \
         '| 103.sh: solved on the candidate'
+    # The base's run of a regression after the candidate's (case 29) is
+    # given a server no candidate run used. 104 fails twice on the
+    # candidate and leaves a table on its server; on the base, run now, it
+    # fails too, unless it finds that table: then it exits 2, a harness
+    # error and no verdict. So a validator defect here, the owner's
+    # candidate accepted on the rest, says the base's server had no table.
+    iso=$work/own-iso-$kind
+    mkdir -p "$iso"
+    cp "$scenarios/protected" "$scenarios/build" "$iso/"
+    cat >"$iso/104.sh" <<EOF
+#!/bin/sh
+$q_function
+if [ "\$(cat value)" != one ]; then
+    q 'create table if not exists candidate_was_here (x int)'
+    [ "\$(q "select to_regclass('public.candidate_was_here') is null")" = f ] || exit 2
+    echo "104: FAIL: too slow"
+    exit 1
+fi
+# The base phase's run, before any candidate code: it passes, and leaves a
+# mark in its tree for the run after it.
+[ -e ran.104 ] || { : >ran.104; exit 0; }
+[ "\$(q "select to_regclass('public.candidate_was_here') is null")" = t ] ||
+    { echo "104: the base's run sees a table a candidate's run made"; exit 2; }
+echo "104: FAIL: too slow"
+exit 1
+EOF
+    expect "$kind: a regression's base run after the candidate's has a server no candidate run used" \
+        "$(export "$pg_var=$pg_source" SPAWN_GATE_JOBS=4 SPAWN_GATE_OWNER_CANDIDATE=1 \
+            XDG_CACHE_HOME="$work/caches/own-iso-$kind" TMPDIR="$pgtmp"
+           judge "$good" "" "$iso")" \
+        'exit=0 {"verdict":"accepted","validator_defects":["104.sh"]}'
+    expect "$kind: and the log says whose server it was" "$(cat "$work/gate.out")" \
+        "| test database: a server of their own for the base's runs of 104.sh, which no candidate run used, up in "
+    refuse "$kind: no server is left after it" "$(left)" 'bwrap'
+    # And what a candidate does to its own server does not reach the base's
+    # run: 105 fails on the candidate, which drops the database's tables
+    # (as a candidate that breaks its server would), and passes on the base,
+    # run now on a server of its own: a candidate failure, rejected. On a
+    # shared server the same candidate gets no verdict (case 9).
+    cat >"$iso/105.sh" <<EOF
+#!/bin/sh
+$q_function
+[ "\$(q 'select 1')" = 1 ] || exit 2
+[ "\$(q "select to_regclass('public.broken_by_candidate') is null")" = t ] || exit 2
+[ "\$(cat value)" = one ] && exit 0
+q 'create table broken_by_candidate (x int)'
+exit 1
+EOF
+    rm -f "$iso/104.sh"
+    expect "$kind: a candidate that fouls its own server is still rejected: the base's run has another" \
+        "$(export "$pg_var=$pg_source" SPAWN_GATE_JOBS=4 XDG_CACHE_HOME="$work/caches/own-iso-$kind" TMPDIR="$pgtmp"
+           judge "$good" "" "$iso")" \
+        'exit=0 {"verdict":"rejected","reason":"regression: 105.sh fails on the candidate"}'
     # A server that does not start is the host's, not a verdict on the
     # candidate: exit 6, `test server`, with its evidence and which start,
     # quoting the server's FATAL line; either start (SPAWN_GATE_TEST_PG_FAIL
@@ -3453,5 +3554,583 @@ refuse "nor run on the base or the candidate" "$(cat "$work/gate.out")" '081.sh'
 expect "as its own task's scenario it is judged: accepted" \
     "$(judge "$good" "$only/082.sh" "$only")" 'exit=0 {"verdict":"accepted"'
 expect "run as the task's" "$(cat "$work/gate.out")" 'candidate: 082.sh must pass'
+
+# 26. Preflight (GitHub issue #47): a scenario or check declares what it
+# needs of the host (`# needs: controller:<path>`, `tool:<name>`, an absolute
+# path), and the gate asks for all of it in one sandbox before the base's
+# build and before any scenario: a missing one is `cannot_judge` (exit 6)
+# naming the scenario and the prerequisite, in seconds, where the check
+# itself would have failed for it at the end of the gate (an owner gate,
+# 2026-11-10: check-web.sh, no node_modules, 11 ms, 55 minutes in). The
+# controller is under $HOME here, as a real one is: the sandbox shows of it
+# only `scripts` and `web/node_modules`, so a path that is on the host and
+# not in the sandbox is missing too.
+pre_controller=$HOME/pre-controller
+pre=$pre_controller/rsi/scenarios
+mkdir -p "$pre" "$pre_controller/web/elsewhere"
+cp "$scenarios/build" "$scenarios/protected" "$pre/"
+printf '#!/bin/sh\necho "301 ran"\n[ -f built ]\n' >"$pre/301.sh"
+cat >"$pre/check-needy.sh" <<'EOF_NEEDY'
+#!/bin/sh
+# What it needs of the host:
+# needs: controller:web/node_modules/ tool:sh
+# needs: /bin
+echo "check-needy ran"
+[ -d "$(dirname "$0")/../../web/node_modules" ]
+EOF_NEEDY
+started=$(date +%s)
+expect "a missing prerequisite is no verdict: cannot_judge, naming the scenario and the prerequisite" \
+    "$(judge "$good" "" "$pre")" \
+    'exit=6 {"cannot_judge":true,"scenario":"check-needy.sh","runs":"none: a prerequisite is missing","prerequisite":"controller:web/node_modules/"}'
+expect "in seconds, not after the scenarios" \
+    "$([ $(($(date +%s) - started)) -lt 30 ] && echo quick) ($(($(date +%s) - started)) s)" quick
+expect "the log names both and where it looked" "$(cat "$work/gate.out")" \
+    "| preflight: check-needy.sh needs controller:web/node_modules/ ($pre_controller/web/node_modules/), which the sandbox does not show"
+# The integrator quotes a cause only from a line that begins with the
+# scenario's name less `.sh` and says "cannot judge" (integrate.rs
+# cannot_judge_cause); the preflight's own lines begin with `preflight:`,
+# and the record then said the gate's log gave no cause (rev-f N1).
+expect "and says it as a scenario would, the form the integrator quotes as the cause" "$(cat "$work/gate.out")" \
+    "| check-needy: cannot judge here: the sandbox does not show controller:web/node_modules/ ($pre_controller/web/node_modules/)"
+refuse "nothing was built" "$(cat "$work/gate.out")" '| == base: build'
+refuse "no scenario ran on the base" "$(cat "$work/gate.out")" '| == base: 301.sh'
+refuse "nor on the candidate" "$(cat "$work/gate.out")" ' ran'
+expect "the stdout's last line is the fact too" "$(tail -n 1 "$work/gate.out")" '{"v":1,"cannot_judge":true,"scenario":"check-needy.sh"'
+expect "a warm (--base-only) runs objectives only: the check's prerequisite is not its business" \
+    "$(SPAWN_GATE_VERDICT=$integrator/verdict sh "$gate" --base-only "$repo" "$base" "$pre" >"$work/gate.out" 2>&1 && echo exit=0 || echo "exit=$?")" 'exit=0'
+mkdir -p "$pre_controller/web/node_modules"
+expect "with the prerequisite there the gate judges as before" "$(judge "$good" "" "$pre")" \
+    'exit=0 {"verdict":"accepted"}'
+expect "and says the preflight found nothing missing" "$(cat "$work/gate.out")" \
+    '| preflight: nothing missing (prerequisites declared: 3, by scenarios: 1)'
+expect "the check ran" "$(cat "$work/gate.out")" '| check-needy ran'
+# On the host and not in the sandbox: missing, as the scenario would find it.
+sed -i 's|^# needs: /bin$|# needs: controller:web/elsewhere/|' "$pre/check-needy.sh"
+expect "a path the host has and the sandbox does not show is missing" "$(judge "$good" "" "$pre")" \
+    'exit=6 {"cannot_judge":true,"scenario":"check-needy.sh","runs":"none: a prerequisite is missing","prerequisite":"controller:web/elsewhere/"}'
+sed -i 's|^# needs: controller:web/elsewhere/$|# needs: tool:no-such-tool-of-the-gate|' "$pre/check-needy.sh"
+expect "a tool that is not on PATH is missing" "$(judge "$good" "" "$pre")" \
+    '"prerequisite":"tool:no-such-tool-of-the-gate"}'
+# An objective's prerequisite stops a warm too: no verdict file, exit 4.
+printf '#!/bin/sh\n# needs: tool:no-such-tool-of-the-gate\n[ -f built ]\n' >"$pre/302.sh"
+expect "an objective's missing prerequisite ends a warm (exit 4)" \
+    "$(SPAWN_GATE_VERDICT=$integrator/verdict sh "$gate" --base-only "$repo" "$base" "$pre" >"$work/gate.out" 2>&1 && echo exit=0 || echo "exit=$?")" 'exit=4'
+expect "which says what is missing" "$(cat "$work/gate.out")" \
+    '| preflight: 302.sh needs tool:no-such-tool-of-the-gate, which the sandbox does not show'
+expect "in the scenario's own name too" "$(cat "$work/gate.out")" \
+    '| 302: cannot judge here: the sandbox does not show tool:no-such-tool-of-the-gate'
+rm -f "$pre/302.sh"
+# A word the gate cannot read is the owner's to correct, never guessed at.
+sed -i 's|^# needs: tool:no-such-tool-of-the-gate$|# needs: web/node_modules|' "$pre/check-needy.sh"
+expect "a prerequisite in no known form is an abort (exit 3)" "$(judge "$good" "" "$pre")" 'exit=3 '
+expect "which names the line" "$(cat "$work/gate.out")" \
+    '`# needs: web/node_modules` is not controller:<path>, tool:<name> or an absolute path'
+
+# 27. Results reused from the base (GitHub issue #48): a regression whose
+# scenario declares what a run reads of the tree (`# reads: binary
+# [<path> ...]`) is not run on the candidate when the candidate's `spawn`
+# is, byte for byte, the binary the base's solved result was taken on, and
+# what it reads is the same in both trees. The build hook here writes a
+# `spawn` from src/main.txt, so a candidate that leaves that file alone
+# builds the base's binary. 401 reads the binary alone, 402 a document too,
+# 403 declares nothing, 404 is on the serial list, 405 is unsolved on the
+# base, and the check has no result on the base at all. 406 and 407 declare
+# the binary and name the build's directory, where a tree's other binaries
+# are, as CARGO_TARGET_DIR and as the directory of SPAWN_BIN.
+reuse_controller=$work/reuse
+rdir=$reuse_controller/rsi/scenarios
+mkdir -p "$rdir"
+cp "$scenarios/protected" "$rdir/"
+cat >"$rdir/build" <<'EOF_REUSE'
+#!/bin/sh
+mkdir -p target/debug
+{ printf '#!/bin/sh\n'; printf 'echo "%s"\n' "$(cat src/main.txt)"; } >target/debug/spawn
+chmod 755 target/debug/spawn
+EOF_REUSE
+reuse_scenario() { # <name> <declaration or nothing> [<more commands>]
+    {
+        printf '#!/bin/sh\n'
+        [ -z "$2" ] || printf '%s\n' "$2"
+        printf 'echo "%s ran in $(basename "$PWD")"\n' "$1"
+        printf '%s\n' "${3:-[ -n \"\$(\"\$SPAWN_BIN\")\" ]}"
+    } >"$rdir/$1.sh"
+}
+reuse_scenario 401 '# reads: binary'
+reuse_scenario 402 '# reads: binary docs/guide.md' '[ -n "$("$SPAWN_BIN")" ] && [ -s docs/guide.md ]'
+reuse_scenario 403 ''
+reuse_scenario 404 '# reads: binary'
+reuse_scenario 405 '# reads: binary' 'exit 1'
+reuse_scenario 406 '# reads: binary' '[ -n "$("$SPAWN_BIN")" ] && [ ! -e "$CARGO_TARGET_DIR/debug/other" ]'
+reuse_scenario 407 '# reads: binary' '[ -n "$("$SPAWN_BIN")" ] && [ ! -e "$(dirname "$SPAWN_BIN")/other" ]'
+reuse_scenario check-declared '# reads: binary'
+printf '404.sh\n' >"$rdir/serial"
+git -C "$seed" checkout -q -B reuse-a "$base"
+mkdir -p "$seed/src" "$seed/docs" "$seed/rsi/scenarios"
+printf 'v1\n' >"$seed/src/main.txt"
+printf 'a guide\n' >"$seed/docs/guide.md"
+printf 'notes\n' >"$seed/docs/notes.md"
+cp "$rdir/401.sh" "$seed/rsi/scenarios/401.sh"
+reuse_a=$(commit reuse-a)
+reuse_candidate() { # <name> <file> <content>: a candidate on reuse-a; prints its commit
+    git -C "$seed" checkout -q -B "$1" "${4:-$reuse_a}"
+    printf '%s\n' "$3" >"$seed/$2"
+    commit "$1"
+}
+reuse_docs=$(reuse_candidate reuse-docs docs/notes.md 'other notes')
+reuse_crate=$(reuse_candidate reuse-crate src/main.txt 'v2')
+reuse_broken=$(reuse_candidate reuse-broken src/main.txt '')
+reuse_copy=$(reuse_candidate reuse-copy rsi/scenarios/401.sh '# another 401')
+reuse_guide=$(reuse_candidate reuse-guide docs/guide.md 'another guide')
+reuse_judge() { # <base> <candidate> [VAR=value]
+    (
+        export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$work/caches/reuse" ${3:+"$3"}
+        base=$1
+        judge "$2" "" "$rdir"
+    )
+}
+reuse_cache=$work/caches/reuse/spawn/gate-base
+expect "a candidate that builds the base's binary: the declared scenarios are not run, and the verdict names them" \
+    "$(reuse_judge "$reuse_a" "$reuse_docs")" 'exit=0 {"verdict":"accepted","reused":["401.sh","402.sh"]}'
+reuse_log=$(cat "$work/gate.out")
+expect "the log says so per scenario, and why" "$reuse_log" \
+    "| == regression: 401.sh must still pass: not run, the base's result (solved) is reused: it declares that a run reads only this of the tree: binary; the candidate's spawn is the binary the base's result was taken on, byte for byte (sha256 "
+expect "where the base's result is from" "$reuse_log" "the base's result is a run in this gate; the scenario and the paths it reads are the same in both trees"
+expect "the paths one declares are in the reason" "$reuse_log" \
+    'reused: it declares that a run reads only this of the tree: binary docs/guide.md;'
+expect "and once for all" "$reuse_log" \
+    '| reused from the base, not run on the candidate: 401.sh 402.sh (SPAWN_GATE_REUSE=0 runs them)'
+expect "the base ran them" "$reuse_log" '| 401 ran in baseline'
+refuse "the candidate did not run 401" "$reuse_log" '| 401 ran in candidate'
+refuse "nor 402" "$reuse_log" '| 402 ran in candidate'
+expect "a scenario that declares nothing is run" "$reuse_log" '| 403 ran in candidate'
+expect "one on the serial list is run, whatever it declares" "$reuse_log" '| 404 ran in candidate'
+expect "and the log says why" "$reuse_log" \
+    '| 404.sh declares what it reads and is run all the same: it is on the serial list'
+expect "one the base did not solve is run" "$reuse_log" \
+    '| 405.sh declares what it reads and is run all the same: the base did not solve it (unsolved)'
+expect "one that names CARGO_TARGET_DIR is run, whatever it declares (rev-f N2)" "$reuse_log" \
+    "| 406.sh declares what it reads and is run all the same: 406.sh names the build's directory (CARGO_TARGET_DIR, or SPAWN_BIN's)"
+expect "and so is one that names the directory of SPAWN_BIN" "$reuse_log" \
+    "| 407.sh declares what it reads and is run all the same: 407.sh names the build's directory (CARGO_TARGET_DIR, or SPAWN_BIN's)"
+expect "both ran" "$(printf '%s\n' "$reuse_log" | grep -cE '^\| 40[67] ran in candidate$')" 2
+expect "a check has no result on the base: run" "$reuse_log" \
+    '| check-declared.sh declares what it reads and is run all the same: only an objective (<digits>.sh) has a result on the base'
+expect "a reused result has a stage line of its own" "$reuse_log" \
+    '| stage gate reused 0ms regression: 401.sh must still pass'
+refuse "a reused result seeds nothing: only a run writes an entry" "$reuse_log" '401.sh: solved on the candidate'
+expect "a run does" "$reuse_log" '| 403.sh: solved on the candidate, seeded'
+# Six the base solved (401 to 404, 406, 407), four the candidate's runs
+# seeded (403, 404, 406, 407).
+expect "every solved entry names the binary its run ran" \
+    "$(cat "$reuse_cache"/* 2>/dev/null | grep -cE '^binary [0-9a-f]{64}$') of $(cat "$reuse_cache"/* 2>/dev/null | grep -c '^solved$')" '10 of 10'
+# The base read whole from the cache: no base build, and the binary the
+# entries name is still what the candidate's is compared with.
+expect "with the base's results all cached, the same reuse" \
+    "$(reuse_judge "$reuse_a" "$reuse_docs")" 'exit=0 {"verdict":"accepted","reused":["401.sh","402.sh"]}'
+refuse "the base was not built for it" "$(cat "$work/gate.out")" '| == base: build'
+expect "the reason says the result is the cache's" "$(cat "$work/gate.out")" \
+    "the base's result is an entry of the base cache, which a run wrote;"
+expect "the switch turns it off: everything is run" \
+    "$(reuse_judge "$reuse_a" "$reuse_docs" SPAWN_GATE_REUSE=0)" 'exit=0 {"verdict":"accepted"}'
+expect "401 ran" "$(cat "$work/gate.out")" '| 401 ran in candidate'
+expect "402 ran" "$(cat "$work/gate.out")" '| 402 ran in candidate'
+expect "and the log says it is the switch" "$(cat "$work/gate.out")" \
+    '| 401.sh declares what it reads and is run all the same: SPAWN_GATE_REUSE=0'
+expect "a switch that is neither 0 nor 1 is an abort (exit 3)" \
+    "$(reuse_judge "$reuse_a" "$reuse_docs" SPAWN_GATE_REUSE=maybe)" 'exit=3 '
+# One byte of the crate: another binary, so nothing is reused.
+expect "a candidate that changes the binary: accepted, nothing reused" \
+    "$(reuse_judge "$reuse_a" "$reuse_crate")" 'exit=0 {"verdict":"accepted"}'
+reuse_log=$(cat "$work/gate.out")
+expect "401 ran on it" "$reuse_log" '| 401 ran in candidate'
+expect "402 ran on it" "$reuse_log" '| 402 ran in candidate'
+expect "and the log says the binaries differ" "$reuse_log" \
+    "| 401.sh declares what it reads and is run all the same: the candidate's spawn (sha256 "
+refuse "nothing is said to be reused" "$reuse_log" '| reused from the base'
+expect "a candidate that breaks the binary is still a regression of a declared scenario" \
+    "$(reuse_judge "$reuse_a" "$reuse_broken")" \
+    'exit=0 {"verdict":"rejected","reason":"regression: 401.sh fails on the candidate"}'
+# The scenario's own file, changed in the candidate's tree: that scenario
+# is run; the other declared one is still reused.
+expect "a candidate that changes the scenario's file: that one is run" \
+    "$(reuse_judge "$reuse_a" "$reuse_copy")" 'exit=0 {"verdict":"accepted","reused":["402.sh"]}'
+expect "401 ran" "$(cat "$work/gate.out")" '| 401 ran in candidate'
+expect "and the log says why" "$(cat "$work/gate.out")" \
+    '| 401.sh declares what it reads and is run all the same: the candidate changes rsi/scenarios/401.sh'
+expect "a candidate that changes a path a scenario reads: that one is run" \
+    "$(reuse_judge "$reuse_a" "$reuse_guide")" 'exit=0 {"verdict":"accepted","reused":["401.sh"]}'
+expect "402 ran" "$(cat "$work/gate.out")" '| 402 ran in candidate'
+expect "and the log names the path" "$(cat "$work/gate.out")" \
+    '| 402.sh declares what it reads and is run all the same: docs/guide.md, which it reads, differs between the base and the candidate'
+# A seeded entry is a run's too (the candidate's, in the gate that accepted
+# it): the gate of reuse-crate ran 401 and 402 on that commit, so a
+# candidate on it that builds the same binary reuses them.
+reuse_next=$(reuse_candidate reuse-next docs/notes.md 'more notes' "$reuse_crate")
+expect "a result seeded by a candidate's run is reused on the next base" \
+    "$(reuse_judge "$reuse_crate" "$reuse_next")" 'exit=0 {"verdict":"accepted","reused":["401.sh","402.sh"]}'
+expect "the base's result was the seed" "$(cat "$work/gate.out")" \
+    "| == base: 401.sh: solved (cached, seeded by the gate of $reuse_crate at "
+refuse "401 did not run on the candidate" "$(cat "$work/gate.out")" '| 401 ran in candidate'
+# The controller's scenario changed since the entry was written: another
+# key, so the base runs it again, and what is reused is that run's result,
+# never one another version of the scenario earned.
+printf '# a comment more\n' >>"$rdir/401.sh"
+expect "a scenario the controller changed is run again on the base" \
+    "$(reuse_judge "$reuse_a" "$reuse_docs")" 'exit=0 {"verdict":"accepted","reused":["401.sh","402.sh"]}'
+reuse_log=$(cat "$work/gate.out")
+expect "run there" "$reuse_log" '| 401 ran in baseline'
+expect "and that run's result is the one reused" "$reuse_log" \
+    "| == regression: 401.sh must still pass: not run, the base's result (solved) is reused"
+# An entry that names no binary (another gate's, an older one's): the gate
+# does not guess what it was taken on.
+for entry in "$reuse_cache"/*; do
+    case "$entry" in *.lock) continue ;; esac
+    if grep -q '^binary ' "$entry"; then sed -i '/^binary /d' "$entry"; fi
+done
+expect "an entry that names no binary is believed and never reused from" \
+    "$(reuse_judge "$reuse_a" "$reuse_docs")" 'exit=0 {"verdict":"accepted"}'
+expect "the log says so" "$(cat "$work/gate.out")" \
+    "| 401.sh declares what it reads and is run all the same: the base's result names no binary it was taken on"
+expect "and 401 ran" "$(cat "$work/gate.out")" '| 401 ran in candidate'
+# A binary line that is not whole makes the entry a miss, judged again.
+for entry in "$reuse_cache"/*; do
+    case "$entry" in *.lock) continue ;; esac
+    [ "$(cat "$entry")" != solved ] || printf 'solved\nbinary abc\n' >"$entry"
+done
+expect "an entry whose binary line is not a sha256 is a miss" \
+    "$(reuse_judge "$reuse_a" "$reuse_docs")" 'exit=0 {"verdict":"accepted","reused":["401.sh","402.sh"]}'
+expect "judged again on the base" "$(cat "$work/gate.out")" \
+    '| == base: 401.sh: its cache entry cannot be read; judged again'
+git -C "$seed" checkout -q main 2>/dev/null || git -C "$seed" checkout -q -B main "$base"
+
+# 28. What is never cached (GitHub issue #29): a base run that could not
+# judge writes no entry, and the exit code alone says which run that is.
+# 501's driver asks the fake server of case 9 for a count and takes its
+# first, second and fourth asks as unanswered: a transport error, which a
+# harness reports as its own (exit 2). Supply PA's reported "fetch failed:
+# other side closed" as a failed assertion (exit 1), and two such runs on
+# the base were a cached `unsolved`: every later gate on that base took a
+# candidate that broke the objective. The third ask is an assertion that
+# fails (exit 1), and from the fifth on the scenario judges the tree.
+transport=$work/transport
+mkdir -p "$transport"
+cp "$scenarios/protected" "$scenarios/build" "$work/server-client" "$transport/"
+cat >"$transport/501.sh" <<'EOF'
+#!/bin/sh
+case "$(sh "$(dirname "$0")/server-client" count)" in
+1 | 2 | 4)
+    echo "501: FAIL: GET /orders: no answer from the server (fetch failed: other side closed)"
+    exit 2
+    ;;
+3)
+    echo "501: FAIL: the order was not confirmed"
+    exit 1
+    ;;
+esac
+[ "$(cat value)" != three ]
+EOF
+# A candidate that breaks 501, and 511 below.
+branch breaks-objective
+printf 'three\n' >"$seed/value"
+breaks=$(commit breaks-objective)
+git -C "$seed" checkout -q main 2>/dev/null || git -C "$seed" checkout -q -B main "$base"
+never_judge() { # <cache name> <scenarios> [VAR=value]: the gate on that candidate, the fake server its test database
+    (
+        export SPAWN_TEST_DATABASE_URL="postgres://u:p@$(printf '%s' "$server_dir" | sed 's|/|%2F|g')/db" ${3:+"$3"}
+        with_jobs 1 "$1" "$breaks" "$2"
+    )
+}
+# never_cached <cache name>: the results that base cache holds, a word each.
+never_cached() {
+    for entry in "$work/caches/$1/spawn/gate-base"/*; do
+        case "$entry" in *.lock) continue ;; esac
+        if [ -f "$entry" ]; then head -n 1 "$entry"; fi
+    done | tr '\n' ' '
+}
+server reset >/dev/null
+expect "a transport error on the base is a host fault, no verdict" "$(never_judge transport "$transport")" \
+    'exit=6 {"host_fault":true,"scenario":"501.sh","on":"base","runs":"2"'
+expect "and nothing is cached" "[$(never_cached transport)]" '[]'
+expect "a second one, in the next gate: judged again, the same fact" "$(never_judge transport "$transport")" \
+    'exit=6 {"host_fault":true,"scenario":"501.sh","on":"base","runs":"2"'
+expect "run, not read" "$(cat "$work/gate.out")" '| == base: 501.sh'
+expect "and still nothing cached" "[$(never_cached transport)]" '[]'
+expect "an assertion's exit 1 and then a transport error do not agree: a host fault" \
+    "$(never_judge transport "$transport")" \
+    'exit=6 {"host_fault":true,"scenario":"501.sh","on":"base","runs":"1, then 2"'
+expect "so no unsolved is cached" "[$(never_cached transport)]" '[]'
+expect "once the server answers, the base solves it and the candidate is still checked for it" \
+    "$(never_judge transport "$transport")" \
+    'exit=0 {"verdict":"rejected","reason":"regression: 501.sh fails on the candidate"}'
+expect "by a run on the base" "$(cat "$work/gate.out")" '| base results from the cache: none; run on the base: 501.sh'
+expect "whose result is the only entry" "[$(never_cached transport)]" '[solved ]'
+# A run the gate itself lost (no status of it) is no exit 1 either: it read
+# as one, and two of them cached `unsolved` for an objective the base
+# solves, so the candidate that breaks it was accepted.
+lost=$work/lost
+mkdir -p "$lost"
+cp "$scenarios/protected" "$scenarios/build" "$lost/"
+printf '#!/bin/sh\n[ "$(cat value)" != three ]\n' >"$lost/511.sh"
+expect "a base run that left no status is a host fault, not an unsolved objective" \
+    "$(never_judge lost "$lost" SPAWN_GATE_TEST_LOST_RUN=511.sh)" \
+    'exit=6 {"host_fault":true,"scenario":"511.sh","on":"base","runs":"4"'
+expect "the log says the gate lost it" "$(cat "$work/gate.out")" \
+    '| gate: the run of 511.sh left no status: the gate lost it (not an exit of the scenario'
+expect "and nothing is cached" "[$(never_cached lost)]" '[]'
+expect "the next gate judges it, and the candidate that breaks it is rejected" \
+    "$(never_judge lost "$lost")" \
+    'exit=0 {"verdict":"rejected","reason":"regression: 511.sh fails on the candidate"}'
+
+# 29. Three classes of a failing regression (the owner, 2026-11-10, after a
+# gate rejected valid work on 028, whose timing check failed on main itself
+# at that load): a numbered scenario the base solved that fails on the
+# candidate is run again there and then on the base, now, and only one the
+# base passes twice is the candidate's failure. A validator below fails by
+# a schedule, whatever the tree says: its n-th run in a tree (it leaves a
+# mark there) passes (P), fails its assertion (F) or cannot run (H: exit
+# 2) by the n-th letter, the base's tree (value is one) and the
+# candidate's each with its schedule. The base's first run is the base
+# phase's, before any candidate code; a run past the schedule passes.
+classes=$work/classes
+class_dir() { # <name>: a scenarios directory, and a base cache, of its own
+    mkdir -p "$classes/$1"
+    cp "$scenarios/protected" "$scenarios/build" "$classes/$1/"
+}
+scheduled() { # <dir> <name> <the base's schedule> <the candidate's>
+    cat >"$classes/$1/$2.sh" <<EOF
+#!/bin/sh
+n=1
+while [ -e "ran.$2.\$n" ]; do n=\$((n + 1)); done
+: >"ran.$2.\$n"
+if [ "\$(cat value)" = one ]; then schedule=$3; else schedule=$4; fi
+echo "$2 run \$n in \$(basename "\$PWD") at \$(date +%s%N)"
+case "\$(printf '%s' "\$schedule" | cut -c"\$n")" in
+F) echo "$2: FAIL: too slow"; exit 1 ;;
+H) echo "$2: harness: no answer"; exit 2 ;;
+esac
+exit 0
+EOF
+}
+class_jobs=1
+class_judge() { # <dir> <candidate> [VAR=value ...]: $class_jobs runs at a time
+    (
+        class_name=$1 class_candidate=$2
+        shift 2
+        [ $# -eq 0 ] || export "$@"
+        with_jobs "$class_jobs" "class-$class_name" "$class_candidate" "$classes/$class_name"
+    )
+}
+# A candidate failure: the candidate fails it twice, the base passes it
+# twice, now. 710 is an objective nobody solved: no regression, no rerun.
+class_dir only
+printf '#!/bin/sh\n[ -f solved ]\n' >"$classes/only/710.sh"
+printf '#!/bin/sh\necho "711 ran in $(basename "$PWD")"\n[ "$(cat value)" != three ]\n' >"$classes/only/711.sh"
+expect "a regression that fails on the candidate and passes on the base is rejected, as before" \
+    "$(class_judge only "$breaks")" 'exit=0 {"verdict":"rejected","reason":"regression: 711.sh fails on the candidate"}'
+class_log=$(cat "$work/gate.out")
+expect "after a second run on the candidate" "$class_log" \
+    '| == regression: 711.sh must still pass (again: a failing regression runs twice)'
+expect "and two on the base, run now" "$class_log" \
+    '| == base: 711.sh (it failed on the candidate: does the base pass it now?) (again)'
+expect "the log says the class: a candidate failure" "$class_log" \
+    '| 711.sh fails on the candidate (1, then 1) and passes on the base, run now (0, then 0): candidate failure'
+expect "twice on the candidate, and three times on the base with the base phase's run" \
+    "$(printf '%s\n' "$class_log" | grep -c '^| 711 ran in candidate$') and $(printf '%s\n' "$class_log" | grep -c '^| 711 ran in baseline$')" \
+    '2 and 3'
+expect "an objective the base did not solve is no regression" "$class_log" \
+    '| 710.sh fails on the base too: an unsolved objective, not a regression'
+refuse "and is not run again" "$class_log" '710.sh must still pass (again'
+# A validator defect, and a cached `solved` that is not believed for it.
+# 721 is too slow on a loaded host, whatever the tree. The load is a
+# comment in the `serial` list beside it: a file every run reads and no
+# base cache key holds, as no key holds the host's load. Quiet for the
+# base's run, which is cached, and loaded from then on.
+class_dir defect
+cat >"$classes/defect/721.sh" <<'EOF'
+#!/bin/sh
+! grep -q '^# load: high$' "$(dirname "$0")/serial" || { echo "721: FAIL: too slow"; exit 1; }
+EOF
+printf '#!/bin/sh\necho "722 ran in $(basename "$PWD")"\n' >"$classes/defect/722.sh"
+printf '#!/bin/sh\n[ "$(cat value)" != three ]\n' >"$classes/defect/723.sh"
+printf '# load: quiet\n' >"$classes/defect/serial"
+expect "a gate in which nothing fails" "$(class_judge defect "$good")" 'exit=0 {"verdict":"accepted"}'
+refuse "pays nothing: no second run" "$(cat "$work/gate.out")" '(again: a failing regression'
+refuse "and no base run after the candidate's" "$(cat "$work/gate.out")" 'does the base pass it now'
+printf '# load: high\n' >"$classes/defect/serial"
+expect "a validator that fails on the base too is no rejection: for a task's candidate, no verdict" \
+    "$(class_judge defect "$good")" \
+    'exit=6 {"host_fault":true,"scenario":"721.sh","on":"candidate and base","runs":"1, then 1 on the candidate; 1 on the base, run now","reason":"validator defect: 721.sh fails on the base too'
+class_log=$(cat "$work/gate.out")
+expect "the fact names the class and the validator" "$(cat "$integrator/verdict")" \
+    '"evidence":"validator_defect","validator_defects":["721.sh"]'
+refuse "and is no verdict" "$(cat "$integrator/verdict")" '"verdict"'
+expect "the base's result was the cache's, taken on a quiet host" "$class_log" '| == base: 721.sh: solved (cached)'
+expect "and is not what decided: the base was run now" "$class_log" \
+    '| == base: 721.sh (it failed on the candidate: does the base pass it now?)'
+expect "the log says the class: a validator defect" "$class_log" \
+    "| 721.sh fails on the candidate and on the base, run now (1, then 1 on the candidate; 1 on the base, run now): validator defect (fails on the base too, under the same conditions), not a rejection; no verdict on a task's candidate"
+expect "the owner's own candidate is judged on the rest and accepted, the validator named" \
+    "$(class_judge defect "$good" SPAWN_GATE_OWNER_CANDIDATE=1)" \
+    'exit=0 {"verdict":"accepted","validator_defects":["721.sh"]}'
+expect "the rest was judged" "$(cat "$work/gate.out")" '| 722 ran in candidate'
+expect "and the log says whose candidate goes on" "$(cat "$work/gate.out")" \
+    "validator defect (fails on the base too, under the same conditions), not a rejection; the owner's candidate is judged on the rest"
+expect "the owner's candidate is still rejected for a failure of its own, the defect named beside it" \
+    "$(class_judge defect "$breaks" SPAWN_GATE_OWNER_CANDIDATE=1)" \
+    'exit=0 {"verdict":"rejected","reason":"regression: 723.sh fails on the candidate","validator_defects":["721.sh"]}'
+expect "a SPAWN_GATE_OWNER_CANDIDATE that is neither 0 nor 1 is an abort (exit 3)" \
+    "$(class_judge defect "$good" SPAWN_GATE_OWNER_CANDIDATE=yes)" 'exit=3 '
+# Isolation: on a shared test server (the fake one of case 9: the gate has
+# none of its own) the base's run after the candidate's saw what the
+# candidate's runs left there, so its failure is evidence of nothing, for
+# the owner's candidate too. With no test database at all, nothing is
+# shared, and the same runs are a validator defect.
+class_dir shared
+scheduled shared 725 PF FF
+expect "on a shared test server a base that fails after the candidate ran is cannot judge, the owner's too" \
+    "$(class_judge shared "$good" SPAWN_GATE_OWNER_CANDIDATE=1 \
+        SPAWN_TEST_DATABASE_URL="postgres://u:p@$(printf '%s' "$server_dir" | sed 's|/|%2F|g')/db")" \
+    'exit=6 {"host_fault":true,"scenario":"725.sh","on":"candidate and base","runs":"1, then 1 on the candidate; 1 on the base, run now"'
+expect "the log says why" "$(cat "$work/gate.out")" \
+    "but on the test server the candidate's runs used (a shared one: the gate has no server of its own, SPAWN_GATE_PG_BIN or SPAWN_GATE_PG_IMAGE), where the base's failure may be the candidate's doing (1, then 1 on the candidate; 1 on the base, run now): infrastructure (cannot judge), no verdict"
+refuse "and it is not called a validator defect" "$(cat "$integrator/verdict")" 'validator_defect'
+expect "with no test database to share, the same runs are a validator defect" \
+    "$(class_judge shared "$good" SPAWN_GATE_OWNER_CANDIDATE=1)" \
+    'exit=0 {"verdict":"accepted","validator_defects":["725.sh"]}'
+# Isolation: the base's run after the candidate's is beside nothing else of
+# the gate. 792, a neighbour on the candidate, lasts until 791's two
+# candidate runs have left their marks and 2 s more, the time in which the
+# base's run would otherwise start: it starts only after 792 has ended.
+class_dir apart
+scheduled apart 791 PF FF
+cat >"$classes/apart/792.sh" <<'EOF'
+#!/bin/sh
+[ "$(cat value)" != one ] || exit 0
+n=0
+until [ -e ran.791.2 ] || [ "$n" -ge 600 ]; do sleep 0.1; n=$((n + 1)); done
+sleep 2
+echo "792 ended at $(date +%s%N)"
+EOF
+class_jobs=2
+expect "two at a time: a validator defect beside a neighbour" \
+    "$(class_judge apart "$good" SPAWN_GATE_OWNER_CANDIDATE=1)" \
+    'exit=0 {"verdict":"accepted","validator_defects":["791.sh"]}'
+class_jobs=1
+apart_base=$(sed -n 's/^| 791 run 2 in baseline at \([0-9]*\)$/\1/p' "$work/gate.out")
+apart_neighbour=$(sed -n 's/^| 792 ended at \([0-9]*\)$/\1/p' "$work/gate.out")
+expect "the base's run after the candidate's started once the neighbour had ended" \
+    "$([ -n "$apart_base" ] && [ -n "$apart_neighbour" ] && [ "$apart_neighbour" -le "$apart_base" ] && echo alone) (792 ended at ${apart_neighbour:-nothing}, the base's run began at ${apart_base:-nothing})" \
+    alone
+# Failing and then passing on the candidate. A base that fails one of its
+# two runs now: the validator's defect all the same.
+class_dir flaky
+scheduled flaky 731 PPF FP
+expect "failed then passed on the candidate, and the base fails one of two: a validator defect" \
+    "$(class_judge flaky "$good")" \
+    'exit=6 {"host_fault":true,"scenario":"731.sh","on":"candidate and base","runs":"1, then 0 on the candidate; 0, then 1 on the base, run now","reason":"validator defect:'
+# The base passes both: a third run on the candidate. One failure of three
+# is unstable on the candidate: no verdict, never accepted on it.
+class_dir unstable
+scheduled unstable 741 PPP FPP
+expect "one failure of three on the candidate, a clean base: unstable, cannot judge (exit 6)" \
+    "$(class_judge unstable "$good" SPAWN_GATE_OWNER_CANDIDATE=1)" \
+    'exit=6 {"cannot_judge":true,"scenario":"741.sh","runs":"1, then 0, then 0 on the candidate; 0, then 0 on the base, run now","reason":"unstable on the candidate:'
+expect "the log says so in the words the integrator quotes" "$(cat "$work/gate.out")" \
+    '| 741: cannot judge: unstable on the candidate (1, then 0, then 0 on the candidate; 0, then 0 on the base, run now)'
+expect "and the class" "$(cat "$work/gate.out")" \
+    'unstable on the candidate, neither a pass nor a candidate failure: infrastructure (cannot judge), no verdict'
+refuse "never a verdict, the owner's candidate neither" "$(cat "$integrator/verdict")" '"verdict"'
+# Two failures of three: the candidate's.
+class_dir twice
+scheduled twice 751 PPP FPF
+expect "two failures of three on the candidate, a clean base: rejected" \
+    "$(class_judge twice "$good")" 'exit=0 {"verdict":"rejected","reason":"regression: 751.sh fails on the candidate"}'
+expect "as a candidate failure" "$(cat "$work/gate.out")" \
+    '| 751.sh fails on the candidate (1, then 0, then 1) and passes on the base, run now (0, then 0): candidate failure'
+# A base run that exits neither 0 nor 1 is the harness's: infrastructure.
+class_dir harness
+scheduled harness 761 PH FF
+expect "a base run, now, that is a harness error: infrastructure, no verdict" \
+    "$(class_judge harness "$good")" \
+    'exit=6 {"host_fault":true,"scenario":"761.sh","on":"candidate and base","runs":"1, then 1 on the candidate; 2 on the base, run now"'
+expect "said as its class" "$(cat "$work/gate.out")" \
+    '| 761.sh failed on the candidate and its run on the base exited 2, neither 0 nor 1 (1, then 1 on the candidate; 2 on the base, run now): infrastructure (cannot judge), no verdict'
+refuse "not a validator defect" "$(cat "$integrator/verdict")" 'validator_defect'
+
+# 30. A validator the owner knows is broken: `<scenarios-dir>/quarantined`,
+# a list like `serial`. A scenario on it is not run as a regression, and the
+# log and the verdict name it in every gate. 771 fails on a tree whose
+# value is three, 773 passes on one whose value is two.
+quarantine=$work/quarantine
+mkdir -p "$quarantine"
+cp "$scenarios/protected" "$scenarios/build" "$quarantine/"
+printf '#!/bin/sh\necho "771 ran in $(basename "$PWD")"\n[ "$(cat value)" != three ]\n' >"$quarantine/771.sh"
+printf '#!/bin/sh\necho "772 ran in $(basename "$PWD")"\n' >"$quarantine/772.sh"
+printf '#!/bin/sh\n[ "$(cat value)" = two ]\n' >"$quarantine/773.sh"
+expect "without the list, the candidate that breaks 771 is rejected" \
+    "$(with_jobs 1 quarantine "$breaks" "$quarantine")" 'regression: 771.sh fails on the candidate'
+printf '# 771: fails on main under load, until its timing check is fixed (the owner)\n771.sh\n\n773.sh\n' \
+    >"$quarantine/quarantined"
+expect "a scenario on the owner's list is not run as a regression, and the verdict names it" \
+    "$(with_jobs 1 quarantine "$breaks" "$quarantine")" 'exit=0 {"verdict":"accepted","quarantined":["771.sh","773.sh"]}'
+quarantine_log=$(cat "$work/gate.out")
+expect "the log names it too" "$quarantine_log" \
+    "| quarantined by the owner's list ($quarantine/quarantined), not run as a regression and named in the verdict: 771.sh 773.sh"
+refuse "it was not run on the candidate" "$quarantine_log" '771 ran in candidate'
+refuse "nor judged on the base" "$quarantine_log" '| == base: 771.sh'
+expect "a scenario that is not on the list is run as before" "$quarantine_log" '| 772 ran in candidate'
+expect "the list is in no base cache key: the other's result is still the cache's" "$quarantine_log" \
+    '| base results from the cache: 772.sh; run on the base: none'
+expect "the task's own scenario is never skipped by the list" \
+    "$(with_jobs 1 quarantine "$good" "$quarantine" "$quarantine/773.sh")" \
+    'exit=0 {"verdict":"accepted","quarantined":["771.sh"]}'
+expect "it ran as the task" "$(cat "$work/gate.out")" '| == candidate: 773.sh must pass'
+# The tree's copy of the list is a scenario file like any other: under the
+# protected paths, so a task's candidate cannot put a scenario on it.
+branch quarantine-self
+printf 'two\n' >"$seed/value"
+mkdir -p "$seed/rsi/scenarios"
+printf '007.sh\n' >"$seed/rsi/scenarios/quarantined"
+quarantine_self=$(commit quarantine-self)
+git -C "$seed" checkout -q main 2>/dev/null || git -C "$seed" checkout -q -B main "$base"
+expect "a candidate that writes the tree's list is refused: the scenarios are protected paths" \
+    "$(judge "$quarantine_self" "$listed/007.sh" "$listed")" 'candidate touches protected paths'
+
+# 31. A known failure first (the owner, 2026-11-10: a gate took 39 minutes
+# to say what the gate before it had said). The regression that last ended
+# a gate of these scenarios is on record beside the base cache, and the
+# next gate judges it first: its job and its block before every other,
+# whatever the scenario order, so a failure that is still there ends the
+# gate before the rest is printed. 783, the last in the order, fails on a
+# tree whose value is three.
+known=$work/known
+mkdir -p "$known"
+cp "$scenarios/protected" "$scenarios/build" "$known/"
+printf '#!/bin/sh\necho "781 ran in $(basename "$PWD")"\n' >"$known/781.sh"
+cp "$known/781.sh" "$known/782.sh"
+sed -i 's/781/782/' "$known/782.sh"
+printf '#!/bin/sh\necho "783 ran in $(basename "$PWD")"\n[ "$(cat value)" != three ]\n' >"$known/783.sh"
+# first_block: the first regression block of the gate's log.
+first_block() { grep -m 1 '^| == regression: ' "$work/gate.out"; }
+expect "a first gate rejects at the failing scenario, in the scenario order" \
+    "$(with_jobs 2 known "$breaks" "$known")" 'regression: 783.sh fails on the candidate'
+refuse "with no known failure yet" "$(cat "$work/gate.out")" 'known failure first'
+expect "the blocks before it were printed" "$(first_block)" '| == regression: 781.sh must still pass'
+expect "the failure is on record beside the base cache" \
+    "$(cat "$work/caches/known/spawn/gate-solved"/*/.known-failure.* 2>/dev/null)" '783.sh'
+expect "the next gate rejects on it again" \
+    "$(with_jobs 2 known "$breaks" "$known")" 'regression: 783.sh fails on the candidate'
+expect "and says it judged the known failure first" "$(cat "$work/gate.out")" \
+    '| known failure first: 783.sh ended the last gate of these scenarios that it failed in'
+expect "its block is the first" "$(first_block)" '| == regression: 783.sh must still pass'
+refuse "and the gate ended on it, before the others' blocks" "$(cat "$work/gate.out")" '| == regression: 781.sh'
+expect "a candidate that passes it is judged on it first, and accepted" \
+    "$(with_jobs 2 known "$good" "$known")" 'exit=0 {"verdict":"accepted"}'
+expect "first, as the record said" "$(first_block)" '| == regression: 783.sh must still pass'
+expect "and the run that passed removed the record" \
+    "$(ls -A "$work/caches/known/spawn/gate-solved"/*/ | grep -c 'known-failure' || true)" 0
+expect "so the gate after it is in the scenario order again" \
+    "$(with_jobs 2 known "$good" "$known" >/dev/null; first_block)" '| == regression: 781.sh must still pass'
+refuse "with nothing said of a known failure" "$(cat "$work/gate.out")" 'known failure first'
 
 echo "gate: all cases pass"

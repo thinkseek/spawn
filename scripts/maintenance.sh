@@ -4,11 +4,27 @@
 # touched:
 #
 #   1. scratch  the gate's scratch directories, `$TMPDIR/spawn-gate.XXXXXX`
-#               (scripts/disk.sh names them), owned by this user and not
-#               modified for SPAWN_MAINTENANCE_SCRATCH_AGE_MIN (default 1440,
-#               a day). The gate removes its own scratch on exit and the
-#               integrator kills it at its wall clock (120 minutes by default), so one that old was
-#               left by a gate killed before its trap ran.
+#               (scripts/disk.sh names them), owned by this user, whose
+#               gate is gone. The gate removes its own scratch on exit, so
+#               one that is still there was left by a gate killed before
+#               its trap ran, or belongs to a gate that runs. Which, the
+#               scratch says itself: the gate's record in it (disk.sh,
+#               gate_scratch: its pid, its start time, the boot). While
+#               that process runs the scratch stays, however old: a gate
+#               runs as long as SPAWN_GATE_WALL_CLOCK_MINUTES allows, an
+#               owner's by hand as long as it takes, and a directory's age
+#               says nothing of either (issue #16, item 4: a fixed 180
+#               minutes removed the scratch of gates still running). Once
+#               that process is gone the scratch goes, whatever its age. A
+#               scratch without a record (a gate from a controller before
+#               the record; a gate killed before it wrote one) cannot say:
+#               it goes by its age alone, not modified for
+#               SPAWN_MAINTENANCE_SCRATCH_AGE_MIN (default 1440, a day)
+#               and for SPAWN_GATE_WALL_CLOCK_MINUTES when that is longer.
+#               In every case a scratch in which some process still has
+#               its working directory, its root or an open file stays
+#               (what a killed gate left running), and so does every
+#               scratch when /proc cannot tell.
 #   2. dumps    deploy.sh's pre-deploy dumps in SPAWN_BACKUP_DIR (default
 #               ~/.local/share/spawn-rsi/backups), named exactly
 #               `spawn-YYYYMMDD-HHMMSS.dump`: the newest
@@ -64,14 +80,48 @@ whole() { # <name> <value>: the value, when it is a whole number
     esac
 }
 
+# scratch_in_use <dir>: a process has its working directory, its root or an
+# open file there (/proc names physical paths, so the directory's is what is
+# compared), or that cannot be told: the directory does not resolve, or
+# this process cannot read its own /proc entry.
+scratch_in_use() {
+    physical=$(readlink -f -- "$1" 2>/dev/null) || return 0
+    [ -n "$physical" ] && [ -n "$(readlink "/proc/$$/cwd" 2>/dev/null)" ] || return 0
+    # The one glob of this script: the processes' entries in /proc.
+    set +f
+    hit=$(find /proc/[0-9]*/cwd /proc/[0-9]*/root /proc/[0-9]*/fd -maxdepth 1 \
+        \( -lname "$physical" -o -lname "$physical/*" \) -print -quit 2>/dev/null)
+    set -f
+    [ -n "$hit" ]
+}
+
 # 1. the gate's scratch
 tmp=${TMPDIR:-/tmp}
 age=${SPAWN_MAINTENANCE_SCRATCH_AGE_MIN:-1440}
 if whole SPAWN_MAINTENANCE_SCRATCH_AGE_MIN "$age"; then
+    # A scratch without its gate's record goes by age alone: never younger
+    # than a gate may run.
+    case ${SPAWN_GATE_WALL_CLOCK_MINUTES-} in
+    '' | *[!0-9]*) ;;
+    *) [ "$SPAWN_GATE_WALL_CLOCK_MINUTES" -le "$age" ] || age=$SPAWN_GATE_WALL_CLOCK_MINUTES ;;
+    esac
     removed=0
+    running=0
     # -type d without -L: a symlink named like scratch is not followed.
     for dir in $(find "$tmp" -mindepth 1 -maxdepth 1 -type d -name "$GATE_SCRATCH_PREFIX.??????" \
-        -user "$(id -u)" -mmin +"$age" | sort); do
+        -user "$(id -u)" | sort); do
+        case $(gate_scratch_owner "$dir") in
+        alive)
+            running=$((running + 1))
+            continue
+            ;;
+        gone) ;;
+        *) [ -n "$(find "$dir" -maxdepth 0 -mmin +"$age")" ] || continue ;;
+        esac
+        if scratch_in_use "$dir"; then
+            say "scratch: kept $dir: its gate is gone, but a process still uses it (or /proc cannot tell)"
+            continue
+        fi
         if [ "$dry" = 1 ]; then
             say "scratch: would remove $dir"
             continue
@@ -84,7 +134,7 @@ if whole SPAWN_MAINTENANCE_SCRATCH_AGE_MIN "$age"; then
             fail "scratch: could not remove $dir"
         fi
     done
-    say "scratch: removed $removed gate scratch director$([ "$removed" = 1 ] && echo y || echo ies) from $tmp$note"
+    say "scratch: removed $removed gate scratch director$([ "$removed" = 1 ] && echo y || echo ies) from $tmp, kept $running whose gate runs$note"
 fi
 
 # 2. deploy.sh's dumps

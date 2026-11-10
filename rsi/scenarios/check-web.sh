@@ -2,6 +2,10 @@
 # Check: the web UI builds. A change to its dependencies is refused unless
 # the owner reviewed that exact set (web-dependencies-reviewed). The build uses the controller's installed
 # node_modules.
+#
+# What it needs of the host, read by the gate before anything runs
+# (scripts/rsi/gate.sh "Preflight"): without it the build below cannot start.
+# needs: controller:web/node_modules/
 set -eu
 [ -f web/package.json ] || exit 0
 controller=$(cd "$(dirname "$0")/../.." && pwd)

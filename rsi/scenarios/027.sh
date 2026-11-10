@@ -49,6 +49,13 @@
 # after, and records the whole result.
 # Runs inside the gate's sandbox (scripts/rsi/gate.sh): needs SPAWN_BIN and
 # SPAWN_TEST_DATABASE_URL, creates and drops its own database, no network.
+#
+# What a run reads of the tree under test, all of it (scripts/rsi/gate.sh
+# "Results reused from the base"): SPAWN_BIN, run for init-db, mission add
+# and mission configure, none of which reads the working directory; the
+# repository, gate and backlog it names are its own, under a scratch
+# directory, and everything else is the controller's scripts and psql.
+# reads: binary
 set -eu
 
 asserted=""
