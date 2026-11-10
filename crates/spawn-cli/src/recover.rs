@@ -42,6 +42,12 @@
 //! model_auth, model_unavailable, context_exhausted, model_error, crashed,
 //! exited. Each
 //! is named in the record's evidence ([`classify`], [`model_cause`]).
+//! A host restart is the terminal server that ran the execution gone: none
+//! answers, or the one that answers is another, told by the identity the
+//! Bridge recorded when the execution's terminal started
+//! (`execution.terminal_started`), not by whether something answers when the
+//! end is read: the first resume after a reboot starts a new server, and the
+//! ends read after it are the restart's all the same ([`server_gone`]).
 //!
 //! Every revival is one command keyed `recover-<execution>-<attempt>`, the
 //! interruption it answers, submitted no earlier than its `due_ms`; its
@@ -65,7 +71,7 @@ use serde_json::{Map, Value, json};
 use spawn_core::command::CommandAction;
 use spawn_core::event::ENGINE;
 use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
-use spawn_core::port::{CommandQueue, TerminalHost};
+use spawn_core::port::{CommandQueue, ServerSeen, TerminalHost, TerminalServer};
 use spawn_postgres::PostgresStore;
 
 use crate::deliver::{self, Work};
@@ -434,8 +440,8 @@ pub(crate) struct Facts<'a> {
     pub(crate) over_budget: Option<&'a Value>,
     /// The execution's resource envelope killed it (objective 029's facts).
     pub(crate) memory: Option<&'a Value>,
-    /// The terminal server that held every terminal is gone: a host
-    /// restart took the execution with it.
+    /// The terminal server that ran the execution is gone ([`server_gone`]):
+    /// a host restart took the execution with it.
     pub(crate) terminal_server_gone: bool,
     /// A free-space reading of the workspace's filesystem under the floor,
     /// taken at the end.
@@ -570,6 +576,39 @@ pub(crate) fn moved(stops: &[Stop], session: &str, work: &Work) -> Option<Moved>
         to_task,
         to_session,
     })
+}
+
+/// Whether the terminal server that ran an execution is gone, `now` being
+/// the server that answers (or none). A server is told as a process is, by
+/// when it started, never by whether something answers: after a host
+/// restart the first resume starts a new server, and an end processed after
+/// it must read as the restart all the same, whatever the order of the ends.
+///
+/// - No server answers: gone.
+/// - The execution's server was recorded when its terminal started
+///   (`ran_on`): gone when the one that answers is another. Never the
+///   execution's record time: its terminal's start may be what started the
+///   server, a whole launch after the record.
+/// - None was recorded (an execution started before it was kept, or whose
+///   record failed): gone when the answering server started after the
+///   execution's record (`recorded_at_ms`): that server is not the one it
+///   ran on, which started before it (a host restart's survivors started
+///   before the boot).
+/// - A host that cannot tell which server answers: not gone (today's
+///   rule), so an end reads as a crash, never as a restart it cannot show.
+pub(crate) fn server_gone(
+    ran_on: Option<&TerminalServer>,
+    recorded_at_ms: i64,
+    now: ServerSeen,
+) -> bool {
+    match now {
+        ServerSeen::Gone => true,
+        ServerSeen::Answers(None) => false,
+        ServerSeen::Answers(Some(answers)) => match ran_on {
+            Some(ran) => *ran != answers,
+            None => answers.started_at_ms > recorded_at_ms,
+        },
+    }
 }
 
 /// The cause of an execution's end, its facts given. The first that holds
@@ -863,6 +902,11 @@ pub(crate) struct Execution {
     pub(crate) workspace: Option<String>,
     #[serde(default)]
     pub(crate) end_event_id: Option<i64>,
+    /// The terminal server its terminal started on, as the Bridge recorded
+    /// it (`execution.terminal_started`): none for an execution started
+    /// before it was kept, or whose record failed.
+    #[serde(default)]
+    pub(crate) terminal_server: Option<TerminalServer>,
 }
 
 impl Execution {
@@ -1661,12 +1705,17 @@ impl One<'_> {
             .as_ref()
             .filter(|reading| reading.free < Self::floor_bytes())
             .cloned();
+        let execution = self.execution();
         let facts = Facts {
             end: Some(end),
             stop: self.last_stop(),
             over_budget: self.row.over_budget.as_ref(),
             memory: None,
-            terminal_server_gone: !self.terminals.server_alive(),
+            terminal_server_gone: server_gone(
+                execution.terminal_server.as_ref(),
+                execution.started_at_ms,
+                self.terminals.server(),
+            ),
             disk: below.as_ref(),
             outage: None,
             retired: self.retired.contains(&self.row.session_id),
@@ -2549,9 +2598,105 @@ mod tests {
         Cause, Config, Credentials, End, Executed, Execution, Facts, Outage, Path, Recorded,
         Recovery, Sent, Stop, ToolFailure, Turn, auth_retry_due, classify, counts_as_failure,
         disk_cleared, key, model_due, model_resumes, model_retries, pending, refused, resume_due,
-        resume_failed, retry_at, way,
+        resume_failed, retry_at, server_gone, way,
     };
     use serde_json::json;
+    use spawn_core::port::{ServerSeen, TerminalServer};
+
+    /// A host restart is the server that ran the execution gone, told by
+    /// its identity, whatever answers when the end is read and whatever
+    /// order the ends are read in (objective 44).
+    #[test]
+    fn a_terminal_server_is_gone_when_the_one_that_ran_the_execution_is_gone() {
+        // The server before the restart, and the one the first resume
+        // started after it, 3.5 s into its launch.
+        let before = TerminalServer {
+            pid: 812,
+            started_at_ms: 1_000_000,
+        };
+        let after = TerminalServer {
+            pid: 812,
+            started_at_ms: 9_000_000,
+        };
+        // Recorded at 5_000_000, before the restart; ran on `before`.
+        let recorded = 5_000_000;
+        // (a) No server answers: gone.
+        assert!(server_gone(Some(&before), recorded, ServerSeen::Gone));
+        assert!(server_gone(None, recorded, ServerSeen::Gone));
+        // (a) Another server answers (a resume started it): gone, read
+        // before or after that resume alike. The same pid is not the
+        // same server.
+        assert!(server_gone(
+            Some(&before),
+            recorded,
+            ServerSeen::Answers(Some(after))
+        ));
+        let other_pid = TerminalServer { pid: 813, ..before };
+        assert!(server_gone(
+            Some(&before),
+            recorded,
+            ServerSeen::Answers(Some(other_pid))
+        ));
+        // (b) The server that ran it answers: not gone, a crash. Also for an
+        // execution recorded before the slow launch that started its
+        // server: its server is younger than its record, and is its own.
+        assert!(!server_gone(
+            Some(&before),
+            recorded,
+            ServerSeen::Answers(Some(before))
+        ));
+        let resumed_at = after.started_at_ms - 3_500;
+        assert!(!server_gone(
+            Some(&after),
+            resumed_at,
+            ServerSeen::Answers(Some(after))
+        ));
+        // (c) No identity recorded (before this change, or a failed
+        // write): gone when the answering server started after the record,
+        // not gone when it started before.
+        assert!(server_gone(
+            None,
+            recorded,
+            ServerSeen::Answers(Some(after))
+        ));
+        assert!(!server_gone(
+            None,
+            recorded,
+            ServerSeen::Answers(Some(before))
+        ));
+        // A host that cannot tell which server answers keeps today's rule:
+        // a crash, never a restart it cannot show.
+        assert!(!server_gone(
+            Some(&before),
+            recorded,
+            ServerSeen::Answers(None)
+        ));
+        assert!(!server_gone(None, recorded, ServerSeen::Answers(None)));
+    }
+
+    #[test]
+    fn an_execution_reads_the_server_its_terminal_started_on() {
+        let row: Execution = serde_json::from_value(json!({
+            "id": "exec_7",
+            "started_at_ms": 1_000,
+            "terminal_server": {"pid": 812, "started_at_ms": 2_000},
+        }))
+        .expect("an execution with its server");
+        assert_eq!(
+            row.terminal_server,
+            Some(TerminalServer {
+                pid: 812,
+                started_at_ms: 2_000,
+            })
+        );
+        let old: Execution = serde_json::from_value(json!({
+            "id": "exec_7",
+            "started_at_ms": 1_000,
+            "terminal_server": null,
+        }))
+        .expect("an execution from before the record");
+        assert_eq!(old.terminal_server, None);
+    }
 
     /// The loop's next pass reads again although the log did not move only
     /// while a wait is open, a revival is pending or an outage is pending:
@@ -2883,6 +3028,7 @@ mod tests {
             evidence: None,
             workspace: None,
             end_event_id: ended.map(|_| 90),
+            terminal_server: None,
         }
     }
 

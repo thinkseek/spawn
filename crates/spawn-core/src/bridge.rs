@@ -112,7 +112,8 @@ use crate::ingest::{claude_line, claude_usage, claude_version};
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
     BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch, Launch, READ_LIMIT, Runner,
-    StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError, WorkspaceStore,
+    ServerSeen, StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError,
+    WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
 use crate::time::{Clock, SystemClock};
@@ -2750,7 +2751,7 @@ impl Bridge {
                 return Err(error);
             }
         }
-        self.launch_and_prompt(claimed, &active, native, &settings, prompt)
+        self.launch_and_prompt(claimed, &active, native, &settings, prompt, report)
     }
 
     /// A retried Start or Resume whose execution the log already records
@@ -3020,6 +3021,7 @@ impl Bridge {
         native: Option<&str>,
         settings: &str,
         prompt: &str,
+        report: &mut TickReport,
     ) -> Result<Outcome, StoreError> {
         let fresh = self.name_session(claimed, native, active)?;
         let launch = self.launch(
@@ -3034,10 +3036,46 @@ impl Bridge {
         if let Err(error) = self.terminals.start(&launch) {
             return self.abandon(claimed, active, format!("start terminal: {error}"), true);
         }
+        self.record_terminal_server(claimed, active, report);
         if prompt.is_empty() {
             return Ok(Outcome::Succeeded);
         }
         self.prompt_engine(claimed, active, prompt)
+    }
+
+    /// Record the terminal server the execution's terminal just started on
+    /// (`execution.terminal_started`): the server that runs it, told by its
+    /// identity, which the recovery compares with the one that answers when
+    /// the execution ends. Read after the start, which may be what started
+    /// the server. A host that cannot tell its server records nothing; a
+    /// server gone already, or a record that failed, is warned once, naming
+    /// the execution: the recovery then reads the server's start against
+    /// the execution's record.
+    fn record_terminal_server(&self, claimed: &Claimed, active: &Active, report: &mut TickReport) {
+        let server = match self.terminals.server() {
+            ServerSeen::Answers(Some(server)) => server,
+            ServerSeen::Answers(None) => return,
+            ServerSeen::Gone => {
+                report.warnings.push(format!(
+                    "{}: {}: record its terminal server: no terminal server answers after its start",
+                    claimed.session_id, active.execution_id
+                ));
+                return;
+            }
+        };
+        if let Err(error) = self.append(
+            &claimed.agent_id,
+            &claimed.session_id,
+            Some(&active.execution_id),
+            Source::Bridge,
+            Some(format!("{}:terminal_started", active.execution_id)),
+            EventKind::TerminalStarted { server },
+        ) {
+            report.warnings.push(format!(
+                "{}: {}: record its terminal server (pid {}, started at {} ms): {error}",
+                claimed.session_id, active.execution_id, server.pid, server.started_at_ms
+            ));
+        }
     }
 
     /// Type a started engine's prompt, answering the engine's trust dialog
