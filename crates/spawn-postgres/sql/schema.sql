@@ -4263,7 +4263,7 @@ $$;
 -- - `typed`: whether the Bridge recorded it typed; `ended`: the session ended
 --   with it (what the alert clears on): the execution it was typed into, or
 --   its own start's, ended; or, never typed or started, it finished while no
---   execution that is still live ran, or it is an input waiting with none.
+--   execution that is still live ran.
 create or replace function spawn_command_message(p_id bigint, p_session text, p_action jsonb,
                                                  p_state text, p_created bigint,
                                                  p_finished bigint, p_bound_ms bigint,
@@ -4343,11 +4343,10 @@ begin
                             where x.session_id = s.session_id and x.event_name = 'execution.ended'
                               and x.source = 'bridge' and x.execution_id = s.execution_id)
          order by s.id desc limit 1;
-        v_ended := case
-            when p_state = 'finished' then
-                v_live_since is null or v_live_since > coalesce(p_finished, p_now)
-            when v_type = 'input' then v_live_since is null
-            else false end;
+        -- An unfinished one has not ended: the Bridge finishes it, and a
+        -- start or resume before it may give it an execution yet.
+        v_ended := p_state = 'finished'
+                   and (v_live_since is null or v_live_since > coalesce(p_finished, p_now));
     end if;
     return jsonb_build_object(
         'state', case when v_answered_at is not null then 'answered'
