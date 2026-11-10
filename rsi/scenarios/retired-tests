@@ -12,4 +12,4 @@ dispatch::tests::a_cannot_judge_host_fault_names_the_objective_judged_outside_th
 # no longer applies while a judging of its source runs, so the gate it asserted was
 # judged `stale` and again no longer happens; the waiting is
 # an_owner_push_requested_while_a_gate_runs_moves_main_only_after_it.
-a_judging_of_the_same_source_finds_main_moved_and_is_judged_again
+integrate::database_tests::a_judging_of_the_same_source_finds_main_moved_and_is_judged_again
