@@ -251,8 +251,9 @@ fn read_progress(directory: &Path) -> Result<Vec<ArchiveProgress>, ArchiveError>
 #[cfg(test)]
 mod tests {
     use super::LocalTranscriptArchive;
-    use spawn_core::id::AgentId;
+    use spawn_core::id::{AgentId, ExecutionId, SessionId, WorkspaceId};
     use spawn_core::port::TranscriptArchive;
+    use spawn_core::transcripts::ArchiveProgress;
 
     #[test]
     fn the_local_archive_passes_the_shared_contract() {
@@ -270,5 +271,40 @@ mod tests {
         let agent = AgentId::new("agent_local").expect("valid agent");
         assert!(archive.append(&agent, "../escape", 0, 0, b"x").is_err());
         std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// The progress records live beside the archive, not in it, and are
+    /// read back as written; one record per native session, the latest.
+    #[test]
+    fn progress_records_are_kept_beside_the_archive() {
+        let base = std::env::temp_dir().join(format!("spawn-progress-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let archive = LocalTranscriptArchive::new(base.join(".transcripts"));
+        assert!(archive.progress().expect("none yet").is_empty());
+        let mut record = ArchiveProgress {
+            agent: AgentId::new("agent_local").expect("valid agent"),
+            native: "0b7c1d2e-0000-4000-8000-000000000001".to_string(),
+            session: SessionId::new("session_local").expect("valid session"),
+            execution: ExecutionId::new("exec_1").expect("valid execution"),
+            workspace: WorkspaceId::new("w:/w").expect("valid workspace"),
+            live: true,
+            known_ms: 10,
+            archived: None,
+            behind_ms: Some(5),
+        };
+        archive.put_progress(&record, false).expect("put");
+        record.live = false;
+        record.behind_ms = None;
+        archive.put_progress(&record, true).expect("put again");
+        assert_eq!(archive.progress().expect("read"), vec![record.clone()]);
+        assert!(
+            base.join(".transcripts-progress/agent_local/0b7c1d2e-0000-4000-8000-000000000001.json")
+                .is_file()
+        );
+        assert!(!base.join(".transcripts").exists(), "the archive holds no record");
+        // Something that is not a record is left out.
+        std::fs::write(base.join(".transcripts-progress/agent_local/x.json"), b"{").expect("write");
+        assert_eq!(archive.progress().expect("read"), vec![record]);
+        std::fs::remove_dir_all(&base).expect("clean up");
     }
 }
