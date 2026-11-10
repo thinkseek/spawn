@@ -155,7 +155,9 @@ status=0
 run || status=$?
 expect "a run succeeds" "$status" "0"
 expect "only the old gate scratch directory goes, and those whose gate is gone" "$(listing "$tmp")" \
-    "other-project spawn-gate-other ${own##*/} spawn-gate.def456 spawn-gate.fil123 spawn-gate.held01 spawn-gate.junk01 spawn-gate.live01 spawn-gate.lnk123 spawn-gate.ns0001 spawn-gate.toolong1 "
+    "$(printf '%s\n' other-project spawn-gate-other "${own##*/}" spawn-gate.def456 spawn-gate.fil123 \
+        spawn-gate.held01 spawn-gate.junk01 spawn-gate.live01 spawn-gate.lnk123 spawn-gate.ns0001 \
+        spawn-gate.toolong1 | LC_ALL=C sort | tr '\n' ' ')"
 expect "it counts the scratch whose gate runs" "$(grep -c 'kept 2 whose gate runs' "$work/out")" "1"
 expect "and names the one a process still uses" "$(grep -c "kept $tmp/spawn-gate.held01: its gate is gone, but a process still uses it" "$work/out")" "1"
 expect "a symlink's target is untouched" "$(listing "$elsewhere")" "keep "
