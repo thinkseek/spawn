@@ -1141,6 +1141,50 @@ select coalesce(jsonb_agg(jsonb_build_object('request', q.id, 'source', q.r ->> 
  where q.r ->> 'type' = 'source.push_requested'
    and not exists (select 1 from owner o where o.r ->> 'request' = q.id::text)";
 
+/// One source's owner landing requests (`spawn mission pushes`), newest
+/// first, pending and decided alike: each as [`SOURCE_PUSHES_PENDING`] gives
+/// it, with `state` (`pending`, `applied` for a `source.moved`, `refused`
+/// for a `source.push_refused`, as `spawn mission push --wait` says it) and
+/// `outcome` (that record with its `event_id` and `at_ms`, null while
+/// pending). `$1` the source as the requests name it; `$2` a commit prefix
+/// or null for every commit; `$3` how many. Read through the
+/// `spawn_events_source_push` index.
+pub(crate) const SOURCE_PUSHES: &str = r"
+with owner as (
+  select e.id, e.session_seq, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as r
+    from spawn_events e
+   where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+     and e.kind -> 'detail' -> 'record' ->> 'type'
+         in ('source.push_requested', 'source.push_refused', 'source.moved')),
+requests as (
+  select q.id, q.session_seq, q.recorded_at_ms, q.r
+    from owner q
+   where q.r ->> 'type' = 'source.push_requested'
+     and q.r ->> 'source' = $1::text
+     and ($2::text is null or starts_with(q.r ->> 'commit', $2::text))
+   order by q.session_seq desc
+   limit $3::bigint)
+select coalesce(jsonb_agg(jsonb_build_object('request', q.id, 'source', q.r ->> 'source',
+                                             'commit', q.r ->> 'commit', 'ref', q.r ->> 'ref',
+                                             'at_ms', q.recorded_at_ms,
+                                             'gated', coalesce((q.r ->> 'gated')::boolean, false),
+                                             'urgent', coalesce((q.r ->> 'urgent')::boolean, false),
+                                             'reason', q.r ->> 'reason',
+                                             'state', case when o.r is null then 'pending'
+                                                           when o.r ->> 'type' = 'source.moved'
+                                                           then 'applied'
+                                                           else 'refused' end,
+                                             'outcome', o.r || jsonb_build_object(
+                                                 'event_id', o.id, 'at_ms', o.recorded_at_ms))
+                          order by q.session_seq desc), '[]'::jsonb)
+  from requests q
+  left join lateral (select o.id, o.recorded_at_ms, o.r
+                       from owner o
+                      where o.r ->> 'type' in ('source.push_refused', 'source.moved')
+                        and o.r ->> 'request' = q.id::text
+                      order by o.session_seq
+                      limit 1) o on true";
+
 /// The outcome of the owner's landing request `$1` (its event id): the
 /// `source.moved` or `source.push_refused` record naming it, with its own
 /// `event_id` and `at_ms`; no row while it is pending.
@@ -1413,6 +1457,18 @@ impl PostgresStore {
                 ],
             )?
             .get(0))
+    }
+
+    /// `source`'s owner landing requests, newest first, at most `limit`, each
+    /// with its state and outcome; `commit` (a prefix) keeps that commit's
+    /// only ([`SOURCE_PUSHES`]).
+    pub fn source_pushes(
+        &self,
+        source: &str,
+        commit: Option<&str>,
+        limit: i64,
+    ) -> Result<Value, StoreError> {
+        self.query_json(SOURCE_PUSHES, &[&source, &commit, &limit])
     }
 
     /// The owner's landing requests without an outcome yet, oldest first

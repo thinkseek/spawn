@@ -56,6 +56,12 @@ const USAGE: &str = "usage:
        nowhere; the task is judged again on the new main), for a fix of a red main.
        --reason: the owner's words, on the record. --wait: wait that long for
        the outcome and print it; exit 0 applied, 1 refused, 3 still pending)
+  spawn mission pushes --source <path> [--commit <hash or prefix>] [--limit N]
+      (the source's owner landing requests, newest first (default 20, at most 1000), pending
+       and decided: each {request, source, commit, ref, at_ms, gated, urgent, reason, state,
+       outcome}, state pending, applied or refused as push --wait says it and outcome its
+       record (null while pending); --commit: that commit's requests only. <path> as the
+       request named it. Records nothing)
   spawn mission moved --source <path> --from <commit> --to <commit>   (owner: a deploy moved main)
       (recorded as source.moved for every deploy, also when no mission's baseline moves;
        after it every delivery whose retries are spent, having typed nothing, is tried once more)
@@ -496,6 +502,7 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
             print(&json!({ "mission": mission, "resumed": true }));
         }
         "push" => return push(&store, &flags),
+        "pushes" => print(&pushes(&store, &flags)?),
         "moved" => {
             let source = text(&flags, "source")?;
             crate::sources::MissionSource::parse(&source)?;
@@ -546,6 +553,42 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
         _ => return Err(USAGE.to_string()),
     }
     Ok(0)
+}
+
+/// `spawn mission pushes`: the source's owner landing requests, newest
+/// first, with their states ([`spawn_postgres::PostgresStore::source_pushes`]).
+fn pushes(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Value, String> {
+    let source = text(flags, "source")?;
+    crate::sources::MissionSource::parse(&source)?;
+    let commit = pushes_commit(flags)?;
+    let limit = pushes_limit(flags)?;
+    store
+        .source_pushes(&source, commit.as_deref(), limit)
+        .map_err(|error| error.to_string())
+}
+
+/// `spawn mission pushes --commit`: a hash or a prefix of one (hex), or none.
+fn pushes_commit(flags: &Flags) -> Result<Option<String>, String> {
+    let Some(commit) = flags.get("commit") else {
+        return Ok(None);
+    };
+    if commit.is_empty() || commit.len() > 64 || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "--commit is a commit hash or a prefix of one, not {commit:?}"
+        ));
+    }
+    Ok(Some(commit.to_ascii_lowercase()))
+}
+
+/// `spawn mission pushes --limit`: 1 to 1000, default 20.
+fn pushes_limit(flags: &Flags) -> Result<i64, String> {
+    let Some(text) = flags.get("limit") else {
+        return Ok(20);
+    };
+    match text.parse::<i64>() {
+        Ok(limit) if (1..=1000).contains(&limit) => Ok(limit),
+        _ => Err(format!("--limit is 1 to 1000, not {text}")),
+    }
 }
 
 /// `spawn mission push`: put the owner's commit in the source at
@@ -740,7 +783,9 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{change, hold_bound, model, objectives_row, split_mission};
+    use super::{
+        change, hold_bound, model, objectives_row, pushes_commit, pushes_limit, split_mission,
+    };
     use crate::Flags;
 
     #[test]
@@ -887,6 +932,31 @@ mod tests {
         );
         let refused = model(&flags(&["--model", "opus"])).expect_err("not a profile");
         assert!(refused.contains("default or cheap"), "{refused}");
+    }
+
+    #[test]
+    fn pushes_lists_twenty_unless_limit_says_and_commit_is_a_hex_prefix() {
+        assert_eq!(pushes_limit(&flags(&[])), Ok(20));
+        assert_eq!(pushes_limit(&flags(&["--limit", "1"])), Ok(1));
+        assert_eq!(pushes_limit(&flags(&["--limit", "1000"])), Ok(1000));
+        for bad in ["0", "-1", "1001", "ten", ""] {
+            let refused = pushes_limit(&flags(&["--limit", bad])).expect_err(bad);
+            assert!(refused.contains("1 to 1000"), "{bad}: {refused}");
+        }
+        assert_eq!(pushes_commit(&flags(&[])), Ok(None));
+        assert_eq!(
+            pushes_commit(&flags(&["--commit", "AB12"])),
+            Ok(Some("ab12".to_string()))
+        );
+        let full = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            pushes_commit(&flags(&["--commit", full])),
+            Ok(Some(full.to_string()))
+        );
+        for bad in ["", "main", "ab%", "ab_", &"a".repeat(65)] {
+            let refused = pushes_commit(&flags(&["--commit", bad])).expect_err(bad);
+            assert!(refused.contains("a prefix of one"), "{bad}: {refused}");
+        }
     }
 
     /// Commit everything in the checkout `directory`, whatever the host's
