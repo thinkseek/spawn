@@ -21,16 +21,19 @@ const USAGE: &str = "usage:
       changes only the settings it is given and keeps every other as the mission has it;
       the database merges them under its lock, checks the result and records it whole.
       A setting is cleared only by its own switch, which takes no value: --no-gate,
-      --no-budget (both fields), --no-minutes, --no-tool-calls, --no-objectives,
+      --no-budget (every field), --no-minutes, --no-tool-calls, --no-daily-usd, --no-objectives,
       --no-workers (back to the default 1); a switch and a value for the same setting
       are refused. Prints {mission, before, after}; with nothing given it changes nothing.
       Clearing the gate, or moving accept away from gate, waits while a task is landing.
       settings: --gate <scenarios dir> [--accept review|gate] [--minutes N] [--tool-calls N]
+                [--daily-usd <US dollars above 0>]
                 [--backlog <dir> --resident <name> [--workers N]]
                 (with add, all of them at once; with configure, any of them alone, and
                 --backlog with --resident for a mission without objectives)
                 (--workers: objective tasks in flight at once, 1 to 16, default 1: the
                 resident takes one, per-task workers the rest)
+                (--daily-usd: what the mission's model calls may cost in a UTC day; the
+                loop raises one cost_budget alert the day it is reached)
   spawn mission objectives [--mission N]
       the backlog of every objective mission (--mission: that one): the fleet's open
       objectives and separately the owner-judged ones (the backlog field `owner_judged`:
@@ -258,6 +261,9 @@ impl Settings {
         if let Some(calls) = number("tool-calls")? {
             budget.insert("tool_calls".to_string(), json!(calls));
         }
+        if let Some(usd) = dollars(flags)? {
+            budget.insert("daily_usd".to_string(), json!(usd));
+        }
         let workers = number("workers")?;
         let objectives = match (directory(flags, "backlog")?, flags.get("resident")) {
             (Some(backlog), Some(resident)) => {
@@ -298,13 +304,32 @@ impl Settings {
     }
 }
 
+/// `--daily-usd`: an amount of US dollars above zero, a plain decimal
+/// (`0.50`, `12`).
+fn dollars(flags: &Flags) -> Result<Option<f64>, String> {
+    let Some(text) = flags.get("daily-usd") else {
+        return Ok(None);
+    };
+    let decimal = !text.is_empty()
+        && text.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.')
+        && text.bytes().filter(|byte| *byte == b'.').count() <= 1
+        && text.bytes().any(|byte| byte.is_ascii_digit());
+    match text.parse::<f64>() {
+        Ok(usd) if decimal && usd.is_finite() && usd > 0.0 => Ok(Some(usd)),
+        _ => Err(format!(
+            "--daily-usd must be an amount of US dollars above zero, not {text}"
+        )),
+    }
+}
+
 /// `configure`'s clearing switches (they take no value), and the setting
 /// (and key in it) each clears.
-const CLEARING: [(&str, &str, Option<&str>); 6] = [
+const CLEARING: [(&str, &str, Option<&str>); 7] = [
     ("no-gate", "gate", None),
     ("no-budget", "budget", None),
     ("no-minutes", "budget", Some("minutes")),
     ("no-tool-calls", "budget", Some("tool_calls")),
+    ("no-daily-usd", "budget", Some("daily_usd")),
     ("no-objectives", "objectives", None),
     ("no-workers", "objectives", Some("workers")),
 ];
@@ -316,12 +341,13 @@ const CLEARING: [(&str, &str, Option<&str>); 6] = [
 /// cleared, or a flag configure does not know, is refused. No flag at all is
 /// an empty change, which changes and records nothing.
 fn change(flags: &Flags) -> Result<Value, String> {
-    const KNOWN: [&str; 8] = [
+    const KNOWN: [&str; 9] = [
         "id",
         "gate",
         "accept",
         "minutes",
         "tool-calls",
+        "daily-usd",
         "backlog",
         "resident",
         "workers",
@@ -367,6 +393,9 @@ fn change(flags: &Flags) -> Result<Value, String> {
     if let Some(calls) = number("tool-calls")? {
         part("budget", Some("tool_calls"), json!(calls));
     }
+    if let Some(usd) = dollars(flags)? {
+        part("budget", Some("daily_usd"), json!(usd));
+    }
     if let Some(backlog) = directory(flags, "backlog")? {
         part("objectives", Some("backlog"), json!(backlog));
     }
@@ -382,6 +411,7 @@ fn change(flags: &Flags) -> Result<Value, String> {
         ("accept", "accept", None),
         ("minutes", "budget", Some("minutes")),
         ("tool-calls", "budget", Some("tool_calls")),
+        ("daily-usd", "budget", Some("daily_usd")),
         ("backlog", "objectives", Some("backlog")),
         ("resident", "objectives", Some("resident")),
         ("workers", "objectives", Some("workers")),
