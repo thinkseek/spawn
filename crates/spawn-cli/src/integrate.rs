@@ -476,6 +476,7 @@ use crate::{main_merge, objectives, sources};
 
 mod host;
 mod inputs;
+pub(crate) mod judging;
 pub(crate) mod owner;
 mod shadow;
 mod warm;
@@ -1585,6 +1586,12 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let cpu = gate::Cpu::from_env(|name| std::env::var(name).ok(), cores)
         .map_err(|error| format!("{error}\n{USAGE}"))?;
+    // Judging directories an earlier integrator left (it stopped before
+    // its cleanup): their gates died with it (integrate/judging.rs).
+    let swept = judging::sweep(&root);
+    if swept > 0 {
+        println!("integrate: removed {swept} judging directories an earlier integrator left");
+    }
     let mut integrator = Integrator::new(root, gate, gate_env, host_room, gates).with_cpu(cpu);
     // The base warm after each landing (warm.rs), unless the owner turned
     // it off; its logs and pid file under the user's cache, beside the base
@@ -2792,6 +2799,7 @@ impl Integrator {
     /// leave room, judged with the scenarios of the first mission on its
     /// source that is not halted. Otherwise it stays pending, for a later
     /// pass.
+    #[allow(clippy::too_many_lines)]
     fn start_owner(
         &self,
         store: &Arc<PostgresStore>,
@@ -2857,14 +2865,28 @@ impl Integrator {
             mission.id,
             request.reason.clone(),
         );
+        let judging = match judging::Judging::create(
+            &self.judge.root,
+            &json!({"kind": "owner", "mission": mission_id, "request": id, "source": source,
+                    "shares_server": shares_server, "jobs": jobs,
+                    "gate": pinned(&self.judge.gate)}),
+        ) {
+            Ok(judging) => judging,
+            Err(error) => {
+                eprintln!("integrate: start the owner judging of request {id}: {error}");
+                return;
+            }
+        };
         let halt = Arc::new(gate::Halt::default());
         let thread_halt = Arc::clone(&halt);
         let handle = std::thread::Builder::new()
             .name(format!("owner-gate-{id}"))
             .spawn(move || {
                 gate::halt_with(thread_halt);
-                let judged = judge.judge_owner(&store, &mirror, &gated, &request, jobs);
-                owner::judged(&said, id, &judged, &backoff, judge.host.backoff);
+                judging.run(|| {
+                    let judged = judge.judge_owner(&store, &mirror, &gated, &request, jobs);
+                    owner::judged(&said, id, &judged, &backoff, judge.host.backoff);
+                });
             });
         let handle = match handle {
             Ok(handle) => handle,
@@ -3145,6 +3167,14 @@ impl Integrator {
         let stop = Arc::new(Stop::default());
         judge.stop = Some(Arc::clone(&stop));
         let task_id = task.id;
+        let judging = judging::Judging::create(
+            &self.judge.root,
+            &json!({"kind": "task", "mission": mission_id, "task": task_id,
+                    "revision": task.revisions, "source": source, "base": main,
+                    "count": count, "shares_server": shares_server, "jobs": jobs,
+                    "gate": pinned(&self.judge.gate)}),
+        )
+        .map_err(|error| format!("start the judging of task {task_id}: {error}"))?;
         let (store, source_owned) = (Arc::clone(store), source.clone());
         let halt = Arc::new(gate::Halt::default());
         let thread_halt = Arc::clone(&halt);
@@ -3155,17 +3185,19 @@ impl Integrator {
                 if let Some(stop) = &judge.stop {
                     gate::stop_with(Arc::clone(&stop.flag));
                 }
-                judged_or_aborted(&store, &task, &main, mission_id, || {
-                    judge.judge(
-                        &store,
-                        &mirror,
-                        &source_owned,
-                        &main,
-                        &gated,
-                        count,
-                        &task,
-                        jobs,
-                    )
+                judging.run(|| {
+                    judged_or_aborted(&store, &task, &main, mission_id, || {
+                        judge.judge(
+                            &store,
+                            &mirror,
+                            &source_owned,
+                            &main,
+                            &gated,
+                            count,
+                            &task,
+                            jobs,
+                        )
+                    });
                 });
             })
             .map_err(|error| format!("start the judging of task {task_id}: {error}"))?;
@@ -5419,7 +5451,7 @@ fn landing_elsewhere(missions: &[Mission], mission: &Mission) -> Option<(i64, i6
 
 pub(crate) fn record(store: &PostgresStore, value: &Value) -> Result<(), String> {
     store
-        .integrator_record(&bound(value))
+        .integrator_record(&judging::named(&bound(value)))
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
@@ -11385,6 +11417,80 @@ mod database_tests {
             Path::new(words[3]),
             super::pinned(&scenarios),
             "the mission's scenarios, as its gates read them"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gate v2 step 2 (integrate/judging.rs): a judging's gate runs in the
+    /// judging's directory under the workspace root, beside `judging.json`
+    /// (what it judges), its verdict and landing name that judging, and the
+    /// directory is gone once they are recorded.
+    #[test]
+    fn a_judgings_outcomes_name_it_and_its_directory_goes_once_they_are_recorded() {
+        let dir = std::env::temp_dir().join(format!("spawn-judging-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let seen = dir.join("seen");
+        let gate = format!(
+            "if [ \"$1\" = --base-only ]; then exit 0; fi\n\
+             private=$(dirname \"$SPAWN_GATE_VERDICT\")\n\
+             printf '%s\\n' \"$private\" >'{seen}'\n\
+             cp \"$(dirname \"$private\")/judging.json\" '{seen}.json'\n\
+             printf '{{\"verdict\":\"accepted\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+             echo '{{\"verdict\":\"accepted\"}}'\n",
+            seen = seen.display()
+        );
+        let (base, source, scenarios, integrator) = world("judging-dir", &gate);
+        let db = Db::new("judging_dir");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+
+        integrator.pass_on(&db.store).expect("the judging's pass");
+        integrator.settle();
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        let gated = control_records(&db, "task.gated");
+        let landed = control_records(&db, "task.landed");
+        assert_eq!((gated.len(), landed.len()), (1, 1), "{gated:?} {landed:?}");
+        let id = gated[0]["judging"]
+            .as_str()
+            .expect("the verdict names its judging");
+        assert_eq!(id.len(), 28, "{id}");
+        assert_eq!(
+            landed[0]["judging"],
+            json!(id),
+            "the landing names the same judging"
+        );
+        // The gate ran in a private directory of that judging's directory.
+        let judgings = base.join("host").join(super::judging::DIRECTORY);
+        let private = std::fs::read_to_string(&seen).expect("the gate's directory");
+        let private = Path::new(private.trim());
+        assert_eq!(private.parent(), Some(judgings.join(id).as_path()));
+        let described: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("seen.json")).expect("judging.json"),
+        )
+        .expect("json");
+        assert_eq!(described["version"], json!(super::judging::VERSION));
+        assert_eq!(described["id"], json!(id));
+        assert_eq!(described["kind"], json!("task"));
+        assert_eq!(described["task"], json!(task));
+        assert_eq!(described["mission"], json!(mission));
+        assert_eq!(described["source"], json!(source));
+        // Gone once recorded; the parent stays, empty.
+        assert!(
+            !judgings.join(id).exists(),
+            "the judging's directory is removed"
+        );
+        assert_eq!(
+            std::fs::read_dir(&judgings).expect("judgings").count(),
+            0,
+            "nothing left under {}",
+            judgings.display()
         );
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&dir);

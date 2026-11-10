@@ -1090,8 +1090,11 @@ pub(crate) fn judge_seeing_base_check(
     limit: Duration,
 ) -> (Result<Verdict, GateFailure>, Option<String>) {
     let mut seen = None;
+    // In a judging's directory when this thread runs one (gate v2 step 2,
+    // integrate::judging), else under the temporary directory as before.
+    let parent = crate::integrate::judging::directory().unwrap_or_else(std::env::temp_dir);
     let judged = judge_in(
-        &std::env::temp_dir(),
+        &parent,
         &measured_free_kb,
         gate,
         repo,
