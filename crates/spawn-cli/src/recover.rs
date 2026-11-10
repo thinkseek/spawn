@@ -548,6 +548,35 @@ pub(crate) fn model_due(base_ms: i64, j: u32, at_ms: i64, retry_at_ms: Option<i6
     retry_at_ms.map_or(due, |named| named.max(due))
 }
 
+/// How many resumes in a row the execution `current` stands at, each of an
+/// execution that ended on a transient model error with no model answer in
+/// between: from `current` back, every execution a revival started
+/// ([`KEY_PREFIX`]) that made no progress, whose predecessor's latest
+/// interruption was `model_unavailable`. A revived execution that made
+/// progress, or one a person or the supervisor started, ends the run.
+pub(crate) fn model_resumes(executions: &[Executed], current: &str) -> u32 {
+    let Some(mut at) = executions
+        .iter()
+        .position(|execution| execution.id == current)
+    else {
+        return 0;
+    };
+    let mut resumes = 0_u32;
+    while at > 0 {
+        let execution = &executions[at];
+        let before = &executions[at - 1];
+        if !execution.key.starts_with(KEY_PREFIX)
+            || execution.progress
+            || before.last_cause.as_deref() != Some(Cause::ModelUnavailable.name())
+        {
+            break;
+        }
+        resumes = resumes.saturating_add(1);
+        at -= 1;
+    }
+    resumes
+}
+
 /// Whether an open login wait may retry: only when the credentials file
 /// still holds the modification time and size it had at the interruption
 /// (a changed file is the clear, not a retry), and only every
@@ -817,6 +846,11 @@ pub(crate) struct Executed {
     /// with [`KEY_PREFIX`].
     #[serde(default)]
     pub(crate) key: String,
+    /// The cause of the latest interruption the recovery recorded for it,
+    /// if any: an execution that ended on a transient model error reads
+    /// `model_unavailable` ([`model_resumes`]).
+    #[serde(default)]
+    pub(crate) last_cause: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1718,6 +1752,11 @@ impl One<'_> {
         let Some(cause) = Cause::from_name(last.cause().unwrap_or_default()) else {
             return Ok(());
         };
+        // A wait made final (a transient model error's retries spent) is
+        // never revived, whatever its cause's own path.
+        if last.path() == Some(Path::Final.name()) {
+            return Ok(());
+        }
         match cause.path() {
             Path::Final => Ok(()),
             Path::Wait => self.wait_path(&last, cause),
@@ -1749,6 +1788,15 @@ impl One<'_> {
                     self.clear(last, cause, evidence)?;
                     return self.revive(last, cause, true);
                 }
+                // An engine that ended on it is resumed a bounded number
+                // of times in a row; past that, its end is final and the
+                // supervisor is told (the dispatcher's digest).
+                if !self.live() && !self.revived(last) {
+                    let resumes = model_resumes(&self.row.executions, &self.execution().id);
+                    if resumes >= self.config.model_retries {
+                        return self.retries_spent(last, resumes);
+                    }
+                }
                 self.revive(last, cause, false)
             }
             Cause::ModelAuth => {
@@ -1773,6 +1821,52 @@ impl One<'_> {
             Cause::DatabaseUnavailable => self.revive(last, cause, true),
             _ => Ok(()),
         }
+    }
+
+    /// Whether the revival of `last` was already submitted (its key, or a
+    /// retry of it).
+    fn revived(&self, last: &Recorded) -> bool {
+        let key = self.key_prefix(last);
+        self.row
+            .commands
+            .iter()
+            .any(|sent| sent.key == key || sent.key.starts_with(&format!("{key}-")))
+    }
+
+    /// The end of an execution whose transient model error was retried
+    /// `resumes` times in a row already: recorded once, `model_unavailable`
+    /// on the final path, with the failed turn and the setting, and never
+    /// revived (a person or the supervisor may resume it).
+    fn retries_spent(&mut self, last: &Recorded, resumes: u32) -> Result<(), String> {
+        let execution = self.execution();
+        let mut evidence = Map::new();
+        for field in ["event_id", "status", "error", "text"] {
+            evidence.insert(
+                field.to_string(),
+                last.record["evidence"][field].clone(),
+            );
+        }
+        evidence.insert("retries".to_string(), json!(self.config.model_retries));
+        evidence.insert("resumes".to_string(), json!(resumes));
+        if let Some(code) = execution.exit_code {
+            evidence.insert("exit_code".to_string(), json!(code));
+        }
+        if let Some(signal) = execution.signal {
+            evidence.insert("signal".to_string(), json!(signal));
+        }
+        let fact = execution
+            .end_event_id
+            .unwrap_or(0)
+            .max(last.fact_event_id());
+        self.record(
+            Cause::ModelUnavailable,
+            evidence,
+            fact,
+            Path::Final,
+            None,
+            "its engine ended on a transient model error again and its retries are spent",
+        )?;
+        Ok(())
     }
 
     /// Whether the credentials file changed since the interruption read it;
