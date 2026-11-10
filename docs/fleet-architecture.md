@@ -721,6 +721,26 @@ it, on the same ladder.
   timeout: a stall shows on the session's task like any other, and the
   `waiting` record is no activity (it moves no stall step and does not make
   a judgement look stale).
+- **Named keys never wait** (backlog P1). A key command
+  (`{"type":"key","key":<name>}`, the name one of escape, up, down, left,
+  right, enter, y, n) presses one key in the agent's pane: from the page's
+  terminal panel while it has focus, or `spawn submit`. It is its own
+  action, never text, so it never waits for the turn: Esc exists to
+  interrupt a busy turn and the others answer a dialog, the very states in
+  which text waits. The Bridge presses it at once, in any pane state, so
+  it may go ahead of an input that waits, and a key behind a waiting input
+  is claimed at once like a stop. Handling is serial and an input's typing
+  is one call, so a key lands before or after a typing, never between its
+  paste and its Enter. At most once: `command.step` `pressing` before the
+  key goes, `pressed` after; a key with `pressing` and no `pressed` is not
+  sent again. A key's steps are not `typing`/`typed`: those mark the input
+  typed last, which every later input waits behind until a turn answers
+  it, and an Esc starts no turn. A key for a session that runs no
+  execution fails with the reason ("runs no execution: a key needs a
+  running engine"); the page's path refuses it before recording anything
+  (409). The trace and the agent page show it as `You → key · Esc`
+  (`Supervisor → key · ↓` for another sender), with "ahead of N waiting
+  inputs" when it went ahead of some.
 - **Authority** comes from grants and DB roles. The dispatcher and the
   supervisor submit as their own principals and only for worker sessions.
   Neither can write observations or runtime events.
@@ -1043,7 +1063,7 @@ read is 405): `/api/overview`, `/api/fleet` (with
 `/api/scorecard` (`crates/spawn-cli/src/serve.rs`; the answer of
 `/api/attention` is documented in `crates/spawn-cli/src/serve/attention.rs`).
 
-It writes one thing: a person's input to a session, `POST
+It writes two things. The first is a person's input to a session, `POST
 /api/session/<id>/input` with `{"text", "key"}` (the key, an idempotency
 key, may come as an `Idempotency-Key` header). That is the command `spawn
 submit --principal human --agent <the session's agent> --session <id> --key
@@ -1052,9 +1072,9 @@ idempotency rule (a retried POST types once), and like every person's input
 it waits for the session's turn (§3). It answers 202 with the command, which
 `/commands` then follows; `{"probe": true}` passes every guard and writes
 nothing, so the page knows before it offers the box. It runs as the
-`spawn_human` login, whose one right is `spawn_human_input`: an input, as
-principal `human`, to the agent the session belongs to; no other action, no
-read, no event. Its guards, in order: the read guard (the clients that may
+`spawn_human` login, whose rights are `spawn_human_input` and
+`spawn_human_key`: an input or a named key, as principal `human`, to the
+agent the session belongs to; no other action, no read, no event. Its guards, in order: the read guard (the clients that may
 read may write: the token, `SPAWN_SERVE_LOCAL_OPEN`'s owner client,
 `SPAWN_SERVE_OPEN_NETWORKS`' clients naming the server by its address);
 POST only (405); without the token, an `Origin` naming the server as the
@@ -1063,6 +1083,16 @@ and, with no token set at all, a client socket the owner's uid holds;
 `Content-Type: application/json` (415), which no form can send without a
 preflight; a body of at most 16 KiB (413); a key and a text a person types:
 not blank, at most 8 KiB, no control character but tab and line ends (400).
+
+The second is a person's named key, `POST /api/session/<id>/key` with
+`{"name", "key"}` (§3, "Named keys never wait"): the command `spawn submit
+--principal human ... --action '{"type":"key","key":<name>}'` makes, through
+`spawn_human_key` (the `spawn_human` login's other right), with the input's
+guards and idempotency rule. The name is one of the set (400 otherwise, the
+refusal naming it); a session no agent has used is 404, and one that runs no
+execution is 409 with the reason, recording nothing. The page sends a key
+only while the terminal panel itself has focus, never from a text box, with
+a modifier or on auto-repeat (`web/src/keys.ts`).
 
 `/api/missions` and `/api/rsi` send what the lists show: a task's brief,
 report and review note come as their first lines with their whole length

@@ -124,6 +124,13 @@ pub enum CommandStep {
     /// first. Only an input from outside Spawn's own loops waits
     /// (`crate::bridge::waits`). Recorded once per command.
     Waiting,
+    /// The Bridge is about to press a key command's key
+    /// ([`crate::command::CommandAction::Key`]). A key's own steps, never
+    /// `typing`/`typed`: those say an input was typed and waits for its
+    /// answer (a turn), and an Esc starts no turn.
+    Pressing,
+    /// The key was sent to the pane.
+    Pressed,
 }
 
 /// Why a checkpoint commit was taken.

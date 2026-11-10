@@ -4,7 +4,7 @@
 //! and a person's input from the web page as the `spawn_human` login,
 //! through `spawn_human_input`, the one function that login may call.
 
-use spawn_core::command::Submission;
+use spawn_core::command::{NamedKey, Submission};
 use spawn_core::id::{CommandId, IdempotencyKey, SessionId};
 use spawn_core::port::StoreError;
 
@@ -67,6 +67,25 @@ pub(crate) const SUBMIT: &str = "select spawn_gateway_submit($1, $2, $3, $4)";
 /// session. `$1` session, `$2` idempotency key, `$3` text.
 pub(crate) const HUMAN_INPUT: &str = "select spawn_human_input($1, $2, $3)";
 
+/// A person's key as the `spawn_human` login (`spawn_human_key`): the
+/// command made (or the one an earlier call with this key made), null when
+/// no agent has used the session, SQLSTATE 55000 when the session runs no
+/// execution. `$1` session, `$2` idempotency key, `$3` the key's name.
+pub(crate) const HUMAN_KEY: &str = "select spawn_human_key($1, $2, $3)";
+
+/// What became of a person's key ([`PostgresStore::submit_human_key`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HumanKey {
+    /// The command that presses it (a new one, or the one an earlier call
+    /// with this idempotency key made).
+    Submitted(CommandId),
+    /// No agent has used the session: there is nothing to press keys into.
+    NoAgent,
+    /// The session runs no execution, in the store's words: a key needs a
+    /// running engine. No command was made.
+    NotRunning(String),
+}
+
 impl PostgresStore {
     /// The fleet as one JSON array, read through the grant-filtered
     /// `spawn_read_*` functions, so it shows exactly what the caller's login
@@ -112,6 +131,41 @@ impl PostgresStore {
     /// `spawn_human` login may call it (`role_url(owner, "spawn_human")`);
     /// that login can do nothing else. `None` when no agent has used the
     /// session.
+    /// Press `key` in `session` as a person, through `spawn_human_key`:
+    /// the key command `spawn submit --principal human` would submit to the
+    /// session's agent, with the same idempotency rule. Only a store
+    /// connected as the `spawn_human` login may call it. A session that
+    /// runs no execution is refused ([`HumanKey::NotRunning`]) and nothing
+    /// is recorded.
+    pub fn submit_human_key(
+        &self,
+        session: &SessionId,
+        key: &IdempotencyKey,
+        name: NamedKey,
+    ) -> Result<HumanKey, StoreError> {
+        let answer = self
+            .lock()
+            .query_one(HUMAN_KEY, &[&session.as_str(), &key.as_str(), &name.name()]);
+        match answer {
+            Ok(row) => Ok(row
+                .get::<_, Option<i64>>(0)
+                .map_or(HumanKey::NoAgent, |id| {
+                    HumanKey::Submitted(CommandId(id.unsigned_abs()))
+                })),
+            Err(error)
+                if error.as_db_error().is_some_and(|db| {
+                    *db.code() == postgres::error::SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE
+                }) =>
+            {
+                let message = error
+                    .as_db_error()
+                    .map_or_else(String::new, |db| db.message().to_string());
+                Ok(HumanKey::NotRunning(message))
+            }
+            Err(error) => Err(crate::backend(&error)),
+        }
+    }
+
     pub fn submit_human_input(
         &self,
         session: &SessionId,
