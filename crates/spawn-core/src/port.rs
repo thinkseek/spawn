@@ -593,6 +593,15 @@ pub trait TerminalHost: Send + Sync {
         terminal: &TerminalName,
         workspace: &WorkspaceId,
     ) -> Result<(), TerminalError>;
+
+    /// Whether [`Self::terminate`] waits for processes to exit (a real
+    /// host's bounded wait, seconds): the Bridge then runs it off its loop,
+    /// so one end does not hold every other execution's turn for that long.
+    /// A host whose terminate returns at once (in memory) says no, and the
+    /// Bridge calls it in line.
+    fn terminate_waits(&self) -> bool {
+        false
+    }
 }
 
 /// Why a watch could not be set: the platform has none, the filesystem does
