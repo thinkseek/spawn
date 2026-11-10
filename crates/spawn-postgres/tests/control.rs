@@ -1355,7 +1355,13 @@ fn a_verdicts_class_inputs_and_env_fold_and_show_and_old_records_still_read() {
         .mission_add("Bound", &json!(["/tmp/source.git"]), "human")
         .expect("add");
     store
-        .mission_configure(mission, Some("/controller/rsi/scenarios"), "gate", None, None)
+        .mission_configure(
+            mission,
+            Some("/controller/rsi/scenarios"),
+            "gate",
+            None,
+            None,
+        )
         .expect("configure");
     let task = store
         .task_assign(mission, "ephemeral", "w", "brief", "default")
@@ -1379,7 +1385,10 @@ fn a_verdicts_class_inputs_and_env_fold_and_show_and_old_records_still_read() {
         .expect("an old record still folds");
     let mut client = admin(&schema);
     let rejections: i32 = client
-        .query_one("select gate_rejections from mission_missions where id = $1", &[&mission])
+        .query_one(
+            "select gate_rejections from mission_missions where id = $1",
+            &[&mission],
+        )
         .expect("mission")
         .get(0);
     assert_eq!(rejections, 1, "the counts move as before");
@@ -1387,7 +1396,10 @@ fn a_verdicts_class_inputs_and_env_fold_and_show_and_old_records_still_read() {
     let wrong = store.integrator_record(&json!({"type": "task.gated", "id": task,
         "revision": 1, "verdict": "host_fault", "class": "code", "evidence": "cannot_judge",
         "scenario": "029.sh", "backoff_secs": 1}));
-    assert!(wrong.is_err(), "a host fault is never a statement about the code");
+    assert!(
+        wrong.is_err(),
+        "a host fault is never a statement about the code"
+    );
     let gated: Vec<serde_json::Value> = store
         .task_stages(task)
         .expect("stages")
@@ -1402,7 +1414,11 @@ fn a_verdicts_class_inputs_and_env_fold_and_show_and_old_records_still_read() {
     assert_eq!(gated[0]["inputs"], inputs, "nulls inside kept");
     assert_eq!(gated[0]["env"], env);
     for name in ["class", "inputs", "env"] {
-        assert!(gated[1].get(name).is_none(), "an old record shows no {name}: {}", gated[1]);
+        assert!(
+            gated[1].get(name).is_none(),
+            "an old record shows no {name}: {}",
+            gated[1]
+        );
     }
     // The last gate is the old rejection: it reads with none of them.
     let last = &store.last_gates().expect("last gates")[task.to_string()];
