@@ -275,7 +275,8 @@ impl Rig {
     }
 
     /// What was typed, each text without the marker it must end with
-    /// (`[spawn message #<command>]`, on a line of its own).
+    /// (`[spawn message #<command>]`, on a line of its own, then the line
+    /// that says how to answer it).
     fn typed(&self) -> Vec<String> {
         self.host
             .typed
@@ -286,9 +287,16 @@ impl Rig {
                 let (body, marker) = text
                     .rsplit_once("\n\n")
                     .unwrap_or_else(|| panic!("{text:?} ends with no marker line"));
+                let (marker, answer) = marker
+                    .split_once('\n')
+                    .unwrap_or_else(|| panic!("{text:?} has no answer line after its marker"));
                 assert!(
                     marker.starts_with("[spawn message #") && marker.ends_with(']'),
                     "{text:?} ends with no marker"
+                );
+                assert!(
+                    answer.contains("spawn ack ") && !answer.contains('\n'),
+                    "{text:?} ends with no answer line"
                 );
                 body.to_string()
             })
