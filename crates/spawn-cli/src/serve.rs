@@ -1,5 +1,6 @@
-//! HTTP API and static files for the observer UI: reads, and two writes, a
-//! person's input to a session and a person's key.
+//! HTTP API and static files for the observer UI: reads, and a person's
+//! writes: an input to a session, a key, and a restart or a reassign of a
+//! stalled worker.
 //!
 //! Every read goes through the same store methods the CLI uses, as the
 //! read-only `spawn_reader` login, so a defect in a read cannot change
@@ -38,6 +39,23 @@
 //! the turn: the Bridge sends it at once. A session no agent has used is
 //! 404; one that runs no execution is 409 with the reason, and no command
 //! is made.
+//!
+//! A person may also restart or reassign a stalled worker from its agent
+//! page: `POST /api/session/<id>/restart` and `POST
+//! /api/session/<id>/reassign` with `{"reason": "..."}` (at most
+//! [`MAX_REASON`] bytes, no control character), through `spawn_human_task`
+//! (the `spawn_human` login's third function), with the input's guards. The
+//! session's delivered task is restarted (`task.restarted`, the dispatcher
+//! stops the running execution and resumes its native session) or reassigned
+//! (cancelled and assigned again to a fresh worker whose branch starts from
+//! the old one's last checkpoint), `by` `human`. It answers 202 with
+//! `{"task", "session_id", "agent_id", "principal": "human"}`, the task and
+//! the worker that now carry the work, or 409 with the reason for a session
+//! that holds no delivered task, and nothing is recorded. `GET
+//! /api/session/<id>` links old and new: each execution's `restart_of` (the
+//! execution of the same session a restart's resume replaced, else null),
+//! and the session's `reassigned_to` and `reassigned_from` (`{"task",
+//! "session_id"}` or null).
 //!
 //! Reading is still worth guarding: `/api/pane/<id>` shows any live pane.
 //! `serve` binds 127.0.0.1 unless told otherwise, and on any other address
