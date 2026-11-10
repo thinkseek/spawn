@@ -390,7 +390,6 @@
 //!   the workers made a load of 18-20, and task 172's gate failed on its
 //!   base.)
 //!
-<<<<<<< 13fc93a710e08f44036aad7336afe9ddee076a00
 //! A verdict a gate run gave binds what it judged and where (`inputs`:
 //! base, candidate, controller commit, scenario-set digest, task scenario;
 //! `env`: host, toolchain, runner; [`inputs`]). With
@@ -399,19 +398,14 @@
 //! beside it (`task.shadow_gated`, [`shadow`]); it never decides or delays
 //! anything, and a disagreement on equal inputs is told to the supervisor
 //! once.
-=======
-//! **Every verdict binds what it judged and where** (objective 035). Each
-//! `task.gated` names its `class` ([`verdict_class`]: `code` for a verdict
-//! on the work, `infrastructure` for one the host could not judge,
-//! `superseded` for `stale`). One a gate run decided carries that run's
-//! `inputs` (the base and candidate the gate was given, the controller's
-//! `.controller` commit and the gate directory's digest, both read just
-//! before that gate started, and the task's scenario) and `env` (this
-//! host, the toolchain line the run printed, the runner: null here)
-//! ([`crate::gate::run_inputs`], [`crate::gate::run_env`]); a head judged
-//! alone adds `head_inputs`. A record no gate ran for has `env` null and
-//! the inputs it knows. Nothing is decided from them.
->>>>>>> 8d89a431e04124976e2ef8553694653ae00ece8a
+//!
+//! Every `task.gated` also names its `class` ([`verdict_class`]: `code` for
+//! a verdict on the work, `infrastructure` for one the host could not
+//! judge, `superseded` for `stale`). A head judged alone too adds
+//! `head_inputs`, read just before the head's own gate started. A record no
+//! gate ran for (`stale`, a conflict or rejection found before the gate, a
+//! `no_room` from the room check) has `env` null and the inputs it knows
+//! ([`inputs::known`]). Nothing is decided from any of them.
 //!
 //! Every judging records its own outcome (`task.gated`, `task.landed`), as
 //! before; the pass reads those records, never the thread's result. An
@@ -2991,7 +2985,7 @@ impl Judge {
                     store,
                     &json!({"type": "task.gated", "id": task.id, "verdict": "stale",
                             "revision": task.revisions, "reason": reason,
-                            "inputs": gate::known_inputs(Some(main), None), "env": null}),
+                            "inputs": inputs::known(Some(main), None), "env": null}),
                 )?;
                 println!("integrate: task {} stale: {reason}", task.id);
                 return Ok(false);
@@ -3047,28 +3041,22 @@ impl Judge {
         // first; the error when it could not be read.
         let moved: std::cell::OnceCell<Result<Option<String>, String>> = std::cell::OnceCell::new();
         let main_now = || moved.get_or_init(|| main_moved(source, main)).clone();
-<<<<<<< 13fc93a710e08f44036aad7336afe9ddee076a00
         // What the candidate's gate run judged and where (objective 035's
         // `inputs` and `env`, [`inputs`]), carried on the record of the
         // verdict it gave: set as that run starts (`env` once it ended).
         let bound: std::cell::RefCell<Option<(Value, Value)>> = std::cell::RefCell::new(None);
-=======
-        // What the verdict judged and where (objective 035): the candidate
-        // run's `inputs`, read just before its gate starts (until then what
-        // is known: the base, the candidate once there is one), its `env`
-        // once it ran (null while no gate ran), and the head's `inputs` when
-        // the head is judged alone too.
-        let inputs: std::cell::RefCell<Value> =
-            std::cell::RefCell::new(gate::known_inputs(Some(main), None));
-        let env: std::cell::RefCell<Value> = std::cell::RefCell::new(Value::Null);
+        // Until a gate runs, what is known (the base, the candidate once
+        // there is one), and the head's `inputs` when the head is judged
+        // alone too.
+        let known: std::cell::RefCell<Value> =
+            std::cell::RefCell::new(inputs::known(Some(main), None));
         let head_inputs: std::cell::RefCell<Option<Value>> = std::cell::RefCell::new(None);
         // A `stale` record judged nothing: what is known, no environment.
         let superseded = |record: &mut Value| {
-            let known = inputs.borrow();
-            record["inputs"] = gate::known_inputs(Some(main), known["candidate"].as_str());
+            let candidate = known.borrow()["candidate"].as_str().map(str::to_string);
+            record["inputs"] = inputs::known(Some(main), candidate.as_deref());
             record["env"] = Value::Null;
         };
->>>>>>> 8d89a431e04124976e2ef8553694653ae00ece8a
         let gated = |verdict: &str, extra: Value| -> Result<(), String> {
             // Stopped for an owner's urgent landing (D2): whatever the gate
             // found but an acceptance (which lands as usual), the judging is
@@ -3170,16 +3158,15 @@ impl Judge {
             if let Some(error) = unread {
                 record_value["main_read"] = json!(error);
             }
-<<<<<<< 13fc93a710e08f44036aad7336afe9ddee076a00
             if let Some((inputs, env)) = bound.borrow().as_ref() {
                 record_value["inputs"] = inputs.clone();
                 record_value["env"] = env.clone();
-=======
-            record_value["inputs"] = inputs.borrow().clone();
-            record_value["env"] = env.borrow().clone();
+            } else {
+                record_value["inputs"] = known.borrow().clone();
+                record_value["env"] = Value::Null;
+            }
             if let Some(head) = head_inputs.borrow().clone() {
                 record_value["head_inputs"] = head;
->>>>>>> 8d89a431e04124976e2ef8553694653ae00ece8a
             }
             record(store, &record_value)?;
             println!("integrate: task {} gated: {verdict}", task.id);
@@ -3225,7 +3212,7 @@ impl Judge {
                 json!({"note": main_merge::conflict_note(main, &merge), "merge": merge.kind()}),
             );
         };
-        inputs.replace(gate::known_inputs(Some(main), Some(&candidate)));
+        known.replace(inputs::known(Some(main), Some(&candidate)));
         let tree_of = |commit: &str| {
             git(&[
                 "--git-dir",
@@ -3300,7 +3287,7 @@ impl Judge {
         let run_gate = |base: &str, judged: &str| {
             // The head's run is bound as the candidate's is: read just
             // before its gate starts.
-            head_inputs.replace(Some(gate::run_inputs(
+            head_inputs.replace(Some(inputs::read(
                 base,
                 judged,
                 scenarios,
@@ -3324,19 +3311,8 @@ impl Judge {
         // The candidate's gate run, measured: a crash in the test
         // database's log counts only inside this window.
         let started = now_ms();
-<<<<<<< 13fc93a710e08f44036aad7336afe9ddee076a00
         let given = inputs::read(main, &candidate, scenarios, scenario.as_deref());
         bound.replace(Some((given.clone(), Value::Null)));
-=======
-        // Read just before the gate starts, never remembered from an
-        // earlier run: the controller and the scenario set may have moved.
-        inputs.replace(gate::run_inputs(
-            main,
-            &candidate,
-            scenarios,
-            scenario.as_deref(),
-        ));
->>>>>>> 8d89a431e04124976e2ef8553694653ae00ece8a
         let (judged, base_check) = gate::judge_seeing_base_check(
             &gate_path,
             mirror,
@@ -3348,15 +3324,7 @@ impl Judge {
             gate_wall_clock(),
         );
         let ended = now_ms();
-<<<<<<< 13fc93a710e08f44036aad7336afe9ddee076a00
         bound.replace(Some((given, inputs::env_here(gate_log(&judged)))));
-=======
-        env.replace(gate::run_env(
-            gate::printed(&judged)
-                .and_then(gate::toolchain_of)
-                .as_deref(),
-        ));
->>>>>>> 8d89a431e04124976e2ef8553694653ae00ece8a
         if let Ok(verdict) = &judged {
             flakes.replace(verdict.flakes.clone());
             red_scenarios.replace(verdict.main_red_scenarios.clone());
@@ -4643,7 +4611,7 @@ fn land(
             store,
             &json!({"type": "task.gated", "id": task.id, "verdict": "stale",
                     "revision": task.revisions,
-                    "inputs": gate::known_inputs(task.base.as_deref(), task.candidate.as_deref())}),
+                    "inputs": inputs::known(task.base.as_deref(), task.candidate.as_deref())}),
         )
         .map(|()| Landing::Stale);
     };
@@ -4704,7 +4672,7 @@ fn land(
                 store,
                 &json!({"type": "task.gated", "id": task.id, "verdict": "stale",
                         "revision": task.revisions,
-                        "inputs": gate::known_inputs(Some(base), Some(candidate))}),
+                        "inputs": inputs::known(Some(base), Some(candidate))}),
             )
             .map(|()| Landing::Stale);
         }
@@ -5034,7 +5002,7 @@ fn bound(value: &Value) -> Value {
         value["class"] = json!(class);
     }
     if value.get("inputs").is_none() {
-        value["inputs"] = gate::known_inputs(value["base"].as_str(), value["candidate"].as_str());
+        value["inputs"] = inputs::known(value["base"].as_str(), value["candidate"].as_str());
     }
     if value.get("env").is_none() {
         value["env"] = Value::Null;
@@ -13705,7 +13673,7 @@ mod database_tests {
         super::record(
             &db.store,
             &json!({"type": "task.gated", "id": task, "revision": 0, "verdict": "stale",
-                    "reason": "behind", "inputs": crate::gate::known_inputs(Some(&main), None),
+                    "reason": "behind", "inputs": crate::inputs::known(Some(&main), None),
                     "env": null}),
         )
         .expect("recorded");
