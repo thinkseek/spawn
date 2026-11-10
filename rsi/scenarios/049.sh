@@ -96,6 +96,12 @@ harness() {
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
 
 controller=$(cd "$(dirname "$0")/../.." && pwd)
+# The tree under test: the gate runs a scenario from the candidate's tree,
+# and $controller is the deployed controller's copy, which lacks the
+# candidate's web/src until it lands.
+tree=$(pwd)
+[ -f "$tree/web/package.json" ] && [ -d "$tree/web/src" ] ||
+    harness "run from the tree under test: no web/src under $tree"
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
 for tool in psql jq od curl sed grep node; do
@@ -416,7 +422,6 @@ fi
 
 # --- (6) the page's words -------------------------------------------------------------------
 
-tree=$controller
 [ -f "$tree/web/src/interventions.ts" ] || fail "(6) there is no web/src/interventions.ts"
 cat >"$WORK/view.test.mjs" <<'NODE'
 import assert from "node:assert/strict";
