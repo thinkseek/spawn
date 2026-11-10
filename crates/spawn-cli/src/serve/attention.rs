@@ -67,7 +67,8 @@
 //! behind them, as the mission board shows them: work a person is holding.
 //!
 //! The supervisor's question is shown when its turn ended at its prompt
-//! and its judgement asks for a person: BLOCKED or WAITING with
+//! and its judgement of that turn (one that rests on the turn's end, never
+//! an earlier turn's) asks for a person: BLOCKED or WAITING with
 //! `needs_human` at least [`ASKS_NEEDS_HUMAN`], or a `HUMAN:` line the
 //! Observer read in its reply. Its words come from its transcript (the
 //! engine's own record, by role), read with the Observer's reader
@@ -324,12 +325,22 @@ fn supervisor(facts: &Facts, question: &Value, for_owner: &Value) -> Value {
 /// live execution's latest turn has ended at its prompt (the judgement
 /// says the turn stopped idle), and it is judged BLOCKED or WAITING with
 /// `needs_human` at least [`ASKS_NEEDS_HUMAN`], or the Observer read a
-/// `HUMAN:` line in its reply. The latest judgement, current or not: a
-/// screen reading after it changes nothing the turn's end does not.
+/// `HUMAN:` line in its reply. The latest judgement, current or not (a
+/// screen reading after it changes nothing the turn's end does not), but
+/// one of this turn: it rests on the turn's end ([`Facts::turn_seq`]) or on
+/// a later fact. A judgement of an earlier turn says nothing of the one
+/// that ended now: once a person answers and the answer's turn ends, the
+/// question that was answered would otherwise be back until the Observer
+/// judges again (GitHub #16 item 9).
 fn asking(facts: &Facts) -> Option<&Observation> {
     let observation = facts.observation.as_ref()?;
-    let at_prompt =
-        facts.live && facts.turn_ended && observation.ambiguity == Some(Ambiguity::TurnStoppedIdle);
+    let of_this_turn = facts
+        .turn_seq
+        .is_some_and(|turn| observation.based_on_seq.0 >= turn);
+    let at_prompt = facts.live
+        && facts.turn_ended
+        && of_this_turn
+        && observation.ambiguity == Some(Ambiguity::TurnStoppedIdle);
     let unsure = matches!(
         observation.state,
         SemanticState::Blocked | SemanticState::Waiting
@@ -535,6 +546,7 @@ mod tests {
             "observation_event_id": observation["based_on_seq"].as_i64().map(|seq| seq * 10),
             "observation_at_ms": at,
             "evidence_seq": observation["based_on_seq"], "turn_ended": true,
+            "turn_seq": observation["based_on_seq"],
             "episode": 3, "open_command": false, "told": [],
         })
     }
@@ -1108,6 +1120,49 @@ mod tests {
             observation.ambiguity = None;
         }
         assert!(asking(&working).is_none());
+    }
+
+    /// GitHub #16 item 9: the supervisor asked, a person answered, and the
+    /// answer's turn has ended. Until the Observer judges that turn, the
+    /// latest judgement is still the one of the turn that asked: it is no
+    /// question of the turn that ended now, and must not return to the
+    /// queue (it did: BLOCKED 0.87 with the turn ended passed again).
+    #[test]
+    fn an_answered_question_does_not_return_when_the_answers_turn_ends() {
+        let judged_at = |seq: u64| judged("BLOCKED", 0.87, false, seq);
+        let supervisor = |observation: &Value, evidence: u64, turn: u64, ended: bool| {
+            let mut row = row(
+                "session_supervisor",
+                "agent_supervisor",
+                observation,
+                NOW - 60_000,
+            );
+            row["evidence_seq"] = json!(evidence);
+            row["turn_seq"] = json!(turn);
+            row["turn_ended"] = json!(ended);
+            facts(&row)
+        };
+        // Its turn ended at 1351 and was judged there: it asks.
+        let asked = supervisor(&judged_at(1351), 1351, 1351, true);
+        assert!(asking(&asked).is_some());
+        // A later fact that is no turn (a screen reading) changes nothing.
+        assert!(asking(&supervisor(&judged_at(1351), 1355, 1351, true)).is_some());
+        // The answer is typed (1356, a new turn: `message.received`).
+        assert!(asking(&supervisor(&judged_at(1351), 1356, 1356, false)).is_none());
+        // The answer's turn ends at 1362; the judgement is still 1351's.
+        let answered = supervisor(&judged_at(1351), 1362, 1362, true);
+        assert!(
+            asking(&answered).is_none(),
+            "the judgement of an earlier turn is no question of this one"
+        );
+        assert!(asks(&answered, None).is_none());
+        // Judged again on the turn that ended: what it says then stands.
+        let again = supervisor(&judged_at(1362), 1362, 1362, true);
+        assert!(asking(&again).is_some(), "it asks again, in this turn");
+        let mut done = judged_at(1363);
+        done["state"] = json!("COMPLETED");
+        done["needs_human"] = json!(0.1);
+        assert!(asking(&supervisor(&done, 1363, 1362, true)).is_none());
     }
 
     /// Objective 34: the attention view lists the owner's holds only while a
