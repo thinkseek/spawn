@@ -614,7 +614,7 @@ impl PostgresStore {
 
     /// Commands into one session, newest first, with who sent them.
     /// `bound_ms`: how long a message may go untaken
-    /// (SPAWN_MESSAGE_TAKEN_SECS, [`crate::message_taken_ms`]).
+    /// (SPAWN_MESSAGE_TAKEN_SECS, read by `spawn serve`).
     pub fn commands_json(
         &self,
         session: &str,
