@@ -432,6 +432,12 @@ pub(crate) enum Why {
     /// Main of a source that was red on a check passes it again
     /// ([`digest::main_red_news`]).
     MainGreen,
+    /// A mission's source is not a directory on this host: its branches are
+    /// not published to it ([`digest::source_away_news`], told once).
+    SourceAway,
+    /// A mission's source that was away is back, or no longer watched
+    /// ([`digest::source_away_news`]).
+    SourceBack,
     /// A gate runner judged a copy of a verdict on the same inputs and
     /// disagreed with the primary ([`digest::shadow_disagreements`], told
     /// once): it decided nothing.
@@ -485,6 +491,8 @@ impl Why {
                 | Self::GateBaseDisagrees
                 | Self::MainRed
                 | Self::MainGreen
+                | Self::SourceAway
+                | Self::SourceBack
                 | Self::ShadowDisagrees
                 | Self::HoldExpired
                 | Self::ObjectiveSolved
@@ -758,6 +766,10 @@ pub(crate) fn read_plan(
     host.extend(digest::main_red_news(&records(
         store.main_red_news(),
         "red main records",
+    )?));
+    host.extend(digest::source_away_news(&records(
+        store.source_away_news(),
+        "source away records",
     )?));
     host.extend(digest::shadow_disagreements(&records(
         store.shadow_disagreements(),

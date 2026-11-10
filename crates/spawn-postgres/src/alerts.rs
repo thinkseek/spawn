@@ -14,6 +14,12 @@ use spawn_core::port::StoreError;
 
 use crate::PostgresStore;
 
+/// The open and active missions' sources, for the `source_away` reading
+/// (P12): `[{mission, sources}]`, by mission.
+pub(crate) const MISSION_SOURCES: &str = "select coalesce(jsonb_agg(jsonb_build_object(
+    'mission', id, 'sources', sources) order by id), '[]'::jsonb)
+  from mission_missions where state in ('open', 'active')";
+
 /// The event watermark and the database's clock, in one index-only read:
 /// an idle pass costs the loop one statement (objective 023).
 pub(crate) const CLOCK: &str = "select coalesce(max(id), 0), spawn_now_ms() from spawn_events";
@@ -244,6 +250,11 @@ impl PostgresStore {
     /// The database's clock in epoch ms ([`NOW`]).
     pub fn now_ms(&self) -> Result<i64, StoreError> {
         Ok(self.query_one(NOW, &[])?.get(0))
+    }
+
+    /// The open and active missions' sources ([`MISSION_SOURCES`]).
+    pub fn alert_mission_sources(&self) -> Result<Value, StoreError> {
+        self.query_json(MISSION_SOURCES, &[])
     }
 
     /// The missions and tasks the loop compares records against ([`MIRROR`]).
