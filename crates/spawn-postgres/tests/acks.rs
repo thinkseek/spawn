@@ -220,8 +220,10 @@ fn a_report_answers_the_delivery_it_reports_on_once() {
         Ok(AckRecord::Recorded { .. })
     ));
     assert_eq!(
-        store.record_report_answer(second, "done", None),
-        Ok(AckRecord::Answered)
+        store
+            .record_report_answer(second, "done", None)
+            .expect("the answer reads"),
+        AckRecord::Answered
     );
     assert!(
         store
