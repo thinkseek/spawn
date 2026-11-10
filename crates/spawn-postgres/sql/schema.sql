@@ -4362,6 +4362,21 @@ begin
         'ended', v_ended);
 end $$;
 
+-- The owner (the loop) and `spawn serve`'s reader login read messages;
+-- nobody else is handed a function over the log. Each runs with its
+-- caller's rights.
+revoke execute on function spawn_messages_marked_from() from public;
+revoke execute on function spawn_command_message(spawn_commands, bigint, bigint, bigint)
+    from public;
+do $$
+begin
+    execute format('grant execute on function spawn_messages_marked_from() to %I',
+                   spawn_login_role('spawn_reader'));
+    execute format('grant execute on function spawn_command_message(spawn_commands, bigint, '
+                   'bigint, bigint) to %I', spawn_login_role('spawn_reader'));
+end
+$$;
+
 -- The backup records: the loop's `spawn backup dump|bundle|verify` writes
 -- them through `spawn_backup_record` (owner only); each names what a copy
 -- holds and what the run measured (docs/storage.md, "Where state lives").
