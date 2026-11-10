@@ -27,7 +27,10 @@ pub(crate) fn message_taken_bound(text: Option<&str>) -> (i64, Option<String>) {
         return (default, None);
     };
     match text.trim().parse::<u64>() {
-        Ok(secs) => (secs.saturating_mul(1000).min(i64::MAX as u64).cast_signed(), None),
+        Ok(secs) => (
+            i64::try_from(secs.saturating_mul(1000)).unwrap_or(i64::MAX),
+            None,
+        ),
         Err(_) => (
             default,
             Some(format!(
