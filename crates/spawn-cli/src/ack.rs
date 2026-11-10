@@ -64,13 +64,17 @@ pub(crate) fn parse(words: &[String]) -> Result<Ack, String> {
         .split_first()
         .ok_or_else(|| format!("no outcome (done or declined); {USAGE}"))?;
     if outcome != "done" && outcome != "declined" {
-        return Err(format!("{outcome}: the outcome is done or declined; {USAGE}"));
+        return Err(format!(
+            "{outcome}: the outcome is done or declined; {USAGE}"
+        ));
     }
     let why = why.join(" ");
     let why = why.trim();
     let why = (!why.is_empty()).then(|| why.chars().take(WHY_CHARS).collect::<String>());
     if outcome == "declined" && why.is_none() {
-        return Err(format!("a decline says why: spawn ack {command_id} declined <why>"));
+        return Err(format!(
+            "a decline says why: spawn ack {command_id} declined <why>"
+        ));
     }
     Ok(Ack {
         command_id,
@@ -84,9 +88,8 @@ pub(crate) fn parse(words: &[String]) -> Result<Ack, String> {
 /// after the pane's agent (`SPAWN_AGENT_ID`): where the loop reads the
 /// agent's acks. Outside an agent's pane, none.
 fn pane_workspace(env: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
-    let outside = |what: &str| {
-        format!("spawn ack runs in an agent's own pane: {what}; nothing was recorded")
-    };
+    let outside =
+        |what: &str| format!("spawn ack runs in an agent's own pane: {what}; nothing was recorded");
     let agent = env("SPAWN_AGENT_ID")
         .filter(|agent| !agent.is_empty())
         .ok_or_else(|| outside("SPAWN_AGENT_ID is not set"))?;
@@ -219,7 +222,10 @@ fn one(
             ack.command_id
         ));
     }
-    let why = ack.why.as_deref().map(|why| why.chars().take(WHY_CHARS).collect::<String>());
+    let why = ack
+        .why
+        .as_deref()
+        .map(|why| why.chars().take(WHY_CHARS).collect::<String>());
     match store
         .record_ack(agent, ack.command_id, &ack.outcome, why.as_deref())
         .map_err(|error| error.to_string())?
@@ -407,7 +413,8 @@ mod tests {
             .map_or(0, |elapsed| elapsed.subsec_nanos());
         let schema = format!("spawn_test_{}_{nanos:x}_acks", std::process::id());
         let store = PostgresStore::connect_in_schema(&url, &schema).expect("connect and migrate");
-        let root = std::env::temp_dir().join(format!("spawn-acks-{}-{nanos:x}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("spawn-acks-{}-{nanos:x}", std::process::id()));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let separator = if url.contains('?') { '&' } else { '?' };
             let owner = format!("{url}{separator}options=-csearch_path%3D{schema}");
@@ -471,7 +478,10 @@ mod tests {
                     serde_json::json!({"command_id": mine, "outcome": "done", "why": null})
                 )]
             );
-            assert!(collect(&store, &rows, &root).is_empty(), "nothing left to read");
+            assert!(
+                collect(&store, &rows, &root).is_empty(),
+                "nothing left to read"
+            );
         }));
         let _ = std::fs::remove_dir_all(&root);
         let _ = postgres::Client::connect(&url, postgres::NoTls)

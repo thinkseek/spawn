@@ -255,7 +255,8 @@ pub fn list(top: &Path, relative: &TreePath) -> Result<Vec<Vec<u8>>, AgentFileEr
         return Ok(Vec::new());
     };
     let shown = directory.shown().to_path_buf();
-    let failed = |error: Errno| AgentFileError::Failed(format!("list {}: {error}", shown.display()));
+    let failed =
+        |error: Errno| AgentFileError::Failed(format!("list {}: {error}", shown.display()));
     let mut names = Vec::new();
     for entry in rustix::fs::Dir::read_from(directory.descriptor()).map_err(failed)? {
         let name = entry.map_err(failed)?.file_name().to_bytes().to_vec();

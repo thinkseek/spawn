@@ -82,7 +82,10 @@ mod tests {
         let text = marked("do the task", CommandId(42), false);
         assert_eq!(
             text,
-            format!("do the task\n\n[spawn message #42]\n{}", answer_line(CommandId(42)))
+            format!(
+                "do the task\n\n[spawn message #42]\n{}",
+                answer_line(CommandId(42))
+            )
         );
         assert_eq!(markers(&text), [CommandId(42)]);
         let several = marked("notice\n\ndo the task", CommandId(43), true);
@@ -96,7 +99,10 @@ mod tests {
         let line = marked("do the task", CommandId(7), true);
         assert_eq!(
             line,
-            format!("do the task [spawn message #7] {}", answer_line(CommandId(7)))
+            format!(
+                "do the task [spawn message #7] {}",
+                answer_line(CommandId(7))
+            )
         );
         assert_eq!(markers(&line), [CommandId(7)]);
     }

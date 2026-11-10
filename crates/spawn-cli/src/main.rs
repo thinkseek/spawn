@@ -174,7 +174,10 @@ mod tests {
             MORE_USAGE.contains("spawn ack <command id> done|declined [<why>]"),
             "{MORE_USAGE}"
         );
-        assert!(!USAGE.contains("ack"), "the contract's line stays as it was");
+        assert!(
+            !USAGE.contains("ack"),
+            "the contract's line stays as it was"
+        );
     }
 
     #[test]
