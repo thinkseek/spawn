@@ -3702,4 +3702,82 @@ expect "judged again on the base" "$(cat "$work/gate.out")" \
     '| == base: 401.sh: its cache entry cannot be read; judged again'
 git -C "$seed" checkout -q main 2>/dev/null || git -C "$seed" checkout -q -B main "$base"
 
+# 28. What is never cached (GitHub issue #29): a base run that could not
+# judge writes no entry, and the exit code alone says which run that is.
+# 501's driver asks the fake server of case 9 for a count and takes its
+# first, second and fourth asks as unanswered: a transport error, which a
+# harness reports as its own (exit 2). Supply PA's reported "fetch failed:
+# other side closed" as a failed assertion (exit 1), and two such runs on
+# the base were a cached `unsolved`: every later gate on that base took a
+# candidate that broke the objective. The third ask is an assertion that
+# fails (exit 1), and from the fifth on the scenario judges the tree.
+transport=$work/transport
+mkdir -p "$transport"
+cp "$scenarios/protected" "$scenarios/build" "$work/server-client" "$transport/"
+cat >"$transport/501.sh" <<'EOF'
+#!/bin/sh
+case "$(sh "$(dirname "$0")/server-client" count)" in
+1 | 2 | 4)
+    echo "501: FAIL: GET /orders: no answer from the server (fetch failed: other side closed)"
+    exit 2
+    ;;
+3)
+    echo "501: FAIL: the order was not confirmed"
+    exit 1
+    ;;
+esac
+[ "$(cat value)" != three ]
+EOF
+# A candidate that breaks 501, and 511 below.
+branch breaks-objective
+printf 'three\n' >"$seed/value"
+breaks=$(commit breaks-objective)
+git -C "$seed" checkout -q main 2>/dev/null || git -C "$seed" checkout -q -B main "$base"
+never_judge() { # <cache name> <scenarios> [VAR=value]: the gate on that candidate, the fake server its test database
+    (
+        export SPAWN_TEST_DATABASE_URL="postgres://u:p@$(printf '%s' "$server_dir" | sed 's|/|%2F|g')/db" ${3:+"$3"}
+        with_jobs 1 "$1" "$breaks" "$2"
+    )
+}
+# never_cached <cache name>: the results that base cache holds, a word each.
+never_cached() {
+    for entry in "$work/caches/$1/spawn/gate-base"/*; do
+        case "$entry" in *.lock) continue ;; esac
+        if [ -f "$entry" ]; then head -n 1 "$entry"; fi
+    done | tr '\n' ' '
+}
+server reset >/dev/null
+expect "a transport error on the base is a host fault, no verdict" "$(never_judge transport "$transport")" \
+    'exit=6 {"host_fault":true,"scenario":"501.sh","on":"base","runs":"2"'
+expect "and nothing is cached" "[$(never_cached transport)]" '[]'
+expect "a second one, in the next gate: judged again, the same fact" "$(never_judge transport "$transport")" \
+    'exit=6 {"host_fault":true,"scenario":"501.sh","on":"base","runs":"2"'
+expect "run, not read" "$(cat "$work/gate.out")" '| == base: 501.sh'
+expect "and still nothing cached" "[$(never_cached transport)]" '[]'
+expect "an assertion's exit 1 and then a transport error do not agree: a host fault" \
+    "$(never_judge transport "$transport")" \
+    'exit=6 {"host_fault":true,"scenario":"501.sh","on":"base","runs":"1, then 2"'
+expect "so no unsolved is cached" "[$(never_cached transport)]" '[]'
+expect "once the server answers, the base solves it and the candidate is still checked for it" \
+    "$(never_judge transport "$transport")" \
+    'exit=0 {"verdict":"rejected","reason":"regression: 501.sh fails on the candidate"}'
+expect "by a run on the base" "$(cat "$work/gate.out")" '| base results from the cache: none; run on the base: 501.sh'
+expect "whose result is the only entry" "[$(never_cached transport)]" '[solved ]'
+# A run the gate itself lost (no status of it) is no exit 1 either: it read
+# as one, and two of them cached `unsolved` for an objective the base
+# solves, so the candidate that breaks it was accepted.
+lost=$work/lost
+mkdir -p "$lost"
+cp "$scenarios/protected" "$scenarios/build" "$lost/"
+printf '#!/bin/sh\n[ "$(cat value)" != three ]\n' >"$lost/511.sh"
+expect "a base run that left no status is a host fault, not an unsolved objective" \
+    "$(never_judge lost "$lost" SPAWN_GATE_TEST_LOST_RUN=511.sh)" \
+    'exit=6 {"host_fault":true,"scenario":"511.sh","on":"base","runs":"4"'
+expect "the log says the gate lost it" "$(cat "$work/gate.out")" \
+    '| gate: the run of 511.sh left no status: the gate lost it (not an exit of the scenario'
+expect "and nothing is cached" "[$(never_cached lost)]" '[]'
+expect "the next gate judges it, and the candidate that breaks it is rejected" \
+    "$(never_judge lost "$lost")" \
+    'exit=0 {"verdict":"rejected","reason":"regression: 511.sh fails on the candidate"}'
+
 echo "gate: all cases pass"
