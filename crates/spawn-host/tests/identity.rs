@@ -399,6 +399,13 @@ fn the_bridge_reads_the_turn_of_an_engine_under_a_symlinked_root() {
     );
     submit(&memory, "key_stop", CommandAction::Stop);
     bridge.tick().expect("stop");
+    // The kill runs off the loop (P7) and gets 50 ms in line: tick until the
+    // stop's end is done, as a one-shot `spawn tick` does (rev-b's N1).
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while bridge.ends_pending() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        bridge.tick().expect("stop");
+    }
     assert!(
         !terminals
             .is_alive(
