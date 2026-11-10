@@ -1204,6 +1204,46 @@ mod tests {
     const AT: &str = r#""timestamp":"2026-11-04T05:46:12.345Z""#;
 
     #[test]
+    fn a_prompt_with_markers_takes_each_message_by_its_line_and_id() {
+        let prompt = format!(
+            r#"{{"type":"user","uuid":"u1",{AT},"message":{{"role":"user","content":"notice\n\nfix it\n\n[spawn message #12]"}}}}"#
+        );
+        assert_eq!(
+            kinds(&prompt),
+            vec![
+                ("message.received".into(), Some("u1".into())),
+                ("message.taken".into(), Some("u1:taken:12".into())),
+            ]
+        );
+        assert_eq!(
+            claude_line(&prompt)[1].kind,
+            EventKind::MessageTaken {
+                command_id: crate::id::CommandId(12)
+            }
+        );
+        // Two inputs in one prompt: both taken, each once.
+        let two = format!(
+            r#"{{"type":"user","uuid":"u2",{AT},"message":{{"content":[{{"type":"text","text":"a\n\n[spawn message #3]"}},{{"type":"text","text":"b\n\n[spawn message #4]"}}]}}}}"#
+        );
+        assert_eq!(
+            kinds(&two),
+            vec![
+                ("message.received".into(), Some("u2".into())),
+                ("message.taken".into(), Some("u2:taken:3".into())),
+                ("message.taken".into(), Some("u2:taken:4".into())),
+            ]
+        );
+        // A tool result that quotes a marker took nothing.
+        let quoted = format!(
+            r#"{{"type":"user","uuid":"u3",{AT},"message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":"[spawn message #12]"}}]}}}}"#
+        );
+        assert_eq!(
+            kinds(&quoted),
+            vec![("tool.completed".into(), Some("toolu_1:completed".into()))]
+        );
+    }
+
+    #[test]
     fn a_transcript_gives_the_turn_and_its_tools() {
         let prompt = format!(
             r#"{{"type":"user","uuid":"u1",{AT},"message":{{"role":"user","content":"fix it"}}}}"#
