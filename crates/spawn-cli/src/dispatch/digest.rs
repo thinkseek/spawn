@@ -80,6 +80,7 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::ObjectiveSolved => "an objective closed: solved on the base (not a rejection)",
         Why::ObjectiveOrder => "a backlog names an order no task can meet",
         Why::OverBudget => "a task went over its budget twice",
+        Why::ModelFinal => "the model's error ended a worker's engine for good (not revived)",
     }
 }
 
@@ -108,6 +109,7 @@ fn lines(pending: &[Escalation]) -> Vec<(Line<'_>, Vec<String>)> {
                 && item.why != Why::ObjectiveYielded
                 && item.why != Why::ObjectiveSolved
                 && item.why != Why::ObjectiveOrder
+                && item.why != Why::ModelFinal
                 && line.first.session_id == item.session_id
                 && line.first.why == item.why
         }) {
@@ -839,4 +841,54 @@ pub(super) fn order(supervisor: &Facts, pending: &[Escalation], spawn: &str) -> 
         },
         task: None,
     })
+}
+
+/// The digest items for `records`, the recovery's final model records that
+/// no delivered digest told yet (`PostgresStore::model_finals`). Each is an
+/// item of the worker's session, id `model-<execution id>`, naming the
+/// session, the execution, the cause and either the refused request's
+/// status (and its text) or the retries spent. No time window: a record
+/// stays an item until a digest carrying its tag (`<session>
+/// model-<execution id>`) reaches the supervisor, so it is told once.
+pub(crate) fn model_finals(records: &[Value]) -> Vec<Escalation> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let session = record["session_id"].as_str()?;
+            let execution = record["execution_id"].as_str()?;
+            let cause = record["cause"].as_str()?;
+            let status = record["status"]
+                .as_i64()
+                .map_or_else(|| "no status".to_string(), |status| format!("status {status}"));
+            let text = record["text"]
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .map_or_else(String::new, |text| format!(" (\"{}\")", one_line(text, 200)));
+            let line = if cause == "model_unavailable" {
+                let retries = record["retries"]
+                    .as_u64()
+                    .map_or_else(|| "its".to_string(), |retries| retries.to_string());
+                format!(
+                    "session {session}: execution {execution} ended on the model's transient \
+                     error again ({cause}, {status}){text} after {retries} retries in a row \
+                     (SPAWN_RECOVER_MODEL_RETRIES): Spawn will not resume it. Resume it once \
+                     the model answers, or reassign its task."
+                )
+            } else {
+                format!(
+                    "session {session}: execution {execution} ended on a request the model \
+                     refused ({cause}, {status}){text}: Spawn will not retry it, the same \
+                     request fails the same way. Look at the session, then resume it with \
+                     another instruction or reassign its task."
+                )
+            };
+            Some(Escalation {
+                session_id: session.to_string(),
+                id: format!("model-{execution}"),
+                why: Why::ModelFinal,
+                line,
+                since_ms: record["at_ms"].as_i64(),
+            })
+        })
+        .collect()
 }
