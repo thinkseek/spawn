@@ -274,7 +274,7 @@ function MissionIdleLine({ mission }: { mission: MissionIdle }) {
         {mission.idleHours} of {mission.hours} h idle
       </span>
       {mission.idle && (
-        <span className="shrink-0 rounded-sm bg-warning/15 px-1 text-micro font-medium text-warning">
+        <span className="shrink-0 rounded bg-wait-tint px-1.5 py-px text-micro font-medium text-warning">
           idle
         </span>
       )}
