@@ -222,6 +222,11 @@ const HISTORY_LIMIT: i64 = 5_000;
 /// How far back a restarted loop looks for commands that finished failed.
 const COMMAND_LOOKBACK_MS: i64 = 600_000;
 
+/// How far before the last reading of the messages the next looks for a
+/// taking or an end: an append that committed after that reading may carry
+/// an earlier time.
+const MESSAGES_MARGIN_MS: i64 = 60_000;
+
 /// On start, the last part of a log is read, not all of it.
 const LOG_TAIL_BYTES: u64 = 1024 * 1024;
 /// The most one reading takes from a log that grew a lot.
@@ -489,9 +494,14 @@ pub(crate) struct Monitor {
     /// The newest command the messages' reading has seen: the next reads
     /// the commands after it.
     messages_after: i64,
-    /// The tracked messages not taken, not alerted and whose session has not
-    /// ended with them, read again until one of those changes.
-    pending: BTreeSet<i64>,
+    /// The tracked messages not taken, not alerted and whose session had not
+    /// ended with them when last read, by the time each falls due: read
+    /// again then.
+    pending: BTreeMap<i64, i64>,
+    /// From when the next reading looks for a `message.taken` or an
+    /// `execution.ended` that may clear an open alert: the last reading's
+    /// time, less a margin for an append that committed late.
+    messages_since: i64,
 }
 
 impl Monitor {
@@ -527,7 +537,8 @@ impl Monitor {
             away_once: BTreeMap::new(),
             messages_due: None,
             messages_after: 0,
-            pending: BTreeSet::new(),
+            pending: BTreeMap::new(),
+            messages_since: 0,
         }
     }
 
@@ -577,12 +588,13 @@ impl Monitor {
             self.commands(&commands, &mut events);
             self.commands_after = now.saturating_sub(1000);
         }
-        // The messages are read when the log moved (a new command, a typing,
-        // a taking, an end all append) and when a pending one falls due:
-        // the new commands and the pending ones only, so an idle pass reads
+        // The messages are read when the log moved (a new command, a taking,
+        // an end all append) and when a pending one falls due: the new
+        // commands, the pending ones due, and the open alerts' whose session
+        // took a message or ended since, so an idle pass reads next to
         // nothing (objective 023).
         if moved || self.messages_due.is_some_and(|due| now >= due) {
-            self.read_messages(store, &mut events, &mut lines);
+            self.read_messages(store, now, &mut events, &mut lines);
         }
         if reading_due {
             self.next_reading_ms = now.saturating_add(self.settings.check_ms);
@@ -1465,19 +1477,30 @@ times in a row)",
             .collect()
     }
 
-    /// Read the commands after the last one seen, the pending messages and
-    /// the open alerts' ([`PostgresStore::alert_messages_since`]), and
-    /// decide. An error is said and read again at the next pass.
+    /// Read the commands after the last one seen, the pending messages due
+    /// at `now`, and the open alerts' that may have cleared
+    /// ([`PostgresStore::alert_messages_since`]), and decide. An error is
+    /// said and read again at the next pass.
     fn read_messages(
         &mut self,
         store: &PostgresStore,
+        now: i64,
         out: &mut Vec<Event>,
         lines: &mut Vec<String>,
     ) {
-        let mut ids = self.open_messages();
-        ids.extend(self.pending.iter().copied());
-        match store.alert_messages_since(self.settings.message_taken_ms, self.messages_after, &ids)
-        {
+        let due: Vec<i64> = self
+            .pending
+            .iter()
+            .filter(|(_, due)| **due <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        match store.alert_messages_since(
+            self.settings.message_taken_ms,
+            self.messages_after,
+            &due,
+            &self.open_messages(),
+            self.messages_since,
+        ) {
             Ok(messages) => self.messages(&messages, out),
             Err(error) => lines.push(format!("alerts: messages: {error}")),
         }
@@ -1519,11 +1542,14 @@ times in a row)",
                 continue;
             }
             // Pending until its alert is in the store: a fire the store
-            // refused for an error is tried again.
-            self.pending.insert(id);
+            // refused for an error is tried again at the next reading.
+            let now = messages["now_ms"].as_i64().unwrap_or_default();
+            let due = message["due_ms"].as_i64().unwrap_or(now);
             if message["not_taken"].as_bool() != Some(true) {
+                self.pending.insert(id, due);
                 continue;
             }
+            self.pending.insert(id, now);
             let typed = message["typed"].as_bool() == Some(true);
             let agent = message["agent_id"].as_str().unwrap_or_default();
             let action = message["action"].as_str().unwrap_or("input");
@@ -1558,19 +1584,10 @@ times in a row)",
         if let Some(max) = messages["max_id"].as_i64() {
             self.messages_after = self.messages_after.max(max);
         }
-        // The earliest bound of a pending message not due yet.
-        self.messages_due = messages["messages"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|message| {
-                message["command_id"]
-                    .as_i64()
-                    .is_some_and(|id| self.pending.contains(&id))
-                    && message["not_taken"].as_bool() != Some(true)
-            })
-            .filter_map(|message| message["due_ms"].as_i64())
-            .min();
+        if let Some(now) = messages["now_ms"].as_i64() {
+            self.messages_since = now.saturating_sub(MESSAGES_MARGIN_MS);
+        }
+        self.messages_due = self.pending.values().copied().min();
     }
 
     /// The model judge's `down` records that reached their bound
