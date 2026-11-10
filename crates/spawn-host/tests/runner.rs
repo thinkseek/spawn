@@ -486,3 +486,75 @@ fn terminating_a_gone_terminal_leaves_one_whose_name_it_prefixes() {
     std::thread::sleep(Duration::from_millis(700));
     assert!(running_with(&marker), "spawn-exec_12's runner still runs");
 }
+
+/// A session that vanished on its own, tmux dying or the session killed
+/// outside `terminate`, leaves no pane to read, while its runner may still
+/// be exiting on the hang-up, or ignore it and run on. `terminate` reads the
+/// session from the leader recorded at start (backlog P6): it waits for a
+/// runner that writes as it dies, and kills one that ignores the hang-up.
+#[test]
+fn terminate_waits_for_a_runner_whose_session_vanished_on_its_own() {
+    let _exclusive = exclusive();
+    let server = Server::new("vanished");
+    // The leaders' records under a private directory of the test's own (no
+    // $XDG_RUNTIME_DIR in a gate's sandbox).
+    let leaders = server.directory.join("leaders");
+    fs::create_dir(&leaders).expect("leaders");
+    fs::set_permissions(&leaders, fs::Permissions::from_mode(0o700)).expect("0700");
+    let host = server
+        .host()
+        .with_terminate_waits(Duration::from_secs(5), Duration::from_secs(2))
+        .with_leaders_under(leaders);
+
+    // tmux dies; the runner writes as it dies, 0.5 s after the hang-up.
+    let late = server.directory.join("late");
+    let marker = format!("spawn-vanished-writing-{}", std::process::id());
+    let script = format!(
+        "trap 'sleep 0.5; echo late >> {}; exit 0' HUP; while :; do sleep 0.05; done",
+        late.display()
+    );
+    host.start(&launch("/bin/sh", &["-c", &script, &marker], &[]))
+        .expect("start");
+    until_running(&marker);
+    server.tmux(&["kill-server"]);
+    assert_eq!(
+        host.runner(&terminal(), &workspace()).expect("runner"),
+        Runner::Gone,
+        "the session vanished"
+    );
+    host.terminate(&terminal(), &workspace())
+        .expect("terminate");
+    assert_eq!(
+        fs::read_to_string(&late).unwrap_or_default(),
+        "late\n",
+        "terminate returned before the runner of a vanished session wrote as it died"
+    );
+    assert!(!running_with(&marker), "the runner is gone");
+
+    // The session killed by hand; the runner ignores the hang-up and runs
+    // on: killed after the wait.
+    let host = host.with_terminate_waits(Duration::from_millis(300), Duration::from_secs(2));
+    server.tmux(&["new-session", "-d", "-s", "keep"]);
+    let marker = format!("spawn-vanished-ignores-{}", std::process::id());
+    host.start(&launch(
+        "/bin/sh",
+        &["-c", "trap '' HUP; while :; do sleep 0.05; done", &marker],
+        &[],
+    ))
+    .expect("start");
+    until_running(&marker);
+    server.tmux(&["kill-session", "-t", "=spawn-exec_1"]);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(running_with(&marker), "it outlived its session");
+    let started = Instant::now();
+    host.terminate(&terminal(), &workspace()).expect("killed");
+    assert!(started.elapsed() >= Duration::from_millis(300), "it waited");
+    assert!(!running_with(&marker), "killed, and gone");
+    // A second terminate is harmless, and waits for nothing.
+    let started = Instant::now();
+    host.terminate(&terminal(), &workspace()).expect("again");
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "nothing to wait for"
+    );
+}
