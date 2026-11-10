@@ -430,15 +430,22 @@ it, on the same ladder.
   | `disk_full` | the workspace's filesystem read under `SPAWN_DISK_FLOOR_GB` at the end | `wait` | probed every `SPAWN_RECOVER_PROBE_SECS` (10 s); revived within one probe of room |
   | `database_unavailable` | two or more passes of the loop that could not reach the database while the execution ran | `wait` | cleared at the first pass that gets through |
   | `model_auth` | an API error line with status 401 or 403, `authentication_failed`, or a text holding `/login` | `wait` | probed every 10 s; cleared when the credentials file changes, one retry every `SPAWN_RECOVER_AUTH_RETRY_SECS` (1800 s) while it does not |
-  | `model_unavailable` | an API error line with status 529, 503, 500, 429 or none, or error `overloaded`, `rate_limit`, `server_error` | `wait` | retried after `SPAWN_RECOVER_MODEL_BACKOFF_SECS` (60 s) doubling per failed turn, capped at 4 x it, or at `retry_at_ms` when the text names when an account is available again |
+  | `model_unavailable` | an API error line with status 529, 503, 500, 429 or none, or error `overloaded`, `rate_limit`, `server_error` | `wait` | retried after `SPAWN_RECOVER_MODEL_BACKOFF_SECS` (60 s) doubling per failed turn, capped at 4 x it, or at `retry_at_ms` when the text names when an account is available again. An engine that *ended* after it is resumed in the same native session after the backoff at most `SPAWN_RECOVER_MODEL_RETRIES` (3, from 1 to 20; another value stops the loop at its start) times in a row with no model answer between (a revived execution that made progress resets the count); its next such end is `model_unavailable` on `final` (evidence: `retries`), never revived, and told to the supervisor once. An engine at its prompt is retried without this bound |
+  | `model_error` | the engine's own end after an API error line that is none of the above (a 400 that is not `Prompt is too long`, a 404, a 413), with no progress after it | `final` | never revived (the same request fails the same way); told to the supervisor once |
   | `context_exhausted` | an API error line whose text holds `Prompt is too long` | `handoff` | due at once: a Stop with its final checkpoint, then a new native session in the same workspace and branch |
   | `budget` | the integrator's Stop of a task over its budget (objective 026) | `handoff` | as a context's |
   | `stopped` | a Stop or Discard from a person, the supervisor, a cancelled task or a retirement | `final` | never revived |
 
   When several hold the first in that order wins: a person's Stop before the
   budget, a memory kill before a host restart, a full disk before a database
-  outage, a model login before a model outage before a context, a crash
-  before a clean exit. A Stop that is part of a revival (a handoff's) is no
+  outage, a model login before a model outage before a context, a request
+  the model refused before a crash, a crash before a clean exit.
+
+  The dispatcher tells the supervisor of each final model record once
+  (`model_unavailable` with its retries spent, `model_error`): one digest
+  item of the worker's session, tagged `<session> model-<execution>`,
+  naming the session, the execution, the cause and the status or the
+  retries. It is news: told, it is never repeated. A Stop that is part of a revival (a handoff's) is no
   interruption of its own.
 
   Each interruption is one control record, written by the owner only
@@ -758,7 +765,7 @@ the system. Its continuity is a design requirement, not a best effort:
 | `spawn loop` restarts or is replaced | The engine runs in tmux outside the loop's lifetime (`KillMode=process`); the next loop recovers the execution from the log and keeps observing it |
 | The engine process exits or crashes | The **recovery** (control layer, facts only, no model): the end is an `exited` or `crashed` interruption — a signal, a non-zero status or a terminal gone while its server lives — recorded once and `resume`d in the same native session at once, then after 10, 20, 40, 80 … s as resumes fail, capped at 640 s. A resume whose execution ends within a minute before any progress failed; three in a row hand off |
 | The machine reboots | tmux is gone, so every terminal in it died: the recovery records `host_restart` and resumes each execution by its key, within one pass of the loop's start |
-| The model API is overloaded, rate limited or unreachable, or the login expired | No execution ends: Claude Code writes its API error line and waits at its prompt. The recovery records `model_unavailable` or `model_auth` as the interruption and `wait`s: a retry after 60 s doubling to 4 minutes (or at the time a 429's text names), a probe of the credentials file every 10 s and one retry every 30 minutes while it does not change. The wait clears on the model's answer or the changed file, and the same native session goes on |
+| The model API is overloaded, rate limited or unreachable, or the login expired | No execution ends: Claude Code writes its API error line and waits at its prompt. The recovery records `model_unavailable` or `model_auth` as the interruption and `wait`s: a retry after 60 s doubling to 4 minutes (or at the time a 429's text names), a probe of the credentials file every 10 s and one retry every 30 minutes while it does not change. The wait clears on the model's answer or the changed file, and the same native session goes on. An engine that ends after the error is resumed after the backoff at most `SPAWN_RECOVER_MODEL_RETRIES` (3) times in a row, then the supervisor is told; one that ends after a request the model will never accept (`model_error`) is never revived, and the supervisor is told |
 | The context window is spent | `Prompt is too long` in an API error line: `context_exhausted`, and the handoff path below |
 | The engine's resource envelope kills it, or the disk fills | `memory_limit` (objective 029) resumes at once; `disk_full` waits until a reading of the workspace's filesystem is at or above `SPAWN_DISK_FLOOR_GB` |
 | Spawn's database is unreachable | The loop does not exit: only passes that could not reach it are not failed ones, the engines run on, and at the first pass that gets through the recovery records `database_unavailable` for each execution that lived through it, clears it, and the Bridge checkpoints what the engines wrote meanwhile |
@@ -1220,9 +1227,11 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
   on live runs. Nothing replays the playbook over recorded episodes.
 - **A write endpoint in the UI** (an input box to the supervisor). Humans
   act with `spawn submit --principal human`.
-- **More dispatcher rules:** stopping a COMPLETED one-shot task and
-  retrying after a transient API error (both escalate), and the actions
-  `restart` and `reassign`.
+- **More dispatcher rules:** stopping a COMPLETED one-shot task (it
+  escalates), and the actions `restart` and `reassign`. Retrying after a
+  transient API error is the recovery's (§3.1): bounded for an engine that
+  ended, unbounded for one at its prompt; telling the supervisor after N
+  live retries is not built.
 - **Ladder health over long periods.** The UI's figures cover the last 24 h.
 - **The backlog, scenarios and gate versioned with the source**
   (docs/storage.md).
