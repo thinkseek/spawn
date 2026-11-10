@@ -809,20 +809,27 @@ impl TerminalHost for TmuxHost {
         }
     }
 
-    /// Whether the server that holds every terminal is there. `list-sessions`
-    /// only asks: unlike `new-session` it never starts a server, so a
-    /// check after a host restart cannot make one appear and hide the fact
-    /// that every terminal died with it.
-    fn server_alive(&self) -> bool {
-        let Ok(run) = self.run(&["list-sessions".to_string()]) else {
-            return true;
+    /// The server that holds every terminal, and which one it is (its pid
+    /// and its start time, tmux's `#{pid}` and `#{start_time}`).
+    /// `list-sessions` only asks: unlike `new-session` it never starts a
+    /// server, so a check after a host restart cannot make one appear and
+    /// hide the fact that every terminal died with it.
+    fn server(&self) -> spawn_core::port::ServerSeen {
+        use spawn_core::port::ServerSeen;
+        let Ok(run) = self.run(&[
+            "list-sessions".to_string(),
+            "-F".to_string(),
+            "#{pid} #{start_time}".to_string(),
+        ]) else {
+            return ServerSeen::Answers(None);
         };
         match run.code {
+            Some(0) => ServerSeen::Answers(server_identity(&run.stdout)),
             // Exit 1 says no server answers, unless tmux said something
             // else (a socket we may not open, a failing tmux): that says
             // nothing about the terminals.
-            Some(1) if gone(&run.stderr) => false,
-            _ => true,
+            Some(1) if gone(&run.stderr) => ServerSeen::Gone,
+            _ => ServerSeen::Answers(None),
         }
     }
 
@@ -1052,6 +1059,18 @@ fn write_local(path: &str, bytes: &[u8]) -> Result<bool, TerminalError> {
 /// Whether tmux's error says the terminal does not exist: no such session,
 /// no server on the socket (or one shutting down), or no socket at all. A socket that may not be
 /// opened is not among them.
+/// The server a `list-sessions -F '#{pid} #{start_time}'` names: every line
+/// is the same server's; none (no session left) names nothing.
+fn server_identity(stdout: &str) -> Option<spawn_core::port::TerminalServer> {
+    let mut words = stdout.lines().next()?.split_whitespace();
+    let pid = words.next()?.parse().ok()?;
+    let started: i64 = words.next()?.parse().ok()?;
+    Some(spawn_core::port::TerminalServer {
+        pid,
+        started_at_ms: started.checked_mul(1000)?,
+    })
+}
+
 fn gone(stderr: &str) -> bool {
     stderr.contains("can't find session")
         || stderr.contains("no server running")
