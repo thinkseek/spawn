@@ -459,6 +459,10 @@ pub(crate) enum Why {
     /// An objective mission's backlog names an order that cannot be met
     /// ([`digest::objective_order`]): a condition until the backlog changes.
     ObjectiveOrder,
+    /// The integrator's drain reached its bound and stopped the gates still
+    /// running, which recorded nothing ([`digest::drain_expiries`]): their
+    /// tasks are judged again from nothing by the next integrator.
+    DrainExpired,
 }
 
 impl Why {
@@ -466,8 +470,9 @@ impl Why {
     /// once, it leaves nothing to resolve. A disk recovery, an approval, a
     /// human's message, a pair of host faults at the gate (the integrator
     /// judges again on its own), an expired hold (its landings resumed on
-    /// their own) and an objective closed solved on the base (nothing is
-    /// assigned for it again) are news. Every other item is a
+    /// their own), an objective closed solved on the base (nothing is
+    /// assigned for it again) and an expired drain (its gates run again
+    /// under the next integrator) are news. Every other item is a
     /// condition that holds while its facts do (a worker's state, a stall,
     /// a path still low on disk, a gate still without room): told, it stays
     /// in [`Plan::told`] until its facts change.
@@ -483,6 +488,7 @@ impl Why {
                 | Self::MainGreen
                 | Self::HoldExpired
                 | Self::ObjectiveSolved
+                | Self::DrainExpired
         )
     }
 }
@@ -773,6 +779,10 @@ pub(crate) fn read_plan(
     host.extend(digest::hold_expiries(&records(
         store.hold_expiries(),
         "source hold records",
+    )?));
+    host.extend(digest::drain_expiries(&records(
+        store.drain_expiries(),
+        "integrator drain records",
     )?));
     // Every timer the records read here name: the times at which this step
     // would decide something new even though nothing is appended meanwhile.
