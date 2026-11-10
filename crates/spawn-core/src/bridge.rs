@@ -2963,9 +2963,8 @@ impl Bridge {
         } else {
             format!("{}\n\n{text}", notices.join("\n\n"))
         };
-        // The message's id, on a line of its own after the whole text: the
-        // transcript line that holds it is the message taken
-        // ([`crate::message`]).
+        // The message's id, at the end of the whole text: the transcript
+        // line that holds it is the message taken ([`crate::message`]).
         let text = crate::message::marked(&text, claimed.command_id);
         let typed = {
             // A merge of main into the workspace waits while this types,
