@@ -463,6 +463,11 @@ pub(crate) enum Why {
     /// An objective mission's backlog names an order that cannot be met
     /// ([`digest::objective_order`]): a condition until the backlog changes.
     ObjectiveOrder,
+    /// A worker's engine ended on the model's error and the recovery will
+    /// not revive it: a request the model never accepts (`model_error`), or
+    /// a transient error whose retries are spent (`model_unavailable`)
+    /// ([`digest::model_finals`], told once).
+    ModelFinal,
 }
 
 impl Why {
@@ -471,7 +476,8 @@ impl Why {
     /// human's message, a pair of host faults at the gate (the integrator
     /// judges again on its own), an expired hold (its landings resumed on
     /// their own) and an objective closed solved on the base (nothing is
-    /// assigned for it again) are news. Every other item is a
+    /// assigned for it again) are news, as is a final model record (the
+    /// recovery decided; the supervisor acts on it or not). Every other item is a
     /// condition that holds while its facts do (a worker's state, a stall,
     /// a path still low on disk, a gate still without room): told, it stays
     /// in [`Plan::told`] until its facts change.
@@ -488,6 +494,7 @@ impl Why {
                 | Self::ShadowDisagrees
                 | Self::HoldExpired
                 | Self::ObjectiveSolved
+                | Self::ModelFinal
         )
     }
 }
@@ -782,6 +789,10 @@ pub(crate) fn read_plan(
     host.extend(digest::hold_expiries(&records(
         store.hold_expiries(),
         "source hold records",
+    )?));
+    host.extend(digest::model_finals(&records(
+        store.model_finals(),
+        "final model records",
     )?));
     // Every timer the records read here name: the times at which this step
     // would decide something new even though nothing is appended meanwhile.
