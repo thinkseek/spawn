@@ -154,6 +154,9 @@ export function deriveTrace(
   now: number,
   executions: readonly KnownExecution[] = [],
   commands: ReadonlyMap<string, KnownCommand> = new Map(),
+  /** The name of the session's agent (`supervisor`): a person's input
+   * reads `You → supervisor` ([`commandHead`]). None: `You → input`. */
+  to: string | null = null,
 ): Trace {
   const events = [...input].sort(compareEvents);
   const spans: Span[] = [];
@@ -308,7 +311,7 @@ export function deriveTrace(
         if (!id) break;
         // In words when the commands endpoint knows it (§4.3).
         const known = commands.get(id);
-        const span = open("command", known ? commandHead(known.principal, known.action) : `command ${id}`, event, null);
+        const span = open("command", known ? commandHead(known.principal, known.action, to) : `command ${id}`, event, null);
         if (known) span.summary = commandSummary(known.action, known.text);
         // A key never waits for the turn (backlog P1): one sent while inputs
         // still wait goes ahead of them, and the row says so.

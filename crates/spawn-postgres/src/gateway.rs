@@ -64,7 +64,8 @@ pub(crate) const SUBMIT: &str = "select spawn_gateway_submit($1, $2, $3, $4)";
 
 /// A person's input as the `spawn_human` login: the command made (or the one
 /// an earlier call with this key made), null when no agent has used the
-/// session. `$1` session, `$2` idempotency key, `$3` text.
+/// session, SQLSTATE 55000 when the session runs no execution. `$1`
+/// session, `$2` idempotency key, `$3` text.
 pub(crate) const HUMAN_INPUT: &str = "select spawn_human_input($1, $2, $3)";
 
 /// A person's key as the `spawn_human` login (`spawn_human_key`): the
@@ -73,32 +74,20 @@ pub(crate) const HUMAN_INPUT: &str = "select spawn_human_input($1, $2, $3)";
 /// execution. `$1` session, `$2` idempotency key, `$3` the key's name.
 pub(crate) const HUMAN_KEY: &str = "select spawn_human_key($1, $2, $3)";
 
-/// What became of a person's key ([`PostgresStore::submit_human_key`]).
+/// What became of a person's write from the page, an input or a key
+/// ([`PostgresStore::submit_human_input`], [`PostgresStore::submit_human_key`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HumanKey {
-    /// The command that presses it (a new one, or the one an earlier call
+pub enum HumanWrite {
+    /// The command that carries it (a new one, or the one an earlier call
     /// with this idempotency key made).
-    Submitted(CommandId),
-    /// No agent has used the session: there is nothing to press keys into.
-    NoAgent,
-    /// The session runs no execution, in the store's words: a key needs a
-    /// running engine. No command was made.
-    NotRunning(String),
-    /// The idempotency key is another request's (another session, another
-    /// key name, or an input), in the store's words. No command was made.
-    KeyUsed(String),
-}
-
-/// What became of a person's input ([`PostgresStore::submit_human_input`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HumanInput {
-    /// The command that types it (a new one, or the one an earlier call
-    /// with this idempotency key, session and text made).
     Submitted(CommandId),
     /// No agent has used the session: there is nothing to type into.
     NoAgent,
-    /// The idempotency key is another request's (another session, other
-    /// text, or a key), in the store's words. No command was made.
+    /// The session runs no execution, in the store's words: an input or a
+    /// key needs a running engine. No command was made.
+    NotRunning(String),
+    /// The idempotency key is another request's (another session, another
+    /// key name, or an input), in the store's words. No command was made.
     KeyUsed(String),
 }
 
@@ -109,6 +98,39 @@ fn key_used(error: &postgres::Error) -> Option<String> {
         .as_db_error()
         .filter(|db| *db.code() == postgres::error::SqlState::UNIQUE_VIOLATION)
         .map(|db| db.message().to_string())
+}
+
+/// What became of a person's key ([`HumanWrite`]).
+pub type HumanKey = HumanWrite;
+
+/// What became of a person's input ([`HumanWrite`]).
+pub type HumanInput = HumanWrite;
+
+/// The answer of `spawn_human_input` or `spawn_human_key`: its command, none
+/// for a session no agent has used, the refusal of a session that runs
+/// no execution (SQLSTATE 55000, its message the reason), or the refusal of
+/// an idempotency key another request used (SQLSTATE 23505).
+fn human_write(answer: Result<postgres::Row, postgres::Error>) -> Result<HumanWrite, StoreError> {
+    match answer {
+        Ok(row) => Ok(row
+            .get::<_, Option<i64>>(0)
+            .map_or(HumanWrite::NoAgent, |id| {
+                HumanWrite::Submitted(CommandId(id.unsigned_abs()))
+            })),
+        Err(error)
+            if error.as_db_error().is_some_and(|db| {
+                *db.code() == postgres::error::SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE
+            }) =>
+        {
+            let message = error
+                .as_db_error()
+                .map_or_else(String::new, |db| db.message().to_string());
+            Ok(HumanWrite::NotRunning(message))
+        }
+        Err(error) => key_used(&error)
+            .map(HumanWrite::KeyUsed)
+            .ok_or_else(|| crate::backend(&error)),
+    }
 }
 
 impl PostgresStore {
@@ -149,8 +171,6 @@ impl PostgresStore {
         Ok(CommandId(row.get::<_, i64>(0).unsigned_abs()))
     }
 
-    /// Type `text` into `session` as a person, through `spawn_human_input`:
-    /// the input `spawn submit --principal human` would submit to the
     /// Press `key` in `session` as a person, through `spawn_human_key`:
     /// the key command `spawn submit --principal human` would submit to the
     /// session's agent, with the same idempotency rule. Only a store
@@ -167,26 +187,7 @@ impl PostgresStore {
         let answer = self
             .lock()
             .query_one(HUMAN_KEY, &[&session.as_str(), &key.as_str(), &name.name()]);
-        match answer {
-            Ok(row) => Ok(row
-                .get::<_, Option<i64>>(0)
-                .map_or(HumanKey::NoAgent, |id| {
-                    HumanKey::Submitted(CommandId(id.unsigned_abs()))
-                })),
-            Err(error)
-                if error.as_db_error().is_some_and(|db| {
-                    *db.code() == postgres::error::SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE
-                }) =>
-            {
-                let message = error
-                    .as_db_error()
-                    .map_or_else(String::new, |db| db.message().to_string());
-                Ok(HumanKey::NotRunning(message))
-            }
-            Err(error) => key_used(&error)
-                .map(HumanKey::KeyUsed)
-                .ok_or_else(|| crate::backend(&error)),
-        }
+        human_write(answer)
     }
 
     /// Type `text` into `session` as a person, through `spawn_human_input`:
@@ -197,6 +198,10 @@ impl PostgresStore {
     /// ([`HumanInput::KeyUsed`]) and nothing is recorded. Only a store
     /// connected as the `spawn_human` login may call it (`role_url(owner,
     /// "spawn_human")`); that login can do nothing else.
+    /// [`HumanInput::NoAgent`] when no agent has used the session; a session
+    /// that runs no execution is refused ([`HumanInput::NotRunning`]) and
+    /// nothing is recorded, though a repeated key still returns its first
+    /// command (objective 040).
     pub fn submit_human_input(
         &self,
         session: &SessionId,
@@ -206,15 +211,6 @@ impl PostgresStore {
         let answer = self
             .lock()
             .query_one(HUMAN_INPUT, &[&session.as_str(), &key.as_str(), &text]);
-        match answer {
-            Ok(row) => Ok(row
-                .get::<_, Option<i64>>(0)
-                .map_or(HumanInput::NoAgent, |id| {
-                    HumanInput::Submitted(CommandId(id.unsigned_abs()))
-                })),
-            Err(error) => key_used(&error)
-                .map(HumanInput::KeyUsed)
-                .ok_or_else(|| crate::backend(&error)),
-        }
+        human_write(answer)
     }
 }
