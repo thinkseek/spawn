@@ -4806,26 +4806,59 @@ mod tests {
             Self::build(watch, true)
         }
 
+        /// A Bridge that copies the transcripts into the store's archive.
+        fn archived() -> Self {
+            Self::build_with(Arc::new(MemoryWatch::new()), true, true)
+        }
+
+        fn config(watch: &Arc<MemoryWatch>) -> BridgeConfig {
+            let mut config = BridgeConfig::new("tester");
+            config.claude_projects = "/projects".to_string();
+            config.screen_quiet = Duration::from_millis(500);
+            config.screen_refresh = Duration::from_secs(30);
+            config.watch = Some(watch.clone());
+            config
+        }
+
+        /// The loop restarted: a new Bridge over the same store, archive and
+        /// clock, rebuilt from the log (and the archive's records).
+        fn restart(&mut self) {
+            let watch = Arc::new(MemoryWatch::new());
+            self.watch = watch.clone();
+            self.bridge = Bridge::new(
+                self.store.clone(),
+                self.store.clone(),
+                self.store.clone(),
+                self.terminal.clone(),
+                Self::config(&watch),
+            )
+            .with_clock(self.clock.clone())
+            .with_transcript_archive(self.store.clone());
+            self.bridge.recover().expect("recover");
+        }
+
         fn build(watch: Arc<MemoryWatch>, settle: bool) -> Self {
+            Self::build_with(watch, settle, false)
+        }
+
+        fn build_with(watch: Arc<MemoryWatch>, settle: bool, archive: bool) -> Self {
             let clock: Arc<ManualClock> = Arc::new(ManualClock::new(Timestamp(1_000)));
             let store = Arc::new(MemoryStore::new("shop", clock.clone()));
             let terminal = Arc::new(Counted {
                 inner: store.clone(),
                 captures: Mutex::new(0),
             });
-            let mut config = BridgeConfig::new("tester");
-            config.claude_projects = "/projects".to_string();
-            config.screen_quiet = Duration::from_millis(500);
-            config.screen_refresh = Duration::from_secs(30);
-            config.watch = Some(watch.clone());
             let mut bridge = Bridge::new(
                 store.clone(),
                 store.clone(),
                 store.clone(),
                 terminal.clone(),
-                config,
+                Self::config(&watch),
             )
             .with_clock(clock.clone());
+            if archive {
+                bridge = bridge.with_transcript_archive(store.clone());
+            }
             let execution = ExecutionId::for_command(CommandId(1));
             store.set_pane(&TerminalName::for_execution(&execution), READY);
             store
@@ -5136,6 +5169,148 @@ mod tests {
     /// A terminal killed from outside ends its execution on the next pass,
     /// as before: the fleet's liveness is one call per pass, not a capture
     /// and not a call per agent.
+    /// A model call at `seconds` past the epoch, as Claude Code writes one.
+    fn call_line(id: &str, seconds: u32) -> String {
+        format!(
+            "{{\"type\":\"assistant\",\"uuid\":\"{id}\",\"timestamp\":\"1970-01-01T00:00:{seconds:02}.000Z\",\
+             \"message\":{{\"id\":\"msg_{id}\",\"model\":\"m\",\"usage\":{{\"input_tokens\":10,\
+             \"output_tokens\":1}}}}}}\n"
+        )
+    }
+
+    impl World {
+        fn agent() -> AgentId {
+            AgentId::new("agent_one").expect("agent")
+        }
+
+        /// The archive's one progress record.
+        fn progress(&self) -> crate::transcripts::ArchiveProgress {
+            let mut records =
+                crate::port::TranscriptArchive::progress(self.store.as_ref()).expect("progress");
+            assert_eq!(records.len(), 1, "one native session: {records:?}");
+            records.remove(0)
+        }
+
+        fn settling(&self, until_ms: i64) -> bool {
+            crate::transcripts::settling(
+                &crate::port::TranscriptArchive::progress(self.store.as_ref()).expect("progress"),
+                until_ms,
+            )
+        }
+
+        /// What the archive holds of the session's transcript.
+        fn archived(&self) -> String {
+            let native = self.progress().native;
+            let copies = crate::port::TranscriptArchive::copies(self.store.as_ref(), &Self::agent(), &native)
+                .expect("copies");
+            copies
+                .iter()
+                .enumerate()
+                .map(|(copy, _)| {
+                    let bytes = crate::port::TranscriptArchive::read(
+                        self.store.as_ref(),
+                        &Self::agent(),
+                        &native,
+                        copy,
+                        0,
+                        usize::MAX,
+                    )
+                    .expect("read");
+                    String::from_utf8(bytes).expect("utf-8")
+                })
+                .collect()
+        }
+    }
+
+    /// Objective 47 (a): a model call of a turn that is still running is in
+    /// the archive within a pass of being written, not at the turn's end;
+    /// nothing is copied when nothing was added, and the progress record
+    /// says until when the transcript is known.
+    #[test]
+    fn a_running_turn_is_archived_within_a_pass() {
+        let mut world = World::archived();
+        world.advance(20_000);
+        let first = call_line("c1", 18);
+        world.engine_writes(&first);
+        world.tick();
+        assert!(world.archived().contains(&first), "the call is archived mid-turn");
+        let progress = world.progress();
+        assert!(progress.live);
+        assert_eq!(progress.behind_ms, None);
+        assert_eq!(progress.known_ms, 21_000 - super::ARCHIVE_SLACK_MS);
+        // Nothing added: nothing copied, and the window up to the read is
+        // settled while a later one is not yet known.
+        let length = world.archived().len();
+        world.tick();
+        assert_eq!(world.archived().len(), length);
+        assert!(!world.settling(19_000));
+        assert!(world.settling(22_000), "not read since the window's end");
+        // An idle execution is known on as the passes go: it holds no
+        // window open once read past its end.
+        world.advance(5_000);
+        world.tick();
+        assert!(!world.settling(22_000), "{:?}", world.progress());
+        let second = call_line("c2", 27);
+        world.engine_writes(&second);
+        world.tick();
+        assert!(world.archived().ends_with(&second));
+        assert_eq!(world.archived().matches("msg_c1").count(), 1, "copied once");
+    }
+
+    /// Objective 47 (a), (b): a copy that fails is warned once and made
+    /// again on every pass, live, after the execution ended, and after a
+    /// restart, which reads what is still to copy from the records; while
+    /// it fails, a window ending after the first line the archive lacks is
+    /// settling, and one ending before it is not.
+    #[test]
+    fn a_failed_copy_holds_the_window_open_until_it_is_made_across_an_end_and_a_restart() {
+        let mut world = World::archived();
+        world.advance(20_000);
+        world.store.hold_archive(&World::agent(), true);
+        world.engine_writes(&call_line("c1", 19));
+        let warnings = world.tick();
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|warning| warning.contains("archive the transcript"))
+                .count(),
+            1,
+            "{warnings:?}"
+        );
+        assert!(
+            !world.tick().iter().any(|warning| warning.contains("archive the transcript")),
+            "the same failure is warned once"
+        );
+        let progress = world.progress();
+        assert_eq!(progress.behind_ms, Some(19_000));
+        assert!(world.settling(19_500), "a call before the end is not archived");
+        assert!(!world.settling(18_500), "a call after the end holds nothing open");
+        // The execution ends, its transcript still not archived.
+        world.store.untrack(
+            &TerminalName::for_execution(&ExecutionId::for_command(CommandId(1))),
+            "gone",
+        );
+        world.tick();
+        world.tick();
+        let progress = world.progress();
+        assert!(!progress.live, "the record says it ended");
+        assert_eq!(progress.behind_ms, Some(19_000));
+        assert!(world.settling(19_500));
+        assert!(!world.settling(18_500));
+        // The loop restarts: what is still to copy is read back.
+        world.restart();
+        world.tick();
+        assert!(world.settling(19_500), "{:?}", world.progress());
+        assert!(world.archived.is_empty() || world.archived().is_empty());
+        // The archive takes writes again: the next pass copies and settles.
+        world.store.hold_archive(&World::agent(), false);
+        world.tick();
+        assert!(world.archived().contains("msg_c1"));
+        assert!(!world.settling(19_500), "{:?}", world.progress());
+        assert!(!world.settling(i64::MAX), "an ended execution, all archived");
+        assert!(world.bridge.ended_archives.lock().expect("lock").is_empty());
+    }
+
     #[test]
     fn a_killed_terminal_ends_its_execution_on_the_next_pass() {
         let mut world = World::new();
