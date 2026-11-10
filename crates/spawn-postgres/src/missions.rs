@@ -112,7 +112,9 @@ from (
                     and c.idempotency_key like 'cancel-notice-' || k.id || '-%'
                     and c.succeeded) as told,
          last.type as closed_by, last.reason, last.yield_reason,
-         coalesce(last.yielded, false) as yielded
+         coalesce(last.yielded, false) as yielded,
+         (select n.id from mission_tasks n where n.reassign_of = k.id order by n.id limit 1)
+           as reassigned_as
     from latest k
     left join lateral (
       select e.id, (e.kind -> 'detail' -> 'record' ->> 'command_id')::bigint as command_id
