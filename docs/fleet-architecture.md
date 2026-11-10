@@ -1113,9 +1113,11 @@ A message's id is its command's id, carried end to end:
 
 - **The marker.** The text the Bridge types for a command ends with the
   command's marker, `[spawn message #<command id>]`, on a line of its own
-  after the text (the workspace notices typed before the text are part of
-  the same message; `crates/spawn-core/src/message.rs`, the Bridge's
-  `type_once`). Every typing carries it: an input, and a start's or a
+  after a text of several lines (the workspace notices typed before the text
+  are part of the same message), and after a space at the end of a text of
+  one line, so a one-line message stays one line: a pane that reads a paste
+  without bracketed paste takes each line break as Enter
+  (`crates/spawn-core/src/message.rs`, the Bridge's `type_once`). Every typing carries it: an input, and a start's or a
   resume's prompt. The Bridge records `message.typed` (keyed
   `cmd_<id>:message`) once the marked text is staged and before its
   `typing` step: the record that says this command's text carried the
