@@ -1110,6 +1110,33 @@ pub(crate) fn gate_host_fault_fields(
     faults: u32,
     backoff: Duration,
 ) -> Value {
+    if let GateFailure::ValidatorDefect {
+        scenario,
+        runs,
+        reason,
+        defects,
+        log,
+    } = failure
+    {
+        return json!({
+            "reason": format!(
+                "validator defect: {} fails on the candidate and on the base, run again now \
+                 ({runs}): the scenario's, not the work's and not the host's; never a \
+                 rejection; fix it or put it on the owner's `quarantined` list; not a verdict \
+                 on the work, judged again in {}",
+                defects.join(", "),
+                spoken(backoff)
+            ),
+            "log": log,
+            "evidence": gate::VALIDATOR_DEFECT,
+            "validator_defects": defects,
+            "fact": {"scenario": scenario, "on": "candidate and base", "runs": runs,
+                     "reason": reason},
+            "host_faults": faults,
+            "backoff_ms": u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+            "escalate": faults == HOST_FAULT_ESCALATE_AT,
+        });
+    }
     let GateFailure::HostFault {
         scenario,
         on,
@@ -3430,6 +3457,10 @@ impl Judge {
         // them and clears it when a later gate of the mission no longer
         // names one.
         let red_scenarios: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        // `quarantined`: the regressions the owner's list kept from running
+        // (gate.sh), named on the record so a gate that judged without them
+        // says so.
+        let quarantined: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
         // A gate on a main that is red (design-main-red.md) runs only as a
         // probe ([`Integrator::red_holds`]): its record says so.
         let probe = mission.red.as_ref().is_some_and(|red| red.main == main);
@@ -3543,6 +3574,9 @@ impl Judge {
             }
             if !flakes.borrow().is_empty() {
                 record_value["flakes"] = json!(*flakes.borrow());
+            }
+            if !quarantined.borrow().is_empty() {
+                record_value["quarantined"] = json!(*quarantined.borrow());
             }
             if !red_scenarios.borrow().is_empty() {
                 record_value["main_red_scenarios"] = json!(*red_scenarios.borrow());
@@ -3725,6 +3759,7 @@ impl Judge {
         if let Ok(verdict) = &judged {
             flakes.replace(verdict.flakes.clone());
             red_scenarios.replace(verdict.main_red_scenarios.clone());
+            quarantined.replace(verdict.quarantined.clone());
         }
         // The red check passed on this base before the candidate ran: main
         // of the source is green on it again, whatever the gate ended with
@@ -3955,7 +3990,14 @@ impl Judge {
             // scenario's harness error on the base, or a check failing on
             // the candidate and the base. `host_fault`: retried after a
             // backoff, never counted toward a halt.
-            Err(failure @ GateFailure::HostFault { .. }) => {
+            // A regression failing on the candidate and on the base, run
+            // again now, is the validator's defect, never a rejection, and
+            // no verdict for a task's candidate (gate.sh's "Three classes
+            // of a failing regression"): `host_fault` with its own evidence,
+            // so the record and its escalation say what it is.
+            Err(
+                failure @ (GateFailure::HostFault { .. } | GateFailure::ValidatorDefect { .. }),
+            ) => {
                 let mut extra = self.gate_host_fault(mission, task.id, &failure);
                 extra["candidate"] = json!(candidate);
                 gated("host_fault", extra)
@@ -4075,7 +4117,8 @@ fn gate_log(judged: &Result<gate::Verdict, GateFailure>) -> Option<&str> {
             | GateFailure::HostFault { log, .. }
             | GateFailure::MainRed { log, .. }
             | GateFailure::CannotJudge { log, .. }
-            | GateFailure::BaseDisagrees { log, .. },
+            | GateFailure::BaseDisagrees { log, .. }
+            | GateFailure::ValidatorDefect { log, .. },
         ) => Some(log),
     }
 }
@@ -4794,6 +4837,17 @@ fn aborted(failure: &GateFailure) -> Value {
         } => {
             json!({"reason": format!("the gate found {scenario} failing on the {on}"), "log": log})
         }
+        // Recorded as `host_fault` with evidence `validator_defect` by the
+        // caller; counted here only if a caller forgets that.
+        GateFailure::ValidatorDefect { defects, log, .. } => json!({
+            "reason": format!(
+                "validator defect: {} fails on the base too; not a verdict on the work",
+                defects.join(", ")
+            ),
+            "evidence": gate::VALIDATOR_DEFECT,
+            "validator_defects": defects,
+            "log": log,
+        }),
         // Recorded as `host_fault` with evidence `main_red` (or as the
         // host's) by the caller; counted here only if a caller forgets that.
         GateFailure::MainRed { scenario, log, .. } => json!({
@@ -13135,6 +13189,72 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&marks);
     }
 
+    /// An owner's gate runs with SPAWN_GATE_OWNER_CANDIDATE=1 and a task's
+    /// without it (review-fix-gate.md): the owner's accepted landing names
+    /// the validators the gate judged it without, failing on the base too,
+    /// and those the owner's list kept from running, on its `source.moved`;
+    /// a task's gate that ends on a validator defect is a host fault with
+    /// its own evidence, `validator_defect`, naming them, never capped.
+    #[test]
+    fn an_owner_gate_is_told_it_is_the_owners_and_a_validator_defect_is_named() {
+        let marks = fresh_marks("spawn-owner-candidate");
+        let seen = marks.to_string_lossy().to_string();
+        let gate = format!(
+            "echo \"${{SPAWN_GATE_OWNER_CANDIDATE:-unset}}\" >>'{seen}/owner'\n\
+             if [ \"${{SPAWN_GATE_OWNER_CANDIDATE-}}\" = 1 ]; then\n\
+             printf '%s\\n' '{{\"v\":1,\"verdict\":\"accepted\",\"validator_defects\":[\"028.sh\",\"../x.sh\"],\"quarantined\":[\"031.sh\"]}}' >\"$SPAWN_GATE_VERDICT\"\n\
+             exit 0\nfi\n\
+             printf '%s\\n' '{{\"v\":1,\"host_fault\":true,\"scenario\":\"028.sh\",\"on\":\"candidate and base\",\"runs\":\"1, then 1 on the candidate; 1 on the base, run now\",\"reason\":\"validator defect: 028.sh fails on the base too\",\"evidence\":\"validator_defect\",\"validator_defects\":[\"028.sh\"]}}' >\"$SPAWN_GATE_VERDICT\"\n\
+             exit 6\n"
+        );
+        let (base, source, scenarios, integrator) = world("owner-candidate", &gate);
+        let db = Db::new("owner_candidate");
+        let mission = db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("D.md", "d\n")],
+            "owner: d",
+        );
+        gated_request(&db, &source, &commit, "d");
+        integrator.pass_on(&db.store).expect("the owner's judging");
+        integrator.settle();
+        let moved = control_records(&db, "source.moved");
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(moved[0]["verdict"], "accepted");
+        assert_eq!(
+            moved[0]["validator_defects"],
+            json!(["028.sh"]),
+            "{}",
+            moved[0]
+        );
+        assert_eq!(moved[0]["quarantined"], json!(["031.sh"]), "{}", moved[0]);
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        push_work(&base, &source, &agent, "work.txt");
+        integrator.pass_on(&db.store).expect("the task's judging");
+        integrator.settle();
+        assert_eq!(verdicts(&db, task), vec!["host_fault"]);
+        let gated = control_records(&db, "task.gated");
+        let fault = gated.last().expect("the task's record");
+        assert_eq!(fault["evidence"], "validator_defect", "{fault}");
+        assert_eq!(fault["validator_defects"], json!(["028.sh"]), "{fault}");
+        assert_eq!(fault["fact"]["on"], "candidate and base", "{fault}");
+        assert!(
+            fault["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("validator defect: 028.sh fails")),
+            "{fault}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(marks.join("owner")).expect("seen"),
+            "1\nunset\n",
+            "the owner's gate only"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
+    }
+
     /// A gated owner's push whose candidate has no scenarios directory
     /// where the mission's is cannot be judged by it: refused, verdict
     /// `no_scenarios`, the owner's to fix; nothing moves.
@@ -13641,6 +13761,27 @@ mod database_tests {
         integrator.settle();
         let (record, _, _) = last_verdict(&db);
         assert_eq!(record["main_red_scenarios"], json!(["046.sh"]), "{record}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A gate verdict's `quarantined` (the regressions the owner's list
+    /// kept from running) is on the task's `task.gated` record.
+    #[test]
+    fn a_verdicts_quarantined_are_on_its_record() {
+        let gate = "printf '{\"verdict\":\"accepted\",\"quarantined\":[\"028.sh\"]}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+        let (base, source, scenarios, integrator) = world("gate-quarantined", gate);
+        let db = Db::new("gate_quarantined");
+        let mission = db.gated_mission(&source, &scenarios);
+        let _task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["quarantined"], json!(["028.sh"]), "{record}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

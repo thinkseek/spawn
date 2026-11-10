@@ -3254,13 +3254,18 @@ begin
     -- `gate`); the gate's own test server that did not start
     -- (`test_server_never_started`: on `test server`, runs `never started`,
     -- scenario `test server`, and which start as its tree: `gate` or
-    -- `candidate`); and its backoff.
+    -- `candidate`); a validator's defect (`validator_defect`: on `candidate
+    -- and base`, a scenario, and `validator_defects` naming at least one
+    -- script, `<name>.sh`: a regression failing on the candidate and on the
+    -- base, run again now, gate.sh's "Three classes of a failing
+    -- regression"); and its backoff.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
        and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log',
                                                           'base_disagrees', 'gate',
                                                           'cannot_judge',
                                                           'sandbox_never_started', 'main_red',
-                                                          'test_server_never_started')
+                                                          'test_server_never_started',
+                                                          'validator_defect')
             or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
             or (p_record ->> 'evidence' in ('failures', 'server_log')
                 and (case when jsonb_typeof(p_record -> 'failures') = 'array'
@@ -3282,6 +3287,15 @@ begin
             or (p_record ->> 'evidence' = 'gate'
                 and (coalesce(p_record -> 'fact' ->> 'scenario', '') !~ '^[^[:space:]|]+$'
                      or coalesce(p_record -> 'fact' ->> 'on', '') not in ('base', 'candidate and base')))
+            or (p_record ->> 'evidence' = 'validator_defect'
+                and (coalesce(p_record -> 'fact' ->> 'scenario', '') !~ '^[^[:space:]|]+$'
+                     or p_record -> 'fact' ->> 'on' is distinct from 'candidate and base'
+                     or jsonb_typeof(p_record -> 'validator_defects') is distinct from 'array'
+                     or jsonb_array_length(p_record -> 'validator_defects') = 0
+                     or exists (select 1
+                                  from jsonb_array_elements(p_record -> 'validator_defects') d
+                                 where jsonb_typeof(d) <> 'string'
+                                    or d #>> '{}' !~ '^[^/[:space:]]+\.sh$')))
             or (p_record ->> 'evidence' = 'cannot_judge'
                 and (coalesce(p_record ->> 'scenario', '') !~ '^[^[:space:]|]+$'
                      or jsonb_typeof(p_record -> 'escalate') is distinct from 'boolean'))

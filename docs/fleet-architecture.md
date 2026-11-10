@@ -966,7 +966,14 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   the same scenario, on an ancestor of the base and unsolved on it, which
   scripts/rsi/gate.sh reads from the solved index beside its base cache; one
   per mission and scenario while red, cleared at the first later `accepted`
-  gating of the mission that does not name it), `task_undelivered` (assigned longer than
+  gating of the mission that does not name it), `validator_defect` (a
+  regression that fails on the base too, run again in the gate: from a
+  task's `host_fault` with evidence `validator_defect`, cleared at the
+  mission's next `accepted` or `rejected` gating; or from an owner's
+  accepted landing whose `source.moved` names it in `validator_defects`, for
+  each mission it moved, cleared only once a gate of the mission names it
+  `quarantined`, since a later gate that does not name it may have read it
+  unsolved on the base rather than passed), `task_undelivered` (assigned longer than
   `SPAWN_ALERT_UNDELIVERED_SECS`, default 300, while its agent holds no
   delivered or reported task), `mission_halted` (cleared at its
   `mission.resumed`), `postgres_crash` (a `terminated by signal`, `No space
@@ -2136,9 +2143,14 @@ are per-agent uids or a mount per engine.
   `main` is neither held nor refused for a red it did not cause (else it
   would have to go ungated). Only the tests `main` fails are unsolved: a
   test the candidate newly fails inside the red check, or a run of it that
-  names no failed test, is the push's regression. Accepted: under the landing lock, the
+  names no failed test, is the push's regression. The owner's gate also
+  runs with `SPAWN_GATE_OWNER_CANDIDATE=1`: a regression that fails on M
+  too, run again after the candidate's runs, is a validator's defect, not
+  the push's, and the gate judges the rest (a task's gate gives no verdict
+  then, a `host_fault` with evidence `validator_defect`). Accepted: under the landing lock, the
   candidate is pushed to `main` with a lease on M, and `source.moved`
-  names `verdict` `accepted`. Rejected (or a candidate without the
+  names `verdict` `accepted`, with the gate's `validator_defects` and
+  `quarantined` when it names any (the `validator_defect` alert). Rejected (or a candidate without the
   mission's scenarios directory, `no_scenarios`): `source.push_refused`
   with `verdict` and the gate's `log`; nothing moves and no mission counts
   it. No verdict (the host's fault, an abort, which is a harness error, no
