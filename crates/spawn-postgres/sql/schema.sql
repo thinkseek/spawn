@@ -1644,21 +1644,34 @@ begin
         at_ms = least(c.at_ms, excluded.at_ms),
         event_id = greatest(c.event_id, excluded.event_id),
         event_at_ms = greatest(c.event_at_ms, excluded.event_at_ms),
-        (input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, usd, rates,
-         recorded_at_ms) =
-            (select case when larger then excluded.input_tokens else c.input_tokens end,
-                    case when larger then excluded.output_tokens else c.output_tokens end,
-                    case when larger then excluded.cache_write_tokens
-                         else c.cache_write_tokens end,
-                    case when larger then excluded.cache_read_tokens
-                         else c.cache_read_tokens end,
-                    case when larger then excluded.usd else c.usd end,
-                    case when larger then excluded.rates else c.rates end,
-                    case when larger then excluded.recorded_at_ms else c.recorded_at_ms end
-               from (select excluded.input_tokens + excluded.output_tokens
-                            + excluded.cache_write_tokens + excluded.cache_read_tokens
-                            > c.input_tokens + c.output_tokens + c.cache_write_tokens
-                              + c.cache_read_tokens as larger) l);
+        input_tokens = case when (excluded.input_tokens + excluded.output_tokens + excluded.cache_write_tokens
+                 + excluded.cache_read_tokens
+                 > c.input_tokens + c.output_tokens + c.cache_write_tokens + c.cache_read_tokens)
+            then excluded.input_tokens else c.input_tokens end,
+        output_tokens = case when (excluded.input_tokens + excluded.output_tokens + excluded.cache_write_tokens
+                 + excluded.cache_read_tokens
+                 > c.input_tokens + c.output_tokens + c.cache_write_tokens + c.cache_read_tokens)
+            then excluded.output_tokens else c.output_tokens end,
+        cache_write_tokens = case when (excluded.input_tokens + excluded.output_tokens + excluded.cache_write_tokens
+                 + excluded.cache_read_tokens
+                 > c.input_tokens + c.output_tokens + c.cache_write_tokens + c.cache_read_tokens)
+            then excluded.cache_write_tokens else c.cache_write_tokens end,
+        cache_read_tokens = case when (excluded.input_tokens + excluded.output_tokens + excluded.cache_write_tokens
+                 + excluded.cache_read_tokens
+                 > c.input_tokens + c.output_tokens + c.cache_write_tokens + c.cache_read_tokens)
+            then excluded.cache_read_tokens else c.cache_read_tokens end,
+        usd = case when (excluded.input_tokens + excluded.output_tokens + excluded.cache_write_tokens
+                 + excluded.cache_read_tokens
+                 > c.input_tokens + c.output_tokens + c.cache_write_tokens + c.cache_read_tokens)
+            then excluded.usd else c.usd end,
+        rates = case when (excluded.input_tokens + excluded.output_tokens + excluded.cache_write_tokens
+                 + excluded.cache_read_tokens
+                 > c.input_tokens + c.output_tokens + c.cache_write_tokens + c.cache_read_tokens)
+            then excluded.rates else c.rates end,
+        recorded_at_ms = case when (excluded.input_tokens + excluded.output_tokens + excluded.cache_write_tokens
+                 + excluded.cache_read_tokens
+                 > c.input_tokens + c.output_tokens + c.cache_write_tokens + c.cache_read_tokens)
+            then excluded.recorded_at_ms else c.recorded_at_ms end;
     get diagnostics v_count = row_count;
     return v_count;
 end $$;
