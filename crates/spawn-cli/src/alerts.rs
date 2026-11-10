@@ -3243,14 +3243,14 @@ connections\n";
         assert!(matches!(&raised[..], [Event::Clear { key, .. }] if key == "cost_budget:4:2026-11-10"));
         assert!(read(&mut monitor, noon + 8000, reading(2.5, 2.0)).is_empty());
         // The next UTC day is a new occurrence.
-        let tomorrow = noon + DAY_MS;
+        let tomorrow = noon + super::DAY_MS;
         let next = read(&mut monitor, tomorrow, reading(0.6, 0.5));
         assert_eq!(fires(&next), ["cost_budget:4:2026-11-11"]);
         // Its day over: cleared at the next day's first reading.
-        let after = read(&mut monitor, tomorrow + DAY_MS, reading(0.1, 0.5));
+        let after = read(&mut monitor, tomorrow + super::DAY_MS, reading(0.1, 0.5));
         assert!(matches!(&after[..], [Event::Clear { key, .. }] if key == "cost_budget:4:2026-11-11"));
         // A budget removed clears its open alert.
-        let third = tomorrow + DAY_MS + 1000;
+        let third = tomorrow + super::DAY_MS + 1000;
         assert_eq!(fires(&read(&mut monitor, third, reading(0.7, 0.5))), ["cost_budget:4:2026-11-12"]);
         let removed = read(&mut monitor, third + 1000, json!([]));
         assert!(matches!(&removed[..], [Event::Clear { key, .. }] if key == "cost_budget:4:2026-11-12"));
