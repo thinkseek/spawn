@@ -165,7 +165,8 @@
 //!   its marker) that no `message.taken` names `SPAWN_MESSAGE_TAKEN_SECS`
 //!   (default 120) after it was recorded (`spawn_command_message`): typed
 //!   and never taken, or never typed. A command an older Spawn typed carries
-//!   no marker (no `message.typed`) and is never one. Once per message;
+//!   no marker (no `message.typed`) and is never one, nor is one sent while
+//!   its session's transcript had held no marker yet. Once per message;
 //!   clears when it is taken, or when its session ends with it untaken (the
 //!   execution it was typed into, or its own start's, ended). A message
 //!   whose session ended first fires nothing. Read on start (every message
