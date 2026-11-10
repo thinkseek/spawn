@@ -373,6 +373,31 @@ pub enum EventKind {
         /// Output tokens when reported.
         output_tokens: Option<u64>,
     },
+    /// One model call's usage, read from an assistant line of the
+    /// execution's transcript (crate::ingest's `claude_usage`): the engine
+    /// writes one line per content block, each repeating the message's id,
+    /// model and usage, so the event is keyed by the message id and its four
+    /// counts. A repeat appends nothing, and a line with a larger usage is
+    /// one more event the cost step folds into the same message (its largest
+    /// usage, its earliest time). The cost step prices it (crate spawn-cli,
+    /// `cost`).
+    #[serde(rename = "model.usage")]
+    ModelUsage {
+        /// The engine's `message.id`.
+        message_id: String,
+        /// The engine's `message.model`.
+        model: String,
+        /// The line's own time (`timestamp`), epoch milliseconds.
+        at_ms: i64,
+        /// `input_tokens`.
+        input_tokens: u64,
+        /// `output_tokens`.
+        output_tokens: u64,
+        /// `cache_creation_input_tokens`.
+        cache_write_tokens: u64,
+        /// `cache_read_input_tokens`.
+        cache_read_tokens: u64,
+    },
     /// The turn ended with an engine or API failure.
     ///
     /// Claude Code fails a turn by writing an API error line to its
@@ -586,6 +611,7 @@ impl EventKind {
             Self::ToolCompleted { .. } => "tool.completed",
             Self::ToolFailed { .. } => "tool.failed",
             Self::TurnStopped { .. } => "turn.stopped",
+            Self::ModelUsage { .. } => "model.usage",
             Self::TurnFailed { .. } => "turn.failed",
             Self::JobStarted { .. } => "job.started",
             Self::JobEnded { .. } => "job.ended",
