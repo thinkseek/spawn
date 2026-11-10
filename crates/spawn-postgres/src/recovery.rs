@@ -98,7 +98,8 @@ select exists (
 ///   with its outcome: what a restarted loop reads to know what it sent.
 /// - `executions`: every execution of the session, oldest first — when it
 ///   ran, how long, the key of the command that started it, and whether it
-///   made progress (a tool call completed or a turn ended). The resume rule
+///   made progress (a tool call completed or a turn ended), and the cause of
+///   the latest interruption recorded for it (`last_cause`). The resume rule
 ///   counts the ones a revival started that died young ([`crate
 ///   `spawn-cli::recover`'s `resume_failed`]).
 /// - `head`: the commit of the agent's latest `artifact.committed`, which a
@@ -179,7 +180,14 @@ with x as (
             'progress', exists (select 1 from spawn_events p
                                  where p.session_id = $1
                                    and p.execution_id = e.execution_id
-                                   and p.event_name in ('tool.completed', 'turn.stopped')))
+                                   and p.event_name in ('tool.completed', 'turn.stopped')),
+            'last_cause', (select r.kind -> 'detail' -> 'record' ->> 'cause'
+                             from spawn_events r
+                            where r.session_id = 'session_control'
+                              and r.event_name = 'control.recorded'
+                              and r.kind -> 'detail' -> 'record' ->> 'type' = 'execution.interrupted'
+                              and r.kind -> 'detail' -> 'record' ->> 'execution_id' = e.execution_id
+                            order by r.id desc limit 1))
             order by e.started_at_ms, e.execution_id), '[]'::jsonb) as list
     from ex e
 )
@@ -259,7 +267,46 @@ select exists (
      and r.kind -> 'detail' -> 'record' ->> 'type' = 'execution.interrupted'
      and r.kind -> 'detail' -> 'record' ->> 'session_id' = $1)";
 
+/// The recovery's final model records the supervisor was not told of yet,
+/// oldest first: every `execution.interrupted` on the `final` path whose
+/// cause is `model_error` (a request the model will never accept) or
+/// `model_unavailable` (a transient error's retries spent), as `{event_id,
+/// at_ms, session_id, agent_id, execution_id, cause, status, error, text,
+/// retries}`. Told is a record, as for the integrator's expired holds: a
+/// digest that reached the supervisor carrying the tag
+/// `<session> model-<execution_id>`, however long ago.
+pub(crate) const MODEL_FINALS: &str = r"
+with told as (
+  select distinct tag
+    from spawn_commands d
+   cross join lateral jsonb_array_elements_text(
+           case when jsonb_typeof(d.action -> 'tags') = 'array'
+                then d.action -> 'tags' else '[]'::jsonb end) tag
+   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
+)
+select coalesce(jsonb_agg(jsonb_build_object(
+         'event_id', e.id, 'at_ms', e.recorded_at_ms,
+         'session_id', x.r ->> 'session_id', 'agent_id', x.r ->> 'agent_id',
+         'execution_id', x.r ->> 'execution_id', 'cause', x.r ->> 'cause',
+         'status', x.r -> 'evidence' -> 'status', 'error', x.r -> 'evidence' -> 'error',
+         'text', x.r -> 'evidence' -> 'text', 'retries', x.r -> 'evidence' -> 'retries')
+         order by e.id), '[]'::jsonb)
+  from spawn_events e
+ cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' = 'execution.interrupted'
+   and x.r ->> 'path' = 'final'
+   and x.r ->> 'cause' in ('model_error', 'model_unavailable')
+   and not exists (select 1 from told
+                    where tag = (x.r ->> 'session_id') || ' model-' || (x.r ->> 'execution_id'))";
+
 impl PostgresStore {
+    /// The final model records not told to the supervisor yet
+    /// ([`MODEL_FINALS`]).
+    pub fn model_finals(&self) -> Result<Value, StoreError> {
+        self.query_json(MODEL_FINALS, &[])
+    }
+
     /// The sessions the recovery looks at ([`RECOVERY_SESSIONS`]).
     pub fn recovery_sessions(&self) -> Result<Value, StoreError> {
         self.query_json(RECOVERY_SESSIONS, &[&RECENT_MS])

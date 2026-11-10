@@ -23,6 +23,13 @@
 # updates the tables. Runs inside the gate's sandbox (scripts/rsi/gate.sh):
 # needs SPAWN_BIN and SPAWN_TEST_DATABASE_URL, creates and drops its own
 # database, no tmux, no network.
+#
+# What a run reads of the tree under test, all of it (scripts/rsi/gate.sh
+# "Results reused from the base"): SPAWN_BIN, run for init-db, mission
+# add/close, resident propose/approve/retire, task assign/accept/stages and
+# submit, none of which reads the working directory; everything else is the
+# controller's scripts, psql and a scratch directory of its own.
+# reads: binary
 set -eu
 
 asserted=""

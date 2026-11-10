@@ -149,7 +149,11 @@ release build, the binary swapped by rename (`spawn.prev` kept), then, with
 `spawn-integrate` stopped and `main` checked again, the schema migrated and
 `main` moved forward, and finally `spawn-loop`, `spawn-integrate` and
 `spawn-serve` restarted. A failure after the integrator stopped restarts the
-services before the script exits. Details in
+services before the script exits. With `SPAWN_DEPLOY_MIRROR` set, a deploy
+that succeeded then publishes that `main` to the mirror (a plain push, never
+forced; a push that fails is said and is not the deploy's failure; a mirror
+whose URL carries a credential is refused before anything is done: the
+credential goes in a credential helper or a deploy key). Details in
 [deploy/systemd/README.md](../deploy/systemd/README.md#deploying).
 
 Rolling back to `spawn.prev` is safe only until the deployed binary writes an

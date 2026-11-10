@@ -33,7 +33,11 @@
 # script open, and the gate pins the controller it found. After a switch, a
 # controller that is neither <name> nor <name>.prev is removed, unless a
 # process still has its working directory, its root or an open file in it
-# (/proc/*/cwd, root, fd): that one goes at a later switch.
+# (/proc/*/cwd, root, fd): that one goes at a later switch. /proc names the
+# physical path, every symlink resolved, so the directory is compared by its
+# physical path too: with $SPAWN_LIVE under a symlink (/home -> /data00/home)
+# the path as given matches nothing there. When /proc cannot be read, or the
+# directory cannot be resolved, it is kept: nothing shows it is unused.
 #
 # A commit with a pnpm-lock.yaml at its root also has a deps store: the
 # dependencies its tree runs on, which git does not hold. `deps` installs one
@@ -112,11 +116,20 @@ remove_tree() {
 
 # in_use <directory>: a process has its working directory, root or an open
 # file there. Processes of other users are unreadable and skipped (they
-# cannot be the integrator's).
+# cannot be the integrator's). The links in /proc hold physical paths, so
+# the directory's physical path is what they are compared with (and the path
+# as given, which costs nothing). In use, too, when that cannot be told: the
+# directory does not resolve, or this process cannot read its own /proc
+# entry.
 in_use() {
-  local hit
+  local hit physical
+  if ! physical=$(readlink -f "$1" 2>/dev/null) || [ -z "$physical" ] ||
+    [ "$(readlink "/proc/$BASHPID/cwd" 2>/dev/null)" != "$(pwd -P)" ]; then
+    say "cannot tell whether a process uses $1 (/proc or the path does not resolve)"
+    return 0
+  fi
   hit=$(find /proc/[0-9]*/cwd /proc/[0-9]*/root /proc/[0-9]*/fd -maxdepth 1 \
-    \( -lname "$1" -o -lname "$1/*" \) -print -quit 2>/dev/null) || true
+    \( -lname "$physical" -o -lname "$physical/*" -o -lname "$1" -o -lname "$1/*" \) -print -quit 2>/dev/null) || true
   [ -n "$hit" ]
 }
 

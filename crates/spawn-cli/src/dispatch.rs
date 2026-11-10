@@ -227,6 +227,12 @@ pub(crate) struct Facts {
     /// The Bridge records a turn's checkpoint before its end.
     #[serde(default)]
     pub(crate) turn_ended: bool,
+    /// Session position of that latest turn event: of the turn's end once
+    /// `turn_ended`. A judgement based on an earlier position was made
+    /// before this turn ended: it is an earlier turn's, or of this turn
+    /// while it ran.
+    #[serde(default)]
+    pub(crate) turn_seq: Option<u64>,
     /// The commit of the agent's latest `artifact.committed`, read with the
     /// rest of these facts: once `turn_ended`, the checkpoint of the turn
     /// that ended (or a later one).
@@ -432,6 +438,12 @@ pub(crate) enum Why {
     /// Main of a source that was red on a check passes it again
     /// ([`digest::main_red_news`]).
     MainGreen,
+    /// A mission's source is not a directory on this host: its branches are
+    /// not published to it ([`digest::source_away_news`], told once).
+    SourceAway,
+    /// A mission's source that was away is back, or no longer watched
+    /// ([`digest::source_away_news`]).
+    SourceBack,
     /// A gate runner judged a copy of a verdict on the same inputs and
     /// disagreed with the primary ([`digest::shadow_disagreements`], told
     /// once): it decided nothing.
@@ -467,6 +479,11 @@ pub(crate) enum Why {
     /// running, which recorded nothing ([`digest::drain_expiries`]): their
     /// tasks are judged again from nothing by the next integrator.
     DrainExpired,
+    /// A worker's engine ended on the model's error and the recovery will
+    /// not revive it: a request the model never accepts (`model_error`), or
+    /// a transient error whose retries are spent (`model_unavailable`)
+    /// ([`digest::model_finals`], told once).
+    ModelFinal,
 }
 
 impl Why {
@@ -476,7 +493,8 @@ impl Why {
     /// judges again on its own), an expired hold (its landings resumed on
     /// their own), an objective closed solved on the base (nothing is
     /// assigned for it again) and an expired drain (its gates run again
-    /// under the next integrator) are news. Every other item is a
+    /// under the next integrator) are news, as is a final model record (the
+    /// recovery decided; the supervisor acts on it or not). Every other item is a
     /// condition that holds while its facts do (a worker's state, a stall,
     /// a path still low on disk, a gate still without room): told, it stays
     /// in [`Plan::told`] until its facts change.
@@ -490,10 +508,13 @@ impl Why {
                 | Self::GateBaseDisagrees
                 | Self::MainRed
                 | Self::MainGreen
+                | Self::SourceAway
+                | Self::SourceBack
                 | Self::ShadowDisagrees
                 | Self::HoldExpired
                 | Self::ObjectiveSolved
                 | Self::DrainExpired
+                | Self::ModelFinal
         )
     }
 }
@@ -734,21 +755,13 @@ pub(crate) struct Reading {
 /// ([`read_plan`]): each is said once.
 static ORDER_LOGGED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
 
-/// One function for both, so the queue a person reads is the dispatcher's
-/// own.
-pub(crate) fn read_plan(
-    store: &PostgresStore,
-    loaded: (Vec<Facts>, Work),
-    disk: impl FnOnce(i64) -> Vec<Escalation>,
-    bounds: &Bounds,
-    supervised: bool,
-    spawn: &str,
-    deployed: Option<&Charter>,
-) -> Result<Reading, String> {
-    let (rows, work) = loaded;
-    let mut lines = Vec::new();
-    let now = now_ms();
-    let mut host = disk(now);
+/// The digest items the host's and the integrator's records name, each read
+/// once a pass ([`read_plan`]): the gate's room, host faults and base
+/// disagreements, red and green mains, sources away, shadow verdicts, overruns, objective
+/// yields, closes and orders, expired holds and drains, and the recovery's
+/// final model records.
+fn record_items(store: &PostgresStore) -> Result<Vec<Escalation>, String> {
+    let mut host = Vec::new();
     host.extend(crate::disk::gate_room_escalations(&records(
         store.gate_room_escalations(),
         "gate room records",
@@ -764,6 +777,10 @@ pub(crate) fn read_plan(
     host.extend(digest::main_red_news(&records(
         store.main_red_news(),
         "red main records",
+    )?));
+    host.extend(digest::source_away_news(&records(
+        store.source_away_news(),
+        "source away records",
     )?));
     host.extend(digest::shadow_disagreements(&records(
         store.shadow_disagreements(),
@@ -793,6 +810,29 @@ pub(crate) fn read_plan(
         store.drain_expiries(),
         "integrator drain records",
     )?));
+    host.extend(digest::model_finals(&records(
+        store.model_finals(),
+        "final model records",
+    )?));
+    Ok(host)
+}
+
+/// One function for both, so the queue a person reads is the dispatcher's
+/// own.
+pub(crate) fn read_plan(
+    store: &PostgresStore,
+    loaded: (Vec<Facts>, Work),
+    disk: impl FnOnce(i64) -> Vec<Escalation>,
+    bounds: &Bounds,
+    supervised: bool,
+    spawn: &str,
+    deployed: Option<&Charter>,
+) -> Result<Reading, String> {
+    let (rows, work) = loaded;
+    let mut lines = Vec::new();
+    let now = now_ms();
+    let mut host = disk(now);
+    host.extend(record_items(store)?);
     // Every timer the records read here name: the times at which this step
     // would decide something new even though nothing is appended meanwhile.
     // A time already reached is no wait (the step acts on it now), so only
@@ -1238,6 +1278,7 @@ mod tests {
             resumed_young: 0,
             failed_resume: None,
             turn_ended: true,
+            turn_seq: None,
             checkpoint: None,
             charter: None,
             jobs: Vec::new(),
@@ -1384,6 +1425,7 @@ mod tests {
             resumed_young: 0,
             failed_resume: None,
             turn_ended: true,
+            turn_seq: None,
             checkpoint: None,
             charter: None,
             jobs: Vec::new(),
@@ -2372,6 +2414,73 @@ mod tests {
             text.lines()
                 .any(|line| line.contains("/srv/missions/supply-pa.git")),
             "each expiry keeps its own line: {text}"
+        );
+        let mut supervisor = idle_supervisor();
+        delivered(&mut supervisor, &plan.orders[0]);
+        let plan = decide_with(&[supervisor], &Work::default(), &items, true, NOW, "spawn");
+        assert!(
+            plan.orders.is_empty() && plan.pending.is_empty() && plan.told.is_empty(),
+            "told once, and resolved by the telling"
+        );
+    }
+
+    /// Objective 39: a final model record reaches an idle supervisor once,
+    /// as an item of the worker's session tagged `<session>
+    /// model-<execution>`, naming the session, the execution, the cause and
+    /// the status or the retries; news, never repeated once told.
+    #[test]
+    fn a_final_model_record_reaches_an_idle_supervisor_once() {
+        let records = [
+            serde_json::json!({"event_id": 40, "at_ms": 1_793_930_021_000_i64,
+                "session_id": "session_worker_a", "agent_id": "agent_worker_a",
+                "execution_id": "exec_a1", "cause": "model_error", "status": 400,
+                "error": "invalid_request",
+                "text": "API Error: 400 unexpected tool_use_id\nfound", "retries": null}),
+            serde_json::json!({"event_id": 52, "at_ms": 1_793_930_031_000_i64,
+                "session_id": "session_worker_b", "agent_id": "agent_worker_b",
+                "execution_id": "exec_b3", "cause": "model_unavailable", "status": 529,
+                "error": "overloaded", "text": "API Error: 529 Overloaded", "retries": 2}),
+        ];
+        let items = super::digest::model_finals(&records);
+        let tags: Vec<String> = items.iter().map(Escalation::tag).collect();
+        assert_eq!(
+            tags,
+            [
+                "session_worker_a model-exec_a1",
+                "session_worker_b model-exec_b3"
+            ]
+        );
+        assert!(items.iter().all(|item| item.why == Why::ModelFinal));
+        assert!(Why::ModelFinal.is_news());
+        assert_eq!(items[0].since_ms, Some(1_793_930_021_000));
+        for part in ["session_worker_a", "exec_a1", "model_error", "status 400"] {
+            assert!(items[0].line.contains(part), "{part}: {}", items[0].line);
+        }
+        for part in [
+            "session_worker_b",
+            "exec_b3",
+            "model_unavailable",
+            "after 2 retries",
+        ] {
+            assert!(items[1].line.contains(part), "{part}: {}", items[1].line);
+        }
+        assert!(items.iter().all(|item| !item.line.contains('\n')));
+        assert!(
+            super::digest::model_finals(&[serde_json::json!({"cause": "model_error"})]).is_empty(),
+            "a record without its session and execution is no item"
+        );
+
+        let rows = [idle_supervisor()];
+        let plan = decide_with(&rows, &Work::default(), &items, true, NOW, "spawn");
+        let CommandAction::Input { tags, .. } = &plan.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert_eq!(
+            tags,
+            &[
+                "session_worker_a model-exec_a1",
+                "session_worker_b model-exec_b3"
+            ]
         );
         let mut supervisor = idle_supervisor();
         delivered(&mut supervisor, &plan.orders[0]);

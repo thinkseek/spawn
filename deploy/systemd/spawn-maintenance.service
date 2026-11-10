@@ -11,14 +11,17 @@ WorkingDirectory=%h/.local/share/spawn-rsi
 # Through sh: the controller is a git export, so a file mode never decides
 # whether the cleanup runs.
 ExecStart=/bin/sh %h/.local/share/spawn-rsi/controllers/spawn/scripts/maintenance.sh
-# TMPDIR (the integrator's, so the gate's scratch is found), SPAWN_BACKUP_DIR
-# and any SPAWN_MAINTENANCE_*.
+# TMPDIR (the integrator's, so the gate's scratch is found), SPAWN_BACKUP_DIR,
+# SPAWN_GATE_WALL_CLOCK_MINUTES and any SPAWN_MAINTENANCE_*.
 EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-# Scratch older than 3 h is a dead gate's: no gate runs longer (the
-# integrator's wall clock, SPAWN_GATE_WALL_CLOCK_MINUTES, is 120 min by
-# default; keep it below this age).
-Environment=SPAWN_MAINTENANCE_SCRATCH_AGE_MIN=180
+# No scratch age here. A gate's scratch goes when the gate that made it is
+# gone (its record in the scratch: pid, start time, boot), whatever its age,
+# and stays while that gate runs, however long: this unit used to set
+# SPAWN_MAINTENANCE_SCRATCH_AGE_MIN=180, and a gate allowed a longer wall
+# clock (SPAWN_GATE_WALL_CLOCK_MINUTES) lost its scratch while it ran. The
+# age (the script's default, a day, and never under the wall clock) is only
+# for a scratch that holds no record.
 TimeoutStartSec=1h
 Nice=10
 IOSchedulingClass=idle
