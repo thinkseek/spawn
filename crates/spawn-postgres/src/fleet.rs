@@ -400,7 +400,7 @@ from (
     select e.session_id, max(e.session_seq) as evidence_seq
       from spawn_events e
      where e.source <> 'observer'
-       and e.event_name not in ('artifact.committed', 'merge.conflicted')
+       and e.event_name not in ('artifact.committed', 'merge.conflicted', 'message.acted')
        and coalesce(e.kind -> 'detail' ->> 'step', '') <> 'waiting'
      group by e.session_id) ev on ev.session_id = s.session_id
   left join (

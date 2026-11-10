@@ -4251,8 +4251,11 @@ $$;
 -- - `typed_at_ms`: the Bridge's `typed` step; `taken_at_ms`: the first
 --   `message.taken` naming it, `taken` how many name it; `answered_at_ms`:
 --   the session's first `turn.stopped` or `turn.failed` after that first
---   `message.taken`. `state` is `answered`, else `taken`, else `typed`, else
---   `recorded`. Times are the records' (`recorded_at_ms`).
+--   `message.taken`. `acted` (`{outcome, why}`) and `acted_at_ms`: its
+--   answer, `message.acted` (an ack, or the report of the task it
+--   delivered; objective 046), null until answered. `state` is `acted`,
+--   else `answered`, else `taken`, else `typed`, else `recorded`. Times
+--   are the records' (`recorded_at_ms`).
 -- - `not_taken`: no `message.taken` names it, it is tracked, and its bound
 --   has passed. Tracked: the Bridge recorded `message.typed` for it (the
 --   text it typed carried the marker; the bound runs from the command's
@@ -4291,6 +4294,8 @@ declare
     v_from bigint;
     v_ended boolean;
     v_live_since bigint;
+    v_acted jsonb;
+    v_acted_at bigint;
 begin
     if not (v_type = 'input'
             or (v_type in ('start', 'resume') and coalesce(p_action ->> 'prompt', '') <> '')) then
@@ -4364,11 +4369,22 @@ begin
         v_ended := p_state = 'finished'
                    and (v_live_since is null or v_live_since > coalesce(p_finished, p_now));
     end if;
+    -- Its answer (objective 046): the agent's ack, or the report of the
+    -- task it delivered, recorded once (`message.acted`, keyed
+    -- `<id>:acted`).
+    select e.kind -> 'detail', e.recorded_at_ms into v_acted, v_acted_at from spawn_events e
+     where e.session_id = p_session and e.source = 'bridge'
+       and e.source_event_id = p_id || ':acted';
     return jsonb_build_object(
-        'state', case when v_answered_at is not null then 'answered'
+        'state', case when v_acted is not null then 'acted'
+                      when v_answered_at is not null then 'answered'
                       when v_taken_at is not null then 'taken'
                       when v_typed_at is not null then 'typed'
                       else 'recorded' end,
+        'acted', case when v_acted is not null
+                      then jsonb_build_object('outcome', v_acted ->> 'outcome',
+                                              'why', coalesce(v_acted -> 'why', 'null'::jsonb)) end,
+        'acted_at_ms', v_acted_at,
         'typed_at_ms', v_typed_at,
         'taken_at_ms', v_taken_at,
         'answered_at_ms', v_answered_at,
