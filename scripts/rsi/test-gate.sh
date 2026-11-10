@@ -1148,6 +1148,15 @@ saved_base=$base
 base=$rust_base
 expect "a test the owner retired may go" "$(judge "$renamed" "" "$retiring_scenarios")" \
     'exit=0 {"verdict":"accepted"}'
+# Retired by its last path component only (batch 16's bare line): nothing
+# matches it, and the refusal says why and what to write.
+printf '# retired by its last component only\nb\n' >"$retiring_scenarios/retired-tests"
+expect "a test retired by its last component only is still a drop, and the reason says so" \
+    "$(judge "$renamed" "" "$retiring_scenarios")" \
+    'drops or renames base tests (1: tests::b); retired-tests names it by its last component only: write the whole name, as cargo lists it'
+expect "the log names the line and the test" "$(cat "$work/gate.out")" \
+    '| retired-tests: b names tests::b only by its last component: write the whole name, as cargo lists it'
+printf '# retired with their feature\ntests::b\n' >"$retiring_scenarios/retired-tests"
 base=$saved_base
 rust_branch rust-moved-path
 drop_b
