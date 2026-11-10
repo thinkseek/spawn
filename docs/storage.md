@@ -553,12 +553,41 @@ adapter in `spawn_host::transcripts`):
 
 - **Where.** `<root>/.transcripts/<agent>/<native session>.jsonl`, beside
   the workspaces, on the host that ran the engine.
-- **When.** After the checkpoint of each turn end, and at the end of each
-  execution, after its terminal is killed and before its workspace is
-  unmounted: the Bridge reads (through the terminal host) what the file
-  gained since the latest copy and appends it,
-  each append made durable (`fdatasync`, and the directory for a new file).
-  A failure is a tick warning; the next copy takes what was missed.
+- **When.** On every pass of the Bridge on which a live execution's
+  transcript was read growing (the watch told of a write, or the file is
+  read on every pass), so a model call of a turn that is still running is
+  archived within a pass of being written, not when its turn ends; and at
+  the end of each execution, after its terminal is killed and before its
+  workspace is unmounted. The Bridge reads (through the terminal host) what
+  the file gained since the latest copy and appends it, each append made
+  durable (`fdatasync`, and the directory for a new file). A pass on which
+  nothing was added copies nothing and reads nothing. A failure is a tick
+  warning, said again only when it changes; the copy is made again on
+  every pass until it succeeds, an ended execution's too (a full disk, an
+  archive directory it cannot write), and across a restart of the loop:
+  what is still to copy is read back from the progress records below and
+  the log, never kept only in the loop's memory.
+- **Progress.** Beside the archive, `<root>/.transcripts-progress/<agent>/
+  <native session>.json` holds one record per native session
+  (`spawn_core::transcripts::ArchiveProgress`, replaced whole on each
+  change, durable once its execution ended): the execution, whether it was
+  live, until when its transcript is known (`known_ms`: the time of the
+  read, less 2 s for a line stamped before it was written), the archive's
+  length, and the time of the first line the archive lacks (`behind_ms`)
+  when a copy failed. A live execution's record is written again every
+  2 s while only `known_ms` moves. The records are not in the archive: the
+  archive's files are still the transcripts' bytes alone.
+- **Settling.** The scorecard's cost reads the archive only, so a window's
+  cost may grow after its end while the archive lacks a call made before
+  it. `spawn scorecard --json` and `/api/scorecard` say `settling: true`
+  exactly while some record holds the window open: a line before the
+  window's end is not archived (`behind_ms` before it), live or ended, or
+  the execution was live and its transcript has not been known since the
+  window's end. An idle or ended execution with everything before the
+  window's end archived holds nothing open, and a call after the end holds
+  nothing open. It is told from these records, not by age; the records are
+  read before the archive, so a window read as settled already has every
+  line before its end, and reads the same figures afterwards.
 - **Never overwritten.** The file is append-only. The Bridge compares the
   last 4 KiB it copied with the file at the same place: a file that shrank,
   or whose bytes there differ (rewritten, replaced), is copied whole as the
@@ -693,7 +722,7 @@ supervisor's login may read it; only the owner writes it).
 | Event log | PostgreSQL, one container on this host, bound to 127.0.0.1 | It *is* the source |
 | Event log backups | `spawn backup dump`, every hour: an encrypted `pg_dump` in R2 bucket `spawn-store` under `postgres/hourly/` (6 h), plus the day's first under `postgres/daily/` (7 d) and the ISO week's first under `postgres/weekly/` (28 d), bucket-locked against deletion and expired by R2 lifecycle; a copy the plausibility check doubts goes to `postgres/suspect/` (30 d) ([deploy/backup](../deploy/backup/README.md)) | They are the copy; the key is kept off-host |
 | What an engine did | read by the Bridge from transcript and pane into the log | Yes: in the log |
-| Full transcript text | `~/.claude/projects/...` on the compute host, copied to `<root>/.transcripts/<agent>/` at turn ends and execution ends; the last 14 days leave the host in the daily bundle below | From the archive, on the same host (restored before a resume when missing); from `bundles/` on another host |
+| Full transcript text | `~/.claude/projects/...` on the compute host, copied to `<root>/.transcripts/<agent>/` on each pass of the Bridge it grew and at execution ends; the last 14 days leave the host in the daily bundle below | From the archive, on the same host (restored before a resume when missing); from `bundles/` on another host |
 | Code: mission sources | bare repos (`missions/*.git`) or remote URLs | Remote URLs: yes |
 | Code: agents' work | per-agent branches in host-local mirrors (`ws/.sources/*.git`), pushed as `spawn/<agent>` to a source that is a directory on this host (a remote source receives none) | Yes for missions with a directory source; no for remote sources, scratch missions and the default repository |
 | Work a task lands | the source's `spawn/<agent>`, fetched by the integrator into its mirror's `refs/spawn-integrate/<agent>`; judged only when it contains the agent's latest checkpoint (its `artifact.committed` in the event log) | Yes: the source holds it; nothing on the host that ran the agent is needed |
