@@ -1182,6 +1182,21 @@ impl One<'_> {
             .find(|stop| !stop.ours() && stop.reached())
     }
 
+    /// The failed turn the engine ended after when the model refused it for
+    /// good, with no progress since ([`refused`]).
+    fn refused_turn(&self, end: &End) -> Option<&Turn> {
+        let after = self
+            .interruptions()
+            .last()
+            .map_or(0, |record| record.fact_event_id());
+        refused(
+            &self.row.turns,
+            self.row.progress.event_id,
+            after,
+            (end.event_id > 0).then_some(end.event_id),
+        )
+    }
+
     /// A free-space reading of the workspace's filesystem, taken now: on
     /// the workspace itself while its mount is there, else on the root that
     /// holds every workspace (the same filesystem, on this host).
@@ -2138,6 +2153,23 @@ fn describe(record: &Recorded) -> String {
             crate::deliver::one_line(&parts.join(", "), 300)
         )
     }
+}
+
+/// The failed turn an execution's end is told from when the model refused
+/// it for good: the latest failed turn after `after` (the fact of the latest
+/// interruption) and before the end (`end_event_id`, when known), if it is
+/// a model error ([`Turn::model_error`]) and nothing made progress after it
+/// (`progress_event_id`: the latest tool call or turn end).
+pub(crate) fn refused(
+    turns: &[Turn],
+    progress_event_id: i64,
+    after: i64,
+    end_event_id: Option<i64>,
+) -> Option<&Turn> {
+    let turn = turns.iter().rev().find(|turn| {
+        turn.event_id > after && end_event_id.is_none_or(|end| turn.event_id < end)
+    })?;
+    (turn.model_error() && progress_event_id < turn.event_id).then_some(turn)
 }
 
 /// The next fact of `execution` that no interruption explains, in log
