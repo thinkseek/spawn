@@ -977,7 +977,17 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   `SPAWN_ALERT_MEMORY_OK_MB`, default 8192), `tmpfs_high` (the used space of
   the filesystem holding `SPAWN_ALERT_TMPFS_PATH`, default `/tmp`, over
   `SPAWN_ALERT_TMPFS_HIGH_MB`, default 8000; clears under
-  `SPAWN_ALERT_TMPFS_OK_MB`, default 6000), `agent_stuck` (the session's
+  `SPAWN_ALERT_TMPFS_OK_MB`, default 6000), `source_away` (`mission #<id>`,
+  at two readings in a row: a source of an open or active mission that is a
+  path on this host is not a directory, an unmounted volume or a moved
+  checkout, so its agents' branches are not published to it until it is
+  back; one reading only notes it, so a path that comes and goes does not
+  flap, and a restart starts the count again; evidence `away_since_ms`, the
+  first of the two readings; one per mission
+  and source while away, cleared at the first reading that finds it, or once
+  the mission no longer has it or is no longer open or active; the
+  supervisor's digest tells each and its end, `host source-away-<event>` and
+  `host source-back-<event>`), `agent_stuck` (the session's
   latest judgement at or above the Observer's 0.5, whatever the dispatcher
   does with it; clears under 0.5, or when the session's current execution
   has ended, whatever the cause, with the Bridge's `execution.ended` as
