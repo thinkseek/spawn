@@ -77,6 +77,9 @@ pub(crate) fn tick(flags: &Flags) -> Result<i32, String> {
     for warning in &report.warnings {
         eprintln!("spawn tick warning: {warning}");
     }
+    for note in &report.notes {
+        eprintln!("spawn tick: {note}");
+    }
     let observations = observer.tick().map_err(|error| error.to_string())?;
     println!(
         "commands={} observations={} sessions={}",
@@ -485,6 +488,8 @@ impl Fleet<'_> {
         let now = now_ms();
         let mut lines: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
+        // What the Bridge measured (each end's kill and its wait), logged.
+        let mut notes: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
         if self.running.is_none() {
             match runtime(self.flags) {
@@ -517,7 +522,13 @@ impl Fleet<'_> {
         let due =
             self.schedule.due(now) || self.steps_at.is_none_or(|at| at.elapsed() >= self.interval);
         if let (Some(open), Some(watermark)) = (self.store.clone(), watermark) {
-            self.bridge_work(&open, watermark, now, &mut warnings, &mut errors);
+            self.bridge_work(
+                &open,
+                watermark,
+                now,
+                (&mut warnings, &mut notes),
+                &mut errors,
+            );
             if due {
                 self.steps_at = Some(std::time::Instant::now());
                 self.steps(&open, watermark, now, &mut lines, &mut errors);
@@ -528,12 +539,18 @@ impl Fleet<'_> {
         // keeps an engine's turn end seen as soon as it is written.
         if let Some((bridge, _)) = self.running.as_mut() {
             match bridge.poll() {
-                Ok(report) => warnings.extend(report.warnings),
+                Ok(report) => {
+                    warnings.extend(report.warnings);
+                    notes.extend(report.notes);
+                }
                 Err(error) => Fleet::fail(&mut errors, "bridge", &error.to_string()),
             }
         }
         for warning in &warnings {
             eprintln!("spawn loop warning: {warning}");
+        }
+        for note in &notes {
+            eprintln!("spawn loop: {note}");
         }
         for line in &lines {
             println!("{line}");
@@ -564,7 +581,7 @@ impl Fleet<'_> {
         open: &std::sync::Arc<PostgresStore>,
         watermark: i64,
         now: i64,
-        warnings: &mut Vec<String>,
+        (warnings, notes): (&mut Vec<String>, &mut Vec<String>),
         errors: &mut Vec<String>,
     ) {
         if !self.schedule.bridge.runs(watermark, now) {
@@ -575,6 +592,7 @@ impl Fleet<'_> {
         match worked {
             Some(Ok((report, more))) => {
                 warnings.extend(report.warnings);
+                notes.extend(report.notes);
                 // Its own wait is the earliest lease still running, or the
                 // next pass when the claim stopped at its per-tick limit and
                 // a command may still be waiting for one.
