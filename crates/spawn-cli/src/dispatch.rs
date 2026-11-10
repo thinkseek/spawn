@@ -432,6 +432,10 @@ pub(crate) enum Why {
     /// Main of a source that was red on a check passes it again
     /// ([`digest::main_red_news`]).
     MainGreen,
+    /// A gate runner judged a copy of a verdict on the same inputs and
+    /// disagreed with the primary ([`digest::shadow_disagreements`], told
+    /// once): it decided nothing.
+    ShadowDisagrees,
     /// An open task's step has not moved within its bound ([`stall`]).
     Stalled,
     /// The deployed charter could not be typed into the supervisor's pane:
@@ -486,6 +490,7 @@ impl Why {
                 | Self::GateBaseDisagrees
                 | Self::MainRed
                 | Self::MainGreen
+                | Self::ShadowDisagrees
                 | Self::HoldExpired
                 | Self::ObjectiveSolved
                 | Self::DrainExpired
@@ -759,6 +764,10 @@ pub(crate) fn read_plan(
     host.extend(digest::main_red_news(&records(
         store.main_red_news(),
         "red main records",
+    )?));
+    host.extend(digest::shadow_disagreements(&records(
+        store.shadow_disagreements(),
+        "shadow verdict records",
     )?));
     host.extend(digest::over_budget_escalations(&records(
         store.over_budget_escalations(),

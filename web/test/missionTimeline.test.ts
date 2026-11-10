@@ -4,6 +4,9 @@ import { test } from "node:test";
 import type { Mission, MissionTask, TaskStage } from "../src/missions.ts";
 import {
   deriveMissionTimeline,
+  earlierLabel,
+  groupEnd,
+  splitEarlier,
   filterLanes,
   hasBars,
   isLive,
@@ -449,4 +452,45 @@ test("names and states", () => {
   assert.equal(missionName({ id: 9, text: null }), "Mission 9");
   assert.equal(laneState({ state: "dropped", halted: null }), "closed");
   assert.equal(laneState({ state: "done", halted: "x" }), "halted");
+});
+
+/** A bar for the split: only its key and end matter. */
+const ended = (key: string, end: number | null) => ({ key, end }) as unknown as import("../src/missionTimeline.ts").TaskBar;
+const group = (key: string, end: number | null, attempts: Array<number | null> = []) => ({
+  key,
+  item: ended(key, end),
+  earlier: attempts.map((at, index) => ({ item: ended(`${key}-${index}`, at) })),
+});
+
+test("a group ends with its last bar, and is open while any bar is", () => {
+  assert.equal(groupEnd(group("a", T0 + 5 * MIN)), T0 + 5 * MIN);
+  assert.equal(groupEnd(group("a", T0 + 5 * MIN, [T0 + 9 * MIN])), T0 + 9 * MIN, "an attempt that ended later");
+  assert.equal(groupEnd(group("a", null, [T0])), null);
+  assert.equal(groupEnd(group("a", T0, [null])), null);
+});
+
+test("groups that ended before the window's edge fold away; open, late and kept ones stay", () => {
+  const cut = T0 + 60 * MIN;
+  const groups = [
+    group("old", T0 + 10 * MIN),
+    group("open", null),
+    group("late", T0 + 90 * MIN),
+    group("edge", cut, []),
+    group("retried", T0 + 20 * MIN, [T0 + 70 * MIN]),
+    group("older", T0 + 30 * MIN),
+    group("selected", T0 + 5 * MIN),
+  ];
+  const split = splitEarlier(groups, cut, (entry) => entry.key === "selected");
+  assert.deepEqual(split.current.map((entry) => entry.key), ["open", "late", "edge", "retried", "selected"]);
+  assert.deepEqual(split.earlier.map((entry) => entry.key), ["old", "older"], "in their order");
+  assert.equal(split.last, T0 + 30 * MIN);
+  const none = splitEarlier(groups, null, () => false);
+  assert.equal(none.earlier.length, 0, "a window that reaches back to the first task folds nothing");
+  assert.equal(none.last, null);
+});
+
+test("the folded row names the count and the window's edge, with the weekday on another day", () => {
+  const now = new Date(2026, 10, 10, 15, 30).getTime();
+  assert.equal(earlierLabel(1, new Date(2026, 10, 10, 9, 5).getTime(), now), "1 task ended before 09:05");
+  assert.equal(earlierLabel(25, new Date(2026, 10, 9, 18, 0).getTime(), now), "25 tasks ended before Mon 18:00");
 });

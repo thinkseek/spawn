@@ -1,7 +1,9 @@
 import {
   AlertTriangle,
   ArrowRight,
+  Check,
   CircleAlert,
+  Copy,
   History,
   Send,
   Sparkles,
@@ -9,7 +11,7 @@ import {
 import { useId, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
 
-import { fetchSessionTail, usePoll } from "../../api";
+import { fetchSessionTail, postKey, usePoll } from "../../api";
 import type { SessionDetail } from "../../api";
 import type {
   CommandRecord,
@@ -31,7 +33,7 @@ import {
   stateLabelUpper,
 } from "../../fleet";
 import { clockTime, formatDuration, relativeTime } from "../../format";
-import { commandGist, foldCommands, inputAt, inputLeads, principalWords } from "../../commands";
+import { commandSummary, foldCommands, inputAt, inputLeads, principalWords } from "../../commands";
 import { doingWords } from "../../home";
 import { recentToolRows, rowText, runEnd } from "../../trace";
 import { freshAt } from "../../validated";
@@ -47,17 +49,25 @@ import {
   SectionLabel,
 } from "./bits";
 import { DoingIcon, doingNow } from "./FleetBoard";
-import { InputBox } from "./InputBox";
+import { InputBox, useWritable } from "./InputBox";
+import { newKey, sendAnswer } from "../../input";
+import { keyLabel } from "../../keys";
+import type { KeyName } from "../../keys";
 
 interface AgentDetailProps {
   agent: FleetAgent;
+  /** Its one name (design §4.5, home.ts agentNames); the ids stay beside
+   * it to copy. */
+  name?: string | null;
   onClose: () => void;
   onOpenTimeline: (sessionId: string) => void;
 }
 
 /** Slide-over with everything about one agent; its polls stop on close. */
-export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps) {
+export function AgentDetail({ agent, name = null, onClose, onOpenTimeline }: AgentDetailProps) {
   const sessionId = agent.session_id;
+  // Who the page names, in the header, the keys line and the input box.
+  const shownName = name ?? (agent.agent_id || sessionId);
   const judgements = usePoll<JudgementRecord[]>(
     `judgements:${sessionId}`,
     (signal) => fetchJudgements(sessionId, signal),
@@ -108,16 +118,17 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
         <>
           <FleetStateDot state={agent.state} />
           <h2
-            className="min-w-0 truncate text-title-sm font-semibold text-foreground"
-            title={agent.label ?? undefined}
+            className="min-w-0 shrink-0 truncate text-title-sm font-semibold text-foreground"
+            title={[shownName, agent.label].filter(Boolean).join("\n")}
           >
-            {agent.label ?? (agent.agent_id || sessionId)}
+            {name ?? agent.label ?? (agent.agent_id || sessionId)}
           </h2>
-          {agent.label && (
-            <span className="min-w-0 shrink truncate select-all font-mono text-micro text-faint-foreground">
-              {agent.agent_id || sessionId}
+          {name && agent.label && (
+            <span className="min-w-0 shrink truncate text-caption text-muted-foreground" title={agent.label}>
+              {agent.label}
             </span>
           )}
+          <CopyIds agentId={agent.agent_id} sessionId={sessionId} />
           <RoleBadge role={agent.role} />
           <FleetStateBadge state={agent.state} />
           <LiveBadge live={agent.live} />
@@ -147,6 +158,7 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
             <div className="flex min-w-0 flex-col gap-2">
               <AgentScreen
                 sessionId={sessionId}
+                keysTo={agent.live ? shownName : null}
                 view={screenView}
                 onView={setScreenView}
                 judged={{
@@ -159,7 +171,7 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
               <div className="rounded-card bg-surface px-3 py-2.5 shadow-card">
                 <InputBox
                   sessionId={sessionId}
-                  to={agent.agent_id || sessionId}
+                  to={shownName}
                   stopped={!agent.live}
                   commands={commands.data}
                 />
@@ -624,11 +636,14 @@ type ScreenView = "live" | "judged";
  */
 function AgentScreen({
   sessionId,
+  keysTo,
   view,
   onView,
   judged,
 }: {
   sessionId: string;
+  /** Who named keys go to, while the agent runs; null: no keys. */
+  keysTo: string | null;
   view: ScreenView;
   onView: (view: ScreenView) => void;
   judged: { text: string | null; judged: boolean; seq: number | null; at: number | null };
@@ -641,6 +656,7 @@ function AgentScreen({
   );
   const data = pane.data;
   const live = view === "live";
+  const keys = useAgentKeys(sessionId, live ? keysTo : null);
   const ids = useId();
   const tabId = (target: ScreenView) => `${ids}-tab-${target}`;
   const panelId = `${ids}-panel`;
@@ -707,6 +723,7 @@ function AgentScreen({
         </div>
       }
       panel={{ id: panelId, labelledBy: tabId(view) }}
+      keys={keys ?? undefined}
       text={live ? (data?.text ?? "") : (judged.text ?? "")}
       placeholder={
         live
@@ -945,7 +962,7 @@ function CommandList({
 /** One command: when, who, what, how it ended, and what its text says
  * (a digest's items, not its header); the whole text opens below. */
 function CommandItem({ record }: { record: CommandRecord }) {
-  const gist = commandGist(record.text);
+  const gist = commandSummary(record.action, record.text);
   return (
     <li className="px-4 py-2">
       <div className="flex flex-wrap items-center gap-2 text-caption">
@@ -980,3 +997,88 @@ function CommandItem({ record }: { record: CommandRecord }) {
   );
 }
 
+
+/** Named keys for the agent on screen (backlog P1), when `to` names it
+ * (it runs, and the live view shows) and this page may write: each key a
+ * command of its own, `POST /api/session/<id>/key`, with a fresh
+ * idempotency key; the last one's fate shows under the panel ("Esc sent",
+ * or the server's refusal, e.g. a session that stopped meanwhile). */
+function useAgentKeys(
+  sessionId: string,
+  to: string | null,
+): { to: string; onKey: (name: KeyName) => void; feedback?: ReactNode } | null {
+  const writable = useWritable(sessionId);
+  const [last, setLast] = useState<{ ok: boolean; text: string } | null>(null);
+  if (!to || writable.state !== "yes") return null;
+  const onKey = (name: KeyName) => {
+    const label = keyLabel(name);
+    setLast({ ok: true, text: `${label}\u2026` });
+    void postKey(sessionId, { name, key: newKey() }).then((reply) => {
+      const answer = sendAnswer(reply.status, reply.body);
+      setLast(answer.ok ? { ok: true, text: `${label} sent` } : { ok: false, text: answer.error });
+    });
+  };
+  return {
+    to,
+    onKey,
+    feedback: last ? (
+      <span className={last.ok ? "text-muted-foreground" : "text-destructive"}>{last.text}</span>
+    ) : undefined,
+  };
+}
+
+/** The agent's ids, beside its name: a button that copies both (agent id,
+ * then session id), which its title shows. The summary below shows the
+ * session id in full. */
+function CopyIds({ agentId, sessionId }: { agentId: string; sessionId: string }) {
+  const [copied, setCopied] = useState<"copied" | "failed" | null>(null);
+  const ids = [agentId, sessionId].filter(Boolean).join(" ");
+  return (
+    <span className="inline-flex shrink-0 items-center">
+      <button
+        type="button"
+        onClick={() => {
+          const show = (state: "copied" | "failed") => {
+            setCopied(state);
+            window.setTimeout(() => setCopied(null), 1_500);
+          };
+          // The clipboard API needs a secure context (https or localhost);
+          // over plain http the older copy command is tried, and a failure
+          // says so.
+          if (navigator.clipboard) {
+            void navigator.clipboard.writeText(ids).then(() => show("copied"), () => show("failed"));
+          } else show(copyByCommand(ids) ? "copied" : "failed");
+        }}
+        title={copied === "failed" ? `Could not copy; select them: ${ids}` : `Copy the ids: ${ids}`}
+        aria-label="Copy the agent and session ids"
+        className={cx(
+          "inline-flex h-6 shrink-0 items-center gap-1 rounded-chip px-1 text-micro text-faint-foreground hover:bg-surface-hover hover:text-foreground",
+          FOCUS_RING,
+        )}
+      >
+        {copied === "copied" ? <Check size={11} aria-hidden="true" /> : <Copy size={11} aria-hidden="true" />}
+        {copied === "copied" ? <span>Copied</span> : copied === "failed" ? <span className="text-destructive">Not copied</span> : null}
+      </button>
+    </span>
+  );
+}
+
+/** Copy text without the clipboard API (plain http): a hidden textarea and
+ * the copy command. Whether it worked. */
+function copyByCommand(text: string): boolean {
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "");
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  let done = false;
+  try {
+    done = document.execCommand("copy");
+  } catch {
+    done = false;
+  }
+  area.remove();
+  return done;
+}

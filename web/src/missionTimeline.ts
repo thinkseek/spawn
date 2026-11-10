@@ -461,3 +461,59 @@ export function phaseAt(bar: TaskBar, at: number, now: number): Segment | null {
   }
   return null;
 }
+
+/** A row group that `splitEarlier` reads: a task's bar and its earlier
+ * attempts (ordering.ts TaskGroup over bars). */
+interface BarGroup {
+  item: TaskBar;
+  earlier: ReadonlyArray<{ item: TaskBar }>;
+}
+
+/** When a group's last bar ended, or null while any of its bars is open. */
+export function groupEnd(group: BarGroup): number | null {
+  let end = group.item.end;
+  if (end === null) return null;
+  for (const attempt of group.earlier) {
+    if (attempt.item.end === null) return null;
+    end = Math.max(end, attempt.item.end);
+  }
+  return end;
+}
+
+/**
+ * Backlog P10: a section's groups split at the window's left edge `cut`.
+ * Under a window that starts after them (Today, a zoom), groups whose every
+ * bar ended before `cut` show no bar, so the timeline folds them into one
+ * "N ended before" row. A group stays when `keep` says so (it holds the
+ * selected task), and an open group always stays. `cut` null splits
+ * nothing (the window reaches back to the first task). `last` is when the
+ * latest of the earlier groups ended.
+ */
+export function splitEarlier<G extends BarGroup>(
+  groups: readonly G[],
+  cut: number | null,
+  keep: (group: G) => boolean,
+): { current: G[]; earlier: G[]; last: number | null } {
+  const current: G[] = [];
+  const earlier: G[] = [];
+  let last: number | null = null;
+  for (const group of groups) {
+    const end = groupEnd(group);
+    if (cut !== null && end !== null && end < cut && !keep(group)) {
+      earlier.push(group);
+      last = last === null ? end : Math.max(last, end);
+    } else current.push(group);
+  }
+  return { current, earlier, last };
+}
+
+/** The folded row's words: "3 tasks ended before 18:00", with the weekday
+ * when the edge is not on `now`'s day ("before Mon 18:00"). */
+export function earlierLabel(count: number, cut: number, now: number): string {
+  const edge = new Date(cut);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const clock = `${pad(edge.getHours())}:${pad(edge.getMinutes())}`;
+  const sameDay = edge.toDateString() === new Date(now).toDateString();
+  const day = sameDay ? "" : `${edge.toLocaleDateString("en", { weekday: "short" })} `;
+  return `${count} task${count === 1 ? "" : "s"} ended before ${day}${clock}`;
+}

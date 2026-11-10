@@ -83,6 +83,15 @@ from (
                            where e.session_id = s.session_id and e.source <> 'observer'
                            order by e.session_seq desc limit 1),
       'last_event_at_ms', s.last_event_at_ms,
+      -- The live execution's current turn, from its own records: the
+      -- latest of its turn's start (`message.received`) and end
+      -- (`turn.stopped`, `turn.failed`). `turn_open` is true while that is a
+      -- start, false once it is an end or no turn began, and null with no
+      -- live execution; `turn_at_ms` is when it was recorded. Whatever the
+      -- execution recorded after its turn ended (a checkpoint, a screen
+      -- read, a notification) does not reopen it.
+      'turn_open', case when s.live then coalesce(t.event_name = 'message.received', false) end,
+      'turn_at_ms', t.recorded_at_ms,
       'event_count', p.event_count,
       'tool_calls', (select count(*) from spawn_events e
                       where e.session_id = s.session_id and e.event_name = 'tool.started'),
@@ -90,6 +99,13 @@ from (
     ) as activity
   from agent_status s
   join spawn_session_state p using (session_id)
+  -- The live execution's latest turn record, newest first along
+  -- (session_id, session_seq): a waiting session's is near its end.
+  left join lateral (
+    select e.event_name, e.recorded_at_ms from spawn_events e
+     where s.live and e.session_id = s.session_id and e.execution_id = s.execution_id
+       and e.event_name in ('message.received', 'turn.stopped', 'turn.failed')
+     order by e.session_seq desc limit 1) t on true
 ) a";
 
 /// How the fleet and the decision ladder did over the last hour and day,
@@ -458,7 +474,8 @@ pub(crate) const SESSION_JUDGEMENTS: &str =
                            from agent_judgements where session_id = $1
                           order by session_seq desc limit $2) j";
 
-/// Commands into one session, newest first, with who sent them, and
+/// Commands into one session, newest first, with who sent them, what they
+/// said (a start's or resume's prompt, an input's text, a key's name), and
 /// `waiting`: whether the Bridge recorded the command's `command.step`
 /// `waiting` (keyed `cmd_<id>:waiting`): an unfinished input that waits for
 /// the session's turn, or a finished one that waited before it was typed.
@@ -466,7 +483,8 @@ pub(crate) const SESSION_JUDGEMENTS: &str =
 pub(crate) const SESSION_COMMANDS: &str =
     "select coalesce(jsonb_agg(row_to_json(c) order by c.command_id desc), '[]'::jsonb)
                    from (select k.id as command_id, k.principal, k.action ->> 'type' as action,
-                                left(coalesce(k.action ->> 'prompt', k.action ->> 'text'), 600) as text,
+                                left(coalesce(k.action ->> 'prompt', k.action ->> 'text',
+                                              k.action ->> 'key'), 600) as text,
                                 k.state, k.succeeded, k.error, k.created_at_ms, k.finished_at_ms,
                                 exists (select 1 from spawn_events w
                                          where w.session_id = k.session_id and w.source = 'bridge'
