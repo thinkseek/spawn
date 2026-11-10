@@ -671,7 +671,9 @@ it, on the same ladder.
   and submits, marks and collects nothing. The queue shows, top to bottom:
   what the supervisor asks ("The supervisor asks"), when its turn ended at
   its prompt judged BLOCKED or WAITING with `needs_human` at least 0.5 (or
-  with a `HUMAN:` line), in its own words from its transcript: its last
+  with a `HUMAN:` line; the judgement of that turn, based on its end or
+  later, never an earlier turn's, so an answered question does not come
+  back when the answer's turn ends), in its own words from its transcript: its last
   `HUMAN:` line not answered since, or else its reply's last paragraph, in
   at most three lines, the whole reply on request; right under it, always
   there whether it asks or not, the box to type to the supervisor; then the
