@@ -390,6 +390,15 @@
 //!   the workers made a load of 18-20, and task 172's gate failed on its
 //!   base.)
 //!
+//! A verdict a gate run gave binds what it judged and where (`inputs`:
+//! base, candidate, controller commit, scenario-set digest, task scenario;
+//! `env`: host, toolchain, runner; [`inputs`]). With
+//! `SPAWN_GATE_SHADOW_RUNNER` set, an `accepted` or `rejected` one is judged
+//! again on that gate runner in the background, and its end is recorded
+//! beside it (`task.shadow_gated`, [`shadow`]); it never decides or delays
+//! anything, and a disagreement on equal inputs is told to the supervisor
+//! once.
+//!
 //! Every judging records its own outcome (`task.gated`, `task.landed`), as
 //! before; the pass reads those records, never the thread's result. An
 //! owner's landing (step 0) never touches a judging: one on another source
