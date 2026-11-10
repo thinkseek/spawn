@@ -2129,6 +2129,42 @@ mod tests {
     /// an idle supervisor once, as an item of `missions` tagged
     /// `missions objective-yielded-<event id>`, its line naming the mission
     /// and the record's reason; two yields keep a line each.
+    /// An expired drain is one item of session `host`, tagged
+    /// `host integrator-drain-expired-<event id>`, news (told once), its
+    /// line naming each stopped task as `task #<id>` and the bound; a
+    /// record without its event id is no item.
+    #[test]
+    fn an_expired_drain_reaches_the_supervisor_once_naming_its_tasks() {
+        let records = [
+            serde_json::json!({
+                "event_id": 4410, "at_ms": 1_794_063_948_000_i64,
+                "type": "integrator.drain_expired", "gates": [212, 215], "bound_s": 7200,
+            }),
+            serde_json::json!({
+                "event_id": 4420, "type": "integrator.drain_expired", "gates": [],
+                "bound_s": 3,
+            }),
+        ];
+        let items = super::digest::drain_expiries(&records);
+        assert_eq!(items.len(), 2);
+        let item = &items[0];
+        assert_eq!(item.tag(), "host integrator-drain-expired-4410");
+        assert_eq!(item.why, Why::DrainExpired);
+        assert!(Why::DrainExpired.is_news());
+        assert_eq!(item.since_ms, Some(1_794_063_948_000));
+        assert!(
+            item.line.contains("task #212") && item.line.contains("task #215"),
+            "{}",
+            item.line
+        );
+        assert!(item.line.contains("7200 s"), "{}", item.line);
+        assert!(items[1].line.contains("no gate was running"), "{}", items[1].line);
+        assert!(
+            super::digest::drain_expiries(&[serde_json::json!({"gates": [1]})]).is_empty(),
+            "no event id, no item"
+        );
+    }
+
     /// A second overrun of an objective's chain is one digest item, tagging
     /// the overrun's record, naming both tasks, and holding the objective.
     #[test]

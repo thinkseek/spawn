@@ -5320,6 +5320,59 @@ mod tests {
     use crate::gate::{GateFailure, Shortfall};
     use serde_json::json;
 
+    /// SPAWN_INTEGRATE_DRAIN_SECS: unset is two hours; a whole number of
+    /// seconds from 1 to a day is taken; anything else refuses to start,
+    /// naming the variable.
+    #[test]
+    fn the_drain_bound_is_a_whole_number_of_seconds_up_to_a_day() {
+        assert_eq!(super::drain_secs(None), Ok(7200));
+        assert_eq!(super::drain_secs(Some("3")), Ok(3));
+        assert_eq!(super::drain_secs(Some(" 600 ")), Ok(600));
+        assert_eq!(super::drain_secs(Some("86400")), Ok(86_400));
+        for bad in ["0", "86401", "x", "1.5", "-5", "+5", "", " ", "1e3", "99999999999999999999"] {
+            let error = super::drain_secs(Some(bad)).expect_err(bad);
+            assert!(error.contains("SPAWN_INTEGRATE_DRAIN_SECS"), "{error}");
+        }
+    }
+
+    /// The integrator's pid file is its pid and start time, nothing else.
+    #[test]
+    fn a_pid_file_names_a_pid_and_its_start_time() {
+        assert_eq!(super::read_pid_file("4242 991\n"), Some((4242, 991)));
+        assert_eq!(super::read_pid_file("4242\n"), None);
+        assert_eq!(super::read_pid_file("4242 991 7\n"), None);
+        assert_eq!(super::read_pid_file("x 991\n"), None);
+        assert_eq!(super::read_pid_file(""), None);
+    }
+
+    /// `spawn integrate --drain` finds the integrator by its pid file: this
+    /// process runs, a start time that is not its own (a pid used again)
+    /// is gone, and a root without the file has no integrator.
+    #[test]
+    fn a_drain_request_needs_the_running_integrator_of_its_root() {
+        let pid = std::process::id();
+        let ticks = super::warm::start_ticks(pid).expect("start time");
+        assert!(super::still_runs(pid, ticks));
+        assert!(!super::still_runs(pid, ticks + 1));
+        let root = std::env::temp_dir().join(format!("spawn-drain-root-{pid}"));
+        let _ = std::fs::remove_dir_all(&root);
+        let error = super::request_drain(&root).expect_err("no pid file");
+        assert!(error.contains("no integrator runs"), "{error}");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join(super::PID_FILE), format!("{pid} {}\n", ticks + 1))
+            .expect("pid file");
+        let error = super::request_drain(&root).expect_err("gone");
+        assert!(error.contains("is gone"), "{error}");
+        super::write_pid_file(&root);
+        assert_eq!(
+            super::read_pid_file(
+                &std::fs::read_to_string(root.join(super::PID_FILE)).expect("written")
+            ),
+            Some((pid, ticks))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn disk_short(free_kb: u64, min_gb: u64, tmpdir: &str) -> Shortfall {
         Shortfall::Disk {
             free_kb,
