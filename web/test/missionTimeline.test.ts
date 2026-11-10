@@ -6,11 +6,13 @@ import {
   deriveMissionTimeline,
   earlierLabel,
   groupEnd,
+  headerLane,
   holdText,
   holdTitle,
   laneLifetimeText,
   laneToday,
   laneTodayText,
+  titleReason,
   splitEarlier,
   filterLanes,
   hasBars,
@@ -449,6 +451,27 @@ test("filters: by mission keeps the lane; by state drops lanes left empty", () =
   const open = filterLanes(lanes, null, "open");
   assert.deepEqual(open.map((l) => l.bars.map((bar) => bar.label)), [["T17"]]);
   assert.deepEqual(filterLanes(lanes, null, "cancelled"), []);
+});
+
+test("a filtered row's header still tells the mission's whole day (rev-f F1)", () => {
+  const a = mission(6, [
+    task(16, "landed", [["assigned", 0], ["landed", 7]]),
+    task(17, "delivered", [["assigned", 8], ["delivered", 9]]),
+  ]);
+  const now = T0 + 20 * MIN;
+  const { lanes } = deriveMissionTimeline([a], now);
+  for (const state of ["open", "landed"] as const) {
+    const [shown] = filterLanes(lanes, null, state);
+    assert.equal(shown.bars.length, 1, `the ${state} filter leaves one bar on the row`);
+    const day = laneToday(headerLane(lanes, shown), now);
+    assert.deepEqual([day.inFlight, day.landed], [1, 1], `under the ${state} filter`);
+  }
+});
+
+test("a title clips a reason only past 2,000 characters", () => {
+  assert.equal(titleReason("short"), "short");
+  assert.equal(titleReason("x".repeat(2000)), "x".repeat(2000));
+  assert.equal(titleReason("x".repeat(5000)), `${"x".repeat(1999)}…`);
 });
 
 test("names and states", () => {
