@@ -6,7 +6,7 @@ import type { Attention } from "../../attention";
 import type { Fleet } from "../../fleet";
 import { relativeTime } from "../../format";
 import type { NeedItem } from "../../home";
-import { agentsNow, digestToday, latestNotes, missionsToday, needsSummary } from "../../home";
+import { agentNames, agentsNow, digestToday, latestNotes, missionsToday, needsSummary } from "../../home";
 import type { Missions } from "../../missions";
 import type { FleetContext } from "../../ordering";
 import { groupAgents, missingAlwaysOn, residentName, usualEngine } from "../../ordering";
@@ -69,6 +69,8 @@ export function FleetView({
   const updated = data?.health.generated_at_ms ?? null;
   const agents = data?.agents;
   const groups = useMemo(() => groupAgents(agents ?? [], context), [agents, context]);
+  // One name per agent (design §4.5), the sidebar's and home's.
+  const names = useMemo(() => agentNames(agents ?? [], context), [agents, context]);
   // Who the box at the top types to: the dispatcher's supervisor, else the
   // board's, else the one Spawn starts.
   const onBoard = agents?.find((agent) => agent.role === "supervisor") ?? null;
@@ -193,6 +195,7 @@ export function FleetView({
         <AgentDetail
           key={selected.session_id}
           agent={selected}
+          name={names.get(selected.session_id) ?? null}
           onClose={() => onSelect(null)}
           onOpenTimeline={onOpenTimeline}
         />
