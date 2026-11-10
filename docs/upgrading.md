@@ -163,3 +163,9 @@ previous binary cannot decode the log. For example, a binary whose
 `notice.received` halts on the first one in the log, as one that lacks
 `message.typed` or `message.taken` (objective 045) does (and one whose
 `CommandAction` lacks `discard` fails that command); roll forward instead.
+Rolling back from a binary whose gates run in units (gate v2 step 2) to one
+that runs them as children: stop the gates first (`systemctl --user stop
+'spawn-gate-*'`) and remove `$SPAWN_WORKSPACE_ROOT/judgings/`, with
+`spawn-integrate` stopped. The older integrator adopts no unit: it judges
+the same tasks again beside them, and their judgings keep their controllers
+from ever being removed.

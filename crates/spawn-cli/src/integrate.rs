@@ -1594,9 +1594,7 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     // 2: they outlive a restart); else as children, which a restart stops.
     let units = gate::units_available();
     if units {
-        println!(
-            "integrate: gates run in systemd user units (spawn-gate-*): a restart does not stop them"
-        );
+        println!("integrate: {UNITS_LINE}");
     } else {
         println!(
             "integrate: no systemd user manager answers: gates run as this process's children, \
@@ -1717,6 +1715,13 @@ pub(crate) fn drain_secs(text: Option<&str>) -> Result<u64, String> {
             )
         })
 }
+
+/// What the integrator says at start when its gates run in units of their
+/// own. deploy/deploy.sh reads the installed binary for these words
+/// (`units_supported`) to stop it at once, without a drain: keep them as
+/// they are, or change both (a test reads deploy.sh for them).
+const UNITS_LINE: &str =
+    "gates run in systemd user units (spawn-gate-*): a restart does not stop them";
 
 /// The integrator's pid file in its root: its pid and start time, for
 /// `spawn integrate --drain` with the same root ([`request_drain`]).
@@ -2363,7 +2368,10 @@ impl Integrator {
     /// The drain's bound: the gates still running are halted (their
     /// process groups killed, as a gate past its time limit is, and their
     /// threads record nothing: [`gate::Halt`]), `integrator.drain_expired`
-    /// names their tasks, and the caller exits.
+    /// names their tasks, and the caller exits. Gates in units of their own
+    /// (gate v2 step 2) are no process of this one: a halt leaves them
+    /// running, the record says so (`left_running`), and the integrator
+    /// that starts next adopts them.
     fn expire_drain(&self, store: Option<&PostgresStore>) {
         self.reap();
         let gates = self.gate_tasks();
@@ -2375,15 +2383,15 @@ impl Integrator {
             .borrow()
             .as_ref()
             .map_or(0, |drain| drain.bound_s);
-        Self::record_own(
-            store,
-            &json!({
-                "type": "integrator.drain_expired", "gates": gates, "bound_s": bound_s,
-            }),
-        );
+        let mut expired = json!({
+            "type": "integrator.drain_expired", "gates": gates, "bound_s": bound_s,
+        });
+        if self.judge.units {
+            expired["left_running"] = json!(true);
+        }
+        Self::record_own(store, &expired);
         println!(
-            "integrate: the drain reached its bound of {bound_s} s: the gates of {} stopped, \
-             nothing recorded for them; exiting",
+            "integrate: the drain reached its bound of {bound_s} s: the gates of {} {}; exiting",
             if gates.is_empty() {
                 "no task".to_string()
             } else {
@@ -2392,6 +2400,11 @@ impl Integrator {
                     .map(|task| format!("task {task}"))
                     .collect::<Vec<_>>()
                     .join(", ")
+            },
+            if self.judge.units {
+                "keep running in their units, for the integrator that starts next to adopt"
+            } else {
+                "stopped, nothing recorded for them"
             }
         );
     }
@@ -3107,7 +3120,7 @@ impl Integrator {
             &self.judge.root,
             &json!({"kind": "owner", "mission": mission_id, "request": id, "source": source,
                     "shares_server": shares_server, "jobs": jobs,
-                    "gate": pinned(&self.judge.gate)}),
+                    "gate": pinned(&self.judge.gate), "scenarios": gated.gate}),
             self.judge.units,
         ) {
             Ok(judging) => judging,
@@ -6086,6 +6099,24 @@ mod tests {
         );
         assert_eq!(task_scenario(now, None), None);
         assert_eq!(task_scenario(now, Some("/")), None);
+    }
+
+    /// deploy/deploy.sh tells a binary whose gates outlive it by the words
+    /// it says at start ([`super::UNITS_LINE`]): the two must not drift.
+    #[test]
+    fn deploy_reads_the_words_the_integrator_says_of_its_units() {
+        let deploy = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/deploy.sh"),
+        )
+        .expect("deploy/deploy.sh");
+        let words = super::UNITS_LINE
+            .split(':')
+            .next()
+            .expect("the words before the colon");
+        assert!(
+            deploy.contains(&format!("grep -aqF '{words}")),
+            "deploy.sh greps for {words:?}"
+        );
     }
 
     #[test]
@@ -11799,6 +11830,13 @@ mod database_tests {
         assert_eq!(described["task"], json!(task));
         assert_eq!(described["mission"], json!(mission));
         assert_eq!(described["source"], json!(source));
+        // What deploy/controller.sh keeps while the judging lasts: the gate
+        // and the scenarios it runs, each as pinned (physical).
+        assert_eq!(
+            described["gate"],
+            json!(super::pinned(&integrator.judge.gate))
+        );
+        assert_eq!(described["scenarios"], json!(super::pinned(&scenarios)));
         // Gone once recorded; the parent stays, empty.
         assert!(
             !judgings.join(id).exists(),
@@ -14164,6 +14202,44 @@ mod database_tests {
             std::fs::symlink_metadata(modules.join("pkg/index.js")).is_ok(),
             "the controller's own is untouched"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An owner judging's description names the gate and the scenarios it
+    /// runs, as pinned, like a task's: deploy/controller.sh keeps the
+    /// controller either lies in while the judging lasts (rev-e C1 on commit
+    /// 7: a Supply push cleans the supply-pa controller a running Supply gate
+    /// reads its scenarios from).
+    #[test]
+    fn an_owner_judging_names_its_gate_and_scenarios() {
+        let (base, source, scenarios, integrator) = world("owner-described", "");
+        let seen = base.join("described.json");
+        let gate = format!(
+            "cp \"$(dirname \"$(dirname \"$SPAWN_GATE_VERDICT\")\")/judging.json\" '{seen}'\n\
+             printf '%s\\n' '{{\"verdict\":\"accepted\"}}' >\"$SPAWN_GATE_VERDICT\"\n",
+            seen = seen.display()
+        );
+        std::fs::write(base.join("gate.sh"), gate).expect("gate");
+        let db = Db::new("owner_described");
+        db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", "")],
+            "owner: described",
+        );
+        gated_request(&db, &source, &commit, "described");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        let described: Value =
+            serde_json::from_str(&std::fs::read_to_string(&seen).expect("judging.json"))
+                .expect("json");
+        assert_eq!(described["kind"], json!("owner"));
+        assert_eq!(
+            described["gate"],
+            json!(super::pinned(&integrator.judge.gate))
+        );
+        assert_eq!(described["scenarios"], json!(super::pinned(&scenarios)));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -17032,6 +17108,65 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         assert!(control_records(&db, "task.gated").is_empty(), "no verdict");
         assert_eq!(db.mission(mission)["tasks"][0]["state"], "reported");
         assert!(control_records(&db, "integrator.drained").is_empty());
+        for path in [base, marks] {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+
+    /// A drain at its bound with gates in units of their own (gate v2 step
+    /// 2, commit 7): the halt stops none of them, `integrator.drain_expired`
+    /// says so (`left_running`), and the integrator that starts next adopts
+    /// the gate and records it once. Skipped where no systemd user manager
+    /// answers.
+    #[test]
+    fn a_drain_at_its_bound_leaves_a_units_gate_for_the_next_integrator() {
+        if !crate::gate::units_available() {
+            eprintln!("no systemd user manager answers here: not tried");
+            return;
+        }
+        let marks = fresh_marks("spawn-db-drain-units-marks");
+        let _release = Release(marks.clone());
+        let _units = StopUnits;
+        let (base, source, scenarios, first) = world("drain-units", &holding_gate(&marks));
+        let first = first.with_units(true);
+        let db = Db::new("drain_units");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w1");
+        push_work(&base, &source, &agent_of(&db, mission, task), "w1.txt");
+        first.pass_on(&db.store).expect("the first pass");
+        assert_eq!(wait_started(&marks, 1).len(), 1, "the gate runs");
+        first.begin_drain(Some(&db.store), 1);
+        first.expire_drain(Some(&db.store));
+        assert_eq!(
+            control_records(&db, "integrator.drain_expired"),
+            vec![
+                json!({"type": "integrator.drain_expired", "gates": [task], "bound_s": 1,
+                        "left_running": true})
+            ]
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            control_records(&db, "task.gated").is_empty(),
+            "no verdict yet"
+        );
+        let second = Integrator::new(
+            base.join("host"),
+            first.judge.gate.clone(),
+            test_gate_env(),
+            room_to_spare(),
+            super::DEFAULT_GATES,
+        )
+        .with_units(true);
+        second
+            .pass_on(&db.store)
+            .expect("the next integrator's pass");
+        assert_eq!(second.running.borrow().len(), 1, "it adopted the gate");
+        std::fs::write(marks.join("release"), "").expect("release");
+        second.settle();
+        first.settle();
+        assert_eq!(started(&marks).len(), 1, "the gate ran once");
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        assert_eq!(control_records(&db, "task.gated").len(), 1);
         for path in [base, marks] {
             let _ = std::fs::remove_dir_all(&path);
         }

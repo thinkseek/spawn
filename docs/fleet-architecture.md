@@ -2764,7 +2764,13 @@ are per-agent uids or a mount per engine.
   the operator and a later pass judges again (a git that cannot run a
   merge is the host's problem, not the work's: objective 008).
   TERM kills the gate with the process (no record), and the next
-  integrator judges the task again from nothing. A drain does not: a
+  integrator judges the task again from nothing, when its gates run as
+  its children. When a systemd user manager answers, each gate runs in a
+  unit of its own (gate v2 step 2, design-gate-survives-restart.md): a
+  stop or a restart stops no gate, the next integrator adopts each one
+  still running and records it once, and deploy/deploy.sh stops such an
+  integrator at once, without a drain (deploy/controller.sh keeps the
+  controller a running judging's gate came from). A drain does not: a
   drain request (SIGUSR1, or `spawn integrate --drain` with the same
   root, which waits until that integrator is gone) records
   `integrator.draining` {`gates`, `bound_s`}, starts no gate, owner
@@ -2773,7 +2779,9 @@ are per-agent uids or a mount per engine.
   `integrator.drained` and exits 0. At `SPAWN_INTEGRATE_DRAIN_SECS`
   (default 7200, from the draining record) it kills the gates still
   running (their process groups; nothing is recorded for them), records
-  `integrator.drain_expired` naming their tasks, exits 0, and the
-  dispatcher tells the supervisor once (`host
+  `integrator.drain_expired` naming their tasks (gates in units are not
+  its processes: they keep running, the record says `left_running`, and
+  the next integrator adopts them), exits 0, and the dispatcher tells the
+  supervisor once (`host
   integrator-drain-expired-<event id>`). One integrator per database: its
   advisory lock belongs to the connection, kept while any gate runs.
