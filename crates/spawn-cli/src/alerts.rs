@@ -4298,6 +4298,7 @@ connections\n";
         use super::super::{Event, Monitor};
         use super::{commit, decided, fires, monitor};
         use serde_json::{Value, json};
+        use spawn_core::command::Outcome;
         use spawn_core::event::{
             ENGINE, EndCause, EventKind, ModelProfile, NewEvent, SessionSeq, Source,
         };
@@ -4862,6 +4863,7 @@ connections\n";
             answered: CommandId,
             deaf: CommandId,
             untyped: CommandId,
+            refused: CommandId,
         }
 
         const MSG_EXECUTION: &str = "exec_msg_1";
@@ -4875,6 +4877,15 @@ connections\n";
             store
                 .host_record(&json!({"type": "host.messages_marked", "started_at_ms": 1}))
                 .expect("the first marking loop");
+            // The older Spawn's input finished; then one the Bridge refused
+            // before typing it, which a loop sends again as a new command.
+            finish(store, old, &Outcome::Succeeded);
+            let refused = input(store, session, "refused", "same text");
+            finish(
+                store,
+                refused,
+                &Outcome::Failed("pane state Busy does not accept input".to_string()),
+            );
             let answered = input(store, session, "answered", "same text");
             let deaf = input(store, session, "deaf", "same text");
             let untyped = input(store, session, "untyped", "same text");
@@ -4889,7 +4900,19 @@ connections\n";
                 answered,
                 deaf,
                 untyped,
+                refused,
             }
+        }
+
+        /// Claim `command` (the oldest unfinished one) and finish it.
+        fn finish(store: &PostgresStore, command: CommandId, outcome: &Outcome) {
+            use spawn_core::port::CommandQueue;
+            let claimed = store
+                .claim("tester", std::time::Duration::from_secs(60))
+                .expect("claim")
+                .expect("a command");
+            assert_eq!(claimed.command_id, command);
+            store.finish(&claimed, outcome).expect("finish");
         }
 
         /// Each command's message read by its id from the records, by the
@@ -4953,6 +4976,12 @@ connections\n";
                     (&never["state"], &never["not_taken"], &never["typed_at_ms"]),
                     (&json!("recorded"), &json!(true), &Value::Null),
                     "{never}"
+                );
+                let refused = message(world.refused);
+                assert_eq!(
+                    (&refused["state"], &refused["not_taken"]),
+                    (&json!("recorded"), &json!(false)),
+                    "one refused before typing is no message not taken: {refused}"
                 );
                 let older = message(world.old);
                 assert_eq!(

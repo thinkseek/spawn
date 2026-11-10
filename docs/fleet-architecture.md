@@ -1155,8 +1155,10 @@ A message's id is its command's id, carried end to end:
   it, and it is never not taken, whenever it was typed — deploy.sh stops
   only the integrator before `init-db`, so the old loop types on, without
   markers, after the upgrade until the deploy restarts it. A command never
-  typed (no `typing` step) is told by when a loop that types markers first
-  started: each loop's Bridge records `host.messages_marked` when it is
+  typed (no `typing` step) that finished failed is none either: the Bridge
+  refused it before typing, its sender is told (`command_failed`), and a
+  loop sends it again as a new command. Any other command never typed is
+  told by when a loop that types markers first started: each loop's Bridge records `host.messages_marked` when it is
   built, and the store keeps the first alone. A never-typed command still
   open at that start or after it, or finished after it, is tracked, its
   bound running from the later of its creation and that start; one that
