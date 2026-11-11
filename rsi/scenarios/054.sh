@@ -1,6 +1,6 @@
 #!/bin/sh
-# Black box: a full `cargo test` leaves no scratch of its own in TMPDIR,
-# apart from a failing test's own directory.
+# Black box: a `cargo test` whose tests pass leaves nothing in TMPDIR (a
+# failing test may keep its own directory).
 #
 # The workspace's tests make their scratch under std::env::temp_dir()
 # (`spawn-git-<tag>-<pid>`, `spawn-branches-<tag>-<pid>`,
@@ -21,7 +21,9 @@
 # Required: every test's scratch is removed when the test ends, kept only
 # when the test fails (for debugging); a halted gate removes its private
 # directory before its thread parks. A `cargo test` whose tests all pass
-# leaves no new `spawn-*` entry in its TMPDIR.
+# leaves no new entry of any name in its TMPDIR (a renamed scratch is a
+# scratch all the same; on 351fb1e6 the toolchain itself leaves nothing
+# there, so no name is allowed).
 #
 # To keep its cost per gate small, the scenario runs only the two crates
 # that leak, `cargo test -p spawn-host -p spawn-cli` (about 130 s; the build
@@ -30,8 +32,7 @@
 # left:
 #   (1) the tests pass (a failing suite cannot be judged for its scratch;
 #       the check of the tests reports it);
-#   (2) no `spawn-*` entry is left in that TMPDIR.
-# Entries of other names (the tools' own) are listed, not judged.
+#   (2) nothing is left in that TMPDIR, whatever its name.
 # Once this is solved, the owner folds the same check into the check of the
 # tests (every crate) and retires this scenario.
 #
@@ -85,21 +86,22 @@ TMPDIR=$scratch cargo test --quiet -p spawn-host -p spawn-cli >"$WORK/test.log" 
 rc=$?
 set -e
 took=$(( $(date +%s) - s ))
-left=$(find "$scratch" -mindepth 1 -maxdepth 1 -name 'spawn-*' -printf '%f\n' | sort)
-others=$(find "$scratch" -mindepth 1 -maxdepth 1 ! -name 'spawn-*' -printf '%f\n' | sort | head -n 20 | tr '\n' ' ')
-[ -z "$others" ] || note "entries of other names left in TMPDIR (not judged): $others"
+# Every entry, whatever its name: a scratch renamed is a scratch all the same.
+# On 351fb1e6 the toolchain (cargo, rustc, git, psql, the test binaries'
+# children) leaves nothing else here, so nothing is allowed.
+left=$(find "$scratch" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
 if [ "$rc" -ne 0 ]; then
     grep -E '^test .* FAILED|^error|panicked' "$WORK/test.log" | head -n 15 >&2 || true
-    fail "(1) cargo test -p spawn-host -p spawn-cli failed (exit $rc, ${took} s): a failing suite cannot be judged for its scratch; its spawn-* entries: $(printf '%s' "$left" | wc -l)"
+    fail "(1) cargo test -p spawn-host -p spawn-cli failed (exit $rc, ${took} s): a failing suite cannot be judged for its scratch; entries in its TMPDIR: $(printf '%s' "$left" | grep -c . || true)"
 fi
 note "(1) cargo test -p spawn-host -p spawn-cli passed in ${took} s"
 count=$(printf '%s' "$left" | grep -c . || true)
 if [ "$count" -gt 0 ]; then
     size=$(du -sm "$scratch" | cut -f1)
     by=$(printf '%s\n' "$left" | sed -E 's/-[0-9]+$//' | sort | uniq -c | sort -rn | head -n 12 | awk '{printf "%s x%s, ", $2, $1}')
-    fail "(2) a passing cargo test -p spawn-host -p spawn-cli left $count spawn-* entries (${size} MB) in its TMPDIR: $by..."
+    fail "(2) a passing cargo test -p spawn-host -p spawn-cli left $count entries (${size} MB) in its TMPDIR, which was empty before: $by..."
 fi
-note "(2) no spawn-* entry left in TMPDIR"
+note "(2) nothing left in TMPDIR"
 
-echo "054: the tests of spawn-host and spawn-cli, all passing, leave no spawn-* scratch in their TMPDIR"
+echo "054: the tests of spawn-host and spawn-cli, all passing, leave nothing in their TMPDIR"
 exit 0
