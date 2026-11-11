@@ -23,10 +23,15 @@ rewraps: a trailing comma before `}`, before `]`, and before the `)` of a
 call is ignored. A one-element tuple's comma, `(x,)`, is kept.
 
 What passes:
-- <source> loses lines, and gains only these, each a whole line: `mod` and
-  `use` lines, attributes and `///` docs placed directly above them, blank
-  lines and `//!` module docs.
-- Each contiguous run of lines removed from <source> appears as a
+- <source> loses lines, and gains only whole `mod` and `use` statements
+  (rustfmt may wrap one over lines), each with the attributes and `///`
+  docs directly above it, blank lines and `//!` module docs.
+- <source> may lose a top-level `use` statement outright (the code that
+  needed it moved; the build proves no name changed meaning). Each is
+  flagged.
+- Each contiguous run of lines removed from <source> (a run that starts
+  with a lone `}` the next kept line repeats is read one line down: the
+  same removal, as the moved code reads) appears as a
   contiguous run of tokens in exactly one file that <head> adds. One
   difference is allowed there: a visibility (`pub(super)` or `pub(crate)`)
   inserted before an item keyword that had none.
@@ -68,10 +73,6 @@ ITEM_KEYWORDS = {
     "async", "unsafe", "extern", "impl", "macro_rules",
 }
 VISIBILITY_SCOPES = {"super", "crate"}
-SOURCE_LINE_OK = re.compile(
-    r"^\s*(?:$|//!.*|(?:pub(?:\((?:crate|super)\))? )?(?:mod [A-Za-z_][A-Za-z0-9_]*;|use [^;]*;)\s*$)"
-)
-SOURCE_DECORATION = re.compile(r"^\s*(?:///.*|#\[[^\]]*\]\s*)$")
 INLINE_MOD = re.compile(r"^(\s*)(?:pub(?:\((?:crate|super)\))? )?mod ([A-Za-z_][A-Za-z0-9_]*) \{\s*$")
 IDENT = re.compile(r"r#[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*")
 NUMBER = re.compile(r"[0-9][0-9_]*(?:\.[0-9][0-9_]*)?(?:[eE][+-]?[0-9_]+)?[A-Za-z0-9_]*")
@@ -273,6 +274,31 @@ def rustfmt(repo: str, base: str, text: str) -> str | None:
     return done.stdout
 
 
+def statements_only(tokens: list[Token], covered: list[bool] | None = None) -> int | None:
+    """The first token that is not part of a `use`/`mod` statement (with
+    the attributes and `///` docs directly above it) or a `//!` doc,
+    skipping covered tokens; None when there is none."""
+    covered = covered or [False] * len(tokens)
+    k = 0
+    while k < len(tokens):
+        if covered[k] or tokens[k].text.startswith("//!"):
+            k += 1
+            continue
+        j = k
+        while j < len(tokens) and not covered[j]:
+            if tokens[j].text.startswith("///"):
+                j += 1
+            elif (end := attribute_end(tokens, j)) is not None:
+                j = end
+            else:
+                break
+        end = statement_end(tokens, j) if j < len(tokens) and not covered[j] else None
+        if end is None or any(covered[j:end]):
+            return k
+        k = end
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("-C", dest="repo", default=".")
@@ -304,22 +330,24 @@ def main() -> int:
     stem = source[: -len(".rs")]
     module_dir = os.path.dirname(source) if os.path.basename(source) in ("mod.rs", "main.rs", "lib.rs") else stem
 
-    # What <source> gained, line by line.
+    # What <source> gained: whole use/mod statements (rustfmt may wrap a
+    # long one over several lines), each with its attributes and docs, and
+    # //! docs.
     matcher = difflib.SequenceMatcher(a=base, b=head, autojunk=False)
     opcodes = matcher.get_opcodes()
     for tag, _a0, _a1, b0, b1 in opcodes:
         if tag not in ("insert", "replace"):
             continue
-        for j in range(b0, b1):
-            line = head[j]
-            if SOURCE_DECORATION.match(line):
-                nxt = next((k for k in range(j + 1, b1) if not SOURCE_DECORATION.match(head[k])), None)
-                if nxt is None or not re.search(r"\b(?:mod|use) ", head[nxt]):
-                    failures.append(f"{source}:{j + 1}: an attribute or doc added above no added mod/use: {line.strip()[:100]}")
-            elif not SOURCE_LINE_OK.match(line):
-                failures.append(f"{source}:{j + 1}: added a line that is not mod/use/blank/module doc: {line.strip()[:100]}")
-            elif re.match(r"^\s*(?:pub(?:\([a-z]+\))? )?use [^;]*::\*;", line):
-                flags.append(f"{source}:{j + 1}: glob import added (prefer an explicit list): {line.strip()}")
+        gained = normalize(tokenize("\n".join(head[b0:b1])))
+        bad = statements_only(gained)
+        if bad is not None:
+            failures.append(
+                f"{source}:{b0 + gained[bad].line + 1}: added what is not a mod/use statement, its attributes"
+                f" or docs, or a module doc: {head[b0 + gained[bad].line].strip()[:100]}"
+            )
+        for k in range(len(gained) - 1):
+            if gained[k].text == ":" and gained[k + 1].text == "*" and k and gained[k - 1].text == ":":
+                flags.append(f"{source}:{b0 + gained[k].line + 1}: glob import added (prefer an explicit list)")
 
     def tokens_in(first: int, last: int) -> list[int]:
         """Indexes of base tokens that start on lines first..last-1."""
@@ -335,6 +363,8 @@ def main() -> int:
             for start in range(len(tokens)):
                 if tokens[start].text != run[0].text and not visibility_at(tokens, start):
                     continue
+                if start >= 4 and visibility_at(tokens, start - 4) and run[0].text in ITEM_KEYWORDS:
+                    continue  # the same placement, found from its inserted visibility
                 end = match_at(run, tokens, start)
                 if end is not None and not any(covered[path][start:end]):
                     found.append((path, start, end))
@@ -360,6 +390,45 @@ def main() -> int:
             runs[-1] = (runs[-1][0], d + 1)
         else:
             runs.append((d, d + 1))
+
+    # Slide a run down past a closing line it shares with what follows
+    # (`}` then the next item, against the same item then its `}`): the
+    # same removal, said the way the moved code reads.
+    removed_set = set(removed)
+    for r, (a0, a1) in enumerate(runs):
+        while a1 < len(base) and a1 not in removed_set and base[a0] == base[a1] and base[a0].strip() in ("}", "};", ""):
+            a0, a1 = a0 + 1, a1 + 1
+        runs[r] = (a0, a1)
+
+    # A top-level use statement <source> no longer needs may go: the code
+    # that needed it moved. The build says no name changed meaning.
+    depth_of: list[int] = []
+    depth = 0
+    for token in base_tokens:
+        if token.text in ("}", ")", "]"):
+            depth -= 1
+        depth_of.append(depth)
+        if token.text in ("{", "(", "["):
+            depth += 1
+
+    def without_imports(indexes: list[int]) -> list[list[int]]:
+        """`indexes` split around the top-level use statements in it."""
+        parts: list[list[int]] = [[]]
+        inside = set(indexes)
+        k = 0
+        while k < len(indexes):
+            at = indexes[k]
+            end = statement_end(base_tokens, at) if depth_of[at] == 0 else None
+            keyword = at + (visibility_at(base_tokens, at) or int(base_tokens[at].text == "pub"))
+            if end is not None and base_tokens[keyword].text == "use" and all(i in inside for i in range(at, end)):
+                text = " ".join(t.text for t in base_tokens[at:end])
+                flags.append(f"{source}:{base_tokens[at].line + 1}: import removed: {text[:100]}")
+                parts.append([])
+                k += end - at
+                continue
+            parts[-1].append(at)
+            k += 1
+        return [part for part in parts if part]
 
     for a0, a1 in runs:
         what = f"{source}:{a0 + 1}-{a1}"
@@ -399,33 +468,22 @@ def main() -> int:
                 place([], [target], f"{what} (mod {name}'s body, as rustfmt lays it out at top level)",
                       normalize(tokenize(formatted)))
                 for part, label in ((before, "before"), (after, "after")):
-                    if part:
-                        place(part, [p for p in news if p != target], f"{what} ({label} mod {name})")
+                    for piece in without_imports(part):
+                        place(piece, [p for p in news if p != target], f"{what} ({label} mod {name})")
                 continue
-        where = place(indexes, list(news), what)
+        wheres = [place(part, list(news), what) for part in without_imports(indexes)]
+        where = next((w for w in wheres if w), None)
         if where:
             for d in range(a0, a1):
                 if re.search(r"\b(?:super|self)::", base[d]) and not base[d].lstrip().startswith("//"):
                     flags.append(f"{source}:{d + 1}: moved one module down into {where}: {base[d].strip()[:100]}")
 
     # What else an added file may hold: use/mod statements, their
-    # attributes, and //! docs.
+    # attributes and docs, and //! docs.
     for path, tokens in news.items():
         k = 0
-        while k < len(tokens):
-            if covered[path][k]:
-                k += 1
-                continue
-            if tokens[k].text.startswith("//!"):
-                k += 1
-                continue
-            j = k
-            while j < len(tokens) and not covered[path][j] and (end := attribute_end(tokens, j)):
-                j = end
-            end = statement_end(tokens, j) if j < len(tokens) and not covered[path][j] else None
-            if end is not None and not any(covered[path][j:end]):
-                k = end
-                continue
+        while (bad := statements_only(tokens[k:], covered[path][k:])) is not None:
+            k += bad
             failures.append(f"{path}:{tokens[k].line + 1}: not moved from {source}: {tokens[k].text[:80]!r}")
             while k < len(tokens) and not covered[path][k]:
                 k += 1

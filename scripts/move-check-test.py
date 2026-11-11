@@ -110,6 +110,61 @@ pub(super) fn join(first: &str, second: &str) -> String {
 '''
 
 
+SHOWN = '''\
+struct Shown(u32);
+
+impl fmt::Display for Shown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+'''
+
+SHOWN_FILE = '''\
+use std::fmt;
+
+pub(super) struct Shown(u32);
+
+impl fmt::Display for Shown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+'''
+
+SHOWN_MOVED = BASE.replace(SHOWN + "\n", "").replace("use std::fmt;\n", "use std::fmt;\n\nmod shown;\n")
+
+SLIDE_MIDDLE = '''\
+fn middle() -> String {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    write!(text, "{}", 2).unwrap();
+    text
+}
+
+'''
+
+SLIDE_BASE = '''\
+fn first() -> u32 {
+    1
+}
+
+''' + SLIDE_MIDDLE + '''\
+fn last() -> u32 {
+    3
+}
+'''
+
+SLIDE_MIDDLE_FILE = '''\
+pub(super) fn middle() -> String {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    write!(text, "{}", 2).unwrap();
+    text
+}
+'''
+
+
 def moved_tests(source: str) -> str:
     start = source.index("/// The tests.")
     return source[:start] + MOD_STUB
@@ -124,11 +179,11 @@ def tree(files: dict[str, str]) -> dict[str, str]:
     return files
 
 
-CASES: list[tuple[str, int, dict[str, str], str]] = []
+CASES: list[tuple[str, int, dict[str, str], str, str]] = []
 
 
-def case(name: str, expect: int, files: dict[str, str], says: str = "") -> None:
-    CASES.append((name, expect, files, says))
+def case(name: str, expect: int, files: dict[str, str], says: str = "", base: str = BASE) -> None:
+    CASES.append((name, expect, files, says, base))
 
 
 # Passes.
@@ -140,6 +195,14 @@ case("both at once", 0,
      {SOURCE: moved_join(moved_tests(BASE)), "src/big/tests.rs": TESTS_FILE, "src/big/join.rs": JOIN_FILE})
 case("a glob re-export passes but is flagged", 0,
      {SOURCE: moved_join(BASE, "use join::*;\n"), "src/big/join.rs": JOIN_FILE}, "glob import added")
+
+case("a re-export rustfmt wraps over lines, one under #[cfg(test)]", 0,
+     {SOURCE: moved_join(BASE, "#[cfg(test)]\nuse join::{\n    join,\n};\n"), "src/big/join.rs": JOIN_FILE})
+case("an import the source no longer needs, removed and flagged", 0,
+     {SOURCE: moved_join(SHOWN_MOVED, "use join::join;\n").replace("use std::fmt;\n", ""),
+      "src/big/join.rs": JOIN_FILE, "src/big/shown.rs": SHOWN_FILE}, "import removed: use std")
+case("a run diffed as the previous item's } plus the item", 0,
+     {SOURCE: SLIDE_BASE.replace(SLIDE_MIDDLE, ""), "src/big/middle.rs": SLIDE_MIDDLE_FILE}, "", SLIDE_BASE)
 
 # Fails: what M1 asks to be shown.
 case("two moved lines swapped", 1,
@@ -164,7 +227,7 @@ case("a removed line found nowhere", 1,
      {SOURCE: BASE.replace('    join("hello", name)\n', '    join("hi", name)\n')})
 case("a line added to the source that is not mod/use", 1,
      {SOURCE: moved_join(BASE).replace("use join::join;\n", "use join::join;\nconst EXTRA: u32 = 1;\n"),
-      "src/big/join.rs": JOIN_FILE}, "added a line")
+      "src/big/join.rs": JOIN_FILE}, "added what is not")
 case("an attribute added above no mod/use", 1,
      {SOURCE: moved_join(BASE).replace("struct Shown", "#[derive(Debug)]\nstruct Shown"),
       "src/big/join.rs": JOIN_FILE}, "")
@@ -179,6 +242,12 @@ case("an item moved twice", 1,
       "src/big/again.rs": JOIN_FILE.replace("//! Joining names.\n\n", "")}, "")
 case("a visibility other than pub(super)/pub(crate)", 1,
      {SOURCE: moved_join(BASE), "src/big/join.rs": JOIN_FILE.replace("pub(super) fn", "pub fn")})
+case("an inline module renamed", 1,
+     {SOURCE: BASE.replace("/// The tests.\n#[cfg(test)]\nmod tests {", "/// The tests.\n#[cfg(test)]\nmod testz {")
+      .replace("mod testz {", "mod testz {", 1)}, "")
+case("a use inside a moved fn's body dropped", 1,
+     {SOURCE: SLIDE_BASE.replace(SLIDE_MIDDLE, ""),
+      "src/big/middle.rs": SLIDE_MIDDLE_FILE.replace("    use std::fmt::Write as _;\n", "")}, "", SLIDE_BASE)
 case("the module stub left out", 1,
      {SOURCE: moved_tests(BASE).replace(MOD_STUB, ""), "src/big/tests.rs": TESTS_FILE})
 
@@ -214,16 +283,21 @@ def main() -> int:
                 out.write(text)
         run(["git", "add", "-A"], repo, env)
         run(["git", "commit", "-q", "-m", "base"], repo, env)
-        for name, expect, files, says in CASES:
+        for name, expect, files, says, base in CASES:
             run(["git", "checkout", "-q", "--detach", "main"], repo, env)
             run(["git", "clean", "-qfd"], repo, env)
+            if base != BASE:
+                with open(os.path.join(repo, SOURCE), "w") as out:
+                    out.write(base)
+                run(["git", "commit", "-qam", "another base"], repo, env)
+            start = run(["git", "rev-parse", "HEAD"], repo, env).stdout.strip()
             for path, text in files.items():
                 os.makedirs(os.path.dirname(os.path.join(repo, path)), exist_ok=True)
                 with open(os.path.join(repo, path), "w") as out:
                     out.write(text)
             run(["git", "add", "-A"], repo, env)
             run(["git", "commit", "-q", "-m", name], repo, env)
-            done = run([sys.executable, "-I", CHECK, "-C", repo, "main", "HEAD", SOURCE], repo, env)
+            done = run([sys.executable, "-I", CHECK, "-C", repo, start, "HEAD", SOURCE], repo, env)
             output = done.stdout + done.stderr
             ok = done.returncode == expect and says in output
             failed += not ok
