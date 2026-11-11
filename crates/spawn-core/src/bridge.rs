@@ -3301,8 +3301,8 @@ impl Bridge {
     }
 
     /// Before a resume of `native`: its transcript is where the engine
-    /// reads it, put back from the archive when it went missing, or why the
-    /// resume cannot go on ([`transcripts::restore`]).
+    /// reads it, put back from the archive when it went missing or lost its
+    /// head, or why the resume cannot go on ([`transcripts::restore`]).
     fn ready_transcript(
         &self,
         claimed: &Claimed,
@@ -3324,11 +3324,23 @@ impl Bridge {
             native,
             read_before,
         )?;
-        if let Some(bytes) = restored {
-            report.warnings.push(format!(
+        match restored {
+            Some(transcripts::Restored::Written { bytes }) => report.warnings.push(format!(
                 "{}: {path} was missing; restored {bytes} bytes from the transcript archive",
                 claimed.session_id
-            ));
+            )),
+            Some(transcripts::Restored::Replaced { bytes, had }) => report.warnings.push(format!(
+                "{}: {path} held {had} bytes and the transcript archive more (it lost its head); \
+                 restored {bytes} bytes, every byte it held among them",
+                claimed.session_id
+            )),
+            Some(transcripts::Restored::Left { had }) => report.warnings.push(format!(
+                "{}: {path} ({had} bytes) is not the transcript archive's latest copy of it, so \
+                 it was not restored from the archive; it is resumed as it is, and the archive \
+                 keeps every copy it made",
+                claimed.session_id
+            )),
+            None => {}
         }
         Ok(())
     }
