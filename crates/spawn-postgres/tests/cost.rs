@@ -195,9 +195,27 @@ fn each_model_row_says_how_many_of_its_tokens_have_no_price() {
     let (_mission, _task, worker) = one_task(&store);
     let now = store.database_now_ms().expect("now");
     started(&store, &worker, 1);
-    usage(&store, &worker, 1, ("msg_x", "model-x", now), [100_000, 10_000, 0, 0]);
-    usage(&store, &worker, 1, ("msg_z1", "model-z", now), [200_000, 20_000, 1, 2]);
-    usage(&store, &worker, 1, ("msg_z2", "model-z", now), [50_000, 5000, 0, 0]);
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_x", "model-x", now),
+        [100_000, 10_000, 0, 0],
+    );
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_z1", "model-z", now),
+        [200_000, 20_000, 1, 2],
+    );
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_z2", "model-z", now),
+        [50_000, 5000, 0, 0],
+    );
     assert_eq!(store.cost_record(&prices(3.0)).expect("record"), 3);
 
     let day = store.cost_window(now - DAY_MS, now + 1000).expect("window");

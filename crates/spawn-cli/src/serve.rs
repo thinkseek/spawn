@@ -3315,7 +3315,13 @@ mod tests {
                 )
                 .expect("a task");
             let docs = store
-                .task_assign(other, "ephemeral", "w2", "Goal: rewrite the guide.", "default")
+                .task_assign(
+                    other,
+                    "ephemeral",
+                    "w2",
+                    "Goal: rewrite the guide.",
+                    "default",
+                )
                 .expect("a task");
             let mut board = store.mission_board(50).expect("the board");
             super::labels::label_board(&mut board);
@@ -3326,8 +3332,10 @@ mod tests {
                     .flatten()
                     .flat_map(|mission| mission["tasks"].as_array().into_iter().flatten())
                     .find(|task| task["id"] == id)
-                    .map(|task| task["label"].clone())
-                    .unwrap_or_else(|| panic!("no task {id} on the board: {board}"))
+                    .map_or_else(
+                        || panic!("no task {id} on the board: {board}"),
+                        |task| task["label"].clone(),
+                    )
             };
             let mut answer = json!({"tasks": [
                 {"task": extras, "usd": 1.0},
