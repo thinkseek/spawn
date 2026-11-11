@@ -1372,8 +1372,9 @@ readable by `spawn_reader` and the supervisor):
 
 | View | One row per | Columns |
 | --- | --- | --- |
-| `spawn_decisions` | judgement (at its time) and command (at its creation) | `at_ms`, `tier` (`rules` when the rules judged, else `model`; `dispatcher` for `spawn-dispatch`, `supervisor` for `spawn_supervisor`, `human` for `human` and `spawn`, `liveness` for `spawn-liveness`, any other principal as its own tier), `session_id`, `agent_id`, `source` (the judge or the principal) |
-| `spawn_interventions` | the scorecard's interventions (docs/design.md §15, autonomy (a)-(d)) | `at_ms`, `kind` (`command`, `resume`, `owner_task`, `cancel_reassign`), `mission_id`, `task_id`, `command_id` |
+| `spawn_decisions` | judgement (at its time), command of Spawn's loops (at its creation) and person's intent (`spawn_human_intents`, at its time; §0) | `at_ms`, `tier` (`rules` when the rules judged, else `model`; `dispatcher` for `spawn-dispatch`, `supervisor` for `spawn_supervisor`, `human` for an intent of `human` or `spawn`, `liveness` for `spawn-liveness`, any other principal as its own tier), `session_id`, `agent_id`, `source` (the judge or the principal) |
+| `spawn_interventions` | the scorecard's interventions (docs/design.md §15, autonomy (a)-(d)) | `at_ms`, `kind` (`command`: a person's intent, `command_id` its first command; `resume`, `owner_task`, `cancel_reassign`), `mission_id`, `task_id`, `command_id`, `cancelled_task_id` (a cancel and reassign's cancelled task) |
+| `spawn_human_intents` | a person's intent (§0) | `at_ms`, `intent` (its first command's id), `principal`, `agent_id`, `session_id`, `commands` (in order), `attempts`, `outcome` (`taken`, `failed`, `pending`), then each command's `created_at_ms`, `finished_at_ms` and `succeeded` in order, and `action` |
 | `spawn_outcomes` | task's closing record | `at_ms`, `outcome` (`landed`, `accepted`: a review that closes it on a mission without a gate, `cancelled`, `aborted`, `over_budget`), `task_id`, `mission_id`, `by` |
 | `spawn_escalations` | distinct tag of the dispatcher's inputs into the supervisor (`Escalation::tag`; a charter's tag is not one), at the first command that carried it | `at_ms`, `tag`, `command_id` |
 
