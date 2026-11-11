@@ -1,4 +1,6 @@
 #!/bin/sh
+# Nightly (rsi/scenarios/nightly/, run by scripts/rsi/nightly.sh on live main, alone on a
+# held host; gate v2 step 5a). Owner: the lead. Left the gate unchanged otherwise.
 # Black box: the Bridge follows screens and transcripts without a
 # subprocess per agent per tick. Today bridge.rs `follow_screen` runs a tmux
 # capture for every live session and `follow_output` re-reads every live
