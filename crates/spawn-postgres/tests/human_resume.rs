@@ -63,7 +63,13 @@ fn gated_mission(store: &PostgresStore) -> (i64, i64) {
         .mission_add("Gated", &json!(["/tmp/source.git"]), "human")
         .expect("add");
     store
-        .mission_configure(mission, Some("/controller/rsi/scenarios"), "gate", None, None)
+        .mission_configure(
+            mission,
+            Some("/controller/rsi/scenarios"),
+            "gate",
+            None,
+            None,
+        )
         .expect("configure");
     let task = store
         .task_assign(mission, "ephemeral", "w", "brief", "default")
@@ -90,9 +96,11 @@ fn the_gating_that_sets_the_floor_names_its_scenarios_and_the_board_names_the_ha
 
     let gated = |verdict: &str, scenarios: u32, names: Value| {
         store
-            .integrator_record(&json!({"type": "task.gated", "id": task, "verdict": verdict,
+            .integrator_record(
+                &json!({"type": "task.gated", "id": task, "verdict": verdict,
                                         "revision": 0, "base": "b1", "scenarios": scenarios,
-                                        "scenario_names": names}))
+                                        "scenario_names": names}),
+            )
             .expect("gated");
     };
     gated("stale", 3, json!(["a.sh", "b.sh", "c.sh"]));
@@ -113,7 +121,12 @@ fn the_gating_that_sets_the_floor_names_its_scenarios_and_the_board_names_the_ha
         "the latest gating at the floor names it"
     );
 
-    let event = halt(&store, mission, "the scenarios fell from 3 to 2", Some(&["d.sh"]));
+    let event = halt(
+        &store,
+        mission,
+        "the scenarios fell from 3 to 2",
+        Some(&["d.sh"]),
+    );
     let halt_value = board_halt(&store, mission);
     assert_eq!(halt_value["event"], event);
     assert_eq!(halt_value["reason"], "the scenarios fell from 3 to 2");
@@ -165,7 +178,12 @@ fn the_page_resumes_exactly_the_halt_it_shows_once() {
         HumanResume::NoMission("mission 999999 does not exist".to_string())
     );
 
-    let first = halt(&store, mission, "the scenarios fell from 5 to 2", Some(&["c.sh"]));
+    let first = halt(
+        &store,
+        mission,
+        "the scenarios fell from 5 to 2",
+        Some(&["c.sh"]),
+    );
     let why = refused(
         page.human_resume(mission, first - 1, &key("k0"))
             .expect("answered"),
@@ -193,11 +211,13 @@ fn the_page_resumes_exactly_the_halt_it_shows_once() {
 
     // The same key is the same resume; a new one finds nothing to resume.
     assert_eq!(
-        page.human_resume(mission, first, &key("k1")).expect("again"),
+        page.human_resume(mission, first, &key("k1"))
+            .expect("again"),
         HumanResume::Resumed(event)
     );
     let why = refused(
-        page.human_resume(mission, first, &key("k2")).expect("answered"),
+        page.human_resume(mission, first, &key("k2"))
+            .expect("answered"),
         "not halted",
     );
     assert!(why.contains("not halted"), "{why}");
@@ -207,11 +227,13 @@ fn the_page_resumes_exactly_the_halt_it_shows_once() {
     // key names the old halt, so it is no resume of the new one.
     let second = halt(&store, mission, "3 gate aborts in a row", None);
     refused(
-        page.human_resume(mission, first, &key("k3")).expect("answered"),
+        page.human_resume(mission, first, &key("k3"))
+            .expect("answered"),
         "the first halt",
     );
     let why = refused(
-        page.human_resume(mission, second, &key("k1")).expect("answered"),
+        page.human_resume(mission, second, &key("k1"))
+            .expect("answered"),
         "a key used for another resume",
     );
     assert!(why.contains("already used"), "{why}");

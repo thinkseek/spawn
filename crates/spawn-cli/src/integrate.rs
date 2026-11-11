@@ -6014,9 +6014,10 @@ fn task_scenario(scenarios: &Path, recorded: Option<&str>) -> Option<PathBuf> {
 mod tests {
     use super::{
         BUDGET_GAP, Freshness, Mission, NO_TEST_DATABASE, aborted, active_ms, budget_gap,
-        freshness, gates_at_once, halt_reason, markers_note, merged_tree, needs_test_database,
-        no_room, over_budget, pinned, report_freshness, room_backoff, room_wait, short_of_room,
-        task_scenario, waits_for_gate, wall_clock_minutes, withheld_without_test_database,
+        floor_gone, floor_reason, freshness, gates_at_once, halt_reason, markers_note, merged_tree,
+        needs_test_database, no_room, over_budget, pinned, report_freshness, room_backoff,
+        room_wait, short_of_room, task_scenario, waits_for_gate, wall_clock_minutes,
+        withheld_without_test_database,
     };
     use crate::gate::{GateFailure, Shortfall};
     use serde_json::json;
@@ -7319,16 +7320,16 @@ mod tests {
         let base = std::env::temp_dir().join(format!(
             "spawn-scenario-names-{}-{}",
             std::process::id(),
-            now_ms()
+            super::now_ms()
         ));
         std::fs::create_dir_all(base.join("nested.sh")).expect("dir");
         for name in ["b.sh", "a.sh", "notes.md", "c.sh.bak"] {
             std::fs::write(base.join(name), "").expect("file");
         }
-        let names = gate::scenario_names(&base).expect("names");
+        let names = crate::gate::scenario_names(&base).expect("names");
         assert_eq!(names, ["a.sh", "b.sh", "nested.sh"]);
         assert!(
-            gate::scenario_names(&base.join("missing"))
+            crate::gate::scenario_names(&base.join("missing"))
                 .expect("none")
                 .is_empty()
         );
