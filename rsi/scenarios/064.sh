@@ -19,12 +19,18 @@
 # Required (read through `GET /api/attention` and web/src/home.ts's
 # latestNotes under node over it):
 #   (1) every `supervisor.for_owner` item carries `tasks`, the tasks its
-#       line names (`#<n>`, `T<n>`, and the numbers listed after "task(s)"
-#       or "report(s)": "reports 2, 3 and 4"), in the line's order, each
-#       `{id, state}` with the task's state now; tasks that do not exist are
-#       left out.
-#   (2) and `settled`: true when it names at least one task and every one
-#       has ended (accepted, landed or cancelled); false otherwise.
+#       line names, in the line's order, each `{id, state}` with the task's
+#       state now; numbers that name no task are left out. A line names a
+#       task as `T<n>`, or as a number (bare or `#<n>`) right after the word
+#       task, tasks, report or reports, a list included ("reports 2, 3 and
+#       4"). A bare `#<n>` elsewhere names none ("mission #3"), nor does a
+#       range ("tasks 160 to 167" names 160 only).
+#   (2) and `settled`: true when its ask is to review, accept or merge the
+#       tasks (the line has a word beginning "review", "accept" or "merg"
+#       and none beginning "deploy"), it names at least one task, and every
+#       one has ended (accepted, landed or cancelled); false otherwise. A
+#       line with any other ask is never settled: hiding a live ask is the
+#       worse failure.
 #   (3) latestNotes leaves a settled line out: it is neither shown nor
 #       counted in `more`.
 #
@@ -33,10 +39,14 @@
 # does, and a fake model judge answers the Observer. One review mission's
 # tasks 2 to 5: 2 and 3 accepted and 4 cancelled by the owner (`spawn task
 # accept`, `spawn task cancel`), 5 reported and waiting for review. Then the
-# supervisor writes three lines, a turn each, oldest first: "For the owner:
-# deploy main to pick up the new cost page." (no task), "For the owner: task
-# #5 waits for your review." (open) and "For the owner: reports 2, 3 and 4
-# are still waiting for your review." (all ended, the newest). Each check is reported; the run
+# supervisor writes five lines, a turn each, oldest first:
+#   "For the owner: deploy main to pick up the new cost page." (no task)
+#   "For the owner: mission #3 has no backlog yet." (no task: a mission)
+#   "For the owner: task #5 waits for your review." (open)
+#   "For the owner: task 2 landed; deploying it needs spawn init-db." (an
+#     ended task, and an ask that still stands)
+#   "For the owner: reports 2, 3 and 4 are still waiting for your review."
+#     (all ended, a review ask: settled; the newest) Each check is reported; the run
 # fails if any failed.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
@@ -375,10 +385,10 @@ attention_json() {
     code=$(curl -s --noproxy '*' -o "$WORK/attention.json" -w '%{http_code}' "$base/api/attention" 2>/dev/null) || code=000
     [ "$code" = 200 ] || harness "GET /api/attention answered $code: $(head -c 300 "$WORK/attention.json" 2>/dev/null)"
 }
-# The supervisor's three lines are all in /api/attention.
-three_lines() {
+# The supervisor's five lines are all in /api/attention.
+five_lines() {
     attention_json
-    [ "$(jq '[.supervisor.for_owner[]? | select(.text | test("reports 2, 3 and 4|task #5|deploy main"))] | length' "$WORK/attention.json")" = 3 ]
+    [ "$(jq '[.supervisor.for_owner[]? | select(.text | test("reports 2, 3 and 4|task #5|deploy main|mission #3|task 2 landed"))] | length' "$WORK/attention.json")" = 5 ]
 }
 
 "$SPAWN_BIN" loop --repo "$repo" --root "$SPAWN_WORKSPACE_ROOT" >>"$WORK/loop.log" 2>&1 &
@@ -411,16 +421,21 @@ states=$(q "select string_agg(id || ':' || state, ' ' order by id) from mission_
 
 # The supervisor's three lines, a turn each. Their reading is the barrier:
 # /api/attention reads the transcript at the request.
-say one "For the owner: deploy main to pick up the new cost page."
-wait_until 60 sh -c "grep -qs 'deploy main to pick' \"\$1\"/*/*.jsonl" _ "$SPAWN_CLAUDE_PROJECTS" ||
-    harness "the supervisor's first line was not in a transcript within 60 s"
-say two "For the owner: task #5 waits for your review."
-wait_until 60 sh -c "grep -qs 'task #5 waits' \"\$1\"/*/*.jsonl" _ "$SPAWN_CLAUDE_PROJECTS" ||
-    harness "the supervisor's second line was not in a transcript within 60 s"
+# One line per turn, oldest first; each is in the transcript before the
+# next is typed, so their order is theirs.
+said() { grep -qs "$1" "$SPAWN_CLAUDE_PROJECTS"/*/*.jsonl; }
+line_turn() { # <tag> <words> <pattern>
+    say "$1" "$2"
+    wait_until 60 said "$3" || harness "the supervisor's line ($3) was not in a transcript within 60 s"
+}
+line_turn one "For the owner: deploy main to pick up the new cost page." 'deploy main to pick'
+line_turn two "For the owner: mission #3 has no backlog yet." 'mission #3 has no'
+line_turn three "For the owner: task #5 waits for your review." 'task #5 waits'
+line_turn four "For the owner: task 2 landed; deploying it needs spawn init-db." 'task 2 landed'
 # The settled line is the newest: shown first, if anything shows it.
-say three "For the owner: reports 2, 3 and 4 are still waiting for your review."
-wait_until 60 three_lines ||
-    harness "/api/attention did not list the supervisor's three lines within 60 s: $(jq -c '.supervisor.for_owner' "$WORK/attention.json" 2>/dev/null | head -c 600)"
+line_turn five "For the owner: reports 2, 3 and 4 are still waiting for your review." 'reports 2, 3 and 4'
+wait_until 60 five_lines ||
+    harness "/api/attention did not list the supervisor's five lines within 60 s: $(jq -c '.supervisor.for_owner' "$WORK/attention.json" 2>/dev/null | head -c 900)"
 
 item() { # <pattern> <fields>: the for_owner item whose text matches
     jq -c --arg p "$1" "[.supervisor.for_owner[] | select(.text | test(\$p)) | $2]" "$WORK/attention.json"
@@ -437,6 +452,12 @@ expect_eq "$(item 'task #5' '{tasks, settled}')" \
 expect_eq "$(item 'deploy main' '{tasks, settled}')" \
     '[{"tasks":[],"settled":false}]' \
     "(1)(2) the line naming no task"
+expect_eq "$(item 'mission #3' '{tasks, settled}')" \
+    '[{"tasks":[],"settled":false}]' \
+    "(1)(2) the line naming mission #3 (task 3 exists, and is not named)"
+expect_eq "$(item 'task 2 landed' '{tasks, settled}')" \
+    '[{"tasks":[{"id":2,"state":"accepted"}],"settled":false}]' \
+    "(1)(2) the line naming task 2, ended, with an ask that still stands (deploying it needs init-db)"
 note "(1), (2) checked: the lines' tasks"
 
 # --- (3) Home's card ------------------------------------------------------------------------
@@ -452,13 +473,14 @@ const { latestNotes } = await import(pathToFileURL(`${env.BB_TREE}/web/src/home.
 const answer = JSON.parse(readFileSync(`${env.BB_WORK}/attention.json`, "utf8"));
 const now = Math.max(...answer.supervisor.for_owner.map((note) => note.at_ms ?? 0)) + 60_000;
 
-test("(3) a settled line is neither shown nor counted", () => {
+test("(3) a settled line is neither shown nor counted; a live ask stays", () => {
   const { shown, more } = latestNotes(answer, now);
-  const texts = shown.map((note) => note.text);
-  assert.ok(!texts.some((text) => text.includes("reports 2, 3 and 4")), `shown: ${JSON.stringify(texts)}`);
-  assert.ok(texts.some((text) => text.includes("task #5")), `shown: ${JSON.stringify(texts)}`);
-  assert.ok(texts.some((text) => text.includes("deploy main")), `shown: ${JSON.stringify(texts)}`);
-  assert.equal(more, 0, "more");
+  // The two newest lines that are not settled; the other two counted.
+  assert.deepEqual(
+    shown.map((note) => note.text),
+    ["task 2 landed; deploying it needs spawn init-db.", "task #5 waits for your review."],
+  );
+  assert.equal(more, 2, "more: the mission #3 and deploy main lines");
 });
 TEST
 if ! BB_TREE=$tree BB_WORK=$WORK node --test "$WORK/notes.test.mjs" >"$WORK/notes.out" 2>&1; then
@@ -471,5 +493,5 @@ if [ -s "$WORK/failures" ]; then
     echo "064: $(wc -l <"$WORK/failures") check(s) failed" >&2
     exit 1
 fi
-echo "064: a line for the owner names its tasks' states, and one whose tasks have all ended is settled and off Home's card"
+echo "064: a line for the owner names its tasks' states; a review ask whose tasks have all ended is settled and off Home's card, any other ask stays"
 exit 0
