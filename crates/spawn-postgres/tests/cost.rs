@@ -384,6 +384,42 @@ fn control(client: &mut postgres::Client, at_ms: i64, record: &Value) {
         .expect("write a control record");
 }
 
+/// A task of `mission` for worker `name` whose execution `execution` spent
+/// `input` tokens of model-x at `at_ms`: the task and its worker.
+fn spending_task(
+    store: &PostgresStore,
+    mission: i64,
+    (name, execution): (&str, u64),
+    (input, at_ms): (u64, i64),
+) -> (i64, Worker) {
+    let task = store
+        .task_assign(mission, "ephemeral", name, "brief", "default")
+        .expect("assign");
+    let worker = Worker {
+        agent: format!("agent_worker_{name}_{task}"),
+        session: format!("session_worker_{name}_{task}"),
+    };
+    started(store, &worker, execution);
+    let id = format!("msg_{execution}");
+    usage(
+        store,
+        &worker,
+        execution,
+        (&id, "model-x", at_ms),
+        [input, 0, 0, 0],
+    );
+    (task, worker)
+}
+
+/// `task` delivered by `command` and reported, then reviewed.
+fn reviewed(store: &PostgresStore, task: i64, command: i64, accept: bool) {
+    store.task_delivered(task, command).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    store
+        .task_review(task, accept, "note", None)
+        .expect("review");
+}
+
 #[test]
 fn a_window_says_what_a_landing_cost_for_the_fleet_and_each_mission() {
     let (store, schema) = store("cost_landing");
@@ -392,23 +428,12 @@ fn a_window_says_what_a_landing_cost_for_the_fleet_and_each_mission() {
 
     // Mission A, without a gate: t1 sent back once, then accepted (a
     // landing), then assigned again and accepted again (still one landing).
-    let (a, t1, w1) = one_task(&store);
-    started(&store, &w1, 1);
-    usage(
-        &store,
-        &w1,
-        1,
-        ("msg_1", "model-x", since + 1),
-        [100_000, 0, 0, 0],
-    );
-    store.task_delivered(t1, 1).expect("delivered");
-    assert!(store.task_reported(t1, "done").expect("reported"));
-    store
-        .task_review(t1, false, "again", None)
-        .expect("sent back");
-    store.task_delivered(t1, 2).expect("delivered again");
-    assert!(store.task_reported(t1, "done again").expect("reported"));
-    store.task_review(t1, true, "ok", None).expect("accepted");
+    let a = store
+        .mission_add("Work", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    let (t1, w1) = spending_task(&store, a, ("w1", 1), (100_000, since + 1));
+    reviewed(&store, t1, 1, false);
+    reviewed(&store, t1, 2, true);
     let now = store.database_now_ms().expect("now");
     control(
         &mut client,
@@ -432,21 +457,7 @@ fn a_window_says_what_a_landing_cost_for_the_fleet_and_each_mission() {
         &json!({"type": "task.landed", "id": t2, "from": "a", "to": "b"}),
     );
     // t3 of mission A is cancelled: it costs, it does not land.
-    let t3 = store
-        .task_assign(a, "ephemeral", "w3", "brief", "default")
-        .expect("assign");
-    let w3 = Worker {
-        agent: format!("agent_worker_w3_{t3}"),
-        session: format!("session_worker_w3_{t3}"),
-    };
-    started(&store, &w3, 3);
-    usage(
-        &store,
-        &w3,
-        3,
-        ("msg_3", "model-x", since + 1),
-        [20_000, 0, 0, 0],
-    );
+    let (t3, _) = spending_task(&store, a, ("w3", 3), (20_000, since + 1));
     store.task_cancel(t3).expect("cancel");
 
     // Mission B, gated: an accepting review is not a landing (its gate
@@ -457,24 +468,8 @@ fn a_window_says_what_a_landing_cost_for_the_fleet_and_each_mission() {
     store
         .mission_configure(b, Some("/controller/rsi/scenarios"), "review", None, None)
         .expect("configure");
-    let t4 = store
-        .task_assign(b, "ephemeral", "w4", "brief", "default")
-        .expect("assign");
-    let w4 = Worker {
-        agent: format!("agent_worker_w4_{t4}"),
-        session: format!("session_worker_w4_{t4}"),
-    };
-    started(&store, &w4, 4);
-    usage(
-        &store,
-        &w4,
-        4,
-        ("msg_4", "model-x", since + 1),
-        [50_000, 0, 0, 0],
-    );
-    store.task_delivered(t4, 4).expect("delivered");
-    assert!(store.task_reported(t4, "done").expect("reported"));
-    store.task_review(t4, true, "ok", None).expect("accepted");
+    let (t4, _) = spending_task(&store, b, ("w4", 4), (50_000, since + 1));
+    reviewed(&store, t4, 4, true);
 
     assert_eq!(store.cost_record(&prices(3.0)).expect("record"), 3);
     let until = store.database_now_ms().expect("now") + 1000;
@@ -485,18 +480,10 @@ fn a_window_says_what_a_landing_cost_for_the_fleet_and_each_mission() {
         json!(1),
         "t1 once, not t2 nor t4: {window}"
     );
-    near(
-        &window["usd_per_landing"],
-        0.51,
-        "the window's dollars per landing",
-    );
+    near(&window["usd_per_landing"], 0.51, "the window's per landing");
     let by_a = entry(&window, "missions", "mission", &json!(a));
     assert_eq!(by_a["landed"], json!(1), "{by_a}");
-    near(
-        &by_a["usd_per_landing"],
-        0.36,
-        "mission A: t1 and the cancelled t3",
-    );
+    near(&by_a["usd_per_landing"], 0.36, "mission A: t1 and t3");
     let by_b = entry(&window, "missions", "mission", &json!(b));
     assert_eq!(by_b["landed"], json!(0), "{by_b}");
     assert_eq!(by_b["usd_per_landing"], Value::Null, "{by_b}");
