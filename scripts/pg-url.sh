@@ -28,8 +28,9 @@
 # the authority, encoded: scheme://userinfo@host:port. Appending
 # `/<database>` names a database on it, whatever form the input took.
 #
-# pg_url_export <url> exports PGUSER, PGPASSWORD, PGHOST and PGPORT for
-# psql (and unsets PGPASSWORD when the URL has none).
+# pg_url_export <url> exports PGUSER, PGPASSWORD, PGHOST, PGPORT and
+# PGDATABASE for psql (and unsets PGPASSWORD, or PGDATABASE, when the URL
+# has none). A psql that means another database names it (-d postgres).
 
 # pg_url_decode <text>: %XX escapes decoded, everything else as it is. A
 # `%` not followed by two hex digits stays; %00 is dropped (no shell
@@ -193,6 +194,15 @@ pg_url_export() {
         export PGPASSWORD
     else
         unset PGPASSWORD
+    fi
+    # The URL's database too (S21): without it, a psql with no -d ran in
+    # libpq's default (the user's name), not the database the URL names. A
+    # URL with none leaves libpq's default, as before.
+    if [ -n "$pg_url_database" ]; then
+        PGDATABASE=$pg_url_database
+        export PGDATABASE
+    else
+        unset PGDATABASE
     fi
     # An empty user or host leaves libpq's defaults.
     [ -n "$PGUSER" ] || unset PGUSER

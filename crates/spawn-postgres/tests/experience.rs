@@ -731,3 +731,61 @@ fn the_interventions_read_looks_records_up_by_index_at_live_size() {
         "{read_rows} event rows read for a stream of {stream}"
     );
 }
+
+#[test]
+fn a_missions_row_says_owner_work_when_it_has_no_objective_backlog() {
+    let (store, schema) = store("experience_owner_work");
+    let mut client = admin(&schema);
+    let control = |client: &mut Client, record: Value| {
+        client
+            .query_one("select spawn_control_record($1)", &[&record])
+            .expect("record through spawn_control_record");
+    };
+    for id in 1..=4 {
+        control(
+            &mut client,
+            json!({"type": "mission.added", "id": id, "text": format!("m{id}"), "origin": "human", "sources": []}),
+        );
+    }
+    let backlog = json!({"backlog": "/ctl/backlog", "resident": "res", "workers": 1});
+    for id in [1, 3] {
+        control(
+            &mut client,
+            json!({"type": "mission.configured", "id": id, "accept": "gate", "gate": "/ctl/scenarios",
+                   "objectives": backlog}),
+        );
+    }
+    control(
+        &mut client,
+        json!({"type": "mission.configured", "id": 2, "accept": "review"}),
+    );
+    // Mission 3's backlog taken away again: its last settings rule.
+    control(
+        &mut client,
+        json!({"type": "mission.configured", "id": 3, "accept": "gate", "gate": "/ctl/scenarios"}),
+    );
+    let now: i64 = client
+        .query_one("select spawn_now_ms()", &[])
+        .expect("now")
+        .get(0);
+    let window = store
+        .experience_window(now - 24 * H, now + H)
+        .expect("the window reads");
+    let rows: Vec<(i64, bool)> = window["missions"]
+        .as_array()
+        .expect("missions")
+        .iter()
+        .map(|m| {
+            (
+                m["mission"].as_i64().expect("id"),
+                m["owner_work"].as_bool().expect("owner_work"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![(1, false), (2, true), (3, true), (4, false)],
+        "a backlog mission is not owner work, nor one never configured; \
+         one configured without a backlog, or with its backlog removed, is"
+    );
+}

@@ -18,7 +18,8 @@
 # Required (the objective's prompt says each rule): an objective with an
 # `objective.solved` record in its mission is "solved", as a landing makes
 # it, in every view built from the backlog; its row names the record
-# (`solved_on_base`: {event, task, base}, null for every other objective);
+# (`solved_on_base`: {event, task, base} and maybe more fields, null for
+# every other objective);
 # the counts follow; and `next_objective` is the objective the integrator's
 # own choice would assign next (solved, in flight, held and owner-judged
 # objectives left out, yields and failed attempts ordered, `after` obeyed).
@@ -81,6 +82,27 @@ for tool in psql jq od curl sed grep sha1sum cut; do
 done
 
 WORK=$(mktemp -d) || harness "mktemp failed"
+# Gone again if a check below refuses, before the cleanup is set.
+trap 'rm -rf "$WORK"' EXIT
+# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
+# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+HOME=$WORK/home
+TMUX_TMPDIR=$WORK/tmux-sock
+mkdir -p "$HOME" "$TMUX_TMPDIR"
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
+export HOME TMUX_TMPDIR
+# The runtime directory too (backlog S20): what Spawn keeps there (a
+# launch's environment file, its terminals' leaders) stays in WORK, never
+# in the real one. systemd's user manager stays reachable by its bus.
+real_runtime=${XDG_RUNTIME_DIR-}
+if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
+    DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
+    export DBUS_SESSION_BUS_ADDRESS
+fi
+XDG_RUNTIME_DIR=$WORK/runtime
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_052_solved_$run"
@@ -263,7 +285,10 @@ code=$(get /api/rsi "$WORK/api.json")
 row() { jq -c --argjson id "$1" "[.missions[] | select(.id == 1) | .objectives[] | select(.id == \$id)][0] | $2" "$WORK/api.json"; }
 expect_eq "$(jq -c '[.missions[] | select(.id == 1) | .objectives[] | .status]' "$WORK/api.json")" '["solved","solved","open","open","open"]' \
     "(1) /api/rsi: the statuses of objectives 1 to 5 (2 was recorded solved on the base, event $solved)"
-expect_eq "$(row 2 '.solved_on_base // "none"')" "{\"base\":\"$B\",\"event\":$solved,\"task\":2}" \
+# Only the three keys this objective names: a later objective may add
+# fields to the record (063 adds at_ms for its time axis), which is
+# compatible and no failure here.
+expect_eq "$(row 2 '.solved_on_base | if type == "object" then {base, event, task} else (. // "none") end')" "{\"base\":\"$B\",\"event\":$solved,\"task\":2}" \
     "(1) /api/rsi: objective 2's solved_on_base (the record that solved it)"
 for n in 1 3 4 5; do
     expect_eq "$(row "$n" 'if has("solved_on_base") then .solved_on_base else "absent" end')" null \

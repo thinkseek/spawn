@@ -90,6 +90,27 @@ done
 real_tmux=$(command -v tmux)
 
 WORK=$(mktemp -d) || harness "mktemp failed"
+# Gone again if a check below refuses, before the cleanup is set.
+trap 'rm -rf "$WORK"' EXIT
+# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
+# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+HOME=$WORK/home
+TMUX_TMPDIR=$WORK/tmux-sock
+mkdir -p "$HOME" "$TMUX_TMPDIR"
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
+export HOME TMUX_TMPDIR
+# The runtime directory too (backlog S20): what Spawn keeps there (a
+# launch's environment file, its terminals' leaders) stays in WORK, never
+# in the real one. systemd's user manager stays reachable by its bus.
+real_runtime=${XDG_RUNTIME_DIR-}
+if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
+    DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
+    export DBUS_SESSION_BUS_ADDRESS
+fi
+XDG_RUNTIME_DIR=$WORK/runtime
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_047_settling_$run"
@@ -134,7 +155,6 @@ cleanup() {
     stop_serve
     stop_loop
     "$real_tmux" -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-    rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SPAWN_TMUX_SOCKET"
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
@@ -155,6 +175,16 @@ finish() {
         if [ -s "$WORK/engine.log" ]; then
             echo "047: the engines' last lines (ms agent what):" >&2
             tail -n 8 "$WORK/engine.log" >&2
+        fi
+        # What says a window is settling (flake notes, sync/flake-047-056.md):
+        # each progress record as it stands, with the time it was written.
+        if [ -d "${SPAWN_WORKSPACE_ROOT-}/.transcripts-progress" ]; then
+            echo "047: the archive's progress records at $(date +%s%3N) (written-ms agent live known_ms behind_ms archived):" >&2
+            find "$SPAWN_WORKSPACE_ROOT/.transcripts-progress" -type f -name '*.json' 2>/dev/null |
+                while IFS= read -r record; do
+                    printf '%s %s\n' "$(stat -c %.3Y "$record" | tr -d .)" \
+                        "$(jq -r '"\(.agent) \(.live) \(.known_ms) \(.behind_ms) \(.archived)"' "$record" 2>/dev/null)"
+                done >&2
         fi
     fi
     cleanup
@@ -544,6 +574,11 @@ done
 u2=$(second_now)
 want2=$(live_total "$u2")
 sleep 6
+# The window to U0 is settled once a pass has read every live transcript
+# after U0 (its records then know past it): wait for that pass, which a
+# loaded host may hold back, before the readings check it stays settled.
+until_card "$u0" "$want0" false 15 ||
+    fail "(2) the window to $(iso "$u0"), which ended before held's turn began, reads [tokens settling] [$reading] 15 s on while held's archive is held; it holds $want0 tokens and is settled: only a call before a window's end holds it open"
 for i in 1 2 3; do
     reading=$(card "$u2")
     [ "${reading#* }" = true ] ||

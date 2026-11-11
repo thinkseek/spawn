@@ -549,10 +549,7 @@ mod tests {
         let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
             "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
         );
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.subsec_nanos());
-        let schema = format!("spawn_test_{}_{nanos:x}_cost_archive", std::process::id());
+        let schema = spawn_postgres::testing::TestSchema::new("cost_archive");
         let store = PostgresStore::connect_in_schema(&url, &schema).expect("connect and migrate");
         let root = scratch("count");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -633,8 +630,6 @@ mod tests {
             unchanged_files_are_not_read_again(&store, &mut client, &root, &prices);
         }));
         let _ = std::fs::remove_dir_all(&root);
-        let _ = postgres::Client::connect(&url, postgres::NoTls)
-            .and_then(|mut client| client.batch_execute(&format!("drop schema {schema} cascade")));
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }

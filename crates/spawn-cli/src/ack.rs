@@ -430,7 +430,7 @@ mod tests {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.subsec_nanos());
-        let schema = format!("spawn_test_{}_{nanos:x}_acks", std::process::id());
+        let schema = spawn_postgres::testing::TestSchema::new("acks");
         let store = PostgresStore::connect_in_schema(&url, &schema).expect("connect and migrate");
         let root =
             std::env::temp_dir().join(format!("spawn-acks-{}-{nanos:x}", std::process::id()));
@@ -503,8 +503,6 @@ mod tests {
             );
         }));
         let _ = std::fs::remove_dir_all(&root);
-        let _ = postgres::Client::connect(&url, postgres::NoTls)
-            .and_then(|mut client| client.batch_execute(&format!("drop schema {schema} cascade")));
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }

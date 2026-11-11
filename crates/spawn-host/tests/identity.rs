@@ -328,7 +328,12 @@ fn the_bridge_reads_the_turn_of_an_engine_under_a_symlinked_root() {
     let world = World::new("bridge");
     let (server, config) = scripted(&world);
     let projects = PathBuf::from(&config.claude_projects);
-    let terminals = Arc::new(TmuxHost::local(&server.program));
+    // What the host keeps in $XDG_RUNTIME_DIR stays in the world's
+    // scratch (backlog S20).
+    let runtime = world.base.join("run");
+    fs::create_dir(&runtime).expect("runtime");
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).expect("0700");
+    let terminals = Arc::new(TmuxHost::local(&server.program).with_runtime_under(runtime));
     let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
     let memory = Arc::new(MemoryStore::new("shop", clock.clone()));
     let mut bridge = Bridge::new(

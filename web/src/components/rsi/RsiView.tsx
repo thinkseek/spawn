@@ -18,6 +18,13 @@ import { Button, Card, CardHeader, Eyebrow, FOCUS_RING, LiveStatus, PageHeader, 
 import { AgentPane } from "./AgentPane";
 import { ObjectiveName } from "./ObjectiveName";
 import { ChartLegend, MetricChart } from "./MetricChart";
+import { ProgressChart } from "./ProgressChart";
+import {
+  chartsProgress,
+  latestProgressLine,
+  progressTitle,
+  settledProgress,
+} from "../../rsiProgress.ts";
 import { PhaseBadge, VerdictBadge, formatMetric, formatNumber, phaseStyle, useNow } from "./Phase";
 import { GateVerdicts } from "./GateVerdicts";
 import { TaskDetail } from "./Verdicts";
@@ -645,6 +652,41 @@ function ObjectivesCard({
 }
 
 function HistoryCard({
+  mission,
+  chosen,
+}: {
+  mission: RsiMission;
+  chosen: number | null;
+}) {
+  if (chartsProgress(mission)) return <ProgressCard mission={mission} />;
+  return <MetricHistoryCard mission={mission} chosen={chosen} />;
+}
+
+/** The Landings card of a mission none of whose objectives names a
+ * metric: its objectives settled over time. */
+function ProgressCard({ mission }: { mission: RsiMission }) {
+  const now = useNow(30_000);
+  const progress = settledProgress(mission);
+  const latest = latestProgressLine(progress, now);
+  return (
+    <Card className="shrink-0 overflow-hidden">
+      <CardHeader
+        icon={<ChartLine size={14} />}
+        title={`Landings · ${progressTitle(progress)}`}
+      />
+      <div className="px-2 pt-3 pb-1">
+        <ProgressChart progress={progress} now={now} />
+      </div>
+      {latest && (
+        <div className="border-t border-surface-border px-4 py-2 text-caption text-muted-foreground">
+          {latest}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function MetricHistoryCard({
   mission,
   chosen,
 }: {

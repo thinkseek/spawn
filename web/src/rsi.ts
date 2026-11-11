@@ -80,6 +80,8 @@ export interface RsiSolvedOnBase {
   task: number | null;
   /** The base commit the scenario passed at. */
   base: string | null;
+  /** When the record was made; null from an older server. */
+  at_ms: number | null;
 }
 
 export interface RsiObjective {
@@ -268,6 +270,7 @@ function normalizeSolvedOnBase(value: unknown): RsiSolvedOnBase | null {
     event: number(raw.event),
     task: optionalNumber(raw.task),
     base: optionalText(raw.base),
+    at_ms: optionalNumber(raw.at_ms),
   };
 }
 
