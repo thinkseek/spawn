@@ -19,7 +19,7 @@ const PAD_RIGHT = 14;
 const PAD_TOP = 14;
 const PAD_BOTTOM = 24;
 
-function useWidth<T extends HTMLElement>() {
+export function useWidth<T extends HTMLElement>() {
   const ref = useRef<T>(null);
   const [width, setWidth] = useState(0);
   useLayoutEffect(() => {

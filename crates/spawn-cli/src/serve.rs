@@ -1452,8 +1452,10 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 ///       "owner_judged": false,            // the owner judges it, not the fleet
 ///       "status": "open" | "solved" | "met" | "owner",   // "solved" by a landing
 ///                                         // or by an objective.solved record
-///       "solved_on_base": {"event": 109278, "task": 201, "base": "<commit>"} | null,
+///       "solved_on_base": {"event": 109278, "task": 201, "base": "<commit>",
+///                          "at_ms": 1793724858211} | null,
 ///                                         // the integrator's objective.solved record
+///                                         // (at_ms: when it was recorded)
 ///       "current": 1021 | null,           // latest landed metric value
 ///       "tasks": [10, 14],                // task ids for this objective
 ///       "landings": [{                    // landed tasks, oldest first
@@ -1660,7 +1662,7 @@ fn next_objective(
 /// tasks (newest first), and `solved`, the mission's `objective.solved`
 /// record of it if one: a one-shot objective solved on the base is
 /// solved, as a landing makes it, and its row names the record
-/// (`solved_on_base`: `{event, task, base}`, null for every other
+/// (`solved_on_base`: `{event, task, base, at_ms}`, null for every other
 /// objective).
 fn objective_json(objective: &Task, tasks: &[Value], solved: Option<&Value>) -> Value {
     let mine: Vec<&Value> = tasks
@@ -1738,6 +1740,7 @@ fn objective_json(objective: &Task, tasks: &[Value], solved: Option<&Value>) -> 
             "event": record["event"],
             "task": record["task"],
             "base": record["base"],
+            "at_ms": record["at_ms"],
         })),
     })
 }
@@ -3773,7 +3776,7 @@ mod tests {
         assert_eq!(statuses, ["solved", "solved", "open", "open", "open"]);
         assert_eq!(
             rows[1]["solved_on_base"],
-            json!({"event": 77, "task": 2, "base": "b0"})
+            json!({"event": 77, "task": 2, "base": "b0", "at_ms": 5})
         );
         for at in [0, 2, 3, 4] {
             assert_eq!(
@@ -3816,6 +3819,29 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir4);
+    }
+
+    /// The row's `solved_on_base` carries `at_ms`, the time of the
+    /// integrator's `objective.solved` record, which the RSI page's
+    /// Landings card places the objective at (web/src/rsiProgress.ts).
+    #[test]
+    fn solved_on_base_carries_the_records_time() {
+        let dir = backlog_dir("board-solved-at", &[1, 2], &[]);
+        let board = with_objectives(json!({
+            "id": 1, "gate": "/g", "objectives": {"backlog": dir.to_str()},
+            "tasks": [task(1, 1, "landed", 10, None)],
+            "solved_on_base": [{"event": 9, "objective": 2, "task": 7, "base": "b",
+                                "at_ms": 1_793_724_858_211_i64}],
+        }));
+        let row = &board["objectives"][1];
+        assert_eq!(row["status"], "solved");
+        assert_eq!(row["solved_on_base"]["at_ms"], json!(1_793_724_858_211_i64));
+        assert_eq!(row["solved_on_base"]["task"], json!(7));
+        assert_eq!(
+            board["objectives"][0]["solved_on_base"],
+            serde_json::Value::Null
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `after` is obeyed against records solved on the base; a held
