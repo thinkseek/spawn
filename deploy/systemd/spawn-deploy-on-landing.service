@@ -16,6 +16,8 @@ ExecStart=/bin/bash %h/.local/share/spawn-rsi/controllers/spawn/deploy/on-landin
 # SPAWN_DEPLOY_ON_LANDING / _QUIET_SECS / _MAX_WAIT_SECS / _RETRY_SECS /
 # _HOLD_SECS.
 EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
+# The live directory, named: on-landing.sh has no default for it.
+Environment=SPAWN_LIVE=%h/.local/share/spawn-rsi
 # cargo and pnpm for the build (deploy.sh), as the owner's shell has them.
 Environment=PATH=%h/.cargo/bin:%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # A deploy builds in minutes; this bounds a hung one. A stop kills the

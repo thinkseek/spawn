@@ -101,6 +101,59 @@ trap cleanup EXIT
 with_db "$test_url" psql -XAtq -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db" >/dev/null
 
 live=$scratch/live
+
+# Never the real home (sync/cc-rules.md (a), after 2026-11-12): deploy.sh
+# and everything the test runs see HOME and the XDG roots in the scratch;
+# the toolchain is named from the real home first (the sandbox binds
+# CARGO_HOME's registry and RUSTUP_HOME read-only). guard_home refuses
+# (exit 2, nothing run) unless HOME, the live directory and every XDG root
+# are set, inside the scratch, and neither are, hold nor lie in the real
+# home; at the start and before every deploy.
+real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+export CARGO_HOME=${CARGO_HOME:-$real_home/.cargo} RUSTUP_HOME=${RUSTUP_HOME:-$real_home/.rustup}
+fake_home=$scratch/home
+mkdir -p "$fake_home/.config" "$fake_home/.cache" "$fake_home/.local/share"
+export HOME=$fake_home XDG_CACHE_HOME=$fake_home/.cache XDG_CONFIG_HOME=$fake_home/.config \
+  XDG_DATA_HOME=$fake_home/.local/share
+guard_home() {
+  local gh_scratch gh_real gh_path gh_name
+  [ -n "$scratch" ] && [ -n "$real_home" ] || {
+    echo "test-deploy: refused: an empty scratch or home variable; nothing ran" >&2
+    exit 2
+  }
+  gh_scratch=$(readlink -f -- "$scratch") && gh_real=$(readlink -f -- "$real_home") || {
+    echo "test-deploy: refused: a path that does not resolve; nothing ran" >&2
+    exit 2
+  }
+  for gh_name in HOME live XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME; do
+    eval "gh_path=\${$gh_name-}"
+    [ -n "$gh_path" ] || {
+      echo "test-deploy: refused: $gh_name is empty; nothing ran" >&2
+      exit 2
+    }
+    gh_path=$(readlink -m -- "$gh_path")
+    case $gh_path/ in "$gh_scratch"/*) ;; *)
+      echo "test-deploy: refused: $gh_name $gh_path is not inside the scratch $gh_scratch; nothing ran" >&2
+      exit 2
+      ;;
+    esac
+    case $gh_path/ in "$gh_real"/*)
+      echo "test-deploy: refused: $gh_name $gh_path is in the real home; nothing ran" >&2
+      exit 2
+      ;;
+    esac
+    case $gh_real/ in "$gh_path"/*)
+      echo "test-deploy: refused: $gh_name $gh_path holds the real home; nothing ran" >&2
+      exit 2
+      ;;
+    esac
+  done
+}
+guard_home
+guard_status=0
+(HOME=$real_home; guard_home) 2>"$scratch/guard.err" || guard_status=$?
+check "the guard refuses the real home (status $guard_status)" \
+  bash -c '[ "$1" -eq 2 ] && grep -q "HOME .* is not inside the scratch" "$2"' _ "$guard_status" "$scratch/guard.err"
 missions=$live/missions/spawn.git
 mkdir -p "$live/bin" "$live/backups" "$scratch/tmp" "$scratch/fakebin"
 printf 'SPAWN_DATABASE_URL=%q\n' "$live_url" >"$live/spawn.env"
@@ -193,6 +246,7 @@ deploy_from=$checkout
 landed=""
 on_main=""
 deploy() {
+  guard_home
   out=$scratch/deploy.out
   set +e
   if [ -n "$on_main" ]; then

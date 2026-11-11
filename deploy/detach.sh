@@ -27,13 +27,14 @@
 # user manager answers here (by hand, a background process outlives the
 # deploy anyway: the caller starts it as before), or the unit did not start.
 detach_start() {
-  local unit=$1 log=$2 assignments=$3
+  # dt_ names: no caller's (sync/cc-rules.md (b)).
+  local dt_unit=$1 dt_log=$2 dt_assignments=$3
   shift 3
   command -v systemd-run >/dev/null 2>&1 || return 1
   systemctl --user show-environment >/dev/null 2>&1 </dev/null || return 1
-  systemd-run --user --quiet --collect --unit "$unit" \
-    -p Type=exec -p EnvironmentFile="$assignments" \
-    -p StandardOutput=append:"$log" -p StandardError=append:"$log" \
+  systemd-run --user --quiet --collect --unit "$dt_unit" \
+    -p Type=exec -p EnvironmentFile="$dt_assignments" \
+    -p StandardOutput=append:"$dt_log" -p StandardError=append:"$dt_log" \
     -p WorkingDirectory="$HOME" -- "$@" </dev/null >/dev/null 2>&1
 }
 
@@ -41,13 +42,14 @@ detach_start() {
 # mode 600, one `NAME="value"` per line (systemd's quoting: a backslash
 # and a double quote escaped; a value with a newline is left out).
 detach_assignments() {
-  local file=$1 assignment value
+  # da_ names: no caller's (sync/cc-rules.md (b)).
+  local da_file=$1 da_assignment da_value
   shift
-  (umask 077 && : >"$file") || return 1
-  for assignment in "$@"; do
-    value=${assignment#*=}
-    case $value in *$'\n'*) continue ;; esac
-    value=${value//\\/\\\\}
-    printf '%s="%s"\n' "${assignment%%=*}" "${value//\"/\\\"}" >>"$file"
+  (umask 077 && : >"$da_file") || return 1
+  for da_assignment in "$@"; do
+    da_value=${da_assignment#*=}
+    case $da_value in *$'\n'*) continue ;; esac
+    da_value=${da_value//\\/\\\\}
+    printf '%s="%s"\n' "${da_assignment%%=*}" "${da_value//\"/\\\"}" >>"$da_file"
   done
 }
