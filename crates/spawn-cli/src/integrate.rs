@@ -7286,6 +7286,55 @@ mod tests {
         assert_eq!(halt_reason(&one, 7), None, "objective 19 yields instead");
     }
 
+    /// A halt on the floor names the scenarios the gating that set the
+    /// floor saw and the directory no longer holds, sorted; nothing without
+    /// that gating's names.
+    #[test]
+    fn a_halt_on_the_floor_names_the_scenarios_gone() {
+        let names = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let mut floor = mission(0, 0, 5);
+        assert_eq!(floor_gone(&floor, &names(&["a.sh"])), None, "no names");
+        floor.scenario_names = Some(names(&["e.sh", "a.sh", "c.sh", "b.sh", "d.sh"]));
+        assert_eq!(
+            floor_gone(&floor, &names(&["a.sh", "b.sh", "f.sh"])),
+            Some(names(&["c.sh", "d.sh", "e.sh"]))
+        );
+        assert_eq!(
+            floor_reason(&floor, 3).as_deref(),
+            Some("the scenarios fell from 5 to 3")
+        );
+        assert_eq!(floor_reason(&floor, 5), None);
+        assert_eq!(
+            floor_reason(&mission(3, 0, 5), 3),
+            floor_reason(&floor, 3),
+            "the same words; halt_reason says the rejections first"
+        );
+        assert!(halt_reason(&mission(3, 0, 5), 3).is_some_and(|r| r.contains("rejections")));
+    }
+
+    /// The scenario names are the directory's `*.sh` files, sorted; a
+    /// directory that does not exist holds none.
+    #[test]
+    fn the_scenario_names_are_the_gate_directorys_scripts() {
+        let base = std::env::temp_dir().join(format!(
+            "spawn-scenario-names-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(base.join("nested.sh")).expect("dir");
+        for name in ["b.sh", "a.sh", "notes.md", "c.sh.bak"] {
+            std::fs::write(base.join(name), "").expect("file");
+        }
+        let names = gate::scenario_names(&base).expect("names");
+        assert_eq!(names, ["a.sh", "b.sh", "nested.sh"]);
+        assert!(
+            gate::scenario_names(&base.join("missing"))
+                .expect("none")
+                .is_empty()
+        );
+        std::fs::remove_dir_all(&base).expect("clean");
+    }
+
     const MINUTE: i64 = 60_000;
 
     #[test]
