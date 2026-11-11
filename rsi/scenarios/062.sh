@@ -47,7 +47,7 @@ controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
 [ -f "$tree/web/src/home.ts" ] || harness "no web/src/home.ts under $tree (run from the candidate's tree)"
-for tool in psql tmux git jq od bash sed grep awk curl node; do
+for tool in psql git jq od bash sed grep awk curl node; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
@@ -55,9 +55,8 @@ WORK=$(mktemp -d) || harness "mktemp failed"
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_062_runs_$run"
-SPAWN_TMUX_SOCKET="bb-062-$run"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -66,16 +65,12 @@ pg_url_export "$SPAWN_TEST_DATABASE_URL" ||
 server_url=$(pg_url_server "$SPAWN_TEST_DATABASE_URL")
 
 database_made=""
-loop_pid=""
 serve_pid=""
 cleanup() {
-    for pid in "$loop_pid" "$serve_pid"; do
-        [ -n "$pid" ] || continue
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
-    done
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-    rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SPAWN_TMUX_SOCKET"
+    if [ -n "$serve_pid" ]; then
+        kill "$serve_pid" 2>/dev/null || true
+        wait "$serve_pid" 2>/dev/null || true
+    fi
     if [ -n "$database_made" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
@@ -85,16 +80,9 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
-    if [ "$rc" -ne 0 ]; then
-        if [ -s "$WORK/loop.log" ]; then
-            echo "062: the loop's last lines:" >&2
-            tail -n 10 "$WORK/loop.log" >&2
-        fi
-        if [ -n "$database_made" ]; then
-            echo "062: (no alerts under test) (key, subject, state, evidence, cleared evidence):" >&2
-            psql -d "$SPAWN_DB_NAME" -tA -c "select key, subject, state, evidence::text, coalesce(cleared_evidence::text, '')
-                from spawn_alerts where false" >&2 2>/dev/null || true
-        fi
+    if [ "$rc" -ne 0 ] && [ -s "$WORK/serve.log" ]; then
+        echo "062: serve's last lines:" >&2
+        tail -n 10 "$WORK/serve.log" >&2
     fi
     cleanup
     if [ "$rc" -eq 0 ]; then exit 0; fi
@@ -147,21 +135,6 @@ git -C "$WORK/seed" add -A
 git -C "$WORK/seed" commit -qm base
 git -C "$WORK/seed" push -q "$repo" main:main
 
-# A quiet engine: the loop may deliver the tasks below to a worker; this
-# one shows a prompt, takes what is typed and does nothing with it.
-cat >"$WORK/claude" <<'ENGINE'
-#!/usr/bin/env bash
-printf 'Welcome to Claude Code\n\n❯ '
-while :; do
-  if IFS= read -r -t 1 typed; then printf 'you: %s\n\nidle\n❯ ' "$typed"; fi
-done
-ENGINE
-chmod 755 "$WORK/claude"
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_DISPATCH SPAWN_SUPERVISOR CLAUDE_CONFIG_DIR SPAWN_CHEAP_MODEL SPAWN_SMALL_MODEL \
@@ -171,15 +144,9 @@ done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
 SPAWN_GIT_REPO=$repo
 SPAWN_WORKSPACE_ROOT=$WORK/ws
-SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
-SPAWN_TMUX_PROGRAM=$WORK/tmux
 SPAWN_WORKER=worker-bb
 SPAWN_LOOP_INTERVAL_MS=300
-# The alert step reads every 2 s (default 30 s).
-SPAWN_ALERT_CHECK_SECS=2
-# The bound under test: a mission with no task in work this long is idle.
-SPAWN_ALERT_MISSION_IDLE_SECS=8
 SPAWN_STALL_ACTIVITY_SECS=1800
 SPAWN_STALL_DELIVERY_SECS=1800
 SPAWN_STALL_REVIEW_SECS=1800
@@ -190,9 +157,9 @@ SPAWN_STALL_HALTED_SECS=1800
 SPAWN_MISSION_FILE=$WORK/mission.md
 SPAWN_DISK_WARN_GB=0
 SPAWN_DISK_FLOOR_GB=0
-export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS SPAWN_TMUX_PROGRAM SPAWN_WORKER SPAWN_LOOP_INTERVAL_MS \
-    SPAWN_ALERT_CHECK_SECS SPAWN_ALERT_MISSION_IDLE_SECS SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_DELIVERY_SECS \
+export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT \
+    SPAWN_CLAUDE_PROJECTS SPAWN_WORKER SPAWN_LOOP_INTERVAL_MS \
+    SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_DELIVERY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \
     SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS SPAWN_MISSION_FILE \
     SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB
@@ -211,18 +178,7 @@ done
 
 # --- helpers ----------------------------------------------------------------
 
-now() { date +%s; }
-q() { scalar "$1"; }
 note() { echo "062: $*" >&2; }
-wait_until() { # <seconds> <command...>
-    limit=$1
-    shift
-    deadline=$(($(now) + limit))
-    until "$@"; do
-        [ "$(now)" -lt "$deadline" ] || return 1
-        sleep 0.5
-    done
-}
 
 record() { # <JSON>: written as the integrator writes it; prints the event id
     id=$(psql -d "$SPAWN_DB_NAME" -tA -v ON_ERROR_STOP=1 -c "select spawn_control_record('$1'::jsonb)" 2>"$WORK/rec.err" | head -n 1)
@@ -233,16 +189,6 @@ record() { # <JSON>: written as the integrator writes it; prints the event id
 assign() { # <task> <mission>: prints the event id
     record "{\"type\":\"task.assigned\",\"id\":$1,\"mission_id\":$2,\"objective\":$1,\"kind\":\"ephemeral\",\"created_by\":\"spawn-integrate\",\"agent_id\":\"agent_worker_objective_$1\",\"session_id\":\"session_worker_objective_$1\",\"scenario\":\"$WORK/ctl/scenarios/objective-$1\",\"brief\":\"Objective $1 of 062\"}"
 }
-task_state() { q "select state from mission_tasks where id = $1"; }
-delivered() { [ "$(task_state "$1")" = delivered ]; }
-cancel() { # <task>: the owner's cancel; prints its event id
-    capture "$SPAWN_BIN" task cancel --id "$1"
-    [ "$status" -eq 0 ] || harness "spawn task cancel --id $1 failed: $(err)"
-    q "select max(id) from spawn_events where event_name = 'control.recorded'
-         and kind -> 'detail' -> 'record' ->> 'type' = 'task.cancelled'
-         and kind -> 'detail' -> 'record' ->> 'id' = '$1'"
-}
-event_ms() { q "select recorded_at_ms from spawn_events where id = $1"; }
 
 start_serve() {
     "$SPAWN_BIN" serve --address "127.0.0.1:0" --web "$WORK/web" >"$WORK/serve.log" 2>&1 &
@@ -258,15 +204,6 @@ start_serve() {
     [ -n "$port" ] || harness "serve did not start: $(head -c 400 "$WORK/serve.log")"
     base="http://127.0.0.1:$port"
 }
-alerts_json() {
-    code=$(curl -s --noproxy '*' -o "$WORK/alerts.json" -w '%{http_code}' "$base/api/alerts" 2>/dev/null) || code=000
-    [ "$code" = 200 ] || harness "GET /api/alerts answered $code: $(head -c 300 "$WORK/alerts.json" 2>/dev/null)"
-}
-idle_of() { # <mission>: its mission_idle alerts in /api/alerts, any state
-    alerts_json
-    jq -c --arg s "mission #$1" '[.[] | select(.kind == "mission_idle" and .subject == $s)]' "$WORK/alerts.json"
-}
-summary() { printf '%s' "$1" | jq -c '[.[] | {key, state, text}]' | head -c 400; }
 
 # --- the missions ----------------------------------------------------------------
 
