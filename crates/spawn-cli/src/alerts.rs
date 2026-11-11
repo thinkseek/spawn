@@ -3549,8 +3549,18 @@ mod tests {
     #[test]
     fn a_cancel_that_ends_the_run_of_rejections_is_a_notice_as_the_fold() {
         let mut monitor = monitor();
-        feed(&mut monitor, 1, 0, json!({"type": "mission.added", "id": 4, "text": "m"}));
-        for (task, objective) in [(1, json!(1)), (2, json!(2)), (3, json!(3)), (4, Value::Null)] {
+        feed(
+            &mut monitor,
+            1,
+            0,
+            json!({"type": "mission.added", "id": 4, "text": "m"}),
+        );
+        for (task, objective) in [
+            (1, json!(1)),
+            (2, json!(2)),
+            (3, json!(3)),
+            (4, Value::Null),
+        ] {
             feed(
                 &mut monitor,
                 1 + task,
@@ -3570,21 +3580,35 @@ mod tests {
             )
         };
         let cancel = |monitor: &mut Monitor, event: i64, task: i64| {
-            feed(monitor, event, 0, json!({"type": "task.cancelled", "id": task}))
+            feed(
+                monitor,
+                event,
+                0,
+                json!({"type": "task.cancelled", "id": task}),
+            )
         };
         for want in ["0 -> 1", "1 -> 2", "2 -> 3"] {
             let events = gate(&mut monitor, 1, "rejected");
-            assert_eq!(rejections_change(&events), Some(format!("{want} (by task.gated)")));
+            assert_eq!(
+                rejections_change(&events),
+                Some(format!("{want} (by task.gated)"))
+            );
         }
         // A cancel of another objective's task: nothing.
         assert_eq!(rejections_change(&cancel(&mut monitor, 20, 2)), None);
         // The yield of objective 1: the run ends.
         let yielded = cancel(&mut monitor, 21, 1);
-        assert_eq!(rejections_change(&yielded), Some("3 -> 0 (by task.cancelled)".into()));
+        assert_eq!(
+            rejections_change(&yielded),
+            Some("3 -> 0 (by task.cancelled)".into())
+        );
         let Some(Event::Fire { text, .. }) = yielded.first() else {
             panic!("a notice: {yielded:?}");
         };
-        assert_eq!(text, "mission #4: gate_rejections 3 -> 0 (by task.cancelled)");
+        assert_eq!(
+            text,
+            "mission #4: gate_rejections 3 -> 0 (by task.cancelled)"
+        );
         // Cancelled again: the run is gone, nothing more.
         assert_eq!(rejections_change(&cancel(&mut monitor, 22, 1)), None);
 
@@ -3594,7 +3618,10 @@ mod tests {
         assert_eq!(rejections_change(&cancel(&mut monitor, 23, 3)), None);
         assert_eq!(rejections_change(&cancel(&mut monitor, 24, 2)), None);
         let events = gate(&mut monitor, 3, "rejected");
-        assert_eq!(rejections_change(&events), Some("2 -> 3 (by task.gated)".into()));
+        assert_eq!(
+            rejections_change(&events),
+            Some("2 -> 3 (by task.gated)".into())
+        );
         // An accept ends it; a run of a task with no objective is no cancel's.
         gate(&mut monitor, 3, "accepted");
         gate(&mut monitor, 4, "rejected");
@@ -3602,7 +3629,12 @@ mod tests {
         // A resume ends the run and its objective: a cancel after says nothing.
         gate(&mut monitor, 4, "accepted");
         gate(&mut monitor, 3, "rejected");
-        feed(&mut monitor, 26, 0, json!({"type": "mission.resumed", "id": 4}));
+        feed(
+            &mut monitor,
+            26,
+            0,
+            json!({"type": "mission.resumed", "id": 4}),
+        );
         assert_eq!(rejections_change(&cancel(&mut monitor, 27, 3)), None);
     }
 
@@ -4946,7 +4978,11 @@ connections\n";
                         "created_by":"spawn-integrate","objective":5}"#,
                 );
                 for _ in 0..2 {
-                    record(client, 2, r#"{"type":"task.gated","id":5,"verdict":"rejected"}"#);
+                    record(
+                        client,
+                        2,
+                        r#"{"type":"task.gated","id":5,"verdict":"rejected"}"#,
+                    );
                 }
                 refold(client);
                 let mut monitor = started(store);
@@ -4962,7 +4998,10 @@ connections\n";
                     )
                     .map(|row| (row.get(0), row.get(1)))
                     .expect("the cancel's notice");
-                assert_eq!(text, "mission #1: gate_rejections 2 -> 0 (by task.cancelled)");
+                assert_eq!(
+                    text,
+                    "mission #1: gate_rejections 2 -> 0 (by task.cancelled)"
+                );
                 assert_eq!(folded, 0, "the store's count");
             });
         }
