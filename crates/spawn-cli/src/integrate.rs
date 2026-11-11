@@ -14749,12 +14749,7 @@ mod database_tests {
         let db = Db::new("owner_no_scenarios");
         let m0 = source_main(&source);
         db.gated_mission(&source, &scenarios);
-        let commit = owner_commit_files(
-            &base,
-            &source,
-            &[("scenarios/protected", ""), ("E.md", "e\n")],
-            "owner: e",
-        );
+        let commit = owner_commit_files(&base, &source, &[("E.md", "e\n")], "owner: e");
         let request = gated_request(&db, &source, &commit, "e");
         integrator.pass_on(&db.store).expect("a pass");
         integrator.settle();
