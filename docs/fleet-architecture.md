@@ -1150,7 +1150,21 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   day has reached its `budget.daily_usd` (§3.5); once per mission and day,
   whatever restarts and however much more it spends; clears when the day
   ends, or at a reading that finds the budget removed or raised above the
-  day's spend), and `message_not_taken` (below, "Messages"). Each fires once per
+  day's spend), `mission_idle` (objective 058; subject `mission #<id>`,
+  key `mission_idle:<mission>:<event>`: at a reading, a mission that is not
+  closed, takes its work from an objective backlog (`objectives` on its
+  record, `--backlog`/`--resident`) and has had no task in work (assigned,
+  delivered, reported, sent back, gated, landing or held) since its last
+  task ended (landed, accepted or cancelled) for
+  `SPAWN_ALERT_MISSION_IDLE_SECS`, default 900; evidence `mission`,
+  `since_ms` (when that task ended) and `event_id` (that record), its text
+  saying for how long; never for owner work (no backlog), a closed mission
+  or one with a task in work; cleared at the mission's next `task.assigned`
+  (`cleared_evidence.event_id` that record) or its close; a restart reads
+  the mission's last ending from the store and an open one back, firing
+  nothing again; Home's Needs you shows it, and the Missions card says how
+  long each idle backlog mission has had no work), and `message_not_taken`
+  (below, "Messages"). Each fires once per
   occurrence and clears with the record or reading that cleared it; a
   threshold of `0` disables its check.
 - **Only later evidence clears (objective 050).** An alert clears only on
