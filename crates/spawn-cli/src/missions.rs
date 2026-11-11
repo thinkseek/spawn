@@ -75,6 +75,16 @@ const USAGE: &str = "usage:
   spawn mission moved --source <path> --from <commit> --to <commit>   (owner: a deploy moved main)
       (recorded as source.moved for every deploy, also when no mission's baseline moves;
        after it every delivery whose retries are spent, having typed nothing, is tried once more)
+  spawn mission landing --source <path> [--deployed <commit>]   (owner: what deploy-on-landing
+      decides on, #54: {source, main, landing, first_undeployed_ms, last_deploy, hold, now_ms}. main is the
+      source's main now; landing the newest gate-accepted landing of exactly that commit on the
+      source (a task.landed of a task of a mission on it, or a source.moved with verdict
+      accepted), {record, event, at_ms, task, request}, or null; first_undeployed_ms when the
+      first such landing after the one that moved main to --deployed was recorded; hold the
+      source's hold or null; last_deploy the newest deploy.finished. Records nothing)
+  spawn mission deployed --head <commit> --ok true|false --by landing|owner [--reason <text>]
+      (owner: how a deploy ended, recorded as deploy.finished: a failure raises the
+       deploy_failed alert, the next success clears it. --reason: at most 500 characters)
   spawn mission hold --source <path> [--reason <text>]   (owner: no task lands on the source until
       a record ends the hold: its release, or its expiry SPAWN_SOURCE_HOLD_SECS after it (1 to
       86400, default 10800); its gates still run and its accepted tasks wait; a hold on a held
@@ -131,6 +141,66 @@ fn hold_bound(text: Option<&str>) -> Result<i32, String> {
                  not '{text}'"
             )
         })
+}
+
+/// `spawn mission landing --source <source> [--deployed <commit>]`: what
+/// deploy/on-landing.sh decides on (#54; [`spawn_postgres::PostgresStore::main_landing`]),
+/// with the source's main read now.
+fn landing(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Value, String> {
+    let source = text(flags, "source")?;
+    crate::sources::MissionSource::parse(&source)?;
+    let deployed = flags.get("deployed");
+    if let Some(commit) = &deployed
+        && !is_commit(commit)
+    {
+        return Err(format!("--deployed is a full commit id, not '{commit}'"));
+    }
+    let (_, main) = crate::integrate::source_head(&source)?;
+    let mut read = store
+        .main_landing(&source, &main, deployed.as_deref())
+        .map_err(|error| error.to_string())?;
+    if let Some(object) = read.as_object_mut() {
+        object.insert("source".to_string(), json!(source));
+        object.insert("main".to_string(), json!(main));
+    }
+    Ok(read)
+}
+
+/// `spawn mission deployed --head <commit> --ok true|false --by landing|owner
+/// [--reason <text>]`: how a deploy ended, one `deploy.finished` (the store
+/// checks its shape; `spawn_deploy_record`). Prints `{event}`.
+fn deployed(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Value, String> {
+    let head = text(flags, "head")?;
+    if !is_commit(&head) {
+        return Err(format!("--head is a full commit id, not '{head}'"));
+    }
+    let ok = match text(flags, "ok")?.as_str() {
+        "true" => true,
+        "false" => false,
+        other => return Err(format!("--ok is true or false, not '{other}'")),
+    };
+    let by = text(flags, "by")?;
+    if by != "landing" && by != "owner" {
+        return Err(format!("--by is landing or owner, not '{by}'"));
+    }
+    let reason: String = flags
+        .get("reason")
+        .unwrap_or_default()
+        .chars()
+        .take(500)
+        .collect();
+    let event = store
+        .deploy_record(
+            &json!({"type": "deploy.finished", "ok": ok, "head": head, "by": by,
+                               "reason": reason}),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(json!({ "event": event }))
+}
+
+/// A full commit id: 40 lowercase hex digits.
+fn is_commit(text: &str) -> bool {
+    text.len() == 40 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// `spawn mission hold --source <source> [--reason <text>]`, its bound from
@@ -568,6 +638,8 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
             let missions = store.source_moved(&source, &from, &to).map_err(err)?;
             print(&json!({ "source": source, "to": to, "missions": missions }));
         }
+        "landing" => print(&landing(&store, &flags)?),
+        "deployed" => print(&deployed(&store, &flags)?),
         "hold" => print(&hold(&store, &flags)?),
         "release" => {
             let source = text(&flags, "source")?;

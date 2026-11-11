@@ -3,6 +3,7 @@
 #
 #   deploy/deploy.sh <verdict-file>            # build, install, move missions main, restart
 #   deploy/deploy.sh --landed <outcome-file>   # build, install, restart: main already moved
+#   deploy/deploy.sh --main                    # the same for the missions main a gate accepted
 #
 # The live system runs only what a deploy installed: the binary and UI in
 # $live, and the controller ($live/controllers/spawn, deploy/controller.sh),
@@ -37,6 +38,29 @@
 # records no move (the integrator's source.moved did), and builds, installs
 # and restarts as below. The file is trusted as a verdict file is: written by
 # the owner's own `spawn mission push`, in a checkout agents cannot write.
+#
+# --main: HEAD is the missions main, and the store says a gate accepted it
+# there (deploy-on-landing, #54: deploy/on-landing.sh runs it). No file is
+# read: `spawn mission landing` reads the newest gate-accepted landing of
+# exactly that commit on this missions repo from the control records, a
+# `task.landed` of a task of a mission on it (the integrator writes one only
+# after the task's gate accepted it) or a `source.moved` there with verdict
+# accepted (an owner's gated push). The deploy refuses unless HEAD is main
+# and such a landing names it; it then pushes nothing and records no move,
+# as --landed. Those records are the integrator's and the owner's, written
+# through owner-only functions; an agent writes none of them.
+#
+# How it ended. Once it holds the deploy lock, every deploy records how it
+# ended, one `deploy.finished` (`spawn mission deployed`): `ok` true once it
+# is live and every relay restarted, false with the reason it said (its last
+# error, every URL in it replaced by <url>: the record is read by anyone who
+# reads alerts, and nothing else of the deploy's environment goes in it),
+# `by` landing for --main and owner for the others. A failure raises the
+# `deploy_failed` alert, and the next deploy that succeeds clears it. A
+# deploy refused by the lock records nothing: another deploy is running,
+# which records its own. A record that cannot be written (a binary from
+# before this, a database down) is said on stderr, never the deploy's
+# failure.
 #
 # Steps, each one stops the deploy on failure:
 #   1. no other deploy runs (flock on $live/deploy.lock), and there is room:
@@ -210,6 +234,8 @@ cd "$repo"
 . "$repo/deploy/backup/lib.sh"
 # shellcheck source=scripts/sandbox.sh
 . "$repo/scripts/sandbox.sh"
+# shellcheck source=deploy/detach.sh
+. "$repo/deploy/detach.sh"
 
 say() { printf 'deploy: %s\n' "$*"; }
 
@@ -225,6 +251,14 @@ say() { printf 'deploy: %s\n' "$*"; }
 [ -d "$live" ] || die "no live directory $live"
 exec 9>>"$live/deploy.lock"
 flock -n 9 || die "another deploy holds $live/deploy.lock"
+locked=1
+# The deploy's last error, for its deploy.finished (header, "How it ended").
+last_error=""
+die() {
+  last_error=$*
+  echo "$PROG: error: $*" >&2
+  exit 1
+}
 
 # release_hold: end the owner's hold on the missions repo, if one is active
 # (deploy/hold.sh). Never fails: a release that cannot run is said, and the
@@ -297,16 +331,46 @@ on_exit() {
     restart || printf "deploy: the restart failed too: systemctl --user status spawn-integrate\n" >&2
   fi
   release_hold
+  record_finished "$status"
   # "|| true": nothing in it can become the deploy's status.
   [ "$status" -ne 0 ] || publish_mirror || true
 }
+
+# record_finished <status>: how this deploy ended, one deploy.finished
+# (header, "How it ended"). Never fails: a record that cannot be written is
+# said. Its own environment, so it runs on any exit.
+record_finished() {
+  [ "${locked-}" = 1 ] || return 0
+  local ok=true reason="" commit out
+  commit=${head:-$(git rev-parse HEAD 2>/dev/null)} || commit=""
+  [[ $commit =~ ^[0-9a-f]{40}$ ]] || {
+    printf 'deploy: no commit to record how the deploy ended\n' >&2
+    return 0
+  }
+  if [ "$1" -ne 0 ]; then
+    ok=false
+    reason=${last_error:-exit $1}
+    reason=$(printf '%s' "$reason" | sed -E 's#[A-Za-z][A-Za-z0-9+.-]*://[^[:space:]]*#<url>#g' | head -c 500)
+  fi
+  if ! out=$(set -a && . "$live/spawn.env" && set +a &&
+    "$live/bin/spawn" mission deployed --head "$commit" --ok "$ok" \
+      --by "$([ -n "${on_main-}" ] && echo landing || echo owner)" --reason "$reason" 2>&1); then
+    printf 'deploy: could not record how the deploy ended (%s)\n' "$(printf '%s' "$out" | head -c 300 | tr '\n' ' ')" >&2
+  fi
+  return 0
+}
 trap on_exit EXIT
 
-landed=""
+landed="" on_main=""
 [ "${1-}" = --landed ] && { landed=1; shift; }
-[ $# -eq 1 ] || die "usage: deploy/deploy.sh <verdict-file> | --landed <outcome-file> (see the header)"
+if [ "${1-}" = --main ] && [ $# -eq 1 ]; then
+  on_main=1
+  shift
+  set -- /dev/null
+fi
+[ $# -eq 1 ] || die "usage: deploy/deploy.sh <verdict-file> | --landed <outcome-file> | --main (see the header)"
 verdict_file=$1
-[ -f "$verdict_file" ] || die "no ${landed:+outcome}${landed:-verdict} file $verdict_file"
+[ -n "$on_main" ] || [ -f "$verdict_file" ] || die "no ${landed:+outcome}${landed:-verdict} file $verdict_file"
 field() { jq -er --arg name "$1" '.[$name] // empty | strings' "$verdict_file"; }
 # outcome_field <name>: a field of the outcome record of a --landed file.
 outcome_field() { jq -er --arg name "$1" '.outcome[$name] // empty | strings' "$verdict_file"; }
@@ -479,7 +543,19 @@ fi
 [ -z "$(git status --porcelain --untracked-files=no)" ] || die "the tree has uncommitted changes"
 head=$(git rev-parse HEAD)
 old=$(git --git-dir="$missions" rev-parse main)
-if [ -n "$landed" ]; then
+if [ -n "$on_main" ]; then
+  # Main as a gate accepted it (see the header, --main): the store says so.
+  [ "$old" = "$head" ] || die "the missions main is $old, not HEAD $head: --main deploys the missions main itself"
+  main_landing=$(set -a && . "$live/spawn.env" && set +a &&
+    "$live/bin/spawn" mission landing --source "$missions") ||
+    die "could not read main's landing from the store (above)"
+  [ "$(printf '%s' "$main_landing" | jq -r '.main')" = "$head" ] ||
+    die "the missions main moved since HEAD was read: deploy again"
+  landing_record=$(printf '%s' "$main_landing" | jq -r '.landing.record // empty')
+  [ -n "$landing_record" ] ||
+    die "no gate-accepted landing of $head on $missions in the store (a task.landed, or a source.moved with verdict accepted): deploy it with a verdict file"
+  say "HEAD $head is main, landed by $landing_record (event $(printf '%s' "$main_landing" | jq -r '.landing.event'), $(printf '%s' "$main_landing" | jq -r 'if .landing.task != null then "task \(.landing.task)" else "request \(.landing.request)" end')): no push, no move to record"
+elif [ -n "$landed" ]; then
   # The owner's gated push landed HEAD (see the header): main moved already.
   state=$(field state) || die "$verdict_file holds no push state"
   [ "$state" = applied ] || die "the owner's push is $state, not applied"
@@ -658,6 +734,20 @@ warm_base_cache() {
   mkdir -p "$live/gate-warm"
   find "$live/gate-warm" -maxdepth 1 -name '*.log' -type f -mtime +7 -delete 2>/dev/null || true
   log=$live/gate-warm/$head.log
+  # A unit of its own (deploy/detach.sh): a deploy run by a oneshot unit
+  # (deploy/on-landing.sh) would otherwise take it down as it exits. The
+  # integrator's gate environment goes through a file, never argv.
+  local unit=spawn-warm-base-${head:0:12}-$$ assignments=$live/gate-warm/$head.$$.env
+  if detach_assignments "$assignments" "${keep[@]}" &&
+    echo "deploy: base-only gate of $head, started $(date -Is) as $unit" >>"$log" &&
+    detach_start "$unit" "$log" "$assignments" \
+      setsid sh "$controller/scripts/rsi/gate.sh" --base-only "$missions" "$head" "$controller/rsi/scenarios"; then
+    rm -f "$assignments"
+    cached=${home}/.cache/spawn/gate-base
+    say "base cache: warming it for $head in the unit $unit, with ${own:-the shared test server}: log $log, results in $cached"
+    return 0
+  fi
+  rm -f "$assignments"
   (
     exec 8>&- 9>&- </dev/null >>"$log" 2>&1
     # Nor anything else the deploy's caller left open (a pipe it reads to
