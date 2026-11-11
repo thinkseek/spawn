@@ -784,7 +784,8 @@ fn a_missions_row_says_owner_work_when_it_has_no_objective_backlog() {
         .collect();
     assert_eq!(
         rows,
-        vec![(1, false), (2, true), (3, true), (4, true)],
-        "a backlog mission is not owner work; review, no settings or a backlog removed is"
+        vec![(1, false), (2, true), (3, true), (4, false)],
+        "a backlog mission is not owner work, nor one never configured; \
+         one configured without a backlog, or with its backlog removed, is"
     );
 }
