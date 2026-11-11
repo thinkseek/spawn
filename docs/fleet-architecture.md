@@ -1163,7 +1163,16 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   (`cleared_evidence.event_id` that record) or its close; a restart reads
   the mission's last ending from the store and an open one back, firing
   nothing again; Home's Needs you shows it, and the Missions card says how
-  long each idle backlog mission has had no work), and `message_not_taken`
+  long each idle backlog mission has had no work), `owner_request_waiting`
+  (S23; subject the source, key `owner_request_waiting:<request>`: an
+  owner's landing request, `source.push_requested`, that no `source.moved`
+  or `source.push_refused` has named for `SPAWN_ALERT_OWNER_REQUEST_SECS`,
+  default 3600; deploy-on-landing waits for such a request unless main
+  holds its commit already, so this is every deploy waiting on it;
+  evidence `request`, `commit`, `requested_ms` and `withdraw`, the
+  `spawn mission push --withdraw <request>` that ends it; once per
+  request; cleared at its outcome, which a restarted step reads from the
+  store), and `message_not_taken`
   (below, "Messages"). Each fires once per
   occurrence and clears with the record or reading that cleared it; a
   threshold of `0` disables its check.

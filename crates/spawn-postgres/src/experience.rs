@@ -157,6 +157,14 @@ select jsonb_build_object(
 impl PostgresStore {
     /// How the fleet did over `[since_ms, until_ms)`, from the experience
     /// views ([`WINDOW`]).
+    ///
+    /// A mission's `owner_work` reads its last configuration record, and
+    /// that is its configuration as its fold has it (`mission_missions`,
+    /// what `/api/rsi` shows): every configure records every setting
+    /// (`spawn mission configure` merges its change into the row through
+    /// `spawn_mission_reconfigure`), and the fold replaces them, so a later
+    /// configure that names only `accept` or a budget keeps the backlog
+    /// (S22; tests/experience.rs).
     pub fn experience_window(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
         self.query_json(WINDOW, &[&since_ms, &until_ms])
     }
