@@ -1060,10 +1060,18 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   candidate and passed) or `reused` (taken from the base's cache as
   solved); `gone`, a later `task.gated` of a mission it names carries
   `scenario_names` without it (the missions on one source share a gate
-  directory); `closed`, every mission it names is closed (the last
+  directory), or, at a reading, no gate directory of an open mission on its
+  source (its own, else its missions') holds the scenario any more, every
+  such directory read and none missing (`reading_ms` and `gates` instead of
+  `event_id`; a mission with no gate never gates, so an old per-mission
+  alert about a retired scenario clears without waiting for one); `closed`,
+  every mission it names is closed (the last
   `mission.closed`; at a start, one read back whose missions all closed
   before clears then); `quarantined`, a gate names it so. A gating that
-  holds the scenario and lists it in neither leaves an owner's open), `task_undelivered` (assigned longer than
+  holds the scenario and lists it in neither leaves an owner's open; Home's
+  Needs you shows an owner's alerts from before objective 056, one per
+  mission and no `source`, as one item per landing and scenario naming
+  every mission), `task_undelivered` (assigned longer than
   `SPAWN_ALERT_UNDELIVERED_SECS`, default 300, while its agent holds no
   delivered or reported task), `mission_halted` (cleared at its
   `mission.resumed`), `postgres_crash` (a `terminated by signal`, `No space
