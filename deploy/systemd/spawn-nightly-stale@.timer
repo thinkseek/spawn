@@ -1,0 +1,10 @@
+[Unit]
+Description=Spawn: hourly, whether the nightly of source %i covers anything
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

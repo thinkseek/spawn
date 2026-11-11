@@ -1,0 +1,13 @@
+[Unit]
+Description=Spawn: whether the nightly of source %i covers anything (scripts/rsi/nightly.sh --stale)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/share/spawn-rsi
+# The nightly's own check alone: no run, no gate. A nightly whose last two
+# runs were skipped, or whose newest fact is over 26 h old, or that never
+# wrote one though its timer fired, raises one nightly_stale alert.
+ExecStart=/bin/bash %h/.local/share/spawn-rsi/controllers/spawn/scripts/rsi/nightly.sh --stale %i
+EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
+Environment=PATH=%h/.cargo/bin:%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+TimeoutStartSec=5min
