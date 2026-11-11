@@ -169,9 +169,16 @@ judge() {
     echo "exit=$status $(without_commits 2>/dev/null <"$integrator/verdict" || true)"
 }
 without_commits() {
-    # The fact's version (`"v":1`, first) and its commits are said once,
-    # below; every other expectation reads the rest.
-    sed -E -e 's/^\{"v":1,/{/' -e 's/,"base":"[0-9a-f]+","candidate":"[0-9a-f]+"\}$/}/'
+    # The fact's version (`"v":1`, first), its commits and the regressions
+    # that passed are said once, below (passed_of); every other expectation
+    # reads the rest.
+    sed -E -e 's/^\{"v":1,/{/' -e 's/,"base":"[0-9a-f]+","candidate":"[0-9a-f]+"\}$/}/' \
+        -e 's/,"passed":\[[^]]*\]//'
+}
+# passed_of: the last verdict's `passed` ("The regressions that passed"),
+# `passed=<list>`, or `passed=none` for a verdict without one.
+passed_of() {
+    printf 'passed=%s\n' "$(sed -n -E 's/.*,"passed":\[([^]]*)\].*/\1/p' "$integrator/verdict" | grep . || echo none)"
 }
 expect() {
     case "$2" in
@@ -207,6 +214,13 @@ expect "a ref is resolved to its commit" \
 expect "a candidate that names no commit is no verdict" \
     "exit=$(sh "$gate" "$repo" "$base" no-such-ref "$scenarios" >/dev/null 2>&1 || echo $?)" 'exit=3'
 expect "no task scenario: regression only" "$(judge "$good")" 'exit=0 {"verdict":"accepted"}'
+# The regressions that passed (objective 056): named in the verdict, in
+# the log's order; 007.sh, unsolved on the base, passes here as a
+# regression. With 007.sh the task, it is the verdict itself, not in it.
+expect "the verdict names the regressions that passed" "$(passed_of)" \
+    'passed="007.sh","check-built.sh","check-probe.sh"'
+judge "$good" "$scenarios/007.sh" >/dev/null
+expect "but not the task's own scenario" "$(passed_of)" 'passed="check-built.sh","check-probe.sh"'
 
 # No room in TMPDIR: exit 5 and a no-room fact in the verdict file (no
 # verdict), before any scratch is made. The integrator records it as
@@ -287,6 +301,8 @@ printf 'echo "probe: broken"\nexit 1\n' >"$seed/probe.sh"
 broken_probe=$(commit broken-probe)
 expect "a check that fails twice and passes on the base is a regression" "$(judge "$broken_probe")" \
     'exit=0 {"verdict":"rejected","reason":"regression: check-probe.sh fails on the candidate"}'
+expect "a rejection names the regressions that passed before it, not the one that failed" "$(passed_of)" \
+    'passed="007.sh","check-built.sh"'
 expect "it ran again before the base" "$(cat "$work/gate.out")" \
     '| == regression: check-probe.sh must still pass (again: a failing check runs twice)'
 expect "and the log says why" "$(cat "$work/gate.out")" \
@@ -303,6 +319,10 @@ EOF
 flaky=$(commit flaky)
 expect "a check that fails once and then passes is a flake, not a regression, named in the verdict" \
     "$(judge "$flaky")" 'exit=0 {"verdict":"accepted","flakes":["check-probe.sh"]}'
+# In the log's order: check-probe.sh, the known failure of the gate before,
+# is judged first.
+expect "a flake that passed again is a regression that passed too" "$(passed_of)" \
+    'passed="check-probe.sh","007.sh","check-built.sh"'
 expect "the log says it" "$(cat "$work/gate.out")" \
     'check-probe.sh failed once (1) and passed again on the candidate: a flake, not a regression'
 broken_scenarios=$work/broken
@@ -3751,6 +3771,8 @@ reuse_judge() { # <base> <candidate> [VAR=value]
 reuse_cache=$work/caches/reuse/spawn/gate-base
 expect "a candidate that builds the base's binary: the declared scenarios are not run, and the verdict names them" \
     "$(reuse_judge "$reuse_a" "$reuse_docs")" 'exit=0 {"verdict":"accepted","reused":["401.sh","402.sh"]}'
+expect "those run and passed are named apart: a result is reused or passed, never both" "$(passed_of)" \
+    'passed="403.sh","404.sh"'
 reuse_log=$(cat "$work/gate.out")
 expect "the log says so per scenario, and why" "$reuse_log" \
     "| == regression: 401.sh must still pass: not run, the base's result (solved) is reused: it declares that a run reads only this of the tree: binary; the candidate's spawn is the binary the base's result was taken on, byte for byte (sha256 "
@@ -4032,6 +4054,7 @@ expect "the log says the class: a validator defect" "$class_log" \
 expect "the owner's own candidate is judged on the rest and accepted, the validator named" \
     "$(class_judge defect "$good" SPAWN_GATE_OWNER_CANDIDATE=1)" \
     'exit=0 {"verdict":"accepted","validator_defects":["721.sh"]}'
+expect "the regressions that passed do not include the validator defect" "$(passed_of)" 'passed="722.sh"'
 expect "the rest was judged" "$(cat "$work/gate.out")" '| 722 ran in candidate'
 expect "and the log says whose candidate goes on" "$(cat "$work/gate.out")" \
     "validator defect (fails on the base too, under the same conditions), not a rejection; the owner's candidate is judged on the rest"
