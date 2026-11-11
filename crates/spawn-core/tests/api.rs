@@ -844,6 +844,129 @@ fn a_resume_restores_a_deleted_transcript_from_the_archive() {
     );
 }
 
+/// A running execution whose transcript the Bridge follows: the store, the
+/// Bridge, and the transcript's path. The files are the in-memory host's:
+/// nothing on disk is read, written or removed.
+fn following() -> (Arc<MemoryStore>, Bridge, String) {
+    let store = store();
+    let execution = ExecutionId::for_command(CommandId(1));
+    store.set_pane(&TerminalName::for_execution(&execution), READY);
+    let mut bridge = Bridge::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        BridgeConfig::new("tester"),
+    );
+    submit_start(&store, "work");
+    bridge.tick().expect("start");
+    let (_, path) = transcript_of_latest(&store);
+    (store, bridge, path)
+}
+
+/// A tool call's line, keyed by `uuid`, calling `tool` (the same length
+/// for every one-digit pair).
+fn tool_line(uuid: &str, tool: &str) -> String {
+    format!(
+        "{{\"type\":\"assistant\",\"uuid\":\"{uuid}\",\"timestamp\":\"2099-01-01T00:00:00.000Z\",\
+         \"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"{tool}\",\"name\":\"Bash\"}}]}}}}\n"
+    )
+}
+
+/// The tool calls the log holds from the engine's transcript, in order.
+fn tools_started(store: &MemoryStore) -> Vec<String> {
+    events(store)
+        .into_iter()
+        .filter(|event| event.source == Source::Claude && event.kind.name() == "tool.started")
+        .map(|event| event.source_event_id.unwrap_or_default())
+        .collect()
+}
+
+fn reread(report: &spawn_core::bridge::TickReport) -> usize {
+    report
+        .warnings
+        .iter()
+        .filter(|warning| warning.contains("reading it again from the start"))
+        .count()
+}
+
+/// Incident 2026-11-12 (D1): a transcript that shrank below the Bridge's
+/// offset read as "nothing new" for ever. It is read again from the start,
+/// warned once, and what is written after it is seen.
+#[test]
+fn a_transcript_that_shrank_is_read_again_from_the_start() {
+    let (store, mut bridge, path) = following();
+    store.append_file(
+        &path,
+        &(tool_line("a1", "toolu_1") + &tool_line("a2", "toolu_2")),
+    );
+    assert_eq!(reread(&bridge.tick().expect("read")), 0);
+    assert_eq!(tools_started(&store).len(), 2);
+
+    // The file is cut to one new line, shorter than what was read.
+    store.replace_file(&path, tool_line("b1", "toolu_3").as_bytes());
+    let report = bridge.tick().expect("read the shrunk file");
+    assert_eq!(reread(&report), 1, "{:?}", report.warnings);
+    assert_eq!(tools_started(&store).len(), 3, "the new line is seen");
+
+    // From there it is followed as before: no warning, no line twice.
+    store.append_file(&path, &tool_line("b2", "toolu_4"));
+    let report = bridge.tick().expect("read on");
+    assert_eq!(reread(&report), 0, "{:?}", report.warnings);
+    bridge.tick().expect("again");
+    assert_eq!(tools_started(&store).len(), 4);
+}
+
+/// A file renamed over the transcript (a restore: the archive's copy with
+/// the lines after it) that is longer than what was read but holds other
+/// bytes before the offset is read again from the start; the lines it
+/// shares with what was read are not appended twice.
+#[test]
+fn a_transcript_replaced_by_a_longer_file_is_read_again_without_repeats() {
+    let (store, mut bridge, path) = following();
+    let first = tool_line("a1", "toolu_1") + &tool_line("a2", "toolu_2");
+    store.append_file(&path, &first);
+    bridge.tick().expect("read");
+    assert_eq!(tools_started(&store).len(), 2);
+
+    let restored = tool_line("z1", "toolu_0") + &first + &tool_line("a3", "toolu_3");
+    store.replace_file(&path, restored.as_bytes());
+    let report = bridge.tick().expect("read the replaced file");
+    assert_eq!(reread(&report), 1, "{:?}", report.warnings);
+    bridge.tick().expect("again");
+    let started = tools_started(&store);
+    assert_eq!(
+        started.len(),
+        4,
+        "a1 and a2 once, z1 and a3 new: {started:?}"
+    );
+    let mut unique = started.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), started.len(), "no line twice: {started:?}");
+}
+
+/// A file of exactly the length read, with other bytes, is a replacement
+/// too: its lines are read.
+#[test]
+fn a_transcript_replaced_by_a_file_of_the_same_length_is_read_again() {
+    let (store, mut bridge, path) = following();
+    store.append_file(&path, &tool_line("a1", "toolu_1"));
+    bridge.tick().expect("read");
+    let other = tool_line("c9", "toolu_9");
+    assert_eq!(other.len(), tool_line("a1", "toolu_1").len());
+    store.replace_file(&path, other.as_bytes());
+    let report = bridge.tick().expect("read the replaced file");
+    assert_eq!(reread(&report), 1, "{:?}", report.warnings);
+    assert_eq!(tools_started(&store).len(), 2);
+
+    // A file that went on, the same bytes and more, is no replacement.
+    store.append_file(&path, &tool_line("c8", "toolu_8"));
+    let report = bridge.tick().expect("read on");
+    assert_eq!(reread(&report), 0, "{:?}", report.warnings);
+    assert_eq!(tools_started(&store).len(), 3);
+}
+
 #[test]
 fn a_resume_whose_transcript_is_gone_without_a_copy_fails_and_starts_nothing() {
     let store = store();
