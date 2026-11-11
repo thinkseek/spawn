@@ -25,10 +25,8 @@ import {
   liveAlerts,
   missionsToday,
   needsSummary,
-  noWorkText,
   needsYou,
   oneLine,
-  quietText,
 } from "../src/home.ts";
 import type { Mission, Missions, MissionTask } from "../src/missions.ts";
 import { fleetContext } from "../src/ordering.ts";
@@ -687,62 +685,4 @@ test("an owner landing's old per-mission validator alerts are one item in Needs 
     [],
     "cleared, Needs you holds no validator item",
   );
-});
-
-test("missions today: a backlog mission with nothing open says how long it has had no work; owner work does not", () => {
-  const ended = (id: number, at: number) => task(id, "cancelled", { updated_at_ms: at, stages: [] });
-  const model = missionsToday(
-    missions([
-      mission(4, "Spawn RSI", [ended(40, NOW - 3 * HOUR), ended(41, NOW - 5 * HOUR)], {
-        objectives: { backlog: "rsi/backlog", resident: "rsi" },
-      }),
-      mission(6, "Supply PA", [ended(60, NOW - 20 * HOUR)], { objectives: { backlog: "b", resident: null } }),
-      mission(8, "Owner work", [ended(80, NOW - 40 * HOUR)], { gate: null }),
-      mission(9, "New backlog", [], { objectives: { backlog: "b", resident: null } }),
-    ]),
-    NOW,
-  );
-  assert.equal(model.rows.length, 0);
-  assert.deepEqual(
-    model.quiet.map((entry) => [entry.id, entry.idle_ms]),
-    [
-      [4, 3 * HOUR],
-      [6, 20 * HOUR],
-      [8, null],
-      [9, null],
-    ],
-    "since its last task ended; none for owner work or a mission that never had a task",
-  );
-  assert.equal(noWorkText(model), "No mission has work open: #4 Spawn RSI none for 3 h, #6 Supply PA none for 20 h.");
-  assert.equal(
-    quietText(model.quiet),
-    "#4 Spawn RSI (no work for 3 h), #6 Supply PA (no work for 20 h), #8 Owner work, #9 New backlog",
-  );
-  assert.equal(noWorkText({ rows: [], quiet: [{ id: 8, name: "Owner work", idle_ms: null }], closed: 0 }), "No mission has work open.");
-});
-
-test("needs you: an idle backlog mission's alert is one item naming it", () => {
-  const items = needsYou({
-    attention: null,
-    missions: null,
-    alerts: [
-      {
-        key: "mission_idle:4:77",
-        kind: "mission_idle",
-        subject: "mission #4",
-        state: "open",
-        fired_at_ms: NOW - HOUR,
-        cleared_at_ms: null,
-        evidence: { mission: 4, since_ms: NOW - 2 * HOUR, event_id: 77 },
-        text: "mission #4 has had no task in work for 2 h since its last task ended",
-      } as unknown as Alert,
-    ],
-    agents: [],
-    health: null,
-    missingAlwaysOn: 0,
-    now: NOW,
-  });
-  assert.equal(items.length, 1);
-  assert.equal(items[0].title, "A mission has no work · mission #4");
-  assert.match(items[0].detail ?? "", /mission #4/);
 });
