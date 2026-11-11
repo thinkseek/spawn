@@ -83,6 +83,14 @@ for tool in psql tmux git jq od bash sed grep stty sha256sum; do
 done
 
 WORK=$(mktemp -d) || harness "mktemp failed"
+# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
+# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+HOME=$WORK/home
+TMUX_TMPDIR=$WORK/tmux-sock
+mkdir -p "$HOME" "$TMUX_TMPDIR"
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
+export HOME TMUX_TMPDIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_j09_stall_$run"
@@ -127,7 +135,6 @@ cleanup() {
     fi
     for socket in "$SPAWN_TMUX_SOCKET" "$SOCKET026"; do
         tmux -L "$socket" kill-server >/dev/null 2>&1 || true
-        rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$socket"
     done
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
@@ -217,7 +224,6 @@ section_026() {
             wait "$loop_pid" 2>/dev/null || true
         fi
         tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-        rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SPAWN_TMUX_SOCKET"
         if [ -n "$database_made" ]; then
             sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
         fi

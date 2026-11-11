@@ -72,6 +72,14 @@ for tool in psql tmux git jq od curl sed grep cmp diff timeout; do
 done
 
 J=$(mktemp -d) || harness "mktemp failed"
+# A scratch HOME, and the tmux server's socket, in $J: nothing here reads
+# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+HOME=$J/home
+TMUX_TMPDIR=$J/tmux-sock
+mkdir -p "$HOME" "$TMUX_TMPDIR"
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
+export HOME TMUX_TMPDIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_TMUX_SOCKET="bb-j05-$run"
@@ -108,7 +116,6 @@ finish() {
         wait "$pid" 2>/dev/null || true
     done
     tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-    rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SPAWN_TMUX_SOCKET"
     for db in $databases; do
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$db" >/dev/null 2>&1 || true

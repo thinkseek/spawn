@@ -81,6 +81,14 @@ for tool in psql jq od curl sed grep sha1sum cut; do
 done
 
 WORK=$(mktemp -d) || harness "mktemp failed"
+# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
+# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+HOME=$WORK/home
+TMUX_TMPDIR=$WORK/tmux-sock
+mkdir -p "$HOME" "$TMUX_TMPDIR"
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
+export HOME TMUX_TMPDIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_052_solved_$run"
@@ -146,12 +154,7 @@ for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SP
 done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
 SPAWN_WORKSPACE_ROOT=$WORK/ws
-# A scratch HOME: nothing here reads or writes the real one (cc-rules (a)).
-real_home=$HOME
-HOME=$WORK/home
-mkdir -p "$HOME"
-[ "$HOME" != "$real_home" ] && [ "${HOME#"$WORK"/}" != "$HOME" ] || harness "HOME is not a scratch directory under WORK: $HOME"
-export HOME SPAWN_DATABASE_URL SPAWN_WORKSPACE_ROOT
+export SPAWN_DATABASE_URL SPAWN_WORKSPACE_ROOT
 mkdir -p "$SPAWN_WORKSPACE_ROOT"
 
 tries=0
