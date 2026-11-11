@@ -119,6 +119,8 @@ impl Story {
             succeeded,
             error: error.map(str::to_string),
             stalls: stalls.iter().map(|tag| (*tag).to_string()).collect(),
+            intent: None,
+            intent_at_ms: None,
         });
         self
     }
