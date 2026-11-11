@@ -2249,24 +2249,29 @@ fn cost(query: &str) -> Result<Value, String> {
         .map_err(|error| format!("{BAD_REQUEST}{error}"))?;
     let store = open_store()?;
     let mut answer = crate::cost::window(&store, name, length_ms)?;
-    let facts = store
-        .task_label_facts(&cost_task_ids(&answer))
-        .map_err(err)?;
-    labels::label_cost(
-        &mut answer,
-        &labels::Context::from_board(&facts, &labels::Titles::new()),
-    );
+    label_cost_tasks(&store, &mut answer)?;
     Ok(answer)
 }
 
-/// The ids of a cost answer's `tasks` rows.
-fn cost_task_ids(answer: &Value) -> Vec<i64> {
-    answer["tasks"]
+/// A cost answer's `tasks` rows, each with its `label` as `/api/missions`
+/// gives it (null for a task the record does not hold): read for those
+/// tasks alone ([`spawn_postgres::PostgresStore::task_label_facts`]).
+fn label_cost_tasks(
+    store: &spawn_postgres::PostgresStore,
+    answer: &mut Value,
+) -> Result<(), String> {
+    let ids: Vec<i64> = answer["tasks"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|row| row["task"].as_i64())
-        .collect()
+        .collect();
+    let facts = store.task_label_facts(&ids).map_err(err)?;
+    labels::label_cost(
+        answer,
+        &labels::Context::from_board(&facts, &labels::Titles::new()),
+    );
+    Ok(())
 }
 
 /// A query parameter's value with its `%XX` escapes decoded (a `+` stays a
@@ -3285,6 +3290,61 @@ mod tests {
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    #[test]
+    fn a_cost_task_row_carries_its_label_as_the_missions_board_gives_it() {
+        in_test_schema(|_owner, store| {
+            let supply = store
+                .mission_add(
+                    "Supply PA: give every provider an AI business agent.",
+                    &json!(["/x/supply.git"]),
+                    "human",
+                )
+                .expect("a mission");
+            let other = store
+                .mission_add("Work on the docs", &json!([]), "human")
+                .expect("a mission");
+            let extras = store
+                .task_assign(
+                    supply,
+                    "ephemeral",
+                    "w1",
+                    "Implement extras in Supply PA: docs/protocol.md, sections Extras",
+                    "default",
+                )
+                .expect("a task");
+            let docs = store
+                .task_assign(other, "ephemeral", "w2", "Goal: rewrite the guide.", "default")
+                .expect("a task");
+            let mut board = store.mission_board(50).expect("the board");
+            super::labels::label_board(&mut board);
+            let board_label = |id: i64| {
+                board["missions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|mission| mission["tasks"].as_array().into_iter().flatten())
+                    .find(|task| task["id"] == id)
+                    .map(|task| task["label"].clone())
+                    .unwrap_or_else(|| panic!("no task {id} on the board: {board}"))
+            };
+            let mut answer = json!({"tasks": [
+                {"task": extras, "usd": 1.0},
+                {"task": docs, "usd": 0.5},
+                {"task": 999_999, "usd": 0.1},
+            ]});
+            super::label_cost_tasks(store, &mut answer).expect("labelled");
+            let label = |index: usize| answer["tasks"][index]["label"].clone();
+            assert!(label(0).is_string(), "{answer}");
+            assert_eq!(label(0), board_label(extras), "{answer}");
+            assert_eq!(label(1), board_label(docs), "{answer}");
+            assert_eq!(label(2), serde_json::Value::Null, "not in the record");
+            // No tasks: nothing to label, and no error.
+            let mut empty = json!({"tasks": []});
+            super::label_cost_tasks(store, &mut empty).expect("labelled");
+            assert_eq!(empty, json!({"tasks": []}));
+        });
     }
 
     /// The supervisor's session starts an execution, as the Bridge records it.
