@@ -22,6 +22,7 @@ import {
   digestToday,
   digestWindow,
   latestNotes,
+  allNotes,
   liveAlerts,
   missionsToday,
   needsSummary,
@@ -351,7 +352,92 @@ test("the supervisor's notes: at most two from the last 6 hours, the rest counte
   const old = latestNotes(view([note(8)]), NOW);
   assert.deepEqual(old.shown, []);
   assert.equal(old.more, 1);
-  assert.deepEqual(latestNotes(null, NOW), { shown: [], more: 0 });
+  assert.deepEqual(latestNotes(null, NOW), { shown: [], more: 0, settled: 0 });
+});
+
+// The supervisor's five lines of rsi/scenarios/064.sh, oldest first, as
+// /api/attention lists them (newest first, with `tasks` and `settled`).
+function fiveLines() {
+  const line = (minutes: number, text: string, tasks: Array<{ id: number; state: string }>, settled: boolean) => ({
+    text,
+    at_ms: NOW - minutes * 60_000,
+    tasks,
+    settled,
+  });
+  return attention({
+    supervisor: {
+      session_id: "session_supervisor",
+      agent_id: "agent_supervisor",
+      live: true,
+      execution_id: null,
+      end_cause: null,
+      busy: false,
+      turn_ended: true,
+      judgement: null,
+      question: null,
+      for_owner: [
+        line(1, "reports 2, 3 and 4 are still waiting for your review.", [
+          { id: 2, state: "accepted" },
+          { id: 3, state: "accepted" },
+          { id: 4, state: "cancelled" },
+        ], true),
+        line(2, "task 2 landed; deploying it needs spawn init-db.", [{ id: 2, state: "accepted" }], false),
+        line(3, "task #5 waits for your review.", [{ id: 5, state: "reported" }], false),
+        line(4, "mission #3 has no backlog yet.", [], false),
+        line(5, "deploy main to pick up the new cost page.", [], false),
+      ],
+      label: null,
+      task_title: null,
+      mission_name: null,
+    },
+  });
+}
+
+test("Home's card leaves a settled line out: neither shown nor counted in more (objective 064)", () => {
+  const notes = latestNotes(fiveLines(), NOW);
+  assert.deepEqual(
+    notes.shown.map((note) => note.text),
+    ["task 2 landed; deploying it needs spawn init-db.", "task #5 waits for your review."],
+  );
+  assert.equal(notes.more, 2, "the mission #3 and deploy main lines");
+  assert.equal(notes.settled, 1);
+  // Only a settled line besides those shown: the card still opens onto it.
+  const only = latestNotes(
+    attention({ supervisor: { ...fiveLines().supervisor!, for_owner: fiveLines().supervisor!.for_owner.slice(0, 2) } }),
+    NOW,
+  );
+  assert.deepEqual(only.shown.map((note) => note.text), ["task 2 landed; deploying it needs spawn init-db."]);
+  assert.equal(only.more, 0);
+  assert.equal(only.settled, 1);
+  // An older server sends no `settled`: every line counts as before.
+  const older = latestNotes(
+    attention({
+      supervisor: {
+        ...fiveLines().supervisor!,
+        for_owner: fiveLines().supervisor!.for_owner.map(({ text, at_ms }) => ({ text, at_ms }) as never),
+      },
+    }),
+    NOW,
+  );
+  assert.deepEqual(older.shown.map((note) => note.text), ["reports 2, 3 and 4 are still waiting for your review.", "task 2 landed; deploying it needs spawn init-db."]);
+  assert.equal(older.more, 3);
+  assert.equal(older.settled, 0);
+});
+
+test("the supervisor's full list still shows a settled line, marked settled, with each named task's state (objective 064)", () => {
+  assert.deepEqual(allNotes(fiveLines()), [
+    {
+      text: "reports 2, 3 and 4 are still waiting for your review.",
+      at_ms: NOW - 60_000,
+      settled: true,
+      tasks: "T2 accepted, T3 accepted, T4 cancelled",
+    },
+    { text: "task 2 landed; deploying it needs spawn init-db.", at_ms: NOW - 120_000, settled: false, tasks: "T2 accepted" },
+    { text: "task #5 waits for your review.", at_ms: NOW - 180_000, settled: false, tasks: "T5 reported" },
+    { text: "mission #3 has no backlog yet.", at_ms: NOW - 240_000, settled: false, tasks: "" },
+    { text: "deploy main to pick up the new cost page.", at_ms: NOW - 300_000, settled: false, tasks: "" },
+  ]);
+  assert.deepEqual(allNotes(null), []);
 });
 
 test("today's digest: one line per task, and alerts, of the last 24 h, newest first; task notices are left out", () => {
