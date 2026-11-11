@@ -120,7 +120,8 @@
 //!   one is under 0.5, or when the session's current execution has ended,
 //!   whatever the cause (stopped, exited, lost), with that end as evidence.
 //!   An alert is a claim that someone must act (objective 057): none fires
-//!   for a worker whose task is past its part (reported, gated, accepted,
+//!   for an ephemeral worker (`agent_worker_*`; a resident outlives its
+//!   tasks and takes other work) whose task is past its part (reported, gated, accepted,
 //!   landing or held, landed: it waits on the gate, a reviewer or the
 //!   owner), its open one clearing at the task record that moved it (that
 //!   record's id its `event_id`), nor for the supervisor with nothing to
@@ -1608,7 +1609,7 @@ times in a row)",
     ///
     /// A stuck judgement is a claim that someone must act (objective 057),
     /// so it fires nothing for an agent that waits because nothing is its
-    /// to do: a worker whose task is past its part ([`PART_DONE`]: it waits
+    /// to do: an ephemeral worker ([`ephemeral`]) whose task is past its part ([`PART_DONE`]: it waits
     /// for the gate, a reviewer, its landing or the owner's hold; its open
     /// alert cleared at the task record that moved it, [`Self::task_record`])
     /// and the supervisor with nothing to dispatch ([`Self::supervisor_work`];
@@ -1750,14 +1751,11 @@ times in a row)",
         }
         for item in &read.items {
             let workers = item.judgement
-                && item
-                    .agent
-                    .as_deref()
-                    .is_some_and(|agent| {
-                        self.held_task(agent).is_some_and(|(_, state)| {
-                            ephemeral(agent) || !PART_DONE.contains(&state.as_str())
-                        })
-                    });
+                && item.agent.as_deref().is_some_and(|agent| {
+                    self.held_task(agent).is_some_and(|(_, state)| {
+                        ephemeral(agent) || !PART_DONE.contains(&state.as_str())
+                    })
+                });
             if !workers {
                 work.push(format!("escalation {}", item.tag));
             }
@@ -5392,6 +5390,61 @@ connections\n";
         assert!(matches!(&cleared[..], [Event::Clear { evidence, .. }]
             if evidence["event_id"] == 300 && evidence["record"] == "task.gated"
                 && evidence["task_state"] == "landing"));
+    }
+
+    /// A resident outlives its tasks: one whose task is reported is still
+    /// alerted stuck (it takes other work), naming no task; its task's
+    /// report clears nothing.
+    #[test]
+    fn a_resident_whose_task_is_reported_is_still_alerted() {
+        let mut monitor = monitor();
+        for (id, record) in [
+            (
+                1,
+                json!({"type": "mission.added", "id": 4, "text": "m", "origin": "human"}),
+            ),
+            (
+                10,
+                json!({"type": "task.assigned", "id": 8, "mission_id": 4,
+                       "agent_id": "agent_resident_r1", "objective": null}),
+            ),
+            (
+                11,
+                json!({"type": "task.delivered", "id": 8, "command_id": 3}),
+            ),
+        ] {
+            let events = feed(&mut monitor, id, 0, record);
+            commit(&mut monitor, &events);
+        }
+        let out = observed(
+            &mut monitor,
+            &stuck_of("session_resident_r1", "agent_resident_r1"),
+        );
+        assert_eq!(fires(&out), ["agent_stuck:session_resident_r1:100"]);
+        commit(&mut monitor, &out);
+        let reported = feed(
+            &mut monitor,
+            120,
+            0,
+            json!({"type": "task.reported", "id": 8, "commit": "c"}),
+        );
+        assert!(
+            !reported
+                .iter()
+                .any(|event| matches!(event, Event::Clear { .. })),
+            "{reported:?}"
+        );
+        commit(&mut monitor, &reported);
+        monitor.known.clear();
+        let out = observed(
+            &mut monitor,
+            &stuck_of("session_resident_r1", "agent_resident_r1"),
+        );
+        let Event::Fire { evidence, .. } = &out[0] else {
+            panic!("a fire: {out:?}");
+        };
+        assert_eq!(evidence["task"], json!(null));
+        assert_eq!(evidence["command"], json!(null));
     }
 
     fn supervisor_stuck() -> Value {

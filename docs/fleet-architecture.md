@@ -1076,7 +1076,8 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   `host source-back-<event>`), `agent_stuck` (the session's
   latest judgement at or above the Observer's 0.5, whatever the dispatcher
   does with it, about an agent someone must act on (objective 057): none,
-  whatever the score, for a worker whose task is past its part (`reported`,
+  whatever the score, for an ephemeral worker (`agent_worker_*`; a resident
+  outlives its tasks and takes other work) whose task is past its part (`reported`,
   gated, `accepted`, `landing`, held behind a hold, `landed`: it waits for
   the gate, a reviewer, its landing or the owner), nor for the supervisor
   while it has nothing to dispatch (no open question to the owner, no
