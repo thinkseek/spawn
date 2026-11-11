@@ -194,6 +194,12 @@ fn history(client: &mut Client) {
         &json!({"type": "mission.closed", "id": 3, "state": "done", "summary": "ok"}),
     );
 
+    decisions(client);
+}
+
+/// Judgements, digests into the supervisor (one tag twice, a charter's tag)
+/// and commands of every principal.
+fn decisions(client: &mut Client) {
     judgement(client, 1, &json!({"state": "WORKING", "judge": "rules"}));
     judgement(
         client,
