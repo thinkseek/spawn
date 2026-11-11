@@ -19,6 +19,7 @@
 //! [`history`] folds the record into marks, [`measure`] counts a scope over a
 //! window, [`transcripts`] reads the archive's tokens and [`time`] the times.
 
+pub(crate) mod fleet;
 mod history;
 mod measure;
 pub(crate) mod time;

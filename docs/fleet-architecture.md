@@ -1314,9 +1314,34 @@ next command and who sent it, the end of the execution) follows it in the
 same log. Nothing exports these episodes or replays them through the rules
 (§9).
 
-The ladder metrics in the UI (decisions per tier, escalations, human
-decisions per agent-hour over the last 24 h) are computed from the log by
-`spawn serve`.
+Four views derive the experience from the log, one row per item, each with
+`at_ms`, the time it counts at (crates/spawn-postgres/sql/schema.sql;
+readable by `spawn_reader` and the supervisor):
+
+| View | One row per | Columns |
+| --- | --- | --- |
+| `spawn_decisions` | judgement (at its time) and command (at its creation) | `at_ms`, `tier` (`rules` when the rules judged, else `model`; `dispatcher` for `spawn-dispatch`, `supervisor` for `spawn_supervisor`, `human` for `human` and `spawn`, `liveness` for `spawn-liveness`, any other principal as its own tier), `session_id`, `agent_id`, `source` (the judge or the principal) |
+| `spawn_interventions` | the scorecard's interventions (docs/design.md §15, autonomy (a)-(d)) | `at_ms`, `kind` (`command`, `resume`, `owner_task`, `cancel_reassign`), `mission_id`, `task_id`, `command_id` |
+| `spawn_outcomes` | task's closing record | `at_ms`, `outcome` (`landed`, `accepted`: a review that closes it on a mission without a gate, `cancelled`, `aborted`, `over_budget`), `task_id`, `mission_id`, `by` |
+| `spawn_escalations` | distinct tag of the dispatcher's inputs into the supervisor (`Escalation::tag`; a charter's tag is not one), at the first command that carried it | `at_ms`, `tag`, `command_id` |
+
+They fold the control stream as the scorecard does: helper views give each
+task's open intervals (`spawn_task_spans`: each assignment to its first
+closing record) and each mission's open span (`spawn_mission_spans`: its
+`mission.added` to its `mission.closed`). `GET
+/api/scorecard/fleet?window=24h|7d|30d|90d[&until=<RFC 3339>]` (any other
+window: 400) counts `[until − window, until)` from them, `agent_judgements`
+and `agent_executions`: the ladder (`ladder`, `ladder_extra`), `agent_hours`
+(clipped to the window), `human_per_agent_hour`, `escalations`,
+`interventions` (`total`, `by_kind`), `outcomes`, `landed_per_day` (landed
+plus accepted over the window's days), `judgements` (as the last hour of
+`/api/fleet` counts them) and `missions` (each open in the window with
+`hours`, `idle_hours`, its span less the union of its tasks' open
+intervals, and `idle`, more than half of it), ratios and hours to 3
+decimals as the scorecard rounds (crates/spawn-cli/src/scorecard/fleet.rs).
+The Scorecard's "How the fleet decides" reads it over the page's window;
+`/api/fleet`'s 24 h ladder and human decisions per agent-hour read
+`spawn_decisions` too, so home and the scorecard agree.
 
 ## 5. Interface
 
@@ -1335,8 +1360,8 @@ read is 405): `/api/overview`, `/api/fleet` (with
 `/api/fleet/<session>/judgements` and `/commands`, each command with
 `waiting` once the Bridge holds it for the agent's turn), `/api/attention`,
 `/api/missions`, `/api/events`, `/api/session/<id>`, `/api/pane/<id>`,
-`/api/rsi` (with `/api/rsi/task/<id>` and `/api/rsi/pane`) and
-`/api/scorecard` (`crates/spawn-cli/src/serve.rs`; the answer of
+`/api/rsi` (with `/api/rsi/task/<id>` and `/api/rsi/pane`),
+`/api/scorecard` and `/api/scorecard/fleet` (§4) (`crates/spawn-cli/src/serve.rs`; the answer of
 `/api/attention` is documented in `crates/spawn-cli/src/serve/attention.rs`).
 
 It writes two things. The first is a person's input to a session, `POST
@@ -1488,9 +1513,10 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
 
 ## 9. Not built
 
-- **Experience views in SQL** (`decisions`, `outcomes`, `interventions`)
-  and outcome labels: the log holds what followed each judgement, but
-  nothing derives, exports or replays the episodes.
+- **Outcome labels for episodes**: the experience views (§4) count
+  decisions, interventions, outcomes and escalations over any window, but
+  nothing labels a judgement with what followed it, exports the episodes
+  or replays them.
 - **RSI objectives over the corpus**, judged by black-box replay through the
   candidate's `spawn` binary on a corpus snapshot the candidate cannot edit:
   rules coverage (share of episodes decided by rules up, agreement with the

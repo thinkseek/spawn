@@ -472,6 +472,27 @@ fn throughput_is_landings_per_open_hour() {
 }
 
 #[test]
+fn over_budget_closes_a_task_and_no_later_record_lands_it() {
+    let mut story = Story::default();
+    story.mission(1, true);
+    // Open 0-4, closed over budget; its landing after that changes nothing,
+    // and it is no person's cancellation (the next try is no intervention).
+    story
+        .assign(at(0), 7, 1, Some(3), "spawn_supervisor")
+        .task(7, "task.over_budget", at(4))
+        .task(7, "task.landed", at(6))
+        .assign(at(8), 8, 1, Some(3), "spawn_supervisor");
+    let history = story.history();
+    let counts = counts(&history, Scope::Fleet, window_hours(0, 10));
+    assert_eq!(counts.landed, 0);
+    assert_eq!(counts.open_ms, 6 * HOUR_MS, "0-4 and 8-10");
+    assert_eq!(
+        dimension(&counts, None, "autonomy")["interventions"],
+        json!(0)
+    );
+}
+
+#[test]
 fn lead_time_runs_from_the_objectives_first_try() {
     let mut story = Story::default();
     story.mission(1, true).mission(2, true);
