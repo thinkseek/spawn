@@ -2390,21 +2390,30 @@ fn write_whole(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
 
 /// Scenario files in the controller's checkout.
 pub(crate) fn count_scenarios(directory: &Path) -> Result<u32, String> {
+    Ok(u32::try_from(scenario_names(directory)?.len()).unwrap_or(u32::MAX))
+}
+
+/// The scenario file names (`*.sh`) in `directory`, sorted: the ones
+/// [`count_scenarios`] counts. None in a directory that does not exist.
+pub(crate) fn scenario_names(directory: &Path) -> Result<Vec<String>, String> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(format!("read {}: {error}", directory.display())),
     };
-    let mut count = 0;
+    let mut names = Vec::new();
     for entry in entries {
         let path = entry
             .map_err(|error| format!("read {}: {error}", directory.display()))?
             .path();
-        if path.extension().and_then(|text| text.to_str()) == Some("sh") {
-            count += 1;
+        if path.extension().and_then(|text| text.to_str()) == Some("sh")
+            && let Some(name) = path.file_name()
+        {
+            names.push(name.to_string_lossy().into_owned());
         }
     }
-    Ok(count)
+    names.sort();
+    Ok(names)
 }
 
 #[cfg(test)]
