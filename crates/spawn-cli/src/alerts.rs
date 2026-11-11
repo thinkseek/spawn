@@ -156,6 +156,23 @@
 //!   read only while the step's fold has a reported task of a mission that
 //!   is open and not halted, or this alert is open: an idle loop reads
 //!   nothing more (objective 023).
+//! - `controller_behind`, `mission #<id>`, key `controller_behind:<mission>:
+//!   <the first reading's ms>`: at every reading for
+//!   `SPAWN_ALERT_CONTROLLER_BEHIND_SECS` (default 1800; 0 disables it), the
+//!   owner's latest landing on a gated mission's source (the latest
+//!   `source.moved` record's `to`; the mission open or active, not halted,
+//!   with a reported task) is newer than the controller its gate's
+//!   scenarios come from (`controllers/<name>-<commit>`): a descendant of
+//!   that commit. The integrator holds such a mission's gates until the
+//!   deploy switches the controller (P22), and every owner's landing is
+//!   followed by its deploy within a minute or so: a wait this long is a
+//!   landing not deployed (deploy.sh's exit 5). A task's landing needs no
+//!   deploy and counts for nothing. Clears at the first reading that finds
+//!   the controller has the landing, or the mission no longer waiting
+//!   (closed, halted, nothing reported). Read on the step's readings, only
+//!   while its fold has such a reported task or this alert is open; the
+//!   first reading behind is kept by the step, so a restarted loop starts
+//!   the bound again (later, never sooner).
 //! - `cost_budget`, `mission #<id>`, key `cost_budget:<mission>:<the UTC
 //!   day, YYYY-MM-DD>`: at a reading (every `SPAWN_ALERT_CHECK_SECS`), the
 //!   mission's cost of the model calls timed in the current UTC day
@@ -279,6 +296,9 @@ pub(crate) struct Settings {
     /// How long no integrator may hold its lock while reported work waits
     /// (0: never alerted).
     pub(crate) integrator_down_ms: i64,
+    /// How long a mission's main may be ahead of its controller while a
+    /// task waits for it (0: never alerted).
+    pub(crate) controller_behind_ms: i64,
     /// The window `spawn alerts --once` shows.
     pub(crate) window_ms: i64,
     /// The two database logs, when named.
@@ -338,6 +358,7 @@ impl Settings {
             tmpfs_ok_mb: number("SPAWN_ALERT_TMPFS_OK_MB", 6000, &mut warnings),
             quiet_ms: secs("SPAWN_ALERT_PG_QUIET_SECS", 900, &mut warnings),
             integrator_down_ms: secs("SPAWN_ALERT_INTEGRATOR_DOWN_SECS", 300, &mut warnings),
+            controller_behind_ms: secs("SPAWN_ALERT_CONTROLLER_BEHIND_SECS", 1800, &mut warnings),
             window_ms: secs("SPAWN_ALERT_WINDOW_SECS", 86_400, &mut warnings),
             test_log: env_value("SPAWN_TEST_DATABASE_LOG").map(PathBuf::from),
             live_log: env_value("SPAWN_DATABASE_LOG").map(PathBuf::from),
@@ -492,6 +513,9 @@ pub(crate) struct Monitor {
     /// The first reading of the current run that found no integrator
     /// holding its lock while reported work waited (`integrator_down`).
     unlocked_since: Option<i64>,
+    /// The first reading of the current run that found each mission's main
+    /// ahead of its controller (`controller_behind`).
+    behind_since: BTreeMap<i64, i64>,
     /// The (mission, source) pairs the last reading found away with no
     /// alert yet, and when it did (`source_away` fires on the second
     /// reading in a row, so a path that comes and goes does not flap). A
@@ -543,6 +567,7 @@ impl Monitor {
             commands_after: 0,
             logs,
             unlocked_since: None,
+            behind_since: BTreeMap::new(),
             away_once: BTreeMap::new(),
             messages_due: None,
             messages_after: 0,
@@ -613,6 +638,7 @@ impl Monitor {
             self.next_reading_ms = now.saturating_add(self.settings.check_ms);
             self.read_host(now, &mut events, &mut lines);
             self.read_integrator(store, now, &mut events, &mut lines);
+            self.read_controllers(store, now, &mut events, &mut lines);
             self.read_sources(store, now, &mut events, &mut lines);
             self.read_budgets(store, now, &mut events, &mut lines);
         }
@@ -1960,6 +1986,128 @@ times in a row)",
         });
     }
 
+    /// The controller-behind reading (`controller_behind`): read only while
+    /// the fold has a reported task of a mission open and not halted, or the
+    /// alert is open. Each listed mission's owner's latest landing is
+    /// compared with its controller in its source.
+    fn read_controllers(
+        &mut self,
+        store: &PostgresStore,
+        now: i64,
+        out: &mut Vec<Event>,
+        lines: &mut Vec<String>,
+    ) {
+        if self.settings.controller_behind_ms <= 0 {
+            return;
+        }
+        let waits = self.tasks.values().any(|task| {
+            task.state.as_deref() == Some("reported")
+                && self.missions.get(&task.mission).is_some_and(|mission| {
+                    mission.halted.is_none() && matches!(mission.state.as_str(), "open" | "active")
+                })
+        });
+        if !waits
+            && !self
+                .known
+                .values()
+                .any(|row| row.open() && row.kind == "controller_behind")
+        {
+            self.behind_since.clear();
+            return;
+        }
+        let reading = match store.alert_controllers() {
+            Ok(reading) => reading,
+            Err(error) => {
+                lines.push(format!("alerts: the missions' controllers: {error}"));
+                return;
+            }
+        };
+        let at = reading["now_ms"].as_i64().unwrap_or(now);
+        let mut behind = BTreeMap::new();
+        for entry in reading["missions"].as_array().into_iter().flatten() {
+            let (Some(mission), Some(gate), Some(source), Some(landed)) = (
+                entry["mission"].as_i64(),
+                entry["gate"].as_str(),
+                entry["source"].as_str(),
+                entry["landed"].as_str(),
+            ) else {
+                continue;
+            };
+            if !Path::new(source).is_absolute() {
+                continue;
+            }
+            if let Some(controller) =
+                crate::integrate::controller_behind(Path::new(source), Path::new(gate), landed)
+            {
+                behind.insert(mission, (controller, landed.to_string()));
+            }
+        }
+        out.extend(self.controller_events(&behind, at));
+    }
+
+    /// What a reading decides, given each waiting mission whose owner's
+    /// latest landing is newer than its controller (`behind`: mission to
+    /// controller and landing):
+    /// fire for each behind for the bound with none open, clear each open
+    /// one whose mission is no longer behind.
+    fn controller_events(
+        &mut self,
+        behind: &BTreeMap<i64, (String, String)>,
+        now: i64,
+    ) -> Vec<Event> {
+        let mut out = Vec::new();
+        let mut open = BTreeSet::new();
+        for (key, row) in &self.known {
+            if !row.open() || row.kind != "controller_behind" {
+                continue;
+            }
+            let Some(mission) = row
+                .subject
+                .strip_prefix("mission #")
+                .and_then(|id| id.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            if behind.contains_key(&mission) {
+                open.insert(mission);
+            } else {
+                out.push(Event::Clear {
+                    key: key.clone(),
+                    evidence: json!({"behind": false, "reading_ms": now}),
+                });
+            }
+        }
+        self.behind_since
+            .retain(|mission, _| behind.contains_key(mission));
+        for (mission, (controller, landed)) in behind {
+            let since = *self.behind_since.entry(*mission).or_insert(now);
+            let behind_ms = now.saturating_sub(since);
+            if open.contains(mission) || behind_ms < self.settings.controller_behind_ms {
+                continue;
+            }
+            out.push(Event::Fire {
+                key: format!("controller_behind:{mission}:{since}"),
+                kind: "controller_behind",
+                subject: format!("mission #{mission}"),
+                evidence: json!({
+                    "controller": controller, "landed": landed, "since_ms": since,
+                    "reading_ms": now, "behind_ms": behind_ms,
+                    "threshold_ms": self.settings.controller_behind_ms,
+                }),
+                text: format!(
+                    "mission #{mission}'s controller {} has not had the owner's landing {} \
+                     for {}s: its gates wait for the deploy that switches the controller (a \
+                     landing not deployed?)",
+                    &controller[..controller.len().min(8)],
+                    &landed[..landed.len().min(8)],
+                    behind_ms / 1000
+                ),
+                notice: false,
+            });
+        }
+        out
+    }
+
     /// The daily budgets' reading (`cost_budget`): each budgeted mission's
     /// spend of the UTC day so far, on the database's clock.
     fn read_budgets(
@@ -3120,7 +3268,7 @@ mod tests {
         days_from_civil, host_sources, line, parse_span, scrub, scrub_value, time_text, window_ms,
     };
     use serde_json::{Value, json};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
 
     fn settings() -> Settings {
@@ -3139,6 +3287,7 @@ mod tests {
             tmpfs_ok_mb: 6000,
             quiet_ms: 900_000,
             integrator_down_ms: 300_000,
+            controller_behind_ms: 1_800_000,
             window_ms: 86_400_000,
             test_log: None,
             live_log: None,
@@ -3919,6 +4068,83 @@ mod tests {
                    "execution_id": "exec_1", "session_id": "session_x", "agent_id": "a"}),
         );
         assert_eq!(fires(&auth), ["model_auth:16"]);
+    }
+
+    /// A mission whose controller lacks the owner's latest landing (P22) fires one
+    /// `controller_behind` once it has been behind for the bound, from the
+    /// first reading that found it so; nothing more while it stays behind;
+    /// clears when the controller catches up (or the mission no longer
+    /// waits); a mission caught up before the bound fires nothing.
+    #[test]
+    fn a_controller_behind_main_fires_after_the_bound_and_clears_when_caught_up() {
+        let mut monitor = monitor();
+        let c1 = "1".repeat(40);
+        let m2 = "2".repeat(40);
+        let behind = |missions: &[i64]| -> BTreeMap<i64, (String, String)> {
+            missions
+                .iter()
+                .map(|mission| (*mission, (c1.clone(), m2.clone())))
+                .collect()
+        };
+        assert!(monitor.controller_events(&behind(&[4, 6]), 1000).is_empty());
+        assert!(
+            monitor
+                .controller_events(&behind(&[4, 6]), 900_000)
+                .is_empty()
+        );
+        // Mission 6 caught up before the bound (its deploy came): it starts
+        // again from its next reading behind.
+        assert!(
+            monitor
+                .controller_events(&behind(&[4]), 1_000_000)
+                .is_empty()
+        );
+        assert!(
+            monitor
+                .controller_events(&behind(&[4, 6]), 1_200_000)
+                .is_empty()
+        );
+        let fired = monitor.controller_events(&behind(&[4, 6]), 1_801_000);
+        assert_eq!(fires(&fired), ["controller_behind:4:1000"]);
+        let Event::Fire {
+            subject,
+            evidence,
+            text,
+            notice,
+            ..
+        } = &fired[0]
+        else {
+            panic!("a fire: {fired:?}");
+        };
+        assert_eq!(subject, "mission #4");
+        assert_eq!(evidence["controller"], c1.as_str());
+        assert_eq!(evidence["landed"], m2.as_str());
+        assert_eq!(evidence["since_ms"], 1000);
+        assert_eq!(evidence["behind_ms"], 1_800_000);
+        assert!(
+            text.contains("controller 11111111 has not had the owner's landing 22222222 for 1800s")
+                && !notice,
+            "{text}"
+        );
+        commit(&mut monitor, &fired);
+        assert!(
+            monitor
+                .controller_events(&behind(&[4, 6]), 2_000_000)
+                .is_empty(),
+            "once per occurrence; 6 is not yet behind for the bound"
+        );
+        let caught_up = monitor.controller_events(&behind(&[6]), 2_100_000);
+        assert_eq!(
+            caught_up.iter().map(Event::key).collect::<Vec<_>>(),
+            ["controller_behind:4:1000"]
+        );
+        let Event::Clear { evidence, .. } = &caught_up[0] else {
+            panic!("a clear: {caught_up:?}");
+        };
+        assert_eq!(evidence["behind"], false);
+        commit(&mut monitor, &caught_up);
+        let six = monitor.controller_events(&behind(&[4, 6]), 3_000_000);
+        assert_eq!(fires(&six), ["controller_behind:6:1200000"]);
     }
 
     /// P12: a host-path source of an open or active mission that is not a

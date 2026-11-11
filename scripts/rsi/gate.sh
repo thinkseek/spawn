@@ -26,7 +26,8 @@
 #   that is new or whose directory the diff touches.
 # - `<scenarios-dir>/build`, when present, builds each tree (run inside it).
 # - With a task scenario: it must fail on the base (exit exactly 1) and pass
-#   on the candidate.
+#   on the candidate, 3 runs of 3 (P25: once landed it is every later gate's
+#   regression); a pass and then a failure rejects the candidate.
 # - Every other scenario in the directory must pass on the candidate, except
 #   ratchet scenarios (a line `# rsi: ratchet`), which compare against the
 #   base and so fail on any tree that did not improve, task-only scenarios
@@ -334,7 +335,8 @@
 # that socket. The environment is cleared down to the list below. Cargo
 # gets a private CARGO_HOME whose registry and git caches are the real
 # ones, read-only, and runs offline: a candidate cannot fetch a new crate or
-# rewrite a cached one.
+# rewrite a cached one. The owner's cargo config is not bound: it may name
+# a compiler cache (kache) as rustc-wrapper, which has no place in a gate.
 # Git reads the gate's own config (an identity, no signing), not the
 # owner's.
 #
@@ -1613,9 +1615,14 @@ sandbox_once() {
     # Git: the gate's config, not the owner's (signing keys, credential
     # helpers).
     set -- "$@" --ro-bind "$work/gitconfig" /tmp/gitconfig
-    # Cargo: a private home over the real caches, read-only, offline.
+    # Cargo: a private home over the real caches, read-only, offline. Not
+    # the owner's cargo config (`config`, `config.toml`): it may name a
+    # compiler cache as rustc-wrapper (kache), which inside would only start
+    # a private daemon in the empty $HOME and leave its files in TMPDIR for
+    # the scenarios to judge (054, 2026-11-11), with no hit from the
+    # owner's cache, which the sandbox never sees (scripts/sandbox.sh's rule).
     set -- "$@" --dir /tmp/cargo-home
-    for name in registry git config config.toml; do
+    for name in registry git; do
         [ -e "$cargo_home/$name" ] && set -- "$@" --ro-bind "$cargo_home/$name" "/tmp/cargo-home/$name"
     done
     # Last, so no bind above shows them again: the sockets the scan found.
@@ -3910,6 +3917,31 @@ candidate_job() {
     job_run "$job" 1 "$work/candidate" "$job_scenario" || run_status=$?
     [ ! -e "$job/slot-waited" ] || return 0
     job_output 1
+    # The task's scenario passes 3 of 3 before it lands (P25): once landed
+    # it is every later gate's regression, so a scenario that passes one
+    # run in four would cost one gate in four from then on (042, 050 and
+    # 054, 2026-11-11). Two more runs on the candidate, in the same slot;
+    # one that fails rejects the candidate (candidate_printed), and nothing
+    # is seeded from it.
+    if [ -e "$job/task" ] && [ "$run_status" -eq 0 ]; then
+        task_runs=0
+        for part in 2 3; do
+            job_stage "$(($(stage_now) - run_at))" "exit 0" "$run_name"
+            job_say "| == $run_name (run $part of 3: the task's scenario passes 3 of 3 before it lands)"
+            run_at=$(stage_now)
+            again=0
+            job_run "$job" "$part" "$work/candidate" "$job_scenario" || again=$?
+            [ ! -e "$job/slot-waited" ] || return 0
+            job_output "$part"
+            task_runs="$task_runs, then $again"
+            if [ "$again" -ne 0 ]; then
+                run_status=$again
+                printf '%s\n' "$task_runs on the candidate" >"$job/runs"
+                : >"$job/unsteady"
+                break
+            fi
+        done
+    fi
     if [ "$run_status" -eq 0 ] && [ -s "$job/seed-entry" ] && [ ! -s "$job/never-started" ]; then
         seed
     fi
@@ -4247,6 +4279,14 @@ candidate_printed() {
         1) metric=$metrics ;;
         *) echo "| two or more METRIC lines on the scenario's stdout: no metric" ;;
         esac
+        if [ "$printed_status" -ne 0 ] && [ -e "$1/unsteady" ]; then
+            printed_runs=$(cat "$1/runs" 2>/dev/null)
+            run_stage "rejected|$printed_name" "$printed_ms"
+            phase_time candidate
+            echo "| $(basename "$printed_scenario") passed, then failed on the candidate ($printed_runs): the task's scenario passes 3 of 3 before it lands"
+            verdict rejected "scenario is unstable on the candidate ($printed_runs): it must pass 3 of 3 runs before it lands"
+            exit 0
+        fi
         if [ "$printed_status" -ne 0 ]; then
             run_stage "rejected|$printed_name" "$printed_ms"
             phase_time candidate

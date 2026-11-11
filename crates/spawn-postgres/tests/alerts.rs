@@ -257,3 +257,63 @@ fn the_sources_away_are_listed_and_are_news_until_told() {
         "only the end is left to tell"
     );
 }
+
+/// P22: the `controller_behind` reading lists each gated mission, open or
+/// active and not halted, that has a reported task, with its gate, the
+/// source it lands on and the owner's latest landing there (none here); not
+/// a mission without a gate, a halted or closed one, or one with nothing
+/// reported.
+#[test]
+fn the_controller_reading_lists_the_gated_missions_with_reported_work() {
+    let (store, schema) = store("alerts_controllers");
+    let mut client = admin(&schema);
+    let gate = "/live/controllers/spawn/rsi/scenarios";
+    let mut mission = |name: &str, gated: bool, reported: bool| -> i64 {
+        let id = store
+            .mission_add(
+                name,
+                &json!([format!("/srv/{name}.git"), "/srv/second.git"]),
+                "human",
+            )
+            .expect("add");
+        if gated {
+            store
+                .mission_configure(id, Some(gate), "gate", None, None)
+                .expect("configure");
+        }
+        let state = if reported { "reported" } else { "delivered" };
+        client
+            .execute(
+                "insert into mission_tasks (mission_id, kind, agent_id, session_id, brief, state,
+                                            created_by, created_at_ms, updated_at_ms)
+                 values ($1, 'ephemeral', 'agent_w', 'session_w', 'b', $2, 'human', 1, 1)",
+                &[&id, &state],
+            )
+            .expect("a task");
+        id
+    };
+    let waiting = mission("waiting", true, true);
+    let _idle = mission("idle", true, false);
+    let _ungated = mission("ungated", false, true);
+    let halted = mission("halted", true, true);
+    let closed = mission("closed", true, true);
+    client
+        .execute(
+            "update mission_missions set halted = 'stop' where id = $1",
+            &[&halted],
+        )
+        .expect("halt one");
+    client
+        .execute(
+            "update mission_missions set state = 'done' where id = $1",
+            &[&closed],
+        )
+        .expect("close one");
+    let reading = store.alert_controllers().expect("the reading");
+    assert!(reading["now_ms"].is_i64(), "{reading}");
+    assert_eq!(
+        reading["missions"],
+        json!([{"mission": waiting, "gate": gate, "source": "/srv/waiting.git", "landed": null}]),
+        "{reading}"
+    );
+}

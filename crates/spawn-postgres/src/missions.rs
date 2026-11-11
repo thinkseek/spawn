@@ -73,6 +73,17 @@ select coalesce((select jsonb_build_object('id', e.id, 'at_ms', e.recorded_at_ms
                     and e.kind -> 'detail' -> 'record' ->> 'type' = 'source.moved'
                   order by e.session_seq desc limit 1), 'null'::jsonb)";
 
+/// Where the latest `source.moved` record of source `$1` moved its main
+/// (`to`): the owner's latest landing on it, which its deploy follows; null
+/// when the owner never moved it.
+pub(crate) const SOURCE_OWNER_LANDED: &str = r"
+select e.kind #>> '{detail,record,to}'
+  from spawn_events e
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' = 'source.moved'
+   and e.kind #>> '{detail,record,source}' = $1
+ order by e.session_seq desc limit 1";
+
 /// Residents (not retired) whose latest delivered task is cancelled: the
 /// dispatcher stops such a worker, sets the task's work aside and tells it
 /// (docs/fleet-architecture.md, "When a task closes"). The latest delivery
@@ -2016,6 +2027,14 @@ impl PostgresStore {
     /// ([`LATEST_SOURCE_MOVED`]).
     pub fn latest_source_moved(&self) -> Result<Value, StoreError> {
         self.query_json(LATEST_SOURCE_MOVED, &[])
+    }
+
+    /// The owner's latest landing on `source`: the `to` of its latest
+    /// `source.moved` record, if any ([`SOURCE_OWNER_LANDED`]).
+    pub fn source_owner_landed(&self, source: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .query_opt(SOURCE_OWNER_LANDED, &[&source])?
+            .and_then(|row| row.get::<_, Option<String>>(0)))
     }
 
     /// Residents whose latest delivered task is cancelled, with the
