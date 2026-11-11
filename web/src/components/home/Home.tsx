@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
-import { ArrowRight, Bot, CircleAlert, CircleCheck, Copy, Flag, History, Info, MessageSquareText, Target } from "lucide-react";
+import { ArrowRight, Bot, CircleAlert, CircleCheck, Copy, Flag, History, Info, MessageSquareText, Play, Target } from "lucide-react";
+
+import { postResume } from "../../api";
+import { newKey } from "../../input";
 
 import { relativeTime } from "../../format";
 import type { AgentsNow, Digest, MissionsToday, NeedItem, NotesShown } from "../../home";
@@ -11,7 +14,58 @@ import { Card, CardHeader, FOCUS_RING, FOCUS_RING_INSET, cx, sinceText } from ".
 // needs you, missions today, agents working now, the supervisor's latest
 // lines, and today as a digest. Each reads a model from home.ts.
 
-/** A command to copy: the page has no write path of its own. */
+/** What a resume from the page came to. */
+type Resumed = { state: "idle" } | { state: "sending" } | { state: "done" } | { state: "refused"; why: string };
+
+/** A halted mission's Resume: `POST /api/mission/<id>/resume` naming the
+ * halt the item shows. One idempotency key per halt, kept across clicks,
+ * so a retried click (the answer lost) resumes once; a page not refreshed
+ * since another halt is refused by the server with the reason. */
+function ResumeButton({ resume }: { resume: { mission: number; halt: number } }) {
+  const [key] = useState(() => newKey());
+  const [resumed, setResumed] = useState<Resumed>({ state: "idle" });
+  const send = () => {
+    setResumed({ state: "sending" });
+    void postResume(resume.mission, { halt: resume.halt, key }).then(
+      ({ status, body }) => {
+        if (status === 202) {
+          setResumed({ state: "done" });
+          return;
+        }
+        const error = (body as { error?: unknown } | null)?.error;
+        setResumed({
+          state: "refused",
+          why: typeof error === "string" ? error : status === null ? "the server was not reached" : `HTTP ${status}`,
+        });
+      },
+      () => setResumed({ state: "refused", why: "the server was not reached" }),
+    );
+  };
+  return (
+    <span className="inline-flex min-w-0 items-center gap-1.5">
+      {resumed.state === "refused" && (
+        <span className="max-w-64 truncate text-micro text-destructive" title={resumed.why}>
+          {resumed.why}
+        </span>
+      )}
+      <button
+        type="button"
+        onClick={send}
+        disabled={resumed.state === "sending" || resumed.state === "done"}
+        title={`Resume mission #${resume.mission} from this halt`}
+        className={cx(
+          "inline-flex h-7 shrink-0 items-center gap-1 rounded-control px-2 text-caption font-medium text-foreground shadow-hairline hover:bg-surface-hover disabled:opacity-60",
+          FOCUS_RING,
+        )}
+      >
+        <Play size={12} aria-hidden="true" />
+        {resumed.state === "sending" ? "Resuming" : resumed.state === "done" ? "Resumed" : "Resume"}
+      </button>
+    </span>
+  );
+}
+
+/** A command to copy. */
 function CopyCommand({ command }: { command: string }) {
   const [copied, setCopied] = useState(false);
   return (
@@ -99,6 +153,9 @@ export function NeedsYou({ items, onOpenAgent }: { items: NeedItem[]; onOpenAgen
             </div>
             <div className="flex shrink-0 items-center gap-2 self-center">
               {item.command && <CopyCommand command={item.command} />}
+              {item.resume && (
+                <ResumeButton key={`${item.resume.mission}:${item.resume.halt}`} resume={item.resume} />
+              )}
               {item.session && (
                 <button
                   type="button"

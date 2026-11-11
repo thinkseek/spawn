@@ -1,8 +1,9 @@
 //! Access as a restricted login: reads through the grant-filtered
 //! `spawn_read_*` functions and submissions through the `agent_commands`
 //! gateway, so the caller sees and sends exactly what `spawn_grants` allows;
-//! and a person's input from the web page as the `spawn_human` login,
-//! through `spawn_human_input`, the one function that login may call.
+//! and a person's writes from the web page as the `spawn_human` login,
+//! through the `spawn_human_*` functions, the only ones that login may call
+//! (an input, a key, a restart or reassign, a mission's resume).
 
 use spawn_core::command::{NamedKey, Submission};
 use spawn_core::id::{CommandId, IdempotencyKey, SessionId};
@@ -79,6 +80,29 @@ pub(crate) const HUMAN_KEY: &str = "select spawn_human_key($1, $2, $3)";
 /// that now carry the work, or SQLSTATE 55000 when the session holds no
 /// delivered task. `$1` session, `$2` `restart` or `reassign`, `$3` reason.
 pub(crate) const HUMAN_TASK: &str = "select spawn_human_task($1, $2, $3)";
+
+/// A person's resume of a halted mission from the page, through
+/// `spawn_human_resume`: the `mission.resumed` record's event id (a new one,
+/// or the one an earlier call with this key made), SQLSTATE P0002 for no
+/// such mission, 55000 when the mission is not halted on that halt, 23505
+/// for a key another resume used. `$1` mission, `$2` the halt's event, `$3`
+/// idempotency key.
+pub(crate) const HUMAN_RESUME: &str = "select spawn_human_resume($1, $2, $3)";
+
+/// What became of a person's resume of a halted mission
+/// ([`PostgresStore::human_resume`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HumanResume {
+    /// Recorded: the `mission.resumed` record's event id (the first one,
+    /// for a repeated key).
+    Resumed(i64),
+    /// No such mission, in the store's words. Nothing was recorded.
+    NoMission(String),
+    /// The mission is not halted, or is halted on another halt, or the
+    /// idempotency key is another resume's, in the store's words. Nothing
+    /// was recorded.
+    Refused(String),
+}
 
 /// What became of a person's restart or reassign
 /// ([`PostgresStore::human_task`]).
@@ -206,6 +230,42 @@ impl PostgresStore {
             .lock()
             .query_one(HUMAN_KEY, &[&session.as_str(), &key.as_str(), &name.name()]);
         human_write(answer)
+    }
+
+    /// Resume `mission`, halted on `halt` (its `mission.halted` event), as a
+    /// person, through `spawn_human_resume`: the owner's `mission.resumed`,
+    /// with `by` `human` and the `halt`, once per idempotency `key`. Only a
+    /// store connected as the `spawn_human` login may call it. A mission
+    /// that is not halted, or is halted on another halt, is refused
+    /// ([`HumanResume::Refused`]) and nothing is recorded.
+    pub fn human_resume(
+        &self,
+        mission: i64,
+        halt: i64,
+        key: &IdempotencyKey,
+    ) -> Result<HumanResume, StoreError> {
+        let answer = self
+            .lock()
+            .query_one(HUMAN_RESUME, &[&mission, &halt, &key.as_str()]);
+        let error = match answer {
+            Ok(row) => return Ok(HumanResume::Resumed(row.get::<_, i64>(0))),
+            Err(error) => error,
+        };
+        let Some(db) = error.as_db_error() else {
+            return Err(crate::backend(&error));
+        };
+        let message = db.message().to_string();
+        match db.code() {
+            code if *code == postgres::error::SqlState::NO_DATA_FOUND => {
+                Ok(HumanResume::NoMission(message))
+            }
+            code if *code == postgres::error::SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE
+                || *code == postgres::error::SqlState::UNIQUE_VIOLATION =>
+            {
+                Ok(HumanResume::Refused(message))
+            }
+            _ => Err(crate::backend(&error)),
+        }
     }
 
     /// Restart (`restart`) or reassign (`reassign`) the delivered task of

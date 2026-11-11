@@ -134,6 +134,17 @@ export interface MissionTask extends Labels {
   updated_at_ms: number | null;
 }
 
+/** The halt a mission is in (/api/missions' `halt`): its `mission.halted`
+ * record's event (what a resume from the page names), the reason, when,
+ * and for a halt on the scenario floor the scenario files gone since the
+ * gating that set it (null for any other halt). */
+export interface MissionHalt {
+  event: number;
+  reason: string | null;
+  at_ms: number | null;
+  gone: string[] | null;
+}
+
 export interface Mission {
   id: number | null;
   text: string | null;
@@ -152,6 +163,8 @@ export interface Mission {
   baseline: string | null;
   /** Why a halt rule fired, until a human resumes the mission. */
   halted: string | null;
+  /** The halt it is in; null when it is not halted (or the server is older). */
+  halt: MissionHalt | null;
   /** Objective missions: the backlog and the resident that works it. */
   objectives: { backlog: string | null; resident: string | null } | null;
   /** The owner's active hold on its source (its event id): no task lands
@@ -271,6 +284,20 @@ function normalizeTask(value: unknown): MissionTask | null {
   };
 }
 
+export function normalizeHalt(value: unknown): MissionHalt | null {
+  if (!isObject(value)) return null;
+  const event = optionalNumber(value.event);
+  if (event === null) return null;
+  return {
+    event,
+    reason: optionalText(value.reason),
+    at_ms: optionalNumber(value.at_ms),
+    gone: Array.isArray(value.gone)
+      ? value.gone.filter((name): name is string => typeof name === "string")
+      : null,
+  };
+}
+
 function normalizeMission(value: unknown): Mission | null {
   if (!isObject(value)) return null;
   const sources = list(value.sources)
@@ -302,6 +329,7 @@ function normalizeMission(value: unknown): Mission | null {
       : null,
     baseline: optionalText(value.baseline),
     halted: optionalText(value.halted),
+    halt: optionalText(value.halted) === null ? null : normalizeHalt(value.halt),
     objectives: isObject(value.objectives)
       ? {
           backlog: optionalText(value.objectives.backlog),
