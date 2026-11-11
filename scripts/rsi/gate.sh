@@ -334,7 +334,8 @@
 # that socket. The environment is cleared down to the list below. Cargo
 # gets a private CARGO_HOME whose registry and git caches are the real
 # ones, read-only, and runs offline: a candidate cannot fetch a new crate or
-# rewrite a cached one.
+# rewrite a cached one. The owner's cargo config is not bound: it may name
+# a compiler cache (kache) as rustc-wrapper, which has no place in a gate.
 # Git reads the gate's own config (an identity, no signing), not the
 # owner's.
 #
@@ -1613,9 +1614,14 @@ sandbox_once() {
     # Git: the gate's config, not the owner's (signing keys, credential
     # helpers).
     set -- "$@" --ro-bind "$work/gitconfig" /tmp/gitconfig
-    # Cargo: a private home over the real caches, read-only, offline.
+    # Cargo: a private home over the real caches, read-only, offline. Not
+    # the owner's cargo config (`config`, `config.toml`): it may name a
+    # compiler cache as rustc-wrapper (kache), which inside would only start
+    # a private daemon in the empty $HOME and leave its files in TMPDIR for
+    # the scenarios to judge (054, 2026-11-11), with no hit from the
+    # owner's cache, which the sandbox never sees (scripts/sandbox.sh's rule).
     set -- "$@" --dir /tmp/cargo-home
-    for name in registry git config config.toml; do
+    for name in registry git; do
         [ -e "$cargo_home/$name" ] && set -- "$@" --ro-bind "$cargo_home/$name" "/tmp/cargo-home/$name"
     done
     # Last, so no bind above shows them again: the sockets the scan found.
