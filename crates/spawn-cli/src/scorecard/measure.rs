@@ -68,6 +68,8 @@ pub(crate) struct Counts {
     pub(crate) by_model: BTreeMap<String, i64>,
     /// Wall clocks of the gate runs, sorted.
     pub(crate) gate_runs: Vec<i64>,
+    /// How many of them were the owner's judgings.
+    pub(crate) owner_gate_runs: usize,
 }
 
 impl Counts {
@@ -145,6 +147,9 @@ pub(crate) fn counts(history: &History, scope: Scope, window: Window) -> Counts 
     for run in &history.gate_runs {
         if scope.holds(run.mission) && window.holds(run.at) {
             counts.gate_runs.push(run.ms);
+            if run.owner {
+                counts.owner_gate_runs += 1;
+            }
         }
     }
     counts.gate_runs.sort_unstable();
@@ -442,6 +447,12 @@ fn gate_time(counts: &Counts) -> Dimension {
     let runs = counts.gate_runs.len();
     let mut parts = Map::new();
     parts.insert("runs".into(), usize_json(runs));
+    // Whose runs: a task's gatings and the owner's judgings (objective 061).
+    parts.insert(
+        "task_runs".into(),
+        usize_json(runs.saturating_sub(counts.owner_gate_runs)),
+    );
+    parts.insert("owner_runs".into(), usize_json(counts.owner_gate_runs));
     Dimension {
         value: if runs >= MIN_N {
             whole(nearest_rank(&counts.gate_runs, 50))

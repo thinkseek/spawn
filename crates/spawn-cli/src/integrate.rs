@@ -16014,6 +16014,65 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Objective 061 (a): an owner judging's records name the gate's wall
+    /// clock (`gate_ms`) and the mission whose gate judged it (`mission`):
+    /// the `source.moved` of an accepted push and the `source.push_refused`
+    /// of a rejected one.
+    #[test]
+    fn an_owner_judgings_records_carry_its_gate_time_and_mission() {
+        let marks = fresh_marks("spawn-owner-gate-ms");
+        let seen = marks.to_string_lossy().to_string();
+        let gate = format!(
+            "n=$(cat '{seen}/n' 2>/dev/null || echo 0); n=$((n + 1)); echo \"$n\" >'{seen}/n'\n\
+             sleep 0.2\n\
+             if [ \"$n\" = 1 ]; then\n\
+             printf '%s\\n' '{{\"v\":1,\"verdict\":\"accepted\"}}' >\"$SPAWN_GATE_VERDICT\"\n\
+             else\n\
+             printf '%s\\n' '{{\"v\":1,\"verdict\":\"rejected\",\"reason\":\"a scenario fails\"}}' >\"$SPAWN_GATE_VERDICT\"\n\
+             fi\n"
+        );
+        let (base, source, scenarios, integrator) = world("owner-gate-ms", &gate);
+        let db = Db::new("owner_gate_ms");
+        let mission = db.gated_mission(&source, &scenarios);
+        let first = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("F.md", "f\n")],
+            "owner: f",
+        );
+        gated_request(&db, &source, &first, "f");
+        integrator.pass_on(&db.store).expect("the first judging");
+        integrator.settle();
+        let second = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("G.md", "g\n")],
+            "owner: g",
+        );
+        gated_request(&db, &source, &second, "g");
+        integrator.pass_on(&db.store).expect("the second judging");
+        integrator.settle();
+        let moved = control_records(&db, "source.moved");
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(moved[0]["mission"], mission, "{}", moved[0]);
+        assert!(
+            moved[0]["gate_ms"].as_i64().is_some_and(|ms| ms >= 200),
+            "the gate's wall clock: {}",
+            moved[0]
+        );
+        let refused = control_records(&db, "source.push_refused");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["verdict"], "rejected", "{}", refused[0]);
+        assert_eq!(refused[0]["mission"], mission, "{}", refused[0]);
+        assert!(
+            refused[0]["gate_ms"].as_i64().is_some_and(|ms| ms >= 200),
+            "{}",
+            refused[0]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
+    }
+
     /// Objective 056 (a): a verdict's `passed` and `reused` (the regressions
     /// that passed in the gate, run or taken from the base's cache) reach
     /// the records written from it: an owner landing's `source.moved` and a
