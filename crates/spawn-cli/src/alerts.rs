@@ -80,7 +80,8 @@
 //!   `event_id`): `passed`, a later gating of a mission it names (or a
 //!   landing of its source) lists the scenario in `passed` or `reused`;
 //!   `gone`, a later gating of a mission it names carries `scenario_names`
-//!   without it; `closed`, every mission it names is closed; `quarantined`,
+//!   without it, or at a reading no gate directory of an open mission on its
+//!   source holds it (`reading_ms` and `gates`, no `event_id`); `closed`, every mission it names is closed; `quarantined`,
 //!   a gate names it so.
 //! - `task_undelivered`, `task #<id>`, key
 //!   `task_undelivered:<task>:<its task.assigned event>`: in `assigned`
@@ -769,6 +770,7 @@ impl Monitor {
             self.read_integrator(store, now, &mut events, &mut lines);
             self.read_controllers(store, now, &mut events, &mut lines);
             self.read_sources(store, now, &mut events, &mut lines);
+            self.read_defect_gates(store, now, &mut events, &mut lines);
             self.read_budgets(store, now, &mut events, &mut lines);
         }
         self.bounds(now, &mut events);
@@ -2329,6 +2331,93 @@ times in a row)",
         };
         let watched = host_sources(&listed);
         out.extend(self.source_events(&watched, |path| Path::new(path).is_dir(), now));
+    }
+
+    /// The open missions' gate directories, when a `validator_defect` is
+    /// open: one whose scenario none of them holds any more clears `gone`
+    /// ([`Monitor::gone_defects`]).
+    fn read_defect_gates(
+        &mut self,
+        store: &PostgresStore,
+        now: i64,
+        out: &mut Vec<Event>,
+        lines: &mut Vec<String>,
+    ) {
+        if self.defects.is_empty() {
+            return;
+        }
+        let listed = match store.alert_mission_gates() {
+            Ok(listed) => listed,
+            Err(error) => {
+                lines.push(format!("alerts: mission gates: {error}"));
+                return;
+            }
+        };
+        let gates: Vec<(i64, Option<String>, Option<String>)> = listed
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                Some((
+                    entry["mission"].as_i64()?,
+                    entry["gate"].as_str().map(str::to_string),
+                    entry["source"].as_str().map(str::to_string),
+                ))
+            })
+            .collect();
+        self.gone_defects(
+            &gates,
+            |path| Path::new(path).is_dir(),
+            |path| Path::new(path).exists(),
+            now,
+            out,
+        );
+    }
+
+    /// Clear each open `validator_defect` whose scenario is in none of the
+    /// gate directories its source's open missions judge with now (`gates`:
+    /// each open mission, its gate directory and first source): the
+    /// deployed scenario set no longer has it (`cause` `gone`, at this
+    /// reading, naming the directories read), so no gating is needed to
+    /// tell. The source is the alert's own (an owner landing's), else its
+    /// missions' (a task's, or an owner's from before alerts were per source,
+    /// whose mission may have no gate of its own: a review mission). Kept
+    /// when no gate directory is found for it, or one of them is not a
+    /// directory now (nothing can be told).
+    fn gone_defects(
+        &mut self,
+        gates: &[(i64, Option<String>, Option<String>)],
+        is_dir: impl Fn(&str) -> bool,
+        exists: impl Fn(&str) -> bool,
+        now: i64,
+        out: &mut Vec<Event>,
+    ) {
+        let source_of = |mission: i64| {
+            gates
+                .iter()
+                .find(|(id, _, _)| *id == mission)
+                .and_then(|(_, _, source)| source.clone())
+        };
+        self.clear_defects(out, |defect| {
+            let sources: BTreeSet<String> = match &defect.source {
+                Some(source) => BTreeSet::from([source.clone()]),
+                None => defect.missions.iter().filter_map(|m| source_of(*m)).collect(),
+            };
+            let dirs: BTreeSet<&str> = gates
+                .iter()
+                .filter(|(_, _, source)| source.as_ref().is_some_and(|s| sources.contains(s)))
+                .filter_map(|(_, gate, _)| gate.as_deref())
+                .collect();
+            if dirs.is_empty() || !dirs.iter().all(|dir| is_dir(dir)) {
+                return None;
+            }
+            let held = dirs.iter().any(|dir| {
+                exists(&Path::new(dir).join(&defect.scenario).to_string_lossy())
+            });
+            (!held).then(|| {
+                json!({"cause": "gone", "reading_ms": now, "gates": dirs.iter().collect::<Vec<_>>()})
+            })
+        });
     }
 
     /// What a reading of `watched` (mission, source) decides, given what is
@@ -4886,6 +4975,107 @@ mod tests {
         );
     }
 
+    /// The live shape of 2026-11-11 23:33 (lead-mac): two owner alerts from
+    /// before objective 056, one per mission (#4, gated, and #7, a review
+    /// mission with no gate of its own), both about 003.sh, which the source's
+    /// deployed scenario set no longer holds. A reading of the open missions'
+    /// gate directories clears both `gone` at once, naming the directory read;
+    /// no gating is needed. A scenario the directory still holds stays open,
+    /// and so does one whose source has no gate directory to read, or whose
+    /// directory is not there now (nothing can be told).
+    #[test]
+    fn a_reading_clears_a_validator_defect_whose_scenario_left_the_deployed_set() {
+        let mut restarted = monitor();
+        let open = |key: &str, evidence: Value| {
+            (
+                key.to_string(),
+                Row {
+                    kind: "validator_defect".to_string(),
+                    subject: "x".to_string(),
+                    state: "open".to_string(),
+                    evidence,
+                    fired_event_id: 130_068,
+                    fired_at_ms: 0,
+                },
+            )
+        };
+        for (key, row) in [
+            open(
+                "validator_defect:4:003.sh:130068",
+                json!({"mission": 4, "scenario": "003.sh", "owner": true, "event_id": 130_068}),
+            ),
+            open(
+                "validator_defect:7:003.sh:130068",
+                json!({"mission": 7, "scenario": "003.sh", "owner": true, "event_id": 130_068}),
+            ),
+            open(
+                "validator_defect:4:041.sh:9",
+                json!({"mission": 4, "scenario": "041.sh", "owner": false, "event_id": 9}),
+            ),
+            open(
+                "validator_defect:9:003.sh:12",
+                json!({"mission": 9, "scenario": "003.sh", "owner": false, "event_id": 12}),
+            ),
+        ] {
+            restarted.known.insert(key, row);
+        }
+        restarted.seed_defects();
+        // Missions 4 (its gate) and 7 (none) on the Spawn source; 9 on a
+        // source whose open missions have no gate.
+        let gates = [
+            (
+                4,
+                Some("/ctl/rsi/scenarios".to_string()),
+                Some("/m/spawn.git".to_string()),
+            ),
+            (7, None, Some("/m/spawn.git".to_string())),
+            (9, None, Some("/m/other.git".to_string())),
+        ];
+        let held = |path: &str| path == "/ctl/rsi/scenarios/041.sh";
+        let mut out = Vec::new();
+        restarted.gone_defects(
+            &gates,
+            |dir| dir == "/ctl/rsi/scenarios",
+            held,
+            5_000,
+            &mut out,
+        );
+        let mut cleared: Vec<(String, Value)> = out
+            .iter()
+            .filter_map(|event| match event {
+                Event::Clear { key, evidence } => Some((key.clone(), evidence.clone())),
+                Event::Fire { .. } => None,
+            })
+            .collect();
+        cleared.sort_by(|left, right| left.0.cmp(&right.0));
+        let gone = json!({"cause": "gone", "reading_ms": 5_000, "gates": ["/ctl/rsi/scenarios"]});
+        assert_eq!(
+            cleared,
+            [
+                ("validator_defect:4:003.sh:130068".to_string(), gone.clone()),
+                ("validator_defect:7:003.sh:130068".to_string(), gone),
+            ],
+            "both of 003.sh's, at one reading"
+        );
+        let left: Vec<&str> = restarted
+            .defects
+            .iter()
+            .map(|defect| defect.key.as_str())
+            .collect();
+        assert_eq!(
+            left,
+            [
+                "validator_defect:4:041.sh:9",
+                "validator_defect:9:003.sh:12"
+            ],
+            "a scenario still deployed, and one with no gate directory to read, stay open"
+        );
+        // A gate directory that is not there now tells nothing.
+        let mut out = Vec::new();
+        restarted.gone_defects(&gates, |_| false, |_| false, 6_000, &mut out);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
     /// A restart that reads open `validator_defect` alerts back (rev-b F1),
     /// one of each origin: a repeat of the task's defect fires nothing, the
     /// mission's next verdict clears only the task's, and a gate naming the
@@ -6140,6 +6330,93 @@ connections\n";
             let mut monitor = Monitor::with(settings());
             monitor.check(store).expect("the step checks");
             monitor
+        }
+
+        /// The live shape of 2026-11-11 23:33 (lead-mac), on a store: two
+        /// owner `validator_defect` alerts from before objective 056, one per
+        /// mission (#4, gated; #7, a review mission with no gate), both about
+        /// 003.sh, which the gate directory no longer holds (retired). A step
+        /// started on that store clears both `gone` on its first check, no
+        /// gating needed, naming the directory it read; a third alert, about
+        /// a scenario the directory still holds, stays open.
+        #[test]
+        fn a_started_step_clears_old_per_mission_defects_whose_scenario_is_retired() {
+            in_schema("alerts_defect_gone", |store, client| {
+                let gate =
+                    std::env::temp_dir().join(format!("spawn-alerts-gone-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&gate);
+                std::fs::create_dir_all(&gate).expect("the gate directory");
+                std::fs::write(gate.join("041.sh"), "").expect("a deployed scenario");
+                let source = "/m/spawn.git";
+                for (id, configured) in [
+                    (
+                        4,
+                        serde_json::json!({"type": "mission.configured", "id": 4, "accept": "gate",
+                               "gate": gate.to_string_lossy()}),
+                    ),
+                    (
+                        7,
+                        serde_json::json!({"type": "mission.configured", "id": 7, "accept": "review"}),
+                    ),
+                ] {
+                    record(
+                        client,
+                        3,
+                        &serde_json::json!({"type": "mission.added", "id": id, "text": "m",
+                                "origin": "human", "sources": [source]})
+                        .to_string(),
+                    );
+                    record(client, 3, &configured.to_string());
+                }
+                refold(client);
+                let fire = |key: &str, mission: i64, scenario: &str, owner: bool| {
+                    store
+                        .alert_record(&serde_json::json!({
+                            "type": "alert.fired", "key": key, "kind": "validator_defect",
+                            "subject": format!("mission #{mission}"),
+                            "evidence": {"event_id": 130_068, "mission": mission,
+                                         "to": "e2f68bdae04e5d37f3ce5ed59357776644d18772",
+                                         "owner": owner, "request": 129_675,
+                                         "scenario": scenario},
+                            "text": format!("mission #{mission}: {scenario} failed on main too"),
+                            "notice": false,
+                        }))
+                        .expect("an old per-mission alert");
+                };
+                fire("validator_defect:4:003.sh:130068", 4, "003.sh", true);
+                fire("validator_defect:7:003.sh:130068", 7, "003.sh", true);
+                fire("validator_defect:4:041.sh:130068", 4, "041.sh", false);
+                let _monitor = started(store);
+                let mut gone = |key: &str| -> (String, Option<Value>) {
+                    client
+                        .query_one(
+                            "select state, cleared_evidence from spawn_alerts where key = $1",
+                            &[&key],
+                        )
+                        .map(|row| (row.get(0), row.get(1)))
+                        .expect("the alert reads")
+                };
+                for key in [
+                    "validator_defect:4:003.sh:130068",
+                    "validator_defect:7:003.sh:130068",
+                ] {
+                    let (state, evidence) = gone(key);
+                    assert_eq!(state, "cleared", "{key}");
+                    let evidence = evidence.expect("its clearing");
+                    assert_eq!(evidence["cause"], "gone", "{key}: {evidence}");
+                    assert_eq!(
+                        evidence["gates"],
+                        serde_json::json!([gate.to_string_lossy()]),
+                        "{evidence}"
+                    );
+                }
+                assert_eq!(
+                    gone("validator_defect:4:041.sh:130068").0,
+                    "open",
+                    "still deployed"
+                );
+                let _ = std::fs::remove_dir_all(&gate);
+            });
         }
 
         /// Objective 053: a step started on a run of rejections (a restart)

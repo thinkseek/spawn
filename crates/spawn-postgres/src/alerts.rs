@@ -20,6 +20,12 @@ pub(crate) const MISSION_SOURCES: &str = "select coalesce(jsonb_agg(jsonb_build_
     'mission', id, 'sources', sources) order by id), '[]'::jsonb)
   from mission_missions where state in ('open', 'active')";
 
+/// The open and active missions' gate directories and first sources: where a
+/// `validator_defect`'s scenario is looked for (`gone` at a reading).
+pub(crate) const MISSION_GATES: &str = "select coalesce(jsonb_agg(jsonb_build_object(
+    'mission', id, 'gate', gate, 'source', sources ->> 0) order by id), '[]'::jsonb)
+  from mission_missions where state in ('open', 'active')";
+
 /// The event watermark and the database's clock, in one index-only read:
 /// an idle pass costs the loop one statement (objective 023).
 pub(crate) const CLOCK: &str = "select coalesce(max(id), 0), spawn_now_ms() from spawn_events";
@@ -374,6 +380,12 @@ impl PostgresStore {
     /// The open and active missions' sources ([`MISSION_SOURCES`]).
     pub fn alert_mission_sources(&self) -> Result<Value, StoreError> {
         self.query_json(MISSION_SOURCES, &[])
+    }
+
+    /// The open and active missions' gate directories and first sources
+    /// ([`MISSION_GATES`]).
+    pub fn alert_mission_gates(&self) -> Result<Value, StoreError> {
+        self.query_json(MISSION_GATES, &[])
     }
 
     /// The missions and tasks the loop compares records against ([`MIRROR`]).
