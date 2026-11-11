@@ -79,6 +79,7 @@ mkdir -p "$HOME"
 runner_home=""
 badroot=""
 otherfs=""
+tmp_parent=""
 # A long root moves a job's scratch to the short directory (the socket path
 # limit): this suite's own, in its scratch, short (8o asserts how short).
 export GATE_RUNNER_SHORT="$scratch/s"
@@ -88,6 +89,7 @@ cleanup() {
     rm -rf "$scratch" "$runner_home"
     [ -z "$badroot" ] || rm -rf "$badroot"
     [ -z "$otherfs" ] || rm -rf "$otherfs"
+    [ -z "$tmp_parent" ] || rm -rf "$tmp_parent"
     rm -rf "$GATE_RUNNER_SHORT"
 }
 trap cleanup EXIT
@@ -447,7 +449,10 @@ rm -rf "$runner_home/jobs/new-$$" "$GATE_RUNNER_SHORT/new-$$"
 
 # 8e. A dispatch to a runner rooted where the gate's sandbox empties its
 # directories is refused, not run: its gate could not see the controller.
-tmp_root="/tmp/gate-runner-root.$$"
+# Under /tmp is the point; a mktemp there, so no fixed name is taken over,
+# and cleanup removes it if the test stops before the rm below.
+tmp_parent=$(mktemp -d /tmp/gate-runner-root.XXXXXX)
+tmp_root=$tmp_parent/root
 cp -R "$runner_home" "$tmp_root"
 status=0
 GATE_RUNNER_REMOTE_BIN="$tmp_root/bin/remote" \
@@ -455,7 +460,8 @@ GATE_RUNNER_REMOTE_BIN="$tmp_root/bin/remote" \
     >"$scratch/dispatch.out" 2>"$scratch/dispatch.err" || status=$?
 expect "a mis-rooted runner is refused: exit 3" "$status" 3
 contains "and says why" "$scratch/dispatch.err" "the gate's sandbox empties"
-rm -rf "$tmp_root"
+rm -rf "$tmp_parent"
+tmp_parent=""
 
 # 8f. --check fails a missing toolchain tool and a scenarios directory with
 # no objective to compare (equal and empty is no comparison).
