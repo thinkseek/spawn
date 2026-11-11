@@ -1,4 +1,6 @@
 #!/bin/sh
+# Nightly (rsi/scenarios/nightly/, run by scripts/rsi/nightly.sh on live main, alone on a
+# held host; gate v2 step 4, design-gate-journeys-spawn.md §2): (2)-(4) are folded into check-j09-stall-cancel; (1), the 90 s delivery stall, is the nightly's. Moved whole: splitting (1) off is not small (one harness, one loop).
 # Black box: no task waits silently. A task whose step stops moving is
 # escalated to the supervisor exactly once per stall, naming the task, the
 # step and the evidence; healthy tasks beside it are not.
