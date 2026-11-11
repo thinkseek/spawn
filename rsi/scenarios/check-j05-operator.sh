@@ -920,6 +920,10 @@ create function pg_temp.ms(h numeric) returns bigint language sql as $$
     select (extract(epoch from timestamptz '2026-10-02 00:00:00+00') * 1000)::bigint
            + round(h * 3600000)::bigint $$;
 create temp sequence seed_seq;
+-- After any control record already here (database D's serving and grants may
+-- have written some of today's, outside the October window).
+select setval('seed_seq', coalesce(max(session_seq), 0) + 1, false)
+  from spawn_events where session_id = 'session_control';
 -- One control record at hour h, in the order written.
 create function pg_temp.rec(h numeric, r jsonb) returns void language sql as $$
     insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id,
