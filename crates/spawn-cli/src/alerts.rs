@@ -4923,6 +4923,46 @@ connections\n";
             monitor
         }
 
+        /// Objective 053: a step started on a run of rejections (a restart)
+        /// knows the run's objective from the store, so the cancel of its
+        /// task fires the notice the store's fold agrees with.
+        #[test]
+        fn a_restarted_step_knows_the_runs_objective_and_its_cancel() {
+            in_schema("alerts_run_cancel", |store, client| {
+                record(
+                    client,
+                    3,
+                    r#"{"type":"mission.added","id":1,"text":"m","origin":"human","sources":[]}"#,
+                );
+                record(
+                    client,
+                    3,
+                    r#"{"type":"task.assigned","id":5,"mission_id":1,"kind":"ephemeral",
+                        "agent_id":"agent_w","session_id":"session_w","brief":"b",
+                        "created_by":"spawn-integrate","objective":5}"#,
+                );
+                for _ in 0..2 {
+                    record(client, 2, r#"{"type":"task.gated","id":5,"verdict":"rejected"}"#);
+                }
+                refold(client);
+                let mut monitor = started(store);
+                let cancelled = record(client, 0, r#"{"type":"task.cancelled","id":5}"#);
+                refold(client);
+                monitor.check(store).expect("the step checks");
+                let (text, folded): (String, i32) = client
+                    .query_one(
+                        "select a.text, m.gate_rejections
+                           from spawn_alerts a, mission_missions m
+                          where a.key = $1 and m.id = 1",
+                        &[&format!("mission_state:1:{cancelled}")],
+                    )
+                    .map(|row| (row.get(0), row.get(1)))
+                    .expect("the cancel's notice");
+                assert_eq!(text, "mission #1: gate_rejections 2 -> 0 (by task.cancelled)");
+                assert_eq!(folded, 0, "the store's count");
+            });
+        }
+
         #[test]
         fn an_older_record_clears_nothing_at_a_first_start_or_after_a_restart() {
             in_schema("alerts_restarts", |store, client| {
