@@ -24,6 +24,8 @@
 #      -50; t2 assigned -100, landed -90; t3 assigned -20, landed -10; t4
 #      assigned -5, delivered, open. Resumed (mission.resumed) at -70.
 #   M2 (added -48): t5 assigned -40 by human, accepted by review -24.
+#   M1, M2 and M3 each take their work from an objective backlog (configured
+#   as added), so their hours without a task are idle hours.
 #   M3 (added -400, closed -300): t6 assigned -360, cancelled by human -350;
 #      t8 assigned -349 with t6's brief (a cancel-and-reassign), accepted by
 #      review -320.
@@ -212,6 +214,12 @@ language sql as $$
 select pg_temp.rec(-720, '{"type":"mission.added","id":1,"text":"043 busy","origin":"human","sources":[]}');
 select pg_temp.rec(-400, '{"type":"mission.added","id":3,"text":"043 closed","origin":"human","sources":[]}');
 select pg_temp.rec(-48, '{"type":"mission.added","id":2,"text":"043 idle","origin":"human","sources":[]}');
+-- Each takes its work from an objective backlog, so its hours without a
+-- task are idle hours (objective 062: a mission without one is owner work,
+-- never flagged idle). Configured as it is added; review, no gate, as before.
+select pg_temp.rec(h, jsonb_build_object('type', 'mission.configured', 'id', id, 'accept', 'review',
+    'objectives', jsonb_build_object('backlog', '/nonexistent/043-backlog', 'resident', 'bb043', 'workers', 1)))
+  from (values (-720, 1), (-400, 3), (-48, 2)) as m(h, id);
 
 select pg_temp.assign(-700, 1, 1, 'spawn_supervisor', 'Task one');
 select pg_temp.rec(-700, '{"type":"task.delivered","id":1,"command_id":1}');
