@@ -120,12 +120,21 @@ stale_secs=${SPAWN_NIGHTLY_STALE_SECS:-93600}
 slot_dir=$HOME/.cache/spawn/gate-slots
 
 mkdir -p "$facts" || die "cannot make $facts"
-if [ -z "$stale_only" ]; then
-  exec 9>>"$facts/.$source_name.lock"
-  if ! flock -n 9; then
-    say "another nightly of $source_name runs; this one does nothing"
-    exit 0
-  fi
+# A run waits a little for the lock (SPAWN_NIGHTLY_LOCK_WAIT_SECS, 120): an
+# hourly --stale holds it for a second, and both timers, Persistent, fire
+# together after a boot past 02:30; a run in progress holds it for hours,
+# so a second run still gives up. --stale never waits: beside a run in
+# progress (whose drain may outlast 26 h since the last fact) it does
+# nothing, and the run's own check follows its fact.
+exec 9>>"$facts/.$source_name.lock"
+if [ -n "$stale_only" ]; then
+  locked() { flock -n 9; }
+else
+  locked() { flock -w "${SPAWN_NIGHTLY_LOCK_WAIT_SECS:-120}" 9; }
+fi
+if ! locked; then
+  say "another nightly of $source_name runs; this one does nothing"
+  exit 0
 fi
 
 now_ms() { echo $(($(date +%s%N) / 1000000)); }
@@ -435,23 +444,22 @@ fi
 # deadline passed first (all let go again).
 held=()
 drain_slots() {
-  local n=$1 i fd left
+  local n=$1 i fd left first=""
   for ((i = 1; i <= n; i++)); do
     (umask 077 && : >>"$slot_dir/slot.$i") 2>/dev/null || continue
     exec {fd}>>"$slot_dir/slot.$i"
     left=$((deadline - $(date +%s)))
     [ "$left" -gt 0 ] || left=0
     if flock -w "$left" "$fd"; then
-      held+=("$fd")
+      if [ "$i" = 1 ]; then first=$fd; else held+=("$fd"); fi
     else
       exec {fd}>&-
-      for fd in "${held[@]}"; do eval "exec $fd>&-"; done
+      for fd in $first "${held[@]}"; do eval "exec $fd>&-"; done
       held=()
       return 1
     fi
   done
-  eval "exec ${held[0]}>&-"
-  held=("${held[@]:1}")
+  [ -z "$first" ] || eval "exec $first>&-"
   say "holding ${#held[@]} of $n host scenario slots, drained in $(($(date +%s) - started_s))s (slot 1 is its own gate's)"
 }
 
