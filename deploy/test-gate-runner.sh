@@ -519,16 +519,15 @@ GATE_RUNNER_MOUNTS=$scratch/mounts "$runner_home/bin/remote" preflight >"$scratc
 expect "lxcfs and fusectl alone: no host share" "$(sed -n 's/^host_shares=//p' "$scratch/preflight.out")" none
 
 # 8l. A cargo config naming a rustc-wrapper the gate's PATH lacks (the
-# primary's kache config copied to a runner without kache) is refused: every
-# build there would fail, and the gate would reject the work.
+# primary's kache config copied to a runner without kache) is no refusal:
+# the gate binds only the cargo home's registry and git into its sandbox,
+# so the wrapper never reaches a build, and the gate judges as before.
 mkdir -p "$scratch/rcargo"
 printf '[build]\nrustc-wrapper = "no-such-wrapper-%s"\n' "$$" >"$scratch/rcargo/config.toml"
 printf "GATE_RUNNER_CARGO_HOME='%s'\n" "$scratch/rcargo" >>"$runner_home/config"
 reset "$out"
 dispatch "$runner_home" "$repo_git" "$base" "$candidate" "$scen" "$out"
-expect "a runner whose cargo wrapper is missing is refused: exit 3" "$status" 3
-contains "and says which" "$scratch/dispatch.err" "names rustc-wrapper no-such-wrapper-$$"
-nothing_ran "nothing was run on it"
+expect "a runner whose cargo config names a missing wrapper still judges: the gate's 0" "$status" 0
 cp "$scratch/config.orig" "$runner_home/config"
 
 # 8m. The runner's registry gets what it lacks of this host's before the
@@ -810,8 +809,7 @@ contains "and says to rerun setup.sh" "$scratch/check.out" "rerun setup.sh there
 cp "$scratch/remote.orig" "$runner_home/bin/remote"
 
 # 10. --check: a runner whose toolchain is not this host's (the key differs).
-# Its cargo home is its own and names no rustc-wrapper: this host's may name
-# one its PATH lacks (case 8l), and the toolchain is to be the only change.
+# Its cargo home is its own, so the toolchain is the only change.
 mkdir -p "$scratch/rcargo-plain"
 GATE_RUNNER_ROOT=$runner_home PATH=/usr/bin:/bin sh "$repo/deploy/gate-runner/setup.sh" \
     --root "$runner_home" --pg-bin "$pg_bin" --jobs 2 --min-free-gb 0 --nice 10 --force \
