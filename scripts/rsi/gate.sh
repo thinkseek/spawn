@@ -26,7 +26,8 @@
 #   that is new or whose directory the diff touches.
 # - `<scenarios-dir>/build`, when present, builds each tree (run inside it).
 # - With a task scenario: it must fail on the base (exit exactly 1) and pass
-#   on the candidate.
+#   on the candidate, 3 runs of 3 (P25: once landed it is every later gate's
+#   regression); a pass and then a failure rejects the candidate.
 # - Every other scenario in the directory must pass on the candidate, except
 #   ratchet scenarios (a line `# rsi: ratchet`), which compare against the
 #   base and so fail on any tree that did not improve, task-only scenarios
@@ -3916,6 +3917,31 @@ candidate_job() {
     job_run "$job" 1 "$work/candidate" "$job_scenario" || run_status=$?
     [ ! -e "$job/slot-waited" ] || return 0
     job_output 1
+    # The task's scenario passes 3 of 3 before it lands (P25): once landed
+    # it is every later gate's regression, so a scenario that passes one
+    # run in four would cost one gate in four from then on (042, 050 and
+    # 054, 2026-11-11). Two more runs on the candidate, in the same slot;
+    # one that fails rejects the candidate (candidate_printed), and nothing
+    # is seeded from it.
+    if [ -e "$job/task" ] && [ "$run_status" -eq 0 ]; then
+        task_runs=0
+        for part in 2 3; do
+            job_stage "$(($(stage_now) - run_at))" "exit 0" "$run_name"
+            job_say "| == $run_name (run $part of 3: the task's scenario passes 3 of 3 before it lands)"
+            run_at=$(stage_now)
+            again=0
+            job_run "$job" "$part" "$work/candidate" "$job_scenario" || again=$?
+            [ ! -e "$job/slot-waited" ] || return 0
+            job_output "$part"
+            task_runs="$task_runs, then $again"
+            if [ "$again" -ne 0 ]; then
+                run_status=$again
+                printf '%s\n' "$task_runs on the candidate" >"$job/runs"
+                : >"$job/unsteady"
+                break
+            fi
+        done
+    fi
     if [ "$run_status" -eq 0 ] && [ -s "$job/seed-entry" ] && [ ! -s "$job/never-started" ]; then
         seed
     fi
@@ -4253,6 +4279,14 @@ candidate_printed() {
         1) metric=$metrics ;;
         *) echo "| two or more METRIC lines on the scenario's stdout: no metric" ;;
         esac
+        if [ "$printed_status" -ne 0 ] && [ -e "$1/unsteady" ]; then
+            printed_runs=$(cat "$1/runs" 2>/dev/null)
+            run_stage "rejected|$printed_name" "$printed_ms"
+            phase_time candidate
+            echo "| $(basename "$printed_scenario") passed, then failed on the candidate ($printed_runs): the task's scenario passes 3 of 3 before it lands"
+            verdict rejected "scenario is unstable on the candidate ($printed_runs): it must pass 3 of 3 runs before it lands"
+            exit 0
+        fi
         if [ "$printed_status" -ne 0 ]; then
             run_stage "rejected|$printed_name" "$printed_ms"
             phase_time candidate
