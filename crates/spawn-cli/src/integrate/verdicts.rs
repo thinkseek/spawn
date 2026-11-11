@@ -1,8 +1,10 @@
 //! How a gate's outcome becomes a record's fields: the host-fault,
 //! base-disagreement, cannot-judge and main-red fields, room and budget
 //! shortfalls, and a rejection's reason and evidence. Moved here from
-//! integrate.rs unchanged (S2 of the split); the integrator re-exports
-//! each item, so its paths in the crate stay as they were.
+//! integrate.rs unchanged (S2 of the split). integrate.rs re-exports
+//! what it and its test modules use, so every name resolves inside
+//! `integrate` as it did; nothing outside `integrate` used these, and
+//! `crate::integrate::<item>` no longer reaches them.
 
 use std::fmt::Write as _;
 use std::time::Duration;
