@@ -30,6 +30,8 @@
 #   objective 2: T4 two conflicts, cancelled; T5 in work, none.
 #   objective 3: T6 two conflicts, now sent back (no earlier attempt).
 #   objective 4: T7 rejected once, cancelled; T8 one conflict, sent back.
+#   no objective: T10 two conflicts, cancelled; T11 in work, none (no
+#     objective is no chain).
 # Mission 2: objective 3, T9 two conflicts, cancelled (not mission 1's).
 # Each check is reported; the run fails if any failed.
 #
@@ -231,6 +233,17 @@ select pg_temp.judged(-13, 7, 'rejected', 0);
 select pg_temp.cancelled(-12, 7);
 select pg_temp.assigned(-11, 1, 8, 4);
 select pg_temp.judged(-10, 8, 'conflict', 0);
+-- Two tasks with no objective: one cancelled after two conflicts, one in
+-- work with none (no objective is no chain).
+select pg_temp.rec(-9, jsonb_build_object('type', 'task.assigned', 'id', 10, 'mission_id', 1,
+    'kind', 'ephemeral', 'created_by', 'human', 'agent_id', 'agent_worker_10', 'session_id', 'session_worker_10',
+    'brief', 'Task 10 of 073'));
+select pg_temp.judged(-8, 10, 'conflict', 0);
+select pg_temp.judged(-7, 10, 'conflict', 1);
+select pg_temp.cancelled(-6, 10);
+select pg_temp.rec(-5, jsonb_build_object('type', 'task.assigned', 'id', 11, 'mission_id', 1,
+    'kind', 'ephemeral', 'created_by', 'human', 'agent_id', 'agent_worker_11', 'session_id', 'session_worker_11',
+    'brief', 'Task 11 of 073'));
 -- Mission 2's objective 3: two conflicts, cancelled.
 select pg_temp.assigned(-35, 2, 9, 3);
 select pg_temp.judged(-34, 9, 'conflict', 0);
@@ -241,8 +254,8 @@ select spawn_control_refold();
 SQL
 capture psql -d "$SPAWN_DB_NAME" -q -f "$WORK/seed.sql"
 [ "$status" -eq 0 ] || harness "seeding the history failed: $(err)"
-tasks=$(scalar "select string_agg(id || ':' || mission_id || ':' || objective || ':' || state, ' ' order by id) from mission_tasks")
-[ "$tasks" = "1:1:1:cancelled 2:1:1:cancelled 3:1:1:revise 4:1:2:cancelled 5:1:2:assigned 6:1:3:revise 7:1:4:cancelled 8:1:4:revise 9:2:3:cancelled" ] ||
+tasks=$(scalar "select string_agg(id || ':' || mission_id || ':' || coalesce(objective::text, '-') || ':' || state, ' ' order by id) from mission_tasks")
+[ "$tasks" = "1:1:1:cancelled 2:1:1:cancelled 3:1:1:revise 4:1:2:cancelled 5:1:2:assigned 6:1:3:revise 7:1:4:cancelled 8:1:4:revise 9:2:3:cancelled 10:1:-:cancelled 11:1:-:assigned" ] ||
     harness "the seed folded to tasks [$tasks]"
 
 web=$WORK/web
@@ -262,7 +275,7 @@ done
 code=$(curl -s --noproxy '*' -o "$WORK/api.json" -w '%{http_code}' "http://127.0.0.1:$port/api/missions" 2>/dev/null) || code=000
 [ "$code" = 200 ] || harness "GET /api/missions answered $code"
 gated=$(jq -c '[.missions[] | .tasks[] | [.id, .objective, ([.stages[] | select(.stage == "gated" and .verdict == "conflict")] | length)]] | sort' "$WORK/api.json")
-[ "$gated" = '[[1,1,1],[2,1,1],[3,1,1],[4,2,2],[5,2,0],[6,3,2],[7,4,0],[8,4,1],[9,3,2]]' ] ||
+[ "$gated" = '[[1,1,1],[2,1,1],[3,1,1],[4,2,2],[5,2,0],[6,3,2],[7,4,0],[8,4,1],[9,3,2],[10,null,2],[11,null,0]]' ] ||
     harness "the answer's tasks are not as seeded: $gated"
 
 # --- (1) the in-flight rows ----------------------------------------------------------------
@@ -290,6 +303,7 @@ test("(1) a task's conflicts count its objective's earlier attempts", () => {
       { task_id: 5, conflicts: 0, earlierConflicts: 2, conflictText: "sent back 2 times as a conflict, 2 on earlier attempts" },
       { task_id: 6, conflicts: 2, earlierConflicts: 0, conflictText: "sent back 2 times as a conflict" },
       { task_id: 8, conflicts: 1, earlierConflicts: 0, conflictText: null },
+      { task_id: 11, conflicts: 0, earlierConflicts: 0, conflictText: null },
     ],
   );
 });
