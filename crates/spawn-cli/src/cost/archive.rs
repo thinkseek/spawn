@@ -479,8 +479,8 @@ mod tests {
                 &[],
             )
             .expect("delete");
-        let _ = count(&store, &root, &prices);
-        assert_eq!(rows(&mut client).len(), 3, "unchanged files are not read");
+        let _ = count(store, root, prices);
+        assert_eq!(rows(client).len(), 3, "unchanged files are not read");
         write(
             &worker.join("n1.1.jsonl"),
             &[
@@ -491,7 +491,7 @@ mod tests {
             .concat(),
         );
         let _ = count(store, root, prices);
-        let last = rows(&mut client);
+        let last = rows(client);
         assert_eq!(
             last.len(),
             5,
