@@ -190,6 +190,51 @@ fn each_message_counts_once_for_its_task_priced_when_recorded() {
 }
 
 #[test]
+fn each_model_row_says_how_many_of_its_tokens_have_no_price() {
+    let (store, _schema) = store("cost_models_unpriced");
+    let (_mission, _task, worker) = one_task(&store);
+    let now = store.database_now_ms().expect("now");
+    started(&store, &worker, 1);
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_x", "model-x", now),
+        [100_000, 10_000, 0, 0],
+    );
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_z1", "model-z", now),
+        [200_000, 20_000, 1, 2],
+    );
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_z2", "model-z", now),
+        [50_000, 5000, 0, 0],
+    );
+    assert_eq!(store.cost_record(&prices(3.0)).expect("record"), 3);
+
+    let day = store.cost_window(now - DAY_MS, now + 1000).expect("window");
+    let x = entry(&day, "models", "model", &json!("model-x"));
+    near(&x["usd"], 0.45, "model-x");
+    assert_eq!(x["unpriced_tokens"], 0, "a priced model: {x}");
+    let z = entry(&day, "models", "model", &json!("model-z"));
+    assert_eq!(z["usd"], Value::Null, "{z}");
+    assert_eq!(z["unpriced_tokens"], 275_003, "all four counts: {z}");
+    assert_eq!(day["total"]["unpriced_tokens"], 275_003);
+    // An execution's models carry theirs too.
+    let execution = entry(&day, "executions", "execution", &json!("exec_1"));
+    let by_model = entry(execution, "models", "model", &json!("model-z"));
+    assert_eq!(by_model["unpriced_tokens"], 275_003, "{execution}");
+    let by_model = entry(execution, "models", "model", &json!("model-x"));
+    assert_eq!(by_model["unpriced_tokens"], 0, "{execution}");
+}
+
+#[test]
 fn a_daily_budget_is_an_amount_above_zero_read_with_the_days_spend() {
     let (store, _schema) = store("cost_budget");
     let (mission, _task, worker) = one_task(&store);
