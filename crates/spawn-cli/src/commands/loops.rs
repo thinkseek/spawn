@@ -425,6 +425,8 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         eprintln!("spawn loop warning: {warning}");
     }
     let root = workspace_root(flags).map(std::path::PathBuf::from);
+    // What only the transcript archive holds, counted beside the passes.
+    cost::archive::start(root.as_deref(), &prices);
     let monitor = disk::Monitor::new(root.as_deref());
     let mut fleet = Fleet {
         flags,

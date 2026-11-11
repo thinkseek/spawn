@@ -562,8 +562,21 @@ mod tests {
             let _ = count(&store, &root, &prices);
             let last = rows(&mut client);
             assert_eq!(last.len(), 5, "a changed file reads the agent again: {last:?}");
-            let unpriced: Option<rust_decimal_free::Usd> = None;
-            let _ = unpriced;
+            let priced: Vec<(String, bool)> = client
+                .query(
+                    "select message_id, usd is not null from spawn_cost_messages
+                      where message_id in ('m-b', 'm-d') order by message_id",
+                    &[],
+                )
+                .expect("usd")
+                .iter()
+                .map(|row| (row.get(0), row.get(1)))
+                .collect();
+            assert_eq!(
+                priced,
+                vec![("m-b".into(), true), ("m-d".into(), false)],
+                "a model with no price counts its tokens unpriced"
+            );
         }));
         let _ = std::fs::remove_dir_all(&root);
         let _ = postgres::Client::connect(&url, postgres::NoTls)

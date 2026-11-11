@@ -11,6 +11,9 @@
 //! loop counts no message twice. `GET /api/cost` ([`window`]) answers the
 //! totals of the last 24 h or 7 d; the alerts step reads each budgeted
 //! mission's spend of the UTC day (crate::alerts, `cost_budget`).
+//! Each time the loop starts, [`archive`] counts what only the transcript
+//! archive holds (objective 048), and the answer says `counted_since_ms`,
+//! the time of the earliest message the record holds.
 //!
 //! Prices are `SPAWN_MODEL_PRICES`: a JSON object from model name to
 //! `{"input", "output", "cache_write", "cache_read"}`, each US dollars per
@@ -22,6 +25,8 @@
 
 use serde_json::{Map, Value, json};
 use spawn_postgres::PostgresStore;
+
+pub(crate) mod archive;
 
 use crate::config::env_value;
 
