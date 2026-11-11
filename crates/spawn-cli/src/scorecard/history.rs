@@ -80,6 +80,9 @@ pub(crate) struct GateRun {
     pub(crate) at: i64,
     pub(crate) mission: Option<i64>,
     pub(crate) ms: i64,
+    /// An owner judging's (`source.moved`, `source.push_refused`), not a
+    /// task's gating.
+    pub(crate) owner: bool,
 }
 
 /// A transcript message's tokens, with the missions whose tasks' agents it
@@ -164,6 +167,9 @@ pub(crate) struct Record {
     pub(crate) accept: Value,
     #[serde(default)]
     pub(crate) gate_ms: Value,
+    /// An owner judging's: the mission whose gate judged it.
+    #[serde(default)]
+    pub(crate) mission: Value,
     #[serde(default)]
     pub(crate) stage_ms: Value,
     #[serde(default)]
@@ -326,6 +332,20 @@ impl Fold {
             "mission.resumed" => {
                 if let Some(id) = id {
                     self.mark(record.at, Some(id), Kind::Resume);
+                }
+            }
+            // An owner judging that names its gate's wall clock (objective
+            // 061): a gate run of the mission whose gate judged it (`mission`,
+            // never the missions the landing moved). One from before it names
+            // none and counts nothing.
+            "source.moved" | "source.push_refused" => {
+                if let Some(ms) = int(&record.gate_ms) {
+                    self.history.gate_runs.push(GateRun {
+                        at: record.at,
+                        mission: int(&record.mission),
+                        ms,
+                        owner: true,
+                    });
                 }
             }
             "task.assigned" => self.assigned(record, record.at),
@@ -497,6 +517,7 @@ impl Fold {
                 at: record.at,
                 mission,
                 ms,
+                owner: false,
             });
         }
     }

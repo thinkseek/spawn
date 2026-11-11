@@ -2652,7 +2652,11 @@ are per-agent uids or a mount per engine.
   `reused` likewise). Rejected (or a candidate without the
   mission's scenarios directory, `no_scenarios`): `source.push_refused`
   with `verdict` and the gate's `log`; nothing moves and no mission counts
-  it. No verdict (the host's fault, an abort, which is a harness error, no
+  it. Both records of a judged request (`source.moved` accepted,
+  `source.push_refused` rejected) carry `gate_ms`, the gate's wall clock,
+  and `mission`, the id of the mission whose gate judged it (objective
+  061): the scorecard's gate time counts the run for the fleet and for
+  that mission (never the moved `missions`), beside the tasks' gatings. No verdict (the host's fault, an abort, which is a harness error, no
   room, a gate that could not run): no outcome is recorded, and the request is
   judged again after the host-fault backoff. When the gate ran, what it
   printed (stdout, then stderr marked `! `, its last 4 MiB) is kept as
