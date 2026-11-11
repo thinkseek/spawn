@@ -2231,11 +2231,21 @@ begin
                                                then coalesce((p_record ->> 'escalate')::boolean, false)
                                           when v_verdict = 'stale' then gate_room_escalated
                                           else false end,
-               scenario_floor = greatest(scenario_floor, coalesce((p_record ->> 'scenarios')::integer, 0)),
+               -- The floor rises only from a gating on the mission's baseline
+               -- (P28, rev-e F1): one in flight across an owner's landing ends
+               -- on the old main (`stale`, or any verdict) with the old
+               -- controller's count, and must not raise the floor the landing
+               -- started again. A `stale` one on the baseline counts as before.
+               scenario_floor = case
+                   when baseline is null or baseline = p_record ->> 'base'
+                       then greatest(scenario_floor,
+                                     coalesce((p_record ->> 'scenarios')::integer, 0))
+                   else scenario_floor end,
                -- The names of the gating that set the floor: the latest at
                -- it (one at the floor with other names replaces them).
                scenario_names = case
-                   when p_record ? 'scenarios'
+                   when (baseline is null or baseline = p_record ->> 'base')
+                        and p_record ? 'scenarios'
                         and (p_record ->> 'scenarios')::integer >= scenario_floor
                         and (p_record ->> 'scenarios')::integer > 0
                        then case when jsonb_typeof(p_record -> 'scenario_names') = 'array'
