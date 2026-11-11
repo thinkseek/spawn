@@ -966,6 +966,72 @@ impl TerminalHost for TmuxHost {
     ) -> Result<bool, TerminalError> {
         write_local(path, bytes)
     }
+
+    fn replace_grown(
+        &self,
+        _workspace: &WorkspaceId,
+        path: &str,
+        bytes: &[u8],
+        current: &[u8],
+    ) -> Result<bool, TerminalError> {
+        replace_local(path, bytes, current)
+    }
+}
+
+/// Replace the regular file `path` with `bytes` if it holds exactly
+/// `current`, never with fewer bytes: whether it was replaced. The bytes go
+/// to a temporary file beside it first, made durable, with the file's mode,
+/// and a rename puts it in place, so the file is whole, old or new, at every
+/// moment.
+fn replace_local(path: &str, bytes: &[u8], current: &[u8]) -> Result<bool, TerminalError> {
+    use std::io::Write;
+    let failed =
+        |what: &str, error: std::io::Error| TerminalError(format!("{what} {path}: {error}"));
+    if bytes.len() < current.len() {
+        return Err(TerminalError(format!(
+            "replacing {path} would shorten it: {} bytes for {}",
+            bytes.len(),
+            current.len()
+        )));
+    }
+    let target = std::path::Path::new(path);
+    let metadata = match target.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(failed("inspect", error)),
+    };
+    if !metadata.is_file() {
+        return Err(TerminalError(format!("{path} is not a regular file")));
+    }
+    if std::fs::read(target).map_err(|error| failed("read", error))? != current {
+        return Ok(false);
+    }
+    let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+        return Err(TerminalError(format!("{path} names no file")));
+    };
+    let temporary = parent.join(format!(
+        ".{}.spawn-replace-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&temporary);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.set_permissions(metadata.permissions())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&temporary, target));
+    match written {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(failed("replace", error))
+        }
+    }
 }
 
 /// Create `path` holding `bytes` unless something is there: whether it was
@@ -1094,7 +1160,7 @@ fn read_local(path: &str, offset: u64) -> Result<Option<Vec<u8>>, TerminalError>
 
 #[cfg(test)]
 mod tests {
-    use super::{READ_LIMIT, read_in_workspace, read_local, runner_of};
+    use super::{READ_LIMIT, read_in_workspace, read_local, replace_local, runner_of};
     use spawn_core::id::TerminalName;
     use spawn_core::port::Runner;
     use std::time::{Duration, Instant};
@@ -1133,6 +1199,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// S16: a transcript is replaced only by a longer file, only while it
+    /// still holds what was read, through a rename, with its mode.
+    #[test]
+    fn a_file_is_replaced_whole_only_by_more_and_only_as_it_was_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("replace-grown");
+        let file = dir.join("n1.jsonl");
+        let path = file.to_str().unwrap();
+        std::fs::write(&file, b"c\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Shorter: refused, nothing written.
+        assert!(replace_local(path, b"", b"c\n").is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"c\n");
+        // Changed since it was read: not replaced.
+        assert!(matches!(
+            replace_local(path, b"a\nb\nc\nd\n", b"d\n"),
+            Ok(false)
+        ));
+        assert_eq!(std::fs::read(&file).unwrap(), b"c\n");
+        // As read: replaced, mode kept, no temporary left.
+        assert!(matches!(
+            replace_local(path, b"a\nb\nc\n", b"c\n"),
+            Ok(true)
+        ));
+        assert_eq!(std::fs::read(&file).unwrap(), b"a\nb\nc\n");
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        // Gone: not replaced, and not made.
+        std::fs::remove_file(&file).unwrap();
+        assert!(matches!(replace_local(path, b"x\n", b""), Ok(false)));
+        assert!(!file.exists());
+        // A symlink is no regular file.
+        std::os::unix::fs::symlink(dir.join("elsewhere"), &file).unwrap();
+        assert!(replace_local(path, b"x\n", b"").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
