@@ -16014,6 +16014,40 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Objective 056 (a): a verdict's `passed` and `reused` (the regressions
+    /// that passed in the gate, run or taken from the base's cache) reach
+    /// the records written from it: an owner landing's `source.moved` and a
+    /// task's `task.gated`, accepted or rejected; a verdict without them
+    /// leaves both keys off.
+    #[test]
+    fn a_verdicts_passed_and_reused_reach_both_records() {
+        let gate = "if [ \"${SPAWN_GATE_OWNER_CANDIDATE-}\" = 1 ]; then\n\
+             printf '%s\\n' '{\"v\":1,\"verdict\":\"accepted\",\"validator_defects\":[\"028.sh\"],\"passed\":[\"001.sh\",\"check-web.sh\",\"../x.sh\"],\"reused\":[\"002.sh\"]}' >\"$SPAWN_GATE_VERDICT\"\n\
+             exit 0\nfi\n\
+             printf '%s\\n' '{\"v\":1,\"verdict\":\"rejected\",\"reason\":\"r\",\"passed\":[\"003.sh\"],\"reused\":[\"004.sh\",\"005.sh\"]}' >\"$SPAWN_GATE_VERDICT\"\n";
+        let (base, source, scenarios, integrator) = world("gate-passed-reused", gate);
+        let db = Db::new("gate_passed_reused");
+        let mission = db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(&base, &source, &[("E.md", "e\n")], "owner: e");
+        gated_request(&db, &source, &commit, "e");
+        integrator.pass_on(&db.store).expect("the owner's judging");
+        integrator.settle();
+        let moved = control_records(&db, "source.moved");
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(moved[0]["passed"], json!(["001.sh", "check-web.sh"]), "{}", moved[0]);
+        assert_eq!(moved[0]["reused"], json!(["002.sh"]), "{}", moved[0]);
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        push_work(&base, &source, &agent, "work.txt");
+        integrator.pass_on(&db.store).expect("the task's judging");
+        integrator.settle();
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["verdict"], "rejected", "{record}");
+        assert_eq!(record["passed"], json!(["003.sh"]), "{record}");
+        assert_eq!(record["reused"], json!(["004.sh", "005.sh"]), "{record}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A gate verdict without `main_red_scenarios` (every gate before it)
     /// leaves the record without the key.
     #[test]
@@ -16033,6 +16067,10 @@ mod database_tests {
         integrator.settle();
         let (record, _, _) = last_verdict(&db);
         assert!(record.get("main_red_scenarios").is_none(), "{record}");
+        assert!(
+            record.get("passed").is_none() && record.get("reused").is_none(),
+            "{record}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
