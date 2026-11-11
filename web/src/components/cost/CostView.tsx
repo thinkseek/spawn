@@ -46,15 +46,12 @@ function Rows({ title, rows }: { title: string; rows: Row[] }) {
               <span className="shrink-0 font-mono text-muted-foreground" title={row.key}>
                 {row.key}
               </span>
-<<<<<<< 1155249526e5d15669383056161873365c933c55
               {row.label && (
                 <span className="min-w-0 truncate text-foreground" title={row.label}>
                   {row.label}
                 </span>
               )}
               <UnpricedMark text={row.unpriced_text} />
-=======
-              <UnpricedMark on={row.unpriced} />
               {row.per_landing !== undefined && (
                 <span
                   title="This mission's priced dollars over its tasks that landed or were accepted in the window"
@@ -63,7 +60,6 @@ function Rows({ title, rows }: { title: string; rows: Row[] }) {
                   {row.per_landing}
                 </span>
               )}
->>>>>>> 23e5537e9af2c998f40a0576df59082b049aa5d1
               <span
                 className={cx(
                   "tnum shrink-0",
@@ -89,12 +85,8 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
         title={label}
         meta={
           figures && (
-<<<<<<< 1155249526e5d15669383056161873365c933c55
-            <span className="tnum text-body font-semibold text-foreground">{figures.total}</span>
-=======
             <span className="flex items-center">
               <span className="tnum text-body font-semibold text-foreground">{figures.total}</span>
-              <UnpricedMark on={figures.unpriced} />
               <span
                 title="The window's priced dollars over the tasks that landed or were accepted in it, counted as the scorecard counts landings"
                 className="tnum ml-2 text-caption text-muted-foreground"
@@ -102,7 +94,6 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
                 {figures.per_landing}
               </span>
             </span>
->>>>>>> 23e5537e9af2c998f40a0576df59082b049aa5d1
           )
         }
       />
