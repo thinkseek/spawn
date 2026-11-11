@@ -40,6 +40,17 @@ pub fn store(case: &str) -> (PostgresStore, Schema) {
 /// failed test.
 pub struct Schema(String);
 
+impl Schema {
+    /// A guard for a schema of its own that the case makes some other way
+    /// than [`store`] (through [`schema_url`] alone, say): a fresh name
+    /// ([`schema_name`]), dropped when the guard goes. Let it go after the
+    /// case's connections to the schema have closed, so its drop never
+    /// waits on their locks.
+    pub fn fresh(case: &str) -> Self {
+        Self(schema_name(case))
+    }
+}
+
 impl std::ops::Deref for Schema {
     type Target = str;
     fn deref(&self) -> &str {
