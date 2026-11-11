@@ -512,55 +512,6 @@ fn tmux_types_into_a_terminal_and_sees_the_echo() {
     assert_eq!(states, vec![(name, spawn_core::port::Runner::Gone)]);
 }
 
-<<<<<<< cb917fbfdbbe279c1cf3b3b2b90f6b3b708dc558
-=======
-/// Whether a pane's program reads lines: `cat` reads its tty in canonical
-/// mode; a program that ran `stty raw` reads keys, and a line break pasted
-/// into it is Enter (the Bridge then keeps a message's marker on the text's
-/// line). A terminal that is not there reads as lines, the default.
-#[test]
-fn tmux_tells_a_pane_that_reads_lines_from_one_that_reads_keys_raw() {
-    let _exclusive = exclusive();
-    let tmux = isolated_tmux("modes");
-    let host = TmuxHost::local(&tmux.program);
-    let lines = terminal("lines");
-    start_session(&host, &launch(&lines)).expect("start succeeds");
-    let raw = terminal("raw");
-    let reader = script(
-        &tmux.scratch,
-        "raw-reader",
-        "#!/bin/sh\nstty raw -echo\necho raw-ready\nexec cat\n",
-    );
-    start_session(
-        &host,
-        &Launch {
-            program: reader,
-            ..launch(&raw)
-        },
-    )
-    .expect("start succeeds");
-    for _ in 0..100 {
-        let pane = host
-            .capture_tail(&raw, &workspace(), 5)
-            .expect("capture succeeds");
-        if pane.contains("raw-ready") {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(host.reads_lines(&lines, &workspace()), "cat reads lines");
-    assert!(
-        !host.reads_lines(&raw, &workspace()),
-        "a raw reader reads keys"
-    );
-    assert!(host.reads_lines(&terminal("missing"), &workspace()));
-    host.terminate(&lines, &workspace())
-        .expect("terminate succeeds");
-    host.terminate(&raw, &workspace())
-        .expect("terminate succeeds");
-}
-
->>>>>>> ec303cf09a80443efb9157e8795d302f7d36ec47
 /// A prompt longer than tmux's message size (16 KiB; an objective's brief
 /// can be) is staged and pasted whole: `set-buffer <text>` refused it as
 /// "command too long", and the dispatcher retried that refusal forever.
