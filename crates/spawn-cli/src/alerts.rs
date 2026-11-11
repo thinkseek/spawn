@@ -11,7 +11,13 @@
 //! An alert fires once per occurrence and clears at most once, whatever
 //! restarts: the key names the occurrence, the store refuses a second
 //! `alert.fired` for a key, and the step reads the keys back on start, so a
-//! restarted loop fires nothing twice and still knows what is open. A
+//! restarted loop fires nothing twice and still knows what is open. It
+//! clears only on evidence after what it fired on (objective 050; [`after`]):
+//! a record later in the log than the alert's own `event_id`, or a reading
+//! at or after its `reading_ms`. A restart reads the last week of records
+//! again, and an older one clears nothing; the records a pass reads are
+//! recorded one at a time, so a halt and its resume in one read end the
+//! alert cleared, naming the resume. A
 //! notice is an `alert.fired` with `notice: true`: it is news, never a
 //! condition, and never clears.
 //!
@@ -566,10 +572,14 @@ impl Monitor {
                 .alert_control(self.watermark, BATCH)
                 .map_err(|error| error.to_string())?;
             let records = batch["records"].as_array().map_or(&[][..], Vec::as_slice);
+            // One record at a time, as at the start: a halt and its resume
+            // in one batch end cleared, naming the resume.
             for entry in records {
                 let id = entry["event_id"].as_i64().unwrap_or_default();
                 let at = entry["at_ms"].as_i64().unwrap_or(now);
-                self.feed(id, at, &entry["record"], &mut events);
+                let mut fed = Vec::new();
+                self.feed(id, at, &entry["record"], &mut fed);
+                self.flush(store, now, &fed, &mut lines);
             }
             // What the step has read: the last control record when the
             // batch was cut at its limit (the rest waits for the next
@@ -670,12 +680,19 @@ impl Monitor {
         let history = store
             .alert_history(now.saturating_sub(HISTORY_MS), HISTORY_LIMIT)
             .map_err(|error| error.to_string())?;
-        let mut events = Vec::new();
+        // Each record is recorded before the next is read, so a later record
+        // in the same history (a halt's resume, a good drill after a failed
+        // one) finds the alert its predecessor fired and clears it, naming
+        // itself; a record older than an open alert's own clears nothing
+        // ([`after`]).
         for entry in history.as_array().into_iter().flatten() {
             let id = entry["event_id"].as_i64().unwrap_or_default();
             let at = entry["at_ms"].as_i64().unwrap_or(now);
-            self.feed(id, at, &entry["record"], &mut events);
+            let mut fed = Vec::new();
+            self.feed(id, at, &entry["record"], &mut fed);
+            self.flush(store, now, &fed, lines);
         }
+        let mut events = Vec::new();
         let observations = store
             .alert_observations()
             .map_err(|error| error.to_string())?;
@@ -1737,6 +1754,7 @@ times in a row)",
                     key,
                     evidence: json!({
                         "quiet_secs": quiet / 1000, "last_line": log.last_line,
+                        "reading_ms": now,
                     }),
                 });
             }
@@ -1803,12 +1821,14 @@ times in a row)",
             if !watched.contains(&entry) {
                 out.push(Event::Clear {
                     key: key.clone(),
-                    evidence: json!({"source": entry.1, "reason": "no longer watched"}),
+                    evidence: json!({
+                        "source": entry.1, "reason": "no longer watched", "reading_ms": now,
+                    }),
                 });
             } else if present(&entry.1) {
                 out.push(Event::Clear {
                     key: key.clone(),
-                    evidence: json!({"source": entry.1, "present": true}),
+                    evidence: json!({"source": entry.1, "present": true, "reading_ms": now}),
                 });
             } else {
                 open.insert(entry);
@@ -1829,7 +1849,10 @@ times in a row)",
                 key: format!("source_away:{mission}:{now}"),
                 kind: "source_away",
                 subject: format!("mission #{mission}"),
-                evidence: json!({"source": source, "present": false, "away_since_ms": since}),
+                evidence: json!({
+                    "source": source, "present": false, "away_since_ms": since,
+                    "reading_ms": now,
+                }),
                 text: format!(
                     "{source} is not a directory on this host: mission #{mission}'s \
                      branches are not published to it until it is back"
@@ -2036,6 +2059,7 @@ times in a row)",
                 subject: "host".to_string(),
                 evidence: json!({
                     "measured_mb": measured, "threshold_mb": low, "top": top_processes(),
+                    "reading_ms": now,
                 }),
                 text: format!("MemAvailable is {measured} MiB, under {low}"),
                 notice: false,
@@ -2044,7 +2068,9 @@ times in a row)",
                 for key in open {
                     out.push(Event::Clear {
                         key,
-                        evidence: json!({"measured_mb": measured, "threshold_mb": ok}),
+                        evidence: json!({
+                            "measured_mb": measured, "threshold_mb": ok, "reading_ms": now,
+                        }),
                     });
                 }
             }
@@ -2073,7 +2099,7 @@ times in a row)",
                 subject: "host".to_string(),
                 evidence: json!({
                     "path": path.display().to_string(),
-                    "measured_mb": measured, "threshold_mb": high,
+                    "measured_mb": measured, "threshold_mb": high, "reading_ms": now,
                 }),
                 text: format!("{} holds {measured} MiB, over {high}", path.display()),
                 notice: false,
@@ -2084,7 +2110,7 @@ times in a row)",
                         key,
                         evidence: json!({
                             "path": path.display().to_string(),
-                            "measured_mb": measured, "threshold_mb": ok,
+                            "measured_mb": measured, "threshold_mb": ok, "reading_ms": now,
                         }),
                     });
                 }
@@ -2166,7 +2192,7 @@ times in a row)",
                         subject: subject.to_string(),
                         evidence: json!({
                             "log": path.display().to_string(),
-                            "lines": matching,
+                            "lines": matching, "reading_ms": now,
                         }),
                         text: format!("the {subject} database's log: {}", line.trim()),
                         notice: false,
@@ -2178,7 +2204,7 @@ times in a row)",
                         key,
                         evidence: json!({
                             "line": line.trim(),
-                            "log": path.display().to_string(),
+                            "log": path.display().to_string(), "reading_ms": now,
                         }),
                     });
                 }
@@ -2216,12 +2242,12 @@ times in a row)",
                     })
                 }
                 Event::Clear { evidence, .. } => {
+                    if !self.clears(&key, evidence, now) {
+                        continue;
+                    }
                     let Some(row) = self.known.get(&key) else {
                         continue;
                     };
-                    if !row.open() || row.fired_event_id == 0 {
-                        continue;
-                    }
                     json!({
                         "type": "alert.cleared", "key": key, "kind": row.kind,
                         "subject": row.subject, "evidence": scrub_value(evidence),
@@ -2351,6 +2377,37 @@ times in a row)",
     fn is_open(&self, key: &str) -> bool {
         self.known.get(key).is_some_and(Row::open)
     }
+
+    /// Whether a clear of `key` with `evidence`, decided at `now`, is
+    /// recorded: the alert is open in the store, and the evidence comes
+    /// after what it fired on ([`after`]). One that does not clears
+    /// nothing, and is no error.
+    fn clears(&self, key: &str, evidence: &Value, now: i64) -> bool {
+        self.known
+            .get(key)
+            .is_some_and(|row| row.open() && row.fired_event_id != 0 && after(row, evidence, now))
+    }
+}
+
+/// Whether a clear's `evidence` comes after what the alert `row` fired on,
+/// read from the alert's own evidence (what the store holds, never the
+/// step's memory, which a restart empties): a record-borne clear names a
+/// control record or event (`event_id`) later in the log than the one the
+/// alert fired on; any other (a reading, `reading_ms`, or else the time it
+/// is decided, `now`) is taken at or after the alert's reading, or its
+/// firing.
+fn after(row: &Row, evidence: &Value, now: i64) -> bool {
+    if let (Some(by), Some(on)) = (
+        evidence["event_id"].as_i64(),
+        row.evidence["event_id"].as_i64(),
+    ) {
+        return by > on;
+    }
+    let read = evidence["reading_ms"].as_i64().unwrap_or(now);
+    let fired = row.evidence["reading_ms"]
+        .as_i64()
+        .unwrap_or(row.fired_at_ms);
+    read >= fired
 }
 
 impl LogWatch {
@@ -3099,7 +3156,7 @@ mod tests {
             .into_iter()
             .filter(|event| match event {
                 Event::Fire { .. } => !monitor.known.contains_key(event.key()),
-                Event::Clear { .. } => monitor.is_open(event.key()),
+                Event::Clear { key, evidence } => monitor.clears(key, evidence, i64::MAX),
             })
             .collect()
     }
@@ -3299,6 +3356,118 @@ mod tests {
             panic!("a clear");
         };
         assert_eq!(evidence["event_id"], 3);
+    }
+
+    /// What a restart reads again: an open halt of record 20, then the
+    /// records of the history in order. A resume older than the halt, a
+    /// good drill older than the failed one, an `up` older than its `down`
+    /// clear nothing; a later one clears.
+    #[test]
+    fn a_record_older_than_an_alerts_own_clears_nothing() {
+        let mut monitor = monitor();
+        let open = |kind: &str, subject: &str, evidence: Value| super::Row {
+            kind: kind.to_string(),
+            subject: subject.to_string(),
+            state: "open".to_string(),
+            evidence,
+            fired_event_id: 100,
+            fired_at_ms: 0,
+        };
+        monitor.known.insert(
+            "mission_halted:4:20".into(),
+            open("mission_halted", "mission #4", json!({"event_id": 20})),
+        );
+        monitor.known.insert(
+            "drill_failed:30".into(),
+            open("drill_failed", "drill", json!({"event_id": 30})),
+        );
+        monitor.known.insert(
+            "judge_down:40".into(),
+            open("judge_down", "jev", json!({"event_id": 40})),
+        );
+        feed(
+            &mut monitor,
+            1,
+            0,
+            json!({"type": "mission.added", "id": 4, "text": "m"}),
+        );
+        for (event_id, record) in [
+            (15, json!({"type": "mission.resumed", "id": 4})),
+            (
+                25,
+                json!({"type": "backup.verified", "ok": true, "key": "old"}),
+            ),
+            (
+                30,
+                json!({"type": "backup.verified", "ok": false, "key": "same"}),
+            ),
+            (
+                35,
+                json!({"type": "host.judge", "judge": "jev", "state": "up"}),
+            ),
+        ] {
+            let events = feed(&mut monitor, event_id, 0, record);
+            let cleared: Vec<Event> = decided(&monitor, events)
+                .into_iter()
+                .filter(|event| matches!(event, Event::Clear { .. }))
+                .collect();
+            assert!(cleared.is_empty(), "record {event_id} cleared {cleared:?}");
+        }
+        for (event_id, record, key) in [
+            (
+                50,
+                json!({"type": "mission.resumed", "id": 4}),
+                "mission_halted:4:20",
+            ),
+            (
+                51,
+                json!({"type": "backup.verified", "ok": true, "key": "new"}),
+                "drill_failed:30",
+            ),
+            (
+                52,
+                json!({"type": "host.judge", "judge": "jev", "state": "up"}),
+                "judge_down:40",
+            ),
+        ] {
+            let events = feed(&mut monitor, event_id, 0, record);
+            let cleared = decided(&monitor, events);
+            assert!(
+                cleared
+                    .iter()
+                    .any(|event| matches!(event, Event::Clear { key: at, evidence }
+                        if at == key && evidence["event_id"] == event_id)),
+                "record {event_id} clears {key}: {cleared:?}"
+            );
+        }
+    }
+
+    /// A reading-borne clear: a reading at or after the one the alert fired
+    /// on, or, when the alert names none, after its firing.
+    #[test]
+    fn a_reading_clears_only_after_the_reading_it_fired_on() {
+        let row = |evidence: Value, fired_at_ms: i64| super::Row {
+            kind: "memory_low".to_string(),
+            subject: "host".to_string(),
+            state: "open".to_string(),
+            evidence,
+            fired_event_id: 7,
+            fired_at_ms,
+        };
+        let fired = row(json!({"reading_ms": 1_000}), 1_200);
+        assert!(!super::after(&fired, &json!({"reading_ms": 900}), 5_000));
+        assert!(super::after(&fired, &json!({"reading_ms": 1_500}), 5_000));
+        let unnamed = row(json!({}), 1_200);
+        assert!(!super::after(&unnamed, &json!({}), 1_100));
+        assert!(super::after(&unnamed, &json!({}), 1_300));
+        // An event names the order whatever the clocks say.
+        let record = row(json!({"event_id": 9}), 0);
+        assert!(!super::after(
+            &record,
+            &json!({"event_id": 9, "reading_ms": 9_999}),
+            0
+        ));
+        assert!(super::after(&record, &json!({"event_id": 10}), 0));
     }
 
     #[test]
@@ -4295,6 +4464,212 @@ connections\n";
     /// appended to a schema of its own in the test database
     /// (`SPAWN_TEST_DATABASE_URL`, never the live one) and read back by
     /// `alert_observations`, as the loop's step reads them.
+    /// An alert clears only on evidence after what it fired on, whatever
+    /// restarts (objective 050): the step meets a history with a halt, its
+    /// resume and a second halt, two dumps and a good then a failed drill.
+    mod restarts {
+        use super::super::Monitor;
+        use super::settings;
+        use serde_json::Value;
+        use spawn_postgres::PostgresStore;
+
+        const HOUR: i64 = 3_600_000;
+
+        /// Run `case` on a migrated schema of its own, with an owner
+        /// connection to it; dropped afterwards.
+        fn in_schema(name: &str, case: impl FnOnce(&PostgresStore, &mut postgres::Client)) {
+            let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+                "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+            );
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.subsec_nanos());
+            let schema = format!("spawn_test_{}_{nanos:x}_{name}", std::process::id());
+            let store = PostgresStore::connect_in_schema(&url, &schema)
+                .expect("a schema of its own, migrated");
+            let separator = if url.contains('?') { '&' } else { '?' };
+            let owner = format!("{url}{separator}options=-csearch_path%3D{schema}");
+            let mut client =
+                postgres::Client::connect(&owner, postgres::NoTls).expect("the owner connects");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                case(&store, &mut client);
+            }));
+            drop(client);
+            drop(store);
+            let _ = postgres::Client::connect(&url, postgres::NoTls).and_then(|mut client| {
+                client.batch_execute(&format!("drop schema {schema} cascade"))
+            });
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
+
+        /// A control record `hours` before now, as the store holds it; its
+        /// event id.
+        fn record(client: &mut postgres::Client, hours: i64, record: &str) -> i64 {
+            let record: Value = serde_json::from_str(record).expect("a record");
+            client
+                .query_one(
+                    "insert into spawn_events (agent_id, session_id, execution_id, source,
+                                               source_event_id, kind, session_seq, recorded_at_ms)
+                     select 'agent_control', 'session_control', null, 'control', null,
+                            jsonb_build_object('name', 'control.recorded',
+                                               'detail', jsonb_build_object('record', $1::jsonb)),
+                            coalesce((select max(session_seq) from spawn_events
+                                       where session_id = 'session_control'), 0) + 1,
+                            spawn_now_ms() - $2::bigint
+                     returning id",
+                    &[&record, &(hours * HOUR)],
+                )
+                .expect("a control record")
+                .get(0)
+        }
+
+        fn refold(client: &mut postgres::Client) {
+            client
+                .batch_execute("select spawn_control_refold()")
+                .expect("refold");
+        }
+
+        /// The alert `key`'s state and the event its clear named.
+        fn alert(client: &mut postgres::Client, key: &str) -> (String, Option<i64>) {
+            client
+                .query_opt(
+                    "select state, (cleared_evidence ->> 'event_id')::bigint
+                       from spawn_alerts where key = $1",
+                    &[&key],
+                )
+                .expect("the alert reads")
+                .map_or(("none".to_string(), None), |row| (row.get(0), row.get(1)))
+        }
+
+        fn count(client: &mut postgres::Client) -> i64 {
+            client
+                .query_one(
+                    "select count(*) from spawn_alerts
+                      where kind in ('mission_halted', 'backup_stale', 'drill_failed')",
+                    &[],
+                )
+                .expect("count")
+                .get(0)
+        }
+
+        /// A loop's step, started fresh, after one check.
+        fn started(store: &PostgresStore) -> Monitor {
+            let mut monitor = Monitor::with(settings());
+            monitor.check(store).expect("the step checks");
+            monitor
+        }
+
+        #[test]
+        fn an_older_record_clears_nothing_at_a_first_start_or_after_a_restart() {
+            in_schema("alerts_restarts", |store, client| {
+                record(
+                    client,
+                    5,
+                    r#"{"type":"mission.added","id":1,"text":"m","origin":"human","sources":[]}"#,
+                );
+                let d1 = record(client, 5, r#"{"type":"backup.dumped","keys":["d1"]}"#);
+                let v1 = record(
+                    client,
+                    4,
+                    r#"{"type":"backup.verified","ok":true,"key":"v1"}"#,
+                );
+                let h1 = record(
+                    client,
+                    3,
+                    r#"{"type":"mission.halted","id":1,"reason":"first"}"#,
+                );
+                let d2 = record(client, 3, r#"{"type":"backup.dumped","keys":["d2"]}"#);
+                let r1 = record(client, 2, r#"{"type":"mission.resumed","id":1}"#);
+                let h2 = record(
+                    client,
+                    1,
+                    r#"{"type":"mission.halted","id":1,"reason":"second"}"#,
+                );
+                let v2 = record(
+                    client,
+                    1,
+                    r#"{"type":"backup.verified","ok":false,"key":"v2","reason":"bad"}"#,
+                );
+                refold(client);
+                assert!(d1 < d2 && v1 < v2 && h1 < r1 && r1 < h2);
+                let halt = format!("mission_halted:1:{h2}");
+                let stale = format!("backup_stale:dump:{d2}");
+                let drill = format!("drill_failed:{v2}");
+
+                // The first start: the second halt, the newer dump and the
+                // failed drill are open; the first halt is cleared on its
+                // resume, which the same history holds.
+                let mut monitor = started(store);
+                for key in [&halt, &stale, &drill] {
+                    assert_eq!(alert(client, key), ("open".to_string(), None), "{key}");
+                }
+                assert_eq!(
+                    alert(client, &format!("mission_halted:1:{h1}")),
+                    ("cleared".to_string(), Some(r1)),
+                    "fired and cleared naming its resume"
+                );
+
+                // Restarts: the older resume, dump and drill clear nothing.
+                for _ in 0..2 {
+                    monitor = started(store);
+                    for key in [&halt, &stale, &drill] {
+                        assert_eq!(alert(client, key).0, "open", "{key} after a restart");
+                    }
+                }
+
+                // Later evidence clears each, naming it.
+                let r2 = record(client, 0, r#"{"type":"mission.resumed","id":1}"#);
+                let d3 = record(client, 0, r#"{"type":"backup.dumped","keys":["d3"]}"#);
+                let v3 = record(
+                    client,
+                    0,
+                    r#"{"type":"backup.verified","ok":true,"key":"v3"}"#,
+                );
+                refold(client);
+                monitor.check(store).expect("the step checks");
+                assert_eq!(alert(client, &halt), ("cleared".to_string(), Some(r2)));
+                assert_eq!(alert(client, &stale), ("cleared".to_string(), Some(d3)));
+                assert_eq!(alert(client, &drill), ("cleared".to_string(), Some(v3)));
+
+                // A further restart fires nothing again.
+                let before = count(client);
+                drop(started(store));
+                assert_eq!(count(client), before);
+
+                // A halt and its resume, and a failed drill and a good one,
+                // written while the loop was down: neither opens.
+                let h3 = record(
+                    client,
+                    0,
+                    r#"{"type":"mission.halted","id":1,"reason":"third"}"#,
+                );
+                let r3 = record(client, 0, r#"{"type":"mission.resumed","id":1}"#);
+                let v4 = record(
+                    client,
+                    0,
+                    r#"{"type":"backup.verified","ok":false,"key":"v4","reason":"bad"}"#,
+                );
+                let v5 = record(
+                    client,
+                    0,
+                    r#"{"type":"backup.verified","ok":true,"key":"v5"}"#,
+                );
+                refold(client);
+                drop(started(store));
+                assert_eq!(
+                    alert(client, &format!("mission_halted:1:{h3}")),
+                    ("cleared".to_string(), Some(r3))
+                );
+                assert_eq!(
+                    alert(client, &format!("drill_failed:{v4}")),
+                    ("cleared".to_string(), Some(v5))
+                );
+            });
+        }
+    }
+
     mod through_the_store {
         use super::super::{Event, Monitor};
         use super::{commit, decided, fires, monitor};
