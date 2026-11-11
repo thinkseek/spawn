@@ -5126,6 +5126,330 @@ connections\n";
             if evidence["stuck"] == 0.05 && evidence["event_id"] == 62));
     }
 
+    /// One mission (`accept`: `gate` or `review`) and its task #7 with
+    /// `agent_worker_w`, moved by `records` (each a control record, its
+    /// event id 10, 11, ...).
+    fn worker_monitor(accept: &str, records: &[Value]) -> Monitor {
+        let mut monitor = monitor();
+        let mut id = 1;
+        let mut each = |monitor: &mut Monitor, record: Value| {
+            let events = feed(monitor, id, id * 1000, record);
+            commit(monitor, &events);
+            id += 1;
+        };
+        each(&mut monitor, json!({"type": "mission.added", "id": 4, "text": "m", "origin": "human"}));
+        each(&mut monitor, json!({"type": "mission.configured", "id": 4, "accept": accept}));
+        id = 10;
+        each(
+            &mut monitor,
+            json!({"type": "task.assigned", "id": 7, "mission_id": 4,
+                   "agent_id": "agent_worker_w", "objective": 26}),
+        );
+        each(&mut monitor, json!({"type": "task.delivered", "id": 7, "command_id": 3}));
+        for record in records {
+            each(&mut monitor, record.clone());
+        }
+        monitor
+    }
+
+    /// A judgement of `session` (`agent`) at event 100, stuck 0.9, WAITING.
+    fn stuck_of(session: &str, agent: &str) -> Value {
+        json!([{"session_id": session, "agent_id": agent, "event_id": 100, "at_ms": 0,
+                "observation": {"stuck": 0.9, "state": "WAITING", "judge": "jev"}}])
+    }
+
+    fn observed(monitor: &mut Monitor, observations: &Value) -> Vec<Event> {
+        let mut out = Vec::new();
+        monitor.observe(observations, &mut out);
+        decided(monitor, out)
+    }
+
+    /// Objective 057 (a): a worker whose task is past its part fires
+    /// nothing, whatever the judge's score: reported (waiting for its gate,
+    /// or for a review), gated stale (reported again), accepted by its
+    /// review (waiting for its landing), landing after an accepted gate (or
+    /// held behind the owner's hold: `task.held` leaves it landing), landed.
+    #[test]
+    fn a_worker_whose_part_is_done_is_never_alerted_stuck() {
+        let reported = json!({"type": "task.reported", "id": 7, "commit": "c"});
+        let cases: Vec<(&str, &str, Vec<Value>)> = vec![
+            ("reported, waiting for its gate", "gate", vec![reported.clone()]),
+            ("reported, waiting for a review", "review", vec![reported.clone()]),
+            (
+                "gated stale: reported again",
+                "gate",
+                vec![
+                    reported.clone(),
+                    json!({"type": "task.gated", "id": 7, "verdict": "stale"}),
+                ],
+            ),
+            (
+                "gated accepted: landing",
+                "gate",
+                vec![
+                    reported.clone(),
+                    json!({"type": "task.gated", "id": 7, "verdict": "accepted"}),
+                ],
+            ),
+            (
+                "landing, held behind the owner's hold",
+                "gate",
+                vec![
+                    reported.clone(),
+                    json!({"type": "task.gated", "id": 7, "verdict": "accepted"}),
+                    json!({"type": "task.held", "id": 7, "hold": 2, "source": "/s"}),
+                ],
+            ),
+            (
+                "reviewed accepted",
+                "review",
+                vec![
+                    reported.clone(),
+                    json!({"type": "task.reviewed", "id": 7, "accepted": true}),
+                ],
+            ),
+            (
+                "landed",
+                "gate",
+                vec![
+                    reported.clone(),
+                    json!({"type": "task.gated", "id": 7, "verdict": "accepted"}),
+                    json!({"type": "task.landed", "id": 7}),
+                ],
+            ),
+        ];
+        for (what, accept, records) in cases {
+            let mut monitor = worker_monitor(accept, &records);
+            let out = observed(&mut monitor, &stuck_of("session_worker_w", "agent_worker_w"));
+            assert!(out.is_empty(), "{what}: {out:?}");
+        }
+    }
+
+    /// Objective 057 (b): a worker stuck in its own work (its task
+    /// delivered) fires once, naming its task and the one command that acts
+    /// on it; one whose task went back for revision names its task, and no
+    /// command (a restart takes a delivered task only).
+    #[test]
+    fn a_worker_stuck_in_its_task_names_the_task_and_its_command() {
+        let mut monitor = worker_monitor("gate", &[]);
+        let out = observed(&mut monitor, &stuck_of("session_worker_w", "agent_worker_w"));
+        assert_eq!(fires(&out), ["agent_stuck:session_worker_w:100"]);
+        let Event::Fire { evidence, text, .. } = &out[0] else {
+            panic!("a fire");
+        };
+        assert_eq!(evidence["task"], 7);
+        assert_eq!(evidence["task_state"], "delivered");
+        assert_eq!(evidence["command"], "spawn task restart --id 7");
+        assert_eq!(evidence["event_id"], 100);
+        assert!(text.contains("spawn task restart --id 7"), "{text}");
+        commit(&mut monitor, &out);
+        let again = observed(&mut monitor, &stuck_of("session_worker_w", "agent_worker_w"));
+        assert!(again.is_empty(), "one alert: {again:?}");
+
+        let mut revising = worker_monitor(
+            "gate",
+            &[
+                json!({"type": "task.reported", "id": 7, "commit": "c"}),
+                json!({"type": "task.gated", "id": 7, "verdict": "rejected", "revision": 0}),
+            ],
+        );
+        let out = observed(&mut revising, &stuck_of("session_worker_w", "agent_worker_w"));
+        let Event::Fire { evidence, .. } = &out[0] else {
+            panic!("a fire: {out:?}");
+        };
+        assert_eq!(evidence["task"], 7);
+        assert_eq!(evidence["task_state"], "revise");
+        assert_eq!(evidence["command"], json!(null));
+    }
+
+    /// Objective 057 (a): an open stuck alert of a worker clears at the
+    /// record that moved its task past its part, that record's id its
+    /// `event_id`: its `task.reported`, and as well a `task.gated` or a
+    /// `task.landed` for one still open.
+    #[test]
+    fn a_workers_stuck_alert_clears_at_its_tasks_report() {
+        for (records, clearing) in [
+            (
+                vec![json!({"type": "task.reported", "id": 7, "commit": "c"})],
+                "task.reported",
+            ),
+            (
+                vec![
+                    json!({"type": "task.reported", "id": 7, "commit": "c"}),
+                    json!({"type": "task.gated", "id": 7, "verdict": "stale"}),
+                ],
+                "task.reported",
+            ),
+        ] {
+            let mut monitor = worker_monitor("gate", &[]);
+            let fired = observed(&mut monitor, &stuck_of("session_worker_w", "agent_worker_w"));
+            commit(&mut monitor, &fired);
+            let mut cleared = Vec::new();
+            for (offset, record) in records.iter().enumerate() {
+                let id = 200 + i64::try_from(offset).unwrap_or_default();
+                let events = feed(&mut monitor, id, 0, record.clone());
+                let events = decided(&monitor, events);
+                commit(&mut monitor, &events);
+                cleared.extend(events.into_iter().filter(|event| matches!(event, Event::Clear { .. })));
+            }
+            assert_eq!(cleared.len(), 1, "{cleared:?}");
+            assert!(matches!(&cleared[0], Event::Clear { key, evidence }
+                if key == "agent_stuck:session_worker_w:100" && evidence["event_id"] == 200
+                    && evidence["record"] == clearing && evidence["task"] == 7));
+            let after = observed(&mut monitor, &stuck_of("session_worker_w", "agent_worker_w"));
+            assert!(after.is_empty(), "nothing fires again: {after:?}");
+        }
+        // Landed by its gate's landing: cleared at the gated accepted.
+        let mut monitor = worker_monitor(
+            "gate",
+            &[json!({"type": "task.reported", "id": 7, "commit": "c"})],
+        );
+        monitor.known.insert(
+            "agent_stuck:session_worker_w:100".to_string(),
+            Row {
+                kind: "agent_stuck".to_string(),
+                subject: "session_worker_w".to_string(),
+                state: "open".to_string(),
+                evidence: json!({"agent_id": "agent_worker_w", "event_id": 100}),
+                fired_event_id: 101,
+                fired_at_ms: 0,
+            },
+        );
+        let events = feed(
+            &mut monitor,
+            300,
+            0,
+            json!({"type": "task.gated", "id": 7, "verdict": "accepted"}),
+        );
+        let cleared: Vec<Event> = decided(&monitor, events)
+            .into_iter()
+            .filter(|event| matches!(event, Event::Clear { .. }))
+            .collect();
+        assert!(matches!(&cleared[..], [Event::Clear { evidence, .. }]
+            if evidence["event_id"] == 300 && evidence["record"] == "task.gated"
+                && evidence["task_state"] == "landing"));
+    }
+
+    fn supervisor_stuck() -> Value {
+        stuck_of("session_supervisor", "agent_supervisor")
+    }
+
+    fn item(tag: &str, agent: Option<&str>, judgement: bool) -> super::DispatchItem {
+        super::DispatchItem {
+            tag: tag.to_string(),
+            agent: agent.map(str::to_string),
+            judgement,
+        }
+    }
+
+    /// Objective 057 (a): the supervisor with nothing to dispatch fires
+    /// nothing, whatever the judge's score; each of its three conditions
+    /// fires one: a question to the owner, a pending or told escalation
+    /// (a worker's own judgement excepted while it holds its task), a
+    /// mission waiting for its first task. Its plan unread: its judgement
+    /// alone, as before.
+    #[test]
+    fn the_supervisor_is_alerted_stuck_only_with_something_to_dispatch() {
+        // Its one mission's task with a worker: nothing to dispatch.
+        let mut monitor = worker_monitor("gate", &[]);
+        monitor.supervisor = Some(super::Dispatch::default());
+        assert!(observed(&mut monitor, &supervisor_stuck()).is_empty());
+        // A worker's judgement about its task is the worker's (its own alert).
+        monitor.supervisor = Some(super::Dispatch {
+            question: false,
+            items: vec![item("session_worker_w 99", Some("agent_worker_w"), true)],
+        });
+        assert!(observed(&mut monitor, &supervisor_stuck()).is_empty());
+
+        let fired = |dispatch: super::Dispatch, monitor: &mut Monitor| {
+            monitor.supervisor = Some(dispatch);
+            let out = observed(monitor, &supervisor_stuck());
+            assert_eq!(fires(&out), ["agent_stuck:session_supervisor:100"]);
+            let Event::Fire { evidence, .. } = &out[0] else {
+                panic!("a fire");
+            };
+            evidence["dispatch"].clone()
+        };
+        // 1. A question to the owner.
+        let mut asking = worker_monitor("gate", &[]);
+        let why = fired(
+            super::Dispatch {
+                question: true,
+                items: Vec::new(),
+            },
+            &mut asking,
+        );
+        assert_eq!(why, json!(["a question to the owner"]));
+        // 2. A pending or told escalation: a report to review, a stall, a
+        // worker's judgement while it holds no task.
+        for escalation in [
+            item("session_worker_w report-7-0", Some("agent_worker_w"), false),
+            item("missions stall-7-halted-3", None, false),
+            item("session_worker_x 98", Some("agent_worker_x"), true),
+        ] {
+            let mut escalated = worker_monitor("gate", &[]);
+            let tag = escalation.tag.clone();
+            let why = fired(
+                super::Dispatch {
+                    question: false,
+                    items: vec![escalation],
+                },
+                &mut escalated,
+            );
+            assert_eq!(why, json!([format!("escalation {tag}")]));
+        }
+        // 3. A mission of its own waiting for its first task (a gated
+        // mission's objectives are the integrator's).
+        let mut waiting = worker_monitor("gate", &[]);
+        let mut events = Vec::new();
+        waiting.feed(
+            50,
+            0,
+            &json!({"type": "mission.added", "id": 5, "text": "n", "origin": "human"}),
+            &mut events,
+        );
+        waiting.feed(
+            51,
+            0,
+            &json!({"type": "mission.added", "id": 6, "text": "g", "origin": "human"}),
+            &mut events,
+        );
+        waiting.feed(
+            52,
+            0,
+            &json!({"type": "mission.configured", "id": 6, "accept": "gate"}),
+            &mut events,
+        );
+        let why = fired(super::Dispatch::default(), &mut waiting);
+        assert_eq!(why, json!(["mission #5 waits for its first task"]));
+        // Unread: the judgement alone.
+        let mut unread = worker_monitor("gate", &[]);
+        unread.supervisor = None;
+        assert_eq!(
+            fires(&observed(&mut unread, &supervisor_stuck())),
+            ["agent_stuck:session_supervisor:100"]
+        );
+    }
+
+    /// Objective 057 (a): the supervisor's open stuck alert clears once it
+    /// has nothing to dispatch, at the latest record the step read.
+    #[test]
+    fn the_supervisors_stuck_alert_clears_once_nothing_is_to_dispatch() {
+        let mut monitor = worker_monitor("gate", &[]);
+        monitor.supervisor = Some(super::Dispatch {
+            question: true,
+            items: Vec::new(),
+        });
+        let fired = observed(&mut monitor, &supervisor_stuck());
+        commit(&mut monitor, &fired);
+        monitor.supervisor = Some(super::Dispatch::default());
+        monitor.watermark = 120;
+        let cleared = observed(&mut monitor, &supervisor_stuck());
+        assert!(matches!(&cleared[..], [Event::Clear { key, evidence }]
+            if key == "agent_stuck:session_supervisor:100" && evidence["event_id"] == 120
+                && evidence["nothing_to_dispatch"] == true));
+    }
+
     /// The stuck alert against the real store: the session's events are
     /// appended to a schema of its own in the test database
     /// (`SPAWN_TEST_DATABASE_URL`, never the live one) and read back by
