@@ -4350,6 +4350,157 @@ mod tests {
         assert_eq!(rejections_change(&cancel(&mut monitor, 27, 3)), None);
     }
 
+    /// Missions for `mission_idle` (objective 058): 1 and 3 take their work
+    /// from a backlog, 2 is owner work, 4 a backlog mission whose task stays
+    /// in work; each has one task (its id the mission's), assigned at event
+    /// 10 + id. Returns the events of the cancels of tasks 1, 2 and 3.
+    fn idle_world(monitor: &mut Monitor) -> Vec<i64> {
+        for id in 1..=4 {
+            feed(monitor, id, 0, json!({"type": "mission.added", "id": id, "text": "m"}));
+            let objectives = if id == 2 { Value::Null } else { json!({"backlog": "b", "resident": "r"}) };
+            feed(
+                monitor,
+                5 + id,
+                0,
+                json!({"type": "mission.configured", "id": id, "accept": "gate",
+                       "objectives": objectives}),
+            );
+            feed(
+                monitor,
+                10 + id,
+                0,
+                json!({"type": "task.assigned", "id": id, "mission_id": id, "agent_id": "a"}),
+            );
+        }
+        feed(monitor, 20, 0, json!({"type": "mission.closed", "id": 3, "state": "done"}));
+        [1, 2, 3]
+            .into_iter()
+            .map(|id| {
+                feed(monitor, 20 + id, 1_000 * id, json!({"type": "task.cancelled", "id": id}));
+                20 + id
+            })
+            .collect()
+    }
+
+    fn read_idle(monitor: &Monitor, now: i64) -> Vec<Event> {
+        let mut out = Vec::new();
+        monitor.read_idle(now, &mut out);
+        out
+    }
+
+    /// Objective 058 (a), (c): a backlog mission with no task in work fires
+    /// once, at the reading the bound has passed since its last task ended;
+    /// owner work, a closed mission and one with a task in work do not.
+    #[test]
+    fn a_backlog_mission_without_work_past_the_bound_is_one_alert() {
+        let mut monitor = monitor();
+        let cancels = idle_world(&mut monitor);
+        assert!(read_idle(&monitor, 1_000 + 900_000 - 1).is_empty(), "not before the bound");
+        let fired = read_idle(&monitor, 1_000 + 900_000);
+        assert_eq!(fires(&fired), ["mission_idle:1:21"], "{fired:?}");
+        let Event::Fire {
+            subject,
+            evidence,
+            text,
+            notice,
+            ..
+        } = &fired[0]
+        else {
+            panic!("a fire");
+        };
+        assert_eq!(subject, "mission #1");
+        assert_eq!(evidence["mission"], 1);
+        assert_eq!(evidence["since_ms"], 1_000);
+        assert_eq!(evidence["event_id"], cancels[0]);
+        assert_eq!(text, "mission #1 has had no task in work for 15 min since its last task ended: its objective backlog has nothing open to assign");
+        assert!(!notice, "an alert: Needs you");
+        commit(&mut monitor, &fired);
+        assert!(read_idle(&monitor, 10_000_000).is_empty(), "once while open");
+    }
+
+    /// Objective 058 (b): the mission's next assignment clears it, naming
+    /// that record, and so does its close; the bound starts again at the
+    /// next task's end.
+    #[test]
+    fn a_missions_next_task_or_its_close_clears_its_idle_alert() {
+        let mut monitor = monitor();
+        idle_world(&mut monitor);
+        let fired = read_idle(&monitor, 2_000_000);
+        commit(&mut monitor, &fired);
+        let assigned = feed(
+            &mut monitor,
+            30,
+            0,
+            json!({"type": "task.assigned", "id": 5, "mission_id": 1, "agent_id": "a"}),
+        );
+        let cleared = decided(&monitor, assigned);
+        assert!(
+            matches!(&cleared[..], [.., Event::Clear { key, evidence }]
+                if key == "mission_idle:1:21" && evidence["event_id"] == 30),
+            "{cleared:?}"
+        );
+        commit(&mut monitor, &cleared);
+        assert!(read_idle(&monitor, 9_000_000).is_empty(), "a task in work");
+        feed(&mut monitor, 31, 3_000_000, json!({"type": "task.cancelled", "id": 5}));
+        let again = read_idle(&monitor, 3_000_000 + 900_000);
+        assert_eq!(fires(&again), ["mission_idle:1:31"]);
+        commit(&mut monitor, &again);
+        let closed = feed(&mut monitor, 32, 0, json!({"type": "mission.closed", "id": 1, "state": "done"}));
+        let cleared = decided(&monitor, closed);
+        assert!(
+            cleared.iter().any(|event| matches!(event, Event::Clear { key, evidence }
+                if key == "mission_idle:1:31" && evidence["event_id"] == 32)),
+            "{cleared:?}"
+        );
+    }
+
+    /// Objective 058: `SPAWN_ALERT_MISSION_IDLE_SECS` is 900 s by default,
+    /// and 0 turns the alert off.
+    #[test]
+    fn the_idle_bound_defaults_to_fifteen_minutes_and_zero_disables_it() {
+        if std::env::var_os("SPAWN_ALERT_MISSION_IDLE_SECS").is_none() {
+            assert_eq!(super::Settings::from_env().0.mission_idle_ms, 900_000);
+        }
+        assert_eq!(settings().mission_idle_ms, 900_000);
+        let mut off = Monitor::with(Settings {
+            mission_idle_ms: 0,
+            ..settings()
+        });
+        idle_world(&mut off);
+        assert!(read_idle(&off, i64::MAX / 2).is_empty(), "disabled");
+    }
+
+    /// Objective 058 after a restart: an open alert read back fires nothing
+    /// again, and the next assignment still clears it.
+    #[test]
+    fn a_restart_keeps_a_mission_idle_alert_one_alert() {
+        let mut restarted = monitor();
+        idle_world(&mut restarted);
+        restarted.known.insert(
+            "mission_idle:1:21".to_string(),
+            Row {
+                kind: "mission_idle".to_string(),
+                subject: "mission #1".to_string(),
+                state: "open".to_string(),
+                evidence: json!({"mission": 1, "since_ms": 1_000, "event_id": 21}),
+                fired_event_id: 21,
+                fired_at_ms: 0,
+            },
+        );
+        assert!(read_idle(&restarted, 5_000_000).is_empty());
+        let assigned = feed(
+            &mut restarted,
+            40,
+            0,
+            json!({"type": "task.assigned", "id": 6, "mission_id": 1, "agent_id": "a"}),
+        );
+        let cleared = decided(&restarted, assigned);
+        assert!(
+            cleared.iter().any(|event| matches!(event, Event::Clear { key, .. } if key == "mission_idle:1:21")),
+            "{cleared:?}"
+        );
+    }
+
     #[test]
     fn a_halt_is_a_notice_and_an_alert_and_a_resume_clears_it() {
         let mut monitor = monitor();
