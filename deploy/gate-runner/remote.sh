@@ -222,21 +222,6 @@ disk_free_kb() {
     echo "$free"
 }
 
-# cargo_wrapper: the rustc-wrapper the cargo config names (the gate binds
-# config and config.toml into its sandbox), "none", or "<name> missing" when
-# the gate's PATH has no such program: every build would fail there.
-cargo_wrapper() {
-    w=$(sed -n 's/^[[:space:]]*rustc-wrapper[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
-        "$cargo_home/config.toml" "$cargo_home/config" 2>/dev/null | head -n 1) || w=""
-    if [ -z "$w" ]; then
-        echo none
-    elif PATH=$cfg_path command -v "$w" >/dev/null 2>&1; then
-        echo "$w"
-    else
-        echo "$w missing"
-    fi
-}
-
 # registry_fs: "same" when the registry is on the file system of the cargo
 # home, where registry-accept stages what it receives: it renames each file
 # into place, and a rename puts a whole file there only within one file
@@ -338,7 +323,6 @@ preflight() {
     printf 'host_shares=%s\n' "$(host_shares)"
     printf 'tmp_fs=%s\n' "$(df -PT /tmp 2>/dev/null | awk 'NR == 2 { print $2 }')"
     printf 'cargo_home=%s\n' "$cargo_home"
-    printf 'cargo_wrapper=%s\n' "$(cargo_wrapper)"
     printf 'registry_fs=%s\n' "$(registry_fs)"
     printf 'pg_image=%s\n' "$cfg_pg_image"
     printf 'pg_bin=%s\n' "$cfg_pg_bin"
