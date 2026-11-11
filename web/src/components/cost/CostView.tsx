@@ -1,7 +1,7 @@
 import { CircleDollarSign } from "lucide-react";
 
 import { readApi, usePoll } from "../../api";
-import type { CostAnswer, CostView as Figures, Row } from "../../cost.ts";
+import type { CostAnswer, CostView as Figures, Fold, Row } from "../../cost.ts";
 import { costView } from "../../cost.ts";
 import { Card, CardHeader, EmptyState, LiveStatus, PageHeader, cx } from "../ui";
 
@@ -31,7 +31,21 @@ function UnpricedMark({ text }: { text: string | null }) {
   );
 }
 
-function Rows({ title, rows }: { title: string; rows: Row[] }) {
+/** A row's share of the window's dollars ("14%", "<1%"); nothing when the
+ * window cost nothing priced. */
+function ShareMark({ share }: { share: string | null }) {
+  if (share === null) return null;
+  return (
+    <span
+      title="Its share of this window's dollars"
+      className="tnum w-9 shrink-0 text-right text-micro text-faint-foreground"
+    >
+      {share}
+    </span>
+  );
+}
+
+function Rows({ title, rows, more = null }: { title: string; rows: Row[]; more?: Fold | null }) {
   return (
     <div className="min-w-0">
       <div className="px-4 pt-3 pb-1 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">
@@ -69,8 +83,18 @@ function Rows({ title, rows }: { title: string; rows: Row[] }) {
               >
                 {row.usd}
               </span>
+              <ShareMark share={row.share} />
             </li>
           ))}
+          {more && (
+            <li
+              data-cost-fold
+              title="The rest of this window's rows, past the ten costliest, folded into one line"
+              className="tnum px-4 py-1 text-caption text-muted-foreground"
+            >
+              {more.text}
+            </li>
+          )}
         </ul>
       )}
     </div>
@@ -116,8 +140,8 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
       {figures ? (
         <div className="grid grid-cols-1 lg:grid-cols-3">
           <Rows title="Missions" rows={figures.missions} />
-          <Rows title="Tasks" rows={figures.tasks} />
-          <Rows title="Agents" rows={figures.agents} />
+          <Rows title="Tasks" rows={figures.tasks} more={figures.tasks_more} />
+          <Rows title="Agents" rows={figures.agents} more={figures.agents_more} />
         </div>
       ) : (
         <EmptyState title="Loading…" />
@@ -129,7 +153,9 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
 /**
  * What the fleet's model calls cost over the last 24 hours and 7 days, in
  * US dollars: the total and what a landing cost, each mission (with its
- * own dollars per landing), task and agent, most costly first
+ * own dollars per landing) and the ten costliest tasks and agents, most
+ * costly first, the rest of each folded into one line ("3 more tasks ·
+ * $1.80"); each row says its share of the window
  * (crates/spawn-cli/src/cost.rs prices each call when it is recorded).
  * Each task row shows its label beside its id. Under each window's total a
  * note says once how many tokens no price counts, on which models, and how
