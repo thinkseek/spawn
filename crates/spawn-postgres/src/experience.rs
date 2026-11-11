@@ -25,15 +25,9 @@ use crate::PostgresStore;
 ///   its close; `null` while open at `$2`), and `owner_work`: whether
 ///   its last configuration before `$2` (`mission.configured` or a legacy
 ///   mission row) left it with no objective backlog (`objectives` not an
-///   object), so its work comes from the owner (objective 062). The last
-///   record is the mission's configuration as its fold has it
-///   (`mission_missions`, what `/api/rsi` shows): every configure records
-///   every setting (`spawn mission configure` merges its change into the
-///   row, `spawn_mission_reconfigure`), and the fold replaces them, so a
-///   later configure that names only `accept` or a budget keeps the backlog
-///   (S22; tests/experience.rs). A mission never configured has declared
-///   neither and is not owner work: its idle flag stays as before
-///   (objective 043).
+///   object), so its work comes from the owner (objective 062). A mission
+///   never configured has declared neither and is not owner work: its idle
+///   flag stays as before (objective 043).
 const WINDOW: &str = r"
 with
   decided as (
@@ -163,6 +157,14 @@ select jsonb_build_object(
 impl PostgresStore {
     /// How the fleet did over `[since_ms, until_ms)`, from the experience
     /// views ([`WINDOW`]).
+    ///
+    /// A mission's `owner_work` reads its last configuration record, and
+    /// that is its configuration as its fold has it (`mission_missions`,
+    /// what `/api/rsi` shows): every configure records every setting
+    /// (`spawn mission configure` merges its change into the row through
+    /// `spawn_mission_reconfigure`), and the fold replaces them, so a later
+    /// configure that names only `accept` or a budget keeps the backlog
+    /// (S22; tests/experience.rs).
     pub fn experience_window(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
         self.query_json(WINDOW, &[&since_ms, &until_ms])
     }
