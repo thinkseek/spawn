@@ -15,7 +15,8 @@
 # only the FAILED lines (integrate/host.rs check_tests_failures).
 #
 # A run whose tests all pass leaves nothing behind (objectives 54 and 55,
-# whose scenarios this folds):
+# whose scenarios this folds). The tests are built first, outside what is
+# judged (below), so the toolchain's own writes are not counted:
 # - nothing in its TMPDIR, whatever the name: the run has a fresh TMPDIR of
 #   its own, and every entry left in it is named;
 # - no schema in its test database but the server's own (public,
@@ -85,6 +86,16 @@ in_public() {
 }
 schemas >"$work/schemas"
 in_public >"$work/public"
+# The build first, with the given TMPDIR, not the judged one: the compiler
+# cache the host's cargo may run as its rustc wrapper (kache) writes a
+# warning marker into TMPDIR when it compiles
+# (kache-cow-warn-<hash>.hardlink-exdev), so a run that compiled would leave
+# it and a run that did not would leave nothing (054.sh's base disagreed with
+# itself on this, owner request 131083). Only the tests' own run is judged.
+if ! cargo test --quiet --workspace --no-run >"$log" 2>&1; then
+    grep -E '^error' -A5 "$log" | head -n 40
+    exit 1
+fi
 if ! SPAWN_TEST_DATABASE_URL="$server_url/$db${pg_url_query:+?$pg_url_query}" TMPDIR="$scratch" \
     cargo test --quiet --workspace >"$log" 2>&1; then
     awk '
