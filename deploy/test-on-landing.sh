@@ -54,6 +54,42 @@ db=spawn_on_landing_test_$$
 live_url=${test_url%/*}/$db
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/spawn-on-landing-test.XXXXXX")
+# Never the real home (sync/cc-rules.md, after 2026-11-12): every tick, the
+# binary and git run with HOME a directory of the scratch, and the test
+# refuses (exit 2, nothing run) when that is empty, does not resolve, lies
+# outside the scratch, or is, holds or lies in the real home.
+real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+fake_home=$scratch/home
+mkdir -p "$fake_home"
+guard_home() {
+  local gh_scratch gh_real gh_home
+  [ -n "$scratch" ] && [ -n "$real_home" ] && [ -n "${HOME-}" ] || {
+    echo "test-on-landing: refused: an empty home or scratch variable; nothing ran" >&2
+    exit 2
+  }
+  gh_scratch=$(readlink -f -- "$scratch") && gh_real=$(readlink -f -- "$real_home") &&
+    gh_home=$(readlink -f -- "$HOME") || {
+    echo "test-on-landing: refused: a home that does not resolve; nothing ran" >&2
+    exit 2
+  }
+  case $gh_home/ in "$gh_scratch"/*) ;; *)
+    echo "test-on-landing: refused: HOME $gh_home is not inside the scratch $gh_scratch; nothing ran" >&2
+    exit 2
+    ;;
+  esac
+  case $gh_home/ in "$gh_real"/*)
+    echo "test-on-landing: refused: HOME $gh_home is in the real home; nothing ran" >&2
+    exit 2
+    ;;
+  esac
+  case $gh_real/ in "$gh_home"/*)
+    echo "test-on-landing: refused: HOME $gh_home holds the real home; nothing ran" >&2
+    exit 2
+    ;;
+  esac
+}
+export HOME=$fake_home
+guard_home
 cleanup() {
   with_db "$test_url" psql -XAtq -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1 || true
   rm -rf "$scratch"
@@ -123,6 +159,7 @@ export FAKE_LOG=$scratch/deploys.log
 : >"$FAKE_LOG"
 # tick [ENV=VALUE...]: one tick, as the timer runs it; output in $out.
 tick() {
+  guard_home
   out=$scratch/tick.out
   set +e
   env SPAWN_LIVE="$live" "$@" bash "$repo/deploy/on-landing.sh" >"$out" 2>&1
@@ -288,6 +325,27 @@ check "deploy.sh did not run" [ "$(deploys)" -eq "$before" ]
 check "recorded: by the landing, with the reason" \
   bash -c 'finished_last=$1; [ "$finished_last" = "false landing $2 pnpm is not on PATH: the UI'"'"'s dependencies for $2 cannot be installed" ]' _ "$(finished | tail -n 1)" "$c6"
 check "and holds nothing" [ "$(holds)" = null ]
+
+echo "== a checkout path that is no clone stops the tick; nothing is removed"
+c7=$(commit_work "a main whose checkout path is taken")
+land "$c7"
+sleep 1.2
+mv "$live/deploy-checkout" "$scratch/checkout-aside"
+mkdir "$live/deploy-checkout"
+echo mine >"$live/deploy-checkout/owners-file"
+before=$(deploys)
+tick SPAWN_DEPLOY_QUIET_SECS=1 SPAWN_DEPLOY_MAX_WAIT_SECS=1
+check "failed (status $status)" [ "$status" -ne 0 ]
+check "the path and what is in it are untouched" [ "$(cat "$live/deploy-checkout/owners-file")" = mine ]
+check "deploy.sh did not run" [ "$(deploys)" -eq "$before" ]
+check "recorded, with the reason" \
+  grep -qF "false landing $c7 $live/deploy-checkout is there but is no clone" <<<"$(finished | tail -n 1)"
+
+echo "== the home guard"
+guard_status=0
+(HOME=$real_home; guard_home) 2>"$scratch/guard.err" || guard_status=$?
+check "the real home is refused (status $guard_status)" \
+  bash -c '[ "$1" -eq 2 ] && grep -q "is not inside the scratch" "$2"' _ "$guard_status" "$scratch/guard.err"
 
 echo
 if [ "$failures" -eq 0 ]; then
