@@ -1807,7 +1807,20 @@ times in a row)",
         }
         self.supervisor_due_ms = now.saturating_add(self.settings.check_ms);
         match crate::serve::attention::supervisor_dispatch(store) {
-            Ok(value) => self.supervisor = Some(Dispatch::from_value(&value)),
+            Ok(value) => {
+                // An order no task can meet is said once in this process,
+                // by the first read of the plan: this one, at times.
+                lines.extend(
+                    value["lines"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .filter(|line| !line.starts_with("dispatch: stalls:"))
+                        .map(str::to_string),
+                );
+                self.supervisor = Some(Dispatch::from_value(&value));
+            }
             Err(error) => {
                 self.supervisor = None;
                 lines.push(format!("alerts: the supervisor's dispatch: {error}"));
