@@ -53,6 +53,7 @@ mod scorecard;
 mod serve;
 mod set_aside;
 mod sources;
+mod storage;
 mod supervise;
 
 // Re-exported at the crate root, where the command modules import them.
