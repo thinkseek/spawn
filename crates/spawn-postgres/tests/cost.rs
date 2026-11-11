@@ -394,10 +394,18 @@ fn a_window_says_what_a_landing_cost_for_the_fleet_and_each_mission() {
     // landing), then assigned again and accepted again (still one landing).
     let (a, t1, w1) = one_task(&store);
     started(&store, &w1, 1);
-    usage(&store, &w1, 1, ("msg_1", "model-x", since + 1), [100_000, 0, 0, 0]);
+    usage(
+        &store,
+        &w1,
+        1,
+        ("msg_1", "model-x", since + 1),
+        [100_000, 0, 0, 0],
+    );
     store.task_delivered(t1, 1).expect("delivered");
     assert!(store.task_reported(t1, "done").expect("reported"));
-    store.task_review(t1, false, "again", None).expect("sent back");
+    store
+        .task_review(t1, false, "again", None)
+        .expect("sent back");
     store.task_delivered(t1, 2).expect("delivered again");
     assert!(store.task_reported(t1, "done again").expect("reported"));
     store.task_review(t1, true, "ok", None).expect("accepted");
@@ -409,7 +417,11 @@ fn a_window_says_what_a_landing_cost_for_the_fleet_and_each_mission() {
                 "agent_id": w1.agent, "session_id": w1.session, "brief": "brief",
                 "created_by": "human", "model": "default"}),
     );
-    control(&mut client, now, &json!({"type": "task.reviewed", "id": t1, "accepted": true}));
+    control(
+        &mut client,
+        now,
+        &json!({"type": "task.reviewed", "id": t1, "accepted": true}),
+    );
     // t2 of mission A landed just before the window: not counted.
     let t2 = store
         .task_assign(a, "ephemeral", "w2", "brief", "default")
@@ -428,7 +440,13 @@ fn a_window_says_what_a_landing_cost_for_the_fleet_and_each_mission() {
         session: format!("session_worker_w3_{t3}"),
     };
     started(&store, &w3, 3);
-    usage(&store, &w3, 3, ("msg_3", "model-x", since + 1), [20_000, 0, 0, 0]);
+    usage(
+        &store,
+        &w3,
+        3,
+        ("msg_3", "model-x", since + 1),
+        [20_000, 0, 0, 0],
+    );
     store.task_cancel(t3).expect("cancel");
 
     // Mission B, gated: an accepting review is not a landing (its gate
@@ -447,7 +465,13 @@ fn a_window_says_what_a_landing_cost_for_the_fleet_and_each_mission() {
         session: format!("session_worker_w4_{t4}"),
     };
     started(&store, &w4, 4);
-    usage(&store, &w4, 4, ("msg_4", "model-x", since + 1), [50_000, 0, 0, 0]);
+    usage(
+        &store,
+        &w4,
+        4,
+        ("msg_4", "model-x", since + 1),
+        [50_000, 0, 0, 0],
+    );
     store.task_delivered(t4, 4).expect("delivered");
     assert!(store.task_reported(t4, "done").expect("reported"));
     store.task_review(t4, true, "ok", None).expect("accepted");
@@ -456,11 +480,23 @@ fn a_window_says_what_a_landing_cost_for_the_fleet_and_each_mission() {
     let until = store.database_now_ms().expect("now") + 1000;
     let window = store.cost_window(since, until).expect("window");
     near(&window["total"]["usd"], 0.51, "the window's dollars");
-    assert_eq!(window["landed"], json!(1), "t1 once, not t2 nor t4: {window}");
-    near(&window["usd_per_landing"], 0.51, "the window's dollars per landing");
+    assert_eq!(
+        window["landed"],
+        json!(1),
+        "t1 once, not t2 nor t4: {window}"
+    );
+    near(
+        &window["usd_per_landing"],
+        0.51,
+        "the window's dollars per landing",
+    );
     let by_a = entry(&window, "missions", "mission", &json!(a));
     assert_eq!(by_a["landed"], json!(1), "{by_a}");
-    near(&by_a["usd_per_landing"], 0.36, "mission A: t1 and the cancelled t3");
+    near(
+        &by_a["usd_per_landing"],
+        0.36,
+        "mission A: t1 and the cancelled t3",
+    );
     let by_b = entry(&window, "missions", "mission", &json!(b));
     assert_eq!(by_b["landed"], json!(0), "{by_b}");
     assert_eq!(by_b["usd_per_landing"], Value::Null, "{by_b}");
@@ -468,7 +504,11 @@ fn a_window_says_what_a_landing_cost_for_the_fleet_and_each_mission() {
     // Just before the window: t2 landed, nothing spent. After it, nothing
     // landed: null, not a figure.
     let before = store.cost_window(since - 10, since).expect("window");
-    assert_eq!(before["landed"], json!(1), "t2's landing, just before: {before}");
+    assert_eq!(
+        before["landed"],
+        json!(1),
+        "t2's landing, just before: {before}"
+    );
     near(&before["usd_per_landing"], 0.0, "no dollars in it over t2");
     let empty = store.cost_window(until, until + 1000).expect("window");
     assert_eq!(empty["landed"], json!(0));
