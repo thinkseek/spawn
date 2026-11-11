@@ -69,6 +69,10 @@
 # So landings wait at most a minute after such a kill, and the bound is the
 # last resort.
 #
+# It removes nothing: it empties its own said-file, and a checkout path
+# that is no clone stops the tick (recorded as a failure) for the owner to
+# move away.
+#
 # The binary and the database are the live ones ($SPAWN_LIVE, default
 # ~/.local/share/spawn-rsi: bin/spawn and spawn.env); the URL never reaches a
 # command line.
@@ -150,7 +154,7 @@ tick() {
     released=$(spawn_live mission release --source "$missions") ||
       die "could not release the hold a killed deploy-on-landing left (above)"
     say "released hold $(printf '%s' "$released" | jq -r '.released') ($hold_reason): its tick or deploy was killed before it could"
-    rm -f "$said_file"
+    : >"$said_file"
     read=$(spawn_live mission landing --source "$missions" ${deployed:+--deployed "$deployed"}) ||
       die "could not read main's landing from the store (above)"
     main=$(printf '%s' "$read" | jq -er '.main') || die "the store's answer names no main"
@@ -211,11 +215,14 @@ tick() {
   fi
 
   say "deploying main $main (landed by $(printf '%s' "$read" | jq -r '.landing.record'), event $(printf '%s' "$read" | jq -r '.landing.event'); live is ${deployed:-unknown}$nightly_note)"
-  rm -f "$said_file"
+  : >"$said_file"
   # The checkout: a clone of the missions repo, at main, nothing in it but
   # the commit (deploy.sh refuses a tree with changes and exports HEAD).
+  # Made once; this script removes nothing (sync/cc-rules.md): a path there
+  # that is no clone is the owner's to look at.
   if [ ! -d "$checkout/.git" ]; then
-    rm -rf "$checkout"
+    [ ! -e "$checkout" ] && [ ! -L "$checkout" ] ||
+      failed "$main" "$checkout is there but is no clone of $missions: move it away by hand, and the next tick makes the clone"
     git clone -q --no-checkout "$missions" "$checkout" ||
       failed "$main" "could not clone $missions into $checkout"
   fi
