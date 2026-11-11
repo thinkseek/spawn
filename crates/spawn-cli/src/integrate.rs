@@ -3933,6 +3933,11 @@ impl Judge {
         // (gate.sh), named on the record so a gate that judged without them
         // says so.
         let quarantined: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        // `passed` and `reused`: the regressions that passed in the gate (run
+        // on the candidate, or taken from the base's cache as solved), which
+        // clear a validator alert (crate::alerts, `validator_defect`).
+        let passed: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let reused: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
         // A gate on a main that is red (design-main-red.md) runs only as a
         // probe ([`Integrator::red_holds`]): its record says so.
         let probe = mission.red.as_ref().is_some_and(|red| red.main == main);
@@ -4052,6 +4057,12 @@ impl Judge {
             }
             if !quarantined.borrow().is_empty() {
                 record_value["quarantined"] = json!(*quarantined.borrow());
+            }
+            if !passed.borrow().is_empty() {
+                record_value["passed"] = json!(*passed.borrow());
+            }
+            if !reused.borrow().is_empty() {
+                record_value["reused"] = json!(*reused.borrow());
             }
             if !red_scenarios.borrow().is_empty() {
                 record_value["main_red_scenarios"] = json!(*red_scenarios.borrow());
@@ -4262,6 +4273,8 @@ impl Judge {
             flakes.replace(verdict.flakes.clone());
             red_scenarios.replace(verdict.main_red_scenarios.clone());
             quarantined.replace(verdict.quarantined.clone());
+            passed.replace(verdict.passed.clone());
+            reused.replace(verdict.reused.clone());
         }
         // The red check passed on this base before the candidate ran: main
         // of the source is green on it again, whatever the gate ended with
@@ -16001,6 +16014,50 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Objective 056 (a): a verdict's `passed` and `reused` (the regressions
+    /// that passed in the gate, run or taken from the base's cache) reach
+    /// the records written from it: an owner landing's `source.moved` and a
+    /// task's `task.gated`, accepted or rejected; a verdict without them
+    /// leaves both keys off.
+    #[test]
+    fn a_verdicts_passed_and_reused_reach_both_records() {
+        let gate = "if [ \"${SPAWN_GATE_OWNER_CANDIDATE-}\" = 1 ]; then\n\
+             printf '%s\\n' '{\"v\":1,\"verdict\":\"accepted\",\"validator_defects\":[\"028.sh\"],\"passed\":[\"001.sh\",\"check-web.sh\",\"../x.sh\"],\"reused\":[\"002.sh\"]}' >\"$SPAWN_GATE_VERDICT\"\n\
+             exit 0\nfi\n\
+             printf '%s\\n' '{\"v\":1,\"verdict\":\"rejected\",\"reason\":\"r\",\"passed\":[\"003.sh\"],\"reused\":[\"004.sh\",\"005.sh\"]}' >\"$SPAWN_GATE_VERDICT\"\n";
+        let (base, source, scenarios, integrator) = world("gate-passed-reused", gate);
+        let db = Db::new("gate_passed_reused");
+        let mission = db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("E.md", "e\n")],
+            "owner: e",
+        );
+        gated_request(&db, &source, &commit, "e");
+        integrator.pass_on(&db.store).expect("the owner's judging");
+        integrator.settle();
+        let moved = control_records(&db, "source.moved");
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(
+            moved[0]["passed"],
+            json!(["001.sh", "check-web.sh"]),
+            "{}",
+            moved[0]
+        );
+        assert_eq!(moved[0]["reused"], json!(["002.sh"]), "{}", moved[0]);
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        push_work(&base, &source, &agent, "work.txt");
+        integrator.pass_on(&db.store).expect("the task's judging");
+        integrator.settle();
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["verdict"], "rejected", "{record}");
+        assert_eq!(record["passed"], json!(["003.sh"]), "{record}");
+        assert_eq!(record["reused"], json!(["004.sh", "005.sh"]), "{record}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A gate verdict without `main_red_scenarios` (every gate before it)
     /// leaves the record without the key.
     #[test]
@@ -16020,6 +16077,10 @@ mod database_tests {
         integrator.settle();
         let (record, _, _) = last_verdict(&db);
         assert!(record.get("main_red_scenarios").is_none(), "{record}");
+        assert!(
+            record.get("passed").is_none() && record.get("reused").is_none(),
+            "{record}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

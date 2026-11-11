@@ -62,21 +62,26 @@
 //!   gating of the mission that does not name it (an accepted gate judged
 //!   every scenario on the base; a rejection may come before the base, so
 //!   it clears nothing).
-//! - `validator_defect`, `mission #<id>`, key
-//!   `validator_defect:<mission>:<scenario>:<event>`: a validator (a
-//!   regression) that fails on the base too, run again in the gate
-//!   (scripts/rsi/gate.sh, "Three classes of a failing regression"), in
-//!   either of two records, each its own alert (evidence `owner`):
-//!   - a task's `task.gated` `host_fault` with evidence `validator_defect`:
-//!     no candidate that fails it gets a verdict. Clears at the mission's
-//!     next `accepted` or `rejected` gating, or once a gate names it
-//!     `quarantined`;
+//! - `validator_defect`: a validator (a regression) that fails on the base
+//!   too, run again in the gate (scripts/rsi/gate.sh, "Three classes of a
+//!   failing regression"), in either of two records, each its own alert
+//!   (evidence `owner`, and `missions`, the missions it is about):
+//!   - a task's `task.gated` `host_fault` with evidence `validator_defect`,
+//!     `mission #<id>`, key `validator_defect:<mission>:<scenario>:<event>`:
+//!     no candidate that fails it gets a verdict. Also clears at the
+//!     mission's next `accepted` or `rejected` gating;
 //!   - an owner's accepted landing (`source.moved` with
-//!     `validator_defects`), for each mission it names: nothing checks the
-//!     scenario until it is fixed or quarantined. Clears only once a gate of
-//!     the mission names it `quarantined`, the owner's decision: a later
-//!     gate that does not name it may have read it unsolved on the base
-//!     rather than passed (review-fix-gate.md F1).
+//!     `validator_defects`), `<source> (mission #<id>, ...)`, key
+//!     `validator_defect:<source>:<scenario>:<event>`: one per source and
+//!     scenario, about the moved missions that are not closed (none: no
+//!     alert), naming `source` and `missions` (objective 056).
+//!
+//!   Either clears from the record (`cleared_evidence` `cause` and
+//!   `event_id`): `passed`, a later gating of a mission it names (or a
+//!   landing of its source) lists the scenario in `passed` or `reused`;
+//!   `gone`, a later gating of a mission it names carries `scenario_names`
+//!   without it; `closed`, every mission it names is closed; `quarantined`,
+//!   a gate names it so.
 //! - `task_undelivered`, `task #<id>`, key
 //!   `task_undelivered:<task>:<its task.assigned event>`: in `assigned`
 //!   longer than `SPAWN_ALERT_UNDELIVERED_SECS` (default 300) while its
@@ -457,6 +462,28 @@ struct Mission {
     aborts: i64,
     escalated: bool,
     accept: Option<String>,
+    /// Its latest `mission.closed` record's event.
+    closed_event: Option<i64>,
+}
+
+impl Mission {
+    /// Closed: `done`, `cancelled` or any state but `open` and `active`.
+    fn closed(&self) -> bool {
+        !matches!(self.state.as_str(), "open" | "active")
+    }
+}
+
+/// An open (or pending) `validator_defect` alert: a task's (one mission) or
+/// an owner landing's (one source, the open missions it moved).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Defect {
+    key: String,
+    owner: bool,
+    /// The owner landing's source; none for a task's, or an owner's alert
+    /// fired before alerts were per source.
+    source: Option<String>,
+    scenario: String,
+    missions: Vec<i64>,
 }
 
 /// An `admission.waiting` with no `admission.admitted` after it yet.
@@ -511,9 +538,8 @@ pub(crate) struct Monitor {
     auth: HashMap<String, String>,
     /// The open (or pending) `scenario_red` key, by mission and scenario.
     red: HashMap<(i64, String), String>,
-    /// The open (or pending) `validator_defect` key, by mission, scenario
-    /// and whether an owner's landing was accepted without it (`owner`).
-    defects: HashMap<(i64, String, bool), String>,
+    /// The open (or pending) `validator_defect` alerts.
+    defects: Vec<Defect>,
     /// The newest dump and bundle records.
     backups: BTreeMap<&'static str, Backup>,
     commands_after: i64,
@@ -570,7 +596,7 @@ impl Monitor {
             judge_down: HashMap::new(),
             auth: HashMap::new(),
             red: HashMap::new(),
-            defects: HashMap::new(),
+            defects: Vec::new(),
             backups: BTreeMap::new(),
             commands_after: 0,
             logs,
@@ -685,6 +711,7 @@ impl Monitor {
                     aborts: mission["gate_aborts"].as_i64().unwrap_or_default(),
                     escalated: mission["gate_room_escalated"].as_bool().unwrap_or(false),
                     accept: mission["accept"].as_str().map(str::to_string),
+                    closed_event: mission["closed_event"].as_i64(),
                 },
             );
         }
@@ -728,6 +755,10 @@ impl Monitor {
             self.flush(store, now, &fed, lines);
         }
         let mut events = Vec::new();
+        // An alert read back whose missions all closed while the loop was
+        // down, or before it fired (an owner alert of before objective 056,
+        // one per mission), names no open mission: it clears now.
+        self.closed_defects(None, now, &mut events);
         let observations = store
             .alert_observations()
             .map_err(|error| error.to_string())?;
@@ -794,73 +825,150 @@ impl Monitor {
         }
     }
 
-    /// The open `validator_defect` alerts the store holds, by mission,
-    /// scenario and origin.
+    /// The open `validator_defect` alerts the store holds: a task's names
+    /// its `mission`; an owner's its `source` and `missions` (one before
+    /// objective 056 its `mission` alone, and no source).
     fn seed_defects(&mut self) {
         for (key, row) in &self.known {
-            if row.open() && row.kind == "validator_defect" {
-                let mission = row.evidence["mission"].as_i64();
-                let scenario = row.evidence["scenario"].as_str();
-                let owner = row.evidence["owner"].as_bool().unwrap_or(false);
-                if let (Some(mission), Some(scenario)) = (mission, scenario) {
-                    self.defects
-                        .insert((mission, scenario.to_string(), owner), key.clone());
-                }
+            if !row.open() || row.kind != "validator_defect" {
+                continue;
+            }
+            let Some(scenario) = row.evidence["scenario"].as_str() else {
+                continue;
+            };
+            let missions: Vec<i64> = match row.evidence["missions"].as_array() {
+                Some(list) => list.iter().filter_map(Value::as_i64).collect(),
+                None => row.evidence["mission"].as_i64().into_iter().collect(),
+            };
+            self.defects.push(Defect {
+                key: key.clone(),
+                owner: row.evidence["owner"].as_bool().unwrap_or(false),
+                source: row.evidence["source"].as_str().map(str::to_string),
+                scenario: scenario.to_string(),
+                missions,
+            });
+        }
+        self.defects.sort_by(|left, right| left.key.cmp(&right.key));
+    }
+
+    /// Take the open defects `clears` decides, each with the evidence of its
+    /// clearing.
+    fn clear_defects(
+        &mut self,
+        out: &mut Vec<Event>,
+        mut clears: impl FnMut(&Defect) -> Option<Value>,
+    ) {
+        let mut kept = Vec::with_capacity(self.defects.len());
+        for defect in std::mem::take(&mut self.defects) {
+            match clears(&defect) {
+                Some(evidence) => out.push(Event::Clear {
+                    key: defect.key,
+                    evidence,
+                }),
+                None => kept.push(defect),
             }
         }
+        self.defects = kept;
     }
 
     /// `validator_defect` from an owner's accepted landing that the gate
     /// judged without a validator failing on the base too (its
-    /// `validator_defects`): one per mission the move names and scenario,
-    /// cleared only once a gate of the mission names it `quarantined` (the
-    /// owner's decision). Nothing else clears it: a later gate that does not
-    /// name it may have judged the scenario unsolved on the base, not
-    /// passed (review-fix-gate.md F1). A `quarantined` the move names clears
-    /// the missions' alerts for it.
+    /// `validator_defects`): one per source and scenario, naming the
+    /// missions the move names that are not closed (none open: none fires;
+    /// one already open for the source and scenario: nothing new). The
+    /// move clears its source's alerts for a scenario it lists in `passed`
+    /// or `reused`, and the moved missions' for one it names `quarantined`.
     fn owner_landing(&mut self, event_id: i64, record: &Value, out: &mut Vec<Event>) {
-        let missions: Vec<i64> = record["missions"]
+        let moved: Vec<i64> = record["missions"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(Value::as_i64)
             .collect();
-        let request = record["request"].as_i64();
-        for mission in &missions {
-            self.quarantine_clears(*mission, record, event_id, out);
-            for scenario in names(&record["validator_defects"]) {
-                let at = (*mission, scenario.clone(), true);
-                if self.defects.contains_key(&at) {
-                    continue;
-                }
-                let key = format!("validator_defect:{mission}:{scenario}:{event_id}");
-                self.defects.insert(at, key.clone());
-                out.push(Event::Fire {
-                    key,
-                    kind: "validator_defect",
-                    subject: format!("mission #{mission}"),
-                    evidence: json!({
-                        "mission": mission, "scenario": scenario, "owner": true,
-                        "request": request, "event_id": event_id, "to": record["to"],
-                    }),
-                    text: format!(
-                        "mission #{mission}: the owner's landing (request #{}) was accepted \
-                         without {scenario}, which failed on main too: until it is repaired, \
-                         nothing checks what it checks. Today only a gate naming it \
-                         `quarantined` clears this alert: the gate's verdict cannot yet tell a \
-                         repaired validator from one it skipped",
-                        request.unwrap_or_default()
-                    ),
-                    notice: false,
-                });
+        let source = record["source"].as_str().map(str::to_string);
+        let passed = passed_names(record);
+        let quarantined = names(&record["quarantined"]);
+        self.clear_defects(out, |defect| {
+            if defect.source.is_some()
+                && defect.source == source
+                && passed.contains(&defect.scenario)
+            {
+                return Some(json!({"cause": "passed", "event_id": event_id,
+                                   "record": "source.moved", "scenario": defect.scenario}));
             }
+            (quarantined.contains(&defect.scenario)
+                && defect
+                    .missions
+                    .iter()
+                    .any(|mission| moved.contains(mission)))
+            .then(|| {
+                json!({"cause": "quarantined", "event_id": event_id,
+                       "record": "source.moved", "quarantined": defect.scenario})
+            })
+        });
+        let Some(source) = source else {
+            return;
+        };
+        let mut missions: Vec<i64> = moved
+            .iter()
+            .copied()
+            .filter(|mission| !self.missions.get(mission).is_some_and(Mission::closed))
+            .collect();
+        missions.sort_unstable();
+        missions.dedup();
+        if missions.is_empty() {
+            return;
+        }
+        let request = record["request"].as_i64();
+        let named = missions
+            .iter()
+            .map(|mission| format!("mission #{mission}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for scenario in names(&record["validator_defects"]) {
+            if self.defects.iter().any(|defect| {
+                defect.owner
+                    && defect.source.as_deref() == Some(source.as_str())
+                    && defect.scenario == scenario
+            }) {
+                continue;
+            }
+            let key = format!("validator_defect:{source}:{scenario}:{event_id}");
+            self.defects.push(Defect {
+                key: key.clone(),
+                owner: true,
+                source: Some(source.clone()),
+                scenario: scenario.clone(),
+                missions: missions.clone(),
+            });
+            out.push(Event::Fire {
+                key,
+                kind: "validator_defect",
+                subject: format!("{source} ({named})"),
+                evidence: json!({
+                    "source": source, "scenario": scenario, "owner": true,
+                    "missions": missions, "request": request, "event_id": event_id,
+                    "to": record["to"],
+                }),
+                text: format!(
+                    "{named}: the owner's landing (request #{}) on {source} was accepted \
+                     without {scenario}, which failed on main too: until it passes again, \
+                     nothing checks what it checks. It clears once a gate passes it, it \
+                     leaves the gate directory, or these missions are closed",
+                    request.unwrap_or_default()
+                ),
+                notice: false,
+            });
         }
     }
 
     /// `validator_defect` from a task's gate that ended on one (`host_fault`,
-    /// evidence `validator_defect`): one per mission and scenario, cleared
-    /// at the mission's next gate verdict (`accepted` or `rejected`: its
-    /// gates judge again) or once a gate names it `quarantined`.
+    /// evidence `validator_defect`): one per mission and scenario. A gating
+    /// of a mission an open alert names clears it when it names the
+    /// scenario `quarantined`, lists it in `passed` or `reused`, or carries
+    /// `scenario_names` without it (gone: the missions on one source share
+    /// a gate directory); a task's alert also at the mission's next
+    /// `accepted` or `rejected` gating (its gates judge again).
     fn task_defects(
         &mut self,
         event_id: i64,
@@ -869,43 +977,66 @@ impl Monitor {
         record: &Value,
         out: &mut Vec<Event>,
     ) {
-        self.quarantine_clears(mission, record, event_id, out);
-        if matches!(record["verdict"].as_str(), Some("accepted" | "rejected")) {
-            let judged: Vec<(i64, String, bool)> = self
-                .defects
-                .keys()
-                .filter(|(at, _, owner)| *at == mission && !owner)
-                .cloned()
-                .collect();
-            for at in judged {
-                if let Some(key) = self.defects.remove(&at) {
-                    out.push(Event::Clear {
-                        key,
-                        evidence: json!({"event_id": event_id, "record": "task.gated",
-                                         "task": task, "verdict": record["verdict"]}),
-                    });
-                }
+        let quarantined = names(&record["quarantined"]);
+        let passed = passed_names(record);
+        let present = record["scenario_names"]
+            .as_array()
+            .map(|_| names(&record["scenario_names"]));
+        let judged = matches!(record["verdict"].as_str(), Some("accepted" | "rejected"));
+        self.clear_defects(out, |defect| {
+            if !defect.missions.contains(&mission) {
+                return None;
             }
-        }
+            let base = json!({"event_id": event_id, "record": "task.gated", "task": task});
+            let with = |cause: &str, extra: Value| {
+                let mut evidence = base.clone();
+                if let (Value::Object(map), Value::Object(more)) = (&mut evidence, extra) {
+                    map.insert("cause".to_string(), json!(cause));
+                    map.extend(more);
+                }
+                evidence
+            };
+            if quarantined.contains(&defect.scenario) {
+                Some(with("quarantined", json!({"quarantined": defect.scenario})))
+            } else if passed.contains(&defect.scenario) {
+                Some(with("passed", json!({"scenario": defect.scenario})))
+            } else if present
+                .as_ref()
+                .is_some_and(|present| !present.contains(&defect.scenario))
+            {
+                Some(with("gone", json!({"scenario": defect.scenario})))
+            } else if judged && !defect.owner {
+                Some(with("judged", json!({"verdict": record["verdict"]})))
+            } else {
+                None
+            }
+        });
         if record["verdict"].as_str() != Some("host_fault")
             || record["evidence"].as_str() != Some("validator_defect")
         {
             return;
         }
         for scenario in names(&record["validator_defects"]) {
-            let at = (mission, scenario.clone(), false);
-            if self.defects.contains_key(&at) {
+            if self.defects.iter().any(|defect| {
+                !defect.owner && defect.scenario == scenario && defect.missions == [mission]
+            }) {
                 continue;
             }
             let key = format!("validator_defect:{mission}:{scenario}:{event_id}");
-            self.defects.insert(at, key.clone());
+            self.defects.push(Defect {
+                key: key.clone(),
+                owner: false,
+                source: None,
+                scenario: scenario.clone(),
+                missions: vec![mission],
+            });
             out.push(Event::Fire {
                 key,
                 kind: "validator_defect",
                 subject: format!("mission #{mission}"),
                 evidence: json!({
-                    "mission": mission, "scenario": scenario, "owner": false,
-                    "task": task, "event_id": event_id,
+                    "mission": mission, "missions": [mission], "scenario": scenario,
+                    "owner": false, "task": task, "event_id": event_id,
                 }),
                 text: format!(
                     "mission #{mission}: {scenario} fails on the base too (task #{task}'s gate): \
@@ -917,26 +1048,61 @@ impl Monitor {
         }
     }
 
-    /// Clear the mission's `validator_defect` alerts, of either origin, for
-    /// each scenario the record names `quarantined`.
-    fn quarantine_clears(
-        &mut self,
-        mission: i64,
-        record: &Value,
-        event_id: i64,
-        out: &mut Vec<Event>,
-    ) {
-        for scenario in names(&record["quarantined"]) {
-            for owner in [false, true] {
-                if let Some(key) = self.defects.remove(&(mission, scenario.clone(), owner)) {
-                    out.push(Event::Clear {
-                        key,
-                        evidence: json!({"event_id": event_id, "record": record["type"],
-                                         "quarantined": scenario}),
-                    });
+    /// Clear each open `validator_defect` whose missions are all closed:
+    /// at a `mission.closed` (`closing`, its event) of one of them, or at
+    /// start (`None`) for those read back, naming the last closing then
+    /// (or, when that is not later than the alert, the start's reading).
+    fn closed_defects(&mut self, closing: Option<(i64, i64)>, now: i64, out: &mut Vec<Event>) {
+        let missions = &self.missions;
+        let all_closed = |defect: &Defect| {
+            !defect.missions.is_empty()
+                && defect
+                    .missions
+                    .iter()
+                    .all(|mission| missions.get(mission).is_some_and(Mission::closed))
+        };
+        let last_closing = |defect: &Defect| {
+            defect
+                .missions
+                .iter()
+                .filter_map(|mission| missions.get(mission).and_then(|row| row.closed_event))
+                .max()
+        };
+        let known = &self.known;
+        let mut clears = Vec::new();
+        let mut kept = Vec::new();
+        for defect in std::mem::take(&mut self.defects) {
+            let evidence = match closing {
+                Some((mission, event_id)) => {
+                    (defect.missions.contains(&mission) && all_closed(&defect)).then(|| {
+                        json!({"cause": "closed", "event_id": event_id,
+                                "record": "mission.closed"})
+                    })
                 }
+                None if all_closed(&defect) => {
+                    let fired = known
+                        .get(&defect.key)
+                        .and_then(|row| row.evidence["event_id"].as_i64());
+                    Some(match (last_closing(&defect), fired) {
+                        (Some(last), Some(fired)) if last > fired => {
+                            json!({"cause": "closed", "event_id": last, "record": "mission.closed"})
+                        }
+                        (last, _) => json!({"cause": "closed", "closed_event_id": last,
+                                            "reading_ms": now}),
+                    })
+                }
+                None => None,
+            };
+            match evidence {
+                Some(evidence) => clears.push(Event::Clear {
+                    key: defect.key,
+                    evidence,
+                }),
+                None => kept.push(defect),
             }
         }
+        self.defects = kept;
+        out.extend(clears);
     }
 
     /// The notices and the halt of one mission's record.
@@ -954,6 +1120,7 @@ impl Monitor {
                 aborts: 0,
                 escalated: false,
                 accept: None,
+                closed_event: None,
             });
         }
         let Some(mission) = self.missions.get_mut(&id) else {
@@ -961,6 +1128,9 @@ impl Monitor {
         };
         let before = snapshot(mission);
         apply_mission(mission, record);
+        if kind == "mission.closed" {
+            mission.closed_event = Some(event_id);
+        }
         let after = snapshot(mission);
         let counters = (mission.rejections, mission.aborts);
         if before != after {
@@ -991,6 +1161,7 @@ impl Monitor {
                     notice: false,
                 });
             }
+            "mission.closed" => self.closed_defects(Some((id, event_id)), 0, out),
             "mission.resumed" => {
                 for key in self.open_keys("mission_halted", &format!("mission #{id}")) {
                     out.push(Event::Clear {
@@ -2621,6 +2792,15 @@ enum Crossing {
 /// over (or under, when `under`), `turn_off` the one it clears at, on the
 /// other side of the margin.
 /// The strings of a record's list, in order.
+/// The scenarios a gate's verdict says passed in it: run on the candidate
+/// and passed (`passed`), or taken from the base's cache as solved
+/// (`reused`).
+fn passed_names(record: &Value) -> Vec<String> {
+    let mut passed = names(&record["passed"]);
+    passed.extend(names(&record["reused"]));
+    passed
+}
+
 fn names(list: &Value) -> Vec<String> {
     list.as_array()
         .into_iter()
@@ -3919,8 +4099,9 @@ mod tests {
     /// `validator_defect` (review-fix-gate.md F1 and N1): a task's gate that
     /// ended on one opens it once per mission and scenario, and the
     /// mission's next verdict clears it; an owner's accepted landing that
-    /// names one opens it for each mission it moves, and only a gate naming
-    /// the scenario `quarantined` clears that one, whatever verdicts come.
+    /// names one opens one for its source, naming the missions it moves,
+    /// which a verdict that says nothing of the scenario leaves open and a
+    /// gate naming it `quarantined` clears (objective 056).
     #[test]
     fn a_validator_defect_is_an_alert_until_judged_again_or_quarantined() {
         let mut monitor = monitor();
@@ -3960,18 +4141,13 @@ mod tests {
             &mut monitor,
             13,
             0,
-            json!({"type": "source.moved", "request": 77, "from": "b", "to": "c",
-                   "missions": [4, 9], "verdict": "accepted",
+            json!({"type": "source.moved", "source": "/s", "request": 77, "from": "b",
+                   "to": "c", "missions": [4, 9], "verdict": "accepted",
                    "validator_defects": ["028.sh"]}),
         );
-        let mut owner: Vec<&str> = fires(&moved);
-        owner.sort_unstable();
         assert_eq!(
-            owner,
-            [
-                "validator_defect:4:028.sh:13",
-                "validator_defect:9:028.sh:13"
-            ],
+            fires(&moved),
+            ["validator_defect:/s:028.sh:13"],
             "{moved:?}"
         );
         commit(&mut monitor, &moved);
@@ -3990,7 +4166,7 @@ mod tests {
             .collect();
         assert_eq!(cleared, ["validator_defect:4:028.sh:11"], "{judged:?}");
         commit(&mut monitor, &judged);
-        assert!(monitor.is_open("validator_defect:4:028.sh:13"));
+        assert!(monitor.is_open("validator_defect:/s:028.sh:13"));
         // A gate of mission 4 that names 028.sh quarantined: the owner chose.
         let quarantined = feed(
             &mut monitor,
@@ -4004,12 +4180,217 @@ mod tests {
             .filter(|event| matches!(event, Event::Clear { .. }))
             .map(Event::key)
             .collect();
-        assert_eq!(cleared, ["validator_defect:4:028.sh:13"], "{quarantined:?}");
-        commit(&mut monitor, &quarantined);
-        assert!(
-            monitor.is_open("validator_defect:9:028.sh:13"),
-            "mission 9's stays"
+        assert_eq!(
+            cleared,
+            ["validator_defect:/s:028.sh:13"],
+            "{quarantined:?}"
         );
+        let Some(Event::Clear { evidence, .. }) = quarantined
+            .iter()
+            .find(|event| matches!(event, Event::Clear { .. }))
+        else {
+            panic!("a clear");
+        };
+        assert_eq!(evidence["cause"], "quarantined");
+        assert_eq!(evidence["event_id"], 15);
+    }
+
+    /// The clearings of `validator_defect` (objective 056) and the evidence
+    /// each names.
+    fn clears_of(events: &[Event]) -> Vec<(String, Value, Value)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Clear { key, evidence } => Some((
+                    key.clone(),
+                    evidence["cause"].clone(),
+                    evidence["event_id"].clone(),
+                )),
+                Event::Fire { .. } => None,
+            })
+            .collect()
+    }
+
+    /// A monitor that knows missions 1 and 2 (open) and 3 (closed), and a
+    /// task of each of 1 and 2 (tasks 1 and 2).
+    fn three_missions() -> Monitor {
+        let mut monitor = monitor();
+        for id in 1..=3 {
+            feed(
+                &mut monitor,
+                id,
+                0,
+                json!({"type": "mission.added", "id": id, "text": "m"}),
+            );
+        }
+        feed(
+            &mut monitor,
+            4,
+            0,
+            json!({"type": "mission.closed", "id": 3, "state": "done"}),
+        );
+        for id in 1..=2 {
+            feed(
+                &mut monitor,
+                4 + id,
+                0,
+                json!({"type": "task.assigned", "id": id, "mission_id": id, "agent_id": "a"}),
+            );
+        }
+        monitor
+    }
+
+    fn landing(missions: &[i64], defects: &[&str]) -> Value {
+        json!({"type": "source.moved", "source": "/s", "request": 9, "from": "b", "to": "c",
+               "missions": missions, "verdict": "accepted", "validator_defects": defects})
+    }
+
+    /// Objective 056 (b): an owner landing's defect is one alert per source
+    /// and scenario, naming the moved missions that are open; none when
+    /// none is; a second landing of the same source and scenario fires
+    /// nothing new.
+    #[test]
+    fn an_owner_landings_defect_is_one_alert_per_source_about_open_missions() {
+        let mut monitor = three_missions();
+        let moved = feed(&mut monitor, 10, 0, landing(&[1, 2, 3], &["v1.sh"]));
+        let fired: Vec<(&str, &str, &Value, String)> = moved
+            .iter()
+            .filter_map(|event| match event {
+                Event::Fire {
+                    key,
+                    subject,
+                    evidence,
+                    text,
+                    ..
+                } => Some((key.as_str(), subject.as_str(), evidence, text.clone())),
+                Event::Clear { .. } => None,
+            })
+            .collect();
+        assert_eq!(fired.len(), 1, "{moved:?}");
+        let (key, subject, evidence, text) = &fired[0];
+        assert_eq!(*key, "validator_defect:/s:v1.sh:10");
+        assert_eq!(*subject, "/s (mission #1, mission #2)");
+        assert_eq!(evidence["missions"], json!([1, 2]));
+        assert_eq!(evidence["source"], "/s");
+        assert_eq!(evidence["owner"], true);
+        assert_eq!(evidence["request"], 9);
+        assert!(
+            text.contains("mission #1, mission #2") && !text.contains("#3"),
+            "{text}"
+        );
+        commit(&mut monitor, &moved);
+        let again = feed(&mut monitor, 11, 0, landing(&[2], &["v1.sh"]));
+        assert!(fires(&again).is_empty(), "{again:?}");
+        let closed_only = feed(&mut monitor, 12, 0, landing(&[3], &["v0.sh"]));
+        assert!(fires(&closed_only).is_empty(), "{closed_only:?}");
+        // A task's defect stays one per mission.
+        let task = feed(
+            &mut monitor,
+            13,
+            0,
+            json!({"type": "task.gated", "id": 1, "verdict": "host_fault",
+                   "evidence": "validator_defect", "validator_defects": ["v1.sh"]}),
+        );
+        assert_eq!(fires(&task), ["validator_defect:1:v1.sh:13"]);
+    }
+
+    /// Objective 056 (c): a gating of a mission it names clears it when the
+    /// scenario passed (`passed`, `reused`) or left the gate directory
+    /// (`scenario_names` without it); one that holds it and passed nothing
+    /// of it leaves it; a later landing of the source that passed it clears
+    /// it; closing every mission it names clears it, one of two does not.
+    #[test]
+    fn a_validator_defect_clears_once_passed_gone_or_its_missions_closed() {
+        let mut monitor = three_missions();
+        let moved = feed(
+            &mut monitor,
+            10,
+            0,
+            landing(&[1, 2], &["v2.sh", "v3.sh", "v4.sh"]),
+        );
+        commit(&mut monitor, &moved);
+        let gated = feed(
+            &mut monitor,
+            11,
+            0,
+            json!({"type": "task.gated", "id": 1, "verdict": "rejected",
+                   "scenario_names": ["o.sh", "v2.sh", "v3.sh", "v4.sh"],
+                   "passed": ["o.sh", "v2.sh"], "reused": ["v3.sh"]}),
+        );
+        let mut cleared = clears_of(&gated);
+        cleared.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            cleared,
+            [
+                (
+                    "validator_defect:/s:v2.sh:10".to_string(),
+                    json!("passed"),
+                    json!(11)
+                ),
+                (
+                    "validator_defect:/s:v3.sh:10".to_string(),
+                    json!("passed"),
+                    json!(11)
+                ),
+            ]
+        );
+        commit(&mut monitor, &gated);
+        let gone = feed(
+            &mut monitor,
+            12,
+            0,
+            json!({"type": "task.gated", "id": 2, "verdict": "rejected",
+                   "scenario_names": ["o.sh", "v2.sh"]}),
+        );
+        assert_eq!(
+            clears_of(&gone),
+            [(
+                "validator_defect:/s:v4.sh:10".to_string(),
+                json!("gone"),
+                json!(12)
+            )]
+        );
+        commit(&mut monitor, &gone);
+
+        // Passed in a later landing of the source.
+        let moved = feed(&mut monitor, 13, 0, landing(&[1, 2], &["v5.sh", "v6.sh"]));
+        commit(&mut monitor, &moved);
+        let mut passed = landing(&[1], &[]);
+        passed["passed"] = json!(["v6.sh"]);
+        let relanded = feed(&mut monitor, 14, 0, passed);
+        assert_eq!(
+            clears_of(&relanded),
+            [(
+                "validator_defect:/s:v6.sh:13".to_string(),
+                json!("passed"),
+                json!(14)
+            )]
+        );
+        commit(&mut monitor, &relanded);
+        // Closed: one of two leaves it, both clear it.
+        let one = feed(
+            &mut monitor,
+            15,
+            0,
+            json!({"type": "mission.closed", "id": 1, "state": "done"}),
+        );
+        assert!(clears_of(&one).is_empty(), "{one:?}");
+        let both = feed(
+            &mut monitor,
+            16,
+            0,
+            json!({"type": "mission.closed", "id": 2, "state": "done"}),
+        );
+        assert_eq!(
+            clears_of(&both),
+            [(
+                "validator_defect:/s:v5.sh:13".to_string(),
+                json!("closed"),
+                json!(16)
+            )]
+        );
+        commit(&mut monitor, &both);
+        assert!(decided(&monitor, both).is_empty(), "each clears once");
     }
 
     /// A restart that reads an open `scenario_red` back fires nothing again
@@ -4116,6 +4497,86 @@ mod tests {
         assert!(decided(&restarted, out).is_empty(), "each once");
         assert!(restarted.pending.is_empty());
         assert_eq!(restarted.messages_due, None);
+    }
+
+    /// Objective 056 after a restart: an owner alert read back (per source)
+    /// fires nothing again for its source and clears when a gating passes
+    /// it; one of before 056 (per mission, no source) whose mission is
+    /// closed clears at the start, and one whose mission is open clears
+    /// once its scenario leaves the gate directory.
+    #[test]
+    fn a_restart_clears_the_validator_defects_it_reads_back_alike() {
+        let mut restarted = three_missions();
+        for (key, evidence, event) in [
+            (
+                "validator_defect:/s:v1.sh:20",
+                json!({"source": "/s", "missions": [1, 2], "scenario": "v1.sh",
+                       "owner": true, "event_id": 20}),
+                20,
+            ),
+            (
+                "validator_defect:3:v7.sh:8",
+                json!({"mission": 3, "scenario": "v7.sh", "owner": true, "event_id": 8}),
+                8,
+            ),
+            (
+                "validator_defect:2:v8.sh:8",
+                json!({"mission": 2, "scenario": "v8.sh", "owner": true, "event_id": 8}),
+                8,
+            ),
+        ] {
+            restarted.known.insert(
+                key.to_string(),
+                Row {
+                    kind: "validator_defect".to_string(),
+                    subject: "x".to_string(),
+                    state: "open".to_string(),
+                    evidence,
+                    fired_event_id: event,
+                    fired_at_ms: 0,
+                },
+            );
+        }
+        restarted.seed_defects();
+        let mut out = Vec::new();
+        restarted.closed_defects(None, 1_000, &mut out);
+        let at_start = decided(&restarted, out);
+        assert_eq!(
+            at_start.iter().map(Event::key).collect::<Vec<_>>(),
+            ["validator_defect:3:v7.sh:8"],
+            "the closed mission's, at the start"
+        );
+        let Event::Clear { evidence, .. } = &at_start[0] else {
+            panic!("a clear");
+        };
+        assert_eq!(evidence["cause"], "closed");
+        commit(&mut restarted, &at_start);
+        let again = feed(&mut restarted, 30, 0, landing(&[1], &["v1.sh"]));
+        assert!(fires(&again).is_empty(), "{again:?}");
+        let gated = feed(
+            &mut restarted,
+            31,
+            0,
+            json!({"type": "task.gated", "id": 2, "verdict": "rejected",
+                   "scenario_names": ["v1.sh"], "passed": ["v1.sh"]}),
+        );
+        let mut cleared = clears_of(&decided(&restarted, gated));
+        cleared.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            cleared,
+            [
+                (
+                    "validator_defect:/s:v1.sh:20".to_string(),
+                    json!("passed"),
+                    json!(31)
+                ),
+                (
+                    "validator_defect:2:v8.sh:8".to_string(),
+                    json!("gone"),
+                    json!(31)
+                ),
+            ]
+        );
     }
 
     /// A restart that reads open `validator_defect` alerts back (rev-b F1),
