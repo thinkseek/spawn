@@ -195,6 +195,14 @@
 //!   while its fold has such a reported task or this alert is open; the
 //!   first reading behind is kept by the step, so a restarted loop starts
 //!   the bound again (later, never sooner).
+//! - `mission_idle`, `mission #<id>`, key `mission_idle:<mission>:<the
+//!   record that ended its last task>` (objective 058): at a reading, a
+//!   mission not closed that takes its work from an objective backlog
+//!   (`objectives` on its record) has had no task in work since its last
+//!   task ended (landed, accepted or cancelled), for
+//!   `SPAWN_ALERT_MISSION_IDLE_SECS` (default 900; 0 disables it). Never for
+//!   owner work. Clears at the mission's next `task.assigned` or its
+//!   close. A restart reads when the last task ended from the store.
 //! - `cost_budget`, `mission #<id>`, key `cost_budget:<mission>:<the UTC
 //!   day, YYYY-MM-DD>`: at a reading (every `SPAWN_ALERT_CHECK_SECS`), the
 //!   mission's cost of the model calls timed in the current UTC day
@@ -2747,7 +2755,14 @@ times in a row)",
     /// mission's idle time and clears its alert; a record that ends a task
     /// (or follows an ended one) with no task of the mission in work after
     /// it starts it, at that record.
-    fn track_idle(&mut self, event_id: i64, at_ms: i64, kind: &str, mission: i64, out: &mut Vec<Event>) {
+    fn track_idle(
+        &mut self,
+        event_id: i64,
+        at_ms: i64,
+        kind: &str,
+        mission: i64,
+        out: &mut Vec<Event>,
+    ) {
         if kind == "task.assigned" {
             if let Some(entry) = self.missions.get_mut(&mission) {
                 entry.idle = None;
@@ -2757,7 +2772,11 @@ times in a row)",
         }
         let ended = matches!(
             kind,
-            "task.landed" | "task.cancelled" | "task.aborted" | "task.over_budget" | "task.reviewed"
+            "task.landed"
+                | "task.cancelled"
+                | "task.aborted"
+                | "task.over_budget"
+                | "task.reviewed"
                 | "task.gated"
         );
         if !ended || self.in_work(mission) {
@@ -4356,8 +4375,17 @@ mod tests {
     /// 10 + id. Returns the events of the cancels of tasks 1, 2 and 3.
     fn idle_world(monitor: &mut Monitor) -> Vec<i64> {
         for id in 1..=4 {
-            feed(monitor, id, 0, json!({"type": "mission.added", "id": id, "text": "m"}));
-            let objectives = if id == 2 { Value::Null } else { json!({"backlog": "b", "resident": "r"}) };
+            feed(
+                monitor,
+                id,
+                0,
+                json!({"type": "mission.added", "id": id, "text": "m"}),
+            );
+            let objectives = if id == 2 {
+                Value::Null
+            } else {
+                json!({"backlog": "b", "resident": "r"})
+            };
             feed(
                 monitor,
                 5 + id,
@@ -4372,11 +4400,21 @@ mod tests {
                 json!({"type": "task.assigned", "id": id, "mission_id": id, "agent_id": "a"}),
             );
         }
-        feed(monitor, 20, 0, json!({"type": "mission.closed", "id": 3, "state": "done"}));
+        feed(
+            monitor,
+            20,
+            0,
+            json!({"type": "mission.closed", "id": 3, "state": "done"}),
+        );
         [1, 2, 3]
             .into_iter()
             .map(|id| {
-                feed(monitor, 20 + id, 1_000 * id, json!({"type": "task.cancelled", "id": id}));
+                feed(
+                    monitor,
+                    20 + id,
+                    1_000 * id,
+                    json!({"type": "task.cancelled", "id": id}),
+                );
                 20 + id
             })
             .collect()
@@ -4395,7 +4433,10 @@ mod tests {
     fn a_backlog_mission_without_work_past_the_bound_is_one_alert() {
         let mut monitor = monitor();
         let cancels = idle_world(&mut monitor);
-        assert!(read_idle(&monitor, 1_000 + 900_000 - 1).is_empty(), "not before the bound");
+        assert!(
+            read_idle(&monitor, 1_000 + 900_000 - 1).is_empty(),
+            "not before the bound"
+        );
         let fired = read_idle(&monitor, 1_000 + 900_000);
         assert_eq!(fires(&fired), ["mission_idle:1:21"], "{fired:?}");
         let Event::Fire {
@@ -4412,10 +4453,16 @@ mod tests {
         assert_eq!(evidence["mission"], 1);
         assert_eq!(evidence["since_ms"], 1_000);
         assert_eq!(evidence["event_id"], cancels[0]);
-        assert_eq!(text, "mission #1 has had no task in work for 15 min since its last task ended: its objective backlog has nothing open to assign");
+        assert_eq!(
+            text,
+            "mission #1 has had no task in work for 15 min since its last task ended: its objective backlog has nothing open to assign"
+        );
         assert!(!notice, "an alert: Needs you");
         commit(&mut monitor, &fired);
-        assert!(read_idle(&monitor, 10_000_000).is_empty(), "once while open");
+        assert!(
+            read_idle(&monitor, 10_000_000).is_empty(),
+            "once while open"
+        );
     }
 
     /// Objective 058 (b): the mission's next assignment clears it, naming
@@ -4441,14 +4488,26 @@ mod tests {
         );
         commit(&mut monitor, &cleared);
         assert!(read_idle(&monitor, 9_000_000).is_empty(), "a task in work");
-        feed(&mut monitor, 31, 3_000_000, json!({"type": "task.cancelled", "id": 5}));
+        feed(
+            &mut monitor,
+            31,
+            3_000_000,
+            json!({"type": "task.cancelled", "id": 5}),
+        );
         let again = read_idle(&monitor, 3_000_000 + 900_000);
         assert_eq!(fires(&again), ["mission_idle:1:31"]);
         commit(&mut monitor, &again);
-        let closed = feed(&mut monitor, 32, 0, json!({"type": "mission.closed", "id": 1, "state": "done"}));
+        let closed = feed(
+            &mut monitor,
+            32,
+            0,
+            json!({"type": "mission.closed", "id": 1, "state": "done"}),
+        );
         let cleared = decided(&monitor, closed);
         assert!(
-            cleared.iter().any(|event| matches!(event, Event::Clear { key, evidence }
+            cleared
+                .iter()
+                .any(|event| matches!(event, Event::Clear { key, evidence }
                 if key == "mission_idle:1:31" && evidence["event_id"] == 32)),
             "{cleared:?}"
         );
@@ -4496,7 +4555,9 @@ mod tests {
         );
         let cleared = decided(&restarted, assigned);
         assert!(
-            cleared.iter().any(|event| matches!(event, Event::Clear { key, .. } if key == "mission_idle:1:21")),
+            cleared.iter().any(
+                |event| matches!(event, Event::Clear { key, .. } if key == "mission_idle:1:21")
+            ),
             "{cleared:?}"
         );
     }
@@ -6743,7 +6804,10 @@ connections\n";
                 refold(client);
                 let key = format!("mission_idle:1:{ended}");
                 let monitor = started(store);
-                assert_eq!(monitor.missions[&1].idle.map(|(_, event)| event), Some(ended));
+                assert_eq!(
+                    monitor.missions[&1].idle.map(|(_, event)| event),
+                    Some(ended)
+                );
                 assert!(monitor.missions[&1].backlog && !monitor.missions[&2].backlog);
                 assert_eq!(alert(client, &key).0, "open");
                 let idle: i64 = client
