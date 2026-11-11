@@ -261,8 +261,8 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
 
 /// What a gate host fault that never started something says: its sandbox
 /// (`sandbox_never_started`) or the gate's own test server
-/// (`test_server_never_started`), with the gate's reason; `None` for
-/// another evidence.
+/// (`test_server_never_started`), or a gate abandoned by its runner
+/// (`abandoned`), with the gate's reason; `None` for another evidence.
 fn never_started(evidence: &Value, fact: &Value) -> Option<String> {
     let said = one_line(fact["reason"].as_str().unwrap_or_default(), 300);
     if evidence == crate::gate::SANDBOX_NEVER_STARTED {
@@ -272,6 +272,8 @@ fn never_started(evidence: &Value, fact: &Value) -> Option<String> {
         ))
     } else if evidence == crate::gate::TEST_SERVER_NEVER_STARTED {
         Some(format!("the gate's own test server never started ({said})"))
+    } else if evidence == crate::gate::ABANDONED {
+        Some(format!("the gate was abandoned ({said})"))
     } else {
         None
     }
@@ -292,6 +294,9 @@ fn host_fault_check(evidence: &Value) -> &'static str {
     } else if evidence == crate::gate::TEST_SERVER_NEVER_STARTED {
         "Check that the gate's test server starts on this host (its memory, disk, \
          SPAWN_GATE_PG_BIN or image, the server's FATAL line in the record) or tell the owner."
+    } else if evidence == crate::gate::ABANDONED {
+        "Check why the gate's unit ended (journalctl --user -u spawn-gate-*: a reboot, the OOM \
+         killer, a stop from outside) or tell the owner."
     } else if evidence == "gate" {
         "Check the host's load and that scenario's harness (its log in the gate output), or \
          tell the owner."

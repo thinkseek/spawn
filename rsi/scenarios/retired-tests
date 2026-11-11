@@ -13,3 +13,6 @@ dispatch::tests::a_cannot_judge_host_fault_names_the_objective_judged_outside_th
 # judged `stale` and again no longer happens; the waiting is
 # an_owner_push_requested_while_a_gate_runs_moves_main_only_after_it.
 integrate::database_tests::a_judging_of_the_same_source_finds_main_moved_and_is_judged_again
+# Gate v2 step 2, commit 2 (rev-f): start_time_of moved from tmux.rs to spawn-host's process.rs with its
+# test, under the same name; the test runs on as process::tests::a_start_time_is_read_past_a_command_with_parentheses.
+tmux::tests::a_start_time_is_read_past_a_command_with_parentheses

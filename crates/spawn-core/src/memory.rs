@@ -5,7 +5,7 @@
 //! monotonic, and one session never holds two live leases. The shared
 //! conformance suite in [`crate::contract`] runs against both.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -109,6 +109,11 @@ struct State {
     exits_on_check: HashMap<TerminalName, (String, Vec<u8>)>,
     /// The transcript archive: per agent and native session, its copies.
     transcripts: HashMap<(AgentId, String), Vec<Vec<u8>>>,
+    /// The archive's progress records, per (agent, native session).
+    archive_progress: BTreeMap<(AgentId, String), crate::transcripts::ArchiveProgress>,
+    /// Agents whose archive refuses every write, as a directory that is not
+    /// one would ([`MemoryStore::hold_archive`]).
+    archive_held: HashSet<AgentId>,
     /// Engines that write to their workspace as they die: `terminate`
     /// leaves the workspace dirty ([`MemoryStore::write_as_it_dies`]).
     dies_writing: HashSet<TerminalName>,
@@ -268,6 +273,18 @@ impl MemoryStore {
     /// rewrites or truncates it would. Test helper.
     pub fn replace_file(&self, path: &str, bytes: &[u8]) {
         self.lock().files.insert(path.to_string(), bytes.to_vec());
+    }
+
+    /// Make the transcript archive of `agent` refuse (`true`) or take
+    /// (`false`) every read and write, as an archive directory that is a
+    /// plain file, or a full disk, would. Test helper.
+    pub fn hold_archive(&self, agent: &AgentId, held: bool) {
+        let mut state = self.lock();
+        if held {
+            state.archive_held.insert(agent.clone());
+        } else {
+            state.archive_held.remove(agent);
+        }
     }
 
     /// Delete a file the terminal host can read, as Claude Code's cleanup
@@ -959,8 +976,11 @@ fn stale_refusal() -> WorkspaceError {
 
 impl TranscriptArchive for MemoryStore {
     fn copies(&self, agent: &AgentId, native: &str) -> Result<Vec<u64>, ArchiveError> {
-        Ok(self
-            .lock()
+        let state = self.lock();
+        if state.archive_held.contains(agent) {
+            return Err(ArchiveError(format!("the archive of {agent} is held")));
+        }
+        Ok(state
             .transcripts
             .get(&(agent.clone(), native.to_string()))
             .map(|copies| {
@@ -1001,6 +1021,9 @@ impl TranscriptArchive for MemoryStore {
         bytes: &[u8],
     ) -> Result<(), ArchiveError> {
         let mut state = self.lock();
+        if state.archive_held.contains(agent) {
+            return Err(ArchiveError(format!("the archive of {agent} is held")));
+        }
         let copies = state
             .transcripts
             .entry((agent.clone(), native.to_string()))
@@ -1019,6 +1042,22 @@ impl TranscriptArchive for MemoryStore {
         }
         held.extend_from_slice(bytes);
         Ok(())
+    }
+
+    fn put_progress(
+        &self,
+        progress: &crate::transcripts::ArchiveProgress,
+        _durable: bool,
+    ) -> Result<(), ArchiveError> {
+        self.lock().archive_progress.insert(
+            (progress.agent.clone(), progress.native.clone()),
+            progress.clone(),
+        );
+        Ok(())
+    }
+
+    fn progress(&self) -> Result<Vec<crate::transcripts::ArchiveProgress>, ArchiveError> {
+        Ok(self.lock().archive_progress.values().cloned().collect())
     }
 }
 

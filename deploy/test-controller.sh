@@ -165,6 +165,37 @@ check "the running script finished as A's: $(tr '\n' ' ' <"$scratch/gate.out")" 
 check "the working directory still read A's scenarios" [ "$(cat "$scratch/cwd.out")" = A ]
 check "the open file still read A's" [ "$(cat "$scratch/fd.out")" = A ]
 
+echo "== a controller a judging names (gate v2 step 2)"
+# A gate in a unit of its own may run a second gate of its judging from the
+# gate.sh its judging.json pinned, with no process holding the directory in
+# between: the judging keeps it; once the judging is gone, the next switch
+# removes it. A judging.json that cannot be read keeps it too.
+ws=$scratch/ws
+mkdir -p "$ws/judgings/0193aa"
+held=$(readlink -f "$dir/spawn-$C")
+printf '{"kind":"task","gate":"%s/scripts/rsi/gate.sh"}\n' "$held" >"$ws/judgings/0193aa/judging.json"
+wctl() { SPAWN_WORKSPACE_ROOT=$ws bash "$script" "$@"; }
+wctl update spawn "$git_dir" "$A" "$modules" 2>/dev/null >/dev/null
+wctl update spawn "$git_dir" "$B" "$modules" 2>"$scratch/err" >/dev/null
+check "C, neither current nor previous, is kept: a judging names it" [ -d "$dir/spawn-$C" ]
+check "says so" grep -q "kept spawn-$C: the judging 0193aa runs its gate from it" "$scratch/err"
+check "D, which nothing names, is removed" [ ! -e "$dir/spawn-$D" ]
+printf 'not json' >"$ws/judgings/0193aa/judging.json"
+wctl update spawn "$git_dir" "$A" "$modules" 2>"$scratch/err" >/dev/null
+check "a judging.json that cannot be read keeps C" [ -d "$dir/spawn-$C" ]
+check "and says why" grep -q "kept spawn-$C: $ws/judgings/0193aa/judging.json cannot be read" "$scratch/err"
+# Another judging names only its scenarios there (Supply's, in its own
+# controller), with a gate elsewhere: kept as well.
+printf '{"kind":"owner","gate":"/elsewhere/gate.sh","scenarios":"%s/rsi/scenarios"}\n' "$held" >"$ws/judgings/0193aa/judging.json"
+wctl update spawn "$git_dir" "$B" "$modules" 2>"$scratch/err" >/dev/null
+check "a judging whose scenarios lie in C keeps it" [ -d "$dir/spawn-$C" ]
+check "and says so" grep -q "kept spawn-$C: the judging 0193aa runs its scenarios from it" "$scratch/err"
+rm -rf "$ws/judgings/0193aa"
+wctl update spawn "$git_dir" "$A" "$modules" 2>"$scratch/err" >/dev/null
+check "C, once its judging is gone, is removed" [ ! -e "$dir/spawn-$C" ]
+# Back to the state the next sections expect: D current.
+ctl update spawn "$git_dir" "$D" "$modules" 2>/dev/null >/dev/null
+
 echo "== a live directory under a symlink (/home -> /data00/home)"
 # Everything names the live directory through the symlink, as on a host
 # whose /home is one: the controller script, and the three holders, which
