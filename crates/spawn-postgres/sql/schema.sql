@@ -4709,6 +4709,238 @@ begin
 end
 $$;
 
+-- Experience (objective 043; docs/fleet-architecture.md §4): decisions,
+-- interventions, outcomes and escalations, one row per item with `at_ms`
+-- (when it counts), derived from the log alone, so every reader (the
+-- scorecard's "How the fleet decides", `/api/fleet`'s ladder, RSI) counts
+-- the same rows. Views read with their owner's rights: the reader selects
+-- them with every table, the supervisor by the grant below. The helper
+-- views (`spawn_experience_*`, `spawn_task_spans`, `spawn_mission_spans`)
+-- fold the control stream as the scorecard does (docs/design.md §15):
+-- a task's interval runs from each assignment to its first closing record,
+-- a review accepted closes only on a mission without a gate as of that
+-- review, and a record that names a closed task changes nothing.
+
+-- A JSON number, or a number written as text, as a bigint; null otherwise.
+create or replace function spawn_experience_int(p_value jsonb) returns bigint
+language sql immutable parallel safe as $$
+    select case
+             when jsonb_typeof(p_value) = 'number' and (p_value #>> '{}') ~ '^-?[0-9]{1,18}$'
+               then (p_value #>> '{}')::bigint
+             when jsonb_typeof(p_value) = 'string' and btrim(p_value #>> '{}') ~ '^-?[0-9]{1,18}$'
+               then btrim(p_value #>> '{}')::bigint
+           end $$;
+
+-- The control records, in stream order.
+create or replace view spawn_experience_records as
+select e.session_seq as seq,
+       e.recorded_at_ms as at_ms,
+       e.kind -> 'detail' -> 'record' ->> 'type' as type,
+       e.kind -> 'detail' -> 'record' as record
+from spawn_events e
+where e.session_id = 'session_control' and e.event_name = 'control.recorded';
+
+-- Each record that sets a mission's settings: `mission.added` (no gate,
+-- accepted by review), `mission.configured` and a legacy mission row.
+create or replace view spawn_experience_settings as
+select r.seq,
+       spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')) as mission_id,
+       case when r.type = 'mission.added' then false
+            else coalesce(jsonb_typeof(coalesce(r.record -> 'gate', r.record -> 'row' -> 'gate')), 'null')
+                 <> 'null' end as gated,
+       case when r.type = 'mission.added' then true
+            else case when jsonb_typeof(coalesce(r.record -> 'accept', r.record -> 'row' -> 'accept'))
+                               = 'string'
+                      then coalesce(r.record -> 'accept', r.record -> 'row' -> 'accept') #>> '{}' = 'review'
+                      else true end end as review
+from spawn_experience_records r
+where r.type in ('mission.added', 'mission.configured')
+   or (r.type = 'legacy.imported' and r.record ->> 'table' = 'mission_missions');
+
+-- Every assignment of a task (a `task.assigned`, or a legacy task row at its
+-- row's creation), with the next assignment of the same task after it.
+create or replace view spawn_experience_assignments as
+select a.*, lead(a.seq) over (partition by a.task_id order by a.seq) as next_seq
+from (
+    select r.seq,
+           r.type,
+           spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')) as task_id,
+           spawn_experience_int(coalesce(r.record -> 'mission_id', r.record -> 'row' -> 'mission_id'))
+               as mission_id,
+           case when r.type = 'task.assigned' then r.at_ms
+                else coalesce(spawn_experience_int(r.record -> 'row' -> 'created_at_ms'), r.at_ms)
+           end as assigned_at_ms,
+           coalesce(r.record ->> 'created_by', r.record -> 'row' ->> 'created_by') as created_by,
+           spawn_experience_int(coalesce(r.record -> 'objective', r.record -> 'row' -> 'objective'))
+               as objective,
+           coalesce(r.record ->> 'brief', r.record -> 'row' ->> 'brief') as brief,
+           r.record
+      from spawn_experience_records r
+     where r.type = 'task.assigned'
+        or (r.type = 'legacy.imported' and r.record ->> 'table' = 'mission_tasks')
+) a
+where a.task_id is not null and a.mission_id is not null;
+
+-- Each assignment's interval: from the assignment to its first closing
+-- record before the task's next assignment (`closed_at_ms` null while
+-- open), with that record's outcome; a legacy row closed as its row says
+-- (at its `updated_at_ms`, no outcome: no record of one).
+create or replace view spawn_task_spans as
+select a.task_id,
+       a.mission_id,
+       a.seq as assigned_seq,
+       a.assigned_at_ms,
+       coalesce(c.at_ms, l.closed_at_ms) as closed_at_ms,
+       c.seq as closed_seq,
+       c.outcome,
+       c.by,
+       a.created_by,
+       a.objective,
+       a.brief
+from spawn_experience_assignments a
+left join lateral (
+    select case when a.type = 'legacy.imported'
+                     and (a.record -> 'row' ->> 'state' in ('cancelled', 'landed')
+                          or (a.record -> 'row' ->> 'state' = 'accepted'
+                              and not coalesce((select s.gated from spawn_experience_settings s
+                                                 where s.mission_id = a.mission_id and s.seq < a.seq
+                                                 order by s.seq desc limit 1), false)))
+                then coalesce(spawn_experience_int(a.record -> 'row' -> 'updated_at_ms'),
+                              (select r.at_ms from spawn_experience_records r where r.seq = a.seq))
+           end as closed_at_ms
+) l on true
+left join lateral (
+    select r.seq,
+           r.at_ms,
+           case r.type when 'task.landed' then 'landed'
+                       when 'task.reviewed' then 'accepted'
+                       when 'task.cancelled' then 'cancelled'
+                       when 'task.aborted' then 'aborted'
+                       when 'task.over_budget' then 'over_budget' end as outcome,
+           r.record ->> 'by' as by
+      from spawn_experience_records r
+     where l.closed_at_ms is null
+       and r.seq > a.seq and (a.next_seq is null or r.seq < a.next_seq)
+       and spawn_experience_int(r.record -> 'id') = a.task_id
+       and (r.type in ('task.landed', 'task.cancelled', 'task.aborted', 'task.over_budget')
+            or (r.type = 'task.reviewed'
+                and lower(r.record ->> 'accepted') in ('true', 't')
+                and not coalesce((select s.gated from spawn_experience_settings s
+                                   where s.mission_id = a.mission_id and s.seq < r.seq
+                                   order by s.seq desc limit 1), false)))
+     order by r.seq
+     limit 1
+) c on true;
+
+-- Each mission's open span: from its `mission.added` to its first
+-- `mission.closed` after (null while open); a legacy mission row from its
+-- row's creation to its update when the row is closed.
+create or replace view spawn_mission_spans as
+select m.mission_id, m.text, m.opened_at_ms, m.closed_at_ms
+from (
+    select spawn_experience_int(r.record -> 'id') as mission_id,
+           r.record ->> 'text' as text,
+           r.at_ms as opened_at_ms,
+           (select c.at_ms from spawn_experience_records c
+             where c.type = 'mission.closed' and c.seq > r.seq
+               and spawn_experience_int(c.record -> 'id') = spawn_experience_int(r.record -> 'id')
+             order by c.seq limit 1) as closed_at_ms
+      from spawn_experience_records r
+     where r.type = 'mission.added'
+    union all
+    select spawn_experience_int(r.record -> 'row' -> 'id'),
+           r.record -> 'row' ->> 'text',
+           coalesce(spawn_experience_int(r.record -> 'row' -> 'created_at_ms'), r.at_ms),
+           case when coalesce(r.record -> 'row' ->> 'state', 'open') not in ('open', 'active')
+                then coalesce(spawn_experience_int(r.record -> 'row' -> 'updated_at_ms'), r.at_ms) end
+      from spawn_experience_records r
+     where r.type = 'legacy.imported' and r.record ->> 'table' = 'mission_missions'
+) m
+where m.mission_id is not null;
+
+-- Every decision: each judgement at its time (tier `rules` when the rules
+-- judged, else `model`) and each command at its creation, by its
+-- principal's tier (`dispatcher`, `supervisor`, `human` for the board's and
+-- the CLI's, `liveness`, any other principal as its own tier). `source`:
+-- the judge or the principal.
+create or replace view spawn_decisions as
+select j.recorded_at_ms as at_ms,
+       case when j.observation ->> 'judge' = 'rules' then 'rules' else 'model' end as tier,
+       j.session_id,
+       j.agent_id,
+       coalesce(j.observation ->> 'judge', 'model') as source
+from agent_judgements j
+union all
+select c.created_at_ms,
+       case c.principal when 'spawn-dispatch' then 'dispatcher'
+                        when 'spawn_supervisor' then 'supervisor'
+                        when 'human' then 'human'
+                        when 'spawn' then 'human'
+                        when 'spawn-liveness' then 'liveness'
+                        else c.principal end,
+       c.session_id,
+       c.agent_id,
+       c.principal
+from spawn_commands c;
+
+-- Every intervention, exactly the scorecard's (docs/design.md §15, autonomy
+-- (a)-(d)): `command`, a person's or the CLI's command, at its creation;
+-- `resume`, a `mission.resumed`; `owner_task`, a task a person assigned on
+-- a mission accepted by review; `cancel_reassign`, a person's cancellation
+-- of an open task followed by the same work (the same objective, or without
+-- one the same brief) assigned again in the mission, at that assignment.
+create or replace view spawn_interventions as
+select c.created_at_ms as at_ms, 'command'::text as kind, null::bigint as mission_id,
+       null::bigint as task_id, c.id as command_id
+from spawn_commands c
+where c.principal in ('human', 'spawn')
+union all
+select r.at_ms, 'resume', spawn_experience_int(r.record -> 'id'), null, null
+from spawn_experience_records r
+where r.type = 'mission.resumed' and spawn_experience_int(r.record -> 'id') is not null
+union all
+select a.assigned_at_ms, 'owner_task', a.mission_id, a.task_id, null
+from spawn_experience_assignments a
+where a.type = 'task.assigned' and a.created_by = 'human'
+  and coalesce((select s.review from spawn_experience_settings s
+                 where s.mission_id = a.mission_id and s.seq < a.seq
+                 order by s.seq desc limit 1), true)
+union all
+select n.assigned_at_ms, 'cancel_reassign', t.mission_id, n.task_id, null
+from spawn_task_spans t
+join spawn_experience_records x on x.seq = t.closed_seq
+cross join lateral (
+    select a.assigned_at_ms, a.task_id
+      from spawn_experience_assignments a
+     where a.type = 'task.assigned' and a.seq > t.closed_seq and a.mission_id = t.mission_id
+       and case when t.objective is not null then a.objective = t.objective
+                else t.brief is not null and a.brief = t.brief end
+     order by a.seq
+     limit 1
+) n
+where t.outcome = 'cancelled'
+  and (jsonb_typeof(x.record -> 'by') is distinct from 'string' or x.record ->> 'by' = 'human');
+
+-- Each task's closing record: `landed`, `accepted` (a review that closes it),
+-- `cancelled`, `aborted` or `over_budget`; `by`, the record's own.
+create or replace view spawn_outcomes as
+select t.closed_at_ms as at_ms, t.outcome, t.task_id, t.mission_id, t.by
+from spawn_task_spans t
+where t.outcome is not null;
+
+-- Every escalation: each distinct tag of the dispatcher's inputs into the
+-- supervisor (`Escalation::tag`, `<session> <id>`; a charter's tag is not
+-- one), once, at the first command that carried it.
+create or replace view spawn_escalations as
+select distinct on (g.tag) c.created_at_ms as at_ms, g.tag, c.id as command_id
+from spawn_commands c
+cross join lateral jsonb_array_elements_text(
+    case when jsonb_typeof(c.action -> 'tags') = 'array' then c.action -> 'tags'
+         else '[]'::jsonb end) g(tag)
+where c.principal = 'spawn-dispatch' and c.session_id = 'session_supervisor'
+  and c.action ->> 'type' = 'input' and g.tag like '% %' and g.tag not like 'charter %'
+order by g.tag, c.id;
+
 revoke all on mission_missions, mission_residents, mission_tasks, mission_source_holds,
                mission_source_reds, spawn_alerts from public;
 -- Every mission function: search_path pinned, closed to public. The
@@ -4760,7 +4992,8 @@ begin
     end loop;
     execute format('grant select on mission_missions, mission_residents, mission_tasks, '
                    'mission_source_holds, mission_source_reds, spawn_alerts, '
-                   'spawn_alert_scores to %I',
+                   'spawn_alert_scores, spawn_decisions, spawn_interventions, spawn_outcomes, '
+                   'spawn_escalations to %I',
                    spawn_login_role('spawn_supervisor'));
 end
 $$;
