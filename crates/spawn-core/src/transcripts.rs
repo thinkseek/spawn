@@ -277,13 +277,19 @@ pub fn parse_rfc3339_ms(text: &str) -> Option<i64> {
     Some(seconds * 1000 + millis)
 }
 
-/// What [`restore`] put back.
+/// What [`restore`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Restored {
-    /// The length of the transcript as restored.
-    pub bytes: u64,
-    /// The length of the file it replaced; `None` when there was none.
-    pub replaced: Option<u64>,
+pub enum Restored {
+    /// The file was missing, and `bytes` were put back.
+    Written { bytes: u64 },
+    /// The file held `had` bytes and the archive more: it was replaced by
+    /// `bytes`, every byte it held among them.
+    Replaced { bytes: u64, had: u64 },
+    /// The archive holds more than the file, but its latest copy is not the
+    /// file, so a join could lack bytes of it: the file, `had` bytes, was
+    /// left as it is, and the resume goes on with it. The archive keeps
+    /// every copy it made.
+    Left { had: u64 },
 }
 
 /// Before a resume of `native`: the transcript is where the engine will
@@ -299,7 +305,8 @@ pub struct Restored {
 /// (`read_before`: the log holds events read from one, so it did). A
 /// transcript that is gone with no copy is an error: resuming would start
 /// the agent blank under its old id. A present file is replaced only when
-/// it is the archive's latest copy, as just read. It runs before a resume,
+/// it is the archive's latest copy, as just read; otherwise it is left as it
+/// is ([`Restored::Left`]) and never holds the resume up. It runs before a resume,
 /// when no engine of the session is running: an engine that wrote after the
 /// read is refused, not raced, but one writing during the rename would
 /// write to the file it replaced.
@@ -348,10 +355,7 @@ pub fn restore(
     if !present {
         host.write_new(workspace, path, &joined)
             .map_err(|error| format!("restore {path}: {error}"))?;
-        return Ok(Some(Restored {
-            bytes: length,
-            replaced: None,
-        }));
+        return Ok(Some(Restored::Written { bytes: length }));
     }
     let current = read_file(host, workspace, path)?;
     if joined == current {
@@ -360,11 +364,12 @@ pub fn restore(
     // The join holds every byte of the file only if the file is the latest
     // copy: archive_to tells a file that went on by the bytes before the
     // copy's end alone, and the engine may write between it and this read.
+    // A mismatch can stay (the archive goes on appending to that copy), so
+    // it never holds the resume up: the file goes on as it is.
     if all.last() != Some(&current) {
-        return Err(format!(
-            "{path} is not the transcript archive's latest copy of it; the resume waits for \
-             the next pass"
-        ));
+        return Ok(Some(Restored::Left {
+            had: u64::try_from(current.len()).unwrap_or(u64::MAX),
+        }));
     }
     let replaced = host
         .replace_grown(workspace, path, &joined, &current)
@@ -374,9 +379,9 @@ pub fn restore(
             "{path} changed while it was being restored; the resume waits for the next pass"
         ));
     }
-    Ok(Some(Restored {
+    Ok(Some(Restored::Replaced {
         bytes: length,
-        replaced: Some(u64::try_from(current.len()).unwrap_or(u64::MAX)),
+        had: u64::try_from(current.len()).unwrap_or(u64::MAX),
     }))
 }
 
@@ -726,13 +731,7 @@ mod tests {
         step(&store, &agent, &workspace);
         store.remove_file(PATH);
         let restored = restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true);
-        assert_eq!(
-            restored,
-            Ok(Some(Restored {
-                bytes: 8,
-                replaced: None
-            }))
-        );
+        assert_eq!(restored, Ok(Some(Restored::Written { bytes: 8 })));
         assert_eq!(file(&store, &workspace), b"old\nnew\n");
         // Present now: nothing to do, and the archive goes on.
         assert_eq!(
@@ -762,10 +761,7 @@ mod tests {
             let restored = restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true);
             assert_eq!(
                 restored,
-                Ok(Some(Restored {
-                    bytes: 6,
-                    replaced: Some(2)
-                })),
+                Ok(Some(Restored::Replaced { bytes: 6, had: 2 })),
                 "archived {archived}"
             );
             assert_eq!(
@@ -800,12 +796,21 @@ mod tests {
         // file.
         let changed = format!("y{}\nz\n", &tail[1..]);
         store.replace_file(PATH, changed.as_bytes());
-        let restored = restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true);
-        assert!(
-            matches!(&restored, Err(error) if error.contains("not the transcript archive's latest copy")),
-            "{restored:?}"
-        );
-        assert_eq!(file(&store, &workspace), changed.as_bytes());
+        let had = u64::try_from(changed.len()).expect("length");
+        // Left as it is, and the resume goes on: not now, nor on any later
+        // resume, though the mismatch stays.
+        for resume in 0..2 {
+            assert_eq!(
+                restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true),
+                Ok(Some(Restored::Left { had })),
+                "resume {resume}"
+            );
+            assert_eq!(
+                file(&store, &workspace),
+                changed.as_bytes(),
+                "resume {resume}"
+            );
+        }
     }
 
     #[test]
@@ -816,10 +821,7 @@ mod tests {
         store.replace_file(PATH, b"a\n");
         assert_eq!(
             restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true),
-            Ok(Some(Restored {
-                bytes: 4,
-                replaced: Some(2)
-            }))
+            Ok(Some(Restored::Replaced { bytes: 4, had: 2 }))
         );
         assert_eq!(file(&store, &workspace), b"a\nb\n");
         // A file that only went on is the transcript itself: left as it is.
