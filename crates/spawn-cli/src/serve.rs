@@ -3826,6 +3826,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir4);
     }
 
+    /// The row's `solved_on_base` carries `at_ms`, the time of the
+    /// integrator's `objective.solved` record, which the RSI page's
+    /// Landings card places the objective at (web/src/rsiProgress.ts).
+    #[test]
+    fn solved_on_base_carries_the_records_time() {
+        let dir = backlog_dir("board-solved-at", &[1, 2], &[]);
+        let board = with_objectives(json!({
+            "id": 1, "gate": "/g", "objectives": {"backlog": dir.to_str()},
+            "tasks": [task(1, 1, "landed", 10, None)],
+            "solved_on_base": [{"event": 9, "objective": 2, "task": 7, "base": "b",
+                                "at_ms": 1_793_724_858_211_i64}],
+        }));
+        let row = &board["objectives"][1];
+        assert_eq!(row["status"], "solved");
+        assert_eq!(row["solved_on_base"]["at_ms"], json!(1_793_724_858_211_i64));
+        assert_eq!(row["solved_on_base"]["task"], json!(7));
+        assert_eq!(board["objectives"][0]["solved_on_base"], serde_json::Value::Null);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `after` is obeyed against records solved on the base; a held
     /// objective is not next until the mission is configured again.
     #[test]
