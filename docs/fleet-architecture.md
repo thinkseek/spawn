@@ -1454,7 +1454,9 @@ and `agent_executions`: the ladder (`ladder`, `ladder_extra`), `agent_hours`
 plus accepted over the window's days), `judgements` (as the last hour of
 `/api/fleet` counts them) and `missions` (each open in the window with
 `hours`, `idle_hours`, its span less the union of its tasks' open
-intervals, and `idle`, more than half of it), ratios and hours to 3
+intervals, `owner_work`, true when its last configuration before
+`until` gives it no objective backlog (a mission never configured is not), and `idle`, more than half of it,
+never for owner work: its work comes from the owner, objective 062), ratios and hours to 3
 decimals as the scorecard rounds (crates/spawn-cli/src/scorecard/fleet.rs).
 The Scorecard's "How the fleet decides" reads it over the page's window;
 `/api/fleet`'s 24 h ladder and human decisions per agent-hour read
@@ -2652,7 +2654,11 @@ are per-agent uids or a mount per engine.
   `reused` likewise). Rejected (or a candidate without the
   mission's scenarios directory, `no_scenarios`): `source.push_refused`
   with `verdict` and the gate's `log`; nothing moves and no mission counts
-  it. No verdict (the host's fault, an abort, which is a harness error, no
+  it. Both records of a judged request (`source.moved` accepted,
+  `source.push_refused` rejected) carry `gate_ms`, the gate's wall clock,
+  and `mission`, the id of the mission whose gate judged it (objective
+  061): the scorecard's gate time counts the run for the fleet and for
+  that mission (never the moved `missions`), beside the tasks' gatings. No verdict (the host's fault, an abort, which is a harness error, no
   room, a gate that could not run): no outcome is recorded, and the request is
   judged again after the host-fault backoff. When the gate ran, what it
   printed (stdout, then stderr marked `! `, its last 4 MiB) is kept as
