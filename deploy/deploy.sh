@@ -66,7 +66,9 @@
 #      code, not the owner's. Binary and UI are staged in $live (spawn.staged,
 #      web.staged), not installed; the export and anything still staged are
 #      removed on every exit;
-#   6. the integrator is drained, then stopped (below, "Draining"), main is
+#   6. the integrator is stopped, its gates left running in their units
+#      (below, "Gates outlive the integrator"), or drained and stopped
+#      (below, "Draining") when its binary runs them as children, main is
 #      read again (it must still be the
 #      verdict's base), the staged binary migrates the schema, and only then
 #      binary and UI are installed: the replaced copies become spawn.prev and
@@ -111,6 +113,15 @@
 # says the hold stays. A hold left by
 # a deploy killed outright expires on its own (SPAWN_SOURCE_HOLD_SECS, 3 h by
 # default).
+#
+# Gates outlive the integrator (gate v2 step 2). When the installed binary
+# runs its gates in systemd user units of their own (its startup line says
+# so; read from the file), stopping the integrator stops no gate: the deploy
+# stops it at once, no drain, also for a pending deploy, and the integrator
+# that starts after it adopts each running gate and records it once. The
+# controller a running judging's gate came from is kept until that judging
+# is gone (deploy/controller.sh). What follows is for a binary without that:
+# the deploy that installs it drains the one before, as before.
 #
 # Draining. Stopping the integrator used to kill every gate it ran, which
 # then started again from nothing (24 gates, 9.7 gate-hours in the 72 h to
@@ -357,6 +368,14 @@ fi
 
 restart() { systemctl --user restart spawn-loop spawn-integrate spawn-serve; }
 
+# units_supported: the installed binary runs its gates in systemd user units
+# of their own (gate v2 step 2; its startup line names them, read from the
+# file, nothing is run to ask), so stopping the integrator stops no gate:
+# the next one adopts them.
+units_supported() {
+  LC_ALL=C grep -aqF 'gates run in systemd user units (spawn-gate-*)' "$live/bin/spawn" 2>/dev/null
+}
+
 # drain_supported: the installed binary has `spawn integrate --drain` (its
 # usage line names it). Read from the file: a binary without it must never
 # be run with --drain or sent SIGUSR1, whose default action ends a process.
@@ -364,13 +383,16 @@ drain_supported() {
   LC_ALL=C grep -aqE 'usage: spawn integrate [][a-z<> |-]*--drain' "$live/bin/spawn" 2>/dev/null
 }
 
-# stop_integrator [now]: drain the integrator when its binary can (header,
-# "Draining"), then stop the unit at once; `now`: no drain, whatever the
-# binary can. Its status is the stop's.
+# stop_integrator [now]: stop the unit at once when its binary runs gates in
+# units of their own (they keep running, and the next integrator adopts
+# them); else drain it when its binary can (header, "Draining"), then stop
+# it; `now`: no drain, whatever the binary can. Its status is the stop's.
 stop_integrator() {
   local code=0 own=${SPAWN_INTEGRATE_DRAIN_SECS:-7200} short=""
   if ! systemctl --user is-active --quiet spawn-integrate; then
     :
+  elif units_supported; then
+    say "stopping spawn-integrate: its gates run in systemd units of their own and keep running; the integrator that starts next adopts them and records each once"
   elif [ "${1-}" = now ]; then
     say "stopping the integrator without a drain (main must not move past the pending deploy during one); its running gates are lost"
   elif drain_supported; then

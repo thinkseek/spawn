@@ -238,6 +238,35 @@ pub fn remove(top: &Path, relative: &TreePath) -> Result<(), AgentFileError> {
     }
 }
 
+/// The names of the entries of the directory `relative` under `top`, the
+/// directory and its parents walked without following a symlink (module
+/// docs); `.` and `..` are left out, and nothing is said of what an entry
+/// is: open each the safe way ([`open_regular`]). Empty when the directory,
+/// or one above it, does not exist.
+pub fn list(top: &Path, relative: &TreePath) -> Result<Vec<Vec<u8>>, AgentFileError> {
+    checked(relative)?;
+    let Some(parent) = parent(top, relative)? else {
+        return Ok(Vec::new());
+    };
+    let Some(directory) = parent
+        .existing_child(relative.file_name())
+        .map_err(AgentFileError::NotRegular)?
+    else {
+        return Ok(Vec::new());
+    };
+    let shown = directory.shown().to_path_buf();
+    let failed =
+        |error: Errno| AgentFileError::Failed(format!("list {}: {error}", shown.display()));
+    let mut names = Vec::new();
+    for entry in rustix::fs::Dir::read_from(directory.descriptor()).map_err(failed)? {
+        let name = entry.map_err(failed)?.file_name().to_bytes().to_vec();
+        if name != b"." && name != b".." {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
 /// A directory of a workspace held open by its descriptor. Every entry
 /// below it is reached through the descriptor (`openat`, `mkdirat`,
 /// `renameat`, `unlinkat`), never by a path from the top, so a component
@@ -345,7 +374,9 @@ impl HeldDirectory {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentFileError, create_new, open_regular, read_regular, remove, rename_within};
+    use super::{
+        AgentFileError, create_new, list, open_regular, read_regular, remove, rename_within,
+    };
     use crate::tree_path::TreePath;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -370,6 +401,35 @@ mod tests {
                 .expect("mkfifo")
                 .success()
         );
+    }
+
+    #[test]
+    fn a_directory_is_listed_by_name_and_never_through_a_symlink() {
+        let base = scratch("list");
+        let ws = base.join("ws");
+        assert_eq!(list(&ws, &path(".spawn/acks")), Ok(Vec::new()), "none yet");
+        std::fs::create_dir_all(ws.join(".spawn/acks")).expect("mkdir");
+        std::fs::write(ws.join(".spawn/acks/b.json"), "{}").expect("write");
+        std::fs::write(ws.join(".spawn/acks/a.json"), "{}").expect("write");
+        let mut names = list(&ws, &path(".spawn/acks")).expect("listed");
+        names.sort();
+        assert_eq!(names, vec![b"a.json".to_vec(), b"b.json".to_vec()]);
+
+        // A symlink in place of the directory, or of a parent, is refused.
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("mkdir");
+        std::fs::write(elsewhere.join("x.json"), "{}").expect("write");
+        std::fs::remove_dir_all(ws.join(".spawn/acks")).expect("rm");
+        std::os::unix::fs::symlink(&elsewhere, ws.join(".spawn/acks")).expect("symlink");
+        assert!(matches!(
+            list(&ws, &path(".spawn/acks")),
+            Err(AgentFileError::NotRegular(_))
+        ));
+        std::fs::remove_file(ws.join(".spawn/acks")).expect("rm");
+        std::fs::remove_dir_all(ws.join(".spawn")).expect("rm");
+        std::os::unix::fs::symlink(&base, ws.join(".spawn")).expect("symlink");
+        assert!(list(&ws, &path(".spawn/acks")).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

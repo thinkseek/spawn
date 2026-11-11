@@ -157,7 +157,7 @@ impl TmuxHost {
     ///
     /// Only under `$XDG_RUNTIME_DIR`, and only while it and both levels
     /// below it are directories of this user that no one else may enter
-    /// ([`private_to_us`]): a record names a session that terminate
+    /// ([`crate::process::private_to_us`]): a record names a session that terminate
     /// SIGKILLs, so a directory another user could write (a shared /tmp,
     /// one pre-made 0777 or a symlink to theirs) must never be read or
     /// written (rev-b on b279f33c). None without it: the pane alone, as
@@ -187,7 +187,7 @@ impl TmuxHost {
             rustix::process::getuid().as_raw()
         ));
         let directory = user.join(format!("{hash:016x}"));
-        if !private_to_us(base) {
+        if !crate::process::private_to_us(base) {
             return None;
         }
         for level in [&user, &directory] {
@@ -195,7 +195,7 @@ impl TmuxHost {
                 use std::os::unix::fs::DirBuilderExt;
                 let _ = std::fs::DirBuilder::new().mode(0o700).create(level);
             }
-            if !private_to_us(level) {
+            if !crate::process::private_to_us(level) {
                 return None;
             }
         }
@@ -225,17 +225,8 @@ impl TmuxHost {
     fn recorded_leader(&self, terminal: &TerminalName) -> Option<u32> {
         let text =
             std::fs::read_to_string(self.leaders_directory(false)?.join(terminal.as_str())).ok()?;
-        let mut words = text.split_whitespace();
-        let leader: u32 = words.next()?.parse().ok()?;
-        let started: u64 = words.next()?.parse().ok()?;
-        if leader <= 1 {
-            return None;
-        }
-        match start_time(leader) {
-            None => Some(leader),
-            Some(now) if started != 0 && now == started => Some(leader),
-            Some(_) => None,
-        }
+        let leader = crate::process::ProcessId::parse(&text)?;
+        leader.leads_its_session().then_some(leader.pid)
     }
 
     /// Remove the terminal's record, once its processes are gone.
@@ -335,55 +326,15 @@ fn session_of(stat: &str) -> Option<(char, u32)> {
     Some((state, session))
 }
 
-/// [`TmuxHost::record_leader`] into `directory`, already checked.
+/// [`TmuxHost::record_leader`] into `directory`, already checked: the
+/// leader with its start time (0 when it is already gone: then the record
+/// stands for its session's members only, `recorded_leader`).
 fn record_leader_in(directory: &std::path::Path, terminal: &TerminalName, leader: u32) {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    // Unknown (0) when the leader is already gone: then the record
-    // stands for its session's members only (`recorded_leader`).
-    let started = start_time(leader).unwrap_or(0);
-    let path = directory.join(terminal.as_str());
-    let temporary = directory.join(format!(".{}.{}", terminal.as_str(), std::process::id()));
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temporary)
-        .and_then(|mut file| writeln!(file, "{leader} {started}"))
-        .and_then(|()| std::fs::rename(&temporary, &path));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-}
-
-/// Whether `path` is a directory (not a symlink) of this user that no one
-/// else may enter or write: mode & 0o077 == 0.
-#[allow(clippy::verbose_bit_mask)] // `& 0o077 == 0` reads as the mode it means
-fn private_to_us(path: &std::path::Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::symlink_metadata(path).is_ok_and(|meta| {
-        meta.is_dir()
-            && meta.uid() == rustix::process::getuid().as_raw()
-            && meta.mode() & 0o077 == 0
-    })
-}
-
-/// The process's start time (`/proc/<pid>/stat`'s 22nd field, in clock
-/// ticks since boot), or `None` when there is no such process.
-fn start_time(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    start_time_of(&stat)
-}
-
-/// A `/proc/<pid>/stat` line's start time: the 20th field after the
-/// command's closing parenthesis (state is the first).
-fn start_time_of(stat: &str) -> Option<u64> {
-    stat[stat.rfind(')')? + 1..]
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()
+    let _ = crate::process::write_private(
+        directory,
+        terminal.as_str(),
+        &format!("{}\n", crate::process::ProcessId::of(leader).record()),
+    );
 }
 
 /// How long a `capture-pane` may take.
@@ -1380,7 +1331,7 @@ mod tests {
             std::fs::write(directory.join(terminal.as_str()), text).expect("record");
         };
         let me = std::process::id();
-        let started = super::start_time(me).expect("my start time");
+        let started = crate::process::start_time(me).expect("my start time");
 
         host.record_leader(&terminal, me);
         assert_eq!(
@@ -1500,12 +1451,5 @@ mod tests {
         assert_eq!(super::server_identity(" \n"), None);
         assert_eq!(super::server_identity("2283540\n"), None);
         assert_eq!(super::server_identity("#{pid} #{start_time}\n"), None);
-    }
-
-    #[test]
-    fn a_start_time_is_read_past_a_command_with_parentheses() {
-        let stat = "42 (a) (b c) S 1 42 42 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 987654 0 0";
-        assert_eq!(super::start_time_of(stat), Some(987_654));
-        assert_eq!(super::start_time_of("42 (x) S 1"), None);
     }
 }

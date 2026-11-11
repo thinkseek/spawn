@@ -754,7 +754,6 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/missions" => Box::new(missions),
         "/api/events" => Box::new(move || events(query)),
         "/api/scorecard" => Box::new(move || scorecard(query)),
-        "/api/scorecard/fleet" => Box::new(move || scorecard_fleet(query)),
         "/api/alerts" => Box::new(move || alerts(query)),
         "/api/cost" => Box::new(move || cost(query)),
         _ => {
@@ -1923,55 +1922,6 @@ fn scorecard(query: &str) -> Result<Value, String> {
     })
 }
 
-/// The windows `/api/scorecard/fleet` answers (the Scorecard's toggle,
-/// web/src/scorecard.ts `WINDOW_PRESETS`), each with its length in ms.
-const FLEET_WINDOWS: [(&str, i64); 4] = [
-    ("24h", crate::scorecard::time::DAY_MS),
-    ("7d", 7 * crate::scorecard::time::DAY_MS),
-    ("30d", 30 * crate::scorecard::time::DAY_MS),
-    ("90d", 90 * crate::scorecard::time::DAY_MS),
-];
-
-/// The window `[since, until)` that `/api/scorecard/fleet`'s `window` and
-/// `until` name, `now` giving the end when `until` is not given (the
-/// database's clock, read only then); a window it does not know, or an
-/// `until` that is no RFC 3339 time, is the caller's mistake.
-fn fleet_window(
-    query: &str,
-    now: impl FnOnce() -> Result<i64, String>,
-) -> Result<(&'static str, i64, i64), String> {
-    let asked = parameter(query, "window").unwrap_or("");
-    let (window, length) = FLEET_WINDOWS
-        .iter()
-        .copied()
-        .find(|(name, _)| *name == asked)
-        .ok_or_else(|| format!("{BAD_REQUEST}window {asked}: one of 24h, 7d, 30d or 90d"))?;
-    let until = match parameter(query, "until").filter(|text| !text.is_empty()) {
-        None => now()?,
-        Some(text) => percent_decoded(text)
-            .as_deref()
-            .and_then(crate::scorecard::time::parse_rfc3339)
-            .ok_or_else(|| {
-                format!("{BAD_REQUEST}until {text}: not an RFC 3339 time (2026-10-02T00:00:00Z)")
-            })?,
-    };
-    Ok((window, until - length, until))
-}
-
-/// `/api/scorecard/fleet?window=24h|7d|30d|90d[&until=<RFC 3339>]`: how the
-/// fleet decided and did over `[until - window, until)` (`until` defaults to
-/// now), counted from the experience views (spawn-postgres, `experience`):
-/// the decision ladder, agent-hours and human decisions per agent-hour,
-/// escalations, interventions, outcomes, landings per day, judgements and
-/// each open mission's idle hours.
-fn scorecard_fleet(query: &str) -> Result<Value, String> {
-    let store = open_store()?;
-    let (window, since, until) = fleet_window(query, || store.database_now_ms().map_err(err))?;
-    let mut answer = store.fleet_experience(since, until).map_err(err)?;
-    answer["window"] = json!(window);
-    Ok(answer)
-}
-
 /// `/api/alerts?since=`: exactly the JSON array of `spawn alerts --once
 /// --json` with the same flag (crate::alerts), from the same store method,
 /// read through the reader login. An empty parameter is the configured
@@ -2097,10 +2047,10 @@ mod tests {
 
     use super::{
         Arc, BAD_REQUEST, DEFAULT_LIMIT, LogStart, MAX_INPUT_BODY, MAX_INPUT_TEXT, MAX_LIMIT,
-        ProcSocket, Shared, access_token, fleet_window, handle, is_json, is_loopback,
-        local_exemption, log_window, objective_json, objective_prompt, open_network_request,
-        open_networks, owner_uid, peer_uid, proc_sockets, rsi_objective, rsi_summary, same_origin,
-        same_secret, serve_requests, server_hosts, tokenless_request, typed_text, with_last_gates,
+        ProcSocket, Shared, access_token, handle, is_json, is_loopback, local_exemption,
+        log_window, objective_json, objective_prompt, open_network_request, open_networks,
+        owner_uid, peer_uid, proc_sockets, rsi_objective, rsi_summary, same_origin, same_secret,
+        serve_requests, server_hosts, tokenless_request, typed_text, with_last_gates,
         with_objectives,
     };
     use crate::objectives::Task;
@@ -2859,88 +2809,6 @@ mod tests {
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
-    }
-
-    #[test]
-    fn the_fleet_window_is_one_it_knows_ending_at_until_or_now() {
-        const DAY: i64 = 86_400_000;
-        let until = crate::scorecard::time::parse_rfc3339("2026-10-31T00:00:00Z").expect("a time");
-        let unused = || -> Result<i64, String> { panic!("until is given: now is not read") };
-        assert_eq!(
-            fleet_window("window=7d&until=2026-10-31T00:00:00Z", unused),
-            Ok(("7d", until - 7 * DAY, until))
-        );
-        assert_eq!(
-            fleet_window("until=2026-10-31T00%3A00%3A00Z&window=90d", unused),
-            Ok(("90d", until - 90 * DAY, until)),
-            "a percent-encoded until"
-        );
-        assert_eq!(
-            fleet_window("window=24h", || Ok(until)),
-            Ok(("24h", until - DAY, until)),
-            "until defaults to now"
-        );
-        assert_eq!(
-            fleet_window("window=30d&until=", || Ok(until)),
-            Ok(("30d", until - 30 * DAY, until))
-        );
-        for bad in ["window=2d", "", "window=7D", "window=7d&until=yesterday"] {
-            let refused = fleet_window(bad, || Ok(until)).expect_err(bad);
-            assert!(refused.starts_with(BAD_REQUEST), "{bad}: {refused}");
-        }
-    }
-
-    /// `/api/scorecard/fleet`'s interventions and landings are what `spawn
-    /// scorecard` counts as autonomy's interventions and throughput's
-    /// landings, over the same window: one definition of each.
-    #[test]
-    fn the_fleet_windows_interventions_and_landings_are_the_scorecards() {
-        in_test_schema(|owner, store| {
-            let mut client =
-                postgres::Client::connect(owner, postgres::NoTls).expect("the owner connects");
-            client
-                .batch_execute(&format!(
-                    "begin; {} commit;",
-                    include_str!("../../spawn-postgres/tests/experience-history.sql")
-                ))
-                .expect("the history seeds");
-            let root = std::env::temp_dir().join(format!(
-                "spawn-serve-fleet-{}-{}",
-                std::process::id(),
-                super::now_ms()
-            ));
-            let hour: i64 = 3_600_000;
-            let b = 1_700_006_400_000;
-            for (since, until) in [(b, b + 100 * hour), (b + 24 * hour, b + 72 * hour)] {
-                let asked = crate::scorecard::Query {
-                    mission: None,
-                    since: Some(crate::scorecard::time::format_rfc3339(since)),
-                    until: Some(crate::scorecard::time::format_rfc3339(until)),
-                };
-                let card = crate::scorecard::measure(store, Some(&root), &asked)
-                    .expect("the scorecard measures");
-                let fleet = &card["scopes"][0]["dimensions"];
-                assert_eq!(card["scopes"][0]["scope"], json!("fleet"));
-                let answer = store
-                    .fleet_experience(since, until)
-                    .expect("the window's figures");
-                assert_eq!(
-                    answer["interventions"]["total"], fleet["autonomy"]["interventions"],
-                    "[{since}, {until}): {answer}"
-                );
-                assert_eq!(
-                    answer["interventions"]["by_kind"], fleet["autonomy"]["by_kind"],
-                    "[{since}, {until})"
-                );
-                let landings = answer["outcomes"]["landed"].as_i64().expect("a count")
-                    + answer["outcomes"]["accepted"].as_i64().expect("a count");
-                assert_eq!(
-                    json!(landings),
-                    fleet["throughput"]["landed"],
-                    "[{since}, {until})"
-                );
-            }
-        });
     }
 
     /// The supervisor's session starts an execution, as the Bridge records it.
