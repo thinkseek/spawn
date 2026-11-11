@@ -1306,7 +1306,7 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
             .as_i64()
             .and_then(|id| gates.get(id.to_string()))
             .cloned()
-            .unwrap_or(serde_json::Value::Null);
+            .unwrap_or(Value::Null);
         if let Some(fields) = task.as_object_mut() {
             fields.insert("last_gate".to_string(), gate);
         }
