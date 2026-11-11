@@ -29,15 +29,28 @@ export interface CostModel {
   /** Null: the model has no price. */
   usd: number | null;
   tokens: CostTokens;
+  /** Its four counts when the model has no price, 0 when it has one. */
+  unpriced_tokens: number;
 }
 
-export interface CostMission extends CostEntry {
+/** What a landing cost (objective 060): the tasks that landed or were
+ * accepted in the window, as the scorecard counts landings, and the priced
+ * dollars over them (null when none landed). */
+export interface CostLandings {
+  landed: number;
+  usd_per_landing: number | null;
+}
+
+export interface CostMission extends CostEntry, Partial<CostLandings> {
   mission: number;
 }
 
 export interface CostTask extends CostEntry {
   task: number;
   mission: number | null;
+  /** The task's label, as `/api/missions` gives it; null for a task the
+   * record does not hold. */
+  label: string | null;
 }
 
 export interface CostAgent extends CostEntry {
@@ -52,7 +65,7 @@ export interface CostExecution extends CostEntry {
 }
 
 /** `GET /api/cost?window=24h|7d`. */
-export interface CostAnswer {
+export interface CostAnswer extends CostLandings {
   window: string;
   since_ms: number;
   until_ms: number;
@@ -67,17 +80,33 @@ export interface CostAnswer {
   counted_since_ms: number | null;
 }
 
-/** One line of the page: its label, its cost as shown, and whether any of
- * its use was on a model with no price. */
+/** One line of the page: its id, its cost as shown, whether any of its use
+ * was on a model with no price and how many tokens that was, and (a task's)
+ * the label the API gives it. */
 export interface Row {
   key: string;
   usd: string;
   unpriced: boolean;
+  /** Tokens of its use on models with no price; 0 when none. */
+  unpriced_tokens: number;
+  /** "+ 220,000 tokens unpriced"; null when none. */
+  unpriced_text: string | null;
+  /** A task's label as the API gives it; null otherwise. */
+  label: string | null;
+  /** A mission's own dollars per landing ([`perLanding`]); absent on a
+   * task's or an agent's line. */
+  per_landing?: string;
 }
 
 export interface CostView {
   total: string;
   unpriced: boolean;
+  /** Said once for the window: how many of its tokens have no price, on
+   * which models, and how to price them (SPAWN_MODEL_PRICES); null when
+   * every token is priced. */
+  unpriced_note: string | null;
+  /** "<dollars> per landing (<n> landed)", or "no landing in the window". */
+  per_landing: string;
   missions: Row[];
   tasks: Row[];
   agents: Row[];
@@ -104,6 +133,20 @@ export function formatUsd(usd: number | null): string {
   return DOLLARS.format(usd);
 }
 
+const TOKENS = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
+
+/** A token count grouped the "en-US" way ("275,000"). */
+export function formatTokens(tokens: number): string {
+  return TOKENS.format(Number.isFinite(tokens) ? tokens : 0);
+}
+
+/** What a row with unpriced use says of it: "+ 220,000 tokens unpriced"
+ * ("1 token"); null when it has none. */
+export function unpricedText(tokens: number): string | null {
+  if (!Number.isFinite(tokens) || tokens <= 0) return null;
+  return `+ ${formatTokens(tokens)} token${tokens === 1 ? "" : "s"} unpriced`;
+}
+
 function count(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
@@ -125,12 +168,89 @@ function shown(entry: Partial<CostEntry> | null | undefined): { usd: string; unp
   return { usd: text, unpriced, order: usd, weight: unpricedTokens };
 }
 
-function rows<T>(entries: unknown, key: (entry: T) => string): Row[] {
+const COUNT = new Intl.NumberFormat("en-US");
+
+/** What a landing cost in the window: "<dollars> per landing (<n>
+ * landed)", the dollars as [`formatUsd`] says them; "no landing in the
+ * window" when none landed. */
+export function perLanding(entry: Partial<CostLandings> | null | undefined): string {
+  const landed = count(entry?.landed);
+  if (landed <= 0) return "no landing in the window";
+  const per = entry?.usd_per_landing;
+  const usd = typeof per === "number" && Number.isFinite(per) ? per : null;
+  return `${formatUsd(usd)} per landing (${COUNT.format(landed)} landed)`;
+}
+
+/** The rows of a list, most costly first; with `landings` (a mission's),
+ * each carries its own dollars per landing. */
+function rows<T>(
+  entries: unknown,
+  key: (entry: T) => string,
+  label: (entry: T) => string | null = () => null,
+  landings = false,
+): Row[] {
   if (!Array.isArray(entries)) return [];
   return (entries as T[])
-    .map((entry) => ({ key: key(entry), ...shown(entry as Partial<CostEntry>) }))
+    .map((entry) => ({
+      key: key(entry),
+      label: label(entry),
+      per_landing: landings ? perLanding(entry as Partial<CostLandings>) : undefined,
+      ...shown(entry as Partial<CostEntry>),
+    }))
     .sort((a, b) => b.order - a.order || b.weight - a.weight || a.key.localeCompare(b.key))
-    .map(({ key: label, usd, unpriced }) => ({ key: label, usd, unpriced }));
+    .map(({ key: id, label: named, per_landing, usd, unpriced, weight }) => {
+      const row: Row = {
+        key: id,
+        usd,
+        unpriced,
+        unpriced_tokens: weight,
+        unpriced_text: unpricedText(weight),
+        label: named,
+      };
+      if (per_landing !== undefined) row.per_landing = per_landing;
+      return row;
+    });
+}
+
+function taskLabel(entry: CostTask): string | null {
+  const label = (entry as Partial<CostTask>).label;
+  return typeof label === "string" && label.trim() !== "" ? label : null;
+}
+
+/** The window's note on what no price counts, said once: "275,000 of
+ * 385,000 tokens (71%) ran on models with no price (bb-model-z): their
+ * cost is not in these figures. Price them in SPAWN_MODEL_PRICES." Each
+ * unpriced model is named, with its count when there are several; a priced
+ * model is not. Null when every token is priced. */
+export function unpricedNote(answer: Partial<CostAnswer> | null | undefined): string | null {
+  const unpriced = count(answer?.total?.unpriced_tokens);
+  if (unpriced <= 0) return null;
+  const all = tokenSum(answer?.total?.tokens);
+  const models = (Array.isArray(answer?.models) ? answer.models : [])
+    .map((model) => {
+      const given = (model as Partial<CostModel>).unpriced_tokens;
+      // An answer from before the rows carried their count: a model with
+      // no price is unpriced in all its tokens.
+      const tokens = typeof given === "number" ? count(given) : model?.usd === null ? tokenSum(model?.tokens) : 0;
+      return { name: String(model?.model ?? ""), tokens };
+    })
+    .filter((model) => model.tokens > 0 && model.name !== "")
+    .sort((a, b) => b.tokens - a.tokens || a.name.localeCompare(b.name));
+  const share = all > 0 ? unpriced / all : 0;
+  const percent = share >= 0.01 ? `${Math.round(share * 100)}%` : "under 1%";
+  const of = all >= unpriced && all > 0 ? ` of ${formatTokens(all)} tokens (${percent})` : " tokens";
+  const named =
+    models.length === 1
+      ? ` (${models[0].name})`
+      : models.length > 1
+        ? ` (${models.map((model) => `${model.name} ${formatTokens(model.tokens)}`).join(", ")})`
+        : "";
+  const noun = models.length === 1 ? "a model" : "models";
+  return (
+    `${formatTokens(unpriced)}${of} ran on ${noun} with no price${named}: their cost is not in ` +
+    `these figures. Price ${models.length === 1 ? "it" : "them"} in SPAWN_MODEL_PRICES ` +
+    `(US dollars per million tokens: input, output, cache_write, cache_read).`
+  );
 }
 
 function twoDigits(value: number): string {
@@ -151,16 +271,20 @@ export function countedSince(answer: Partial<CostAnswer> | null | undefined): st
   return `Counted since ${day} ${twoDigits(at.getUTCHours())}:${twoDigits(at.getUTCMinutes())} UTC`;
 }
 
-/** The page's figures for one window's answer: the total; each mission
- * (`#<id>`), task (`T<id>`) and agent (its id), most costly first; and
+/** The page's figures for one window's answer: the total, what a landing
+ * cost and, once, the note on its unpriced tokens; each mission (`#<id>`,
+ * with its own dollars per landing), task (`T<id>`, with its label) and
+ * agent (its id), most costly first, each with its unpriced count; and
  * since when the record counts, when the window starts before it. */
 export function costView(answer: Partial<CostAnswer> | null | undefined): CostView {
   const total = shown(answer?.total);
   return {
     total: total.usd,
     unpriced: total.unpriced,
-    missions: rows<CostMission>(answer?.missions, (entry) => `#${entry.mission}`),
-    tasks: rows<CostTask>(answer?.tasks, (entry) => `T${entry.task}`),
+    unpriced_note: unpricedNote(answer),
+    per_landing: perLanding(answer),
+    missions: rows<CostMission>(answer?.missions, (entry) => `#${entry.mission}`, undefined, true),
+    tasks: rows<CostTask>(answer?.tasks, (entry) => `T${entry.task}`, taskLabel),
     agents: rows<CostAgent>(answer?.agents, (entry) => String(entry.agent)),
     since: countedSince(answer),
   };

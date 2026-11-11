@@ -17,15 +17,16 @@ function fetchCost(window: string, signal: AbortSignal): Promise<CostAnswer> {
   return readApi(`/api/cost?window=${window}`, signal, (raw) => raw as CostAnswer);
 }
 
-/** The mark of a figure that leaves out use on a model with no price. */
-function UnpricedMark({ on }: { on: boolean }) {
-  if (!on) return null;
+/** The mark of a row whose figure leaves out use on a model with no
+ * price: how many tokens ("+ 220,000 tokens unpriced"). */
+function UnpricedMark({ text }: { text: string | null }) {
+  if (!text) return null;
   return (
     <span
-      title="Part of this use ran on a model SPAWN_MODEL_PRICES does not price: its tokens are counted, its cost is not"
-      className="ml-1.5 rounded bg-wait-tint px-1 py-px text-micro font-medium text-warning"
+      title="These tokens ran on a model SPAWN_MODEL_PRICES does not price: they are counted, their cost is not"
+      className="shrink-0 rounded bg-wait-tint px-1 py-px text-micro font-medium text-warning"
     >
-      unpriced use
+      {text}
     </span>
   );
 }
@@ -42,13 +43,27 @@ function Rows({ title, rows }: { title: string; rows: Row[] }) {
         <ul className="pb-2">
           {rows.map((row) => (
             <li key={row.key} className="flex items-center gap-2 px-4 py-1 text-caption">
-              <span className="min-w-0 truncate font-mono text-muted-foreground" title={row.key}>
+              <span className="shrink-0 font-mono text-muted-foreground" title={row.key}>
                 {row.key}
               </span>
-              <UnpricedMark on={row.unpriced} />
+              {row.label && (
+                <span className="min-w-0 truncate text-foreground" title={row.label}>
+                  {row.label}
+                </span>
+              )}
+              <UnpricedMark text={row.unpriced_text} />
+              {row.per_landing !== undefined && (
+                <span
+                  title="This mission's priced dollars over its tasks that landed or were accepted in the window"
+                  className="tnum ml-auto shrink-0 text-micro text-faint-foreground"
+                >
+                  {row.per_landing}
+                </span>
+              )}
               <span
                 className={cx(
-                  "tnum ml-auto shrink-0",
+                  "tnum shrink-0",
+                  row.per_landing === undefined ? "ml-auto" : "ml-2",
                   row.usd === "unpriced" ? "text-warning" : "text-foreground",
                 )}
               >
@@ -72,11 +87,24 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
           figures && (
             <span className="flex items-center">
               <span className="tnum text-body font-semibold text-foreground">{figures.total}</span>
-              <UnpricedMark on={figures.unpriced} />
+              <span
+                title="The window's priced dollars over the tasks that landed or were accepted in it, counted as the scorecard counts landings"
+                className="tnum ml-2 text-caption text-muted-foreground"
+              >
+                {figures.per_landing}
+              </span>
             </span>
           )
         }
       />
+      {figures?.unpriced_note && (
+        <p
+          title="SPAWN_MODEL_PRICES is a JSON object from model name to its four rates; set, it replaces the built-in prices whole. A price applies to calls recorded after it is set."
+          className="px-4 pt-2 text-caption text-warning"
+        >
+          {figures.unpriced_note}
+        </p>
+      )}
       {figures?.since && (
         <p
           title="The cost record holds no message from before this time, so this window's figures may be low"
@@ -100,10 +128,13 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
 
 /**
  * What the fleet's model calls cost over the last 24 hours and 7 days, in
- * US dollars: the total, each mission, task and agent, most costly first
+ * US dollars: the total and what a landing cost, each mission (with its
+ * own dollars per landing), task and agent, most costly first
  * (crates/spawn-cli/src/cost.rs prices each call when it is recorded).
- * Use on a model with no price is marked, and a figure of only such use
- * reads "unpriced", never $0.00. A window that starts before the earliest
+ * Each task row shows its label beside its id. Under each window's total a
+ * note says once how many tokens no price counts, on which models, and how
+ * to price them; a row with such use says its count, and a figure of only
+ * such use reads "unpriced", never $0.00. A window that starts before the earliest
  * message the record holds says since when it counts. Strictly read-only.
  */
 export function CostView() {

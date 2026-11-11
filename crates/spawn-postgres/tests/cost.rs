@@ -14,7 +14,7 @@ use spawn_core::port::EventLog;
 use spawn_postgres::{ArchiveCounted, ArchiveFile, ArchivedMessage, PostgresStore};
 
 mod common;
-use common::store;
+use common::{admin, store};
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -187,6 +187,51 @@ fn each_message_counts_once_for_its_task_priced_when_recorded() {
     assert_eq!(store.cost_record(&prices(6.0)).expect("record"), 1);
     let day = store.cost_window(now - DAY_MS, now + 1000).expect("window");
     near(&day["total"]["usd"], 0.7155, "msg_4 at $6 a million");
+}
+
+#[test]
+fn each_model_row_says_how_many_of_its_tokens_have_no_price() {
+    let (store, _schema) = store("cost_models_unpriced");
+    let (_mission, _task, worker) = one_task(&store);
+    let now = store.database_now_ms().expect("now");
+    started(&store, &worker, 1);
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_x", "model-x", now),
+        [100_000, 10_000, 0, 0],
+    );
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_z1", "model-z", now),
+        [200_000, 20_000, 1, 2],
+    );
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_z2", "model-z", now),
+        [50_000, 5000, 0, 0],
+    );
+    assert_eq!(store.cost_record(&prices(3.0)).expect("record"), 3);
+
+    let day = store.cost_window(now - DAY_MS, now + 1000).expect("window");
+    let x = entry(&day, "models", "model", &json!("model-x"));
+    near(&x["usd"], 0.45, "model-x");
+    assert_eq!(x["unpriced_tokens"], 0, "a priced model: {x}");
+    let z = entry(&day, "models", "model", &json!("model-z"));
+    assert_eq!(z["usd"], Value::Null, "{z}");
+    assert_eq!(z["unpriced_tokens"], 275_003, "all four counts: {z}");
+    assert_eq!(day["total"]["unpriced_tokens"], 275_003);
+    // An execution's models carry theirs too.
+    let execution = entry(&day, "executions", "execution", &json!("exec_1"));
+    let by_model = entry(execution, "models", "model", &json!("model-z"));
+    assert_eq!(by_model["unpriced_tokens"], 275_003, "{execution}");
+    let by_model = entry(execution, "models", "model", &json!("model-x"));
+    assert_eq!(by_model["unpriced_tokens"], 0, "{execution}");
 }
 
 #[test]
@@ -364,4 +409,140 @@ fn an_agents_archive_marks_are_replaced_whole_and_owner_only() {
         refused.code() == Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
         "{refused}"
     );
+}
+
+/// One control record at `at_ms`, written straight into the log (a record
+/// the store has no call for: a task assigned again, a second landing).
+fn control(client: &mut postgres::Client, at_ms: i64, record: &Value) {
+    client
+        .execute(
+            "insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id,
+                                       kind, session_seq, recorded_at_ms)
+             values ('agent_control', 'session_control', null, 'control', null,
+                     jsonb_build_object('name', 'control.recorded',
+                                        'detail', jsonb_build_object('record', $1::jsonb)),
+                     (select coalesce(max(session_seq), 0) + 1 from spawn_events
+                       where session_id = 'session_control'),
+                     $2)",
+            &[record, &at_ms],
+        )
+        .expect("write a control record");
+}
+
+/// A task of `mission` for worker `name` whose execution `execution` spent
+/// `input` tokens of model-x at `at_ms`: the task and its worker.
+fn spending_task(
+    store: &PostgresStore,
+    mission: i64,
+    (name, execution): (&str, u64),
+    (input, at_ms): (u64, i64),
+) -> (i64, Worker) {
+    let task = store
+        .task_assign(mission, "ephemeral", name, "brief", "default")
+        .expect("assign");
+    let worker = Worker {
+        agent: format!("agent_worker_{name}_{task}"),
+        session: format!("session_worker_{name}_{task}"),
+    };
+    started(store, &worker, execution);
+    let id = format!("msg_{execution}");
+    usage(
+        store,
+        &worker,
+        execution,
+        (&id, "model-x", at_ms),
+        [input, 0, 0, 0],
+    );
+    (task, worker)
+}
+
+/// `task` delivered by `command` and reported, then reviewed.
+fn reviewed(store: &PostgresStore, task: i64, command: i64, accept: bool) {
+    store.task_delivered(task, command).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    store
+        .task_review(task, accept, "note", None)
+        .expect("review");
+}
+
+#[test]
+fn a_window_says_what_a_landing_cost_for_the_fleet_and_each_mission() {
+    let (store, schema) = store("cost_landing");
+    let mut client = admin(&schema);
+    let since = store.database_now_ms().expect("now");
+
+    // Mission A, without a gate: t1 sent back once, then accepted (a
+    // landing), then assigned again and accepted again (still one landing).
+    let a = store
+        .mission_add("Work", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    let (t1, w1) = spending_task(&store, a, ("w1", 1), (100_000, since + 1));
+    reviewed(&store, t1, 1, false);
+    reviewed(&store, t1, 2, true);
+    let now = store.database_now_ms().expect("now");
+    control(
+        &mut client,
+        now,
+        &json!({"type": "task.assigned", "id": t1, "mission_id": a, "kind": "ephemeral",
+                "agent_id": w1.agent, "session_id": w1.session, "brief": "brief",
+                "created_by": "human", "model": "default"}),
+    );
+    control(
+        &mut client,
+        now,
+        &json!({"type": "task.reviewed", "id": t1, "accepted": true}),
+    );
+    // t2 of mission A landed just before the window: not counted.
+    let t2 = store
+        .task_assign(a, "ephemeral", "w2", "brief", "default")
+        .expect("assign");
+    control(
+        &mut client,
+        since - 1,
+        &json!({"type": "task.landed", "id": t2, "from": "a", "to": "b"}),
+    );
+    // t3 of mission A is cancelled: it costs, it does not land.
+    let (t3, _) = spending_task(&store, a, ("w3", 3), (20_000, since + 1));
+    store.task_cancel(t3).expect("cancel");
+
+    // Mission B, gated: an accepting review is not a landing (its gate
+    // lands it), so it has dollars and no landing.
+    let b = store
+        .mission_add("Gated", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(b, Some("/controller/rsi/scenarios"), "review", None, None)
+        .expect("configure");
+    let (t4, _) = spending_task(&store, b, ("w4", 4), (50_000, since + 1));
+    reviewed(&store, t4, 4, true);
+
+    assert_eq!(store.cost_record(&prices(3.0)).expect("record"), 3);
+    let until = store.database_now_ms().expect("now") + 1000;
+    let window = store.cost_window(since, until).expect("window");
+    near(&window["total"]["usd"], 0.51, "the window's dollars");
+    assert_eq!(
+        window["landed"],
+        json!(1),
+        "t1 once, not t2 nor t4: {window}"
+    );
+    near(&window["usd_per_landing"], 0.51, "the window's per landing");
+    let by_a = entry(&window, "missions", "mission", &json!(a));
+    assert_eq!(by_a["landed"], json!(1), "{by_a}");
+    near(&by_a["usd_per_landing"], 0.36, "mission A: t1 and t3");
+    let by_b = entry(&window, "missions", "mission", &json!(b));
+    assert_eq!(by_b["landed"], json!(0), "{by_b}");
+    assert_eq!(by_b["usd_per_landing"], Value::Null, "{by_b}");
+
+    // Just before the window: t2 landed, nothing spent. After it, nothing
+    // landed: null, not a figure.
+    let before = store.cost_window(since - 10, since).expect("window");
+    assert_eq!(
+        before["landed"],
+        json!(1),
+        "t2's landing, just before: {before}"
+    );
+    near(&before["usd_per_landing"], 0.0, "no dollars in it over t2");
+    let empty = store.cost_window(until, until + 1000).expect("window");
+    assert_eq!(empty["landed"], json!(0));
+    assert_eq!(empty["usd_per_landing"], Value::Null);
 }

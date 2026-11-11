@@ -84,6 +84,74 @@ select e.kind #>> '{detail,record,to}'
    and e.kind #>> '{detail,record,source}' = $1
  order by e.session_seq desc limit 1";
 
+/// What deploy/on-landing.sh decides on (#54), for source `$1` whose main
+/// is `$2`, the live controller's commit `$3` (null: unknown):
+/// - `landing`: the newest gate-accepted landing of exactly `$2` on the
+///   source, `{record, event, at_ms, task, request}`, or null. Gate-accepted
+///   is a `task.landed` of a task of a mission on the source (the integrator
+///   writes it only after the task's gate accepted it) or a `source.moved`
+///   on the source with `verdict` accepted (an owner's gated push). A
+///   deploy's own `source.moved` names no verdict and is no such landing.
+/// - `first_undeployed_ms`: when the first gate-accepted landing after the
+///   one that moved main to `$3` was recorded (any `task.landed` or
+///   `source.moved` to `$3` is that one), or null when `$3` names none;
+/// - `hold`: the source's hold, `{hold, by, reason, main, expires_ms}`, or
+///   null: a row is a hold until a record ends it, past its bound too;
+/// - `last_deploy`: the newest `deploy.finished`, `{ok, head, by, event,
+///   at_ms}`, or null;
+/// - `now_ms`: the database's clock, which every `at_ms` is on.
+pub(crate) const MAIN_LANDING: &str = r"
+with on_source as (
+  select e.session_seq as seq, e.id as event, e.recorded_at_ms as at_ms,
+         e.kind #>> '{detail,record,type}' as type, e.kind #>> '{detail,record,to}' as moved_to,
+         e.kind #>> '{detail,record,type}' = 'task.landed'
+           or e.kind #>> '{detail,record,verdict}' = 'accepted' as accepted,
+         case when e.kind #>> '{detail,record,type}' = 'task.landed'
+              then e.kind #> '{detail,record,id}' end as task,
+         e.kind #> '{detail,record,request}' as request
+    from spawn_events e
+   where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+     and e.kind -> 'detail' -> 'record' ->> 'type' in ('task.landed', 'source.moved',
+                                                       'deploy.finished')
+     and e.kind -> 'detail' -> 'record' ->> 'type' <> 'deploy.finished'
+     and case when e.kind #>> '{detail,record,type}' = 'source.moved'
+              then e.kind #>> '{detail,record,source}' = $1
+              else jsonb_typeof(e.kind #> '{detail,record,id}') = 'number'
+                   and exists (select 1
+                                 from mission_tasks t
+                                 join mission_missions m on m.id = t.mission_id
+                                where t.id = (e.kind #>> '{detail,record,id}')::numeric::bigint
+                                  and m.sources ->> 0 = $1)
+         end
+), anchor as (
+  select max(seq) as seq from on_source where moved_to = $3
+)
+select jsonb_build_object(
+  'now_ms', spawn_now_ms(),
+  'landing', (select jsonb_build_object('record', o.type, 'event', o.event, 'at_ms', o.at_ms,
+                                        'task', o.task, 'request', o.request)
+                from on_source o
+               where o.moved_to = $2 and o.accepted
+               order by o.seq desc limit 1),
+  'first_undeployed_ms', (select min(o.at_ms)
+                            from on_source o, anchor a
+                           where o.seq > a.seq and o.accepted),
+  'last_deploy', (select jsonb_build_object('ok', e.kind #> '{detail,record,ok}',
+                                            'head', e.kind #>> '{detail,record,head}',
+                                            'by', e.kind #>> '{detail,record,by}',
+                                            'event', e.id, 'at_ms', e.recorded_at_ms)
+                    from spawn_events e
+                   where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                     and e.kind -> 'detail' -> 'record' ->> 'type' in ('task.landed',
+                                                                       'source.moved',
+                                                                       'deploy.finished')
+                     and e.kind -> 'detail' -> 'record' ->> 'type' = 'deploy.finished'
+                   order by e.session_seq desc limit 1),
+  'hold', (select jsonb_build_object('hold', h.hold, 'by', h.by, 'reason', h.reason,
+                                     'main', h.main, 'expires_ms', h.expires_ms)
+             from mission_source_holds h
+            where h.source = $1))";
+
 /// Residents (not retired) whose latest delivered task is cancelled: the
 /// dispatcher stops such a worker, sets the task's work aside and tells it
 /// (docs/fleet-architecture.md, "When a task closes"). The latest delivery
@@ -405,6 +473,28 @@ select jsonb_build_object(
              created_at_ms, updated_at_ms from mission_residents) r), '[]'::jsonb)
 )"
 );
+
+/// What the labels of the tasks `$1` (an array of ids) are made of, read
+/// as [`MISSION_BOARD`] reads them (the mission's whole text, a brief's
+/// first 600 characters), so a label is the one `/api/missions` gives:
+/// `{missions: [{id, text, sources, gate, accept, tasks: [{id, kind,
+/// agent_id, session_id, brief, state, objective}]}]}`, only the missions
+/// of those tasks and only those tasks. A task the record does not hold is
+/// not there.
+pub(crate) const TASK_LABEL_FACTS: &str = r"
+select jsonb_build_object(
+  'missions', coalesce((select jsonb_agg(jsonb_build_object(
+      'id', m.id, 'text', m.text, 'sources', m.sources, 'state', m.state,
+      'gate', m.gate, 'accept', m.accept,
+      'tasks', (select jsonb_agg(jsonb_build_object(
+          'id', k.id, 'kind', k.kind, 'agent_id', k.agent_id, 'session_id', k.session_id,
+          'brief', left(k.brief, 600), 'state', k.state, 'objective', k.objective)
+          order by k.id)
+        from mission_tasks k where k.mission_id = m.id and k.id = any($1)))
+      order by m.id desc)
+    from mission_missions m
+   where exists (select 1 from mission_tasks k where k.mission_id = m.id and k.id = any($1))),
+   '[]'::jsonb))";
 
 /// What the dashboard's labels are made of (`spawn serve`, serve/labels.rs):
 /// every mission with its text's start, the tasks a label can name (each
@@ -2023,6 +2113,11 @@ impl PostgresStore {
         self.query_json(LABEL_FACTS, &[])
     }
 
+    /// What the labels of `tasks` are made of ([`TASK_LABEL_FACTS`]).
+    pub fn task_label_facts(&self, tasks: &[i64]) -> Result<Value, StoreError> {
+        self.query_json(TASK_LABEL_FACTS, &[&tasks])
+    }
+
     /// A task's stages from the control stream, oldest first:
     /// `[{stage, verdict?, at_ms, took_ms?}]`, `took_ms` the time since the
     /// task's previous record. `[]` for a task with no records. The owner's
@@ -2078,6 +2173,28 @@ impl PostgresStore {
         Ok(self
             .query_opt(SOURCE_OWNER_LANDED, &[&source])?
             .and_then(|row| row.get::<_, Option<String>>(0)))
+    }
+
+    /// What deploy/on-landing.sh decides on ([`MAIN_LANDING`]): main's
+    /// gate-accepted landing on `source`, when the first landing after the
+    /// live commit `deployed` was, and the source's hold.
+    pub fn main_landing(
+        &self,
+        source: &str,
+        main: &str,
+        deployed: Option<&str>,
+    ) -> Result<Value, StoreError> {
+        Ok(self
+            .query_one(MAIN_LANDING, &[&source, &main, &deployed])?
+            .get(0))
+    }
+
+    /// Record how a deploy ended, `deploy.finished` (owner only; the shape
+    /// is checked by `spawn_deploy_record`). Returns the event's id.
+    pub fn deploy_record(&self, record: &Value) -> Result<i64, StoreError> {
+        Ok(self
+            .query_one("select spawn_deploy_record($1)", &[record])?
+            .get(0))
     }
 
     /// Residents whose latest delivered task is cancelled, with the
