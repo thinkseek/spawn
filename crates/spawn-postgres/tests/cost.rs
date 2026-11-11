@@ -244,7 +244,7 @@ fn archived(agent: &str, id: &str, model: &str, at_ms: i64, input: i64) -> Archi
 /// the record counts.
 #[test]
 fn an_archived_message_counts_once_for_the_task_its_agent_held() {
-    let (store, schema) = store("cost_archive");
+    let (store, _schema) = store("cost_archive");
     let (mission, task, worker) = one_task(&store);
     let now = store.database_now_ms().expect("now");
     assert_eq!(
