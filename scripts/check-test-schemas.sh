@@ -25,8 +25,6 @@ here=$(cd "$(dirname "$0")" && pwd)
 schemas() {
     (
         pg_url_export "$SPAWN_TEST_DATABASE_URL" || exit 2
-        # pg_url_export leaves the database out; the tests' is the URL's.
-        [ -z "$pg_url_database" ] || { PGDATABASE=$pg_url_database; export PGDATABASE; }
         names=$(psql -X -qtA -v ON_ERROR_STOP=1 \
             -c "select nspname from pg_namespace where nspname like 'spawn\_test\_%'") || exit 2
         [ -z "$names" ] || printf '%s\n' "$names" | LC_ALL=C sort
