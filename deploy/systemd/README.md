@@ -194,7 +194,7 @@ journalctl --user -u spawn-nightly@spawn -n 20
 Settings, in `spawn.env`: `SPAWN_NIGHTLY_WAIT_SECS` (7200),
 `SPAWN_NIGHTLY_POLL_SECS` (60, only without a slot budget),
 `SPAWN_NIGHTLY_SAMPLE_SECS` (15), `SPAWN_NIGHTLY_STALE_SECS` (93600),
-`SPAWN_NIGHTLY_STALE_RUNS` (2).
+`SPAWN_NIGHTLY_STALE_RUNS` (2), `SPAWN_NIGHTLY_LOCK_WAIT_SECS` (120: how long a run waits for an hourly check to let go of the lock).
 
 ## Deploying
 

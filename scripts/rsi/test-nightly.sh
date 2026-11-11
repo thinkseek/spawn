@@ -173,6 +173,7 @@ nightly() { # the nightly as its unit runs it: spawn.env's variables
   HOME="$scratch/home" PATH="$scratch/bin:$PATH" SPAWN_LIVE="$live" SPAWN_WORKSPACE_ROOT="$scratch/ws" \
     SPAWN_GATE_ENV_FILE="$scratch/gate-env" NIGHTLY_TEST_SCRATCH="$scratch" NIGHTLY_UNIT_ONLY=1 SPAWN_DATABASE_URL="$url" \
     SPAWN_NIGHTLY_WAIT_SECS="${WAIT:-60}" SPAWN_NIGHTLY_POLL_SECS=1 SPAWN_NIGHTLY_SAMPLE_SECS=1 \
+    SPAWN_NIGHTLY_LOCK_WAIT_SECS="${LOCKWAIT:-120}" \
     bash "$ctl/scripts/rsi/nightly.sh" spawn "$@" >"$scratch/out" 2>&1
 }
 field() { jq -r "$1" "$fact"; }
@@ -312,6 +313,13 @@ HOME="$scratch/home" PATH="$scratch/bin:$PATH" SPAWN_LIVE="$live" SPAWN_WORKSPAC
   NIGHTLY_TEST_SCRATCH="$scratch" SPAWN_DATABASE_URL="$url" \
   bash "$ctl/scripts/rsi/nightly.sh" --stale spawn >"$scratch/out" 2>&1
 check "--stale fires one alert ($(tail -n 1 "$scratch/out"))" [ "$(stale_keys)" = "nightly_stale:spawn:$(field .judged_at)" ]
+exec 7>>"$scratch/ws/nightly/.spawn.lock"
+flock 7
+HOME="$scratch/home" PATH="$scratch/bin:$PATH" SPAWN_LIVE="$live" SPAWN_WORKSPACE_ROOT="$scratch/ws" \
+  NIGHTLY_TEST_SCRATCH="$scratch" SPAWN_DATABASE_URL="$url" \
+  bash "$ctl/scripts/rsi/nightly.sh" --stale spawn >"$scratch/out.locked" 2>&1
+exec 7>&-
+check "--stale beside a run in progress does nothing" grep -q 'another nightly of spawn runs' "$scratch/out.locked"
 check "--stale runs no gate and writes no fact" bash -c '[ ! -s "$1" ] && [ "$(jq .at "$2")" -lt "$(($(date +%s) * 1000 - 90000000))" ]' _ "$scratch/calls" "$fact"
 nightly
 check "a run clears it" [ "$(stale_keys)" = "" ]
@@ -344,11 +352,21 @@ check "its work directory is gone" bash -c '! ls -d "$1"/.run-spawn.* 2>/dev/nul
 rm -f "$scratch/behave/023.sh"
 nightly
 
+echo "== a run beside a short holder of the lock (an hourly --stale) still judges"
+flock "$scratch/ws/nightly/.spawn.lock" sleep 2 &
+short=$!
+sleep 0.3
+before=$(field .at)
+LOCKWAIT=30 nightly
+wait "$short"
+check "it waited for the lock and judged ($(tail -n 1 "$scratch/out"))" \
+  bash -c '[ "$(jq .at "$1")" != "$2" ] && [ "$(jq -r .state "$1")" = green ]' _ "$fact" "$before"
+
 echo "== another nightly of the source runs"
 exec 7>>"$scratch/ws/nightly/.spawn.lock"
 flock 7
 before=$(field .at)
-nightly
+LOCKWAIT=1 nightly
 check "this one does nothing ($(tail -n 1 "$scratch/out"))" grep -q 'another nightly of spawn runs' "$scratch/out"
 check "the fact file is untouched" [ "$(field .at)" = "$before" ]
 exec 7>&-
