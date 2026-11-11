@@ -15,12 +15,9 @@ use crate::PostgresStore;
 /// the time of the earliest message the record holds (null: none). `usd` is the sum of the
 /// priced messages' costs, 0 for an entry with only unpriced ones (`null`
 /// for a model that is priced nowhere in the window); `unpriced_tokens` the
-<<<<<<< 1155249526e5d15669383056161873365c933c55
 /// four counts of the messages with no price (on every row: a model's, an
 /// execution's models' too, 0 when all of them are priced). Most costly
 /// first.
-=======
-/// four counts of the messages with no price. Most costly first.
 ///
 /// `landed` (objective 060): the tasks that landed or were accepted in the
 /// window, as the scorecard counts a landing (`spawn_task_spans`: an
@@ -29,7 +26,6 @@ use crate::PostgresStore;
 /// back or assigned again; `usd_per_landing` the window's priced dollars
 /// over them (null: none landed). Each mission's row carries its own, from
 /// its tasks and its dollars.
->>>>>>> 23e5537e9af2c998f40a0576df59082b049aa5d1
 const WINDOW: &str = r"
 with m as materialized (
   select c.*, c.input_tokens + c.output_tokens + c.cache_write_tokens
