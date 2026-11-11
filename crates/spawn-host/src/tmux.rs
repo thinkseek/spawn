@@ -49,9 +49,9 @@ pub struct TmuxHost {
     socket: Option<String>,
     /// [`HANGUP_WAIT`] and [`KILL_WAIT`], shorter in a test.
     waits: (Duration, Duration),
-    /// Where the leaders directory goes instead of `$XDG_RUNTIME_DIR`
-    /// ([`TmuxHost::with_leaders_under`]): a test's own.
-    leaders_base: Option<std::path::PathBuf>,
+    /// What this host keeps in `$XDG_RUNTIME_DIR` goes here instead
+    /// ([`TmuxHost::with_runtime_under`]): a test's own.
+    runtime_base: Option<std::path::PathBuf>,
 }
 
 /// One finished tmux call.
@@ -74,7 +74,7 @@ impl TmuxHost {
             program: program.to_string(),
             socket,
             waits: (HANGUP_WAIT, KILL_WAIT),
-            leaders_base: None,
+            runtime_base: None,
         }
     }
 
@@ -86,13 +86,31 @@ impl TmuxHost {
         self
     }
 
-    /// The same host, recording its terminals' pane leaders under `base`
-    /// instead of `$XDG_RUNTIME_DIR` (a test's private directory; the same
-    /// checks apply).
+    /// The same host, keeping under `base` what it would keep in
+    /// `$XDG_RUNTIME_DIR`: its terminals' pane leaders, and the private
+    /// files a launch's environment and a staged text pass through. A
+    /// test's own directory (the same checks apply), so that no test writes
+    /// in or removes from the real one (backlog S20).
     #[must_use]
-    pub fn with_leaders_under(mut self, base: std::path::PathBuf) -> Self {
-        self.leaders_base = Some(base);
+    pub fn with_runtime_under(mut self, base: std::path::PathBuf) -> Self {
+        self.runtime_base = Some(base);
         self
+    }
+
+    /// Where this host keeps its runtime files: [`TmuxHost::with_runtime_under`]'s
+    /// directory, else `$XDG_RUNTIME_DIR`.
+    fn runtime_directory(&self) -> Option<std::path::PathBuf> {
+        self.runtime_base
+            .clone()
+            .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from))
+    }
+
+    /// Where [`write_private`] files go: the runtime directory when it is a
+    /// directory, else the temporary directory.
+    fn private_directory(&self) -> std::path::PathBuf {
+        self.runtime_directory()
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(std::env::temp_dir)
     }
 
     /// The pids of the terminal's panes: each the leader of the session its
@@ -163,10 +181,7 @@ impl TmuxHost {
     /// written (rev-b on b279f33c). None without it: the pane alone, as
     /// before P6. `create` makes the two levels (0700) when missing.
     fn leaders_directory(&self, create: bool) -> Option<std::path::PathBuf> {
-        let base = self
-            .leaders_base
-            .clone()
-            .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from))?;
+        let base = self.runtime_directory()?;
         self.leaders_directory_in(&base, create)
     }
 
@@ -436,9 +451,10 @@ fn run_words_within(words: &[String], limit: Duration) -> Result<Run, TerminalEr
 }
 
 /// Write `environment` as `NAME='value'` lines to a new file only this uid
-/// can read (created exclusively, mode 600, in `XDG_RUNTIME_DIR` when there
-/// is one, else the temporary directory), for a pane's shell to source.
+/// can read (created exclusively, mode 600, in `directory`), for a pane's
+/// shell to source.
 fn write_environment(
+    directory: &std::path::Path,
     terminal: &TerminalName,
     environment: &[(String, String)],
 ) -> Result<std::path::PathBuf, TerminalError> {
@@ -459,7 +475,7 @@ fn write_environment(
         text.push_str(&spawn_core::shell::shell_quote(value));
         text.push('\n');
     }
-    write_private(terminal, LAUNCH, "env", "the environment", &text)
+    write_private(directory, terminal, LAUNCH, "env", "the environment", &text)
 }
 
 /// The kind of [`write_private`] file a launch's environment goes through
@@ -506,10 +522,12 @@ fn runner_of(terminal: &TerminalName, line: &str) -> Runner {
 }
 
 /// `text` in a new file only this uid reads (mode 600, created exclusively)
-/// in `XDG_RUNTIME_DIR` (else the temporary directory): what must reach tmux
-/// but never a command line, which every local user reads in /proc and tmux
-/// caps in size. The caller removes it.
+/// in `directory` ([`TmuxHost::private_directory`]: `XDG_RUNTIME_DIR`, else
+/// the temporary directory): what must reach tmux but never a command line,
+/// which every local user reads in /proc and tmux caps in size. The caller
+/// removes it.
 fn write_private(
+    directory: &std::path::Path,
     terminal: &TerminalName,
     kind: &str,
     extension: &str,
@@ -518,10 +536,6 @@ fn write_private(
 ) -> Result<std::path::PathBuf, TerminalError> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let directory = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .filter(|path| path.is_dir())
-        .unwrap_or_else(std::env::temp_dir);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
@@ -580,7 +594,11 @@ impl TmuxHost {
         // and removes before it runs the program. Every launch has that file,
         // empty or not: its name, on the pane's start command, is how
         // `runner` tells this launch from anything else of the same name.
-        let file = write_environment(&launch.terminal, &launch.environment)?;
+        let file = write_environment(
+            &self.private_directory(),
+            &launch.terminal,
+            &launch.environment,
+        )?;
         arguments.extend(
             [
                 "--",
@@ -650,7 +668,14 @@ impl TerminalHost for TmuxHost {
         // from a private file, not given on the command line: tmux refuses
         // a command over its message size (16 KiB), and a long prompt (an
         // objective's brief) is longer.
-        let path = write_private(terminal, "stage", "txt", "the text to stage", text)?;
+        let path = write_private(
+            &self.private_directory(),
+            terminal,
+            "stage",
+            "txt",
+            "the text to stage",
+            text,
+        )?;
         let load = vec![
             "load-buffer".to_string(),
             "-b".to_string(),
@@ -1407,10 +1432,10 @@ mod tests {
         std::fs::create_dir(&base).expect("base");
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).expect("0700");
         let host = super::TmuxHost::on_socket("tmux", Some(format!("p6-{}", std::process::id())))
-            .with_leaders_under(base.clone());
+            .with_runtime_under(base.clone());
         let other =
             super::TmuxHost::on_socket("tmux", Some(format!("p6-other-{}", std::process::id())))
-                .with_leaders_under(base.clone());
+                .with_runtime_under(base.clone());
         let terminal = TerminalName::new("spawn-exec_p6").expect("valid terminal");
         let write = |text: &str| {
             let directory = host.leaders_directory(true).expect("a private directory");
@@ -1479,7 +1504,7 @@ mod tests {
         let base = scratch.join("open-base");
         std::fs::create_dir(&base).expect("base");
         mode(&base, 0o777);
-        let host = super::TmuxHost::local("tmux").with_leaders_under(base.clone());
+        let host = super::TmuxHost::local("tmux").with_runtime_under(base.clone());
         assert_eq!(host.leaders_directory(true), None);
         host.record_leader(&terminal, me);
         assert_eq!(host.recorded_leader(&terminal), None);
@@ -1488,7 +1513,7 @@ mod tests {
         let base = scratch.join("private-base");
         std::fs::create_dir(&base).expect("base");
         mode(&base, 0o700);
-        let host = super::TmuxHost::local("tmux").with_leaders_under(base.clone());
+        let host = super::TmuxHost::local("tmux").with_runtime_under(base.clone());
         let user = base.join(format!(
             "spawn-leaders-{}",
             rustix::process::getuid().as_raw()
@@ -1516,7 +1541,7 @@ mod tests {
 
         // No base at all: nothing.
         std::fs::remove_file(&user).expect("unlink");
-        let host = super::TmuxHost::local("tmux").with_leaders_under(scratch.join("missing"));
+        let host = super::TmuxHost::local("tmux").with_runtime_under(scratch.join("missing"));
         assert_eq!(host.leaders_directory(true), None);
         let _ = std::fs::remove_dir_all(&scratch);
     }
