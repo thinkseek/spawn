@@ -4,7 +4,10 @@
 # source from the controller's checkout (scripts/), the deploy and backup
 # scripts, the relays and the systemd units (deploy/, scripts/*.py), and the
 # UI build's configuration, which deploy.sh executes (all of web/ but its
-# sources: vite.config.js and postcss.config.js load on their own),
+# sources and their tests: vite.config.js and postcss.config.js load on
+# their own; no script of the owner's (gate.sh, deploy.sh) runs web/test/,
+# and a change to web/src/ must be able to change the
+# test of what it changed, as crates/*/tests can),
 # and what picks or configures the Rust toolchain that builds the candidate
 # as the owner at deploy (rust-toolchain files, .cargo/).
 rsi/
@@ -12,6 +15,7 @@ scripts/
 deploy/
 web/
 !web/src/
+!web/test/
 !web/index.html
 rust-toolchain
 rust-toolchain.toml
