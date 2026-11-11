@@ -176,6 +176,16 @@ finish() {
             echo "047: the engines' last lines (ms agent what):" >&2
             tail -n 8 "$WORK/engine.log" >&2
         fi
+        # What says a window is settling (flake notes, sync/flake-047-056.md):
+        # each progress record as it stands, with the time it was written.
+        if [ -d "${SPAWN_WORKSPACE_ROOT-}/.transcripts-progress" ]; then
+            echo "047: the archive's progress records at $(date +%s%3N) (written-ms agent live known_ms behind_ms archived):" >&2
+            find "$SPAWN_WORKSPACE_ROOT/.transcripts-progress" -type f -name '*.json' 2>/dev/null |
+                while IFS= read -r record; do
+                    printf '%s %s\n' "$(stat -c %.3Y "$record" | tr -d .)" \
+                        "$(jq -r '"\(.agent) \(.live) \(.known_ms) \(.behind_ms) \(.archived)"' "$record" 2>/dev/null)"
+                done >&2
+        fi
     fi
     cleanup
     if [ "$rc" -eq 0 ]; then exit 0; fi
@@ -564,6 +574,11 @@ done
 u2=$(second_now)
 want2=$(live_total "$u2")
 sleep 6
+# The window to U0 is settled once a pass has read every live transcript
+# after U0 (its records then know past it): wait for that pass, which a
+# loaded host may hold back, before the readings check it stays settled.
+until_card "$u0" "$want0" false 15 ||
+    fail "(2) the window to $(iso "$u0"), which ended before held's turn began, reads [tokens settling] [$reading] 15 s on while held's archive is held; it holds $want0 tokens and is settled: only a call before a window's end holds it open"
 for i in 1 2 3; do
     reading=$(card "$u2")
     [ "${reading#* }" = true ] ||

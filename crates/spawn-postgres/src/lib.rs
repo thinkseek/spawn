@@ -93,6 +93,8 @@ mod recovery;
 mod row;
 mod scorecard;
 mod sessions;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 mod wake;
 
 pub use acks::{AckRecord, ReportAnswer};
