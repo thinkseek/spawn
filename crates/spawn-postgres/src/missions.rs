@@ -1084,12 +1084,33 @@ select coalesce(jsonb_agg(jsonb_build_object('mission', m.id,
 /// Open objective missions (`objectives` = `{backlog, resident}`), for the
 /// RSI page: settings, the resident, and every task newest first with its
 /// gate verdicts from the control stream (oldest first, without logs).
+/// Also what the integrator's choice reads besides the tasks and their
+/// outcomes: `configured_ms` (when the mission was last configured, as
+/// [`GATED`] reads it: an overrun chain's hold ends with a newer one) and
+/// `solved_on_base`, the mission's `objective.solved` records, oldest first
+/// (`[{event, objective, task, base, at_ms}]`): the records
+/// [`OBJECTIVE_LANDINGS`] counts as landings, by the same condition.
 pub(crate) const OBJECTIVE_MISSIONS: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
   select m.id, m.text, m.state, m.sources, m.gate, m.accept, m.budget, m.baseline, m.halted,
          m.scenario_floor, m.gate_rejections, m.gate_aborts, m.objectives,
          m.created_at_ms, m.updated_at_ms,
+         (select max(e.recorded_at_ms) from spawn_events e
+           where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+             and e.kind -> 'detail' -> 'record' ->> 'type' = 'mission.configured'
+             and e.kind -> 'detail' -> 'record' ->> 'id' = m.id::text) as configured_ms,
+         coalesce((select jsonb_agg(jsonb_build_object(
+                     'event', e.id,
+                     'objective', (e.kind -> 'detail' -> 'record' ->> 'objective')::integer,
+                     'task', (e.kind -> 'detail' -> 'record' ->> 'task')::bigint,
+                     'base', e.kind -> 'detail' -> 'record' ->> 'base',
+                     'at_ms', e.recorded_at_ms) order by e.session_seq, e.id)
+                     from spawn_events e
+                    where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                      and e.kind -> 'detail' -> 'record' ->> 'type' = 'objective.solved'
+                      and e.kind -> 'detail' -> 'record' ->> 'id' = m.id::text), '[]'::jsonb)
+           as solved_on_base,
          (select jsonb_build_object('name', r.name, 'agent_id', r.agent_id,
                                     'session_id', r.session_id, 'state', r.state)
             from mission_residents r where r.name = m.objectives ->> 'resident') as resident,
