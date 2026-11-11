@@ -150,6 +150,7 @@ fn a_refused_command_sent_again_continues_its_intent() {
     let mut client = admin(&schema);
     let note = input("note B");
     let w1 = ("human", "session_w1", &note);
+    let (cli, w2) = (("spawn", "session_w1", &note), ("human", "session_w2", &note));
     // Refused twice (a dispatcher's same text between, not a person's),
     // then taken: one intent.
     let a1 = command(&mut client, w1, 0, End::Failed, None);
@@ -160,83 +161,27 @@ fn a_refused_command_sent_again_continues_its_intent() {
     // Sent again after it was taken: a new intent.
     let b = command(&mut client, w1, 4, End::Ok, None);
     // Another principal, another session, another action: new ones.
-    let other_principal = command(
-        &mut client,
-        ("spawn", "session_w1", &note),
-        5,
-        End::Ok,
-        None,
-    );
-    let other_session = command(
-        &mut client,
-        ("human", "session_w2", &note),
-        6,
-        End::Ok,
-        None,
-    );
+    let other_principal = command(&mut client, cli, 5, End::Ok, None);
+    let other_session = command(&mut client, w2, 6, End::Ok, None);
     let stop = json!({"type": "stop"});
-    let s1 = command(
-        &mut client,
-        ("human", "session_w1", &stop),
-        7,
-        End::Failed,
-        None,
-    );
-    let s2 = command(
-        &mut client,
-        ("human", "session_w1", &stop),
-        8,
-        End::Ok,
-        None,
-    );
+    let w1_stop = ("human", "session_w1", &stop);
+    let s1 = command(&mut client, w1_stop, 7, End::Failed, None);
+    let s2 = command(&mut client, w1_stop, 8, End::Ok, None);
     // More than 60 minutes after the refusal: a new intent.
     let late = input("late");
-    let l1 = command(
-        &mut client,
-        ("human", "session_w1", &late),
-        10,
-        End::Failed,
-        None,
-    );
-    let l2 = command(
-        &mut client,
-        ("human", "session_w1", &late),
-        71,
-        End::Failed,
-        None,
-    );
+    let w1_late = ("human", "session_w1", &late);
+    let l1 = command(&mut client, w1_late, 10, End::Failed, None);
+    let l2 = command(&mut client, w1_late, 71, End::Failed, None);
     // Sent again before the refusal finished: a new intent.
     let slow = input("slow");
-    let f1 = command(
-        &mut client,
-        ("human", "session_w1", &slow),
-        100,
-        End::Failed,
-        Some(110),
-    );
-    let f2 = command(
-        &mut client,
-        ("human", "session_w1", &slow),
-        105,
-        End::Ok,
-        None,
-    );
+    let w1_slow = ("human", "session_w1", &slow);
+    let f1 = command(&mut client, w1_slow, 100, End::Failed, Some(110));
+    let f2 = command(&mut client, w1_slow, 105, End::Ok, None);
     // Refused, then still pending: one intent, pending.
     let wait = input("wait");
-    let p1 = command(
-        &mut client,
-        ("human", "session_w1", &wait),
-        120,
-        End::Failed,
-        None,
-    );
-    let p2 = command(
-        &mut client,
-        ("human", "session_w1", &wait),
-        121,
-        End::Pending,
-        None,
-    );
+    let w1_wait = ("human", "session_w1", &wait);
+    let p1 = command(&mut client, w1_wait, 120, End::Failed, None);
+    let p2 = command(&mut client, w1_wait, 121, End::Pending, None);
 
     let taken = || "taken".to_string();
     let failed = || "failed".to_string();
