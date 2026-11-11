@@ -1074,6 +1074,69 @@ fn gate_time_is_the_median_wall_clock_of_the_runs_that_name_one() {
     assert_eq!(dimension(&fleet, None, "cost")["gate_ms"], json!(1_800_000));
 }
 
+/// Objective 067: the gate time the window's runs spent, and what of it
+/// decided nothing (aborted, no_room, host_fault, stale), for the fleet and
+/// each mission; a record with no gate time, or a run outside the window,
+/// adds nothing.
+#[test]
+fn gate_time_says_how_much_of_it_decided_nothing() {
+    let mut story = Story::default();
+    story.mission(1, true).mission(2, true);
+    for task in 1..=8 {
+        story.assign(at(0), task, if task <= 6 { 1 } else { 2 }, None, "spawn-integrate");
+    }
+    story
+        .gated(at(1), 1, "accepted", Some(600_000))
+        .gated(at(1), 2, "rejected", Some(900_000))
+        .gated(at(2), 3, "conflict", Some(300_000))
+        .gated(at(2), 4, "aborted", Some(1_200_000))
+        .gated(at(3), 5, "host_fault", Some(480_000))
+        // Stale as the integrator writes it when main moved under the gate.
+        .rec(
+            at(3),
+            json!({"type": "task.gated", "id": 6, "verdict": "stale", "found": "accepted",
+                   "main_now": "m", "revision": 0, "gate_ms": 420_000}),
+        )
+        // A stale with no gate run behind it (discarded): nothing.
+        .rec(
+            at(4),
+            json!({"type": "task.gated", "id": 6, "verdict": "stale", "found": "discarded"}),
+        )
+        .gated(at(4), 7, "no_room", Some(60_000))
+        .gated(at(5), 8, "incompatible", Some(240_000))
+        // Outside the window.
+        .gated(at(30), 7, "aborted", Some(9_000_000))
+        .gated(at(-2), 8, "host_fault", Some(9_000_000));
+    let history = story.history();
+    let parts = |scope: Scope| {
+        let gate = dimension(
+            &counts(&history, scope, window_hours(0, 24)),
+            None,
+            "gate_time",
+        );
+        json!({"runs": gate["runs"], "total_ms": gate["total_ms"],
+               "undecided_ms": gate["undecided_ms"], "undecided_runs": gate["undecided_runs"]})
+    };
+    assert_eq!(
+        parts(Scope::Fleet),
+        json!({"runs": 8, "total_ms": 4_200_000, "undecided_ms": 2_160_000, "undecided_runs": 4})
+    );
+    assert_eq!(
+        parts(Scope::Mission(1)),
+        json!({"runs": 6, "total_ms": 3_900_000, "undecided_ms": 2_100_000, "undecided_runs": 3}),
+        "65 min, 35 of them aborted, host_fault and stale"
+    );
+    assert_eq!(
+        parts(Scope::Mission(2)),
+        json!({"runs": 2, "total_ms": 300_000, "undecided_ms": 60_000, "undecided_runs": 1})
+    );
+    // No run: zeros, not missing.
+    assert_eq!(
+        parts(Scope::Mission(3)),
+        json!({"runs": 0, "total_ms": 0, "undecided_ms": 0, "undecided_runs": 0})
+    );
+}
+
 #[test]
 fn keys_and_tags_name_their_task() {
     assert_eq!(delivery_of("deliver-6-0"), Some((6, "deliver-6-0")));
