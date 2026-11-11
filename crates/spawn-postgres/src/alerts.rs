@@ -316,7 +316,9 @@ select jsonb_build_object(
 /// The missions the `controller_behind` alert reads (P22), on the
 /// database's clock: `{now_ms, missions}`, each gated mission open or
 /// active and not halted that has a reported task, with its gate, its
-/// first source (the one it lands on) and the owner's latest landing on
+/// first source (the one it lands on: `sources ->> 0`, as the integrator's
+/// `gated_missions` reads it, so the alert and the wait judge one source)
+/// and the owner's latest landing on
 /// that source (`landed`: the latest `source.moved` record's `to`, or
 /// null).
 pub(crate) const CONTROLLERS: &str = r"
@@ -426,7 +428,7 @@ impl PostgresStore {
     }
 
     /// The missions whose controller the `controller_behind` alert
-    /// compares with main ([`CONTROLLERS`]).
+    /// compares with the owner's latest landing ([`CONTROLLERS`]).
     pub fn alert_controllers(&self) -> Result<Value, StoreError> {
         self.query_json(CONTROLLERS, &[])
     }
