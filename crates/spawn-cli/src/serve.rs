@@ -108,7 +108,10 @@ use tiny_http::{Header, Method, Request, Response, Server};
 use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::TerminalHost;
 
-use crate::objectives::{Landing, Task, landed_value, load_backlog, metric_lines};
+use crate::objectives::{
+    Landing, Outcome, Task, attempts, choose, holds, landed_value, load_backlog, metric_lines,
+    overruns,
+};
 use crate::{Flags, env_or, env_value};
 
 /// Prefix of an error that answers 400.
@@ -1391,17 +1394,51 @@ fn rsi_overview() -> Result<Value, String> {
     }))
 }
 
-/// Open objective missions with their backlog's objectives filled in.
-fn objective_missions(store: &spawn_postgres::PostgresStore) -> Result<Vec<Value>, String> {
+/// Open objective missions with their backlog's objectives filled in, each
+/// with its tasks' outcomes (`PostgresStore::objective_outcomes`, the
+/// integrator's own read) for [`with_objectives`]'s `next_objective`.
+pub(crate) fn objective_missions(
+    store: &spawn_postgres::PostgresStore,
+) -> Result<Vec<Value>, String> {
     let missions = store.objective_missions().map_err(err)?;
     let Value::Array(missions) = missions else {
         return Ok(Vec::new());
     };
-    Ok(missions.into_iter().map(with_objectives).collect())
+    missions
+        .into_iter()
+        .map(|mut mission| {
+            if let Some(id) = mission["id"].as_i64() {
+                let outcomes = store.objective_outcomes(id).map_err(err)?;
+                if let Some(fields) = mission.as_object_mut() {
+                    fields.insert("outcomes".to_string(), outcomes);
+                }
+            }
+            Ok(with_objectives(mission))
+        })
+        .collect()
+}
+
+/// Whether a task of an objective mission is in flight: from its
+/// assignment until it lands or is cancelled. Accepted work of a mission
+/// with a gate still waits for the gate and then lands; accepted without
+/// one is closed.
+fn task_in_flight(task: &Value, gated: bool) -> bool {
+    match task["state"].as_str() {
+        Some("landed" | "cancelled") | None => false,
+        Some("accepted") => gated,
+        Some(_) => true,
+    }
 }
 
 /// One mission row with `backlog`, `backlog_error`, `objectives` and
-/// `next_objective` added.
+/// `next_objective` added. The row's `solved_on_base` (the mission's
+/// `objective.solved` records) and `outcomes` (its tasks' outcomes, when
+/// read) are taken out: each objective row names its own record, and
+/// `next_objective` is what [`crate::objectives::choose`] gives one free
+/// slot from the integrator's own inputs (the landings, landed tasks and
+/// `objective.solved` records as `OBJECTIVE_LANDINGS`; the objectives with
+/// a task in flight; the attempts; the held objectives), null when it
+/// would assign nothing.
 pub(crate) fn with_objectives(mut mission: Value) -> Value {
     let backlog = mission
         .pointer("/objectives/backlog")
@@ -1419,26 +1456,100 @@ pub(crate) fn with_objectives(mut mission: Value) -> Value {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let (solved, outcomes) = match mission.as_object_mut() {
+        Some(fields) => (fields.remove("solved_on_base"), fields.remove("outcomes")),
+        None => (None, None),
+    };
+    let solved: Vec<Value> = solved
+        .and_then(|solved| solved.as_array().cloned())
+        .unwrap_or_default();
+    let outcomes: Vec<Outcome> = outcomes
+        .and_then(|outcomes| serde_json::from_value(outcomes).ok())
+        .unwrap_or_default();
+    let record = |id: u32| {
+        solved
+            .iter()
+            .find(|record| record["objective"].as_u64() == Some(u64::from(id)))
+    };
     let rows: Vec<Value> = objectives
         .iter()
-        .map(|objective| objective_json(objective, &tasks))
+        .map(|objective| objective_json(objective, &tasks, record(objective.id)))
         .collect();
-    let next = rows
-        .iter()
-        .find(|row| row["status"] == "open")
-        .map(|row| row["id"].clone());
+    let next = next_objective(&mission, &objectives, &tasks, &solved, &outcomes);
     if let Some(fields) = mission.as_object_mut() {
         fields.insert("backlog".to_string(), json!(backlog));
         fields.insert("backlog_error".to_string(), json!(error));
-        fields.insert("next_objective".to_string(), next.unwrap_or(Value::Null));
+        fields.insert("next_objective".to_string(), json!(next));
         fields.insert("objectives".to_string(), Value::Array(rows));
     }
     mission
 }
 
+/// What the integrator assigns next in `mission`: the objective
+/// [`crate::objectives::choose`] gives one free slot, from the same inputs
+/// as `crate::objectives::assign_next`.
+fn next_objective(
+    mission: &Value,
+    objectives: &[Task],
+    tasks: &[Value],
+    solved: &[Value],
+    outcomes: &[Outcome],
+) -> Option<u32> {
+    // Newest first, as `OBJECTIVE_LANDINGS` gives them (`landed_value`
+    // reads the first metric); a record solved on the base has none.
+    let mut landed: Vec<&Value> = tasks
+        .iter()
+        .filter(|task| task["state"] == "landed")
+        .collect();
+    landed.sort_by_key(|task| {
+        std::cmp::Reverse((task["updated_at_ms"].as_i64(), task["id"].as_i64()))
+    });
+    let landings: Vec<Landing> = landed
+        .iter()
+        .filter_map(|task| {
+            Some(Landing {
+                objective: u32::try_from(task["objective"].as_u64()?).ok()?,
+                metric: task["metric"].as_str().map(str::to_string),
+            })
+        })
+        .chain(solved.iter().filter_map(|record| {
+            Some(Landing {
+                objective: u32::try_from(record["objective"].as_u64()?).ok()?,
+                metric: None,
+            })
+        }))
+        .collect();
+    let gated = !mission["gate"].is_null();
+    let in_flight: BTreeSet<u32> = tasks
+        .iter()
+        .filter(|task| task_in_flight(task, gated))
+        .filter_map(|task| u32::try_from(task["objective"].as_u64()?).ok())
+        .collect();
+    let configured_ms = mission["configured_ms"].as_i64();
+    let held: BTreeSet<u32> = overruns(outcomes)
+        .iter()
+        .filter(|(_, overrun)| holds(overrun, configured_ms))
+        .map(|(objective, _)| *objective)
+        .collect();
+    choose(
+        objectives,
+        &landings,
+        &in_flight,
+        &attempts(outcomes),
+        &held,
+        1,
+    )
+    .first()
+    .map(|task| task.id)
+}
+
 /// One backlog objective with its status and landings, from the mission's
-/// tasks (newest first).
-fn objective_json(objective: &Task, tasks: &[Value]) -> Value {
+/// tasks (newest first), and `solved`, the mission's `objective.solved`
+/// record of it if one: a one-shot objective solved on the base is
+/// solved, as a landing makes it, and its row names the record
+/// (`solved_on_base`: `{event, task, base}`, null for every other
+/// objective).
+fn objective_json(objective: &Task, tasks: &[Value], solved: Option<&Value>) -> Value {
     let mine: Vec<&Value> = tasks
         .iter()
         .filter(|task| task["objective"].as_u64() == Some(u64::from(objective.id)))
@@ -1470,7 +1581,7 @@ fn objective_json(objective: &Task, tasks: &[Value]) -> Value {
         } else {
             "open"
         }
-    } else if landed.is_empty() {
+    } else if landed.is_empty() && solved.is_none() {
         "open"
     } else {
         "solved"
@@ -1510,6 +1621,11 @@ fn objective_json(objective: &Task, tasks: &[Value]) -> Value {
         "current": current,
         "tasks": mine.iter().map(|task| task["id"].clone()).collect::<Vec<_>>(),
         "landings": history,
+        "solved_on_base": solved.map(|record| json!({
+            "event": record["event"],
+            "task": record["task"],
+            "base": record["base"],
+        })),
     })
 }
 
@@ -1532,11 +1648,7 @@ fn rsi_summary(mission: &Value) -> Value {
     let open_task = mission["tasks"].as_array().and_then(|tasks| {
         tasks
             .iter()
-            .find(|task| match task["state"].as_str() {
-                Some("landed" | "cancelled") | None => false,
-                Some("accepted") => gated,
-                Some(_) => true,
-            })
+            .find(|task| task_in_flight(task, gated))
             .map(|task| {
                 json!({
                     "id": task["id"],
