@@ -196,6 +196,15 @@ jq . ~/.local/share/spawn-rsi/ws/nightly/spawn.json
 journalctl --user -u spawn-nightly@spawn -n 20
 ```
 
+To retire a source's nightly, stop its timers and remove its fact file
+with them: a red fact left behind holds that source's tasks for good (step
+5b reads it whether or not a nightly still runs).
+
+```sh
+systemctl --user disable --now spawn-nightly@spawn.timer spawn-nightly-stale@spawn.timer
+rm -f ~/.local/share/spawn-rsi/ws/nightly/spawn.json
+```
+
 Settings, in `spawn.env`: `SPAWN_NIGHTLY_WAIT_SECS` (7200),
 `SPAWN_NIGHTLY_POLL_SECS` (60, only without a slot budget),
 `SPAWN_NIGHTLY_SAMPLE_SECS` (15), `SPAWN_NIGHTLY_STALE_SECS` (93600),
