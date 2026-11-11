@@ -439,10 +439,13 @@ fn parts_of(name: &str, field: &dyn Fn(&str) -> Value) -> String {
             )
         }
         "gate_time" => format!(
-            "runs {} (the owner's {}, tasks' {})",
+            "runs {} (the owner's {}, tasks' {}); undecided {} of {} over {} runs",
             show(&field("runs")),
             show(&field("owner_runs")),
-            show(&field("task_runs"))
+            show(&field("task_runs")),
+            ms(&field("undecided_ms")),
+            ms(&field("total_ms")),
+            show(&field("undecided_runs"))
         ),
         _ => String::new(),
     }
