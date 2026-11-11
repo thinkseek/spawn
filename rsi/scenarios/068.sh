@@ -13,12 +13,13 @@
 # Required (read through `GET /api/cost?window=24h` and web/src/cost.ts's
 # costView under node over it):
 #   (1) costView(answer).tasks holds the 10 costliest tasks, most costly
-#       first, and `tasks_more` the rest: {count, usd, text}, text "<n>
-#       more tasks · <dollars>" ("1 more task" for one); null with 10 or
-#       fewer. `agents` and `agents_more` the same ("<n> more agents").
+#       first, and `tasks_more` the rest: {count, usd, text}, usd their
+#       dollars summed and rounded to cents, text "<n> more tasks ·
+#       <dollars>" ("1 more task" for one); null with 10 or fewer.
+#       `agents` and `agents_more` the same ("<n> more agents").
 #   (2) every Row carries `share`, its dollars over the window's: a whole
-#       percent ("14%"), "<1%" when above zero and under one percent, null
-#       when the window cost nothing priced.
+#       percent, rounded to the nearest ("14%"), "<1%" when above zero and
+#       under one percent, null when the window cost nothing priced.
 #
 # The history is seeded as the store holds it: tasks assigned through
 # spawn_control_record() and folded, and each worker's model calls as the
