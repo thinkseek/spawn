@@ -44,13 +44,16 @@ export interface LadderFigures {
 
 /** One mission's idle time over the window: its open span (from its
  * `mission.added` to its close, clipped) less the hours a task of it was in
- * flight. Idle when that is more than half the span. */
+ * flight. Idle when that is more than half the span, unless the mission is
+ * owner work (no objective backlog: its work comes from the owner, so an hour
+ * without a task there is no loss), which is never idle. */
 export interface MissionIdle {
   mission: number;
   text: string;
   hours: number;
   idleHours: number;
   idle: boolean;
+  ownerWork: boolean;
 }
 
 /** The window's interventions (design §15 autonomy (a)-(d)), by kind. */
@@ -151,7 +154,8 @@ export function decisionsFromApi(answer: unknown): DecisionWindow {
         text: typeof mission.text === "string" ? mission.text : "",
         hours: num(mission.hours),
         idleHours: num(mission.idle_hours),
-        idle: mission.idle === true,
+        idle: mission.idle === true && mission.owner_work !== true,
+        ownerWork: mission.owner_work === true,
       };
     }),
   };

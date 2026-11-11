@@ -70,6 +70,27 @@ for tool in psql tmux git jq od bash sed grep awk curl node; do
 done
 
 WORK=$(mktemp -d) || harness "mktemp failed"
+# Gone again if a check below refuses, before the cleanup is set.
+trap 'rm -rf "$WORK"' EXIT
+# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
+# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+HOME=$WORK/home
+TMUX_TMPDIR=$WORK/tmux-sock
+mkdir -p "$HOME" "$TMUX_TMPDIR"
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
+export HOME TMUX_TMPDIR
+# The runtime directory too (backlog S20): what Spawn keeps there (a
+# launch's environment file, its terminals' leaders) stays in WORK, never
+# in the real one. systemd's user manager stays reachable by its bus.
+real_runtime=${XDG_RUNTIME_DIR-}
+if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
+    DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
+    export DBUS_SESSION_BUS_ADDRESS
+fi
+XDG_RUNTIME_DIR=$WORK/runtime
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_056_runs_$run"
@@ -93,7 +114,6 @@ cleanup() {
         wait "$pid" 2>/dev/null || true
     done
     tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-    rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SPAWN_TMUX_SOCKET"
     if [ -n "$database_made" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
@@ -109,6 +129,18 @@ finish() {
             tail -n 10 "$WORK/loop.log" >&2
         fi
         if [ -n "$database_made" ]; then
+            # The timeline a missed notice is read from (flake notes,
+            # sync/flake-047-056.md): the markers' records and the task
+            # notices, by event id and time.
+            echo "056: the task records (event id, recorded ms, type, task):" >&2
+            psql -d "$SPAWN_DB_NAME" -tA -c "select id, recorded_at_ms, kind -> 'detail' -> 'record' ->> 'type',
+                       kind -> 'detail' -> 'record' ->> 'id'
+                  from spawn_events where session_id = 'session_control' and event_name = 'control.recorded'
+                   and kind -> 'detail' -> 'record' ->> 'type' like 'task.%' order by id" >&2 2>/dev/null || true
+            echo "056: the task notices (key, fired event id, fired ms):" >&2
+            psql -d "$SPAWN_DB_NAME" -tA -c "select key, fired_event_id, fired_at_ms from spawn_alerts
+                 where kind = 'task_state' order by fired_event_id" >&2 2>/dev/null || true
+            echo "056: now $(date +%s%3N) ms" >&2
             echo "056: the validator alerts (key, subject, state, evidence, cleared evidence):" >&2
             psql -d "$SPAWN_DB_NAME" -tA -c "select key, subject, state, evidence::text, coalesce(cleared_evidence::text, '')
                 from spawn_alerts where kind = 'validator_defect' order by fired_event_id" >&2 2>/dev/null || true
@@ -289,6 +321,23 @@ read_past() { # <what>: writes a marker task record and waits for its notice
     wait_until 30 marker_seen "$m" ||
         harness "$1: 30 s after record $m the loop's alert step has fired no task notice on it"
 }
+# The start: the step reads from where the log stands when it starts, so a
+# marker written before that is never read, and its notice would wait on
+# the task's next record (a delivery the dispatcher makes at its own pace;
+# a loaded gate flaked here, sync/flake-047-056.md). So markers are written
+# until one is noticed, a new one every 5 s for at most 60 s: from that one
+# on, the step is reading, and every later marker's own record fires.
+until_reading() {
+    # Not `deadline`: wait_until sets that one (cc-rules (b)).
+    reading_by=$(($(now) + 60))
+    while :; do
+        marker=$((marker + 1))
+        m=$(record "{\"type\":\"task.assigned\",\"id\":$marker,\"mission_id\":4,\"objective\":$marker,\"kind\":\"ephemeral\",\"created_by\":\"spawn-integrate\",\"agent_id\":\"agent_worker_objective_$marker\",\"session_id\":\"session_worker_objective_$marker\",\"scenario\":\"$WORK/ctl/scenarios/objective-$marker\",\"brief\":\"marker\"}")
+        wait_until 5 marker_seen "$m" && return 0
+        [ "$(now)" -lt "$reading_by" ] ||
+            harness "the start: 60 s of markers (the last record $m) and the loop's alert step has fired no task notice on any"
+    done
+}
 marker_seen() {
     [ "$(q "select count(*) from spawn_alerts where kind = 'task_state' and subject = 'task #$marker'
               and (evidence ->> 'event_id')::bigint >= $1")" -gt 0 ]
@@ -369,7 +418,7 @@ done
 "$SPAWN_BIN" loop --repo "$repo" --root "$SPAWN_WORKSPACE_ROOT" >>"$WORK/loop.log" 2>&1 &
 loop_pid=$!
 start_serve
-read_past "the start"
+until_reading
 close_mission 3 >/dev/null
 read_past "mission 3 closed"
 

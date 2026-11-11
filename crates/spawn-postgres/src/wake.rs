@@ -135,10 +135,7 @@ mod tests {
         use spawn_core::port::CommandQueue;
         let url = std::env::var("SPAWN_TEST_DATABASE_URL")
             .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database");
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.subsec_nanos());
-        let schema = format!("spawn_test_wake_{}_{nanos:x}", std::process::id());
+        let schema = crate::testing::TestSchema::new("wake");
         let store = PostgresStore::connect_in_schema(&url, &schema).expect("migrate");
         let mut listener = store.listen().expect("listen");
         // The channel is the database's, not the schema's: another case's
@@ -174,10 +171,6 @@ mod tests {
             "the append moved the watermark"
         );
         drop(store);
-        let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("admin");
-        admin
-            .batch_execute(&format!("drop schema {schema} cascade"))
-            .expect("drop the schema");
     }
 
     /// `next_lease_ms` dates the wait the Bridge's claim would otherwise
@@ -187,10 +180,7 @@ mod tests {
         use spawn_core::port::CommandQueue;
         let url = std::env::var("SPAWN_TEST_DATABASE_URL")
             .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database");
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.subsec_nanos());
-        let schema = format!("spawn_test_lease_{}_{nanos:x}", std::process::id());
+        let schema = crate::testing::TestSchema::new("lease");
         let store = PostgresStore::connect_in_schema(&url, &schema).expect("migrate");
         assert_eq!(
             store.next_lease_ms().expect("lease"),
@@ -221,9 +211,5 @@ mod tests {
         let due = store.next_lease_ms().expect("lease").expect("a lease");
         assert!(due > 0, "the claimed command's lease dates the next pass");
         drop(store);
-        let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("admin");
-        admin
-            .batch_execute(&format!("drop schema {schema} cascade"))
-            .expect("drop the schema");
     }
 }

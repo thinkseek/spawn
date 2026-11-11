@@ -23,7 +23,7 @@ fn exists(schema: &str) -> bool {
 
 #[test]
 fn a_schema_made_through_its_url_alone_is_dropped_with_its_guard() {
-    let schema = Schema::fresh("guard_url");
+    let schema = Schema::new("guard_url");
     let name = schema.to_string();
     assert!(!exists(&name), "a fresh name names no schema yet");
     PostgresStore::connect(&schema_url(&schema))
@@ -38,7 +38,7 @@ fn a_schema_made_through_its_url_alone_is_dropped_with_its_guard() {
 #[test]
 fn several_schemas_of_one_case_are_each_dropped_with_their_guards() {
     let schemas: Vec<Schema> = (0..3)
-        .map(|number| Schema::fresh(&format!("guard_many_{number}")))
+        .map(|number| Schema::new(&format!("guard_many_{number}")))
         .collect();
     let names: Vec<String> = schemas.iter().map(ToString::to_string).collect();
     for schema in &schemas {

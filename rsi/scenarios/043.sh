@@ -24,6 +24,8 @@
 #      -50; t2 assigned -100, landed -90; t3 assigned -20, landed -10; t4
 #      assigned -5, delivered, open. Resumed (mission.resumed) at -70.
 #   M2 (added -48): t5 assigned -40 by human, accepted by review -24.
+#   M1, M2 and M3 each take their work from an objective backlog (configured
+#   as added), so their hours without a task are idle hours.
 #   M3 (added -400, closed -300): t6 assigned -360, cancelled by human -350;
 #      t8 assigned -349 with t6's brief (a cancel-and-reassign), accepted by
 #      review -320.
@@ -96,6 +98,27 @@ for tool in psql jq od curl sed grep node; do
 done
 
 WORK=$(mktemp -d) || harness "mktemp failed"
+# Gone again if a check below refuses, before the cleanup is set.
+trap 'rm -rf "$WORK"' EXIT
+# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
+# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+HOME=$WORK/home
+TMUX_TMPDIR=$WORK/tmux-sock
+mkdir -p "$HOME" "$TMUX_TMPDIR"
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
+export HOME TMUX_TMPDIR
+# The runtime directory too (backlog S20): what Spawn keeps there (a
+# launch's environment file, its terminals' leaders) stays in WORK, never
+# in the real one. systemd's user manager stays reachable by its bus.
+real_runtime=${XDG_RUNTIME_DIR-}
+if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
+    DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
+    export DBUS_SESSION_BUS_ADDRESS
+fi
+XDG_RUNTIME_DIR=$WORK/runtime
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_043_health_$run"
@@ -212,6 +235,12 @@ language sql as $$
 select pg_temp.rec(-720, '{"type":"mission.added","id":1,"text":"043 busy","origin":"human","sources":[]}');
 select pg_temp.rec(-400, '{"type":"mission.added","id":3,"text":"043 closed","origin":"human","sources":[]}');
 select pg_temp.rec(-48, '{"type":"mission.added","id":2,"text":"043 idle","origin":"human","sources":[]}');
+-- Each takes its work from an objective backlog, so its hours without a
+-- task are idle hours (objective 062: a mission without one is owner work,
+-- never flagged idle). Configured as it is added; review, no gate, as before.
+select pg_temp.rec(h, jsonb_build_object('type', 'mission.configured', 'id', id, 'accept', 'review',
+    'objectives', jsonb_build_object('backlog', '/nonexistent/043-backlog', 'resident', 'bb043', 'workers', 1)))
+  from (values (-720, 1), (-400, 3), (-48, 2)) as m(h, id);
 
 select pg_temp.assign(-700, 1, 1, 'spawn_supervisor', 'Task one');
 select pg_temp.rec(-700, '{"type":"task.delivered","id":1,"command_id":1}');

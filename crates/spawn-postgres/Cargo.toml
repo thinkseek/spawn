@@ -16,8 +16,13 @@ postgres-protocol.workspace = true
 fallible-iterator.workspace = true
 spawn-kdf.workspace = true
 
+[features]
+# The test schema guard (`testing::TestSchema`), for tests only.
+testing = []
+
 [dev-dependencies]
 spawn-core = { workspace = true, features = ["testing"] }
+spawn-postgres = { path = ".", features = ["testing"] }
 
 [lints]
 workspace = true

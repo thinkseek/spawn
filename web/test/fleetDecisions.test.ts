@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { decisionsFromHealth } from "../src/fleetDecisions.ts";
+import { decisionsFromApi, decisionsFromHealth } from "../src/fleetDecisions.ts";
 
 const health = {
   last_hour: {
@@ -41,4 +41,27 @@ test("the 24 h ladder: every step, liveness, the extra tiers and the human rate"
   assert.deepEqual(ladder.extra, [["owner_gate", 4]]);
   assert.deepEqual([ladder.humanPerAgentHour, ladder.agentHours, ladder.toolCallsPerHour, ladder.failuresPerHour], [0.05, 40, 140, 3]);
   assert.equal(decisionsFromHealth({ ...health, ladder_24h: {} }).ladder.counts.human, 0, "a step the server leaves out counts 0");
+});
+
+test("idle hours by mission: owner work is said, never flagged idle, and keeps its hours", () => {
+  const answer = {
+    missions: [
+      { mission: 1, text: "backlog", hours: 24, idle_hours: 24, idle: true, owner_work: false },
+      { mission: 2, text: "owner", hours: 24, idle_hours: 20, idle: false, owner_work: true },
+      { mission: 3, text: "busy", hours: 24, idle_hours: 0, idle: false, owner_work: false },
+      { mission: 4, text: "older server", hours: 24, idle_hours: 20, idle: true, owner_work: true },
+      { mission: 5, text: "no field", hours: 24, idle_hours: 20, idle: true },
+    ],
+  };
+  const rows = decisionsFromApi(answer).idleHoursByMission ?? [];
+  assert.deepEqual(
+    rows.map((row) => [row.mission, row.idle, row.ownerWork, row.idleHours]),
+    [
+      [1, true, false, 24],
+      [2, false, true, 20],
+      [3, false, false, 0],
+      [4, false, true, 20],
+      [5, true, false, 20],
+    ],
+  );
 });

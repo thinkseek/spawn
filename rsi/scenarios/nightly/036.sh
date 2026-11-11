@@ -119,15 +119,49 @@ for tool in psql tmux git jq od bash sed grep awk date sha256sum sort find uname
 done
 
 WORK=$(mktemp -d) || harness "mktemp failed"
+# Gone again if a check below refuses, before the cleanup is set.
+trap 'rm -rf "$WORK"' EXIT
+# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
+# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+HOME=$WORK/home
+TMUX_TMPDIR=$WORK/tmux-sock
+mkdir -p "$HOME" "$TMUX_TMPDIR"
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
+export HOME TMUX_TMPDIR
+# The runtime directory too (backlog S20): what Spawn keeps there (a
+# launch's environment file, its terminals' leaders) stays in WORK, never
+# in the real one. systemd's user manager stays reachable by its bus.
+real_runtime=${XDG_RUNTIME_DIR-}
+if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
+    DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
+    export DBUS_SESSION_BUS_ADDRESS
+fi
+XDG_RUNTIME_DIR=$WORK/runtime
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_036_shadow_$run"
 SPAWN_TMUX_SOCKET="bb-036-$run"
 SPAWN_PSQL=psql
 export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
-# The runner's root: under $HOME, as setup.sh wants it (the gate's sandbox
-# empties /tmp, /run and /var/tmp), short (its jobs' scratch is under it).
-runner_root="$HOME/.bb036-$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
+# The runner's root: on the disk, out of /tmp, /run and /var/tmp (setup.sh
+# refuses those: the gate's sandbox empties them), short (its jobs' scratch
+# is under it), and never in the real home (cc-rules (a)). Run by hand with
+# TMPDIR on the disk, that is WORK's home. In the gate, WORK is in the
+# sandbox's /tmp, and the root goes under the gate's own HOME: an empty
+# tmpfs at the home's path, which is the sandbox's and not the real home
+# (its file system says so, or this refuses).
+case $WORK/ in
+/tmp/* | /run/* | /var/tmp/*)
+    [ -n "$real_home" ] && [ "$(stat -f -c %T -- "$real_home" 2>/dev/null)" = tmpfs ] ||
+        harness "WORK $WORK is under /tmp, /run or /var/tmp, and ${real_home:-the home} is no sandbox's empty tmpfs: the runner's root has no place (run by hand with TMPDIR on the disk)"
+    runner_parent=$real_home
+    ;;
+*) runner_parent=$HOME ;;
+esac
+runner_root="$runner_parent/.bb036-$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
 TEST_URL=$SPAWN_TEST_DATABASE_URL
 
 # shellcheck source=scripts/pg-url.sh
@@ -151,7 +185,6 @@ cleanup() {
         wait "$loop_pid" 2>/dev/null || true
     fi
     tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-    rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SPAWN_TMUX_SOCKET"
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
