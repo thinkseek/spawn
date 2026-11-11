@@ -5131,23 +5131,20 @@ connections\n";
     /// event id 10, 11, ...).
     fn worker_monitor(accept: &str, records: &[Value]) -> Monitor {
         let mut monitor = monitor();
-        let mut id = 1;
-        let mut each = |monitor: &mut Monitor, record: Value| {
-            let events = feed(monitor, id, id * 1000, record);
-            commit(monitor, &events);
-            id += 1;
-        };
-        each(&mut monitor, json!({"type": "mission.added", "id": 4, "text": "m", "origin": "human"}));
-        each(&mut monitor, json!({"type": "mission.configured", "id": 4, "accept": accept}));
-        id = 10;
-        each(
-            &mut monitor,
-            json!({"type": "task.assigned", "id": 7, "mission_id": 4,
-                   "agent_id": "agent_worker_w", "objective": 26}),
-        );
-        each(&mut monitor, json!({"type": "task.delivered", "id": 7, "command_id": 3}));
-        for record in records {
-            each(&mut monitor, record.clone());
+        let mut all = vec![
+            (1, json!({"type": "mission.added", "id": 4, "text": "m", "origin": "human"})),
+            (2, json!({"type": "mission.configured", "id": 4, "accept": accept})),
+            (
+                10,
+                json!({"type": "task.assigned", "id": 7, "mission_id": 4,
+                       "agent_id": "agent_worker_w", "objective": 26}),
+            ),
+            (11, json!({"type": "task.delivered", "id": 7, "command_id": 3})),
+        ];
+        all.extend((12..).zip(records.iter().cloned()));
+        for (id, record) in all {
+            let events = feed(&mut monitor, id, id * 1000, record);
+            commit(&mut monitor, &events);
         }
         monitor
     }
