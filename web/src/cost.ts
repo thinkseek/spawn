@@ -207,9 +207,9 @@ export const TOP_ROWS = 10;
  * one percent; null when the window cost nothing priced. */
 export function shareText(usd: number, windowUsd: number): string | null {
   if (!Number.isFinite(windowUsd) || windowUsd <= 0) return null;
-  const part = Number.isFinite(usd) ? usd / windowUsd : 0;
-  if (part > 0 && part < 0.01) return "<1%";
-  return `${Math.round(part * 100)}%`;
+  const percent = Number.isFinite(usd) ? (usd * 100) / windowUsd : 0;
+  if (percent > 0 && percent < 1) return "<1%";
+  return `${Math.round(percent) + 0}%`;
 }
 
 /** The rows past the first `top`, folded into one line: their count, their

@@ -71,7 +71,7 @@ test("(b) each row's share of the window, rounded to the nearest whole percent",
   assert.equal(shareText(14.5, 100), "15%");
   assert.equal(shareText(14.49, 100), "14%");
   assert.equal(shareText(1, 100), "1%");
-  assert.equal(shareText(0.995, 100), "1%");
+  assert.equal(shareText(0.995, 100), "<1%", "under one percent, though it rounds to 1");
 });
 
 test("(b) a share above zero and under one percent is '<1%'; nothing priced is null", () => {
