@@ -241,7 +241,9 @@ workspace root, symlinks resolved):
   record names; compared with `<root>/.transcripts` by size and SHA-256. A
   live file that grew since the bundle (its first bytes the restored file)
   and one made since are expected; one last written before the bundle's
-  window (`SPAWN_BACKUP_TRANSCRIPT_DAYS`) is in no bundle, counted apart and
+  window (`SPAWN_BACKUP_TRANSCRIPT_DAYS`) is in no bundle (so it has no
+  off-host copy once the bundles that held it expire: an owner question,
+  sync/recovery.md), counted apart and
   not a failure; a live file changed, shorter, gone, or written within the
   window and not restored is a mismatch;
 - every mission source: `git clone --mirror` of its full bundle, each
@@ -256,7 +258,9 @@ mismatch older than the bundle, or a backup that cannot be restored); 2 when
 it cannot run (no settings, a refused `--into`, no stored bundle). It reads
 live and writes none of it, records nothing, reads the key as `verify` does
 and prints none of it, and removes its directory at the end (`--keep` leaves
-it) only after checking it is still the one it made. `test-restore-drill.sh`
+it) only after checking it is still the one it made. It reads the bundle
+records from the live database, as `verify` does: it drills the backup, not
+a restore of a host that lost its database too. `test-restore-drill.sh`
 tests it end to end: the binary's own `spawn backup bundle` against a fake R2
 (a local directory behind a small HTTP server) and a throwaway database,
 under a fake HOME.

@@ -56,15 +56,27 @@ db=spawn_restore_drill_test_$$
 db_url=${test_url%/*}/$db
 
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+[ -n "$real_home" ] || die "the uid's passwd home is unknown"
+real_home=$(cd "$real_home" && pwd -P)
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/spawn-restore-drill-test.XXXXXX")
 scratch=$(cd "$scratch" && pwd -P)
+# The fake home is never in the real one (nor in $HOME as it was given).
+for home in "$real_home" "$(cd "$HOME" && pwd -P)"; do
+  case "$scratch/" in
+  "$home"/*)
+    rm -rf "$scratch"
+    echo "$PROG: refusing: the scratch $scratch is inside the home $home (set TMPDIR elsewhere)" >&2
+    exit 2
+    ;;
+  esac
+done
 fake_home=$scratch/home
 mkdir -m 700 "$fake_home"
 # guard_home: HOME is the fake one, and is not the real home by any path.
 guard_home() {
   local resolved
   resolved=$(cd "$HOME" 2>/dev/null && pwd -P) || { echo "$PROG: HOME does not resolve" >&2; exit 2; }
-  if [ -z "$HOME" ] || [ "$resolved" != "$fake_home" ] || [ "$resolved" = "$(cd "$real_home" && pwd -P)" ]; then
+  if [ -z "$HOME" ] || [ "$resolved" != "$fake_home" ] || [ "$resolved" = "$real_home" ]; then
     echo "$PROG: refusing: HOME ($HOME) is not this test's fake home" >&2
     exit 2
   fi
@@ -289,7 +301,13 @@ kept=$(sed -n 's/^restore-drill: kept //p' "$out")
 check "kept, and named" [ -d "$kept" ]
 check "mode 700" [ "$(stat -c %a "$kept")" = 700 ]
 check "holds the restored archive" [ -f "$kept/transcripts/agent_a/one.jsonl" ]
-rm -rf "$kept"
+# Removed only when it is a drill's directory in this test's own --into.
+case $kept in
+"$scratch"/drills/spawn-restore-drill-*)
+  [ "$(dirname "$kept")" = "$scratch/drills" ] && [ -d "$kept" ] && [ ! -L "$kept" ] && rm -rf "$kept"
+  ;;
+*) fail "the kept path $kept is not a drill directory under $scratch/drills: left" ;;
+esac
 
 echo "== 5. a stored bundle changed in the bucket cannot be restored"
 stored=$(find "$bucket_dir/drill-bucket/bundles/incr" -type f ! -name '*.meta' | head -1)
