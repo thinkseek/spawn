@@ -12,6 +12,7 @@ import {
   focusObjective,
   metricPoints,
   openTask,
+  solvedOnBaseNote,
 } from "../../rsi";
 import { Button, Card, CardHeader, Eyebrow, FOCUS_RING, LiveStatus, PageHeader, chip, cx } from "../ui";
 import { AgentPane } from "./AgentPane";
@@ -219,6 +220,9 @@ function ObjectiveCard({ mission }: { mission: RsiMission }) {
         </div>
         <StatusPill status={objective.status} />
       </div>
+      {solvedOnBaseNote(objective) && (
+        <p className="mt-1 text-caption text-muted-foreground">{solvedOnBaseNote(objective)}</p>
+      )}
 
       {objective.metric ? (
         <>
@@ -623,6 +627,14 @@ function ObjectivesCard({
                   </span>
                 )}
               </span>
+              {solvedOnBaseNote(objective) && (
+                <span
+                  className="text-micro text-faint-foreground"
+                  title={`objective.solved record #${objective.solved_on_base?.event ?? ""}`}
+                >
+                  {solvedOnBaseNote(objective)}
+                </span>
+              )}
               <StatusPill status={objective.status} />
             </li>
           ))}
