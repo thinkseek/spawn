@@ -363,10 +363,13 @@ fn many_migrations_at_once_on_one_cluster_all_succeed() {
     let databases: Vec<Database> = (0..DATABASES)
         .map(|number| Database::new(&format!("roles_burst_{number}"), None))
         .collect();
+    // Guarded as the databases are: each migration makes its schema, and
+    // the guards drop them once every migration has returned.
+    let schemas: Vec<common::Schema> = (0..SCHEMAS)
+        .map(|number| common::Schema::fresh(&format!("burst_{number}")))
+        .collect();
     let mut urls: Vec<String> = databases.iter().map(Database::url).collect();
-    urls.extend(
-        (0..SCHEMAS).map(|number| common::schema_url(&schema_name(&format!("burst_{number}")))),
-    );
+    urls.extend(schemas.iter().map(|schema| common::schema_url(schema)));
     let start = std::sync::Arc::new(std::sync::Barrier::new(urls.len()));
     let migrations: Vec<_> = urls
         .into_iter()
@@ -380,9 +383,18 @@ fn many_migrations_at_once_on_one_cluster_all_succeed() {
             })
         })
         .collect();
-    for migration in migrations {
+    // Every thread joined (its store, and so its connections, gone with
+    // it) before the schemas and databases are dropped, a failed case's
+    // too.
+    let outcomes: Vec<_> = migrations
+        .into_iter()
+        .map(std::thread::JoinHandle::join)
+        .collect();
+    drop(schemas);
+    drop(databases);
+    for outcome in outcomes {
         assert_eq!(
-            migration.join().expect("the migration returns"),
+            outcome.expect("the migration returns"),
             Ok(true),
             "every migration succeeds and its supervisor logs in"
         );
