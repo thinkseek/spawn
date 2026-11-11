@@ -24,6 +24,18 @@ else
         fi
     done
 fi
+# web/test/ is the fleet's to add to and change (rsi/scenarios/protected),
+# but not to shrink: a test file the base has is still there. Removing one
+# is the owner's change, as removing a cargo test is (gate.sh's ratchet).
+if [ -d "$SPAWN_BASELINE_TREE/web/test" ]; then
+    removed=$(cd "$SPAWN_BASELINE_TREE" && find web/test -type f | while IFS= read -r test_file; do
+        [ -f "$OLDPWD/$test_file" ] || printf '%s ' "$test_file"
+    done)
+    if [ -n "$removed" ]; then
+        echo "FAILED web-test-removed: $removed"
+        exit 1
+    fi
+fi
 [ -d "$controller/web/node_modules" ] || { echo "no node_modules in $controller/web"; exit 1; }
 rm -rf web/node_modules
 ln -s "$controller/web/node_modules" web/node_modules
