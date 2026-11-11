@@ -479,6 +479,8 @@ function DimensionTile({
   const mark = trendMark(dimension.trend, dimension.better);
   const previous = formatValue(dimKey, dimension.previous);
   const groups = dimensionParts(dimKey, dimensions);
+  // Gate time says how much of it decided nothing (objective 067).
+  const note = tileNote(dimKey, dimension as GateSpending);
 
   return (
     <section
@@ -501,6 +503,11 @@ function DimensionTile({
             </div>
           )}
           <div className="text-micro text-faint-foreground">{info.unit}</div>
+          {note && (
+            <div className="mt-0.5 text-micro text-muted-foreground" title={note}>
+              {note}
+            </div>
+          )}
         </div>
         {mark && (
           <span
