@@ -3281,7 +3281,10 @@ mod tests {
         // backlog directory below.
         let owner_row = objective_json(&owner, &[], None);
         let fleet_row = objective_json(&objective(2, false), &[], None);
-        assert_eq!(objective_json(&objective(1, false), &[], None)["status"], "open");
+        assert_eq!(
+            objective_json(&objective(1, false), &[], None)["status"],
+            "open"
+        );
         assert_eq!(owner_row["status"], "owner");
         assert_eq!(owner_row["owner_judged"], true);
         assert_eq!(fleet_row["status"], "open");
@@ -3389,7 +3392,11 @@ mod tests {
             json!({"event": 77, "task": 2, "base": "b0"})
         );
         for at in [0, 2, 3, 4] {
-            assert_eq!(rows[at]["solved_on_base"], serde_json::Value::Null, "row {at}");
+            assert_eq!(
+                rows[at]["solved_on_base"],
+                serde_json::Value::Null,
+                "row {at}"
+            );
         }
         // Its landings are a landing's only; the record is not one.
         assert_eq!(rows[1]["landings"], json!([]));
@@ -3419,7 +3426,10 @@ mod tests {
             .as_array_mut()
             .expect("tasks")
             .push(task(5, 4, "accepted", 50, None));
-        assert_eq!(with_objectives(mission)["next_objective"], serde_json::Value::Null);
+        assert_eq!(
+            with_objectives(mission)["next_objective"],
+            serde_json::Value::Null
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir4);
     }
