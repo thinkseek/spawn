@@ -811,10 +811,14 @@ fn line_time(line: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FOR_OWNER_ITEMS, answer, asking, asks, for_owner, question, said, waiting_holds};
+    use super::{
+        FOR_OWNER_ITEMS, answer, asking, asks, for_owner, named_tasks, owner_note, question,
+        review_ask, said, task_states, waiting_holds,
+    };
     use crate::deliver::Work;
     use crate::dispatch::{Escalation, Facts, Why, decide_with};
     use serde_json::{Value, json};
+    use std::collections::BTreeMap;
 
     const NOW: i64 = 1_793_957_840_000;
 
@@ -1476,5 +1480,95 @@ mod tests {
         assert_eq!(listed[0]["waiting"], json!([12, 15]));
         assert_eq!(waiting_holds(&json!({"now_ms": 5, "holds": []})), json!([]));
         assert_eq!(waiting_holds(&json!({})), json!([]));
+    }
+
+    #[test]
+    fn a_line_names_its_tasks_in_each_form() {
+        assert_eq!(named_tasks("task 2 landed; deploying it needs init-db"), [2]);
+        assert_eq!(named_tasks("task #5 waits for your review."), [5]);
+        assert_eq!(named_tasks("Task 7 and T12 are done"), [7, 12]);
+        assert_eq!(named_tasks("Report 9 is in"), [9]);
+        assert_eq!(named_tasks("T3, T4 ready"), [3, 4]);
+        assert_eq!(named_tasks("tasks 160 to 167 land next"), [160], "a range names its first");
+        assert_eq!(named_tasks("tasks 160-167"), [160]);
+        assert_eq!(named_tasks("mission #3 has no backlog yet."), Vec::<i64>::new());
+        assert_eq!(named_tasks("see issue #54 and PR 12"), Vec::<i64>::new());
+        assert_eq!(named_tasks("deploy main (3 commits)"), Vec::<i64>::new());
+        assert_eq!(named_tasks("Tea12 and t12 name none"), Vec::<i64>::new());
+        assert_eq!(named_tasks("task 5 again, task #5"), [5], "each once");
+        assert_eq!(named_tasks("tasks"), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn a_list_after_reports_names_every_number_in_it() {
+        assert_eq!(named_tasks("reports 2, 3 and 4 wait"), [2, 3, 4]);
+        assert_eq!(named_tasks("tasks #2, #3, and #4"), [2, 3, 4]);
+        assert_eq!(named_tasks("tasks 8 and 9"), [8, 9]);
+        assert_eq!(
+            named_tasks("tasks 2, mission 3"),
+            [2],
+            "a comma before a word ends the list"
+        );
+        // The live line (2026-11-11 06:23Z): four reports, two missions.
+        assert_eq!(
+            named_tasks(
+                "reports 198, 204, 208 and 211 (missions 7/8) are still waiting for your ccd \
+                 review"
+            ),
+            [198, 204, 208, 211]
+        );
+    }
+
+    #[test]
+    fn only_a_review_accept_or_merge_ask_without_a_deploy_can_settle() {
+        assert!(review_ask("task #5 waits for your review."));
+        assert!(review_ask("Accept T4 when you can"));
+        assert!(review_ask("merging reports 2 and 3 is yours"));
+        assert!(!review_ask("task 2 landed; deploying it needs spawn init-db."));
+        assert!(!review_ask("review T4, then deploy main"));
+        assert!(!review_ask("decide whether task 3 should go on"));
+    }
+
+    #[test]
+    fn a_line_is_settled_only_when_its_review_ask_names_tasks_that_all_ended() {
+        let states = task_states(&json!({"missions": [
+            {"id": 1, "tasks": [{"id": 2, "state": "accepted"}, {"id": 3, "state": "landed"},
+                                {"id": 4, "state": "cancelled"}, {"id": 5, "state": "reported"}]},
+            {"id": 2, "tasks": [{"id": 198, "state": "accepted"}, {"id": 204, "state": "accepted"},
+                                {"id": 208, "state": "cancelled"}, {"id": 211, "state": "accepted"}]}
+        ]}));
+        let note = |text: &str| owner_note(text, Some(7), &states);
+        assert_eq!(
+            note("reports 2, 3 and 4 are still waiting for your review."),
+            json!({"text": "reports 2, 3 and 4 are still waiting for your review.", "at_ms": 7,
+                   "tasks": [{"id": 2, "state": "accepted"}, {"id": 3, "state": "landed"},
+                             {"id": 4, "state": "cancelled"}],
+                   "settled": true})
+        );
+        let live = note(
+            "reports 198, 204, 208 and 211 (missions 7/8) are still waiting for your ccd review",
+        );
+        assert_eq!(live["settled"], json!(true), "{live}");
+        assert_eq!(live["tasks"].as_array().map(Vec::len), Some(4));
+        // A number naming no task is left out; one task still open keeps it.
+        let open = note("reports 2, 99 and 5 wait for your review");
+        assert_eq!(
+            open["tasks"],
+            json!([{"id": 2, "state": "accepted"}, {"id": 5, "state": "reported"}])
+        );
+        assert_eq!(open["settled"], json!(false));
+        // Another ask stands, whatever became of its tasks.
+        let init = note("task 2 landed; deploying it needs spawn init-db.");
+        assert_eq!(init["tasks"], json!([{"id": 2, "state": "accepted"}]));
+        assert_eq!(init["settled"], json!(false));
+        // No task named, or none known: never settled.
+        assert_eq!(note("mission #3 has no backlog yet.")["tasks"], json!([]));
+        assert_eq!(note("mission #3 has no backlog yet.")["settled"], json!(false));
+        let unknown = note("task 99 waits for your review");
+        assert_eq!(unknown["tasks"], json!([]));
+        assert_eq!(unknown["settled"], json!(false));
+        let none = owner_note("review task 2", None, &BTreeMap::new());
+        assert_eq!(none["at_ms"], Value::Null);
+        assert_eq!(none["settled"], json!(false));
     }
 }
