@@ -4420,6 +4420,26 @@ fn an_owner_landing_starts_the_scenario_floor_again() {
         (json!(0), serde_json::Value::Null, json!(c1)),
         "the floor starts again at the owner's landing"
     );
+    // A task gate in flight across the landing ends `stale`, on the old
+    // main with the old controller's count: it does not raise the floor
+    // (rev-e F1), nor does a verdict on a base that is not the baseline.
+    store
+        .integrator_record(&json!({"type": "task.gated", "revision": 0, "id": task,
+                                   "verdict": "stale", "base": "b1",
+                                   "reason": "main moved", "scenarios": 56,
+                                   "scenario_names": ["001.sh", "002.sh"]}))
+        .expect("a stale verdict");
+    assert_eq!(
+        floor(&mut client),
+        (json!(0), serde_json::Value::Null, json!(c1)),
+        "a stale verdict leaves the floor"
+    );
+    gated(0, "b1", 56);
+    assert_eq!(
+        floor(&mut client).0,
+        0,
+        "a verdict on the old base leaves the floor"
+    );
     // The next gate sets it from the scenarios then (40 after a retirement
     // of 16), and a later fall stays under it, for the integrator's halt.
     gated(0, &c1, 40);
