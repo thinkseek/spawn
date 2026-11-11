@@ -70,6 +70,9 @@ pub(crate) struct Counts {
     pub(crate) gate_runs: Vec<i64>,
     /// How many of them were the owner's judgings.
     pub(crate) owner_gate_runs: usize,
+    /// The runs whose verdict decided nothing, and their wall clocks summed.
+    pub(crate) undecided_gate_runs: usize,
+    pub(crate) undecided_gate_ms: i64,
 }
 
 impl Counts {
@@ -149,6 +152,10 @@ pub(crate) fn counts(history: &History, scope: Scope, window: Window) -> Counts 
             counts.gate_runs.push(run.ms);
             if run.owner {
                 counts.owner_gate_runs += 1;
+            }
+            if run.undecided {
+                counts.undecided_gate_runs += 1;
+                counts.undecided_gate_ms = counts.undecided_gate_ms.saturating_add(run.ms);
             }
         }
     }
@@ -453,6 +460,14 @@ fn gate_time(counts: &Counts) -> Dimension {
         usize_json(runs.saturating_sub(counts.owner_gate_runs)),
     );
     parts.insert("owner_runs".into(), usize_json(counts.owner_gate_runs));
+    // What the gate spent, and what of it decided nothing (objective 067):
+    // only judged runs, each by its record's gate time.
+    parts.insert("total_ms".into(), json!(counts.gate_ms()));
+    parts.insert("undecided_ms".into(), json!(counts.undecided_gate_ms));
+    parts.insert(
+        "undecided_runs".into(),
+        usize_json(counts.undecided_gate_runs),
+    );
     Dimension {
         value: if runs >= MIN_N {
             whole(nearest_rank(&counts.gate_runs, 50))
