@@ -8,6 +8,29 @@ The north-star metric is human interventions per agent-hour, at a given
 throughput (tasks completed, scenarios passed). Every part below exists to
 push that number down, and to do it with the system itself as the improver.
 
+It counts what a person meant, once (objective 049): a person's command
+(principal `human` or `spawn`, the board's and the CLI's) continues the
+intent of the latest earlier command of the same principal, session and
+action (the whole JSON, as jsonb) when that one finished failed at or
+before this one was created, at most 60 minutes before it; otherwise it
+starts one. An intent counts at its first command's creation; its outcome
+is its last command's (`taken`, `failed`, `pending`). The view
+`spawn_human_intents` holds one row per intent, and every count of a
+person's commands reads it: the scorecard's autonomy (`command`, with the
+part `retries`, the commands beyond each intent's first), `/api/fleet`'s
+`ladder_24h.human` and `human_per_agent_hour`, and the experience views
+(§4). `GET /api/interventions?window=24h|7d[&until=<RFC 3339>]` (any other
+window, or an `until` that is no time, 400) answers the figure over
+`[until − window, until)`: `window`, `since_ms`, `until_ms`, `agent_hours`
+(the executions' running time clipped to the window, to 3 decimals),
+`total`, `by_kind` {`command`, `resume`, `owner_task`, `cancel_reassign`},
+`retries`, `per_agent_hour` (null with no agent hours) and `items`, the
+interventions newest first, each with `kind`, `at_ms`, `principal`, `agent`,
+`session`, `line`, `commands` (an intent's ids in order), `attempts` and
+`outcome`, each command's outcome as it stood before `until`. Home shows it
+for 24 h and 7 d with the interventions behind each figure
+(`web/src/interventions.ts`).
+
 Four ideas carry the design:
 
 1. **A decision ladder.** Every judgement and every action goes to the
@@ -1379,6 +1402,7 @@ The Scorecard's "How the fleet decides" reads it over the page's window;
 | Escalations (top of the board) | What the supervisor asks, in at most three lines (its `HUMAN:` line or its reply's last paragraph; the whole reply on request), and under it the box to type to the supervisor, always there; the dispatcher's escalations not yet told to the supervisor, and those told and unresolved (folded to a count while nothing is pending), each with its heading, line, agent and age (`/api/attention`, computed by the dispatcher's code); below it, the supervisor's "For the owner:" lines with their age, to read, not counted |
 | Always-on agents (below the queue) | The supervisor, then the residents, pinned live or not: liveness, state and for how long, last activity, uptime, the task each holds |
 | Health strip | In this order: liveness (always-on agents up, shortest uptime, liveness restarts in 24 h), resources (free disk per place against its warning and floor; memory available now against a 4 GiB warning line, of the total; each gated mission's waits for gate room: the run's task, how many `no_room` outcomes since when, whether it was escalated; a value the server could not read shows as unread, never guessed), judgements, the decision ladder and human decisions per agent-hour |
+| Human interventions (Home) | The north star (§0) for the last 24 h and 7 days: interventions per agent-hour, how many, the retries left out, and on request the list behind each figure (kind, agent, line, its commands and tries, outcome) |
 | Fleet board | The rest of the fleet in groups: on a task (escalated first, by the escalations queue, then the quietest), idle, ended (folded, newest end first); each row its state, the mission and task it holds, what it does now, its last event; the sidebar's session list uses the same groups |
 | Agent detail | A box to type to its session, with what was sent there and whether it was typed or waits for the agent's turn; live terminal; the Jev panel (distribution, needs_human, stuck, the judge's attention flag and its reason, evidence, rules-vs-Jev); the commands into it (an input waiting for the turn says so); state timeline; event timeline |
 | Missions | Missions with open tasks first, then idle active ones, then closed ones (folded); each mission's tasks in flight (oldest first), landed or accepted, sent back, cancelled (folded), an objective's retries nested under its latest attempt; residents waiting for a human's approval |
@@ -1390,7 +1414,8 @@ read is 405): `/api/overview`, `/api/fleet` (with
 `waiting` once the Bridge holds it for the agent's turn), `/api/attention`,
 `/api/missions`, `/api/events`, `/api/session/<id>`, `/api/pane/<id>`,
 `/api/rsi` (with `/api/rsi/task/<id>` and `/api/rsi/pane`),
-`/api/scorecard` and `/api/scorecard/fleet` (§4) (`crates/spawn-cli/src/serve.rs`; the answer of
+`/api/scorecard` and `/api/scorecard/fleet` (§4), `/api/interventions`
+(§0) (`crates/spawn-cli/src/serve.rs`; the answer of
 `/api/attention` is documented in `crates/spawn-cli/src/serve/attention.rs`).
 
 It writes two things. The first is a person's input to a session, `POST
