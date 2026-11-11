@@ -62,33 +62,43 @@ real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 fake_home=$scratch/home
 mkdir -p "$fake_home"
 guard_home() {
-  local gh_scratch gh_real gh_home
-  [ -n "$scratch" ] && [ -n "$real_home" ] && [ -n "${HOME-}" ] || {
-    echo "test-on-landing: refused: an empty home or scratch variable; nothing ran" >&2
+  local gh_scratch gh_real gh_path gh_name
+  [ -n "$scratch" ] && [ -n "$real_home" ] && [ -n "${HOME-}" ] && [ -n "${live-}" ] || {
+    echo "test-on-landing: refused: an empty home, scratch or live variable; nothing ran" >&2
     exit 2
   }
-  gh_scratch=$(readlink -f -- "$scratch") && gh_real=$(readlink -f -- "$real_home") &&
-    gh_home=$(readlink -f -- "$HOME") || {
-    echo "test-on-landing: refused: a home that does not resolve; nothing ran" >&2
+  gh_scratch=$(readlink -f -- "$scratch") && gh_real=$(readlink -f -- "$real_home") || {
+    echo "test-on-landing: refused: a path that does not resolve; nothing ran" >&2
     exit 2
   }
-  case $gh_home/ in "$gh_scratch"/*) ;; *)
-    echo "test-on-landing: refused: HOME $gh_home is not inside the scratch $gh_scratch; nothing ran" >&2
-    exit 2
-    ;;
-  esac
-  case $gh_home/ in "$gh_real"/*)
-    echo "test-on-landing: refused: HOME $gh_home is in the real home; nothing ran" >&2
-    exit 2
-    ;;
-  esac
-  case $gh_real/ in "$gh_home"/*)
-    echo "test-on-landing: refused: HOME $gh_home holds the real home; nothing ran" >&2
-    exit 2
-    ;;
-  esac
+  # HOME, the fake live directory, and every XDG root the test sets.
+  for gh_name in HOME live XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME; do
+    eval "gh_path=\${$gh_name-}"
+    [ -n "$gh_path" ] || {
+      echo "test-on-landing: refused: $gh_name is empty; nothing ran" >&2
+      exit 2
+    }
+    gh_path=$(readlink -m -- "$gh_path")
+    case $gh_path/ in "$gh_scratch"/*) ;; *)
+      echo "test-on-landing: refused: $gh_name $gh_path is not inside the scratch $gh_scratch; nothing ran" >&2
+      exit 2
+      ;;
+    esac
+    case $gh_path/ in "$gh_real"/*)
+      echo "test-on-landing: refused: $gh_name $gh_path is in the real home; nothing ran" >&2
+      exit 2
+      ;;
+    esac
+    case $gh_real/ in "$gh_path"/*)
+      echo "test-on-landing: refused: $gh_name $gh_path holds the real home; nothing ran" >&2
+      exit 2
+      ;;
+    esac
+  done
 }
-export HOME=$fake_home
+live=$scratch/live
+export HOME=$fake_home XDG_CACHE_HOME=$fake_home/.cache XDG_CONFIG_HOME=$fake_home/.config \
+  XDG_DATA_HOME=$fake_home/.local/share
 guard_home
 cleanup() {
   with_db "$test_url" psql -XAtq -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1 || true
@@ -341,11 +351,22 @@ check "deploy.sh did not run" [ "$(deploys)" -eq "$before" ]
 check "recorded, with the reason" \
   grep -qF "false landing $c7 $live/deploy-checkout is there but is no clone" <<<"$(finished | tail -n 1)"
 
-echo "== the home guard"
+echo "== the home guard, and SPAWN_LIVE never defaulted"
 guard_status=0
 (HOME=$real_home; guard_home) 2>"$scratch/guard.err" || guard_status=$?
 check "the real home is refused (status $guard_status)" \
-  bash -c '[ "$1" -eq 2 ] && grep -q "is not inside the scratch" "$2"' _ "$guard_status" "$scratch/guard.err"
+  bash -c '[ "$1" -eq 2 ] && grep -q "HOME .* is not inside the scratch" "$2"' _ "$guard_status" "$scratch/guard.err"
+guard_status=0
+(live=$real_home/.local/share/spawn-rsi; guard_home) 2>"$scratch/guard.err" || guard_status=$?
+check "a live directory outside the scratch is refused (status $guard_status)" \
+  bash -c '[ "$1" -eq 2 ] && grep -q "live .* is not inside the scratch" "$2"' _ "$guard_status" "$scratch/guard.err"
+guard_status=0
+(fake_home=""; HOME=""; guard_home) 2>"$scratch/guard.err" || guard_status=$?
+check "an empty HOME is refused (status $guard_status)" [ "$guard_status" -eq 2 ]
+nolive_status=0
+env -u SPAWN_LIVE bash "$repo/deploy/on-landing.sh" >"$scratch/nolive.out" 2>&1 || nolive_status=$?
+check "on-landing.sh without SPAWN_LIVE refuses (status $nolive_status), touching nothing" \
+  bash -c '[ "$1" -eq 2 ] && grep -q "SPAWN_LIVE is not set" "$2"' _ "$nolive_status" "$scratch/nolive.out"
 
 echo
 if [ "$failures" -eq 0 ]; then

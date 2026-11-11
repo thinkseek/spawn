@@ -73,13 +73,20 @@
 # that is no clone stops the tick (recorded as a failure) for the owner to
 # move away.
 #
-# The binary and the database are the live ones ($SPAWN_LIVE, default
-# ~/.local/share/spawn-rsi: bin/spawn and spawn.env); the URL never reaches a
+# The binary and the database are the live ones ($SPAWN_LIVE, which must be
+# set: no default; bin/spawn and spawn.env); the URL never reaches a
 # command line.
 set -euo pipefail
 
 PROG=on-landing
-live=${SPAWN_LIVE:-$HOME/.local/share/spawn-rsi}
+# Named, never defaulted (sync/cc-rules.md): a run that forgot it must not
+# act on the live directory. The unit names it; deploy.sh gets it too.
+if [ -z "${SPAWN_LIVE-}" ]; then
+  printf 'on-landing: error: SPAWN_LIVE is not set (the unit sets it): nothing was done\n' >&2
+  exit 2
+fi
+live=$SPAWN_LIVE
+export SPAWN_LIVE
 missions=$live/missions/spawn.git
 checkout=$live/deploy-checkout
 said_file=$live/on-landing.said
