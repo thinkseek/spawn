@@ -910,7 +910,8 @@ owner or the supervisor (`spawn task restart --id N [--reason <text>]`,
 `spawn task reassign --id N [--reason <text>]`, the store's
 `spawn_task_restart` and `spawn_task_reassign`), or by a person from the
 agent page (`POST /api/session/<id>/restart` and `/reassign`, `by` `human`,
-through `spawn_human_task`). Each takes a `delivered` task only, refuses any
+through `spawn_human_task`); a stuck worker's `agent_stuck` alert names its
+`spawn task restart --id N` ("Alerts"). Each takes a `delivered` task only, refuses any
 other naming its state (nothing recorded or sent), and prints `{task,
 session_id, agent_id}`: the task and the worker that now carry the work.
 
@@ -1085,9 +1086,25 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   supervisor's digest tells each and its end, `host source-away-<event>` and
   `host source-back-<event>`), `agent_stuck` (the session's
   latest judgement at or above the Observer's 0.5, whatever the dispatcher
-  does with it; clears under 0.5, or when the session's current execution
-  has ended, whatever the cause, with the Bridge's `execution.ended` as
-  evidence; a session whose current execution has ended fires none),
+  does with it, about an agent someone must act on (objective 057): none,
+  whatever the score, for an ephemeral worker (`agent_worker_*`; a resident
+  outlives its tasks and takes other work) whose task is past its part (`reported`,
+  gated, `accepted`, `landing`, held behind a hold, `landed`: it waits for
+  the gate, a reviewer, its landing or the owner), nor for the supervisor
+  while it has nothing to dispatch (no open question to the owner, no
+  pending or told escalation of the attention view other than a worker's
+  own judgement while that worker holds its task, and no mission of its own
+  waiting for its first task; tasks a worker holds, delivered or later, are
+  the workers' work); a worker's alert names its `task` and its `command`,
+  the one command that acts on it, `spawn task restart --id <task>` (a
+  delivered task's; one sent back for revision names no command), which
+  Needs you shows to copy; clears under 0.5, or when the session's current
+  execution has ended, whatever the cause, with the Bridge's
+  `execution.ended` as evidence, or at the task record that moved a
+  worker's task past its part (its `task.reported`, `task.gated` and so on,
+  that record's id its `event_id`), or, for the supervisor, at the first
+  pass that finds it with nothing to dispatch (the latest record read its
+  `event_id`); a session whose current execution has ended fires none),
   `judge_down` (the model judge's watcher recorded `host.judge` `down`, two
   calls in a row failed after its last answer, and no `up` after it,
   `SPAWN_ALERT_JUDGE_DOWN_SECS` after the first failed (default 900): no

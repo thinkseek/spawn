@@ -204,6 +204,72 @@ pub(super) fn attention() -> Result<Value, String> {
     Ok(view)
 }
 
+/// What the supervisor has to dispatch, read as [`attention`] reads it, for
+/// the alert step's `agent_stuck` (crate::alerts, objective 057): `{question,
+/// items}`, `question` whether it asks the owner something now (the
+/// attention view's `supervisor.question`), `items` the plan's `pending` and
+/// `told` escalations, each `{tag, session_id, agent_id, why, judgement}`,
+/// `judgement` true for one that is a worker's own judgement (attention,
+/// stopped at its prompt, a nudge that did not help): the alert step decides
+/// which of them are the supervisor's to act on. `lines` are the plan's log
+/// lines, for the loop's log.
+pub(crate) fn supervisor_dispatch(store: &spawn_postgres::PostgresStore) -> Result<Value, String> {
+    let disk = store.host_disk().map_err(super::err)?;
+    let (bounds, _) = dispatch::Bounds::from_env();
+    let (waits, _) = crate::deliver::Waits::from_env();
+    let reading = dispatch::read_plan(
+        store,
+        dispatch::load(store, waits)?,
+        |now| crate::disk::escalations(disk.as_array().map_or(&[][..], Vec::as_slice), now),
+        &bounds,
+        crate::config::supervised(),
+        &crate::config::spawn_program(),
+        None,
+    )?;
+    let supervisor = reading
+        .rows
+        .iter()
+        .find(|facts| facts.session_id == SUPERVISOR_SESSION);
+    // The transcript is read only when the judgement may ask: most passes
+    // have no question, and read nothing more.
+    let question = supervisor.is_some_and(|facts| {
+        asking(facts).is_some() && {
+            let said = store
+                .latest_turn(SUPERVISOR_SESSION)
+                .ok()
+                .and_then(|turn| transcript_tail(&turn))
+                .map(|bytes| said(&bytes));
+            asks(facts, said.as_ref()).is_some()
+        }
+    });
+    let agents: BTreeMap<&str, &str> = reading
+        .rows
+        .iter()
+        .map(|facts| (facts.session_id.as_str(), facts.agent_id.as_str()))
+        .collect();
+    let items: Vec<Value> = reading
+        .plan
+        .pending
+        .iter()
+        .chain(&reading.plan.told)
+        .map(|escalation| {
+            json!({
+                "tag": escalation.tag(),
+                "session_id": escalation.session_id,
+                "agent_id": agents.get(escalation.session_id.as_str()),
+                "why": dispatch::heading(escalation.why),
+                "judgement": matches!(
+                    escalation.why,
+                    dispatch::Why::Attention | dispatch::Why::Idle | dispatch::Why::NudgeFailed
+                ),
+            })
+        })
+        .collect();
+    // The plan's once-said log lines (an order no task can meet) are said
+    // by whoever reads the plan first in this process: the loop logs them.
+    Ok(json!({ "question": question, "items": items, "lines": reading.lines }))
+}
+
 /// The owner's holds of `holds` (`PostgresStore::source_holds`: `{now_ms,
 /// holds}`) that have at least one task waiting behind them.
 fn waiting_holds(holds: &Value) -> Value {
