@@ -498,16 +498,6 @@ pub trait TerminalHost: Send + Sync {
         text: &str,
     ) -> Result<(), TerminalError>;
 
-    /// Whether the terminal's program reads its input a line at a time
-    /// (canonical mode), so a line break in a paste is one more line of the
-    /// same input; false when it reads keys raw and takes a line break it is
-    /// not told is pasted as Enter. True when the host cannot tell. The
-    /// Bridge puts a message's marker ([`crate::message`]) on a line of its
-    /// own when this is true.
-    fn reads_lines(&self, _terminal: &TerminalName, _workspace: &WorkspaceId) -> bool {
-        true
-    }
-
     /// Type what [`Self::stage_text`] held, literally, then press Enter. A
     /// failure here may have typed some or all of it.
     fn submit_staged(
