@@ -90,6 +90,12 @@ export interface GateTime extends DimensionBase {
    * 061): `runs` = `task_runs` + `owner_runs`. */
   task_runs: number;
   owner_runs: number;
+  /** The runs' gate times summed, and what of it (and how many runs)
+   * decided nothing: aborted, no_room, host_fault or stale (objective
+   * 067). */
+  total_ms: number;
+  undecided_ms: number;
+  undecided_runs: number;
 }
 
 export interface Dimensions {
@@ -268,6 +274,9 @@ export function normalizeDimensions(value: unknown): Dimensions {
       // An answer from before the owner's runs were counted: every run a task's.
       task_runs: gateTime.task_runs === undefined ? number(gateTime.runs) : number(gateTime.task_runs),
       owner_runs: number(gateTime.owner_runs),
+      total_ms: number(gateTime.total_ms),
+      undecided_ms: number(gateTime.undecided_ms),
+      undecided_runs: number(gateTime.undecided_runs),
     },
   };
 }
@@ -640,6 +649,13 @@ export function dimensionParts(
             { label: "runs", value: formatDecimal(d.runs, 0), title: gateRunsText(d) },
             { label: "the owner's", value: formatDecimal(d.owner_runs, 0) },
             { label: "tasks'", value: formatDecimal(d.task_runs, 0) },
+            {
+              label: "decided nothing",
+              value: `${formatSpan(d.undecided_ms)} · ${formatDecimal(d.undecided_runs, 0)} ${
+                d.undecided_runs === 1 ? "run" : "runs"
+              }`,
+              title: `${msTitle(d.undecided_ms)} of ${msTitle(d.total_ms)}: aborted, no_room, host_fault or stale`,
+            },
           ],
         },
       ];
