@@ -486,7 +486,10 @@ fn over_budget_closes_a_task_and_no_later_record_lands_it() {
     let counts = counts(&history, Scope::Fleet, window_hours(0, 10));
     assert_eq!(counts.landed, 0);
     assert_eq!(counts.open_ms, 6 * HOUR_MS, "0-4 and 8-10");
-    assert_eq!(dimension(&counts, None, "autonomy")["interventions"], json!(0));
+    assert_eq!(
+        dimension(&counts, None, "autonomy")["interventions"],
+        json!(0)
+    );
 }
 
 #[test]

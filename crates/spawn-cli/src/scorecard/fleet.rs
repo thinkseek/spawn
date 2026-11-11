@@ -49,9 +49,7 @@ pub(crate) fn window_of(
         .iter()
         .find(|(name, _)| *name == asked)
         .copied()
-        .ok_or_else(|| {
-            Failure::Request(format!("window {asked}: not one of 24h, 7d, 30d, 90d"))
-        })?;
+        .ok_or_else(|| Failure::Request(format!("window {asked}: not one of 24h, 7d, 30d, 90d")))?;
     let until = match until {
         Some(text) => parse_rfc3339(text).ok_or_else(|| {
             Failure::Request(format!(
@@ -79,11 +77,7 @@ fn milli(numerator: i64, denominator: i64) -> Value {
 }
 
 /// The answer for `window` (named `name`) from the store.
-pub(crate) fn measure(
-    store: &PostgresStore,
-    name: &str,
-    window: Window,
-) -> Result<Value, Failure> {
+pub(crate) fn measure(store: &PostgresStore, name: &str, window: Window) -> Result<Value, Failure> {
     let counts = store
         .experience_window(window.since, window.until)
         .map_err(|error| Failure::Record(error.to_string()))?;
@@ -95,7 +89,10 @@ pub(crate) fn answer(counts: &Value, name: &str, window: Window) -> Value {
     let ladder_counts = counts["ladder"].as_object().cloned().unwrap_or_default();
     let mut ladder = Map::new();
     for tier in TIERS {
-        ladder.insert(tier.to_string(), json!(ladder_counts.get(tier).map_or(0, count)));
+        ladder.insert(
+            tier.to_string(),
+            json!(ladder_counts.get(tier).map_or(0, count)),
+        );
     }
     let extra: BTreeMap<&String, i64> = ladder_counts
         .iter()
@@ -110,14 +107,24 @@ pub(crate) fn answer(counts: &Value, name: &str, window: Window) -> Value {
     let human = count(&ladder["human"]);
     let by_kind: Map<String, Value> = KINDS
         .iter()
-        .map(|kind| ((*kind).to_string(), json!(count(&counts["interventions"][kind]))))
+        .map(|kind| {
+            (
+                (*kind).to_string(),
+                json!(count(&counts["interventions"][kind])),
+            )
+        })
         .collect();
     let interventions: i64 = counts["interventions"]
         .as_object()
         .map_or(0, |kinds| kinds.values().map(count).sum());
     let outcomes: Map<String, Value> = OUTCOMES
         .iter()
-        .map(|outcome| ((*outcome).to_string(), json!(count(&counts["outcomes"][outcome]))))
+        .map(|outcome| {
+            (
+                (*outcome).to_string(),
+                json!(count(&counts["outcomes"][outcome])),
+            )
+        })
         .collect();
     let landings = count(&outcomes["landed"]) + count(&outcomes["accepted"]);
     let length = window.until - window.since;
@@ -175,7 +182,11 @@ fn idle(mission: &Value, window: Window) -> Value {
         .flatten()
         .filter_map(|task| Some((task[0].as_i64()?, task[1].as_i64())))
         .collect();
-    let busy_ms = if span_ms > 0 { union_ms(&tasks, span) } else { 0 };
+    let busy_ms = if span_ms > 0 {
+        union_ms(&tasks, span)
+    } else {
+        0
+    };
     let idle_ms = span_ms - busy_ms;
     json!({
         "mission": mission["mission"],
@@ -209,8 +220,10 @@ mod tests {
     fn a_window_is_one_it_knows_ending_at_until_or_now() {
         let now = || Ok(U);
         assert_eq!(
-            window_of(Some("7d"), Some("2026-10-31T00:00:00Z"), || panic!("no clock read"))
-                .expect("a window"),
+            window_of(Some("7d"), Some("2026-10-31T00:00:00Z"), || panic!(
+                "no clock read"
+            ))
+            .expect("a window"),
             (
                 "7d",
                 Window {
@@ -260,7 +273,10 @@ mod tests {
         });
         let answer = answer(&counts, "7d", window);
         assert_eq!(answer["ladder"]["human"], 1);
-        assert_eq!(answer["ladder_extra"], json!([["owner_gate", 2], ["spawn-integrate", 1]]));
+        assert_eq!(
+            answer["ladder_extra"],
+            json!([["owner_gate", 2], ["spawn-integrate", 1]])
+        );
         assert_eq!(answer["agent_hours"], json!(26.0));
         assert_eq!(answer["human_per_agent_hour"], json!(0.038));
         assert_eq!(answer["landed_per_day"], json!(0.429));

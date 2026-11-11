@@ -31,7 +31,14 @@ fn record(client: &mut Client, hours: i64, record: &Value) {
         .expect("write a control record");
 }
 
-fn command(client: &mut Client, principal: &str, key: &str, session: &str, action: &Value, hours: i64) {
+fn command(
+    client: &mut Client,
+    principal: &str,
+    key: &str,
+    session: &str,
+    action: &Value,
+    hours: i64,
+) {
     client
         .execute(
             "insert into spawn_commands (principal, idempotency_key, agent_id, session_id, action,
@@ -58,7 +65,15 @@ fn judgement(client: &mut Client, hours: i64, observation: &Value) {
         .expect("write a judgement");
 }
 
-fn assign(client: &mut Client, hours: i64, id: i64, mission: i64, by: &str, objective: Option<i64>, brief: &str) {
+fn assign(
+    client: &mut Client,
+    hours: i64,
+    id: i64,
+    mission: i64,
+    by: &str,
+    objective: Option<i64>,
+    brief: &str,
+) {
     record(
         client,
         hours,
@@ -87,53 +102,181 @@ fn counts(client: &mut Client, view: &str, column: &str, since: i64, until: i64)
 /// mission 3 closed: every kind of intervention and outcome, and the
 /// records that are none.
 fn history(client: &mut Client) {
-    record(client, 0, &json!({"type": "mission.added", "id": 1, "text": "open", "origin": "human", "sources": []}));
-    record(client, 0, &json!({"type": "mission.added", "id": 2, "text": "gated", "origin": "human", "sources": []}));
-    record(client, 0, &json!({"type": "mission.configured", "id": 2, "gate": "scripts/gate.sh", "accept": "gate"}));
-    record(client, 0, &json!({"type": "mission.added", "id": 3, "text": "short", "origin": "human", "sources": []}));
+    record(
+        client,
+        0,
+        &json!({"type": "mission.added", "id": 1, "text": "open", "origin": "human", "sources": []}),
+    );
+    record(
+        client,
+        0,
+        &json!({"type": "mission.added", "id": 2, "text": "gated", "origin": "human", "sources": []}),
+    );
+    record(
+        client,
+        0,
+        &json!({"type": "mission.configured", "id": 2, "gate": "scripts/gate.sh", "accept": "gate"}),
+    );
+    record(
+        client,
+        0,
+        &json!({"type": "mission.added", "id": 3, "text": "short", "origin": "human", "sources": []}),
+    );
     // Mission 1: a person's task (an intervention: review accepts here),
     // accepted; a task cancelled by a person then the same objective again
     // (cancel and reassign), landed, and a landing after that changes
     // nothing; a task the integrator cancelled, then its brief again (no
     // intervention); one over budget.
     assign(client, 1, 1, 1, "human", None, "one");
-    record(client, 2, &json!({"type": "task.reviewed", "id": 1, "accepted": true}));
+    record(
+        client,
+        2,
+        &json!({"type": "task.reviewed", "id": 1, "accepted": true}),
+    );
     assign(client, 3, 2, 1, "spawn_supervisor", Some(9), "two");
-    record(client, 4, &json!({"type": "task.cancelled", "id": 2, "by": "human"}));
-    record(client, 4, &json!({"type": "task.landed", "id": 2, "from": "a", "to": "b"}));
+    record(
+        client,
+        4,
+        &json!({"type": "task.cancelled", "id": 2, "by": "human"}),
+    );
+    record(
+        client,
+        4,
+        &json!({"type": "task.landed", "id": 2, "from": "a", "to": "b"}),
+    );
     assign(client, 5, 3, 1, "spawn_supervisor", Some(9), "two, again");
-    record(client, 6, &json!({"type": "task.landed", "id": 3, "from": "a", "to": "b"}));
-    record(client, 7, &json!({"type": "task.landed", "id": 3, "from": "b", "to": "c"}));
+    record(
+        client,
+        6,
+        &json!({"type": "task.landed", "id": 3, "from": "a", "to": "b"}),
+    );
+    record(
+        client,
+        7,
+        &json!({"type": "task.landed", "id": 3, "from": "b", "to": "c"}),
+    );
     assign(client, 8, 4, 1, "spawn_supervisor", None, "four");
-    record(client, 9, &json!({"type": "task.cancelled", "id": 4, "by": "spawn-integrate"}));
+    record(
+        client,
+        9,
+        &json!({"type": "task.cancelled", "id": 4, "by": "spawn-integrate"}),
+    );
     assign(client, 10, 5, 1, "spawn_supervisor", None, "four");
-    record(client, 11, &json!({"type": "task.over_budget", "id": 5, "reason": "big"}));
+    record(
+        client,
+        11,
+        &json!({"type": "task.over_budget", "id": 5, "reason": "big"}),
+    );
     // Mission 2: a person's task on a gated mission (no intervention), its
     // review accepted (not its close: the gate lands it), then aborted.
     assign(client, 12, 6, 2, "human", None, "six");
-    record(client, 13, &json!({"type": "task.reviewed", "id": 6, "accepted": true}));
-    record(client, 14, &json!({"type": "task.aborted", "id": 6, "reason": "host"}));
+    record(
+        client,
+        13,
+        &json!({"type": "task.reviewed", "id": 6, "accepted": true}),
+    );
+    record(
+        client,
+        14,
+        &json!({"type": "task.aborted", "id": 6, "reason": "host"}),
+    );
     record(client, 15, &json!({"type": "mission.resumed", "id": 2}));
     // Mission 3: open 0-20, a task 16-18.
     assign(client, 16, 7, 3, "spawn_supervisor", None, "seven");
-    record(client, 18, &json!({"type": "task.landed", "id": 7, "from": "a", "to": "b"}));
-    record(client, 20, &json!({"type": "mission.closed", "id": 3, "state": "done", "summary": "ok"}));
+    record(
+        client,
+        18,
+        &json!({"type": "task.landed", "id": 7, "from": "a", "to": "b"}),
+    );
+    record(
+        client,
+        20,
+        &json!({"type": "mission.closed", "id": 3, "state": "done", "summary": "ok"}),
+    );
 
     judgement(client, 1, &json!({"state": "WORKING", "judge": "rules"}));
-    judgement(client, 21, &json!({"state": "WORKING", "judge": "jev", "latency_ms": 400, "rules_state": "WAITING"}));
-    judgement(client, 22, &json!({"state": "WORKING", "judge": "jev", "latency_ms": 200}));
-    judgement(client, 23, &json!({"state": "WORKING", "judge": "rules", "reason": "JUDGE_UNAVAILABLE"}));
+    judgement(
+        client,
+        21,
+        &json!({"state": "WORKING", "judge": "jev", "latency_ms": 400, "rules_state": "WAITING"}),
+    );
+    judgement(
+        client,
+        22,
+        &json!({"state": "WORKING", "judge": "jev", "latency_ms": 200}),
+    );
+    judgement(
+        client,
+        23,
+        &json!({"state": "WORKING", "judge": "rules", "reason": "JUDGE_UNAVAILABLE"}),
+    );
 
     let tags = |tags: &[&str]| json!({"type": "input", "text": "items", "tags": tags});
-    command(client, "spawn-dispatch", "digest-1", "session_supervisor", &tags(&["session_w a-1", "charter 0abc"]), 2);
-    command(client, "spawn-dispatch", "digest-2", "session_supervisor", &tags(&["session_w a-1", "session_w b-1"]), 21);
+    command(
+        client,
+        "spawn-dispatch",
+        "digest-1",
+        "session_supervisor",
+        &tags(&["session_w a-1", "charter 0abc"]),
+        2,
+    );
+    command(
+        client,
+        "spawn-dispatch",
+        "digest-2",
+        "session_supervisor",
+        &tags(&["session_w a-1", "session_w b-1"]),
+        21,
+    );
     // Tags into a worker are no escalation.
-    command(client, "spawn-dispatch", "nudge-1", "session_w", &tags(&["session_w c-1"]), 21);
-    command(client, "spawn_supervisor", "sup-1", "session_w", &json!({"type": "input", "text": "go"}), 22);
-    command(client, "human", "board-1", "session_w", &json!({"type": "input", "text": "note"}), 3);
-    command(client, "spawn", "cli-1", "session_w", &json!({"type": "input", "text": "note"}), 22);
-    command(client, "spawn-liveness", "live-1", "session_supervisor", &json!({"type": "resume"}), 23);
-    command(client, "owner_gate", "gate-1", "session_w", &json!({"type": "input", "text": "landed"}), 23);
+    command(
+        client,
+        "spawn-dispatch",
+        "nudge-1",
+        "session_w",
+        &tags(&["session_w c-1"]),
+        21,
+    );
+    command(
+        client,
+        "spawn_supervisor",
+        "sup-1",
+        "session_w",
+        &json!({"type": "input", "text": "go"}),
+        22,
+    );
+    command(
+        client,
+        "human",
+        "board-1",
+        "session_w",
+        &json!({"type": "input", "text": "note"}),
+        3,
+    );
+    command(
+        client,
+        "spawn",
+        "cli-1",
+        "session_w",
+        &json!({"type": "input", "text": "note"}),
+        22,
+    );
+    command(
+        client,
+        "spawn-liveness",
+        "live-1",
+        "session_supervisor",
+        &json!({"type": "resume"}),
+        23,
+    );
+    command(
+        client,
+        "owner_gate",
+        "gate-1",
+        "session_w",
+        &json!({"type": "input", "text": "landed"}),
+        23,
+    );
 }
 
 #[test]
@@ -174,7 +317,10 @@ fn the_views_derive_decisions_interventions_outcomes_and_escalations_from_the_lo
         .expect("landings")
         .get(0);
     assert_eq!(landed, "3@6 7@18");
-    assert_eq!(counts(&mut client, "spawn_escalations", "'all'", 0, 24), "all:2");
+    assert_eq!(
+        counts(&mut client, "spawn_escalations", "'all'", 0, 24),
+        "all:2"
+    );
     assert_eq!(
         counts(&mut client, "spawn_escalations", "tag", 20, 24),
         "session_w b-1:1",
@@ -202,35 +348,65 @@ fn the_window_counts_the_views_and_each_missions_open_span() {
         ))
         .expect("executions");
 
-    let window = store.experience_window(12 * H, 24 * H).expect("the window reads");
-    assert_eq!(window["agent_ms"], json!(11 * H), "12-22, and 23 to the window's end");
+    let window = store
+        .experience_window(12 * H, 24 * H)
+        .expect("the window reads");
+    assert_eq!(
+        window["agent_ms"],
+        json!(11 * H),
+        "12-22, and 23 to the window's end"
+    );
     assert_eq!(window["ladder"]["human"], 1);
     assert_eq!(window["ladder"]["owner_gate"], 1);
     assert_eq!(window["interventions"], json!({"command": 1, "resume": 1}));
     assert_eq!(window["outcomes"], json!({"aborted": 1, "landed": 1}));
     assert_eq!(window["escalations"], 1);
     assert_eq!(window["judgements"]["total"], 3);
-    assert_eq!(window["judgements"]["by_judge"], json!({"jev": 2, "rules": 1}));
+    assert_eq!(
+        window["judgements"]["by_judge"],
+        json!({"jev": 2, "rules": 1})
+    );
     assert_eq!(window["judgements"]["judge_unavailable"], 1);
     assert_eq!(window["judgements"]["disagreements"], 1);
-    assert_eq!(window["judgements"]["model_latency_p50_ms"].as_f64(), Some(300.0));
+    assert_eq!(
+        window["judgements"]["model_latency_p50_ms"].as_f64(),
+        Some(300.0)
+    );
     let missions: Vec<(i64, Option<i64>, Value)> = window["missions"]
         .as_array()
         .expect("missions")
         .iter()
-        .map(|m| (m["mission"].as_i64().expect("id"), m["closed_at_ms"].as_i64(), m["tasks"].clone()))
+        .map(|m| {
+            (
+                m["mission"].as_i64().expect("id"),
+                m["closed_at_ms"].as_i64(),
+                m["tasks"].clone(),
+            )
+        })
         .collect();
     assert_eq!(
         missions,
         vec![
-            (1, None, json!([[H, 2 * H], [3 * H, 4 * H], [5 * H, 6 * H], [8 * H, 9 * H], [10 * H, 11 * H]])),
+            (
+                1,
+                None,
+                json!([
+                    [H, 2 * H],
+                    [3 * H, 4 * H],
+                    [5 * H, 6 * H],
+                    [8 * H, 9 * H],
+                    [10 * H, 11 * H]
+                ])
+            ),
             (2, None, json!([[12 * H, 14 * H]])),
             (3, Some(20 * H), json!([[16 * H, 18 * H]])),
         ]
     );
 
     // As of an earlier end: a close at or after it is not one yet.
-    let before = store.experience_window(0, 17 * H).expect("the window reads");
+    let before = store
+        .experience_window(0, 17 * H)
+        .expect("the window reads");
     assert_eq!(before["missions"][2]["tasks"], json!([[16 * H, null]]));
     assert_eq!(before["missions"][2]["closed_at_ms"], Value::Null);
 }
@@ -242,7 +418,12 @@ fn the_reader_and_the_supervisor_read_the_views() {
     history(&mut client);
     for login in ["spawn_reader", "spawn_supervisor"] {
         let mut reader = as_login(&schema, login);
-        for view in ["spawn_decisions", "spawn_interventions", "spawn_outcomes", "spawn_escalations"] {
+        for view in [
+            "spawn_decisions",
+            "spawn_interventions",
+            "spawn_outcomes",
+            "spawn_escalations",
+        ] {
             let n: i64 = reader
                 .query_one(&format!("select count(*) from {view}"), &[])
                 .unwrap_or_else(|error| panic!("{login} reads {view}: {error}"))
@@ -256,16 +437,57 @@ fn the_reader_and_the_supervisor_read_the_views() {
 fn the_fleets_ladder_reads_the_decisions_view() {
     let (store, schema) = store("experience_health");
     let mut client = admin(&schema);
-    let now: i64 = client.query_one("select spawn_now_ms()", &[]).expect("now").get(0);
+    let now: i64 = client
+        .query_one("select spawn_now_ms()", &[])
+        .expect("now")
+        .get(0);
     let hours_ago = |h: i64| (now - h * H) / H;
     // Times relative to now, rounded to the hour below: within the day.
-    command(&mut client, "human", "board-1", "session_w", &json!({"type": "input", "text": "a"}), hours_ago(2));
-    command(&mut client, "spawn", "cli-1", "session_w", &json!({"type": "input", "text": "b"}), hours_ago(3));
-    command(&mut client, "owner_gate", "gate-1", "session_w", &json!({"type": "input", "text": "c"}), hours_ago(4));
-    command(&mut client, "human", "board-0", "session_w", &json!({"type": "input", "text": "old"}), hours_ago(30));
+    command(
+        &mut client,
+        "human",
+        "board-1",
+        "session_w",
+        &json!({"type": "input", "text": "a"}),
+        hours_ago(2),
+    );
+    command(
+        &mut client,
+        "spawn",
+        "cli-1",
+        "session_w",
+        &json!({"type": "input", "text": "b"}),
+        hours_ago(3),
+    );
+    command(
+        &mut client,
+        "owner_gate",
+        "gate-1",
+        "session_w",
+        &json!({"type": "input", "text": "c"}),
+        hours_ago(4),
+    );
+    command(
+        &mut client,
+        "human",
+        "board-0",
+        "session_w",
+        &json!({"type": "input", "text": "old"}),
+        hours_ago(30),
+    );
     let health = store.fleet_health().expect("the health reads");
-    assert_eq!(health["ladder_24h"]["human"], 2, "the board's and the CLI's, in the day");
-    assert_eq!(health["ladder_24h"]["owner_gate"], 1, "another principal as its own tier");
+    assert_eq!(
+        health["ladder_24h"]["human"], 2,
+        "the board's and the CLI's, in the day"
+    );
+    assert_eq!(
+        health["ladder_24h"]["owner_gate"], 1,
+        "another principal as its own tier"
+    );
     assert_eq!(health["ladder_24h"]["rules"], 0);
-    assert_eq!(health["human_per_agent_hour"], Value::Null, "no agent hours");
+    assert_eq!(
+        health["human_per_agent_hour"],
+        Value::Null,
+        "no agent hours"
+    );
 }
