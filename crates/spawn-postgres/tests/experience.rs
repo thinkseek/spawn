@@ -497,3 +497,48 @@ fn the_fleets_ladder_reads_the_decisions_view() {
         "no agent hours"
     );
 }
+
+/// Objective 049: the interventions window lists every kind with its line,
+/// newest first: a resume, a person's task, a cancel and reassign, and each
+/// person's intent.
+#[test]
+fn the_interventions_window_lists_each_kind_with_its_line() {
+    let (store, schema) = store("experience_interventions");
+    let mut client = admin(&schema);
+    history(&mut client);
+    let read = store
+        .interventions_window(0, 24 * H)
+        .expect("the window reads");
+    let lines: Vec<String> = read["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["kind"] != "command")
+        .map(|item| format!("{} {}", item["kind"].as_str().unwrap_or_default(), item["line"].as_str().unwrap_or_default()))
+        .collect();
+    assert_eq!(lines.len(), 3, "{read}");
+    assert!(lines.contains(&"owner_task assigned task #1".to_string()), "{lines:?}");
+    assert!(
+        lines.contains(&"cancel_reassign cancelled task #2, assigned task #3".to_string()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.starts_with("resume resumed mission #")),
+        "{lines:?}"
+    );
+    let times: Vec<i64> = read["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|item| item["at_ms"].as_i64().unwrap_or_default())
+        .collect();
+    assert!(times.windows(2).all(|pair| pair[0] >= pair[1]), "newest first: {times:?}");
+    for item in read["items"].as_array().into_iter().flatten() {
+        if item["kind"] == "command" {
+            assert!(item["outcome"].is_string() && item["attempts"].is_i64(), "{item}");
+        } else {
+            assert_eq!(item["commands"], json!([]), "{item}");
+            assert_eq!(item["outcome"], Value::Null, "{item}");
+        }
+    }
+}
