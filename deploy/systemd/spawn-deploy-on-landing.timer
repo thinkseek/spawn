@@ -1,0 +1,12 @@
+[Unit]
+Description=Spawn: deploy-on-landing, a tick a minute (deploy/on-landing.sh)
+
+[Timer]
+# A minute after the last tick ended, so ticks never overlap (the script's
+# own lock stops one that would). The debounce (SPAWN_DEPLOY_QUIET_SECS) and
+# the max wait are the script's, not the timer's.
+OnBootSec=2min
+OnUnitInactiveSec=1min
+
+[Install]
+WantedBy=timers.target
