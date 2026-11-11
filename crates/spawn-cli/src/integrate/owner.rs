@@ -529,7 +529,8 @@ pub(super) enum Judged {
     Refused(String),
     /// No verdict on the owner's commit (the host's fault, an abort, no
     /// room, a gate that could not run, a source that could not be read):
-    /// nothing recorded; judged again after the backoff.
+    /// no outcome recorded (a gate that ran records `source.push_no_verdict`
+    /// with its kept log, [`super::retained`]); judged again after the backoff.
     NoVerdict(String),
     /// Nothing recorded, judged again at the next pass with no backoff:
     /// main moved (behind the integrator's back, or the commit is in main
@@ -884,17 +885,76 @@ impl super::Judge {
                             self.crash_in(started, ended)
                         }) =>
             {
-                Ok(Judged::NoVerdict(format!(
-                    "the gate's rejection was the host's: {fault:?}"
-                )))
+                Ok(self.no_verdict_kept(
+                    store,
+                    request,
+                    format!("the gate's rejection was the host's: {fault:?}"),
+                    Some(&verdict.output),
+                ))
             }
             Ok(verdict) => refuse(
                 "rejected",
                 format!("the owner's gate rejected it: {}", verdict.reason.trim()),
                 &verdict.output,
             ),
-            Err(failure) => Ok(Judged::NoVerdict(no_verdict(failure))),
+            // Reaped: the integrator that started the gate records its end.
+            Err(failure @ crate::gate::GateFailure::Reaped) => {
+                Ok(Judged::NoVerdict(no_verdict(failure)))
+            }
+            Err(failure) => {
+                let log = failure_log(&failure).map(str::to_string);
+                Ok(self.no_verdict_kept(store, request, no_verdict(failure), log.as_deref()))
+            }
         }
+    }
+
+    /// A gate run that gave `request` no verdict (P26): the gate's `log`,
+    /// when it printed one, kept under the integrator's root
+    /// ([`super::retained`]), and `source.push_no_verdict` {request, reason,
+    /// log: the kept file's path or null} recorded, naming the judging. The
+    /// request stays pending (no outcome names it), judged again after its
+    /// backoff; the journal's line ([`judged`]) names the path too. Neither
+    /// keeping nor recording failing changes that: each is said and the
+    /// no-verdict stands.
+    fn no_verdict_kept(
+        &self,
+        store: &PostgresStore,
+        request: &Request,
+        why: String,
+        log: Option<&str>,
+    ) -> Judged {
+        let judging = super::judging::current_id();
+        let kept = log.and_then(|log| {
+            match super::retained::keep(
+                &self.root,
+                request.id,
+                judging.as_deref(),
+                log,
+                super::retained::KEEP,
+            ) {
+                Ok(path) => Some(path.to_string_lossy().to_string()),
+                Err(error) => {
+                    eprintln!(
+                        "integrate: owner request {}: keep its gate's log: {error}",
+                        request.id
+                    );
+                    None
+                }
+            }
+        });
+        let mut record =
+            json!({"type": "source.push_no_verdict", "request": request.id, "reason": why});
+        record["log"] = json!(kept);
+        if let Err(error) = super::record(store, &record) {
+            eprintln!(
+                "integrate: owner request {}: record its no verdict: {error}",
+                request.id
+            );
+        }
+        Judged::NoVerdict(match kept {
+            Some(path) => format!("{why}; the gate's log: {path}"),
+            None => why,
+        })
     }
 
     /// Land an accepted owner judging: under the landing hold (a connection
@@ -996,6 +1056,23 @@ fn refuse_owner(
     match refused_with(store, request, reason.clone(), extra) {
         Ok(_) => Judged::Refused(reason),
         Err(error) => Judged::NoVerdict(format!("record its refusal ({reason}): {error}")),
+    }
+}
+
+/// What the gate printed, for the ends that ran it (stdout, then stderr
+/// marked `! `); None for one that never ran, ran past its wall clock or was
+/// reaped by another integrator.
+fn failure_log(failure: &crate::gate::GateFailure) -> Option<&str> {
+    use crate::gate::GateFailure;
+    match failure {
+        GateFailure::Aborted { log, .. }
+        | GateFailure::NoRoom { log, .. }
+        | GateFailure::HostFault { log, .. }
+        | GateFailure::ValidatorDefect { log, .. }
+        | GateFailure::MainRed { log, .. }
+        | GateFailure::CannotJudge { log, .. }
+        | GateFailure::BaseDisagrees { log, .. } => Some(log),
+        GateFailure::Timeout | GateFailure::Reaped | GateFailure::Failed(_) => None,
     }
 }
 

@@ -1625,8 +1625,8 @@ controller. Missions, tasks, residents and landings are events in
   `task.reviewed`, `task.cancelled`, `task.gated`, `task.held`, `task.landed`,
   `task.aborted`, `task.over_budget`, `resident.proposed`, `resident.approved`,
   `resident.retired`, `legacy.imported`, `host.disk`, `host.judge`,
-  `source.push_requested`, `source.push_refused` (§10.3, "The owner's
-  landings"), and the loop's alerts: `alert.fired` and `alert.cleared`
+  `source.push_requested`, `source.push_refused`, `source.push_no_verdict`
+  (§10.3, "The owner's landings"), and the loop's alerts: `alert.fired` and `alert.cleared`
   (§3.4, folded into `spawn_alerts`).
   `task.report_unfinished` is a delivered task's report the dispatcher read
   and did not take because it is still a draft: it names the task's
@@ -1649,7 +1649,8 @@ controller. Missions, tasks, residents and landings are events in
   `task.landed`, `task.aborted`, `task.over_budget`, `mission.halted`, and
   the outcomes of the
   owner's landings: `source.moved` naming a `request`,
-  `source.push_refused`), `source.moved` (`spawn mission moved`), the
+  `source.push_refused`, and an owner judging's `source.push_no_verdict`),
+  `source.moved` (`spawn mission moved`), the
   owner's `source.push_requested` (`spawn mission push`; folded into no
   table, nor is `source.push_refused`), the loop's `host.disk` and the
   judge watcher's `host.judge` (through `spawn_host_record`; folded into no table,
@@ -2589,8 +2590,21 @@ are per-agent uids or a mount per engine.
   mission's scenarios directory, `no_scenarios`): `source.push_refused`
   with `verdict` and the gate's `log`; nothing moves and no mission counts
   it. No verdict (the host's fault, an abort, which is a harness error, no
-  room, a gate that could not run): nothing is recorded, and the request is
-  judged again after the host-fault backoff. With `--urgent` (gated or
+  room, a gate that could not run): no outcome is recorded, and the request is
+  judged again after the host-fault backoff. When the gate ran, what it
+  printed (stdout, then stderr marked `! `, its last 4 MiB) is kept as
+  `<root>/no-verdict-logs/<ms>-request-<request>-<judging>.log` (the
+  newest 32 kept, the older removed as each is written), and
+  `source.push_no_verdict` {request, reason, log: that path or null,
+  judging} is recorded, folded into no table and no outcome (the request
+  stays pending); the journal's no-verdict line names the path too.
+  Every judging's gates, task or owner, whatever they end with, keep their
+  files: when a gate's private directory in a judging's directory goes,
+  its `stdout` (the per-scenario lines at its end), `stderr`, `verdict` and
+  `status` (never its `env`) are copied first to
+  `<root>/gate-logs/<judging>/<gate>/`, each its last 4 MiB; the newest 200
+  judgings are kept, at most 2 GiB in all, the oldest removed first. The
+  judging's records name that directory (`gate_logs`) once a gate is kept. With `--urgent` (gated or
   not; for a fix of a red `main`, D2) the request does not wait out a
   task's judging in flight on its source: that judging is stopped (its
   gate's process group killed, as at its wall clock) and records itself

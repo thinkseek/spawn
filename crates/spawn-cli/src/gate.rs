@@ -1755,6 +1755,8 @@ impl Drop for PrivateDirectory {
         // A directory dropped on another thread than the one that made it
         // stays in that one's list; removing a path already gone is harmless.
         HELD.with(|held| held.borrow_mut().retain(|path| *path != self.0));
+        // A judging's gate keeps its files first (P26).
+        crate::integrate::judging::keep_gate(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
