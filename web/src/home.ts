@@ -198,6 +198,34 @@ export function haltWords(reason: string, gone: readonly string[] | null): { det
   return { detail, full: rest > 0 ? `${reason}; gone: ${gone.join(", ")}` : null };
 }
 
+/** An owner landing's `validator_defect` alerts from before objective 056,
+ * one per mission (evidence `owner` and `mission`, no `source`), folded by
+ * landing and scenario (evidence `event_id`, `scenario`): the first alert of
+ * each group maps to the missions it names together (`mission #4, mission
+ * #7`), every other to null (said by the first). Alerts of one source
+ * (objective 056) and a task's own are not in the map. */
+export function foldedDefects(alerts: readonly Alert[]): Map<string, string | null> {
+  const groups = new Map<string, Alert[]>();
+  for (const alert of alerts) {
+    if (alert.kind !== "validator_defect") continue;
+    const evidence = (alert.evidence ?? {}) as Record<string, unknown>;
+    if (evidence.owner !== true || typeof evidence.mission !== "number" || "source" in evidence) continue;
+    const group = `${String(evidence.event_id)}\u0000${String(evidence.scenario)}`;
+    groups.set(group, [...(groups.get(group) ?? []), alert]);
+  }
+  const folded = new Map<string, string | null>();
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    const named = group
+      .map((alert) => (alert.evidence as { mission: number }).mission)
+      .sort((left, right) => left - right)
+      .map((mission) => `mission #${mission}`)
+      .join(", ");
+    group.forEach((alert, index) => folded.set(alert.key, index === 0 ? named : null));
+  }
+  return folded;
+}
+
 /** Every item that needs the owner, actions first, oldest first within. */
 export function needsYou(input: NeedsInput): NeedItem[] {
   const items: NeedItem[] = [];
@@ -251,21 +279,32 @@ export function needsYou(input: NeedsInput): NeedItem[] {
       session: null,
     });
   }
-  for (const alert of liveAlerts(input.alerts, input.agents)) {
+  const live = liveAlerts(input.alerts, input.agents);
+  const folded = foldedDefects(live);
+  for (const alert of live) {
     // A halted mission is said once, with its command.
     if (alert.kind === "mission_halted" && [...halted].some((id) => alert.subject === `mission #${id}`)) continue;
+    // An owner landing's validator alerts from before they were one per
+    // source (one per mission) are one item, naming every mission.
+    const fold = folded.get(alert.key);
+    if (fold === null) continue;
     const named = input.nameOf?.(alert.subject) ?? null;
     const stale = alertStale(alert, input.agents);
-    const score = (alert.evidence as { stuck?: unknown } | null)?.stuck;
+    const evidence = alert.evidence as { stuck?: unknown; command?: unknown } | null;
+    const score = evidence?.stuck;
+    // The one command that acts on it, when the alert step named one (a
+    // stuck worker's `spawn task restart --id <task>`).
+    const namedCommand = evidence?.command;
+    const command = typeof namedCommand === "string" ? namedCommand : null;
     items.push({
       key: `alert:${alert.key}`,
       tone: stale ? "know" : "act",
-      title: alertTitle(alert, named),
+      title: fold !== undefined ? alertTitle({ kind: alert.kind, subject: fold }) : alertTitle(alert, named),
       detail: stale
         ? `scored stuck${typeof score === "number" ? ` ${score.toFixed(2)}` : ""} ${ageText(input.now - alert.fired_at_ms)} ago; not scored since (its latest judgement, ${ageText(input.now - (stale.judged_at_ms ?? input.now))} ago, has no score${stale.judgement?.reason ? `: ${stale.judgement.reason}` : ""})`
         : alert.text,
       since_ms: alert.fired_at_ms,
-      command: null,
+      command,
       // A session's alert opens that agent's page.
       session: named !== null ? alert.subject : null,
     });
