@@ -559,3 +559,175 @@ fn the_interventions_window_lists_each_kind_with_its_line() {
         }
     }
 }
+
+/// Every value of `key` anywhere in a JSON plan, as text.
+fn plan_values(plan: &Value, key: &str, out: &mut Vec<Value>) {
+    match plan {
+        Value::Object(map) => {
+            for (name, value) in map {
+                if name == key {
+                    out.push(value.clone());
+                }
+                plan_values(value, key, out);
+            }
+        }
+        Value::Array(list) => list.iter().for_each(|value| plan_values(value, key, out)),
+        _ => {}
+    }
+}
+
+/// The rows the plan read from spawn_events: each scan's rows and the rows
+/// its filter removed, times its loops.
+fn events_read(plan: &Value) -> i64 {
+    let mut total = 0;
+    let mut all = vec![plan.clone()];
+    while let Some(node) = all.pop() {
+        if node["Relation Name"] == "spawn_events" {
+            let loops = node["Actual Loops"].as_i64().unwrap_or(1);
+            let rows = node["Actual Rows"].as_i64().unwrap_or(0)
+                + node["Rows Removed by Filter"].as_i64().unwrap_or(0)
+                + node["Rows Removed by Index Recheck"].as_i64().unwrap_or(0);
+            total += rows * loops;
+        }
+        match node {
+            Value::Object(map) => all.extend(map.into_iter().map(|(_, value)| value)),
+            Value::Array(list) => all.extend(list),
+            _ => {}
+        }
+    }
+    total
+}
+
+/// A week of 300 tasks after `mission.added`: each assigned, judged eight
+/// times and closed, every tenth cancelled by a person and assigned again
+/// (same objective) as task 1000 + its id, then landed; every twentieth
+/// assigned by a person. About 3000 control records, as the live log.
+fn live_size_week(client: &mut Client) {
+    client
+        .batch_execute(
+            "insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id,
+                                       kind, session_seq, recorded_at_ms)
+             select 'agent_control', 'session_control', null, 'control', null,
+                    jsonb_build_object('name', 'control.recorded',
+                                       'detail', jsonb_build_object('record', r.record)),
+                    1 + row_number() over (order by r.ord), 3600000 + r.ord * 180000
+               from (
+                 select t * 12 + 0 as ord,
+                        jsonb_build_object('type', 'task.assigned', 'id', t, 'mission_id', 1,
+                                           'kind', 'ephemeral', 'agent_id', 'agent_worker_w_' || t,
+                                           'session_id', 'session_worker_w_' || t,
+                                           'brief', 'brief ' || t, 'objective', t,
+                                           'created_by',
+                                           case when t % 20 = 0 then 'human' else 'spawn-dispatch' end,
+                                           'model', 'default') as record
+                   from generate_series(1, 300) t
+                 union all
+                 select t * 12 + g, jsonb_build_object('type', 'task.gated', 'id', t,
+                                                      'verdict', 'rejected', 'revision', g)
+                   from generate_series(1, 300) t, generate_series(1, 8) g
+                 union all
+                 select t * 12 + 9,
+                        case when t % 10 = 0
+                             then jsonb_build_object('type', 'task.cancelled', 'id', t, 'by', 'human')
+                             else jsonb_build_object('type', 'task.landed', 'id', t) end
+                   from generate_series(1, 300) t
+                 union all
+                 select t * 12 + 10,
+                        jsonb_build_object('type', 'task.assigned', 'id', 1000 + t, 'mission_id', 1,
+                                           'kind', 'ephemeral', 'agent_id', 'agent_worker_w_' || (1000 + t),
+                                           'session_id', 'session_worker_w_' || (1000 + t),
+                                           'brief', 'brief ' || t, 'objective', t,
+                                           'created_by', 'spawn-dispatch', 'model', 'default')
+                   from generate_series(10, 300, 10) t
+                 union all
+                 select t * 12 + 11, jsonb_build_object('type', 'task.landed', 'id', 1000 + t)
+                   from generate_series(10, 300, 10) t
+               ) r;
+             analyze spawn_events;",
+        )
+        .expect("a live-size control stream");
+}
+
+/// Home's interventions figure at the live log's size (2026-11-11: objective
+/// 049's /api/interventions passed its 10 s statement timeout on every read,
+/// 12 s on a copy of the live log, 2736 control records): a week of 330
+/// tasks, each assigned, judged and closed, every tenth cancelled by a person
+/// and assigned again, every twentieth assigned by a person. The read and
+/// the scorecard's window count the same interventions; the experience
+/// views look a task's or a mission's records up by index
+/// (spawn_events_control_record_int_id, _row_id), not by decoding the whole
+/// control stream once per assignment; and the read stays within 25 passes
+/// over the stream (the cancel-and-reassign lateral over
+/// spawn_experience_assignments took 34 here).
+#[test]
+fn the_interventions_read_looks_records_up_by_index_at_live_size() {
+    let (store, schema) = store("experience_live_size");
+    let mut client = admin(&schema);
+    record(
+        &mut client,
+        0,
+        &json!({"type": "mission.added", "id": 1, "text": "live size", "origin": "human",
+                "sources": []}),
+    );
+    live_size_week(&mut client);
+    let (since, until) = (0, 8 * 24 * H);
+
+    let read = store
+        .interventions_window(since, until)
+        .expect("the interventions read");
+    let mut by_kind = std::collections::BTreeMap::<String, i64>::new();
+    for item in read["items"].as_array().into_iter().flatten() {
+        *by_kind
+            .entry(item["kind"].as_str().unwrap_or_default().to_string())
+            .or_default() += 1;
+    }
+    assert_eq!(by_kind.get("cancel_reassign"), Some(&30), "{by_kind:?}");
+    assert_eq!(by_kind.get("owner_task"), Some(&15), "{by_kind:?}");
+    let window = store
+        .experience_window(since, until)
+        .expect("the scorecard's window");
+    let counted: std::collections::BTreeMap<String, i64> = window["interventions"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(kind, n)| (kind.clone(), n.as_i64().unwrap_or_default()))
+        .collect();
+    assert_eq!(by_kind, counted, "the figure agrees with the scorecard");
+
+    let plan: Value = client
+        .query_one(
+            "explain (analyze, format json)
+             select count(*) from spawn_interventions where at_ms >= $1 and at_ms < $2",
+            &[&since, &until],
+        )
+        .expect("the plan")
+        .get(0);
+    let mut indexes = Vec::new();
+    plan_values(&plan, "Index Name", &mut indexes);
+    for index in [
+        "spawn_events_control_record_int_id",
+        "spawn_events_control_record_row_id",
+    ] {
+        assert!(
+            indexes.contains(&json!(index)),
+            "{index} unused: {indexes:?}"
+        );
+    }
+    // Each lookup by index reads a task's or a mission's records, not the
+    // stream: 56 448 event rows on this log (18 passes over its ~3060
+    // control records), against 103 848 (34) with the cancel-and-reassign
+    // lateral over spawn_experience_assignments, which folded every
+    // assignment again for each cancelled task (12 s on the live log).
+    let read_rows = events_read(&plan);
+    let stream: i64 = client
+        .query_one(
+            "select count(*) from spawn_events where session_id = 'session_control'",
+            &[],
+        )
+        .expect("the stream")
+        .get(0);
+    assert!(
+        read_rows <= 25 * stream,
+        "{read_rows} event rows read for a stream of {stream}"
+    );
+}
