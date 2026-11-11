@@ -7,7 +7,7 @@ the transcript archive (an encrypted tar of git bundles and transcript
 files). Both are encrypted on this host before they leave it, and **no key
 on this host can delete or overwrite them** in R2 before they age out.
 
-The command is the binary's: `spawn backup dump|bundle|verify`
+The command is the binary's: `spawn backup dump|bundle|verify` (and `restore-drill`, by hand)
 (`crates/spawn-cli/src/backup.rs`). This directory holds what it does not:
 the timers, the bucket's lifecycle and lock rules, the old shell tools
 (`pg-backup.sh`, `pg-restore-drill.sh`, `lib.sh`) kept for manual use, and
@@ -225,6 +225,41 @@ the bundle must list exactly those — and a full bundle must additionally
 pass `git bundle verify` in an empty repository (an increment's
 prerequisites are its base's commits, which the drill does not fetch). A store with no bundle yet says so in the record and passes. The result is the record's `bundle`
 object; a bundle that fails makes the day's verdict a failure.
+
+`spawn backup restore-drill [--into <dir>] [--keep]` (by hand; core (ii))
+restores the sources and the transcript archive themselves, not only opens
+them. It takes the newest stored bundle and the chain of increments back to
+its full bundle (each record's `base_event_id`; a base that stored nothing
+breaks the chain and fails the drill), fetches and decrypts each (the
+object's `x-amz-meta-sha256` and the archive's SHA-256 against the record's),
+and applies them in order into a new directory of its own, mode 700, under
+`--into` (default `/data/tmp`; never under `$HOME`, `$SPAWN_LIVE` or the
+workspace root, symlinks resolved):
+
+- the transcript archive: each slice at its offset (whole at 0, an append at
+  exactly the size restored so far), each file then the size the newest
+  record names; compared with `<root>/.transcripts` by size and SHA-256. A
+  live file that grew since the bundle (its first bytes the restored file)
+  and one made since are expected; one last written before the bundle's
+  window (`SPAWN_BACKUP_TRANSCRIPT_DAYS`) is in no bundle, counted apart and
+  not a failure; a live file changed, shorter, gone, or written within the
+  window and not restored is a mismatch;
+- every mission source: `git clone --mirror` of its full bundle, each
+  increment's bundle fetched on top, the refs set to the newest record's
+  heads, `git fsck --connectivity-only`; compared with the live repository's
+  `refs/heads` and `refs/tags`. A ref live moved on to a descendant, added or
+  removed since is expected; one live moved to a commit that does not descend
+  from the restored one is a mismatch.
+
+One line per resource, then `passed` (exit 0) or `FAILED` (exit 1: a
+mismatch older than the bundle, or a backup that cannot be restored); 2 when
+it cannot run (no settings, a refused `--into`, no stored bundle). It reads
+live and writes none of it, records nothing, reads the key as `verify` does
+and prints none of it, and removes its directory at the end (`--keep` leaves
+it) only after checking it is still the one it made. `test-restore-drill.sh`
+tests it end to end: the binary's own `spawn backup bundle` against a fake R2
+(a local directory behind a small HTTP server) and a throwaway database,
+under a fake HOME.
 
 `pg-restore-drill.sh [KEY]` remains for the manual, docker-based drill the
 old daily script documented: a throwaway container of the live server's
