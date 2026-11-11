@@ -150,7 +150,10 @@ fn a_refused_command_sent_again_continues_its_intent() {
     let mut client = admin(&schema);
     let note = input("note B");
     let w1 = ("human", "session_w1", &note);
-    let (cli, w2) = (("spawn", "session_w1", &note), ("human", "session_w2", &note));
+    let (cli, w2) = (
+        ("spawn", "session_w1", &note),
+        ("human", "session_w2", &note),
+    );
     // Refused twice (a dispatcher's same text between, not a person's),
     // then taken: one intent.
     let a1 = command(&mut client, w1, 0, End::Failed, None);
