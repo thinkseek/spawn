@@ -510,7 +510,7 @@ const TASK_WORDS: [&str; 4] = ["task", "tasks", "report", "reports"];
 /// `[{text, at_ms, tasks, settled}]` ([`owner_note`]), the named tasks'
 /// states read for those tasks alone. When they cannot be read, every line
 /// names no task and none is settled, and a warning says why.
-fn owner_notes(
+pub(super) fn owner_notes(
     store: &spawn_postgres::PostgresStore,
     notes: &[(String, Option<i64>)],
     warnings: &mut Vec<String>,

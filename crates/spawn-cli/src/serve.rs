@@ -3294,6 +3294,71 @@ mod tests {
         }
     }
 
+    /// Objective 064, through the real store: each line for the owner
+    /// carries the tasks it names with their states now, and only a review
+    /// ask whose tasks have all ended is settled.
+    #[test]
+    fn the_owners_lines_carry_their_tasks_states_and_whether_they_are_settled() {
+        in_test_schema(|owner, store| {
+            let mission = store
+                .mission_add("064 owner work", &json!([]), "human")
+                .expect("a mission");
+            let task = |brief: &str| {
+                store
+                    .task_assign(mission, "ephemeral", "w1", brief, "default")
+                    .expect("a task")
+            };
+            let (a, b, c, d) = (task("a"), task("b"), task("c"), task("d"));
+            let mut client =
+                postgres::Client::connect(owner, postgres::NoTls).expect("the owner connects");
+            let mut record = |value: serde_json::Value| {
+                client
+                    .query_one("select spawn_control_record($1)", &[&value])
+                    .expect("a record");
+            };
+            for id in [a, b, d] {
+                record(json!({"type": "task.reported", "id": id, "commit": "c"}));
+            }
+            for id in [a, b] {
+                record(json!({"type": "task.reviewed", "id": id, "accepted": true}));
+            }
+            store.task_cancel(c).expect("cancelled");
+            let lines: Vec<(String, Option<i64>)> = [
+                format!("reports {a}, {b} and {c} are still waiting for your review."),
+                format!("task #{d} waits for your review."),
+                format!("task {a} landed; deploying it needs spawn init-db."),
+                format!("mission #{mission} has no backlog yet; task 999999 neither."),
+            ]
+            .into_iter()
+            .map(|text| (text, Some(5)))
+            .collect();
+            let mut warnings = Vec::new();
+            let notes = super::attention::owner_notes(store, &lines, &mut warnings);
+            assert!(warnings.is_empty(), "{warnings:?}");
+            let shape = |index: usize| {
+                json!({"tasks": notes[index]["tasks"], "settled": notes[index]["settled"]})
+            };
+            assert_eq!(
+                shape(0),
+                json!({"tasks": [{"id": a, "state": "accepted"}, {"id": b, "state": "accepted"},
+                                 {"id": c, "state": "cancelled"}],
+                       "settled": true})
+            );
+            assert_eq!(
+                shape(1),
+                json!({"tasks": [{"id": d, "state": "reported"}], "settled": false})
+            );
+            assert_eq!(
+                shape(2),
+                json!({"tasks": [{"id": a, "state": "accepted"}], "settled": false}),
+                "an ask other than a review stands"
+            );
+            assert_eq!(shape(3), json!({"tasks": [], "settled": false}));
+            assert_eq!(notes[0]["text"], json!(lines[0].0));
+            assert_eq!(notes[0]["at_ms"], json!(5));
+        });
+    }
+
     #[test]
     fn a_cost_task_row_carries_its_label_as_the_missions_board_gives_it() {
         in_test_schema(|_owner, store| {
