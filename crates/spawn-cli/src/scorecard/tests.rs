@@ -1509,7 +1509,7 @@ fn gate_time_counts_the_owners_judgings_for_the_fleet_and_their_mission() {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.subsec_nanos());
-    let schema = format!("spawn_test_{}_{nanos:x}_gate_owner", std::process::id());
+    let schema = spawn_postgres::testing::TestSchema::new("gate_owner");
     let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
         .expect("connect and migrate");
     let root =
@@ -1595,8 +1595,6 @@ fn gate_time_counts_the_owners_judgings_for_the_fleet_and_their_mission() {
         );
     }));
     let _ = std::fs::remove_dir_all(&root);
-    let _ = postgres::Client::connect(&url, postgres::NoTls)
-        .and_then(|mut client| client.batch_execute(&format!("drop schema {schema} cascade")));
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }

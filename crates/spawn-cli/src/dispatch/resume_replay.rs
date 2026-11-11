@@ -32,18 +32,14 @@ const NEVER_READY: &str = "pane never became ready, last state Unknown";
 struct Db {
     store: Arc<PostgresStore>,
     url: String,
-    schema: String,
+    schema: spawn_postgres::testing::TestSchema,
 }
 
 impl Db {
     fn new(case: &str) -> Self {
-        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
-            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
-        );
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.subsec_nanos());
-        let schema = format!("spawn_test_{}_{nanos:x}_{case}", std::process::id());
+        // Dropped after the store (declared after it), when the test passes (P19).
+        let schema = spawn_postgres::testing::TestSchema::new(case);
+        let url = schema.url().to_string();
         let store = PostgresStore::connect_in_schema(&url, &schema).expect("connect and migrate");
         Self {
             store: Arc::new(store),
@@ -114,14 +110,6 @@ impl Db {
                 key
             })
             .collect()
-    }
-}
-
-impl Drop for Db {
-    fn drop(&mut self) {
-        if let Ok(mut client) = postgres::Client::connect(&self.url, postgres::NoTls) {
-            let _ = client.batch_execute(&format!("drop schema if exists {} cascade", self.schema));
-        }
     }
 }
 

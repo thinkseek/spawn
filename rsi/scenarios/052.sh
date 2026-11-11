@@ -18,7 +18,8 @@
 # Required (the objective's prompt says each rule): an objective with an
 # `objective.solved` record in its mission is "solved", as a landing makes
 # it, in every view built from the backlog; its row names the record
-# (`solved_on_base`: {event, task, base}, null for every other objective);
+# (`solved_on_base`: {event, task, base} and maybe more fields, null for
+# every other objective);
 # the counts follow; and `next_objective` is the objective the integrator's
 # own choice would assign next (solved, in flight, held and owner-judged
 # objectives left out, yields and failed attempts ordered, `after` obeyed).
@@ -284,7 +285,10 @@ code=$(get /api/rsi "$WORK/api.json")
 row() { jq -c --argjson id "$1" "[.missions[] | select(.id == 1) | .objectives[] | select(.id == \$id)][0] | $2" "$WORK/api.json"; }
 expect_eq "$(jq -c '[.missions[] | select(.id == 1) | .objectives[] | .status]' "$WORK/api.json")" '["solved","solved","open","open","open"]' \
     "(1) /api/rsi: the statuses of objectives 1 to 5 (2 was recorded solved on the base, event $solved)"
-expect_eq "$(row 2 '.solved_on_base // "none"')" "{\"base\":\"$B\",\"event\":$solved,\"task\":2}" \
+# Only the three keys this objective names: a later objective may add
+# fields to the record (063 adds at_ms for its time axis), which is
+# compatible and no failure here.
+expect_eq "$(row 2 '.solved_on_base | if type == "object" then {base, event, task} else (. // "none") end')" "{\"base\":\"$B\",\"event\":$solved,\"task\":2}" \
     "(1) /api/rsi: objective 2's solved_on_base (the record that solved it)"
 for n in 1 3 4 5; do
     expect_eq "$(row "$n" 'if has("solved_on_base") then .solved_on_base else "absent" end')" null \
