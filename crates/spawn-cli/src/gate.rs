@@ -752,6 +752,13 @@ pub(crate) struct Verdict {
     /// The regressions the owner's `quarantined` list kept from running
     /// (the verdict's `quarantined`). Script file names only.
     pub(crate) quarantined: Vec<String>,
+    /// The regressions run on the candidate in this gate whose run passed
+    /// (the verdict's `passed`, checks included, the task's own scenario
+    /// not). Script file names only.
+    pub(crate) passed: Vec<String>,
+    /// The regressions not run, taken from the base's cache as solved (the
+    /// verdict's `reused`). Script file names only.
+    pub(crate) reused: Vec<String>,
     /// Everything the gate printed, stderr marked `! `, the verdict last.
     pub(crate) output: String,
 }
@@ -1363,6 +1370,8 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
         main_red_scenarios: main_red_scenarios(&value),
         validator_defects: script_names(&value, "validator_defects"),
         quarantined: script_names(&value, "quarantined"),
+        passed: script_names(&value, "passed"),
+        reused: script_names(&value, "reused"),
         output,
     })
 }

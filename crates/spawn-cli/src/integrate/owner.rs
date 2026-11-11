@@ -1180,7 +1180,8 @@ impl super::Judge {
 /// The fields an accepted owner judging's `source.moved` adds: its verdict,
 /// and the validators the gate judged it without, failing on the base too
 /// (`validator_defects`), or that the owner's list kept from running
-/// (`quarantined`), when there are any.
+/// (`quarantined`), and the regressions that passed in it (`passed`, run;
+/// `reused`, from the base's cache), when there are any.
 fn accepted_extra(verdict: &crate::gate::Verdict) -> serde_json::Value {
     let mut extra = json!({"verdict": "accepted"});
     if !verdict.validator_defects.is_empty() {
@@ -1188,6 +1189,14 @@ fn accepted_extra(verdict: &crate::gate::Verdict) -> serde_json::Value {
     }
     if !verdict.quarantined.is_empty() {
         extra["quarantined"] = json!(verdict.quarantined);
+    }
+    // Which regressions passed in this gate (run, or reused from the base's
+    // cache): what clears an open validator alert of the source.
+    if !verdict.passed.is_empty() {
+        extra["passed"] = json!(verdict.passed);
+    }
+    if !verdict.reused.is_empty() {
+        extra["reused"] = json!(verdict.reused);
     }
     extra
 }
