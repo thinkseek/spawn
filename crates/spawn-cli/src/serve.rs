@@ -106,7 +106,7 @@
 //! [`answers`]'s.
 
 mod answers;
-mod attention;
+pub(crate) mod attention;
 mod labels;
 
 use std::collections::BTreeSet;
