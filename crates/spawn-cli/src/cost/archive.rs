@@ -514,6 +514,33 @@ mod tests {
         );
     }
 
+    /// An archive of two agents: `agent_w_1`'s transcript (one message
+    /// before its executions, one in each) and `agent_none_2`'s, with no
+    /// execution. The worker's directory.
+    fn archive_of_two(root: &Path) -> PathBuf {
+        let worker = root.join("agent_w_1");
+        let stranger = root.join("agent_none_2");
+        std::fs::create_dir_all(&worker).expect("dir");
+        std::fs::create_dir_all(&stranger).expect("dir");
+        write(
+            &worker.join("n1.jsonl"),
+            &[
+                line("m-early", "x", "2026-11-10T09:00:00.000Z", [1, 0, 0, 0]),
+                line("m-a", "x", "2026-11-10T10:30:00.000Z", [2, 0, 0, 0]),
+                line("m-a", "x", "2026-11-10T10:30:00.000Z", [2, 0, 0, 0]),
+                line("m-b", "x", "2026-11-10T11:30:00.000Z", [3, 1, 0, 0]),
+            ]
+            .concat(),
+        );
+        write(
+            &stranger.join("n2.jsonl"),
+            &line("m-x", "x", "2026-11-10T10:30:00.000Z", [4, 0, 0, 0]),
+        );
+        // Not an archive file.
+        write(&worker.join("notes.txt"), "{}");
+        worker
+    }
+
     /// The archive counted once: a second count adds nothing, a copy file
     /// adds nothing, an agent with no execution is skipped and said, and
     /// files as they were marked are not read again.
@@ -537,26 +564,7 @@ mod tests {
             let ten = 1_794_304_800_000_i64;
             started(&mut client, "agent_w_1", "exec_a", ten);
             started(&mut client, "agent_w_1", "exec_b", ten + 3_600_000);
-            let worker = root.join("agent_w_1");
-            let stranger = root.join("agent_none_2");
-            std::fs::create_dir_all(&worker).expect("dir");
-            std::fs::create_dir_all(&stranger).expect("dir");
-            write(
-                &worker.join("n1.jsonl"),
-                &[
-                    line("m-early", "x", "2026-11-10T09:00:00.000Z", [1, 0, 0, 0]),
-                    line("m-a", "x", "2026-11-10T10:30:00.000Z", [2, 0, 0, 0]),
-                    line("m-a", "x", "2026-11-10T10:30:00.000Z", [2, 0, 0, 0]),
-                    line("m-b", "x", "2026-11-10T11:30:00.000Z", [3, 1, 0, 0]),
-                ]
-                .concat(),
-            );
-            write(
-                &stranger.join("n2.jsonl"),
-                &line("m-x", "x", "2026-11-10T10:30:00.000Z", [4, 0, 0, 0]),
-            );
-            // Not an archive file.
-            write(&worker.join("notes.txt"), "{}");
+            let worker = archive_of_two(&root);
 
             let lines = count(&store, &root, &prices);
             assert_eq!(
