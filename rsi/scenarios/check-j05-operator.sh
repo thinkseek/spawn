@@ -17,6 +17,8 @@
 #                 bypasses them;
 #   blackbox 100  `spawn serve`: the read-only API and static files, no
 #                 writes, the token off loopback;
+#   001           `spawn version` prints one line starting with "spawn " (with
+#                 blackbox 010);
 #   027 (1)-(6)   `spawn mission configure` changes only what it is given;
 #   007 (2)       `spawn task stages --id N` ends `cancelled` for each task
 #                 the closure rule cancels (007 (1), (3)-(5) move to CI as a
@@ -238,6 +240,12 @@ for gone in status dispatch charter hook corpus judge; do
     assert_eq "$status" 1 "$gone exit"
     assert_contains "$(err)" "unknown command $gone" "$gone is not a command"
 done
+
+# 001 whole: `spawn version` prints one line that starts with "spawn ".
+echo "j05: [001] spawn version"
+capture "$SPAWN_BIN" version
+assert_eq "$status" 0 "001: spawn version exit"
+assert_eq "$(out | grep -c '^spawn ')" 1 "001: lines of spawn version starting with 'spawn '"
 
 echo "j05: [bb010 cli contract] a missing or invalid flag fails before the store"
 capture "$SPAWN_BIN" submit --agent agent_x --session session_x
@@ -1137,5 +1145,5 @@ jq -S . "$card" >"$WORK/card.sorted"
 cmp -s "$WORK/api.sorted" "$WORK/card.sorted" ||
     fail "(4) /api/scorecard differs from \`spawn scorecard --json\` for the same window: $(diff "$WORK/card.sorted" "$WORK/api.sorted" | head -n 12 | tr '\n' ' ')"
 
-echo "j05: the operator's CLI and API answered as blackbox 010, 020, 030, 060, 080, 100, 027, 007 (2) and 017 (4) require"
+echo "j05: the operator's CLI and API answered as blackbox 010, 020, 030, 060, 080, 100, 001, 027, 007 (2) and 017 (4) require"
 exit 0
