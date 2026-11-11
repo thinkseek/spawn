@@ -21,6 +21,8 @@ main, changes nothing live until that commit is gated and deployed.
 | `spawn-backup` (`.timer`) | `spawn backup dump`: the hourly encrypted `pg_dump` of the event log to R2, bucket-locked, expired by R2's lifecycle; install, keys, windows and cost in [deploy/backup](../backup/README.md) | oneshot, hourly at :00 + up to 5 min |
 | `spawn-backup-bundle` (`.timer`) | `spawn backup bundle`: the daily encrypted bundle of the mission sources and the 14-day transcript window — a full bundle the ISO week's first (or when none is within 7 days), an increment against its base otherwise; a failed run retries twice (15 min apart) | oneshot, daily at 04:00 + up to 1 h |
 | `spawn-backup-verify` (`.timer`) | `spawn backup verify`: the daily restore drill — the newest dump restored into a scratch database of its own on `SPAWN_BACKUP_DRILL_DATABASE_URL` and compared with its record (never the live database), and the newest bundle fetched, unpacked and compared with its own | oneshot, daily at 05:00 + up to 1 h |
+| `spawn-nightly@<source>` (`.timer`) | `scripts/rsi/nightly.sh <source>` from the controller: the scenarios in `rsi/scenarios/nightly/` (moved out of the gate), each judged by the gate on live `main` against itself, alone on a held host; the fact file `$SPAWN_WORKSPACE_ROOT/nightly/<source>.json` (green, red, flaky or skipped) and one `nightly_red` alert per red (below) | oneshot, daily at 02:30 + up to 10 min |
+| `spawn-nightly-stale@<source>` (`.timer`) | `scripts/rsi/nightly.sh --stale <source>`: whether the nightly covers anything (two skipped runs in a row, no fact younger than 26 h, or none though its timer fired: one `nightly_stale` alert); no run, no gate | oneshot, hourly |
 | `spawn-maintenance` (`.timer`) | `scripts/maintenance.sh` from the controller: the gate's leftover scratch (`$TMPDIR/spawn-gate.XXXXXX` whose gate is gone, by the pid, start time and boot the gate recorded in it; never a running gate's, whatever its age), deploy.sh's dumps in the backups directory beyond the newest 5; nothing Spawn did not create ([docs/storage.md](../../docs/storage.md#disk-room)) | oneshot, hourly |
 
 `spawn-loop` uses `KillMode=process` so a restart keeps the agents' tmux
@@ -156,6 +158,43 @@ journalctl --user -u spawn-maintenance -n 20
 Settings, in `spawn.env`: `SPAWN_MAINTENANCE_KEEP_DUMPS` (5),
 `SPAWN_MAINTENANCE_SCRATCH_AGE_MIN` (1440: only for a scratch that holds no
 record of its gate, and never under `SPAWN_GATE_WALL_CLOCK_MINUTES`).
+
+- `spawn-nightly@spawn.timer` (gate v2 step 5a, sync/design-nightly-min.md),
+  installed by hand. It takes every host scenario slot as the run holding
+  it ends (up to 2 h, else the fact file says `skipped`), so the host
+  drains instead of having to fall quiet by itself, then lets slot 1 go to
+  its own gate and holds 2..N for its whole run (a gate that needs one
+  meanwhile waits, and past its `SPAWN_GATE_SLOT_WAIT_SECS` has no room:
+  judged again after the backoff),
+  and judges each `rsi/scenarios/nightly/*.sh` with the gate: main against
+  itself, the scenario as a check (run again on a failure; a pass the second
+  time is `flaky`), with the integrator's gate environment
+  (`SPAWN_GATE_ENV_FILE`). A red run fires one `nightly_red` alert (`spawn
+  alerts`, the home page), keyed by the red's first main, naming the failed
+  scenarios and the landings since the last green; the first green or flaky
+  run clears it. The gate's log of each scenario's last run is kept at
+  `$SPAWN_WORKSPACE_ROOT/nightly/<source>.<scenario>.log`. A red does not
+  hold landings yet (step 5b). A run stopped by its unit's timeout (6 h)
+  writes `skipped`, saying so. Two skipped runs in a row, or no fact younger
+  than 26 h, fire one `nightly_stale` alert (from the run itself, and hourly
+  from `spawn-nightly-stale@spawn.timer`, so a nightly that never runs is
+  told too); the first run that judges clears it.
+
+```sh
+SPAWN_TEST_DATABASE_URL=… SPAWN_BIN=target/debug/spawn bash scripts/rsi/test-nightly.sh   # in a checkout
+cp deploy/systemd/spawn-nightly@.service deploy/systemd/spawn-nightly@.timer \
+  deploy/systemd/spawn-nightly-stale@.service deploy/systemd/spawn-nightly-stale@.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now spawn-nightly@spawn.timer spawn-nightly-stale@spawn.timer
+systemctl --user start spawn-nightly@spawn.service   # one run now, optional (after a fix: clears a red)
+jq . ~/.local/share/spawn-rsi/ws/nightly/spawn.json
+journalctl --user -u spawn-nightly@spawn -n 20
+```
+
+Settings, in `spawn.env`: `SPAWN_NIGHTLY_WAIT_SECS` (7200),
+`SPAWN_NIGHTLY_POLL_SECS` (60, only without a slot budget),
+`SPAWN_NIGHTLY_SAMPLE_SECS` (15), `SPAWN_NIGHTLY_STALE_SECS` (93600),
+`SPAWN_NIGHTLY_STALE_RUNS` (2), `SPAWN_NIGHTLY_LOCK_WAIT_SECS` (120: how long a run waits for an hourly check to let go of the lock).
 
 ## Deploying
 

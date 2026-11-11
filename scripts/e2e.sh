@@ -256,7 +256,9 @@ while :; do
       tool
       printf 'STALLED: halfway through, stopping here\n'
       stop; pending=0 ;;
-    continue)
+    # The nudge, as Spawn types a one-line input: its text, then its message
+    # marker and answer line on the same line (crates/spawn-core/src/bridge.rs).
+    continue | "continue [spawn message #"*)
       prompt
       tool
       printf 'DONE: finished after continue\n'
