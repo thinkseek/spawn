@@ -46,6 +46,12 @@
 #               at each start), with their locks, and a half-made one
 #               (`.<id>.XXXXXX`, a gate killed while it made it) older than
 #               a day.
+#   5. catalogs the fleet's test database's own system catalogs, VACUUM
+#               (ANALYZE)d (scripts/vacuum-catalogs.sh, P21): test runs
+#               make and drop schemas there, and the catalogs grow with
+#               every run. Only that database (SPAWN_FLEET_TEST_DATABASE_URL),
+#               refused when its port or database is the live one's; it
+#               drops no schema and removes no file.
 #
 # Every step runs even when an earlier one failed; the exit status is 1
 # when any did. SPAWN_MAINTENANCE_DRY_RUN=1 prints what would go and
@@ -214,5 +220,9 @@ if whole SPAWN_MAINTENANCE_CACHE_AGE_DAYS "$days" 2>/dev/null && [ -d "$servers"
     done
     say "servers: removed $gone private test server templates no gate used for $days days from $servers$note"
 fi
+
+# 5. the fleet's test database's catalogs (it says what it did; a refusal
+# or a failure fails the run).
+sh "$(dirname "$0")/vacuum-catalogs.sh" || fail "catalogs: the step failed or was refused (above)"
 
 exit "$failed"
