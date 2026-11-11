@@ -10,8 +10,8 @@ use super::measure::{
     trend, union_ms,
 };
 use super::time::{DAY_MS, HOUR_MS, day_of, days, format_rfc3339, parse_rfc3339, parse_span};
-use super::transcripts::{Message, read_archive};
-use super::{Failure, When, card, text, window};
+use super::transcripts::{Message, Reach, read_archive};
+use super::{Failure, When, card, reach_tokens, text, window};
 use crate::deliver::delivery_of;
 
 /// 2026-10-02T00:00:00Z.
@@ -931,7 +931,7 @@ fn tokens_count_once_per_message_across_lines_and_copies() {
         line("2026-10-02T22:00:00.000Z", "msg_a", "opus", [10, 0, 0, 90]),
     )
     .expect("supervisor");
-    let messages = read_archive(&root, t0()).expect("read the archive");
+    let (messages, _) = read_archive(&root, t0()).expect("read the archive");
     let seen: Vec<(&str, &str, i64, &str, i64)> = messages
         .iter()
         .map(|message| {
@@ -953,7 +953,10 @@ fn tokens_count_once_per_message_across_lines_and_copies() {
             ("agent_resident_r1", "msg_f", at(41), "opus", 1100),
         ]
     );
-    assert_eq!(read_archive(&root.join("missing"), t0()), Ok(Vec::new()));
+    assert_eq!(
+        read_archive(&root.join("missing"), t0()).map(|(messages, _)| messages),
+        Ok(Vec::new())
+    );
     std::fs::remove_dir_all(&root).expect("clean up");
 }
 
@@ -1315,4 +1318,144 @@ fn a_settling_window_says_so_in_its_json_and_on_its_header_line() {
     let mut figures = open.clone();
     figures["settling"] = serde_json::Value::Bool(false);
     assert_eq!(figures, settled);
+}
+
+/// The archive says how far back its tokens reach: from its oldest message
+/// when every file was read, past the time asked from when it holds a file
+/// last written more than a day before it, and from nothing when it holds
+/// no message.
+#[test]
+fn the_archive_says_how_far_back_its_tokens_reach() {
+    let root = std::env::temp_dir().join(format!(
+        "spawn-scorecard-reach-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |time| time.subsec_nanos())
+    ));
+    let agent = root.join("agent_w1");
+    std::fs::create_dir_all(&agent).expect("archive");
+    let line = |time: &str, id: &str| {
+        format!(
+            "{{\"type\":\"assistant\",\"timestamp\":\"{time}\",\"message\":{{\"id\":\"{id}\",\
+             \"model\":\"opus\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n"
+        )
+    };
+    assert_eq!(
+        read_archive(&root.join("missing"), t0()),
+        Ok((Vec::new(), Reach::From(None)))
+    );
+    assert_eq!(
+        read_archive(&root, t0()).map(|(_, reach)| reach),
+        Ok(Reach::From(None)),
+        "an archive with no message"
+    );
+    std::fs::write(
+        agent.join("0a0a0a0a-0000-4000-8000-000000000001.jsonl"),
+        [
+            line("2026-10-02T05:00:00.000Z", "msg_b"),
+            line("2026-10-02T03:00:00.000Z", "msg_a"),
+        ]
+        .concat(),
+    )
+    .expect("a transcript");
+    assert_eq!(
+        read_archive(&root, t0()).map(|(_, reach)| reach),
+        Ok(Reach::From(Some(at(3)))),
+        "every file read: the oldest message"
+    );
+    // A file last written two days before the time asked from holds lines
+    // from before it: the archive reaches back past it, and that file is
+    // not read.
+    let old = agent.join("0a0a0a0a-0000-4000-8000-000000000002.jsonl");
+    std::fs::write(&old, line("2026-09-29T00:00:00.000Z", "msg_old")).expect("an old one");
+    let written = std::time::UNIX_EPOCH
+        + std::time::Duration::from_millis(
+            u64::try_from(t0() - 2 * DAY_MS).expect("after the epoch"),
+        );
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .and_then(|file| file.set_modified(written))
+        .expect("age the file");
+    let (messages, reach) = read_archive(&root, t0()).expect("read the archive");
+    assert_eq!(reach, Reach::Before);
+    assert_eq!(
+        messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        vec!["msg_a", "msg_b"]
+    );
+    // Asked from before it, the old file is read and is the oldest.
+    assert_eq!(
+        read_archive(&root, t0() - 4 * DAY_MS).map(|(_, reach)| reach),
+        Ok(Reach::From(Some(t0() - 3 * DAY_MS)))
+    );
+    std::fs::remove_dir_all(&root).expect("clean up");
+}
+
+/// A window that starts before the archive's oldest model call says so in
+/// its JSON and on its header line, and so does one whose previous window
+/// alone starts before it; the figures are the same either way.
+#[test]
+fn a_window_before_the_archive_says_so_in_its_json_and_on_its_header_line() {
+    let history = small_card_story().history();
+    let window = window_hours(24, 48);
+    let header = |card: &Value| text(card).lines().next().unwrap_or_default().to_string();
+    let read = |reach: Reach| {
+        let mut card = card(&history, window, None).expect("a card");
+        reach_tokens(&mut card, reach, window.since, window.since - DAY_MS);
+        card
+    };
+    let whole = read(Reach::Before);
+    assert_eq!(whole["tokens_short"], Value::Null);
+    assert_eq!(whole["tokens_from_ms"], Value::Null);
+    assert!(!header(&whole).contains("tokens"), "{}", header(&whole));
+    // The archive's oldest call at or before the previous window's start.
+    for oldest in [at(-1), at(0)] {
+        let card = read(Reach::From(Some(oldest)));
+        assert_eq!(card["tokens_short"], Value::Null, "{oldest}");
+        assert_eq!(card, whole);
+    }
+    let previous = read(Reach::From(Some(at(5))));
+    assert_eq!(previous["tokens_short"], json!("previous"));
+    assert_eq!(previous["tokens_from_ms"], json!(at(5)));
+    assert!(
+        header(&previous).contains(&format!(
+            "tokens: the transcript archive begins at {}, after the previous window's start",
+            format_rfc3339(at(5))
+        )),
+        "{}",
+        header(&previous)
+    );
+    // The window's own start, exactly, is still covered.
+    assert_eq!(
+        read(Reach::From(Some(at(24))))["tokens_short"],
+        json!("previous")
+    );
+    let short = read(Reach::From(Some(at(30))));
+    assert_eq!(short["tokens_short"], json!("window"));
+    assert_eq!(short["tokens_from_ms"], json!(at(30)));
+    assert!(
+        header(&short).contains(&format!(
+            "tokens: the transcript archive begins at {}, after this window's start: \
+             tokens before it are not counted",
+            format_rfc3339(at(30))
+        )),
+        "{}",
+        header(&short)
+    );
+    let none = read(Reach::From(None));
+    assert_eq!(none["tokens_short"], json!("window"));
+    assert_eq!(none["tokens_from_ms"], Value::Null);
+    assert!(
+        header(&none).contains("the transcript archive holds no model call"),
+        "{}",
+        header(&none)
+    );
+    // The figures are the same: the fields say only where the tokens begin.
+    for card in [previous, short, none] {
+        let mut figures = card.clone();
+        figures["tokens_short"] = Value::Null;
+        figures["tokens_from_ms"] = Value::Null;
+        assert_eq!(figures, whole);
+    }
 }

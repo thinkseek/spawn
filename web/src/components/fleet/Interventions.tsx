@@ -2,8 +2,8 @@ import { useState } from "react";
 import { ChevronRight, Hand } from "lucide-react";
 
 import { readApi, usePoll } from "../../api";
-import type { InterventionsAnswer, InterventionsView } from "../../interventions.ts";
-import { interventionsView } from "../../interventions.ts";
+import type { FigureState, InterventionsAnswer } from "../../interventions.ts";
+import { figureState } from "../../interventions.ts";
 import { Card, CardHeader, FOCUS_RING_INSET, cx } from "../ui";
 
 const POLL_MS = 60_000;
@@ -27,16 +27,23 @@ const OUTCOME_TONE: Record<string, string> = {
   pending: "text-muted-foreground",
 };
 
-function Figure({ label, view }: { label: string; view: InterventionsView | null }) {
+function Figure({ label, state }: { label: string; state: FigureState }) {
   const [open, setOpen] = useState(false);
-  if (!view) {
+  if (state.kind !== "view") {
     return (
       <div className="min-w-0 px-4 py-3">
         <div className="text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">{label}</div>
-        <p className="mt-1 text-caption text-faint-foreground">Loading…</p>
+        {state.kind === "failed" ? (
+          <p className="mt-1 break-words text-caption text-warning" role="status">
+            Could not read the interventions: {state.reason}
+          </p>
+        ) : (
+          <p className="mt-1 text-caption text-faint-foreground">Loading…</p>
+        )}
       </div>
     );
   }
+  const { view, stale } = state;
   return (
     <div className="min-w-0 px-4 py-3">
       <div className="text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">{label}</div>
@@ -50,6 +57,11 @@ function Figure({ label, view }: { label: string; view: InterventionsView | null
         <span className="tnum">{view.count}</span>
         {view.retries && <span className="tnum text-faint-foreground"> · {view.retries}</span>}
       </div>
+      {stale && (
+        <p className="mt-1 break-words text-caption text-warning" role="status">
+          The last read failed: {stale}
+        </p>
+      )}
       {view.rows.length > 0 && (
         <button
           type="button"
@@ -114,8 +126,8 @@ export function InterventionsCard() {
       <CardHeader icon={<Hand size={14} />} title="Human interventions" />
       <div className="grid grid-cols-1 sm:grid-cols-2">
         {WINDOWS.map((window) => {
-          const data = polls[window.id].data;
-          return <Figure key={window.id} label={window.label} view={data ? interventionsView(data) : null} />;
+          const poll = polls[window.id];
+          return <Figure key={window.id} label={window.label} state={figureState(poll.data, poll.error)} />;
         })}
       </div>
     </Card>

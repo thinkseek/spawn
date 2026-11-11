@@ -297,6 +297,17 @@
 #   that name or as CARGO_TARGET_DIR or the directory of SPAWN_BIN.
 # SPAWN_GATE_REUSE=0 turns it off: every regression is run.
 #
+# The regressions that passed (objective 056). A verdict names the
+# regressions this gate ran on the candidate whose run passed, checks
+# among them (`"passed":["003.sh","check-tests.sh",...]`, in the log's
+# order); those taken from the base are `reused`, as above, never both.
+# The task's own scenario is not in it: it is the verdict itself. A check
+# that failed once and passed again is in `passed` and in `flakes`. A
+# rejection names those printed before the run that decided it. With
+# these, a reader knows a validator that failed in an earlier gate
+# (`validator_defects`) passes again, here and now, on this candidate,
+# and can clear what it raised for it.
+#
 # A tree that is not Spawn names its owner-installed inputs (dependencies the
 # sandbox cannot download) in `<scenarios-dir>/bind`: absolute directories
 # under $HOME, bound read-only at the same path.
@@ -691,6 +702,7 @@ EOF
 
 metric=""
 flakes=""
+passed=""
 reused=""
 validator_defects=""
 quarantined=""
@@ -721,6 +733,9 @@ verdict() {
     # The checks that failed once and passed again on the candidate (a
     # flake, not a regression), in the log's order.
     [ -n "${flakes-}" ] && json="$json,\"flakes\":[$flakes]"
+    # The regressions run on the candidate that passed ("The regressions
+    # that passed"), in the log's order.
+    [ -n "${passed-}" ] && json="$json,\"passed\":[$passed]"
     # The regressions not run on the candidate: the base's result, reused
     # ("Results reused from the base"), in the scenario order.
     [ -n "${reused-}" ] && json="$json,\"reused\":[$reused]"
@@ -4314,6 +4329,11 @@ candidate_printed() {
     # A known failure that passes is known no longer.
     if [ -e "$1/first" ] && [ -n "$known_failure_file" ]; then
         rm -f -- "$known_failure_file" 2>/dev/null || :
+    fi
+    # A regression run here that passed: named in the verdict ("The
+    # regressions that passed"). The task's scenario is the verdict itself.
+    if [ ! -e "$1/task" ]; then
+        passed="${passed:+$passed,}\"$(json_string "$(basename "$printed_scenario")")\""
     fi
     run_stage "ok|$printed_name" "$printed_ms"
 }

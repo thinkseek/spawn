@@ -2027,7 +2027,21 @@ begin
         -- a halted one, unless its halt was this very move: `clear`); a
         -- record from before it did moved every mission on the source at
         -- that baseline.
-        update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at
+        -- The integrator's landing of an owner's request (it names the
+        -- `request`) is the owner changing the scenario set, as a resume is
+        -- (P28): the missions it moves take the scenarios as they are after
+        -- it, so the floor starts again (0, no names) and their next gate sets
+        -- it. The floor guards against a task's candidate deleting its judge:
+        -- an owner's retirement of scenarios is not one, and halted every
+        -- mission on the source at its next pass. A task judging does not
+        -- start on a main ahead of its controller (P22's controller_behind),
+        -- so the next gate counts the deployed scenarios. A move with no
+        -- request (`spawn mission moved`) keeps the floor.
+        update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at,
+                                    scenario_floor = case when p_record ? 'request' then 0
+                                                          else scenario_floor end,
+                                    scenario_names = case when p_record ? 'request' then null
+                                                          else scenario_names end
          where sources ->> 0 = p_record ->> 'source' and baseline = p_record ->> 'from'
            and (p_record -> 'missions' is null
                 or id in (select m::bigint
@@ -2045,7 +2059,8 @@ begin
         -- baseline yet (new, or resumed), not halted: they take the new main
         -- as their first baseline, so a gate of theirs that was judging
         -- against the old main when it landed does not leave them at it.
-        update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at
+        update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at,
+                                    scenario_floor = 0, scenario_names = null
          where sources ->> 0 = p_record ->> 'source' and baseline is null
            and jsonb_typeof(p_record -> 'without_baseline') = 'array'
            and id in (select m::bigint
@@ -2216,11 +2231,21 @@ begin
                                                then coalesce((p_record ->> 'escalate')::boolean, false)
                                           when v_verdict = 'stale' then gate_room_escalated
                                           else false end,
-               scenario_floor = greatest(scenario_floor, coalesce((p_record ->> 'scenarios')::integer, 0)),
+               -- The floor rises only from a gating on the mission's baseline
+               -- (P28, rev-e F1): one in flight across an owner's landing ends
+               -- on the old main (`stale`, or any verdict) with the old
+               -- controller's count, and must not raise the floor the landing
+               -- started again. A `stale` one on the baseline counts as before.
+               scenario_floor = case
+                   when baseline is null or baseline = p_record ->> 'base'
+                       then greatest(scenario_floor,
+                                     coalesce((p_record ->> 'scenarios')::integer, 0))
+                   else scenario_floor end,
                -- The names of the gating that set the floor: the latest at
                -- it (one at the floor with other names replaces them).
                scenario_names = case
-                   when p_record ? 'scenarios'
+                   when (baseline is null or baseline = p_record ->> 'base')
+                        and p_record ? 'scenarios'
                         and (p_record ->> 'scenarios')::integer >= scenario_floor
                         and (p_record ->> 'scenarios')::integer > 0
                        then case when jsonb_typeof(p_record -> 'scenario_names') = 'array'
@@ -4970,6 +4995,23 @@ language sql immutable parallel safe as $$
                then btrim(p_value #>> '{}')::bigint
            end $$;
 
+-- The control records by the ids the experience views look them up by,
+-- each lookup "the first or latest record of this task (mission) after a
+-- seq": spawn_task_spans' closing record (`record -> 'id'`), and
+-- spawn_experience_settings' and spawn_experience_assignments' (`id`, or a
+-- legacy row's `row -> 'id'`). Without them each lookup decoded the whole
+-- control stream, once per assignment: /api/interventions took 12 s and the
+-- scorecard's window 61 s on a copy of the live log of 2026-11-11 (2736
+-- control records), 0.5 s and 1.1 s with them.
+create index if not exists spawn_events_control_record_int_id
+    on spawn_events (spawn_experience_int(kind -> 'detail' -> 'record' -> 'id'), session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded';
+create index if not exists spawn_events_control_record_row_id
+    on spawn_events (spawn_experience_int(coalesce(kind -> 'detail' -> 'record' -> 'id',
+                                                   kind -> 'detail' -> 'record' -> 'row' -> 'id')),
+                     session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded';
+
 -- The control records, in stream order.
 create or replace view spawn_experience_records as
 select e.session_seq as seq,
@@ -5188,7 +5230,12 @@ from spawn_human_intents i;
 -- a mission accepted by review; `cancel_reassign`, a person's cancellation
 -- of an open task followed by the same work (the same objective, or without
 -- one the same brief) assigned again in the mission, at that assignment
--- (`task_id` the new task, `cancelled_task_id` the one cancelled).
+-- (`task_id` the new task, `cancelled_task_id` the one cancelled). The
+-- reassignment is read from the `task.assigned` records themselves, with
+-- spawn_experience_assignments' expressions: that view's window (`next_seq`)
+-- keeps a mission's predicate out of it, so a lateral over it folded every
+-- assignment of the log once per cancelled task (/api/interventions, 12 s
+-- on the live log of 2026-11-11, past its 10 s statement timeout).
 create or replace view spawn_interventions as
 select i.at_ms, 'command'::text as kind, null::bigint as mission_id,
        null::bigint as task_id, i.intent as command_id, null::bigint as cancelled_task_id
@@ -5209,12 +5256,19 @@ select n.assigned_at_ms, 'cancel_reassign', t.mission_id, n.task_id, null, t.tas
 from spawn_task_spans t
 join spawn_experience_records x on x.seq = t.closed_seq
 cross join lateral (
-    select a.assigned_at_ms, a.task_id
-      from spawn_experience_assignments a
-     where a.type = 'task.assigned' and a.seq > t.closed_seq and a.mission_id = t.mission_id
-       and case when t.objective is not null then a.objective = t.objective
-                else t.brief is not null and a.brief = t.brief end
-     order by a.seq
+    select r.at_ms as assigned_at_ms,
+           spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')) as task_id
+      from spawn_experience_records r
+     where r.type = 'task.assigned' and r.seq > t.closed_seq
+       and spawn_experience_int(coalesce(r.record -> 'mission_id', r.record -> 'row' -> 'mission_id'))
+           = t.mission_id
+       and spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')) is not null
+       and case when t.objective is not null
+                then spawn_experience_int(coalesce(r.record -> 'objective', r.record -> 'row' -> 'objective'))
+                     = t.objective
+                else t.brief is not null
+                     and coalesce(r.record ->> 'brief', r.record -> 'row' ->> 'brief') = t.brief end
+     order by r.seq
      limit 1
 ) n
 where t.outcome = 'cancelled'
