@@ -6,6 +6,7 @@
 
 import { readApi } from "./api";
 import { formatCost, formatDecimal, modelCostText } from "./scorecardFormat.ts";
+import { tokenReachOf } from "./tokenReach.ts";
 
 export { formatDecimal };
 
@@ -119,6 +120,12 @@ export interface Scorecard {
   /** The archive may still lack a model call made before `until_ms`: the
    * cost may still grow (web/src/settling.ts says it in words). */
   settling: boolean;
+  /** The archive's tokens begin after the window's start (`"window"`) or
+   * only after the previous window's (`"previous"`); null when they reach
+   * back past both (web/src/tokenReach.ts says it in words). */
+  tokens_short: "window" | "previous" | null;
+  /** The archive's oldest model call, when the tokens are short. */
+  tokens_from_ms: number | null;
   scopes: ScorecardScope[];
 }
 
@@ -266,6 +273,7 @@ export function normalizeScorecard(value: unknown): Scorecard {
     previous_since_ms: optionalNumber(raw.previous_since_ms),
     min_n: number(raw.min_n),
     settling: raw.settling === true,
+    ...tokenReachOf(raw),
     scopes: list(raw.scopes).map((entry) => {
       const scope = object(entry);
       return {
