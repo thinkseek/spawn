@@ -1398,7 +1398,17 @@ create table if not exists mission_missions (
     -- or of a task without one in it (design-halt-per-objective.md). A run
     -- of one objective's tasks yields that objective instead of halting the
     -- mission.
-    gate_rejection_objective integer
+    gate_rejection_objective integer,
+    -- The scenario file names (`*.sh`) the gate directory held at the
+    -- gating that set `scenario_floor` (the latest `task.gated` at the floor
+    -- since the last resume, its `scenario_names`), null without one.
+    scenario_names jsonb,
+    -- The halt the mission is in (null while it is not halted): its
+    -- `mission.halted` record's event id and time, and `gone`, the scenarios
+    -- a halt on the floor names (null for any other halt).
+    halt_event      bigint,
+    halt_at_ms      bigint,
+    halt_gone       jsonb
 );
 
 create table if not exists mission_residents (
@@ -1483,6 +1493,21 @@ alter table mission_missions add column if not exists gate_host_task bigint;
 alter table mission_missions add column if not exists gate_host_due_ms bigint;
 alter table mission_missions add column if not exists gate_base_disagrees integer not null default 0;
 alter table mission_missions add column if not exists gate_rejection_objective integer;
+alter table mission_missions add column if not exists scenario_names jsonb;
+alter table mission_missions add column if not exists halt_event bigint;
+alter table mission_missions add column if not exists halt_at_ms bigint;
+alter table mission_missions add column if not exists halt_gone jsonb;
+-- A mission halted before its halt was folded: its latest `mission.halted`.
+update mission_missions m
+   set halt_event = h.id, halt_at_ms = h.recorded_at_ms,
+       halt_gone = case when jsonb_typeof(h.r -> 'gone') = 'array' then h.r -> 'gone' end
+  from (select distinct on (e.kind -> 'detail' -> 'record' ->> 'id')
+               e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as r
+          from spawn_events e
+         where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and e.kind -> 'detail' -> 'record' ->> 'type' = 'mission.halted'
+         order by e.kind -> 'detail' -> 'record' ->> 'id', e.id desc) h
+ where m.halted is not null and m.halt_event is null and h.r ->> 'id' = m.id::text;
 alter table mission_tasks add column if not exists base text;
 alter table mission_tasks add column if not exists candidate text;
 alter table mission_tasks add column if not exists gate_log text;
@@ -1967,14 +1992,24 @@ begin
                                     objectives = p_record -> 'objectives', updated_at_ms = p_at
          where id = v_id;
     when 'mission.halted' then
-        update mission_missions set halted = p_record ->> 'reason', updated_at_ms = p_at
+        -- The halt the mission is in: this record, and the scenarios it
+        -- names gone (a halt on the scenario floor).
+        update mission_missions set halted = p_record ->> 'reason', halt_event = p_event,
+                                    halt_at_ms = p_at,
+                                    halt_gone = case when jsonb_typeof(p_record -> 'gone') = 'array'
+                                                     then p_record -> 'gone' end,
+                                    updated_at_ms = p_at
          where id = v_id;
     when 'mission.resumed' then
         -- The next gate records the source's main as the new baseline, and
         -- the scenario count as the new floor: a human who resumes has seen
         -- the scenarios as they are (only the owner changes them).
+        -- The owner's resume and a person's from the page
+        -- (`spawn_human_resume`, `by` human, naming its `halt`) fold alike.
         update mission_missions set halted = null, baseline = null, gate_rejections = 0,
-                                    gate_aborts = 0, scenario_floor = 0, gate_room_task = null,
+                                    gate_aborts = 0, scenario_floor = 0, scenario_names = null,
+                                    halt_event = null, halt_at_ms = null, halt_gone = null,
+                                    gate_room_task = null,
                                     gate_room_since_ms = null,
                                     gate_room_last_ms = null, gate_room_waits = 0,
                                     gate_room_escalated = false, gate_host_faults = 0,
@@ -2001,7 +2036,8 @@ begin
         -- reading of this very move (main away from their baseline with no
         -- record). The owner's record is that explanation, so they are not
         -- halted any more and are judged again at the next pass.
-        update mission_missions set halted = null, updated_at_ms = p_at
+        update mission_missions set halted = null, halt_event = null, halt_at_ms = null,
+                                    halt_gone = null, updated_at_ms = p_at
          where jsonb_typeof(p_record -> 'clear') = 'array'
            and id in (select m::bigint
                         from jsonb_array_elements_text(p_record -> 'clear') m);
@@ -2181,6 +2217,15 @@ begin
                                           when v_verdict = 'stale' then gate_room_escalated
                                           else false end,
                scenario_floor = greatest(scenario_floor, coalesce((p_record ->> 'scenarios')::integer, 0)),
+               -- The names of the gating that set the floor: the latest at
+               -- it (one at the floor with other names replaces them).
+               scenario_names = case
+                   when p_record ? 'scenarios'
+                        and (p_record ->> 'scenarios')::integer >= scenario_floor
+                        and (p_record ->> 'scenarios')::integer > 0
+                       then case when jsonb_typeof(p_record -> 'scenario_names') = 'array'
+                                 then p_record -> 'scenario_names' end
+                   else scenario_names end,
                updated_at_ms = p_at
          where id = v_mission;
     when 'task.landed' then
