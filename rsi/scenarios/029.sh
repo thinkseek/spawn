@@ -88,8 +88,8 @@
 # that exits 2 on the base aborts every gate. An objective-29 task is then
 # never rejected or aborted for this: the gate states the fact, and the
 # integrator records a host fault with the evidence `cannot_judge`. The units
-# it makes (the slice, the scopes in it, set-property drop-ins under
-# $XDG_RUNTIME_DIR) are named after its run and removed at its end; it never
+# it makes (the slice, the scopes in it, set-property drop-ins under the
+# manager's runtime directory, the real one) are named after its run and removed at its end; it never
 # touches another unit.
 #
 # rsi: task-only
@@ -190,6 +190,17 @@ TMUX_TMPDIR=$WORK/tmux-sock
 mkdir -p "$HOME" "$TMUX_TMPDIR"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
 export HOME TMUX_TMPDIR
+# The runtime directory too (backlog S20): what Spawn keeps there (a
+# launch's environment file, its terminals' leaders) stays in WORK, never
+# in the real one. systemd's user manager stays reachable by its bus.
+real_runtime=${XDG_RUNTIME_DIR-}
+if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
+    DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
+    export DBUS_SESSION_BUS_ADDRESS
+fi
+XDG_RUNTIME_DIR=$WORK/runtime
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 # Digits and `_` only: a `-` in a slice's name nests it in another slice.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
@@ -219,8 +230,9 @@ cleanup() {
     # scopes of its stem, and the slice's runtime drop-ins.
     systemctl --user stop "$slice" >/dev/null 2>&1 || true
     systemctl --user reset-failed "$stem-*" >/dev/null 2>&1 || true
-    if [ -n "${XDG_RUNTIME_DIR-}" ] && [ -d "$XDG_RUNTIME_DIR/systemd/user.control/$slice.d" ]; then
-        rm -rf "$XDG_RUNTIME_DIR/systemd/user.control/$slice.d"
+    # The manager's own runtime directory (the real one), not the run's.
+    if [ -n "${real_runtime-}" ] && [ -d "$real_runtime/systemd/user.control/$slice.d" ]; then
+        rm -rf "$real_runtime/systemd/user.control/$slice.d"
     fi
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.

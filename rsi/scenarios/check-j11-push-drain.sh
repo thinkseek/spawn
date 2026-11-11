@@ -80,6 +80,17 @@ TMUX_TMPDIR=$ROOT/tmux-sock
 mkdir -p "$HOME" "$TMUX_TMPDIR"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
 export HOME TMUX_TMPDIR
+# The runtime directory too (backlog S20): what Spawn keeps there (a
+# launch's environment file, its terminals' leaders) stays in ROOT, never
+# in the real one. systemd's user manager stays reachable by its bus.
+real_runtime=${XDG_RUNTIME_DIR-}
+if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
+    DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
+    export DBUS_SESSION_BUS_ADDRESS
+fi
+XDG_RUNTIME_DIR=$ROOT/runtime
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export XDG_RUNTIME_DIR
 W021=$ROOT/s021
 mkdir -p "$W021"
 # Not $$ alone: the gate's PID namespace makes it the same small number.

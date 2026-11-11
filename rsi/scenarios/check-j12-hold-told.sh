@@ -94,6 +94,17 @@ TMUX_TMPDIR=$WORK/tmux-sock
 mkdir -p "$HOME" "$TMUX_TMPDIR"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
 export HOME TMUX_TMPDIR
+# The runtime directory too (backlog S20): what Spawn keeps there (a
+# launch's environment file, its terminals' leaders) stays in WORK, never
+# in the real one. systemd's user manager stays reachable by its bus.
+real_runtime=${XDG_RUNTIME_DIR-}
+if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
+    DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
+    export DBUS_SESSION_BUS_ADDRESS
+fi
+XDG_RUNTIME_DIR=$WORK/runtime
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_j12_030_alerts_$run"
@@ -1052,6 +1063,17 @@ TMUX_TMPDIR=$WORK/tmux-sock
 mkdir -p "$HOME" "$TMUX_TMPDIR"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
 export HOME TMUX_TMPDIR
+# The runtime directory too (backlog S20): what Spawn keeps there (a
+# launch's environment file, its terminals' leaders) stays in WORK, never
+# in the real one. systemd's user manager stays reachable by its bus.
+real_runtime=${XDG_RUNTIME_DIR-}
+if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
+    DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
+    export DBUS_SESSION_BUS_ADDRESS
+fi
+XDG_RUNTIME_DIR=$WORK/runtime
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_j12_031_backup_$run"
@@ -1077,6 +1099,9 @@ cleanup() {
     fi
     if command -v gpgconf >/dev/null 2>&1 && [ -d "$GNUPGHOME" ]; then
         gpgconf --homedir "$GNUPGHOME" --kill gpg-agent >/dev/null 2>&1 || true
+        # gpg puts a scratch home's agent sockets in /run/user/<uid>/gnupg/d.*
+        # whatever XDG_RUNTIME_DIR says (S20): that directory goes too.
+        gpgconf --homedir "$GNUPGHOME" --remove-socketdir >/dev/null 2>&1 || true
     fi
     if [ -n "$database_made" ]; then
         # A scratch database a drill named and left behind goes too, but only
