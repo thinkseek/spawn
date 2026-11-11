@@ -46,9 +46,18 @@ function Rows({ title, rows }: { title: string; rows: Row[] }) {
                 {row.key}
               </span>
               <UnpricedMark on={row.unpriced} />
+              {row.per_landing !== undefined && (
+                <span
+                  title="This mission's priced dollars over its tasks that landed or were accepted in the window"
+                  className="tnum ml-auto shrink-0 text-micro text-faint-foreground"
+                >
+                  {row.per_landing}
+                </span>
+              )}
               <span
                 className={cx(
-                  "tnum ml-auto shrink-0",
+                  "tnum shrink-0",
+                  row.per_landing === undefined ? "ml-auto" : "ml-2",
                   row.usd === "unpriced" ? "text-warning" : "text-foreground",
                 )}
               >
@@ -73,6 +82,12 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
             <span className="flex items-center">
               <span className="tnum text-body font-semibold text-foreground">{figures.total}</span>
               <UnpricedMark on={figures.unpriced} />
+              <span
+                title="The window's priced dollars over the tasks that landed or were accepted in it, counted as the scorecard counts landings"
+                className="tnum ml-2 text-caption text-muted-foreground"
+              >
+                {figures.per_landing}
+              </span>
             </span>
           )
         }
@@ -100,7 +115,8 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
 
 /**
  * What the fleet's model calls cost over the last 24 hours and 7 days, in
- * US dollars: the total, each mission, task and agent, most costly first
+ * US dollars: the total and what a landing cost, each mission (with its
+ * own dollars per landing), task and agent, most costly first
  * (crates/spawn-cli/src/cost.rs prices each call when it is recorded).
  * Use on a model with no price is marked, and a figure of only such use
  * reads "unpriced", never $0.00. A window that starts before the earliest
