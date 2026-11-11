@@ -97,6 +97,11 @@ WORK=$(mktemp -d) || harness "mktemp failed"
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_065_runs_$run"
 SPAWN_TMUX_SOCKET="bb-065-$run"
+# The tmux server's socket lives in WORK, so the cleanup removes nothing
+# outside it (cc-rules (a), 2026-11-12).
+TMUX_TMPDIR=$WORK/tmux-sock
+mkdir -p "$TMUX_TMPDIR"
+export TMUX_TMPDIR
 SPAWN_PSQL=psql
 export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
 
@@ -116,7 +121,6 @@ cleanup() {
         wait "$pid" 2>/dev/null || true
     done
     tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-    rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SPAWN_TMUX_SOCKET"
     if [ -n "$database_made" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
@@ -286,9 +290,11 @@ near() { # <got> <want> <slack>: |got - want| <= slack
 # --- the disk: archive, Claude Code's projects, workspaces ------------------------------
 
 # A scratch HOME: nothing here reads or writes the real one.
+real_home=$HOME
 HOME=$WORK/home
 export HOME
 mkdir -p "$HOME"
+[ "$HOME" != "$real_home" ] && [ "${HOME#"$WORK"/}" != "$HOME" ] || harness "HOME is not a scratch directory under WORK: $HOME"
 MIB=1048576
 root=$SPAWN_WORKSPACE_ROOT
 projects=$SPAWN_CLAUDE_PROJECTS
