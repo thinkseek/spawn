@@ -21,10 +21,11 @@
 //!   live one is longer and its first bytes are the restored file (it grew
 //!   since the bundle: expected). A live file the backup lacks was made
 //!   after the bundle (expected), or was last written before the bundle's
-//!   window (`SPAWN_BACKUP_TRANSCRIPT_DAYS`): in no bundle, said apart and
-//!   counted, not a failure. Anything else is a mismatch: a live file
-//!   shorter than its restored copy, with other bytes, gone, or written
-//!   within the window and not in the backup;
+//!   window (`SPAWN_BACKUP_TRANSCRIPT_DAYS`): in no bundle, so with no
+//!   off-host copy once the bundles that held it expire, said apart and
+//!   counted, not a failure (the window is the owner's question). Anything
+//!   else is a mismatch: a live file shorter than its restored copy, with
+//!   other bytes, gone, or written within the window and not in the backup;
 //! - a ref is at the same commit as live, or live moved it to a descendant
 //!   (newer: expected); a live ref the backup lacks was made since, and a
 //!   restored ref live no longer has was removed since (both said, both
@@ -638,7 +639,8 @@ impl Transcripts {
         format!(
             "restore-drill: transcripts: {} files ({} bytes) restored; against {}: {} the same, \
              {} grown since (their start the same), {} new since the bundle, {} in no bundle \
-             (last written before its window, {} bytes), {} mismatch(es)",
+             (last written before its window, {} bytes: no off-host copy once older bundles \
+             expire), {} mismatch(es)",
             self.restored,
             self.restored_bytes,
             live.display(),
@@ -963,14 +965,22 @@ mod tests {
     struct Own(PathBuf);
 
     impl Own {
+        /// A directory made fresh here (a random name, `create_dir`, never
+        /// one that was there): its Drop removes only what this made.
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "spawn-restore-drill-test-{name}-{}",
-                std::process::id()
-            ));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).expect("a directory of its own");
-            Self(path.canonicalize().expect("resolved"))
+            for _ in 0..10 {
+                let path = std::env::temp_dir().join(format!(
+                    "spawn-restore-drill-test-{name}-{}-{}",
+                    std::process::id(),
+                    crate::backup::random_hex(6).expect("random")
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path.canonicalize().expect("resolved")),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => panic!("{}: {error}", path.display()),
+                }
+            }
+            panic!("no fresh directory for {name}");
         }
     }
 
