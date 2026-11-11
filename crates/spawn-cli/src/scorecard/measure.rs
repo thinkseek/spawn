@@ -399,7 +399,8 @@ fn marks_per_landing(
 /// Autonomy: the interventions per landing, and `retries`, a person's
 /// commands sent again after a refusal (each intent counts once).
 fn autonomy(counts: &Counts, enough: bool) -> Dimension {
-    let mut dimension = marks_per_landing(counts, enough, &INTERVENTIONS, "interventions", "by_kind");
+    let mut dimension =
+        marks_per_landing(counts, enough, &INTERVENTIONS, "interventions", "by_kind");
     dimension
         .parts
         .insert("retries".into(), usize_json(counts.count(Kind::Retry)));

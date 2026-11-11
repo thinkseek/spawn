@@ -20,8 +20,8 @@
 //! window, [`transcripts`] reads the archive's tokens and [`time`] the times.
 
 pub(crate) mod fleet;
-pub(crate) mod interventions;
 mod history;
+pub(crate) mod interventions;
 mod measure;
 pub(crate) mod time;
 mod transcripts;

@@ -514,16 +514,27 @@ fn the_interventions_window_lists_each_kind_with_its_line() {
         .into_iter()
         .flatten()
         .filter(|item| item["kind"] != "command")
-        .map(|item| format!("{} {}", item["kind"].as_str().unwrap_or_default(), item["line"].as_str().unwrap_or_default()))
+        .map(|item| {
+            format!(
+                "{} {}",
+                item["kind"].as_str().unwrap_or_default(),
+                item["line"].as_str().unwrap_or_default()
+            )
+        })
         .collect();
     assert_eq!(lines.len(), 3, "{read}");
-    assert!(lines.contains(&"owner_task assigned task #1".to_string()), "{lines:?}");
+    assert!(
+        lines.contains(&"owner_task assigned task #1".to_string()),
+        "{lines:?}"
+    );
     assert!(
         lines.contains(&"cancel_reassign cancelled task #2, assigned task #3".to_string()),
         "{lines:?}"
     );
     assert!(
-        lines.iter().any(|line| line.starts_with("resume resumed mission #")),
+        lines
+            .iter()
+            .any(|line| line.starts_with("resume resumed mission #")),
         "{lines:?}"
     );
     let times: Vec<i64> = read["items"]
@@ -532,10 +543,16 @@ fn the_interventions_window_lists_each_kind_with_its_line() {
         .flatten()
         .map(|item| item["at_ms"].as_i64().unwrap_or_default())
         .collect();
-    assert!(times.windows(2).all(|pair| pair[0] >= pair[1]), "newest first: {times:?}");
+    assert!(
+        times.windows(2).all(|pair| pair[0] >= pair[1]),
+        "newest first: {times:?}"
+    );
     for item in read["items"].as_array().into_iter().flatten() {
         if item["kind"] == "command" {
-            assert!(item["outcome"].is_string() && item["attempts"].is_i64(), "{item}");
+            assert!(
+                item["outcome"].is_string() && item["attempts"].is_i64(),
+                "{item}"
+            );
         } else {
             assert_eq!(item["commands"], json!([]), "{item}");
             assert_eq!(item["outcome"], Value::Null, "{item}");
