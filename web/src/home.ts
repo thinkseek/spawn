@@ -260,7 +260,8 @@ export function needsYou(input: NeedsInput): NeedItem[] {
     const score = evidence?.stuck;
     // The one command that acts on it, when the alert step named one (a
     // stuck worker's `spawn task restart --id <task>`).
-    const command = typeof evidence?.command === "string" ? evidence.command : null;
+    const named_command = evidence?.command;
+    const command = typeof named_command === "string" ? named_command : null;
     items.push({
       key: `alert:${alert.key}`,
       tone: stale ? "know" : "act",
