@@ -567,3 +567,47 @@ fn a_cancellation_names_who_cancelled() {
         .get(0);
     assert_eq!(before, after);
 }
+
+/// Objective 061: the facts keep each owner judging (`source.moved`,
+/// `source.push_refused`) with its gate's wall clock (`gate_ms`) and the
+/// mission whose gate judged it (`mission`); one recorded before them names
+/// neither, and the missions a landing moved are not its `mission`.
+#[test]
+fn the_facts_keep_the_owners_judgings_with_their_gate_time_and_mission() {
+    let (store, schema) = store("scorecard_owner_judgings");
+    let mut client = admin(&schema);
+    for (at, value) in [
+        (
+            1000,
+            json!({"type": "source.moved", "source": "/s", "from": "a", "to": "b", "request": 7,
+                   "verdict": "accepted", "missions": [1, 2], "mission": 1, "gate_ms": 300_000}),
+        ),
+        (
+            2000,
+            json!({"type": "source.push_refused", "request": 8, "verdict": "rejected",
+                   "reason": "r", "mission": 2, "gate_ms": 450_000}),
+        ),
+        (
+            3000,
+            json!({"type": "source.moved", "source": "/s", "from": "b", "to": "c", "request": 9,
+                   "verdict": "accepted", "missions": [1, 2]}),
+        ),
+    ] {
+        record(&mut client, at, &value);
+    }
+    let facts = store.scorecard_facts(4000).expect("the facts");
+    let moved = by_type(&facts, "source.moved");
+    assert_eq!(moved.len(), 2, "{facts}");
+    assert_eq!(moved[0]["gate_ms"], 300_000);
+    assert_eq!(moved[0]["mission"], 1);
+    assert_eq!(
+        moved[1].get("gate_ms"),
+        None,
+        "a landing from before names no gate time"
+    );
+    assert_eq!(moved[1].get("mission"), None);
+    let refused = by_type(&facts, "source.push_refused");
+    assert_eq!(refused[0]["gate_ms"], 450_000);
+    assert_eq!(refused[0]["mission"], 2);
+    assert_eq!(refused[0]["at"], 2000);
+}

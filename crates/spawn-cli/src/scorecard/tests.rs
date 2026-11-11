@@ -1459,3 +1459,145 @@ fn a_window_before_the_archive_says_so_in_its_json_and_on_its_header_line() {
         assert_eq!(figures, whole);
     }
 }
+
+/// Two gate-accepting missions on `source`, and a task's gating on each:
+/// 10 min on mission 1, 6.7 min on mission 2.
+fn record_two_missions_with_a_task_gating(
+    record: &mut dyn FnMut(&str, Value) -> i64,
+    source: &str,
+) {
+    for mission in [1, 2] {
+        record(
+            "spawn_control_record",
+            json!({"type": "mission.added", "id": mission, "text": "m", "origin": "human",
+                   "sources": [source]}),
+        );
+        record(
+            "spawn_control_record",
+            json!({"type": "mission.configured", "id": mission, "accept": "gate", "gate": "/g"}),
+        );
+    }
+    for (task, mission, ms) in [(1, 1, 600_000), (2, 2, 400_000)] {
+        record(
+            "spawn_control_record",
+            json!({"type": "task.assigned", "id": task, "mission_id": mission, "objective": task,
+                   "kind": "ephemeral", "created_by": "spawn-integrate",
+                   "agent_id": format!("agent_w_{task}"), "session_id": format!("session_w_{task}"),
+                   "brief": "b"}),
+        );
+        record(
+            "spawn_control_record",
+            json!({"type": "task.reported", "id": task, "commit": "c"}),
+        );
+        record(
+            "spawn_control_record",
+            json!({"type": "task.gated", "id": task, "verdict": "rejected", "revision": 0,
+                   "base": "b", "gate_ms": ms}),
+        );
+    }
+}
+
+/// Objective 061, through the real store: the owner's judgings that name
+/// their gate's wall clock (`gate_ms`) count in gate time beside the tasks'
+/// gatings, for the fleet and for the mission whose gate judged them
+/// (`mission`), never for the missions the landing moved; one from before
+/// (no `gate_ms`) counts nothing.
+#[test]
+fn gate_time_counts_the_owners_judgings_for_the_fleet_and_their_mission() {
+    let url = std::env::var("SPAWN_TEST_DATABASE_URL")
+        .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    let schema = format!("spawn_test_{}_{nanos:x}_gate_owner", std::process::id());
+    let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
+        .expect("connect and migrate");
+    let root =
+        std::env::temp_dir().join(format!("spawn-gate-owner-{}-{nanos:x}", std::process::id()));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        let owner = format!("{url}{separator}options=-csearch_path%3D{schema}");
+        let mut client =
+            postgres::Client::connect(&owner, postgres::NoTls).expect("the owner connects");
+        let mut record = |function: &str, value: Value| -> i64 {
+            client
+                .query_one(&format!("select {function}($1)"), &[&value])
+                .expect("a record")
+                .get(0)
+        };
+        let source = "/srv/source.git";
+        record_two_missions_with_a_task_gating(&mut record, source);
+        let base = "a".repeat(40);
+        let candidate = "b".repeat(40);
+        let mut request = |commit: &str| {
+            record(
+                "spawn_control_record",
+                json!({"type": "source.push_requested", "source": source, "commit": commit,
+                       "ref": format!("refs/spawn-owner/{commit}"), "by": "human", "gated": true}),
+            )
+        };
+        let accepted = request(&candidate);
+        let refused = request(&base);
+        let before = request(&candidate);
+        // Judged by mission 1's gate: accepted (5 min), refused (8.3 min);
+        // and one recorded before the gate's wall clock was (no `gate_ms`).
+        record(
+            "spawn_integrator_record",
+            json!({"type": "source.moved", "source": source, "from": base, "to": candidate,
+                   "request": accepted, "by": "human", "verdict": "accepted", "mission": 1,
+                   "gate_ms": 300_000}),
+        );
+        record(
+            "spawn_integrator_record",
+            json!({"type": "source.push_refused", "request": refused, "reason": "rejected",
+                   "verdict": "rejected", "mission": 1, "gate_ms": 500_000}),
+        );
+        record(
+            "spawn_integrator_record",
+            json!({"type": "source.moved", "source": source, "from": candidate, "to": base,
+                   "request": before, "by": "human", "verdict": "accepted"}),
+        );
+        let now = store.database_now_ms().expect("now");
+        let card = super::measure(
+            &store,
+            Some(&root),
+            &super::Query {
+                mission: None,
+                since: Some(format_rfc3339(now - HOUR_MS)),
+                until: Some(format_rfc3339(now + 60_000)),
+            },
+        )
+        .expect("the scorecard");
+        let gate = |scope: &str, mission: Value| {
+            let found = card["scopes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|entry| entry["scope"] == scope && entry["mission"] == mission)
+                .unwrap_or_else(|| panic!("no {scope} {mission} scope: {card}"));
+            let d = &found["dimensions"]["gate_time"];
+            json!({"value": d["value"], "n": d["n"], "runs": d["runs"],
+                   "task_runs": d["task_runs"], "owner_runs": d["owner_runs"]})
+        };
+        assert_eq!(
+            gate("fleet", Value::Null),
+            json!({"value": 400_000, "n": 4, "runs": 4, "task_runs": 2, "owner_runs": 2}),
+            "the median of 5, 6.7, 8.3 and 10 min: nearest rank"
+        );
+        assert_eq!(
+            gate("mission", json!(1)),
+            json!({"value": 500_000, "n": 3, "runs": 3, "task_runs": 1, "owner_runs": 2})
+        );
+        assert_eq!(
+            gate("mission", json!(2)),
+            json!({"value": null, "n": 1, "runs": 1, "task_runs": 1, "owner_runs": 0}),
+            "the landings moved mission 2 too; its gate judged none of them"
+        );
+    }));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = postgres::Client::connect(&url, postgres::NoTls)
+        .and_then(|mut client| client.batch_execute(&format!("drop schema {schema} cascade")));
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
