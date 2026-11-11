@@ -36,7 +36,7 @@ fn command(client: &mut Client, principal: &str, key: &str, session: &str, actio
         .execute(
             "insert into spawn_commands (principal, idempotency_key, agent_id, session_id, action,
                                          state, succeeded, created_at_ms, finished_at_ms)
-             values ($1, $2, 'agent_x', $3, $4, 'finished', true, $5, $5 + 1000)",
+             values ($1, $2, 'agent_x', $3, $4, 'finished', true, $5::bigint, $5::bigint + 1000)",
             &[&principal, &key, &session, action, &(hours * H)],
         )
         .expect("write a command");
