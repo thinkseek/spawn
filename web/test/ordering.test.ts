@@ -18,6 +18,7 @@ import {
   orderMissions,
   orderScopes,
   splitId,
+  stateWords,
   taskSection,
   taskStateLabel,
   taskTitle,
@@ -114,6 +115,66 @@ test("a task's section follows its state; accepted waits for the gate only in a 
   assert.equal(taskSection(state("revise"), gated), "sent_back");
   assert.equal(taskSection(state("cancelled"), gated), "cancelled");
   assert.equal(taskSection(state("unknown"), gated), "in_flight");
+});
+
+test("a task state in the owner's words: handed to its worker is in work, not delivered", () => {
+  assert.equal(stateWords("assigned"), "waiting for its worker");
+  assert.equal(stateWords("delivered"), "in work");
+  assert.equal(stateWords("revise"), "sent back");
+  for (const state of ["reported", "accepted", "landing", "landed", "cancelled", "unknown", "halted", "idle"]) {
+    assert.equal(stateWords(state), state, `${state} reads as it is`);
+  }
+  // Not an own word: a name an object inherits is a state as it is.
+  assert.equal(stateWords("constructor"), "constructor");
+  assert.equal(stateWords("toString"), "toString");
+});
+
+test("the Missions card's label: an assigned task waits for its worker, a delivered one is in work", () => {
+  const gate = { gate: "/g", accept: "gate" };
+  const review = { gate: "/g", accept: "review" };
+  const plain = { gate: null, accept: "review" };
+  const assigned = task(1, "assigned", [["assigned", 0]]);
+  const delivered = task(2, "delivered", [["assigned", 0], ["delivered", 1]]);
+  for (const mission of [gate, review, plain]) {
+    assert.equal(taskStateLabel(assigned, mission), "waiting for its worker");
+    assert.equal(taskStateLabel(delivered, mission), "in work");
+    // An earlier attempt left in work reads the same in its nested row.
+    assert.equal(attemptOutcome(delivered, mission), "in work");
+  }
+  const reported = task(3, "reported", [["assigned", 0], ["delivered", 1], ["reported", 2]]);
+  assert.equal(taskStateLabel(reported, gate), "gating");
+  assert.equal(taskStateLabel(reported, review), "in review");
+  const back = task(4, "revise", [["assigned", 0], ["delivered", 1], ["reported", 2], ["gated", 3, "rejected"]]);
+  assert.equal(taskStateLabel(back, gate), "sent back");
+  const budget = task(5, "cancelled", [["assigned", 0], ["delivered", 1], ["aborted", 2]]);
+  assert.equal(taskStateLabel(budget, gate), "aborted at budget");
+  assert.equal(taskStateLabel(task(6, "landing", [["assigned", 0]]), gate), "landing");
+  assert.equal(taskStateLabel(task(7, "landed", [["assigned", 0]]), gate), "landed");
+});
+
+test("the fleet keeps a held task's store state beside its words", () => {
+  const context = fleetContext({
+    missions: [mission(1, [task(1, "assigned", [["assigned", 0]]), task(2, "delivered", [["assigned", 0], ["delivered", 1]])])],
+    residents: [],
+    holds: [],
+  } as Missions);
+  const one = heldTask({ session_id: "session_worker_objective_1", agent_id: "agent_worker_objective_1" }, context);
+  const two = heldTask({ session_id: "session_worker_objective_2", agent_id: "agent_worker_objective_2" }, context);
+  assert.deepEqual([one?.state, one?.label], ["assigned", "waiting for its worker"]);
+  assert.deepEqual([two?.state, two?.label], ["delivered", "in work"]);
+});
+
+test("the sidebar badge, the RSI page's pill and steps, and the Missions page's steps read the owner's words", () => {
+  // What the sidebar's RSI badge prints for each `rsiPhase`.
+  assert.deepEqual(
+    ["halted", "idle", "assigned", "delivered", "reported", "accepted", "landing"].map(stateWords),
+    ["halted", "idle", "waiting for its worker", "in work", "reported", "accepted", "landing"],
+  );
+  // The RSI page's steps of a gated task, and the Missions page's pipeline.
+  assert.deepEqual(
+    ["assigned", "delivered", "reported", "landing", "landed"].map(stateWords),
+    ["waiting for its worker", "in work", "reported", "landing", "landed"],
+  );
 });
 
 test("state labels and attempt outcomes speak an observer's words", () => {

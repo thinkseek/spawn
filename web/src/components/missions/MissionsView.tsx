@@ -37,6 +37,7 @@ import {
   missionClass,
   missionName,
   orderMissions,
+  stateWords,
   taskTitle,
 } from "../../ordering";
 import { Fact, SectionLabel } from "../fleet/bits";
@@ -850,7 +851,7 @@ function Pipeline({
   const at = reached(task.state, steps);
   return (
     <ol
-      aria-label={`Task state: ${task.raw_state ?? "unknown"}`}
+      aria-label={`Task state: ${stateWords(task.raw_state ?? "unknown")}`}
       className="flex flex-wrap items-center gap-1"
     >
       {steps.map((step, index) => {
@@ -879,7 +880,7 @@ function Pipeline({
               )}
             >
               {done && !current && <Check size={11} />}
-              {step}
+              {stateWords(step)}
             </span>
           </li>
         );
@@ -888,7 +889,7 @@ function Pipeline({
         <li className="flex items-center gap-1">
           <RotateCcw size={12} className="text-warning" />
           <span className="inline-flex h-6 items-center gap-1 rounded-md bg-wait-tint px-2 text-micro font-medium text-warning ring-1 ring-warning/30 ring-inset">
-            revise
+            {stateWords("revise")}
             <span className="tnum">×{task.revisions}</span>
           </span>
         </li>
@@ -948,7 +949,7 @@ function StageSteps({
   const settled = endedWell(task.state);
   return (
     <ol
-      aria-label={`Task stages, state ${task.raw_state ?? "unknown"}`}
+      aria-label={`Task stages, state ${stateWords(task.raw_state ?? "unknown")}`}
       className="flex flex-wrap items-start gap-x-1 gap-y-2"
     >
       {stages.map((stage, index) => {
@@ -994,7 +995,7 @@ function StageSteps({
               : undefined
           }
           chip="text-faint-foreground ring-surface-border"
-          label={step}
+          label={stateWords(step)}
           took={index === 0 ? waiting : null}
           slow={index === 0 && waiting !== null && slow[slow.length - 1]}
         />

@@ -5,6 +5,7 @@ import type { ReactNode } from "react";
 import { usePoll } from "../../api";
 import { clockTime, formatDuration, relativeTime } from "../../format";
 import { freshAt } from "../../validated";
+import { stateWords } from "../../ordering";
 import type { RsiDashboard, RsiMission, RsiObjective, RsiTask } from "../../rsi";
 import {
   chartObjective,
@@ -314,7 +315,8 @@ function Figure({
   );
 }
 
-/** The steps of a task the gate alone accepts. */
+/** The steps of a task the gate alone accepts (store states; shown in the
+ * owner's words by `stateWords`). */
 const STEPS = ["assigned", "delivered", "reported", "landing", "landed"] as const;
 
 function stepIndex(state: string): number {
@@ -401,7 +403,7 @@ function TaskCard({
               {STEPS.map((step, index) => (
                 <div
                   key={step}
-                  title={step}
+                  title={stateWords(step)}
                   className={cx(
                     "h-1 rounded-full",
                     index < current
