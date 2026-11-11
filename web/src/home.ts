@@ -256,7 +256,11 @@ export function needsYou(input: NeedsInput): NeedItem[] {
     if (alert.kind === "mission_halted" && [...halted].some((id) => alert.subject === `mission #${id}`)) continue;
     const named = input.nameOf?.(alert.subject) ?? null;
     const stale = alertStale(alert, input.agents);
-    const score = (alert.evidence as { stuck?: unknown } | null)?.stuck;
+    const evidence = alert.evidence as { stuck?: unknown; command?: unknown } | null;
+    const score = evidence?.stuck;
+    // The one command that acts on it, when the alert step named one (a
+    // stuck worker's `spawn task restart --id <task>`).
+    const command = typeof evidence?.command === "string" ? evidence.command : null;
     items.push({
       key: `alert:${alert.key}`,
       tone: stale ? "know" : "act",
@@ -265,7 +269,7 @@ export function needsYou(input: NeedsInput): NeedItem[] {
         ? `scored stuck${typeof score === "number" ? ` ${score.toFixed(2)}` : ""} ${ageText(input.now - alert.fired_at_ms)} ago; not scored since (its latest judgement, ${ageText(input.now - (stale.judged_at_ms ?? input.now))} ago, has no score${stale.judgement?.reason ? `: ${stale.judgement.reason}` : ""})`
         : alert.text,
       since_ms: alert.fired_at_ms,
-      command: null,
+      command,
       // A session's alert opens that agent's page.
       session: named !== null ? alert.subject : null,
     });
