@@ -1396,6 +1396,19 @@ select e.kind -> 'detail' -> 'record' || jsonb_build_object('event_id', e.id,
  order by e.session_seq
  limit 1";
 
+/// Why the last owner judging of the request `$1` (its event id) that
+/// recorded a `source.push_no_verdict` found no verdict: that record's
+/// `reason`; no row when none did. A rare read (once per owner judging that
+/// ends with no verdict), through the control session's events.
+pub(crate) const SOURCE_PUSH_LAST_NO_VERDICT: &str = r"
+select e.kind -> 'detail' -> 'record' ->> 'reason'
+  from spawn_events e
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' = 'source.push_no_verdict'
+   and e.kind -> 'detail' -> 'record' ->> 'request' = ($1::bigint)::text
+ order by e.session_seq desc
+ limit 1";
+
 /// How the integrator applies an owner's landing request
 /// ([`PostgresStore::source_push_request`]; design-owner-push-between-gates.md).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1680,6 +1693,15 @@ impl PostgresStore {
         Ok(self
             .query_opt(SOURCE_PUSH_OUTCOME, &[&request])?
             .map(|row| row.get(0)))
+    }
+
+    /// The reason of the last `source.push_no_verdict` recorded for the
+    /// owner's landing request `request`, `None` when it has none
+    /// ([`SOURCE_PUSH_LAST_NO_VERDICT`]).
+    pub fn source_push_last_no_verdict(&self, request: i64) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .query_opt(SOURCE_PUSH_LAST_NO_VERDICT, &[&request])?
+            .and_then(|row| row.get(0)))
     }
 
     /// Hold an owner's landing (owner only): the lock of

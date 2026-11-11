@@ -52,6 +52,19 @@
 //! integrator, which stops that judging (`Integrator::stop_for`); the
 //! judging records itself discarded by the request, and the request is
 //! applied or judged at the pass that reaps it.
+//!
+//! A pending request is withdrawn by its owner (`spawn mission push
+//! --withdraw <request>`, [`withdraw`]): `source.push_refused` with the
+//! reason [`WITHDRAWN`], recorded under the landing hold, so a landing
+//! either recorded its outcome first (and the withdrawal is refused) or
+//! finds the request ended under its own hold and moves nothing ([`ended`]).
+//! An owner judging in flight for it is stopped at the next pass
+//! (`Integrator::stop_withdrawn`) and its result discarded
+//! ([`Judged::Ended`]).
+//!
+//! An owner judging whose gate ends with no verdict for the reason the
+//! request's judging before it recorded is refused, not judged a third time
+//! (`Judge::no_verdict_kept`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -275,6 +288,11 @@ pub(super) fn apply(store: &PostgresStore, request: &Request) -> Result<Outcome,
     // held until the outcome is recorded.
     let own = store.new_connection().map_err(|error| error.to_string())?;
     let _hold = own.source_push_hold().map_err(|error| error.to_string())?;
+    // Withdrawn since this pass read it: nothing moves ([`withdraw`] records
+    // under this hold).
+    if let Some(why) = ended(&own, request.id)? {
+        return Ok(Outcome::Refused(why));
+    }
     if git(&[
         "--git-dir",
         source,
@@ -391,6 +409,79 @@ pub(super) fn refused_with(
     }
     record(store, &refusal)?;
     Ok(Outcome::Refused(reason))
+}
+
+/// The reason of the refusal that withdraws a request ([`withdraw`]).
+pub(crate) const WITHDRAWN: &str = "withdrawn by the owner";
+
+/// Why the request `request` is pending no more (its refusal's reason, or
+/// that it was applied), `None` while it is pending. A landing asks under
+/// its landing hold, before it moves main.
+pub(super) fn ended(store: &PostgresStore, request: i64) -> Result<Option<String>, String> {
+    let outcome = store
+        .source_push_outcome(request)
+        .map_err(|error| error.to_string())?;
+    Ok(outcome.map(|outcome| match outcome["reason"].as_str() {
+        Some(reason) => reason.to_string(),
+        None => "applied already".to_string(),
+    }))
+}
+
+/// `spawn mission push --withdraw`: the pending request `request` ends
+/// refused, [`WITHDRAWN`], whether it waits, backs off or is being judged;
+/// its record, as `spawn mission push --wait` prints a refusal's. Recorded
+/// as every refusal is, under the landing hold (a connection of its own, as
+/// [`apply`]'s): a landing of the request in flight has its outcome
+/// recorded before this one looks, and one that comes after finds the
+/// request ended before it moves main ([`ended`]). A request that ended
+/// already, or that does not exist, is an error and records nothing.
+///
+/// So is one whose commit the source's main already holds: its landing went
+/// out and the integrator stopped before the record (the hold, a session
+/// lock, went with it). Step 0 records that landing at its next pass
+/// ([`moved_from`]); a refusal here would leave main holding a commit its
+/// request calls refused, with no `source.moved`.
+pub(crate) fn withdraw(store: &PostgresStore, request: i64) -> Result<serde_json::Value, String> {
+    let own = store.new_connection().map_err(|error| error.to_string())?;
+    let _hold = own.source_push_hold().map_err(|error| error.to_string())?;
+    let outcome = || {
+        own.source_push_outcome(request)
+            .map_err(|error| error.to_string())
+    };
+    if let Some(outcome) = outcome()? {
+        return Err(format!(
+            "the owner landing request {request} ended already ({}): nothing is withdrawn",
+            match outcome["reason"].as_str() {
+                Some(reason) => format!("refused: {reason}"),
+                None => "applied".to_string(),
+            }
+        ));
+    }
+    let Some(pending) = pending(&own)?
+        .into_iter()
+        .find(|pending| pending.id == request)
+    else {
+        return Err(format!(
+            "no owner landing request {request}: nothing is withdrawn"
+        ));
+    };
+    let (_, main) = source_head(&pending.source).map_err(|error| {
+        format!(
+            "the owner landing request {request}: whether main holds it already cannot be told \
+             ({error}); nothing is withdrawn"
+        )
+    })?;
+    if contains(&pending.source, &pending.commit, &main) {
+        return Err(format!(
+            "the owner landing request {request}: main holds it already: its landing is recorded \
+             at the next pass; nothing is withdrawn"
+        ));
+    }
+    record(
+        &own,
+        &json!({"type": "source.push_refused", "request": request, "reason": WITHDRAWN}),
+    )?;
+    outcome()?.ok_or_else(|| format!("the withdrawal of request {request} left no record"))
 }
 
 /// Record that `request` moved its source's main `from` -> `to`.
@@ -536,6 +627,10 @@ pub(super) enum Judged {
     /// main moved (behind the integrator's back, or the commit is in main
     /// now, which step 0 records).
     Again(String),
+    /// The request ended while it was judged (its owner withdrew it,
+    /// [`withdraw`]), and why: this judging's result is discarded, nothing
+    /// is recorded, nothing moves, and it is not judged again.
+    Ended(String),
 }
 
 /// The scenarios directory `scenarios` (pinned: the controller's) as a path
@@ -723,6 +818,10 @@ impl super::Judge {
         let source = request.source.as_str();
         let commit = request.commit.as_str();
         let mirror_path = mirror.to_string_lossy().to_string();
+        // Withdrawn since step 0 read it: no gate runs for it.
+        if let Ok(Some(why)) = ended(store, request.id) {
+            return Judged::Ended(why);
+        }
         if let Err(error) = sources::refresh(mirror, source) {
             return Judged::NoVerdict(error);
         }
@@ -890,6 +989,7 @@ impl super::Judge {
                     request,
                     format!("the gate's rejection was the host's: {fault:?}"),
                     Some(&verdict.output),
+                    true,
                 ))
             }
             Ok(verdict) => refuse(
@@ -902,8 +1002,9 @@ impl super::Judge {
                 Ok(Judged::NoVerdict(no_verdict(failure)))
             }
             Err(failure) => {
-                let log = failure_log(&failure).map(str::to_string);
-                Ok(self.no_verdict_kept(store, request, no_verdict(failure), log.as_deref()))
+                let (log, again) = (failure_log(&failure).map(str::to_string), repeats(&failure));
+                let why = no_verdict(failure);
+                Ok(self.no_verdict_kept(store, request, why, log.as_deref(), again))
             }
         }
     }
@@ -916,13 +1017,40 @@ impl super::Judge {
     /// backoff; the journal's line ([`judged`]) names the path too. Neither
     /// keeping nor recording failing changes that: each is said and the
     /// no-verdict stands.
+    ///
+    /// Unless it is the second in a row for one reason (P27): when
+    /// `repeats` (a fault, not a wait for room nor a gate that never
+    /// started) and the request's last `source.push_no_verdict` before this
+    /// one carries the same `reason` (the record's, apart from the kept
+    /// log's path, which is new at every judging), the fault is not
+    /// passing, and a third judging would only hold the source behind a
+    /// longer backoff (request 131083, 2026-11-11). The request is
+    /// refused, `source.push_refused` with `verdict` `no_verdict` and
+    /// `kept_log`, this judging's log, and its owner classifies the fault
+    /// before requesting again. The store's records decide, so an
+    /// integrator that restarted between the two refuses all the same.
     fn no_verdict_kept(
         &self,
         store: &PostgresStore,
         request: &Request,
         why: String,
         log: Option<&str>,
+        repeats: bool,
     ) -> Judged {
+        // Read before this judging's own record is written.
+        let before = if repeats {
+            store
+                .source_push_last_no_verdict(request.id)
+                .unwrap_or_else(|error| {
+                    eprintln!(
+                        "integrate: owner request {}: read its last no verdict: {error}",
+                        request.id
+                    );
+                    None
+                })
+        } else {
+            None
+        };
         let judging = super::judging::current_id();
         let kept = log.and_then(|log| {
             match super::retained::keep(
@@ -949,6 +1077,17 @@ impl super::Judge {
             eprintln!(
                 "integrate: owner request {}: record its no verdict: {error}",
                 request.id
+            );
+        }
+        if before.as_deref() == Some(why.as_str()) {
+            return refuse_owner(
+                store,
+                request,
+                format!(
+                    "no verdict twice for the same reason ({why}): classify it (candidate \
+                     failure, test defect or infrastructure) before requesting again"
+                ),
+                &json!({"verdict": "no_verdict", "kept_log": kept}),
             );
         }
         Judged::NoVerdict(match kept {
@@ -984,6 +1123,13 @@ impl super::Judge {
             Ok(hold) => hold,
             Err(error) => return Judged::NoVerdict(error.to_string()),
         };
+        // Withdrawn while its gate ran: an accepted candidate does not land
+        // ([`withdraw`] records under this hold, so not after this either).
+        match ended(&own, request.id) {
+            Ok(None) => {}
+            Ok(Some(why)) => return Judged::Ended(why),
+            Err(error) => return Judged::NoVerdict(error),
+        }
         let pushed = git(&[
             "--git-dir",
             &mirror_path,
@@ -1059,6 +1205,19 @@ fn refuse_owner(
     }
 }
 
+/// Whether a gate's end with no verdict is a fault that may be "the same
+/// reason twice" ([`super::Judge::no_verdict_kept`]): not waiting for room,
+/// nor a gate that never started or that another integrator reaped (which
+/// records nothing anyway), which are no fault of the request however often
+/// in a row.
+pub(super) fn repeats(failure: &crate::gate::GateFailure) -> bool {
+    use crate::gate::GateFailure;
+    !matches!(
+        failure,
+        GateFailure::NoRoom { .. } | GateFailure::Failed(_) | GateFailure::Reaped
+    )
+}
+
 /// What the gate printed, for the ends that ran it (stdout, then stderr
 /// marked `! `); None for one that never ran, ran past its wall clock or was
 /// reaped by another integrator.
@@ -1108,13 +1267,23 @@ fn no_verdict(failure: crate::gate::GateFailure) -> String {
 /// An owner judging's end, on its thread: said, and its backoff kept
 /// (`backoff`, shared with step 0): grown after no verdict (the host-fault
 /// backoff from `base`), dropped otherwise.
+///
+/// A request that ended while it was judged without this judging recording
+/// its outcome (withdrawn, [`withdraw`]) has the judging's result discarded.
 pub(super) fn judged(
-    said: &str,
+    store: &PostgresStore,
     id: i64,
-    judged: &Judged,
+    said: &str,
+    judged: Judged,
     backoff: &std::sync::Mutex<HashMap<i64, (u32, std::time::Instant)>>,
     base: std::time::Duration,
 ) {
+    let judged = match judged {
+        Judged::NoVerdict(_) | Judged::Again(_) if let Ok(Some(why)) = ended(store, id) => {
+            Judged::Ended(why)
+        }
+        other => other,
+    };
     let mut backoff = backoff
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1135,6 +1304,10 @@ pub(super) fn judged(
         Judged::Refused(reason) => {
             backoff.remove(&id);
             println!("{said}: refused: {reason}");
+        }
+        Judged::Ended(why) => {
+            backoff.remove(&id);
+            println!("{said}: its judging is discarded, the request ended: {why}");
         }
         Judged::Landed { from, to } => {
             backoff.remove(&id);

@@ -173,7 +173,8 @@ pub(crate) fn measure(
     let progress = spawn_host::LocalTranscriptArchive::new(&archive)
         .progress()
         .map_err(|error| Failure::Record(error.to_string()))?;
-    let messages = transcripts::read_archive(&archive, previous_since).map_err(Failure::Record)?;
+    let (messages, reach) =
+        transcripts::read_archive(&archive, previous_since).map_err(Failure::Record)?;
     let mut history = History::from_record(&facts, &messages);
     history.clip(previous_since, window.until);
     let mut card = card(&history, window, mission)?;
@@ -181,7 +182,37 @@ pub(crate) fn measure(
         &mut card,
         spawn_core::transcripts::settling(&progress, window.until),
     );
+    reach_tokens(&mut card, reach, window.since, previous_since);
     Ok(card)
+}
+
+/// Say whether the archive's tokens reach back to the windows' starts: a
+/// window that starts before the archive's oldest model call has no tokens
+/// read from before that call, and the card says so rather than count a
+/// short cost as the whole. `tokens_short` is `"window"` when the window
+/// itself starts before it (or the archive holds no call), `"previous"`
+/// when only the previous window does, and null when the archive reaches
+/// back past both; `tokens_from_ms` is the archive's oldest call when the
+/// tokens are short, else null.
+fn reach_tokens(card: &mut Value, reach: transcripts::Reach, since: i64, previous_since: i64) {
+    let (short, from) = match reach {
+        transcripts::Reach::From(None) => (Some("window"), None),
+        transcripts::Reach::From(Some(oldest)) if oldest > since => (Some("window"), Some(oldest)),
+        transcripts::Reach::From(Some(oldest)) if oldest > previous_since => {
+            (Some("previous"), Some(oldest))
+        }
+        transcripts::Reach::Before | transcripts::Reach::From(Some(_)) => (None, None),
+    };
+    if let Some(card) = card.as_object_mut() {
+        card.insert(
+            "tokens_short".to_string(),
+            short.map_or(Value::Null, |short| Value::String(short.to_string())),
+        );
+        card.insert(
+            "tokens_from_ms".to_string(),
+            from.map_or(Value::Null, Value::from),
+        );
+    }
 }
 
 /// Say whether the card's window is still settling: the archive may lack a
@@ -508,8 +539,26 @@ pub(crate) fn text(card: &Value) -> String {
     } else {
         ""
     };
+    let from = card.get("tokens_from_ms").and_then(Value::as_i64);
+    let short = match (card.get("tokens_short").and_then(Value::as_str), from) {
+        (Some("window"), Some(from)) => format!(
+            "; tokens: the transcript archive begins at {}, after this window's start: \
+             tokens before it are not counted",
+            format_rfc3339(from)
+        ),
+        (Some("window"), None) => {
+            "; tokens: the transcript archive holds no model call: no tokens are counted"
+                .to_string()
+        }
+        (Some("previous"), Some(from)) => format!(
+            "; tokens: the transcript archive begins at {}, after the previous window's start: \
+             its tokens before it are not counted",
+            format_rfc3339(from)
+        ),
+        _ => String::new(),
+    };
     let mut out = format!(
-        "spawn scorecard {} to {} (previous window from {}); minimum n {}{settling}\n",
+        "spawn scorecard {} to {} (previous window from {}); minimum n {}{settling}{short}\n",
         format_rfc3339(at("since_ms")),
         format_rfc3339(at("until_ms")),
         format_rfc3339(at("previous_since_ms")),
