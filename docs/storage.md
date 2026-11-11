@@ -699,6 +699,61 @@ outside Spawn's cleanup), the mirrors under `<root>/.sources`, which hold
 branches, and the transcript archive under `<root>/.transcripts`, which
 holds the agents' history; none of them is pruned automatically.
 
+### What uses the disk
+
+Transcripts are never deleted (the owner's ruling), so the transcript
+archive is the one steady grower, and what it grows by is the figure that
+says when storage needs a decision. The page shows it, beside what else
+uses the disk:
+
+- **The loop's sample.** `spawn loop` records a control record
+  `host.storage {archive_bytes, archive_files, projects_bytes,
+  projects_files}` through `spawn_host_record` at its start, and then
+  whenever its latest one is an hour old (`crates/spawn-cli/src/storage.rs`):
+  the regular files, apparent sizes summed, under `<root>/.transcripts` and
+  under Claude Code's projects directory as the Bridge resolves it
+  (`SPAWN_CLAUDE_PROJECTS`, else `$CLAUDE_CONFIG_DIR/projects`, else
+  `$HOME/.claude/projects`). A symbolic link is not followed; a directory
+  that cannot be read is skipped. A sample that could not be written is
+  tried again a minute later, and never fails a pass. The control fold
+  takes the record into no table; the samples are read from the log
+  (index `spawn_events_host_storage`).
+- **`/api/fleet`'s `health.storage`.** `free_bytes` is the free space of the
+  workspace root's file system, read at each request (`df`). The sizes are
+  read at most every 10 minutes and kept between reads, with `read_at_ms`
+  saying when: the page polls `/api/fleet` every 3 s in every tab, and one
+  walk of the live root (about 35,000 entries) takes about 0.3 s. The
+  figures:
+  - `archive {path, bytes, files}`: `<root>/.transcripts`;
+  - `projects {path, bytes, files, before}`: Claude Code's own transcripts;
+    `before` is the `projects_files` of the newest sample at least an hour
+    older than `read_at_ms` (null without one), so a loss of them (as on
+    2026-11-12 00:34, when a test run removed every one on the host) shows
+    as a fall;
+  - `workspaces {path, bytes}`: the regular files under the root outside
+    `.transcripts` and `.transcripts-progress`;
+  - `database {bytes, tables}`: `pg_database_size`, and the five largest
+    tables of the store's schema by `pg_total_relation_size`, `[{name,
+    bytes}]`, largest first (a bloat like the 2.7 GB of 2026-11, for about
+    17 MB of data, shows here);
+  - `growth_bytes_per_day`: what was appended to the archive, its bytes
+    now less the `archive_bytes` of the oldest sample of the last 7 days,
+    over the days between them, rounded down; null without a sample at
+    least a day old;
+  - `days_left`: `free_bytes` over `growth_bytes_per_day`, rounded down;
+    null when the growth is null or not above zero.
+
+  Without a workspace root, `archive`, `workspaces`, `free_bytes` and the
+  growth are null.
+- **The Storage card.** Home's host section ("Every agent and the host")
+  shows the four rows (web/src/resources.ts `storageView`): "Transcript
+  archive" with "grows about <size> a day" (or "not measured yet"), "Claude
+  Code transcripts" with "<files> files" (and ", down from <before>" when
+  the count fell), "Workspaces", and "Database" with its largest table; and
+  under them "about <days> days at the archive's growth". A size reads
+  "<n> MB" to one decimal under 1024 MB (1 MB is 1024 * 1024 bytes), "<n>
+  GB" from there.
+
 ## Alerts
 
 What went wrong is recorded, not printed into a pane
