@@ -622,6 +622,15 @@ const HELD: [&str; 6] = [
     "landed",
 ];
 
+/// Whether `agent` is an ephemeral worker (`agent_worker_*`), which lives
+/// for its task: once its part is done it has nothing else to do. A
+/// resident outlives its tasks and takes other work (the owner's, the
+/// supervisor's), so a task of its past its part says nothing of what it
+/// may be stuck on.
+fn ephemeral(agent: &str) -> bool {
+    agent.starts_with("agent_worker_")
+}
+
 /// The one command that acts on a worker stuck in its task.
 fn restart_command(task: i64) -> String {
     format!("spawn task restart --id {task}")
@@ -1232,7 +1241,7 @@ the base, unsolved on it (task #{task}'s gate)"
                     ),
                     notice: true,
                 });
-                if PART_DONE.contains(&after.as_str()) {
+                if PART_DONE.contains(&after.as_str()) && ephemeral(&task.agent) {
                     self.part_done(event_id, id, &task.agent, kind, &after, out);
                 }
             }
@@ -1625,9 +1634,13 @@ times in a row)",
                     .as_str()
                     .and_then(|agent| self.held_task(agent))
             };
-            let done = held
-                .as_ref()
-                .is_some_and(|(_, state)| PART_DONE.contains(&state.as_str()));
+            let done = held.as_ref().is_some_and(|(_, state)| {
+                PART_DONE.contains(&state.as_str())
+                    && observation["agent_id"].as_str().is_some_and(ephemeral)
+            });
+            // A resident's task past its part is history, not what it is
+            // stuck on: its alert names a task in work only.
+            let held = held.filter(|(_, state)| done || !PART_DONE.contains(&state.as_str()));
             let dispatch = if is_supervisor {
                 self.supervisor_work()
             } else {
@@ -1740,7 +1753,11 @@ times in a row)",
                 && item
                     .agent
                     .as_deref()
-                    .is_some_and(|agent| self.held_task(agent).is_some());
+                    .is_some_and(|agent| {
+                        self.held_task(agent).is_some_and(|(_, state)| {
+                            ephemeral(agent) || !PART_DONE.contains(&state.as_str())
+                        })
+                    });
             if !workers {
                 work.push(format!("escalation {}", item.tag));
             }
