@@ -1398,7 +1398,17 @@ create table if not exists mission_missions (
     -- or of a task without one in it (design-halt-per-objective.md). A run
     -- of one objective's tasks yields that objective instead of halting the
     -- mission.
-    gate_rejection_objective integer
+    gate_rejection_objective integer,
+    -- The scenario file names (`*.sh`) the gate directory held at the
+    -- gating that set `scenario_floor` (the latest `task.gated` at the floor
+    -- since the last resume, its `scenario_names`), null without one.
+    scenario_names jsonb,
+    -- The halt the mission is in (null while it is not halted): its
+    -- `mission.halted` record's event id and time, and `gone`, the scenarios
+    -- a halt on the floor names (null for any other halt).
+    halt_event      bigint,
+    halt_at_ms      bigint,
+    halt_gone       jsonb
 );
 
 create table if not exists mission_residents (
@@ -1483,6 +1493,21 @@ alter table mission_missions add column if not exists gate_host_task bigint;
 alter table mission_missions add column if not exists gate_host_due_ms bigint;
 alter table mission_missions add column if not exists gate_base_disagrees integer not null default 0;
 alter table mission_missions add column if not exists gate_rejection_objective integer;
+alter table mission_missions add column if not exists scenario_names jsonb;
+alter table mission_missions add column if not exists halt_event bigint;
+alter table mission_missions add column if not exists halt_at_ms bigint;
+alter table mission_missions add column if not exists halt_gone jsonb;
+-- A mission halted before its halt was folded: its latest `mission.halted`.
+update mission_missions m
+   set halt_event = h.id, halt_at_ms = h.recorded_at_ms,
+       halt_gone = case when jsonb_typeof(h.r -> 'gone') = 'array' then h.r -> 'gone' end
+  from (select distinct on (e.kind -> 'detail' -> 'record' ->> 'id')
+               e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as r
+          from spawn_events e
+         where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and e.kind -> 'detail' -> 'record' ->> 'type' = 'mission.halted'
+         order by e.kind -> 'detail' -> 'record' ->> 'id', e.id desc) h
+ where m.halted is not null and m.halt_event is null and h.r ->> 'id' = m.id::text;
 alter table mission_tasks add column if not exists base text;
 alter table mission_tasks add column if not exists candidate text;
 alter table mission_tasks add column if not exists gate_log text;
@@ -1866,7 +1891,7 @@ end $$;
 -- Who may call the mission functions: the owner (humans' CLI, the
 -- controller) and the supervisor's login; not the reader's, and not the web
 -- page's typing login (`human`, which may only call `spawn_human_input`,
--- `spawn_human_key` and `spawn_human_task`).
+-- `spawn_human_key`, `spawn_human_task` and `spawn_human_resume`).
 create or replace function spawn_mission_caller() returns text
 language sql stable as $$
     select case when x.p is null or x.p in ('spawn_reader', 'human') then null
@@ -1967,14 +1992,24 @@ begin
                                     objectives = p_record -> 'objectives', updated_at_ms = p_at
          where id = v_id;
     when 'mission.halted' then
-        update mission_missions set halted = p_record ->> 'reason', updated_at_ms = p_at
+        -- The halt the mission is in: this record, and the scenarios it
+        -- names gone (a halt on the scenario floor).
+        update mission_missions set halted = p_record ->> 'reason', halt_event = p_event,
+                                    halt_at_ms = p_at,
+                                    halt_gone = case when jsonb_typeof(p_record -> 'gone') = 'array'
+                                                     then p_record -> 'gone' end,
+                                    updated_at_ms = p_at
          where id = v_id;
     when 'mission.resumed' then
         -- The next gate records the source's main as the new baseline, and
         -- the scenario count as the new floor: a human who resumes has seen
         -- the scenarios as they are (only the owner changes them).
+        -- The owner's resume and a person's from the page
+        -- (`spawn_human_resume`, `by` human, naming its `halt`) fold alike.
         update mission_missions set halted = null, baseline = null, gate_rejections = 0,
-                                    gate_aborts = 0, scenario_floor = 0, gate_room_task = null,
+                                    gate_aborts = 0, scenario_floor = 0, scenario_names = null,
+                                    halt_event = null, halt_at_ms = null, halt_gone = null,
+                                    gate_room_task = null,
                                     gate_room_since_ms = null,
                                     gate_room_last_ms = null, gate_room_waits = 0,
                                     gate_room_escalated = false, gate_host_faults = 0,
@@ -2001,7 +2036,8 @@ begin
         -- reading of this very move (main away from their baseline with no
         -- record). The owner's record is that explanation, so they are not
         -- halted any more and are judged again at the next pass.
-        update mission_missions set halted = null, updated_at_ms = p_at
+        update mission_missions set halted = null, halt_event = null, halt_at_ms = null,
+                                    halt_gone = null, updated_at_ms = p_at
          where jsonb_typeof(p_record -> 'clear') = 'array'
            and id in (select m::bigint
                         from jsonb_array_elements_text(p_record -> 'clear') m);
@@ -2181,6 +2217,15 @@ begin
                                           when v_verdict = 'stale' then gate_room_escalated
                                           else false end,
                scenario_floor = greatest(scenario_floor, coalesce((p_record ->> 'scenarios')::integer, 0)),
+               -- The names of the gating that set the floor: the latest at
+               -- it (one at the floor with other names replaces them).
+               scenario_names = case
+                   when p_record ? 'scenarios'
+                        and (p_record ->> 'scenarios')::integer >= scenario_floor
+                        and (p_record ->> 'scenarios')::integer > 0
+                       then case when jsonb_typeof(p_record -> 'scenario_names') = 'array'
+                                 then p_record -> 'scenario_names' end
+                   else scenario_names end,
                updated_at_ms = p_at
          where id = v_mission;
     when 'task.landed' then
@@ -3393,6 +3438,83 @@ begin
     end if;
     perform spawn_control_record(jsonb_build_object('type', 'mission.resumed', 'id', p_mission));
 end $$;
+
+-- A person's resume of a halted mission from the web page (`spawn serve`,
+-- `POST /api/mission/<id>/resume`, objective 051): the `mission.resumed`
+-- the owner's `spawn mission resume` records, folded alike, naming who
+-- (`by`, the caller's principal: `human`), the halt it resumes (`halt`, the
+-- `mission.halted` event the page showed) and its idempotency key (`key`).
+-- Only the halt the mission is in now is resumed: a mission that is not
+-- halted, or is halted on another halt (a page not refreshed since), is
+-- refused with the reason (SQLSTATE 55000, which the page answers 409) and
+-- nothing is recorded. A repeated key returns its first record, for the
+-- same mission and halt only (another is refused, SQLSTATE 23505). No such
+-- mission is SQLSTATE P0002 (404). Returns the record's event id. Only the
+-- `spawn_human` login may call it, beside `spawn_human_input`,
+-- `spawn_human_key` and `spawn_human_task`: it resumes and does nothing else.
+create or replace function spawn_human_resume(p_mission bigint, p_halt bigint, p_key text)
+returns bigint language plpgsql security definer as $$
+declare
+    v_first record;
+    v_halted text;
+    v_halt bigint;
+begin
+    if spawn_principal() is distinct from 'human' then
+        raise exception '% may not resume as a person (only the spawn_human login does)',
+            session_user using errcode = '42501';
+    end if;
+    if coalesce(p_key, '') = '' or octet_length(p_key) > 256 or p_key ~ '[[:cntrl:]]' then
+        raise exception 'a resume needs an idempotency key of 1 to 256 bytes, no control character'
+            using errcode = '22023';
+    end if;
+    if p_mission is null or p_halt is null then
+        raise exception 'a resume names its mission and the halt it resumes' using errcode = '22023';
+    end if;
+    -- Check and record under the append lock, so no other change interleaves
+    -- (two first uses of one key that race are one resume).
+    perform pg_advisory_xact_lock(1399957335);
+    select e.id, e.kind -> 'detail' -> 'record' as r into v_first
+      from spawn_events e
+     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+       and e.kind -> 'detail' -> 'record' ->> 'type' = 'mission.resumed'
+       and e.kind -> 'detail' -> 'record' ->> 'by' = 'human'
+       and e.kind -> 'detail' -> 'record' ->> 'key' = p_key
+     order by e.id limit 1;
+    if v_first.id is not null then
+        if v_first.r ->> 'id' is distinct from p_mission::text
+           or v_first.r ->> 'halt' is distinct from p_halt::text then
+            raise exception 'idempotency key % was already used for another resume: send this one with a new key',
+                quote_literal(p_key) using errcode = '23505';
+        end if;
+        return v_first.id;
+    end if;
+    select m.halted, m.halt_event into v_halted, v_halt
+      from mission_missions m where m.id = p_mission;
+    if not found then
+        raise exception 'mission % does not exist', p_mission using errcode = 'P0002';
+    end if;
+    if v_halted is null then
+        raise exception 'mission % is not halted: there is nothing to resume', p_mission
+            using errcode = '55000';
+    end if;
+    if v_halt is distinct from p_halt then
+        raise exception 'mission % is halted on %, not on %: reload the page to see its halt',
+            p_mission, coalesce(v_halt::text, 'an earlier halt'), p_halt using errcode = '55000';
+    end if;
+    return spawn_control_record(jsonb_build_object(
+        'type', 'mission.resumed', 'id', p_mission, 'by', spawn_principal(), 'halt', p_halt,
+        'key', p_key));
+end $$;
+
+do $$
+begin
+    execute format('alter function spawn_human_resume(bigint, bigint, text) set search_path = %I, pg_temp',
+                   current_schema());
+    execute 'revoke execute on function spawn_human_resume(bigint, bigint, text) from public';
+    execute format('grant execute on function spawn_human_resume(bigint, bigint, text) to %I',
+                   spawn_login_role('spawn_human'));
+end
+$$;
 
 -- The owner moved a source's main forward outside the gate (a deploy): the
 -- missions whose baseline is `p_from` take `p_to` instead of halting. The

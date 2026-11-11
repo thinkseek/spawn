@@ -2486,7 +2486,16 @@ are per-agent uids or a mount per engine.
     the halt's record names the source and both commits (`cause`:
     `main_moved`), so `spawn mission moved` can tell it from any other.
 
-  A halted mission lands nothing until a human runs `spawn mission resume`.
+  A halted mission lands nothing until a human runs `spawn mission resume`,
+  or resumes it from Needs you (`POST /api/mission/<id>/resume` {halt, key},
+  as the `spawn_human` login through `spawn_human_resume`: the same
+  `mission.resumed`, with `by` `human` and the `halt` it resumes, refused
+  with the reason unless the mission is halted on exactly that halt, once
+  per idempotency key). `/api/missions` names the halt a mission is in
+  (`halt`: its `mission.halted` event, reason, time, and `gone`); a halt on
+  the scenario floor names the scenario files gone since the gating that
+  set the floor (that `task.gated` carries `scenario_names`, the halt
+  `gone`).
   No rule counts host faults, however many in a row, whatever their evidence:
   a halt needs a human, and a host fault is the host's, so it is judged again
   after its backoff; 020's evidence (the test database) is escalated at two

@@ -368,8 +368,11 @@ macro_rules! active_holds {
 
 /// The board of missions with their tasks, newest first; each task carries
 /// its stages ([`PostgresStore::task_stages`]) and each mission the `hold`
-/// on its source (the active hold's event id, or null); `holds` is every
-/// active hold ([`SOURCE_HOLDS`]).
+/// on its source (the active hold's event id, or null) and the `halt` it
+/// is in (`{event, reason, at_ms, gone}`: its `mission.halted` record's
+/// event id and time, and the scenarios a halt on the floor names gone, else
+/// null; null while it is not halted); `holds` is every active hold
+/// ([`SOURCE_HOLDS`]).
 pub(crate) const MISSION_BOARD: &str = concat!(
     r"
 select jsonb_build_object(
@@ -379,6 +382,9 @@ select jsonb_build_object(
   'missions', coalesce((select jsonb_agg(row_to_json(x) order by x.id desc) from (
       select m.id, m.text, m.origin, m.sources, m.state, m.summary,
              m.gate, m.accept, m.budget, m.baseline, m.halted, m.objectives,
+             case when m.halted is not null then jsonb_build_object(
+                 'event', m.halt_event, 'reason', m.halted, 'at_ms', m.halt_at_ms,
+                 'gone', m.halt_gone) end as halt,
              (select h.hold from mission_source_holds h where h.source = m.sources ->> 0) as hold,
              m.created_at_ms, m.updated_at_ms,
              coalesce((select jsonb_agg(jsonb_build_object(
@@ -805,7 +811,7 @@ pub(crate) const GATED: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
   select m.id, m.state, m.gate, m.accept, m.budget, m.baseline, m.halted, m.scenario_floor,
-         spawn_now_ms() as now_ms,
+         m.scenario_names, spawn_now_ms() as now_ms,
          m.gate_rejections, m.gate_aborts, m.gate_room_task, m.gate_room_since_ms,
          m.gate_room_last_ms,
          m.gate_room_waits, m.gate_room_escalated, m.gate_host_faults, m.gate_host_task,

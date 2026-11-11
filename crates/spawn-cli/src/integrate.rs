@@ -746,6 +746,17 @@ pub(crate) struct Mission {
     pub(crate) halted: Option<String>,
     #[serde(default)]
     pub(crate) scenario_floor: u32,
+    /// The scenario file names (`*.sh`) the gate directory held at the
+    /// gating that set `scenario_floor` (the latest at the floor since the
+    /// mission's last resume), folded by the store from that `task.gated`'s
+    /// `scenario_names`; none before such a gating, or from a record without
+    /// them. A halt on the floor names the ones gone since ([`floor_gone`]).
+    #[serde(default)]
+    pub(crate) scenario_names: Option<Vec<String>>,
+    /// The gate directory's scenario file names as this pass read them, for
+    /// the gating's record (`scenario_names`): never the store's.
+    #[serde(skip)]
+    pub(crate) scenarios_now: Option<Vec<String>>,
     #[serde(default)]
     pub(crate) gate_rejections: u32,
     /// The objective every rejection of the current `gate_rejections` run
@@ -924,15 +935,34 @@ pub(crate) fn halt_reason(mission: &Mission, scenarios: u32) -> Option<String> {
     if mission.gate_aborts >= HALT_AFTER {
         return Some(format!("{} gate aborts in a row", mission.gate_aborts));
     }
-    // A candidate that deletes the scenario that judges it passes by removing
-    // the work, so the count may not fall.
-    if mission.scenario_floor > 0 && scenarios < mission.scenario_floor {
-        return Some(format!(
+    floor_reason(mission, scenarios)
+}
+
+/// The scenario floor's halt rule: a candidate that deletes the scenario
+/// that judges it passes by removing the work, so the count may not fall.
+fn floor_reason(mission: &Mission, scenarios: u32) -> Option<String> {
+    (mission.scenario_floor > 0 && scenarios < mission.scenario_floor).then(|| {
+        format!(
             "the scenarios fell from {} to {scenarios}",
             mission.scenario_floor
-        ));
-    }
-    None
+        )
+    })
+}
+
+/// The scenarios a halt on the floor names as gone: the file names the
+/// gating that set the floor saw (`scenario_names`) that `now` (the gate
+/// directory's at the halt) no longer holds, sorted. None when that gating
+/// named none (a record from before names were recorded).
+pub(crate) fn floor_gone(mission: &Mission, now: &[String]) -> Option<Vec<String>> {
+    let then = mission.scenario_names.as_ref()?;
+    let mut gone: Vec<String> = then
+        .iter()
+        .filter(|name| !now.contains(name))
+        .cloned()
+        .collect();
+    gone.sort();
+    gone.dedup();
+    Some(gone)
 }
 
 /// The wait after the `waits`-th `no_room` in a row: [`ROOM_BACKOFF`],
@@ -3008,6 +3038,9 @@ impl Integrator {
         let started_ms = gate::UnitRun::read(gate).map_or_else(now_ms, |run| run.started_ms);
         let mut gated = mission.clone();
         gated.gate = field("scenarios")?;
+        gated.scenarios_now = serde_json::from_value(described["scenario_names"].clone())
+            .ok()
+            .flatten();
         Ok(Some(Adoption {
             mission: gated,
             task: task.clone(),
@@ -3272,9 +3305,15 @@ impl Integrator {
             return Ok(false);
         }
         let scenarios = pinned(Path::new(&mission.gate));
-        let count = gate::count_scenarios(&scenarios)?;
+        let names = gate::scenario_names(&scenarios)?;
+        let count = u32::try_from(names.len()).unwrap_or(u32::MAX);
         if let Some(reason) = halt_reason(mission, count) {
-            return halt(store, mission, &reason).map(|()| false);
+            // A halt on the floor names the scenarios gone since the gating
+            // that set it, so a human tells a replacement from a deletion.
+            let gone = (floor_reason(mission, count).as_ref() == Some(&reason))
+                .then(|| floor_gone(mission, &names))
+                .flatten();
+            return halt_naming(store, mission, &reason, gone).map(|()| false);
         }
         let aborted = Self::enforce_budget(store, mission)?;
         let Some(source) = mission.source.as_deref() else {
@@ -3362,6 +3401,7 @@ impl Integrator {
             }
             let mut gated = mission.clone();
             gated.gate = scenarios.to_string_lossy().into_owned();
+            gated.scenarios_now = Some(names.clone());
             ready.push(Ready {
                 mission: mission.id,
                 source: source.to_string(),
@@ -3516,6 +3556,7 @@ impl Integrator {
                     "revision": task.revisions, "source": source, "base": main,
                     "count": count, "shares_server": shares_server, "jobs": jobs,
                     "gate": pinned(&self.judge.gate), "scenarios": gated.gate,
+                    "scenario_names": gated.scenarios_now,
                     "probe": probe}),
             self.judge.units,
         )
@@ -3890,7 +3931,8 @@ impl Judge {
             {
                 let mut discarded = json!({"type": "task.gated", "id": task.id,
                 "verdict": "stale", "found": "discarded", "revision": task.revisions,
-                "base": main, "scenarios": count, "request": request,
+                "base": main, "scenarios": count, "scenario_names": mission.scenarios_now,
+                "request": request,
                 "reason": format!(
                     "discarded by the owner's urgent landing (request {request}){}",
                     reason.map(|reason| format!(": {reason}")).unwrap_or_default()
@@ -3927,6 +3969,7 @@ impl Judge {
                 stale["id"] = json!(task.id);
                 stale["revision"] = json!(task.revisions);
                 stale["scenarios"] = json!(count);
+                stale["scenario_names"] = json!(mission.scenarios_now);
                 if let Some(log) = extra.get("log") {
                     stale["log"] = log.clone();
                 }
@@ -3963,7 +4006,8 @@ impl Judge {
             };
             let mut record_value = json!({"type": "task.gated", "id": task.id, "verdict": verdict,
                                           "revision": task.revisions, "base": main,
-                                          "scenarios": count});
+                                          "scenarios": count,
+                                          "scenario_names": mission.scenarios_now});
             if let (Some(target), Some(extra)) = (record_value.as_object_mut(), extra.as_object()) {
                 target.extend(extra.clone());
             }
@@ -5999,11 +6043,30 @@ fn bound(value: &Value) -> Value {
 }
 
 fn halt(store: &PostgresStore, mission: &Mission, reason: &str) -> Result<(), String> {
-    record(
-        store,
-        &json!({"type": "mission.halted", "id": mission.id, "reason": reason}),
-    )?;
-    println!("integrate: mission {} HALTED: {reason}", mission.id);
+    halt_naming(store, mission, reason, None)
+}
+
+/// [`halt`], naming the scenarios `gone` for a halt on the scenario floor
+/// ([`floor_gone`]): the record's `gone`, which the board shows.
+fn halt_naming(
+    store: &PostgresStore,
+    mission: &Mission,
+    reason: &str,
+    gone: Option<Vec<String>>,
+) -> Result<(), String> {
+    let mut halted = json!({"type": "mission.halted", "id": mission.id, "reason": reason});
+    if let Some(gone) = &gone {
+        halted["gone"] = json!(gone);
+    }
+    record(store, &halted)?;
+    match gone {
+        Some(gone) if !gone.is_empty() => println!(
+            "integrate: mission {} HALTED: {reason} (gone: {})",
+            mission.id,
+            gone.join(", ")
+        ),
+        _ => println!("integrate: mission {} HALTED: {reason}", mission.id),
+    }
     Ok(())
 }
 
@@ -6142,9 +6205,10 @@ fn task_scenario(scenarios: &Path, recorded: Option<&str>) -> Option<PathBuf> {
 mod tests {
     use super::{
         BUDGET_GAP, Freshness, Mission, NO_TEST_DATABASE, aborted, active_ms, budget_gap,
-        freshness, gates_at_once, halt_reason, markers_note, merged_tree, needs_test_database,
-        no_room, over_budget, pinned, report_freshness, room_backoff, room_wait, short_of_room,
-        task_scenario, waits_for_gate, wall_clock_minutes, withheld_without_test_database,
+        floor_gone, floor_reason, freshness, gates_at_once, halt_reason, markers_note, merged_tree,
+        needs_test_database, no_room, over_budget, pinned, report_freshness, room_backoff,
+        room_wait, short_of_room, task_scenario, waits_for_gate, wall_clock_minutes,
+        withheld_without_test_database,
     };
     use crate::gate::{GateFailure, Shortfall};
     use serde_json::json;
@@ -7412,6 +7476,55 @@ mod tests {
         );
         one.objectives = Some(json!({"backlog": "/b", "resident": "r"}));
         assert_eq!(halt_reason(&one, 7), None, "objective 19 yields instead");
+    }
+
+    /// A halt on the floor names the scenarios the gating that set the
+    /// floor saw and the directory no longer holds, sorted; nothing without
+    /// that gating's names.
+    #[test]
+    fn a_halt_on_the_floor_names_the_scenarios_gone() {
+        let names = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let mut floor = mission(0, 0, 5);
+        assert_eq!(floor_gone(&floor, &names(&["a.sh"])), None, "no names");
+        floor.scenario_names = Some(names(&["e.sh", "a.sh", "c.sh", "b.sh", "d.sh"]));
+        assert_eq!(
+            floor_gone(&floor, &names(&["a.sh", "b.sh", "f.sh"])),
+            Some(names(&["c.sh", "d.sh", "e.sh"]))
+        );
+        assert_eq!(
+            floor_reason(&floor, 3).as_deref(),
+            Some("the scenarios fell from 5 to 3")
+        );
+        assert_eq!(floor_reason(&floor, 5), None);
+        assert_eq!(
+            floor_reason(&mission(3, 0, 5), 3),
+            floor_reason(&floor, 3),
+            "the same words; halt_reason says the rejections first"
+        );
+        assert!(halt_reason(&mission(3, 0, 5), 3).is_some_and(|r| r.contains("rejections")));
+    }
+
+    /// The scenario names are the directory's `*.sh` files, sorted; a
+    /// directory that does not exist holds none.
+    #[test]
+    fn the_scenario_names_are_the_gate_directorys_scripts() {
+        let base = std::env::temp_dir().join(format!(
+            "spawn-scenario-names-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        std::fs::create_dir_all(base.join("nested.sh")).expect("dir");
+        for name in ["b.sh", "a.sh", "notes.md", "c.sh.bak"] {
+            std::fs::write(base.join(name), "").expect("file");
+        }
+        let names = crate::gate::scenario_names(&base).expect("names");
+        assert_eq!(names, ["a.sh", "b.sh", "nested.sh"]);
+        assert!(
+            crate::gate::scenario_names(&base.join("missing"))
+                .expect("none")
+                .is_empty()
+        );
+        std::fs::remove_dir_all(&base).expect("clean");
     }
 
     const MINUTE: i64 = 60_000;
