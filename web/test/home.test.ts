@@ -21,6 +21,7 @@ import {
   digestSince,
   digestToday,
   digestWindow,
+  doingWords,
   latestNotes,
   allNotes,
   liveAlerts,
@@ -30,7 +31,7 @@ import {
   oneLine,
 } from "../src/home.ts";
 import type { Mission, Missions, MissionTask } from "../src/missions.ts";
-import { fleetContext } from "../src/ordering.ts";
+import { fleetContext, heldTask } from "../src/ordering.ts";
 
 const NOW = 1_794_224_000_000;
 const MIN = 60_000;
@@ -324,6 +325,56 @@ test("working now: live agents with a task or a running turn, each by its one na
     ],
   );
   assert.deepEqual(model.idle.map((entry) => entry.name), ["supervisor"]);
+});
+
+test("working now is unchanged: an agent waiting at its prompt on an assigned or a delivered task says so, never in work", () => {
+  const supply = mission(6, "Supply PA", [
+    task(268, "assigned", { session_id: "session_worker_objective_268", agent_id: "agent_worker_objective_268" }),
+    task(269, "delivered", { session_id: "session_worker_objective_269", agent_id: "agent_worker_objective_269" }),
+    task(270, "delivered", { session_id: "session_worker_objective_270", agent_id: "agent_worker_objective_270" }),
+    task(271, "assigned", { session_id: "session_worker_objective_271", agent_id: "agent_worker_objective_271" }),
+  ]);
+  const context = fleetContext(missions([supply]));
+  const model = agentsNow(
+    [
+      agent("session_worker_objective_268", { state: "WAITING" }),
+      agent("session_worker_objective_269", { state: "WAITING" }),
+      agent("session_worker_objective_270", { state: "WORKING" }),
+      agent("session_worker_objective_271", { state: "WORKING" }),
+    ],
+    context,
+  );
+  assert.deepEqual(
+    model.working.map((entry) => [entry.name, entry.doing]),
+    [
+      ["worker · Supply PA T268", "waiting at its prompt"],
+      ["worker · Supply PA T269", "waiting at its prompt"],
+      ["worker · Supply PA T270", "working"],
+      ["worker · Supply PA T271", "working"],
+    ],
+  );
+  for (const id of [268, 269]) {
+    const held = heldTask({ session_id: `session_worker_objective_${id}`, agent_id: `agent_worker_objective_${id}` }, context);
+    assert.equal(doingWords(agent(`session_worker_objective_${id}`), held), "waiting at its prompt");
+  }
+});
+
+test("the Missions card says an assigned task waits for its worker and a delivered one is in work", () => {
+  const model = missionsToday(
+    missions([
+      mission(4, "RSI", [
+        task(268, "delivered", { stages: [{ stage: "delivered", verdict: null, at_ms: NOW - 5 * MIN, took_ms: null }] as MissionTask["stages"] }),
+        task(272, "assigned"),
+        task(273, "revise"),
+        task(274, "reported"),
+      ]),
+    ]),
+    NOW,
+  );
+  assert.deepEqual(
+    model.rows[0].inFlight.map((entry) => [entry.task_id, entry.state]),
+    [[268, "in work"], [272, "waiting for its worker"], [273, "sent back"], [274, "gating"]],
+  );
 });
 
 test("the supervisor's notes: at most two from the last 6 hours, the rest counted", () => {
@@ -655,7 +706,7 @@ test("each task's day is one line: landed after its gates, sent back and where i
   assert.equal(byTask.get("T2")?.text, "Supply PA · T2 sent back twice: sent back 2× (rejected, conflict); now gating");
   assert.equal(byTask.get("T3")?.text, "Supply PA · T3 stopped: cancelled");
   assert.equal(byTask.get("T3")?.kind, "stopped");
-  assert.equal(byTask.get("T4")?.text, "Supply PA · T4 new: started; now delivered");
+  assert.equal(byTask.get("T4")?.text, "Supply PA · T4 new: started; now in work");
   assert.equal(byTask.has("T5"), false, "nothing in the window");
   assert.deepEqual([digest.landed, digest.sentBack], [1, 2]);
   assert.equal(digest.entries[0].text.includes("T4"), true, "newest first");

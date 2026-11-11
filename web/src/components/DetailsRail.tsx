@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import type { Execution, Observation, RsiSummary, SessionDetail } from "../api";
 import { executionFields, executionLine } from "../executionFacts";
 import { relativeTime } from "../format";
+import { stateWords } from "../ordering";
 import { Card, CardHeader, cx } from "./ui";
 
 interface DetailsRailProps {
@@ -215,7 +216,7 @@ export function RailContent({
               label="Task"
               value={
                 residentRsi.open_task
-                  ? `#${residentRsi.open_task.id} · ${residentRsi.open_task.state}`
+                  ? `#${residentRsi.open_task.id} · ${stateWords(residentRsi.open_task.state)}`
                   : "—"
               }
             />
