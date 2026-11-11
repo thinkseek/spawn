@@ -51,6 +51,9 @@ Flagged for a look, without failing:
 - `super::` or `self::` in a run moved out of an item list and one module
   down, where its meaning shifts. A module body moved into its own file
   stays at the same depth, so it is not flagged.
+- An attribute other than `#[cfg(test)]` on an added use or mod
+  (`#[allow(...)]` silences lints on it; another `#[cfg]` may compile it
+  out).
 - A glob `use ...::*;` added to <source>. Prefer explicit re-export lists:
   a later local item silently shadows a glob-imported namesake.
 
@@ -274,6 +277,20 @@ def rustfmt(repo: str, base: str, text: str) -> str | None:
     return done.stdout
 
 
+def odd_attributes(tokens: list[Token], covered: list[bool] | None = None) -> list[Token]:
+    """The attributes other than `#[cfg(test)]` among uncovered tokens,
+    each as its first token with its whole text."""
+    covered = covered or [False] * len(tokens)
+    found = []
+    for k in range(len(tokens)):
+        if covered[k] or (end := attribute_end(tokens, k)) is None:
+            continue
+        text = "".join(t.text for t in tokens[k:end])
+        if text != "#[cfg(test)]":
+            found.append(Token(text, tokens[k].line))
+    return found
+
+
 def statements_only(tokens: list[Token], covered: list[bool] | None = None) -> int | None:
     """The first token that is not part of a `use`/`mod` statement (with
     the attributes and `///` docs directly above it) or a `//!` doc,
@@ -345,6 +362,8 @@ def main() -> int:
                 f"{source}:{b0 + gained[bad].line + 1}: added what is not a mod/use statement, its attributes"
                 f" or docs, or a module doc: {head[b0 + gained[bad].line].strip()[:100]}"
             )
+        for attribute in odd_attributes(gained):
+            flags.append(f"{source}:{b0 + attribute.line + 1}: attribute other than #[cfg(test)] added: {attribute.text[:80]}")
         for k in range(len(gained) - 1):
             if gained[k].text == ":" and gained[k + 1].text == "*" and k and gained[k - 1].text == ":":
                 flags.append(f"{source}:{b0 + gained[k].line + 1}: glob import added (prefer an explicit list)")
@@ -481,6 +500,8 @@ def main() -> int:
     # What else an added file may hold: use/mod statements, their
     # attributes and docs, and //! docs.
     for path, tokens in news.items():
+        for attribute in odd_attributes(tokens, covered[path]):
+            flags.append(f"{path}:{attribute.line + 1}: attribute other than #[cfg(test)] added: {attribute.text[:80]}")
         k = 0
         while (bad := statements_only(tokens[k:], covered[path][k:])) is not None:
             k += bad
