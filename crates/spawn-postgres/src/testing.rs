@@ -31,7 +31,7 @@ pub struct TestSchema {
 
 impl TestSchema {
     /// A fresh schema name for `case` in the test database:
-    /// `spawn_test_<pid>_<nanos><n>_<case>`, not the pid alone (in a gate's
+    /// `spawn_test_<pid>_<nanos>_<n>_<case>`, not the pid alone (in a gate's
     /// PID namespace the pid is the same on every run), and `n` counts the
     /// schemas this process named, so two cases started in the same
     /// nanosecond differ. The schema itself is made by whatever connects
@@ -39,9 +39,18 @@ impl TestSchema {
     ///
     /// # Panics
     ///
-    /// When `SPAWN_TEST_DATABASE_URL` is not set: tests do not skip.
+    /// When `SPAWN_TEST_DATABASE_URL` is not set (tests do not skip), or
+    /// `case` is not lowercase ASCII letters, digits and `_` (the schema
+    /// name goes into SQL unquoted, as `connect_in_schema` requires).
     pub fn new(case: &str) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        assert!(
+            !case.is_empty()
+                && case
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
+            "a test schema's case is lowercase letters, digits and _: {case:?}"
+        );
         let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let url = std::env::var(TEST_DATABASE_URL).unwrap_or_else(|_| {
             panic!("{TEST_DATABASE_URL} must point at a disposable database; tests do not skip")
@@ -50,7 +59,7 @@ impl TestSchema {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.subsec_nanos());
         let name = format!(
-            "spawn_test_{}_{nanos:x}{ordinal:x}_{case}",
+            "spawn_test_{}_{nanos:x}_{ordinal:x}_{case}",
             std::process::id()
         );
         Self { name, url }
@@ -155,6 +164,12 @@ mod tests {
             .expect("connect")
             .batch_execute(&format!("drop schema {name} cascade"))
             .expect("drop the kept schema");
+    }
+
+    #[test]
+    #[should_panic(expected = "a test schema's case is lowercase letters, digits and _")]
+    fn a_case_that_is_no_bare_identifier_is_refused() {
+        let _ = TestSchema::new("x; drop schema public");
     }
 
     #[test]
