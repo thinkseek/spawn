@@ -99,16 +99,19 @@ for tool in psql tmux git jq od bash sed grep awk date sort curl node sha1sum; d
 done
 
 WORK=$(mktemp -d) || harness "mktemp failed"
+# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
+# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+HOME=$WORK/home
+TMUX_TMPDIR=$WORK/tmux-sock
+mkdir -p "$HOME" "$TMUX_TMPDIR"
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
+export HOME TMUX_TMPDIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_051_resume_$run"
 SPAWN_TMUX_SOCKET="bb-051-$run"
 SPAWN_PSQL=psql
-# The tmux server's socket lives in WORK, so the cleanup removes nothing
-# outside it (cc-rules (a), 2026-11-12).
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$TMUX_TMPDIR"
-export TMUX_TMPDIR
 export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
 TEST_URL=$SPAWN_TEST_DATABASE_URL
 
@@ -354,12 +357,7 @@ SPAWN_STALL_HALTED_SECS=1800
 # No base warm after the landing: its gate runs would be noise in judged.log.
 SPAWN_INTEGRATE_WARM=0
 BACKOFF_SECS=2
-# A scratch HOME: nothing here reads or writes the real one (cc-rules (a)).
-real_home=$HOME
-HOME=$WORK/home
-mkdir -p "$HOME"
-[ "$HOME" != "$real_home" ] && [ "${HOME#"$WORK"/}" != "$HOME" ] || harness "HOME is not a scratch directory under WORK: $HOME"
-export HOME SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
+export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
     SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
     SPAWN_LOOP_INTERVAL_MS SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB SPAWN_SUPERVISOR \
     SPAWN_MISSION_FILE SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS \
