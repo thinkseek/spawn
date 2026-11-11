@@ -78,10 +78,75 @@ select jsonb_build_object(
                   order by m.mission_id), '[]'::jsonb)
                  from missions m))";
 
+/// The interventions of `[$1, $2)` (objective 049), each command's outcome
+/// as it stood before `$2`:
+/// - `agent_ms`: the executions' running time clipped to the window, as
+///   [`WINDOW`] counts it;
+/// - `items`: newest first, one per intervention (`spawn_interventions`;
+///   a person's commands as intents, `spawn_human_intents`, each taken as
+///   it stood before `$2`: its commands created before it, its outcome its
+///   last one's if that finished before it, else `pending`). Each item has
+///   `kind`, `at_ms`, `principal`, `agent`, `session` (a command's; null
+///   for the other kinds), `line` (an input's first line, at most 120
+///   characters, else the action's type; "resumed mission #<id>",
+///   "assigned task #<id>", "cancelled task #<id>, assigned task #<id>"),
+///   `commands` (an intent's ids in order; `[]` otherwise), `attempts` and
+///   `outcome` (null for the other kinds).
+const INTERVENTIONS: &str = r"
+with
+  intents as (
+    select i.at_ms, i.intent, i.principal, i.agent_id, i.session_id, i.action,
+           k.n, i.commands[1:k.n] as commands,
+           case when i.finished_at_ms[k.n] is null or i.finished_at_ms[k.n] >= $2 then 'pending'
+                when i.succeeded[k.n] then 'taken'
+                else 'failed' end as outcome
+      from spawn_human_intents i
+     cross join lateral (
+           select count(*)::integer as n from unnest(i.created_at_ms) t(created)
+            where t.created < $2) k
+     where i.at_ms >= $1 and i.at_ms < $2),
+  items as (
+    select i.at_ms, 'command' as kind, i.intent as id,
+           jsonb_build_object(
+             'kind', 'command', 'at_ms', i.at_ms, 'principal', i.principal,
+             'agent', i.agent_id, 'session', i.session_id,
+             'line', case when i.action ->> 'type' = 'input'
+                               and jsonb_typeof(i.action -> 'text') = 'string'
+                          then left(split_part(i.action ->> 'text', E'\n', 1), 120)
+                          else coalesce(i.action ->> 'type', 'command') end,
+             'commands', to_jsonb(i.commands), 'attempts', i.n, 'outcome', i.outcome) as item
+      from intents i
+    union all
+    select v.at_ms, v.kind, coalesce(v.task_id, v.mission_id),
+           jsonb_build_object(
+             'kind', v.kind, 'at_ms', v.at_ms, 'principal', null, 'agent', null,
+             'session', null,
+             'line', case v.kind
+                       when 'resume' then 'resumed mission #' || v.mission_id
+                       when 'owner_task' then 'assigned task #' || v.task_id
+                       else 'cancelled task #' || v.cancelled_task_id
+                            || ', assigned task #' || v.task_id end,
+             'commands', '[]'::jsonb, 'attempts', null, 'outcome', null)
+      from spawn_interventions v
+     where v.kind <> 'command' and v.at_ms >= $1 and v.at_ms < $2)
+select jsonb_build_object(
+  'agent_ms', (select coalesce(sum(greatest(0,
+                 least(coalesce(x.ended_at_ms, $2), $2) - greatest(x.started_at_ms, $1))), 0)::bigint
+                 from agent_executions x
+                where x.started_at_ms < $2 and coalesce(x.ended_at_ms, $2) > $1),
+  'items', (select coalesce(jsonb_agg(t.item order by t.at_ms desc, t.kind, t.id desc), '[]'::jsonb)
+              from items t))";
+
 impl PostgresStore {
     /// How the fleet did over `[since_ms, until_ms)`, from the experience
     /// views ([`WINDOW`]).
     pub fn experience_window(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
         self.query_json(WINDOW, &[&since_ms, &until_ms])
+    }
+
+    /// The interventions of `[since_ms, until_ms)` and the agent time
+    /// beside them ([`INTERVENTIONS`]).
+    pub fn interventions_window(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
+        self.query_json(INTERVENTIONS, &[&since_ms, &until_ms])
     }
 }
