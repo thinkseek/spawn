@@ -321,6 +321,9 @@ pub(crate) struct Settings {
     /// How long a mission's main may be ahead of its controller while a
     /// task waits for it (0: never alerted).
     pub(crate) controller_behind_ms: i64,
+    /// How long a mission that takes its work from an objective backlog may
+    /// have no task in work (0: never alerted).
+    pub(crate) mission_idle_ms: i64,
     /// The window `spawn alerts --once` shows.
     pub(crate) window_ms: i64,
     /// The two database logs, when named.
@@ -381,6 +384,7 @@ impl Settings {
             quiet_ms: secs("SPAWN_ALERT_PG_QUIET_SECS", 900, &mut warnings),
             integrator_down_ms: secs("SPAWN_ALERT_INTEGRATOR_DOWN_SECS", 300, &mut warnings),
             controller_behind_ms: secs("SPAWN_ALERT_CONTROLLER_BEHIND_SECS", 1800, &mut warnings),
+            mission_idle_ms: secs("SPAWN_ALERT_MISSION_IDLE_SECS", 900, &mut warnings),
             window_ms: secs("SPAWN_ALERT_WINDOW_SECS", 86_400, &mut warnings),
             test_log: env_value("SPAWN_TEST_DATABASE_LOG").map(PathBuf::from),
             live_log: env_value("SPAWN_DATABASE_LOG").map(PathBuf::from),
@@ -477,6 +481,12 @@ struct Mission {
     accept: Option<String>,
     /// Its latest `mission.closed` record's event.
     closed_event: Option<i64>,
+    /// It takes its work from an objective backlog (`objectives` on its
+    /// record: `--backlog`, `--resident`); owner work does not.
+    backlog: bool,
+    /// When its last task ended with none in work after it, and the record
+    /// that ended it (`at_ms`, `event_id`); none while a task is in work.
+    idle: Option<(i64, i64)>,
 }
 
 impl Mission {
@@ -772,6 +782,7 @@ impl Monitor {
             self.read_sources(store, now, &mut events, &mut lines);
             self.read_defect_gates(store, now, &mut events, &mut lines);
             self.read_budgets(store, now, &mut events, &mut lines);
+            self.read_idle(now, &mut events);
         }
         self.bounds(now, &mut events);
         self.flush(store, now, &events, &mut lines);
@@ -809,6 +820,10 @@ impl Monitor {
                     escalated: mission["gate_room_escalated"].as_bool().unwrap_or(false),
                     accept: mission["accept"].as_str().map(str::to_string),
                     closed_event: mission["closed_event"].as_i64(),
+                    backlog: mission["backlog"].as_bool().unwrap_or(false),
+                    idle: mission["idle"]["at_ms"]
+                        .as_i64()
+                        .zip(mission["idle"]["event_id"].as_i64()),
                 },
             );
         }
@@ -1219,6 +1234,8 @@ impl Monitor {
                 escalated: false,
                 accept: None,
                 closed_event: None,
+                backlog: false,
+                idle: None,
             });
         }
         let Some(mission) = self.missions.get_mut(&id) else {
@@ -1259,7 +1276,10 @@ impl Monitor {
                     notice: false,
                 });
             }
-            "mission.closed" => self.closed_defects(Some((id, event_id)), 0, out),
+            "mission.closed" => {
+                self.closed_defects(Some((id, event_id)), 0, out);
+                self.clear_idle(id, event_id, "mission.closed", out);
+            }
             "mission.resumed" => {
                 for key in self.open_keys("mission_halted", &format!("mission #{id}")) {
                     out.push(Event::Clear {
@@ -1420,6 +1440,7 @@ the base, unsolved on it (task #{task}'s gate)"
                 }
             }
         }
+        self.track_idle(event_id, at_ms, kind, task.mission, out);
         if self
             .tasks
             .get(&id)
@@ -2709,6 +2730,101 @@ times in a row)",
         out
     }
 
+    /// Whether a task of `mission` is in work: assigned, delivered,
+    /// reported, sent back, gated, landing or held (not landed, accepted or
+    /// cancelled).
+    fn in_work(&self, mission: i64) -> bool {
+        self.tasks.values().any(|task| {
+            task.mission == mission
+                && !matches!(
+                    task.state.as_deref(),
+                    Some("landed" | "accepted" | "cancelled")
+                )
+        })
+    }
+
+    /// A task record's part in `mission_idle`: an assignment ends the
+    /// mission's idle time and clears its alert; a record after which no
+    /// task of the mission is in work starts it, at that record.
+    fn track_idle(&mut self, event_id: i64, at_ms: i64, kind: &str, mission: i64, out: &mut Vec<Event>) {
+        if kind == "task.assigned" {
+            if let Some(entry) = self.missions.get_mut(&mission) {
+                entry.idle = None;
+            }
+            self.clear_idle(mission, event_id, kind, out);
+            return;
+        }
+        let ended = matches!(
+            kind,
+            "task.landed" | "task.cancelled" | "task.aborted" | "task.over_budget" | "task.reviewed"
+                | "task.gated"
+        );
+        if !ended || self.in_work(mission) {
+            return;
+        }
+        if let Some(entry) = self.missions.get_mut(&mission)
+            && entry.idle.is_none()
+        {
+            entry.idle = Some((at_ms, event_id));
+        }
+    }
+
+    /// Clear the mission's open `mission_idle` alert, naming the record.
+    fn clear_idle(&self, mission: i64, event_id: i64, record: &str, out: &mut Vec<Event>) {
+        for key in self.open_keys("mission_idle", &format!("mission #{mission}")) {
+            out.push(Event::Clear {
+                key,
+                evidence: json!({"event_id": event_id, "record": record}),
+            });
+        }
+    }
+
+    /// The idle missions' reading (`mission_idle`): a mission not closed
+    /// that takes its work from an objective backlog, with no task in work
+    /// since its last task ended `SPAWN_ALERT_MISSION_IDLE_SECS` ago or
+    /// more, fires once (its key names the record that ended that task).
+    fn read_idle(&self, now: i64, out: &mut Vec<Event>) {
+        let bound = self.settings.mission_idle_ms;
+        if bound <= 0 {
+            return;
+        }
+        let mut ids: Vec<&i64> = self.missions.keys().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let mission = &self.missions[id];
+            let Some((since_ms, event_id)) = mission.idle else {
+                continue;
+            };
+            let subject = format!("mission #{id}");
+            let key = format!("mission_idle:{id}:{event_id}");
+            if mission.closed()
+                || !mission.backlog
+                || now.saturating_sub(since_ms) < bound
+                || self.in_work(*id)
+                || self.known.contains_key(&key)
+                || !self.open_keys("mission_idle", &subject).is_empty()
+            {
+                continue;
+            }
+            let idle_ms = now.saturating_sub(since_ms);
+            out.push(Event::Fire {
+                key,
+                kind: "mission_idle",
+                subject: subject.clone(),
+                evidence: json!({
+                    "mission": id, "since_ms": since_ms, "event_id": event_id,
+                    "idle_ms": idle_ms, "reading_ms": now,
+                }),
+                text: format!(
+                    "{subject} has had no task in work for {} since its last task ended: \
+                     its objective backlog has nothing open to assign",
+                    idle_words(idle_ms)
+                ),
+                notice: false,
+            });
+        }
+    }
+
     /// The daily budgets' reading (`cost_budget`): each budgeted mission's
     /// spend of the UTC day so far, on the database's clock.
     fn read_budgets(
@@ -3188,6 +3304,23 @@ enum Crossing {
 /// over (or under, when `under`), `turn_off` the one it clears at, on the
 /// other side of the margin.
 /// The strings of a record's list, in order.
+/// A span in the words an alert's text holds: "45 s", "12 min", "3 h 20 min".
+fn idle_words(ms: i64) -> String {
+    let seconds = ms.max(0) / 1000;
+    if seconds < 60 {
+        format!("{seconds} s")
+    } else if seconds < 3600 {
+        format!("{} min", seconds / 60)
+    } else {
+        let minutes = (seconds % 3600) / 60;
+        if minutes == 0 {
+            format!("{} h", seconds / 3600)
+        } else {
+            format!("{} h {minutes} min", seconds / 3600)
+        }
+    }
+}
+
 /// The scenarios a gate's verdict says passed in it: run on the candidate
 /// and passed (`passed`), or taken from the base's cache as solved
 /// (`reused`).
@@ -3284,6 +3417,7 @@ fn apply_mission(mission: &mut Mission, record: &Value) {
         }
         "mission.configured" => {
             mission.accept = record["accept"].as_str().map(str::to_string);
+            mission.backlog = record["objectives"].is_object();
         }
         "task.assigned" if mission.state == "open" => {
             mission.state = "active".to_string();
@@ -3920,6 +4054,7 @@ mod tests {
             quiet_ms: 900_000,
             integrator_down_ms: 300_000,
             controller_behind_ms: 1_800_000,
+            mission_idle_ms: 900_000,
             window_ms: 86_400_000,
             test_log: None,
             live_log: None,
