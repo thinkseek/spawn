@@ -1720,6 +1720,11 @@ impl Bridge {
             return Ok(());
         };
         let mut read = 0_usize;
+        // One checkpoint per read: the workspace does not change while the
+        // lines are read, so a later turn end in the same read finds the
+        // one taken for the first, and a transcript read again from the
+        // start commits once, not at each of its old turns (rev-g on S15).
+        let mut checkpointed = false;
         for line in bytes[..end].split(|byte| *byte == b'\n') {
             let start = read;
             read += line.len() + 1;
@@ -1744,18 +1749,19 @@ impl Bridge {
                 // would not be reading it: see [`Follow::settling`].
                 active.follow.settling = Some(self.clock.now().0);
             }
-            if ends_turn
-                && !self.checkpoint(
+            if ends_turn && !checkpointed {
+                if !self.checkpoint(
                     agent_id,
                     session,
                     active,
                     CheckpointReason::TurnStopped,
                     report,
-                )?
-            {
-                active.follow.advance(&bytes[..start]);
-                // The commit stays due: the line is read again next pass.
-                return Ok(());
+                )? {
+                    active.follow.advance(&bytes[..start]);
+                    // The commit stays due: the line is read again next pass.
+                    return Ok(());
+                }
+                checkpointed = true;
             }
             if active.follow.version.is_none()
                 && let Some(version) = claude_version(&line)
@@ -3295,8 +3301,8 @@ impl Bridge {
     }
 
     /// Before a resume of `native`: its transcript is where the engine
-    /// reads it, put back from the archive when it went missing, or why the
-    /// resume cannot go on ([`transcripts::restore`]).
+    /// reads it, put back from the archive when it went missing or lost its
+    /// head, or why the resume cannot go on ([`transcripts::restore`]).
     fn ready_transcript(
         &self,
         claimed: &Claimed,
@@ -3318,11 +3324,23 @@ impl Bridge {
             native,
             read_before,
         )?;
-        if let Some(bytes) = restored {
-            report.warnings.push(format!(
+        match restored {
+            Some(transcripts::Restored::Written { bytes }) => report.warnings.push(format!(
                 "{}: {path} was missing; restored {bytes} bytes from the transcript archive",
                 claimed.session_id
-            ));
+            )),
+            Some(transcripts::Restored::Replaced { bytes, had }) => report.warnings.push(format!(
+                "{}: {path} held {had} bytes and the transcript archive more (it lost its head); \
+                 restored {bytes} bytes, every byte it held among them",
+                claimed.session_id
+            )),
+            Some(transcripts::Restored::Left { had }) => report.warnings.push(format!(
+                "{}: {path} ({had} bytes) is not the transcript archive's latest copy of it, so \
+                 it was not restored from the archive; it is resumed as it is, and the archive \
+                 keeps every copy it made",
+                claimed.session_id
+            )),
+            None => {}
         }
         Ok(())
     }

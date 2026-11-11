@@ -940,6 +940,30 @@ impl TerminalHost for MemoryStore {
         Ok(true)
     }
 
+    fn replace_grown(
+        &self,
+        _workspace: &WorkspaceId,
+        path: &str,
+        bytes: &[u8],
+        current: &[u8],
+    ) -> Result<bool, TerminalError> {
+        if bytes.len() < current.len() {
+            return Err(TerminalError(format!(
+                "replacing {path} would shorten it: {} bytes for {}",
+                bytes.len(),
+                current.len()
+            )));
+        }
+        let mut state = self.lock();
+        match state.files.get_mut(path) {
+            Some(held) if held.as_slice() == current => {
+                *held = bytes.to_vec();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn terminate(
         &self,
         terminal: &TerminalName,

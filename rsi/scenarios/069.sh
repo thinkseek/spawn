@@ -75,6 +75,17 @@ SPAWN_CLAUDE_PROJECTS=$WORK/home/projects
 export HOME SPAWN_CLAUDE_PROJECTS
 mkdir -p "$SPAWN_CLAUDE_PROJECTS" || harness "mkdir $SPAWN_CLAUDE_PROJECTS failed"
 [ "$HOME" != "$real_home" ] && [ "${HOME#"$WORK"/}" != "$HOME" ] || harness "HOME is not a scratch directory under WORK: $HOME"
+# The runtime directory too (backlog S20): what Spawn keeps there (a
+# launch's environment file, its terminals' leaders) stays in WORK, never
+# in the real one. systemd's user manager stays reachable by its bus.
+real_runtime=${XDG_RUNTIME_DIR-}
+if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
+    DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
+    export DBUS_SESSION_BUS_ADDRESS
+fi
+XDG_RUNTIME_DIR=$WORK/runtime
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export XDG_RUNTIME_DIR
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
