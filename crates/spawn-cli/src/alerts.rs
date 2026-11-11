@@ -4346,6 +4346,184 @@ connections\n";
     /// appended to a schema of its own in the test database
     /// (`SPAWN_TEST_DATABASE_URL`, never the live one) and read back by
     /// `alert_observations`, as the loop's step reads them.
+    /// An alert clears only on evidence after what it fired on, whatever
+    /// restarts (objective 050): the step meets a history with a halt, its
+    /// resume and a second halt, two dumps and a good then a failed drill.
+    mod restarts {
+        use super::super::Monitor;
+        use super::settings;
+        use serde_json::Value;
+        use spawn_postgres::PostgresStore;
+
+        const HOUR: i64 = 3_600_000;
+
+        /// Run `case` on a migrated schema of its own, with an owner
+        /// connection to it; dropped afterwards.
+        fn in_schema(name: &str, case: impl FnOnce(&PostgresStore, &mut postgres::Client)) {
+            let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+                "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+            );
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.subsec_nanos());
+            let schema = format!("spawn_test_{}_{nanos:x}_{name}", std::process::id());
+            let store = PostgresStore::connect_in_schema(&url, &schema)
+                .expect("a schema of its own, migrated");
+            let separator = if url.contains('?') { '&' } else { '?' };
+            let owner = format!("{url}{separator}options=-csearch_path%3D{schema}");
+            let mut client =
+                postgres::Client::connect(&owner, postgres::NoTls).expect("the owner connects");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                case(&store, &mut client);
+            }));
+            drop(client);
+            drop(store);
+            let _ = postgres::Client::connect(&url, postgres::NoTls).and_then(|mut client| {
+                client.batch_execute(&format!("drop schema {schema} cascade"))
+            });
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
+
+        /// A control record `hours` before now, as the store holds it; its
+        /// event id.
+        fn record(client: &mut postgres::Client, hours: i64, record: &str) -> i64 {
+            let record: Value = serde_json::from_str(record).expect("a record");
+            client
+                .query_one(
+                    "insert into spawn_events (agent_id, session_id, execution_id, source,
+                                               source_event_id, kind, session_seq, recorded_at_ms)
+                     select 'agent_control', 'session_control', null, 'control', null,
+                            jsonb_build_object('name', 'control.recorded',
+                                               'detail', jsonb_build_object('record', $1::jsonb)),
+                            coalesce((select max(session_seq) from spawn_events
+                                       where session_id = 'session_control'), 0) + 1,
+                            spawn_now_ms() - $2::bigint
+                     returning id",
+                    &[&record, &(hours * HOUR)],
+                )
+                .expect("a control record")
+                .get(0)
+        }
+
+        fn refold(client: &mut postgres::Client) {
+            client
+                .batch_execute("select spawn_control_refold()")
+                .expect("refold");
+        }
+
+        /// The alert `key`'s state and the event its clear named.
+        fn alert(client: &mut postgres::Client, key: &str) -> (String, Option<i64>) {
+            client
+                .query_opt(
+                    "select state, (cleared_evidence ->> 'event_id')::bigint
+                       from spawn_alerts where key = $1",
+                    &[&key],
+                )
+                .expect("the alert reads")
+                .map_or(("none".to_string(), None), |row| (row.get(0), row.get(1)))
+        }
+
+        fn count(client: &mut postgres::Client) -> i64 {
+            client
+                .query_one(
+                    "select count(*) from spawn_alerts
+                      where kind in ('mission_halted', 'backup_stale', 'drill_failed')",
+                    &[],
+                )
+                .expect("count")
+                .get(0)
+        }
+
+        /// A loop's step, started fresh, after one check.
+        fn started(store: &PostgresStore) -> Monitor {
+            let mut monitor = Monitor::with(settings());
+            monitor.check(store).expect("the step checks");
+            monitor
+        }
+
+        #[test]
+        fn an_older_record_clears_nothing_at_a_first_start_or_after_a_restart() {
+            in_schema("alerts_restarts", |store, client| {
+                record(client, 5, r#"{"type":"mission.added","id":1,"text":"m","origin":"human","sources":[]}"#);
+                let d1 = record(client, 5, r#"{"type":"backup.dumped","keys":["d1"]}"#);
+                let v1 = record(client, 4, r#"{"type":"backup.verified","ok":true,"key":"v1"}"#);
+                let h1 = record(client, 3, r#"{"type":"mission.halted","id":1,"reason":"first"}"#);
+                let d2 = record(client, 3, r#"{"type":"backup.dumped","keys":["d2"]}"#);
+                let r1 = record(client, 2, r#"{"type":"mission.resumed","id":1}"#);
+                let h2 = record(client, 1, r#"{"type":"mission.halted","id":1,"reason":"second"}"#);
+                let v2 = record(
+                    client,
+                    1,
+                    r#"{"type":"backup.verified","ok":false,"key":"v2","reason":"bad"}"#,
+                );
+                refold(client);
+                assert!(d1 < d2 && v1 < v2 && h1 < r1 && r1 < h2);
+                let halt = format!("mission_halted:1:{h2}");
+                let stale = format!("backup_stale:dump:{d2}");
+                let drill = format!("drill_failed:{v2}");
+
+                // The first start: the second halt, the newer dump and the
+                // failed drill are open; the first halt is cleared on its
+                // resume, which the same history holds.
+                let mut monitor = started(store);
+                for key in [&halt, &stale, &drill] {
+                    assert_eq!(alert(client, key), ("open".to_string(), None), "{key}");
+                }
+                assert_eq!(
+                    alert(client, &format!("mission_halted:1:{h1}")),
+                    ("cleared".to_string(), Some(r1)),
+                    "fired and cleared naming its resume"
+                );
+
+                // Restarts: the older resume, dump and drill clear nothing.
+                for _ in 0..2 {
+                    monitor = started(store);
+                    for key in [&halt, &stale, &drill] {
+                        assert_eq!(alert(client, key).0, "open", "{key} after a restart");
+                    }
+                }
+
+                // Later evidence clears each, naming it.
+                let r2 = record(client, 0, r#"{"type":"mission.resumed","id":1}"#);
+                let d3 = record(client, 0, r#"{"type":"backup.dumped","keys":["d3"]}"#);
+                let v3 = record(client, 0, r#"{"type":"backup.verified","ok":true,"key":"v3"}"#);
+                refold(client);
+                monitor.check(store).expect("the step checks");
+                assert_eq!(alert(client, &halt), ("cleared".to_string(), Some(r2)));
+                assert_eq!(alert(client, &stale), ("cleared".to_string(), Some(d3)));
+                assert_eq!(alert(client, &drill), ("cleared".to_string(), Some(v3)));
+
+                // A further restart fires nothing again.
+                let before = count(client);
+                drop(started(store));
+                assert_eq!(count(client), before);
+
+                // A halt and its resume, and a failed drill and a good one,
+                // written while the loop was down: neither opens.
+                let h3 = record(client, 0, r#"{"type":"mission.halted","id":1,"reason":"third"}"#);
+                let r3 = record(client, 0, r#"{"type":"mission.resumed","id":1}"#);
+                let v4 = record(
+                    client,
+                    0,
+                    r#"{"type":"backup.verified","ok":false,"key":"v4","reason":"bad"}"#,
+                );
+                let v5 = record(client, 0, r#"{"type":"backup.verified","ok":true,"key":"v5"}"#);
+                refold(client);
+                drop(started(store));
+                assert_eq!(
+                    alert(client, &format!("mission_halted:1:{h3}")),
+                    ("cleared".to_string(), Some(r3))
+                );
+                assert_eq!(
+                    alert(client, &format!("drill_failed:{v4}")),
+                    ("cleared".to_string(), Some(v5))
+                );
+            });
+        }
+    }
+
     mod through_the_store {
         use super::super::{Event, Monitor};
         use super::{commit, decided, fires, monitor};
