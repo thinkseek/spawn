@@ -1409,9 +1409,9 @@ fn public_holds_only_the_gateway_the_readers_and_pure_helpers() {
         granted,
         [
             "agent_commands INSERT",
+            "spawn_experience_int EXECUTE",
             "spawn_gateway_insert EXECUTE",
             "spawn_gateway_submit EXECUTE",
-            "spawn_experience_int EXECUTE",
             "spawn_grant_matches EXECUTE",
             "spawn_login_role EXECUTE",
             "spawn_mission_caller EXECUTE",
