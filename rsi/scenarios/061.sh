@@ -18,12 +18,16 @@
 #       an owner judging alike (an owner judging's record carries `gate_ms`
 #       and `mission`, the mission whose gate judged it), with `runs` split
 #       into `task_runs` and `owner_runs`.
-#   (2) the judging mission's `gate_time` counts them the same way.
+#   (2) the judging mission's `gate_time` counts them the same way, and
+#       no other mission's does: the missions an owner landing moves (the
+#       store's `missions` on its record) are not the mission whose gate
+#       judged it.
 #
-# Records are written as the integrator writes them, through
-# spawn_control_record() (the owner judging's `gate_ms` and `mission` as the
-# integrator must now write them); `spawn serve` answers. Each check is
-# reported; the run fails if any failed.
+# Task records are written through spawn_control_record(); each owner
+# landing is requested as `spawn mission push` records it and its outcome is
+# recorded through spawn_integrator_record(), as the integrator records it,
+# with the `gate_ms` and `mission` the integrator must now write. `spawn
+# serve` answers. Each check is reported; the run fails if any failed.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -203,27 +207,43 @@ start_serve() {
 
 # --- the records ----------------------------------------------------------------
 
-# Mission 1 is a gate mission on source $SOURCE. Its tasks 1 and 2 are judged
-# by its gate (10 and 15 min); the owner's three landings on the same source
-# are judged by the same gate, as the integrator judges an owner push
-# between task gates (20, 5 and 7.5 min), and their records name the gate's
-# wall clock and the mission whose gate judged them. The records' fields are
-# the integrator's own (crates/spawn-cli/src/integrate/owner.rs) plus
-# `mission` and `gate_ms`.
+# Missions 1 and 2 are gate missions on the same source, at base B. Mission
+# 1's tasks 1 and 2 are judged by its gate (10 and 15 min), mission 2's task
+# 3 by its own (6.7 min). The owner's three landings on the source are judged
+# by mission 1's gate, as the integrator judges an owner push between task
+# gates (20, 5 and 7.5 min). Each is requested as `spawn mission push`
+# records it, and its outcome is recorded through spawn_integrator_record()
+# as the integrator records it, plus the gate's wall clock (`gate_ms`) and
+# the mission whose gate judged it (`mission`). The store names the missions
+# the landing moves (`missions`: 1 and 2), which is not the mission whose
+# gate judged it.
 SOURCE=$WORK/source-bb
 B=$(printf 'bb-061-base' | sha1sum | cut -c1-40)
 C=$(printf 'bb-061-candidate' | sha1sum | cut -c1-40)
-record "{\"type\":\"mission.added\",\"id\":1,\"text\":\"061 mission\",\"origin\":\"human\",\"sources\":[]}" >/dev/null
-record "{\"type\":\"mission.configured\",\"id\":1,\"accept\":\"gate\",\"gate\":\"$WORK/ctl/scenarios\"}" >/dev/null
-for t in 1 2; do
-    assign "$t" 1 >/dev/null
-    record "{\"type\":\"task.reported\",\"id\":$t,\"commit\":\"$C\"}" >/dev/null
+for m in 1 2; do
+    record "{\"type\":\"mission.added\",\"id\":$m,\"text\":\"061 mission $m\",\"origin\":\"human\",\"sources\":[\"$SOURCE\"]}" >/dev/null
+    record "{\"type\":\"mission.configured\",\"id\":$m,\"accept\":\"gate\",\"gate\":\"$WORK/ctl/scenarios\"}" >/dev/null
 done
-record "{\"type\":\"task.gated\",\"id\":1,\"verdict\":\"rejected\",\"revision\":0,\"base\":\"$B\",\"scenarios\":4,\"reason\":\"regression: a scenario fails on the candidate\",\"gate_ms\":600000}" >/dev/null
-record "{\"type\":\"task.gated\",\"id\":2,\"verdict\":\"rejected\",\"revision\":0,\"base\":\"$B\",\"scenarios\":4,\"reason\":\"regression: a scenario fails on the candidate\",\"gate_ms\":900000}" >/dev/null
-record "{\"type\":\"source.moved\",\"source\":\"$SOURCE\",\"request\":901,\"from\":\"$B\",\"to\":\"$C\",\"verdict\":\"accepted\",\"by\":\"human\",\"mission\":1,\"gate_ms\":1200000}" >/dev/null
-record "{\"type\":\"source.moved\",\"source\":\"$SOURCE\",\"request\":902,\"from\":\"$C\",\"to\":\"$B\",\"verdict\":\"accepted\",\"by\":\"human\",\"mission\":1,\"gate_ms\":300000}" >/dev/null
-record "{\"type\":\"source.moved\",\"source\":\"$SOURCE\",\"request\":903,\"from\":\"$B\",\"to\":\"$C\",\"verdict\":\"accepted\",\"by\":\"human\",\"mission\":1,\"gate_ms\":450000}" >/dev/null
+gated() { # <task> <gate_ms>: the task's gate rejected it at base B
+    record "{\"type\":\"task.reported\",\"id\":$1,\"commit\":\"$C\"}" >/dev/null
+    record "{\"type\":\"task.gated\",\"id\":$1,\"verdict\":\"rejected\",\"revision\":0,\"base\":\"$B\",\"scenarios\":4,\"reason\":\"regression: a scenario fails on the candidate\",\"gate_ms\":$2}" >/dev/null
+}
+assign 1 1 >/dev/null
+assign 2 1 >/dev/null
+assign 3 2 >/dev/null
+gated 1 600000
+gated 2 900000
+gated 3 400000
+owner_landing() { # <from> <to> <gate_ms>: requested, judged by mission 1's gate, moved
+    request=$(record "{\"type\":\"source.push_requested\",\"source\":\"$SOURCE\",\"commit\":\"$2\",\"ref\":\"refs/spawn-owner/$2\",\"by\":\"human\",\"gated\":true}")
+    moved=$(psql -d "$SPAWN_DB_NAME" -tA -v ON_ERROR_STOP=1 -c "select spawn_integrator_record('{\"type\":\"source.moved\",\"source\":\"$SOURCE\",\"from\":\"$1\",\"to\":\"$2\",\"request\":$request,\"by\":\"human\",\"verdict\":\"accepted\",\"mission\":1,\"gate_ms\":$3}'::jsonb)" 2>"$WORK/rec.err" | head -n 1)
+    case "$moved" in '' | *[!0-9]*) harness "recording the owner landing of request $request failed: $(head -c 300 "$WORK/rec.err")" ;; esac
+    [ "$(scalar "select kind -> 'detail' -> 'record' ->> 'missions' from spawn_events where id = $moved")" = '[1, 2]' ] ||
+        harness "the store did not name missions 1 and 2 on the owner landing: $(scalar "select kind -> 'detail' -> 'record' from spawn_events where id = $moved")"
+}
+owner_landing "$B" "$C" 1200000
+owner_landing "$C" "$B" 300000
+owner_landing "$B" "$C" 450000
 start_serve
 
 since=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ)
@@ -232,20 +252,22 @@ code=$(curl -s --noproxy '*' -o "$WORK/card.json" -w '%{http_code}' "$base/api/s
 gate() { # <scope filter>: that scope's gate_time {value, n, runs, task_runs, owner_runs}
     jq -c "[.scopes[] | select($1) | .dimensions.gate_time | {value, n, runs, task_runs, owner_runs}]" "$WORK/card.json"
 }
-[ "$(jq -c '[.scopes[] | select(.scope == "mission") | .mission]' "$WORK/card.json")" = '[1]' ] ||
-    harness "the card's mission scopes are not mission 1 alone: $(jq -c '[.scopes[] | {scope, mission}]' "$WORK/card.json")"
+[ "$(jq -c '[.scopes[] | select(.scope == "mission") | .mission] | sort' "$WORK/card.json")" = '[1,2]' ] ||
+    harness "the card's mission scopes are not missions 1 and 2: $(jq -c '[.scopes[] | {scope, mission}]' "$WORK/card.json")"
 
 # --- (1) the fleet's gate time counts the owner's judgings ----------------------------
 
-expect_eq "$(gate '.scope == "fleet"')" '[{"value":600000,"n":5,"runs":5,"task_runs":2,"owner_runs":3}]' \
-    "(1) the fleet's gate_time over two task gatings (10, 15 min) and three owner judgings (20, 5, 7.5 min): the median of the five, with the runs split by whose they were"
+expect_eq "$(gate '.scope == "fleet"')" '[{"value":450000,"n":6,"runs":6,"task_runs":3,"owner_runs":3}]' \
+    "(1) the fleet's gate_time over three task gatings (10, 15, 6.7 min) and three owner judgings (20, 5, 7.5 min): the median of the six (nearest rank), with the runs split by whose they were"
 note "(1) checked: the fleet"
 
 # --- (2) and the mission's, whose gate judged them ----------------------------------------
 
 expect_eq "$(gate '.scope == "mission" and .mission == 1')" '[{"value":600000,"n":5,"runs":5,"task_runs":2,"owner_runs":3}]' \
-    "(2) mission 1's gate_time, its gate having judged all five"
-note "(2) checked: the mission"
+    "(2) mission 1's gate_time: its two tasks' gatings and the three owner judgings its gate ran"
+expect_eq "$(gate '.scope == "mission" and .mission == 2')" '[{"value":null,"n":1,"runs":1,"task_runs":1,"owner_runs":0}]' \
+    "(2) mission 2's gate_time: its one task's gating and none of the owner judgings, though the landings moved its baseline too (\`missions\` names it)"
+note "(2) checked: the missions"
 
 if [ -s "$WORK/failures" ]; then
     asserted=1
