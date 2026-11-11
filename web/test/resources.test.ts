@@ -63,3 +63,73 @@ test("gate room: one row per gated mission, the waiting gates longest first", ()
   assert.equal(normalizeGateRoom(undefined), null, "an older server reports none");
   assert.deepEqual(normalizeGateRoom([]), []);
 });
+
+// What uses the disk (objective 065): the Storage card's words.
+
+import { readFileSync } from "node:fs";
+
+import { normalizeFleet } from "../src/fleet.ts";
+import { normalizeStorage, storageSize, storageView } from "../src/resources.ts";
+
+const MB = 1024 ** 2;
+const STORAGE = {
+  free_bytes: 400 * GIB,
+  read_at_ms: 1_000,
+  archive: { path: "/ws/.transcripts", bytes: 12 * MB, files: 3 },
+  projects: { path: "/home/x/.claude/projects", bytes: MB, files: 3, before: 40 },
+  workspaces: { path: "/ws", bytes: 2 * MB },
+  database: { bytes: 2.7 * GIB, tables: [{ name: "spawn_events", bytes: 2.5 * GIB }, { name: "mission_tasks", bytes: 9 * MB }] },
+  growth_bytes_per_day: 0.07 * GIB,
+  days_left: 5714,
+};
+
+test("a size is MB to one decimal under 1024 MB, GB from there", () => {
+  assert.equal(storageSize(12 * MB), "12.0 MB");
+  assert.equal(storageSize(1023.94 * MB), "1023.9 MB");
+  assert.equal(storageSize(1024 * MB), "1.0 GB");
+  assert.equal(storageSize(3 * GIB), "3.0 GB");
+  assert.equal(storageSize(null), "—");
+});
+
+test("the storage rows say what uses the disk, its growth and Claude Code's fall", () => {
+  const { rows, lasts } = storageView(STORAGE);
+  assert.deepEqual(rows, [
+    { name: "Transcript archive", size: "12.0 MB", note: "grows about 71.7 MB a day" },
+    { name: "Claude Code transcripts", size: "1.0 MB", note: "3 files, down from 40" },
+    { name: "Workspaces", size: "2.0 MB", note: "" },
+    { name: "Database", size: "2.7 GB", note: "largest: spawn_events 2.5 GB" },
+  ]);
+  assert.equal(lasts, "about 5,714 days at the archive's growth");
+});
+
+test("no fall, no growth, no days: the card says so and invents nothing", () => {
+  const steady = storageView({ ...STORAGE, projects: { ...STORAGE.projects, before: 3 } });
+  assert.equal(steady.rows[1].note, "3 files");
+  const grew = storageView({ ...STORAGE, projects: { ...STORAGE.projects, before: 1 } });
+  assert.equal(grew.rows[1].note, "3 files", "a rise is no fall");
+  const unsampled = storageView({ ...STORAGE, projects: { ...STORAGE.projects, before: null } });
+  assert.equal(unsampled.rows[1].note, "3 files");
+  const young = storageView({ ...STORAGE, growth_bytes_per_day: null, days_left: null });
+  assert.deepEqual([young.rows[0].note, young.lasts], ["not measured yet", null]);
+  const bare = storageView(null);
+  assert.deepEqual(
+    bare.rows.map((row) => row.size),
+    ["—", "—", "—", "—"],
+  );
+  assert.equal(bare.lasts, null);
+});
+
+test("the health carries the storage, null from an older server", () => {
+  const fleet = normalizeFleet({ agents: [], health: { storage: STORAGE } });
+  assert.deepEqual(fleet.health.storage, normalizeStorage(STORAGE));
+  assert.equal(fleet.health.storage?.projects?.before, 40);
+  assert.equal(fleet.health.storage?.workspaces?.files, null);
+  assert.equal(normalizeFleet({ agents: [], health: {} }).health.storage, null);
+});
+
+test("the host section's Resources are followed by a Storage card drawn from storageView", () => {
+  const strip = readFileSync(new URL("../src/components/fleet/HealthStrip.tsx", import.meta.url), "utf8");
+  assert.match(strip, /<Cell label="Storage"[^>]*>\s*<StorageCard storage=\{health\.storage\} \/>/);
+  assert.match(strip, /const \{ rows, lasts \} = storageView\(storage\)/);
+  assert.ok(strip.indexOf('label="Resources"') < strip.indexOf('label="Storage"'));
+});
