@@ -25,9 +25,15 @@ use crate::PostgresStore;
 ///   its close; `null` while open at `$2`), and `owner_work`: whether
 ///   its last configuration before `$2` (`mission.configured` or a legacy
 ///   mission row) left it with no objective backlog (`objectives` not an
-///   object), so its work comes from the owner (objective 062). A mission
-///   never configured has declared neither and is not owner work: its idle
-///   flag stays as before (objective 043).
+///   object), so its work comes from the owner (objective 062). The last
+///   record is the mission's configuration as its fold has it
+///   (`mission_missions`, what `/api/rsi` shows): every configure records
+///   every setting (`spawn mission configure` merges its change into the
+///   row, `spawn_mission_reconfigure`), and the fold replaces them, so a
+///   later configure that names only `accept` or a budget keeps the backlog
+///   (S22; tests/experience.rs). A mission never configured has declared
+///   neither and is not owner work: its idle flag stays as before
+///   (objective 043).
 const WINDOW: &str = r"
 with
   decided as (
