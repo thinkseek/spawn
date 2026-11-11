@@ -39,7 +39,11 @@
 //!   `aborted` or `stale` gating) is no notice.
 //! - `mission_state`, `mission #<id>`, key `mission_state:<mission>:<event>`:
 //!   a record after which any of the mission's `state`, `halted`,
-//!   `gate_rejections`, `gate_aborts`, `gate_room_escalated` differs.
+//!   `gate_rejections`, `gate_aborts`, `gate_room_escalated` differs. The
+//!   step folds `gate_rejections` as the store does, with the run's
+//!   objective (`gate_rejection_objective`, read back on start): a cancel of
+//!   a task of the objective every rejection of the run was ends the run
+//!   (objective 053).
 //! - `gate_base_disagrees`, `mission #<id>`, key
 //!   `gate_base_disagrees:<event>`: a `task.gated` host fault with
 //!   `base_disagrees` and `alert` true (objective 033).
@@ -446,6 +450,10 @@ struct Mission {
     state: String,
     halted: Option<String>,
     rejections: i64,
+    /// The objective of every rejection in the run of `rejections`, as the
+    /// fold keeps it (`gate_rejection_objective`): a cancel of a task of it
+    /// ends the run.
+    run_objective: Option<i64>,
     aborts: i64,
     escalated: bool,
     accept: Option<String>,
@@ -673,6 +681,7 @@ impl Monitor {
                     state: mission["state"].as_str().unwrap_or("open").to_string(),
                     halted: mission["halted"].as_str().map(str::to_string),
                     rejections: mission["gate_rejections"].as_i64().unwrap_or_default(),
+                    run_objective: mission["gate_rejection_objective"].as_i64(),
                     aborts: mission["gate_aborts"].as_i64().unwrap_or_default(),
                     escalated: mission["gate_room_escalated"].as_bool().unwrap_or(false),
                     accept: mission["accept"].as_str().map(str::to_string),
@@ -941,6 +950,7 @@ impl Monitor {
                 state: "open".to_string(),
                 halted: None,
                 rejections: 0,
+                run_objective: None,
                 aborts: 0,
                 escalated: false,
                 accept: None,
@@ -1103,6 +1113,13 @@ the base, unsolved on it (task #{task}'s gate)"
         if kind == "task.gated" && guarded {
             self.gating(event_id, id, task.mission, record, out);
         }
+        if kind == "task.cancelled" {
+            // Whoever cancels it (a yield, the owner, an objective solved on
+            // the base), as the fold: a cancel of the run's objective ends it.
+            self.mission_change(event_id, task.mission, kind, out, |mission| {
+                apply_cancel(mission, task.objective);
+            });
+        }
         let after = task_state_after(record, accept_gate, task.revisions);
         if let Some(after) = after {
             if bumps_revision(record)
@@ -1145,6 +1162,40 @@ the base, unsolved on it (task #{task}'s gate)"
         }
     }
 
+    /// The `mission_state` notice of a record after which a mission's
+    /// watched fields differ (`change` applies the record's fold).
+    fn mission_change(
+        &mut self,
+        event_id: i64,
+        mission_id: i64,
+        kind: &str,
+        out: &mut Vec<Event>,
+        change: impl FnOnce(&mut Mission),
+    ) {
+        let Some(mission) = self.missions.get_mut(&mission_id) else {
+            return;
+        };
+        let before = snapshot(mission);
+        change(mission);
+        let after = snapshot(mission);
+        if before != after {
+            out.push(Event::Fire {
+                key: format!("mission_state:{mission_id}:{event_id}"),
+                kind: "mission_state",
+                subject: format!("mission #{mission_id}"),
+                evidence: json!({
+                    "mission": mission_id, "record": kind, "event_id": event_id,
+                    "before": before, "after": after,
+                }),
+                text: format!(
+                    "mission #{mission_id}: {} (by {kind})",
+                    changed(&before, &after)
+                ),
+                notice: true,
+            });
+        }
+    }
+
     /// A gating's mission counters, and 033's base disagreement.
     fn gating(
         &mut self,
@@ -1154,27 +1205,10 @@ the base, unsolved on it (task #{task}'s gate)"
         record: &Value,
         out: &mut Vec<Event>,
     ) {
-        if let Some(mission) = self.missions.get_mut(&mission_id) {
-            let before = snapshot(mission);
-            apply_gating(mission, record);
-            let after = snapshot(mission);
-            if before != after {
-                out.push(Event::Fire {
-                    key: format!("mission_state:{mission_id}:{event_id}"),
-                    kind: "mission_state",
-                    subject: format!("mission #{mission_id}"),
-                    evidence: json!({
-                        "mission": mission_id, "record": "task.gated", "event_id": event_id,
-                        "before": before, "after": after,
-                    }),
-                    text: format!(
-                        "mission #{mission_id}: {} (by task.gated)",
-                        changed(&before, &after)
-                    ),
-                    notice: true,
-                });
-            }
-        }
+        let objective = self.tasks.get(&task).and_then(|task| task.objective);
+        self.mission_change(event_id, mission_id, "task.gated", out, |mission| {
+            apply_gating(mission, record, objective);
+        });
         self.red_scenarios(event_id, task, mission_id, record, out);
         self.task_defects(event_id, task, mission_id, record, out);
         if base_disagrees(record).is_some() {
@@ -2668,6 +2702,7 @@ fn apply_mission(mission: &mut Mission, record: &Value) {
         "mission.resumed" => {
             mission.halted = None;
             mission.rejections = 0;
+            mission.run_objective = None;
             mission.aborts = 0;
             mission.escalated = false;
         }
@@ -2682,11 +2717,23 @@ fn apply_mission(mission: &mut Mission, record: &Value) {
     }
 }
 
-/// The fold's counter changes of a gating.
-fn apply_gating(mission: &mut Mission, record: &Value) {
+/// The fold's counter changes of a gating of a task of `objective`.
+fn apply_gating(mission: &mut Mission, record: &Value, objective: Option<i64>) {
     match record["verdict"].as_str().unwrap_or_default() {
-        "rejected" => mission.rejections += 1,
-        "accepted" => mission.rejections = 0,
+        "rejected" => {
+            // The run's objective: the first rejection's task's, kept while
+            // every later one is a task of the same objective.
+            mission.run_objective = if mission.rejections == 0 {
+                objective
+            } else {
+                mission.run_objective.filter(|run| Some(*run) == objective)
+            };
+            mission.rejections += 1;
+        }
+        "accepted" => {
+            mission.rejections = 0;
+            mission.run_objective = None;
+        }
         _ => {}
     }
     match record["verdict"].as_str().unwrap_or_default() {
@@ -2700,6 +2747,15 @@ fn apply_gating(mission: &mut Mission, record: &Value) {
         }
         "stale" => {}
         _ => mission.escalated = false,
+    }
+}
+
+/// The fold's change of a cancel of a task of `objective`: one of the
+/// objective every rejection of the mission's run was ends that run.
+fn apply_cancel(mission: &mut Mission, objective: Option<i64>) {
+    if objective.is_some() && mission.run_objective == objective {
+        mission.rejections = 0;
+        mission.run_objective = None;
     }
 }
 
@@ -3464,6 +3520,122 @@ mod tests {
             assert_eq!(evidence["after"]["gate_aborts"], aborts);
             assert_eq!(evidence["before"]["gate_aborts"], aborts - 1);
         }
+    }
+
+    /// The `gate_rejections` change a record's notices say: "<before> ->
+    /// <after> (by <record>)", or `None` when none says it.
+    fn rejections_change(events: &[Event]) -> Option<String> {
+        events.iter().find_map(|event| match event {
+            Event::Fire {
+                kind: "mission_state",
+                evidence,
+                ..
+            } if evidence["before"]["gate_rejections"] != evidence["after"]["gate_rejections"] => {
+                Some(format!(
+                    "{} -> {} (by {})",
+                    evidence["before"]["gate_rejections"],
+                    evidence["after"]["gate_rejections"],
+                    evidence["record"].as_str().unwrap_or_default()
+                ))
+            }
+            _ => None,
+        })
+    }
+
+    /// Objective 053: a cancel of a task of the objective every rejection
+    /// of the run was ends the run, with its notice; a cancel outside the
+    /// run (another objective, a run of two, a task with none) changes
+    /// nothing, as the store's fold.
+    #[test]
+    fn a_cancel_that_ends_the_run_of_rejections_is_a_notice_as_the_fold() {
+        let mut monitor = monitor();
+        feed(
+            &mut monitor,
+            1,
+            0,
+            json!({"type": "mission.added", "id": 4, "text": "m"}),
+        );
+        for (task, objective) in [
+            (1, json!(1)),
+            (2, json!(2)),
+            (3, json!(3)),
+            (4, Value::Null),
+        ] {
+            feed(
+                &mut monitor,
+                1 + task,
+                0,
+                json!({"type": "task.assigned", "id": task, "mission_id": 4,
+                       "agent_id": format!("agent_{task}"), "objective": objective}),
+            );
+        }
+        let mut event = 10;
+        let mut gate = |monitor: &mut Monitor, task: i64, verdict: &str| {
+            event += 1;
+            feed(
+                monitor,
+                event,
+                0,
+                json!({"type": "task.gated", "id": task, "verdict": verdict}),
+            )
+        };
+        let cancel = |monitor: &mut Monitor, event: i64, task: i64| {
+            feed(
+                monitor,
+                event,
+                0,
+                json!({"type": "task.cancelled", "id": task}),
+            )
+        };
+        for want in ["0 -> 1", "1 -> 2", "2 -> 3"] {
+            let events = gate(&mut monitor, 1, "rejected");
+            assert_eq!(
+                rejections_change(&events),
+                Some(format!("{want} (by task.gated)"))
+            );
+        }
+        // A cancel of another objective's task: nothing.
+        assert_eq!(rejections_change(&cancel(&mut monitor, 20, 2)), None);
+        // The yield of objective 1: the run ends.
+        let yielded = cancel(&mut monitor, 21, 1);
+        assert_eq!(
+            rejections_change(&yielded),
+            Some("3 -> 0 (by task.cancelled)".into())
+        );
+        let Some(Event::Fire { text, .. }) = yielded.first() else {
+            panic!("a notice: {yielded:?}");
+        };
+        assert_eq!(
+            text,
+            "mission #4: gate_rejections 3 -> 0 (by task.cancelled)"
+        );
+        // Cancelled again: the run is gone, nothing more.
+        assert_eq!(rejections_change(&cancel(&mut monitor, 22, 1)), None);
+
+        // A run of two objectives: a cancel of either ends nothing.
+        gate(&mut monitor, 2, "rejected");
+        gate(&mut monitor, 3, "rejected");
+        assert_eq!(rejections_change(&cancel(&mut monitor, 23, 3)), None);
+        assert_eq!(rejections_change(&cancel(&mut monitor, 24, 2)), None);
+        let events = gate(&mut monitor, 3, "rejected");
+        assert_eq!(
+            rejections_change(&events),
+            Some("2 -> 3 (by task.gated)".into())
+        );
+        // An accept ends it; a run of a task with no objective is no cancel's.
+        gate(&mut monitor, 3, "accepted");
+        gate(&mut monitor, 4, "rejected");
+        assert_eq!(rejections_change(&cancel(&mut monitor, 25, 4)), None);
+        // A resume ends the run and its objective: a cancel after says nothing.
+        gate(&mut monitor, 4, "accepted");
+        gate(&mut monitor, 3, "rejected");
+        feed(
+            &mut monitor,
+            26,
+            0,
+            json!({"type": "mission.resumed", "id": 4}),
+        );
+        assert_eq!(rejections_change(&cancel(&mut monitor, 27, 3)), None);
     }
 
     #[test]
@@ -4785,6 +4957,53 @@ connections\n";
             let mut monitor = Monitor::with(settings());
             monitor.check(store).expect("the step checks");
             monitor
+        }
+
+        /// Objective 053: a step started on a run of rejections (a restart)
+        /// knows the run's objective from the store, so the cancel of its
+        /// task fires the notice the store's fold agrees with.
+        #[test]
+        fn a_restarted_step_knows_the_runs_objective_and_its_cancel() {
+            in_schema("alerts_run_cancel", |store, client| {
+                record(
+                    client,
+                    3,
+                    r#"{"type":"mission.added","id":1,"text":"m","origin":"human","sources":[]}"#,
+                );
+                record(
+                    client,
+                    3,
+                    r#"{"type":"task.assigned","id":5,"mission_id":1,"kind":"ephemeral",
+                        "agent_id":"agent_w","session_id":"session_w","brief":"b",
+                        "created_by":"spawn-integrate","objective":5}"#,
+                );
+                for _ in 0..2 {
+                    record(
+                        client,
+                        2,
+                        r#"{"type":"task.gated","id":5,"verdict":"rejected"}"#,
+                    );
+                }
+                refold(client);
+                let mut monitor = started(store);
+                let cancelled = record(client, 0, r#"{"type":"task.cancelled","id":5}"#);
+                refold(client);
+                monitor.check(store).expect("the step checks");
+                let (text, folded): (String, i32) = client
+                    .query_one(
+                        "select a.text, m.gate_rejections
+                           from spawn_alerts a, mission_missions m
+                          where a.key = $1 and m.id = 1",
+                        &[&format!("mission_state:1:{cancelled}")],
+                    )
+                    .map(|row| (row.get(0), row.get(1)))
+                    .expect("the cancel's notice");
+                assert_eq!(
+                    text,
+                    "mission #1: gate_rejections 2 -> 0 (by task.cancelled)"
+                );
+                assert_eq!(folded, 0, "the store's count");
+            });
         }
 
         #[test]
