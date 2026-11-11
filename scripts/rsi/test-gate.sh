@@ -572,6 +572,28 @@ tools=$(commit tools)
 expect "a tool under \$HOME runs, its neighbours and ~/.bun stay hidden" \
     "$(PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH" judge "$tools")" 'exit=0 {"verdict":"accepted"}'
 
+# 3b''. The owner's cargo config does not reach the sandbox: it may name a
+# compiler cache as rustc-wrapper (kache), whose daemon and TMPDIR files
+# have no place in a gate (054, 2026-11-11). The private CARGO_HOME still
+# has the real registry and git caches.
+owner_cargo=$work/owner-cargo
+mkdir -p "$owner_cargo/registry/index" "$owner_cargo/git/db"
+printf '[build]\nrustc-wrapper = "owner-wrapper"\n' >"$owner_cargo/config.toml"
+printf '[build]\nrustc-wrapper = "owner-wrapper"\n' >"$owner_cargo/config"
+branch cargo-config
+printf 'two\n' >"$seed/value"
+cat >"$seed/probe.sh" <<'EOF'
+#!/bin/sh
+[ -d "$CARGO_HOME/registry/index" ] || { echo "no registry in $CARGO_HOME"; exit 1; }
+[ -d "$CARGO_HOME/git/db" ] || { echo "no git cache in $CARGO_HOME"; exit 1; }
+for name in config.toml config; do
+    [ ! -e "$CARGO_HOME/$name" ] || { echo "sees the owner's cargo $name"; exit 1; }
+done
+EOF
+cargo_config=$(commit cargo-config)
+expect "the owner's cargo config is not in the sandbox; its registry and git caches are" \
+    "$(CARGO_HOME="$owner_cargo" judge "$cargo_config")" 'exit=0 {"verdict":"accepted"}'
+
 # 3c. No network but loopback: a host listener and the live database port
 # are unreachable; the sandbox's own loopback works.
 listener=$work/listener.port
