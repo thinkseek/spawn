@@ -30,6 +30,18 @@ check() {
 }
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/test-nightly.XXXXXX")
+# A scratch HOME for the test itself too, not only for the nightly it runs
+# (cc-rules (a)): nothing here reads or writes the real home.
+real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+export HOME=$scratch/home
+# Checked before anything is made in it; the empty scratch goes on a refusal.
+case $HOME/ in "${real_home:-/nonexistent}"/*)
+  echo "test-nightly: refused: HOME $HOME is in the real home $real_home; nothing ran" >&2
+  rmdir "$scratch"
+  exit 2
+  ;;
+esac
+mkdir -p "$HOME"
 # shellcheck source=scripts/pg-url.sh
 . "$here/scripts/pg-url.sh"
 pg_url_export "$SPAWN_TEST_DATABASE_URL" || {
