@@ -2782,10 +2782,9 @@ mod tests {
     /// A repository with `main` checked out, an agent branch with one
     /// checkpoint mounted, and `main` moved on by a new file: a clean merge
     /// is due. Returns the checkout, the store, the workspace and the base
-    /// directory.
-    fn due_merge(tag: &str) -> (PathBuf, GitWorkspace, WorkspaceId, PathBuf) {
-        let base = std::env::temp_dir().join(format!("spawn-git-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+    /// directory (removed when the test ends).
+    fn due_merge(tag: &str) -> (PathBuf, GitWorkspace, WorkspaceId, crate::Scratch) {
+        let base = crate::Scratch::new(&format!("spawn-git-{tag}"));
         let checkout = base.join("repo");
         std::fs::create_dir_all(&checkout).expect("create the repository");
         git(&checkout, &["init", "-q", "--initial-branch=main"]);
@@ -3010,9 +3009,8 @@ mod tests {
 
     /// A repository with `main`, and `agent_a` mounted under `<base>/work`
     /// by a store whose cap for one file is 1 MiB.
-    fn capped(tag: &str) -> (PathBuf, GitWorkspace, WorkspaceId, PathBuf) {
-        let base = std::env::temp_dir().join(format!("spawn-git-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+    fn capped(tag: &str) -> (PathBuf, GitWorkspace, WorkspaceId, crate::Scratch) {
+        let base = crate::Scratch::new(&format!("spawn-git-{tag}"));
         let checkout = base.join("repo");
         std::fs::create_dir_all(&checkout).expect("create the repository");
         git(&checkout, &["init", "-q", "--initial-branch=main"]);

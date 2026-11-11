@@ -50,9 +50,13 @@ impl Scratch {
         &self.path
     }
 
-    /// A path inside the directory.
-    pub fn join(&self, name: impl AsRef<Path>) -> PathBuf {
-        self.path.join(name)
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
     }
 }
 
