@@ -659,7 +659,7 @@ export function doingWords(agent: FleetAgent, task: TaskRef | null): string {
   if (tool) return `running ${tool}`;
   const job = activity.jobs[0];
   if (job) return `waiting on its background ${job.kind} job`;
-  if (task && task.label !== "assigned" && task.label !== "delivered" && agent.state !== "WORKING") return task.label;
+  if (task && task.state !== "assigned" && task.state !== "delivered" && agent.state !== "WORKING") return task.label;
   return STATE_WORDS[agent.state] ?? agent.state.toLowerCase();
 }
 
