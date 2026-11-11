@@ -5052,24 +5052,25 @@ from spawn_human_intents i;
 -- `resume`, a `mission.resumed`; `owner_task`, a task a person assigned on
 -- a mission accepted by review; `cancel_reassign`, a person's cancellation
 -- of an open task followed by the same work (the same objective, or without
--- one the same brief) assigned again in the mission, at that assignment.
+-- one the same brief) assigned again in the mission, at that assignment
+-- (`task_id` the new task, `cancelled_task_id` the one cancelled).
 create or replace view spawn_interventions as
 select i.at_ms, 'command'::text as kind, null::bigint as mission_id,
-       null::bigint as task_id, i.intent as command_id
+       null::bigint as task_id, i.intent as command_id, null::bigint as cancelled_task_id
 from spawn_human_intents i
 union all
-select r.at_ms, 'resume', spawn_experience_int(r.record -> 'id'), null, null
+select r.at_ms, 'resume', spawn_experience_int(r.record -> 'id'), null, null, null
 from spawn_experience_records r
 where r.type = 'mission.resumed' and spawn_experience_int(r.record -> 'id') is not null
 union all
-select a.assigned_at_ms, 'owner_task', a.mission_id, a.task_id, null
+select a.assigned_at_ms, 'owner_task', a.mission_id, a.task_id, null, null
 from spawn_experience_assignments a
 where a.type = 'task.assigned' and a.created_by = 'human'
   and coalesce((select s.review from spawn_experience_settings s
                  where s.mission_id = a.mission_id and s.seq < a.seq
                  order by s.seq desc limit 1), true)
 union all
-select n.assigned_at_ms, 'cancel_reassign', t.mission_id, n.task_id, null
+select n.assigned_at_ms, 'cancel_reassign', t.mission_id, n.task_id, null, t.task_id
 from spawn_task_spans t
 join spawn_experience_records x on x.seq = t.closed_seq
 cross join lateral (
