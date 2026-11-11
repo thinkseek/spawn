@@ -119,6 +119,17 @@
 //!   current execution has ended fires nothing; clears when the latest
 //!   one is under 0.5, or when the session's current execution has ended,
 //!   whatever the cause (stopped, exited, lost), with that end as evidence.
+//!   An alert is a claim that someone must act (objective 057): none fires
+//!   for a worker whose task is past its part (reported, gated, accepted,
+//!   landing or held, landed: it waits on the gate, a reviewer or the
+//!   owner), its open one clearing at the task record that moved it (that
+//!   record's id its `event_id`), nor for the supervisor with nothing to
+//!   dispatch (no question to the owner, no pending or told escalation of
+//!   the attention view but a worker's own judgement while it holds its
+//!   task, no mission of its own waiting for its first task), its open one
+//!   clearing at the first pass that finds so. A worker's alert names its
+//!   `task` and `command`, the one command that acts on it: `spawn task
+//!   restart --id <task>` (a delivered task's).
 //! - `judge_down`, the judge's name (`jev`), key `judge_down:<its
 //!   host.judge down event>`: the model judge's watcher recorded `down` (two
 //!   calls in a row failed after its last answer, crate judge_watch.rs) and
