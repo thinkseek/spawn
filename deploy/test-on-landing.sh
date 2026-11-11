@@ -21,7 +21,8 @@
 #
 # Covered: a live main deploys nothing; a main nothing gate-accepted landed
 # deploys nothing; the debounce waits for a quiet spell and the max wait
-# bounds it; a held source, a pending deploy, a red nightly (until it is
+# bounds it; a held source, an owner's landing request with no outcome
+# (S23), a pending deploy, a red nightly (until it is
 # green), a busy deploy lock and the off switch each make the tick wait,
 # and say so once; the deploy runs main's own deploy.sh --main from the
 # checkout at main while the source is held with this script's reason; a
@@ -180,6 +181,7 @@ tick() {
 deploys() { wc -l <"$FAKE_LOG"; }
 live_commit() { readlink "$live/controllers/spawn"; }
 holds() { spawn_live mission landing --source "$missions" | jq -c '.hold'; }
+holds_request() { spawn_live mission landing --source "$missions" | jq -c '.owner_request'; }
 finished() {
   sql "select r ->> 'ok' || ' ' || (r ->> 'by') || ' ' || (r ->> 'head') || ' ' || (r ->> 'reason')
          from (select kind -> 'detail' -> 'record' as r, session_seq from spawn_events
@@ -216,6 +218,30 @@ tick SPAWN_DEPLOY_QUIET_SECS=1
 check "not deployed" [ "$(deploys)" -eq 0 ]
 check "says who holds it" grep -qF "main $c1 waits: the source is held (owner gate $c1)" "$out"
 spawn_live mission release --source "$missions" >/dev/null
+
+echo "== an owner's landing request in judging (S23)"
+# As spawn mission push records it (the owner's commit waits at its ref);
+# the source names it as on-landing reads it.
+request=$(sql "select spawn_source_push_request('$missions', '$c1', 'refs/spawn-owner/$c1')")
+other=$(sql "select spawn_source_push_request('$missions', '$c0', 'refs/spawn-owner/$c0')")
+# Past the 1 s quiet spell, so nothing but the request holds the deploy.
+sleep 2
+tick SPAWN_DEPLOY_QUIET_SECS=1
+check "not deployed" [ "$(deploys)" -eq 0 ]
+check "says the owner's request waits, the oldest named" \
+  grep -qF "main $c1 waits: the owner's landing request $request ($c1) is waiting for its judging or in it" "$out"
+tick SPAWN_DEPLOY_QUIET_SECS=1
+check "said once" [ ! -s "$out" ]
+# Its outcome, as the integrator records one: refused names the request.
+sql "select spawn_integrator_record(jsonb_build_object('type', 'source.push_refused',
+       'request', $request, 'reason', 'test-on-landing: refused'))" >/dev/null
+tick SPAWN_DEPLOY_QUIET_SECS=1
+check "the next pending request still holds the deploy" \
+  grep -qF "main $c1 waits: the owner's landing request $other ($c0)" "$out"
+check "still not deployed" [ "$(deploys)" -eq 0 ]
+sql "select spawn_integrator_record(jsonb_build_object('type', 'source.push_refused',
+       'request', $other, 'reason', 'test-on-landing: refused'))" >/dev/null
+check "no request left: the store says none" [ "$(holds_request)" = null ]
 
 echo "== a pending deploy"
 echo "$c0 $c1" >"$live/deploy.pending"
