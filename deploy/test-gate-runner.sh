@@ -6,7 +6,10 @@
 # bare repository and scenario directories, with a PostgreSQL of the host's
 # own (SPAWN_GATE_PG_BIN, as a real runner has).
 #
-#   deploy/test-gate-runner.sh
+#   TMPDIR=<a short directory on the disk, outside /tmp and your home> deploy/test-gate-runner.sh
+#
+# It runs under a scratch HOME (cc-rules (a)): nothing of the real home is
+# read but the toolchain (CARGO_HOME, RUSTUP_HOME) or written.
 #
 # Covered: the success path (the gate's verdict and log come back, the
 # record names one attempt); a stage timeout (the runner's own `timeout`
@@ -53,13 +56,32 @@ command -v bwrap >/dev/null 2>&1 || {
     exit 1
 }
 
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/gate-runner-test.XXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/grt.XXXXXX")
+# Never the real home (cc-rules (a), 2026-11-12): HOME is the scratch's, and
+# everything this suite puts "under \$HOME" (the runner's root, the short
+# directory, the long root of 8o) is in the scratch. The scratch must be on
+# the disk, out of /tmp, /run and /var/tmp (the gate's sandbox empties those,
+# and setup.sh refuses a root there), and out of the real home: run with
+# TMPDIR=<a short directory on the disk>, e.g. /data/tmp/<you>. The
+# toolchain is named from the real home first (cargo and rustup find their
+# homes through these).
+real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+case $(readlink -f -- "$scratch")/ in
+/tmp/* | /run/* | /var/tmp/* | "$(readlink -f -- "${real_home:-/nonexistent}")"/*)
+    printf '%s: refused: the scratch %s is under /tmp, /run, /var/tmp or the real home; set TMPDIR to a short directory on the disk elsewhere; nothing ran\n' "$prog" "$scratch" >&2
+    rmdir -- "$scratch"
+    exit 2
+    ;;
+esac
+export CARGO_HOME=${CARGO_HOME:-$real_home/.cargo} RUSTUP_HOME=${RUSTUP_HOME:-$real_home/.rustup}
+export HOME=$scratch/home
+mkdir -p "$HOME"
 runner_home=""
 badroot=""
 otherfs=""
 # A long root moves a job's scratch to the short directory (the socket path
-# limit): this suite's own, so nothing of a real runner's is touched.
-export GATE_RUNNER_SHORT="$HOME/.grs-test-$$"
+# limit): this suite's own, in its scratch, short (8o asserts how short).
+export GATE_RUNNER_SHORT="$scratch/s"
 short_before=""
 cleanup() {
     chmod -R u+w "$scratch" "$runner_home" 2>/dev/null || true
@@ -85,7 +107,7 @@ mkdir -p "$XDG_CACHE_HOME"
 # A throwaway repository: one base, one candidate that changes `value`.
 repo_git=$scratch/repo.git
 seed=$scratch/seed
-git init -q --bare "$repo_git"
+git init -q --bare --initial-branch=main "$repo_git"
 git init -q --initial-branch=main "$seed"
 git -C "$seed" config user.name t
 git -C "$seed" config user.email t@localhost
@@ -344,6 +366,9 @@ envfile=$scratch/gate-env
     printf 'SPAWN_INTEGRATE_PID=%s\0' $$
     printf 'PATH=%s\0' "$PATH"
     printf 'HOME=%s\0' "$HOME"
+    # The toolchain's homes: this suite's HOME is a scratch one (above).
+    printf 'CARGO_HOME=%s\0' "$CARGO_HOME"
+    printf 'RUSTUP_HOME=%s\0' "$RUSTUP_HOME"
     [ -z "${LANG-}" ] || printf 'LANG=%s\0' "$LANG"
     printf 'SPAWN_GATE_JOBS=2\0'
     printf 'SPAWN_GATE_MIN_FREE_GB=0\0'
@@ -793,6 +818,12 @@ attempt=$(jq -r '.attempts[-1].id' "$job/record.json")
 [ -n "$attempt" ] && [ -d "$GATE_RUNNER_SHORT/$attempt" ] && pass "its scratch was the short directory, on the disk" ||
     fail "no scratch in $GATE_RUNNER_SHORT for attempt $attempt: $(ls -A "$GATE_RUNNER_SHORT" 2>/dev/null)"
 [ ! -e "/tmp/gate-runner/$attempt" ] && pass "and not /tmp/gate-runner" || fail "the scratch went to /tmp/gate-runner/$attempt"
+# The short directory must leave the gate's socket room: <short>/<attempt>
+# plus the ~40 bytes remote.sh allows for it, within 107. A scratch that
+# drifted longer fails here, by name, not as a socket error further on.
+short_len=$((${#GATE_RUNNER_SHORT} + 1 + ${#attempt} + 40))
+[ "$short_len" -le 107 ] && pass "the short scratch leaves the socket room ($short_len of 107 bytes)" ||
+    fail "the short scratch $GATE_RUNNER_SHORT/$attempt plus 40 is $short_len bytes, over 107: run with a shorter TMPDIR"
 "$longroot/bin/remote" remove "$attempt" >/dev/null 2>&1 || true
 [ ! -e "$GATE_RUNNER_SHORT/$attempt" ] && pass "and removing the job removes its short scratch" ||
     fail "the short scratch outlived its job"
