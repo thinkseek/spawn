@@ -799,7 +799,9 @@ fn owner_lines(text: &str) -> Vec<&str> {
         if under_heading {
             if let Some(item) = list_item(line) {
                 // An item that is itself an inline line keeps only its words.
-                let words = for_owner(item).filter(|words| !words.is_empty()).unwrap_or(item);
+                let words = for_owner(item)
+                    .filter(|words| !words.is_empty())
+                    .unwrap_or(item);
                 if !words.is_empty() {
                     lines.push(words);
                 }
