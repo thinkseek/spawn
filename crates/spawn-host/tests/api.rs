@@ -47,6 +47,23 @@ fn start_session(host: &TmuxHost, launch: &Launch) -> Result<(), TerminalError> 
     Err(last.expect("one attempt"))
 }
 
+/// `program`'s host, keeping in `scratch` what it would keep in
+/// `$XDG_RUNTIME_DIR` (backlog S20: no test writes in or removes from the
+/// real one).
+fn host_in(scratch: &Scratch, program: &str) -> TmuxHost {
+    TmuxHost::local(program).with_runtime_under(runtime(scratch))
+}
+
+/// The runtime directory in `scratch`, private (0700) as the real one is.
+fn runtime(scratch: &Scratch) -> PathBuf {
+    let directory = scratch.join("run");
+    if !directory.is_dir() {
+        fs::create_dir(&directory).expect("runtime");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).expect("0700");
+    }
+    directory
+}
+
 /// A directory of one test's own (its fake executables, its logs), removed
 /// when the test ends.
 fn scratch(tag: &str) -> Scratch {
@@ -469,7 +486,7 @@ fn launch(name: &TerminalName) -> Launch {
 fn tmux_types_into_a_terminal_and_sees_the_echo() {
     let _exclusive = exclusive();
     let tmux = isolated_tmux("echo");
-    let host = TmuxHost::local(&tmux.program);
+    let host = host_in(&tmux.scratch, &tmux.program);
     let name = terminal("echo");
     start_session(&host, &launch(&name)).expect("start succeeds");
 
@@ -519,7 +536,7 @@ fn tmux_types_into_a_terminal_and_sees_the_echo() {
 fn tmux_stages_a_text_longer_than_its_message_size() {
     let _exclusive = exclusive();
     let tmux = isolated_tmux("long");
-    let host = TmuxHost::local(&tmux.program);
+    let host = host_in(&tmux.scratch, &tmux.program);
     let name = terminal("long");
     start_session(&host, &launch(&name)).expect("start succeeds");
 
@@ -571,7 +588,7 @@ fn a_launchs_environment_never_reaches_a_command_line() {
             tmux.program
         ),
     );
-    let host = TmuxHost::local(&logging);
+    let host = host_in(&tmux.scratch, &logging);
     let name = terminal("environment");
     let mut launched = launch(&name);
     let secret = "postgres://spawn_supervisor_x:s3cret-0f9a@127.0.0.1:5432/spawn";
@@ -612,10 +629,7 @@ fn a_launchs_environment_never_reaches_a_command_line() {
         !lines.contains("second line"),
         "a value on tmux's command line"
     );
-    let directory = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_dir())
-        .unwrap_or_else(std::env::temp_dir);
+    let directory = runtime(&tmux.scratch);
     let left: Vec<_> = fs::read_dir(&directory)
         .expect("read the directory")
         .filter_map(Result::ok)
@@ -633,7 +647,7 @@ fn a_launchs_environment_never_reaches_a_command_line() {
 fn tmux_rejects_a_duplicate_terminal() {
     let _exclusive = exclusive();
     let tmux = isolated_tmux("dup");
-    let host = TmuxHost::local(&tmux.program);
+    let host = host_in(&tmux.scratch, &tmux.program);
     let name = terminal("dup");
     start_session(&host, &launch(&name)).expect("start succeeds");
     let error = host
@@ -647,7 +661,7 @@ fn tmux_rejects_a_duplicate_terminal() {
 fn tmux_matches_the_session_name_exactly() {
     let _exclusive = exclusive();
     let tmux = isolated_tmux("exact");
-    let host = TmuxHost::local(&tmux.program);
+    let host = host_in(&tmux.scratch, &tmux.program);
     let first = terminal("a");
     let second = terminal("ab");
     for name in [&first, &second] {
@@ -667,7 +681,7 @@ fn tmux_matches_the_session_name_exactly() {
 fn tmux_starts_in_the_launch_directory() {
     let _exclusive = exclusive();
     let tmux = isolated_tmux("cwd");
-    let host = TmuxHost::local(&tmux.program);
+    let host = host_in(&tmux.scratch, &tmux.program);
     let name = terminal("cwd");
     let mut started = launch(&name);
     started.program = "/bin/sh".to_string();
@@ -696,7 +710,7 @@ fn files_are_written_new_on_the_host() {
     let scratch = scratch("write-new");
     let directory = scratch.join("write-new");
     let _ = fs::remove_dir_all(&directory);
-    let local = TmuxHost::local("tmux");
+    let local = host_in(&scratch, "tmux");
     contract::terminal_files("local", &local, &directory.to_string_lossy());
     let big: Vec<u8> = (0..=255u8).cycle().take(300_000).collect();
     let path = directory.join("local/big.jsonl");
@@ -739,7 +753,8 @@ fn a_host_on_a_socket_runs_tmux_on_that_server() {
             calls = calls.display()
         ),
     );
-    let host = TmuxHost::on_socket(&logging, Some(socket.clone()));
+    let host = TmuxHost::on_socket(&logging, Some(socket.clone()))
+        .with_runtime_under(runtime(&server.scratch));
     let name = terminal("socket");
     start_session(&host, &launch(&name)).expect("start on the socket");
     assert!(host.is_alive(&name, &workspace()).expect("is_alive"));
@@ -762,7 +777,7 @@ fn a_capture_from_a_tmux_that_never_answers_fails_in_time() {
     let _exclusive = exclusive();
     let scratch = scratch("hung");
     let hung = script(&scratch, "fake-tmux-hung", "#!/bin/sh\nexec sleep 60\n");
-    let host = TmuxHost::local(&hung);
+    let host = host_in(&scratch, &hung);
     let started = std::time::Instant::now();
     let captured = host.capture_tail(&terminal("hung"), &workspace(), 20);
     let took = started.elapsed();
@@ -781,7 +796,7 @@ fn the_adapters_pass_the_shared_contract() {
     let (_scratch, repo, root) = repository("contract");
     contract::workspace_store("host_ws", &GitWorkspace::new(&repo, &root));
     let tmux = isolated_tmux("contract");
-    let host = TmuxHost::local(&tmux.program);
+    let host = host_in(&tmux.scratch, &tmux.program);
     // A second session keeps the private server up: killing its last session
     // shuts it down, and a `has-session` racing that shutdown fails with
     // "server exited unexpectedly" instead of reporting the terminal gone.
@@ -811,7 +826,7 @@ fn a_terminal_server_is_told_by_its_identity_and_asking_never_starts_one() {
     use spawn_core::port::ServerSeen;
     let _exclusive = exclusive();
     let tmux = isolated_tmux("server");
-    let host = TmuxHost::local(&tmux.program);
+    let host = host_in(&tmux.scratch, &tmux.program);
     assert_eq!(host.server(), ServerSeen::Gone);
     assert!(!host.server_alive());
     // Asking twice started nothing.
