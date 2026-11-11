@@ -313,6 +313,34 @@ select jsonb_build_object(
                                              and h.expires_ms > spawn_now_ms())),
                       '[]'::jsonb))";
 
+/// The missions the `controller_behind` alert reads (P22), on the
+/// database's clock: `{now_ms, missions}`, each gated mission open or
+/// active and not halted that has a reported task, with its gate, its
+/// first source (the one it lands on) and the owner's latest landing on
+/// that source (`landed`: the latest `source.moved` record's `to`, or
+/// null).
+pub(crate) const CONTROLLERS: &str = r"
+select jsonb_build_object(
+  'now_ms', spawn_now_ms(),
+  'missions', coalesce((select jsonb_agg(jsonb_build_object(
+                                 'mission', m.id, 'gate', m.gate, 'source', m.sources ->> 0,
+                                 'landed', (select e.kind #>> '{detail,record,to}'
+                                              from spawn_events e
+                                             where e.session_id = 'session_control'
+                                               and e.event_name = 'control.recorded'
+                                               and e.kind -> 'detail' -> 'record' ->> 'type'
+                                                   = 'source.moved'
+                                               and e.kind #>> '{detail,record,source}'
+                                                   = m.sources ->> 0
+                                             order by e.session_seq desc limit 1))
+                                 order by m.id)
+                          from mission_missions m
+                         where m.gate is not null and m.state in ('open', 'active')
+                           and m.halted is null
+                           and exists (select 1 from mission_tasks k
+                                        where k.mission_id = m.id and k.state = 'reported')),
+                       '[]'::jsonb))";
+
 impl PostgresStore {
     /// Record an `alert.fired` or `alert.cleared` record (owner only).
     /// Returns the event's id; a second `fired` for a key, a `cleared`
@@ -395,6 +423,12 @@ impl PostgresStore {
     /// waits for one ([`INTEGRATOR`]).
     pub fn alert_integrator(&self) -> Result<Value, StoreError> {
         self.query_json(INTEGRATOR, &[&crate::missions::INTEGRATOR_LOCK_KEY])
+    }
+
+    /// The missions whose controller the `controller_behind` alert
+    /// compares with main ([`CONTROLLERS`]).
+    pub fn alert_controllers(&self) -> Result<Value, StoreError> {
+        self.query_json(CONTROLLERS, &[])
     }
 
     /// The alerts the window shows ([`ALERTS`]).

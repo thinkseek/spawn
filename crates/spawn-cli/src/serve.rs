@@ -776,6 +776,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/events" => Box::new(move || events(query)),
         "/api/scorecard" => Box::new(move || scorecard(query)),
         "/api/scorecard/fleet" => Box::new(move || scorecard_fleet(query)),
+        "/api/interventions" => Box::new(move || interventions(query)),
         "/api/alerts" => Box::new(move || alerts(query)),
         "/api/cost" => Box::new(move || cost(query)),
         _ => {
@@ -2063,6 +2064,44 @@ fn scorecard_fleet(query: &str) -> Result<Value, String> {
         None => open_store()?,
     };
     crate::scorecard::fleet::measure(&store, name, span).map_err(failure)
+}
+
+/// `/api/interventions?window=24h|7d&until=<RFC 3339>`: the north star
+/// over `[until − window, until)` (24h when the window is absent, now when
+/// `until` is) and the interventions behind it, one per intent of a person
+/// (crate::scorecard::interventions), read through the reader login. Any
+/// other window, or an `until` that is not a time, is the caller's
+/// mistake: 400.
+fn interventions(query: &str) -> Result<Value, String> {
+    let given = |name: &str| -> Result<Option<String>, String> {
+        parameter(query, name)
+            .map(|text| {
+                percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad {name} {text}"))
+            })
+            .transpose()
+            .map(|value| value.filter(|text| !text.is_empty()))
+    };
+    let (window, until) = (given("window")?, given("until")?);
+    let failure = |failure: crate::scorecard::Failure| match failure {
+        crate::scorecard::Failure::Request(error) => format!("{BAD_REQUEST}{error}"),
+        crate::scorecard::Failure::Record(error) => error,
+    };
+    let mut store = None;
+    let (name, span) =
+        crate::scorecard::interventions::window_of(window.as_deref(), until.as_deref(), || {
+            let opened = open_store().map_err(crate::scorecard::Failure::Record)?;
+            let now = opened
+                .database_now_ms()
+                .map_err(|error| crate::scorecard::Failure::Record(error.to_string()))?;
+            store = Some(opened);
+            Ok(now)
+        })
+        .map_err(failure)?;
+    let store = match store {
+        Some(store) => store,
+        None => open_store()?,
+    };
+    crate::scorecard::interventions::measure(&store, name, span).map_err(failure)
 }
 
 /// `/api/alerts?since=`: exactly the JSON array of `spawn alerts --once

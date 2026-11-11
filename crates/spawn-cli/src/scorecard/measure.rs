@@ -396,6 +396,17 @@ fn marks_per_landing(
     }
 }
 
+/// Autonomy: the interventions per landing, and `retries`, a person's
+/// commands sent again after a refusal (each intent counts once).
+fn autonomy(counts: &Counts, enough: bool) -> Dimension {
+    let mut dimension =
+        marks_per_landing(counts, enough, &INTERVENTIONS, "interventions", "by_kind");
+    dimension
+        .parts
+        .insert("retries".into(), usize_json(counts.count(Kind::Retry)));
+    dimension
+}
+
 fn cost(counts: &Counts, enough: bool) -> Dimension {
     let by_model = counts
         .by_model
@@ -451,7 +462,7 @@ fn dimensions_of(counts: &Counts) -> Vec<Dimension> {
         lead_time(counts, enough),
         first_pass(counts, enough),
         marks_per_landing(counts, enough, &SEND_BACKS, "send_backs", "by_verdict"),
-        marks_per_landing(counts, enough, &INTERVENTIONS, "interventions", "by_kind"),
+        autonomy(counts, enough),
         marks_per_landing(counts, enough, &FAILURES, "events", "by_kind"),
         cost(counts, enough),
         gate_time(counts),

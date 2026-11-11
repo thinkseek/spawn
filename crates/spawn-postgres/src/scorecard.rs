@@ -21,6 +21,11 @@ use crate::PostgresStore;
 /// fields, plus its `state` and times. Records of no measure (reports,
 /// residents, halts, host facts) are left out.
 const FACTS: &str = r"
+with h as materialized (
+  select u.id, i.intent, i.at_ms
+    from spawn_human_intents i
+   cross join lateral unnest(i.commands) as u(id)
+   where i.at_ms < $1)
 select jsonb_build_object(
   'control', (
     select coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
@@ -75,7 +80,9 @@ select jsonb_build_object(
              'succeeded', r.succeeded,
              'error', case when r.succeeded is false and c.principal = 'spawn-dispatch'
                                 and c.idempotency_key like 'deliver-%' then c.error end,
-             'stalls', t.stalls))
+             'stalls', t.stalls,
+             'intent', h.intent,
+             'intent_at_ms', h.at_ms))
              order by c.id), '[]'::jsonb)
       from spawn_commands c
      -- A command's result is a fact of the moment it finished: one that
@@ -91,6 +98,7 @@ select jsonb_build_object(
                            from jsonb_array_elements_text(c.action -> 'tags')
                                 with ordinality as g(tag, n)
                           where g.tag ~ '(^| )stall-[0-9]+-[a-z_]+-[0-9]+$') end as stalls) t
+     left join h on h.id = c.id
      where c.created_at_ms < $1
        and (c.principal in ('human', 'spawn')
             or r.succeeded is false
@@ -110,6 +118,9 @@ impl PostgresStore {
     /// one, the dispatcher's deliveries (`deliver-<task>-<revision>` and their
     /// retries; `error` only on a failed one) and its digests that carry a
     /// stall tag (`stalls`: those tags, `<session> stall-<task>-<step>-<n>`).
+    /// A person's command names its intent (`spawn_human_intents`: `intent`,
+    /// its first command's id, and `intent_at_ms`, that one's creation): a
+    /// refused command sent again continues the intent of the one before.
     /// A command is in them from its creation and its result (`succeeded`,
     /// `finished_at_ms`, `error`) from its finish: one created before
     /// `until_ms` that finished later is unfinished here.

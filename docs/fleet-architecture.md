@@ -8,6 +8,29 @@ The north-star metric is human interventions per agent-hour, at a given
 throughput (tasks completed, scenarios passed). Every part below exists to
 push that number down, and to do it with the system itself as the improver.
 
+It counts what a person meant, once (objective 049): a person's command
+(principal `human` or `spawn`, the board's and the CLI's) continues the
+intent of the latest earlier command of the same principal, session and
+action (the whole JSON, as jsonb) when that one finished failed at or
+before this one was created, at most 60 minutes before it; otherwise it
+starts one. An intent counts at its first command's creation; its outcome
+is its last command's (`taken`, `failed`, `pending`). The view
+`spawn_human_intents` holds one row per intent, and every count of a
+person's commands reads it: the scorecard's autonomy (`command`, with the
+part `retries`, the commands beyond each intent's first), `/api/fleet`'s
+`ladder_24h.human` and `human_per_agent_hour`, and the experience views
+(§4). `GET /api/interventions?window=24h|7d[&until=<RFC 3339>]` (any other
+window, or an `until` that is no time, 400) answers the figure over
+`[until − window, until)`: `window`, `since_ms`, `until_ms`, `agent_hours`
+(the executions' running time clipped to the window, to 3 decimals),
+`total`, `by_kind` {`command`, `resume`, `owner_task`, `cancel_reassign`},
+`retries`, `per_agent_hour` (null with no agent hours) and `items`, the
+interventions newest first, each with `kind`, `at_ms`, `principal`, `agent`,
+`session`, `line`, `commands` (an intent's ids in order), `attempts` and
+`outcome`, each command's outcome as it stood before `until`. Home shows it
+for 24 h and 7 d with the interventions behind each figure
+(`web/src/interventions.ts`).
+
 Four ideas carry the design:
 
 1. **A decision ladder.** Every judgement and every action goes to the
@@ -1070,7 +1093,17 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   restart, while a gated mission that is open or active, not halted, and on
   a source no owner holds has a reported task; cleared at the first reading
   that finds the lock held; the lock is read only while such a task is in
-  the step's fold or the alert is open), `model_auth` (objective 028's
+  the step's fold or the alert is open), `controller_behind` (subject
+  `mission #<id>`: the owner's latest landing on a gated mission's source
+  (the latest `source.moved`'s `to`; the mission open or active, not
+  halted, with a reported task) is newer than the controller its gate's
+  scenarios come from (`controllers/<name>-<commit>`) at every reading for
+  `SPAWN_ALERT_CONTROLLER_BEHIND_SECS`, default 1800; the integrator holds
+  that mission's gates until the deploy switches the controller (P22), so a
+  wait this long is a landing not deployed; a task's landing needs no
+  deploy and counts for nothing; cleared at the first reading that finds
+  the controller has the landing or the mission no longer waiting),
+  `model_auth` (objective 028's
   `execution.interrupted` with cause `model_auth`) and `cost_budget`
   (subject `mission #<id>`, key `cost_budget:<mission>:<UTC day>`: at a
   reading, the mission's cost of the model calls timed in the current UTC
@@ -1349,8 +1382,9 @@ readable by `spawn_reader` and the supervisor):
 
 | View | One row per | Columns |
 | --- | --- | --- |
-| `spawn_decisions` | judgement (at its time) and command (at its creation) | `at_ms`, `tier` (`rules` when the rules judged, else `model`; `dispatcher` for `spawn-dispatch`, `supervisor` for `spawn_supervisor`, `human` for `human` and `spawn`, `liveness` for `spawn-liveness`, any other principal as its own tier), `session_id`, `agent_id`, `source` (the judge or the principal) |
-| `spawn_interventions` | the scorecard's interventions (docs/design.md §15, autonomy (a)-(d)) | `at_ms`, `kind` (`command`, `resume`, `owner_task`, `cancel_reassign`), `mission_id`, `task_id`, `command_id` |
+| `spawn_decisions` | judgement (at its time), command of Spawn's loops (at its creation) and person's intent (`spawn_human_intents`, at its time; §0) | `at_ms`, `tier` (`rules` when the rules judged, else `model`; `dispatcher` for `spawn-dispatch`, `supervisor` for `spawn_supervisor`, `human` for an intent of `human` or `spawn`, `liveness` for `spawn-liveness`, any other principal as its own tier), `session_id`, `agent_id`, `source` (the judge or the principal) |
+| `spawn_interventions` | the scorecard's interventions (docs/design.md §15, autonomy (a)-(d)) | `at_ms`, `kind` (`command`: a person's intent, `command_id` its first command; `resume`, `owner_task`, `cancel_reassign`), `mission_id`, `task_id`, `command_id`, `cancelled_task_id` (a cancel and reassign's cancelled task) |
+| `spawn_human_intents` | a person's intent (§0) | `at_ms`, `intent` (its first command's id), `principal`, `agent_id`, `session_id`, `commands` (in order), `attempts`, `outcome` (`taken`, `failed`, `pending`), then each command's `created_at_ms`, `finished_at_ms` and `succeeded` in order, and `action` |
 | `spawn_outcomes` | task's closing record | `at_ms`, `outcome` (`landed`, `accepted`: a review that closes it on a mission without a gate, `cancelled`, `aborted`, `over_budget`), `task_id`, `mission_id`, `by` |
 | `spawn_escalations` | distinct tag of the dispatcher's inputs into the supervisor (`Escalation::tag`; a charter's tag is not one), at the first command that carried it | `at_ms`, `tag`, `command_id` |
 
@@ -1379,6 +1413,7 @@ The Scorecard's "How the fleet decides" reads it over the page's window;
 | Escalations (top of the board) | What the supervisor asks, in at most three lines (its `HUMAN:` line or its reply's last paragraph; the whole reply on request), and under it the box to type to the supervisor, always there; the dispatcher's escalations not yet told to the supervisor, and those told and unresolved (folded to a count while nothing is pending), each with its heading, line, agent and age (`/api/attention`, computed by the dispatcher's code); below it, the supervisor's "For the owner:" lines with their age, to read, not counted |
 | Always-on agents (below the queue) | The supervisor, then the residents, pinned live or not: liveness, state and for how long, last activity, uptime, the task each holds |
 | Health strip | In this order: liveness (always-on agents up, shortest uptime, liveness restarts in 24 h), resources (free disk per place against its warning and floor; memory available now against a 4 GiB warning line, of the total; each gated mission's waits for gate room: the run's task, how many `no_room` outcomes since when, whether it was escalated; a value the server could not read shows as unread, never guessed), judgements, the decision ladder and human decisions per agent-hour |
+| Human interventions (Home) | The north star (§0) for the last 24 h and 7 days: interventions per agent-hour, how many, the retries left out, and on request the list behind each figure (kind, agent, line, its commands and tries, outcome) |
 | Fleet board | The rest of the fleet in groups: on a task (escalated first, by the escalations queue, then the quietest), idle, ended (folded, newest end first); each row its state, the mission and task it holds, what it does now, its last event; the sidebar's session list uses the same groups |
 | Agent detail | A box to type to its session, with what was sent there and whether it was typed or waits for the agent's turn; live terminal; the Jev panel (distribution, needs_human, stuck, the judge's attention flag and its reason, evidence, rules-vs-Jev); the commands into it (an input waiting for the turn says so); state timeline; event timeline |
 | Missions | Missions with open tasks first, then idle active ones, then closed ones (folded); each mission's tasks in flight (oldest first), landed or accepted, sent back, cancelled (folded), an objective's retries nested under its latest attempt; residents waiting for a human's approval |
@@ -1390,7 +1425,8 @@ read is 405): `/api/overview`, `/api/fleet` (with
 `waiting` once the Bridge holds it for the agent's turn), `/api/attention`,
 `/api/missions`, `/api/events`, `/api/session/<id>`, `/api/pane/<id>`,
 `/api/rsi` (with `/api/rsi/task/<id>` and `/api/rsi/pane`),
-`/api/scorecard` and `/api/scorecard/fleet` (§4) (`crates/spawn-cli/src/serve.rs`; the answer of
+`/api/scorecard` and `/api/scorecard/fleet` (§4), `/api/interventions`
+(§0) (`crates/spawn-cli/src/serve.rs`; the answer of
 `/api/attention` is documented in `crates/spawn-cli/src/serve/attention.rs`).
 
 It writes two things. The first is a person's input to a session, `POST
@@ -1667,7 +1703,13 @@ the tree's own:
   model, the model mapping, a stream asked for again before its first
   event, the cut signal, the body cap). The halt rule on the scenario count (§10.3) protects them.
   check-tests runs first among the regressions (the most often decisive,
-  so its failure stops the rest early);
+  so its failure stops the rest early). It also fails a run whose tests
+  all pass but leave something behind (objectives 54 and 55, folded into
+  it): any entry in the run's own fresh TMPDIR, any schema in the run's
+  own fresh database on the test server, or a relation, function or type
+  new in that database's public, each one `FAILED leftover-scratch:`,
+  `leftover-schema:` or `leftover-public:` line, which the integrator reads
+  as the candidate's failure, not the host's;
 - a check that fails on the candidate is run again there, as an
   objective's "unsolved" needs two runs that agree: passing the second
   time, it is a flake (said in the log, and named in the verdict's and the
