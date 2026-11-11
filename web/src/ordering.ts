@@ -83,6 +83,21 @@ function aborted(task: Pick<MissionTask, "stages">): boolean {
   return task.stages.some((stage) => stage.stage === "aborted");
 }
 
+/** The store's task state words that mislead an owner, in the owner's words:
+ * `delivered` means handed to its worker, which works on it, not finished. */
+const STATE_WORDS: Record<string, string> = {
+  assigned: "waiting for its worker",
+  delivered: "in work",
+  revise: "sent back",
+};
+
+/** A task state in the owner's words: `assigned` "waiting for its worker",
+ * `delivered` "in work", `revise` "sent back"; every other state as it is.
+ * The API keeps the store's states; the words are the page's. */
+export function stateWords(state: string): string {
+  return Object.hasOwn(STATE_WORDS, state) ? STATE_WORDS[state] : state;
+}
+
 /** The task's state in an observer's words: `gating` for a task that waits
  * for the gate, `aborted at budget` for the integrator's over-budget abort. */
 export function taskStateLabel(task: Pick<MissionTask, "state" | "raw_state" | "stages">, mission: Gated): string {
@@ -98,7 +113,7 @@ export function taskStateLabel(task: Pick<MissionTask, "state" | "raw_state" | "
     case "unknown":
       return task.raw_state ?? "unknown";
     default:
-      return task.state;
+      return stateWords(task.state);
   }
 }
 
