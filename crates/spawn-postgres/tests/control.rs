@@ -4206,7 +4206,11 @@ fn an_objective_solved_on_the_base_ends_its_task() {
     assert_eq!(records[0]["task"], json!(task));
     assert_eq!(records[0]["base"], json!("b0"));
     assert!(row(mission)["configured_ms"].is_i64());
-    assert_eq!(row(other)["solved_on_base"], json!([]), "another mission's record");
+    assert_eq!(
+        row(other)["solved_on_base"],
+        json!([]),
+        "another mission's record"
+    );
     let landings = store.objective_landings(mission).expect("landings");
     assert_eq!(landings, json!([{"objective": 34, "metric": null}]));
 }
