@@ -2238,9 +2238,11 @@ fn alerts(query: &str) -> Result<Value, String> {
 /// `/api/cost?window=24h|7d` (24h when absent; any other window is the
 /// caller's mistake, 400): what the model calls timed in [now minus the
 /// window, now) cost, per model, mission, task, agent and execution
-/// (crate::cost), read through the reader login. Each `tasks` row carries
-/// its `label`, the task's label as `/api/missions` gives it ([`labels`]),
-/// or null for a task the record does not hold.
+/// (crate::cost), and what a landing cost in it, for the fleet and each
+/// mission (`landed`, `usd_per_landing`), read through the reader login.
+/// Each `tasks` row carries its `label`, the task's label as
+/// `/api/missions` gives it ([`labels`]), or null for a task the record
+/// does not hold.
 fn cost(query: &str) -> Result<Value, String> {
     let asked = parameter(query, "window")
         .map(|text| percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad window {text}")))
