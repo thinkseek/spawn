@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 
+import { stateWords } from "../../ordering";
 import { cx } from "../ui";
 
 export interface PhaseStyle {
@@ -138,7 +139,7 @@ export function PhaseBadge({
           style.pulse && "animate-spawn-pulse",
         )}
       />
-      {phase}
+      {stateWords(phase)}
     </span>
   );
 }

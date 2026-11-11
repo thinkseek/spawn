@@ -11,7 +11,7 @@ import { rsiPhase, sessionTaskLabel } from "../missions";
 import type { ThemeChoice } from "../theme";
 import { THEME_CHOICES, THEME_KEY, useTheme } from "../theme";
 import type { FleetContext } from "../ordering";
-import { AGENT_GROUP_LABEL, groupAgents, heldTask } from "../ordering";
+import { AGENT_GROUP_LABEL, groupAgents, heldTask, stateWords } from "../ordering";
 import { phaseStyle } from "./rsi/Phase";
 import { recordedState } from "../recordedState";
 import { StateDot, stateLabel } from "./StateDot";
@@ -135,7 +135,7 @@ export function Sidebar({
                     phaseStyle(phase).pulse && "animate-spawn-pulse",
                   )}
                 />
-                {phase}
+                {stateWords(phase)}
               </span>
             )
           }

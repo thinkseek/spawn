@@ -248,3 +248,89 @@ fn only_the_owner_records_deploys() {
         "{refused}"
     );
 }
+
+/// S23: an owner's landing request with no outcome yet, waiting for its
+/// judging or in it, is what `owner_request` names, the oldest on the
+/// source first; a request on another source is not; an outcome naming it
+/// (`source.push_refused`, or a `source.moved` with its `request`) ends it.
+/// deploy/on-landing.sh waits while it is there.
+#[test]
+fn an_owners_landing_request_without_an_outcome_is_named_until_it_has_one() {
+    let (store, schema) = store("deploy_owner_request");
+    let mut client = admin(&schema);
+    accepted_task(&store, SOURCE);
+    accepted_task(&store, ELSEWHERE);
+    let ask = |source: &str, digit: char| {
+        let commit = commit(digit);
+        store
+            .source_push_request(
+                source,
+                &commit,
+                &format!("refs/spawn-owner/{commit}"),
+                &spawn_postgres::PushRequest {
+                    gated: true,
+                    urgent: false,
+                    reason: None,
+                },
+            )
+            .expect("the owner's request")
+    };
+    assert_eq!(
+        landing(&store, &commit('a'), None)["owner_request"],
+        Value::Null
+    );
+
+    let elsewhere = ask(ELSEWHERE, 'e');
+    assert_eq!(
+        landing(&store, &commit('a'), None)["owner_request"],
+        Value::Null,
+        "another source's request holds nothing here"
+    );
+    let first = ask(SOURCE, 'b');
+    let second = ask(SOURCE, 'c');
+    let read = landing(&store, &commit('a'), None);
+    assert_eq!(
+        read["owner_request"]["request"], first,
+        "the oldest: {read}"
+    );
+    assert_eq!(read["owner_request"]["commit"], commit('b'));
+    assert!(read["owner_request"]["at_ms"].as_i64().is_some(), "{read}");
+
+    // A judging that ended with no verdict leaves it pending.
+    control(
+        &mut client,
+        &json!({"type": "source.push_no_verdict", "request": first, "reason": "host fault",
+                "judging": "0123456789abcdef"}),
+    );
+    assert_eq!(
+        landing(&store, &commit('a'), None)["owner_request"]["request"],
+        first
+    );
+
+    // Refused: the next one is named.
+    control(
+        &mut client,
+        &json!({"type": "source.push_refused", "request": first, "reason": "a conflict"}),
+    );
+    assert_eq!(
+        landing(&store, &commit('a'), None)["owner_request"]["request"],
+        second
+    );
+    // Applied: a source.moved naming it; none is left on the source.
+    control(
+        &mut client,
+        &json!({"type": "source.moved", "source": SOURCE, "from": commit('a'), "to": commit('c'),
+                "request": second, "by": "human", "verdict": "accepted"}),
+    );
+    assert_eq!(
+        landing(&store, &commit('c'), None)["owner_request"],
+        Value::Null
+    );
+    // The other source's request is still its own.
+    assert_eq!(
+        store
+            .main_landing(ELSEWHERE, &commit('a'), None)
+            .expect("read")["owner_request"]["request"],
+        elsewhere
+    );
+}
