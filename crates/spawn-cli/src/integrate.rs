@@ -3933,6 +3933,11 @@ impl Judge {
         // (gate.sh), named on the record so a gate that judged without them
         // says so.
         let quarantined: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        // `passed` and `reused`: the regressions that passed in the gate (run
+        // on the candidate, or taken from the base's cache as solved), which
+        // clear a validator alert (crate::alerts, `validator_defect`).
+        let passed: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let reused: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
         // A gate on a main that is red (design-main-red.md) runs only as a
         // probe ([`Integrator::red_holds`]): its record says so.
         let probe = mission.red.as_ref().is_some_and(|red| red.main == main);
@@ -4052,6 +4057,12 @@ impl Judge {
             }
             if !quarantined.borrow().is_empty() {
                 record_value["quarantined"] = json!(*quarantined.borrow());
+            }
+            if !passed.borrow().is_empty() {
+                record_value["passed"] = json!(*passed.borrow());
+            }
+            if !reused.borrow().is_empty() {
+                record_value["reused"] = json!(*reused.borrow());
             }
             if !red_scenarios.borrow().is_empty() {
                 record_value["main_red_scenarios"] = json!(*red_scenarios.borrow());
@@ -4262,6 +4273,8 @@ impl Judge {
             flakes.replace(verdict.flakes.clone());
             red_scenarios.replace(verdict.main_red_scenarios.clone());
             quarantined.replace(verdict.quarantined.clone());
+            passed.replace(verdict.passed.clone());
+            reused.replace(verdict.reused.clone());
         }
         // The red check passed on this base before the candidate ran: main
         // of the source is green on it again, whatever the gate ended with
