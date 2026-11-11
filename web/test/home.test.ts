@@ -569,7 +569,7 @@ test("each task's day is one line: landed after its gates, sent back and where i
   assert.equal(byTask.get("T2")?.text, "Supply PA · T2 sent back twice: sent back 2× (rejected, conflict); now gating");
   assert.equal(byTask.get("T3")?.text, "Supply PA · T3 stopped: cancelled");
   assert.equal(byTask.get("T3")?.kind, "stopped");
-  assert.equal(byTask.get("T4")?.text, "Supply PA · T4 new: started; now delivered");
+  assert.equal(byTask.get("T4")?.text, "Supply PA · T4 new: started; now in work");
   assert.equal(byTask.has("T5"), false, "nothing in the window");
   assert.deepEqual([digest.landed, digest.sentBack], [1, 2]);
   assert.equal(digest.entries[0].text.includes("T4"), true, "newest first");
