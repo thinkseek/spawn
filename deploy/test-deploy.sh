@@ -462,6 +462,33 @@ check "refused while another deploy holds the lock (status $status)" [ "$status"
 check "and records nothing: the deploy holding it records its own" [ "$(finished | wc -l)" -eq $((recorded + 3)) ]
 on_main=""
 
+echo "== the warm-up outlives a deploy run by a oneshot unit (deploy/detach.sh, #54)"
+# deploy/on-landing.sh runs deploy.sh in a oneshot unit, whose cgroup systemd
+# stops when the tick exits; the warm-up (warm_base_cache) is started with
+# detach_start. Here the same start, from a oneshot unit that exits at once
+# after it, against a plain setsid child (what deploy.sh did before) as the
+# control; and its environment came from the file, not argv.
+if systemctl --user show-environment >/dev/null 2>&1; then
+  detached=$scratch/detached-alive plain=$scratch/plain-alive unit=spawn-test-detach-$$
+  # shellcheck disable=SC2016
+  systemd-run --user --wait --quiet --collect -p Type=oneshot --unit "$unit-tick" \
+    bash -c '. "$1/deploy/detach.sh"
+      detach_assignments "$3.env" "WARM_SECRET=postgres://u:p@h/db" "QUOTED=a \"b\" c" &&
+      detach_start "$2" "$3.log" "$3.env" sh -c "sleep 3; printf %s/%s \"\$WARM_SECRET\" \"\$QUOTED\" >$3" &&
+      unlink "$3.env"' _ "$repo" "$unit" "$detached"
+  # shellcheck disable=SC2016
+  systemd-run --user --wait --quiet --collect -p Type=oneshot --unit "$unit-plain" \
+    bash -c '(exec setsid sh -c "sleep 3; touch $1") & exit 0' _ "$plain"
+  sleep 5
+  check "the detached warm-up outlived its oneshot unit" [ -e "$detached" ]
+  check "with the environment of its file, quoting kept" \
+    [ "$(cat "$detached" 2>/dev/null)" = 'postgres://u:p@h/db/a "b" c' ]
+  check "and the file is gone" [ ! -e "$detached.env" ]
+  check "a plain setsid child did not (the checks above mean something)" [ ! -e "$plain" ]
+else
+  echo "skip: no user manager here: the warm-up's own unit is not tested"
+fi
+
 echo "== the drain (objective 037)"
 rm -f "$live/deploy.pending"
 export SPAWN_CALLS=$scratch/spawn-calls.log DRAINED_AT=$scratch/drained-at SYSTEMCTL_TIMES=$scratch/systemctl-times.log

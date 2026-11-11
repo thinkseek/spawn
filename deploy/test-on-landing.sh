@@ -186,6 +186,14 @@ printf '{"v":1,"state":"skipped","failed":["023"],"red_since":"%s"}\n' "$c0" >"$
 tick SPAWN_DEPLOY_QUIET_SECS=1
 check "a skipped night keeps it red" [ "$(deploys)" -eq 0 ]
 
+echo "not json" >"$scratch/ws/nightly/spawn.json"
+tick SPAWN_DEPLOY_QUIET_SECS=1
+check "a fact that does not read holds it too (closed, not open)" [ "$(deploys)" -eq 0 ]
+check "says so" grep -qF "main $c1 waits: the nightly's fact $scratch/ws/nightly/spawn.json does not read as JSON" "$out"
+echo '[]' >"$scratch/ws/nightly/spawn.json"
+tick SPAWN_DEPLOY_QUIET_SECS=1
+check "nor does a fact that is no object" [ "$(deploys)" -eq 0 ]
+
 echo "== the off switch and a busy deploy lock"
 printf '{"v":1,"state":"green","failed":[],"red_since":null}\n' >"$scratch/ws/nightly/spawn.json"
 tick SPAWN_DEPLOY_QUIET_SECS=1 SPAWN_DEPLOY_ON_LANDING=0

@@ -26,7 +26,10 @@
 # - no deploy is pending (<live>/deploy.pending: a deploy died after its
 #   push; the owner's next deploy completes it);
 # - the nightly is not red on the source (its fact,
-#   $SPAWN_WORKSPACE_ROOT/nightly/spawn.json, has no red_since): a red main
+#   $SPAWN_WORKSPACE_ROOT/nightly/spawn.json, has no red_since; a fact that
+#   is there and does not read as a JSON object counts as red, and a
+#   source with no fact at all is deployed, the deploy's line saying red
+#   was not checked): a red main
 #   is a known regression, and a deploy would put it live. Task landings
 #   wait while it is red too (gate v2 step 5b), so what waits here is what
 #   landed before the red was found; the first tick after a green night
@@ -169,14 +172,22 @@ tick() {
     say_once "main $main has no gate-accepted landing in the store: not deployed here (a deploy with a gate's verdict file deploys it)"
     return 0
   fi
-  local fact red
+  local fact red nightly_note=""
   fact=${SPAWN_WORKSPACE_ROOT:-}/nightly/$(basename "$missions" .git).json
   if [ -n "${SPAWN_WORKSPACE_ROOT-}" ] && [ -f "$fact" ]; then
-    red=$(jq -r '.red_since // empty' "$fact" 2>/dev/null) || red=""
+    # A fact that is there but does not read is no green: closed, not open.
+    if ! red=$(jq -er 'if type == "object" then (.red_since // "") else error("not an object") end' "$fact" 2>/dev/null); then
+      say_once "main $main waits: the nightly's fact $fact does not read as JSON; deployed once it does (a nightly run writes it again), or by hand"
+      return 0
+    fi
     if [ -n "$red" ]; then
       say_once "main $main waits: the nightly is red since $red (failed: $(jq -r '(.failed // []) | join(" ")' "$fact" 2>/dev/null)); deployed after a green night, or by hand"
       return 0
     fi
+  else
+    # No nightly on this source (yet): nothing says main is red, and the
+    # deploy says it did not look.
+    nightly_note="; no nightly fact at ${fact#/}, so red was not checked"
   fi
   local now at first last_ok last_head last_at
   now=$(printf '%s' "$read" | jq -r '.now_ms')
@@ -199,7 +210,7 @@ tick() {
     return 0
   fi
 
-  say "deploying main $main (landed by $(printf '%s' "$read" | jq -r '.landing.record'), event $(printf '%s' "$read" | jq -r '.landing.event'); live is ${deployed:-unknown})"
+  say "deploying main $main (landed by $(printf '%s' "$read" | jq -r '.landing.record'), event $(printf '%s' "$read" | jq -r '.landing.event'); live is ${deployed:-unknown}$nightly_note)"
   rm -f "$said_file"
   # The checkout: a clone of the missions repo, at main, nothing in it but
   # the commit (deploy.sh refuses a tree with changes and exports HEAD).

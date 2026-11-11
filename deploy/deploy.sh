@@ -234,6 +234,8 @@ cd "$repo"
 . "$repo/deploy/backup/lib.sh"
 # shellcheck source=scripts/sandbox.sh
 . "$repo/scripts/sandbox.sh"
+# shellcheck source=deploy/detach.sh
+. "$repo/deploy/detach.sh"
 
 say() { printf 'deploy: %s\n' "$*"; }
 
@@ -732,6 +734,20 @@ warm_base_cache() {
   mkdir -p "$live/gate-warm"
   find "$live/gate-warm" -maxdepth 1 -name '*.log' -type f -mtime +7 -delete 2>/dev/null || true
   log=$live/gate-warm/$head.log
+  # A unit of its own (deploy/detach.sh): a deploy run by a oneshot unit
+  # (deploy/on-landing.sh) would otherwise take it down as it exits. The
+  # integrator's gate environment goes through a file, never argv.
+  local unit=spawn-warm-base-${head:0:12}-$$ assignments=$live/gate-warm/$head.$$.env
+  if detach_assignments "$assignments" "${keep[@]}" &&
+    echo "deploy: base-only gate of $head, started $(date -Is) as $unit" >>"$log" &&
+    detach_start "$unit" "$log" "$assignments" \
+      setsid sh "$controller/scripts/rsi/gate.sh" --base-only "$missions" "$head" "$controller/rsi/scenarios"; then
+    rm -f "$assignments"
+    cached=${home}/.cache/spawn/gate-base
+    say "base cache: warming it for $head in the unit $unit, with ${own:-the shared test server}: log $log, results in $cached"
+    return 0
+  fi
+  rm -f "$assignments"
   (
     exec 8>&- 9>&- </dev/null >>"$log" 2>&1
     # Nor anything else the deploy's caller left open (a pipe it reads to
