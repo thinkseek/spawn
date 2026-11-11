@@ -37,9 +37,56 @@ from (
    order by e.kind -> 'detail' -> 'record' ->> 'judge', e.session_seq desc
 ) j";
 
+/// The `host.storage` samples `/api/fleet`'s storage figures are read
+/// from, each as `{at_ms, archive_bytes, archive_files, projects_bytes,
+/// projects_files}` or null: `oldest`, the oldest recorded at or after `$1`
+/// (the archive's growth is measured from it), and `before`, the newest
+/// recorded at or before `$2` (Claude Code's files then).
+pub(crate) const HOST_STORAGE: &str = r"
+with samples as (
+  select e.recorded_at_ms, e.id,
+         (e.kind -> 'detail' -> 'record') - 'type'
+           || jsonb_build_object('at_ms', e.recorded_at_ms) as sample
+    from spawn_events e
+   where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+     and e.kind -> 'detail' -> 'record' ->> 'type' = 'host.storage'
+)
+select jsonb_build_object(
+  'oldest', (select s.sample from samples s where s.recorded_at_ms >= $1
+              order by s.recorded_at_ms, s.id limit 1),
+  'before', (select s.sample from samples s where s.recorded_at_ms <= $2
+              order by s.recorded_at_ms desc, s.id desc limit 1))";
+
+/// The database's size (`pg_database_size`) and its five largest tables by
+/// `pg_total_relation_size`, largest first, as `{bytes, tables: [{name,
+/// bytes}]}`.
+pub(crate) const DATABASE_SIZE: &str = r"
+select jsonb_build_object(
+  'bytes', pg_database_size(current_database()),
+  'tables', coalesce((
+    select jsonb_agg(jsonb_build_object('name', t.relname, 'bytes', t.bytes)
+                     order by t.bytes desc, t.relname)
+      from (select c.relname, pg_total_relation_size(c.oid) as bytes
+              from pg_class c join pg_namespace n on n.oid = c.relnamespace
+             where c.relkind in ('r', 'p') and n.nspname = 'public'
+             order by pg_total_relation_size(c.oid) desc, c.relname
+             limit 5) t), '[]'::jsonb))";
+
 impl PostgresStore {
+    /// The `host.storage` samples the storage figures need ([`HOST_STORAGE`]):
+    /// the oldest at or after `since_ms` and the newest at or before
+    /// `before_ms`.
+    pub fn host_storage(&self, since_ms: i64, before_ms: i64) -> Result<Value, StoreError> {
+        self.query_json(HOST_STORAGE, &[&since_ms, &before_ms])
+    }
+
+    /// The database's size and its five largest tables ([`DATABASE_SIZE`]).
+    pub fn database_size(&self) -> Result<Value, StoreError> {
+        self.query_json(DATABASE_SIZE, &[])
+    }
+
     /// Record a host fact through `spawn_host_record` (owner only):
-    /// `host.disk`, `host.judge`, and the recovery's records. Returns the
+    /// `host.disk`, `host.storage`, `host.judge`, and the recovery's records. Returns the
     /// event's id.
     pub fn host_record(&self, record: &Value) -> Result<i64, StoreError> {
         Ok(self
