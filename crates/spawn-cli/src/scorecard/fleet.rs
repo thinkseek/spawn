@@ -95,7 +95,7 @@ pub(crate) fn answer(counts: &Value, name: &str, window: Window) -> Value {
     let ladder_counts = counts["ladder"].as_object().cloned().unwrap_or_default();
     let mut ladder = Map::new();
     for tier in TIERS {
-        ladder.insert(tier.to_string(), json!(count(&ladder_counts[tier])));
+        ladder.insert(tier.to_string(), json!(ladder_counts.get(tier).map_or(0, count)));
     }
     let extra: BTreeMap<&String, i64> = ladder_counts
         .iter()
