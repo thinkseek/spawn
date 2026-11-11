@@ -241,7 +241,7 @@ fn archived(agent: &str, id: &str, model: &str, at_ms: i64, input: i64) -> Archi
 /// task at its time (one timed before the task, the task held when the
 /// execution started), once; one the record holds keeps what it holds; one
 /// of an agent with no execution is not counted. The answer says since when
-/// the record counts. The reader may not record.
+/// the record counts.
 #[test]
 fn an_archived_message_counts_once_for_the_task_its_agent_held() {
     let (store, schema) = store("cost_archive");
@@ -322,7 +322,14 @@ fn an_archived_message_counts_once_for_the_task_its_agent_held() {
     );
     let live = entry(&month, "agents", "agent", &json!(worker.agent));
     assert_eq!(live["tokens"]["input"], 3_000_100, "msg_live as it was");
+}
 
+/// The marks of an agent's archive files are replaced whole; the reader
+/// may not record an archived message.
+#[test]
+fn an_agents_archive_marks_are_replaced_whole_and_owner_only() {
+    let (store, schema) = store("cost_archive_marks");
+    let agent = "agent_worker_w1_1";
     // The marks of an agent's files, replaced whole.
     let file = |name: &str, length: i64| ArchiveFile {
         file: name.to_string(),
@@ -330,13 +337,13 @@ fn an_archived_message_counts_once_for_the_task_its_agent_held() {
         modified_ms: 7,
     };
     store
-        .cost_archive_mark(&worker.agent, &[file("a.jsonl", 1), file("a.1.jsonl", 2)])
+        .cost_archive_mark(agent, &[file("a.jsonl", 1), file("a.1.jsonl", 2)])
         .expect("mark");
     store
-        .cost_archive_mark(&worker.agent, &[file("a.jsonl", 3)])
+        .cost_archive_mark(agent, &[file("a.jsonl", 3)])
         .expect("mark");
     assert_eq!(
-        store.cost_archive_files(&worker.agent).expect("marks"),
+        store.cost_archive_files(agent).expect("marks"),
         vec![file("a.jsonl", 3)]
     );
     assert!(

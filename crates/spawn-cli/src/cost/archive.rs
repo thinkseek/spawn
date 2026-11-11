@@ -39,7 +39,7 @@ use super::{Prices, plural};
 pub(crate) const BATCH: usize = 500;
 
 /// The longest the counter waits between tries to reach the database.
-const MOST_WAIT: Duration = Duration::from_secs(300);
+const MOST_WAIT: Duration = Duration::from_mins(5);
 
 /// Count the archive under `root` beside the loop's passes: on its own
 /// thread and its own connection, tried again (with a doubling wait) until
@@ -598,7 +598,7 @@ mod tests {
                 5,
                 "a changed file reads the agent again: {last:?}"
             );
-            let priced: Vec<(String, bool)> = client
+            let usd_known: Vec<(String, bool)> = client
                 .query(
                     "select message_id, usd is not null from spawn_cost_messages
                       where message_id in ('m-b', 'm-d') order by message_id",
@@ -609,7 +609,7 @@ mod tests {
                 .map(|row| (row.get(0), row.get(1)))
                 .collect();
             assert_eq!(
-                priced,
+                usd_known,
                 vec![("m-b".into(), true), ("m-d".into(), false)],
                 "a model with no price counts its tokens unpriced"
             );
