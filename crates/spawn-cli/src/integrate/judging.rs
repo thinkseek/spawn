@@ -311,6 +311,35 @@ pub(crate) fn units() -> bool {
     })
 }
 
+/// Keep the gate files of `gate`, a gate's private directory about to be
+/// removed, when it is in the directory of the judging this thread runs:
+/// copied to `<root>/gate-logs/<judging>/` ([`super::retained::keep_gate`]),
+/// whatever the gate ended with. Outside a judging, or for a directory
+/// elsewhere, nothing. A failure is said and the removal goes on.
+pub(crate) fn keep_gate(gate: &Path) {
+    let Some(judging) = CURRENT.with(|current| current.borrow().clone()) else {
+        return;
+    };
+    if gate.parent() != Some(judging.directory.as_path()) {
+        return;
+    }
+    let Some(root) = judging.directory.parent().and_then(Path::parent) else {
+        return;
+    };
+    if let Err(error) = super::retained::keep_gate(
+        root,
+        &judging.id,
+        gate,
+        super::retained::GATE_KEEP,
+        super::retained::GATE_TOTAL_BYTES,
+    ) {
+        eprintln!(
+            "integrate: judging {}: keep its gate's files: {error}",
+            judging.id
+        );
+    }
+}
+
 /// The id of the judging this thread runs; None outside one.
 pub(crate) fn current_id() -> Option<String> {
     CURRENT.with(|current| current.borrow().as_ref().map(|judging| judging.id.clone()))
@@ -327,6 +356,13 @@ pub(crate) fn named(record: &Value) -> std::borrow::Cow<'_, Value> {
         Some(judging) => {
             let mut named = record.clone();
             named["judging"] = json!(judging.id);
+            // Where its gates' files are kept, once one has been.
+            if let Some(root) = judging.directory.parent().and_then(Path::parent) {
+                let kept = root.join(super::retained::GATE_LOGS).join(&judging.id);
+                if kept.is_dir() {
+                    named["gate_logs"] = json!(kept.to_string_lossy());
+                }
+            }
             std::borrow::Cow::Owned(named)
         }
         None => std::borrow::Cow::Borrowed(record),

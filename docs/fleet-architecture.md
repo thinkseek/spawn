@@ -2556,7 +2556,14 @@ are per-agent uids or a mount per engine.
   newest 32 kept, the older removed as each is written), and
   `source.push_no_verdict` {request, reason, log: that path or null,
   judging} is recorded, folded into no table and no outcome (the request
-  stays pending); the journal's no-verdict line names the path too. With `--urgent` (gated or
+  stays pending); the journal's no-verdict line names the path too.
+  Every judging's gates, task or owner, whatever they end with, keep their
+  files: when a gate's private directory in a judging's directory goes,
+  its `stdout` (the per-scenario lines at its end), `stderr`, `verdict` and
+  `status` (never its `env`) are copied first to
+  `<root>/gate-logs/<judging>/<gate>/`, each its last 4 MiB; the newest 200
+  judgings are kept, at most 2 GiB in all, the oldest removed first. The
+  judging's records name that directory (`gate_logs`) once a gate is kept. With `--urgent` (gated or
   not; for a fix of a red `main`, D2) the request does not wait out a
   task's judging in flight on its source: that judging is stopped (its
   gate's process group killed, as at its wall clock) and records itself
