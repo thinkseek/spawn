@@ -464,6 +464,56 @@ mod tests {
         std::fs::write(path, text).expect("write");
     }
 
+    /// Marked as read: a message removed from the record is not counted
+    /// again until a file of its agent changes; then the agent is read again.
+    fn unchanged_files_are_not_read_again(
+        store: &PostgresStore,
+        client: &mut postgres::Client,
+        root: &Path,
+        prices: &Prices,
+    ) {
+        let worker = root.join("agent_w_1");
+        client
+            .execute(
+                "delete from spawn_cost_messages where message_id = 'm-c'",
+                &[],
+            )
+            .expect("delete");
+        let _ = count(&store, &root, &prices);
+        assert_eq!(rows(&mut client).len(), 3, "unchanged files are not read");
+        write(
+            &worker.join("n1.1.jsonl"),
+            &[
+                line("m-a", "x", "2026-11-10T10:20:00.000Z", [20, 0, 0, 0]),
+                line("m-c", "x", "2026-11-10T11:40:00.000Z", [5, 0, 0, 0]),
+                line("m-d", "y", "2026-11-10T11:50:00.000Z", [6, 0, 0, 0]),
+            ]
+            .concat(),
+        );
+        let _ = count(store, root, prices);
+        let last = rows(&mut client);
+        assert_eq!(
+            last.len(),
+            5,
+            "a changed file reads the agent again: {last:?}"
+        );
+        let usd_known: Vec<(String, bool)> = client
+            .query(
+                "select message_id, usd is not null from spawn_cost_messages
+                  where message_id in ('m-b', 'm-d') order by message_id",
+                &[],
+            )
+            .expect("usd")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(
+            usd_known,
+            vec![("m-b".into(), true), ("m-d".into(), false)],
+            "a model with no price counts its tokens unpriced"
+        );
+    }
+
     /// The archive counted once: a second count adds nothing, a copy file
     /// adds nothing, an agent with no execution is skipped and said, and
     /// files as they were marked are not read again.
@@ -572,47 +622,7 @@ mod tests {
             assert_eq!(after.len(), 4);
             assert_eq!(after[0], first[0], "a held message keeps what it holds");
 
-            // Marked as read: a message removed from the record is not
-            // counted again until a file changes.
-            client
-                .execute(
-                    "delete from spawn_cost_messages where message_id = 'm-c'",
-                    &[],
-                )
-                .expect("delete");
-            let _ = count(&store, &root, &prices);
-            assert_eq!(rows(&mut client).len(), 3, "unchanged files are not read");
-            write(
-                &worker.join("n1.1.jsonl"),
-                &[
-                    line("m-a", "x", "2026-11-10T10:20:00.000Z", [20, 0, 0, 0]),
-                    line("m-c", "x", "2026-11-10T11:40:00.000Z", [5, 0, 0, 0]),
-                    line("m-d", "y", "2026-11-10T11:50:00.000Z", [6, 0, 0, 0]),
-                ]
-                .concat(),
-            );
-            let _ = count(&store, &root, &prices);
-            let last = rows(&mut client);
-            assert_eq!(
-                last.len(),
-                5,
-                "a changed file reads the agent again: {last:?}"
-            );
-            let usd_known: Vec<(String, bool)> = client
-                .query(
-                    "select message_id, usd is not null from spawn_cost_messages
-                      where message_id in ('m-b', 'm-d') order by message_id",
-                    &[],
-                )
-                .expect("usd")
-                .iter()
-                .map(|row| (row.get(0), row.get(1)))
-                .collect();
-            assert_eq!(
-                usd_known,
-                vec![("m-b".into(), true), ("m-d".into(), false)],
-                "a model with no price counts its tokens unpriced"
-            );
+            unchanged_files_are_not_read_again(&store, &mut client, &root, &prices);
         }));
         let _ = std::fs::remove_dir_all(&root);
         let _ = postgres::Client::connect(&url, postgres::NoTls)
