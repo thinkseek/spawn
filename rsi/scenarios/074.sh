@@ -1,12 +1,12 @@
 #!/bin/sh
 # Black box: an alert, and a storage line, when a database outgrows what
-# the live event log justifies: the live database, or the test database
-# that the fleet's tests leave their schemas in.
+# the live event log justifies: the live database, or a test database the
+# loop knows (the gates', or the fleet's, which tests leave schemas in).
 #
 # The problem (the lead's read-only SELECTs on the live cluster, 2026-11-12;
 # queue.md 11-11 09:37; analysis-storage-rev-b.md): the fleet's test
-# database (spawn_fleet_test, on the test cluster the loop's
-# SPAWN_TEST_DATABASE_URL names) had grown to 2.7 GB. It held 2533 schemas
+# database (spawn_fleet_test, the database the loop hands the engines from
+# SPAWN_FLEET_TEST_DATABASE_URL) had grown to 2.7 GB. It held 2533 schemas
 # that crate tests created and never dropped. Nothing measured it and
 # nothing alerted; it was found by hand on the host's disk and first read
 # as live-database bloat. The live database is 159 MB for a 35 MB event log
@@ -17,29 +17,32 @@
 # web/src/resources.ts's storageView under node over it):
 #   (1) the loop's alert step reads, every SPAWN_ALERT_DATABASE_SECS
 #       (default 600), the live database's size and its event log's bytes
-#       (the sum of spawn_events.kind's stored size), and, when
-#       SPAWN_TEST_DATABASE_URL is set, the size of the database it names
-#       and its schemas (other than pg_*, information_schema and public).
+#       (the sum of spawn_events.kind's stored size), and the size and
+#       schemas (other than pg_*, information_schema and public) of each
+#       test database it is given: the gates' (SPAWN_TEST_DATABASE_URL, role
+#       "test") and the engines' (SPAWN_FLEET_TEST_DATABASE_URL, role
+#       "fleet_test"), each when set.
 #       A database at or above SPAWN_ALERT_DATABASE_FLOOR_MB (default
 #       1024) and above SPAWN_ALERT_DATABASE_RATIO (default 10) times the
 #       log's bytes opens one `database_size` alert, subject "database
-#       <name>", evidence {database, role ("live" or "test"), bytes,
+#       <name>", evidence {database, role ("live", "test" or "fleet_test"), bytes,
 #       log_bytes, ratio (bytes over log_bytes, one decimal), schemas}; its
 #       text names the database, its size, the ratio and "<n> schemas".
 #       One open per database.
 #   (2) it clears at the first reading where the database no longer
 #       qualifies, its cleared evidence that reading.
-#   (3) /api/fleet's `health.storage` carries `test_database`: {name,
-#       bytes, schemas} (null without SPAWN_TEST_DATABASE_URL), and
-#       `database.log_bytes`; storageView adds a row "Test database" with
-#       note "<n> schemas", and the "Database" row's note says the log's
-#       size ("log <size>").
+#   (3) /api/fleet's `health.storage` carries `test_databases`: [{role,
+#       name, bytes, schemas}], the gates' first, each only when set, and
+#       `database.log_bytes`; storageView adds a row "Gate test database"
+#       and a row "Fleet test database", each with note "<n> schemas", and
+#       the "Database" row's note says the log's size ("log <size>").
 #
 # A real `spawn loop` and `spawn serve` run on a scratch database (the
-# live one), with a second scratch database as the test database. The live
-# database holds about 2 MB of log and is above the floor (set from its own
-# size) but within the ratio; the test database holds 40 padded schemas,
-# above both. Then 35 of them are dropped. Each check is reported; the run
+# live one), with two more scratch databases: the gates' test database
+# (empty) and the fleet's (40 padded schemas, above both the floor and the
+# ratio). The live database holds about 2 MB of log and is above the floor
+# (set from its own size) but within the ratio. Then 35 of the fleet test
+# database's schemas are dropped. Each check is reported; the run
 # fails if any failed.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
@@ -75,6 +78,7 @@ SPAWN_DB_NAME="bb_074_dbsize_$run"
 SPAWN_TMUX_SOCKET="bb-074-$run"
 SPAWN_PSQL=psql
 TEST_DB="bb_074_testdb_$run"
+FLEET_DB="bb_074_fleetdb_$run"
 export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
 # The tmux server's socket lives in WORK, so the cleanup removes nothing
 # outside it (cc-rules (a), 2026-11-12).
@@ -90,6 +94,7 @@ server_url=$(pg_url_server "$SPAWN_TEST_DATABASE_URL")
 
 database_made=""
 test_db_made=""
+fleet_db_made=""
 loop_pid=""
 serve_pid=""
 cleanup() {
@@ -101,6 +106,9 @@ cleanup() {
     tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
     if [ -n "$test_db_made" ]; then
         psql -d postgres -tAq -c "drop database if exists $TEST_DB" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$fleet_db_made" ]; then
+        psql -d postgres -tAq -c "drop database if exists $FLEET_DB" >/dev/null 2>&1 || true
     fi
     if [ -n "$database_made" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
@@ -306,9 +314,11 @@ SQL
 capture psql -d "$SPAWN_DB_NAME" -q -f "$WORK/pad.sql"
 [ "$status" -eq 0 ] || harness "seeding the live log failed: $(err)"
 
-psql -d postgres -tAq -c "create database $TEST_DB" >/dev/null 2>&1 || harness "cannot create the test database"
+psql -d postgres -tAq -c "create database $TEST_DB" >/dev/null 2>&1 || harness "cannot create the gates' test database"
 test_db_made=1
-# 40 schemas of about 1.1 MB each, as tests leave them.
+psql -d postgres -tAq -c "create database $FLEET_DB" >/dev/null 2>&1 || harness "cannot create the fleet test database"
+fleet_db_made=1
+# 40 schemas of about 1.1 MB each in the fleet's, as tests leave them.
 cat >"$WORK/left.sql" <<'SQL'
 \set ON_ERROR_STOP 1
 do $$ begin
@@ -321,12 +331,12 @@ do $$ begin
     end loop;
 end $$;
 SQL
-capture psql -d "$TEST_DB" -q -f "$WORK/left.sql"
-[ "$status" -eq 0 ] || harness "padding the test database failed: $(err)"
+capture psql -d "$FLEET_DB" -q -f "$WORK/left.sql"
+[ "$status" -eq 0 ] || harness "padding the fleet test database failed: $(err)"
 
 live_bytes=$(q "select pg_database_size(current_database())")
 log_bytes=$(q "select sum(pg_column_size(kind)) from spawn_events")
-test_bytes=$(psql -d "$TEST_DB" -tA -c "select pg_database_size(current_database())")
+test_bytes=$(psql -d "$FLEET_DB" -tA -c "select pg_database_size(current_database())")
 # The floor: 1 MB under the live database, so it is above the floor and
 # only the ratio keeps it quiet.
 floor_mb=$(((live_bytes / 1048576) - 1))
@@ -334,14 +344,16 @@ floor_mb=$(((live_bytes / 1048576) - 1))
 [ "$live_bytes" -lt $((10 * log_bytes)) ] ||
     harness "the live database ($live_bytes) is not within 10 times its log ($log_bytes): the seed is too small"
 [ "$test_bytes" -gt $((10 * log_bytes + 10485760)) ] ||
-    harness "the test database ($test_bytes) is not well above 10 times the log ($log_bytes)"
+    harness "the fleet test database ($test_bytes) is not well above 10 times the log ($log_bytes)"
 SPAWN_ALERT_DATABASE_FLOOR_MB=$floor_mb
 export SPAWN_ALERT_DATABASE_FLOOR_MB
-note "live $live_bytes B, log $log_bytes B, test $test_bytes B, floor $floor_mb MB"
-# The loop and serve are given the test database as theirs; this script
-# reaches the server through the PG* variables pg_url_export set above.
+note "live $live_bytes B, log $log_bytes B, fleet test $test_bytes B, floor $floor_mb MB"
+# The loop and serve are given the two test databases as theirs; this
+# script reaches the server through the PG* variables pg_url_export set
+# above.
 SPAWN_TEST_DATABASE_URL="$server_url/$TEST_DB"
-export SPAWN_TEST_DATABASE_URL
+SPAWN_FLEET_TEST_DATABASE_URL="$server_url/$FLEET_DB"
+export SPAWN_TEST_DATABASE_URL SPAWN_FLEET_TEST_DATABASE_URL
 
 "$SPAWN_BIN" loop --repo "$repo" --root "$SPAWN_WORKSPACE_ROOT" >>"$WORK/loop.log" 2>&1 &
 loop_pid=$!
@@ -351,22 +363,24 @@ alert_of() { # <database>: its database_size alerts in /api/alerts, any state
     alerts_json
     jq -c --arg s "database $1" '[.[] | select(.kind == "database_size" and .subject == $s)]' "$WORK/alerts.json"
 }
-open_for_test() { [ "$(alert_of "$TEST_DB" | jq '[.[] | select(.state == "open")] | length')" = 1 ]; }
+open_for_fleet() { [ "$(alert_of "$FLEET_DB" | jq '[.[] | select(.state == "open")] | length')" = 1 ]; }
 
-# --- (1) the test database opens one alert; the live one does not --------------------------
+# --- (1) the fleet test database opens one alert; the others do not -----------------------
 
-if wait_until 40 open_for_test; then
-    expect_eq "$(alert_of "$TEST_DB" | jq -c --argjson floor "$((floor_mb * 1048576))" --argjson log "$log_bytes" --arg db "$TEST_DB" '[.[] | .evidence as $e | {
+if wait_until 40 open_for_fleet; then
+    expect_eq "$(alert_of "$FLEET_DB" | jq -c --argjson floor "$((floor_mb * 1048576))" --argjson log "$log_bytes" --arg db "$FLEET_DB" '[.[] | .evidence as $e | {
         database: $e.database, role: $e.role, schemas: $e.schemas,
         above_floor: ($e.bytes >= $floor), above_ratio: ($e.bytes > 10 * $e.log_bytes),
         ratio: ($e.ratio == ((($e.bytes / $e.log_bytes) * 10 | round) / 10)),
         log_from_live: ($e.log_bytes >= $log),
         text: ((.text | contains($db)) and (.text | contains("40 schemas")))}]')" \
-        "[{\"database\":\"$TEST_DB\",\"role\":\"test\",\"schemas\":40,\"above_floor\":true,\"above_ratio\":true,\"ratio\":true,\"log_from_live\":true,\"text\":true}]" \
-        "(1) the test database's database_size alert: its evidence, and a text naming it and its 40 schemas"
+        "[{\"database\":\"$FLEET_DB\",\"role\":\"fleet_test\",\"schemas\":40,\"above_floor\":true,\"above_ratio\":true,\"ratio\":true,\"log_from_live\":true,\"text\":true}]" \
+        "(1) the fleet test database's database_size alert: its evidence, and a text naming it and its 40 schemas"
 else
-    check_failed "(1) the test database ($test_bytes B, 40 schemas, over 10 times the live log's $log_bytes B and over the $floor_mb MB floor) has no open database_size alert 40 s after the loop started: $(alert_of "$TEST_DB" | head -c 400)"
+    check_failed "(1) the fleet test database ($test_bytes B, 40 schemas, over 10 times the live log's $log_bytes B and over the $floor_mb MB floor) has no open database_size alert 40 s after the loop started: $(alert_of "$FLEET_DB" | head -c 400)"
 fi
+expect_eq "$(alert_of "$TEST_DB" | jq -c 'length')" 0 \
+    "(1) no database_size alert for the gates' test database (under the floor)"
 expect_eq "$(alert_of "$SPAWN_DB_NAME" | jq -c 'length')" 0 \
     "(1) no database_size alert for the live database (above the floor, within 10 times its log)"
 note "(1) checked: the alert"
@@ -375,9 +389,9 @@ note "(1) checked: the alert"
 
 code=$(curl -s --noproxy '*' -o "$WORK/fleet.json" -w '%{http_code}' "$base/api/fleet" 2>/dev/null) || code=000
 [ "$code" = 200 ] || harness "GET /api/fleet answered $code"
-expect_eq "$(jq -c '.health.storage | {test: (.test_database | {name, schemas, sized: (.bytes > 0)}), log: (.database.log_bytes | type)}' "$WORK/fleet.json" 2>/dev/null)" \
-    "{\"test\":{\"name\":\"$TEST_DB\",\"schemas\":40,\"sized\":true},\"log\":\"number\"}" \
-    "(3) /api/fleet health.storage.test_database and database.log_bytes"
+expect_eq "$(jq -c '.health.storage | {tests: [.test_databases[]? | {role, name, schemas, sized: (.bytes > 0)}], log: (.database.log_bytes | type)}' "$WORK/fleet.json" 2>/dev/null)" \
+    "{\"tests\":[{\"role\":\"test\",\"name\":\"$TEST_DB\",\"schemas\":0,\"sized\":true},{\"role\":\"fleet_test\",\"name\":\"$FLEET_DB\",\"schemas\":40,\"sized\":true}],\"log\":\"number\"}" \
+    "(3) /api/fleet health.storage.test_databases (the gates', then the fleet's) and database.log_bytes"
 cat >"$WORK/storage.test.mjs" <<'TEST'
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -388,15 +402,17 @@ const env = process.env;
 const { storageView } = await import(pathToFileURL(`${env.BB_TREE}/web/src/resources.ts`).href);
 const fleet = JSON.parse(readFileSync(`${env.BB_WORK}/fleet.json`, "utf8"));
 
-test("(3) the storage rows name the test database's schemas and the log's size", () => {
+test("(3) the storage rows name the test databases' schemas and the log's size", () => {
   const rows = storageView(fleet.health.storage).rows;
-  const testRow = rows.find((row) => row.name === "Test database");
-  assert.ok(testRow, `a Test database row: ${JSON.stringify(rows)}`);
-  assert.equal(testRow.note, "40 schemas");
+  const gateRow = rows.find((row) => row.name === "Gate test database");
+  const fleetRow = rows.find((row) => row.name === "Fleet test database");
+  assert.ok(gateRow && fleetRow, `the two test database rows: ${JSON.stringify(rows)}`);
+  assert.equal(gateRow.note, "0 schemas");
+  assert.equal(fleetRow.note, "40 schemas");
   const database = rows.find((row) => row.name === "Database");
   assert.match(database?.note ?? "", /log \d+(\.\d)? MB/);
-  const without = storageView({ ...fleet.health.storage, test_database: null }).rows;
-  assert.equal(without.find((row) => row.name === "Test database"), undefined, "no row without a test database");
+  const without = storageView({ ...fleet.health.storage, test_databases: [] }).rows;
+  assert.equal(without.find((row) => /test database/.test(row.name)), undefined, "no row without a test database");
 });
 TEST
 if ! BB_TREE=$tree BB_WORK=$WORK node --test "$WORK/storage.test.mjs" >"$WORK/storage.out" 2>&1; then
@@ -412,17 +428,17 @@ do $$ begin
     for s in 6..40 loop execute format('drop schema bb_left_%s cascade', s); end loop;
 end $$;
 SQL
-capture psql -d "$TEST_DB" -q -f "$WORK/drop.sql"
-[ "$status" -eq 0 ] || harness "dropping the test database's schemas failed: $(err)"
-after_bytes=$(psql -d "$TEST_DB" -tA -c "select pg_database_size(current_database())")
-[ "$after_bytes" -lt $((10 * log_bytes)) ] || harness "the test database ($after_bytes) is still over 10 times the log ($log_bytes) after the drop"
-cleared() { [ "$(alert_of "$TEST_DB" | jq -c '[.[] | .state]')" = '["cleared"]' ]; }
+capture psql -d "$FLEET_DB" -q -f "$WORK/drop.sql"
+[ "$status" -eq 0 ] || harness "dropping the fleet test database's schemas failed: $(err)"
+after_bytes=$(psql -d "$FLEET_DB" -tA -c "select pg_database_size(current_database())")
+[ "$after_bytes" -lt $((10 * log_bytes)) ] || harness "the fleet test database ($after_bytes) is still over 10 times the log ($log_bytes) after the drop"
+cleared() { [ "$(alert_of "$FLEET_DB" | jq -c '[.[] | .state]')" = '["cleared"]' ]; }
 if wait_until 40 cleared; then
-    expect_eq "$(alert_of "$TEST_DB" | jq -c '[.[] | .cleared_evidence | {schemas, within: (.bytes <= 10 * .log_bytes)}]')" \
+    expect_eq "$(alert_of "$FLEET_DB" | jq -c '[.[] | .cleared_evidence | {schemas, within: (.bytes <= 10 * .log_bytes)}]')" \
         '[{"schemas":5,"within":true}]' \
         "(2) the alert's cleared evidence: the reading that cleared it (5 schemas left, within 10 times the log)"
 else
-    check_failed "(2) the test database's alert did not clear within 40 s of dropping 35 of its 40 schemas ($after_bytes B now): $(alert_of "$TEST_DB" | head -c 400)"
+    check_failed "(2) the fleet test database's alert did not clear within 40 s of dropping 35 of its 40 schemas ($after_bytes B now): $(alert_of "$FLEET_DB" | head -c 400)"
 fi
 note "(2) checked: the clearing"
 
@@ -431,5 +447,5 @@ if [ -s "$WORK/failures" ]; then
     echo "074: $(wc -l <"$WORK/failures") check(s) failed" >&2
     exit 1
 fi
-echo "074: a database that outgrows the live log opens a database_size alert and clears when it no longer does; storage names the test database's schemas and the log's size"
+echo "074: a database that outgrows the live log opens a database_size alert and clears when it no longer does; storage names the test databases' schemas and the log's size"
 exit 0
