@@ -3818,8 +3818,12 @@ runnable_tests() {
 # candidate's target directory is the one check-tests reuses. What names
 # cannot see: a test kept by name whose body no longer tests anything (the
 # empty-body check above catches only an empty one), and one of two
-# same-named tests in different crates traded for a third.
-if [ -f "$work/baseline/Cargo.toml" ] && [ -f "$work/candidate/Cargo.toml" ]; then
+# same-named tests in different crates traded for a third. A gate of a
+# commit against itself (scripts/rsi/nightly.sh: main judged as its own
+# candidate, one scenario at a time) has no diff to drop a test, and skips
+# the listing: it compiles both trees' test binaries.
+if [ -f "$work/baseline/Cargo.toml" ] && [ -f "$work/candidate/Cargo.toml" ] &&
+    [ "$base_commit" != "$candidate_commit" ]; then
     section "tests: what cargo runs, base and candidate"
     listing_started=$(date +%s)
     mkdir -p "$work/base-target"
@@ -3954,6 +3958,9 @@ candidate_job() {
                     [ ! -e "$job/slot-waited" ] || return 0
                     job_output 4
                     job_stage "$(($(stage_now) - run_at))" "exit $on_base2" "$base_name (again)"
+                    # scripts/rsi/nightly.sh reads these words exactly (a check
+                    # main fails on every run, judged against itself, is its
+                    # red): reword them there too.
                     printf '%s\n' "$run_status, then $again on the candidate; $on_base, then $on_base2 on the base" >"$job/runs"
                     if [ "$on_base" -eq 1 ] && [ "$on_base2" -eq 1 ] &&
                         shared_failed "$job/out.3" "$job/out.4" "$job/main-red"; then

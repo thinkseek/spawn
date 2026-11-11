@@ -1,4 +1,6 @@
 #!/bin/sh
+# Nightly (rsi/scenarios/nightly/, run by scripts/rsi/nightly.sh on live main, alone on a
+# held host; gate v2 step 5a). Owner: the lead. Left the gate unchanged otherwise.
 # Black box: the loop's database work follows change, not the clock. The
 # dispatcher's step (dispatch::step), the residents' and the supervisor's
 # liveness (supervise::keep_residents, keep_alive) and the mission rows
