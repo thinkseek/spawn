@@ -15,28 +15,32 @@
 #
 # 1. One nightly per source at a time (flock on <facts>/.<source>.lock; a
 #    second exits 0 and says so).
-# 2. A quiet host: it starts only when no gate runs (no active spawn-gate-*
-#    unit and no scripts/rsi/gate.sh process), waiting up to
-#    SPAWN_NIGHTLY_WAIT_SECS (default 7200), checked each
-#    SPAWN_NIGHTLY_POLL_SECS (60); past that it writes `skipped` and says
-#    so. Then it holds the host for its whole run through the budget every
-#    gate takes (scripts/rsi/gate.sh, "Host scenario slots"): it locks slots
-#    2..N of $HOME/.cache/spawn/gate-slots, so its own gate runs in slot 1
-#    and no other gate's scenario runs beside it (one waits, up to its
-#    SPAWN_GATE_SLOT_WAIT_SECS, and then has no room: judged again after
-#    the backoff). Builds and test listings take no slot: a gate that
-#    starts meanwhile may still build beside it, so the gates seen running
-#    beside it are counted (`gates_beside` in the fact file, sampled each
-#    SPAWN_NIGHTLY_SAMPLE_SECS, 15) and a flaky or red result says how
-#    quiet the host was.
+# 2. A quiet host, made rather than waited for (the fleet's gates run
+#    around the clock): it takes every slot of the budget all gates take
+#    (scripts/rsi/gate.sh, "Host scenario slots"; $HOME/.cache/spawn/
+#    gate-slots, 1..N) at once, each as the scenario run holding it ends,
+#    up to SPAWN_NIGHTLY_WAIT_SECS (default 7200); past that it writes
+#    `skipped` and says so. A gate that wants a slot meanwhile waits, so
+#    the host drains. Once all are held it lets slot 1 go to its own gate
+#    and keeps 2..N for its whole run: no other gate's scenario runs beside
+#    it (one waits, up to its SPAWN_GATE_SLOT_WAIT_SECS, and then has no
+#    room: judged again after the backoff). Without a budget (no flock, no
+#    host_jobs) it waits instead for no gate to run (no active
+#    spawn-gate-* unit, no scripts/rsi/gate.sh process), checked each
+#    SPAWN_NIGHTLY_POLL_SECS (60), up to the same. Builds and test listings
+#    take no slot: a gate may still build beside it, so the gates seen
+#    running beside it are counted (`gates_beside` in the fact file,
+#    sampled each SPAWN_NIGHTLY_SAMPLE_SECS, 15) and a flaky or red result
+#    says how quiet the host was. A run stopped before its end (the unit's
+#    TimeoutStartSec, a stop) writes `skipped`, saying so.
 # 3. Each scenario is judged by the gate itself, main against itself
 #    (gate.sh <repo> <main> <main> <dir>), with the integrator's gate
 #    environment (SPAWN_GATE_ENV_FILE, as deploy.sh's base-cache warm-up
 #    reads it) and SPAWN_GATE_JOBS=1. <dir> is a copy of the controller's
 #    scenario directory without its *.sh, holding the one scenario as
 #    `check-nightly-<name>-run.sh`: a check (its name ends in a letter, so
-#    the base phase does not take it for an objective and run it there too), so a failure is run again on the
-#    candidate and then on the base, and a pass on the second run is a
+#    the base phase does not take it for an objective and run it there
+#    too), so a failure is run again on the candidate and then on the base, and a pass on the second run is a
 #    flake (an objective that fails on the base would be read as unsolved
 #    and pass). The gate's build cache builds main once; the tests listing
 #    is skipped, as a commit against itself drops no test.
@@ -53,8 +57,9 @@
 #    nightly), written whole: {"v":1,"main":<sha>,"at":<ms>,"state":
 #    "green|red|flaky|skipped","failed":[<names>],"last_green":<sha or
 #    null>}, and beside those `red_since` (the main of the first red run of
-#    this red, null otherwise), `flaky`, `skipped` (names), `gates_beside`
-#    and `reason` (for skipped). State: red if any failed, else skipped if
+#    this red, null otherwise), `flaky`, `skipped` (names), `gates_beside`,
+#    `reason` (for skipped), `skipped_runs` (skipped runs in a row, this
+#    one included) and `judged_at` (the last run that judged, not skipped). State: red if any failed, else skipped if
 #    any was skipped, else flaky if any was, else green. last_green moves to
 #    main on green or flaky, which end a red (red_since null). A skipped run
 #    during a red keeps it: red_since and the red's failed list stay, as
@@ -72,6 +77,13 @@
 #    EnvironmentFile), reached through PG* variables (scripts/pg-url.sh),
 #    never an argument; nothing here prints it.
 #
+# 6. A nightly that covers nothing raises ONE owner alert too,
+#    `nightly_stale` (check_stale below: two skipped runs in a row, or no
+#    fact younger than 26 h), cleared by the first run that judges.
+#    `nightly.sh --stale <source>` makes that check alone (no run), hourly
+#    from spawn-nightly-stale@<source>.timer, so a nightly that never runs
+#    is told as well.
+#
 # Exit: 0 when the fact file was written (whatever the state) or another
 # run holds the source, 2 when it could not be (no main, no scenario
 # directory, a fact file that cannot be written).
@@ -83,7 +95,12 @@ die() {
   exit 2
 }
 
-[ $# -ge 1 ] && [ $# -le 2 ] || die "usage: nightly.sh <source> [<scenarios-dir>]"
+stale_only=""
+if [ "${1-}" = --stale ]; then
+  stale_only=1
+  shift
+fi
+[ $# -ge 1 ] && [ $# -le 2 ] || die "usage: nightly.sh [--stale] <source> [<scenarios-dir>]"
 source_name=$1
 case $source_name in '' | *[!A-Za-z0-9._-]*) die "a source is a name ([A-Za-z0-9._-]), not '$source_name'" ;; esac
 live=${SPAWN_LIVE:-$HOME/.local/share/spawn-rsi}
@@ -99,18 +116,24 @@ gate_env_file=${SPAWN_GATE_ENV_FILE:-$HOME/.config/spawn/gate-env}
 wait_secs=${SPAWN_NIGHTLY_WAIT_SECS:-7200}
 poll_secs=${SPAWN_NIGHTLY_POLL_SECS:-60}
 sample_secs=${SPAWN_NIGHTLY_SAMPLE_SECS:-15}
+stale_secs=${SPAWN_NIGHTLY_STALE_SECS:-93600}
 slot_dir=$HOME/.cache/spawn/gate-slots
 
 mkdir -p "$facts" || die "cannot make $facts"
-exec 9>>"$facts/.$source_name.lock"
-if ! flock -n 9; then
-  say "another nightly of $source_name runs; this one does nothing"
-  exit 0
+if [ -z "$stale_only" ]; then
+  exec 9>>"$facts/.$source_name.lock"
+  if ! flock -n 9; then
+    say "another nightly of $source_name runs; this one does nothing"
+    exit 0
+  fi
 fi
 
 now_ms() { echo $(($(date +%s%N) / 1000000)); }
 
-main=$(git --git-dir="$repo" rev-parse --verify --quiet refs/heads/main) || die "no main in $repo"
+main=""
+if [ -z "$stale_only" ]; then
+  main=$(git --git-dir="$repo" rev-parse --verify --quiet refs/heads/main) || die "no main in $repo"
+fi
 previous='{}'
 if [ -s "$fact" ]; then
   previous=$(jq -c 'if type == "object" then . else {} end' "$fact" 2>/dev/null) || previous='{}'
@@ -121,6 +144,10 @@ last_green=$(jq -r '.last_green // empty' <<<"$previous")
 red_since=$(jq -r 'if .state == "red" then (.red_since // .main // empty) else (.red_since // empty) end' <<<"$previous")
 red_failed=""
 [ -z "$red_since" ] || red_failed=$(jq -r '(.failed // [])[]' <<<"$previous")
+# Skipped runs in a row, and when a run last judged anything (not skipped).
+skipped_runs=$(jq -r '.skipped_runs // 0' <<<"$previous")
+judged_at=$(jq -r '.judged_at // empty' <<<"$previous")
+fact_written=""
 
 # write_fact <state> <failed> <flaky> <skipped> <gates_beside> <reason>: the
 # fact file, whole (the lists newline-separated names).
@@ -140,16 +167,26 @@ write_fact() {
     [ -z "$red_since" ] || failed=$red_failed
     ;;
   esac
+  if [ "$state" = skipped ]; then
+    skipped_runs=$((skipped_runs + 1))
+  else
+    skipped_runs=0
+    judged_at=$at
+  fi
   jq -n --arg main "$main" --argjson at "$at" --arg state "$state" \
     --arg failed "$failed" --arg flaky "$3" --arg skipped "$4" --argjson beside "$5" \
-    --arg reason "$6" --arg last_green "$last_green" --arg red_since "$red_since" '
+    --arg reason "$6" --arg last_green "$last_green" --arg red_since "$red_since" \
+    --argjson skipped_runs "$skipped_runs" --arg judged_at "$judged_at" '
     def names: split("\n") | map(select(. != ""));
     {v: 1, main: $main, at: $at, state: $state, failed: ($failed | names),
      last_green: (if $last_green == "" then null else $last_green end),
      red_since: (if $red_since == "" then null else $red_since end),
-     flaky: ($flaky | names), skipped: ($skipped | names), gates_beside: $beside}
+     flaky: ($flaky | names), skipped: ($skipped | names), gates_beside: $beside,
+     skipped_runs: $skipped_runs,
+     judged_at: (if $judged_at == "" then null else ($judged_at | tonumber) end)}
     + (if $reason == "" then {} else {reason: $reason} end)' >"$fact.tmp" &&
     mv -f "$fact.tmp" "$fact" || die "cannot write $fact"
+  fact_written=1
   say "$source_name at $main: $state${red_since:+ (red since $red_since)}${2:+ (failed: $(tr '\n' ' ' <<<"$2" | sed 's/ $//'))}${3:+ (flaky: $(tr '\n' ' ' <<<"$3" | sed 's/ $//'))}${4:+ (skipped: $(tr '\n' ' ' <<<"$4" | sed 's/ $//'))}${6:+: $6}; gates beside it: $5; $fact"
 }
 
@@ -182,10 +219,11 @@ select spawn_alert_record(:'r'::jsonb);
 SQL
 }
 
-# open_alerts: the keys of this source's open nightly_red alerts.
+# open_alerts [<kind>]: the keys of this source's open alerts of the kind
+# (nightly_red by default).
 open_alerts() {
-  psql -X -At -q -v ON_ERROR_STOP=1 -v s="$source_name" <<'SQL'
-select key from spawn_alerts where kind = 'nightly_red' and subject = :'s' and state = 'open' order by key;
+  psql -X -At -q -v ON_ERROR_STOP=1 -v s="$source_name" -v k="${1:-nightly_red}" <<'SQL'
+select key from spawn_alerts where kind = :'k' and subject = :'s' and state = 'open' order by key;
 SQL
 }
 
@@ -227,23 +265,78 @@ raise_red() { # raise_red <failed names>
   fi
 }
 
-clear_red() {
+clear_red() { # clear_red [<kind>]: every open alert of the kind (nightly_red)
   db_open || return 0
-  local open key
-  if ! open=$(open_alerts); then
+  local open key kind=${1:-nightly_red}
+  if ! open=$(open_alerts "$kind"); then
     say "the alerts could not be read: none cleared"
     return 0
   fi
   while IFS= read -r key; do
     [ -n "$key" ] || continue
-    if alert_record "$(jq -cn --arg key "$key" --arg subject "$source_name" --arg main "$main" \
-      '{type: "alert.cleared", key: $key, kind: "nightly_red", subject: $subject,
-        evidence: {main: $main, state: "green"}}')" >/dev/null; then
+    if alert_record "$(jq -cn --arg key "$key" --arg kind "$kind" --arg subject "$source_name" \
+      --arg main "$(jq -r '.main // empty' "$fact" 2>/dev/null)" --arg state "$(jq -r '.state // empty' "$fact" 2>/dev/null)" \
+      '{type: "alert.cleared", key: $key, kind: $kind, subject: $subject,
+        evidence: {main: $main, state: $state}}')" >/dev/null; then
       say "alert cleared: $key"
     else
       say "alert $key could not be cleared (above)"
     fi
   done <<<"$open"
+}
+
+# check_stale: the nightly's coverage. Stale when no run judged anything
+# lately: the newest fact older than SPAWN_NIGHTLY_STALE_SECS (93600, 26 h),
+# SPAWN_NIGHTLY_STALE_RUNS skipped runs in a row (default 2), or no fact
+# at all though spawn-nightly@<source>.timer has fired. Stale raises ONE
+# owner alert, kind `nightly_stale`, key nightly_stale:<source>:<judged_at
+# of the last run that judged, or never>; the first run that judges clears
+# it. Run at the end of every nightly, and on its own (`--stale`) by
+# spawn-nightly-stale@<source>.timer hourly, so a nightly that never runs is
+# told too.
+check_stale() {
+  local why="" age runs triggered key open evidence
+  if [ ! -s "$fact" ]; then
+    triggered=$(systemctl --user show -p LastTriggerUSec --value "spawn-nightly@$source_name.timer" 2>/dev/null)
+    case $triggered in '' | 0 | n/a) ;; *) why="no fact file, though spawn-nightly@$source_name.timer last fired at $triggered" ;; esac
+  else
+    age=$((($(now_ms) - $(jq -r '.at // 0' "$fact")) / 1000))
+    runs=$(jq -r '.skipped_runs // 0' "$fact")
+    if [ "$age" -gt "$stale_secs" ]; then
+      why="the newest nightly of $source_name is ${age}s old (over ${stale_secs}s)"
+    elif [ "$runs" -ge "${SPAWN_NIGHTLY_STALE_RUNS:-2}" ]; then
+      why="$runs nightly runs of $source_name in a row were skipped, the last: $(jq -r '.reason // "no reason"' "$fact")"
+    fi
+  fi
+  if [ -z "$why" ]; then
+    # Cleared only by a fact of a run that judged (a missing file, or one
+    # whose last run was skipped, is not coverage).
+    if [ -s "$fact" ] && [ "$(jq -r '.skipped_runs // 0' "$fact")" = 0 ]; then
+      clear_red nightly_stale
+    fi
+    return 0
+  fi
+  db_open || return 0
+  key="nightly_stale:$source_name:$( (jq -r '.judged_at // "never"' "$fact" 2>/dev/null) || echo never)"
+  [ "$key" != "nightly_stale:$source_name:" ] || key="nightly_stale:$source_name:never"
+  if ! open=$(open_alerts nightly_stale); then
+    say "the alerts could not be read: no alert raised"
+    return 0
+  fi
+  if grep -qxF -- "$key" <<<"$open"; then
+    say "stale: $why; alert $key is open already"
+    return 0
+  fi
+  evidence=$(jq -cn --arg why "$why" --arg fact "$fact" \
+    --argjson last "$( (jq -c '{state, main, at, judged_at, skipped_runs, reason}' "$fact" 2>/dev/null) || echo null)" \
+    '{why: $why, fact: $fact, last: $last}')
+  if alert_record "$(jq -cn --arg key "$key" --arg subject "$source_name" --argjson evidence "$evidence" \
+    --arg text "the nightly of $source_name covers nothing: $why" '{type: "alert.fired", key: $key,
+      kind: "nightly_stale", subject: $subject, evidence: $evidence, text: $text, notice: false}')" >/dev/null; then
+    say "stale: $why; alert fired: $key"
+  else
+    say "alert $key could not be recorded (above)"
+  fi
 }
 
 # gates_running [<own work dir>]: how many gates run on this host: active
@@ -276,58 +369,35 @@ gates_running() {
   [ "$units" -ge "$procs" ] && echo "$units" || echo "$procs"
 }
 
+if [ -n "$stale_only" ]; then
+  check_stale
+  exit 0
+fi
+
+# A run stopped before its fact (the unit's TimeoutStartSec, a stop, a
+# kill of its gate) says so: skipped, and why.
+started_s=$(date +%s)
+on_signal() {
+  if [ -z "$fact_written" ]; then
+    local beside
+    beside=$(cat "${work:-/nonexistent}/beside" 2>/dev/null)
+    write_fact skipped "" "" "" "${beside:-0}" \
+      "stopped by a signal after $(($(date +%s) - started_s))s (the unit's timeout, or a stop): not judged"
+    check_stale
+  fi
+  exit 2
+}
+trap on_signal INT TERM HUP
+
 list=()
 for file in "$scenarios"/nightly/*.sh; do
   [ -f "$file" ] && list+=("$file")
 done
 if [ ${#list[@]} -eq 0 ]; then
   write_fact skipped "" "" "" 0 "no scenario in $scenarios/nightly"
+  check_stale
   exit 0
 fi
-
-# 2. The quiet host.
-deadline=$(($(date +%s) + wait_secs))
-while :; do
-  busy=$(gates_running)
-  [ "$busy" -gt 0 ] || break
-  if [ "$(date +%s)" -ge "$deadline" ]; then
-    write_fact skipped "" "" "" "$busy" "$busy gate(s) still running after ${wait_secs}s: not run"
-    exit 0
-  fi
-  sleep "$poll_secs"
-done
-
-work=$(mktemp -d "$facts/.run-$source_name.XXXXXX") || die "cannot make a work directory under $facts"
-sampler=""
-cleanup() {
-  [ -z "$sampler" ] || kill "$sampler" 2>/dev/null
-  rm -rf "$work"
-}
-trap cleanup EXIT
-trap 'exit 2' INT TERM HUP
-
-# The host's budget: the file every gate reads, else the integrator's
-# SPAWN_GATE_HOST_JOBS (below), else none held.
-held=()
-hold_slots() { # hold_slots <host_jobs>
-  local n=$1 i fd
-  [[ $n =~ ^[1-9][0-9]*$ ]] || return 0
-  command -v flock >/dev/null 2>&1 || return 0
-  mkdir -p "$slot_dir" && chmod 700 "$slot_dir" 2>/dev/null || return 0
-  for ((i = 2; i <= n; i++)); do
-    (umask 077 && : >>"$slot_dir/slot.$i") 2>/dev/null || continue
-    exec {fd}>>"$slot_dir/slot.$i"
-    # A gate that started after the quiet check may hold one for a run.
-    if flock -w "$((wait_secs < 1800 ? wait_secs : 1800))" "$fd"; then
-      held+=("$fd")
-    else
-      exec {fd}>&-
-      say "slot $i stayed taken: run beside its holder"
-    fi
-  done
-  (umask 077 && : >>"$slot_dir/slot.1") 2>/dev/null || true
-  say "holding $((${#held[@]})) of $n host scenario slots (slot 1 is its own gate's)"
-}
 
 # The integrator's gate environment (deploy/gate-env.sh), as deploy.sh's
 # warm-up takes it.
@@ -356,7 +426,68 @@ if [ -z "$host_jobs" ]; then
     case $assignment in SPAWN_GATE_HOST_JOBS=*) host_jobs=${assignment#*=} ;; esac
   done
 fi
-hold_slots "${host_jobs:-0}"
+# The host's budget: the file every gate reads, else the integrator's
+# SPAWN_GATE_HOST_JOBS (above). drain_slots <host_jobs>: every slot taken,
+# 1..N, waiting (until the deadline) for the scenario runs that hold them to
+# end, so the host drains towards quiet rather than waiting for it: a gate
+# that wants one meanwhile waits, the integrator's next gates too. Slot 1
+# is let go once all are held, for the nightly's own gate. 1 when the
+# deadline passed first (all let go again).
+held=()
+drain_slots() {
+  local n=$1 i fd left
+  for ((i = 1; i <= n; i++)); do
+    (umask 077 && : >>"$slot_dir/slot.$i") 2>/dev/null || continue
+    exec {fd}>>"$slot_dir/slot.$i"
+    left=$((deadline - $(date +%s)))
+    [ "$left" -gt 0 ] || left=0
+    if flock -w "$left" "$fd"; then
+      held+=("$fd")
+    else
+      exec {fd}>&-
+      for fd in "${held[@]}"; do eval "exec $fd>&-"; done
+      held=()
+      return 1
+    fi
+  done
+  eval "exec ${held[0]}>&-"
+  held=("${held[@]:1}")
+  say "holding ${#held[@]} of $n host scenario slots, drained in $(($(date +%s) - started_s))s (slot 1 is its own gate's)"
+}
+
+# 2. A quiet host. With a slot budget, the slots drained (above), up to
+# SPAWN_NIGHTLY_WAIT_SECS; without one (no flock, no budget), no gate
+# running, checked each SPAWN_NIGHTLY_POLL_SECS, up to the same.
+deadline=$(($(date +%s) + wait_secs))
+if [[ ${host_jobs:-} =~ ^[1-9][0-9]*$ ]] && command -v flock >/dev/null 2>&1 &&
+  mkdir -p "$slot_dir" && chmod 700 "$slot_dir" 2>/dev/null; then
+  if ! drain_slots "$host_jobs"; then
+    busy=$(gates_running)
+    write_fact skipped "" "" "" "$busy" "the host's scenario slots were not all free within ${wait_secs}s ($busy gate(s) running): not run"
+    check_stale
+    exit 0
+  fi
+else
+  while :; do
+    busy=$(gates_running)
+    [ "$busy" -gt 0 ] || break
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      write_fact skipped "" "" "" "$busy" "$busy gate(s) still running after ${wait_secs}s, and no slot budget to drain: not run"
+      check_stale
+      exit 0
+    fi
+    sleep "$poll_secs"
+  done
+fi
+
+work=$(mktemp -d "$facts/.run-$source_name.XXXXXX") || die "cannot make a work directory under $facts"
+sampler=""
+cleanup() {
+  [ -z "$sampler" ] || kill "$sampler" 2>/dev/null
+  rm -rf "$work"
+}
+trap cleanup EXIT
+
 
 # The gates beside it, sampled for the whole run (the largest count seen).
 : >"$work/beside"
@@ -493,4 +624,5 @@ case $state in
 red) raise_red "$failed" ;;
 green | flaky) clear_red ;;
 esac
+check_stale
 exit 0
