@@ -22,7 +22,11 @@ use crate::PostgresStore;
 /// - `missions`: each mission open in the window (`spawn_mission_spans`),
 ///   by id, with its span and its tasks' open intervals as the scorecard's
 ///   throughput counts them (each task's latest assignment before `$2`, to
-///   its close; `null` while open at `$2`).
+///   its close; `null` while open at `$2`), and `owner_work`: whether,
+///   as its last settings record before `$2` (`mission.added`,
+///   `mission.configured` or a legacy mission row) left it, it has no
+///   objective backlog (`objectives` not an object), so its work comes from
+///   the owner (objective 062).
 const WINDOW: &str = r"
 with
   decided as (
@@ -72,6 +76,18 @@ select jsonb_build_object(
   'missions', (select coalesce(jsonb_agg(jsonb_build_object(
                   'mission', m.mission_id, 'text', left(m.text, 200),
                   'opened_at_ms', m.opened_at_ms, 'closed_at_ms', m.closed_at_ms,
+                  'owner_work', coalesce((
+                      select coalesce(jsonb_typeof(coalesce(r.record -> 'objectives',
+                                                            r.record -> 'row' -> 'objectives')),
+                                      'null') <> 'object'
+                        from spawn_experience_records r
+                       where r.at_ms < $2
+                         and (r.type in ('mission.added', 'mission.configured')
+                              or (r.type = 'legacy.imported'
+                                  and r.record ->> 'table' = 'mission_missions'))
+                         and spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id'))
+                             = m.mission_id
+                       order by r.seq desc limit 1), true),
                   'tasks', (select coalesce(jsonb_agg(jsonb_build_array(s.assigned_at_ms, s.closed_at_ms)
                                                       order by s.assigned_at_ms, s.task_id), '[]'::jsonb)
                               from spans s where s.mission_id = m.mission_id))
