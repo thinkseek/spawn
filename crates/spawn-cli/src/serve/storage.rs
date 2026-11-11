@@ -47,7 +47,9 @@ pub(crate) fn kept_or_read(
     now_ms: i64,
     read: impl FnOnce(i64) -> Result<Value, String>,
 ) -> Result<Value, String> {
-    let mut kept = kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut kept = kept
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(sizes) = kept
         .as_ref()
         .filter(|kept| (0..READ_EVERY_MS).contains(&now_ms.saturating_sub(kept.read_at_ms)))
@@ -110,7 +112,7 @@ pub(crate) fn days_left(free: Option<u64>, growth: Option<i64>) -> Option<u64> {
 /// database's, the archive's growth and Claude Code's count before, from
 /// `samples` (`{oldest, before}`, as `PostgresStore::host_storage` reads
 /// them for this moment).
-pub(crate) fn sizes(read_at_ms: i64, walked: &Walked, samples: &Value, database: Value) -> Value {
+pub(crate) fn sizes(read_at_ms: i64, walked: &Walked, samples: &Value, database: &Value) -> Value {
     let path = |path: &Path| path.display().to_string();
     let root = walked.root.as_deref();
     json!({
@@ -130,7 +132,7 @@ pub(crate) fn sizes(read_at_ms: i64, walked: &Walked, samples: &Value, database:
             "path": path(root),
             "bytes": walked.workspaces.bytes,
         })),
-        "database": database,
+        "database": database.clone(),
         "growth_bytes_per_day": root.and_then(|_| growth(walked.archive.bytes, &samples["oldest"], read_at_ms)),
     })
 }
@@ -156,7 +158,7 @@ pub(crate) fn report(store: &PostgresStore, now_ms: i64) -> Result<Value, String
             )
             .map_err(|error| error.to_string())?;
         let database = store.database_size().map_err(|error| error.to_string())?;
-        Ok(sizes(read_at_ms, &walked, &samples, database))
+        Ok(sizes(read_at_ms, &walked, &samples, &database))
     })?;
     let free = root
         .as_deref()
@@ -189,10 +191,12 @@ mod tests {
         assert_eq!(ask(1000)["read_at_ms"], 1000);
         assert_eq!(ask(4000)["read_at_ms"], 1000, "kept: 3 s later");
         assert_eq!(ask(1000 + READ_EVERY_MS - 1)["read_at_ms"], 1000);
-        assert_eq!(ask(1000 + READ_EVERY_MS)["read_at_ms"], 1000 + READ_EVERY_MS);
+        assert_eq!(
+            ask(1000 + READ_EVERY_MS)["read_at_ms"],
+            1000 + READ_EVERY_MS
+        );
         // A clock set back reads again rather than keep a read from ahead.
         assert_eq!(ask(500)["read_at_ms"], 500);
-        drop(ask);
         assert_eq!(reads, [1000, 1000 + READ_EVERY_MS, 500]);
         // A failed read keeps nothing and says so.
         let empty: Mutex<Option<Kept>> = Mutex::new(None);
@@ -212,8 +216,14 @@ mod tests {
         assert_eq!(growth(12 * MIB, &oldest(DAY_MS - 1, 5 * MIB), now), None);
         assert_eq!(growth(12 * MIB, &Value::Null, now), None);
         // A shrinking archive grows by less than nothing.
-        assert_eq!(growth(MIB, &oldest(DAY_MS, 3 * MIB), now), Some(-2 * i64::try_from(MIB).expect("fits")));
-        assert_eq!(days_left(Some(10 * MIB), Some(i64::try_from(3 * MIB).expect("fits"))), Some(3));
+        assert_eq!(
+            growth(MIB, &oldest(DAY_MS, 3 * MIB), now),
+            Some(-2 * i64::try_from(MIB).expect("fits"))
+        );
+        assert_eq!(
+            days_left(Some(10 * MIB), Some(i64::try_from(3 * MIB).expect("fits"))),
+            Some(3)
+        );
         assert_eq!(days_left(Some(10 * MIB), Some(0)), None);
         assert_eq!(days_left(Some(10 * MIB), Some(-5)), None);
         assert_eq!(days_left(Some(10 * MIB), None), None);
@@ -238,7 +248,7 @@ mod tests {
             "before": {"at_ms": now - 7_200_000, "archive_bytes": 11_000, "projects_files": 40},
         });
         let database = json!({"bytes": 9, "tables": [{"name": "spawn_events", "bytes": 8}]});
-        let kept = sizes(now, &walked, &samples, database.clone());
+        let kept = sizes(now, &walked, &samples, &database);
         let figures = with_free(kept, Some(100_000));
         assert_eq!(
             figures,
@@ -256,7 +266,15 @@ mod tests {
             })
         );
         // Without samples: no growth, no count before, no days.
-        let bare = with_free(sizes(now, &walked, &json!({"oldest": null, "before": null}), json!(null)), Some(1));
+        let bare = with_free(
+            sizes(
+                now,
+                &walked,
+                &json!({"oldest": null, "before": null}),
+                &Value::Null,
+            ),
+            Some(1),
+        );
         assert_eq!(bare["growth_bytes_per_day"], Value::Null);
         assert_eq!(bare["projects"]["before"], Value::Null);
         assert_eq!(bare["days_left"], Value::Null);

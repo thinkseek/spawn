@@ -210,8 +210,20 @@ pub(crate) mod tests {
         // A link is not followed, nor counted.
         std::os::unix::fs::symlink(root.join(".transcripts"), root.join("agent_c/link"))
             .expect("a link");
-        assert_eq!(archive(&root), Sizes { bytes: 8000, files: 2 });
-        assert_eq!(workspaces(&root), Sizes { bytes: 2010, files: 2 });
+        assert_eq!(
+            archive(&root),
+            Sizes {
+                bytes: 8000,
+                files: 2
+            }
+        );
+        assert_eq!(
+            workspaces(&root),
+            Sizes {
+                bytes: 2010,
+                files: 2
+            }
+        );
         assert_eq!(walk(&root.join("missing"), &[]), Sizes::default());
         std::fs::remove_dir_all(&root).expect("clean up");
     }
@@ -230,9 +242,15 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&root).expect("clean up");
         // Root reads any directory: then the walk counts it, and nothing fails.
         let want = if readable {
-            Sizes { bytes: 500, files: 2 }
+            Sizes {
+                bytes: 500,
+                files: 2,
+            }
         } else {
-            Sizes { bytes: 100, files: 1 }
+            Sizes {
+                bytes: 100,
+                files: 1,
+            }
         };
         assert_eq!(sizes, want);
     }
@@ -258,7 +276,10 @@ pub(crate) mod tests {
         let start = 1_000_000;
         assert!(at(&mut sampler, start), "one at its start");
         assert!(!at(&mut sampler, start + 1), "none within the hour");
-        assert!(!at(&mut sampler, start + SAMPLE_EVERY_MS - 1), "none within the hour");
+        assert!(
+            !at(&mut sampler, start + SAMPLE_EVERY_MS - 1),
+            "none within the hour"
+        );
         assert!(at(&mut sampler, start + SAMPLE_EVERY_MS), "one after it");
         assert!(!at(&mut sampler, start + SAMPLE_EVERY_MS + 1000));
         std::fs::remove_dir_all(&root).expect("clean up");
@@ -277,11 +298,7 @@ pub(crate) mod tests {
     fn a_sample_that_could_not_be_written_is_tried_again_in_a_minute() {
         let root = scratch("sampler_retry");
         let mut sampler = Sampler::with(Some(&root), root.join("projects"));
-        assert!(
-            sampler
-                .check_with(0, |_| Err("down".to_string()))
-                .is_err()
-        );
+        assert!(sampler.check_with(0, |_| Err("down".to_string())).is_err());
         assert!(!sampler.due(59_999));
         assert!(sampler.due(60_000));
         std::fs::remove_dir_all(&root).expect("clean up");

@@ -36,16 +36,19 @@ fn samples_are_recorded_into_no_table_and_read_back_by_age() {
     let (store, schema) = store("storage_samples");
     let mut client = admin(&schema);
     let tables_before: i64 = client
-        .query_one(
-            "select count(*) from mission_missions",
-            &[],
-        )
+        .query_one("select count(*) from mission_missions", &[])
         .expect("count")
         .get(0);
     // Three samples, at 1000, 5000 and 9000.
     let mut ids = Vec::new();
-    for (at, archive, files) in [(1000, 5 * MIB, 40), (5000, 11 * MIB, 40), (9000, 12 * MIB, 3)] {
-        let id = store.host_record(&sample(archive, files)).expect("recorded");
+    for (at, archive, files) in [
+        (1000, 5 * MIB, 40),
+        (5000, 11 * MIB, 40),
+        (9000, 12 * MIB, 3),
+    ] {
+        let id = store
+            .host_record(&sample(archive, files))
+            .expect("recorded");
         place(&mut client, id, at);
         ids.push(id);
     }
@@ -119,5 +122,8 @@ fn the_database_figures_are_its_size_and_its_five_largest_tables() {
         .iter()
         .map(|table| table["bytes"].as_i64().expect("bytes"))
         .collect();
-    assert!(sizes.windows(2).all(|pair| pair[0] >= pair[1]), "largest first: {sizes:?}");
+    assert!(
+        sizes.windows(2).all(|pair| pair[0] >= pair[1]),
+        "largest first: {sizes:?}"
+    );
 }
