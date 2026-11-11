@@ -17,7 +17,10 @@
 #   less.
 # The second rule covers what the first cannot see: a gate runs its tests
 # in a PID namespace, so a live test's pid there may run nothing here.
-# Other names (no pid in them) always stay.
+# Other names (no pid in them) always stay. The /proc check sees this
+# host only: another host's tests (a gate runner's) are covered by the
+# idle rule alone. A real mode, when the owner allows one, must refuse a
+# --min-idle-hours below a floor (0 is accepted here, print-only).
 #
 # Output, one line per schema, then a summary:
 #   would-drop <schema> pid=<pid> idle=<h>h size=<MB>MB
@@ -49,6 +52,10 @@ esac
 here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=scripts/pg-url.sh
 . "$here/pg-url.sh"
+# Print-only by construction too: every transaction of this run's psql is
+# read-only, so not even a mistake below could drop anything.
+PGOPTIONS="${PGOPTIONS:+$PGOPTIONS }-c default_transaction_read_only=on"
+export PGOPTIONS
 pg_url_export "$SPAWN_TEST_DATABASE_URL" || { echo "sweep-test-schemas: SPAWN_TEST_DATABASE_URL is not one postgres URL" >&2; exit 2; }
 [ -n "${PGDATABASE-}" ] || { echo "sweep-test-schemas: the URL names no database" >&2; exit 2; }
 
