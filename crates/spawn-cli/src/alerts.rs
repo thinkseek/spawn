@@ -6706,6 +6706,76 @@ connections\n";
             });
         }
 
+        /// Objective 058: a step started while a backlog mission has had no
+        /// task in work for longer than the bound reads when its last task
+        /// ended from the store and fires once; a restart fires nothing
+        /// again; the mission's next assignment clears it. Owner work fires
+        /// nothing.
+        #[test]
+        fn a_started_step_reads_a_missions_idle_time_from_the_store() {
+            in_schema("alerts_mission_idle", |store, client| {
+                for id in [1, 2] {
+                    record(
+                        client,
+                        3,
+                        &format!(
+                            r#"{{"type":"mission.added","id":{id},"text":"m","origin":"human","sources":[]}}"#
+                        ),
+                    );
+                    record(
+                        client,
+                        3,
+                        &format!(
+                            r#"{{"type":"task.assigned","id":{id},"mission_id":{id},"kind":"ephemeral",
+                                "agent_id":"agent_w{id}","session_id":"session_w{id}","brief":"b",
+                                "created_by":"spawn-integrate","objective":{id}}}"#
+                        ),
+                    );
+                }
+                record(
+                    client,
+                    3,
+                    r#"{"type":"mission.configured","id":1,"accept":"gate",
+                        "objectives":{"backlog":"b","resident":"r"}}"#,
+                );
+                let ended = record(client, 2, r#"{"type":"task.cancelled","id":1}"#);
+                record(client, 2, r#"{"type":"task.cancelled","id":2}"#);
+                refold(client);
+                let key = format!("mission_idle:1:{ended}");
+                let monitor = started(store);
+                assert_eq!(monitor.missions[&1].idle.map(|(_, event)| event), Some(ended));
+                assert!(monitor.missions[&1].backlog && !monitor.missions[&2].backlog);
+                assert_eq!(alert(client, &key).0, "open");
+                let idle: i64 = client
+                    .query_one(
+                        "select count(*) from spawn_alerts where kind = 'mission_idle'",
+                        &[],
+                    )
+                    .expect("count")
+                    .get(0);
+                assert_eq!(idle, 1, "none for owner work");
+                let mut restarted = started(store);
+                let fired: i64 = client
+                    .query_one(
+                        "select count(*) from spawn_alerts where kind = 'mission_idle'",
+                        &[],
+                    )
+                    .expect("count")
+                    .get(0);
+                assert_eq!(fired, 1, "a restart fires nothing again");
+                let assigned = record(
+                    client,
+                    0,
+                    r#"{"type":"task.assigned","id":3,"mission_id":1,"kind":"ephemeral",
+                        "agent_id":"agent_w3","session_id":"session_w3","brief":"b",
+                        "created_by":"spawn-integrate","objective":3}"#,
+                );
+                refold(client);
+                restarted.check(store).expect("the step checks");
+                assert_eq!(alert(client, &key), ("cleared".to_string(), Some(assigned)));
+            });
+        }
+
         /// Objective 053: a step started on a run of rejections (a restart)
         /// knows the run's objective from the store, so the cancel of its
         /// task fires the notice the store's fold agrees with.
