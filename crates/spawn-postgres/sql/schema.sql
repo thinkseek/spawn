@@ -2377,6 +2377,13 @@ begin
         -- commit not in the source, main moving under it twice): main and
         -- every baseline stay where they were.
         null;
+    when 'source.push_no_verdict' then
+        -- An owner judging of a request ended with no verdict (the host's
+        -- fault, an abort, a base that disagreed with itself, ...): the
+        -- request stays pending, judged again after its backoff. It names
+        -- the request, the reason and where the gate's log is kept
+        -- (spawn-cli integrate/retained.rs). No outcome: folded into no table.
+        null;
     when 'integrator.draining', 'integrator.drained', 'integrator.drain_expired' then
         -- The integrator's drain (spawn_integrator_record): read from the
         -- log, folded into no table.
@@ -3536,6 +3543,7 @@ begin
        or p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
                                       'task.held', 'source.hold_expired', 'task.cancelled',
                                       'source.moved', 'source.push_refused',
+                                      'source.push_no_verdict',
                                       'task.over_budget', 'objective.solved',
                                       'source.main_red', 'source.main_probe',
                                       'source.main_green', 'task.shadow_gated',
@@ -3593,12 +3601,14 @@ begin
     --   judging's `accepted` (the `task.aborted` the done-mission rule below
     --   makes of a `stale` is that `stale`);
     -- - one `task.landed`;
-    -- - one owner's outcome, `source.moved` or `source.push_refused`.
+    -- - one owner's outcome, `source.moved` or `source.push_refused`;
+    -- - one owner's `source.push_no_verdict` (no outcome: the request stays
+    --   pending), and none after that judging's outcome.
     -- A judging is about one task or one owner's request: an outcome naming
     -- another under a judging already recorded is refused, never swallowed.
     if p_record ? 'judging' then
         if p_record ->> 'type' not in ('task.gated', 'task.landed', 'source.moved',
-                                       'source.push_refused')
+                                       'source.push_refused', 'source.push_no_verdict')
            or jsonb_typeof(p_record -> 'judging') is distinct from 'string'
            or p_record ->> 'judging' !~ '^[0-9a-f]{16,64}$' then
             raise exception 'a judging names a gate''s outcome by 16 to 64 hex digits: %', p_record;
@@ -3632,6 +3642,9 @@ begin
                    and (p_record ->> 'verdict' is distinct from 'stale'
                         or e.kind #>> '{detail,record,verdict}' is distinct from 'accepted')
                when 'task.landed' then e.kind #>> '{detail,record,type}' = 'task.landed'
+               when 'source.push_no_verdict' then
+                   e.kind #>> '{detail,record,type}'
+                       in ('source.moved', 'source.push_refused', 'source.push_no_verdict')
                else e.kind #>> '{detail,record,type}' in ('source.moved', 'source.push_refused')
                end
          order by coalesce(e.kind #>> '{detail,record,verdict}', '')

@@ -9,7 +9,8 @@
 //! under the temporary directory ([`crate::gate`]'s `judge`).
 //!
 //! Every outcome the judging records (`task.gated`, `task.landed`,
-//! `source.moved`, `source.push_refused`) names its id (`judging`): the
+//! `source.moved`, `source.push_refused`, an owner judging's
+//! `source.push_no_verdict`) names its id (`judging`): the
 //! store records one of each kind per judging and returns the first to any
 //! later one (spawn_integrator_record, and the unique index
 //! `spawn_events_control_judging_outcome`). That is what lets a later integrator
@@ -47,11 +48,12 @@ pub(crate) const DIRECTORY: &str = "judgings";
 
 /// The record types that name the judging that wrote them; any other is
 /// recorded as it is.
-const OUTCOMES: [&str; 4] = [
+const OUTCOMES: [&str; 5] = [
     "task.gated",
     "task.landed",
     "source.moved",
     "source.push_refused",
+    "source.push_no_verdict",
 ];
 
 /// One judging: its id and its directory.
@@ -307,6 +309,11 @@ pub(crate) fn units() -> bool {
             .as_ref()
             .is_some_and(|judging| judging.units)
     })
+}
+
+/// The id of the judging this thread runs; None outside one.
+pub(crate) fn current_id() -> Option<String> {
+    CURRENT.with(|current| current.borrow().as_ref().map(|judging| judging.id.clone()))
 }
 
 /// `record` naming the judging this thread runs, when it is one of a
