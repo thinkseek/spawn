@@ -98,6 +98,10 @@ echo "gate (stub): $scenario on $3"
 case $(cat "$NIGHTLY_TEST_SCRATCH/behave/$plain" 2>/dev/null || echo pass) in
 pass) printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT" ;;
 flaky) printf '{"verdict":"accepted","flakes":["%s"]}\n' "$scenario" >"$SPAWN_GATE_VERDICT" ;;
+sleep)
+  sleep 30
+  printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
+  ;;
 fail) printf '{"verdict":"rejected","reason":"regression: %s must still pass"}\n' "$scenario" >"$SPAWN_GATE_VERDICT" ;;
 main)
   printf '{"host_fault":true,"on":"main","scenario":"%s","reason":"main is red on it"}\n' "$scenario" >"$SPAWN_GATE_VERDICT"
@@ -135,12 +139,34 @@ printf 'SPAWN_INTEGRATE_PID=1\0SPAWN_GATE_HOST_JOBS=3\0PATH=%s\0HOME=%s\0' \
 # $scratch/busy exists.
 cat >"$scratch/bin/systemctl" <<'EOF'
 #!/bin/sh
-[ -e "$NIGHTLY_TEST_SCRATCH/busy" ] && echo "spawn-gate-1-abc-0.service loaded active running spawn gate"
+case "$*" in
+*LastTriggerUSec*) [ -e "$NIGHTLY_TEST_SCRATCH/fired" ] && echo "Tue 2026-11-10 02:31:04 CST" ;;
+*list-units*) [ -e "$NIGHTLY_TEST_SCRATCH/busy" ] && echo "spawn-gate-1-abc-0.service loaded active running spawn gate" ;;
+esac
 exit 0
 EOF
 printf '#!/bin/sh\nexit 1\n' >"$scratch/bin/pgrep"
 chmod +x "$scratch/bin/systemctl" "$scratch/bin/pgrep"
 
+# A busy host: another gate's scenario run holding slot 2 (and its unit
+# listed), until busy_off.
+slots=$scratch/home/.cache/spawn/gate-slots
+holder=""
+busy_on() {
+  mkdir -p "$slots" && chmod 700 "$slots"
+  : >>"$slots/slot.2"
+  touch "$scratch/busy"
+  flock "$slots/slot.2" sleep "${1:-600}" &
+  holder=$!
+  sleep 0.3
+}
+busy_off() {
+  [ -z "$holder" ] || kill "$holder" 2>/dev/null
+  [ -z "$holder" ] || wait "$holder" 2>/dev/null
+  pkill -f "^sleep ${1:-600}\$" 2>/dev/null
+  holder=""
+  rm -f "$scratch/busy"
+}
 fact=$scratch/ws/nightly/spawn.json
 nightly() { # the nightly as its unit runs it: spawn.env's variables
   : >"$scratch/calls"
@@ -152,6 +178,7 @@ nightly() { # the nightly as its unit runs it: spawn.env's variables
 field() { jq -r "$1" "$fact"; }
 store() { psql -X -At -q -d "$db" -c "$1"; }
 alerts_fired() { store "select count(*) from spawn_alerts where kind = 'nightly_red'"; }
+stale_keys() { store "select coalesce(string_agg(key, ' '), '') from spawn_alerts where kind = 'nightly_stale' and state = 'open'"; }
 open_key() { store "select coalesce(string_agg(key, ' '), '') from spawn_alerts where kind = 'nightly_red' and state = 'open'"; }
 
 echo "== green"
@@ -188,9 +215,9 @@ check "its evidence lists the landing since the last green" \
 check "the gate's log kept beside the fact file" grep -q "gate (stub): check-nightly-023-run.sh on $m2" "$scratch/ws/nightly/spawn.023.sh.log"
 
 echo "== a busy night during the red"
-touch "$scratch/busy"
+busy_on
 WAIT=1 nightly
-rm -f "$scratch/busy"
+busy_off
 check "skipped, the red kept: since $m2, 023 failed" \
   [ "$(field .state) $(field .red_since) $(field '.failed | join(",")')" = "skipped $m2 023.sh" ]
 check "its alert still open, alone" [ "$(open_key) $(alerts_fired)" = "nightly_red:spawn:$m2 1" ]
@@ -250,11 +277,72 @@ check "each scenario's log is this run's" \
   grep -q "gate (stub): check-nightly-023-run.sh on $(field .main)" "$scratch/ws/nightly/spawn.023.sh.log"
 
 echo "== a busy host"
-touch "$scratch/busy"
+busy_on
 WAIT=2 nightly
-check "skipped, a gate still running" [ "$(field .state) $(field .gates_beside)" = "skipped 1" ]
+check "skipped: a slot stayed held ($(field .reason))" \
+  [ "$(field .state) $(field .gates_beside) $(field .skipped_runs)" = "skipped 1 1" ]
+check "the reason says the slots were not free" grep -q 'slots were not all free within 2s' <<<"$(field .reason)"
 check "no gate run" [ ! -s "$scratch/calls" ]
-rm -f "$scratch/busy"
+check "no stale alert after one skipped run" [ "$(stale_keys)" = "" ]
+
+echo "== the second skipped run in a row"
+judged=$(field .judged_at)
+WAIT=1 nightly
+busy_off
+check "two in a row" [ "$(field .skipped_runs)" = 2 ]
+check "one nightly_stale alert, keyed by the last run that judged" [ "$(stale_keys)" = "nightly_stale:spawn:$judged" ]
+busy_on
+WAIT=1 nightly
+busy_off
+check "still one stale alert after a third" [ "$(store "select count(*) from spawn_alerts where kind = 'nightly_stale'")" = 1 ]
+
+echo "== the host drains: a slot held for 3 s more"
+busy_on 3
+WAIT=30 nightly
+busy_off 3
+check "it waited for the run holding the slot, then judged ($(grep -o 'drained in [0-9]*s' "$scratch/out"))" \
+  bash -c '[ "$(jq -r .state "$1")" = green ] && grep -qE "drained in [2-9]s" "$2"' _ "$fact" "$scratch/out"
+check "the judging run clears the stale alert" [ "$(stale_keys)" = "" ]
+check "skipped_runs back to 0" [ "$(field .skipped_runs)" = 0 ]
+
+echo "== no fact younger than 26 h (the hourly --stale check)"
+jq '.at = (.at - 100000000)' "$fact" >"$fact.old" && mv "$fact.old" "$fact"
+: >"$scratch/calls"
+HOME="$scratch/home" PATH="$scratch/bin:$PATH" SPAWN_LIVE="$live" SPAWN_WORKSPACE_ROOT="$scratch/ws" \
+  NIGHTLY_TEST_SCRATCH="$scratch" SPAWN_DATABASE_URL="$url" \
+  bash "$ctl/scripts/rsi/nightly.sh" --stale spawn >"$scratch/out" 2>&1
+check "--stale fires one alert ($(tail -n 1 "$scratch/out"))" [ "$(stale_keys)" = "nightly_stale:spawn:$(field .judged_at)" ]
+check "--stale runs no gate and writes no fact" bash -c '[ ! -s "$1" ] && [ "$(jq .at "$2")" -lt "$(($(date +%s) * 1000 - 90000000))" ]' _ "$scratch/calls" "$fact"
+nightly
+check "a run clears it" [ "$(stale_keys)" = "" ]
+
+echo "== no fact at all, though the timer fired"
+mv "$fact" "$fact.kept"
+touch "$scratch/fired"
+HOME="$scratch/home" PATH="$scratch/bin:$PATH" SPAWN_LIVE="$live" SPAWN_WORKSPACE_ROOT="$scratch/ws" \
+  NIGHTLY_TEST_SCRATCH="$scratch" SPAWN_DATABASE_URL="$url" \
+  bash "$ctl/scripts/rsi/nightly.sh" --stale spawn >"$scratch/out" 2>&1
+check "stale, never judged ($(tail -n 1 "$scratch/out"))" [ "$(stale_keys)" = "nightly_stale:spawn:never" ]
+rm -f "$scratch/fired"
+mv "$fact.kept" "$fact"
+nightly
+check "a run clears it" [ "$(stale_keys)" = "" ]
+
+echo "== a run stopped by a signal (the unit's timeout)"
+echo sleep >"$scratch/behave/023.sh"
+: >"$scratch/calls"
+HOME="$scratch/home" PATH="$scratch/bin:$PATH" SPAWN_LIVE="$live" SPAWN_WORKSPACE_ROOT="$scratch/ws" \
+  SPAWN_GATE_ENV_FILE="$scratch/gate-env" NIGHTLY_TEST_SCRATCH="$scratch" SPAWN_DATABASE_URL="$url" \
+  SPAWN_NIGHTLY_SAMPLE_SECS=1 setsid bash "$ctl/scripts/rsi/nightly.sh" spawn >"$scratch/out" 2>&1 &
+stopped=$!
+for _ in $(seq 1 100); do grep -q '^call' "$scratch/calls" && break; sleep 0.1; done
+kill -TERM -- "-$stopped" 2>/dev/null
+wait "$stopped" 2>/dev/null
+check "the fact says it was stopped ($(field .reason))" \
+  bash -c '[ "$(jq -r .state "$1")" = skipped ] && jq -r .reason "$1" | grep -q "stopped by a signal"' _ "$fact"
+check "its work directory is gone" bash -c '! ls -d "$1"/.run-spawn.* 2>/dev/null | grep -q .' _ "$scratch/ws/nightly"
+rm -f "$scratch/behave/023.sh"
+nightly
 
 echo "== another nightly of the source runs"
 exec 7>>"$scratch/ws/nightly/.spawn.lock"
