@@ -39,6 +39,7 @@ import { Card, CardHeader, EmptyState, LiveStatus, PageHeader, cx } from "../ui"
 import { ViewToggle, useStoredChoice } from "../ViewToggle";
 import type { ViewOption } from "../ViewToggle";
 import { settlingNote } from "../../settling.ts";
+import { tokenReachNote } from "../../tokenReach.ts";
 import { FleetDecisions } from "./FleetDecisions";
 
 const POLL_MS = 60_000;
@@ -327,6 +328,7 @@ function WindowCard({ card }: { card: Scorecard }) {
         </Fact>
       </div>
       <SettlingNote card={card} />
+      <TokenReachNote card={card} />
     </Card>
   );
 }
@@ -338,6 +340,18 @@ function SettlingNote({ card }: { card: Scorecard }) {
   if (note === null) return null;
   return (
     <p className="border-t border-surface-border px-4 py-2 text-caption text-muted-foreground" role="status">
+      {note}
+    </p>
+  );
+}
+
+/** Under the window, when it (or the previous window) starts before the
+ * transcript archive's oldest model call: its tokens begin there. */
+function TokenReachNote({ card }: { card: Scorecard }) {
+  const note = tokenReachNote(card);
+  if (note === null) return null;
+  return (
+    <p className="border-t border-surface-border px-4 py-2 text-caption text-muted-foreground" role="note">
       {note}
     </p>
   );

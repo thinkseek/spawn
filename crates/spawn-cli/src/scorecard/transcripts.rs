@@ -156,16 +156,36 @@ fn read_file(
     }
 }
 
+/// How far back the archive's tokens reach, from one reading of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reach {
+    /// The archive holds a file last written more than a day before the
+    /// time asked from: it holds lines from before that time, so its tokens
+    /// reach back past it.
+    Before,
+    /// Every file was read: the archive's tokens begin at its oldest
+    /// message, or it holds none.
+    From(Option<i64>),
+}
+
 /// Every message of the archive under `archive` (a `.transcripts`
 /// directory), oldest first. A directory that does not exist holds none.
 ///
 /// Files last written more than a day before `not_before_ms` are not read:
 /// a line is written when its message is, so such a file holds no line from
 /// `not_before_ms` on (the day absorbs a clock apart from the database's).
-pub(crate) fn read_archive(archive: &Path, not_before_ms: i64) -> Result<Vec<Message>, String> {
+///
+/// And how far back the archive's tokens reach: told from the archive
+/// itself, never inferred from a window's lack of calls.
+pub(crate) fn read_archive(
+    archive: &Path,
+    not_before_ms: i64,
+) -> Result<(Vec<Message>, Reach), String> {
     let agents = match std::fs::read_dir(archive) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), Reach::From(None)));
+        }
         Err(error) => return Err(format!("read {}: {error}", archive.display())),
     };
     let mut agent_names: Vec<String> = agents
@@ -176,16 +196,27 @@ pub(crate) fn read_archive(archive: &Path, not_before_ms: i64) -> Result<Vec<Mes
         .collect();
     agent_names.sort();
     let mut out = Vec::new();
+    let mut older = false;
     for agent in agent_names {
         let directory = archive.join(&agent);
-        let mut files: Vec<String> = std::fs::read_dir(&directory)
+        let mut files: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&directory)
             .map_err(|error| format!("read {}: {error}", directory.display()))?
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-            .filter(|entry| written_since(entry, not_before_ms))
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .filter(|name| copy_file(name))
-            .collect();
+        {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if !copy_file(&name) {
+                continue;
+            }
+            if written_since(&entry, not_before_ms) {
+                files.push(name);
+            } else {
+                older = true;
+            }
+        }
         files.sort();
         let mut messages = BTreeMap::new();
         for file in files {
@@ -204,7 +235,12 @@ pub(crate) fn read_archive(archive: &Path, not_before_ms: i64) -> Result<Vec<Mes
         );
     }
     out.sort_by(|a, b| (a.at_ms, &a.agent, &a.id).cmp(&(b.at_ms, &b.agent, &b.id)));
-    Ok(out)
+    let reach = if older {
+        Reach::Before
+    } else {
+        Reach::From(out.first().map(|message| message.at_ms))
+    };
+    Ok((out, reach))
 }
 
 /// Whether the file was last written within a day before `not_before_ms`,
