@@ -40,14 +40,10 @@ harness() {
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
 
-# The candidate's tree: the gate runs a scenario from inside it, and its
-# web/src is what the page would run (the controller holds main's copy).
-tree=$(pwd)
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-[ -f "$tree/web/src/home.ts" ] || harness "no web/src/home.ts under $tree (run from the candidate's tree)"
-for tool in psql git jq od bash sed grep awk curl node; do
+for tool in psql git jq od bash sed grep awk curl; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
@@ -208,10 +204,12 @@ start_serve() {
 # --- the records ----------------------------------------------------------------
 
 # Mission 1 is a gate mission on source $SOURCE. Its tasks 1 and 2 are judged
-# by its gate (10 and 15 min); the owner's two landings on the same source
+# by its gate (10 and 15 min); the owner's three landings on the same source
 # are judged by the same gate, as the integrator judges an owner push
-# between task gates (20 and 5 min), and their records name the gate's
-# wall clock and the mission whose gate judged them.
+# between task gates (20, 5 and 7.5 min), and their records name the gate's
+# wall clock and the mission whose gate judged them. The records' fields are
+# the integrator's own (crates/spawn-cli/src/integrate/owner.rs) plus
+# `mission` and `gate_ms`.
 SOURCE=$WORK/source-bb
 B=$(printf 'bb-061-base' | sha1sum | cut -c1-40)
 C=$(printf 'bb-061-candidate' | sha1sum | cut -c1-40)
@@ -223,8 +221,9 @@ for t in 1 2; do
 done
 record "{\"type\":\"task.gated\",\"id\":1,\"verdict\":\"rejected\",\"revision\":0,\"base\":\"$B\",\"scenarios\":4,\"reason\":\"regression: a scenario fails on the candidate\",\"gate_ms\":600000}" >/dev/null
 record "{\"type\":\"task.gated\",\"id\":2,\"verdict\":\"rejected\",\"revision\":0,\"base\":\"$B\",\"scenarios\":4,\"reason\":\"regression: a scenario fails on the candidate\",\"gate_ms\":900000}" >/dev/null
-record "{\"type\":\"source.moved\",\"source\":\"$SOURCE\",\"request\":901,\"from\":\"$B\",\"to\":\"$C\",\"missions\":[1],\"verdict\":\"accepted\",\"by\":\"human\",\"mission\":1,\"gate_ms\":1200000}" >/dev/null
-record "{\"type\":\"source.moved\",\"source\":\"$SOURCE\",\"request\":902,\"from\":\"$C\",\"to\":\"$B\",\"missions\":[1],\"verdict\":\"accepted\",\"by\":\"human\",\"mission\":1,\"gate_ms\":300000}" >/dev/null
+record "{\"type\":\"source.moved\",\"source\":\"$SOURCE\",\"request\":901,\"from\":\"$B\",\"to\":\"$C\",\"verdict\":\"accepted\",\"by\":\"human\",\"mission\":1,\"gate_ms\":1200000}" >/dev/null
+record "{\"type\":\"source.moved\",\"source\":\"$SOURCE\",\"request\":902,\"from\":\"$C\",\"to\":\"$B\",\"verdict\":\"accepted\",\"by\":\"human\",\"mission\":1,\"gate_ms\":300000}" >/dev/null
+record "{\"type\":\"source.moved\",\"source\":\"$SOURCE\",\"request\":903,\"from\":\"$B\",\"to\":\"$C\",\"verdict\":\"accepted\",\"by\":\"human\",\"mission\":1,\"gate_ms\":450000}" >/dev/null
 start_serve
 
 since=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ)
@@ -238,14 +237,14 @@ gate() { # <scope filter>: that scope's gate_time {value, n, runs, task_runs, ow
 
 # --- (1) the fleet's gate time counts the owner's judgings ----------------------------
 
-expect_eq "$(gate '.scope == "fleet"')" '[{"value":600000,"n":4,"runs":4,"task_runs":2,"owner_runs":2}]' \
-    "(1) the fleet's gate_time over two task gatings (10, 15 min) and two owner judgings (20, 5 min): the median of the four, with the runs split by whose they were"
+expect_eq "$(gate '.scope == "fleet"')" '[{"value":600000,"n":5,"runs":5,"task_runs":2,"owner_runs":3}]' \
+    "(1) the fleet's gate_time over two task gatings (10, 15 min) and three owner judgings (20, 5, 7.5 min): the median of the five, with the runs split by whose they were"
 note "(1) checked: the fleet"
 
 # --- (2) and the mission's, whose gate judged them ----------------------------------------
 
-expect_eq "$(gate '.scope == "mission" and .mission == 1')" '[{"value":600000,"n":4,"runs":4,"task_runs":2,"owner_runs":2}]' \
-    "(2) mission 1's gate_time, its gate having judged all four"
+expect_eq "$(gate '.scope == "mission" and .mission == 1')" '[{"value":600000,"n":5,"runs":5,"task_runs":2,"owner_runs":3}]' \
+    "(2) mission 1's gate_time, its gate having judged all five"
 note "(2) checked: the mission"
 
 if [ -s "$WORK/failures" ]; then
