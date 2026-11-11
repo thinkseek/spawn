@@ -3254,9 +3254,9 @@ mod tests {
             ),
             task(10, 1, "landed", 10, None),
         ];
-        let one_shot = objective_json(&objective(1, false), &tasks);
+        let one_shot = objective_json(&objective(1, false), &tasks, None);
         assert_eq!(one_shot["status"], "solved");
-        let recurring = objective_json(&objective(2, true), &tasks);
+        let recurring = objective_json(&objective(2, true), &tasks, None);
         assert_eq!(recurring["status"], "met");
         assert_eq!(recurring["current"], 1021.0);
         assert_eq!(recurring["tasks"], json!([13, 12, 11]));
@@ -3266,7 +3266,7 @@ mod tests {
         assert_eq!(landings[0]["task"], 11);
         assert_eq!(landings[0]["baseline"], 1573.0);
         assert_eq!(landings[1]["candidate"], 1021.0);
-        let untouched = objective_json(&objective(3, false), &tasks);
+        let untouched = objective_json(&objective(3, false), &tasks, None);
         assert_eq!(untouched["status"], "open");
         assert_eq!(untouched["landings"], json!([]));
     }
@@ -3279,9 +3279,9 @@ mod tests {
         owner.owner_judged = true;
         // The rows as the board builds them, and then through a real
         // backlog directory below.
-        let owner_row = objective_json(&owner, &[]);
-        let fleet_row = objective_json(&objective(2, false), &[]);
-        assert_eq!(objective_json(&objective(1, false), &[])["status"], "open");
+        let owner_row = objective_json(&owner, &[], None);
+        let fleet_row = objective_json(&objective(2, false), &[], None);
+        assert_eq!(objective_json(&objective(1, false), &[], None)["status"], "open");
         assert_eq!(owner_row["status"], "owner");
         assert_eq!(owner_row["owner_judged"], true);
         assert_eq!(fleet_row["status"], "open");
@@ -3332,7 +3332,7 @@ mod tests {
             20,
             Some("METRIC ingest_total_ns baseline=1573 candidate=1200"),
         )];
-        let recurring = objective_json(&objective(2, true), &tasks);
+        let recurring = objective_json(&objective(2, true), &tasks, None);
         assert_eq!(recurring["status"], "open");
         assert_eq!(recurring["current"], 1200.0);
     }
