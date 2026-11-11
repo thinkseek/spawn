@@ -7,7 +7,7 @@ import { newKey } from "../../input";
 
 import { relativeTime } from "../../format";
 import type { AgentsNow, Digest, MissionsToday, NeedItem, NotesShown } from "../../home";
-import { awayFrom, needsSummary } from "../../home";
+import { awayFrom, needsSummary, noWorkText, quietText } from "../../home";
 import { Card, CardHeader, FOCUS_RING, FOCUS_RING_INSET, cx, sinceText } from "../ui";
 
 // The home page's sections (design-ui-information.md §3, layout A): what
@@ -182,7 +182,7 @@ export function MissionsTodayCard({ model, onOpen }: { model: MissionsToday; onO
     <Card>
       <CardHeader icon={<Target size={14} />} title="Missions" meta={<span>today</span>} />
       {model.rows.length === 0 ? (
-        <p className="px-4 py-3 text-caption text-muted-foreground">No mission has work open.</p>
+        <p className="px-4 py-3 text-caption text-muted-foreground">{noWorkText(model)}</p>
       ) : (
         <ul className="divide-y divide-surface-border">
           {model.rows.map((row) => (
@@ -228,7 +228,7 @@ export function MissionsTodayCard({ model, onOpen }: { model: MissionsToday; onO
         <p className="border-t border-surface-border px-4 py-2 text-caption text-faint-foreground">
           {model.quiet.length > 0 && (
             <>
-              Nothing open: {model.quiet.map((mission) => `#${mission.id} ${mission.name}`).join(", ")}
+              Nothing open: {quietText(model.quiet)}
             </>
           )}
           {model.quiet.length > 0 && model.closed > 0 && " · "}
