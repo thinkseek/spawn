@@ -206,7 +206,7 @@ fn the_window_counts_the_views_and_each_missions_open_span() {
     assert_eq!(window["agent_ms"], json!(11 * H), "12-22, and 23 to the window's end");
     assert_eq!(window["ladder"]["human"], 1);
     assert_eq!(window["ladder"]["owner_gate"], 1);
-    assert_eq!(window["interventions"], json!({"resume": 1}));
+    assert_eq!(window["interventions"], json!({"command": 1, "resume": 1}));
     assert_eq!(window["outcomes"], json!({"aborted": 1, "landed": 1}));
     assert_eq!(window["escalations"], 1);
     assert_eq!(window["judgements"]["total"], 3);
