@@ -23,6 +23,10 @@
 #   (2) `taskStateLabel(task, mission)` (Home's Missions card) says the
 #       same: "waiting for its worker" for an assigned task, "in work" for
 #       a delivered one; "gating", "in review" and "sent back" as today.
+#   (3) Home's "Working now" is unchanged: a live agent waiting at its
+#       prompt on an assigned or a delivered task still reads "waiting at
+#       its prompt" (web/src/home.ts doingWords over ordering.ts's
+#       fleetContext and heldTask), never "in work".
 #   The API keeps the store's states.
 #
 # The history is seeded as the store holds it and folded by
@@ -248,11 +252,28 @@ test("(2) Home's Missions card says the same", () => {
     ["waiting for its worker", "in work", "gating", "sent back", "in review"],
   );
 });
+
+test("(3) Home's Working now is unchanged: an agent waiting on its task says so", async () => {
+  const home = await import(pathToFileURL(`${env.BB_TREE}/web/src/home.ts`).href);
+  const context = ordering.fleetContext(answer);
+  for (const task of [1, 2]) {
+    const agent = {
+      session_id: `session_worker_task_${task}`,
+      agent_id: `agent_worker_task_${task}`,
+      state: "WAITING",
+      live: true,
+      activity: { current_tool: null, current_tool_summary: null, jobs: [] },
+    };
+    const held = ordering.heldTask(agent, context);
+    assert.equal(held?.task_id, task, `task ${task} is the agent's`);
+    assert.equal(home.doingWords(agent, held), "waiting at its prompt", `the agent on task ${task}`);
+  }
+});
 TEST
 if ! BB_TREE=$tree BB_WORK=$WORK node --test "$WORK/words.test.mjs" >"$WORK/words.out" 2>&1; then
-    check_failed "(1)/(2) web/src/ordering.ts over the answer: $(grep -E '^not ok|AssertionError|expected|actual|Error|exports' "$WORK/words.out" | head -n 12 | tr '\n' ' ' | head -c 1000)"
+    check_failed "(1)-(3) web/src/ordering.ts and home.ts over the answer: $(grep -E '^not ok|AssertionError|expected|actual|Error|exports' "$WORK/words.out" | head -n 12 | tr '\n' ' ' | head -c 1000)"
 fi
-note "(1), (2) checked: the page's words"
+note "(1)-(3) checked: the page's words"
 
 if [ -s "$WORK/failures" ]; then
     asserted=1
