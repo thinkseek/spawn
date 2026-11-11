@@ -1758,6 +1758,110 @@ begin
     return v_count;
 end $$;
 
+-- The transcript archive's part of the cost record (objective 048): the
+-- messages of executions the cost step never read (they ended before 041,
+-- or their `model.usage` events are gone) are counted from the archive
+-- (`<root>/.transcripts/<agent>/<native>[.<n>].jsonl`) each time the loop
+-- starts. Each archive file it counted, with its length and modification
+-- time then: a file the same as it was is not read again.
+create table if not exists spawn_cost_archive_files (
+    agent_id      text   not null,
+    file          text   not null,
+    length        bigint not null,
+    modified_ms   bigint not null,
+    counted_at_ms bigint not null,
+    primary key (agent_id, file)
+);
+
+-- The archive's messages into the cost record (owner only): `p_messages`,
+-- `[{agent_id, message_id, model, at_ms, input, output, cache_write,
+-- cache_read}]`, each message once (the caller folds its lines and copies
+-- by 041's rules: its largest usage, its earliest line's time and model).
+-- A message counts for the agent whose archive holds it, that agent's
+-- execution running at its time (the latest started at or before it; a
+-- message timed before all of them, the agent's first), the task the agent
+-- held then (its latest task assigned at or before the message; a message
+-- timed before any, the latest assigned at or before that execution
+-- started; none: no task) and that task's mission, priced by `p_prices` as
+-- `spawn_cost_record` prices. A message the record already holds keeps what
+-- it holds; one of an agent with no execution is not counted. The row's
+-- event mark is 0, so the cost step's fold still starts where it did.
+-- Returns `{counted, unplaced}`: the messages it added, and those of
+-- agents with no execution.
+create or replace function spawn_cost_archive_record(p_prices jsonb, p_messages jsonb)
+returns jsonb language plpgsql security definer as $$
+declare
+    v_counted bigint;
+    v_unplaced bigint;
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not record costs', session_user using errcode = '42501';
+    end if;
+    if jsonb_typeof(p_prices) is distinct from 'object' then
+        raise exception 'the prices are a JSON object, not %', p_prices;
+    end if;
+    if jsonb_typeof(p_messages) is distinct from 'array' then
+        raise exception 'the messages are a JSON array, not %', p_messages;
+    end if;
+    with given as (
+        select distinct on (x.message_id) x.*
+          from jsonb_to_recordset(p_messages)
+               as x(agent_id text, message_id text, model text, at_ms bigint,
+                    input bigint, output bigint, cache_write bigint, cache_read bigint)
+         where nullif(x.message_id, '') is not null and nullif(x.agent_id, '') is not null
+           and nullif(x.model, '') is not null and x.at_ms is not null
+         order by x.message_id, x.at_ms
+    ), placed as (
+        select g.*, e.execution_id, e.session_id, e.started_at_ms
+          from given g
+         cross join lateral (
+               select u.execution_id, u.session_id, u.started_at_ms
+                 from ((select s.execution_id, s.session_id, s.recorded_at_ms as started_at_ms,
+                               1 as rank
+                          from spawn_events s
+                         where s.agent_id = g.agent_id and s.event_name = 'execution.started'
+                           and s.execution_id is not null and s.recorded_at_ms <= g.at_ms
+                         order by s.recorded_at_ms desc, s.id desc limit 1)
+                       union all
+                       (select s.execution_id, s.session_id, s.recorded_at_ms, 2
+                          from spawn_events s
+                         where s.agent_id = g.agent_id and s.event_name = 'execution.started'
+                           and s.execution_id is not null
+                         order by s.recorded_at_ms, s.id limit 1)) u
+                order by u.rank limit 1) e
+    ), tasked as (
+        select p.*, t.task_id, k.mission_id, p_prices -> p.model as rates
+          from placed p
+         cross join lateral (
+               select coalesce(
+                   (select k.id from mission_tasks k
+                     where k.agent_id = p.agent_id and k.created_at_ms <= p.at_ms
+                     order by k.created_at_ms desc, k.id desc limit 1),
+                   (select k.id from mission_tasks k
+                     where k.agent_id = p.agent_id and k.created_at_ms <= p.started_at_ms
+                     order by k.created_at_ms desc, k.id desc limit 1)) as task_id) t
+          left join mission_tasks k on k.id = t.task_id
+    ), added as (
+        insert into spawn_cost_messages
+            (message_id, execution_id, agent_id, session_id, task_id, mission_id, model, at_ms,
+             input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, usd, rates,
+             event_id, event_at_ms, recorded_at_ms)
+        select t.message_id, t.execution_id, t.agent_id, t.session_id, t.task_id, t.mission_id,
+               t.model, t.at_ms, coalesce(t.input, 0), coalesce(t.output, 0),
+               coalesce(t.cache_write, 0), coalesce(t.cache_read, 0),
+               spawn_cost_usd(t.rates, coalesce(t.input, 0), coalesce(t.output, 0),
+                              coalesce(t.cache_write, 0), coalesce(t.cache_read, 0)),
+               t.rates, 0, 0, spawn_now_ms()
+          from tasked t
+        on conflict (message_id) do nothing
+        returning 1
+    )
+    select (select count(*) from added),
+           (select count(*) from given) - (select count(*) from placed)
+      into v_counted, v_unplaced;
+    return jsonb_build_object('counted', v_counted, 'unplaced', v_unplaced);
+end $$;
+
 
 -- Who may call the mission functions: the owner (humans' CLI, the
 -- controller) and the supervisor's login; not the reader's, and not the web
@@ -4971,6 +5075,7 @@ begin
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
         'spawn_alert_record(jsonb)', 'spawn_backup_record(jsonb)',
         'spawn_cost_record(jsonb)', 'spawn_cost_usd(jsonb, bigint, bigint, bigint, bigint)',
+        'spawn_cost_archive_record(jsonb, jsonb)',
         'spawn_objective_assign(bigint, integer, text, text, bigint)', 'spawn_task_stages(bigint)',
         'spawn_landing_hold(bigint)', 'spawn_landing_release()',
         'spawn_source_holdable(text)', 'spawn_source_hold_lock(text)',
