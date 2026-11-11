@@ -300,7 +300,8 @@ export function SupervisorNotes({
   talk,
 }: {
   model: NotesShown;
-  all: Array<{ text: string; at_ms: number | null }>;
+  /** The full list (`allNotes`): a settled line too, marked so. */
+  all: NoteRow[];
   /** The box that types to the supervisor. */
   talk: ReactNode;
 }) {
@@ -312,14 +313,18 @@ export function SupervisorNotes({
         icon={<MessageSquareText size={14} />}
         title="From the supervisor"
         meta={
-          model.more > 0 && (
+          (model.more > 0 || model.settled > 0) && (
             <button
               type="button"
               onClick={() => setOpen((value) => !value)}
               aria-expanded={open}
               className={cx("rounded-chip px-1 text-caption text-muted-foreground hover:text-foreground", FOCUS_RING)}
             >
-              {open ? "Show the latest" : `${model.more} more`}
+              {open
+                ? "Show the latest"
+                : model.more > 0
+                  ? `${model.more} more`
+                  : `${model.settled} settled`}
             </button>
           )
         }
@@ -328,14 +333,39 @@ export function SupervisorNotes({
         <p className="px-4 py-2.5 text-caption text-muted-foreground">Nothing new in the last 6 hours.</p>
       ) : (
         <ul className="divide-y divide-surface-border">
-          {shown.map((note, index) => (
-            <li key={`${note.at_ms}-${index}`} className="flex min-w-0 items-baseline gap-3 px-4 py-2">
-              <p className={cx("min-w-0 flex-1 text-caption text-foreground", !open && "truncate")} title={note.text}>
-                {note.text}
-              </p>
-              <span className="tnum shrink-0 text-caption text-faint-foreground">{relativeTime(note.at_ms)}</span>
-            </li>
-          ))}
+          {shown.map((note, index) => {
+            const row = open ? (note as NoteRow) : null;
+            return (
+              <li key={`${note.at_ms}-${index}`} className="flex min-w-0 items-baseline gap-3 px-4 py-2">
+                <div className="min-w-0 flex-1">
+                  <p
+                    className={cx(
+                      "text-caption",
+                      row?.settled ? "text-muted-foreground" : "text-foreground",
+                      !open && "truncate",
+                    )}
+                    title={note.text}
+                  >
+                    {note.text}
+                  </p>
+                  {row && (row.settled || row.tasks) && (
+                    <p className="mt-0.5 text-micro text-faint-foreground">
+                      {row.settled && (
+                        <span
+                          className="mr-1.5 rounded-chip bg-surface-hover px-1 font-medium text-muted-foreground"
+                          title="Its tasks have all ended: nothing is left to review"
+                        >
+                          settled
+                        </span>
+                      )}
+                      {row.tasks}
+                    </p>
+                  )}
+                </div>
+                <span className="tnum shrink-0 text-caption text-faint-foreground">{relativeTime(note.at_ms)}</span>
+              </li>
+            );
+          })}
         </ul>
       )}
       <div className="border-t border-surface-border px-4 py-2.5">{talk}</div>
