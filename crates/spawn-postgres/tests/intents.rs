@@ -91,6 +91,59 @@ fn intents(client: &mut Client) -> Vec<(Vec<i64>, String)> {
         .collect()
 }
 
+/// The intent of `a1`, the first: at 0, three attempts, the board's, its
+/// agent's.
+fn first_intent(client: &mut Client, a1: i64) {
+    let first: (i64, i64, String, String) = client
+        .query_one(
+            "select at_ms, attempts, principal, agent_id from spawn_human_intents where intent = $1",
+            &[&a1],
+        )
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+        .expect("the first intent");
+    assert_eq!(first, (0, 3, "human".to_string(), "agent_w1".to_string()));
+}
+
+/// The experience views count `intents` intents, one decision and one
+/// intervention each, and the supervisor and the reader read the view.
+fn views_count_intents(client: &mut Client, schema: &str, intents: i64) {
+    // The experience views count intents: one decision and one intervention each.
+    let count = |client: &mut Client, sql: &str| -> i64 {
+        client.query_one(sql, &[]).expect("count").get(0)
+    };
+    assert_eq!(
+        count(
+            client,
+            "select count(*) from spawn_interventions where kind = 'command'"
+        ),
+        intents
+    );
+    assert_eq!(
+        count(
+            client,
+            "select count(*) from spawn_decisions where tier = 'human'"
+        ),
+        intents
+    );
+    assert_eq!(
+        count(
+            client,
+            "select count(*) from spawn_decisions where tier = 'dispatcher'"
+        ),
+        1,
+        "the dispatcher's own commands still count each"
+    );
+    // The supervisor and the reader read the view.
+    for login in ["spawn_supervisor", "spawn_reader"] {
+        let mut reader = as_login(schema, login);
+        assert_eq!(
+            count(&mut reader, "select count(*) from spawn_human_intents"),
+            intents,
+            "{login}"
+        );
+    }
+}
+
 #[test]
 fn a_refused_command_sent_again_continues_its_intent() {
     let (_store, schema) = store("intents_rule");
@@ -202,50 +255,9 @@ fn a_refused_command_sent_again_continues_its_intent() {
             (vec![p1, p2], "pending".to_string()),
         ]
     );
-    let first: (i64, i64, String, String) = client
-        .query_one(
-            "select at_ms, attempts, principal, agent_id from spawn_human_intents where intent = $1",
-            &[&a1],
-        )
-        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
-        .expect("the first intent");
-    assert_eq!(first, (0, 3, "human".to_string(), "agent_w1".to_string()));
+    first_intent(&mut client, a1);
 
-    // The experience views count intents: one decision and one intervention each.
-    let count = |client: &mut Client, sql: &str| -> i64 {
-        client.query_one(sql, &[]).expect("count").get(0)
-    };
-    assert_eq!(
-        count(
-            &mut client,
-            "select count(*) from spawn_interventions where kind = 'command'"
-        ),
-        10
-    );
-    assert_eq!(
-        count(
-            &mut client,
-            "select count(*) from spawn_decisions where tier = 'human'"
-        ),
-        10
-    );
-    assert_eq!(
-        count(
-            &mut client,
-            "select count(*) from spawn_decisions where tier = 'dispatcher'"
-        ),
-        1,
-        "the dispatcher's own commands still count each"
-    );
-    // The supervisor and the reader read the view.
-    for login in ["spawn_supervisor", "spawn_reader"] {
-        let mut reader = as_login(&schema, login);
-        assert_eq!(
-            count(&mut reader, "select count(*) from spawn_human_intents"),
-            10,
-            "{login}"
-        );
-    }
+    views_count_intents(&mut client, &schema, 10);
 }
 
 #[test]
