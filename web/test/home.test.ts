@@ -646,6 +646,13 @@ test("a controller without the owner's landing has its own title in Needs you (P
   );
 });
 
+test("a deploy that failed has its own title in Needs you (#54)", () => {
+  assert.equal(
+    alertTitle({ kind: "deploy_failed", subject: "deploy" }),
+    "A deploy failed · deploy",
+  );
+});
+
 test("a validator that fails on main too has its own title in Needs you", () => {
   assert.equal(
     alertTitle({ kind: "validator_defect", subject: "mission #4" }),

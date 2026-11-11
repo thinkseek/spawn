@@ -1,0 +1,25 @@
+[Unit]
+Description=Spawn: deploy what the fleet landed on the Spawn source (deploy/on-landing.sh, #54)
+After=spawn-integrate.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/share/spawn-rsi
+# From the controller, the deployed commit's tree, like the gate and the
+# nightly (deploy/ is protected: no candidate changes it). Through bash: the
+# controller is a git export, so a file mode never decides whether it runs.
+# The script reads itself whole before it runs: the deploy it starts
+# switches the controller it lives in.
+ExecStart=/bin/bash %h/.local/share/spawn-rsi/controllers/spawn/deploy/on-landing.sh
+# SPAWN_DATABASE_URL (read by bin/spawn and deploy.sh from the environment,
+# never an argument), SPAWN_WORKSPACE_ROOT (the nightly's fact), TMPDIR, and
+# SPAWN_DEPLOY_ON_LANDING / _QUIET_SECS / _MAX_WAIT_SECS / _RETRY_SECS /
+# _HOLD_SECS.
+EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
+# cargo and pnpm for the build (deploy.sh), as the owner's shell has them.
+Environment=PATH=%h/.cargo/bin:%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# A deploy builds in minutes; this bounds a hung one. A stop kills the
+# tick and its deploy (SIGTERM first: deploy.sh's trap restarts the services
+# and releases the hold); a hold left by a SIGKILL is released by the next
+# tick (on-landing.sh, "A hold that outlives its deploy").
+TimeoutStartSec=1h

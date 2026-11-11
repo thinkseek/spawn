@@ -29,7 +29,13 @@
 # and the deploy releases that hold on success and on failure; --landed
 # deploys a HEAD the owner's gated push already landed (no push, no move),
 # and refuses an outcome that is not an accepted landing of HEAD on this
-# missions repo, or a main that moved since; the drain
+# missions repo, or a main that moved since; --main (deploy-on-landing, #54)
+# deploys the missions main when the store holds a gate-accepted landing of
+# it (a task.landed of a task of a mission on it), and refuses a HEAD that
+# is not main, a main nothing landed, and one only a deploy's own move (no
+# verdict) names; every deploy that held the lock records how it ended
+# (deploy.finished: by owner or landing, ok, the reason without its URLs),
+# and one refused by the lock records nothing; the drain
 # (objective 037): a binary that can drain is drained before the stop, and
 # the stop follows within the unit's restart delay; a binary that cannot is
 # never asked (no --drain, no SIGUSR1); a binary whose gates run in units of
@@ -185,11 +191,16 @@ hold_missions() {
 # checkout); output in $out, status in $status.
 deploy_from=$checkout
 landed=""
+on_main=""
 deploy() {
   out=$scratch/deploy.out
   set +e
-  (cd "$deploy_from" && env SPAWN_LIVE="$live" TMPDIR="$scratch/tmp" PATH="$scratch/fakebin:$PATH" "$@" \
-    bash "${TEST_DEPLOY_SCRIPT:-deploy/deploy.sh}" ${landed:+--landed} "$verdict") >"$out" 2>&1
+  if [ -n "$on_main" ]; then
+    set -- "$@" bash "${TEST_DEPLOY_SCRIPT:-deploy/deploy.sh}" --main
+  else
+    set -- "$@" bash "${TEST_DEPLOY_SCRIPT:-deploy/deploy.sh}" ${landed:+--landed} "$verdict"
+  fi
+  (cd "$deploy_from" && env SPAWN_LIVE="$live" TMPDIR="$scratch/tmp" PATH="$scratch/fakebin:$PATH" "$@") >"$out" 2>&1
   status=$?
   set -e
   sed 's/^/  | /' "$out"
@@ -201,6 +212,16 @@ check "refused" [ "$status" -ne 0 ]
 check "says how much is free and needed" grep -q "GB free, the deploy needs 1000000" "$out"
 check "before any backup" [ -z "$(ls "$live/backups")" ]
 check "before touching a service" [ ! -s "$SYSTEMCTL_LOG" ]
+
+# finished: every deploy.finished in the fake live database, oldest first,
+# one per line: `<ok> <by> <head> <reason>`.
+finished() {
+  with_db "$live_url" psql -XAtq -F ' ' -c "select r ->> 'ok', r ->> 'by', r ->> 'head', r ->> 'reason'
+      from (select kind -> 'detail' -> 'record' as r, session_seq from spawn_events
+             where session_id = 'session_control'
+               and kind -> 'detail' -> 'record' ->> 'type' = 'deploy.finished') d
+     order by session_seq" 2>/dev/null
+}
 
 echo "== the deploy lock"
 # -o: the lock stays with flock itself, not with sleep, so killing flock
@@ -387,7 +408,59 @@ check "main stays HEAD" [ "$(main)" = "$head" ]
 check "nothing is pending" [ ! -e "$live/deploy.pending" ]
 check "the controller is HEAD's" [ "$(readlink "$live/controllers/spawn")" = "spawn-$head" ]
 check "the services restarted" grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$SYSTEMCTL_LOG"
+check "recorded how it ended: ok, by the owner" [ "$(finished | tail -n 1)" = "true owner $head " ]
 landed=""
+
+echo "== --main: the missions main a gate accepted (deploy-on-landing, #54)"
+on_main=1
+recorded=$(finished | wc -l)
+git --git-dir="$missions" update-ref refs/heads/main "$base"
+: >"$SYSTEMCTL_LOG"
+backups=$(ls "$live/backups" | wc -l)
+deploy
+check "refused when HEAD is not the missions main (status $status)" [ "$status" -ne 0 ]
+check "says so" grep -qF "the missions main is $base, not HEAD $head" "$out"
+check "before any backup" [ "$(ls "$live/backups" | wc -l)" -eq "$backups" ]
+check "before touching a service" [ ! -s "$SYSTEMCTL_LOG" ]
+check "recorded the failure, by the landing" [ "$(finished | tail -n 1 | cut -d' ' -f1-3)" = "false landing $head" ]
+git --git-dir="$missions" update-ref refs/heads/main "$head"
+# A deploy's own move to HEAD names no verdict: no landing.
+spawn_live mission moved --source "$missions" --from "$base" --to "$head" >/dev/null
+deploy
+check "refused for a main no gate-accepted landing names (status $status)" [ "$status" -ne 0 ]
+check "says so" grep -qF "no gate-accepted landing of $head on $missions in the store" "$out"
+check "before any backup" [ "$(ls "$live/backups" | wc -l)" -eq "$backups" ]
+check "before touching a service" [ ! -s "$SYSTEMCTL_LOG" ]
+check "the reason is on the record" \
+  bash -c 'finished | tail -n 1 | grep -qF "false landing $1 no gate-accepted landing of $1"' _ "$head"
+# A task of the mission on the missions repo, accepted by its gate and landed
+# at HEAD: the integrator's records.
+mission=$(with_db "$live_url" psql -XAtq -c "select id from mission_missions where sources ->> 0 = '$missions' order by id limit 1")
+task=$(spawn_live task assign --mission "$mission" --kind ephemeral --worker w --brief "test-deploy: landed" | jq -r '.task')
+with_db "$live_url" psql -XAtq -v ON_ERROR_STOP=1 \
+  -c "select spawn_control_record(jsonb_build_object('type', 'task.landed', 'id', $task, 'from', '$base', 'to', '$head'))" >/dev/null
+: >"$SYSTEMCTL_LOG"
+deploy
+check "a main whose landing the gate accepted deploys (status $status)" [ "$status" -eq 0 ]
+check "says what landed it" grep -qE "HEAD $head is main, landed by task.landed \(event [0-9]+, task $task\): no push, no move to record" "$out"
+check "main stays HEAD" [ "$(main)" = "$head" ]
+check "nothing is pending" [ ! -e "$live/deploy.pending" ]
+check "the services restarted" grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$SYSTEMCTL_LOG"
+check "recorded: ok, by the landing" [ "$(finished | tail -n 1)" = "true landing $head " ]
+check "one record per deploy that held the lock" [ "$(finished | wc -l)" -eq $((recorded + 3)) ]
+flock -o "$live/deploy.lock" sleep 120 &
+holder=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  flock -n "$live/deploy.lock" true || break
+  sleep 0.2
+done
+deploy
+pkill -P "$holder" 2>/dev/null || true
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+check "refused while another deploy holds the lock (status $status)" [ "$status" -ne 0 ]
+check "and records nothing: the deploy holding it records its own" [ "$(finished | wc -l)" -eq $((recorded + 3)) ]
+on_main=""
 
 echo "== the drain (objective 037)"
 rm -f "$live/deploy.pending"
