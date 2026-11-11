@@ -86,6 +86,10 @@ export interface Cost extends DimensionBase {
 
 export interface GateTime extends DimensionBase {
   runs: number;
+  /** Of the runs, the tasks' gatings and the owner's judgings (objective
+   * 061): `runs` = `task_runs` + `owner_runs`. */
+  task_runs: number;
+  owner_runs: number;
 }
 
 export interface Dimensions {
@@ -261,6 +265,9 @@ export function normalizeDimensions(value: unknown): Dimensions {
     gate_time: {
       ...base("gate_time"),
       runs: number(gateTime.runs),
+      // An answer from before the owner's runs were counted: every run a task's.
+      task_runs: gateTime.task_runs === undefined ? number(gateTime.runs) : number(gateTime.task_runs),
+      owner_runs: number(gateTime.owner_runs),
     },
   };
 }
@@ -629,11 +636,24 @@ export function dimensionParts(
       return [
         {
           title: null,
-          parts: [{ label: "runs", value: formatDecimal(d.runs, 0) }],
+          parts: [
+            { label: "runs", value: formatDecimal(d.runs, 0), title: gateRunsText(d) },
+            { label: "the owner's", value: formatDecimal(d.owner_runs, 0) },
+            { label: "tasks'", value: formatDecimal(d.task_runs, 0) },
+          ],
         },
       ];
     }
   }
+}
+
+/** Gate time's runs in words, saying how many were the owner's judgings:
+ * "6 gate runs, 3 of them the owner's"; "1 gate run, none the owner's". */
+export function gateRunsText(d: Pick<GateTime, "runs" | "owner_runs">): string {
+  const runs = `${formatDecimal(d.runs, 0)} gate ${d.runs === 1 ? "run" : "runs"}`;
+  if (d.owner_runs <= 0) return `${runs}, none the owner's`;
+  if (d.runs === 1 && d.owner_runs === 1) return `${runs}, the owner's`;
+  return `${runs}, ${formatDecimal(d.owner_runs, 0)} of them the owner's`;
 }
 
 /** An epoch-millisecond time as a UTC ISO string, whole seconds without

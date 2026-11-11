@@ -29,7 +29,13 @@
 # and the deploy releases that hold on success and on failure; --landed
 # deploys a HEAD the owner's gated push already landed (no push, no move),
 # and refuses an outcome that is not an accepted landing of HEAD on this
-# missions repo, or a main that moved since; the drain
+# missions repo, or a main that moved since; --main (deploy-on-landing, #54)
+# deploys the missions main when the store holds a gate-accepted landing of
+# it (a task.landed of a task of a mission on it), and refuses a HEAD that
+# is not main, a main nothing landed, and one only a deploy's own move (no
+# verdict) names; every deploy that held the lock records how it ended
+# (deploy.finished: by owner or landing, ok, the reason without its URLs),
+# and one refused by the lock records nothing; the drain
 # (objective 037): a binary that can drain is drained before the stop, and
 # the stop follows within the unit's restart delay; a binary that cannot is
 # never asked (no --drain, no SIGUSR1); a binary whose gates run in units of
@@ -95,6 +101,59 @@ trap cleanup EXIT
 with_db "$test_url" psql -XAtq -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db" >/dev/null
 
 live=$scratch/live
+
+# Never the real home (sync/cc-rules.md (a), after 2026-11-12): deploy.sh
+# and everything the test runs see HOME and the XDG roots in the scratch;
+# the toolchain is named from the real home first (the sandbox binds
+# CARGO_HOME's registry and RUSTUP_HOME read-only). guard_home refuses
+# (exit 2, nothing run) unless HOME, the live directory and every XDG root
+# are set, inside the scratch, and neither are, hold nor lie in the real
+# home; at the start and before every deploy.
+real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+export CARGO_HOME=${CARGO_HOME:-$real_home/.cargo} RUSTUP_HOME=${RUSTUP_HOME:-$real_home/.rustup}
+fake_home=$scratch/home
+mkdir -p "$fake_home/.config" "$fake_home/.cache" "$fake_home/.local/share"
+export HOME=$fake_home XDG_CACHE_HOME=$fake_home/.cache XDG_CONFIG_HOME=$fake_home/.config \
+  XDG_DATA_HOME=$fake_home/.local/share
+guard_home() {
+  local gh_scratch gh_real gh_path gh_name
+  [ -n "$scratch" ] && [ -n "$real_home" ] || {
+    echo "test-deploy: refused: an empty scratch or home variable; nothing ran" >&2
+    exit 2
+  }
+  gh_scratch=$(readlink -f -- "$scratch") && gh_real=$(readlink -f -- "$real_home") || {
+    echo "test-deploy: refused: a path that does not resolve; nothing ran" >&2
+    exit 2
+  }
+  for gh_name in HOME live XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME; do
+    eval "gh_path=\${$gh_name-}"
+    [ -n "$gh_path" ] || {
+      echo "test-deploy: refused: $gh_name is empty; nothing ran" >&2
+      exit 2
+    }
+    gh_path=$(readlink -m -- "$gh_path")
+    case $gh_path/ in "$gh_scratch"/*) ;; *)
+      echo "test-deploy: refused: $gh_name $gh_path is not inside the scratch $gh_scratch; nothing ran" >&2
+      exit 2
+      ;;
+    esac
+    case $gh_path/ in "$gh_real"/*)
+      echo "test-deploy: refused: $gh_name $gh_path is in the real home; nothing ran" >&2
+      exit 2
+      ;;
+    esac
+    case $gh_real/ in "$gh_path"/*)
+      echo "test-deploy: refused: $gh_name $gh_path holds the real home; nothing ran" >&2
+      exit 2
+      ;;
+    esac
+  done
+}
+guard_home
+guard_status=0
+(HOME=$real_home; guard_home) 2>"$scratch/guard.err" || guard_status=$?
+check "the guard refuses the real home (status $guard_status)" \
+  bash -c '[ "$1" -eq 2 ] && grep -q "HOME .* is not inside the scratch" "$2"' _ "$guard_status" "$scratch/guard.err"
 missions=$live/missions/spawn.git
 mkdir -p "$live/bin" "$live/backups" "$scratch/tmp" "$scratch/fakebin"
 printf 'SPAWN_DATABASE_URL=%q\n' "$live_url" >"$live/spawn.env"
@@ -159,7 +218,7 @@ build_id=5370617766537472617921
 printf '[build]\nrustflags = ["-C", "link-arg=-Wl,--build-id=0x%s"]\n' "$build_id" >"$checkout/.cargo/config.toml"
 echo stray >"$checkout/web/public/stray.txt"
 
-git init -q --bare "$missions"
+git init -q --bare -b main "$missions"
 git -C "$checkout" push -q "$missions" "$base:refs/heads/main"
 verdict=$scratch/verdict.json
 # verdict_over <main>: the gate's verdict for HEAD over that main.
@@ -185,11 +244,17 @@ hold_missions() {
 # checkout); output in $out, status in $status.
 deploy_from=$checkout
 landed=""
+on_main=""
 deploy() {
+  guard_home
   out=$scratch/deploy.out
   set +e
-  (cd "$deploy_from" && env SPAWN_LIVE="$live" TMPDIR="$scratch/tmp" PATH="$scratch/fakebin:$PATH" "$@" \
-    bash "${TEST_DEPLOY_SCRIPT:-deploy/deploy.sh}" ${landed:+--landed} "$verdict") >"$out" 2>&1
+  if [ -n "$on_main" ]; then
+    set -- "$@" bash "${TEST_DEPLOY_SCRIPT:-deploy/deploy.sh}" --main
+  else
+    set -- "$@" bash "${TEST_DEPLOY_SCRIPT:-deploy/deploy.sh}" ${landed:+--landed} "$verdict"
+  fi
+  (cd "$deploy_from" && env SPAWN_LIVE="$live" TMPDIR="$scratch/tmp" PATH="$scratch/fakebin:$PATH" "$@") >"$out" 2>&1
   status=$?
   set -e
   sed 's/^/  | /' "$out"
@@ -201,6 +266,16 @@ check "refused" [ "$status" -ne 0 ]
 check "says how much is free and needed" grep -q "GB free, the deploy needs 1000000" "$out"
 check "before any backup" [ -z "$(ls "$live/backups")" ]
 check "before touching a service" [ ! -s "$SYSTEMCTL_LOG" ]
+
+# finished: every deploy.finished in the fake live database, oldest first,
+# one per line: `<ok> <by> <head> <reason>`.
+finished() {
+  with_db "$live_url" psql -XAtq -F ' ' -c "select r ->> 'ok', r ->> 'by', r ->> 'head', r ->> 'reason'
+      from (select kind -> 'detail' -> 'record' as r, session_seq from spawn_events
+             where session_id = 'session_control'
+               and kind -> 'detail' -> 'record' ->> 'type' = 'deploy.finished') d
+     order by session_seq" 2>/dev/null
+}
 
 echo "== the deploy lock"
 # -o: the lock stays with flock itself, not with sleep, so killing flock
@@ -387,7 +462,86 @@ check "main stays HEAD" [ "$(main)" = "$head" ]
 check "nothing is pending" [ ! -e "$live/deploy.pending" ]
 check "the controller is HEAD's" [ "$(readlink "$live/controllers/spawn")" = "spawn-$head" ]
 check "the services restarted" grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$SYSTEMCTL_LOG"
+check "recorded how it ended: ok, by the owner" [ "$(finished | tail -n 1)" = "true owner $head " ]
 landed=""
+
+echo "== --main: the missions main a gate accepted (deploy-on-landing, #54)"
+on_main=1
+recorded=$(finished | wc -l)
+git --git-dir="$missions" update-ref refs/heads/main "$base"
+: >"$SYSTEMCTL_LOG"
+backups=$(ls "$live/backups" | wc -l)
+deploy
+check "refused when HEAD is not the missions main (status $status)" [ "$status" -ne 0 ]
+check "says so" grep -qF "the missions main is $base, not HEAD $head" "$out"
+check "before any backup" [ "$(ls "$live/backups" | wc -l)" -eq "$backups" ]
+check "before touching a service" [ ! -s "$SYSTEMCTL_LOG" ]
+check "recorded the failure, by the landing" [ "$(finished | tail -n 1 | cut -d' ' -f1-3)" = "false landing $head" ]
+git --git-dir="$missions" update-ref refs/heads/main "$head"
+# A deploy's own move to HEAD names no verdict: no landing.
+spawn_live mission moved --source "$missions" --from "$base" --to "$head" >/dev/null
+deploy
+check "refused for a main no gate-accepted landing names (status $status)" [ "$status" -ne 0 ]
+check "says so" grep -qF "no gate-accepted landing of $head on $missions in the store" "$out"
+check "before any backup" [ "$(ls "$live/backups" | wc -l)" -eq "$backups" ]
+check "before touching a service" [ ! -s "$SYSTEMCTL_LOG" ]
+check "the reason is on the record" \
+  grep -qF "false landing $head no gate-accepted landing of $head" <<<"$(finished | tail -n 1)"
+# A task of the mission on the missions repo, accepted by its gate and landed
+# at HEAD: the integrator's records.
+mission=$(with_db "$live_url" psql -XAtq -c "select id from mission_missions where sources ->> 0 = '$missions' order by id limit 1")
+task=$(spawn_live task assign --mission "$mission" --kind ephemeral --worker w --brief "test-deploy: landed" | jq -r '.task')
+with_db "$live_url" psql -XAtq -v ON_ERROR_STOP=1 \
+  -c "select spawn_control_record(jsonb_build_object('type', 'task.landed', 'id', $task, 'from', '$base', 'to', '$head'))" >/dev/null
+: >"$SYSTEMCTL_LOG"
+deploy
+check "a main whose landing the gate accepted deploys (status $status)" [ "$status" -eq 0 ]
+check "says what landed it" grep -qE "HEAD $head is main, landed by task.landed \(event [0-9]+, task $task\): no push, no move to record" "$out"
+check "main stays HEAD" [ "$(main)" = "$head" ]
+check "nothing is pending" [ ! -e "$live/deploy.pending" ]
+check "the services restarted" grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$SYSTEMCTL_LOG"
+check "recorded: ok, by the landing" [ "$(finished | tail -n 1)" = "true landing $head " ]
+check "one record per deploy that held the lock" [ "$(finished | wc -l)" -eq $((recorded + 3)) ]
+flock -o "$live/deploy.lock" sleep 120 &
+holder=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  flock -n "$live/deploy.lock" true || break
+  sleep 0.2
+done
+deploy
+pkill -P "$holder" 2>/dev/null || true
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+check "refused while another deploy holds the lock (status $status)" [ "$status" -ne 0 ]
+check "and records nothing: the deploy holding it records its own" [ "$(finished | wc -l)" -eq $((recorded + 3)) ]
+on_main=""
+
+echo "== the warm-up outlives a deploy run by a oneshot unit (deploy/detach.sh, #54)"
+# deploy/on-landing.sh runs deploy.sh in a oneshot unit, whose cgroup systemd
+# stops when the tick exits; the warm-up (warm_base_cache) is started with
+# detach_start. Here the same start, from a oneshot unit that exits at once
+# after it, against a plain setsid child (what deploy.sh did before) as the
+# control; and its environment came from the file, not argv.
+if systemctl --user show-environment >/dev/null 2>&1; then
+  detached=$scratch/detached-alive plain=$scratch/plain-alive unit=spawn-test-detach-$$
+  # shellcheck disable=SC2016
+  systemd-run --user --wait --quiet --collect -p Type=oneshot --unit "$unit-tick" \
+    bash -c '. "$1/deploy/detach.sh"
+      detach_assignments "$3.env" "WARM_SECRET=postgres://u:p@h/db" "QUOTED=a \"b\" c" &&
+      detach_start "$2" "$3.log" "$3.env" sh -c "sleep 3; printf %s/%s \"\$WARM_SECRET\" \"\$QUOTED\" >$3" &&
+      unlink "$3.env"' _ "$repo" "$unit" "$detached"
+  # shellcheck disable=SC2016
+  systemd-run --user --wait --quiet --collect -p Type=oneshot --unit "$unit-plain" \
+    bash -c '(exec setsid sh -c "sleep 3; touch $1") & exit 0' _ "$plain"
+  sleep 5
+  check "the detached warm-up outlived its oneshot unit" [ -e "$detached" ]
+  check "with the environment of its file, quoting kept" \
+    [ "$(cat "$detached" 2>/dev/null)" = 'postgres://u:p@h/db/a "b" c' ]
+  check "and the file is gone" [ ! -e "$detached.env" ]
+  check "a plain setsid child did not (the checks above mean something)" [ ! -e "$plain" ]
+else
+  echo "skip: no user manager here: the warm-up's own unit is not tested"
+fi
 
 echo "== the drain (objective 037)"
 rm -f "$live/deploy.pending"
@@ -589,7 +743,7 @@ echo "== the mirror (SPAWN_DEPLOY_MIRROR)"
 cp "$scratch/real-spawn" "$live/bin/spawn"
 export FAKE_INTEGRATOR_INACTIVE=1
 mirror=$scratch/mirror.git
-git init -q --bare "$mirror"
+git init -q --bare -b main "$mirror"
 mirror_main() { git --git-dir="$mirror" rev-parse refs/heads/main; }
 # mirror_at <commit>: the mirror's main is that commit, main is the base
 # again with a verdict over it.
