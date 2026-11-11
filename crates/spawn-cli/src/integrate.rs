@@ -12213,7 +12213,7 @@ mod database_tests {
         std::fs::create_dir_all(&marks).expect("marks");
         let _release = Release(marks.clone());
         let (base, source, scenarios, first) = world("adopt", &holding_gate(&marks));
-        let _units = StopUnits(base.join("host"));
+        let units = StopUnits(base.join("host"));
         let first = first.with_units(true);
         let second = Integrator::new(
             base.join("host"),
@@ -12272,6 +12272,8 @@ mod database_tests {
             "nothing left"
         );
         assert_eq!(started(&marks).len(), 1, "the gate ran once");
+        // The units go before the scratch their judgings are in.
+        drop(units);
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&marks);
     }
@@ -17439,7 +17441,7 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         let marks = fresh_marks("spawn-db-drain-units-marks");
         let _release = Release(marks.clone());
         let (base, source, scenarios, first) = world("drain-units", &holding_gate(&marks));
-        let _units = StopUnits(base.join("host"));
+        let units = StopUnits(base.join("host"));
         let first = first.with_units(true);
         let db = Db::new("drain_units");
         let mission = db.gated_mission(&source, &scenarios);
@@ -17479,6 +17481,8 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         assert_eq!(started(&marks).len(), 1, "the gate ran once");
         assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
         assert_eq!(control_records(&db, "task.gated").len(), 1);
+        // The units go before the scratch their judgings are in.
+        drop(units);
         for path in [base, marks] {
             let _ = std::fs::remove_dir_all(&path);
         }

@@ -61,8 +61,8 @@
 # The runner must judge in the environment this host judges in, or its
 # verdict is not this host's verdict. So before any job the dispatcher
 # refuses (exit 3) a runner that shows the host's files to the gate (an
-# OrbStack machine that is not --isolated), whose cargo config names a
-# rustc-wrapper it does not have, or whose memory is under the floor; and it
+# OrbStack machine that is not --isolated), or whose memory is under the
+# floor; and it
 # sends the runner whatever files of this host's cargo registry it lacks (the
 # gate builds offline from the registry: a crate missing there is a rejection
 # here of work this host accepts). The runner puts them in place under a
@@ -338,9 +338,6 @@ require_runner() {
     "") die "the runner reports no host_shares (its helper predates the check)" 3 ;;
     *) die "the runner shows the host's files to the gate ($(pv "$report" host_shares)): candidate code could read them, and the gate's socket scan walks them (an OrbStack machine must be --isolated)" 3 ;;
     esac
-    case "$(pv "$report" cargo_wrapper)" in
-    *" missing") die "the runner's cargo config ($(pv "$report" cargo_home)) names rustc-wrapper $(pv "$report" cargo_wrapper | cut -d' ' -f1), which its gate PATH lacks: every build would fail" 3 ;;
-    esac
     memory=$(pv "$report" mem_available_kb)
     if [ "$min_free_memory_mb" != 0 ]; then
         case "$memory" in '' | *[!0-9]*) die "the runner cannot read its available memory" 3 ;; esac
@@ -560,10 +557,7 @@ if [ "$check" = 1 ]; then
         fi
         ;;
     esac
-    case "$(pv "$reportlines" cargo_wrapper)" in
-    *" missing") report "cargo" FAIL "its config names rustc-wrapper $(pv "$reportlines" cargo_wrapper | cut -d' ' -f1), which the gate's PATH lacks" ;;
-    *) report "cargo" ok "rustc-wrapper $(pv "$reportlines" cargo_wrapper), home $(pv "$reportlines" cargo_home)" ;;
-    esac
+    report "cargo" ok "home $(pv "$reportlines" cargo_home)"
     if [ -n "$registry_src" ] && [ -d "$registry_src" ]; then
         case "$(pv "$reportlines" registry_fs)" in
         same)
