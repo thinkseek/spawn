@@ -1169,7 +1169,7 @@ fn judge_in(
     let adopting = adopted.is_some();
     let directory = match adopted.map_or_else(
         || PrivateDirectory::create_in(parent),
-        |path| Ok(PrivateDirectory(path)),
+        |path| Ok(PrivateDirectory::adopt(path)),
     ) {
         Ok(directory) => directory,
         Err(error) => {
@@ -1702,9 +1702,26 @@ fn failed(error: &std::io::Error) -> GateFailure {
 
 /// A new directory, mode 0700, under the temporary directory; removed on
 /// drop. The gate's stdout, stderr and verdict file live in it.
+///
+/// A halted gate's thread never returns, so it never drops this: the thread
+/// removes the directories it holds ([`HELD`]) before it parks for good
+/// ([`park_for_good`]).
 struct PrivateDirectory(PathBuf);
 
+thread_local! {
+    /// The private directories this thread holds, the gate's among them:
+    /// a halted gate's thread removes them before it parks for good, since
+    /// its group is killed and nothing reads them after.
+    static HELD: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl PrivateDirectory {
+    /// The directory at `path` (an adopted judging's), held by this thread.
+    fn adopt(path: PathBuf) -> Self {
+        HELD.with(|held| held.borrow_mut().push(path.clone()));
+        Self(path)
+    }
+
     #[cfg(test)]
     fn create() -> std::io::Result<Self> {
         Self::create_in(&std::env::temp_dir())
@@ -1725,7 +1742,7 @@ impl PrivateDirectory {
             std::process::id()
         ));
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
-        Ok(Self(path))
+        Ok(Self::adopt(path))
     }
 
     fn path(&self) -> &Path {
@@ -1735,7 +1752,18 @@ impl PrivateDirectory {
 
 impl Drop for PrivateDirectory {
     fn drop(&mut self) {
+        // A directory dropped on another thread than the one that made it
+        // stays in that one's list; removing a path already gone is harmless.
+        HELD.with(|held| held.borrow_mut().retain(|path| *path != self.0));
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Remove every private directory this thread holds ([`HELD`]): a halted
+/// gate's, whose thread never returns to drop it.
+fn remove_held() {
+    for path in HELD.with(|held| std::mem::take(&mut *held.borrow_mut())) {
+        let _ = std::fs::remove_dir_all(&path);
     }
 }
 
@@ -1830,8 +1858,11 @@ fn this_halt() -> Option<std::sync::Arc<Halt>> {
 }
 
 /// A halted judging's thread waits here for the process to end: it never
-/// returns, so it records nothing.
+/// returns, so it records nothing. Its gate's private directory is removed
+/// first (its group is killed already, and nothing reads the directory
+/// after), so a halted integrator leaves none in its TMPDIR.
 fn park_for_good() -> ! {
+    remove_held();
     loop {
         std::thread::park();
     }
@@ -2718,6 +2749,58 @@ mod tests {
         assert!(!after.exists(), "no gate starts on a halted thread");
         assert!(!after_returned.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A halted gate's thread, which parks for good and never drops its
+    /// gate's private directory, removes that directory before it parks:
+    /// both when the halt kills a running gate and when it came before the
+    /// gate started.
+    #[test]
+    fn a_halted_gate_removes_its_private_directory() {
+        let wait_gone = |path: &Path| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while path.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            !path.exists()
+        };
+        // Halted while its gate runs.
+        let running = std::sync::Arc::new(super::Halt::default());
+        let thread_halt = std::sync::Arc::clone(&running);
+        let (tell, told) = std::sync::mpsc::channel();
+        // Never joined: a halted gate's thread parks for good.
+        let _gate = std::thread::spawn(move || {
+            super::halt_with(thread_halt);
+            let directory = PrivateDirectory::create().expect("directory");
+            let started = directory.path().join("started");
+            tell.send(directory.path().to_path_buf()).expect("tell");
+            let _ = run_bounded(
+                shell(&format!("touch {}; exec sleep 60", started.display())),
+                Duration::from_mins(5),
+                directory.path(),
+            );
+        });
+        let path = told.recv().expect("the gate's directory");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !path.join("started").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(path.join("started").exists(), "the gate started");
+        running.halt();
+        assert!(wait_gone(&path), "removed: {}", path.display());
+
+        // Halted before its gate starts.
+        let early = std::sync::Arc::new(super::Halt::default());
+        early.halt();
+        let (tell, told) = std::sync::mpsc::channel();
+        let _late = std::thread::spawn(move || {
+            super::halt_with(early);
+            let directory = PrivateDirectory::create().expect("directory");
+            tell.send(directory.path().to_path_buf()).expect("tell");
+            let _ = run_bounded(shell("true"), Duration::from_mins(5), directory.path());
+        });
+        let path = told.recv().expect("the gate's directory");
+        assert!(wait_gone(&path), "removed: {}", path.display());
     }
 
     /// A stop on the gate's thread (an owner's urgent landing,
@@ -3814,6 +3897,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// Each unit a test's gates noted in `units` (one name a line) is gone:
+    /// `expected` names, and none of them still listed by the manager.
+    fn assert_noted_units_gone(units: &Path, expected: usize) {
+        let noted = std::fs::read_to_string(units).unwrap_or_default();
+        let noted: Vec<&str> = noted.lines().filter(|unit| !unit.is_empty()).collect();
+        assert_eq!(noted.len(), expected, "each gate noted its unit: {noted:?}");
+        let left = Command::new("systemctl")
+            .args([
+                "--user",
+                "list-units",
+                "--all",
+                "--plain",
+                "--no-legend",
+                "--",
+            ])
+            .args(&noted)
+            .output()
+            .expect("systemctl");
+        let left = String::from_utf8_lossy(&left.stdout).trim().to_string();
+        assert!(left.is_empty(), "units left: {left}");
+    }
+
     #[test]
     fn a_gate_in_a_unit_ends_with_its_files_and_leaves_no_unit() {
         if !super::units_available() {
@@ -3827,21 +3932,32 @@ mod tests {
             crate::integrate::judging::Judging::create(&root, &serde_json::json!({}), true)
                 .expect("a judging");
         let note_unit = |result: &Result<super::Verdict, GateFailure>| format!("{result:?}");
+        // Each gate notes its own unit (its cgroup names it), so the end
+        // asks after this test's units alone: the suite's other tests run
+        // units under the same pid beside it (P24).
+        let units = root.join("units");
+        let noted = |body: &str| {
+            format!(
+                "grep -o 'spawn-gate-[^/]*\\.service' /proc/self/cgroup | head -n 1 >>{}\n{body}",
+                units.display()
+            )
+        };
         judging.run(|| {
-            let accepted = FakeGate::new(
+            let accepted = FakeGate::new(&noted(
                 "grep -q 'spawn-gate-' /proc/self/cgroup || { echo 'not in a unit' >&2; exit 3; }\n\
                  [ -z \"${INVOCATION_ID-}\" ] || { echo 'the manager environment' >&2; exit 3; }\n\
                  echo 'judged' \n\
                  echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n",
-            )
+            ))
             .judge(&path_only());
             let said = note_unit(&accepted);
             let verdict = accepted.expect(&said);
             assert!(verdict.accepted, "{said}");
             assert!(verdict.output.contains("judged"), "its stdout: {said}");
 
-            let killed = FakeGate::new("echo 'its last words'\nkill -KILL $PPID\nsleep 5\n")
-                .judge(&path_only());
+            let killed =
+                FakeGate::new(&noted("echo 'its last words'\nkill -KILL $PPID\nsleep 5\n"))
+                    .judge(&path_only());
             let said = note_unit(&killed);
             let Err(GateFailure::HostFault { on, runs, log, .. }) = killed else {
                 panic!("a runner killed is abandoned, a host fault: {said}");
@@ -3849,7 +3965,7 @@ mod tests {
             assert_eq!((on.as_str(), runs.as_str()), ("runner", "no status"));
             assert!(log.contains("its last words"), "{log}");
 
-            let gate = FakeGate::new("sleep 60\n");
+            let gate = FakeGate::new(&noted("sleep 60\n"));
             let (late, _) = gate.judge_seeing_within(&path_only(), Duration::from_secs(2));
             let said = note_unit(&late);
             assert!(matches!(late, Err(GateFailure::Timeout)), "{said}");
@@ -3859,11 +3975,11 @@ mod tests {
         let running = root.join("running");
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_flag = std::sync::Arc::clone(&flag);
-        let body = format!(
+        let body = noted(&format!(
             "(sleep 3; touch {}) & touch {}; sleep 60\n",
             marker.display(),
             running.display()
-        );
+        ));
         let stopping =
             crate::integrate::judging::Judging::create(&root, &serde_json::json!({}), true)
                 .expect("a judging");
@@ -3887,20 +4003,9 @@ mod tests {
             !marker.exists(),
             "what the gate started was stopped with its unit"
         );
-        // No unit of this test's gates is left (their names hold its pid).
-        let left = Command::new("systemctl")
-            .args([
-                "--user",
-                "list-units",
-                "--all",
-                "--plain",
-                "--no-legend",
-                &format!("spawn-gate-{}-*", std::process::id()),
-            ])
-            .output()
-            .expect("systemctl");
-        let left = String::from_utf8_lossy(&left.stdout).trim().to_string();
-        assert!(left.is_empty(), "units left: {left}");
+        // No unit of this test's gates is left: the ones they noted, not
+        // every unit of the process (the suite's other tests run theirs).
+        assert_noted_units_gone(&units, 4);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -3050,13 +3050,14 @@ impl Bridge {
         };
         // The message's id, at the end of the whole text: the transcript
         // line that holds it is the message taken ([`crate::message`]). On
-        // the line of a one-line text that starts an engine (a start's or a
-        // resume's prompt) or goes into a pane that reads keys raw.
-        let one_line = !text.contains('\n')
-            && (!matches!(claimed.action(), Ok(CommandAction::Input { .. }))
-                || !self
-                    .terminals
-                    .reads_lines(&active.terminal(), &active.workspace));
+        // the line of a one-line text, whatever the pane reads: in a pane
+        // that reads lines, a marker on a line of its own would make one
+        // input four submissions at the paste (the text, a blank line, the
+        // marker, the answer line), and an engine that acts on the first
+        // line could exit
+        // before the Enter that follows the paste (003, rev-e's
+        // analysis-003-flake.md).
+        let one_line = !text.contains('\n');
         let text = crate::message::marked(&text, claimed.command_id, one_line);
         let typed = {
             // A merge of main into the workspace waits while this types,

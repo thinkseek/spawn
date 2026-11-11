@@ -14,6 +14,8 @@ pub mod agent_files;
 pub mod git;
 pub mod process;
 pub mod root;
+#[cfg(any(test, feature = "testing"))]
+pub mod scratch;
 pub mod tmux;
 pub mod transcripts;
 pub mod tree_path;
@@ -31,6 +33,8 @@ pub use git::{
 };
 pub use process::{current_uid, undumpable};
 pub use root::canonical_root;
+#[cfg(any(test, feature = "testing"))]
+pub use scratch::Scratch;
 pub use tmux::TmuxHost;
 pub use transcripts::{LocalTranscriptArchive, TRANSCRIPT_DIRECTORY};
 pub use watch::InotifyWatch;
