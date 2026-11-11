@@ -167,12 +167,12 @@ pub(super) fn attention() -> Result<Value, String> {
                 .map(|observation| question(facts, observation, &turn, said.as_ref()))
         })
         .unwrap_or(Value::Null);
-    let for_owner = said
-        .as_ref()
-        .map_or(&[][..], |said| said.for_owner.as_slice())
-        .iter()
-        .map(|(text, at_ms)| json!({ "text": text, "at_ms": at_ms }))
-        .collect();
+    let for_owner = owner_notes(
+        &store,
+        said.as_ref()
+            .map_or(&[][..], |said| said.for_owner.as_slice()),
+        &mut warnings,
+    );
     let holds = match store.source_holds() {
         Ok(holds) => waiting_holds(&holds),
         Err(error) => {
@@ -185,7 +185,7 @@ pub(super) fn attention() -> Result<Value, String> {
         &reading.plan,
         &told_at,
         &question,
-        &Value::Array(for_owner),
+        &for_owner,
         &warnings,
         super::now_ms(),
     );
@@ -476,6 +476,213 @@ fn transcript_tail(turn: &Value) -> Option<Vec<u8>> {
     crate::config::terminal_host()
         .read_from(&workspace, path, length.saturating_sub(TRANSCRIPT_TAIL))
         .ok()?
+}
+
+/// Task states in which a task has ended: a review ask about it is settled.
+const ENDED: [&str; 3] = ["accepted", "landed", "cancelled"];
+
+/// Words a number right after names a task (any case): `task 5`, `reports
+/// 2, 3 and 4`.
+const TASK_WORDS: [&str; 4] = ["task", "tasks", "report", "reports"];
+
+/// The supervisor's lines for the owner as `/api/attention` lists them,
+/// `[{text, at_ms, tasks, settled}]` ([`owner_note`]), the named tasks'
+/// states read for those tasks alone. When they cannot be read, every line
+/// names no task and none is settled, and a warning says why.
+fn owner_notes(
+    store: &spawn_postgres::PostgresStore,
+    notes: &[(String, Option<i64>)],
+    warnings: &mut Vec<String>,
+) -> Value {
+    let mut ids: Vec<i64> = notes
+        .iter()
+        .flat_map(|(text, _)| named_tasks(text))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let states = if ids.is_empty() {
+        BTreeMap::new()
+    } else {
+        match store.task_label_facts(&ids) {
+            Ok(facts) => task_states(&facts),
+            Err(error) => {
+                warnings.push(format!("attention: the tasks the owner's lines name: {error}"));
+                BTreeMap::new()
+            }
+        }
+    };
+    Value::Array(
+        notes
+            .iter()
+            .map(|(text, at_ms)| owner_note(text, *at_ms, &states))
+            .collect(),
+    )
+}
+
+/// `{id: state}` of a board's tasks (`{missions: [{tasks: [{id, state}]}]}`).
+fn task_states(board: &Value) -> BTreeMap<i64, String> {
+    board["missions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|mission| mission["tasks"].as_array().into_iter().flatten())
+        .filter_map(|task| {
+            Some((
+                task["id"].as_i64()?,
+                task["state"].as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// One line for the owner, `{text, at_ms, tasks, settled}`: `tasks` the
+/// tasks it names ([`named_tasks`]) that `states` holds, `{id, state}` in
+/// the line's order; `settled` when its ask is a review of them
+/// ([`review_ask`]), it names one at least, and every one has ended
+/// ([`ENDED`]).
+fn owner_note(text: &str, at_ms: Option<i64>, states: &BTreeMap<i64, String>) -> Value {
+    let tasks: Vec<(i64, &str)> = named_tasks(text)
+        .into_iter()
+        .filter_map(|id| states.get(&id).map(|state| (id, state.as_str())))
+        .collect();
+    let settled = review_ask(text)
+        && !tasks.is_empty()
+        && tasks.iter().all(|(_, state)| ENDED.contains(state));
+    json!({
+        "text": text,
+        "at_ms": at_ms,
+        "tasks": tasks
+            .iter()
+            .map(|(id, state)| json!({"id": id, "state": state}))
+            .collect::<Vec<_>>(),
+        "settled": settled,
+    })
+}
+
+/// A piece of a line, as [`named_tasks`] and [`review_ask`] read it.
+#[derive(Debug, PartialEq)]
+enum Token {
+    /// Letters, then any letters or digits (`reports`, `T12`).
+    Word(String),
+    /// Digits, after a `#` or not (`5`, `#5`); one too long for an id is
+    /// [`Token::Other`].
+    Number(i64),
+    Comma,
+    /// Any other mark (`;`, `(`, `-`, `/`, a lone `#`).
+    Other,
+}
+
+fn tokens(line: &str) -> Vec<Token> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < chars.len() {
+        let c = chars[at];
+        let digit_at = |index: usize| chars.get(index).is_some_and(char::is_ascii_digit);
+        if c.is_whitespace() {
+            at += 1;
+        } else if c.is_alphabetic() {
+            let start = at;
+            while at < chars.len() && chars[at].is_alphanumeric() {
+                at += 1;
+            }
+            out.push(Token::Word(chars[start..at].iter().collect()));
+        } else if c.is_ascii_digit() || (c == '#' && digit_at(at + 1)) {
+            if c == '#' {
+                at += 1;
+            }
+            let start = at;
+            while digit_at(at) {
+                at += 1;
+            }
+            let digits: String = chars[start..at].iter().collect();
+            out.push(digits.parse().map_or(Token::Other, Token::Number));
+        } else {
+            out.push(if c == ',' { Token::Comma } else { Token::Other });
+            at += 1;
+        }
+    }
+    out
+}
+
+/// `T<n>`: a task by its short name.
+fn short_name(word: &str) -> Option<i64> {
+    let digits = word.strip_prefix('T')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The task ids a line names, in its order, each once: `T<n>`, and a
+/// number (bare or `#<n>`) right after the word task, tasks, report or
+/// reports, with the list it starts (`reports 198, 204, 208 and 211`: a
+/// comma, "and", or both, before each next number). A `#<n>` or number
+/// anywhere else names none (`mission #4`), nor does a range's end (`tasks
+/// 160 to 167` names 160).
+fn named_tasks(line: &str) -> Vec<i64> {
+    let tokens = tokens(line);
+    let mut ids: Vec<i64> = Vec::new();
+    let mut push = |id: i64| {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    };
+    let is_and = |token: Option<&Token>| {
+        matches!(token, Some(Token::Word(word)) if word.eq_ignore_ascii_case("and"))
+    };
+    let mut at = 0;
+    while at < tokens.len() {
+        let Token::Word(word) = &tokens[at] else {
+            at += 1;
+            continue;
+        };
+        at += 1;
+        if let Some(id) = short_name(word) {
+            push(id);
+            continue;
+        }
+        if !TASK_WORDS.contains(&word.to_lowercase().as_str()) {
+            continue;
+        }
+        let Some(Token::Number(first)) = tokens.get(at) else {
+            continue;
+        };
+        push(*first);
+        at += 1;
+        loop {
+            let mut next = at;
+            if tokens.get(next) == Some(&Token::Comma) {
+                next += 1;
+            }
+            if is_and(tokens.get(next)) {
+                next += 1;
+            }
+            match tokens.get(next) {
+                Some(Token::Number(id)) if next > at => {
+                    push(*id);
+                    at = next + 1;
+                }
+                _ => break,
+            }
+        }
+    }
+    ids
+}
+
+/// Whether a line asks the owner to review, accept or merge (a word that
+/// begins "review", "accept" or "merg") and asks no deploy (none begins
+/// "deploy"): the only ask the tasks' ending settles.
+fn review_ask(line: &str) -> bool {
+    let words: Vec<String> = tokens(line)
+        .into_iter()
+        .filter_map(|token| match token {
+            Token::Word(word) => Some(word.to_lowercase()),
+            _ => None,
+        })
+        .collect();
+    let begins = |prefix: &str| words.iter().any(|word| word.starts_with(prefix));
+    (begins("review") || begins("accept") || begins("merg")) && !begins("deploy")
 }
 
 /// What the end of a transcript says the model wrote last.
