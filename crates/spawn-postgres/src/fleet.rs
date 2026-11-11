@@ -116,7 +116,7 @@ pub(crate) const FLEET_HEALTH: &str = r"
 with
   now as (select spawn_now_ms() as ms),
   -- The day's decisions, by tier: the experience view the scorecard's
-  -- "How the fleet decides" reads too (`spawn_decisions`), over
+  -- 'How the fleet decides' reads too (`spawn_decisions`), over
   -- [now - 24 h, now), so home and the scorecard count the same rows. The
   -- hour's judgements carry the whole judgement. Both read their window by
   -- time (spawn_events_name_time).
