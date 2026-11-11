@@ -298,7 +298,11 @@ pub struct Restored {
 /// `None` when nothing needed doing, or the session never had a transcript
 /// (`read_before`: the log holds events read from one, so it did). A
 /// transcript that is gone with no copy is an error: resuming would start
-/// the agent blank under its old id.
+/// the agent blank under its old id. A present file is replaced only when
+/// it is the archive's latest copy, as just read. It runs before a resume,
+/// when no engine of the session is running: an engine that wrote after the
+/// read is refused, not raced, but one writing during the rename would
+/// write to the file it replaced.
 pub fn restore(
     host: &dyn TerminalHost,
     archive: Option<&dyn TranscriptArchive>,
@@ -352,6 +356,15 @@ pub fn restore(
     let current = read_file(host, workspace, path)?;
     if joined == current {
         return Ok(None);
+    }
+    // The join holds every byte of the file only if the file is the latest
+    // copy: archive_to tells a file that went on by the bytes before the
+    // copy's end alone, and the engine may write between it and this read.
+    if all.last() != Some(&current) {
+        return Err(format!(
+            "{path} is not the transcript archive's latest copy of it; the resume waits for \
+             the next pass"
+        ));
     }
     let replaced = host
         .replace_grown(workspace, path, &joined, &current)
@@ -771,6 +784,28 @@ mod tests {
             assert!(copies(&store, &agent).iter().any(|copy| copy == b"a\nb\n"));
             assert!(copies(&store, &agent).iter().any(|copy| copy == b"c\n"));
         }
+    }
+
+    #[test]
+    fn a_file_the_latest_copy_does_not_hold_is_left_as_it_is() {
+        let (store, agent, workspace) = setup();
+        store.append_file(PATH, "a\n");
+        step(&store, &agent, &workspace);
+        // A new file, longer than the overlap the archive compares.
+        let tail = "x".repeat(5000);
+        store.replace_file(PATH, format!("{tail}\n").as_bytes());
+        step(&store, &agent, &workspace);
+        // Its head changes outside the compared overlap, and it goes on:
+        // the archive takes it as an append, so its latest copy is not the
+        // file.
+        let changed = format!("y{}\nz\n", &tail[1..]);
+        store.replace_file(PATH, changed.as_bytes());
+        let restored = restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true);
+        assert!(
+            matches!(&restored, Err(error) if error.contains("not the transcript archive's latest copy")),
+            "{restored:?}"
+        );
+        assert_eq!(file(&store, &workspace), changed.as_bytes());
     }
 
     #[test]

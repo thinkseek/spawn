@@ -985,6 +985,7 @@ impl TerminalHost for TmuxHost {
 /// moment.
 fn replace_local(path: &str, bytes: &[u8], current: &[u8]) -> Result<bool, TerminalError> {
     use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let failed =
         |what: &str, error: std::io::Error| TerminalError(format!("{what} {path}: {error}"));
     if bytes.len() < current.len() {
@@ -1015,16 +1016,21 @@ fn replace_local(path: &str, bytes: &[u8], current: &[u8]) -> Result<bool, Termi
         std::process::id()
     ));
     let _ = std::fs::remove_file(&temporary);
+    // Made with the file's mode, so it is never more open than the file,
+    // even before the mode is set exactly (the umask only narrows it).
     let written = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(metadata.permissions().mode() & 0o7777)
         .open(&temporary)
         .and_then(|mut file| {
             file.write_all(bytes)?;
             file.set_permissions(metadata.permissions())?;
             file.sync_all()
         })
-        .and_then(|()| std::fs::rename(&temporary, target));
+        .and_then(|()| std::fs::rename(&temporary, target))
+        // The rename is durable once the directory is.
+        .and_then(|()| std::fs::File::open(parent)?.sync_all());
     match written {
         Ok(()) => Ok(true),
         Err(error) => {
