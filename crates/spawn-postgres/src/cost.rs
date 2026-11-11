@@ -15,7 +15,9 @@ use crate::PostgresStore;
 /// the time of the earliest message the record holds (null: none). `usd` is the sum of the
 /// priced messages' costs, 0 for an entry with only unpriced ones (`null`
 /// for a model that is priced nowhere in the window); `unpriced_tokens` the
-/// four counts of the messages with no price. Most costly first.
+/// four counts of the messages with no price (on every row: a model's, an
+/// execution's models' too, 0 when all of them are priced). Most costly
+/// first.
 const WINDOW: &str = r"
 with m as materialized (
   select c.*, c.input_tokens + c.output_tokens + c.cache_write_tokens
@@ -26,7 +28,8 @@ with m as materialized (
   select execution_id, model, sum(usd) as usd,
          jsonb_build_object('input', sum(input_tokens), 'output', sum(output_tokens),
                             'cache_write', sum(cache_write_tokens),
-                            'cache_read', sum(cache_read_tokens)) as tokens
+                            'cache_read', sum(cache_read_tokens)) as tokens,
+         coalesce(sum(total) filter (where usd is null), 0) as unpriced_tokens
     from m group by execution_id, model
 )
 select jsonb_build_object(
@@ -40,13 +43,15 @@ select jsonb_build_object(
               'unpriced_tokens', coalesce(sum(total) filter (where usd is null), 0))
               from m),
   'models', coalesce((select jsonb_agg(jsonb_build_object(
-                'model', model, 'usd', usd, 'tokens', tokens)
+                'model', model, 'usd', usd, 'tokens', tokens,
+                'unpriced_tokens', unpriced_tokens)
                 order by usd desc nulls last, model)
               from (select model, sum(usd) as usd,
                            jsonb_build_object('input', sum(input_tokens),
                                               'output', sum(output_tokens),
                                               'cache_write', sum(cache_write_tokens),
-                                              'cache_read', sum(cache_read_tokens)) as tokens
+                                              'cache_read', sum(cache_read_tokens)) as tokens,
+                           coalesce(sum(total) filter (where usd is null), 0) as unpriced_tokens
                       from m group by model) g), '[]'::jsonb),
   'missions', coalesce((select jsonb_agg(jsonb_build_object(
                 'mission', mission_id, 'usd', usd, 'tokens', tokens,
@@ -85,7 +90,8 @@ select jsonb_build_object(
                 'execution', execution_id, 'agent', agent_id, 'task', task_id, 'usd', usd,
                 'tokens', tokens, 'unpriced_tokens', unpriced_tokens,
                 'models', (select coalesce(jsonb_agg(jsonb_build_object(
-                                     'model', b.model, 'usd', b.usd, 'tokens', b.tokens)
+                                     'model', b.model, 'usd', b.usd, 'tokens', b.tokens,
+                                     'unpriced_tokens', b.unpriced_tokens)
                                      order by b.usd desc nulls last, b.model), '[]'::jsonb)
                              from by_execution_model b where b.execution_id = g.execution_id))
                 order by usd desc, unpriced_tokens desc, execution_id)
