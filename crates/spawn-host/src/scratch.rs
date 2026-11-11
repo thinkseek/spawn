@@ -49,7 +49,6 @@ impl Scratch {
     pub fn path(&self) -> &Path {
         &self.path
     }
-
 }
 
 impl std::ops::Deref for Scratch {
@@ -69,17 +68,11 @@ impl AsRef<Path> for Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            eprintln!(
-                "the failed test's scratch is kept: {}",
-                self.path.display()
-            );
+            eprintln!("the failed test's scratch is kept: {}", self.path.display());
             return;
         }
         if let Err(error) = remove_tree(&self.path) {
-            eprintln!(
-                "cannot remove the scratch {}: {error}",
-                self.path.display()
-            );
+            eprintln!("cannot remove the scratch {}: {error}", self.path.display());
         }
     }
 }
@@ -165,7 +158,10 @@ mod tests {
 
     #[test]
     fn two_scratches_of_one_prefix_are_distinct() {
-        let (one, two) = (Scratch::new("spawn-scratch-twice"), Scratch::new("spawn-scratch-twice"));
+        let (one, two) = (
+            Scratch::new("spawn-scratch-twice"),
+            Scratch::new("spawn-scratch-twice"),
+        );
         assert_ne!(one.path(), two.path());
         assert!(one.path().is_dir() && two.path().is_dir());
     }
