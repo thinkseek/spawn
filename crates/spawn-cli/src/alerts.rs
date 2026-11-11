@@ -62,21 +62,26 @@
 //!   gating of the mission that does not name it (an accepted gate judged
 //!   every scenario on the base; a rejection may come before the base, so
 //!   it clears nothing).
-//! - `validator_defect`, `mission #<id>`, key
-//!   `validator_defect:<mission>:<scenario>:<event>`: a validator (a
-//!   regression) that fails on the base too, run again in the gate
-//!   (scripts/rsi/gate.sh, "Three classes of a failing regression"), in
-//!   either of two records, each its own alert (evidence `owner`):
-//!   - a task's `task.gated` `host_fault` with evidence `validator_defect`:
-//!     no candidate that fails it gets a verdict. Clears at the mission's
-//!     next `accepted` or `rejected` gating, or once a gate names it
-//!     `quarantined`;
+//! - `validator_defect`: a validator (a regression) that fails on the base
+//!   too, run again in the gate (scripts/rsi/gate.sh, "Three classes of a
+//!   failing regression"), in either of two records, each its own alert
+//!   (evidence `owner`, and `missions`, the missions it is about):
+//!   - a task's `task.gated` `host_fault` with evidence `validator_defect`,
+//!     `mission #<id>`, key `validator_defect:<mission>:<scenario>:<event>`:
+//!     no candidate that fails it gets a verdict. Also clears at the
+//!     mission's next `accepted` or `rejected` gating;
 //!   - an owner's accepted landing (`source.moved` with
-//!     `validator_defects`), for each mission it names: nothing checks the
-//!     scenario until it is fixed or quarantined. Clears only once a gate of
-//!     the mission names it `quarantined`, the owner's decision: a later
-//!     gate that does not name it may have read it unsolved on the base
-//!     rather than passed (review-fix-gate.md F1).
+//!     `validator_defects`), `<source> (mission #<id>, ...)`, key
+//!     `validator_defect:<source>:<scenario>:<event>`: one per source and
+//!     scenario, about the moved missions that are not closed (none: no
+//!     alert), naming `source` and `missions` (objective 056).
+//!
+//!   Either clears from the record (`cleared_evidence` `cause` and
+//!   `event_id`): `passed`, a later gating of a mission it names (or a
+//!   landing of its source) lists the scenario in `passed` or `reused`;
+//!   `gone`, a later gating of a mission it names carries `scenario_names`
+//!   without it; `closed`, every mission it names is closed; `quarantined`,
+//!   a gate names it so.
 //! - `task_undelivered`, `task #<id>`, key
 //!   `task_undelivered:<task>:<its task.assigned event>`: in `assigned`
 //!   longer than `SPAWN_ALERT_UNDELIVERED_SECS` (default 300) while its
@@ -892,7 +897,10 @@ impl Monitor {
                                    "record": "source.moved", "scenario": defect.scenario}));
             }
             (quarantined.contains(&defect.scenario)
-                && defect.missions.iter().any(|mission| moved.contains(mission)))
+                && defect
+                    .missions
+                    .iter()
+                    .any(|mission| moved.contains(mission)))
             .then(|| {
                 json!({"cause": "quarantined", "event_id": event_id,
                        "record": "source.moved", "quarantined": defect.scenario})
@@ -971,7 +979,9 @@ impl Monitor {
     ) {
         let quarantined = names(&record["quarantined"]);
         let passed = passed_names(record);
-        let present = record["scenario_names"].as_array().map(|_| names(&record["scenario_names"]));
+        let present = record["scenario_names"]
+            .as_array()
+            .map(|_| names(&record["scenario_names"]));
         let judged = matches!(record["verdict"].as_str(), Some("accepted" | "rejected"));
         self.clear_defects(out, |defect| {
             if !defect.missions.contains(&mission) {
@@ -1063,10 +1073,12 @@ impl Monitor {
         let mut kept = Vec::new();
         for defect in std::mem::take(&mut self.defects) {
             let evidence = match closing {
-                Some((mission, event_id)) => (defect.missions.contains(&mission)
-                    && all_closed(&defect))
-                .then(|| json!({"cause": "closed", "event_id": event_id,
-                                "record": "mission.closed"})),
+                Some((mission, event_id)) => {
+                    (defect.missions.contains(&mission) && all_closed(&defect)).then(|| {
+                        json!({"cause": "closed", "event_id": event_id,
+                                "record": "mission.closed"})
+                    })
+                }
                 None if all_closed(&defect) => {
                     let fired = known
                         .get(&defect.key)
@@ -4133,7 +4145,11 @@ mod tests {
                    "to": "c", "missions": [4, 9], "verdict": "accepted",
                    "validator_defects": ["028.sh"]}),
         );
-        assert_eq!(fires(&moved), ["validator_defect:/s:028.sh:13"], "{moved:?}");
+        assert_eq!(
+            fires(&moved),
+            ["validator_defect:/s:028.sh:13"],
+            "{moved:?}"
+        );
         commit(&mut monitor, &moved);
         // The mission's next verdict clears the task's, not the owner's.
         let judged = feed(
@@ -4164,7 +4180,11 @@ mod tests {
             .filter(|event| matches!(event, Event::Clear { .. }))
             .map(Event::key)
             .collect();
-        assert_eq!(cleared, ["validator_defect:/s:028.sh:13"], "{quarantined:?}");
+        assert_eq!(
+            cleared,
+            ["validator_defect:/s:028.sh:13"],
+            "{quarantined:?}"
+        );
         let Some(Event::Clear { evidence, .. }) = quarantined
             .iter()
             .find(|event| matches!(event, Event::Clear { .. }))
@@ -4196,9 +4216,19 @@ mod tests {
     fn three_missions() -> Monitor {
         let mut monitor = monitor();
         for id in 1..=3 {
-            feed(&mut monitor, id, 0, json!({"type": "mission.added", "id": id, "text": "m"}));
+            feed(
+                &mut monitor,
+                id,
+                0,
+                json!({"type": "mission.added", "id": id, "text": "m"}),
+            );
         }
-        feed(&mut monitor, 4, 0, json!({"type": "mission.closed", "id": 3, "state": "done"}));
+        feed(
+            &mut monitor,
+            4,
+            0,
+            json!({"type": "mission.closed", "id": 3, "state": "done"}),
+        );
         for id in 1..=2 {
             feed(
                 &mut monitor,
@@ -4244,7 +4274,10 @@ mod tests {
         assert_eq!(evidence["source"], "/s");
         assert_eq!(evidence["owner"], true);
         assert_eq!(evidence["request"], 9);
-        assert!(text.contains("mission #1, mission #2") && !text.contains("#3"), "{text}");
+        assert!(
+            text.contains("mission #1, mission #2") && !text.contains("#3"),
+            "{text}"
+        );
         commit(&mut monitor, &moved);
         let again = feed(&mut monitor, 11, 0, landing(&[2], &["v1.sh"]));
         assert!(fires(&again).is_empty(), "{again:?}");
@@ -4269,7 +4302,12 @@ mod tests {
     #[test]
     fn a_validator_defect_clears_once_passed_gone_or_its_missions_closed() {
         let mut monitor = three_missions();
-        let moved = feed(&mut monitor, 10, 0, landing(&[1, 2], &["v2.sh", "v3.sh", "v4.sh"]));
+        let moved = feed(
+            &mut monitor,
+            10,
+            0,
+            landing(&[1, 2], &["v2.sh", "v3.sh", "v4.sh"]),
+        );
         commit(&mut monitor, &moved);
         let gated = feed(
             &mut monitor,
@@ -4284,8 +4322,16 @@ mod tests {
         assert_eq!(
             cleared,
             [
-                ("validator_defect:/s:v2.sh:10".to_string(), json!("passed"), json!(11)),
-                ("validator_defect:/s:v3.sh:10".to_string(), json!("passed"), json!(11)),
+                (
+                    "validator_defect:/s:v2.sh:10".to_string(),
+                    json!("passed"),
+                    json!(11)
+                ),
+                (
+                    "validator_defect:/s:v3.sh:10".to_string(),
+                    json!("passed"),
+                    json!(11)
+                ),
             ]
         );
         commit(&mut monitor, &gated);
@@ -4298,7 +4344,11 @@ mod tests {
         );
         assert_eq!(
             clears_of(&gone),
-            [("validator_defect:/s:v4.sh:10".to_string(), json!("gone"), json!(12))]
+            [(
+                "validator_defect:/s:v4.sh:10".to_string(),
+                json!("gone"),
+                json!(12)
+            )]
         );
         commit(&mut monitor, &gone);
 
@@ -4310,16 +4360,34 @@ mod tests {
         let relanded = feed(&mut monitor, 14, 0, passed);
         assert_eq!(
             clears_of(&relanded),
-            [("validator_defect:/s:v6.sh:13".to_string(), json!("passed"), json!(14))]
+            [(
+                "validator_defect:/s:v6.sh:13".to_string(),
+                json!("passed"),
+                json!(14)
+            )]
         );
         commit(&mut monitor, &relanded);
         // Closed: one of two leaves it, both clear it.
-        let one = feed(&mut monitor, 15, 0, json!({"type": "mission.closed", "id": 1, "state": "done"}));
+        let one = feed(
+            &mut monitor,
+            15,
+            0,
+            json!({"type": "mission.closed", "id": 1, "state": "done"}),
+        );
         assert!(clears_of(&one).is_empty(), "{one:?}");
-        let both = feed(&mut monitor, 16, 0, json!({"type": "mission.closed", "id": 2, "state": "done"}));
+        let both = feed(
+            &mut monitor,
+            16,
+            0,
+            json!({"type": "mission.closed", "id": 2, "state": "done"}),
+        );
         assert_eq!(
             clears_of(&both),
-            [("validator_defect:/s:v5.sh:13".to_string(), json!("closed"), json!(16))]
+            [(
+                "validator_defect:/s:v5.sh:13".to_string(),
+                json!("closed"),
+                json!(16)
+            )]
         );
         commit(&mut monitor, &both);
         assert!(decided(&monitor, both).is_empty(), "each clears once");
@@ -4497,8 +4565,16 @@ mod tests {
         assert_eq!(
             cleared,
             [
-                ("validator_defect:/s:v1.sh:20".to_string(), json!("passed"), json!(31)),
-                ("validator_defect:2:v8.sh:8".to_string(), json!("gone"), json!(31)),
+                (
+                    "validator_defect:/s:v1.sh:20".to_string(),
+                    json!("passed"),
+                    json!(31)
+                ),
+                (
+                    "validator_defect:2:v8.sh:8".to_string(),
+                    json!("gone"),
+                    json!(31)
+                ),
             ]
         );
     }

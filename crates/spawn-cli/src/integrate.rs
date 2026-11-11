@@ -16039,7 +16039,12 @@ mod database_tests {
         integrator.settle();
         let moved = control_records(&db, "source.moved");
         assert_eq!(moved.len(), 1, "{moved:?}");
-        assert_eq!(moved[0]["passed"], json!(["001.sh", "check-web.sh"]), "{}", moved[0]);
+        assert_eq!(
+            moved[0]["passed"],
+            json!(["001.sh", "check-web.sh"]),
+            "{}",
+            moved[0]
+        );
         assert_eq!(moved[0]["reused"], json!(["002.sh"]), "{}", moved[0]);
         let task = db.reported_task(mission, "w");
         let agent = agent_of(&db, mission, task);
