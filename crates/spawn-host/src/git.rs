@@ -3178,7 +3178,7 @@ mod tests {
     /// A store with branch `agent_a` checkpointed once (`start`, holding
     /// `kept.txt`) and once more with a cancelled task's work (`work`,
     /// adding `one.txt` and changing `kept.txt`).
-    fn worked(tag: &str) -> (GitWorkspace, WorkspaceId, PathBuf, String, String) {
+    fn worked(tag: &str) -> (GitWorkspace, WorkspaceId, crate::Scratch, String, String) {
         let (_, store, workspace, base) = capped(tag);
         let directory = PathBuf::from(workspace.path());
         std::fs::write(directory.join("kept.txt"), "before\n").expect("write");
