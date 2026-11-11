@@ -9,18 +9,25 @@
 # minutes after it got 056 and 057 (lead-mac, queue.md 23:35). Home says
 # only "No mission has work open" (Home.tsx, the Missions card): no alert,
 # nothing in Needs you, no time since, no mission named as the one waiting,
-# and an idle fleet is the most expensive state the owner has.
+# and an idle fleet is the most expensive state the owner has. The
+# scorecard's "Idle hours by mission" flags the two owner-work missions (#7
+# 75%, #8 76%) as idle beside #4 (37%) and #6 (40%), though owner work has
+# no backlog of its own (lead-mac, queue.md 23:45): idle is a fault only for
+# a mission that takes its work from an objective backlog.
 #
 # Required (read through `GET /api/alerts` and web/src/home.ts's needsYou
 # under node over it), with SPAWN_ALERT_MISSION_IDLE_SECS=8 (the bound):
-#   (1) an active mission whose last task ended (cancelled) and that has no
-#       task in work for the bound fires ONE open `mission_idle` alert,
+#   (1) an active mission that takes its work from an objective backlog,
+#       whose last task ended (cancelled) and that has no task in work for
+#       the bound, fires ONE open `mission_idle` alert,
 #       subject `mission #<id>`; its evidence names `mission`, `since_ms`
 #       (when its last task ended) and `event_id` (that record), and its
 #       text names the mission.
-#   (2) a mission whose task is still in work (delivered) fires none, and a
-#       closed mission fires none: read once (1)'s alert is open, which a
-#       pass after the bound fired (the barrier).
+#   (2) a mission whose task is still in work (delivered) fires none, a
+#       closed mission fires none, and an owner-work mission (no objective
+#       backlog: its work comes from the owner, so no task is no fault)
+#       fires none: read once (1)'s alert is open, which a pass after the
+#       bound fired (the barrier); each was without work longer than 1.
 #   (3) Needs you shows (1)'s alert as one item naming mission #1.
 #   (4) a task assigned to the mission clears it: cleared_evidence
 #       `event_id` the `task.assigned` record.
@@ -276,10 +283,16 @@ summary() { printf '%s' "$1" | jq -c '[.[] | {key, state, text}]' | head -c 400;
 
 # --- the missions ----------------------------------------------------------------
 
+# Missions 1, 2 and 3 take their work from an objective backlog (as the
+# live RSI and Supply PA missions do); mission 4 is owner work: no backlog,
+# its tasks come from the owner when there is something to do.
+mkdir -p "$WORK/ctl/backlog"
 for id in 1 2 3; do
     record "{\"type\":\"mission.added\",\"id\":$id,\"text\":\"058 mission $id\",\"origin\":\"human\",\"sources\":[]}" >/dev/null
-    record "{\"type\":\"mission.configured\",\"id\":$id,\"accept\":\"gate\",\"gate\":\"$WORK/ctl/scenarios\"}" >/dev/null
+    record "{\"type\":\"mission.configured\",\"id\":$id,\"accept\":\"gate\",\"gate\":\"$WORK/ctl/scenarios\",\"objectives\":{\"backlog\":\"$WORK/ctl/backlog\",\"resident\":\"bbres\",\"workers\":1}}" >/dev/null
 done
+record '{"type":"mission.added","id":4,"text":"058 owner work","origin":"human","sources":[]}' >/dev/null
+record '{"type":"mission.configured","id":4,"accept":"review"}' >/dev/null
 
 "$SPAWN_BIN" loop --repo "$repo" --root "$SPAWN_WORKSPACE_ROOT" >>"$WORK/loop.log" 2>&1 &
 loop_pid=$!
@@ -287,14 +300,16 @@ start_serve
 
 # Mission 2 has a task, then is closed; mission 3's task stays in work;
 # mission 1's task is cancelled last.
+assign 5 4 >/dev/null
 assign 2 2 >/dev/null
 assign 3 3 >/dev/null
 assign 1 1 >/dev/null
-for task in 1 2 3; do
+for task in 1 2 3 5; do
     wait_until 60 delivered "$task" || harness "task #$task was not delivered within 60 s (it is $(task_state "$task"))"
 done
 capture "$SPAWN_BIN" mission close --id 2 --state done --summary "058 closes it"
 [ "$status" -eq 0 ] || harness "spawn mission close --id 2 failed: $(err)"
+cancel 5 >/dev/null
 c1=$(cancel 1)
 c1_ms=$(event_ms "$c1")
 
@@ -318,6 +333,9 @@ if wait_until 40 open_one; then
     got=$(idle_of 2)
     expect_eq "$(printf '%s' "$got" | jq length)" 0 \
         "(2) mission_idle alerts for mission 2, closed before mission 1's task ended: $(summary "$got")"
+    got=$(idle_of 4)
+    expect_eq "$(printf '%s' "$got" | jq length)" 0 \
+        "(2) mission_idle alerts for mission 4, owner work (no objective backlog), without a task since before mission 1's ended: $(summary "$got")"
     note "(2) checked: no alert for a mission in work or a closed one"
 else
     check_failed "(1) mission 1 has had no task in work since its cancel (record $c1), past the 8 s bound, and has no open mission_idle alert 40 s on: $(summary "$(idle_of 1)"); (2) is not judged without it"
