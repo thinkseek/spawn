@@ -275,6 +275,14 @@ function IdleRow({ mission }: { mission: MissionIdle }) {
       {mission.idle && (
         <span className="shrink-0 rounded-full bg-warning/10 px-1.5 text-micro font-medium text-warning">idle</span>
       )}
+      {mission.ownerWork && (
+        <span
+          className="shrink-0 rounded-full bg-muted px-1.5 text-micro font-medium text-muted-foreground"
+          title="No objective backlog: its work comes from the owner, so idle hours here are no loss"
+        >
+          owner work
+        </span>
+      )}
     </li>
   );
 }
