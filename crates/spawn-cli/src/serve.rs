@@ -94,6 +94,7 @@ mod answers;
 mod attention;
 mod labels;
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1334,13 +1335,19 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 ///     "backlog_error": "<why it could not be read>" | null,
 ///     "resident": {"name", "agent_id", "session_id", "state", "label",
 ///                  "task_title", "mission_name"} | null,
-///     "next_objective": 3 | null,         // what the integrator assigns next
+///     "next_objective": 3 | null,         // what the integrator assigns next:
+///                                         // objectives::choose over the landings
+///                                         // (and objective.solved records), the
+///                                         // tasks in flight, attempts and holds
 ///     "objectives": [{                    // the backlog, by id
 ///       "id": 2, "title": "...", "prompt": "...", "recurring": true,
 ///       "metric": "ingest_total_ns" | null, "unit": "ns",
 ///       "direction": "lower" | "higher", "target": 1100 | null,
 ///       "owner_judged": false,            // the owner judges it, not the fleet
-///       "status": "open" | "solved" | "met" | "owner",
+///       "status": "open" | "solved" | "met" | "owner",   // "solved" by a landing
+///                                         // or by an objective.solved record
+///       "solved_on_base": {"event": 109278, "task": 201, "base": "<commit>"} | null,
+///                                         // the integrator's objective.solved record
 ///       "current": 1021 | null,           // latest landed metric value
 ///       "tasks": [10, 14],                // task ids for this objective
 ///       "landings": [{                    // landed tasks, oldest first
