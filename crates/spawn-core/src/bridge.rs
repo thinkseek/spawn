@@ -381,6 +381,13 @@ struct Follow {
     due_at: Option<i64>,
     /// Bytes of the transcript read so far.
     offset: u64,
+    /// The last bytes read before `offset`, at most [`FOLLOW_OVERLAP`]:
+    /// what the file must still hold there for the offset to mean anything.
+    /// A file that is shorter than the offset, or holds other bytes before
+    /// it, shrank or was replaced (a rewrite, a restore, a file renamed over
+    /// it), and is read again from the start ([`Bridge::follow_output`]).
+    /// Empty after a restart: then only the length is checked.
+    tail: Vec<u8>,
     /// The last screen state recorded, and when.
     screen: Option<(ScreenState, i64)>,
     /// A state read once and not recorded yet: a screen is recorded when
@@ -430,6 +437,38 @@ struct Follow {
     evidence: Option<String>,
     /// Where the transcript archive stands with its transcript.
     archiving: Archiving,
+}
+
+/// How many bytes before its read position the Bridge keeps of a
+/// transcript to tell a file that went on from one that shrank or was
+/// replaced, as the archive's copier does with its copies
+/// (transcripts.rs `OVERLAP`).
+const FOLLOW_OVERLAP: usize = 4096;
+
+impl Follow {
+    /// How many bytes before the offset a read checks: the tail kept, or,
+    /// with none (after a restart), one, which says the file still reaches
+    /// the offset.
+    fn kept(&self) -> usize {
+        if self.tail.is_empty() {
+            usize::from(self.offset > 0)
+        } else {
+            self.tail.len()
+        }
+    }
+
+    /// `bytes`, read from the transcript at `offset`, are dealt with: the
+    /// offset moves past them, and the tail keeps their last bytes.
+    fn advance(&mut self, bytes: &[u8]) {
+        self.offset += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if bytes.len() >= FOLLOW_OVERLAP {
+            self.tail = bytes[bytes.len() - FOLLOW_OVERLAP..].to_vec();
+        } else {
+            self.tail.extend_from_slice(bytes);
+            let over = self.tail.len().saturating_sub(FOLLOW_OVERLAP);
+            self.tail.drain(..over);
+        }
+    }
 }
 
 /// How far the archive has an execution's transcript ([`Bridge::keep_archive`]),
@@ -1596,6 +1635,16 @@ impl Bridge {
     /// ([`Follow::poll`]). A read that leaves a line half-written, or a
     /// checkpoint uncommitted, keeps the execution due, so the next pass
     /// reads again: a line is never lost to the moment it was written.
+    ///
+    /// A transcript that shrank below the offset, or was replaced (other
+    /// bytes than the ones read just before the offset: a rewrite, a
+    /// restore, a file renamed over it, of any length), is read again from
+    /// the start, warned once per time it is found. Without this the offset
+    /// pointed past the end of the new file, every read came back empty and
+    /// its lines were never seen (incident 2026-11-12, D1: markers never
+    /// taken, turns and usage missed). Reading again appends nothing twice:
+    /// a line's events carry its key (`source_event_id`), which the log
+    /// takes once per session.
     fn follow_output(
         &self,
         agent_id: &AgentId,
@@ -1612,11 +1661,10 @@ impl Bridge {
             return Ok(());
         };
         let path = transcript_path(&self.config.claude_projects, &active.workspace, native);
-        let bytes = match self
-            .terminals
-            .read_from(&active.workspace, &path, active.follow.offset)
-        {
-            Ok(Some(bytes)) => bytes,
+        // Read past the offset only while the file holds what was read there
+        // ([`Bridge::read_followed`]); `limit`: a full read's bytes past it.
+        let (bytes, limit) = match self.read_followed(session, &path, active, report) {
+            Ok(Some(read)) => read,
             Ok(None) => {
                 let now = self.clock.now().0;
                 let since = *active.follow.first_seen.get_or_insert(now);
@@ -1662,8 +1710,8 @@ impl Bridge {
             // limit: skip what was read rather than stall on it forever (the
             // rest of it parses as nothing). Anything shorter is a line
             // still being written: it is read next pass.
-            if bytes.len() >= READ_LIMIT {
-                active.follow.offset += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            if bytes.len() >= limit {
+                active.follow.advance(&bytes);
                 active.follow.watch.dirty = false;
                 report.warnings.push(format!(
                     "{session}: skipped a line over {READ_LIMIT} bytes in {path}"
@@ -1705,7 +1753,7 @@ impl Bridge {
                     report,
                 )?
             {
-                active.follow.offset += u64::try_from(start).unwrap_or(u64::MAX);
+                active.follow.advance(&bytes[..start]);
                 // The commit stays due: the line is read again next pass.
                 return Ok(());
             }
@@ -1725,9 +1773,49 @@ impl Bridge {
                 })?;
             }
         }
-        active.follow.offset += u64::try_from(end + 1).unwrap_or(u64::MAX);
+        active.follow.advance(&bytes[..=end]);
         active.follow.watch.dirty = false;
         Ok(())
+    }
+
+    /// The transcript at `path` past the offset, and how many bytes a full
+    /// read holds there. It is read from [`Follow::kept`] bytes before the
+    /// offset, and those must be what was read there. When they are not
+    /// (the file shrank below the offset, or was replaced) it is said, and
+    /// the file is read again from the start ([`Bridge::follow_output`]).
+    fn read_followed(
+        &self,
+        session: &SessionId,
+        path: &str,
+        active: &mut Active,
+        report: &mut TickReport,
+    ) -> Result<Option<(Vec<u8>, usize)>, TerminalError> {
+        let kept = active.follow.kept();
+        let from = active
+            .follow
+            .offset
+            .saturating_sub(u64::try_from(kept).unwrap_or(0));
+        let Some(mut bytes) = self.terminals.read_from(&active.workspace, path, from)? else {
+            return Ok(None);
+        };
+        let tail = &active.follow.tail;
+        if bytes.len() >= kept && (tail.is_empty() || bytes[..kept] == tail[..]) {
+            bytes.drain(..kept);
+            return Ok(Some((bytes, READ_LIMIT.saturating_sub(kept))));
+        }
+        // Lines read before are not appended twice (their events' keys are
+        // taken), so reading it again loses nothing and repeats nothing.
+        report.warnings.push(format!(
+            "{session}: the transcript {path} shrank below the {} bytes read, \
+             or was replaced: reading it again from the start",
+            active.follow.offset
+        ));
+        active.follow.offset = 0;
+        active.follow.tail.clear();
+        Ok(self
+            .terminals
+            .read_from(&active.workspace, path, 0)?
+            .map(|bytes| (bytes, READ_LIMIT)))
     }
 
     /// Whether the transcript is read on this pass although nothing was
