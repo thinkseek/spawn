@@ -278,7 +278,10 @@ close_mission() { # <id>: prints the mission.closed event id
 
 # The alert step has read up to <event id>: every alert step pass reads in
 # order, so an alert fired on a later record proves it. A task notice is
-# fired on every task record; this one is the marker.
+# fired on every task record; this one is the marker. Any notice of the
+# marker's task fired on a record from it on counts: a step that starts
+# after the record was written reads from where it starts, and sees the
+# task's next record (its delivery) instead.
 marker=100
 read_past() { # <what>: writes a marker task record and waits for its notice
     marker=$((marker + 1))
@@ -286,7 +289,10 @@ read_past() { # <what>: writes a marker task record and waits for its notice
     wait_until 30 marker_seen "$m" ||
         harness "$1: 30 s after record $m the loop's alert step has fired no task notice on it"
 }
-marker_seen() { [ "$(q "select count(*) from spawn_alerts where key = 'task_state:$marker:$1'")" -gt 0 ]; }
+marker_seen() {
+    [ "$(q "select count(*) from spawn_alerts where kind = 'task_state' and subject = 'task #$marker'
+              and (evidence ->> 'event_id')::bigint >= $1")" -gt 0 ]
+}
 
 start_serve() {
     "$SPAWN_BIN" serve --address "127.0.0.1:0" --web "$WORK/web" >"$WORK/serve.log" 2>&1 &
