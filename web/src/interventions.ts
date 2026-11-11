@@ -97,3 +97,25 @@ export function interventionsView(
     rows: Array.isArray(answer?.items) ? answer.items.map(row) : [],
   };
 }
+
+/**
+ * What one window's figure shows (Home): the answer's view; the reason the
+ * read failed when there is no answer (a 500 such as a statement timeout,
+ * no server) rather than "Loading…" for ever; or loading, before the first
+ * answer or failure. A failure after an answer keeps the answer on screen
+ * and says the last read failed, and why.
+ */
+export type FigureState =
+  | { kind: "loading" }
+  | { kind: "failed"; reason: string }
+  | { kind: "view"; view: InterventionsView; stale: string | null };
+
+export function figureState(
+  answer: Partial<InterventionsAnswer> | null | undefined,
+  error: string | null | undefined,
+): FigureState {
+  const reason = typeof error === "string" && error.trim() !== "" ? error.trim() : null;
+  if (answer) return { kind: "view", view: interventionsView(answer), stale: reason };
+  if (reason) return { kind: "failed", reason };
+  return { kind: "loading" };
+}
