@@ -13,7 +13,6 @@
 //! each time it writes one, so it stays at most `KEEP` × `LOG_BYTES` (about
 //! 128 MB). The path goes in the journal's no-verdict line and on the
 //! request's `source.push_no_verdict` record.
-
 //!
 //! Every judging's gates, whatever the outcome (lead-mac, 2026-11-11: the
 //! per-scenario lines at the end of a gate's stdout are the measurement's
@@ -21,8 +20,10 @@
 //! dropped, its `stdout`, `stderr`, `verdict` and `status` are copied first
 //! to `<root>/gate-logs/<judging>/<gate directory>/` (each cut to its last
 //! [`LOG_BYTES`]; [`keep_gate`]). `<root>/gate-logs` keeps the newest
-//! [`GATE_KEEP`] judgings (by id, which sorts by start) and at most
-//! [`GATE_TOTAL_BYTES`] in all, the oldest removed first. A judging's
+//! [`GATE_KEEP`] judgings and at most [`GATE_TOTAL_BYTES`] in all, those
+//! whose gate was kept longest ago removed first (by the time a gate was
+//! last kept in each, not by the judging's start: a long judging that ends
+//! last is the newest), never the one just kept. A judging's
 //! outcome records name the directory (`gate_logs`, [`super::judging`]'s
 //! `named`) once a gate of it has been kept.
 
@@ -155,7 +156,7 @@ pub(crate) fn keep_gate(
         }
     }
     for file in GATE_FILES {
-        let Ok(bytes) = std::fs::read(gate.join(file)) else {
+        let Ok(bytes) = read_tail(&gate.join(file), LOG_BYTES) else {
             continue;
         };
         let text = String::from_utf8_lossy(&bytes);
@@ -169,39 +170,64 @@ pub(crate) fn keep_gate(
             .and_then(|mut out| out.write_all(tail(&text, LOG_BYTES).as_bytes()))
             .map_err(|error| format!("write {}: {error}", path.display()))?;
     }
-    prune_gates(&logs, keep, total);
+    // The time this judging's gate was kept: its directory's, which the
+    // pruning orders by (a gate directory made in it set it already; a
+    // second gate of the same name would not).
+    let _ = std::fs::File::open(&judging_dir)
+        .and_then(|dir| dir.set_modified(std::time::SystemTime::now()));
+    prune_gates(&logs, judging, keep, total);
     Ok(judging_dir)
 }
 
-/// Remove the oldest judgings' directories in `logs` (by name) past `keep`,
-/// and then past `total` bytes in all.
-fn prune_gates(logs: &Path, keep: usize, total: u64) {
+/// Remove judgings' directories in `logs` past `keep`, and then past `total`
+/// bytes in all: the one whose gate was kept longest ago first (its
+/// directory's modification time, then its name), never `current`, the one
+/// just kept.
+fn prune_gates(logs: &Path, current: &str, keep: usize, total: u64) {
     let Ok(entries) = std::fs::read_dir(logs) else {
         return;
     };
-    let mut judgings: Vec<(String, u64)> = entries
+    let mut judgings: Vec<(std::time::SystemTime, String, u64)> = entries
         .flatten()
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| {
             let name = entry.file_name().to_string_lossy().to_string();
-            (name, size(&entry.path()))
+            let at = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            (at, name, size(&entry.path()))
         })
         .collect();
     judgings.sort_unstable();
-    let mut held: u64 = judgings.iter().map(|(_, bytes)| bytes).sum();
+    let mut held: u64 = judgings.iter().map(|(_, _, bytes)| bytes).sum();
     let mut left = judgings.len();
-    for (name, bytes) in &judgings {
+    for (_, name, bytes) in &judgings {
         if left <= keep && held <= total {
             break;
         }
-        // The newest is never removed: it is the one just kept.
-        if left == 1 {
-            break;
+        if name == current {
+            continue;
         }
         let _ = std::fs::remove_dir_all(logs.join(name));
         held = held.saturating_sub(*bytes);
         left -= 1;
     }
+}
+
+/// The last `limit` bytes of the file at `path` (all of it when shorter),
+/// read from there: never the whole of a large file.
+fn read_tail(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read as _, Seek as _};
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    let limit = u64::try_from(limit).unwrap_or(u64::MAX);
+    if length > limit {
+        file.seek(std::io::SeekFrom::Start(length - limit))?;
+    }
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// The bytes of the files under `path`.
@@ -295,6 +321,7 @@ mod tests {
         let source = gate(&root, "spawn-gate-1-c-0", &"x".repeat(1000));
         for judging in ["0001", "0002", "0003", "0004", "0005"] {
             keep_gate(&root, judging, &source, 3, u64::MAX).expect("kept");
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let left = |root: &Path| {
             let mut left: Vec<String> = std::fs::read_dir(root.join(GATE_LOGS))
@@ -317,10 +344,29 @@ mod tests {
         );
         // Each judging holds about 1 kB: a 2.5 kB total keeps the newest two.
         keep_gate(&root, "0006", &source, 10, 2500).expect("kept");
+        std::thread::sleep(std::time::Duration::from_millis(20));
         assert_eq!(left(&root), ["0005", "0006"], "the newest within the bytes");
         // The newest is kept even alone over the total.
         keep_gate(&root, "0007", &source, 10, 10).expect("kept");
         assert_eq!(left(&root), ["0007"]);
+        // A long judging (an early id) whose gate is kept last is the newest:
+        // the one kept longest ago goes, not the one with the smallest id.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        keep_gate(&root, "0009", &source, 2, u64::MAX).expect("kept");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        keep_gate(&root, "0001", &source, 2, u64::MAX).expect("kept");
+        assert_eq!(
+            left(&root),
+            ["0001", "0009"],
+            "0007, kept longest ago, went"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        keep_gate(&root, "0010", &source, 2, u64::MAX).expect("kept");
+        assert_eq!(
+            left(&root),
+            ["0001", "0010"],
+            "0009 was kept before 0001: it goes, though its id is later"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
