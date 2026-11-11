@@ -44,7 +44,16 @@ impl Server {
         let directory = std::env::temp_dir().join(&socket);
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).expect("scratch");
-        Self { directory, socket }
+        let server = Self { directory, socket };
+        fs::create_dir(server.runtime()).expect("runtime");
+        fs::set_permissions(server.runtime(), fs::Permissions::from_mode(0o700)).expect("0700");
+        server
+    }
+
+    /// The hosts' runtime directory, in place of `$XDG_RUNTIME_DIR`: what
+    /// they keep there stays in the test's scratch (backlog S20).
+    fn runtime(&self) -> PathBuf {
+        self.directory.join("run")
     }
 
     /// The host, through a `tmux` that runs on this server.
@@ -70,7 +79,7 @@ impl Server {
         permissions.set_mode(0o755);
         fs::set_permissions(&temporary, permissions).expect("chmod");
         fs::rename(&temporary, &target).expect("rename");
-        TmuxHost::local(&target.display().to_string())
+        TmuxHost::local(&target.display().to_string()).with_runtime_under(self.runtime())
     }
 
     /// tmux on this server, directly: what a terminal manager does.
@@ -269,7 +278,7 @@ fn a_launch_starts_while_the_server_shuts_down_after_its_last_terminal() {
     let _exclusive = exclusive();
     let server = Server::new("restart");
     let host = server.host();
-    let before = environment_files();
+    let before = environment_files(&server);
     for round in 0..20 {
         host.start(&launch("/bin/cat", &[], &[]))
             .unwrap_or_else(|error| panic!("start {round}: {error:?}"));
@@ -282,26 +291,18 @@ fn a_launch_starts_while_the_server_shuts_down_after_its_last_terminal() {
         host.terminate(&terminal(), &workspace()).expect("kill");
     }
     // A pane killed before its shell ran leaves its environment file.
-    let directory = environment_directory();
-    for name in environment_files() {
+    let directory = server.runtime();
+    for name in environment_files(&server) {
         if !before.contains(&name) {
             let _ = fs::remove_file(directory.join(name));
         }
     }
 }
 
-/// Where a launch's environment file is written.
-fn environment_directory() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_dir())
-        .unwrap_or_else(std::env::temp_dir)
-}
-
 /// The environment files of this process's launches that are still there.
-fn environment_files() -> Vec<String> {
+fn environment_files(server: &Server) -> Vec<String> {
     let prefix = format!("spawn-launch-spawn-exec_1-{}-", std::process::id());
-    fs::read_dir(environment_directory())
+    fs::read_dir(server.runtime())
         .expect("read the directory")
         .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
@@ -343,7 +344,7 @@ fn a_launch_is_asked_again_only_of_a_server_that_left() {
             tmux = server.command(),
         ))
     };
-    let before = environment_files();
+    let before = environment_files(&server);
 
     fs::write(&left, "").expect("marker");
     let host = tmux(true);
@@ -369,7 +370,11 @@ fn a_launch_is_asked_again_only_of_a_server_that_left() {
         asked.len() > 1 && asked.len() <= 5 && asked.iter().all(|call| call == "new-session"),
         "{asked:?}"
     );
-    assert_eq!(environment_files(), before, "an environment file was left");
+    assert_eq!(
+        environment_files(&server),
+        before,
+        "an environment file was left"
+    );
 }
 
 /// Wait until a process holding `marker` runs, then a moment for its shell
@@ -504,7 +509,7 @@ fn terminate_waits_for_a_runner_whose_session_vanished_on_its_own() {
     let host = server
         .host()
         .with_terminate_waits(Duration::from_secs(5), Duration::from_secs(2))
-        .with_leaders_under(leaders);
+        .with_runtime_under(leaders);
 
     // tmux dies; the runner writes as it dies, 0.5 s after the hang-up.
     let late = server.directory.join("late");
