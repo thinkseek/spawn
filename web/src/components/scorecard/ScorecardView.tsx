@@ -1,9 +1,9 @@
 import { CalendarDays, Gauge, OctagonAlert, Target } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
-import { usePoll } from "../../api";
+import { readApi, usePoll } from "../../api";
 import type { FleetHealth } from "../../fleet";
-import { decisionsFromHealth } from "../../fleetDecisions";
+import { decisionsFromApi, decisionsFromHealth } from "../../fleetDecisions";
 import { absoluteTitle, localDateTime, relativeTime } from "../../format";
 import type { Missions } from "../../missions";
 import { isQuietScope, orderScopes } from "../../ordering";
@@ -62,7 +62,8 @@ interface Loaded {
  * How the fleet and each mission did over a window: throughput, lead time,
  * first-pass quality, rework, autonomy, reliability, cost and gate time,
  * each against the previous window of the same length. Strictly read-only:
- * the only requests are GET /api/scorecard (and GET /api/missions, polled by
+ * the only requests are GET /api/scorecard and /api/scorecard/fleet (and
+ * GET /api/missions, polled by
  * App, for the missions' titles and order).
  */
 export function ScorecardView({
@@ -90,6 +91,14 @@ export function ScorecardView({
     POLL_MS,
   );
   const data = scorecard.data?.card ?? null;
+  // "How the fleet decides" over the page's window, from the experience
+  // views; home's health (the last hour and 24 h) until it answers.
+  const fleetWindow = usePoll(
+    `scorecard-fleet?window=${since}`,
+    (signal) => readApi(`/api/scorecard/fleet?window=${since}`, signal, decisionsFromApi),
+    POLL_MS,
+  );
+  const decisions = fleetWindow.data ?? (health ? decisionsFromHealth(health) : null);
 
   const titles = useMemo(() => {
     const out = new Map<number, string>();
@@ -194,7 +203,7 @@ export function ScorecardView({
               </div>
             )}
             <WindowCard card={data} />
-            <FleetDecisions decisions={health ? decisionsFromHealth(health) : null} />
+            <FleetDecisions decisions={decisions} />
             {scopes.length === 0 ? (
               <Card>
                 <EmptyState
