@@ -314,6 +314,50 @@ mod tests {
     }
 
     #[test]
+    fn an_owner_work_mission_is_never_idle_and_a_backlog_one_is_as_before() {
+        let window = Window {
+            since: U - DAY_MS,
+            until: U,
+        };
+        let counts = json!({
+            "missions": [
+                {"mission": 1, "text": "backlog", "opened_at_ms": at(-48.0), "closed_at_ms": null,
+                 "owner_work": false, "tasks": []},
+                {"mission": 2, "text": "owner", "opened_at_ms": at(-48.0), "closed_at_ms": null,
+                 "owner_work": true, "tasks": []},
+                {"mission": 3, "text": "busy backlog", "opened_at_ms": at(-48.0), "closed_at_ms": null,
+                 "owner_work": false, "tasks": [[at(-30.0), null]]},
+                {"mission": 4, "text": "busy owner", "opened_at_ms": at(-48.0), "closed_at_ms": null,
+                 "owner_work": true, "tasks": [[at(-30.0), null]]}
+            ]
+        });
+        let answer = answer(&counts, "24h", window);
+        let rows: Vec<(i64, f64, bool, bool)> = answer["missions"]
+            .as_array()
+            .expect("missions")
+            .iter()
+            .map(|m| {
+                (
+                    m["mission"].as_i64().expect("id"),
+                    m["idle_hours"].as_f64().expect("idle hours"),
+                    m["idle"].as_bool().expect("idle"),
+                    m["owner_work"].as_bool().expect("owner work"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (1, 24.0, true, false),
+                (2, 24.0, false, true),
+                (3, 0.0, false, false),
+                (4, 0.0, false, true)
+            ],
+            "owner work keeps its idle hours but is never flagged idle"
+        );
+    }
+
+    #[test]
     fn no_agent_hours_means_no_rate() {
         let window = Window {
             since: U - DAY_MS,
