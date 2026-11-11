@@ -18,6 +18,7 @@ import { AgentDetail } from "./AgentDetail";
 import { AlwaysOnAgents, uptimeMs } from "./AlwaysOnAgents";
 import { FleetBoard } from "./FleetBoard";
 import { InputBox } from "./InputBox";
+import { InterventionsCard } from "./Interventions";
 import { HealthStrip } from "./HealthStrip";
 import type { Liveness } from "./HealthStrip";
 
@@ -44,7 +45,8 @@ interface FleetViewProps {
  * The home page, in the order the owner asks (design-ui-information.md §3,
  * layout A): does anything need me, is work moving (each mission today),
  * who is working now and on what, what the supervisor said lately (with
- * the box to type to it), and today as a digest. The always-on cards, the
+ * the box to type to it), today as a digest, and the north star (human
+ * interventions per agent-hour, with the interventions behind it). The always-on cards, the
  * health tiles and the whole fleet board are folded under "Every agent and
  * the host" at the bottom. The polls live in App, so the sidebar shows the
  * same counts from any view.
@@ -158,6 +160,7 @@ export function FleetView({
               digest={digestSince(missions, digestAlerts.data ?? alerts, now, digestSpan.since, agents ?? null, digestSpan.away)}
               back={away?.at ?? null}
             />
+            <InterventionsCard />
             <button
               type="button"
               onClick={() => setDetailsOpen((value) => !value)}
