@@ -10,6 +10,11 @@
 # After COMMAND, the tmpfs must hold exactly the sentinels: anything new is
 # something COMMAND wrote there, a missing one something it removed.
 #
+# What it cannot see: the tmpfs hides the user's systemd bus, so a process
+# COMMAND would start as a systemd user unit (systemd-run --user) does not
+# start, and one that does runs with the manager's own, real
+# XDG_RUNTIME_DIR, outside this check (rev-e's O2 on 56d71760).
+#
 # Exit: COMMAND's status when the tmpfs is as seeded; 3 when it is not (the
 # difference on stderr); 2 when the check itself cannot run.
 set -eu
