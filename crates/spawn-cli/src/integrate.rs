@@ -9553,20 +9553,36 @@ mod database_tests {
         }
     }
 
-    /// Stops this test process's gate units when a test ends, a failed one
-    /// too: a unit outlives the test that started it (gate v2 step 2).
-    struct StopUnits;
+    /// Stops the gate units of one test's integrators when the test ends, a
+    /// failed one too: a unit outlives the test that started it (gate v2
+    /// step 2). Only that test's: the units its judgings under the root
+    /// name (a unit is named after its private directory,
+    /// `<root>/judgings/<id>/<unit>`), never every unit of the test process.
+    /// The suite runs its tests on threads of one process, so the units of
+    /// tests running beside it share its pid: a pid-wide stop at the end of
+    /// one test killed the gate another was still waiting on, whose
+    /// adopter then found the runner gone without a status (P24).
+    struct StopUnits(PathBuf);
 
     impl Drop for StopUnits {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("systemctl")
-                .args([
-                    "--user",
-                    "stop",
-                    &format!("spawn-gate-{}-*", std::process::id()),
-                ])
-                .stderr(std::process::Stdio::null())
-                .status();
+            let judgings = self.0.join(super::judging::DIRECTORY);
+            for judging in std::fs::read_dir(&judgings).into_iter().flatten().flatten() {
+                for private in std::fs::read_dir(judging.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    let name = private.file_name().to_string_lossy().to_string();
+                    if !name.starts_with("spawn-gate-") {
+                        continue;
+                    }
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["--user", "stop", "--", &format!("{name}.service")])
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
         }
     }
 
@@ -11903,8 +11919,8 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&marks);
         std::fs::create_dir_all(&marks).expect("marks");
         let _release = Release(marks.clone());
-        let _units = StopUnits;
         let (base, source, scenarios, first) = world("adopt", &holding_gate(&marks));
+        let _units = StopUnits(base.join("host"));
         let first = first.with_units(true);
         let second = Integrator::new(
             base.join("host"),
@@ -17129,8 +17145,8 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         }
         let marks = fresh_marks("spawn-db-drain-units-marks");
         let _release = Release(marks.clone());
-        let _units = StopUnits;
         let (base, source, scenarios, first) = world("drain-units", &holding_gate(&marks));
+        let _units = StopUnits(base.join("host"));
         let first = first.with_units(true);
         let db = Db::new("drain_units");
         let mission = db.gated_mission(&source, &scenarios);

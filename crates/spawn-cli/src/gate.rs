@@ -3897,6 +3897,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// Each unit a test's gates noted in `units` (one name a line) is gone:
+    /// `expected` names, and none of them still listed by the manager.
+    fn assert_noted_units_gone(units: &Path, expected: usize) {
+        let noted = std::fs::read_to_string(units).unwrap_or_default();
+        let noted: Vec<&str> = noted.lines().filter(|unit| !unit.is_empty()).collect();
+        assert_eq!(noted.len(), expected, "each gate noted its unit: {noted:?}");
+        let left = Command::new("systemctl")
+            .args([
+                "--user",
+                "list-units",
+                "--all",
+                "--plain",
+                "--no-legend",
+                "--",
+            ])
+            .args(&noted)
+            .output()
+            .expect("systemctl");
+        let left = String::from_utf8_lossy(&left.stdout).trim().to_string();
+        assert!(left.is_empty(), "units left: {left}");
+    }
+
     #[test]
     fn a_gate_in_a_unit_ends_with_its_files_and_leaves_no_unit() {
         if !super::units_available() {
@@ -3910,21 +3932,32 @@ mod tests {
             crate::integrate::judging::Judging::create(&root, &serde_json::json!({}), true)
                 .expect("a judging");
         let note_unit = |result: &Result<super::Verdict, GateFailure>| format!("{result:?}");
+        // Each gate notes its own unit (its cgroup names it), so the end
+        // asks after this test's units alone: the suite's other tests run
+        // units under the same pid beside it (P24).
+        let units = root.join("units");
+        let noted = |body: &str| {
+            format!(
+                "grep -o 'spawn-gate-[^/]*\\.service' /proc/self/cgroup | head -n 1 >>{}\n{body}",
+                units.display()
+            )
+        };
         judging.run(|| {
-            let accepted = FakeGate::new(
+            let accepted = FakeGate::new(&noted(
                 "grep -q 'spawn-gate-' /proc/self/cgroup || { echo 'not in a unit' >&2; exit 3; }\n\
                  [ -z \"${INVOCATION_ID-}\" ] || { echo 'the manager environment' >&2; exit 3; }\n\
                  echo 'judged' \n\
                  echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n",
-            )
+            ))
             .judge(&path_only());
             let said = note_unit(&accepted);
             let verdict = accepted.expect(&said);
             assert!(verdict.accepted, "{said}");
             assert!(verdict.output.contains("judged"), "its stdout: {said}");
 
-            let killed = FakeGate::new("echo 'its last words'\nkill -KILL $PPID\nsleep 5\n")
-                .judge(&path_only());
+            let killed =
+                FakeGate::new(&noted("echo 'its last words'\nkill -KILL $PPID\nsleep 5\n"))
+                    .judge(&path_only());
             let said = note_unit(&killed);
             let Err(GateFailure::HostFault { on, runs, log, .. }) = killed else {
                 panic!("a runner killed is abandoned, a host fault: {said}");
@@ -3932,7 +3965,7 @@ mod tests {
             assert_eq!((on.as_str(), runs.as_str()), ("runner", "no status"));
             assert!(log.contains("its last words"), "{log}");
 
-            let gate = FakeGate::new("sleep 60\n");
+            let gate = FakeGate::new(&noted("sleep 60\n"));
             let (late, _) = gate.judge_seeing_within(&path_only(), Duration::from_secs(2));
             let said = note_unit(&late);
             assert!(matches!(late, Err(GateFailure::Timeout)), "{said}");
@@ -3942,11 +3975,11 @@ mod tests {
         let running = root.join("running");
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_flag = std::sync::Arc::clone(&flag);
-        let body = format!(
+        let body = noted(&format!(
             "(sleep 3; touch {}) & touch {}; sleep 60\n",
             marker.display(),
             running.display()
-        );
+        ));
         let stopping =
             crate::integrate::judging::Judging::create(&root, &serde_json::json!({}), true)
                 .expect("a judging");
@@ -3970,20 +4003,9 @@ mod tests {
             !marker.exists(),
             "what the gate started was stopped with its unit"
         );
-        // No unit of this test's gates is left (their names hold its pid).
-        let left = Command::new("systemctl")
-            .args([
-                "--user",
-                "list-units",
-                "--all",
-                "--plain",
-                "--no-legend",
-                &format!("spawn-gate-{}-*", std::process::id()),
-            ])
-            .output()
-            .expect("systemctl");
-        let left = String::from_utf8_lossy(&left.stdout).trim().to_string();
-        assert!(left.is_empty(), "units left: {left}");
+        // No unit of this test's gates is left: the ones they noted, not
+        // every unit of the process (the suite's other tests run theirs).
+        assert_noted_units_gone(&units, 4);
         let _ = std::fs::remove_dir_all(&root);
     }
 
