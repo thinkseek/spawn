@@ -74,10 +74,10 @@ until the PoC is measured and the owner says to switch.
   `mv` would copy and a running gate could read half a crate, so the
   preflight reports it (`registry_fs=other (<directory>)`), `--check` fails
   it, the dispatcher refuses the runner (exit 3) and `registry-accept`
-  accepts nothing. **Not** the primary's cargo config: a
-  `rustc-wrapper` it names (the primary's `kache`) must be on the runner's
-  gate `PATH`, or every build fails; the dispatcher refuses a runner whose
-  config names a wrapper it lacks.
+  accepts nothing. **Not** the primary's cargo config: the gate binds only
+  the cargo home's `registry` and `git` into its sandbox, so a
+  `rustc-wrapper` a config names (the primary's `kache`) never reaches a
+  gate build, on the primary or a runner.
 - **The UI's dependencies**, if the gate is to run `check-web.sh`: install
   the controller's `web/` dependencies in a checkout and point setup at it
   (`--web <checkout>/web`). Without it the check reports the gap and
@@ -177,7 +177,7 @@ deploy/gate-runner.sh --check <runner> <source.git> <base> <scenarios>
 It reports what the runner has — helper version, git/tar/gzip/sha256sum/
 nice/timeout/flock/bwrap, rustc/cargo/node/psql/python3/jq (a missing one is
 a failure), the private server, free disk against the floor, isolation from
-the host, the cores and memory a gate gets, the cargo wrapper, whether the
+the host, the cores and memory a gate gets, the cargo home, whether the
 registry is on its cargo home's file system and how many files of this
 host's it lacks, the UI's lockfile against the
 controller's — and then, with the runner ready, sends those registry files

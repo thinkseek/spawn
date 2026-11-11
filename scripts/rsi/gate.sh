@@ -3920,9 +3920,9 @@ candidate_job() {
     # The task's scenario passes 3 of 3 before it lands (P25): once landed
     # it is every later gate's regression, so a scenario that passes one
     # run in four would cost one gate in four from then on (042, 050 and
-    # 054, 2026-11-11). Two more runs on the candidate, in the same slot;
-    # one that fails rejects the candidate (candidate_printed), and nothing
-    # is seeded from it.
+    # 054, 2026-11-11). Two more runs on the candidate, each claiming a
+    # slot of its own; one that fails rejects the candidate
+    # (candidate_printed), and nothing is seeded from it.
     if [ -e "$job/task" ] && [ "$run_status" -eq 0 ]; then
         task_runs=0
         for part in 2 3; do
