@@ -84,6 +84,34 @@ select e.kind #>> '{detail,record,to}'
    and e.kind #>> '{detail,record,source}' = $1
  order by e.session_seq desc limit 1";
 
+/// The owner's landing requests (`source.push_requested`, `spawn mission
+/// push`) that have no outcome yet, as two CTEs to follow a `with` (or a
+/// comma): `owner`, the control records of the requests and their outcomes,
+/// read through the `spawn_events_source_push` index; and `pending`, the
+/// requests (`id`, `session_seq`, `recorded_at_ms`, the record `r`) that no
+/// outcome (a `source.moved` or a `source.push_refused`) names by its
+/// `request`. One text, so the integrator's queue ([`SOURCE_PUSHES_PENDING`])
+/// and what deploy-on-landing waits for ([`MAIN_LANDING`]) are one notion of
+/// pending. A `source.push_no_verdict` is no outcome: its request stays.
+macro_rules! owner_requests_pending {
+    () => {
+        r"owner as (
+  select e.id, e.session_seq, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as r
+    from spawn_events e
+   where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+     and e.kind -> 'detail' -> 'record' ->> 'type'
+         in ('source.push_requested', 'source.push_refused', 'source.moved')
+), pending as (
+  select q.id, q.session_seq, q.recorded_at_ms, q.r
+    from owner q
+   where q.r ->> 'type' = 'source.push_requested'
+     and not exists (select 1 from owner o
+                      where o.r ->> 'type' in ('source.push_refused', 'source.moved')
+                        and o.r ->> 'request' = q.id::text)
+)"
+    };
+}
+
 /// What deploy/on-landing.sh decides on (#54), for source `$1` whose main
 /// is `$2`, the live controller's commit `$3` (null: unknown):
 /// - `landing`: the newest gate-accepted landing of exactly `$2` on the
@@ -99,14 +127,16 @@ select e.kind #>> '{detail,record,to}'
 ///   null: a row is a hold until a record ends it, past its bound too;
 /// - `last_deploy`: the newest `deploy.finished`, `{ok, head, by, event,
 ///   at_ms}`, or null;
-/// - `owner_request`: the oldest owner's landing request on the source
-///   (`source.push_requested`) with no outcome yet (no `source.moved` or
-///   `source.push_refused` names it), `{request, commit, at_ms}`, or null:
-///   one waiting for its judging or in it, which holds nothing on the
-///   source until it is accepted, and which a deploy would restart (S23).
-///   Read through the `spawn_events_source_push` index;
+/// - `owner_requests`: the owner's landing requests on the source
+///   (`source.push_requested`) with no outcome yet, as
+///   [`owner_requests_pending!`] reads them, oldest first, each `{request,
+///   commit, at_ms}` (`[]` when none): each waits for its judging or is in
+///   it, holds nothing on the source until it is accepted, and a deploy
+///   would restart its judging (S23). deploy/on-landing.sh waits for the
+///   ones whose commit main does not hold already;
 /// - `now_ms`: the database's clock, which every `at_ms` is on.
-pub(crate) const MAIN_LANDING: &str = r"
+pub(crate) const MAIN_LANDING: &str = concat!(
+    r#"
 with on_source as (
   select e.session_seq as seq, e.id as event, e.recorded_at_ms as at_ms,
          e.kind #>> '{detail,record,type}' as type, e.kind #>> '{detail,record,to}' as moved_to,
@@ -131,13 +161,9 @@ with on_source as (
          end
 ), anchor as (
   select max(seq) as seq from on_source where moved_to = $3
-), owner as (
-  select e.id, e.session_seq, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as r
-    from spawn_events e
-   where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-     and e.kind -> 'detail' -> 'record' ->> 'type'
-         in ('source.push_requested', 'source.push_refused', 'source.moved')
-)
+), "#,
+    owner_requests_pending!(),
+    r#"
 select jsonb_build_object(
   'now_ms', spawn_now_ms(),
   'landing', (select jsonb_build_object('record', o.type, 'event', o.event, 'at_ms', o.at_ms,
@@ -163,15 +189,13 @@ select jsonb_build_object(
                                      'main', h.main, 'expires_ms', h.expires_ms)
              from mission_source_holds h
             where h.source = $1),
-  'owner_request', (select jsonb_build_object('request', q.id, 'commit', q.r ->> 'commit',
-                                              'at_ms', q.recorded_at_ms)
-                      from owner q
-                     where q.r ->> 'type' = 'source.push_requested' and q.r ->> 'source' = $1
-                       and not exists (select 1 from owner o
-                                        where o.r ->> 'type' in ('source.push_refused',
-                                                                 'source.moved')
-                                          and o.r ->> 'request' = q.id::text)
-                     order by q.session_seq limit 1))";
+  'owner_requests', (select coalesce(jsonb_agg(jsonb_build_object('request', q.id,
+                                                                  'commit', q.r ->> 'commit',
+                                                                  'at_ms', q.recorded_at_ms)
+                                               order by q.session_seq), '[]'::jsonb)
+                       from pending q
+                      where q.r ->> 'source' = $1))"#
+);
 
 /// Residents (not retired) whose latest delivered task is cancelled: the
 /// dispatcher stops such a worker, sets the task's work aside and tells it
@@ -1431,13 +1455,10 @@ pub(crate) const PUBLISHING_AGENTS: &str = "select a.agent_id,
 /// commit, ref, at_ms, gated, urgent, reason}]`, `request` the request's
 /// event id (`gated` and `urgent` false and `reason` null when not given). Read through the
 /// `spawn_events_source_push` index.
-pub(crate) const SOURCE_PUSHES_PENDING: &str = r"
-with owner as (
-  select e.id, e.session_seq, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as r
-    from spawn_events e
-   where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-     and e.kind -> 'detail' -> 'record' ->> 'type'
-         in ('source.push_requested', 'source.push_refused', 'source.moved'))
+pub(crate) const SOURCE_PUSHES_PENDING: &str = concat!(
+    "with ",
+    owner_requests_pending!(),
+    r"
 select coalesce(jsonb_agg(jsonb_build_object('request', q.id, 'source', q.r ->> 'source',
                                              'commit', q.r ->> 'commit', 'ref', q.r ->> 'ref',
                                              'at_ms', q.recorded_at_ms,
@@ -1445,9 +1466,8 @@ select coalesce(jsonb_agg(jsonb_build_object('request', q.id, 'source', q.r ->> 
                                              'urgent', coalesce((q.r ->> 'urgent')::boolean, false),
                                              'reason', q.r ->> 'reason')
                           order by q.session_seq), '[]'::jsonb)
-  from owner q
- where q.r ->> 'type' = 'source.push_requested'
-   and not exists (select 1 from owner o where o.r ->> 'request' = q.id::text)";
+  from pending q"
+);
 
 /// One source's owner landing requests (`spawn mission pushes`), newest
 /// first, pending and decided alike: each as [`SOURCE_PUSHES_PENDING`] gives
