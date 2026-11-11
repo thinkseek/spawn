@@ -628,6 +628,26 @@ pub trait TerminalHost: Send + Sync {
         bytes: &[u8],
     ) -> Result<bool, TerminalError>;
 
+    /// Replace the regular file at `path`, as the terminal's process sees
+    /// it, with `bytes`, if it still holds exactly `current`: whether it was
+    /// replaced (`false`: it changed, or is gone, since it was read). Never
+    /// shorter: `bytes` shorter than `current` is an error and nothing is
+    /// written. The bytes go to a new file beside it first, made durable,
+    /// and a rename puts it in place: the file is whole, old or new, at
+    /// every moment. How the Bridge puts back a transcript that lost its
+    /// head (S16). A host that cannot is an error, never a silent no-op.
+    fn replace_grown(
+        &self,
+        _workspace: &WorkspaceId,
+        path: &str,
+        _bytes: &[u8],
+        _current: &[u8],
+    ) -> Result<bool, TerminalError> {
+        Err(TerminalError(format!(
+            "this terminal host cannot replace {path}"
+        )))
+    }
+
     /// Kill the terminal and its process, and return only once the runner
     /// and every process it started have exited, so nothing of the engine's
     /// can write to the workspace after it (the Bridge's final checkpoint
