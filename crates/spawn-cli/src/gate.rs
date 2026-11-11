@@ -2751,6 +2751,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A halted gate's thread, which parks for good and never drops its
+    /// gate's private directory, removes that directory before it parks:
+    /// both when the halt kills a running gate and when it came before the
+    /// gate started.
+    #[test]
+    fn a_halted_gate_removes_its_private_directory() {
+        let wait_gone = |path: &Path| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while path.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            !path.exists()
+        };
+        // Halted while its gate runs.
+        let running = std::sync::Arc::new(super::Halt::default());
+        let thread_halt = std::sync::Arc::clone(&running);
+        let (tell, told) = std::sync::mpsc::channel();
+        // Never joined: a halted gate's thread parks for good.
+        let _gate = std::thread::spawn(move || {
+            super::halt_with(thread_halt);
+            let directory = PrivateDirectory::create().expect("directory");
+            let started = directory.path().join("started");
+            tell.send(directory.path().to_path_buf()).expect("tell");
+            let _ = run_bounded(
+                shell(&format!("touch {}; exec sleep 60", started.display())),
+                Duration::from_mins(5),
+                directory.path(),
+            );
+        });
+        let path = told.recv().expect("the gate's directory");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !path.join("started").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(path.join("started").exists(), "the gate started");
+        running.halt();
+        assert!(wait_gone(&path), "removed: {}", path.display());
+
+        // Halted before its gate starts.
+        let early = std::sync::Arc::new(super::Halt::default());
+        early.halt();
+        let (tell, told) = std::sync::mpsc::channel();
+        let _late = std::thread::spawn(move || {
+            super::halt_with(early);
+            let directory = PrivateDirectory::create().expect("directory");
+            tell.send(directory.path().to_path_buf()).expect("tell");
+            let _ = run_bounded(shell("true"), Duration::from_mins(5), directory.path());
+        });
+        let path = told.recv().expect("the gate's directory");
+        assert!(wait_gone(&path), "removed: {}", path.display());
+    }
+
     /// A stop on the gate's thread (an owner's urgent landing,
     /// [`super::stop_with`]) kills the whole group, as a timeout does, and
     /// is an abort with [`super::STOPPED`]; a gate that thread would start
