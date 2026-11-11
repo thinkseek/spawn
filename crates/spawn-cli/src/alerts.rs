@@ -165,6 +165,9 @@
 //!   first later one with `over_alert` false.
 //! - `drill_failed`, `drill`, key `drill_failed:<its record>`: a
 //!   `backup.verified` with `ok` false; clears at the next with `ok` true.
+//! - `deploy_failed`, `deploy`, key `deploy_failed:<its record>`: a
+//!   `deploy.finished` with `ok` false (deploy/deploy.sh, #54), while none
+//!   is open; clears at the next with `ok` true, from any deploy.
 //! - `integrator_down`, `spawn-integrate`, key `integrator_down:<the first
 //!   reading's ms>`: no backend holds the integrator's lock on this store
 //!   (`pg_locks`, the lock `integrator_try_lock` takes) at every reading for
@@ -937,6 +940,7 @@ impl Monitor {
             }
             "backup.dumped" | "backup.bundled" => self.backup_record(event_id, at_ms, record, out),
             "backup.verified" => self.verified_record(event_id, record, out),
+            "deploy.finished" => self.deploy_record(event_id, record, out),
             "execution.interrupted" | "execution.cleared" => {
                 self.auth_record(event_id, record, out);
             }
@@ -1760,6 +1764,48 @@ times in a row)",
                 out.push(Event::Clear {
                     key: open,
                     evidence: json!({"key": record["key"], "event_id": event_id}),
+                });
+            }
+        }
+    }
+
+    /// How a deploy of the live system ended (#54, deploy/deploy.sh): a
+    /// failure fires `deploy_failed` while none is open (deploy-on-landing
+    /// tries a failed main again after a while, and its failure then is the
+    /// same occurrence), and a success, from any deploy, clears it.
+    fn deploy_record(&mut self, event_id: i64, record: &Value, out: &mut Vec<Event>) {
+        let open = self.open_keys("deploy_failed", "deploy");
+        if record["ok"].as_bool() == Some(false) {
+            if open.is_empty() {
+                let head = record["head"].as_str().unwrap_or_default();
+                out.push(Event::Fire {
+                    key: format!("deploy_failed:{event_id}"),
+                    kind: "deploy_failed",
+                    subject: "deploy".to_string(),
+                    evidence: json!({"head": record["head"], "by": record["by"],
+                                     "reason": record["reason"], "event_id": event_id}),
+                    text: format!(
+                        "{} deploy of {} failed: {}",
+                        if record["by"] == "landing" {
+                            "the landing's"
+                        } else {
+                            "the owner's"
+                        },
+                        head.get(..12).unwrap_or(head),
+                        record["reason"]
+                            .as_str()
+                            .filter(|reason| !reason.is_empty())
+                            .unwrap_or("no reason given")
+                    ),
+                    notice: false,
+                });
+            }
+        } else if record["ok"].as_bool() == Some(true) {
+            for key in open {
+                out.push(Event::Clear {
+                    key,
+                    evidence: json!({"head": record["head"], "by": record["by"],
+                                     "event_id": event_id}),
                 });
             }
         }
@@ -5546,6 +5592,80 @@ mod tests {
                    "execution_id": "exec_1", "session_id": "session_x", "agent_id": "a"}),
         );
         assert_eq!(fires(&auth), ["model_auth:16"]);
+    }
+
+    /// A failed deploy (#54) fires one `deploy_failed`, naming the head and
+    /// the reason; a failure again while it is open fires nothing more (the
+    /// landing's deploy is tried again later); a success from any deploy
+    /// clears it, and the next failure is a new occurrence.
+    #[test]
+    fn a_failed_deploy_fires_once_until_a_deploy_succeeds() {
+        let mut monitor = monitor();
+        let head = "c".repeat(40);
+        let failed = feed(
+            &mut monitor,
+            20,
+            0,
+            json!({"type": "deploy.finished", "ok": false, "head": head, "by": "landing",
+                   "reason": "cargo build failed"}),
+        );
+        assert_eq!(fires(&failed), ["deploy_failed:20"]);
+        let Event::Fire {
+            kind,
+            subject,
+            text,
+            evidence,
+            notice,
+            ..
+        } = &failed[0]
+        else {
+            panic!("a fire: {failed:?}");
+        };
+        assert_eq!(
+            (*kind, subject.as_str(), *notice),
+            ("deploy_failed", "deploy", false)
+        );
+        assert_eq!(
+            text,
+            "the landing's deploy of cccccccccccc failed: cargo build failed"
+        );
+        assert_eq!(evidence["head"], json!(head));
+        commit(&mut monitor, &failed);
+        let again = feed(
+            &mut monitor,
+            21,
+            0,
+            json!({"type": "deploy.finished", "ok": false, "head": head, "by": "landing",
+                   "reason": "cargo build failed"}),
+        );
+        assert!(again.is_empty(), "one alert while it is open: {again:?}");
+        let fixed = feed(
+            &mut monitor,
+            22,
+            0,
+            json!({"type": "deploy.finished", "ok": true, "head": "d".repeat(40),
+                   "by": "owner", "reason": ""}),
+        );
+        assert!(
+            matches!(fixed.as_slice(), [Event::Clear { key, .. }] if key == "deploy_failed:20"),
+            "{fixed:?}"
+        );
+        commit(&mut monitor, &fixed);
+        let next = feed(
+            &mut monitor,
+            23,
+            0,
+            json!({"type": "deploy.finished", "ok": false, "head": head, "by": "owner",
+                   "reason": ""}),
+        );
+        assert_eq!(fires(&next), ["deploy_failed:23"]);
+        let Event::Fire { text, .. } = &next[0] else {
+            panic!("a fire")
+        };
+        assert_eq!(
+            text,
+            "the owner's deploy of cccccccccccc failed: no reason given"
+        );
     }
 
     /// A mission whose controller lacks the owner's latest landing (P22) fires one

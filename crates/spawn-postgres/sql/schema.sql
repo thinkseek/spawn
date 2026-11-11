@@ -2380,6 +2380,11 @@ begin
                 coalesce((p_record ->> 'notice')::boolean, false),
                 p_record ->> 'text', coalesce(p_record -> 'evidence', '{}'::jsonb),
                 p_event, p_at);
+    when 'deploy.finished' then
+        -- How a deploy of the live system ended (deploy/deploy.sh, through
+        -- spawn_deploy_record): read by the alert step (`deploy_failed`),
+        -- folded into no table.
+        null;
     when 'backup.dumped', 'backup.bundled', 'backup.verified' then
         -- What `spawn backup` did (crate backup.rs): read from the log by the
         -- next run, folded into no table. What a copy holds is in its record
@@ -4786,6 +4791,49 @@ begin
     return spawn_control_record(p_record);
 end $$;
 
+-- How a deploy ended (#54): deploy/deploy.sh writes one `deploy.finished`
+-- through `spawn mission deployed` once it holds the deploy lock, for every
+-- kind of deploy (`by`: `landing` for deploy/on-landing.sh, `owner` for a
+-- hand deploy), `ok` false with the reason the deploy said, true once the
+-- services restarted on the new build. The alert step raises
+-- `deploy_failed` on a failure and clears it at the next success. Its shape
+-- is fixed, every field checked, and nothing else is taken: a record is
+-- read by anyone who reads alerts, so nothing in it may come from the
+-- deploy's environment but the reason's text, which deploy.sh writes.
+create or replace function spawn_deploy_record(p_record jsonb)
+returns bigint language plpgsql security definer as $$
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not record deploys', session_user using errcode = '42501';
+    end if;
+    if p_record ->> 'type' is distinct from 'deploy.finished' then
+        raise exception 'not a deploy record: %', p_record ->> 'type';
+    end if;
+    if exists (select 1 from jsonb_object_keys(p_record) k
+                where k not in ('type', 'ok', 'head', 'by', 'reason')) then
+        raise exception 'a deploy record has type, ok, head, by and reason, and nothing else';
+    end if;
+    if jsonb_typeof(p_record -> 'ok') is distinct from 'boolean'
+       or coalesce(p_record ->> 'head', '') !~ '^[0-9a-f]{40}$'
+       or coalesce(p_record ->> 'by', '') not in ('landing', 'owner')
+       or jsonb_typeof(p_record -> 'reason') is distinct from 'string'
+       or length(p_record ->> 'reason') > 500 then
+        raise exception 'a deploy record is {ok: boolean, head: a commit, by: landing|owner, '
+                        'reason: at most 500 characters}';
+    end if;
+    return spawn_control_record(p_record);
+end $$;
+
+-- The landings and the deploy records, found without reading the rest of
+-- the stream: deploy/on-landing.sh reads main's landing and the last deploy
+-- every minute (`MAIN_LANDING`).
+create index if not exists spawn_events_landing
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' in ('task.landed', 'source.moved',
+                                                      'deploy.finished');
+
 -- The backup records, found without reading the rest of the stream: a run
 -- reads the ones before it to decide its tiers and its bundle's base.
 create index if not exists spawn_events_backup
@@ -5323,7 +5371,8 @@ begin
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
         'spawn_alert_record(jsonb)', 'spawn_backup_record(jsonb)',
-        'spawn_cost_record(jsonb)', 'spawn_cost_usd(jsonb, bigint, bigint, bigint, bigint)',
+        'spawn_deploy_record(jsonb)', 'spawn_cost_record(jsonb)',
+        'spawn_cost_usd(jsonb, bigint, bigint, bigint, bigint)',
         'spawn_cost_archive_record(jsonb, jsonb)',
         'spawn_objective_assign(bigint, integer, text, text, bigint)', 'spawn_task_stages(bigint)',
         'spawn_landing_hold(bigint)', 'spawn_landing_release()',
