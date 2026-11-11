@@ -87,32 +87,26 @@ export interface Row {
   key: string;
   usd: string;
   unpriced: boolean;
-<<<<<<< 1155249526e5d15669383056161873365c933c55
   /** Tokens of its use on models with no price; 0 when none. */
   unpriced_tokens: number;
   /** "+ 220,000 tokens unpriced"; null when none. */
   unpriced_text: string | null;
   /** A task's label as the API gives it; null otherwise. */
   label: string | null;
-=======
   /** A mission's own dollars per landing ([`perLanding`]); absent on a
    * task's or an agent's line. */
   per_landing?: string;
->>>>>>> 23e5537e9af2c998f40a0576df59082b049aa5d1
 }
 
 export interface CostView {
   total: string;
   unpriced: boolean;
-<<<<<<< 1155249526e5d15669383056161873365c933c55
   /** Said once for the window: how many of its tokens have no price, on
    * which models, and how to price them (SPAWN_MODEL_PRICES); null when
    * every token is priced. */
   unpriced_note: string | null;
-=======
   /** "<dollars> per landing (<n> landed)", or "no landing in the window". */
   per_landing: string;
->>>>>>> 23e5537e9af2c998f40a0576df59082b049aa5d1
   missions: Row[];
   tasks: Row[];
   agents: Row[];
@@ -174,24 +168,48 @@ function shown(entry: Partial<CostEntry> | null | undefined): { usd: string; unp
   return { usd: text, unpriced, order: usd, weight: unpricedTokens };
 }
 
-<<<<<<< 1155249526e5d15669383056161873365c933c55
+const COUNT = new Intl.NumberFormat("en-US");
+
+/** What a landing cost in the window: "<dollars> per landing (<n>
+ * landed)", the dollars as [`formatUsd`] says them; "no landing in the
+ * window" when none landed. */
+export function perLanding(entry: Partial<CostLandings> | null | undefined): string {
+  const landed = count(entry?.landed);
+  if (landed <= 0) return "no landing in the window";
+  const per = entry?.usd_per_landing;
+  const usd = typeof per === "number" && Number.isFinite(per) ? per : null;
+  return `${formatUsd(usd)} per landing (${COUNT.format(landed)} landed)`;
+}
+
+/** The rows of a list, most costly first; with `landings` (a mission's),
+ * each carries its own dollars per landing. */
 function rows<T>(
   entries: unknown,
   key: (entry: T) => string,
   label: (entry: T) => string | null = () => null,
+  landings = false,
 ): Row[] {
   if (!Array.isArray(entries)) return [];
   return (entries as T[])
-    .map((entry) => ({ key: key(entry), label: label(entry), ...shown(entry as Partial<CostEntry>) }))
+    .map((entry) => ({
+      key: key(entry),
+      label: label(entry),
+      per_landing: landings ? perLanding(entry as Partial<CostLandings>) : undefined,
+      ...shown(entry as Partial<CostEntry>),
+    }))
     .sort((a, b) => b.order - a.order || b.weight - a.weight || a.key.localeCompare(b.key))
-    .map(({ key: id, label: named, usd, unpriced, weight }) => ({
-      key: id,
-      usd,
-      unpriced,
-      unpriced_tokens: weight,
-      unpriced_text: unpricedText(weight),
-      label: named,
-    }));
+    .map(({ key: id, label: named, per_landing, usd, unpriced, weight }) => {
+      const row: Row = {
+        key: id,
+        usd,
+        unpriced,
+        unpriced_tokens: weight,
+        unpriced_text: unpricedText(weight),
+        label: named,
+      };
+      if (per_landing !== undefined) row.per_landing = per_landing;
+      return row;
+    });
 }
 
 function taskLabel(entry: CostTask): string | null {
@@ -233,33 +251,6 @@ export function unpricedNote(answer: Partial<CostAnswer> | null | undefined): st
     `these figures. Price ${models.length === 1 ? "it" : "them"} in SPAWN_MODEL_PRICES ` +
     `(US dollars per million tokens: input, output, cache_write, cache_read).`
   );
-=======
-const COUNT = new Intl.NumberFormat("en-US");
-
-/** What a landing cost in the window: "<dollars> per landing (<n>
- * landed)", the dollars as [`formatUsd`] says them; "no landing in the
- * window" when none landed. */
-export function perLanding(entry: Partial<CostLandings> | null | undefined): string {
-  const landed = count(entry?.landed);
-  if (landed <= 0) return "no landing in the window";
-  const per = entry?.usd_per_landing;
-  const usd = typeof per === "number" && Number.isFinite(per) ? per : null;
-  return `${formatUsd(usd)} per landing (${COUNT.format(landed)} landed)`;
-}
-
-function rows<T>(entries: unknown, key: (entry: T) => string, landings = false): Row[] {
-  if (!Array.isArray(entries)) return [];
-  return (entries as T[])
-    .map((entry) => ({
-      key: key(entry),
-      ...shown(entry as Partial<CostEntry>),
-      ...(landings ? { per_landing: perLanding(entry as Partial<CostLandings>) } : {}),
-    }))
-    .sort((a, b) => b.order - a.order || b.weight - a.weight || a.key.localeCompare(b.key))
-    .map(({ key: label, usd, unpriced, per_landing }) =>
-      per_landing === undefined ? { key: label, usd, unpriced } : { key: label, usd, unpriced, per_landing },
-    );
->>>>>>> 23e5537e9af2c998f40a0576df59082b049aa5d1
 }
 
 function twoDigits(value: number): string {
@@ -280,32 +271,20 @@ export function countedSince(answer: Partial<CostAnswer> | null | undefined): st
   return `Counted since ${day} ${twoDigits(at.getUTCHours())}:${twoDigits(at.getUTCMinutes())} UTC`;
 }
 
-<<<<<<< 1155249526e5d15669383056161873365c933c55
-/** The page's figures for one window's answer: the total and, once, the
- * note on its unpriced tokens; each mission (`#<id>`), task (`T<id>`, with
- * its label) and agent (its id), most costly first, each with its unpriced
- * count; and since when the record counts, when the window starts before
- * it. */
-=======
-/** The page's figures for one window's answer: the total and what a
- * landing cost; each mission, with its own dollars per landing,
- * `#<id>`; each task (`T<id>`) and agent (its id), most costly first; and
+/** The page's figures for one window's answer: the total, what a landing
+ * cost and, once, the note on its unpriced tokens; each mission (`#<id>`,
+ * with its own dollars per landing), task (`T<id>`, with its label) and
+ * agent (its id), most costly first, each with its unpriced count; and
  * since when the record counts, when the window starts before it. */
->>>>>>> 23e5537e9af2c998f40a0576df59082b049aa5d1
 export function costView(answer: Partial<CostAnswer> | null | undefined): CostView {
   const total = shown(answer?.total);
   return {
     total: total.usd,
     unpriced: total.unpriced,
-<<<<<<< 1155249526e5d15669383056161873365c933c55
     unpriced_note: unpricedNote(answer),
-    missions: rows<CostMission>(answer?.missions, (entry) => `#${entry.mission}`),
-    tasks: rows<CostTask>(answer?.tasks, (entry) => `T${entry.task}`, taskLabel),
-=======
     per_landing: perLanding(answer),
-    missions: rows<CostMission>(answer?.missions, (entry) => `#${entry.mission}`, true),
-    tasks: rows<CostTask>(answer?.tasks, (entry) => `T${entry.task}`),
->>>>>>> 23e5537e9af2c998f40a0576df59082b049aa5d1
+    missions: rows<CostMission>(answer?.missions, (entry) => `#${entry.mission}`, undefined, true),
+    tasks: rows<CostTask>(answer?.tasks, (entry) => `T${entry.task}`, taskLabel),
     agents: rows<CostAgent>(answer?.agents, (entry) => String(entry.agent)),
     since: countedSince(answer),
   };
