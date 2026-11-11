@@ -1454,7 +1454,9 @@ and `agent_executions`: the ladder (`ladder`, `ladder_extra`), `agent_hours`
 plus accepted over the window's days), `judgements` (as the last hour of
 `/api/fleet` counts them) and `missions` (each open in the window with
 `hours`, `idle_hours`, its span less the union of its tasks' open
-intervals, and `idle`, more than half of it), ratios and hours to 3
+intervals, `owner_work`, true when its last configuration before
+`until` gives it no objective backlog (a mission never configured is not), and `idle`, more than half of it,
+never for owner work: its work comes from the owner, objective 062), ratios and hours to 3
 decimals as the scorecard rounds (crates/spawn-cli/src/scorecard/fleet.rs).
 The Scorecard's "How the fleet decides" reads it over the page's window;
 `/api/fleet`'s 24 h ladder and human decisions per agent-hour read
