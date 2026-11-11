@@ -66,6 +66,8 @@ for tool in psql jq od curl sed grep sha1sum cut node; do
 done
 
 WORK=$(mktemp -d) || harness "mktemp failed"
+# Gone again if a check below refuses, before the cleanup is set.
+trap 'rm -rf "$WORK"' EXIT
 # A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
 # or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
