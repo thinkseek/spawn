@@ -146,8 +146,8 @@ impl PostgresStore {
     }
 
     /// The cost of the messages timed in `[since_ms, until_ms)` ([`WINDOW`]):
-    /// `{total, models, missions, tasks, agents, executions,
-    /// counted_since_ms}`.
+    /// `{total, landed, usd_per_landing, models, missions, tasks, agents,
+    /// executions, counted_since_ms}`.
     pub fn cost_window(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
         self.query_json(WINDOW, &[&since_ms, &until_ms])
     }
