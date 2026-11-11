@@ -46,6 +46,9 @@ select jsonb_build_object(
              'accept', coalesce(x.r -> 'accept', x.r -> 'row' -> 'accept'),
              'gate_ms', case when jsonb_typeof(x.r -> 'gate_ms') = 'number'
                              then x.r -> 'gate_ms' end,
+             -- An owner judging's mission: the one whose gate judged it.
+             'mission', case when jsonb_typeof(x.r -> 'mission') = 'number'
+                             then x.r -> 'mission' end,
              'stage_ms', (select to_jsonb((s.m[1])::bigint)
                             from regexp_matches(x.r ->> 'log',
                                    '^[ \t]*\| stage gate [^ \t\n]+ ([0-9]{1,15})ms total[ \t\r]*$',
@@ -67,7 +70,8 @@ select jsonb_build_object(
        and x.r ->> 'type' in ('mission.added', 'mission.configured', 'mission.resumed',
                               'task.assigned', 'task.delivered', 'task.gated', 'task.landed',
                               'task.reviewed', 'task.cancelled', 'task.aborted',
-                              'task.over_budget', 'legacy.imported')),
+                              'task.over_budget', 'legacy.imported',
+                              'source.moved', 'source.push_refused')),
   'commands', (
     select coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
              'id', c.id,

@@ -438,7 +438,12 @@ fn parts_of(name: &str, field: &dyn Fn(&str) -> Value) -> String {
                 }
             )
         }
-        "gate_time" => format!("runs {}", show(&field("runs"))),
+        "gate_time" => format!(
+            "runs {} (the owner's {}, tasks' {})",
+            show(&field("runs")),
+            show(&field("owner_runs")),
+            show(&field("task_runs"))
+        ),
         _ => String::new(),
     }
 }

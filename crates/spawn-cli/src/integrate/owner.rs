@@ -885,6 +885,28 @@ impl super::Judge {
     /// that is not an acceptance, `Err(Ok(extra))` when the gate accepted
     /// `candidate` on `main` (the fields its `source.moved` adds:
     /// [`accepted_extra`]), `Err(Err(_))` when it could not be run.
+    /// The gate's environment for an owner's candidate.
+    fn owner_gate_env(
+        &self,
+        scenarios: &std::path::Path,
+        jobs: Option<usize>,
+    ) -> Vec<(String, String)> {
+        // A check main is red on is unsolved on the base for an owner's push
+        // (the lead, 2026-11-10): the regression rule holds for what the base
+        // solves, and a push during a red main must not have to go ungated.
+        let mut gate_env = self.judging_env(scenarios, jobs);
+        gate_env.retain(|(name, _)| name != "SPAWN_GATE_RED_UNSOLVED");
+        gate_env.push(("SPAWN_GATE_RED_UNSOLVED".to_string(), "1".to_string()));
+        // The owner's own candidate (gate.sh's "Three classes of a failing
+        // regression"): a validator that fails on the base too does not end
+        // the gate; the rest is judged and the verdict names it, carried on
+        // the `source.moved` and raised as an alert (alerts.rs
+        // `validator_defect`).
+        gate_env.retain(|(name, _)| name != "SPAWN_GATE_OWNER_CANDIDATE");
+        gate_env.push(("SPAWN_GATE_OWNER_CANDIDATE".to_string(), "1".to_string()));
+        gate_env
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn judge_owner_candidate(
         &self,
@@ -942,19 +964,7 @@ impl super::Judge {
             }
             Err(RoomFailure::Bad(reason)) => return Err(Err(reason)),
         }
-        // A check main is red on is unsolved on the base for an owner's push
-        // (the lead, 2026-11-10): the regression rule holds for what the base
-        // solves, and a push during a red main must not have to go ungated.
-        let mut gate_env = self.judging_env(&scenarios, jobs);
-        gate_env.retain(|(name, _)| name != "SPAWN_GATE_RED_UNSOLVED");
-        gate_env.push(("SPAWN_GATE_RED_UNSOLVED".to_string(), "1".to_string()));
-        // The owner's own candidate (gate.sh's "Three classes of a failing
-        // regression"): a validator that fails on the base too does not end
-        // the gate; the rest is judged and the verdict names it, carried on
-        // the `source.moved` and raised as an alert (alerts.rs
-        // `validator_defect`).
-        gate_env.retain(|(name, _)| name != "SPAWN_GATE_OWNER_CANDIDATE");
-        gate_env.push(("SPAWN_GATE_OWNER_CANDIDATE".to_string(), "1".to_string()));
+        let gate_env = self.owner_gate_env(&scenarios, jobs);
         let started = super::now_ms();
         let judged = crate::gate::judge(
             &super::pinned(&self.gate),
@@ -967,16 +977,24 @@ impl super::Judge {
             super::gate_wall_clock(),
         );
         let ended = super::now_ms();
+        // The gate's wall clock, and the mission whose gate judged it, on
+        // the judging's record when the gate gave a verdict: the
+        // scorecard's gate time counts the run (objective 061).
+        let run = GateRun {
+            mission: mission.id,
+            gate_ms: ended.saturating_sub(started),
+        };
         let refuse = |verdict: &str, reason: String, log: &str| {
             Ok(refuse_owner(
                 store,
                 request,
                 reason,
-                &json!({"verdict": verdict, "log": log}),
+                &json!({"verdict": verdict, "log": log, "mission": run.mission,
+                        "gate_ms": run.gate_ms}),
             ))
         };
         match judged {
-            Ok(verdict) if verdict.accepted => Err(Ok(accepted_extra(&verdict))),
+            Ok(verdict) if verdict.accepted => Err(Ok(accepted_extra(&verdict, run))),
             Ok(verdict)
                 if test_database
                     && let Some(fault) =
@@ -1177,13 +1195,22 @@ impl super::Judge {
     }
 }
 
+/// One owner judging's gate run: the mission whose gate judged it, and the
+/// gate's wall clock in ms (the scorecard's gate time, objective 061).
+#[derive(Debug, Clone, Copy)]
+struct GateRun {
+    mission: i64,
+    gate_ms: i64,
+}
+
 /// The fields an accepted owner judging's `source.moved` adds: its verdict,
+/// the gate run (`mission`, `gate_ms`),
 /// and the validators the gate judged it without, failing on the base too
 /// (`validator_defects`), or that the owner's list kept from running
 /// (`quarantined`), and the regressions that passed in it (`passed`, run;
 /// `reused`, from the base's cache), when there are any.
-fn accepted_extra(verdict: &crate::gate::Verdict) -> serde_json::Value {
-    let mut extra = json!({"verdict": "accepted"});
+fn accepted_extra(verdict: &crate::gate::Verdict, run: GateRun) -> serde_json::Value {
+    let mut extra = json!({"verdict": "accepted", "mission": run.mission, "gate_ms": run.gate_ms});
     if !verdict.validator_defects.is_empty() {
         extra["validator_defects"] = json!(verdict.validator_defects);
     }
