@@ -160,7 +160,9 @@ function rows<T>(entries: unknown, key: (entry: T) => string, landings = false):
       ...(landings ? { per_landing: perLanding(entry as Partial<CostLandings>) } : {}),
     }))
     .sort((a, b) => b.order - a.order || b.weight - a.weight || a.key.localeCompare(b.key))
-    .map(({ order: _order, weight: _weight, ...row }) => row);
+    .map(({ key: label, usd, unpriced, per_landing }) =>
+      per_landing === undefined ? { key: label, usd, unpriced } : { key: label, usd, unpriced, per_landing },
+    );
 }
 
 function twoDigits(value: number): string {
@@ -182,8 +184,8 @@ export function countedSince(answer: Partial<CostAnswer> | null | undefined): st
 }
 
 /** The page's figures for one window's answer: the total and what a
- * landing cost; each mission (with its own dollars per landing),
- * `#<id>`; task (`T<id>`) and agent (its id), most costly first; and
+ * landing cost; each mission, with its own dollars per landing,
+ * `#<id>`; each task (`T<id>`) and agent (its id), most costly first; and
  * since when the record counts, when the window starts before it. */
 export function costView(answer: Partial<CostAnswer> | null | undefined): CostView {
   const total = shown(answer?.total);
