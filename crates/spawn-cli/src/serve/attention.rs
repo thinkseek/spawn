@@ -42,7 +42,9 @@
 //!       "asked_at_ms": 1793957000000 | null,  // the end of that turn
 //!       "human": null | {"text": "Should I ...?", "at_ms": ... | null}
 //!     },
-//!     "for_owner": [{"text": "deploy ffc9fe7", "at_ms": 1793957000000 | null}]
+//!     "for_owner": [{"text": "deploy ffc9fe7", "at_ms": 1793957000000 | null,
+//!                    "tasks": [{"id": 198, "state": "accepted"}],  // the tasks it names
+//!                    "settled": false}]   // a review ask whose tasks have all ended
 //!   },
 //!   "on_own_jobs": [{              // workers the rules hold as working on a
 //!     "session_id", "agent_id",    // background job of their own: not escalated
@@ -90,6 +92,25 @@
 //! not a queue: nothing waits on them, and an owner's message, an
 //! instruction rather than an answer, does not clear them. Without a
 //! transcript the list is empty and the judgement alone decides.
+//!
+//! Each line says what became of the tasks it names (objective 064: a line
+//! saying four reports waited for review stood for 30 h when all four had
+//! ended before it was written). `tasks` are the tasks the line names, in
+//! its order, each once, `{id, state}` with the task's state now (read for
+//! those tasks alone); a number that names no task is left out. A line
+//! names a task as `T<n>`, or as a number (bare or `#<n>`) right after the
+//! word task, tasks, report or reports, a list included ("reports 198, 204,
+//! 208 and 211": a comma, "and", or both, before each next number). A bare
+//! `#<n>` elsewhere names none ("mission #4", "issue #54"), nor does a
+//! range's end ("tasks 160 to 167" names 160). `settled` is true when the
+//! line's ask is to review, accept or merge the tasks (a word beginning
+//! "review", "accept" or "merg", and none beginning "deploy"), it names a
+//! task at least, and every task it names has ended (accepted, landed or
+//! cancelled); false otherwise. A line with any other ask (a deploy, an
+//! init-db, a decision) is never settled, whatever became of its tasks:
+//! hiding a live ask is the worse failure. Home's card leaves a settled
+//! line out (web/src/home.ts `latestNotes`); the supervisor's full list
+//! still shows it, marked settled.
 
 use std::collections::BTreeMap;
 
