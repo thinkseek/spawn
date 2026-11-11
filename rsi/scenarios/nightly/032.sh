@@ -1,4 +1,6 @@
 #!/bin/sh
+# Nightly (rsi/scenarios/nightly/, run by scripts/rsi/nightly.sh on live main, alone on a
+# held host; gate v2 step 4, design-gate-journeys-spawn.md §2): the p90 of resumes over five faults, load-sensitive; moved whole.
 # Black box: a soak. One agent that runs forever (an approved resident with
 # a delivered task) works on a synthetic workload while faults are injected
 # at seeded, deterministic times: an engine kill, a memory-limit kill, a

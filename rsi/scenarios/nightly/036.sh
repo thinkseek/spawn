@@ -1,4 +1,6 @@
 #!/bin/sh
+# Nightly (rsi/scenarios/nightly/, run by scripts/rsi/nightly.sh on live main, alone on a
+# held host; gate v2 step 4, design-gate-journeys-spawn.md §2): the shadow runner decides nothing; moved whole.
 # Black box: a runner judges a copy of what the primary judged, beside it,
 # and decides nothing. Gates are the fleet's bottleneck (48 h to 2026-11-09:
 # 112 gates, mean 17 min, max 101; a reported task waited about 5 h for its
