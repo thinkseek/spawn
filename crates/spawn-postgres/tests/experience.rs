@@ -213,7 +213,7 @@ fn the_window_counts_the_views_and_each_missions_open_span() {
     assert_eq!(window["judgements"]["by_judge"], json!({"jev": 2, "rules": 1}));
     assert_eq!(window["judgements"]["judge_unavailable"], 1);
     assert_eq!(window["judgements"]["disagreements"], 1);
-    assert_eq!(window["judgements"]["model_latency_p50_ms"], json!(300.0));
+    assert_eq!(window["judgements"]["model_latency_p50_ms"].as_f64(), Some(300.0));
     let missions: Vec<(i64, Option<i64>, Value)> = window["missions"]
         .as_array()
         .expect("missions")
