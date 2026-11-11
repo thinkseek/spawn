@@ -1169,7 +1169,7 @@ fn judge_in(
     let adopting = adopted.is_some();
     let directory = match adopted.map_or_else(
         || PrivateDirectory::create_in(parent),
-        |path| Ok(PrivateDirectory(path)),
+        |path| Ok(PrivateDirectory::adopt(path)),
     ) {
         Ok(directory) => directory,
         Err(error) => {
@@ -1702,9 +1702,26 @@ fn failed(error: &std::io::Error) -> GateFailure {
 
 /// A new directory, mode 0700, under the temporary directory; removed on
 /// drop. The gate's stdout, stderr and verdict file live in it.
+///
+/// A halted gate's thread never returns, so it never drops this: the thread
+/// removes the directories it holds ([`HELD`]) before it parks for good
+/// ([`park_for_good`]).
 struct PrivateDirectory(PathBuf);
 
+thread_local! {
+    /// The private directories this thread holds, the gate's among them:
+    /// a halted gate's thread removes them before it parks for good, since
+    /// its group is killed and nothing reads them after.
+    static HELD: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl PrivateDirectory {
+    /// The directory at `path` (an adopted judging's), held by this thread.
+    fn adopt(path: PathBuf) -> Self {
+        HELD.with(|held| held.borrow_mut().push(path.clone()));
+        Self(path)
+    }
+
     #[cfg(test)]
     fn create() -> std::io::Result<Self> {
         Self::create_in(&std::env::temp_dir())
@@ -1725,7 +1742,7 @@ impl PrivateDirectory {
             std::process::id()
         ));
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
-        Ok(Self(path))
+        Ok(Self::adopt(path))
     }
 
     fn path(&self) -> &Path {
@@ -1735,7 +1752,18 @@ impl PrivateDirectory {
 
 impl Drop for PrivateDirectory {
     fn drop(&mut self) {
+        // A directory dropped on another thread than the one that made it
+        // stays in that one's list; removing a path already gone is harmless.
+        HELD.with(|held| held.borrow_mut().retain(|path| *path != self.0));
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Remove every private directory this thread holds ([`HELD`]): a halted
+/// gate's, whose thread never returns to drop it.
+fn remove_held() {
+    for path in HELD.with(|held| std::mem::take(&mut *held.borrow_mut())) {
+        let _ = std::fs::remove_dir_all(&path);
     }
 }
 
@@ -1830,8 +1858,11 @@ fn this_halt() -> Option<std::sync::Arc<Halt>> {
 }
 
 /// A halted judging's thread waits here for the process to end: it never
-/// returns, so it records nothing.
+/// returns, so it records nothing. Its gate's private directory is removed
+/// first (its group is killed already, and nothing reads the directory
+/// after), so a halted integrator leaves none in its TMPDIR.
 fn park_for_good() -> ! {
+    remove_held();
     loop {
         std::thread::park();
     }
@@ -2718,6 +2749,58 @@ mod tests {
         assert!(!after.exists(), "no gate starts on a halted thread");
         assert!(!after_returned.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A halted gate's thread, which parks for good and never drops its
+    /// gate's private directory, removes that directory before it parks:
+    /// both when the halt kills a running gate and when it came before the
+    /// gate started.
+    #[test]
+    fn a_halted_gate_removes_its_private_directory() {
+        let wait_gone = |path: &Path| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while path.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            !path.exists()
+        };
+        // Halted while its gate runs.
+        let running = std::sync::Arc::new(super::Halt::default());
+        let thread_halt = std::sync::Arc::clone(&running);
+        let (tell, told) = std::sync::mpsc::channel();
+        // Never joined: a halted gate's thread parks for good.
+        let _gate = std::thread::spawn(move || {
+            super::halt_with(thread_halt);
+            let directory = PrivateDirectory::create().expect("directory");
+            let started = directory.path().join("started");
+            tell.send(directory.path().to_path_buf()).expect("tell");
+            let _ = run_bounded(
+                shell(&format!("touch {}; exec sleep 60", started.display())),
+                Duration::from_mins(5),
+                directory.path(),
+            );
+        });
+        let path = told.recv().expect("the gate's directory");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !path.join("started").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(path.join("started").exists(), "the gate started");
+        running.halt();
+        assert!(wait_gone(&path), "removed: {}", path.display());
+
+        // Halted before its gate starts.
+        let early = std::sync::Arc::new(super::Halt::default());
+        early.halt();
+        let (tell, told) = std::sync::mpsc::channel();
+        let _late = std::thread::spawn(move || {
+            super::halt_with(early);
+            let directory = PrivateDirectory::create().expect("directory");
+            tell.send(directory.path().to_path_buf()).expect("tell");
+            let _ = run_bounded(shell("true"), Duration::from_mins(5), directory.path());
+        });
+        let path = told.recv().expect("the gate's directory");
+        assert!(wait_gone(&path), "removed: {}", path.display());
     }
 
     /// A stop on the gate's thread (an owner's urgent landing,

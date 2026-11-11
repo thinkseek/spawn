@@ -6249,8 +6249,8 @@ mod tests {
         use spawn_core::port::{BaseMerge, Commit, WorkspaceStore};
         use spawn_host::GitWorkspace;
 
-        let base = std::env::temp_dir().join(format!("spawn-land-push-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        // Removed when the test ends (kept when it fails).
+        let base = spawn_host::Scratch::new("spawn-land-push");
         let seed = base.join("seed");
         std::fs::create_dir_all(&seed).expect("seed directory");
         let seed_path = seed.to_string_lossy().to_string();
@@ -9935,6 +9935,9 @@ mod database_tests {
         );
         std::fs::write(marks.join("release"), "").expect("release");
         integrator.settle();
+        for base in [base_a, base_b, marks] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 
     /// A cap of one is one gate at a time across missions, as before.
