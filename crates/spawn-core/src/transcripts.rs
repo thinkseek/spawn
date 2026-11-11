@@ -723,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_transcript_is_restored_whole_from_its_copies() {
+    fn a_missing_transcript_is_restored_from_the_latest_copy() {
         let (store, agent, workspace) = setup();
         store.append_file(PATH, "old\n");
         step(&store, &agent, &workspace);
