@@ -1,6 +1,6 @@
 //! HTTP API and static files for the observer UI: reads, and a person's
-//! writes: an input to a session, a key, and a restart or a reassign of a
-//! stalled worker.
+//! writes: an input to a session, a key, a restart or a reassign of a
+//! stalled worker, and the resume of a halted mission.
 //!
 //! Every read goes through the same store methods the CLI uses, as the
 //! read-only `spawn_reader` login, so a defect in a read cannot change
@@ -65,6 +65,21 @@
 //! and the session's `reassigned_to` and `reassigned_from` (`{"task",
 //! "session_id"}` or null).
 //!
+//! A person may also resume a halted mission from Needs you (objective
+//! 051): `POST /api/mission/<id>/resume` with `{"halt": <event>, "key":
+//! "<idempotency key>"}` (the key may come in an `Idempotency-Key` header),
+//! with the input's guards in the same order, `{"probe": true}` passing them
+//! and writing nothing (200). It runs through `spawn_human_resume`, the
+//! `spawn_human` login's fourth function, which records the owner's
+//! `mission.resumed` with `by` from its own `spawn_principal()` (`human`,
+//! never from here) and the `halt` it resumes; serve never writes it as the
+//! owner. The halt is the mission's `mission.halted` event the page showed
+//! (`/api/missions`' `halt.event`): it answers 202 `{"event": <the
+//! mission.resumed record>}` for the halt the mission is in, the same event
+//! for the same key again, and 409 with the reason, recording nothing, when
+//! the mission is not halted or is halted on another halt (a page not
+//! refreshed since); 404 for no such mission; 400 without a key or a halt.
+//!
 //! Reading is still worth guarding: `/api/pane/<id>` shows any live pane.
 //! `serve` binds 127.0.0.1 unless told otherwise, and on any other address
 //! it refuses to start without `SPAWN_SERVE_TOKEN`. With a token set, every
@@ -94,6 +109,7 @@ mod answers;
 mod attention;
 mod labels;
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -108,7 +124,10 @@ use tiny_http::{Header, Method, Request, Response, Server};
 use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::TerminalHost;
 
-use crate::objectives::{Landing, Task, landed_value, load_backlog, metric_lines};
+use crate::objectives::{
+    Landing, Outcome, Task, attempts, choose, holds, landed_value, load_backlog, metric_lines,
+    overruns,
+};
 use crate::{Flags, env_or, env_value};
 
 /// Prefix of an error that answers 400.
@@ -704,6 +723,12 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
         {
             return key(request, id, access, shared);
         }
+        if let Some(id) = path
+            .strip_prefix("/api/mission/")
+            .and_then(|rest| rest.strip_suffix("/resume"))
+        {
+            return resume(request, id, access, shared);
+        }
         for action in ["restart", "reassign"] {
             if let Some(id) = path
                 .strip_prefix("/api/session/")
@@ -1115,6 +1140,89 @@ fn move_task(
     }
 }
 
+/// `POST /api/mission/<id>/resume`, past the read guard (`access`): a
+/// person resumes mission `id` on the halt the page showed (module doc).
+fn resume(mut request: Request, id: &str, access: Access, shared: &Shared) -> Result<(), String> {
+    if *request.method() != Method::Post {
+        return request
+            .respond(not_allowed("POST"))
+            .map_err(|error| error.to_string());
+    }
+    let (status, body) = match resumed(&mut request, id, access, shared) {
+        Ok(answer) => answer,
+        Err((status, error)) => (status, json!({ "error": error })),
+    };
+    request
+        .respond(json_response(status, &body))
+        .map_err(|error| error.to_string())
+}
+
+/// The body of `POST /api/mission/<id>/resume`: the halt it resumes (its
+/// `mission.halted` event) and the idempotency key, or `{"probe": true}`
+/// alone. Nothing else: no principal, no reason.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResumeBody {
+    #[serde(default)]
+    halt: Option<i64>,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    probe: bool,
+}
+
+/// The checks of a person's resume after its method, then the probe's
+/// answer or the record: `(202, {event})`, or `(status, why)` when refused.
+fn resumed(
+    request: &mut Request,
+    id: &str,
+    access: Access,
+    shared: &Shared,
+) -> Result<(u16, Value), (u16, String)> {
+    let (body, header_key) = write_body(request, access, shared, "a resume")?;
+    let body: ResumeBody = serde_json::from_slice(&body).map_err(|error| {
+        (
+            400,
+            format!("{BAD_REQUEST}the body is not a resume: {error}"),
+        )
+    })?;
+    let mission: i64 = id
+        .parse()
+        .ok()
+        .filter(|mission| *mission > 0)
+        .ok_or_else(|| (400, format!("{BAD_REQUEST}bad mission {id}")))?;
+    if body.probe {
+        if body.halt.is_some() || body.key.is_some() || header_key.is_some() {
+            return Err((
+                400,
+                format!("{BAD_REQUEST}a probe carries no halt and no key"),
+            ));
+        }
+        writer(shared).map_err(|error| (500, error))?;
+        return Ok((200, json!({ "writable": true, "mission": mission })));
+    }
+    let key = idempotency(body.key, header_key, "a resume")?;
+    let halt = body.halt.ok_or_else(|| {
+        (
+            400,
+            format!(
+                "{BAD_REQUEST}a resume names the halt it resumes (\"halt\", the mission's \
+                 halt.event), so that a page not refreshed resumes no other"
+            ),
+        )
+    })?;
+    let store = writer(shared).map_err(|error| (500, error))?;
+    match store.human_resume(mission, halt, &key) {
+        Ok(spawn_postgres::HumanResume::Resumed(event)) => Ok((
+            202,
+            json!({ "event": event, "mission": mission, "halt": halt, "principal": "human" }),
+        )),
+        Ok(spawn_postgres::HumanResume::NoMission(why)) => Err((404, why)),
+        Ok(spawn_postgres::HumanResume::Refused(why)) => Err((409, why)),
+        Err(error) => Err((500, error.to_string())),
+    }
+}
+
 /// Whether `origin` is this page's own: present, and the same host over
 /// http as the request's `Host`.
 fn same_origin(host: Option<&str>, origin: Option<&str>) -> bool {
@@ -1193,8 +1301,9 @@ fn typed_text(text: Option<String>) -> Result<String, String> {
 }
 
 /// A connection as the `spawn_human` login, derived from the owner's URL:
-/// the one login a write uses, which may call `spawn_human_input` and
-/// nothing else.
+/// the one login a write uses, which may call the `spawn_human_*`
+/// functions (an input, a key, a restart or reassign, a resume) and nothing
+/// else. A resume, too, is written only through it, never as the owner.
 fn writer(shared: &Shared) -> Result<spawn_postgres::PostgresStore, String> {
     let owner = shared
         .owner_url
@@ -1332,13 +1441,19 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 ///     "backlog_error": "<why it could not be read>" | null,
 ///     "resident": {"name", "agent_id", "session_id", "state", "label",
 ///                  "task_title", "mission_name"} | null,
-///     "next_objective": 3 | null,         // what the integrator assigns next
+///     "next_objective": 3 | null,         // what the integrator assigns next:
+///                                         // objectives::choose over the landings
+///                                         // (and objective.solved records), the
+///                                         // tasks in flight, attempts and holds
 ///     "objectives": [{                    // the backlog, by id
 ///       "id": 2, "title": "...", "prompt": "...", "recurring": true,
 ///       "metric": "ingest_total_ns" | null, "unit": "ns",
 ///       "direction": "lower" | "higher", "target": 1100 | null,
 ///       "owner_judged": false,            // the owner judges it, not the fleet
-///       "status": "open" | "solved" | "met" | "owner",
+///       "status": "open" | "solved" | "met" | "owner",   // "solved" by a landing
+///                                         // or by an objective.solved record
+///       "solved_on_base": {"event": 109278, "task": 201, "base": "<commit>"} | null,
+///                                         // the integrator's objective.solved record
 ///       "current": 1021 | null,           // latest landed metric value
 ///       "tasks": [10, 14],                // task ids for this objective
 ///       "landings": [{                    // landed tasks, oldest first
@@ -1392,17 +1507,51 @@ fn rsi_overview() -> Result<Value, String> {
     }))
 }
 
-/// Open objective missions with their backlog's objectives filled in.
-fn objective_missions(store: &spawn_postgres::PostgresStore) -> Result<Vec<Value>, String> {
+/// Open objective missions with their backlog's objectives filled in, each
+/// with its tasks' outcomes (`PostgresStore::objective_outcomes`, the
+/// integrator's own read) for [`with_objectives`]'s `next_objective`.
+pub(crate) fn objective_missions(
+    store: &spawn_postgres::PostgresStore,
+) -> Result<Vec<Value>, String> {
     let missions = store.objective_missions().map_err(err)?;
     let Value::Array(missions) = missions else {
         return Ok(Vec::new());
     };
-    Ok(missions.into_iter().map(with_objectives).collect())
+    missions
+        .into_iter()
+        .map(|mut mission| {
+            if let Some(id) = mission["id"].as_i64() {
+                let outcomes = store.objective_outcomes(id).map_err(err)?;
+                if let Some(fields) = mission.as_object_mut() {
+                    fields.insert("outcomes".to_string(), outcomes);
+                }
+            }
+            Ok(with_objectives(mission))
+        })
+        .collect()
+}
+
+/// Whether a task of an objective mission is in flight: from its
+/// assignment until it lands or is cancelled. Accepted work of a mission
+/// with a gate still waits for the gate and then lands; accepted without
+/// one is closed.
+fn task_in_flight(task: &Value, gated: bool) -> bool {
+    match task["state"].as_str() {
+        Some("landed" | "cancelled") | None => false,
+        Some("accepted") => gated,
+        Some(_) => true,
+    }
 }
 
 /// One mission row with `backlog`, `backlog_error`, `objectives` and
-/// `next_objective` added.
+/// `next_objective` added. The row's `solved_on_base` (the mission's
+/// `objective.solved` records) and `outcomes` (its tasks' outcomes, when
+/// read) are taken out: each objective row names its own record, and
+/// `next_objective` is what [`crate::objectives::choose`] gives one free
+/// slot from the integrator's own inputs (the landings, landed tasks and
+/// `objective.solved` records as `OBJECTIVE_LANDINGS`; the objectives with
+/// a task in flight; the attempts; the held objectives), null when it
+/// would assign nothing.
 pub(crate) fn with_objectives(mut mission: Value) -> Value {
     let backlog = mission
         .pointer("/objectives/backlog")
@@ -1420,26 +1569,100 @@ pub(crate) fn with_objectives(mut mission: Value) -> Value {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let (solved, outcomes) = match mission.as_object_mut() {
+        Some(fields) => (fields.remove("solved_on_base"), fields.remove("outcomes")),
+        None => (None, None),
+    };
+    let solved: Vec<Value> = solved
+        .and_then(|solved| solved.as_array().cloned())
+        .unwrap_or_default();
+    let outcomes: Vec<Outcome> = outcomes
+        .and_then(|outcomes| serde_json::from_value(outcomes).ok())
+        .unwrap_or_default();
+    let record = |id: u32| {
+        solved
+            .iter()
+            .find(|record| record["objective"].as_u64() == Some(u64::from(id)))
+    };
     let rows: Vec<Value> = objectives
         .iter()
-        .map(|objective| objective_json(objective, &tasks))
+        .map(|objective| objective_json(objective, &tasks, record(objective.id)))
         .collect();
-    let next = rows
-        .iter()
-        .find(|row| row["status"] == "open")
-        .map(|row| row["id"].clone());
+    let next = next_objective(&mission, &objectives, &tasks, &solved, &outcomes);
     if let Some(fields) = mission.as_object_mut() {
         fields.insert("backlog".to_string(), json!(backlog));
         fields.insert("backlog_error".to_string(), json!(error));
-        fields.insert("next_objective".to_string(), next.unwrap_or(Value::Null));
+        fields.insert("next_objective".to_string(), json!(next));
         fields.insert("objectives".to_string(), Value::Array(rows));
     }
     mission
 }
 
+/// What the integrator assigns next in `mission`: the objective
+/// [`crate::objectives::choose`] gives one free slot, from the same inputs
+/// as `crate::objectives::assign_next`.
+fn next_objective(
+    mission: &Value,
+    objectives: &[Task],
+    tasks: &[Value],
+    solved: &[Value],
+    outcomes: &[Outcome],
+) -> Option<u32> {
+    // Newest first, as `OBJECTIVE_LANDINGS` gives them (`landed_value`
+    // reads the first metric); a record solved on the base has none.
+    let mut landed: Vec<&Value> = tasks
+        .iter()
+        .filter(|task| task["state"] == "landed")
+        .collect();
+    landed.sort_by_key(|task| {
+        std::cmp::Reverse((task["updated_at_ms"].as_i64(), task["id"].as_i64()))
+    });
+    let landings: Vec<Landing> = landed
+        .iter()
+        .filter_map(|task| {
+            Some(Landing {
+                objective: u32::try_from(task["objective"].as_u64()?).ok()?,
+                metric: task["metric"].as_str().map(str::to_string),
+            })
+        })
+        .chain(solved.iter().filter_map(|record| {
+            Some(Landing {
+                objective: u32::try_from(record["objective"].as_u64()?).ok()?,
+                metric: None,
+            })
+        }))
+        .collect();
+    let gated = !mission["gate"].is_null();
+    let in_flight: BTreeSet<u32> = tasks
+        .iter()
+        .filter(|task| task_in_flight(task, gated))
+        .filter_map(|task| u32::try_from(task["objective"].as_u64()?).ok())
+        .collect();
+    let configured_ms = mission["configured_ms"].as_i64();
+    let held: BTreeSet<u32> = overruns(outcomes)
+        .iter()
+        .filter(|(_, overrun)| holds(overrun, configured_ms))
+        .map(|(objective, _)| *objective)
+        .collect();
+    choose(
+        objectives,
+        &landings,
+        &in_flight,
+        &attempts(outcomes),
+        &held,
+        1,
+    )
+    .first()
+    .map(|task| task.id)
+}
+
 /// One backlog objective with its status and landings, from the mission's
-/// tasks (newest first).
-fn objective_json(objective: &Task, tasks: &[Value]) -> Value {
+/// tasks (newest first), and `solved`, the mission's `objective.solved`
+/// record of it if one: a one-shot objective solved on the base is
+/// solved, as a landing makes it, and its row names the record
+/// (`solved_on_base`: `{event, task, base}`, null for every other
+/// objective).
+fn objective_json(objective: &Task, tasks: &[Value], solved: Option<&Value>) -> Value {
     let mine: Vec<&Value> = tasks
         .iter()
         .filter(|task| task["objective"].as_u64() == Some(u64::from(objective.id)))
@@ -1471,7 +1694,7 @@ fn objective_json(objective: &Task, tasks: &[Value]) -> Value {
         } else {
             "open"
         }
-    } else if landed.is_empty() {
+    } else if landed.is_empty() && solved.is_none() {
         "open"
     } else {
         "solved"
@@ -1511,6 +1734,11 @@ fn objective_json(objective: &Task, tasks: &[Value]) -> Value {
         "current": current,
         "tasks": mine.iter().map(|task| task["id"].clone()).collect::<Vec<_>>(),
         "landings": history,
+        "solved_on_base": solved.map(|record| json!({
+            "event": record["event"],
+            "task": record["task"],
+            "base": record["base"],
+        })),
     })
 }
 
@@ -1533,11 +1761,7 @@ fn rsi_summary(mission: &Value) -> Value {
     let open_task = mission["tasks"].as_array().and_then(|tasks| {
         tasks
             .iter()
-            .find(|task| match task["state"].as_str() {
-                Some("landed" | "cancelled") | None => false,
-                Some("accepted") => gated,
-                Some(_) => true,
-            })
+            .find(|task| task_in_flight(task, gated))
             .map(|task| {
                 json!({
                     "id": task["id"],
@@ -2706,6 +2930,161 @@ mod tests {
         }
     }
 
+    const RESUME: &str = "/api/mission/6/resume";
+
+    /// The resume path has the input's guards (POST only, the page's Origin
+    /// without the token, JSON), a body of a halt and a key alone (or a
+    /// probe), and a mission named by its number. Past every guard it
+    /// reaches the database (here none: 500).
+    #[test]
+    fn a_resumes_path_has_the_inputs_guards_and_a_halt_and_a_key() {
+        let get = exchange(
+            Some("secret"),
+            "",
+            None,
+            &format!(
+                "GET {RESUME} HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\n\
+                 Authorization: Bearer secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        refused(&get, 405, "GET");
+        let body = r#"{"halt":61,"key":"k-1"}"#;
+        let named = "Host: 127.0.0.1:PORT\r\nContent-Type: application/json\r\n";
+        refused(
+            &post(None, "", None, RESUME, named, body),
+            403,
+            "no token and no Origin",
+        );
+        let elsewhere = format!("{named}Origin: http://elsewhere.example\r\n");
+        refused(
+            &post(None, "", None, RESUME, &elsewhere, body),
+            403,
+            "another site's page",
+        );
+        let text = "Host: 127.0.0.1:PORT\r\nAuthorization: Bearer secret\r\n\
+                    Content-Type: text/plain\r\n";
+        refused(
+            &post(Some("secret"), "", None, RESUME, text, body),
+            415,
+            "not JSON",
+        );
+        for (bad, why) in [
+            ("not json", "not JSON"),
+            (r#"{"halt":61}"#, "no idempotency key"),
+            (r#"{"key":"k"}"#, "no halt"),
+            (r#"{"halt":"61","key":"k"}"#, "a halt that is no event id"),
+            (r#"{"halt":61,"key":"k","by":"owner"}"#, "who resumes"),
+            (r#"{"halt":61,"key":""}"#, "an empty key"),
+            (r#"{"probe":true,"halt":61}"#, "a probe with a halt"),
+        ] {
+            refused(
+                &post(Some("secret"), "", None, RESUME, SCRIPT, bad),
+                400,
+                why,
+            );
+        }
+        for path in ["/api/mission/six/resume", "/api/mission/-1/resume"] {
+            refused(
+                &post(Some("secret"), "", None, path, SCRIPT, body),
+                400,
+                "a mission that is no number",
+            );
+        }
+        let other_key = format!("{SCRIPT}Idempotency-Key: other\r\n");
+        refused(
+            &post(Some("secret"), "", None, RESUME, &other_key, body),
+            400,
+            "a key in the body and another in the header",
+        );
+        for reaching in [body, r#"{"probe":true}"#] {
+            let reached = post(Some("secret"), "", None, RESUME, SCRIPT, reaching);
+            assert_eq!(reached.status, 500, "{reached:?}");
+            assert_eq!(reached.body["error"], "SPAWN_DATABASE_URL is not set");
+        }
+        let header_key = format!("{SCRIPT}Idempotency-Key: k-1\r\n");
+        let reached = post(
+            Some("secret"),
+            "",
+            None,
+            RESUME,
+            &header_key,
+            r#"{"halt":61}"#,
+        );
+        assert_eq!(reached.status, 500, "the key in its header: {reached:?}");
+    }
+
+    /// A person's resume reaches the test database as the `spawn_human`
+    /// login: the halt the mission is in, once per key, `by` human; any
+    /// other is 409 with the reason and records nothing; no mission is 404.
+    #[test]
+    fn a_persons_resume_reaches_the_test_database_once_for_the_halt_it_names() {
+        in_test_schema(|owner, store| {
+            let to = |path: &str, body: &str| {
+                post(
+                    Some("secret"),
+                    "",
+                    Some(owner.to_string()),
+                    path,
+                    SCRIPT,
+                    body,
+                )
+            };
+            let mission = store
+                .mission_add("Resumed from the page", &json!([]), "human")
+                .expect("a mission");
+            let path = format!("/api/mission/{mission}/resume");
+            let probe = to(&path, r#"{"probe":true}"#);
+            assert_eq!(probe.status, 200, "{probe:?}");
+            let idle = to(&path, r#"{"halt":1,"key":"r-0"}"#);
+            assert_eq!(idle.status, 409, "{idle:?}");
+            assert!(
+                idle.body["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("not halted")),
+                "{idle:?}"
+            );
+            let halt = store
+                .integrator_record(&json!({"type": "mission.halted", "id": mission,
+                                           "reason": "the scenarios fell from 5 to 2",
+                                           "gone": ["c.sh"]}))
+                .expect("halted");
+            let stale = to(&path, &format!(r#"{{"halt":{},"key":"r-1"}}"#, halt - 1));
+            assert_eq!(stale.status, 409, "{stale:?}");
+            let missing = to(
+                "/api/mission/999999/resume",
+                &format!(r#"{{"halt":{halt},"key":"r-1"}}"#),
+            );
+            assert_eq!(missing.status, 404, "{missing:?}");
+            let body = format!(r#"{{"halt":{halt},"key":"r-2"}}"#);
+            let first = to(&path, &body);
+            assert_eq!(first.status, 202, "{first:?}");
+            let event = first.body["event"].as_i64().expect("the record's event");
+            let again = to(&path, &body);
+            assert_eq!(again.status, 202, "{again:?}");
+            assert_eq!(again.body["event"], event, "a retried POST resumes once");
+            let board = store.mission_board(10).expect("the board");
+            assert!(board["missions"][0]["halted"].is_null());
+            assert!(board["missions"][0]["halt"].is_null());
+            let mut client =
+                postgres::Client::connect(owner, postgres::NoTls).expect("the owner connects");
+            let records: Vec<serde_json::Value> = client
+                .query(
+                    "select kind -> 'detail' -> 'record' from spawn_events
+                      where session_id = 'session_control'
+                        and kind -> 'detail' -> 'record' ->> 'type' = 'mission.resumed'",
+                    &[],
+                )
+                .expect("the records")
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            assert_eq!(records.len(), 1, "{records:?}");
+            assert_eq!(records[0]["by"], "human");
+            assert_eq!(records[0]["halt"], halt);
+            assert_eq!(records[0]["id"], mission);
+        });
+    }
+
     /// Who may write past the guards: the token's holder from anywhere, the
     /// page itself on an open network, and, with no token set, the owner's
     /// own client. Each reaches the database (here none: 500).
@@ -3174,9 +3553,9 @@ mod tests {
             ),
             task(10, 1, "landed", 10, None),
         ];
-        let one_shot = objective_json(&objective(1, false), &tasks);
+        let one_shot = objective_json(&objective(1, false), &tasks, None);
         assert_eq!(one_shot["status"], "solved");
-        let recurring = objective_json(&objective(2, true), &tasks);
+        let recurring = objective_json(&objective(2, true), &tasks, None);
         assert_eq!(recurring["status"], "met");
         assert_eq!(recurring["current"], 1021.0);
         assert_eq!(recurring["tasks"], json!([13, 12, 11]));
@@ -3186,7 +3565,7 @@ mod tests {
         assert_eq!(landings[0]["task"], 11);
         assert_eq!(landings[0]["baseline"], 1573.0);
         assert_eq!(landings[1]["candidate"], 1021.0);
-        let untouched = objective_json(&objective(3, false), &tasks);
+        let untouched = objective_json(&objective(3, false), &tasks, None);
         assert_eq!(untouched["status"], "open");
         assert_eq!(untouched["landings"], json!([]));
     }
@@ -3199,9 +3578,12 @@ mod tests {
         owner.owner_judged = true;
         // The rows as the board builds them, and then through a real
         // backlog directory below.
-        let owner_row = objective_json(&owner, &[]);
-        let fleet_row = objective_json(&objective(2, false), &[]);
-        assert_eq!(objective_json(&objective(1, false), &[])["status"], "open");
+        let owner_row = objective_json(&owner, &[], None);
+        let fleet_row = objective_json(&objective(2, false), &[], None);
+        assert_eq!(
+            objective_json(&objective(1, false), &[], None)["status"],
+            "open"
+        );
         assert_eq!(owner_row["status"], "owner");
         assert_eq!(owner_row["owner_judged"], true);
         assert_eq!(fleet_row["status"], "open");
@@ -3252,9 +3634,136 @@ mod tests {
             20,
             Some("METRIC ingest_total_ns baseline=1573 candidate=1200"),
         )];
-        let recurring = objective_json(&objective(2, true), &tasks);
+        let recurring = objective_json(&objective(2, true), &tasks, None);
         assert_eq!(recurring["status"], "open");
         assert_eq!(recurring["current"], 1200.0);
+    }
+
+    /// A backlog of `ids` in a fresh directory, each objective's JSON
+    /// extended by `extra` (its id's entry).
+    fn backlog_dir(name: &str, ids: &[u32], extra: &[(u32, &str)]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("spawn-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for id in ids {
+            let more = extra
+                .iter()
+                .find(|(of, _)| of == id)
+                .map_or("", |(_, more)| *more);
+            std::fs::write(
+                dir.join(format!("{id:03}.json")),
+                format!(r#"{{"id": {id}, "title": "o{id}", "prompt": "p"{more}}}"#),
+            )
+            .expect("write");
+        }
+        dir
+    }
+
+    /// An objective the integrator recorded solved on the base reads as
+    /// solved and names its record; `next_objective` is the integrator's
+    /// own choice: not solved, not in flight, yields behind the others.
+    #[test]
+    fn an_objective_solved_on_the_base_is_solved_and_next_is_the_integrators_choice() {
+        let dir = backlog_dir("board-solved", &[1, 2, 3, 4, 5], &[]);
+        let board = with_objectives(json!({
+            "id": 1,
+            "gate": "/g",
+            "objectives": {"backlog": dir.to_str()},
+            "tasks": [
+                task(4, 4, "cancelled", 40, None),
+                task(3, 3, "reported", 30, None),
+                task(2, 2, "cancelled", 20, None),
+                task(1, 1, "landed", 10, None),
+            ],
+            "solved_on_base": [{"event": 77, "objective": 2, "task": 2, "base": "b0", "at_ms": 5}],
+            "outcomes": [
+                {"type": "task.gated", "task": 4, "objective": 4, "verdict": "rejected"},
+                {"type": "task.gated", "task": 4, "objective": 4, "verdict": "rejected"},
+                {"type": "task.gated", "task": 4, "objective": 4, "verdict": "rejected"},
+                {"type": "task.cancelled", "task": 4, "objective": 4, "yielded": true},
+            ],
+        }));
+        let rows = board["objectives"].as_array().expect("rows");
+        let statuses: Vec<&serde_json::Value> = rows.iter().map(|row| &row["status"]).collect();
+        assert_eq!(statuses, ["solved", "solved", "open", "open", "open"]);
+        assert_eq!(
+            rows[1]["solved_on_base"],
+            json!({"event": 77, "task": 2, "base": "b0"})
+        );
+        for at in [0, 2, 3, 4] {
+            assert_eq!(
+                rows[at]["solved_on_base"],
+                serde_json::Value::Null,
+                "row {at}"
+            );
+        }
+        // Its landings are a landing's only; the record is not one.
+        assert_eq!(rows[1]["landings"], json!([]));
+        assert_eq!(board["next_objective"], json!(5));
+        // The inputs are taken out of the row.
+        assert!(board.get("outcomes").is_none());
+        assert!(board.get("solved_on_base").is_none());
+        let summary = rsi_summary(&board);
+        assert_eq!(summary["objectives"]["open"], 3);
+        assert_eq!(summary["objectives"]["solved"], 2);
+        assert_eq!(summary["next_objective"], 5);
+
+        // Without objective 5, the yielded 4 is next; with 4 in flight too,
+        // nothing is.
+        let dir4 = backlog_dir("board-solved-4", &[1, 2, 3, 4], &[]);
+        let mut mission = json!({
+            "id": 1, "gate": "/g", "objectives": {"backlog": dir4.to_str()},
+            "tasks": [task(1, 1, "landed", 10, None)],
+            "solved_on_base": [{"event": 77, "objective": 2, "task": 2, "base": "b0"}],
+        });
+        mission["tasks"]
+            .as_array_mut()
+            .expect("tasks")
+            .push(task(3, 3, "delivered", 30, None));
+        assert_eq!(with_objectives(mission.clone())["next_objective"], json!(4));
+        mission["tasks"]
+            .as_array_mut()
+            .expect("tasks")
+            .push(task(5, 4, "accepted", 50, None));
+        assert_eq!(
+            with_objectives(mission)["next_objective"],
+            serde_json::Value::Null
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir4);
+    }
+
+    /// `after` is obeyed against records solved on the base; a held
+    /// objective is not next until the mission is configured again.
+    #[test]
+    fn next_objective_obeys_order_holds_and_only_its_own_records() {
+        let dir = backlog_dir("board-order", &[1, 2, 3], &[(1, r#", "after": [2]"#)]);
+        // Objective 2 open: 1 waits for it, so 2 is next.
+        let open = with_objectives(json!({
+            "id": 1, "gate": "/g", "objectives": {"backlog": dir.to_str()}, "tasks": [],
+        }));
+        assert_eq!(open["next_objective"], json!(2));
+        // Objective 2 solved on the base: 1 may go.
+        let solved = with_objectives(json!({
+            "id": 1, "gate": "/g", "objectives": {"backlog": dir.to_str()}, "tasks": [],
+            "solved_on_base": [{"event": 9, "objective": 2, "task": 7, "base": "b"}],
+        }));
+        assert_eq!(solved["objectives"][1]["status"], "solved");
+        assert_eq!(solved["next_objective"], json!(1));
+        // Objective 1 held after a second overrun, not configured since:
+        // 3 is next; a newer configure ends the hold.
+        let held = json!({
+            "id": 1, "gate": "/g", "objectives": {"backlog": dir.to_str()}, "tasks": [],
+            "configured_ms": 100,
+            "solved_on_base": [{"event": 9, "objective": 2, "task": 7, "base": "b"}],
+            "outcomes": [{"type": "task.over_budget", "task": 8, "objective": 1,
+                          "chain": true, "at_ms": 200}],
+        });
+        assert_eq!(with_objectives(held.clone())["next_objective"], json!(3));
+        let mut configured = held;
+        configured["configured_ms"] = json!(300);
+        assert_eq!(with_objectives(configured)["next_objective"], json!(1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

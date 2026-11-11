@@ -478,6 +478,7 @@ mod host;
 mod inputs;
 pub(crate) mod judging;
 pub(crate) mod owner;
+mod retained;
 mod shadow;
 mod warm;
 
@@ -746,6 +747,17 @@ pub(crate) struct Mission {
     pub(crate) halted: Option<String>,
     #[serde(default)]
     pub(crate) scenario_floor: u32,
+    /// The scenario file names (`*.sh`) the gate directory held at the
+    /// gating that set `scenario_floor` (the latest at the floor since the
+    /// mission's last resume), folded by the store from that `task.gated`'s
+    /// `scenario_names`; none before such a gating, or from a record without
+    /// them. A halt on the floor names the ones gone since ([`floor_gone`]).
+    #[serde(default)]
+    pub(crate) scenario_names: Option<Vec<String>>,
+    /// The gate directory's scenario file names as this pass read them, for
+    /// the gating's record (`scenario_names`): never the store's.
+    #[serde(skip)]
+    pub(crate) scenarios_now: Option<Vec<String>>,
     #[serde(default)]
     pub(crate) gate_rejections: u32,
     /// The objective every rejection of the current `gate_rejections` run
@@ -924,15 +936,34 @@ pub(crate) fn halt_reason(mission: &Mission, scenarios: u32) -> Option<String> {
     if mission.gate_aborts >= HALT_AFTER {
         return Some(format!("{} gate aborts in a row", mission.gate_aborts));
     }
-    // A candidate that deletes the scenario that judges it passes by removing
-    // the work, so the count may not fall.
-    if mission.scenario_floor > 0 && scenarios < mission.scenario_floor {
-        return Some(format!(
+    floor_reason(mission, scenarios)
+}
+
+/// The scenario floor's halt rule: a candidate that deletes the scenario
+/// that judges it passes by removing the work, so the count may not fall.
+fn floor_reason(mission: &Mission, scenarios: u32) -> Option<String> {
+    (mission.scenario_floor > 0 && scenarios < mission.scenario_floor).then(|| {
+        format!(
             "the scenarios fell from {} to {scenarios}",
             mission.scenario_floor
-        ));
-    }
-    None
+        )
+    })
+}
+
+/// The scenarios a halt on the floor names as gone: the file names the
+/// gating that set the floor saw (`scenario_names`) that `now` (the gate
+/// directory's at the halt) no longer holds, sorted. None when that gating
+/// named none (a record from before names were recorded).
+pub(crate) fn floor_gone(mission: &Mission, now: &[String]) -> Option<Vec<String>> {
+    let then = mission.scenario_names.as_ref()?;
+    let mut gone: Vec<String> = then
+        .iter()
+        .filter(|name| !now.contains(name))
+        .cloned()
+        .collect();
+    gone.sort();
+    gone.dedup();
+    Some(gone)
 }
 
 /// The wait after the `waits`-th `no_room` in a row: [`ROOM_BACKOFF`],
@@ -2416,6 +2447,89 @@ impl Integrator {
         self
     }
 
+    /// Whether `task` waits for the controller (P22), saying so when it
+    /// starts to. Base and controller come from one commit: a gate on a
+    /// main past an owner's landing the controller does not have judges it
+    /// with the old controller's scenarios and gate (task 259, 2026-11-11:
+    /// base d31d6dba, controller 983509fc, check-e2e failing on both). The
+    /// window is the owner's landing (`source.moved`, which moves main)
+    /// until its deploy (which switches the controller): the task waits for
+    /// the deploy, without limit. Task landings need no deploy and hold
+    /// nothing: only the owner's latest landing is compared. The alert
+    /// `controller_behind` (alerts.rs) says when the wait is no window.
+    fn controller_behind(
+        &self,
+        store: &PostgresStore,
+        mission: &Mission,
+        task: &Task,
+        source: &str,
+        mirror: &Path,
+        scenarios: &Path,
+    ) -> Result<bool, String> {
+        if controller_commit(scenarios).is_none() {
+            return Ok(false);
+        }
+        let Some(landed) = store
+            .source_owner_landed(source)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(false);
+        };
+        let Some(controller) = controller_behind(mirror, scenarios, &landed) else {
+            return Ok(false);
+        };
+        if self
+            .waiting
+            .borrow_mut()
+            .insert((task.id, Wait::Controller))
+        {
+            println!(
+                "integrate: mission {}: task {} waits: the owner's landing {} on {source} is \
+                 newer than the controller its scenarios come from ({}): it waits for the \
+                 deploy that switches the controller",
+                mission.id,
+                task.id,
+                short_commit(&landed),
+                short_commit(&controller)
+            );
+        }
+        Ok(true)
+    }
+
+    /// Whether `task` is held by the nightly's red on its source (gate v2
+    /// step 5b), saying so when it starts to be: while the nightly's fact
+    /// has a red ([`nightly_red`]), no task of the source is judged, so no
+    /// task lands on it (one already accepted when the red appeared lands:
+    /// its gate judged before the red was known). The owner's pushes are
+    /// judged and land as before (`owner.rs`): a fix or a revert is one. A
+    /// green or flaky nightly, the timer's or one run by hand after the
+    /// fix, ends the red and the hold.
+    fn nightly_holds(&self, mission: &Mission, task: &Task, source: &str) -> bool {
+        let Some(red) = nightly_red(&self.judge.root, source) else {
+            return false;
+        };
+        if self
+            .waiting
+            .borrow_mut()
+            .insert((task.id, Wait::NightlyRed))
+        {
+            println!(
+                "integrate: mission {}: task {} held: main of {source} is red since {} on the \
+                 nightly ({}): task landings wait for a green or flaky nightly; the owner's \
+                 pushes still land",
+                mission.id,
+                task.id,
+                short_commit(&red.since),
+                if red.failed.is_empty() {
+                    "no scenario named".to_string()
+                } else {
+                    red.failed.join(", ")
+                }
+            );
+        }
+        true
+    }
+
     /// Whether `task`'s gate backs off this pass ([`gate_wait`]), saying
     /// so when it starts to: the line is printed once, not on every pass
     /// it goes on waiting, like every other wait.
@@ -2925,6 +3039,9 @@ impl Integrator {
         let started_ms = gate::UnitRun::read(gate).map_or_else(now_ms, |run| run.started_ms);
         let mut gated = mission.clone();
         gated.gate = field("scenarios")?;
+        gated.scenarios_now = serde_json::from_value(described["scenario_names"].clone())
+            .ok()
+            .flatten();
         Ok(Some(Adoption {
             mission: gated,
             task: task.clone(),
@@ -3189,9 +3306,15 @@ impl Integrator {
             return Ok(false);
         }
         let scenarios = pinned(Path::new(&mission.gate));
-        let count = gate::count_scenarios(&scenarios)?;
+        let names = gate::scenario_names(&scenarios)?;
+        let count = u32::try_from(names.len()).unwrap_or(u32::MAX);
         if let Some(reason) = halt_reason(mission, count) {
-            return halt(store, mission, &reason).map(|()| false);
+            // A halt on the floor names the scenarios gone since the gating
+            // that set it, so a human tells a replacement from a deletion.
+            let gone = (floor_reason(mission, count).as_ref() == Some(&reason))
+                .then(|| floor_gone(mission, &names))
+                .flatten();
+            return halt_naming(store, mission, &reason, gone).map(|()| false);
         }
         let aborted = Self::enforce_budget(store, mission)?;
         let Some(source) = mission.source.as_deref() else {
@@ -3271,8 +3394,15 @@ impl Integrator {
             if red == RedHold::Held {
                 return Ok(false);
             }
+            if self.controller_behind(store, mission, task, source, &mirror, &scenarios)? {
+                return Ok(false);
+            }
+            if self.nightly_holds(mission, task, source) {
+                return Ok(false);
+            }
             let mut gated = mission.clone();
             gated.gate = scenarios.to_string_lossy().into_owned();
+            gated.scenarios_now = Some(names.clone());
             ready.push(Ready {
                 mission: mission.id,
                 source: source.to_string(),
@@ -3427,6 +3557,7 @@ impl Integrator {
                     "revision": task.revisions, "source": source, "base": main,
                     "count": count, "shares_server": shares_server, "jobs": jobs,
                     "gate": pinned(&self.judge.gate), "scenarios": gated.gate,
+                    "scenario_names": gated.scenarios_now,
                     "probe": probe}),
             self.judge.units,
         )
@@ -3801,7 +3932,8 @@ impl Judge {
             {
                 let mut discarded = json!({"type": "task.gated", "id": task.id,
                 "verdict": "stale", "found": "discarded", "revision": task.revisions,
-                "base": main, "scenarios": count, "request": request,
+                "base": main, "scenarios": count, "scenario_names": mission.scenarios_now,
+                "request": request,
                 "reason": format!(
                     "discarded by the owner's urgent landing (request {request}){}",
                     reason.map(|reason| format!(": {reason}")).unwrap_or_default()
@@ -3838,6 +3970,7 @@ impl Judge {
                 stale["id"] = json!(task.id);
                 stale["revision"] = json!(task.revisions);
                 stale["scenarios"] = json!(count);
+                stale["scenario_names"] = json!(mission.scenarios_now);
                 if let Some(log) = extra.get("log") {
                     stale["log"] = log.clone();
                 }
@@ -3874,7 +4007,8 @@ impl Judge {
             };
             let mut record_value = json!({"type": "task.gated", "id": task.id, "verdict": verdict,
                                           "revision": task.revisions, "base": main,
-                                          "scenarios": count});
+                                          "scenarios": count,
+                                          "scenario_names": mission.scenarios_now});
             if let (Some(target), Some(extra)) = (record_value.as_object_mut(), extra.as_object()) {
                 target.extend(extra.clone());
             }
@@ -5345,6 +5479,102 @@ fn gate_wait(mission: &Mission, task: &Task) -> Option<(Wait, String)> {
     })
 }
 
+/// The nightly's red on a source (gate v2 step 5b, sync/design-nightly-
+/// min.md): its fact file `<root>/nightly/<name>.json`, which
+/// scripts/rsi/nightly.sh writes for `$SPAWN_LIVE/missions/<name>.git`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NightlyRed {
+    /// The main of the first red run of this red.
+    pub(crate) since: String,
+    /// The scenarios that failed.
+    pub(crate) failed: Vec<String>,
+}
+
+/// The nightly's red on `source`, read from `<root>/nightly/<name>.json`
+/// (`<name>`: the source's last path component without `.git`): the fact's
+/// `red_since` while it is set. nightly.sh sets it at a red run, keeps it
+/// through a skipped run (nothing ran that showed main fixed), and clears
+/// it at a green or flaky run. None for a source with no fact, a fact that
+/// cannot be read, or one with no red: a nightly that does not run holds
+/// nothing (its own alert, nightly_stale, says so).
+pub(crate) fn nightly_red(root: &Path, source: &str) -> Option<NightlyRed> {
+    let name = Path::new(source).file_name()?.to_str()?;
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return None;
+    }
+    let text = std::fs::read_to_string(root.join("nightly").join(format!("{name}.json"))).ok()?;
+    let fact: Value = serde_json::from_str(&text).ok()?;
+    let since = fact["red_since"]
+        .as_str()
+        .filter(|since| !since.is_empty())?;
+    let failed = fact["failed"]
+        .as_array()
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|name| name.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(NightlyRed {
+        since: since.to_string(),
+        failed,
+    })
+}
+
+/// The commit the controller holding `scenarios` was built from: the
+/// `<name>-<40 hex>` directory under a `controllers` directory on the
+/// scenarios' physical path (deploy/controller.sh builds
+/// `controllers/<name>-<commit>`; the mission's gate names it through the
+/// `controllers/<name>` symlink). None for scenarios not in a controller.
+pub(crate) fn controller_commit(scenarios: &Path) -> Option<String> {
+    let physical = std::fs::canonicalize(scenarios).unwrap_or_else(|_| scenarios.to_path_buf());
+    let parts: Vec<&std::ffi::OsStr> = physical.iter().collect();
+    parts.windows(2).find_map(|pair| {
+        if pair[0] != "controllers" {
+            return None;
+        }
+        let name = pair[1].to_str()?;
+        let (_, commit) = name.rsplit_once('-')?;
+        (commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then(|| commit.to_ascii_lowercase())
+    })
+}
+
+/// The controller commit `scenarios` come from when the commit `landed`
+/// (the owner's latest landing, in the repository at `repository`: the
+/// mirror or the source itself) is newer than it: a descendant, not the
+/// commit itself. None when they are one commit, when the scenarios are in
+/// no controller, or when the controller's commit is not `landed`'s
+/// ancestor there (the controller has the landing, or is of another
+/// repository's commits: nothing to say).
+pub(crate) fn controller_behind(
+    repository: &Path,
+    scenarios: &Path,
+    landed: &str,
+) -> Option<String> {
+    let controller = controller_commit(scenarios)?;
+    if landed.eq_ignore_ascii_case(&controller) {
+        return None;
+    }
+    let repository = repository.to_string_lossy();
+    git(&[
+        "-C",
+        &repository,
+        "merge-base",
+        "--is-ancestor",
+        &controller,
+        landed,
+    ])
+    .is_ok()
+    .then_some(controller)
+}
+
 /// Why a task waits, for saying each wait once ([`Integrator::waiting`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Wait {
@@ -5358,6 +5588,12 @@ enum Wait {
     Gate,
     /// The CPU has no room for its gate.
     Cpu,
+    /// The owner's latest landing on its source is newer than the
+    /// controller its scenarios come from: its deploy has not switched the
+    /// controller yet (P22).
+    Controller,
+    /// The nightly found main of its source red (gate v2 step 5b).
+    NightlyRed,
 }
 
 /// Whether a wait was said this pass or before, for [`Integrator::backs_off`].
@@ -5808,11 +6044,30 @@ fn bound(value: &Value) -> Value {
 }
 
 fn halt(store: &PostgresStore, mission: &Mission, reason: &str) -> Result<(), String> {
-    record(
-        store,
-        &json!({"type": "mission.halted", "id": mission.id, "reason": reason}),
-    )?;
-    println!("integrate: mission {} HALTED: {reason}", mission.id);
+    halt_naming(store, mission, reason, None)
+}
+
+/// [`halt`], naming the scenarios `gone` for a halt on the scenario floor
+/// ([`floor_gone`]): the record's `gone`, which the board shows.
+fn halt_naming(
+    store: &PostgresStore,
+    mission: &Mission,
+    reason: &str,
+    gone: Option<Vec<String>>,
+) -> Result<(), String> {
+    let mut halted = json!({"type": "mission.halted", "id": mission.id, "reason": reason});
+    if let Some(gone) = &gone {
+        halted["gone"] = json!(gone);
+    }
+    record(store, &halted)?;
+    match gone {
+        Some(gone) if !gone.is_empty() => println!(
+            "integrate: mission {} HALTED: {reason} (gone: {})",
+            mission.id,
+            gone.join(", ")
+        ),
+        _ => println!("integrate: mission {} HALTED: {reason}", mission.id),
+    }
     Ok(())
 }
 
@@ -5951,9 +6206,10 @@ fn task_scenario(scenarios: &Path, recorded: Option<&str>) -> Option<PathBuf> {
 mod tests {
     use super::{
         BUDGET_GAP, Freshness, Mission, NO_TEST_DATABASE, aborted, active_ms, budget_gap,
-        freshness, gates_at_once, halt_reason, markers_note, merged_tree, needs_test_database,
-        no_room, over_budget, pinned, report_freshness, room_backoff, room_wait, short_of_room,
-        task_scenario, waits_for_gate, wall_clock_minutes, withheld_without_test_database,
+        floor_gone, floor_reason, freshness, gates_at_once, halt_reason, markers_note, merged_tree,
+        needs_test_database, no_room, over_budget, pinned, report_freshness, room_backoff,
+        room_wait, short_of_room, task_scenario, waits_for_gate, wall_clock_minutes,
+        withheld_without_test_database,
     };
     use crate::gate::{GateFailure, Shortfall};
     use serde_json::json;
@@ -7223,6 +7479,55 @@ mod tests {
         assert_eq!(halt_reason(&one, 7), None, "objective 19 yields instead");
     }
 
+    /// A halt on the floor names the scenarios the gating that set the
+    /// floor saw and the directory no longer holds, sorted; nothing without
+    /// that gating's names.
+    #[test]
+    fn a_halt_on_the_floor_names_the_scenarios_gone() {
+        let names = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let mut floor = mission(0, 0, 5);
+        assert_eq!(floor_gone(&floor, &names(&["a.sh"])), None, "no names");
+        floor.scenario_names = Some(names(&["e.sh", "a.sh", "c.sh", "b.sh", "d.sh"]));
+        assert_eq!(
+            floor_gone(&floor, &names(&["a.sh", "b.sh", "f.sh"])),
+            Some(names(&["c.sh", "d.sh", "e.sh"]))
+        );
+        assert_eq!(
+            floor_reason(&floor, 3).as_deref(),
+            Some("the scenarios fell from 5 to 3")
+        );
+        assert_eq!(floor_reason(&floor, 5), None);
+        assert_eq!(
+            floor_reason(&mission(3, 0, 5), 3),
+            floor_reason(&floor, 3),
+            "the same words; halt_reason says the rejections first"
+        );
+        assert!(halt_reason(&mission(3, 0, 5), 3).is_some_and(|r| r.contains("rejections")));
+    }
+
+    /// The scenario names are the directory's `*.sh` files, sorted; a
+    /// directory that does not exist holds none.
+    #[test]
+    fn the_scenario_names_are_the_gate_directorys_scripts() {
+        let base = std::env::temp_dir().join(format!(
+            "spawn-scenario-names-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        std::fs::create_dir_all(base.join("nested.sh")).expect("dir");
+        for name in ["b.sh", "a.sh", "notes.md", "c.sh.bak"] {
+            std::fs::write(base.join(name), "").expect("file");
+        }
+        let names = crate::gate::scenario_names(&base).expect("names");
+        assert_eq!(names, ["a.sh", "b.sh", "nested.sh"]);
+        assert!(
+            crate::gate::scenario_names(&base.join("missing"))
+                .expect("none")
+                .is_empty()
+        );
+        std::fs::remove_dir_all(&base).expect("clean");
+    }
+
     const MINUTE: i64 = 60_000;
 
     #[test]
@@ -8270,6 +8575,108 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The controller's commit is read from its directory's name on the
+    /// scenarios' physical path (through the `controllers/<name>` symlink);
+    /// main is behind-checked against it: a descendant is ahead, the commit
+    /// itself, an ancestor or an unrelated commit is not, and scenarios in
+    /// no controller say nothing.
+    #[test]
+    fn a_main_ahead_of_its_controller_is_a_descendant_of_its_commit() {
+        let git = crate::sources::test_git;
+        let base =
+            std::env::temp_dir().join(format!("spawn-controller-commit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let repo_path = repo.to_string_lossy().to_string();
+        std::fs::create_dir_all(&repo).expect("repo");
+        git(&["init", "-q", "--initial-branch=main", &repo_path]).expect("init");
+        std::fs::write(repo.join("a"), "1\n").expect("write");
+        commit_in(&repo_path, "one");
+        let c1 = git(&["-C", &repo_path, "rev-parse", "HEAD"]).expect("c1");
+        std::fs::write(repo.join("a"), "2\n").expect("write");
+        commit_in(&repo_path, "two");
+        let c2 = git(&["-C", &repo_path, "rev-parse", "HEAD"]).expect("c2");
+        let controllers = base.join("controllers");
+        std::fs::create_dir_all(controllers.join(format!("spawn-{c1}/rsi/scenarios")))
+            .expect("controller");
+        std::os::unix::fs::symlink(format!("spawn-{c1}"), controllers.join("spawn")).expect("link");
+        let scenarios = controllers.join("spawn/rsi/scenarios");
+        assert_eq!(super::controller_commit(&scenarios), Some(c1.clone()));
+        assert_eq!(
+            super::controller_behind(&repo, &scenarios, &c2),
+            Some(c1.clone())
+        );
+        assert_eq!(
+            super::controller_behind(&repo, &scenarios, &c1),
+            None,
+            "one commit"
+        );
+        // The controller ahead of main (an ancestor main): not behind.
+        std::fs::create_dir_all(controllers.join(format!("spawn-{c2}/rsi/scenarios")))
+            .expect("controller two");
+        let ahead = controllers.join(format!("spawn-{c2}/rsi/scenarios"));
+        assert_eq!(super::controller_behind(&repo, &ahead, &c1), None);
+        // A commit this repository does not have: nothing to say.
+        let other = controllers.join(format!("spawn-{}/rsi/scenarios", "e".repeat(40)));
+        std::fs::create_dir_all(&other).expect("other");
+        assert_eq!(super::controller_behind(&repo, &other, &c2), None);
+        // Not a controller: no commit on the path, or not 40 hex digits.
+        let plain = base.join("scenarios");
+        std::fs::create_dir_all(&plain).expect("plain");
+        assert_eq!(super::controller_commit(&plain), None);
+        let short = controllers.join("spawn-abc1234/rsi/scenarios");
+        std::fs::create_dir_all(&short).expect("short");
+        assert_eq!(super::controller_commit(&short), None);
+        assert_eq!(super::controller_behind(&repo, &plain, &c2), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Gate v2 step 5b: the nightly's red is read from
+    /// `<root>/nightly/<name>.json`, `<name>` the source's last component
+    /// without `.git`: its `red_since` while set (a red, or a skipped run
+    /// during one), with the failed names; nothing for green or flaky (null),
+    /// no fact, a fact that is no JSON, or a source whose name nightly.sh
+    /// would refuse.
+    #[test]
+    fn the_nightly_red_is_the_facts_red_since() {
+        let root = std::env::temp_dir().join(format!("spawn-nightly-fact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("nightly")).expect("facts");
+        let source = "/live/missions/spawn.git";
+        let write =
+            |text: &str| std::fs::write(root.join("nightly/spawn.json"), text).expect("fact");
+        assert_eq!(super::nightly_red(&root, source), None, "no fact");
+        write(r#"{"v":1,"state":"red","failed":["023","025"],"red_since":"abc123"}"#);
+        assert_eq!(
+            super::nightly_red(&root, source),
+            Some(super::NightlyRed {
+                since: "abc123".to_string(),
+                failed: vec!["023".to_string(), "025".to_string()],
+            })
+        );
+        assert!(
+            super::nightly_red(&root, "/elsewhere/spawn").is_some(),
+            "the name without .git too"
+        );
+        write(r#"{"v":1,"state":"skipped","failed":["023"],"red_since":"abc123"}"#);
+        assert!(
+            super::nightly_red(&root, source).is_some(),
+            "a skipped night keeps the red"
+        );
+        for clear in [
+            r#"{"v":1,"state":"green","failed":[],"red_since":null}"#,
+            r#"{"v":1,"state":"flaky","failed":[],"red_since":null}"#,
+            r#"{"v":1,"state":"red","red_since":""}"#,
+            "not json",
+        ] {
+            write(clear);
+            assert_eq!(super::nightly_red(&root, source), None, "{clear}");
+        }
+        assert_eq!(super::nightly_red(&root, "/live/missions/.git"), None);
+        assert_eq!(super::nightly_red(&root, "/live/missions/a b.git"), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
@@ -11920,7 +12327,7 @@ mod database_tests {
         std::fs::create_dir_all(&marks).expect("marks");
         let _release = Release(marks.clone());
         let (base, source, scenarios, first) = world("adopt", &holding_gate(&marks));
-        let _units = StopUnits(base.join("host"));
+        let units = StopUnits(base.join("host"));
         let first = first.with_units(true);
         let second = Integrator::new(
             base.join("host"),
@@ -11979,6 +12386,8 @@ mod database_tests {
             "nothing left"
         );
         assert_eq!(started(&marks).len(), 1, "the gate ran once");
+        // The units go before the scratch their judgings are in.
+        drop(units);
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&marks);
     }
@@ -13982,6 +14391,156 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Every judging keeps its gates' files (P26, lead-mac): an accepted
+    /// task's gate leaves its stdout (the per-scenario lines at its end),
+    /// stderr and verdict under `<root>/gate-logs/<judging>/<gate>/` after
+    /// the judging's own directory is removed, and the task's `task.gated`
+    /// and `task.landed` name that directory (`gate_logs`). The environment
+    /// file is not kept.
+    #[test]
+    fn an_accepted_task_judging_keeps_its_gates_files_and_names_them() {
+        let gate = "if [ \"$1\" = --base-only ]; then exit 0; fi\n\
+                    echo '| stage gate ok 6095ms regression: check-web.sh must still pass'\n\
+                    echo 'a note on stderr' >&2\n\
+                    printf '{\"verdict\":\"accepted\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+                    echo '{\"verdict\":\"accepted\"}'\n";
+        let (base, source, scenarios, integrator) = world("kept-gates", gate);
+        let db = Db::new("kept_gates");
+        let mission = db.gated_mission(&source, &scenarios);
+        db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        integrator.pass_on(&db.store).expect("the judging's pass");
+        integrator.settle();
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        let gated = control_records(&db, "task.gated");
+        assert_eq!(gated.len(), 1, "{gated:?}");
+        let judging = gated[0]["judging"].as_str().expect("names its judging");
+        let kept = base
+            .join("host")
+            .join(super::retained::GATE_LOGS)
+            .join(judging);
+        assert_eq!(gated[0]["gate_logs"], json!(kept.to_string_lossy()));
+        let landed = control_records(&db, "task.landed");
+        assert_eq!(landed[0]["gate_logs"], gated[0]["gate_logs"]);
+        let dirs: Vec<PathBuf> = std::fs::read_dir(&kept)
+            .expect("the kept judging")
+            .map(|entry| entry.expect("entry").path())
+            .collect();
+        assert!(!dirs.is_empty(), "at least the candidate's gate");
+        let stdout: String = dirs
+            .iter()
+            .map(|gate| std::fs::read_to_string(gate.join("stdout")).unwrap_or_default())
+            .collect();
+        assert!(
+            stdout.contains("| stage gate ok 6095ms regression: check-web.sh must still pass"),
+            "{stdout}"
+        );
+        assert!(dirs.iter().any(|gate| {
+            std::fs::read_to_string(gate.join("stderr"))
+                .is_ok_and(|text| text.contains("a note on stderr"))
+        }));
+        assert!(
+            dirs.iter().all(|gate| !gate.join("env").exists()),
+            "no env file kept"
+        );
+        assert!(
+            !base
+                .join("host")
+                .join(super::judging::DIRECTORY)
+                .join(judging)
+                .exists(),
+            "the judging's own directory is removed"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An owner judging with no verdict keeps what its gate printed (P26):
+    /// a host fault and an abort each leave a readable log under the
+    /// integrator's root, stdout then stderr marked `! `, and a
+    /// `source.push_no_verdict` naming the request, the judging and the
+    /// log's path. Still no outcome: nothing moves, nothing is refused, and
+    /// the request is judged again after its backoff.
+    #[test]
+    fn an_owner_no_verdict_keeps_its_gates_log_and_names_it() {
+        let gate = "echo '| == base: the line the owner needs'\n\
+                    echo 'a harness complaint' >&2\n\
+                    printf '%s\\n' '{\"host_fault\":true,\"scenario\":\"check-tests.sh\",\"on\":\"base\",\"runs\":\"1, then 1 on the base\",\"reason\":\"r\"}' >\"$SPAWN_GATE_VERDICT\"\n\
+                    exit 6\n";
+        let (base, source, scenarios, mut integrator) = world("owner-kept", gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_mins(10),
+            cap: 3,
+        };
+        let db = Db::new("owner_kept");
+        let m0 = source_main(&source);
+        db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("K.md", "k\n")],
+            "owner: k",
+        );
+        let request = gated_request(&db, &source, &commit, "k");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        assert_eq!(source_main(&source), m0, "nothing moves");
+        assert!(control_records(&db, "source.moved").is_empty());
+        assert!(control_records(&db, "source.push_refused").is_empty());
+        let kept = control_records(&db, "source.push_no_verdict");
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0]["request"], json!(request));
+        let judging = kept[0]["judging"].as_str().expect("names its judging");
+        assert!(
+            kept[0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("the host's fault on check-tests.sh")),
+            "{kept:?}"
+        );
+        let path = std::path::PathBuf::from(kept[0]["log"].as_str().expect("names its log"));
+        assert_eq!(
+            path.parent(),
+            Some(base.join("host").join(super::retained::DIRECTORY).as_path())
+        );
+        assert!(
+            path.to_string_lossy()
+                .ends_with(&format!("-request-{request}-{judging}.log")),
+            "{}",
+            path.display()
+        );
+        let log = std::fs::read_to_string(&path).expect("the kept log reads");
+        assert!(log.contains("| == base: the line the owner needs"), "{log}");
+        assert!(log.contains("! a harness complaint"), "{log}");
+        let gates = base
+            .join("host")
+            .join(super::retained::GATE_LOGS)
+            .join(judging);
+        assert_eq!(kept[0]["gate_logs"], json!(gates.to_string_lossy()));
+        assert!(
+            !base
+                .join("host")
+                .join(super::judging::DIRECTORY)
+                .join(judging)
+                .exists(),
+            "the judging's own directory is still removed"
+        );
+        let backoff = Arc::clone(&integrator.owner.borrow().backoff);
+        assert_eq!(
+            backoff
+                .lock()
+                .expect("backoff")
+                .get(&request)
+                .map(|(faults, _)| *faults),
+            Some(1),
+            "judged again after its backoff"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// An owner judging whose gate aborts (a non-zero exit with no verdict
     /// to believe: a harness error) records nothing and is judged again
     /// after its backoff, as the host's other failures are (the lead,
@@ -14008,6 +14567,11 @@ mod database_tests {
             "an abort is no refusal"
         );
         assert!(control_records(&db, "source.moved").is_empty());
+        let kept = control_records(&db, "source.push_no_verdict");
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        let log = std::fs::read_to_string(kept[0]["log"].as_str().expect("names its log"))
+            .expect("the abort's log reads");
+        assert!(log.contains("half a run"), "{log}");
         let backoff = Arc::clone(&integrator.owner.borrow().backoff);
         assert_eq!(
             backoff
@@ -17146,7 +17710,7 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         let marks = fresh_marks("spawn-db-drain-units-marks");
         let _release = Release(marks.clone());
         let (base, source, scenarios, first) = world("drain-units", &holding_gate(&marks));
-        let _units = StopUnits(base.join("host"));
+        let units = StopUnits(base.join("host"));
         let first = first.with_units(true);
         let db = Db::new("drain_units");
         let mission = db.gated_mission(&source, &scenarios);
@@ -17186,6 +17750,8 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         assert_eq!(started(&marks).len(), 1, "the gate ran once");
         assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
         assert_eq!(control_records(&db, "task.gated").len(), 1);
+        // The units go before the scratch their judgings are in.
+        drop(units);
         for path in [base, marks] {
             let _ = std::fs::remove_dir_all(&path);
         }
@@ -17214,5 +17780,260 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         ] {
             assert!(db.store.integrator_record(&bad).is_err(), "refused: {bad}");
         }
+    }
+
+    /// The 12:39 sequence (P22; task 259, 2026-11-11): an owner's landing
+    /// moves main while the mission's gate is the deployed controller's,
+    /// built from the main before it. A task judged then would judge the
+    /// new main with the old controller's scenarios: it waits, said once,
+    /// starting no gate, until the deploy switches the controller to the
+    /// landing; then it is judged on the new main by the new controller.
+    /// Its own landing then moves main past the controller with no deploy
+    /// to come, and holds the next task not at all.
+    #[test]
+    fn a_task_waits_for_the_controller_of_the_owners_landing() {
+        let marks = fresh_marks("spawn-controller-behind");
+        let release = Release(marks.clone());
+        let seen = marks.to_string_lossy().to_string();
+        let gate = format!(
+            "echo \"$4\" >>'{seen}/scenarios-given'\n{}",
+            holding_gate(&marks)
+        );
+        let (base, source, _, integrator) = world("controller-behind", &gate);
+        let db = Db::new("controller_behind");
+        let m0 = source_main(&source);
+        // deploy/controller.sh's layout: controllers/<name>-<commit>, and
+        // controllers/<name>, the symlink the mission's gate names.
+        let controllers = base.join("controllers");
+        let deploy = |commit: &str| {
+            std::fs::create_dir_all(controllers.join(format!("spawn-{commit}/rsi/scenarios")))
+                .expect("a controller");
+            let next = controllers.join("spawn.next");
+            let _ = std::fs::remove_file(&next);
+            std::os::unix::fs::symlink(format!("spawn-{commit}"), &next).expect("link");
+            std::fs::rename(&next, controllers.join("spawn")).expect("switch");
+        };
+        deploy(&m0);
+        let mission = db.gated_mission(&source, &controllers.join("spawn/rsi/scenarios"));
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        push_work(&base, &source, &agent, "work.txt");
+        let commit = owner_commit(&base, &source, "CONTRACT.md", "v1\n", "owner: the contract");
+        owner_request(&db, &source, &commit);
+
+        integrator.pass_on(&db.store).expect("the landing's pass");
+        assert_eq!(
+            source_main(&source),
+            commit,
+            "the owner's landing moved main"
+        );
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass before the deploy");
+        integrator.pass_on(&db.store).expect("another");
+        assert!(
+            integrator.running.borrow().is_empty() && started(&marks).is_empty(),
+            "no gate judges the new main with the old controller: {:?}",
+            started(&marks)
+        );
+        assert!(verdicts(&db, task).is_empty());
+        assert!(
+            integrator
+                .waiting
+                .borrow()
+                .contains(&(task, super::Wait::Controller)),
+            "the wait is said (once: the set holds it)"
+        );
+
+        deploy(&commit);
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass after the deploy");
+        let judged = wait_started(&marks, 1);
+        assert_eq!(judged.len(), 1, "{judged:?}");
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+        assert_eq!(verdicts(&db, task), vec!["accepted"]);
+        let given = std::fs::read_to_string(marks.join("scenarios-given")).expect("given");
+        assert!(
+            given
+                .trim_end()
+                .ends_with(&format!("controllers/spawn-{commit}/rsi/scenarios")),
+            "the new controller's scenarios: {given}"
+        );
+        // The task's landing moves main past the controller too, but needs
+        // no deploy: the next task is judged on it, not held.
+        assert_eq!(control_records(&db, "task.landed").len(), 1);
+        let landed = source_main(&source);
+        assert_ne!(landed, commit);
+        let next = db.reported_task(mission, "w2");
+        let next_agent = agent_of(&db, mission, next);
+        push_work(&base, &source, &next_agent, "next.txt");
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass after the landing");
+        integrator.settle();
+        assert_eq!(verdicts(&db, next), vec!["accepted"], "judged, not held");
+        assert!(
+            !integrator
+                .waiting
+                .borrow()
+                .contains(&(next, super::Wait::Controller))
+        );
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
+    }
+
+    /// P22, on the store: a gated mission's reported task waits while the
+    /// owner's latest landing on its source is newer than the controller
+    /// its gate is in. The loop's alert step fires `controller_behind` once
+    /// that has held at every reading for the bound, once, and clears it at
+    /// the first reading after the deploy switches the controller to the
+    /// landing. Main moved by anything but the owner (a task's landing)
+    /// fires nothing.
+    #[test]
+    fn the_controller_behind_alert_fires_once_and_clears_after_the_deploy() {
+        let (base, source, _, integrator) = world("controller-alert", "exit 0\n");
+        let db = Db::new("controller_alert");
+        let m0 = source_main(&source);
+        let controllers = base.join("controllers");
+        let deploy = |commit: &str| {
+            std::fs::create_dir_all(controllers.join(format!("spawn-{commit}/rsi/scenarios")))
+                .expect("a controller");
+            let next = controllers.join("spawn.next");
+            let _ = std::fs::remove_file(&next);
+            std::os::unix::fs::symlink(format!("spawn-{commit}"), &next).expect("link");
+            std::fs::rename(&next, controllers.join("spawn")).expect("switch");
+        };
+        deploy(&m0);
+        let mission = db.gated_mission(&source, &controllers.join("spawn/rsi/scenarios"));
+        db.reported_task(mission, "w");
+        let (mut settings, _) = crate::alerts::Settings::from_env();
+        settings.check_ms = 1;
+        settings.integrator_down_ms = 0;
+        settings.controller_behind_ms = 300;
+        settings.memory_low_mb = 0;
+        settings.tmpfs_high_mb = 0;
+        settings.test_log = None;
+        settings.live_log = None;
+        let mut monitor = crate::alerts::Monitor::with(settings);
+        let mut check = || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            monitor.check(&db.store).expect("a check");
+        };
+        let past_the_bound = || std::thread::sleep(std::time::Duration::from_millis(400));
+        let alerts = || -> Vec<Value> {
+            db.store
+                .alerts(0)
+                .expect("the alerts")
+                .as_array()
+                .expect("alerts")
+                .iter()
+                .filter(|row| row["kind"] == "controller_behind")
+                .cloned()
+                .collect()
+        };
+
+        // Main is the controller's commit, then past it by a push that is
+        // no owner's landing: nothing, however long.
+        check();
+        main_moves(&base, &source, "pushed.txt");
+        check();
+        past_the_bound();
+        check();
+        assert!(alerts().is_empty(), "{:?}", alerts());
+        let m1 = owner_commit(&base, &source, "CONTRACT.md", "v1\n", "owner: the contract");
+        owner_request(&db, &source, &m1);
+        integrator.pass_on(&db.store).expect("the landing's pass");
+        assert_eq!(source_main(&source), m1, "the owner's landing moved main");
+        check();
+        assert!(alerts().is_empty(), "not yet: the bound starts");
+        past_the_bound();
+        check();
+        check();
+        let fired = alerts();
+        assert_eq!(fired.len(), 1, "once: {fired:?}");
+        assert_eq!(fired[0]["state"], "open");
+        assert_eq!(fired[0]["subject"], format!("mission #{mission}"));
+        assert_eq!(fired[0]["evidence"]["controller"], m0.as_str());
+        assert_eq!(fired[0]["evidence"]["landed"], m1.as_str());
+
+        deploy(&m1);
+        check();
+        let cleared = alerts();
+        assert_eq!(cleared.len(), 1, "{cleared:?}");
+        assert_eq!(cleared[0]["state"], "cleared", "{cleared:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Gate v2 step 5b, on the store: while the nightly's fact for the
+    /// source has a red (`red_since`), the mission's reported task is not
+    /// judged (held, said once), so nothing of it lands; the owner's push
+    /// on the red source still lands; a green nightly (`red_since` null)
+    /// releases the task, which is then judged and lands.
+    #[test]
+    fn a_red_nightly_holds_task_landings_and_not_the_owners() {
+        let marks = fresh_marks("spawn-nightly-red");
+        let release = Release(marks.clone());
+        let (base, source, scenarios, integrator) = world("nightly-red", &holding_gate(&marks));
+        let db = Db::new("nightly_red");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        push_work(&base, &source, &agent, "work.txt");
+        // nightly.sh's fact for $SPAWN_LIVE/missions/source.git: red.
+        let facts = integrator.judge.root.join("nightly");
+        std::fs::create_dir_all(&facts).expect("facts");
+        let m0 = source_main(&source);
+        let fact = |red_since: Option<&str>| {
+            let state = if red_since.is_some() { "red" } else { "green" };
+            let failed: &[&str] = if red_since.is_some() { &["023"] } else { &[] };
+            std::fs::write(
+                facts.join("source.json"),
+                json!({"v": 1, "main": m0, "at": 1, "state": state, "failed": failed,
+                       "last_green": null, "red_since": red_since})
+                .to_string(),
+            )
+            .expect("the fact");
+        };
+        fact(Some(&m0));
+
+        integrator.pass_on(&db.store).expect("a pass while red");
+        integrator.pass_on(&db.store).expect("another");
+        assert!(
+            integrator.running.borrow().is_empty() && started(&marks).is_empty(),
+            "no task is judged while the nightly is red: {:?}",
+            started(&marks)
+        );
+        assert!(verdicts(&db, task).is_empty());
+        assert!(
+            integrator
+                .waiting
+                .borrow()
+                .contains(&(task, super::Wait::NightlyRed)),
+            "the hold is said (once: the set holds it)"
+        );
+
+        // The owner's push lands on the red source: a fix or a revert is one.
+        let commit = owner_commit(&base, &source, "FIX.md", "fix\n", "owner: the fix");
+        owner_request(&db, &source, &commit);
+        integrator.pass_on(&db.store).expect("the owner's pass");
+        assert_eq!(source_main(&source), commit, "the owner's push landed");
+        assert!(started(&marks).is_empty(), "the task is still held");
+
+        // A green nightly ends the red: the task is judged and lands.
+        fact(None);
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass after the green night");
+        integrator.settle();
+        assert_eq!(verdicts(&db, task), vec!["accepted"]);
+        integrator.pass_on(&db.store).expect("the landing's pass");
+        assert_eq!(control_records(&db, "task.landed").len(), 1);
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
     }
 }

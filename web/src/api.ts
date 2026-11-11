@@ -489,15 +489,38 @@ export async function postTaskMove(
   return postWrite(sessionId, action, body, signal);
 }
 
+/** `POST /api/mission/<id>/resume` with `{halt, key}`: a person resumes a
+ * halted mission on the halt the page showed (its `mission.halted` event).
+ * 202 with `{event}`, the `mission.resumed` record (the same one for the
+ * same key again); 409 with the reason when the mission is not halted, or
+ * is halted on another halt. With the input's guards. */
+export async function postResume(
+  mission: number,
+  body: { halt: number; key: string } | { probe: true },
+  signal?: AbortSignal,
+): Promise<{ status: number | null; body: unknown }> {
+  return postJson(`/api/mission/${encodeURIComponent(String(mission))}/resume`, body, signal);
+}
+
 async function postWrite(
   sessionId: string,
   path: "input" | "key" | "restart" | "reassign",
   body: Record<string, unknown>,
   signal?: AbortSignal,
 ): Promise<{ status: number | null; body: unknown }> {
+  return postJson(`/api/session/${encodeURIComponent(sessionId)}/${path}`, body, signal);
+}
+
+/** POST `body` as JSON to `url` with the page's headers: the HTTP status,
+ * null when the server was not reached, and its JSON answer. */
+async function postJson(
+  url: string,
+  body: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<{ status: number | null; body: unknown }> {
   let response: Response;
   try {
-    response = await fetch(`/api/session/${encodeURIComponent(sessionId)}/${path}`, {
+    response = await fetch(url, {
       method: "POST",
       signal,
       cache: "no-store",

@@ -173,8 +173,13 @@ record of its gate, and never under `SPAWN_GATE_WALL_CLOCK_MINUTES`).
   alerts`, the home page), keyed by the red's first main, naming the failed
   scenarios and the landings since the last green; the first green or flaky
   run clears it. The gate's log of each scenario's last run is kept at
-  `$SPAWN_WORKSPACE_ROOT/nightly/<source>.<scenario>.log`. A red does not
-  hold landings yet (step 5b). A run stopped by its unit's timeout (6 h)
+  `$SPAWN_WORKSPACE_ROOT/nightly/<source>.<scenario>.log`. While a red
+  lasts (the fact's `red_since`, kept through a skipped run), the
+  integrator judges no task of that source, so none lands ("held: main of
+  <source> is red since <sha> on the nightly"); the owner's pushes still
+  land, and the first green or flaky run, the timer's or
+  `nightly.sh <source>` by hand after the fix, releases the tasks (step
+  5b). A run stopped by its unit's timeout (6 h)
   writes `skipped`, saying so. Two skipped runs in a row, or no fact younger
   than 26 h, fire one `nightly_stale` alert (from the run itself, and hourly
   from `spawn-nightly-stale@spawn.timer`, so a nightly that never runs is
@@ -189,6 +194,16 @@ systemctl --user enable --now spawn-nightly@spawn.timer spawn-nightly-stale@spaw
 systemctl --user start spawn-nightly@spawn.service   # one run now, optional (after a fix: clears a red)
 jq . ~/.local/share/spawn-rsi/ws/nightly/spawn.json
 journalctl --user -u spawn-nightly@spawn -n 20
+```
+
+To retire a source's nightly, stop its timers and remove its fact file
+with them: a red fact left behind holds that source's tasks for good (step
+5b reads it whether or not a nightly still runs).
+
+```sh
+systemctl --user disable --now spawn-nightly@spawn.timer spawn-nightly-stale@spawn.timer
+systemctl --user stop spawn-nightly@spawn.service   # a run in progress would write the fact again
+rm -f ~/.local/share/spawn-rsi/ws/nightly/spawn.json
 ```
 
 Settings, in `spawn.env`: `SPAWN_NIGHTLY_WAIT_SECS` (7200),
