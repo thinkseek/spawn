@@ -346,3 +346,58 @@ fn a_judgings_verdict_stands_over_a_later_abandoned() {
     assert_ne!(fault, verdict);
     assert_eq!(recorded(&mut client, "task.gated", other).len(), 1);
 }
+
+/// An owner judging's `source.push_no_verdict` (P26) is recorded once per
+/// judging, and none after that judging's outcome: a later one returns the
+/// outcome, nothing more recorded. It is no outcome itself: the request it
+/// names stays pending (`source_pushes_pending`).
+#[test]
+fn an_owner_judgings_no_verdict_is_once_and_never_after_its_outcome() {
+    let (store, schema) = store("judging_no_verdict");
+    let mut client = admin(&schema);
+    reported_task(&store, "/srv/owned");
+    let request = store
+        .source_push_request(
+            "/srv/owned",
+            MAIN,
+            &format!("refs/spawn-owner/{MAIN}"),
+            &spawn_postgres::PushRequest {
+                gated: true,
+                urgent: false,
+                reason: None,
+            },
+        )
+        .expect("a gated request");
+    let no_verdict = json!({"type": "source.push_no_verdict", "request": request,
+                            "reason": "the host's fault on check-tests.sh: r",
+                            "log": "/root/no-verdict-logs/1-request-1-x.log",
+                            "judging": JUDGING});
+    let first = store
+        .integrator_record(&no_verdict)
+        .expect("the no-verdict");
+    assert_eq!(store.integrator_record(&no_verdict).expect("again"), first);
+    assert_eq!(
+        recorded(&mut client, "source.push_no_verdict", JUDGING).len(),
+        1
+    );
+    let pending = store.source_pushes_pending().expect("pending");
+    assert!(
+        pending
+            .to_string()
+            .contains(&format!("\"request\":{request}")),
+        "still pending: {pending}"
+    );
+    // Another judging of the request: refused, then a no-verdict under it
+    // returns the refusal, nothing more.
+    let second = "0193a2b4c5d6e7f8fedcba9876543210";
+    let refused = json!({"type": "source.push_refused", "request": request, "reason": "x",
+                         "judging": second});
+    let outcome = store.integrator_record(&refused).expect("the refusal");
+    let late = json!({"type": "source.push_no_verdict", "request": request, "reason": "r",
+                      "log": null, "judging": second});
+    assert_eq!(
+        store.integrator_record(&late).expect("after its outcome"),
+        outcome
+    );
+    assert!(recorded(&mut client, "source.push_no_verdict", second).is_empty());
+}
