@@ -2825,6 +2825,17 @@ are per-agent uids or a mount per engine.
   objective mission with its backlog's objectives (status, landed metric
   values), its tasks with their `task.gated` verdicts, the halt reason and
   the baseline (the shape is documented in `crates/spawn-cli/src/serve.rs`);
+  every view of the backlog (`/api/rsi`, `/api/overview`'s RSI summary,
+  `spawn mission objectives`) reads the integrator's records as the
+  integrator does: an objective with an `objective.solved` record of its
+  own mission is solved, as a landing makes it, and its row names the record
+  (`solved_on_base`: `{event, task, base}`, null otherwise; the page says
+  "solved on the base at <base>, task #<task>"), and `next_objective` is
+  what `objectives::choose` gives one free slot from the integrator's own
+  inputs (the landings with those records, the objectives with a task in
+  flight, the attempts and the held objectives), null when it would assign
+  nothing. Mission 4's objective 34, solved on the base on 2026-11-08, was
+  still shown open and next three days later before this;
   `/api/rsi/task/<id>` answers one task, `/api/rsi/objective/<mission>/<id>`
   one objective's whole prompt; `/api/rsi/pane` shows the
   resident's terminal.
