@@ -1080,6 +1080,25 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   day's spend), and `message_not_taken` (below, "Messages"). Each fires once per
   occurrence and clears with the record or reading that cleared it; a
   threshold of `0` disables its check.
+- **Only later evidence clears (objective 050).** An alert clears only on
+  evidence that comes after what fired it, at the loop's first start and
+  after any restart: a record-borne clear on a control record (or, for
+  `agent_stuck`, an observation or an execution's end) later in the log
+  than the record the alert fired on (its event id is greater); a
+  reading-borne clear on a reading taken at or after the alert's own. Each
+  alert's evidence names what it fired on (`event_id`, or `reading_ms` for
+  a host reading, a log line or the integrator's lock), so the rule is
+  checked against what the store holds, never against the step's memory,
+  which a restart empties: a restarted step reads its open alerts back and
+  then the last 7 days of records again, and a record older than an open
+  alert's own (a resume before the halt, an older dump, a good drill before
+  the failed one) clears nothing and is no error. The records a pass reads
+  are recorded one at a time, so a later record in the same read (a halt
+  and its resume written while the loop was down, or both in the history
+  of a store the step meets for the first time) finds the alert the earlier
+  one fired and clears it, naming itself. The judge's exception stands: an
+  `up` whose `down` is older than the history clears its open alert (the
+  `up` is the later record).
 - **When.** A record-borne alert is recorded within one pass of its record; a
   host reading or a log line within `SPAWN_ALERT_CHECK_SECS` (default 30)
   and one pass; a bound within one pass of falling due, never before,
