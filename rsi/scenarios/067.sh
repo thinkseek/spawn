@@ -25,9 +25,9 @@
 #
 # Records are written as the integrator writes them, through
 # spawn_control_record(); `spawn serve` answers. Gate mission 1's tasks 1
-# to 5 are judged once each: accepted (10 min), rejected (15 min),
-# conflict (5 min), aborted (20 min) and host_fault (8 min): 58 min, 28 of
-# them deciding nothing. Each check is reported; the run fails if any
+# to 6 are judged once each: accepted (10 min), rejected (15 min),
+# conflict (5 min), aborted (20 min), host_fault (8 min) and stale (7 min,
+# main moved while the gate ran): 65 min, 35 of them deciding nothing. Each check is reported; the run fails if any
 # failed.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
@@ -226,23 +226,29 @@ judged 2 rejected 900000
 judged 3 conflict 300000
 judged 4 aborted 1200000
 judged 5 host_fault 480000
+# Stale as the integrator writes it when main moved while the gate ran
+# (integrate.rs stale_on_main_move): what the gate found, and main now.
+assign 6 1 >/dev/null
+record "{\"type\":\"task.reported\",\"id\":6,\"commit\":\"$C\",\"report\":\"Task 6 is done.\"}" >/dev/null
+M=$(printf 'bb-067-main-now' | sha1sum | cut -c1-40)
+record "{\"type\":\"task.gated\",\"id\":6,\"verdict\":\"stale\",\"found\":\"accepted\",\"revision\":0,\"base\":\"$B\",\"main_now\":\"$M\",\"scenarios\":4,\"reason\":\"main moved while the gate ran: its accepted is no verdict on the new main; judged again\",\"gate_ms\":420000}" >/dev/null
 start_serve
 
 since=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ)
 code=$(curl -s --noproxy '*' -o "$WORK/card.json" -w '%{http_code}' "$base/api/scorecard?since=$since" 2>/dev/null) || code=000
 [ "$code" = 200 ] || harness "GET /api/scorecard?since=$since answered $code: $(head -c 300 "$WORK/card.json" 2>/dev/null)"
-[ "$(jq -c '[.scopes[] | select(.scope == "fleet") | .dimensions.gate_time.runs]' "$WORK/card.json")" = '[5]' ] ||
-    harness "the fleet's gate_time does not count the five runs: $(jq -c '[.scopes[] | select(.scope == "fleet") | .dimensions.gate_time]' "$WORK/card.json")"
+[ "$(jq -c '[.scopes[] | select(.scope == "fleet") | .dimensions.gate_time.runs]' "$WORK/card.json")" = '[6]' ] ||
+    harness "the fleet's gate_time does not count the six runs: $(jq -c '[.scopes[] | select(.scope == "fleet") | .dimensions.gate_time]' "$WORK/card.json")"
 gate() { # <scope filter>: that scope's {total_ms, undecided_ms, undecided_runs, runs}
     jq -c "[.scopes[] | select($1) | .dimensions.gate_time | {total_ms, undecided_ms, undecided_runs, runs}]" "$WORK/card.json"
 }
 
 # --- (1) the answer ----------------------------------------------------------------------
 
-expect_eq "$(gate '.scope == "fleet"')" '[{"total_ms":3480000,"undecided_ms":1680000,"undecided_runs":2,"runs":5}]' \
-    "(1) the fleet's gate time: 58 min over five runs, 28 min of it (aborted, host_fault) deciding nothing"
-expect_eq "$(gate '.scope == "mission" and .mission == 1')" '[{"total_ms":3480000,"undecided_ms":1680000,"undecided_runs":2,"runs":5}]' \
-    "(1) mission 1's gate time, the same five runs"
+expect_eq "$(gate '.scope == "fleet"')" '[{"total_ms":3900000,"undecided_ms":2100000,"undecided_runs":3,"runs":6}]' \
+    "(1) the fleet's gate time: 65 min over six runs, 35 min of it (aborted, host_fault, stale) deciding nothing"
+expect_eq "$(gate '.scope == "mission" and .mission == 1')" '[{"total_ms":3900000,"undecided_ms":2100000,"undecided_runs":3,"runs":6}]' \
+    "(1) mission 1's gate time, the same six runs"
 note "(1) checked: the answer"
 
 # --- (2) the page's words ----------------------------------------------------------------------
@@ -259,7 +265,7 @@ const { undecidedText } = await import(pathToFileURL(`${env.BB_TREE}/web/src/sco
 const gate = JSON.parse(readFileSync(`${env.BB_WORK}/gate.json`, "utf8"));
 
 test("(2) what the gate spent on runs that decided nothing", () => {
-  assert.equal(undecidedText(gate), "28m of 58m gate time decided nothing (48%)");
+  assert.equal(undecidedText(gate), "35m of 1.1 h gate time decided nothing (54%)");
   assert.equal(
     undecidedText({ ...gate, total_ms: 36_000_000, undecided_ms: 5_400_000 }),
     "1.5 h of 10.0 h gate time decided nothing (15%)",
