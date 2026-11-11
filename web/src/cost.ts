@@ -96,6 +96,18 @@ export interface Row {
   /** A mission's own dollars per landing ([`perLanding`]); absent on a
    * task's or an agent's line. */
   per_landing?: string;
+  /** Its dollars over the window's, a whole percent rounded to the nearest
+   * ("14%"); "<1%" when above zero and under one percent; null when the
+   * window cost nothing priced ([`shareText`]). */
+  share: string | null;
+}
+
+/** The rows past the ten costliest, folded into one line: how many, their
+ * dollars summed to the cent, and "<n> more tasks · <dollars>". */
+export interface Fold {
+  count: number;
+  usd: number;
+  text: string;
 }
 
 export interface CostView {
@@ -108,8 +120,14 @@ export interface CostView {
   /** "<dollars> per landing (<n> landed)", or "no landing in the window". */
   per_landing: string;
   missions: Row[];
+  /** The ten costliest tasks; the rest are in `tasks_more`. */
   tasks: Row[];
+  /** The tasks past the ten costliest; null with ten or fewer. */
+  tasks_more: Fold | null;
+  /** The ten costliest agents; the rest are in `agents_more`. */
   agents: Row[];
+  /** The agents past the ten costliest; null with ten or fewer. */
+  agents_more: Fold | null;
   /** "Counted since <YYYY-MM-DD HH:MM> UTC" when the window starts before
    * the earliest message the record holds (its figures may be low); null
    * otherwise. */
@@ -181,24 +199,54 @@ export function perLanding(entry: Partial<CostLandings> | null | undefined): str
   return `${formatUsd(usd)} per landing (${COUNT.format(landed)} landed)`;
 }
 
-/** The rows of a list, most costly first; with `landings` (a mission's),
- * each carries its own dollars per landing. */
+/** How many rows of tasks and of agents the page names; the rest fold. */
+export const TOP_ROWS = 10;
+
+/** A row's share of the window: its dollars over the window's, a whole
+ * percent rounded to the nearest ("14%"); "<1%" when above zero and under
+ * one percent; null when the window cost nothing priced. */
+export function shareText(usd: number, windowUsd: number): string | null {
+  if (!Number.isFinite(windowUsd) || windowUsd <= 0) return null;
+  const percent = Number.isFinite(usd) ? (usd * 100) / windowUsd : 0;
+  if (percent > 0 && percent < 1) return "<1%";
+  return `${Math.round(percent) + 0}%`;
+}
+
+/** The rows past the first `top`, folded into one line: their count, their
+ * dollars summed and rounded to the cent, and "<n> more <noun>s ·
+ * <dollars>" ("1 more <noun>"); null when none is past them. */
+export function fold(dollars: number[], noun: string, top = TOP_ROWS): Fold | null {
+  const rest = dollars.slice(top);
+  if (rest.length === 0) return null;
+  const sum = rest.reduce((all, usd) => all + (Number.isFinite(usd) ? usd : 0), 0);
+  const usd = Math.round(sum * 100) / 100 + 0;
+  // Said from the sum itself, so a fold that cost under a cent reads
+  // "<$0.01", never "$0.00".
+  const text = `${COUNT.format(rest.length)} more ${noun}${rest.length === 1 ? "" : "s"} · ${formatUsd(sum)}`;
+  return { count: rest.length, usd, text };
+}
+
+/** The rows of a list, most costly first, each with its share of the
+ * window's `windowUsd`, and each one's dollars in the same order; with
+ * `landings` (a mission's), each carries its own dollars per landing. */
 function rows<T>(
   entries: unknown,
+  windowUsd: number,
   key: (entry: T) => string,
   label: (entry: T) => string | null = () => null,
   landings = false,
-): Row[] {
-  if (!Array.isArray(entries)) return [];
-  return (entries as T[])
+): { rows: Row[]; dollars: number[] } {
+  if (!Array.isArray(entries)) return { rows: [], dollars: [] };
+  const sorted = (entries as T[])
     .map((entry) => ({
       key: key(entry),
       label: label(entry),
       per_landing: landings ? perLanding(entry as Partial<CostLandings>) : undefined,
       ...shown(entry as Partial<CostEntry>),
     }))
-    .sort((a, b) => b.order - a.order || b.weight - a.weight || a.key.localeCompare(b.key))
-    .map(({ key: id, label: named, per_landing, usd, unpriced, weight }) => {
+    .sort((a, b) => b.order - a.order || b.weight - a.weight || a.key.localeCompare(b.key));
+  return {
+    rows: sorted.map(({ key: id, label: named, per_landing, usd, unpriced, weight, order }) => {
       const row: Row = {
         key: id,
         usd,
@@ -206,10 +254,13 @@ function rows<T>(
         unpriced_tokens: weight,
         unpriced_text: unpricedText(weight),
         label: named,
+        share: shareText(order, windowUsd),
       };
       if (per_landing !== undefined) row.per_landing = per_landing;
       return row;
-    });
+    }),
+    dollars: sorted.map((entry) => entry.order),
+  };
 }
 
 function taskLabel(entry: CostTask): string | null {
@@ -273,19 +324,27 @@ export function countedSince(answer: Partial<CostAnswer> | null | undefined): st
 
 /** The page's figures for one window's answer: the total, what a landing
  * cost and, once, the note on its unpriced tokens; each mission (`#<id>`,
- * with its own dollars per landing), task (`T<id>`, with its label) and
- * agent (its id), most costly first, each with its unpriced count; and
- * since when the record counts, when the window starts before it. */
+ * with its own dollars per landing), the ten costliest tasks (`T<id>`, with
+ * its label) and agents (its id) with the rest of each folded into one
+ * line, most costly first, each with its unpriced count and its share of
+ * the window; and since when the record counts, when the window starts
+ * before it. */
 export function costView(answer: Partial<CostAnswer> | null | undefined): CostView {
   const total = shown(answer?.total);
+  const windowUsd = total.order;
+  const missions = rows<CostMission>(answer?.missions, windowUsd, (entry) => `#${entry.mission}`, undefined, true);
+  const tasks = rows<CostTask>(answer?.tasks, windowUsd, (entry) => `T${entry.task}`, taskLabel);
+  const agents = rows<CostAgent>(answer?.agents, windowUsd, (entry) => String(entry.agent));
   return {
     total: total.usd,
     unpriced: total.unpriced,
     unpriced_note: unpricedNote(answer),
     per_landing: perLanding(answer),
-    missions: rows<CostMission>(answer?.missions, (entry) => `#${entry.mission}`, undefined, true),
-    tasks: rows<CostTask>(answer?.tasks, (entry) => `T${entry.task}`, taskLabel),
-    agents: rows<CostAgent>(answer?.agents, (entry) => String(entry.agent)),
+    missions: missions.rows,
+    tasks: tasks.rows.slice(0, TOP_ROWS),
+    tasks_more: fold(tasks.dollars, "task"),
+    agents: agents.rows.slice(0, TOP_ROWS),
+    agents_more: fold(agents.dollars, "agent"),
     since: countedSince(answer),
   };
 }
