@@ -93,6 +93,13 @@
 //! instruction rather than an answer, does not clear them. Without a
 //! transcript the list is empty and the judgement alone decides.
 //!
+//! A `For the owner:` line with no words after it (`**For the owner:**`)
+//! is a heading: each list item right under it (`- `, `* ` or `<n>. `,
+//! after any indent), up to a blank line or a line that is no item, is a
+//! line of its own, its words without the marker, at its turn's time
+//! (objective 070). The heading is none, and a list under any other heading
+//! is not the owner's.
+//!
 //! Each line says what became of the tasks it names (objective 064: a line
 //! saying four reports waited for review stood for 30 h when all four had
 //! ended before it was written). `tasks` are the tasks the line names, in
@@ -737,11 +744,7 @@ fn said(bytes: &[u8]) -> Said {
                 {
                     human = Some((question.trim().to_string(), line_time(&line)));
                 }
-                let words: Vec<&str> = text
-                    .lines()
-                    .filter_map(for_owner)
-                    .filter(|words| !words.is_empty())
-                    .collect();
+                let words = owner_lines(&text);
                 if !words.is_empty() {
                     let at = line_time(&line);
                     notes.extend(words.into_iter().map(|words| (words.to_string(), at)));
@@ -780,6 +783,53 @@ fn for_owner(line: &str) -> Option<&str> {
         rest.trim_start_matches(|c: char| c.is_whitespace() || emphasis(c))
             .trim_end_matches(|c: char| c.is_whitespace() || c == '*'),
     )
+}
+
+/// The lines a reply's `text` has for the owner, in its order: each inline
+/// [`FOR_OWNER`] line's words, and each list item right under a heading (a
+/// [`FOR_OWNER`] line with no words after it: `**For the owner:**`), up to
+/// a blank line or a line that is no item ([`list_item`]). The heading
+/// itself is none, and a list under any other heading is not the owner's
+/// (objective 070: 19 of the supervisor's 217 owner blocks were headings
+/// over lists, and none of their items reached Home).
+fn owner_lines(text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut under_heading = false;
+    for line in text.lines() {
+        if under_heading {
+            if let Some(item) = list_item(line) {
+                // An item that is itself an inline line keeps only its words.
+                let words = for_owner(item).filter(|words| !words.is_empty()).unwrap_or(item);
+                if !words.is_empty() {
+                    lines.push(words);
+                }
+                continue;
+            }
+            under_heading = false;
+        }
+        match for_owner(line) {
+            Some("") => under_heading = true,
+            Some(words) => lines.push(words),
+            None => {}
+        }
+    }
+    lines
+}
+
+/// A list item's words without its marker (`- `, `* ` or `<n>. `, after
+/// any indent); `None` for a line that is no item, a blank one included.
+fn list_item(line: &str) -> Option<&str> {
+    let rest = line.trim_start();
+    let words = if let Some(words) = rest.strip_prefix("- ").or_else(|| rest.strip_prefix("* ")) {
+        words
+    } else {
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits == 0 {
+            return None;
+        }
+        rest[digits..].strip_prefix(". ")?
+    };
+    Some(words.trim())
 }
 
 /// Whether a transcript's prompt line is a dispatcher digest
