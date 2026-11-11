@@ -2360,6 +2360,11 @@ begin
         -- A fact about this host's free disk (spawn loop, crate disk.rs):
         -- read from the log, folded into no table.
         null;
+    when 'host.storage' then
+        -- A sample of what the transcript archive and Claude Code's own
+        -- transcripts hold (spawn loop, crate storage.rs): read from the
+        -- log by `/api/fleet`'s storage figures, folded into no table.
+        null;
     when 'host.judge' then
         -- The model judge's calls began failing (`down`) or answered again
         -- (`up`): one record per crossing (spawn loop, crate judge_watch.rs),
@@ -4455,6 +4460,16 @@ begin
            or jsonb_typeof(p_record -> 'free_bytes') is distinct from 'number' then
             raise exception 'a host.disk record has a path, free_bytes and state low or recovered: %', p_record;
         end if;
+    elsif v_type = 'host.storage' then
+        -- What the transcript archive and Claude Code's own transcripts
+        -- hold, sampled by the loop at its start and hourly
+        -- (docs/storage.md, "What uses the disk").
+        if jsonb_typeof(p_record -> 'archive_bytes') is distinct from 'number'
+           or jsonb_typeof(p_record -> 'archive_files') is distinct from 'number'
+           or jsonb_typeof(p_record -> 'projects_bytes') is distinct from 'number'
+           or jsonb_typeof(p_record -> 'projects_files') is distinct from 'number' then
+            raise exception 'a host.storage record has archive_bytes, archive_files, projects_bytes and projects_files: %', p_record;
+        end if;
     elsif v_type = 'host.judge' then
         if p_record ->> 'judge' is null or p_record ->> 'state' is null
            or p_record ->> 'state' not in ('down', 'up') then
@@ -4546,6 +4561,12 @@ create index if not exists spawn_events_host_disk
     on spawn_events (session_seq)
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'host.disk';
+
+-- The `host.storage` samples, found without reading the rest of the stream.
+create index if not exists spawn_events_host_storage
+    on spawn_events (recorded_at_ms)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' = 'host.storage';
 
 -- The alert transitions: the loop's `alert.fired` and `alert.cleared`
 -- records (`spawn_alert_record`, owner only), each once per occurrence
