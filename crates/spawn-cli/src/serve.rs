@@ -108,6 +108,7 @@
 mod answers;
 pub(crate) mod attention;
 mod labels;
+mod storage;
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -1877,13 +1878,15 @@ fn rsi_pane(query: &str) -> Result<Value, String> {
 /// (`label`, `task_title`, `mission_name`: [`labels`]), plus
 /// fleet health, the decision ladder and each gated mission's gate-room
 /// waits. Computed by SQL from storage, except what the host has now, read
-/// at this request: the health's `disk` (free space, [`crate::disk::report`])
-/// and `memory` (`/proc/meminfo`, [`crate::memory::report`]).
+/// at this request: the health's `disk` (free space, [`crate::disk::report`]),
+/// `memory` (`/proc/meminfo`, [`crate::memory::report`]) and `storage`
+/// (what uses the disk, [`storage::report`]: its sizes kept for ten minutes).
 fn fleet() -> Result<Value, String> {
     let store = open_store()?;
     let mut health = store.fleet_health().map_err(err)?;
     health["disk"] = crate::disk::report(&store.host_disk().map_err(err)?);
     health["memory"] = crate::memory::report();
+    health["storage"] = storage::report(&store, now_ms())?;
     let mut agents = store.fleet_board().map_err(err)?;
     labels::label_fleet(&mut agents, &label_context(&store)?);
     Ok(json!({
