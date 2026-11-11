@@ -1,0 +1,13 @@
+[Unit]
+Description=Spawn: the nightly of source %i, once a night
+
+[Timer]
+# 02:30 local, before the backup bundle (04:00) and its verify (05:00); a night missed
+# while the host was off runs at boot. The run itself waits for no gate to
+# be running (up to 2 h).
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

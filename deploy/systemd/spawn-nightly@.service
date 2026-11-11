@@ -1,0 +1,18 @@
+[Unit]
+Description=Spawn: the nightly of source %i (scripts/rsi/nightly.sh: the scenarios that left the gate, on live main)
+After=spawn-integrate.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/share/spawn-rsi
+# From the controller, the deployed commit's tree, like the gate. Through
+# bash: the controller is a git export, so a file mode never decides whether
+# it runs.
+ExecStart=/bin/bash %h/.local/share/spawn-rsi/controllers/spawn/scripts/rsi/nightly.sh %i
+# SPAWN_WORKSPACE_ROOT (the fact file's root), SPAWN_DATABASE_URL (the alert;
+# reaches psql as PG* variables, never an argument), TMPDIR, SPAWN_NIGHTLY_*.
+EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
+Environment=PATH=%h/.cargo/bin:%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Its wait for a quiet host (2 h) and its gates (a scenario, its reruns and
+# the base's), with room.
+TimeoutStartSec=6h
