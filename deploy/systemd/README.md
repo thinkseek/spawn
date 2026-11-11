@@ -202,6 +202,7 @@ with them: a red fact left behind holds that source's tasks for good (step
 
 ```sh
 systemctl --user disable --now spawn-nightly@spawn.timer spawn-nightly-stale@spawn.timer
+systemctl --user stop spawn-nightly@spawn.service   # a run in progress would write the fact again
 rm -f ~/.local/share/spawn-rsi/ws/nightly/spawn.json
 ```
 
