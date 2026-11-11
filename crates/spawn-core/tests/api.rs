@@ -967,6 +967,138 @@ fn a_transcript_replaced_by_a_file_of_the_same_length_is_read_again() {
     assert_eq!(tools_started(&store).len(), 3);
 }
 
+/// A turn's end, keyed by `uuid`.
+fn turn_end(uuid: &str) -> String {
+    format!(
+        "{{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"{uuid}\",\
+         \"timestamp\":\"2099-01-01T00:00:00.000Z\"}}\n"
+    )
+}
+
+fn commits(store: &MemoryStore) -> usize {
+    store
+        .workspace_calls()
+        .iter()
+        .filter(|call| *call == "commit")
+        .count()
+}
+
+/// rev-g on S15: a transcript read again from the start holds every old
+/// turn end; each would walk the workspace's index (636 of them in the
+/// live supervisor's). One read checkpoints once, whatever it holds.
+#[test]
+fn one_read_checkpoints_once_however_many_turns_it_ends() {
+    let turns = |count: usize| -> String {
+        (1..=count)
+            .map(|n| {
+                tool_line(&format!("a{n}"), &format!("toolu_{n}")) + &turn_end(&format!("s{n}"))
+            })
+            .collect()
+    };
+    let stopped = |store: &MemoryStore| {
+        events(store)
+            .iter()
+            .filter(|event| event.kind.name() == "turn.stopped")
+            .count()
+    };
+    // The commits of a first read of `count` turns, then of a read of the
+    // same file again from the start with one turn more.
+    let commits_of = |count: usize| -> (usize, usize) {
+        let (store, mut bridge, path) = following();
+        store.append_file(&path, &turns(count));
+        let before = commits(&store);
+        bridge.tick().expect("read");
+        let first = commits(&store) - before;
+        assert_eq!(stopped(&store), count);
+        store.replace_file(&path, (turn_end("s0") + &turns(count)).as_bytes());
+        let before = commits(&store);
+        let report = bridge.tick().expect("read the replaced file");
+        assert_eq!(reread(&report), 1, "{:?}", report.warnings);
+        assert_eq!(
+            stopped(&store),
+            count + 1,
+            "the new turn once, the old ones not again"
+        );
+        (first, commits(&store) - before)
+    };
+    assert_eq!(
+        commits_of(1),
+        commits_of(5),
+        "as many commits for five turns as for one"
+    );
+    assert_eq!(
+        commits_of(5).0,
+        1,
+        "one checkpoint for a read of five turns"
+    );
+}
+
+/// rev-g on S15: an execution that starts on a transcript that is already
+/// there (a resume, its file restored from the archive into the new
+/// workspace) keeps no bytes before its offset, only the length; a
+/// restarted Bridge does the same. Neither is taken for a shrink: the
+/// lines after are read once, with no warning, and a shrink after it is
+/// still seen.
+#[test]
+fn a_resume_and_a_restart_follow_on_without_reading_again() {
+    let store = store();
+    for command in 1..=3 {
+        let execution = ExecutionId::for_command(CommandId(command));
+        store.set_pane(&TerminalName::for_execution(&execution), READY);
+    }
+    let mut bridge = archiving_bridge(&store);
+    submit_start(&store, "work");
+    bridge.tick().expect("start");
+    let (_, path) = transcript_of_latest(&store);
+    let long: String = (1..=50)
+        .map(|n| tool_line(&format!("a{n:02}"), &format!("toolu_{n:02}")))
+        .collect();
+    store.append_file(&path, &long);
+    bridge.tick().expect("read");
+    submit(&store, "key_stop", CommandAction::Stop);
+    bridge.tick().expect("stop");
+    submit(
+        &store,
+        "key_resume",
+        CommandAction::Resume {
+            prompt: Some("go on".to_string()),
+            model: None,
+        },
+    );
+    assert_eq!(reread(&bridge.tick().expect("resume")), 0);
+    let (_, resumed) = transcript_of_latest(&store);
+    assert_ne!(
+        resumed, path,
+        "restored into the new workspace from the archive"
+    );
+    store.append_file(&resumed, &tool_line("b1", "toolu_b1"));
+    for _ in 0..2 {
+        let report = bridge.tick().expect("read on");
+        assert_eq!(reread(&report), 0, "{:?}", report.warnings);
+    }
+    assert_eq!(tools_started(&store).len(), 51);
+
+    // The loop restarts: a new Bridge rebuilt from the log.
+    let mut bridge = archiving_bridge(&store);
+    bridge.recover().expect("recover");
+    store.append_file(&resumed, &tool_line("b2", "toolu_b2"));
+    for _ in 0..2 {
+        let report = bridge.tick().expect("read after the restart");
+        assert_eq!(reread(&report), 0, "{:?}", report.warnings);
+    }
+    let started = tools_started(&store);
+    assert_eq!(started.len(), 52, "{started:?}");
+
+    // A shrink is still a shrink, also found by a Bridge that has read
+    // nothing yet (only the length to check).
+    let mut bridge = archiving_bridge(&store);
+    bridge.recover().expect("recover");
+    store.replace_file(&resumed, tool_line("c1", "toolu_c1").as_bytes());
+    let report = bridge.tick().expect("read the shrunk file");
+    assert_eq!(reread(&report), 1, "{:?}", report.warnings);
+    assert_eq!(tools_started(&store).len(), 53);
+}
+
 #[test]
 fn a_resume_whose_transcript_is_gone_without_a_copy_fails_and_starts_nothing() {
     let store = store();
