@@ -2416,6 +2416,55 @@ impl Integrator {
         self
     }
 
+    /// Whether `task` waits for the controller (P22), saying so when it
+    /// starts to. Base and controller come from one commit: a gate on a
+    /// main past an owner's landing the controller does not have judges it
+    /// with the old controller's scenarios and gate (task 259, 2026-11-11:
+    /// base d31d6dba, controller 983509fc, check-e2e failing on both). The
+    /// window is the owner's landing (`source.moved`, which moves main)
+    /// until its deploy (which switches the controller): the task waits for
+    /// the deploy, without limit. Task landings need no deploy and hold
+    /// nothing: only the owner's latest landing is compared. The alert
+    /// `controller_behind` (alerts.rs) says when the wait is no window.
+    fn controller_behind(
+        &self,
+        store: &PostgresStore,
+        mission: &Mission,
+        task: &Task,
+        source: &str,
+        mirror: &Path,
+        scenarios: &Path,
+    ) -> Result<bool, String> {
+        if controller_commit(scenarios).is_none() {
+            return Ok(false);
+        }
+        let Some(landed) = store
+            .source_owner_landed(source)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(false);
+        };
+        let Some(controller) = controller_behind(mirror, scenarios, &landed) else {
+            return Ok(false);
+        };
+        if self
+            .waiting
+            .borrow_mut()
+            .insert((task.id, Wait::Controller))
+        {
+            println!(
+                "integrate: mission {}: task {} waits: the owner's landing {} on {source} is \
+                 newer than the controller its scenarios come from ({}): it waits for the \
+                 deploy that switches the controller",
+                mission.id,
+                task.id,
+                short_commit(&landed),
+                short_commit(&controller)
+            );
+        }
+        Ok(true)
+    }
+
     /// Whether `task`'s gate backs off this pass ([`gate_wait`]), saying
     /// so when it starts to: the line is printed once, not on every pass
     /// it goes on waiting, like every other wait.
@@ -3269,6 +3318,9 @@ impl Integrator {
             }
             let red = self.red_holds(mission, source, &main, task);
             if red == RedHold::Held {
+                return Ok(false);
+            }
+            if self.controller_behind(store, mission, task, source, &mirror, &scenarios)? {
                 return Ok(false);
             }
             let mut gated = mission.clone();
@@ -5345,6 +5397,54 @@ fn gate_wait(mission: &Mission, task: &Task) -> Option<(Wait, String)> {
     })
 }
 
+/// The commit the controller holding `scenarios` was built from: the
+/// `<name>-<40 hex>` directory under a `controllers` directory on the
+/// scenarios' physical path (deploy/controller.sh builds
+/// `controllers/<name>-<commit>`; the mission's gate names it through the
+/// `controllers/<name>` symlink). None for scenarios not in a controller.
+pub(crate) fn controller_commit(scenarios: &Path) -> Option<String> {
+    let physical = std::fs::canonicalize(scenarios).unwrap_or_else(|_| scenarios.to_path_buf());
+    let parts: Vec<&std::ffi::OsStr> = physical.iter().collect();
+    parts.windows(2).find_map(|pair| {
+        if pair[0] != "controllers" {
+            return None;
+        }
+        let name = pair[1].to_str()?;
+        let (_, commit) = name.rsplit_once('-')?;
+        (commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then(|| commit.to_ascii_lowercase())
+    })
+}
+
+/// The controller commit `scenarios` come from when the commit `landed`
+/// (the owner's latest landing, in the repository at `repository`: the
+/// mirror or the source itself) is newer than it: a descendant, not the
+/// commit itself. None when they are one commit, when the scenarios are in
+/// no controller, or when the controller's commit is not `landed`'s
+/// ancestor there (the controller has the landing, or is of another
+/// repository's commits: nothing to say).
+pub(crate) fn controller_behind(
+    repository: &Path,
+    scenarios: &Path,
+    landed: &str,
+) -> Option<String> {
+    let controller = controller_commit(scenarios)?;
+    if landed.eq_ignore_ascii_case(&controller) {
+        return None;
+    }
+    let repository = repository.to_string_lossy();
+    git(&[
+        "-C",
+        &repository,
+        "merge-base",
+        "--is-ancestor",
+        &controller,
+        landed,
+    ])
+    .is_ok()
+    .then_some(controller)
+}
+
 /// Why a task waits, for saying each wait once ([`Integrator::waiting`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Wait {
@@ -5358,6 +5458,10 @@ enum Wait {
     Gate,
     /// The CPU has no room for its gate.
     Cpu,
+    /// The owner's latest landing on its source is newer than the
+    /// controller its scenarios come from: its deploy has not switched the
+    /// controller yet (P22).
+    Controller,
 }
 
 /// Whether a wait was said this pass or before, for [`Integrator::backs_off`].
@@ -8269,6 +8373,62 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The controller's commit is read from its directory's name on the
+    /// scenarios' physical path (through the `controllers/<name>` symlink);
+    /// main is behind-checked against it: a descendant is ahead, the commit
+    /// itself, an ancestor or an unrelated commit is not, and scenarios in
+    /// no controller say nothing.
+    #[test]
+    fn a_main_ahead_of_its_controller_is_a_descendant_of_its_commit() {
+        let git = crate::sources::test_git;
+        let base =
+            std::env::temp_dir().join(format!("spawn-controller-commit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let repo_path = repo.to_string_lossy().to_string();
+        std::fs::create_dir_all(&repo).expect("repo");
+        git(&["init", "-q", "--initial-branch=main", &repo_path]).expect("init");
+        std::fs::write(repo.join("a"), "1\n").expect("write");
+        commit_in(&repo_path, "one");
+        let c1 = git(&["-C", &repo_path, "rev-parse", "HEAD"]).expect("c1");
+        std::fs::write(repo.join("a"), "2\n").expect("write");
+        commit_in(&repo_path, "two");
+        let c2 = git(&["-C", &repo_path, "rev-parse", "HEAD"]).expect("c2");
+        let controllers = base.join("controllers");
+        std::fs::create_dir_all(controllers.join(format!("spawn-{c1}/rsi/scenarios")))
+            .expect("controller");
+        std::os::unix::fs::symlink(format!("spawn-{c1}"), controllers.join("spawn")).expect("link");
+        let scenarios = controllers.join("spawn/rsi/scenarios");
+        assert_eq!(super::controller_commit(&scenarios), Some(c1.clone()));
+        assert_eq!(
+            super::controller_behind(&repo, &scenarios, &c2),
+            Some(c1.clone())
+        );
+        assert_eq!(
+            super::controller_behind(&repo, &scenarios, &c1),
+            None,
+            "one commit"
+        );
+        // The controller ahead of main (an ancestor main): not behind.
+        std::fs::create_dir_all(controllers.join(format!("spawn-{c2}/rsi/scenarios")))
+            .expect("controller two");
+        let ahead = controllers.join(format!("spawn-{c2}/rsi/scenarios"));
+        assert_eq!(super::controller_behind(&repo, &ahead, &c1), None);
+        // A commit this repository does not have: nothing to say.
+        let other = controllers.join(format!("spawn-{}/rsi/scenarios", "e".repeat(40)));
+        std::fs::create_dir_all(&other).expect("other");
+        assert_eq!(super::controller_behind(&repo, &other, &c2), None);
+        // Not a controller: no commit on the path, or not 40 hex digits.
+        let plain = base.join("scenarios");
+        std::fs::create_dir_all(&plain).expect("plain");
+        assert_eq!(super::controller_commit(&plain), None);
+        let short = controllers.join("spawn-abc1234/rsi/scenarios");
+        std::fs::create_dir_all(&short).expect("short");
+        assert_eq!(super::controller_commit(&short), None);
+        assert_eq!(super::controller_behind(&repo, &plain, &c2), None);
         let _ = std::fs::remove_dir_all(&base);
     }
 }
@@ -17198,5 +17358,190 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         ] {
             assert!(db.store.integrator_record(&bad).is_err(), "refused: {bad}");
         }
+    }
+
+    /// The 12:39 sequence (P22; task 259, 2026-11-11): an owner's landing
+    /// moves main while the mission's gate is the deployed controller's,
+    /// built from the main before it. A task judged then would judge the
+    /// new main with the old controller's scenarios: it waits, said once,
+    /// starting no gate, until the deploy switches the controller to the
+    /// landing; then it is judged on the new main by the new controller.
+    /// Its own landing then moves main past the controller with no deploy
+    /// to come, and holds the next task not at all.
+    #[test]
+    fn a_task_waits_for_the_controller_of_the_owners_landing() {
+        let marks = fresh_marks("spawn-controller-behind");
+        let release = Release(marks.clone());
+        let seen = marks.to_string_lossy().to_string();
+        let gate = format!(
+            "echo \"$4\" >>'{seen}/scenarios-given'\n{}",
+            holding_gate(&marks)
+        );
+        let (base, source, _, integrator) = world("controller-behind", &gate);
+        let db = Db::new("controller_behind");
+        let m0 = source_main(&source);
+        // deploy/controller.sh's layout: controllers/<name>-<commit>, and
+        // controllers/<name>, the symlink the mission's gate names.
+        let controllers = base.join("controllers");
+        let deploy = |commit: &str| {
+            std::fs::create_dir_all(controllers.join(format!("spawn-{commit}/rsi/scenarios")))
+                .expect("a controller");
+            let next = controllers.join("spawn.next");
+            let _ = std::fs::remove_file(&next);
+            std::os::unix::fs::symlink(format!("spawn-{commit}"), &next).expect("link");
+            std::fs::rename(&next, controllers.join("spawn")).expect("switch");
+        };
+        deploy(&m0);
+        let mission = db.gated_mission(&source, &controllers.join("spawn/rsi/scenarios"));
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        push_work(&base, &source, &agent, "work.txt");
+        let commit = owner_commit(&base, &source, "CONTRACT.md", "v1\n", "owner: the contract");
+        owner_request(&db, &source, &commit);
+
+        integrator.pass_on(&db.store).expect("the landing's pass");
+        assert_eq!(
+            source_main(&source),
+            commit,
+            "the owner's landing moved main"
+        );
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass before the deploy");
+        integrator.pass_on(&db.store).expect("another");
+        assert!(
+            integrator.running.borrow().is_empty() && started(&marks).is_empty(),
+            "no gate judges the new main with the old controller: {:?}",
+            started(&marks)
+        );
+        assert!(verdicts(&db, task).is_empty());
+        assert!(
+            integrator
+                .waiting
+                .borrow()
+                .contains(&(task, super::Wait::Controller)),
+            "the wait is said (once: the set holds it)"
+        );
+
+        deploy(&commit);
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass after the deploy");
+        let judged = wait_started(&marks, 1);
+        assert_eq!(judged.len(), 1, "{judged:?}");
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+        assert_eq!(verdicts(&db, task), vec!["accepted"]);
+        let given = std::fs::read_to_string(marks.join("scenarios-given")).expect("given");
+        assert!(
+            given
+                .trim_end()
+                .ends_with(&format!("controllers/spawn-{commit}/rsi/scenarios")),
+            "the new controller's scenarios: {given}"
+        );
+        // The task's landing moves main past the controller too, but needs
+        // no deploy: the next task is judged on it, not held.
+        assert_eq!(control_records(&db, "task.landed").len(), 1);
+        let landed = source_main(&source);
+        assert_ne!(landed, commit);
+        let next = db.reported_task(mission, "w2");
+        let next_agent = agent_of(&db, mission, next);
+        push_work(&base, &source, &next_agent, "next.txt");
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass after the landing");
+        integrator.settle();
+        assert_eq!(verdicts(&db, next), vec!["accepted"], "judged, not held");
+        assert!(
+            !integrator
+                .waiting
+                .borrow()
+                .contains(&(next, super::Wait::Controller))
+        );
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
+    }
+
+    /// P22, on the store: a gated mission's reported task waits while the
+    /// owner's latest landing on its source is newer than the controller
+    /// its gate is in. The loop's alert step fires `controller_behind` once
+    /// that has held at every reading for the bound, once, and clears it at
+    /// the first reading after the deploy switches the controller to the
+    /// landing. Main moved by anything but the owner (a task's landing)
+    /// fires nothing.
+    #[test]
+    fn the_controller_behind_alert_fires_once_and_clears_after_the_deploy() {
+        let (base, source, _, integrator) = world("controller-alert", "exit 0\n");
+        let db = Db::new("controller_alert");
+        let m0 = source_main(&source);
+        let controllers = base.join("controllers");
+        let deploy = |commit: &str| {
+            std::fs::create_dir_all(controllers.join(format!("spawn-{commit}/rsi/scenarios")))
+                .expect("a controller");
+            let next = controllers.join("spawn.next");
+            let _ = std::fs::remove_file(&next);
+            std::os::unix::fs::symlink(format!("spawn-{commit}"), &next).expect("link");
+            std::fs::rename(&next, controllers.join("spawn")).expect("switch");
+        };
+        deploy(&m0);
+        let mission = db.gated_mission(&source, &controllers.join("spawn/rsi/scenarios"));
+        db.reported_task(mission, "w");
+        let (mut settings, _) = crate::alerts::Settings::from_env();
+        settings.check_ms = 1;
+        settings.integrator_down_ms = 0;
+        settings.controller_behind_ms = 300;
+        settings.memory_low_mb = 0;
+        settings.tmpfs_high_mb = 0;
+        settings.test_log = None;
+        settings.live_log = None;
+        let mut monitor = crate::alerts::Monitor::with(settings);
+        let mut check = || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            monitor.check(&db.store).expect("a check");
+        };
+        let past_the_bound = || std::thread::sleep(std::time::Duration::from_millis(400));
+        let alerts = || -> Vec<Value> {
+            db.store
+                .alerts(0)
+                .expect("the alerts")
+                .as_array()
+                .expect("alerts")
+                .iter()
+                .filter(|row| row["kind"] == "controller_behind")
+                .cloned()
+                .collect()
+        };
+
+        // Main is the controller's commit, then past it by a push that is
+        // no owner's landing: nothing, however long.
+        check();
+        main_moves(&base, &source, "pushed.txt");
+        check();
+        past_the_bound();
+        check();
+        assert!(alerts().is_empty(), "{:?}", alerts());
+        let m1 = owner_commit(&base, &source, "CONTRACT.md", "v1\n", "owner: the contract");
+        owner_request(&db, &source, &m1);
+        integrator.pass_on(&db.store).expect("the landing's pass");
+        assert_eq!(source_main(&source), m1, "the owner's landing moved main");
+        check();
+        assert!(alerts().is_empty(), "not yet: the bound starts");
+        past_the_bound();
+        check();
+        check();
+        let fired = alerts();
+        assert_eq!(fired.len(), 1, "once: {fired:?}");
+        assert_eq!(fired[0]["state"], "open");
+        assert_eq!(fired[0]["subject"], format!("mission #{mission}"));
+        assert_eq!(fired[0]["evidence"]["controller"], m0.as_str());
+        assert_eq!(fired[0]["evidence"]["landed"], m1.as_str());
+
+        deploy(&m1);
+        check();
+        let cleared = alerts();
+        assert_eq!(cleared.len(), 1, "{cleared:?}");
+        assert_eq!(cleared[0]["state"], "cleared", "{cleared:?}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
