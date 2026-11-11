@@ -2898,7 +2898,7 @@ mod tests {
             assert!(board["missions"][0]["halt"].is_null());
             let mut client =
                 postgres::Client::connect(owner, postgres::NoTls).expect("the owner connects");
-            let records: Vec<Value> = client
+            let records: Vec<serde_json::Value> = client
                 .query(
                     "select kind -> 'detail' -> 'record' from spawn_events
                       where session_id = 'session_control'
