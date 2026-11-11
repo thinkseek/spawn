@@ -14749,7 +14749,12 @@ mod database_tests {
         let db = Db::new("owner_no_scenarios");
         let m0 = source_main(&source);
         db.gated_mission(&source, &scenarios);
-        let commit = owner_commit_files(&base, &source, &[("E.md", "e\n")], "owner: e");
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("E.md", "e\n")],
+            "owner: e",
+        );
         let request = gated_request(&db, &source, &commit, "e");
         integrator.pass_on(&db.store).expect("a pass");
         integrator.settle();
@@ -16028,7 +16033,12 @@ mod database_tests {
         let (base, source, scenarios, integrator) = world("gate-passed-reused", gate);
         let db = Db::new("gate_passed_reused");
         let mission = db.gated_mission(&source, &scenarios);
-        let commit = owner_commit_files(&base, &source, &[("E.md", "e\n")], "owner: e");
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("E.md", "e\n")],
+            "owner: e",
+        );
         gated_request(&db, &source, &commit, "e");
         integrator.pass_on(&db.store).expect("the owner's judging");
         integrator.settle();
