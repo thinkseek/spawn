@@ -2,8 +2,8 @@ import type { ReactNode } from "react";
 
 import type { DiskPlace, FleetHealth, LadderStep } from "../../fleet";
 import { absoluteTitle, clockTime, formatDuration } from "../../format";
-import type { GateRoom, Memory } from "../../resources";
-import { memoryBar, waitingGates } from "../../resources";
+import type { GateRoom, Memory, Storage } from "../../resources";
+import { memoryBar, storageView, waitingGates } from "../../resources";
 import { cx } from "../ui";
 
 export const LADDER: Array<{
@@ -189,6 +189,41 @@ function MemoryBar({ memory }: { memory: Memory | null }) {
   );
 }
 
+/** What uses the disk (`health.storage`): the archive, Claude Code's own
+ * transcripts, the workspaces and the database, one row each with its size
+ * and note, then how long the free space lasts at the archive's growth. */
+export function StorageCard({ storage }: { storage: Storage | null }) {
+  if (!storage) {
+    return <p className="text-caption text-faint-foreground">This server reports no storage.</p>;
+  }
+  const { rows, lasts } = storageView(storage);
+  const fell = (storage.projects?.before ?? 0) > (storage.projects?.files ?? Infinity);
+  return (
+    <div className="min-w-0 text-caption">
+      <ul className="space-y-0.5">
+        {rows.map((row, index) => (
+          <li key={row.name} className="flex min-w-0 items-baseline gap-2">
+            <span className="shrink-0 text-muted-foreground">{row.name}</span>
+            <span className="tnum shrink-0 font-medium text-foreground">{row.size}</span>
+            <span
+              className={cx("ml-auto min-w-0 truncate text-right", index === 1 && fell ? "text-warning" : "text-faint-foreground")}
+              title={row.note}
+            >
+              {row.note}
+            </span>
+          </li>
+        ))}
+      </ul>
+      <p
+        className="tnum mt-1.5 text-faint-foreground"
+        title={`Free on the workspace root: ${formatGib(storage.free_bytes)}; sizes read ${clockTime(storage.read_at_ms)}`}
+      >
+        {lasts ?? "How long the disk lasts: not measured yet"}
+      </p>
+    </div>
+  );
+}
+
 function ago(ms: number | null): string {
   return ms == null ? "—" : formatDuration(Math.max(0, Date.now() - ms));
 }
@@ -352,6 +387,10 @@ export function HealthStrip({
           <MemoryBar memory={health.memory} />
           <GateRoomList rows={health.gate_room} />
         </div>
+      </Cell>
+
+      <Cell label="Storage" className="sm:col-span-2">
+        <StorageCard storage={health.storage} />
       </Cell>
 
     </section>
