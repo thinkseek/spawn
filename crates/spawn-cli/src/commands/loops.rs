@@ -429,6 +429,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     // What only the transcript archive holds, counted beside the passes.
     cost::archive::start(root.as_deref(), &prices);
     let monitor = disk::Monitor::new(root.as_deref());
+    let sampler = crate::storage::Sampler::new(root.as_deref());
     let mut fleet = Fleet {
         flags,
         running: Some(runtime(flags)?),
@@ -440,6 +441,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         spawn: spawn_program(),
         workspace_root: root,
         disk: monitor,
+        storage: sampler,
         terminals: crate::config::terminal_host(),
         config,
         recovery: crate::recover::Recovery::new(),
@@ -480,6 +482,9 @@ struct Fleet<'a> {
     spawn: String,
     workspace_root: Option<std::path::PathBuf>,
     disk: disk::Monitor,
+    /// The `host.storage` samples: at the loop's start, then hourly
+    /// ([`crate::storage::Sampler`]).
+    storage: crate::storage::Sampler,
     /// The terminal host the recovery asks whether a native session's
     /// terminal server lives on (an end found with it gone is a host
     /// restart).
@@ -678,6 +683,12 @@ impl Fleet<'_> {
                 .check(open)
                 .unwrap_or_else(|error| vec![format!("disk: {error}")]),
         );
+        // The storage sample never fails a pass either: one that could not
+        // be written is tried again a minute later.
+        match self.storage.check(open, now) {
+            Ok(line) => lines.extend(line),
+            Err(error) => lines.push(error),
+        }
         // The recovery first of the rules that revive an agent: it records
         // every interruption once, with its cause and its evidence, and
         // takes the one way back that cause has. The dispatcher's

@@ -312,7 +312,7 @@ fn model_relay() -> Option<ModelRelay> {
 }
 
 /// Claude Code's transcript directory, which is where the Bridge reads it.
-fn claude_projects() -> String {
+pub(crate) fn claude_projects() -> String {
     resolve_claude_projects(env_value)
 }
 
