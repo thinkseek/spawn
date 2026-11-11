@@ -42,7 +42,9 @@
 //!    killed) and records itself discarded by the request (`task.gated`
 //!    `stale`, found `discarded`, the request and the owner's reason),
 //!    counted nowhere, and the request is applied or judged at the pass
-//!    that reaps it; an owner judging is never stopped. The integrator is
+//!    that reaps it; an owner judging is never stopped for one, only by
+//!    its own request's withdrawal (`spawn mission push --withdraw`,
+//!    [`owner::withdraw`]), which discards what it judged. The integrator is
 //!    never stopped for an owner's landing. A gated request (`spawn mission push
 //!    --gated`) is not applied here: it is an owner judging, a judging of its
 //!    source started ahead of the source's ready tasks (never in place of a
@@ -58,8 +60,9 @@
 //!    under the landing hold and `source.moved` names the `verdict`;
 //!    rejected: `source.push_refused` with the `verdict` and the `log`,
 //!    counted by no mission; no verdict (the host's fault, an abort, no
-//!    room): nothing recorded, judged again after the host-fault backoff
-//!    ([`owner::Judged`]);
+//!    room): nothing recorded, judged again after the host-fault backoff,
+//!    and refused when its gate ends with none for the reason the request's
+//!    judging before it recorded ([`owner::Judged`]);
 //! 1. a halt rule that fired stops the mission's landings until a human
 //!    resumes it: three gate rejections in a row (in an objective mission,
 //!    three of one objective's tasks yield that objective instead,
@@ -2185,7 +2188,9 @@ struct Running {
     /// The owner's request this judging judges (an owner judging,
     /// [`Integrator::start_owner`]); None for a task's.
     owner: Option<i64>,
-    /// Its stop, for an owner's urgent landing on its source ([`Stop`]).
+    /// Its stop: a task's, for an owner's urgent landing on its source
+    /// ([`Stop`]); an owner's, for its request's withdrawal
+    /// ([`Integrator::stop_withdrawn`]).
     stop: Arc<Stop>,
     /// Its halt, for a drain past its bound ([`gate::Halt`]).
     halt: Arc<gate::Halt>,
@@ -2806,6 +2811,7 @@ impl Integrator {
         // A hold past its bound ends by its record, before any mission's
         // step: nothing lands on its source until then.
         expire_holds(store)?;
+        self.stop_withdrawn(store);
         // Step 0: the owner's landings, applied before any mission's step
         // reads its source's main, so no baseline check sees a main the
         // owner moved without its record. A source whose request is still
@@ -2837,10 +2843,35 @@ impl Integrator {
         steps
     }
 
+    /// Stop the owner judgings in flight whose request its owner withdrew
+    /// (`spawn mission push --withdraw`, [`owner::withdraw`]), each once:
+    /// its gate is killed, as a task's is for an urgent landing, and its
+    /// thread finds the request ended and discards what it judged
+    /// ([`owner::Judged::Ended`]); the pass that reaps it goes on with its
+    /// source. One it could not ask about is asked again next pass: its
+    /// gate runs on, and its result is discarded all the same.
+    fn stop_withdrawn(&self, store: &PostgresStore) {
+        for gate in self.running.borrow().iter() {
+            let Some(request) = gate.owner else {
+                continue;
+            };
+            if !gate.handle.is_finished()
+                && owner::ended(store, request).ok().flatten().as_deref() == Some(owner::WITHDRAWN)
+                && gate.stop.stop(request, None)
+            {
+                println!(
+                    "integrate: the owner withdrew request {request} on {}: its owner judging is \
+                     stopped",
+                    gate.source
+                );
+            }
+        }
+    }
+
     /// Stop the task judgings in flight on the sources of `urgent` (the
     /// owner's urgent requests step 0 found waiting, D2), each once: its
     /// gate is killed, and it records itself discarded by the request
-    /// ([`Stop`]). An owner judging is never stopped.
+    /// ([`Stop`]). An owner judging is never stopped for one.
     fn stop_for(&self, urgent: &[owner::Request]) {
         for request in urgent {
             for gate in self.running.borrow().iter() {
@@ -3248,14 +3279,18 @@ impl Integrator {
         };
         let halt = Arc::new(gate::Halt::default());
         let thread_halt = Arc::clone(&halt);
+        // Its stop, for its owner's withdrawal ([`Self::stop_withdrawn`]).
+        let stop = Arc::new(Stop::default());
+        let thread_stop = Arc::clone(&stop.flag);
         let judging_id = judging.id().to_string();
         let handle = std::thread::Builder::new()
             .name(format!("owner-gate-{id}"))
             .spawn(move || {
                 gate::halt_with(thread_halt);
+                gate::stop_with(thread_stop);
                 judging.run(|| {
                     let judged = judge.judge_owner(&store, &mirror, &gated, &request, jobs);
-                    owner::judged(&said, id, &judged, &backoff, judge.host.backoff);
+                    owner::judged(&store, id, &said, judged, &backoff, judge.host.backoff);
                 });
             });
         let handle = match handle {
@@ -3281,7 +3316,7 @@ impl Integrator {
             shares_server,
             jobs: jobs.unwrap_or(0),
             owner: Some(id),
-            stop: Arc::new(Stop::default()),
+            stop,
             halt,
             judging: judging_id,
             handle,
@@ -14826,17 +14861,66 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// An owner judging that finds no verdict (the host's fault) records
-    /// nothing: the request stays pending, is not judged again before its
-    /// backoff, and is judged again after it.
-    #[test]
-    fn an_owner_judging_with_no_verdict_stays_pending_until_its_backoff() {
-        let gate = format!(
-            "echo \"$3\" >>\"$(dirname \"$0\")/started\"\n\
+    /// A gate that notes its run in `runs` beside it and ends with the
+    /// host's fault on check-tests.sh, the same at every run.
+    fn gate_with_one_host_fault() -> String {
+        format!(
+            "echo \"$3\" >>\"$(dirname \"$0\")/runs\"\n\
              printf '%s\\n' '{}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n",
             "{\"host_fault\":true,\"scenario\":\"check-tests.sh\",\"on\":\"base\",\"runs\":\"1, then 1 on the base\",\"reason\":\"r\"}"
-        );
-        let (base, source, scenarios, mut integrator) = world("owner-no-verdict", &gate);
+        )
+    }
+
+    /// How many owner judgings of `request` in a row found no verdict, as
+    /// its backoff counts them; None without a backoff.
+    fn faults_of(integrator: &Integrator, request: i64) -> Option<u32> {
+        let backoff = Arc::clone(&integrator.owner.borrow().backoff);
+        let kept = backoff.lock().expect("backoff");
+        kept.get(&request).map(|(faults, _)| *faults)
+    }
+
+    /// The `source.push_no_verdict` records of `request`, oldest first: each
+    /// (reason, kept log's path or empty).
+    fn no_verdict_records(db: &Db, request: i64) -> Vec<(String, String)> {
+        control_records(db, "source.push_no_verdict")
+            .iter()
+            .filter(|record| record["request"] == json!(request))
+            .map(|record| {
+                let text = |name: &str| record[name].as_str().unwrap_or_default().to_string();
+                (text("reason"), text("log"))
+            })
+            .collect()
+    }
+
+    /// The backoff of `request`'s owner judging is over now (its count
+    /// kept).
+    fn end_backoff(integrator: &Integrator, request: i64) {
+        let backoff = Arc::clone(&integrator.owner.borrow().backoff);
+        if let Some(kept) = backoff.lock().expect("backoff").get_mut(&request) {
+            kept.1 = std::time::Instant::now();
+        }
+    }
+
+    /// The refusal of a request that found no verdict twice for `why`.
+    fn twice(why: &str) -> String {
+        format!(
+            "no verdict twice for the same reason ({why}): classify it (candidate failure, test \
+             defect or infrastructure) before requesting again"
+        )
+    }
+
+    /// An owner judging that finds no verdict (the host's fault) records no
+    /// outcome: the request stays pending, is not judged again before its
+    /// backoff, and is judged again after it. No verdict again for another
+    /// reason (the fault on another scenario) is still no refusal: the
+    /// backoff grows.
+    #[test]
+    fn an_owner_judging_with_no_verdict_stays_pending_until_its_backoff() {
+        let gate = "echo \"$3\" >>\"$(dirname \"$0\")/runs\"\n\
+                    n=$(($(wc -l <\"$(dirname \"$0\")/runs\")))\n\
+                    printf '{\"host_fault\":true,\"scenario\":\"check-%s.sh\",\"on\":\"base\",\"runs\":\"1, then 1 on the base\",\"reason\":\"r\"}\\n' \"$n\" >\"$SPAWN_GATE_VERDICT\"\n\
+                    exit 6\n";
+        let (base, source, scenarios, mut integrator) = world("owner-no-verdict", gate);
         integrator.judge.host = super::HostSettings {
             server_log: None,
             backoff: std::time::Duration::from_mins(10),
@@ -14852,51 +14936,708 @@ mod database_tests {
             "owner: a",
         );
         let request = gated_request(&db, &source, &commit, "a");
-        let runs = || {
-            std::fs::read_to_string(base.join("started"))
-                .unwrap_or_default()
-                .lines()
-                .count()
-        };
         integrator.pass_on(&db.store).expect("a pass");
         integrator.settle();
-        assert_eq!(runs(), 1);
+        assert_eq!(gate_runs(&base), 1);
         assert_eq!(source_main(&source), m0);
         assert!(control_records(&db, "source.moved").is_empty());
         assert!(control_records(&db, "source.push_refused").is_empty());
-        let backoff = Arc::clone(&integrator.owner.borrow().backoff);
-        assert_eq!(
-            backoff
-                .lock()
-                .expect("backoff")
-                .get(&request)
-                .map(|(faults, _)| *faults),
-            Some(1)
-        );
+        assert_eq!(faults_of(&integrator, request), Some(1));
         integrator
             .pass_on(&db.store)
             .expect("a pass in its backoff");
         integrator.settle();
-        assert_eq!(runs(), 1, "not judged again inside its backoff");
-        backoff
-            .lock()
-            .expect("backoff")
-            .insert(request, (1, std::time::Instant::now()));
+        assert_eq!(gate_runs(&base), 1, "not judged again inside its backoff");
+        end_backoff(&integrator, request);
         integrator
             .pass_on(&db.store)
             .expect("a pass after its backoff");
         integrator.settle();
-        assert_eq!(runs(), 2, "judged again after it");
+        assert_eq!(gate_runs(&base), 2, "judged again after it");
         assert_eq!(
-            backoff
-                .lock()
-                .expect("backoff")
-                .get(&request)
-                .map(|(faults, _)| *faults),
+            faults_of(&integrator, request),
             Some(2),
             "the backoff grows"
         );
+        let found = no_verdict_records(&db, request);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].0.contains("check-1.sh"), "{found:?}");
+        assert!(found[1].0.contains("check-2.sh"), "{found:?}");
+        assert!(
+            control_records(&db, "source.push_refused").is_empty(),
+            "another reason is no refusal"
+        );
+        assert_eq!(source_main(&source), m0);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An owner judging that finds no verdict twice in a row for the same
+    /// reason (the same failure on the same scenario) is refused, not
+    /// judged a third time (request 131083, 2026-11-11: three judgings for
+    /// one deterministic fault, its source held behind it). The reason is
+    /// the one its `source.push_no_verdict` records carry, apart from the
+    /// kept log's path, which differs at every judging (P26). The refusal
+    /// names the reason and the second log, nothing moves, and the
+    /// source's next request is judged.
+    #[test]
+    fn an_owner_judging_with_no_verdict_twice_for_one_reason_is_refused() {
+        let (base, source, scenarios, mut integrator) =
+            world("owner-no-verdict-twice", &gate_with_one_host_fault());
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_mins(10),
+            cap: 3,
+        };
+        let db = Db::new("owner_no_verdict_twice");
+        let m0 = source_main(&source);
+        db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("A.md", "a\n")],
+            "owner: a",
+        );
+        let request = gated_request(&db, &source, &commit, "a");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        assert_eq!(gate_runs(&base), 1);
+        assert!(control_records(&db, "source.push_refused").is_empty());
+        assert_eq!(faults_of(&integrator, request), Some(1));
+        end_backoff(&integrator, request);
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass after its backoff");
+        integrator.settle();
+        assert_eq!(gate_runs(&base), 2, "judged a second time");
+        let found = no_verdict_records(&db, request);
+        assert_eq!(found.len(), 2, "one per judging: {found:?}");
+        let why = found[0].0.clone();
+        assert!(why.contains("check-tests.sh"), "{why}");
+        assert_eq!(found[1].0, why, "the same reason");
+        assert!(
+            !found[0].1.is_empty() && !found[1].1.is_empty() && found[0].1 != found[1].1,
+            "two kept logs, two paths: {found:?}"
+        );
+        let refused = control_records(&db, "source.push_refused");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["request"], json!(request));
+        assert_eq!(refused[0]["verdict"], "no_verdict");
+        assert_eq!(refused[0]["reason"], twice(&why));
+        assert_eq!(refused[0]["kept_log"], found[1].1.as_str());
+        assert_eq!(source_main(&source), m0, "nothing moves");
+        assert!(control_records(&db, "source.moved").is_empty());
+        assert_eq!(faults_of(&integrator, request), None, "no backoff left");
+        assert_eq!(
+            db.store.source_pushes_pending().expect("pending"),
+            json!([])
+        );
+        integrator.pass_on(&db.store).expect("the next pass");
+        integrator.settle();
+        assert_eq!(gate_runs(&base), 2, "never a third time");
+        let next = gated_request(&db, &source, &commit, "a, again");
+        integrator.pass_on(&db.store).expect("the next request");
+        integrator.settle();
+        assert_eq!(gate_runs(&base), 3, "the source's next request is judged");
+        assert_eq!(
+            faults_of(&integrator, next),
+            Some(1),
+            "counted from its own first: another request's records are not its"
+        );
+        assert_eq!(control_records(&db, "source.push_refused").len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The rule reads the store's records, not the integrator's memory: an
+    /// integrator that starts between the two judgings (a deploy) refuses
+    /// the request at its own first judging of it, the request's second.
+    #[test]
+    fn no_verdict_twice_for_one_reason_is_refused_across_an_integrator_restart() {
+        let (base, source, scenarios, mut first) =
+            world("owner-no-verdict-restart", &gate_with_one_host_fault());
+        let host = || super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_mins(10),
+            cap: 3,
+        };
+        first.judge.host = host();
+        let db = Db::new("owner_no_verdict_restart");
+        let m0 = source_main(&source);
+        db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("A.md", "a\n")],
+            "owner: a",
+        );
+        let request = gated_request(&db, &source, &commit, "a");
+        first.pass_on(&db.store).expect("a pass");
+        first.settle();
+        assert_eq!(gate_runs(&base), 1);
+        assert_eq!(faults_of(&first, request), Some(1));
+        let gate = first.judge.gate.clone();
+        drop(first);
+        let mut second = Integrator::new(
+            base.join("host"),
+            gate,
+            test_gate_env(),
+            room_to_spare(),
+            super::DEFAULT_GATES,
+        );
+        second.judge.host = host();
+        assert_eq!(faults_of(&second, request), None, "it remembers nothing");
+        second
+            .pass_on(&db.store)
+            .expect("the next integrator's pass");
+        second.settle();
+        assert_eq!(gate_runs(&base), 2, "judged a second time, at once");
+        let found = no_verdict_records(&db, request);
+        assert_eq!(found.len(), 2, "{found:?}");
+        let refused = control_records(&db, "source.push_refused");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["request"], json!(request));
+        assert_eq!(refused[0]["reason"], twice(&found[0].0));
+        assert_eq!(source_main(&source), m0);
+        second.pass_on(&db.store).expect("a pass after it");
+        second.settle();
+        assert_eq!(gate_runs(&base), 2, "never a third time");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// No room is ordinary waiting, not a fault to classify: an owner
+    /// judging that finds no room twice in a row stays pending and is
+    /// judged again after its backoff, as before, although each records
+    /// the same reason. Nor is it "the same reason" for a fault: the rule
+    /// compares a judging with the request's judging just before it, so a
+    /// fault, no room, then that fault again is judged once more, and the
+    /// fault twice in a row after it is refused.
+    #[test]
+    fn an_owner_judging_without_room_twice_stays_pending_and_is_judged_again() {
+        let gate = "echo ran >>\"$(dirname \"$0\")/runs\"\n\
+                    case $(($(wc -l <\"$(dirname \"$0\")/runs\"))) in\n\
+                    3|5|6) printf '%s\\n' '{\"host_fault\":true,\"scenario\":\"check-tests.sh\",\"on\":\"base\",\"runs\":\"1, then 1 on the base\",\"reason\":\"r\"}' >\"$SPAWN_GATE_VERDICT\"\n\
+                    exit 6;;\n\
+                    esac\n\
+                    printf '%s\\n' '{\"no_room\":true,\"free_kb\":2048,\"min_gb\":10,\"tmpdir\":\"/data/tmp\"}' >\"$SPAWN_GATE_VERDICT\"\n\
+                    exit 5\n";
+        let (base, source, scenarios, mut integrator) = world("owner-no-room-twice", gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_mins(10),
+            cap: 3,
+        };
+        let db = Db::new("owner_no_room_twice");
+        let m0 = source_main(&source);
+        db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("A.md", "a\n")],
+            "owner: a",
+        );
+        let request = gated_request(&db, &source, &commit, "a");
+        let judged_again = |runs: usize| {
+            end_backoff(&integrator, request);
+            integrator.pass_on(&db.store).expect("a pass");
+            integrator.settle();
+            assert_eq!(gate_runs(&base), runs, "judged again");
+        };
+        let pending = |faults: u32| {
+            assert!(
+                control_records(&db, "source.push_refused").is_empty(),
+                "not refused"
+            );
+            let pending = db.store.source_pushes_pending().expect("pending");
+            assert_eq!(pending[0]["request"], json!(request), "{pending}");
+            assert_eq!(faults_of(&integrator, request), Some(faults));
+        };
+        judged_again(1);
+        pending(1);
+        judged_again(2);
+        pending(2);
+        let found = no_verdict_records(&db, request);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].0.starts_with("no room to judge"), "{found:?}");
+        assert_eq!(found[0].0, found[1].0, "no room twice, the same reason");
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass in its backoff");
+        integrator.settle();
+        assert_eq!(gate_runs(&base), 2, "not judged inside its backoff");
+        judged_again(3); // the fault
+        pending(3);
+        judged_again(4); // no room
+        pending(4);
+        judged_again(5); // the fault again, after no room: once more
+        pending(5);
+        judged_again(6); // the fault twice in a row
+        let found = no_verdict_records(&db, request);
+        let refused = control_records(&db, "source.push_refused");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["reason"], twice(&found[5].0));
+        assert!(found[5].0.contains("check-tests.sh"), "{found:?}");
+        assert_eq!(source_main(&source), m0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A gate that could not start, a gate another integrator reaped and a
+    /// wait for room are no fault of the request, however often in a row:
+    /// none may be "the same reason twice". A reaped gate records nothing,
+    /// and the same text twice at a judging's end is only backed off: the
+    /// request stays pending.
+    #[test]
+    fn a_gate_that_never_started_or_was_reaped_twice_stays_pending() {
+        use crate::gate::{GateFailure, Shortfall};
+        let no_room = GateFailure::NoRoom {
+            short: Shortfall::Disk {
+                free_kb: 1,
+                min_gb: 10,
+                tmpdir: "/t".to_string(),
+            },
+            log: String::new(),
+        };
+        assert!(!super::owner::repeats(&no_room));
+        assert!(!super::owner::repeats(&GateFailure::Failed(
+            "x".to_string()
+        )));
+        assert!(!super::owner::repeats(&GateFailure::Reaped));
+        assert!(super::owner::repeats(&GateFailure::Timeout));
+        assert!(super::owner::repeats(&GateFailure::Aborted {
+            reason: "r".to_string(),
+            log: String::new(),
+        }));
+
+        let (base, source, scenarios, integrator) = world("owner-reaped", "exit 0\n");
+        let db = Db::new("owner_reaped");
+        db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("A.md", "a\n")],
+            "owner: a",
+        );
+        let request = gated_request(&db, &source, &commit, "a");
+        // Reaped, twice: what the judging's thread ends with.
+        let backoff = Arc::clone(&integrator.owner.borrow().backoff);
+        for _ in 0..2 {
+            super::owner::judged(
+                &db.store,
+                request,
+                "the request",
+                super::owner::Judged::NoVerdict(
+                    "the integrator that started the gate reaped it".to_string(),
+                ),
+                &backoff,
+                std::time::Duration::from_mins(10),
+            );
+        }
+        assert_eq!(faults_of(&integrator, request), Some(2), "backed off");
+        assert!(
+            no_verdict_records(&db, request).is_empty(),
+            "nothing recorded"
+        );
+        assert!(control_records(&db, "source.push_refused").is_empty());
+        let pending = db.store.source_pushes_pending().expect("pending");
+        assert_eq!(pending[0]["request"], json!(request), "still pending");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A request whose commit main already holds is not withdrawn: its
+    /// landing went out without its record (the integrator stopped between
+    /// the two), and a refusal would leave main holding a commit its request
+    /// calls refused. The withdrawal is an error, nothing is recorded, and
+    /// the next pass records the landing.
+    #[test]
+    fn a_request_main_already_holds_is_not_withdrawn() {
+        let (base, source, scenarios, integrator) = world("owner-withdraw-landed", "exit 0\n");
+        let db = Db::new("owner_withdraw_landed");
+        let m0 = source_main(&source);
+        db.gated_mission(&source, &scenarios);
+        let commit = owner_commit(&base, &source, "L.md", "l\n", "owner: l");
+        let request = plain_request(&db, &source, &commit);
+        // The landing's push, with no record of it.
+        git(&[
+            "--git-dir",
+            &source,
+            "update-ref",
+            "refs/heads/main",
+            &commit,
+            &m0,
+        ])
+        .expect("main moves");
+        let refused = super::owner::withdraw(&db.store, request).expect_err("main holds it");
+        assert_eq!(
+            refused,
+            format!(
+                "the owner landing request {request}: main holds it already: its landing is \
+                 recorded at the next pass; nothing is withdrawn"
+            )
+        );
+        assert!(control_records(&db, "source.push_refused").is_empty());
+        assert_eq!(
+            db.store.source_push_outcome(request).expect("outcome"),
+            None,
+            "still pending"
+        );
+        integrator.pass_on(&db.store).expect("the next pass");
+        let moved = control_records(&db, "source.moved");
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(moved[0]["request"], json!(request));
+        assert_eq!(moved[0]["to"], commit.as_str());
+        assert_eq!(source_main(&source), commit);
+        assert!(control_records(&db, "source.push_refused").is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A withdrawal and the two waits of a task do not touch each other
+    /// (gate v2 step 5b, P22). While the nightly is red on the source its
+    /// task is held and the owner's gated request is still judged; that
+    /// request withdrawn mid-judging has its gate stopped, lands nothing,
+    /// and leaves the task held as it was, never judged. It is no landing
+    /// of the owner's either (`source.moved` is, P22's fact), so no task
+    /// waits for a deploy because of it. A green nightly then releases the
+    /// task, which is judged and lands.
+    #[test]
+    fn a_withdrawn_owner_request_leaves_a_task_held_by_the_nightly_as_it_was() {
+        let marks = fresh_marks("spawn-withdrawn-nightly");
+        let release = Release(marks.clone());
+        let gate = gate_holding_then(&marks, "", "{\"verdict\":\"accepted\"}", 0);
+        let (base, source, scenarios, integrator) = world("withdrawn-nightly", &gate);
+        let db = Db::new("withdrawn_nightly");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        push_work(&base, &source, &agent, "work.txt");
+        let facts = integrator.judge.root.join("nightly");
+        std::fs::create_dir_all(&facts).expect("facts");
+        let m0 = source_main(&source);
+        let fact = |red_since: Option<&str>| {
+            let state = if red_since.is_some() { "red" } else { "green" };
+            std::fs::write(
+                facts.join("source.json"),
+                json!({"v": 1, "main": m0, "at": 1, "state": state, "failed": [],
+                       "last_green": null, "red_since": red_since})
+                .to_string(),
+            )
+            .expect("the fact");
+        };
+        fact(Some(&m0));
+        let held = |what: &str| {
+            assert!(
+                verdicts(&db, task).is_empty(),
+                "{what}: the task is not judged"
+            );
+            assert!(
+                integrator
+                    .waiting
+                    .borrow()
+                    .contains(&(task, super::Wait::NightlyRed)),
+                "{what}: held by the nightly's red"
+            );
+            assert!(
+                !integrator
+                    .waiting
+                    .borrow()
+                    .contains(&(task, super::Wait::Controller)),
+                "{what}: not waiting for a deploy"
+            );
+        };
+        let _ = std::fs::remove_file(marks.join("release"));
+        integrator.pass_on(&db.store).expect("a pass while red");
+        held("before the request");
+        assert!(started(&marks).is_empty());
+
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("A.md", "a\n")],
+            "owner: a",
+        );
+        let request = gated_request(&db, &source, &commit, "a");
+        integrator.pass_on(&db.store).expect("the owner's pass");
+        assert_eq!(wait_started(&marks, 1).len(), 1, "the owner's gate runs");
+        held("while the owner's gate runs");
+        super::owner::withdraw(&db.store, request).expect("withdrawn while judged");
+        // A gate that is not stopped is released after 300 s (a guard
+        // against a hang only): the test then fails on `release`.
+        let watchdog = marks.join("release");
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_mins(5));
+            let _ = std::fs::write(watchdog, "");
+        });
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass that stops it");
+        integrator.settle();
+        assert!(!marks.join("release").exists(), "never released");
+        integrator.pass_on(&db.store).expect("a pass after it");
+        integrator.pass_on(&db.store).expect("another");
+        held("after the withdrawal");
+        assert_eq!(started(&marks).len(), 1, "no gate but the owner's ran");
+        assert_eq!(source_main(&source), m0, "nothing moved");
+        assert!(control_records(&db, "source.moved").is_empty());
+        assert_eq!(
+            db.store.source_owner_landed(&source).expect("landed"),
+            None,
+            "a withdrawal is no landing of the owner's"
+        );
+        assert_withdrawn_only(&db, request);
+
+        fact(None);
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass after the green night");
+        integrator.settle();
+        assert_eq!(verdicts(&db, task), vec!["accepted"]);
+        integrator.pass_on(&db.store).expect("the landing's pass");
+        assert_eq!(control_records(&db, "task.landed").len(), 1);
+        assert_withdrawn_only(&db, request);
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
+    }
+
+    /// A request as `spawn mission push` records it, not gated.
+    fn plain_request(db: &Db, source: &str, commit: &str) -> i64 {
+        db.store
+            .source_push_request(
+                source,
+                commit,
+                &super::owner::owner_ref(commit),
+                &spawn_postgres::PushRequest::default(),
+            )
+            .expect("the owner's request")
+    }
+
+    /// The one refusal recorded is the withdrawal of `request`.
+    fn assert_withdrawn_only(db: &Db, request: i64) {
+        let refused = control_records(db, "source.push_refused");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["request"], json!(request));
+        assert_eq!(refused[0]["reason"], super::owner::WITHDRAWN);
+    }
+
+    /// `spawn mission push --withdraw` on a request that waits: it ends
+    /// refused, "withdrawn by the owner", as `spawn mission pushes` then
+    /// says, and no pass applies it, not even one that read it pending
+    /// before the withdrawal. A request that ended (withdrawn, or applied)
+    /// or that does not exist is an error, and nothing changes.
+    #[test]
+    fn a_waiting_owner_request_is_withdrawn_and_an_ended_one_is_not() {
+        let (base, source, scenarios, integrator) = world("owner-withdrawn", "exit 0\n");
+        let db = Db::new("owner_withdrawn");
+        let m0 = source_main(&source);
+        db.gated_mission(&source, &scenarios);
+        let commit = owner_commit(&base, &source, "W.md", "w\n", "owner: w");
+        let request = plain_request(&db, &source, &commit);
+        let outcome = super::owner::withdraw(&db.store, request).expect("withdrawn");
+        assert_eq!(outcome["type"], "source.push_refused", "{outcome}");
+        assert_eq!(outcome["request"], json!(request));
+        assert_eq!(outcome["reason"], "withdrawn by the owner");
+        // Step 0 read it pending, then it was withdrawn: not applied.
+        let read_before = super::owner::Request {
+            id: request,
+            source: source.clone(),
+            commit: commit.clone(),
+            gated: false,
+            urgent: false,
+            reason: None,
+        };
+        assert_eq!(
+            super::owner::apply(&db.store, &read_before).expect("applied"),
+            super::owner::Outcome::Refused("withdrawn by the owner".to_string())
+        );
+        assert_eq!(source_main(&source), m0, "nothing moves");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        assert_eq!(source_main(&source), m0, "nothing moves");
+        assert!(control_records(&db, "source.moved").is_empty());
+        assert_withdrawn_only(&db, request);
+        let listed = db.store.source_pushes(&source, None, 20).expect("pushes");
+        assert_eq!(listed[0]["request"], json!(request), "{listed}");
+        assert_eq!(listed[0]["state"], "refused", "{listed}");
+        assert_eq!(listed[0]["outcome"]["reason"], "withdrawn by the owner");
+
+        assert_eq!(
+            super::owner::withdraw(&db.store, request).expect_err("ended"),
+            format!(
+                "the owner landing request {request} ended already (refused: withdrawn by the \
+                 owner): nothing is withdrawn"
+            )
+        );
+        assert_eq!(
+            super::owner::withdraw(&db.store, request + 1000).expect_err("unknown"),
+            format!(
+                "no owner landing request {}: nothing is withdrawn",
+                request + 1000
+            )
+        );
+        let applied = plain_request(&db, &source, &commit);
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass that applies");
+        assert_eq!(source_main(&source), commit, "the next request lands");
+        assert_eq!(
+            super::owner::withdraw(&db.store, applied).expect_err("applied"),
+            format!(
+                "the owner landing request {applied} ended already (applied): nothing is withdrawn"
+            )
+        );
+        assert_eq!(source_main(&source), commit, "and stays landed");
+        assert_eq!(control_records(&db, "source.moved").len(), 1);
+        assert_withdrawn_only(&db, request);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A request withdrawn in the backoff of its owner judging is refused
+    /// and never judged again; the source's next request is judged at
+    /// once, not behind that backoff.
+    #[test]
+    fn an_owner_request_withdrawn_in_its_backoff_is_not_judged_again() {
+        let (base, source, scenarios, mut integrator) =
+            world("owner-withdrawn-backoff", &gate_with_one_host_fault());
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_mins(10),
+            cap: 3,
+        };
+        let db = Db::new("owner_withdrawn_backoff");
+        let m0 = source_main(&source);
+        db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("A.md", "a\n")],
+            "owner: a",
+        );
+        let request = gated_request(&db, &source, &commit, "a");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        assert_eq!(gate_runs(&base), 1);
+        assert_eq!(faults_of(&integrator, request), Some(1), "in its backoff");
+        super::owner::withdraw(&db.store, request).expect("withdrawn");
+        assert_withdrawn_only(&db, request);
+        end_backoff(&integrator, request);
+        integrator.pass_on(&db.store).expect("a pass after it");
+        integrator.settle();
+        assert_eq!(gate_runs(&base), 1, "not judged again");
+        assert_eq!(faults_of(&integrator, request), None, "its backoff is gone");
+        assert_eq!(source_main(&source), m0);
+
+        let next = gated_request(&db, &source, &commit, "a, again");
+        integrator.pass_on(&db.store).expect("the next request");
+        integrator.settle();
+        assert_eq!(gate_runs(&base), 2, "the source's next request is judged");
+        assert_eq!(faults_of(&integrator, next), Some(1));
+        assert_withdrawn_only(&db, request);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A request withdrawn while its owner judging runs never lands: the
+    /// gate, left to end `accepted` (no pass in between stops it), finds
+    /// the request ended under the landing hold and moves nothing. The
+    /// source's next request is judged and lands.
+    #[test]
+    fn a_withdrawn_owner_request_whose_gate_then_accepts_does_not_land() {
+        let marks = fresh_marks("spawn-owner-withdrawn-accepted");
+        let release = Release(marks.clone());
+        let gate = gate_holding_then(&marks, "", "{\"verdict\":\"accepted\"}", 0);
+        let (base, source, scenarios, integrator) = world("owner-withdrawn-accepted", &gate);
+        let db = Db::new("owner_withdrawn_accepted");
+        let m0 = source_main(&source);
+        db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("A.md", "a\n")],
+            "owner: a",
+        );
+        let request = gated_request(&db, &source, &commit, "a");
+        let _ = std::fs::remove_file(marks.join("release"));
+        integrator.pass_on(&db.store).expect("a pass");
+        assert_eq!(wait_started(&marks, 1).len(), 1, "its gate started");
+        super::owner::withdraw(&db.store, request).expect("withdrawn while judged");
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+        assert_eq!(source_main(&source), m0, "an accepted gate lands nothing");
+        assert!(control_records(&db, "source.moved").is_empty());
+        assert_withdrawn_only(&db, request);
+        assert_eq!(faults_of(&integrator, request), None);
+
+        let next = gated_request(&db, &source, &commit, "a, again");
+        integrator.pass_on(&db.store).expect("the next request");
+        integrator.settle();
+        let moved = control_records(&db, "source.moved");
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(moved[0]["request"], json!(next));
+        assert_eq!(source_main(&source), commit);
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
+    }
+
+    /// The pass after a withdrawal stops the owner judging in flight for
+    /// the request: its gate is killed, not waited for, its result is
+    /// discarded, and the source is free at the pass that reaps it.
+    #[test]
+    fn a_withdrawal_stops_the_owner_judging_in_flight() {
+        let marks = fresh_marks("spawn-owner-withdrawn-stopped");
+        let release = Release(marks.clone());
+        let gate = gate_holding_then(&marks, "", "{\"verdict\":\"accepted\"}", 0);
+        let (base, source, scenarios, integrator) = world("owner-withdrawn-stopped", &gate);
+        let db = Db::new("owner_withdrawn_stopped");
+        let m0 = source_main(&source);
+        db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("A.md", "a\n")],
+            "owner: a",
+        );
+        let request = gated_request(&db, &source, &commit, "a");
+        let _ = std::fs::remove_file(marks.join("release"));
+        integrator.pass_on(&db.store).expect("a pass");
+        assert_eq!(wait_started(&marks, 1).len(), 1, "its gate started");
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass while it is judged");
+        assert!(
+            integrator
+                .running
+                .borrow()
+                .iter()
+                .all(|gate| gate.stop.by().is_none()),
+            "a pending request's judging is not stopped"
+        );
+        super::owner::withdraw(&db.store, request).expect("withdrawn while judged");
+        // A gate that is not stopped is released after 300 s (a guard
+        // against a hang only): the test then fails on `release`.
+        let watchdog = marks.join("release");
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_mins(5));
+            let _ = std::fs::write(watchdog, "");
+        });
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass that stops it");
+        integrator.settle();
+        assert!(!marks.join("release").exists(), "never released");
+        assert_eq!(source_main(&source), m0, "nothing moves");
+        assert!(control_records(&db, "source.moved").is_empty());
+        assert_withdrawn_only(&db, request);
+        assert_eq!(faults_of(&integrator, request), None, "no backoff");
+
+        std::fs::write(marks.join("release"), "").expect("release");
+        let next = gated_request(&db, &source, &commit, "a, again");
+        integrator.pass_on(&db.store).expect("the next request");
+        integrator.settle();
+        let moved = control_records(&db, "source.moved");
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(moved[0]["request"], json!(next));
+        assert_eq!(started(&marks).len(), 2, "judged at once");
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
     }
 
     /// An urgent owner's request (`spawn mission push --urgent`,
