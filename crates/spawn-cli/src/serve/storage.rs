@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn the_figures_carry_the_growth_and_the_count_before_from_the_samples() {
         let root = scratch("figures");
-        let projects = root.join("projects-elsewhere");
+        let projects = scratch("figures_projects");
         file(&root.join(".transcripts/agent_a/a1.jsonl"), 3000);
         file(&root.join(".transcripts/agent_a/a2.jsonl"), 9000);
         file(&root.join(".transcripts-progress/agent_a/a1.json"), 10);
@@ -242,6 +242,7 @@ mod tests {
         file(&projects.join("-two/s2.jsonl"), 200);
         let walked = Walked::read(Some(&root), projects.clone());
         std::fs::remove_dir_all(&root).expect("clean up");
+        std::fs::remove_dir_all(&projects).expect("clean up");
         let now = 50 * DAY_MS;
         let samples = json!({
             "oldest": {"at_ms": now - 2 * DAY_MS, "archive_bytes": 2000, "projects_files": 40},
