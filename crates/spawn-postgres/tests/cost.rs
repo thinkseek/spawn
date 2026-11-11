@@ -248,20 +248,30 @@ fn an_archived_message_counts_once_for_the_task_its_agent_held() {
     let (mission, task, worker) = one_task(&store);
     let now = store.database_now_ms().expect("now");
     assert_eq!(
-        store
-            .cost_window(now - DAY_MS, now + 1000)
-            .expect("window")["counted_since_ms"],
+        store.cost_window(now - DAY_MS, now + 1000).expect("window")["counted_since_ms"],
         Value::Null,
         "nothing counted"
     );
     started(&store, &worker, 1);
-    usage(&store, &worker, 1, ("msg_live", "model-x", now), [100, 0, 0, 0]);
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_live", "model-x", now),
+        [100, 0, 0, 0],
+    );
     assert_eq!(store.cost_record(&prices(3.0)).expect("record"), 1);
 
     let messages = [
         // Eleven days ago, before the task and the execution: the agent's
         // first execution, the task held when it started.
-        archived(&worker.agent, "msg_old", "model-x", now - 11 * DAY_MS, 1_000_000),
+        archived(
+            &worker.agent,
+            "msg_old",
+            "model-x",
+            now - 11 * DAY_MS,
+            1_000_000,
+        ),
         archived(&worker.agent, "msg_new", "model-x", now + 1, 2_000_000),
         // Held already: it keeps what it holds.
         archived(&worker.agent, "msg_live", "model-x", now - DAY_MS, 9_999),
@@ -306,9 +316,7 @@ fn an_archived_message_counts_once_for_the_task_its_agent_held() {
     assert_eq!(execution["task"], task);
     assert_eq!(month["counted_since_ms"], now - 11 * DAY_MS);
     assert_eq!(
-        store
-            .cost_window(now - DAY_MS, now + 1000)
-            .expect("window")["counted_since_ms"],
+        store.cost_window(now - DAY_MS, now + 1000).expect("window")["counted_since_ms"],
         now - 11 * DAY_MS,
         "whatever the window"
     );
@@ -331,7 +339,12 @@ fn an_archived_message_counts_once_for_the_task_its_agent_held() {
         store.cost_archive_files(&worker.agent).expect("marks"),
         vec![file("a.jsonl", 3)]
     );
-    assert!(store.cost_archive_files("agent_other").expect("marks").is_empty());
+    assert!(
+        store
+            .cost_archive_files("agent_other")
+            .expect("marks")
+            .is_empty()
+    );
 
     let mut reader = common::as_login(&schema, "spawn_reader");
     let refused = reader
