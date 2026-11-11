@@ -1083,7 +1083,13 @@ fn gate_time_says_how_much_of_it_decided_nothing() {
     let mut story = Story::default();
     story.mission(1, true).mission(2, true);
     for task in 1..=8 {
-        story.assign(at(0), task, if task <= 6 { 1 } else { 2 }, None, "spawn-integrate");
+        story.assign(
+            at(0),
+            task,
+            if task <= 6 { 1 } else { 2 },
+            None,
+            "spawn-integrate",
+        );
     }
     story
         .gated(at(1), 1, "accepted", Some(600_000))
