@@ -746,6 +746,17 @@ pub(crate) struct Mission {
     pub(crate) halted: Option<String>,
     #[serde(default)]
     pub(crate) scenario_floor: u32,
+    /// The scenario file names (`*.sh`) the gate directory held at the
+    /// gating that set `scenario_floor` (the latest at the floor since the
+    /// mission's last resume), folded by the store from that `task.gated`'s
+    /// `scenario_names`; none before such a gating, or from a record without
+    /// them. A halt on the floor names the ones gone since ([`floor_gone`]).
+    #[serde(default)]
+    pub(crate) scenario_names: Option<Vec<String>>,
+    /// The gate directory's scenario file names as this pass read them, for
+    /// the gating's record (`scenario_names`): never the store's.
+    #[serde(skip)]
+    pub(crate) scenarios_now: Option<Vec<String>>,
     #[serde(default)]
     pub(crate) gate_rejections: u32,
     /// The objective every rejection of the current `gate_rejections` run
@@ -924,15 +935,34 @@ pub(crate) fn halt_reason(mission: &Mission, scenarios: u32) -> Option<String> {
     if mission.gate_aborts >= HALT_AFTER {
         return Some(format!("{} gate aborts in a row", mission.gate_aborts));
     }
-    // A candidate that deletes the scenario that judges it passes by removing
-    // the work, so the count may not fall.
-    if mission.scenario_floor > 0 && scenarios < mission.scenario_floor {
-        return Some(format!(
+    floor_reason(mission, scenarios)
+}
+
+/// The scenario floor's halt rule: a candidate that deletes the scenario
+/// that judges it passes by removing the work, so the count may not fall.
+fn floor_reason(mission: &Mission, scenarios: u32) -> Option<String> {
+    (mission.scenario_floor > 0 && scenarios < mission.scenario_floor).then(|| {
+        format!(
             "the scenarios fell from {} to {scenarios}",
             mission.scenario_floor
-        ));
-    }
-    None
+        )
+    })
+}
+
+/// The scenarios a halt on the floor names as gone: the file names the
+/// gating that set the floor saw (`scenario_names`) that `now` (the gate
+/// directory's at the halt) no longer holds, sorted. None when that gating
+/// named none (a record from before names were recorded).
+pub(crate) fn floor_gone(mission: &Mission, now: &[String]) -> Option<Vec<String>> {
+    let then = mission.scenario_names.as_ref()?;
+    let mut gone: Vec<String> = then
+        .iter()
+        .filter(|name| !now.contains(name))
+        .cloned()
+        .collect();
+    gone.sort();
+    gone.dedup();
+    Some(gone)
 }
 
 /// The wait after the `waits`-th `no_room` in a row: [`ROOM_BACKOFF`],
@@ -2925,6 +2955,9 @@ impl Integrator {
         let started_ms = gate::UnitRun::read(gate).map_or_else(now_ms, |run| run.started_ms);
         let mut gated = mission.clone();
         gated.gate = field("scenarios")?;
+        gated.scenarios_now = serde_json::from_value(described["scenario_names"].clone())
+            .ok()
+            .flatten();
         Ok(Some(Adoption {
             mission: gated,
             task: task.clone(),
@@ -3189,9 +3222,15 @@ impl Integrator {
             return Ok(false);
         }
         let scenarios = pinned(Path::new(&mission.gate));
-        let count = gate::count_scenarios(&scenarios)?;
+        let names = gate::scenario_names(&scenarios)?;
+        let count = u32::try_from(names.len()).unwrap_or(u32::MAX);
         if let Some(reason) = halt_reason(mission, count) {
-            return halt(store, mission, &reason).map(|()| false);
+            // A halt on the floor names the scenarios gone since the gating
+            // that set it, so a human tells a replacement from a deletion.
+            let gone = (floor_reason(mission, count).as_ref() == Some(&reason))
+                .then(|| floor_gone(mission, &names))
+                .flatten();
+            return halt_naming(store, mission, &reason, gone).map(|()| false);
         }
         let aborted = Self::enforce_budget(store, mission)?;
         let Some(source) = mission.source.as_deref() else {
@@ -3273,6 +3312,7 @@ impl Integrator {
             }
             let mut gated = mission.clone();
             gated.gate = scenarios.to_string_lossy().into_owned();
+            gated.scenarios_now = Some(names.clone());
             ready.push(Ready {
                 mission: mission.id,
                 source: source.to_string(),
@@ -3427,6 +3467,7 @@ impl Integrator {
                     "revision": task.revisions, "source": source, "base": main,
                     "count": count, "shares_server": shares_server, "jobs": jobs,
                     "gate": pinned(&self.judge.gate), "scenarios": gated.gate,
+                    "scenario_names": gated.scenarios_now,
                     "probe": probe}),
             self.judge.units,
         )
@@ -3801,7 +3842,8 @@ impl Judge {
             {
                 let mut discarded = json!({"type": "task.gated", "id": task.id,
                 "verdict": "stale", "found": "discarded", "revision": task.revisions,
-                "base": main, "scenarios": count, "request": request,
+                "base": main, "scenarios": count, "scenario_names": mission.scenarios_now,
+                "request": request,
                 "reason": format!(
                     "discarded by the owner's urgent landing (request {request}){}",
                     reason.map(|reason| format!(": {reason}")).unwrap_or_default()
@@ -3838,6 +3880,7 @@ impl Judge {
                 stale["id"] = json!(task.id);
                 stale["revision"] = json!(task.revisions);
                 stale["scenarios"] = json!(count);
+                stale["scenario_names"] = json!(mission.scenarios_now);
                 if let Some(log) = extra.get("log") {
                     stale["log"] = log.clone();
                 }
@@ -3874,7 +3917,8 @@ impl Judge {
             };
             let mut record_value = json!({"type": "task.gated", "id": task.id, "verdict": verdict,
                                           "revision": task.revisions, "base": main,
-                                          "scenarios": count});
+                                          "scenarios": count,
+                                          "scenario_names": mission.scenarios_now});
             if let (Some(target), Some(extra)) = (record_value.as_object_mut(), extra.as_object()) {
                 target.extend(extra.clone());
             }
@@ -5808,11 +5852,30 @@ fn bound(value: &Value) -> Value {
 }
 
 fn halt(store: &PostgresStore, mission: &Mission, reason: &str) -> Result<(), String> {
-    record(
-        store,
-        &json!({"type": "mission.halted", "id": mission.id, "reason": reason}),
-    )?;
-    println!("integrate: mission {} HALTED: {reason}", mission.id);
+    halt_naming(store, mission, reason, None)
+}
+
+/// [`halt`], naming the scenarios `gone` for a halt on the scenario floor
+/// ([`floor_gone`]): the record's `gone`, which the board shows.
+fn halt_naming(
+    store: &PostgresStore,
+    mission: &Mission,
+    reason: &str,
+    gone: Option<Vec<String>>,
+) -> Result<(), String> {
+    let mut halted = json!({"type": "mission.halted", "id": mission.id, "reason": reason});
+    if let Some(gone) = &gone {
+        halted["gone"] = json!(gone);
+    }
+    record(store, &halted)?;
+    match gone {
+        Some(gone) if !gone.is_empty() => println!(
+            "integrate: mission {} HALTED: {reason} (gone: {})",
+            mission.id,
+            gone.join(", ")
+        ),
+        _ => println!("integrate: mission {} HALTED: {reason}", mission.id),
+    }
     Ok(())
 }
 
