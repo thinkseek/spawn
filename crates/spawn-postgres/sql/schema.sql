@@ -4749,9 +4749,10 @@ select r.seq,
             else coalesce(jsonb_typeof(coalesce(r.record -> 'gate', r.record -> 'row' -> 'gate')), 'null')
                  <> 'null' end as gated,
        case when r.type = 'mission.added' then true
-            else coalesce(coalesce(r.record -> 'accept', r.record -> 'row' -> 'accept') ->> 0,
-                          coalesce(r.record ->> 'accept', r.record -> 'row' ->> 'accept'),
-                          'review') = 'review' end as review
+            else case when jsonb_typeof(coalesce(r.record -> 'accept', r.record -> 'row' -> 'accept'))
+                               = 'string'
+                      then coalesce(r.record -> 'accept', r.record -> 'row' -> 'accept') #>> '{}' = 'review'
+                      else true end end as review
 from spawn_experience_records r
 where r.type in ('mission.added', 'mission.configured')
    or (r.type = 'legacy.imported' and r.record ->> 'table' = 'mission_missions');
