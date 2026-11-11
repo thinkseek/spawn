@@ -83,7 +83,14 @@ pub(crate) struct GateRun {
     /// An owner judging's (`source.moved`, `source.push_refused`), not a
     /// task's gating.
     pub(crate) owner: bool,
+    /// Its verdict decided nothing ([`UNDECIDED`]): the gate's time on it
+    /// was spent for no verdict (objective 067).
+    pub(crate) undecided: bool,
 }
+
+/// The gate verdicts that decide nothing: the gate gave none (`aborted`,
+/// `no_room`, `host_fault`), or main moved while it ran (`stale`).
+pub(crate) const UNDECIDED: [&str; 4] = ["aborted", "no_room", "host_fault", "stale"];
 
 /// A transcript message's tokens, with the missions whose tasks' agents it
 /// belongs to (a task's, between its first delivery and its close).
@@ -345,6 +352,9 @@ impl Fold {
                         mission: int(&record.mission),
                         ms,
                         owner: true,
+                        // An owner judging is recorded only with a verdict
+                        // (accepted or rejected).
+                        undecided: false,
                     });
                 }
             }
@@ -518,6 +528,7 @@ impl Fold {
                 mission,
                 ms,
                 owner: false,
+                undecided: UNDECIDED.contains(&text(&record.verdict).unwrap_or_default()),
             });
         }
     }
