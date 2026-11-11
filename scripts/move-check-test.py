@@ -204,6 +204,13 @@ case("an import the source no longer needs, removed and flagged", 0,
 case("a run diffed as the previous item's } plus the item", 0,
      {SOURCE: SLIDE_BASE.replace(SLIDE_MIDDLE, ""), "src/big/middle.rs": SLIDE_MIDDLE_FILE}, "", SLIDE_BASE)
 
+case("an #[allow] on an added use passes, flagged", 0,
+     {SOURCE: moved_join(BASE, "#[allow(warnings)]\nuse join::join;\n"), "src/big/join.rs": JOIN_FILE},
+     "attribute other than #[cfg(test)] added: #[allow(warnings)]")
+case("a #[cfg] on a new file's use passes, flagged", 0,
+     {SOURCE: moved_join(BASE), "src/big/join.rs": JOIN_FILE.replace("//! Joining names.\n", "//! Joining names.\n\n#[cfg(any())]\nuse std::fmt;\n")},
+     "attribute other than #[cfg(test)] added: #[cfg(any())]")
+
 # Fails: what M1 asks to be shown.
 case("two moved lines swapped", 1,
      {SOURCE: moved_join(BASE), "src/big/join.rs": JOIN_FILE.replace(
