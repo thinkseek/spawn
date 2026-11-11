@@ -222,14 +222,30 @@ journalctl --user -u spawn-nightly@spawn -n 20
   ended (`deploy.finished`); a failure raises one `deploy_failed` alert,
   which the next successful deploy clears, and a failed main is tried again
   after `SPAWN_DEPLOY_RETRY_SECS` (1800) or at the next landing.
-  `SPAWN_DEPLOY_ON_LANDING=0` in `spawn.env` pauses it.
+  `SPAWN_DEPLOY_ON_LANDING=0` in `spawn.env` pauses it. The base cache's
+  warm-up that a deploy starts runs in a unit of its own
+  (`spawn-warm-base-<commit>-<pid>`, deploy/detach.sh): the tick's unit is
+  a oneshot, and a child left in its cgroup would be stopped with it.
+
+  `<live>/deploy-checkout` is a build input, like the owner's checkout:
+  deploy.sh exports its HEAD and links its `web/node_modules` into the
+  build. Agents run as the owner's uid, so they can write it, as they can
+  write the owner's checkout (the same-uid limit, docs/fleet-architecture.md
+  §10.2); the build runs in the sandbox (no network, `$HOME` hidden), and
+  the tick checks the tree out with `--force` at main before each deploy.
+
+  Its unit's environment is `spawn.env` and the unit's PATH, not the
+  owner's shell: start it once by hand, with `SPAWN_DEPLOY_ON_LANDING=0`
+  set in `spawn.env` (it then reads the store and says it is paused), and
+  read its journal before enabling the timer.
 
 ```sh
 SPAWN_BIN=target/debug/spawn bash deploy/test-on-landing.sh   # in a checkout; a throwaway database
 cp deploy/systemd/spawn-deploy-on-landing.service deploy/systemd/spawn-deploy-on-landing.timer ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now spawn-deploy-on-landing.timer
+systemctl --user start spawn-deploy-on-landing.service   # once by hand, paused (above); then:
 journalctl --user -u spawn-deploy-on-landing -n 20
+systemctl --user enable --now spawn-deploy-on-landing.timer
 ```
 
 To retire a source's nightly, stop its timers and remove its fact file
