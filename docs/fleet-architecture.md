@@ -2608,7 +2608,23 @@ are per-agent uids or a mount per engine.
   newest 32 kept, the older removed as each is written), and
   `source.push_no_verdict` {request, reason, log: that path or null,
   judging} is recorded, folded into no table and no outcome (the request
-  stays pending); the journal's no-verdict line names the path too.
+  stays pending); the journal's no-verdict line names the path too. It is
+  judged again once: a gate that ends with no verdict for the `reason` the
+  request's `source.push_no_verdict` just before it carries (the same
+  failure on the same scenario; the log's path, new at every judging, is
+  not part of it) is not a fault that passes, so the request is refused,
+  `source.push_refused` with `verdict` `no_verdict`, `kept_log` (that
+  judging's log) and the reason "no verdict twice for the same reason
+  (<reason>): classify it (candidate failure, test defect or
+  infrastructure) before requesting again", and its source goes on (on
+  2026-11-11 request 131083 was judged three times for one deterministic
+  fault, with nothing able to land behind it). The store's records decide,
+  so an integrator that restarted between the two judgings refuses all the
+  same. Another reason grows the backoff as before. Waiting for room and
+  a gate that could not start are no fault of the request: they back off
+  however often in a row and are never refused, and a judging that
+  recorded nothing (the room check before the gate, a gate another
+  integrator reaped) never counts.
   Every judging's gates, task or owner, whatever they end with, keep their
   files: when a gate's private directory in a judging's directory goes,
   its `stdout` (the per-scenario lines at its end), `stderr`, `verdict` and
@@ -2623,7 +2639,20 @@ are per-agent uids or a mount per engine.
   the `request` and the owner's reason, counted nowhere; the task is
   judged again on the new `main`, and the request is applied or judged at
   the pass that reaps the stopped judging. An owner judging is never
-  stopped. So the owner's landing is a record
+  stopped for one. `spawn mission push --withdraw <request>` (owner only)
+  withdraws a pending request, whether it waits, backs off or is being
+  judged: it records `source.push_refused` {`request`, `reason`:
+  "withdrawn by the owner"} under the landing lock and prints `{request,
+  state, outcome}`, so `spawn mission pushes` and a `--wait`ing push see a
+  refusal. A landing takes that lock and asks whether the request is still
+  pending before it moves `main`, so a withdrawn request never lands: an
+  owner judging in flight for it is stopped at the integrator's next pass
+  (its gate killed, as a task's is for an urgent request) and whatever it
+  judged, an acceptance too, is discarded. A request that ended already,
+  or that does not exist, is an error and records nothing; so is one
+  whose commit `main` already holds (its landing went out without its
+  record, which the next pass writes: a refusal would contradict `main`),
+  and so is `--withdraw` given with any other flag of a push. So the owner's landing is a record
   (the request, then the outcome that names it), and the integrator acts on
   that record, never on a `main` that changed under it ([design.md](design.md)
   §14). `spawn mission moved` still records a move the owner made behind

@@ -42,6 +42,7 @@ const USAGE: &str = "usage:
   spawn mission resume --id N
   spawn mission push --source <path> --commit <commit> [--repo <dir>] [--wait <seconds>]
                      [--gated] [--urgent] [--reason <text>]
+  spawn mission push --withdraw <request>
       (owner: land a commit on a mission source's main. <commit> is resolved in the git
        repository of the current directory (--repo: another), or is already in the source;
        it is put in the source at refs/spawn-owner/<hash>, no branch moves, and the request
@@ -54,11 +55,17 @@ const USAGE: &str = "usage:
        stopped for it. --gated: the source's gate judges the landing first, as a judging of
        its own taken before the source's next task, with the commit's own scenarios: moved
        when accepted, source.push_refused (with the gate's reason and log) when rejected,
-       pending again after a host fault or no room. --urgent: a judging of a task in flight
+       pending again after a host fault or no room, and refused when it ends with no
+       verdict twice in a row for the same reason (no room is never one). --urgent: a judging of a task in flight
        on the source is stopped and recorded as discarded by this request (stale, counted
        nowhere; the task is judged again on the new main), for a fix of a red main.
        --reason: the owner's words, on the record. --wait: wait that long for
-       the outcome and print it; exit 0 applied, 1 refused, 3 still pending)
+       the outcome and print it; exit 0 applied, 1 refused, 3 still pending.
+       --withdraw: the pending request <request> (waiting, backing off or being judged: its
+       gate is stopped and whatever it judged is discarded) ends refused, source.push_refused
+       with the reason \"withdrawn by the owner\", and nothing of it lands: prints {request,
+       state, outcome}. A request that ended already, or that does not exist, is an error
+       and records nothing; so is --withdraw with any other flag of a push)
   spawn mission pushes --source <path> [--commit <hash or prefix>] [--limit N]
       (the source's owner landing requests, newest first (default 20, at most 1000), pending
        and decided: each {request, source, commit, ref, at_ms, gated, urgent, reason, state,
@@ -630,7 +637,14 @@ fn pushes_limit(flags: &Flags) -> Result<i64, String> {
 /// `refs/spawn-owner/<hash>` and record the request the integrator applies
 /// (docs/fleet-architecture.md §10.3, "The owner's landings"). Exit 0, or,
 /// with `--wait`, 0 when applied, 1 when refused, 3 when still pending.
+/// `--withdraw <request>` withdraws a pending request instead
+/// ([`crate::integrate::owner::withdraw`]).
 fn push(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<i32, String> {
+    if let Some(request) = withdrawn(flags)? {
+        let outcome = crate::integrate::owner::withdraw(store, request)?;
+        print(&json!({ "request": request, "state": "refused", "outcome": outcome }));
+        return Ok(0);
+    }
     let source = text(flags, "source")?;
     crate::sources::MissionSource::parse(&source)?;
     if !source.starts_with('/') {
@@ -693,6 +707,34 @@ fn push(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<i32, Str
     answer["outcome"] = outcome.unwrap_or(Value::Null);
     print(&answer);
     Ok(code)
+}
+
+/// `spawn mission push --withdraw <request>`: the request to withdraw, or
+/// none for a push. It goes alone: with any flag of a push it is refused,
+/// so nobody believes a withdrawal also pushed, waited or gave a reason.
+fn withdrawn(flags: &Flags) -> Result<Option<i64>, String> {
+    if flags.get("withdraw").is_none() {
+        return Ok(None);
+    }
+    let mut others: Vec<String> = ["source", "commit", "repo", "wait", "reason"]
+        .into_iter()
+        .filter(|name| flags.get(name).is_some())
+        .chain(
+            ["gated", "urgent"]
+                .into_iter()
+                .filter(|name| flags.switch(name)),
+        )
+        .map(|name| format!("--{name}"))
+        .collect();
+    others.sort();
+    if !others.is_empty() {
+        return Err(format!(
+            "--withdraw <request> goes alone: it withdraws a pending request and takes no other \
+             flag of a push (given: {}); nothing is withdrawn",
+            others.join(", ")
+        ));
+    }
+    id(flags, "withdraw").map(Some)
 }
 
 /// Resolve `wanted` in the owner's repository `repo` (else in the source,
@@ -830,6 +872,7 @@ mod tests {
 
     use super::{
         change, hold_bound, model, objectives_row, pushes_commit, pushes_limit, split_mission,
+        withdrawn,
     };
     use crate::Flags;
 
@@ -984,6 +1027,45 @@ mod tests {
     fn flags(words: &[&str]) -> Flags {
         let words: Vec<String> = words.iter().map(ToString::to_string).collect();
         Flags::parse(&words).expect("valid flags")
+    }
+
+    /// `spawn mission push --withdraw` goes alone: with any other flag of a
+    /// push it is an error that names them, never a withdrawal that
+    /// ignored them.
+    #[test]
+    fn withdraw_takes_no_other_flag_of_a_push() {
+        let push = |words: &[&str]| {
+            let mut words: Vec<String> = words.iter().map(ToString::to_string).collect();
+            words.insert(0, "push".to_string());
+            withdrawn(&split_mission(&words).expect("flags").1)
+        };
+        assert_eq!(push(&["--source", "/s", "--commit", "abc"]), Ok(None));
+        assert_eq!(push(&["--withdraw", "42"]), Ok(Some(42)));
+        assert_eq!(
+            push(&["--withdraw", "x"]),
+            Err("--withdraw must be a number, not x".to_string())
+        );
+        for other in [
+            &["--source", "/s"][..],
+            &["--commit", "abc"],
+            &["--repo", "/r"],
+            &["--wait", "5"],
+            &["--reason", "why"],
+            &["--gated"],
+            &["--urgent"],
+        ] {
+            let refused = push(&[&["--withdraw", "42"], other].concat()).expect_err("refused");
+            assert!(
+                refused.starts_with("--withdraw <request> goes alone")
+                    && refused.contains(&format!("(given: {})", other[0])),
+                "{refused}"
+            );
+        }
+        assert!(
+            push(&["--urgent", "--withdraw", "42", "--wait", "5", "--gated"])
+                .expect_err("refused")
+                .contains("(given: --gated, --urgent, --wait)")
+        );
     }
 
     #[test]
