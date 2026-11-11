@@ -352,8 +352,8 @@ test("the supervisor's lines for the owner are read, not counted", () => {
   ];
   const view = normalizeAttention(raw);
   assert.deepEqual(view.supervisor?.for_owner, [
-    { text: "deploy ffc9fe7; it touches deploy/", at_ms: NOW - 60_000 },
-    { text: "approve resident `docs`", at_ms: null },
+    { text: "deploy ffc9fe7; it touches deploy/", at_ms: NOW - 60_000, tasks: [], settled: false },
+    { text: "approve resident `docs`", at_ms: null, tasks: [], settled: false },
   ]);
   assert.equal(attentionGroups(view).count, 6, "no more than without them");
 
@@ -371,6 +371,31 @@ test("the supervisor's lines for the owner are read, not counted", () => {
   // An older server sends none.
   delete raw.supervisor.for_owner;
   assert.deepEqual(normalizeAttention(raw).supervisor?.for_owner, []);
+});
+
+test("a line for the owner keeps the tasks it names and whether it is settled (objective 064)", () => {
+  const raw = answer() as { supervisor: { for_owner?: unknown } };
+  raw.supervisor.for_owner = [
+    {
+      text: "reports 2, 3 and 4 are still waiting for your review.",
+      at_ms: NOW,
+      tasks: [{ id: 2, state: "accepted" }, { id: 3 }, { state: "x" }, null],
+      settled: true,
+    },
+    { text: "task #5 waits for your review.", at_ms: NOW, tasks: "5", settled: "yes" },
+  ];
+  assert.deepEqual(normalizeAttention(raw).supervisor?.for_owner, [
+    {
+      text: "reports 2, 3 and 4 are still waiting for your review.",
+      at_ms: NOW,
+      tasks: [
+        { id: 2, state: "accepted" },
+        { id: 3, state: "unknown" },
+      ],
+      settled: true,
+    },
+    { text: "task #5 waits for your review.", at_ms: NOW, tasks: [], settled: false },
+  ]);
 });
 
 test("the supervisor asks in at most its HUMAN: line, else its reply's last paragraph", () => {

@@ -42,7 +42,9 @@
 //!       "asked_at_ms": 1793957000000 | null,  // the end of that turn
 //!       "human": null | {"text": "Should I ...?", "at_ms": ... | null}
 //!     },
-//!     "for_owner": [{"text": "deploy ffc9fe7", "at_ms": 1793957000000 | null}]
+//!     "for_owner": [{"text": "deploy ffc9fe7", "at_ms": 1793957000000 | null,
+//!                    "tasks": [{"id": 198, "state": "accepted"}],  // the tasks it names
+//!                    "settled": false}]   // a review ask whose tasks have all ended
 //!   },
 //!   "on_own_jobs": [{              // workers the rules hold as working on a
 //!     "session_id", "agent_id",    // background job of their own: not escalated
@@ -90,6 +92,25 @@
 //! not a queue: nothing waits on them, and an owner's message, an
 //! instruction rather than an answer, does not clear them. Without a
 //! transcript the list is empty and the judgement alone decides.
+//!
+//! Each line says what became of the tasks it names (objective 064: a line
+//! saying four reports waited for review stood for 30 h when all four had
+//! ended before it was written). `tasks` are the tasks the line names, in
+//! its order, each once, `{id, state}` with the task's state now (read for
+//! those tasks alone); a number that names no task is left out. A line
+//! names a task as `T<n>`, or as a number (bare or `#<n>`) right after the
+//! word task, tasks, report or reports, a list included ("reports 198, 204,
+//! 208 and 211": a comma, "and", or both, before each next number). A bare
+//! `#<n>` elsewhere names none ("mission #4", "issue #54"), nor does a
+//! range's end ("tasks 160 to 167" names 160). `settled` is true when the
+//! line's ask is to review, accept or merge the tasks (a word beginning
+//! "review", "accept" or "merg", and none beginning "deploy"), it names a
+//! task at least, and every task it names has ended (accepted, landed or
+//! cancelled); false otherwise. A line with any other ask (a deploy, an
+//! init-db, a decision) is never settled, whatever became of its tasks:
+//! hiding a live ask is the worse failure. Home's card leaves a settled
+//! line out (web/src/home.ts `latestNotes`); the supervisor's full list
+//! still shows it, marked settled.
 
 use std::collections::BTreeMap;
 
@@ -167,12 +188,12 @@ pub(super) fn attention() -> Result<Value, String> {
                 .map(|observation| question(facts, observation, &turn, said.as_ref()))
         })
         .unwrap_or(Value::Null);
-    let for_owner = said
-        .as_ref()
-        .map_or(&[][..], |said| said.for_owner.as_slice())
-        .iter()
-        .map(|(text, at_ms)| json!({ "text": text, "at_ms": at_ms }))
-        .collect();
+    let for_owner = owner_notes(
+        &store,
+        said.as_ref()
+            .map_or(&[][..], |said| said.for_owner.as_slice()),
+        &mut warnings,
+    );
     let holds = match store.source_holds() {
         Ok(holds) => waiting_holds(&holds),
         Err(error) => {
@@ -185,7 +206,7 @@ pub(super) fn attention() -> Result<Value, String> {
         &reading.plan,
         &told_at,
         &question,
-        &Value::Array(for_owner),
+        &for_owner,
         &warnings,
         super::now_ms(),
     );
@@ -478,6 +499,208 @@ fn transcript_tail(turn: &Value) -> Option<Vec<u8>> {
         .ok()?
 }
 
+/// Task states in which a task has ended: a review ask about it is settled.
+const ENDED: [&str; 3] = ["accepted", "landed", "cancelled"];
+
+/// Words a number right after names a task (any case): `task 5`, `reports
+/// 2, 3 and 4`.
+const TASK_WORDS: [&str; 4] = ["task", "tasks", "report", "reports"];
+
+/// The supervisor's lines for the owner as `/api/attention` lists them,
+/// `[{text, at_ms, tasks, settled}]` ([`owner_note`]), the named tasks'
+/// states read for those tasks alone. When they cannot be read, every line
+/// names no task and none is settled, and a warning says why.
+pub(super) fn owner_notes(
+    store: &spawn_postgres::PostgresStore,
+    notes: &[(String, Option<i64>)],
+    warnings: &mut Vec<String>,
+) -> Value {
+    let mut ids: Vec<i64> = notes
+        .iter()
+        .flat_map(|(text, _)| named_tasks(text))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let states = if ids.is_empty() {
+        BTreeMap::new()
+    } else {
+        match store.task_label_facts(&ids) {
+            Ok(facts) => task_states(&facts),
+            Err(error) => {
+                warnings.push(format!(
+                    "attention: the tasks the owner's lines name: {error}"
+                ));
+                BTreeMap::new()
+            }
+        }
+    };
+    Value::Array(
+        notes
+            .iter()
+            .map(|(text, at_ms)| owner_note(text, *at_ms, &states))
+            .collect(),
+    )
+}
+
+/// `{id: state}` of a board's tasks (`{missions: [{tasks: [{id, state}]}]}`).
+fn task_states(board: &Value) -> BTreeMap<i64, String> {
+    board["missions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|mission| mission["tasks"].as_array().into_iter().flatten())
+        .filter_map(|task| Some((task["id"].as_i64()?, task["state"].as_str()?.to_string())))
+        .collect()
+}
+
+/// One line for the owner, `{text, at_ms, tasks, settled}`: `tasks` the
+/// tasks it names ([`named_tasks`]) that `states` holds, `{id, state}` in
+/// the line's order; `settled` when its ask is a review of them
+/// ([`review_ask`]), it names one at least, and every one has ended
+/// ([`ENDED`]).
+fn owner_note(text: &str, at_ms: Option<i64>, states: &BTreeMap<i64, String>) -> Value {
+    let tasks: Vec<(i64, &str)> = named_tasks(text)
+        .into_iter()
+        .filter_map(|id| states.get(&id).map(|state| (id, state.as_str())))
+        .collect();
+    let settled = review_ask(text)
+        && !tasks.is_empty()
+        && tasks.iter().all(|(_, state)| ENDED.contains(state));
+    json!({
+        "text": text,
+        "at_ms": at_ms,
+        "tasks": tasks
+            .iter()
+            .map(|(id, state)| json!({"id": id, "state": state}))
+            .collect::<Vec<_>>(),
+        "settled": settled,
+    })
+}
+
+/// A piece of a line, as [`named_tasks`] and [`review_ask`] read it.
+#[derive(Debug, PartialEq)]
+enum Token {
+    /// Letters, then any letters or digits (`reports`, `T12`).
+    Word(String),
+    /// Digits, after a `#` or not (`5`, `#5`); one too long for an id is
+    /// [`Token::Other`].
+    Number(i64),
+    Comma,
+    /// Any other mark (`;`, `(`, `-`, `/`, a lone `#`).
+    Other,
+}
+
+fn tokens(line: &str) -> Vec<Token> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < chars.len() {
+        let c = chars[at];
+        let digit_at = |index: usize| chars.get(index).is_some_and(char::is_ascii_digit);
+        if c.is_whitespace() {
+            at += 1;
+        } else if c.is_alphabetic() {
+            let start = at;
+            while at < chars.len() && chars[at].is_alphanumeric() {
+                at += 1;
+            }
+            out.push(Token::Word(chars[start..at].iter().collect()));
+        } else if c.is_ascii_digit() || (c == '#' && digit_at(at + 1)) {
+            if c == '#' {
+                at += 1;
+            }
+            let start = at;
+            while digit_at(at) {
+                at += 1;
+            }
+            let digits: String = chars[start..at].iter().collect();
+            out.push(digits.parse().map_or(Token::Other, Token::Number));
+        } else {
+            out.push(if c == ',' { Token::Comma } else { Token::Other });
+            at += 1;
+        }
+    }
+    out
+}
+
+/// `T<n>`: a task by its short name.
+fn short_name(word: &str) -> Option<i64> {
+    let digits = word.strip_prefix('T')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The task ids a line names, in its order, each once: `T<n>`, and a
+/// number (bare or `#<n>`) right after the word task, tasks, report or
+/// reports, with the list it starts (`reports 198, 204, 208 and 211`: a
+/// comma, "and", or both, before each next number). A `#<n>` or number
+/// anywhere else names none (`mission #4`), nor does a range's end (`tasks
+/// 160 to 167` names 160).
+fn named_tasks(line: &str) -> Vec<i64> {
+    let tokens = tokens(line);
+    let mut ids: Vec<i64> = Vec::new();
+    let mut push = |id: i64| {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    };
+    let is_and = |token: Option<&Token>| matches!(token, Some(Token::Word(word)) if word.eq_ignore_ascii_case("and"));
+    let mut at = 0;
+    while at < tokens.len() {
+        let Token::Word(word) = &tokens[at] else {
+            at += 1;
+            continue;
+        };
+        at += 1;
+        if let Some(id) = short_name(word) {
+            push(id);
+            continue;
+        }
+        if !TASK_WORDS.contains(&word.to_lowercase().as_str()) {
+            continue;
+        }
+        let Some(Token::Number(first)) = tokens.get(at) else {
+            continue;
+        };
+        push(*first);
+        at += 1;
+        loop {
+            let mut next = at;
+            if tokens.get(next) == Some(&Token::Comma) {
+                next += 1;
+            }
+            if is_and(tokens.get(next)) {
+                next += 1;
+            }
+            match tokens.get(next) {
+                Some(Token::Number(id)) if next > at => {
+                    push(*id);
+                    at = next + 1;
+                }
+                _ => break,
+            }
+        }
+    }
+    ids
+}
+
+/// Whether a line asks the owner to review, accept or merge (a word that
+/// begins "review", "accept" or "merg") and asks no deploy (none begins
+/// "deploy"): the only ask the tasks' ending settles.
+fn review_ask(line: &str) -> bool {
+    let words: Vec<String> = tokens(line)
+        .into_iter()
+        .filter_map(|token| match token {
+            Token::Word(word) => Some(word.to_lowercase()),
+            _ => None,
+        })
+        .collect();
+    let begins = |prefix: &str| words.iter().any(|word| word.starts_with(prefix));
+    (begins("review") || begins("accept") || begins("merg")) && !begins("deploy")
+}
+
 /// What the end of a transcript says the model wrote last.
 #[derive(Debug, Default, PartialEq)]
 struct Said {
@@ -583,10 +806,14 @@ fn line_time(line: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FOR_OWNER_ITEMS, answer, asking, asks, for_owner, question, said, waiting_holds};
+    use super::{
+        FOR_OWNER_ITEMS, answer, asking, asks, for_owner, named_tasks, owner_note, question,
+        review_ask, said, task_states, waiting_holds,
+    };
     use crate::deliver::Work;
     use crate::dispatch::{Escalation, Facts, Why, decide_with};
     use serde_json::{Value, json};
+    use std::collections::BTreeMap;
 
     const NOW: i64 = 1_793_957_840_000;
 
@@ -1248,5 +1475,110 @@ mod tests {
         assert_eq!(listed[0]["waiting"], json!([12, 15]));
         assert_eq!(waiting_holds(&json!({"now_ms": 5, "holds": []})), json!([]));
         assert_eq!(waiting_holds(&json!({})), json!([]));
+    }
+
+    #[test]
+    fn a_line_names_its_tasks_in_each_form() {
+        assert_eq!(
+            named_tasks("task 2 landed; deploying it needs init-db"),
+            [2]
+        );
+        assert_eq!(named_tasks("task #5 waits for your review."), [5]);
+        assert_eq!(named_tasks("Task 7 and T12 are done"), [7, 12]);
+        assert_eq!(named_tasks("Report 9 is in"), [9]);
+        assert_eq!(named_tasks("T3, T4 ready"), [3, 4]);
+        assert_eq!(
+            named_tasks("tasks 160 to 167 land next"),
+            [160],
+            "a range names its first"
+        );
+        assert_eq!(named_tasks("tasks 160-167"), [160]);
+        assert_eq!(
+            named_tasks("mission #3 has no backlog yet."),
+            Vec::<i64>::new()
+        );
+        assert_eq!(named_tasks("see issue #54 and PR 12"), Vec::<i64>::new());
+        assert_eq!(named_tasks("deploy main (3 commits)"), Vec::<i64>::new());
+        assert_eq!(named_tasks("Tea12 and t12 name none"), Vec::<i64>::new());
+        assert_eq!(named_tasks("task 5 again, task #5"), [5], "each once");
+        assert_eq!(named_tasks("tasks"), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn a_list_after_reports_names_every_number_in_it() {
+        assert_eq!(named_tasks("reports 2, 3 and 4 wait"), [2, 3, 4]);
+        assert_eq!(named_tasks("tasks #2, #3, and #4"), [2, 3, 4]);
+        assert_eq!(named_tasks("tasks 8 and 9"), [8, 9]);
+        assert_eq!(
+            named_tasks("tasks 2, mission 3"),
+            [2],
+            "a comma before a word ends the list"
+        );
+        // The live line (2026-11-11 06:23Z): four reports, two missions.
+        assert_eq!(
+            named_tasks(
+                "reports 198, 204, 208 and 211 (missions 7/8) are still waiting for your ccd \
+                 review"
+            ),
+            [198, 204, 208, 211]
+        );
+    }
+
+    #[test]
+    fn only_a_review_accept_or_merge_ask_without_a_deploy_can_settle() {
+        assert!(review_ask("task #5 waits for your review."));
+        assert!(review_ask("Accept T4 when you can"));
+        assert!(review_ask("merging reports 2 and 3 is yours"));
+        assert!(!review_ask(
+            "task 2 landed; deploying it needs spawn init-db."
+        ));
+        assert!(!review_ask("review T4, then deploy main"));
+        assert!(!review_ask("decide whether task 3 should go on"));
+    }
+
+    #[test]
+    fn a_line_is_settled_only_when_its_review_ask_names_tasks_that_all_ended() {
+        let states = task_states(&json!({"missions": [
+            {"id": 1, "tasks": [{"id": 2, "state": "accepted"}, {"id": 3, "state": "landed"},
+                                {"id": 4, "state": "cancelled"}, {"id": 5, "state": "reported"}]},
+            {"id": 2, "tasks": [{"id": 198, "state": "accepted"}, {"id": 204, "state": "accepted"},
+                                {"id": 208, "state": "cancelled"}, {"id": 211, "state": "accepted"}]}
+        ]}));
+        let note = |text: &str| owner_note(text, Some(7), &states);
+        assert_eq!(
+            note("reports 2, 3 and 4 are still waiting for your review."),
+            json!({"text": "reports 2, 3 and 4 are still waiting for your review.", "at_ms": 7,
+                   "tasks": [{"id": 2, "state": "accepted"}, {"id": 3, "state": "landed"},
+                             {"id": 4, "state": "cancelled"}],
+                   "settled": true})
+        );
+        let live = note(
+            "reports 198, 204, 208 and 211 (missions 7/8) are still waiting for your ccd review",
+        );
+        assert_eq!(live["settled"], json!(true), "{live}");
+        assert_eq!(live["tasks"].as_array().map(Vec::len), Some(4));
+        // A number naming no task is left out; one task still open keeps it.
+        let open = note("reports 2, 99 and 5 wait for your review");
+        assert_eq!(
+            open["tasks"],
+            json!([{"id": 2, "state": "accepted"}, {"id": 5, "state": "reported"}])
+        );
+        assert_eq!(open["settled"], json!(false));
+        // Another ask stands, whatever became of its tasks.
+        let init = note("task 2 landed; deploying it needs spawn init-db.");
+        assert_eq!(init["tasks"], json!([{"id": 2, "state": "accepted"}]));
+        assert_eq!(init["settled"], json!(false));
+        // No task named, or none known: never settled.
+        assert_eq!(note("mission #3 has no backlog yet.")["tasks"], json!([]));
+        assert_eq!(
+            note("mission #3 has no backlog yet.")["settled"],
+            json!(false)
+        );
+        let unknown = note("task 99 waits for your review");
+        assert_eq!(unknown["tasks"], json!([]));
+        assert_eq!(unknown["settled"], json!(false));
+        let unread = owner_note("review task 2", None, &BTreeMap::new());
+        assert_eq!(unread["at_ms"], Value::Null);
+        assert_eq!(unread["settled"], json!(false));
     }
 }
