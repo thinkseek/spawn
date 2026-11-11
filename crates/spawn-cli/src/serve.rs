@@ -2819,7 +2819,11 @@ mod tests {
             (r#"{"halt":61,"key":""}"#, "an empty key"),
             (r#"{"probe":true,"halt":61}"#, "a probe with a halt"),
         ] {
-            refused(&post(Some("secret"), "", None, RESUME, SCRIPT, bad), 400, why);
+            refused(
+                &post(Some("secret"), "", None, RESUME, SCRIPT, bad),
+                400,
+                why,
+            );
         }
         for path in ["/api/mission/six/resume", "/api/mission/-1/resume"] {
             refused(
@@ -2840,7 +2844,14 @@ mod tests {
             assert_eq!(reached.body["error"], "SPAWN_DATABASE_URL is not set");
         }
         let header_key = format!("{SCRIPT}Idempotency-Key: k-1\r\n");
-        let reached = post(Some("secret"), "", None, RESUME, &header_key, r#"{"halt":61}"#);
+        let reached = post(
+            Some("secret"),
+            "",
+            None,
+            RESUME,
+            &header_key,
+            r#"{"halt":61}"#,
+        );
         assert_eq!(reached.status, 500, "the key in its header: {reached:?}");
     }
 
