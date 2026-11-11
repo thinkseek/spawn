@@ -165,8 +165,9 @@ pub(crate) fn answer(counts: &Value, name: &str, window: Window) -> Value {
 }
 
 /// One mission's span in the window, its idle hours (the span less the
-/// union of its tasks' open intervals) and whether it sat idle more than
-/// half of it.
+/// union of its tasks' open intervals), whether it is owner work (no
+/// objective backlog) and whether it sat idle more than half of it, which an
+/// owner-work mission never is.
 fn idle(mission: &Value, window: Window) -> Value {
     let opened = count(&mission["opened_at_ms"]);
     let span = Window {
@@ -188,12 +189,16 @@ fn idle(mission: &Value, window: Window) -> Value {
         0
     };
     let idle_ms = span_ms - busy_ms;
+    // A mission with no objective backlog takes its work from the owner: an
+    // hour without a task there is no loss, so it is never flagged idle.
+    let owner_work = mission["owner_work"].as_bool().unwrap_or(false);
     json!({
         "mission": mission["mission"],
         "text": mission["text"],
         "hours": milli(span_ms, HOUR_MS),
         "idle_hours": milli(idle_ms, HOUR_MS),
-        "idle": idle_ms * 2 > span_ms,
+        "idle": !owner_work && idle_ms * 2 > span_ms,
+        "owner_work": owner_work,
     })
 }
 
