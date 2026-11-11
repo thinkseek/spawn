@@ -432,7 +432,7 @@ check "says so" grep -qF "no gate-accepted landing of $head on $missions in the 
 check "before any backup" [ "$(ls "$live/backups" | wc -l)" -eq "$backups" ]
 check "before touching a service" [ ! -s "$SYSTEMCTL_LOG" ]
 check "the reason is on the record" \
-  bash -c 'finished | tail -n 1 | grep -qF "false landing $1 no gate-accepted landing of $1"' _ "$head"
+  grep -qF "false landing $head no gate-accepted landing of $head" <<<"$(finished | tail -n 1)"
 # A task of the mission on the missions repo, accepted by its gate and landed
 # at HEAD: the integrator's records.
 mission=$(with_db "$live_url" psql -XAtq -c "select id from mission_missions where sources ->> 0 = '$missions' order by id limit 1")

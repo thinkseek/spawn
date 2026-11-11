@@ -23,6 +23,7 @@ main, changes nothing live until that commit is gated and deployed.
 | `spawn-backup-verify` (`.timer`) | `spawn backup verify`: the daily restore drill — the newest dump restored into a scratch database of its own on `SPAWN_BACKUP_DRILL_DATABASE_URL` and compared with its record (never the live database), and the newest bundle fetched, unpacked and compared with its own | oneshot, daily at 05:00 + up to 1 h |
 | `spawn-nightly@<source>` (`.timer`) | `scripts/rsi/nightly.sh <source>` from the controller: the scenarios in `rsi/scenarios/nightly/` (moved out of the gate), each judged by the gate on live `main` against itself, alone on a held host; the fact file `$SPAWN_WORKSPACE_ROOT/nightly/<source>.json` (green, red, flaky or skipped) and one `nightly_red` alert per red (below) | oneshot, daily at 02:30 + up to 10 min |
 | `spawn-nightly-stale@<source>` (`.timer`) | `scripts/rsi/nightly.sh --stale <source>`: whether the nightly covers anything (two skipped runs in a row, no fact younger than 26 h, or none though its timer fired: one `nightly_stale` alert); no run, no gate | oneshot, hourly |
+| `spawn-deploy-on-landing` (`.timer`) | `deploy/on-landing.sh` from the controller (#54): deploys what the fleet landed on the Spawn source, `deploy.sh --main` from its own checkout of main, once the store holds a gate-accepted landing of it, after a quiet spell (at the latest a max wait), never while the source is held, a deploy is pending or running, or the nightly is red (below) | oneshot, a minute after the last tick |
 | `spawn-maintenance` (`.timer`) | `scripts/maintenance.sh` from the controller: the gate's leftover scratch (`$TMPDIR/spawn-gate.XXXXXX` whose gate is gone, by the pid, start time and boot the gate recorded in it; never a running gate's, whatever its age), deploy.sh's dumps in the backups directory beyond the newest 5; nothing Spawn did not create ([docs/storage.md](../../docs/storage.md#disk-room)) | oneshot, hourly |
 
 `spawn-loop` uses `KillMode=process` so a restart keeps the agents' tmux
@@ -194,6 +195,41 @@ systemctl --user enable --now spawn-nightly@spawn.timer spawn-nightly-stale@spaw
 systemctl --user start spawn-nightly@spawn.service   # one run now, optional (after a fix: clears a red)
 jq . ~/.local/share/spawn-rsi/ws/nightly/spawn.json
 journalctl --user -u spawn-nightly@spawn -n 20
+```
+
+- `spawn-deploy-on-landing.timer` (#54), installed by hand. A landing the
+  integrator makes on the Spawn source (`<live>/missions/spawn.git`, whose
+  main is the live system) is deployed without a hand step. Only that
+  source: a landing on any other (Supply PA's) deploys nothing. Each tick
+  (deploy/on-landing.sh, which says why it waits, once per change) deploys
+  the missions main when the store holds a gate-accepted landing of exactly
+  that commit (`spawn mission landing`: a task.landed of a task of a
+  mission on the source, or an owner's gated source.moved; never a file)
+  and no landing came for `SPAWN_DEPLOY_QUIET_SECS` (300), or
+  `SPAWN_DEPLOY_MAX_WAIT_SECS` (1800) after the first landing not live yet.
+  It waits while the source is held (an owner gate, or another deploy),
+  while `deploy.pending` exists, while another deploy holds the lock, and
+  while the nightly is red (`red_since` in the fact: a red main is a known
+  regression; deployed at the first tick after a green night, or by
+  hand). It holds the source while it deploys, so no landing moves main
+  under the build (reason `deploy-on-landing <main>`, at most
+  `SPAWN_DEPLOY_HOLD_SECS`, 3600); a tick or deploy killed outright leaves
+  that hold, and the next tick releases it. It deploys with main's own
+  `deploy/deploy.sh --main` from `<live>/deploy-checkout` (a clone it makes;
+  the UI's dependencies installed with pnpm when the lockfile changed), as
+  the owner deploys: the drain, the integrator's restart and the gates that
+  outlive it are deploy.sh's. Every deploy, the owner's too, records how it
+  ended (`deploy.finished`); a failure raises one `deploy_failed` alert,
+  which the next successful deploy clears, and a failed main is tried again
+  after `SPAWN_DEPLOY_RETRY_SECS` (1800) or at the next landing.
+  `SPAWN_DEPLOY_ON_LANDING=0` in `spawn.env` pauses it.
+
+```sh
+SPAWN_BIN=target/debug/spawn bash deploy/test-on-landing.sh   # in a checkout; a throwaway database
+cp deploy/systemd/spawn-deploy-on-landing.service deploy/systemd/spawn-deploy-on-landing.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now spawn-deploy-on-landing.timer
+journalctl --user -u spawn-deploy-on-landing -n 20
 ```
 
 To retire a source's nightly, stop its timers and remove its fact file
