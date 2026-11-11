@@ -1720,6 +1720,11 @@ impl Bridge {
             return Ok(());
         };
         let mut read = 0_usize;
+        // One checkpoint per read: the workspace does not change while the
+        // lines are read, so a later turn end in the same read finds the
+        // one taken for the first, and a transcript read again from the
+        // start commits once, not at each of its old turns (rev-g on S15).
+        let mut checkpointed = false;
         for line in bytes[..end].split(|byte| *byte == b'\n') {
             let start = read;
             read += line.len() + 1;
@@ -1744,18 +1749,19 @@ impl Bridge {
                 // would not be reading it: see [`Follow::settling`].
                 active.follow.settling = Some(self.clock.now().0);
             }
-            if ends_turn
-                && !self.checkpoint(
+            if ends_turn && !checkpointed {
+                if !self.checkpoint(
                     agent_id,
                     session,
                     active,
                     CheckpointReason::TurnStopped,
                     report,
-                )?
-            {
-                active.follow.advance(&bytes[..start]);
-                // The commit stays due: the line is read again next pass.
-                return Ok(());
+                )? {
+                    active.follow.advance(&bytes[..start]);
+                    // The commit stays due: the line is read again next pass.
+                    return Ok(());
+                }
+                checkpointed = true;
             }
             if active.follow.version.is_none()
                 && let Some(version) = claude_version(&line)
