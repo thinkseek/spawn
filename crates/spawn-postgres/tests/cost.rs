@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use spawn_core::event::{ENGINE, EventKind, ModelProfile, NewEvent, Source};
 use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, WorkspaceId};
 use spawn_core::port::EventLog;
-use spawn_postgres::PostgresStore;
+use spawn_postgres::{ArchiveCounted, ArchiveFile, ArchivedMessage, PostgresStore};
 
 mod common;
 use common::store;
@@ -222,4 +222,126 @@ fn a_daily_budget_is_an_amount_above_zero_read_with_the_days_spend() {
     // Before the day: nothing spent.
     let earlier = store.cost_budgets(now - 2000, now - 1000).expect("budgets");
     near(&earlier[0]["spent_usd"], 0.0, "no spend before the message");
+}
+
+fn archived(agent: &str, id: &str, model: &str, at_ms: i64, input: i64) -> ArchivedMessage {
+    ArchivedMessage {
+        agent_id: agent.to_string(),
+        message_id: id.to_string(),
+        model: model.to_string(),
+        at_ms,
+        input,
+        output: 0,
+        cache_write: 0,
+        cache_read: 0,
+    }
+}
+
+/// Objective 048: an archived message counts for its agent's execution and
+/// task at its time (one timed before the task, the task held when the
+/// execution started), once; one the record holds keeps what it holds; one
+/// of an agent with no execution is not counted. The answer says since when
+/// the record counts. The reader may not record.
+#[test]
+fn an_archived_message_counts_once_for_the_task_its_agent_held() {
+    let (store, schema) = store("cost_archive");
+    let (mission, task, worker) = one_task(&store);
+    let now = store.database_now_ms().expect("now");
+    assert_eq!(
+        store
+            .cost_window(now - DAY_MS, now + 1000)
+            .expect("window")["counted_since_ms"],
+        Value::Null,
+        "nothing counted"
+    );
+    started(&store, &worker, 1);
+    usage(&store, &worker, 1, ("msg_live", "model-x", now), [100, 0, 0, 0]);
+    assert_eq!(store.cost_record(&prices(3.0)).expect("record"), 1);
+
+    let messages = [
+        // Eleven days ago, before the task and the execution: the agent's
+        // first execution, the task held when it started.
+        archived(&worker.agent, "msg_old", "model-x", now - 11 * DAY_MS, 1_000_000),
+        archived(&worker.agent, "msg_new", "model-x", now + 1, 2_000_000),
+        // Held already: it keeps what it holds.
+        archived(&worker.agent, "msg_live", "model-x", now - DAY_MS, 9_999),
+        archived("agent_nobody_9", "msg_stray", "model-x", now, 5),
+    ];
+    let counted = store
+        .cost_archive_record(&prices(3.0), &messages)
+        .expect("archive");
+    assert_eq!(
+        counted,
+        ArchiveCounted {
+            counted: 2,
+            unplaced: 1
+        }
+    );
+    assert_eq!(
+        store
+            .cost_archive_record(&prices(6.0), &messages)
+            .expect("again"),
+        ArchiveCounted {
+            counted: 0,
+            unplaced: 1
+        },
+        "again adds nothing"
+    );
+
+    let month = store
+        .cost_window(now - 30 * DAY_MS, now + 1000)
+        .expect("window");
+    near(&month["total"]["usd"], 9.0003, "$3 + $6 + the live $0.0003");
+    near(
+        &entry(&month, "tasks", "task", &json!(task))["usd"],
+        9.0003,
+        "every message the task's",
+    );
+    near(
+        &entry(&month, "missions", "mission", &json!(mission))["usd"],
+        9.0003,
+        "and its mission's",
+    );
+    let execution = entry(&month, "executions", "execution", &json!("exec_1"));
+    assert_eq!(execution["task"], task);
+    assert_eq!(month["counted_since_ms"], now - 11 * DAY_MS);
+    assert_eq!(
+        store
+            .cost_window(now - DAY_MS, now + 1000)
+            .expect("window")["counted_since_ms"],
+        now - 11 * DAY_MS,
+        "whatever the window"
+    );
+    let live = entry(&month, "agents", "agent", &json!(worker.agent));
+    assert_eq!(live["tokens"]["input"], 3_000_100, "msg_live as it was");
+
+    // The marks of an agent's files, replaced whole.
+    let file = |name: &str, length: i64| ArchiveFile {
+        file: name.to_string(),
+        length,
+        modified_ms: 7,
+    };
+    store
+        .cost_archive_mark(&worker.agent, &[file("a.jsonl", 1), file("a.1.jsonl", 2)])
+        .expect("mark");
+    store
+        .cost_archive_mark(&worker.agent, &[file("a.jsonl", 3)])
+        .expect("mark");
+    assert_eq!(
+        store.cost_archive_files(&worker.agent).expect("marks"),
+        vec![file("a.jsonl", 3)]
+    );
+    assert!(store.cost_archive_files("agent_other").expect("marks").is_empty());
+
+    let mut reader = common::as_login(&schema, "spawn_reader");
+    let refused = reader
+        .query_one(
+            "select spawn_cost_archive_record('{}'::jsonb, '[]'::jsonb)",
+            &[],
+        )
+        .expect_err("the reader may not record");
+    assert!(
+        refused.code() == Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+        "{refused}"
+    );
 }
