@@ -652,3 +652,37 @@ test("a validator that fails on main too has its own title in Needs you", () => 
     "A validator fails on main too · mission #4",
   );
 });
+
+test("an owner landing's old per-mission validator alerts are one item in Needs you, naming every mission; once cleared, none", () => {
+  // The live shape of 2026-11-11 23:33: two alerts of request #129675's
+  // landing (event 130068) about 003.sh, one per mission, from before
+  // objective 056 made them one per source.
+  const old = (mission: number) =>
+    alert(`validator_defect:${mission}:003.sh:130068`, "validator_defect", `mission #${mission}`, {
+      evidence: { event_id: 130068, mission, owner: true, request: 129675, scenario: "003.sh" },
+      text: `mission #${mission}: the owner's landing (request #129675) was accepted without 003.sh`,
+    });
+  const perSource = alert("validator_defect:/s:v1.sh:20", "validator_defect", "/s (mission #4)", {
+    evidence: { event_id: 20, source: "/s", missions: [4], owner: true, scenario: "v1.sh" },
+  });
+  const task = (mission: number) =>
+    alert(`validator_defect:${mission}:028.sh:11`, "validator_defect", `mission #${mission}`, {
+      evidence: { event_id: 11, mission, owner: false, scenario: "028.sh" },
+    });
+  const items = needsYou({ ...base, alerts: [old(7), old(4), perSource, task(4), task(5)] });
+  const titles = items.filter((item) => item.key.startsWith("alert:validator_defect")).map((item) => item.title);
+  assert.deepEqual(titles, [
+    "A validator fails on main too · mission #4, mission #7",
+    "A validator fails on main too · /s (mission #4)",
+    "A validator fails on main too · mission #4",
+    "A validator fails on main too · mission #5",
+  ]);
+  const folded = items.find((item) => item.title.endsWith("mission #4, mission #7"));
+  assert.equal(folded?.session, null, "a mission list is no session");
+  const cleared = [old(4), old(7)].map((entry) => ({ ...entry, state: "cleared" }));
+  assert.deepEqual(
+    needsYou({ ...base, alerts: cleared }).filter((item) => item.key.startsWith("alert:")),
+    [],
+    "cleared, Needs you holds no validator item",
+  );
+});
