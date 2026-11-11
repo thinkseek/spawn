@@ -39,7 +39,11 @@
 //!   `aborted` or `stale` gating) is no notice.
 //! - `mission_state`, `mission #<id>`, key `mission_state:<mission>:<event>`:
 //!   a record after which any of the mission's `state`, `halted`,
-//!   `gate_rejections`, `gate_aborts`, `gate_room_escalated` differs.
+//!   `gate_rejections`, `gate_aborts`, `gate_room_escalated` differs. The
+//!   step folds `gate_rejections` as the store does, with the run's
+//!   objective (`gate_rejection_objective`, read back on start): a cancel of
+//!   a task of the objective every rejection of the run was ends the run
+//!   (objective 053).
 //! - `gate_base_disagrees`, `mission #<id>`, key
 //!   `gate_base_disagrees:<event>`: a `task.gated` host fault with
 //!   `base_disagrees` and `alert` true (objective 033).
