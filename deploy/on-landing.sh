@@ -24,9 +24,15 @@
 # - nobody holds the source (`spawn mission hold`): an owner gate, or a
 #   deploy, is under way, and its deploy follows;
 # - no owner's landing request on the source is waiting for its judging or
-#   in it (`spawn mission landing`'s owner_request: a source.push_requested
+#   in it (`spawn mission landing`'s owner_requests: a source.push_requested
 #   with no source.moved or source.push_refused naming it). Such a judging
-#   holds nothing until it is accepted, and a deploy restarts it (S23);
+#   holds nothing until it is accepted, and a deploy restarts it (S23). A
+#   request whose commit main holds already is not waited for: its landing
+#   went out and its record follows at the integrator's next pass, so there
+#   is no judging to restart (and `spawn mission push --withdraw` refuses
+#   it, so a wait would end only with the integrator). The wait's line
+#   names the withdrawal that ends it; the loop's owner_request_waiting
+#   alert says so too once a request has waited an hour;
 # - no deploy is pending (<live>/deploy.pending: a deploy died after its
 #   push; the owner's next deploy completes it);
 # - the nightly is not red on the source (its fact,
@@ -181,9 +187,22 @@ tick() {
   fi
   # An owner's landing in its judging holds nothing on the source until it
   # is accepted, and a deploy would stop its gate (S23: 06:24 restarted the
-  # S3 owner judging): wait while the store has one with no outcome.
-  if [ "$(printf '%s' "$read" | jq -r '.owner_request')" != null ]; then
-    say_once "main $main waits: the owner's landing request $(printf '%s' "$read" | jq -r '.owner_request.request') ($(printf '%s' "$read" | jq -r '.owner_request.commit')) is waiting for its judging or in it; deployed once it has an outcome"
+  # S3 owner judging): wait while the store has one with no outcome, the
+  # oldest whose commit main does not hold already (header).
+  local requests request commit waiting=""
+  requests=$(printf '%s' "$read" | jq -r '.owner_requests[]? | "\(.request) \(.commit)"') ||
+    die "the store's answer does not read (owner_requests)"
+  while read -r request commit; do
+    [ -n "$request" ] || continue
+    if [[ $commit =~ ^[0-9a-f]{40}$ ]] &&
+      git --git-dir "$missions" merge-base --is-ancestor "$commit" "$main" 2>/dev/null; then
+      continue
+    fi
+    waiting="$request $commit"
+    break
+  done <<<"$requests"
+  if [ -n "$waiting" ]; then
+    say_once "main $main waits: the owner's landing request ${waiting% *} (${waiting#* }) is waiting for its judging or in it; deployed once it has an outcome (spawn mission push --withdraw ${waiting% *} ends it)"
     return 0
   fi
   if [ -e "$live/deploy.pending" ]; then
