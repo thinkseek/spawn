@@ -220,7 +220,9 @@ export function fold(dollars: number[], noun: string, top = TOP_ROWS): Fold | nu
   if (rest.length === 0) return null;
   const sum = rest.reduce((all, usd) => all + (Number.isFinite(usd) ? usd : 0), 0);
   const usd = Math.round(sum * 100) / 100 + 0;
-  const text = `${COUNT.format(rest.length)} more ${noun}${rest.length === 1 ? "" : "s"} · ${formatUsd(usd)}`;
+  // Said from the sum itself, so a fold that cost under a cent reads
+  // "<$0.01", never "$0.00".
+  const text = `${COUNT.format(rest.length)} more ${noun}${rest.length === 1 ? "" : "s"} · ${formatUsd(sum)}`;
   return { count: rest.length, usd, text };
 }
 
