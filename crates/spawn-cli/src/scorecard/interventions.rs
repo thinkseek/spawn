@@ -122,9 +122,15 @@ mod tests {
             panic!("an until needs no now")
         })
         .expect("7d");
-        assert_eq!((name, window.since, window.until), ("7d", 3 * DAY_MS, 10 * DAY_MS));
-        for (window, until) in [(Some("2d"), None), (Some("30d"), None), (None, Some("yesterday"))]
-        {
+        assert_eq!(
+            (name, window.since, window.until),
+            ("7d", 3 * DAY_MS, 10 * DAY_MS)
+        );
+        for (window, until) in [
+            (Some("2d"), None),
+            (Some("30d"), None),
+            (None, Some("yesterday")),
+        ] {
             assert!(
                 matches!(window_of(window, until, || Ok(0)), Err(Failure::Request(_))),
                 "{window:?} {until:?}"

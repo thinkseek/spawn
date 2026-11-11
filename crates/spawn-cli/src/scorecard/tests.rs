@@ -708,7 +708,11 @@ fn autonomy_counts_a_persons_intent_once_and_its_retries_apart() {
         None,
         "autonomy",
     );
-    assert_eq!(autonomy["by_kind"]["command"], json!(2), "two intents in the window");
+    assert_eq!(
+        autonomy["by_kind"]["command"],
+        json!(2),
+        "two intents in the window"
+    );
     assert_eq!(autonomy["interventions"], json!(2));
     assert_eq!(autonomy["retries"], json!(2), "board-2 and board-3");
     let wider = dimension(

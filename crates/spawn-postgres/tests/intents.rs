@@ -31,7 +31,13 @@ fn command(
     end: End,
     finished: Option<i64>,
 ) -> i64 {
-    let key = format!("k-{}", client.query_one("select count(*) from spawn_commands", &[]).expect("count").get::<_, i64>(0));
+    let key = format!(
+        "k-{}",
+        client
+            .query_one("select count(*) from spawn_commands", &[])
+            .expect("count")
+            .get::<_, i64>(0)
+    );
     let created = minutes * M;
     let finished_at: Option<i64> = match end {
         End::Pending => None,
@@ -42,14 +48,27 @@ fn command(
         End::Failed => Some(false),
         End::Pending => None,
     };
-    let state = if matches!(end, End::Pending) { "pending" } else { "finished" };
+    let state = if matches!(end, End::Pending) {
+        "pending"
+    } else {
+        "finished"
+    };
     client
         .query_one(
             "insert into spawn_commands (principal, idempotency_key, agent_id, session_id, action,
                                          state, succeeded, created_at_ms, finished_at_ms)
              values ($1, $2, replace($3, 'session_', 'agent_'), $3, $4, $5, $6, $7, $8)
              returning id",
-            &[&principal, &key, &session, action, &state, &succeeded, &created, &finished_at],
+            &[
+                &principal,
+                &key,
+                &session,
+                action,
+                &state,
+                &succeeded,
+                &created,
+                &finished_at,
+            ],
         )
         .expect("write a command")
         .get(0)
@@ -88,23 +107,83 @@ fn a_refused_command_sent_again_continues_its_intent() {
     // Sent again after it was taken: a new intent.
     let b = command(&mut client, w1, 4, End::Ok, None);
     // Another principal, another session, another action: new ones.
-    let other_principal = command(&mut client, ("spawn", "session_w1", &note), 5, End::Ok, None);
-    let other_session = command(&mut client, ("human", "session_w2", &note), 6, End::Ok, None);
+    let other_principal = command(
+        &mut client,
+        ("spawn", "session_w1", &note),
+        5,
+        End::Ok,
+        None,
+    );
+    let other_session = command(
+        &mut client,
+        ("human", "session_w2", &note),
+        6,
+        End::Ok,
+        None,
+    );
     let stop = json!({"type": "stop"});
-    let s1 = command(&mut client, ("human", "session_w1", &stop), 7, End::Failed, None);
-    let s2 = command(&mut client, ("human", "session_w1", &stop), 8, End::Ok, None);
+    let s1 = command(
+        &mut client,
+        ("human", "session_w1", &stop),
+        7,
+        End::Failed,
+        None,
+    );
+    let s2 = command(
+        &mut client,
+        ("human", "session_w1", &stop),
+        8,
+        End::Ok,
+        None,
+    );
     // More than 60 minutes after the refusal: a new intent.
     let late = input("late");
-    let l1 = command(&mut client, ("human", "session_w1", &late), 10, End::Failed, None);
-    let l2 = command(&mut client, ("human", "session_w1", &late), 71, End::Failed, None);
+    let l1 = command(
+        &mut client,
+        ("human", "session_w1", &late),
+        10,
+        End::Failed,
+        None,
+    );
+    let l2 = command(
+        &mut client,
+        ("human", "session_w1", &late),
+        71,
+        End::Failed,
+        None,
+    );
     // Sent again before the refusal finished: a new intent.
     let slow = input("slow");
-    let f1 = command(&mut client, ("human", "session_w1", &slow), 100, End::Failed, Some(110));
-    let f2 = command(&mut client, ("human", "session_w1", &slow), 105, End::Ok, None);
+    let f1 = command(
+        &mut client,
+        ("human", "session_w1", &slow),
+        100,
+        End::Failed,
+        Some(110),
+    );
+    let f2 = command(
+        &mut client,
+        ("human", "session_w1", &slow),
+        105,
+        End::Ok,
+        None,
+    );
     // Refused, then still pending: one intent, pending.
     let wait = input("wait");
-    let p1 = command(&mut client, ("human", "session_w1", &wait), 120, End::Failed, None);
-    let p2 = command(&mut client, ("human", "session_w1", &wait), 121, End::Pending, None);
+    let p1 = command(
+        &mut client,
+        ("human", "session_w1", &wait),
+        120,
+        End::Failed,
+        None,
+    );
+    let p2 = command(
+        &mut client,
+        ("human", "session_w1", &wait),
+        121,
+        End::Pending,
+        None,
+    );
 
     let taken = || "taken".to_string();
     let failed = || "failed".to_string();
@@ -137,15 +216,24 @@ fn a_refused_command_sent_again_continues_its_intent() {
         client.query_one(sql, &[]).expect("count").get(0)
     };
     assert_eq!(
-        count(&mut client, "select count(*) from spawn_interventions where kind = 'command'"),
+        count(
+            &mut client,
+            "select count(*) from spawn_interventions where kind = 'command'"
+        ),
         10
     );
     assert_eq!(
-        count(&mut client, "select count(*) from spawn_decisions where tier = 'human'"),
+        count(
+            &mut client,
+            "select count(*) from spawn_decisions where tier = 'human'"
+        ),
         10
     );
     assert_eq!(
-        count(&mut client, "select count(*) from spawn_decisions where tier = 'dispatcher'"),
+        count(
+            &mut client,
+            "select count(*) from spawn_decisions where tier = 'dispatcher'"
+        ),
         1,
         "the dispatcher's own commands still count each"
     );
@@ -171,11 +259,19 @@ fn the_interventions_window_takes_each_intent_as_it_stood() {
     let c2 = command(&mut client, w, 20, End::Failed, None);
     let c3 = command(&mut client, w, 30, End::Ok, None);
     let stop = json!({"type": "stop"});
-    let s = command(&mut client, ("spawn", "session_v", &stop), 40, End::Ok, None);
+    let s = command(
+        &mut client,
+        ("spawn", "session_v", &stop),
+        40,
+        End::Ok,
+        None,
+    );
 
     // Before c3 was created: the intent of c1 and c2, refused, not yet sent
     // again; its last refusal finished, so failed.
-    let early = store.interventions_window(0, 25 * M).expect("the window reads");
+    let early = store
+        .interventions_window(0, 25 * M)
+        .expect("the window reads");
     let items = early["items"].as_array().cloned().unwrap_or_default();
     assert_eq!(items.len(), 1, "{early}");
     assert_eq!(items[0]["commands"], json!([c1, c2]));
@@ -183,14 +279,20 @@ fn the_interventions_window_takes_each_intent_as_it_stood() {
     assert_eq!(items[0]["outcome"], "failed");
     let line = items[0]["line"].as_str().unwrap_or_default();
     assert!(line.starts_with("first line y"), "{line}");
-    assert_eq!(line.chars().count(), 120, "the first line, at most 120 characters");
+    assert_eq!(
+        line.chars().count(),
+        120,
+        "the first line, at most 120 characters"
+    );
     // At c2's own creation plus half a second: c2 had not finished.
     let racing = store
         .interventions_window(0, 20 * M + 500)
         .expect("the window reads");
     assert_eq!(racing["items"][0]["outcome"], "pending");
 
-    let all = store.interventions_window(0, 60 * M).expect("the window reads");
+    let all = store
+        .interventions_window(0, 60 * M)
+        .expect("the window reads");
     assert_eq!(
         all["items"],
         json!([
