@@ -47,6 +47,11 @@
 //!   repo's `git bundle` (heads listed; a full one verified alone) compared
 //!   with its record, so the sources and transcripts are proven to open too:
 //!   exit 0 when both pass, 1 when either does not, 2 when it cannot run.
+//! - `spawn backup restore-drill`, by hand (core (ii)): the newest stored
+//!   bundle and its chain back to a full one restored into a scratch
+//!   directory of its own (mode 700, never under `$HOME`, `$SPAWN_LIVE` or
+//!   the root), the transcript archive and every mission source, and
+//!   compared with live, read only ([`restore_drill`]).
 //!
 //! The bucket stays inside R2's free tier: `SPAWN_BACKUP_R2_LIMIT_MB`
 //! (default 10000) is 10,000,000,000 bytes, and nothing is ever written
@@ -88,6 +93,8 @@ use spawn_postgres::PostgresStore;
 use crate::Flags;
 use crate::config::{env_or, env_value, open_store, workspace_root};
 
+mod restore_drill;
+
 /// The default limits, in decimal megabytes (1,000,000 bytes each): R2's
 /// free tier is 10 GB-month of storage, and the owner's alert is at 8 GB.
 const DEFAULT_LIMIT_MB: u64 = 10_000;
@@ -96,7 +103,7 @@ const DEFAULT_ALERT_MB: u64 = 8_000;
 /// A byte count per `SPAWN_BACKUP_R2_*` megabyte.
 const MB: u64 = 1_000_000;
 
-const USAGE: &str = "usage: spawn backup dump|bundle|verify [--root <dir>]";
+const USAGE: &str = "usage: spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep]";
 
 /// One `postgres://` URL, read the way libpq reads it (scripts/pg-url.sh):
 /// user and password percent-decoded, an IPv6 host in brackets, a socket
@@ -850,17 +857,24 @@ fn output(mut command: Command, what: &str) -> Result<(bool, String, String), St
     ))
 }
 
-/// The entry point: `spawn backup dump|bundle|verify [--root <dir>]`.
+/// The entry point: `spawn backup dump|bundle|verify|restore-drill [--root <dir>]`.
 pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
     let Some(verb) = arguments.first() else {
         return Err(USAGE.to_string());
     };
     let rest: Vec<String> = arguments[1..].to_vec();
-    let flags = Flags::parse(&rest).map_err(|error| format!("{error}\n{USAGE}"))?;
+    let switches: &[&str] = if verb == "restore-drill" {
+        &["keep"]
+    } else {
+        &[]
+    };
+    let flags =
+        Flags::parse_with_switches(&rest, switches).map_err(|error| format!("{error}\n{USAGE}"))?;
     match verb.as_str() {
         "dump" => dump(&flags),
         "bundle" => bundle(&flags),
         "verify" => verify(&flags),
+        "restore-drill" => restore_drill::restore_drill(&flags),
         other => Err(format!("unknown backup command {other}\n{USAGE}")),
     }
 }
