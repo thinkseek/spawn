@@ -543,6 +543,77 @@ pub(crate) struct Monitor {
     /// `execution.ended` that may clear an open alert: the last reading's
     /// time, less a margin for an append that committed late.
     messages_since: i64,
+    /// What the supervisor had to dispatch when last read
+    /// ([`crate::serve::attention::supervisor_dispatch`]), read only while
+    /// its latest judgement is stuck or its `agent_stuck` is open; `None`
+    /// before a read (or after one that failed): its judgement alone
+    /// decides, as before objective 057.
+    supervisor: Option<Dispatch>,
+    /// When the supervisor's dispatch may be read again: at most once per
+    /// `SPAWN_ALERT_CHECK_SECS`.
+    supervisor_due_ms: i64,
+}
+
+/// What the supervisor has to dispatch, as one read of the attention view
+/// found it (`agent_stuck`, objective 057).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Dispatch {
+    /// It asks the owner a question (the attention view's `question`).
+    pub(crate) question: bool,
+    /// The plan's pending and told escalations.
+    pub(crate) items: Vec<DispatchItem>,
+}
+
+/// One escalation of the supervisor's plan.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DispatchItem {
+    pub(crate) tag: String,
+    /// The agent it is about, when it is about one.
+    pub(crate) agent: Option<String>,
+    /// It is a worker's own judgement (attention, idle, a nudge that did
+    /// not help), not a record the supervisor must act on.
+    pub(crate) judgement: bool,
+}
+
+impl Dispatch {
+    /// From [`crate::serve::attention::supervisor_dispatch`]'s answer.
+    pub(crate) fn from_value(value: &Value) -> Self {
+        Self {
+            question: value["question"].as_bool().unwrap_or(false),
+            items: value["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|item| DispatchItem {
+                    tag: item["tag"].as_str().unwrap_or_default().to_string(),
+                    agent: item["agent_id"].as_str().map(str::to_string),
+                    judgement: item["judgement"].as_bool().unwrap_or(false),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// A worker's task states in which its part is done: what it waits on is
+/// the gate, a reviewer, the landing or the owner's hold (objective 057). A
+/// `reported` task waits for its gate or its review, `accepted` for its
+/// landing, `landing` for its push (or behind a hold), `landed` for nothing.
+const PART_DONE: [&str; 4] = ["reported", "accepted", "landing", "landed"];
+
+/// The task states in which a worker holds a task: delivered or later, its
+/// work (or done), never the supervisor's to assign.
+const HELD: [&str; 6] = [
+    "delivered",
+    "revise",
+    "reported",
+    "accepted",
+    "landing",
+    "landed",
+];
+
+/// The one command that acts on a worker stuck in its task.
+fn restart_command(task: i64) -> String {
+    format!("spawn task restart --id {task}")
 }
 
 impl Monitor {
@@ -581,6 +652,8 @@ impl Monitor {
             messages_after: 0,
             pending: BTreeMap::new(),
             messages_since: 0,
+            supervisor: None,
+            supervisor_due_ms: 0,
         }
     }
 
