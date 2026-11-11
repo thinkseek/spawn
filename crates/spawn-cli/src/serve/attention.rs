@@ -527,7 +527,9 @@ pub(super) fn owner_notes(
         match store.task_label_facts(&ids) {
             Ok(facts) => task_states(&facts),
             Err(error) => {
-                warnings.push(format!("attention: the tasks the owner's lines name: {error}"));
+                warnings.push(format!(
+                    "attention: the tasks the owner's lines name: {error}"
+                ));
                 BTreeMap::new()
             }
         }
@@ -547,12 +549,7 @@ fn task_states(board: &Value) -> BTreeMap<i64, String> {
         .into_iter()
         .flatten()
         .flat_map(|mission| mission["tasks"].as_array().into_iter().flatten())
-        .filter_map(|task| {
-            Some((
-                task["id"].as_i64()?,
-                task["state"].as_str()?.to_string(),
-            ))
-        })
+        .filter_map(|task| Some((task["id"].as_i64()?, task["state"].as_str()?.to_string())))
         .collect()
 }
 
@@ -649,9 +646,7 @@ fn named_tasks(line: &str) -> Vec<i64> {
             ids.push(id);
         }
     };
-    let is_and = |token: Option<&Token>| {
-        matches!(token, Some(Token::Word(word)) if word.eq_ignore_ascii_case("and"))
-    };
+    let is_and = |token: Option<&Token>| matches!(token, Some(Token::Word(word)) if word.eq_ignore_ascii_case("and"));
     let mut at = 0;
     while at < tokens.len() {
         let Token::Word(word) = &tokens[at] else {
@@ -1484,14 +1479,24 @@ mod tests {
 
     #[test]
     fn a_line_names_its_tasks_in_each_form() {
-        assert_eq!(named_tasks("task 2 landed; deploying it needs init-db"), [2]);
+        assert_eq!(
+            named_tasks("task 2 landed; deploying it needs init-db"),
+            [2]
+        );
         assert_eq!(named_tasks("task #5 waits for your review."), [5]);
         assert_eq!(named_tasks("Task 7 and T12 are done"), [7, 12]);
         assert_eq!(named_tasks("Report 9 is in"), [9]);
         assert_eq!(named_tasks("T3, T4 ready"), [3, 4]);
-        assert_eq!(named_tasks("tasks 160 to 167 land next"), [160], "a range names its first");
+        assert_eq!(
+            named_tasks("tasks 160 to 167 land next"),
+            [160],
+            "a range names its first"
+        );
         assert_eq!(named_tasks("tasks 160-167"), [160]);
-        assert_eq!(named_tasks("mission #3 has no backlog yet."), Vec::<i64>::new());
+        assert_eq!(
+            named_tasks("mission #3 has no backlog yet."),
+            Vec::<i64>::new()
+        );
         assert_eq!(named_tasks("see issue #54 and PR 12"), Vec::<i64>::new());
         assert_eq!(named_tasks("deploy main (3 commits)"), Vec::<i64>::new());
         assert_eq!(named_tasks("Tea12 and t12 name none"), Vec::<i64>::new());
@@ -1524,7 +1529,9 @@ mod tests {
         assert!(review_ask("task #5 waits for your review."));
         assert!(review_ask("Accept T4 when you can"));
         assert!(review_ask("merging reports 2 and 3 is yours"));
-        assert!(!review_ask("task 2 landed; deploying it needs spawn init-db."));
+        assert!(!review_ask(
+            "task 2 landed; deploying it needs spawn init-db."
+        ));
         assert!(!review_ask("review T4, then deploy main"));
         assert!(!review_ask("decide whether task 3 should go on"));
     }
@@ -1563,7 +1570,10 @@ mod tests {
         assert_eq!(init["settled"], json!(false));
         // No task named, or none known: never settled.
         assert_eq!(note("mission #3 has no backlog yet.")["tasks"], json!([]));
-        assert_eq!(note("mission #3 has no backlog yet.")["settled"], json!(false));
+        assert_eq!(
+            note("mission #3 has no backlog yet.")["settled"],
+            json!(false)
+        );
         let unknown = note("task 99 waits for your review");
         assert_eq!(unknown["tasks"], json!([]));
         assert_eq!(unknown["settled"], json!(false));

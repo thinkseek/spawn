@@ -3335,9 +3335,7 @@ mod tests {
             let mut warnings = Vec::new();
             let notes = super::attention::owner_notes(store, &lines, &mut warnings);
             assert!(warnings.is_empty(), "{warnings:?}");
-            let shape = |index: usize| {
-                json!({"tasks": notes[index]["tasks"], "settled": notes[index]["settled"]})
-            };
+            let shape = |index: usize| json!({"tasks": notes[index]["tasks"], "settled": notes[index]["settled"]});
             assert_eq!(
                 shape(0),
                 json!({"tasks": [{"id": a, "state": "accepted"}, {"id": b, "state": "accepted"},
