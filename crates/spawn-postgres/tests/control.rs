@@ -4350,3 +4350,87 @@ fn a_validator_defect_is_a_host_fault_of_its_own_shape() {
     let counts: (i32, i32, i32) = (row.get(0), row.get(1), row.get(2));
     assert_eq!(counts, (1, 0, 0), "a host fault, nothing else");
 }
+
+/// P28: the integrator's landing of an owner's request starts the scenario
+/// floor again (0, no names), as a resume does: the owner changing the
+/// scenario set (a retirement) is not a candidate deleting its judge, and
+/// must not halt the missions on the source at their next pass. Their next
+/// gate sets the floor from the scenarios then, so the guard still holds
+/// against a later fall. A move with no request (`spawn mission moved`)
+/// keeps the floor.
+#[test]
+fn an_owner_landing_starts_the_scenario_floor_again() {
+    let (store, schema) = store("control_owner_floor");
+    let mut client = admin(&schema);
+    let source = "/tmp/owner-floor.git";
+    let c1 = "1".repeat(40);
+    let mission = store
+        .mission_add("On the source", &json!([source]), "human")
+        .expect("add");
+    store
+        .mission_configure(mission, Some("/scenarios"), "gate", None, None)
+        .expect("configure");
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    let gated = |revision: i32, base: &str, scenarios: u32| {
+        store
+            .integrator_record(
+                &json!({"type": "task.gated", "revision": revision, "id": task,
+                                       "verdict": "aborted", "base": base,
+                                       "reason": "a gate that died", "scenarios": scenarios,
+                                       "scenario_names": ["001.sh", "002.sh"]}),
+            )
+            .expect("a verdict");
+    };
+    let floor = |client: &mut Client| {
+        let row = tables(client);
+        (
+            row["missions"][0]["scenario_floor"].clone(),
+            row["missions"][0]["scenario_names"].clone(),
+            row["missions"][0]["baseline"].clone(),
+        )
+    };
+    gated(0, "b0", 56);
+    assert_eq!(floor(&mut client).0, 56);
+    // A deploy behind Spawn's back moves the baseline and keeps the floor.
+    assert_eq!(store.source_moved(source, "b0", "b1").expect("moved"), 1);
+    let (kept, names, baseline) = floor(&mut client);
+    assert_eq!((kept, baseline), (json!(56), json!("b1")));
+    assert_eq!(names, json!(["001.sh", "002.sh"]));
+    // The owner's landing, recorded by the integrator, starts it again.
+    let request = store
+        .source_push_request(
+            source,
+            &c1,
+            &format!("refs/spawn-owner/{c1}"),
+            &PushRequest::default(),
+        )
+        .expect("a request");
+    store
+        .integrator_record(
+            &json!({"type": "source.moved", "source": source, "from": "b1",
+                                   "to": c1, "request": request}),
+        )
+        .expect("the owner's landing");
+    assert_eq!(
+        floor(&mut client),
+        (json!(0), serde_json::Value::Null, json!(c1)),
+        "the floor starts again at the owner's landing"
+    );
+    // The next gate sets it from the scenarios then (40 after a retirement
+    // of 16), and a later fall stays under it, for the integrator's halt.
+    gated(0, &c1, 40);
+    assert_eq!(floor(&mut client).0, 40);
+    gated(0, &c1, 39);
+    assert_eq!(floor(&mut client).0, 40, "a fall does not lower the floor");
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the fold replays to the same tables"
+    );
+}

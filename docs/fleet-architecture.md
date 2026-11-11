@@ -2496,7 +2496,14 @@ are per-agent uids or a mount per engine.
   (`halt`: its `mission.halted` event, reason, time, and `gone`); a halt on
   the scenario floor names the scenario files gone since the gating that
   set the floor (that `task.gated` carries `scenario_names`, the halt
-  `gone`).
+  `gone`). The floor guards against a task's candidate deleting its judge,
+  not against the owner changing the set: the integrator's landing of an
+  owner's request (`source.moved` naming its `request`) starts the floor
+  again for the missions it moves, as a resume does (0, no names), and
+  their next gate sets it from the scenarios then. That gate counts the
+  deployed scenarios, since no task judging starts while main is ahead of
+  its controller. A move with no request (`spawn mission moved`) keeps the
+  floor.
   No rule counts host faults, however many in a row, whatever their evidence:
   a halt needs a human, and a host fault is the host's, so it is judged again
   after its backoff; 020's evidence (the test database) is escalated at two

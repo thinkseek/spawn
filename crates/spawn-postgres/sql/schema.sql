@@ -2027,7 +2027,21 @@ begin
         -- a halted one, unless its halt was this very move: `clear`); a
         -- record from before it did moved every mission on the source at
         -- that baseline.
-        update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at
+        -- The integrator's landing of an owner's request (it names the
+        -- `request`) is the owner changing the scenario set, as a resume is
+        -- (P28): the missions it moves take the scenarios as they are after
+        -- it, so the floor starts again (0, no names) and their next gate sets
+        -- it. The floor guards against a task's candidate deleting its judge:
+        -- an owner's retirement of scenarios is not one, and halted every
+        -- mission on the source at its next pass. A task judging does not
+        -- start on a main ahead of its controller (P22's controller_behind),
+        -- so the next gate counts the deployed scenarios. A move with no
+        -- request (`spawn mission moved`) keeps the floor.
+        update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at,
+                                    scenario_floor = case when p_record ? 'request' then 0
+                                                          else scenario_floor end,
+                                    scenario_names = case when p_record ? 'request' then null
+                                                          else scenario_names end
          where sources ->> 0 = p_record ->> 'source' and baseline = p_record ->> 'from'
            and (p_record -> 'missions' is null
                 or id in (select m::bigint
@@ -2045,7 +2059,8 @@ begin
         -- baseline yet (new, or resumed), not halted: they take the new main
         -- as their first baseline, so a gate of theirs that was judging
         -- against the old main when it landed does not leave them at it.
-        update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at
+        update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at,
+                                    scenario_floor = 0, scenario_names = null
          where sources ->> 0 = p_record ->> 'source' and baseline is null
            and jsonb_typeof(p_record -> 'without_baseline') = 'array'
            and id in (select m::bigint
