@@ -131,7 +131,28 @@ select jsonb_build_object(
                           where e.session_id = 'session_control'
                             and e.event_name = 'control.recorded'
                             and e.kind -> 'detail' -> 'record' ->> 'type' = 'mission.closed'
-                            and e.kind -> 'detail' -> 'record' ->> 'id' = m.id::text))
+                            and e.kind -> 'detail' -> 'record' ->> 'id' = m.id::text),
+        -- It takes its work from an objective backlog, and, when it is not
+        -- closed and has tasks but none in work, the record that ended its
+        -- last one (objective 058, `mission_idle`).
+        'backlog', jsonb_typeof(m.objectives) = 'object',
+        'idle', case when m.state in ('open', 'active')
+                          and jsonb_typeof(m.objectives) = 'object'
+                          and exists (select 1 from mission_tasks k where k.mission_id = m.id)
+                          and not exists (select 1 from mission_tasks k
+                                           where k.mission_id = m.id
+                                             and k.state not in ('landed', 'accepted', 'cancelled'))
+                     then (select jsonb_build_object('event_id', e.id, 'at_ms', e.recorded_at_ms)
+                             from spawn_events e
+                            where e.session_id = 'session_control'
+                              and e.event_name = 'control.recorded'
+                              and e.kind -> 'detail' -> 'record' ->> 'type'
+                                  in ('task.landed', 'task.cancelled', 'task.aborted',
+                                      'task.over_budget', 'task.reviewed', 'task.gated')
+                              and e.kind -> 'detail' -> 'record' ->> 'id'
+                                  in (select k.id::text from mission_tasks k
+                                       where k.mission_id = m.id)
+                            order by e.id desc limit 1) end)
       order by m.id) from mission_missions m), '[]'::jsonb),
   'tasks', coalesce((select jsonb_agg(jsonb_build_object(
         'id', k.id, 'mission', k.mission_id, 'state', k.state, 'agent_id', k.agent_id,
