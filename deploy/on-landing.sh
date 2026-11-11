@@ -23,6 +23,10 @@
 #   process of this uid can write one;
 # - nobody holds the source (`spawn mission hold`): an owner gate, or a
 #   deploy, is under way, and its deploy follows;
+# - no owner's landing request on the source is waiting for its judging or
+#   in it (`spawn mission landing`'s owner_request: a source.push_requested
+#   with no source.moved or source.push_refused naming it). Such a judging
+#   holds nothing until it is accepted, and a deploy restarts it (S23);
 # - no deploy is pending (<live>/deploy.pending: a deploy died after its
 #   push; the owner's next deploy completes it);
 # - the nightly is not red on the source (its fact,
@@ -173,6 +177,13 @@ tick() {
   fi
   if [ "$(printf '%s' "$read" | jq -r '.hold')" != null ]; then
     say_once "main $main waits: the source is held ($(printf '%s' "$read" | jq -r '.hold.reason // "no reason"')); the holder's deploy follows"
+    return 0
+  fi
+  # An owner's landing in its judging holds nothing on the source until it
+  # is accepted, and a deploy would stop its gate (S23: 06:24 restarted the
+  # S3 owner judging): wait while the store has one with no outcome.
+  if [ "$(printf '%s' "$read" | jq -r '.owner_request')" != null ]; then
+    say_once "main $main waits: the owner's landing request $(printf '%s' "$read" | jq -r '.owner_request.request') ($(printf '%s' "$read" | jq -r '.owner_request.commit')) is waiting for its judging or in it; deployed once it has an outcome"
     return 0
   fi
   if [ -e "$live/deploy.pending" ]; then
