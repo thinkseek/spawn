@@ -218,7 +218,7 @@ build_id=5370617766537472617921
 printf '[build]\nrustflags = ["-C", "link-arg=-Wl,--build-id=0x%s"]\n' "$build_id" >"$checkout/.cargo/config.toml"
 echo stray >"$checkout/web/public/stray.txt"
 
-git init -q --bare "$missions"
+git init -q --bare -b main "$missions"
 git -C "$checkout" push -q "$missions" "$base:refs/heads/main"
 verdict=$scratch/verdict.json
 # verdict_over <main>: the gate's verdict for HEAD over that main.
@@ -743,7 +743,7 @@ echo "== the mirror (SPAWN_DEPLOY_MIRROR)"
 cp "$scratch/real-spawn" "$live/bin/spawn"
 export FAKE_INTEGRATOR_INACTIVE=1
 mirror=$scratch/mirror.git
-git init -q --bare "$mirror"
+git init -q --bare -b main "$mirror"
 mirror_main() { git --git-dir="$mirror" rev-parse refs/heads/main; }
 # mirror_at <commit>: the mirror's main is that commit, main is the base
 # again with a verdict over it.
