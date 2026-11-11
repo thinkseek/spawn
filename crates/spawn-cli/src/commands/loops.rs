@@ -24,7 +24,8 @@
 //!   revival's backoff;
 //! - the cost step ([`cost::record`]), which folds the Bridge's
 //!   `model.usage` records into each message's priced cost, and waits for
-//!   nothing but them;
+//!   nothing but them (what only the transcript archive holds is
+//!   counted once at start, beside the passes: [`cost::archive::start`]);
 //! - the alerts ([`alerts::Monitor::check`]), which waits for its next host
 //!   reading (`SPAWN_ALERT_CHECK_SECS`, 30 s) or a bound's due time.
 //!
