@@ -566,10 +566,14 @@ impl Monitor {
                 .alert_control(self.watermark, BATCH)
                 .map_err(|error| error.to_string())?;
             let records = batch["records"].as_array().map_or(&[][..], Vec::as_slice);
+            // One record at a time, as at the start: a halt and its resume
+            // in one batch end cleared, naming the resume.
             for entry in records {
                 let id = entry["event_id"].as_i64().unwrap_or_default();
                 let at = entry["at_ms"].as_i64().unwrap_or(now);
-                self.feed(id, at, &entry["record"], &mut events);
+                let mut fed = Vec::new();
+                self.feed(id, at, &entry["record"], &mut fed);
+                self.flush(store, now, &fed, &mut lines);
             }
             // What the step has read: the last control record when the
             // batch was cut at its limit (the rest waits for the next
@@ -670,12 +674,19 @@ impl Monitor {
         let history = store
             .alert_history(now.saturating_sub(HISTORY_MS), HISTORY_LIMIT)
             .map_err(|error| error.to_string())?;
-        let mut events = Vec::new();
+        // Each record is recorded before the next is read, so a later record
+        // in the same history (a halt's resume, a good drill after a failed
+        // one) finds the alert its predecessor fired and clears it, naming
+        // itself; a record older than an open alert's own clears nothing
+        // ([`after`]).
         for entry in history.as_array().into_iter().flatten() {
             let id = entry["event_id"].as_i64().unwrap_or_default();
             let at = entry["at_ms"].as_i64().unwrap_or(now);
-            self.feed(id, at, &entry["record"], &mut events);
+            let mut fed = Vec::new();
+            self.feed(id, at, &entry["record"], &mut fed);
+            self.flush(store, now, &fed, lines);
         }
+        let mut events = Vec::new();
         let observations = store
             .alert_observations()
             .map_err(|error| error.to_string())?;
@@ -1737,6 +1748,7 @@ times in a row)",
                     key,
                     evidence: json!({
                         "quiet_secs": quiet / 1000, "last_line": log.last_line,
+                        "reading_ms": now,
                     }),
                 });
             }
@@ -1803,12 +1815,14 @@ times in a row)",
             if !watched.contains(&entry) {
                 out.push(Event::Clear {
                     key: key.clone(),
-                    evidence: json!({"source": entry.1, "reason": "no longer watched"}),
+                    evidence: json!({
+                        "source": entry.1, "reason": "no longer watched", "reading_ms": now,
+                    }),
                 });
             } else if present(&entry.1) {
                 out.push(Event::Clear {
                     key: key.clone(),
-                    evidence: json!({"source": entry.1, "present": true}),
+                    evidence: json!({"source": entry.1, "present": true, "reading_ms": now}),
                 });
             } else {
                 open.insert(entry);
@@ -1829,7 +1843,10 @@ times in a row)",
                 key: format!("source_away:{mission}:{now}"),
                 kind: "source_away",
                 subject: format!("mission #{mission}"),
-                evidence: json!({"source": source, "present": false, "away_since_ms": since}),
+                evidence: json!({
+                    "source": source, "present": false, "away_since_ms": since,
+                    "reading_ms": now,
+                }),
                 text: format!(
                     "{source} is not a directory on this host: mission #{mission}'s \
                      branches are not published to it until it is back"
@@ -2036,6 +2053,7 @@ times in a row)",
                 subject: "host".to_string(),
                 evidence: json!({
                     "measured_mb": measured, "threshold_mb": low, "top": top_processes(),
+                    "reading_ms": now,
                 }),
                 text: format!("MemAvailable is {measured} MiB, under {low}"),
                 notice: false,
@@ -2044,7 +2062,9 @@ times in a row)",
                 for key in open {
                     out.push(Event::Clear {
                         key,
-                        evidence: json!({"measured_mb": measured, "threshold_mb": ok}),
+                        evidence: json!({
+                            "measured_mb": measured, "threshold_mb": ok, "reading_ms": now,
+                        }),
                     });
                 }
             }
@@ -2073,7 +2093,7 @@ times in a row)",
                 subject: "host".to_string(),
                 evidence: json!({
                     "path": path.display().to_string(),
-                    "measured_mb": measured, "threshold_mb": high,
+                    "measured_mb": measured, "threshold_mb": high, "reading_ms": now,
                 }),
                 text: format!("{} holds {measured} MiB, over {high}", path.display()),
                 notice: false,
@@ -2084,7 +2104,7 @@ times in a row)",
                         key,
                         evidence: json!({
                             "path": path.display().to_string(),
-                            "measured_mb": measured, "threshold_mb": ok,
+                            "measured_mb": measured, "threshold_mb": ok, "reading_ms": now,
                         }),
                     });
                 }
@@ -2166,7 +2186,7 @@ times in a row)",
                         subject: subject.to_string(),
                         evidence: json!({
                             "log": path.display().to_string(),
-                            "lines": matching,
+                            "lines": matching, "reading_ms": now,
                         }),
                         text: format!("the {subject} database's log: {}", line.trim()),
                         notice: false,
@@ -2178,7 +2198,7 @@ times in a row)",
                         key,
                         evidence: json!({
                             "line": line.trim(),
-                            "log": path.display().to_string(),
+                            "log": path.display().to_string(), "reading_ms": now,
                         }),
                     });
                 }
@@ -2216,12 +2236,12 @@ times in a row)",
                     })
                 }
                 Event::Clear { evidence, .. } => {
+                    if !self.clears(&key, evidence, now) {
+                        continue;
+                    }
                     let Some(row) = self.known.get(&key) else {
                         continue;
                     };
-                    if !row.open() || row.fired_event_id == 0 {
-                        continue;
-                    }
                     json!({
                         "type": "alert.cleared", "key": key, "kind": row.kind,
                         "subject": row.subject, "evidence": scrub_value(evidence),
@@ -2351,6 +2371,37 @@ times in a row)",
     fn is_open(&self, key: &str) -> bool {
         self.known.get(key).is_some_and(Row::open)
     }
+
+    /// Whether a clear of `key` with `evidence`, decided at `now`, is
+    /// recorded: the alert is open in the store, and the evidence comes
+    /// after what it fired on ([`after`]). One that does not clears
+    /// nothing, and is no error.
+    fn clears(&self, key: &str, evidence: &Value, now: i64) -> bool {
+        self.known
+            .get(key)
+            .is_some_and(|row| row.open() && row.fired_event_id != 0 && after(row, evidence, now))
+    }
+}
+
+/// Whether a clear's `evidence` comes after what the alert `row` fired on,
+/// read from the alert's own evidence (what the store holds, never the
+/// step's memory, which a restart empties): a record-borne clear names a
+/// control record or event (`event_id`) later in the log than the one the
+/// alert fired on; any other (a reading, `reading_ms`, or else the time it
+/// is decided, `now`) is taken at or after the alert's reading, or its
+/// firing.
+fn after(row: &Row, evidence: &Value, now: i64) -> bool {
+    if let (Some(by), Some(on)) = (
+        evidence["event_id"].as_i64(),
+        row.evidence["event_id"].as_i64(),
+    ) {
+        return by > on;
+    }
+    let read = evidence["reading_ms"].as_i64().unwrap_or(now);
+    let fired = row.evidence["reading_ms"]
+        .as_i64()
+        .unwrap_or(row.fired_at_ms);
+    read >= fired
 }
 
 impl LogWatch {
@@ -3099,7 +3150,7 @@ mod tests {
             .into_iter()
             .filter(|event| match event {
                 Event::Fire { .. } => !monitor.known.contains_key(event.key()),
-                Event::Clear { .. } => monitor.is_open(event.key()),
+                Event::Clear { key, evidence } => monitor.clears(key, evidence, i64::MAX),
             })
             .collect()
     }
