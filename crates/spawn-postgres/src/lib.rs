@@ -96,6 +96,7 @@ mod sessions;
 mod wake;
 
 pub use acks::{AckRecord, ReportAnswer};
+pub use cost::{ArchiveCounted, ArchiveFile, ArchivedMessage};
 pub use gateway::{HumanInput, HumanKey, HumanTask, HumanWrite};
 pub use missions::{ActivityEvent, LandingHold, PushRequest};
 pub use sessions::{

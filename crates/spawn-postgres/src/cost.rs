@@ -11,7 +11,8 @@ use spawn_core::port::StoreError;
 use crate::PostgresStore;
 
 /// The messages timed in `[$1, $2)`, summed by model, mission, task, agent
-/// and execution (an execution with its models). `usd` is the sum of the
+/// and execution (an execution with its models), and `counted_since_ms`:
+/// the time of the earliest message the record holds (null: none). `usd` is the sum of the
 /// priced messages' costs, 0 for an entry with only unpriced ones (`null`
 /// for a model that is priced nowhere in the window); `unpriced_tokens` the
 /// four counts of the messages with no price. Most costly first.
@@ -96,7 +97,8 @@ select jsonb_build_object(
                                               'cache_write', sum(cache_write_tokens),
                                               'cache_read', sum(cache_read_tokens)) as tokens,
                            coalesce(sum(total) filter (where usd is null), 0) as unpriced_tokens
-                      from m group by execution_id) g), '[]'::jsonb))";
+                      from m group by execution_id) g), '[]'::jsonb),
+  'counted_since_ms', (select min(at_ms) from spawn_cost_messages))";
 
 /// Every mission with a daily budget (`budget.daily_usd`) and its cost of
 /// the messages timed in `[$1, $2)` (the UTC day so far).
@@ -123,7 +125,8 @@ impl PostgresStore {
     }
 
     /// The cost of the messages timed in `[since_ms, until_ms)` ([`WINDOW`]):
-    /// `{total, models, missions, tasks, agents, executions}`.
+    /// `{total, models, missions, tasks, agents, executions,
+    /// counted_since_ms}`.
     pub fn cost_window(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
         self.query_json(WINDOW, &[&since_ms, &until_ms])
     }
@@ -133,4 +136,98 @@ impl PostgresStore {
     pub fn cost_budgets(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
         self.query_json(BUDGETS, &[&since_ms, &until_ms])
     }
+
+    /// Count archived messages the record lacks
+    /// (`spawn_cost_archive_record`, owner only), each priced by `prices`.
+    pub fn cost_archive_record(
+        &self,
+        prices: &Value,
+        messages: &[ArchivedMessage],
+    ) -> Result<ArchiveCounted, StoreError> {
+        let messages = serde_json::to_value(messages)
+            .map_err(|error| StoreError::Rejected(format!("the messages: {error}")))?;
+        let answer: Value = self
+            .query_one(
+                "select spawn_cost_archive_record($1, $2)",
+                &[prices, &messages],
+            )?
+            .get(0);
+        let count = |name: &str| answer[name].as_i64().unwrap_or_default();
+        Ok(ArchiveCounted {
+            counted: count("counted"),
+            unplaced: count("unplaced"),
+        })
+    }
+
+    /// The archive files of `agent` the loop counted, and what each was
+    /// then: `(file, length, modified_ms)`, by file.
+    pub fn cost_archive_files(&self, agent: &str) -> Result<Vec<ArchiveFile>, StoreError> {
+        let rows = self.query(
+            "select file, length, modified_ms from spawn_cost_archive_files
+              where agent_id = $1 order by file",
+            &[&agent],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| ArchiveFile {
+                file: row.get(0),
+                length: row.get(1),
+                modified_ms: row.get(2),
+            })
+            .collect())
+    }
+
+    /// Mark `files` of `agent` counted as they are now; the agent's other
+    /// marks (files gone from its directory) are dropped.
+    pub fn cost_archive_mark(&self, agent: &str, files: &[ArchiveFile]) -> Result<(), StoreError> {
+        let files = serde_json::to_value(files)
+            .map_err(|error| StoreError::Rejected(format!("the files: {error}")))?;
+        self.execute(
+            "with given as (
+                 select x.* from jsonb_to_recordset($2::jsonb)
+                     as x(file text, length bigint, modified_ms bigint)
+             ), gone as (
+                 delete from spawn_cost_archive_files f
+                  where f.agent_id = $1 and f.file not in (select file from given)
+             )
+             insert into spawn_cost_archive_files as f
+                 (agent_id, file, length, modified_ms, counted_at_ms)
+             select $1, g.file, g.length, g.modified_ms, spawn_now_ms() from given g
+             on conflict (agent_id, file) do update
+                 set length = excluded.length, modified_ms = excluded.modified_ms,
+                     counted_at_ms = excluded.counted_at_ms",
+            &[&agent, &files],
+        )?;
+        Ok(())
+    }
+}
+
+/// One assistant message of the transcript archive, folded over its lines
+/// and copies (its largest usage, its earliest line's time and model).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ArchivedMessage {
+    pub agent_id: String,
+    pub message_id: String,
+    pub model: String,
+    pub at_ms: i64,
+    pub input: i64,
+    pub output: i64,
+    pub cache_write: i64,
+    pub cache_read: i64,
+}
+
+/// What [`PostgresStore::cost_archive_record`] did: the messages it added,
+/// and those it could not place (their agent has no execution).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ArchiveCounted {
+    pub counted: i64,
+    pub unplaced: i64,
+}
+
+/// An archive file as the loop counted it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ArchiveFile {
+    pub file: String,
+    pub length: i64,
+    pub modified_ms: i64,
 }

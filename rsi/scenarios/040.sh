@@ -328,7 +328,11 @@ state_of() { q "select state || ':' || coalesce(succeeded::text, '-') from spawn
 error_of() { q "select coalesce(error, '') from spawn_commands where id = $1"; }
 finished() { [ "$(q "select state from spawn_commands where id = $1")" = finished ]; }
 succeeded() { [ "$(state_of "$1")" = finished:true ]; }
-read_count() { grep -c "^$1 [0-9.]* $2\$" "$WORK/engine.log" || true; }
+# An input's line ends with its text, or with its text and then the message's
+# marker and the answer line Spawn types after it on the same line
+# (crates/spawn-core/src/bridge.rs: a one-line input carries its marker at
+# its own line's end, whatever the pane reads).
+read_count() { grep -c "^$1 [0-9.]* $2\( \[spawn message #[0-9][0-9]*\] .*\)\{0,1\}\$" "$WORK/engine.log" || true; }
 logged() { [ "$(read_count "$1" "$2")" -ge 1 ]; }
 judged_waiting() {
     [ "$(q "select coalesce(observation ->> 'state', '') from spawn_session_state

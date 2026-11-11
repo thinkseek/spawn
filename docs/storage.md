@@ -588,6 +588,12 @@ adapter in `spawn_host::transcripts`):
   nothing open. It is told from these records, not by age; the records are
   read before the archive, so a window read as settled already has every
   line before its end, and reads the same figures afterwards.
+- **The cost record.** Each time `spawn loop` starts it counts, beside its
+  passes, every assistant message the archive holds and the cost record
+  (`spawn_cost_messages`) lacks (objective 048; docs/fleet-architecture.md
+  §3.5): the archive alone, one agent at a time, the files marked in
+  `spawn_cost_archive_files` (length and modification time when counted)
+  not read again while they are unchanged.
 - **Never overwritten.** The file is append-only. The Bridge compares the
   last 4 KiB it copied with the file at the same place: a file that shrank,
   or whose bytes there differ (rewritten, replaced), is copied whole as the
