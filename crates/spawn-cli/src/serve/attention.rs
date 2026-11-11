@@ -211,7 +211,8 @@ pub(super) fn attention() -> Result<Value, String> {
 /// `told` escalations, each `{tag, session_id, agent_id, why, judgement}`,
 /// `judgement` true for one that is a worker's own judgement (attention,
 /// stopped at its prompt, a nudge that did not help): the alert step decides
-/// which of them are the supervisor's to act on.
+/// which of them are the supervisor's to act on. `lines` are the plan's log
+/// lines, for the loop's log.
 pub(crate) fn supervisor_dispatch(store: &spawn_postgres::PostgresStore) -> Result<Value, String> {
     let disk = store.host_disk().map_err(super::err)?;
     let (bounds, _) = dispatch::Bounds::from_env();
@@ -264,7 +265,9 @@ pub(crate) fn supervisor_dispatch(store: &spawn_postgres::PostgresStore) -> Resu
             })
         })
         .collect();
-    Ok(json!({ "question": question, "items": items }))
+    // The plan's once-said log lines (an order no task can meet) are said
+    // by whoever reads the plan first in this process: the loop logs them.
+    Ok(json!({ "question": question, "items": items, "lines": reading.lines }))
 }
 
 /// The owner's holds of `holds` (`PostgresStore::source_holds`: `{now_ms,
