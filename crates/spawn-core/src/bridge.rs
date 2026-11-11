@@ -405,6 +405,12 @@ struct Follow {
     /// processes (TerminalHost::terminate), so it is tried again only after
     /// [`END_RETRY_MS`], discard or not (rev-f on 204d1a1f).
     kill_failed_at: Option<i64>,
+    /// Why the end's last attempt failed (its kill, or its final
+    /// checkpoint), until one gets through. A stop that finds its end not
+    /// done says this, whichever pass of the Bridge read the failure: the
+    /// ticks go on with the end too, and may read a kill's result before
+    /// the stop is claimed again.
+    end_error: Option<String>,
     /// The end's kill, running off the Bridge's loop while it waits for the
     /// engine's processes to exit ([`TerminalHost::terminate_waits`]):
     /// each end attempt reads whether it is done; until then the end is
@@ -2036,12 +2042,13 @@ impl Bridge {
             };
             if let Err(error) = killed {
                 active.follow.kill_failed_at = Some(self.clock.now().0);
-                report
-                    .warnings
-                    .push(format!("terminate {}: {error}", active.terminal()));
+                let error = format!("terminate {}: {error}", active.terminal());
+                active.follow.end_error = Some(error.clone());
+                report.warnings.push(error);
                 return Ok(false);
             }
             active.follow.kill_failed_at = None;
+            active.follow.end_error = None;
             return self.finish_end(agent_id, session, active, ending, report);
         }
         // A checkpoint whose record waits is recorded before the end.
@@ -2084,6 +2091,7 @@ impl Bridge {
             return self.end_failed(agent_id, session, active, (false, error), report);
         }
         active.follow.kill_failed_at = None;
+        active.follow.end_error = None;
         let committed = self.checkpoint(
             agent_id,
             session,
@@ -2257,6 +2265,7 @@ impl Bridge {
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
         let (checkpoint, error) = failure;
+        active.follow.end_error = Some(error.clone());
         active.follow.end_failures = active.follow.end_failures.saturating_add(1);
         let failures = active.follow.end_failures;
         let what = if checkpoint {
@@ -2700,6 +2709,7 @@ impl Bridge {
             held.follow.end_failures = active.follow.end_failures;
             held.follow.end_tried_at = active.follow.end_tried_at;
             held.follow.kill_failed_at = active.follow.kill_failed_at;
+            held.follow.end_error.clone_from(&active.follow.end_error);
             held.follow.killing.clone_from(&active.follow.killing);
             held.follow.evidence = active.follow.evidence;
         }
@@ -3719,6 +3729,7 @@ impl Bridge {
                 held.follow.end_failures = ending.follow.end_failures;
                 held.follow.end_tried_at = ending.follow.end_tried_at;
                 held.follow.kill_failed_at = ending.follow.kill_failed_at;
+                held.follow.end_error.clone_from(&ending.follow.end_error);
                 held.follow.killing.clone_from(&ending.follow.killing);
                 held.follow.evidence = ending.follow.evidence;
             }
@@ -4245,6 +4256,7 @@ impl Bridge {
             held.follow.end_failures = active.follow.end_failures;
             held.follow.end_tried_at = active.follow.end_tried_at;
             held.follow.kill_failed_at = active.follow.kill_failed_at;
+            held.follow.end_error.clone_from(&active.follow.end_error);
             held.follow.killing.clone_from(&active.follow.killing);
             held.follow.evidence = active.follow.evidence;
         }
@@ -4256,12 +4268,36 @@ impl Bridge {
             return Ok(Handled::Waiting);
         }
         if report.warnings.is_empty() {
-            report.warnings.push(format!(
-                "{}: the end is stalled and its final checkpoint retried every {} s; a \
-                 discard command gives the uncommitted work up",
-                claimed.session_id,
-                END_RETRY_MS / 1000
-            ));
+            // Nothing failed in this attempt: the end waits on a failure an
+            // earlier one met (the kill's, read by a tick's pass over the
+            // session, or the checkpoint's), and says which.
+            report
+                .warnings
+                .push(if active.follow.kill_failed_at.is_some() {
+                    format!(
+                        "{}: the end waits: {}; the kill is tried again within {} s",
+                        claimed.session_id,
+                        active
+                            .follow
+                            .end_error
+                            .as_deref()
+                            .unwrap_or("the runner outlived its kill"),
+                        END_RETRY_MS / 1000
+                    )
+                } else {
+                    format!(
+                        "{}: the end is stalled and its final checkpoint retried every {} s{}; a \
+                     discard command gives the uncommitted work up",
+                        claimed.session_id,
+                        END_RETRY_MS / 1000,
+                        active
+                            .follow
+                            .end_error
+                            .as_deref()
+                            .map(|error| format!(" ({error})"))
+                            .unwrap_or_default()
+                    )
+                });
         }
         Ok(Handled::Finished(Outcome::Failed(
             report.warnings.join("; "),
