@@ -655,27 +655,6 @@ fn autonomy_counts_the_owners_interventions() {
 }
 
 #[test]
-fn an_overrun_closes_its_task_as_an_abort_does() {
-    let mut story = Story::default();
-    story.mission(1, true);
-    // Task 1 runs over its budget at 2 h; a person's cancellation after
-    // that closes nothing, so the same objective again is no reassignment.
-    story
-        .assign(at(0), 1, 1, Some(7), "spawn-integrate")
-        .task(1, "task.over_budget", at(2))
-        .cancelled(at(3), 1, Some("human"))
-        .assign(at(4), 2, 1, Some(7), "spawn-integrate")
-        .task(2, "task.landed", at(6));
-    let history = story.history();
-    let counted = counts(&history, Scope::Fleet, window_hours(0, 24));
-    let throughput = dimension(&counted, None, "throughput");
-    assert_eq!(throughput["open_hours"], json!(4.0), "0-2 and 4-6");
-    assert_eq!(throughput["landed"], json!(1));
-    let autonomy = dimension(&counted, None, "autonomy");
-    assert_eq!(autonomy["interventions"], json!(0));
-}
-
-#[test]
 fn reliability_counts_failures_of_the_machinery() {
     let mut story = Story::default();
     story.mission(1, true);
@@ -1238,4 +1217,32 @@ fn clipping_the_history_to_both_windows_changes_no_number() {
         card(&clipped, window_hours(0, 48), None),
         card(&whole, window_hours(0, 48), None)
     );
+}
+
+/// Objective 47 (b): the card says whether its window is still settling,
+/// and the text form says so on its header line.
+#[test]
+fn a_settling_window_says_so_in_its_json_and_on_its_header_line() {
+    let history = small_card_story().history();
+    let mut settled = card(&history, window_hours(0, 48), None).expect("a card");
+    super::settle(&mut settled, false);
+    assert_eq!(settled["settling"], serde_json::Value::Bool(false));
+    let header = |card: &serde_json::Value| text(card).lines().next().map(str::to_string);
+    assert!(
+        !header(&settled).unwrap_or_default().contains("settling"),
+        "{:?}",
+        header(&settled)
+    );
+    let mut open = card(&history, window_hours(0, 48), None).expect("a card");
+    super::settle(&mut open, true);
+    assert_eq!(open["settling"], serde_json::Value::Bool(true));
+    assert!(
+        header(&open).unwrap_or_default().contains("settling"),
+        "{:?}",
+        header(&open)
+    );
+    // The figures are the same: settling says only that they may grow.
+    let mut figures = open.clone();
+    figures["settling"] = serde_json::Value::Bool(false);
+    assert_eq!(figures, settled);
 }

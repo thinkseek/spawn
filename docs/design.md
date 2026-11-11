@@ -108,7 +108,7 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | `WorkspaceStore` | `ensure_branch(branch, from)`、`mount`、`commit`、`unmount` | 工作区的四个动作；`ensure_branch` 返回 `Existing` 或 `Created(Fork)`，新分支建在 `from`（另一个 agent 的分支头或完整 commit id，`ForkFrom::parse` 校验）或基线，已有分支忽略 `from`；`commit` 返回 `Created(CommitId)` 或 `Unchanged` |
 | | `merge_base(workspace)` | 把基线（源的 `main`）合进已挂载、处于两轮之间空闲的工作区的分支（Bridge 不调用；集成器判 `conflict` 时、调度器给活着的 worker 键入任务前调用，见 spawn-cli 的 `main_merge`）：`Current`、`Merged{commit,files}` 或 `Conflicted{files,marked}`；内容冲突把带冲突标记的合并写进目录（`marked`），等标记解决后的 checkpoint 提交合并；目录与分支不符、或标记表达不了的冲突什么都不改。默认实现返回 `Current`（内存实现可配置结果） |
 | `TerminalHost` | `start`、`submit_text`、`send_keys`、`is_alive`、`runner`、`capture_tail`、`read_from`、`write_new`、`terminate`、`terminate_waits` | 终端生命周期、屏尾读取与读写引擎的文件（`write_new` 只建不改：路径上已有东西时返回 false，文件整体出现或不出现；`terminate_waits` 为真的实现（tmux）其 `terminate` 要等进程退出，Bridge 把它放到自己的线程上跑，不占串行循环）；`start` 之后每个方法都再传一次 `WorkspaceId`，实现层不在进程间保存状态 |
-| `TranscriptArchive` | `copies`、`read`、`append(copy, at, bytes)` | 原生会话记录的存档（见 [storage.md](./storage.md#the-transcript-archive)）：每个 agent 的每个原生会话有编号的副本，副本只增长，`at` 不等于副本当前长度的追加被拒，已存的字节从不改写；本地实现在 `<root>/.transcripts` |
+| `TranscriptArchive` | `copies`、`read`、`append(copy, at, bytes)`、`put_progress`、`progress` | 原生会话记录的存档（见 [storage.md](./storage.md#the-transcript-archive)）：每个 agent 的每个原生会话有编号的副本，副本只增长，`at` 不等于副本当前长度的追加被拒，已存的字节从不改写；每个原生会话一条进度记录（归档到哪、何时读过、缺的第一行的时间），本地实现在 `<root>/.transcripts`，进度记录在 `<root>/.transcripts-progress` |
 
 错误类型：
 
@@ -184,7 +184,7 @@ checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.commit
 
 恢复：每次 `spawn tick` 是新进程，从位置 0 折叠全部事件得到活跃执行、原生会话 id 与待提交的 checkpoint。`Resume` 复用最新原生会话 id，新开 Execution 与 mount，优先 `--resume`；逻辑 Session 不变。
 
-会话记录存档（`spawn_core::transcripts`）：每次 `turn_stopped` 的 checkpoint 之后、结束流程里 `terminate` 之后 `unmount` 之前，Bridge 把会话记录自上次复制以来新增的字节追加进 `TranscriptArchive`；最后复制的 4 KiB 与文件同一位置不一致（被截短、改写或替换）时整份复制成下一个副本，旧副本不动。`Resume` 在 mount 之后、启动终端之前检查会话记录：缺失时从最新副本恢复（tick 报告里警告）；缺失且没有副本、而日志里有从它读出的事件时，恢复失败并卸载，不在旧 id 下空白启动。日志不存会话记录内容，也不记复制。
+会话记录存档（`spawn_core::transcripts`）：执行活着时，Bridge 每一轮读到 transcript 变长（或复制曾失败）就复制一次，没新增就什么都不复制；结束流程里 `terminate` 之后 `unmount` 之前，Bridge 把会话记录自上次复制以来新增的字节追加进 `TranscriptArchive`，并写下进度记录；复制失败时警告（失败原因变了才再警告），下一轮再试，执行结束后也一样，重启后从进度记录接着试；最后复制的 4 KiB 与文件同一位置不一致（被截短、改写或替换）时整份复制成下一个副本，旧副本不动。`Resume` 在 mount 之后、启动终端之前检查会话记录：缺失时从最新副本恢复（tick 报告里警告）；缺失且没有副本、而日志里有从它读出的事件时，恢复失败并卸载，不在旧 id 下空白启动。日志不存会话记录内容，也不记复制。
 
 ## 6. 屏尾判定
 
@@ -421,7 +421,7 @@ Bridge、Observer、调度器（`deliver.rs`、`dispatch.rs`）、集成器（`i
 
 ## 15. 记分卡（`spawn scorecard`）
 
-所有者的目标（2026-11-06）是 Spawn 在每个维度上同时优秀，处在帕累托前沿上：没有哪个维度靠另一个维度退步来变好。`spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]` 一次量出全部八个维度，只读记录：`session_control` 的控制记录（它们的 `recorded_at_ms`）、`spawn_commands` 的行，以及 `$SPAWN_WORKSPACE_ROOT/.transcripts`（或 `--root` 下的 `.transcripts`）里归档的 transcript。没有新增手工维护的计数器、表或列：读同一份记录的人得到同样的数，给出 `--until` 之后同样的参数得到逐字节相同的 JSON。看板的 Scorecard 视图（`web/src/components/scorecard/`）读 `GET /api/scorecard?mission=&since=&until=`，它回答的正是 `spawn scorecard --json` 同样参数的 JSON；`spawn serve` 以 reader 登录读库，从它自己的 `SPAWN_WORKSPACE_ROOT` 读 transcript。代码在 `crates/spawn-cli/src/scorecard.rs`（`history` 折叠记录，`measure` 计数，`transcripts` 读 token，`time` 读写时间），事实的查询在 `crates/spawn-postgres/src/scorecard.rs`。
+所有者的目标（2026-11-06）是 Spawn 在每个维度上同时优秀，处在帕累托前沿上：没有哪个维度靠另一个维度退步来变好。`spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]` 一次量出全部八个维度，只读记录：`session_control` 的控制记录（它们的 `recorded_at_ms`）、`spawn_commands` 的行，以及 `$SPAWN_WORKSPACE_ROOT/.transcripts`（或 `--root` 下的 `.transcripts`）里归档的 transcript。没有新增手工维护的计数器、表或列：读同一份记录的人得到同样的数，给出 `--until` 之后同样的参数得到逐字节相同的 JSON（窗口已 settled 之后）。成本只读归档，Bridge 在每一轮发现 transcript 变长时就把它复制进归档（不只在回合结束时），所以运行中回合的模型调用在一轮之内就被计入；JSON 的 `settling` 为 true 表示归档可能还缺窗口结束（`until`）之前的某次调用：依据 `<root>/.transcripts-progress` 里每个原生会话的进度记录判断（某条 `until` 之前写的行还没归档，或执行在 `until` 时还活着而 Spawn 自那之后没读过它的 transcript），不按时间长短；归档追上之后为 false，此后数字不再变。文本形式在首行写 settling，看板在窗口下方显示 `web/src/settling.ts` 的提示（docs/storage.md「The transcript archive」）。看板的 Scorecard 视图（`web/src/components/scorecard/`）读 `GET /api/scorecard?mission=&since=&until=`，它回答的正是 `spawn scorecard --json` 同样参数的 JSON；`spawn serve` 以 reader 登录读库，从它自己的 `SPAWN_WORKSPACE_ROOT` 读 transcript。代码在 `crates/spawn-cli/src/scorecard.rs`（`history` 折叠记录，`measure` 计数，`transcripts` 读 token，`time` 读写时间），事实的查询在 `crates/spawn-postgres/src/scorecard.rs`。
 
 **窗口。** `<time>` 是 RFC 3339（`2026-10-02T00:00:00Z`）或往回的一段时长（`36h`、`7d`）。`--until` 默认是现在（数据库的时钟 `spawn_now_ms()`，一段时长从现在往回数）；`--since` 默认 `7d`，一段时长从窗口的终点往回数，所以给定 `--until` 就固定了窗口。窗口是 [since, until)，至多 400 天；前一个窗口是紧挨在它前面、同样长的一段。不带 `--mission`：先是全队（fleet），然后按 id 列出每个在任一窗口里有任务在开、落地或有任何计入记录的任务（在 `until` 之前指派）的 mission；带 `--mission N`：只有那个 mission（没有记录提到它就拒绝）。事实在一个快照里读：`until` 之前的每条记录，之后的一条都不读。
 
@@ -442,8 +442,7 @@ Times are a record's `recorded_at_ms`; an event belongs to a window or day when 
 
 **定义没说死的地方，这样读：**
 
-- 一个任务只落地一次（第一条落地记录）；关闭之后的记录不再落地、不再关闭它。`task.aborted` 和 `task.over_budget`（超预算中止，折叠成 `cancelled`）也是一次取消：它关闭任务，也算重试链里“取消过的一次尝试”，但它是集成器的，不是人的干预。
-- 同样的干预和落地也由经验视图逐条给出（`spawn_interventions`、`spawn_outcomes` 的 `landed` 加 `accepted`；docs/fleet-architecture.md §4），`GET /api/scorecard/fleet` 按窗口数它们：与本节的 autonomy 和 throughput 是同一个定义。
+- 一个任务只落地一次（第一条落地记录）；关闭之后的记录不再落地、不再关闭它。`task.aborted`（超预算中止，折叠成 `cancelled`）也是一次取消：它关闭任务，也算重试链里“取消过的一次尝试”，但它是集成器的，不是人的干预。
 - 重新指派的前导时间：一个目标在本 mission 里上一次落地之前的尝试属于那次落地，不属于这一次（循环的目标每轮从自己的第一次尝试量起）。
 - 一个会话上同时开着几个任务时（常驻工人的队列），命令归最早指派的那个（投递按最早的先送）。
 - 取消再指派：每个人的取消，配它之后（按流的顺序）在同一 mission 里第一个同目标（或无目标时同 brief）的指派，各算一次。

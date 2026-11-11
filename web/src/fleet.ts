@@ -4,7 +4,7 @@
 
 import type { SessionState } from "./api";
 import type { Labels } from "./label.ts";
-import type { CommandMessage } from "./messages.ts";
+import type { CommandMessage, MessageActed } from "./messages.ts";
 import { labels } from "./label.ts";
 import { readApi } from "./api";
 import type { GateRoom, Memory } from "./resources";
@@ -512,7 +512,14 @@ function normalizeMessage(value: unknown): CommandMessage | null {
     answered_at_ms: optionalNumber(value.answered_at_ms),
     taken: optionalNumber(value.taken) ?? 0,
     not_taken: value.not_taken === true,
+    acted: normalizeActed(value.acted),
+    acted_at_ms: optionalNumber(value.acted_at_ms),
   };
+}
+
+function normalizeActed(value: unknown): MessageActed | null {
+  if (!isObject(value) || typeof value.outcome !== "string") return null;
+  return { outcome: value.outcome, why: typeof value.why === "string" ? value.why : null };
 }
 
 const sessionPath = (id: string) => encodeURIComponent(id);

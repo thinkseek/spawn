@@ -1225,7 +1225,7 @@ function CommandItem({ record }: { record: CommandRecord }) {
         {line && (
           <span
             className={record.message?.not_taken ? "text-warning" : "text-faint-foreground"}
-            title="The message this command typed, by its id: typed, taken by the engine, answered"
+            title="The message this command typed, by its id: typed, taken by the engine, answered, and the agent's own answer (spawn ack, or its task's report): done or declined"
           >
             {line}
           </span>

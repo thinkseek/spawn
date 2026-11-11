@@ -116,6 +116,9 @@ export interface Scorecard {
   until_ms: number | null;
   previous_since_ms: number | null;
   min_n: number;
+  /** The archive may still lack a model call made before `until_ms`: the
+   * cost may still grow (web/src/settling.ts says it in words). */
+  settling: boolean;
   scopes: ScorecardScope[];
 }
 
@@ -262,6 +265,7 @@ export function normalizeScorecard(value: unknown): Scorecard {
     until_ms: optionalNumber(raw.until_ms),
     previous_since_ms: optionalNumber(raw.previous_since_ms),
     min_n: number(raw.min_n),
+    settling: raw.settling === true,
     scopes: list(raw.scopes).map((entry) => {
       const scope = object(entry);
       return {

@@ -777,7 +777,7 @@ the system. Its continuity is a design requirement, not a best effort:
 | The context window is spent | `Prompt is too long` in an API error line: `context_exhausted`, and the handoff path below |
 | The engine's resource envelope kills it, or the disk fills | `memory_limit` (objective 029) resumes at once; `disk_full` waits until a reading of the workspace's filesystem is at or above `SPAWN_DISK_FLOOR_GB` |
 | Spawn's database is unreachable | The loop does not exit: only passes that could not reach it are not failed ones, the engines run on, and at the first pass that gets through the recovery records `database_unavailable` for each execution that lived through it, clears it, and the Bridge checkpoints what the engines wrote meanwhile |
-| A transcript Claude Code deleted | The resume puts it back from the transcript archive (`<root>/.transcripts`, copied at turn ends and execution ends; docs/storage.md, "The transcript archive"); one gone with no copy fails the resume instead of starting blank under the old id |
+| A transcript Claude Code deleted | The resume puts it back from the transcript archive (`<root>/.transcripts`, copied on each pass it grew and at execution ends; docs/storage.md, "The transcript archive"); one gone with no copy fails the resume instead of starting blank under the old id |
 | The native session cannot be resumed (transcript lost with no copy, resume fails three times, or there is none) | `start` a fresh native session inside the same Spawn session, on the same workspace and branch, with a handoff prompt rebuilt from the log: mission, open worker tasks, recent escalations and decisions, the interruption and the branch head |
 | The context window fills | Claude Code compacts on its own; the handoff path above is the fallback when it cannot |
 | A deploy changes its charter | Each new native session's start records the hash of the charter it gives; when the native session that runs holds another (after a loop restart, a resume or a compaction), the dispatcher types the new charter in at its next idle prompt, once, by record (§3, the supervisor) |
@@ -1187,8 +1187,54 @@ A message's id is its command's id, carried end to end:
   or ended an execution since (an idle pass reads next to nothing, objective
   023). An open one reaches
   `/api/alerts` and Home's Needs you, which names the agent and the message.
-  Out of scope (objective 046): an agent's explicit acknowledgement, what a
-  reply says, and retrying a message not taken.
+  Out of scope: what a reply says, and retrying a message not taken.
+- **Acted: the agent's own answer (objective 046).** Answered says the turn
+  a message started ended, not that the agent did what it asked. The agent
+  says which: `spawn ack <command id> done|declined [<why>]`, run in its
+  own pane (a why is required for `declined`: the words after the outcome;
+  optional for `done`). The marker is followed by one line that tells it
+  so (`message.rs`'s `answer_line`: `spawn ack <id> done`, or `spawn ack
+  <id> declined <why>`, and that a task's delivery is answered by its
+  report). The pane has no database login, and the ack needs none: it is
+  a file, written whole (hidden, then renamed) into the workspace the
+  pane was launched in, `$SPAWN_WORKSPACE/.spawn/acks/` (the Bridge sets
+  `SPAWN_WORKSPACE` beside `SPAWN_AGENT_ID`, `SPAWN_SESSION_ID` and
+  `SPAWN_EXECUTION_ID`; never the shell's current directory, so an ack
+  from a subdirectory lands there too; `.spawn/` is in no checkpoint).
+  `spawn ack` exits 0 once the file is in place, and non-zero, saying why
+  and writing nothing, for a missing or non-numeric id, an outcome other
+  than done or declined, a decline with no why, or outside an agent's pane
+  (no `SPAWN_WORKSPACE`, or one that is not the agent's workspace under the
+  loop's root). On every dispatcher pass the loop reads each agent's acks
+  from its workspace the safe way (`agent_files`: no symlink followed),
+  oldest first (`crates/spawn-cli/src/ack.rs`), records each and removes
+  it; an ack made while the loop is down waits there until it is back.
+  Whose ack it is, is the workspace's: it counts only for a message into
+  that agent's session, never by an id it carries, so setting
+  `SPAWN_SESSION_ID` to another worker's session, or writing an ack file by
+  hand, answers nothing of another agent's. An ack of another session's
+  message, an unknown id, a command that types nothing, or a task's
+  delivery records nothing, and the loop's log says so. Recorded:
+  `message.acted {command_id, outcome, why}` in the message's session,
+  keyed `<id>:acted`, so the first answer stands and a later one records
+  nothing, whatever restarts (`crates/spawn-postgres/src/acks.rs`).
+- **A report answers its delivery.** A task's report answers the message
+  that delivered it (the command the task's latest `task.delivered` before
+  the report names): an Outcome of done is `done`; blocked or failed is
+  `declined`, the Outcome line its why. It is recorded from the
+  `task.reported` record, once (the same key), on the next pass after the
+  report is taken; a loop's first pass reads every report, so one taken
+  just before a stop is answered once it is back. Only a tracked message
+  (the Bridge typed its marker) is answered.
+- **Read.** The commands API's `message` gains `acted` (`{outcome, why}`,
+  null until answered; `why` null for a done with none) and `acted_at_ms`;
+  `state` is `acted` once answered, whatever else. The agent page appends
+  it to what it says of the message: " · done", " · declined: <why>" (a why
+  over 80 characters cut to its first 79 and "…"). A message never
+  answered is no alert. The lifecycle above, its alert, the report's rules
+  and the dispatcher's order are unchanged; `message.acted` is no fact
+  about the engine for the dispatcher's judgements, as the storage records
+  are not.
 
 ### 3.5 Cost: what the model calls cost
 
@@ -1249,39 +1295,9 @@ next command and who sent it, the end of the execution) follows it in the
 same log. Nothing exports these episodes or replays them through the rules
 (§9).
 
-Four views derive the experience from the log and the command queue, one
-row per item with its time (`at_ms`), readable by the reader (`spawn
-serve`) and the supervisor (`crates/spawn-postgres/sql/schema.sql`):
-
-- `spawn_decisions` (`at_ms`, `tier`, `session_id`, `agent_id`, `source`):
-  every judgement, tier `rules` when the rules judged and `model`
-  otherwise, and every command at its creation, by its principal:
-  `dispatcher` (`spawn-dispatch`), `supervisor` (`spawn_supervisor`),
-  `human` (`human`, `spawn`), `liveness` (`spawn-liveness`), any other
-  principal its own tier.
-- `spawn_interventions` (`at_ms`, `kind`, ...): the owner's interventions
-  exactly as the scorecard's autonomy counts them (docs/design.md §15):
-  `command`, `resume`, `owner_task`, `cancel_reassign`.
-- `spawn_outcomes` (`at_ms`, `outcome`, `task_id`, `mission_id`, `by`):
-  each task's closing record: `landed`, `accepted` (by review, on a mission
-  without a gate), `cancelled`, `aborted`, `over_budget`.
-- `spawn_escalations` (`at_ms`, `tag`, `command_id`): each distinct tag of
-  the dispatcher's inputs into the supervisor (`Escalation::tag`), once, at
-  the first command that carried it.
-
-`GET /api/scorecard/fleet?window=24h|7d|30d|90d[&until=<RFC 3339>]`
-counts them over `[until - window, until)` (`until` defaults to the
-database's now; any other window is 400): the ladder by tier, agent-hours
-(every execution's running time in the window) and human decisions per
-agent-hour, escalations, interventions by kind, outcomes, landings per day,
-the judgements as `/api/fleet`'s last hour counts them, and each mission
-open in the window with its idle hours (its hours open less the union of
-its tasks' open intervals; `idle` past half). Ratios and hours are rounded
-to 3 decimals as the scorecard rounds (`crates/spawn-postgres/src/
-experience.rs`). The Scorecard's "How the fleet decides" reads it for the
-page's window (`web/src/fleetDecisions.ts`, `decisionsFromApi`);
-`/api/fleet`'s 24 h ladder and human decisions per agent-hour read the
-same view.
+The ladder metrics in the UI (decisions per tier, escalations, human
+decisions per agent-hour over the last 24 h) are computed from the log by
+`spawn serve`.
 
 ## 5. Interface
 
@@ -1300,8 +1316,8 @@ read is 405): `/api/overview`, `/api/fleet` (with
 `/api/fleet/<session>/judgements` and `/commands`, each command with
 `waiting` once the Bridge holds it for the agent's turn), `/api/attention`,
 `/api/missions`, `/api/events`, `/api/session/<id>`, `/api/pane/<id>`,
-`/api/rsi` (with `/api/rsi/task/<id>` and `/api/rsi/pane`),
-`/api/scorecard` and `/api/scorecard/fleet` (§4) (`crates/spawn-cli/src/serve.rs`; the answer of
+`/api/rsi` (with `/api/rsi/task/<id>` and `/api/rsi/pane`) and
+`/api/scorecard` (`crates/spawn-cli/src/serve.rs`; the answer of
 `/api/attention` is documented in `crates/spawn-cli/src/serve/attention.rs`).
 
 It writes two things. The first is a person's input to a session, `POST
@@ -1453,9 +1469,9 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
 
 ## 9. Not built
 
-- **Outcome labels and episode export:** the experience views (§4) count
-  decisions, interventions, outcomes and escalations, but nothing labels a
-  judgement with what followed it, exports the episodes or replays them.
+- **Experience views in SQL** (`decisions`, `outcomes`, `interventions`)
+  and outcome labels: the log holds what followed each judgement, but
+  nothing derives, exports or replays the episodes.
 - **RSI objectives over the corpus**, judged by black-box replay through the
   candidate's `spawn` binary on a corpus snapshot the candidate cannot edit:
   rules coverage (share of episodes decided by rules up, agreement with the
@@ -1471,6 +1487,7 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
   transient API error is the recovery's (§3.1): bounded for an engine that
   ended, unbounded for one at its prompt; telling the supervisor after N
   live retries is not built.
+- **Ladder health over long periods.** The UI's figures cover the last 24 h.
 - **The backlog, scenarios and gate versioned with the source**
   (docs/storage.md).
 - **The Review point in code** (§1.1). Review sessions are run by the lead
@@ -2793,7 +2810,13 @@ are per-agent uids or a mount per engine.
   the operator and a later pass judges again (a git that cannot run a
   merge is the host's problem, not the work's: objective 008).
   TERM kills the gate with the process (no record), and the next
-  integrator judges the task again from nothing. A drain does not: a
+  integrator judges the task again from nothing, when its gates run as
+  its children. When a systemd user manager answers, each gate runs in a
+  unit of its own (gate v2 step 2, design-gate-survives-restart.md): a
+  stop or a restart stops no gate, the next integrator adopts each one
+  still running and records it once, and deploy/deploy.sh stops such an
+  integrator at once, without a drain (deploy/controller.sh keeps the
+  controller a running judging's gate came from). A drain does not: a
   drain request (SIGUSR1, or `spawn integrate --drain` with the same
   root, which waits until that integrator is gone) records
   `integrator.draining` {`gates`, `bound_s`}, starts no gate, owner
@@ -2802,7 +2825,9 @@ are per-agent uids or a mount per engine.
   `integrator.drained` and exits 0. At `SPAWN_INTEGRATE_DRAIN_SECS`
   (default 7200, from the draining record) it kills the gates still
   running (their process groups; nothing is recorded for them), records
-  `integrator.drain_expired` naming their tasks, exits 0, and the
-  dispatcher tells the supervisor once (`host
+  `integrator.drain_expired` naming their tasks (gates in units are not
+  its processes: they keep running, the record says `left_running`, and
+  the next integrator adopts them), exits 0, and the dispatcher tells the
+  supervisor once (`host
   integrator-drain-expired-<event id>`). One integrator per database: its
   advisory lock belongs to the connection, kept while any gate runs.
