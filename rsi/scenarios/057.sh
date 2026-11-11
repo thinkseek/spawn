@@ -19,10 +19,15 @@
 # Required (read through `GET /api/alerts` and web/src/home.ts's needsYou
 # under node over it); a fake model judge scores the sessions it is told to
 # as stuck 0.9, WAITING:
-#   (1) the supervisor, with no mission at all (nothing to dispatch), judged
-#       stuck after a turn: no `agent_stuck` alert for it.
+#   (1) the supervisor with nothing to dispatch (no question to the owner,
+#       no escalation, no objective waiting to be assigned: the tasks in
+#       work are the workers'), judged stuck after a turn: no
+#       `agent_stuck` alert for it.
 #   (2) a worker whose task is reported (waiting for its gate), judged stuck
 #       after a turn: no `agent_stuck` alert for it.
+#   (1) and (2) are read once worker 2's alert of (3) has fired: the alert
+#   step reads every session's latest judgement on each pass, and worker
+#   2's is recorded after theirs, so that pass read them (the barrier).
 #   (3) a worker whose task is delivered (its own work), judged stuck after a
 #       turn: one open `agent_stuck` alert; its evidence names `task` (the
 #       task id) and `command` (the one command that acts on it: `spawn task
@@ -368,8 +373,6 @@ stuck_judged() {
         harness "the fake judge was not asked about $2 within 60 s of a turn (judge log: $(tail -n 5 "$WORK/judge.log" | tr '\n' ' '))"
     wait_until 30 observed_stuck "$2" "$from" ||
         harness "no judgement of $2 with stuck >= 0.5 was recorded within 30 s of the judge's answer"
-    # Three passes of the alert step (every 2 s) read it.
-    sleep 7
 }
 # observed_stuck <session> <ms>: the Observer recorded a judgement of the
 # session with stuck >= 0.5 since then (the alert step reads the latest).
@@ -407,42 +410,48 @@ summary() { printf '%s' "$1" | jq -c '[.[] | {key, state, text}]' | head -c 400;
 loop_pid=$!
 start_serve
 
-# --- (1) the supervisor, with nothing to dispatch --------------------------------------
+# --- the world's agents: the supervisor, worker 1 (its task reported) and
+# worker 2 (its task delivered) -----------------------------------------------------------
 
 wait_until 60 judged_since session_supervisor 0.05 0 ||
     harness "the supervisor was not judged within 60 s of the loop's start (loop: $(tail -n 3 "$WORK/loop.log" | tr '\n' ' '))"
-stuck_judged agent_supervisor session_supervisor one
-got=$(stuck_of session_supervisor)
-expect_eq "$(printf '%s' "$got" | jq length)" 0 \
-    "(1) agent_stuck alerts for the supervisor, judged stuck (0.9, WAITING) with no mission at all: $(summary "$got")"
-: >"$WORK/stuck-sessions"
-note "(1) checked: an idle supervisor with nothing to dispatch"
-
-# --- (2) a worker whose task is reported ----------------------------------------------
-
 record '{"type":"mission.added","id":1,"text":"057 objectives","origin":"human","sources":[]}' >/dev/null
 record "{\"type\":\"mission.configured\",\"id\":1,\"accept\":\"gate\",\"gate\":\"$WORK/ctl/scenarios\"}" >/dev/null
-assign 1
-wait_until 60 delivered 1 || harness "task #1 was not delivered within 60 s (it is $(task_state 1))"
-wait_until 60 judged_since session_worker_objective_1 0.05 0 ||
-    harness "worker 1 was not judged after its brief within 60 s"
+for task in 1 2; do
+    assign "$task"
+    wait_until 60 delivered "$task" || harness "task #$task was not delivered within 60 s (it is $(task_state "$task"))"
+    wait_until 60 judged_since "session_worker_objective_$task" 0.05 0 ||
+        harness "worker $task was not judged after its brief within 60 s"
+done
 reported 1 >/dev/null
+
+# The supervisor and worker 1 are judged stuck after a turn each, and the
+# judgements are recorded; then worker 2. Worker 2's alert is the barrier:
+# the alert step reads every session's latest judgement on each pass, so
+# the pass that fires on worker 2's (recorded after the other two) read
+# theirs too. Without it, (1) and (2) are not judged.
+stuck_judged agent_supervisor session_supervisor one
 stuck_judged agent_worker_objective_1 session_worker_objective_1 two
-got=$(stuck_of session_worker_objective_1)
-expect_eq "$(printf '%s' "$got" | jq length)" 0 \
-    "(2) agent_stuck alerts for worker 1, judged stuck (0.9, WAITING) while its task is reported (waiting for its gate): $(summary "$got")"
-note "(2) checked: a worker whose task is reported"
+stuck_judged agent_worker_objective_2 session_worker_objective_2 three
+open_two() { [ "$(stuck_of session_worker_objective_2 | jq -c '[.[] | .state]')" = '["open"]' ]; }
+if wait_until 30 open_two; then
+    # --- (1) the supervisor, with nothing to dispatch ----------------------------------
+    got=$(stuck_of session_supervisor)
+    expect_eq "$(printf '%s' "$got" | jq length)" 0 \
+        "(1) agent_stuck alerts for the supervisor, judged stuck (0.9, WAITING) with nothing to dispatch (no question, no escalation, no objective waiting to be assigned; the tasks in work are the workers'): $(summary "$got")"
+    note "(1) checked: an idle supervisor with nothing to dispatch"
+    # --- (2) a worker whose task is reported ------------------------------------------
+    got=$(stuck_of session_worker_objective_1)
+    expect_eq "$(printf '%s' "$got" | jq length)" 0 \
+        "(2) agent_stuck alerts for worker 1, judged stuck (0.9, WAITING) while its task is reported (waiting for its gate): $(summary "$got")"
+    note "(2) checked: a worker whose task is reported"
+else
+    check_failed "(3) worker 2, judged stuck (0.9) while its task is delivered, has no open agent_stuck alert 30 s after the judgement was recorded: $(summary "$(stuck_of session_worker_objective_2)"); (1) and (2) are not judged without it"
+fi
 
 # --- (3) a worker stuck in its own work -------------------------------------------------
 
-assign 2
-wait_until 60 delivered 2 || harness "task #2 was not delivered within 60 s (it is $(task_state 2))"
-wait_until 60 judged_since session_worker_objective_2 0.05 0 ||
-    harness "worker 2 was not judged after its brief within 60 s"
-stuck_judged agent_worker_objective_2 session_worker_objective_2 three
 got=$(stuck_of session_worker_objective_2)
-expect_eq "$(printf '%s' "$got" | jq -c '[.[] | .state]')" '["open"]' \
-    "(3) agent_stuck alerts for worker 2, judged stuck (0.9) while its task is delivered: $(summary "$got")"
 expect_eq "$(printf '%s' "$got" | jq -c '[.[] | .evidence.task]')" '[2]' "(3) the alert's evidence.task"
 expect_eq "$(printf '%s' "$got" | jq -c '[.[] | .evidence.command]')" '["spawn task restart --id 2"]' \
     "(3) the alert's evidence.command (the one command that acts on it)"
