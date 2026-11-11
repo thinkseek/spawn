@@ -375,6 +375,7 @@ const ALERT_TITLES: Record<string, string> = {
   judge_down: "The model judge answers no call",
   integrator_down: "The integrator is down",
   controller_behind: "A landing waits for its deploy",
+  deploy_failed: "A deploy failed",
   mission_halted: "A mission is halted",
   task_undelivered: "A task was never delivered",
   admission_wait: "Work waits for room",

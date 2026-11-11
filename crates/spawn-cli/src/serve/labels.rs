@@ -893,6 +893,25 @@ fn label_missions(missions: Option<&mut Value>, context: &Context) {
     }
 }
 
+/// `/api/cost`'s task rows labelled: each its `label`, the task's label as
+/// `/api/missions` gives it, or null for a task `context` does not hold.
+pub(super) fn label_cost(answer: &mut Value, context: &Context) {
+    for row in answer
+        .get_mut("tasks")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        let label = row["task"]
+            .as_i64()
+            .and_then(|id| context.task_fields(id))
+            .map_or(Value::Null, |fields| fields["label"].clone());
+        if let Some(fields) = row.as_object_mut() {
+            fields.insert("label".to_string(), label);
+        }
+    }
+}
+
 /// `/api/rsi`'s missions labelled, as [`label_board`] does, each resident
 /// too; an objective title a brief lacks comes from the loaded backlog (the
 /// mission's `objectives` rows).

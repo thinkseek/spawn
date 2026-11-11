@@ -15,18 +15,35 @@ use crate::PostgresStore;
 /// the time of the earliest message the record holds (null: none). `usd` is the sum of the
 /// priced messages' costs, 0 for an entry with only unpriced ones (`null`
 /// for a model that is priced nowhere in the window); `unpriced_tokens` the
-/// four counts of the messages with no price. Most costly first.
+/// four counts of the messages with no price (on every row: a model's, an
+/// execution's models' too, 0 when all of them are priced). Most costly
+/// first.
+///
+/// `landed` (objective 060): the tasks that landed or were accepted in the
+/// window, as the scorecard counts a landing (`spawn_task_spans`: an
+/// assignment closed by `task.landed`, or by an accepting review on a
+/// mission without a gate then), each task once however often it was sent
+/// back or assigned again; `usd_per_landing` the window's priced dollars
+/// over them (null: none landed). Each mission's row carries its own, from
+/// its tasks and its dollars.
 const WINDOW: &str = r"
 with m as materialized (
   select c.*, c.input_tokens + c.output_tokens + c.cache_write_tokens
               + c.cache_read_tokens as total
     from spawn_cost_messages c
    where c.at_ms >= $1 and c.at_ms < $2
+), landings as materialized (
+  select s.mission_id, count(distinct s.task_id) as landed
+    from spawn_task_spans s
+   where s.outcome in ('landed', 'accepted')
+     and s.closed_at_ms >= $1 and s.closed_at_ms < $2
+   group by s.mission_id
 ), by_execution_model as (
   select execution_id, model, sum(usd) as usd,
          jsonb_build_object('input', sum(input_tokens), 'output', sum(output_tokens),
                             'cache_write', sum(cache_write_tokens),
-                            'cache_read', sum(cache_read_tokens)) as tokens
+                            'cache_read', sum(cache_read_tokens)) as tokens,
+         coalesce(sum(total) filter (where usd is null), 0) as unpriced_tokens
     from m group by execution_id, model
 )
 select jsonb_build_object(
@@ -40,25 +57,34 @@ select jsonb_build_object(
               'unpriced_tokens', coalesce(sum(total) filter (where usd is null), 0))
               from m),
   'models', coalesce((select jsonb_agg(jsonb_build_object(
-                'model', model, 'usd', usd, 'tokens', tokens)
+                'model', model, 'usd', usd, 'tokens', tokens,
+                'unpriced_tokens', unpriced_tokens)
                 order by usd desc nulls last, model)
               from (select model, sum(usd) as usd,
                            jsonb_build_object('input', sum(input_tokens),
                                               'output', sum(output_tokens),
                                               'cache_write', sum(cache_write_tokens),
-                                              'cache_read', sum(cache_read_tokens)) as tokens
+                                              'cache_read', sum(cache_read_tokens)) as tokens,
+                           coalesce(sum(total) filter (where usd is null), 0) as unpriced_tokens
                       from m group by model) g), '[]'::jsonb),
+  'landed', (select coalesce(sum(landed), 0) from landings),
+  'usd_per_landing', (select coalesce(sum(m.usd), 0)
+                             / nullif((select sum(landed) from landings), 0)
+                        from m),
   'missions', coalesce((select jsonb_agg(jsonb_build_object(
-                'mission', mission_id, 'usd', usd, 'tokens', tokens,
-                'unpriced_tokens', unpriced_tokens)
-                order by usd desc, unpriced_tokens desc, mission_id)
+                'mission', g.mission_id, 'usd', g.usd, 'tokens', g.tokens,
+                'unpriced_tokens', g.unpriced_tokens,
+                'landed', coalesce(l.landed, 0),
+                'usd_per_landing', g.usd / nullif(l.landed, 0))
+                order by g.usd desc, g.unpriced_tokens desc, g.mission_id)
               from (select mission_id, coalesce(sum(usd), 0) as usd,
                            jsonb_build_object('input', sum(input_tokens),
                                               'output', sum(output_tokens),
                                               'cache_write', sum(cache_write_tokens),
                                               'cache_read', sum(cache_read_tokens)) as tokens,
                            coalesce(sum(total) filter (where usd is null), 0) as unpriced_tokens
-                      from m where mission_id is not null group by mission_id) g), '[]'::jsonb),
+                      from m where mission_id is not null group by mission_id) g
+              left join landings l on l.mission_id = g.mission_id), '[]'::jsonb),
   'tasks', coalesce((select jsonb_agg(jsonb_build_object(
                 'task', task_id, 'mission', mission_id, 'usd', usd, 'tokens', tokens,
                 'unpriced_tokens', unpriced_tokens)
@@ -85,7 +111,8 @@ select jsonb_build_object(
                 'execution', execution_id, 'agent', agent_id, 'task', task_id, 'usd', usd,
                 'tokens', tokens, 'unpriced_tokens', unpriced_tokens,
                 'models', (select coalesce(jsonb_agg(jsonb_build_object(
-                                     'model', b.model, 'usd', b.usd, 'tokens', b.tokens)
+                                     'model', b.model, 'usd', b.usd, 'tokens', b.tokens,
+                                     'unpriced_tokens', b.unpriced_tokens)
                                      order by b.usd desc nulls last, b.model), '[]'::jsonb)
                              from by_execution_model b where b.execution_id = g.execution_id))
                 order by usd desc, unpriced_tokens desc, execution_id)
@@ -125,8 +152,8 @@ impl PostgresStore {
     }
 
     /// The cost of the messages timed in `[since_ms, until_ms)` ([`WINDOW`]):
-    /// `{total, models, missions, tasks, agents, executions,
-    /// counted_since_ms}`.
+    /// `{total, landed, usd_per_landing, models, missions, tasks, agents,
+    /// executions, counted_since_ms}`.
     pub fn cost_window(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
         self.query_json(WINDOW, &[&since_ms, &until_ms])
     }
