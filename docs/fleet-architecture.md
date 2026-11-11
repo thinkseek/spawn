@@ -1135,11 +1135,14 @@ A message's id is its command's id, carried end to end:
   after the text (the workspace notices typed before the text are part of
   the same message; `crates/spawn-core/src/message.rs`, the Bridge's
   `type_once`). A one-line text carries it at the end of its line instead,
-  after a space, when it is a start's or a resume's prompt (typed as the
-  engine comes up) or goes into a pane whose program reads keys raw (its tty
-  has `-icanon`, which the tmux host reads with `stty -a`): such a program,
-  unless it asked for a bracketed paste, takes each pasted line break as
-  Enter, and the marker would be a prompt of its own. Every typing carries it: an input, and a start's or a
+  after a space, whatever the pane reads: a program that reads keys raw (its
+  tty has `-icanon`), unless it asked for a bracketed paste, takes each
+  pasted line break as Enter, and one that reads lines submits each pasted
+  line, so a marker on a line of its own would be a prompt of its own, and
+  the engine could act on the text, or exit, before the Bridge's Enter
+  (regression 003 under load; rev-e's analysis of 2026-11-11). The answer
+  line (objective 046, below) follows the marker the same way: after a
+  space on a one-line text, so the paste stays one line. Every typing carries it: an input, and a start's or a
   resume's prompt. The Bridge records `message.typed` (keyed
   `cmd_<id>:message`) once the marked text is staged and before its
   `typing` step: the record that says this command's text carried the
@@ -1212,7 +1215,8 @@ A message's id is its command's id, carried end to end:
   says which: `spawn ack <command id> done|declined [<why>]`, run in its
   own pane (a why is required for `declined`: the words after the outcome;
   optional for `done`). The marker is followed by one line that tells it
-  so (`message.rs`'s `answer_line`: `spawn ack <id> done`, or `spawn ack
+  so (after a space, on the same line, for a text of one line;
+  `message.rs`'s `answer_line`: `spawn ack <id> done`, or `spawn ack
   <id> declined <why>`, and that a task's delivery is answered by its
   report). The pane has no database login, and the ack needs none: it is
   a file, written whole (hidden, then renamed) into the workspace the
@@ -1276,6 +1280,28 @@ it per execution and prices it (objective 041;
   supervisor's) and that task's mission. A restarted loop counts no message
   twice and loses none: the rows are the record, and the fold reads the
   events again from ten minutes before the newest it folded.
+- **Counted from the archive too** (objective 048,
+  `crates/spawn-cli/src/cost/archive.rs`). An execution the Bridge read
+  before it emitted usage events (every one that ended before 041), or
+  whose events are gone, is in the transcript archive and in no cost. Each
+  time `spawn loop` starts, a thread of its own, with its own connection and
+  never holding up a pass, reads the archive alone
+  (`<root>/.transcripts/<agent>/<native>.jsonl` and its copies
+  `<native>.<n>.jsonl`; never the live transcripts, never the event log)
+  and counts every assistant message the record lacks by the same rules
+  (once per id across every line and copy of the agent, read as the Bridge
+  reads a line), for the agent whose directory holds it, that agent's
+  execution running at the message's time (the latest started at or before
+  it; one timed before all of them, the agent's first), the task the agent
+  held then by the rule above, and that task's mission, priced when
+  recorded (`spawn_cost_archive_record`, owner only, in batches of 500). A
+  message the record holds keeps what it holds; a message of an agent with
+  no recorded execution is not counted, and the loop's log says how many it
+  skipped. `spawn_cost_archive_files` marks each file counted with its
+  length and modification time: an agent whose files are all as marked is
+  not read again, one with any file changed is read whole. A file that
+  cannot be read, or a line that is not JSON, is skipped; an agent whose
+  count fails is logged and counted again at the next start.
 - **Priced when recorded.** `SPAWN_MODEL_PRICES` is a JSON object from model
   name to `{"input", "output", "cache_write", "cache_read"}`, US dollars per
   million tokens, each a number not below zero; a message costs each count
@@ -1293,7 +1319,10 @@ it per execution and prices it (objective 041;
 - **Served and shown.** `GET /api/cost?window=24h|7d` (24h when absent; any
   other window 400) answers the messages timed in [now minus the window,
   now) on the database's clock: `{window, since_ms, until_ms, total, models,
-  missions, tasks, agents, executions}`, each with its `usd` (the exact sum;
+  missions, tasks, agents, executions, counted_since_ms}` (the last: the
+  time of the earliest message the record holds, null when none; the page
+  says "Counted since <YYYY-MM-DD HH:MM> UTC" on a window that starts
+  before it), each with its `usd` (the exact sum;
   0 for an entry of unpriced use only, null for an unpriced model), its
   `tokens` and its `unpriced_tokens`. The dashboard's Cost page (sidebar)
   shows the total and each mission, task and agent over 24 h and 7 d

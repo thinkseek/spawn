@@ -16,3 +16,12 @@ integrate::database_tests::a_judging_of_the_same_source_finds_main_moved_and_is_
 # Gate v2 step 2, commit 2 (rev-f): start_time_of moved from tmux.rs to spawn-host's process.rs with its
 # test, under the same name; the test runs on as process::tests::a_start_time_is_read_past_a_command_with_parentheses.
 tmux::tests::a_start_time_is_read_past_a_command_with_parentheses
+#
+# P15 (after the 003 marker fix d00de15e): where the Bridge puts a message's
+# marker no longer depends on whether a pane reads lines, so
+# `TerminalHost::reads_lines` and the tmux host's `stty -a` reading went with
+# their only caller. What the test asserted (a raw reader told from a line
+# reader) decides nothing now; the marker's place is pinned by
+# a_one_line_input_into_a_pane_that_reads_lines_carries_its_marker_on_its_line
+# and an_input_of_several_lines_carries_its_marker_on_a_line_of_its_own.
+tmux_tells_a_pane_that_reads_lines_from_one_that_reads_keys_raw

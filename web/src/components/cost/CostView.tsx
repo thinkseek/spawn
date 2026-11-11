@@ -77,6 +77,14 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
           )
         }
       />
+      {figures?.since && (
+        <p
+          title="The cost record holds no message from before this time, so this window's figures may be low"
+          className="px-4 pt-2 text-caption text-warning"
+        >
+          {figures.since}
+        </p>
+      )}
       {figures ? (
         <div className="grid grid-cols-1 lg:grid-cols-3">
           <Rows title="Missions" rows={figures.missions} />
@@ -95,7 +103,8 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
  * US dollars: the total, each mission, task and agent, most costly first
  * (crates/spawn-cli/src/cost.rs prices each call when it is recorded).
  * Use on a model with no price is marked, and a figure of only such use
- * reads "unpriced", never $0.00. Strictly read-only.
+ * reads "unpriced", never $0.00. A window that starts before the earliest
+ * message the record holds says since when it counts. Strictly read-only.
  */
 export function CostView() {
   const day = usePoll("cost-24h", (signal) => fetchCost("24h", signal), POLL_MS);

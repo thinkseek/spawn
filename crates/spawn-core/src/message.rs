@@ -6,13 +6,15 @@
 //! the Bridge types ends with the command's marker, `[spawn message #<id>]`,
 //! on a line of its own after the text (the workspace notices before the
 //! text are part of the same message). A text of one line carries it at the
-//! end of that line instead, after a space, when it is a start's or a
-//! resume's prompt (typed as the engine comes up) or goes into a pane whose
-//! program reads keys raw ([`crate::port::TerminalHost::reads_lines`]
-//! false): such a program, unless it asked for a bracketed paste, takes each
-//! pasted line break as Enter, and would take the marker as a prompt of its
-//! own. After the marker comes one line that says how to answer the
-//! message ([`answer_line`], objective 046). The engine's transcript keeps what it
+//! end of that line instead, after a space, whatever the pane reads: a
+//! program that reads keys raw takes each pasted line break as Enter (unless
+//! it asked for a bracketed paste), and one that reads lines submits each
+//! pasted line; either would take a marker on a line of its own as a prompt
+//! of its own, and act on the text before the Bridge's Enter. After the
+//! marker comes one line that says how to answer the message
+//! ([`answer_line`], objective 046); for a text of one line it follows the
+//! marker after a space, on the same line. The engine's transcript keeps
+//! what it
 //! was given, so the transcript's user line that holds the marker is the
 //! message taken (`message.taken`, crate::ingest), whatever its text: two
 //! messages with the same text are told apart by their ids, never by the
@@ -41,9 +43,9 @@ pub fn answer_line(command: CommandId) -> String {
 
 /// `text` as the Bridge types it for `command`: the text, then its marker on
 /// a line of its own, then the line that says how to answer it
-/// ([`answer_line`]); after a space each when `one_line` (a prompt that
-/// starts an engine, or a pane that reads keys raw) and the text is one
-/// line.
+/// ([`answer_line`]); after a space each, on the text's own line, when
+/// `one_line` (the Bridge passes it for every text of one line) and the text
+/// is one line.
 pub fn marked(text: &str, command: CommandId, one_line: bool) -> String {
     if one_line && !text.contains('\n') {
         format!("{text} {} {}", marker(command), answer_line(command))

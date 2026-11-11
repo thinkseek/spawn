@@ -512,6 +512,8 @@ fn tmux_types_into_a_terminal_and_sees_the_echo() {
     assert_eq!(states, vec![(name, spawn_core::port::Runner::Gone)]);
 }
 
+<<<<<<< cb917fbfdbbe279c1cf3b3b2b90f6b3b708dc558
+=======
 /// Whether a pane's program reads lines: `cat` reads its tty in canonical
 /// mode; a program that ran `stty raw` reads keys, and a line break pasted
 /// into it is Enter (the Bridge then keeps a message's marker on the text's
@@ -558,6 +560,7 @@ fn tmux_tells_a_pane_that_reads_lines_from_one_that_reads_keys_raw() {
         .expect("terminate succeeds");
 }
 
+>>>>>>> ec303cf09a80443efb9157e8795d302f7d36ec47
 /// A prompt longer than tmux's message size (16 KiB; an objective's brief
 /// can be) is staged and pasted whole: `set-buffer <text>` refused it as
 /// "command too long", and the dispatcher retried that refusal forever.
