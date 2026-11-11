@@ -381,6 +381,7 @@ const ALERT_TITLES: Record<string, string> = {
   backup_stale: "A backup is late",
   source_away: "A mission's source is not a directory on this host",
   validator_defect: "A validator fails on main too",
+  mission_idle: "A mission has no work",
   message_not_taken: "A message was not taken",
 };
 
@@ -423,8 +424,11 @@ export interface MissionRow {
 export interface MissionsToday {
   /** Active missions with open tasks (or halted), most recently moved first. */
   rows: MissionRow[];
-  /** Active missions with nothing open: one folded line. */
-  quiet: Array<{ id: number | null; name: string }>;
+  /** Active missions with nothing open: one folded line. `idle_ms`: how
+   * long a mission that takes its work from an objective backlog has had
+   * no task in work, since its last task ended (objective 058); null for
+   * owner work, or a mission that never had a task. */
+  quiet: Array<{ id: number | null; name: string; idle_ms: number | null }>;
   closed: number;
 }
 
@@ -470,7 +474,13 @@ export function missionsToday(missions: Missions | null, now: number): MissionsT
       continue;
     }
     if (kind === "idle" && !mission.halted) {
-      quiet.push({ id: mission.id, name });
+      let ended: number | null = null;
+      for (const task of mission.tasks) {
+        const at = latestRecord(task);
+        if (at !== null && (ended === null || at > ended)) ended = at;
+      }
+      const idle_ms = mission.objectives && ended !== null ? Math.max(0, now - ended) : null;
+      quiet.push({ id: mission.id, name, idle_ms });
       continue;
     }
     const inFlight: InFlight[] = mission.tasks
@@ -505,6 +515,29 @@ export function missionsToday(missions: Missions | null, now: number): MissionsT
   }
   rows.sort((left, right) => right.moved - left.moved);
   return { rows: rows.map(({ moved: _moved, ...row }) => row), quiet, closed };
+}
+
+/** The card's words when no mission has work open: each mission that
+ * takes its work from a backlog, with how long it has had none ("No mission
+ * has work open: #4 Spawn RSI none for 3 h, #6 Supply PA none for 20 h."). */
+export function noWorkText(model: MissionsToday): string {
+  const idle = model.quiet.filter((mission) => mission.idle_ms !== null);
+  if (idle.length === 0) return "No mission has work open.";
+  return `No mission has work open: ${idle
+    .map((mission) => `#${mission.id} ${mission.name} none for ${ageText(mission.idle_ms ?? 0)}`)
+    .join(", ")}.`;
+}
+
+/** The folded line's words for the missions with nothing open, a backlog
+ * mission with how long ("#4 Spawn RSI (no work for 3 h), #8 Owner work"). */
+export function quietText(quiet: MissionsToday["quiet"]): string {
+  return quiet
+    .map((mission) =>
+      mission.idle_ms === null
+        ? `#${mission.id} ${mission.name}`
+        : `#${mission.id} ${mission.name} (no work for ${ageText(mission.idle_ms)})`,
+    )
+    .join(", ");
 }
 
 // ---------------------------------------------------------------------------
