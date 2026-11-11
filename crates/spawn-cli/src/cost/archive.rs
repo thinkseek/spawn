@@ -174,7 +174,9 @@ fn files(directory: &Path) -> Result<Vec<ArchiveFile>, String> {
                 .modified()
                 .ok()
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX));
+                .map_or(0, |since| {
+                    i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+                });
             Some(ArchiveFile {
                 file: name,
                 length: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
@@ -241,7 +243,9 @@ struct Folded {
 
 impl Folded {
     fn total(usage: &[u64; 4]) -> u64 {
-        usage.iter().fold(0_u64, |sum, count| sum.saturating_add(*count))
+        usage
+            .iter()
+            .fold(0_u64, |sum, count| sum.saturating_add(*count))
     }
 
     /// Fold one more line of the same message in.
@@ -368,7 +372,13 @@ mod tests {
     fn copy_files_are_the_native_and_its_numbered_copies() {
         assert!(copy_file("abc-123.jsonl"));
         assert!(copy_file("abc-123.2.jsonl"));
-        for name in ["abc.x.jsonl", "abc..jsonl", ".jsonl", "abc.json", "a b.jsonl"] {
+        for name in [
+            "abc.x.jsonl",
+            "abc..jsonl",
+            ".jsonl",
+            "abc.json",
+            "a b.jsonl",
+        ] {
             assert!(!copy_file(name), "{name}");
         }
     }
@@ -470,8 +480,9 @@ mod tests {
         let root = scratch("count");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut client = owner(&url, &schema);
-            let prices = Prices::parse(r#"{"x":{"input":1,"output":1,"cache_write":1,"cache_read":1}}"#)
-                .expect("prices");
+            let prices =
+                Prices::parse(r#"{"x":{"input":1,"output":1,"cache_write":1,"cache_read":1}}"#)
+                    .expect("prices");
             // 2026-11-10T10:00:00Z, and the executions at 10:00 and 11:00.
             let ten = 1_794_304_800_000_i64;
             started(&mut client, "agent_w_1", "exec_a", ten);
@@ -510,9 +521,27 @@ mod tests {
             assert_eq!(
                 first,
                 vec![
-                    ("m-a".into(), "exec_a".into(), ten + 1_800_000, 2, "x".into()),
-                    ("m-b".into(), "exec_b".into(), ten + 5_400_000, 4, "x".into()),
-                    ("m-early".into(), "exec_a".into(), ten - 3_600_000, 1, "x".into()),
+                    (
+                        "m-a".into(),
+                        "exec_a".into(),
+                        ten + 1_800_000,
+                        2,
+                        "x".into()
+                    ),
+                    (
+                        "m-b".into(),
+                        "exec_b".into(),
+                        ten + 5_400_000,
+                        4,
+                        "x".into()
+                    ),
+                    (
+                        "m-early".into(),
+                        "exec_a".into(),
+                        ten - 3_600_000,
+                        1,
+                        "x".into()
+                    ),
                 ],
                 "each at its execution then; one before them all at the first"
             );
@@ -546,7 +575,10 @@ mod tests {
             // Marked as read: a message removed from the record is not
             // counted again until a file changes.
             client
-                .execute("delete from spawn_cost_messages where message_id = 'm-c'", &[])
+                .execute(
+                    "delete from spawn_cost_messages where message_id = 'm-c'",
+                    &[],
+                )
                 .expect("delete");
             let _ = count(&store, &root, &prices);
             assert_eq!(rows(&mut client).len(), 3, "unchanged files are not read");
@@ -561,7 +593,11 @@ mod tests {
             );
             let _ = count(&store, &root, &prices);
             let last = rows(&mut client);
-            assert_eq!(last.len(), 5, "a changed file reads the agent again: {last:?}");
+            assert_eq!(
+                last.len(),
+                5,
+                "a changed file reads the agent again: {last:?}"
+            );
             let priced: Vec<(String, bool)> = client
                 .query(
                     "select message_id, usd is not null from spawn_cost_messages
