@@ -4962,11 +4962,68 @@ from (
 ) m
 where m.mission_id is not null;
 
+-- A person's intents (objective 049; docs/fleet-architecture.md §0): a
+-- command of the board or the CLI (principal `human` or `spawn`) continues
+-- the intent of the latest earlier command of the same principal, session
+-- and action (the whole JSON, as jsonb) when that one finished failed at or
+-- before this one was created, at most 60 minutes before it; otherwise it
+-- starts one. From the records alone, never the text's meaning. One row per
+-- intent: its time (its first command's creation), its first command's id,
+-- its commands in order and their count, and its outcome, its last
+-- command's (`taken`, `failed`, `pending` while unfinished). The arrays
+-- after give each command's creation, finish and result in the same order,
+-- so a reader can take the intent as it stood at an earlier time (the
+-- commands created before it, the last one's result if it finished before).
+create or replace view spawn_human_intents as
+with person as (
+    select c.id, c.principal, c.agent_id, c.session_id, c.action, c.created_at_ms,
+           c.finished_at_ms, c.succeeded,
+           lag(c.succeeded) over k as prev_succeeded,
+           lag(c.finished_at_ms) over k as prev_finished_at_ms
+      from spawn_commands c
+     where c.principal in ('human', 'spawn')
+    window k as (partition by c.principal, c.session_id, c.action order by c.id)
+), marked as (
+    select p.*,
+           not coalesce(p.prev_succeeded is false
+                        and p.prev_finished_at_ms <= p.created_at_ms
+                        and p.created_at_ms - p.prev_finished_at_ms <= 3600000, false) as starts
+      from person p
+), chained as (
+    select m.*,
+           sum(case when m.starts then 1 else 0 end)
+               over (partition by m.principal, m.session_id, m.action order by m.id) as chain
+      from marked m
+), intents as (
+    select min(c.created_at_ms) as at_ms,
+           min(c.id) as intent,
+           c.principal,
+           (array_agg(c.agent_id order by c.id))[1] as agent_id,
+           c.session_id,
+           array_agg(c.id order by c.id) as commands,
+           count(*) as attempts,
+           (array_agg(c.finished_at_ms order by c.id desc))[1] as last_finished_at_ms,
+           (array_agg(c.succeeded order by c.id desc))[1] as last_succeeded,
+           array_agg(c.created_at_ms order by c.id) as created_at_ms,
+           array_agg(c.finished_at_ms order by c.id) as finished_at_ms,
+           array_agg(c.succeeded order by c.id) as succeeded,
+           (array_agg(c.action order by c.id))[1] as action
+      from chained c
+     group by c.principal, c.session_id, c.action, c.chain
+)
+select i.at_ms, i.intent, i.principal, i.agent_id, i.session_id, i.commands, i.attempts,
+       case when i.last_finished_at_ms is null then 'pending'
+            when i.last_succeeded then 'taken'
+            else 'failed' end as outcome,
+       i.created_at_ms, i.finished_at_ms, i.succeeded, i.action
+from intents i;
+
 -- Every decision: each judgement at its time (tier `rules` when the rules
--- judged, else `model`) and each command at its creation, by its
--- principal's tier (`dispatcher`, `supervisor`, `human` for the board's and
--- the CLI's, `liveness`, any other principal as its own tier). `source`:
--- the judge or the principal.
+-- judged, else `model`), each command at its creation, by its principal's
+-- tier (`dispatcher`, `supervisor`, `liveness`, any other principal as its
+-- own tier), and each intent of a person (the board's and the CLI's
+-- commands, `spawn_human_intents`: a refused command sent again is one) at
+-- its time, tier `human`. `source`: the judge or the principal.
 create or replace view spawn_decisions as
 select j.recorded_at_ms as at_ms,
        case when j.observation ->> 'judge' = 'rules' then 'rules' else 'model' end as tier,
@@ -4978,39 +5035,42 @@ union all
 select c.created_at_ms,
        case c.principal when 'spawn-dispatch' then 'dispatcher'
                         when 'spawn_supervisor' then 'supervisor'
-                        when 'human' then 'human'
-                        when 'spawn' then 'human'
                         when 'spawn-liveness' then 'liveness'
                         else c.principal end,
        c.session_id,
        c.agent_id,
        c.principal
-from spawn_commands c;
+from spawn_commands c
+where c.principal not in ('human', 'spawn')
+union all
+select i.at_ms, 'human', i.session_id, i.agent_id, i.principal
+from spawn_human_intents i;
 
 -- Every intervention, exactly the scorecard's (docs/design.md §15, autonomy
--- (a)-(d)): `command`, a person's or the CLI's command, at its creation;
+-- (a)-(d)): `command`, a person's intent (`spawn_human_intents`: a refused
+-- command sent again is one), at its time, `command_id` its first command;
 -- `resume`, a `mission.resumed`; `owner_task`, a task a person assigned on
 -- a mission accepted by review; `cancel_reassign`, a person's cancellation
 -- of an open task followed by the same work (the same objective, or without
--- one the same brief) assigned again in the mission, at that assignment.
+-- one the same brief) assigned again in the mission, at that assignment
+-- (`task_id` the new task, `cancelled_task_id` the one cancelled).
 create or replace view spawn_interventions as
-select c.created_at_ms as at_ms, 'command'::text as kind, null::bigint as mission_id,
-       null::bigint as task_id, c.id as command_id
-from spawn_commands c
-where c.principal in ('human', 'spawn')
+select i.at_ms, 'command'::text as kind, null::bigint as mission_id,
+       null::bigint as task_id, i.intent as command_id, null::bigint as cancelled_task_id
+from spawn_human_intents i
 union all
-select r.at_ms, 'resume', spawn_experience_int(r.record -> 'id'), null, null
+select r.at_ms, 'resume', spawn_experience_int(r.record -> 'id'), null, null, null
 from spawn_experience_records r
 where r.type = 'mission.resumed' and spawn_experience_int(r.record -> 'id') is not null
 union all
-select a.assigned_at_ms, 'owner_task', a.mission_id, a.task_id, null
+select a.assigned_at_ms, 'owner_task', a.mission_id, a.task_id, null, null
 from spawn_experience_assignments a
 where a.type = 'task.assigned' and a.created_by = 'human'
   and coalesce((select s.review from spawn_experience_settings s
                  where s.mission_id = a.mission_id and s.seq < a.seq
                  order by s.seq desc limit 1), true)
 union all
-select n.assigned_at_ms, 'cancel_reassign', t.mission_id, n.task_id, null
+select n.assigned_at_ms, 'cancel_reassign', t.mission_id, n.task_id, null, t.task_id
 from spawn_task_spans t
 join spawn_experience_records x on x.seq = t.closed_seq
 cross join lateral (
@@ -5098,7 +5158,7 @@ begin
     execute format('grant select on mission_missions, mission_residents, mission_tasks, '
                    'mission_source_holds, mission_source_reds, spawn_alerts, '
                    'spawn_alert_scores, spawn_decisions, spawn_interventions, spawn_outcomes, '
-                   'spawn_escalations to %I',
+                   'spawn_escalations, spawn_human_intents to %I',
                    spawn_login_role('spawn_supervisor'));
 end
 $$;
