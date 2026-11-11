@@ -68,7 +68,6 @@ test("gate room: one row per gated mission, the waiting gates longest first", ()
 
 import { readFileSync } from "node:fs";
 
-import { normalizeFleet } from "../src/fleet.ts";
 import { normalizeStorage, storageSize, storageView } from "../src/resources.ts";
 
 const MB = 1024 ** 2;
@@ -119,12 +118,14 @@ test("no fall, no growth, no days: the card says so and invents nothing", () => 
   assert.equal(bare.lasts, null);
 });
 
-test("the health carries the storage, null from an older server", () => {
-  const fleet = normalizeFleet({ agents: [], health: { storage: STORAGE } });
-  assert.deepEqual(fleet.health.storage, normalizeStorage(STORAGE));
-  assert.equal(fleet.health.storage?.projects?.before, 40);
-  assert.equal(fleet.health.storage?.workspaces?.files, null);
-  assert.equal(normalizeFleet({ agents: [], health: {} }).health.storage, null);
+test("the health's storage is read as the server reports it, null from an older server", () => {
+  const storage = normalizeStorage(STORAGE);
+  assert.equal(storage?.projects?.before, 40);
+  assert.equal(storage?.workspaces?.files, null, "the workspaces are not counted");
+  assert.deepEqual(storage?.database?.tables[0], { name: "spawn_events", bytes: 2.5 * GIB });
+  assert.equal(normalizeStorage(undefined), null);
+  const rootless = normalizeStorage({ ...STORAGE, archive: null, workspaces: null, free_bytes: null });
+  assert.deepEqual([rootless?.archive, rootless?.workspaces, rootless?.free_bytes], [null, null, null]);
 });
 
 test("the host section's Resources are followed by a Storage card drawn from storageView", () => {
