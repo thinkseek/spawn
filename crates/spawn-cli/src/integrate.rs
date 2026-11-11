@@ -478,6 +478,7 @@ mod host;
 mod inputs;
 pub(crate) mod judging;
 pub(crate) mod owner;
+mod retained;
 mod shadow;
 mod warm;
 
@@ -14142,6 +14143,84 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// An owner judging with no verdict keeps what its gate printed (P26):
+    /// a host fault and an abort each leave a readable log under the
+    /// integrator's root, stdout then stderr marked `! `, and a
+    /// `source.push_no_verdict` naming the request, the judging and the
+    /// log's path. Still no outcome: nothing moves, nothing is refused, and
+    /// the request is judged again after its backoff.
+    #[test]
+    fn an_owner_no_verdict_keeps_its_gates_log_and_names_it() {
+        let gate = "echo '| == base: the line the owner needs'\n\
+                    echo 'a harness complaint' >&2\n\
+                    printf '%s\\n' '{\"host_fault\":true,\"scenario\":\"check-tests.sh\",\"on\":\"base\",\"runs\":\"1, then 1 on the base\",\"reason\":\"r\"}' >\"$SPAWN_GATE_VERDICT\"\n\
+                    exit 6\n";
+        let (base, source, scenarios, mut integrator) = world("owner-kept", gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_mins(10),
+            cap: 3,
+        };
+        let db = Db::new("owner_kept");
+        let m0 = source_main(&source);
+        db.gated_mission(&source, &scenarios);
+        let commit = owner_commit_files(
+            &base,
+            &source,
+            &[("scenarios/protected", ""), ("K.md", "k\n")],
+            "owner: k",
+        );
+        let request = gated_request(&db, &source, &commit, "k");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        assert_eq!(source_main(&source), m0, "nothing moves");
+        assert!(control_records(&db, "source.moved").is_empty());
+        assert!(control_records(&db, "source.push_refused").is_empty());
+        let kept = control_records(&db, "source.push_no_verdict");
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0]["request"], json!(request));
+        let judging = kept[0]["judging"].as_str().expect("names its judging");
+        assert!(
+            kept[0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("the host's fault on check-tests.sh")),
+            "{kept:?}"
+        );
+        let path = std::path::PathBuf::from(kept[0]["log"].as_str().expect("names its log"));
+        assert_eq!(
+            path.parent(),
+            Some(base.join("host").join(super::retained::DIRECTORY).as_path())
+        );
+        assert!(
+            path.to_string_lossy()
+                .ends_with(&format!("-request-{request}-{judging}.log")),
+            "{}",
+            path.display()
+        );
+        let log = std::fs::read_to_string(&path).expect("the kept log reads");
+        assert!(log.contains("| == base: the line the owner needs"), "{log}");
+        assert!(log.contains("! a harness complaint"), "{log}");
+        assert!(
+            !base
+                .join("host")
+                .join(super::judging::DIRECTORY)
+                .join(judging)
+                .exists(),
+            "the judging's own directory is still removed"
+        );
+        let backoff = Arc::clone(&integrator.owner.borrow().backoff);
+        assert_eq!(
+            backoff
+                .lock()
+                .expect("backoff")
+                .get(&request)
+                .map(|(faults, _)| *faults),
+            Some(1),
+            "judged again after its backoff"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// An owner judging whose gate aborts (a non-zero exit with no verdict
     /// to believe: a harness error) records nothing and is judged again
     /// after its backoff, as the host's other failures are (the lead,
@@ -14168,6 +14247,11 @@ mod database_tests {
             "an abort is no refusal"
         );
         assert!(control_records(&db, "source.moved").is_empty());
+        let kept = control_records(&db, "source.push_no_verdict");
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        let log = std::fs::read_to_string(kept[0]["log"].as_str().expect("names its log"))
+            .expect("the abort's log reads");
+        assert!(log.contains("half a run"), "{log}");
         let backoff = Arc::clone(&integrator.owner.borrow().backoff);
         assert_eq!(
             backoff
