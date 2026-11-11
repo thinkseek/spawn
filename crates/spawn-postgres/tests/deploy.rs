@@ -249,11 +249,14 @@ fn only_the_owner_records_deploys() {
     );
 }
 
-/// S23: an owner's landing request with no outcome yet, waiting for its
-/// judging or in it, is what `owner_request` names, the oldest on the
-/// source first; a request on another source is not; an outcome naming it
-/// (`source.push_refused`, or a `source.moved` with its `request`) ends it.
-/// deploy/on-landing.sh waits while it is there.
+/// S23: the owner's landing requests with no outcome yet, waiting for their
+/// judging or in it, are what `owner_requests` lists, oldest first, each
+/// `{request, commit, at_ms}`; a request on another source is not there; an
+/// outcome naming one (`source.push_refused`, or a `source.moved` with its
+/// `request`) takes it out, and a `source.push_no_verdict` does not. They
+/// are the integrator's queue on the source (`source_pushes_pending`, the
+/// one SQL). deploy/on-landing.sh waits for the first whose commit main
+/// does not hold.
 #[test]
 fn an_owners_landing_request_without_an_outcome_is_named_until_it_has_one() {
     let (store, schema) = store("deploy_owner_request");
@@ -275,26 +278,44 @@ fn an_owners_landing_request_without_an_outcome_is_named_until_it_has_one() {
             )
             .expect("the owner's request")
     };
-    assert_eq!(
-        landing(&store, &commit('a'), None)["owner_request"],
-        Value::Null
-    );
+    // The requests `owner_requests` lists on `source`, oldest first, after
+    // checking they are the integrator's queue there (one SQL).
+    let pending = |source: &str, main: &str| -> Vec<Value> {
+        let read = store.main_landing(source, main, None).expect("read");
+        let listed: Vec<Value> = read["owner_requests"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a list: {read}"))
+            .iter()
+            .map(|request| request["request"].clone())
+            .collect();
+        let queue: Vec<Value> = store
+            .source_pushes_pending()
+            .expect("the queue")
+            .as_array()
+            .expect("a list")
+            .iter()
+            .filter(|request| request["source"] == source)
+            .map(|request| request["request"].clone())
+            .collect();
+        assert_eq!(listed, queue, "the integrator's queue on {source}");
+        listed
+    };
+    assert!(pending(SOURCE, &commit('a')).is_empty());
 
     let elsewhere = ask(ELSEWHERE, 'e');
-    assert_eq!(
-        landing(&store, &commit('a'), None)["owner_request"],
-        Value::Null,
+    assert!(
+        pending(SOURCE, &commit('a')).is_empty(),
         "another source's request holds nothing here"
     );
     let first = ask(SOURCE, 'b');
     let second = ask(SOURCE, 'c');
+    assert_eq!(pending(SOURCE, &commit('a')), [json!(first), json!(second)]);
     let read = landing(&store, &commit('a'), None);
-    assert_eq!(
-        read["owner_request"]["request"], first,
-        "the oldest: {read}"
+    assert_eq!(read["owner_requests"][0]["commit"], commit('b'), "{read}");
+    assert!(
+        read["owner_requests"][0]["at_ms"].as_i64().is_some(),
+        "{read}"
     );
-    assert_eq!(read["owner_request"]["commit"], commit('b'));
-    assert!(read["owner_request"]["at_ms"].as_i64().is_some(), "{read}");
 
     // A judging that ended with no verdict leaves it pending.
     control(
@@ -302,35 +323,21 @@ fn an_owners_landing_request_without_an_outcome_is_named_until_it_has_one() {
         &json!({"type": "source.push_no_verdict", "request": first, "reason": "host fault",
                 "judging": "0123456789abcdef"}),
     );
-    assert_eq!(
-        landing(&store, &commit('a'), None)["owner_request"]["request"],
-        first
-    );
+    assert_eq!(pending(SOURCE, &commit('a')), [json!(first), json!(second)]);
 
-    // Refused: the next one is named.
+    // Refused: the next one is first.
     control(
         &mut client,
         &json!({"type": "source.push_refused", "request": first, "reason": "a conflict"}),
     );
-    assert_eq!(
-        landing(&store, &commit('a'), None)["owner_request"]["request"],
-        second
-    );
+    assert_eq!(pending(SOURCE, &commit('a')), [json!(second)]);
     // Applied: a source.moved naming it; none is left on the source.
     control(
         &mut client,
         &json!({"type": "source.moved", "source": SOURCE, "from": commit('a'), "to": commit('c'),
                 "request": second, "by": "human", "verdict": "accepted"}),
     );
-    assert_eq!(
-        landing(&store, &commit('c'), None)["owner_request"],
-        Value::Null
-    );
+    assert!(pending(SOURCE, &commit('c')).is_empty());
     // The other source's request is still its own.
-    assert_eq!(
-        store
-            .main_landing(ELSEWHERE, &commit('a'), None)
-            .expect("read")["owner_request"]["request"],
-        elsewhere
-    );
+    assert_eq!(pending(ELSEWHERE, &commit('a')), [json!(elsewhere)]);
 }

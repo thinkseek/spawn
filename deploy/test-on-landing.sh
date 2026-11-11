@@ -181,7 +181,16 @@ tick() {
 deploys() { wc -l <"$FAKE_LOG"; }
 live_commit() { readlink "$live/controllers/spawn"; }
 holds() { spawn_live mission landing --source "$missions" | jq -c '.hold'; }
-holds_request() { spawn_live mission landing --source "$missions" | jq -c '.owner_request'; }
+requests_pending() { spawn_live mission landing --source "$missions" | jq -c '[.owner_requests[].request]'; }
+# owner_commit <message>: a commit on top of main that main does not hold,
+# waiting at its owner ref as `spawn mission push` leaves one; prints it.
+owner_commit() {
+  local made
+  made=$(git -C "$work" -c user.name=test -c user.email=test@localhost commit-tree \
+    -p HEAD -m "$1" "HEAD^{tree}")
+  git -C "$work" push -q "$missions" "$made:refs/spawn-owner/$made"
+  printf '%s\n' "$made"
+}
 finished() {
   sql "select r ->> 'ok' || ' ' || (r ->> 'by') || ' ' || (r ->> 'head') || ' ' || (r ->> 'reason')
          from (select kind -> 'detail' -> 'record' as r, session_seq from spawn_events
@@ -220,28 +229,44 @@ check "says who holds it" grep -qF "main $c1 waits: the source is held (owner ga
 spawn_live mission release --source "$missions" >/dev/null
 
 echo "== an owner's landing request in judging (S23)"
-# As spawn mission push records it (the owner's commit waits at its ref);
-# the source names it as on-landing reads it.
-request=$(sql "select spawn_source_push_request('$missions', '$c1', 'refs/spawn-owner/$c1')")
-other=$(sql "select spawn_source_push_request('$missions', '$c0', 'refs/spawn-owner/$c0')")
-# Past the 1 s quiet spell, so nothing but the request holds the deploy.
+# As spawn mission push records them, oldest first: one of main's own
+# commit (its landing went out; its record follows at the integrator's
+# next pass), then two that main does not hold.
+held=$(sql "select spawn_source_push_request('$missions', '$c1', 'refs/spawn-owner/$c1')")
+o1=$(owner_commit "the owner's first push")
+o2=$(owner_commit "the owner's second push")
+first=$(sql "select spawn_source_push_request('$missions', '$o1', 'refs/spawn-owner/$o1')")
+second=$(sql "select spawn_source_push_request('$missions', '$o2', 'refs/spawn-owner/$o2')")
+# Past the 1 s quiet spell, so nothing but the requests holds the deploy.
 sleep 2
 tick SPAWN_DEPLOY_QUIET_SECS=1
 check "not deployed" [ "$(deploys)" -eq 0 ]
-check "says the owner's request waits, the oldest named" \
-  grep -qF "main $c1 waits: the owner's landing request $request ($c1) is waiting for its judging or in it" "$out"
+check "says the oldest request main does not hold waits, and how to withdraw it" \
+  grep -qF "main $c1 waits: the owner's landing request $first ($o1) is waiting for its judging or in it; deployed once it has an outcome (spawn mission push --withdraw $first ends it)" "$out"
+check "the request main holds already is not the one waited for" \
+  bash -c '! grep -qF "landing request $1 " "$2"' _ "$held" "$out"
 tick SPAWN_DEPLOY_QUIET_SECS=1
 check "said once" [ ! -s "$out" ]
 # Its outcome, as the integrator records one: refused names the request.
 sql "select spawn_integrator_record(jsonb_build_object('type', 'source.push_refused',
-       'request', $request, 'reason', 'test-on-landing: refused'))" >/dev/null
+       'request', $first, 'reason', 'test-on-landing: refused'))" >/dev/null
 tick SPAWN_DEPLOY_QUIET_SECS=1
 check "the next pending request still holds the deploy" \
-  grep -qF "main $c1 waits: the owner's landing request $other ($c0)" "$out"
+  grep -qF "main $c1 waits: the owner's landing request $second ($o2)" "$out"
 check "still not deployed" [ "$(deploys)" -eq 0 ]
 sql "select spawn_integrator_record(jsonb_build_object('type', 'source.push_refused',
-       'request', $other, 'reason', 'test-on-landing: refused'))" >/dev/null
-check "no request left: the store says none" [ "$(holds_request)" = null ]
+       'request', $second, 'reason', 'test-on-landing: refused'))" >/dev/null
+check "the store still has main's own request pending" [ "$(requests_pending)" = "[$held]" ]
+# Past the requests: a pending deploy is the next wait, so the request main
+# holds does not hold the tick (and nothing deploys here).
+echo "s23 $c1" >"$live/deploy.pending"
+tick SPAWN_DEPLOY_QUIET_SECS=1
+check "a request whose commit main holds holds nothing: the tick goes on to the next wait" \
+  grep -qF "main $c1 waits: a deploy is pending" "$out"
+rm "$live/deploy.pending"
+sql "select spawn_integrator_record(jsonb_build_object('type', 'source.moved', 'source', '$missions',
+       'from', '$c0', 'to', '$c1', 'request', $held, 'by', 'human'))" >/dev/null
+check "no request left: the store says none" [ "$(requests_pending)" = "[]" ]
 
 echo "== a pending deploy"
 echo "$c0 $c1" >"$live/deploy.pending"
