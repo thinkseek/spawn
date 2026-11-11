@@ -14143,6 +14143,73 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Every judging keeps its gates' files (P26, lead-mac): an accepted
+    /// task's gate leaves its stdout (the per-scenario lines at its end),
+    /// stderr and verdict under `<root>/gate-logs/<judging>/<gate>/` after
+    /// the judging's own directory is removed, and the task's `task.gated`
+    /// and `task.landed` name that directory (`gate_logs`). The environment
+    /// file is not kept.
+    #[test]
+    fn an_accepted_task_judging_keeps_its_gates_files_and_names_them() {
+        let gate = "if [ \"$1\" = --base-only ]; then exit 0; fi\n\
+                    echo '| stage gate ok 6095ms regression: check-web.sh must still pass'\n\
+                    echo 'a note on stderr' >&2\n\
+                    printf '{\"verdict\":\"accepted\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+                    echo '{\"verdict\":\"accepted\"}'\n";
+        let (base, source, scenarios, integrator) = world("kept-gates", gate);
+        let db = Db::new("kept_gates");
+        let mission = db.gated_mission(&source, &scenarios);
+        db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        integrator.pass_on(&db.store).expect("the judging's pass");
+        integrator.settle();
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        let gated = control_records(&db, "task.gated");
+        assert_eq!(gated.len(), 1, "{gated:?}");
+        let judging = gated[0]["judging"].as_str().expect("names its judging");
+        let kept = base
+            .join("host")
+            .join(super::retained::GATE_LOGS)
+            .join(judging);
+        assert_eq!(gated[0]["gate_logs"], json!(kept.to_string_lossy()));
+        let landed = control_records(&db, "task.landed");
+        assert_eq!(landed[0]["gate_logs"], gated[0]["gate_logs"]);
+        let dirs: Vec<PathBuf> = std::fs::read_dir(&kept)
+            .expect("the kept judging")
+            .map(|entry| entry.expect("entry").path())
+            .collect();
+        assert!(!dirs.is_empty(), "at least the candidate's gate");
+        let stdout: String = dirs
+            .iter()
+            .map(|gate| std::fs::read_to_string(gate.join("stdout")).unwrap_or_default())
+            .collect();
+        assert!(
+            stdout.contains("| stage gate ok 6095ms regression: check-web.sh must still pass"),
+            "{stdout}"
+        );
+        assert!(dirs.iter().any(|gate| {
+            std::fs::read_to_string(gate.join("stderr"))
+                .is_ok_and(|text| text.contains("a note on stderr"))
+        }));
+        assert!(
+            dirs.iter().all(|gate| !gate.join("env").exists()),
+            "no env file kept"
+        );
+        assert!(
+            !base
+                .join("host")
+                .join(super::judging::DIRECTORY)
+                .join(judging)
+                .exists(),
+            "the judging's own directory is removed"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// An owner judging with no verdict keeps what its gate printed (P26):
     /// a host fault and an abort each leave a readable log under the
     /// integrator's root, stdout then stderr marked `! `, and a
@@ -14200,6 +14267,11 @@ mod database_tests {
         let log = std::fs::read_to_string(&path).expect("the kept log reads");
         assert!(log.contains("| == base: the line the owner needs"), "{log}");
         assert!(log.contains("! a harness complaint"), "{log}");
+        let gates = base
+            .join("host")
+            .join(super::retained::GATE_LOGS)
+            .join(judging);
+        assert_eq!(kept[0]["gate_logs"], json!(gates.to_string_lossy()));
         assert!(
             !base
                 .join("host")
