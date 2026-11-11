@@ -133,9 +133,22 @@ SPAWN_DB_NAME="bb_036_shadow_$run"
 SPAWN_TMUX_SOCKET="bb-036-$run"
 SPAWN_PSQL=psql
 export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
-# The runner's root: under $HOME, as setup.sh wants it (the gate's sandbox
-# empties /tmp, /run and /var/tmp), short (its jobs' scratch is under it).
-runner_root="$HOME/.bb036-$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
+# The runner's root: on the disk, out of /tmp, /run and /var/tmp (setup.sh
+# refuses those: the gate's sandbox empties them), short (its jobs' scratch
+# is under it), and never in the real home (cc-rules (a)). Run by hand with
+# TMPDIR on the disk, that is WORK's home. In the gate, WORK is in the
+# sandbox's /tmp, and the root goes under the gate's own HOME: an empty
+# tmpfs at the home's path, which is the sandbox's and not the real home
+# (its file system says so, or this refuses).
+case $WORK/ in
+/tmp/* | /run/* | /var/tmp/*)
+    [ -n "$real_home" ] && [ "$(stat -f -c %T -- "$real_home" 2>/dev/null)" = tmpfs ] ||
+        harness "WORK $WORK is under /tmp, /run or /var/tmp, and ${real_home:-the home} is no sandbox's empty tmpfs: the runner's root has no place (run by hand with TMPDIR on the disk)"
+    runner_parent=$real_home
+    ;;
+*) runner_parent=$HOME ;;
+esac
+runner_root="$runner_parent/.bb036-$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
 TEST_URL=$SPAWN_TEST_DATABASE_URL
 
 # shellcheck source=scripts/pg-url.sh
