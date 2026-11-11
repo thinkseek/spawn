@@ -386,7 +386,10 @@ fn many_migrations_at_once_on_one_cluster_all_succeed() {
     // Every thread joined (its store, and so its connections, gone with
     // it) before the schemas and databases are dropped, a failed case's
     // too.
-    let outcomes: Vec<_> = migrations.into_iter().map(|migration| migration.join()).collect();
+    let outcomes: Vec<_> = migrations
+        .into_iter()
+        .map(std::thread::JoinHandle::join)
+        .collect();
     drop(schemas);
     drop(databases);
     for outcome in outcomes {
