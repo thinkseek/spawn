@@ -777,7 +777,7 @@ the system. Its continuity is a design requirement, not a best effort:
 | The context window is spent | `Prompt is too long` in an API error line: `context_exhausted`, and the handoff path below |
 | The engine's resource envelope kills it, or the disk fills | `memory_limit` (objective 029) resumes at once; `disk_full` waits until a reading of the workspace's filesystem is at or above `SPAWN_DISK_FLOOR_GB` |
 | Spawn's database is unreachable | The loop does not exit: only passes that could not reach it are not failed ones, the engines run on, and at the first pass that gets through the recovery records `database_unavailable` for each execution that lived through it, clears it, and the Bridge checkpoints what the engines wrote meanwhile |
-| A transcript Claude Code deleted | The resume puts it back from the transcript archive (`<root>/.transcripts`, copied at turn ends and execution ends; docs/storage.md, "The transcript archive"); one gone with no copy fails the resume instead of starting blank under the old id |
+| A transcript Claude Code deleted | The resume puts it back from the transcript archive (`<root>/.transcripts`, copied on each pass it grew and at execution ends; docs/storage.md, "The transcript archive"); one gone with no copy fails the resume instead of starting blank under the old id |
 | The native session cannot be resumed (transcript lost with no copy, resume fails three times, or there is none) | `start` a fresh native session inside the same Spawn session, on the same workspace and branch, with a handoff prompt rebuilt from the log: mission, open worker tasks, recent escalations and decisions, the interruption and the branch head |
 | The context window fills | Claude Code compacts on its own; the handoff path above is the fallback when it cannot |
 | A deploy changes its charter | Each new native session's start records the hash of the charter it gives; when the native session that runs holds another (after a loop restart, a resume or a compaction), the dispatcher types the new charter in at its next idle prompt, once, by record (§3, the supervisor) |
@@ -2810,7 +2810,13 @@ are per-agent uids or a mount per engine.
   the operator and a later pass judges again (a git that cannot run a
   merge is the host's problem, not the work's: objective 008).
   TERM kills the gate with the process (no record), and the next
-  integrator judges the task again from nothing. A drain does not: a
+  integrator judges the task again from nothing, when its gates run as
+  its children. When a systemd user manager answers, each gate runs in a
+  unit of its own (gate v2 step 2, design-gate-survives-restart.md): a
+  stop or a restart stops no gate, the next integrator adopts each one
+  still running and records it once, and deploy/deploy.sh stops such an
+  integrator at once, without a drain (deploy/controller.sh keeps the
+  controller a running judging's gate came from). A drain does not: a
   drain request (SIGUSR1, or `spawn integrate --drain` with the same
   root, which waits until that integrator is gone) records
   `integrator.draining` {`gates`, `bound_s`}, starts no gate, owner
@@ -2819,7 +2825,9 @@ are per-agent uids or a mount per engine.
   `integrator.drained` and exits 0. At `SPAWN_INTEGRATE_DRAIN_SECS`
   (default 7200, from the draining record) it kills the gates still
   running (their process groups; nothing is recorded for them), records
-  `integrator.drain_expired` naming their tasks, exits 0, and the
-  dispatcher tells the supervisor once (`host
+  `integrator.drain_expired` naming their tasks (gates in units are not
+  its processes: they keep running, the record says `left_running`, and
+  the next integrator adopts them), exits 0, and the dispatcher tells the
+  supervisor once (`host
   integrator-drain-expired-<event id>`). One integrator per database: its
   advisory lock belongs to the connection, kept while any gate runs.

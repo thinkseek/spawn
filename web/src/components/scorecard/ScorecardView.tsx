@@ -38,6 +38,7 @@ import { useNow } from "../rsi/Phase";
 import { Card, CardHeader, EmptyState, LiveStatus, PageHeader, cx } from "../ui";
 import { ViewToggle, useStoredChoice } from "../ViewToggle";
 import type { ViewOption } from "../ViewToggle";
+import { settlingNote } from "../../settling.ts";
 import { FleetDecisions } from "./FleetDecisions";
 
 const POLL_MS = 60_000;
@@ -316,7 +317,20 @@ function WindowCard({ card }: { card: Scorecard }) {
           </span>
         </Fact>
       </div>
+      <SettlingNote card={card} />
     </Card>
+  );
+}
+
+/** Under the window, while the archive may still lack a model call made
+ * before its end: the cost shown may still grow. */
+function SettlingNote({ card }: { card: Scorecard }) {
+  const note = settlingNote(card);
+  if (note === null) return null;
+  return (
+    <p className="border-t border-surface-border px-4 py-2 text-caption text-muted-foreground" role="status">
+      {note}
+    </p>
   );
 }
 

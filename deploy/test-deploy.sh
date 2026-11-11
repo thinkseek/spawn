@@ -32,7 +32,9 @@
 # missions repo, or a main that moved since; the drain
 # (objective 037): a binary that can drain is drained before the stop, and
 # the stop follows within the unit's restart delay; a binary that cannot is
-# never asked (no --drain, no SIGUSR1); a drain past SPAWN_DEPLOY_DRAIN_SECS
+# never asked (no --drain, no SIGUSR1); a binary whose gates run in units of
+# their own (gate v2 step 2) is stopped at once, never drained, and the
+# deploy says its gates keep running; a drain past SPAWN_DEPLOY_DRAIN_SECS
 # or one that fails falls back to the stop and the deploy goes on, the
 # owner's hold released; so does a drain that ignores TERM (timeout's
 # --kill-after, status 137); an integrator whose own bound
@@ -419,6 +421,10 @@ if [ "\${1-} \${2-}" = "integrate --drain" ]; then
 fi
 exec "$scratch/real-spawn" "\$@"
 EOF
+  elif [ "$1" = units ]; then
+    # A binary of gate v2 step 2: its startup line names the units, and it
+    # can drain too (it must not be asked to).
+    printf '#!/bin/sh\n# usage: spawn integrate [--once | --drain] [--root <dir>]\n# integrate: gates run in systemd user units (spawn-gate-*): a restart does not stop them\necho "$*" >>"$SPAWN_CALLS"\nexec "%s" "$@"\n' "$scratch/real-spawn" >"$live/bin/spawn"
   else
     printf '#!/bin/sh\necho "$*" >>"$SPAWN_CALLS"\nexec "%s" "$@"\n' "$scratch/real-spawn" >"$live/bin/spawn"
   fi
@@ -452,6 +458,17 @@ deploy
 check "succeeded (status $status)" [ "$status" -eq 0 ]
 check "never ran --drain (so no SIGUSR1 reached anything)" bash -c '! grep -q -- "--drain" "$1"' _ "$SPAWN_CALLS"
 check "says the stop loses the running gates" grep -q "the installed binary cannot drain" "$out"
+check "stopped the integrator" grep -qx -- "--user stop spawn-integrate" "$SYSTEMCTL_LOG"
+check "main moved to HEAD" [ "$(main)" = "$head" ]
+
+echo "-- a binary whose gates run in units of their own (gate v2 step 2)"
+installed units
+deploy
+check "succeeded (status $status)" [ "$status" -eq 0 ]
+check "never ran --drain" bash -c '! grep -q -- "--drain" "$1"' _ "$SPAWN_CALLS"
+check "says the gates keep running and are adopted" \
+  grep -q "its gates run in systemd units of their own and keep running; the integrator that starts next adopts them" "$out"
+check "says nothing is lost" bash -c '! grep -q "running gates are lost" "$1"' _ "$out"
 check "stopped the integrator" grep -qx -- "--user stop spawn-integrate" "$SYSTEMCTL_LOG"
 check "main moved to HEAD" [ "$(main)" = "$head" ]
 

@@ -78,6 +78,29 @@ create unique index if not exists spawn_events_source_key
 create index if not exists spawn_events_session_name
     on spawn_events (session_id, event_name, id);
 
+-- One outcome of each kind per judging (gate v2, design-gate-survives-
+-- restart.md D4): a gate may outlive the integrator that started it, and
+-- the next one reaps it, so two integrators, or one after a crash between
+-- its record and its cleanup, may record one gate's outcome again.
+-- spawn_integrator_record returns the first instead; this index is the
+-- store's own refusal of a second, whatever writes it. The kinds: one
+-- verdict, and the `stale` after an `accepted` (the `task.aborted` a done
+-- mission makes of it is that `stale`); one landing; one owner's outcome,
+-- moved or refused. (An earlier draft of this index, never on live, had
+-- another key under the name spawn_events_control_judging: dropped, so a
+-- database that took it holds only this one.)
+drop index if exists spawn_events_control_judging;
+create unique index if not exists spawn_events_control_judging_outcome
+    on spawn_events ((kind #>> '{detail,record,judging}'),
+                     (case kind #>> '{detail,record,type}'
+                          when 'task.gated' then
+                              case when kind #>> '{detail,record,verdict}' = 'stale'
+                                   then 'stale' else 'verdict' end
+                          when 'task.aborted' then 'stale'
+                          when 'source.push_refused' then 'source.moved'
+                          else kind #>> '{detail,record,type}' end))
+    where session_id = 'session_control' and kind #>> '{detail,record,judging}' is not null;
+
 -- An agent's latest checkpoint, read by the integrator before it judges.
 create index if not exists spawn_events_agent_name
     on spawn_events (agent_id, event_name, id);
@@ -3395,6 +3418,8 @@ declare
     v_mission bigint;
     v_stale bigint;
     v_recorded bigint;
+    v_subject text;
+    v_other text;
     v_request jsonb;
     v_hold mission_source_holds;
 begin
@@ -3450,6 +3475,68 @@ begin
                             p_record ->> 'type', p_record;
         end if;
         return spawn_control_record(p_record);
+    end if;
+    -- A judging's outcome names its judging (gate v2, design-gate-survives-
+    -- restart.md D4): the id of the directory its gate writes into. A gate
+    -- may outlive the integrator that started it, and a later one reaps it;
+    -- a reap after a crash between record and cleanup may decide anew, and
+    -- differently (the host-fault cap counts the judging's own host fault,
+    -- main may have moved, a deploy may read the gate's exit otherwise). So
+    -- the first outcome stands, and is returned to any later one before any
+    -- other check, nothing more recorded:
+    -- - one verdict (`task.gated`) per judging, whatever the verdict; the one
+    --   second is the `stale` of a landing that found main moved after the
+    --   judging's `accepted` (the `task.aborted` the done-mission rule below
+    --   makes of a `stale` is that `stale`);
+    -- - one `task.landed`;
+    -- - one owner's outcome, `source.moved` or `source.push_refused`.
+    -- A judging is about one task or one owner's request: an outcome naming
+    -- another under a judging already recorded is refused, never swallowed.
+    if p_record ? 'judging' then
+        if p_record ->> 'type' not in ('task.gated', 'task.landed', 'source.moved',
+                                       'source.push_refused')
+           or jsonb_typeof(p_record -> 'judging') is distinct from 'string'
+           or p_record ->> 'judging' !~ '^[0-9a-f]{16,64}$' then
+            raise exception 'a judging names a gate''s outcome by 16 to 64 hex digits: %', p_record;
+        end if;
+        v_subject := case when p_record ->> 'type' like 'source.%'
+                          then 'request ' || coalesce(p_record ->> 'request', '?')
+                          else 'task ' || coalesce(p_record ->> 'id', '?') end;
+        select r.subject into v_other
+          from spawn_events e
+         cross join lateral (
+             select case when e.kind #>> '{detail,record,type}' like 'source.%'
+                         then 'request ' || coalesce(e.kind #>> '{detail,record,request}', '?')
+                         else 'task ' || coalesce(e.kind #>> '{detail,record,id}', '?') end
+                    as subject) r
+         where e.session_id = 'session_control'
+           and e.kind #>> '{detail,record,judging}' = p_record ->> 'judging'
+           and r.subject <> v_subject
+         order by e.id
+         limit 1;
+        if v_other is not null then
+            raise exception 'judging % is about % already, not %: %', p_record ->> 'judging',
+                            v_other, v_subject, p_record;
+        end if;
+        select e.id into v_recorded
+          from spawn_events e
+         where e.session_id = 'session_control'
+           and e.kind #>> '{detail,record,judging}' = p_record ->> 'judging'
+           and case p_record ->> 'type'
+               when 'task.gated' then
+                   e.kind #>> '{detail,record,type}' in ('task.gated', 'task.aborted')
+                   and (p_record ->> 'verdict' is distinct from 'stale'
+                        or e.kind #>> '{detail,record,verdict}' is distinct from 'accepted')
+               when 'task.landed' then e.kind #>> '{detail,record,type}' = 'task.landed'
+               else e.kind #>> '{detail,record,type}' in ('source.moved', 'source.push_refused')
+               end
+         order by coalesce(e.kind #>> '{detail,record,verdict}', '')
+                      = coalesce(p_record ->> 'verdict', '') desc,
+                  e.id
+         limit 1;
+        if v_recorded is not null then
+            return v_recorded;
+        end if;
     end if;
     -- Main of a source red on a check (docs/fleet-architecture.md §10.3,
     -- "Main is red"): a red names its source, main, check and the shared
@@ -3673,14 +3760,16 @@ begin
     -- and base`, a scenario, and `validator_defects` naming at least one
     -- script, `<name>.sh`: a regression failing on the candidate and on the
     -- base, run again now, gate.sh's "Three classes of a failing
-    -- regression"); and its backoff.
+    -- regression"); a gate whose runner ended without its status
+    -- (`abandoned`: on `runner`, runs `no status`; gate v2 step 2, D6); and
+    -- its backoff.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
        and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log',
                                                           'base_disagrees', 'gate',
                                                           'cannot_judge',
                                                           'sandbox_never_started', 'main_red',
                                                           'test_server_never_started',
-                                                          'validator_defect')
+                                                          'validator_defect', 'abandoned')
             or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
             or (p_record ->> 'evidence' in ('failures', 'server_log')
                 and (case when jsonb_typeof(p_record -> 'failures') = 'array'
@@ -3725,6 +3814,9 @@ begin
                      or p_record -> 'fact' ->> 'on' is distinct from 'test server'
                      or p_record -> 'fact' ->> 'runs' is distinct from 'never started'
                      or coalesce(p_record -> 'fact' ->> 'tree', '') not in ('gate', 'candidate')))
+            or (p_record ->> 'evidence' = 'abandoned'
+                and (p_record -> 'fact' ->> 'on' is distinct from 'runner'
+                     or p_record -> 'fact' ->> 'runs' is distinct from 'no status'))
             or (p_record ->> 'evidence' = 'main_red'
                 and (coalesce(p_record -> 'fact' ->> 'scenario', '') !~ '^check-[^/[:space:]]+\.sh$'
                      or p_record -> 'fact' ->> 'on' is distinct from 'main'
@@ -3836,7 +3928,8 @@ begin
             return spawn_control_record(jsonb_build_object(
                 'type', 'task.aborted', 'id', (p_record ->> 'id')::bigint,
                 'reason', format('the landing went stale %s times after mission %s was done',
-                                 v_stale + 1, v_mission)));
+                                 v_stale + 1, v_mission))
+                || jsonb_strip_nulls(jsonb_build_object('judging', p_record -> 'judging')));
         end if;
     end if;
     v_recorded := spawn_control_record(p_record);
