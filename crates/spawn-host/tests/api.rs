@@ -13,7 +13,7 @@ use std::process::Command;
 use spawn_core::contract;
 use spawn_core::id::{BranchName, TerminalName, WorkspaceId};
 use spawn_core::port::{Commit, Launch, TerminalError, TerminalHost, WorkspaceStore};
-use spawn_host::{GitWorkspace, TmuxHost};
+use spawn_host::{GitWorkspace, Scratch, TmuxHost};
 
 /// Serialize the external programs of this test binary.
 ///
@@ -47,19 +47,17 @@ fn start_session(host: &TmuxHost, launch: &Launch) -> Result<(), TerminalError> 
     Err(last.expect("one attempt"))
 }
 
-/// Directory that holds the fake executables of this test process.
-fn scratch() -> PathBuf {
-    let path = std::env::temp_dir().join(format!("spawn-host-test-{}", std::process::id()));
-    fs::create_dir_all(&path).expect("create scratch directory");
-    path
+/// A directory of one test's own (its fake executables, its logs), removed
+/// when the test ends.
+fn scratch(tag: &str) -> Scratch {
+    Scratch::new(&format!("spawn-host-test-{tag}"))
 }
 
-/// Write an executable without ever holding the target open.
-fn script(name: &str, body: &str) -> String {
+/// Write an executable in `directory` without ever holding the target open.
+fn script(directory: &Scratch, name: &str, body: &str) -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = format!("{name}-{ordinal}");
-    let directory = scratch();
     let target = directory.join(&name);
     let temporary = directory.join(format!("{name}.tmp"));
     {
@@ -86,11 +84,10 @@ fn git(directory: &PathBuf, arguments: &[&str]) {
     assert!(status.success(), "git {arguments:?} failed");
 }
 
-/// Repository with one base commit, and an empty workspace root.
-fn repository(tag: &str) -> (PathBuf, PathBuf) {
-    let base = std::env::temp_dir().join(format!("spawn-git-{tag}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&base);
-    fs::create_dir_all(&base).expect("create scratch repository");
+/// Repository with one base commit, and an empty workspace root; first, the
+/// scratch that holds both, which the test keeps until it ends.
+fn repository(tag: &str) -> (Scratch, PathBuf, PathBuf) {
+    let base = Scratch::new(&format!("spawn-git-{tag}"));
     let repo = base.join("repo");
     fs::create_dir_all(&repo).expect("create repository directory");
     git(&repo, &["init", "-q", "--initial-branch=main"]);
@@ -99,7 +96,7 @@ fn repository(tag: &str) -> (PathBuf, PathBuf) {
     git(&repo, &["commit", "-qm", "base"]);
     let root = base.join("work");
     fs::create_dir_all(&root).expect("create workspace root");
-    (repo.join(".git"), root)
+    (base, repo.join(".git"), root)
 }
 
 fn branch() -> BranchName {
@@ -109,7 +106,7 @@ fn branch() -> BranchName {
 #[test]
 fn mount_of_an_unknown_branch_fails() {
     let _exclusive = exclusive();
-    let (repo, root) = repository("unknown");
+    let (_scratch, repo, root) = repository("unknown");
     let store = GitWorkspace::new(&repo, &root);
     assert!(store.mount(&branch()).is_err(), "no commit, no mount");
 }
@@ -117,7 +114,7 @@ fn mount_of_an_unknown_branch_fails() {
 #[test]
 fn ensure_branch_is_idempotent_and_mount_extracts_the_base() {
     let _exclusive = exclusive();
-    let (repo, root) = repository("mount");
+    let (_scratch, repo, root) = repository("mount");
     let store = GitWorkspace::new(&repo, &root);
     store
         .ensure_branch(&branch(), None)
@@ -141,7 +138,7 @@ fn ensure_branch_is_idempotent_and_mount_extracts_the_base() {
 #[test]
 fn an_untouched_workspace_produces_no_commit() {
     let _exclusive = exclusive();
-    let (repo, root) = repository("unchanged");
+    let (_scratch, repo, root) = repository("unchanged");
     let store = GitWorkspace::new(&repo, &root);
     store
         .ensure_branch(&branch(), None)
@@ -157,7 +154,7 @@ fn an_untouched_workspace_produces_no_commit() {
 #[test]
 fn a_changed_workspace_advances_the_branch() {
     let _exclusive = exclusive();
-    let (repo, root) = repository("created");
+    let (_scratch, repo, root) = repository("created");
     let store = GitWorkspace::new(&repo, &root);
     store
         .ensure_branch(&branch(), None)
@@ -185,7 +182,7 @@ const CAP: u64 = 1 << 20;
 #[test]
 fn a_file_over_the_cap_stays_out_of_the_checkpoint_and_the_rest_goes_in() {
     let _exclusive = exclusive();
-    let (repo, root) = repository("large");
+    let (_scratch, repo, root) = repository("large");
     let store = GitWorkspace::new(&repo, &root).with_max_file_bytes(CAP);
     store
         .ensure_branch(&branch(), None)
@@ -242,7 +239,7 @@ fn noise(seed: u64, length: usize) -> Vec<u8> {
 #[test]
 fn a_file_under_the_cap_is_a_blob_across_remounts() {
     let _exclusive = exclusive();
-    let (repo, root) = repository("kept");
+    let (_scratch, repo, root) = repository("kept");
     let store = GitWorkspace::new(&repo, &root);
     let reference = format!("refs/heads/{}", branch());
     store
@@ -297,7 +294,7 @@ fn a_file_under_the_cap_is_a_blob_across_remounts() {
 #[test]
 fn a_file_over_the_cap_named_like_a_pattern_drops_nothing_else() {
     let _exclusive = exclusive();
-    let (repo, root) = repository("pattern");
+    let (_scratch, repo, root) = repository("pattern");
     let store = GitWorkspace::new(&repo, &root).with_max_file_bytes(CAP);
     store
         .ensure_branch(&branch(), None)
@@ -346,7 +343,7 @@ const ODD_LARGE_NAMES: [&[u8]; 4] = [
 fn a_file_over_the_cap_of_any_name_is_left_out_and_told_of() {
     use std::os::unix::ffi::OsStrExt;
     let _exclusive = exclusive();
-    let (repo, root) = repository("odd-names");
+    let (_scratch, repo, root) = repository("odd-names");
     let store = GitWorkspace::new(&repo, &root).with_max_file_bytes(CAP);
     store
         .ensure_branch(&branch(), None)
@@ -391,7 +388,7 @@ fn a_file_over_the_cap_of_any_name_is_left_out_and_told_of() {
 #[test]
 fn a_commit_records_the_branch_from_the_identifier() {
     let _exclusive = exclusive();
-    let (repo, root) = repository("identity");
+    let (_scratch, repo, root) = repository("identity");
     let store = GitWorkspace::new(&repo, &root);
     store
         .ensure_branch(&branch(), None)
@@ -411,6 +408,8 @@ fn a_commit_records_the_branch_from_the_identifier() {
 struct IsolatedTmux {
     program: String,
     socket: String,
+    /// The test's scratch (the fake tmux among it), removed after the server.
+    scratch: Scratch,
 }
 
 impl Drop for IsolatedTmux {
@@ -434,11 +433,17 @@ impl Drop for IsolatedTmux {
 
 fn isolated_tmux(tag: &str) -> IsolatedTmux {
     let socket = format!("spawn-host-test-{tag}-{}", std::process::id());
+    let scratch = scratch(tag);
     let program = script(
+        &scratch,
         &format!("fake-tmux-{tag}"),
         &format!("#!/bin/sh\nexec tmux -L {socket} \"$@\"\n"),
     );
-    IsolatedTmux { program, socket }
+    IsolatedTmux {
+        program,
+        socket,
+        scratch,
+    }
 }
 
 fn terminal(name: &str) -> TerminalName {
@@ -552,12 +557,13 @@ fn tmux_stages_a_text_longer_than_its_message_size() {
 fn a_launchs_environment_never_reaches_a_command_line() {
     let _exclusive = exclusive();
     let tmux = isolated_tmux("environment");
-    let argv = scratch().join("environment-argv.log");
-    let out = scratch().join("environment-out.txt");
+    let argv = tmux.scratch.join("environment-argv.log");
+    let out = tmux.scratch.join("environment-out.txt");
     let _ = fs::remove_file(&argv);
     let _ = fs::remove_file(&out);
     // A tmux that records every command line it is given.
     let logging = script(
+        &tmux.scratch,
         "logging-tmux-environment",
         &format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexec '{}' \"$@\"\n",
@@ -687,7 +693,8 @@ fn tmux_starts_in_the_launch_directory() {
 /// a pipe holds, arrive whole, and no temporary file is left.
 #[test]
 fn files_are_written_new_on_the_host() {
-    let directory = scratch().join("write-new");
+    let scratch = scratch("write-new");
+    let directory = scratch.join("write-new");
     let _ = fs::remove_dir_all(&directory);
     let local = TmuxHost::local("tmux");
     contract::terminal_files("local", &local, &directory.to_string_lossy());
@@ -716,14 +723,16 @@ fn files_are_written_new_on_the_host() {
 #[test]
 fn a_host_on_a_socket_runs_tmux_on_that_server() {
     let _exclusive = exclusive();
-    let calls = scratch().join("tmux-socket-calls.log");
-    let _ = fs::remove_file(&calls);
     let socket = format!("spawn-host-test-socket-{}", std::process::id());
-    let _server = IsolatedTmux {
+    let server = IsolatedTmux {
         program: String::new(),
         socket: socket.clone(),
+        scratch: scratch("socket"),
     };
+    let calls = server.scratch.join("tmux-socket-calls.log");
+    let _ = fs::remove_file(&calls);
     let logging = script(
+        &server.scratch,
         "fake-tmux-socket",
         &format!(
             "#!/bin/sh\nprintf 'tmux %s\\n' \"$*\" >> '{calls}'\nexec tmux \"$@\"\n",
@@ -751,7 +760,8 @@ fn a_host_on_a_socket_runs_tmux_on_that_server() {
 #[test]
 fn a_capture_from_a_tmux_that_never_answers_fails_in_time() {
     let _exclusive = exclusive();
-    let hung = script("fake-tmux-hung", "#!/bin/sh\nexec sleep 60\n");
+    let scratch = scratch("hung");
+    let hung = script(&scratch, "fake-tmux-hung", "#!/bin/sh\nexec sleep 60\n");
     let host = TmuxHost::local(&hung);
     let started = std::time::Instant::now();
     let captured = host.capture_tail(&terminal("hung"), &workspace(), 20);
@@ -768,7 +778,7 @@ fn a_capture_from_a_tmux_that_never_answers_fails_in_time() {
 #[test]
 fn the_adapters_pass_the_shared_contract() {
     let _exclusive = exclusive();
-    let (repo, root) = repository("contract");
+    let (_scratch, repo, root) = repository("contract");
     contract::workspace_store("host_ws", &GitWorkspace::new(&repo, &root));
     let tmux = isolated_tmux("contract");
     let host = TmuxHost::local(&tmux.program);

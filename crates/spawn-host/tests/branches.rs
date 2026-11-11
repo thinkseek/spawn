@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use spawn_core::id::{BranchName, WorkspaceId};
 use spawn_core::port::{BaseMerge, Branch, Commit, WorkspaceStore};
-use spawn_host::{GitWorkspace, has_conflict_block, has_conflict_block_sized};
+use spawn_host::{GitWorkspace, Scratch, has_conflict_block, has_conflict_block_sized};
 
 /// Output of git in `directory`, which must succeed.
 fn git(directory: &Path, arguments: &[&str]) -> String {
@@ -34,13 +34,13 @@ fn git(directory: &Path, arguments: &[&str]) -> String {
 struct Fixture {
     checkout: PathBuf,
     store: GitWorkspace,
+    /// The repository and the workspace root; removed when the test ends.
+    _scratch: Scratch,
 }
 
 impl Fixture {
     fn new(tag: &str, files: &[(&str, &str)]) -> Self {
-        let base =
-            std::env::temp_dir().join(format!("spawn-branches-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
+        let base = Scratch::new(&format!("spawn-branches-{tag}"));
         let checkout = base.join("repo");
         fs::create_dir_all(&checkout).expect("create the repository");
         git(&checkout, &["init", "-q", "--initial-branch=main"]);
@@ -54,6 +54,7 @@ impl Fixture {
         Self {
             store: GitWorkspace::new(checkout.join(".git"), &root),
             checkout,
+            _scratch: base,
         }
     }
 
