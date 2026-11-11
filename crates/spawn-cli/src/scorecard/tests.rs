@@ -677,6 +677,49 @@ fn autonomy_counts_the_owners_interventions() {
     );
 }
 
+/// Objective 049: a person's command sent again after a refusal continues
+/// its intent (as the store names it): one intervention, at the intent's
+/// time, and the commands beyond its first are `retries`.
+#[test]
+fn autonomy_counts_a_persons_intent_once_and_its_retries_apart() {
+    let mut story = Story::default();
+    story.mission(1, true);
+    story
+        .command("human", "board-1", "session_1", "input", at(9), Some(false), None, &[])
+        .command("human", "board-2", "session_1", "input", at(10), Some(false), None, &[])
+        .ok("human", "board-3", "session_1", at(11))
+        .ok("spawn", "cli-1", "session_1", at(12))
+        // An intent begun before the window: its retry in it counts nowhere.
+        .command("human", "board-0", "session_1", "input", at(1), Some(false), None, &[])
+        .ok("human", "board-0b", "session_1", at(4));
+    // As the store names them: commands 1-3 one intent (1's), 5-6 another.
+    for command in &mut story.commands {
+        let (intent, at_ms) = match command.id {
+            1..=3 => (1, at(9)),
+            5 | 6 => (5, at(1)),
+            id => (id, command.created_at_ms),
+        };
+        command.intent = Some(intent);
+        command.intent_at_ms = Some(at_ms);
+    }
+    let history = story.history();
+    let autonomy = dimension(
+        &counts(&history, Scope::Fleet, window_hours(3, 24)),
+        None,
+        "autonomy",
+    );
+    assert_eq!(autonomy["by_kind"]["command"], json!(2), "two intents in the window");
+    assert_eq!(autonomy["interventions"], json!(2));
+    assert_eq!(autonomy["retries"], json!(2), "board-2 and board-3");
+    let wider = dimension(
+        &counts(&history, Scope::Fleet, window_hours(0, 24)),
+        None,
+        "autonomy",
+    );
+    assert_eq!(wider["by_kind"]["command"], json!(3));
+    assert_eq!(wider["retries"], json!(3));
+}
+
 #[test]
 fn reliability_counts_failures_of_the_machinery() {
     let mut story = Story::default();
