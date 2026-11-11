@@ -29,9 +29,10 @@
 # spawn_control_refold(), as 052 does; `spawn serve` answers. One objective
 # mission whose backlog holds objectives 1 to 5, none with a metric, hours
 # before now:
+#   objective 4: task 4 landed -8 (settled first, though not first by id).
 #   objective 1: task 1 landed -7.     objective 2: task 2 landed -5.
 #   objective 3: task 3, objective.solved on the base -4.5 (no landing).
-#   objective 4: task 4 landed -2.     objective 5: task 5 in flight.
+#   objective 5: task 5 in flight.
 # Each check is reported; the run fails if any failed.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
@@ -192,6 +193,7 @@ select pg_temp.rec(-10, '{"type":"mission.added","id":1,"text":"063 objectives",
 select pg_temp.rec(-10, jsonb_build_object('type', 'mission.configured', 'id', 1, 'accept', 'gate',
     'gate', '$ctl/rsi/scenarios', 'budget', jsonb_build_object('minutes', 240, 'tool_calls', 600),
     'objectives', jsonb_build_object('backlog', '$ctl/rsi/backlog', 'resident', 'rsi', 'workers', 2)));
+select pg_temp.lands(-8, 4, 4, '$C4');
 select pg_temp.lands(-7, 1, 1, '$C1');
 select pg_temp.lands(-5, 2, 2, '$C2');
 select pg_temp.assigned(-4.8, 3, 3);
@@ -200,7 +202,6 @@ select pg_temp.rec(-4.5, '{"type":"objective.solved","id":1,"objective":3,"task"
 select pg_temp.rec(-4.5, jsonb_build_object('type', 'task.cancelled', 'id', 3, 'by', 'spawn-integrate',
     'solved', (select max(id) from spawn_events where kind -> 'detail' -> 'record' ->> 'type' = 'objective.solved'),
     'reason', 'objective 3 is solved on the base, so task #3 ends without a rejection'));
-select pg_temp.lands(-2, 4, 4, '$C4');
 select pg_temp.assigned(-1, 5, 5);
 commit;
 select spawn_control_refold();
@@ -211,6 +212,10 @@ tasks=$(scalar "select string_agg(id || ':' || state || ':' || coalesce(objectiv
 [ "$tasks" = "1:landed:1 2:landed:2 3:cancelled:3 4:landed:4 5:assigned:5" ] || harness "the seed folded to tasks [$tasks]"
 solved_ms=$(scalar "select recorded_at_ms from spawn_events where kind -> 'detail' -> 'record' ->> 'type' = 'objective.solved'")
 [ -n "$solved_ms" ] || harness "no objective.solved record was seeded"
+# Each task's landing time, from its task.landed record: {"<task>": ms}.
+landed_ms=$(scalar "select json_object_agg(kind -> 'detail' -> 'record' ->> 'id', recorded_at_ms) from spawn_events
+    where kind -> 'detail' -> 'record' ->> 'type' = 'task.landed'")
+[ "$(printf '%s' "$landed_ms" | jq -c 'keys')" = '["1","2","4"]' ] || harness "the seed's landings are not tasks 1, 2 and 4: $landed_ms"
 
 web=$WORK/web
 mkdir -p "$web"
@@ -254,19 +259,19 @@ const { settledProgress, progressTitle } = await import(
 const answer = JSON.parse(readFileSync(`${env.BB_WORK}/api.json`, "utf8"));
 const mission = answer.missions.find((entry) => entry.id === 1);
 const objective = (id) => mission.objectives.find((entry) => entry.id === id);
-const landed = (id) => objective(id).landings[0].at_ms;
+const landed = (task) => JSON.parse(env.BB_LANDED_MS)[String(task)];
 
-test("(2) one point per settled objective, oldest first, counting up", () => {
+test("(2) one point per settled objective, oldest first (not by id), counting up", () => {
   const progress = settledProgress(mission);
   assert.equal(progress.total, 5, "total");
   assert.equal(progress.settled, 4, "settled");
   assert.deepEqual(
     progress.points.map(({ objective, task, at_ms, settled, on_base }) => ({ objective, task, at_ms, settled, on_base })),
     [
-      { objective: 1, task: 1, at_ms: landed(1), settled: 1, on_base: false },
-      { objective: 2, task: 2, at_ms: landed(2), settled: 2, on_base: false },
-      { objective: 3, task: 3, at_ms: Number(env.BB_SOLVED_MS), settled: 3, on_base: true },
-      { objective: 4, task: 4, at_ms: landed(4), settled: 4, on_base: false },
+      { objective: 4, task: 4, at_ms: landed(4), settled: 1, on_base: false },
+      { objective: 1, task: 1, at_ms: landed(1), settled: 2, on_base: false },
+      { objective: 2, task: 2, at_ms: landed(2), settled: 3, on_base: false },
+      { objective: 3, task: 3, at_ms: Number(env.BB_SOLVED_MS), settled: 4, on_base: true },
     ],
   );
 });
@@ -287,7 +292,7 @@ test("(3) the title, and a mission with nothing settled", () => {
   assert.equal(progressTitle(none), "0 of 5 objectives settled");
 });
 TEST
-if ! BB_TREE=$tree BB_WORK=$WORK BB_SOLVED_MS=$solved_ms node --test "$WORK/progress.test.mjs" >"$WORK/progress.out" 2>&1; then
+if ! BB_TREE=$tree BB_WORK=$WORK BB_SOLVED_MS=$solved_ms BB_LANDED_MS=$landed_ms node --test "$WORK/progress.test.mjs" >"$WORK/progress.out" 2>&1; then
     check_failed "(2)/(3) web/src/rsiProgress.ts over the answer: $(grep -E '^not ok|AssertionError|expected|actual|Error' "$WORK/progress.out" | head -n 10 | tr '\n' ' ' | head -c 900)"
 fi
 note "(2), (3) checked: the card's model"
