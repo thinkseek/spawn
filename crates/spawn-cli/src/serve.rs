@@ -2238,7 +2238,9 @@ fn alerts(query: &str) -> Result<Value, String> {
 /// `/api/cost?window=24h|7d` (24h when absent; any other window is the
 /// caller's mistake, 400): what the model calls timed in [now minus the
 /// window, now) cost, per model, mission, task, agent and execution
-/// (crate::cost), read through the reader login.
+/// (crate::cost), read through the reader login. Each `tasks` row carries
+/// its `label`, the task's label as `/api/missions` gives it ([`labels`]),
+/// or null for a task the record does not hold.
 fn cost(query: &str) -> Result<Value, String> {
     let asked = parameter(query, "window")
         .map(|text| percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad window {text}")))
@@ -2246,7 +2248,25 @@ fn cost(query: &str) -> Result<Value, String> {
     let (name, length_ms) = crate::cost::window_of(asked.as_deref())
         .map_err(|error| format!("{BAD_REQUEST}{error}"))?;
     let store = open_store()?;
-    crate::cost::window(&store, name, length_ms)
+    let mut answer = crate::cost::window(&store, name, length_ms)?;
+    let facts = store
+        .task_label_facts(&cost_task_ids(&answer))
+        .map_err(err)?;
+    labels::label_cost(
+        &mut answer,
+        &labels::Context::from_board(&facts, &labels::Titles::new()),
+    );
+    Ok(answer)
+}
+
+/// The ids of a cost answer's `tasks` rows.
+fn cost_task_ids(answer: &Value) -> Vec<i64> {
+    answer["tasks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row["task"].as_i64())
+        .collect()
 }
 
 /// A query parameter's value with its `%XX` escapes decoded (a `+` stays a
