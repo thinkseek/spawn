@@ -1675,14 +1675,14 @@ times in a row)",
                     evidence["task"] = json!(task);
                     evidence["task_state"] = json!(state);
                     evidence["command"] = json!(command);
-                    text.push_str(&format!(" on task #{task} ({state})"));
+                    text = format!("{text} on task #{task} ({state})");
                     if let Some(command) = &command {
-                        text.push_str(&format!("; `{command}` gives it a fresh execution"));
+                        text = format!("{text}; `{command}` gives it a fresh execution");
                     }
                 }
                 if let Some(dispatch) = &dispatch {
                     evidence["dispatch"] = json!(dispatch);
-                    text.push_str(&format!("; it has to dispatch: {}", dispatch.join(", ")));
+                    text = format!("{text}; it has to dispatch: {}", dispatch.join(", "));
                 }
                 out.push(Event::Fire {
                     key: format!("agent_stuck:{session}:{event_id}"),
@@ -5132,14 +5132,23 @@ connections\n";
     fn worker_monitor(accept: &str, records: &[Value]) -> Monitor {
         let mut monitor = monitor();
         let mut all = vec![
-            (1, json!({"type": "mission.added", "id": 4, "text": "m", "origin": "human"})),
-            (2, json!({"type": "mission.configured", "id": 4, "accept": accept})),
+            (
+                1,
+                json!({"type": "mission.added", "id": 4, "text": "m", "origin": "human"}),
+            ),
+            (
+                2,
+                json!({"type": "mission.configured", "id": 4, "accept": accept}),
+            ),
             (
                 10,
                 json!({"type": "task.assigned", "id": 7, "mission_id": 4,
                        "agent_id": "agent_worker_w", "objective": 26}),
             ),
-            (11, json!({"type": "task.delivered", "id": 7, "command_id": 3})),
+            (
+                11,
+                json!({"type": "task.delivered", "id": 7, "command_id": 3}),
+            ),
         ];
         all.extend((12..).zip(records.iter().cloned()));
         for (id, record) in all {
@@ -5170,8 +5179,16 @@ connections\n";
     fn a_worker_whose_part_is_done_is_never_alerted_stuck() {
         let reported = json!({"type": "task.reported", "id": 7, "commit": "c"});
         let cases: Vec<(&str, &str, Vec<Value>)> = vec![
-            ("reported, waiting for its gate", "gate", vec![reported.clone()]),
-            ("reported, waiting for a review", "review", vec![reported.clone()]),
+            (
+                "reported, waiting for its gate",
+                "gate",
+                vec![reported.clone()],
+            ),
+            (
+                "reported, waiting for a review",
+                "review",
+                vec![reported.clone()],
+            ),
             (
                 "gated stale: reported again",
                 "gate",
@@ -5217,7 +5234,10 @@ connections\n";
         ];
         for (what, accept, records) in cases {
             let mut monitor = worker_monitor(accept, &records);
-            let out = observed(&mut monitor, &stuck_of("session_worker_w", "agent_worker_w"));
+            let out = observed(
+                &mut monitor,
+                &stuck_of("session_worker_w", "agent_worker_w"),
+            );
             assert!(out.is_empty(), "{what}: {out:?}");
         }
     }
@@ -5229,7 +5249,10 @@ connections\n";
     #[test]
     fn a_worker_stuck_in_its_task_names_the_task_and_its_command() {
         let mut monitor = worker_monitor("gate", &[]);
-        let out = observed(&mut monitor, &stuck_of("session_worker_w", "agent_worker_w"));
+        let out = observed(
+            &mut monitor,
+            &stuck_of("session_worker_w", "agent_worker_w"),
+        );
         assert_eq!(fires(&out), ["agent_stuck:session_worker_w:100"]);
         let Event::Fire { evidence, text, .. } = &out[0] else {
             panic!("a fire");
@@ -5240,7 +5263,10 @@ connections\n";
         assert_eq!(evidence["event_id"], 100);
         assert!(text.contains("spawn task restart --id 7"), "{text}");
         commit(&mut monitor, &out);
-        let again = observed(&mut monitor, &stuck_of("session_worker_w", "agent_worker_w"));
+        let again = observed(
+            &mut monitor,
+            &stuck_of("session_worker_w", "agent_worker_w"),
+        );
         assert!(again.is_empty(), "one alert: {again:?}");
 
         let mut revising = worker_monitor(
@@ -5250,7 +5276,10 @@ connections\n";
                 json!({"type": "task.gated", "id": 7, "verdict": "rejected", "revision": 0}),
             ],
         );
-        let out = observed(&mut revising, &stuck_of("session_worker_w", "agent_worker_w"));
+        let out = observed(
+            &mut revising,
+            &stuck_of("session_worker_w", "agent_worker_w"),
+        );
         let Event::Fire { evidence, .. } = &out[0] else {
             panic!("a fire: {out:?}");
         };
@@ -5279,7 +5308,10 @@ connections\n";
             ),
         ] {
             let mut monitor = worker_monitor("gate", &[]);
-            let fired = observed(&mut monitor, &stuck_of("session_worker_w", "agent_worker_w"));
+            let fired = observed(
+                &mut monitor,
+                &stuck_of("session_worker_w", "agent_worker_w"),
+            );
             commit(&mut monitor, &fired);
             let mut cleared = Vec::new();
             for (offset, record) in records.iter().enumerate() {
@@ -5287,13 +5319,20 @@ connections\n";
                 let events = feed(&mut monitor, id, 0, record.clone());
                 let events = decided(&monitor, events);
                 commit(&mut monitor, &events);
-                cleared.extend(events.into_iter().filter(|event| matches!(event, Event::Clear { .. })));
+                cleared.extend(
+                    events
+                        .into_iter()
+                        .filter(|event| matches!(event, Event::Clear { .. })),
+                );
             }
             assert_eq!(cleared.len(), 1, "{cleared:?}");
             assert!(matches!(&cleared[0], Event::Clear { key, evidence }
                 if key == "agent_stuck:session_worker_w:100" && evidence["event_id"] == 200
                     && evidence["record"] == clearing && evidence["task"] == 7));
-            let after = observed(&mut monitor, &stuck_of("session_worker_w", "agent_worker_w"));
+            let after = observed(
+                &mut monitor,
+                &stuck_of("session_worker_w", "agent_worker_w"),
+            );
             assert!(after.is_empty(), "nothing fires again: {after:?}");
         }
         // Landed by its gate's landing: cleared at the gated accepted.
