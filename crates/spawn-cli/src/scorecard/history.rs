@@ -29,9 +29,12 @@ pub(crate) enum Kind {
     Incompatible,
     /// Rework: a review with `accepted` false.
     Reviewed,
-    /// Autonomy: a command of a person (`human`, the board) or the CLI
-    /// (`spawn`).
+    /// Autonomy: an intent of a person (`human`, the board) or the CLI
+    /// (`spawn`): its first command (objective 049).
     Command,
+    /// Autonomy's part `retries`: a command of a person's intent after its
+    /// first, at the intent's time; not an intervention.
+    Retry,
     /// Autonomy: a `mission.resumed`.
     Resume,
     /// Autonomy: a task a person assigned on a mission that a review accepts.
@@ -194,6 +197,12 @@ pub(crate) struct Command {
     /// Its stall tags (`<session> stall-<task>-<step>-<n>`).
     #[serde(default)]
     pub(crate) stalls: Vec<String>,
+    /// A person's command: its intent's first command, and that one's
+    /// creation (`spawn_human_intents`); none, an intent of its own.
+    #[serde(default)]
+    pub(crate) intent: Option<i64>,
+    #[serde(default)]
+    pub(crate) intent_at_ms: Option<i64>,
 }
 
 /// The facts as the store answers them: `{control, commands}`.
@@ -611,10 +620,17 @@ impl History {
             let mission = self.command_mission(command, &by_session);
             let at = command.created_at_ms;
             if matches!(command.principal.as_str(), "human" | "spawn") {
+                // One intervention per intent; a command sent again after a
+                // refusal is a retry of it, counted at the intent's time.
+                let first = command.intent.is_none_or(|intent| intent == command.id);
                 marks.push(Mark {
-                    at,
+                    at: if first {
+                        at
+                    } else {
+                        command.intent_at_ms.unwrap_or(at)
+                    },
                     mission,
-                    kind: Kind::Command,
+                    kind: if first { Kind::Command } else { Kind::Retry },
                 });
             }
             if command.succeeded == Some(false) {
