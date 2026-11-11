@@ -1221,6 +1221,9 @@ the base, unsolved on it (task #{task}'s gate)"
                     ),
                     notice: true,
                 });
+                if PART_DONE.contains(&after.as_str()) {
+                    self.part_done(event_id, id, &task.agent, kind, &after, out);
+                }
             }
         }
         if self
@@ -1233,6 +1236,41 @@ the base, unsolved on it (task #{task}'s gate)"
             out.push(Event::Clear {
                 key: format!("task_undelivered:{id}:{assigned}"),
                 evidence: json!({"event_id": event_id, "record": kind}),
+            });
+        }
+    }
+
+    /// A worker's task moved past its part ([`PART_DONE`]) by the record
+    /// `event_id`: the worker's open `agent_stuck` (on this task, or one
+    /// that names none) clears at it, naming it (objective 057).
+    fn part_done(
+        &mut self,
+        event_id: i64,
+        task: i64,
+        agent: &str,
+        record: &str,
+        state: &str,
+        out: &mut Vec<Event>,
+    ) {
+        let open: Vec<String> = self
+            .known
+            .iter()
+            .filter(|(_, row)| {
+                row.open()
+                    && row.kind == "agent_stuck"
+                    && row.evidence["agent_id"].as_str() == Some(agent)
+                    && row.evidence["task"]
+                        .as_i64()
+                        .is_none_or(|named| named == task)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in open {
+            out.push(Event::Clear {
+                key,
+                evidence: json!({
+                    "event_id": event_id, "record": record, "task": task, "task_state": state,
+                }),
             });
         }
     }
