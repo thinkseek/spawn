@@ -101,7 +101,8 @@ pub(crate) struct Task {
     pub(crate) assigned_at: i64,
     pub(crate) delivered_at: Option<i64>,
     pub(crate) closed_at: Option<i64>,
-    /// When it was cancelled, if it was (`task.cancelled`, `task.aborted`).
+    /// When it was cancelled, if it was (`task.cancelled`, `task.aborted`,
+    /// `task.over_budget`).
     pub(crate) cancelled_at: Option<i64>,
     pub(crate) sent_back: bool,
 }
@@ -351,7 +352,9 @@ impl Fold {
                     self.landed(task, record.at);
                 }
             }
-            "task.cancelled" | "task.aborted" => {
+            // Over budget closes the task too (it leaves flight; its
+            // objective's next task continues the work), never a person's.
+            "task.cancelled" | "task.aborted" | "task.over_budget" => {
                 let Some(task) = id.and_then(|id| self.history.tasks.get_mut(&id)) else {
                     return;
                 };
