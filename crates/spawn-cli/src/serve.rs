@@ -3337,6 +3337,126 @@ mod tests {
         assert_eq!(recurring["current"], 1200.0);
     }
 
+    /// A backlog of `ids` in a fresh directory, each objective's JSON
+    /// extended by `extra` (its id's entry).
+    fn backlog_dir(name: &str, ids: &[u32], extra: &[(u32, &str)]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("spawn-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for id in ids {
+            let more = extra
+                .iter()
+                .find(|(of, _)| of == id)
+                .map_or("", |(_, more)| *more);
+            std::fs::write(
+                dir.join(format!("{id:03}.json")),
+                format!(r#"{{"id": {id}, "title": "o{id}", "prompt": "p"{more}}}"#),
+            )
+            .expect("write");
+        }
+        dir
+    }
+
+    /// An objective the integrator recorded solved on the base reads as
+    /// solved and names its record; `next_objective` is the integrator's
+    /// own choice: not solved, not in flight, yields behind the others.
+    #[test]
+    fn an_objective_solved_on_the_base_is_solved_and_next_is_the_integrators_choice() {
+        let dir = backlog_dir("board-solved", &[1, 2, 3, 4, 5], &[]);
+        let board = with_objectives(json!({
+            "id": 1,
+            "gate": "/g",
+            "objectives": {"backlog": dir.to_str()},
+            "tasks": [
+                task(4, 4, "cancelled", 40, None),
+                task(3, 3, "reported", 30, None),
+                task(2, 2, "cancelled", 20, None),
+                task(1, 1, "landed", 10, None),
+            ],
+            "solved_on_base": [{"event": 77, "objective": 2, "task": 2, "base": "b0", "at_ms": 5}],
+            "outcomes": [
+                {"type": "task.gated", "task": 4, "objective": 4, "verdict": "rejected"},
+                {"type": "task.gated", "task": 4, "objective": 4, "verdict": "rejected"},
+                {"type": "task.gated", "task": 4, "objective": 4, "verdict": "rejected"},
+                {"type": "task.cancelled", "task": 4, "objective": 4, "yielded": true},
+            ],
+        }));
+        let rows = board["objectives"].as_array().expect("rows");
+        let statuses: Vec<&Value> = rows.iter().map(|row| &row["status"]).collect();
+        assert_eq!(statuses, ["solved", "solved", "open", "open", "open"]);
+        assert_eq!(
+            rows[1]["solved_on_base"],
+            json!({"event": 77, "task": 2, "base": "b0"})
+        );
+        for at in [0, 2, 3, 4] {
+            assert_eq!(rows[at]["solved_on_base"], Value::Null, "row {at}");
+        }
+        // Its landings are a landing's only; the record is not one.
+        assert_eq!(rows[1]["landings"], json!([]));
+        assert_eq!(board["next_objective"], json!(5));
+        // The inputs are taken out of the row.
+        assert!(board.get("outcomes").is_none());
+        assert!(board.get("solved_on_base").is_none());
+        let summary = rsi_summary(&board);
+        assert_eq!(summary["objectives"]["open"], 3);
+        assert_eq!(summary["objectives"]["solved"], 2);
+        assert_eq!(summary["next_objective"], 5);
+
+        // Without objective 5, the yielded 4 is next; with 4 in flight too,
+        // nothing is.
+        let dir4 = backlog_dir("board-solved-4", &[1, 2, 3, 4], &[]);
+        let mut mission = json!({
+            "id": 1, "gate": "/g", "objectives": {"backlog": dir4.to_str()},
+            "tasks": [task(1, 1, "landed", 10, None)],
+            "solved_on_base": [{"event": 77, "objective": 2, "task": 2, "base": "b0"}],
+        });
+        mission["tasks"]
+            .as_array_mut()
+            .expect("tasks")
+            .push(task(3, 3, "delivered", 30, None));
+        assert_eq!(with_objectives(mission.clone())["next_objective"], json!(4));
+        mission["tasks"]
+            .as_array_mut()
+            .expect("tasks")
+            .push(task(5, 4, "accepted", 50, None));
+        assert_eq!(with_objectives(mission)["next_objective"], Value::Null);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir4);
+    }
+
+    /// Another mission's record solves nothing here; `after` is obeyed
+    /// against records solved on the base; a held objective is not next.
+    #[test]
+    fn next_objective_obeys_order_holds_and_only_its_own_records() {
+        let dir = backlog_dir("board-order", &[1, 2, 3], &[(1, r#", "after": [2]"#)]);
+        // Objective 2 open: 1 waits for it, so 2 is next.
+        let open = with_objectives(json!({
+            "id": 1, "gate": "/g", "objectives": {"backlog": dir.to_str()}, "tasks": [],
+        }));
+        assert_eq!(open["next_objective"], json!(2));
+        // Objective 2 solved on the base: 1 may go.
+        let solved = with_objectives(json!({
+            "id": 1, "gate": "/g", "objectives": {"backlog": dir.to_str()}, "tasks": [],
+            "solved_on_base": [{"event": 9, "objective": 2, "task": 7, "base": "b"}],
+        }));
+        assert_eq!(solved["objectives"][1]["status"], "solved");
+        assert_eq!(solved["next_objective"], json!(1));
+        // Objective 1 held after a second overrun, not configured since:
+        // 3 is next; a newer configure ends the hold.
+        let held = json!({
+            "id": 1, "gate": "/g", "objectives": {"backlog": dir.to_str()}, "tasks": [],
+            "configured_ms": 100,
+            "solved_on_base": [{"event": 9, "objective": 2, "task": 7, "base": "b"}],
+            "outcomes": [{"type": "task.over_budget", "task": 8, "objective": 1,
+                          "chain": true, "at_ms": 200}],
+        });
+        assert_eq!(with_objectives(held.clone())["next_objective"], json!(3));
+        let mut configured = held;
+        configured["configured_ms"] = json!(300);
+        assert_eq!(with_objectives(configured)["next_objective"], json!(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_board_gets_each_tasks_last_gate_and_keeps_its_stages() {
         let stages = json!([{"stage": "assigned", "at_ms": 1},
