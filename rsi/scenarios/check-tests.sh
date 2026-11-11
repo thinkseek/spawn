@@ -55,6 +55,8 @@ log=$work/log
 scratch=$(mktemp -d)
 db=""
 cleanup() {
+    # A test may leave a directory it made unwritable: make it removable first.
+    chmod -R u+rwX "$scratch" 2>/dev/null || true
     rm -rf "$work" "$scratch"
     if [ -n "$db" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$db" >/dev/null 2>&1 || true
