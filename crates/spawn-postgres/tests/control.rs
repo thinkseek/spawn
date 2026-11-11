@@ -4174,6 +4174,41 @@ fn an_objective_solved_on_the_base_ends_its_task() {
         .expect("cancelled");
     let board = store.mission_board(10).expect("board");
     assert_eq!(board["missions"][0]["tasks"][0]["state"], "cancelled");
+    // The views of the backlog read the record (spawn-cli's RSI page and
+    // `spawn mission objectives`): the mission's own records only, and when
+    // it was last configured, as the integrator's choice reads them.
+    let other = store
+        .mission_add("objectives too", &json!(["/tmp/other.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(
+            other,
+            Some("/controller/rsi/scenarios"),
+            "gate",
+            None,
+            Some(&json!({"backlog": "/controller/rsi/backlog", "resident": "rsi"})),
+        )
+        .expect("configure");
+    let missions = store.objective_missions().expect("objective missions");
+    let row = |id: i64| {
+        missions
+            .as_array()
+            .expect("missions")
+            .iter()
+            .find(|row| row["id"] == json!(id))
+            .cloned()
+            .expect("mission row")
+    };
+    let records = row(mission)["solved_on_base"].clone();
+    assert_eq!(records.as_array().map(Vec::len), Some(1), "{records}");
+    assert_eq!(records[0]["event"], json!(solved));
+    assert_eq!(records[0]["objective"], json!(34));
+    assert_eq!(records[0]["task"], json!(task));
+    assert_eq!(records[0]["base"], json!("b0"));
+    assert!(row(mission)["configured_ms"].is_i64());
+    assert_eq!(row(other)["solved_on_base"], json!([]), "another mission's record");
+    let landings = store.objective_landings(mission).expect("landings");
+    assert_eq!(landings, json!([{"objective": 34, "metric": null}]));
 }
 
 /// An objective closed solved on the base is news the supervisor was not told
