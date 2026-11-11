@@ -205,6 +205,11 @@ export function MissionsTodayCard({ model, onOpen }: { model: MissionsToday; onO
                     <li key={task.task_id ?? task.title} className="flex min-w-0 items-baseline gap-2 text-caption">
                       <span className="tnum w-10 shrink-0 font-mono text-micro text-faint-foreground">T{task.task_id}</span>
                       <span className="min-w-0 flex-1 truncate text-foreground">{task.title ?? "untitled"}</span>
+                      {task.conflictText && (
+                        <span className="shrink-0 font-medium text-warning" title="Each conflict spent a worker round and a gate run again">
+                          {task.conflictText}
+                        </span>
+                      )}
                       <span className="tnum shrink-0 text-muted-foreground">
                         {task.state}
                         {task.since_ms !== null && ` ${sinceText(task.since_ms)}`}
