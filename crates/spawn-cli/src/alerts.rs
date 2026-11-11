@@ -11,7 +11,13 @@
 //! An alert fires once per occurrence and clears at most once, whatever
 //! restarts: the key names the occurrence, the store refuses a second
 //! `alert.fired` for a key, and the step reads the keys back on start, so a
-//! restarted loop fires nothing twice and still knows what is open. A
+//! restarted loop fires nothing twice and still knows what is open. It
+//! clears only on evidence after what it fired on (objective 050; [`after`]):
+//! a record later in the log than the alert's own `event_id`, or a reading
+//! at or after its `reading_ms`. A restart reads the last week of records
+//! again, and an older one clears nothing; the records a pass reads are
+//! recorded one at a time, so a halt and its resume in one read end the
+//! alert cleared, naming the resume. A
 //! notice is an `alert.fired` with `notice: true`: it is news, never a
 //! condition, and never clears.
 //!
@@ -3387,9 +3393,18 @@ mod tests {
         );
         for (event_id, record) in [
             (15, json!({"type": "mission.resumed", "id": 4})),
-            (25, json!({"type": "backup.verified", "ok": true, "key": "old"})),
-            (30, json!({"type": "backup.verified", "ok": false, "key": "same"})),
-            (35, json!({"type": "host.judge", "judge": "jev", "state": "up"})),
+            (
+                25,
+                json!({"type": "backup.verified", "ok": true, "key": "old"}),
+            ),
+            (
+                30,
+                json!({"type": "backup.verified", "ok": false, "key": "same"}),
+            ),
+            (
+                35,
+                json!({"type": "host.judge", "judge": "jev", "state": "up"}),
+            ),
         ] {
             let events = feed(&mut monitor, event_id, 0, record);
             let cleared: Vec<Event> = decided(&monitor, events)
@@ -3399,9 +3414,21 @@ mod tests {
             assert!(cleared.is_empty(), "record {event_id} cleared {cleared:?}");
         }
         for (event_id, record, key) in [
-            (50, json!({"type": "mission.resumed", "id": 4}), "mission_halted:4:20"),
-            (51, json!({"type": "backup.verified", "ok": true, "key": "new"}), "drill_failed:30"),
-            (52, json!({"type": "host.judge", "judge": "jev", "state": "up"}), "judge_down:40"),
+            (
+                50,
+                json!({"type": "mission.resumed", "id": 4}),
+                "mission_halted:4:20",
+            ),
+            (
+                51,
+                json!({"type": "backup.verified", "ok": true, "key": "new"}),
+                "drill_failed:30",
+            ),
+            (
+                52,
+                json!({"type": "host.judge", "judge": "jev", "state": "up"}),
+                "judge_down:40",
+            ),
         ] {
             let events = feed(&mut monitor, event_id, 0, record);
             let cleared = decided(&monitor, events);
@@ -3435,7 +3462,11 @@ mod tests {
         assert!(super::after(&unnamed, &json!({}), 1_300));
         // An event names the order whatever the clocks say.
         let record = row(json!({"event_id": 9}), 0);
-        assert!(!super::after(&record, &json!({"event_id": 9, "reading_ms": 9_999}), 0));
+        assert!(!super::after(
+            &record,
+            &json!({"event_id": 9, "reading_ms": 9_999}),
+            0
+        ));
         assert!(super::after(&record, &json!({"event_id": 10}), 0));
     }
 
@@ -4533,13 +4564,29 @@ connections\n";
         #[test]
         fn an_older_record_clears_nothing_at_a_first_start_or_after_a_restart() {
             in_schema("alerts_restarts", |store, client| {
-                record(client, 5, r#"{"type":"mission.added","id":1,"text":"m","origin":"human","sources":[]}"#);
+                record(
+                    client,
+                    5,
+                    r#"{"type":"mission.added","id":1,"text":"m","origin":"human","sources":[]}"#,
+                );
                 let d1 = record(client, 5, r#"{"type":"backup.dumped","keys":["d1"]}"#);
-                let v1 = record(client, 4, r#"{"type":"backup.verified","ok":true,"key":"v1"}"#);
-                let h1 = record(client, 3, r#"{"type":"mission.halted","id":1,"reason":"first"}"#);
+                let v1 = record(
+                    client,
+                    4,
+                    r#"{"type":"backup.verified","ok":true,"key":"v1"}"#,
+                );
+                let h1 = record(
+                    client,
+                    3,
+                    r#"{"type":"mission.halted","id":1,"reason":"first"}"#,
+                );
                 let d2 = record(client, 3, r#"{"type":"backup.dumped","keys":["d2"]}"#);
                 let r1 = record(client, 2, r#"{"type":"mission.resumed","id":1}"#);
-                let h2 = record(client, 1, r#"{"type":"mission.halted","id":1,"reason":"second"}"#);
+                let h2 = record(
+                    client,
+                    1,
+                    r#"{"type":"mission.halted","id":1,"reason":"second"}"#,
+                );
                 let v2 = record(
                     client,
                     1,
@@ -4575,7 +4622,11 @@ connections\n";
                 // Later evidence clears each, naming it.
                 let r2 = record(client, 0, r#"{"type":"mission.resumed","id":1}"#);
                 let d3 = record(client, 0, r#"{"type":"backup.dumped","keys":["d3"]}"#);
-                let v3 = record(client, 0, r#"{"type":"backup.verified","ok":true,"key":"v3"}"#);
+                let v3 = record(
+                    client,
+                    0,
+                    r#"{"type":"backup.verified","ok":true,"key":"v3"}"#,
+                );
                 refold(client);
                 monitor.check(store).expect("the step checks");
                 assert_eq!(alert(client, &halt), ("cleared".to_string(), Some(r2)));
@@ -4589,14 +4640,22 @@ connections\n";
 
                 // A halt and its resume, and a failed drill and a good one,
                 // written while the loop was down: neither opens.
-                let h3 = record(client, 0, r#"{"type":"mission.halted","id":1,"reason":"third"}"#);
+                let h3 = record(
+                    client,
+                    0,
+                    r#"{"type":"mission.halted","id":1,"reason":"third"}"#,
+                );
                 let r3 = record(client, 0, r#"{"type":"mission.resumed","id":1}"#);
                 let v4 = record(
                     client,
                     0,
                     r#"{"type":"backup.verified","ok":false,"key":"v4","reason":"bad"}"#,
                 );
-                let v5 = record(client, 0, r#"{"type":"backup.verified","ok":true,"key":"v5"}"#);
+                let v5 = record(
+                    client,
+                    0,
+                    r#"{"type":"backup.verified","ok":true,"key":"v5"}"#,
+                );
                 refold(client);
                 drop(started(store));
                 assert_eq!(
