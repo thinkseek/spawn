@@ -910,7 +910,8 @@ owner or the supervisor (`spawn task restart --id N [--reason <text>]`,
 `spawn task reassign --id N [--reason <text>]`, the store's
 `spawn_task_restart` and `spawn_task_reassign`), or by a person from the
 agent page (`POST /api/session/<id>/restart` and `/reassign`, `by` `human`,
-through `spawn_human_task`). Each takes a `delivered` task only, refuses any
+through `spawn_human_task`); a stuck worker's `agent_stuck` alert names its
+`spawn task restart --id N` ("Alerts"). Each takes a `delivered` task only, refuses any
 other naming its state (nothing recorded or sent), and prints `{task,
 session_id, agent_id}`: the task and the worker that now carry the work.
 
