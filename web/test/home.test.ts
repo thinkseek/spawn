@@ -21,6 +21,7 @@ import {
   digestSince,
   digestToday,
   digestWindow,
+  haltWords,
   latestNotes,
   liveAlerts,
   missionsToday,
@@ -113,6 +114,7 @@ function mission(id: number, name: string, tasks: MissionTask[], fields: Partial
     budget: null,
     baseline: null,
     halted: null,
+    halt: null,
     objectives: null,
     hold: null,
     created_at_ms: NOW - 48 * HOUR,
@@ -199,6 +201,41 @@ test("a halted mission is one item to act on, with its resume command, and its h
   assert.equal(items[0].tone, "act");
   assert.equal(items[0].command, "spawn mission resume --id 6");
   assert.match(items[0].title, /#6 Supply PA is halted/);
+});
+
+test("a halted mission's item resumes the halt it shows and names the scenarios gone", () => {
+  const gone = ["c.sh", "d.sh", "e.sh"];
+  const halt = { event: 41, reason: "the scenarios fell from 5 to 2", at_ms: NOW - 2 * HOUR, gone };
+  const [item] = needsYou({
+    ...base,
+    missions: missions([mission(6, "Supply PA", [], { halted: halt.reason, halt })]),
+  });
+  assert.deepEqual(item.resume, { mission: 6, halt: 41 });
+  assert.equal(item.command, "spawn mission resume --id 6", "the command to copy stays");
+  assert.equal(item.detail, "the scenarios fell from 5 to 2; gone: c.sh, d.sh, e.sh");
+  assert.equal(item.full, null, "the line names them all");
+  assert.equal(item.since_ms, NOW - 2 * HOUR, "since the halt");
+});
+
+test("a halt with more than five scenarios gone names five and counts the rest; full names all", () => {
+  const gone = Array.from({ length: 12 }, (_, n) => `${String(n + 1).padStart(3, "0")}.sh`);
+  const words = haltWords("the scenarios fell from 40 to 28", gone);
+  assert.equal(words.detail, "the scenarios fell from 40 to 28; gone: 001.sh, 002.sh, 003.sh, 004.sh, 005.sh and 7 more");
+  assert.equal(words.full, `the scenarios fell from 40 to 28; gone: ${gone.join(", ")}`);
+  assert.deepEqual(haltWords("the scenarios fell from 6 to 1", gone.slice(0, 5)).full, null);
+  assert.deepEqual(haltWords("3 gate rejections in a row", null), { detail: "3 gate rejections in a row", full: null });
+  assert.deepEqual(haltWords("x", []), { detail: "x", full: null });
+});
+
+test("another halt is its reason alone and still resumable; a server without halt offers the command only", () => {
+  const halt = { event: 80, reason: "3 gate rejections in a row", at_ms: NOW - HOUR, gone: null };
+  const [other] = needsYou({ ...base, missions: missions([mission(8, "Other", [], { halted: halt.reason, halt })]) });
+  assert.equal(other.detail, "3 gate rejections in a row");
+  assert.deepEqual(other.resume, { mission: 8, halt: 80 });
+  const [older] = needsYou({ ...base, missions: missions([mission(9, "Older", [], { halted: "x" })]) });
+  assert.equal(older.resume, null);
+  assert.equal(older.command, "spawn mission resume --id 9");
+  assert.deepEqual(needsYou({ ...base, missions: missions([mission(10, "Running", [])]) }), []);
 });
 
 test("a held source asks for the owner when it expires soon or a task waits on it, with the release command", () => {
