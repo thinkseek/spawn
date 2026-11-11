@@ -7,7 +7,8 @@
 //! projects directory), and the format is the engine's. So the Bridge copies what the
 //! engine appended since the last copy into a [`TranscriptArchive`] at each
 //! turn end and at the end of the execution ([`archive`]), and before a
-//! resume puts a missing file back from it ([`restore`]).
+//! resume puts a missing file back from it, or one that lost its head
+//! ([`restore`]).
 //!
 //! The file is append-only. A file that shrank, or whose bytes before the
 //! end of the last copy changed (rewritten, replaced), is copied whole as
@@ -276,12 +277,39 @@ pub fn parse_rfc3339_ms(text: &str) -> Option<i64> {
     Some(seconds * 1000 + millis)
 }
 
+/// What [`restore`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Restored {
+    /// The file was missing, and `bytes` were put back.
+    Written { bytes: u64 },
+    /// The file held `had` bytes and the archive more: it was replaced by
+    /// `bytes`, every byte it held among them.
+    Replaced { bytes: u64, had: u64 },
+    /// The archive holds more than the file, but its latest copy is not the
+    /// file, so a join could lack bytes of it: the file, `had` bytes, was
+    /// left as it is, and the resume goes on with it. The archive keeps
+    /// every copy it made.
+    Left { had: u64 },
+}
+
 /// Before a resume of `native`: the transcript is where the engine will
-/// look for it. A missing file is put back from the latest copy: the bytes
-/// restored, or `None` when nothing was missing, or the session never had a
-/// transcript (`read_before`: the log holds events read from one, so it
-/// did). A transcript that is gone with no copy is an error: resuming would
-/// start the agent blank under its old id.
+/// look for it, holding everything the archive holds of it. A missing file
+/// is put back; so is one the archive holds more than (S16: it lost its
+/// head, as when the projects directory was removed under a running engine
+/// and the engine went on writing a new file). What is put back is the
+/// archive's whole transcript ([`whole`]): its copies, joined. A present
+/// file is first archived itself, so none of its bytes can be lost, and is
+/// replaced only by a longer file that holds every byte of it, through a
+/// new file and a rename ([`TerminalHost::replace_grown`]); never truncated.
+/// `None` when nothing needed doing, or the session never had a transcript
+/// (`read_before`: the log holds events read from one, so it did). A
+/// transcript that is gone with no copy is an error: resuming would start
+/// the agent blank under its old id. A present file is replaced only when
+/// it is the archive's latest copy, as just read; otherwise it is left as it
+/// is ([`Restored::Left`]) and never holds the resume up. It runs before a resume,
+/// when no engine of the session is running: an engine that wrote after the
+/// read is refused, not raced, but one writing during the rename would
+/// write to the file it replaced.
 pub fn restore(
     host: &dyn TerminalHost,
     archive: Option<&dyn TranscriptArchive>,
@@ -290,33 +318,88 @@ pub fn restore(
     agent: &AgentId,
     native: &str,
     read_before: bool,
-) -> Result<Option<u64>, String> {
-    let copies = match archive {
-        Some(archive) => archive
-            .copies(agent, native)
-            .map_err(|error| error.to_string())?,
-        None => Vec::new(),
-    };
-    // Read from the end of the latest copy: only what is newer comes back.
-    let probe = copies.last().copied().unwrap_or(0);
+) -> Result<Option<Restored>, String> {
     let present = host
-        .read_from(workspace, path, probe)
+        .read_from(workspace, path, 0)
         .map_err(|error| format!("read {path}: {error}"))?
         .is_some();
-    if present {
-        return Ok(None);
-    }
-    let (Some(archive), Some(length)) = (archive, copies.last().copied()) else {
-        if read_before {
-            return Err(format!(
-                "the transcript of native session {native} is gone from {path} and the \
-                 transcript archive holds no copy; resuming would start the agent blank under \
-                 its old id"
-            ));
+    let Some(archive) = archive else {
+        if !present && read_before {
+            return Err(gone_without_copy(native, path));
         }
         return Ok(None);
     };
-    let copy = copies.len() - 1;
+    if present {
+        // Its own bytes first: whatever happens next, the archive has them.
+        archive_to(host, archive, workspace, path, agent, native)?;
+    }
+    let copies = archive
+        .copies(agent, native)
+        .map_err(|error| error.to_string())?;
+    if copies.is_empty() {
+        if !present && read_before {
+            return Err(gone_without_copy(native, path));
+        }
+        return Ok(None);
+    }
+    // One copy that the present file just extended is the file itself.
+    if present && copies.len() == 1 {
+        return Ok(None);
+    }
+    let mut all = Vec::with_capacity(copies.len());
+    for (copy, length) in copies.iter().enumerate() {
+        all.push(read_copy(archive, agent, native, copy, *length)?);
+    }
+    let joined = whole(&all);
+    let length = u64::try_from(joined.len()).unwrap_or(u64::MAX);
+    if !present {
+        host.write_new(workspace, path, &joined)
+            .map_err(|error| format!("restore {path}: {error}"))?;
+        return Ok(Some(Restored::Written { bytes: length }));
+    }
+    let current = read_file(host, workspace, path)?;
+    if joined == current {
+        return Ok(None);
+    }
+    // The join holds every byte of the file only if the file is the latest
+    // copy: archive_to tells a file that went on by the bytes before the
+    // copy's end alone, and the engine may write between it and this read.
+    // A mismatch can stay (the archive goes on appending to that copy), so
+    // it never holds the resume up: the file goes on as it is.
+    if all.last() != Some(&current) {
+        return Ok(Some(Restored::Left {
+            had: u64::try_from(current.len()).unwrap_or(u64::MAX),
+        }));
+    }
+    let replaced = host
+        .replace_grown(workspace, path, &joined, &current)
+        .map_err(|error| format!("restore {path}: {error}"))?;
+    if !replaced {
+        return Err(format!(
+            "{path} changed while it was being restored; the resume waits for the next pass"
+        ));
+    }
+    Ok(Some(Restored::Replaced {
+        bytes: length,
+        had: u64::try_from(current.len()).unwrap_or(u64::MAX),
+    }))
+}
+
+fn gone_without_copy(native: &str, path: &str) -> String {
+    format!(
+        "the transcript of native session {native} is gone from {path} and the transcript \
+         archive holds no copy; resuming would start the agent blank under its old id"
+    )
+}
+
+/// Copy `copy` of `native`'s transcript, all `length` bytes of it.
+fn read_copy(
+    archive: &dyn TranscriptArchive,
+    agent: &AgentId,
+    native: &str,
+    copy: usize,
+    length: u64,
+) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     while u64::try_from(bytes.len()).unwrap_or(u64::MAX) < length {
         let offset = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -330,9 +413,87 @@ pub fn restore(
         }
         bytes.extend_from_slice(&chunk);
     }
-    host.write_new(workspace, path, &bytes)
-        .map_err(|error| format!("restore {path}: {error}"))?;
-    Ok(Some(length))
+    Ok(bytes)
+}
+
+/// The whole file at `path`.
+fn read_file(
+    host: &dyn TerminalHost,
+    workspace: &WorkspaceId,
+    path: &str,
+) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    loop {
+        let offset = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let chunk = host
+            .read_from(workspace, path, offset)
+            .map_err(|error| format!("read {path}: {error}"))?
+            .unwrap_or_default();
+        if chunk.is_empty() {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+}
+
+/// The transcript the copies hold together, oldest first. A copy is made
+/// only when the file did not go on from the copy before it ([`archive_to`]):
+/// it was cut short, it lost its head, or the engine rewrote it. A copy that
+/// holds everything before it and more is taken whole. Otherwise what it
+/// holds after the whole lines it shares with what came before is read:
+/// - nothing: it was cut short, and adds nothing;
+/// - a line whose `uuid` is already there: the engine rewrote what it had
+///   written (a format change, a compaction), and the copy stands for the
+///   transcript from then on, as before;
+/// - only new lines: the file lost its head and the engine went on, and
+///   the lines follow what came before (on a line of their own, if what
+///   came before ended inside a line).
+///
+/// So no line is dropped but one the engine itself wrote again.
+pub fn whole(copies: &[Vec<u8>]) -> Vec<u8> {
+    let mut joined: Vec<u8> = Vec::new();
+    for copy in copies {
+        if copy.starts_with(&joined) {
+            joined.clone_from(copy);
+            continue;
+        }
+        let shared = joined
+            .iter()
+            .zip(copy.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let from = copy[..shared]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |newline| newline + 1);
+        let rest = &copy[from..];
+        if shared == copy.len() || rest.is_empty() {
+            continue;
+        }
+        let known = uuids(&joined);
+        if uuids(rest).iter().any(|uuid| known.contains(uuid)) {
+            joined.clone_from(copy);
+            continue;
+        }
+        if !joined.is_empty() && !joined.ends_with(b"\n") {
+            joined.push(b'\n');
+        }
+        joined.extend_from_slice(rest);
+    }
+    joined
+}
+
+/// The `uuid` of each line of a transcript that has one.
+fn uuids(bytes: &[u8]) -> std::collections::HashSet<String> {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .filter_map(|line| {
+            line.get("uuid")
+                .and_then(|uuid| uuid.as_str())
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 /// Whether `event` was read from a native transcript: what tells a session
@@ -363,7 +524,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ArchiveProgress, archive, archive_to, first_line_ms, parse_rfc3339_ms, restore, settling,
+        ArchiveProgress, Restored, archive, archive_to, first_line_ms, parse_rfc3339_ms, restore,
+        settling, whole,
     };
     use crate::id::{AgentId, WorkspaceId};
     use crate::id::{ExecutionId, SessionId};
@@ -553,6 +715,13 @@ mod tests {
         assert_eq!(copies(&store, &agent)[0].len(), big.len());
     }
 
+    fn file(store: &MemoryStore, workspace: &WorkspaceId) -> Vec<u8> {
+        store
+            .read_from(workspace, PATH, 0)
+            .expect("read")
+            .expect("present")
+    }
+
     #[test]
     fn a_missing_transcript_is_restored_from_the_latest_copy() {
         let (store, agent, workspace) = setup();
@@ -562,19 +731,158 @@ mod tests {
         step(&store, &agent, &workspace);
         store.remove_file(PATH);
         let restored = restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true);
-        assert_eq!(restored, Ok(Some(4)));
-        assert_eq!(
-            store.read_from(&workspace, PATH, 0).expect("read"),
-            Some(b"new\n".to_vec())
-        );
-        // Present now: nothing to do, and the archive goes on as before.
+        assert_eq!(restored, Ok(Some(Restored::Written { bytes: 8 })));
+        assert_eq!(file(&store, &workspace), b"old\nnew\n");
+        // Present now: nothing to do, and the archive goes on.
         assert_eq!(
             restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true),
             Ok(None)
         );
         store.append_file(PATH, "more\n");
         step(&store, &agent, &workspace);
-        assert_eq!(copies(&store, &agent).len(), 2, "the restored file went on");
+        assert_eq!(file(&store, &workspace), b"old\nnew\nmore\n");
+    }
+
+    /// S16: the projects directory removed under a running engine, which
+    /// went on writing a new file: at the resume the file holds only what
+    /// came after, and the archive more. Whether the new lines were archived
+    /// yet or not, the file gets every line back, its own included.
+    #[test]
+    fn a_transcript_that_lost_its_head_is_restored_whole() {
+        for archived in [true, false] {
+            let (store, agent, workspace) = setup();
+            store.append_file(PATH, "a\nb\n");
+            step(&store, &agent, &workspace);
+            store.remove_file(PATH);
+            store.append_file(PATH, "c\n");
+            if archived {
+                step(&store, &agent, &workspace);
+            }
+            let restored = restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true);
+            assert_eq!(
+                restored,
+                Ok(Some(Restored::Replaced { bytes: 6, had: 2 })),
+                "archived {archived}"
+            );
+            assert_eq!(
+                file(&store, &workspace),
+                b"a\nb\nc\n",
+                "archived {archived}"
+            );
+            // Restored once: the next resume finds it whole.
+            assert_eq!(
+                restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true),
+                Ok(None),
+                "archived {archived}"
+            );
+            // The archive still holds every copy it had: nothing was lost
+            // there either.
+            assert!(copies(&store, &agent).iter().any(|copy| copy == b"a\nb\n"));
+            assert!(copies(&store, &agent).iter().any(|copy| copy == b"c\n"));
+        }
+    }
+
+    #[test]
+    fn a_file_the_latest_copy_does_not_hold_is_left_as_it_is() {
+        let (store, agent, workspace) = setup();
+        store.append_file(PATH, "a\n");
+        step(&store, &agent, &workspace);
+        // A new file, longer than the overlap the archive compares.
+        let tail = "x".repeat(5000);
+        store.replace_file(PATH, format!("{tail}\n").as_bytes());
+        step(&store, &agent, &workspace);
+        // Its head changes outside the compared overlap, and it goes on:
+        // the archive takes it as an append, so its latest copy is not the
+        // file.
+        let changed = format!("y{}\nz\n", &tail[1..]);
+        store.replace_file(PATH, changed.as_bytes());
+        let had = u64::try_from(changed.len()).expect("length");
+        // Left as it is, and the resume goes on: not now, nor on any later
+        // resume, though the mismatch stays.
+        for resume in 0..2 {
+            assert_eq!(
+                restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true),
+                Ok(Some(Restored::Left { had })),
+                "resume {resume}"
+            );
+            assert_eq!(
+                file(&store, &workspace),
+                changed.as_bytes(),
+                "resume {resume}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_transcript_cut_short_is_restored_and_one_that_went_on_is_left() {
+        let (store, agent, workspace) = setup();
+        store.append_file(PATH, "a\nb\n");
+        step(&store, &agent, &workspace);
+        store.replace_file(PATH, b"a\n");
+        assert_eq!(
+            restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true),
+            Ok(Some(Restored::Replaced { bytes: 4, had: 2 }))
+        );
+        assert_eq!(file(&store, &workspace), b"a\nb\n");
+        // A file that only went on is the transcript itself: left as it is.
+        store.append_file(PATH, "c\n");
+        assert_eq!(
+            restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true),
+            Ok(None)
+        );
+        assert_eq!(file(&store, &workspace), b"a\nb\nc\n");
+    }
+
+    #[test]
+    fn the_copies_are_joined_without_dropping_a_line() {
+        let join =
+            |copies: &[&[u8]]| whole(&copies.iter().map(|copy| copy.to_vec()).collect::<Vec<_>>());
+        assert_eq!(join(&[b"a\nb\n"]), b"a\nb\n");
+        // Went on: the longer copy.
+        assert_eq!(join(&[b"a\n", b"a\nb\n"]), b"a\nb\n");
+        // Cut short: nothing new.
+        assert_eq!(join(&[b"a\nb\n", b"a\n"]), b"a\nb\n");
+        // A new file: all of it after.
+        assert_eq!(join(&[b"a\nb\n", b"c\n"]), b"a\nb\nc\n");
+        // Cut short, then went on: what is new after the shared lines.
+        assert_eq!(join(&[b"a\nb\n", b"a\nc\n"]), b"a\nb\nc\n");
+        // A copy that ended inside a line keeps its bytes, on a line of
+        // their own.
+        assert_eq!(join(&[b"a\nb", b"c\n"]), b"a\nb\nc\n");
+        // Shared bytes inside a first line are no shared line.
+        assert_eq!(
+            join(&[b"{\"x\":1}\n", b"{\"y\":2}\n"]),
+            b"{\"x\":1}\n{\"y\":2}\n"
+        );
+        // A line the engine wrote again (its uuid is there): the rewrite
+        // stands for the transcript.
+        assert_eq!(
+            join(&[
+                b"{\"uuid\":\"u1\",\"c\":\"go\"}\n{\"uuid\":\"u2\"}\n",
+                b"{\"uuid\":\"u1\",\"c\":\"GO\"}\n"
+            ]),
+            b"{\"uuid\":\"u1\",\"c\":\"GO\"}\n"
+        );
+        // Lost its head and went on: the new lines follow.
+        assert_eq!(
+            join(&[
+                b"{\"uuid\":\"u1\"}\n{\"uuid\":\"u2\"}\n",
+                b"{\"uuid\":\"u3\"}\n"
+            ]),
+            b"{\"uuid\":\"u1\"}\n{\"uuid\":\"u2\"}\n{\"uuid\":\"u3\"}\n"
+        );
+    }
+
+    #[test]
+    fn a_host_that_cannot_replace_says_so() {
+        let (store, _agent, workspace) = setup();
+        store.append_file(PATH, "c\n");
+        assert!(store.replace_grown(&workspace, PATH, b"", b"c\n").is_err());
+        assert!(matches!(
+            store.replace_grown(&workspace, PATH, b"x\nc\n", b"d\n"),
+            Ok(false)
+        ));
+        assert_eq!(file(&store, &workspace), b"c\n");
     }
 
     #[test]
