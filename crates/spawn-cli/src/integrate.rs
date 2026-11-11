@@ -2465,6 +2465,40 @@ impl Integrator {
         Ok(true)
     }
 
+    /// Whether `task` is held by the nightly's red on its source (gate v2
+    /// step 5b), saying so when it starts to be: while the nightly's fact
+    /// has a red ([`nightly_red`]), no task of the source is judged, so no
+    /// task lands on it (one already accepted when the red appeared lands:
+    /// its gate judged before the red was known). The owner's pushes are
+    /// judged and land as before (`owner.rs`): a fix or a revert is one. A
+    /// green or flaky nightly, the timer's or one run by hand after the
+    /// fix, ends the red and the hold.
+    fn nightly_holds(&self, mission: &Mission, task: &Task, source: &str) -> bool {
+        let Some(red) = nightly_red(&self.judge.root, source) else {
+            return false;
+        };
+        if self
+            .waiting
+            .borrow_mut()
+            .insert((task.id, Wait::NightlyRed))
+        {
+            println!(
+                "integrate: mission {}: task {} held: main of {source} is red since {} on the \
+                 nightly ({}): task landings wait for a green or flaky nightly; the owner's \
+                 pushes still land",
+                mission.id,
+                task.id,
+                short_commit(&red.since),
+                if red.failed.is_empty() {
+                    "no scenario named".to_string()
+                } else {
+                    red.failed.join(", ")
+                }
+            );
+        }
+        true
+    }
+
     /// Whether `task`'s gate backs off this pass ([`gate_wait`]), saying
     /// so when it starts to: the line is printed once, not on every pass
     /// it goes on waiting, like every other wait.
@@ -3321,6 +3355,9 @@ impl Integrator {
                 return Ok(false);
             }
             if self.controller_behind(store, mission, task, source, &mirror, &scenarios)? {
+                return Ok(false);
+            }
+            if self.nightly_holds(mission, task, source) {
                 return Ok(false);
             }
             let mut gated = mission.clone();
@@ -5397,6 +5434,54 @@ fn gate_wait(mission: &Mission, task: &Task) -> Option<(Wait, String)> {
     })
 }
 
+/// The nightly's red on a source (gate v2 step 5b, sync/design-nightly-
+/// min.md): its fact file `<root>/nightly/<name>.json`, which
+/// scripts/rsi/nightly.sh writes for `$SPAWN_LIVE/missions/<name>.git`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NightlyRed {
+    /// The main of the first red run of this red.
+    pub(crate) since: String,
+    /// The scenarios that failed.
+    pub(crate) failed: Vec<String>,
+}
+
+/// The nightly's red on `source`, read from `<root>/nightly/<name>.json`
+/// (`<name>`: the source's last path component without `.git`): the fact's
+/// `red_since` while it is set. nightly.sh sets it at a red run, keeps it
+/// through a skipped run (nothing ran that showed main fixed), and clears
+/// it at a green or flaky run. None for a source with no fact, a fact that
+/// cannot be read, or one with no red: a nightly that does not run holds
+/// nothing (its own alert, nightly_stale, says so).
+pub(crate) fn nightly_red(root: &Path, source: &str) -> Option<NightlyRed> {
+    let name = Path::new(source).file_name()?.to_str()?;
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return None;
+    }
+    let text = std::fs::read_to_string(root.join("nightly").join(format!("{name}.json"))).ok()?;
+    let fact: Value = serde_json::from_str(&text).ok()?;
+    let since = fact["red_since"]
+        .as_str()
+        .filter(|since| !since.is_empty())?;
+    let failed = fact["failed"]
+        .as_array()
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|name| name.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(NightlyRed {
+        since: since.to_string(),
+        failed,
+    })
+}
+
 /// The commit the controller holding `scenarios` was built from: the
 /// `<name>-<40 hex>` directory under a `controllers` directory on the
 /// scenarios' physical path (deploy/controller.sh builds
@@ -5462,6 +5547,8 @@ enum Wait {
     /// controller its scenarios come from: its deploy has not switched the
     /// controller yet (P22).
     Controller,
+    /// The nightly found main of its source red (gate v2 step 5b).
+    NightlyRed,
 }
 
 /// Whether a wait was said this pass or before, for [`Integrator::backs_off`].
@@ -8430,6 +8517,52 @@ mod tests {
         assert_eq!(super::controller_commit(&short), None);
         assert_eq!(super::controller_behind(&repo, &plain, &c2), None);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Gate v2 step 5b: the nightly's red is read from
+    /// `<root>/nightly/<name>.json`, `<name>` the source's last component
+    /// without `.git`: its `red_since` while set (a red, or a skipped run
+    /// during one), with the failed names; nothing for green or flaky (null),
+    /// no fact, a fact that is no JSON, or a source whose name nightly.sh
+    /// would refuse.
+    #[test]
+    fn the_nightly_red_is_the_facts_red_since() {
+        let root = std::env::temp_dir().join(format!("spawn-nightly-fact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("nightly")).expect("facts");
+        let source = "/live/missions/spawn.git";
+        let write =
+            |text: &str| std::fs::write(root.join("nightly/spawn.json"), text).expect("fact");
+        assert_eq!(super::nightly_red(&root, source), None, "no fact");
+        write(r#"{"v":1,"state":"red","failed":["023","025"],"red_since":"abc123"}"#);
+        assert_eq!(
+            super::nightly_red(&root, source),
+            Some(super::NightlyRed {
+                since: "abc123".to_string(),
+                failed: vec!["023".to_string(), "025".to_string()],
+            })
+        );
+        assert!(
+            super::nightly_red(&root, "/elsewhere/spawn").is_some(),
+            "the name without .git too"
+        );
+        write(r#"{"v":1,"state":"skipped","failed":["023"],"red_since":"abc123"}"#);
+        assert!(
+            super::nightly_red(&root, source).is_some(),
+            "a skipped night keeps the red"
+        );
+        for clear in [
+            r#"{"v":1,"state":"green","failed":[],"red_since":null}"#,
+            r#"{"v":1,"state":"flaky","failed":[],"red_since":null}"#,
+            r#"{"v":1,"state":"red","red_since":""}"#,
+            "not json",
+        ] {
+            write(clear);
+            assert_eq!(super::nightly_red(&root, source), None, "{clear}");
+        }
+        assert_eq!(super::nightly_red(&root, "/live/missions/.git"), None);
+        assert_eq!(super::nightly_red(&root, "/live/missions/a b.git"), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
@@ -17559,5 +17692,75 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         assert_eq!(cleared.len(), 1, "{cleared:?}");
         assert_eq!(cleared[0]["state"], "cleared", "{cleared:?}");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Gate v2 step 5b, on the store: while the nightly's fact for the
+    /// source has a red (`red_since`), the mission's reported task is not
+    /// judged (held, said once), so nothing of it lands; the owner's push
+    /// on the red source still lands; a green nightly (`red_since` null)
+    /// releases the task, which is then judged and lands.
+    #[test]
+    fn a_red_nightly_holds_task_landings_and_not_the_owners() {
+        let marks = fresh_marks("spawn-nightly-red");
+        let release = Release(marks.clone());
+        let (base, source, scenarios, integrator) = world("nightly-red", &holding_gate(&marks));
+        let db = Db::new("nightly_red");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        push_work(&base, &source, &agent, "work.txt");
+        // nightly.sh's fact for $SPAWN_LIVE/missions/source.git: red.
+        let facts = integrator.judge.root.join("nightly");
+        std::fs::create_dir_all(&facts).expect("facts");
+        let m0 = source_main(&source);
+        let fact = |red_since: Option<&str>| {
+            let state = if red_since.is_some() { "red" } else { "green" };
+            let failed: &[&str] = if red_since.is_some() { &["023"] } else { &[] };
+            std::fs::write(
+                facts.join("source.json"),
+                json!({"v": 1, "main": m0, "at": 1, "state": state, "failed": failed,
+                       "last_green": null, "red_since": red_since})
+                .to_string(),
+            )
+            .expect("the fact");
+        };
+        fact(Some(&m0));
+
+        integrator.pass_on(&db.store).expect("a pass while red");
+        integrator.pass_on(&db.store).expect("another");
+        assert!(
+            integrator.running.borrow().is_empty() && started(&marks).is_empty(),
+            "no task is judged while the nightly is red: {:?}",
+            started(&marks)
+        );
+        assert!(verdicts(&db, task).is_empty());
+        assert!(
+            integrator
+                .waiting
+                .borrow()
+                .contains(&(task, super::Wait::NightlyRed)),
+            "the hold is said (once: the set holds it)"
+        );
+
+        // The owner's push lands on the red source: a fix or a revert is one.
+        let commit = owner_commit(&base, &source, "FIX.md", "fix\n", "owner: the fix");
+        owner_request(&db, &source, &commit);
+        integrator.pass_on(&db.store).expect("the owner's pass");
+        assert_eq!(source_main(&source), commit, "the owner's push landed");
+        assert!(started(&marks).is_empty(), "the task is still held");
+
+        // A green nightly ends the red: the task is judged and lands.
+        fact(None);
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass after the green night");
+        integrator.settle();
+        assert_eq!(verdicts(&db, task), vec!["accepted"]);
+        integrator.pass_on(&db.store).expect("the landing's pass");
+        assert_eq!(control_records(&db, "task.landed").len(), 1);
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&marks);
     }
 }

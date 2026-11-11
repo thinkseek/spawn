@@ -1703,7 +1703,13 @@ the tree's own:
   model, the model mapping, a stream asked for again before its first
   event, the cut signal, the body cap). The halt rule on the scenario count (§10.3) protects them.
   check-tests runs first among the regressions (the most often decisive,
-  so its failure stops the rest early);
+  so its failure stops the rest early). It also fails a run whose tests
+  all pass but leave something behind (objectives 54 and 55, folded into
+  it): any entry in the run's own fresh TMPDIR, any schema in the run's
+  own fresh database on the test server, or a relation, function or type
+  new in that database's public, each one `FAILED leftover-scratch:`,
+  `leftover-schema:` or `leftover-public:` line, which the integrator reads
+  as the candidate's failure, not the host's;
 - a check that fails on the candidate is run again there, as an
   objective's "unsolved" needs two runs that agree: passing the second
   time, it is a flake (said in the log, and named in the verdict's and the
