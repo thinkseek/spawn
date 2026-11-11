@@ -700,6 +700,7 @@ impl Monitor {
             let observations = store
                 .alert_observations()
                 .map_err(|error| error.to_string())?;
+            self.read_supervisor(store, now, &observations, &mut lines);
             self.observe(&observations, &mut events);
             let commands = store
                 .alert_failed_commands(self.commands_after)
@@ -804,6 +805,7 @@ impl Monitor {
         let observations = store
             .alert_observations()
             .map_err(|error| error.to_string())?;
+        self.read_supervisor(store, now, &observations, lines);
         self.observe(&observations, &mut events);
         self.commands_after = now.saturating_sub(COMMAND_LOOKBACK_MS);
         let commands = store
@@ -1545,6 +1547,16 @@ times in a row)",
     /// judges once more after every end, so a judgement can be newer than
     /// the end it follows, and a restart that reads an old stuck judgement
     /// of a session that has ended must not open it again.
+    ///
+    /// A stuck judgement is a claim that someone must act (objective 057),
+    /// so it fires nothing for an agent that waits because nothing is its
+    /// to do: a worker whose task is past its part ([`PART_DONE`]: it waits
+    /// for the gate, a reviewer, its landing or the owner's hold; its open
+    /// alert cleared at the task record that moved it, [`Self::task_record`])
+    /// and the supervisor with nothing to dispatch ([`Self::supervisor_work`];
+    /// its open alert clears then). A worker's alert names its task and the
+    /// one command that acts on it, `spawn task restart --id <task>` (a
+    /// delivered task: the only one a restart takes).
     fn observe(&mut self, observations: &Value, out: &mut Vec<Event>) {
         for observation in observations.as_array().into_iter().flatten() {
             let session = observation["session_id"]
@@ -1556,6 +1568,23 @@ times in a row)",
             let stuck = judgement["stuck"].as_f64();
             let open = self.open_keys("agent_stuck", &session);
             let ended = observation["ended_event"].as_i64();
+            let is_supervisor = session == crate::supervise::SUPERVISOR_SESSION;
+            let held = if is_supervisor {
+                None
+            } else {
+                observation["agent_id"]
+                    .as_str()
+                    .and_then(|agent| self.held_task(agent))
+            };
+            let done = held
+                .as_ref()
+                .is_some_and(|(_, state)| PART_DONE.contains(&state.as_str()));
+            let dispatch = if is_supervisor {
+                self.supervisor_work()
+            } else {
+                None
+            };
+            let idle_supervisor = dispatch.as_ref().is_some_and(Vec::is_empty);
             if let Some(ended) = ended {
                 for key in open {
                     out.push(Event::Clear {
@@ -1566,23 +1595,6 @@ times in a row)",
                         }),
                     });
                 }
-            } else if open.is_empty() && stuck.is_some_and(|stuck| stuck >= LIKELY) {
-                out.push(Event::Fire {
-                    key: format!("agent_stuck:{session}:{event_id}"),
-                    kind: "agent_stuck",
-                    subject: session.clone(),
-                    evidence: json!({
-                        "agent_id": observation["agent_id"], "stuck": stuck,
-                        "state": judgement["state"], "judge": judgement["judge"],
-                        "event_id": event_id,
-                    }),
-                    text: format!(
-                        "{session} is stuck ({:.2}): {}",
-                        stuck.unwrap_or_default(),
-                        judgement["state"].as_str().unwrap_or("unknown")
-                    ),
-                    notice: false,
-                });
             } else if stuck.is_some_and(|stuck| stuck < LIKELY) {
                 for key in open {
                     out.push(Event::Clear {
@@ -1590,6 +1602,151 @@ times in a row)",
                         evidence: json!({"stuck": stuck, "event_id": event_id}),
                     });
                 }
+            } else if done {
+                // Its task's record cleared it; one still open (a record
+                // read before a restart) clears at a later judgement.
+                let (task, state) = held.clone().unwrap_or_default();
+                for key in open {
+                    out.push(Event::Clear {
+                        key,
+                        evidence: json!({"event_id": event_id, "task": task, "task_state": state}),
+                    });
+                }
+            } else if idle_supervisor {
+                for key in open {
+                    out.push(Event::Clear {
+                        key,
+                        evidence: json!({
+                            "event_id": self.watermark, "nothing_to_dispatch": true,
+                        }),
+                    });
+                }
+            } else if open.is_empty() && stuck.is_some_and(|stuck| stuck >= LIKELY) {
+                let mut evidence = json!({
+                    "agent_id": observation["agent_id"], "stuck": stuck,
+                    "state": judgement["state"], "judge": judgement["judge"],
+                    "event_id": event_id,
+                });
+                let mut text = format!(
+                    "{session} is stuck ({:.2}): {}",
+                    stuck.unwrap_or_default(),
+                    judgement["state"].as_str().unwrap_or("unknown")
+                );
+                if let Some((task, state)) = &held {
+                    let command = (state == "delivered").then(|| restart_command(*task));
+                    evidence["task"] = json!(task);
+                    evidence["task_state"] = json!(state);
+                    evidence["command"] = json!(command);
+                    text.push_str(&format!(" on task #{task} ({state})"));
+                    if let Some(command) = &command {
+                        text.push_str(&format!("; `{command}` gives it a fresh execution"));
+                    }
+                }
+                if let Some(dispatch) = &dispatch {
+                    evidence["dispatch"] = json!(dispatch);
+                    text.push_str(&format!("; it has to dispatch: {}", dispatch.join(", ")));
+                }
+                out.push(Event::Fire {
+                    key: format!("agent_stuck:{session}:{event_id}"),
+                    kind: "agent_stuck",
+                    subject: session.clone(),
+                    evidence,
+                    text,
+                    notice: false,
+                });
+            }
+        }
+    }
+
+    /// The task `agent` holds: its latest delivered or later ([`HELD`]),
+    /// with its state. A task only assigned is not with the worker yet.
+    fn held_task(&self, agent: &str) -> Option<(i64, String)> {
+        self.tasks
+            .iter()
+            .filter(|(_, task)| task.agent == agent)
+            .filter_map(|(id, task)| {
+                task.state
+                    .as_deref()
+                    .filter(|state| HELD.contains(state))
+                    .map(|state| (*id, state.to_string()))
+            })
+            .max_by_key(|(id, _)| *id)
+    }
+
+    /// What the supervisor has to dispatch, from the last read of its plan
+    /// ([`Self::read_supervisor`]) and the step's own fold: a question to
+    /// the owner, a pending or told escalation (a worker's own judgement
+    /// excepted while that worker holds a task: its work, which its own
+    /// alert names), and a mission waiting for it to assign its first task
+    /// (open or active, not halted, not the integrator's gate, no task
+    /// yet). Empty: nothing to dispatch. `None` when its plan was not read.
+    fn supervisor_work(&self) -> Option<Vec<String>> {
+        let read = self.supervisor.as_ref()?;
+        let mut work = Vec::new();
+        if read.question {
+            work.push("a question to the owner".to_string());
+        }
+        for item in &read.items {
+            let workers = item.judgement
+                && item
+                    .agent
+                    .as_deref()
+                    .is_some_and(|agent| self.held_task(agent).is_some());
+            if !workers {
+                work.push(format!("escalation {}", item.tag));
+            }
+        }
+        let mut missions: Vec<(&i64, &Mission)> = self.missions.iter().collect();
+        missions.sort_by_key(|(id, _)| **id);
+        for (id, mission) in missions {
+            let waiting = matches!(mission.state.as_str(), "open" | "active")
+                && mission.halted.is_none()
+                && mission.accept.as_deref() != Some("gate")
+                && !self.tasks.values().any(|task| task.mission == *id);
+            if waiting {
+                work.push(format!("mission #{id} waits for its first task"));
+            }
+        }
+        Some(work)
+    }
+
+    /// Read what the supervisor has to dispatch, when its `agent_stuck`
+    /// depends on it: its latest judgement (in `observations`) is stuck and
+    /// its execution has not ended, or its alert is open. At most once per
+    /// `SPAWN_ALERT_CHECK_SECS`; a read that fails is said, and its
+    /// judgement alone decides until the next.
+    fn read_supervisor(
+        &mut self,
+        store: &PostgresStore,
+        now: i64,
+        observations: &Value,
+        lines: &mut Vec<String>,
+    ) {
+        let session = crate::supervise::SUPERVISOR_SESSION;
+        let stuck = observations
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|observation| observation["session_id"] == session)
+            .any(|observation| {
+                observation["ended_event"].is_null()
+                    && observation["observation"]["stuck"]
+                        .as_f64()
+                        .is_some_and(|stuck| stuck >= LIKELY)
+            });
+        if !stuck && self.open_keys("agent_stuck", session).is_empty() {
+            self.supervisor_due_ms = 0;
+            return;
+        }
+        if now < self.supervisor_due_ms {
+            return;
+        }
+        self.supervisor_due_ms = now.saturating_add(self.settings.check_ms);
+        match crate::serve::attention::supervisor_dispatch(store) {
+            Ok(value) => self.supervisor = Some(Dispatch::from_value(&value)),
+            Err(error) => {
+                self.supervisor = None;
+                lines.push(format!("alerts: the supervisor's dispatch: {error}"));
             }
         }
     }
