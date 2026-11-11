@@ -75,6 +75,11 @@ run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_056_runs_$run"
 SPAWN_TMUX_SOCKET="bb-056-$run"
 SPAWN_PSQL=psql
+# The tmux server's socket lives in WORK, so the cleanup removes nothing
+# outside it (cc-rules (a), 2026-11-12).
+TMUX_TMPDIR=$WORK/tmux-sock
+mkdir -p "$TMUX_TMPDIR"
+export TMUX_TMPDIR
 export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
@@ -93,7 +98,6 @@ cleanup() {
         wait "$pid" 2>/dev/null || true
     done
     tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-    rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SPAWN_TMUX_SOCKET"
     if [ -n "$database_made" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
@@ -206,7 +210,12 @@ SPAWN_STALL_HALTED_SECS=1800
 SPAWN_MISSION_FILE=$WORK/mission.md
 SPAWN_DISK_WARN_GB=0
 SPAWN_DISK_FLOOR_GB=0
-export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
+# A scratch HOME: nothing here reads or writes the real one (cc-rules (a)).
+real_home=$HOME
+HOME=$WORK/home
+mkdir -p "$HOME"
+[ "$HOME" != "$real_home" ] && [ "${HOME#"$WORK"/}" != "$HOME" ] || harness "HOME is not a scratch directory under WORK: $HOME"
+export HOME SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
     SPAWN_CLAUDE_PROJECTS SPAWN_TMUX_PROGRAM SPAWN_WORKER SPAWN_LOOP_INTERVAL_MS \
     SPAWN_ALERT_CHECK_SECS SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_DELIVERY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \

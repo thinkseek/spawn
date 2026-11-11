@@ -174,7 +174,12 @@ for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SP
 done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
 SPAWN_WORKSPACE_ROOT=$WORK/ws
-export SPAWN_DATABASE_URL SPAWN_WORKSPACE_ROOT
+# A scratch HOME: nothing here reads or writes the real one (cc-rules (a)).
+real_home=$HOME
+HOME=$WORK/home
+mkdir -p "$HOME"
+[ "$HOME" != "$real_home" ] && [ "${HOME#"$WORK"/}" != "$HOME" ] || harness "HOME is not a scratch directory under WORK: $HOME"
+export HOME SPAWN_DATABASE_URL SPAWN_WORKSPACE_ROOT
 mkdir -p "$SPAWN_WORKSPACE_ROOT"
 
 tries=0
