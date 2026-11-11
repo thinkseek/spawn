@@ -1046,12 +1046,23 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   per mission and scenario while red, cleared at the first later `accepted`
   gating of the mission that does not name it), `validator_defect` (a
   regression that fails on the base too, run again in the gate: from a
-  task's `host_fault` with evidence `validator_defect`, cleared at the
-  mission's next `accepted` or `rejected` gating; or from an owner's
-  accepted landing whose `source.moved` names it in `validator_defects`, for
-  each mission it moved, cleared only once a gate of the mission names it
-  `quarantined`, since a later gate that does not name it may have read it
-  unsolved on the base rather than passed), `task_undelivered` (assigned longer than
+  task's `host_fault` with evidence `validator_defect`, one per mission and
+  scenario, also cleared at the mission's next `accepted` or `rejected`
+  gating; or from an owner's accepted landing whose `source.moved` names it
+  in `validator_defects`, one per source and scenario (objective 056), its
+  evidence naming `source`, `scenario`, `owner`, `request`, `event_id` and
+  `missions`, the moved missions that are not closed (none open: no alert;
+  one already open for the source and scenario: nothing new). Either kind
+  clears from the record, its `cleared_evidence` naming `cause` and
+  `event_id`: `passed`, a later `task.gated` of a mission it names, or
+  `source.moved` of its source, lists the scenario in `passed` (run on the
+  candidate and passed) or `reused` (taken from the base's cache as
+  solved); `gone`, a later `task.gated` of a mission it names carries
+  `scenario_names` without it (the missions on one source share a gate
+  directory); `closed`, every mission it names is closed (the last
+  `mission.closed`; at a start, one read back whose missions all closed
+  before clears then); `quarantined`, a gate names it so. A gating that
+  holds the scenario and lists it in neither leaves an owner's open), `task_undelivered` (assigned longer than
   `SPAWN_ALERT_UNDELIVERED_SECS`, default 300, while its agent holds no
   delivered or reported task), `mission_halted` (cleared at its
   `mission.resumed`), `postgres_crash` (a `terminated by signal`, `No space
@@ -2596,8 +2607,10 @@ are per-agent uids or a mount per engine.
   the push's, and the gate judges the rest (a task's gate gives no verdict
   then, a `host_fault` with evidence `validator_defect`). Accepted: under the landing lock, the
   candidate is pushed to `main` with a lease on M, and `source.moved`
-  names `verdict` `accepted`, with the gate's `validator_defects` and
-  `quarantined` when it names any (the `validator_defect` alert). Rejected (or a candidate without the
+  names `verdict` `accepted`, with the gate's `validator_defects`,
+  `quarantined`, `passed` and `reused` when it names any (the
+  `validator_defect` alert; a task's `task.gated` carries `passed` and
+  `reused` likewise). Rejected (or a candidate without the
   mission's scenarios directory, `no_scenarios`): `source.push_refused`
   with `verdict` and the gate's `log`; nothing moves and no mission counts
   it. No verdict (the host's fault, an abort, which is a harness error, no
