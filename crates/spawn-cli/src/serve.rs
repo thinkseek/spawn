@@ -3842,7 +3842,10 @@ mod tests {
         assert_eq!(row["status"], "solved");
         assert_eq!(row["solved_on_base"]["at_ms"], json!(1_793_724_858_211_i64));
         assert_eq!(row["solved_on_base"]["task"], json!(7));
-        assert_eq!(board["objectives"][0]["solved_on_base"], serde_json::Value::Null);
+        assert_eq!(
+            board["objectives"][0]["solved_on_base"],
+            serde_json::Value::Null
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
