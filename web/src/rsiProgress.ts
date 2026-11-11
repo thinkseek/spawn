@@ -28,7 +28,7 @@ export interface SettledProgress {
 }
 
 type ProgressMission = Pick<RsiMission, "objectives">;
-type ProgressObjective = Pick<RsiObjective, "id" | "status" | "landings" | "solved_on_base">;
+type ProgressObjective = Pick<RsiObjective, "id" | "status" | "metric" | "landings" | "solved_on_base">;
 
 function finite(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
