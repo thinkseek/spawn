@@ -32,6 +32,8 @@ import {
   showValue,
   trendMark,
 } from "../../scorecard";
+import { tileNote } from "../../scorecardFormat";
+import type { GateSpending } from "../../scorecardFormat";
 import { Fact, SectionLabel } from "../fleet/bits";
 import { Collapsible } from "../missions/parts";
 import { useNow } from "../rsi/Phase";
