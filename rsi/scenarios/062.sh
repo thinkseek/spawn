@@ -46,7 +46,7 @@ tree=$(pwd)
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-[ -f "$tree/web/src/home.ts" ] || harness "no web/src/home.ts under $tree (run from the candidate's tree)"
+[ -f "$tree/web/src/fleetDecisions.ts" ] || harness "no web/src/fleetDecisions.ts under $tree (run from the candidate's tree)"
 for tool in psql git jq od bash sed grep awk curl node; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
