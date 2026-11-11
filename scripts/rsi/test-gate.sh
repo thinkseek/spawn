@@ -468,6 +468,44 @@ expect "breaking a solved objective is a regression" \
 
 expect "relative scenarios refused" "$(sh "$gate" "$repo" "$base" "$good" scenarios | tail -n 1)" 'not absolute'
 
+# 5c. The task's scenario passes 3 of 3 on the candidate before it lands
+# (P25: once landed it is every later gate's regression; 042, 050 and 054
+# each failed on main the day they landed). A task scenario that passes
+# its first run and fails its second, or its third, rejects the candidate,
+# naming the runs; one that passes all three lands, each run in the log.
+judge "$good" "$scenarios/007.sh" >/dev/null
+expect "a task scenario is run twice more on the candidate" \
+    "$(grep -c "the task's scenario passes 3 of 3 before it lands)\$" "$work/gate.out")" 2
+expect "each further run is named" "$(cat "$work/gate.out")" \
+    "(run 3 of 3: the task's scenario passes 3 of 3 before it lands)"
+steady_scenarios=$work/steady
+cp -r "$scenarios" "$steady_scenarios"
+printf '%s\n' '#!/bin/sh' \
+    '# Wants value=two, then runs the candidate'"'"'s own task-probe.sh.' \
+    '[ "$(cat value)" = two ] || exit 1' \
+    '[ ! -f task-probe.sh ] || sh task-probe.sh' >"$steady_scenarios/017.sh"
+for failing in 2 3; do
+    branch "unsteady-$failing"
+    printf 'two\n' >"$seed/value"
+    # Fails on run $failing only: the tree is the candidate's, writable.
+    printf '%s\n' 'n=$(($(cat .task-runs 2>/dev/null || echo 0) + 1))' \
+        'echo "$n" >.task-runs' "[ \"\$n\" -ne $failing ]" >"$seed/task-probe.sh"
+    unsteady=$(commit "unsteady-$failing")
+    runs="0, then 1 on the candidate"
+    [ "$failing" = 2 ] || runs="0, then 0, then 1 on the candidate"
+    expect "a task scenario that fails its run $failing of 3 rejects the candidate" \
+        "$(judge "$unsteady" "$steady_scenarios/017.sh" "$steady_scenarios")" \
+        "exit=0 {\"verdict\":\"rejected\",\"reason\":\"scenario is unstable on the candidate ($runs): it must pass 3 of 3 runs before it lands\"}"
+    expect "and the log says so ($failing)" "$(cat "$work/gate.out")" \
+        "| 017.sh passed, then failed on the candidate ($runs): the task's scenario passes 3 of 3 before it lands"
+done
+branch steady
+printf 'two\n' >"$seed/value"
+printf '%s\n' 'n=$(($(cat .task-runs 2>/dev/null || echo 0) + 1))' 'echo "$n" >.task-runs' >"$seed/task-probe.sh"
+steady=$(commit steady)
+expect "a task scenario that passes 3 of 3 lands" \
+    "$(judge "$steady" "$steady_scenarios/017.sh" "$steady_scenarios")" 'exit=0 {"verdict":"accepted"}'
+
 # 1. The reviewer's forgery: candidate code finds the gate in /proc, writes
 # an accepted verdict to its stdout and to the integrator's verdict file,
 # and kills it. In the sandbox it finds neither: the gate exits 0 with its
@@ -571,6 +609,28 @@ EOF
 tools=$(commit tools)
 expect "a tool under \$HOME runs, its neighbours and ~/.bun stay hidden" \
     "$(PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH" judge "$tools")" 'exit=0 {"verdict":"accepted"}'
+
+# 3b''. The owner's cargo config does not reach the sandbox: it may name a
+# compiler cache as rustc-wrapper (kache), whose daemon and TMPDIR files
+# have no place in a gate (054, 2026-11-11). The private CARGO_HOME still
+# has the real registry and git caches.
+owner_cargo=$work/owner-cargo
+mkdir -p "$owner_cargo/registry/index" "$owner_cargo/git/db"
+printf '[build]\nrustc-wrapper = "owner-wrapper"\n' >"$owner_cargo/config.toml"
+printf '[build]\nrustc-wrapper = "owner-wrapper"\n' >"$owner_cargo/config"
+branch cargo-config
+printf 'two\n' >"$seed/value"
+cat >"$seed/probe.sh" <<'EOF'
+#!/bin/sh
+[ -d "$CARGO_HOME/registry/index" ] || { echo "no registry in $CARGO_HOME"; exit 1; }
+[ -d "$CARGO_HOME/git/db" ] || { echo "no git cache in $CARGO_HOME"; exit 1; }
+for name in config.toml config; do
+    [ ! -e "$CARGO_HOME/$name" ] || { echo "sees the owner's cargo $name"; exit 1; }
+done
+EOF
+cargo_config=$(commit cargo-config)
+expect "the owner's cargo config is not in the sandbox; its registry and git caches are" \
+    "$(CARGO_HOME="$owner_cargo" judge "$cargo_config")" 'exit=0 {"verdict":"accepted"}'
 
 # 3c. No network but loopback: a host listener and the live database port
 # are unreachable; the sandbox's own loopback works.

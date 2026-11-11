@@ -70,6 +70,18 @@ export interface RsiLanding {
   candidate: number | null;
 }
 
+/** The integrator's `objective.solved` record: the objective's scenario
+ * passed at a base commit main already holds, so it is solved, as a landing
+ * makes it, and is never assigned again. */
+export interface RsiSolvedOnBase {
+  /** The record's event id. */
+  event: number;
+  /** The task that was cancelled on it. */
+  task: number | null;
+  /** The base commit the scenario passed at. */
+  base: string | null;
+}
+
 export interface RsiObjective {
   id: number;
   title: string;
@@ -90,6 +102,8 @@ export interface RsiObjective {
   tasks: number[];
   /** Oldest first. */
   landings: RsiLanding[];
+  /** Set when the integrator recorded it solved on the base; null otherwise. */
+  solved_on_base: RsiSolvedOnBase | null;
 }
 
 export interface RsiResident extends Labels {
@@ -247,6 +261,26 @@ function normalizeLanding(value: unknown): RsiLanding {
   };
 }
 
+function normalizeSolvedOnBase(value: unknown): RsiSolvedOnBase | null {
+  if (!isObject(value)) return null;
+  const raw = object(value);
+  return {
+    event: number(raw.event),
+    task: optionalNumber(raw.task),
+    base: optionalText(raw.base),
+  };
+}
+
+/** What the page says beside an objective solved on the base, or null:
+ * "solved on the base at <base>, task #<task>". */
+export function solvedOnBaseNote(objective: RsiObjective): string | null {
+  const record = objective.solved_on_base;
+  if (!record) return null;
+  const base = record.base ? record.base.slice(0, 7) : "the base";
+  const task = record.task === null ? "" : `, task #${record.task}`;
+  return `solved on the base at ${base}${task}`;
+}
+
 function objectiveStatus(value: unknown): ObjectiveStatus {
   return value === "solved" || value === "met" || value === "owner"
     ? value
@@ -274,6 +308,7 @@ function normalizeObjective(value: unknown): RsiObjective {
     landings: list(raw.landings)
       .map(normalizeLanding)
       .sort((left, right) => left.at_ms - right.at_ms || left.task - right.task),
+    solved_on_base: normalizeSolvedOnBase(raw.solved_on_base),
   };
 }
 

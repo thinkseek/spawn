@@ -455,13 +455,8 @@ fn list_objectives(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Resu
                 .map_err(|_| "--mission takes a mission id".to_string())
         })
         .transpose()?;
-    let missions = store
-        .objective_missions()
-        .map_err(|error| error.to_string())?;
-    let missions = missions.as_array().cloned().unwrap_or_default();
-    let rows: Vec<Value> = missions
+    let rows: Vec<Value> = crate::serve::objective_missions(store)?
         .into_iter()
-        .map(crate::serve::with_objectives)
         .filter(|mission| only.is_none_or(|id| mission["id"].as_i64() == Some(id)))
         .map(|mission| objectives_row(&mission))
         .collect();

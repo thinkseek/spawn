@@ -1755,6 +1755,8 @@ impl Drop for PrivateDirectory {
         // A directory dropped on another thread than the one that made it
         // stays in that one's list; removing a path already gone is harmless.
         HELD.with(|held| held.borrow_mut().retain(|path| *path != self.0));
+        // A judging's gate keeps its files first (P26).
+        crate::integrate::judging::keep_gate(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -2388,23 +2390,28 @@ fn write_whole(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
     std::fs::rename(&temporary, path)
 }
 
-/// Scenario files in the controller's checkout.
-pub(crate) fn count_scenarios(directory: &Path) -> Result<u32, String> {
+/// The scenario file names (`*.sh`) in the controller's checkout, sorted;
+/// none in a directory that does not exist. Their number is the count the
+/// scenario floor holds.
+pub(crate) fn scenario_names(directory: &Path) -> Result<Vec<String>, String> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(format!("read {}: {error}", directory.display())),
     };
-    let mut count = 0;
+    let mut names = Vec::new();
     for entry in entries {
         let path = entry
             .map_err(|error| format!("read {}: {error}", directory.display()))?
             .path();
-        if path.extension().and_then(|text| text.to_str()) == Some("sh") {
-            count += 1;
+        if path.extension().and_then(|text| text.to_str()) == Some("sh")
+            && let Some(name) = path.file_name()
+        {
+            names.push(name.to_string_lossy().into_owned());
         }
     }
-    Ok(count)
+    names.sort();
+    Ok(names)
 }
 
 #[cfg(test)]

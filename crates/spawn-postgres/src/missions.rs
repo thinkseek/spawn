@@ -73,6 +73,17 @@ select coalesce((select jsonb_build_object('id', e.id, 'at_ms', e.recorded_at_ms
                     and e.kind -> 'detail' -> 'record' ->> 'type' = 'source.moved'
                   order by e.session_seq desc limit 1), 'null'::jsonb)";
 
+/// Where the latest `source.moved` record of source `$1` moved its main
+/// (`to`): the owner's latest landing on it, which its deploy follows; null
+/// when the owner never moved it.
+pub(crate) const SOURCE_OWNER_LANDED: &str = r"
+select e.kind #>> '{detail,record,to}'
+  from spawn_events e
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' = 'source.moved'
+   and e.kind #>> '{detail,record,source}' = $1
+ order by e.session_seq desc limit 1";
+
 /// Residents (not retired) whose latest delivered task is cancelled: the
 /// dispatcher stops such a worker, sets the task's work aside and tells it
 /// (docs/fleet-architecture.md, "When a task closes"). The latest delivery
@@ -357,8 +368,11 @@ macro_rules! active_holds {
 
 /// The board of missions with their tasks, newest first; each task carries
 /// its stages ([`PostgresStore::task_stages`]) and each mission the `hold`
-/// on its source (the active hold's event id, or null); `holds` is every
-/// active hold ([`SOURCE_HOLDS`]).
+/// on its source (the active hold's event id, or null) and the `halt` it
+/// is in (`{event, reason, at_ms, gone}`: its `mission.halted` record's
+/// event id and time, and the scenarios a halt on the floor names gone, else
+/// null; null while it is not halted); `holds` is every active hold
+/// ([`SOURCE_HOLDS`]).
 pub(crate) const MISSION_BOARD: &str = concat!(
     r"
 select jsonb_build_object(
@@ -368,6 +382,9 @@ select jsonb_build_object(
   'missions', coalesce((select jsonb_agg(row_to_json(x) order by x.id desc) from (
       select m.id, m.text, m.origin, m.sources, m.state, m.summary,
              m.gate, m.accept, m.budget, m.baseline, m.halted, m.objectives,
+             case when m.halted is not null then jsonb_build_object(
+                 'event', m.halt_event, 'reason', m.halted, 'at_ms', m.halt_at_ms,
+                 'gone', m.halt_gone) end as halt,
              (select h.hold from mission_source_holds h where h.source = m.sources ->> 0) as hold,
              m.created_at_ms, m.updated_at_ms,
              coalesce((select jsonb_agg(jsonb_build_object(
@@ -794,7 +811,7 @@ pub(crate) const GATED: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
   select m.id, m.state, m.gate, m.accept, m.budget, m.baseline, m.halted, m.scenario_floor,
-         spawn_now_ms() as now_ms,
+         m.scenario_names, spawn_now_ms() as now_ms,
          m.gate_rejections, m.gate_aborts, m.gate_room_task, m.gate_room_since_ms,
          m.gate_room_last_ms,
          m.gate_room_waits, m.gate_room_escalated, m.gate_host_faults, m.gate_host_task,
@@ -1084,12 +1101,33 @@ select coalesce(jsonb_agg(jsonb_build_object('mission', m.id,
 /// Open objective missions (`objectives` = `{backlog, resident}`), for the
 /// RSI page: settings, the resident, and every task newest first with its
 /// gate verdicts from the control stream (oldest first, without logs).
+/// Also what the integrator's choice reads besides the tasks and their
+/// outcomes: `configured_ms` (when the mission was last configured, as
+/// [`GATED`] reads it: an overrun chain's hold ends with a newer one) and
+/// `solved_on_base`, the mission's `objective.solved` records, oldest first
+/// (`[{event, objective, task, base, at_ms}]`): the records
+/// [`OBJECTIVE_LANDINGS`] counts as landings, by the same condition.
 pub(crate) const OBJECTIVE_MISSIONS: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
   select m.id, m.text, m.state, m.sources, m.gate, m.accept, m.budget, m.baseline, m.halted,
          m.scenario_floor, m.gate_rejections, m.gate_aborts, m.objectives,
          m.created_at_ms, m.updated_at_ms,
+         (select max(e.recorded_at_ms) from spawn_events e
+           where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+             and e.kind -> 'detail' -> 'record' ->> 'type' = 'mission.configured'
+             and e.kind -> 'detail' -> 'record' ->> 'id' = m.id::text) as configured_ms,
+         coalesce((select jsonb_agg(jsonb_build_object(
+                     'event', e.id,
+                     'objective', (e.kind -> 'detail' -> 'record' ->> 'objective')::integer,
+                     'task', (e.kind -> 'detail' -> 'record' ->> 'task')::bigint,
+                     'base', e.kind -> 'detail' -> 'record' ->> 'base',
+                     'at_ms', e.recorded_at_ms) order by e.session_seq, e.id)
+                     from spawn_events e
+                    where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                      and e.kind -> 'detail' -> 'record' ->> 'type' = 'objective.solved'
+                      and e.kind -> 'detail' -> 'record' ->> 'id' = m.id::text), '[]'::jsonb)
+           as solved_on_base,
          (select jsonb_build_object('name', r.name, 'agent_id', r.agent_id,
                                     'session_id', r.session_id, 'state', r.state)
             from mission_residents r where r.name = m.objectives ->> 'resident') as resident,
@@ -2010,6 +2048,14 @@ impl PostgresStore {
     /// ([`LATEST_SOURCE_MOVED`]).
     pub fn latest_source_moved(&self) -> Result<Value, StoreError> {
         self.query_json(LATEST_SOURCE_MOVED, &[])
+    }
+
+    /// The owner's latest landing on `source`: the `to` of its latest
+    /// `source.moved` record, if any ([`SOURCE_OWNER_LANDED`]).
+    pub fn source_owner_landed(&self, source: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .query_opt(SOURCE_OWNER_LANDED, &[&source])?
+            .and_then(|row| row.get::<_, Option<String>>(0)))
     }
 
     /// Residents whose latest delivered task is cancelled, with the

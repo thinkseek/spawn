@@ -1093,7 +1093,17 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   restart, while a gated mission that is open or active, not halted, and on
   a source no owner holds has a reported task; cleared at the first reading
   that finds the lock held; the lock is read only while such a task is in
-  the step's fold or the alert is open), `model_auth` (objective 028's
+  the step's fold or the alert is open), `controller_behind` (subject
+  `mission #<id>`: the owner's latest landing on a gated mission's source
+  (the latest `source.moved`'s `to`; the mission open or active, not
+  halted, with a reported task) is newer than the controller its gate's
+  scenarios come from (`controllers/<name>-<commit>`) at every reading for
+  `SPAWN_ALERT_CONTROLLER_BEHIND_SECS`, default 1800; the integrator holds
+  that mission's gates until the deploy switches the controller (P22), so a
+  wait this long is a landing not deployed; a task's landing needs no
+  deploy and counts for nothing; cleared at the first reading that finds
+  the controller has the landing or the mission no longer waiting),
+  `model_auth` (objective 028's
   `execution.interrupted` with cause `model_auth`) and `cost_budget`
   (subject `mission #<id>`, key `cost_budget:<mission>:<UTC day>`: at a
   reading, the mission's cost of the model calls timed in the current UTC
@@ -1615,8 +1625,8 @@ controller. Missions, tasks, residents and landings are events in
   `task.reviewed`, `task.cancelled`, `task.gated`, `task.held`, `task.landed`,
   `task.aborted`, `task.over_budget`, `resident.proposed`, `resident.approved`,
   `resident.retired`, `legacy.imported`, `host.disk`, `host.judge`,
-  `source.push_requested`, `source.push_refused` (§10.3, "The owner's
-  landings"), and the loop's alerts: `alert.fired` and `alert.cleared`
+  `source.push_requested`, `source.push_refused`, `source.push_no_verdict`
+  (§10.3, "The owner's landings"), and the loop's alerts: `alert.fired` and `alert.cleared`
   (§3.4, folded into `spawn_alerts`).
   `task.report_unfinished` is a delivered task's report the dispatcher read
   and did not take because it is still a draft: it names the task's
@@ -1639,7 +1649,8 @@ controller. Missions, tasks, residents and landings are events in
   `task.landed`, `task.aborted`, `task.over_budget`, `mission.halted`, and
   the outcomes of the
   owner's landings: `source.moved` naming a `request`,
-  `source.push_refused`), `source.moved` (`spawn mission moved`), the
+  `source.push_refused`, and an owner judging's `source.push_no_verdict`),
+  `source.moved` (`spawn mission moved`), the
   owner's `source.push_requested` (`spawn mission push`; folded into no
   table, nor is `source.push_refused`), the loop's `host.disk` and the
   judge watcher's `host.judge` (through `spawn_host_record`; folded into no table,
@@ -1693,7 +1704,13 @@ the tree's own:
   model, the model mapping, a stream asked for again before its first
   event, the cut signal, the body cap). The halt rule on the scenario count (§10.3) protects them.
   check-tests runs first among the regressions (the most often decisive,
-  so its failure stops the rest early);
+  so its failure stops the rest early). It also fails a run whose tests
+  all pass but leave something behind (objectives 54 and 55, folded into
+  it): any entry in the run's own fresh TMPDIR, any schema in the run's
+  own fresh database on the test server, or a relation, function or type
+  new in that database's public, each one `FAILED leftover-scratch:`,
+  `leftover-schema:` or `leftover-public:` line, which the integrator reads
+  as the candidate's failure, not the host's;
 - a check that fails on the candidate is run again there, as an
   objective's "unsolved" needs two runs that agree: passing the second
   time, it is a flake (said in the log, and named in the verdict's and the
@@ -2470,7 +2487,16 @@ are per-agent uids or a mount per engine.
     the halt's record names the source and both commits (`cause`:
     `main_moved`), so `spawn mission moved` can tell it from any other.
 
-  A halted mission lands nothing until a human runs `spawn mission resume`.
+  A halted mission lands nothing until a human runs `spawn mission resume`,
+  or resumes it from Needs you (`POST /api/mission/<id>/resume` {halt, key},
+  as the `spawn_human` login through `spawn_human_resume`: the same
+  `mission.resumed`, with `by` `human` and the `halt` it resumes, refused
+  with the reason unless the mission is halted on exactly that halt, once
+  per idempotency key). `/api/missions` names the halt a mission is in
+  (`halt`: its `mission.halted` event, reason, time, and `gone`); a halt on
+  the scenario floor names the scenario files gone since the gating that
+  set the floor (that `task.gated` carries `scenario_names`, the halt
+  `gone`).
   No rule counts host faults, however many in a row, whatever their evidence:
   a halt needs a human, and a host fault is the host's, so it is judged again
   after its backoff; 020's evidence (the test database) is escalated at two
@@ -2564,8 +2590,21 @@ are per-agent uids or a mount per engine.
   mission's scenarios directory, `no_scenarios`): `source.push_refused`
   with `verdict` and the gate's `log`; nothing moves and no mission counts
   it. No verdict (the host's fault, an abort, which is a harness error, no
-  room, a gate that could not run): nothing is recorded, and the request is
-  judged again after the host-fault backoff. With `--urgent` (gated or
+  room, a gate that could not run): no outcome is recorded, and the request is
+  judged again after the host-fault backoff. When the gate ran, what it
+  printed (stdout, then stderr marked `! `, its last 4 MiB) is kept as
+  `<root>/no-verdict-logs/<ms>-request-<request>-<judging>.log` (the
+  newest 32 kept, the older removed as each is written), and
+  `source.push_no_verdict` {request, reason, log: that path or null,
+  judging} is recorded, folded into no table and no outcome (the request
+  stays pending); the journal's no-verdict line names the path too.
+  Every judging's gates, task or owner, whatever they end with, keep their
+  files: when a gate's private directory in a judging's directory goes,
+  its `stdout` (the per-scenario lines at its end), `stderr`, `verdict` and
+  `status` (never its `env`) are copied first to
+  `<root>/gate-logs/<judging>/<gate>/`, each its last 4 MiB; the newest 200
+  judgings are kept, at most 2 GiB in all, the oldest removed first. The
+  judging's records name that directory (`gate_logs`) once a gate is kept. With `--urgent` (gated or
   not; for a fix of a red `main`, D2) the request does not wait out a
   task's judging in flight on its source: that judging is stopped (its
   gate's process group killed, as at its wall clock) and records itself
@@ -2809,6 +2848,17 @@ are per-agent uids or a mount per engine.
   objective mission with its backlog's objectives (status, landed metric
   values), its tasks with their `task.gated` verdicts, the halt reason and
   the baseline (the shape is documented in `crates/spawn-cli/src/serve.rs`);
+  every view of the backlog (`/api/rsi`, `/api/overview`'s RSI summary,
+  `spawn mission objectives`) reads the integrator's records as the
+  integrator does: an objective with an `objective.solved` record of its
+  own mission is solved, as a landing makes it, and its row names the record
+  (`solved_on_base`: `{event, task, base}`, null otherwise; the page says
+  "solved on the base at <base>, task #<task>"), and `next_objective` is
+  what `objectives::choose` gives one free slot from the integrator's own
+  inputs (the landings with those records, the objectives with a task in
+  flight, the attempts and the held objectives), null when it would assign
+  nothing. Mission 4's objective 34, solved on the base on 2026-11-08, was
+  still shown open and next three days later before this;
   `/api/rsi/task/<id>` answers one task, `/api/rsi/objective/<mission>/<id>`
   one objective's whole prompt; `/api/rsi/pane` shows the
   resident's terminal.
