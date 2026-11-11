@@ -195,6 +195,14 @@
 //!   while its fold has such a reported task or this alert is open; the
 //!   first reading behind is kept by the step, so a restarted loop starts
 //!   the bound again (later, never sooner).
+//! - `mission_idle`, `mission #<id>`, key `mission_idle:<mission>:<the
+//!   record that ended its last task>` (objective 058): at a reading, a
+//!   mission not closed that takes its work from an objective backlog
+//!   (`objectives` on its record) has had no task in work since its last
+//!   task ended (landed, accepted or cancelled), for
+//!   `SPAWN_ALERT_MISSION_IDLE_SECS` (default 900; 0 disables it). Never for
+//!   owner work. Clears at the mission's next `task.assigned` or its
+//!   close. A restart reads when the last task ended from the store.
 //! - `cost_budget`, `mission #<id>`, key `cost_budget:<mission>:<the UTC
 //!   day, YYYY-MM-DD>`: at a reading (every `SPAWN_ALERT_CHECK_SECS`), the
 //!   mission's cost of the model calls timed in the current UTC day
@@ -321,6 +329,9 @@ pub(crate) struct Settings {
     /// How long a mission's main may be ahead of its controller while a
     /// task waits for it (0: never alerted).
     pub(crate) controller_behind_ms: i64,
+    /// How long a mission that takes its work from an objective backlog may
+    /// have no task in work (0: never alerted).
+    pub(crate) mission_idle_ms: i64,
     /// The window `spawn alerts --once` shows.
     pub(crate) window_ms: i64,
     /// The two database logs, when named.
@@ -381,6 +392,7 @@ impl Settings {
             quiet_ms: secs("SPAWN_ALERT_PG_QUIET_SECS", 900, &mut warnings),
             integrator_down_ms: secs("SPAWN_ALERT_INTEGRATOR_DOWN_SECS", 300, &mut warnings),
             controller_behind_ms: secs("SPAWN_ALERT_CONTROLLER_BEHIND_SECS", 1800, &mut warnings),
+            mission_idle_ms: secs("SPAWN_ALERT_MISSION_IDLE_SECS", 900, &mut warnings),
             window_ms: secs("SPAWN_ALERT_WINDOW_SECS", 86_400, &mut warnings),
             test_log: env_value("SPAWN_TEST_DATABASE_LOG").map(PathBuf::from),
             live_log: env_value("SPAWN_DATABASE_LOG").map(PathBuf::from),
@@ -477,6 +489,12 @@ struct Mission {
     accept: Option<String>,
     /// Its latest `mission.closed` record's event.
     closed_event: Option<i64>,
+    /// It takes its work from an objective backlog (`objectives` on its
+    /// record: `--backlog`, `--resident`); owner work does not.
+    backlog: bool,
+    /// When its last task ended with none in work after it, and the record
+    /// that ended it (`at_ms`, `event_id`); none while a task is in work.
+    idle: Option<(i64, i64)>,
 }
 
 impl Mission {
@@ -772,6 +790,7 @@ impl Monitor {
             self.read_sources(store, now, &mut events, &mut lines);
             self.read_defect_gates(store, now, &mut events, &mut lines);
             self.read_budgets(store, now, &mut events, &mut lines);
+            self.read_idle(now, &mut events);
         }
         self.bounds(now, &mut events);
         self.flush(store, now, &events, &mut lines);
@@ -809,6 +828,10 @@ impl Monitor {
                     escalated: mission["gate_room_escalated"].as_bool().unwrap_or(false),
                     accept: mission["accept"].as_str().map(str::to_string),
                     closed_event: mission["closed_event"].as_i64(),
+                    backlog: mission["backlog"].as_bool().unwrap_or(false),
+                    idle: mission["idle"]["at_ms"]
+                        .as_i64()
+                        .zip(mission["idle"]["event_id"].as_i64()),
                 },
             );
         }
@@ -1219,6 +1242,8 @@ impl Monitor {
                 escalated: false,
                 accept: None,
                 closed_event: None,
+                backlog: false,
+                idle: None,
             });
         }
         let Some(mission) = self.missions.get_mut(&id) else {
@@ -1259,7 +1284,10 @@ impl Monitor {
                     notice: false,
                 });
             }
-            "mission.closed" => self.closed_defects(Some((id, event_id)), 0, out),
+            "mission.closed" => {
+                self.closed_defects(Some((id, event_id)), 0, out);
+                self.clear_idle(id, event_id, "mission.closed", out);
+            }
             "mission.resumed" => {
                 for key in self.open_keys("mission_halted", &format!("mission #{id}")) {
                     out.push(Event::Clear {
@@ -1420,6 +1448,7 @@ the base, unsolved on it (task #{task}'s gate)"
                 }
             }
         }
+        self.track_idle(event_id, at_ms, kind, task.mission, out);
         if self
             .tasks
             .get(&id)
@@ -2709,6 +2738,113 @@ times in a row)",
         out
     }
 
+    /// Whether a task of `mission` is in work: assigned, delivered,
+    /// reported, sent back, gated, landing or held (not landed, accepted or
+    /// cancelled).
+    fn in_work(&self, mission: i64) -> bool {
+        self.tasks.values().any(|task| {
+            task.mission == mission
+                && !matches!(
+                    task.state.as_deref(),
+                    Some("landed" | "accepted" | "cancelled")
+                )
+        })
+    }
+
+    /// A task record's part in `mission_idle`: an assignment ends the
+    /// mission's idle time and clears its alert; a record that ends a task
+    /// (or follows an ended one) with no task of the mission in work after
+    /// it starts it, at that record.
+    fn track_idle(
+        &mut self,
+        event_id: i64,
+        at_ms: i64,
+        kind: &str,
+        mission: i64,
+        out: &mut Vec<Event>,
+    ) {
+        if kind == "task.assigned" {
+            if let Some(entry) = self.missions.get_mut(&mission) {
+                entry.idle = None;
+            }
+            self.clear_idle(mission, event_id, kind, out);
+            return;
+        }
+        let ended = matches!(
+            kind,
+            "task.landed"
+                | "task.cancelled"
+                | "task.aborted"
+                | "task.over_budget"
+                | "task.reviewed"
+                | "task.gated"
+        );
+        if !ended || self.in_work(mission) {
+            return;
+        }
+        // The latest such record, as the store's mirror reads it on start
+        // (a restart's history is read with the tasks' states as they are).
+        if let Some(entry) = self.missions.get_mut(&mission) {
+            entry.idle = Some((at_ms, event_id));
+        }
+    }
+
+    /// Clear the mission's open `mission_idle` alert, naming the record.
+    fn clear_idle(&self, mission: i64, event_id: i64, record: &str, out: &mut Vec<Event>) {
+        for key in self.open_keys("mission_idle", &format!("mission #{mission}")) {
+            out.push(Event::Clear {
+                key,
+                evidence: json!({"event_id": event_id, "record": record}),
+            });
+        }
+    }
+
+    /// The idle missions' reading (`mission_idle`): a mission not closed
+    /// that takes its work from an objective backlog, with no task in work
+    /// since its last task ended `SPAWN_ALERT_MISSION_IDLE_SECS` ago or
+    /// more, fires once (its key names the record that ended that task).
+    fn read_idle(&self, now: i64, out: &mut Vec<Event>) {
+        let bound = self.settings.mission_idle_ms;
+        if bound <= 0 {
+            return;
+        }
+        let mut ids: Vec<&i64> = self.missions.keys().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let mission = &self.missions[id];
+            let Some((since_ms, event_id)) = mission.idle else {
+                continue;
+            };
+            let subject = format!("mission #{id}");
+            let key = format!("mission_idle:{id}:{event_id}");
+            if mission.closed()
+                || !mission.backlog
+                || now.saturating_sub(since_ms) < bound
+                || self.in_work(*id)
+                || self.known.contains_key(&key)
+                || !self.open_keys("mission_idle", &subject).is_empty()
+            {
+                continue;
+            }
+            let idle_ms = now.saturating_sub(since_ms);
+            out.push(Event::Fire {
+                key,
+                kind: "mission_idle",
+                subject: subject.clone(),
+                evidence: json!({
+                    "mission": id, "since_ms": since_ms, "event_id": event_id,
+                    "idle_ms": idle_ms, "reading_ms": now,
+                }),
+                text: format!(
+                    "{subject} has had no task in work for {} since its last task ended: \
+                     its objective backlog has nothing open to assign",
+                    idle_words(idle_ms)
+                ),
+                notice: false,
+            });
+        }
+    }
+
     /// The daily budgets' reading (`cost_budget`): each budgeted mission's
     /// spend of the UTC day so far, on the database's clock.
     fn read_budgets(
@@ -3188,6 +3324,23 @@ enum Crossing {
 /// over (or under, when `under`), `turn_off` the one it clears at, on the
 /// other side of the margin.
 /// The strings of a record's list, in order.
+/// A span in the words an alert's text holds: "45 s", "12 min", "3 h 20 min".
+fn idle_words(ms: i64) -> String {
+    let seconds = ms.max(0) / 1000;
+    if seconds < 60 {
+        format!("{seconds} s")
+    } else if seconds < 3600 {
+        format!("{} min", seconds / 60)
+    } else {
+        let minutes = (seconds % 3600) / 60;
+        if minutes == 0 {
+            format!("{} h", seconds / 3600)
+        } else {
+            format!("{} h {minutes} min", seconds / 3600)
+        }
+    }
+}
+
 /// The scenarios a gate's verdict says passed in it: run on the candidate
 /// and passed (`passed`), or taken from the base's cache as solved
 /// (`reused`).
@@ -3284,6 +3437,7 @@ fn apply_mission(mission: &mut Mission, record: &Value) {
         }
         "mission.configured" => {
             mission.accept = record["accept"].as_str().map(str::to_string);
+            mission.backlog = record["objectives"].is_object();
         }
         "task.assigned" if mission.state == "open" => {
             mission.state = "active".to_string();
@@ -3920,6 +4074,7 @@ mod tests {
             quiet_ms: 900_000,
             integrator_down_ms: 300_000,
             controller_behind_ms: 1_800_000,
+            mission_idle_ms: 900_000,
             window_ms: 86_400_000,
             test_log: None,
             live_log: None,
@@ -4212,6 +4367,199 @@ mod tests {
             json!({"type": "mission.resumed", "id": 4}),
         );
         assert_eq!(rejections_change(&cancel(&mut monitor, 27, 3)), None);
+    }
+
+    /// Missions for `mission_idle` (objective 058): 1 and 3 take their work
+    /// from a backlog, 2 is owner work, 4 a backlog mission whose task stays
+    /// in work; each has one task (its id the mission's), assigned at event
+    /// 10 + id. Returns the events of the cancels of tasks 1, 2 and 3.
+    fn idle_world(monitor: &mut Monitor) -> Vec<i64> {
+        for id in 1..=4 {
+            feed(
+                monitor,
+                id,
+                0,
+                json!({"type": "mission.added", "id": id, "text": "m"}),
+            );
+            let objectives = if id == 2 {
+                Value::Null
+            } else {
+                json!({"backlog": "b", "resident": "r"})
+            };
+            feed(
+                monitor,
+                5 + id,
+                0,
+                json!({"type": "mission.configured", "id": id, "accept": "gate",
+                       "objectives": objectives}),
+            );
+            feed(
+                monitor,
+                10 + id,
+                0,
+                json!({"type": "task.assigned", "id": id, "mission_id": id, "agent_id": "a"}),
+            );
+        }
+        feed(
+            monitor,
+            20,
+            0,
+            json!({"type": "mission.closed", "id": 3, "state": "done"}),
+        );
+        [1, 2, 3]
+            .into_iter()
+            .map(|id| {
+                feed(
+                    monitor,
+                    20 + id,
+                    1_000 * id,
+                    json!({"type": "task.cancelled", "id": id}),
+                );
+                20 + id
+            })
+            .collect()
+    }
+
+    fn read_idle(monitor: &Monitor, now: i64) -> Vec<Event> {
+        let mut out = Vec::new();
+        monitor.read_idle(now, &mut out);
+        out
+    }
+
+    /// Objective 058 (a), (c): a backlog mission with no task in work fires
+    /// once, at the reading the bound has passed since its last task ended;
+    /// owner work, a closed mission and one with a task in work do not.
+    #[test]
+    fn a_backlog_mission_without_work_past_the_bound_is_one_alert() {
+        let mut monitor = monitor();
+        let cancels = idle_world(&mut monitor);
+        assert!(
+            read_idle(&monitor, 1_000 + 900_000 - 1).is_empty(),
+            "not before the bound"
+        );
+        let fired = read_idle(&monitor, 1_000 + 900_000);
+        assert_eq!(fires(&fired), ["mission_idle:1:21"], "{fired:?}");
+        let Event::Fire {
+            subject,
+            evidence,
+            text,
+            notice,
+            ..
+        } = &fired[0]
+        else {
+            panic!("a fire");
+        };
+        assert_eq!(subject, "mission #1");
+        assert_eq!(evidence["mission"], 1);
+        assert_eq!(evidence["since_ms"], 1_000);
+        assert_eq!(evidence["event_id"], cancels[0]);
+        assert_eq!(
+            text,
+            "mission #1 has had no task in work for 15 min since its last task ended: its objective backlog has nothing open to assign"
+        );
+        assert!(!notice, "an alert: Needs you");
+        commit(&mut monitor, &fired);
+        assert!(
+            read_idle(&monitor, 10_000_000).is_empty(),
+            "once while open"
+        );
+    }
+
+    /// Objective 058 (b): the mission's next assignment clears it, naming
+    /// that record, and so does its close; the bound starts again at the
+    /// next task's end.
+    #[test]
+    fn a_missions_next_task_or_its_close_clears_its_idle_alert() {
+        let mut monitor = monitor();
+        idle_world(&mut monitor);
+        let fired = read_idle(&monitor, 2_000_000);
+        commit(&mut monitor, &fired);
+        let assigned = feed(
+            &mut monitor,
+            30,
+            0,
+            json!({"type": "task.assigned", "id": 5, "mission_id": 1, "agent_id": "a"}),
+        );
+        let cleared = decided(&monitor, assigned);
+        assert!(
+            matches!(&cleared[..], [.., Event::Clear { key, evidence }]
+                if key == "mission_idle:1:21" && evidence["event_id"] == 30),
+            "{cleared:?}"
+        );
+        commit(&mut monitor, &cleared);
+        assert!(read_idle(&monitor, 9_000_000).is_empty(), "a task in work");
+        feed(
+            &mut monitor,
+            31,
+            3_000_000,
+            json!({"type": "task.cancelled", "id": 5}),
+        );
+        let again = read_idle(&monitor, 3_000_000 + 900_000);
+        assert_eq!(fires(&again), ["mission_idle:1:31"]);
+        commit(&mut monitor, &again);
+        let closed = feed(
+            &mut monitor,
+            32,
+            0,
+            json!({"type": "mission.closed", "id": 1, "state": "done"}),
+        );
+        let cleared = decided(&monitor, closed);
+        assert!(
+            cleared
+                .iter()
+                .any(|event| matches!(event, Event::Clear { key, evidence }
+                if key == "mission_idle:1:31" && evidence["event_id"] == 32)),
+            "{cleared:?}"
+        );
+    }
+
+    /// Objective 058: `SPAWN_ALERT_MISSION_IDLE_SECS` is 900 s by default,
+    /// and 0 turns the alert off.
+    #[test]
+    fn the_idle_bound_defaults_to_fifteen_minutes_and_zero_disables_it() {
+        if std::env::var_os("SPAWN_ALERT_MISSION_IDLE_SECS").is_none() {
+            assert_eq!(super::Settings::from_env().0.mission_idle_ms, 900_000);
+        }
+        assert_eq!(settings().mission_idle_ms, 900_000);
+        let mut off = Monitor::with(Settings {
+            mission_idle_ms: 0,
+            ..settings()
+        });
+        idle_world(&mut off);
+        assert!(read_idle(&off, i64::MAX / 2).is_empty(), "disabled");
+    }
+
+    /// Objective 058 after a restart: an open alert read back fires nothing
+    /// again, and the next assignment still clears it.
+    #[test]
+    fn a_restart_keeps_a_mission_idle_alert_one_alert() {
+        let mut restarted = monitor();
+        idle_world(&mut restarted);
+        restarted.known.insert(
+            "mission_idle:1:21".to_string(),
+            Row {
+                kind: "mission_idle".to_string(),
+                subject: "mission #1".to_string(),
+                state: "open".to_string(),
+                evidence: json!({"mission": 1, "since_ms": 1_000, "event_id": 21}),
+                fired_event_id: 21,
+                fired_at_ms: 0,
+            },
+        );
+        assert!(read_idle(&restarted, 5_000_000).is_empty());
+        let assigned = feed(
+            &mut restarted,
+            40,
+            0,
+            json!({"type": "task.assigned", "id": 6, "mission_id": 1, "agent_id": "a"}),
+        );
+        let cleared = decided(&restarted, assigned);
+        assert!(
+            cleared.iter().any(
+                |event| matches!(event, Event::Clear { key, .. } if key == "mission_idle:1:21")
+            ),
+            "{cleared:?}"
+        );
     }
 
     #[test]
@@ -6416,6 +6764,79 @@ connections\n";
                     "still deployed"
                 );
                 let _ = std::fs::remove_dir_all(&gate);
+            });
+        }
+
+        /// Objective 058: a step started while a backlog mission has had no
+        /// task in work for longer than the bound reads when its last task
+        /// ended from the store and fires once; a restart fires nothing
+        /// again; the mission's next assignment clears it. Owner work fires
+        /// nothing.
+        #[test]
+        fn a_started_step_reads_a_missions_idle_time_from_the_store() {
+            in_schema("alerts_mission_idle", |store, client| {
+                for id in [1, 2] {
+                    record(
+                        client,
+                        3,
+                        &format!(
+                            r#"{{"type":"mission.added","id":{id},"text":"m","origin":"human","sources":[]}}"#
+                        ),
+                    );
+                    record(
+                        client,
+                        3,
+                        &format!(
+                            r#"{{"type":"task.assigned","id":{id},"mission_id":{id},"kind":"ephemeral",
+                                "agent_id":"agent_w{id}","session_id":"session_w{id}","brief":"b",
+                                "created_by":"spawn-integrate","objective":{id}}}"#
+                        ),
+                    );
+                }
+                record(
+                    client,
+                    3,
+                    r#"{"type":"mission.configured","id":1,"accept":"gate",
+                        "objectives":{"backlog":"b","resident":"r"}}"#,
+                );
+                let ended = record(client, 2, r#"{"type":"task.cancelled","id":1}"#);
+                record(client, 2, r#"{"type":"task.cancelled","id":2}"#);
+                refold(client);
+                let key = format!("mission_idle:1:{ended}");
+                let monitor = started(store);
+                assert_eq!(
+                    monitor.missions[&1].idle.map(|(_, event)| event),
+                    Some(ended)
+                );
+                assert!(monitor.missions[&1].backlog && !monitor.missions[&2].backlog);
+                assert_eq!(alert(client, &key).0, "open");
+                let idle: i64 = client
+                    .query_one(
+                        "select count(*) from spawn_alerts where kind = 'mission_idle'",
+                        &[],
+                    )
+                    .expect("count")
+                    .get(0);
+                assert_eq!(idle, 1, "none for owner work");
+                let mut restarted = started(store);
+                let fired: i64 = client
+                    .query_one(
+                        "select count(*) from spawn_alerts where kind = 'mission_idle'",
+                        &[],
+                    )
+                    .expect("count")
+                    .get(0);
+                assert_eq!(fired, 1, "a restart fires nothing again");
+                let assigned = record(
+                    client,
+                    0,
+                    r#"{"type":"task.assigned","id":3,"mission_id":1,"kind":"ephemeral",
+                        "agent_id":"agent_w3","session_id":"session_w3","brief":"b",
+                        "created_by":"spawn-integrate","objective":3}"#,
+                );
+                refold(client);
+                restarted.check(store).expect("the step checks");
+                assert_eq!(alert(client, &key), ("cleared".to_string(), Some(assigned)));
             });
         }
 
