@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use spawn_core::id::{BranchName, WorkspaceId};
 use spawn_core::port::{BaseMerge, Commit, SetAside, WorkspaceStore};
-use spawn_host::GitWorkspace;
+use spawn_host::{GitWorkspace, Scratch};
 
 /// Output of git in `directory`, which must succeed.
 fn git(directory: &Path, arguments: &[&str]) -> String {
@@ -31,10 +31,10 @@ fn git(directory: &Path, arguments: &[&str]) -> String {
 
 /// A project whose `main` holds `files` (no `.gitignore` unless one is
 /// among them), checked out in `<base>/repo`; the store over its `.git`;
-/// the workspace root.
-fn project(tag: &str, files: &[(&str, &str)]) -> (PathBuf, GitWorkspace, PathBuf) {
-    let base = std::env::temp_dir().join(format!("spawn-runtime-{tag}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&base);
+/// the workspace root; first, the scratch that holds them all, which the
+/// test keeps until it ends.
+fn project(tag: &str, files: &[(&str, &str)]) -> (Scratch, PathBuf, GitWorkspace, PathBuf) {
+    let base = Scratch::new(&format!("spawn-runtime-{tag}"));
     let checkout = base.join("repo");
     fs::create_dir_all(&checkout).expect("create the repository");
     git(&checkout, &["init", "-q", "--initial-branch=main"]);
@@ -46,7 +46,7 @@ fn project(tag: &str, files: &[(&str, &str)]) -> (PathBuf, GitWorkspace, PathBuf
     let root = base.join("work");
     fs::create_dir_all(&root).expect("create the workspace root");
     let store = GitWorkspace::new(checkout.join(".git"), &root);
-    (checkout, store, root)
+    (base, checkout, store, root)
 }
 
 fn write(directory: &Path, path: &str, text: &str) {
@@ -87,7 +87,7 @@ fn a_checkpoint_commits_none_of_the_engines_runtime_files_and_the_projects_claud
     // The project ignores its build output only, and its negations would
     // re-include the engine's files over any lower rule: no rule of the
     // project decides what a checkpoint takes.
-    let (checkout, store, _) = project(
+    let (_scratch, checkout, store, _) = project(
         "untracked",
         &[
             ("README.md", "base\n"),
@@ -168,7 +168,7 @@ fn a_checkpoint_commits_none_of_the_engines_runtime_files_and_the_projects_claud
 /// beside it still stays out.
 #[test]
 fn a_runtime_file_the_project_tracks_is_committed_like_any_tracked_file() {
-    let (checkout, store, root) = project(
+    let (_scratch, checkout, store, root) = project(
         "tracked",
         &[
             ("README.md", "base\n"),
@@ -218,7 +218,7 @@ fn a_runtime_file_the_project_tracks_is_committed_like_any_tracked_file() {
 /// stays in.
 #[test]
 fn a_set_aside_keeps_the_work_but_not_the_engines_runtime_files() {
-    let (checkout, store, _) = project(
+    let (_scratch, checkout, store, _) = project(
         "set-aside",
         &[
             ("README.md", "base\n"),
@@ -247,7 +247,7 @@ fn a_set_aside_keeps_the_work_but_not_the_engines_runtime_files() {
 /// would undo the owner's removal when the branch lands).
 #[test]
 fn a_runtime_file_main_removes_during_a_pending_merge_stays_removed() {
-    let (checkout, store, _) = project(
+    let (_scratch, checkout, store, _) = project(
         "pending",
         &[
             ("notes.txt", "base\n"),
@@ -319,7 +319,7 @@ fn git_in(checkout: &Path, directory: &Path, index: &Path, arguments: &[&str]) -
 /// checkpoint takes them out of the branch; the engine keeps its files.
 #[test]
 fn a_runtime_file_only_a_checkpoint_from_before_put_in_the_branch_leaves_it() {
-    let (checkout, store, root) = project("before", &[("README.md", "base\n")]);
+    let (_scratch, checkout, store, root) = project("before", &[("README.md", "base\n")]);
     let (workspace, directory) = mount(&store);
     write(&directory, LOCK, LOCK_TEXT);
     write(&directory, WORKTREE_FILE, "fn main() {}\n");
@@ -378,7 +378,7 @@ fn a_runtime_file_only_a_checkpoint_from_before_put_in_the_branch_leaves_it() {
 /// instead of a modify/delete conflict.
 #[test]
 fn a_runtime_file_the_owner_removes_from_main_leaves_the_branch_and_lands_clean() {
-    let (checkout, store, _) = project(
+    let (_scratch, checkout, store, _) = project(
         "removed",
         &[
             ("README.md", "base\n"),
@@ -432,7 +432,7 @@ fn a_runtime_file_the_owner_removes_from_main_leaves_the_branch_and_lands_clean(
 #[test]
 fn a_runtime_file_main_adds_during_a_pending_merge_stays() {
     const SCHEDULE: &str = ".claude/scheduled_tasks.json";
-    let (checkout, store, _) = project("added", &[("notes.txt", "base\n")]);
+    let (_scratch, checkout, store, _) = project("added", &[("notes.txt", "base\n")]);
     let (workspace, directory) = mount(&store);
     write(&directory, "notes.txt", "agent\n");
     assert!(matches!(
