@@ -446,6 +446,10 @@ struct Mission {
     state: String,
     halted: Option<String>,
     rejections: i64,
+    /// The objective of every rejection in the run of `rejections`, as the
+    /// fold keeps it (`gate_rejection_objective`): a cancel of a task of it
+    /// ends the run.
+    run_objective: Option<i64>,
     aborts: i64,
     escalated: bool,
     accept: Option<String>,
@@ -673,6 +677,7 @@ impl Monitor {
                     state: mission["state"].as_str().unwrap_or("open").to_string(),
                     halted: mission["halted"].as_str().map(str::to_string),
                     rejections: mission["gate_rejections"].as_i64().unwrap_or_default(),
+                    run_objective: mission["gate_rejection_objective"].as_i64(),
                     aborts: mission["gate_aborts"].as_i64().unwrap_or_default(),
                     escalated: mission["gate_room_escalated"].as_bool().unwrap_or(false),
                     accept: mission["accept"].as_str().map(str::to_string),
@@ -941,6 +946,7 @@ impl Monitor {
                 state: "open".to_string(),
                 halted: None,
                 rejections: 0,
+                run_objective: None,
                 aborts: 0,
                 escalated: false,
                 accept: None,
@@ -1103,6 +1109,13 @@ the base, unsolved on it (task #{task}'s gate)"
         if kind == "task.gated" && guarded {
             self.gating(event_id, id, task.mission, record, out);
         }
+        if kind == "task.cancelled" {
+            // Whoever cancels it (a yield, the owner, an objective solved on
+            // the base), as the fold: a cancel of the run's objective ends it.
+            self.mission_change(event_id, task.mission, kind, out, |mission| {
+                apply_cancel(mission, task.objective);
+            });
+        }
         let after = task_state_after(record, accept_gate, task.revisions);
         if let Some(after) = after {
             if bumps_revision(record)
@@ -1145,6 +1158,40 @@ the base, unsolved on it (task #{task}'s gate)"
         }
     }
 
+    /// The `mission_state` notice of a record after which a mission's
+    /// watched fields differ (`change` applies the record's fold).
+    fn mission_change(
+        &mut self,
+        event_id: i64,
+        mission_id: i64,
+        kind: &str,
+        out: &mut Vec<Event>,
+        change: impl FnOnce(&mut Mission),
+    ) {
+        let Some(mission) = self.missions.get_mut(&mission_id) else {
+            return;
+        };
+        let before = snapshot(mission);
+        change(mission);
+        let after = snapshot(mission);
+        if before != after {
+            out.push(Event::Fire {
+                key: format!("mission_state:{mission_id}:{event_id}"),
+                kind: "mission_state",
+                subject: format!("mission #{mission_id}"),
+                evidence: json!({
+                    "mission": mission_id, "record": kind, "event_id": event_id,
+                    "before": before, "after": after,
+                }),
+                text: format!(
+                    "mission #{mission_id}: {} (by {kind})",
+                    changed(&before, &after)
+                ),
+                notice: true,
+            });
+        }
+    }
+
     /// A gating's mission counters, and 033's base disagreement.
     fn gating(
         &mut self,
@@ -1154,27 +1201,10 @@ the base, unsolved on it (task #{task}'s gate)"
         record: &Value,
         out: &mut Vec<Event>,
     ) {
-        if let Some(mission) = self.missions.get_mut(&mission_id) {
-            let before = snapshot(mission);
-            apply_gating(mission, record);
-            let after = snapshot(mission);
-            if before != after {
-                out.push(Event::Fire {
-                    key: format!("mission_state:{mission_id}:{event_id}"),
-                    kind: "mission_state",
-                    subject: format!("mission #{mission_id}"),
-                    evidence: json!({
-                        "mission": mission_id, "record": "task.gated", "event_id": event_id,
-                        "before": before, "after": after,
-                    }),
-                    text: format!(
-                        "mission #{mission_id}: {} (by task.gated)",
-                        changed(&before, &after)
-                    ),
-                    notice: true,
-                });
-            }
-        }
+        let objective = self.tasks.get(&task).and_then(|task| task.objective);
+        self.mission_change(event_id, mission_id, "task.gated", out, |mission| {
+            apply_gating(mission, record, objective);
+        });
         self.red_scenarios(event_id, task, mission_id, record, out);
         self.task_defects(event_id, task, mission_id, record, out);
         if base_disagrees(record).is_some() {
@@ -2668,6 +2698,7 @@ fn apply_mission(mission: &mut Mission, record: &Value) {
         "mission.resumed" => {
             mission.halted = None;
             mission.rejections = 0;
+            mission.run_objective = None;
             mission.aborts = 0;
             mission.escalated = false;
         }
@@ -2682,11 +2713,23 @@ fn apply_mission(mission: &mut Mission, record: &Value) {
     }
 }
 
-/// The fold's counter changes of a gating.
-fn apply_gating(mission: &mut Mission, record: &Value) {
+/// The fold's counter changes of a gating of a task of `objective`.
+fn apply_gating(mission: &mut Mission, record: &Value, objective: Option<i64>) {
     match record["verdict"].as_str().unwrap_or_default() {
-        "rejected" => mission.rejections += 1,
-        "accepted" => mission.rejections = 0,
+        "rejected" => {
+            // The run's objective: the first rejection's task's, kept while
+            // every later one is a task of the same objective.
+            mission.run_objective = if mission.rejections == 0 {
+                objective
+            } else {
+                mission.run_objective.filter(|run| Some(*run) == objective)
+            };
+            mission.rejections += 1;
+        }
+        "accepted" => {
+            mission.rejections = 0;
+            mission.run_objective = None;
+        }
         _ => {}
     }
     match record["verdict"].as_str().unwrap_or_default() {
@@ -2700,6 +2743,15 @@ fn apply_gating(mission: &mut Mission, record: &Value) {
         }
         "stale" => {}
         _ => mission.escalated = false,
+    }
+}
+
+/// The fold's change of a cancel of a task of `objective`: one of the
+/// objective every rejection of the mission's run was ends that run.
+fn apply_cancel(mission: &mut Mission, objective: Option<i64>) {
+    if objective.is_some() && mission.run_objective == objective {
+        mission.rejections = 0;
+        mission.run_objective = None;
     }
 }
 

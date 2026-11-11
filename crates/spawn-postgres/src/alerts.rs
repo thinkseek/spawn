@@ -119,6 +119,7 @@ select jsonb_build_object(
   'missions', coalesce((select jsonb_agg(jsonb_build_object(
         'id', m.id, 'state', m.state, 'halted', m.halted, 'accept', m.accept,
         'gated', m.gate is not null, 'gate_rejections', m.gate_rejections,
+        'gate_rejection_objective', m.gate_rejection_objective,
         'gate_aborts', m.gate_aborts, 'gate_room_escalated', m.gate_room_escalated)
       order by m.id) from mission_missions m), '[]'::jsonb),
   'tasks', coalesce((select jsonb_agg(jsonb_build_object(
