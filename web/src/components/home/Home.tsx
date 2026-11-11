@@ -6,7 +6,7 @@ import { postResume } from "../../api";
 import { newKey } from "../../input";
 
 import { relativeTime } from "../../format";
-import type { AgentsNow, Digest, MissionsToday, NeedItem, NotesShown } from "../../home";
+import type { AgentsNow, Digest, MissionsToday, NeedItem, NoteRow, NotesShown } from "../../home";
 import { awayFrom, needsSummary, noWorkText, quietText } from "../../home";
 import { Card, CardHeader, FOCUS_RING, FOCUS_RING_INSET, cx, sinceText } from "../ui";
 
