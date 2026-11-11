@@ -1280,6 +1280,28 @@ it per execution and prices it (objective 041;
   supervisor's) and that task's mission. A restarted loop counts no message
   twice and loses none: the rows are the record, and the fold reads the
   events again from ten minutes before the newest it folded.
+- **Counted from the archive too** (objective 048,
+  `crates/spawn-cli/src/cost/archive.rs`). An execution the Bridge read
+  before it emitted usage events (every one that ended before 041), or
+  whose events are gone, is in the transcript archive and in no cost. Each
+  time `spawn loop` starts, a thread of its own, with its own connection and
+  never holding up a pass, reads the archive alone
+  (`<root>/.transcripts/<agent>/<native>.jsonl` and its copies
+  `<native>.<n>.jsonl`; never the live transcripts, never the event log)
+  and counts every assistant message the record lacks by the same rules
+  (once per id across every line and copy of the agent, read as the Bridge
+  reads a line), for the agent whose directory holds it, that agent's
+  execution running at the message's time (the latest started at or before
+  it; one timed before all of them, the agent's first), the task the agent
+  held then by the rule above, and that task's mission, priced when
+  recorded (`spawn_cost_archive_record`, owner only, in batches of 500). A
+  message the record holds keeps what it holds; a message of an agent with
+  no recorded execution is not counted, and the loop's log says how many it
+  skipped. `spawn_cost_archive_files` marks each file counted with its
+  length and modification time: an agent whose files are all as marked is
+  not read again, one with any file changed is read whole. A file that
+  cannot be read, or a line that is not JSON, is skipped; an agent whose
+  count fails is logged and counted again at the next start.
 - **Priced when recorded.** `SPAWN_MODEL_PRICES` is a JSON object from model
   name to `{"input", "output", "cache_write", "cache_read"}`, US dollars per
   million tokens, each a number not below zero; a message costs each count
@@ -1297,7 +1319,10 @@ it per execution and prices it (objective 041;
 - **Served and shown.** `GET /api/cost?window=24h|7d` (24h when absent; any
   other window 400) answers the messages timed in [now minus the window,
   now) on the database's clock: `{window, since_ms, until_ms, total, models,
-  missions, tasks, agents, executions}`, each with its `usd` (the exact sum;
+  missions, tasks, agents, executions, counted_since_ms}` (the last: the
+  time of the earliest message the record holds, null when none; the page
+  says "Counted since <YYYY-MM-DD HH:MM> UTC" on a window that starts
+  before it), each with its `usd` (the exact sum;
   0 for an entry of unpriced use only, null for an unpriced model), its
   `tokens` and its `unpriced_tokens`. The dashboard's Cost page (sidebar)
   shows the total and each mission, task and agent over 24 h and 7 d

@@ -62,6 +62,9 @@ export interface CostAnswer {
   tasks: CostTask[];
   agents: CostAgent[];
   executions: CostExecution[];
+  /** The time of the earliest message the cost record holds; null when it
+   * holds none (objective 048). */
+  counted_since_ms: number | null;
 }
 
 /** One line of the page: its label, its cost as shown, and whether any of
@@ -78,6 +81,10 @@ export interface CostView {
   missions: Row[];
   tasks: Row[];
   agents: Row[];
+  /** "Counted since <YYYY-MM-DD HH:MM> UTC" when the window starts before
+   * the earliest message the record holds (its figures may be low); null
+   * otherwise. */
+  since: string | null;
 }
 
 const DOLLARS = new Intl.NumberFormat("en-US", {
@@ -126,8 +133,27 @@ function rows<T>(entries: unknown, key: (entry: T) => string): Row[] {
     .map(({ key: label, usd, unpriced }) => ({ key: label, usd, unpriced }));
 }
 
+function twoDigits(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+/** The note of a window that starts before the record's first message:
+ * "Counted since <YYYY-MM-DD HH:MM> UTC", to the minute; null when the
+ * record holds nothing or counts from the window's start. */
+export function countedSince(answer: Partial<CostAnswer> | null | undefined): string | null {
+  const counted = answer?.counted_since_ms;
+  const since = answer?.since_ms;
+  if (typeof counted !== "number" || !Number.isFinite(counted)) return null;
+  if (typeof since !== "number" || !Number.isFinite(since) || since >= counted) return null;
+  const at = new Date(counted);
+  if (Number.isNaN(at.getTime())) return null;
+  const day = `${at.getUTCFullYear()}-${twoDigits(at.getUTCMonth() + 1)}-${twoDigits(at.getUTCDate())}`;
+  return `Counted since ${day} ${twoDigits(at.getUTCHours())}:${twoDigits(at.getUTCMinutes())} UTC`;
+}
+
 /** The page's figures for one window's answer: the total; each mission
- * (`#<id>`), task (`T<id>`) and agent (its id), most costly first. */
+ * (`#<id>`), task (`T<id>`) and agent (its id), most costly first; and
+ * since when the record counts, when the window starts before it. */
 export function costView(answer: Partial<CostAnswer> | null | undefined): CostView {
   const total = shown(answer?.total);
   return {
@@ -136,5 +162,6 @@ export function costView(answer: Partial<CostAnswer> | null | undefined): CostVi
     missions: rows<CostMission>(answer?.missions, (entry) => `#${entry.mission}`),
     tasks: rows<CostTask>(answer?.tasks, (entry) => `T${entry.task}`),
     agents: rows<CostAgent>(answer?.agents, (entry) => String(entry.agent)),
+    since: countedSince(answer),
   };
 }

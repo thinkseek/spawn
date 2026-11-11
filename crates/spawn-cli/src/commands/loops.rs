@@ -24,7 +24,8 @@
 //!   revival's backoff;
 //! - the cost step ([`cost::record`]), which folds the Bridge's
 //!   `model.usage` records into each message's priced cost, and waits for
-//!   nothing but them;
+//!   nothing but them (what only the transcript archive holds is
+//!   counted once at start, beside the passes: [`cost::archive::start`]);
 //! - the alerts ([`alerts::Monitor::check`]), which waits for its next host
 //!   reading (`SPAWN_ALERT_CHECK_SECS`, 30 s) or a bound's due time.
 //!
@@ -425,6 +426,8 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         eprintln!("spawn loop warning: {warning}");
     }
     let root = workspace_root(flags).map(std::path::PathBuf::from);
+    // What only the transcript archive holds, counted beside the passes.
+    cost::archive::start(root.as_deref(), &prices);
     let monitor = disk::Monitor::new(root.as_deref());
     let mut fleet = Fleet {
         flags,
