@@ -1032,7 +1032,11 @@ showed an alert. `spawn loop` now raises its own, from records and readings
 - **What fires.** Notices, for every mission: `task_state` (a control record
   after which the task's state differs, with `from` and `to`),
   `mission_state` (its `state`, `halted`, `gate_rejections`, `gate_aborts` or
-  `gate_room_escalated` differs, with `before` and `after`),
+  `gate_room_escalated` differs, with `before` and `after`; the step folds
+  `gate_rejections` by the store's rule, the run's objective included and
+  read back on start, so a cancel that ends the run (a yield, the owner's
+  cancel) is one: "gate_rejections 3 -> 0 (by task.cancelled)"; objective
+  053),
   `gate_base_disagrees` (objective 033's host fault with `alert`), and
   `command_failed` (a command that finished failed; an owner's note is not
   news). Conditions: `scenario_red` (a gate of the mission found main red
