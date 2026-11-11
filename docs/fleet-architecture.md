@@ -1070,7 +1070,17 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   restart, while a gated mission that is open or active, not halted, and on
   a source no owner holds has a reported task; cleared at the first reading
   that finds the lock held; the lock is read only while such a task is in
-  the step's fold or the alert is open), `model_auth` (objective 028's
+  the step's fold or the alert is open), `controller_behind` (subject
+  `mission #<id>`: the owner's latest landing on a gated mission's source
+  (the latest `source.moved`'s `to`; the mission open or active, not
+  halted, with a reported task) is newer than the controller its gate's
+  scenarios come from (`controllers/<name>-<commit>`) at every reading for
+  `SPAWN_ALERT_CONTROLLER_BEHIND_SECS`, default 1800; the integrator holds
+  that mission's gates until the deploy switches the controller (P22), so a
+  wait this long is a landing not deployed; a task's landing needs no
+  deploy and counts for nothing; cleared at the first reading that finds
+  the controller has the landing or the mission no longer waiting),
+  `model_auth` (objective 028's
   `execution.interrupted` with cause `model_auth`) and `cost_budget`
   (subject `mission #<id>`, key `cost_budget:<mission>:<UTC day>`: at a
   reading, the mission's cost of the model calls timed in the current UTC
