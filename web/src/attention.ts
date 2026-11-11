@@ -56,10 +56,21 @@ export interface SupervisorQuestion {
 /** A line the supervisor wrote for the owner ("For the owner: ..."): what
  * its grants do not cover. It does not wait on it, so it asks nothing and
  * nothing answers it; it is there to be read. */
+/** A task a line for the owner names, with its state now. */
+export interface NoteTask {
+  id: number;
+  state: string;
+}
+
 export interface OwnerNote {
   text: string;
   /** When it wrote the line, if the transcript says. */
   at_ms: number | null;
+  /** The tasks the line names, in its order (objective 064). */
+  tasks: NoteTask[];
+  /** Its ask is a review, accept or merge of tasks that have all ended:
+   * nothing is left to do, and Home's card leaves it out. */
+  settled: boolean;
 }
 
 export interface SupervisorView extends Labels {
@@ -227,7 +238,13 @@ function normalizeNotes(value: unknown): OwnerNote[] {
   return list(value).flatMap((entry) => {
     const raw = object(entry);
     const note = raw ? optionalText(raw.text) : null;
-    return raw && note ? [{ text: note, at_ms: optionalNumber(raw.at_ms) }] : [];
+    if (!raw || !note) return [];
+    const tasks = list(raw.tasks).flatMap((value) => {
+      const task = object(value);
+      const id = task ? optionalNumber(task.id) : null;
+      return task && id !== null ? [{ id, state: optionalText(task.state) ?? "unknown" }] : [];
+    });
+    return [{ text: note, at_ms: optionalNumber(raw.at_ms), tasks, settled: raw.settled === true }];
   });
 }
 
