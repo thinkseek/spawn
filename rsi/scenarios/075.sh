@@ -18,7 +18,9 @@
 #       Row carries it as `label` (the page shows "#4 Spawn RSI").
 #   (2) every Row carries `unpriced_short`: "+<n> unpriced", the count
 #       compact ("950", "55K", "1.1M", "17M", "485M", "1.5B": one decimal
-#       under 10, whole from 10, K/M/B by thousands), null with none;
+#       under 10, whole from 10, K/M/B by thousands; rounded first, then
+#       the unit picked, so 9,960 is "10K" and 999,600 "1.0M"), null with
+#       none;
 #       `unpriced_text` (the full count, objective 059) stays, for the
 #       badge's title. The page's badge shows the short text, and the
 #       dollars never shrink or wrap.
@@ -270,8 +272,11 @@ test("(2) the compact count's steps", () => {
   const one = (tokens) =>
     costView({ ...answer, missions: [{ ...answer.missions[0], unpriced_tokens: tokens }] }).missions[0].unpriced_short;
   assert.deepEqual(
-    [950, 55_000, 1_148_834, 17_000_456, 485_321_042, 1_463_163_060, 0].map(one),
-    ["+950 unpriced", "+55K unpriced", "+1.1M unpriced", "+17M unpriced", "+485M unpriced", "+1.5B unpriced", null],
+    [950, 9_960, 55_000, 999_600, 1_148_834, 17_000_456, 485_321_042, 1_463_163_060, 0].map(one),
+    [
+      "+950 unpriced", "+10K unpriced", "+55K unpriced", "+1.0M unpriced", "+1.1M unpriced",
+      "+17M unpriced", "+485M unpriced", "+1.5B unpriced", null,
+    ],
   );
 });
 TEST
