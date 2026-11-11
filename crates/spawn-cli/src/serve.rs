@@ -2772,6 +2772,150 @@ mod tests {
         }
     }
 
+    const RESUME: &str = "/api/mission/6/resume";
+
+    /// The resume path has the input's guards (POST only, the page's Origin
+    /// without the token, JSON), a body of a halt and a key alone (or a
+    /// probe), and a mission named by its number. Past every guard it
+    /// reaches the database (here none: 500).
+    #[test]
+    fn a_resumes_path_has_the_inputs_guards_and_a_halt_and_a_key() {
+        let get = exchange(
+            Some("secret"),
+            "",
+            None,
+            &format!(
+                "GET {RESUME} HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\n\
+                 Authorization: Bearer secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        refused(&get, 405, "GET");
+        let body = r#"{"halt":61,"key":"k-1"}"#;
+        let named = "Host: 127.0.0.1:PORT\r\nContent-Type: application/json\r\n";
+        refused(
+            &post(None, "", None, RESUME, named, body),
+            403,
+            "no token and no Origin",
+        );
+        let elsewhere = format!("{named}Origin: http://elsewhere.example\r\n");
+        refused(
+            &post(None, "", None, RESUME, &elsewhere, body),
+            403,
+            "another site's page",
+        );
+        let text = "Host: 127.0.0.1:PORT\r\nAuthorization: Bearer secret\r\n\
+                    Content-Type: text/plain\r\n";
+        refused(
+            &post(Some("secret"), "", None, RESUME, text, body),
+            415,
+            "not JSON",
+        );
+        for (bad, why) in [
+            ("not json", "not JSON"),
+            (r#"{"halt":61}"#, "no idempotency key"),
+            (r#"{"key":"k"}"#, "no halt"),
+            (r#"{"halt":"61","key":"k"}"#, "a halt that is no event id"),
+            (r#"{"halt":61,"key":"k","by":"owner"}"#, "who resumes"),
+            (r#"{"halt":61,"key":""}"#, "an empty key"),
+            (r#"{"probe":true,"halt":61}"#, "a probe with a halt"),
+        ] {
+            refused(&post(Some("secret"), "", None, RESUME, SCRIPT, bad), 400, why);
+        }
+        for path in ["/api/mission/six/resume", "/api/mission/-1/resume"] {
+            refused(
+                &post(Some("secret"), "", None, path, SCRIPT, body),
+                400,
+                "a mission that is no number",
+            );
+        }
+        let other_key = format!("{SCRIPT}Idempotency-Key: other\r\n");
+        refused(
+            &post(Some("secret"), "", None, RESUME, &other_key, body),
+            400,
+            "a key in the body and another in the header",
+        );
+        for reaching in [body, r#"{"probe":true}"#] {
+            let reached = post(Some("secret"), "", None, RESUME, SCRIPT, reaching);
+            assert_eq!(reached.status, 500, "{reached:?}");
+            assert_eq!(reached.body["error"], "SPAWN_DATABASE_URL is not set");
+        }
+        let header_key = format!("{SCRIPT}Idempotency-Key: k-1\r\n");
+        let reached = post(Some("secret"), "", None, RESUME, &header_key, r#"{"halt":61}"#);
+        assert_eq!(reached.status, 500, "the key in its header: {reached:?}");
+    }
+
+    /// A person's resume reaches the test database as the `spawn_human`
+    /// login: the halt the mission is in, once per key, `by` human; any
+    /// other is 409 with the reason and records nothing; no mission is 404.
+    #[test]
+    fn a_persons_resume_reaches_the_test_database_once_for_the_halt_it_names() {
+        in_test_schema(|owner, store| {
+            let to = |path: &str, body: &str| {
+                post(
+                    Some("secret"),
+                    "",
+                    Some(owner.to_string()),
+                    path,
+                    SCRIPT,
+                    body,
+                )
+            };
+            let mission = store
+                .mission_add("Resumed from the page", &json!([]), "human")
+                .expect("a mission");
+            let path = format!("/api/mission/{mission}/resume");
+            let probe = to(&path, r#"{"probe":true}"#);
+            assert_eq!(probe.status, 200, "{probe:?}");
+            let idle = to(&path, r#"{"halt":1,"key":"r-0"}"#);
+            assert_eq!(idle.status, 409, "{idle:?}");
+            assert!(
+                idle.body["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("not halted")),
+                "{idle:?}"
+            );
+            let halt = store
+                .integrator_record(&json!({"type": "mission.halted", "id": mission,
+                                           "reason": "the scenarios fell from 5 to 2",
+                                           "gone": ["c.sh"]}))
+                .expect("halted");
+            let stale = to(&path, &format!(r#"{{"halt":{},"key":"r-1"}}"#, halt - 1));
+            assert_eq!(stale.status, 409, "{stale:?}");
+            let missing = to(
+                "/api/mission/999999/resume",
+                &format!(r#"{{"halt":{halt},"key":"r-1"}}"#),
+            );
+            assert_eq!(missing.status, 404, "{missing:?}");
+            let body = format!(r#"{{"halt":{halt},"key":"r-2"}}"#);
+            let first = to(&path, &body);
+            assert_eq!(first.status, 202, "{first:?}");
+            let event = first.body["event"].as_i64().expect("the record's event");
+            let again = to(&path, &body);
+            assert_eq!(again.status, 202, "{again:?}");
+            assert_eq!(again.body["event"], event, "a retried POST resumes once");
+            let board = store.mission_board(10).expect("the board");
+            assert!(board["missions"][0]["halted"].is_null());
+            assert!(board["missions"][0]["halt"].is_null());
+            let mut client =
+                postgres::Client::connect(owner, postgres::NoTls).expect("the owner connects");
+            let records: Vec<Value> = client
+                .query(
+                    "select kind -> 'detail' -> 'record' from spawn_events
+                      where session_id = 'session_control'
+                        and kind -> 'detail' -> 'record' ->> 'type' = 'mission.resumed'",
+                    &[],
+                )
+                .expect("the records")
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            assert_eq!(records.len(), 1, "{records:?}");
+            assert_eq!(records[0]["by"], "human");
+            assert_eq!(records[0]["halt"], halt);
+            assert_eq!(records[0]["id"], mission);
+        });
+    }
+
     /// Who may write past the guards: the token's holder from anywhere, the
     /// page itself on an open network, and, with no token set, the owner's
     /// own client. Each reaches the database (here none: 500).
