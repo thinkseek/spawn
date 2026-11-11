@@ -588,6 +588,21 @@ adapter in `spawn_host::transcripts`):
   nothing open. It is told from these records, not by age; the records are
   read before the archive, so a window read as settled already has every
   line before its end, and reads the same figures afterwards.
+- **Where the tokens begin.** The archive's tokens begin at its oldest
+  model call; a window that starts before it has no tokens from before
+  it. `spawn scorecard --json` and `/api/scorecard` say `tokens_short:
+  "window"` when the window starts before its oldest call (or the
+  archive holds none), `"previous"` when
+  only the previous window does (its figures and the trends are short),
+  and null when the archive reaches back past both starts;
+  `tokens_from_ms` is that oldest call when the tokens are short, else
+  null. The text form says it on its header line, and the page under the
+  window (web/src/tokenReach.ts). It is told from the archive, never from
+  a window's lack of calls: a file last written more than a day before
+  the previous window's start (and so not read) holds lines from before
+  it, and the archive then reaches back past both; otherwise every file
+  is read and its oldest message is where the tokens begin. The figures
+  are the same either way: these fields say only that they are short.
 - **The cost record.** Each time `spawn loop` starts it counts, beside its
   passes, every assistant message the archive holds and the cost record
   (`spawn_cost_messages`) lacks (objective 048; docs/fleet-architecture.md
