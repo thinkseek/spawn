@@ -59,7 +59,16 @@ fn constraints(client: &mut Client, schema: &str) -> Vec<String> {
 /// Every index (`create index if not exists` keeps an old definition), and
 /// every function by signature, with how it runs.
 fn indexes_and_functions(client: &mut Client, schema: &str) -> Vec<String> {
-    client
+    // Read with neither schema on the search path: pg_get_indexdef leaves a
+    // function in an index expression unqualified when its schema is on the
+    // reader's search path, so the client's own schema (the upgraded one)
+    // printed `spawn_experience_int(…)` and the fresh one
+    // `<schema>.spawn_experience_int(…)` for the same index (the first
+    // indexes that call a function, 2026-11-11).
+    let mut read = client.transaction().expect("a transaction");
+    read.batch_execute("set local search_path to pg_catalog")
+        .expect("no schema on the search path");
+    let rows = read
         .query(
             "select indexdef from pg_indexes where schemaname = $1
              union all
@@ -71,8 +80,9 @@ fn indexes_and_functions(client: &mut Client, schema: &str) -> Vec<String> {
               order by 1",
             &[&schema],
         )
-        .expect("read the indexes and functions")
-        .iter()
+        .expect("read the indexes and functions");
+    read.commit().expect("end the read");
+    rows.iter()
         .map(|row| row.get::<_, String>(0).replace(schema, "<schema>"))
         .collect()
 }
