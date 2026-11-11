@@ -259,16 +259,11 @@ mod tests {
         let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
             "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
         );
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.subsec_nanos());
-        let schema = format!("spawn_test_{}_{nanos:x}_{name}", std::process::id());
+        let schema = spawn_postgres::testing::TestSchema::new(name);
         let store = Arc::new(
             PostgresStore::connect_in_schema(&url, &schema).expect("a schema of its own, migrated"),
         );
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| case(store)));
-        let _ = postgres::Client::connect(&url, postgres::NoTls)
-            .and_then(|mut client| client.batch_execute(&format!("drop schema {schema} cascade")));
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }

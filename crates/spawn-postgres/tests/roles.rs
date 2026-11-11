@@ -366,7 +366,7 @@ fn many_migrations_at_once_on_one_cluster_all_succeed() {
     // Guarded as the databases are: each migration makes its schema, and
     // the guards drop them once every migration has returned.
     let schemas: Vec<common::Schema> = (0..SCHEMAS)
-        .map(|number| common::Schema::fresh(&format!("burst_{number}")))
+        .map(|number| common::Schema::new(&format!("burst_{number}")))
         .collect();
     let mut urls: Vec<String> = databases.iter().map(Database::url).collect();
     urls.extend(schemas.iter().map(|schema| common::schema_url(schema)));
