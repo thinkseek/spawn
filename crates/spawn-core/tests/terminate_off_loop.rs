@@ -338,6 +338,41 @@ fn a_kill_that_fails_off_the_loop_fails_the_stop_as_before() {
     );
 }
 
+/// A kill that fails while its stop waits to be claimed again: the tick's
+/// own pass over the session reads the kill's result first (the end goes on
+/// each tick, the stop's or not). The stop, claimed next, fails with that
+/// kill's error, not with a checkpoint that was never tried. Before the
+/// fix this order was a race in a_kill_that_fails_off_the_loop_fails_the_stop_as_before
+/// (5 runs in 40), and the stop said "the end is stalled and its final
+/// checkpoint retried".
+#[test]
+fn a_kill_that_fails_while_its_stop_waits_fails_the_stop_with_the_kill_error() {
+    let mut rig = Rig::with_retry(Duration::from_secs(1));
+    rig.submit("key_stop", CommandAction::Stop);
+    rig.tick();
+    assert_eq!(rig.finished(2), None, "the stop waits for its kill");
+    rig.host.release(Release::Outlived);
+    // The kill's thread answers; the stop is not due again yet, so the
+    // ticks' pass over the session is what reads it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !rig.notes.iter().any(|note| note.ends_with(", and failed")) {
+        assert!(
+            Instant::now() < deadline,
+            "the kill's failure was never read"
+        );
+        rig.tick();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(rig.finished(2), None, "the stop is not claimed yet");
+    rig.clock.advance(Duration::from_secs(2));
+    rig.tick_until(|rig| rig.finished(2).is_some());
+    let (succeeded, error) = rig.finished(2).expect("finished");
+    assert!(!succeeded);
+    assert!(error.contains("a process outlived the kill"), "{error}");
+    assert!(!error.contains("checkpoint"), "{error}");
+    assert!(!rig.ended(), "the execution stays, its workspace mounted");
+}
+
 /// An input waiting for its turn when the stop came is failed once the end
 /// is done, never typed; the stop itself is not failed with it.
 #[test]
