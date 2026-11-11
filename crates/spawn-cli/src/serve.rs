@@ -1,6 +1,6 @@
 //! HTTP API and static files for the observer UI: reads, and a person's
-//! writes: an input to a session, a key, and a restart or a reassign of a
-//! stalled worker.
+//! writes: an input to a session, a key, a restart or a reassign of a
+//! stalled worker, and the resume of a halted mission.
 //!
 //! Every read goes through the same store methods the CLI uses, as the
 //! read-only `spawn_reader` login, so a defect in a read cannot change
@@ -64,6 +64,21 @@
 //! execution of the same session a restart's resume replaced, else null),
 //! and the session's `reassigned_to` and `reassigned_from` (`{"task",
 //! "session_id"}` or null).
+//!
+//! A person may also resume a halted mission from Needs you (objective
+//! 051): `POST /api/mission/<id>/resume` with `{"halt": <event>, "key":
+//! "<idempotency key>"}` (the key may come in an `Idempotency-Key` header),
+//! with the input's guards in the same order, `{"probe": true}` passing them
+//! and writing nothing (200). It runs through `spawn_human_resume`, the
+//! `spawn_human` login's fourth function, which records the owner's
+//! `mission.resumed` with `by` from its own `spawn_principal()` (`human`,
+//! never from here) and the `halt` it resumes; serve never writes it as the
+//! owner. The halt is the mission's `mission.halted` event the page showed
+//! (`/api/missions`' `halt.event`): it answers 202 `{"event": <the
+//! mission.resumed record>}` for the halt the mission is in, the same event
+//! for the same key again, and 409 with the reason, recording nothing, when
+//! the mission is not halted or is halted on another halt (a page not
+//! refreshed since); 404 for no such mission; 400 without a key or a halt.
 //!
 //! Reading is still worth guarding: `/api/pane/<id>` shows any live pane.
 //! `serve` binds 127.0.0.1 unless told otherwise, and on any other address
@@ -704,6 +719,12 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
         {
             return key(request, id, access, shared);
         }
+        if let Some(id) = path
+            .strip_prefix("/api/mission/")
+            .and_then(|rest| rest.strip_suffix("/resume"))
+        {
+            return resume(request, id, access, shared);
+        }
         for action in ["restart", "reassign"] {
             if let Some(id) = path
                 .strip_prefix("/api/session/")
@@ -1114,6 +1135,89 @@ fn move_task(
     }
 }
 
+/// `POST /api/mission/<id>/resume`, past the read guard (`access`): a
+/// person resumes mission `id` on the halt the page showed (module doc).
+fn resume(mut request: Request, id: &str, access: Access, shared: &Shared) -> Result<(), String> {
+    if *request.method() != Method::Post {
+        return request
+            .respond(not_allowed("POST"))
+            .map_err(|error| error.to_string());
+    }
+    let (status, body) = match resumed(&mut request, id, access, shared) {
+        Ok(answer) => answer,
+        Err((status, error)) => (status, json!({ "error": error })),
+    };
+    request
+        .respond(json_response(status, &body))
+        .map_err(|error| error.to_string())
+}
+
+/// The body of `POST /api/mission/<id>/resume`: the halt it resumes (its
+/// `mission.halted` event) and the idempotency key, or `{"probe": true}`
+/// alone. Nothing else: no principal, no reason.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResumeBody {
+    #[serde(default)]
+    halt: Option<i64>,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    probe: bool,
+}
+
+/// The checks of a person's resume after its method, then the probe's
+/// answer or the record: `(202, {event})`, or `(status, why)` when refused.
+fn resumed(
+    request: &mut Request,
+    id: &str,
+    access: Access,
+    shared: &Shared,
+) -> Result<(u16, Value), (u16, String)> {
+    let (body, header_key) = write_body(request, access, shared, "a resume")?;
+    let body: ResumeBody = serde_json::from_slice(&body).map_err(|error| {
+        (
+            400,
+            format!("{BAD_REQUEST}the body is not a resume: {error}"),
+        )
+    })?;
+    let mission: i64 = id
+        .parse()
+        .ok()
+        .filter(|mission| *mission > 0)
+        .ok_or_else(|| (400, format!("{BAD_REQUEST}bad mission {id}")))?;
+    if body.probe {
+        if body.halt.is_some() || body.key.is_some() || header_key.is_some() {
+            return Err((
+                400,
+                format!("{BAD_REQUEST}a probe carries no halt and no key"),
+            ));
+        }
+        writer(shared).map_err(|error| (500, error))?;
+        return Ok((200, json!({ "writable": true, "mission": mission })));
+    }
+    let key = idempotency(body.key, header_key, "a resume")?;
+    let halt = body.halt.ok_or_else(|| {
+        (
+            400,
+            format!(
+                "{BAD_REQUEST}a resume names the halt it resumes (\"halt\", the mission's \
+                 halt.event), so that a page not refreshed resumes no other"
+            ),
+        )
+    })?;
+    let store = writer(shared).map_err(|error| (500, error))?;
+    match store.human_resume(mission, halt, &key) {
+        Ok(spawn_postgres::HumanResume::Resumed(event)) => Ok((
+            202,
+            json!({ "event": event, "mission": mission, "halt": halt, "principal": "human" }),
+        )),
+        Ok(spawn_postgres::HumanResume::NoMission(why)) => Err((404, why)),
+        Ok(spawn_postgres::HumanResume::Refused(why)) => Err((409, why)),
+        Err(error) => Err((500, error.to_string())),
+    }
+}
+
 /// Whether `origin` is this page's own: present, and the same host over
 /// http as the request's `Host`.
 fn same_origin(host: Option<&str>, origin: Option<&str>) -> bool {
@@ -1192,8 +1296,9 @@ fn typed_text(text: Option<String>) -> Result<String, String> {
 }
 
 /// A connection as the `spawn_human` login, derived from the owner's URL:
-/// the one login a write uses, which may call `spawn_human_input` and
-/// nothing else.
+/// the one login a write uses, which may call the `spawn_human_*`
+/// functions (an input, a key, a restart or reassign, a resume) and nothing
+/// else. A resume, too, is written only through it, never as the owner.
 fn writer(shared: &Shared) -> Result<spawn_postgres::PostgresStore, String> {
     let owner = shared
         .owner_url

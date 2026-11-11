@@ -1,8 +1,9 @@
 //! Access as a restricted login: reads through the grant-filtered
 //! `spawn_read_*` functions and submissions through the `agent_commands`
 //! gateway, so the caller sees and sends exactly what `spawn_grants` allows;
-//! and a person's input from the web page as the `spawn_human` login,
-//! through `spawn_human_input`, the one function that login may call.
+//! and a person's writes from the web page as the `spawn_human` login,
+//! through the `spawn_human_*` functions, the only ones that login may call
+//! (an input, a key, a restart or reassign, a mission's resume).
 
 use spawn_core::command::{NamedKey, Submission};
 use spawn_core::id::{CommandId, IdempotencyKey, SessionId};
