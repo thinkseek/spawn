@@ -3352,6 +3352,93 @@ mod tests {
         assert_eq!(evidence["event_id"], 3);
     }
 
+    /// What a restart reads again: an open halt of record 20, then the
+    /// records of the history in order. A resume older than the halt, a
+    /// good drill older than the failed one, an `up` older than its `down`
+    /// clear nothing; a later one clears.
+    #[test]
+    fn a_record_older_than_an_alerts_own_clears_nothing() {
+        let mut monitor = monitor();
+        let open = |kind: &str, subject: &str, evidence: Value| super::Row {
+            kind: kind.to_string(),
+            subject: subject.to_string(),
+            state: "open".to_string(),
+            evidence,
+            fired_event_id: 100,
+            fired_at_ms: 0,
+        };
+        monitor.known.insert(
+            "mission_halted:4:20".into(),
+            open("mission_halted", "mission #4", json!({"event_id": 20})),
+        );
+        monitor.known.insert(
+            "drill_failed:30".into(),
+            open("drill_failed", "drill", json!({"event_id": 30})),
+        );
+        monitor.known.insert(
+            "judge_down:40".into(),
+            open("judge_down", "jev", json!({"event_id": 40})),
+        );
+        feed(
+            &mut monitor,
+            1,
+            0,
+            json!({"type": "mission.added", "id": 4, "text": "m"}),
+        );
+        for (event_id, record) in [
+            (15, json!({"type": "mission.resumed", "id": 4})),
+            (25, json!({"type": "backup.verified", "ok": true, "key": "old"})),
+            (30, json!({"type": "backup.verified", "ok": false, "key": "same"})),
+            (35, json!({"type": "host.judge", "judge": "jev", "state": "up"})),
+        ] {
+            let events = feed(&mut monitor, event_id, 0, record);
+            let cleared: Vec<Event> = decided(&monitor, events)
+                .into_iter()
+                .filter(|event| matches!(event, Event::Clear { .. }))
+                .collect();
+            assert!(cleared.is_empty(), "record {event_id} cleared {cleared:?}");
+        }
+        for (event_id, record, key) in [
+            (50, json!({"type": "mission.resumed", "id": 4}), "mission_halted:4:20"),
+            (51, json!({"type": "backup.verified", "ok": true, "key": "new"}), "drill_failed:30"),
+            (52, json!({"type": "host.judge", "judge": "jev", "state": "up"}), "judge_down:40"),
+        ] {
+            let events = feed(&mut monitor, event_id, 0, record);
+            let cleared = decided(&monitor, events);
+            assert!(
+                cleared
+                    .iter()
+                    .any(|event| matches!(event, Event::Clear { key: at, evidence }
+                        if at == key && evidence["event_id"] == event_id)),
+                "record {event_id} clears {key}: {cleared:?}"
+            );
+        }
+    }
+
+    /// A reading-borne clear: a reading at or after the one the alert fired
+    /// on, or, when the alert names none, after its firing.
+    #[test]
+    fn a_reading_clears_only_after_the_reading_it_fired_on() {
+        let row = |evidence: Value, fired_at_ms: i64| super::Row {
+            kind: "memory_low".to_string(),
+            subject: "host".to_string(),
+            state: "open".to_string(),
+            evidence,
+            fired_event_id: 7,
+            fired_at_ms,
+        };
+        let fired = row(json!({"reading_ms": 1_000}), 1_200);
+        assert!(!super::after(&fired, &json!({"reading_ms": 900}), 5_000));
+        assert!(super::after(&fired, &json!({"reading_ms": 1_500}), 5_000));
+        let unnamed = row(json!({}), 1_200);
+        assert!(!super::after(&unnamed, &json!({}), 1_100));
+        assert!(super::after(&unnamed, &json!({}), 1_300));
+        // An event names the order whatever the clocks say.
+        let record = row(json!({"event_id": 9}), 0);
+        assert!(!super::after(&record, &json!({"event_id": 9, "reading_ms": 9_999}), 0));
+        assert!(super::after(&record, &json!({"event_id": 10}), 0));
+    }
+
     #[test]
     fn a_restarted_loop_reads_its_alerts_back_and_fires_nothing_twice() {
         let mut monitor = monitor();
