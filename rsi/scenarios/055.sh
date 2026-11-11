@@ -17,8 +17,8 @@
 #
 # Required: a crate-suite run whose tests pass leaves no schema it made in
 # the test database, of any name (a schema renamed is a schema all the
-# same); every case drops what it made, the cases that make several
-# included.
+# same), and nothing in its public schema; every case drops what it made,
+# the cases that make several included.
 #
 # To keep its cost per gate small, the scenario runs only the crate that
 # leaks, `cargo test -p spawn-postgres` (about 20 s; the build is the
@@ -28,7 +28,8 @@
 #   (1) the tests pass (a failing suite cannot be judged for what it
 #       leaves; the check of the tests reports it);
 #   (2) no schema is left but the server's own (public, information_schema,
-#       pg_*), whatever its name.
+#       pg_*), whatever its name, and public holds no relation, function
+#       or type it did not hold before the run.
 # Once this is solved, the owner folds the same check into the check of the
 # tests (every crate) and retires this scenario.
 #
@@ -99,8 +100,16 @@ schemas() {
         where nspname not in ('public', 'information_schema') and nspname not like 'pg\\_%'
         order by nspname" 2>"$WORK/q.err" || harness "listing the schemas failed: $(head -c 300 "$WORK/q.err")"
 }
+# What public holds: its relations, functions and types, as "<kind> <name>".
+in_public() {
+    psql -d "$db" -qtA -v ON_ERROR_STOP=1 -c "select 'relation ' || relname from pg_class where relnamespace = 'public'::regnamespace
+        union all select 'function ' || proname from pg_proc where pronamespace = 'public'::regnamespace
+        union all select 'type ' || typname from pg_type where typnamespace = 'public'::regnamespace
+        order by 1" 2>"$WORK/q.err" || harness "listing public failed: $(head -c 300 "$WORK/q.err")"
+}
 before=$(schemas | grep -c . || true)
 [ "$before" -eq 0 ] || harness "the fresh database already holds $before schemas"
+public_before=$(in_public)
 
 s=$(date +%s)
 set +e
@@ -119,7 +128,13 @@ if [ "$count" -gt 0 ]; then
     size=$(psql -d "$db" -qtAc "select pg_size_pretty(pg_database_size(current_database()))" 2>/dev/null || echo "?")
     fail "(2) a passing cargo test -p spawn-postgres left $count schemas in its test database (now $size), which held none before: $(printf '%s\n' "$left" | head -n 12 | tr '\n' ' ')..."
 fi
-note "(2) no schema left in the test database"
+public_after=$(in_public)
+if [ "$public_after" != "$public_before" ]; then
+    printf '%s\n' "$public_before" >"$WORK/public.before"
+    added=$(printf '%s\n' "$public_after" | grep -vxF -f "$WORK/public.before" | head -n 12 | tr '\n' ' ')
+    fail "(2) a passing cargo test -p spawn-postgres left objects in public of its test database: $added..."
+fi
+note "(2) no schema left in the test database, and nothing new in public"
 
-echo "055: the tests of spawn-postgres, all passing, leave no schema in their test database"
+echo "055: the tests of spawn-postgres, all passing, leave no schema and nothing new in public in their test database"
 exit 0
