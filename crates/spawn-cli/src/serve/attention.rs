@@ -1577,8 +1577,8 @@ mod tests {
         let unknown = note("task 99 waits for your review");
         assert_eq!(unknown["tasks"], json!([]));
         assert_eq!(unknown["settled"], json!(false));
-        let none = owner_note("review task 2", None, &BTreeMap::new());
-        assert_eq!(none["at_ms"], Value::Null);
-        assert_eq!(none["settled"], json!(false));
+        let unread = owner_note("review task 2", None, &BTreeMap::new());
+        assert_eq!(unread["at_ms"], Value::Null);
+        assert_eq!(unread["settled"], json!(false));
     }
 }
