@@ -273,7 +273,7 @@ function IdleRow({ mission }: { mission: MissionIdle }) {
       </span>
       <span className="tnum w-9 shrink-0 text-right text-faint-foreground">{Math.round(share * 100)}%</span>
       {mission.idle && (
-        <span className="shrink-0 rounded-full bg-warning/15 px-1.5 text-micro font-medium text-warning">idle</span>
+        <span className="shrink-0 rounded-full bg-warning/10 px-1.5 text-micro font-medium text-warning">idle</span>
       )}
     </li>
   );
