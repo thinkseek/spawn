@@ -1306,7 +1306,7 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
             .as_i64()
             .and_then(|id| gates.get(id.to_string()))
             .cloned()
-            .unwrap_or(Value::Null);
+            .unwrap_or(serde_json::Value::Null);
         if let Some(fields) = task.as_object_mut() {
             fields.insert("last_gate".to_string(), gate);
         }
@@ -3382,14 +3382,14 @@ mod tests {
             ],
         }));
         let rows = board["objectives"].as_array().expect("rows");
-        let statuses: Vec<&Value> = rows.iter().map(|row| &row["status"]).collect();
+        let statuses: Vec<&serde_json::Value> = rows.iter().map(|row| &row["status"]).collect();
         assert_eq!(statuses, ["solved", "solved", "open", "open", "open"]);
         assert_eq!(
             rows[1]["solved_on_base"],
             json!({"event": 77, "task": 2, "base": "b0"})
         );
         for at in [0, 2, 3, 4] {
-            assert_eq!(rows[at]["solved_on_base"], Value::Null, "row {at}");
+            assert_eq!(rows[at]["solved_on_base"], serde_json::Value::Null, "row {at}");
         }
         // Its landings are a landing's only; the record is not one.
         assert_eq!(rows[1]["landings"], json!([]));
@@ -3419,13 +3419,13 @@ mod tests {
             .as_array_mut()
             .expect("tasks")
             .push(task(5, 4, "accepted", 50, None));
-        assert_eq!(with_objectives(mission)["next_objective"], Value::Null);
+        assert_eq!(with_objectives(mission)["next_objective"], serde_json::Value::Null);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir4);
     }
 
-    /// Another mission's record solves nothing here; `after` is obeyed
-    /// against records solved on the base; a held objective is not next.
+    /// `after` is obeyed against records solved on the base; a held
+    /// objective is not next until the mission is configured again.
     #[test]
     fn next_objective_obeys_order_holds_and_only_its_own_records() {
         let dir = backlog_dir("board-order", &[1, 2, 3], &[(1, r#", "after": [2]"#)]);
