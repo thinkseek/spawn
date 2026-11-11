@@ -2388,13 +2388,9 @@ fn write_whole(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
     std::fs::rename(&temporary, path)
 }
 
-/// Scenario files in the controller's checkout.
-pub(crate) fn count_scenarios(directory: &Path) -> Result<u32, String> {
-    Ok(u32::try_from(scenario_names(directory)?.len()).unwrap_or(u32::MAX))
-}
-
-/// The scenario file names (`*.sh`) in `directory`, sorted: the ones
-/// [`count_scenarios`] counts. None in a directory that does not exist.
+/// The scenario file names (`*.sh`) in the controller's checkout, sorted;
+/// none in a directory that does not exist. Their number is the count the
+/// scenario floor holds.
 pub(crate) fn scenario_names(directory: &Path) -> Result<Vec<String>, String> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
