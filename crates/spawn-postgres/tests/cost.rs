@@ -465,10 +465,11 @@ fn a_window_says_what_a_landing_cost_for_the_fleet_and_each_mission() {
     assert_eq!(by_b["landed"], json!(0), "{by_b}");
     assert_eq!(by_b["usd_per_landing"], Value::Null, "{by_b}");
 
-    // A window with spending and no landing says null, not a figure.
+    // Just before the window: t2 landed, nothing spent. After it, nothing
+    // landed: null, not a figure.
     let before = store.cost_window(since - 10, since).expect("window");
     assert_eq!(before["landed"], json!(1), "t2's landing, just before: {before}");
-    assert_eq!(before["usd_per_landing"], json!(0), "{before}");
+    near(&before["usd_per_landing"], 0.0, "no dollars in it over t2");
     let empty = store.cost_window(until, until + 1000).expect("window");
     assert_eq!(empty["landed"], json!(0));
     assert_eq!(empty["usd_per_landing"], Value::Null);
