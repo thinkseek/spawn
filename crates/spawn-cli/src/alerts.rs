@@ -2744,8 +2744,9 @@ times in a row)",
     }
 
     /// A task record's part in `mission_idle`: an assignment ends the
-    /// mission's idle time and clears its alert; a record after which no
-    /// task of the mission is in work starts it, at that record.
+    /// mission's idle time and clears its alert; a record that ends a task
+    /// (or follows an ended one) with no task of the mission in work after
+    /// it starts it, at that record.
     fn track_idle(&mut self, event_id: i64, at_ms: i64, kind: &str, mission: i64, out: &mut Vec<Event>) {
         if kind == "task.assigned" {
             if let Some(entry) = self.missions.get_mut(&mission) {
@@ -2762,9 +2763,9 @@ times in a row)",
         if !ended || self.in_work(mission) {
             return;
         }
-        if let Some(entry) = self.missions.get_mut(&mission)
-            && entry.idle.is_none()
-        {
+        // The latest such record, as the store's mirror reads it on start
+        // (a restart's history is read with the tasks' states as they are).
+        if let Some(entry) = self.missions.get_mut(&mission) {
             entry.idle = Some((at_ms, event_id));
         }
     }
