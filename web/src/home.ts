@@ -101,8 +101,12 @@ export interface NeedItem {
   /** The whole text when `detail` shortens it; shown on expand. */
   full?: string | null;
   since_ms: number | null;
-  /** The command that acts on it, to copy (no write path from the page). */
+  /** The command that acts on it, to copy. */
   command: string | null;
+  /** A halted mission's resume from the page (`POST
+   * /api/mission/<mission>/resume`): the mission and the halt it resumes
+   * (its `mission.halted` event), so a page not refreshed resumes no other. */
+  resume?: { mission: number; halt: number } | null;
   /** The session whose page answers it (a question, an escalated agent). */
   session: string | null;
 }
@@ -165,6 +169,35 @@ function escalation(item: AttentionItem, told: boolean): NeedItem {
   };
 }
 
+/** Scenario names a halted mission's item names in its line; the rest are
+ * counted ("and N more") and named in full on expand. */
+export const GONE_SHOWN = 5;
+
+/** A mission's `halt` as read (normalizeMissions, or the answer as it
+ * came): null without an event to resume. */
+function haltOf(value: unknown): { event: number; reason: string | null; at_ms: number | null; gone: string[] | null } | null {
+  if (typeof value !== "object" || value === null) return null;
+  const halt = value as { event?: unknown; reason?: unknown; at_ms?: unknown; gone?: unknown };
+  if (typeof halt.event !== "number" || !Number.isFinite(halt.event)) return null;
+  return {
+    event: halt.event,
+    reason: typeof halt.reason === "string" ? halt.reason : null,
+    at_ms: typeof halt.at_ms === "number" ? halt.at_ms : null,
+    gone: Array.isArray(halt.gone) ? halt.gone.filter((name): name is string => typeof name === "string") : null,
+  };
+}
+
+/** A halt's line: the reason, then, when scenarios are gone, at most
+ * GONE_SHOWN of their names and "and N more" for the rest; `full` names
+ * them all when the line does not. */
+export function haltWords(reason: string, gone: readonly string[] | null): { detail: string; full: string | null } {
+  if (!gone || gone.length === 0) return { detail: reason, full: null };
+  const shown = gone.slice(0, GONE_SHOWN).join(", ");
+  const rest = gone.length - GONE_SHOWN;
+  const detail = `${reason}; gone: ${shown}${rest > 0 ? ` and ${rest} more` : ""}`;
+  return { detail, full: rest > 0 ? `${reason}; gone: ${gone.join(", ")}` : null };
+}
+
 /** Every item that needs the owner, actions first, oldest first within. */
 export function needsYou(input: NeedsInput): NeedItem[] {
   const items: NeedItem[] = [];
@@ -189,13 +222,17 @@ export function needsYou(input: NeedsInput): NeedItem[] {
   for (const mission of missions?.missions ?? []) {
     if (!mission.halted || mission.id === null) continue;
     halted.add(mission.id);
+    const halt = haltOf(mission.halt);
+    const words = haltWords(halt?.reason ?? mission.halted, halt?.gone ?? null);
     items.push({
       key: `halted:${mission.id}`,
       tone: "act",
       title: `Mission #${mission.id} ${missionName(mission)} is halted`,
-      detail: mission.halted,
-      since_ms: mission.updated_at_ms,
+      detail: words.detail,
+      full: words.full,
+      since_ms: halt?.at_ms ?? mission.updated_at_ms,
       command: `spawn mission resume --id ${mission.id}`,
+      resume: halt ? { mission: mission.id, halt: halt.event } : null,
       session: null,
     });
   }
