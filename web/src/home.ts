@@ -237,6 +237,28 @@ export function alertWords(alert: Pick<Alert, "kind" | "subject" | "text" | "evi
   return `${alert.subject} has had no task in work for ${ageText(now - since)} since its last task ended: its objective backlog has nothing open to assign`;
 }
 
+/** A row's words on the Alerts page as of `now`: an open alert's are
+ * `alertWords`; a cleared or notice one keeps its stored text (its mission is
+ * no longer without work, so its time does not count on; objective 080). */
+export function alertRowWords(
+  alert: Pick<Alert, "kind" | "subject" | "text" | "evidence" | "state">,
+  now: number,
+): string {
+  return alert.state === "open" ? alertWords(alert, now) : alert.text;
+}
+
+/** The open-alerts banner's line on every page but Home: how many, the
+ * newest one's (by `fired_at_ms`) words as of `now`, and when it fired; null
+ * for none (objective 080). */
+export function openAlertsLine(
+  alerts: readonly Pick<Alert, "kind" | "subject" | "text" | "evidence" | "fired_at_ms">[],
+  now: number,
+): { count: number; text: string; fired_at_ms: number } | null {
+  if (alerts.length === 0) return null;
+  const newest = alerts.reduce((latest, alert) => (alert.fired_at_ms > latest.fired_at_ms ? alert : latest));
+  return { count: alerts.length, text: alertWords(newest, now), fired_at_ms: newest.fired_at_ms };
+}
+
 /** Every item that needs the owner, actions first, oldest first within. */
 export function needsYou(input: NeedsInput): NeedItem[] {
   const items: NeedItem[] = [];
