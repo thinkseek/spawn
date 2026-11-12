@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { CoreFigure, CoreLinesAnswer } from "../src/coreLines.ts";
-import { coreLinesView, rangeWords, sinceWords, spanWords, trendView, unitWords } from "../src/coreLines.ts";
+import { coreLinesView, drillMark, rangeWords, sinceWords, spanWords, trendView, unitWords } from "../src/coreLines.ts";
 
 const GIB = 1024 ** 3;
 const MIB = 1024 ** 2;
@@ -161,8 +161,8 @@ test("each unit in words, and each range form", () => {
 });
 
 test("an answer missing its parts, or none, reads as an empty card", () => {
-  assert.deepEqual(coreLinesView(null), { rows: [], notice: null, ignored: [], pending: [] });
-  assert.deepEqual(coreLinesView({}), { rows: [], notice: null, ignored: [], pending: [] });
+  assert.deepEqual(coreLinesView(null), { rows: [], notice: null, ignored: [], pending: [], drills: [] });
+  assert.deepEqual(coreLinesView({}), { rows: [], notice: null, ignored: [], pending: [], drills: [] });
 });
 
 // Objective 086: the performance line's units.
@@ -288,3 +288,34 @@ test("coreLinesView's marks stay as they were with trends in the answer", () => 
   assert.deepEqual(coreLinesView(withTrends), plain);
 });
 
+
+// Objective 093: the recovery table's rows under the recoverability line.
+test("each drill row says its last pass, never passed, or no drill", () => {
+  const now = Date.UTC(2026, 10, 12, 12, 0);
+  const view = coreLinesView(
+    {
+      lines: [],
+      drills: [
+        { name: "Database", source: "record backup.verified", passed_at_ms: now - 3 * 3_600_000 },
+        { name: "Old drill", source: "unit bb-drill-c.service", passed_at_ms: now - 8 * 86_400_000 },
+        { name: "Off-host copy", source: "unit bb-drill-b.service", passed_at_ms: null },
+        { name: "Configuration and credentials", source: null, passed_at_ms: null },
+      ],
+    },
+    now,
+  );
+  assert.deepEqual(
+    view.drills.map((drill) => [drill.name, drill.tone]),
+    [
+      ["Database", "plain"],
+      ["Old drill", "warning"],
+      ["Off-host copy", "warning"],
+      ["Configuration and credentials", "muted"],
+    ],
+  );
+  assert.match(view.drills[0].text, /^passed \d\d-\d\d \d\d:\d\d \(3 h ago\)$/);
+  assert.match(view.drills[1].text, /\(192 h ago\)$/);
+  assert.equal(view.drills[2].text, "never passed");
+  assert.equal(view.drills[3].text, "no drill");
+  assert.equal(drillMark(null, now).text, "no drill");
+});

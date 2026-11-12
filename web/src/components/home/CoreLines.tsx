@@ -87,7 +87,9 @@ function Guardrail({ mark, figure }: { mark: CoreMark; figure: CoreFigure | unde
  * figure not built yet, a range not read), never as its internal key and
  * reason (lead-mac 2026-11-12 18:15). Each figure
  * carries its last 7 days as a small line, the change as its title
- * (objective 090). Read-only.
+ * (objective 090). Under the recoverability row, the recovery table's rows
+ * each with its drill's last pass, "never passed" or "no drill" (objective
+ * 093). Read-only.
  */
 export function CoreLinesCard() {
   const poll = usePoll("core-lines", fetchCoreLines, POLL_MS);
@@ -137,6 +139,16 @@ export function CoreLinesCard() {
                     <Trend figure={line?.north_star} />
                   </span>
                 </div>
+                {line?.line === "recoverability" && view.drills.length > 0 && (
+                  <ul className="mt-1.5 space-y-0.5" aria-label="Restore drills">
+                    {view.drills.map((drill, at) => (
+                      <li key={`${at}:${drill.name}`} className="flex min-w-0 items-baseline gap-2 text-caption">
+                        <span className="min-w-0 truncate text-muted-foreground">{drill.name}</span>
+                        <span className={cx("tnum ml-auto shrink-0", TONE[drill.tone])}>{drill.text}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
                 {row.guardrails.length > 0 && (
                   <ul className="mt-2 grid grid-cols-1 gap-1.5 sm:grid-cols-2 lg:grid-cols-3">
                     {row.guardrails.map((mark, at) => (
