@@ -229,6 +229,18 @@ select jsonb_build_object(
                       order by e.id desc
                       limit 1) x))";
 
+/// When the newest control record of type `$1` with `ok` true was
+/// recorded (objective 093: a restore drill's last pass, the database
+/// drill's `backup.verified`); null without one.
+pub(crate) const NEWEST_PASSED: &str = r"
+select e.recorded_at_ms
+  from spawn_events e
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' = $1
+   and e.kind -> 'detail' -> 'record' -> 'ok' = 'true'::jsonb
+ order by e.id desc
+ limit 1";
+
 /// Every distinct mission source, sorted: what a full bundle holds.
 pub(crate) const SOURCES: &str = r"
 select coalesce(jsonb_agg(distinct s.source order by s.source), '[]'::jsonb)
@@ -257,6 +269,14 @@ impl PostgresStore {
     /// The newest database copy and bundle ([`NEWEST_BACKUPS`]).
     pub fn newest_backups(&self) -> Result<Value, StoreError> {
         self.query_json(NEWEST_BACKUPS, &[])
+    }
+
+    /// When the newest record of type `kind` with `ok` true was recorded
+    /// ([`NEWEST_PASSED`]); `None` without one.
+    pub fn newest_passed_record(&self, kind: &str) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .query_opt(NEWEST_PASSED, &[&kind])?
+            .map(|row| row.get(0)))
     }
 
     /// Every distinct mission source ([`SOURCES`]).
