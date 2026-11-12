@@ -255,8 +255,8 @@ else
     expect_eq "$(obs '[.north_star.key] + [.guardrails[].key]')" \
         '["observability.needs_you_right","observability.unpriced_share","observability.interventions_per_agent_hour","observability.not_measured"]' \
         "(1) the observability line's north star and guardrails, in order"
-    expect_eq "$(figure observability.needs_you_right | jq -c '{value, state}')" '{"value":null,"state":"not_collected"}' \
-        "(1) the north star waits for the alerts' outcome classes"
+    # The north star's value is the alert outcomes' objective's (B4): only its
+    # key is this line's, and 084 holds "not collected exactly when no value".
     share=$(jq -c '.total | (.tokens | .input + .output + .cache_write + .cache_read) as $all | if $all > 0 then .unpriced_tokens / $all else null end' "$WORK/cost.json")
     expect_eq "$share" 0.25 "(1) the seed: /api/cost?window=7d has a quarter of its tokens unpriced"
     expect_eq "$(figure observability.unpriced_share)" '{"unit":"share","value":0.25,"range":{"max":0.05},"state":"out"}' \
