@@ -142,12 +142,15 @@ select min(e.recorded_at_ms)
 /// the lead's timing on the live copy): the same projections, the control
 /// records only of `seq > $3` (the last kept seq less [`OVERLAP`]) or
 /// recorded at or after `$2` (the kept reading's end), the commands only of
-/// `id > $4` (the last kept id less [`OVERLAP`]) or finished at or after
-/// `$2` (a finish is the one change a command row gets, and what makes a
-/// failed one a fact). The control records are found as two lists of ids,
-/// one per index (`spawn_events_session_seq`, `spawn_events_name_time`), and
-/// read back by primary key from an array of them: as one `or`, a generic
-/// plan walked every control record, and joined back it scanned the table.
+/// `id > $4` (the last kept id less [`OVERLAP`]), created at or after `$2`
+/// (a database clock stepped back makes a later id an earlier time) or
+/// finished at or after `$2` (a finish is the one change a command row
+/// gets, and what makes a failed one a fact). The control records are found
+/// as two lists of ids, one per index (`spawn_events_session_seq`,
+/// `spawn_events_name_time`), and read back from an array of them
+/// (`id = any(...)` in the Index Cond of `spawn_events_session_name`, the
+/// lead's plan): as one `or`, a generic plan walked every control record,
+/// and joined back it scanned the table.
 /// It is made from [`FACTS`]'s text, so the projections are one.
 static FACTS_SINCE: LazyLock<String> = LazyLock::new(|| {
     let control = "      from spawn_events e\n";
@@ -163,8 +166,8 @@ static FACTS_SINCE: LazyLock<String> = LazyLock::new(|| {
         .replace(
             control,
             "      from spawn_events e
-     -- WINDOW: by id, from the two lists (an array, so each row is one
-     -- primary key probe: joined, a generic plan scanned the table).
+     -- WINDOW: by id, from the two lists (an array, so the rows are index
+     -- probes on their ids: joined, a generic plan scanned the table).
      cross join (select array(
               select s.id from spawn_events s
                where s.session_id = 'session_control' and s.session_seq > $3
@@ -181,7 +184,8 @@ static FACTS_SINCE: LazyLock<String> = LazyLock::new(|| {
         )
         .replace(
             commands,
-            "     where c.created_at_ms < $1 and (c.id > $4 or c.finished_at_ms >= $2)\n",
+            "     where c.created_at_ms < $1
+       and (c.id > $4 or c.created_at_ms >= $2 or c.finished_at_ms >= $2)\n",
         )
 });
 
@@ -191,10 +195,35 @@ static FACTS_SINCE: LazyLock<String> = LazyLock::new(|| {
 /// order) is found while fewer than this many were written after it.
 const OVERLAP: i64 = 256;
 
+/// How long kept facts are trusted before a reading reads them all again
+/// (the lead, on rev-e's review): a row the window cannot see (one that
+/// committed more than [`OVERLAP`] numbers late) is then missing for at most
+/// this long, against one whole reading (about 150 ms) an hour. Measured
+/// on the readings' own ends, so a test passes its clock in.
+const FULL_EVERY_MS: i64 = 3_600_000;
+
+/// Whether the last kept control fact is still the same record (seq,
+/// recorded_at and the record's id; the facts carry no event id): a store
+/// restored in place to an earlier point, under the same URL and name,
+/// fails it, and its kept facts are dropped for a whole reading rather than
+/// left as facts no whole reading would give (rev-e's F2). One probe of
+/// `spawn_events_session_seq` per kept reading.
+const KEPT_STILL_THERE: &str = r"
+select exists (
+  select 1
+    from spawn_events e
+   cross join lateral (select e.kind -> 'detail' -> 'record' as r offset 0) x
+   where e.session_id = 'session_control' and e.session_seq = $1
+     and e.event_name = 'control.recorded' and e.recorded_at_ms = $2
+     and nullif(coalesce(x.r -> 'id', x.r -> 'row' -> 'id'), 'null'::jsonb)
+         is not distinct from $3::jsonb)";
+
 /// One store's facts as its last reading left them: its end, its control
 /// facts by seq, its command facts by id.
 struct Kept {
     until: i64,
+    /// The end of the whole reading these facts began with.
+    full_until: i64,
     control: BTreeMap<i64, Value>,
     commands: BTreeMap<i64, Value>,
 }
@@ -224,9 +253,12 @@ impl Kept {
     }
 }
 
-/// The facts each store (by its URL, database and schema) last read, in
-/// this process: the dashboard's and the loop's Core lines readings read
-/// only what is new since ([`FACTS_SINCE`]).
+/// The facts each store (by its URL, database, the database's oid and
+/// schema) last read, in this process: the dashboard's and the loop's Core
+/// lines readings read only what is new since ([`FACTS_SINCE`]). One lock
+/// for every store, held through the reading's statements, a whole one
+/// included: a process reads one store in production (serve, the loop), so
+/// no reading waits on another store's; tests with many stores serialise.
 static KEPT: Mutex<BTreeMap<(u64, String), Kept>> = Mutex::new(BTreeMap::new());
 
 impl PostgresStore {
@@ -259,12 +291,35 @@ impl PostgresStore {
     /// the kept one's end reads only what is new since ([`FACTS_SINCE`]); an
     /// earlier end, a first reading or one after a failed one reads them all
     /// ([`FACTS`]), and an earlier end leaves the kept facts as they were.
+    /// Kept facts are read again whole when their whole reading's end is an
+    /// hour ([`FULL_EVERY_MS`]) behind, or when their last control fact is
+    /// no longer the same record ([`KEPT_STILL_THERE`]: a restore in place).
     pub fn scorecard_facts(&self, until_ms: i64) -> Result<Value, StoreError> {
+        self.scorecard_facts_with_overlap(until_ms, OVERLAP)
+    }
+
+    /// [`Self::scorecard_facts`] with the window's overlap given: the tests'
+    /// seam, so a short history still has rows below the window (rev-e's
+    /// F1). Every other caller uses [`OVERLAP`].
+    #[doc(hidden)]
+    pub fn scorecard_facts_with_overlap(
+        &self,
+        until_ms: i64,
+        overlap: i64,
+    ) -> Result<Value, StoreError> {
         let key = self.facts_key()?;
         let mut all = KEPT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut facts = match all.remove(&key) {
+        let mut kept = all.remove(&key);
+        if let Some(stale) = &kept
+            && until_ms >= stale.until
+            && (until_ms.saturating_sub(stale.full_until) >= FULL_EVERY_MS
+                || !self.kept_still_there(stale)?)
+        {
+            kept = None;
+        }
+        let mut facts = match kept {
             Some(kept) if until_ms < kept.until => {
                 let facts = self.query_json(FACTS, &[&until_ms]);
                 all.insert(key, kept);
@@ -275,12 +330,12 @@ impl PostgresStore {
                     .control
                     .keys()
                     .next_back()
-                    .map_or(i64::MIN, |seq| seq - OVERLAP);
+                    .map_or(i64::MIN, |seq| seq - overlap);
                 let since_id = kept
                     .commands
                     .keys()
                     .next_back()
-                    .map_or(i64::MIN, |id| id - OVERLAP);
+                    .map_or(i64::MIN, |id| id - overlap);
                 let read = self.query_json(
                     &FACTS_SINCE,
                     &[&until_ms, &kept.until, &since_seq, &since_id],
@@ -295,6 +350,7 @@ impl PostgresStore {
                 let read = self.query_json(FACTS, &[&until_ms])?;
                 let mut kept = Kept {
                     until: until_ms,
+                    full_until: until_ms,
                     control: BTreeMap::new(),
                     commands: BTreeMap::new(),
                 };
@@ -336,14 +392,34 @@ impl PostgresStore {
         &FACTS_SINCE
     }
 
+    /// Whether `kept`'s last control fact is still the same record
+    /// ([`KEPT_STILL_THERE`]); kept facts with no control fact are not
+    /// trusted (a whole reading of such a store is small).
+    fn kept_still_there(&self, kept: &Kept) -> Result<bool, StoreError> {
+        let Some((seq, fact)) = kept.control.last_key_value() else {
+            return Ok(false);
+        };
+        let at = fact["at"].as_i64();
+        let id = fact.get("id").cloned();
+        Ok(self.query_one(KEPT_STILL_THERE, &[seq, &at, &id])?.get(0))
+    }
+
     /// Which store this is, for [`KEPT`]: a hash of the URL it connected
-    /// with (never kept itself) and its database and schema.
+    /// with (never kept itself), its database, that database's oid (a
+    /// database dropped and made again under the name is another store) and
+    /// its schema.
     fn facts_key(&self) -> Result<(u64, String), StoreError> {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::new();
         self.url.hash(&mut hasher);
         let place: String = self
-            .query_one("select current_database() || '.' || current_schema()", &[])?
+            .query_one(
+                "select current_database() || '.'
+                        || (select d.oid from pg_database d
+                             where d.datname = current_database())::text
+                        || '.' || current_schema()",
+                &[],
+            )?
             .get(0);
         Ok((hasher.finish(), place))
     }

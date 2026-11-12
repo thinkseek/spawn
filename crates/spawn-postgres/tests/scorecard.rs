@@ -951,12 +951,17 @@ fn oracle(client: &mut Client, until: i64) -> Value {
 }
 
 /// A step of a random history: a control record of a kind the facts read,
-/// a command of a kind they keep (or not), or a pending command finishing.
+/// a command of a kind they keep (or not), a pending command finishing (the
+/// oldest, or one at random: far below the newest), or a record or command
+/// stamped ahead of `now` (a database clock stepped back after it, so later
+/// numbers carry earlier times).
 fn random_step(client: &mut Client, state: &mut u64, now: i64, task: &mut i64) {
     *state = state
         .wrapping_mul(6_364_136_223_846_793_005)
         .wrapping_add(1_442_695_040_888_963_407);
-    let pick = (*state >> 33) % 9;
+    let pick = (*state >> 33) % 12;
+    // Ahead by 20 or 21: on a later step's end (`now` or `now + 1`) exactly.
+    let ahead = now + 20 + i64::from((*state >> 20) % 2 == 0);
     let log = "| == candidate\n| stage gate rejected 300000ms total\n| more";
     match pick {
         0 => {
@@ -1019,6 +1024,35 @@ fn random_step(client: &mut Client, state: &mut u64, now: i64, task: &mut i64) {
             None,
             now,
         ),
+        8 => record(
+            client,
+            ahead,
+            &json!({"type": "task.landed", "id": *task}),
+        ),
+        9 => command(
+            client,
+            "human",
+            &format!("ahead-{now}"),
+            &json!({"type": "input", "text": "x"}),
+            None,
+            None,
+            ahead,
+        ),
+        10 => {
+            // A pending command at random finishes now, failed: most are far
+            // below the newest id.
+            let offset = i64::try_from((*state >> 40) % 64).expect("small");
+            client
+                .execute(
+                    "update spawn_commands set state = 'finished', succeeded = false,
+                            finished_at_ms = $1
+                      where id = (select id from spawn_commands where state = 'pending'
+                                   order by id offset ($2 % greatest(1, (select count(*)
+                                     from spawn_commands where state = 'pending'))) limit 1)",
+                    &[&now, &offset],
+                )
+                .expect("a command finishes");
+        }
         _ => {
             // The oldest pending command finishes now: failed every other
             // time, which makes a dispatcher's "other" command a fact.
@@ -1035,13 +1069,16 @@ fn random_step(client: &mut Client, state: &mut u64, now: i64, task: &mut i64) {
 }
 
 /// The kept facts (design-facts-incremental.md): after each step of a
-/// random history (records, commands made, commands finishing), a reading
-/// at a later end (or the same end again) reads only what is new and gives
-/// exactly the whole statement's answer, the oracle's. Three seeds.
+/// random history (records, commands made, commands finishing, either
+/// stamped ahead), a reading at a later end (or the same end again) reads
+/// only what is new and gives exactly the whole statement's answer, the
+/// oracle's; now and then a reading at an earlier end, also the oracle's.
+/// The overlap is 0 and 3 (rev-e's F1), so most rows are below the window
+/// and only its time and finish arms find what changed. Three seeds each.
 #[test]
 fn the_kept_facts_are_the_whole_facts_after_every_step() {
-    for seed in [1_u64, 7, 42] {
-        let (store, schema) = store(&format!("scorecard_kept_{seed}"));
+    for (seed, overlap) in [1_u64, 7, 42].into_iter().flat_map(|s| [(s, 0), (s, 3)]) {
+        let (store, schema) = store(&format!("scorecard_kept_{seed}_{overlap}"));
         let mut client = admin(&schema);
         let (mut state, mut task) = (seed, 0);
         record(
@@ -1050,14 +1087,20 @@ fn the_kept_facts_are_the_whole_facts_after_every_step() {
             &json!({"type": "mission.added", "id": 1, "text": "m",
                                          "origin": "human", "sources": []}),
         );
-        for step in 0..60_i64 {
+        for step in 0..220_i64 {
             let now = 100 + step * 10;
             random_step(&mut client, &mut state, now, &mut task);
-            let until = if step % 7 == 3 { now } else { now + 1 };
+            let until = match step % 11 {
+                5 => now - 35,
+                _ if step % 7 == 3 => now,
+                _ => now + 1,
+            };
             assert_eq!(
-                store.scorecard_facts(until).expect("the facts"),
+                store
+                    .scorecard_facts_with_overlap(until, overlap)
+                    .expect("the facts"),
                 oracle(&mut client, until),
-                "seed {seed} step {step}"
+                "seed {seed} overlap {overlap} step {step}"
             );
         }
     }
@@ -1166,6 +1209,113 @@ fn the_kept_facts_take_a_late_commit_an_earlier_end_and_keep_stores_apart() {
         Some(2),
         "the person's and the failed one: {finished}"
     );
+}
+
+/// A person's command written straight into the commands table with the id
+/// `id` (a gap's id, as a commit later than its number would leave it).
+fn command_with_id(client: &mut Client, id: i64, key: &str, created: i64) {
+    client
+        .execute(
+            "insert into spawn_commands (id, principal, idempotency_key, agent_id, session_id,
+                                         action, state, created_at_ms)
+             values ($1, 'human', $2, 'agent_resident_r1', 'session_resident_r1',
+                     '{\"type\": \"input\", \"text\": \"x\"}'::jsonb, 'pending', $3)",
+            &[&id, &key, &created],
+        )
+        .expect("write a command with its id");
+}
+
+/// A row no window finds (a command committed below the kept id, recorded
+/// before the kept end, unfinished) is missing from kept readings for at
+/// most an hour of ends: the first reading an hour after the whole one
+/// reads them all again. The clock is the readings' ends, passed in.
+#[test]
+fn kept_facts_are_read_whole_again_after_an_hour() {
+    let (store, schema) = store("scorecard_kept_hour");
+    let mut client = admin(&schema);
+    record(&mut client, 10, &json!({"type": "task.landed", "id": 1}));
+    for n in 0..6_i64 {
+        command(
+            &mut client,
+            "human",
+            &format!("p{n}"),
+            &json!({"type": "input", "text": "x"}),
+            None,
+            None,
+            500 + n,
+        );
+    }
+    let first: i64 = client
+        .query_one("select min(id) from spawn_commands", &[])
+        .expect("the first id")
+        .get(0);
+    client
+        .execute("delete from spawn_commands where id = $1", &[&first])
+        .expect("leave a gap");
+    let start = 1_000_i64;
+    assert_eq!(
+        store
+            .scorecard_facts_with_overlap(start, 0)
+            .expect("facts"),
+        oracle(&mut client, start)
+    );
+    command_with_id(&mut client, first, "late", 600);
+    let within = start + 3_600_000 - 1;
+    let missed = store
+        .scorecard_facts_with_overlap(within, 0)
+        .expect("facts");
+    assert_eq!(
+        missed["commands"].as_array().map(Vec::len),
+        Some(5),
+        "the late command is not seen within the hour: {missed}"
+    );
+    let after = start + 3_600_000;
+    let whole = store
+        .scorecard_facts_with_overlap(after, 0)
+        .expect("facts");
+    assert_eq!(whole, oracle(&mut client, after));
+    assert_eq!(whole["commands"].as_array().map(Vec::len), Some(6));
+}
+
+/// A store restored in place to an earlier point (the same URL, database
+/// and schema): when the last kept control record is gone, or its seq now
+/// holds another record, the next reading drops the kept facts and reads
+/// them whole, so no fact of the lost records stays (rev-e's F2). Overlap
+/// 0, so a window alone would keep them.
+#[test]
+fn a_store_restored_in_place_leaves_no_kept_fact_behind() {
+    for replaced in [false, true] {
+        let (store, schema) = store(&format!("scorecard_kept_restored_{replaced}"));
+        let mut client = admin(&schema);
+        for n in 1..=5_i64 {
+            record(&mut client, n * 100, &json!({"type": "task.landed", "id": n}));
+        }
+        assert_eq!(
+            store.scorecard_facts_with_overlap(1_000, 0).expect("facts"),
+            oracle(&mut client, 1_000)
+        );
+        // The restore: seqs 4 and 5 lost; seq 4 written again as another
+        // record, and (replaced) seq 5 too, at seq 5's old time.
+        client
+            .execute(
+                "delete from spawn_events where session_id = 'session_control'
+                   and session_seq >= 4",
+                &[],
+            )
+            .expect("restore to an earlier point");
+        record_seq(&mut client, 450, 4, &json!({"type": "task.landed", "id": 44}));
+        if replaced {
+            record_seq(&mut client, 500, 5, &json!({"type": "task.landed", "id": 55}));
+        }
+        let read = store.scorecard_facts_with_overlap(1_100, 0).expect("facts");
+        assert_eq!(read, oracle(&mut client, 1_100), "replaced {replaced}");
+        assert!(
+            by_type(&read, "task.landed")
+                .iter()
+                .all(|fact| fact["id"] != 4 && fact["id"] != 5),
+            "no lost record's fact stays: {read}"
+        );
+    }
 }
 
 /// A kept reading's statement reads what is new, not the log: the buffers
