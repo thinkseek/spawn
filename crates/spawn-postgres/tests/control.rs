@@ -4646,11 +4646,11 @@ fn a_load_sensitive_commit_is_kept_parked_and_released_on_its_task() {
             "{what}: {error}"
         );
     }
-    // A task only counting, or none, is not parked: refused.
+    // `spawn task release` (task_release): a task only counting, or none,
+    // is refused; a parked one says what it released.
     for (what, id) in [("only counting", other), ("no task", other + 1000)] {
         let error = store
-            .integrator_record(&json!({"type": "task.released", "id": id, "by": "a person",
-                                       "reason": "r"}))
+            .task_release(id, "a person", "r")
             .expect_err(what)
             .to_string();
         assert!(
@@ -4658,10 +4658,13 @@ fn a_load_sensitive_commit_is_kept_parked_and_released_on_its_task() {
             "{what}: {error}"
         );
     }
-    store
-        .integrator_record(&json!({"type": "task.released", "id": task, "by": "a person",
-                                   "reason": "the root fix landed"}))
+    let released = store
+        .task_release(task, "a person", "the root fix landed")
         .expect("released");
+    assert_eq!(released["task"], task);
+    assert_eq!(released["pushed"], json!(pushed));
+    assert_eq!(released["scenarios"], json!(["099.sh", "046.sh"]));
+    assert!(released["event"].as_i64().is_some(), "{released}");
     assert_eq!(held(&mut client, task), (None, None, None));
     assert_eq!(
         held(&mut client, other).0,

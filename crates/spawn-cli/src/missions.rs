@@ -111,6 +111,8 @@ const USAGE: &str = "usage:
   spawn task cancel --id N
       (a delivered task's resident is stopped at once, its work set aside on its branch,
        and it is told before its next task; an ephemeral worker is stopped)
+  spawn task release --id N --reason <text> [--by <name>]
+      (a task the integrator parked, load-sensitive twice on one pushed commit, is judged again)
   spawn task restart --id N [--reason <text>]
       (a delivered task's worker gets a fresh execution: its running one is stopped, its final
        checkpoint kept, and its native session resumed on its workspace. Prints the task and
@@ -935,6 +937,20 @@ pub(crate) fn task(rest: &[String]) -> Result<i32, String> {
             let task = id(&flags, "id")?;
             store.task_cancel(task).map_err(err)?;
             print(&json!({ "task": task, "cancelled": true }));
+        }
+        // A task the integrator's load-sensitive bound parked
+        // (sync/design-load-sensitive-bound.md): a person releases it, by
+        // name and with a reason, and its next gate judges it again (owner
+        // only: the store takes `task.released` from the integrator's role).
+        "release" => {
+            let task = id(&flags, "id")?;
+            let by = flags
+                .get("by")
+                .or_else(|| crate::config::env_value("USER"))
+                .filter(|by| !by.trim().is_empty())
+                .ok_or("--by NAME is required when USER is unset")?;
+            let reason = text(&flags, "reason")?;
+            print(&store.task_release(task, &by, &reason).map_err(err)?);
         }
         "restart" => {
             let task = id(&flags, "id")?;

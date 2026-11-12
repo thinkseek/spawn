@@ -2153,6 +2153,30 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// Release `task`, parked by the integrator's load-sensitive bound
+    /// (`spawn task release`, owner only): records `task.released` with
+    /// `by` and `reason`, and returns what it released, read in the same
+    /// statement: `{task, pushed, scenarios, event}`, the parked pushed
+    /// commit and every scenario found load-sensitive on it. A task that is
+    /// not parked (or none) is refused by the record's check, never a
+    /// silent no-op.
+    pub fn task_release(&self, task: i64, by: &str, reason: &str) -> Result<Value, StoreError> {
+        let record = serde_json::json!({"type": "task.released", "id": task, "by": by,
+                                        "reason": reason});
+        self.query_json(
+            "with parked as (
+                 select gate_parked_pushed, gate_load_sensitive_scenarios
+                   from mission_tasks where id = $1 for update)
+             select jsonb_build_object(
+                      'task', $1::bigint,
+                      'pushed', parked.gate_parked_pushed,
+                      'scenarios', parked.gate_load_sensitive_scenarios,
+                      'event', spawn_integrator_record($2))
+               from (select 1) one left join parked on true",
+            &[&task, &record],
+        )
+    }
+
     /// Cancel a task that is not closed yet.
     pub fn task_cancel(&self, task: i64) -> Result<(), StoreError> {
         self.execute("select spawn_task_cancel($1)", &[&task])?;
