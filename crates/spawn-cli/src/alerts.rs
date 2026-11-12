@@ -8987,7 +8987,7 @@ connections\n";
                     ("fleet_test", Url("postgres://spawn:secret-074@127.0.0.1:1/none".into())),
                 ],
                 database_floor_mb: 0,
-                database_ratio: 1_000_000,
+                database_ratio: u64::MAX,
                 ..settings()
             });
             store
@@ -8996,7 +8996,7 @@ connections\n";
                 .expect("a record in the log");
             let (mut out, mut lines) = (Vec::new(), Vec::new());
             monitor.read_databases(&store, 1000, &mut out, &mut lines);
-            assert!(out.is_empty(), "within a million times: {out:?}");
+            assert!(out.is_empty(), "within u64::MAX times: {out:?}");
             assert_eq!(lines.len(), 1, "{lines:?}");
             assert!(lines[0].starts_with("alerts: the fleet_test database's size: "), "{lines:?}");
             assert!(!lines[0].contains("secret-074"), "{lines:?}");
