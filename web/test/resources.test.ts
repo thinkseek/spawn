@@ -154,7 +154,8 @@ test("the health's storage is read as the server reports it, null from an older 
 test("the host section's Resources are followed by a Storage card drawn from storageView", () => {
   const strip = readFileSync(new URL("../src/components/fleet/HealthStrip.tsx", import.meta.url), "utf8");
   assert.match(strip, /<Cell label="Storage"[^>]*>\s*<StorageCard storage=\{health\.storage\} \/>/);
-  assert.match(strip, /const \{ rows, lasts \} = storageView\(storage\)/);
+  assert.match(strip, /const \{ rows, lasts, measured_from \} = storageView\(storage\)/);
+  assert.match(strip, /How long the disk lasts: \$\{measured_from === null \? "not measured yet" : `measured from \$\{measured_from\}`\}/);
   assert.ok(strip.indexOf('label="Resources"') < strip.indexOf('label="Storage"'));
 });
 
