@@ -4,8 +4,9 @@
 // `gate_room_*` columns: the run of `no_room` gate outcomes of one task).
 // A value the server could not read stays null: nothing here guesses one.
 //
-// Pure (one import of another pure module), tested in web/test/resources.test.ts.
+// Pure (imports of other pure modules only), tested in web/test/resources.test.ts.
 
+import { localDateTime } from "./format.ts";
 import { missionName } from "./ordering.ts";
 
 /** The line under which memory is short, when the server names none: the
@@ -159,6 +160,9 @@ export interface Storage {
   /** The free space over the persistent growth, rounded down; null without
    * one above 0. */
   days_left: number | null;
+  /** When the growth is first measured: the oldest sample of the last 7
+   * days plus a day; null without a sample (or from an older server). */
+  growth_from_ms: number | null;
 }
 
 /** A test database: the gates' (`test`) or the engines' (`fleet_test`).
@@ -224,6 +228,7 @@ export function normalizeStorage(value: unknown): Storage | null {
     },
     persistent_growth_bytes_per_day: optionalNumber(raw.persistent_growth_bytes_per_day),
     days_left: optionalNumber(raw.days_left),
+    growth_from_ms: optionalNumber(raw.growth_from_ms),
   };
 }
 
@@ -269,6 +274,9 @@ export interface StorageView {
   /** "about <days> days at the growth of the archive, Claude Code's
    * transcripts and the database"; null without days left. */
   lasts: string | null;
+  /** The local date and time the growth is first measured, while it is
+   * not yet and that moment is still ahead of the sizes' read; else null. */
+  measured_from: string | null;
 }
 
 /** The Storage card's words: what uses the disk, one row each, and how
@@ -277,6 +285,11 @@ export interface StorageView {
 export function storageView(value: unknown): StorageView {
   const storage = normalizeStorage(value);
   const growth = storage?.growth_bytes_per_day ?? null;
+  const from = storage?.growth_from_ms ?? null;
+  const readAt = storage?.read_at_ms ?? null;
+  // A moment already past promises nothing.
+  const measuredFrom =
+    growth === null && from !== null && readAt !== null && from > readAt ? localDateTime(from) : null;
   const projects = storage?.projects ?? null;
   const files = projects?.files ?? null;
   const before = projects?.before ?? null;
@@ -288,7 +301,12 @@ export function storageView(value: unknown): StorageView {
     {
       name: "Transcript archive",
       size: storageSize(storage?.archive?.bytes),
-      note: growth === null ? "not measured yet" : `grows about ${storageSize(growth)} a day`,
+      note:
+        growth !== null
+          ? `grows about ${storageSize(growth)} a day`
+          : measuredFrom !== null
+            ? `measured from ${measuredFrom}`
+            : "not measured yet",
     },
     {
       name: "Claude Code transcripts",
@@ -322,6 +340,7 @@ export function storageView(value: unknown): StorageView {
       days === null
         ? null
         : `about ${count(days)} days at the growth of the archive, Claude Code's transcripts and the database`,
+    measured_from: measuredFrom,
   };
 }
 
