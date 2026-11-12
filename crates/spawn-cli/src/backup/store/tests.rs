@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use super::{
-    Bucket, Entry, Head, Keys, Listed, Plan, Put, Source, Store, Verified, hmac_sha256, may_write,
-    plan, random_hex, ranges, restore, restore_with, sources, store_r2,
+    Bucket, Entry, Head, Keys, Listed, Plan, Put, Reader, Source, Store, Verified, create_list,
+    hmac_sha256, may_write, plan, plan_summary, put_summary, random_hex, ranges, restore,
+    restore_with, sources, store_r2, top, write_list,
 };
 use crate::backup::{hex, md5_hex};
 
@@ -31,6 +32,9 @@ impl Bucket for Memory {
         *self.writes.borrow_mut().entry(key.to_string()).or_default() += 1;
         Ok(Put::Written)
     }
+}
+
+impl Reader for Memory {
     fn head(&self, key: &str) -> Result<Option<Head>, String> {
         Ok(self.objects.borrow().get(key).map(|(bytes, sha256)| Head {
             length: bytes.len() as u64,
@@ -639,6 +643,9 @@ fn a_multipart_etag_is_refused() {
         fn put_new(&self, key: &str, file: &Path, sha256: &str) -> Result<Put, String> {
             self.0.put_new(key, file, sha256)
         }
+    }
+
+    impl Reader for Multipart {
         fn head(&self, key: &str) -> Result<Option<Head>, String> {
             Ok(self.0.head(key)?.map(|head| Head {
                 etag: format!("{}-2", head.etag),
@@ -682,6 +689,9 @@ fn a_found_object_with_a_multipart_etag_is_refused() {
         fn put_new(&self, key: &str, file: &Path, sha256: &str) -> Result<Put, String> {
             self.0.put_new(key, file, sha256)
         }
+    }
+
+    impl Reader for Found {
         fn head(&self, key: &str) -> Result<Option<Head>, String> {
             Ok(self.0.head(key)?.map(|head| Head {
                 etag: if key == self.1 {
@@ -1084,6 +1094,9 @@ fn an_object_found_by_the_conditional_put_is_adopted_only_on_its_contents() {
             }
             self.inner.put_new(key, file, sha256)
         }
+    }
+
+    impl Reader for Raced {
         fn head(&self, key: &str) -> Result<Option<Head>, String> {
             self.inner.head(key)
         }
@@ -1148,4 +1161,184 @@ fn an_object_found_by_the_conditional_put_is_adopted_only_on_its_contents() {
         fs::remove_dir_all(&dir).expect("clean up");
         fs::remove_dir_all(&work).expect("clean up");
     }
+}
+
+/// A bucket that panics at any PUT: a plan run on it proves it sent
+/// nothing (the plan's own type, [`super::ReadOnly`], has no PUT at all).
+struct Refusing<'a>(&'a Memory);
+
+impl Bucket for Refusing<'_> {
+    fn put_new(&self, key: &str, _: &Path, _: &str) -> Result<Put, String> {
+        panic!("a plan tried to write {key}");
+    }
+}
+
+impl Reader for Refusing<'_> {
+    fn head(&self, key: &str) -> Result<Option<Head>, String> {
+        self.0.head(key)
+    }
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        self.0.get(key)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<Listed>, String> {
+        self.0.list(prefix)
+    }
+}
+
+fn planner<'a>(bucket: &'a Refusing<'a>, work: &'a Path) -> Store<'a, Refusing<'a>> {
+    Store {
+        bucket,
+        keys: keys(),
+        name_key: [7; 32],
+        seal: &seal,
+        open: &open,
+        scratch: work,
+        nonce: &|| random_hex(4),
+    }
+}
+
+/// lead-mac's go, step 1: `plan` says what `put` would send, and sends
+/// nothing. After a put, one file grows, one is rewritten, one is new and
+/// one is untouched: the plan counts them as the next put will, with the
+/// bytes it would send, by top directory, over a bucket that panics at a
+/// PUT; the bucket's objects are as they were.
+#[test]
+fn a_plan_says_what_a_put_would_send_and_sends_nothing() {
+    let dir = scratch("plan");
+    let work = scratch("plan-work");
+    let bucket = Memory::default();
+    fs::create_dir_all(dir.join("agent_x")).expect("agent");
+    fs::create_dir_all(dir.join("agent_y")).expect("agent");
+    fs::write(dir.join("agent_x/a.jsonl"), b"aaaa\n").expect("a");
+    fs::write(dir.join("agent_x/b.jsonl"), b"bbbb\n").expect("b");
+    fs::write(dir.join("agent_y/c.jsonl"), b"cccc\n").expect("c");
+    store(&bucket, &work)
+        .put(&listed(&dir), 1_000)
+        .expect("the first put");
+    let before = bucket.objects.borrow().clone();
+    let writes = bucket.writes.borrow().clone();
+    // a grows; b is rewritten (another size, other bytes); d is new.
+    fs::write(dir.join("agent_x/a.jsonl"), b"aaaa\nmore\n").expect("a");
+    set_mtime(&dir.join("agent_x/a.jsonl"), 2_000_000_000);
+    fs::write(dir.join("agent_x/b.jsonl"), b"BB\n").expect("b");
+    set_mtime(&dir.join("agent_x/b.jsonl"), 2_000_000_000);
+    fs::write(dir.join("agent_y/d.jsonl"), b"dddddd\n").expect("d");
+    let refusing = Refusing(&bucket);
+    let counts = planner(&refusing, &work)
+        .plan(&listed(&dir))
+        .expect("the plan");
+    assert_eq!(
+        (
+            counts.files,
+            counts.unchanged,
+            counts.appended,
+            counts.whole
+        ),
+        (4, 1, 1, 2)
+    );
+    assert_eq!(counts.bytes, 10 + 3 + 5 + 7);
+    assert_eq!(counts.send, 5 + 3 + 7, "a's new bytes, b and d whole");
+    assert_eq!(counts.by_top["agent_x/a.jsonl"], (1, 10, 5));
+    assert_eq!(counts.by_top["agent_y/c.jsonl"], (1, 5, 0));
+    assert_eq!(
+        counts.listed,
+        [
+            ("agent_x/a.jsonl".to_string(), 10),
+            ("agent_x/b.jsonl".to_string(), 3),
+            ("agent_y/c.jsonl".to_string(), 5),
+            ("agent_y/d.jsonl".to_string(), 7),
+        ]
+    );
+    assert_eq!(*bucket.objects.borrow(), before, "nothing written");
+    assert_eq!(*bucket.writes.borrow(), writes, "no PUT");
+    fs::remove_dir_all(&dir).expect("clean up");
+    fs::remove_dir_all(&work).expect("clean up");
+}
+
+/// A path's top directory: its first two components.
+#[test]
+fn a_paths_top_is_its_first_two_components() {
+    assert_eq!(top("projects/-home-x/s.jsonl"), "projects/-home-x");
+    assert_eq!(top("projects/-home-x/sub/t.jsonl"), "projects/-home-x");
+    assert_eq!(top("history.jsonl"), "history.jsonl");
+    assert_eq!(top("agent_x/a.jsonl"), "agent_x/a.jsonl");
+}
+
+/// A plan and the put after it, nothing changed between them, agree on the
+/// files: the same counts, and their lines begin alike ("N file(s): U
+/// unchanged, G grown, W whole"), on a first run and on one after changes.
+#[test]
+fn a_plan_and_the_put_after_it_agree_on_the_files() {
+    let dir = scratch("plan-put");
+    let work = scratch("plan-put-work");
+    let bucket = Memory::default();
+    fs::create_dir_all(dir.join("agent_x")).expect("agent");
+    fs::write(dir.join("agent_x/a.jsonl"), b"aaaa\n").expect("a");
+    fs::write(dir.join("agent_x/b.jsonl"), b"bbbb\n").expect("b");
+    for round in 0..2 {
+        if round == 1 {
+            fs::write(dir.join("agent_x/a.jsonl"), b"aaaa\nmore\n").expect("a");
+            set_mtime(&dir.join("agent_x/a.jsonl"), 2_000_000_000);
+            fs::write(dir.join("agent_x/c.jsonl"), b"cc\n").expect("c");
+        }
+        let refusing = Refusing(&bucket);
+        let planned = planner(&refusing, &work)
+            .plan(&listed(&dir))
+            .expect("the plan");
+        let put = store(&bucket, &work)
+            .put(&listed(&dir), 1_000 + round)
+            .expect("the put");
+        assert_eq!(
+            (
+                planned.files,
+                planned.unchanged,
+                planned.appended,
+                planned.whole
+            ),
+            (put.files, put.unchanged, put.appended, put.whole),
+            "round {round}"
+        );
+        let first = |line: String| line.split(';').next().map(str::to_string);
+        assert_eq!(
+            first(plan_summary(&planned)),
+            first(put_summary(&put)),
+            "round {round}"
+        );
+    }
+    fs::remove_dir_all(&dir).expect("clean up");
+    fs::remove_dir_all(&work).expect("clean up");
+}
+
+/// `--list`: a new file, mode 0600, a line per path with its size; an entry
+/// already at the name (a file, a symlink) is refused and left as it is.
+#[test]
+fn the_plans_list_is_a_new_private_file_never_written_over() {
+    use std::io::Read as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = scratch("plan-list");
+    let at = dir.join("list.txt");
+    let mut file = create_list(&at).expect("new");
+    write_list(
+        &mut file,
+        &[("a/b.jsonl".to_string(), 3), ("tab\tname".to_string(), 0)],
+    )
+    .expect("written");
+    let mut text = String::new();
+    fs::File::open(&at)
+        .expect("read")
+        .read_to_string(&mut text)
+        .expect("read");
+    assert_eq!(text, "3\t\"a/b.jsonl\"\n0\t\"tab\\tname\"\n");
+    assert_eq!(
+        fs::metadata(&at).expect("mode").permissions().mode() & 0o777,
+        0o600
+    );
+    let error = create_list(&at).unwrap_err();
+    assert!(error.contains("never written over"), "{error}");
+    assert_eq!(fs::read_to_string(&at).expect("kept"), text);
+    let link = dir.join("link.txt");
+    std::os::unix::fs::symlink(dir.join("target.txt"), &link).expect("link");
+    assert!(create_list(&link).is_err());
+    assert!(!dir.join("target.txt").exists(), "created through the link");
+    fs::remove_dir_all(&dir).expect("clean up");
 }
