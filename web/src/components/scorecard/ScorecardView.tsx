@@ -32,7 +32,7 @@ import {
   showValue,
   trendMark,
 } from "../../scorecard";
-import { tileNote } from "../../scorecardFormat";
+import { ownerRunsTileNote, tileNote } from "../../scorecardFormat";
 import type { GateSpending } from "../../scorecardFormat";
 import { Fact, SectionLabel } from "../fleet/bits";
 import { Collapsible } from "../missions/parts";
@@ -225,6 +225,8 @@ export function ScorecardView({
                       scope={scope}
                       minN={data.min_n}
                       title={scope.mission === null ? null : (titles.get(scope.mission) ?? null)}
+                      sinceMs={data.since_ms}
+                      ownerRunsFromMs={data.owner_runs_from_ms}
                     />
                   ))}
                 <QuietScopes
@@ -421,10 +423,14 @@ function ScopeCard({
   scope,
   minN,
   title,
+  sinceMs,
+  ownerRunsFromMs,
 }: {
   scope: ScorecardScope;
   minN: number;
   title: string | null;
+  sinceMs: number | null;
+  ownerRunsFromMs: number | null | undefined;
 }) {
   const landings = scope.dimensions.throughput.n;
   return (
@@ -449,7 +455,13 @@ function ScopeCard({
 
       <div className="grid grid-cols-1 gap-3 p-3 sm:grid-cols-2 sm:p-4 xl:grid-cols-4">
         {DIMENSION_KEYS.map((key) => (
-          <DimensionTile key={key} dimKey={key} dimensions={scope.dimensions} minN={minN} />
+          <DimensionTile
+            key={key}
+            dimKey={key}
+            dimensions={scope.dimensions}
+            minN={minN}
+            ownerNote={ownerRunsTileNote(key, sinceMs, ownerRunsFromMs)}
+          />
         ))}
       </div>
 
@@ -470,10 +482,13 @@ function DimensionTile({
   dimKey,
   dimensions,
   minN,
+  ownerNote,
 }: {
   dimKey: DimensionKey;
   dimensions: Dimensions;
   minN: number;
+  /** Gate time's owner-runs note (objective 076), beside the owner's runs. */
+  ownerNote: string | null;
 }) {
   const dimension = dimensions[dimKey];
   const info = DIMENSION_INFO[dimKey];
@@ -582,6 +597,11 @@ function DimensionTile({
             )}
           </div>
         ))}
+        {ownerNote && (
+          <p className="text-micro text-warning" role="note" title={ownerNote}>
+            {ownerNote}
+          </p>
+        )}
       </div>
     </section>
   );

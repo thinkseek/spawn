@@ -19,7 +19,10 @@ use crate::PostgresStore;
 /// total` line names (scripts/stage.sh, scripts/rsi/gate.sh). A
 /// `legacy.imported` row (from before the control stream) lends its own
 /// fields, plus its `state` and times. Records of no measure (reports,
-/// residents, halts, host facts) are left out.
+/// residents, halts, host facts) are left out. `owner_runs_from_ms` is the
+/// time of the earliest owner judging (`source.moved`,
+/// `source.push_refused`) that names its gate's wall clock, read over the
+/// whole log, not up to `$1`; null when none does.
 const FACTS: &str = r"
 with h as materialized (
   select u.id, i.intent, i.at_ms
@@ -107,7 +110,17 @@ select jsonb_build_object(
        and (c.principal in ('human', 'spawn')
             or r.succeeded is false
             or (c.principal = 'spawn-dispatch'
-                and (c.idempotency_key like 'deliver-%' or t.stalls is not null)))))";
+                and (c.idempotency_key like 'deliver-%' or t.stalls is not null)))),
+  -- From when the owner's judgings are counted (objective 076): the
+  -- earliest owner judging that carries its gate's wall clock, whatever
+  -- `$1` is; null when none does.
+  'owner_runs_from_ms', (
+    select min(e.recorded_at_ms)
+      from spawn_events e
+     cross join lateral (select e.kind -> 'detail' -> 'record' as r offset 0) x
+     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+       and x.r ->> 'type' in ('source.moved', 'source.push_refused')
+       and jsonb_typeof(x.r -> 'gate_ms') = 'number'))";
 
 impl PostgresStore {
     /// The database's clock (`spawn_now_ms()`), in epoch milliseconds: the
