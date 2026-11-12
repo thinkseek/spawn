@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import type { CostAnswer, CostEntry } from "../src/cost.ts";
-import { compactCount, costView, unpricedShort } from "../src/cost.ts";
+import { compactCount, costView, rowLines, unpricedShort } from "../src/cost.ts";
 
 function entry(usd: number, unpriced: number): CostEntry {
   return { usd, tokens: { input: 100_000 + unpriced, output: 0, cache_write: 0, cache_read: 0 }, unpriced_tokens: unpriced };
@@ -99,4 +99,57 @@ test("(c) the page's unpriced mark sits on the row's second line, its full count
   assert.match(page, /"tnum ml-auto shrink-0 whitespace-nowrap"/);
   assert.match(page, /first\.label \? "shrink-0" : "min-w-0 truncate"/);
   assert.match(page, /<span className="min-w-0 flex-1 truncate text-foreground" title=\{first\.label\}>/);
+});
+
+// Objective 079: a row's first line is its key, label, amount and share;
+// its unpriced text and per-landing text go on a second line.
+test("rowLines: the amount and share on the first line, the mark and per-landing text on the second", () => {
+  const raw = answer();
+  raw.missions = [
+    { mission: 1, name: "Bb Alpha", landed: 56, usd_per_landing: 10.11, ...entry(566.2, 1_463_163_060) },
+    { mission: 3, name: null, landed: 0, usd_per_landing: null, ...entry(0.3, 0) },
+  ] as CostAnswer["missions"];
+  raw.tasks = [
+    { task: 1, mission: 1, label: "T1 label", ...entry(0.3, 0) },
+    { task: 2, mission: 1, label: "T2 label", ...entry(0, 500_000) },
+  ];
+  const view = costView(raw);
+  const first = (row: (typeof view.missions)[number]) => ({ key: row.key, label: row.label, usd: row.usd, share: row.share });
+  const mission = view.missions.find((row) => row.key === "#1")!;
+  // A mission row with both: its unpriced text, then its per-landing text.
+  assert.deepEqual(rowLines(mission), {
+    first: first(mission),
+    second: ["+ 1,463,163,060 tokens unpriced", "$10.11 per landing (56 landed)"],
+  });
+  assert.equal(rowLines(mission).first.usd, "$566.20");
+  // A mission row with only its per-landing text.
+  const other = view.missions.find((row) => row.key === "#3")!;
+  assert.deepEqual(rowLines(other), { first: first(other), second: ["no landing in the window"] });
+  // A task row with only an unpriced mark, and one with neither.
+  const t2 = view.tasks.find((row) => row.key === "T2")!;
+  assert.deepEqual(rowLines(t2), { first: first(t2), second: ["+ 500,000 tokens unpriced"] });
+  assert.equal(rowLines(t2).first.usd, "unpriced");
+  const t1 = view.tasks.find((row) => row.key === "T1")!;
+  assert.deepEqual(rowLines(t1), { first: first(t1), second: [] });
+  // An agent row: its unpriced text or nothing; never a per-landing text.
+  for (const agent of view.agents) {
+    assert.deepEqual(rowLines(agent).second, agent.unpriced_text ? [agent.unpriced_text] : [], agent.key);
+  }
+  // What the rows say is unchanged: rowLines only splits them.
+  assert.deepEqual(
+    view.tasks.map((row) => row.key),
+    costView(raw).tasks.map((row) => row.key),
+  );
+});
+
+test("the Cost page renders each row from rowLines, the amount and share on the first line, every column min-w-0", () => {
+  const page = readFileSync(new URL("../src/components/cost/CostView.tsx", import.meta.url), "utf8");
+  assert.match(page, /const \{ first, second \} = rowLines\(row\);/);
+  // The amount never shrinks; the label truncates and keeps its full text.
+  assert.match(page, /"tnum ml-auto shrink-0 whitespace-nowrap"/);
+  assert.match(page, /truncate text-foreground" title=\{first\.label\}/);
+  // The second line only when there is one, wrapping.
+  assert.match(page, /\{second\.length > 0 && \(\s*<div className="[^"]*flex-wrap/);
+  // Every grid column is min-w-0.
+  assert.match(page, /grid grid-cols-1 lg:grid-cols-3 \[&>\*\]:min-w-0/);
 });
