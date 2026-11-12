@@ -343,7 +343,7 @@ done
 # - $BB_WORK/fault-alloc: the next tool allocates 256 MiB (the memory-limit
 #   fault, where an envelope can confine it).
 # $BB_WORK/soak-over ends the work: the turn ends and no new one works.
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 settings=
@@ -446,7 +446,7 @@ work() {
 printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     if [ "$pending" = 0 ]; then
       line '"type":"user","message":{"role":"user","content":"prompt"}'

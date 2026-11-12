@@ -251,7 +251,7 @@ mkdir -p "$WORK/claude-config" "$WORK/ctl" "$WORK/state"
 # (`turn_duration`). Call k of a turn uses 1000 + k input tokens and 7
 # output tokens. Every prompt, call and turn end is logged (engine.log: ms
 # agent what).
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -299,7 +299,7 @@ turn() { # <the prompt's text>
 printf 'Welcome to Claude Code\n\n❯ '
 buffer=""
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     buffer="${buffer:+$buffer
 }$typed"
   elif [ -n "$buffer" ]; then
