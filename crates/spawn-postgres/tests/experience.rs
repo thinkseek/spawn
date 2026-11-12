@@ -1580,6 +1580,16 @@ fn windows_read(weeks: i64, windows: &[(i64, i64)]) -> Vec<WindowRead> {
 /// only `mission_id is not null` on the first. A walk on a column that does
 /// not lead shows in the buffers alone; the growth test before counted rows,
 /// on the log's last day (nothing after it to walk), and passed.
+///
+/// What it does not see (the lead's plan on the live copy, 6257004a): there
+/// the two window scans (owner_task's and cancel_reassign's) took _brief
+/// with the time as a filter, every assignment of the log at about 4 us
+/// each (1.4 ms a scan today). Here both take
+/// spawn_events_control_record_type at every placement tried (mid-log 7
+/// days and 24 h, the last 24 h of 2 and of 4 weeks: 260 against 262
+/// buffers), so the plan differs from live's on its statistics, not by
+/// the 10% bound; the last day shows nothing either, so no placement pins
+/// it.
 #[test]
 fn a_window_costs_the_same_whatever_history_follows_it() {
     let windows = [(7, 14), (7, 8)];
