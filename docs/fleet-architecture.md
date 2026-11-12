@@ -1163,7 +1163,16 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   (`cleared_evidence.event_id` that record) or its close; a restart reads
   the mission's last ending from the store and an open one back, firing
   nothing again; Home's Needs you shows it, and the Missions card says how
-  long each idle backlog mission has had no work), and `message_not_taken`
+  long each idle backlog mission has had no work), `owner_request_waiting`
+  (S23; subject the source, key `owner_request_waiting:<request>`: an
+  owner's landing request, `source.push_requested`, that no `source.moved`
+  or `source.push_refused` has named for `SPAWN_ALERT_OWNER_REQUEST_SECS`,
+  default 3600; deploy-on-landing waits for such a request unless main
+  holds its commit already, so this is every deploy waiting on it;
+  evidence `request`, `commit`, `requested_ms` and `withdraw`, the
+  `spawn mission push --withdraw <request>` that ends it; once per
+  request; cleared at its outcome, which a restarted step reads from the
+  store), and `message_not_taken`
   (below, "Messages"). Each fires once per
   occurrence and clears with the record or reading that cleared it; a
   threshold of `0` disables its check.
@@ -1283,7 +1292,9 @@ A message's id is its command's id, carried end to end:
   finished before it was the older Spawn's to type, and is not.
 - **The alert.** The alerts step raises `message_not_taken` (subject the
   session, key `message_not_taken:<command id>`, evidence the command, the
-  agent, the session and whether it was typed) once per message when it
+  agent, the session, whether it was typed and, typed, how many transcript
+  lines the Bridge recorded since the typing, `read_since_typed`, at most
+  100 counted) once per message when it
   becomes not taken while its session has not ended with it; it clears when
   the message is taken, or when the session ends with it untaken (the
   execution it was typed into, or its own start's, ended; a never-typed one
@@ -1296,6 +1307,10 @@ A message's id is its command's id, carried end to end:
   or ended an execution since (an idle pass reads next to nothing, objective
   023). An open one reaches
   `/api/alerts` and Home's Needs you, which names the agent and the message.
+  A typed one with no line read since (S17) is not said as not taken:
+  its text and Home's title ("Spawn has read nothing of a transcript since
+  a message was typed") say whether the agent took it is unknown, since
+  either Spawn is not reading the transcript or the engine wrote nothing.
   Out of scope: what a reply says, and retrying a message not taken.
 - **Acted: the agent's own answer (objective 046).** Answered says the turn
   a message started ended, not that the agent did what it asked. The agent

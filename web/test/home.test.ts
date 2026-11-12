@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import type { Alert } from "../src/api.ts";
@@ -829,4 +830,86 @@ test("an owner landing's old per-mission validator alerts are one item in Needs 
     [],
     "cleared, Needs you holds no validator item",
   );
+});
+
+test("missions today: each task in flight counts its conflict verdicts and says so from two (objective 069)", () => {
+  const gated = (verdict: string, hoursAgo: number) =>
+    ({ stage: "gated", verdict, at_ms: NOW - hoursAgo * HOUR, took_ms: null }) as MissionTask["stages"][number];
+  const reviewed = (verdict: string, hoursAgo: number) =>
+    ({ stage: "reviewed", verdict, at_ms: NOW - hoursAgo * HOUR, took_ms: null }) as MissionTask["stages"][number];
+  const model = missionsToday(
+    missions([
+      mission(4, "RSI", [
+        task(1, "reported"),
+        task(2, "revise", { stages: [gated("conflict", 5)] }),
+        task(3, "reported", { stages: [gated("conflict", 6), gated("conflict", 4)] }),
+        task(4, "revise", { stages: [gated("conflict", 8), gated("conflict", 6), gated("conflict", 4)] }),
+        task(5, "revise", { stages: [gated("rejected", 6), gated("incompatible", 4), gated("conflict", 3)] }),
+        task(6, "revise", { stages: [gated("conflict", 6), reviewed("conflict", 4), reviewed("rejected", 3)] }),
+        task(7, "landed", { stages: [gated("conflict", 6), gated("conflict", 4), gated("accepted", 3)] }),
+      ]),
+    ]),
+    NOW,
+  );
+  assert.deepEqual(
+    model.rows[0].inFlight.map(({ task_id, conflicts, conflictText }) => [task_id, conflicts, conflictText]),
+    [
+      [1, 0, null],
+      [2, 1, null],
+      [3, 2, "sent back 2 times as a conflict"],
+      [4, 3, "sent back 3 times as a conflict"],
+      [5, 1, null],
+      [6, 1, null],
+    ],
+    "rejected, incompatible and reviewed send-backs do not count; a landed task is not in flight",
+  );
+});
+
+test("Home's in-flight line shows the conflict text beside the task's state, in the warning tone", () => {
+  const home = readFileSync(new URL("../src/components/home/Home.tsx", import.meta.url), "utf8");
+  const line = home.slice(home.indexOf("row.inFlight.map"), home.indexOf("row.lastRejection &&"));
+  assert.match(line, /\{task\.conflictText && \(\s*<span className="[^"]*text-warning[^"]*"[^>]*>\s*\{task\.conflictText\}/);
+  assert.ok(line.indexOf("task.conflictText") < line.indexOf("{task.state}"), "the text sits beside the state");
+});
+
+test("an owner's landing request waiting for its verdict has its own title, and the withdrawal as its command (S24)", () => {
+  const waiting = alert("owner_request_waiting:135555", "owner_request_waiting", "/live/missions/spawn.git", {
+    evidence: {
+      request: 135555,
+      commit: "a9e3c0c7",
+      withdraw: "spawn mission push --withdraw 135555",
+      // A command field it does not have must not be read instead.
+    },
+    text: "the owner's landing request #135555 (a9e3c0c7) on /live/missions/spawn.git has had no outcome for 1 h",
+  });
+  const items = needsYou({ ...base, alerts: [waiting] });
+  assert.equal(items.length, 1);
+  assert.equal(items[0].title, "An owner's landing waits for its verdict · /live/missions/spawn.git");
+  assert.equal(items[0].command, "spawn mission push --withdraw 135555");
+  assert.equal(items[0].tone, "act");
+  assert.equal(items[0].detail, waiting.text);
+  // Another kind's `withdraw` is no command of its own.
+  const other = alert("x:1", "deploy_failed", "deploy", { evidence: { withdraw: "spawn mission push --withdraw 1" } });
+  assert.equal(needsYou({ ...base, alerts: [other] })[0].command, null);
+});
+
+test("a message not taken says whether Spawn read the transcript since it was typed, from the alert's own evidence (S17)", () => {
+  const unread = alert("message_not_taken:41", "message_not_taken", "session_resident", {
+    evidence: { command: 41, typed: true, read_since_typed: 0 },
+  });
+  const heard = alert("message_not_taken:42", "message_not_taken", "session_worker", {
+    evidence: { command: 42, typed: true, read_since_typed: 3 },
+  });
+  const older = alert("message_not_taken:43", "message_not_taken", "session_old", {
+    evidence: { command: 43, typed: true },
+  });
+  assert.equal(alertTitle(unread), "Spawn has read nothing of a transcript since a message was typed · session_resident");
+  assert.equal(alertTitle(heard), "A message was not taken · session_worker");
+  assert.equal(alertTitle(older), "A message was not taken · session_old", "no evidence: said as before, never guessed");
+  assert.equal(alertTitle({ kind: "message_not_taken", subject: "s" }), "A message was not taken · s");
+  const titles = needsYou({ ...base, alerts: [unread, heard] }).map((item) => item.title);
+  assert.deepEqual(titles, [
+    "Spawn has read nothing of a transcript since a message was typed · session_resident",
+    "A message was not taken · session_worker",
+  ]);
 });

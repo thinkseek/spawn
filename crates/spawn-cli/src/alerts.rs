@@ -206,6 +206,18 @@
 //!   `SPAWN_ALERT_MISSION_IDLE_SECS` (default 900; 0 disables it). Never for
 //!   owner work. Clears at the mission's next `task.assigned` or its
 //!   close. A restart reads when the last task ended from the store.
+//! - `owner_request_waiting`, the source, key
+//!   `owner_request_waiting:<request>` (S23): an owner's landing request
+//!   (`source.push_requested`, `spawn mission push`) that has had no outcome
+//!   (no `source.moved` or `source.push_refused` names it) for
+//!   `SPAWN_ALERT_OWNER_REQUEST_SECS` (default 3600, longer than a gate and
+//!   its backoff; 0 disables it): deploy-on-landing waits for such a
+//!   request (deploy/on-landing.sh), so the integrator down or a judging
+//!   that never ends stops every deploy. Evidence the request, its commit
+//!   and the withdrawal that ends it (`spawn mission push --withdraw
+//!   <request>`). Once per request; clears at its outcome. A restart reads
+//!   the pending requests from the store (the integrator's queue) and
+//!   clears an open one whose request ended meanwhile, naming the outcome.
 //! - `cost_budget`, `mission #<id>`, key `cost_budget:<mission>:<the UTC
 //!   day, YYYY-MM-DD>`: at a reading (every `SPAWN_ALERT_CHECK_SECS`), the
 //!   mission's cost of the model calls timed in the current UTC day
@@ -220,7 +232,12 @@
 //!   (objective 045): a message (what the Bridge types for a command, with
 //!   its marker) that no `message.taken` names `SPAWN_MESSAGE_TAKEN_SECS`
 //!   (default 120) after it was recorded (`spawn_command_message`): typed
-//!   and never taken, or never typed. A command an older Spawn typed carries
+//!   and never taken, or never typed. A typed one's evidence says how many
+//!   transcript lines the Bridge recorded since the typing
+//!   (`read_since_typed`, at most 100 counted, S17): with none, its text
+//!   says Spawn has read nothing of the transcript since and cannot tell
+//!   whether the agent took it, rather than that it did not. A command an
+//!   older Spawn typed carries
 //!   no marker (no `message.typed`) and is never one, nor is one sent while
 //!   its session's transcript had held no marker yet. Once per message;
 //!   clears when it is taken, or when its session ends with it untaken (the
@@ -335,6 +352,9 @@ pub(crate) struct Settings {
     /// How long a mission that takes its work from an objective backlog may
     /// have no task in work (0: never alerted).
     pub(crate) mission_idle_ms: i64,
+    /// How long an owner's landing request may have no outcome (0: never
+    /// alerted).
+    pub(crate) owner_request_ms: i64,
     /// The window `spawn alerts --once` shows.
     pub(crate) window_ms: i64,
     /// The two database logs, when named.
@@ -396,6 +416,7 @@ impl Settings {
             integrator_down_ms: secs("SPAWN_ALERT_INTEGRATOR_DOWN_SECS", 300, &mut warnings),
             controller_behind_ms: secs("SPAWN_ALERT_CONTROLLER_BEHIND_SECS", 1800, &mut warnings),
             mission_idle_ms: secs("SPAWN_ALERT_MISSION_IDLE_SECS", 900, &mut warnings),
+            owner_request_ms: secs("SPAWN_ALERT_OWNER_REQUEST_SECS", 3600, &mut warnings),
             window_ms: secs("SPAWN_ALERT_WINDOW_SECS", 86_400, &mut warnings),
             test_log: env_value("SPAWN_TEST_DATABASE_LOG").map(PathBuf::from),
             live_log: env_value("SPAWN_DATABASE_LOG").map(PathBuf::from),
@@ -568,6 +589,10 @@ pub(crate) struct Monitor {
     admitted: HashMap<String, Pending>,
     /// The model judge's `down` records with no `up` after them, by judge.
     judge_down: HashMap<String, Pending>,
+    /// The owner's landing requests with no outcome yet, by request (its
+    /// event id): subject the source, evidence its commit
+    /// (`owner_request_waiting`).
+    owner_requests: BTreeMap<i64, Pending>,
     /// An open (or pending) model-login alert key, by execution id.
     auth: HashMap<String, String>,
     /// The open (or pending) `scenario_red` key, by mission and scenario.
@@ -708,6 +733,7 @@ impl Monitor {
             missions: HashMap::new(),
             admitted: HashMap::new(),
             judge_down: HashMap::new(),
+            owner_requests: BTreeMap::new(),
             auth: HashMap::new(),
             red: HashMap::new(),
             defects: Vec::new(),
@@ -899,6 +925,9 @@ impl Monitor {
             .map_err(|error| error.to_string())?;
         self.messages(&messages, &mut events);
         self.watermark = store.alert_clock().map_err(|error| error.to_string())?.0;
+        // Read after the watermark: a request or an outcome recorded since
+        // is in both reads, and folds the same.
+        self.seed_owner_requests(store, now, &mut events)?;
         for log in &mut self.logs {
             let open = self
                 .known
@@ -945,7 +974,12 @@ impl Monitor {
                 self.auth_record(event_id, record, out);
             }
             "host.judge" => self.judge_record(event_id, at_ms, record, out),
-            "source.moved" => self.owner_landing(event_id, record, out),
+            "source.moved" => {
+                self.owner_request_ended(event_id, record, out);
+                self.owner_landing(event_id, record, out);
+            }
+            "source.push_requested" => self.owner_request(event_id, at_ms, record),
+            "source.push_refused" => self.owner_request_ended(event_id, record, out),
             _ => {}
         }
     }
@@ -2189,6 +2223,10 @@ times in a row)",
             let agent = message["agent_id"].as_str().unwrap_or_default();
             let action = message["action"].as_str().unwrap_or("input");
             let secs = self.settings.message_taken_ms / 1000;
+            // The Bridge's own record (S17): the transcript lines it read
+            // after the typing. None read: Spawn cannot tell whether the
+            // agent took it, so the alert says that and not that it did not.
+            let read = message["read_since_typed"].as_i64();
             out.push(Event::Fire {
                 key,
                 kind: "message_not_taken",
@@ -2201,11 +2239,26 @@ times in a row)",
                     "action": action, "typed": typed,
                     "recorded_at_ms": message["created_at_ms"],
                     "bound_ms": self.settings.message_taken_ms,
+                    "read_since_typed": read,
                 }),
-                text: if typed {
+                text: if typed && read == Some(0) {
                     format!(
-                        "{agent} has not taken message #{id} (its {action}): typed, and no \
-                         transcript line holds its marker {secs} s after it was sent"
+                        "message #{id} to {agent} (its {action}) was typed, and {secs} s after \
+                         it was sent Spawn has read no line of {agent}'s transcript since the \
+                         typing: whether {agent} took it is unknown. Either Spawn is not reading \
+                         that transcript (the Bridge follows it), or the engine has written \
+                         nothing since"
+                    )
+                } else if typed {
+                    format!(
+                        "{agent} has not taken message #{id} (its {action}): typed, and the \
+                         transcript lines Spawn has read since ({}) hold no marker of it {secs} s \
+                         after it was sent",
+                        match read {
+                            Some(100) => "100 or more".to_string(),
+                            Some(lines) => lines.to_string(),
+                            None => "a number not read".to_string(),
+                        }
                     )
                 } else {
                     format!(
@@ -2223,6 +2276,117 @@ times in a row)",
             self.messages_since = now.saturating_sub(MESSAGES_MARGIN_MS);
         }
         self.messages_due = self.pending.values().copied().min();
+    }
+
+    /// The owner's landing requests with no outcome, as the store has them
+    /// on start (`source_pushes_pending`, the integrator's queue); an open
+    /// `owner_request_waiting` whose request ended while the loop was down
+    /// clears, naming that outcome.
+    fn seed_owner_requests(
+        &mut self,
+        store: &PostgresStore,
+        now: i64,
+        out: &mut Vec<Event>,
+    ) -> Result<(), String> {
+        let pending = store
+            .source_pushes_pending()
+            .map_err(|error| error.to_string())?;
+        for request in pending.as_array().into_iter().flatten() {
+            let Some(id) = request["request"].as_i64() else {
+                continue;
+            };
+            self.owner_requests.entry(id).or_insert(Pending {
+                event_id: id,
+                at_ms: request["at_ms"].as_i64().unwrap_or(now),
+                subject: request["source"].as_str().unwrap_or_default().to_string(),
+                evidence: json!({"commit": request["commit"]}),
+            });
+        }
+        let ended: Vec<(String, i64)> = self
+            .known
+            .iter()
+            .filter(|(_, row)| row.open() && row.kind == "owner_request_waiting")
+            .filter_map(|(key, row)| Some((key.clone(), row.evidence["request"].as_i64()?)))
+            .filter(|(_, request)| !self.owner_requests.contains_key(request))
+            .collect();
+        for (key, request) in ended {
+            let outcome = store
+                .source_push_outcome(request)
+                .map_err(|error| error.to_string())?;
+            if let Some(outcome) = outcome {
+                out.push(Event::Clear {
+                    key,
+                    evidence: json!({"event_id": outcome["event_id"], "record": outcome["type"],
+                                     "request": request}),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// A `source.push_requested`: the owner's landing request, pending
+    /// until its outcome (`owner_request_waiting`).
+    fn owner_request(&mut self, event_id: i64, at_ms: i64, record: &Value) {
+        self.owner_requests.entry(event_id).or_insert(Pending {
+            event_id,
+            at_ms,
+            subject: record["source"].as_str().unwrap_or_default().to_string(),
+            evidence: json!({"commit": record["commit"]}),
+        });
+    }
+
+    /// A `source.moved` or `source.push_refused` that names a request: its
+    /// outcome. The request is no longer pending, and its alert clears.
+    fn owner_request_ended(&mut self, event_id: i64, record: &Value, out: &mut Vec<Event>) {
+        let Some(request) = record["request"].as_i64() else {
+            return;
+        };
+        self.owner_requests.remove(&request);
+        let key = format!("owner_request_waiting:{request}");
+        if self.is_open(&key) {
+            out.push(Event::Clear {
+                key,
+                evidence: json!({"event_id": event_id, "record": record["type"],
+                                 "request": request}),
+            });
+        }
+    }
+
+    /// The owner's landing requests that have had no outcome for
+    /// `SPAWN_ALERT_OWNER_REQUEST_SECS` (`owner_request_waiting`), once each.
+    fn owner_request_bounds(&self, now: i64, out: &mut Vec<Event>) {
+        let bound = self.settings.owner_request_ms;
+        if bound <= 0 {
+            return;
+        }
+        for (request, pending) in &self.owner_requests {
+            let key = format!("owner_request_waiting:{request}");
+            if now < pending.at_ms.saturating_add(bound) || self.known.contains_key(&key) {
+                continue;
+            }
+            let waited = now.saturating_sub(pending.at_ms);
+            let commit = pending.evidence["commit"].as_str().unwrap_or_default();
+            let withdraw = format!("spawn mission push --withdraw {request}");
+            out.push(Event::Fire {
+                key,
+                kind: "owner_request_waiting",
+                subject: pending.subject.clone(),
+                evidence: json!({
+                    "request": request, "source": pending.subject, "commit": commit,
+                    "requested_ms": pending.at_ms, "waited_ms": waited,
+                    "threshold_ms": bound, "event_id": request, "withdraw": withdraw,
+                }),
+                text: format!(
+                    "the owner's landing request #{request} ({}) on {} has had no outcome for \
+                     {}: deploy-on-landing waits for it unless main holds its commit already \
+                     (S23). Its verdict ends it, or `{withdraw}`",
+                    commit.get(..12).unwrap_or(commit),
+                    pending.subject,
+                    idle_words(waited)
+                ),
+                notice: false,
+            });
+        }
     }
 
     /// The model judge's `down` records that reached their bound
@@ -2323,6 +2487,7 @@ times in a row)",
             });
         }
         self.judge_bounds(now, out);
+        self.owner_request_bounds(now, out);
         for (subject, max_age) in [
             ("dump", self.settings.dump_max_age_ms),
             ("bundle", self.settings.bundle_max_age_ms),
@@ -3273,6 +3438,16 @@ times in a row)",
                 next = next.min(pending.at_ms.saturating_add(self.settings.judge_down_ms));
             }
         }
+        if self.settings.owner_request_ms > 0 {
+            for (request, pending) in &self.owner_requests {
+                if !self
+                    .known
+                    .contains_key(&format!("owner_request_waiting:{request}"))
+                {
+                    next = next.min(pending.at_ms.saturating_add(self.settings.owner_request_ms));
+                }
+            }
+        }
         for (subject, max_age) in [
             ("dump", self.settings.dump_max_age_ms),
             ("bundle", self.settings.bundle_max_age_ms),
@@ -4121,6 +4296,7 @@ mod tests {
             integrator_down_ms: 300_000,
             controller_behind_ms: 1_800_000,
             mission_idle_ms: 900_000,
+            owner_request_ms: 3_600_000,
             window_ms: 86_400_000,
             test_log: None,
             live_log: None,
@@ -6699,6 +6875,115 @@ connections\n";
                 && evidence["nothing_to_dispatch"] == true));
     }
 
+    /// `owner_request_waiting` (S23): an owner's landing request with no
+    /// outcome fires once at SPAWN_ALERT_OWNER_REQUEST_SECS after it was
+    /// recorded, never before, naming the withdrawal that ends it; the step
+    /// plans its pass for that time; its outcome (a `source.moved` naming
+    /// it) clears it; one refused before its bound fires nothing; a
+    /// `source.push_no_verdict` is no outcome; 0 disables the check.
+    #[test]
+    fn an_owner_request_with_no_outcome_for_its_bound_fires_once_and_its_outcome_clears_it() {
+        let mut monitor = monitor();
+        let source = "/live/missions/spawn.git";
+        let commit_a = "a".repeat(40);
+        for (event_id, record) in [
+            (
+                10,
+                json!({"type": "source.push_requested", "source": source, "commit": commit_a,
+                       "ref": format!("refs/spawn-owner/{commit_a}")}),
+            ),
+            (
+                11,
+                json!({"type": "source.push_requested", "source": source, "commit": "b".repeat(40),
+                       "ref": "refs/spawn-owner/b"}),
+            ),
+            (
+                12,
+                json!({"type": "source.push_refused", "request": 11, "reason": "a conflict"}),
+            ),
+            (
+                13,
+                json!({"type": "source.push_no_verdict", "request": 10, "reason": "host fault"}),
+            ),
+        ] {
+            assert!(feed(&mut monitor, event_id, 1000, record).is_empty());
+        }
+        monitor.plan(1000);
+        assert_eq!(
+            monitor.next_bound_ms,
+            Some(1000 + 3_600_000),
+            "planned at its bound"
+        );
+        let mut early = Vec::new();
+        monitor.bounds(1000 + 3_599_999, &mut early);
+        assert!(early.is_empty(), "never before its bound: {early:?}");
+        let mut due = Vec::new();
+        monitor.bounds(1000 + 3_600_000, &mut due);
+        assert_eq!(
+            fires(&due),
+            ["owner_request_waiting:10"],
+            "the refused one fires nothing"
+        );
+        let Event::Fire {
+            subject,
+            evidence,
+            text,
+            ..
+        } = &due[0]
+        else {
+            panic!("a fire");
+        };
+        assert_eq!(subject, source);
+        assert_eq!(evidence["request"], 10);
+        assert_eq!(evidence["commit"], commit_a.as_str());
+        assert_eq!(evidence["event_id"], 10);
+        assert_eq!(evidence["waited_ms"], 3_600_000);
+        assert_eq!(evidence["withdraw"], "spawn mission push --withdraw 10");
+        assert!(
+            text.contains(
+                "request #10 (aaaaaaaaaaaa) on /live/missions/spawn.git has had no outcome for 1 h"
+            ) && text.contains("`spawn mission push --withdraw 10`"),
+            "{text}"
+        );
+        let recorded = decided(&monitor, due);
+        commit(&mut monitor, &recorded);
+        let mut again = Vec::new();
+        monitor.bounds(1000 + 7_200_000, &mut again);
+        assert!(decided(&monitor, again).is_empty(), "once per request");
+        monitor.plan(1000 + 7_200_000);
+        assert_eq!(monitor.next_bound_ms, None, "nothing left to plan");
+
+        let moved = feed(
+            &mut monitor,
+            20,
+            9000,
+            json!({"type": "source.moved", "source": source, "from": "c".repeat(40),
+                   "to": commit_a, "request": 10, "by": "human"}),
+        );
+        let cleared = decided(&monitor, moved);
+        assert!(
+            matches!(&cleared[..], [Event::Clear { key, evidence }]
+                if key == "owner_request_waiting:10" && evidence["event_id"] == 20
+                    && evidence["record"] == "source.moved"),
+            "{cleared:?}"
+        );
+        assert!(monitor.owner_requests.is_empty());
+
+        let mut off = Monitor::with(Settings {
+            owner_request_ms: 0,
+            ..settings()
+        });
+        feed(
+            &mut off,
+            10,
+            1000,
+            json!({"type": "source.push_requested", "source": source, "commit": commit_a}),
+        );
+        let mut none = Vec::new();
+        off.bounds(i64::MAX / 2, &mut none);
+        assert!(none.is_empty(), "0 disables it");
+    }
+
     /// The stuck alert against the real store: the session's events are
     /// appended to a schema of its own in the test database
     /// (`SPAWN_TEST_DATABASE_URL`, never the live one) and read back by
@@ -6792,6 +7077,87 @@ connections\n";
             let mut monitor = Monitor::with(settings());
             monitor.check(store).expect("the step checks");
             monitor
+        }
+
+        /// `owner_request_waiting` on a store, across a restart (S23): two
+        /// owner requests recorded two hours ago with no outcome fire on the
+        /// first check (a third, refused, fires nothing); a `source.moved`
+        /// naming one clears it at the next check; the other's refusal,
+        /// recorded while the loop is down, clears it when a new step
+        /// starts, naming the refusal; nothing fires twice. The alert's
+        /// evidence goes through the store's `spawn_alert_record`.
+        #[test]
+        fn an_owner_request_waiting_fires_on_the_store_and_clears_at_its_outcome_across_a_restart()
+        {
+            in_schema("alerts_owner_request", |store, client| {
+                let source = "/live/missions/spawn.git";
+                let ask = |client: &mut postgres::Client, digit: char| {
+                    let commit = digit.to_string().repeat(40);
+                    record(
+                        client,
+                        2,
+                        &format!(
+                            r#"{{"type":"source.push_requested","source":"{source}",
+                                "commit":"{commit}","ref":"refs/spawn-owner/{commit}"}}"#
+                        ),
+                    )
+                };
+                let a = ask(client, 'a');
+                let c = ask(client, 'c');
+                let refused = ask(client, 'e');
+                record(
+                    client,
+                    2,
+                    &format!(
+                        r#"{{"type":"source.push_refused","request":{refused},"reason":"r"}}"#
+                    ),
+                );
+                let mut monitor = started(store);
+                let key_a = format!("owner_request_waiting:{a}");
+                let key_c = format!("owner_request_waiting:{c}");
+                assert_eq!(alert(client, &key_a).0, "open");
+                assert_eq!(alert(client, &key_c).0, "open");
+                assert_eq!(
+                    alert(client, &format!("owner_request_waiting:{refused}")).0,
+                    "none"
+                );
+
+                let moved = record(
+                    client,
+                    0,
+                    &format!(
+                        r#"{{"type":"source.moved","source":"{source}","from":"{}",
+                            "to":"{}","request":{a},"by":"human"}}"#,
+                        "0".repeat(40),
+                        "a".repeat(40)
+                    ),
+                );
+                monitor.check(store).expect("the step checks");
+                assert_eq!(alert(client, &key_a), ("cleared".to_string(), Some(moved)));
+                assert_eq!(alert(client, &key_c).0, "open");
+                drop(monitor);
+
+                let refusal = record(
+                    client,
+                    0,
+                    &format!(
+                        r#"{{"type":"source.push_refused","request":{c},"reason":"withdrawn by the owner"}}"#
+                    ),
+                );
+                let _restarted = started(store);
+                assert_eq!(
+                    alert(client, &key_c),
+                    ("cleared".to_string(), Some(refusal))
+                );
+                let fired: i64 = client
+                    .query_one(
+                        "select count(*) from spawn_alerts where kind = 'owner_request_waiting'",
+                        &[],
+                    )
+                    .expect("count")
+                    .get(0);
+                assert_eq!(fired, 2, "once per request, whatever restarts");
+            });
         }
 
         /// The live shape of 2026-11-11 23:33 (lead-mac), on a store: two
@@ -7820,6 +8186,65 @@ connections\n";
             });
         }
 
+        /// S17: a typed message's alert says what the Bridge recorded of the
+        /// transcript since the typing. `deaf` has a transcript line read
+        /// after it (a turn's end): the agent has not taken it, and the text
+        /// says so with the count. `silent`, typed after that line, has none
+        /// read since: the text says whether the agent took it is unknown,
+        /// and why (Spawn not reading the transcript, or nothing written).
+        #[test]
+        fn a_typed_message_not_taken_says_whether_spawn_read_the_transcript_since() {
+            in_schema("messages_read_since", |store| {
+                let world = messages_world(store);
+                let deaf = world.deaf;
+                // Recorded after the typing, at a later millisecond.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                turn_ended(store, "msg", MSG_EXECUTION, "t-after-deaf");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let silent = input(store, "msg", "silent", "same text");
+                typed(store, "msg", MSG_EXECUTION, silent, true);
+                let mut monitor = prompt_monitor();
+                let fired = read(&mut monitor, store);
+                let alert = |id: CommandId| {
+                    fired
+                        .iter()
+                        .find_map(|event| match event {
+                            Event::Fire {
+                                key,
+                                evidence,
+                                text,
+                                ..
+                            } if *key == format!("message_not_taken:{}", id.0) => {
+                                Some((evidence.clone(), text.clone()))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("an alert for {}: {fired:?}", id.0))
+                };
+                let (heard, heard_text) = alert(deaf);
+                assert_eq!(heard["read_since_typed"], 1);
+                assert!(
+                    heard_text.starts_with(&format!(
+                        "agent_msg has not taken message #{} (its input): typed, and the \
+                         transcript lines Spawn has read since (1) hold no marker of it",
+                        deaf.0
+                    )),
+                    "{heard_text}"
+                );
+                let (unread, unread_text) = alert(silent);
+                assert_eq!(unread["read_since_typed"], 0);
+                assert!(
+                    unread_text.contains(
+                        "Spawn has read no line of agent_msg's transcript since the typing: \
+                         whether agent_msg took it is unknown. Either Spawn is not reading that \
+                         transcript (the Bridge follows it), or the engine has written nothing since"
+                    ),
+                    "{unread_text}"
+                );
+                assert!(!unread_text.contains("has not taken"), "{unread_text}");
+            });
+        }
+
         /// The alert fires for the two not taken (whether typed in its
         /// evidence), once; the one taken later clears, and the session's
         /// end clears the other; a fresh step then fires nothing.
@@ -7858,7 +8283,12 @@ connections\n";
                 assert_eq!(deaf_evidence["command"], json!(deaf.0));
                 assert_eq!(deaf_evidence["agent_id"], "agent_msg");
                 assert_eq!(deaf_evidence["typed"], true);
+                assert_eq!(
+                    deaf_evidence["read_since_typed"], 0,
+                    "no transcript line recorded since it was typed"
+                );
                 assert_eq!(evidence(untyped).1["typed"], false);
+                assert_eq!(evidence(untyped).1["read_since_typed"], Value::Null);
                 commit(&mut monitor, &fired);
                 assert!(read(&mut monitor, store).is_empty(), "once");
 

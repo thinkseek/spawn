@@ -67,7 +67,7 @@ const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|residen
 
 /// The commands the contract's line does not hold, each on a line of its own
 /// after it.
-const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]\n       spawn alerts --once [--json] [--since <90s|30m|2h|1d|ms>]\n       spawn alerts --follow [--json] [--since <event id>]\n       spawn backup dump|bundle|verify [--root <dir>]\n       spawn ack <command id> done|declined [<why>]";
+const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]\n       spawn alerts --once [--json] [--since <90s|30m|2h|1d|ms>]\n       spawn alerts --follow [--json] [--since <event id>]\n       spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep]\n       spawn ack <command id> done|declined [<why>]";
 
 fn main() {
     let code = match dispatch() {
