@@ -22,9 +22,11 @@
 #       already judged.
 #   (2) `GET /api/alerts`' rows carry `outcome`: null while open (and for a
 #       notice), "cleared" when its condition cleared it, else its verdict.
-#   (3) `GET /api/core-lines`' `observability.needs_you_right`: of the alerts
-#       (not notices) that ended in the last 7 days, the share whose outcome
-#       is "cleared"; null with none.
+#   (3) `GET /api/core-lines`' `observability.needs_you_right`: not
+#       collected (value null, state not_collected) until A22/A23 land
+#       (owner, 2026-11-12, sync/astra/findings.md A23): the share of ended
+#       alerts their condition cleared is not whether they were right, so it
+#       is not shown. The share itself stays a unit test of core_lines.rs.
 #   (4) a running loop learns of a judgement: an open alert the owner judges
 #       is cleared in the loop's view by its next pass, so the loop retries
 #       no clear the store refuses, and a later occurrence of the same kind
@@ -335,10 +337,8 @@ if [ "$code" != 200 ]; then
     check_failed "(3) GET /api/core-lines answered $code"
 else
     got=$(jq -c '.lines[] | select(.line == "observability") | .north_star | {key, unit, value, state}' "$WORK/lines.json")
-    expect_eq "$(printf '%s' "$got" | jq -c '{key, unit, state}')" '{"key":"observability.needs_you_right","unit":"share","state":"no_range"}' \
-        "(3) the observability north star has a value and no range set"
-    awk -v v="$(printf '%s' "$got" | jq -r '.value')" 'BEGIN { d = v - 1 / 3; if (d < 0) d = -d; exit !(v != "null" && d < 1e-9) }' ||
-        check_failed "(3) Needs you is right [$(printf '%s' "$got" | jq -r '.value')]: one right (a1) of the three that ended (a1, a2 false, a3 duplicate)"
+    expect_eq "$got" '{"key":"observability.needs_you_right","unit":"share","value":null,"state":"not_collected"}' \
+        "(3) the observability north star is not collected until A22/A23 land (a condition clearing is not an alert being right)"
     note "(3) checked: the north star"
 fi
 
