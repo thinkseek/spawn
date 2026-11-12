@@ -334,9 +334,15 @@ pub(super) fn read_ranges(path: Option<&std::path::Path>) -> Result<Option<Strin
 
 /// `GET /api/core-lines`.
 pub(super) fn core_lines() -> Result<Value, String> {
-    let store = super::open_store()?;
-    let storage = super::storage::report(&store, super::now_ms())?;
-    let path = ranges_path();
+    core_lines_at(&super::open_store()?, ranges_path())
+}
+
+/// The answer with the ranges file at `path`, read now.
+pub(super) fn core_lines_at(
+    store: &spawn_postgres::PostgresStore,
+    path: Option<PathBuf>,
+) -> Result<Value, String> {
+    let storage = super::storage::report(store, super::now_ms())?;
     let file = path
         .as_ref()
         .map_or(Value::Null, |path| json!(path.display().to_string()));

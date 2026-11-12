@@ -3303,6 +3303,80 @@ mod tests {
         }
     }
 
+    /// Objective 084, through the real store: `/api/core-lines`' answer
+    /// with no ranges file, a broken one and one with ranges, read at each
+    /// request.
+    #[test]
+    fn the_core_lines_answer_reads_its_ranges_file_at_each_request() {
+        use serde_json::Value;
+        in_test_schema(|_owner, store| {
+            let dir = std::env::temp_dir().join(format!(
+                "spawn-core-lines-serve-{}-{}",
+                std::process::id(),
+                super::now_ms()
+            ));
+            std::fs::create_dir_all(&dir).expect("a directory");
+            let file = dir.join("core-lines.json");
+            let read = || {
+                super::core_lines::core_lines_at(store, Some(file.clone())).expect("the answer")
+            };
+            let figure = |view: &Value, key: &str| {
+                view["lines"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|line| {
+                        std::iter::once(line["north_star"].clone()).chain(
+                            line["guardrails"].as_array().cloned().unwrap_or_default(),
+                        )
+                    })
+                    .find(|figure| figure["key"] == key)
+                    .unwrap_or_else(|| panic!("no {key}: {view}"))
+            };
+            // No file: no ranges, no error.
+            let none = read();
+            assert_eq!(none["ranges_file"], json!(file.display().to_string()));
+            assert_eq!(none["ranges_error"], Value::Null);
+            assert_eq!(none["ignored_ranges"], json!([]));
+            assert_eq!(figure(&none, "storage.free_bytes")["range"], Value::Null);
+            assert_eq!(
+                figure(&none, "performance.report_to_live")["state"],
+                json!("not_collected")
+            );
+            // A file: its ranges, and the entries it cannot use listed.
+            std::fs::write(
+                &file,
+                r#"{"ranges": {"storage.database_ratio": {"min": 0, "max": 1000000000000},
+                    "storage.free_bites": {"min": 1},
+                    "recoverability.restores_passed": {"min": 6},
+                    "storage.days_left": {"max": "many"}}}"#,
+            )
+            .expect("the file");
+            let ranged = read();
+            assert_eq!(ranged["ranges_error"], Value::Null);
+            assert_eq!(
+                ranged["ignored_ranges"],
+                json!([{"key": "storage.days_left", "reason": "needs a number min or max"},
+                       {"key": "storage.free_bites", "reason": "unknown figure"}])
+            );
+            let ratio = figure(&ranged, "storage.database_ratio");
+            assert_eq!(ratio["range"], json!({"min": 0, "max": 1_000_000_000_000_i64}));
+            // The test schema's database has a size; its log may have none.
+            let expected = if ratio["value"].is_null() { "not_collected" } else { "in" };
+            assert_eq!(ratio["state"], json!(expected), "{ratio}");
+            let restores = figure(&ranged, "recoverability.restores_passed");
+            assert_eq!(restores["range"], json!({"min": 6}));
+            assert_eq!(restores["state"], json!("not_collected"));
+            // A broken file: no ranges, and why.
+            std::fs::write(&file, "{\"ranges\": ").expect("the file");
+            let broken = read();
+            assert!(broken["ranges_error"].as_str().is_some_and(|why| !why.is_empty()));
+            assert_eq!(broken["ignored_ranges"], json!([]));
+            assert_eq!(figure(&broken, "storage.database_ratio")["range"], Value::Null);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
     /// Objective 064, through the real store: each line for the owner
     /// carries the tasks it names with their states now, and only a review
     /// ask whose tasks have all ended is settled.
