@@ -177,3 +177,62 @@ fn a_store_run_is_a_backup_stored_record_of_fixed_shape() {
         "nothing refused was recorded"
     );
 }
+
+fn drilled(kind: &str) -> Value {
+    json!({
+        "type": kind, "ok": true, "reason": "",
+        "bundle": "bundles/spawn/full/20261113-040000.tar.zst.gpg", "bundle_event_id": 41,
+        "mismatches": 0, "duration_ms": 1234,
+    })
+}
+
+/// A restore drill's verdict per resource (`backup.drilled.transcripts`,
+/// `backup.drilled.missions`, objective 104) is accepted through the
+/// owner's spawn_backup_record and folded into no table; its shape is
+/// fixed: another field, ok that is not a boolean or not "reason is empty",
+/// a reason that is not a string or over 500 characters, a bundle that is
+/// not a string, a count that is not a whole number at or above 0, each
+/// refuses the whole record.
+#[test]
+fn a_drill_verdict_is_a_backup_drilled_record_of_fixed_shape() {
+    let (store, schema) = store("backup_drilled");
+    let mut client = admin(&schema);
+    for kind in ["backup.drilled.transcripts", "backup.drilled.missions"] {
+        store.backup_record(&drilled(kind)).expect("a passed drill");
+    }
+    let mut failed = drilled("backup.drilled.missions");
+    failed["ok"] = json!(false);
+    failed["reason"] = json!("r".repeat(500));
+    failed["mismatches"] = json!(3);
+    store.backup_record(&failed).expect("a failed drill");
+    let with = |field: &str, value: Value| {
+        let mut record = drilled("backup.drilled.transcripts");
+        record[field] = value;
+        record
+    };
+    for (what, record) in [
+        ("another field", with("keys", json!([]))),
+        ("ok false with no reason", with("ok", json!(false))),
+        ("ok true with a reason", with("reason", json!("a mismatch"))),
+        ("ok as text", with("ok", json!("true"))),
+        ("a reason that is not a string", with("reason", json!(1))),
+        ("a reason over 500 characters", {
+            let mut record = with("ok", json!(false));
+            record["reason"] = json!("r".repeat(501));
+            record
+        }),
+        ("a bundle that is not a string", with("bundle", json!(1))),
+        ("no bundle", with("bundle", Value::Null)),
+        ("a negative count", with("mismatches", json!(-1))),
+        ("a fractional count", with("duration_ms", json!(1.5))),
+        ("an event id as text", with("bundle_event_id", json!("41"))),
+    ] {
+        assert!(store.backup_record(&record).is_err(), "{what}: {record}");
+    }
+    assert_eq!(control_records(&mut client, "backup.drilled.transcripts"), 1);
+    assert_eq!(
+        control_records(&mut client, "backup.drilled.missions"),
+        2,
+        "nothing refused was recorded"
+    );
+}
