@@ -7735,8 +7735,7 @@ connections\n";
                 );
                 monitor.check(store).expect("the step checks");
                 assert_eq!(
-                    monitor.missions[&4].aborts,
-                    2,
+                    monitor.missions[&4].aborts, 2,
                     "a record after the start is the checks'"
                 );
                 assert!(monitor.tasks.contains_key(&9));
