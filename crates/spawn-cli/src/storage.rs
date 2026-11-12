@@ -286,6 +286,13 @@ pub(crate) mod tests {
         // A link is not followed, nor counted.
         std::os::unix::fs::symlink(root.join(".transcripts"), root.join("agent_c/link"))
             .expect("a link");
+        // The Core lines reader's first sights (objective 094) are no
+        // workspace, nor the file they are written through.
+        file(&root.join(super::TEST_SCHEMAS_SEEN), 2558);
+        file(
+            &root.join(format!("{}.partial", super::TEST_SCHEMAS_SEEN)),
+            40,
+        );
         assert_eq!(
             archive(&root),
             Sizes {
