@@ -996,8 +996,9 @@ fn intervention_rows(client: &mut Client, from: &str, since: i64, until: i64) ->
 }
 
 /// spawn_interventions as it was before it read from the window outward
-/// (d61e85eb), word for word: the oracle the view's answers are compared
-/// with.
+/// (d61e85eb), word for word but for its resume branch, widened as the
+/// view's is to a pause and its release (objective 102): the oracle the
+/// view's answers are compared with.
 const ORACLE: &str = r"
 create view spawn_interventions_oracle as
 select i.at_ms, 'command'::text as kind, null::bigint as mission_id,
