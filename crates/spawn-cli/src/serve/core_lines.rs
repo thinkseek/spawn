@@ -253,7 +253,47 @@ fn performance_now(store: &spawn_postgres::PostgresStore, now_ms: i64) -> Value 
 /// The four lines: the performance line's figures from `performance`
 /// ([`performance`]), the storage line's from `storage` (health.storage as
 /// [`super::storage::report`] gives it).
-pub(super) fn lines(storage: &Value, performance: &Value) -> Vec<Line> {
+/// The performance line ([`performance`]'s values).
+fn performance_line(performance: &Value) -> Line {
+    Line {
+        name: "performance",
+        north_star: Figure::new(
+            "performance.report_to_live",
+            "Time from report to live",
+            "ms",
+            performance["report_to_live"].clone(),
+        ),
+        guardrails: vec![
+            Figure::new(
+                "performance.gate_time",
+                "Gate time per run",
+                "ms",
+                performance["gate_time"].clone(),
+            ),
+            Figure::new(
+                "performance.decided_nothing",
+                "Gate time that decided nothing",
+                "share",
+                performance["decided_nothing"].clone(),
+            ),
+            Figure::new(
+                "performance.first_pass",
+                "Landings that pass first time",
+                "share",
+                performance["first_pass"].clone(),
+            ),
+            Figure::new(
+                "performance.usd_per_landing",
+                "Dollars per landing",
+                "usd",
+                performance["usd_per_landing"].clone(),
+            ),
+        ],
+    }
+}
+
+/// The storage line, from health.storage.
+fn storage_line(storage: &Value) -> Line {
     let database = &storage["database"];
     let ratio = match (database["bytes"].as_f64(), database["log_bytes"].as_f64()) {
         (Some(bytes), Some(log)) if log > 0.0 => json!(bytes / log),
@@ -269,83 +309,53 @@ pub(super) fn lines(storage: &Value, performance: &Value) -> Vec<Line> {
             .max()
             .map_or(Value::Null, |most| json!(most))
     };
+    Line {
+        name: "storage",
+        north_star: Figure::new(
+            "storage.days_left",
+            "Days until the disk is full",
+            "days",
+            storage["days_left"].clone(),
+        ),
+        guardrails: vec![
+            Figure::new(
+                "storage.free_bytes",
+                "Free disk",
+                "bytes",
+                storage["free_bytes"].clone(),
+            ),
+            Figure::new(
+                "storage.archive_growth",
+                "Transcript archive growth",
+                "bytes_per_day",
+                storage["growth_bytes_per_day"].clone(),
+            ),
+            Figure::new(
+                "storage.database_ratio",
+                "Database against its log",
+                "ratio",
+                ratio,
+            ),
+            Figure::new(
+                "storage.test_database_bytes",
+                "Largest test database",
+                "bytes",
+                largest("bytes"),
+            ),
+            Figure::new(
+                "storage.test_database_schemas",
+                "Most test schemas",
+                "count",
+                largest("schemas"),
+            ),
+        ],
+    }
+}
+
+pub(super) fn lines(storage: &Value, performance: &Value) -> Vec<Line> {
     vec![
-        Line {
-            name: "performance",
-            north_star: Figure::new(
-                "performance.report_to_live",
-                "Time from report to live",
-                "ms",
-                performance["report_to_live"].clone(),
-            ),
-            guardrails: vec![
-                Figure::new(
-                    "performance.gate_time",
-                    "Gate time per run",
-                    "ms",
-                    performance["gate_time"].clone(),
-                ),
-                Figure::new(
-                    "performance.decided_nothing",
-                    "Gate time that decided nothing",
-                    "share",
-                    performance["decided_nothing"].clone(),
-                ),
-                Figure::new(
-                    "performance.first_pass",
-                    "Landings that pass first time",
-                    "share",
-                    performance["first_pass"].clone(),
-                ),
-                Figure::new(
-                    "performance.usd_per_landing",
-                    "Dollars per landing",
-                    "usd",
-                    performance["usd_per_landing"].clone(),
-                ),
-            ],
-        },
-        Line {
-            name: "storage",
-            north_star: Figure::new(
-                "storage.days_left",
-                "Days until the disk is full",
-                "days",
-                storage["days_left"].clone(),
-            ),
-            guardrails: vec![
-                Figure::new(
-                    "storage.free_bytes",
-                    "Free disk",
-                    "bytes",
-                    storage["free_bytes"].clone(),
-                ),
-                Figure::new(
-                    "storage.archive_growth",
-                    "Transcript archive growth",
-                    "bytes_per_day",
-                    storage["growth_bytes_per_day"].clone(),
-                ),
-                Figure::new(
-                    "storage.database_ratio",
-                    "Database against its log",
-                    "ratio",
-                    ratio,
-                ),
-                Figure::new(
-                    "storage.test_database_bytes",
-                    "Largest test database",
-                    "bytes",
-                    largest("bytes"),
-                ),
-                Figure::new(
-                    "storage.test_database_schemas",
-                    "Most test schemas",
-                    "count",
-                    largest("schemas"),
-                ),
-            ],
-        },
+        performance_line(performance),
+        storage_line(storage),
         Line {
             name: "observability",
             north_star: Figure::not_collected(
