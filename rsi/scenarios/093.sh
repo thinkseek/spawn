@@ -32,7 +32,8 @@
 #       lists `drills` [{name, source ("record <type>", "unit <name>", or
 #       null), passed_at_ms}] in the file's order.
 #   (2) the figures: north star `recoverability.restores_passed` (count: the
-#       rows whose last pass is within 7 days; null with no rows);
+#       rows whose last pass is within 7 days; null with no rows; since
+#       objective 105, a row whose newest drill failed is not counted);
 #       `recoverability.session_backup_age` (ms: the answer's moment less the
 #       status file's `at`; null without one); `recoverability.oldest_drill_age`
 #       (ms: the answer's moment less the oldest of the rows' last passes,
@@ -286,8 +287,8 @@ else
             check_failed "(1) serve's log does not name the refused unit [$refused]"
     done
     rec() { jq -c ".lines[] | select(.line == \"recoverability\") | ([.north_star] + .guardrails)[] | select(.key == \"$1\")" "$WORK/api.json"; }
-    expect_eq "$(rec recoverability.restores_passed | jq -c '{unit, value}')" '{"unit":"count","value":2}' \
-        "(2) restores passed in 7 days: the database and the session files (the old drill is 8 days old)"
+    expect_eq "$(rec recoverability.restores_passed | jq -c '{unit, value}')" '{"unit":"count","value":1}' \
+        "(2) restores passed in 7 days: the session files (the old drill is 8 days old; since 105 the database's newest drill, failed 1 h ago, is not counted)"
     between() { # <key> <at_ms> <what>
         value=$(rec "$1" | jq -r '.value')
         awk -v v="$value" -v lo="$((seed_now - $2))" -v hi="$((asked - $2))" 'BEGIN { exit !(v ~ /^[0-9]+$/ && v >= lo && v <= hi) }' ||
