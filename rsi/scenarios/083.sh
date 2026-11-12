@@ -258,7 +258,10 @@ test("(2) the local date and time, to the minute", () => {
 
 test("(2) once measured, or with no sample, as before", () => {
   const grown = storageView({ ...storage, read_at_ms: at + 3_600_000, growth_bytes_per_day: 5 * MIB, days_left: 40, growth_from_ms: at });
-  assert.deepEqual([archive(grown).note, grown.measured_from, grown.lasts], ["grows about 5.0 MB a day", null, "about 40 days at the archive's growth"]);
+  assert.deepEqual([archive(grown).note, grown.measured_from], ["grows about 5.0 MB a day", null]);
+  // The words after the days are 065's and change with objective 085 (the
+  // growth of every persistent grower): only the days are this check's.
+  assert.ok(typeof grown.lasts === "string" && grown.lasts.startsWith("about 40 days at "), `lasts: ${grown.lasts}`);
   const bare = storageView({ ...storage, growth_bytes_per_day: null, days_left: null, growth_from_ms: null });
   assert.deepEqual([archive(bare).note, bare.measured_from, bare.lasts], ["not measured yet", null, null]);
   const past = storageView({ ...storage, read_at_ms: at + 3_600_000, growth_bytes_per_day: null, days_left: null, growth_from_ms: at });
