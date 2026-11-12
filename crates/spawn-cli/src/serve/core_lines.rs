@@ -558,7 +558,11 @@ mod tests {
                 {"role": "x", "bytes": 9, "schemas": 1},
             ],
         });
-        let view = answer(&lines(&storage, &Value::Null), &json!("/ws/core-lines.json"), Ok(None));
+        let view = answer(
+            &lines(&storage, &Value::Null),
+            &json!("/ws/core-lines.json"),
+            Ok(None),
+        );
         let names: Vec<&str> = view["lines"]
             .as_array()
             .expect("lines")
@@ -591,13 +595,18 @@ mod tests {
             ]
         );
         // No log size: no ratio; no readable test database: none.
-        let bare =
-            lines(&json!({"database": {"bytes": 300, "log_bytes": 0}, "test_databases": []}), &Value::Null);
+        let bare = lines(
+            &json!({"database": {"bytes": 300, "log_bytes": 0}, "test_databases": []}),
+            &Value::Null,
+        );
         assert_eq!(bare[1].guardrails[2].value, Value::Null);
         assert_eq!(bare[1].guardrails[3].value, Value::Null);
         // The performance line without its figures: nothing collected.
         assert_eq!(view["lines"][0]["north_star"]["state"], "not_collected");
-        assert_eq!(view["lines"][0]["guardrails"].as_array().map(Vec::len), Some(4));
+        assert_eq!(
+            view["lines"][0]["guardrails"].as_array().map(Vec::len),
+            Some(4)
+        );
         // The other north stars are not collected, with no guardrails.
         for index in [2, 3] {
             assert_eq!(view["lines"][index]["north_star"]["state"], "not_collected");
