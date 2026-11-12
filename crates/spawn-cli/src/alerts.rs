@@ -725,6 +725,9 @@ pub(crate) struct Monitor {
     /// Each figure with an open alert that has not been out since, by key:
     /// the first reading of this stretch.
     guardrail_back: BTreeMap<String, i64>,
+    /// The Core lines reading in flight on a thread of its own, and one
+    /// given up that may still run (cc-astra A18: never inside a pass).
+    guardrail_reads: guardrails::Reads,
 }
 
 /// What the supervisor has to dispatch, as one read of the attention view
@@ -841,6 +844,7 @@ impl Monitor {
             guardrail_due_ms: 0,
             guardrail_out: BTreeMap::new(),
             guardrail_back: BTreeMap::new(),
+            guardrail_reads: guardrails::Reads::default(),
         }
     }
 
@@ -855,7 +859,9 @@ impl Monitor {
         let (watermark, now) = store.alert_clock().map_err(|error| error.to_string())?;
         let reading_due = now >= self.next_reading_ms;
         let bound_due = self.next_bound_ms.is_some_and(|due| now >= due);
-        if watermark <= self.watermark && !reading_due && !bound_due {
+        // A Core lines reading in flight is looked at by every check.
+        let guardrails_due = self.guardrail_reads.in_flight();
+        if watermark <= self.watermark && !reading_due && !bound_due && !guardrails_due {
             return Ok(lines);
         }
         let mut events = Vec::new();
@@ -918,9 +924,10 @@ impl Monitor {
             }
             if now >= self.guardrail_due_ms {
                 self.guardrail_due_ms = now.saturating_add(self.settings.guardrail_ms);
-                self.read_guardrails(store, now, &mut events, &mut lines);
+                self.start_guardrails(now);
             }
         }
+        self.poll_guardrails(now, &mut events, &mut lines);
         self.bounds(now, &mut events);
         self.flush(store, now, &events, &mut lines);
         self.plan(now);
@@ -928,13 +935,18 @@ impl Monitor {
     }
 
     /// The earliest time the step waits for even when no record is
-    /// written: its next host reading (`SPAWN_ALERT_CHECK_SECS`), or a
-    /// bound's due time. Before the first check it is `0`, so a fresh loop
-    /// runs it once.
+    /// written: its next host reading (`SPAWN_ALERT_CHECK_SECS`), a
+    /// bound's due time, or, while a Core lines reading runs on its thread,
+    /// the next look at it (alerts/guardrails.rs). Before the first check it
+    /// is `0`, so a fresh loop runs it once.
     pub(crate) fn due_ms(&self) -> i64 {
-        self.next_bound_ms.map_or(self.next_reading_ms, |bound| {
+        let due = self.next_bound_ms.map_or(self.next_reading_ms, |bound| {
             bound.min(self.next_reading_ms)
-        })
+        });
+        // While a Core lines reading runs, look again shortly.
+        self.guardrail_reads
+            .poll_ms()
+            .map_or(due, |poll| poll.min(due))
     }
 
     /// Read what the step needs back: its alerts, the missions and tasks, the
