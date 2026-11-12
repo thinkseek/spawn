@@ -43,6 +43,9 @@ export interface CostLandings {
 
 export interface CostMission extends CostEntry, Partial<CostLandings> {
   mission: number;
+  /** The mission's name, as `/api/missions` gives its `mission_name`;
+   * null for a mission the record does not hold. */
+  name?: string | null;
 }
 
 export interface CostTask extends CostEntry {
@@ -91,7 +94,11 @@ export interface Row {
   unpriced_tokens: number;
   /** "+ 220,000 tokens unpriced"; null when none. */
   unpriced_text: string | null;
-  /** A task's label as the API gives it; null otherwise. */
+  /** The same count made compact, for the badge: "+485M unpriced"
+   * ([`unpricedShort`]); null when none. */
+  unpriced_short: string | null;
+  /** A task's label or a mission's name as the API gives it; null
+   * otherwise. */
   label: string | null;
   /** A mission's own dollars per landing ([`perLanding`]); absent on a
    * task's or an agent's line. */
@@ -163,6 +170,38 @@ export function formatTokens(tokens: number): string {
 export function unpricedText(tokens: number): string | null {
   if (!Number.isFinite(tokens) || tokens <= 0) return null;
   return `+ ${formatTokens(tokens)} token${tokens === 1 ? "" : "s"} unpriced`;
+}
+
+/** A count's step: its divisor and its letter. */
+const STEPS: ReadonlyArray<[number, string]> = [
+  [1e3, "K"],
+  [1e6, "M"],
+  [1e9, "B"],
+];
+
+/** A count made compact: "950", "55K", "1.1M", "17M", "485M", "1.5B"; one
+ * decimal under 10, whole from 10, K, M or B by thousands. It is rounded
+ * first and the step picked after, so 9,960 is "10K" and 999,600 "1.0M". */
+export function compactCount(value: number): string {
+  const n = Number.isFinite(value) ? Math.abs(value) : 0;
+  const sign = Number.isFinite(value) && value < 0 ? "-" : "";
+  const whole = Math.round(n);
+  if (whole < 1000) return `${sign}${whole}`;
+  let said = "";
+  for (const [size, letter] of STEPS) {
+    const scaled = n / size;
+    const rounded = scaled < 10 ? Math.round(scaled * 10) / 10 : Math.round(scaled);
+    said = `${rounded < 10 ? rounded.toFixed(1) : String(rounded)}${letter}`;
+    if (rounded < 1000) break;
+  }
+  return `${sign}${said}`;
+}
+
+/** A row's unpriced badge, short enough to keep its dollars on the page:
+ * "+485M unpriced" ([`compactCount`]); null when it has none. */
+export function unpricedShort(tokens: number): string | null {
+  if (!Number.isFinite(tokens) || tokens <= 0) return null;
+  return `+${compactCount(tokens)} unpriced`;
 }
 
 function count(value: unknown): number {
@@ -253,6 +292,7 @@ function rows<T>(
         unpriced,
         unpriced_tokens: weight,
         unpriced_text: unpricedText(weight),
+        unpriced_short: unpricedShort(weight),
         label: named,
         share: shareText(order, windowUsd),
       };
@@ -266,6 +306,11 @@ function rows<T>(
 function taskLabel(entry: CostTask): string | null {
   const label = (entry as Partial<CostTask>).label;
   return typeof label === "string" && label.trim() !== "" ? label : null;
+}
+
+function missionName(entry: CostMission): string | null {
+  const name = (entry as Partial<CostMission>).name;
+  return typeof name === "string" && name.trim() !== "" ? name : null;
 }
 
 /** The window's note on what no price counts, said once: "275,000 of
@@ -324,7 +369,7 @@ export function countedSince(answer: Partial<CostAnswer> | null | undefined): st
 
 /** The page's figures for one window's answer: the total, what a landing
  * cost and, once, the note on its unpriced tokens; each mission (`#<id>`,
- * with its own dollars per landing), the ten costliest tasks (`T<id>`, with
+ * with its name and its own dollars per landing), the ten costliest tasks (`T<id>`, with
  * its label) and agents (its id) with the rest of each folded into one
  * line, most costly first, each with its unpriced count and its share of
  * the window; and since when the record counts, when the window starts
@@ -332,7 +377,7 @@ export function countedSince(answer: Partial<CostAnswer> | null | undefined): st
 export function costView(answer: Partial<CostAnswer> | null | undefined): CostView {
   const total = shown(answer?.total);
   const windowUsd = total.order;
-  const missions = rows<CostMission>(answer?.missions, windowUsd, (entry) => `#${entry.mission}`, undefined, true);
+  const missions = rows<CostMission>(answer?.missions, windowUsd, (entry) => `#${entry.mission}`, missionName, true);
   const tasks = rows<CostTask>(answer?.tasks, windowUsd, (entry) => `T${entry.task}`, taskLabel);
   const agents = rows<CostAgent>(answer?.agents, windowUsd, (entry) => String(entry.agent));
   return {

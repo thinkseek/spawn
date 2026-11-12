@@ -2248,7 +2248,8 @@ fn alerts(query: &str) -> Result<Value, String> {
 /// mission (`landed`, `usd_per_landing`), read through the reader login.
 /// Each `tasks` row carries its `label`, the task's label as
 /// `/api/missions` gives it ([`labels`]), or null for a task the record
-/// does not hold.
+/// does not hold; each `missions` row its `name`, the mission's
+/// `mission_name` as `/api/missions` gives it, or null likewise.
 fn cost(query: &str) -> Result<Value, String> {
     let asked = parameter(query, "window")
         .map(|text| percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad window {text}")))
@@ -2262,19 +2263,24 @@ fn cost(query: &str) -> Result<Value, String> {
 }
 
 /// A cost answer's `tasks` rows, each with its `label` as `/api/missions`
-/// gives it (null for a task the record does not hold): read for those
-/// tasks alone ([`spawn_postgres::PostgresStore::task_label_facts`]).
+/// gives it, and its `missions` rows, each with its `name` (null for a
+/// task or mission the record does not hold): read for those tasks and
+/// missions alone ([`spawn_postgres::PostgresStore::label_facts_of`]).
 fn label_cost_tasks(
     store: &spawn_postgres::PostgresStore,
     answer: &mut Value,
 ) -> Result<(), String> {
-    let ids: Vec<i64> = answer["tasks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|row| row["task"].as_i64())
-        .collect();
-    let facts = store.task_label_facts(&ids).map_err(err)?;
+    let ids_of = |list: &str, field: &str| -> Vec<i64> {
+        answer[list]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row[field].as_i64())
+            .collect()
+    };
+    let tasks = ids_of("tasks", "task");
+    let missions = ids_of("missions", "mission");
+    let facts = store.label_facts_of(&tasks, &missions).map_err(err)?;
     labels::label_cost(
         answer,
         &labels::Context::from_board(&facts, &labels::Titles::new()),
@@ -3418,6 +3424,56 @@ mod tests {
             let mut empty = json!({"tasks": []});
             super::label_cost_tasks(store, &mut empty).expect("labelled");
             assert_eq!(empty, json!({"tasks": []}));
+        });
+    }
+
+    #[test]
+    fn a_cost_mission_row_carries_its_name_as_the_missions_board_gives_it() {
+        in_test_schema(|_owner, store| {
+            let supply = store
+                .mission_add(
+                    "Owner work on Supply PA: changes the owner reviews.",
+                    &json!(["/x/supply.git"]),
+                    "human",
+                )
+                .expect("a mission");
+            let docs = store
+                .mission_add("Docs: rewrite the guide.", &json!([]), "human")
+                .expect("a mission");
+            // A task of the first mission alone: the second is named all
+            // the same, with none of its tasks in the answer.
+            let task = store
+                .task_assign(supply, "ephemeral", "w1", "Goal: one change.", "default")
+                .expect("a task");
+            let mut board = store.mission_board(50).expect("the board");
+            super::labels::label_board(&mut board);
+            let board_name = |id: i64| {
+                board["missions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|mission| mission["id"] == id)
+                    .map_or_else(
+                        || panic!("no mission {id} on the board: {board}"),
+                        |mission| mission["mission_name"].clone(),
+                    )
+            };
+            let mut answer = json!({
+                "missions": [
+                    {"mission": supply, "usd": 1.0},
+                    {"mission": docs, "usd": 0.5},
+                    {"mission": 999_999, "usd": 0.1},
+                ],
+                "tasks": [{"task": task, "mission": supply, "usd": 1.0}],
+            });
+            super::label_cost_tasks(store, &mut answer).expect("labelled");
+            let name = |index: usize| answer["missions"][index]["name"].clone();
+            assert_eq!(name(0), json!("Supply PA · owner work"), "{answer}");
+            assert_eq!(name(0), board_name(supply), "{answer}");
+            assert_eq!(name(1), board_name(docs), "{answer}");
+            assert!(name(1).is_string(), "{answer}");
+            assert_eq!(name(2), serde_json::Value::Null, "not in the record");
+            assert!(answer["tasks"][0]["label"].is_string(), "{answer}");
         });
     }
 

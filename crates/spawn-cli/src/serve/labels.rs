@@ -894,8 +894,24 @@ fn label_missions(missions: Option<&mut Value>, context: &Context) {
 }
 
 /// `/api/cost`'s task rows labelled: each its `label`, the task's label as
-/// `/api/missions` gives it, or null for a task `context` does not hold.
+/// `/api/missions` gives it, or null for a task `context` does not hold;
+/// and its mission rows named: each its `name`, the mission's
+/// `mission_name` as `/api/missions` gives it, or null likewise.
 pub(super) fn label_cost(answer: &mut Value, context: &Context) {
+    for row in answer
+        .get_mut("missions")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        let name = row["mission"]
+            .as_i64()
+            .and_then(|id| context.mission(id))
+            .map_or(Value::Null, |mission| json!(mission.name));
+        if let Some(fields) = row.as_object_mut() {
+            fields.insert("name".to_string(), name);
+        }
+    }
     for row in answer
         .get_mut("tasks")
         .and_then(Value::as_array_mut)
