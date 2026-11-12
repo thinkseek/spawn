@@ -91,7 +91,7 @@ test("(c) the Cost page shows each row's share and the fold line under tasks and
   const page = readFileSync(new URL("../src/components/cost/CostView.tsx", import.meta.url), "utf8");
   assert.match(page, /<Rows title="Tasks" rows=\{figures\.tasks\} more=\{figures\.tasks_more\} \/>/);
   assert.match(page, /<Rows title="Agents" rows=\{figures\.agents\} more=\{figures\.agents_more\} \/>/);
-  assert.match(page, /<ShareMark share=\{row\.share\} \/>/);
+  assert.match(page, /<ShareMark share=\{first\.share\} \/>/);
   assert.match(page, /\{more && \([\s\S]*?\{more\.text\}[\s\S]*?<\/li>/);
   assert.ok(page.indexOf("{rows.map(") < page.indexOf("{more.text}"), "the fold line follows the rows");
 });

@@ -2,7 +2,7 @@ import { CircleDollarSign } from "lucide-react";
 
 import { readApi, usePoll } from "../../api";
 import type { CostAnswer, CostView as Figures, Fold, Row } from "../../cost.ts";
-import { costView } from "../../cost.ts";
+import { costView, rowLines } from "../../cost.ts";
 import { Card, CardHeader, EmptyState, LiveStatus, PageHeader, cx } from "../ui";
 
 const POLL_MS = 30_000;
@@ -20,15 +20,14 @@ function fetchCost(window: string, signal: AbortSignal): Promise<CostAnswer> {
 /** The mark of a row whose figure leaves out use on a model with no
  * price: how many tokens, compact ("+485M unpriced"), the full count
  * ("+ 485,321,042 tokens unpriced") in its title. */
-function UnpricedMark({ short, full }: { short: string | null; full: string | null }) {
-  if (!short) return null;
+function UnpricedMark({ text }: { text: string }) {
   return (
     <span
       data-cost-unpriced
-      title={`${full ?? short}: these tokens ran on a model SPAWN_MODEL_PRICES does not price; they are counted, their cost is not`}
-      className="shrink-0 whitespace-nowrap rounded bg-wait-tint px-1 py-px text-micro font-medium text-warning"
+      title={`${text}: these tokens ran on a model SPAWN_MODEL_PRICES does not price; they are counted, their cost is not`}
+      className="min-w-0 break-words rounded bg-wait-tint px-1 py-px font-medium text-warning"
     >
-      {short}
+      {text}
     </span>
   );
 }
@@ -57,45 +56,61 @@ function Rows({ title, rows, more = null }: { title: string; rows: Row[]; more?:
         <p className="px-4 pb-2 text-caption text-faint-foreground">None in this window.</p>
       ) : (
         <ul className="pb-2">
-          {rows.map((row) => (
-            <li key={row.key} className="flex min-w-0 items-center gap-2 px-4 py-1 text-caption">
-              {/* A long name truncates; the badge, the per-landing figure
-                  and the dollars never shrink, wrap or leave the column. */}
-              <span
-                className={cx(
-                  "font-mono text-muted-foreground",
-                  row.label ? "shrink-0" : "min-w-0 truncate",
+          {rows.map((row) => {
+            const { first, second } = rowLines(row);
+            return (
+              <li key={first.key} className="min-w-0 px-4 py-1 text-caption">
+                {/* First line: the amount and share never shrink or leave
+                    the column; the label truncates before anything else
+                    gives way (objective 079). */}
+                <div className="flex min-w-0 items-baseline gap-2">
+                  <span
+                    className={cx(
+                      "font-mono text-muted-foreground",
+                      first.label ? "shrink-0" : "min-w-0 truncate",
+                    )}
+                    title={first.key}
+                  >
+                    {first.key}
+                  </span>
+                  {first.label && (
+                    <span className="min-w-0 flex-1 truncate text-foreground" title={first.label}>
+                      {first.label}
+                    </span>
+                  )}
+                  <span
+                    className={cx(
+                      "tnum ml-auto shrink-0 whitespace-nowrap",
+                      first.usd === "unpriced" ? "text-warning" : "text-foreground",
+                    )}
+                  >
+                    {first.usd}
+                  </span>
+                  <ShareMark share={first.share} />
+                </div>
+                {/* Second line: the unpriced mark's text and the per-landing
+                    text, in full, wrapping if it must. */}
+                {second.length > 0 && (
+                  <div className="mt-0.5 flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-micro">
+                    {second.map((text, index) =>
+                      // rowLines puts the unpriced mark's text first.
+                      index === 0 && row.unpriced_text ? (
+                        <UnpricedMark key={text} text={text} />
+                      ) : (
+                        <span
+                          key={text}
+                          title="This mission's priced dollars over its tasks that landed or were accepted in the window"
+                          className="tnum min-w-0 break-words text-faint-foreground"
+                        >
+                          {text}
+                        </span>
+                      ),
+                    )}
+                  </div>
                 )}
-                title={row.key}
-              >
-                {row.key}
-              </span>
-              {row.label && (
-                <span className="min-w-0 truncate text-foreground" title={row.label}>
-                  {row.label}
-                </span>
-              )}
-              <UnpricedMark short={row.unpriced_short} full={row.unpriced_text} />
-              {row.per_landing !== undefined && (
-                <span
-                  title="This mission's priced dollars over its tasks that landed or were accepted in the window"
-                  className="tnum ml-auto shrink-0 whitespace-nowrap text-micro text-faint-foreground"
-                >
-                  {row.per_landing}
-                </span>
-              )}
-              <span
-                className={cx(
-                  "tnum shrink-0 whitespace-nowrap",
-                  row.per_landing === undefined ? "ml-auto" : "ml-2",
-                  row.usd === "unpriced" ? "text-warning" : "text-foreground",
-                )}
-              >
-                {row.usd}
-              </span>
-              <ShareMark share={row.share} />
-            </li>
-          ))}
+              </li>
+            );
+          })}
           {more && (
             <li
               data-cost-fold
@@ -148,7 +163,7 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
         </p>
       )}
       {figures ? (
-        <div className="grid grid-cols-1 lg:grid-cols-3">
+        <div className="grid grid-cols-1 lg:grid-cols-3 [&>*]:min-w-0">
           <Rows title="Missions" rows={figures.missions} />
           <Rows title="Tasks" rows={figures.tasks} more={figures.tasks_more} />
           <Rows title="Agents" rows={figures.agents} more={figures.agents_more} />
