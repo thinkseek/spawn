@@ -352,8 +352,35 @@ select e.recorded_at_ms
  where e.session_id = 'session_control' and e.event_name = 'control.recorded'
    and e.kind -> 'detail' -> 'record' ->> 'type' = $1
    and e.kind -> 'detail' -> 'record' -> 'ok' = 'true'::jsonb
- order by e.id desc
+ order by e.recorded_at_ms desc, e.id desc
  limit 1";
+
+/// A drill record type's two facts in one statement (objective 105): the
+/// newest control record of type `$1` whatever its `ok` (`at_ms`,
+/// `record`), and its last pass (`passed_at_ms`): that record's time when
+/// it passed, else the newest record of the type with `ok` true (a subplan
+/// in the CASE branch not taken does not run, so a passed newest costs one
+/// lookup). Newest is by recorded time, the id breaking a tie: the order of
+/// spawn_events_control_record_type, one backward index read each. No row
+/// without a record of the type.
+pub(crate) const DRILL_OF_TYPE: &str = r"
+with newest as (
+  select e.recorded_at_ms as at_ms, e.kind -> 'detail' -> 'record' as record
+    from spawn_events e
+   where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+     and e.kind -> 'detail' -> 'record' ->> 'type' = $1
+   order by e.recorded_at_ms desc, e.id desc
+   limit 1)
+select jsonb_build_object('at_ms', n.at_ms, 'record', n.record,
+  'passed_at_ms', case when n.record -> 'ok' = 'true'::jsonb then n.at_ms
+                       else (select e.recorded_at_ms from spawn_events e
+                              where e.session_id = 'session_control'
+                                and e.event_name = 'control.recorded'
+                                and e.kind -> 'detail' -> 'record' ->> 'type' = $1
+                                and e.kind -> 'detail' -> 'record' -> 'ok' = 'true'::jsonb
+                              order by e.recorded_at_ms desc, e.id desc
+                              limit 1) end)
+  from newest n";
 
 /// Every distinct mission source, sorted: what a full bundle holds.
 pub(crate) const SOURCES: &str = r"
@@ -390,6 +417,15 @@ impl PostgresStore {
     pub fn newest_passed_record(&self, kind: &str) -> Result<Option<i64>, StoreError> {
         Ok(self
             .query_opt(NEWEST_PASSED, &[&kind])?
+            .map(|row| row.get(0)))
+    }
+
+    /// The newest record of type `kind` and its last pass
+    /// ([`DRILL_OF_TYPE`]): `{at_ms, record, passed_at_ms}`; `None` without
+    /// a record of the type.
+    pub fn drill_of_type(&self, kind: &str) -> Result<Option<Value>, StoreError> {
+        Ok(self
+            .query_opt(DRILL_OF_TYPE, &[&kind])?
             .map(|row| row.get(0)))
     }
 
