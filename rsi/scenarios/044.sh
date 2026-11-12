@@ -255,7 +255,7 @@ mkdir -p "$WORK/claude-config" "$WORK/state"
 # workspace (n = the lines already there + 1). A turn logs, as it starts,
 # the lines work.txt holds and whether they are exactly `work 1..n`
 # (turns.log). Its PID is in pid-<agent>.
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 mode=new
@@ -306,7 +306,7 @@ turn() {
 printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     if [ "$pending" = 0 ]; then
       line '"type":"user","message":{"role":"user","content":"prompt"}'

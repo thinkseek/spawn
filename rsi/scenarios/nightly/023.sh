@@ -274,7 +274,7 @@ done
 # second of quiet, the transcript's end of the turn first, then the prompt.
 # A turn whose text names `BB:HANG` never ends: the screen shows a running
 # turn and the engine writes nothing more (a worker busy and quiet).
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -295,7 +295,7 @@ printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 hang=
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     if [ "$pending" = 0 ]; then
       line '"type":"user","message":{"role":"user","content":"prompt"}'

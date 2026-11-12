@@ -292,7 +292,7 @@ lane_loop_env() {
     # ($BB_WORK/src-<name>, else $BB_WORK/source.git) holds the file on
     # spawn/<agent> (or 30 s passed), a second turn writes the report. A
     # session that is not a resident (the supervisor) takes no job.
-    cat >"$WORK/claude" <<'ENGINE'
+    bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -329,7 +329,7 @@ printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 job=
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     if [ "$pending" = 0 ]; then
       line '"type":"user","message":{"role":"user","content":"prompt"}'
