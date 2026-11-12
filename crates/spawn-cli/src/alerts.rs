@@ -5168,14 +5168,22 @@ mod tests {
         idle_world(&mut monitor);
         // Mission 4 has a task in work; cancel it, then pause it before
         // the bound: it never fires, past the bound or long after.
-        feed(&mut monitor, 24, 4_000, json!({"type": "task.cancelled", "id": 4}));
+        feed(
+            &mut monitor,
+            24,
+            4_000,
+            json!({"type": "task.cancelled", "id": 4}),
+        );
         let paused = feed(
             &mut monitor,
             25,
             5_000,
             json!({"type": "mission.paused", "id": 4, "reason": "owner hold"}),
         );
-        assert!(decided(&monitor, paused).is_empty(), "nothing open to clear");
+        assert!(
+            decided(&monitor, paused).is_empty(),
+            "nothing open to clear"
+        );
         let fired = read_idle(&monitor, 50_000_000);
         assert_eq!(
             fires(&fired),

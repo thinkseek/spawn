@@ -1703,7 +1703,8 @@ controller. Missions, tasks, residents and landings are events in
   `control.recorded`, whose detail is `{type, ...}`. A new record type adds
   no `EventKind` variant.
 - **Record types:** `mission.added`, `mission.configured`, `mission.closed`,
-  `mission.halted`, `mission.resumed`, `source.moved`, `source.held`,
+  `mission.halted`, `mission.resumed`, `mission.paused`, `mission.unpaused`,
+  `source.moved`, `source.held`,
   `source.released`, `source.hold_expired`, `task.assigned`,
   `task.delivered`, `task.report_unfinished`, `task.reported`,
   `task.reviewed`, `task.cancelled`, `task.gated`, `task.held`, `task.landed`,
@@ -1712,6 +1713,20 @@ controller. Missions, tasks, residents and landings are events in
   `source.push_requested`, `source.push_refused`, `source.push_no_verdict`
   (§10.3, "The owner's landings"), and the loop's alerts: `alert.fired` and `alert.cleared`
   (§3.4, folded into `spawn_alerts`).
+  `mission.paused` {id, reason} is the owner's hold on a mission (`spawn
+  mission pause`, a human only; objective 099), never of a closed or an
+  already paused one; `mission.unpaused` {id, pause_event} is `spawn mission
+  resume` of a paused mission, and clears only the pause (a halt it is in
+  stays, for a second resume). While a mission is paused no objective is
+  assigned to it (`spawn_objective_assign` refuses, naming the pause),
+  nothing is delivered to its workers, its resident and the workers of its
+  delivered tasks are stopped by the dispatcher's Stop (`pause-<mission>-
+  <pause record>-<execution>`: a final checkpoint, recorded `stopped`, never
+  revived) and its delivered tasks stay delivered; no `mission_idle` fires
+  (a pause clears an open one) and the Scorecard counts its paused time as
+  `paused_hours`, not idle. At the unpause each worker the pause stopped is
+  resumed once in its own native session (`unpause-<mission>-<unpause
+  record>-<session>`), on its workspace rebuilt from its branch.
   `task.report_unfinished` is a delivered task's report the dispatcher read
   and did not take because it is still a draft: it names the task's
   `revision`, the content's `digest`, the `markers` (each with its `line`,

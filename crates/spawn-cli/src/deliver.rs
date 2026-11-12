@@ -1470,7 +1470,10 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
             });
         }
     }
-    let ordered: BTreeSet<String> = orders.iter().map(|order| order.session_id.clone()).collect();
+    let ordered: BTreeSet<String> = orders
+        .iter()
+        .map(|order| order.session_id.clone())
+        .collect();
     orders.extend(
         pause_orders(work, &facts)
             .into_iter()
@@ -2212,13 +2215,13 @@ mod tests {
         mark_delivery, new_report, news_items, next_due, next_up, notice_task, put_aside,
         report_contract, report_due, retry_wait_ms, task_prompt, typed,
     };
-    use std::collections::BTreeSet;
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
     use spawn_core::command::CommandAction;
     use spawn_core::event::{ModelProfile, SessionSeq};
     use spawn_core::mission::TaskState;
     use spawn_core::observation::{Ambiguity, Confidence, Observation, SemanticState};
+    use std::collections::BTreeSet;
 
     fn task(id: i64, state: TaskState, kind: &str) -> TaskRow {
         TaskRow {
@@ -2991,7 +2994,10 @@ mod tests {
         else {
             panic!("a resume, not {:?}", resume.action);
         };
-        assert!(prompt.contains("Mission #1 resumed by the owner"), "{prompt}");
+        assert!(
+            prompt.contains("Mission #1 resumed by the owner"),
+            "{prompt}"
+        );
         assert!(prompt.contains("Continue task #4"), "{prompt}");
         assert!(
             plan.iter().any(|order| order.task == Some(6)),
