@@ -1326,30 +1326,43 @@ fn a_store_restored_in_place_leaves_no_kept_fact_behind() {
 /// probe passes, is read whole, not merged into the old database's facts.
 /// The case makes its own database, and drops it and its logins after.
 /// What the drops may touch (the lead's two conditions): the database's
-/// name is made here for this run (`spawn_test_<pid>_<nanos>_kept_oid`),
+/// name is made here for this run (`spawn_test_<pid>_<nanos>_oid`, every
+/// nanosecond since the epoch),
 /// never read from the environment or from the URL's own database, and
 /// every drop names that literal (and the three logins migrate made for
 /// it, `<login>_<name>`), nothing by pattern. The drops are this case's
 /// own lines, not a helper shared with other tests. After a failed
 /// assertion the database may be left behind (the reviewed reaper's
-/// print-only list shows it); the drop after the case is only tried.
+/// print-only list shows it); the drop after the case is only tried, and
+/// only for a database (and logins) this case's own `create database`
+/// made: a name that already existed fails the case and is left alone.
 #[test]
 fn a_database_made_again_under_its_name_is_another_store() {
     let url = common::url();
+    // Every nanosecond since the epoch, not the second's alone: in the
+    // gate's pid namespace the pid repeats on every run (rev-e's F3). Short
+    // enough that each login is `<base>_<name>` (spawn_login_role hashes a
+    // name only past 63 characters).
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.subsec_nanos());
-    let name = format!("spawn_test_{}_{nanos:x}_kept_oid", std::process::id());
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let name = format!("spawn_test_{}_{nanos:x}_oid", std::process::id());
+    assert!("spawn_supervisor_".len() + name.len() <= 63, "{name}");
     let ours = url
         .rsplit_once('/')
         .map_or(url.clone(), |(server, _)| format!("{server}/{name}"));
     let mut maintenance = Client::connect(&url, NoTls).expect("admin");
+    // Whether the database (and so its logins) is this case's: set only
+    // once its `create database` succeeded, so a name that already existed
+    // is never dropped here (rev-e's F3).
+    let (mut made, mut ever_made) = (false, false);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // The first history, then one that differs but for its last record.
         for (ids, until) in [([1, 2, 3], 1_000), ([9, 8, 3], 1_100)] {
             maintenance
                 .batch_execute(&format!("create database {name}"))
                 .expect("the database");
+            (made, ever_made) = (true, true);
             let store = PostgresStore::connect(&ours).expect("connect");
             store.migrate().expect("migrate");
             let mut client = Client::connect(&ours, NoTls).expect("its owner");
@@ -1369,11 +1382,16 @@ fn a_database_made_again_under_its_name_is_another_store() {
             maintenance
                 .batch_execute(&format!("drop database {name} with (force)"))
                 .expect("drop the case's database");
+            made = false;
         }
     }));
-    let _ = maintenance.batch_execute(&format!("drop database if exists {name} with (force)"));
-    for base in ["spawn_human", "spawn_reader", "spawn_supervisor"] {
-        let _ = maintenance.batch_execute(&format!("drop role if exists {base}_{name}"));
+    if made {
+        let _ = maintenance.batch_execute(&format!("drop database {name} with (force)"));
+    }
+    if ever_made {
+        for base in ["spawn_human", "spawn_reader", "spawn_supervisor"] {
+            let _ = maintenance.batch_execute(&format!("drop role if exists {base}_{name}"));
+        }
     }
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
