@@ -4470,6 +4470,19 @@ expect "1, then 1 at load, 0 alone but slow: rejected, slower alone" \
     "$(class_judge loadslow "$good" SPAWN_GATE_SOLO_SLOW_MS=1000)" \
     'exit=0 {"verdict":"rejected","reason":"regression: 768.sh fails on the candidate: slower alone than the base (alone '
 expect "with its stage line alone" "$(alone_stage 768)" 'loaded=2 alone=1.'
+# 772: slower alone than twice the base but not by the slack (60 s here):
+# load-sensitive, not rejected: the slow rule needs both (rev-e N2).
+class_dir loadslowish
+scheduled loadslowish 772 PPP FFS
+expect "1, then 1 at load, 0 alone, slower than twice the base but within the slack: load-sensitive" \
+    "$(class_judge loadslowish "$good" SPAWN_GATE_SOLO_SLOW_MS=60000)" \
+    'exit=6 {"cannot_judge":true,"scenario":"772.sh","runs":"1, then 1 at 4 at a time, then 0 alone on the candidate;'
+# 773: 1, then 0, then 1 at load and 0 alone: load-sensitive (rev-e N3).
+class_dir loadthirdpass
+scheduled loadthirdpass 773 PPP FPFP
+expect "1, then 0, then 1 at load and 0 alone: load-sensitive, cannot judge" \
+    "$(class_judge loadthirdpass "$good")" \
+    'exit=6 {"cannot_judge":true,"scenario":"773.sh","runs":"1, then 0, then 1 at 4 at a time, then 0 alone on the candidate; 0, then 0 on the base, run now","reason":"load-sensitive on the candidate: fails at 4 at a time (1, then 0, then 1), passes alone (0)'
 # D2: one exit 1 and no pass (1, then 2) at load gets no run alone: a
 # candidate that fouls its own server is shown by it (759, 760, 105).
 class_dir loadonevote

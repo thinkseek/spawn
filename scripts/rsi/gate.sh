@@ -181,7 +181,9 @@
 #   on a fresh one. So when two exit 1s would reject (1, then 1; 1, then 0,
 #   then 1) and they ran at load (SPAWN_GATE_JOBS above 1, the scenario not
 #   on the serial list), the candidate runs it once more as the base did:
-#   alone, on a fresh test server of its own, in a fresh sandbox, its stage
+#   alone, on a fresh test server of its own (with the gate's own server,
+#   SPAWN_GATE_PG_*; without one, on the shared server, as the base's runs
+#   then are), in a fresh sandbox, its stage
 #   line "... must still pass (alone)". An exit 1 alone: the candidate
 #   failure stands. An exit 0 alone: `cannot_judge`, "load-sensitive on the
 #   candidate: fails at <n> at a time (...), passes alone (0) as the base
