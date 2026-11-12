@@ -544,20 +544,20 @@ mod tests {
 
         // A first read that runs over the wait: not collected, no hang.
         let slow = Arc::new(Cache::default());
-        let (hold, held) = mpsc::channel::<()>();
+        let (unblock, blocked) = mpsc::channel::<()>();
         let started_at = Instant::now();
         let none = slow.get(
             &plan("/s"),
             0,
             Duration::from_millis(100),
             move |_: &Plan, _: Option<&Reading>, _: i64| {
-                let _ = held.recv();
+                let _ = blocked.recv();
                 reading(4)
             },
         );
         assert!(none.is_none());
         assert!(started_at.elapsed() < Duration::from_secs(2));
-        drop(hold);
+        drop(unblock);
     }
 
     /// A walk past its bound keeps the previous figure, never a partial

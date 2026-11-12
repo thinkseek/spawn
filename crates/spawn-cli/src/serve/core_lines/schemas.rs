@@ -245,16 +245,51 @@ mod tests {
         assert!(check(&key_value).is_ok());
 
         for (name, url, mode, want) in [
-            ("loose", "postgres://bb@127.0.0.1/spawn_test", 0o644, "mode 0644"),
-            ("group", "postgres://bb@127.0.0.1/spawn_test", 0o640, "mode 0640"),
-            ("remote", "postgres://bb@192.0.2.1:5432/spawn_test", 0o600, "not this one's"),
-            ("named", "postgres://bb@db.example.com/spawn_test", 0o600, "not this one's"),
+            (
+                "loose",
+                "postgres://bb@127.0.0.1/spawn_test",
+                0o644,
+                "mode 0644",
+            ),
+            (
+                "group",
+                "postgres://bb@127.0.0.1/spawn_test",
+                0o640,
+                "mode 0640",
+            ),
+            (
+                "remote",
+                "postgres://bb@192.0.2.1:5432/spawn_test",
+                0o600,
+                "not this one's",
+            ),
+            (
+                "named",
+                "postgres://bb@db.example.com/spawn_test",
+                0o600,
+                "not this one's",
+            ),
             ("live", live, 0o600, "live database"),
             // The live database under other spellings: TCP loopback against
             // its socket, an explicit default port, another user, ::1.
-            ("live_tcp", "postgres://spawn@127.0.0.1/spawn_live", 0o600, "live database"),
-            ("live_port", "postgres://spawn@localhost:5432/spawn_live", 0o600, "live database"),
-            ("live_user", "postgres://someone_else:pw@[::1]:5432/spawn_live", 0o600, "live database"),
+            (
+                "live_tcp",
+                "postgres://spawn@127.0.0.1/spawn_live",
+                0o600,
+                "live database",
+            ),
+            (
+                "live_port",
+                "postgres://spawn@localhost:5432/spawn_live",
+                0o600,
+                "live database",
+            ),
+            (
+                "live_user",
+                "postgres://someone_else:pw@[::1]:5432/spawn_live",
+                0o600,
+                "live database",
+            ),
             ("garbage", "not a url at all ===", 0o600, "postgres URL"),
         ] {
             let why = check(&url_file(dir, name, url, mode)).expect_err(name);
@@ -265,7 +300,12 @@ mod tests {
             );
         }
         // Another port is another server's database.
-        let other_port = url_file(dir, "other_port", "postgres://spawn@127.0.0.1:5433/spawn_live", 0o600);
+        let other_port = url_file(
+            dir,
+            "other_port",
+            "postgres://spawn@127.0.0.1:5433/spawn_live",
+            0o600,
+        );
         assert!(check(&other_port).is_ok());
         // Not this user's: checked against another uid.
         let why = url_from_file(&socket, Some(live), me.wrapping_add(1)).expect_err("not mine");
@@ -364,6 +404,31 @@ mod tests {
         }
     }
 
+    /// The statements that make the test's eight schemas (`names`, in the
+    /// order of [`the_test_database_read_counts_only_the_leftovers`]): the
+    /// held, the old ones and the one whose pid runs made 25 h ago, the
+    /// fresh one now, a bad comment, the rest with none.
+    fn making(names: &[String], now: i64, day_ago: i64) -> String {
+        use std::fmt::Write as _;
+        let mut sql = String::new();
+        for name in names {
+            let _ = write!(sql, "create schema {name}; ");
+        }
+        for (name, at) in [
+            (&names[0], day_ago),
+            (&names[1], now),
+            (&names[2], day_ago),
+            (&names[3], day_ago),
+        ] {
+            let _ = write!(
+                sql,
+                "comment on schema {name} is '{{\"made_at_ms\": {at}}}'; "
+            );
+        }
+        let _ = write!(sql, "comment on schema {} is 'made by hand'; ", names[6]);
+        sql
+    }
+
     /// Against the test database: the one read gives each schema's comment
     /// and whether a live session holds it, and the leaked count is held,
     /// fresh, old with its pid gone, old with its pid alive, no comment
@@ -410,23 +475,7 @@ mod tests {
             .expect("the clock")
             .get(0);
         let day_ago = now - 25 * HOUR;
-        let comment = |at: i64| format!("'{{\"made_at_ms\": {at}}}'");
-        let mut sql = String::new();
-        for name in &made.names {
-            sql.push_str(&format!("create schema {name}; "));
-        }
-        for (name, at) in [
-            (&names[0], day_ago),
-            (&names[1], now),
-            (&names[2], day_ago),
-            (&names[3], day_ago),
-        ] {
-            sql.push_str(&format!("comment on schema {name} is {}; ", comment(at)));
-        }
-        sql.push_str(&format!(
-            "comment on schema {} is 'made by hand'; ",
-            names[6]
-        ));
+        let sql = making(&names, now, day_ago);
         client.batch_execute(&sql).expect("make the schemas");
         // A live session holding the first, as a running test's store.
         let mut holder = postgres::Client::connect(&url, postgres::NoTls).expect("connect");

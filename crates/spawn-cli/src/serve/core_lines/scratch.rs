@@ -398,7 +398,7 @@ mod tests {
             fill(&root.join(name), 700);
         }
         fill(&root.join("loose.txt"), 60);
-        let old = SystemTime::now() - Duration::from_secs(2 * 86_400);
+        let old = SystemTime::now() - Duration::from_hours(48);
         for name in [
             "owned",
             "gone",
