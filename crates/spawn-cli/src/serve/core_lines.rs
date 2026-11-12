@@ -1020,4 +1020,78 @@ mod tests {
         assert_eq!(figures[3].value, json!(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Objective 090: a figure's trend is one point per UTC day of the last
+    /// 7 that has a sample carrying it, that day's last; a day without one
+    /// has no point; a sample outside the window is left out.
+    #[test]
+    fn a_trend_is_each_days_last_sample_of_the_last_seven() {
+        const D: i64 = super::DAY_MS;
+        const H: i64 = 3_600_000;
+        // 2026-11-12, 13:30 UTC.
+        let midnight = 20_404 * D;
+        let now = midnight + 13 * H + 30 * 60_000;
+        assert_eq!(super::trend_since(now), midnight - 6 * D);
+        let samples = json!([
+            {"at_ms": midnight - 8 * D + H, "values": {"a.one": 1}},
+            {"at_ms": midnight - 7 * D + 23 * H, "values": {"a.one": 2}},
+            {"at_ms": midnight - 6 * D, "values": {"a.one": 100, "a.two": 7}},
+            {"at_ms": midnight - 3 * D + H, "values": {"a.one": 110, "a.two": null}},
+            {"at_ms": midnight - D + H, "values": {"a.one": 999, "a.two": 8}},
+            {"at_ms": midnight - D + 5 * H, "values": {"a.one": 120.5}},
+            {"at_ms": now, "values": {"a.one": 121}},
+            {"at_ms": midnight + D + H, "values": {"a.one": 5}},
+        ]);
+        let trends = super::trends(&samples, now);
+        assert_eq!(
+            json!(trends["a.one"]),
+            json!([
+                {"day": "2026-11-06", "value": 100},
+                {"day": "2026-11-09", "value": 110},
+                {"day": "2026-11-11", "value": 120.5},
+                {"day": "2026-11-12", "value": 121},
+            ])
+        );
+        // A day whose last sample does not carry the figure keeps the
+        // day's last sample that does; a null is no point.
+        assert_eq!(
+            json!(trends["a.two"]),
+            json!([{"day": "2026-11-06", "value": 7}, {"day": "2026-11-11", "value": 8}])
+        );
+        assert!(super::trends(&json!([]), now).is_empty());
+
+        // In the answer: every figure carries a trend, empty without one.
+        let mut trends = trends;
+        trends.insert("storage.free_bytes".to_string(), vec![json!({"day": "2026-11-12", "value": 3})]);
+        let view = answer(
+            &lines(&json!({"free_bytes": 3}), &Value::Null, Vec::new()),
+            &Value::Null,
+            Ok(None),
+            &trends,
+        );
+        for line in view["lines"].as_array().expect("lines") {
+            for figure in std::iter::once(&line["north_star"])
+                .chain(line["guardrails"].as_array().expect("guardrails"))
+            {
+                let want = if figure["key"] == "storage.free_bytes" {
+                    json!([{"day": "2026-11-12", "value": 3}])
+                } else {
+                    json!([])
+                };
+                assert_eq!(figure["trend"], want, "{figure}");
+            }
+        }
+    }
+
+    /// Objective 090: a sample holds every figure that has a value, and
+    /// none without.
+    #[test]
+    fn a_sample_holds_every_figure_with_a_value() {
+        let figures = lines(&json!({"free_bytes": 3, "days_left": 9}), &Value::Null, Vec::new());
+        let values = super::values_of(&figures);
+        assert_eq!(
+            Value::Object(values),
+            json!({"storage.free_bytes": 3, "storage.days_left": 9})
+        );
+    }
 }
