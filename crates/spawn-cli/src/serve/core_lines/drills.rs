@@ -15,12 +15,16 @@
 //!
 //! A row with `record` passed at the newest control record of that type
 //! with `ok` true (the database drill's `backup.verified`, backup.rs
-//! `record_verified`). A row with `unit` is read without root through
+//! `record_verified`); its newest drill (`last`, objective 105) is the
+//! newest record of that type whatever its `ok`, both read in one statement
+//! (`drill_of_type`). A row with `unit` is read without root through
 //! `$SPAWN_SYSTEMCTL show -p Result,ExecMainStatus,ExecMainExitTimestamp
 //! --timestamp=unix -- <unit>` (default `systemctl`), its arguments as argv
 //! and no shell, each call bounded ([`UNIT_LIMIT`]; one that runs over is no
 //! pass) and its duration logged: it passed when `Result` is `success` and
-//! `ExecMainStatus` 0, at its exit timestamp. A reading is kept for
+//! `ExecMainStatus` 0, at its exit timestamp, and the same output gives its
+//! newest run (`last`: not ok, with "Result=<Result>,
+//! ExecMainStatus=<status>", otherwise). A reading is kept for
 //! [`UNIT_KEPT_MS`]. A unit name other than
 //! `[A-Za-z0-9][A-Za-z0-9@._-]*.service` is never run ([`unit_allowed`]) and
 //! the log names it as refused: systemctl reads a leading `-` as an option
@@ -154,6 +158,86 @@ pub(super) fn parse_show(text: &str) -> Option<i64> {
     (seconds > 0).then(|| seconds.saturating_mul(1000))
 }
 
+/// A row's newest drill, whatever it gave (objective 105).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Last {
+    /// When it ended; `None` when that is not known (a unit's run with no
+    /// exit timestamp).
+    pub(super) at_ms: Option<i64>,
+    pub(super) ok: bool,
+    /// "" when it passed.
+    pub(super) reason: String,
+}
+
+/// What a row's drill gave: its last pass and its newest drill.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Reading {
+    pub(super) passed_at_ms: Option<i64>,
+    pub(super) last: Option<Last>,
+}
+
+impl Reading {
+    /// Counted by the north star at `since`: a pass at or after it, and a
+    /// newest drill that did not fail.
+    fn counts(&self, since: i64) -> bool {
+        self.passed_at_ms.is_some_and(|at| at >= since)
+            && self.last.as_ref().is_none_or(|last| last.ok)
+    }
+}
+
+/// The newest run in `systemctl show`'s output: ok exactly when `Result`
+/// is `success` and `ExecMainStatus` 0, at its `ExecMainExitTimestamp`
+/// (`None` without one), its reason "Result=<Result>,
+/// ExecMainStatus=<status>" when not ok. `None` for a unit that has not
+/// run: no `Result`, or a success with no exit timestamp (what systemd
+/// shows for a unit never started).
+pub(super) fn parse_last(text: &str) -> Option<Last> {
+    let mut properties = BTreeMap::new();
+    for line in text.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            properties.insert(key.trim(), value.trim());
+        }
+    }
+    let result = *properties.get("Result")?;
+    let status = properties.get("ExecMainStatus").copied().unwrap_or("");
+    let at_ms = properties
+        .get("ExecMainExitTimestamp")
+        .and_then(|at| at.trim_start_matches('@').parse::<i64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| seconds.saturating_mul(1000));
+    let ok = result == "success" && status == "0";
+    if ok && at_ms.is_none() {
+        return None;
+    }
+    Some(Last {
+        at_ms,
+        ok,
+        reason: if ok {
+            String::new()
+        } else {
+            format!("Result={result}, ExecMainStatus={status}")
+        },
+    })
+}
+
+/// A record type's reading from [`spawn_postgres::PostgresStore::drill_of_type`]'s
+/// `{at_ms, record, passed_at_ms}`: the newest record ok exactly when its
+/// `ok` is JSON true, its reason its `reason` when a string, else "".
+pub(super) fn record_reading(answer: Option<&Value>) -> Reading {
+    let Some(answer) = answer else {
+        return Reading::default();
+    };
+    let record = &answer["record"];
+    Reading {
+        passed_at_ms: answer["passed_at_ms"].as_i64(),
+        last: Some(Last {
+            at_ms: answer["at_ms"].as_i64(),
+            ok: record["ok"] == Value::Bool(true),
+            reason: record["reason"].as_str().unwrap_or("").to_string(),
+        }),
+    }
+}
+
 /// `<program> show -p Result,ExecMainStatus,ExecMainExitTimestamp
 /// --timestamp=unix -- <unit>`, as argv, no stdin, its output read: `Err`
 /// when it could not start, ran over `limit` (killed, with what it
@@ -231,15 +315,16 @@ pub(super) fn show(program: &str, unit: &str, limit: Duration) -> Result<String,
     }
 }
 
-/// The units' readings kept: `(read at, last pass)` by unit.
-static UNITS: Mutex<BTreeMap<String, (i64, Option<i64>)>> = Mutex::new(BTreeMap::new());
+/// The units' readings kept: `(read at, reading)` by unit.
+static UNITS: Mutex<BTreeMap<String, (i64, Reading)>> = Mutex::new(BTreeMap::new());
 
 /// The refused names already in the log: each is named once.
 static REFUSED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
-/// A unit's last pass at `now_ms`, kept for [`UNIT_KEPT_MS`]; each call is
-/// logged with its duration. A refused name is logged (once) and not run.
-fn unit_pass(unit: &str, now_ms: i64) -> Option<i64> {
+/// A unit's last pass and last run at `now_ms`, from one `systemctl show`,
+/// kept for [`UNIT_KEPT_MS`]; each call is logged with its duration. A
+/// refused name is logged (once) and not run.
+fn unit_reading(unit: &str, now_ms: i64) -> Reading {
     if !unit_allowed(unit) {
         let mut refused = REFUSED
             .lock()
@@ -249,71 +334,86 @@ fn unit_pass(unit: &str, now_ms: i64) -> Option<i64> {
                 "core-lines: drill unit {unit:?} refused: not [A-Za-z0-9][A-Za-z0-9@._-]*.service"
             );
         }
-        return None;
+        return Reading::default();
     }
-    if let Some((at, pass)) = UNITS
+    if let Some((at, reading)) = UNITS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(unit)
-        .copied()
+        .cloned()
         && now_ms.saturating_sub(at) < UNIT_KEPT_MS
     {
-        return pass;
+        return reading;
     }
     let program = crate::env_value("SPAWN_SYSTEMCTL").unwrap_or_else(|| "systemctl".to_string());
     let started = Instant::now();
     let shown = show(&program, unit, UNIT_LIMIT);
     let took = started.elapsed().as_millis();
-    let pass = match shown {
+    let reading = match shown {
         Ok(text) => {
             eprintln!("core-lines: {program} show {unit}: {took} ms");
-            parse_show(&text)
+            Reading {
+                passed_at_ms: parse_show(&text),
+                last: parse_last(&text),
+            }
         }
         Err(why) => {
             eprintln!("core-lines: {program} show {unit}: {why} ({took} ms)");
-            None
+            Reading::default()
         }
     };
     UNITS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(unit.to_string(), (now_ms, pass));
-    pass
+        .insert(unit.to_string(), (now_ms, reading.clone()));
+    reading
 }
 
-/// Each row's last pass, in order: a record's from `record`, a unit's from
-/// `unit` (only for a name [`unit_allowed`] takes), none without a drill.
-pub(super) fn last_passes(
+/// Each row's reading, in order: a record's from `record` (each type read
+/// once however many rows name it), a unit's from `unit` (only for a name
+/// [`unit_allowed`] takes), none without a drill.
+pub(super) fn readings(
     config: &Config,
-    mut record: impl FnMut(&str) -> Option<i64>,
-    mut unit: impl FnMut(&str) -> Option<i64>,
-) -> Vec<Option<i64>> {
+    mut record: impl FnMut(&str) -> Reading,
+    mut unit: impl FnMut(&str) -> Reading,
+) -> Vec<Reading> {
+    let mut types: BTreeMap<&str, Reading> = BTreeMap::new();
     config
         .drills
         .iter()
         .map(|drill| match &drill.source {
-            Source::Record(kind) => record(kind),
+            Source::Record(kind) => types
+                .entry(kind.as_str())
+                .or_insert_with(|| record(kind))
+                .clone(),
             Source::Unit(name) if unit_allowed(name) => unit(name),
-            Source::Unit(_) | Source::None => None,
+            Source::Unit(_) | Source::None => Reading::default(),
         })
         .collect()
 }
 
-/// The answer's `drills`: `{name, source, passed_at_ms}` in the file's
-/// order, `source` "record <type>", "unit <name>" or null.
-pub(super) fn drills_json(config: &Config, passes: &[Option<i64>]) -> Value {
+/// The answer's `drills`: `{name, source, passed_at_ms, last}` in the
+/// file's order, `source` "record <type>", "unit <name>" or null, `last`
+/// `{at_ms, ok, reason}` or null.
+pub(super) fn drills_json(config: &Config, readings: &[Reading]) -> Value {
     json!(
         config
             .drills
             .iter()
-            .zip(passes)
-            .map(|(drill, pass)| {
+            .zip(readings)
+            .map(|(drill, reading)| {
                 let source = match &drill.source {
                     Source::Record(kind) => json!(format!("record {kind}")),
                     Source::Unit(unit) => json!(format!("unit {unit}")),
                     Source::None => Value::Null,
                 };
-                json!({"name": drill.name, "source": source, "passed_at_ms": pass})
+                let last = reading.last.as_ref().map_or(Value::Null, |last| {
+                    json!({"at_ms": last.at_ms, "ok": last.ok, "reason": last.reason})
+                });
+                json!({
+                    "name": drill.name, "source": source,
+                    "passed_at_ms": reading.passed_at_ms, "last": last,
+                })
             })
             .collect::<Vec<_>>()
     )
@@ -328,26 +428,27 @@ pub(super) fn status_at_ms(path: Option<&Path>) -> Option<i64> {
     Some(seconds.saturating_mul(1000))
 }
 
-/// The north star and the two ages at `now_ms`, from the rows' last passes
+/// The north star and the two ages at `now_ms`, from the rows' readings
 /// and the status file's moment:
 /// - `recoverability.restores_passed`: the rows whose last pass is within
-///   7 days; null with no rows;
+///   7 days and whose newest drill did not fail (none, or ok: objective
+///   105); null with no rows;
 /// - `recoverability.session_backup_age`: `now_ms` less the status file's
 ///   moment; null without one;
 /// - `recoverability.oldest_drill_age`: `now_ms` less the oldest last pass,
 ///   rows that never passed left out; null with none.
 pub(super) fn figures(
-    passes: &[Option<i64>],
+    readings: &[Reading],
     status_at_ms: Option<i64>,
     now_ms: i64,
 ) -> (Figure, Vec<Figure>) {
     let age =
         |at: Option<i64>| at.map_or(Value::Null, |at| json!(now_ms.saturating_sub(at).max(0)));
     let since = now_ms.saturating_sub(WEEK_MS);
-    let within = if passes.is_empty() {
+    let within = if readings.is_empty() {
         Value::Null
     } else {
-        json!(passes.iter().flatten().filter(|at| **at >= since).count())
+        json!(readings.iter().filter(|reading| reading.counts(since)).count())
     };
     (
         Figure::new(
@@ -367,7 +468,7 @@ pub(super) fn figures(
                 "recoverability.oldest_drill_age",
                 "Age of the oldest passed drill",
                 "ms",
-                age(passes.iter().flatten().min().copied()),
+                age(readings.iter().filter_map(|reading| reading.passed_at_ms).min()),
             ),
         ],
     )
@@ -381,9 +482,10 @@ pub(super) struct Drills {
     pub(super) list: Value,
 }
 
-/// Read the drills of the file's `text` at `now_ms`: a record's last pass
-/// from the store (a failed read is no pass, and logged), a unit's through
-/// systemctl ([`unit_pass`]). The two ages join the line only when the file
+/// Read the drills of the file's `text` at `now_ms`: a record type's newest
+/// record and last pass from the store in one statement (a failed read is
+/// no reading, and logged), a unit's through systemctl
+/// ([`unit_reading`]). The two ages join the line only when the file
 /// names its recovery table (`recoverability`): without one both would be
 /// null by construction, and objective 087's line stays its four
 /// guardrails. The north star is always there (null with no rows).
@@ -393,34 +495,34 @@ pub(super) fn read(
     now_ms: i64,
 ) -> Drills {
     let config = config(text);
-    let passes = last_passes(
+    let readings = readings(
         &config,
-        |kind| match store.newest_passed_record(kind) {
-            Ok(at) => at,
+        |kind| match store.drill_of_type(kind) {
+            Ok(answer) => record_reading(answer.as_ref()),
             Err(error) => {
-                eprintln!("core-lines: the newest passing {kind}: {error}");
-                None
+                eprintln!("core-lines: the newest {kind}: {error}");
+                Reading::default()
             }
         },
-        |unit| unit_pass(unit, now_ms),
+        |unit| unit_reading(unit, now_ms),
     );
     // A refused name is named in the log too.
     for drill in &config.drills {
         if let Source::Unit(unit) = &drill.source
             && !unit_allowed(unit)
         {
-            unit_pass(unit, now_ms);
+            unit_reading(unit, now_ms);
         }
     }
     let (north_star, mut guardrails) =
-        figures(&passes, status_at_ms(config.status.as_deref()), now_ms);
+        figures(&readings, status_at_ms(config.status.as_deref()), now_ms);
     if !config.present {
         guardrails.clear();
     }
     Drills {
         north_star,
         guardrails,
-        list: drills_json(&config, &passes),
+        list: drills_json(&config, &readings),
     }
 }
 
