@@ -1062,7 +1062,10 @@ mod tests {
 
         // In the answer: every figure carries a trend, empty without one.
         let mut trends = trends;
-        trends.insert("storage.free_bytes".to_string(), vec![json!({"day": "2026-11-12", "value": 3})]);
+        trends.insert(
+            "storage.free_bytes".to_string(),
+            vec![json!({"day": "2026-11-12", "value": 3})],
+        );
         let view = answer(
             &lines(&json!({"free_bytes": 3}), &Value::Null, Vec::new()),
             &Value::Null,
@@ -1087,7 +1090,11 @@ mod tests {
     /// none without.
     #[test]
     fn a_sample_holds_every_figure_with_a_value() {
-        let figures = lines(&json!({"free_bytes": 3, "days_left": 9}), &Value::Null, Vec::new());
+        let figures = lines(
+            &json!({"free_bytes": 3, "days_left": 9}),
+            &Value::Null,
+            Vec::new(),
+        );
         let values = super::values_of(&figures);
         assert_eq!(
             Value::Object(values),

@@ -252,15 +252,33 @@ mod tests {
         let start = 1_000_000;
         assert_eq!(at(&mut sampler, start, &mut written, false), Ok(true));
         assert_eq!(at(&mut sampler, start + 1, &mut written, false), Ok(false));
-        assert_eq!(at(&mut sampler, start + H - 1, &mut written, false), Ok(false));
+        assert_eq!(
+            at(&mut sampler, start + H - 1, &mut written, false),
+            Ok(false)
+        );
         // The hour's sample cannot be written: a line, tried a minute later.
         let failed = at(&mut sampler, start + H, &mut written, true);
-        assert!(failed.as_ref().is_err_and(|line| line.contains("down")), "{failed:?}");
-        assert_eq!(at(&mut sampler, start + H + 59_999, &mut written, false), Ok(false));
-        assert_eq!(at(&mut sampler, start + H + 60_000, &mut written, false), Ok(true));
+        assert!(
+            failed.as_ref().is_err_and(|line| line.contains("down")),
+            "{failed:?}"
+        );
+        assert_eq!(
+            at(&mut sampler, start + H + 59_999, &mut written, false),
+            Ok(false)
+        );
+        assert_eq!(
+            at(&mut sampler, start + H + 60_000, &mut written, false),
+            Ok(true)
+        );
         // The next is an hour after the one written.
-        assert_eq!(at(&mut sampler, start + 2 * H, &mut written, false), Ok(false));
-        assert_eq!(at(&mut sampler, start + 2 * H + 60_000, &mut written, false), Ok(true));
+        assert_eq!(
+            at(&mut sampler, start + 2 * H, &mut written, false),
+            Ok(false)
+        );
+        assert_eq!(
+            at(&mut sampler, start + 2 * H + 60_000, &mut written, false),
+            Ok(true)
+        );
         assert_eq!(
             written.iter().map(|(now, _)| *now).collect::<Vec<_>>(),
             [start, start + H + 60_000, start + 2 * H + 60_000]
@@ -274,7 +292,8 @@ mod tests {
     #[test]
     fn a_reading_that_failed_is_tried_again_in_a_minute() {
         let mut sampler = Sampler::every(H);
-        let result = sampler.check_with(0, || Reading::done(Err("no store".to_string())), |_| Ok(1));
+        let result =
+            sampler.check_with(0, || Reading::done(Err("no store".to_string())), |_| Ok(1));
         assert!(result.is_err_and(|line| line.contains("no store")));
         assert!(!sampler.due(59_999));
         assert!(sampler.due(60_000));
@@ -289,27 +308,31 @@ mod tests {
         let mut sampler = Sampler::every(H);
         let mut started = 0;
         let mut written = 0;
-        let mut check = |sampler: &mut Sampler, now: i64, hold: Option<std::sync::mpsc::Receiver<()>>| {
-            let begun = std::time::Instant::now();
-            let result = sampler.check_with(
-                now,
-                || {
-                    started += 1;
-                    Reading::spawn(move || {
-                        if let Some(hold) = hold {
-                            let _ = hold.recv();
-                        }
-                        Ok(super::tests::values())
-                    })
-                },
-                |_| {
-                    written += 1;
-                    Ok(1)
-                },
-            );
-            assert!(begun.elapsed() < std::time::Duration::from_secs(2), "the pass waited");
-            result
-        };
+        let mut check =
+            |sampler: &mut Sampler, now: i64, hold: Option<std::sync::mpsc::Receiver<()>>| {
+                let begun = std::time::Instant::now();
+                let result = sampler.check_with(
+                    now,
+                    || {
+                        started += 1;
+                        Reading::spawn(move || {
+                            if let Some(hold) = hold {
+                                let _ = hold.recv();
+                            }
+                            Ok(super::tests::values())
+                        })
+                    },
+                    |_| {
+                        written += 1;
+                        Ok(1)
+                    },
+                );
+                assert!(
+                    begun.elapsed() < std::time::Duration::from_secs(2),
+                    "the pass waited"
+                );
+                result
+            };
         assert_eq!(check(&mut sampler, 0, Some(hold)), Ok(None));
         assert_eq!(check(&mut sampler, 1000, None), Ok(None), "still reading");
         let given_up = check(&mut sampler, READ_LIMIT_MS, None);
