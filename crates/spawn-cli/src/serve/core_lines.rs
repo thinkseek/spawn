@@ -57,8 +57,10 @@
 //! [`recoverability`]) are the ages of the newest database copy and bundle
 //! (health.backups on `/api/fleet`), the age of the oldest nightly judging
 //! and how many sources the nightly holds red (its fact files,
-//! [`nightly_facts`]). The other lines' north stars are not collected yet;
-//! later objectives add their figures to this frame.
+//! [`nightly_facts`]). The recoverability north star and its two ages
+//! (objective 093) are the recovery table's drills, the rows the same file
+//! names under `recoverability` ([`drills`]); the answer lists them as
+//! `drills`. Later objectives add their figures to this frame.
 //!
 //! No range lives in code: they come only from the ranges file,
 //! `SPAWN_CORE_LINES_FILE`, by default `<workspace root>/core-lines.json`,
@@ -1009,7 +1011,13 @@ mod tests {
             ],
         });
         let view = answer(
-            &lines(&storage, &Value::Null, &Observed::default(), Value::Null, Vec::new()),
+            &lines(
+                &storage,
+                &Value::Null,
+                &Observed::default(),
+                Value::Null,
+                Vec::new(),
+            ),
             &json!("/ws/core-lines.json"),
             Ok(None),
             &std::collections::BTreeMap::new(),
@@ -1091,7 +1099,13 @@ mod tests {
         assert!((share - 300_000.0 / 5_100_000.0).abs() < 1e-12, "{share}");
         assert_eq!(values["first_pass"], json!(0.749));
         assert_eq!(values["usd_per_landing"], json!(8.08));
-        let line = &lines(&json!({}), &values, &Observed::default(), Value::Null, Vec::new())[0];
+        let line = &lines(
+            &json!({}),
+            &values,
+            &Observed::default(),
+            Value::Null,
+            Vec::new(),
+        )[0];
         let keys: Vec<&str> = std::iter::once(&line.north_star)
             .chain(&line.guardrails)
             .map(|figure| figure.key)
@@ -1119,7 +1133,13 @@ mod tests {
             json!({"report_to_live": null, "gate_time": null, "decided_nothing": null,
                    "first_pass": null, "usd_per_landing": null})
         );
-        let line = &lines(&json!({}), &none, &Observed::default(), Value::Null, Vec::new())[0];
+        let line = &lines(
+            &json!({}),
+            &none,
+            &Observed::default(),
+            Value::Null,
+            Vec::new(),
+        )[0];
         assert!(
             std::iter::once(&line.north_star)
                 .chain(&line.guardrails)
@@ -1128,7 +1148,15 @@ mod tests {
         // Neither answer read: every value null.
         assert_eq!(performance(&Value::Null, &Value::Null), none);
         assert_eq!(
-            lines(&json!({}), &values, &Observed::default(), Value::Null, Vec::new())[0].guardrails[3].name,
+            lines(
+                &json!({}),
+                &values,
+                &Observed::default(),
+                Value::Null,
+                Vec::new()
+            )[0]
+            .guardrails[3]
+                .name,
             "Dollars per landing (priced use only)",
             "the Cost page's priced dollars only (cc-astra A11)"
         );
@@ -1187,7 +1215,13 @@ mod tests {
             json!(840_000),
             "the guardrails are untouched"
         );
-        let line = &lines(&json!({}), &young, &Observed::default(), Value::Null, Vec::new())[0];
+        let line = &lines(
+            &json!({}),
+            &young,
+            &Observed::default(),
+            Value::Null,
+            Vec::new(),
+        )[0];
         assert_eq!(
             figure_json(&line.north_star, None),
             json!({"key": "performance.report_to_live", "name": "Time from report to live",
@@ -1206,13 +1240,27 @@ mod tests {
         let none = measured(values.clone(), None, now);
         assert_eq!(none["report_to_live"], Value::Null);
         assert_eq!(none["measuring_since_ms"], Value::Null);
-        let star = &lines(&json!({}), &none, &Observed::default(), Value::Null, Vec::new())[0].north_star;
+        let star = &lines(
+            &json!({}),
+            &none,
+            &Observed::default(),
+            Value::Null,
+            Vec::new(),
+        )[0]
+        .north_star;
         assert!(figure_json(star, None).get("measuring_since_ms").is_none());
         // Covered (exactly 7 days, and more): the Scorecard's value, no start.
         for first in [now - 7 * DAY, now - 30 * DAY] {
             let covered = measured(values.clone(), Some(first), now);
             assert_eq!(covered, values, "covered from {first}");
-            let star = &lines(&json!({}), &covered, &Observed::default(), Value::Null, Vec::new())[0].north_star;
+            let star = &lines(
+                &json!({}),
+                &covered,
+                &Observed::default(),
+                Value::Null,
+                Vec::new(),
+            )[0]
+            .north_star;
             let shown = figure_json(star, None);
             assert_eq!(shown["value"], json!(383_820_000));
             assert!(shown.get("measuring_since_ms").is_none());
@@ -1297,7 +1345,13 @@ mod tests {
         assert_eq!(bundle_only[0].value, Value::Null);
         assert_eq!(bundle_only[1].value, json!(6_000));
         // The line carries them as its guardrails, in order.
-        let line = &lines(&json!({}), &Value::Null, &Observed::default(), Value::Null, both)[3];
+        let line = &lines(
+            &json!({}),
+            &Value::Null,
+            &Observed::default(),
+            Value::Null,
+            both,
+        )[3];
         assert_eq!(line.name, "recoverability");
         assert_eq!(
             line.guardrails
@@ -1520,7 +1574,13 @@ mod tests {
             ]
         );
         // Nothing read: the two guardrails count too.
-        let bare = lines(&storage, &Value::Null, &Observed::default(), Value::Null, Vec::new());
+        let bare = lines(
+            &storage,
+            &Value::Null,
+            &Observed::default(),
+            Value::Null,
+            Vec::new(),
+        );
         assert_eq!(bare[2].guardrails[0].value, Value::Null);
         assert_eq!(bare[2].guardrails[1].value, Value::Null);
         assert_eq!(bare[2].guardrails[2].value, json!(9));

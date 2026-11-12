@@ -926,8 +926,7 @@ its `total_ms`, a share; null when the total is 0), `performance.first_pass`
 and `performance.usd_per_landing` (`/api/cost?window=7d`). A value the page
 does not have is not collected. These are kept for a minute, so Home's
 minute poll does not compute the 7-day windows again; the ranges file is
-still read at every request. The recoverability north star is not
-collected yet.
+still read at every request.
 
 The observability line (objective 092) has the north star
 `observability.needs_you_right`, "Needs you is right": of the alerts (not
@@ -936,8 +935,7 @@ share whose `outcome` is `cleared` (their condition cleared them, rather
 than the owner judging them false, stale or a duplicate); null with none.
 
 The recoverability line (objective 087) has the north star
-`recoverability.restores_passed` (not collected until the restore drills
-record) and four guardrails: `recoverability.cloud_dump_age` and
+`recoverability.restores_passed` (objective 093, below) and four guardrails: `recoverability.cloud_dump_age` and
 `recoverability.cloud_bundle_age` (ms since the newest `backup.dumped` and
 `backup.bundled`, the records health.backups names on `/api/fleet`),
 `recoverability.nightly_age` (ms since the oldest `judged_at` among the
@@ -949,6 +947,39 @@ as the integrator holds a source's landings). Each is null without its
 record or files. The card shows ages as spans ("32 min", "30 h"). The live
 ranges: copy max 7200000 (2 h), bundle max 93600000 (26 h), nightly age max
 93600000, nightly red max 0.
+
+The north star (objective 093) counts the critical resources whose
+restore drill passed in the last 7 days. Which resources count is the
+recovery table's (sync/recovery.md), so the rows live in the Core lines
+file beside the ranges, read at every request:
+`"recoverability": {"drills": [{"name", "record"?: <type>, "unit"?:
+<name>.service}], "session_backup_status"?: <path>}`. A row with `record`
+passed at the newest control record of that type with `ok` true (the
+database drill's `backup.verified`). A row with `unit` is read without root
+through `$SPAWN_SYSTEMCTL show -p Result,ExecMainStatus,ExecMainExitTimestamp
+--timestamp=unix -- <unit>` (`SPAWN_SYSTEMCTL` defaults to `systemctl`),
+run as argv with no shell, each call bounded to 3 s (one that runs over is
+killed and is no pass) and its duration in serve's log, a reading kept for
+60 s: it passed when `Result` is `success` and `ExecMainStatus` 0, at its
+exit timestamp. A unit name other than `[A-Za-z0-9][A-Za-z0-9@._-]*.service`
+is never run and serve's log names it as refused: a leading `-` is an
+option to systemctl (`-H<host>` is an SSH connection to that host, and the
+file is writable by the agents' account), and a `.timer` has no `ExecMain*`
+result. A row with neither has no drill. The figures:
+`recoverability.restores_passed` (count, the rows whose last pass is within
+7 days; null with no rows), then after 087's guardrails
+`recoverability.session_backup_age` (ms since the status file's `at`, epoch
+seconds; null without one) and `recoverability.oldest_drill_age` (ms since
+the oldest of the rows' last passes, rows that never passed left out; null
+with none). The answer lists `drills`, `[{name, source ("record <type>",
+"unit <name>" or null), passed_at_ms}]` in the file's order, and the Home
+card lists them under the recoverability row with their last pass, "never
+passed" or "no drill". The live file (a lead step, from recovery.md): the
+database (record `backup.verified`), the session files (unit
+`spawn-session-backup-drill.service`), the other rows as the table says,
+configuration and credentials with no drill; `session_backup_status`
+`/var/backups/spawn-sessions/status.json`; ranges: restores passed min 6,
+session backup max 1800000 (30 min), oldest drill max 604800000 (7 days).
 
 Ranges live only in one file, `SPAWN_CORE_LINES_FILE`, by default
 `<workspace root>/core-lines.json`, shaped `{"ranges": {<figure key>:

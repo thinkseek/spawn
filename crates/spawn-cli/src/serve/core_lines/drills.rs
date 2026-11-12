@@ -117,7 +117,9 @@ pub(super) fn unit_allowed(unit: &str) -> bool {
         return false;
     };
     let mut chars = stem.chars();
-    chars.next().is_some_and(|first| first.is_ascii_alphanumeric())
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-'))
 }
 
@@ -214,7 +216,9 @@ static REFUSED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 /// logged with its duration. A refused name is logged (once) and not run.
 fn unit_pass(unit: &str, now_ms: i64) -> Option<i64> {
     if !unit_allowed(unit) {
-        let mut refused = REFUSED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut refused = REFUSED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if refused.insert(unit.to_string()) {
             eprintln!(
                 "core-lines: drill unit {unit:?} refused: not [A-Za-z0-9][A-Za-z0-9@._-]*.service"
@@ -312,7 +316,8 @@ pub(super) fn figures(
     status_at_ms: Option<i64>,
     now_ms: i64,
 ) -> (Figure, Vec<Figure>) {
-    let age = |at: Option<i64>| at.map_or(Value::Null, |at| json!(now_ms.saturating_sub(at).max(0)));
+    let age =
+        |at: Option<i64>| at.map_or(Value::Null, |at| json!(now_ms.saturating_sub(at).max(0)));
     let since = now_ms.saturating_sub(WEEK_MS);
     let passed = if passes.is_empty() {
         Value::Null
@@ -354,7 +359,11 @@ pub(super) struct Drills {
 /// Read the drills of the file's `text` at `now_ms`: a record's last pass
 /// from the store (a failed read is no pass, and logged), a unit's through
 /// systemctl ([`unit_pass`]).
-pub(super) fn read(store: &spawn_postgres::PostgresStore, text: Option<&str>, now_ms: i64) -> Drills {
+pub(super) fn read(
+    store: &spawn_postgres::PostgresStore,
+    text: Option<&str>,
+    now_ms: i64,
+) -> Drills {
     let config = config(text);
     let passes = last_passes(
         &config,
@@ -375,8 +384,7 @@ pub(super) fn read(store: &spawn_postgres::PostgresStore, text: Option<&str>, no
             unit_pass(unit, now_ms);
         }
     }
-    let (north_star, guardrails) =
-        figures(&passes, status_at_ms(config.status.as_deref()), now_ms);
+    let (north_star, guardrails) = figures(&passes, status_at_ms(config.status.as_deref()), now_ms);
     Drills {
         north_star,
         guardrails,
