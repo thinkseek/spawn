@@ -87,22 +87,54 @@ impl Walked {
     }
 }
 
-/// The bytes appended to the archive per day: its `bytes` now less the
-/// `archive_bytes` of `oldest` (the oldest sample of the last 7 days), over
-/// the days between them. `None` without a sample at least a day old.
-pub(crate) fn growth(bytes: u64, oldest: &Value, read_at_ms: i64) -> Option<i64> {
+/// The bytes a grower gains per day (objective 065 for the archive, 085
+/// for every grower that persists): its `bytes` now less the `field` of
+/// `oldest` (the oldest sample of the last 7 days that carries it), over
+/// the days between them, rounded down. `None` without such a sample at
+/// least a day old.
+pub(crate) fn growth_of(bytes: u64, oldest: &Value, field: &str, read_at_ms: i64) -> Option<i64> {
     let at = oldest["at_ms"].as_i64()?;
-    let then = oldest["archive_bytes"].as_i64()?;
+    let then = oldest[field].as_i64()?;
     let elapsed = read_at_ms.saturating_sub(at);
     if elapsed < GROWTH_MIN_MS {
         return None;
     }
     let appended = i128::from(bytes) - i128::from(then);
-    i64::try_from(appended * i128::from(DAY_MS) / i128::from(elapsed)).ok()
+    i64::try_from((appended * i128::from(DAY_MS)).div_euclid(i128::from(elapsed))).ok()
+}
+
+/// The growth of every grower that persists (objective 085), in bytes a
+/// day: the archive's (`archive_bytes`, without a root none), Claude Code's
+/// transcripts' (`projects_bytes`) and the database's (`database_bytes`,
+/// against `database`, this answer's database bytes), each from the oldest
+/// sample of the window that carries it (`carrying`, as
+/// `PostgresStore::host_storage` reads it).
+pub(crate) fn growth_parts(
+    archive: Option<u64>,
+    projects: u64,
+    database: Option<u64>,
+    carrying: &Value,
+    read_at_ms: i64,
+) -> Value {
+    let part = |bytes: Option<u64>, field: &str| {
+        bytes.and_then(|bytes| growth_of(bytes, &carrying[field], field, read_at_ms))
+    };
+    json!({
+        "archive": part(archive, "archive_bytes"),
+        "projects": part(Some(projects), "projects_bytes"),
+        "database": part(database, "database_bytes"),
+    })
+}
+
+/// The parts' sum ([`growth_parts`]); `None` while any part is.
+pub(crate) fn persistent_growth(parts: &Value) -> Option<i64> {
+    ["archive", "projects", "database"]
+        .iter()
+        .try_fold(0_i64, |sum, part| sum.checked_add(parts[*part].as_i64()?))
 }
 
 /// How many days `free` bytes last at `growth` bytes a day, rounded down;
-/// `None` when either is unknown or the archive does not grow.
+/// `None` when either is unknown or what persists does not grow.
 pub(crate) fn days_left(free: Option<u64>, growth: Option<i64>) -> Option<u64> {
     let growth = u64::try_from(growth?).ok().filter(|growth| *growth > 0)?;
     Some(free? / growth)
@@ -130,7 +162,8 @@ pub(crate) fn test_databases(readings: Vec<(&'static str, Result<Value, String>)
 
 /// The kept part of the figures, read at `read_at_ms`: the sizes, the
 /// database's, the test databases' ([`test_databases`]), the archive's
-/// growth and Claude Code's count before, from `samples` (`{oldest,
+/// growth, the growth of every grower that persists ([`growth_parts`]) and
+/// their sum, and Claude Code's count before, from `samples` (`{carrying,
 /// before}`, as `PostgresStore::host_storage` reads them for this moment).
 pub(crate) fn sizes(
     read_at_ms: i64,
@@ -141,6 +174,13 @@ pub(crate) fn sizes(
 ) -> Value {
     let path = |path: &Path| path.display().to_string();
     let root = walked.root.as_deref();
+    let parts = growth_parts(
+        root.map(|_| walked.archive.bytes),
+        walked.projects.bytes,
+        database["bytes"].as_u64(),
+        &samples["carrying"],
+        read_at_ms,
+    );
     json!({
         "read_at_ms": read_at_ms,
         "archive": root.map(|root| json!({
@@ -160,13 +200,16 @@ pub(crate) fn sizes(
         })),
         "database": database.clone(),
         "test_databases": tests.clone(),
-        "growth_bytes_per_day": root.and_then(|_| growth(walked.archive.bytes, &samples["oldest"], read_at_ms)),
+        "growth_bytes_per_day": parts["archive"],
+        "persistent_growth_bytes_per_day": persistent_growth(&parts),
+        "growth_parts": parts,
     })
 }
 
-/// The figures with the free space now: `free_bytes` and `days_left`.
+/// The figures with the free space now: `free_bytes` and `days_left` (at
+/// the persistent growth, objective 085).
 pub(crate) fn with_free(mut sizes: Value, free: Option<u64>) -> Value {
-    let days = days_left(free, sizes["growth_bytes_per_day"].as_i64());
+    let days = days_left(free, sizes["persistent_growth_bytes_per_day"].as_i64());
     sizes["free_bytes"] = json!(free);
     sizes["days_left"] = json!(days);
     sizes
@@ -210,8 +253,8 @@ pub(crate) fn report(store: &PostgresStore, now_ms: i64) -> Result<Value, String
 #[cfg(test)]
 mod tests {
     use super::{
-        DAY_MS, Kept, READ_EVERY_MS, Walked, days_left, growth, kept_or_read, sizes,
-        test_databases, with_free,
+        DAY_MS, Kept, READ_EVERY_MS, Walked, days_left, growth_of, growth_parts, kept_or_read,
+        persistent_growth, sizes, test_databases, with_free,
     };
     use crate::storage::tests::{file, scratch};
     use serde_json::{Value, json};
@@ -250,16 +293,17 @@ mod tests {
     fn the_growth_is_what_was_appended_per_day_since_the_oldest_sample() {
         let now = 100 * DAY_MS;
         let oldest = |ago: i64, bytes: u64| json!({"at_ms": now - ago, "archive_bytes": bytes});
+        let growth = |bytes: u64, oldest: &Value| growth_of(bytes, oldest, "archive_bytes", now);
         // 7 MiB appended in 6.5 days.
         let six_and_a_half = 13 * DAY_MS / 2;
-        let got = growth(12 * MIB, &oldest(six_and_a_half, 5 * MIB), now).expect("a growth");
+        let got = growth(12 * MIB, &oldest(six_and_a_half, 5 * MIB)).expect("a growth");
         assert_eq!(got, i64::try_from(7 * MIB * 2 / 13).expect("fits"));
         // A sample under a day old, or none, measures nothing.
-        assert_eq!(growth(12 * MIB, &oldest(DAY_MS - 1, 5 * MIB), now), None);
-        assert_eq!(growth(12 * MIB, &Value::Null, now), None);
+        assert_eq!(growth(12 * MIB, &oldest(DAY_MS - 1, 5 * MIB)), None);
+        assert_eq!(growth(12 * MIB, &Value::Null), None);
         // A shrinking archive grows by less than nothing.
         assert_eq!(
-            growth(MIB, &oldest(DAY_MS, 3 * MIB), now),
+            growth(MIB, &oldest(DAY_MS, 3 * MIB)),
             Some(-2 * i64::try_from(MIB).expect("fits"))
         );
         assert_eq!(
@@ -286,11 +330,18 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("clean up");
         std::fs::remove_dir_all(&projects).expect("clean up");
         let now = 50 * DAY_MS;
+        let oldest = json!({"at_ms": now - 2 * DAY_MS, "archive_bytes": 2000,
+                            "projects_bytes": 100, "projects_files": 40});
         let samples = json!({
-            "oldest": {"at_ms": now - 2 * DAY_MS, "archive_bytes": 2000, "projects_files": 40},
+            "oldest": oldest,
+            "carrying": {
+                "archive_bytes": oldest, "projects_bytes": oldest,
+                "database_bytes": {"at_ms": now - DAY_MS, "archive_bytes": 9000,
+                                   "projects_bytes": 200, "database_bytes": 6000},
+            },
             "before": {"at_ms": now - 7_200_000, "archive_bytes": 11_000, "projects_files": 40},
         });
-        let database = json!({"bytes": 9, "tables": [{"name": "spawn_events", "bytes": 8}]});
+        let database = json!({"bytes": 9000, "tables": [{"name": "spawn_events", "bytes": 8}]});
         let tests = json!([{"role": "test", "name": "spawn_test", "bytes": 7, "schemas": 0}]);
         let kept = sizes(now, &walked, &samples, &database, &tests);
         let figures = with_free(kept, Some(100_000));
@@ -306,8 +357,10 @@ mod tests {
                 "database": database,
                 "test_databases": tests,
                 "growth_bytes_per_day": 5000,
+                "growth_parts": {"archive": 5000, "projects": 100, "database": 3000},
+                "persistent_growth_bytes_per_day": 8100,
                 "free_bytes": 100_000,
-                "days_left": 20,
+                "days_left": 12,
             })
         );
         // Without samples: no growth, no count before, no days.
@@ -322,8 +375,58 @@ mod tests {
             Some(1),
         );
         assert_eq!(bare["growth_bytes_per_day"], Value::Null);
+        assert_eq!(bare["persistent_growth_bytes_per_day"], Value::Null);
         assert_eq!(bare["projects"]["before"], Value::Null);
         assert_eq!(bare["days_left"], Value::Null);
+    }
+
+    /// Objective 085: each grower that persists is measured from the oldest
+    /// sample carrying its size; the sum is null while a part is, and a part
+    /// that shrinks counts against the others.
+    #[test]
+    fn the_persistent_growth_is_the_sum_of_the_parts_each_from_its_own_sample() {
+        let now = 100 * DAY_MS;
+        let mib = i64::try_from(MIB).expect("fits");
+        let old_shape = json!({"at_ms": now - 3 * DAY_MS, "archive_bytes": 9 * MIB,
+                               "projects_bytes": MIB / 4});
+        let with_database = json!({"at_ms": now - 2 * DAY_MS, "archive_bytes": 10 * MIB,
+                                   "projects_bytes": MIB / 2, "database_bytes": 100 * MIB});
+        let carrying = json!({"archive_bytes": old_shape, "projects_bytes": old_shape,
+                              "database_bytes": with_database});
+        let parts = growth_parts(Some(12 * MIB), MIB, Some(108 * MIB), &carrying, now);
+        assert_eq!(
+            parts,
+            json!({"archive": mib, "projects": mib / 4, "database": 4 * mib})
+        );
+        assert_eq!(persistent_growth(&parts), Some(mib + mib / 4 + 4 * mib));
+        // Without a sample carrying the database's size (only the old
+        // shape in the window): its part is null, and so is the sum.
+        let young = json!({"archive_bytes": old_shape, "projects_bytes": old_shape,
+                           "database_bytes": null});
+        let parts = growth_parts(Some(12 * MIB), MIB, Some(108 * MIB), &young, now);
+        assert_eq!(parts["database"], Value::Null);
+        assert_eq!(parts["archive"], mib);
+        assert_eq!(persistent_growth(&parts), None);
+        // No database bytes in this answer, or no root: that part is null.
+        let parts = growth_parts(None, MIB, None, &carrying, now);
+        assert_eq!(parts["archive"], Value::Null);
+        assert_eq!(parts["database"], Value::Null);
+        assert_eq!(parts["projects"], mib / 4);
+        // A shrinking database (a vacuum) counts against the rest.
+        let parts = growth_parts(Some(12 * MIB), MIB, Some(96 * MIB), &carrying, now);
+        assert_eq!(parts["database"], -2 * mib);
+        assert_eq!(persistent_growth(&parts), Some(mib + mib / 4 - 2 * mib));
+        // Days left over a sum at or below 0: none.
+        let figures = with_free(
+            json!({"persistent_growth_bytes_per_day": persistent_growth(&parts)}),
+            Some(10 * MIB),
+        );
+        assert_eq!(figures["days_left"], Value::Null);
+        let figures = with_free(
+            json!({"persistent_growth_bytes_per_day": 3 * mib}),
+            Some(10 * MIB),
+        );
+        assert_eq!(figures["days_left"], 3);
     }
 
     /// Objective 074: the test databases, the gates' first, each as read;

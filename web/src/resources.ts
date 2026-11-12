@@ -113,8 +113,10 @@ export function memoryBar(memory: Memory): { tone: MemoryTone; scale: number } {
 // (docs/storage.md, "What uses the disk"): the transcript archive (kept
 // whole, so the one steady grower), Claude Code's own transcripts, the
 // workspaces, the database (with its event log's bytes) and the test
-// databases the server is given, with their schemas (objective 074); what the archive grows by a day, and how
-// long the free space lasts at that rate. The sizes are read at most every
+// databases the server is given, with their schemas (objective 074); what the archive grows by a day, what
+// every grower that persists (the archive, Claude Code's transcripts, the
+// database) grows by, and how long the free space lasts at their sum
+// (objective 085). The sizes are read at most every
 // 10 minutes (`read_at_ms`); the free space at each request.
 
 /** A directory's regular files: their sizes summed, and how many. */
@@ -149,7 +151,13 @@ export interface Storage {
   test_databases: TestDatabase[];
   /** Bytes appended to the archive a day; null without a sample a day old. */
   growth_bytes_per_day: number | null;
-  /** The free space over the growth, rounded down; null without a growth. */
+  /** Bytes a day of each grower that persists, each null without a sample
+   * a day old carrying its size (objective 085); null from an older server. */
+  growth_parts: { archive: number | null; projects: number | null; database: number | null } | null;
+  /** The parts' sum; null while any part is null. */
+  persistent_growth_bytes_per_day: number | null;
+  /** The free space over the persistent growth, rounded down; null without
+   * one above 0. */
   days_left: number | null;
 }
 
@@ -191,6 +199,7 @@ export function normalizeStorage(value: unknown): Storage | null {
   if (!raw) return null;
   const projects = place(raw.projects);
   const database = object(raw.database);
+  const parts = object(raw.growth_parts);
   return {
     free_bytes: optionalNumber(raw.free_bytes),
     read_at_ms: optionalNumber(raw.read_at_ms),
@@ -208,6 +217,12 @@ export function normalizeStorage(value: unknown): Storage | null {
     },
     test_databases: testDatabases(raw.test_databases),
     growth_bytes_per_day: optionalNumber(raw.growth_bytes_per_day),
+    growth_parts: parts && {
+      archive: optionalNumber(parts.archive),
+      projects: optionalNumber(parts.projects),
+      database: optionalNumber(parts.database),
+    },
+    persistent_growth_bytes_per_day: optionalNumber(raw.persistent_growth_bytes_per_day),
     days_left: optionalNumber(raw.days_left),
   };
 }
@@ -251,12 +266,13 @@ export interface StorageRow {
 
 export interface StorageView {
   rows: StorageRow[];
-  /** "about <days> days at the archive's growth"; null without a growth. */
+  /** "about <days> days at the growth of the archive, Claude Code's
+   * transcripts and the database"; null without days left. */
   lasts: string | null;
 }
 
 /** The Storage card's words: what uses the disk, one row each, and how
- * long the free space lasts at the archive's growth. Takes the server's
+ * long the free space lasts at the growth of what persists. Takes the server's
  * `health.storage` as it is or normalized. */
 export function storageView(value: unknown): StorageView {
   const storage = normalizeStorage(value);
@@ -300,7 +316,13 @@ export function storageView(value: unknown): StorageView {
     })),
   ];
   const days = storage?.days_left ?? null;
-  return { rows, lasts: days === null ? null : `about ${count(days)} days at the archive's growth` };
+  return {
+    rows,
+    lasts:
+      days === null
+        ? null
+        : `about ${count(days)} days at the growth of the archive, Claude Code's transcripts and the database`,
+  };
 }
 
 // The newest off-host backups, as `/api/fleet`'s `health.backups` reports
