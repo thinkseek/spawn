@@ -18,15 +18,17 @@ function fetchCost(window: string, signal: AbortSignal): Promise<CostAnswer> {
 }
 
 /** The mark of a row whose figure leaves out use on a model with no
- * price: how many tokens ("+ 220,000 tokens unpriced"). */
-function UnpricedMark({ text }: { text: string | null }) {
-  if (!text) return null;
+ * price: how many tokens, compact ("+485M unpriced"), the full count
+ * ("+ 485,321,042 tokens unpriced") in its title. */
+function UnpricedMark({ short, full }: { short: string | null; full: string | null }) {
+  if (!short) return null;
   return (
     <span
-      title="These tokens ran on a model SPAWN_MODEL_PRICES does not price: they are counted, their cost is not"
-      className="shrink-0 rounded bg-wait-tint px-1 py-px text-micro font-medium text-warning"
+      data-cost-unpriced
+      title={`${full ?? short}: these tokens ran on a model SPAWN_MODEL_PRICES does not price; they are counted, their cost is not`}
+      className="shrink-0 whitespace-nowrap rounded bg-wait-tint px-1 py-px text-micro font-medium text-warning"
     >
-      {text}
+      {short}
     </span>
   );
 }
@@ -56,8 +58,16 @@ function Rows({ title, rows, more = null }: { title: string; rows: Row[]; more?:
       ) : (
         <ul className="pb-2">
           {rows.map((row) => (
-            <li key={row.key} className="flex items-center gap-2 px-4 py-1 text-caption">
-              <span className="shrink-0 font-mono text-muted-foreground" title={row.key}>
+            <li key={row.key} className="flex min-w-0 items-center gap-2 px-4 py-1 text-caption">
+              {/* A long name truncates; the badge, the per-landing figure
+                  and the dollars never shrink, wrap or leave the column. */}
+              <span
+                className={cx(
+                  "font-mono text-muted-foreground",
+                  row.label ? "shrink-0" : "min-w-0 truncate",
+                )}
+                title={row.key}
+              >
                 {row.key}
               </span>
               {row.label && (
@@ -65,18 +75,18 @@ function Rows({ title, rows, more = null }: { title: string; rows: Row[]; more?:
                   {row.label}
                 </span>
               )}
-              <UnpricedMark text={row.unpriced_text} />
+              <UnpricedMark short={row.unpriced_short} full={row.unpriced_text} />
               {row.per_landing !== undefined && (
                 <span
                   title="This mission's priced dollars over its tasks that landed or were accepted in the window"
-                  className="tnum ml-auto shrink-0 text-micro text-faint-foreground"
+                  className="tnum ml-auto shrink-0 whitespace-nowrap text-micro text-faint-foreground"
                 >
                   {row.per_landing}
                 </span>
               )}
               <span
                 className={cx(
-                  "tnum shrink-0",
+                  "tnum shrink-0 whitespace-nowrap",
                   row.per_landing === undefined ? "ml-auto" : "ml-2",
                   row.usd === "unpriced" ? "text-warning" : "text-foreground",
                 )}
@@ -157,9 +167,11 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
  * costly first, the rest of each folded into one line ("3 more tasks ·
  * $1.80"); each row says its share of the window
  * (crates/spawn-cli/src/cost.rs prices each call when it is recorded).
- * Each task row shows its label beside its id. Under each window's total a
+ * Each mission row shows its name beside its id ("#4 Spawn RSI"), each
+ * task row its label; a long name truncates so the dollars stay whole. Under each window's total a
  * note says once how many tokens no price counts, on which models, and how
- * to price them; a row with such use says its count, and a figure of only
+ * to price them; a row with such use says its count compact ("+485M
+ * unpriced", the full count in its title), and a figure of only
  * such use reads "unpriced", never $0.00. A window that starts before the earliest
  * message the record holds says since when it counts. Strictly read-only.
  */
