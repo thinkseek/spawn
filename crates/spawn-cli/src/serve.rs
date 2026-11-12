@@ -4578,6 +4578,9 @@ mod tests {
         let address = format!("127.0.0.1:{port}");
         let slots = Slots::new(4);
         let mut first = true;
+        // Asked only once the new listener is bound: a request the stopped
+        // one took before it was dropped is answered 500 by tiny_http.
+        let (bound, listening) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             keep_listening(
                 server,
@@ -4589,10 +4592,18 @@ mod tests {
                     }
                     serve_requests(server, &shared, &slots)
                 },
-                |address| tiny_http::Server::http(address).map_err(|error| error.to_string()),
+                |address| {
+                    let server =
+                        tiny_http::Server::http(address).map_err(|error| error.to_string())?;
+                    bound.send(()).ok();
+                    Ok(server)
+                },
                 |_stops| std::time::Duration::from_millis(50),
             )
         });
+        listening
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the stopped listener is listened on again within 10 s");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let answer = loop {
             let attempt = std::net::TcpStream::connect(("127.0.0.1", port)).and_then(|mut stream| {
@@ -4609,7 +4620,7 @@ mod tests {
                 other => panic!("no answer on port {port} after the listener stopped: {other:?}"),
             }
         };
-        assert!(answer.starts_with("HTTP/1.1 200"), "{}", answer.lines().next().unwrap_or(""));
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
         std::fs::remove_dir_all(&web).ok();
     }
 
