@@ -482,6 +482,24 @@ test("names and states", () => {
   assert.equal(laneState({ state: "done", halted: "x" }), "halted");
 });
 
+test("a paused mission's lane is paused, halted or not; a closed one is not (objective 099)", () => {
+  const paused = { at_ms: T0, event_id: 41, reason: "owner hold" };
+  assert.equal(laneState({ state: "active", halted: null, paused }), "paused");
+  assert.equal(laneState({ state: "open", halted: null, paused }), "paused");
+  assert.equal(laneState({ state: "active", halted: "three rejections", paused }), "paused");
+  assert.equal(laneState({ state: "active", halted: null, paused: null }), "active");
+  assert.equal(laneState({ state: "active", halted: null }), "active", "an older server's mission");
+  assert.equal(laneState({ state: "done", halted: null, paused }), "done");
+  const timeline = deriveMissionTimeline([mission(6, [], { paused }), mission(4, [])], T0);
+  assert.deepEqual(
+    timeline.lanes.map((lane) => [lane.mission.id, lane.state]).sort(),
+    [
+      [4, "active"],
+      [6, "paused"],
+    ],
+  );
+});
+
 /** A bar for the split: only its key and end matter. */
 const ended = (key: string, end: number | null) => ({ key, end }) as unknown as import("../src/missionTimeline.ts").TaskBar;
 const group = (key: string, end: number | null, attempts: Array<number | null> = []) => ({
