@@ -420,6 +420,7 @@ const ALERT_TITLES: Record<string, string> = {
   mission_idle: "A mission has no work",
   message_not_taken: "A message was not taken",
   owner_request_waiting: "An owner's landing waits for its verdict",
+  guardrail_out_of_range: "A guardrail is out of its range",
 };
 
 /** A message not taken whose evidence says Spawn has read no line of the
