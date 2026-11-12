@@ -118,6 +118,28 @@ test("no fall, no growth, no days: the card says so and invents nothing", () => 
   assert.equal(bare.lasts, null);
 });
 
+test("while the growth is not measured yet, the archive's row says from when it is", () => {
+  const at = Date.UTC(2026, 10, 12, 23, 31, 20);
+  const local = localDateTime(at);
+  const archive = (view: ReturnType<typeof storageView>) => view.rows[0].note;
+  // Pending: no growth, and the moment is still ahead of the read.
+  const pending = storageView({ ...STORAGE, read_at_ms: at - 3_600_000, growth_bytes_per_day: null, days_left: null, growth_from_ms: at });
+  assert.deepEqual([archive(pending), pending.measured_from, pending.lasts], [`measured from ${local}`, local, null]);
+  assert.equal(normalizeStorage({ ...STORAGE, growth_from_ms: at })?.growth_from_ms, at);
+  // Measured: the growth, as before.
+  const measured = storageView({ ...STORAGE, read_at_ms: at + 3_600_000, growth_from_ms: at });
+  assert.deepEqual([archive(measured), measured.measured_from], ["grows about 71.7 MB a day", null]);
+  // No sample (or an older server): not measured yet.
+  const none = storageView({ ...STORAGE, growth_bytes_per_day: null, days_left: null, growth_from_ms: null });
+  assert.deepEqual([archive(none), none.measured_from], ["not measured yet", null]);
+  const older = storageView({ ...STORAGE, growth_bytes_per_day: null, days_left: null });
+  assert.deepEqual([archive(older), older.measured_from], ["not measured yet", null]);
+  // Already past: a moment gone promises nothing.
+  const past = storageView({ ...STORAGE, read_at_ms: at + 3_600_000, growth_bytes_per_day: null, days_left: null, growth_from_ms: at });
+  assert.deepEqual([archive(past), past.measured_from], ["not measured yet", null]);
+  assert.equal(storageView(null).measured_from, null);
+});
+
 test("the health's storage is read as the server reports it, null from an older server", () => {
   const storage = normalizeStorage(STORAGE);
   assert.equal(storage?.projects?.before, 40);
