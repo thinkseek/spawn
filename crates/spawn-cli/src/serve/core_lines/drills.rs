@@ -70,10 +70,11 @@ pub(super) struct Drill {
     pub(super) source: Source,
 }
 
-/// The file's `recoverability`: its rows, in order, and the session
-/// backups' status file.
+/// The file's `recoverability`: whether it names one, its rows, in order,
+/// and the session backups' status file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Config {
+    pub(super) present: bool,
     pub(super) drills: Vec<Drill>,
     pub(super) status: Option<PathBuf>,
 }
@@ -86,6 +87,9 @@ pub(super) fn config(text: Option<&str>) -> Config {
         return Config::default();
     };
     let section = &value["recoverability"];
+    if !section.is_object() {
+        return Config::default();
+    }
     let drills = section["drills"]
         .as_array()
         .into_iter()
@@ -106,7 +110,11 @@ pub(super) fn config(text: Option<&str>) -> Config {
         .as_str()
         .filter(|path| !path.is_empty())
         .map(PathBuf::from);
-    Config { drills, status }
+    Config {
+        present: true,
+        drills,
+        status,
+    }
 }
 
 /// Whether systemctl may be asked about `unit`: a letter or digit first
@@ -418,6 +426,7 @@ mod tests {
         assert_eq!(
             config(Some(text)),
             Config {
+                present: true,
                 drills: vec![
                     Drill {
                         name: "Database".into(),
@@ -438,6 +447,10 @@ mod tests {
         assert_eq!(config(None), Config::default());
         assert_eq!(config(Some("not json")), Config::default());
         assert_eq!(config(Some(r#"{"ranges": {}}"#)), Config::default());
+        assert!(!Config::default().present, "no table named");
+        // A table with no rows is named, and has none.
+        let empty = config(Some(r#"{"recoverability": {}}"#));
+        assert!(empty.present && empty.drills.is_empty() && empty.status.is_none());
     }
 
     #[test]
@@ -497,6 +510,7 @@ mod tests {
     fn the_rows_last_passes_count_within_7_days_and_give_both_ages() {
         let now = 100 * DAY;
         let config = Config {
+            present: true,
             drills: vec![
                 Drill {
                     name: "Database".into(),
