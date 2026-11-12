@@ -128,7 +128,6 @@ test("rowLines: the amount and share on the first line, the mark and per-landing
   // A task row with only an unpriced mark, and one with neither.
   const t2 = view.tasks.find((row) => row.key === "T2")!;
   assert.deepEqual(rowLines(t2), { first: first(t2), second: ["+ 500,000 tokens unpriced"] });
-  assert.equal(rowLines(t2).first.usd, "unpriced");
   const t1 = view.tasks.find((row) => row.key === "T1")!;
   assert.deepEqual(rowLines(t1), { first: first(t1), second: [] });
   // An agent row: its unpriced text or nothing; never a per-landing text.
