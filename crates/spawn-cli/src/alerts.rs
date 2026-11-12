@@ -118,6 +118,21 @@
 //!   `SPAWN_ALERT_TMPFS_HIGH_MB` (default 8000); clears under
 //!   `SPAWN_ALERT_TMPFS_OK_MB` (default 6000). A threshold of 0 disables its
 //!   check.
+//! - `database_size`, `database <name>`, key `database_size:<name>:<reading
+//!   ms>` (objective 074): every `SPAWN_ALERT_DATABASE_SECS` (default 600)
+//!   the step reads the live database's size and its event log's bytes (the
+//!   sum of `spawn_events.kind`'s stored size), and the size and schemas
+//!   (other than `pg_*`, `information_schema` and `public`) of each test
+//!   database it is given: the gates' (`SPAWN_TEST_DATABASE_URL`, role
+//!   `test`) and the engines' (`SPAWN_FLEET_TEST_DATABASE_URL`, role
+//!   `fleet_test`), each when set. A database at or above
+//!   `SPAWN_ALERT_DATABASE_FLOOR_MB` (default 1024) and above
+//!   `SPAWN_ALERT_DATABASE_RATIO` (default 10) times the log's bytes fires,
+//!   evidence `{database, role, bytes, log_bytes, ratio, schemas}`; one open
+//!   per database. Clears at the first reading that finds it no longer so,
+//!   that reading its evidence. A test database that cannot be read is a
+//!   line; its alert stays as it was. The fleet's test database once grew to
+//!   2.7 GB (2533 schemas tests left) unmeasured, and was read as live bloat.
 //! - `agent_stuck`, the session id, key `agent_stuck:<session>:<its
 //!   observation>`: the session's latest `observation.recorded` says `stuck`
 //!   at or above [`LIKELY`] (0.5), whatever the dispatcher does with it; a
