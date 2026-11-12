@@ -112,7 +112,8 @@ export function memoryBar(memory: Memory): { tone: MemoryTone; scale: number } {
 // What uses the disk, as `/api/fleet`'s `health.storage` reports it
 // (docs/storage.md, "What uses the disk"): the transcript archive (kept
 // whole, so the one steady grower), Claude Code's own transcripts, the
-// workspaces and the database; what the archive grows by a day, and how
+// workspaces, the database (with its event log's bytes) and the test
+// databases the server is given, with their schemas (objective 074); what the archive grows by a day, and how
 // long the free space lasts at that rate. The sizes are read at most every
 // 10 minutes (`read_at_ms`); the free space at each request.
 
@@ -136,11 +137,45 @@ export interface Storage {
   projects: (StoragePlace & { before: number | null }) | null;
   /** Everything under the root outside the archive; null without a root. */
   workspaces: StoragePlace | null;
-  database: { bytes: number | null; tables: Array<{ name: string; bytes: number }> } | null;
+  /** The live database: its size, its event log's bytes (what the data
+   * justifies; null from an older server) and its largest tables. */
+  database: {
+    bytes: number | null;
+    log_bytes: number | null;
+    tables: Array<{ name: string; bytes: number }>;
+  } | null;
+  /** The test databases the server is given (objective 074), the gates'
+   * first; empty when none is (or from an older server). */
+  test_databases: TestDatabase[];
   /** Bytes appended to the archive a day; null without a sample a day old. */
   growth_bytes_per_day: number | null;
   /** The free space over the growth, rounded down; null without a growth. */
   days_left: number | null;
+}
+
+/** A test database: the gates' (`test`) or the engines' (`fleet_test`).
+ * Its name, size and schemas are null when the server could not read it. */
+export interface TestDatabase {
+  role: string;
+  name: string | null;
+  bytes: number | null;
+  /** Its schemas other than pg_*, information_schema and public. */
+  schemas: number | null;
+}
+
+function testDatabases(value: unknown): TestDatabase[] {
+  return (Array.isArray(value) ? value : []).flatMap((entry) => {
+    const raw = object(entry);
+    if (!raw || typeof raw.role !== "string") return [];
+    return [
+      {
+        role: raw.role,
+        name: typeof raw.name === "string" ? raw.name : null,
+        bytes: optionalNumber(raw.bytes),
+        schemas: optionalNumber(raw.schemas),
+      },
+    ];
+  });
 }
 
 function place(value: unknown): StoragePlace | null {
@@ -164,12 +199,14 @@ export function normalizeStorage(value: unknown): Storage | null {
     workspaces: place(raw.workspaces),
     database: database && {
       bytes: optionalNumber(database.bytes),
+      log_bytes: optionalNumber(database.log_bytes),
       tables: (Array.isArray(database.tables) ? database.tables : []).flatMap((entry) => {
         const table = object(entry);
         const bytes = table ? optionalNumber(table.bytes) : null;
         return table && typeof table.name === "string" && bytes !== null ? [{ name: table.name, bytes }] : [];
       }),
     },
+    test_databases: testDatabases(raw.test_databases),
     growth_bytes_per_day: optionalNumber(raw.growth_bytes_per_day),
     days_left: optionalNumber(raw.days_left),
   };
@@ -184,6 +221,12 @@ export function storageSize(bytes: number | null | undefined): string {
   const mb = bytes / MB;
   return mb < 1024 ? `${mb.toFixed(1)} MB` : `${(mb / 1024).toFixed(1)} GB`;
 }
+
+/** The storage rows' names of the test databases, by role. */
+const TEST_DATABASE_NAMES: Record<string, string> = {
+  test: "Gate test database",
+  fleet_test: "Fleet test database",
+};
 
 export interface StorageRow {
   name: string;
@@ -207,6 +250,7 @@ export function storageView(value: unknown): StorageView {
   const files = projects?.files ?? null;
   const before = projects?.before ?? null;
   const largest = storage?.database?.tables[0] ?? null;
+  const logBytes = storage?.database?.log_bytes ?? null;
   const count = (n: number) => n.toLocaleString("en-US");
   const rows: StorageRow[] = [
     {
@@ -226,8 +270,18 @@ export function storageView(value: unknown): StorageView {
     {
       name: "Database",
       size: storageSize(storage?.database?.bytes),
-      note: largest ? `largest: ${largest.name} ${storageSize(largest.bytes)}` : "",
+      note: [
+        largest ? `largest: ${largest.name} ${storageSize(largest.bytes)}` : null,
+        logBytes !== null ? `log ${storageSize(logBytes)}` : null,
+      ]
+        .filter((part) => part !== null)
+        .join(", "),
     },
+    ...(storage?.test_databases ?? []).map((database) => ({
+      name: TEST_DATABASE_NAMES[database.role] ?? `Test database (${database.role})`,
+      size: storageSize(database.bytes),
+      note: database.schemas === null ? "unreadable" : `${count(database.schemas)} schemas`,
+    })),
   ];
   const days = storage?.days_left ?? null;
   return { rows, lasts: days === null ? null : `about ${count(days)} days at the archive's growth` };
