@@ -348,9 +348,7 @@ pub(super) fn core_lines_at(
     path: Option<&std::path::Path>,
 ) -> Result<Value, String> {
     let storage = super::storage::report(store, super::now_ms())?;
-    let file = path
-        .as_ref()
-        .map_or(Value::Null, |path| json!(path.display().to_string()));
+    let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
     Ok(answer(&lines(&storage), &file, read_ranges(path)))
 }
 
