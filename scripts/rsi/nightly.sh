@@ -355,7 +355,7 @@ gates_running() {
   local units procs=0 pid cmd parent nested pids=" " own=" "
   units=$(systemctl --user list-units 'spawn-gate-*' --state=active --no-legend --plain 2>/dev/null | grep -c . || true)
   for pid in $(pgrep -f 'scripts/rsi/gate\.sh ' 2>/dev/null); do
-    cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || continue
+    cmd=$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline") || continue
     case $cmd in *scripts/rsi/gate.sh*) ;; *) continue ;; esac
     pids="$pids$pid "
     if [ -n "${1-}" ]; then case $cmd in *"$1"*) own="$own$pid " ;; esac; fi
