@@ -5,8 +5,10 @@ use serde_json::{Value, json};
 use super::{Figure, Line};
 
 /// What the observability line reads besides the answer itself: the 7-day
-/// cost window's `total`, health's `human_per_agent_hour`, and the north
-/// star "Needs you is right" ([`needs_you_right`], objective 092).
+/// cost window's `total`, the Home card's human interventions per
+/// agent-hour (`human_per_agent_hour`: `/api/interventions?window=24h`'s
+/// `per_agent_hour`, objective 100), and the north star "Needs you is right"
+/// ([`needs_you_right`], objective 092).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(in crate::serve) struct Observed {
     pub(in crate::serve) cost_total: Value,
@@ -49,16 +51,20 @@ pub(super) fn observability_line(observed: &Observed) -> Line {
                 "share",
                 unpriced_share(&observed.cost_total),
             ),
-            Figure::new(
-                "observability.interventions_per_agent_hour",
-                "Human interventions per agent-hour",
-                "ratio",
-                if observed.human_per_agent_hour.is_number() {
-                    observed.human_per_agent_hour.clone()
-                } else {
-                    Value::Null
-                },
-            ),
+            Figure {
+                // The Home card's figure over its 24 h, said beside it.
+                window: Some("24h"),
+                ..Figure::new(
+                    "observability.interventions_per_agent_hour",
+                    "Human interventions per agent-hour",
+                    "ratio",
+                    if observed.human_per_agent_hour.is_number() {
+                        observed.human_per_agent_hour.clone()
+                    } else {
+                        Value::Null
+                    },
+                )
+            },
             Figure::not_collected(NOT_MEASURED, "Figures not measured", "count"),
         ],
     }
@@ -122,6 +128,64 @@ mod tests {
     use super::super::*;
     use super::*;
     use serde_json::{Value, json};
+
+    /// Objective 100: interventions per agent-hour is the Home card's 24 h
+    /// figure and says its window; no other figure carries one.
+    #[test]
+    fn interventions_per_agent_hour_says_its_24_hour_window_and_no_other_figure_does() {
+        let observed = Observed {
+            human_per_agent_hour: json!(0.25),
+            ..Observed::default()
+        };
+        let all = lines(&json!({}), &Value::Null, &observed, Value::Null, Vec::new());
+        let figures: Vec<&Figure> = all
+            .iter()
+            .flat_map(|line| std::iter::once(&line.north_star).chain(&line.guardrails))
+            .collect();
+        let windowed: Vec<(&str, Option<&str>)> = figures
+            .iter()
+            .filter(|figure| figure.window.is_some())
+            .map(|figure| (figure.key, figure.window))
+            .collect();
+        assert_eq!(
+            windowed,
+            [("observability.interventions_per_agent_hour", Some("24h"))]
+        );
+        let view = figure_json(
+            figures
+                .iter()
+                .find(|figure| figure.key == "observability.interventions_per_agent_hour")
+                .expect("the figure"),
+            None,
+        );
+        assert_eq!(view["window"], "24h");
+        assert_eq!(view["value"], json!(0.25));
+        assert_eq!(view["name"], "Human interventions per agent-hour");
+        // Null when the card's figure is (no agent time).
+        let idle = lines(
+            &json!({}),
+            &Value::Null,
+            &Observed::default(),
+            Value::Null,
+            Vec::new(),
+        );
+        let figure = idle[2]
+            .guardrails
+            .iter()
+            .find(|figure| figure.key == "observability.interventions_per_agent_hour")
+            .expect("the figure");
+        assert_eq!(figure.value, Value::Null);
+        assert!(
+            figure_json(figure, None).get("window").is_some(),
+            "said even when null"
+        );
+        assert!(
+            figure_json(&idle[2].guardrails[0], None)
+                .get("window")
+                .is_none(),
+            "no other figure says a window"
+        );
+    }
 
     /// Objective 092: the share of the alerts that ended in the last 7
     /// days whose condition cleared them.

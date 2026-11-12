@@ -51,7 +51,9 @@
 //! (objective 088) are the share of the 7-day cost window's tokens no price
 //! covers (`/api/cost?window=7d`'s total, kept with the performance figures:
 //! unpriced_tokens over its input, output, cache write and cache read
-//! tokens; null with none), health's `human_per_agent_hour` on
+//! tokens; null with none), the Home card's human interventions per
+//! agent-hour (`/api/interventions?window=24h`'s `per_agent_hour`, its last
+//! 24 h, objective 100; the figure says `"window": "24h"`) on
 //! `/api/fleet`, and how many figures of this same answer have no value,
 //! itself left out. The recoverability guardrails (objective 087,
 //! [`recoverability`]) are the ages of the newest database copy and bundle
@@ -113,6 +115,9 @@ pub(super) struct Figure {
     /// When a figure still measuring its window started measuring (null
     /// otherwise): said as `measuring_since_ms`.
     pub(super) measuring_since_ms: Value,
+    /// The window a figure is read over, when it says one (objective 100:
+    /// interventions per agent-hour, "24h"): said as `window`.
+    pub(super) window: Option<&'static str>,
 }
 
 impl Figure {
@@ -123,6 +128,7 @@ impl Figure {
             unit,
             value,
             measuring_since_ms: Value::Null,
+            window: None,
         }
     }
 
@@ -246,6 +252,9 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
     });
     if !figure.measuring_since_ms.is_null() {
         answer["measuring_since_ms"] = figure.measuring_since_ms.clone();
+    }
+    if let Some(window) = figure.window {
+        answer["window"] = json!(window);
     }
     answer
 }
@@ -382,7 +391,8 @@ pub(crate) struct Parts {
     /// The storage report, with the scratch nobody owns and each test
     /// server's schemas.
     pub(crate) storage: Option<Duration>,
-    /// The fleet's health.
+    /// Human interventions per agent-hour, the Home card's 24 h answer
+    /// (`/api/interventions`, objective 100).
     pub(crate) health: Option<Duration>,
 }
 
@@ -534,10 +544,21 @@ fn lines_at(
     storage["unowned_scratch_bytes"] = reading.map_or(Value::Null, unowned::Reading::unowned_bytes);
     storage["leaked_test_schemas"] = reading.map_or(Value::Null, unowned::Reading::leaked);
     let (performance, cost_total) = performance_now(store, now_ms, parts);
-    let health = timed(&mut parts.health, || store.fleet_health()).map_err(super::err)?;
+    // The Home card's figure (objective 100): `/api/interventions?window=24h`
+    // over the 24 h ending at this reading's now, through the same answer.
+    let interventions = timed(&mut parts.health, || {
+        let (name, window) =
+            crate::scorecard::interventions::window_of(Some("24h"), None, || Ok(now_ms))?;
+        crate::scorecard::interventions::measure(store, name, window)
+    })
+    .map_err(|failure| match failure {
+        crate::scorecard::Failure::Request(error) | crate::scorecard::Failure::Record(error) => {
+            error
+        }
+    })?;
     let observed = Observed {
         cost_total,
-        human_per_agent_hour: health["human_per_agent_hour"].clone(),
+        human_per_agent_hour: interventions["per_agent_hour"].clone(),
         // Not collected until A22/A23 land (owner, 2026-11-12): the share of
         // alerts whose condition cleared them is not whether they were right
         // (sync/astra/findings.md A23), so it is not shown as the north star.
