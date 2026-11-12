@@ -2470,7 +2470,10 @@ fn a_warm_cut_off_by_a_restart_is_warmed_again_at_the_first_pass() {
         if let Some(words) = &said {
             assert_eq!(words.len(), 4, "{words:?}");
             assert_eq!(words[0], "--base-only");
-            assert!(words[1].contains(".sources"), "the source's mirror: {words:?}");
+            assert!(
+                words[1].contains(".sources"),
+                "the source's mirror: {words:?}"
+            );
             assert_eq!(words[2], main, "the source's main as it is");
             assert_eq!(Path::new(&words[3]), super::pinned(&scenarios));
         }
@@ -2478,7 +2481,10 @@ fn a_warm_cut_off_by_a_restart_is_warmed_again_at_the_first_pass() {
         let _ = std::fs::remove_dir_all(&dir);
         said
     }
-    assert!(first_pass("live").is_some(), "warmed again at the first pass");
+    assert!(
+        first_pass("live").is_some(),
+        "warmed again at the first pass"
+    );
     assert_eq!(first_pass("drain"), None, "a drain starts no warm");
     assert_eq!(
         first_pass("halted"),

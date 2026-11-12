@@ -453,13 +453,11 @@ impl Warms {
 /// A source or scenarios a line cannot hold is left out: that warm is not
 /// warmed again after a restart.
 fn record(pid: u32, ticks: u64, want: &Want) -> String {
-    let mut record = format!("pid {pid}\nstart {ticks}\ncommit {}\n", want.commit);
+    let record = format!("pid {pid}\nstart {ticks}\ncommit {}\n", want.commit);
     let scenarios = want.scenarios.to_str().unwrap_or_default();
-    let one_line = |text: &str| {
-        !text.is_empty() && !text.contains('\n') && text.trim() == text
-    };
+    let one_line = |text: &str| !text.is_empty() && !text.contains('\n') && text.trim() == text;
     if one_line(&want.source) && one_line(scenarios) {
-        record.push_str(&format!("source {}\nscenarios {scenarios}\n", want.source));
+        return format!("{record}source {}\nscenarios {scenarios}\n", want.source);
     }
     record
 }

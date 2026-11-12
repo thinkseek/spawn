@@ -2155,8 +2155,7 @@ impl Integrator {
     /// first ([`warm::Warms::take_over`]), and the warm it cut off is warmed
     /// again for its source's main at the first passes ([`Self::poll_warm`]).
     fn with_warm(self, dir: PathBuf) -> Self {
-        let mut warms =
-            warm::Warms::new(self.judge.gate.clone(), self.judge.gate_env.clone(), dir);
+        let mut warms = warm::Warms::new(self.judge.gate.clone(), self.judge.gate_env.clone(), dir);
         warms.take_over();
         *self.warms.borrow_mut() = Some(warms);
         self
@@ -2257,10 +2256,13 @@ impl Integrator {
         if let Some(source) = warms.lost_source().map(str::to_string)
             && stepped
         {
-            match store.gated_missions().map_err(|error| error.to_string()).and_then(|missions| {
-                serde_json::from_value::<Vec<Mission>>(missions)
-                    .map_err(|error| format!("gated missions: {error}"))
-            }) {
+            match store
+                .gated_missions()
+                .map_err(|error| error.to_string())
+                .and_then(|missions| {
+                    serde_json::from_value::<Vec<Mission>>(missions)
+                        .map_err(|error| format!("gated missions: {error}"))
+                }) {
                 Ok(missions) => {
                     let live = missions.iter().any(|mission| {
                         mission.halted.is_none() && mission.source.as_deref() == Some(&source)
