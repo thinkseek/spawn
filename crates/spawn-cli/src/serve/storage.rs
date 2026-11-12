@@ -133,8 +133,9 @@ pub(crate) fn persistent_growth(parts: &Value) -> Option<i64> {
         .try_fold(0_i64, |sum, part| sum.checked_add(parts[*part].as_i64()?))
 }
 
-/// The moment the growth is first measured: the `at_ms` of `oldest` (the
-/// oldest sample of the last 7 days, the one [`growth`] is measured from)
+/// The moment the archive's growth is first measured (objective 083): the
+/// `at_ms` of `oldest` (the oldest sample of the last 7 days carrying the
+/// archive's size, the one its growth is measured from, [`growth_parts`])
 /// plus [`GROWTH_MIN_MS`]. `None` without a sample.
 pub(crate) fn growth_from(oldest: &Value) -> Option<i64> {
     oldest["at_ms"].as_i64()?.checked_add(GROWTH_MIN_MS)
@@ -207,14 +208,10 @@ pub(crate) fn sizes(
         })),
         "database": database.clone(),
         "test_databases": tests.clone(),
-<<<<<<< 66dc88cfe90ce25b9ed195d4b929bbf892e9bf0f
         "growth_bytes_per_day": parts["archive"],
+        "growth_from_ms": root.and_then(|_| growth_from(&samples["carrying"]["archive_bytes"])),
         "persistent_growth_bytes_per_day": persistent_growth(&parts),
         "growth_parts": parts,
-=======
-        "growth_bytes_per_day": root.and_then(|_| growth(walked.archive.bytes, &samples["oldest"], read_at_ms)),
-        "growth_from_ms": root.and_then(|_| growth_from(&samples["oldest"])),
->>>>>>> 05d0fa6454296d6c641be63703a1ce4aa46e6422
     })
 }
 
@@ -265,13 +262,8 @@ pub(crate) fn report(store: &PostgresStore, now_ms: i64) -> Result<Value, String
 #[cfg(test)]
 mod tests {
     use super::{
-<<<<<<< 66dc88cfe90ce25b9ed195d4b929bbf892e9bf0f
-        DAY_MS, Kept, READ_EVERY_MS, Walked, days_left, growth_of, growth_parts, kept_or_read,
-        persistent_growth, sizes, test_databases, with_free,
-=======
-        DAY_MS, Kept, READ_EVERY_MS, Walked, days_left, growth, growth_from, kept_or_read, sizes,
-        test_databases, with_free,
->>>>>>> 05d0fa6454296d6c641be63703a1ce4aa46e6422
+        DAY_MS, Kept, READ_EVERY_MS, Walked, days_left, growth_from, growth_of, growth_parts,
+        kept_or_read, persistent_growth, sizes, test_databases, with_free,
     };
     use crate::storage::tests::{file, scratch};
     use serde_json::{Value, json};
@@ -374,12 +366,9 @@ mod tests {
                 "database": database,
                 "test_databases": tests,
                 "growth_bytes_per_day": 5000,
-<<<<<<< 66dc88cfe90ce25b9ed195d4b929bbf892e9bf0f
+                "growth_from_ms": now - DAY_MS,
                 "growth_parts": {"archive": 5000, "projects": 100, "database": 3000},
                 "persistent_growth_bytes_per_day": 8100,
-=======
-                "growth_from_ms": now - DAY_MS,
->>>>>>> 05d0fa6454296d6c641be63703a1ce4aa46e6422
                 "free_bytes": 100_000,
                 "days_left": 12,
             })
@@ -401,7 +390,6 @@ mod tests {
         assert_eq!(bare["days_left"], Value::Null);
     }
 
-<<<<<<< 66dc88cfe90ce25b9ed195d4b929bbf892e9bf0f
     /// Objective 085: each grower that persists is measured from the oldest
     /// sample carrying its size; the sum is null while a part is, and a part
     /// that shrinks counts against the others.
@@ -449,7 +437,8 @@ mod tests {
             Some(10 * MIB),
         );
         assert_eq!(figures["days_left"], 3);
-=======
+    }
+
     /// Objective 083: while the growth cannot be measured yet, the figures
     /// say from when it will be: the oldest sample plus a day; null with no
     /// sample, or no workspace root.
@@ -464,24 +453,23 @@ mod tests {
         std::fs::remove_dir_all(&projects).expect("clean up");
         let now = 50 * DAY_MS;
         let ten_hours = 36_000_000;
+        let oldest = json!({"at_ms": now - ten_hours, "archive_bytes": 1000,
+                            "projects_bytes": 0, "projects_files": 0});
         let samples = json!({
-            "oldest": {"at_ms": now - ten_hours, "archive_bytes": 1000, "projects_files": 0},
+            "oldest": oldest,
+            "carrying": {"archive_bytes": oldest, "projects_bytes": oldest, "database_bytes": null},
             "before": {"at_ms": now - 7_200_000, "archive_bytes": 2000, "projects_files": 0},
         });
-        assert_eq!(
-            growth_from(&samples["oldest"]),
-            Some(now - ten_hours + DAY_MS)
-        );
+        assert_eq!(growth_from(&oldest), Some(now - ten_hours + DAY_MS));
         assert_eq!(growth_from(&Value::Null), None);
         let pending = sizes(now, &walked, &samples, &Value::Null, &json!([]));
         assert_eq!(pending["growth_bytes_per_day"], Value::Null);
         assert_eq!(pending["growth_from_ms"], json!(now - ten_hours + DAY_MS));
-        let none = json!({"oldest": null, "before": null});
+        let none = json!({"oldest": null, "carrying": null, "before": null});
         let bare = sizes(now, &walked, &none, &Value::Null, &json!([]));
         assert_eq!(bare["growth_from_ms"], Value::Null);
         let unrooted = sizes(now, &rootless, &samples, &Value::Null, &json!([]));
         assert_eq!(unrooted["growth_from_ms"], Value::Null);
->>>>>>> 05d0fa6454296d6c641be63703a1ce4aa46e6422
     }
 
     /// Objective 074: the test databases, the gates' first, each as read;
