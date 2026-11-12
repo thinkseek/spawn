@@ -28,6 +28,8 @@ import {
   allNotes,
   liveAlerts,
   missionsToday,
+  noWorkText,
+  quietText,
   conflictText,
   earlierConflictCount,
   needsSummary,
@@ -374,6 +376,40 @@ test("missions today: open work as a row, today's landings and the latest send-b
   assert.deepEqual(row.lastRejection && [row.lastRejection.task_id, row.lastRejection.verdict], [219, "rejected"]);
   assert.deepEqual(model.quiet.map((entry) => entry.id), [8], "an active mission with nothing open folds");
   assert.equal(model.closed, 1);
+});
+
+test("missions today: a paused mission reads paused, as a row or quiet, never idle (objective 099)", () => {
+  const pause = { at_ms: NOW - 2 * HOUR, event_id: 77, reason: "owner hold" };
+  const ended = { updated_at_ms: NOW - 5 * HOUR, stages: [] };
+  const model = missionsToday(
+    missions([
+      // Work in flight, paused: a row that says so.
+      mission(1, "Held work", [task(10, "delivered")], { paused: pause, objectives: { backlog: "/b", resident: "r" } }),
+      // Nothing in flight, paused: quiet, paused, no idle time.
+      mission(6, "Supply PA", [task(20, "cancelled", ended)], {
+        paused: pause,
+        objectives: { backlog: "/b", resident: "supply" },
+      }),
+      // Nothing in flight, not paused: idle as before.
+      mission(2, "Idle", [task(30, "cancelled", ended)], { objectives: { backlog: "/b", resident: "two" } }),
+      // A row not paused.
+      mission(3, "Busy", [task(40, "delivered")]),
+    ]),
+    NOW,
+  );
+  const row = (id: number) => model.rows.find((entry) => entry.id === id);
+  assert.equal(row(1)?.paused, true, "a paused mission's row");
+  assert.equal(row(3)?.paused, false, "a mission not paused");
+  const quiet = (id: number) => model.quiet.find((entry) => entry.id === id);
+  assert.deepEqual(quiet(6), { id: 6, name: "Supply PA", idle_ms: null, paused: true });
+  assert.equal(quiet(2)?.paused, undefined);
+  assert.equal(quiet(2)?.idle_ms, 5 * HOUR);
+  assert.equal(quietText(model.quiet), "#6 Supply PA (paused), #2 Idle (no work for 5 h)");
+  const none = noWorkText(model);
+  assert.match(none, /#2 Idle none for/);
+  assert.doesNotMatch(none, /#6 /, "a paused mission is not one with no work");
+  // Only paused missions quiet: no mission is named for having none.
+  assert.equal(noWorkText({ rows: [], quiet: [quiet(6)!], closed: 0 }), "No mission has work open.");
 });
 
 test("working now: live agents with a task or a running turn, each by its one name; idle ones fold; ended ones are absent", () => {

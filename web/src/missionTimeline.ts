@@ -91,7 +91,7 @@ export interface TaskBar {
   stalled: boolean;
 }
 
-export type LaneState = "active" | "halted" | "done" | "closed";
+export type LaneState = "active" | "paused" | "halted" | "done" | "closed";
 
 export interface LaneCounts {
   total: number;
@@ -148,7 +148,15 @@ const TERMINAL: Record<string, Outcome> = {
   cancelled: "cancelled",
 };
 
-export function laneState(mission: Pick<Mission, "state" | "halted">): LaneState {
+/** A lane's state. A mission the owner paused (objective 099) that is not
+ * closed is "paused", halted or not: nothing moves in it until the owner
+ * resumes it. `paused` is optional for a mission read from an older
+ * server. */
+export function laneState(
+  mission: Pick<Mission, "state" | "halted"> & { paused?: Mission["paused"] | undefined },
+): LaneState {
+  const open = mission.state === null || mission.state === "active" || mission.state === "open";
+  if (mission.paused && open) return "paused";
   if (mission.halted) return "halted";
   switch (mission.state) {
     case "done":

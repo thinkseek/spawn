@@ -203,6 +203,7 @@ export function MissionsTodayCard({ model, onOpen }: { model: MissionsToday; onO
                 <div className="flex min-w-0 items-baseline gap-2">
                   <span className="tnum shrink-0 text-caption text-faint-foreground">#{row.id}</span>
                   <span className="shrink-0 text-label font-semibold text-foreground">{row.name}</span>
+                  {row.paused && <span className="shrink-0 text-caption font-medium text-muted-foreground">paused</span>}
                   {row.halted && <span className="shrink-0 text-caption font-medium text-destructive">halted</span>}
                   <span className="tnum ml-auto shrink-0 text-caption text-muted-foreground">
                     {row.landedToday} landed today

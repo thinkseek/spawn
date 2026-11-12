@@ -770,6 +770,10 @@ pub(crate) struct Mission {
     pub(crate) baseline: Option<String>,
     #[serde(default)]
     pub(crate) halted: Option<String>,
+    /// The owner has paused it (objective 099): no objective is assigned
+    /// to it (`spawn_objective_assign` would refuse) until it is resumed.
+    #[serde(default)]
+    pub(crate) paused: bool,
     #[serde(default)]
     pub(crate) scenario_floor: u32,
     /// The scenario file names (`*.sh`) the gate directory held at the
@@ -2984,7 +2988,8 @@ impl Integrator {
             }
         }
         // An objective mission's free slots get their objectives, whatever
-        // its gate is doing; a closed mission gets none.
+        // its gate is doing; a closed mission gets none, nor one the owner
+        // paused.
         // A task this pass aborted, or one whose gate runs now, yields
         // nothing: the first is over, the second is being judged.
         let mut settled: std::collections::BTreeSet<i64> = aborted.into_iter().collect();
@@ -2996,6 +3001,7 @@ impl Integrator {
                 .map(|gate| gate.task),
         );
         if mission.state != "done"
+            && !mission.paused
             && let Err(error) = objectives::assign_next(store, mission, &settled)
         {
             eprintln!("integrate: mission {}: {error}", mission.id);

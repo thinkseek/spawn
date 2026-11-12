@@ -197,6 +197,59 @@ select jsonb_build_object(
                       where q.r ->> 'source' = $1))"#
 );
 
+/// The owner's pauses as the dispatcher acts on them (objective 099): every
+/// mission not closed that is paused, or was unpaused since its last pause,
+/// `[{id, pause_event, unpause_event, unpause_at_ms, sessions}]`. `sessions`
+/// are the workers the pause holds: its resident (approved, the one its
+/// objectives name) and the worker of each of its delivered tasks, each
+/// `{agent_id, session_id, started_at_ms, final, resumed}`: when its latest
+/// execution started, whether the recovery recorded that execution's end
+/// on the `final` path (a Stop's end: nothing else revives it), and whether
+/// the dispatcher already sent the unpause's resume
+/// (`unpause-<mission>-<unpause_event>-<session>`, however long ago).
+pub(crate) const MISSION_PAUSES: &str = r"
+with paused as materialized (
+  select m.id, m.pause_event, m.unpause_event, m.unpause_at_ms, m.objectives ->> 'resident' as resident
+    from mission_missions m
+   where m.state in ('open', 'active')
+     and (m.pause_event is not null or m.unpause_event is not null)
+),
+workers as (
+  select p.id, r.agent_id, r.session_id
+    from paused p join mission_residents r on r.name = p.resident and r.state = 'approved'
+  union
+  select p.id, k.agent_id, k.session_id
+    from paused p join mission_tasks k on k.mission_id = p.id and k.state = 'delivered'
+)
+select coalesce(jsonb_agg(jsonb_build_object(
+         'id', p.id, 'pause_event', p.pause_event, 'unpause_event', p.unpause_event,
+         'unpause_at_ms', p.unpause_at_ms,
+         'sessions', coalesce((
+           select jsonb_agg(jsonb_build_object(
+                    'agent_id', w.agent_id, 'session_id', w.session_id,
+                    'started_at_ms', last.started_at_ms,
+                    'final', exists (
+                      select 1 from spawn_events r
+                       where r.session_id = 'session_control' and r.event_name = 'control.recorded'
+                         and r.kind -> 'detail' -> 'record' ->> 'type' = 'execution.interrupted'
+                         and r.kind -> 'detail' -> 'record' ->> 'session_id' = w.session_id
+                         and r.kind -> 'detail' -> 'record' ->> 'execution_id' = last.execution_id
+                         and r.kind -> 'detail' -> 'record' ->> 'path' = 'final'),
+                    'resumed', p.unpause_event is not null and exists (
+                      select 1 from spawn_commands c
+                       where c.principal = 'spawn-dispatch' and c.session_id = w.session_id
+                         and c.idempotency_key = format('unpause-%s-%s-%s', p.id, p.unpause_event,
+                                                        w.session_id)))
+                  order by w.session_id)
+             from workers w
+             left join lateral (
+               select x.execution_id, x.started_at_ms from agent_executions x
+                where x.session_id = w.session_id
+                order by x.started_at_ms desc, x.execution_id desc limit 1) last on true
+            where w.id = p.id), '[]'::jsonb))
+       order by p.id), '[]'::jsonb)
+  from paused p";
+
 /// Residents (not retired) whose latest delivered task is cancelled: the
 /// dispatcher stops such a worker, sets the task's work aside and tells it
 /// (docs/fleet-architecture.md, "When a task closes"). The latest delivery
@@ -498,6 +551,9 @@ select jsonb_build_object(
              case when m.halted is not null then jsonb_build_object(
                  'event', m.halt_event, 'reason', m.halted, 'at_ms', m.halt_at_ms,
                  'gone', m.halt_gone) end as halt,
+             case when m.pause_event is not null then jsonb_build_object(
+                 'at_ms', m.pause_at_ms, 'event_id', m.pause_event,
+                 'reason', m.pause_reason) end as paused,
              (select h.hold from mission_source_holds h where h.source = m.sources ->> 0) as hold,
              m.created_at_ms, m.updated_at_ms,
              coalesce((select jsonb_agg(jsonb_build_object(
@@ -948,7 +1004,7 @@ pub(crate) const GATED: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
   select m.id, m.state, m.gate, m.accept, m.budget, m.baseline, m.halted, m.scenario_floor,
-         m.scenario_names, spawn_now_ms() as now_ms,
+         m.scenario_names, spawn_now_ms() as now_ms, m.pause_event is not null as paused,
          m.gate_rejections, m.gate_aborts, m.gate_room_task, m.gate_room_since_ms,
          m.gate_room_last_ms,
          m.gate_room_waits, m.gate_room_escalated, m.gate_host_faults, m.gate_host_task,
@@ -1756,10 +1812,20 @@ impl PostgresStore {
         Ok(held.then_some(LandingHold { store: self }))
     }
 
-    /// Clear a halted mission. A human's decision: owner only.
+    /// Resume a mission (owner only): a paused one is unpaused
+    /// (`mission.unpaused`, its halt kept), a halted one that is not paused
+    /// is resumed (`mission.resumed`).
     pub fn mission_resume(&self, mission: i64) -> Result<(), StoreError> {
         self.execute("select spawn_mission_resume($1)", &[&mission])?;
         Ok(())
+    }
+
+    /// Pause a mission (`mission.paused`, objective 099): owner only, never
+    /// a closed or an already paused mission. Returns the record's event id.
+    pub fn mission_pause(&self, mission: i64, reason: Option<&str>) -> Result<i64, StoreError> {
+        Ok(self
+            .query_one("select spawn_mission_pause($1, $2)", &[&mission, &reason])?
+            .get(0))
     }
 
     /// The owner moved `source`'s main from `from` to `to` outside the gate
@@ -2245,6 +2311,12 @@ impl PostgresStore {
         Ok(self
             .query_one("select spawn_deploy_record($1)", &[record])?
             .get(0))
+    }
+
+    /// The owner's pauses and unpauses the dispatcher acts on, with the
+    /// workers each holds ([`MISSION_PAUSES`]).
+    pub fn mission_pauses(&self) -> Result<Value, StoreError> {
+        self.query_json(MISSION_PAUSES, &[])
     }
 
     /// Residents whose latest delivered task is cancelled, with the

@@ -1038,6 +1038,7 @@ function SectionRowLabel({
 
 const LANE_STATE: Record<Lane["state"], { label: string; dot: string; text: string }> = {
   active: { label: "active", dot: "bg-success", text: "text-muted-foreground" },
+  paused: { label: "paused", dot: "bg-faint-foreground", text: "text-muted-foreground" },
   halted: { label: "halted", dot: "bg-warning", text: "text-warning" },
   done: { label: "done", dot: "bg-faint-foreground", text: "text-muted-foreground" },
   closed: { label: "closed", dot: "bg-faint-foreground", text: "text-muted-foreground" },

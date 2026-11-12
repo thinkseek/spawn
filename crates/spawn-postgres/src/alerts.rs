@@ -168,6 +168,9 @@ select jsonb_build_object(
         -- closed and has tasks but none in work, the record that ended its
         -- last one (objective 058, `mission_idle`).
         'backlog', jsonb_typeof(m.objectives) = 'object',
+        -- The owner's pause it is in (objective 099): no `mission_idle`
+        -- while it lasts, and its unpause starts the idle time again.
+        'paused', m.pause_event is not null,
         'idle', case when m.state in ('open', 'active')
                           and jsonb_typeof(m.objectives) = 'object'
                           and exists (select 1 from mission_tasks k where k.mission_id = m.id)
@@ -178,12 +181,14 @@ select jsonb_build_object(
                              from spawn_events e
                             where e.session_id = 'session_control'
                               and e.event_name = 'control.recorded'
-                              and e.kind -> 'detail' -> 'record' ->> 'type'
-                                  in ('task.landed', 'task.cancelled', 'task.aborted',
-                                      'task.over_budget', 'task.reviewed', 'task.gated')
-                              and e.kind -> 'detail' -> 'record' ->> 'id'
-                                  in (select k.id::text from mission_tasks k
-                                       where k.mission_id = m.id)
+                              and ((e.kind -> 'detail' -> 'record' ->> 'type'
+                                      in ('task.landed', 'task.cancelled', 'task.aborted',
+                                          'task.over_budget', 'task.reviewed', 'task.gated')
+                                    and e.kind -> 'detail' -> 'record' ->> 'id'
+                                      in (select k.id::text from mission_tasks k
+                                           where k.mission_id = m.id))
+                                or (e.kind -> 'detail' -> 'record' ->> 'type' = 'mission.unpaused'
+                                    and e.kind -> 'detail' -> 'record' ->> 'id' = m.id::text))
                             order by e.id desc limit 1) end)
       order by m.id) from mission_missions m), '[]'::jsonb),
   'tasks', coalesce((select jsonb_agg(jsonb_build_object(

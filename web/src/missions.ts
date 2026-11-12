@@ -145,6 +145,16 @@ export interface MissionHalt {
   gone: string[] | null;
 }
 
+/** The owner's pause a mission is in (/api/missions' `paused`, objective
+ * 099): its `mission.paused` record's event, when, and the owner's reason.
+ * While it lasts nothing is assigned or delivered to the mission and its
+ * resident is stopped; `spawn mission resume` ends it. */
+export interface MissionPause {
+  at_ms: number | null;
+  event_id: number;
+  reason: string | null;
+}
+
 export interface Mission {
   id: number | null;
   text: string | null;
@@ -165,6 +175,9 @@ export interface Mission {
   halted: string | null;
   /** The halt it is in; null when it is not halted (or the server is older). */
   halt: MissionHalt | null;
+  /** The owner's pause it is in; null when it is not paused (or the server
+   * is older). Its `state` stays as it was. */
+  paused: MissionPause | null;
   /** Objective missions: the backlog and the resident that works it. */
   objectives: { backlog: string | null; resident: string | null } | null;
   /** The owner's active hold on its source (its event id): no task lands
@@ -298,6 +311,13 @@ export function normalizeHalt(value: unknown): MissionHalt | null {
   };
 }
 
+export function normalizePause(value: unknown): MissionPause | null {
+  if (!isObject(value)) return null;
+  const event_id = optionalNumber(value.event_id);
+  if (event_id === null) return null;
+  return { at_ms: optionalNumber(value.at_ms), event_id, reason: optionalText(value.reason) };
+}
+
 function normalizeMission(value: unknown): Mission | null {
   if (!isObject(value)) return null;
   const sources = list(value.sources)
@@ -330,6 +350,7 @@ function normalizeMission(value: unknown): Mission | null {
     baseline: optionalText(value.baseline),
     halted: optionalText(value.halted),
     halt: optionalText(value.halted) === null ? null : normalizeHalt(value.halt),
+    paused: normalizePause(value.paused),
     objectives: isObject(value.objectives)
       ? {
           backlog: optionalText(value.objectives.backlog),

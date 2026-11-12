@@ -65,3 +65,20 @@ test("idle hours by mission: owner work is said, never flagged idle, and keeps i
     ],
   );
 });
+
+test("idle hours by mission: paused hours are read, 0 from an older server (objective 099)", () => {
+  const answer = {
+    missions: [
+      { mission: 6, text: "paused", hours: 24, idle_hours: 4, paused_hours: 20, idle: false, owner_work: false },
+      { mission: 7, text: "older server", hours: 24, idle_hours: 24, idle: true, owner_work: false },
+    ],
+  };
+  const rows = decisionsFromApi(answer).idleHoursByMission ?? [];
+  assert.deepEqual(
+    rows.map((row) => [row.mission, row.idle, row.idleHours, row.pausedHours]),
+    [
+      [6, false, 4, 20],
+      [7, true, 24, 0],
+    ],
+  );
+});

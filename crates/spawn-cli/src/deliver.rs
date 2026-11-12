@@ -62,6 +62,20 @@
 //!   stopped and not told. A cancelled task's report is never collected: only
 //!   delivered tasks are, and only a report written after their own mark.
 //!
+//! - **a paused mission's workers get nothing** (`spawn mission pause`,
+//!   objective 099; [`PausedMission`]): none of its tasks is delivered (nor queued
+//!   for its turn, so no delivery stall), no restart or cancel notice
+//!   resumes its workers, and its resident and the worker of each of its
+//!   delivered tasks are stopped at once if they run, by a Stop keyed
+//!   `pause-<mission>-<pause record>-<execution>` (its final checkpoint on
+//!   the branch; the recovery records the end `stopped`, final, and
+//!   revives nothing). Their delivered tasks stay delivered. At the
+//!   owner's resume (`mission.unpaused`) each of them whose latest
+//!   execution started before the unpause and ended final is resumed once,
+//!   keyed `unpause-<mission>-<unpause record>-<session>`, in its own
+//!   native session, on its workspace rebuilt from its branch
+//!   ([`pause_orders`]).
+//!
 //! Missions, reports, approvals, human commands to workers (with their
 //! outcome) and failed deliveries become digest items for the supervisor
 //! ([`news_items`]). Like the dispatcher, delivery keeps no state:
@@ -598,6 +612,51 @@ impl HumanNote {
     }
 }
 
+/// A mission the owner paused, or unpaused since its last pause
+/// (`mission_pauses`, objective 099), with the workers the pause holds.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct PausedMission {
+    /// The mission.
+    pub(crate) id: i64,
+    /// The `mission.paused` record it is in; `None` once unpaused.
+    #[serde(default)]
+    pub(crate) pause_event: Option<i64>,
+    /// Its latest `mission.unpaused` record, and when, while not paused.
+    #[serde(default)]
+    pub(crate) unpause_event: Option<i64>,
+    #[serde(default)]
+    pub(crate) unpause_at_ms: Option<i64>,
+    /// Its resident and the workers of its delivered tasks.
+    #[serde(default)]
+    pub(crate) sessions: Vec<PausedWorker>,
+}
+
+/// One worker a pause holds.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct PausedWorker {
+    pub(crate) agent_id: String,
+    pub(crate) session_id: String,
+    /// When its latest execution started.
+    #[serde(default)]
+    pub(crate) started_at_ms: Option<i64>,
+    /// The recovery recorded that execution's end on the `final` path.
+    #[serde(default, rename = "final")]
+    pub(crate) ended_final: bool,
+    /// The unpause's resume was sent already, however long ago.
+    #[serde(default)]
+    pub(crate) resumed: bool,
+}
+
+/// The key of the Stop a pause sends to a running worker.
+pub(crate) fn pause_stop_key(mission: i64, pause: i64, execution: &str) -> String {
+    format!("pause-{mission}-{pause}-{execution}")
+}
+
+/// The key of the resume an unpause sends to a worker the pause stopped.
+pub(crate) fn unpause_key(mission: i64, unpause: i64, session: &str) -> String {
+    format!("unpause-{mission}-{unpause}-{session}")
+}
+
 /// What the supervisor should hear about besides worker states.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct News {
@@ -622,6 +681,8 @@ pub(crate) struct Work {
     pub(crate) cancelled: Vec<Cancelled>,
     /// The latest `source.moved` record, if any.
     pub(crate) moved: Option<Moved>,
+    /// The owner's pauses and unpauses ([`PausedMission`]).
+    pub(crate) pauses: Vec<PausedMission>,
     /// The delivery waits (the defaults, unless the loop set its settings).
     pub(crate) waits: Waits,
 }
@@ -640,8 +701,17 @@ impl Work {
                 .map_err(|error| format!("cancelled deliveries: {error}"))?,
             moved: serde_json::from_value(store.latest_source_moved().map_err(error)?)
                 .map_err(|error| format!("latest source.moved: {error}"))?,
+            pauses: serde_json::from_value(store.mission_pauses().map_err(error)?)
+                .map_err(|error| format!("mission pauses: {error}"))?,
             waits: Waits::default(),
         })
+    }
+
+    /// Whether the owner has paused `mission` (objective 099).
+    pub(crate) fn paused(&self, mission: i64) -> bool {
+        self.pauses
+            .iter()
+            .any(|pause| pause.id == mission && pause.pause_event.is_some())
     }
 
     /// Sessions whose tasks are in one of `states`.
@@ -1295,6 +1365,8 @@ pub(crate) fn next_up(work: &Work) -> BTreeSet<i64> {
         .iter()
         .filter(|task| matches!(task.state, TaskState::Assigned | TaskState::Revise))
         .filter(|task| turns.take(task) && !blocked.contains(task.session_id.as_str()))
+        // A paused mission's task waits for the owner's resume.
+        .filter(|task| !work.paused(task.mission_id))
         .map(|task| task.id)
         .collect()
 }
@@ -1344,7 +1416,10 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
                 orders.extend(delivery(task, found, settled, key));
             }
             TaskState::Delivered => {
-                if let (Some(restart), Some(facts)) = (&task.restart, found) {
+                // A paused mission's worker is not resumed by a restart.
+                if let (Some(restart), Some(facts)) = (&task.restart, found)
+                    && !work.paused(task.mission_id)
+                {
                     orders.extend(restart_order(task, restart, facts));
                 }
             }
@@ -1371,7 +1446,11 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
     }
     for cancelled in work.cancelled.iter().filter(|cancelled| !cancelled.told) {
         if let Some(facts) = facts.get(cancelled.session_id.as_str()) {
-            orders.extend(cancel_order(cancelled, facts, now_ms));
+            // A paused mission's resident is stopped, and told only once
+            // the mission is resumed.
+            orders.extend(cancel_order(cancelled, facts, now_ms).filter(|order| {
+                !work.paused(cancelled.mission_id) || order.action == CommandAction::Stop
+            }));
         }
     }
     for (agent, session) in &work.retired {
@@ -1391,7 +1470,103 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
             });
         }
     }
+    let ordered: BTreeSet<String> = orders
+        .iter()
+        .map(|order| order.session_id.clone())
+        .collect();
+    orders.extend(
+        pause_orders(work, &facts)
+            .into_iter()
+            .filter(|order| !ordered.contains(&order.session_id)),
+    );
     orders
+}
+
+/// The pauses' orders (objective 099): a Stop for every running worker a
+/// pause holds (once per execution: a Stop that fails is pursued by
+/// `dispatch::stops`), and after the owner's resume one resume for each
+/// worker the pause stopped: its latest execution started before the
+/// unpause and its end was recorded final (a Stop's), and the unpause's
+/// resume was never sent. A worker already given an order this pass (a
+/// cancel's Stop or notice) gets none of these.
+fn pause_orders(work: &Work, facts: &BTreeMap<&str, &Facts>) -> Vec<Order> {
+    let mut orders = Vec::new();
+    let retired: BTreeSet<&str> = work
+        .retired
+        .iter()
+        .map(|(_, session)| session.as_str())
+        .collect();
+    for pause in &work.pauses {
+        for worker in &pause.sessions {
+            let Some(facts) = facts.get(worker.session_id.as_str()) else {
+                continue;
+            };
+            if let Some(event) = pause.pause_event {
+                if facts.live_and_free() && !facts.stopping() {
+                    let execution = facts.execution_id.as_deref().unwrap_or("none");
+                    orders.push(Order {
+                        agent_id: worker.agent_id.clone(),
+                        session_id: worker.session_id.clone(),
+                        key: pause_stop_key(pause.id, event, execution),
+                        action: CommandAction::Stop,
+                        task: None,
+                    });
+                }
+                continue;
+            }
+            let (Some(unpause), Some(unpaused_at)) = (pause.unpause_event, pause.unpause_at_ms)
+            else {
+                continue;
+            };
+            let key = unpause_key(pause.id, unpause, &worker.session_id);
+            let stopped_by_pause = worker.ended_final
+                && worker
+                    .started_at_ms
+                    .is_some_and(|started| started < unpaused_at);
+            if facts.live
+                || facts.open_command
+                || facts.execution_id.is_none()
+                || !stopped_by_pause
+                || worker.resumed
+                || facts.sent(&key).is_some()
+                || retired.contains(worker.session_id.as_str())
+            {
+                continue;
+            }
+            let task = work.tasks.iter().find(|task| {
+                task.session_id == worker.session_id && task.state == TaskState::Delivered
+            });
+            orders.push(Order {
+                agent_id: worker.agent_id.clone(),
+                session_id: worker.session_id.clone(),
+                key,
+                action: CommandAction::Resume {
+                    prompt: Some(unpause_prompt(pause.id, task)),
+                    model: task.map(|task| task.model),
+                },
+                task: None,
+            });
+        }
+    }
+    orders
+}
+
+/// What a worker is told when its mission is resumed after the owner's
+/// pause: why its engine was stopped, that its workspace was made again
+/// from its branch, and what to do now.
+pub(crate) fn unpause_prompt(mission: i64, task: Option<&TaskRow>) -> String {
+    let next = task.map_or_else(
+        || "You have no task in work: wait for your next task.".to_string(),
+        |task| {
+            format!(
+                "Continue task #{id} where you left it; when it is done, write `{REPORT}` as the task asked, once.",
+                id = task.id
+            )
+        },
+    );
+    format!(
+        "[Mission #{mission} resumed by the owner]\nThe owner paused mission #{mission}, and Spawn stopped your engine with a final checkpoint of your work. The mission is resumed now: this is your same conversation, and your workspace was made again from your branch (only what the checkpoint kept is there; check with `git status` and `git log`). {next}"
+    )
 }
 
 /// Whether the reassigned task `task` waits for the worker of the task it
@@ -2036,9 +2211,9 @@ fn send_note(
 mod tests {
     use super::{
         CREDENTIALS_LINE, Cancelled, DELIVERY_RETRIES, NOT_READY_RETRY_MS, News, PROCESSES_LINE,
-        REPORT, TaskRow, Work, delivered, delivery_mark, mark_delivery, new_report, news_items,
-        next_due, notice_task, put_aside, report_contract, report_due, retry_wait_ms, task_prompt,
-        typed,
+        PausedMission, PausedWorker, REPORT, Restart, TaskRow, Work, delivered, delivery_mark,
+        mark_delivery, new_report, news_items, next_due, next_up, notice_task, put_aside,
+        report_contract, report_due, retry_wait_ms, task_prompt, typed,
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
@@ -2046,6 +2221,7 @@ mod tests {
     use spawn_core::event::{ModelProfile, SessionSeq};
     use spawn_core::mission::TaskState;
     use spawn_core::observation::{Ambiguity, Confidence, Observation, SemanticState};
+    use std::collections::BTreeSet;
 
     fn task(id: i64, state: TaskState, kind: &str) -> TaskRow {
         TaskRow {
@@ -2721,6 +2897,138 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Objective 099: a paused mission's resident with a delivered task,
+    /// and a task of the mission waiting for a worker of its own.
+    fn paused_work(pause: Option<i64>, unpause: Option<(i64, i64)>, worker: PausedWorker) -> Work {
+        let mut waiting = task(6, TaskState::Assigned, "ephemeral");
+        waiting.agent_id = "agent_worker_objective_6".to_string();
+        waiting.session_id = "session_worker_objective_6".to_string();
+        Work {
+            tasks: vec![task(4, TaskState::Delivered, "resident"), waiting],
+            pauses: vec![PausedMission {
+                id: 1,
+                pause_event: pause,
+                unpause_event: unpause.map(|(event, _)| event),
+                unpause_at_ms: unpause.map(|(_, at)| at),
+                sessions: vec![worker],
+            }],
+            ..Work::default()
+        }
+    }
+
+    fn core_held(started_at_ms: i64, ended_final: bool, resumed: bool) -> PausedWorker {
+        PausedWorker {
+            agent_id: "agent_resident_core".to_string(),
+            session_id: "session_resident_core".to_string(),
+            started_at_ms: Some(started_at_ms),
+            ended_final,
+            resumed,
+        }
+    }
+
+    /// Objective 099: while its mission is paused, a resident is stopped at
+    /// once (idle or in a turn), gets nothing (no delivery, no restart's
+    /// resume) and is not revived; the mission's waiting task is not
+    /// delivered nor queued for its turn. Its delivered task stays as it is.
+    #[test]
+    fn a_paused_missions_resident_is_stopped_and_gets_nothing() {
+        let work = paused_work(Some(50), None, core_held(1_000, false, false));
+        assert!(work.paused(1));
+        assert!(!work.paused(2));
+        assert!(next_up(&work).is_empty(), "the waiting task is not up");
+        for idle in [true, false] {
+            let plan = super::orders(&work, &[worker(true, idle)], 5_000);
+            assert_eq!(
+                plan.iter()
+                    .map(|order| (order.key.as_str(), &order.action, order.task))
+                    .collect::<Vec<_>>(),
+                vec![("pause-1-50-exec_3", &CommandAction::Stop, None)],
+                "idle {idle}: the resident is stopped, nothing else"
+            );
+        }
+        // Its Stop under way: not sent again.
+        let mut stopping = worker(true, true);
+        stopping.stops.push(crate::dispatch::StopSent {
+            succeeded: None,
+            finished_at_ms: None,
+            ..failed_switch("pause-1-50-exec_3", 6_000)
+        });
+        assert!(super::orders(&work, &[stopping], 6_000).is_empty());
+        // Stopped: nothing revives it, not even a restart asked meanwhile.
+        let mut restarted = work.clone();
+        restarted.tasks[0].restart = Some(Restart {
+            n: 1,
+            execution_id: Some("exec_3".to_string()),
+            by: None,
+            reason: None,
+        });
+        let mut stopped = worker(false, false);
+        stopped.recovered = Some(70);
+        assert!(super::orders(&restarted, &[stopped.clone()], 7_000).is_empty());
+        assert!(super::orders(&work, &[stopped], 7_000).is_empty());
+    }
+
+    /// Objective 099: at the owner's resume the resident the pause stopped
+    /// is resumed once, in its own session, told of its task; the mission's
+    /// waiting task is delivered again. A worker that ran since the unpause,
+    /// or whose end was not the pause's final Stop, or that was resumed
+    /// already, is left alone.
+    #[test]
+    fn an_unpaused_missions_resident_is_resumed_once() {
+        let work = paused_work(None, Some((60, 2_000)), core_held(1_000, true, false));
+        assert!(!work.paused(1));
+        assert_eq!(next_up(&work), BTreeSet::from([6]));
+        let stopped = worker(false, false);
+        let plan = super::orders(&work, std::slice::from_ref(&stopped), 8_000);
+        let resume = plan
+            .iter()
+            .find(|order| order.session_id == "session_resident_core")
+            .expect("the resident is resumed");
+        assert_eq!(resume.key, "unpause-1-60-session_resident_core");
+        let CommandAction::Resume {
+            prompt: Some(prompt),
+            ..
+        } = &resume.action
+        else {
+            panic!("a resume, not {:?}", resume.action);
+        };
+        assert!(
+            prompt.contains("Mission #1 resumed by the owner"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Continue task #4"), "{prompt}");
+        assert!(
+            plan.iter().any(|order| order.task == Some(6)),
+            "the waiting task goes to its worker: {plan:?}"
+        );
+        let resumes = |work: &Work, facts: &Facts| {
+            super::orders(work, std::slice::from_ref(facts), 8_000)
+                .into_iter()
+                .filter(|order| order.session_id == "session_resident_core")
+                .count()
+        };
+        // Sent already (however long ago, or in this day's log): once.
+        let sent = paused_work(None, Some((60, 2_000)), core_held(1_000, true, true));
+        assert_eq!(resumes(&sent, &stopped), 0);
+        let mut told = stopped.clone();
+        told.dispatched.push(Sent {
+            id: Some(80),
+            key: "unpause-1-60-session_resident_core".to_string(),
+            text: None,
+            created_at_ms: 7_000,
+            finished_at_ms: Some(7_500),
+            succeeded: Some(true),
+            error: None,
+        });
+        assert_eq!(resumes(&work, &told), 0);
+        // Ran since the unpause, or ended otherwise, or running: left alone.
+        let since = paused_work(None, Some((60, 2_000)), core_held(3_000, true, false));
+        assert_eq!(resumes(&since, &stopped), 0);
+        let other_end = paused_work(None, Some((60, 2_000)), core_held(1_000, false, false));
+        assert_eq!(resumes(&other_end, &stopped), 0);
+        assert_eq!(resumes(&work, &worker(true, true)), 0);
     }
 
     /// Audit #3: a closed task's worker, or a retired resident, whose Stop

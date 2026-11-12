@@ -164,10 +164,23 @@ pub(crate) fn answer(counts: &Value, name: &str, window: Window) -> Value {
     })
 }
 
-/// One mission's span in the window, its idle hours (the span less the
-/// union of its tasks' open intervals), whether it is owner work (no
-/// objective backlog) and whether it sat idle more than half of it, which an
-/// owner-work mission never is.
+/// The `[start, end]` pairs of `value` (an open end is `None`).
+fn intervals(value: &Value) -> Vec<(i64, Option<i64>)> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|pair| Some((pair[0].as_i64()?, pair[1].as_i64())))
+        .collect()
+}
+
+/// One mission's span in the window, its paused hours (the owner's pauses
+/// within the span, objective 099), its idle hours (the span less the union
+/// of its tasks' open intervals and its pauses: a paused hour is the
+/// owner's choice, not idle), whether it is owner work (no objective
+/// backlog) and whether it sat idle more than half of its span less its
+/// paused time, which an owner-work mission never is, nor one paused at the
+/// window's end.
 fn idle(mission: &Value, window: Window) -> Value {
     let opened = count(&mission["opened_at_ms"]);
     let span = Window {
@@ -177,27 +190,27 @@ fn idle(mission: &Value, window: Window) -> Value {
             .map_or(window.until, |closed| closed.min(window.until)),
     };
     let span_ms = (span.until - span.since).max(0);
-    let tasks: Vec<(i64, Option<i64>)> = mission["tasks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|task| Some((task[0].as_i64()?, task[1].as_i64())))
-        .collect();
-    let busy_ms = if span_ms > 0 {
-        union_ms(&tasks, span)
+    let tasks = intervals(&mission["tasks"]);
+    let pauses = intervals(&mission["pauses"]);
+    let (busy_ms, paused_ms) = if span_ms > 0 {
+        let both: Vec<(i64, Option<i64>)> = tasks.iter().chain(&pauses).copied().collect();
+        (union_ms(&both, span), union_ms(&pauses, span))
     } else {
-        0
+        (0, 0)
     };
     let idle_ms = span_ms - busy_ms;
     // A mission with no objective backlog takes its work from the owner: an
     // hour without a task there is no loss, so it is never flagged idle.
     let owner_work = mission["owner_work"].as_bool().unwrap_or(false);
+    // Paused at the window's end: the owner holds it now.
+    let paused_now = pauses.iter().any(|(_, end)| end.is_none());
     json!({
         "mission": mission["mission"],
         "text": mission["text"],
         "hours": milli(span_ms, HOUR_MS),
         "idle_hours": milli(idle_ms, HOUR_MS),
-        "idle": !owner_work && idle_ms * 2 > span_ms,
+        "paused_hours": milli(paused_ms, HOUR_MS),
+        "idle": !owner_work && !paused_now && idle_ms * 2 > span_ms - paused_ms,
         "owner_work": owner_work,
     })
 }
@@ -354,6 +367,60 @@ mod tests {
                 (4, 0.0, false, true)
             ],
             "owner work keeps its idle hours but is never flagged idle"
+        );
+    }
+
+    #[test]
+    fn paused_time_is_not_idle_and_a_mission_paused_at_the_end_is_never_flagged() {
+        let window = Window {
+            since: U - DAY_MS,
+            until: U,
+        };
+        let counts = json!({
+            "missions": [
+                // Paused for the last 20 h, still paused: 4 h idle, 20 paused.
+                {"mission": 1, "text": "paused now", "opened_at_ms": at(-48.0), "closed_at_ms": null,
+                 "owner_work": false, "tasks": [], "pauses": [[at(-20.0), null]]},
+                // Paused 12 h and resumed; a task of 2 h in the window, and
+                // one inside the pause, counted once: idle 24 − 12 − 2 = 10,
+                // more than half of 24 − 12.
+                {"mission": 2, "text": "resumed", "opened_at_ms": at(-48.0), "closed_at_ms": null,
+                 "owner_work": false, "tasks": [[at(-26.0), at(-22.0)], [at(-14.0), at(-11.0)]],
+                 "pauses": [[at(-22.0), at(-10.0)]]},
+                // Paused 16 h, resumed, then busy 4 of the 8 h left: idle 4,
+                // not more than half of 24 − 16.
+                {"mission": 3, "text": "half", "opened_at_ms": at(-48.0), "closed_at_ms": null,
+                 "owner_work": false, "tasks": [[at(-4.0), null]],
+                 "pauses": [[at(-30.0), at(-8.0)]]},
+                // No pause at all: as before.
+                {"mission": 4, "text": "idle", "opened_at_ms": at(-48.0), "closed_at_ms": null,
+                 "owner_work": false, "tasks": []}
+            ]
+        });
+        let answer = answer(&counts, "24h", window);
+        let rows: Vec<(i64, f64, f64, f64, bool)> = answer["missions"]
+            .as_array()
+            .expect("missions")
+            .iter()
+            .map(|m| {
+                (
+                    m["mission"].as_i64().expect("id"),
+                    m["hours"].as_f64().expect("hours"),
+                    m["idle_hours"].as_f64().expect("idle hours"),
+                    m["paused_hours"].as_f64().expect("paused hours"),
+                    m["idle"].as_bool().expect("idle"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (1, 24.0, 4.0, 20.0, false),
+                (2, 24.0, 10.0, 12.0, true),
+                (3, 24.0, 4.0, 16.0, false),
+                (4, 24.0, 24.0, 0.0, true)
+            ],
+            "paused hours are left out of idle hours, and a mission paused at the end is not idle"
         );
     }
 
