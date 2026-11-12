@@ -60,7 +60,11 @@
 //! [`nightly_facts`]). The recoverability north star and its two ages
 //! (objective 093) are the recovery table's drills, the rows the same file
 //! names under `recoverability` ([`drills`]); the answer lists them as
-//! `drills`. Later objectives add their figures to this frame.
+//! `drills`. The storage line's last two guardrails (objective 094) are the
+//! scratch nobody owns and the leaked test schemas, read in the background
+//! and kept ([`unowned`], [`scratch`], [`schemas`]); the answer lists
+//! `scratch` and `test_schemas`. Later objectives add their figures to this
+//! frame.
 //!
 //! No range lives in code: they come only from the ranges file,
 //! `SPAWN_CORE_LINES_FILE`, by default `<workspace root>/core-lines.json`,

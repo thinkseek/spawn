@@ -934,6 +934,89 @@ notices) that ended in the last 7 days (`cleared_at_ms` in the window), the
 share whose `outcome` is `cleared` (their condition cleared them, rather
 than the owner judging them false, stale or a duplicate); null with none.
 
+The storage line's last two guardrails (objective 094) are read only.
+They come after the frame's five.
+
+`storage.unowned_scratch_bytes`, "Scratch nobody owns" (bytes; null with
+no roots), is the bytes of the scratch nobody owns. The Core lines file
+names the roots: `"storage": {"scratch_roots": [<dir>], "scratch_exclude":
+[<path>]}`. Each top-level entry of a root is one of three:
+- owned: its `.spawn-owner` file, `<pid> <start ticks>` (the integrator's
+  pid file's form), names a process still running at that start time; or,
+  with no marker, something in it changed in the last 24 h;
+- gone: its marker names a process that does not run, or a pid now used by
+  another process;
+- idle: no marker, and nothing in it changed in 24 h.
+
+The figure is the gone and idle entries' file lengths. These are never
+counted:
+- symlinks, never followed at any depth (nor dated);
+- an entry holding a `*.jsonl` file;
+- `.transcripts`, and names starting `incident-` or ending `.pending` or
+  `-pending`;
+- `/data/recovery`, `/var/backups/spawn-sessions` and Claude Code's
+  projects directory, and anything under them or holding them;
+- the configured excludes.
+
+The answer lists `scratch` `{roots, unowned: [{path, bytes, reason:
+"gone"|"idle"}]}`, the 20 largest first.
+
+`storage.leaked_test_schemas`, "Leaked test schemas" (count; null when no
+test server answered), is the sum over the test servers of the schemas
+(not `public`, not the system's) left over by a test that is gone. All
+three must hold:
+- no live session's `application_name` is its name;
+- the `<pid>` of `spawn_test_<pid>_…` is no process on this host (a name
+  with no pid has no owner);
+- it was made at least 24 h ago, by its comment `{"made_at_ms": <ms>}`.
+  Without a comment that reads so, it is dated by its first sight. The
+  first sights are kept in `<workspace root>/test-schemas-seen.json`,
+  `{"<server>/<schema>": <ms>}`: a schema is added when first seen, a first
+  sight never moves, and a schema gone from a server that answered is
+  dropped.
+
+Every test schema is made so (`PostgresStore::connect_in_schema`,
+`TestSchema`, the spawn-postgres test helpers, `made_schema_sql`). Its
+connection's `application_name` is the schema's name, and it carries that
+comment.
+
+The test servers are read in this order:
+- `SPAWN_TEST_DATABASE_URL` ("test") and `SPAWN_FLEET_TEST_DATABASE_URL`
+  ("fleet_test");
+- each `storage.test_database_url_files` entry `{name, url_file}`.
+
+A URL file is used only when this user owns it as a regular file at mode
+0600, and its URL names a local socket or a loopback host. It must also
+not name the live database: that is compared by the database each URL
+names (local or not, port, database name, after libpq's defaults), so
+another spelling of it is refused too. A refused file is listed in
+`ignored_ranges` as `storage.test_database_url_files.<name>` with why. No
+URL is printed.
+
+Each server is read by one statement over `pg_namespace` and
+`pg_stat_activity` (`spawn_postgres::test_schemas`), on a connection of
+its own, 5 s connecting and 5 s querying. A server that does not answer is
+left out, and serve's log says why. The answer lists `test_schemas`
+`[{server, schemas, leaked}]`.
+
+Both are read on a thread of their own, at most every 10 minutes and kept
+between. A request, and the loop's sample, gets the kept reading and never
+waits; only the first read after start is waited for, at most 10 s, and
+until it ends the figures are not collected. A scratch walk is bounded to
+5 s and a million entries per root. One past its bound keeps the previous
+figure and says so in serve's log; it never gives a partial count.
+
+Nothing here removes, moves, renames or touches a file or a schema. A
+sweep is the owner's decision.
+
+The live file (a lead step):
+- `scratch_roots` `["/var/tmp/spawn"]` and `scratch_exclude`
+  `["/var/tmp/spawn/sync"]`;
+- ranges: scratch nobody owns max 2147483648 (2 GB), leaked test schemas
+  max 200;
+- on live the schema figure reads 0 for the first day, since no schema has
+  been seen 24 h before.
+
 The recoverability line (objective 087) has the north star
 `recoverability.restores_passed` (objective 093, below) and four guardrails: `recoverability.cloud_dump_age` and
 `recoverability.cloud_bundle_age` (ms since the newest `backup.dumped` and
