@@ -61,6 +61,7 @@ pub(crate) fn walk(path: &Path, skip: &[PathBuf]) -> Sizes {
                     pending.push(child);
                 }
             } else if kind.is_file()
+                && !skip.contains(&entry.path())
                 && let Ok(metadata) = entry.metadata()
             {
                 sizes.bytes = sizes.bytes.saturating_add(metadata.len());
@@ -81,10 +82,23 @@ pub(crate) fn archive(root: &Path) -> Sizes {
     walk(&archive_path(root), &[])
 }
 
+/// The test schemas' first sights, kept under the workspace root by the
+/// Core lines reader (objective 094): its bookkeeping, no workspace.
+pub(crate) const TEST_SCHEMAS_SEEN: &str = "test-schemas-seen.json";
+
 /// The workspaces: everything under `root` outside the archive and its
-/// progress directory.
+/// progress directory, and the test schemas' first sights (and the file
+/// it is written through).
 pub(crate) fn workspaces(root: &Path) -> Sizes {
-    walk(root, &[root.join(ARCHIVE), root.join(PROGRESS)])
+    walk(
+        root,
+        &[
+            root.join(ARCHIVE),
+            root.join(PROGRESS),
+            root.join(TEST_SCHEMAS_SEEN),
+            root.join(format!("{TEST_SCHEMAS_SEEN}.partial")),
+        ],
+    )
 }
 
 /// Claude Code's projects directory, as the Bridge reads it
