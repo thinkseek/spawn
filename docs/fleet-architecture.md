@@ -1292,7 +1292,9 @@ A message's id is its command's id, carried end to end:
   finished before it was the older Spawn's to type, and is not.
 - **The alert.** The alerts step raises `message_not_taken` (subject the
   session, key `message_not_taken:<command id>`, evidence the command, the
-  agent, the session and whether it was typed) once per message when it
+  agent, the session, whether it was typed and, typed, how many transcript
+  lines the Bridge recorded since the typing, `read_since_typed`, at most
+  100 counted) once per message when it
   becomes not taken while its session has not ended with it; it clears when
   the message is taken, or when the session ends with it untaken (the
   execution it was typed into, or its own start's, ended; a never-typed one
@@ -1305,6 +1307,10 @@ A message's id is its command's id, carried end to end:
   or ended an execution since (an idle pass reads next to nothing, objective
   023). An open one reaches
   `/api/alerts` and Home's Needs you, which names the agent and the message.
+  A typed one with no line read since (S17) is not said as not taken:
+  its text and Home's title ("Spawn has read nothing of a transcript since
+  a message was typed") say whether the agent took it is unknown, since
+  either Spawn is not reading the transcript or the engine wrote nothing.
   Out of scope: what a reply says, and retrying a message not taken.
 - **Acted: the agent's own answer (objective 046).** Answered says the turn
   a message started ended, not that the agent did what it asked. The agent
