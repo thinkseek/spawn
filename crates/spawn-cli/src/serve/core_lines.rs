@@ -40,8 +40,9 @@
 //! key names no figure, or with no number min or max, is left out and listed
 //! in `ignored_ranges`. A missing file is no ranges and no error; a file that
 //! is not such JSON is no ranges and a `ranges_error`. Nothing but `spawn
-//! serve` reads the file, and no gate, integrator or deploy step reads the
-//! answer: monitoring only.
+//! serve` and the loop's alert step ([`reading`], `guardrail_out_of_range`)
+//! read the file, and no gate, integrator or deploy step reads the answer:
+//! monitoring only.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -444,6 +445,15 @@ pub(super) fn read_ranges(path: Option<&std::path::Path>) -> Result<Option<Strin
 /// `GET /api/core-lines`.
 pub(super) fn core_lines() -> Result<Value, String> {
     core_lines_at(&super::open_store()?, ranges_path().as_deref())
+}
+
+/// The same answer for the loop's alert step (`guardrail_out_of_range`,
+/// objective 089): the same figures, computed by the same code, the ranges
+/// file read now. The costly figures are kept as for `spawn serve` (the
+/// performance line for a minute, health.storage's sizes for ten), so a
+/// reading does not stall the loop.
+pub(crate) fn reading(store: &spawn_postgres::PostgresStore) -> Result<Value, String> {
+    core_lines_at(store, ranges_path().as_deref())
 }
 
 /// The answer with the ranges file at `path`, read now.
