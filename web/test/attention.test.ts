@@ -352,8 +352,8 @@ test("the supervisor's lines for the owner are read, not counted", () => {
   ];
   const view = normalizeAttention(raw);
   assert.deepEqual(view.supervisor?.for_owner, [
-    { text: "deploy ffc9fe7; it touches deploy/", at_ms: NOW - 60_000, tasks: [], settled: false },
-    { text: "approve resident `docs`", at_ms: null, tasks: [], settled: false },
+    { text: "deploy ffc9fe7; it touches deploy/", at_ms: NOW - 60_000, tasks: [], settled: false, current: true },
+    { text: "approve resident `docs`", at_ms: null, tasks: [], settled: false, current: true },
   ]);
   assert.equal(attentionGroups(view).count, 6, "no more than without them");
 
@@ -393,9 +393,23 @@ test("a line for the owner keeps the tasks it names and whether it is settled (o
         { id: 3, state: "unknown" },
       ],
       settled: true,
+      current: true,
     },
-    { text: "task #5 waits for your review.", at_ms: NOW, tasks: [], settled: false },
+    { text: "task #5 waits for your review.", at_ms: NOW, tasks: [], settled: false, current: true },
   ]);
+});
+
+test("a line for the owner keeps whether it is of the newest block; an older server's counts as current (objective 078)", () => {
+  const raw = answer() as { supervisor: { for_owner?: unknown } };
+  raw.supervisor.for_owner = [
+    { text: "now", at_ms: NOW, current: true },
+    { text: "before", at_ms: NOW - 60_000, current: false },
+    { text: "older server", at_ms: NOW - 120_000 },
+  ];
+  assert.deepEqual(
+    normalizeAttention(raw).supervisor?.for_owner?.map((note) => note.current),
+    [true, false, true],
+  );
 });
 
 test("the supervisor asks in at most its HUMAN: line, else its reply's last paragraph", () => {
