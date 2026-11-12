@@ -665,7 +665,7 @@ mod tests {
         assert_eq!(parse_show(""), None);
     }
 
-    /// The rows of [`the_rows_readings_count_within_7_days_and_give_both_ages`].
+    /// The rows of [`the_rows_last_passes_count_within_7_days_and_give_both_ages`].
     fn seven_rows() -> Config {
         Config {
             present: true,
@@ -707,7 +707,7 @@ mod tests {
     /// newest passing one), a unit's three results, a refused name, no
     /// drill, one outside 7 days; and both ages.
     #[test]
-    fn the_rows_readings_count_within_7_days_and_give_both_ages() {
+    fn the_rows_last_passes_count_within_7_days_and_give_both_ages() {
         let now = 100 * DAY;
         let config = seven_rows();
         let mut asked = Vec::new();
