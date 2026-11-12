@@ -5,7 +5,7 @@
 //! A real database is required (`SPAWN_TEST_DATABASE_URL`); every case runs
 //! in a schema of its own.
 
-use postgres::Client;
+use postgres::{Client, NoTls};
 use serde_json::{Value, json};
 
 mod common;
@@ -1317,6 +1317,56 @@ fn a_store_restored_in_place_leaves_no_kept_fact_behind() {
                 .all(|fact| fact["id"] != 4 && fact["id"] != 5),
             "no lost record's fact stays: {read}"
         );
+    }
+}
+
+/// The kept facts are keyed by the database's oid too: a database dropped
+/// and made again under its name and URL (a restore by re-creation) whose
+/// last control record is the same row as the kept one, so the restore
+/// probe passes, is read whole, not merged into the old database's facts.
+/// The case makes its own database, and drops it and its logins after.
+#[test]
+fn a_database_made_again_under_its_name_is_another_store() {
+    let url = common::url();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    let name = format!("spawn_test_{}_{nanos:x}_kept_oid", std::process::id());
+    let ours = url
+        .rsplit_once('/')
+        .map_or(url.clone(), |(server, _)| format!("{server}/{name}"));
+    let mut maintenance = Client::connect(&url, NoTls).expect("admin");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // The first history, then one that differs but for its last record.
+        for (ids, until) in [([1, 2, 3], 1_000), ([9, 8, 3], 1_100)] {
+            maintenance
+                .batch_execute(&format!("create database {name}"))
+                .expect("the database");
+            let store = PostgresStore::connect(&ours).expect("connect");
+            store.migrate().expect("migrate");
+            let mut client = Client::connect(&ours, NoTls).expect("its owner");
+            for (n, id) in (1_i64..).zip(ids) {
+                record(&mut client, n * 100, &json!({"type": "task.landed", "id": id}));
+            }
+            assert_eq!(
+                store
+                    .scorecard_facts_with_overlap(until, 0)
+                    .expect("facts"),
+                oracle(&mut client, until),
+                "the history of {ids:?}"
+            );
+            drop((store, client));
+            maintenance
+                .batch_execute(&format!("drop database {name} with (force)"))
+                .expect("drop the case's database");
+        }
+    }));
+    let _ = maintenance.batch_execute(&format!("drop database if exists {name} with (force)"));
+    for base in ["spawn_human", "spawn_reader", "spawn_supervisor"] {
+        let _ = maintenance.batch_execute(&format!("drop role if exists {base}_{name}"));
+    }
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
     }
 }
 
