@@ -250,9 +250,6 @@ fn performance_now(store: &spawn_postgres::PostgresStore, now_ms: i64) -> Value 
     values
 }
 
-/// The four lines: the performance line's figures from `performance`
-/// ([`performance`]), the storage line's from `storage` (health.storage as
-/// [`super::storage::report`] gives it).
 /// The performance line ([`performance`]'s values).
 fn performance_line(performance: &Value) -> Line {
     Line {
@@ -352,6 +349,9 @@ fn storage_line(storage: &Value) -> Line {
     }
 }
 
+/// The four lines: the performance line's figures from `performance`
+/// ([`performance`]), the storage line's from `storage` (health.storage as
+/// [`super::storage::report`] gives it).
 pub(super) fn lines(storage: &Value, performance: &Value) -> Vec<Line> {
     vec![
         performance_line(performance),
