@@ -2248,7 +2248,8 @@ fn alerts(query: &str) -> Result<Value, String> {
 /// mission (`landed`, `usd_per_landing`), read through the reader login.
 /// Each `tasks` row carries its `label`, the task's label as
 /// `/api/missions` gives it ([`labels`]), or null for a task the record
-/// does not hold.
+/// does not hold; each `missions` row its `name`, the mission's
+/// `mission_name` as `/api/missions` gives it, or null likewise.
 fn cost(query: &str) -> Result<Value, String> {
     let asked = parameter(query, "window")
         .map(|text| percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad window {text}")))
@@ -2262,19 +2263,24 @@ fn cost(query: &str) -> Result<Value, String> {
 }
 
 /// A cost answer's `tasks` rows, each with its `label` as `/api/missions`
-/// gives it (null for a task the record does not hold): read for those
-/// tasks alone ([`spawn_postgres::PostgresStore::task_label_facts`]).
+/// gives it, and its `missions` rows, each with its `name` (null for a
+/// task or mission the record does not hold): read for those tasks and
+/// missions alone ([`spawn_postgres::PostgresStore::label_facts_of`]).
 fn label_cost_tasks(
     store: &spawn_postgres::PostgresStore,
     answer: &mut Value,
 ) -> Result<(), String> {
-    let ids: Vec<i64> = answer["tasks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|row| row["task"].as_i64())
-        .collect();
-    let facts = store.task_label_facts(&ids).map_err(err)?;
+    let ids_of = |list: &str, field: &str| -> Vec<i64> {
+        answer[list]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row[field].as_i64())
+            .collect()
+    };
+    let tasks = ids_of("tasks", "task");
+    let missions = ids_of("missions", "mission");
+    let facts = store.label_facts_of(&tasks, &missions).map_err(err)?;
     labels::label_cost(
         answer,
         &labels::Context::from_board(&facts, &labels::Titles::new()),

@@ -524,8 +524,9 @@ select jsonb_build_object(
 /// first 600 characters), so a label is the one `/api/missions` gives:
 /// `{missions: [{id, text, sources, gate, accept, tasks: [{id, kind,
 /// agent_id, session_id, brief, state, objective}]}]}`, only the missions
-/// of those tasks and only those tasks. A task the record does not hold is
-/// not there.
+/// of those tasks and those named in `$2` (an array of ids; `tasks` null
+/// for one holding none of them), and only those tasks. A task or mission
+/// the record does not hold is not there.
 pub(crate) const TASK_LABEL_FACTS: &str = r"
 select jsonb_build_object(
   'missions', coalesce((select jsonb_agg(jsonb_build_object(
