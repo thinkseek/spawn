@@ -698,3 +698,43 @@ fn the_live_record_starts_at_the_first_deploy_of_any_outcome() {
         "the earliest, a failed deploy too"
     );
 }
+
+/// Objective 095: the facts name where the live record begins, the first
+/// `deploy.finished` of any outcome (a failed one too), read over the whole
+/// log before their end: one recorded long before a 7-day window is found,
+/// none after the end counts, and with no deploy record it is null.
+#[test]
+fn the_facts_find_the_live_records_start_before_the_window() {
+    const DAY: i64 = 86_400_000;
+    let (store, schema) = store("scorecard_live_from");
+    let mut client = admin(&schema);
+    let now = 100 * DAY;
+    let empty = store.scorecard_facts(now).expect("the facts");
+    assert_eq!(empty["live_from_ms"], Value::Null, "{empty}");
+    for (at, value) in [
+        // Eight days before `now`: before a 7-day window's start.
+        (
+            now - 8 * DAY,
+            json!({"type": "deploy.finished", "ok": false, "head": "h", "by": "landing",
+                   "reason": "the build failed"}),
+        ),
+        (
+            now - 2 * DAY,
+            json!({"type": "deploy.finished", "ok": true, "head": "h", "by": "landing",
+                   "reason": ""}),
+        ),
+        (
+            now - DAY,
+            json!({"type": "task.reported", "id": 4, "commit": "c"}),
+        ),
+    ] {
+        record(&mut client, at, &value);
+    }
+    let facts = store.scorecard_facts(now).expect("the facts");
+    assert_eq!(facts["live_from_ms"], now - 8 * DAY, "{facts}");
+    // The facts of an earlier end hold only what was recorded before it.
+    let earlier = store.scorecard_facts(now - 5 * DAY).expect("the facts");
+    assert_eq!(earlier["live_from_ms"], now - 8 * DAY);
+    let before = store.scorecard_facts(now - 8 * DAY).expect("the facts");
+    assert_eq!(before["live_from_ms"], Value::Null, "{before}");
+}

@@ -243,8 +243,14 @@ wait_until() { # <seconds> <command...>
         sleep 0.5
     done
 }
+# The log is emptied here, by this shell, before the launch: with `>log &`
+# the truncation ran in the child, after the fork, so at (3)'s restart this
+# shell could read the stopped serve's port line first and send the request
+# to a dead port (task 303's base run, "answered 000" over (2)'s body, which
+# curl had left in place). As 046's start_serve.
 start_serve() {
-    "$SPAWN_BIN" serve --address "127.0.0.1:0" --web "$WORK/web" >"$WORK/serve.log" 2>&1 &
+    : >"$WORK/serve.log"
+    "$SPAWN_BIN" serve --address "127.0.0.1:0" --web "$WORK/web" >>"$WORK/serve.log" 2>&1 &
     serve_pid=$!
     port=""
     i=0
@@ -356,8 +362,8 @@ note "(1) checked: the loop's sample"
 # --- (2) the answer ------------------------------------------------------------------------
 
 start_serve
-code=$(curl -s --noproxy '*' -o "$WORK/api.json" -w '%{http_code}' "$base/api/fleet" 2>/dev/null) || code=000
-[ "$code" = 200 ] || harness "GET /api/fleet answered $code: $(head -c 300 "$WORK/api.json")"
+code=$(bb_http "$WORK/api.json" --noproxy '*' "$base/api/fleet")
+[ "$code" = 200 ] || harness "GET /api/fleet answered $code$(bb_http_why "$WORK/api.json"): $(head -c 300 "$WORK/api.json")"
 storage() { jq -c ".health.storage | $1" "$WORK/api.json"; }
 read_at=$(storage '.read_at_ms')
 db_now=$(storage '.database.bytes')
@@ -402,10 +408,12 @@ note "(2) checked: the answer"
 kill "$serve_pid" 2>/dev/null || true
 wait "$serve_pid" 2>/dev/null || true
 serve_pid=""
-cp "$WORK/api.json" "$WORK/counted.json"
+# (2)'s answer is moved away, not copied: curl leaves the file as it was
+# when no answer comes, and a stale body must not read as this one.
+mv "$WORK/api.json" "$WORK/counted.json"
 SPAWN_SESSION_BACKUP_STATUS=$WORK/backups/none.json start_serve
-code=$(curl -s --noproxy '*' -o "$WORK/api.json" -w '%{http_code}' "$base/api/fleet" 2>/dev/null) || code=000
-[ "$code" = 200 ] || harness "GET /api/fleet (no status file) answered $code: $(head -c 300 "$WORK/api.json")"
+code=$(bb_http "$WORK/api.json" --noproxy '*' "$base/api/fleet")
+[ "$code" = 200 ] || harness "GET /api/fleet (no status file) answered $code$(bb_http_why "$WORK/api.json"): $(head -c 300 "$WORK/api.json" 2>/dev/null)"
 cp "$WORK/api.json" "$WORK/excluded.json"
 expect_eq "$(storage '{backups: .growth_parts.session_backups, excluded: .growth_excluded}')" \
     '{"backups":null,"excluded":["session_backups"]}' "(3) no status file: the session backups' part is null and listed as left out"

@@ -289,6 +289,23 @@ test("coreLinesView's marks stay as they were with trends in the answer", () => 
 });
 
 
+<<<<<<< e2f5b0be8f5f199d98517d18270e9082ce36ce90
+test("a figure whose window is not covered yet says measuring since, in local time (objective 095)", () => {
+  // Local wall-clock fields, so the words hold in any time zone.
+  const since = new Date(2026, 10, 2, 7, 5).getTime();
+  const waiting = answer();
+  waiting.lines[0].north_star = { ...waiting.lines[0].north_star, measuring_since_ms: since };
+  assert.deepEqual(coreLinesView(waiting).rows[0].north_star, {
+    name: "Time from report to live",
+    value: "measuring since 11-02 07:05",
+    range: "no range set",
+    tone: "muted",
+  });
+  // Covered: the figure's own value, no matter a stray null.
+  const covered = answer();
+  covered.lines[0].north_star = { ...covered.lines[0].north_star, value: 5_400_000, state: "no_range", measuring_since_ms: null };
+  assert.equal(coreLinesView(covered).rows[0].north_star.value, "1 h 30 min");
+=======
 // Objective 093: the recovery table's rows under the recoverability line.
 test("each drill row says its last pass, never passed, or no drill", () => {
   const now = Date.UTC(2026, 10, 12, 12, 0);
@@ -318,4 +335,5 @@ test("each drill row says its last pass, never passed, or no drill", () => {
   assert.equal(view.drills[2].text, "never passed");
   assert.equal(view.drills[3].text, "no drill");
   assert.equal(drillMark(null, now).text, "no drill");
+>>>>>>> 2186a63001cae57808975bcaaa669cc613606370
 });

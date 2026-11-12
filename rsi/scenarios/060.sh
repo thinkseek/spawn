@@ -380,7 +380,7 @@ assign() {
 }
 
 # The page's API: GET <path> into <file>; its status code.
-get() { curl -s --noproxy '*' -o "$2" -w '%{http_code}' "$base$1" 2>/dev/null || echo 000; }
+get() { bb_http "$2" --noproxy '*' "$base$1"; }
 # cost <window> <check>: the answer for the window in $WORK/cost-<window>.json;
 # an answer other than 200 with JSON is the behaviour's failure.
 cost() {

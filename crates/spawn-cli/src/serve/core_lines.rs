@@ -381,7 +381,11 @@ static PERFORMANCE: std::sync::Mutex<Option<(i64, Value, Value)>> = std::sync::M
 /// scope's `report_to_live` value, `gate_time` value (the median),
 /// `gate_time`'s `undecided_ms` over its `total_ms` (null when the total is
 /// 0), `first_pass` value, and the cost window's `usd_per_landing`. A value
-/// the page does not have is null.
+/// the page does not have is null. While the 7 days are not covered by the
+/// live record (`report_to_live`'s `covered` false, objective 095), report
+/// to live has no value and `measuring_since_ms` is its `measured_from_ms`:
+/// the figure would measure the record's start, not the wait. [`measured`]
+/// holds it back by the same rule from the record's start alone.
 pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
     let fleet = scorecard["scopes"]
         .as_array()
@@ -394,13 +398,19 @@ pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
         (Some(undecided), Some(total)) if total > 0.0 => json!(undecided / total),
         _ => Value::Null,
     };
-    json!({
-        "report_to_live": fleet["report_to_live"]["value"],
+    let live = &fleet["report_to_live"];
+    let mut values = json!({
+        "report_to_live": live["value"],
         "gate_time": gate["value"],
         "decided_nothing": decided_nothing,
         "first_pass": fleet["first_pass"]["value"],
         "usd_per_landing": cost["usd_per_landing"],
-    })
+    });
+    if live["covered"] == false {
+        values["report_to_live"] = Value::Null;
+        values["measuring_since_ms"] = live["measured_from_ms"].clone();
+    }
+    values
 }
 
 /// The window report to live is measured over: the Scorecard's default.
@@ -1306,6 +1316,37 @@ mod tests {
         assert_eq!(line.north_star.key, "observability.needs_you_right");
         assert_eq!(line.north_star.unit, "share");
         assert_eq!(line.north_star.value, json!(0.5));
+    }
+
+    /// Objective 095: the north star while the Scorecard's 7 days are not
+    /// covered by the live record has no value and says where the measuring
+    /// began; once covered it is the Scorecard's value, with no such field.
+    #[test]
+    fn the_performance_north_star_measures_since_the_record_until_covered() {
+        let card = |covered: bool, from: Value| {
+            json!({"scopes": [{"scope": "fleet", "dimensions": {
+                "report_to_live": {"value": 3_600_000, "n": 3, "covered": covered,
+                                   "measured_from_ms": from},
+                "gate_time": {"value": null}, "first_pass": {"value": null}}}]})
+        };
+        let star = |scorecard: &Value| {
+            let values = performance(scorecard, &Value::Null);
+            let line = &lines(&json!({}), &values, &Observed::default(), Vec::new())[0];
+            figure_json(&line.north_star, None)
+        };
+        let waiting = star(&card(false, json!(1_700_000_000_000_i64)));
+        assert_eq!(waiting["key"], "performance.report_to_live");
+        assert_eq!(waiting["value"], Value::Null);
+        assert_eq!(waiting["state"], "not_collected");
+        assert_eq!(waiting["measuring_since_ms"], json!(1_700_000_000_000_i64));
+        let covered = star(&card(true, json!(1_700_000_000_000_i64)));
+        assert_eq!(covered["value"], json!(3_600_000));
+        assert_eq!(covered["state"], "no_range");
+        assert_eq!(covered.get("measuring_since_ms"), None, "{covered}");
+        // With no deploy record: nothing measured, nothing to say since when.
+        let never = star(&card(false, Value::Null));
+        assert_eq!(never["value"], Value::Null);
+        assert_eq!(never.get("measuring_since_ms"), None, "{never}");
     }
 
     fn values(figures: &[Figure]) -> Vec<(&'static str, Value)> {
