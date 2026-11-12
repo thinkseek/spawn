@@ -500,13 +500,48 @@ fn storage_line(storage: &Value) -> Line {
     }
 }
 
+/// The window of the observability north star: 7 days.
+const WEEK_MS: i64 = 7 * 24 * 3_600_000;
+
+/// "Needs you is right" (objective 092): of the alerts (not notices) that
+/// ended in the 7 days up to `now_ms` (`cleared_at_ms` in the window), the
+/// share whose outcome is "cleared", their condition cleared them rather
+/// than the owner judging them false, stale or a duplicate; null with none.
+/// `alerts` are rows as `/api/alerts` gives them.
+pub(super) fn needs_you_right(alerts: &Value, now_ms: i64) -> Value {
+    let since = now_ms.saturating_sub(WEEK_MS);
+    let (mut ended, mut right) = (0_u32, 0_u32);
+    for alert in alerts.as_array().into_iter().flatten() {
+        if alert["state"] == "notice" || alert["notice"] == true {
+            continue;
+        }
+        let Some(at) = alert["cleared_at_ms"].as_i64() else {
+            continue;
+        };
+        if at < since || at > now_ms {
+            continue;
+        }
+        ended += 1;
+        if alert["outcome"] == "cleared" {
+            right += 1;
+        }
+    }
+    if ended == 0 {
+        Value::Null
+    } else {
+        json!(f64::from(right) / f64::from(ended))
+    }
+}
+
 /// The four lines: the performance line's figures from `performance`
 /// ([`performance`]), the storage line's from `storage` (health.storage as
-/// [`super::storage::report`] gives it), the recoverability guardrails
+/// [`super::storage::report`] gives it), the observability north star
+/// `needs_you_right` ([`needs_you_right`]), the recoverability guardrails
 /// `recoverability` ([`recoverability`]).
 pub(super) fn lines(
     storage: &Value,
     performance: &Value,
+    needs_you_right: Value,
     recoverability: Vec<Figure>,
 ) -> Vec<Line> {
     vec![
@@ -514,10 +549,11 @@ pub(super) fn lines(
         storage_line(storage),
         Line {
             name: "observability",
-            north_star: Figure::not_collected(
+            north_star: Figure::new(
                 "observability.needs_you_right",
                 "Needs you is right",
                 "share",
+                needs_you_right,
             ),
             guardrails: Vec::new(),
         },
@@ -658,9 +694,13 @@ fn lines_at(
     let performance = performance_now(store, now_ms);
     let backups = store.newest_backups().map_err(super::err)?;
     let facts = nightly_facts(nightly);
+    let alerts = store
+        .alerts(now_ms.saturating_sub(WEEK_MS))
+        .map_err(super::err)?;
     Ok(lines(
         &storage,
         &performance,
+        needs_you_right(&alerts, now_ms),
         recoverability(&backups, facts.as_deref(), now_ms),
     ))
 }
@@ -798,7 +838,7 @@ mod tests {
             ],
         });
         let view = answer(
-            &lines(&storage, &Value::Null, Vec::new()),
+            &lines(&storage, &Value::Null, Value::Null, Vec::new()),
             &json!("/ws/core-lines.json"),
             Ok(None),
             &std::collections::BTreeMap::new(),
@@ -838,6 +878,7 @@ mod tests {
         let bare = lines(
             &json!({"database": {"bytes": 300, "log_bytes": 0}, "test_databases": []}),
             &Value::Null,
+            Value::Null,
             Vec::new(),
         );
         assert_eq!(bare[1].guardrails[2].value, Value::Null);
@@ -878,7 +919,7 @@ mod tests {
         assert!((share - 300_000.0 / 5_100_000.0).abs() < 1e-12, "{share}");
         assert_eq!(values["first_pass"], json!(0.749));
         assert_eq!(values["usd_per_landing"], json!(8.08));
-        let line = &lines(&json!({}), &values, Vec::new())[0];
+        let line = &lines(&json!({}), &values, Value::Null, Vec::new())[0];
         let keys: Vec<&str> = std::iter::once(&line.north_star)
             .chain(&line.guardrails)
             .map(|figure| figure.key)
@@ -906,7 +947,7 @@ mod tests {
             json!({"report_to_live": null, "gate_time": null, "decided_nothing": null,
                    "first_pass": null, "usd_per_landing": null})
         );
-        let line = &lines(&json!({}), &none, Vec::new())[0];
+        let line = &lines(&json!({}), &none, Value::Null, Vec::new())[0];
         assert!(
             std::iter::once(&line.north_star)
                 .chain(&line.guardrails)
@@ -914,6 +955,45 @@ mod tests {
         );
         // Neither answer read: every value null.
         assert_eq!(performance(&Value::Null, &Value::Null), none);
+    }
+
+    /// Objective 092: the share of the alerts that ended in the last 7
+    /// days whose condition cleared them.
+    #[test]
+    fn needs_you_is_right_is_the_share_of_the_ended_alerts_their_condition_cleared() {
+        use super::needs_you_right;
+        const DAY: i64 = 86_400_000;
+        let now = 30 * DAY;
+        let row = |state: &str, cleared: Option<i64>, outcome: Option<&str>| {
+            json!({"key": "k", "state": state, "cleared_at_ms": cleared, "outcome": outcome})
+        };
+        // None ended: none open, none at all.
+        assert_eq!(needs_you_right(&json!([]), now), Value::Null);
+        assert_eq!(
+            needs_you_right(&json!([row("open", None, None)]), now),
+            Value::Null
+        );
+        // A notice is left out; one ended outside the window too.
+        let rows = json!([
+            row("cleared", Some(now - DAY), Some("cleared")),
+            row("cleared", Some(now - 2 * DAY), Some("false")),
+            row("cleared", Some(now - 3 * DAY), Some("duplicate")),
+            row("cleared", Some(now - 6 * DAY), Some("cleared")),
+            row("open", None, None),
+            row("notice", Some(now - DAY), None),
+            row("cleared", Some(now - 8 * DAY), Some("stale")),
+            row("cleared", Some(now - 9 * DAY), Some("cleared")),
+        ]);
+        let share = needs_you_right(&rows, now).as_f64().expect("a share");
+        assert!((share - 0.5).abs() < 1e-12, "{share}");
+        // Only the ones outside the window: none.
+        let old = json!([row("cleared", Some(now - 8 * DAY), Some("cleared"))]);
+        assert_eq!(needs_you_right(&old, now), Value::Null);
+        // The line carries it.
+        let line = &lines(&json!({}), &Value::Null, json!(0.5), Vec::new())[2];
+        assert_eq!(line.north_star.key, "observability.needs_you_right");
+        assert_eq!(line.north_star.unit, "share");
+        assert_eq!(line.north_star.value, json!(0.5));
     }
 
     fn values(figures: &[Figure]) -> Vec<(&'static str, Value)> {
@@ -953,7 +1033,7 @@ mod tests {
         assert_eq!(bundle_only[0].value, Value::Null);
         assert_eq!(bundle_only[1].value, json!(6_000));
         // The line carries them as its guardrails, in order.
-        let line = &lines(&json!({}), &Value::Null, both)[3];
+        let line = &lines(&json!({}), &Value::Null, Value::Null, both)[3];
         assert_eq!(line.name, "recoverability");
         assert_eq!(
             line.guardrails
@@ -1077,7 +1157,7 @@ mod tests {
             vec![json!({"day": "2026-11-12", "value": 3})],
         );
         let view = answer(
-            &lines(&json!({"free_bytes": 3}), &Value::Null, Vec::new()),
+            &lines(&json!({"free_bytes": 3}), &Value::Null, Value::Null, Vec::new()),
             &Value::Null,
             Ok(None),
             &trends,
@@ -1103,6 +1183,7 @@ mod tests {
         let figures = lines(
             &json!({"free_bytes": 3, "days_left": 9}),
             &Value::Null,
+            Value::Null,
             Vec::new(),
         );
         let values = super::values_of(&figures);
