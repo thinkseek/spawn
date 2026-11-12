@@ -7728,7 +7728,11 @@ connections\n";
                 assert_eq!(monitor.tasks[&7].revisions, 1);
 
                 assign(client, 9);
-                record(client, 0, r#"{"type":"task.aborted","id":9,"reason":"over"}"#);
+                record(
+                    client,
+                    0,
+                    r#"{"type":"task.gated","id":9,"verdict":"aborted","revision":0}"#,
+                );
                 monitor.check(store).expect("the step checks");
                 assert_eq!(
                     monitor.missions[&4].aborts,
