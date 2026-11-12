@@ -1,4 +1,4 @@
-//! The eight dimensions of one scope over one window, from a [`History`]
+//! The nine dimensions of one scope over one window, from a [`History`]
 //! (docs/design.md §15).
 
 use std::collections::BTreeMap;

@@ -1153,12 +1153,21 @@ fn gate_time_says_how_much_of_it_decided_nothing() {
 fn report_to_live_runs_from_the_last_report_to_the_deploy_that_ships_it() {
     let minutes = |m: i64| at(0) + m * 60_000;
     let deployed = |story: &mut Story, m: i64, ok: bool| {
-        story.rec(minutes(m), json!({"type": "deploy.finished", "ok": ok, "head": "h"}));
+        story.rec(
+            minutes(m),
+            json!({"type": "deploy.finished", "ok": ok, "head": "h"}),
+        );
     };
     let mut story = Story::default();
     story.mission(1, true).mission(2, false);
     for task in 1..=6 {
-        story.assign(minutes(60), task, if task == 6 { 2 } else { 1 }, None, "spawn-integrate");
+        story.assign(
+            minutes(60),
+            task,
+            if task == 6 { 2 } else { 1 },
+            None,
+            "spawn-integrate",
+        );
     }
     // T1: reported 120, landed 150, deploy at 180: 60 min.
     story
