@@ -215,8 +215,11 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
         .map_or_else(|| address.clone(), |address| address.to_string());
     let slots = Slots::new(MAX_IN_FLIGHT);
     // The Core lines reading, once, beside the requests: the first person
-    // after a restart gets the kept figures, not the cold computation (a
-    // request meanwhile waits on the same locks, never computes it twice).
+    // after a restart gets the kept figures, not the cold computation. A
+    // request meanwhile waits on the performance figures' lock (archive and
+    // cost, cc-astra A35) and the storage sizes' lock, so those are computed
+    // once; its other parts (health, trends, the backup facts) it computes
+    // itself, as every request does (rev-e N1).
     std::thread::spawn(|| println!("serve: {}", core_lines::warm()));
     keep_listening(
         server,
