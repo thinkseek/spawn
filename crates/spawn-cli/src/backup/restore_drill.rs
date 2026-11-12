@@ -50,9 +50,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -121,7 +121,7 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
                 event_id,
                 duration_ms: elapsed_ms(started),
             };
-            let both = [(TRANSCRIPTS, Err(reason.clone())), (MISSIONS, Err(reason))];
+            let both = [(TRANSCRIPTS, Outcome::Unrestorable(reason.clone())), (MISSIONS, Outcome::Unrestorable(reason))];
             return Ok(record_verdicts(&store, &verdict, &both).unwrap_or(1));
         }
     };
@@ -146,7 +146,7 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
         Err(error) => {
             let reason = format!("the backup cannot be restored: {error}");
             println!("restore-drill: FAILED: {reason}");
-            (1, [(TRANSCRIPTS, Err(reason.clone())), (MISSIONS, Err(reason))])
+            (1, [(TRANSCRIPTS, Outcome::Unrestorable(reason.clone())), (MISSIONS, Outcome::Unrestorable(reason))])
         }
     };
     if flags.switch("keep") {
@@ -171,8 +171,16 @@ const MISSIONS: &str = "missions";
 /// The longest reason a drill record takes (`spawn_backup_record`).
 const REASON_CHARS: usize = 500;
 
-/// One resource's outcome: its count of mismatches, or why it failed.
-type Outcome = Result<usize, String>;
+/// One resource's outcome.
+#[derive(Debug, Clone)]
+enum Outcome {
+    /// Restored, and nothing older than the bundle differs.
+    Passed,
+    /// Restored, with this many mismatches; the reason names the first.
+    Mismatched(usize, String),
+    /// The backup cannot be restored, for this reason.
+    Unrestorable(String),
+}
 
 /// What every record of one drill names.
 struct Verdict<'a> {
@@ -217,11 +225,14 @@ fn said(report: &Report) -> i32 {
 /// reason the count and the first.
 fn outcome(resource: &str, mismatches: &[String], key: &str) -> Outcome {
     match mismatches.first() {
-        None => Ok(0),
-        Some(first) => Err(format!(
-            "{resource}: {} mismatch(es) older than bundle {key}; the first: {first}",
-            mismatches.len()
-        )),
+        None => Outcome::Passed,
+        Some(first) => Outcome::Mismatched(
+            mismatches.len(),
+            format!(
+                "{resource}: {} mismatch(es) older than bundle {key}; the first: {first}",
+                mismatches.len()
+            ),
+        ),
     }
 }
 
@@ -246,15 +257,11 @@ fn record_verdicts(
 /// A drill record, exactly `{type, ok, reason, bundle, bundle_event_id,
 /// mismatches, duration_ms}`: ok with reason "" when the resource has no
 /// mismatch; a backup that cannot be restored counts none.
-pub(super) fn drill_record(resource: &str, outcome: &Outcome, verdict: &Verdict<'_>) -> Value {
+fn drill_record(resource: &str, outcome: &Outcome, verdict: &Verdict<'_>) -> Value {
     let (ok, reason, mismatches) = match outcome {
-        Ok(0) => (true, String::new(), 0),
-        Ok(count) => (false, format!("{resource}: {count} mismatch(es)"), *count),
-        Err(reason) => (false, reason.clone(), 0),
-    };
-    let mismatches = match outcome {
-        Err(reason) if reason.starts_with(resource) => count_of(reason),
-        _ => mismatches,
+        Outcome::Passed => (true, "", 0),
+        Outcome::Mismatched(count, reason) => (false, reason.as_str(), *count),
+        Outcome::Unrestorable(reason) => (false, reason.as_str(), 0),
     };
     json!({
         "type": format!("backup.drilled.{resource}"),
@@ -411,6 +418,26 @@ impl Drop for DrillDir {
     }
 }
 
+/// Whether a bundle record stored something (a key in the bucket).
+fn stored(record: &BundleRecord) -> bool {
+    record.record["keys"]
+        .as_array()
+        .is_some_and(|keys| !keys.is_empty())
+}
+
+/// A bundle record's key in the bucket (its first).
+fn bundle_key(record: &BundleRecord) -> String {
+    record.record["keys"][0]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The milliseconds since `started`.
+fn elapsed_ms(started: Instant) -> i64 {
+    i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
 /// Why there is no chain to restore.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Chain {
@@ -422,11 +449,6 @@ pub(super) enum Chain {
 
 /// The newest stored bundle and its bases back to a full one, oldest first.
 pub(super) fn chain_of(records: &[BundleRecord]) -> Result<Vec<&BundleRecord>, Chain> {
-    let stored = |record: &BundleRecord| {
-        record.record["keys"]
-            .as_array()
-            .is_some_and(|keys| !keys.is_empty())
-    };
     let Some(newest) = records.iter().rev().find(|record| stored(record)) else {
         return Err(Chain::None);
     };
@@ -486,10 +508,7 @@ fn run(settings: &Settings, chain: &[&BundleRecord], drill: &Path) -> Result<Rep
         let manifest = fetch_bundle(settings, record, &here)?;
         unpacked.push((here.join("unpacked"), manifest));
     }
-    let key = newest.record["keys"][0]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
+    let key = bundle_key(newest);
     let bundle_ms = newest.at_ms;
     let mut lines = Vec::new();
     let mut mismatches = Vec::new();
