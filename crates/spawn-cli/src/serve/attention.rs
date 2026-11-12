@@ -199,6 +199,7 @@ pub(super) fn attention() -> Result<Value, String> {
         &store,
         said.as_ref()
             .map_or(&[][..], |said| said.for_owner.as_slice()),
+        said.as_ref().map_or(0, |said| said.current),
         &mut warnings,
     );
     let holds = match store.source_holds() {
@@ -514,12 +515,15 @@ const ENDED: [&str; 3] = ["accepted", "landed", "cancelled"];
 const TASK_WORDS: [&str; 4] = ["task", "tasks", "report", "reports"];
 
 /// The supervisor's lines for the owner as `/api/attention` lists them,
-/// `[{text, at_ms, tasks, settled}]` ([`owner_note`]), the named tasks'
-/// states read for those tasks alone. When they cannot be read, every line
-/// names no task and none is settled, and a warning says why.
+/// `[{text, at_ms, tasks, settled, current}]` ([`owner_note`]), the named
+/// tasks' states read for those tasks alone; the first `current` of
+/// `notes` (newest first) are the newest block's ([`Said::current`]). When
+/// the states cannot be read, every line names no task and none is
+/// settled, and a warning says why.
 pub(super) fn owner_notes(
     store: &spawn_postgres::PostgresStore,
     notes: &[(String, Option<i64>)],
+    current: usize,
     warnings: &mut Vec<String>,
 ) -> Value {
     let mut ids: Vec<i64> = notes
@@ -544,7 +548,14 @@ pub(super) fn owner_notes(
     Value::Array(
         notes
             .iter()
-            .map(|(text, at_ms)| owner_note(text, *at_ms, &states))
+            .enumerate()
+            .map(|(index, (text, at_ms))| {
+                let mut note = owner_note(text, *at_ms, &states);
+                if let Some(fields) = note.as_object_mut() {
+                    fields.insert("current".to_string(), json!(index < current));
+                }
+                note
+            })
             .collect(),
     )
 }
@@ -719,6 +730,10 @@ struct Said {
     /// Its [`FOR_OWNER`] lines, whatever prompts came since: newest first,
     /// each once with its latest time, at most [`FOR_OWNER_ITEMS`].
     for_owner: Vec<(String, Option<i64>)>,
+    /// How many of `for_owner`, from its start, the newest turn with a
+    /// [`FOR_OWNER`] line wrote: its newest block, the current one
+    /// (objective 078). A turn begins at a prompt, whatever its time.
+    current: usize,
 }
 
 /// Read `bytes`, the end of a Claude Code transcript. A first line cut by
@@ -732,10 +747,17 @@ fn said(bytes: &[u8]) -> Said {
         .map_or(&[][..], |end| &bytes[..end]);
     let mut human = None;
     let mut notes = Vec::new();
+    // The turn each line is of: a prompt, a digest included, begins one.
+    let mut turn = 0_usize;
     for line in whole.split(|byte| *byte == b'\n') {
         let line = String::from_utf8_lossy(line);
         match claude_reply(&line) {
-            Some(ReplyPart::Prompt) if !is_digest(&line) => human = None,
+            Some(ReplyPart::Prompt) => {
+                turn += 1;
+                if !is_digest(&line) {
+                    human = None;
+                }
+            }
             Some(ReplyPart::Text(text)) => {
                 if let Some(question) = text
                     .lines()
@@ -747,18 +769,29 @@ fn said(bytes: &[u8]) -> Said {
                 let words = owner_lines(&text);
                 if !words.is_empty() {
                     let at = line_time(&line);
-                    notes.extend(words.into_iter().map(|words| (words.to_string(), at)));
+                    notes.extend(
+                        words
+                            .into_iter()
+                            .map(|words| (words.to_string(), at, turn)),
+                    );
                 }
             }
             _ => {}
         }
     }
+    // Newest first, so the newest block's lines (each line's latest
+    // saying) lead the list.
+    let newest = notes.last().map(|(_, _, turn)| *turn);
     let mut for_owner: Vec<(String, Option<i64>)> = Vec::new();
-    for (words, at) in notes.into_iter().rev() {
+    let mut current = 0;
+    for (words, at, turn) in notes.into_iter().rev() {
         if for_owner.len() == FOR_OWNER_ITEMS {
             break;
         }
         if !for_owner.iter().any(|(seen, _)| *seen == words) {
+            if Some(turn) == newest {
+                current += 1;
+            }
             for_owner.push((words, at));
         }
     }
@@ -766,6 +799,7 @@ fn said(bytes: &[u8]) -> Said {
         reply: reply.text().map(str::to_string),
         human,
         for_owner,
+        current,
     }
 }
 
