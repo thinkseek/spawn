@@ -1126,3 +1126,10 @@ test("a message not taken says whether Spawn read the transcript since it was ty
     "A message was not taken · session_worker",
   ]);
 });
+
+test("a guardrail out of its range has its own title in Needs you (objective 089)", () => {
+  assert.equal(
+    alertTitle({ kind: "guardrail_out_of_range", subject: "guardrail storage.free_bytes" }),
+    "A guardrail is out of its range · guardrail storage.free_bytes",
+  );
+});
