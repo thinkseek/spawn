@@ -75,7 +75,8 @@ function finite(value: unknown): number | null {
 }
 
 /** A number in a unit's words: bytes as storageSize ("104.0 GB"), a day's
- * growth "<size> a day", days "1,234 days", a ratio "4.7×", a count
+ * growth "<size> a day", days "1,234 days", a ratio "4.7×" (below one
+ * "0.13"), a count
  * grouped ("1,214"), milliseconds in hours ("1.5 h"), a share as a whole
  * percent ("95%"). */
 export function unitWords(unit: string, value: number): string {
@@ -87,7 +88,9 @@ export function unitWords(unit: string, value: number): string {
     case "days":
       return `${GROUPED.format(value)} days`;
     case "ratio":
-      return `${value.toFixed(1)}×`;
+      // Below one (interventions per agent-hour) as a plain number with
+      // two significant digits, else as a multiple.
+      return Math.abs(value) < 1 ? `${Number(value.toPrecision(2))}` : `${value.toFixed(1)}×`;
     case "ms":
       return `${(value / 3_600_000).toFixed(1)} h`;
     case "share":
