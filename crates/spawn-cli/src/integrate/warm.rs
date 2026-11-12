@@ -847,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pid_file_says_pid_start_commit_source_and_scenarios_or_is_refused() {
+    fn a_pid_file_says_pid_start_and_commit_or_is_refused() {
         assert_eq!(
             Left::parse(
                 "pid 4242\nstart 98765\ncommit abc123\nsource /src/my spawn\n\
