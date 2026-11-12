@@ -492,7 +492,14 @@ work=$(mktemp -d "$facts/.run-$source_name.XXXXXX") || die "cannot make a work d
 sampler=""
 cleanup() {
   [ -z "$sampler" ] || kill "$sampler" 2>/dev/null
-  rm -rf "$work"
+  # Only the run's own work directory. The controller copies a run makes in
+  # it (cp -a) are read-only, as the live controllers are: made writable
+  # first, or rm leaves them, and the directory, behind every night.
+  case $work in "$facts"/.run-"$source_name".??????)
+    chmod -R u+w -- "$work" 2>/dev/null
+    rm -rf -- "$work"
+    ;;
+  esac
 }
 trap cleanup EXIT
 
