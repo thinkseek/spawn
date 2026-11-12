@@ -879,6 +879,9 @@ select coalesce(jsonb_agg(jsonb_build_object(
 /// so they never count toward the cap either. Nor does the gate's own test
 /// server that did not start (`on` `test server`), whichever start it was:
 /// no candidate code makes a server start.
+/// Nor does a regression the gate found load-sensitive (`load_sensitive`,
+/// and the bound's `load_sensitive_parked`): it passed alone, as the base
+/// does, and its own bound ends its re-judging.
 pub(crate) const TASK_HOST_FAULTS: &str = r"
 select count(*)
   from spawn_events e
@@ -892,7 +895,7 @@ select count(*)
    and not (coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') = 'sandbox'
             and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'tree', '') <> 'candidate')
    and coalesce(e.kind -> 'detail' -> 'record' ->> 'evidence', '') not in
-       ('base_disagrees', 'cannot_judge', 'main_red')";
+       ('base_disagrees', 'cannot_judge', 'main_red', 'load_sensitive', 'load_sensitive_parked')";
 
 /// The work an ephemeral objective task starts from: the newest earlier
 /// task of its objective that ended without landing (cancelled, aborted or
@@ -1029,7 +1032,10 @@ from (
                'delivered_at_ms', k.delivered_at_ms, 'objective', k.objective,
                'revisions', k.revisions, 'brief', k.brief, 'report', k.report,
                'updated_at_ms', k.updated_at_ms, 'held_by', k.held_by,
-               'continues', k.continues)
+               'continues', k.continues,
+               'gate_load_sensitive_pushed', k.gate_load_sensitive_pushed,
+               'gate_load_sensitive_scenarios', k.gate_load_sensitive_scenarios,
+               'gate_parked_pushed', k.gate_parked_pushed)
                order by k.id) as tasks
         from mission_tasks k
         left join mission_residents r on r.agent_id = k.agent_id

@@ -1544,6 +1544,17 @@ alter table mission_tasks add column if not exists held_by bigint;
 alter table mission_tasks add column if not exists reissue_of bigint;
 alter table mission_tasks add column if not exists continues bigint;
 alter table mission_tasks add column if not exists reassign_of bigint;
+-- The re-judge bound of a load-sensitive regression (sync/design-load-
+-- sensitive-bound.md): the task's pushed commit (its branch head, never
+-- the merge with main the gate runs) whose gate last said a regression is
+-- load-sensitive (gate.sh's `load_sensitive`, recorded as a `host_fault`
+-- with evidence `load_sensitive`), every scenario it named across those
+-- judgings, and the pushed commit the second one parked (evidence
+-- `load_sensitive_parked`): not judged again until a new commit is pushed
+-- or a person's `task.released`.
+alter table mission_tasks add column if not exists gate_load_sensitive_pushed text;
+alter table mission_tasks add column if not exists gate_load_sensitive_scenarios jsonb;
+alter table mission_tasks add column if not exists gate_parked_pushed text;
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
@@ -2189,6 +2200,26 @@ begin
                review_note = case when v_verdict in ('rejected', 'conflict', 'incompatible') then p_record ->> 'note'
                                   else review_note end,
                revisions = revisions + case when v_verdict in ('rejected', 'conflict', 'incompatible') then 1 else 0 end,
+               -- The load-sensitive bound: set by its two evidences, kept
+               -- by `no_room` and `stale` (no judging), cleared by every
+               -- other verdict on the task (a released task's next gate
+               -- starts the count again).
+               gate_load_sensitive_pushed = case
+                   when v_verdict in ('no_room', 'stale') then gate_load_sensitive_pushed
+                   when v_verdict = 'host_fault'
+                        and p_record ->> 'evidence' in ('load_sensitive', 'load_sensitive_parked')
+                       then p_record ->> 'pushed' end,
+               gate_load_sensitive_scenarios = case
+                   when v_verdict in ('no_room', 'stale') then gate_load_sensitive_scenarios
+                   when v_verdict = 'host_fault'
+                        and p_record ->> 'evidence' in ('load_sensitive', 'load_sensitive_parked')
+                        and jsonb_typeof(p_record -> 'sensitive') = 'array'
+                       then p_record -> 'sensitive' end,
+               gate_parked_pushed = case
+                   when v_verdict in ('no_room', 'stale') then gate_parked_pushed
+                   when v_verdict = 'host_fault'
+                        and p_record ->> 'evidence' = 'load_sensitive_parked'
+                       then p_record ->> 'pushed' end,
                updated_at_ms = p_at
          where id = v_id;
         update mission_missions
@@ -2224,20 +2255,31 @@ begin
                -- A red main (evidence `main_red`) is no host fault of the run:
                -- it leaves the run as it was, as `no_room` does; the
                -- source's red holds the gates instead of a backoff.
+               -- A task parked by the load-sensitive bound ends the run:
+               -- it is not judged again, so nothing waits behind it.
                gate_host_faults = case when v_verdict = 'host_fault'
                                             and p_record ->> 'evidence' = 'main_red'
                                            then gate_host_faults
+                                       when v_verdict = 'host_fault'
+                                            and p_record ->> 'evidence' = 'load_sensitive_parked'
+                                           then 0
                                        when v_verdict = 'host_fault' then gate_host_faults + 1
                                        when v_verdict in ('no_room', 'stale') then gate_host_faults
                                        else 0 end,
                gate_host_task = case when v_verdict = 'host_fault'
                                           and p_record ->> 'evidence' = 'main_red'
                                          then gate_host_task
+                                     when v_verdict = 'host_fault'
+                                          and p_record ->> 'evidence' = 'load_sensitive_parked'
+                                         then null
                                      when v_verdict = 'host_fault' then v_id
                                      when v_verdict in ('no_room', 'stale') then gate_host_task end,
                gate_host_due_ms = case when v_verdict = 'host_fault'
                                             and p_record ->> 'evidence' = 'main_red'
                                            then gate_host_due_ms
+                                       when v_verdict = 'host_fault'
+                                            and p_record ->> 'evidence' = 'load_sensitive_parked'
+                                           then null
                                        when v_verdict = 'host_fault'
                                            then (p_record ->> 'due_ms')::bigint
                                        when v_verdict in ('no_room', 'stale')
@@ -2361,6 +2403,14 @@ begin
          where id = v_id
            and (p_record ->> 'revision' is null
                 or revisions = (p_record ->> 'revision')::integer);
+    when 'task.released' then
+        -- A person releases a task the load-sensitive bound parked
+        -- (`spawn task release`): its next gate judges it, and the count
+        -- starts again. Only its own columns move.
+        update mission_tasks set gate_load_sensitive_pushed = null,
+                                 gate_load_sensitive_scenarios = null,
+                                 gate_parked_pushed = null, updated_at_ms = p_at
+         where id = v_id;
     when 'task.cancelled' then
         -- `by` names who cancelled (spawn_task_cancel_by), read by the
         -- scorecard, not by the fold.
@@ -3835,8 +3885,22 @@ begin
                                       'source.main_red', 'source.main_probe',
                                       'source.main_green', 'task.shadow_gated',
                                       'integrator.draining', 'integrator.drained',
-                                      'integrator.drain_expired') then
+                                      'integrator.drain_expired', 'task.released') then
         raise exception 'the integrator does not record %', p_record ->> 'type';
+    end if;
+    -- A release of a task the load-sensitive bound parked: by a person or
+    -- the integrator (owner only, as every record here), naming who and
+    -- why, of a task that is parked: a task that is not is refused, never
+    -- a silent no-op.
+    if p_record ->> 'type' = 'task.released'
+       and (jsonb_typeof(p_record -> 'id') is distinct from 'number'
+            or coalesce(p_record ->> 'by', '') = ''
+            or coalesce(p_record ->> 'reason', '') = ''
+            or not exists (select 1 from mission_tasks
+                            where id = (p_record ->> 'id')::bigint
+                              and gate_parked_pushed is not null)) then
+        raise exception 'task.released names a parked task, its by and its reason: %',
+            p_record using errcode = '22023';
     end if;
     -- A shadow verdict (spawn-cli integrate/shadow.rs): a gate runner judged
     -- a copy of what the primary judged, on the inputs it names. It is
@@ -4173,7 +4237,9 @@ begin
                                                           'cannot_judge',
                                                           'sandbox_never_started', 'main_red',
                                                           'test_server_never_started',
-                                                          'validator_defect', 'abandoned')
+                                                          'validator_defect', 'abandoned',
+                                                          'load_sensitive',
+                                                          'load_sensitive_parked')
             or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
             or (p_record ->> 'evidence' in ('failures', 'server_log')
                 and (case when jsonb_typeof(p_record -> 'failures') = 'array'
@@ -4207,6 +4273,23 @@ begin
             or (p_record ->> 'evidence' = 'cannot_judge'
                 and (coalesce(p_record ->> 'scenario', '') !~ '^[^[:space:]|]+$'
                      or jsonb_typeof(p_record -> 'escalate') is distinct from 'boolean'))
+            -- A regression gate.sh found load-sensitive (like for like), and
+            -- the bound's second one for the same pushed commit (parked):
+            -- the commit, and the scenarios named (`sensitive`, not the gate's
+            -- `scenarios` count), each a `<name>.sh`.
+            or (p_record ->> 'evidence' in ('load_sensitive', 'load_sensitive_parked')
+                and (coalesce(p_record ->> 'scenario', '') !~ '^[^[:space:]|]+$'
+                     or coalesce(p_record ->> 'pushed', '') !~ '^[0-9a-f]{7,64}$'
+                     or jsonb_typeof(p_record -> 'escalate') is distinct from 'boolean'
+                     or jsonb_typeof(p_record -> 'sensitive') is distinct from 'array'
+                     or jsonb_array_length(p_record -> 'sensitive') = 0
+                     or exists (select 1
+                                  from jsonb_array_elements(p_record -> 'sensitive') d
+                                 where jsonb_typeof(d) <> 'string'
+                                    or d #>> '{}' !~ '^[^/[:space:]]+\.sh$')
+                     or (p_record ->> 'evidence' = 'load_sensitive_parked'
+                         and (p_record ->> 'parked' is distinct from 'true'
+                              or p_record ->> 'escalate' is distinct from 'true'))))
             or (p_record ->> 'evidence' = 'sandbox_never_started'
                 and (coalesce(p_record -> 'fact' ->> 'scenario', '') = ''
                      or p_record -> 'fact' ->> 'on' is distinct from 'sandbox'

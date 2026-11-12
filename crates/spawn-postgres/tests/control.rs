@@ -4454,3 +4454,224 @@ fn an_owner_landing_starts_the_scenario_floor_again() {
         "the fold replays to the same tables"
     );
 }
+
+/// The load-sensitive bound (sync/design-load-sensitive-bound.md): a
+/// `host_fault` with evidence `load_sensitive` names the pushed commit and
+/// the scenarios, and the task keeps them; `no_room` and `stale` keep them,
+/// any other verdict on the task clears them. The bound's record
+/// (`load_sensitive_parked`, `parked` and `escalate` true) parks the
+/// commit and ends the mission's run of host faults, keeping the task's
+/// `candidate`; another shape of either is refused. `task.released` (owner
+/// only, with `by` and `reason`) clears only its own task, and is refused
+/// for a task that is not parked (one only counting included). A refold
+/// gives the same rows.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_load_sensitive_commit_is_kept_parked_and_released_on_its_task() {
+    let (store, schema) = store("control_load_sensitive");
+    let mut client = admin(&schema);
+    let mission = store
+        .mission_add("Gated", &json!(["/srv/load.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(mission, Some("/scenarios"), "gate", None, None)
+        .expect("configure");
+    let reported = |worker: &str| {
+        let task = store
+            .task_assign(mission, "ephemeral", worker, "brief", "default")
+            .expect("assign");
+        store.task_delivered(task, 1).expect("delivered");
+        assert!(store.task_reported(task, "done").expect("reported"));
+        task
+    };
+    let task = reported("w1");
+    let other = reported("w2");
+    let pushed = "a".repeat(40);
+    let fault = |id: i64, evidence: &str, change: &dyn Fn(&mut serde_json::Value)| {
+        let mut record = json!({"type": "task.gated", "id": id, "revision": 0,
+                                "verdict": "host_fault", "base": "b1", "candidate": "c1",
+                                "reason": "host fault: load-sensitive",
+                                "evidence": evidence, "scenario": "099.sh",
+                                "sensitive": ["099.sh"], "pushed": pushed,
+                                "host_faults": 1, "backoff_ms": 60_000, "escalate": false});
+        if evidence == "load_sensitive_parked" {
+            record["parked"] = json!(true);
+            record["escalate"] = json!(true);
+            record["backoff_ms"] = json!(0);
+        }
+        change(&mut record);
+        record
+    };
+    for (what, evidence, change) in [
+        (
+            "no pushed commit",
+            "load_sensitive",
+            &(|r: &mut serde_json::Value| {
+                r.as_object_mut().map(|o| o.remove("pushed"));
+            }) as &dyn Fn(&mut serde_json::Value),
+        ),
+        ("not a commit", "load_sensitive", &|r| {
+            r["pushed"] = json!("main; drop");
+        }),
+        ("no scenarios", "load_sensitive", &|r| {
+            r["sensitive"] = json!([]);
+        }),
+        ("a path", "load_sensitive", &|r| {
+            r["sensitive"] = json!(["../099.sh"]);
+        }),
+        ("no escalate", "load_sensitive", &|r| {
+            r["escalate"] = json!(null);
+        }),
+        ("not parked", "load_sensitive_parked", &|r| {
+            r["parked"] = json!(false);
+        }),
+        ("not escalated", "load_sensitive_parked", &|r| {
+            r["escalate"] = json!(false);
+        }),
+    ] {
+        let error = store
+            .integrator_record(&fault(task, evidence, change))
+            .expect_err(what)
+            .to_string();
+        assert!(
+            error.contains("a host_fault verdict names"),
+            "{what}: {error}"
+        );
+    }
+    let held = |client: &mut Client,
+                id: i64|
+     -> (Option<String>, Option<serde_json::Value>, Option<String>) {
+        let row = client
+            .query_one(
+                "select gate_load_sensitive_pushed, gate_load_sensitive_scenarios,
+                        gate_parked_pushed from mission_tasks where id = $1",
+                &[&id],
+            )
+            .expect("the task");
+        (row.get(0), row.get(1), row.get(2))
+    };
+    let run = |client: &mut Client| -> (i32, Option<i64>) {
+        let row = client
+            .query_one(
+                "select gate_host_faults, gate_host_task from mission_missions where id = $1",
+                &[&mission],
+            )
+            .expect("the mission");
+        (row.get(0), row.get(1))
+    };
+    // Not held: no release.
+    let error = store
+        .integrator_record(
+            &json!({"type": "task.released", "id": task, "by": "a person",
+                                   "reason": "r"}),
+        )
+        .expect_err("a task the bound does not hold")
+        .to_string();
+    assert!(
+        error.contains("task.released names a parked task"),
+        "{error}"
+    );
+
+    store
+        .integrator_record(&fault(task, "load_sensitive", &|_| {}))
+        .expect("load_sensitive");
+    assert_eq!(
+        held(&mut client, task),
+        (Some(pushed.clone()), Some(json!(["099.sh"])), None)
+    );
+    assert_eq!(run(&mut client), (1, Some(task)));
+    // `no_room` keeps it.
+    store
+        .integrator_record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                                   "verdict": "no_room", "base": "b1", "scenarios": 7,
+                                   "reason": "no room to judge now; not a verdict",
+                                   "log": "the gate did not run", "escalate": false,
+                                   "check": "memory", "measured": 1500, "threshold": 2048}))
+        .expect("no room");
+    assert_eq!(
+        held(&mut client, task).0,
+        Some(pushed.clone()),
+        "no_room keeps it"
+    );
+    // The bound's record parks it and ends the run.
+    store
+        .integrator_record(&fault(task, "load_sensitive_parked", &|r| {
+            r["sensitive"] = json!(["099.sh", "046.sh"]);
+        }))
+        .expect("parked");
+    assert_eq!(
+        held(&mut client, task),
+        (
+            Some(pushed.clone()),
+            Some(json!(["099.sh", "046.sh"])),
+            Some(pushed.clone())
+        )
+    );
+    assert_eq!(run(&mut client), (0, None), "the run ends");
+    let row = client
+        .query_one(
+            "select state, revisions from mission_tasks where id = $1",
+            &[&task],
+        )
+        .expect("the task");
+    let state: (String, i32) = (row.get(0), row.get(1));
+    assert_eq!(
+        state,
+        ("reported".to_string(), 0),
+        "neither rejected nor sent back"
+    );
+    // Another task's load_sensitive leaves this one alone; its release too.
+    store
+        .integrator_record(&fault(other, "load_sensitive", &|_| {}))
+        .expect("the other's");
+    let before = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(tables(&mut client), before, "a refold gives the same rows");
+    for (what, release) in [
+        (
+            "no by",
+            json!({"type": "task.released", "id": task, "reason": "r"}),
+        ),
+        (
+            "no reason",
+            json!({"type": "task.released", "id": task, "by": "a person"}),
+        ),
+    ] {
+        let error = store
+            .integrator_record(&release)
+            .expect_err(what)
+            .to_string();
+        assert!(
+            error.contains("task.released names a parked task"),
+            "{what}: {error}"
+        );
+    }
+    // A task only counting, or none, is not parked: refused.
+    for (what, id) in [("only counting", other), ("no task", other + 1000)] {
+        let error = store
+            .integrator_record(&json!({"type": "task.released", "id": id, "by": "a person",
+                                       "reason": "r"}))
+            .expect_err(what)
+            .to_string();
+        assert!(
+            error.contains("task.released names a parked task"),
+            "{what}: {error}"
+        );
+    }
+    store
+        .integrator_record(&json!({"type": "task.released", "id": task, "by": "a person",
+                                   "reason": "the root fix landed"}))
+        .expect("released");
+    assert_eq!(held(&mut client, task), (None, None, None));
+    assert_eq!(
+        held(&mut client, other).0,
+        Some(pushed.clone()),
+        "only its own task"
+    );
+    // Any other verdict on the task clears it.
+    store
+        .integrator_record(&json!({"type": "task.gated", "id": other, "revision": 0,
+                                   "verdict": "rejected", "reason": "r", "note": "n"}))
+        .expect("rejected");
+    assert_eq!(held(&mut client, other), (None, None, None));
+}
