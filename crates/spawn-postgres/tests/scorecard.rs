@@ -161,6 +161,8 @@ fn the_facts_project_each_record_to_what_the_measures_read() {
             "mission.configured",
             "mission.configured",
             "task.assigned",
+            // A report is kept as its time (objective 081).
+            "task.reported",
             "task.gated",
             "task.gated",
             "task.gated",
