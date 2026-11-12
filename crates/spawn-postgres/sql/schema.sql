@@ -2365,6 +2365,11 @@ begin
         -- transcripts hold (spawn loop, crate storage.rs): read from the
         -- log by `/api/fleet`'s storage figures, folded into no table.
         null;
+    when 'host.core_lines' then
+        -- An hourly sample of every Core lines figure that has a value
+        -- (spawn loop, crate core_lines_sample.rs, objective 090): read from
+        -- the log by `/api/core-lines`' 7-day trends, folded into no table.
+        null;
     when 'host.judge' then
         -- The model judge's calls began failing (`down`) or answered again
         -- (`up`): one record per crossing (spawn loop, crate judge_watch.rs),
@@ -4470,6 +4475,12 @@ begin
            or jsonb_typeof(p_record -> 'projects_files') is distinct from 'number' then
             raise exception 'a host.storage record has archive_bytes, archive_files, projects_bytes and projects_files: %', p_record;
         end if;
+    elsif v_type = 'host.core_lines' then
+        -- The Core lines figures' values, sampled by the loop at its start
+        -- and hourly (objective 090): {<figure key>: <value>}.
+        if jsonb_typeof(p_record -> 'values') is distinct from 'object' then
+            raise exception 'a host.core_lines record has values, an object: %', p_record;
+        end if;
     elsif v_type = 'host.judge' then
         if p_record ->> 'judge' is null or p_record ->> 'state' is null
            or p_record ->> 'state' not in ('down', 'up') then
@@ -4567,6 +4578,13 @@ create index if not exists spawn_events_host_storage
     on spawn_events (recorded_at_ms)
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'host.storage';
+
+-- The `host.core_lines` samples (objective 090), found without reading the
+-- rest of the stream: `/api/core-lines` reads the last 7 days of them.
+create index if not exists spawn_events_host_core_lines
+    on spawn_events (recorded_at_ms)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' = 'host.core_lines';
 
 -- The alert transitions: the loop's `alert.fired` and `alert.cleared`
 -- records (`spawn_alert_record`, owner only), each once per occurrence

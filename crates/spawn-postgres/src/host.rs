@@ -67,6 +67,18 @@ select jsonb_build_object(
   'before', (select s.sample from samples s where s.recorded_at_ms <= $2
               order by s.recorded_at_ms desc, s.id desc limit 1))";
 
+/// The `host.core_lines` samples recorded at or after `$1` (objective 090),
+/// oldest first, each as `{at_ms, values}`: through their own partial index
+/// (`spawn_events_host_core_lines`), never the rest of the control stream.
+pub(crate) const HOST_CORE_LINES: &str = r"
+select coalesce(jsonb_agg(jsonb_build_object('at_ms', s.recorded_at_ms, 'values', s.vals)
+                          order by s.recorded_at_ms, s.id), '[]'::jsonb)
+  from (select e.recorded_at_ms, e.id, e.kind -> 'detail' -> 'record' -> 'values' as vals
+          from spawn_events e
+         where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and e.kind -> 'detail' -> 'record' ->> 'type' = 'host.core_lines'
+           and e.recorded_at_ms >= $1) s";
+
 /// The schemas a database holds other than PostgreSQL's own (`pg_*`,
 /// `information_schema`) and `public`: what tests leave behind (objective
 /// 074).
@@ -143,6 +155,12 @@ impl PostgresStore {
         self.query_json(HOST_STORAGE, &[&since_ms, &before_ms])
     }
 
+    /// The `host.core_lines` samples recorded at or after `since_ms`, oldest
+    /// first, as `[{at_ms, values}]` ([`HOST_CORE_LINES`]).
+    pub fn host_core_lines(&self, since_ms: i64) -> Result<Value, StoreError> {
+        self.query_json(HOST_CORE_LINES, &[&since_ms])
+    }
+
     /// The database's name, size, schemas, event log bytes and five
     /// largest tables ([`DATABASE_SIZE`]).
     pub fn database_size(&self) -> Result<Value, StoreError> {
@@ -150,7 +168,8 @@ impl PostgresStore {
     }
 
     /// Record a host fact through `spawn_host_record` (owner only):
-    /// `host.disk`, `host.storage`, `host.judge`, and the recovery's records. Returns the
+    /// `host.disk`, `host.storage`, `host.core_lines`, `host.judge`, and the
+    /// recovery's records. Returns the
     /// event's id.
     pub fn host_record(&self, record: &Value) -> Result<i64, StoreError> {
         Ok(self

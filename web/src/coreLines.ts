@@ -21,6 +21,25 @@ export interface CoreFigure {
   value: number | null;
   range: CoreRange | null;
   state: "in" | "out" | "no_range" | "not_collected" | string;
+  /** The last 7 UTC days (objective 090): each day's last sample carrying
+   * the figure, oldest first; empty without one. */
+  trend?: CoreTrendPoint[];
+}
+
+/** One day of a figure's trend. */
+export interface CoreTrendPoint {
+  /** The UTC day, YYYY-MM-DD. */
+  day: string;
+  value: number;
+}
+
+/** A figure's trend on the card: its values, oldest first, and which way
+ * it went from the first to the last. */
+export interface CoreTrendView {
+  points: number[];
+  /** "up <n>%", "down <n>%", "steady" under half a percent, or null with
+   * fewer than two points or a first point of 0. */
+  change: string | null;
 }
 
 export interface CoreLine {
@@ -150,4 +169,19 @@ export function coreLinesView(answer: Partial<CoreLinesAnswer> | null | undefine
     notice: error === null ? null : `ranges file unreadable: ${error}`,
     ignored: ignored.map((entry) => `${entry?.key}: ${entry?.reason}`),
   };
+}
+
+/** A figure's trend in words (objective 090): its points' values, and the
+ * change from the first point to the last, rounded, relative to the first
+ * point's size. */
+export function trendView(figure: Partial<CoreFigure> | null | undefined): CoreTrendView {
+  const trend = Array.isArray(figure?.trend) ? figure.trend : [];
+  const points = trend.map((point) => finite(point?.value)).filter((value): value is number => value !== null);
+  if (points.length < 2 || points[0] === 0) return { points, change: null };
+  const first = points[0];
+  const last = points[points.length - 1];
+  const percent = ((last - first) / Math.abs(first)) * 100;
+  if (Math.abs(percent) < 0.5) return { points, change: "steady" };
+  const rounded = Math.round(Math.abs(percent));
+  return { points, change: `${percent > 0 ? "up" : "down"} ${rounded}%` };
 }
