@@ -429,6 +429,7 @@ const ALERT_TITLES: Record<string, string> = {
   backup_stale: "A backup is late",
   source_away: "A mission's source is not a directory on this host",
   validator_defect: "A validator fails on main too",
+  task_parked: "A task is parked: load-sensitive twice",
   mission_idle: "A mission has no work",
   message_not_taken: "A message was not taken",
   owner_request_waiting: "An owner's landing waits for its verdict",

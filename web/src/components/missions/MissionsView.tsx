@@ -21,6 +21,7 @@ import type {
   MissionTask,
   Missions,
   Resident,
+  TaskParked,
   TaskState,
 } from "../../missions";
 import {
@@ -641,6 +642,22 @@ function EarlierAttempts({ group, missionName }: { group: TaskGroup<MissionTask>
   );
 }
 
+/** A task the load-sensitive bound parked: why it is not judged, and what
+ * judges it again (sync/design-load-sensitive-bound.md). */
+function ParkedLine({ id, parked }: { id: number | null; parked: TaskParked }) {
+  const on = parked.scenarios.length > 0 ? parked.scenarios.join(", ") : "its scenarios";
+  return (
+    <div className="rounded-md border border-warning/25 bg-wait-tint px-3 py-2 text-caption text-warning">
+      Parked: load-sensitive twice on {on} (
+      <span className="font-mono" title={parked.pushed}>
+        {parked.pushed.slice(0, 10)}
+      </span>
+      ); judged again on a new push or{" "}
+      <code className="font-mono select-all">spawn task release --id {id ?? "?"} --reason …</code>
+    </div>
+  );
+}
+
 function TaskRow({
   task,
   mission,
@@ -704,6 +721,8 @@ function TaskRow({
           updated <Ago ms={task.updated_at_ms} />
         </span>
       </div>
+
+      {task.parked && <ParkedLine id={task.id} parked={task.parked} />}
 
       {task.stages.length > 0 ? (
         <StageSteps task={task} steps={pipelineOf(mission)} />

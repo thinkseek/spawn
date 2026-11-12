@@ -4608,6 +4608,27 @@ fn a_load_sensitive_commit_is_kept_parked_and_released_on_its_task() {
         )
     );
     assert_eq!(run(&mut client), (0, None), "the run ends");
+    // The board says it (rev-e F1): the pushed commit and the scenarios.
+    let on_board = |id: i64| -> serde_json::Value {
+        let board = store.mission_board(50).expect("the board");
+        board["missions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|mission| mission["tasks"].as_array().cloned().unwrap_or_default())
+            .find(|row| row["id"] == id)
+            .expect("the task on the board")["parked"]
+            .clone()
+    };
+    assert_eq!(
+        on_board(task),
+        json!({"pushed": pushed, "scenarios": ["099.sh", "046.sh"]})
+    );
+    assert_eq!(
+        on_board(other),
+        serde_json::Value::Null,
+        "counting is not parked"
+    );
     let row = client
         .query_one(
             "select state, revisions from mission_tasks where id = $1",
@@ -4666,6 +4687,11 @@ fn a_load_sensitive_commit_is_kept_parked_and_released_on_its_task() {
     assert_eq!(released["scenarios"], json!(["099.sh", "046.sh"]));
     assert!(released["event"].as_i64().is_some(), "{released}");
     assert_eq!(held(&mut client, task), (None, None, None));
+    assert_eq!(
+        on_board(task),
+        serde_json::Value::Null,
+        "released: off the board's line"
+    );
     assert_eq!(
         held(&mut client, other).0,
         Some(pushed.clone()),

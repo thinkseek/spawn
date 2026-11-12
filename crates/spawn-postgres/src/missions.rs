@@ -564,6 +564,12 @@ select jsonb_build_object(
                  'candidate', k.candidate, 'objective', k.objective, 'metric', k.metric,
                  'model', k.model, 'stages', spawn_task_stages(k.id),
                  'held_by', k.held_by,
+                 -- Parked by the load-sensitive bound: its pushed commit
+                 -- and every scenario found load-sensitive on it (columns
+                 -- of the row already read; null for any other task).
+                 'parked', case when k.gate_parked_pushed is not null then
+                     jsonb_build_object('pushed', k.gate_parked_pushed,
+                                        'scenarios', k.gate_load_sensitive_scenarios) end,
                  'created_by', k.created_by, 'created_at_ms', k.created_at_ms,
                  'updated_at_ms', k.updated_at_ms) order by k.id)
                from mission_tasks k where k.mission_id = m.id), '[]'::jsonb) as tasks
