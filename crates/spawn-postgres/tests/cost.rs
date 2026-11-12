@@ -8,7 +8,7 @@
 //! in a schema of its own.
 
 use serde_json::{Value, json};
-use spawn_core::event::{ENGINE, EventKind, ModelProfile, NewEvent, Source};
+use spawn_core::event::{ENGINE, EndCause, EventKind, ModelProfile, NewEvent, Source};
 use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, WorkspaceId};
 use spawn_core::port::EventLog;
 use spawn_postgres::{ArchiveCounted, ArchiveFile, ArchivedMessage, PostgresStore};
@@ -232,6 +232,90 @@ fn each_model_row_says_how_many_of_its_tokens_have_no_price() {
     assert_eq!(by_model["unpriced_tokens"], 275_003, "{execution}");
     let by_model = entry(execution, "models", "model", &json!("model-x"));
     assert_eq!(by_model["unpriced_tokens"], 0, "{execution}");
+}
+
+/// P30: each execution's models, grouped once and joined (no longer a
+/// subquery per execution): the whole `executions` list over several
+/// executions and models, priced and unpriced, pinned as the window gave it
+/// before the change.
+#[test]
+fn every_executions_models_are_its_own_in_the_window() {
+    let (store, _schema) = store("cost_execution_models");
+    let (_mission, task, worker) = one_task(&store);
+    let now = store.database_now_ms().expect("now");
+    let lines: [(u64, &str, &str, [u64; 4]); 6] = [
+        (1, "m1", "model-x", [100_000, 10_000, 0, 0]),
+        (1, "m2", "model-x", [0, 20_000, 0, 0]),
+        (1, "m3", "model-y", [1_000_000, 0, 0, 0]),
+        (1, "m4", "model-z", [1000, 100, 0, 0]),
+        (2, "m5", "model-x", [0, 0, 0, 1_000_000]),
+        (3, "m6", "model-z", [10, 0, 0, 0]),
+    ];
+    // One session runs one execution at a time: each ends before the next.
+    for execution in 1..=3 {
+        started(&store, &worker, execution);
+        for (_, id, model, counts) in lines.iter().filter(|line| line.0 == execution) {
+            usage(&store, &worker, execution, (id, model, now), *counts);
+        }
+        store
+            .append(NewEvent {
+                agent_id: AgentId::new(&worker.agent).expect("valid agent"),
+                session_id: SessionId::new(&worker.session).expect("valid session"),
+                execution_id: Some(ExecutionId::for_command(CommandId(execution))),
+                source: Source::Bridge,
+                source_event_id: Some(format!("end-{execution}")),
+                kind: EventKind::ExecutionEnded {
+                    cause: EndCause::Stopped,
+                    exit_code: None,
+                    signal: None,
+                    evidence: None,
+                },
+            })
+            .expect("end");
+    }
+    let prices = json!({
+        "model-x": {"input": 3, "output": 15, "cache_write": 3.75, "cache_read": 0.3},
+        "model-y": {"input": 1, "output": 5, "cache_write": 1.25, "cache_read": 0.1},
+    });
+    assert_eq!(store.cost_record(&prices).expect("record"), 6);
+    let day = store.cost_window(now - DAY_MS, now + 1000).expect("window");
+    let tokens = |input: u64, output: u64, cache_write: u64, cache_read: u64| json!({"input": input, "output": output, "cache_write": cache_write, "cache_read": cache_read});
+    let model = |name: &str, usd: Value, tokens: Value, unpriced: u64| json!({"model": name, "usd": usd, "tokens": tokens, "unpriced_tokens": unpriced});
+    let execution = |id: &str, usd: Value, tokens: Value, unpriced: u64, models: Vec<Value>| {
+        json!({"execution": id, "agent": worker.agent, "task": task, "usd": usd,
+               "tokens": tokens, "unpriced_tokens": unpriced, "models": models})
+    };
+    assert_eq!(
+        day["executions"],
+        json!([
+            execution(
+                "exec_1",
+                json!(1.75),
+                tokens(1_101_000, 30_100, 0, 0),
+                1100,
+                vec![
+                    model("model-y", json!(1.0), tokens(1_000_000, 0, 0, 0), 0),
+                    model("model-x", json!(0.75), tokens(100_000, 30_000, 0, 0), 0),
+                    model("model-z", Value::Null, tokens(1000, 100, 0, 0), 1100),
+                ],
+            ),
+            execution(
+                "exec_2",
+                json!(0.3),
+                tokens(0, 0, 0, 1_000_000),
+                0,
+                vec![model("model-x", json!(0.3), tokens(0, 0, 0, 1_000_000), 0)],
+            ),
+            execution(
+                "exec_3",
+                json!(0),
+                tokens(10, 0, 0, 0),
+                10,
+                vec![model("model-z", Value::Null, tokens(10, 0, 0, 0), 10)],
+            ),
+        ]),
+        "{day}"
+    );
 }
 
 #[test]
@@ -545,4 +629,66 @@ fn a_window_says_what_a_landing_cost_for_the_fleet_and_each_mission() {
     let empty = store.cost_window(until, until + 1000).expect("window");
     assert_eq!(empty["landed"], json!(0));
     assert_eq!(empty["usd_per_landing"], Value::Null);
+}
+
+#[test]
+fn a_summary_gives_the_windows_total_landings_and_cost_per_landing() {
+    let (store, _schema) = store("cost_summary");
+    let since = store.database_now_ms().expect("now");
+
+    // Two missions, three executions, two models (one priced nowhere), an
+    // execution with both models, a landing in one mission and not the
+    // other, and a message after the window.
+    let a = store
+        .mission_add("Work", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    let (t1, w1) = spending_task(&store, a, ("w1", 1), (100_000, since + 1));
+    usage(
+        &store,
+        &w1,
+        1,
+        ("msg_1z", "model-z", since + 2),
+        [7000, 300, 20, 5],
+    );
+    reviewed(&store, t1, 1, true);
+    let (t2, w2) = spending_task(&store, a, ("w2", 2), (40_000, since + 3));
+    usage(
+        &store,
+        &w2,
+        2,
+        ("msg_2b", "model-x", since + 4),
+        [1000, 2000, 3000, 4000],
+    );
+    store.task_cancel(t2).expect("cancel");
+    let b = store
+        .mission_add("Other", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    let (t3, w3) = spending_task(&store, b, ("w3", 3), (60_000, since + 5));
+    reviewed(&store, t3, 3, true);
+    let later = store.database_now_ms().expect("now") + 60_000;
+    usage(&store, &w3, 3, ("msg_3l", "model-x", later), [9, 9, 9, 9]);
+    assert_eq!(store.cost_record(&prices(3.0)).expect("record"), 6);
+
+    let until = store.database_now_ms().expect("now") + 1000;
+    for (from, to, what) in [
+        (since, until, "the window"),
+        (since, later + 1, "with the later message"),
+        (since + 3, until, "a part of it"),
+        (until, until + 1000, "an empty window"),
+    ] {
+        let window = store.cost_window(from, to).expect("window");
+        let summary = store.cost_summary(from, to).expect("summary");
+        let expected = json!({
+            "total": window["total"],
+            "landed": window["landed"],
+            "usd_per_landing": window["usd_per_landing"],
+        });
+        assert_eq!(summary, expected, "{what}: the window says {window}");
+    }
+    let window = store.cost_summary(since, until).expect("summary");
+    assert_eq!(window["landed"], json!(2), "t1 and t3: {window}");
+    assert!(
+        usd(&window["total"]["unpriced_tokens"]) > 0.0,
+        "model-z's tokens are unpriced: {window}"
+    );
 }
