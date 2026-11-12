@@ -187,6 +187,29 @@ pub(crate) fn growth_from(oldest: &Value) -> Option<i64> {
     oldest["at_ms"].as_i64()?.checked_add(GROWTH_MIN_MS)
 }
 
+/// When each part of the growth is first measured (objective 098): for
+/// every part of [`growth_parts`] (and [`session_backups_part`]), the
+/// oldest sample of the window carrying its field plus a day
+/// ([`growth_from`], 083's rule per part), from `carrying` as
+/// [`growth_parts`] reads it; null without such a sample. The archive's is
+/// also null without a workspace root (`rooted` false), as 083's
+/// `growth_from_ms`, which it equals.
+pub(crate) fn growth_from_parts(carrying: &Value, rooted: bool) -> Value {
+    Value::Object(
+        PARTS
+            .iter()
+            .map(|(part, field)| {
+                let from = if *part == "archive" && !rooted {
+                    None
+                } else {
+                    growth_from(&carrying[*field])
+                };
+                ((*part).to_string(), json!(from))
+            })
+            .collect(),
+    )
+}
+
 /// The moment the persistent growth is first measured (objective 091): the
 /// latest of its counted parts' moments ([`growth_from`] of the oldest
 /// sample of the window carrying each part's size, `carrying` as
@@ -276,6 +299,7 @@ pub(crate) fn sizes(
         "persistent_growth_bytes_per_day": persistent_growth(&parts, &excluded),
         "persistent_from_ms": root.and_then(|_| persistent_from(&samples["carrying"], &excluded)),
         "growth_parts": parts,
+        "growth_from_parts": growth_from_parts(&samples["carrying"], root.is_some()),
         "growth_excluded": excluded,
     })
 }
