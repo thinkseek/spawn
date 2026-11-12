@@ -271,11 +271,17 @@ impl Monitor {
             if figure.state == "out" {
                 self.guardrail_back.remove(&figure.key);
                 let since = *self.guardrail_out.entry(figure.key.clone()).or_insert(now);
-                if open.is_empty() && now.saturating_sub(since) >= self.settings.guardrail_raise_ms
+                // The stretch's alert, once judged by the owner (objective
+                // 092), is not open and is not raised again: the next stretch
+                // out of range is a new occurrence.
+                let key = format!("{KIND}:{}:{since}", figure.key);
+                if open.is_empty()
+                    && !self.known.contains_key(&key)
+                    && now.saturating_sub(since) >= self.settings.guardrail_raise_ms
                 {
                     let line = figure.line.clone();
                     out.push(Event::Fire {
-                        key: format!("{KIND}:{}:{since}", figure.key),
+                        key,
                         kind: KIND,
                         text: format!(
                             "guardrail out of range: {line}'s {} is {}, out of its range ({}) \
@@ -489,6 +495,61 @@ mod tests {
         commit(&mut monitor, &fired);
         // One open per figure: still out, nothing more.
         assert!(read(&mut monitor, start + 3 * RAISE, low()).0.is_empty());
+    }
+
+    /// Objective 092: an open alert the owner judges while the loop runs is
+    /// cleared in the loop's view by the next pass (the `alert.judged`
+    /// record it reads), so the loop clears it no more, and the figure's
+    /// next stretch out of range fires a new alert.
+    #[test]
+    fn an_alert_judged_while_the_loop_runs_is_cleared_in_its_view_and_a_new_stretch_fires() {
+        let mut monitor = monitor();
+        let low = || Ok(answer("out", &json!(2 * GIB)));
+        let high = || Ok(answer("in", &json!(50 * GIB)));
+        read(&mut monitor, 0, low());
+        let (fired, _) = read(&mut monitor, RAISE, low());
+        let first = format!("{KIND}:storage.free_bytes:0");
+        assert_eq!(keys(&fired), [format!("fire {first}")]);
+        commit(&mut monitor, &fired);
+        // The owner judges it false: the next pass reads the record.
+        let mut out = Vec::new();
+        monitor.feed(
+            50,
+            RAISE + 1,
+            &json!({"type": "alert.judged", "key": first, "verdict": "false"}),
+            &mut out,
+        );
+        assert!(out.is_empty(), "a judgement fires and clears nothing");
+        assert!(!monitor.known[&first].open(), "cleared in the loop's view");
+        // Still out in the same stretch: the judged alert is not raised again.
+        assert!(read(&mut monitor, 2 * RAISE, low()).0.is_empty());
+        // Back in for longer than the clear hold: no clear is tried.
+        let back = 2 * RAISE + 1;
+        assert!(read(&mut monitor, back, high()).0.is_empty());
+        assert!(
+            read(&mut monitor, back + CLEAR, high()).0.is_empty(),
+            "no clear of the judged alert"
+        );
+        // Out again, held: a new alert fires.
+        let again = back + CLEAR + 1;
+        read(&mut monitor, again, low());
+        let (fired, _) = read(&mut monitor, again + RAISE, low());
+        assert_eq!(
+            keys(&fired),
+            [format!("fire {KIND}:storage.free_bytes:{again}")]
+        );
+        // A judgement of a key the loop does not know, or of one not open,
+        // changes nothing.
+        commit(&mut monitor, &fired);
+        let mut out = Vec::new();
+        monitor.feed(
+            60,
+            again + RAISE,
+            &json!({"type": "alert.judged", "key": "elsewhere:1", "verdict": "stale"}),
+            &mut out,
+        );
+        assert!(out.is_empty());
+        assert!(monitor.known[&format!("{KIND}:storage.free_bytes:{again}")].open());
     }
 
     #[test]

@@ -109,6 +109,15 @@ export interface NeedItem {
   resume?: { mission: number; halt: number } | null;
   /** The session whose page answers it (a question, an escalated agent). */
   session: string | null;
+  /** An alert's judgement verb (objective 092), named beside it: `spawn
+   * alert judge <key> false|stale|duplicate`, for one that should not have
+   * been raised. */
+  judge?: string | null;
+}
+
+/** The owner's verb for an alert that should not have been raised. */
+export function judgeCommand(key: string): string {
+  return `spawn alert judge ${key} false|stale|duplicate`;
 }
 
 export interface NeedsInput {
@@ -342,6 +351,9 @@ export function needsYou(input: NeedsInput): NeedItem[] {
       command,
       // A session's alert opens that agent's page.
       session: named !== null ? alert.subject : null,
+      // A folded owner's validator item stands for several alerts: no one
+      // key to judge.
+      judge: fold === undefined ? judgeCommand(alert.key) : null,
     });
   }
 

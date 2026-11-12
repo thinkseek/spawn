@@ -32,6 +32,7 @@ import {
   earlierConflictCount,
   needsSummary,
   needsYou,
+  judgeCommand,
   openAlertsLine,
   oneLine,
 } from "../src/home.ts";
@@ -1132,4 +1133,17 @@ test("a guardrail out of its range has its own title in Needs you (objective 089
     alertTitle({ kind: "guardrail_out_of_range", subject: "guardrail storage.free_bytes" }),
     "A guardrail is out of its range · guardrail storage.free_bytes",
   );
+});
+
+// Objective 092: the owner may judge an alert that should not have been
+// raised; Needs you names the verb beside each alert.
+test("each alert in Needs you names the verb that judges it", () => {
+  assert.equal(judgeCommand("bb:a3"), "spawn alert judge bb:a3 false|stale|duplicate");
+  const items = needsYou({ ...base, alerts: [alert("memory_low:1", "memory_low", "host")] });
+  const item = items.find((entry) => entry.key === "alert:memory_low:1");
+  assert.ok(item, JSON.stringify(items));
+  assert.equal(item.judge, "spawn alert judge memory_low:1 false|stale|duplicate");
+  // Other items name none.
+  const halted = needsYou({ ...base, alerts: [] });
+  assert.ok(halted.every((entry) => !entry.judge));
 });

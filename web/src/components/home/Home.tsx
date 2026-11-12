@@ -150,6 +150,14 @@ export function NeedsYou({ items, onOpenAgent }: { items: NeedItem[]; onOpenAgen
                 )}
               </div>
               <NeedDetail item={item} />
+              {item.judge && (
+                <p className="mt-0.5 min-w-0 truncate text-caption text-faint-foreground">
+                  Should not have been raised?{" "}
+                  <code className="rounded-chip bg-inset px-1 font-mono text-micro text-muted-foreground select-all">
+                    {item.judge}
+                  </code>
+                </p>
+              )}
             </div>
             <div className="flex shrink-0 items-center gap-2 self-center">
               {item.command && <CopyCommand command={item.command} />}

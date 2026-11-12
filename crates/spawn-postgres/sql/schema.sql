@@ -1608,6 +1608,13 @@ create table if not exists spawn_alerts (
 
 create index if not exists spawn_alerts_time on spawn_alerts (fired_at_ms);
 
+-- The owner's judgement of an alert (objective 092, `spawn alert judge`):
+-- `false`, `stale` or `duplicate`, and when. An alert's outcome is its
+-- verdict when judged, `cleared` when its condition cleared it, none while
+-- open (and for a notice): what "Needs you is right" counts.
+alter table spawn_alerts add column if not exists verdict text;
+alter table spawn_alerts add column if not exists judged_at_ms bigint;
+
 -- When each open agent_stuck alert's session was last scored (its latest
 -- judgement carrying `stuck`): the alerts window's `scored_at_ms`, so a
 -- score that stands while the judge is down shows its age. A view, read
@@ -2407,6 +2414,28 @@ begin
         -- restore with the record and not with the live database
         -- (docs/storage.md, "Where state lives").
         null;
+    when 'alert.judged' then
+        -- The owner's verdict on an alert (`spawn alert judge`, objective
+        -- 092): `false`, `stale` or `duplicate`, once, never on a notice. An
+        -- open alert it judges is cleared by it (cleared evidence {judged});
+        -- a cleared one keeps its cleared evidence and gains the verdict.
+        if p_record ->> 'verdict' is null
+           or p_record ->> 'verdict' not in ('false', 'stale', 'duplicate') then
+            raise exception 'an alert verdict is false, stale or duplicate: %', p_record;
+        end if;
+        if not exists (select 1 from spawn_alerts
+                        where key = p_record ->> 'key' and not notice and verdict is null) then
+            raise exception 'alert % cannot be judged: no such alert, a notice, or judged already',
+                            p_record ->> 'key';
+        end if;
+        update spawn_alerts
+           set verdict = p_record ->> 'verdict', judged_at_ms = p_at,
+               state = 'cleared',
+               cleared_event_id = coalesce(cleared_event_id, p_event),
+               cleared_at_ms = coalesce(cleared_at_ms, p_at),
+               cleared_evidence = coalesce(cleared_evidence,
+                                           jsonb_build_object('judged', p_record ->> 'verdict'))
+         where key = p_record ->> 'key';
     when 'alert.cleared' then
         -- What cleared an alert, once: the row must be open (a notice never
         -- clears, and a cleared alert is cleared at most once).
@@ -4605,8 +4634,31 @@ begin
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record alerts', session_user using errcode = '42501';
     end if;
-    if v_type not in ('alert.fired', 'alert.cleared') then
+    if v_type not in ('alert.fired', 'alert.cleared', 'alert.judged') then
         raise exception 'not an alert record: %', v_type;
+    end if;
+    -- The owner's judgement (objective 092): `{type, key, verdict}`, checked
+    -- as the fold checks it, before anything is written.
+    if v_type = 'alert.judged' then
+        if exists (select 1 from jsonb_object_keys(p_record) k
+                    where k not in ('type', 'key', 'verdict')) then
+            raise exception 'an alert judgement is {type, key, verdict}, nothing else';
+        end if;
+        if coalesce(p_record ->> 'verdict', '') not in ('false', 'stale', 'duplicate') then
+            raise exception 'an alert verdict is false, stale or duplicate, not %',
+                            coalesce(p_record ->> 'verdict', 'none');
+        end if;
+        if not exists (select 1 from spawn_alerts where key = p_record ->> 'key') then
+            raise exception 'no alert has the key %', p_record ->> 'key';
+        end if;
+        if exists (select 1 from spawn_alerts where key = p_record ->> 'key' and notice) then
+            raise exception 'alert % is a notice: a notice is not judged', p_record ->> 'key';
+        end if;
+        if exists (select 1 from spawn_alerts
+                    where key = p_record ->> 'key' and verdict is not null) then
+            raise exception 'alert % is judged already', p_record ->> 'key';
+        end if;
+        return spawn_control_record(p_record);
     end if;
     if nullif(p_record ->> 'key', '') is null or nullif(p_record ->> 'kind', '') is null
        or nullif(p_record ->> 'subject', '') is null then
