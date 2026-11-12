@@ -2313,13 +2313,14 @@ impl PostgresStore {
             .get(0))
     }
 
-    /// Residents whose latest delivered task is cancelled, with the
-    /// checkpoint it started from ([`CANCELLED_DELIVERIES`]).
+    /// The owner's pauses and unpauses the dispatcher acts on, with the
+    /// workers each holds ([`MISSION_PAUSES`]).
     pub fn mission_pauses(&self) -> Result<Value, StoreError> {
         self.query_json(MISSION_PAUSES, &[])
     }
 
-    /// Residents whose latest delivered task is cancelled ([`CANCELLED_DELIVERIES`]).
+    /// Residents whose latest delivered task is cancelled, with the
+    /// checkpoint it started from ([`CANCELLED_DELIVERIES`]).
     pub fn cancelled_deliveries(&self) -> Result<Value, StoreError> {
         self.query_json_prepared(CANCELLED_DELIVERIES, &[])
     }
