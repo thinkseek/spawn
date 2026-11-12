@@ -732,23 +732,11 @@ fn lines_at(
     };
     let backups = store.newest_backups().map_err(super::err)?;
     let facts = nightly_facts(nightly);
-<<<<<<< ad2f243f1cc0a734da78b0a4e1ceef02c6340d25
     Ok(lines(
         &storage,
         &performance,
+        &observed,
         recoverability(&backups, facts.as_deref(), now_ms),
-=======
-    let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
-    Ok(answer(
-        &lines(
-            &storage,
-            &performance,
-            &observed,
-            recoverability(&backups, facts.as_deref(), now_ms),
-        ),
-        &file,
-        read_ranges(path),
->>>>>>> 84edc1f280fa4e6a6e371b536b296da6e5835be3
     ))
 }
 
@@ -1119,7 +1107,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-<<<<<<< ad2f243f1cc0a734da78b0a4e1ceef02c6340d25
     /// Objective 090: a figure's trend is one point per UTC day of the last
     /// 7 that has a sample carrying it, that day's last; a day without one
     /// has no point; a sample outside the window is left out.
@@ -1166,7 +1153,12 @@ mod tests {
             vec![json!({"day": "2026-11-12", "value": 3})],
         );
         let view = answer(
-            &lines(&json!({"free_bytes": 3}), &Value::Null, Vec::new()),
+            &lines(
+                &json!({"free_bytes": 3}),
+                &Value::Null,
+                &Observed::default(),
+                Vec::new(),
+            ),
             &Value::Null,
             Ok(None),
             &trends,
@@ -1192,14 +1184,19 @@ mod tests {
         let figures = lines(
             &json!({"free_bytes": 3, "days_left": 9}),
             &Value::Null,
+            &Observed::default(),
             Vec::new(),
         );
         let values = super::values_of(&figures);
+        // The count not measured always has a value (objective 088): the
+        // other 13 figures that have none.
         assert_eq!(
             Value::Object(values),
-            json!({"storage.free_bytes": 3, "storage.days_left": 9})
+            json!({"storage.free_bytes": 3, "storage.days_left": 9,
+                   "observability.not_measured": 13})
         );
-=======
+    }
+
     /// Objective 088: the observability line's guardrails.
     #[test]
     fn the_observability_line_gives_unpriced_use_interventions_and_the_count_not_measured() {
@@ -1266,6 +1263,7 @@ mod tests {
                     "observability.not_measured": {"max": 0}}}"#
                     .to_string(),
             )),
+            &std::collections::BTreeMap::new(),
         );
         let states: Vec<&str> = view["lines"][2]["guardrails"]
             .as_array()
@@ -1274,6 +1272,5 @@ mod tests {
             .map(|figure| figure["state"].as_str().expect("a state"))
             .collect();
         assert_eq!(states, ["out", "out", "out"]);
->>>>>>> 84edc1f280fa4e6a6e371b536b296da6e5835be3
     }
 }
