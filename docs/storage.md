@@ -910,6 +910,21 @@ bytes over its `log_bytes`), `storage.test_database_bytes` (the largest
 readable test database) and `storage.test_database_schemas` (the most test
 schemas). The other lines' north stars are not collected yet.
 
+The recoverability line (objective 087) has the north star
+`recoverability.restores_passed` (not collected until the restore drills
+record) and four guardrails: `recoverability.cloud_dump_age` and
+`recoverability.cloud_bundle_age` (ms since the newest `backup.dumped` and
+`backup.bundled`, the records health.backups names on `/api/fleet`),
+`recoverability.nightly_age` (ms since the oldest `judged_at` among the
+nightly's fact files, every non-hidden `*.json` in `<workspace
+root>/nightly`; the scenario logs, lock and run files beside them are not
+facts, and a fact with no `judged_at` or that cannot be read is passed
+over) and `recoverability.nightly_red` (the facts whose `red_since` is set,
+as the integrator holds a source's landings). Each is null without its
+record or files. The card shows ages as spans ("32 min", "30 h"). The live
+ranges: copy max 7200000 (2 h), bundle max 93600000 (26 h), nightly age max
+93600000, nightly red max 0.
+
 Ranges live only in one file, `SPAWN_CORE_LINES_FILE`, by default
 `<workspace root>/core-lines.json`, shaped `{"ranges": {<figure key>:
 {"min"?: number, "max"?: number}}}`, read at every request: an edit shows
