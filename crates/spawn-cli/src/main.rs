@@ -35,6 +35,7 @@ mod backup;
 mod commands;
 mod config;
 mod context;
+mod core_lines_sample;
 mod cost;
 mod deliver;
 mod disk;
