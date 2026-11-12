@@ -736,12 +736,16 @@ warm_base_cache() {
   log=$live/gate-warm/$head.log
   # A unit of its own (deploy/detach.sh): a deploy run by a oneshot unit
   # (deploy/on-landing.sh) would otherwise take it down as it exits. The
-  # integrator's gate environment goes through a file, never argv.
+  # integrator's gate environment goes through a file, never argv. No setsid
+  # in front: a unit's main process already leads its own session, and
+  # setsid then forks and its parent exits at once, so systemd stops the
+  # unit and kills the warm-up before gate.sh says a word (every deploy's
+  # warm-up from cb88b709 to here: a log of one line, the next gate cold).
   local unit=spawn-warm-base-${head:0:12}-$$ assignments=$live/gate-warm/$head.$$.env
   if detach_assignments "$assignments" "${keep[@]}" &&
     echo "deploy: base-only gate of $head, started $(date -Is) as $unit" >>"$log" &&
     detach_start "$unit" "$log" "$assignments" \
-      setsid sh "$controller/scripts/rsi/gate.sh" --base-only "$missions" "$head" "$controller/rsi/scenarios"; then
+      sh "$controller/scripts/rsi/gate.sh" --base-only "$missions" "$head" "$controller/rsi/scenarios"; then
     rm -f "$assignments"
     cached=${home}/.cache/spawn/gate-base
     say "base cache: warming it for $head in the unit $unit, with ${own:-the shared test server}: log $log, results in $cached"

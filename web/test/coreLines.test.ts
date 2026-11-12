@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { CoreFigure, CoreLinesAnswer } from "../src/coreLines.ts";
-import { coreLinesView, rangeWords, spanWords, unitWords } from "../src/coreLines.ts";
+import { coreLinesView, rangeWords, spanWords, trendView, unitWords } from "../src/coreLines.ts";
 
 const GIB = 1024 ** 3;
 const MIB = 1024 ** 2;
@@ -202,3 +202,39 @@ test("the recoverability row (objective 087): the ages as spans, the reds as a c
     ],
   );
 });
+
+function trended(...values: number[]): CoreFigure {
+  const figure = fig("storage.free_bytes", "Free disk", "bytes", 120 * GIB, null, "no_range");
+  figure.trend = values.map((value, i) => ({ day: `2026-11-0${i + 1}`, value }));
+  return figure;
+}
+
+test("trendView gives the points and which way they went, first to last (objective 090)", () => {
+  assert.deepEqual(trendView(trended(100 * GIB, 110 * GIB, 120 * GIB)), { points: [100 * GIB, 110 * GIB, 120 * GIB], change: "up 20%" });
+  assert.deepEqual(trendView(trended(200, 150)), { points: [200, 150], change: "down 25%" });
+  // Under half a percent either way is steady; half a percent is not.
+  assert.equal(trendView(trended(1000, 1004)).change, "steady");
+  assert.equal(trendView(trended(1000, 996)).change, "steady");
+  assert.equal(trendView(trended(1000, 1005)).change, "up 1%");
+  // Relative to the first point's size: a negative start that rises is up.
+  assert.equal(trendView(trended(-200, -100)).change, "up 50%");
+  // Only the first and the last count.
+  assert.equal(trendView(trended(100, 500, 1, 150)).change, "up 50%");
+});
+
+test("trendView has no change with fewer than two points or a first point of 0", () => {
+  assert.deepEqual(trendView(trended(5)), { points: [5], change: null });
+  assert.deepEqual(trendView(trended(0, 5)), { points: [0, 5], change: null });
+  assert.deepEqual(trendView(trended()), { points: [], change: null });
+  // A figure from before the trends, or none.
+  assert.deepEqual(trendView(fig("a", "A", "count", 1, null, "no_range")), { points: [], change: null });
+  assert.deepEqual(trendView(null), { points: [], change: null });
+});
+
+test("coreLinesView's marks stay as they were with trends in the answer", () => {
+  const plain = coreLinesView(answer());
+  const withTrends = answer();
+  withTrends.lines[1].guardrails[0].trend = [{ day: "2026-11-12", value: 1 }];
+  assert.deepEqual(coreLinesView(withTrends), plain);
+});
+

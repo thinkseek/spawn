@@ -419,6 +419,8 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     warnings.extend(more);
     let (alerting, more) = alerts::Monitor::from_env();
     warnings.extend(more);
+    let (core_lines, more) = crate::core_lines_sample::Sampler::from_env();
+    warnings.extend(more);
     // A price the loop cannot read would record every cost wrong: it stops
     // here, naming the setting.
     let prices = cost::Prices::from_env()?;
@@ -442,6 +444,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         workspace_root: root,
         disk: monitor,
         storage: sampler,
+        core_lines,
         terminals: crate::config::terminal_host(),
         config,
         recovery: crate::recover::Recovery::new(),
@@ -485,6 +488,10 @@ struct Fleet<'a> {
     /// The `host.storage` samples: at the loop's start, then hourly
     /// ([`crate::storage::Sampler`]).
     storage: crate::storage::Sampler,
+    /// The `host.core_lines` samples (objective 090): at the loop's start,
+    /// then every `SPAWN_CORE_LINES_SAMPLE_SECS`, read beside the passes
+    /// ([`crate::core_lines_sample::Sampler`]).
+    core_lines: crate::core_lines_sample::Sampler,
     /// The terminal host the recovery asks whether a native session's
     /// terminal server lives on (an end found with it gone is a host
     /// restart).
@@ -686,6 +693,12 @@ impl Fleet<'_> {
         // The storage sample never fails a pass either: one that could not
         // be written is tried again a minute later.
         match self.storage.check(open, now) {
+            Ok(line) => lines.extend(line),
+            Err(error) => lines.push(error),
+        }
+        // Nor the Core lines sample: its reading runs beside the passes and
+        // one that could not be read or written is tried a minute later.
+        match self.core_lines.check(open, now) {
             Ok(line) => lines.extend(line),
             Err(error) => lines.push(error),
         }

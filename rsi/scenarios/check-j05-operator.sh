@@ -943,6 +943,10 @@ part=017
 cat >"$WORK/seed.sql" <<'SQL'
 \set ON_ERROR_STOP 1
 begin;
+-- The store's own append lock (spawn_append_trusted's advisory lock),
+-- held to commit: no append can take a session_seq between the max
+-- read below and these inserts.
+select pg_advisory_xact_lock(1399957335);
 -- Hours from T0 = 2026-10-02T00:00:00Z, in ms.
 create function pg_temp.ms(h numeric) returns bigint language sql as $$
     select (extract(epoch from timestamptz '2026-10-02 00:00:00+00') * 1000)::bigint
