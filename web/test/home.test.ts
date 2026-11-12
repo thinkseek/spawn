@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import type { Alert } from "../src/api.ts";
@@ -829,4 +830,44 @@ test("an owner landing's old per-mission validator alerts are one item in Needs 
     [],
     "cleared, Needs you holds no validator item",
   );
+});
+
+test("missions today: each task in flight counts its conflict verdicts and says so from two (objective 069)", () => {
+  const gated = (verdict: string, hoursAgo: number) =>
+    ({ stage: "gated", verdict, at_ms: NOW - hoursAgo * HOUR, took_ms: null }) as MissionTask["stages"][number];
+  const reviewed = (verdict: string, hoursAgo: number) =>
+    ({ stage: "reviewed", verdict, at_ms: NOW - hoursAgo * HOUR, took_ms: null }) as MissionTask["stages"][number];
+  const model = missionsToday(
+    missions([
+      mission(4, "RSI", [
+        task(1, "reported"),
+        task(2, "revise", { stages: [gated("conflict", 5)] }),
+        task(3, "reported", { stages: [gated("conflict", 6), gated("conflict", 4)] }),
+        task(4, "revise", { stages: [gated("conflict", 8), gated("conflict", 6), gated("conflict", 4)] }),
+        task(5, "revise", { stages: [gated("rejected", 6), gated("incompatible", 4), gated("conflict", 3)] }),
+        task(6, "revise", { stages: [gated("conflict", 6), reviewed("conflict", 4), reviewed("rejected", 3)] }),
+        task(7, "landed", { stages: [gated("conflict", 6), gated("conflict", 4), gated("accepted", 3)] }),
+      ]),
+    ]),
+    NOW,
+  );
+  assert.deepEqual(
+    model.rows[0].inFlight.map(({ task_id, conflicts, conflictText }) => [task_id, conflicts, conflictText]),
+    [
+      [1, 0, null],
+      [2, 1, null],
+      [3, 2, "sent back 2 times as a conflict"],
+      [4, 3, "sent back 3 times as a conflict"],
+      [5, 1, null],
+      [6, 1, null],
+    ],
+    "rejected, incompatible and reviewed send-backs do not count; a landed task is not in flight",
+  );
+});
+
+test("Home's in-flight line shows the conflict text beside the task's state, in the warning tone", () => {
+  const home = readFileSync(new URL("../src/components/home/Home.tsx", import.meta.url), "utf8");
+  const line = home.slice(home.indexOf("row.inFlight.map"), home.indexOf("row.lastRejection &&"));
+  assert.match(line, /\{task\.conflictText && \(\s*<span className="[^"]*text-warning[^"]*"[^>]*>\s*\{task\.conflictText\}/);
+  assert.ok(line.indexOf("task.conflictText") < line.indexOf("{task.state}"), "the text sits beside the state");
 });
