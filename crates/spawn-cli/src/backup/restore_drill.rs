@@ -130,7 +130,10 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
                 event_id,
                 duration_ms: elapsed_ms(started),
             };
-            let both = [(TRANSCRIPTS, Outcome::Unrestorable(reason.clone())), (MISSIONS, Outcome::Unrestorable(reason))];
+            let both = [
+                (TRANSCRIPTS, Outcome::Unrestorable(reason.clone())),
+                (MISSIONS, Outcome::Unrestorable(reason)),
+            ];
             return Ok(record_verdicts(&store, &verdict, &both).unwrap_or(1));
         }
     };
@@ -148,14 +151,26 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
     let result = run(&settings, &chain, drill.path());
     let newest = chain[chain.len() - 1];
     let (code, outcomes) = match result {
-        Ok(report) => (said(&report), [
-            (TRANSCRIPTS, outcome(TRANSCRIPTS, &report.transcripts, &report.key)),
-            (MISSIONS, outcome(MISSIONS, &report.missions, &report.key)),
-        ]),
+        Ok(report) => (
+            said(&report),
+            [
+                (
+                    TRANSCRIPTS,
+                    outcome(TRANSCRIPTS, &report.transcripts, &report.key),
+                ),
+                (MISSIONS, outcome(MISSIONS, &report.missions, &report.key)),
+            ],
+        ),
         Err(error) => {
             let reason = format!("the backup cannot be restored: {error}");
             println!("restore-drill: FAILED: {reason}");
-            (1, [(TRANSCRIPTS, Outcome::Unrestorable(reason.clone())), (MISSIONS, Outcome::Unrestorable(reason))])
+            (
+                1,
+                [
+                    (TRANSCRIPTS, Outcome::Unrestorable(reason.clone())),
+                    (MISSIONS, Outcome::Unrestorable(reason)),
+                ],
+            )
         }
     };
     if flags.switch("keep") {
@@ -256,7 +271,9 @@ fn record_verdicts(
     for (resource, outcome) in outcomes {
         let record = drill_record(resource, outcome, verdict);
         if let Err(error) = store.backup_record(&record) {
-            eprintln!("spawn backup restore-drill: backup.drilled.{resource} was not recorded: {error}");
+            eprintln!(
+                "spawn backup restore-drill: backup.drilled.{resource} was not recorded: {error}"
+            );
             refused = Some(2);
         }
     }

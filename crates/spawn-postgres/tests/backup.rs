@@ -229,7 +229,10 @@ fn a_drill_verdict_is_a_backup_drilled_record_of_fixed_shape() {
     ] {
         assert!(store.backup_record(&record).is_err(), "{what}: {record}");
     }
-    assert_eq!(control_records(&mut client, "backup.drilled.transcripts"), 1);
+    assert_eq!(
+        control_records(&mut client, "backup.drilled.transcripts"),
+        1
+    );
     assert_eq!(
         control_records(&mut client, "backup.drilled.missions"),
         2,
