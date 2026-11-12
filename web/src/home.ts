@@ -410,6 +410,10 @@ export interface InFlight {
   state: string;
   /** Since the task's latest record. */
   since_ms: number | null;
+  /** How many of the task's gate verdicts were `conflict` (objective 069). */
+  conflicts: number;
+  /** "sent back <n> times as a conflict" when two or more, else null. */
+  conflictText: string | null;
 }
 
 export interface MissionRow {
@@ -462,6 +466,17 @@ function sendBacks(task: MissionTask): Array<{ verdict: string; at_ms: number }>
     .map((stage) => ({ verdict: stage.verdict ?? "rejected", at_ms: stage.at_ms ?? 0 }));
 }
 
+/** How many of a task's gate verdicts were `conflict`: a `rejected` or
+ * `incompatible` one, or a review's verdict, does not count. */
+export function conflictCount(task: MissionTask): number {
+  return task.stages.filter((stage) => stage.stage === "gated" && stage.verdict === "conflict").length;
+}
+
+/** The in-flight line's words for a task that lost rounds to conflicts. */
+export function conflictText(conflicts: number): string | null {
+  return conflicts >= 2 ? `sent back ${conflicts} times as a conflict` : null;
+}
+
 export function missionsToday(missions: Missions | null, now: number): MissionsToday {
   const rows: Array<MissionRow & { moved: number }> = [];
   const quiet: MissionsToday["quiet"] = [];
@@ -491,6 +506,8 @@ export function missionsToday(missions: Missions | null, now: number): MissionsT
         title: task.task_title,
         state: taskStateLabel(task, mission),
         since_ms: latestRecord(task),
+        conflicts: conflictCount(task),
+        conflictText: conflictText(conflictCount(task)),
       }))
       .sort((left, right) => (left.task_id ?? 0) - (right.task_id ?? 0));
     let landedToday = 0;
