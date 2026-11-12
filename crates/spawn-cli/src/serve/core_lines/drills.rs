@@ -318,11 +318,17 @@ pub(super) fn show(program: &str, unit: &str, limit: Duration) -> Result<String,
 /// The units' readings kept: `(read at, reading)` by unit.
 static UNITS: Mutex<BTreeMap<String, (i64, Reading)>> = Mutex::new(BTreeMap::new());
 
+/// Held across a unit's cache check, call and keeping: a reading that runs
+/// beside another (serve's warm reading and the first request) waits for
+/// its call and takes what it kept, so each unit is asked once.
+static SHOWING: Mutex<()> = Mutex::new(());
+
 /// The refused names already in the log: each is named once.
 static REFUSED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 /// A unit's last pass and last run at `now_ms`, from one `systemctl show`,
-/// kept for [`UNIT_KEPT_MS`]; each call is logged with its duration. A
+/// kept for [`UNIT_KEPT_MS`] (one call at a time, [`SHOWING`]); each call
+/// is logged with its duration. A
 /// refused name is logged (once) and not run.
 fn unit_reading(unit: &str, now_ms: i64) -> Reading {
     if !unit_allowed(unit) {
@@ -336,6 +342,9 @@ fn unit_reading(unit: &str, now_ms: i64) -> Reading {
         }
         return Reading::default();
     }
+    let _showing = SHOWING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((at, reading)) = UNITS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -656,13 +665,9 @@ mod tests {
         assert_eq!(parse_show(""), None);
     }
 
-    /// The drill rows: a passing and a failing record (the store gives the
-    /// newest passing one), a unit's three results, a refused name, no
-    /// drill, one outside 7 days; and both ages.
-    #[test]
-    fn the_rows_readings_count_within_7_days_and_give_both_ages() {
-        let now = 100 * DAY;
-        let config = Config {
+    /// The rows of [`the_rows_readings_count_within_7_days_and_give_both_ages`].
+    fn seven_rows() -> Config {
+        Config {
             present: true,
             drills: vec![
                 Drill {
@@ -695,7 +700,16 @@ mod tests {
                 },
             ],
             status: None,
-        };
+        }
+    }
+
+    /// The drill rows: a passing and a failing record (the store gives the
+    /// newest passing one), a unit's three results, a refused name, no
+    /// drill, one outside 7 days; and both ages.
+    #[test]
+    fn the_rows_readings_count_within_7_days_and_give_both_ages() {
+        let now = 100 * DAY;
+        let config = seven_rows();
         let mut asked = Vec::new();
         let passed = |at: i64| Reading {
             passed_at_ms: Some(at),
