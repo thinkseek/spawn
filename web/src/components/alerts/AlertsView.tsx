@@ -3,9 +3,10 @@ import { BellRing } from "lucide-react";
 import type { Alert } from "../../api";
 import { fetchAlerts, usePoll } from "../../api";
 import type { FleetAgent } from "../../fleet";
-import { alertMoot, alertStale, alertTitle } from "../../home";
+import { alertMoot, alertRowWords, alertStale, alertTitle, openAlertsLine } from "../../home";
 import { absoluteTitle, localDateTime, relativeTime } from "../../format";
 import { LiveStatus, PageHeader, cx } from "../ui";
+import { useNowEvery } from "../timeaxis/useTimeWindow";
 
 /** What each state looks like: a condition still true, news, or done. */
 function stateClass(state: Alert["state"]): string {
@@ -33,7 +34,17 @@ function Evidence({ label, value }: { label: string; value: unknown }) {
   );
 }
 
-function AlertRow({ alert, title = null, note = null }: { alert: Alert; title?: string | null; note?: string | null }) {
+function AlertRow({
+  alert,
+  now,
+  title = null,
+  note = null,
+}: {
+  alert: Alert;
+  now: number;
+  title?: string | null;
+  note?: string | null;
+}) {
   const at =
     alert.state === "cleared" ? (alert.cleared_at_ms ?? alert.fired_at_ms) : alert.fired_at_ms;
   return (
@@ -63,7 +74,7 @@ function AlertRow({ alert, title = null, note = null }: { alert: Alert; title?: 
           {relativeTime(at)} · {localDateTime(at, true)}
         </span>
       </div>
-      <p className="mt-1 text-caption text-foreground">{alert.text}</p>
+      <p className="mt-1 text-caption text-foreground">{alertRowWords(alert, now)}</p>
       {note && <p className="mt-0.5 text-micro text-warning">{note}</p>}
       {alert.scored_at_ms != null && (
         <p className="tnum mt-0.5 text-micro text-muted-foreground" title={absoluteTitle(alert.scored_at_ms)}>
@@ -90,6 +101,7 @@ export function AlertsView({
   onShowHome?: () => void;
 }) {
   const alerts = usePoll("alerts", fetchAlerts, 3_000);
+  const now = useNowEvery(60_000);
   const data = alerts.data ?? [];
   const open = data.filter((alert) => alert.state === "open");
   const applies = open.filter((alert) => !alertMoot(alert, agents));
@@ -128,6 +140,7 @@ export function AlertsView({
                   <AlertRow
                     key={alert.key}
                     alert={alert}
+                    now={now}
                     title={alertTitle(alert, nameOf(alert.subject))}
                     note={stale ? "Not scored since it fired: its latest judgement has no score. To know, not to act." : null}
                   />
@@ -143,7 +156,7 @@ export function AlertsView({
               </summary>
               <ul className="opacity-70">
                 {moot.map((alert) => (
-                  <AlertRow key={alert.key} alert={alert} title={alertTitle(alert, nameOf(alert.subject))} />
+                  <AlertRow key={alert.key} alert={alert} now={now} title={alertTitle(alert, nameOf(alert.subject))} />
                 ))}
               </ul>
             </details>
@@ -160,7 +173,7 @@ export function AlertsView({
             ) : (
               <ul>
                 {cleared.map((alert) => (
-                  <AlertRow key={alert.key} alert={alert} title={alertTitle(alert, nameOf(alert.subject))} />
+                  <AlertRow key={alert.key} alert={alert} now={now} title={alertTitle(alert, nameOf(alert.subject))} />
                 ))}
               </ul>
             )}
@@ -190,7 +203,7 @@ export function AlertsView({
             ) : (
               <ul>
                 {notices.map((alert) => (
-                  <AlertRow key={alert.key} alert={alert} />
+                  <AlertRow key={alert.key} alert={alert} now={now} />
                 ))}
               </ul>
             )}
@@ -201,14 +214,14 @@ export function AlertsView({
   );
 }
 
-/** The open alerts on every page: kind, subject, since when, the text. */
 /** The open alerts that still apply, on every page but Home (whose "Needs
  * you" lists them with what to do): one line, the newest, and a count. An
  * alert about a session that has ended never reaches it (home.ts
  * liveAlerts). */
 export function OpenAlerts({ alerts, onOpen }: { alerts: Alert[]; onOpen: () => void }) {
-  if (alerts.length === 0) return null;
-  const newest = alerts.reduce((latest, alert) => (alert.fired_at_ms > latest.fired_at_ms ? alert : latest));
+  const now = useNowEvery(60_000);
+  const line = openAlertsLine(alerts, now);
+  if (line === null) return null;
   return (
     <div className="shrink-0 border-b border-surface-border bg-fail-tint px-3 py-1.5">
       <button
@@ -218,11 +231,11 @@ export function OpenAlerts({ alerts, onOpen }: { alerts: Alert[]; onOpen: () => 
         title="Open the Alerts page"
       >
         <span className="shrink-0 font-medium text-destructive">
-          {alerts.length} open alert{alerts.length === 1 ? "" : "s"}
+          {line.count} open alert{line.count === 1 ? "" : "s"}
         </span>
         <span className="min-w-0 truncate text-muted-foreground">
-          <span className="text-foreground">{newest.text}</span>{" "}
-          <span className="tnum text-faint-foreground">since {relativeTime(newest.fired_at_ms)}</span>
+          <span className="text-foreground">{line.text}</span>{" "}
+          <span className="tnum text-faint-foreground">since {relativeTime(line.fired_at_ms)}</span>
         </span>
         <span className="ml-auto shrink-0 text-caption font-medium text-foreground">Alerts</span>
       </button>
