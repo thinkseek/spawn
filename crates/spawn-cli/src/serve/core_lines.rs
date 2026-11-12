@@ -79,6 +79,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 
 mod drills;
+mod schemas;
+mod scratch;
+mod unowned;
 
 /// The file's name under the workspace root, when `SPAWN_CORE_LINES_FILE`
 /// names none.
@@ -595,6 +598,20 @@ fn storage_line(storage: &Value) -> Line {
                 "count",
                 largest("schemas"),
             ),
+            // Objective 094, after the frame's five: read in the background
+            // and kept ([`unowned`]), set on `storage` by [`lines_at`].
+            Figure::new(
+                "storage.unowned_scratch_bytes",
+                "Scratch nobody owns",
+                "bytes",
+                storage["unowned_scratch_bytes"].clone(),
+            ),
+            Figure::new(
+                "storage.leaked_test_schemas",
+                "Leaked test schemas",
+                "count",
+                storage["leaked_test_schemas"].clone(),
+            ),
         ],
     }
 }
@@ -823,14 +840,25 @@ pub(super) fn core_lines_at(
     let now_ms = super::now_ms();
     let contents = read_ranges(path);
     let text = contents.as_ref().ok().and_then(Option::as_deref);
-    let (figures, drills) = lines_at(store, nightly, text, now_ms)?;
+    let (figures, extras) = lines_at(store, nightly, text, now_ms)?;
     let samples = store
         .host_core_lines(trend_since(now_ms))
         .map_err(super::err)?;
     let samples = measured_samples(samples, store.first_deploy_finished_ms().ok().flatten());
     let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
     let mut view = answer(&figures, &file, contents, &trends(&samples, now_ms));
-    view["drills"] = drills;
+    view["drills"] = extras.drills;
+    view["scratch"] = extras.scratch;
+    view["test_schemas"] = extras.test_schemas;
+    // A URL file refused (objective 094) is said where a range left out is.
+    if let Some(ignored) = view["ignored_ranges"].as_array_mut() {
+        for (name, why) in extras.refused {
+            ignored.push(json!({
+                "key": format!("storage.test_database_url_files.{name}"),
+                "reason": why,
+            }));
+        }
+    }
     Ok(view)
 }
 
@@ -852,16 +880,31 @@ pub(super) fn measured_samples(mut samples: Value, first_deploy_ms: Option<i64>)
     samples
 }
 
+/// What the answer gains beside the lines: the drills (objective 093), the
+/// scratch nobody owns, each test server's schemas and the URL files
+/// refused (objective 094).
+struct Extras {
+    drills: Value,
+    scratch: Value,
+    test_schemas: Value,
+    refused: Vec<(String, String)>,
+}
+
 /// The four lines' figures, read at `now_ms` with the nightly's fact files
 /// in `nightly` and the Core lines file's contents `file` (its
-/// `recoverability` drills, objective 093), and the answer's `drills`.
+/// `recoverability` drills, objective 093; its `storage` scratch roots and
+/// test servers, objective 094), and what the answer gains beside them.
 fn lines_at(
     store: &spawn_postgres::PostgresStore,
     nightly: Option<&Path>,
     file: Option<&str>,
     now_ms: i64,
-) -> Result<(Vec<Line>, Value), String> {
-    let storage = super::storage::report(store, now_ms)?;
+) -> Result<(Vec<Line>, Extras), String> {
+    let mut storage = super::storage::report(store, now_ms)?;
+    let unowned = unowned::now(file, now_ms);
+    let reading = unowned.reading.as_deref();
+    storage["unowned_scratch_bytes"] = reading.map_or(Value::Null, unowned::Reading::unowned_bytes);
+    storage["leaked_test_schemas"] = reading.map_or(Value::Null, unowned::Reading::leaked);
     let (performance, cost_total) = performance_now(store, now_ms);
     let health = store.fleet_health().map_err(super::err)?;
     let alerts = store
@@ -885,7 +928,12 @@ fn lines_at(
             drills.north_star.value,
             guardrails,
         ),
-        drills.list,
+        Extras {
+            drills: drills.list,
+            scratch: unowned::scratch_json(&unowned.plan, reading),
+            test_schemas: unowned::test_schemas_json(reading),
+            refused: unowned.refused,
+        },
     ))
 }
 
