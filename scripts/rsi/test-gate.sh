@@ -1251,6 +1251,19 @@ other_lang=C.UTF-8
 expect "a gate with another LANG lands" "$(LANG=$other_lang judge_rust "$shifted")" 'exit=0 {"verdict":"accepted"}'
 expect "and misses: the sandbox's environment is in the key" "$(cat "$work/gate.out")" \
     "| tests: the base's listing is not in the cache (none): listed now"
+# Another gate: a copy of gate.sh with one more comment line (beside the
+# scripts it sources, with a TMPDIR of its own outside $work, as in case 9).
+listing_gate_copy=$work/gate-copy-listing
+mkdir -p "$listing_gate_copy/rsi" "$work/gate-copy-listing-tmp"
+cp "$(dirname "$gate")"/../*.sh "$listing_gate_copy/"
+cp "$gate" "$(dirname "$gate")/gate-pg.sh" "$listing_gate_copy/rsi/"
+chmod -R u+w "$listing_gate_copy"
+printf '# changed\n' >>"$listing_gate_copy/rsi/gate.sh"
+expect "a gate whose gate.sh differs by one comment line lands" \
+    "$(gate=$listing_gate_copy/rsi/gate.sh TMPDIR=$work/gate-copy-listing-tmp && export TMPDIR && judge_rust "$shifted")" \
+    'exit=0 {"verdict":"accepted"}'
+expect "and misses: the gate is in the key" "$(cat "$work/gate.out")" \
+    "| tests: the base's listing is not in the cache (none): listed now"
 # A damaged entry is a miss with its reason, listed again and rewritten
 # whole (its key line, `runnable 4`, 4 names).
 listing_damaged() { # listing_damaged <what> <reason>
