@@ -1216,7 +1216,6 @@ mod tests {
         }
     }
 
-<<<<<<< b2acbd8ca428a28aef0044923c13ffd342b46548
     /// Objective 092: the share of the alerts that ended in the last 7
     /// days whose condition cleared them.
     #[test]
@@ -1256,7 +1255,8 @@ mod tests {
         assert_eq!(line.north_star.key, "observability.needs_you_right");
         assert_eq!(line.north_star.unit, "share");
         assert_eq!(line.north_star.value, json!(0.5));
-=======
+    }
+
     /// Objective 095: the north star while the Scorecard's 7 days are not
     /// covered by the live record has no value and says where the measuring
     /// began; once covered it is the Scorecard's value, with no such field.
@@ -1286,7 +1286,6 @@ mod tests {
         let never = star(&card(false, Value::Null));
         assert_eq!(never["value"], Value::Null);
         assert_eq!(never.get("measuring_since_ms"), None, "{never}");
->>>>>>> 193654be5d00586b9f8d3fc7d27777c64eafa74a
     }
 
     fn values(figures: &[Figure]) -> Vec<(&'static str, Value)> {
