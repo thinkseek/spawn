@@ -865,6 +865,78 @@ test("missions today: each task in flight counts its conflict verdicts and says 
   );
 });
 
+test("missions today: a task counts its objective's earlier attempts' conflicts too (objective 073)", () => {
+  const gated = (verdict: string, hoursAgo: number) =>
+    ({ stage: "gated", verdict, at_ms: NOW - hoursAgo * HOUR, took_ms: null }) as MissionTask["stages"][number];
+  const made = (hoursAgo: number) => NOW - hoursAgo * HOUR;
+  const model = missionsToday(
+    missions([
+      mission(1, "Backlog", [
+        // Objective 1: two earlier attempts with a conflict each, then T3.
+        task(1, "cancelled", { objective: 1, created_at_ms: made(30), stages: [gated("conflict", 29)] }),
+        task(2, "cancelled", { objective: 1, created_at_ms: made(20), stages: [gated("conflict", 19)] }),
+        task(3, "revise", { objective: 1, created_at_ms: made(10), stages: [gated("conflict", 9)] }),
+        // Objective 2: an earlier attempt with two; T5 has none of its own.
+        task(4, "cancelled", { objective: 2, created_at_ms: made(30), stages: [gated("conflict", 29), gated("conflict", 28)] }),
+        task(5, "delivered", { objective: 2, created_at_ms: made(10) }),
+        // Objective 4: an earlier attempt without a conflict (rejected).
+        task(7, "cancelled", { objective: 4, created_at_ms: made(30), stages: [gated("rejected", 29)] }),
+        task(8, "revise", { objective: 4, created_at_ms: made(10), stages: [gated("conflict", 9)] }),
+        // Objective 5: T12 is earlier than T13, whose conflicts T12 does not count.
+        task(12, "revise", { objective: 5, created_at_ms: made(20), stages: [gated("conflict", 19)] }),
+        task(13, "revise", { objective: 5, created_at_ms: made(10), stages: [gated("conflict", 9), gated("conflict", 8)] }),
+        // Objective 3 here; mission 2's objective 3 is another objective.
+        task(6, "revise", { objective: 3, created_at_ms: made(10), stages: [gated("conflict", 9), gated("conflict", 8)] }),
+        // No objective: nothing earlier, whatever other such tasks had.
+        task(10, "cancelled", { created_at_ms: made(30), stages: [gated("conflict", 29), gated("conflict", 28)] }),
+        task(11, "delivered", { created_at_ms: made(10) }),
+      ]),
+      mission(2, "Other backlog", [
+        task(9, "cancelled", { objective: 3, created_at_ms: made(40), stages: [gated("conflict", 39), gated("conflict", 38)] }),
+        task(14, "delivered", { objective: 3, created_at_ms: made(5) }),
+      ]),
+    ]),
+    NOW,
+  );
+  const rows = (id: number) =>
+    model.rows
+      .find((row) => row.id === id)!
+      .inFlight.map(({ task_id, conflicts, earlierConflicts, conflictText }) => [task_id, conflicts, earlierConflicts, conflictText]);
+  assert.deepEqual(rows(1), [
+    [3, 1, 2, "sent back 3 times as a conflict, 2 on earlier attempts"],
+    [5, 0, 2, "sent back 2 times as a conflict, 2 on earlier attempts"],
+    [6, 2, 0, "sent back 2 times as a conflict"],
+    [8, 1, 0, null],
+    [11, 0, 0, null],
+    [12, 1, 0, null],
+    [13, 2, 1, "sent back 3 times as a conflict, 1 on earlier attempts"],
+  ]);
+  // Mission 2's T14 counts its own mission's T9 only.
+  assert.deepEqual(rows(2), [[14, 0, 2, "sent back 2 times as a conflict, 2 on earlier attempts"]]);
+});
+
+test("conflictText counts the task's own conflicts and its earlier attempts' together, from two (objective 073)", () => {
+  assert.equal(conflictText(0), null);
+  assert.equal(conflictText(1), null);
+  assert.equal(conflictText(2), "sent back 2 times as a conflict");
+  assert.equal(conflictText(1, 0), null);
+  assert.equal(conflictText(0, 1), null);
+  assert.equal(conflictText(1, 1), "sent back 2 times as a conflict, 1 on earlier attempts");
+  assert.equal(conflictText(0, 2), "sent back 2 times as a conflict, 2 on earlier attempts");
+  assert.equal(conflictText(3, 0), "sent back 3 times as a conflict");
+});
+
+test("tasks made at the same time order by id for their earlier attempts (objective 073)", () => {
+  const gated = { stage: "gated", verdict: "conflict", at_ms: NOW - HOUR, took_ms: null } as MissionTask["stages"][number];
+  const first = task(20, "cancelled", { objective: 9, stages: [gated] });
+  const second = task(21, "revise", { objective: 9, stages: [gated] });
+  const backlog = mission(5, "Backlog", [second, first]);
+  assert.equal(earlierConflictCount(second, backlog), 1);
+  assert.equal(earlierConflictCount(first, backlog), 0);
+  const unmade = task(22, "revise", { objective: 9, created_at_ms: null });
+  assert.equal(earlierConflictCount(unmade, mission(5, "Backlog", [first, second, unmade])), 0, "no time: before every timed task");
+});
+
 test("Home's in-flight line shows the conflict text beside the task's state, in the warning tone", () => {
   const home = readFileSync(new URL("../src/components/home/Home.tsx", import.meta.url), "utf8");
   const line = home.slice(home.indexOf("row.inFlight.map"), home.indexOf("row.lastRejection &&"));
