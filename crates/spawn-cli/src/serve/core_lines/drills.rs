@@ -295,9 +295,7 @@ pub(super) fn drills_json(config: &Config, passes: &[Option<i64>]) -> Value {
 pub(super) fn status_at_ms(path: Option<&Path>) -> Option<i64> {
     let text = std::fs::read_to_string(path?).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
-    let seconds = value["at"]
-        .as_i64()
-        .or_else(|| value["at"].as_f64().map(|at| at as i64))?;
+    let seconds = value["at"].as_i64()?;
     Some(seconds.saturating_mul(1000))
 }
 
