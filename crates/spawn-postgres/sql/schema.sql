@@ -4677,6 +4677,7 @@ declare
     v_typed_at bigint;
     v_typing_exec text;
     v_typing_at bigint;
+    v_typing_id bigint;
     v_marked boolean;
     v_taken bigint;
     v_taken_id bigint;
@@ -4698,7 +4699,8 @@ begin
     select min(e.recorded_at_ms) into v_typed_at from spawn_events e
      where e.session_id = p_session and e.source = 'bridge'
        and e.source_event_id = 'cmd_' || p_id || ':typed';
-    select e.execution_id, e.recorded_at_ms into v_typing_exec, v_typing_at from spawn_events e
+    select e.execution_id, e.recorded_at_ms, e.id into v_typing_exec, v_typing_at, v_typing_id
+      from spawn_events e
      where e.session_id = p_session and e.source = 'bridge'
        and e.source_event_id in ('cmd_' || p_id || ':typing', 'cmd_' || p_id || ':message')
      order by e.id limit 1;
@@ -4740,15 +4742,27 @@ begin
     -- It waited for its turn: the bound runs from the session's last busy
     -- screen or turn end after its start and before the Bridge began typing
     -- it (or before now). Only an untaken one is read: a taken one is never
-    -- not taken.
+    -- not taken. Each kind is the latest row before the typing's (by id,
+    -- through spawn_events_session_name, read backwards from the typing or
+    -- the end: a long-lived session's older readings are never scanned).
     if v_tracked and v_taken = 0 then
-        select greatest(v_from, max(e.recorded_at_ms)) into v_from from spawn_events e
-         where e.session_id = p_session
-           and (e.event_name in ('turn.stopped', 'turn.failed')
-                or (e.event_name = 'screen.observed'
-                    and e.kind -> 'detail' ->> 'state' = 'busy'))
-           and e.recorded_at_ms > v_from
-           and e.recorded_at_ms <= coalesce(v_typing_at, p_now);
+        select greatest(v_from, max(x.at)) into v_from from (
+            (select e.recorded_at_ms as at from spawn_events e
+              where e.session_id = p_session and e.event_name = 'screen.observed'
+                and e.kind -> 'detail' ->> 'state' = 'busy'
+                and (v_typing_id is null or e.id < v_typing_id)
+              order by e.id desc limit 1)
+            union all
+            (select e.recorded_at_ms from spawn_events e
+              where e.session_id = p_session and e.event_name = 'turn.stopped'
+                and (v_typing_id is null or e.id < v_typing_id)
+              order by e.id desc limit 1)
+            union all
+            (select e.recorded_at_ms from spawn_events e
+              where e.session_id = p_session and e.event_name = 'turn.failed'
+                and (v_typing_id is null or e.id < v_typing_id)
+              order by e.id desc limit 1)) x
+         where x.at <= coalesce(v_typing_at, p_now);
     end if;
     -- The session ended with it: the execution it was typed into, or its
     -- own start's, ended.
