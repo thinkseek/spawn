@@ -89,16 +89,10 @@ export function spanWords(ms: number): string {
 }
 
 /** A number in a unit's words: bytes as storageSize ("104.0 GB"), a day's
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
- * growth "<size> a day", days "1,234 days", a ratio "4.7×", a count
- * grouped ("1,214"), milliseconds as a span ("1 h 32 min"), a share as a
- * percent to one decimal ("74.9%"), dollars and cents ("$8.08"). */
-=======
  * growth "<size> a day", days "1,234 days", a ratio "4.7×" (below one
- * "0.13"), a count
- * grouped ("1,214"), milliseconds in hours ("1.5 h"), a share as a whole
- * percent ("95%"). */
->>>>>>> 0c9ab77233354544a58812b663d20217c80ce798
+ * "0.13"), a count grouped ("1,214"), milliseconds as a span ("1 h 32
+ * min"), a share as a percent to one decimal ("74.9%"), dollars and cents
+ * ("$8.08"). */
 export function unitWords(unit: string, value: number): string {
   switch (unit) {
     case "bytes":
