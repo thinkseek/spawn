@@ -68,6 +68,7 @@ test("gate room: one row per gated mission, the waiting gates longest first", ()
 
 import { readFileSync } from "node:fs";
 
+import { localDateTime } from "../src/format.ts";
 import { normalizeStorage, storageSize, storageView } from "../src/resources.ts";
 
 const MB = 1024 ** 2;
