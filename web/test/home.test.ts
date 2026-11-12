@@ -15,6 +15,7 @@ import {
   agentsNow,
   alertMoot,
   alertStale,
+  alertRowWords,
   alertTitle,
   alertsSpanMs,
   awayFrom,
@@ -31,6 +32,7 @@ import {
   earlierConflictCount,
   needsSummary,
   needsYou,
+  openAlertsLine,
   oneLine,
 } from "../src/home.ts";
 import type { Mission, Missions, MissionTask } from "../src/missions.ts";
@@ -307,6 +309,44 @@ test("an alert without a numeric since_ms keeps its text, and other alerts are a
   assert.equal(needsYou({ ...base, alerts: [bare] })[0].detail, text);
   const other = alert("disk:/", "disk_low", "/", { evidence: { since_ms: NOW - 31 * HOUR }, text: "disk is low" });
   assert.equal(needsYou({ ...base, alerts: [other] })[0].detail, "disk is low");
+});
+
+test("openAlertsLine: none is null; one mission_idle alert counts on as of now (objective 080)", () => {
+  assert.equal(openAlertsLine([], NOW), null);
+  const since = NOW - 31 * HOUR;
+  const words = (how: string) =>
+    `mission #6 has had no task in work for ${how} since its last task ended: its objective backlog has nothing open to assign`;
+  const idle = alert("mission_idle:6:40", "mission_idle", "mission #6", {
+    fired_at_ms: since + 15 * MIN,
+    evidence: { mission: 6, since_ms: since, event_id: 40, idle_ms: 15 * MIN, reading_ms: since + 15 * MIN },
+    text: words("15 min"),
+  });
+  assert.deepEqual(openAlertsLine([idle], NOW), { count: 1, text: words("31 h"), fired_at_ms: since + 15 * MIN });
+  assert.deepEqual(openAlertsLine([idle], since + 72 * HOUR), { count: 1, text: words("3 d"), fired_at_ms: since + 15 * MIN });
+});
+
+test("openAlertsLine: of two kinds, the newest speaks, in its own words or the mission's as of now (objective 080)", () => {
+  const since = NOW - 31 * HOUR;
+  const words = (how: string) =>
+    `mission #6 has had no task in work for ${how} since its last task ended: its objective backlog has nothing open to assign`;
+  const idle = alert("mission_idle:6:40", "mission_idle", "mission #6", {
+    fired_at_ms: since + 15 * MIN,
+    evidence: { mission: 6, since_ms: since },
+    text: words("15 min"),
+  });
+  const newer = alert("disk:/", "disk_low", "/", { fired_at_ms: since + 16 * MIN, evidence: { since_ms: since }, text: "disk is low" });
+  assert.deepEqual(openAlertsLine([idle, newer], NOW), { count: 2, text: "disk is low", fired_at_ms: since + 16 * MIN });
+  const older = { ...newer, fired_at_ms: since + 14 * MIN };
+  assert.deepEqual(openAlertsLine([older, idle], NOW), { count: 2, text: words("31 h"), fired_at_ms: since + 15 * MIN });
+});
+
+test("an Alerts row: open mission_idle counts on; cleared or notice keeps its stored text (objective 080)", () => {
+  const since = NOW - 31 * HOUR;
+  const text = "mission #6 has had no task in work for 15 min since its last task ended: its objective backlog has nothing open to assign";
+  const idle = alert("mission_idle:6:40", "mission_idle", "mission #6", { evidence: { mission: 6, since_ms: since }, text });
+  assert.equal(alertRowWords(idle, NOW), text.replace("15 min", "31 h"));
+  assert.equal(alertRowWords({ ...idle, state: "cleared", cleared_at_ms: NOW - HOUR }, NOW), text);
+  assert.equal(alertRowWords({ ...idle, state: "notice" }, NOW), text);
 });
 
 test("missions today: open work as a row, today's landings and the latest send-back; nothing open folds; closed is counted", () => {
