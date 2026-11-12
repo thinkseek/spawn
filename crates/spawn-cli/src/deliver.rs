@@ -2208,10 +2208,11 @@ fn send_note(
 mod tests {
     use super::{
         CREDENTIALS_LINE, Cancelled, DELIVERY_RETRIES, NOT_READY_RETRY_MS, News, PROCESSES_LINE,
-        REPORT, TaskRow, Work, delivered, delivery_mark, mark_delivery, new_report, news_items,
-        next_due, notice_task, put_aside, report_contract, report_due, retry_wait_ms, task_prompt,
-        typed,
+        Pause, PausedWorker, REPORT, Restart, TaskRow, Work, delivered, delivery_mark,
+        mark_delivery, new_report, news_items, next_due, next_up, notice_task, put_aside,
+        report_contract, report_due, retry_wait_ms, task_prompt, typed,
     };
+    use std::collections::BTreeSet;
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
     use spawn_core::command::CommandAction;
@@ -2935,7 +2936,7 @@ mod tests {
         assert!(!work.paused(2));
         assert!(next_up(&work).is_empty(), "the waiting task is not up");
         for idle in [true, false] {
-            let plan = orders(&work, &[worker(true, idle)], 5_000);
+            let plan = super::orders(&work, &[worker(true, idle)], 5_000);
             assert_eq!(
                 plan.iter()
                     .map(|order| (order.key.as_str(), &order.action, order.task))
@@ -2951,7 +2952,7 @@ mod tests {
             finished_at_ms: None,
             ..failed_switch("pause-1-50-exec_3", 6_000)
         });
-        assert!(orders(&work, &[stopping], 6_000).is_empty());
+        assert!(super::orders(&work, &[stopping], 6_000).is_empty());
         // Stopped: nothing revives it, not even a restart asked meanwhile.
         let mut restarted = work.clone();
         restarted.tasks[0].restart = Some(Restart {
@@ -2962,8 +2963,8 @@ mod tests {
         });
         let mut stopped = worker(false, false);
         stopped.recovered = Some(70);
-        assert!(orders(&restarted, &[stopped.clone()], 7_000).is_empty());
-        assert!(orders(&work, &[stopped], 7_000).is_empty());
+        assert!(super::orders(&restarted, &[stopped.clone()], 7_000).is_empty());
+        assert!(super::orders(&work, &[stopped], 7_000).is_empty());
     }
 
     /// Objective 099: at the owner's resume the resident the pause stopped
@@ -2977,7 +2978,7 @@ mod tests {
         assert!(!work.paused(1));
         assert_eq!(next_up(&work), BTreeSet::from([6]));
         let stopped = worker(false, false);
-        let plan = orders(&work, &[stopped.clone()], 8_000);
+        let plan = super::orders(&work, &[stopped.clone()], 8_000);
         let resume = plan
             .iter()
             .find(|order| order.session_id == "session_resident_core")
