@@ -393,7 +393,10 @@ fn parts_of(name: &str, field: &dyn Fn(&str) -> Value) -> String {
         ),
         "first_pass" => format!("first pass {}", show(&field("first_pass"))),
         "report_to_live" => {
-            let since = match (field("covered").as_bool(), field("measured_from_ms").as_i64()) {
+            let since = match (
+                field("covered").as_bool(),
+                field("measured_from_ms").as_i64(),
+            ) {
                 (Some(false), Some(from)) => format!(", measured since {}", format_rfc3339(from)),
                 _ => String::new(),
             };

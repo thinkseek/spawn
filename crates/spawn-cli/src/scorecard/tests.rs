@@ -1301,12 +1301,24 @@ fn report_to_live_counts_only_landings_from_the_live_records_start() {
     let history = story_with(false).history();
     // A window that starts at the record's start: covered.
     assert_eq!(
-        rtl(&history, Window { since: minutes(120), until: at(24) })["covered"],
+        rtl(
+            &history,
+            Window {
+                since: minutes(120),
+                until: at(24)
+            }
+        )["covered"],
         json!(true)
     );
     // A window starting after the record: covered, measured from its own start.
     assert_eq!(
-        rtl(&history, Window { since: minutes(135), until: at(24) }),
+        rtl(
+            &history,
+            Window {
+                since: minutes(135),
+                until: at(24)
+            }
+        ),
         json!({"value": 6_000_000, "n": 3, "not_live": 1,
                "measured_from_ms": minutes(135), "covered": true, "lead_n": 4})
     );
