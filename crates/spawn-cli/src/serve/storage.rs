@@ -108,11 +108,37 @@ pub(crate) fn days_left(free: Option<u64>, growth: Option<i64>) -> Option<u64> {
     Some(free? / growth)
 }
 
+/// The test databases' entries (objective 074): `{role, name, bytes,
+/// schemas}` for each `(role, reading)`, in the order given (the gates'
+/// first); one that could not be read has its name, bytes and schemas
+/// null, and says why (`error`).
+pub(crate) fn test_databases(readings: Vec<(&'static str, Result<Value, String>)>) -> Value {
+    readings
+        .into_iter()
+        .map(|(role, reading)| match reading {
+            Ok(reading) => json!({
+                "role": role, "name": reading["name"], "bytes": reading["bytes"],
+                "schemas": reading["schemas"],
+            }),
+            Err(error) => json!({
+                "role": role, "name": null, "bytes": null, "schemas": null,
+                "error": crate::alerts::scrub(&error),
+            }),
+        })
+        .collect()
+}
+
 /// The kept part of the figures, read at `read_at_ms`: the sizes, the
-/// database's, the archive's growth and Claude Code's count before, from
-/// `samples` (`{oldest, before}`, as `PostgresStore::host_storage` reads
-/// them for this moment).
-pub(crate) fn sizes(read_at_ms: i64, walked: &Walked, samples: &Value, database: &Value) -> Value {
+/// database's, the test databases' ([`test_databases`]), the archive's
+/// growth and Claude Code's count before, from `samples` (`{oldest,
+/// before}`, as `PostgresStore::host_storage` reads them for this moment).
+pub(crate) fn sizes(
+    read_at_ms: i64,
+    walked: &Walked,
+    samples: &Value,
+    database: &Value,
+    tests: &Value,
+) -> Value {
     let path = |path: &Path| path.display().to_string();
     let root = walked.root.as_deref();
     json!({
@@ -133,6 +159,7 @@ pub(crate) fn sizes(read_at_ms: i64, walked: &Walked, samples: &Value, database:
             "bytes": walked.workspaces.bytes,
         })),
         "database": database.clone(),
+        "test_databases": tests.clone(),
         "growth_bytes_per_day": root.and_then(|_| growth(walked.archive.bytes, &samples["oldest"], read_at_ms)),
     })
 }
@@ -158,7 +185,21 @@ pub(crate) fn report(store: &PostgresStore, now_ms: i64) -> Result<Value, String
             )
             .map_err(|error| error.to_string())?;
         let database = store.database_size().map_err(|error| error.to_string())?;
-        Ok(sizes(read_at_ms, &walked, &samples, &database))
+        // The gates' test database and the engines', each when its URL is
+        // set (objective 074).
+        let tests = test_databases(
+            crate::alerts::test_database_urls()
+                .into_iter()
+                .map(|(role, url)| {
+                    (
+                        role,
+                        spawn_postgres::test_database_size(&url.0)
+                            .map_err(|error| error.to_string()),
+                    )
+                })
+                .collect(),
+        );
+        Ok(sizes(read_at_ms, &walked, &samples, &database, &tests))
     })?;
     let free = root
         .as_deref()
@@ -169,7 +210,8 @@ pub(crate) fn report(store: &PostgresStore, now_ms: i64) -> Result<Value, String
 #[cfg(test)]
 mod tests {
     use super::{
-        DAY_MS, Kept, READ_EVERY_MS, Walked, days_left, growth, kept_or_read, sizes, with_free,
+        DAY_MS, Kept, READ_EVERY_MS, Walked, days_left, growth, kept_or_read, sizes,
+        test_databases, with_free,
     };
     use crate::storage::tests::{file, scratch};
     use serde_json::{Value, json};
@@ -249,7 +291,8 @@ mod tests {
             "before": {"at_ms": now - 7_200_000, "archive_bytes": 11_000, "projects_files": 40},
         });
         let database = json!({"bytes": 9, "tables": [{"name": "spawn_events", "bytes": 8}]});
-        let kept = sizes(now, &walked, &samples, &database);
+        let tests = json!([{"role": "test", "name": "spawn_test", "bytes": 7, "schemas": 0}]);
+        let kept = sizes(now, &walked, &samples, &database, &tests);
         let figures = with_free(kept, Some(100_000));
         assert_eq!(
             figures,
@@ -261,6 +304,7 @@ mod tests {
                              "before": 40},
                 "workspaces": {"path": root.display().to_string(), "bytes": 2000},
                 "database": database,
+                "test_databases": tests,
                 "growth_bytes_per_day": 5000,
                 "free_bytes": 100_000,
                 "days_left": 20,
@@ -273,11 +317,47 @@ mod tests {
                 &walked,
                 &json!({"oldest": null, "before": null}),
                 &Value::Null,
+                &json!([]),
             ),
             Some(1),
         );
         assert_eq!(bare["growth_bytes_per_day"], Value::Null);
         assert_eq!(bare["projects"]["before"], Value::Null);
         assert_eq!(bare["days_left"], Value::Null);
+    }
+
+    /// Objective 074: the test databases, the gates' first, each as read;
+    /// one that cannot be read keeps its role and says why, without its URL.
+    #[test]
+    fn the_test_databases_are_listed_in_order_each_as_read() {
+        let listed = test_databases(vec![
+            (
+                "test",
+                Ok(json!({"name": "spawn_test", "bytes": 9 * MIB, "schemas": 0})),
+            ),
+            (
+                "fleet_test",
+                Ok(json!({"name": "spawn_fleet_test", "bytes": 2765 * MIB, "schemas": 2533})),
+            ),
+        ]);
+        assert_eq!(
+            listed,
+            json!([
+                {"role": "test", "name": "spawn_test", "bytes": 9 * MIB, "schemas": 0},
+                {"role": "fleet_test", "name": "spawn_fleet_test", "bytes": 2765 * MIB,
+                 "schemas": 2533},
+            ])
+        );
+        let down = test_databases(vec![(
+            "fleet_test",
+            Err("error connecting to server: Connection refused".to_string()),
+        )]);
+        assert_eq!(down[0]["role"], "fleet_test");
+        assert_eq!(down[0]["schemas"], Value::Null);
+        assert_eq!(
+            down[0]["error"],
+            "error connecting to server: Connection refused"
+        );
+        assert_eq!(test_databases(Vec::new()), json!([]));
     }
 }
