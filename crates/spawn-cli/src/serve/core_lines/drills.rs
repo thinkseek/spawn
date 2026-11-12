@@ -407,9 +407,10 @@ pub(super) fn drills_json(config: &Config, readings: &[Reading]) -> Value {
                     Source::Unit(unit) => json!(format!("unit {unit}")),
                     Source::None => Value::Null,
                 };
-                let last = reading.last.as_ref().map_or(Value::Null, |last| {
-                    json!({"at_ms": last.at_ms, "ok": last.ok, "reason": last.reason})
-                });
+                let last = reading.last.as_ref().map_or(
+                    Value::Null,
+                    |last| json!({"at_ms": last.at_ms, "ok": last.ok, "reason": last.reason}),
+                );
                 json!({
                     "name": drill.name, "source": source,
                     "passed_at_ms": reading.passed_at_ms, "last": last,
@@ -448,7 +449,12 @@ pub(super) fn figures(
     let within = if readings.is_empty() {
         Value::Null
     } else {
-        json!(readings.iter().filter(|reading| reading.counts(since)).count())
+        json!(
+            readings
+                .iter()
+                .filter(|reading| reading.counts(since))
+                .count()
+        )
     };
     (
         Figure::new(
@@ -468,7 +474,10 @@ pub(super) fn figures(
                 "recoverability.oldest_drill_age",
                 "Age of the oldest passed drill",
                 "ms",
-                age(readings.iter().filter_map(|reading| reading.passed_at_ms).min()),
+                age(readings
+                    .iter()
+                    .filter_map(|reading| reading.passed_at_ms)
+                    .min()),
             ),
         ],
     )
@@ -529,8 +538,8 @@ pub(super) fn read(
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, Drill, Source, config, drills_json, figures, last_passes, parse_show, show,
-        status_at_ms, unit_allowed,
+        Config, Drill, Last, Reading, Source, config, drills_json, figures, parse_last, parse_show,
+        readings, record_reading, show, status_at_ms, unit_allowed,
     };
     use serde_json::{Value, json};
     use std::time::{Duration, Instant};
@@ -651,7 +660,7 @@ mod tests {
     /// newest passing one), a unit's three results, a refused name, no
     /// drill, one outside 7 days; and both ages.
     #[test]
-    fn the_rows_last_passes_count_within_7_days_and_give_both_ages() {
+    fn the_rows_readings_count_within_7_days_and_give_both_ages() {
         let now = 100 * DAY;
         let config = Config {
             present: true,
@@ -688,21 +697,38 @@ mod tests {
             status: None,
         };
         let mut asked = Vec::new();
-        let passes = last_passes(
+        let passed = |at: i64| Reading {
+            passed_at_ms: Some(at),
+            last: Some(Last {
+                at_ms: Some(at),
+                ok: true,
+                reason: String::new(),
+            }),
+        };
+        let readings = readings(
             &config,
-            |kind| (kind == "backup.verified").then_some(now - 3 * HOUR),
+            |kind| {
+                if kind == "backup.verified" {
+                    passed(now - 3 * HOUR)
+                } else {
+                    Reading::default()
+                }
+            },
             |unit| {
                 asked.push(unit.to_string());
                 match unit {
-                    "a.service" => Some(now - 10 * HOUR),
-                    "c.service" => Some(now - 8 * DAY),
-                    _ => None,
+                    "a.service" => passed(now - 10 * HOUR),
+                    "c.service" => passed(now - 8 * DAY),
+                    _ => Reading::default(),
                 }
             },
         );
         assert_eq!(asked, ["a.service", "b.service", "c.service"]);
         assert_eq!(
-            passes,
+            readings
+                .iter()
+                .map(|reading| reading.passed_at_ms)
+                .collect::<Vec<_>>(),
             [
                 Some(now - 3 * HOUR),
                 None,
@@ -713,21 +739,23 @@ mod tests {
                 None
             ]
         );
-        let list = drills_json(&config, &passes);
+        let list = drills_json(&config, &readings);
         assert_eq!(
             list[0],
-            json!({"name": "Database", "source": "record backup.verified", "passed_at_ms": now - 3 * HOUR})
+            json!({"name": "Database", "source": "record backup.verified",
+                   "passed_at_ms": now - 3 * HOUR,
+                   "last": {"at_ms": now - 3 * HOUR, "ok": true, "reason": ""}})
         );
         assert_eq!(
             list[5],
-            json!({"name": "Refused", "source": "unit -Hhost.service", "passed_at_ms": null})
+            json!({"name": "Refused", "source": "unit -Hhost.service", "passed_at_ms": null, "last": null})
         );
         assert_eq!(
             list[6],
-            json!({"name": "Configuration", "source": null, "passed_at_ms": null})
+            json!({"name": "Configuration", "source": null, "passed_at_ms": null, "last": null})
         );
 
-        let (star, ages) = figures(&passes, Some(now - 10 * 60_000), now);
+        let (star, ages) = figures(&readings, Some(now - 10 * 60_000), now);
         assert_eq!(star.key, "recoverability.restores_passed");
         assert_eq!(star.value, json!(2), "the old drill is 8 days old");
         assert_eq!(ages[0].key, "recoverability.session_backup_age");
@@ -740,9 +768,130 @@ mod tests {
         assert_eq!(star.value, Value::Null);
         assert_eq!(ages[0].value, Value::Null);
         assert_eq!(ages[1].value, Value::Null);
-        let (star, ages) = figures(&[None, None], None, now);
+        let (star, ages) = figures(&[Reading::default(), Reading::default()], None, now);
         assert_eq!(star.value, json!(0));
         assert_eq!(ages[1].value, Value::Null);
+    }
+
+    /// Objective 105: a row whose newest drill failed after a pass within
+    /// 7 days is not counted; its pass still gives the oldest age. A pass
+    /// with no newest drill read (`last` null) still counts.
+    #[test]
+    fn a_row_whose_newest_drill_failed_is_not_counted() {
+        let now = 100 * DAY;
+        let failed = Reading {
+            passed_at_ms: Some(now - 3 * HOUR),
+            last: Some(Last {
+                at_ms: Some(now - HOUR),
+                ok: false,
+                reason: "the restore failed".into(),
+            }),
+        };
+        let unread = Reading {
+            passed_at_ms: Some(now - 5 * HOUR),
+            last: None,
+        };
+        let (star, ages) = figures(&[failed, unread], None, now);
+        assert_eq!(star.value, json!(1));
+        assert_eq!(
+            ages[1].value,
+            json!(5 * HOUR),
+            "the failed row's pass is newer"
+        );
+    }
+
+    /// Each record type is read once per reading, however many rows name it.
+    #[test]
+    fn a_record_type_is_read_once_per_reading() {
+        let row = |name: &str| Drill {
+            name: name.into(),
+            source: Source::Record("backup.verified".into()),
+        };
+        let config = Config {
+            present: true,
+            drills: vec![row("One"), row("Two")],
+            status: None,
+        };
+        let mut reads = 0;
+        let got = readings(
+            &config,
+            |_| {
+                reads += 1;
+                Reading::default()
+            },
+            |_| Reading::default(),
+        );
+        assert_eq!(reads, 1);
+        assert_eq!(got.len(), 2);
+    }
+
+    /// A record type's newest record: ok exactly when `ok` is JSON true,
+    /// its reason a string's or ""; no record, no reading.
+    #[test]
+    fn a_records_newest_drill_is_its_own_ok_and_reason() {
+        let reading = record_reading(Some(&json!({
+            "at_ms": 7, "passed_at_ms": 3,
+            "record": {"type": "backup.verified", "ok": false, "reason": "pg_restore exited 1"},
+        })));
+        assert_eq!(reading.passed_at_ms, Some(3));
+        assert_eq!(
+            reading.last,
+            Some(Last {
+                at_ms: Some(7),
+                ok: false,
+                reason: "pg_restore exited 1".into()
+            })
+        );
+        let odd = record_reading(Some(&json!({
+            "at_ms": 9, "passed_at_ms": null,
+            "record": {"type": "backup.verified", "ok": "true", "reason": 5},
+        })));
+        assert_eq!(
+            odd.last,
+            Some(Last {
+                at_ms: Some(9),
+                ok: false,
+                reason: String::new()
+            }),
+            "ok is JSON true only; a reason that is no string is \"\""
+        );
+        assert_eq!(record_reading(None), Reading::default());
+    }
+
+    /// A unit's newest run from the same `systemctl show` output.
+    #[test]
+    fn a_units_newest_run_is_read_from_its_show_output() {
+        assert_eq!(
+            parse_last("Result=success\nExecMainStatus=0\nExecMainExitTimestamp=@5\n"),
+            Some(Last {
+                at_ms: Some(5000),
+                ok: true,
+                reason: String::new()
+            })
+        );
+        assert_eq!(
+            parse_last("Result=exit-code\nExecMainStatus=1\nExecMainExitTimestamp=@5\n"),
+            Some(Last {
+                at_ms: Some(5000),
+                ok: false,
+                reason: "Result=exit-code, ExecMainStatus=1".into()
+            })
+        );
+        assert_eq!(
+            parse_last("Result=timeout\nExecMainStatus=0\nExecMainExitTimestamp=\n"),
+            Some(Last {
+                at_ms: None,
+                ok: false,
+                reason: "Result=timeout, ExecMainStatus=0".into()
+            }),
+            "a failure with no exit timestamp"
+        );
+        assert_eq!(
+            parse_last("Result=success\nExecMainStatus=0\nExecMainExitTimestamp=\n"),
+            None,
+            "never run"
+        );
+        assert_eq!(parse_last(""), None);
     }
 
     #[test]
