@@ -606,7 +606,7 @@ mod tests {
         assert_eq!(unpriced_share(&tokens(300, 100, 100)), json!(0.25));
 
         let observed = Observed {
-            cost_total: tokens(300_000, 0, 100_000),
+            cost_total: tokens(400_000, 0, 100_000),
             human_per_agent_hour: json!(0.125),
         };
         let all = lines(&storage, &observed);
