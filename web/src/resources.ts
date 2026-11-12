@@ -163,6 +163,11 @@ export interface Storage {
      * sample a day old. */
     session_backups: number | null;
   } | null;
+  /** When each part of growth_parts is first measured: the oldest sample of
+   * the last 7 days carrying its field plus a day; null without one (the
+   * archive's also without a workspace root). Objective 098; null from an
+   * older server. */
+  growth_from_parts: Record<string, number | null> | null;
   /** The parts left out of the sum because their source cannot be read now
    * (objective 097): ["session_backups"] without a readable status file,
    * [] when every part is counted; null from an older server. */
@@ -214,6 +219,13 @@ function place(value: unknown): StoragePlace | null {
 }
 
 /** The health's `storage`; null when the server reports none (an older one). */
+/** `growth_from_parts`, each part a number or null; null without the object. */
+function fromParts(value: unknown): Record<string, number | null> | null {
+  const parts = object(value);
+  if (!parts) return null;
+  return Object.fromEntries(Object.entries(parts).map(([part, at]) => [part, optionalNumber(at)]));
+}
+
 export function normalizeStorage(value: unknown): Storage | null {
   const raw = object(value);
   if (!raw) return null;
@@ -243,6 +255,7 @@ export function normalizeStorage(value: unknown): Storage | null {
       database: optionalNumber(parts.database),
       session_backups: optionalNumber(parts.session_backups),
     },
+    growth_from_parts: fromParts(raw.growth_from_parts),
     growth_excluded: Array.isArray(raw.growth_excluded)
       ? raw.growth_excluded.filter((part): part is string => typeof part === "string")
       : null,
@@ -288,6 +301,11 @@ export interface StorageRow {
   name: string;
   size: string;
   note: string;
+  /** A grower's row (the archive, Claude Code's transcripts, the database,
+   * objective 098): the local date and time its own growth is first
+   * measured, while that growth is null and the moment is after the sizes'
+   * read; else null (and always null for a row with no growth part). */
+  measured_from: string | null;
 }
 
 export interface StorageView {
