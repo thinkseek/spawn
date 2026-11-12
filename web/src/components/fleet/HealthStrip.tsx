@@ -196,7 +196,7 @@ export function StorageCard({ storage }: { storage: Storage | null }) {
   if (!storage) {
     return <p className="text-caption text-faint-foreground">This server reports no storage.</p>;
   }
-  const { rows, lasts } = storageView(storage);
+  const { rows, lasts, measured_from } = storageView(storage);
   const fell = (storage.projects?.before ?? 0) > (storage.projects?.files ?? Infinity);
   return (
     <div className="min-w-0 text-caption">
@@ -218,7 +218,7 @@ export function StorageCard({ storage }: { storage: Storage | null }) {
         className="tnum mt-1.5 text-faint-foreground"
         title={`Free on the workspace root: ${formatGib(storage.free_bytes)}; sizes read ${clockTime(storage.read_at_ms)}`}
       >
-        {lasts ?? "How long the disk lasts: not measured yet"}
+        {lasts ?? `How long the disk lasts: ${measured_from === null ? "not measured yet" : `measured from ${measured_from}`}`}
       </p>
     </div>
   );
