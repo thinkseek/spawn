@@ -1478,7 +1478,7 @@ select e.recorded_at_ms
  where e.session_id = 'session_control' and e.event_name = 'control.recorded'
    and e.kind -> 'detail' -> 'record' ->> 'type' = $1
    and e.kind -> 'detail' -> 'record' -> 'ok' = 'true'::jsonb
- order by e.id desc
+ order by e.recorded_at_ms desc, e.id desc
  limit 1";
     let (store, schema) = store("interventions_type_index");
     let mut client = admin(&schema);
