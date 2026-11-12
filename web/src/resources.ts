@@ -154,8 +154,20 @@ export interface Storage {
   growth_bytes_per_day: number | null;
   /** Bytes a day of each grower that persists, each null without a sample
    * a day old carrying its size (objective 085); null from an older server. */
-  growth_parts: { archive: number | null; projects: number | null; database: number | null } | null;
-  /** The parts' sum; null while any part is null. */
+  growth_parts: {
+    archive: number | null;
+    projects: number | null;
+    database: number | null;
+    /** The session backups' reflink-aware growth, from their status file's
+     * `estimated_bytes` (objective 097); null when left out or without a
+     * sample a day old. */
+    session_backups: number | null;
+  } | null;
+  /** The parts left out of the sum because their source cannot be read now
+   * (objective 097): ["session_backups"] without a readable status file;
+   * empty from an older server. */
+  growth_excluded: string[];
+  /** The counted parts' sum; null while any counted part is null. */
   persistent_growth_bytes_per_day: number | null;
   /** The free space over the persistent growth, rounded down; null without
    * one above 0. */
@@ -229,7 +241,11 @@ export function normalizeStorage(value: unknown): Storage | null {
       archive: optionalNumber(parts.archive),
       projects: optionalNumber(parts.projects),
       database: optionalNumber(parts.database),
+      session_backups: optionalNumber(parts.session_backups),
     },
+    growth_excluded: Array.isArray(raw.growth_excluded)
+      ? raw.growth_excluded.filter((part): part is string => typeof part === "string")
+      : [],
     persistent_growth_bytes_per_day: optionalNumber(raw.persistent_growth_bytes_per_day),
     days_left: optionalNumber(raw.days_left),
     growth_from_ms: optionalNumber(raw.growth_from_ms),
@@ -277,8 +293,13 @@ export interface StorageRow {
 export interface StorageView {
   rows: StorageRow[];
   /** "about <days> days at the growth of the archive, Claude Code's
-   * transcripts and the database"; null without days left. */
+   * transcripts, the database and the session backups" when the session
+   * backups are counted (objective 097), "... transcripts and the database"
+   * when they are not (or from an older server); null without days left. */
   lasts: string | null;
+  /** "session backups are not counted" while they are left out of the sum
+   * (their status file does not read); null otherwise. */
+  lasts_note: string | null;
   /** The local date and time the growth is first measured, while it is
    * not yet and that moment is still ahead of the sizes' read; else null. */
   measured_from: string | null;
@@ -343,6 +364,13 @@ export function storageView(value: unknown): StorageView {
     })),
   ];
   const days = storage?.days_left ?? null;
+  // Counted only when the server says so: an older server gives no part.
+  const backups =
+    storage?.growth_parts !== null &&
+    storage?.growth_parts !== undefined &&
+    "session_backups" in (object(value)?.growth_parts as object ?? {}) &&
+    !storage.growth_excluded.includes("session_backups");
+  const excluded = storage?.growth_excluded.includes("session_backups") ?? false;
   const lastsAt = storage?.persistent_from_ms ?? null;
   const lastsFrom =
     days === null && lastsAt !== null && readAt !== null && lastsAt > readAt ? localDateTime(lastsAt) : null;
@@ -351,7 +379,10 @@ export function storageView(value: unknown): StorageView {
     lasts:
       days === null
         ? null
-        : `about ${count(days)} days at the growth of the archive, Claude Code's transcripts and the database`,
+        : backups
+          ? `about ${count(days)} days at the growth of the archive, Claude Code's transcripts, the database and the session backups`
+          : `about ${count(days)} days at the growth of the archive, Claude Code's transcripts and the database`,
+    lasts_note: excluded ? "session backups are not counted" : null,
     measured_from: measuredFrom,
     lasts_from: lastsFrom,
   };
