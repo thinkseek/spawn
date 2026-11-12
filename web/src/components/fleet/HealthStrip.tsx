@@ -197,7 +197,7 @@ function BackupRows({ backups }: { backups: Backups | null }) {
   }
   const now = Date.now();
   return (
-    <ul className="mt-1.5 space-y-0.5 border-t border-border pt-1.5">
+    <ul className="mt-1.5 space-y-0.5 border-t border-surface-border pt-1.5">
       {backupView(backups, now).map((row) => (
         <li key={row.name} className="flex min-w-0 items-baseline gap-2">
           <span className="shrink-0 text-muted-foreground">{row.name}</span>
@@ -205,7 +205,7 @@ function BackupRows({ backups }: { backups: Backups | null }) {
             {backupAge(row.age_ms)}
           </span>
           <span className="ml-auto min-w-0 truncate text-right text-faint-foreground" title={row.key ?? ""}>
-            {row.age_ms === null ? "" : "ago"}
+            {row.key ?? ""}
           </span>
         </li>
       ))}
