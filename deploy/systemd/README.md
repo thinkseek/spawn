@@ -24,7 +24,7 @@ main, changes nothing live until that commit is gated and deployed.
 | `spawn-nightly@<source>` (`.timer`) | `scripts/rsi/nightly.sh <source>` from the controller: the scenarios in `rsi/scenarios/nightly/` (moved out of the gate), each judged by the gate on live `main` against itself, alone on a held host; the fact file `$SPAWN_WORKSPACE_ROOT/nightly/<source>.json` (green, red, flaky or skipped) and one `nightly_red` alert per red (below) | oneshot, daily at 02:30 + up to 10 min |
 | `spawn-nightly-stale@<source>` (`.timer`) | `scripts/rsi/nightly.sh --stale <source>`: whether the nightly covers anything (two skipped runs in a row, no fact younger than 26 h, or none though its timer fired: one `nightly_stale` alert); no run, no gate | oneshot, hourly |
 | `spawn-deploy-on-landing` (`.timer`) | `deploy/on-landing.sh` from the controller (#54): deploys what the fleet landed on the Spawn source, `deploy.sh --main` from its own checkout of main, once the store holds a gate-accepted landing of it, after a quiet spell (at the latest a max wait), never while the source is held, a deploy is pending or running, or the nightly is red (below) | oneshot, a minute after the last tick |
-| `spawn-maintenance` (`.timer`) | `scripts/maintenance.sh` from the controller: the gate's leftover scratch (`$TMPDIR/spawn-gate.XXXXXX` whose gate is gone, by the pid, start time and boot the gate recorded in it; never a running gate's, whatever its age), deploy.sh's dumps in the backups directory beyond the newest 5; nothing Spawn did not create ([docs/storage.md](../../docs/storage.md#disk-room)) | oneshot, hourly |
+| `spawn-maintenance` (`.timer`) | `scripts/maintenance.sh` from the controller: the gate's leftover scratch (`$TMPDIR/spawn-gate.XXXXXX` whose gate is gone, by the pid, start time and boot the gate recorded in it; never a running gate's, whatever its age), deploy.sh's dumps in the backups directory beyond the newest 5, and a VACUUM (ANALYZE) of the fleet's test database's own catalogs (`scripts/vacuum-catalogs.sh`, P21: refused on the live database's port or name, drops no schema); nothing Spawn did not create ([docs/storage.md](../../docs/storage.md#disk-room)) | oneshot, hourly |
 
 `spawn-loop` uses `KillMode=process` so a restart keeps the agents' tmux
 server alive. That only works because `ExecStart` is `spawn loop` itself: with
@@ -149,6 +149,7 @@ the binary and the checkout, the third is a timer to install.
 set -a; . ~/.local/share/spawn-rsi/spawn.env; set +a
 SPAWN_MAINTENANCE_DRY_RUN=1 sh ~/.local/share/spawn-rsi/controllers/spawn/scripts/maintenance.sh
 sh scripts/test-maintenance.sh                    # in a checkout; throwaway directories only
+bash scripts/test-vacuum-catalogs.sh              # in a checkout; a throwaway cluster of its own, a fake HOME
 cp deploy/systemd/spawn-maintenance.service deploy/systemd/spawn-maintenance.timer ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now spawn-maintenance.timer
