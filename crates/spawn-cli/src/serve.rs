@@ -3372,7 +3372,11 @@ mod tests {
             ));
             std::fs::create_dir_all(&dir).expect("a directory");
             let file = dir.join("core-lines.json");
-            let read = || super::core_lines::core_lines_at(store, Some(&file)).expect("the answer");
+            let nightly = dir.join("nightly");
+            let read = || {
+                super::core_lines::core_lines_at(store, Some(&file), Some(&nightly))
+                    .expect("the answer")
+            };
             let figure = |view: &Value, key: &str| {
                 view["lines"]
                     .as_array()
@@ -3395,6 +3399,16 @@ mod tests {
                 figure(&none, "performance.report_to_live")["state"],
                 json!("not_collected")
             );
+            // Objective 087: no backup record and no nightly directory, no
+            // recoverability figure.
+            for key in [
+                "recoverability.cloud_dump_age",
+                "recoverability.cloud_bundle_age",
+                "recoverability.nightly_age",
+                "recoverability.nightly_red",
+            ] {
+                assert_eq!(figure(&none, key)["value"], Value::Null, "{key}");
+            }
             // A file: its ranges, and the entries it cannot use listed.
             std::fs::write(
                 &file,

@@ -83,6 +83,10 @@ test("each unit in words, and each range form", () => {
   assert.equal(unitWords("ms", 5_400_000), "1 h 30 min");
   assert.equal(unitWords("share", 0.954), "95.4%");
   assert.equal(unitWords("usd", 8.08), "$8.08");
+  assert.equal(unitWords("ms", 1_920_000), "32 min");
+  assert.equal(unitWords("ms", 108_000_000), "30 h");
+  assert.equal(rangeWords("ms", { max: 7_200_000 }), "2 h or less");
+  assert.equal(rangeWords("ms", { max: 93_600_000 }), "26 h or less");
   assert.equal(rangeWords("count", { min: 6 }), "6 or more");
   assert.equal(rangeWords("count", { max: 200 }), "200 or less");
   assert.equal(rangeWords("count", { min: 1, max: 200 }), "between 1 and 200");
@@ -149,4 +153,36 @@ test("the performance row in words, an out-of-range north star in the warning to
     { name: "Landings that pass first time", value: "not collected yet", range: "70.0% or more", tone: "muted" },
     { name: "Dollars per landing", value: "$8.08", range: "$10.00 or less", tone: "plain" },
   ]);
+});
+
+test("the recoverability row (objective 087): the ages as spans, the reds as a count", () => {
+  const view = coreLinesView({
+    lines: [
+      {
+        line: "recoverability",
+        north_star: fig("recoverability.restores_passed", "Critical resources with a restore passed in 7 days", "count", null, null, "not_collected"),
+        guardrails: [
+          fig("recoverability.cloud_dump_age", "Age of the newest database copy", "ms", 1_920_000, { max: 7_200_000 }, "in"),
+          fig("recoverability.cloud_bundle_age", "Age of the newest bundle", "ms", 108_000_000, { max: 93_600_000 }, "out"),
+          fig("recoverability.nightly_age", "Age of the oldest nightly judging", "ms", null, { max: 93_600_000 }, "not_collected"),
+          fig("recoverability.nightly_red", "Nightly sources held red", "count", 1, { max: 0 }, "out"),
+        ],
+      },
+    ],
+    ranges_file: null,
+    ranges_error: null,
+    ignored_ranges: [],
+  });
+  const row = view.rows[0];
+  assert.equal(row.line, "Recoverability");
+  assert.equal(row.north_star.value, "not collected yet");
+  assert.deepEqual(
+    row.guardrails.map((mark) => [mark.value, mark.range, mark.tone]),
+    [
+      ["32 min", "2 h or less", "plain"],
+      ["30 h", "26 h or less", "warning"],
+      ["not collected yet", "26 h or less", "muted"],
+      ["1", "0 or less", "warning"],
+    ],
+  );
 });
