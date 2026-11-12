@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { CoreFigure, CoreLinesAnswer } from "../src/coreLines.ts";
-import { coreLinesView, rangeWords, spanWords, trendView, unitWords } from "../src/coreLines.ts";
+import { coreLinesView, rangeWords, sinceWords, spanWords, trendView, unitWords } from "../src/coreLines.ts";
 
 const GIB = 1024 ** 3;
 const MIB = 1024 ** 2;
@@ -72,6 +72,56 @@ test("the card says a broken ranges file and each range left out", () => {
   );
   assert.equal(ignoring.notice, null);
   assert.deepEqual(ignoring.ignored, ["storage.free_bites: unknown figure", "storage.test_database_schemas: needs a number min or max"]);
+  // On Home, in words, never the key and reason (lead-mac 2026-11-12 18:15).
+  assert.deepEqual(ignoring.pending, [
+    "free bites: figure not built yet",
+    "Most test schemas: range not read (it needs a number min or max)",
+  ]);
+  const leaked = coreLinesView(answer({ ignored_ranges: [{ key: "storage.leaked_test_schemas", reason: "unknown figure" }] }));
+  assert.deepEqual(leaked.pending, ["leaked test schemas: figure not built yet"]);
+});
+
+test("a byte range reads as core-lines.json wrote it", () => {
+  assert.equal(rangeWords("bytes_per_day", { max: 500_000_000 }), "500 MB a day or less");
+  assert.equal(rangeWords("bytes", { max: 500_000_000 }), "500 MB or less");
+  assert.equal(rangeWords("bytes", { min: 40_000_000_000 }), "40 GB or more");
+  assert.equal(rangeWords("bytes", { min: 1_500_000_000 }), "1.5 GB or more");
+  assert.equal(rangeWords("bytes", { min: 1_000_000, max: 500_000_000 }), "between 1 MB and 500 MB");
+  // Written in 1024s, it reads as storageSize says it (084's words).
+  assert.equal(rangeWords("bytes_per_day", { max: 512 * MIB }), "512.0 MB a day or less");
+  assert.equal(rangeWords("bytes", { min: 40 * GIB }), "40.0 GB or more");
+  assert.equal(rangeWords("bytes", { min: MIB, max: 500 * MIB }), "between 1.0 MB and 500.0 MB");
+  assert.equal(rangeWords("bytes", { max: 0 }), "0.0 MB or less");
+  // A value is still storageSize's.
+  assert.equal(unitWords("bytes", 500_000_000), "476.8 MB");
+});
+
+test("report to live while its window is not covered: measuring since, local time", () => {
+  const since = new Date(2026, 10, 12, 9, 5).getTime();
+  assert.equal(sinceWords(since), "11-12 09:05");
+  const view = coreLinesView({
+    lines: [
+      {
+        line: "performance",
+        north_star: {
+          key: "performance.report_to_live",
+          name: "Time from report to live",
+          unit: "ms",
+          value: null,
+          range: { max: 3_600_000 },
+          state: "not_collected",
+          measuring_since_ms: since,
+        },
+        guardrails: [],
+      },
+    ],
+  });
+  assert.deepEqual(view.rows[0].north_star, {
+    name: "Time from report to live",
+    value: "measuring since 11-12 09:05",
+    range: "1 h or less",
+    tone: "muted",
+  });
 });
 
 test("each unit in words, and each range form", () => {
@@ -95,8 +145,8 @@ test("each unit in words, and each range form", () => {
 });
 
 test("an answer missing its parts, or none, reads as an empty card", () => {
-  assert.deepEqual(coreLinesView(null), { rows: [], notice: null, ignored: [] });
-  assert.deepEqual(coreLinesView({}), { rows: [], notice: null, ignored: [] });
+  assert.deepEqual(coreLinesView(null), { rows: [], notice: null, ignored: [], pending: [] });
+  assert.deepEqual(coreLinesView({}), { rows: [], notice: null, ignored: [], pending: [] });
 });
 
 // Objective 086: the performance line's units.

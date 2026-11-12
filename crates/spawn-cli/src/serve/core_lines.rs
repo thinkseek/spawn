@@ -22,7 +22,10 @@
 //! `range` is the file's entry for the figure (`{min?, max?}`, numbers) or
 //! null; `state` is `in` when the value lies within it (bounds included),
 //! `out` when it does not, `no_range` without a range and `not_collected`
-//! without a value. `trend` (objective 090) is the figure's last 7 days:
+//! without a value. A figure still measuring its window carries
+//! `measuring_since_ms`, when its measure starts (only
+//! `performance.report_to_live`, below). `trend` (objective 090) is the
+//! figure's last 7 days:
 //! one `{day, value}` for each UTC day (today and the 6 before) that has a
 //! `host.core_lines` sample carrying the figure, that day's last such
 //! sample, oldest first; empty without one. The loop records those samples
@@ -34,8 +37,15 @@
 //! fleet scope over its default 7 days (report to live, the gate time's
 //! median, the share of gate time that decided nothing, first pass) and
 //! `/api/cost?window=7d`'s dollars per landing ([`performance`]), kept for a
-//! minute so a Home poll does not compute them again at every request. The
-//! storage figures are health.storage's on `/api/fleet`, read the same way
+//! minute so a Home poll does not compute them again at every request.
+//! Report to live (objective 095's (2), by hand for the owner, lead-mac
+//! 2026-11-12 18:15): the live record starts at the first `deploy.finished`
+//! of any outcome, and a landing before it reads as going live with that
+//! first deploy, so a 7-day window reaching back before it measures the
+//! record's start, not the wait (106 h on Home). Until the record covers the
+//! 7 days the figure has no value (`not_collected`, and no sample) and
+//! carries `measuring_since_ms`, the record's start (none without a
+//! record) ([`measured`]). The storage figures are health.storage's on `/api/fleet`, read the same way
 //! ([`super::storage::report`]). The recoverability guardrails (objective
 //! 087, [`recoverability`]) are the ages of the newest database copy and
 //! bundle (health.backups on `/api/fleet`), the age of the oldest nightly
@@ -69,6 +79,9 @@ pub(super) struct Figure {
     pub(super) name: &'static str,
     pub(super) unit: &'static str,
     pub(super) value: Value,
+    /// When a figure still measuring its window started measuring (null
+    /// otherwise): said as `measuring_since_ms`.
+    pub(super) measuring_since_ms: Value,
 }
 
 impl Figure {
@@ -78,6 +91,7 @@ impl Figure {
             name,
             unit,
             value,
+            measuring_since_ms: Value::Null,
         }
     }
 
@@ -242,14 +256,18 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
         (Some(value), Some(range)) if range.holds(value) => "in",
         (Some(_), Some(_)) => "out",
     };
-    json!({
+    let mut answer = json!({
         "key": figure.key,
         "name": figure.name,
         "unit": figure.unit,
         "value": figure.value,
         "range": range.map_or(Value::Null, Range::json),
         "state": state,
-    })
+    });
+    if !figure.measuring_since_ms.is_null() {
+        answer["measuring_since_ms"] = figure.measuring_since_ms.clone();
+    }
+    answer
 }
 
 /// The nightly's fact files under `<workspace root>/nightly`, as
@@ -372,9 +390,29 @@ pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
     })
 }
 
+/// The window report to live is measured over: the Scorecard's default.
+const REPORT_TO_LIVE_WINDOW_MS: i64 = 7 * DAY_MS;
+
+/// `values` with report to live held back while the live record does not
+/// cover its window: with the record starting at `first_deploy_ms` (the
+/// first `deploy.finished`; `None` without one or when it cannot be read)
+/// later than `now_ms` less the window, `report_to_live` is null and
+/// `measuring_since_ms` the record's start (null without a record). Covered,
+/// the values are as they were.
+pub(super) fn measured(mut values: Value, first_deploy_ms: Option<i64>, now_ms: i64) -> Value {
+    let covered = first_deploy_ms
+        .is_some_and(|first| first <= now_ms.saturating_sub(REPORT_TO_LIVE_WINDOW_MS));
+    if !covered {
+        values["report_to_live"] = Value::Null;
+        values["measuring_since_ms"] = first_deploy_ms.map_or(Value::Null, |first| json!(first));
+    }
+    values
+}
+
 /// The performance values, kept for [`PERFORMANCE_KEPT_MS`]: computed from
-/// the 7-day scorecard and cost window as the pages compute them. A part
-/// that cannot be read counts as not collected.
+/// the 7-day scorecard and cost window as the pages compute them, report to
+/// live held back until the live record covers the window ([`measured`]). A
+/// part that cannot be read counts as not collected.
 fn performance_now(store: &spawn_postgres::PostgresStore, now_ms: i64) -> Value {
     let mut kept = PERFORMANCE
         .lock()
@@ -395,21 +433,29 @@ fn performance_now(store: &spawn_postgres::PostgresStore, now_ms: i64) -> Value 
     let cost = crate::cost::window_of(Some("7d"))
         .and_then(|(name, length_ms)| crate::cost::window(store, name, length_ms))
         .unwrap_or(Value::Null);
-    let values = performance(&scorecard, &cost);
+    let first_deploy_ms = store.first_deploy_finished_ms().ok().flatten();
+    let database_now_ms = store.database_now_ms().unwrap_or(now_ms);
+    let values = measured(
+        performance(&scorecard, &cost),
+        first_deploy_ms,
+        database_now_ms,
+    );
     *kept = Some((now_ms, values.clone()));
     values
 }
 
 /// The performance line ([`performance`]'s values).
 fn performance_line(performance: &Value) -> Line {
+    let mut report_to_live = Figure::new(
+        "performance.report_to_live",
+        "Time from report to live",
+        "ms",
+        performance["report_to_live"].clone(),
+    );
+    report_to_live.measuring_since_ms = performance["measuring_since_ms"].clone();
     Line {
         name: "performance",
-        north_star: Figure::new(
-            "performance.report_to_live",
-            "Time from report to live",
-            "ms",
-            performance["report_to_live"].clone(),
-        ),
+        north_star: report_to_live,
         guardrails: vec![
             Figure::new(
                 "performance.gate_time",
@@ -431,7 +477,9 @@ fn performance_line(performance: &Value) -> Line {
             ),
             Figure::new(
                 "performance.usd_per_landing",
-                "Dollars per landing",
+                // The Cost page's priced dollars only: usage on a model no
+                // price names is not in it (cc-astra A11).
+                "Dollars per landing (priced use only)",
                 "usd",
                 performance["usd_per_landing"].clone(),
             ),
@@ -681,8 +729,8 @@ pub(crate) fn sample_values() -> Result<Map<String, Value>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Figure, answer, figure_json, lines, nightly_facts, parse_ranges, performance, read_ranges,
-        recoverability,
+        Figure, answer, figure_json, lines, measured, nightly_facts, parse_ranges, performance,
+        read_ranges, recoverability,
     };
     use serde_json::{Value, json};
 
@@ -904,6 +952,59 @@ mod tests {
         );
         // Neither answer read: every value null.
         assert_eq!(performance(&Value::Null, &Value::Null), none);
+        assert_eq!(
+            lines(&json!({}), &values, Vec::new())[0].guardrails[3].name,
+            "Dollars per landing (priced use only)",
+            "the Cost page's priced dollars only (cc-astra A11)"
+        );
+    }
+
+    /// Objective 095's (2), by hand: report to live is held back, measuring
+    /// since the first deploy record, until that record covers the 7 days.
+    #[test]
+    fn report_to_live_waits_until_the_live_record_covers_the_window() {
+        const DAY: i64 = 86_400_000;
+        let now = 100 * DAY;
+        let values = json!({"report_to_live": 383_820_000, "gate_time": 840_000});
+        // The record began 2 days ago: no value, measuring since then.
+        let young = measured(values.clone(), Some(now - 2 * DAY), now);
+        assert_eq!(young["report_to_live"], Value::Null);
+        assert_eq!(young["measuring_since_ms"], json!(now - 2 * DAY));
+        assert_eq!(
+            young["gate_time"],
+            json!(840_000),
+            "the guardrails are untouched"
+        );
+        let line = &lines(&json!({}), &young, Vec::new())[0];
+        assert_eq!(
+            figure_json(&line.north_star, None),
+            json!({"key": "performance.report_to_live", "name": "Time from report to live",
+                   "unit": "ms", "value": null, "range": null, "state": "not_collected",
+                   "measuring_since_ms": now - 2 * DAY})
+        );
+        assert!(
+            !super::values_of(std::slice::from_ref(line))
+                .contains_key("performance.report_to_live"),
+            "no sample of it while measuring"
+        );
+        // Just short of 7 days: still measuring.
+        let short = measured(values.clone(), Some(now - 7 * DAY + 1), now);
+        assert_eq!(short["report_to_live"], Value::Null);
+        // No deploy record at all: no value and no start.
+        let none = measured(values.clone(), None, now);
+        assert_eq!(none["report_to_live"], Value::Null);
+        assert_eq!(none["measuring_since_ms"], Value::Null);
+        let star = &lines(&json!({}), &none, Vec::new())[0].north_star;
+        assert!(figure_json(star, None).get("measuring_since_ms").is_none());
+        // Covered (exactly 7 days, and more): the Scorecard's value, no start.
+        for first in [now - 7 * DAY, now - 30 * DAY] {
+            let covered = measured(values.clone(), Some(first), now);
+            assert_eq!(covered, values, "covered from {first}");
+            let star = &lines(&json!({}), &covered, Vec::new())[0].north_star;
+            let shown = figure_json(star, None);
+            assert_eq!(shown["value"], json!(383_820_000));
+            assert!(shown.get("measuring_since_ms").is_none());
+        }
     }
 
     fn values(figures: &[Figure]) -> Vec<(&'static str, Value)> {
