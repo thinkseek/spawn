@@ -174,7 +174,9 @@ pub(crate) fn persistent_growth(parts: &Value, excluded: &[&str]) -> Option<i64>
     PARTS
         .iter()
         .filter(|(part, _)| !excluded.contains(part))
-        .try_fold(0_i64, |sum, (part, _)| sum.checked_add(parts[*part].as_i64()?))
+        .try_fold(0_i64, |sum, (part, _)| {
+            sum.checked_add(parts[*part].as_i64()?)
+        })
 }
 
 /// The moment the archive's growth is first measured (objective 083): the
@@ -479,7 +481,10 @@ mod tests {
             parts,
             json!({"archive": mib, "projects": mib / 4, "database": 4 * mib})
         );
-        assert_eq!(persistent_growth(&parts, BACKUPS_LEFT_OUT), Some(mib + mib / 4 + 4 * mib));
+        assert_eq!(
+            persistent_growth(&parts, BACKUPS_LEFT_OUT),
+            Some(mib + mib / 4 + 4 * mib)
+        );
         // Without a sample carrying the database's size (only the old
         // shape in the window): its part is null, and so is the sum.
         let young = json!({"archive_bytes": old_shape, "projects_bytes": old_shape,
@@ -496,7 +501,10 @@ mod tests {
         // A shrinking database (a vacuum) counts against the rest.
         let parts = growth_parts(Some(12 * MIB), MIB, Some(96 * MIB), &carrying, now);
         assert_eq!(parts["database"], -2 * mib);
-        assert_eq!(persistent_growth(&parts, BACKUPS_LEFT_OUT), Some(mib + mib / 4 - 2 * mib));
+        assert_eq!(
+            persistent_growth(&parts, BACKUPS_LEFT_OUT),
+            Some(mib + mib / 4 - 2 * mib)
+        );
         // Days left over a sum at or below 0: none.
         let figures = with_free(
             json!({"persistent_growth_bytes_per_day": persistent_growth(&parts, BACKUPS_LEFT_OUT)}),
@@ -536,8 +544,14 @@ mod tests {
         );
         let root = scratch("session_backups");
         let projects = scratch("session_backups_projects");
-        file(&root.join(".transcripts/agent_a/a1.jsonl"), usize::try_from(12 * MIB).expect("fits"));
-        file(&projects.join("p/s.jsonl"), usize::try_from(MIB).expect("fits"));
+        file(
+            &root.join(".transcripts/agent_a/a1.jsonl"),
+            usize::try_from(12 * MIB).expect("fits"),
+        );
+        file(
+            &projects.join("p/s.jsonl"),
+            usize::try_from(MIB).expect("fits"),
+        );
         let status = root.join("status.json");
         let without = root.join("without.json");
         std::fs::write(&status, r#"{"at": 1, "estimated_bytes": 41943040}"#).expect("status");
@@ -554,7 +568,10 @@ mod tests {
         std::fs::remove_dir_all(&projects).expect("clean up");
         let database = json!({"bytes": 108 * MIB});
 
-        let figures = with_free(sizes(now, &counted, &samples, &database, &json!([])), Some(70 * MIB));
+        let figures = with_free(
+            sizes(now, &counted, &samples, &database, &json!([])),
+            Some(70 * MIB),
+        );
         assert_eq!(
             figures["growth_parts"],
             json!({"archive": mib, "projects": mib / 4, "database": 4 * mib,
@@ -565,12 +582,30 @@ mod tests {
         assert_eq!(figures["persistent_growth_bytes_per_day"], four);
         assert_eq!(figures["days_left"], 70 * mib / four);
 
-        for (walked, why) in [(&none, "no file named"), (&absent, "no file there"), (&unnumbered, "no number")] {
-            let figures = with_free(sizes(now, walked, &samples, &database, &json!([])), Some(70 * MIB));
-            assert_eq!(figures["growth_parts"]["session_backups"], Value::Null, "{why}");
-            assert_eq!(figures["growth_excluded"], json!(["session_backups"]), "{why}");
+        for (walked, why) in [
+            (&none, "no file named"),
+            (&absent, "no file there"),
+            (&unnumbered, "no number"),
+        ] {
+            let figures = with_free(
+                sizes(now, walked, &samples, &database, &json!([])),
+                Some(70 * MIB),
+            );
+            assert_eq!(
+                figures["growth_parts"]["session_backups"],
+                Value::Null,
+                "{why}"
+            );
+            assert_eq!(
+                figures["growth_excluded"],
+                json!(["session_backups"]),
+                "{why}"
+            );
             let three = mib + mib / 4 + 4 * mib;
-            assert_eq!(figures["persistent_growth_bytes_per_day"], three, "{why}: the other three");
+            assert_eq!(
+                figures["persistent_growth_bytes_per_day"], three,
+                "{why}: the other three"
+            );
             assert_eq!(figures["days_left"], 70 * mib / three, "{why}");
         }
         assert_eq!(growth_excluded(Some(0)), Vec::<&str>::new());
@@ -653,7 +688,10 @@ mod tests {
             Some(now - 10 * 3_600_000 + DAY_MS)
         );
         let first = json!({"archive_bytes": young, "projects_bytes": old, "database_bytes": old});
-        assert_eq!(persistent_from(&first, BACKUPS_LEFT_OUT), Some(now - 10 * 3_600_000 + DAY_MS));
+        assert_eq!(
+            persistent_from(&first, BACKUPS_LEFT_OUT),
+            Some(now - 10 * 3_600_000 + DAY_MS)
+        );
         let samples = json!({"oldest": old, "carrying": carrying, "before": null});
         let pending = with_free(
             sizes(now, &walked, &samples, &json!({"bytes": 900}), &json!([])),

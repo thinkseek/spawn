@@ -378,10 +378,18 @@ pub(crate) mod tests {
             r#"{"at": 1, "accounts": [], "estimated_bytes": 41943040, "free_bytes": 1}"#,
         )
         .expect("the status file");
-        std::fs::write(&without, r#"{"at": 1, "accounts": [], "estimated": "40 MiB"}"#)
-            .expect("a status file without the number");
+        std::fs::write(
+            &without,
+            r#"{"at": 1, "accounts": [], "estimated": "40 MiB"}"#,
+        )
+        .expect("a status file without the number");
         let mut written = Vec::new();
-        for path in [Some(status), None, Some(root.join("none.json")), Some(without)] {
+        for path in [
+            Some(status),
+            None,
+            Some(root.join("none.json")),
+            Some(without),
+        ] {
             let mut sampler = Sampler::with(Some(&root), projects.clone()).with_status(path);
             sampler
                 .check_with(
@@ -397,8 +405,15 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&root).expect("clean up");
         assert_eq!(written.len(), 4, "every sample is written");
         assert_eq!(written[0]["session_backup_bytes"], 41_943_040);
-        for (sample, why) in written[1..].iter().zip(["no file named", "no file there", "no number"]) {
-            assert!(sample.get("session_backup_bytes").is_none(), "{why}: {sample}");
+        for (sample, why) in
+            written[1..]
+                .iter()
+                .zip(["no file named", "no file there", "no number"])
+        {
+            assert!(
+                sample.get("session_backup_bytes").is_none(),
+                "{why}: {sample}"
+            );
             assert_eq!(sample["archive_bytes"], 100, "{why}");
         }
     }
