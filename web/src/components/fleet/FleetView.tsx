@@ -18,6 +18,7 @@ import { AgentDetail } from "./AgentDetail";
 import { AlwaysOnAgents, uptimeMs } from "./AlwaysOnAgents";
 import { FleetBoard } from "./FleetBoard";
 import { InputBox } from "./InputBox";
+import { CoreLinesCard } from "../home/CoreLines";
 import { InterventionsCard } from "./Interventions";
 import { HealthStrip } from "./HealthStrip";
 import type { Liveness } from "./HealthStrip";
@@ -161,6 +162,7 @@ export function FleetView({
               back={away?.at ?? null}
             />
             <InterventionsCard />
+            <CoreLinesCard />
             <button
               type="button"
               onClick={() => setDetailsOpen((value) => !value)}
