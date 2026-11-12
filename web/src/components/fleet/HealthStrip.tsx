@@ -242,6 +242,11 @@ export function StorageCard({ storage, backups = null }: { storage: Storage | nu
             >
               {row.note}
             </span>
+            {row.measured_from !== null && row.note !== `measured from ${row.measured_from}` && (
+              <span className="tnum shrink-0 text-faint-foreground" title="when this line's own growth is first measured">
+                measured from {row.measured_from}
+              </span>
+            )}
           </li>
         ))}
       </ul>

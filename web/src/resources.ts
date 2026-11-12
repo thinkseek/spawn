@@ -345,6 +345,13 @@ export function storageView(value: unknown): StorageView {
   const logBytes = storage?.database?.log_bytes ?? null;
   const tests = shownTestDatabases(storage?.test_databases ?? []);
   const count = (n: number) => n.toLocaleString("en-US");
+  // Each grower's own date (objective 098): its moment while its growth is
+  // null and the moment is still ahead of the sizes' read.
+  const lineFrom = (part: "archive" | "projects" | "database"): string | null => {
+    const at = storage?.growth_from_parts?.[part] ?? null;
+    const grows = storage?.growth_parts?.[part] ?? null;
+    return grows === null && at !== null && readAt !== null && at > readAt ? localDateTime(at) : null;
+  };
   const rows: StorageRow[] = [
     {
       name: "Transcript archive",
@@ -355,6 +362,7 @@ export function storageView(value: unknown): StorageView {
           : measuredFrom !== null
             ? `measured from ${measuredFrom}`
             : "not measured yet",
+      measured_from: lineFrom("archive"),
     },
     {
       name: "Claude Code transcripts",
@@ -363,8 +371,9 @@ export function storageView(value: unknown): StorageView {
         files === null
           ? ""
           : `${count(files)} files${before !== null && before > files ? `, down from ${count(before)}` : ""}`,
+      measured_from: lineFrom("projects"),
     },
-    { name: "Workspaces", size: storageSize(storage?.workspaces?.bytes), note: "" },
+    { name: "Workspaces", size: storageSize(storage?.workspaces?.bytes), note: "", measured_from: null },
     {
       name: "Database",
       size: storageSize(storage?.database?.bytes),
@@ -374,11 +383,13 @@ export function storageView(value: unknown): StorageView {
       ]
         .filter((part) => part !== null)
         .join(", "),
+      measured_from: lineFrom("database"),
     },
     ...tests.map((database) => ({
       name: TEST_DATABASE_NAMES[database.role] ?? `Test database (${database.role})`,
       size: storageSize(database.bytes),
       note: database.schemas === null ? "unreadable" : `${count(database.schemas)} ${database.schemas === 1 ? "schema" : "schemas"}`,
+      measured_from: null,
     })),
   ];
   const days = storage?.days_left ?? null;
