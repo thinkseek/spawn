@@ -675,17 +675,32 @@ pub(crate) struct PlanCounts {
     /// file's new bytes, a whole file's all (a segment already in the
     /// bucket is not sent again, so put may send less).
     pub(crate) send: u64,
-    /// By top directory (a path's first two components): files, bytes,
-    /// bytes to send.
-    pub(crate) by_top: BTreeMap<String, (u64, u64, u64)>,
+    /// By group ([`group`]: the agent, or the sessions' root and project
+    /// directory): files, bytes, bytes to send.
+    pub(crate) by_group: BTreeMap<String, (u64, u64, u64)>,
     /// Every selected path and its size, in order.
     pub(crate) listed: Vec<(String, u64)>,
 }
 
-/// A path's first two components (`projects/<dir>`, `agent_x/<file>`; a
-/// file at the top is itself).
-pub(crate) fn top(path: &str) -> String {
-    path.splitn(3, '/').take(2).collect::<Vec<_>>().join("/")
+/// The group a plan counts a path in, never a file's name (the lead's
+/// ruling on rev-g N2: a plan's printed lines are posted and read, so they
+/// name directories only; the file names are in `--list` alone): the first
+/// directory of a transcript (its agent), the first two directories of a
+/// session file (`projects/<project>`, `file-history/<session>`), fewer
+/// when the file is higher up; a file at the area's top is `(top)`, but for
+/// the sessions' `history.jsonl`, a fixed name of the area.
+pub(crate) fn group(area: &str, path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').collect();
+    let directories = &parts[..parts.len() - 1];
+    let depth = if area == "transcripts" { 1 } else { 2 };
+    if directories.is_empty() {
+        return if area == "sessions" && path == "history.jsonl" {
+            path.to_string()
+        } else {
+            "(top)".to_string()
+        };
+    }
+    directories[..depth.min(directories.len())].join("/")
 }
 
 /// How `put` takes `source` against its entry in the last manifest
@@ -780,7 +795,10 @@ impl<B: Reader> Store<'_, B> {
             counts.files += 1;
             counts.bytes += source.size;
             counts.send += send;
-            let at = counts.by_top.entry(top(&source.path)).or_default();
+            let at = counts
+                .by_group
+                .entry(group(&self.keys.area, &source.path))
+                .or_default();
             at.0 += 1;
             at.1 += source.size;
             at.2 += send;
@@ -1345,8 +1363,8 @@ is not sent again)",
 }
 
 /// `plan`: what `put` would upload now, uploading nothing (lead-mac's go,
-/// 2026-11-13, step 1). The same selection (`sources`, with the lines put
-/// says about skipped entries) and the same comparison with the newest
+/// 2026-11-13, step 1). The same selection (`sources`; the entries put
+/// would skip are counted by why, not named) and the same comparison with the newest
 /// manifest (LIST and GET), over a bucket that cannot write ([`ReadOnly`]):
 /// no PUT is reachable, no manifest is made, no `backup.stored` recorded,
 /// no lock taken. `may_write` is not consulted: it guards writes, and a
@@ -1370,27 +1388,56 @@ fn plan_verb<R: Reader>(
     let from = from_dir(settings, flags, area);
     let mut said = Vec::new();
     let sources = sources(area, &from, &mut said)?;
-    for line in &said {
-        println!("store plan {area}: {line}");
-    }
     let counts = store.plan(&sources)?;
     let bucket = match kind(&settings.r2.bucket) {
         Kind::Keep => "keep",
         Kind::Work => "work",
         Kind::Other => "other",
     };
-    println!(
-        "store plan {area}: the {bucket} bucket, prefix {:?}; nothing is sent",
-        settings.prefix
-    );
-    println!("store plan {area}: {}", plan_summary(&counts));
-    for (top, (files, bytes, send)) in &counts.by_top {
-        println!("store plan {area}: {top}: {files} file(s), {bytes} bytes, {send} to send");
+    for line in plan_lines(area, bucket, &settings.prefix, &said, &counts) {
+        println!("{line}");
     }
     if let Some(file) = list.as_mut() {
         write_list(file, &counts.listed)?;
     }
     Ok(0)
+}
+
+/// What `plan` prints: a summary that names no file (the lead's ruling:
+/// it is posted and read). The entries put would skip, counted by why
+/// (put's own lines name them); the bucket by kind and prefix; the totals;
+/// a line per group ([`group`]) with its files, bytes and bytes to send.
+pub(crate) fn plan_lines(
+    area: &str,
+    bucket: &str,
+    prefix: &str,
+    said: &[String],
+    counts: &PlanCounts,
+) -> Vec<String> {
+    let mut skipped: BTreeMap<&str, u64> = BTreeMap::new();
+    for line in said {
+        let why = line
+            .rfind(" (")
+            .and_then(|at| line[at + 2..].strip_suffix(')'))
+            .unwrap_or("other");
+        *skipped.entry(why).or_default() += 1;
+    }
+    let mut lines: Vec<String> = skipped
+        .into_iter()
+        .map(|(why, count)| {
+            format!("store plan {area}: {count} entry(ies) skipped as put skips them ({why})")
+        })
+        .collect();
+    lines.push(format!(
+        "store plan {area}: the {bucket} bucket, prefix {prefix:?}; nothing is sent"
+    ));
+    lines.push(format!("store plan {area}: {}", plan_summary(counts)));
+    for (group, (files, bytes, send)) in &counts.by_group {
+        lines.push(format!(
+            "store plan {area}: {group}: {files} file(s), {bytes} bytes, {send} to send"
+        ));
+    }
+    lines
 }
 
 /// `--list`'s file: new, mode 0600, `O_CREAT | O_EXCL` (any entry at the

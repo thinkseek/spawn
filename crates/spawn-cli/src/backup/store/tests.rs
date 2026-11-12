@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     Bucket, Entry, Head, Keys, Listed, Plan, Put, Reader, Source, Store, Verified, create_list,
-    hmac_sha256, may_write, plan, plan_summary, put_summary, random_hex, ranges, restore,
-    restore_with, sources, store_r2, top, write_list,
+    group, hmac_sha256, may_write, plan, plan_lines, plan_summary, put_summary, random_hex, ranges,
+    restore, restore_with, sources, store_r2, write_list,
 };
 use crate::backup::{hex, md5_hex};
 
@@ -1238,8 +1238,9 @@ fn a_plan_says_what_a_put_would_send_and_sends_nothing() {
     );
     assert_eq!(counts.bytes, 10 + 3 + 5 + 7);
     assert_eq!(counts.send, 5 + 3 + 7, "a's new bytes, b and d whole");
-    assert_eq!(counts.by_top["agent_x/a.jsonl"], (1, 10, 5));
-    assert_eq!(counts.by_top["agent_y/c.jsonl"], (1, 5, 0));
+    assert_eq!(counts.by_group["agent_x"], (2, 13, 8));
+    assert_eq!(counts.by_group["agent_y"], (2, 12, 7));
+    assert_eq!(counts.by_group.len(), 2);
     assert_eq!(
         counts.listed,
         [
@@ -1255,13 +1256,83 @@ fn a_plan_says_what_a_put_would_send_and_sends_nothing() {
     fs::remove_dir_all(&work).expect("clean up");
 }
 
-/// A path's top directory: its first two components.
+/// A plan's group names directories, never a file: a transcript's agent;
+/// a session file's root and project (or session) directory, fewer when it
+/// is higher up; `history.jsonl` by its fixed name; any other file at the
+/// top as `(top)`.
 #[test]
-fn a_paths_top_is_its_first_two_components() {
-    assert_eq!(top("projects/-home-x/s.jsonl"), "projects/-home-x");
-    assert_eq!(top("projects/-home-x/sub/t.jsonl"), "projects/-home-x");
-    assert_eq!(top("history.jsonl"), "history.jsonl");
-    assert_eq!(top("agent_x/a.jsonl"), "agent_x/a.jsonl");
+fn a_plans_group_is_a_directory_never_a_file() {
+    assert_eq!(group("transcripts", "agent_x/a.jsonl"), "agent_x");
+    assert_eq!(group("transcripts", "agent_x/sub/a.jsonl"), "agent_x");
+    assert_eq!(group("transcripts", "loose.jsonl"), "(top)");
+    assert_eq!(
+        group("sessions", "projects/-home-x/s.jsonl"),
+        "projects/-home-x"
+    );
+    assert_eq!(
+        group("sessions", "projects/-home-x/sub/t.jsonl"),
+        "projects/-home-x"
+    );
+    assert_eq!(group("sessions", "file-history/u1/h@v1"), "file-history/u1");
+    assert_eq!(group("sessions", "projects/x.jsonl"), "projects");
+    assert_eq!(group("sessions", "history.jsonl"), "history.jsonl");
+    assert_eq!(group("sessions", "other.jsonl"), "(top)");
+}
+
+/// The lead's ruling: what a plan prints names no file, and its groups'
+/// counts add up to the `--list` file's lines (every file name is there
+/// alone). A symlink put would skip is counted by why, not named.
+#[test]
+fn a_plans_lines_name_no_file_and_add_up_to_its_list() {
+    let dir = scratch("plan-lines");
+    let work = scratch("plan-lines-work");
+    let bucket = Memory::default();
+    for (agent, name, text) in [
+        ("agent_x", "secret-a.jsonl", &b"aaaa\n"[..]),
+        ("agent_x", "secret-b.jsonl", b"bb\n"),
+        ("agent_y", "secret-c.jsonl", b"c\n"),
+    ] {
+        fs::create_dir_all(dir.join(agent)).expect("agent");
+        fs::write(dir.join(agent).join(name), text).expect("file");
+    }
+    std::os::unix::fs::symlink(
+        dir.join("agent_y/secret-c.jsonl"),
+        dir.join("agent_y/secret-link"),
+    )
+    .expect("link");
+    let mut said = Vec::new();
+    let selected = sources("transcripts", &dir, &mut said).expect("sources");
+    assert_eq!(said.len(), 1, "{said:?}");
+    let refusing = Refusing(&bucket);
+    let counts = planner(&refusing, &work).plan(&selected).expect("the plan");
+    let lines = plan_lines("transcripts", "work", "locktest/t/", &said, &counts);
+    for line in &lines {
+        assert!(!line.contains("secret"), "a file named: {line}");
+    }
+    assert!(
+        lines.iter().any(|line| line
+            == "store plan transcripts: 1 entry(ies) skipped as put skips them (a symlink)"),
+        "{lines:?}"
+    );
+    let at = work.join("list.txt");
+    let mut file = create_list(&at).expect("new");
+    write_list(&mut file, &counts.listed).expect("written");
+    let listed = fs::read_to_string(&at).expect("the list").lines().count() as u64;
+    let grouped: u64 = lines
+        .iter()
+        .filter_map(|line| line.strip_suffix(" to send"))
+        .filter_map(|line| line.rsplit(": ").next())
+        .filter_map(|counted| counted.split(' ').next()?.parse::<u64>().ok())
+        .sum();
+    assert_eq!((grouped, listed), (3, 3), "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("store plan transcripts: 3 file(s): ")),
+        "{lines:?}"
+    );
+    fs::remove_dir_all(&dir).expect("clean up");
+    fs::remove_dir_all(&work).expect("clean up");
 }
 
 /// A plan and the put after it, nothing changed between them, agree on the
