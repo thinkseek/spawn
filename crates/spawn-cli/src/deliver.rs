@@ -2998,7 +2998,7 @@ mod tests {
             "the waiting task goes to its worker: {plan:?}"
         );
         let resumes = |work: &Work, facts: &Facts| {
-            orders(work, &[facts.clone()], 8_000)
+            super::orders(work, &[facts.clone()], 8_000)
                 .into_iter()
                 .filter(|order| order.session_id == "session_resident_core")
                 .count()
