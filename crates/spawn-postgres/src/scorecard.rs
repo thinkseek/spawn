@@ -148,4 +148,17 @@ impl PostgresStore {
     pub fn scorecard_facts(&self, until_ms: i64) -> Result<Value, StoreError> {
         self.query_json(FACTS, &[&until_ms])
     }
+
+    /// When the live record starts: the first `deploy.finished` of any
+    /// outcome (objective 095's record start), or `None` without one.
+    pub fn first_deploy_finished_ms(&self) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .query_one(
+                "select min(e.recorded_at_ms) from spawn_events e
+                  where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                    and e.kind -> 'detail' -> 'record' ->> 'type' = 'deploy.finished'",
+                &[],
+            )?
+            .get(0))
+    }
 }

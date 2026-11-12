@@ -665,3 +665,36 @@ fn the_facts_carry_reports_and_deploys() {
     assert_eq!(deploys[1]["ok"], true);
     assert_eq!(deploys[1]["at"], 3000);
 }
+
+/// The live record's start (objective 095's (2), the Core lines hand fix):
+/// the first `deploy.finished` of any outcome, a failed one too; none
+/// without one, and other records are not it.
+#[test]
+fn the_live_record_starts_at_the_first_deploy_of_any_outcome() {
+    let (store, schema) = store("scorecard_first_deploy");
+    let mut client = admin(&schema);
+    assert_eq!(store.first_deploy_finished_ms().expect("read"), None);
+    record(
+        &mut client,
+        1000,
+        &json!({"type": "task.reported", "id": 4, "commit": "c"}),
+    );
+    assert_eq!(
+        store.first_deploy_finished_ms().expect("read"),
+        None,
+        "a report is no deploy"
+    );
+    for (at, ok) in [(5000, true), (2000, false), (3000, true)] {
+        record(
+            &mut client,
+            at,
+            &json!({"type": "deploy.finished", "ok": ok, "head": "h", "by": "landing",
+                   "reason": ""}),
+        );
+    }
+    assert_eq!(
+        store.first_deploy_finished_ms().expect("read"),
+        Some(2000),
+        "the earliest, a failed deploy too"
+    );
+}
