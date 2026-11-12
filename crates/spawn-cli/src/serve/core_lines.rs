@@ -394,6 +394,13 @@ pub(crate) struct Parts {
     /// Human interventions per agent-hour, the Home card's 24 h answer
     /// (`/api/interventions`, objective 100).
     pub(crate) health: Option<Duration>,
+    /// The wait for the kept performance figures' lock, behind another
+    /// reader computing them (cc-astra A35).
+    pub(crate) lock_wait: Option<Duration>,
+    /// Whether the performance figures were `measured` by this reading or
+    /// `kept` from another's within the minute (cc-astra A35): a kept one
+    /// times neither archive nor cost.
+    pub(crate) performance: Option<&'static str>,
 }
 
 impl Parts {
@@ -408,6 +415,7 @@ impl Parts {
             self.cost,
             self.storage,
             self.health,
+            self.lock_wait,
         ]
         .into_iter()
         .flatten()
@@ -415,20 +423,23 @@ impl Parts {
     }
 
     /// `open_ms=<n|none> trends_ms=… facts_ms=… archive_ms=… cost_ms=…
-    /// storage_ms=… health_ms=…`.
+    /// storage_ms=… health_ms=… lock_wait_ms=… performance=<measured|kept|none>`.
     pub(crate) fn text(&self) -> String {
         let ms = |part: Option<Duration>| {
             part.map_or_else(|| "none".to_string(), |took| took.as_millis().to_string())
         };
         format!(
-            "open_ms={} trends_ms={} facts_ms={} archive_ms={} cost_ms={} storage_ms={} health_ms={}",
+            "open_ms={} trends_ms={} facts_ms={} archive_ms={} cost_ms={} storage_ms={} \
+health_ms={} lock_wait_ms={} performance={}",
             ms(self.open),
             ms(self.trends),
             ms(self.facts),
             ms(self.archive),
             ms(self.cost),
             ms(self.storage),
-            ms(self.health)
+            ms(self.health),
+            ms(self.lock_wait),
+            self.performance.unwrap_or("none")
         )
     }
 }

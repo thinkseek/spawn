@@ -576,6 +576,30 @@ fn plan_values(plan: &Value, key: &str, out: &mut Vec<Value>) {
     }
 }
 
+/// Each scan of spawn_events in a plan: its index (or a sequential scan),
+/// its rows with what its filter removed, and its loops; for a message.
+fn event_scans(plan: &Value) -> Vec<String> {
+    let mut scans = Vec::new();
+    let mut all = vec![plan.clone()];
+    while let Some(node) = all.pop() {
+        if node["Relation Name"] == "spawn_events" {
+            scans.push(format!(
+                "{} {} rows+{} removed x{}",
+                node["Index Name"].as_str().unwrap_or("seq"),
+                node["Actual Rows"],
+                node["Rows Removed by Filter"].as_i64().unwrap_or(0),
+                node["Actual Loops"]
+            ));
+        }
+        match node {
+            Value::Object(map) => all.extend(map.into_iter().map(|(_, value)| value)),
+            Value::Array(list) => all.extend(list),
+            _ => {}
+        }
+    }
+    scans
+}
+
 /// The rows the plan read from spawn_events: each scan's rows and the rows
 /// its filter removed, times its loops.
 fn events_read(plan: &Value) -> i64 {
@@ -932,5 +956,534 @@ fn a_partial_reconfigure_keeps_a_missions_owner_work_as_its_fold_has_it() {
         vec![(1, false), (2, false), (3, true), (4, true), (5, false)],
         "a configure that names only accept, a budget or the workers keeps the backlog; \
          an explicit null clears it; a mission configured with none is owner work"
+    );
+}
+
+/// One control record at `at_ms`, written straight into the log.
+fn record_ms(client: &mut Client, at_ms: i64, record: &Value) {
+    client
+        .execute(
+            "insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id,
+                                       kind, session_seq, recorded_at_ms)
+             values ('agent_control', 'session_control', null, 'control', null,
+                     jsonb_build_object('name', 'control.recorded',
+                                        'detail', jsonb_build_object('record', $1::jsonb)),
+                     (select coalesce(max(session_seq), 0) + 1 from spawn_events
+                       where session_id = 'session_control'),
+                     $2)",
+            &[record, &at_ms],
+        )
+        .expect("write a control record");
+}
+
+/// The rows of `from` (a relation with `$1`, `$2` its window), every
+/// column, in one order, as text.
+fn intervention_rows(client: &mut Client, from: &str, since: i64, until: i64) -> String {
+    client
+        .query_one(
+            &format!(
+                "select coalesce(string_agg(row, ' ' order by row), '') from (
+                   select concat_ws(',', v.at_ms, v.kind, coalesce(v.mission_id::text, '-'),
+                                    coalesce(v.task_id::text, '-'),
+                                    coalesce(v.command_id::text, '-'),
+                                    coalesce(v.cancelled_task_id::text, '-')) as row
+                     from {from} v) t"
+            ),
+            &[&since, &until],
+        )
+        .expect("the interventions")
+        .get(0)
+}
+
+/// spawn_interventions as it was before it read from the window outward
+/// (d61e85eb), word for word: the oracle the view's answers are compared
+/// with.
+const ORACLE: &str = r"
+create view spawn_interventions_oracle as
+select i.at_ms, 'command'::text as kind, null::bigint as mission_id,
+       null::bigint as task_id, i.intent as command_id, null::bigint as cancelled_task_id
+from spawn_human_intents i
+union all
+select r.at_ms, 'resume', spawn_experience_int(r.record -> 'id'), null, null, null
+from spawn_experience_records r
+where r.type = 'mission.resumed' and spawn_experience_int(r.record -> 'id') is not null
+union all
+select a.assigned_at_ms, 'owner_task', a.mission_id, a.task_id, null, null
+from spawn_experience_assignments a
+where a.type = 'task.assigned' and a.created_by = 'human'
+  and coalesce((select s.review from spawn_experience_settings s
+                 where s.mission_id = a.mission_id and s.seq < a.seq
+                 order by s.seq desc limit 1), true)
+union all
+select n.assigned_at_ms, 'cancel_reassign', t.mission_id, n.task_id, null, t.task_id
+from spawn_task_spans t
+join spawn_experience_records x on x.seq = t.closed_seq
+cross join lateral (
+    select r.at_ms as assigned_at_ms,
+           spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')) as task_id
+      from spawn_experience_records r
+     where r.type = 'task.assigned' and r.seq > t.closed_seq
+       and spawn_experience_int(coalesce(r.record -> 'mission_id', r.record -> 'row' -> 'mission_id'))
+           = t.mission_id
+       and spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')) is not null
+       and case when t.objective is not null
+                then spawn_experience_int(coalesce(r.record -> 'objective', r.record -> 'row' -> 'objective'))
+                     = t.objective
+                else t.brief is not null
+                     and coalesce(r.record ->> 'brief', r.record -> 'row' ->> 'brief') = t.brief end
+     order by r.seq
+     limit 1
+) n
+where t.outcome = 'cancelled'
+  and (jsonb_typeof(x.record -> 'by') is distinct from 'string' or x.record ->> 'by' = 'human');";
+
+/// The window `[$1, $2)` of the view, as a reader asks it.
+const WINDOWED: &str = "(select * from spawn_interventions where at_ms >= $1 and at_ms < $2)";
+
+/// The oracle's rows of `[since, until)` against the view's.
+fn same_as_the_view(client: &mut Client, since: i64, until: i64, what: &str) {
+    let oracle = intervention_rows(
+        client,
+        "(select * from spawn_interventions_oracle where at_ms >= $1 and at_ms < $2)",
+        since,
+        until,
+    );
+    let read = intervention_rows(client, WINDOWED, since, until);
+    assert_eq!(read, oracle, "{what}: [{since}, {until})");
+}
+
+/// The oracle beside the view, in the case's schema.
+fn with_oracle(client: &mut Client) {
+    client.batch_execute(ORACLE).expect("the oracle view");
+}
+
+/// A small deterministic generator (no crate for it): the same stream for
+/// the same seed.
+struct Lcg(u64);
+
+impl Lcg {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (self.0 >> 33) % n
+    }
+
+    fn pick<'a, T>(&mut self, from: &'a [T]) -> &'a T {
+        &from[usize::try_from(self.below(from.len() as u64)).unwrap_or(0)]
+    }
+}
+
+/// A record that closes task `id`, one of every way (or none).
+fn random_closing(random: &mut Lcg, id: i64) -> Value {
+    match random.below(8) {
+        0 => json!({"type": "task.cancelled", "id": id, "by": "human"}),
+        1 => json!({"type": "task.cancelled", "id": id, "by": "spawn-integrate"}),
+        2 => json!({"type": "task.cancelled", "id": id, "by": 7}),
+        3 => json!({"type": "task.cancelled", "id": id}),
+        4 => json!({"type": "task.landed", "id": id, "from": "a", "to": "b"}),
+        5 => json!({"type": "task.aborted", "id": id, "reason": "x"}),
+        6 => json!({"type": "task.over_budget", "id": id, "reason": "x"}),
+        _ => json!({"type": "task.reviewed", "id": id,
+                    "accepted": random.pick(&[json!(true), json!(false), json!("t")])}),
+    }
+}
+
+/// A person's command at `at`, taken or failed.
+fn random_command(client: &mut Client, random: &mut Lcg, key: &str, at: i64) {
+    let principal = *random.pick(&["human", "spawn"]);
+    let text = *random.pick(&["a", "b"]);
+    command(
+        client,
+        principal,
+        key,
+        "session_x",
+        &json!({"type": "input", "text": text}),
+        0,
+    );
+    client
+        .execute(
+            "update spawn_commands set created_at_ms = $1::bigint, finished_at_ms = $1::bigint + 1000,
+                    succeeded = $2 where idempotency_key = $3",
+            &[&at, &(random.below(2) == 0), &key],
+        )
+        .expect("time the command");
+}
+
+/// A random control stream over two days: three missions configured and
+/// reconfigured (gated or not, accepted by review or not), tasks assigned
+/// and assigned again under the same id, of an objective (a number, a
+/// number as text, none) or only a brief, by a person or not, closed every
+/// way a span closes or not at all (cancelled by a person, by another, by a
+/// `by` that is not text; landed, aborted, over budget, a review accepted
+/// or not), legacy task and mission rows in every state, resumptions and a
+/// person's commands. Returns the last record's time.
+fn random_stream(client: &mut Client, seed: u64) -> i64 {
+    let mut random = Lcg(seed);
+    let minute = 60_000;
+    let mut at = H;
+    for mission in 1..=3 {
+        record_ms(
+            client,
+            at,
+            &json!({"type": "mission.added", "id": mission, "text": "m", "origin": "human",
+                    "sources": []}),
+        );
+    }
+    let mut tasks: Vec<i64> = Vec::new();
+    let objectives = [json!(null), json!(1), json!(2), json!("2"), json!(3)];
+    let briefs = [json!("a"), json!("b"), json!(null)];
+    for step in 0..140 {
+        at += i64::try_from(random.below(40)).unwrap_or(0) * minute + minute;
+        let mission = i64::try_from(random.below(3)).unwrap_or(0) + 1;
+        match random.below(12) {
+            0..=3 => {
+                let id = if tasks.is_empty() || random.below(4) > 0 {
+                    let id = 100 + step;
+                    tasks.push(id);
+                    id
+                } else {
+                    *random.pick(&tasks)
+                };
+                let mut assigned = json!({
+                    "type": "task.assigned", "id": id, "mission_id": mission,
+                    "kind": "ephemeral", "agent_id": format!("agent_worker_w_{id}"),
+                    "session_id": format!("session_worker_w_{id}"),
+                    "created_by": random.pick(&["human", "spawn-dispatch", "spawn_supervisor"]),
+                    "model": "default",
+                });
+                let objective = random.pick(&objectives).clone();
+                if !objective.is_null() || random.below(2) == 0 {
+                    assigned["objective"] = objective;
+                }
+                let brief = random.pick(&briefs).clone();
+                if !brief.is_null() {
+                    assigned["brief"] = brief;
+                }
+                record_ms(client, at, &assigned);
+            }
+            4..=7 if !tasks.is_empty() => {
+                let id = *random.pick(&tasks);
+                let closing = random_closing(&mut random, id);
+                record_ms(client, at, &closing);
+            }
+            8 => {
+                let gate = if random.below(2) == 0 {
+                    json!(null)
+                } else {
+                    json!("scripts/gate.sh")
+                };
+                record_ms(
+                    client,
+                    at,
+                    &json!({"type": "mission.configured", "id": mission, "gate": gate,
+                            "accept": random.pick(&["review", "gate"])}),
+                );
+            }
+            9 => record_ms(
+                client,
+                at,
+                &json!({"type": "mission.resumed", "id": mission}),
+            ),
+            10 => {
+                let id = 100 + step;
+                tasks.push(id);
+                record_ms(
+                    client,
+                    at,
+                    &json!({"type": "legacy.imported", "table": "mission_tasks",
+                            "row": {"id": id, "mission_id": mission,
+                                    "state": random.pick(&["open", "active", "cancelled",
+                                                           "landed", "accepted"]),
+                                    "objective": random.pick(&objectives),
+                                    "brief": random.pick(&briefs),
+                                    "created_by": random.pick(&["human", "spawn-dispatch"]),
+                                    "created_at_ms": at - minute, "updated_at_ms": at}}),
+                );
+            }
+            _ => {
+                random_command(client, &mut random, &format!("k{seed}-{step}"), at);
+            }
+        }
+    }
+    at
+}
+
+/// The view gives the oracle's rows (the view before, d61e85eb) for every
+/// window: on the history every other test reads, and on random streams
+/// with every kind of record a span or a reassignment depends on, over
+/// windows that cut anywhere, both edges included and excluded, an empty
+/// window and the whole log.
+#[test]
+fn the_window_read_gives_the_views_rows_of_every_window() {
+    let (_store, schema) = store("interventions_window_read");
+    let mut client = admin(&schema);
+    with_oracle(&mut client);
+    history(&mut client);
+    same_as_the_view(&mut client, 0, i64::MAX, "history, all of it");
+    same_as_the_view(&mut client, 5 * H, 5 * H, "history, an empty window");
+    for since in 0..=21 {
+        for until in since + 1..=22 {
+            same_as_the_view(&mut client, since * H, until * H, "history");
+        }
+    }
+    // On the gated mission 2: a review accepted does not close a task
+    // (its gate does), so a person's cancellation after it does, and the
+    // same objective again is its reassignment (at 25 h).
+    assign(&mut client, 22, 8, 2, "spawn_supervisor", Some(4), "eight");
+    record(
+        &mut client,
+        23,
+        &json!({"type": "task.reviewed", "id": 8, "accepted": true}),
+    );
+    record(
+        &mut client,
+        24,
+        &json!({"type": "task.cancelled", "id": 8, "by": "human"}),
+    );
+    assign(
+        &mut client,
+        25,
+        9,
+        2,
+        "spawn_supervisor",
+        Some(4),
+        "eight, again",
+    );
+    assert!(
+        intervention_rows(&mut client, WINDOWED, 25 * H, 26 * H).contains("cancel_reassign,2,9"),
+        "a cancellation after a review on a gated mission is reassigned"
+    );
+    same_as_the_view(&mut client, 22 * H, 26 * H, "history, gated");
+    same_as_the_view(&mut client, 0, i64::MAX, "history, all of it, gated");
+    // The edges: a reassignment at exactly 5 h is in [5 h, …) and not in
+    // […, 5 h).
+    same_as_the_view(&mut client, 5 * H, 5 * H + 1, "history, at an edge");
+    same_as_the_view(&mut client, 5 * H - 1, 5 * H, "history, before an edge");
+    for seed in 1..=8 {
+        let (_store, schema) = store(&format!("interventions_random_{seed}"));
+        let mut client = admin(&schema);
+        with_oracle(&mut client);
+        let last = random_stream(&mut client, seed);
+        same_as_the_view(&mut client, 0, i64::MAX, &format!("seed {seed}, all of it"));
+        let all = intervention_rows(&mut client, WINDOWED, 0, last + 1);
+        assert!(
+            all.contains("cancel_reassign") && all.contains("owner_task"),
+            "seed {seed} has the kinds that matter: {all}"
+        );
+        let mut cuts = vec![0, last + 1];
+        let mut random = Lcg(seed * 7919);
+        for _ in 0..10 {
+            cuts.push(i64::try_from(random.below(u64::try_from(last).unwrap_or(1))).unwrap_or(0));
+        }
+        cuts.sort_unstable();
+        for (i, since) in cuts.iter().enumerate() {
+            for until in &cuts[i + 1..] {
+                same_as_the_view(&mut client, *since, *until, &format!("seed {seed}"));
+            }
+        }
+    }
+}
+
+/// `weeks` of the live-size week's stream ([`live_size_week`]'s records,
+/// each week's task ids and objectives its own).
+fn live_size_weeks(client: &mut Client, weeks: i64) {
+    client
+        .execute(
+            "insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id,
+                                       kind, session_seq, recorded_at_ms)
+             select 'agent_control', 'session_control', null, 'control', null,
+                    jsonb_build_object('name', 'control.recorded',
+                                       'detail', jsonb_build_object('record', r.record)),
+                    1 + row_number() over (order by r.ord), 3600000 + r.ord * 180000
+               from (
+                 select t * 12 + 0 as ord,
+                        jsonb_build_object('type', 'task.assigned', 'id', t, 'mission_id', 1,
+                                           'kind', 'ephemeral', 'agent_id', 'agent_worker_w_' || t,
+                                           'session_id', 'session_worker_w_' || t,
+                                           'brief', 'brief ' || t, 'objective', t,
+                                           'created_by',
+                                           case when t % 20 = 0 then 'human' else 'spawn-dispatch' end,
+                                           'model', 'default') as record
+                   from generate_series(1, 300 * $1::bigint) t
+                 union all
+                 select t * 12 + g, jsonb_build_object('type', 'task.gated', 'id', t,
+                                                      'verdict', 'rejected', 'revision', g)
+                   from generate_series(1, 300 * $1::bigint) t, generate_series(1, 8) g
+                 union all
+                 select t * 12 + 9,
+                        case when t % 10 = 0
+                             then jsonb_build_object('type', 'task.cancelled', 'id', t, 'by', 'human')
+                             else jsonb_build_object('type', 'task.landed', 'id', t) end
+                   from generate_series(1, 300 * $1::bigint) t
+                 union all
+                 select t * 12 + 10,
+                        jsonb_build_object('type', 'task.assigned', 'id', 100000 + t, 'mission_id', 1,
+                                           'kind', 'ephemeral',
+                                           'agent_id', 'agent_worker_w_' || (100000 + t),
+                                           'session_id', 'session_worker_w_' || (100000 + t),
+                                           'brief', 'brief ' || t, 'objective', t,
+                                           'created_by', 'spawn-dispatch', 'model', 'default')
+                   from generate_series(10, 300 * $1::bigint, 10) t
+                 union all
+                 select t * 12 + 11, jsonb_build_object('type', 'task.landed', 'id', 100000 + t)
+                   from generate_series(10, 300 * $1::bigint, 10) t
+               ) r",
+            &[&weeks],
+        )
+        .expect("a live-size control stream");
+    client
+        .batch_execute("analyze spawn_events")
+        .expect("analyze");
+}
+
+/// The rows the read takes from spawn_events for the last day of a
+/// stream of `weeks` weeks, its rows, and the indexes it used.
+fn last_day_read(weeks: i64) -> (i64, String, String, Vec<Value>, Vec<String>) {
+    let (_store, schema) = store(&format!("interventions_weeks_{weeks}"));
+    let mut client = admin(&schema);
+    record(
+        &mut client,
+        0,
+        &json!({"type": "mission.added", "id": 1, "text": "live size", "origin": "human",
+                "sources": []}),
+    );
+    with_oracle(&mut client);
+    live_size_weeks(&mut client, weeks);
+    let until: i64 = client
+        .query_one(
+            "select max(recorded_at_ms) + 1 from spawn_events where session_id = 'session_control'",
+            &[],
+        )
+        .expect("the stream's end")
+        .get(0);
+    let since = until - 24 * H;
+    // A generic plan, as a reader's prepared statement gets after its
+    // fifth run: the window is two parameters, not constants.
+    client
+        .batch_execute("set plan_cache_mode = force_generic_plan")
+        .expect("generic plans");
+    let plan: Value = client
+        .query_one(
+            "explain (analyze, format json)
+             select count(*) from spawn_interventions where at_ms >= $1 and at_ms < $2",
+            &[&since, &until],
+        )
+        .expect("the plan")
+        .get(0);
+    let mut indexes = Vec::new();
+    plan_values(&plan, "Index Name", &mut indexes);
+    // fleet_health's statement, whole (its interventions count, objective
+    // 103, windows the view by its own `now`).
+    let health: Value = client
+        .query_one(
+            &format!(
+                "explain (analyze, format json) {}",
+                spawn_postgres::testing::FLEET_HEALTH
+            ),
+            &[],
+        )
+        .expect("the plan")
+        .get(0);
+    let mut scans = event_scans(&plan);
+    scans.push(format!("health: {}", events_read(&health)));
+    scans.extend(event_scans(&health));
+    let read = intervention_rows(&mut client, WINDOWED, since, until);
+    let view = intervention_rows(
+        &mut client,
+        "(select * from spawn_interventions_oracle where at_ms >= $1 and at_ms < $2)",
+        since,
+        until,
+    );
+    (
+        events_read(&plan).max(events_read(&health)),
+        read,
+        view,
+        indexes,
+        scans,
+    )
+}
+
+/// The view's window grows with the window, not the log (the lead,
+/// 2026-11-13: the view took 1.1 s on the live log, the 24 h bound applied
+/// after the whole history was worked out). The last day of one week and of
+/// four weeks of the live-size stream, under a generic plan: the oracle's
+/// rows, every kind there, by the assignment index, and four times the
+/// history reads no more than 10% more event rows than one week (a bound on
+/// rows read, never a time).
+#[test]
+fn the_window_read_grows_with_the_window_not_the_log() {
+    let (one, one_read, one_view, indexes, one_scans) = last_day_read(1);
+    assert_eq!(one_read, one_view);
+    assert!(one_read.contains("cancel_reassign"), "{one_read}");
+    assert!(one_read.contains("owner_task"), "{one_read}");
+    assert!(one > 0, "the plan reads spawn_events");
+    assert!(
+        indexes.contains(&json!("spawn_events_control_assignment_objective")),
+        "{indexes:?}"
+    );
+    let (four, four_read, four_view, _, four_scans) = last_day_read(4);
+    assert_eq!(four_read, four_view);
+    assert_eq!(
+        four_read.matches("cancel_reassign").count(),
+        one_read.matches("cancel_reassign").count(),
+        "a day of the same stream"
+    );
+    assert!(
+        four <= one + one / 10,
+        "the last day of 4 weeks read {four} event rows, of 1 week {one}:\n{four_scans:#?}\n{one_scans:#?}"
+    );
+}
+
+/// The newest record of a type (host.rs's NEWEST_PASSED, copied word for
+/// word) is found by spawn_events_control_record_type under a generic plan,
+/// the type a parameter, without reading the stream.
+#[test]
+fn the_newest_record_of_a_type_is_read_by_its_index_under_a_generic_plan() {
+    const NEWEST_PASSED: &str = r"
+select e.recorded_at_ms
+  from spawn_events e
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' = $1
+   and e.kind -> 'detail' -> 'record' -> 'ok' = 'true'::jsonb
+ order by e.id desc
+ limit 1";
+    let (store, schema) = store("interventions_type_index");
+    let mut client = admin(&schema);
+    record(
+        &mut client,
+        0,
+        &json!({"type": "mission.added", "id": 1, "text": "live size", "origin": "human",
+                "sources": []}),
+    );
+    live_size_weeks(&mut client, 1);
+    record(
+        &mut client,
+        1,
+        &json!({"type": "backup.drilled.transcripts", "ok": true}),
+    );
+    client
+        .batch_execute("set plan_cache_mode = force_generic_plan")
+        .expect("generic plans");
+    let plan: Value = client
+        .query_one(
+            &format!("explain (analyze, format json) {NEWEST_PASSED}"),
+            &[&"backup.drilled.missions"],
+        )
+        .expect("the plan")
+        .get(0);
+    let mut indexes = Vec::new();
+    plan_values(&plan, "Index Name", &mut indexes);
+    assert!(
+        indexes.contains(&json!("spawn_events_control_record_type")),
+        "{indexes:?}"
+    );
+    assert!(events_read(&plan) <= 1, "{} rows read", events_read(&plan));
+    assert_eq!(
+        store
+            .newest_passed_record("backup.drilled.transcripts")
+            .expect("the read"),
+        Some(H)
     );
 }

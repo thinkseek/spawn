@@ -136,10 +136,15 @@ with
       from agent_executions x, now
      where coalesce(x.ended_at_ms, now.ms) > now.ms - 86400000),
   -- The day's interventions (`spawn_interventions`), as the Home card
-  -- counts them (`/api/interventions?window=24h`, objective 103).
+  -- counts them (`/api/interventions?window=24h`, objective 103). The
+  -- window's bounds are values (scalar subqueries), not a join with `now`,
+  -- so they reach each of the view's base scans and the count reads the
+  -- day, not the log (a join bound is applied after the whole history is
+  -- worked out: 83 100 event rows for 4 weeks against 5 895 for 1, in
+  -- tests/experience.rs).
   intervened as (
-    select count(*) as n from spawn_interventions v, now
-     where v.at_ms >= now.ms - 86400000 and v.at_ms < now.ms),
+    select count(*) as n from spawn_interventions v
+     where v.at_ms >= (select ms from now) - 86400000 and v.at_ms < (select ms from now)),
   events as (
     select e.event_name from spawn_events e, now
      where e.event_name in ('tool.started', 'tool.failed', 'turn.failed')
