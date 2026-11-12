@@ -136,10 +136,12 @@ old_young=spawn_test_${dead}_aa02_2_written_since
 old_vanish=spawn_test_${dead}_aa03_3_vanishes
 old_locked=spawn_test_${dead}_aa04_4_locked
 old_keep2=spawn_test_${dead}_aa05_5_also_goes
+old_viewed=spawn_test_${dead}_aa06_6_viewed_from_outside
+old_fk=spawn_test_${dead}_aa07_7_referenced_from_outside
 alive=spawn_test_$$_bb01_1_alive
 young=spawn_test_${dead}_cc01_1_young
 nopid=spawn_test_sweepprobe_nopid
-for s in "$old_gone" "$old_young" "$old_vanish" "$old_locked" "$old_keep2"; do make "$s" old; done
+for s in "$old_gone" "$old_young" "$old_vanish" "$old_locked" "$old_keep2" "$old_viewed" "$old_fk"; do make "$s" old; done
 make "$alive" old
 make "$young"
 make "$nopid" old
@@ -153,15 +155,15 @@ check "a gone pid with 2-day-old files would be dropped" has "^would-drop $old_g
 check "a pid that runs here stays" has "^keep +$alive pid=$$ .* pid $$ runs here$"
 check "one written now stays" has "^keep +$young .*written 0h ago \\(< 24h\\)$"
 check "one with no pid stays" has "^keep +$nopid pid=- .* no pid in the name$"
-check "it says it dropped nothing" has "^sweep-test-schemas \\(print-only, nothing dropped\\): would drop 5 schema"
-check "all 8 schemas are still there" [ "$(schema_count)" = 8 ]
+check "it says it dropped nothing" has "^sweep-test-schemas \\(print-only, nothing dropped\\): would drop 7 schema"
+check "all 10 schemas are still there" [ "$(schema_count)" = 10 ]
 cp "$out" "$scratch/list.md"
 
 echo "== 2. --apply refusals, each alone: exit 2, nothing dropped"
 refused() { # refused <description> <message pattern>
   check "$1: refused (status $status)" [ "$status" -eq 2 ]
   check "$1: says why" has "$2"
-  check "$1: nothing dropped" [ "$(schema_count)" = 8 ]
+  check "$1: nothing dropped" [ "$(schema_count)" = 10 ]
 }
 run HOME="$HOME" PATH="$PATH" SPAWN_TEST_DATABASE_URL="$target_url" -- --apply "$scratch/list.md"
 refused "no live URL known" "refused: no live database URL is known"
@@ -203,6 +205,14 @@ echo "== 3. --apply of the reviewed list"
 # held by another session's lock; a qualifying schema appears that is not
 # on the list, and another database's section lists one more.
 admin -c "insert into $old_young.t values (2)" -c "checkpoint" >/dev/null
+# And another schema (not a test schema's) now depends on two listed ones: a
+# view over one's table, a foreign key to the other's. Their files are aged
+# again after (the key's index, any page a check wrote).
+admin -c "create schema other_app" -c "create view other_app.v as select x from $old_viewed.t" \
+  -c "alter table $old_fk.t add primary key (x)" \
+  -c "create table other_app.r (x int references $old_fk.t (x))" >/dev/null
+age_old "$old_viewed"
+age_old "$old_fk"
 admin -c "drop schema $old_vanish cascade" >/dev/null
 not_listed=spawn_test_${dead}_dd01_1_not_listed
 other_only=spawn_test_${dead}_ee01_1_other_section
@@ -234,8 +244,17 @@ exists "$old_locked" && pass "  it is still there" || fail "  it is still there"
 exists "$not_listed" && pass "a qualifying schema not on the list stays" || fail "a qualifying schema not on the list stays"
 exists "$other_only" && pass "one listed only in another database's section stays" || fail "one listed only in another database's section stays"
 for s in "$alive" "$young" "$nopid"; do exists "$s" && pass "kept: $s" || fail "kept: $s"; done
-check "the totals are said" has "^sweep-test-schemas --apply: dropped 2, skipped 2, failed 1$"
-check "before and after: count and MB" has "^sweep-test-schemas --apply: spawn_test_\\* before: 9 schema\\(s\\), [0-9]+ MB; after: 7 schema\\(s\\), [0-9]+ MB$"
+check "a qualifying schema not on the list is said, kept" has "^not-on-list $not_listed pid=$dead idle=4[78]h size=[0-9]+MB \\(qualifies now, not reviewed: kept\\)$"
+check "  so is the one only another database's section lists" has "^not-on-list $other_only "
+check "  with their count" has "^sweep-test-schemas --apply: 2 qualifying schema\\(s\\) not on the list, kept$"
+check "a listed one another schema's view depends on is skipped" has "^skipped $old_viewed dependents-outside \\([0-9]+ objects\\)$"
+exists "$old_viewed" && pass "  it is still there" || fail "  it is still there"
+check "  and so is the view" [ "$(admin -c "select count(*) from pg_views where schemaname = 'other_app' and viewname = 'v'")" = 1 ]
+check "a listed one another schema's foreign key references is skipped" has "^skipped $old_fk dependents-outside \\([0-9]+ objects\\)$"
+exists "$old_fk" && pass "  it is still there" || fail "  it is still there"
+check "  and so is the key" [ "$(admin -c "select count(*) from pg_constraint where conrelid = 'other_app.r'::regclass and contype = 'f'")" = 1 ]
+check "the totals are said" has "^sweep-test-schemas --apply: dropped 2, skipped 4, failed 1$"
+check "before and after: count and MB" has "^sweep-test-schemas --apply: spawn_test_\\* before: 11 schema\\(s\\), [0-9]+ MB; after: 9 schema\\(s\\), [0-9]+ MB$"
 
 echo "== 4. no file times (not a superuser): a gone pid alone never qualifies"
 unknown=spawn_test_${dead}_ff01_1_age_unknown
