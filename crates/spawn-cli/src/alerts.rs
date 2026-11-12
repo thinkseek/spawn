@@ -246,7 +246,8 @@
 //!   evidence the command, agent, session and whether it was typed
 //!   (objective 045): a message (what the Bridge types for a command, with
 //!   its marker) that no `message.taken` names `SPAWN_MESSAGE_TAKEN_SECS`
-//!   (default 120) after it was recorded (`spawn_command_message`): typed
+//!   (default 120) after it was recorded, or, if it waited for its turn,
+//!   after the turn it waited behind ended (`spawn_command_message`): typed
 //!   and never taken, or never typed. A typed one's evidence says how many
 //!   transcript lines the Bridge recorded since the typing
 //!   (`read_since_typed`, at most 100 counted, S17): with none, its text
@@ -2307,7 +2308,7 @@ times in a row)",
                 text: if typed && read == Some(0) {
                     format!(
                         "message #{id} to {agent} (its {action}) was typed, and {secs} s after \
-                         it was sent Spawn has read no line of {agent}'s transcript since the \
+                         it could be typed Spawn has read no line of {agent}'s transcript since the \
                          typing: whether {agent} took it is unknown. Either Spawn is not reading \
                          that transcript (the Bridge follows it), or the engine has written \
                          nothing since"
@@ -2316,7 +2317,7 @@ times in a row)",
                     format!(
                         "{agent} has not taken message #{id} (its {action}): typed, and the \
                          transcript lines Spawn has read since ({}) hold no marker of it {secs} s \
-                         after it was sent",
+                         after it could be typed",
                         match read {
                             Some(100) => "100 or more".to_string(),
                             Some(lines) => lines.to_string(),
@@ -2326,7 +2327,8 @@ times in a row)",
                 } else {
                     format!(
                         "{agent} has not taken message #{id} (its {action}): never typed \
-                         {secs} s after it was sent"
+                         {secs} s after it could be typed (sent to a ready session, or the turn \
+                         it waited behind ended)"
                     )
                 },
                 notice: false,
