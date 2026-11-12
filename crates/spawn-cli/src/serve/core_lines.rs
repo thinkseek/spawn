@@ -202,7 +202,7 @@ pub(super) fn nightly_facts(dir: Option<&Path>) -> Option<Vec<Value>> {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name.starts_with('.') || !name.ends_with(".json") {
+        if name.starts_with('.') || Path::new(name).extension().is_none_or(|ext| ext != "json") {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(entry.path()) else {
