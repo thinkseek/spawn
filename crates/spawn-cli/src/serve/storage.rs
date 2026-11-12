@@ -71,6 +71,9 @@ pub(crate) struct Walked {
     pub(crate) workspaces: Sizes,
     pub(crate) projects_path: PathBuf,
     pub(crate) projects: Sizes,
+    /// The session backups' `estimated_bytes` (objective 097); `None`
+    /// without a status file that reads with that number.
+    pub(crate) session_backups: Option<u64>,
 }
 
 impl Walked {
@@ -83,6 +86,9 @@ impl Walked {
             workspaces: root.map(workspaces).unwrap_or_default(),
             projects: walk(&projects_path, &[]),
             projects_path,
+            session_backups: crate::storage::session_backup_bytes(
+                crate::storage::session_backup_status().as_deref(),
+            ),
         }
     }
 }
@@ -126,11 +132,49 @@ pub(crate) fn growth_parts(
     })
 }
 
-/// The parts' sum ([`growth_parts`]); `None` while any part is.
-pub(crate) fn persistent_growth(parts: &Value) -> Option<i64> {
-    ["archive", "projects", "database"]
+/// The persistent growth's parts, each by the sample field it is measured
+/// from: the three of objective 085 and the session backups' (097).
+const PARTS: [(&str, &str); 4] = [
+    ("archive", "archive_bytes"),
+    ("projects", "projects_bytes"),
+    ("database", "database_bytes"),
+    ("session_backups", "session_backup_bytes"),
+];
+
+/// The session backups' growth (objective 097), measured as the other
+/// parts are ([`growth_of`]): `bytes` (this answer's `estimated_bytes`, the
+/// status file's) less the oldest sample of the window carrying
+/// `session_backup_bytes`, over the days between. Null without `bytes` or
+/// such a sample a day old.
+pub(crate) fn session_backups_part(bytes: Option<u64>, carrying: &Value, read_at_ms: i64) -> Value {
+    json!(bytes.and_then(|bytes| growth_of(
+        bytes,
+        &carrying["session_backup_bytes"],
+        "session_backup_bytes",
+        read_at_ms
+    )))
+}
+
+/// The parts left out of the sum because their source cannot be read now
+/// (objective 097): the session backups' while no status file reads, or
+/// the one that reads holds no `estimated_bytes` number (`session_backups`
+/// is that number). A format change excludes the part; it never nulls the
+/// whole forecast.
+pub(crate) fn growth_excluded(session_backups: Option<u64>) -> Vec<&'static str> {
+    if session_backups.is_some() {
+        Vec::new()
+    } else {
+        vec!["session_backups"]
+    }
+}
+
+/// The counted parts' sum ([`growth_parts`], [`session_backups_part`]),
+/// those `excluded` left out; `None` while any counted part is.
+pub(crate) fn persistent_growth(parts: &Value, excluded: &[&str]) -> Option<i64> {
+    PARTS
         .iter()
-        .try_fold(0_i64, |sum, part| sum.checked_add(parts[*part].as_i64()?))
+        .filter(|(part, _)| !excluded.contains(part))
+        .try_fold(0_i64, |sum, (part, _)| sum.checked_add(parts[*part].as_i64()?))
 }
 
 /// The moment the archive's growth is first measured (objective 083): the
@@ -142,13 +186,15 @@ pub(crate) fn growth_from(oldest: &Value) -> Option<i64> {
 }
 
 /// The moment the persistent growth is first measured (objective 091): the
-/// latest of its parts' moments ([`growth_from`] of the oldest sample of the
-/// window carrying each part's size, `carrying` as [`growth_parts`] reads
-/// it). `None` while any part has no such sample.
-pub(crate) fn persistent_from(carrying: &Value) -> Option<i64> {
-    ["archive_bytes", "projects_bytes", "database_bytes"]
+/// latest of its counted parts' moments ([`growth_from`] of the oldest
+/// sample of the window carrying each part's size, `carrying` as
+/// [`growth_parts`] reads it), those `excluded` left out. `None` while any
+/// counted part has no such sample.
+pub(crate) fn persistent_from(carrying: &Value, excluded: &[&str]) -> Option<i64> {
+    PARTS
         .iter()
-        .try_fold(i64::MIN, |latest, field| {
+        .filter(|(part, _)| !excluded.contains(part))
+        .try_fold(i64::MIN, |latest, (_, field)| {
             Some(latest.max(growth_from(&carrying[*field])?))
         })
 }
@@ -194,13 +240,16 @@ pub(crate) fn sizes(
 ) -> Value {
     let path = |path: &Path| path.display().to_string();
     let root = walked.root.as_deref();
-    let parts = growth_parts(
+    let mut parts = growth_parts(
         root.map(|_| walked.archive.bytes),
         walked.projects.bytes,
         database["bytes"].as_u64(),
         &samples["carrying"],
         read_at_ms,
     );
+    parts["session_backups"] =
+        session_backups_part(walked.session_backups, &samples["carrying"], read_at_ms);
+    let excluded = growth_excluded(walked.session_backups);
     json!({
         "read_at_ms": read_at_ms,
         "archive": root.map(|root| json!({
@@ -222,9 +271,10 @@ pub(crate) fn sizes(
         "test_databases": tests.clone(),
         "growth_bytes_per_day": parts["archive"],
         "growth_from_ms": root.and_then(|_| growth_from(&samples["carrying"]["archive_bytes"])),
-        "persistent_growth_bytes_per_day": persistent_growth(&parts),
-        "persistent_from_ms": root.and_then(|_| persistent_from(&samples["carrying"])),
+        "persistent_growth_bytes_per_day": persistent_growth(&parts, &excluded),
+        "persistent_from_ms": root.and_then(|_| persistent_from(&samples["carrying"], &excluded)),
         "growth_parts": parts,
+        "growth_excluded": excluded,
     })
 }
 
@@ -283,6 +333,10 @@ mod tests {
     use std::sync::Mutex;
 
     const MIB: u64 = 1024 * 1024;
+
+    /// The session backups left out, as without a status file: objective
+    /// 085's three parts.
+    const BACKUPS_LEFT_OUT: &[&str] = &["session_backups"];
 
     #[test]
     fn a_second_request_within_ten_minutes_walks_nothing() {
@@ -422,7 +476,7 @@ mod tests {
             parts,
             json!({"archive": mib, "projects": mib / 4, "database": 4 * mib})
         );
-        assert_eq!(persistent_growth(&parts), Some(mib + mib / 4 + 4 * mib));
+        assert_eq!(persistent_growth(&parts, BACKUPS_LEFT_OUT), Some(mib + mib / 4 + 4 * mib));
         // Without a sample carrying the database's size (only the old
         // shape in the window): its part is null, and so is the sum.
         let young = json!({"archive_bytes": old_shape, "projects_bytes": old_shape,
@@ -430,7 +484,7 @@ mod tests {
         let parts = growth_parts(Some(12 * MIB), MIB, Some(108 * MIB), &young, now);
         assert_eq!(parts["database"], Value::Null);
         assert_eq!(parts["archive"], mib);
-        assert_eq!(persistent_growth(&parts), None);
+        assert_eq!(persistent_growth(&parts, BACKUPS_LEFT_OUT), None);
         // No database bytes in this answer, or no root: that part is null.
         let parts = growth_parts(None, MIB, None, &carrying, now);
         assert_eq!(parts["archive"], Value::Null);
@@ -439,10 +493,10 @@ mod tests {
         // A shrinking database (a vacuum) counts against the rest.
         let parts = growth_parts(Some(12 * MIB), MIB, Some(96 * MIB), &carrying, now);
         assert_eq!(parts["database"], -2 * mib);
-        assert_eq!(persistent_growth(&parts), Some(mib + mib / 4 - 2 * mib));
+        assert_eq!(persistent_growth(&parts, BACKUPS_LEFT_OUT), Some(mib + mib / 4 - 2 * mib));
         // Days left over a sum at or below 0: none.
         let figures = with_free(
-            json!({"persistent_growth_bytes_per_day": persistent_growth(&parts)}),
+            json!({"persistent_growth_bytes_per_day": persistent_growth(&parts, BACKUPS_LEFT_OUT)}),
             Some(10 * MIB),
         );
         assert_eq!(figures["days_left"], Value::Null);
@@ -505,13 +559,13 @@ mod tests {
                            "projects_bytes": 0, "projects_files": 0, "database_bytes": 500});
         // A part without a sample: none.
         let partial = json!({"archive_bytes": old, "projects_bytes": old, "database_bytes": null});
-        assert_eq!(persistent_from(&partial), None);
-        assert_eq!(persistent_from(&Value::Null), None);
+        assert_eq!(persistent_from(&partial, BACKUPS_LEFT_OUT), None);
+        assert_eq!(persistent_from(&Value::Null, BACKUPS_LEFT_OUT), None);
         // All three: the latest of them.
         let carrying =
             json!({"archive_bytes": old, "projects_bytes": old, "database_bytes": young});
         assert_eq!(
-            persistent_from(&carrying),
+            persistent_from(&carrying, BACKUPS_LEFT_OUT),
             Some(now - 10 * 3_600_000 + DAY_MS)
         );
         let first = json!({"archive_bytes": young, "projects_bytes": old, "database_bytes": old});
