@@ -437,7 +437,12 @@ export interface InFlight {
   since_ms: number | null;
   /** How many of the task's gate verdicts were `conflict` (objective 069). */
   conflicts: number;
-  /** "sent back <n> times as a conflict" when two or more, else null. */
+  /** How many `conflict` gate verdicts the mission's other tasks for the
+   * same objective, assigned before it, had (objective 073); 0 with no
+   * objective. */
+  earlierConflicts: number;
+  /** "sent back <n> times as a conflict[, <e> on earlier attempts]" when
+   * `conflicts` and `earlierConflicts` are two or more in all, else null. */
   conflictText: string | null;
 }
 
@@ -497,9 +502,34 @@ export function conflictCount(task: MissionTask): number {
   return task.stages.filter((stage) => stage.stage === "gated" && stage.verdict === "conflict").length;
 }
 
-/** The in-flight line's words for a task that lost rounds to conflicts. */
-export function conflictText(conflicts: number): string | null {
-  return conflicts >= 2 ? `sent back ${conflicts} times as a conflict` : null;
+/** The in-flight line's words for a task that lost rounds to conflicts,
+ * its own and its objective's earlier attempts' together (objective 073):
+ * "sent back 3 times as a conflict, 2 on earlier attempts"; null under two
+ * in all. */
+export function conflictText(conflicts: number, earlier = 0): string | null {
+  const total = conflicts + earlier;
+  if (total < 2) return null;
+  return `sent back ${total} times as a conflict${earlier > 0 ? `, ${earlier} on earlier attempts` : ""}`;
+}
+
+/** Whether `other` was assigned before `task`: by when each was made, the
+ * id between two made at once (or with no time). */
+function assignedBefore(other: MissionTask, task: MissionTask): boolean {
+  const at = (entry: MissionTask) => entry.created_at_ms ?? Number.NEGATIVE_INFINITY;
+  if (at(other) !== at(task)) return at(other) < at(task);
+  return (other.id ?? 0) < (task.id ?? 0);
+}
+
+/** The `conflict` gate verdicts of the earlier attempts at `task`'s
+ * objective: the mission's other tasks for the same objective assigned
+ * before it (objective 073). A task with no objective has none; another
+ * mission's objective of the same number is not the same objective (only
+ * `mission`'s tasks are read). */
+export function earlierConflictCount(task: MissionTask, mission: Mission): number {
+  if (task.objective === null) return 0;
+  return mission.tasks
+    .filter((other) => other !== task && other.objective === task.objective && assignedBefore(other, task))
+    .reduce((sum, other) => sum + conflictCount(other), 0);
 }
 
 export function missionsToday(missions: Missions | null, now: number): MissionsToday {
@@ -526,14 +556,19 @@ export function missionsToday(missions: Missions | null, now: number): MissionsT
     }
     const inFlight: InFlight[] = mission.tasks
       .filter((task) => isOpenTask(task, mission))
-      .map((task) => ({
-        task_id: task.id,
-        title: task.task_title,
-        state: taskStateLabel(task, mission),
-        since_ms: latestRecord(task),
-        conflicts: conflictCount(task),
-        conflictText: conflictText(conflictCount(task)),
-      }))
+      .map((task) => {
+        const conflicts = conflictCount(task);
+        const earlierConflicts = earlierConflictCount(task, mission);
+        return {
+          task_id: task.id,
+          title: task.task_title,
+          state: taskStateLabel(task, mission),
+          since_ms: latestRecord(task),
+          conflicts,
+          earlierConflicts,
+          conflictText: conflictText(conflicts, earlierConflicts),
+        };
+      })
       .sort((left, right) => (left.task_id ?? 0) - (right.task_id ?? 0));
     let landedToday = 0;
     let lastRejection: MissionRow["lastRejection"] = null;

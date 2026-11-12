@@ -15,6 +15,7 @@ import {
   gatePassRate,
   landedToday,
   landings,
+  missionLastLanding,
   prune,
   replayTime,
   runningCount,
@@ -188,6 +189,39 @@ test("landings are known by task, up to now", () => {
   ];
   assert.deepEqual([...landings(events, 150)], [[3, 100]]);
   assert.deepEqual([...landings(events, 300)], [[3, 100], [4, 200]]);
+});
+
+// A mission of `/api/rsi`: task 1 landed at 1000, task 2 at 5000, task 3 in flight.
+const HISTORY = {
+  objectives: [
+    { landings: [{ at_ms: 1_000 }] },
+    { landings: [{ at_ms: 5_000 }] },
+    { landings: [] },
+  ],
+  tasks: [{ id: 3 }, { id: 2 }, { id: 1 }],
+};
+
+test("a mission's last landing comes from its whole history, not only the scene's events", () => {
+  // The scene's events start at midnight and hold none of its landings.
+  assert.equal(missionLastLanding(HISTORY, new Map(), 10_000), 5_000);
+  // A landing the scene saw after the answer was read is the latest.
+  assert.equal(missionLastLanding(HISTORY, new Map([[3, 9_000]]), 10_000), 9_000);
+  // Another mission's task is not this mission's landing.
+  assert.equal(missionLastLanding(HISTORY, new Map([[99, 9_000]]), 10_000), 5_000);
+});
+
+test("a mission's last landing is as of the scene's time, the replay clock in replay", () => {
+  assert.equal(missionLastLanding(HISTORY, new Map(), 4_999), 1_000);
+  assert.equal(missionLastLanding(HISTORY, new Map(), 5_000), 5_000);
+  assert.equal(missionLastLanding(HISTORY, new Map([[3, 9_000]]), 8_000), 5_000, "a seen landing after the clock");
+  assert.equal(missionLastLanding(HISTORY, new Map(), 999), null, "not landed yet as of the clock");
+});
+
+test("only a mission that never landed has no last landing", () => {
+  const fresh = { objectives: [{ landings: [] }, {}], tasks: [{ id: 3 }] };
+  assert.equal(missionLastLanding(fresh, new Map(), 10_000), null);
+  assert.equal(missionLastLanding({}, new Map(), 10_000), null);
+  assert.equal(missionLastLanding(fresh, new Map([[3, 2_000]]), 10_000), 2_000);
 });
 
 test("the gate pass rate counts only verdicts that judge the work", () => {
