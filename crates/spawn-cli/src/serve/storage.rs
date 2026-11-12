@@ -148,7 +148,9 @@ pub(crate) fn growth_from(oldest: &Value) -> Option<i64> {
 pub(crate) fn persistent_from(carrying: &Value) -> Option<i64> {
     ["archive_bytes", "projects_bytes", "database_bytes"]
         .iter()
-        .try_fold(i64::MIN, |latest, field| Some(latest.max(growth_from(&carrying[*field])?)))
+        .try_fold(i64::MIN, |latest, field| {
+            Some(latest.max(growth_from(&carrying[*field])?))
+        })
 }
 
 /// How many days `free` bytes last at `growth` bytes a day, rounded down;
@@ -506,15 +508,25 @@ mod tests {
         assert_eq!(persistent_from(&partial), None);
         assert_eq!(persistent_from(&Value::Null), None);
         // All three: the latest of them.
-        let carrying = json!({"archive_bytes": old, "projects_bytes": old, "database_bytes": young});
-        assert_eq!(persistent_from(&carrying), Some(now - 10 * 3_600_000 + DAY_MS));
+        let carrying =
+            json!({"archive_bytes": old, "projects_bytes": old, "database_bytes": young});
+        assert_eq!(
+            persistent_from(&carrying),
+            Some(now - 10 * 3_600_000 + DAY_MS)
+        );
         let first = json!({"archive_bytes": young, "projects_bytes": old, "database_bytes": old});
         assert_eq!(persistent_from(&first), Some(now - 10 * 3_600_000 + DAY_MS));
         let samples = json!({"oldest": old, "carrying": carrying, "before": null});
-        let pending = with_free(sizes(now, &walked, &samples, &json!({"bytes": 900}), &json!([])), Some(1));
+        let pending = with_free(
+            sizes(now, &walked, &samples, &json!({"bytes": 900}), &json!([])),
+            Some(1),
+        );
         assert_eq!(pending["persistent_growth_bytes_per_day"], Value::Null);
         assert_eq!(pending["days_left"], Value::Null);
-        assert_eq!(pending["persistent_from_ms"], json!(now - 10 * 3_600_000 + DAY_MS));
+        assert_eq!(
+            pending["persistent_from_ms"],
+            json!(now - 10 * 3_600_000 + DAY_MS)
+        );
         let samples = json!({"oldest": old, "carrying": partial, "before": null});
         let missing = sizes(now, &walked, &samples, &Value::Null, &json!([]));
         assert_eq!(missing["persistent_from_ms"], Value::Null);
