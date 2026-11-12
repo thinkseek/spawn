@@ -237,7 +237,10 @@ mod tests {
         let refused = |path: &Path, want: &str| {
             let why = check(path).expect_err("refused");
             assert!(why.contains(want), "{}: {why}", path.display());
-            assert!(!why.contains("postgres"), "the reason never holds the URL: {why}");
+            assert!(
+                !why.contains("://") && !why.contains("spawn_") && !why.contains("192.0.2"),
+                "the reason never holds the URL: {why}"
+            );
         };
         refused(&url_file(dir, "loose", "postgres://bb@127.0.0.1/spawn_test", 0o644), "mode 0644");
         refused(&url_file(dir, "group", "postgres://bb@127.0.0.1/spawn_test", 0o640), "mode 0640");
@@ -310,5 +313,123 @@ mod tests {
         assert_eq!(leaked(&schemas, "test", &seen, now, &runs), 3, "old, seen and bb_other");
         // A day on, the never-seen and the bad-comment ones are leftovers too.
         assert_eq!(leaked(&schemas, "test", &seen, now + 25 * HOUR, &runs), 6);
+    }
+
+    /// The schemas this test makes in the test database, dropped by name
+    /// when it ends, passed or not.
+    struct Made {
+        url: String,
+        names: Vec<String>,
+    }
+
+    impl Drop for Made {
+        fn drop(&mut self) {
+            if let Ok(mut client) = postgres::Client::connect(&self.url, postgres::NoTls) {
+                for name in &self.names {
+                    let _ = client.batch_execute(&format!(
+                        "set lock_timeout = '5s'; drop schema if exists {name} cascade"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Against the test database: the one read gives each schema's comment
+    /// and whether a live session holds it, and the leaked count is held,
+    /// fresh, old with its pid gone, old with its pid alive, no comment
+    /// first seen 25 h ago and never seen, a bad comment, no pid.
+    #[test]
+    fn the_test_database_read_counts_only_the_leftovers() {
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL")
+            .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip");
+        let mut exited = std::process::Command::new("true").spawn().expect("a process");
+        let dead = exited.id();
+        exited.wait().expect("it exits");
+        assert!(!super::pid_runs(dead), "process {dead} is gone");
+        let alive = std::process::id();
+        let token = format!(
+            "{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos())
+        );
+        let gone = |case: &str| format!("spawn_test_{dead}_{token}_{case}");
+        let names = vec![
+            gone("held"),
+            gone("fresh"),
+            gone("old"),
+            format!("spawn_test_{alive}_{token}_alive"),
+            gone("seen"),
+            gone("unseen"),
+            gone("junk"),
+            format!("bb_{token}_other"),
+        ];
+        let made = Made {
+            url: url.clone(),
+            names: names.clone(),
+        };
+        let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
+        let now: i64 = client
+            .query_one(
+                "select floor(extract(epoch from clock_timestamp()) * 1000)::bigint",
+                &[],
+            )
+            .expect("the clock")
+            .get(0);
+        let day_ago = now - 25 * HOUR;
+        let comment = |at: i64| format!("'{{\"made_at_ms\": {at}}}'");
+        let mut sql = String::new();
+        for name in &made.names {
+            sql.push_str(&format!("create schema {name}; "));
+        }
+        for (name, at) in [
+            (&names[0], day_ago),
+            (&names[1], now),
+            (&names[2], day_ago),
+            (&names[3], day_ago),
+        ] {
+            sql.push_str(&format!("comment on schema {name} is {}; ", comment(at)));
+        }
+        sql.push_str(&format!("comment on schema {} is 'made by hand'; ", names[6]));
+        client.batch_execute(&sql).expect("make the schemas");
+        // A live session holding the first, as a running test's store.
+        let mut holder = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
+        holder
+            .batch_execute(&format!("set application_name to '{}'", names[0]))
+            .expect("name the session");
+
+        let all = spawn_postgres::test_schemas(&url).expect("the read");
+        let mine: Vec<serde_json::Value> = all
+            .as_array()
+            .expect("an array")
+            .iter()
+            .filter(|schema| schema["name"].as_str().is_some_and(|name| name.contains(&token)))
+            .cloned()
+            .collect();
+        assert_eq!(mine.len(), 8, "{mine:?}");
+        let held: Vec<&str> = mine
+            .iter()
+            .filter(|schema| schema["held"] == true)
+            .filter_map(|schema| schema["name"].as_str())
+            .collect();
+        assert_eq!(held, [names[0].as_str()]);
+        assert!(all.as_array().expect("an array").iter().all(|schema| {
+            let name = schema["name"].as_str().unwrap_or("pg_");
+            name != "public" && name != "information_schema" && !name.starts_with("pg_")
+        }));
+        let mut seen = BTreeMap::from([
+            (format!("test/{}", names[4]), day_ago),
+            (format!("test/{}", names[7]), day_ago),
+        ]);
+        let listed: Vec<&str> = mine.iter().filter_map(|schema| schema["name"].as_str()).collect();
+        update_seen(&mut seen, "test", &listed, now);
+        assert_eq!(
+            leaked(&mine, "test", &seen, now, &super::pid_runs),
+            3,
+            "the old one whose pid is gone, the one first seen 25 h ago and the one with no pid"
+        );
+        drop(holder);
+        drop(client);
+        drop(made);
     }
 }
