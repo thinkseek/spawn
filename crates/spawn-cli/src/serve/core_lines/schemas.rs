@@ -244,82 +244,29 @@ mod tests {
         let key_value = url_file(dir, "kv", "host=/tmp dbname=spawn_test", 0o600);
         assert!(check(&key_value).is_ok());
 
-        let refused = |path: &Path, want: &str| {
-            let why = check(path).expect_err("refused");
-            assert!(why.contains(want), "{}: {why}", path.display());
+        for (name, url, mode, want) in [
+            ("loose", "postgres://bb@127.0.0.1/spawn_test", 0o644, "mode 0644"),
+            ("group", "postgres://bb@127.0.0.1/spawn_test", 0o640, "mode 0640"),
+            ("remote", "postgres://bb@192.0.2.1:5432/spawn_test", 0o600, "not this one's"),
+            ("named", "postgres://bb@db.example.com/spawn_test", 0o600, "not this one's"),
+            ("live", live, 0o600, "live database"),
+            // The live database under other spellings: TCP loopback against
+            // its socket, an explicit default port, another user, ::1.
+            ("live_tcp", "postgres://spawn@127.0.0.1/spawn_live", 0o600, "live database"),
+            ("live_port", "postgres://spawn@localhost:5432/spawn_live", 0o600, "live database"),
+            ("live_user", "postgres://someone_else:pw@[::1]:5432/spawn_live", 0o600, "live database"),
+            ("garbage", "not a url at all ===", 0o600, "postgres URL"),
+        ] {
+            let why = check(&url_file(dir, name, url, mode)).expect_err(name);
+            assert!(why.contains(want), "{name}: {why}");
             assert!(
                 !why.contains("://") && !why.contains("spawn_") && !why.contains("192.0.2"),
                 "the reason never holds the URL: {why}"
             );
-        };
-        refused(
-            &url_file(dir, "loose", "postgres://bb@127.0.0.1/spawn_test", 0o644),
-            "mode 0644",
-        );
-        refused(
-            &url_file(dir, "group", "postgres://bb@127.0.0.1/spawn_test", 0o640),
-            "mode 0640",
-        );
-        refused(
-            &url_file(
-                dir,
-                "remote",
-                "postgres://bb@192.0.2.1:5432/spawn_test",
-                0o600,
-            ),
-            "not this one's",
-        );
-        refused(
-            &url_file(
-                dir,
-                "named",
-                "postgres://bb@db.example.com/spawn_test",
-                0o600,
-            ),
-            "not this one's",
-        );
-        refused(&url_file(dir, "live", live, 0o600), "live database");
-        refused(
-            &url_file(
-                dir,
-                "live_tcp",
-                "postgres://spawn@127.0.0.1/spawn_live",
-                0o600,
-            ),
-            "live database",
-        );
-        refused(
-            &url_file(
-                dir,
-                "live_port",
-                "postgres://spawn@localhost:5432/spawn_live",
-                0o600,
-            ),
-            "live database",
-        );
-        refused(
-            &url_file(
-                dir,
-                "live_user",
-                "postgres://someone_else:pw@[::1]:5432/spawn_live",
-                0o600,
-            ),
-            "live database",
-        );
-        refused(
-            &url_file(dir, "garbage", "not a url at all ===", 0o600),
-            "postgres URL",
-        );
+        }
         // Another port is another server's database.
-        assert!(
-            check(&url_file(
-                dir,
-                "other_port",
-                "postgres://spawn@127.0.0.1:5433/spawn_live",
-                0o600
-            ))
-            .is_ok()
-        );
+        let other_port = url_file(dir, "other_port", "postgres://spawn@127.0.0.1:5433/spawn_live", 0o600);
+        assert!(check(&other_port).is_ok());
         // Not this user's: checked against another uid.
         let why = url_from_file(&socket, Some(live), me.wrapping_add(1)).expect_err("not mine");
         assert!(why.contains("not owned by this user"), "{why}");
