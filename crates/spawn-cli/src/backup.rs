@@ -367,13 +367,18 @@ impl Settings {
         format!("{}{key}", self.prefix)
     }
 
+    /// `spawn backup`'s settings: its bucket and credentials from r2.env
+    /// ([`Self::backup_r2`]), never the keep bucket.
     pub(crate) fn from_env(flags: &Flags) -> Result<Self, String> {
-        let root = workspace_root(flags)
-            .map(PathBuf::from)
-            .ok_or_else(|| "--root or SPAWN_WORKSPACE_ROOT is required".to_string())?;
-        let key_file = env_value("SPAWN_BACKUP_KEY_FILE")
-            .map_or_else(|| home().join(".config/spawn/backup.key"), PathBuf::from);
-        private_file(&key_file, "the backup key")?;
+        Self::with_r2(flags, Self::backup_r2)
+    }
+
+    /// The bucket and credentials `spawn backup` works with: r2.env's
+    /// (`SPAWN_R2_ENV_FILE`), each value from it or else the environment.
+    /// A bucket locked for good ([`store::locked_forever`]) is refused here,
+    /// before any request: the store is the keep bucket's only writer, and
+    /// `spawn backup` has no business there (the lead, 2026-11-13).
+    fn backup_r2() -> Result<R2, String> {
         let env_file = env_value("SPAWN_R2_ENV_FILE")
             .map_or_else(|| home().join(".config/spawn/r2.env"), PathBuf::from);
         private_file(&env_file, "the R2 environment")?;
@@ -393,6 +398,23 @@ impl Settings {
             access_key: needed("SPAWN_R2_ACCESS_KEY_ID")?,
             secret_key: needed("SPAWN_R2_SECRET_ACCESS_KEY")?,
         };
+        not_locked_forever(&r2.bucket)?;
+        Ok(r2)
+    }
+
+    /// The settings with the bucket and credentials `r2` gives (the store
+    /// passes its own credential's, so it never needs r2.env).
+    pub(crate) fn with_r2(
+        flags: &Flags,
+        r2: impl FnOnce() -> Result<R2, String>,
+    ) -> Result<Self, String> {
+        let root = workspace_root(flags)
+            .map(PathBuf::from)
+            .ok_or_else(|| "--root or SPAWN_WORKSPACE_ROOT is required".to_string())?;
+        let key_file = env_value("SPAWN_BACKUP_KEY_FILE")
+            .map_or_else(|| home().join(".config/spawn/backup.key"), PathBuf::from);
+        private_file(&key_file, "the backup key")?;
+        let r2 = r2()?;
         let prefix = prefix_value(env_value("SPAWN_BACKUP_PREFIX"))?;
         let limit_bytes = megabytes("SPAWN_BACKUP_R2_LIMIT_MB", DEFAULT_LIMIT_MB)?;
         let alert_bytes = megabytes("SPAWN_BACKUP_R2_ALERT_MB", DEFAULT_ALERT_MB)?;
@@ -430,6 +452,19 @@ SPAWN_BACKUP_R2_LIMIT_MB ({limit_bytes} bytes)"
             None => PathBuf::from(name),
         }
     }
+}
+
+/// `spawn backup` never writes to a bucket locked for good (the keep
+/// bucket, [`store::locked_forever`]); its name is never in the message.
+fn not_locked_forever(bucket: &str) -> Result<(), String> {
+    if store::locked_forever(bucket) {
+        return Err(
+            "refused: SPAWN_R2_BUCKET names the keep bucket (locked for good); spawn backup \
+never writes there, only spawn store does"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn home() -> PathBuf {
@@ -1503,6 +1538,9 @@ fn put_object(
     sha256: &str,
     events: i64,
 ) -> Result<(), String> {
+    // Again at the PUT itself, before any request (settings are checked
+    // when read; this holds whatever built them).
+    not_locked_forever(&settings.r2.bucket)?;
     let md5 = md5_file(file)?;
     let options = format!(
         "upload-file = \"{}\"\nheader = \"Content-Type: application/octet-stream\"\n\
@@ -2970,10 +3008,10 @@ fn record_verified(
 #[cfg(test)]
 mod tests {
     use super::{
-        Stamp, Tier, bundle_compression, bundle_stamps, copy_events, full_bundle, md5_hex,
-        parse_env_file, parse_listing, parse_listing_tagged, parse_pg_url, read_bundle_records,
-        read_dump_records, server_major, suspect, tiers_for, transcript_offset, window_files,
-        within_limit, without_transaction_timeout,
+        R2, Settings, Stamp, Tier, bundle_compression, bundle_stamps, copy_events, full_bundle,
+        md5_hex, not_locked_forever, parse_env_file, parse_listing, parse_listing_tagged,
+        parse_pg_url, put_object, read_bundle_records, read_dump_records, server_major, suspect,
+        tiers_for, transcript_offset, window_files, within_limit, without_transaction_timeout,
     };
 
     /// `SPAWN_BACKUP_PREFIX` is a bucket prefix and nothing else: unset or
@@ -3287,6 +3325,50 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         let (entries, token) = parse_listing(last);
         assert_eq!(entries, [("c".to_string(), 5)]);
         assert_eq!(token, None, "the last page names no token");
+    }
+
+    /// `spawn backup` never writes to the keep bucket (the lead,
+    /// 2026-11-13): refused at the PUT before any request (the endpoint is
+    /// a closed port: a request would fail otherwise), and when its
+    /// settings are read.
+    #[test]
+    fn spawn_backup_never_writes_to_the_keep_bucket() {
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-backup-keep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.subsec_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let file = dir.join("object");
+        std::fs::write(&file, b"bytes").expect("object");
+        let settings = |bucket: &str| Settings {
+            root: dir.clone(),
+            key_file: dir.join("key"),
+            r2: R2 {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: bucket.to_string(),
+                access_key: "made-up-id".to_string(),
+                secret_key: "made-up-secret".to_string(),
+            },
+            pg_bin: None,
+            compress: "zstd:9".to_string(),
+            transcript_days: 14,
+            limit_bytes: 1,
+            alert_bytes: 1,
+            prefix: "locktest/x/".to_string(),
+            drill_url: None,
+        };
+        let error = put_object(&settings("made-up-keep"), "k", &file, "s", 0).unwrap_err();
+        assert!(error.contains("never writes there"), "{error}");
+        assert!(!error.contains("made-up-keep"), "{error}");
+        // Another bucket gets as far as the request (a closed port).
+        let error = put_object(&settings("made-up-store"), "k", &file, "s", 0).unwrap_err();
+        assert!(!error.contains("never writes there"), "{error}");
+        assert!(not_locked_forever("made-up-keep").is_err());
+        assert!(not_locked_forever("made-up-store").is_ok());
+        std::fs::remove_dir_all(&dir).expect("clean up");
     }
 
     #[test]

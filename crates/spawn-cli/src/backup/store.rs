@@ -962,13 +962,14 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
             "unknown area {area} (transcripts or sessions)\n{USAGE}"
         ));
     }
-    let mut settings = Settings::from_env(&flags)?;
-    // The store's own bucket and credential, never r2.env's.
+    // The store's own bucket and credential; r2.env is never read (rev-g N5).
     let credential = env_value("SPAWN_STORE_ENV_FILE").map_or_else(
         || super::home().join(".config/spawn/r2-store.env"),
         PathBuf::from,
     );
-    settings.r2 = store_r2(&credential, env_value("SPAWN_STORE_BUCKET").as_deref())?;
+    let settings = Settings::with_r2(&flags, || {
+        store_r2(&credential, env_value("SPAWN_STORE_BUCKET").as_deref())
+    })?;
     let scratch = Scratch::new("store")?;
     let keys = Keys {
         prefix: settings.prefix.clone(),
