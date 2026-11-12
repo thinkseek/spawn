@@ -811,6 +811,19 @@ pub(crate) fn suspect(events: i64, bytes: u64, previous: Option<(i64, u64)>) -> 
 
 /// The keys and sizes of one ListObjectsV2 page, and whether more follow.
 pub(crate) fn parse_listing(xml: &str) -> (Vec<(String, u64)>, Option<String>) {
+    let (entries, token) = parse_listing_tagged(xml);
+    (
+        entries
+            .into_iter()
+            .map(|listed| (listed.key, listed.size))
+            .collect(),
+        token,
+    )
+}
+
+/// A listing page's keys with their size and ETag (unquoted, lower case:
+/// the XML spells the quotes `&quot;` or as they are).
+pub(crate) fn parse_listing_tagged(xml: &str) -> (Vec<store::Listed>, Option<String>) {
     let mut entries = Vec::new();
     let mut rest = xml;
     while let Some(start) = rest.find("<Contents>") {
@@ -823,8 +836,14 @@ pub(crate) fn parse_listing(xml: &str) -> (Vec<(String, u64)>, Option<String>) {
         let size = between(body, "<Size>", "</Size>")
             .and_then(|text| text.trim().parse::<u64>().ok())
             .unwrap_or(0);
+        let etag = between(body, "<ETag>", "</ETag>")
+            .unwrap_or_default()
+            .replace("&quot;", "")
+            .replace('"', "")
+            .trim()
+            .to_ascii_lowercase();
         if !key.is_empty() {
-            entries.push((key, size));
+            entries.push(store::Listed { key, size, etag });
         }
         rest = &block[end + "</Contents>".len()..];
     }
@@ -1557,8 +1576,8 @@ fn head_object(settings: &Settings, key: &str) -> Result<Option<store::Head>, St
     }
 }
 
-/// Every key under `prefix`, with its size (every listing page).
-fn list_prefix(settings: &Settings, prefix: &str) -> Result<Vec<(String, u64)>, String> {
+/// Every key under `prefix`, with its size and ETag (every listing page).
+fn list_prefix(settings: &Settings, prefix: &str) -> Result<Vec<store::Listed>, String> {
     let mut keys = Vec::new();
     let mut token: Option<String> = None;
     for _ in 0..100_000 {
@@ -1577,8 +1596,11 @@ fn list_prefix(settings: &Settings, prefix: &str) -> Result<Vec<(String, u64)>, 
                 first_line(&String::from_utf8_lossy(&response.body))
             ));
         }
-        let (page, next) = parse_listing(&String::from_utf8_lossy(&response.body));
-        keys.extend(page.into_iter().filter(|(key, _)| key.starts_with(prefix)));
+        let (page, next) = parse_listing_tagged(&String::from_utf8_lossy(&response.body));
+        keys.extend(
+            page.into_iter()
+                .filter(|listed| listed.key.starts_with(prefix)),
+        );
         match next {
             Some(next) => token = Some(next),
             None => return Ok(keys),
@@ -2949,9 +2971,9 @@ fn record_verified(
 mod tests {
     use super::{
         Stamp, Tier, bundle_compression, bundle_stamps, copy_events, full_bundle, md5_hex,
-        parse_env_file, parse_listing, parse_pg_url, read_bundle_records, read_dump_records,
-        server_major, suspect, tiers_for, transcript_offset, window_files, within_limit,
-        without_transaction_timeout,
+        parse_env_file, parse_listing, parse_listing_tagged, parse_pg_url, read_bundle_records,
+        read_dump_records, server_major, suspect, tiers_for, transcript_offset, window_files,
+        within_limit, without_transaction_timeout,
     };
 
     /// `SPAWN_BACKUP_PREFIX` is a bucket prefix and nothing else: unset or
@@ -3265,6 +3287,26 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         let (entries, token) = parse_listing(last);
         assert_eq!(entries, [("c".to_string(), 5)]);
         assert_eq!(token, None, "the last page names no token");
+    }
+
+    #[test]
+    fn a_listing_gives_each_keys_etag_unquoted() {
+        let page = "<ListBucketResult><Contents><Key>a</Key><Size>3</Size>\
+<ETag>&quot;0CC175B9C0F1B6A831C399E269772661&quot;</ETag></Contents><Contents><Key>b</Key>\
+<Size>4</Size><ETag>\"92eb5ffee6ae2fec3ad71c777531578f\"</ETag></Contents>\
+<IsTruncated>false</IsTruncated></ListBucketResult>";
+        let (entries, _) = parse_listing_tagged(page);
+        let tags: Vec<(&str, u64, &str)> = entries
+            .iter()
+            .map(|listed| (listed.key.as_str(), listed.size, listed.etag.as_str()))
+            .collect();
+        assert_eq!(
+            tags,
+            [
+                ("a", 3, "0cc175b9c0f1b6a831c399e269772661"),
+                ("b", 4, "92eb5ffee6ae2fec3ad71c777531578f")
+            ]
+        );
     }
 
     #[test]

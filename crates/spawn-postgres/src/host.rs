@@ -362,8 +362,8 @@ from mission_missions m
 cross join lateral jsonb_array_elements_text(coalesce(m.sources, '[]'::jsonb)) s(source)";
 
 impl PostgresStore {
-    /// Record a `backup.dumped`, `backup.bundled` or `backup.verified`
-    /// record (owner only). Returns the event's id.
+    /// Record a `backup.dumped`, `backup.bundled`, `backup.verified` or
+    /// `backup.stored` record (owner only). Returns the event's id.
     pub fn backup_record(&self, record: &Value) -> Result<i64, StoreError> {
         Ok(self
             .query_one("select spawn_backup_record($1)", &[record])?

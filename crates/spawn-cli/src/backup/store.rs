@@ -21,22 +21,35 @@
 //! holds anything of its plaintext (rev-g F1). A key found there is taken
 //! as written (its name is its content's); `verify` finds one lost. A grown
 //! file's old bytes are read and hashed again each run it grows (the prefix
-//! check). The newest manifest is the newest key, so runs of one area,
-//! host and account must not overlap: put holds the backup lock. Nothing here deletes or overwrites an
-//! object.
+//! check). Nothing here deletes or overwrites an object.
 //!
 //! A run's manifest lists every file of the area with its size, ns mtime,
-//! whole-file sha256 and segments (offset, length, name), under a key unique
-//! to the run (`<area>/manifests/<host>/<account>/<stamp>-<random>.json.gpg`),
-//! read back the same way. A file whose size and mtime are the last
-//! manifest's is not read. The last manifest is the newest one in the bucket
-//! (never a local guess).
+//! whole-file sha256 and segments (offset, length, name, and the stored
+//! object's size and MD5), under
+//! `<area>/manifests/<host>/<account>/<generation>-<stamp>-<random>.json.gpg`,
+//! read back the same way. The generation is the last manifest's plus one,
+//! taken under the backup lock (runs of one area, host and account never
+//! overlap), twelve digits, so the newest manifest is the greatest key
+//! whatever the clock or the random part says (cc-astra A32). A file whose
+//! size and mtime are the last manifest's is not read. The last manifest is
+//! the newest one in the bucket (never a local guess). Only the newest
+//! manifest can be read back for now: choosing an older one (an earlier
+//! version of a file, a file a later run no longer saw) is not there yet;
+//! the older manifests and their objects are kept.
+//!
+//! `verify` checks the stored size and MD5 (the bucket's ETag) of every
+//! object the newest manifest names, from one listing (an ETag is the MD5
+//! only of an object sent in one PUT: nothing here is ever sent multipart,
+//! and `put` refuses an object whose ETag is not a plain MD5), and rebuilds and
+//! hashes a sample (cc-astra A30). `get` writes into the directory it is
+//! given through descriptors: no parent is followed through a symlink and
+//! the file is created exclusively, never over anything (cc-astra A29).
 //!
 //! It ships switched off: until `SPAWN_STORE_ENABLED=1`, `put` writes only
 //! under a `locktest/` prefix (`SPAWN_BACKUP_PREFIX`), the throwaway prefix
 //! of the existing bucket. Originals are never moved or removed.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -71,12 +84,17 @@ pub(crate) struct Segment {
     pub(crate) offset: u64,
     pub(crate) length: u64,
     pub(crate) name: String,
+    /// The stored (sealed) object's size and MD5, as the bucket lists them.
+    pub(crate) stored: u64,
+    pub(crate) etag: String,
 }
 
 /// A run's manifest: every file of the area as the run left it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Manifest {
     pub(crate) version: u32,
+    /// The last manifest's plus one (1 for the first).
+    pub(crate) generation: u64,
     pub(crate) area: String,
     pub(crate) host: String,
     pub(crate) account: String,
@@ -99,6 +117,15 @@ pub(crate) struct Head {
     pub(crate) sha256: String,
 }
 
+/// A key as the bucket lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Listed {
+    pub(crate) key: String,
+    pub(crate) size: u64,
+    /// The ETag, lower case, unquoted (the MD5 of an object put whole).
+    pub(crate) etag: String,
+}
+
 /// The bucket, as this layer uses it: never a delete, never an overwrite.
 pub(crate) trait Bucket {
     /// Write `file` at `key` unless the key exists (`If-None-Match: *`),
@@ -106,8 +133,8 @@ pub(crate) trait Bucket {
     fn put_new(&self, key: &str, file: &Path, sha256: &str) -> Result<Put, String>;
     fn head(&self, key: &str) -> Result<Option<Head>, String>;
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String>;
-    /// Every key under `prefix`, with its size.
-    fn list(&self, prefix: &str) -> Result<Vec<(String, u64)>, String>;
+    /// Every key under `prefix`, with its size and ETag.
+    fn list(&self, prefix: &str) -> Result<Vec<Listed>, String>;
 }
 
 /// The bucket of the backups (`spawn backup`'s settings and client).
@@ -121,7 +148,7 @@ impl Bucket for Settings {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
         super::get_object_bytes(self, key).map(|found| found.map(|(bytes, _)| bytes))
     }
-    fn list(&self, prefix: &str) -> Result<Vec<(String, u64)>, String> {
+    fn list(&self, prefix: &str) -> Result<Vec<Listed>, String> {
         super::list_prefix(self, prefix)
     }
 }
@@ -231,8 +258,11 @@ impl Keys {
             self.prefix, self.area, self.host, self.account
         )
     }
-    pub(crate) fn manifest(&self, stamp: &str, random: &str) -> String {
-        format!("{}{stamp}-{random}.json.gpg", self.manifests())
+    pub(crate) fn manifest(&self, generation: u64, stamp: &str, random: &str) -> String {
+        format!(
+            "{}{generation:012}-{stamp}-{random}.json.gpg",
+            self.manifests()
+        )
     }
 }
 
@@ -332,8 +362,22 @@ fn sources(area: &str, from: &Path, said: &mut Vec<String>) -> Result<Vec<Source
     match area {
         "transcripts" => walk(from, from, &mut out, said)?,
         "sessions" => {
-            walk(from, &from.join("projects"), &mut out, said)?;
-            walk(from, &from.join("file-history"), &mut out, said)?;
+            for root in ["projects", "file-history"] {
+                let root = from.join(root);
+                // The root itself is never followed either (cc-astra pass
+                // 39): a symlinked projects or file-history is refused.
+                match fs::symlink_metadata(&root) {
+                    Ok(metadata) if !metadata.file_type().is_dir() => {
+                        return Err(format!(
+                            "{} is not a directory (a symlink is refused)",
+                            root.display()
+                        ));
+                    }
+                    Ok(_) => walk(from, &root, &mut out, said)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(format!("{}: {error}", root.display())),
+                }
+            }
             let history = from.join("history.jsonl");
             if let Ok(metadata) = fs::symlink_metadata(&history) {
                 if metadata.file_type().is_file() {
@@ -391,6 +435,37 @@ pub(crate) struct Store<'a, B: Bucket> {
     pub(crate) seal: &'a dyn Fn(&Path, &Path) -> Result<(), String>,
     pub(crate) open: &'a dyn Fn(&Path, &Path) -> Result<(), String>,
     pub(crate) scratch: &'a Path,
+    /// The random part of a manifest's key (uniqueness only, never order).
+    pub(crate) nonce: &'a dyn Fn() -> Result<String, String>,
+}
+
+/// What a sent object is in the bucket: whether this run wrote it, and its
+/// stored size and MD5.
+struct Sent {
+    wrote: bool,
+    stored: u64,
+    etag: String,
+}
+
+/// What `verify` found of the newest manifest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Verified {
+    /// Objects the manifest names (distinct).
+    pub(crate) named: u64,
+    pub(crate) present: u64,
+    pub(crate) missing: u64,
+    /// There, but not of the size or MD5 the manifest says.
+    pub(crate) wrong: u64,
+    /// The area's objects it does not name (older versions', a failed run's).
+    pub(crate) unnamed: u64,
+    /// Files rebuilt from their objects and hashed against the manifest.
+    pub(crate) hashed: u64,
+}
+
+impl Verified {
+    pub(crate) fn ok(&self) -> bool {
+        self.missing == 0 && self.wrong == 0
+    }
 }
 
 /// What `put` did.
@@ -410,10 +485,22 @@ impl<B: Bucket> Store<'_, B> {
     /// The newest manifest of this area, host and account, and its key.
     pub(crate) fn newest(&self) -> Result<Option<(String, Manifest)>, String> {
         let listed = self.bucket.list(&self.keys.manifests())?;
-        let Some((key, _)) = listed
+        let prefix = self.keys.manifests();
+        let Some(key) = listed
             .into_iter()
-            .filter(|(key, _)| key.ends_with(".json.gpg"))
-            .max_by(|a, b| a.0.cmp(&b.0))
+            .map(|listed| listed.key)
+            .filter(|key| {
+                // Only `<generation:012>-...` keys (A32); a key of another
+                // form is never the newest.
+                key.ends_with(".json.gpg")
+                    && key
+                        .strip_prefix(&prefix)
+                        .and_then(|rest| rest.get(..13))
+                        .is_some_and(|head| {
+                            head.ends_with('-') && head[..12].bytes().all(|b| b.is_ascii_digit())
+                        })
+            })
+            .max()
         else {
             return Ok(None);
         };
@@ -439,13 +526,18 @@ impl<B: Bucket> Store<'_, B> {
     }
 
     /// Seal `bytes` and write them at `key` unless it exists; read back
-    /// either way. True when this run wrote it.
-    fn send(&self, key: &str, bytes: &[u8]) -> Result<(bool, u64), String> {
+    /// either way.
+    fn send(&self, key: &str, bytes: &[u8]) -> Result<Sent, String> {
         // A key that is there is taken as written (rev-g N1): a segment's
         // name is the HMAC of its bytes, a manifest's key is the run's own;
-        // `verify` is what finds one lost.
-        if self.bucket.head(key)?.is_some() {
-            return Ok((false, 0));
+        // `verify` is what finds one lost or changed.
+        if let Some(head) = self.bucket.head(key)? {
+            single_put(key, &head.etag)?;
+            return Ok(Sent {
+                wrote: false,
+                stored: head.length,
+                etag: head.etag,
+            });
         }
         let plain = self.scratch.join(format!("plain-{}", random_hex(6)?));
         let sealed = self.scratch.join(format!("sealed-{}", random_hex(6)?));
@@ -460,38 +552,71 @@ impl<B: Bucket> Store<'_, B> {
             // plaintext hash in the metadata would confirm a guessed
             // segment to anyone who can read the bucket.
             let sealed_sha256 = super::sha256_file(&sealed)?;
-            if self.bucket.put_new(key, &sealed, &sealed_sha256)? == Put::Existed {
-                return Ok((false, 0));
-            }
+            let wrote = self.bucket.put_new(key, &sealed, &sealed_sha256)? == Put::Written;
             // Read back before it counts: what is there is what was sent.
             let head = self
                 .bucket
                 .head(key)?
                 .ok_or_else(|| format!("{key}: not there after its PUT"))?;
-            if head.length != length || head.etag != md5 || head.sha256 != sealed_sha256 {
+            single_put(key, &head.etag)?;
+            if wrote && (head.length != length || head.etag != md5 || head.sha256 != sealed_sha256)
+            {
                 return Err(format!(
                     "{key}: read back {} bytes, ETag {:?}, sha256 {}; sent {length} bytes, MD5 {md5:?}, sha256 {sealed_sha256}",
                     head.length, head.etag, head.sha256
                 ));
             }
-            Ok((true, length))
+            Ok(Sent {
+                wrote,
+                stored: head.length,
+                etag: head.etag,
+            })
         })();
         let _ = fs::remove_file(&plain);
         let _ = fs::remove_file(&sealed);
         result
     }
 
+    /// The segment `name` holding `bytes`: as `known` holds it (this run's
+    /// or the last manifest's), else sent; its stored size and MD5.
+    fn segment(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        known: &mut BTreeMap<String, (u64, String)>,
+        counts: &mut PutCounts,
+    ) -> Result<(u64, String), String> {
+        if let Some(held) = known.get(name) {
+            return Ok(held.clone());
+        }
+        let sent = self.send(&self.keys.segment(name), bytes)?;
+        if sent.wrote {
+            counts.segments_written += 1;
+            counts.bytes_written += sent.stored;
+        } else {
+            counts.segments_found += 1;
+        }
+        known.insert(name.to_string(), (sent.stored, sent.etag.clone()));
+        Ok((sent.stored, sent.etag))
+    }
+
     /// One `put` run of the area's files `sources`.
     fn put(&self, sources: &[Source], made_ms: i64) -> Result<PutCounts, String> {
         let last = self.newest()?.map(|(_, manifest)| manifest);
+        let generation = last.as_ref().map_or(0, |manifest| manifest.generation) + 1;
         let by_path: BTreeMap<&str, &Entry> = last
             .iter()
             .flat_map(|manifest| &manifest.files)
             .map(|entry| (entry.path.as_str(), entry))
             .collect();
-        let mut known: BTreeSet<String> = by_path
+        let mut known: BTreeMap<String, (u64, String)> = by_path
             .values()
-            .flat_map(|entry| entry.segments.iter().map(|segment| segment.name.clone()))
+            .flat_map(|entry| {
+                entry
+                    .segments
+                    .iter()
+                    .map(|segment| (segment.name.clone(), (segment.stored, segment.etag.clone())))
+            })
             .collect();
         let mut counts = PutCounts::default();
         let mut files = Vec::new();
@@ -541,19 +666,13 @@ impl<B: Bucket> Store<'_, B> {
                 }
                 whole.update(&bytes);
                 let name = hex(&hmac_sha256(&self.name_key, &bytes));
-                if known.insert(name.clone()) {
-                    let (wrote, sent) = self.send(&self.keys.segment(&name), &bytes)?;
-                    if wrote {
-                        counts.segments_written += 1;
-                        counts.bytes_written += sent;
-                    } else {
-                        counts.segments_found += 1;
-                    }
-                }
+                let (stored, etag) = self.segment(&name, &bytes, &mut known, &mut counts)?;
                 segments.push(Segment {
                     offset,
                     length,
                     name,
+                    stored,
+                    etag,
                 });
             }
             files.push(Entry {
@@ -566,6 +685,7 @@ impl<B: Bucket> Store<'_, B> {
         }
         let manifest = Manifest {
             version: 1,
+            generation,
             area: self.keys.area.clone(),
             host: self.keys.host.clone(),
             account: self.keys.account.clone(),
@@ -575,12 +695,12 @@ impl<B: Bucket> Store<'_, B> {
         let text = serde_json::to_vec(&manifest).map_err(|error| error.to_string())?;
         let key = self
             .keys
-            .manifest(&Stamp::at(made_ms).text(), &random_hex(4)?);
-        let (wrote, sent) = self.send(&key, &text)?;
-        if !wrote {
+            .manifest(generation, &Stamp::at(made_ms).text(), &(self.nonce)()?);
+        let sent = self.send(&key, &text)?;
+        if !sent.wrote {
             return Err(format!("{key}: a manifest key that already existed"));
         }
-        counts.bytes_written += sent;
+        counts.bytes_written += sent.stored;
         counts.manifest = key;
         Ok(counts)
     }
@@ -618,30 +738,87 @@ impl<B: Bucket> Store<'_, B> {
         Ok(bytes)
     }
 
-    /// Every segment the newest manifest names is in the bucket; how many
-    /// are, how many are missing, and how many of the area's objects it
-    /// does not name (older versions' segments, a failed run's).
-    pub(crate) fn check(&self, manifest: &Manifest) -> Result<(u64, u64, u64), String> {
-        let named: BTreeSet<String> = manifest
-            .files
-            .iter()
-            .flat_map(|entry| {
-                entry
-                    .segments
-                    .iter()
-                    .map(|segment| self.keys.segment(&segment.name))
-            })
-            .collect();
-        let held: BTreeSet<String> = self
+    /// The newest manifest checked (cc-astra A30): every object it names
+    /// is in the bucket with the size and MD5 it recorded (one listing),
+    /// and a sample of its files (the first two and the largest, each once)
+    /// is rebuilt and hashed against it.
+    pub(crate) fn verify(&self, manifest: &Manifest) -> Result<Verified, String> {
+        let mut named: BTreeMap<String, (u64, &str)> = BTreeMap::new();
+        for segment in manifest.files.iter().flat_map(|entry| &entry.segments) {
+            named.insert(
+                self.keys.segment(&segment.name),
+                (segment.stored, segment.etag.as_str()),
+            );
+        }
+        let held: BTreeMap<String, (u64, String)> = self
             .bucket
             .list(&format!("{}{}/segments/", self.keys.prefix, self.keys.area))?
             .into_iter()
-            .map(|(key, _)| key)
+            .map(|listed| (listed.key, (listed.size, listed.etag)))
             .collect();
-        let present = named.intersection(&held).count() as u64;
-        let missing = named.difference(&held).count() as u64;
-        let unnamed = held.difference(&named).count() as u64;
-        Ok((present, missing, unnamed))
+        let mut found = Verified {
+            named: named.len() as u64,
+            ..Verified::default()
+        };
+        for (key, (stored, etag)) in &named {
+            match held.get(key) {
+                None => found.missing += 1,
+                Some((size, held_etag)) if size == stored && held_etag == etag => {
+                    found.present += 1;
+                }
+                Some(_) => found.wrong += 1,
+            }
+        }
+        found.unnamed = held.keys().filter(|key| !named.contains_key(*key)).count() as u64;
+        let mut sample: Vec<&Entry> = manifest.files.iter().take(2).collect();
+        if let Some(largest) = manifest.files.iter().max_by_key(|entry| entry.size)
+            && !sample.iter().any(|entry| entry.path == largest.path)
+        {
+            sample.push(largest);
+        }
+        if found.missing == 0 && found.wrong == 0 {
+            for entry in sample {
+                self.rebuild(entry)?;
+                found.hashed += 1;
+            }
+        }
+        Ok(found)
+    }
+}
+
+/// An object's ETag is its body's MD5 only when it was sent in one request:
+/// a multipart upload's is `<md5 of the parts' MD5s>-<parts>`. Every
+/// segment and manifest is sent with one PUT ([`super::put_new_object`]),
+/// so `verify`'s MD5 check holds; an object whose ETag is not a plain MD5
+/// is refused here rather than recorded, so a change to multipart fails the
+/// run (and `a_multipart_etag_is_refused`) instead of every later verify.
+fn single_put(key: &str, etag: &str) -> Result<(), String> {
+    if etag.len() == 32
+        && etag
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "{key}: ETag {etag:?} is not one PUT's MD5 (a multipart object?); not recorded"
+        ))
+    }
+}
+
+/// Write a rebuilt file into `into` (`get`, cc-astra A29): through
+/// descriptors from `into` down, no parent followed through a symlink, the
+/// file created exclusively (spawn-host's `create_with`); refused when
+/// anything is already at the path.
+pub(crate) fn restore(into: &Path, path: &str, bytes: &[u8]) -> Result<(), String> {
+    let relative = spawn_host::tree_path::TreePath::from_bytes(path.as_bytes());
+    match spawn_host::agent_files::create_with(into, &relative, bytes) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!(
+            "refused: {} already holds something at {path}; nothing written",
+            into.display()
+        )),
+        Err(error) => Err(format!("refused: {path} under {}: {error}", into.display())),
     }
 }
 
@@ -676,6 +853,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
         seal: &seal,
         open: &open,
         scratch: &scratch.path,
+        nonce: &|| random_hex(4),
     };
     match verb.as_str() {
         "put" => put_verb(&store, &settings, &flags, &area),
@@ -701,21 +879,18 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
             let (key, manifest) = store
                 .newest()?
                 .ok_or("no manifest in the bucket for this area, host and account")?;
-            let (present, missing, unnamed) = store.check(&manifest)?;
-            let mut sample: Vec<&Entry> = manifest.files.iter().take(2).collect();
-            if let Some(largest) = manifest.files.iter().max_by_key(|entry| entry.size) {
-                sample.push(largest);
-            }
-            let mut rebuilt = 0;
-            for entry in &sample {
-                store.rebuild(entry)?;
-                rebuilt += 1;
-            }
+            let found = store.verify(&manifest)?;
             println!(
-                "store verify {area}: {key}: {} file(s), {present} segment(s) present, {missing} missing, {unnamed} not named by it; {rebuilt} file(s) rebuilt and matched",
-                manifest.files.len()
+                "store verify {area}: {key}: {} file(s), {} object(s) named: {} present with their size and MD5, {} missing, {} of another size or MD5; {} not named by it; {} file(s) rebuilt and hashed",
+                manifest.files.len(),
+                found.named,
+                found.present,
+                found.missing,
+                found.wrong,
+                found.unnamed,
+                found.hashed
             );
-            Ok(i32::from(missing > 0))
+            Ok(i32::from(!found.ok()))
         }
         other => Err(format!("unknown store command {other}\n{USAGE}")),
     }
@@ -798,23 +973,8 @@ fn get_verb(store: &Store<'_, Settings>, flags: &Flags, area: &str) -> Result<i3
         .find(|entry| entry.path == path)
         .ok_or_else(|| format!("{path} is not in the newest manifest"))?;
     let bytes = store.rebuild(entry)?;
+    restore(&into, &entry.path, &bytes)?;
     let target = into.join(&entry.path);
-    if !into.is_dir()
-        || target.exists()
-        || entry
-            .path
-            .split('/')
-            .any(|part| part == ".." || part.is_empty())
-    {
-        return Err(format!(
-            "refused: {} (the directory must exist and the file must not)",
-            target.display()
-        ));
-    }
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
-    }
-    fs::write(&target, &bytes).map_err(|error| format!("{}: {error}", target.display()))?;
     println!(
         "store get {area}: {} ({} bytes, sha256 {})",
         target.display(),

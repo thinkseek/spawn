@@ -15,8 +15,8 @@
 //! What it read is that one file, whatever the path names a moment later:
 //! callers use the descriptor's stat, never an earlier `lstat`, and read at
 //! most a bound ([`read_regular`]) or the descriptor's size. Writers that
-//! make or move a file in a workspace go through [`create_new`] and
-//! [`rename_within`], which walk the same way.
+//! make or move a file in a workspace go through [`create_new`],
+//! [`create_with`] and [`rename_within`], which walk the same way.
 
 use std::ffi::OsStr;
 use std::fs::{File, Metadata};
@@ -174,6 +174,37 @@ pub fn create_new(top: &Path, relative: &TreePath) -> Result<bool, AgentFileErro
             "create {relative}: {error}"
         ))),
     }
+}
+
+/// Create the file `relative` under `top` holding `bytes`, never over
+/// anything: its missing parents made the way [`create_new`] makes them
+/// (none followed through a symlink), the file itself created exclusively
+/// (`O_CREAT | O_EXCL | O_NOFOLLOW`, mode 0600), so an entry already there,
+/// a dangling symlink included, or one made by another process a moment
+/// before, is left as it is: `Ok(false)`, nothing written. (`spawn store
+/// get`, which restores into a directory the caller names.)
+pub fn create_with(top: &Path, relative: &TreePath, bytes: &[u8]) -> Result<bool, AgentFileError> {
+    use std::io::Write;
+    checked(relative)?;
+    let parent = HeldDirectory::parent_of(top, relative).map_err(AgentFileError::NotRegular)?;
+    let descriptor = match rustix::fs::openat(
+        parent.descriptor(),
+        relative.file_name(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(Errno::EXIST) => return Ok(false),
+        Err(error) => {
+            return Err(AgentFileError::Failed(format!(
+                "create {relative}: {error}"
+            )));
+        }
+    };
+    File::from(descriptor)
+        .write_all(bytes)
+        .map_err(|error| AgentFileError::Failed(format!("write {relative}: {error}")))?;
+    Ok(true)
 }
 
 /// Write `bytes` as the regular file `relative` under `top`, replacing what
