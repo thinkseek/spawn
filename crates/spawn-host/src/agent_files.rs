@@ -16,7 +16,8 @@
 //! callers use the descriptor's stat, never an earlier `lstat`, and read at
 //! most a bound ([`read_regular`]) or the descriptor's size. Writers that
 //! make or move a file in a workspace go through [`create_new`],
-//! [`create_with`] and [`rename_within`], which walk the same way.
+//! [`create_with`] (which never removes anything) and [`rename_within`],
+//! which walk the same way.
 
 use std::ffi::OsStr;
 use std::fs::{File, Metadata};
@@ -176,52 +177,88 @@ pub fn create_new(top: &Path, relative: &TreePath) -> Result<bool, AgentFileErro
     }
 }
 
-/// Create the file `relative` under `top` holding `bytes`, never over
-/// anything: its missing parents made the way [`create_new`] makes them
-/// (none followed through a symlink), the file itself created exclusively
-/// (`O_CREAT | O_EXCL | O_NOFOLLOW`, mode 0600), so an entry already there,
-/// a dangling symlink included, or one made by another process a moment
-/// before, is left as it is: `Ok(false)`, nothing written. (`spawn store
-/// get`, which restores into a directory the caller names.)
-pub fn create_with(top: &Path, relative: &TreePath, bytes: &[u8]) -> Result<bool, AgentFileError> {
-    use std::io::Write;
+/// What [`create_with`] did. It never removes anything.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Created {
+    /// The file is whole at its name.
+    Written,
+    /// Something is already at this name (the file's, or its partial
+    /// name): left as it is, nothing written.
+    Exists(TreePath),
+    /// The bytes written so far are left at the partial name: the write
+    /// failed, or the file's name was taken before the partial got it.
+    Partial { partial: TreePath, why: String },
+}
+
+/// Create the file `relative` under `top` with what `write` writes, never
+/// over anything and never removing anything (cc-astra A37: a restore is
+/// not a deleter). Its missing parents are made the way [`create_new`]
+/// makes them (none followed through a symlink). The bytes go first to
+/// `relative` with `marker` appended to its name (the partial name),
+/// created exclusively (`O_CREAT | O_EXCL | O_NOFOLLOW`, mode 0600), and
+/// once whole it is given the file's name with `RENAME_NOREPLACE`. So:
+/// - an entry already at the file's name (a dangling symlink included) is
+///   refused before anything is written: [`Created::Exists`];
+/// - an entry at the partial name (an earlier restore's partial file) is
+///   refused the same way, never written over;
+/// - a write that fails, or a name taken by another process before the
+///   rename, leaves the partial file where it is: [`Created::Partial`].
+///
+/// (`spawn store get`, which restores into a directory the caller names.)
+pub fn create_with(
+    top: &Path,
+    relative: &TreePath,
+    marker: &str,
+    write: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> Result<Created, AgentFileError> {
     checked(relative)?;
+    let mut partial_bytes = relative.as_bytes().to_vec();
+    partial_bytes.extend_from_slice(marker.as_bytes());
+    let partial = TreePath::from_bytes(partial_bytes);
+    checked(&partial)?;
     let parent = HeldDirectory::parent_of(top, relative).map_err(AgentFileError::NotRegular)?;
-    let descriptor = match rustix::fs::openat(
+    match rustix::fs::statat(
         parent.descriptor(),
         relative.file_name(),
+        AtFlags::SYMLINK_NOFOLLOW,
+    ) {
+        Ok(_) => return Ok(Created::Exists(relative.clone())),
+        Err(Errno::NOENT) => {}
+        Err(error) => return Err(AgentFileError::Failed(format!("stat {relative}: {error}"))),
+    }
+    let descriptor = match rustix::fs::openat(
+        parent.descriptor(),
+        partial.file_name(),
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o600),
     ) {
         Ok(descriptor) => descriptor,
-        Err(Errno::EXIST) => return Ok(false),
+        Err(Errno::EXIST) => return Ok(Created::Exists(partial)),
         Err(error) => {
-            return Err(AgentFileError::Failed(format!(
-                "create {relative}: {error}"
-            )));
+            return Err(AgentFileError::Failed(format!("create {partial}: {error}")));
         }
     };
     let mut file = File::from(descriptor);
-    if let Err(error) = file.write_all(bytes) {
-        // The file this call made, half written: removed through the same
-        // held parent, so a run again can make it whole (rev-g N1), and
-        // only while the name still is that file (rev-g N4: same device and
-        // inode as the descriptor written, the name not followed).
-        let ours = rustix::fs::fstat(&file);
-        let there = rustix::fs::statat(
-            parent.descriptor(),
-            relative.file_name(),
-            AtFlags::SYMLINK_NOFOLLOW,
-        );
-        if let (Ok(ours), Ok(there)) = (ours, there)
-            && (ours.st_dev, ours.st_ino) == (there.st_dev, there.st_ino)
-        {
-            let _ =
-                rustix::fs::unlinkat(parent.descriptor(), relative.file_name(), AtFlags::empty());
-        }
-        return Err(AgentFileError::Failed(format!("write {relative}: {error}")));
+    if let Err(error) = write(&mut file).and_then(|()| file.sync_all()) {
+        return Ok(Created::Partial {
+            partial,
+            why: format!("write: {error}"),
+        });
     }
-    Ok(true)
+    drop(file);
+    match rustix::fs::renameat_with(
+        parent.descriptor(),
+        partial.file_name(),
+        parent.descriptor(),
+        relative.file_name(),
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => Ok(Created::Written),
+        Err(error) => Ok(Created::Partial {
+            partial,
+            why: format!("naming it {relative}: {error}"),
+        }),
+    }
 }
 
 /// Write `bytes` as the regular file `relative` under `top`, replacing what

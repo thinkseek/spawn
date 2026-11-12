@@ -43,7 +43,13 @@
 //! and `put` refuses an object whose ETag is not a plain MD5), and rebuilds and
 //! hashes a sample (cc-astra A30). `get` writes into the directory it is
 //! given through descriptors: no parent is followed through a symlink and
-//! the file is created exclusively, never over anything (cc-astra A29). A
+//! the file is created exclusively, never over anything (cc-astra A29). It
+//! never removes anything (cc-astra A37): the bytes go to
+//! `<file>.spawn-store-get.partial` and are named once whole; a write that
+//! fails leaves that partial file, names it and exits non-zero, and a
+//! restore into the same place refuses on it. An object found at a
+//! segment's key by `put` enters a manifest only once its contents are
+//! checked against the segment (length and HMAC). A
 //! stored path with a `.git` component is put like any other but not
 //! restored by `get` (the workspace's path rule refuses it); none of the
 //! areas' files has one.
@@ -684,9 +690,9 @@ impl<B: Bucket> Store<'_, B> {
     /// Seal `bytes` and write them at `key` unless it exists; read back
     /// either way.
     fn send(&self, key: &str, bytes: &[u8]) -> Result<Sent, String> {
-        // A key that is there is taken as written (rev-g N1): a segment's
-        // name is the HMAC of its bytes, a manifest's key is the run's own;
-        // `verify` is what finds one lost or changed.
+        // A key that is there is not written again; a segment found there
+        // is adopted only once its contents are checked ([`Self::adopt`]),
+        // a manifest found there is an error (the run's key is its own).
         if let Some(head) = self.bucket.head(key)? {
             single_put(key, &head.etag)?;
             return Ok(Sent {
@@ -745,15 +751,40 @@ impl<B: Bucket> Store<'_, B> {
         if let Some(held) = known.get(name) {
             return Ok(held.clone());
         }
-        let sent = self.send(&self.keys.segment(name), bytes)?;
+        let key = self.keys.segment(name);
+        let sent = self.send(&key, bytes)?;
         if sent.wrote {
             counts.segments_written += 1;
             counts.bytes_written += sent.stored;
         } else {
+            self.adopt(&key, name, bytes)?;
             counts.segments_found += 1;
         }
         known.insert(name.to_string(), (sent.stored, sent.etag.clone()));
         Ok((sent.stored, sent.etag))
+    }
+
+    /// An object found at a segment's key (a HEAD, or the conditional
+    /// PUT's "already there") enters the manifest only once its contents
+    /// are this segment's: fetched, opened, and its length and HMAC
+    /// compared with the bytes read here (cc-astra A30: never adopted on its
+    /// own size and ETag). The other trusted source is the last manifest,
+    /// ours and sealed, whose segments are taken without a request. A
+    /// mismatch is an error that names the key: never a new baseline,
+    /// never a write over it or a removal.
+    fn adopt(&self, key: &str, name: &str, bytes: &[u8]) -> Result<(), String> {
+        let found = self
+            .open_object(key)
+            .map_err(|error| format!("{key}: found, but cannot be read back: {error}"))?;
+        if found.len() != bytes.len() || hex(&hmac_sha256(&self.name_key, &found)) != name {
+            return Err(format!(
+                "{key}: the object found there is not this segment ({} bytes against {}); \
+not adopted, nothing written over it",
+                found.len(),
+                bytes.len()
+            ));
+        }
+        Ok(())
     }
 
     /// One `put` run of the area's files `sources`.
@@ -962,17 +993,39 @@ fn single_put(key: &str, etag: &str) -> Result<(), String> {
     }
 }
 
-/// Write a rebuilt file into `into` (`get`, cc-astra A29): through
-/// descriptors from `into` down, no parent followed through a symlink, the
-/// file created exclusively (spawn-host's `create_with`); refused when
-/// anything is already at the path.
+/// The partial name's mark: a restore whose write did not finish leaves
+/// `<file>.spawn-store-get.partial` (cc-astra A37).
+pub(crate) const PARTIAL_MARK: &str = ".spawn-store-get.partial";
+
+/// Write a rebuilt file into `into` (`get`, cc-astra A29 and A37): through
+/// descriptors from `into` down, no parent followed through a symlink,
+/// written to its partial name and named once whole, never over anything,
+/// never removing anything (spawn-host's `create_with`). Refused when
+/// anything is already at the path or at its partial name; a failed write
+/// leaves the partial file and names it.
 pub(crate) fn restore(into: &Path, path: &str, bytes: &[u8]) -> Result<(), String> {
+    restore_with(into, path, |file| file.write_all(bytes))
+}
+
+/// [`restore`] with the write given (a test fails it midway).
+pub(crate) fn restore_with(
+    into: &Path,
+    path: &str,
+    write: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> Result<(), String> {
+    use spawn_host::agent_files::Created;
     let relative = spawn_host::tree_path::TreePath::from_bytes(path.as_bytes());
-    match spawn_host::agent_files::create_with(into, &relative, bytes) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(format!(
-            "refused: {} already holds something at {path}; nothing written",
+    match spawn_host::agent_files::create_with(into, &relative, PARTIAL_MARK, write) {
+        Ok(Created::Written) => Ok(()),
+        Ok(Created::Exists(taken)) => Err(format!(
+            "refused: {} already holds something at {taken}; nothing written",
             into.display()
+        )),
+        Ok(Created::Partial { partial, why }) => Err(format!(
+            "{path}: not restored ({why}); the bytes written so far are left at {} \
+(a partial restore: nothing was removed, and a restore into the same place refuses until \
+it is moved away)",
+            into.join(partial.as_path()).display()
         )),
         Err(error) => Err(format!("refused: {path} under {}: {error}", into.display())),
     }

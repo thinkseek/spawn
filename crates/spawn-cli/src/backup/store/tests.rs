@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     Bucket, Entry, Head, Keys, Listed, Plan, Put, Source, Store, Verified, hmac_sha256, may_write,
-    plan, random_hex, ranges, restore, sources, store_r2,
+    plan, random_hex, ranges, restore, restore_with, sources, store_r2,
 };
 use crate::backup::{hex, md5_hex};
 
@@ -794,4 +794,111 @@ R2_SECRET_ACCESS_KEY=made-up-secret\nR2_BUCKETS=b-store,b-keep,b-work\n";
         }
     }
     fs::remove_dir_all(&dir).expect("clean up");
+}
+
+/// cc-astra A30 adoption: an object already at a segment's key enters the
+/// manifest only when its contents are that segment's; one of the right
+/// size and a valid ETag but other bytes, at the key of a file verify would
+/// not sample, is an error naming the key, and nothing is written over it.
+#[test]
+fn a_found_object_is_adopted_only_on_its_contents() {
+    let body: &[u8] = b"ddd\n";
+    let key = keys().segment(&hex(&hmac_sha256(&[7; 32], body)));
+    for (seeded, adopted) in [
+        (b"sealed:ddd\n".to_vec(), true),
+        (b"sealed:eee\n".to_vec(), false),
+    ] {
+        let dir = scratch("adopt");
+        let work = scratch("adopt-work");
+        let bucket = Memory::default();
+        let store = store(&bucket, &work);
+        fs::create_dir_all(dir.join("agent_x")).expect("agent");
+        for (name, text) in [
+            ("a", &b"aaaaaaaa\n"[..]),
+            ("b", b"bbbbbbbbbb\n"),
+            ("c", b"cccccccccccccc\n"),
+            ("d", body),
+        ] {
+            fs::write(dir.join(format!("agent_x/{name}.jsonl")), text).expect("file");
+        }
+        bucket
+            .objects
+            .borrow_mut()
+            .insert(key.clone(), (seeded.clone(), "theirs".to_string()));
+        let result = store.put(&listed(&dir), 1_000);
+        if adopted {
+            let counts = result.expect("adopted on its contents");
+            assert_eq!((counts.segments_found, counts.segments_written), (1, 3));
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.starts_with(&key), "{error}");
+            assert!(error.contains("not this segment"), "{error}");
+            assert!(store.newest().expect("newest").is_none(), "no manifest");
+        }
+        assert_eq!(
+            bucket.objects.borrow()[&key].0,
+            seeded,
+            "never written over"
+        );
+        assert!(!bucket.writes.borrow().contains_key(&key));
+        fs::remove_dir_all(&dir).expect("clean up");
+        fs::remove_dir_all(&work).expect("clean up");
+    }
+}
+
+/// cc-astra A37: a restore never deletes. A write that fails midway leaves
+/// the bytes so far at the partial name, named in the error; nothing in
+/// the directory is removed, and a restore into the same place refuses on
+/// the partial file rather than writing over it.
+#[test]
+fn a_failed_restore_leaves_its_partial_file_and_removes_nothing() {
+    use std::io::Write as _;
+    let into = scratch("a37");
+    fs::create_dir_all(into.join("p")).expect("p");
+    fs::write(into.join("p/other.jsonl"), b"theirs").expect("theirs");
+    let listing = |dir: &Path| -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("list")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    let error = restore_with(&into, "p/s.jsonl", |file| {
+        file.write_all(b"half")?;
+        Err(std::io::Error::other("the disk filled"))
+    })
+    .unwrap_err();
+    let partial = into.join("p/s.jsonl.spawn-store-get.partial");
+    assert!(error.contains(&partial.display().to_string()), "{error}");
+    assert!(error.contains("the disk filled"), "{error}");
+    assert_eq!(fs::read(&partial).expect("the partial file"), b"half");
+    assert_eq!(
+        listing(&into.join("p")),
+        ["other.jsonl", "s.jsonl.spawn-store-get.partial"],
+        "nothing removed, the file not made"
+    );
+    assert_eq!(
+        fs::read(into.join("p/other.jsonl")).expect("theirs"),
+        b"theirs"
+    );
+    let error = restore(&into, "p/s.jsonl", b"whole").unwrap_err();
+    assert!(error.contains("already holds"), "{error}");
+    assert!(error.contains("s.jsonl.spawn-store-get.partial"), "{error}");
+    assert_eq!(
+        fs::read(&partial).expect("still"),
+        b"half",
+        "never written over"
+    );
+    // A whole restore elsewhere names its file and leaves no partial.
+    restore(&into, "p/t.jsonl", b"whole").expect("whole");
+    assert_eq!(fs::read(into.join("p/t.jsonl")).expect("t"), b"whole");
+    assert!(!into.join("p/t.jsonl.spawn-store-get.partial").exists());
+    fs::remove_dir_all(&into).expect("clean up");
 }
