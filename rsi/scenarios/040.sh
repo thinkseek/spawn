@@ -385,9 +385,9 @@ base="http://127.0.0.1:$port"
 # post_input <body>: the status code; the answer in $WORK/input.json. As the
 # page posts it: JSON, the page's own Origin, from the owner's own client.
 post_input() {
-    curl -s --noproxy '*' -o "$WORK/input.json" -w '%{http_code}' -X POST \
+    bb_http "$WORK/input.json" --noproxy '*' -X POST \
         -H 'Content-Type: application/json' -H "Origin: $base" \
-        --data "$1" "$base/api/session/$SESSION/input" 2>/dev/null || echo 000
+        --data "$1" "$base/api/session/$SESSION/input"
 }
 get_json() { # <path> <file>
     code=$(curl -s --noproxy '*' -o "$2" -w '%{http_code}' "$base$1" 2>/dev/null) || code=000

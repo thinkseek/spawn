@@ -275,7 +275,7 @@ while [ "$i" -lt 100 ]; do
 done
 [ -n "$port" ] || harness "serve did not start: $(head -c 400 "$WORK/serve.log")"
 get() { # <path> <file>: the status code
-    curl -s --noproxy '*' -o "$2" -w '%{http_code}' "http://127.0.0.1:$port$1" 2>/dev/null || echo 000
+    bb_http "$2" --noproxy '*' "http://127.0.0.1:$port$1"
 }
 
 # --- (1) /api/rsi -----------------------------------------------------------------------

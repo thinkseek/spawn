@@ -734,9 +734,9 @@ keys_part() {
     [ -n "$port" ] || harness "serve did not start: $(head -c 400 "$WORK/serve.log")"
     # post_key <session> <body>: the status code; the answer in $WORK/key.json.
     post_key() {
-        curl -s -o "$WORK/key.json" -w '%{http_code}' -X POST \
+        bb_http "$WORK/key.json" -X POST \
             -H 'Content-Type: application/json' -H "Origin: http://127.0.0.1:$port" \
-            --data "$2" "http://127.0.0.1:$port/api/session/$1/key" 2>/dev/null || echo 000
+            --data "$2" "http://127.0.0.1:$port/api/session/$1/key"
     }
     before_keys=$(read_count key '')
     code=$(post_key "$SESSION" '{"name":"up","key":"bb-page-up"}')
