@@ -896,6 +896,24 @@ fn a_failed_restore_leaves_its_partial_file_and_removes_nothing() {
         b"half",
         "never written over"
     );
+    // A creator racing the write: the file's name taken while the partial
+    // is written. The rename never replaces it; ours stays the partial.
+    let raced = into.join("p/r.jsonl");
+    let error = restore_with(&into, "p/r.jsonl", |file| {
+        fs::write(&raced, b"theirs")?;
+        file.write_all(b"ours")
+    })
+    .unwrap_err();
+    assert!(error.contains("r.jsonl.spawn-store-get.partial"), "{error}");
+    assert_eq!(
+        fs::read(&raced).expect("theirs"),
+        b"theirs",
+        "never replaced"
+    );
+    assert_eq!(
+        fs::read(into.join("p/r.jsonl.spawn-store-get.partial")).expect("ours"),
+        b"ours"
+    );
     // A whole restore elsewhere names its file and leaves no partial.
     restore(&into, "p/t.jsonl", b"whole").expect("whole");
     assert_eq!(fs::read(into.join("p/t.jsonl")).expect("t"), b"whole");
