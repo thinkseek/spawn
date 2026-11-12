@@ -346,3 +346,26 @@ test("a refused test database URL file is said by its name and its reason", () =
   });
   assert.deepEqual(view.pending, ["test database URL file loose not used: mode 0644, not 0600"]);
 });
+
+// Objective 100: interventions per agent-hour is the Home card's, over its
+// 24 h window, said beside its name; a figure without a window is named as
+// it was.
+test("a figure that says its window is named with it", () => {
+  const view = coreLinesView({
+    lines: [
+      {
+        line: "observability",
+        north_star: { key: "observability.needs_you_right", name: "Needs you is right", unit: "share", value: null, range: null, state: "not_collected" },
+        guardrails: [
+          { key: "observability.interventions_per_agent_hour", name: "Human interventions per agent-hour", unit: "ratio", value: 0.25, range: null, state: "no_range", window: "24h" },
+          { key: "observability.unpriced_share", name: "Use with no price", unit: "share", value: 0, range: null, state: "no_range" },
+        ],
+      },
+    ],
+  });
+  assert.deepEqual(view.rows[0].guardrails.map((mark) => mark.name), [
+    "Human interventions per agent-hour (last 24 h)",
+    "Use with no price",
+  ]);
+  assert.equal(view.rows[0].north_star.name, "Needs you is right");
+});

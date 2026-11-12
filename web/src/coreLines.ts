@@ -26,6 +26,9 @@ export interface CoreFigure {
   trend?: CoreTrendPoint[];
   /** A figure still measuring its window: when it started (objective 095). */
   measuring_since_ms?: number | null;
+  /** The window a figure is read over, when it says one (objective 100:
+   * interventions per agent-hour, "24h"). */
+  window?: string;
 }
 
 /** One day of a figure's trend. */
@@ -212,13 +215,24 @@ export function sinceWords(ms: number): string {
   return `${two(at.getMonth() + 1)}-${two(at.getDate())} ${two(at.getHours())}:${two(at.getMinutes())}`;
 }
 
+/** A figure's window beside its name: " (last 24 h)" for "24h", " (last 7
+ * days)" for "7d", nothing without one. */
+function windowWords(window: unknown): string {
+  if (typeof window !== "string" || window === "") return "";
+  const hours = /^(\d+)h$/.exec(window);
+  if (hours) return ` (last ${hours[1]} h)`;
+  const days = /^(\d+)d$/.exec(window);
+  if (days) return ` (last ${days[1]} ${days[1] === "1" ? "day" : "days"})`;
+  return ` (${window})`;
+}
+
 function mark(raw: unknown): CoreMark {
   const figure = (typeof raw === "object" && raw !== null ? raw : {}) as Partial<CoreFigure>;
   const unit = typeof figure.unit === "string" ? figure.unit : "count";
   const value = finite(figure.value);
   const since = finite(figure.measuring_since_ms);
   return {
-    name: typeof figure.name === "string" ? figure.name : String(figure.key ?? ""),
+    name: `${typeof figure.name === "string" ? figure.name : String(figure.key ?? "")}${windowWords(figure.window)}`,
     value:
       value !== null ? unitWords(unit, value) : since !== null ? `measuring since ${sinceWords(since)}` : "not collected yet",
     range: rangeWords(unit, figure.range),
