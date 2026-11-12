@@ -481,6 +481,35 @@ pub(crate) fn reading() -> Result<(Value, Parts), String> {
     Ok((view, parts))
 }
 
+/// Warm the reading at serve's start (the lead, 2026-11-13: the first GET
+/// after each restart took about 3 s, later ones 0.05 s): one reading run
+/// now, as a request would run it, so the kept performance figures, the
+/// storage sizes and the archive's parsed files are there for the first
+/// person. Its line says each part's time, so the first deploy shows which
+/// part the cold start costs. No store read beyond the request's own, and
+/// not on the alert step's path.
+pub(super) fn warm() -> String {
+    let begun = Instant::now();
+    let warmed = super::open_store()
+        .and_then(|store| warm_at(&store, ranges_path().as_deref(), nightly_dir().as_deref()));
+    let took = begun.elapsed().as_millis();
+    match warmed {
+        Ok(parts) => format!("core lines warmed in {took} ms: {}", parts.text()),
+        Err(error) => format!("core lines not warmed ({took} ms): {error}"),
+    }
+}
+
+/// [`warm`]'s reading through `store`, its parts.
+pub(super) fn warm_at(
+    store: &spawn_postgres::PostgresStore,
+    path: Option<&Path>,
+    nightly: Option<&Path>,
+) -> Result<Parts, String> {
+    let mut parts = Parts::default();
+    core_lines_timed(store, path, nightly, &mut parts)?;
+    Ok(parts)
+}
+
 /// The answer with the ranges file at `path` and the nightly's fact files
 /// in `nightly`, read now, with the trends of the last 7 days' samples.
 pub(super) fn core_lines_at(
