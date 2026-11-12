@@ -98,7 +98,11 @@ fn words(unit: &str, value: &Value) -> String {
             if minutes < 60.0 {
                 format!("{minutes:.0} min")
             } else {
-                format!("{:.0} h {:.0} min", (minutes / 60.0).floor(), minutes % 60.0)
+                format!(
+                    "{:.0} h {:.0} min",
+                    (minutes / 60.0).floor(),
+                    minutes % 60.0
+                )
             }
         }
         "share" => format!("{:.1}%", number * 100.0),
@@ -122,7 +126,12 @@ fn range_words(unit: &str, range: &Value) -> String {
 /// evidence's `key`, else its subject's.
 fn figure_of(subject: &str, evidence: &Value) -> String {
     evidence["key"].as_str().map_or_else(
-        || subject.strip_prefix("guardrail ").unwrap_or(subject).to_string(),
+        || {
+            subject
+                .strip_prefix("guardrail ")
+                .unwrap_or(subject)
+                .to_string()
+        },
         str::to_string,
     )
 }
@@ -166,7 +175,8 @@ impl Monitor {
             if figure.state == "out" {
                 self.guardrail_back.remove(&figure.key);
                 let since = *self.guardrail_out.entry(figure.key.clone()).or_insert(now);
-                if open.is_empty() && now.saturating_sub(since) >= self.settings.guardrail_raise_ms {
+                if open.is_empty() && now.saturating_sub(since) >= self.settings.guardrail_raise_ms
+                {
                     let line = figure.line.clone();
                     out.push(Event::Fire {
                         key: format!("{KIND}:{}:{since}", figure.key),
@@ -269,7 +279,11 @@ mod tests {
     }
 
     /// One reading at `at`: the events, and the lines.
-    fn read(monitor: &mut Monitor, at: i64, reading: Result<Value, String>) -> (Vec<Event>, Vec<String>) {
+    fn read(
+        monitor: &mut Monitor,
+        at: i64,
+        reading: Result<Value, String>,
+    ) -> (Vec<Event>, Vec<String>) {
         let (mut out, mut lines) = (Vec::new(), Vec::new());
         monitor.guardrail_events(at, reading, &mut out, &mut lines);
         (out, lines)
@@ -279,7 +293,13 @@ mod tests {
     fn commit(monitor: &mut Monitor, events: &[Event]) {
         for event in events {
             match event {
-                Event::Fire { key, kind, subject, evidence, .. } => {
+                Event::Fire {
+                    key,
+                    kind,
+                    subject,
+                    evidence,
+                    ..
+                } => {
                     monitor.known.entry(key.clone()).or_insert(Row {
                         kind: (*kind).to_string(),
                         subject: subject.clone(),
@@ -316,15 +336,42 @@ mod tests {
     fn a_figure_held_out_raises_once_after_the_hold_and_a_reading_in_restarts_it() {
         let mut monitor = monitor();
         let low = || Ok(answer("out", json!(2 * GIB)));
-        assert!(read(&mut monitor, 1000, low()).0.is_empty(), "out, the hold just began");
-        assert!(read(&mut monitor, 1000 + RAISE - 1, low()).0.is_empty(), "not held long enough");
+        assert!(
+            read(&mut monitor, 1000, low()).0.is_empty(),
+            "out, the hold just began"
+        );
+        assert!(
+            read(&mut monitor, 1000 + RAISE - 1, low()).0.is_empty(),
+            "not held long enough"
+        );
         // A reading in range restarts the count.
-        assert!(read(&mut monitor, 1000 + RAISE - 1, Ok(answer("in", json!(50 * GIB)))).0.is_empty());
-        assert!(read(&mut monitor, 1000 + RAISE, low()).0.is_empty(), "the hold starts again");
+        assert!(
+            read(
+                &mut monitor,
+                1000 + RAISE - 1,
+                Ok(answer("in", json!(50 * GIB)))
+            )
+            .0
+            .is_empty()
+        );
+        assert!(
+            read(&mut monitor, 1000 + RAISE, low()).0.is_empty(),
+            "the hold starts again"
+        );
         let start = 1000 + RAISE;
         let (fired, _) = read(&mut monitor, start + RAISE, low());
-        assert_eq!(keys(&fired), [format!("fire {KIND}:storage.free_bytes:{start}")]);
-        let Event::Fire { kind, subject, evidence, text, .. } = &fired[0] else {
+        assert_eq!(
+            keys(&fired),
+            [format!("fire {KIND}:storage.free_bytes:{start}")]
+        );
+        let Event::Fire {
+            kind,
+            subject,
+            evidence,
+            text,
+            ..
+        } = &fired[0]
+        else {
             panic!("a fire");
         };
         assert_eq!(*kind, KIND);
@@ -335,8 +382,14 @@ mod tests {
                     "value": 2 * GIB, "range": {"min": 42_949_672_960_i64},
                     "out_since_ms": start, "reading_ms": start + RAISE})
         );
-        assert!(text.contains("storage") && text.contains("Free disk"), "{text}");
-        assert!(text.contains("2.0 GB") && text.contains("40.0 GB or more"), "{text}");
+        assert!(
+            text.contains("storage") && text.contains("Free disk"),
+            "{text}"
+        );
+        assert!(
+            text.contains("2.0 GB") && text.contains("40.0 GB or more"),
+            "{text}"
+        );
         commit(&mut monitor, &fired);
         // One open per figure: still out, nothing more.
         assert!(read(&mut monitor, start + 3 * RAISE, low()).0.is_empty());
@@ -351,15 +404,23 @@ mod tests {
         let (fired, _) = read(&mut monitor, RAISE, low());
         commit(&mut monitor, &fired);
         let back = RAISE + 1000;
-        assert!(read(&mut monitor, back, fine()).0.is_empty(), "back in, the hold just began");
+        assert!(
+            read(&mut monitor, back, fine()).0.is_empty(),
+            "back in, the hold just began"
+        );
         assert!(read(&mut monitor, back + CLEAR - 1, fine()).0.is_empty());
         // Out again: the clear hold restarts.
         assert!(read(&mut monitor, back + CLEAR - 1, low()).0.is_empty());
         let again = back + CLEAR;
         assert!(read(&mut monitor, again, fine()).0.is_empty());
         let (cleared, _) = read(&mut monitor, again + CLEAR, fine());
-        assert_eq!(keys(&cleared), [format!("clear {KIND}:storage.free_bytes:0")]);
-        let Event::Clear { evidence, .. } = &cleared[0] else { panic!("a clear") };
+        assert_eq!(
+            keys(&cleared),
+            [format!("clear {KIND}:storage.free_bytes:0")]
+        );
+        let Event::Clear { evidence, .. } = &cleared[0] else {
+            panic!("a clear")
+        };
         assert_eq!(
             evidence,
             &json!({"key": "storage.free_bytes", "state": "in", "value": 50 * GIB,
@@ -373,8 +434,16 @@ mod tests {
     fn no_range_or_no_value_raises_nothing_and_clears_an_open_one_after_the_hold() {
         let mut monitor = monitor();
         for at in [0, RAISE, 3 * RAISE] {
-            assert!(read(&mut monitor, at, Ok(answer("no_range", json!(1)))).0.is_empty());
-            assert!(read(&mut monitor, at, Ok(answer("not_collected", Value::Null))).0.is_empty());
+            assert!(
+                read(&mut monitor, at, Ok(answer("no_range", json!(1))))
+                    .0
+                    .is_empty()
+            );
+            assert!(
+                read(&mut monitor, at, Ok(answer("not_collected", Value::Null)))
+                    .0
+                    .is_empty()
+            );
         }
         // A figure that loses its value counts as not out.
         read(&mut monitor, 10 * RAISE, Ok(answer("out", json!(1))));
@@ -416,12 +485,24 @@ mod tests {
         );
         // Still out, well past the hold: no second alert.
         for at in [100, 100 + RAISE, 100 + 3 * RAISE] {
-            assert!(read(&mut restarted, at, Ok(answer("out", json!(1)))).0.is_empty());
+            assert!(
+                read(&mut restarted, at, Ok(answer("out", json!(1))))
+                    .0
+                    .is_empty()
+            );
         }
         // Back in: it clears after the hold, counted from this run's reading.
         let back = 100 + 4 * RAISE;
-        assert!(read(&mut restarted, back, Ok(answer("in", json!(50 * GIB)))).0.is_empty());
-        let (cleared, _) = read(&mut restarted, back + CLEAR, Ok(answer("in", json!(50 * GIB))));
+        assert!(
+            read(&mut restarted, back, Ok(answer("in", json!(50 * GIB))))
+                .0
+                .is_empty()
+        );
+        let (cleared, _) = read(
+            &mut restarted,
+            back + CLEAR,
+            Ok(answer("in", json!(50 * GIB))),
+        );
         assert_eq!(keys(&cleared), [format!("clear {key}")]);
     }
 
@@ -442,7 +523,9 @@ mod tests {
         );
         let (cleared, _) = read(&mut monitor, 20, Ok(answer("in", json!(50 * GIB))));
         assert_eq!(keys(&cleared), [format!("clear {key}")]);
-        let Event::Clear { evidence, .. } = &cleared[0] else { panic!("a clear") };
+        let Event::Clear { evidence, .. } = &cleared[0] else {
+            panic!("a clear")
+        };
         assert_eq!(
             evidence,
             &json!({"key": "storage.free_disk", "state": "gone", "reading_ms": 20})
@@ -465,7 +548,10 @@ mod tests {
         assert_eq!(words("count", &json!(1214)), "1214");
         assert_eq!(words("days", &json!(30)), "30 days");
         assert_eq!(range_words("share", &json!({"max": 0.05})), "5.0% or less");
-        assert_eq!(range_words("count", &json!({"min": 1, "max": 2})), "between 1 and 2");
+        assert_eq!(
+            range_words("count", &json!({"min": 1, "max": 2})),
+            "between 1 and 2"
+        );
         assert_eq!(range_words("count", &json!({})), "no range set");
     }
 }
