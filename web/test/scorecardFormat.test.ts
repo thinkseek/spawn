@@ -8,6 +8,7 @@ import {
   modelCostText,
   ownerRunsNote,
   ownerRunsTileNote,
+  reportToLiveText,
   tileNote,
   undecidedText,
 } from "../src/scorecardFormat.ts";
@@ -117,4 +118,28 @@ test("the Scorecard page's gate time tile, the fleet's and each mission's, shows
   assert.equal(ownerRunsTileNote("cost", from - HOUR, from), null);
   assert.equal(ownerRunsTileNote("throughput", from - HOUR, null), null);
   assert.equal(ownerRunsTileNote("gate_time", from - HOUR, undefined), null);
+});
+
+// Objective 081: from a landing's report to the deploy that puts it live.
+test("reportToLiveText says the median in hours, the live landings and the ones not live yet", () => {
+  // rsi/scenarios/081.sh: 1.0 h over four live landings, one waiting.
+  assert.equal(
+    reportToLiveText({ value: 3_600_000, p90: 7_200_000, n: 4, not_live: 1 } as never),
+    "1.0 h from report to live (4 landings; 1 not live yet)",
+  );
+  assert.equal(reportToLiveText({ value: 5_400_000, n: 1, not_live: 0 }), "1.5 h from report to live (1 landing)");
+  assert.equal(reportToLiveText({ value: 2_880_000, n: 4, not_live: 3 }), "0.8 h from report to live (4 landings; 3 not live yet)");
+  assert.equal(reportToLiveText({ value: 36 * 3_600_000, n: 12 }), "36.0 h from report to live (12 landings)");
+  // No value (below the minimum), or no dimension (an older server): null.
+  assert.equal(reportToLiveText({ value: null, n: 2, not_live: 1 }), null);
+  assert.equal(reportToLiveText({}), null);
+  assert.equal(reportToLiveText(null), null);
+  assert.equal(reportToLiveText(undefined), null);
+});
+
+test("the Scorecard page's report-to-live tile shows that line; no other tile does", () => {
+  const dimension = { value: 3_600_000, n: 4, not_live: 1 };
+  assert.equal(tileNote("report_to_live", dimension as never), "1.0 h from report to live (4 landings; 1 not live yet)");
+  assert.equal(tileNote("report_to_live", { value: null, n: 1 } as never), null);
+  assert.equal(tileNote("lead_time", dimension as never), null);
 });

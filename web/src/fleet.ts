@@ -7,8 +7,8 @@ import type { Labels } from "./label.ts";
 import type { CommandMessage, MessageActed } from "./messages.ts";
 import { labels } from "./label.ts";
 import { readApi } from "./api";
-import type { GateRoom, Memory, Storage } from "./resources";
-import { normalizeGateRoom, normalizeMemory, normalizeStorage } from "./resources";
+import type { Backups, GateRoom, Memory, Storage } from "./resources";
+import { normalizeBackups, normalizeGateRoom, normalizeMemory, normalizeStorage } from "./resources";
 import type { RsiPane } from "./rsi";
 import { normalizePane } from "./rsi";
 
@@ -147,6 +147,8 @@ export interface FleetHealth {
   gate_room: GateRoom[] | null;
   /** What uses the disk and how long it lasts; null when not reported. */
   storage: Storage | null;
+  /** The newest database copy and bundle uploaded; null when not reported. */
+  backups: Backups | null;
 }
 
 export interface DiskPlace {
@@ -455,6 +457,7 @@ function normalizeHealth(value: unknown, agents: FleetAgent[]): FleetHealth {
     memory: normalizeMemory(health.memory),
     gate_room: normalizeGateRoom(health.gate_room),
     storage: normalizeStorage(health.storage),
+    backups: normalizeBackups(health.backups),
   };
 }
 

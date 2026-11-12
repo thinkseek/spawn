@@ -1,4 +1,4 @@
-//! The eight dimensions of one scope over one window, from a [`History`]
+//! The nine dimensions of one scope over one window, from a [`History`]
 //! (docs/design.md §15).
 
 use std::collections::BTreeMap;
@@ -62,6 +62,11 @@ pub(crate) struct Counts {
     pub(crate) open_ms: i64,
     /// Lead times of the landings, sorted.
     pub(crate) lead_ms: Vec<i64>,
+    /// The live landings' waits from their report to the deploy that put
+    /// them live, sorted; and how many landings are not live yet
+    /// (objective 081). A landing with no report counts in neither.
+    pub(crate) report_to_live_ms: Vec<i64>,
+    pub(crate) not_live: usize,
     pub(crate) first_pass: usize,
     pub(crate) marks: BTreeMap<Kind, usize>,
     pub(crate) tokens: i64,
@@ -132,9 +137,15 @@ pub(crate) fn counts(history: &History, scope: Scope, window: Window) -> Counts 
             counts.landed += 1;
             counts.lead_ms.push(landing.lead_ms);
             counts.first_pass += usize::from(landing.first_pass);
+            match (landing.report_to_live_ms, landing.reported_at) {
+                (Some(ms), _) => counts.report_to_live_ms.push(ms),
+                (None, Some(_)) => counts.not_live += 1,
+                (None, None) => {}
+            }
         }
     }
     counts.lead_ms.sort_unstable();
+    counts.report_to_live_ms.sort_unstable();
     for mark in &history.marks {
         if scope.holds(mark.mission) && window.holds(mark.at) {
             *counts.marks.entry(mark.kind).or_insert(0) += 1;
@@ -293,7 +304,7 @@ fn per_landed(counts: &Counts, enough: bool, numerator: impl Into<i128>) -> Opti
     }
 }
 
-const NAMES: [&str; 8] = [
+const NAMES: [&str; 9] = [
     "throughput",
     "lead_time",
     "first_pass",
@@ -302,6 +313,7 @@ const NAMES: [&str; 8] = [
     "reliability",
     "cost",
     "gate_time",
+    "report_to_live",
 ];
 
 const SEND_BACKS: [(Kind, &str); 4] = [
@@ -368,6 +380,31 @@ fn lead_time(counts: &Counts, enough: bool) -> Dimension {
     Dimension {
         value: rank(50),
         n: counts.landed,
+        better: Better::Lower,
+        parts,
+    }
+}
+
+/// The performance north star (objective 081): how long a landing waits
+/// from its task's last report to the deploy that puts it live, the median
+/// and p90 by nearest rank over the window's live landings; `n` is how
+/// many are live, `not_live` how many have no deploy yet (left out of the
+/// figures). Enough at [`MIN_N`] live landings.
+fn report_to_live(counts: &Counts) -> Dimension {
+    let live = counts.report_to_live_ms.len();
+    let rank = |percent| {
+        if live >= MIN_N {
+            whole(nearest_rank(&counts.report_to_live_ms, percent))
+        } else {
+            None
+        }
+    };
+    let mut parts = Map::new();
+    parts.insert("p90".into(), number(rank(90)));
+    parts.insert("not_live".into(), usize_json(counts.not_live));
+    Dimension {
+        value: rank(50),
+        n: live,
         better: Better::Lower,
         parts,
     }
@@ -480,7 +517,7 @@ fn gate_time(counts: &Counts) -> Dimension {
     }
 }
 
-/// The eight dimensions of `counts`, in [`NAMES`] order.
+/// The nine dimensions of `counts`, in [`NAMES`] order.
 fn dimensions_of(counts: &Counts) -> Vec<Dimension> {
     let enough = counts.landed >= MIN_N;
     vec![
@@ -492,10 +529,11 @@ fn dimensions_of(counts: &Counts) -> Vec<Dimension> {
         marks_per_landing(counts, enough, &FAILURES, "events", "by_kind"),
         cost(counts, enough),
         gate_time(counts),
+        report_to_live(counts),
     ]
 }
 
-/// The eight dimensions of `counts` as JSON, each with `value`, `n`,
+/// The nine dimensions of `counts` as JSON, each with `value`, `n`,
 /// `enough`, `better`, `previous`, `trend` and its parts; `previous` and
 /// `trend` from `previous` (the previous window's counts), null without it.
 pub(crate) fn dimensions(counts: &Counts, previous: Option<&Counts>) -> Value {

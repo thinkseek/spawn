@@ -41,7 +41,8 @@
 #         bytes now less the `archive_bytes` of the oldest sample of the
 #         last 7 days, over the days between them; null without a sample
 #         at least a day old;
-#       - `days_left`: free_bytes over growth_bytes_per_day, rounded down;
+#       - `days_left`: free_bytes over growth_bytes_per_day, rounded down
+#         (since objective 085, over persistent_growth_bytes_per_day);
 #         null when the growth is null or not above zero.
 #   (3) resources.ts `storageView(storage)`: `rows` [{name, size, note}]
 #       holding, in this order (other rows may sit among them), rows for
@@ -407,7 +408,17 @@ fi
 free=$(storage '.free_bytes')
 slack=$((df_free / 100 > 64 * MIB ? df_free / 100 : 64 * MIB))
 near "$free" "$df_free" "$slack" || check_failed "(2) free_bytes [$free], against df's [$df_free] (slack $slack)"
-if [ "$free" != null ] && [ "$growth" != null ] && [ "$growth" -gt 0 ] 2>/dev/null; then
+# Since objective 085 days_left runs on the growth of every persistent grower
+# (persistent_growth_bytes_per_day), not the archive's alone; this seed has
+# no database_bytes, so that growth, and days_left with it, is null here.
+if [ "$(storage 'has("persistent_growth_bytes_per_day")')" = true ]; then
+    persistent=$(storage '.persistent_growth_bytes_per_day')
+    if [ "$free" != null ] && [ "$persistent" != null ] && [ "$persistent" -gt 0 ] 2>/dev/null; then
+        expect_eq "$(storage '.days_left')" "$((free / persistent))" "(2) days_left: the answer's free_bytes over its persistent growth, rounded down"
+    else
+        expect_eq "$(storage '.days_left')" null "(2) days_left: null without a persistent growth above 0"
+    fi
+elif [ "$free" != null ] && [ "$growth" != null ] && [ "$growth" -gt 0 ] 2>/dev/null; then
     expect_eq "$(storage '.days_left')" "$((free / growth))" "(2) days_left: the answer's free_bytes over its growth, rounded down"
 fi
 got_db=$(storage '.database.bytes')
@@ -494,7 +505,11 @@ test("(3) without a fall, without a growth, and in GB", () => {
 });
 
 test("(3) how long the disk lasts", () => {
-  assert.equal(storageView(storage).lasts, `about ${storage.days_left.toLocaleString("en-US")} days at the archive's growth`);
+  // The words after the days changed with objective 085 (the growth of every
+  // persistent grower); a null days_left (085 on this seed) says nothing.
+  const lasts = storageView(storage).lasts;
+  if (storage.days_left == null) assert.equal(lasts, null);
+  else assert.ok(typeof lasts === "string" && lasts.startsWith(`about ${storage.days_left.toLocaleString("en-US")} days at `), `lasts: ${lasts}`);
 });
 TEST
 if ! BB_TREE=$tree BB_WORK=$WORK node --test "$WORK/storage.test.mjs" >"$WORK/storage.out" 2>&1; then
