@@ -208,8 +208,85 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
         open,
         owner_url: env_value("SPAWN_DATABASE_URL"),
     });
-    serve_requests(&server, &shared, MAX_IN_FLIGHT);
-    Ok(0)
+    // Listen again on the bound address, so a client's port stays right.
+    let bound = server
+        .server_addr()
+        .to_ip()
+        .map_or_else(|| address.clone(), |address| address.to_string());
+    let slots = Slots::new(MAX_IN_FLIGHT);
+    keep_listening(
+        server,
+        &bound,
+        |server| serve_requests(server, &shared, &slots),
+        |address| Server::http(address).map_err(|error| error.to_string()),
+        listen_again_pause,
+    )
+}
+
+/// Serve from `listener` and, each time it stops, listen again on
+/// `address`. Returns only when it cannot listen again.
+///
+/// One failed accept() (a connection reset before it was taken, too many
+/// open files, no memory) ends tiny_http's accept thread for good, and its
+/// error goes only to the `log` crate. Its requests then end, and serve
+/// once returned Ok(0) and exited without a word: a page and every client
+/// saw a refused port and nothing said why. Now the stop is said on stderr
+/// (the journal), and the same address is listened on again after a
+/// pause. If that fails, every try, serve exits with an error, so its unit
+/// restarts it and the reason is in the journal.
+fn keep_listening<L>(
+    mut listener: L,
+    address: &str,
+    mut serve: impl FnMut(&L) -> std::io::Error,
+    mut listen: impl FnMut(&str) -> Result<L, String>,
+    pause: impl Fn(u32) -> std::time::Duration,
+) -> Result<i32, String> {
+    let mut stops: u32 = 0;
+    loop {
+        let started = std::time::Instant::now();
+        let error = serve(&listener);
+        // A listener that served a while starts the pauses over.
+        if started.elapsed() >= LISTEN_AGAIN_QUIET {
+            stops = 0;
+        }
+        stops = stops.saturating_add(1);
+        eprintln!("serve: the listener stopped: {error}; listening again on {address}");
+        // The old listener's socket goes first, so its port can be bound again.
+        drop(listener);
+        let mut tries = 0;
+        let next = loop {
+            tries += 1;
+            std::thread::sleep(pause(stops));
+            match listen(address) {
+                Ok(next) => break next,
+                Err(error) if tries < LISTEN_AGAIN_TRIES => {
+                    eprintln!("serve: cannot listen again on {address} yet: {error}");
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "serve: cannot listen again on {address} after the listener stopped \
+                         ({tries} tries): {error}"
+                    ));
+                }
+            }
+        };
+        eprintln!("serve: listening again on http://{address}");
+        listener = next;
+    }
+}
+
+/// Tries to listen again after the listener stopped, before serve gives up.
+const LISTEN_AGAIN_TRIES: u32 = 5;
+
+/// A listener that served this long before it stopped starts the pauses
+/// over.
+const LISTEN_AGAIN_QUIET: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// The pause before listening again after the `stops`-th stop in a row:
+/// 200 ms, doubling, at most 5 s.
+fn listen_again_pause(stops: u32) -> std::time::Duration {
+    let millis = 200u64.saturating_mul(1u64 << stops.saturating_sub(1).min(5));
+    std::time::Duration::from_millis(millis.min(5000))
 }
 
 /// Requests served at once. Each runs on its own thread, so a client that
@@ -244,6 +321,13 @@ struct Slots {
 struct Slot(Arc<Slots>);
 
 impl Slots {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            taken: AtomicUsize::new(0),
+            limit,
+        })
+    }
+
     fn take(slots: &Arc<Self>) -> Option<Slot> {
         slots
             .taken
@@ -261,15 +345,16 @@ impl Drop for Slot {
     }
 }
 
-/// Serve `server`'s requests until it closes: each on a thread of its own,
-/// at most `limit` at once, and 503 past them.
-fn serve_requests(server: &Server, shared: &Arc<Shared>, limit: usize) {
-    let slots = Arc::new(Slots {
-        taken: AtomicUsize::new(0),
-        limit,
-    });
-    for request in server.incoming_requests() {
-        let Some(slot) = Slots::take(&slots) else {
+/// Serve `server`'s requests until its listener stops: each on a thread of
+/// its own, at most the slots' limit at once, and 503 past them. Returns why
+/// it stopped.
+fn serve_requests(server: &Server, shared: &Arc<Shared>, slots: &Arc<Slots>) -> std::io::Error {
+    loop {
+        let request = match server.recv() {
+            Ok(request) => request,
+            Err(error) => return error,
+        };
+        let Some(slot) = Slots::take(slots) else {
             let busy = json_response(503, &json!({ "error": "busy: too many requests at once" }));
             if let Err(error) = request.respond(busy) {
                 eprintln!("serve: {error}");
@@ -2402,8 +2487,8 @@ mod tests {
         ProcSocket, Shared, access_token, backups, handle, is_json, is_loopback, local_exemption,
         log_window, objective_json, objective_prompt, open_network_request, open_networks,
         owner_uid, peer_uid, proc_sockets, rsi_objective, rsi_summary, same_origin, same_secret,
-        serve_requests, server_hosts, tokenless_request, typed_text, with_last_gates,
-        with_objectives,
+        Slots, keep_listening, listen_again_pause, serve_requests, server_hosts,
+        tokenless_request, typed_text, with_last_gates, with_objectives,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -4428,8 +4513,104 @@ mod tests {
             open: Vec::new(),
             owner_url: None,
         });
-        std::thread::spawn(move || serve_requests(&server, &shared, limit));
+        let slots = Slots::new(limit);
+        std::thread::spawn(move || serve_requests(&server, &shared, &slots));
         (port, web)
+    }
+
+    /// A listener that stops (one failed accept ends tiny_http's accept
+    /// thread) is listened on again, each stop said; when it cannot be,
+    /// every try, serve gives up with an error instead of `Ok(0)`.
+    #[test]
+    fn a_stopped_listener_is_listened_on_again_then_given_up_with_an_error() {
+        let mut served = Vec::new();
+        let mut listens = 0;
+        let outcome = keep_listening(
+            1u32,
+            "127.0.0.1:9",
+            |listener: &u32| {
+                served.push(*listener);
+                std::io::Error::other("accept failed")
+            },
+            |_address: &str| {
+                listens += 1;
+                if listens == 1 { Ok(2u32) } else { Err("address in use".to_string()) }
+            },
+            |_stops| std::time::Duration::ZERO,
+        );
+        assert_eq!(served, vec![1, 2], "the first listener, then the one listened on again");
+        assert_eq!(listens, 1 + 5, "one listen that worked, then five tries");
+        let error = outcome.expect_err("serve gives up with an error, never Ok(0)");
+        assert!(
+            error.contains("cannot listen again on 127.0.0.1:9") && error.contains("(5 tries)")
+                && error.contains("address in use"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_pause_before_listening_again_doubles_from_200_ms_to_at_most_5_s() {
+        let millis = |stops| listen_again_pause(stops).as_millis();
+        assert_eq!(
+            [millis(1), millis(2), millis(3), millis(5), millis(6), millis(40)],
+            [200, 400, 800, 3200, 5000, 5000]
+        );
+    }
+
+    /// The real listener: stopped, it is listened on again on the same
+    /// port, and a request there is answered.
+    #[test]
+    fn a_stopped_tiny_http_listener_answers_again_on_the_same_port() {
+        use std::io::{Read, Write};
+        let web = std::env::temp_dir().join(format!("spawn-serve-again-{}", std::process::id()));
+        std::fs::create_dir_all(&web).expect("web");
+        std::fs::write(web.join("index.html"), "<!doctype html>\n").expect("index");
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("listen");
+        let port = server.server_addr().to_ip().expect("ip").port();
+        let shared = Arc::new(Shared {
+            web: web.clone(),
+            token: None,
+            port: Some(port),
+            hosts: server_hosts("127.0.0.1:0", port),
+            open: Vec::new(),
+            owner_url: None,
+        });
+        let address = format!("127.0.0.1:{port}");
+        let slots = Slots::new(4);
+        let mut first = true;
+        std::thread::spawn(move || {
+            keep_listening(
+                server,
+                &address,
+                |server| {
+                    if std::mem::take(&mut first) {
+                        // As a failed accept ends tiny_http's accept thread.
+                        return std::io::Error::other("test: the accept thread stopped");
+                    }
+                    serve_requests(server, &shared, &slots)
+                },
+                |address| tiny_http::Server::http(address).map_err(|error| error.to_string()),
+                |_stops| std::time::Duration::from_millis(50),
+            )
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let answer = loop {
+            let attempt = std::net::TcpStream::connect(("127.0.0.1", port)).and_then(|mut stream| {
+                write!(stream, "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")?;
+                let mut answer = String::new();
+                stream.read_to_string(&mut answer)?;
+                Ok(answer)
+            });
+            match attempt {
+                Ok(answer) if !answer.is_empty() => break answer,
+                _ if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                other => panic!("no answer on port {port} after the listener stopped: {other:?}"),
+            }
+        };
+        assert!(answer.starts_with("HTTP/1.1 200"), "{}", answer.lines().next().unwrap_or(""));
+        std::fs::remove_dir_all(&web).ok();
     }
 
     /// A client that asks for `big.bin` and never reads the answer.
