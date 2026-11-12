@@ -779,11 +779,7 @@ fn said(bytes: &[u8]) -> Said {
                 let words = owner_lines(&text);
                 if !words.is_empty() {
                     let at = line_time(&line);
-                    notes.extend(
-                        words
-                            .into_iter()
-                            .map(|words| (words.to_string(), at, turn)),
-                    );
+                    notes.extend(words.into_iter().map(|words| (words.to_string(), at, turn)));
                 }
             }
             _ => {}
@@ -1762,7 +1758,9 @@ mod tests {
             prompt(at),
             line(
                 "assistant",
-                &json!("For the owner:\n- set SPAWN_WORKSPACE for #11\n- restart task 5\n- keep me"),
+                &json!(
+                    "For the owner:\n- set SPAWN_WORKSPACE for #11\n- restart task 5\n- keep me"
+                ),
                 at,
             ),
             prompt(at),
@@ -1777,7 +1775,11 @@ mod tests {
         ]
         .concat();
         let read = said(transcript.as_bytes());
-        let texts: Vec<&str> = read.for_owner.iter().map(|(text, _)| text.as_str()).collect();
+        let texts: Vec<&str> = read
+            .for_owner
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect();
         assert_eq!(
             texts,
             [
@@ -1788,15 +1790,26 @@ mod tests {
                 "set SPAWN_WORKSPACE for #11",
             ]
         );
-        assert_eq!(read.current, 3, "the second turn's three lines, both its replies");
+        assert_eq!(
+            read.current, 3,
+            "the second turn's three lines, both its replies"
+        );
 
         // One turn alone: all current. No line at all: none.
-        let one = [prompt(at), line("assistant", &json!("For the owner: x"), at)].concat();
+        let one = [
+            prompt(at),
+            line("assistant", &json!("For the owner: x"), at),
+        ]
+        .concat();
         assert_eq!(said(one.as_bytes()).current, 1);
         let none = [prompt(at), line("assistant", &json!("Next: y"), at)].concat();
         assert_eq!(said(none.as_bytes()).current, 0);
         // Without any prompt in the tail, its lines are one turn.
-        let bare = line("assistant", &json!("For the owner: a\nFor the owner: b"), at);
+        let bare = line(
+            "assistant",
+            &json!("For the owner: a\nFor the owner: b"),
+            at,
+        );
         assert_eq!(said(bare.as_bytes()).current, 2);
     }
 
