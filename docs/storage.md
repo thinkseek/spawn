@@ -778,6 +778,16 @@ uses the disk:
     sample records that number as `session_backup_bytes`; a sample whose
     file does not read, or holds no such number, leaves it out and is
     still written;
+  - `growth_from_parts` (objective 098): for every part of `growth_parts`,
+    the moment it is first measured. That is the `at_ms` of the oldest
+    sample of the last 7 days carrying its field, plus a day (083's rule,
+    per part). It is null without such a sample, and the archive's is also
+    null without a workspace root. The archive's equals `growth_from_ms`.
+    The Storage card dates each grower's line from it ("measured from
+    <local date and time>", `storageView`'s rows' `measured_from`) while
+    that line's growth is null and the moment is after the sizes' read.
+    The session backups have no line: while they are pending, 091's
+    forecast date covers them;
   - `growth_excluded` (objective 097): the parts left out of the sum
     because their source cannot be read now: `["session_backups"]` while
     no status file reads, or the one that reads holds no

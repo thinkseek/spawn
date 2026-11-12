@@ -94,10 +94,10 @@ test("a size is MB to one decimal under 1024 MB, GB from there", () => {
 test("the storage rows say what uses the disk, its growth and Claude Code's fall", () => {
   const { rows, lasts } = storageView(STORAGE);
   assert.deepEqual(rows, [
-    { name: "Transcript archive", size: "12.0 MB", note: "grows about 71.7 MB a day" },
-    { name: "Claude Code transcripts", size: "1.0 MB", note: "3 files, down from 40" },
-    { name: "Workspaces", size: "2.0 MB", note: "" },
-    { name: "Database", size: "2.7 GB", note: "largest: spawn_events 2.5 GB" },
+    { name: "Transcript archive", size: "12.0 MB", note: "grows about 71.7 MB a day", measured_from: null },
+    { name: "Claude Code transcripts", size: "1.0 MB", note: "3 files, down from 40", measured_from: null },
+    { name: "Workspaces", size: "2.0 MB", note: "", measured_from: null },
+    { name: "Database", size: "2.7 GB", note: "largest: spawn_events 2.5 GB", measured_from: null },
   ]);
   assert.equal(lasts, "about 5,714 days at the growth of the archive, Claude Code's transcripts and the database");
 });
@@ -198,6 +198,10 @@ test("the host section's Resources are followed by a Storage card drawn from sto
   assert.match(strip, /<Cell label="Storage"[^>]*>\s*<StorageCard storage=\{health\.storage\} backups=\{health\.backups\} \/>/);
   assert.match(strip, /backupView\(backups, now\)/, "the card's backup rows are drawn from backupView");
   assert.match(strip, /const \{ rows, lasts, lasts_note, measured_from, lasts_from \} = storageView\(storage\)/);
+  // Objective 098: each line's own date beside it while it is set (not twice
+  // when the note already says it, as the archive's 083 note does).
+  assert.match(strip, /row\.measured_from !== null && row\.note !== `measured from \$\{row\.measured_from\}`/);
+  assert.match(strip, /measured from \{row\.measured_from\}/);
   // Objective 097: the note that the session backups are not counted, under the line.
   assert.match(strip, /\{lasts_note !== null && <p[^>]*>\{lasts_note\}<\/p>\}/);
   assert.match(strip, /How long the disk lasts: \$\{lasts_from !== null \? `measured from \$\{lasts_from\}` : measured_from === null \? "not measured yet" : `measured from \$\{measured_from\}`\}/);
@@ -219,9 +223,9 @@ const TESTED = {
 test("the test databases follow the database, the gates' first, each with its schemas", () => {
   const { rows } = storageView(TESTED);
   assert.deepEqual(rows.slice(3), [
-    { name: "Database", size: "2.7 GB", note: "largest: spawn_events 2.5 GB, log 35.0 MB" },
-    { name: "Gate test database", size: "20.0 MB", note: "0 schemas" },
-    { name: "Fleet test database", size: "2.7 GB", note: "2,533 schemas" },
+    { name: "Database", size: "2.7 GB", note: "largest: spawn_events 2.5 GB, log 35.0 MB", measured_from: null },
+    { name: "Gate test database", size: "20.0 MB", note: "0 schemas", measured_from: null },
+    { name: "Fleet test database", size: "2.7 GB", note: "2,533 schemas", measured_from: null },
   ]);
 });
 
@@ -248,7 +252,7 @@ test("a test database the server could not read is said unreadable, and kept", (
   assert.deepEqual(storage?.test_databases, [{ role: "test", name: null, bytes: null, schemas: null }]);
   assert.equal(storage?.database?.log_bytes, 35 * MB);
   const row = storageView(storage).rows[4];
-  assert.deepEqual(row, { name: "Gate test database", size: "—", note: "unreadable" });
+  assert.deepEqual(row, { name: "Gate test database", size: "—", note: "unreadable", measured_from: null });
   assert.deepEqual(normalizeStorage(STORAGE)?.test_databases, []);
   assert.equal(normalizeStorage(STORAGE)?.database?.log_bytes, null);
 });
@@ -346,4 +350,46 @@ test("storageView counts the session backups or says they are not counted", () =
   const older = storageView({ ...STORAGE, days_left: 1234 });
   assert.equal(older.lasts, "about 1,234 days at the growth of the archive, Claude Code's transcripts and the database");
   assert.equal(older.lasts_note, null);
+});
+
+// Objective 098: each grower's line says from when its own growth is
+// measured, while it is pending; local time, as the archive's 083 date.
+test("each grower's row carries its own measured_from while its growth is pending", () => {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const local = (ms: number) => {
+    const d = new Date(ms);
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+  const at = Date.UTC(2026, 10, 12, 23, 31, 20);
+  const parts = { archive: at, projects: at + 60_000, database: at + 120_000, session_backups: at + 180_000 };
+  const lines = (value: unknown) =>
+    ["Transcript archive", "Claude Code transcripts", "Database"].map(
+      (name) => storageView(value).rows.find((row) => row.name === name)?.measured_from,
+    );
+  const nulls = { archive: null, projects: null, database: null, session_backups: null };
+  // Pending: each its own date.
+  const pending = { ...STORAGE, read_at_ms: at - 3_600_000, growth_bytes_per_day: null, growth_parts: nulls, growth_from_ms: at, growth_from_parts: parts };
+  assert.deepEqual(lines(pending), [local(at), local(at + 60_000), local(at + 120_000)]);
+  // No new row for the session backups, nor a date on another row.
+  const view = storageView(pending);
+  assert.equal(view.rows.filter((row) => row.measured_from !== null).length, 3);
+  assert.equal(view.rows.find((row) => row.name === "Workspaces")?.measured_from, null);
+  // Measured: no date, whatever the moment.
+  assert.deepEqual(
+    lines({ ...pending, growth_bytes_per_day: 5, growth_parts: { archive: 5, projects: 1, database: 2, session_backups: null } }),
+    [null, null, null],
+  );
+  // Only the database pending: only its line dated.
+  assert.deepEqual(lines({ ...pending, growth_parts: { archive: 5, projects: 1, database: null, session_backups: null } }), [
+    null,
+    null,
+    local(at + 120_000),
+  ]);
+  // A moment already past the read: none.
+  assert.deepEqual(lines({ ...pending, read_at_ms: at + 3_600_000 }), [null, null, null]);
+  // No moment, or an older server's answer: none.
+  assert.deepEqual(lines({ ...pending, growth_from_parts: { archive: null, projects: null, database: null } }), [null, null, null]);
+  assert.deepEqual(lines({ ...STORAGE, growth_parts: nulls }), [null, null, null]);
+  assert.equal(normalizeStorage({ ...STORAGE, growth_from_parts: parts })?.growth_from_parts?.database, at + 120_000);
+  assert.equal(normalizeStorage(STORAGE)?.growth_from_parts, null);
 });
