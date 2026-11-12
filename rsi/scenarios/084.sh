@@ -274,7 +274,9 @@ else
         "(1) the other lines' north stars"
     expect_eq "$(lines '[.lines[] | ([.north_star] + .guardrails)[] | select((.value == null) != (.state == "not_collected")) | .key]')" '[]' \
         "(1) a figure is not collected exactly when it has no value"
-    expect_eq "$(lines '.lines[] | select(.line == "storage") | [.north_star.key] + [.guardrails[].key]')" \
+    # Later objectives add storage guardrails after these (094): this
+    # frame's are the first six, in order.
+    expect_eq "$(lines '.lines[] | select(.line == "storage") | ([.north_star.key] + [.guardrails[].key])[:6]')" \
         '["storage.days_left","storage.free_bytes","storage.archive_growth","storage.database_ratio","storage.test_database_bytes","storage.test_database_schemas"]' \
         "(1) the storage line's north star and guardrails, in order"
     growth=$(fleet '.growth_bytes_per_day')
@@ -418,7 +420,7 @@ test("(3) over the answer: four rows, the storage line's marks", () => {
   assert.ok(Array.isArray(answer.lines), "GET /api/core-lines answered");
   const view = coreLinesView(answer);
   assert.equal(view.rows.length, 4);
-  assert.equal(view.rows[1].guardrails.length, 5);
+  assert.ok(view.rows[1].guardrails.length >= 5, "this frame's five storage guardrails, and any a later objective adds after them");
   assert.deepEqual(view.rows[1].guardrails.slice(0, 2).map((mark) => mark.tone), ["plain", "warning"], "free disk in, archive growth out");
 });
 TEST
