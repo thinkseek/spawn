@@ -431,7 +431,10 @@ states=$(q "select string_agg(id || ':' || state, ' ' order by id) from mission_
 said() { grep -qs "$1" "$SPAWN_CLAUDE_PROJECTS"/*/*.jsonl; }
 turn() { # <tag> <words> <pattern>
     say "$1" "$2"
-    wait_until 60 said "$3" || harness "the supervisor's turn ($3) was not in a transcript within 60 s"
+    wait_until 60 said "$3" || {
+        supervisor_turn_dump "$3"
+        harness "the supervisor's turn ($3) was not in a transcript within 60 s"
+    }
 }
 # A heading over a dash list, ended by a blank line; then another heading
 # (not the owner's) over a list of its own.
