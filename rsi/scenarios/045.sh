@@ -416,8 +416,13 @@ start_loop() {
 web=$WORK/web
 mkdir -p "$web"
 printf '<!doctype html><title>spawn</title>\n' >"$web/index.html"
+# A restart writes the same log: it is emptied here, in this shell, before
+# the launch, and the launch appends. With `serve >"$WORK/serve.log" &` the
+# truncation ran in the child, after the fork, so this shell could read the
+# stopped serve's port line first and send every request to a dead port.
 start_serve() {
-    "$SPAWN_BIN" serve --address "127.0.0.1:0" --web "$web" >"$WORK/serve.log" 2>&1 &
+    : >"$WORK/serve.log"
+    "$SPAWN_BIN" serve --address "127.0.0.1:0" --web "$web" >>"$WORK/serve.log" 2>&1 &
     serve_pid=$!
     port=""
     i=0
@@ -429,6 +434,9 @@ start_serve() {
     done
     [ -n "$port" ] || harness "serve did not start: $(head -c 400 "$WORK/serve.log")"
     base="http://127.0.0.1:$port"
+    # This launch answers on the port it named.
+    ready=$(curl -sS --noproxy '*' -o /dev/null -w '%{http_code}' "$base/" 2>"$WORK/ready.err") || true
+    [ "$ready" = 200 ] || harness "serve (pid $serve_pid) named port $port and GET / there answered [$ready]: $(head -c 300 "$WORK/ready.err")"
 }
 
 # --- helpers ----------------------------------------------------------------
