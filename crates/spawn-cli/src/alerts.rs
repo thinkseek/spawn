@@ -3367,17 +3367,18 @@ times in a row)",
             let open = self.open_keys("database_size", &subject);
             if over {
                 if open.is_empty() {
-                    let times = ratio_of(reading.bytes, log_bytes)
-                        .map_or_else(|| "with no".to_string(), |ratio| format!("{ratio} times"));
+                    let against = ratio_of(reading.bytes, log_bytes).map_or_else(
+                        || "and the live event log is empty".to_string(),
+                        |ratio| format!("{ratio} times its live event log of {}", size_text(log_bytes)),
+                    );
                     out.push(Event::Fire {
                         key: format!("database_size:{}:{now}", reading.name),
                         kind: "database_size",
                         text: format!(
-                            "database {} ({}) holds {}, {times} its live event log of {}: {} schemas",
+                            "database {} ({}) holds {}, {against}: {} schemas",
                             reading.name,
                             reading.role,
                             size_text(reading.bytes),
-                            size_text(log_bytes),
                             reading.schemas
                         ),
                         subject,
@@ -8989,6 +8990,10 @@ connections\n";
                 database_ratio: 1_000_000,
                 ..settings()
             });
+            store
+                .host_record(&json!({"type": "host.storage", "archive_bytes": 1,
+                    "archive_files": 1, "projects_bytes": 1, "projects_files": 1}))
+                .expect("a record in the log");
             let (mut out, mut lines) = (Vec::new(), Vec::new());
             monitor.read_databases(&store, 1000, &mut out, &mut lines);
             assert!(out.is_empty(), "within a million times: {out:?}");
