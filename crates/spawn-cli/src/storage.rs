@@ -283,10 +283,14 @@ pub(crate) mod tests {
         let mut written = Vec::new();
         let mut at = |sampler: &mut Sampler, now: i64| {
             sampler
-                .check_with(now, || Some(7000), |sample| {
-                    written.push((now, sample.clone()));
-                    Ok(1)
-                })
+                .check_with(
+                    now,
+                    || Some(7000),
+                    |sample| {
+                        written.push((now, sample.clone()));
+                        Ok(1)
+                    },
+                )
                 .expect("checked")
                 .is_some()
         };
@@ -321,17 +325,25 @@ pub(crate) mod tests {
         let mut written = Vec::new();
         let mut sampler = Sampler::with(Some(&root), projects.clone());
         sampler
-            .check_with(0, || Some(8 * 1024 * 1024), |sample| {
-                written.push(sample.clone());
-                Ok(1)
-            })
+            .check_with(
+                0,
+                || Some(8 * 1024 * 1024),
+                |sample| {
+                    written.push(sample.clone());
+                    Ok(1)
+                },
+            )
             .expect("written");
         let mut unread = Sampler::with(Some(&root), projects);
         unread
-            .check_with(0, || None, |sample| {
-                written.push(sample.clone());
-                Ok(2)
-            })
+            .check_with(
+                0,
+                || None,
+                |sample| {
+                    written.push(sample.clone());
+                    Ok(2)
+                },
+            )
             .expect("written without the database's size");
         std::fs::remove_dir_all(&root).expect("clean up");
         assert_eq!(written.len(), 2);

@@ -124,7 +124,11 @@ fn the_oldest_sample_carrying_a_size_passes_over_older_ones_without_it() {
         read["carrying"]["database_bytes"]["database_bytes"],
         100 * MIB
     );
-    assert!(read["carrying"]["archive_bytes"].get("database_bytes").is_none());
+    assert!(
+        read["carrying"]["archive_bytes"]
+            .get("database_bytes")
+            .is_none()
+    );
     // Since 0, the one at 500 carries all three.
     let read = store.host_storage(0, 0).expect("read");
     assert_eq!(read["carrying"]["database_bytes"]["at_ms"], 500);
