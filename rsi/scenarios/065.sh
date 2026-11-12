@@ -360,6 +360,10 @@ note "(1) checked: the loop's sample"
 
 # --- (2) the answer ------------------------------------------------------------------------
 
+# The loop keeps writing to the database, so its size is read on both sides
+# of the answer (before serve starts, which may read it then, and after the
+# GET): the answer's size must lie between the two.
+db_before=$(scalar "select pg_database_size(current_database())")
 start_serve
 code=$(curl -s --noproxy '*' -o "$WORK/api.json" -w '%{http_code}' "$base/api/fleet" 2>/dev/null) || code=000
 [ "$code" = 200 ] || harness "GET /api/fleet answered $code: $(head -c 300 "$WORK/api.json")"
@@ -370,7 +374,7 @@ db_tables=$(scalar "select json_agg(c.relname order by pg_total_relation_size(c.
                              where c.relkind in ('r', 'p') and n.nspname = 'public'
                              order by pg_total_relation_size(c.oid) desc, c.relname limit 5) c")
 db_tables=$(printf '%s' "$db_tables" | jq -c .) || harness "psql's table list is not JSON"
-case "$df_free$db_bytes" in '' | *[!0-9]*) harness "df or psql read nothing: [$df_free] [$db_bytes]" ;; esac
+case "$df_free$db_before$db_bytes" in '' | *[!0-9]*) harness "df or psql read nothing: [$df_free] [$db_bytes]" ;; esac
 storage() { jq -c ".health.storage | $1" "$WORK/api.json"; }
 
 expect_eq "$(storage '.archive | {path, bytes, files}')" \
@@ -396,7 +400,10 @@ if [ "$free" != null ] && [ "$growth" != null ] && [ "$growth" -gt 0 ] 2>/dev/nu
     expect_eq "$(storage '.days_left')" "$((free / growth))" "(2) days_left: the answer's free_bytes over its growth, rounded down"
 fi
 got_db=$(storage '.database.bytes')
-near "$got_db" "$db_bytes" "$((db_bytes / 100))" || check_failed "(2) database.bytes [$got_db], against pg_database_size [$db_bytes]"
+# Between the two reads, with 1% slack on each side for a page or two.
+awk -v g="$got_db" -v lo="$((db_before - db_before / 100))" -v hi="$((db_bytes + db_bytes / 100))" \
+    'BEGIN { exit !(g ~ /^[0-9]+$/ && g >= lo && g <= hi) }' ||
+    check_failed "(2) database.bytes [$got_db], against pg_database_size read before [$db_before] and after [$db_bytes] the answer (1% slack each side)"
 expect_eq "$(storage '[.database.tables[]?.name]')" "$db_tables" "(2) the database's five largest tables, largest first"
 note "(2) checked: the answer"
 
