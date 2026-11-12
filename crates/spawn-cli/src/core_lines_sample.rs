@@ -31,19 +31,18 @@ const RETRY_MS: i64 = 60_000;
 /// How long a reading may take before it is given up.
 pub(crate) const READ_LIMIT_MS: i64 = 300_000;
 
-/// The figures' values, as a reading gives them.
-type Values = Result<Map<String, Value>, String>;
-
 /// One reading of the figures, running or done: its answer comes on `answer`;
 /// `worker` is the thread computing it (none when it was read in place).
-pub(crate) struct Reading {
-    answer: Receiver<Values>,
+/// `V` is what a reading gives: the figures' values for a sample, the whole
+/// answer for the alert step's guardrails (crate alerts/guardrails.rs).
+pub(crate) struct Reading<V = Map<String, Value>> {
+    answer: Receiver<Result<V, String>>,
     worker: Option<JoinHandle<()>>,
 }
 
-impl Reading {
+impl<V: Send + 'static> Reading<V> {
     /// A reading on a thread of its own.
-    pub(crate) fn spawn(read: impl FnOnce() -> Values + Send + 'static) -> Self {
+    pub(crate) fn spawn(read: impl FnOnce() -> Result<V, String> + Send + 'static) -> Self {
         let (send, answer) = std::sync::mpsc::channel();
         let worker = std::thread::Builder::new()
             .name("core-lines-sample".to_string())
@@ -66,7 +65,7 @@ impl Reading {
 
     /// A reading already done: `values`.
     #[cfg(test)]
-    pub(crate) fn done(values: Values) -> Self {
+    pub(crate) fn done(values: Result<V, String>) -> Self {
         let (send, answer) = std::sync::mpsc::channel();
         let _ = send.send(values);
         Self {
@@ -76,10 +75,16 @@ impl Reading {
     }
 
     /// Whether its thread is still running.
-    fn running(&self) -> bool {
+    pub(crate) fn running(&self) -> bool {
         self.worker
             .as_ref()
             .is_some_and(|worker| !worker.is_finished())
+    }
+
+    /// Its answer if it has come, never waiting: `Empty` while it runs,
+    /// `Disconnected` when it ended without one.
+    pub(crate) fn try_answer(&self) -> Result<Result<V, String>, TryRecvError> {
+        self.answer.try_recv()
     }
 }
 
