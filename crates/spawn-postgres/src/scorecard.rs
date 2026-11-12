@@ -21,12 +21,10 @@ use crate::PostgresStore;
 /// fields, plus its `state` and times. Records of no measure (a report's text,
 /// residents' and halts' records, host facts) are left out; a report is
 /// kept as its time (`task.reported`, where a landing's wait for live
-/// starts) and a deploy as its `ok` (`deploy.finished`, objective 081). `owner_runs_from_ms` is the
-/// time of the earliest owner judging (`source.moved`,
-/// `source.push_refused`) that names its gate's wall clock, read over the
-/// whole log, not up to `$1`; null when none does. `live_from_ms` is the
-/// time of the first `deploy.finished` of any outcome before `$1`, where
-/// report to live's record begins (objective 095); null with none.
+/// starts) and a deploy as its `ok` (`deploy.finished`, objective 081).
+/// `owner_runs_from_ms` and `live_from_ms` are added from these facts by
+/// [`PostgresStore::scorecard_facts`], not read again here (each read was
+/// a second pass over the whole control stream).
 const FACTS: &str = r"
 with h as materialized (
   select u.id, i.intent, i.at_ms
@@ -34,8 +32,14 @@ with h as materialized (
    cross join lateral unnest(i.commands) as u(id)
    where i.at_ms < $1)
 select jsonb_build_object(
+  -- Each record's small object is built first and only then sorted and
+  -- aggregated: sorted with its record (a gate's log, a brief) the rows
+  -- spilled 28 MB to disk on every reading (the lead's plan on the live
+  -- copy, 2026-11-13).
   'control', (
-    select coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
+    select coalesce(jsonb_agg(q.o order by q.seq), '[]'::jsonb)
+      from (
+    select e.session_seq as seq, jsonb_strip_nulls(jsonb_build_object(
              'seq', e.session_seq,
              'at', e.recorded_at_ms,
              'type', x.r ->> 'type',
@@ -66,8 +70,7 @@ select jsonb_build_object(
              'state', x.r -> 'row' -> 'state',
              'created_at_ms', x.r -> 'row' -> 'created_at_ms',
              'updated_at_ms', x.r -> 'row' -> 'updated_at_ms',
-             'delivered_at_ms', x.r -> 'row' -> 'delivered_at_ms'))
-             order by e.session_seq), '[]'::jsonb)
+             'delivered_at_ms', x.r -> 'row' -> 'delivered_at_ms')) as o
       from spawn_events e
      -- `offset 0` keeps the record a value of its own: inlined, each of the
      -- thirty `x.r` above would take it out of the event's `kind` (a gate's
@@ -80,7 +83,8 @@ select jsonb_build_object(
                               'task.reviewed', 'task.cancelled', 'task.aborted',
                               'task.over_budget', 'legacy.imported',
                               'source.moved', 'source.push_refused',
-                              'task.reported', 'deploy.finished')),
+                              'task.reported', 'deploy.finished')
+    offset 0) q),
   'commands', (
     select coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
              'id', c.id,
@@ -116,27 +120,20 @@ select jsonb_build_object(
        and (c.principal in ('human', 'spawn')
             or r.succeeded is false
             or (c.principal = 'spawn-dispatch'
-                and (c.idempotency_key like 'deliver-%' or t.stalls is not null)))),
-  -- From when the owner's judgings are counted (objective 076): the
-  -- earliest owner judging that carries its gate's wall clock, whatever
-  -- `$1` is; null when none does.
-  'owner_runs_from_ms', (
-    select min(e.recorded_at_ms)
-      from spawn_events e
-     cross join lateral (select e.kind -> 'detail' -> 'record' as r offset 0) x
-     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-       and x.r ->> 'type' in ('source.moved', 'source.push_refused')
-       and jsonb_typeof(x.r -> 'gate_ms') = 'number'),
-  -- Where the live record begins (objective 095): the first
-  -- `deploy.finished` of any outcome, over the whole log before `$1`
-  -- (whatever the window); null when there is none.
-  'live_from_ms', (
-    select min(e.recorded_at_ms)
-      from spawn_events e
-     cross join lateral (select e.kind -> 'detail' -> 'record' as r offset 0) x
-     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-       and e.recorded_at_ms < $1
-       and x.r ->> 'type' = 'deploy.finished'))";
+                and (c.idempotency_key like 'deliver-%' or t.stalls is not null)))))";
+
+/// From when the owner's judgings are counted (objective 076): the earliest
+/// owner judging that carries its gate's wall clock, over the whole log
+/// whatever the window; null when none does. Read only when the facts hold
+/// no such judging before their `until` (then the earliest is after it, or
+/// there is none); otherwise it is the facts' own earliest.
+const OWNER_RUNS_FROM: &str = r"
+select min(e.recorded_at_ms)
+  from spawn_events e
+ cross join lateral (select e.kind -> 'detail' -> 'record' as r offset 0) x
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and x.r ->> 'type' in ('source.moved', 'source.push_refused')
+   and jsonb_typeof(x.r -> 'gate_ms') = 'number'";
 
 impl PostgresStore {
     /// The database's clock (`spawn_now_ms()`), in epoch milliseconds: the
@@ -157,8 +154,36 @@ impl PostgresStore {
     /// A command is in them from its creation and its result (`succeeded`,
     /// `finished_at_ms`, `error`) from its finish: one created before
     /// `until_ms` that finished later is unfinished here.
+    ///
+    /// `live_from_ms` (the first `deploy.finished` before `until_ms`) and
+    /// `owner_runs_from_ms` (the first owner judging with its gate's wall
+    /// clock, whatever `until_ms`) are taken from the control facts, which
+    /// hold every such record before `until_ms`, not read again; the latter
+    /// is read ([`OWNER_RUNS_FROM`]) only when none is before `until_ms`.
     pub fn scorecard_facts(&self, until_ms: i64) -> Result<Value, StoreError> {
-        self.query_json(FACTS, &[&until_ms])
+        let mut facts = self.query_json(FACTS, &[&until_ms])?;
+        let earliest = |types: &[&str], gated: bool| {
+            facts["control"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|fact| {
+                    fact["type"]
+                        .as_str()
+                        .is_some_and(|kind| types.contains(&kind))
+                        && (!gated || fact["gate_ms"].is_number())
+                })
+                .filter_map(|fact| fact["at"].as_i64())
+                .min()
+        };
+        let live_from = earliest(&["deploy.finished"], false);
+        let owner_runs_from = match earliest(&["source.moved", "source.push_refused"], true) {
+            Some(at) => Some(at),
+            None => self.query_one(OWNER_RUNS_FROM, &[])?.get(0),
+        };
+        facts["live_from_ms"] = serde_json::json!(live_from);
+        facts["owner_runs_from_ms"] = serde_json::json!(owner_runs_from);
+        Ok(facts)
     }
 
     /// When the live record starts: the first `deploy.finished` of any
