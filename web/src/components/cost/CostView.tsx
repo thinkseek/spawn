@@ -2,7 +2,7 @@ import { CircleDollarSign } from "lucide-react";
 
 import { readApi, usePoll } from "../../api";
 import type { CostAnswer, CostView as Figures, Fold, Row } from "../../cost.ts";
-import { costView } from "../../cost.ts";
+import { costView, rowLines } from "../../cost.ts";
 import { Card, CardHeader, EmptyState, LiveStatus, PageHeader, cx } from "../ui";
 
 const POLL_MS = 30_000;
@@ -92,8 +92,9 @@ function Rows({ title, rows, more = null }: { title: string; rows: Row[]; more?:
                     text, in full, wrapping if it must. */}
                 {second.length > 0 && (
                   <div className="mt-0.5 flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-micro">
-                    {second.map((text) =>
-                      text === row.unpriced_text ? (
+                    {second.map((text, index) =>
+                      // rowLines puts the unpriced mark's text first.
+                      index === 0 && row.unpriced_text ? (
                         <UnpricedMark key={text} text={text} />
                       ) : (
                         <span
