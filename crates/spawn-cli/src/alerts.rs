@@ -961,6 +961,13 @@ impl Monitor {
     /// pending records, and where the event log stands.
     fn start(&mut self, store: &PostgresStore, lines: &mut Vec<String>) -> Result<(), String> {
         let mirror = store.alert_mirror().map_err(|error| error.to_string())?;
+        // Where the event log stood when the missions and tasks were read,
+        // from the same snapshot (objective 106): every record after it is
+        // the checks' to feed, whatever commits while the start runs, and
+        // none the mirror holds is fed again.
+        let watermark = mirror["watermark"]
+            .as_i64()
+            .ok_or_else(|| "the alert mirror holds no watermark".to_string())?;
         let now = mirror["now_ms"]
             .as_i64()
             .unwrap_or_else(|| store.now_ms().unwrap_or_default());
@@ -1017,8 +1024,13 @@ impl Monitor {
         // one) finds the alert its predecessor fired and clears it, naming
         // itself; a record older than an open alert's own clears nothing
         // ([`after`]).
+        // A record after the watermark is the checks' (objective 106): fed
+        // here too, it would fold twice.
         for entry in history.as_array().into_iter().flatten() {
             let id = entry["event_id"].as_i64().unwrap_or_default();
+            if id > watermark {
+                continue;
+            }
             let at = entry["at_ms"].as_i64().unwrap_or(now);
             let mut fed = Vec::new();
             self.feed(id, at, &entry["record"], &mut fed);
@@ -1045,7 +1057,7 @@ impl Monitor {
             .alert_messages_all(self.settings.message_taken_ms, &self.open_messages())
             .map_err(|error| error.to_string())?;
         self.messages(&messages, &mut events);
-        self.watermark = store.alert_clock().map_err(|error| error.to_string())?.0;
+        self.watermark = watermark;
         // Read after the watermark: a request or an outcome recorded since
         // is in both reads, and folds the same.
         self.seed_owner_requests(store, now, &mut events)?;

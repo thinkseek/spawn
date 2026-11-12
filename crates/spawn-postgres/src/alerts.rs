@@ -151,9 +151,15 @@ pub(crate) const NOW: &str = "select spawn_now_ms()";
 /// The missions and tasks the loop compares a record against, with what a
 /// task's delivery bound needs (its `task.assigned` record, and whether its
 /// agent holds a delivered or reported task).
+///
+/// `watermark` is the newest event id, read by the same statement and so
+/// from the same snapshot as the missions and tasks: the loop's checks go on
+/// from it, so a record committed after this read is fed by them, and one
+/// the missions and tasks already hold is not fed again (objective 106).
 pub(crate) const MIRROR: &str = r"
 select jsonb_build_object(
   'now_ms', spawn_now_ms(),
+  'watermark', (select coalesce(max(id), 0) from spawn_events),
   'missions', coalesce((select jsonb_agg(jsonb_build_object(
         'id', m.id, 'state', m.state, 'halted', m.halted, 'accept', m.accept,
         'gated', m.gate is not null, 'gate_rejections', m.gate_rejections,
