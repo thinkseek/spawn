@@ -45,6 +45,14 @@ with m as materialized (
                             'cache_read', sum(cache_read_tokens)) as tokens,
          coalesce(sum(total) filter (where usd is null), 0) as unpriced_tokens
     from m group by execution_id, model
+), execution_models as (
+  -- Each execution's models, grouped once and joined below (P30: a
+  -- subquery per execution re-read by_execution_model for each of them).
+  select execution_id,
+         jsonb_agg(jsonb_build_object('model', model, 'usd', usd, 'tokens', tokens,
+                                      'unpriced_tokens', unpriced_tokens)
+                   order by usd desc nulls last, model) as models
+    from by_execution_model group by execution_id
 )
 select jsonb_build_object(
   'total', (select jsonb_build_object(
@@ -108,14 +116,10 @@ select jsonb_build_object(
                            coalesce(sum(total) filter (where usd is null), 0) as unpriced_tokens
                       from m group by agent_id) g), '[]'::jsonb),
   'executions', coalesce((select jsonb_agg(jsonb_build_object(
-                'execution', execution_id, 'agent', agent_id, 'task', task_id, 'usd', usd,
-                'tokens', tokens, 'unpriced_tokens', unpriced_tokens,
-                'models', (select coalesce(jsonb_agg(jsonb_build_object(
-                                     'model', b.model, 'usd', b.usd, 'tokens', b.tokens,
-                                     'unpriced_tokens', b.unpriced_tokens)
-                                     order by b.usd desc nulls last, b.model), '[]'::jsonb)
-                             from by_execution_model b where b.execution_id = g.execution_id))
-                order by usd desc, unpriced_tokens desc, execution_id)
+                'execution', g.execution_id, 'agent', g.agent_id, 'task', g.task_id,
+                'usd', g.usd, 'tokens', g.tokens, 'unpriced_tokens', g.unpriced_tokens,
+                'models', coalesce(e.models, '[]'::jsonb))
+                order by g.usd desc, g.unpriced_tokens desc, g.execution_id)
               from (select execution_id, max(agent_id) as agent_id,
                            (array_agg(task_id order by at_ms desc, message_id))[1] as task_id,
                            coalesce(sum(usd), 0) as usd,
@@ -124,7 +128,8 @@ select jsonb_build_object(
                                               'cache_write', sum(cache_write_tokens),
                                               'cache_read', sum(cache_read_tokens)) as tokens,
                            coalesce(sum(total) filter (where usd is null), 0) as unpriced_tokens
-                      from m group by execution_id) g), '[]'::jsonb),
+                      from m group by execution_id) g
+              left join execution_models e on e.execution_id = g.execution_id), '[]'::jsonb),
   'counted_since_ms', (select min(at_ms) from spawn_cost_messages))";
 
 /// Every mission with a daily budget (`budget.daily_usd`) and its cost of

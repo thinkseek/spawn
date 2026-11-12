@@ -8,7 +8,7 @@
 //! in a schema of its own.
 
 use serde_json::{Value, json};
-use spawn_core::event::{ENGINE, EventKind, ModelProfile, NewEvent, Source};
+use spawn_core::event::{ENGINE, EndCause, EventKind, ModelProfile, NewEvent, Source};
 use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, WorkspaceId};
 use spawn_core::port::EventLog;
 use spawn_postgres::{ArchiveCounted, ArchiveFile, ArchivedMessage, PostgresStore};
@@ -232,6 +232,90 @@ fn each_model_row_says_how_many_of_its_tokens_have_no_price() {
     assert_eq!(by_model["unpriced_tokens"], 275_003, "{execution}");
     let by_model = entry(execution, "models", "model", &json!("model-x"));
     assert_eq!(by_model["unpriced_tokens"], 0, "{execution}");
+}
+
+/// P30: each execution's models, grouped once and joined (no longer a
+/// subquery per execution): the whole `executions` list over several
+/// executions and models, priced and unpriced, pinned as the window gave it
+/// before the change.
+#[test]
+fn every_executions_models_are_its_own_in_the_window() {
+    let (store, _schema) = store("cost_execution_models");
+    let (_mission, task, worker) = one_task(&store);
+    let now = store.database_now_ms().expect("now");
+    let lines: [(u64, &str, &str, [u64; 4]); 6] = [
+        (1, "m1", "model-x", [100_000, 10_000, 0, 0]),
+        (1, "m2", "model-x", [0, 20_000, 0, 0]),
+        (1, "m3", "model-y", [1_000_000, 0, 0, 0]),
+        (1, "m4", "model-z", [1000, 100, 0, 0]),
+        (2, "m5", "model-x", [0, 0, 0, 1_000_000]),
+        (3, "m6", "model-z", [10, 0, 0, 0]),
+    ];
+    // One session runs one execution at a time: each ends before the next.
+    for execution in 1..=3 {
+        started(&store, &worker, execution);
+        for (_, id, model, counts) in lines.iter().filter(|line| line.0 == execution) {
+            usage(&store, &worker, execution, (id, model, now), *counts);
+        }
+        store
+            .append(NewEvent {
+                agent_id: AgentId::new(&worker.agent).expect("valid agent"),
+                session_id: SessionId::new(&worker.session).expect("valid session"),
+                execution_id: Some(ExecutionId::for_command(CommandId(execution))),
+                source: Source::Bridge,
+                source_event_id: Some(format!("end-{execution}")),
+                kind: EventKind::ExecutionEnded {
+                    cause: EndCause::Stopped,
+                    exit_code: None,
+                    signal: None,
+                    evidence: None,
+                },
+            })
+            .expect("end");
+    }
+    let prices = json!({
+        "model-x": {"input": 3, "output": 15, "cache_write": 3.75, "cache_read": 0.3},
+        "model-y": {"input": 1, "output": 5, "cache_write": 1.25, "cache_read": 0.1},
+    });
+    assert_eq!(store.cost_record(&prices).expect("record"), 6);
+    let day = store.cost_window(now - DAY_MS, now + 1000).expect("window");
+    let tokens = |input: u64, output: u64, cache_write: u64, cache_read: u64| json!({"input": input, "output": output, "cache_write": cache_write, "cache_read": cache_read});
+    let model = |name: &str, usd: Value, tokens: Value, unpriced: u64| json!({"model": name, "usd": usd, "tokens": tokens, "unpriced_tokens": unpriced});
+    let execution = |id: &str, usd: Value, tokens: Value, unpriced: u64, models: Vec<Value>| {
+        json!({"execution": id, "agent": worker.agent, "task": task, "usd": usd,
+               "tokens": tokens, "unpriced_tokens": unpriced, "models": models})
+    };
+    assert_eq!(
+        day["executions"],
+        json!([
+            execution(
+                "exec_1",
+                json!(1.75),
+                tokens(1_101_000, 30_100, 0, 0),
+                1100,
+                vec![
+                    model("model-y", json!(1.0), tokens(1_000_000, 0, 0, 0), 0),
+                    model("model-x", json!(0.75), tokens(100_000, 30_000, 0, 0), 0),
+                    model("model-z", Value::Null, tokens(1000, 100, 0, 0), 1100),
+                ],
+            ),
+            execution(
+                "exec_2",
+                json!(0.3),
+                tokens(0, 0, 0, 1_000_000),
+                0,
+                vec![model("model-x", json!(0.3), tokens(0, 0, 0, 1_000_000), 0)],
+            ),
+            execution(
+                "exec_3",
+                json!(0),
+                tokens(10, 0, 0, 0),
+                10,
+                vec![model("model-z", Value::Null, tokens(10, 0, 0, 0), 10)],
+            ),
+        ]),
+        "{day}"
+    );
 }
 
 #[test]
