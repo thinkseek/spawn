@@ -44,7 +44,8 @@
 //!     },
 //!     "for_owner": [{"text": "deploy ffc9fe7", "at_ms": 1793957000000 | null,
 //!                    "tasks": [{"id": 198, "state": "accepted"}],  // the tasks it names
-//!                    "settled": false}]   // a review ask whose tasks have all ended
+//!                    "settled": false,    // a review ask whose tasks have all ended
+//!                    "current": true}]    // of the newest For-the-owner block
 //!   },
 //!   "on_own_jobs": [{              // workers the rules hold as working on a
 //!     "session_id", "agent_id",    // background job of their own: not escalated
@@ -118,6 +119,15 @@
 //! hiding a live ask is the worse failure. Home's card leaves a settled
 //! line out (web/src/home.ts `latestNotes`); the supervisor's full list
 //! still shows it, marked settled.
+//!
+//! `current` is true for the lines of the supervisor's newest turn that has
+//! a `For the owner:` line (inline or a heading's items), false for every
+//! earlier turn's (objective 078: the supervisor restates its list in each
+//! block, so an ask it dropped, or said before in other words, is no longer
+//! current). A turn begins at a prompt, a digest included, whatever its
+//! time; a later turn without such a line changes nothing. A line said in
+//! the newest block and before is current (its latest saying). Home's card
+//! shows the current lines and counts the earlier ones.
 
 use std::collections::BTreeMap;
 
@@ -199,6 +209,7 @@ pub(super) fn attention() -> Result<Value, String> {
         &store,
         said.as_ref()
             .map_or(&[][..], |said| said.for_owner.as_slice()),
+        said.as_ref().map_or(0, |said| said.current),
         &mut warnings,
     );
     let holds = match store.source_holds() {
@@ -514,12 +525,15 @@ const ENDED: [&str; 3] = ["accepted", "landed", "cancelled"];
 const TASK_WORDS: [&str; 4] = ["task", "tasks", "report", "reports"];
 
 /// The supervisor's lines for the owner as `/api/attention` lists them,
-/// `[{text, at_ms, tasks, settled}]` ([`owner_note`]), the named tasks'
-/// states read for those tasks alone. When they cannot be read, every line
-/// names no task and none is settled, and a warning says why.
+/// `[{text, at_ms, tasks, settled, current}]` ([`owner_note`]), the named
+/// tasks' states read for those tasks alone; the first `current` of
+/// `notes` (newest first) are the newest block's ([`Said::current`]). When
+/// the states cannot be read, every line names no task and none is
+/// settled, and a warning says why.
 pub(super) fn owner_notes(
     store: &spawn_postgres::PostgresStore,
     notes: &[(String, Option<i64>)],
+    current: usize,
     warnings: &mut Vec<String>,
 ) -> Value {
     let mut ids: Vec<i64> = notes
@@ -544,7 +558,14 @@ pub(super) fn owner_notes(
     Value::Array(
         notes
             .iter()
-            .map(|(text, at_ms)| owner_note(text, *at_ms, &states))
+            .enumerate()
+            .map(|(index, (text, at_ms))| {
+                let mut note = owner_note(text, *at_ms, &states);
+                if let Some(fields) = note.as_object_mut() {
+                    fields.insert("current".to_string(), json!(index < current));
+                }
+                note
+            })
             .collect(),
     )
 }
@@ -719,6 +740,10 @@ struct Said {
     /// Its [`FOR_OWNER`] lines, whatever prompts came since: newest first,
     /// each once with its latest time, at most [`FOR_OWNER_ITEMS`].
     for_owner: Vec<(String, Option<i64>)>,
+    /// How many of `for_owner`, from its start, the newest turn with a
+    /// [`FOR_OWNER`] line wrote: its newest block, the current one
+    /// (objective 078). A turn begins at a prompt, whatever its time.
+    current: usize,
 }
 
 /// Read `bytes`, the end of a Claude Code transcript. A first line cut by
@@ -732,10 +757,17 @@ fn said(bytes: &[u8]) -> Said {
         .map_or(&[][..], |end| &bytes[..end]);
     let mut human = None;
     let mut notes = Vec::new();
+    // The turn each line is of: a prompt, a digest included, begins one.
+    let mut turn = 0_usize;
     for line in whole.split(|byte| *byte == b'\n') {
         let line = String::from_utf8_lossy(line);
         match claude_reply(&line) {
-            Some(ReplyPart::Prompt) if !is_digest(&line) => human = None,
+            Some(ReplyPart::Prompt) => {
+                turn += 1;
+                if !is_digest(&line) {
+                    human = None;
+                }
+            }
             Some(ReplyPart::Text(text)) => {
                 if let Some(question) = text
                     .lines()
@@ -747,18 +779,25 @@ fn said(bytes: &[u8]) -> Said {
                 let words = owner_lines(&text);
                 if !words.is_empty() {
                     let at = line_time(&line);
-                    notes.extend(words.into_iter().map(|words| (words.to_string(), at)));
+                    notes.extend(words.into_iter().map(|words| (words.to_string(), at, turn)));
                 }
             }
             _ => {}
         }
     }
+    // Newest first, so the newest block's lines (each line's latest
+    // saying) lead the list.
+    let newest = notes.last().map(|(_, _, turn)| *turn);
     let mut for_owner: Vec<(String, Option<i64>)> = Vec::new();
-    for (words, at) in notes.into_iter().rev() {
+    let mut current = 0;
+    for (words, at, turn) in notes.into_iter().rev() {
         if for_owner.len() == FOR_OWNER_ITEMS {
             break;
         }
         if !for_owner.iter().any(|(seen, _)| *seen == words) {
+            if Some(turn) == newest {
+                current += 1;
+            }
             for_owner.push((words, at));
         }
     }
@@ -766,6 +805,7 @@ fn said(bytes: &[u8]) -> Said {
         reply: reply.text().map(str::to_string),
         human,
         for_owner,
+        current,
     }
 }
 
@@ -1705,6 +1745,72 @@ mod tests {
         assert_eq!(list_item("**bold**"), None);
         assert_eq!(list_item(""), None);
         assert_eq!(list_item("plain words"), None);
+    }
+
+    /// Objective 078: the newest turn with a For-the-owner line is current,
+    /// told apart from an earlier one by its prompt, not its time; a later
+    /// turn without one changes nothing.
+    #[test]
+    fn the_newest_block_is_current_and_earlier_turns_are_not() {
+        let at = "2026-11-12T08:57:00.000Z";
+        let prompt = |at: &str| line("user", &json!("go on"), at);
+        let transcript = [
+            prompt(at),
+            line(
+                "assistant",
+                &json!(
+                    "For the owner:\n- set SPAWN_WORKSPACE for #11\n- restart task 5\n- keep me"
+                ),
+                at,
+            ),
+            prompt(at),
+            line(
+                "assistant",
+                &json!("For the owner:\n- set SPAWN_WORKSPACE for #11 and #12\n- keep me"),
+                at,
+            ),
+            line("assistant", &json!("For the owner: and task 3 landed"), at),
+            prompt(at),
+            line("assistant", &json!("Next: check the gate logs."), at),
+        ]
+        .concat();
+        let read = said(transcript.as_bytes());
+        let texts: Vec<&str> = read
+            .for_owner
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "and task 3 landed",
+                "keep me",
+                "set SPAWN_WORKSPACE for #11 and #12",
+                "restart task 5",
+                "set SPAWN_WORKSPACE for #11",
+            ]
+        );
+        assert_eq!(
+            read.current, 3,
+            "the second turn's three lines, both its replies"
+        );
+
+        // One turn alone: all current. No line at all: none.
+        let one = [
+            prompt(at),
+            line("assistant", &json!("For the owner: x"), at),
+        ]
+        .concat();
+        assert_eq!(said(one.as_bytes()).current, 1);
+        let none = [prompt(at), line("assistant", &json!("Next: y"), at)].concat();
+        assert_eq!(said(none.as_bytes()).current, 0);
+        // Without any prompt in the tail, its lines are one turn.
+        let bare = line(
+            "assistant",
+            &json!("For the owner: a\nFor the owner: b"),
+            at,
+        );
+        assert_eq!(said(bare.as_bytes()).current, 2);
     }
 
     /// Objective 070 through the transcript reader, with 064's `tasks` and

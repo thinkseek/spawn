@@ -435,7 +435,7 @@ test("the supervisor's notes: at most two from the last 6 hours, the rest counte
   const old = latestNotes(view([note(8)]), NOW);
   assert.deepEqual(old.shown, []);
   assert.equal(old.more, 1);
-  assert.deepEqual(latestNotes(null, NOW), { shown: [], more: 0, settled: 0 });
+  assert.deepEqual(latestNotes(null, NOW), { shown: [], more: 0, earlier: 0, settled: 0 });
 });
 
 // The supervisor's five lines of rsi/scenarios/064.sh, oldest first, as
@@ -514,13 +514,83 @@ test("the supervisor's full list still shows a settled line, marked settled, wit
       at_ms: NOW - 60_000,
       settled: true,
       tasks: "T2 accepted, T3 accepted, T4 cancelled",
+      current: true,
     },
-    { text: "task 2 landed; deploying it needs spawn init-db.", at_ms: NOW - 120_000, settled: false, tasks: "T2 accepted" },
-    { text: "task #5 waits for your review.", at_ms: NOW - 180_000, settled: false, tasks: "T5 reported" },
-    { text: "mission #3 has no backlog yet.", at_ms: NOW - 240_000, settled: false, tasks: "" },
-    { text: "deploy main to pick up the new cost page.", at_ms: NOW - 300_000, settled: false, tasks: "" },
+    { text: "task 2 landed; deploying it needs spawn init-db.", at_ms: NOW - 120_000, settled: false, tasks: "T2 accepted", current: true },
+    { text: "task #5 waits for your review.", at_ms: NOW - 180_000, settled: false, tasks: "T5 reported", current: true },
+    { text: "mission #3 has no backlog yet.", at_ms: NOW - 240_000, settled: false, tasks: "", current: true },
+    { text: "deploy main to pick up the new cost page.", at_ms: NOW - 300_000, settled: false, tasks: "", current: true },
   ]);
   assert.deepEqual(allNotes(null), []);
+});
+
+// rsi/scenarios/078.sh's two blocks as /api/attention lists them: the
+// newest (two lines) current, the earlier turn's three lines not.
+function twoBlocks() {
+  const line = (minutes: number, text: string, tasks: Array<{ id: number; state: string }>, current: boolean, settled = false) => ({
+    text,
+    at_ms: NOW - minutes * 60_000,
+    tasks,
+    settled,
+    current,
+  });
+  return attention({
+    supervisor: {
+      ...fiveLines().supervisor!,
+      for_owner: [
+        line(1, "My engine needs SPAWN_WORKSPACE set, so I can answer messages #11, #12 and #13.", [], true),
+        line(1, "Scenario bb.sh exits 2 on the base (see the gate output for task 3).", [{ id: 3, state: "accepted" }], true),
+        line(2, "My engine needs SPAWN_WORKSPACE set, so I can answer messages #11 and #12.", [], false),
+        line(2, "If task 5 stays idle, restart it or reassign it.", [{ id: 5, state: "reported" }], false),
+        line(2, "The relay names another model for worker 5.", [], false),
+        line(3, "reports 2 and 4 wait for your review.", [{ id: 2, state: "accepted" }, { id: 4, state: "cancelled" }], false, true),
+      ],
+    },
+  });
+}
+
+test("Home's card shows the newest block alone and counts the earlier turns' lines as earlier (objective 078)", () => {
+  const notes = latestNotes(twoBlocks(), NOW);
+  assert.deepEqual(
+    notes.shown.map((note) => note.text),
+    [
+      "My engine needs SPAWN_WORKSPACE set, so I can answer messages #11, #12 and #13.",
+      "Scenario bb.sh exits 2 on the base (see the gate output for task 3).",
+    ],
+  );
+  assert.equal(notes.more, 0);
+  assert.equal(notes.earlier, 3, "the earlier turn's unsettled lines; the settled one is not among them");
+  assert.equal(notes.settled, 1);
+  // A current line past NOTES_SHOWN or stale is in `more`, never `earlier`.
+  const stale = latestNotes(twoBlocks(), NOW + 7 * HOUR);
+  assert.deepEqual(stale.shown, []);
+  assert.equal(stale.more, 2);
+  assert.equal(stale.earlier, 3);
+});
+
+test("each line Home's card shows says what became of the tasks it names (objective 078)", () => {
+  const shown = latestNotes(twoBlocks(), NOW).shown;
+  assert.deepEqual(
+    shown.map((note) => note.taskStates),
+    ["", "T3 accepted"],
+  );
+  const many = latestNotes(
+    attention({
+      supervisor: {
+        ...fiveLines().supervisor!,
+        for_owner: [{ text: "review T2 and T4", at_ms: NOW, tasks: [{ id: 2, state: "accepted" }, { id: 4, state: "cancelled" }], settled: false, current: true }],
+      },
+    }),
+    NOW,
+  );
+  assert.equal(many.shown[0]?.taskStates, "T2 accepted, T4 cancelled");
+});
+
+test("the full list keeps every line, an earlier turn's marked not current (objective 078)", () => {
+  const rows = allNotes(twoBlocks());
+  assert.equal(rows.length, 6);
+  assert.deepEqual(rows.map((row) => row.current), [true, true, false, false, false, false]);
+  assert.equal(rows[1]?.tasks, "T3 accepted");
 });
 
 test("today's digest: one line per task, and alerts, of the last 24 h, newest first; task notices are left out", () => {
