@@ -3263,6 +3263,124 @@ times in a row)",
         }
     }
 
+    /// The databases' sizes, every `SPAWN_ALERT_DATABASE_SECS`: the live
+    /// one's (with its event log's bytes) through the store, each test
+    /// database's through a connection of its own ([`Monitor::database_events`]).
+    fn read_databases(
+        &mut self,
+        store: &PostgresStore,
+        now: i64,
+        out: &mut Vec<Event>,
+        lines: &mut Vec<String>,
+    ) {
+        let live = store.database_size().map_err(|error| error.to_string());
+        let tests: Vec<(&'static str, Result<Value, String>)> = self
+            .settings
+            .test_databases
+            .iter()
+            .map(|(role, url)| {
+                (
+                    *role,
+                    spawn_postgres::test_database_size(&url.0).map_err(|error| error.to_string()),
+                )
+            })
+            .collect();
+        self.database_events(now, live, &tests, out, lines);
+    }
+
+    /// `database_size`, from one reading: the live database's (`{name,
+    /// bytes, schemas, log_bytes}`) and each test database's (`{name, bytes,
+    /// schemas}`, by role). A database at or above the floor and above the
+    /// ratio times the live log's bytes opens one alert (one open per
+    /// database); one open whose database this reading finds no longer so
+    /// clears, the reading its evidence. Without the live reading nothing
+    /// is decided (there is no log to measure against); a test database
+    /// that cannot be read is a line, and its alert, if any, stays as it
+    /// was.
+    fn database_events(
+        &self,
+        now: i64,
+        live: Result<Value, String>,
+        tests: &[(&'static str, Result<Value, String>)],
+        out: &mut Vec<Event>,
+        lines: &mut Vec<String>,
+    ) {
+        let live = match live {
+            Ok(live) => live,
+            Err(error) => {
+                lines.push(format!("alerts: the live database's size: {}", scrub(&error)));
+                return;
+            }
+        };
+        let Some(log_bytes) = live["log_bytes"].as_u64() else {
+            lines.push("alerts: the live database's size: no event log bytes".to_string());
+            return;
+        };
+        let mut readings: Vec<DatabaseSize> = Vec::new();
+        let mut read = |role: &'static str, value: &Value, lines: &mut Vec<String>| {
+            match DatabaseSize::from_value(role, value) {
+                Some(reading) => {
+                    if readings.iter().all(|seen| seen.name != reading.name) {
+                        readings.push(reading);
+                    }
+                }
+                None => lines.push(format!("alerts: the {role} database's size: unreadable")),
+            }
+        };
+        read("live", &live, lines);
+        for (role, reading) in tests {
+            match reading {
+                Ok(value) => read(role, value, lines),
+                Err(error) => lines.push(format!(
+                    "alerts: the {role} database's size: {}",
+                    scrub(error)
+                )),
+            }
+        }
+        let floor = u128::from(self.settings.database_floor_mb) * 1024 * 1024;
+        let ratio = u128::from(self.settings.database_ratio);
+        for reading in readings {
+            let subject = format!("database {}", reading.name);
+            let bytes = u128::from(reading.bytes);
+            let over = bytes >= floor && bytes > ratio * u128::from(log_bytes);
+            let evidence = json!({
+                "database": reading.name, "role": reading.role, "bytes": reading.bytes,
+                "log_bytes": log_bytes, "ratio": ratio_of(reading.bytes, log_bytes),
+                "schemas": reading.schemas, "floor_mb": self.settings.database_floor_mb,
+                "max_ratio": self.settings.database_ratio, "reading_ms": now,
+            });
+            let open = self.open_keys("database_size", &subject);
+            if over {
+                if open.is_empty() {
+                    let times = ratio_of(reading.bytes, log_bytes)
+                        .map_or_else(|| "with no".to_string(), |ratio| format!("{ratio} times"));
+                    out.push(Event::Fire {
+                        key: format!("database_size:{}:{now}", reading.name),
+                        kind: "database_size",
+                        text: format!(
+                            "database {} ({}) holds {}, {times} its live event log of {}: {} schemas",
+                            reading.name,
+                            reading.role,
+                            size_text(reading.bytes),
+                            size_text(log_bytes),
+                            reading.schemas
+                        ),
+                        subject,
+                        evidence,
+                        notice: false,
+                    });
+                }
+            } else {
+                for key in open {
+                    out.push(Event::Clear {
+                        key,
+                        evidence: evidence.clone(),
+                    });
+                }
+            }
+        }
+    }
+
     /// Read what the log `index` appended since the last reading.
     fn read_log(&mut self, index: usize, now: i64, out: &mut Vec<Event>, lines: &mut Vec<String>) {
         let subject = self.logs[index].subject;
@@ -3541,6 +3659,53 @@ times in a row)",
             .get(key)
             .is_some_and(|row| row.open() && row.fired_event_id != 0 && after(row, evidence, now))
     }
+}
+
+/// One database's size reading (`database_size`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DatabaseSize {
+    /// "live", "test" (the gates') or "fleet_test" (the engines').
+    role: &'static str,
+    name: String,
+    bytes: u64,
+    /// Its schemas other than `pg_*`, `information_schema` and `public`.
+    schemas: u64,
+}
+
+impl DatabaseSize {
+    fn from_value(role: &'static str, value: &Value) -> Option<Self> {
+        Some(Self {
+            role,
+            name: value["name"].as_str()?.to_string(),
+            bytes: value["bytes"].as_u64()?,
+            schemas: value["schemas"].as_u64()?,
+        })
+    }
+}
+
+/// `bytes` over `log_bytes` to one decimal (half up); none for an empty
+/// log.
+fn ratio_of(bytes: u64, log_bytes: u64) -> Option<f64> {
+    if log_bytes == 0 {
+        return None;
+    }
+    let (bytes, log) = (u128::from(bytes), u128::from(log_bytes));
+    let tenths = (bytes * 20 + log) / (2 * log);
+    format!("{}.{}", tenths / 10, tenths % 10).parse().ok()
+}
+
+/// "12.0 MB" under 1024 MB, "3.0 GB" from there, as the storage card says
+/// a size (half up).
+fn size_text(bytes: u64) -> String {
+    const MIB: u128 = 1024 * 1024;
+    let bytes = u128::from(bytes);
+    let (unit, scale) = if bytes < 1024 * MIB {
+        ("MB", MIB)
+    } else {
+        ("GB", 1024 * MIB)
+    };
+    let tenths = (bytes * 20 + scale) / (2 * scale);
+    format!("{}.{} {unit}", tenths / 10, tenths % 10)
 }
 
 /// Whether a clear's `evidence` comes after what the alert `row` fired on,
