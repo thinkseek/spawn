@@ -336,15 +336,11 @@ export function storageView(value: unknown): StorageView {
   const days = storage?.days_left ?? null;
   return {
     rows,
-<<<<<<< 66dc88cfe90ce25b9ed195d4b929bbf892e9bf0f
     lasts:
       days === null
         ? null
         : `about ${count(days)} days at the growth of the archive, Claude Code's transcripts and the database`,
-=======
-    lasts: days === null ? null : `about ${count(days)} days at the archive's growth`,
     measured_from: measuredFrom,
->>>>>>> 05d0fa6454296d6c641be63703a1ce4aa46e6422
   };
 }
 
