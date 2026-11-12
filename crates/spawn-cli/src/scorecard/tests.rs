@@ -1747,7 +1747,8 @@ fn the_card_says_from_when_the_owners_judgings_are_counted() {
             json!({"type": "source.push_refused", "request": refused, "reason": "rejected",
                    "verdict": "rejected", "mission": 1, "gate_ms": 403_000}),
         );
-        let at: i64 = client
+        let at: i64 = postgres::Client::connect(&owner, postgres::NoTls)
+            .expect("the owner connects")
             .query_one(
                 "select max(recorded_at_ms) from spawn_events
                   where session_id = 'session_control'
