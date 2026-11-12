@@ -32,7 +32,8 @@
 #       line with any other ask is never settled: hiding a live ask is the
 #       worse failure.
 #   (3) latestNotes leaves a settled line out: it is neither shown nor
-#       counted in `more`.
+#       counted in `more` (nor in `earlier`, objective 078's count of
+#       lines from turns before the newest block); the four live asks are.
 #
 # A real `spawn loop` runs with the supervisor on, `spawn serve` answers, a
 # fake engine writes each turn's words to its transcript as Claude Code
@@ -446,7 +447,10 @@ states=$(q "select string_agg(id || ':' || state, ' ' order by id) from mission_
 said() { grep -qs "$1" "$SPAWN_CLAUDE_PROJECTS"/*/*.jsonl; }
 line_turn() { # <tag> <words> <pattern>
     say "$1" "$2"
-    wait_until 60 said "$3" || harness "the supervisor's line ($3) was not in a transcript within 60 s"
+    wait_until 60 said "$3" || {
+        supervisor_turn_dump "$3"
+        harness "the supervisor's line ($3) was not in a transcript within 60 s"
+    }
 }
 line_turn one "For the owner: deploy main to pick up the new cost page." 'deploy main to pick'
 line_turn two "For the owner: mission #3 has no backlog yet." 'mission #3 has no'
@@ -494,13 +498,12 @@ const answer = JSON.parse(readFileSync(`${env.BB_WORK}/attention.json`, "utf8"))
 const now = Math.max(...answer.supervisor.for_owner.map((note) => note.at_ms ?? 0)) + 60_000;
 
 test("(3) a settled line is neither shown nor counted; a live ask stays", () => {
-  const { shown, more } = latestNotes(answer, now);
-  // The two newest lines that are not settled; the other two counted.
-  assert.deepEqual(
-    shown.map((note) => note.text),
-    ["task 2 landed; deploying it needs spawn init-db.", "task #5 waits for your review."],
-  );
-  assert.equal(more, 2, "more: the mission #3 and deploy main lines");
+  const { shown, more, earlier } = latestNotes(answer, now);
+  const texts = shown.map((note) => note.text);
+  // Every live ask is shown, or counted in more, or (objective 078: a line
+  // of an earlier turn than the newest block) counted as earlier.
+  assert.ok(!texts.includes("reports 2, 3 and 4 are still waiting for your review."), "the settled line is not shown");
+  assert.equal(texts.length + more + (earlier ?? 0), 4, `shown ${JSON.stringify(texts)}, ${more} more, ${earlier ?? 0} earlier: the four live asks`);
 });
 TEST
 if ! BB_TREE=$tree BB_WORK=$WORK node --test "$WORK/notes.test.mjs" >"$WORK/notes.out" 2>&1; then
