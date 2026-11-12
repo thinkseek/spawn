@@ -10,7 +10,7 @@ use super::measure::{
     trend, union_ms,
 };
 use super::time::{DAY_MS, HOUR_MS, day_of, days, format_rfc3339, parse_rfc3339, parse_span};
-use super::transcripts::{Message, Reach, read_archive};
+use super::transcripts::{Message, Parsed, Reach, read_archive, read_archive_parsed};
 use super::{Failure, When, card, reach_tokens, text, window};
 use crate::deliver::delivery_of;
 
@@ -1993,4 +1993,245 @@ fn the_card_says_from_when_the_owners_judgings_are_counted() {
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
+}
+
+/// The archive as a first reading in this process reads it: copied to a
+/// directory of its own (another archive, so nothing of it is kept), read,
+/// removed.
+fn read_fresh(root: &std::path::Path, copy: &str) -> Vec<Message> {
+    let fresh = root.with_extension(copy);
+    for agent in std::fs::read_dir(root).expect("the archive") {
+        let agent = agent.expect("an agent").path();
+        let to = fresh.join(agent.file_name().expect("a name"));
+        std::fs::create_dir_all(&to).expect("a copy");
+        for file in std::fs::read_dir(&agent).expect("an agent's files") {
+            let file = file.expect("a file").path();
+            std::fs::copy(&file, to.join(file.file_name().expect("a name"))).expect("copy");
+        }
+    }
+    let (messages, _, parsed) = read_archive_parsed(&fresh, t0()).expect("read the copy");
+    assert!(
+        parsed.whole_files > 0,
+        "a first reading reads from the start"
+    );
+    std::fs::remove_dir_all(&fresh).expect("clean up");
+    messages
+}
+
+/// A scratch archive with one agent's transcript file in it: the root, the
+/// file, and a transcript line of a message (at `time`, under `model`, with
+/// `tokens` input tokens and one output token).
+fn kept_archive(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = std::env::temp_dir().join(format!(
+        "spawn-scorecard-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |time| time.subsec_nanos())
+    ));
+    let agent = root.join("agent_w1");
+    std::fs::create_dir_all(&agent).expect("archive");
+    let file = agent.join("0a0a0a0a-0000-4000-8000-000000000001.jsonl");
+    (root, file)
+}
+
+fn kept_line(time: &str, id: &str, model: &str, tokens: u64) -> String {
+    format!(
+        "{{\"type\":\"assistant\",\"timestamp\":\"{time}\",\"message\":{{\"id\":\"{id}\",\
+         \"model\":\"{model}\",\"usage\":{{\"input_tokens\":{tokens},\"output_tokens\":1}}}}}}\n"
+    )
+}
+
+fn append_to(file: &std::path::Path, text: &str) {
+    use std::io::Write;
+    std::fs::File::options()
+        .append(true)
+        .open(file)
+        .and_then(|mut handle| handle.write_all(text.as_bytes()))
+        .expect("append");
+}
+
+fn length_of(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path).expect("a file").len()
+}
+
+/// A file read again parses only what was added to it, and gives what a
+/// first reading gives (a line being written included). Counted (files read
+/// from the start, bytes parsed), not timed.
+#[test]
+fn a_file_read_again_parses_only_what_was_added_to_it() {
+    let (root, file) = kept_archive("kept-grown");
+    let line = kept_line;
+    let append = |text: &str| append_to(&file, text);
+    let length = length_of;
+    let first = [
+        line("2026-10-02T03:00:00.000Z", "msg_a", "opus", 10),
+        line("2026-10-02T04:00:00.000Z", "msg_b", "opus", 20),
+    ]
+    .concat();
+    std::fs::write(&file, &first).expect("a transcript");
+    let read = || read_archive_parsed(&root, t0()).expect("read the archive");
+
+    let (messages, _, parsed) = read();
+    assert_eq!(
+        parsed,
+        Parsed {
+            whole_files: 1,
+            bytes: length(&file)
+        }
+    );
+    assert_eq!(messages, read_fresh(&root, "fresh-1"));
+    assert_eq!(messages.len(), 2);
+
+    // Unchanged: nothing parsed, the same messages.
+    let (again, _, parsed) = read();
+    assert_eq!(
+        parsed,
+        Parsed::default(),
+        "an unchanged file parses nothing"
+    );
+    assert_eq!(again, messages);
+
+    // Grown, with a line of a message it holds (earlier, more tokens): only
+    // the added lines are parsed, and they count as a first reading counts
+    // them.
+    let added = [
+        line("2026-10-02T02:00:00.000Z", "msg_b", "sonnet", 50),
+        line("2026-10-02T05:00:00.000Z", "msg_c", "opus", 30),
+    ]
+    .concat();
+    append(&added);
+    let (grown, _, parsed) = read();
+    assert_eq!(
+        parsed,
+        Parsed {
+            whole_files: 0,
+            bytes: added.len() as u64
+        }
+    );
+    assert_eq!(grown, read_fresh(&root, "fresh-2"));
+    assert_eq!(grown.len(), 3);
+    assert!(
+        grown
+            .iter()
+            .any(|m| m.id == "msg_b" && m.at_ms == at(2) && m.model == "sonnet" && m.tokens == 51),
+        "{grown:?}"
+    );
+
+    // A line being written (no newline yet) counts as a first reading
+    // counts it, and is parsed again once it is whole.
+    let next = line("2026-10-02T06:00:00.000Z", "msg_d", "opus", 40);
+    let (part, rest) = next.split_at(next.len() - 1);
+    append(part);
+    let (partial, _, parsed) = read();
+    assert_eq!(
+        parsed,
+        Parsed {
+            whole_files: 0,
+            bytes: part.len() as u64
+        }
+    );
+    assert_eq!(partial, read_fresh(&root, "fresh-3"));
+    append(rest);
+    let (whole, _, parsed) = read();
+    assert_eq!(
+        parsed,
+        Parsed {
+            whole_files: 0,
+            bytes: next.len() as u64
+        }
+    );
+    assert_eq!(whole, read_fresh(&root, "fresh-4"));
+    assert_eq!(whole.len(), 4);
+
+    std::fs::remove_dir_all(&root).expect("clean up");
+}
+
+/// A file shorter than read, with other first bytes, or of the same length
+/// at another time is read from its start; a file gone is no longer kept.
+#[test]
+fn a_file_not_the_one_read_is_read_from_its_start() {
+    let (root, file) = kept_archive("kept-replaced");
+    let line = kept_line;
+    let length = length_of;
+    let read = || read_archive_parsed(&root, t0()).expect("read the archive");
+    std::fs::write(
+        &file,
+        [
+            line("2026-10-02T03:00:00.000Z", "msg_a", "opus", 10),
+            line("2026-10-02T04:00:00.000Z", "msg_b", "opus", 20),
+        ]
+        .concat(),
+    )
+    .expect("a transcript");
+    let (messages, _, parsed) = read();
+    assert_eq!((messages.len(), parsed.whole_files), (2, 1));
+
+    // Shorter than read (truncated, rotated): from its start.
+    std::fs::write(&file, line("2026-10-02T07:00:00.000Z", "msg_e", "opus", 1)).expect("truncate");
+    let (short, _, parsed) = read();
+    assert_eq!(
+        parsed,
+        Parsed {
+            whole_files: 1,
+            bytes: length(&file)
+        }
+    );
+    assert_eq!(short, read_fresh(&root, "fresh-5"));
+    assert_eq!(short.len(), 1);
+
+    // Written in its place, longer, with other first bytes: from its start.
+    // Its last line lies past the first bytes kept.
+    let mut replaced: String = (0..40)
+        .map(|n| {
+            line(
+                "2026-10-02T08:00:00.000Z",
+                &format!("msg_f{n:02}"),
+                "opus",
+                1,
+            )
+        })
+        .collect();
+    replaced.push_str(&line("2026-10-02T09:00:00.000Z", "msg_g", "opus", 1));
+    assert!(replaced.len() > 4096 + 200);
+    std::fs::write(&file, &replaced).expect("replace");
+    let (other, _, parsed) = read();
+    assert_eq!(
+        parsed,
+        Parsed {
+            whole_files: 1,
+            bytes: length(&file)
+        }
+    );
+    assert_eq!(other, read_fresh(&root, "fresh-6"));
+    assert!(other.iter().all(|m| m.id != "msg_e"), "{other:?}");
+
+    // The same length and first bytes at another time (a line past them
+    // rewritten): from its start.
+    let same_length = replaced.replace("msg_g", "msg_h");
+    assert_eq!(same_length.len(), replaced.len());
+    std::fs::write(&file, &same_length).expect("rewrite");
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .and_then(|handle| {
+            handle.set_modified(std::time::SystemTime::now() + std::time::Duration::from_hours(1))
+        })
+        .expect("another time");
+    let (rewritten, _, parsed) = read();
+    assert_eq!(
+        parsed,
+        Parsed {
+            whole_files: 1,
+            bytes: length(&file)
+        }
+    );
+    assert_eq!(rewritten, read_fresh(&root, "fresh-7"));
+    assert!(rewritten.iter().any(|m| m.id == "msg_h"), "{rewritten:?}");
+
+    // A file gone is no longer read nor kept.
+    std::fs::remove_file(&file).expect("remove");
+    let (none, _, parsed) = read();
+    assert_eq!((none.len(), parsed), (0, Parsed::default()));
+    std::fs::remove_dir_all(&root).expect("clean up");
 }

@@ -13,8 +13,10 @@
 //! timestamp counts nothing.
 
 use std::collections::BTreeMap;
-use std::io::BufRead;
-use std::path::Path;
+use std::io::{BufRead, Read, Seek};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 use serde::Deserialize;
 
@@ -123,37 +125,140 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-/// Fold one file's lines into `messages`, keyed by message id.
-fn read_file(
+/// A message's earliest time, its model then, and its most tokens.
+type Folded = BTreeMap<String, (i64, String, i64)>;
+
+/// Count one line's message in `messages`: at its earliest time (the model
+/// of the first line at that time), with the most tokens of its lines.
+fn fold(messages: &mut Folded, id: String, at_ms: i64, model: String, tokens: i64) {
+    messages
+        .entry(id)
+        .and_modify(|(first_ms, first_model, most)| {
+            if at_ms < *first_ms {
+                *first_ms = at_ms;
+                first_model.clone_from(&model);
+            }
+            *most = (*most).max(tokens);
+        })
+        .or_insert((at_ms, model, tokens));
+}
+
+/// Fold the lines of `reader` into `messages`: the whole lines into
+/// `messages`, and how many bytes they took; a last line with no newline
+/// (a line being written) into `tail` instead, so a later read of a longer
+/// file starts at that line again.
+fn read_lines(
+    reader: impl Read,
     path: &Path,
-    messages: &mut BTreeMap<String, (i64, String, i64)>,
-) -> Result<(), String> {
-    let file =
-        std::fs::File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
+    messages: &mut Folded,
+    tail: &mut Folded,
+) -> Result<u64, String> {
+    let mut reader = std::io::BufReader::new(reader);
     let mut bytes = Vec::new();
+    let mut whole = 0_u64;
     loop {
         bytes.clear();
         let read = reader
             .read_until(b'\n', &mut bytes)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
         if read == 0 {
-            return Ok(());
+            return Ok(whole);
+        }
+        let ended = bytes.last() == Some(&b'\n');
+        if ended {
+            whole += u64::try_from(read).unwrap_or(u64::MAX);
         }
         let Some((id, at_ms, model, tokens)) = message_of(&bytes) else {
             continue;
         };
-        messages
-            .entry(id)
-            .and_modify(|(first_ms, first_model, most)| {
-                if at_ms < *first_ms {
-                    *first_ms = at_ms;
-                    first_model.clone_from(&model);
-                }
-                *most = (*most).max(tokens);
-            })
-            .or_insert((at_ms, model, tokens));
+        fold(
+            if ended { messages } else { tail },
+            id,
+            at_ms,
+            model,
+            tokens,
+        );
     }
+}
+
+/// How many bytes of a file's start are kept to tell the same file grown
+/// from another one written in its place.
+const HEAD_BYTES: u64 = 4096;
+
+/// What one archive file held when it was last read: its length, time and
+/// first bytes then, how far its whole lines went, and their messages.
+struct Kept {
+    length: u64,
+    modified: Option<SystemTime>,
+    head: Vec<u8>,
+    whole: u64,
+    messages: Folded,
+}
+
+/// The files read by each archive's last reading (crate serve's Core
+/// lines and the loop's guardrail reading read the archive every few
+/// minutes, and it is hundreds of megabytes): a file read again parses
+/// only what was added to it since.
+static KEPT: Mutex<BTreeMap<PathBuf, BTreeMap<PathBuf, Kept>>> = Mutex::new(BTreeMap::new());
+
+/// What a reading of the archive parsed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Parsed {
+    /// Files read from their start.
+    pub(crate) whole_files: u64,
+    /// Bytes parsed, in all files.
+    pub(crate) bytes: u64,
+}
+
+/// Fold one file's messages into `messages`: from what `kept` holds of it
+/// when the file is the one it read, grown or not (the same first bytes,
+/// and longer, or the same length and time), else from its start; `kept`
+/// then holds the file as it is now.
+fn read_file(
+    path: &Path,
+    kept: Option<Kept>,
+    messages: &mut Folded,
+    parsed: &mut Parsed,
+) -> Result<Kept, String> {
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    let length = metadata.len();
+    let modified = metadata.modified().ok();
+    let mut head = Vec::new();
+    (&mut file)
+        .take(HEAD_BYTES)
+        .read_to_end(&mut head)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    let same = kept.filter(|kept| {
+        head.starts_with(&kept.head)
+            && (length > kept.length || (length == kept.length && modified == kept.modified))
+    });
+    let mut kept = same.unwrap_or_else(|| {
+        parsed.whole_files += 1;
+        Kept {
+            length: 0,
+            modified: None,
+            head: Vec::new(),
+            whole: 0,
+            messages: Folded::new(),
+        }
+    });
+    file.seek(std::io::SeekFrom::Start(kept.whole))
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    let mut tail = Folded::new();
+    let whole = read_lines(&mut file, path, &mut kept.messages, &mut tail)?;
+    parsed.bytes += length.saturating_sub(kept.whole);
+    kept.whole += whole;
+    kept.length = length;
+    kept.modified = modified;
+    kept.head = head;
+    for (id, (at_ms, model, tokens)) in kept.messages.iter().chain(&tail) {
+        fold(messages, id.clone(), *at_ms, model.clone(), *tokens);
+    }
+    Ok(kept)
 }
 
 /// How far back the archive's tokens reach, from one reading of it.
@@ -177,9 +282,48 @@ pub(crate) enum Reach {
 ///
 /// And how far back the archive's tokens reach: told from the archive
 /// itself, never inferred from a window's lack of calls.
+///
+/// A file this process read before is parsed only past what it read then
+/// ([`KEPT`]): the archive is written by appending, and a file that is not
+/// the one read (other first bytes, shorter, or the same length at another
+/// time) is read from its start.
 pub(crate) fn read_archive(
     archive: &Path,
     not_before_ms: i64,
+) -> Result<(Vec<Message>, Reach), String> {
+    read_archive_parsed(archive, not_before_ms).map(|(messages, reach, _)| (messages, reach))
+}
+
+/// [`read_archive`], and what it parsed.
+pub(crate) fn read_archive_parsed(
+    archive: &Path,
+    not_before_ms: i64,
+) -> Result<(Vec<Message>, Reach, Parsed), String> {
+    let mut all_kept = KEPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut kept = all_kept.remove(archive).unwrap_or_default();
+    let mut now_kept = BTreeMap::new();
+    let mut parsed = Parsed::default();
+    let read = read_agents(
+        archive,
+        not_before_ms,
+        &mut kept,
+        &mut now_kept,
+        &mut parsed,
+    );
+    // Only the files this reading read are kept: a file gone, or no longer
+    // read, is dropped with it.
+    all_kept.insert(archive.to_path_buf(), now_kept);
+    read.map(|(messages, reach)| (messages, reach, parsed))
+}
+
+fn read_agents(
+    archive: &Path,
+    not_before_ms: i64,
+    kept: &mut BTreeMap<PathBuf, Kept>,
+    now_kept: &mut BTreeMap<PathBuf, Kept>,
+    parsed: &mut Parsed,
 ) -> Result<(Vec<Message>, Reach), String> {
     let agents = match std::fs::read_dir(archive) {
         Ok(entries) => entries,
@@ -218,9 +362,11 @@ pub(crate) fn read_archive(
             }
         }
         files.sort();
-        let mut messages = BTreeMap::new();
+        let mut messages = Folded::new();
         for file in files {
-            read_file(&directory.join(file), &mut messages)?;
+            let path = directory.join(file);
+            let file_kept = read_file(&path, kept.remove(&path), &mut messages, parsed)?;
+            now_kept.insert(path, file_kept);
         }
         out.extend(
             messages
