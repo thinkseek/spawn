@@ -80,18 +80,13 @@ test("each unit in words, and each range form", () => {
   assert.equal(unitWords("days", 1), "1 days");
   assert.equal(unitWords("ratio", 10), "10.0×");
   assert.equal(unitWords("count", 1_234_567), "1,234,567");
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
   assert.equal(unitWords("ms", 5_400_000), "1 h 30 min");
   assert.equal(unitWords("share", 0.954), "95.4%");
   assert.equal(unitWords("usd", 8.08), "$8.08");
-=======
-  assert.equal(unitWords("ms", 5_400_000), "1.5 h");
   assert.equal(unitWords("ms", 1_920_000), "32 min");
   assert.equal(unitWords("ms", 108_000_000), "30 h");
-  assert.equal(unitWords("ms", 7_200_000), "2 h");
+  assert.equal(rangeWords("ms", { max: 7_200_000 }), "2 h or less");
   assert.equal(rangeWords("ms", { max: 93_600_000 }), "26 h or less");
-  assert.equal(unitWords("share", 0.954), "95%");
->>>>>>> aa8c535f0d9d2c8532b8db571dbba3ae26242767
   assert.equal(rangeWords("count", { min: 6 }), "6 or more");
   assert.equal(rangeWords("count", { max: 200 }), "200 or less");
   assert.equal(rangeWords("count", { min: 1, max: 200 }), "between 1 and 200");
@@ -104,7 +99,6 @@ test("an answer missing its parts, or none, reads as an empty card", () => {
   assert.deepEqual(coreLinesView({}), { rows: [], notice: null, ignored: [] });
 });
 
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
 // Objective 086: the performance line's units.
 test("ms reads as a span, the minutes rounded", () => {
   assert.equal(spanWords(45_000), "45 s");
@@ -159,19 +153,9 @@ test("the performance row in words, an out-of-range north star in the warning to
     { name: "Landings that pass first time", value: "not collected yet", range: "70.0% or more", tone: "muted" },
     { name: "Dollars per landing", value: "$8.08", range: "$10.00 or less", tone: "plain" },
   ]);
-=======
-test("spans: ms, s, min, hours and days", () => {
-  assert.equal(spanWords(450), "450 ms");
-  assert.equal(spanWords(12_000), "12 s");
-  assert.equal(spanWords(59_000), "59 s");
-  assert.equal(spanWords(3_599_000), "59 min");
-  assert.equal(spanWords(3_600_000), "1 h");
-  assert.equal(spanWords(10_800_000), "3 h");
-  assert.equal(spanWords(36_000_000), "10 h");
-  assert.equal(spanWords(4 * 86_400_000), "4 days");
 });
 
-test("the recoverability row: the ages as spans, the reds as a count", () => {
+test("the recoverability row (objective 087): the ages as spans, the reds as a count", () => {
   const view = coreLinesView({
     lines: [
       {
@@ -201,5 +185,4 @@ test("the recoverability row: the ages as spans, the reds as a count", () => {
       ["1", "0 or less", "warning"],
     ],
   );
->>>>>>> aa8c535f0d9d2c8532b8db571dbba3ae26242767
 });

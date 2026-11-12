@@ -74,7 +74,6 @@ function finite(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
 const USD = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 
 /** Milliseconds as a span (objective 086): under a minute "<s> s"; under an
@@ -87,33 +86,12 @@ export function spanWords(ms: number): string {
   const hours = Math.floor(minutes / 60);
   const rest = minutes % 60;
   return rest === 0 ? `${GROUPED.format(hours)} h` : `${GROUPED.format(hours)} h ${rest} min`;
-=======
-/** Milliseconds as a span: "450 ms", "12 s", "32 min", then hours ("1.5 h"
- * below ten, whole from ten: "30 h"), then days from three ("4 days"). */
-export function spanWords(ms: number): string {
-  const abs = Math.abs(ms);
-  if (abs < 1_000) return `${Math.round(ms)} ms`;
-  if (abs < 60_000) return `${Math.trunc(ms / 1_000)} s`;
-  if (abs < 3_600_000) return `${Math.trunc(ms / 60_000)} min`;
-  const hours = ms / 3_600_000;
-  if (Math.abs(hours) < 10) {
-    const tenths = Math.round(hours * 10) / 10;
-    return `${Number.isInteger(tenths) ? tenths.toFixed(0) : tenths.toFixed(1)} h`;
-  }
-  if (Math.abs(hours) < 72) return `${Math.round(hours)} h`;
-  return `${GROUPED.format(ms / 86_400_000)} days`;
->>>>>>> aa8c535f0d9d2c8532b8db571dbba3ae26242767
 }
 
 /** A number in a unit's words: bytes as storageSize ("104.0 GB"), a day's
  * growth "<size> a day", days "1,234 days", a ratio "4.7×", a count
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
  * grouped ("1,214"), milliseconds as a span ("1 h 32 min"), a share as a
  * percent to one decimal ("74.9%"), dollars and cents ("$8.08"). */
-=======
- * grouped ("1,214"), milliseconds as a span ("32 min", "1.5 h", "30 h":
- * spanWords), a share as a whole percent ("95%"). */
->>>>>>> aa8c535f0d9d2c8532b8db571dbba3ae26242767
 export function unitWords(unit: string, value: number): string {
   switch (unit) {
     case "bytes":
