@@ -10,7 +10,7 @@ const PERFORMANCE_KEPT_MS: i64 = 60_000;
 
 /// The performance figures of the last read and the 7-day cost window's
 /// `total` (objective 088), and when.
-static PERFORMANCE: std::sync::Mutex<Option<(i64, Value, Value)>> = std::sync::Mutex::new(None);
+static PERFORMANCE: std::sync::Mutex<Kept> = std::sync::Mutex::new(None);
 
 /// The performance line's values (objective 086), from the Scorecard's
 /// answer over its default 7 days and `/api/cost?window=7d`'s: the fleet
@@ -97,15 +97,11 @@ pub(super) fn performance_now(
     now_ms: i64,
     parts: &mut super::Parts,
 ) -> (Value, Value) {
-    let mut kept = PERFORMANCE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((_, values, cost_total)) = kept
-        .as_ref()
-        .filter(|(at, _, _)| (0..PERFORMANCE_KEPT_MS).contains(&now_ms.saturating_sub(*at)))
-    {
-        return (values.clone(), cost_total.clone());
+    let (mut kept, held) = kept_now(now_ms, parts);
+    if let Some(held) = held {
+        return held;
     }
+    parts.performance = Some("measured");
     let root = crate::env_value("SPAWN_WORKSPACE_ROOT");
     let scorecard = super::timed(&mut parts.archive, || {
         crate::scorecard::measure(
@@ -134,6 +130,32 @@ pub(super) fn performance_now(
     let cost_total = cost["total"].clone();
     *kept = Some((now_ms, values.clone(), cost_total.clone()));
     (values, cost_total)
+}
+
+/// The kept performance figures: when, the values and the cost total.
+type Kept = Option<(i64, Value, Value)>;
+
+/// The kept performance figures' lock, the wait for it timed as
+/// `lock_wait` (behind another reader computing them, cc-astra A35), and
+/// the figures kept within [`PERFORMANCE_KEPT_MS`] of `now_ms`, if any
+/// (then marked `kept`).
+fn kept_now(
+    now_ms: i64,
+    parts: &mut super::Parts,
+) -> (std::sync::MutexGuard<'static, Kept>, Option<(Value, Value)>) {
+    let kept = super::timed(&mut parts.lock_wait, || {
+        PERFORMANCE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
+    let held = kept
+        .as_ref()
+        .filter(|(at, _, _)| (0..PERFORMANCE_KEPT_MS).contains(&now_ms.saturating_sub(*at)))
+        .map(|(_, values, cost_total)| (values.clone(), cost_total.clone()));
+    if held.is_some() {
+        parts.performance = Some("kept");
+    }
+    (kept, held)
 }
 
 /// The performance line ([`performance`]'s values).
@@ -184,6 +206,46 @@ mod tests {
     use super::super::*;
     use super::*;
     use serde_json::{Value, json};
+
+    /// cc-astra A35: a reading that waits behind another holding the kept
+    /// figures' lock says the wait as `lock_wait`, and the figures it then
+    /// finds kept are marked `kept`. Lower bounds only.
+    #[test]
+    fn a_reading_behind_another_says_its_lock_wait_and_that_it_was_kept() {
+        let (held, release) = (
+            std::sync::mpsc::channel::<()>(),
+            std::sync::mpsc::channel::<()>(),
+        );
+        let (locked, is_locked) = held;
+        let (go, wait) = release;
+        let now_ms = 1_000_000;
+        let holder = std::thread::spawn(move || {
+            let mut kept = PERFORMANCE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *kept = Some((now_ms, json!({"x": 1}), json!(2)));
+            locked.send(()).expect("locked");
+            let _ = wait.recv();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        is_locked.recv().expect("the holder has the lock");
+        go.send(()).expect("go");
+        let mut parts = Parts::default();
+        let (_guard, held) = kept_now(now_ms + 1, &mut parts);
+        holder.join().expect("holder");
+        assert_eq!(held, Some((json!({"x": 1}), json!(2))));
+        assert_eq!(parts.performance, Some("kept"));
+        let waited = parts.lock_wait.expect("timed");
+        assert!(
+            waited >= std::time::Duration::from_millis(150),
+            "{waited:?}"
+        );
+        assert!(
+            parts.text().contains(" performance=kept"),
+            "{}",
+            parts.text()
+        );
+    }
 
     /// Objective 086: the performance line from a scorecard and a cost
     /// answer, as the pages give them.
