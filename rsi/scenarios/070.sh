@@ -26,8 +26,8 @@
 #       A list under any other heading is not the owner's.
 #   (2) each such item carries `tasks` and `settled` as an inline line
 #       does (objective 064).
-#   (3) latestNotes shows and counts them as any other line, a settled one
-#       left out.
+#   (3) latestNotes shows and counts them as any other line (in `more`,
+#       or in objective 078's `earlier`), a settled one left out.
 #
 # A real `spawn loop` runs with the supervisor on, `spawn serve` answers, a
 # fake engine writes each turn's words to its transcript as Claude Code
@@ -495,10 +495,12 @@ const answer = JSON.parse(readFileSync(`${env.BB_WORK}/attention.json`, "utf8"))
 const now = Math.max(...answer.supervisor.for_owner.map((note) => note.at_ms ?? 0)) + 60_000;
 
 test("(3) the list items reach the card; the settled one is neither shown nor counted", () => {
-  const { shown, more } = latestNotes(answer, now);
+  const { shown, more, earlier } = latestNotes(answer, now);
   const texts = shown.map((note) => note.text);
   assert.equal(texts[0], "task #5 waits for your review.", "the newest line first");
-  assert.equal(texts.length + more, 5, `shown ${JSON.stringify(texts)} and ${more} more: the five live asks`);
+  // Shown, in more, or (objective 078: a line of an earlier turn than the
+  // newest block) counted as earlier.
+  assert.equal(texts.length + more + (earlier ?? 0), 5, `shown ${JSON.stringify(texts)}, ${more} more, ${earlier ?? 0} earlier: the five live asks`);
   assert.ok(!texts.includes("Reports 2, 3 and 4 are still waiting for your review."), "the settled item is not shown");
 });
 TEST
