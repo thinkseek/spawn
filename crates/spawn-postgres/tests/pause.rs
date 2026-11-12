@@ -60,7 +60,11 @@ fn refusal<T: std::fmt::Debug>(result: Result<T, spawn_core::port::StoreError>) 
 /// An objective mission worked by the approved resident `name`.
 fn objective_mission(store: &PostgresStore, name: &str) -> i64 {
     let mission = store
-        .mission_add("Supply PA: an agent for every provider", &json!(["/tmp/source.git"]), "human")
+        .mission_add(
+            "Supply PA: an agent for every provider",
+            &json!(["/tmp/source.git"]),
+            "human",
+        )
         .expect("add");
     store
         .resident_propose(name, "Works the backlog")
@@ -166,7 +170,9 @@ fn the_owner_pauses_and_resumes_and_nothing_is_assigned_while_paused() {
         .expect("assigned again");
 
     // A closed mission is not paused; nor is one that does not exist.
-    store.mission_close(mission, "done", "held no more").expect("close");
+    store
+        .mission_close(mission, "done", "held no more")
+        .expect("close");
     let closed = refusal(store.mission_pause(mission, None));
     assert!(closed.contains("closed"), "{closed}");
     assert!(refusal(store.mission_pause(9_999, None)).contains("does not exist"));
@@ -179,7 +185,9 @@ fn a_mission_both_paused_and_halted_is_resumed_twice_the_pause_first() {
     let mut client = admin(&schema);
     let mission = objective_mission(&store, "core");
     let halt = store
-        .integrator_record(&json!({"type": "mission.halted", "id": mission, "reason": "three rejections"}))
+        .integrator_record(
+            &json!({"type": "mission.halted", "id": mission, "reason": "three rejections"}),
+        )
         .expect("halted");
 
     // A halted mission may be paused: its halt stays.
@@ -225,7 +233,11 @@ fn the_fold_of_a_pause_replays_and_the_window_counts_its_time() {
     client
         .batch_execute("select spawn_control_refold()")
         .expect("refold");
-    assert_eq!(mission_row(&mut client, mission), before, "the log gives the same row");
+    assert_eq!(
+        mission_row(&mut client, mission),
+        before,
+        "the log gives the same row"
+    );
 
     // The window names the pause, open while it lasts.
     let now = store.now_ms().expect("now");
