@@ -91,18 +91,56 @@ impl Walked {
 /// `archive_bytes` of `oldest` (the oldest sample of the last 7 days), over
 /// the days between them. `None` without a sample at least a day old.
 pub(crate) fn growth(bytes: u64, oldest: &Value, read_at_ms: i64) -> Option<i64> {
+    growth_of(bytes, oldest, "archive_bytes", read_at_ms)
+}
+
+/// The bytes a grower gains per day: its `bytes` now less the `field` of
+/// `oldest` (the oldest sample of the last 7 days that carries it), over
+/// the days between them, rounded down. `None` without such a sample at
+/// least a day old.
+pub(crate) fn growth_of(bytes: u64, oldest: &Value, field: &str, read_at_ms: i64) -> Option<i64> {
     let at = oldest["at_ms"].as_i64()?;
-    let then = oldest["archive_bytes"].as_i64()?;
+    let then = oldest[field].as_i64()?;
     let elapsed = read_at_ms.saturating_sub(at);
     if elapsed < GROWTH_MIN_MS {
         return None;
     }
     let appended = i128::from(bytes) - i128::from(then);
-    i64::try_from(appended * i128::from(DAY_MS) / i128::from(elapsed)).ok()
+    i64::try_from((appended * i128::from(DAY_MS)).div_euclid(i128::from(elapsed))).ok()
+}
+
+/// The growth of every grower that persists (objective 085), in bytes a
+/// day: the archive's (`archive_bytes`, without a root none), Claude Code's
+/// transcripts' (`projects_bytes`) and the database's (`database_bytes`,
+/// against `database`, this answer's database bytes), each from the oldest
+/// sample of the window that carries it (`carrying`, as
+/// `PostgresStore::host_storage` reads it).
+pub(crate) fn growth_parts(
+    archive: Option<u64>,
+    projects: u64,
+    database: Option<u64>,
+    carrying: &Value,
+    read_at_ms: i64,
+) -> Value {
+    let part = |bytes: Option<u64>, field: &str| {
+        bytes.and_then(|bytes| growth_of(bytes, &carrying[field], field, read_at_ms))
+    };
+    json!({
+        "archive": part(archive, "archive_bytes"),
+        "projects": part(Some(projects), "projects_bytes"),
+        "database": part(database, "database_bytes"),
+    })
+}
+
+/// The parts' sum ([`growth_parts`]); `None` while any part is.
+pub(crate) fn persistent_growth(parts: &Value) -> Option<i64> {
+    ["archive", "projects", "database"]
+        .iter()
+        .try_fold(0_i64, |sum, part| sum.checked_add(parts[*part].as_i64()?))
 }
 
 /// How many days `free` bytes last at `growth` bytes a day, rounded down;
-/// `None` when either is unknown or the archive does not grow.
+/// `None` when either is unknown or what persists does not grow.
 pub(crate) fn days_left(free: Option<u64>, growth: Option<i64>) -> Option<u64> {
     let growth = u64::try_from(growth?).ok().filter(|growth| *growth > 0)?;
     Some(free? / growth)
@@ -130,7 +168,8 @@ pub(crate) fn test_databases(readings: Vec<(&'static str, Result<Value, String>)
 
 /// The kept part of the figures, read at `read_at_ms`: the sizes, the
 /// database's, the test databases' ([`test_databases`]), the archive's
-/// growth and Claude Code's count before, from `samples` (`{oldest,
+/// growth, the growth of every grower that persists ([`growth_parts`]) and
+/// their sum, and Claude Code's count before, from `samples` (`{carrying,
 /// before}`, as `PostgresStore::host_storage` reads them for this moment).
 pub(crate) fn sizes(
     read_at_ms: i64,
@@ -141,6 +180,13 @@ pub(crate) fn sizes(
 ) -> Value {
     let path = |path: &Path| path.display().to_string();
     let root = walked.root.as_deref();
+    let parts = growth_parts(
+        root.map(|_| walked.archive.bytes),
+        walked.projects.bytes,
+        database["bytes"].as_u64(),
+        &samples["carrying"],
+        read_at_ms,
+    );
     json!({
         "read_at_ms": read_at_ms,
         "archive": root.map(|root| json!({
@@ -160,13 +206,16 @@ pub(crate) fn sizes(
         })),
         "database": database.clone(),
         "test_databases": tests.clone(),
-        "growth_bytes_per_day": root.and_then(|_| growth(walked.archive.bytes, &samples["oldest"], read_at_ms)),
+        "growth_bytes_per_day": parts["archive"],
+        "persistent_growth_bytes_per_day": persistent_growth(&parts),
+        "growth_parts": parts,
     })
 }
 
-/// The figures with the free space now: `free_bytes` and `days_left`.
+/// The figures with the free space now: `free_bytes` and `days_left` (at
+/// the persistent growth, objective 085).
 pub(crate) fn with_free(mut sizes: Value, free: Option<u64>) -> Value {
-    let days = days_left(free, sizes["growth_bytes_per_day"].as_i64());
+    let days = days_left(free, sizes["persistent_growth_bytes_per_day"].as_i64());
     sizes["free_bytes"] = json!(free);
     sizes["days_left"] = json!(days);
     sizes
