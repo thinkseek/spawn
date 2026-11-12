@@ -596,13 +596,16 @@ fn storage_line(storage: &Value) -> Line {
 }
 
 /// The window of the observability north star: 7 days.
+#[cfg(test)]
 const WEEK_MS: i64 = 7 * 24 * 3_600_000;
 
 /// "Needs you is right" (objective 092): of the alerts (not notices) that
 /// ended in the 7 days up to `now_ms` (`cleared_at_ms` in the window), the
 /// share whose outcome is "cleared", their condition cleared them rather
 /// than the owner judging them false, stale or a duplicate; null with none.
-/// `alerts` are rows as `/api/alerts` gives them.
+/// `alerts` are rows as `/api/alerts` gives them. Not read live until A23
+/// replaces it: a condition clearing is not evidence the alert was right.
+#[cfg(test)]
 pub(super) fn needs_you_right(alerts: &Value, now_ms: i64) -> Value {
     let since = now_ms.saturating_sub(WEEK_MS);
     let (mut ended, mut right) = (0_u32, 0_u32);
@@ -856,13 +859,13 @@ fn lines_at(
     let storage = super::storage::report(store, now_ms)?;
     let (performance, cost_total) = performance_now(store, now_ms);
     let health = store.fleet_health().map_err(super::err)?;
-    let alerts = store
-        .alerts(now_ms.saturating_sub(WEEK_MS))
-        .map_err(super::err)?;
     let observed = Observed {
         cost_total,
         human_per_agent_hour: health["human_per_agent_hour"].clone(),
-        needs_you_right: needs_you_right(&alerts, now_ms),
+        // Not collected until A22/A23 land (owner, 2026-11-12): the share of
+        // alerts whose condition cleared them is not whether they were right
+        // (sync/astra/findings.md A23), so it is not shown as the north star.
+        needs_you_right: Value::Null,
     };
     let backups = store.newest_backups().map_err(super::err)?;
     let facts = nightly_facts(nightly);
