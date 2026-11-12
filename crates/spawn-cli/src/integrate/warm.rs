@@ -607,7 +607,7 @@ fn clean_logs(dir: &Path, days: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Left, PID_FILE, Want, Warms, stat_start_ticks};
+    use super::{Left, Lost, PID_FILE, Taken, Want, Warms, stat_start_ticks};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
@@ -703,6 +703,8 @@ mod tests {
         let file = std::fs::read_to_string(scratch.0.join("warm").join(PID_FILE)).expect("pid");
         assert!(file.contains(&format!("pid {pid}\n")), "{file}");
         assert!(file.contains("commit abc123\n"), "{file}");
+        assert!(file.contains("source /src/spawn\n"), "{file}");
+        assert!(file.contains("scenarios /live/rsi/scenarios\n"), "{file}");
         warms.abandon("test over");
         assert!(!alive(pid));
     }
@@ -794,7 +796,7 @@ mod tests {
             record.replace("fff666", "0000aa"),
         )
         .expect("edit");
-        let new = warms(&scratch, 30);
+        let mut new = warms(&scratch, 30);
         new.take_over();
         assert!(alive(pid), "a file naming another commit stops nothing");
         // Another start time: a pid used again.
@@ -842,14 +844,36 @@ mod tests {
     }
 
     #[test]
-    fn a_pid_file_says_pid_start_and_commit_or_is_refused() {
+    fn a_pid_file_says_pid_start_commit_source_and_scenarios_or_is_refused() {
+        assert_eq!(
+            Left::parse(
+                "pid 4242\nstart 98765\ncommit abc123\nsource /src/my spawn\n\
+                 scenarios /live/rsi/scenarios\n"
+            ),
+            Some(Left {
+                pid: 4242,
+                start: 98765,
+                commit: "abc123".to_string(),
+                source: Some("/src/my spawn".to_string()),
+                scenarios: Some(PathBuf::from("/live/rsi/scenarios")),
+            })
+        );
+        // An older integrator's file: no source, no scenarios.
         assert_eq!(
             Left::parse("pid 4242\nstart 98765\ncommit abc123\n"),
             Some(Left {
                 pid: 4242,
                 start: 98765,
-                commit: "abc123".to_string()
+                commit: "abc123".to_string(),
+                source: None,
+                scenarios: None,
             })
+        );
+        // A source without scenarios cannot be warmed as it was: neither.
+        assert_eq!(
+            Left::parse("pid 4242\nstart 98765\ncommit abc123\nsource /src/spawn\n")
+                .and_then(|left| left.source),
+            None
         );
         for wrong in [
             "",
@@ -860,6 +884,227 @@ mod tests {
         ] {
             assert_eq!(Left::parse(wrong), None, "{wrong:?}");
         }
+        // What a warm writes is what a take-over reads.
+        let written = super::record(77, 88, &want("abc123"));
+        assert_eq!(
+            Left::parse(&written),
+            Some(Left {
+                pid: 77,
+                start: 88,
+                commit: "abc123".to_string(),
+                source: Some("/src/spawn".to_string()),
+                scenarios: Some(PathBuf::from("/live/rsi/scenarios")),
+            })
+        );
+    }
+
+    /// A pid that names no process any more: one that ran and was reaped.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().expect("true");
+        let pid = child.id();
+        child.wait().expect("reaped");
+        pid
+    }
+
+    fn write_pid_file(scratch: &Scratch, text: &str) {
+        std::fs::create_dir_all(scratch.0.join("warm")).expect("warm dir");
+        std::fs::write(scratch.0.join("warm").join(PID_FILE), text).expect("pid file");
+    }
+
+    fn lost(commit: &str) -> Lost {
+        Lost {
+            source: "/src/spawn".to_string(),
+            commit: commit.to_string(),
+            scenarios: PathBuf::from("/live/rsi/scenarios"),
+            tries: 0,
+        }
+    }
+
+    fn warmed_args(scratch: &Scratch, commit: &str) -> Vec<String> {
+        let args = scratch.0.join(format!("args.{commit}"));
+        until("the gate's arguments", || args.exists());
+        std::fs::read_to_string(&args)
+            .expect("args")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A warm its integrator's restart cut off (gone: its parent-death
+    /// signal ended it) is warmed again by the next integrator, for its
+    /// source's main as it is, with its scenarios.
+    #[test]
+    fn a_gone_warm_with_a_source_is_warmed_again() {
+        let scratch = Scratch::new("again-gone");
+        write_pid_file(
+            &scratch,
+            &format!(
+                "pid {}\nstart 1\ncommit aaa111\nsource /src/spawn\nscenarios \
+                 /live/rsi/scenarios\n",
+                dead_pid()
+            ),
+        );
+        let mut new = warms(&scratch, 30);
+        assert_eq!(
+            new.take_over(),
+            Taken::Again {
+                lost: lost("aaa111"),
+                stopped: false
+            }
+        );
+        assert!(!scratch.0.join("warm").join(PID_FILE).exists());
+        assert_eq!(new.lost_source(), Some("/src/spawn"));
+        new.want_lost(true, &|source| {
+            assert_eq!(source, "/src/spawn");
+            Ok("aaa111".to_string())
+        });
+        assert_eq!(new.lost_source(), None, "wanted once");
+        new.poll(&|_| Some(PathBuf::from("/mirror.git")));
+        assert!(new.running_pid().is_some());
+        assert_eq!(
+            warmed_args(&scratch, "aaa111"),
+            [
+                "--base-only",
+                "/mirror.git",
+                "aaa111",
+                "/live/rsi/scenarios"
+            ]
+        );
+        new.abandon("test over");
+    }
+
+    /// A warm still running when the next integrator starts (no setpriv,
+    /// or its parent-death signal not yet delivered) is stopped by the
+    /// take-over, then warmed again.
+    #[test]
+    fn a_running_warm_with_a_source_is_stopped_then_warmed_again() {
+        let scratch = Scratch::new("again-running");
+        let mut old = warms(&scratch, 30);
+        old.want(want("bbb222"));
+        old.poll(&|_| Some(PathBuf::from("/mirror.git")));
+        let pid = old.running_pid().expect("the predecessor's warm");
+        until("the warm to start its gate", || {
+            scratch.0.join("args.bbb222").exists()
+        });
+        std::fs::remove_file(scratch.0.join("args.bbb222")).expect("args");
+        let mut new = warms(&scratch, 30);
+        assert_eq!(
+            new.take_over(),
+            Taken::Again {
+                lost: lost("bbb222"),
+                stopped: true
+            }
+        );
+        until("the predecessor's warm to stop", || !alive(pid));
+        new.want_lost(true, &|_| Ok("bbb222".to_string()));
+        new.poll(&|_| Some(PathBuf::from("/mirror.git")));
+        let again = new.running_pid().expect("warmed again");
+        assert_ne!(again, pid);
+        assert_eq!(warmed_args(&scratch, "bbb222")[2], "bbb222");
+        new.abandon("test over");
+        old.abandon("test over");
+    }
+
+    /// Main moved between the two integrators by a move neither saw: the
+    /// new main is warmed, never the commit the lost warm had.
+    #[test]
+    fn a_lost_warm_whose_main_moved_warms_the_new_main() {
+        let scratch = Scratch::new("again-moved");
+        write_pid_file(
+            &scratch,
+            &format!(
+                "pid {}\nstart 1\ncommit ccc333\nsource /src/spawn\nscenarios \
+                 /live/rsi/scenarios\n",
+                dead_pid()
+            ),
+        );
+        let mut new = warms(&scratch, 30);
+        assert!(matches!(new.take_over(), Taken::Again { .. }));
+        new.want_lost(true, &|_| Ok("ddd444".to_string()));
+        new.poll(&|_| Some(PathBuf::from("/mirror.git")));
+        assert_eq!(warmed_args(&scratch, "ddd444")[2], "ddd444");
+        new.abandon("test over");
+        assert!(
+            !scratch.0.join("args.ccc333").exists(),
+            "the old main is never warmed"
+        );
+        new.poll(&|_| Some(PathBuf::from("/mirror.git")));
+        assert_eq!(new.running_pid(), None, "nothing more is wanted");
+    }
+
+    /// A source whose missions are all halted is warmed for no gate: the
+    /// lost warm is dropped, and its main is not even read.
+    #[test]
+    fn a_lost_warm_on_a_halted_source_is_not_warmed_again() {
+        let scratch = Scratch::new("again-halted");
+        write_pid_file(
+            &scratch,
+            &format!(
+                "pid {}\nstart 1\ncommit eee555\nsource /src/spawn\nscenarios /s\n",
+                dead_pid()
+            ),
+        );
+        let mut new = warms(&scratch, 30);
+        assert!(matches!(new.take_over(), Taken::Again { .. }));
+        new.want_lost(false, &|_| panic!("main is not read for a halted source"));
+        assert_eq!(new.lost_source(), None);
+        new.poll(&|_| Some(PathBuf::from("/mirror.git")));
+        assert_eq!(new.running_pid(), None);
+    }
+
+    /// A main that cannot be read is tried again at the next passes, then
+    /// given up; a warm this integrator wants first is not replaced.
+    #[test]
+    fn a_lost_warm_waits_for_its_main_and_for_the_warm_wanted_first() {
+        let scratch = Scratch::new("again-wait");
+        write_pid_file(
+            &scratch,
+            &format!(
+                "pid {}\nstart 1\ncommit fff666\nsource /src/spawn\nscenarios /s\n",
+                dead_pid()
+            ),
+        );
+        let mut new = warms(&scratch, 30);
+        assert!(matches!(new.take_over(), Taken::Again { .. }));
+        new.want(want("abc999"));
+        new.want_lost(true, &|_| panic!("not while another warm is wanted"));
+        assert_eq!(new.lost_source(), Some("/src/spawn"));
+        new.poll(&|_| None);
+        for _ in 1..super::LOST_TRIES {
+            new.wanted = None;
+            new.want_lost(true, &|_| Err("unreachable".to_string()));
+            assert_eq!(new.lost_source(), Some("/src/spawn"), "tried again");
+        }
+        new.want_lost(true, &|_| Err("unreachable".to_string()));
+        assert_eq!(new.lost_source(), None, "given up");
+    }
+
+    /// An older integrator's pid file names no source: whatever it warmed
+    /// is not warmed again. A file that is not a warm's is as before.
+    #[test]
+    fn a_pid_file_without_a_source_or_not_a_warms_warms_nothing_again() {
+        let scratch = Scratch::new("again-none");
+        write_pid_file(
+            &scratch,
+            &format!("pid {}\nstart 1\ncommit abc123\n", dead_pid()),
+        );
+        let mut new = warms(&scratch, 30);
+        assert_eq!(
+            new.take_over(),
+            Taken::NoSource {
+                commit: "abc123".to_string()
+            }
+        );
+        assert_eq!(new.lost_source(), None);
+        assert!(!scratch.0.join("warm").join(PID_FILE).exists());
+        write_pid_file(&scratch, "something else\n");
+        assert_eq!(new.take_over(), Taken::NotAWarm);
+        assert_eq!(new.lost_source(), None);
+        assert!(!scratch.0.join("warm").join(PID_FILE).exists());
+        assert_eq!(new.take_over(), Taken::Nothing);
+        new.want_lost(true, &|_| panic!("nothing is lost"));
+        new.poll(&|_| Some(PathBuf::from("/mirror.git")));
+        assert_eq!(new.running_pid(), None);
     }
 
     /// The start time is field 22 of /proc/<pid>/stat, read after a command
