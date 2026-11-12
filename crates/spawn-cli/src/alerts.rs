@@ -7681,7 +7681,7 @@ connections\n";
                         1,
                         &format!(
                             r#"{{"type":"task.assigned","id":{task},"mission_id":4,
-                                "kind":"work","agent_id":"agent_worker_{task}",
+                                "kind":"ephemeral","agent_id":"agent_worker_{task}",
                                 "session_id":"session_{task}","brief":"b",
                                 "created_by":"agent_supervisor","objective":1}}"#
                         ),
