@@ -77,7 +77,7 @@ fn words(unit: &str, value: &Value) -> String {
     };
     match unit {
         "bytes" | "bytes_per_day" => {
-            let size = if number >= 0.0 && number < 1.8e19 {
+            let size = if (0.0..1.8e19).contains(&number) {
                 // A non-negative size within u64 converts as whole bytes.
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let bytes = number as u64;
@@ -261,7 +261,7 @@ mod tests {
 
     /// An answer with free disk at `value` in state `state` (its range min
     /// 40 GiB), and the database ratio in range.
-    fn answer(state: &str, value: Value) -> Value {
+    fn answer(state: &str, value: &Value) -> Value {
         json!({"lines": [
             {"line": "performance", "north_star": {"key": "performance.report_to_live",
                 "name": "Time from report to live", "unit": "ms", "value": null,
@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn a_figure_held_out_raises_once_after_the_hold_and_a_reading_in_restarts_it() {
         let mut monitor = monitor();
-        let low = || Ok(answer("out", json!(2 * GIB)));
+        let low = || Ok(answer("out", &json!(2 * GIB)));
         assert!(
             read(&mut monitor, 1000, low()).0.is_empty(),
             "out, the hold just began"
@@ -349,7 +349,7 @@ mod tests {
             read(
                 &mut monitor,
                 1000 + RAISE - 1,
-                Ok(answer("in", json!(50 * GIB)))
+                Ok(answer("in", &json!(50 * GIB)))
             )
             .0
             .is_empty()
@@ -398,8 +398,8 @@ mod tests {
     #[test]
     fn an_open_alert_clears_after_the_clear_hold_and_a_reading_out_restarts_it() {
         let mut monitor = monitor();
-        let low = || Ok(answer("out", json!(2 * GIB)));
-        let fine = || Ok(answer("in", json!(50 * GIB)));
+        let low = || Ok(answer("out", &json!(2 * GIB)));
+        let fine = || Ok(answer("in", &json!(50 * GIB)));
         read(&mut monitor, 0, low());
         let (fired, _) = read(&mut monitor, RAISE, low());
         commit(&mut monitor, &fired);
@@ -435,36 +435,36 @@ mod tests {
         let mut monitor = monitor();
         for at in [0, RAISE, 3 * RAISE] {
             assert!(
-                read(&mut monitor, at, Ok(answer("no_range", json!(1))))
+                read(&mut monitor, at, Ok(answer("no_range", &json!(1))))
                     .0
                     .is_empty()
             );
             assert!(
-                read(&mut monitor, at, Ok(answer("not_collected", Value::Null)))
+                read(&mut monitor, at, Ok(answer("not_collected", &Value::Null)))
                     .0
                     .is_empty()
             );
         }
         // A figure that loses its value counts as not out.
-        read(&mut monitor, 10 * RAISE, Ok(answer("out", json!(1))));
-        let (fired, _) = read(&mut monitor, 11 * RAISE, Ok(answer("out", json!(1))));
+        read(&mut monitor, 10 * RAISE, Ok(answer("out", &json!(1))));
+        let (fired, _) = read(&mut monitor, 11 * RAISE, Ok(answer("out", &json!(1))));
         commit(&mut monitor, &fired);
         let at = 11 * RAISE + 1;
-        read(&mut monitor, at, Ok(answer("not_collected", Value::Null)));
-        let (cleared, _) = read(&mut monitor, at + CLEAR, Ok(answer("no_range", json!(1))));
+        read(&mut monitor, at, Ok(answer("not_collected", &Value::Null)));
+        let (cleared, _) = read(&mut monitor, at + CLEAR, Ok(answer("no_range", &json!(1))));
         assert_eq!(cleared.len(), 1, "{cleared:?}");
     }
 
     #[test]
     fn a_failed_reading_decides_nothing_and_is_a_line() {
         let mut monitor = monitor();
-        read(&mut monitor, 0, Ok(answer("out", json!(1))));
+        read(&mut monitor, 0, Ok(answer("out", &json!(1))));
         let (events, lines) = read(&mut monitor, RAISE, Err("connection refused".to_string()));
         assert!(events.is_empty());
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("connection refused"), "{lines:?}");
         // The count went on: the next reading out raises.
-        let (fired, _) = read(&mut monitor, RAISE + 1, Ok(answer("out", json!(1))));
+        let (fired, _) = read(&mut monitor, RAISE + 1, Ok(answer("out", &json!(1))));
         assert_eq!(fired.len(), 1);
     }
 
@@ -486,7 +486,7 @@ mod tests {
         // Still out, well past the hold: no second alert.
         for at in [100, 100 + RAISE, 100 + 3 * RAISE] {
             assert!(
-                read(&mut restarted, at, Ok(answer("out", json!(1))))
+                read(&mut restarted, at, Ok(answer("out", &json!(1))))
                     .0
                     .is_empty()
             );
@@ -494,14 +494,14 @@ mod tests {
         // Back in: it clears after the hold, counted from this run's reading.
         let back = 100 + 4 * RAISE;
         assert!(
-            read(&mut restarted, back, Ok(answer("in", json!(50 * GIB))))
+            read(&mut restarted, back, Ok(answer("in", &json!(50 * GIB))))
                 .0
                 .is_empty()
         );
         let (cleared, _) = read(
             &mut restarted,
             back + CLEAR,
-            Ok(answer("in", json!(50 * GIB))),
+            Ok(answer("in", &json!(50 * GIB))),
         );
         assert_eq!(keys(&cleared), [format!("clear {key}")]);
     }
@@ -521,7 +521,7 @@ mod tests {
                 fired_at_ms: 10,
             },
         );
-        let (cleared, _) = read(&mut monitor, 20, Ok(answer("in", json!(50 * GIB))));
+        let (cleared, _) = read(&mut monitor, 20, Ok(answer("in", &json!(50 * GIB))));
         assert_eq!(keys(&cleared), [format!("clear {key}")]);
         let Event::Clear { evidence, .. } = &cleared[0] else {
             panic!("a clear")
