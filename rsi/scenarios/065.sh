@@ -360,17 +360,30 @@ note "(1) checked: the loop's sample"
 
 # --- (2) the answer ------------------------------------------------------------------------
 
+# The loop keeps writing to the database, so its size is read on both sides
+# of the answer (before serve starts, which may read it then, and after the
+# GET): the answer's size must lie between the two.
+db_before=$(scalar "select pg_database_size(current_database())")
+# Every table's pg_total_relation_size, {name: bytes}: read on both sides of
+# the answer too, as the tables grow while the loop writes.
+table_sizes() {
+    scalar "select coalesce(json_object_agg(c.relname, pg_total_relation_size(c.oid)), '{}')
+              from pg_class c join pg_namespace n on n.oid = c.relnamespace
+             where c.relkind in ('r', 'p') and n.nspname = 'public'" | jq -c . ||
+        harness "psql's table sizes are not JSON"
+}
+tables_before=$(table_sizes)
 start_serve
 code=$(curl -s --noproxy '*' -o "$WORK/api.json" -w '%{http_code}' "$base/api/fleet" 2>/dev/null) || code=000
 [ "$code" = 200 ] || harness "GET /api/fleet answered $code: $(head -c 300 "$WORK/api.json")"
 df_free=$(df -B1 --output=avail "$root" | tail -n 1 | tr -d ' ')
 db_bytes=$(scalar "select pg_database_size(current_database())")
-db_tables=$(scalar "select json_agg(c.relname order by pg_total_relation_size(c.oid) desc, c.relname)
-                      from (select c.oid, c.relname from pg_class c join pg_namespace n on n.oid = c.relnamespace
-                             where c.relkind in ('r', 'p') and n.nspname = 'public'
-                             order by pg_total_relation_size(c.oid) desc, c.relname limit 5) c")
-db_tables=$(printf '%s' "$db_tables" | jq -c .) || harness "psql's table list is not JSON"
-case "$df_free$db_bytes" in '' | *[!0-9]*) harness "df or psql read nothing: [$df_free] [$db_bytes]" ;; esac
+tables_after=$(table_sizes)
+# table_sizes runs in a subshell: its harness exit leaves the value empty.
+[ -n "$tables_before" ] && [ -n "$tables_after" ] || harness "psql read no table sizes: [$tables_before] [$tables_after]"
+for value in "$df_free" "$db_before" "$db_bytes"; do
+    case "$value" in '' | *[!0-9]*) harness "df or psql read nothing: [$df_free] [$db_before] [$db_bytes]" ;; esac
+done
 storage() { jq -c ".health.storage | $1" "$WORK/api.json"; }
 
 expect_eq "$(storage '.archive | {path, bytes, files}')" \
@@ -396,8 +409,43 @@ if [ "$free" != null ] && [ "$growth" != null ] && [ "$growth" -gt 0 ] 2>/dev/nu
     expect_eq "$(storage '.days_left')" "$((free / growth))" "(2) days_left: the answer's free_bytes over its growth, rounded down"
 fi
 got_db=$(storage '.database.bytes')
-near "$got_db" "$db_bytes" "$((db_bytes / 100))" || check_failed "(2) database.bytes [$got_db], against pg_database_size [$db_bytes]"
-expect_eq "$(storage '[.database.tables[]?.name]')" "$db_tables" "(2) the database's five largest tables, largest first"
+# Between the two reads, with 1% slack on each side for a page or two.
+awk -v g="$got_db" -v lo="$((db_before - db_before / 100))" -v hi="$((db_bytes + db_bytes / 100))" \
+    'BEGIN { exit !(g ~ /^[0-9]+$/ && g >= lo && g <= hi) }' ||
+    check_failed "(2) database.bytes [$got_db], against pg_database_size read before [$db_before] and after [$db_bytes] the answer (1% slack each side)"
+# The five largest tables, largest first, judged against the two readings:
+# each listed table's bytes lie between its own before and after (with the
+# same 1% slack, at least a page); the list is largest first by its own
+# bytes (one reading of the answer's); and no table left out was larger,
+# before the answer, than the smallest listed. An exact order of sizes read
+# at another moment would fail on tables that grow past each other.
+table_problems=$(jq -r --argjson b "$tables_before" --argjson a "$tables_after" '
+    def slack(x): ([x / 100, 8192] | max);
+    (.health.storage.database.tables // null) as $t
+    | if ($t | type) != "array" then "the tables are not a list: \($t | tojson)"
+      else
+        ([($b | length), 5] | min) as $want
+        | ([$t[].name]) as $names
+        | ($t | map(.bytes) | min) as $low
+        | (if ($t | length) != $want then "\($t | length) tables listed, not \($want)" else empty end),
+          ($t[] | . as $r
+            | if $b[$r.name] == null or $a[$r.name] == null then "\($r.name | tojson) is no table of the database"
+              elif ($r.bytes | type) != "number"
+                   or $r.bytes < $b[$r.name] - slack($b[$r.name])
+                   or $r.bytes > $a[$r.name] + slack($a[$r.name])
+              then "\($r.name) at \($r.bytes | tojson) bytes, outside its \($b[$r.name]) before and \($a[$r.name]) after"
+              else empty end),
+          (range(1; $t | length) as $i
+            | select(($t[$i - 1].bytes | type) == "number" and ($t[$i].bytes | type) == "number"
+                     and $t[$i - 1].bytes < $t[$i].bytes)
+            | "\($t[$i - 1].name) (\($t[$i - 1].bytes)) is listed before the larger \($t[$i].name) (\($t[$i].bytes))"),
+          ($b | to_entries[]
+            | select(.key as $k | $names | any(. == $k) | not)
+            | select(($low | type) == "number" and .value > $low + slack($low))
+            | "\(.key) (\(.value) bytes before the answer) is left out, larger than the smallest listed (\($low))")
+      end' "$WORK/api.json" 2>&1) || harness "jq could not read the answer's tables: $table_problems"
+[ -z "$table_problems" ] ||
+    check_failed "(2) the database's five largest tables, largest first: $(printf '%s' "$table_problems" | tr '\n' ';' | head -c 700)"
 note "(2) checked: the answer"
 
 # --- (3) the card's words --------------------------------------------------------------------
