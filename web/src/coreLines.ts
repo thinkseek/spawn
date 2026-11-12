@@ -79,8 +79,8 @@ function finite(value: unknown): number | null {
 export function spanWords(ms: number): string {
   const abs = Math.abs(ms);
   if (abs < 1_000) return `${Math.round(ms)} ms`;
-  if (abs < 60_000) return `${Math.round(ms / 1_000)} s`;
-  if (abs < 3_600_000) return `${Math.round(ms / 60_000)} min`;
+  if (abs < 60_000) return `${Math.trunc(ms / 1_000)} s`;
+  if (abs < 3_600_000) return `${Math.trunc(ms / 60_000)} min`;
   const hours = ms / 3_600_000;
   if (Math.abs(hours) < 10) {
     const tenths = Math.round(hours * 10) / 10;

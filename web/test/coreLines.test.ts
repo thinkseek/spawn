@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { CoreFigure, CoreLinesAnswer } from "../src/coreLines.ts";
-import { coreLinesView, rangeWords, unitWords } from "../src/coreLines.ts";
+import { coreLinesView, rangeWords, spanWords, unitWords } from "../src/coreLines.ts";
 
 const GIB = 1024 ** 3;
 const MIB = 1024 ** 2;
@@ -96,4 +96,47 @@ test("each unit in words, and each range form", () => {
 test("an answer missing its parts, or none, reads as an empty card", () => {
   assert.deepEqual(coreLinesView(null), { rows: [], notice: null, ignored: [] });
   assert.deepEqual(coreLinesView({}), { rows: [], notice: null, ignored: [] });
+});
+
+test("spans: ms, s, min, hours and days", () => {
+  assert.equal(spanWords(450), "450 ms");
+  assert.equal(spanWords(12_000), "12 s");
+  assert.equal(spanWords(59_000), "59 s");
+  assert.equal(spanWords(3_599_000), "59 min");
+  assert.equal(spanWords(3_600_000), "1 h");
+  assert.equal(spanWords(10_800_000), "3 h");
+  assert.equal(spanWords(36_000_000), "10 h");
+  assert.equal(spanWords(4 * 86_400_000), "4 days");
+});
+
+test("the recoverability row: the ages as spans, the reds as a count", () => {
+  const view = coreLinesView({
+    lines: [
+      {
+        line: "recoverability",
+        north_star: fig("recoverability.restores_passed", "Critical resources with a restore passed in 7 days", "count", null, null, "not_collected"),
+        guardrails: [
+          fig("recoverability.cloud_dump_age", "Age of the newest database copy", "ms", 1_920_000, { max: 7_200_000 }, "in"),
+          fig("recoverability.cloud_bundle_age", "Age of the newest bundle", "ms", 108_000_000, { max: 93_600_000 }, "out"),
+          fig("recoverability.nightly_age", "Age of the oldest nightly judging", "ms", null, { max: 93_600_000 }, "not_collected"),
+          fig("recoverability.nightly_red", "Nightly sources held red", "count", 1, { max: 0 }, "out"),
+        ],
+      },
+    ],
+    ranges_file: null,
+    ranges_error: null,
+    ignored_ranges: [],
+  });
+  const row = view.rows[0];
+  assert.equal(row.line, "Recoverability");
+  assert.equal(row.north_star.value, "not collected yet");
+  assert.deepEqual(
+    row.guardrails.map((mark) => [mark.value, mark.range, mark.tone]),
+    [
+      ["32 min", "2 h or less", "plain"],
+      ["30 h", "26 h or less", "warning"],
+      ["not collected yet", "26 h or less", "muted"],
+      ["1", "0 or less", "warning"],
+    ],
+  );
 });
