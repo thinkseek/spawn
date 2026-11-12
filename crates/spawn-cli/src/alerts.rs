@@ -7657,6 +7657,88 @@ connections\n";
             });
         }
 
+        /// A rejection and an abort the store's missions and tasks already
+        /// hold fold once (objective 106): the step goes on from the
+        /// watermark its mirror read in the same statement, so its first
+        /// check feeds none of the records the mirror holds again, and a
+        /// record after the start is fed by the checks.
+        #[test]
+        fn a_rejection_and_an_abort_the_mirror_holds_fold_once() {
+            in_schema("alerts_mirror_once", |store, client| {
+                record(
+                    client,
+                    1,
+                    r#"{"type":"mission.added","id":4,"text":"m","origin":"human"}"#,
+                );
+                record(
+                    client,
+                    1,
+                    r#"{"type":"mission.configured","id":4,"accept":"gate","gate":"/g"}"#,
+                );
+                let assign = |client: &mut postgres::Client, task: i64| {
+                    record(
+                        client,
+                        1,
+                        &format!(
+                            r#"{{"type":"task.assigned","id":{task},"mission_id":4,
+                                "kind":"work","agent_id":"agent_worker_{task}",
+                                "session_id":"session_{task}","brief":"b",
+                                "created_by":"agent_supervisor","objective":1}}"#
+                        ),
+                    )
+                };
+                assign(client, 7);
+                record(
+                    client,
+                    1,
+                    r#"{"type":"task.gated","id":7,"verdict":"rejected","revision":0}"#,
+                );
+                assign(client, 8);
+                let last = record(
+                    client,
+                    1,
+                    r#"{"type":"task.aborted","id":8,"reason":"over"}"#,
+                );
+                refold(client);
+                let gates = |client: &mut postgres::Client| -> (i32, i32, i32) {
+                    let row = client
+                        .query_one(
+                            "select m.gate_rejections, m.gate_aborts, k.revisions
+                               from mission_missions m join mission_tasks k on k.id = 7
+                              where m.id = 4",
+                            &[],
+                        )
+                        .expect("the fold reads");
+                    (row.get(0), row.get(1), row.get(2))
+                };
+                assert_eq!(gates(client), (1, 1, 1), "the store holds them once");
+
+                let mut monitor = started(store);
+                assert!(monitor.watermark >= last, "the mirror's watermark");
+                let mission = &monitor.missions[&4];
+                assert_eq!((mission.rejections, mission.aborts), (1, 1));
+                assert_eq!(monitor.tasks[&7].revisions, 1);
+                monitor.check(store).expect("the step checks");
+                let mission = &monitor.missions[&4];
+                assert_eq!(
+                    (mission.rejections, mission.aborts),
+                    (1, 1),
+                    "no check feeds a record the mirror holds again"
+                );
+                assert_eq!(monitor.tasks[&7].revisions, 1);
+
+                assign(client, 9);
+                record(client, 0, r#"{"type":"task.aborted","id":9,"reason":"over"}"#);
+                monitor.check(store).expect("the step checks");
+                assert_eq!(
+                    monitor.missions[&4].aborts,
+                    2,
+                    "a record after the start is the checks'"
+                );
+                assert!(monitor.tasks.contains_key(&9));
+            });
+        }
+
         /// The live shape of 2026-11-11 23:33 (lead-mac), on a store: two
         /// owner `validator_defect` alerts from before objective 056, one per
         /// mission (#4, gated; #7, a review mission with no gate), both about
