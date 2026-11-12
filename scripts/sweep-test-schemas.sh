@@ -30,10 +30,14 @@
 # - nothing may have changed in the schema since the list, checked under the
 #   schema's locks: no catalog row of any object in it, no column,
 #   dependency or comment, and no data row newer than the list's transaction
-#   id (xmin, or a set xmax; age() comparisons, safe across wraparound, a
-#   frozen row old), and its tables' modified-row counts (the statistics
-#   collector: deletes leave no row to see) and its sequences' values
-#   (nextval sets no xmin) as the list has them.
+#   id mark (xmin, or a set xmax; age() comparisons, safe across wraparound,
+#   a frozen row old). The mark is the oldest transaction still running when
+#   the list was made (pg_snapshot_xmin), so a writer already open then is
+#   newer than it (rev-e r2 F1). And as the list has them: its tables'
+#   modified-row counts (the statistics collector: deletes leave no row to
+#   see), its sequences' values (nextval sets no xmin), and the objects a
+#   DROP ... CASCADE of it removes, their count and a hash of their
+#   identities (a DROP of one of them since leaves no row to see; r2 F2).
 # So "nothing changed since a list that old" is "nothing changed for that
 # long". The pid is checked again too, and an unknown age still keeps it.
 # Other names (no pid in them) always stay.
@@ -43,8 +47,8 @@
 # names the database the list is for (its name and port, never the URL), and
 # --apply takes only that section:
 #   database <name> port <port>
-#   listed <epoch> xid <next transaction id>
-#   would-drop <schema> pid=<pid> idle=<h>h size=<MB>MB mods=<n> seq=<n>
+#   listed <epoch> xid <oldest running transaction id>
+#   would-drop <schema> pid=<pid> idle=<h>h size=<MB>MB mods=<n> seq=<n> objs=<n> ids=<md5>
 #   keep       <schema> pid=<pid> idle=<h>h size=<MB>MB <why>
 # A list file may hold several runs' output, one section each, in any text
 # around them (a markdown file with code blocks): only lines that start with
@@ -57,13 +61,15 @@
 # - --min-idle-hours is below 24, or the list is younger than it;
 # - the list file is missing, holds no section for this database, or more
 #   than one, or the section has no single `listed` line, or a would-drop
-#   line without mods= and seq=;
+#   line without mods=, seq=, objs= and ids=;
 # - any would-drop name in the section is not spawn_test_<pid>_<...>
 #   (lower-case letters, digits and `_`), or is listed twice.
 # First, each schema that qualifies now but is not on the list:
 # `not-on-list <name> ...`, kept, and their count. Then for each name, in
 # the list's order: its dry-run line (as the print-only run says it now),
-# then `dropped <name>` or `skipped <name> <why>`. Each drop is one
+# then `dropped <name>` or `skipped <name> <why>`, and below it, each line
+# indented `  | `, all psql said (the NOTICE `drop cascades to ...` and its
+# DETAIL, or the error), never discarded. Each drop is one
 # `DROP SCHEMA "<name>" CASCADE` in a transaction of its own, under its
 # locks, with a lock timeout, so one that fails is said and the others go
 # on. One whose CASCADE would also drop something of another schema (any
@@ -175,9 +181,10 @@ if [ "$apply" = 1 ]; then
     reviewed=$(awk -v want="database $target_database port $target_port" '
         /^database / { inside = ($0 == want); next }
         inside && /^would-drop / { print $2 }' "$apply_list")
-    # When the list was made, and the next transaction id then (the
+    # When the list was made, and the oldest transaction running then (the
     # print-only run's `listed <epoch> xid <xid>` line): everything written
-    # after it has a newer xmin or xmax, so a change since the list is seen
+    # by a transaction not yet committed then has an xmin or xmax no older
+    # than it, so a change since the list is seen
     # exactly (below); and the list must be at least the idle floor old, so
     # "nothing changed since the list" is "nothing changed for that long",
     # whatever the file times say (cc-astra A3; the lead's decision 17:2x).
@@ -193,17 +200,22 @@ if [ "$apply" = 1 ]; then
     list_age=$(($(date +%s) - listed_at))
     [ "$list_age" -ge $((min_idle_hours * 3600)) ] ||
         { echo "$prog: refused: the list is $((list_age / 3600))h old; --apply needs it at least ${min_idle_hours}h old, so that no change since it means none for that long" >&2; exit 2; }
-    # Each name's mods and seq when listed (see schema_rows).
+    # Each name's mods, seq, objs and ids when listed (see schema_rows).
     listed_counts=$(awk -v want="database $target_database port $target_port" '
         /^database / { inside = ($0 == want); next }
         inside && /^would-drop / {
-            m = ""; q = ""
-            for (i = 3; i <= NF; i++) { if ($i ~ /^mods=[0-9]+$/) m = substr($i, 6); if ($i ~ /^seq=[0-9]+$/) q = substr($i, 5) }
-            print $2, m, q
+            m = ""; q = ""; o = ""; h = ""
+            for (i = 3; i <= NF; i++) {
+                if ($i ~ /^mods=[0-9]+$/) m = substr($i, 6)
+                if ($i ~ /^seq=[0-9]+$/) q = substr($i, 5)
+                if ($i ~ /^objs=[0-9]+$/) o = substr($i, 6)
+                if ($i ~ /^ids=[0-9a-f]{32}$/) h = substr($i, 5)
+            }
+            print $2, m, q, o, h
         }' "$apply_list")
-    no_counts=$(printf '%s\n' "$listed_counts" | awk 'NF > 0 && NF < 3 { print $1 }')
+    no_counts=$(printf '%s\n' "$listed_counts" | awk 'NF > 0 && NF < 5 { print $1 }')
     [ -z "$no_counts" ] ||
-        { echo "$prog: refused: would-drop lines without mods= and seq= (make the list again with this version): $(printf '%s\n' "$no_counts" | head -n 3 | tr '\n' ' ')" >&2; exit 2; }
+        { echo "$prog: refused: would-drop lines without mods=, seq=, objs= and ids= (make the list again with this version): $(printf '%s\n' "$no_counts" | head -n 3 | tr '\n' ' ')" >&2; exit 2; }
     bad_names=$(printf '%s\n' "$reviewed" | grep . | grep -vE '^spawn_test_[0-9]+_[a-z0-9_]+$' || true)
     [ -z "$bad_names" ] ||
         { echo "$prog: refused: names in the list that are not spawn_test_<pid>_...: $(printf '%s\n' "$bad_names" | head -n 5 | tr '\n' ' ')" >&2; exit 2; }
@@ -219,31 +231,51 @@ PGOPTIONS="${PGOPTIONS:+$PGOPTIONS }-c default_transaction_read_only=on"
 export PGOPTIONS
 
 # schema_rows <idle expression> [<one schema>]: name|bytes|idle seconds
-# (empty when the files cannot be read)|mods|seq, of every spawn_test_*
-# schema or of the one named (none when it is gone). mods: the rows its
-# tables have had inserted, updated and deleted, by the statistics
-# collector; seq: the sum of its sequences' last values. A list carries both
-# for each would-drop name, and --apply finds them unchanged or keeps the
-# schema: a DELETE leaves no row a scan sees, and nextval sets no xmin.
+# (empty when the files cannot be read)|mods|seq|objs|ids, of every
+# spawn_test_* schema or of the one named (none when it is gone). mods: the
+# rows its tables have had inserted, updated and deleted, by the statistics
+# collector; seq: the sum of its sequences' last values; objs and ids: the
+# objects DROP ... CASCADE removes with it (the pg_depend closure from the
+# namespace, the one --apply walks below), their count and the md5 of their
+# sorted `<catalog> <identity>` lines. A list carries all four for each
+# would-drop name, and --apply finds them unchanged or keeps the schema: a
+# DELETE leaves no row a scan sees, nextval sets no xmin, and a DROP of one
+# of its objects leaves no row at all.
 schema_rows() {
     psql -X -qtA -F '|' -v ON_ERROR_STOP=1 -v sr_one="${2-}" <<SQL
-select n.nspname,
-       coalesce(sum(pg_total_relation_size(c.oid)) filter (where c.relkind in ('r', 'm')), 0),
-       $1,
-       coalesce(sum(pg_stat_get_tuples_inserted(c.oid) + pg_stat_get_tuples_updated(c.oid)
-                    + pg_stat_get_tuples_deleted(c.oid)) filter (where c.relkind in ('r', 'm')), 0),
-       (select coalesce(sum(s.last_value), 0) from pg_sequences s where s.schemaname = n.nspname)
-  from pg_namespace n
-  left join pg_class c on c.relnamespace = n.oid and c.relkind in ('r', 'i', 't', 'm', 'S')
- where n.nspname like 'spawn\_test\_%' and (:'sr_one' = '' or n.nspname = :'sr_one')
- group by n.nspname
- order by n.nspname
+select g.nspname, g.bytes, g.idle, g.mods, g.seq, f.objs, f.ids
+  from (select n.oid, n.nspname,
+               coalesce(sum(pg_total_relation_size(c.oid)) filter (where c.relkind in ('r', 'm')), 0) as bytes,
+               $1 as idle,
+               coalesce(sum(pg_stat_get_tuples_inserted(c.oid) + pg_stat_get_tuples_updated(c.oid)
+                            + pg_stat_get_tuples_deleted(c.oid)) filter (where c.relkind in ('r', 'm')), 0) as mods,
+               (select coalesce(sum(s.last_value), 0) from pg_sequences s where s.schemaname = n.nspname) as seq
+          from pg_namespace n
+          left join pg_class c on c.relnamespace = n.oid and c.relkind in ('r', 'i', 't', 'm', 'S')
+         where n.nspname like 'spawn\_test\_%' and (:'sr_one' = '' or n.nspname = :'sr_one')
+         group by n.oid, n.nspname) g
+ cross join lateral (
+    with recursive k(classid, objid, objsubid) as (
+        select 'pg_namespace'::regclass::oid, g.oid, 0
+        union
+        select d.classid, d.objid, d.objsubid
+          from pg_depend d join k on d.refclassid = k.classid and d.refobjid = k.objid
+         where d.deptype <> 'p'
+    )
+    select count(*) as objs,
+           md5(coalesce(string_agg(k.classid::regclass::text || ' ' || i.identity, E'\n'
+                                   order by k.classid::regclass::text || ' ' || i.identity collate "C"), '')) as ids
+      from k, pg_identify_object(k.classid, k.objid, k.objsubid) i) f
+ order by g.nspname
 SQL
 }
-# When this run looks, and the next transaction id: a print-only run's list
-# carries them (`listed <epoch> xid <xid>`), taken before anything is read.
+# When this run looks, and the oldest transaction still running (or, none
+# running, the next): a print-only run's list carries them (`listed <epoch>
+# xid <xid>`), taken before anything is read. Not the next transaction id: a
+# writer open now has an older one, and its change, committed after the
+# list, would read as old (rev-e r2 F1).
 listed_mark=$(psql -X -qtA -F ' ' -v ON_ERROR_STOP=1 \
-    -c "select extract(epoch from now())::bigint, 'xid', pg_snapshot_xmax(pg_current_snapshot())") ||
+    -c "select extract(epoch from now())::bigint, 'xid', pg_snapshot_xmin(pg_current_snapshot())") ||
     { echo "$prog: cannot read the database" >&2; exit 2; }
 idle_sql="floor(extract(epoch from now() - max((pg_stat_file(pg_relation_filepath(c.oid), true)).modification)))::bigint"
 ages_readable=1
@@ -255,8 +287,8 @@ if ! rows=$(schema_rows "$idle_sql" 2>/dev/null); then
 fi
 
 min_idle=$((min_idle_hours * 3600))
-# judge <name> <bytes> <idle> [<mods> <seq> [listed]]: sets jd_line (the
-# dry-run line, with mods and seq when given) and jd_why (empty when the
+# judge <name> <bytes> <idle> [<mods> <seq> <objs> <ids> [listed]]: sets
+# jd_line (the dry-run line, with mods, seq, objs and ids when given) and jd_why (empty when the
 # schema qualifies). `listed`: the age floor was the list's (its files were
 # that old when it was made, and the list is that old now), so only an
 # unknown age keeps it here.
@@ -271,11 +303,11 @@ judge() {
         jd_why="pid $jd_pid runs here"
     elif [ -z "$3" ]; then
         jd_why="its age is unknown"
-    elif [ "${6-}" != listed ] && [ "$3" -lt "$min_idle" ]; then
+    elif [ "${8-}" != listed ] && [ "$3" -lt "$min_idle" ]; then
         jd_why="written ${jd_hours}h ago (< ${min_idle_hours}h)"
     fi
     if [ -z "$jd_why" ]; then
-        jd_line=$(printf 'would-drop %s pid=%s idle=%sh size=%sMB%s' "$1" "$jd_pid" "$jd_hours" "$jd_mb" "${4:+ mods=$4 seq=${5-0}}")
+        jd_line=$(printf 'would-drop %s pid=%s idle=%sh size=%sMB%s' "$1" "$jd_pid" "$jd_hours" "$jd_mb" "${4:+ mods=$4 seq=${5-0} objs=${6-0} ids=${7-}}")
     else
         jd_line=$(printf 'keep       %s pid=%s idle=%sh size=%sMB %s' "$1" "${jd_pid:--}" "${jd_hours:-?}" "$jd_mb" "$jd_why")
     fi
@@ -289,9 +321,9 @@ if [ "$apply" = 0 ]; then
     echo "database $target_database port $target_port"
     printf 'listed %s\n' "$listed_mark"
     drop_count=0 drop_bytes=0 keep_count=0 keep_bytes=0
-    while IFS='|' read -r name bytes idle mods seqs; do
+    while IFS='|' read -r name bytes idle mods seqs objs ids; do
         [ -n "$name" ] || continue
-        judge "$name" "$bytes" "$idle" "$mods" "$seqs"
+        judge "$name" "$bytes" "$idle" "$mods" "$seqs" "$objs" "$ids"
         printf '%s\n' "$jd_line"
         if [ -z "$jd_why" ]; then
             drop_count=$((drop_count + 1)) drop_bytes=$((drop_bytes + bytes))
@@ -310,9 +342,9 @@ before=$(totals "$rows")
 # The difference the other way (owner's step 4): what qualifies now and is
 # not on the reviewed list is said, and kept.
 not_listed=0
-while IFS='|' read -r name bytes idle mods seqs; do
+while IFS='|' read -r name bytes idle mods seqs objs ids; do
     [ -n "$name" ] || continue
-    judge "$name" "$bytes" "$idle" "$mods" "$seqs"
+    judge "$name" "$bytes" "$idle" "$mods" "$seqs" "$objs" "$ids"
     [ -z "$jd_why" ] || continue
     # A here-string, not a pipe: under pipefail, grep -q stopping at its
     # match killed printf with SIGPIPE on a list longer than a pipe's
@@ -340,8 +372,8 @@ for name in $reviewed; do
         skipped=$((skipped + 1))
         continue
     fi
-    IFS='|' read -r _ now_bytes now_idle now_mods now_seqs <<<"$now_row"
-    judge "$name" "$now_bytes" "$now_idle" "$now_mods" "$now_seqs" listed
+    IFS='|' read -r _ now_bytes now_idle now_mods now_seqs now_objs now_ids <<<"$now_row"
+    judge "$name" "$now_bytes" "$now_idle" "$now_mods" "$now_seqs" "$now_objs" "$now_ids" listed
     printf '%s\n' "$jd_line"
     if [ -n "$jd_why" ]; then
         echo "skipped $name $jd_why"
@@ -374,15 +406,16 @@ for name in $reviewed; do
     # The name, the list's xid and time go in as settings (psql quotes them),
     # and to SQL through format('%I') and casts.
     if [ "$preview" = 1 ]; then tx_end=rollback; else tx_end=commit; fi
-    read -r _ name_mods name_seq < <(awk -v n="$name" '$1 == n' <<<"$listed_counts")
+    read -r _ name_mods name_seq name_objs name_ids < <(awk -v n="$name" '$1 == n' <<<"$listed_counts")
     if drop_err=$(PGOPTIONS=$pgoptions_drop psql -X -q -v ON_ERROR_STOP=1 -v dn_name="$name" \
         -v dn_xid="$listed_xid" -v dn_end="$tx_end" \
-        -v dn_mods="$name_mods" -v dn_seq="$name_seq" 2>&1 >/dev/null <<'SQL'
+        -v dn_mods="$name_mods" -v dn_seq="$name_seq" -v dn_objs="$name_objs" -v dn_ids="$name_ids" 2>&1 >/dev/null <<'SQL'
 begin;
 set local lock_timeout = '10s';
 select set_config('sweep.name', :'dn_name', true), set_config('sweep.xid', :'dn_xid', true),
        set_config('sweep.mods', :'dn_mods', true),
-       set_config('sweep.seq', :'dn_seq', true);
+       set_config('sweep.seq', :'dn_seq', true),
+       set_config('sweep.objs', :'dn_objs', true), set_config('sweep.ids', :'dn_ids', true);
 do $sweep$
 declare
     nsp oid := (select oid from pg_namespace where nspname = current_setting('sweep.name'));
@@ -392,6 +425,7 @@ declare
     oids oid[];
     found bigint;
     first text;
+    ids text;
 begin
     if nsp is null then
         raise exception 'sweep: gone';
@@ -426,6 +460,17 @@ begin
         raise exception 'sweep: dependents-outside (%: %)', found, first;
     end if;
 
+    -- Changed since the list: the objects themselves, as schema_rows hashes
+    -- them (a DROP of one leaves no row to see; rev-e r2 F2).
+    select count(*), md5(coalesce(string_agg(classid::regclass::text || ' ' || identity, E'\n'
+                                             order by classid::regclass::text || ' ' || identity collate "C"), ''))
+      into found, ids from sweep_closure;
+    if found <> current_setting('sweep.objs')::bigint then
+        raise exception 'sweep: changed since the list (objects: % then, % now)', current_setting('sweep.objs'), found;
+    end if;
+    if ids <> current_setting('sweep.ids') then
+        raise exception 'sweep: changed since the list (objects: % then and now, other identities)', found;
+    end if;
     -- Changed since the list: catalog rows of every class in the closure.
     for cls in select distinct classid::regclass from sweep_closure loop
         select array_agg(objid) into oids from sweep_closure where classid = cls;
@@ -483,19 +528,22 @@ SQL
             echo "dropped $name"
         fi
         dropped=$((dropped + 1))
-    elif printf '%s\n' "$drop_err" | grep -q 'sweep: dependents-outside'; then
-        echo "skipped $name dependents-outside ($(printf '%s\n' "$drop_err" | sed -n 's/.*sweep: dependents-outside (\(.*\))$/\1/p' | head -n 1))"
+    elif grep -q 'sweep: dependents-outside' <<<"$drop_err"; then
+        echo "skipped $name dependents-outside ($(sed -n 's/.*sweep: dependents-outside (\(.*\))$/\1/p' <<<"$drop_err" | sed -n 1p))"
         skipped=$((skipped + 1))
-    elif printf '%s\n' "$drop_err" | grep -q 'sweep: changed since the list'; then
-        echo "skipped $name changed since the list ($(printf '%s\n' "$drop_err" | sed -n 's/.*sweep: changed since the list (\(.*\))$/\1/p' | head -n 1))"
+    elif grep -q 'sweep: changed since the list' <<<"$drop_err"; then
+        echo "skipped $name changed since the list ($(sed -n 's/.*sweep: changed since the list (\(.*\))$/\1/p' <<<"$drop_err" | sed -n 1p))"
         skipped=$((skipped + 1))
-    elif printf '%s\n' "$drop_err" | grep -q 'sweep: gone'; then
+    elif grep -q 'sweep: gone' <<<"$drop_err"; then
         echo "skipped $name gone"
         skipped=$((skipped + 1))
     else
-        echo "skipped $name the drop failed: $(printf '%s\n' "$drop_err" | grep -m1 ERROR || printf '%s\n' "$drop_err" | head -n 1)"
+        echo "skipped $name the drop failed: $(grep -m1 ERROR <<<"$drop_err" || sed -n 1p <<<"$drop_err")"
         failed=$((failed + 1))
     fi
+    # Everything psql said, kept as evidence (the lead, 2026-11-12): the
+    # DROP's `NOTICE:  drop cascades to ...` and its DETAIL, or the error.
+    [ -z "$drop_err" ] || sed 's/^/  | /' <<<"$drop_err"
 done
 after_rows=$(schema_rows "null") || after_rows=""
 if [ "$preview" = 1 ]; then

@@ -163,7 +163,9 @@ cp "$out" "$scratch/list-fresh.md"
 # (its transaction id stays this run's, so what changes after it is seen).
 # aged_listed: a `listed` line 25 h old with the transaction id of now.
 aged() { sed -E "s/^listed [0-9]+ /listed $(($(date +%s) - 90000)) /" "$1"; }
-aged_listed() { echo "listed $(($(date +%s) - 90000)) xid $(admin -c "select pg_snapshot_xmax(pg_current_snapshot())")"; }
+aged_listed() { echo "listed $(($(date +%s) - 90000)) xid $(admin -c "select pg_snapshot_xmin(pg_current_snapshot())")"; }
+# a would-drop line's objs= and ids= for a hand-made line (never matching)
+fp="objs=1 ids=00000000000000000000000000000000"
 aged "$scratch/list-fresh.md" >"$scratch/list.md"
 # list_of <name>...: a list made now by the print-only run, aged 25 h, with
 # the would-drop lines of the names given (each must qualify) and any
@@ -217,15 +219,19 @@ refused "a list with no section for the target" "refused: the list holds 0 secti
 cat "$scratch/list.md" "$scratch/list.md" >"$scratch/twice.md"
 run "${live[@]}" -- --apply "$scratch/twice.md"
 refused "a list with two sections for the target" "refused: the list holds 2 sections"
-{ cat "$scratch/list.md"; echo "would-drop public pid=1 idle=99h size=0MB mods=0 seq=0"; } >"$scratch/public.md"
+{ cat "$scratch/list.md"; echo "would-drop public pid=1 idle=99h size=0MB mods=0 seq=0 $fp"; } >"$scratch/public.md"
 run "${live[@]}" -- --apply "$scratch/public.md"
 refused "a name that is not a test schema's" "refused: names in the list that are not spawn_test_<pid>_...: public"
-{ cat "$scratch/list.md"; echo "would-drop spawn_test_nopid_x pid=- idle=99h size=0MB mods=0 seq=0"; } >"$scratch/nopid.md"
+{ cat "$scratch/list.md"; echo "would-drop spawn_test_nopid_x pid=- idle=99h size=0MB mods=0 seq=0 $fp"; } >"$scratch/nopid.md"
 run "${live[@]}" -- --apply "$scratch/nopid.md"
 refused "a test schema's name without a pid" "refused: names in the list that are not spawn_test_<pid>_...: spawn_test_nopid_x"
-{ cat "$scratch/list.md"; echo "would-drop $old_gone pid=$dead idle=48h size=0MB mods=1 seq=0"; } >"$scratch/dup.md"
+{ cat "$scratch/list.md"; echo "would-drop $old_gone pid=$dead idle=48h size=0MB mods=1 seq=0 $fp"; } >"$scratch/dup.md"
 run "${live[@]}" -- --apply "$scratch/dup.md"
 refused "a name listed twice" "refused: names listed twice: $old_gone"
+sed -E "s/^(would-drop $old_gone .*) objs=[0-9]+ ids=[0-9a-f]+\$/\1/" "$scratch/list.md" >"$scratch/noobjs.md"
+check "  (the list without objs= and ids= is that list less them)" [ "$(grep -c ' objs=' "$scratch/noobjs.md")" = $(($(grep -c ' objs=' "$scratch/list.md") - 1)) ]
+run "${live[@]}" -- --apply "$scratch/noobjs.md"
+refused "a would-drop line without objs= and ids= (a list of the version before)" "refused: would-drop lines without mods=, seq=, objs= and ids= \\(make the list again with this version\\): $old_gone"
 
 echo "== 3. --apply of the reviewed list"
 # Since the list: one is written to, one is dropped by someone else, one is
@@ -279,7 +285,7 @@ exists "$old_locked" && pass "  it is still there" || fail "  it is still there"
 exists "$not_listed" && pass "a qualifying schema not on the list stays" || fail "a qualifying schema not on the list stays"
 exists "$other_only" && pass "one listed only in another database's section stays" || fail "one listed only in another database's section stays"
 for s in "$alive" "$young" "$nopid"; do exists "$s" && pass "kept: $s" || fail "kept: $s"; done
-check "a qualifying schema not on the list is said, kept" has "^not-on-list $not_listed pid=$dead idle=4[78]h size=[0-9]+MB mods=1 seq=0 \\(qualifies now, not reviewed: kept\\)$"
+check "a qualifying schema not on the list is said, kept" has "^not-on-list $not_listed pid=$dead idle=4[78]h size=[0-9]+MB mods=1 seq=0 objs=[0-9]+ ids=[0-9a-f]{32} \\(qualifies now, not reviewed: kept\\)$"
 check "  so is the one only another database's section lists" has "^not-on-list $other_only "
 check "  with their count" has "^sweep-test-schemas --apply: 2 qualifying schema\\(s\\) not on the list, kept$"
 check "a listed one another schema's view depends on is skipped" has "^skipped $old_viewed dependents-outside \\(1: \"_RETURN\" on other_app\\.v\\)$"
@@ -301,7 +307,7 @@ check "print-only: exit 0 (status $status)" [ "$status" -eq 0 ]
 check "it says the times cannot be read" has "cannot read the relation files' times here; every schema stays"
 check "the gone pid's schema is kept: age unknown" has "^keep +$unknown pid=$dead idle=\\?h .* its age is unknown$"
 check "nothing would be dropped" has "would drop 0 schema"
-{ echo "database sweep_db port $port"; aged_listed; echo "would-drop $unknown pid=$dead idle=48h size=0MB mods=1 seq=0"; } >"$scratch/unknown.md"
+{ echo "database sweep_db port $port"; aged_listed; echo "would-drop $unknown pid=$dead idle=48h size=0MB mods=1 seq=0 $fp"; } >"$scratch/unknown.md"
 run "${plain[@]}" -- --apply "$scratch/unknown.md"
 check "--apply: exit 0, nothing failed (status $status)" [ "$status" -eq 0 ]
 check "--apply: skipped, its age unknown" has "^skipped $unknown its age is unknown$"
@@ -317,7 +323,7 @@ long2=spawn_test_${dead}_ab02_2_long_list_second
 make "$long1" old
 make "$long2" old
 padding=$(for i in $(seq 1100); do
-  echo "would-drop spawn_test_${dead}_ff${i}_padding_padding_padding_padding_padding_padding pid=$dead idle=48h size=0MB mods=0 seq=0"
+  echo "would-drop spawn_test_${dead}_ff${i}_padding_padding_padding_padding_padding_padding pid=$dead idle=48h size=0MB mods=0 seq=0 $fp"
 done)
 list_of "$long1" "$long2" >"$scratch/long.md"
 padding=""
@@ -330,37 +336,70 @@ check "nor the second" bash -c "! grep -q '^not-on-list $long2 ' '$out'"
 check "both are dropped" bash -c "grep -qx 'dropped $long1' '$out' && grep -qx 'dropped $long2' '$out'"
 
 echo "== 6. under the drop's locks: a change since the list, an outside operator; --preview drops nothing"
-# Made old, listed (25 h back, the transaction id of now); then, after the
-# list: a function in one, a row inserted into another and one deleted from
-# a third (no checkpoint: their files keep their old times), and an operator
-# in another schema over a fourth's function.
+# Made old, listed (25 h back, the transaction id of the list); then, after
+# the list: a function made in one and one dropped from another, a row
+# inserted into a third and one deleted from a fourth (no checkpoint: their
+# files keep their old times), and an operator in another schema over a
+# fifth's function. And a sixth's function replaced by a writer that was
+# already open when the list was made, committed after it, with a later
+# transaction committed between them (rev-e r2 F1: the next transaction id
+# then is newer than the writer's).
 c_func=spawn_test_${dead}_ca01_1_function_since
 c_ins=spawn_test_${dead}_ca02_2_insert_since
 c_del=spawn_test_${dead}_ca03_3_delete_since
 c_op=spawn_test_${dead}_ca04_4_operator_outside
 c_ok=spawn_test_${dead}_ca05_5_untouched
-for s in "$c_func" "$c_ins" "$c_del" "$c_op" "$c_ok"; do make "$s"; done
-admin -c "create function $c_op.lt(int, int) returns boolean language sql immutable as 'select \$1 < \$2'" >/dev/null
-for s in "$c_func" "$c_ins" "$c_del" "$c_op" "$c_ok"; do age_old "$s"; done
-list_of "$c_func" "$c_ins" "$c_del" "$c_op" "$c_ok" >"$scratch/changes.md"
-check "the changes list holds all five" [ "$(grep -c '^would-drop ' "$scratch/changes.md")" = 5 ]
+c_drop=spawn_test_${dead}_ca06_6_function_dropped_since
+c_open=spawn_test_${dead}_ca07_7_writer_open_at_the_list
+c_all=("$c_func" "$c_ins" "$c_del" "$c_op" "$c_ok" "$c_drop" "$c_open")
+for s in "${c_all[@]}"; do make "$s"; done
+admin -c "create function $c_op.lt(int, int) returns boolean language sql immutable as 'select \$1 < \$2'" \
+  -c "create function $c_drop.f() returns int language sql as 'select 1'" \
+  -c "create function $c_open.f() returns int language sql as 'select 1'" >/dev/null
+for s in "${c_all[@]}"; do age_old "$s"; done
+mkfifo "$scratch/writer.in"
+admin <"$scratch/writer.in" >"$scratch/writer.out" 2>&1 &
+writer=$!
+exec 7>"$scratch/writer.in"
+echo "begin; create or replace function $c_open.f() returns int language sql as 'select 2';" >&7
+for _ in $(seq 100); do
+  [ "$(admin -c "select count(*) from pg_stat_activity where datname = 'sweep_db' and state = 'idle in transaction' and backend_xid is not null")" = 1 ] && break
+  sleep 0.1
+done
+check "a writer is open, its function replaced, not committed" \
+  [ "$(admin -c "select count(*) from pg_stat_activity where datname = 'sweep_db' and state = 'idle in transaction' and backend_xid is not null")" = 1 ]
+admin -c "select txid_current()" >/dev/null
+list_of "${c_all[@]}" >"$scratch/changes.md"
+echo "commit;" >&7
+exec 7>&-
+wait "$writer"
+check "the writer committed after the list" [ "$(admin -c "select $c_open.f()")" = 2 ]
+check "the list's xid is the writer's or older" \
+  [ "$(admin -c "select age(xmin) <= age('$(sed -n 's/^listed [0-9]* xid //p' "$scratch/changes.md")'::text::xid) from pg_proc where oid = '$c_open.f'::regproc")" = t ]
+check "the changes list holds all seven" [ "$(grep -c '^would-drop ' "$scratch/changes.md")" = 7 ]
 admin -c "create function $c_func.g() returns int language sql as 'select 1'" \
+  -c "drop function $c_drop.f()" \
   -c "insert into $c_ins.t values (5)" -c "delete from $c_del.t" \
   -c "create operator public.<<< (function = $c_op.lt, leftarg = int, rightarg = int)" >/dev/null
 run "${live[@]}" -- --apply "$scratch/changes.md" --preview
 check "--preview: exit 0 (status $status)" [ "$status" -eq 0 ]
 check "--preview: the untouched one would be dropped" has "^would drop $c_ok \\(preview: rolled back\\)\$"
-check "--preview: says it dropped nothing" has "^sweep-test-schemas --apply --preview \\(nothing dropped\\): would drop 1, skipped 4, failed 0\$"
-for s in "$c_func" "$c_ins" "$c_del" "$c_op" "$c_ok"; do exists "$s" && pass "--preview: kept $s" || fail "--preview: kept $s"; done
+check "--preview: what the drop said is kept" has "^  \\| NOTICE:  drop cascades to table $c_ok\\.t\$"
+check "--preview: says it dropped nothing" has "^sweep-test-schemas --apply --preview \\(nothing dropped\\): would drop 1, skipped 6, failed 0\$"
+for s in "${c_all[@]}"; do exists "$s" && pass "--preview: kept $s" || fail "--preview: kept $s"; done
 run "${live[@]}" -- --apply "$scratch/changes.md"
 check "exit 0 (status $status)" [ "$status" -eq 0 ]
-check "a function made since the list: kept" has "^skipped $c_func changed since the list \\([0-9]+ in pg_proc\\)\$"
+check "a function made since the list: kept" has "^skipped $c_func changed since the list \\(objects: [0-9]+ then, [0-9]+ now\\)\$"
+check "a function dropped since the list: kept" has "^skipped $c_drop changed since the list \\(objects: [0-9]+ then, [0-9]+ now\\)\$"
+check "a function replaced by a writer open at the list: kept" has "^skipped $c_open changed since the list \\(1 in pg_proc\\)\$"
 check "a row inserted since the list, not checkpointed: kept" has "^skipped $c_ins changed since the list \\([0-9]+ rows of $c_ins\\.t\\)\$"
 check "a row deleted since the list, not checkpointed: kept" has "^skipped $c_del changed since the list \\(rows modified: 1 then, 2 now\\)\$"
 check "an operator in another schema over its function: kept" has "^skipped $c_op dependents-outside \\(1: public\\.<<<\\(integer,integer\\)\\)\$"
 check "  and so is the operator" [ "$(admin -c "select count(*) from pg_operator where oprname = '<<<'")" = 1 ]
 check "the untouched one is dropped" has "^dropped $c_ok\$"
-for s in "$c_func" "$c_ins" "$c_del" "$c_op"; do exists "$s" && pass "kept: $s" || fail "kept: $s"; done
+check "  and what the drop said is kept, under it" bash -c "grep -A1 -x 'dropped $c_ok' '$out' | tail -n 1 | grep -qx '  | NOTICE:  drop cascades to table $c_ok.t'"
+check "the totals: 1 dropped, 6 kept" has "^sweep-test-schemas --apply: dropped 1, skipped 6, failed 0\$"
+for s in "$c_func" "$c_ins" "$c_del" "$c_op" "$c_drop" "$c_open"; do exists "$s" && pass "kept: $s" || fail "kept: $s"; done
 ! exists "$c_ok" && pass "gone: $c_ok" || fail "gone: $c_ok"
 
 guard_home
