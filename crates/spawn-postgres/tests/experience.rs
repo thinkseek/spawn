@@ -784,9 +784,72 @@ fn a_missions_row_says_owner_work_when_it_has_no_objective_backlog() {
         .collect();
     assert_eq!(
         rows,
-        vec![(1, false), (2, true), (3, true), (4, false)],
-        "a backlog mission is not owner work, nor one never configured; \
-         one configured without a backlog, or with its backlog removed, is"
+        vec![(1, false), (2, true), (3, true), (4, true)],
+        "a backlog mission is not owner work; one configured without a backlog, \
+         with its backlog removed, or never configured at all is (objective 077)"
+    );
+}
+
+/// Objective 077: a mission that was only ever added (its `mission.added`,
+/// no `mission.configured`, no legacy row) has no objective backlog, so its
+/// work comes from the owner: its row is owner work, whatever its text
+/// says, and the card never flags it idle. Beside it a backlog mission with
+/// no task all along stays not owner work, so the card flags it idle.
+/// Seeded like live's missions 4, 7 and 8, through the real store.
+#[test]
+fn a_mission_only_ever_added_is_owner_work_and_not_idle_beside_an_idle_backlog_one() {
+    let (store, schema) = store("experience_owner_work_added");
+    let mut client = admin(&schema);
+    let control = |client: &mut Client, record: Value| {
+        client
+            .query_one("select spawn_control_record($1)", &[&record])
+            .expect("record through spawn_control_record");
+    };
+    let texts = [
+        (4, "Improve Spawn from the backlog"),
+        (7, "Owner work on the deploy"),
+        (8, "Keep the docs in step with the code"),
+    ];
+    for (id, text) in texts {
+        control(
+            &mut client,
+            json!({"type": "mission.added", "id": id, "text": text, "origin": "human", "sources": []}),
+        );
+    }
+    control(
+        &mut client,
+        json!({"type": "mission.configured", "id": 4, "accept": "gate", "gate": "/ctl/scenarios",
+               "objectives": {"backlog": "/ctl/backlog", "resident": "res", "workers": 1}}),
+    );
+    let now: i64 = client
+        .query_one("select spawn_now_ms()", &[])
+        .expect("now")
+        .get(0);
+    let window = store
+        .experience_window(now - 24 * H, now + H)
+        .expect("the window reads");
+    // The card's rule (spawn-cli scorecard::fleet `idle`): a mission is idle
+    // when it is not owner work and sat without a task more than half its
+    // span; none of these has a task, so each is idle unless owner work.
+    let rows: Vec<(i64, bool, bool)> = window["missions"]
+        .as_array()
+        .expect("missions")
+        .iter()
+        .map(|m| {
+            let owner_work = m["owner_work"].as_bool().expect("owner_work");
+            let tasks = m["tasks"].as_array().expect("tasks");
+            (
+                m["mission"].as_i64().expect("id"),
+                owner_work,
+                !owner_work && tasks.is_empty(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![(4, false, true), (7, true, false), (8, true, false)],
+        "[mission, owner_work, idle]: a never-configured mission is owner work \
+         and not idle, whatever its text; the backlog mission is idle"
     );
 }
 
@@ -800,8 +863,8 @@ fn a_missions_row_says_owner_work_when_it_has_no_objective_backlog() {
 /// keeps the backlog, and only an explicit null clears it. Each configured
 /// mission's `owner_work` is checked against the fold
 /// (`mission_missions.objectives` not an object). Seeded like live: missions
-/// 6, 7 and 8 have only their `mission.added`; what they say is 077's to
-/// decide and is not pinned here.
+/// 6, 7 and 8 have only their `mission.added` and are owner work (077,
+/// pinned by its own test), so only the configured ones are compared.
 #[test]
 fn a_partial_reconfigure_keeps_a_missions_owner_work_as_its_fold_has_it() {
     let (store, schema) = store("experience_owner_work_fold");

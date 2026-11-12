@@ -772,10 +772,16 @@ export function agentsNow(agents: readonly FleetAgent[] | null, context: FleetCo
 // The supervisor's lines for the owner
 
 export interface NotesShown {
-  shown: Array<{ text: string; at_ms: number | null }>;
-  /** Every other note that is not settled (older than NOTE_FRESH_MS, or
-   * past NOTES_SHOWN). */
+  /** The shown lines, each with what became of the tasks it names ("T3
+   * accepted"; "" when it names none), worded as `allNotes` words them. */
+  shown: Array<{ text: string; at_ms: number | null; taskStates: string }>;
+  /** Every other current note that is not settled (older than
+   * NOTE_FRESH_MS, or past NOTES_SHOWN). */
   more: number;
+  /** The notes of the supervisor's earlier turns that are not settled
+   * (objective 078): its newest block restates what it still asks, so
+   * these are neither shown nor in `more`. The full list has them. */
+  earlier: number;
   /** The settled notes, left out of `shown` and `more`: a review ask whose
    * tasks have all ended (objective 064). The full list still has them. */
   settled: number;
@@ -783,20 +789,51 @@ export interface NotesShown {
 
 /** A line for the owner as Home and the full list read it: the API's item,
  * whose `tasks` and `settled` an older server does not send. */
-type NoteLike = { text: string; at_ms: number | null; tasks?: unknown; settled?: unknown };
+type NoteLike = { text: string; at_ms: number | null; tasks?: unknown; settled?: unknown; current?: unknown };
+
+/** Whether a line is of the supervisor's newest block: an older server
+ * that does not say counts every line as current. */
+function isCurrent(note: NoteLike): boolean {
+  return note.current !== false;
+}
+
+/** What became of the tasks a line names, "T2 accepted, T4 cancelled"; ""
+ * when it names none (or an older server sends no `tasks`). */
+function taskStates(note: NoteLike): string {
+  const tasks = Array.isArray(note.tasks) ? note.tasks : [];
+  return tasks
+    .flatMap((task: unknown) => {
+      const entry = typeof task === "object" && task !== null ? (task as { id?: unknown; state?: unknown }) : null;
+      return entry && typeof entry.id === "number"
+        ? [`T${entry.id} ${typeof entry.state === "string" ? entry.state : "unknown"}`]
+        : [];
+    })
+    .join(", ");
+}
 
 function newestFirst<T extends NoteLike>(notes: readonly T[]): T[] {
   return [...notes].sort((left, right) => (right.at_ms ?? 0) - (left.at_ms ?? 0));
 }
 
-/** Home's "From the supervisor" card: the newest fresh lines that are not
- * settled, and how many others there are. A settled line (its review ask's
- * tasks have all ended) is neither shown nor counted in `more`. */
+/** Home's "From the supervisor" card: the newest fresh lines of the
+ * supervisor's newest block that are not settled, each with its tasks'
+ * states, and how many others there are. A settled line (its review ask's
+ * tasks have all ended) is neither shown nor counted in `more`, nor is a
+ * line of an earlier turn (counted in `earlier`, objective 078). */
 export function latestNotes(attention: Attention | null, now: number): NotesShown {
-  const all = newestFirst(attention?.supervisor?.for_owner ?? []);
-  const notes = all.filter((note) => (note as NoteLike).settled !== true);
-  const shown = notes.filter((note) => note.at_ms !== null && now - note.at_ms < NOTE_FRESH_MS).slice(0, NOTES_SHOWN);
-  return { shown, more: notes.length - shown.length, settled: all.length - notes.length };
+  const all = newestFirst<NoteLike>(attention?.supervisor?.for_owner ?? []);
+  const notes = all.filter((note) => note.settled !== true);
+  const current = notes.filter(isCurrent);
+  const shown = current
+    .filter((note) => note.at_ms !== null && now - note.at_ms < NOTE_FRESH_MS)
+    .slice(0, NOTES_SHOWN)
+    .map((note) => ({ text: note.text, at_ms: note.at_ms, taskStates: taskStates(note) }));
+  return {
+    shown,
+    more: current.length - shown.length,
+    earlier: notes.length - current.length,
+    settled: all.length - notes.length,
+  };
 }
 
 /** One line of the supervisor's full list. */
@@ -807,28 +844,22 @@ export interface NoteRow {
   /** What became of the tasks it names, "T2 accepted, T4 cancelled"; ""
    * when it names none. */
   tasks: string;
+  /** Of the supervisor's newest block; false for an earlier turn's line
+   * (objective 078). */
+  current: boolean;
 }
 
 /** The supervisor's full list of lines for the owner, newest first: every
- * line, a settled one too, marked so, each with its named tasks' states. */
+ * line, a settled one and an earlier turn's too, marked so, each with its
+ * named tasks' states. */
 export function allNotes(attention: Attention | null): NoteRow[] {
-  return newestFirst(attention?.supervisor?.for_owner ?? []).map((note) => {
-    const raw = note as NoteLike;
-    const tasks = Array.isArray(raw.tasks) ? raw.tasks : [];
-    return {
-      text: note.text,
-      at_ms: note.at_ms,
-      settled: raw.settled === true,
-      tasks: tasks
-        .flatMap((task: unknown) => {
-          const entry = typeof task === "object" && task !== null ? (task as { id?: unknown; state?: unknown }) : null;
-          return entry && typeof entry.id === "number"
-            ? [`T${entry.id} ${typeof entry.state === "string" ? entry.state : "unknown"}`]
-            : [];
-        })
-        .join(", "),
-    };
-  });
+  return newestFirst<NoteLike>(attention?.supervisor?.for_owner ?? []).map((note) => ({
+    text: note.text,
+    at_ms: note.at_ms,
+    settled: note.settled === true,
+    tasks: taskStates(note),
+    current: isCurrent(note),
+  }));
 }
 
 // ---------------------------------------------------------------------------
