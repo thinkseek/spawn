@@ -13,11 +13,15 @@
 //! low-priority claimant with one job: at most one host scenario slot that
 //! no gate is waiting for, and one compiler job.
 //!
-//! One warm at a time. A warm of a commit main has since moved past is
-//! abandoned (its process group gets TERM, then KILL after
-//! [`ABANDON_GRACE`]). The entries it finished stay valid for the commit
-//! they name, and the new commit gets its own warm. A commit warmed once is
-//! not warmed again by the same integrator.
+//! One warm at a time, and one wanted per source, kept until it runs. A
+//! warm is abandoned only when its own source's main has moved past it (its
+//! process group gets TERM, then KILL after [`ABANDON_GRACE`]); the entries
+//! it finished stay valid for the commit they name, and the new commit gets
+//! its own warm. A landing on another source never cuts a warm off: that
+//! source's warm waits, kept, until the running one ends, and the wanted
+//! ones start in the order they were wanted (cc-astra A33: a Flake Doctor
+//! landing abandoned a still-current Spawn warm as "main moved on"). A
+//! commit warmed once is not warmed again by the same integrator.
 //!
 //! It cannot outlive the integrator unaccounted for:
 //! - the gate runs under `setpriv --pdeathsig TERM`, started from the
@@ -83,9 +87,11 @@ pub(super) struct Warms {
     gate: PathBuf,
     env: Vec<(String, String)>,
     dir: PathBuf,
-    wanted: Option<Want>,
+    /// At most one per source, in the order they were first wanted.
+    wanted: Vec<Want>,
     running: Option<Warm>,
-    done: Option<Want>,
+    /// The last warm finished, per source.
+    done: Vec<Want>,
     lost: Option<Lost>,
 }
 
@@ -124,9 +130,9 @@ impl Warms {
             gate,
             env,
             dir,
-            wanted: None,
+            wanted: Vec::new(),
             running: None,
-            done: None,
+            done: Vec::new(),
             lost: None,
         }
     }
@@ -155,7 +161,7 @@ impl Warms {
             );
             return;
         }
-        if self.wanted.is_some() || self.running.is_some() {
+        if !self.wanted.is_empty() || self.running.is_some() {
             return;
         }
         match main(&lost.source) {
@@ -195,34 +201,46 @@ impl Warms {
         }
     }
 
-    /// Main of `want.source` is now `want.commit`: warm it at the next
-    /// [`Self::poll`]. A later want replaces an earlier one not yet started.
+    /// Main of `want.source` is now `want.commit`: warm it at a later
+    /// [`Self::poll`]. A later want of the same source replaces an earlier
+    /// one not yet started (in its place); another source's is kept.
     pub(super) fn want(&mut self, want: Want) {
-        self.wanted = Some(want);
+        match self
+            .wanted
+            .iter_mut()
+            .find(|wanted| wanted.source == want.source)
+        {
+            Some(wanted) => *wanted = want,
+            None => self.wanted.push(want),
+        }
     }
 
     /// Once per pass, on the main thread: say how a warm that ended went,
-    /// abandon one main has moved past, and start the wanted one when its
-    /// mirror has the commit (`mirror` answers, refreshing it when it may;
-    /// None: not this pass).
+    /// abandon one its own source's main has moved past, and, with none
+    /// running, start the first wanted one whose mirror has the commit
+    /// (`mirror` answers, refreshing it when it may; None: not this pass).
+    /// A want of another source than the running warm's waits for it.
     pub(super) fn poll(&mut self, mirror: &dyn Fn(&Want) -> Option<PathBuf>) {
         self.reap();
-        let Some(want) = self.wanted.clone() else {
+        let (done, running) = (&self.done, self.running.as_ref());
+        self.wanted
+            .retain(|want| !done.contains(want) && running.is_none_or(|warm| warm.want != *want));
+        if let Some(warm) = &self.running {
+            let source = warm.want.source.clone();
+            if !self.wanted.iter().any(|want| want.source == source) {
+                return;
+            }
+            self.abandon(&format!("{source}'s main moved on"));
+        }
+        let Some((at, repo)) = self
+            .wanted
+            .iter()
+            .enumerate()
+            .find_map(|(at, want)| mirror(want).map(|repo| (at, repo)))
+        else {
             return;
         };
-        if self.done.as_ref() == Some(&want)
-            || self.running.as_ref().is_some_and(|warm| warm.want == want)
-        {
-            self.wanted = None;
-            return;
-        }
-        if self.running.is_some() {
-            self.abandon("main moved on");
-        }
-        let Some(repo) = mirror(&want) else {
-            return;
-        };
-        self.wanted = None;
+        let want = self.wanted.remove(at);
         match self.start(&want, &repo) {
             Ok(warm) => {
                 println!(
@@ -258,7 +276,8 @@ impl Warms {
                     warm.log.display()
                 );
                 if let Some(warm) = self.running.take() {
-                    self.done = Some(warm.want);
+                    self.done.retain(|done| done.source != warm.want.source);
+                    self.done.push(warm.want);
                 }
                 let _ = std::fs::remove_file(self.dir.join(PID_FILE));
             }
@@ -733,6 +752,57 @@ mod tests {
         warms.abandon("test over");
     }
 
+    /// cc-astra A33: a landing on another source never cuts the running
+    /// warm off. Its warm is kept (a second landing there replaces it) and
+    /// starts once the running one is gone; the running warm's own source
+    /// moving still supersedes it, and then the wants start in the order
+    /// they came.
+    #[test]
+    fn another_sources_landing_waits_for_the_running_warm_and_is_kept() {
+        let scratch = Scratch::new("two-sources");
+        let mut warms = warms(&scratch, 30);
+        let mirror = |_: &Want| Some(PathBuf::from("/mirror.git"));
+        let other = |commit: &str| Want {
+            source: "/src/other".to_string(),
+            ..want(commit)
+        };
+        warms.want(want("aaa111"));
+        warms.poll(&mirror);
+        let first = warms.running_pid().expect("spawn's warm");
+        warms.want(other("bbb222"));
+        warms.poll(&mirror);
+        assert_eq!(warms.running_pid(), Some(first), "not cut off");
+        assert!(alive(first));
+        warms.want(other("ccc333"));
+        warms.poll(&mirror);
+        assert_eq!(warms.running_pid(), Some(first), "still not cut off");
+        // Spawn's own main moves: its warm is superseded, and the other
+        // source's, wanted first, starts, with its latest commit.
+        warms.want(want("ddd444"));
+        warms.poll(&mirror);
+        let second = warms.running_pid().expect("the other source's warm");
+        assert_ne!(second, first);
+        assert!(!alive(first), "the superseded warm's group is gone");
+        until("the other source's warm", || {
+            scratch.0.join("args.ccc333").exists()
+        });
+        assert!(
+            !scratch.0.join("args.bbb222").exists(),
+            "a replaced want never runs"
+        );
+        // Spawn's new commit waits for it, kept.
+        warms.poll(&mirror);
+        assert_eq!(warms.running_pid(), Some(second));
+        warms.abandon("test over");
+        warms.poll(&mirror);
+        let third = warms.running_pid().expect("spawn's new commit, kept");
+        until("spawn's new commit's warm", || {
+            scratch.0.join("args.ddd444").exists()
+        });
+        warms.abandon("test over");
+        assert!(!alive(third));
+    }
+
     /// A mirror that has not the commit yet (an owner's landing, a gate on
     /// the source holding the mirror) defers the warm to a later pass.
     #[test]
@@ -1074,7 +1144,7 @@ mod tests {
         assert_eq!(new.lost_source(), Some("/src/spawn"));
         new.poll(&|_| None);
         for _ in 1..super::LOST_TRIES {
-            new.wanted = None;
+            new.wanted.clear();
             new.want_lost(true, &|_| Err("unreachable".to_string()));
             assert_eq!(new.lost_source(), Some("/src/spawn"), "tried again");
         }

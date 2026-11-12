@@ -308,6 +308,16 @@ pub(super) fn unowned_in(
     Ok(unowned)
 }
 
+/// The roots of `roots` that are refused ([`refused_root`]), each with why,
+/// in order: the answer names them, and the figure is not collected while
+/// any is (a count without them is not the whole).
+pub(super) fn refused_roots(roots: &[PathBuf]) -> Vec<(PathBuf, String)> {
+    roots
+        .iter()
+        .filter_map(|root| refused_root(root).map(|why| (root.clone(), why)))
+        .collect()
+}
+
 /// Every root's entries nobody owns, largest first (then by path): `Err`
 /// when a root's walk goes past its bound. A root that cannot be read has
 /// none, and so has a refused one ([`refused_root`]): its error is reported
@@ -348,7 +358,7 @@ pub(super) fn unowned(
 
 #[cfg(test)]
 mod tests {
-    use super::{Bound, MARKER, Reason, never_counted, unowned};
+    use super::{Bound, MARKER, Reason, never_counted, refused_roots, unowned};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
@@ -624,6 +634,23 @@ mod tests {
             Ok(Vec::new())
         );
         assert_eq!(count(std::slice::from_ref(&through), &[]), Ok(Vec::new()));
+
+        // The refused ones are named, with why; a real root and one that is
+        // not there are not refused.
+        let absent = scratch.0.join("absent");
+        let refused = refused_roots(&[protected.clone(), alias.clone(), through.clone(), absent]);
+        assert_eq!(
+            refused
+                .iter()
+                .map(|(root, _)| root.clone())
+                .collect::<Vec<_>>(),
+            vec![alias.clone(), through.clone()]
+        );
+        assert!(refused[0].1.contains("is a symlink"), "{refused:?}");
+        assert!(
+            refused[1].1.contains(&parent.display().to_string()),
+            "{refused:?}"
+        );
 
         // A real root, its protected entry named through an alias: compared
         // on the resolved path, so it never counts.
