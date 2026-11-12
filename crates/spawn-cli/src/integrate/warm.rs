@@ -635,7 +635,12 @@ mod tests {
         let gate = dir.join("gate.sh");
         std::fs::write(
             &gate,
-            format!("printf '%s\\n' \"$@\" >\"$WARM_ARGS.$3\"\nsleep {secs}\n"),
+            // Written whole, then named: a test that sees the file reads
+            // all of it.
+            format!(
+                "printf '%s\\n' \"$@\" >\"$WARM_ARGS.$3.tmp\"\n\
+                 mv \"$WARM_ARGS.$3.tmp\" \"$WARM_ARGS.$3\"\nsleep {secs}\n"
+            ),
         )
         .expect("gate");
         gate

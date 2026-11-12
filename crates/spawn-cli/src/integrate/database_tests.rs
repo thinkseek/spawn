@@ -2417,7 +2417,7 @@ fn a_warm_cut_off_by_a_restart_is_warmed_again_at_the_first_pass() {
     // `case`: "live", "drain" or "halted". The warm's arguments, if any.
     fn first_pass(case: &str) -> Option<Vec<String>> {
         let dir = std::env::temp_dir().join(format!(
-            "spawn-db-warm-again-{case}-{}",
+            "spawn-warm-again-dir-{case}-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
