@@ -117,7 +117,13 @@ cleanup() {
   "$tmux" -L "$socket" kill-server 2>/dev/null || true
   rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$socket"
   if [ "${KEEP:-0}" != 1 ] && command -v psql >/dev/null; then
-    E2E_PSQL_SCHEMA='' e2e_psql -q -c "drop schema if exists $schema cascade" >/dev/null 2>&1 || true
+    # A drop that fails is said, not hidden: the schema stays in the test
+    # database until the sweep (sync/storage-testdb-bloat.md: 17 e2e
+    # schemas were left there unsaid). psql's words, with no credentials.
+    local drop_error
+    if ! drop_error=$(E2E_PSQL_SCHEMA='' e2e_psql -q -c "drop schema if exists $schema cascade" 2>&1 >/dev/null); then
+      echo "e2e: warning: the test schema $schema was not dropped, and stays in the test database: $(printf '%s' "$drop_error" | sed -E 's#(://)[^@[:space:]]*@#\1***@#g' | head -n 3 | tr '\n' ' ')" >&2
+    fi
   fi
   if [ "${KEEP:-0}" != 1 ]; then rm -rf "$work"; else echo "e2e: kept $work" >&2; fi
 }
