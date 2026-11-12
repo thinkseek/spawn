@@ -197,6 +197,10 @@ fn name_key(settings: &Settings) -> Result<[u8; 32], String> {
     let secret = fs::read(&settings.key_file)
         .map_err(|error| format!("the backup key {}: {error}", settings.key_file.display()))?;
     Ok(Sha256::new()
+        // FROZEN from the first live put on: every segment's name is made
+        // with it, so a changed label names no object the bucket holds
+        // (rev-g N1 on 8c0e3d77; it read "spawn backup store: ..." until
+        // then, which only the locktest hand run used).
         .chain_update(b"spawn store: segment names\0")
         .chain_update(&secret)
         .finalize()
