@@ -5158,6 +5158,60 @@ mod tests {
         );
     }
 
+    /// Objective 099: a mission the owner paused fires no `mission_idle`,
+    /// however long it has had no task in work; a pause clears an open one,
+    /// naming the `mission.paused` record; the owner's resume starts the
+    /// idle time again from its own record.
+    #[test]
+    fn a_paused_mission_fires_no_idle_alert_and_its_pause_clears_one() {
+        let mut monitor = monitor();
+        idle_world(&mut monitor);
+        // Mission 4 has a task in work; cancel it, then pause it before
+        // the bound: it never fires, past the bound or long after.
+        feed(&mut monitor, 24, 4_000, json!({"type": "task.cancelled", "id": 4}));
+        let paused = feed(
+            &mut monitor,
+            25,
+            5_000,
+            json!({"type": "mission.paused", "id": 4, "reason": "owner hold"}),
+        );
+        assert!(decided(&monitor, paused).is_empty(), "nothing open to clear");
+        let fired = read_idle(&monitor, 50_000_000);
+        assert_eq!(
+            fires(&fired),
+            ["mission_idle:1:21"],
+            "mission 1 is idle, paused mission 4 is not: {fired:?}"
+        );
+        commit(&mut monitor, &fired);
+        // Mission 1's open alert clears at its pause, naming the record.
+        let pause = feed(
+            &mut monitor,
+            40,
+            60_000_000,
+            json!({"type": "mission.paused", "id": 1, "reason": null}),
+        );
+        let cleared = decided(&monitor, pause);
+        assert!(
+            matches!(&cleared[..], [Event::Clear { key, evidence }]
+                if key == "mission_idle:1:21" && evidence["event_id"] == 40
+                    && evidence["record"] == "mission.paused"),
+            "{cleared:?}"
+        );
+        commit(&mut monitor, &cleared);
+        assert!(read_idle(&monitor, 90_000_000).is_empty(), "both paused");
+        // The resume of mission 4: idle again from the unpause, not from
+        // its last task's end.
+        feed(
+            &mut monitor,
+            41,
+            100_000_000,
+            json!({"type": "mission.unpaused", "id": 4, "pause_event": 25}),
+        );
+        assert!(read_idle(&monitor, 100_000_000 + 900_000 - 1).is_empty());
+        let again = read_idle(&monitor, 100_000_000 + 900_000);
+        assert_eq!(fires(&again), ["mission_idle:4:41"], "{again:?}");
+    }
+
     /// Objective 058: `SPAWN_ALERT_MISSION_IDLE_SECS` is 900 s by default,
     /// and 0 turns the alert off.
     #[test]
