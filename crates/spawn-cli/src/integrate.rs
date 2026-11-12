@@ -2152,9 +2152,11 @@ impl Integrator {
 
     /// This integrator warming the base cache after each landing, its logs
     /// and pid file in `dir`; a warm a predecessor left there is stopped
-    /// first ([`warm::Warms::take_over`]).
+    /// first ([`warm::Warms::take_over`]), and the warm it cut off is warmed
+    /// again for its source's main at the first passes ([`Self::poll_warm`]).
     fn with_warm(self, dir: PathBuf) -> Self {
-        let warms = warm::Warms::new(self.judge.gate.clone(), self.judge.gate_env.clone(), dir);
+        let mut warms =
+            warm::Warms::new(self.judge.gate.clone(), self.judge.gate_env.clone(), dir);
         warms.take_over();
         *self.warms.borrow_mut() = Some(warms);
         self
