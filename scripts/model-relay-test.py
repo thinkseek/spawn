@@ -419,6 +419,21 @@ class RelayTest(unittest.TestCase):
         self.addCleanup(setattr, relay, name, getattr(relay, name))
         setattr(relay, name, value)
 
+    def record_attempts(self):
+        """Each DeepSeek attempt the relay starts, as (the request's arrival,
+        the attempt's start), both on the relay's own clock, for this test."""
+        handler = self.relay.RequestHandlerClass
+        opened = handler._open
+        attempts = []
+
+        def recorded(this, request, seconds):
+            attempts.append((this._arrived, time.monotonic()))
+            return opened(this, request, seconds)
+
+        self.addCleanup(setattr, handler, "_open", opened)
+        handler._open = recorded
+        return attempts
+
     def fast_retries(self):
         self.patch("STREAM_BACKOFF", (0, 0, 0, 0))
         self.patch("DEEPSEEK_SILENCE", 1)
@@ -613,8 +628,10 @@ class RelayTest(unittest.TestCase):
             ["silent", "stall", "stall"],
             ["stall", "fail", "silent", "stall", "stall"],
         )
+        attempts = self.record_attempts()
         for plan in plans:
             self.deepseek.requests.clear()
+            attempts.clear()
             self.deepseek.plan = list(plan)
             started = time.monotonic()
             connection, response = self.stream()
@@ -626,8 +643,18 @@ class RelayTest(unittest.TestCase):
             # inside the bound.
             self.assertLess(took, relay.STREAM_BUDGET + 0.3, plan)
             self.assertLess(took, 180 * scale, plan)
-            for seen in self.deepseek.requests:
-                self.assertLess(seen["at"] - started, relay.STREAM_BUDGET, plan)
+            # No attempt starts at or after the deadline, judged on the
+            # relay's own times: the request's arrival as the relay saw it
+            # and each attempt's start. Measured from the client's `started`
+            # to the upstream's receipt instead, two loopback transits count
+            # against the relay, and a loaded host read an attempt started
+            # inside its deadline as 0.67 ms late (Flake Doctor, judging
+            # 01a1cf1bd120551eca33bad40c3d).
+            # Every request DeepSeek saw was a recorded attempt (an attempt
+            # left with almost no time may end before it reaches DeepSeek).
+            self.assertGreaterEqual(len(attempts), len(self.deepseek.requests), plan)
+            for arrived, at in attempts:
+                self.assertLess(at - arrived, relay.STREAM_BUDGET, plan)
 
     def test_a_stall_ends_at_the_silence_bound_not_at_the_next_keep_alive(self):
         self.fast_retries()
