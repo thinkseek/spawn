@@ -46,11 +46,16 @@
 #   than one;
 # - any would-drop name in the section is not spawn_test_<pid>_<...>
 #   (lower-case letters, digits and `_`).
-# For each name, in the list's order: its dry-run line (as the print-only
-# run says it now), then `dropped <name>` or `skipped <name> <why>`. Each
-# drop is one `DROP SCHEMA "<name>" CASCADE` in a transaction of its own,
-# with a lock timeout, so one that fails is said and the others go on. Last,
-# the spawn_test_* schemas before and after: count and MB.
+# First, each schema that qualifies now but is not on the list:
+# `not-on-list <name> ...`, kept, and their count. Then for each name, in
+# the list's order: its dry-run line (as the print-only run says it now),
+# then `dropped <name>` or `skipped <name> <why>`. Each drop is one
+# `DROP SCHEMA "<name>" CASCADE` in a transaction of its own, with a lock
+# timeout, so one that fails is said and the others go on; one whose
+# CASCADE would also drop something of another schema (a view, a foreign
+# key, a column of its type) is rolled back: `skipped <name>
+# dependents-outside`. Last, the spawn_test_* schemas before and after:
+# count and MB.
 #
 # The URL goes to psql as PG* variables (scripts/pg-url.sh), never an
 # argument. Exit 0; 1 when a drop failed; 2 when refused or the database
@@ -221,6 +226,18 @@ fi
 echo "database $target_database port $target_port"
 echo "$prog --apply: $(printf '%s\n' "$reviewed" | grep -c . || true) reviewed name(s) from $apply_list"
 before=$(totals "$rows")
+# The difference the other way (owner's step 4): what qualifies now and is
+# not on the reviewed list is said, and kept.
+not_listed=0
+while IFS='|' read -r name bytes idle; do
+    [ -n "$name" ] || continue
+    judge "$name" "$bytes" "$idle"
+    [ -z "$jd_why" ] || continue
+    printf '%s\n' "$reviewed" | grep -qxF -- "$name" && continue
+    echo "not-on-list ${jd_line#would-drop } (qualifies now, not reviewed: kept)"
+    not_listed=$((not_listed + 1))
+done <<<"$rows"
+echo "$prog --apply: $not_listed qualifying schema(s) not on the list, kept"
 dropped=0 skipped=0 failed=0
 for name in $reviewed; do
     if [ "$ages_readable" = 1 ]; then
@@ -246,14 +263,68 @@ for name in $reviewed; do
         skipped=$((skipped + 1))
         continue
     fi
-    # One statement, one transaction; the name quoted by psql (:"..."), and
-    # checked against spawn_test_<pid>_[a-z0-9_]+ above besides.
-    if drop_err=$(printf 'set lock_timeout = %s;\ndrop schema :"dn_name" cascade;\n' "'10s'" |
-        PGOPTIONS=$pgoptions_drop psql -X -q -v ON_ERROR_STOP=1 -v dn_name="$name" 2>&1 >/dev/null); then
+    # One transaction per name: CASCADE also drops what other schemas hold
+    # that depends on this one (a view, a foreign key, a column of its type,
+    # a default or trigger calling its function), which is outside the
+    # owner's scope. So the transaction counts every object outside the
+    # schema (pg_toast aside: the schema's own tables' TOAST lives there)
+    # before and after the drop, and rolls back when the count moved:
+    # `skipped <name> dependents-outside`, kept whole. The name goes in as a
+    # setting (psql quotes it) and to DROP through format('%I').
+    if drop_err=$(PGOPTIONS=$pgoptions_drop psql -X -q -v ON_ERROR_STOP=1 -v dn_name="$name" 2>&1 >/dev/null <<'SQL'
+begin;
+set local lock_timeout = '10s';
+select set_config('sweep.name', :'dn_name', true);
+do $sweep$
+declare
+    nsp oid := (select oid from pg_namespace where nspname = current_setting('sweep.name'));
+    outside_before bigint;
+    outside_after bigint;
+begin
+    if nsp is null then
+        raise exception 'sweep: gone';
+    end if;
+    select into outside_before
+           (select count(*) from pg_class c where c.relnamespace not in (nsp, 'pg_toast'::regnamespace))
+         + (select count(*) from pg_type t where t.typnamespace <> nsp)
+         + (select count(*) from pg_proc p where p.pronamespace <> nsp)
+         + (select count(*) from pg_constraint k where k.connamespace <> nsp)
+         + (select count(*) from pg_attribute a join pg_class c on c.oid = a.attrelid
+             where c.relnamespace not in (nsp, 'pg_toast'::regnamespace) and not a.attisdropped)
+         + (select count(*) from pg_attrdef d join pg_class c on c.oid = d.adrelid where c.relnamespace <> nsp)
+         + (select count(*) from pg_rewrite r join pg_class c on c.oid = r.ev_class where c.relnamespace <> nsp)
+         + (select count(*) from pg_trigger g join pg_class c on c.oid = g.tgrelid where c.relnamespace <> nsp)
+         + (select count(*) from pg_policy y join pg_class c on c.oid = y.polrelid where c.relnamespace <> nsp);
+    execute format('drop schema %I cascade', current_setting('sweep.name'));
+    select into outside_after
+           (select count(*) from pg_class c where c.relnamespace not in (nsp, 'pg_toast'::regnamespace))
+         + (select count(*) from pg_type t where t.typnamespace <> nsp)
+         + (select count(*) from pg_proc p where p.pronamespace <> nsp)
+         + (select count(*) from pg_constraint k where k.connamespace <> nsp)
+         + (select count(*) from pg_attribute a join pg_class c on c.oid = a.attrelid
+             where c.relnamespace not in (nsp, 'pg_toast'::regnamespace) and not a.attisdropped)
+         + (select count(*) from pg_attrdef d join pg_class c on c.oid = d.adrelid where c.relnamespace <> nsp)
+         + (select count(*) from pg_rewrite r join pg_class c on c.oid = r.ev_class where c.relnamespace <> nsp)
+         + (select count(*) from pg_trigger g join pg_class c on c.oid = g.tgrelid where c.relnamespace <> nsp)
+         + (select count(*) from pg_policy y join pg_class c on c.oid = y.polrelid where c.relnamespace <> nsp);
+    if outside_after <> outside_before then
+        raise exception 'sweep: dependents-outside (% objects)', outside_before - outside_after;
+    end if;
+end
+$sweep$;
+commit;
+SQL
+    ); then
         echo "dropped $name"
         dropped=$((dropped + 1))
+    elif printf '%s\n' "$drop_err" | grep -q 'sweep: dependents-outside'; then
+        echo "skipped $name dependents-outside ($(printf '%s\n' "$drop_err" | sed -n 's/.*sweep: dependents-outside (\(.*\)).*/\1/p' | head -n 1))"
+        skipped=$((skipped + 1))
+    elif printf '%s\n' "$drop_err" | grep -q 'sweep: gone'; then
+        echo "skipped $name gone"
+        skipped=$((skipped + 1))
     else
-        echo "skipped $name the drop failed: $(printf '%s\n' "$drop_err" | head -n 1)"
+        echo "skipped $name the drop failed: $(printf '%s\n' "$drop_err" | grep -m1 ERROR || printf '%s\n' "$drop_err" | head -n 1)"
         failed=$((failed + 1))
     fi
 done
