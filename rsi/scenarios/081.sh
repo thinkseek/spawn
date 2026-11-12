@@ -19,7 +19,9 @@
 #       landed to the first `deploy.finished` with `ok` true at or after the
 #       landing; `p90` the same at 90; `n` how many of the window's landings
 #       are live; `not_live` how many have no such deploy yet (left out of
-#       value and p90); better "lower".
+#       value and p90); better "lower". A deploy is known by when it
+#       finished, so a landing made while one ran counts as shipped by it:
+#       optimistic by at most one deploy's run.
 #   (2) web/src/scorecardFormat.ts (node-loadable) exports
 #       `reportToLiveText(dimension)`: "<value in hours, one decimal> h
 #       from report to live (<n> landing[s])", the parenthesis ending
@@ -210,7 +212,7 @@ create function pg_temp.landed(h numeric, task int) returns void language sql as
     select pg_temp.rec(h, jsonb_build_object('type', 'task.landed', 'id', task, 'from', '$B', 'to', '$C',
         'missions', '[]'::jsonb)) \$\$;
 create function pg_temp.deployed(h numeric, ok boolean) returns void language sql as \$\$
-    select pg_temp.rec(h, jsonb_build_object('type', 'deploy.finished', 'by', 'integrate', 'head', '$C',
+    select pg_temp.rec(h, jsonb_build_object('type', 'deploy.finished', 'by', 'landing', 'head', '$C',
         'ok', ok, 'reason', case when ok then '' else 'the build failed' end)) \$\$;
 
 select pg_temp.rec(-12, '{"type":"mission.added","id":1,"text":"081 mission","origin":"human","sources":[]}');
@@ -267,8 +269,8 @@ code=$(curl -s --noproxy '*' -o "$WORK/api.json" -w '%{http_code}' "http://127.0
 # --- (1) the answer ----------------------------------------------------------------------
 
 H=3600000
-expect_eq "$(jq -c '[.scopes[] | select(.scope == "fleet") | .dimensions.report_to_live | {value, p90, n, not_live, better}]' "$WORK/api.json")" \
-    "[{\"value\":$H,\"p90\":$((2 * H)),\"n\":4,\"not_live\":1,\"better\":\"lower\"}]" \
+expect_eq "$(jq -c '[.scopes[] | select(.scope == "fleet") | .dimensions.report_to_live | {value, p90, n, not_live, better, enough}]' "$WORK/api.json")" \
+    "[{\"value\":$H,\"p90\":$((2 * H)),\"n\":4,\"not_live\":1,\"better\":\"lower\",\"enough\":true}]" \
     "(1) the fleet's report_to_live: median 1.0 h and p90 2.0 h over the four live landings (T2 from its last report, past the failed deploy), T5 not live"
 expect_eq "$(jq -c '[.scopes[] | select(.scope == "mission" and .mission == 1) | .dimensions.report_to_live | {value, n, not_live}]' "$WORK/api.json")" \
     "[{\"value\":$H,\"n\":4,\"not_live\":1}]" \
