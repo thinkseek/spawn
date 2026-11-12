@@ -1029,7 +1029,7 @@ mod tests {
         const D: i64 = super::DAY_MS;
         const H: i64 = 3_600_000;
         // 2026-11-12, 13:30 UTC.
-        let midnight = 20_404 * D;
+        let midnight = 20_769 * D;
         let now = midnight + 13 * H + 30 * 60_000;
         assert_eq!(super::trend_since(now), midnight - 6 * D);
         let samples = json!([
