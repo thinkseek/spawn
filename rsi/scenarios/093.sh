@@ -25,7 +25,7 @@
 #       --timestamp=unix -- <unit>` (default systemctl, its arguments as argv,
 #       the unit after --, the call bounded in time): passed when Result is
 #       success and ExecMainStatus 0, at its exit timestamp; a unit name
-#       other than [A-Za-z0-9][A-Za-z0-9@._-]*.(service|timer) (no leading
+#       other than [A-Za-z0-9][A-Za-z0-9@._-]*.service (no leading
 #       "-", which systemctl would read as an option: -H<host> is SSH to a
 #       host) is never run, and serve's log names it as refused; neither:
 #       no drill. The answer
@@ -41,7 +41,8 @@
 # The history: a passing database drill 3 h ago and a failed one 1 h ago;
 # a fake systemctl with three units: one passed 10 h ago, one failed, one
 # passed 8 days ago; three names it must never be called with (a shell
-# command, "-Hbb.invalid.service" and "--host=bb.invalid.service"); a
+# command, "-Hbb.invalid.service" and "--host=bb.invalid.service"), and a
+# timer, which has no ExecMain* result and so is refused too; a
 # configuration row with no drill;
 # a status file 10 minutes old.
 #
@@ -245,6 +246,7 @@ cat >"$SPAWN_WORKSPACE_ROOT/core-lines.json" <<JSON
      {"name": "Not a unit", "unit": "bb drill; touch $WORK/ran"},
      {"name": "An option", "unit": "-Hbb.invalid.service"},
      {"name": "A long option", "unit": "--host=bb.invalid.service"},
+     {"name": "A timer", "unit": "bb-drill-a.timer"},
      {"name": "Configuration and credentials"}
    ]}}
 JSON
@@ -269,7 +271,7 @@ if [ "$code" != 200 ]; then
     check_failed "(1) GET /api/core-lines answered $code: $(head -c 200 "$WORK/api.json")"
 else
     expect_eq "$(jq -c '.drills | map({name, source, passed_at_ms})' "$WORK/api.json")" \
-        "[{\"name\":\"Database\",\"source\":\"record backup.verified\",\"passed_at_ms\":$verified_at},{\"name\":\"Session files\",\"source\":\"unit bb-drill-a.service\",\"passed_at_ms\":$((unit_a_s * 1000))},{\"name\":\"Off-host copy\",\"source\":\"unit bb-drill-b.service\",\"passed_at_ms\":null},{\"name\":\"Old drill\",\"source\":\"unit bb-drill-c.service\",\"passed_at_ms\":$((unit_c_s * 1000))},{\"name\":\"Not a unit\",\"source\":\"unit bb drill; touch $WORK/ran\",\"passed_at_ms\":null},{\"name\":\"An option\",\"source\":\"unit -Hbb.invalid.service\",\"passed_at_ms\":null},{\"name\":\"A long option\",\"source\":\"unit --host=bb.invalid.service\",\"passed_at_ms\":null},{\"name\":\"Configuration and credentials\",\"source\":null,\"passed_at_ms\":null}]" \
+        "[{\"name\":\"Database\",\"source\":\"record backup.verified\",\"passed_at_ms\":$verified_at},{\"name\":\"Session files\",\"source\":\"unit bb-drill-a.service\",\"passed_at_ms\":$((unit_a_s * 1000))},{\"name\":\"Off-host copy\",\"source\":\"unit bb-drill-b.service\",\"passed_at_ms\":null},{\"name\":\"Old drill\",\"source\":\"unit bb-drill-c.service\",\"passed_at_ms\":$((unit_c_s * 1000))},{\"name\":\"Not a unit\",\"source\":\"unit bb drill; touch $WORK/ran\",\"passed_at_ms\":null},{\"name\":\"An option\",\"source\":\"unit -Hbb.invalid.service\",\"passed_at_ms\":null},{\"name\":\"A long option\",\"source\":\"unit --host=bb.invalid.service\",\"passed_at_ms\":null},{\"name\":\"A timer\",\"source\":\"unit bb-drill-a.timer\",\"passed_at_ms\":null},{\"name\":\"Configuration and credentials\",\"source\":null,\"passed_at_ms\":null}]" \
         "(1) the drills, in the file's order: the database's newest passing record (not the failed one after it), two units passed, one failed, a name never run, no drill"
     [ ! -e "$WORK/ran" ] || check_failed "(1) a unit name that is a shell command ran"
     if grep -qE 'bb drill|bb\.invalid' "$WORK/systemctl.calls" 2>/dev/null; then
@@ -279,7 +281,7 @@ else
         "(1) every systemctl call names its unit after --"
     expect_eq "$(sed -n 's/.* -- //p' "$WORK/systemctl.calls" | sort -u | tr '\n' ' ')" "bb-drill-a.service bb-drill-b.service bb-drill-c.service " \
         "(1) systemctl is asked for the three well-named units only"
-    for refused in "-Hbb.invalid.service" "--host=bb.invalid.service" "bb drill; touch"; do
+    for refused in "-Hbb.invalid.service" "--host=bb.invalid.service" "bb drill; touch" "bb-drill-a.timer"; do
         grep -qF -- "$refused" "$WORK/serve.log" ||
             check_failed "(1) serve's log does not name the refused unit [$refused]"
     done
