@@ -3313,7 +3313,6 @@ mod tests {
         }
     }
 
-<<<<<<< 473482087eeb00d72ae07b9ad749038a7392029b
     /// Objective 82, through the real store: the health's `backups` is
     /// null for each kind before any upload, then the newest record of each
     /// kind as `{at_ms, key, bytes}`, whatever other records lie between.
@@ -3356,7 +3355,9 @@ mod tests {
                        "bundle": {"at_ms": 2_000, "key": "bundles/full/b.tar.zst.gpg", "bytes": 50}}),
                 "the newest of each kind"
             );
-=======
+        });
+    }
+
     /// Objective 084, through the real store: `/api/core-lines`' answer
     /// with no ranges file, a broken one and one with ranges, read at each
     /// request.
@@ -3439,7 +3440,6 @@ mod tests {
                 Value::Null
             );
             let _ = std::fs::remove_dir_all(&dir);
->>>>>>> a924116f967f0496ea8c8200331c81122b4e5bce
         });
     }
 
