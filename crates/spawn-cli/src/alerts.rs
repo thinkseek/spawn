@@ -360,6 +360,43 @@ pub(crate) struct Settings {
     /// The two database logs, when named.
     pub(crate) test_log: Option<PathBuf>,
     pub(crate) live_log: Option<PathBuf>,
+    /// How often the databases' sizes are read (`database_size`).
+    pub(crate) database_ms: i64,
+    /// A database under this is never alerted, whatever its ratio.
+    pub(crate) database_floor_mb: u64,
+    /// A database over this many times the live log's bytes is alerted.
+    pub(crate) database_ratio: u64,
+    /// The gates' test database (`SPAWN_TEST_DATABASE_URL`) and the
+    /// engines' (`SPAWN_FLEET_TEST_DATABASE_URL`), when set.
+    pub(crate) test_databases: Vec<(&'static str, Url)>,
+}
+
+/// A database URL, which holds a password: never shown, not even by
+/// `Debug`.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Url(pub(crate) String);
+
+impl std::fmt::Debug for Url {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Url(..)")
+    }
+}
+
+/// The test databases the step reads, by role, from the environment: the
+/// gates' (`SPAWN_TEST_DATABASE_URL`, "test") first, then the engines'
+/// (`SPAWN_FLEET_TEST_DATABASE_URL`, "fleet_test"), each when set.
+pub(crate) fn test_database_urls() -> Vec<(&'static str, Url)> {
+    [
+        ("test", "SPAWN_TEST_DATABASE_URL"),
+        ("fleet_test", "SPAWN_FLEET_TEST_DATABASE_URL"),
+    ]
+    .into_iter()
+    .filter_map(|(role, name)| {
+        env_value(name)
+            .filter(|url| !url.trim().is_empty())
+            .map(|url| (role, Url(url)))
+    })
+    .collect()
 }
 
 /// A number from `SPAWN_ALERT_*`, its default when unset, or its default
@@ -420,6 +457,10 @@ impl Settings {
             window_ms: secs("SPAWN_ALERT_WINDOW_SECS", 86_400, &mut warnings),
             test_log: env_value("SPAWN_TEST_DATABASE_LOG").map(PathBuf::from),
             live_log: env_value("SPAWN_DATABASE_LOG").map(PathBuf::from),
+            database_ms: secs("SPAWN_ALERT_DATABASE_SECS", 600, &mut warnings),
+            database_floor_mb: number("SPAWN_ALERT_DATABASE_FLOOR_MB", 1024, &mut warnings),
+            database_ratio: number("SPAWN_ALERT_DATABASE_RATIO", 10, &mut warnings),
+            test_databases: test_database_urls(),
         };
         (settings, warnings)
     }
@@ -637,6 +678,8 @@ pub(crate) struct Monitor {
     /// When the supervisor's dispatch may be read again: at most once per
     /// `SPAWN_ALERT_CHECK_SECS`.
     supervisor_due_ms: i64,
+    /// When the databases' sizes are read next (`database_size`).
+    database_due_ms: i64,
 }
 
 /// What the supervisor has to dispatch, as one read of the attention view
@@ -749,6 +792,7 @@ impl Monitor {
             messages_since: 0,
             supervisor: None,
             supervisor_due_ms: 0,
+            database_due_ms: 0,
         }
     }
 
@@ -820,6 +864,10 @@ impl Monitor {
             self.read_defect_gates(store, now, &mut events, &mut lines);
             self.read_budgets(store, now, &mut events, &mut lines);
             self.read_idle(now, &mut events);
+            if now >= self.database_due_ms {
+                self.database_due_ms = now.saturating_add(self.settings.database_ms);
+                self.read_databases(store, now, &mut events, &mut lines);
+            }
         }
         self.bounds(now, &mut events);
         self.flush(store, now, &events, &mut lines);
