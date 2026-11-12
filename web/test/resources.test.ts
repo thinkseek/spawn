@@ -68,7 +68,7 @@ test("gate room: one row per gated mission, the waiting gates longest first", ()
 
 import { readFileSync } from "node:fs";
 
-import { normalizeStorage, storageSize, storageView } from "../src/resources.ts";
+import { backupAge, backupView, normalizeBackups, normalizeStorage, storageSize, storageView } from "../src/resources.ts";
 
 const MB = 1024 ** 2;
 const STORAGE = {
@@ -130,7 +130,8 @@ test("the health's storage is read as the server reports it, null from an older 
 
 test("the host section's Resources are followed by a Storage card drawn from storageView", () => {
   const strip = readFileSync(new URL("../src/components/fleet/HealthStrip.tsx", import.meta.url), "utf8");
-  assert.match(strip, /<Cell label="Storage"[^>]*>\s*<StorageCard storage=\{health\.storage\} \/>/);
+  assert.match(strip, /<Cell label="Storage"[^>]*>\s*<StorageCard storage=\{health\.storage\} backups=\{health\.backups\} \/>/);
+  assert.match(strip, /backupView\(backups, now\)/, "the card's backup rows are drawn from backupView");
   assert.match(strip, /const \{ rows, lasts \} = storageView\(storage\)/);
   assert.ok(strip.indexOf('label="Resources"') < strip.indexOf('label="Storage"'));
 });
@@ -212,4 +213,35 @@ test("fresh test databases (no schema) are no rows; a tiny log is not said", () 
   );
   const small = storageView({ ...TESTED, database: { ...TESTED.database, log_bytes: 0.06 * MB } }).rows;
   assert.equal(small[3].note, "largest: spawn_events 2.5 GB, log 0.1 MB");
+});
+
+test("backupView: the database copy then the bundle, with their ages and keys", () => {
+  const now = 100_000_000;
+  const backups = {
+    dump: { at_ms: now - 1_800_000, key: "postgres/hourly/a.dump.gpg", bytes: 9_400_000 },
+    bundle: { at_ms: now - 36_000_000, key: "bundles/incr/b.tar.zst.gpg", bytes: 5_000_000 },
+  };
+  assert.deepEqual(backupView(backups, now), [
+    { name: "Database copy", age_ms: 1_800_000, key: "postgres/hourly/a.dump.gpg" },
+    { name: "Transcripts and sources", age_ms: 36_000_000, key: "bundles/incr/b.tar.zst.gpg" },
+  ]);
+  assert.deepEqual(backupView({ ...backups, bundle: null }, now)[1], {
+    name: "Transcripts and sources",
+    age_ms: null,
+    key: null,
+  });
+  // An older server reports no backups: both rows have none.
+  assert.deepEqual(
+    backupView(undefined, now).map((row) => [row.name, row.age_ms, row.key]),
+    [
+      ["Database copy", null, null],
+      ["Transcripts and sources", null, null],
+    ],
+  );
+  assert.equal(normalizeBackups(undefined), null);
+  assert.deepEqual(normalizeBackups({ dump: { at_ms: "soon" }, bundle: null }), { dump: null, bundle: null });
+  assert.equal(backupAge(1_800_000 + 12_000), "30 min");
+  assert.equal(backupAge(36_000_000), "10 h");
+  assert.equal(backupAge(3 * 86_400_000), "3 d");
+  assert.equal(backupAge(null), "no backup yet");
 });
