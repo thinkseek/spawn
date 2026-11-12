@@ -73,6 +73,47 @@ fn the_backup_records_are_accepted_and_any_other_type_refused() {
     );
 }
 
+/// Objective 093: a drill's last pass is the newest record of its type
+/// with `ok` true, a failed drill after it left aside; none without one,
+/// and the dashboard's read-only login reads it.
+#[test]
+fn a_drills_last_pass_is_its_newest_record_with_ok_true() {
+    let (store, schema) = store("backup_drill_pass");
+    let mut client = admin(&schema);
+    assert_eq!(
+        store.newest_passed_record("backup.verified").expect("read"),
+        None
+    );
+    let drill = |ok: bool| json!({"type": "backup.verified", "ok": ok, "reason": ""});
+    store.backup_record(&drill(true)).expect("a first pass");
+    let passed = store.backup_record(&drill(true)).expect("a second pass");
+    store.backup_record(&drill(false)).expect("a failure after");
+    let at: i64 = client
+        .query_one(
+            "select recorded_at_ms from spawn_events where id = $1",
+            &[&passed],
+        )
+        .expect("read the pass")
+        .get(0);
+    assert_eq!(
+        store.newest_passed_record("backup.verified").expect("read"),
+        Some(at)
+    );
+    assert_eq!(
+        store.newest_passed_record("backup.dumped").expect("read"),
+        None,
+        "another type has no pass"
+    );
+    let login = role_url(&schema_url(&schema), "spawn_reader").expect("the reader's URL");
+    let reader = PostgresStore::connect(&login).expect("log in");
+    assert_eq!(
+        reader
+            .newest_passed_record("backup.verified")
+            .expect("the reader reads it"),
+        Some(at)
+    );
+}
+
 /// Only the owner writes them: the supervisor's login reads the log through
 /// its own paths and may not record a backup.
 #[test]

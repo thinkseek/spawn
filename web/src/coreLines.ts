@@ -50,12 +50,31 @@ export interface CoreLine {
   guardrails: CoreFigure[];
 }
 
+/** One row of the recovery table (objective 093): its drill's source
+ * ("record <type>", "unit <name>", or null: no drill) and its last pass. */
+export interface CoreDrill {
+  name: string;
+  source: string | null;
+  passed_at_ms: number | null;
+}
+
 /** `GET /api/core-lines`. */
 export interface CoreLinesAnswer {
   lines: CoreLine[];
   ranges_file: string | null;
   ranges_error: string | null;
   ignored_ranges: Array<{ key: string; reason: string }>;
+  /** The Core lines file's recoverability rows, in its order. */
+  drills?: CoreDrill[];
+}
+
+/** A drill on the card, under the recoverability row. */
+export interface CoreDrillMark {
+  name: string;
+  /** "passed MM-DD HH:MM (<span> ago)", "never passed" or "no drill". */
+  text: string;
+  /** "plain" passed within 7 days, "warning" not, "muted" no drill. */
+  tone: "plain" | "warning" | "muted";
 }
 
 /** A figure on the card: its words and its tone. */
@@ -85,6 +104,25 @@ export interface CoreLinesView {
    * build does not have, "<name>: range not read (it needs a number min or
    * max)" for one without a bound. */
   pending: string[];
+  /** The recovery table's rows, each with its last pass (objective 093). */
+  drills: CoreDrillMark[];
+}
+
+const WEEK_MS = 7 * 86_400_000;
+
+/** A drill row in words at `now`: its last pass and how long ago, "never
+ * passed" with a drill and no pass, "no drill" without one. */
+export function drillMark(raw: Partial<CoreDrill> | null | undefined, now: number): CoreDrillMark {
+  const name = typeof raw?.name === "string" ? raw.name : "";
+  const source = typeof raw?.source === "string" && raw.source !== "" ? raw.source : null;
+  const passed = finite(raw?.passed_at_ms);
+  if (source === null) return { name, text: "no drill", tone: "muted" };
+  if (passed === null) return { name, text: "never passed", tone: "warning" };
+  return {
+    name,
+    text: `passed ${sinceWords(passed)} (${spanWords(Math.max(0, now - passed))} ago)`,
+    tone: now - passed <= WEEK_MS ? "plain" : "warning",
+  };
 }
 
 const LINE_NAMES: Record<string, string> = {
@@ -199,7 +237,7 @@ function pendingWords(entry: { key?: unknown; reason?: unknown } | null | undefi
 }
 
 /** The card's words for an answer of `GET /api/core-lines`. */
-export function coreLinesView(answer: Partial<CoreLinesAnswer> | null | undefined): CoreLinesView {
+export function coreLinesView(answer: Partial<CoreLinesAnswer> | null | undefined, now: number = Date.now()): CoreLinesView {
   const lines = Array.isArray(answer?.lines) ? answer.lines : [];
   const error = typeof answer?.ranges_error === "string" && answer.ranges_error !== "" ? answer.ranges_error : null;
   const ignored = Array.isArray(answer?.ignored_ranges) ? answer.ignored_ranges : [];
@@ -219,6 +257,7 @@ export function coreLinesView(answer: Partial<CoreLinesAnswer> | null | undefine
     notice: error === null ? null : `ranges file unreadable: ${error}`,
     ignored: ignored.map((entry) => `${entry?.key}: ${entry?.reason}`),
     pending: ignored.map((entry) => pendingWords(entry, names)),
+    drills: (Array.isArray(answer?.drills) ? answer.drills : []).map((drill) => drillMark(drill, now)),
   };
 }
 
