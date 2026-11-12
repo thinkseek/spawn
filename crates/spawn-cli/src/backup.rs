@@ -94,6 +94,7 @@ use crate::Flags;
 use crate::config::{env_or, env_value, open_store, workspace_root};
 
 mod restore_drill;
+mod store;
 
 /// The default limits, in decimal megabytes (1,000,000 bytes each): R2's
 /// free tier is 10 GB-month of storage, and the owner's alert is at 8 GB.
@@ -103,7 +104,7 @@ const DEFAULT_ALERT_MB: u64 = 8_000;
 /// A byte count per `SPAWN_BACKUP_R2_*` megabyte.
 const MB: u64 = 1_000_000;
 
-const USAGE: &str = "usage: spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep]";
+const USAGE: &str = "usage: spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep]\n       spawn backup store put|get|list|verify --area transcripts|sessions ...";
 
 /// One `postgres://` URL, read the way libpq reads it (scripts/pg-url.sh):
 /// user and password percent-decoded, an IPv6 host in brackets, a socket
@@ -863,6 +864,9 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
         return Err(USAGE.to_string());
     };
     let rest: Vec<String> = arguments[1..].to_vec();
+    if verb == "store" {
+        return store::command(&rest);
+    }
     let switches: &[&str] = if verb == "restore-drill" {
         &["keep"]
     } else {
@@ -1198,6 +1202,18 @@ fn count_events(settings: &Settings, scratch: &Scratch, dump: &Path) -> Result<(
 /// gpg: AES256, no compression (the archive is compressed), the passphrase
 /// from its file.
 fn gpg(settings: &Settings, decrypting: bool, input: &Path, out: &Path) -> Result<(), String> {
+    gpg_with(settings, decrypting, "none", input, out)
+}
+
+/// gpg with the backup key; `compress` is its --compress-algo when it
+/// encrypts (the dumps and bundles are compressed before: `none`).
+fn gpg_with(
+    settings: &Settings,
+    decrypting: bool,
+    compress: &str,
+    input: &Path,
+    out: &Path,
+) -> Result<(), String> {
     let mut command = Command::new("gpg");
     command
         .args([
@@ -1220,7 +1236,7 @@ fn gpg(settings: &Settings, decrypting: bool, input: &Path, out: &Path) -> Resul
                 "--cipher-algo",
                 "AES256",
                 "--compress-algo",
-                "none",
+                compress,
             ])
             .arg("--output")
             .arg(out)
@@ -1239,6 +1255,12 @@ fn encrypt(settings: &Settings, input: &Path, out: &Path) -> Result<(), String> 
 
 fn decrypt(settings: &Settings, input: &Path, out: &Path) -> Result<(), String> {
     gpg(settings, true, input, out)
+}
+
+/// A store object sealed: compressed (zlib) and encrypted with the backup
+/// key, as one gpg step (`spawn backup store`).
+fn seal(settings: &Settings, input: &Path, out: &Path) -> Result<(), String> {
+    gpg_with(settings, false, "zlib", input, out)
 }
 
 /// One exchange with the bucket. `options` is curl config (headers, the
@@ -1483,6 +1505,82 @@ header = \"x-amz-meta-sha256: {}\"\nheader = \"x-amz-meta-spawn-events: {}\"\n",
         ));
     }
     Ok(())
+}
+
+/// Write `file` at `key` only when no object is there (`If-None-Match: *`:
+/// the bucket answers 412 to a key that exists), with the plaintext's
+/// `sha256` as metadata (`spawn backup store`). Never an overwrite.
+fn put_new_object(
+    settings: &Settings,
+    key: &str,
+    file: &Path,
+    sha256: &str,
+) -> Result<store::Put, String> {
+    let options = format!(
+        "upload-file = \"{}\"\nheader = \"Content-Type: application/octet-stream\"\n\
+header = \"If-None-Match: *\"\nheader = \"x-amz-meta-sha256: {}\"\n",
+        escape_config(&file.display().to_string()),
+        sha256
+    );
+    let response = bucket_request(settings, &settings.r2.url(key), &options)?;
+    match response.status {
+        200 => Ok(store::Put::Written),
+        412 => Ok(store::Put::Existed),
+        status => Err(format!(
+            "PUT {key} answered {status}: {}",
+            first_line(&String::from_utf8_lossy(&response.body))
+        )),
+    }
+}
+
+/// An object's length, ETag (lower case, unquoted) and sha256 metadata, as
+/// HEAD reads them; `None` when there is no such key.
+fn head_object(settings: &Settings, key: &str) -> Result<Option<store::Head>, String> {
+    let response = bucket_request(settings, &settings.r2.url(key), "head\n")?;
+    match response.status {
+        200 => Ok(Some(store::Head {
+            length: header_value(&response.headers, "content-length")
+                .and_then(|text| text.parse().ok())
+                .unwrap_or(0),
+            etag: header_value(&response.headers, "etag")
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_ascii_lowercase(),
+            sha256: header_value(&response.headers, "x-amz-meta-sha256").unwrap_or_default(),
+        })),
+        404 => Ok(None),
+        status => Err(format!("HEAD {key} answered {status}")),
+    }
+}
+
+/// Every key under `prefix`, with its size (every listing page).
+fn list_prefix(settings: &Settings, prefix: &str) -> Result<Vec<(String, u64)>, String> {
+    let mut keys = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..100_000 {
+        let mut query = format!(
+            "?list-type=2&max-keys=1000&prefix={}",
+            percent_encode(prefix)
+        );
+        if let Some(token) = &token {
+            let _ = write!(query, "&continuation-token={}", percent_encode(token));
+        }
+        let response = bucket_request(settings, &settings.r2.url(&query), "")?;
+        if response.status != 200 {
+            return Err(format!(
+                "ListObjectsV2 {prefix} answered {}: {}",
+                response.status,
+                first_line(&String::from_utf8_lossy(&response.body))
+            ));
+        }
+        let (page, next) = parse_listing(&String::from_utf8_lossy(&response.body));
+        keys.extend(page.into_iter().filter(|(key, _)| key.starts_with(prefix)));
+        match next {
+            Some(next) => token = Some(next),
+            None => return Ok(keys),
+        }
+    }
+    Err("ListObjectsV2 did not end".to_string())
 }
 
 /// `spawn backup dump`'s body is above; `bundle` and `verify` follow.
