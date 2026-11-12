@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     Bucket, Entry, Head, Keys, Listed, Plan, Put, Source, Store, Verified, hmac_sha256, may_write,
-    plan, random_hex, ranges, restore, sources,
+    plan, random_hex, ranges, restore, sources, store_r2,
 };
 use crate::backup::{hex, md5_hex};
 
@@ -179,11 +179,26 @@ fn a_file_is_sent_whole_grown_or_not_at_all() {
 
 #[test]
 fn it_writes_only_under_locktest_until_switched_on() {
-    assert!(may_write("locktest/store-test-1/", None).is_ok());
-    assert!(may_write("", None).unwrap_err().contains("switched off"));
-    assert!(may_write("sessions/", None).is_err());
-    assert!(may_write("sessions/", Some("0")).is_err());
-    assert!(may_write("", Some("1")).is_ok());
+    // Made-up names: the real ones are values of the credential.
+    let work = "made-up-work";
+    assert!(may_write("locktest/store-test-1/", work, None).is_ok());
+    assert!(may_write("probe/store-test-1/", work, None).is_ok());
+    assert!(
+        may_write("", work, None)
+            .unwrap_err()
+            .contains("switched off")
+    );
+    assert!(may_write("sessions/", work, None).is_err());
+    assert!(may_write("sessions/", work, Some("0")).is_err());
+    assert!(may_write("", "made-up-keep", Some("1")).is_ok());
+    // A test object never goes to the keep bucket, nor to any bucket not
+    // named as the work one: fail closed.
+    for bucket in ["made-up-keep", "made-up-store", "made-up", "made-up-work-keep", ""] {
+        let error = may_write("locktest/store-test-1/", bucket, None).unwrap_err();
+        assert!(error.contains("never the keep bucket"), "{bucket}: {error}");
+        assert!(bucket.is_empty() || !error.contains(bucket), "{error}");
+        assert!(may_write("probe/x/", bucket, Some("0")).is_err());
+    }
 }
 
 /// Counted, not timed: what each run writes, and that what comes back is
@@ -578,4 +593,49 @@ fn a_multipart_etag_is_refused() {
     assert!(error.contains("not one PUT's MD5"), "{error}");
     fs::remove_dir_all(&dir).expect("clean up");
     fs::remove_dir_all(&work).expect("clean up");
+}
+
+/// The store's credential (lead-mac 01:41): its four keys, the bucket one
+/// it lists, mode 600; what it refuses names the key, never a value.
+#[test]
+fn the_store_credential_gives_a_listed_bucket_and_never_says_a_value() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("credential");
+    let file = dir.join("r2-store.env");
+    let write = |text: &str, mode: u32| {
+        fs::write(&file, text).expect("credential");
+        fs::set_permissions(&file, fs::Permissions::from_mode(mode)).expect("mode");
+    };
+    let full = "R2_ENDPOINT=https://made-up.example\nR2_ACCESS_KEY_ID=made-up-id\n\
+R2_SECRET_ACCESS_KEY=made-up-secret\nR2_BUCKETS=b-store,b-keep,b-work\n";
+    write(full, 0o600);
+    let r2 = store_r2(&file, Some("b-work")).expect("a listed bucket");
+    assert_eq!(
+        (r2.endpoint.as_str(), r2.bucket.as_str(), r2.access_key.as_str(), r2.secret_key.as_str()),
+        ("https://made-up.example", "b-work", "made-up-id", "made-up-secret")
+    );
+    let refusals = [
+        store_r2(&file, Some("b-other")).unwrap_err(),
+        store_r2(&file, None).unwrap_err(),
+        store_r2(&file, Some(" ")).unwrap_err(),
+        {
+            write(&full.replace("R2_SECRET_ACCESS_KEY=made-up-secret\n", ""), 0o600);
+            store_r2(&file, Some("b-work")).unwrap_err()
+        },
+        {
+            write(full, 0o644);
+            store_r2(&file, Some("b-work")).unwrap_err()
+        },
+    ];
+    assert!(refusals[0].contains("does not list"), "{}", refusals[0]);
+    assert!(refusals[1].contains("SPAWN_STORE_BUCKET is required"));
+    assert!(refusals[2].contains("SPAWN_STORE_BUCKET is required"));
+    assert!(refusals[3].contains("R2_SECRET_ACCESS_KEY is not set"), "{}", refusals[3]);
+    assert!(refusals[4].contains("must be 600"), "{}", refusals[4]);
+    for refusal in &refusals {
+        for value in ["made-up.example", "made-up-id", "made-up-secret", "b-store", "b-keep", "b-other"] {
+            assert!(!refusal.contains(value), "{value} in {refusal}");
+        }
+    }
+    fs::remove_dir_all(&dir).expect("clean up");
 }

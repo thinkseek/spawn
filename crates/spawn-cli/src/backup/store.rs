@@ -45,9 +45,35 @@
 //! given through descriptors: no parent is followed through a symlink and
 //! the file is created exclusively, never over anything (cc-astra A29).
 //!
+//! Its bucket and credentials are the fleet's store credential,
+//! `~/.config/spawn/r2-store.env` (`SPAWN_STORE_ENV_FILE`; mode 600; keys
+//! `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` and
+//! `R2_BUCKETS`, a comma list), read as backup.rs reads r2.env: parsed,
+//! never sourced, the keys only to curl on stdin, no value ever printed. The
+//! bucket is `SPAWN_STORE_BUCKET`, which must be one `R2_BUCKETS` lists;
+//! there is no default. For example (placeholders):
+//!
+//! ```text
+//! R2_ENDPOINT=https://<account>.r2.cloudflarestorage.com
+//! R2_BUCKETS=<name>-store,<name>-keep,<name>-work
+//! SPAWN_STORE_BUCKET=<name>-work SPAWN_BACKUP_PREFIX=locktest/<run>/ spawn store put ...
+//! ```
+//!
 //! It ships switched off: until `SPAWN_STORE_ENABLED=1`, `put` writes only
-//! under a `locktest/` prefix (`SPAWN_BACKUP_PREFIX`), the throwaway prefix
-//! of the existing bucket. Originals are never moved or removed.
+//! a test object, under a `locktest/` or `probe/` prefix
+//! (`SPAWN_BACKUP_PREFIX`), and only in a bucket whose name ends in `-work`.
+//! Anything written to the keep bucket is there for good (its lock has no
+//! end), so a test is never let near it: the rule takes the work bucket by
+//! its name, never by elimination, and any other bucket (the keep bucket,
+//! the old store bucket, one of a name it does not know) is refused before
+//! anything is read or sent. Originals are never moved or removed.
+//!
+//! Every listing is under `<prefix><area>/` (an area's manifests, its
+//! segments), so an object outside it is never read or counted: the keep
+//! bucket's permanent `probe/` lock-check object is not in `verify`'s
+//! "not named" count, and that count (older versions', a failed run's
+//! objects) never fails `verify` anyway; only a missing or changed object
+//! does.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -63,7 +89,8 @@ use crate::config::env_value;
 
 const USAGE: &str = "usage: spawn store put --area transcripts|sessions [--from <dir>] [--root <dir>]\n       \
 spawn store get --area <area> --path <file> --into <dir> [--root <dir>]\n       \
-spawn store list|verify --area <area> [--root <dir>]";
+spawn store list|verify --area <area> [--root <dir>]\n\
+the bucket: SPAWN_STORE_BUCKET, one R2_BUCKETS lists in ~/.config/spawn/r2-store.env (SPAWN_STORE_ENV_FILE)";
 
 /// The largest segment: a file that grew by more is cut into several.
 const SEGMENT_MAX: u64 = 64 * 1024 * 1024;
@@ -266,22 +293,74 @@ impl Keys {
     }
 }
 
-/// Whether a run may write under `prefix`: anywhere once
-/// `SPAWN_STORE_ENABLED=1` (the owner's buckets and token exist), else only
-/// under `locktest/`.
-pub(crate) fn may_write(prefix: &str, enabled: Option<&str>) -> Result<(), String> {
-    if enabled == Some("1") || prefix.starts_with("locktest/") {
+/// Whether a run may write under `prefix` in `bucket`: anywhere once
+/// `SPAWN_STORE_ENABLED=1` (the lead switches it on), else only a test
+/// object: under `locktest/` or `probe/`, in a bucket whose name ends in
+/// `-work` (fail closed: the keep bucket, whose objects are there for good,
+/// is never a test's, nor is any bucket not named as the work one). The
+/// bucket's name is never in the message (it is a value of the credential).
+pub(crate) fn may_write(prefix: &str, bucket: &str, enabled: Option<&str>) -> Result<(), String> {
+    if enabled == Some("1") {
         return Ok(());
     }
-    Err(format!(
-        "refused: the store is switched off (SPAWN_STORE_ENABLED is not 1), so it writes only \
-under a locktest/ prefix (SPAWN_BACKUP_PREFIX), not under {:?}",
-        if prefix.is_empty() {
-            "the bucket's root"
-        } else {
-            prefix
-        }
-    ))
+    if !(prefix.starts_with("locktest/") || prefix.starts_with("probe/")) {
+        return Err(format!(
+            "refused: the store is switched off (SPAWN_STORE_ENABLED is not 1), so it writes only \
+under a locktest/ or probe/ prefix (SPAWN_BACKUP_PREFIX), not under {:?}",
+            if prefix.is_empty() {
+                "the bucket's root"
+            } else {
+                prefix
+            }
+        ));
+    }
+    if !bucket.ends_with("-work") {
+        return Err(
+            "refused: the store is switched off, so a test object goes only to the work bucket \
+(a name ending in -work), never the keep bucket, whose objects are there for good; \
+SPAWN_STORE_BUCKET names another"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The store's bucket and credentials, from the store credential `file`
+/// (`R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKETS`)
+/// and `bucket` (`SPAWN_STORE_BUCKET`), which must be one `R2_BUCKETS`
+/// lists. A missing key or a bucket not listed refuses, naming the key or
+/// the setting, never a value.
+pub(crate) fn store_r2(file: &Path, bucket: Option<&str>) -> Result<super::R2, String> {
+    super::private_file(file, "the store credential")?;
+    let vars = super::parse_env_file(
+        &fs::read_to_string(file)
+            .map_err(|error| format!("the store credential {}: {error}", file.display()))?,
+    );
+    let needed = |name: &str| -> Result<String, String> {
+        vars.get(name)
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .ok_or_else(|| format!("{name} is not set in {}", file.display()))
+    };
+    let bucket = bucket
+        .map(str::trim)
+        .filter(|bucket| !bucket.is_empty())
+        .ok_or("SPAWN_STORE_BUCKET is required: the bucket the store reads and writes")?;
+    if !needed("R2_BUCKETS")?
+        .split(',')
+        .any(|listed| listed.trim() == bucket)
+    {
+        return Err(format!(
+            "SPAWN_STORE_BUCKET names a bucket R2_BUCKETS in {} does not list",
+            file.display()
+        ));
+    }
+    Ok(super::R2 {
+        endpoint: needed("R2_ENDPOINT")?,
+        bucket: bucket.to_string(),
+        access_key: needed("R2_ACCESS_KEY_ID")?,
+        secret_key: needed("R2_SECRET_ACCESS_KEY")?,
+    })
 }
 
 /// A file of an area: its path in the manifest and on disk.
@@ -836,7 +915,13 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
             "unknown area {area} (transcripts or sessions)\n{USAGE}"
         ));
     }
-    let settings = Settings::from_env(&flags)?;
+    let mut settings = Settings::from_env(&flags)?;
+    // The store's own bucket and credential, never r2.env's.
+    let credential = env_value("SPAWN_STORE_ENV_FILE").map_or_else(
+        || super::home().join(".config/spawn/r2-store.env"),
+        PathBuf::from,
+    );
+    settings.r2 = store_r2(&credential, env_value("SPAWN_STORE_BUCKET").as_deref())?;
     let scratch = Scratch::new("store")?;
     let keys = Keys {
         prefix: settings.prefix.clone(),
@@ -905,6 +990,7 @@ fn put_verb(
 ) -> Result<i32, String> {
     may_write(
         &settings.prefix,
+        &settings.r2.bucket,
         env_value("SPAWN_STORE_ENABLED").as_deref(),
     )?;
     let _lock = Lock::acquire(&settings.root)?;
