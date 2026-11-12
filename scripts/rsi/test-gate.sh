@@ -2986,6 +2986,35 @@ EOF
         "$(export "$pg_var=$pg_source" SPAWN_GATE_JOBS=4 XDG_CACHE_HOME="$work/caches/own-iso-$kind" TMPDIR="$pgtmp"
            judge "$good" "" "$iso")" \
         'exit=0 {"verdict":"rejected","reason":"regression: 105.sh fails on the candidate"}'
+    refuse "$kind: one exit 1 and no pass gets no run alone (D2)" "$(cat "$work/gate.out")" \
+        'regression: 105.sh must still pass (alone)'
+    # Two exit 1s at load, the second seeing what the first left on the
+    # candidate phase's server, and a pass alone on a fresh server of its
+    # own, as the base's runs: load-sensitive, cannot judge, never
+    # accepted (design-gate-like-for-like.md R2: like for like on the
+    # server too).
+    cat >"$iso/106.sh" <<EOF
+#!/bin/sh
+$q_function
+[ "\$(q 'select 1')" = 1 ] || exit 2
+[ "\$(cat value)" = one ] && exit 0
+[ "\$(q "select to_regclass('public.left_by_106') is null")" = t ] || { echo "106: FAIL: a table left"; exit 1; }
+# A server no earlier run of the candidate used: passes.
+[ -e ran.106 ] && exit 0
+: >ran.106
+q 'create table left_by_106 (x int)'
+echo "106: FAIL: too slow"
+exit 1
+EOF
+    rm -f "$iso/105.sh"
+    expect "$kind: two exit 1s at load and a pass alone on a server of its own: load-sensitive, cannot judge" \
+        "$(export "$pg_var=$pg_source" SPAWN_GATE_JOBS=4 XDG_CACHE_HOME="$work/caches/own-iso-$kind" TMPDIR="$pgtmp"
+           judge "$good" "" "$iso")" \
+        'exit=6 {"cannot_judge":true,"scenario":"106.sh","runs":"1, then 1 at 4 at a time, then 0 alone on the candidate; 0, then 0 on the base, run now","reason":"load-sensitive on the candidate:'
+    expect "$kind: its run alone had a server of its own" "$(cat "$work/gate.out")" \
+        "| test database: a server of its own for the candidate's run alone, up in "
+    refuse "$kind: no server is left after the run alone" "$(left)" 'bwrap'
+    rm -f "$iso/106.sh"
     # A server that does not start is the host's, not a verdict on the
     # candidate: exit 6, `test server`, with its evidence and which start,
     # quoting the server's FATAL line; either start (SPAWN_GATE_TEST_PG_FAIL
@@ -4171,6 +4200,7 @@ echo "$2 run \$n in \$(basename "\$PWD") at \$(date +%s%N)"
 case "\$(printf '%s' "\$schedule" | cut -c"\$n")" in
 F) echo "$2: FAIL: too slow"; exit 1 ;;
 H) echo "$2: harness: no answer"; exit 2 ;;
+S) sleep 3; echo "$2: slow pass" ;;
 esac
 exit 0
 EOF
@@ -4381,6 +4411,80 @@ expect "2, then 0, then 1 on the candidate, a clean base: harness on the candida
     "$(class_judge harnessvote "$good")" \
     'exit=6 {"cannot_judge":true,"scenario":"763.sh","runs":"2, then 0, then 1 on the candidate; 0, then 0 on the base, run now","reason":"harness on the candidate:'
 refuse "not a candidate failure" "$(cat "$work/gate.out")" '763.sh fails on the candidate'
+
+# Like for like before a rejection (design-gate-like-for-like.md, R2): two
+# exit 1s at load (SPAWN_GATE_JOBS 4) run once more on the candidate alone,
+# on a fresh server, as the base's runs did. The candidate's third run is
+# that run alone (index 3 of its schedule).
+alone_stage() { # <scenario number>: its candidate stage lines, loaded and alone
+    printf 'loaded=%s alone=%s.' \
+        "$(grep -cE "^\| stage gate exit [0-9]+ [0-9]+ms regression: $1\.sh must still pass( \(again\)| \(a third run\))?\$" "$work/gate.out")" \
+        "$(grep -cE "^\| stage gate exit [0-9]+ [0-9]+ms regression: $1\.sh must still pass \(alone\)\$" "$work/gate.out")"
+}
+class_jobs=4
+# 764: 1, then 1 at load, 0 alone, the base 0, then 0: load-sensitive,
+# cannot judge, never accepted (D1).
+class_dir loadsens
+scheduled loadsens 764 PPP FFP
+expect "1, then 1 at 4 at a time and 0 alone on the candidate, a clean base: load-sensitive, cannot judge" \
+    "$(class_judge loadsens "$good")" \
+    'exit=6 {"cannot_judge":true,"scenario":"764.sh","runs":"1, then 1 at 4 at a time, then 0 alone on the candidate; 0, then 0 on the base, run now","reason":"load-sensitive on the candidate: fails at 4 at a time (1, then 1), passes alone (0) as the base does (0, then 0): no verdict","load_sensitive":[{"scenario":"764.sh","runs":"1, then 1 at 4 at a time; 0 alone","base":"0, then 0 alone","solo_ms":'
+expect "the log line the integrator quotes" "$(cat "$work/gate.out")" \
+    "| 764.sh: load-sensitive: fails at 4 at a time (1, then 1), passes alone (0) as the base does (0, then 0): not this candidate's failure; root fix wanted"
+expect "and the cause" "$(cat "$work/gate.out")" \
+    '| 764: cannot judge: load-sensitive on the candidate: fails at 4 at a time (1, then 1), passes alone (0) as the base does (0, then 0): no verdict'
+expect "two stage lines at load and one alone" "$(alone_stage 764)" 'loaded=2 alone=1.'
+refuse "never accepted" "$(cat "$work/gate.out")" '"verdict":"accepted"'
+# 765: 1, then 1 at load, 1 alone: the candidate failure stands.
+class_dir loadfail
+scheduled loadfail 765 PPP FFF
+expect "1, then 1 at load and 1 alone: rejected" \
+    "$(class_judge loadfail "$good")" 'exit=0 {"verdict":"rejected","reason":"regression: 765.sh fails on the candidate"}'
+expect "as a candidate failure, alone too" "$(cat "$work/gate.out")" \
+    '| 765.sh fails on the candidate (1, then 1 at 4 at a time, then 1 alone) and passes on the base, run now (0, then 0): candidate failure, alone too'
+expect "with its stage line alone" "$(alone_stage 765)" 'loaded=2 alone=1.'
+# 765b: 1, then 0, then 1 at load (two votes of three), 1 alone: rejected.
+class_dir loadthird
+scheduled loadthird 771 PPP FPFF
+expect "1, then 0, then 1 at load and 1 alone: rejected" \
+    "$(class_judge loadthird "$good")" 'exit=0 {"verdict":"rejected","reason":"regression: 771.sh fails on the candidate"}'
+expect "three runs at load and one alone" "$(alone_stage 771)" 'loaded=3 alone=1.'
+# 766: 1, then 1 at load, 2 alone: the harness's, cannot judge.
+class_dir loadharness
+scheduled loadharness 766 PPP FFH
+expect "1, then 1 at load and 2 alone: harness on the candidate (solo), cannot judge" \
+    "$(class_judge loadharness "$good")" \
+    'exit=6 {"cannot_judge":true,"scenario":"766.sh","runs":"1, then 1 at 4 at a time, then 2 alone on the candidate; 0, then 0 on the base, run now","reason":"harness on the candidate (solo):'
+# 767b (769): on the serial list, its runs were alone already: no run alone.
+class_dir loadserial
+scheduled loadserial 769 PPP FF
+printf '769.sh\n' >"$classes/loadserial/serial"
+expect "1, then 1 on the serial list at 4 at a time: rejected with no run alone" \
+    "$(class_judge loadserial "$good")" 'exit=0 {"verdict":"rejected","reason":"regression: 769.sh fails on the candidate"}'
+expect "two stage lines, none alone" "$(alone_stage 769)" 'loaded=2 alone=0.'
+# 768: 1, then 1 at load, 0 alone but slower than the base by twice and the
+# slack (SPAWN_GATE_SOLO_SLOW_MS 1000 here, 15 s on a host): rejected.
+class_dir loadslow
+scheduled loadslow 768 PPP FFS
+expect "1, then 1 at load, 0 alone but slow: rejected, slower alone" \
+    "$(class_judge loadslow "$good" SPAWN_GATE_SOLO_SLOW_MS=1000)" \
+    'exit=0 {"verdict":"rejected","reason":"regression: 768.sh fails on the candidate: slower alone than the base (alone '
+expect "with its stage line alone" "$(alone_stage 768)" 'loaded=2 alone=1.'
+# D2: one exit 1 and no pass (1, then 2) at load gets no run alone: a
+# candidate that fouls its own server is shown by it (759, 760, 105).
+class_dir loadonevote
+scheduled loadonevote 770 PPP FH
+expect "1, then 2 at 4 at a time: rejected with no run alone" \
+    "$(class_judge loadonevote "$good")" 'exit=0 {"verdict":"rejected","reason":"regression: 770.sh fails on the candidate"}'
+expect "no stage line alone" "$(alone_stage 770)" 'loaded=2 alone=0.'
+class_jobs=1
+# 767: 1, then 1 at SPAWN_GATE_JOBS 1: like for like already, no run alone
+# (757 above, pinned here by its stage lines).
+class_dir loadjobsone
+scheduled loadjobsone 767 PPP FF
+expect "1, then 1 one at a time: rejected with no run alone" \
+    "$(class_judge loadjobsone "$good")" 'exit=0 {"verdict":"rejected","reason":"regression: 767.sh fails on the candidate"}'
+expect "two stage lines, none alone" "$(alone_stage 767)" 'loaded=2 alone=0.'
 
 # A base run that exits neither 0 nor 1 is the harness's: infrastructure.
 class_dir harness
