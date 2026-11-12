@@ -1407,7 +1407,7 @@ fn write_pid_file(root: &Path) {
 }
 
 /// A pid file's pid and start time.
-fn read_pid_file(text: &str) -> Option<(u32, u64)> {
+pub(crate) fn read_pid_file(text: &str) -> Option<(u32, u64)> {
     let mut words = text.split_whitespace();
     let pid = words.next()?.parse().ok()?;
     let ticks = words.next()?.parse().ok()?;
@@ -1416,7 +1416,7 @@ fn read_pid_file(text: &str) -> Option<(u32, u64)> {
 
 /// Whether the process `pid` that started at `ticks` still runs: not gone,
 /// not a zombie, and not another process under a pid used again.
-fn still_runs(pid: u32, ticks: u64) -> bool {
+pub(crate) fn still_runs(pid: u32, ticks: u64) -> bool {
     warm::start_ticks(pid) == Some(ticks) && !warm::exited_unreaped(pid)
 }
 
