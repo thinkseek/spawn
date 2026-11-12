@@ -270,9 +270,13 @@ for name in $reviewed; do
     # schema (pg_toast aside: the schema's own tables' TOAST lives there)
     # before and after the drop, and rolls back when the count moved:
     # `skipped <name> dependents-outside`, kept whole. The name goes in as a
-    # setting (psql quotes it) and to DROP through format('%I').
+    # setting (psql quotes it) and to DROP through format('%I'). REPEATABLE
+    # READ: both counts read one snapshot (plus this transaction's own drop),
+    # so another session's DDL meanwhile (ccd's tests make and drop tables
+    # all the time) neither fakes a skip nor hides a real cascade by netting
+    # it out (rev-e's F3).
     if drop_err=$(PGOPTIONS=$pgoptions_drop psql -X -q -v ON_ERROR_STOP=1 -v dn_name="$name" 2>&1 >/dev/null <<'SQL'
-begin;
+begin isolation level repeatable read;
 set local lock_timeout = '10s';
 select set_config('sweep.name', :'dn_name', true);
 do $sweep$
