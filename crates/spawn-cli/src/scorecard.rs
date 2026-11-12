@@ -392,6 +392,7 @@ fn parts_of(name: &str, field: &dyn Fn(&str) -> Value) -> String {
             show(&field("open_hours"))
         ),
         "first_pass" => format!("first pass {}", show(&field("first_pass"))),
+        "report_to_live" => format!("not live yet {}", show(&field("not_live"))),
         "rework" => format!(
             "send-backs {}: {}",
             show(&field("send_backs")),
@@ -473,7 +474,7 @@ fn line(name: &str, dimension: &Value, min_n: &Value) -> String {
     let field = |key: &str| dimension.get(key).cloned().unwrap_or(Value::Null);
     let enough = field("enough").as_bool().unwrap_or(false);
     let n = show(&field("n"));
-    let as_ms = matches!(name, "lead_time" | "gate_time");
+    let as_ms = matches!(name, "lead_time" | "gate_time" | "report_to_live");
     let shown = |value: &Value| if as_ms { ms(value) } else { show(value) };
     let value = if enough && !field("value").is_null() {
         match name {
@@ -489,6 +490,11 @@ fn line(name: &str, dimension: &Value, min_n: &Value) -> String {
             "reliability" => format!("{} failures per landing, n {n}", show(&field("value"))),
             "cost" => format!("{} tokens per landing, n {n}", show(&field("value"))),
             "gate_time" => format!("median {} over {n} runs", ms(&field("value"))),
+            "report_to_live" => format!(
+                "median {}, p90 {}, n {n} live",
+                ms(&field("value")),
+                ms(&field("p90"))
+            ),
             _ => show(&field("value")),
         }
     } else {
@@ -608,6 +614,7 @@ pub(crate) fn text(card: &Value) -> String {
             "reliability",
             "cost",
             "gate_time",
+            "report_to_live",
         ] {
             if let Some(dimension) = scope.pointer(&format!("/dimensions/{name}")) {
                 out.push_str(&line(name, dimension, &min_n));

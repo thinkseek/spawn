@@ -161,6 +161,8 @@ fn the_facts_project_each_record_to_what_the_measures_read() {
             "mission.configured",
             "mission.configured",
             "task.assigned",
+            // A report is kept as its time (objective 081).
+            "task.reported",
             "task.gated",
             "task.gated",
             "task.gated",
@@ -610,4 +612,56 @@ fn the_facts_keep_the_owners_judgings_with_their_gate_time_and_mission() {
     assert_eq!(refused[0]["gate_ms"], 450_000);
     assert_eq!(refused[0]["mission"], 2);
     assert_eq!(refused[0]["at"], 2000);
+}
+
+/// Objective 081: the scorecard's facts carry each `task.reported` (its time,
+/// not its text) and each `deploy.finished` with its `ok`, a failed deploy
+/// too, so the scorecard can tell how long a landing waited to go live.
+#[test]
+fn the_facts_carry_reports_and_deploys() {
+    let (store, schema) = store("scorecard_report_to_live");
+    let mut client = admin(&schema);
+    for (at, value) in [
+        (
+            1000,
+            json!({"type": "task.reported", "id": 4, "commit": "c", "report": "a long report"}),
+        ),
+        (
+            2000,
+            json!({"type": "deploy.finished", "ok": false, "head": "h", "by": "landing",
+                   "reason": "the build failed"}),
+        ),
+        (
+            3000,
+            json!({"type": "deploy.finished", "ok": true, "head": "h", "by": "owner",
+                   "reason": ""}),
+        ),
+        (
+            5000,
+            json!({"type": "deploy.finished", "ok": true, "head": "h", "by": "owner",
+                   "reason": ""}),
+        ),
+    ] {
+        record(&mut client, at, &value);
+    }
+    let facts = store.scorecard_facts(4000).expect("the facts");
+    let reported = by_type(&facts, "task.reported");
+    assert_eq!(reported.len(), 1, "{facts}");
+    assert_eq!(reported[0]["id"], 4);
+    assert_eq!(reported[0]["at"], 1000);
+    assert_eq!(
+        reported[0].get("report"),
+        None,
+        "a report's text is not read"
+    );
+    let deploys = by_type(&facts, "deploy.finished");
+    assert_eq!(
+        deploys.len(),
+        2,
+        "a deploy after `until` is not read: {facts}"
+    );
+    assert_eq!(deploys[0]["ok"], false);
+    assert_eq!(deploys[0]["at"], 2000);
+    assert_eq!(deploys[1]["ok"], true);
+    assert_eq!(deploys[1]["at"], 3000);
 }

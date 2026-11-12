@@ -72,6 +72,12 @@ pub(crate) struct Landing {
     pub(crate) lead_ms: i64,
     /// The task had no send-back before it landed.
     pub(crate) first_pass: bool,
+    /// From the task's last `task.reported` before it landed to the first
+    /// deploy that succeeded at or after the landing (objective 081): `None`
+    /// while no deploy has (not live yet), or with no report to count from.
+    pub(crate) report_to_live_ms: Option<i64>,
+    /// Its task's last report before it landed, if any.
+    pub(crate) reported_at: Option<i64>,
 }
 
 /// A gate run that names its wall clock.
@@ -118,6 +124,8 @@ pub(crate) struct Task {
     /// `task.over_budget`).
     pub(crate) cancelled_at: Option<i64>,
     pub(crate) sent_back: bool,
+    /// Its latest `task.reported`.
+    pub(crate) reported_at: Option<i64>,
 }
 
 impl Task {
@@ -137,6 +145,10 @@ pub(crate) struct History {
     pub(crate) marks: Vec<Mark>,
     pub(crate) gate_runs: Vec<GateRun>,
     pub(crate) tokens: Vec<Tokens>,
+    /// When each deploy that succeeded (`deploy.finished` with `ok` true)
+    /// finished, in stream order: it ships the then-current main, every
+    /// landing before it.
+    pub(crate) deploys: Vec<i64>,
 }
 
 /// One control record, as the store projects it (spawn-postgres,
@@ -166,6 +178,9 @@ pub(crate) struct Record {
     pub(crate) verdict: Value,
     #[serde(default)]
     pub(crate) accepted: Value,
+    /// A deploy's `ok` (`deploy.finished`).
+    #[serde(default)]
+    pub(crate) ok: Value,
     #[serde(default)]
     pub(crate) by: Value,
     #[serde(default)]
@@ -364,6 +379,17 @@ impl Fold {
             }
             "task.assigned" => self.assigned(record, record.at),
             "legacy.imported" => self.legacy(record),
+            // A report: the last one before a landing is where its wait for
+            // live starts (objective 081).
+            "task.reported" => {
+                if let Some(task) = id.and_then(|id| self.history.tasks.get_mut(&id)) {
+                    task.reported_at = Some(record.at);
+                }
+            }
+            // A failed deploy ships nothing.
+            "deploy.finished" if boolean(&record.ok) == Some(true) => {
+                self.history.deploys.push(record.at);
+            }
             "task.delivered" => {
                 if let Some(task) = id.and_then(|id| self.history.tasks.get_mut(&id)) {
                     task.delivered_at.get_or_insert(record.at);
@@ -435,6 +461,7 @@ impl Fold {
             closed_at: None,
             cancelled_at: None,
             sent_back: false,
+            reported_at: None,
         };
         if record.kind == "task.assigned" {
             if text(&record.created_by) == Some("human") && self.mission(mission).review {
@@ -552,6 +579,8 @@ impl Fold {
             task: id,
             lead_ms: at - start,
             first_pass: !task.sent_back,
+            report_to_live_ms: None,
+            reported_at: task.reported_at,
         };
         if let Some(objective) = task.objective {
             self.objective_landings
@@ -612,6 +641,7 @@ impl History {
             fold.apply(record);
         }
         let mut history = fold.history;
+        history.live();
         history.commands(&facts.commands);
         history.messages(messages);
         history
@@ -759,6 +789,22 @@ impl History {
     /// Only what counts in `[since, until)`: the landings, marks, gate runs
     /// and tokens in it, and the tasks open in it. Every count of a window
     /// inside it is the same after; there is less to read for each.
+    /// Each landing's wait from its report to live: to the first deploy that
+    /// succeeded at or after it. A deploy is known only by when it finished,
+    /// so a landing made while one ran counts as shipped by it (optimistic
+    /// by at most one deploy's run).
+    fn live(&mut self) {
+        let mut deploys = self.deploys.clone();
+        deploys.sort_unstable();
+        for landing in &mut self.landings {
+            let Some(reported) = landing.reported_at else {
+                continue;
+            };
+            let first = deploys.partition_point(|at| *at < landing.at);
+            landing.report_to_live_ms = deploys.get(first).map(|deployed| deployed - reported);
+        }
+    }
+
     pub(crate) fn clip(&mut self, since: i64, until: i64) {
         let inside = |at: i64| since <= at && at < until;
         self.landings.retain(|landing| inside(landing.at));

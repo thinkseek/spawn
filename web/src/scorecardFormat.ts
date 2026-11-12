@@ -57,7 +57,30 @@ export function undecidedText(gate: GateSpending | null | undefined): string | n
  * each mission alike: gate time's `undecidedText`; null for any other
  * dimension, or with no gate time. */
 export function tileNote(key: string, dimension: GateSpending | null | undefined): string | null {
-  return key === "gate_time" ? undecidedText(dimension) : null;
+  if (key === "gate_time") return undecidedText(dimension);
+  if (key === "report_to_live") return reportToLiveText(dimension as ReportToLiveFields | null | undefined);
+  return null;
+}
+
+/** What `reportToLiveText` reads of a scope's `report_to_live`. */
+export interface ReportToLiveFields {
+  value?: unknown;
+  n?: unknown;
+  not_live?: unknown;
+}
+
+/** The performance north star in words (objective 081): "1.0 h from report
+ * to live (4 landings; 1 not live yet)", the median in hours to one
+ * decimal, the live landings' count, and the ones not live yet when there
+ * are any; null when the dimension or its value is missing. */
+export function reportToLiveText(dimension: ReportToLiveFields | null | undefined): string | null {
+  const value = dimension?.value;
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const n = typeof dimension?.n === "number" && Number.isFinite(dimension.n) ? dimension.n : 0;
+  const notLive = typeof dimension?.not_live === "number" && Number.isFinite(dimension.not_live) ? dimension.not_live : 0;
+  const landings = `${formatDecimal(n, 0)} ${n === 1 ? "landing" : "landings"}`;
+  const waiting = notLive > 0 ? `; ${formatDecimal(notLive, 0)} not live yet` : "";
+  return `${(value / 3_600_000).toFixed(1)} h from report to live (${landings}${waiting})`;
 }
 
 /** From when the owner's judgings are counted, in words (objective 076):
