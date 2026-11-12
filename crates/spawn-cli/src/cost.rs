@@ -179,11 +179,26 @@ pub(crate) fn window_of(asked: Option<&str>) -> Result<(&'static str, i64), Stri
 /// `GET /api/cost?window=`: the cost of the messages timed in [now minus
 /// the window, now), on the database's clock.
 pub(crate) fn window(store: &PostgresStore, name: &str, length_ms: i64) -> Result<Value, String> {
+    timed(store, name, length_ms, PostgresStore::cost_window)
+}
+
+/// The same window's `total`, `landed` and `usd_per_landing` alone
+/// ([`PostgresStore::cost_summary`]), for the Core lines card.
+pub(crate) fn summary(store: &PostgresStore, name: &str, length_ms: i64) -> Result<Value, String> {
+    timed(store, name, length_ms, PostgresStore::cost_summary)
+}
+
+/// `read` over [now minus `length_ms`, now) on the database's clock, the
+/// window's name and bounds added.
+fn timed(
+    store: &PostgresStore,
+    name: &str,
+    length_ms: i64,
+    read: fn(&PostgresStore, i64, i64) -> Result<Value, spawn_core::port::StoreError>,
+) -> Result<Value, String> {
     let until_ms = store.database_now_ms().map_err(|error| error.to_string())?;
     let since_ms = until_ms.saturating_sub(length_ms);
-    let mut answer = store
-        .cost_window(since_ms, until_ms)
-        .map_err(|error| error.to_string())?;
+    let mut answer = read(store, since_ms, until_ms).map_err(|error| error.to_string())?;
     if let Value::Object(map) = &mut answer {
         map.insert("window".to_string(), json!(name));
         map.insert("since_ms".to_string(), json!(since_ms));

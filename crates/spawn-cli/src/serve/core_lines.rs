@@ -441,7 +441,7 @@ fn performance_now(store: &spawn_postgres::PostgresStore, now_ms: i64) -> (Value
     )
     .unwrap_or(Value::Null);
     let cost = crate::cost::window_of(Some("7d"))
-        .and_then(|(name, length_ms)| crate::cost::window(store, name, length_ms))
+        .and_then(|(name, length_ms)| crate::cost::summary(store, name, length_ms))
         .unwrap_or(Value::Null);
     let first_deploy_ms = store.first_deploy_finished_ms().ok().flatten();
     let database_now_ms = store.database_now_ms().unwrap_or(now_ms);

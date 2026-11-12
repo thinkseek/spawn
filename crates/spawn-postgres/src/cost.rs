@@ -132,6 +132,40 @@ select jsonb_build_object(
               left join execution_models e on e.execution_id = g.execution_id), '[]'::jsonb),
   'counted_since_ms', (select min(at_ms) from spawn_cost_messages))";
 
+/// [`WINDOW`]'s `total`, `landed` and `usd_per_landing` alone, by the same
+/// sums, for a reader that needs no breakdown (the Core lines card's
+/// performance line): [`WINDOW`]'s executions with their models run a
+/// per-model subquery for each execution, about 0.55 s of its 0.68 s on the
+/// live record of 2026-11-12 (258 executions in 7 days), none of it here.
+const SUMMARY: &str = r"
+with m as materialized (
+  select c.usd, c.input_tokens, c.output_tokens, c.cache_write_tokens, c.cache_read_tokens,
+         c.input_tokens + c.output_tokens + c.cache_write_tokens
+              + c.cache_read_tokens as total
+    from spawn_cost_messages c
+   where c.at_ms >= $1 and c.at_ms < $2
+), landings as materialized (
+  select s.mission_id, count(distinct s.task_id) as landed
+    from spawn_task_spans s
+   where s.outcome in ('landed', 'accepted')
+     and s.closed_at_ms >= $1 and s.closed_at_ms < $2
+   group by s.mission_id
+)
+select jsonb_build_object(
+  'total', (select jsonb_build_object(
+              'usd', coalesce(sum(usd), 0),
+              'tokens', jsonb_build_object(
+                  'input', coalesce(sum(input_tokens), 0),
+                  'output', coalesce(sum(output_tokens), 0),
+                  'cache_write', coalesce(sum(cache_write_tokens), 0),
+                  'cache_read', coalesce(sum(cache_read_tokens), 0)),
+              'unpriced_tokens', coalesce(sum(total) filter (where usd is null), 0))
+              from m),
+  'landed', (select coalesce(sum(landed), 0) from landings),
+  'usd_per_landing', (select coalesce(sum(m.usd), 0)
+                             / nullif((select sum(landed) from landings), 0)
+                        from m))";
+
 /// Every mission with a daily budget (`budget.daily_usd`) and its cost of
 /// the messages timed in `[$1, $2)` (the UTC day so far).
 const BUDGETS: &str = r"
@@ -161,6 +195,13 @@ impl PostgresStore {
     /// executions, counted_since_ms}`.
     pub fn cost_window(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
         self.query_json(WINDOW, &[&since_ms, &until_ms])
+    }
+
+    /// The cost of the messages timed in `[since_ms, until_ms)` without its
+    /// breakdown ([`SUMMARY`]): `{total, landed, usd_per_landing}`, each as
+    /// [`Self::cost_window`] gives it.
+    pub fn cost_summary(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
+        self.query_json(SUMMARY, &[&since_ms, &until_ms])
     }
 
     /// Each mission with a daily budget and its spend in `[since_ms,

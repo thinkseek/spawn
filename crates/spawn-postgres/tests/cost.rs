@@ -630,3 +630,65 @@ fn a_window_says_what_a_landing_cost_for_the_fleet_and_each_mission() {
     assert_eq!(empty["landed"], json!(0));
     assert_eq!(empty["usd_per_landing"], Value::Null);
 }
+
+#[test]
+fn a_summary_gives_the_windows_total_landings_and_cost_per_landing() {
+    let (store, _schema) = store("cost_summary");
+    let since = store.database_now_ms().expect("now");
+
+    // Two missions, three executions, two models (one priced nowhere), an
+    // execution with both models, a landing in one mission and not the
+    // other, and a message after the window.
+    let a = store
+        .mission_add("Work", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    let (t1, w1) = spending_task(&store, a, ("w1", 1), (100_000, since + 1));
+    usage(
+        &store,
+        &w1,
+        1,
+        ("msg_1z", "model-z", since + 2),
+        [7000, 300, 20, 5],
+    );
+    reviewed(&store, t1, 1, true);
+    let (t2, w2) = spending_task(&store, a, ("w2", 2), (40_000, since + 3));
+    usage(
+        &store,
+        &w2,
+        2,
+        ("msg_2b", "model-x", since + 4),
+        [1000, 2000, 3000, 4000],
+    );
+    store.task_cancel(t2).expect("cancel");
+    let b = store
+        .mission_add("Other", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    let (t3, w3) = spending_task(&store, b, ("w3", 3), (60_000, since + 5));
+    reviewed(&store, t3, 3, true);
+    let later = store.database_now_ms().expect("now") + 60_000;
+    usage(&store, &w3, 3, ("msg_3l", "model-x", later), [9, 9, 9, 9]);
+    assert_eq!(store.cost_record(&prices(3.0)).expect("record"), 6);
+
+    let until = store.database_now_ms().expect("now") + 1000;
+    for (from, to, what) in [
+        (since, until, "the window"),
+        (since, later + 1, "with the later message"),
+        (since + 3, until, "a part of it"),
+        (until, until + 1000, "an empty window"),
+    ] {
+        let window = store.cost_window(from, to).expect("window");
+        let summary = store.cost_summary(from, to).expect("summary");
+        let expected = json!({
+            "total": window["total"],
+            "landed": window["landed"],
+            "usd_per_landing": window["usd_per_landing"],
+        });
+        assert_eq!(summary, expected, "{what}: the window says {window}");
+    }
+    let window = store.cost_summary(since, until).expect("summary");
+    assert_eq!(window["landed"], json!(2), "t1 and t3: {window}");
+    assert!(
+        usd(&window["total"]["unpriced_tokens"]) > 0.0,
+        "model-z's tokens are unpriced: {window}"
+    );
+}
