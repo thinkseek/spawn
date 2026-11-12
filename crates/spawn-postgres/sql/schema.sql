@@ -249,6 +249,11 @@ $$;
 -- DEFINER paths such as the `agent_commands` gateway, which must record
 -- `command.accepted` with source `gateway` even when a restricted login
 -- submitted the command. Restricted logins call `spawn_append` below.
+-- The append lock, pg_advisory_xact_lock(1399957335), is copied outside
+-- this file: the black-box scenarios rsi/scenarios/045.sh, 050.sh and
+-- check-j05-operator.sh take it to insert events with their own
+-- session_seq beside a running store. A change of the key must update them
+-- too, or their inserts collide again with the store's appends.
 create or replace function spawn_append_trusted(
     p_agent      text,
     p_session    text,
