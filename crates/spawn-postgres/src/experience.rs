@@ -29,6 +29,9 @@ use crate::PostgresStore;
 ///   with no configuration record before `$2` (only its `mission.added`)
 ///   has no objective backlog either, so it is owner work too (objective
 ///   077); only a mission whose last configuration has a backlog is not.
+///   `pauses`: the owner's pauses recorded before `$2` (objective 099),
+///   oldest first, each `[paused_at_ms, unpaused_at_ms]`, the second `null`
+///   while it lasts at `$2`.
 const WINDOW: &str = r"
 with
   decided as (
@@ -92,7 +95,21 @@ select jsonb_build_object(
                        order by r.seq desc limit 1), true),
                   'tasks', (select coalesce(jsonb_agg(jsonb_build_array(s.assigned_at_ms, s.closed_at_ms)
                                                       order by s.assigned_at_ms, s.task_id), '[]'::jsonb)
-                              from spans s where s.mission_id = m.mission_id))
+                              from spans s where s.mission_id = m.mission_id),
+                  'pauses', (select coalesce(jsonb_agg(jsonb_build_array(p.recorded_at_ms, (
+                                 select min(u.recorded_at_ms) from spawn_events u
+                                  where u.session_id = 'session_control'
+                                    and u.event_name = 'control.recorded'
+                                    and u.kind -> 'detail' -> 'record' ->> 'type' = 'mission.unpaused'
+                                    and u.kind -> 'detail' -> 'record' ->> 'pause_event' = p.id::text
+                                    and u.recorded_at_ms < $2))
+                                 order by p.id), '[]'::jsonb)
+                               from spawn_events p
+                              where p.session_id = 'session_control'
+                                and p.event_name = 'control.recorded'
+                                and p.kind -> 'detail' -> 'record' ->> 'type' = 'mission.paused'
+                                and p.kind -> 'detail' -> 'record' ->> 'id' = m.mission_id::text
+                                and p.recorded_at_ms < $2))
                   order by m.mission_id), '[]'::jsonb)
                  from missions m))";
 
