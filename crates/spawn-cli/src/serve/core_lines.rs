@@ -76,6 +76,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
+mod drills;
+
 /// The file's name under the workspace root, when `SPAWN_CORE_LINES_FILE`
 /// names none.
 const RANGES_FILE: &str = "core-lines.json";
@@ -807,18 +809,17 @@ pub(super) fn core_lines_at(
     nightly: Option<&Path>,
 ) -> Result<Value, String> {
     let now_ms = super::now_ms();
-    let figures = lines_at(store, nightly, now_ms)?;
+    let contents = read_ranges(path);
+    let text = contents.as_ref().ok().and_then(Option::as_deref);
+    let (figures, drills) = lines_at(store, nightly, text, now_ms)?;
     let samples = store
         .host_core_lines(trend_since(now_ms))
         .map_err(super::err)?;
     let samples = measured_samples(samples, store.first_deploy_finished_ms().ok().flatten());
     let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
-    Ok(answer(
-        &figures,
-        &file,
-        read_ranges(path),
-        &trends(&samples, now_ms),
-    ))
+    let mut view = answer(&figures, &file, contents, &trends(&samples, now_ms));
+    view["drills"] = drills;
+    Ok(view)
 }
 
 /// `samples` (`host.core_lines`, `[{at_ms, values}]`) without a report to
@@ -840,12 +841,14 @@ pub(super) fn measured_samples(mut samples: Value, first_deploy_ms: Option<i64>)
 }
 
 /// The four lines' figures, read at `now_ms` with the nightly's fact files
-/// in `nightly`.
+/// in `nightly` and the Core lines file's contents `file` (its
+/// `recoverability` drills, objective 093), and the answer's `drills`.
 fn lines_at(
     store: &spawn_postgres::PostgresStore,
     nightly: Option<&Path>,
+    file: Option<&str>,
     now_ms: i64,
-) -> Result<Vec<Line>, String> {
+) -> Result<(Vec<Line>, Value), String> {
     let storage = super::storage::report(store, now_ms)?;
     let (performance, cost_total) = performance_now(store, now_ms);
     let health = store.fleet_health().map_err(super::err)?;
@@ -859,11 +862,18 @@ fn lines_at(
     };
     let backups = store.newest_backups().map_err(super::err)?;
     let facts = nightly_facts(nightly);
-    Ok(lines(
-        &storage,
-        &performance,
-        &observed,
-        recoverability(&backups, facts.as_deref(), now_ms),
+    let drills = drills::read(store, file, now_ms);
+    let mut guardrails = recoverability(&backups, facts.as_deref(), now_ms);
+    guardrails.extend(drills.guardrails);
+    Ok((
+        lines(
+            &storage,
+            &performance,
+            &observed,
+            drills.north_star.value,
+            guardrails,
+        ),
+        drills.list,
     ))
 }
 
@@ -883,11 +893,10 @@ pub(super) fn values_of(lines: &[Line]) -> Map<String, Value> {
 /// dashboard's own read-only connection and its statement timeout.
 pub(crate) fn sample_values() -> Result<Map<String, Value>, String> {
     let store = super::open_store()?;
-    Ok(values_of(&lines_at(
-        &store,
-        nightly_dir().as_deref(),
-        super::now_ms(),
-    )?))
+    let contents = read_ranges(ranges_path().as_deref());
+    let text = contents.as_ref().ok().and_then(Option::as_deref);
+    let (lines, _) = lines_at(&store, nightly_dir().as_deref(), text, super::now_ms())?;
+    Ok(values_of(&lines))
 }
 
 #[cfg(test)]
