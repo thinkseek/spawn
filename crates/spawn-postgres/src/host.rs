@@ -105,15 +105,17 @@ const TEST_DATABASE_LIMIT: std::time::Duration = std::time::Duration::from_secs(
 /// A URL that does not parse, a server that cannot be reached, a statement
 /// that fails. The error never names the URL.
 pub fn test_database_size(url: &str) -> Result<Value, StoreError> {
-    let mut config: postgres::Config = url
-        .parse()
-        .map_err(|_: postgres::Error| StoreError::Backend("the URL is not a postgres URL".to_string()))?;
+    let mut config: postgres::Config = url.parse().map_err(|_: postgres::Error| {
+        StoreError::Backend("the URL is not a postgres URL".to_string())
+    })?;
     let limit = format!("-c statement_timeout={}", TEST_DATABASE_LIMIT.as_millis());
     let options = match config.get_options() {
         Some(options) if !options.trim().is_empty() => format!("{options} {limit}"),
         _ => limit,
     };
-    config.options(&options).connect_timeout(TEST_DATABASE_LIMIT);
+    config
+        .options(&options)
+        .connect_timeout(TEST_DATABASE_LIMIT);
     let mut client = config
         .connect(postgres::NoTls)
         .map_err(|error| crate::backend(&error))?;
