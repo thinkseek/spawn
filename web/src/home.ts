@@ -290,11 +290,13 @@ export function needsYou(input: NeedsInput): NeedItem[] {
     if (fold === null) continue;
     const named = input.nameOf?.(alert.subject) ?? null;
     const stale = alertStale(alert, input.agents);
-    const evidence = alert.evidence as { stuck?: unknown; command?: unknown } | null;
+    const evidence = alert.evidence as { stuck?: unknown; command?: unknown; withdraw?: unknown } | null;
     const score = evidence?.stuck;
     // The one command that acts on it, when the alert step named one (a
-    // stuck worker's `spawn task restart --id <task>`).
-    const namedCommand = evidence?.command;
+    // stuck worker's `spawn task restart --id <task>`; an owner's landing
+    // request waiting for its verdict, the `spawn mission push --withdraw
+    // <request>` that ends it).
+    const namedCommand = alert.kind === "owner_request_waiting" ? evidence?.withdraw : evidence?.command;
     const command = typeof namedCommand === "string" ? namedCommand : null;
     items.push({
       key: `alert:${alert.key}`,
@@ -384,10 +386,22 @@ const ALERT_TITLES: Record<string, string> = {
   validator_defect: "A validator fails on main too",
   mission_idle: "A mission has no work",
   message_not_taken: "A message was not taken",
+  owner_request_waiting: "An owner's landing waits for its verdict",
 };
 
-export function alertTitle(alert: Pick<Alert, "kind" | "subject">, named: string | null = null): string {
-  const title = ALERT_TITLES[alert.kind] ?? alert.kind.replaceAll("_", " ");
+/** A message not taken whose evidence says Spawn has read no line of the
+ * transcript since it was typed (`read_since_typed` 0, the Bridge's own
+ * record): whether the agent took it is unknown, so the title does not say
+ * it was not taken (S17). */
+const UNREAD_TITLE = "Spawn has read nothing of a transcript since a message was typed";
+
+export function alertTitle(
+  alert: Pick<Alert, "kind" | "subject"> & Partial<Pick<Alert, "evidence">>,
+  named: string | null = null,
+): string {
+  const evidence = (alert.evidence ?? null) as { read_since_typed?: unknown } | null;
+  const unread = alert.kind === "message_not_taken" && evidence?.read_since_typed === 0;
+  const title = unread ? UNREAD_TITLE : (ALERT_TITLES[alert.kind] ?? alert.kind.replaceAll("_", " "));
   return `${title} · ${named ?? alert.subject}`;
 }
 
@@ -410,6 +424,10 @@ export interface InFlight {
   state: string;
   /** Since the task's latest record. */
   since_ms: number | null;
+  /** How many of the task's gate verdicts were `conflict` (objective 069). */
+  conflicts: number;
+  /** "sent back <n> times as a conflict" when two or more, else null. */
+  conflictText: string | null;
 }
 
 export interface MissionRow {
@@ -462,6 +480,17 @@ function sendBacks(task: MissionTask): Array<{ verdict: string; at_ms: number }>
     .map((stage) => ({ verdict: stage.verdict ?? "rejected", at_ms: stage.at_ms ?? 0 }));
 }
 
+/** How many of a task's gate verdicts were `conflict`: a `rejected` or
+ * `incompatible` one, or a review's verdict, does not count. */
+export function conflictCount(task: MissionTask): number {
+  return task.stages.filter((stage) => stage.stage === "gated" && stage.verdict === "conflict").length;
+}
+
+/** The in-flight line's words for a task that lost rounds to conflicts. */
+export function conflictText(conflicts: number): string | null {
+  return conflicts >= 2 ? `sent back ${conflicts} times as a conflict` : null;
+}
+
 export function missionsToday(missions: Missions | null, now: number): MissionsToday {
   const rows: Array<MissionRow & { moved: number }> = [];
   const quiet: MissionsToday["quiet"] = [];
@@ -491,6 +520,8 @@ export function missionsToday(missions: Missions | null, now: number): MissionsT
         title: task.task_title,
         state: taskStateLabel(task, mission),
         since_ms: latestRecord(task),
+        conflicts: conflictCount(task),
+        conflictText: conflictText(conflictCount(task)),
       }))
       .sort((left, right) => (left.task_id ?? 0) - (right.task_id ?? 0));
     let landedToday = 0;

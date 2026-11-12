@@ -789,3 +789,85 @@ fn a_missions_row_says_owner_work_when_it_has_no_objective_backlog() {
          one configured without a backlog, or with its backlog removed, is"
     );
 }
+
+/// S22 (rev-g's note on 077): the idle hours card's `owner_work` reads a
+/// mission's last configuration record before the window's end, and that
+/// is the mission's configuration as its fold has it, because every
+/// configure records the whole configuration: `spawn mission configure`
+/// merges its change into the mission's row (`spawn_mission_reconfigure`,
+/// objective 027) and records `mission.configured` with every setting. So
+/// a later configure that names only `accept`, a budget or a worker count
+/// keeps the backlog, and only an explicit null clears it. Each configured
+/// mission's `owner_work` is checked against the fold
+/// (`mission_missions.objectives` not an object). Seeded like live: missions
+/// 6, 7 and 8 have only their `mission.added`; what they say is 077's to
+/// decide and is not pinned here.
+#[test]
+fn a_partial_reconfigure_keeps_a_missions_owner_work_as_its_fold_has_it() {
+    let (store, schema) = store("experience_owner_work_fold");
+    let mut client = admin(&schema);
+    let missions: Vec<i64> = (1..=8)
+        .map(|n| {
+            store
+                .mission_add(&format!("m{n}"), &json!(["/tmp/source.git"]), "human")
+                .expect("add")
+        })
+        .collect();
+    assert_eq!(missions, (1..=8).collect::<Vec<i64>>(), "ids as live's");
+    let backlog = json!({"backlog": "/ctl/backlog", "resident": "res", "workers": 1});
+    for id in [1, 2, 3, 5] {
+        store
+            .mission_configure(id, Some("/ctl/scenarios"), "gate", None, Some(&backlog))
+            .expect("a backlog mission");
+    }
+    store
+        .mission_configure(4, Some("/ctl/scenarios"), "gate", None, None)
+        .expect("a gated mission with no backlog");
+    for (id, change) in [
+        (1, json!({"accept": "review"})),
+        (2, json!({"budget": {"minutes": 90}})),
+        (3, json!({"objectives": null})),
+        (4, json!({"budget": {"minutes": 90}})),
+        (5, json!({"objectives": {"workers": 4}})),
+    ] {
+        store
+            .mission_reconfigure(id, &change)
+            .unwrap_or_else(|error| panic!("mission {id}: {change}: {error}"));
+    }
+    let now: i64 = client
+        .query_one("select spawn_now_ms()", &[])
+        .expect("now")
+        .get(0);
+    let window = store
+        .experience_window(now - 24 * H, now + H)
+        .expect("the window reads");
+    let card: Vec<(i64, bool)> = window["missions"]
+        .as_array()
+        .expect("missions")
+        .iter()
+        .map(|m| {
+            (
+                m["mission"].as_i64().expect("id"),
+                m["owner_work"].as_bool().expect("owner_work"),
+            )
+        })
+        .filter(|(id, _)| *id <= 5)
+        .collect();
+    let fold: Vec<(i64, bool)> = client
+        .query(
+            "select id, coalesce(jsonb_typeof(objectives), 'null') <> 'object'
+               from mission_missions where id <= 5 order by id",
+            &[],
+        )
+        .expect("the fold")
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(card, fold, "the card says what the missions' fold says");
+    assert_eq!(
+        card,
+        vec![(1, false), (2, false), (3, true), (4, true), (5, false)],
+        "a configure that names only accept, a budget or the workers keeps the backlog; \
+         an explicit null clears it; a mission configured with none is owner work"
+    );
+}
