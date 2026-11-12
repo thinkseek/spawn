@@ -107,6 +107,7 @@
 
 mod answers;
 pub(crate) mod attention;
+mod core_lines;
 mod labels;
 mod storage;
 
@@ -784,6 +785,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/interventions" => Box::new(move || interventions(query)),
         "/api/alerts" => Box::new(move || alerts(query)),
         "/api/cost" => Box::new(move || cost(query)),
+        "/api/core-lines" => Box::new(core_lines::core_lines),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
                 Box::new(move || session(id, query))

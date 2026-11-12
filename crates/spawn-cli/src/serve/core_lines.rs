@@ -271,12 +271,13 @@ pub(super) fn lines(storage: &Value) -> Vec<Line> {
     ]
 }
 
-/// The answer from the lines, the ranges file's path and its contents
+/// The answer from the lines, the ranges file's path (null when there is
+/// no workspace root to find it under) and its contents
 /// (`Err` when it could not be read for another reason than not being
 /// there; `Ok(None)` when it is not there).
 pub(super) fn answer(
     lines: &[Line],
-    ranges_file: &str,
+    ranges_file: Value,
     contents: Result<Option<String>, String>,
 ) -> Value {
     let known: Vec<&str> = lines
@@ -339,9 +340,7 @@ pub(super) fn core_lines() -> Result<Value, String> {
     let file = path
         .as_ref()
         .map_or(Value::Null, |path| json!(path.display().to_string()));
-    let mut view = answer(&lines(&storage), "", read_ranges(path.as_deref()));
-    view["ranges_file"] = file;
-    Ok(view)
+    Ok(answer(&lines(&storage), file, read_ranges(path.as_deref())))
 }
 
 #[cfg(test)]
@@ -439,7 +438,7 @@ mod tests {
                 {"role": "x", "bytes": 9, "schemas": 1},
             ],
         });
-        let view = answer(&lines(&storage), "/ws/core-lines.json", Ok(None));
+        let view = answer(&lines(&storage), json!("/ws/core-lines.json"), Ok(None));
         let names: Vec<&str> = view["lines"]
             .as_array()
             .expect("lines")
