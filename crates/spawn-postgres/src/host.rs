@@ -57,12 +57,23 @@ select jsonb_build_object(
   'before', (select s.sample from samples s where s.recorded_at_ms <= $2
               order by s.recorded_at_ms desc, s.id desc limit 1))";
 
-/// The database's size (`pg_database_size`) and its five largest tables by
-/// `pg_total_relation_size`, largest first, as `{bytes, tables: [{name,
-/// bytes}]}`.
+/// The schemas a database holds other than PostgreSQL's own (`pg_*`,
+/// `information_schema`) and `public`: what tests leave behind (objective
+/// 074).
+const SCHEMAS: &str = r"(select count(*) from pg_namespace n
+     where n.nspname not like 'pg\_%' and n.nspname not in ('information_schema', 'public'))";
+
+/// The database's name, its size (`pg_database_size`), its schemas
+/// ([`SCHEMAS`]), its event log's bytes (the sum of `spawn_events.kind`'s
+/// stored size, `pg_column_size`: what the data justifies, objective 074)
+/// and its five largest tables by `pg_total_relation_size`, largest first,
+/// as `{name, bytes, schemas, log_bytes, tables: [{name, bytes}]}`.
 pub(crate) const DATABASE_SIZE: &str = r"
 select jsonb_build_object(
+  'name', current_database(),
   'bytes', pg_database_size(current_database()),
+  'schemas', SCHEMAS_COUNT,
+  'log_bytes', (select coalesce(sum(pg_column_size(e.kind)), 0)::bigint from spawn_events e),
   'tables', coalesce((
     select jsonb_agg(jsonb_build_object('name', t.relname, 'bytes', t.bytes)
                      order by t.bytes desc, t.relname)
@@ -72,6 +83,46 @@ select jsonb_build_object(
              order by pg_total_relation_size(c.oid) desc, c.relname
              limit 5) t), '[]'::jsonb))";
 
+/// A test database's name, size and schemas ([`SCHEMAS`]), as `{name,
+/// bytes, schemas}`.
+const TEST_DATABASE_SIZE: &str = r"
+select jsonb_build_object(
+  'name', current_database(),
+  'bytes', pg_database_size(current_database()),
+  'schemas', SCHEMAS_COUNT)";
+
+/// How long a test database's reading may take, connecting or querying: a
+/// server that does not answer costs the reader no more than this.
+const TEST_DATABASE_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The name, size and schemas of the test database at `url` (the gates' or
+/// the fleet's, objective 074), as `{name, bytes, schemas}`: one read-only
+/// statement on a connection of its own, which gives up after 5 s
+/// connecting and 5 s querying.
+///
+/// # Errors
+///
+/// A URL that does not parse, a server that cannot be reached, a statement
+/// that fails. The error never names the URL.
+pub fn test_database_size(url: &str) -> Result<Value, StoreError> {
+    let mut config: postgres::Config = url
+        .parse()
+        .map_err(|_: postgres::Error| StoreError::Backend("the URL is not a postgres URL".to_string()))?;
+    let limit = format!("-c statement_timeout={}", TEST_DATABASE_LIMIT.as_millis());
+    let options = match config.get_options() {
+        Some(options) if !options.trim().is_empty() => format!("{options} {limit}"),
+        _ => limit,
+    };
+    config.options(&options).connect_timeout(TEST_DATABASE_LIMIT);
+    let mut client = config
+        .connect(postgres::NoTls)
+        .map_err(|error| crate::backend(&error))?;
+    let row = client
+        .query_one(&TEST_DATABASE_SIZE.replace("SCHEMAS_COUNT", SCHEMAS), &[])
+        .map_err(|error| crate::backend(&error))?;
+    row.try_get(0).map_err(|error| crate::backend(&error))
+}
+
 impl PostgresStore {
     /// The `host.storage` samples the storage figures need ([`HOST_STORAGE`]):
     /// the oldest at or after `since_ms` and the newest at or before
@@ -80,9 +131,10 @@ impl PostgresStore {
         self.query_json(HOST_STORAGE, &[&since_ms, &before_ms])
     }
 
-    /// The database's size and its five largest tables ([`DATABASE_SIZE`]).
+    /// The database's name, size, schemas, event log bytes and five
+    /// largest tables ([`DATABASE_SIZE`]).
     pub fn database_size(&self) -> Result<Value, StoreError> {
-        self.query_json(DATABASE_SIZE, &[])
+        self.query_json(&DATABASE_SIZE.replace("SCHEMAS_COUNT", SCHEMAS), &[])
     }
 
     /// Record a host fact through `spawn_host_record` (owner only):
