@@ -93,6 +93,13 @@
 //! instruction rather than an answer, does not clear them. Without a
 //! transcript the list is empty and the judgement alone decides.
 //!
+//! A `For the owner:` line with no words after it (`**For the owner:**`)
+//! is a heading: each list item right under it (`- `, `* ` or `<n>. `,
+//! after any indent), up to a blank line or a line that is no item, is a
+//! line of its own, its words without the marker, at its turn's time
+//! (objective 070). The heading is none, and a list under any other heading
+//! is not the owner's.
+//!
 //! Each line says what became of the tasks it names (objective 064: a line
 //! saying four reports waited for review stood for 30 h when all four had
 //! ended before it was written). `tasks` are the tasks the line names, in
@@ -737,11 +744,7 @@ fn said(bytes: &[u8]) -> Said {
                 {
                     human = Some((question.trim().to_string(), line_time(&line)));
                 }
-                let words: Vec<&str> = text
-                    .lines()
-                    .filter_map(for_owner)
-                    .filter(|words| !words.is_empty())
-                    .collect();
+                let words = owner_lines(&text);
                 if !words.is_empty() {
                     let at = line_time(&line);
                     notes.extend(words.into_iter().map(|words| (words.to_string(), at)));
@@ -782,6 +785,55 @@ fn for_owner(line: &str) -> Option<&str> {
     )
 }
 
+/// The lines a reply's `text` has for the owner, in its order: each inline
+/// [`FOR_OWNER`] line's words, and each list item right under a heading (a
+/// [`FOR_OWNER`] line with no words after it: `**For the owner:**`), up to
+/// a blank line or a line that is no item ([`list_item`]). The heading
+/// itself is none, and a list under any other heading is not the owner's
+/// (objective 070: 19 of the supervisor's 217 owner blocks were headings
+/// over lists, and none of their items reached Home).
+fn owner_lines(text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut under_heading = false;
+    for line in text.lines() {
+        if under_heading {
+            if let Some(item) = list_item(line) {
+                // An item that is itself an inline line keeps only its words.
+                let words = for_owner(item)
+                    .filter(|words| !words.is_empty())
+                    .unwrap_or(item);
+                if !words.is_empty() {
+                    lines.push(words);
+                }
+                continue;
+            }
+            under_heading = false;
+        }
+        match for_owner(line) {
+            Some("") => under_heading = true,
+            Some(words) => lines.push(words),
+            None => {}
+        }
+    }
+    lines
+}
+
+/// A list item's words without its marker (`- `, `* ` or `<n>. `, after
+/// any indent); `None` for a line that is no item, a blank one included.
+fn list_item(line: &str) -> Option<&str> {
+    let rest = line.trim_start();
+    let words = if let Some(words) = rest.strip_prefix("- ").or_else(|| rest.strip_prefix("* ")) {
+        words
+    } else {
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits == 0 {
+            return None;
+        }
+        rest[digits..].strip_prefix(". ")?
+    };
+    Some(words.trim())
+}
+
 /// Whether a transcript's prompt line is a dispatcher digest
 /// ([`dispatch::DIGEST_OPENING`]).
 fn is_digest(line: &str) -> bool {
@@ -807,8 +859,8 @@ fn line_time(line: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FOR_OWNER_ITEMS, answer, asking, asks, for_owner, named_tasks, owner_note, question,
-        review_ask, said, task_states, waiting_holds,
+        FOR_OWNER_ITEMS, answer, asking, asks, for_owner, list_item, named_tasks, owner_lines,
+        owner_note, question, review_ask, said, task_states, waiting_holds,
     };
     use crate::deliver::Work;
     use crate::dispatch::{Escalation, Facts, Why, decide_with};
@@ -1347,7 +1399,7 @@ mod tests {
         transcript += &line(
             "assistant",
             &json!(
-                "- **For the owner:** resume mission 7.\nFor the owner:\n- a heading lists nothing"
+                "- **For the owner:** resume mission 7.\nFor the owner:\n- a heading's item is a line"
             ),
             "2026-11-06T08:02:00.000Z",
         );
@@ -1356,6 +1408,10 @@ mod tests {
         assert_eq!(
             notes,
             [
+                (
+                    "a heading's item is a line".to_string(),
+                    time("2026-11-06T08:02:00.000Z")
+                ),
                 (
                     "resume mission 7.".to_string(),
                     time("2026-11-06T08:02:00.000Z")
@@ -1580,5 +1636,133 @@ mod tests {
         let unread = owner_note("review task 2", None, &BTreeMap::new());
         assert_eq!(unread["at_ms"], Value::Null);
         assert_eq!(unread["settled"], json!(false));
+    }
+
+    /// Objective 070: the items of a list under a "For the owner:" heading.
+    #[test]
+    fn each_item_under_a_for_the_owner_heading_is_a_line() {
+        // A dash list, ended by a blank line; another heading's list after.
+        assert_eq!(
+            owner_lines(
+                "Done with the pass.\nFor the owner:\n- Reports 2, 3 and 4 are still waiting for \
+                 your review.\n- If task 5 stays idle, restart it or reassign it.\n  - Set \
+                 SPAWN_WORKSPACE on the host.\n\n- after the blank line\nNext:\n- my own work"
+            ),
+            [
+                "Reports 2, 3 and 4 are still waiting for your review.",
+                "If task 5 stays idle, restart it or reassign it.",
+                "Set SPAWN_WORKSPACE on the host.",
+            ]
+        );
+        // An emphasised heading over a numbered list, ended by a line that is
+        // no item.
+        assert_eq!(
+            owner_lines(
+                "**For the owner:**\n1. Deploy main to pick up the cost page.\n2. Mission #3 has \
+                 no backlog yet.\nThat is all for now.\n3. not the owner's"
+            ),
+            [
+                "Deploy main to pick up the cost page.",
+                "Mission #3 has no backlog yet."
+            ]
+        );
+        // A star list, under a quoted heading.
+        assert_eq!(
+            owner_lines("> For the owner:\n* accept T4\n*   merge T5  \n**bold** is no item"),
+            ["accept T4", "merge T5"]
+        );
+        // A list under any other heading is not the owner's.
+        assert!(owner_lines("Next:\n- restart task 5\n1. deploy main").is_empty());
+        assert!(owner_lines("For the owner\n- no colon, no heading").is_empty());
+        // An inline line is as before, and ends nothing it was not in.
+        assert_eq!(
+            owner_lines("For the owner: task #5 waits for your review.\n- not an item"),
+            ["task #5 waits for your review."]
+        );
+        // An inline line right after a heading's list is still one.
+        assert_eq!(
+            owner_lines("For the owner:\n- a\nFor the owner: b\n- not an item"),
+            ["a", "b"]
+        );
+        // An item that is itself an inline line keeps only its words; an
+        // empty item is none.
+        assert_eq!(
+            owner_lines("For the owner:\n- For the owner: deploy\n- \n-   \n- x"),
+            ["deploy", "x"]
+        );
+        // A heading with nothing under it lists nothing.
+        assert!(owner_lines("For the owner:\n\n- later").is_empty());
+        assert!(owner_lines("**For the owner:**").is_empty());
+    }
+
+    #[test]
+    fn a_list_item_is_its_words_without_the_marker() {
+        assert_eq!(list_item("- a b"), Some("a b"));
+        assert_eq!(list_item("    * a"), Some("a"));
+        assert_eq!(list_item("12. a"), Some("a"));
+        assert_eq!(list_item("12.a"), None);
+        assert_eq!(list_item("-a"), None);
+        assert_eq!(list_item("**bold**"), None);
+        assert_eq!(list_item(""), None);
+        assert_eq!(list_item("plain words"), None);
+    }
+
+    /// Objective 070 through the transcript reader, with 064's `tasks` and
+    /// `settled` on each item: the items carry their turn's time.
+    #[test]
+    fn a_headings_items_reach_for_owner_with_their_tasks_and_settled() {
+        let at = "2026-11-12T00:52:00.000Z";
+        let transcript = line(
+            "assistant",
+            &json!(
+                "For the owner:\n- If the RSI resident stays idle on task 271, restart it or \
+                 reassign the task\n- Set SPAWN_WORKSPACE on the host\n- Reports 198, 204, 208 \
+                 and 211 (missions 7/8) are still waiting for your ccd review\n\nNext:\n- watch \
+                 task 271"
+            ),
+            at,
+        );
+        let notes = said(transcript.as_bytes()).for_owner;
+        let time = crate::scorecard::time::parse_rfc3339(at);
+        assert_eq!(
+            notes
+                .iter()
+                .map(|(text, at)| (text.as_str(), *at))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "Reports 198, 204, 208 and 211 (missions 7/8) are still waiting for your ccd \
+                     review",
+                    time
+                ),
+                ("Set SPAWN_WORKSPACE on the host", time),
+                (
+                    "If the RSI resident stays idle on task 271, restart it or reassign the task",
+                    time
+                ),
+            ]
+        );
+        let states = task_states(&json!({"missions": [{"tasks": [
+            {"id": 198, "state": "accepted"}, {"id": 204, "state": "accepted"},
+            {"id": 208, "state": "cancelled"}, {"id": 211, "state": "accepted"},
+            {"id": 271, "state": "delivered"}
+        ]}]}));
+        let shaped: Vec<Value> = notes
+            .iter()
+            .map(|(text, at)| {
+                let note = owner_note(text, *at, &states);
+                json!({"tasks": note["tasks"], "settled": note["settled"]})
+            })
+            .collect();
+        assert_eq!(
+            shaped,
+            [
+                json!({"tasks": [{"id": 198, "state": "accepted"}, {"id": 204, "state": "accepted"},
+                                 {"id": 208, "state": "cancelled"}, {"id": 211, "state": "accepted"}],
+                       "settled": true}),
+                json!({"tasks": [], "settled": false}),
+                json!({"tasks": [{"id": 271, "state": "delivered"}], "settled": false}),
+            ]
+        );
     }
 }
