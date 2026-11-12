@@ -1080,7 +1080,21 @@ impl Monitor {
             }
             "source.push_requested" => self.owner_request(event_id, at_ms, record),
             "source.push_refused" => self.owner_request_ended(event_id, record, out),
+            "alert.judged" => self.judged_record(record),
             _ => {}
+        }
+    }
+
+    /// The owner judged an alert (`spawn alert judge`, objective 092): an
+    /// open one is cleared by it, so the step clears it no more, and a later
+    /// occurrence of its kind and subject fires anew.
+    fn judged_record(&mut self, record: &Value) {
+        if let Some(row) = record["key"]
+            .as_str()
+            .and_then(|key| self.known.get_mut(key))
+            && row.open()
+        {
+            row.state = "cleared".to_string();
         }
     }
 
@@ -3622,6 +3636,10 @@ times in a row)",
                             fired_event_id: 0,
                             fired_at_ms: 0,
                         });
+                    } else if let Some(row) = self.known.get_mut(&key) {
+                        // A clear the store refused: the alert is not open
+                        // there (cleared or judged), so it is not retried.
+                        row.state = "cleared".to_string();
                     }
                     lines.push(format!("alerts: {key}: {why}"));
                 }
@@ -4460,6 +4478,44 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
         rows["cursor"].as_i64().unwrap_or_default()
     };
     follow_stream(&store, after, json)
+}
+
+/// The verdicts an owner may give an alert (objective 092).
+pub(crate) const VERDICTS: [&str; 3] = ["false", "stale", "duplicate"];
+
+const JUDGE_USAGE: &str = "usage: spawn alert judge <key> false|stale|duplicate";
+
+/// The arguments of `spawn alert`: `judge <key> <verdict>`, the key and
+/// the verdict, or why they are not.
+pub(crate) fn judge_arguments(arguments: &[String]) -> Result<(String, String), String> {
+    match arguments {
+        [verb, key, verdict] if verb == "judge" => {
+            if key.trim().is_empty() {
+                return Err(format!("the key is empty\n{JUDGE_USAGE}"));
+            }
+            if !VERDICTS.contains(&verdict.as_str()) {
+                return Err(format!(
+                    "{verdict:?} is not a verdict (false, stale or duplicate)\n{JUDGE_USAGE}"
+                ));
+            }
+            Ok((key.clone(), verdict.clone()))
+        }
+        _ => Err(JUDGE_USAGE.to_string()),
+    }
+}
+
+/// `spawn alert judge <key> false|stale|duplicate`: the owner's judgement
+/// of an alert that should not have been raised. It records `alert.judged`
+/// through `spawn_alert_record`; an open alert is cleared by it. The store
+/// refuses a key no alert has, a notice and an alert judged already.
+pub(crate) fn alert(arguments: &[String]) -> Result<i32, String> {
+    let (key, verdict) = judge_arguments(arguments)?;
+    let store = open_store()?;
+    let id = store
+        .alert_judge(&key, &verdict)
+        .map_err(|error| format!("{key} was not judged: {error}"))?;
+    println!("judged {key} {verdict} (event {id})");
+    Ok(0)
 }
 
 /// One alert as a line for a person: its state, kind, subject, time and
