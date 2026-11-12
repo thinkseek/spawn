@@ -24,22 +24,17 @@
 //! `out` when it does not, `no_range` without a range and `not_collected`
 //! without a value.
 //!
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
 //! The performance figures (objective 086) are the pages': the Scorecard's
 //! fleet scope over its default 7 days (report to live, the gate time's
 //! median, the share of gate time that decided nothing, first pass) and
 //! `/api/cost?window=7d`'s dollars per landing ([`performance`]), kept for a
 //! minute so a Home poll does not compute them again at every request. The
 //! storage figures are health.storage's on `/api/fleet`, read the same way
-//! ([`super::storage::report`]). The other lines' north stars are not
-=======
-//! The storage figures are health.storage's on `/api/fleet`, read the same
-//! way ([`super::storage::report`]). The recoverability guardrails
-//! (objective 087, [`recoverability`]) are the ages of the newest database
-//! copy and bundle (health.backups on `/api/fleet`), the age of the oldest
-//! nightly judging and how many sources the nightly holds red (its fact
-//! files, [`nightly_facts`]). The other lines' north stars are not
->>>>>>> aa8c535f0d9d2c8532b8db571dbba3ae26242767
+//! ([`super::storage::report`]). The recoverability guardrails (objective
+//! 087, [`recoverability`]) are the ages of the newest database copy and
+//! bundle (health.backups on `/api/fleet`), the age of the oldest nightly
+//! judging and how many sources the nightly holds red (its fact files,
+//! [`nightly_facts`]). The other lines' north stars are not
 //! collected yet; later objectives add their figures to this frame.
 //!
 //! No range lives in code: they come only from the ranges file,
@@ -197,7 +192,92 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
     })
 }
 
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
+/// The nightly's fact files under `<workspace root>/nightly`, as
+/// scripts/rsi/nightly.sh writes them (`<source>.json`; a source's name may
+/// hold dots): every non-hidden `*.json` there, read and parsed. The
+/// scenario logs beside them (`<source>.<scenario>.log`), the lock
+/// (`.<source>.lock`) and the run files (`.run-*`) are not facts; a file
+/// that cannot be read or parsed as an object is passed over. `None`
+/// without the directory.
+pub(super) fn nightly_facts(dir: Option<&Path>) -> Option<Vec<Value>> {
+    let entries = std::fs::read_dir(dir?).ok()?;
+    let mut facts = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with('.') || Path::new(name).extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if let Ok(fact @ Value::Object(_)) = serde_json::from_str::<Value>(&text) {
+            facts.push(fact);
+        }
+    }
+    Some(facts)
+}
+
+/// The recoverability guardrails at `now_ms`, from `backups` (health.backups
+/// on `/api/fleet`: `{dump, bundle}`, each `{at_ms, ...}` or null) and the
+/// nightly's fact files (`None`: no directory):
+/// - the age of the newest database copy and of the newest bundle, null
+///   without the record;
+/// - the age of the oldest nightly judging (`judged_at`), a fact with none
+///   passed over; null without one;
+/// - the facts whose `red_since` is set (a non-empty string, as the
+///   integrator's `nightly_red` holds a source's landings); null without a
+///   fact.
+pub(super) fn recoverability(backups: &Value, facts: Option<&[Value]>, now_ms: i64) -> Vec<Figure> {
+    let age =
+        |at: Option<i64>| at.map_or(Value::Null, |at| json!(now_ms.saturating_sub(at).max(0)));
+    let facts = facts.filter(|facts| !facts.is_empty());
+    let oldest = facts.and_then(|facts| {
+        facts
+            .iter()
+            .filter_map(|fact| fact["judged_at"].as_i64())
+            .min()
+    });
+    let red = facts.map_or(Value::Null, |facts| {
+        json!(
+            facts
+                .iter()
+                .filter(|fact| fact["red_since"]
+                    .as_str()
+                    .is_some_and(|since| !since.is_empty()))
+                .count()
+        )
+    });
+    vec![
+        Figure::new(
+            "recoverability.cloud_dump_age",
+            "Age of the newest database copy",
+            "ms",
+            age(backups["dump"]["at_ms"].as_i64()),
+        ),
+        Figure::new(
+            "recoverability.cloud_bundle_age",
+            "Age of the newest bundle",
+            "ms",
+            age(backups["bundle"]["at_ms"].as_i64()),
+        ),
+        Figure::new(
+            "recoverability.nightly_age",
+            "Age of the oldest nightly judging",
+            "ms",
+            age(oldest),
+        ),
+        Figure::new(
+            "recoverability.nightly_red",
+            "Nightly sources held red",
+            "count",
+            red,
+        ),
+    ]
+}
+
 /// How long the performance figures are kept: a Home poll must not compute
 /// the 7-day scorecard and cost window again at every request.
 const PERFORMANCE_KEPT_MS: i64 = 60_000;
@@ -301,98 +381,6 @@ fn performance_line(performance: &Value) -> Line {
 
 /// The storage line, from health.storage.
 fn storage_line(storage: &Value) -> Line {
-=======
-/// The nightly's fact files under `<workspace root>/nightly`, as
-/// scripts/rsi/nightly.sh writes them (`<source>.json`; a source's name may
-/// hold dots): every non-hidden `*.json` there, read and parsed. The
-/// scenario logs beside them (`<source>.<scenario>.log`), the lock
-/// (`.<source>.lock`) and the run files (`.run-*`) are not facts; a file
-/// that cannot be read or parsed as an object is passed over. `None`
-/// without the directory.
-pub(super) fn nightly_facts(dir: Option<&Path>) -> Option<Vec<Value>> {
-    let entries = std::fs::read_dir(dir?).ok()?;
-    let mut facts = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name.starts_with('.') || Path::new(name).extension().is_none_or(|ext| ext != "json") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        if let Ok(fact @ Value::Object(_)) = serde_json::from_str::<Value>(&text) {
-            facts.push(fact);
-        }
-    }
-    Some(facts)
-}
-
-/// The recoverability guardrails at `now_ms`, from `backups` (health.backups
-/// on `/api/fleet`: `{dump, bundle}`, each `{at_ms, ...}` or null) and the
-/// nightly's fact files (`None`: no directory):
-/// - the age of the newest database copy and of the newest bundle, null
-///   without the record;
-/// - the age of the oldest nightly judging (`judged_at`), a fact with none
-///   passed over; null without one;
-/// - the facts whose `red_since` is set (a non-empty string, as the
-///   integrator's `nightly_red` holds a source's landings); null without a
-///   fact.
-pub(super) fn recoverability(backups: &Value, facts: Option<&[Value]>, now_ms: i64) -> Vec<Figure> {
-    let age =
-        |at: Option<i64>| at.map_or(Value::Null, |at| json!(now_ms.saturating_sub(at).max(0)));
-    let facts = facts.filter(|facts| !facts.is_empty());
-    let oldest = facts.and_then(|facts| {
-        facts
-            .iter()
-            .filter_map(|fact| fact["judged_at"].as_i64())
-            .min()
-    });
-    let red = facts.map_or(Value::Null, |facts| {
-        json!(
-            facts
-                .iter()
-                .filter(|fact| fact["red_since"]
-                    .as_str()
-                    .is_some_and(|since| !since.is_empty()))
-                .count()
-        )
-    });
-    vec![
-        Figure::new(
-            "recoverability.cloud_dump_age",
-            "Age of the newest database copy",
-            "ms",
-            age(backups["dump"]["at_ms"].as_i64()),
-        ),
-        Figure::new(
-            "recoverability.cloud_bundle_age",
-            "Age of the newest bundle",
-            "ms",
-            age(backups["bundle"]["at_ms"].as_i64()),
-        ),
-        Figure::new(
-            "recoverability.nightly_age",
-            "Age of the oldest nightly judging",
-            "ms",
-            age(oldest),
-        ),
-        Figure::new(
-            "recoverability.nightly_red",
-            "Nightly sources held red",
-            "count",
-            red,
-        ),
-    ]
-}
-
-/// The four lines, the storage line's figures from `storage` (health.storage
-/// as [`super::storage::report`] gives it), the recoverability guardrails
-/// `recoverability` ([`recoverability`]).
-pub(super) fn lines(storage: &Value, recoverability: Vec<Figure>) -> Vec<Line> {
->>>>>>> aa8c535f0d9d2c8532b8db571dbba3ae26242767
     let database = &storage["database"];
     let ratio = match (database["bytes"].as_f64(), database["log_bytes"].as_f64()) {
         (Some(bytes), Some(log)) if log > 0.0 => json!(bytes / log),
@@ -453,8 +441,13 @@ pub(super) fn lines(storage: &Value, recoverability: Vec<Figure>) -> Vec<Line> {
 
 /// The four lines: the performance line's figures from `performance`
 /// ([`performance`]), the storage line's from `storage` (health.storage as
-/// [`super::storage::report`] gives it).
-pub(super) fn lines(storage: &Value, performance: &Value) -> Vec<Line> {
+/// [`super::storage::report`] gives it), the recoverability guardrails
+/// `recoverability` ([`recoverability`]).
+pub(super) fn lines(
+    storage: &Value,
+    performance: &Value,
+    recoverability: Vec<Figure>,
+) -> Vec<Line> {
     vec![
         performance_line(performance),
         storage_line(storage),
@@ -564,22 +557,18 @@ pub(super) fn core_lines_at(
     path: Option<&Path>,
     nightly: Option<&Path>,
 ) -> Result<Value, String> {
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
     let now_ms = super::now_ms();
     let storage = super::storage::report(store, now_ms)?;
     let performance = performance_now(store, now_ms);
-    let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
-    Ok(answer(
-        &lines(&storage, &performance),
-=======
-    let now = super::now_ms();
-    let storage = super::storage::report(store, now)?;
     let backups = store.newest_backups().map_err(super::err)?;
     let facts = nightly_facts(nightly);
     let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
     Ok(answer(
-        &lines(&storage, recoverability(&backups, facts.as_deref(), now)),
->>>>>>> aa8c535f0d9d2c8532b8db571dbba3ae26242767
+        &lines(
+            &storage,
+            &performance,
+            recoverability(&backups, facts.as_deref(), now_ms),
+        ),
         &file,
         read_ranges(path),
     ))
@@ -587,14 +576,10 @@ pub(super) fn core_lines_at(
 
 #[cfg(test)]
 mod tests {
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
-    use super::{Figure, answer, figure_json, lines, parse_ranges, performance, read_ranges};
-=======
     use super::{
-        Figure, answer, figure_json, lines, nightly_facts, parse_ranges, read_ranges,
+        Figure, answer, figure_json, lines, nightly_facts, parse_ranges, performance, read_ranges,
         recoverability,
     };
->>>>>>> aa8c535f0d9d2c8532b8db571dbba3ae26242767
     use serde_json::{Value, json};
 
     const KNOWN: [&str; 3] = ["a.one", "a.two", "a.three"];
@@ -699,11 +684,7 @@ mod tests {
             ],
         });
         let view = answer(
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
-            &lines(&storage, &Value::Null),
-=======
-            &lines(&storage, Vec::new()),
->>>>>>> aa8c535f0d9d2c8532b8db571dbba3ae26242767
+            &lines(&storage, &Value::Null, Vec::new()),
             &json!("/ws/core-lines.json"),
             Ok(None),
         );
@@ -741,11 +722,8 @@ mod tests {
         // No log size: no ratio; no readable test database: none.
         let bare = lines(
             &json!({"database": {"bytes": 300, "log_bytes": 0}, "test_databases": []}),
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
             &Value::Null,
-=======
             Vec::new(),
->>>>>>> aa8c535f0d9d2c8532b8db571dbba3ae26242767
         );
         assert_eq!(bare[1].guardrails[2].value, Value::Null);
         assert_eq!(bare[1].guardrails[3].value, Value::Null);
@@ -764,7 +742,6 @@ mod tests {
         assert_eq!(view["ignored_ranges"], json!([]));
     }
 
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
     /// Objective 086: the performance line from a scorecard and a cost
     /// answer, as the pages give them.
     #[test]
@@ -786,7 +763,7 @@ mod tests {
         assert!((share - 300_000.0 / 5_100_000.0).abs() < 1e-12, "{share}");
         assert_eq!(values["first_pass"], json!(0.749));
         assert_eq!(values["usd_per_landing"], json!(8.08));
-        let line = &lines(&json!({}), &values)[0];
+        let line = &lines(&json!({}), &values, Vec::new())[0];
         let keys: Vec<&str> = std::iter::once(&line.north_star)
             .chain(&line.guardrails)
             .map(|figure| figure.key)
@@ -814,7 +791,7 @@ mod tests {
             json!({"report_to_live": null, "gate_time": null, "decided_nothing": null,
                    "first_pass": null, "usd_per_landing": null})
         );
-        let line = &lines(&json!({}), &none)[0];
+        let line = &lines(&json!({}), &none, Vec::new())[0];
         assert!(
             std::iter::once(&line.north_star)
                 .chain(&line.guardrails)
@@ -822,7 +799,8 @@ mod tests {
         );
         // Neither answer read: every value null.
         assert_eq!(performance(&Value::Null, &Value::Null), none);
-=======
+    }
+
     fn values(figures: &[Figure]) -> Vec<(&'static str, Value)> {
         figures
             .iter()
@@ -860,7 +838,7 @@ mod tests {
         assert_eq!(bundle_only[0].value, Value::Null);
         assert_eq!(bundle_only[1].value, json!(6_000));
         // The line carries them as its guardrails, in order.
-        let line = &lines(&json!({}), both)[3];
+        let line = &lines(&json!({}), &Value::Null, both)[3];
         assert_eq!(line.name, "recoverability");
         assert_eq!(
             line.guardrails
@@ -936,6 +914,5 @@ mod tests {
         assert_eq!(figures[2].value, Value::Null);
         assert_eq!(figures[3].value, json!(1));
         let _ = std::fs::remove_dir_all(&dir);
->>>>>>> aa8c535f0d9d2c8532b8db571dbba3ae26242767
     }
 }
