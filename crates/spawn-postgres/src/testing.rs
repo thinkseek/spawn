@@ -237,3 +237,7 @@ mod tests {
         assert_ne!(first.name(), second.name());
     }
 }
+
+/// `fleet_health`'s statement, for a test to read its plan (its
+/// interventions count must read the day, not the log: tests/experience.rs).
+pub const FLEET_HEALTH: &str = crate::fleet::FLEET_HEALTH;

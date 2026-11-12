@@ -5494,6 +5494,40 @@ union all
 select i.at_ms, 'human', i.session_id, i.agent_id, i.principal
 from spawn_human_intents i;
 
+-- The assignment records (a `task.assigned`, a legacy task row) by mission
+-- and objective, and by mission and brief: spawn_interventions finds a
+-- cancelled task's attempts of the same work and the next assignment of it
+-- by these, never by reading the rest of the control stream.
+create index if not exists spawn_events_control_assignment_objective
+    on spawn_events (spawn_experience_int(coalesce(kind -> 'detail' -> 'record' -> 'mission_id',
+                                                   kind -> 'detail' -> 'record' -> 'row' -> 'mission_id')),
+                     spawn_experience_int(coalesce(kind -> 'detail' -> 'record' -> 'objective',
+                                                   kind -> 'detail' -> 'record' -> 'row' -> 'objective')),
+                     session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and (kind -> 'detail' -> 'record' ->> 'type' = 'task.assigned'
+           or (kind -> 'detail' -> 'record' ->> 'type' = 'legacy.imported'
+               and kind -> 'detail' -> 'record' ->> 'table' = 'mission_tasks'));
+create index if not exists spawn_events_control_assignment_brief
+    on spawn_events (spawn_experience_int(coalesce(kind -> 'detail' -> 'record' -> 'mission_id',
+                                                   kind -> 'detail' -> 'record' -> 'row' -> 'mission_id')),
+                     md5(coalesce(kind -> 'detail' -> 'record' ->> 'brief',
+                                  kind -> 'detail' -> 'record' -> 'row' ->> 'brief')),
+                     session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and (kind -> 'detail' -> 'record' ->> 'type' = 'task.assigned'
+           or (kind -> 'detail' -> 'record' ->> 'type' = 'legacy.imported'
+               and kind -> 'detail' -> 'record' ->> 'table' = 'mission_tasks'));
+
+-- The control records of a type, by time: a window's records of a type
+-- (spawn_interventions' assignments and resumptions of `[$1, $2)`) and the
+-- newest record of a type (host.rs's NEWEST_PASSED, spelled as it spells
+-- the type) are read without reading the stream, under a generic plan too
+-- (the window and the type parameters).
+create index if not exists spawn_events_control_record_type
+    on spawn_events ((kind -> 'detail' -> 'record' ->> 'type'), recorded_at_ms, id)
+    where session_id = 'session_control' and event_name = 'control.recorded';
+
 -- Every intervention, exactly the scorecard's (docs/design.md §15, autonomy
 -- (a)-(d)): `command`, a person's intent (`spawn_human_intents`: a refused
 -- command sent again is one), at its time, `command_id` its first command;
@@ -5501,12 +5535,24 @@ from spawn_human_intents i;
 -- a mission accepted by review; `cancel_reassign`, a person's cancellation
 -- of an open task followed by the same work (the same objective, or without
 -- one the same brief) assigned again in the mission, at that assignment
--- (`task_id` the new task, `cancelled_task_id` the one cancelled). The
--- reassignment is read from the `task.assigned` records themselves, with
--- spawn_experience_assignments' expressions: that view's window (`next_seq`)
--- keeps a mission's predicate out of it, so a lateral over it folded every
--- assignment of the log once per cancelled task (/api/interventions, 12 s
--- on the live log of 2026-11-11, past its 10 s statement timeout).
+-- (`task_id` the new task, `cancelled_task_id` the one cancelled).
+--
+-- Each kind's time is a column of its base scan, so a reader's window
+-- (`at_ms >= $1 and at_ms < $2`, under a generic plan too, or bounds that
+-- are values such as `(select ms from now)`; never a join with another
+-- relation, which is applied after the whole history) reaches the scan
+-- and the read grows with the window, not the log (the view before worked
+-- the whole history out and bounded it last: 1.1 s on the live log of
+-- 2026-11-13). A reassignment starts from the assignment (`task.assigned`,
+-- in the window by spawn_events_name_time): the earlier assignments of the
+-- same work in its mission (its objective, or without one its brief:
+-- spawn_events_control_assignment_objective, _brief), each one's span closed
+-- as spawn_task_spans closes it (its next assignment and first closing
+-- record by the task's id; a legacy row its row closed has no closing
+-- record), kept when a person cancelled it and no assignment of that work
+-- came between: this assignment is its reassignment. The view before is
+-- the tests' oracle (tests/experience.rs). A further kind is one more
+-- branch whose time is its base scan's.
 create or replace view spawn_interventions as
 select i.at_ms, 'command'::text as kind, null::bigint as mission_id,
        null::bigint as task_id, i.intent as command_id, null::bigint as cancelled_task_id
@@ -5516,34 +5562,114 @@ select r.at_ms, 'resume', spawn_experience_int(r.record -> 'id'), null, null, nu
 from spawn_experience_records r
 where r.type = 'mission.resumed' and spawn_experience_int(r.record -> 'id') is not null
 union all
-select a.assigned_at_ms, 'owner_task', a.mission_id, a.task_id, null, null
-from spawn_experience_assignments a
-where a.type = 'task.assigned' and a.created_by = 'human'
-  and coalesce((select s.review from spawn_experience_settings s
-                 where s.mission_id = a.mission_id and s.seq < a.seq
-                 order by s.seq desc limit 1), true)
+select r.at_ms, 'owner_task', a.mission_id, a.task_id, null, null
+  from spawn_experience_records r
+ cross join lateral (
+       select spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')) as task_id,
+              spawn_experience_int(coalesce(r.record -> 'mission_id', r.record -> 'row' -> 'mission_id'))
+                  as mission_id) a
+ where r.type = 'task.assigned'
+   and a.task_id is not null and a.mission_id is not null
+   and coalesce(r.record ->> 'created_by', r.record -> 'row' ->> 'created_by') = 'human'
+   and coalesce((select s.review from spawn_experience_settings s
+                  where s.mission_id = a.mission_id and s.seq < r.seq
+                  order by s.seq desc limit 1), true)
 union all
-select n.assigned_at_ms, 'cancel_reassign', t.mission_id, n.task_id, null, t.task_id
-from spawn_task_spans t
-join spawn_experience_records x on x.seq = t.closed_seq
-cross join lateral (
-    select r.at_ms as assigned_at_ms,
-           spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')) as task_id
-      from spawn_experience_records r
-     where r.type = 'task.assigned' and r.seq > t.closed_seq
-       and spawn_experience_int(coalesce(r.record -> 'mission_id', r.record -> 'row' -> 'mission_id'))
-           = t.mission_id
-       and spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')) is not null
-       and case when t.objective is not null
-                then spawn_experience_int(coalesce(r.record -> 'objective', r.record -> 'row' -> 'objective'))
-                     = t.objective
-                else t.brief is not null
-                     and coalesce(r.record ->> 'brief', r.record -> 'row' ->> 'brief') = t.brief end
-     order by r.seq
-     limit 1
-) n
-where t.outcome = 'cancelled'
-  and (jsonb_typeof(x.record -> 'by') is distinct from 'string' or x.record ->> 'by' = 'human');
+select w.at_ms, 'cancel_reassign', n.mission_id, n.task_id, null, p.task_id
+  from spawn_experience_records w
+ cross join lateral (
+       select w.seq,
+              spawn_experience_int(coalesce(w.record -> 'id', w.record -> 'row' -> 'id')) as task_id,
+              spawn_experience_int(coalesce(w.record -> 'mission_id', w.record -> 'row' -> 'mission_id'))
+                  as mission_id,
+              spawn_experience_int(coalesce(w.record -> 'objective', w.record -> 'row' -> 'objective'))
+                  as objective,
+              coalesce(w.record ->> 'brief', w.record -> 'row' ->> 'brief') as brief) n
+ cross join lateral (
+       -- The earlier assignments of n's work in its mission: of its
+       -- objective, or (one without an objective) of its brief.
+       select r.seq, r.type, r.record,
+              spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')) as task_id,
+              spawn_experience_int(coalesce(r.record -> 'objective', r.record -> 'row' -> 'objective'))
+                  as objective,
+              coalesce(r.record ->> 'brief', r.record -> 'row' ->> 'brief') as brief
+         from spawn_experience_records r
+        where (r.type = 'task.assigned'
+               or (r.type = 'legacy.imported' and r.record ->> 'table' = 'mission_tasks'))
+          and spawn_experience_int(coalesce(r.record -> 'mission_id', r.record -> 'row' -> 'mission_id'))
+              = n.mission_id
+          and spawn_experience_int(coalesce(r.record -> 'objective', r.record -> 'row' -> 'objective'))
+              = n.objective
+          and r.seq < n.seq
+       union all
+       select r.seq, r.type, r.record,
+              spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')),
+              null::bigint,
+              coalesce(r.record ->> 'brief', r.record -> 'row' ->> 'brief')
+         from spawn_experience_records r
+        where (r.type = 'task.assigned'
+               or (r.type = 'legacy.imported' and r.record ->> 'table' = 'mission_tasks'))
+          and spawn_experience_int(coalesce(r.record -> 'mission_id', r.record -> 'row' -> 'mission_id'))
+              = n.mission_id
+          and md5(coalesce(r.record ->> 'brief', r.record -> 'row' ->> 'brief')) = md5(n.brief)
+          and coalesce(r.record ->> 'brief', r.record -> 'row' ->> 'brief') = n.brief
+          and spawn_experience_int(coalesce(r.record -> 'objective', r.record -> 'row' -> 'objective'))
+              is null
+          and r.seq < n.seq
+     ) p
+ -- Its span, as spawn_task_spans closes it: up to the task's next
+ -- assignment; a legacy row its row closed has no closing record.
+ cross join lateral (
+       select min(r.seq) as next_seq
+         from spawn_experience_records r
+        where (r.type = 'task.assigned'
+               or (r.type = 'legacy.imported' and r.record ->> 'table' = 'mission_tasks'))
+          and spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')) = p.task_id
+          and spawn_experience_int(coalesce(r.record -> 'mission_id', r.record -> 'row' -> 'mission_id'))
+              is not null
+          and r.seq > p.seq) x
+ cross join lateral (
+       select r.seq, r.type, r.record
+         from spawn_experience_records r
+        where r.seq > p.seq and (x.next_seq is null or r.seq < x.next_seq)
+          and spawn_experience_int(r.record -> 'id') = p.task_id
+          and (r.type in ('task.landed', 'task.cancelled', 'task.aborted', 'task.over_budget')
+               or (r.type = 'task.reviewed'
+                   and lower(r.record ->> 'accepted') in ('true', 't')
+                   and not coalesce((select s.gated from spawn_experience_settings s
+                                      where s.mission_id = n.mission_id and s.seq < r.seq
+                                      order by s.seq desc limit 1), false)))
+        order by r.seq
+        limit 1) c
+ where w.type = 'task.assigned'
+   and n.task_id is not null and n.mission_id is not null and p.task_id is not null
+   and not (p.type = 'legacy.imported'
+            and (p.record -> 'row' ->> 'state' in ('cancelled', 'landed')
+                 or (p.record -> 'row' ->> 'state' = 'accepted'
+                     and not coalesce((select s.gated from spawn_experience_settings s
+                                        where s.mission_id = n.mission_id and s.seq < p.seq
+                                        order by s.seq desc limit 1), false))))
+   and c.type = 'task.cancelled' and c.seq < n.seq
+   and (jsonb_typeof(c.record -> 'by') is distinct from 'string' or c.record ->> 'by' = 'human')
+   -- No assignment of the cancelled task's work came between: n is the
+   -- first after the cancellation (of its objective; without one, of its
+   -- brief, whatever objective that assignment has).
+   and (p.objective is null or not exists (
+       select 1 from spawn_experience_records r
+        where r.type = 'task.assigned' and r.seq > c.seq and r.seq < n.seq
+          and spawn_experience_int(coalesce(r.record -> 'mission_id', r.record -> 'row' -> 'mission_id'))
+              = n.mission_id
+          and spawn_experience_int(coalesce(r.record -> 'objective', r.record -> 'row' -> 'objective'))
+              = p.objective
+          and spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')) is not null))
+   and (p.objective is not null or not exists (
+       select 1 from spawn_experience_records r
+        where r.type = 'task.assigned' and r.seq > c.seq and r.seq < n.seq
+          and spawn_experience_int(coalesce(r.record -> 'mission_id', r.record -> 'row' -> 'mission_id'))
+              = n.mission_id
+          and md5(coalesce(r.record ->> 'brief', r.record -> 'row' ->> 'brief')) = md5(p.brief)
+          and coalesce(r.record ->> 'brief', r.record -> 'row' ->> 'brief') = p.brief
+          and spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')) is not null));
 
 -- Each task's closing record: `landed`, `accepted` (a review that closes it),
 -- `cancelled`, `aborted` or `over_budget`; `by`, the record's own.
