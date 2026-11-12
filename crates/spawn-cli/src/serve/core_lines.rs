@@ -283,33 +283,7 @@ pub(super) fn lines(storage: &Value, observed: &Observed) -> Vec<Line> {
                 ),
             ],
         },
-        Line {
-            name: "observability",
-            north_star: Figure::not_collected(
-                "observability.needs_you_right",
-                "Needs you is right",
-                "share",
-            ),
-            guardrails: vec![
-                Figure::new(
-                    "observability.unpriced_share",
-                    "Use with no price",
-                    "share",
-                    unpriced_share(&observed.cost_total),
-                ),
-                Figure::new(
-                    "observability.interventions_per_agent_hour",
-                    "Human interventions per agent-hour",
-                    "ratio",
-                    if observed.human_per_agent_hour.is_number() {
-                        observed.human_per_agent_hour.clone()
-                    } else {
-                        Value::Null
-                    },
-                ),
-                Figure::not_collected(NOT_MEASURED, "Figures not measured", "count"),
-            ],
-        },
+        observability_line(observed),
         Line {
             name: "recoverability",
             north_star: Figure::not_collected(
@@ -322,6 +296,37 @@ pub(super) fn lines(storage: &Value, observed: &Observed) -> Vec<Line> {
     ];
     count_not_measured(&mut lines);
     lines
+}
+
+/// The observability line (objective 088), its count not measured yet set.
+fn observability_line(observed: &Observed) -> Line {
+    Line {
+        name: "observability",
+        north_star: Figure::not_collected(
+            "observability.needs_you_right",
+            "Needs you is right",
+            "share",
+        ),
+        guardrails: vec![
+            Figure::new(
+                "observability.unpriced_share",
+                "Use with no price",
+                "share",
+                unpriced_share(&observed.cost_total),
+            ),
+            Figure::new(
+                "observability.interventions_per_agent_hour",
+                "Human interventions per agent-hour",
+                "ratio",
+                if observed.human_per_agent_hour.is_number() {
+                    observed.human_per_agent_hour.clone()
+                } else {
+                    Value::Null
+                },
+            ),
+            Figure::not_collected(NOT_MEASURED, "Figures not measured", "count"),
+        ],
+    }
 }
 
 /// Sets the count of figures not measured: those of `lines` with no value,
@@ -424,7 +429,11 @@ pub(super) fn core_lines_at(
         human_per_agent_hour: health["human_per_agent_hour"].clone(),
     };
     let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
-    Ok(answer(&lines(&storage, &observed), &file, read_ranges(path)))
+    Ok(answer(
+        &lines(&storage, &observed),
+        &file,
+        read_ranges(path),
+    ))
 }
 
 #[cfg(test)]
@@ -535,7 +544,11 @@ mod tests {
                 {"role": "x", "bytes": 9, "schemas": 1},
             ],
         });
-        let view = answer(&lines(&storage, &Observed::default()), &json!("/ws/core-lines.json"), Ok(None));
+        let view = answer(
+            &lines(&storage, &Observed::default()),
+            &json!("/ws/core-lines.json"),
+            Ok(None),
+        );
         let names: Vec<&str> = view["lines"]
             .as_array()
             .expect("lines")
@@ -611,7 +624,10 @@ mod tests {
         };
         let all = lines(&storage, &observed);
         let observability = &all[2];
-        assert_eq!(observability.north_star.key, "observability.needs_you_right");
+        assert_eq!(
+            observability.north_star.key,
+            "observability.needs_you_right"
+        );
         assert_eq!(observability.north_star.value, Value::Null);
         let guardrails: Vec<(&str, &str, Value)> = observability
             .guardrails
