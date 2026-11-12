@@ -183,3 +183,33 @@ test("a test database the server could not read is said unreadable, and kept", (
   assert.deepEqual(normalizeStorage(STORAGE)?.test_databases, []);
   assert.equal(normalizeStorage(STORAGE)?.database?.log_bytes, null);
 });
+
+test("fresh test databases (no schema) are no rows; a tiny log is not said", () => {
+  const fresh = storageView({
+    ...TESTED,
+    database: { ...TESTED.database, log_bytes: 1392 },
+    test_databases: [{ role: "test", name: "spawn_test", bytes: 8 * MB, schemas: 0 }],
+  }).rows;
+  assert.deepEqual(
+    fresh.map((row) => row.name),
+    ["Transcript archive", "Claude Code transcripts", "Workspaces", "Database"],
+  );
+  assert.equal(fresh[3].note, "largest: spawn_events 2.5 GB", "log 0.0 MB would say nothing");
+  // One schema in either shows both, the empty one with "0 schemas".
+  const left = storageView({
+    ...TESTED,
+    test_databases: [
+      { role: "test", name: "spawn_test", bytes: 8 * MB, schemas: 0 },
+      { role: "fleet_test", name: "spawn_fleet_test", bytes: 9 * MB, schemas: 1 },
+    ],
+  }).rows;
+  assert.deepEqual(
+    left.slice(4).map((row) => [row.name, row.note]),
+    [
+      ["Gate test database", "0 schemas"],
+      ["Fleet test database", "1 schema"],
+    ],
+  );
+  const small = storageView({ ...TESTED, database: { ...TESTED.database, log_bytes: 0.06 * MB } }).rows;
+  assert.equal(small[3].note, "largest: spawn_events 2.5 GB, log 0.1 MB");
+});
