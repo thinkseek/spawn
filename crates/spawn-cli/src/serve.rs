@@ -2484,10 +2484,10 @@ mod tests {
 
     use super::{
         Arc, BAD_REQUEST, DEFAULT_LIMIT, LogStart, MAX_INPUT_BODY, MAX_INPUT_TEXT, MAX_LIMIT,
-        ProcSocket, Shared, access_token, backups, handle, is_json, is_loopback, local_exemption,
-        log_window, objective_json, objective_prompt, open_network_request, open_networks,
-        owner_uid, peer_uid, proc_sockets, rsi_objective, rsi_summary, same_origin, same_secret,
-        Slots, keep_listening, listen_again_pause, serve_requests, server_hosts,
+        ProcSocket, Shared, Slots, access_token, backups, handle, is_json, is_loopback,
+        keep_listening, listen_again_pause, local_exemption, log_window, objective_json,
+        objective_prompt, open_network_request, open_networks, owner_uid, peer_uid, proc_sockets,
+        rsi_objective, rsi_summary, same_origin, same_secret, serve_requests, server_hosts,
         tokenless_request, typed_text, with_last_gates, with_objectives,
     };
     use crate::objectives::Task;
@@ -4534,15 +4534,24 @@ mod tests {
             },
             |_address: &str| {
                 listens += 1;
-                if listens == 1 { Ok(2u32) } else { Err("address in use".to_string()) }
+                if listens == 1 {
+                    Ok(2u32)
+                } else {
+                    Err("address in use".to_string())
+                }
             },
             |_stops| std::time::Duration::ZERO,
         );
-        assert_eq!(served, vec![1, 2], "the first listener, then the one listened on again");
+        assert_eq!(
+            served,
+            vec![1, 2],
+            "the first listener, then the one listened on again"
+        );
         assert_eq!(listens, 1 + 5, "one listen that worked, then five tries");
         let error = outcome.expect_err("serve gives up with an error, never Ok(0)");
         assert!(
-            error.contains("cannot listen again on 127.0.0.1:9") && error.contains("(5 tries)")
+            error.contains("cannot listen again on 127.0.0.1:9")
+                && error.contains("(5 tries)")
                 && error.contains("address in use"),
             "{error}"
         );
@@ -4552,7 +4561,14 @@ mod tests {
     fn the_pause_before_listening_again_doubles_from_200_ms_to_at_most_5_s() {
         let millis = |stops| listen_again_pause(stops).as_millis();
         assert_eq!(
-            [millis(1), millis(2), millis(3), millis(5), millis(6), millis(40)],
+            [
+                millis(1),
+                millis(2),
+                millis(3),
+                millis(5),
+                millis(6),
+                millis(40)
+            ],
             [200, 400, 800, 3200, 5000, 5000]
         );
     }
@@ -4606,12 +4622,16 @@ mod tests {
             .expect("the stopped listener is listened on again within 10 s");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let answer = loop {
-            let attempt = std::net::TcpStream::connect(("127.0.0.1", port)).and_then(|mut stream| {
-                write!(stream, "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")?;
-                let mut answer = String::new();
-                stream.read_to_string(&mut answer)?;
-                Ok(answer)
-            });
+            let attempt =
+                std::net::TcpStream::connect(("127.0.0.1", port)).and_then(|mut stream| {
+                    write!(
+                        stream,
+                        "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                    )?;
+                    let mut answer = String::new();
+                    stream.read_to_string(&mut answer)?;
+                    Ok(answer)
+                });
             match attempt {
                 Ok(answer) if !answer.is_empty() => break answer,
                 _ if std::time::Instant::now() < deadline => {
