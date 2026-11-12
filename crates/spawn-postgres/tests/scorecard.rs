@@ -1137,6 +1137,17 @@ fn the_kept_facts_take_a_late_commit_an_earlier_end_and_keep_stores_apart() {
             800 + n,
         );
     }
+    // A person's command after them: a fact with the highest id, so the
+    // kept reading's id window starts above every one of the 300.
+    command(
+        &mut client,
+        "human",
+        "after-the-300",
+        &json!({"type": "input", "text": "x"}),
+        None,
+        None,
+        1150,
+    );
     assert_eq!(
         kept.scorecard_facts(1200).expect("facts"),
         oracle(&mut client, 1200)
@@ -1152,8 +1163,8 @@ fn the_kept_facts_take_a_late_commit_an_earlier_end_and_keep_stores_apart() {
     assert_eq!(finished, oracle(&mut client, 1400));
     assert_eq!(
         finished["commands"].as_array().map(Vec::len),
-        Some(1),
-        "{finished}"
+        Some(2),
+        "the person's and the failed one: {finished}"
     );
 }
 
