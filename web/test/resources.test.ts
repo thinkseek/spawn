@@ -99,7 +99,26 @@ test("the storage rows say what uses the disk, its growth and Claude Code's fall
     { name: "Workspaces", size: "2.0 MB", note: "" },
     { name: "Database", size: "2.7 GB", note: "largest: spawn_events 2.5 GB" },
   ]);
-  assert.equal(lasts, "about 5,714 days at the archive's growth");
+  assert.equal(lasts, "about 5,714 days at the growth of the archive, Claude Code's transcripts and the database");
+});
+
+test("how long the disk lasts is said at the growth of what persists; the archive keeps its own", () => {
+  const view = storageView({
+    ...STORAGE,
+    growth_bytes_per_day: 2 * MB,
+    growth_parts: { archive: 2 * MB, projects: MB, database: 7 * MB },
+    persistent_growth_bytes_per_day: 10 * MB,
+    days_left: 1234,
+  });
+  assert.equal(view.lasts, "about 1,234 days at the growth of the archive, Claude Code's transcripts and the database");
+  assert.equal(view.rows[0].note, "grows about 2.0 MB a day", "the archive's row: its own growth");
+  const normalized = normalizeStorage({ ...STORAGE, growth_parts: { archive: 5, projects: null, database: 7 } });
+  assert.deepEqual(normalized?.growth_parts, { archive: 5, projects: null, database: 7 });
+  assert.equal(normalized?.persistent_growth_bytes_per_day, null);
+  // Not yet measured: the archive keeps its growth, the disk has no days.
+  const young = storageView({ ...STORAGE, growth_bytes_per_day: 2 * MB, persistent_growth_bytes_per_day: null, days_left: null });
+  assert.equal(young.lasts, null);
+  assert.equal(young.rows[0].note, "grows about 2.0 MB a day");
 });
 
 test("no fall, no growth, no days: the card says so and invents nothing", () => {

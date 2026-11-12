@@ -39,9 +39,13 @@ from (
 
 /// The `host.storage` samples `/api/fleet`'s storage figures are read
 /// from, each as `{at_ms, archive_bytes, archive_files, projects_bytes,
-/// projects_files}` or null: `oldest`, the oldest recorded at or after `$1`
-/// (the archive's growth is measured from it), and `before`, the newest
-/// recorded at or before `$2` (Claude Code's files then).
+/// projects_files}` (and `database_bytes` since objective 085) or null:
+/// `oldest`, the oldest recorded at or after `$1`; `carrying`, for each of
+/// `archive_bytes`, `projects_bytes` and `database_bytes`, the oldest
+/// recorded at or after `$1` that carries it as a number (each grower's
+/// growth is measured from it: an older sample without it is passed over);
+/// and `before`, the newest recorded at or before `$2` (Claude Code's files
+/// then).
 pub(crate) const HOST_STORAGE: &str = r"
 with samples as (
   select e.recorded_at_ms, e.id,
@@ -54,6 +58,12 @@ with samples as (
 select jsonb_build_object(
   'oldest', (select s.sample from samples s where s.recorded_at_ms >= $1
               order by s.recorded_at_ms, s.id limit 1),
+  'carrying', (select jsonb_object_agg(f.field, (
+                 select s.sample from samples s
+                  where s.recorded_at_ms >= $1
+                    and jsonb_typeof(s.sample -> f.field) = 'number'
+                  order by s.recorded_at_ms, s.id limit 1))
+                 from unnest(array['archive_bytes', 'projects_bytes', 'database_bytes']) f(field)),
   'before', (select s.sample from samples s where s.recorded_at_ms <= $2
               order by s.recorded_at_ms desc, s.id desc limit 1))";
 
@@ -127,8 +137,8 @@ pub fn test_database_size(url: &str) -> Result<Value, StoreError> {
 
 impl PostgresStore {
     /// The `host.storage` samples the storage figures need ([`HOST_STORAGE`]):
-    /// the oldest at or after `since_ms` and the newest at or before
-    /// `before_ms`.
+    /// the oldest at or after `since_ms` (overall and carrying each grower's
+    /// size) and the newest at or before `before_ms`.
     pub fn host_storage(&self, since_ms: i64, before_ms: i64) -> Result<Value, StoreError> {
         self.query_json(HOST_STORAGE, &[&since_ms, &before_ms])
     }
