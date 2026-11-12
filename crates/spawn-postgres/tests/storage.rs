@@ -84,7 +84,57 @@ fn samples_are_recorded_into_no_table_and_read_back_by_age() {
     assert_eq!(read["oldest"]["at_ms"], 1000);
     assert_eq!(read["before"]["projects_files"], 3);
     let read = store.host_storage(10_000, 500).expect("read");
-    assert_eq!(read, json!({"oldest": null, "before": null}));
+    assert_eq!(
+        read,
+        json!({"oldest": null, "before": null,
+               "carrying": {"archive_bytes": null, "projects_bytes": null, "database_bytes": null}})
+    );
+}
+
+/// Objective 085: each grower's growth is measured from the oldest sample
+/// of the window that carries its size; an older sample without it (the
+/// shape before `database_bytes`) is passed over for that one alone.
+#[test]
+fn the_oldest_sample_carrying_a_size_passes_over_older_ones_without_it() {
+    let (store, schema) = store("storage_carrying");
+    let mut client = admin(&schema);
+    let with_database = |archive: i64, database: i64| {
+        let mut sample = sample(archive, 40);
+        sample["database_bytes"] = json!(database);
+        sample
+    };
+    for (at, record) in [
+        (500, with_database(4 * MIB, 90 * MIB)),
+        (1000, sample(5 * MIB, 40)),
+        (3000, with_database(6 * MIB, 100 * MIB)),
+        (5000, with_database(7 * MIB, 101 * MIB)),
+    ] {
+        let id = store.host_record(&record).expect("recorded");
+        place(&mut client, id, at);
+    }
+    // Since 800: the old-shape sample at 1000 is the oldest, and the
+    // oldest carrying the archive's and the projects' sizes; the database's
+    // is measured from 3000 (the one at 500 is outside the window).
+    let read = store.host_storage(800, 0).expect("read");
+    assert_eq!(read["oldest"]["at_ms"], 1000);
+    assert_eq!(read["carrying"]["archive_bytes"]["at_ms"], 1000);
+    assert_eq!(read["carrying"]["projects_bytes"]["at_ms"], 1000);
+    assert_eq!(read["carrying"]["database_bytes"]["at_ms"], 3000);
+    assert_eq!(
+        read["carrying"]["database_bytes"]["database_bytes"],
+        100 * MIB
+    );
+    assert!(
+        read["carrying"]["archive_bytes"]
+            .get("database_bytes")
+            .is_none()
+    );
+    // Since 0, the one at 500 carries all three.
+    let read = store.host_storage(0, 0).expect("read");
+    assert_eq!(read["carrying"]["database_bytes"]["at_ms"], 500);
+    // Since 6000: none.
+    let read = store.host_storage(6000, 0).expect("read");
+    assert_eq!(read["carrying"]["database_bytes"], Value::Null);
 }
 
 #[test]

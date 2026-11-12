@@ -215,7 +215,8 @@ function BackupRows({ backups }: { backups: Backups | null }) {
 
 /** What uses the disk (`health.storage`): the archive, Claude Code's own
  * transcripts, the workspaces and the database, one row each with its size
- * and note, then how long the free space lasts at the archive's growth;
+ * and note, then how long the free space lasts at the growth of what
+ * persists (the archive, Claude Code's transcripts and the database);
  * then how old the newest off-host backups are (`health.backups`). */
 export function StorageCard({ storage, backups = null }: { storage: Storage | null; backups?: Backups | null }) {
   if (!storage) {
