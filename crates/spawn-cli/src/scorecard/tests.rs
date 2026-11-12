@@ -1174,8 +1174,8 @@ fn report_to_live_runs_from_the_last_report_to_the_deploy_that_ships_it() {
         .task(2, "task.landed", minutes(276));
     deployed(&mut story, 300, false);
     deployed(&mut story, 360, true);
-    // T3 and T4 shipped by one deploy at 480 (60 and 48 min); T6, a review
-    // mission's accepted report, by the same (90 min).
+    // T3 and T4 shipped by one deploy at 468 (48 and 36 min); T6, a review
+    // mission's accepted report, by the same (78 min).
     story
         .task(3, "task.reported", minutes(420))
         .task(4, "task.reported", minutes(432))
@@ -1202,7 +1202,7 @@ fn report_to_live_runs_from_the_last_report_to_the_deploy_that_ships_it() {
         json!({"value": d["value"], "p90": d["p90"], "n": d["n"], "not_live": d["not_live"],
                "enough": d["enough"], "better": d["better"]})
     };
-    // Fleet live waits: 60, 120, 48 (T3: 450 -> 468), 36 (T4: 432 -> 468),
+    // Fleet live waits: 60, 120, 48 (T3: 420 -> 468), 36 (T4: 432 -> 468),
     // 78 (T6: 390 -> 468); sorted 36, 48, 60, 78, 120.
     assert_eq!(
         rtl(Scope::Fleet),
