@@ -11,7 +11,7 @@ import type { Fleet } from "../../fleet";
 import { clockTime } from "../../format";
 import { focusObjective, fetchDashboard } from "../../rsi";
 import type { RsiMission } from "../../rsi";
-import { REPLAY_HOURS, REPLAY_SPEEDS } from "../../show";
+import { REPLAY_HOURS, REPLAY_SPEEDS, missionLastLanding } from "../../show";
 import type { Mode, Tone } from "../../show";
 import { FOCUS_RING, chip, cx } from "../ui";
 import { TONE_COLOR, TONE_LABEL } from "./layout";
