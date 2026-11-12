@@ -231,8 +231,12 @@
 //!   (`objectives` on its record) has had no task in work since its last
 //!   task ended (landed, accepted or cancelled), for
 //!   `SPAWN_ALERT_MISSION_IDLE_SECS` (default 900; 0 disables it). Never for
-//!   owner work. Clears at the mission's next `task.assigned` or its
-//!   close. A restart reads when the last task ended from the store.
+//!   owner work, and never while the owner has the mission paused
+//!   (`mission.paused`, objective 099). Clears at the mission's next
+//!   `task.assigned`, its close or its pause (the cleared evidence names the
+//!   record). The owner's resume of a pause (`mission.unpaused`) starts the
+//!   idle time of a mission with no task in work again, from that record. A
+//!   restart reads when the last task ended (or the unpause) from the store.
 //! - `owner_request_waiting`, the source, key
 //!   `owner_request_waiting:<request>` (S23): an owner's landing request
 //!   (`source.push_requested`, `spawn mission push`) that has had no outcome
