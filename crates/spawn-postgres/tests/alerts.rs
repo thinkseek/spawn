@@ -288,6 +288,10 @@ fn only_the_owner_records_alerts() {
     let refused = supervisor
         .alert_record(&fired("memory_low:3", false))
         .expect_err("a restricted login records no alert");
+    assert!(
+        supervisor.alert_judge("memory_low:3", "false").is_err(),
+        "a restricted login judges no alert"
+    );
     // Either the function's grant (revoked from everyone but the owner) or
     // its own caller check refuses it.
     let message = refused.to_string();
