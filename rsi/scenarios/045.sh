@@ -438,7 +438,7 @@ q() { scalar "$1"; }
 put() { printf '%s\n' "$3" >"$WORK/state/$1.$2"; }
 get() { cat "$WORK/state/$1.$2" 2>/dev/null || true; }
 # api <path> <file>: GET from serve; its status code.
-api() { curl -s --noproxy '*' -o "$2" -w '%{http_code}' "$base$1" 2>/dev/null || echo 000; }
+api() { bb_http "$2" --noproxy '*' "$base$1"; }
 # commands <label>: the session's commands into $WORK/commands-<label>.json.
 commands() {
     code=$(api "/api/fleet/$(get "$1" session)/commands?limit=100" "$WORK/commands-$1.json")

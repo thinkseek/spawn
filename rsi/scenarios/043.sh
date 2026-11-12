@@ -360,8 +360,8 @@ while [ "$i" -lt 100 ]; do
 done
 [ -n "$port" ] || harness "serve did not start: $(head -c 400 "$WORK/serve.log")"
 fleet_api() { # <window> <file>: the status code
-    curl -s --noproxy '*' -o "$2" -w '%{http_code}' \
-        "http://127.0.0.1:$port/api/scorecard/fleet?window=$1&until=$U_ISO" 2>/dev/null || echo 000
+    bb_http "$2" --noproxy '*' \
+        "http://127.0.0.1:$port/api/scorecard/fleet?window=$1&until=$U_ISO"
 }
 # The figures the page shows, in one line, from an answer.
 # Numbers to 3 decimals and objects with sorted keys, so the same figures

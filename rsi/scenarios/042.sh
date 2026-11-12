@@ -499,9 +499,9 @@ base="http://127.0.0.1:$port"
 # page_post <session> <verb> <body>: the status code; the answer in
 # $WORK/post.json. As the page posts: JSON, the page's own Origin.
 page_post() {
-    curl -s --noproxy '*' -o "$WORK/post.json" -w '%{http_code}' -X POST \
+    bb_http "$WORK/post.json" --noproxy '*' -X POST \
         -H 'Content-Type: application/json' -H "Origin: $base" \
-        --data "$3" "$base/api/session/$1/$2" 2>/dev/null || echo 000
+        --data "$3" "$base/api/session/$1/$2"
 }
 session_json() { # <session> <file>
     code=$(curl -s --noproxy '*' -o "$2" -w '%{http_code}' "$base/api/session/$1?after=0&limit=1000" 2>/dev/null) || code=000
