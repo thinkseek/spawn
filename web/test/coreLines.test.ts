@@ -238,3 +238,20 @@ test("coreLinesView's marks stay as they were with trends in the answer", () => 
   assert.deepEqual(coreLinesView(withTrends), plain);
 });
 
+
+test("a figure whose window is not covered yet says measuring since, in local time (objective 095)", () => {
+  // Local wall-clock fields, so the words hold in any time zone.
+  const since = new Date(2026, 10, 2, 7, 5).getTime();
+  const waiting = answer();
+  waiting.lines[0].north_star = { ...waiting.lines[0].north_star, measuring_since_ms: since };
+  assert.deepEqual(coreLinesView(waiting).rows[0].north_star, {
+    name: "Time from report to live",
+    value: "measuring since 11-02 07:05",
+    range: "no range set",
+    tone: "muted",
+  });
+  // Covered: the figure's own value, no matter a stray null.
+  const covered = answer();
+  covered.lines[0].north_star = { ...covered.lines[0].north_star, value: 5_400_000, state: "no_range", measuring_since_ms: null };
+  assert.equal(coreLinesView(covered).rows[0].north_star.value, "1 h 30 min");
+});
