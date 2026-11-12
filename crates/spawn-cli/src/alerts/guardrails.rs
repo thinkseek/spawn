@@ -21,11 +21,55 @@
 //! its first reading, and adopts an alert the record already holds open
 //! (one open per figure, across restarts). A reading that fails is a line in
 //! the loop's log and decides nothing.
+//!
+//! A reading is the whole answer (the 7-day Scorecard with its transcript
+//! walk, the cost window, the storage report...), and its one-minute cache
+//! has always expired at the step's 300 s, so it never runs inside a pass
+//! (cc-astra A18): it runs on a thread of its own, on the dashboard's
+//! read-only connection and its statement timeout, as 090's sampler does
+//! ([`crate::core_lines_sample`]). Each check only looks whether it has come
+//! back, and the step looks again every [`POLL_MS`] while it runs; a reading
+//! back is said with how long it took (`alerts: core lines read in <s> s`)
+//! and decides at that check. One not back after [`READ_LIMIT_MS`] is given
+//! up and decides nothing, and no other starts until its thread has ended,
+//! so a slow reading never piles up threads; the pass never waits on it nor
+//! on the performance figures' lock it may hold.
 
 use serde_json::{Value, json};
 
 use super::{Event, Monitor};
-use spawn_postgres::PostgresStore;
+use crate::core_lines_sample::Reading as Pending;
+use std::sync::mpsc::TryRecvError;
+
+/// How long a reading may take before it is given up: as long as the
+/// sampler's.
+pub(super) const READ_LIMIT_MS: i64 = crate::core_lines_sample::READ_LIMIT_MS;
+
+/// How soon the step looks again while a reading runs.
+pub(super) const POLL_MS: i64 = 5_000;
+
+/// The step's Core lines readings: the one in flight (when it started, by
+/// the step's clock and the host's), and one given up whose thread may
+/// still run.
+#[derive(Default)]
+pub(super) struct Reads {
+    reading: Option<(Pending<Value>, i64, std::time::Instant)>,
+    abandoned: Option<Pending<Value>>,
+    /// When the step looks again, while a reading runs.
+    poll_ms: Option<i64>,
+}
+
+impl Reads {
+    /// Whether a reading is in flight.
+    pub(super) fn in_flight(&self) -> bool {
+        self.reading.is_some()
+    }
+
+    /// When the step should look again: while a reading runs, shortly.
+    pub(super) fn poll_ms(&self) -> Option<i64> {
+        self.reading.as_ref().and(self.poll_ms)
+    }
+}
 
 /// The alert's kind.
 pub(super) const KIND: &str = "guardrail_out_of_range";
@@ -137,15 +181,67 @@ fn figure_of(subject: &str, evidence: &Value) -> String {
 }
 
 impl Monitor {
-    /// Read the Core lines figures and decide on their alerts.
-    pub(super) fn read_guardrails(
+    /// The figures are due at `now`: start a reading on a thread of its
+    /// own ([`crate::serve::core_lines::reading`]).
+    pub(super) fn start_guardrails(&mut self, now: i64) {
+        self.start_guardrails_with(now, || Pending::spawn(crate::serve::core_lines::reading));
+    }
+
+    /// Start a reading through `start`, unless one is in flight or one
+    /// given up still runs (then this turn has none).
+    pub(super) fn start_guardrails_with(
         &mut self,
-        store: &PostgresStore,
+        now: i64,
+        start: impl FnOnce() -> Pending<Value>,
+    ) {
+        let reads = &mut self.guardrail_reads;
+        if reads.abandoned.as_ref().is_some_and(|old| !old.running()) {
+            reads.abandoned = None;
+        }
+        if reads.reading.is_some() || reads.abandoned.is_some() {
+            return;
+        }
+        reads.reading = Some((start(), now, std::time::Instant::now()));
+        reads.poll_ms = Some(now.saturating_add(POLL_MS));
+    }
+
+    /// Look at the reading in flight, never waiting: one back decides on
+    /// the alerts at `now`, said with how long it took; one over the limit
+    /// is given up.
+    pub(super) fn poll_guardrails(
+        &mut self,
         now: i64,
         out: &mut Vec<Event>,
         lines: &mut Vec<String>,
     ) {
-        let reading = crate::serve::core_lines::reading(store);
+        let Some((pending, started, begun)) = self.guardrail_reads.reading.take() else {
+            return;
+        };
+        let reading = match pending.try_answer() {
+            Err(TryRecvError::Empty) => {
+                if now.saturating_sub(started) < READ_LIMIT_MS {
+                    self.guardrail_reads.reading = Some((pending, started, begun));
+                    self.guardrail_reads.poll_ms = Some(now.saturating_add(POLL_MS));
+                } else {
+                    self.guardrail_reads.abandoned = Some(pending);
+                    self.guardrail_reads.poll_ms = None;
+                    lines.push(format!(
+                        "alerts: the core lines' reading took over {} s: given up, it decides nothing",
+                        READ_LIMIT_MS / 1000
+                    ));
+                }
+                return;
+            }
+            Err(TryRecvError::Disconnected) => {
+                Err("the reading ended without an answer".to_string())
+            }
+            Ok(reading) => reading,
+        };
+        self.guardrail_reads.poll_ms = None;
+        lines.push(format!(
+            "alerts: core lines read in {:.1} s",
+            begun.elapsed().as_secs_f64()
+        ));
         self.guardrail_events(now, reading, out, lines);
     }
 
@@ -244,7 +340,7 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::super::{Event, Monitor, Row, Settings};
-    use super::{KIND, range_words, words};
+    use super::{KIND, POLL_MS, Pending, READ_LIMIT_MS, range_words, words};
     use serde_json::{Value, json};
 
     const RAISE: i64 = 7_200_000;
@@ -553,5 +649,113 @@ mod tests {
             "between 1 and 2"
         );
         assert_eq!(range_words("count", &json!({})), "no range set");
+    }
+
+    /// cc-astra A18: the reading runs beside the checks. A check never waits
+    /// for it (nor for the lock it may hold); the step looks again every
+    /// POLL_MS while it runs; one over the limit is given up, and no other
+    /// starts beside its thread; a reading back decides, said with its time.
+    #[test]
+    fn a_slow_core_lines_reading_never_holds_a_check() {
+        let mut monitor = monitor();
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let mut started = 0;
+        let poll = |monitor: &mut Monitor, at: i64| {
+            let begun = std::time::Instant::now();
+            let (mut out, mut lines) = (Vec::new(), Vec::new());
+            monitor.poll_guardrails(at, &mut out, &mut lines);
+            assert!(
+                begun.elapsed() < std::time::Duration::from_secs(2),
+                "the check waited"
+            );
+            (out, lines)
+        };
+        monitor.start_guardrails_with(0, || {
+            started += 1;
+            Pending::spawn(move || {
+                let _ = hold.recv();
+                Ok(answer("out", &json!(1)))
+            })
+        });
+        assert!(monitor.guardrail_reads.in_flight());
+        assert_eq!(monitor.guardrail_reads.poll_ms(), Some(POLL_MS));
+        assert!(monitor.due_ms() <= POLL_MS, "the step looks again shortly");
+        let (out, lines) = poll(&mut monitor, 1000);
+        assert!(
+            out.is_empty() && lines.is_empty(),
+            "still reading: {lines:?}"
+        );
+        assert_eq!(monitor.guardrail_reads.poll_ms(), Some(1000 + POLL_MS));
+        // Due again while it runs: no second reading.
+        monitor.start_guardrails_with(2000, || {
+            started += 1;
+            Pending::done(Ok(answer("out", &json!(1))))
+        });
+        assert_eq!(started, 1);
+        // Over the limit: given up, it decides nothing.
+        let (out, lines) = poll(&mut monitor, READ_LIMIT_MS);
+        assert!(out.is_empty());
+        assert!(
+            lines.len() == 1 && lines[0].contains("took over 300 s: given up"),
+            "{lines:?}"
+        );
+        assert!(!monitor.guardrail_reads.in_flight());
+        assert_eq!(monitor.guardrail_reads.poll_ms(), None);
+        // Due again, but the given-up thread still runs: none starts.
+        monitor.start_guardrails_with(READ_LIMIT_MS + 1, || {
+            started += 1;
+            Pending::done(Ok(answer("out", &json!(1))))
+        });
+        assert_eq!(started, 1);
+        assert!(!monitor.guardrail_reads.in_flight());
+        release.send(()).expect("release the reading");
+        let mut ended = false;
+        for _ in 0..200 {
+            if !monitor
+                .guardrail_reads
+                .abandoned
+                .as_ref()
+                .is_some_and(Pending::running)
+            {
+                ended = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(ended, "the given-up reading's thread ended");
+        // Once it has ended, readings start again, and one back decides:
+        // out at two readings RAISE apart fires once.
+        let t0 = 2 * READ_LIMIT_MS;
+        for at in [t0, t0 + RAISE] {
+            monitor.start_guardrails_with(at, || {
+                started += 1;
+                Pending::done(Ok(answer("out", &json!(1))))
+            });
+            let (out, lines) = poll(&mut monitor, at);
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with("alerts: core lines read in ")),
+                "{lines:?}"
+            );
+            if at == t0 {
+                assert!(out.is_empty(), "{:?}", keys(&out));
+            } else {
+                assert_eq!(keys(&out), [format!("fire {KIND}:storage.free_bytes:{t0}")]);
+            }
+        }
+        assert_eq!(started, 3);
+        // A reading that fails is a line and decides nothing.
+        monitor.start_guardrails_with(t0 + 2 * RAISE, || {
+            Pending::done(Err("no store".to_string()))
+        });
+        let (out, lines) = poll(&mut monitor, t0 + 2 * RAISE);
+        assert!(out.is_empty());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("the core lines' figures: no store")),
+            "{lines:?}"
+        );
     }
 }

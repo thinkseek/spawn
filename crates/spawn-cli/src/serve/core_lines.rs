@@ -67,8 +67,8 @@
 //! key names no figure, or with no number min or max, is left out and listed
 //! in `ignored_ranges`. A missing file is no ranges and no error; a file that
 //! is not such JSON is no ranges and a `ranges_error`. Nothing but `spawn
-//! serve` and the loop's alert step ([`reading`], `guardrail_out_of_range`)
-//! read the file, and no gate, integrator or deploy step reads the answer:
+//! serve` and the loop's alert step ([`reading`], `guardrail_out_of_range`,
+//! on a thread of its own) read the file, and no gate, integrator or deploy step reads the answer:
 //! monitoring only.
 
 use std::collections::BTreeMap;
@@ -747,11 +747,17 @@ pub(super) fn core_lines() -> Result<Value, String> {
 
 /// The same answer for the loop's alert step (`guardrail_out_of_range`,
 /// objective 089): the same figures, computed by the same code, the ranges
-/// file and the nightly's fact files read now. The costly figures are kept
-/// as for `spawn serve` (the performance line for a minute, health.storage's
-/// sizes for ten), so a reading does not stall the loop.
-pub(crate) fn reading(store: &spawn_postgres::PostgresStore) -> Result<Value, String> {
-    core_lines_at(store, ranges_path().as_deref(), nightly_dir().as_deref())
+/// file and the nightly's fact files read now, through the dashboard's own
+/// read-only connection and its statement timeout. It is the whole
+/// Scorecard and more (cc-astra A18: a minute's cache has always expired
+/// at the step's 300 s), so the step runs it on a thread of its own and
+/// never waits for it (crate alerts/guardrails.rs).
+pub(crate) fn reading() -> Result<Value, String> {
+    core_lines_at(
+        &super::open_store()?,
+        ranges_path().as_deref(),
+        nightly_dir().as_deref(),
+    )
 }
 
 /// The answer with the ranges file at `path` and the nightly's fact files
