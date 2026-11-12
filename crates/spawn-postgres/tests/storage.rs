@@ -251,3 +251,106 @@ fn the_size_reading_names_the_database_its_log_and_its_schemas() {
     let error = spawn_postgres::test_database_size("not a url secret-074").expect_err("no URL");
     assert!(!error.to_string().contains("secret-074"), "{error}");
 }
+
+/// The names of every index a JSON plan uses.
+fn plan_indexes(plan: &Value, out: &mut Vec<String>) {
+    match plan {
+        Value::Object(map) => {
+            for (name, value) in map {
+                if name == "Index Name"
+                    && let Some(index) = value.as_str()
+                {
+                    out.push(index.to_string());
+                }
+                plan_indexes(value, out);
+            }
+        }
+        Value::Array(list) => list.iter().for_each(|value| plan_indexes(value, out)),
+        _ => {}
+    }
+}
+
+/// Objective 090: the loop's `host.core_lines` samples go through
+/// `spawn_host_record` (one without its values object is refused), fold
+/// into no table, and are read back since a time, oldest first, through
+/// their own partial index.
+#[test]
+fn core_lines_samples_are_recorded_and_read_back_through_their_index() {
+    let (store, schema) = store("storage_core_lines");
+    let mut client = admin(&schema);
+    let tables_before: i64 = client
+        .query_one("select count(*) from mission_missions", &[])
+        .expect("count")
+        .get(0);
+    for (at, free) in [(1000, 5), (5000, 6), (9000, 7)] {
+        let id = store
+            .host_record(&json!({"type": "host.core_lines",
+                                 "values": {"storage.free_bytes": free, "storage.days_left": 10}}))
+            .expect("recorded");
+        place(&mut client, id, at);
+    }
+    for bad in [
+        json!({"type": "host.core_lines"}),
+        json!({"type": "host.core_lines", "values": [1, 2]}),
+        json!({"type": "host.core_lines", "values": null}),
+    ] {
+        assert!(store.host_record(&bad).is_err(), "refused: {bad}");
+    }
+    let count: i64 = client
+        .query_one(
+            "select count(*) from spawn_events
+              where kind -> 'detail' -> 'record' ->> 'type' = 'host.core_lines'",
+            &[],
+        )
+        .expect("count")
+        .get(0);
+    assert_eq!(count, 3);
+    let tables_after: i64 = client
+        .query_one("select count(*) from mission_missions", &[])
+        .expect("count")
+        .get(0);
+    assert_eq!(tables_before, tables_after, "folded into no table");
+
+    let read = store.host_core_lines(2000).expect("read");
+    assert_eq!(
+        read,
+        json!([
+            {"at_ms": 5000, "values": {"storage.free_bytes": 6, "storage.days_left": 10}},
+            {"at_ms": 9000, "values": {"storage.free_bytes": 7, "storage.days_left": 10}},
+        ])
+    );
+    assert_eq!(store.host_core_lines(10_000).expect("read"), json!([]));
+
+    // The partial index exists, and the 7-day read goes through it.
+    let definition: String = client
+        .query_one(
+            "select indexdef from pg_indexes
+              where schemaname = $1 and indexname = 'spawn_events_host_core_lines'",
+            &[&&*schema],
+        )
+        .expect("the index exists")
+        .get(0);
+    assert!(definition.contains("recorded_at_ms"), "{definition}");
+    assert!(definition.contains("host.core_lines"), "{definition}");
+    client
+        .batch_execute("set enable_seqscan = off")
+        .expect("no sequential scan");
+    let plan: Value = client
+        .query_one(
+            "explain (format json)
+             select e.recorded_at_ms, e.kind -> 'detail' -> 'record' -> 'values'
+               from spawn_events e
+              where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                and e.kind -> 'detail' -> 'record' ->> 'type' = 'host.core_lines'
+                and e.recorded_at_ms >= $1",
+            &[&2000_i64],
+        )
+        .expect("the plan")
+        .get(0);
+    let mut indexes = Vec::new();
+    plan_indexes(&plan, &mut indexes);
+    assert!(
+        indexes.contains(&"spawn_events_host_core_lines".to_string()),
+        "the samples' index unused: {indexes:?}"
+    );
+}
