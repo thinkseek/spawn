@@ -27,7 +27,8 @@
 #       State and range as for every figure.
 #
 # The history: model calls an hour ago, 300,000 input tokens on a priced
-# model and 100,000 on a model with no price (a quarter unpriced).
+# model and 100,000 on a model with no price (a quarter unpriced); one
+# agent's execution from 10 h to 2 h ago and one person's command 3 h ago.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -195,6 +196,19 @@ create function pg_temp.usage(h numeric, n int, model text, input bigint) return
             nextval('seed_seq'), pg_temp.ms(h)) \$\$;
 select pg_temp.usage(-1, 1, 'bb-model-x', 300000);
 select pg_temp.usage(-1, 2, 'bb-model-y', 100000);
+-- Agent time as the Bridge records it (049): one execution from 10 h to 2 h
+-- ago, 8 agent-hours in the last 24 h; and one person's command in it.
+create function pg_temp.bridge(h numeric, name text, detail jsonb) returns void language sql as \$\$
+    insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id,
+                              kind, session_seq, recorded_at_ms)
+    values ('agent_worker_w_1', 'session_worker_w_1', 'exec_bb_088_w', 'bridge', null,
+            jsonb_build_object('name', name, 'detail', detail), nextval('seed_seq'), pg_temp.ms(h)) \$\$;
+select pg_temp.bridge(-10, 'execution.started', '{"engine":"claude","workspace":"/w/a"}');
+select pg_temp.bridge(-2, 'execution.ended', '{"cause":"exited","exit_code":0}');
+insert into spawn_commands (principal, idempotency_key, agent_id, session_id, action, state,
+                            succeeded, error, created_at_ms, finished_at_ms)
+values ('human', 'board-1', 'agent_worker_w_1', 'session_worker_w_1',
+        '{"type":"input","text":"a note"}', 'finished', true, null, pg_temp.ms(-3), pg_temp.ms(-3) + 1000);
 commit;
 select spawn_cost_record('{"bb-model-x": {"input": 3, "output": 15, "cache_write": 3.75, "cache_read": 0.3}}');
 SQL
@@ -248,11 +262,11 @@ else
     expect_eq "$(figure observability.unpriced_share)" '{"unit":"share","value":0.25,"range":{"max":0.05},"state":"out"}' \
         "(1) use with no price: 100,000 of 400,000 tokens, out of its range of 5% or less"
     rate=$(jq -c '.health.human_per_agent_hour' "$WORK/fleet.json")
-    rate_state=not_collected
-    [ "$rate" = null ] || rate_state=$(awk -v v="$rate" 'BEGIN { print (v <= 0.05 ? "in" : "out") }')
+    case "$rate" in '' | null) harness "/api/fleet has no human_per_agent_hour for 8 seeded agent-hours and one command: [$rate]" ;; esac
+    rate_state=$(awk -v v="$rate" 'BEGIN { print (v <= 0.05 ? "in" : "out") }')
     expect_eq "$(figure observability.interventions_per_agent_hour)" \
         "{\"unit\":\"ratio\",\"value\":$rate,\"range\":{\"max\":0.05},\"state\":\"$rate_state\"}" \
-        "(1) interventions per agent-hour: /api/fleet's human_per_agent_hour"
+        "(1) interventions per agent-hour: /api/fleet's human_per_agent_hour ($rate: one command over 8 agent-hours)"
     others=$(jq -c '[.lines[] | ([.north_star] + .guardrails)[] | select(.key != "observability.not_measured" and .value == null)] | length' "$WORK/api.json")
     [ "$others" -gt 0 ] || harness "every other figure has a value: the count cannot be told from zero"
     expect_eq "$(figure observability.not_measured)" "{\"unit\":\"count\",\"value\":$others,\"range\":{\"max\":0},\"state\":\"out\"}" \
