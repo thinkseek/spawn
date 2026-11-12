@@ -5618,16 +5618,24 @@ select w.at_ms, 'cancel_reassign', n.mission_id, n.task_id, null, p.task_id
           and r.seq < n.seq
      ) p
  -- Its span, as spawn_task_spans closes it: up to the task's next
- -- assignment; a legacy row its row closed has no closing record.
- cross join lateral (
-       select min(r.seq) as next_seq
+ -- assignment; a legacy row its row closed has no closing record. Found
+ -- among the task's own records (spawn_events_control_record_row_id, by
+ -- its id and seq), the first that is an assignment. The type test is
+ -- spelled so that no assignment index (_objective, _brief: their
+ -- predicate) applies: by one of them this lookup walked every later
+ -- assignment of the log for each cancelled attempt (a 7-day window 1.4 s
+ -- on the live log of 2026-11-13, more as history followed it).
+ left join lateral (
+       select r.seq as next_seq
          from spawn_experience_records r
-        where (r.type = 'task.assigned'
-               or (r.type = 'legacy.imported' and r.record ->> 'table' = 'mission_tasks'))
-          and spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')) = p.task_id
+        where spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')) = p.task_id
+          and r.seq > p.seq
+          and r.type in ('task.assigned', 'legacy.imported')
+          and (r.type = 'task.assigned' or r.record ->> 'table' = 'mission_tasks')
           and spawn_experience_int(coalesce(r.record -> 'mission_id', r.record -> 'row' -> 'mission_id'))
               is not null
-          and r.seq > p.seq) x
+        order by r.seq
+        limit 1) x on true
  cross join lateral (
        select r.seq, r.type, r.record
          from spawn_experience_records r

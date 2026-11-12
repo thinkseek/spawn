@@ -1289,6 +1289,14 @@ fn the_window_read_gives_the_views_rows_of_every_window() {
 /// `weeks` of the live-size week's stream ([`live_size_week`]'s records,
 /// each week's task ids and objectives its own).
 fn live_size_weeks(client: &mut Client, weeks: i64) {
+    live_size_stream(client, weeks, false);
+}
+
+/// [`live_size_weeks`], and with `old_work` twenty pieces of work assigned
+/// and cancelled by a person in the first hours, then assigned again around
+/// day 7 (objectives 800001-800020: tasks 500000 + k, then 600000 + k,
+/// landed): reassignments of old work.
+fn live_size_stream(client: &mut Client, weeks: i64, old_work: bool) {
     client
         .execute(
             "insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id,
@@ -1296,7 +1304,8 @@ fn live_size_weeks(client: &mut Client, weeks: i64) {
              select 'agent_control', 'session_control', null, 'control', null,
                     jsonb_build_object('name', 'control.recorded',
                                        'detail', jsonb_build_object('record', r.record)),
-                    1 + row_number() over (order by r.ord), 3600000 + r.ord * 180000
+                    1 + row_number() over (order by r.ord),
+                    (3600000 + r.ord * 180000)::bigint
                from (
                  select t * 12 + 0 as ord,
                         jsonb_build_object('type', 'task.assigned', 'id', t, 'mission_id', 1,
@@ -1329,8 +1338,27 @@ fn live_size_weeks(client: &mut Client, weeks: i64) {
                  union all
                  select t * 12 + 11, jsonb_build_object('type', 'task.landed', 'id', 100000 + t)
                    from generate_series(10, 300 * $1::bigint, 10) t
+                 union all
+                 select k * 12 + w.at,
+                        case w.what
+                          when 'assigned' then
+                            jsonb_build_object('type', 'task.assigned', 'id', w.task + k,
+                                               'mission_id', 1, 'kind', 'ephemeral',
+                                               'agent_id', 'agent_worker_w_' || (w.task + k),
+                                               'session_id', 'session_worker_w_' || (w.task + k),
+                                               'brief', 'old brief ' || k, 'objective', 800000 + k,
+                                               'created_by', 'spawn-dispatch', 'model', 'default')
+                          when 'cancelled' then
+                            jsonb_build_object('type', 'task.cancelled', 'id', w.task + k,
+                                               'by', 'human')
+                          else jsonb_build_object('type', 'task.landed', 'id', w.task + k) end
+                   from generate_series(1, 20) k,
+                        (values (0.25, 'assigned', 500000), (0.5, 'cancelled', 500000),
+                                (3400.25, 'assigned', 600000), (3400.5, 'landed', 600000))
+                          as w(at, what, task)
+                  where $2
                ) r",
-            &[&weeks],
+            &[&weeks, &old_work],
         )
         .expect("a live-size control stream");
     client
@@ -1486,4 +1514,90 @@ select e.recorded_at_ms
             .expect("the read"),
         Some(H)
     );
+}
+
+/// The buffers a plan's root read (shared hits and reads).
+fn plan_buffers(plan: &Value) -> i64 {
+    let root = &plan[0]["Plan"];
+    root["Shared Hit Blocks"].as_i64().unwrap_or(0)
+        + root["Shared Read Blocks"].as_i64().unwrap_or(0)
+}
+
+/// What one window read of [`windows_read`] gives: its buffers, its rows,
+/// the oracle's rows, its spawn_events scans (for a message).
+type WindowRead = (i64, String, String, Vec<String>);
+
+/// The windows `[from, to)` (in days) of a stream of `weeks` weeks with old
+/// work reassigned in it, under a generic plan.
+fn windows_read(weeks: i64, windows: &[(i64, i64)]) -> Vec<WindowRead> {
+    let (_store, schema) = store(&format!("interventions_follow_{weeks}"));
+    let mut client = admin(&schema);
+    record(
+        &mut client,
+        0,
+        &json!({"type": "mission.added", "id": 1, "text": "live size", "origin": "human",
+                "sources": []}),
+    );
+    with_oracle(&mut client);
+    live_size_stream(&mut client, weeks, true);
+    client
+        .batch_execute("set plan_cache_mode = force_generic_plan")
+        .expect("generic plans");
+    windows
+        .iter()
+        .map(|&(from, to)| {
+            let (since, until) = (from * 24 * H, to * 24 * H);
+            let plan: Value = client
+                .query_one(
+                    "explain (analyze, buffers, format json)
+                     select count(*) from spawn_interventions where at_ms >= $1 and at_ms < $2",
+                    &[&since, &until],
+                )
+                .expect("the plan")
+                .get(0);
+            let read = intervention_rows(&mut client, WINDOWED, since, until);
+            let view = intervention_rows(
+                &mut client,
+                "(select * from spawn_interventions_oracle where at_ms >= $1 and at_ms < $2)",
+                since,
+                until,
+            );
+            (plan_buffers(&plan), read, view, event_scans(&plan))
+        })
+        .collect()
+}
+
+/// A window costs what is in it, whatever history follows it (the lead,
+/// 2026-11-13: after the window-first view a 7-day window still took 1.4 s
+/// on the live log, as each cancelled attempt's next assignment, `x`,
+/// walked every later assignment). The same 7-day and 24 h windows, old
+/// work reassigned in both, of a stream of 2 weeks and of 4: the oracle's
+/// rows, the reassignments of old work among them, and the 4 weeks' read
+/// takes no more than 10% more buffers than the 2 weeks'.
+///
+/// Buffers, not rows: `x` returned no row and its filter removed none, as
+/// its index (_brief) was walked on its third column (`session_seq`) with
+/// only `mission_id is not null` on the first. A walk on a column that does
+/// not lead shows in the buffers alone; the growth test before counted rows,
+/// on the log's last day (nothing after it to walk), and passed.
+#[test]
+fn a_window_costs_the_same_whatever_history_follows_it() {
+    let windows = [(7, 14), (7, 8)];
+    let two = windows_read(2, &windows);
+    let four = windows_read(4, &windows);
+    for ((window, two), four) in windows.iter().zip(&two).zip(&four) {
+        let (two_buffers, two_read, two_view, two_scans) = two;
+        let (four_buffers, four_read, four_view, four_scans) = four;
+        assert_eq!(two_read, two_view, "{window:?}");
+        assert_eq!(four_read, four_view, "{window:?}");
+        assert_eq!(two_read, four_read, "{window:?}: the same window");
+        assert!(
+            two_read.matches("cancel_reassign").count() >= 20,
+            "{window:?}: {two_read}"
+        );
+        assert!(
+            *four_buffers <= two_buffers + two_buffers / 10,
+            "{window:?}: 4 weeks read {four_buffers} buffers, 2 weeks {two_buffers}:\n{four_scans:#?}\n{two_scans:#?}"
+        );
+    }
 }
