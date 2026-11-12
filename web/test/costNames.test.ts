@@ -92,11 +92,11 @@ test("(b) the compact count: one decimal under 10, whole from 10, rounded before
   assert.equal(unpricedShort(9_960), "+10K unpriced");
 });
 
-test("(c) the page's badge shows the short text, the full count in its title; the dollars never shrink or wrap", () => {
+test("(c) the page's unpriced mark sits on the row's second line, its full count in its title; the dollars never shrink or wrap (objectives 059, 079)", () => {
   const page = readFileSync(new URL("../src/components/cost/CostView.tsx", import.meta.url), "utf8");
-  assert.match(page, /<UnpricedMark short=\{row\.unpriced_short\} full=\{row\.unpriced_text\} \/>/);
-  assert.match(page, /title=\{`\$\{full \?\? short\}/);
-  assert.match(page, /"tnum shrink-0 whitespace-nowrap"/);
-  assert.match(page, /row\.label \? "shrink-0" : "min-w-0 truncate"/);
-  assert.match(page, /<span className="min-w-0 truncate text-foreground" title=\{row\.label\}>/);
+  assert.match(page, /<UnpricedMark key=\{text\} text=\{text\} \/>/);
+  assert.match(page, /title=\{`\$\{text\}: these tokens ran on a model SPAWN_MODEL_PRICES does not price/);
+  assert.match(page, /"tnum ml-auto shrink-0 whitespace-nowrap"/);
+  assert.match(page, /first\.label \? "shrink-0" : "min-w-0 truncate"/);
+  assert.match(page, /<span className="min-w-0 flex-1 truncate text-foreground" title=\{first\.label\}>/);
 });
