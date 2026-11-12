@@ -496,7 +496,8 @@ function DimensionTile({
   const mark = trendMark(dimension.trend, dimension.better);
   const previous = formatValue(dimKey, dimension.previous);
   const groups = dimensionParts(dimKey, dimensions);
-  // Gate time says how much of it decided nothing (objective 067).
+  // Gate time says how much of it decided nothing (objective 067); report
+  // to live says its median in hours and how many are live (objective 081).
   const note = tileNote(dimKey, dimension as GateSpending);
 
   return (

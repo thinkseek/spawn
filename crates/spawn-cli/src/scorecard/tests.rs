@@ -1144,6 +1144,94 @@ fn gate_time_says_how_much_of_it_decided_nothing() {
     );
 }
 
+/// Objective 081: a landing's wait from its task's last report before it
+/// landed to the first deploy that succeeded at or after it, for the fleet
+/// and each mission; a failed deploy ships nothing, a re-report restarts
+/// the wait, a landing with no deploy since is not live, and one whose task
+/// never reported counts in neither.
+#[test]
+fn report_to_live_runs_from_the_last_report_to_the_deploy_that_ships_it() {
+    let minutes = |m: i64| at(0) + m * 60_000;
+    let deployed = |story: &mut Story, m: i64, ok: bool| {
+        story.rec(
+            minutes(m),
+            json!({"type": "deploy.finished", "ok": ok, "head": "h"}),
+        );
+    };
+    let mut story = Story::default();
+    story.mission(1, true).mission(2, false);
+    for task in 1..=6 {
+        story.assign(
+            minutes(60),
+            task,
+            if task == 6 { 2 } else { 1 },
+            None,
+            "spawn-integrate",
+        );
+    }
+    // T1: reported 120, landed 150, deploy at 180: 60 min.
+    story
+        .task(1, "task.reported", minutes(120))
+        .task(1, "task.landed", minutes(150));
+    deployed(&mut story, 180, true);
+    // T2: reported 210, sent back, reported again 240, landed 276; a failed
+    // deploy at 300; the next ok at 360: 120 min from its last report.
+    story
+        .task(2, "task.reported", minutes(210))
+        .gated(minutes(222), 2, "rejected", None)
+        .task(2, "task.reported", minutes(240))
+        .task(2, "task.landed", minutes(276));
+    deployed(&mut story, 300, false);
+    deployed(&mut story, 360, true);
+    // T3 and T4 shipped by one deploy at 468 (48 and 36 min); T6, a review
+    // mission's accepted report, by the same (78 min).
+    story
+        .task(3, "task.reported", minutes(420))
+        .task(4, "task.reported", minutes(432))
+        .task(6, "task.reported", minutes(390))
+        .reviewed(minutes(400), 6, true)
+        .task(3, "task.landed", minutes(450))
+        .task(4, "task.landed", minutes(468));
+    // A deploy that finished as T4 landed ships it (at or after).
+    deployed(&mut story, 468, true);
+    // T5 landed with no report recorded: in neither figure.
+    story.task(5, "task.landed", minutes(500));
+    // T7: reported, landed, no deploy since: not live.
+    story.assign(minutes(60), 7, 1, None, "spawn-integrate");
+    story
+        .task(7, "task.reported", minutes(600))
+        .task(7, "task.landed", minutes(630));
+    let history = story.history();
+    let rtl = |scope: Scope| {
+        let d = dimension(
+            &counts(&history, scope, window_hours(0, 24)),
+            None,
+            "report_to_live",
+        );
+        json!({"value": d["value"], "p90": d["p90"], "n": d["n"], "not_live": d["not_live"],
+               "enough": d["enough"], "better": d["better"]})
+    };
+    // Fleet live waits: 60, 120, 48 (T3: 420 -> 468), 36 (T4: 432 -> 468),
+    // 78 (T6: 390 -> 468); sorted 36, 48, 60, 78, 120.
+    assert_eq!(
+        rtl(Scope::Fleet),
+        json!({"value": 3_600_000, "p90": 7_200_000, "n": 5, "not_live": 1,
+               "enough": true, "better": "lower"})
+    );
+    // Mission 1: 36, 48, 60, 120.
+    assert_eq!(
+        rtl(Scope::Mission(1)),
+        json!({"value": 2_880_000, "p90": 7_200_000, "n": 4, "not_live": 1,
+               "enough": true, "better": "lower"})
+    );
+    // Mission 2: one live landing, below the minimum: no value.
+    assert_eq!(
+        rtl(Scope::Mission(2)),
+        json!({"value": null, "p90": null, "n": 1, "not_live": 0,
+               "enough": false, "better": "lower"})
+    );
+}
+
 #[test]
 fn keys_and_tags_name_their_task() {
     assert_eq!(delivery_of("deliver-6-0"), Some((6, "deliver-6-0")));

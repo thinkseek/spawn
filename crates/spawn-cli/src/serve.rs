@@ -1884,18 +1884,28 @@ fn rsi_pane(query: &str) -> Result<Value, String> {
 /// at this request: the health's `disk` (free space, [`crate::disk::report`]),
 /// `memory` (`/proc/meminfo`, [`crate::memory::report`]) and `storage`
 /// (what uses the disk, [`storage::report`]: its sizes kept for ten minutes).
+/// Its `backups` are the newest database copy and bundle (objective 82,
+/// [`backups`]).
 fn fleet() -> Result<Value, String> {
     let store = open_store()?;
     let mut health = store.fleet_health().map_err(err)?;
     health["disk"] = crate::disk::report(&store.host_disk().map_err(err)?);
     health["memory"] = crate::memory::report();
     health["storage"] = storage::report(&store, now_ms())?;
+    health["backups"] = backups(&store)?;
     let mut agents = store.fleet_board().map_err(err)?;
     labels::label_fleet(&mut agents, &label_context(&store)?);
     Ok(json!({
         "agents": agents,
         "health": health,
     }))
+}
+
+/// The health's `backups`: `{dump, bundle}`, each the newest `backup.dumped`
+/// or `backup.bundled` record as `{at_ms, key, bytes}`, or null when there
+/// is none.
+fn backups(store: &spawn_postgres::PostgresStore) -> Result<Value, String> {
+    store.newest_backups().map_err(err)
 }
 
 /// What the fleet board and the attention queue label their agents with
@@ -2387,7 +2397,7 @@ mod tests {
 
     use super::{
         Arc, BAD_REQUEST, DEFAULT_LIMIT, LogStart, MAX_INPUT_BODY, MAX_INPUT_TEXT, MAX_LIMIT,
-        ProcSocket, Shared, access_token, handle, is_json, is_loopback, local_exemption,
+        ProcSocket, Shared, access_token, backups, handle, is_json, is_loopback, local_exemption,
         log_window, objective_json, objective_prompt, open_network_request, open_networks,
         owner_uid, peer_uid, proc_sockets, rsi_objective, rsi_summary, same_origin, same_secret,
         serve_requests, server_hosts, tokenless_request, typed_text, with_last_gates,
@@ -3299,6 +3309,51 @@ mod tests {
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    /// Objective 82, through the real store: the health's `backups` is
+    /// null for each kind before any upload, then the newest record of each
+    /// kind as `{at_ms, key, bytes}`, whatever other records lie between.
+    #[test]
+    fn the_health_carries_the_newest_dump_and_bundle() {
+        in_test_schema(|owner, store| {
+            assert_eq!(
+                backups(store).expect("backups"),
+                json!({"dump": null, "bundle": null}),
+                "no upload yet"
+            );
+            let mut client =
+                postgres::Client::connect(owner, postgres::NoTls).expect("the owner connects");
+            let mut upload = |kind: &str, key: &str, bytes: i64, at_ms: i64| {
+                let id = store
+                    .backup_record(&json!({"type": kind, "keys": [key, "other"], "bytes": bytes}))
+                    .expect("a backup record");
+                client
+                    .execute(
+                        "update spawn_events set recorded_at_ms = $1 where id = $2",
+                        &[&at_ms, &id],
+                    )
+                    .expect("placed");
+            };
+            upload("backup.dumped", "postgres/hourly/a.dump.gpg", 900, 1_000);
+            assert_eq!(
+                backups(store).expect("backups"),
+                json!({"dump": {"at_ms": 1_000, "key": "postgres/hourly/a.dump.gpg", "bytes": 900},
+                       "bundle": null}),
+                "a dump and no bundle"
+            );
+            upload("backup.bundled", "bundles/full/b.tar.zst.gpg", 50, 2_000);
+            upload("backup.dumped", "postgres/hourly/c.dump.gpg", 940, 3_000);
+            store
+                .backup_record(&json!({"type": "backup.verified", "ok": true}))
+                .expect("a drill record");
+            assert_eq!(
+                backups(store).expect("backups"),
+                json!({"dump": {"at_ms": 3_000, "key": "postgres/hourly/c.dump.gpg", "bytes": 940},
+                       "bundle": {"at_ms": 2_000, "key": "bundles/full/b.tar.zst.gpg", "bytes": 50}}),
+                "the newest of each kind"
+            );
+        });
     }
 
     /// Objective 064, through the real store: each line for the owner

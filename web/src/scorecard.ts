@@ -16,6 +16,7 @@ export { formatDecimal };
 export const DIMENSION_KEYS = [
   "throughput",
   "lead_time",
+  "report_to_live",
   "first_pass",
   "rework",
   "autonomy",
@@ -49,6 +50,15 @@ export interface Throughput extends DimensionBase {
 export interface LeadTime extends DimensionBase {
   /** Milliseconds; null below `min_n`. */
   p90: number | null;
+}
+
+/** The performance north star (objective 081): from a landing's report to
+ * the deploy that put it live. `n` counts the live landings. */
+export interface ReportToLive extends DimensionBase {
+  /** Milliseconds; null below `min_n`. */
+  p90: number | null;
+  /** Landings with no deploy since, left out of the figures. */
+  not_live: number;
 }
 
 export interface FirstPass extends DimensionBase {
@@ -101,6 +111,7 @@ export interface GateTime extends DimensionBase {
 export interface Dimensions {
   throughput: Throughput;
   lead_time: LeadTime;
+  report_to_live: ReportToLive;
   first_pass: FirstPass;
   rework: Rework;
   autonomy: Autonomy;
@@ -183,6 +194,7 @@ function counts(value: unknown): Record<string, number> {
 const DEFAULT_BETTER: Record<DimensionKey, Better> = {
   throughput: "higher",
   lead_time: "lower",
+  report_to_live: "lower",
   first_pass: "higher",
   rework: "lower",
   autonomy: "lower",
@@ -220,6 +232,7 @@ export function normalizeDimensions(value: unknown): Dimensions {
 
   const throughput = part("throughput");
   const leadTime = part("lead_time");
+  const reportToLive = part("report_to_live");
   const firstPass = part("first_pass");
   const rework = part("rework");
   const autonomy = part("autonomy");
@@ -245,6 +258,11 @@ export function normalizeDimensions(value: unknown): Dimensions {
     lead_time: {
       ...base("lead_time"),
       p90: perLanding("lead_time", leadTime.p90),
+    },
+    report_to_live: {
+      ...base("report_to_live"),
+      p90: perLanding("report_to_live", reportToLive.p90),
+      not_live: number(reportToLive.not_live),
     },
     first_pass: {
       ...base("first_pass"),
@@ -361,6 +379,7 @@ export interface DimensionInfo {
 export const DIMENSION_INFO: Record<DimensionKey, DimensionInfo> = {
   throughput: { label: "Throughput", short: "Throughput", unit: "landings per open hour" },
   lead_time: { label: "Lead time", short: "Lead time", unit: "per landing" },
+  report_to_live: { label: "Report to live", short: "Report to live", unit: "per landing" },
   first_pass: { label: "First-pass quality", short: "First pass", unit: "of landings, first pass" },
   rework: { label: "Rework", short: "Rework", unit: "send-backs per landing" },
   autonomy: { label: "Autonomy", short: "Autonomy", unit: "interventions per landing" },
@@ -423,6 +442,7 @@ export function formatValue(key: DimensionKey, value: number | null): string {
   if (value === null || !Number.isFinite(value)) return "—";
   switch (key) {
     case "lead_time":
+    case "report_to_live":
     case "gate_time":
       return formatSpan(value);
     case "first_pass":
@@ -441,7 +461,7 @@ export function formatValue(key: DimensionKey, value: number | null): string {
 /** The raw number behind a formatted value, for its title. */
 export function rawTitle(key: DimensionKey, value: number | null): string {
   if (value === null || !Number.isFinite(value)) return "";
-  if (key === "lead_time" || key === "gate_time") return msTitle(value);
+  if (key === "lead_time" || key === "report_to_live" || key === "gate_time") return msTitle(value);
   if (key === "first_pass") return `share ${value}`;
   return String(value);
 }
@@ -570,6 +590,22 @@ export function dimensionParts(
         {
           title: null,
           parts: [{ label: "p90", value: formatSpan(d.p90), title: msTitle(d.p90) }],
+        },
+      ];
+    }
+    case "report_to_live": {
+      const d = dimensions.report_to_live;
+      return [
+        {
+          title: null,
+          parts: [
+            { label: "p90", value: formatSpan(d.p90), title: msTitle(d.p90) },
+            {
+              label: "not live yet",
+              value: formatDecimal(d.not_live, 0),
+              title: "Landings with no deploy since: left out of the figures",
+            },
+          ],
         },
       ];
     }
