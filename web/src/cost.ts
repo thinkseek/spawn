@@ -109,6 +109,23 @@ export interface Row {
   share: string | null;
 }
 
+/** A row as the page lays it out (objective 079): `first` is one line, its
+ * key, label, amount and share, the amount and share always in full and
+ * the label truncating before them; `second` is the line under it, in
+ * full and wrapping if it must: its unpriced mark's text, then its
+ * per-landing text, each only when the row has it ([] for neither). */
+export interface RowLines {
+  first: { key: string; label: string | null; usd: string; share: string | null };
+  second: string[];
+}
+
+export function rowLines(row: Row): RowLines {
+  const second: string[] = [];
+  if (row.unpriced_text) second.push(row.unpriced_text);
+  if (row.per_landing !== undefined) second.push(row.per_landing);
+  return { first: { key: row.key, label: row.label, usd: row.usd, share: row.share }, second };
+}
+
 /** The rows past the ten costliest, folded into one line: how many, their
  * dollars summed to the cent, and "<n> more tasks · <dollars>". */
 export interface Fold {
