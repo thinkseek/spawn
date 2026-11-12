@@ -25,7 +25,11 @@
 //! without a value.
 //!
 //! The storage figures are health.storage's on `/api/fleet`, read the same
-//! way ([`super::storage::report`]). The other lines' north stars are not
+//! way ([`super::storage::report`]). The recoverability guardrails
+//! (objective 087, [`recoverability`]) are the ages of the newest database
+//! copy and bundle (health.backups on `/api/fleet`), the age of the oldest
+//! nightly judging and how many sources the nightly holds red (its fact
+//! files, [`nightly_facts`]). The other lines' north stars are not
 //! collected yet; later objectives add their figures to this frame.
 //!
 //! No range lives in code: they come only from the ranges file,
@@ -39,7 +43,7 @@
 //! answer: monitoring only.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
@@ -183,9 +187,93 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
     })
 }
 
+/// The nightly's fact files under `<workspace root>/nightly`, as
+/// scripts/rsi/nightly.sh writes them (`<source>.json`; a source's name may
+/// hold dots): every non-hidden `*.json` there, read and parsed. The
+/// scenario logs beside them (`<source>.<scenario>.log`), the lock
+/// (`.<source>.lock`) and the run files (`.run-*`) are not facts; a file
+/// that cannot be read or parsed as an object is passed over. `None`
+/// without the directory.
+pub(super) fn nightly_facts(dir: Option<&Path>) -> Option<Vec<Value>> {
+    let entries = std::fs::read_dir(dir?).ok()?;
+    let mut facts = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with('.') || !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if let Ok(fact @ Value::Object(_)) = serde_json::from_str::<Value>(&text) {
+            facts.push(fact);
+        }
+    }
+    Some(facts)
+}
+
+/// The recoverability guardrails at `now_ms`, from `backups` (health.backups
+/// on `/api/fleet`: `{dump, bundle}`, each `{at_ms, ...}` or null) and the
+/// nightly's fact files (`None`: no directory):
+/// - the age of the newest database copy and of the newest bundle, null
+///   without the record;
+/// - the age of the oldest nightly judging (`judged_at`), a fact with none
+///   passed over; null without one;
+/// - the facts whose `red_since` is set (a non-empty string, as the
+///   integrator's `nightly_red` holds a source's landings); null without a
+///   fact.
+pub(super) fn recoverability(backups: &Value, facts: Option<&[Value]>, now_ms: i64) -> Vec<Figure> {
+    let age = |at: Option<i64>| at.map_or(Value::Null, |at| json!(now_ms.saturating_sub(at).max(0)));
+    let facts = facts.filter(|facts| !facts.is_empty());
+    let oldest = facts.and_then(|facts| {
+        facts
+            .iter()
+            .filter_map(|fact| fact["judged_at"].as_i64())
+            .min()
+    });
+    let red = facts.map_or(Value::Null, |facts| {
+        json!(
+            facts
+                .iter()
+                .filter(|fact| fact["red_since"].as_str().is_some_and(|since| !since.is_empty()))
+                .count()
+        )
+    });
+    vec![
+        Figure::new(
+            "recoverability.cloud_dump_age",
+            "Age of the newest database copy",
+            "ms",
+            age(backups["dump"]["at_ms"].as_i64()),
+        ),
+        Figure::new(
+            "recoverability.cloud_bundle_age",
+            "Age of the newest bundle",
+            "ms",
+            age(backups["bundle"]["at_ms"].as_i64()),
+        ),
+        Figure::new(
+            "recoverability.nightly_age",
+            "Age of the oldest nightly judging",
+            "ms",
+            age(oldest),
+        ),
+        Figure::new(
+            "recoverability.nightly_red",
+            "Nightly sources held red",
+            "count",
+            red,
+        ),
+    ]
+}
+
 /// The four lines, the storage line's figures from `storage` (health.storage
-/// as [`super::storage::report`] gives it).
-pub(super) fn lines(storage: &Value) -> Vec<Line> {
+/// as [`super::storage::report`] gives it), the recoverability guardrails
+/// `recoverability` ([`recoverability`]).
+pub(super) fn lines(storage: &Value, recoverability: Vec<Figure>) -> Vec<Line> {
     let database = &storage["database"];
     let ratio = match (database["bytes"].as_f64(), database["log_bytes"].as_f64()) {
         (Some(bytes), Some(log)) if log > 0.0 => json!(bytes / log),
@@ -268,7 +356,7 @@ pub(super) fn lines(storage: &Value) -> Vec<Line> {
                 "Critical resources with a restore passed in 7 days",
                 "count",
             ),
-            guardrails: Vec::new(),
+            guardrails: recoverability,
         },
     ]
 }
@@ -337,19 +425,37 @@ pub(super) fn read_ranges(path: Option<&std::path::Path>) -> Result<Option<Strin
     }
 }
 
-/// `GET /api/core-lines`.
-pub(super) fn core_lines() -> Result<Value, String> {
-    core_lines_at(&super::open_store()?, ranges_path().as_deref())
+/// Where the nightly's fact files are: `<SPAWN_WORKSPACE_ROOT>/nightly`.
+fn nightly_dir() -> Option<PathBuf> {
+    crate::env_value("SPAWN_WORKSPACE_ROOT").map(|root| PathBuf::from(root).join("nightly"))
 }
 
-/// The answer with the ranges file at `path`, read now.
+/// `GET /api/core-lines`.
+pub(super) fn core_lines() -> Result<Value, String> {
+    core_lines_at(
+        &super::open_store()?,
+        ranges_path().as_deref(),
+        nightly_dir().as_deref(),
+    )
+}
+
+/// The answer with the ranges file at `path` and the nightly's fact files
+/// in `nightly`, read now.
 pub(super) fn core_lines_at(
     store: &spawn_postgres::PostgresStore,
-    path: Option<&std::path::Path>,
+    path: Option<&Path>,
+    nightly: Option<&Path>,
 ) -> Result<Value, String> {
-    let storage = super::storage::report(store, super::now_ms())?;
+    let now = super::now_ms();
+    let storage = super::storage::report(store, now)?;
+    let backups = store.newest_backups().map_err(super::err)?;
+    let facts = nightly_facts(nightly);
     let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
-    Ok(answer(&lines(&storage), &file, read_ranges(path)))
+    Ok(answer(
+        &lines(&storage, recoverability(&backups, facts.as_deref(), now)),
+        &file,
+        read_ranges(path),
+    ))
 }
 
 #[cfg(test)]
@@ -458,7 +564,11 @@ mod tests {
                 {"role": "x", "bytes": 9, "schemas": 1},
             ],
         });
-        let view = answer(&lines(&storage), &json!("/ws/core-lines.json"), Ok(None));
+        let view = answer(
+            &lines(&storage, Vec::new()),
+            &json!("/ws/core-lines.json"),
+            Ok(None),
+        );
         let names: Vec<&str> = view["lines"]
             .as_array()
             .expect("lines")
@@ -491,8 +601,10 @@ mod tests {
             ]
         );
         // No log size: no ratio; no readable test database: none.
-        let bare =
-            lines(&json!({"database": {"bytes": 300, "log_bytes": 0}, "test_databases": []}));
+        let bare = lines(
+            &json!({"database": {"bytes": 300, "log_bytes": 0}, "test_databases": []}),
+            Vec::new(),
+        );
         assert_eq!(bare[1].guardrails[2].value, Value::Null);
         assert_eq!(bare[1].guardrails[3].value, Value::Null);
         // The other north stars are not collected, with no guardrails.
