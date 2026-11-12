@@ -175,6 +175,8 @@ cat >"$scratch/fakebin/systemctl" <<'EOF'
 echo "$*" >>"$SYSTEMCTL_LOG"
 [ -z "${SYSTEMCTL_TIMES-}" ] || echo "$(date +%s.%N) $*" >>"$SYSTEMCTL_TIMES"
 # FAKE_INTEGRATOR_INACTIVE: the integrator unit is not running.
+# FAKE_INTEGRATOR_PID: the integrator's main pid (else none: no warm-up).
+case "$*" in "--user show -p MainPID --value spawn-integrate") [ -z "${FAKE_INTEGRATOR_PID-}" ] || echo "$FAKE_INTEGRATOR_PID" ;; esac
 case "$*" in "--user is-active --quiet spawn-integrate") [ -z "${FAKE_INTEGRATOR_INACTIVE-}" ] || exit 3 ;; esac
 case "${SYSTEMCTL_FAIL-}" in "$*="*) exit "${SYSTEMCTL_FAIL##*=}" ;; esac
 case "$*" in "--user try-restart spawn-model-relay") exit 5 ;; esac
@@ -501,6 +503,28 @@ check "main stays HEAD" [ "$(main)" = "$head" ]
 check "nothing is pending" [ ! -e "$live/deploy.pending" ]
 check "the services restarted" grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$SYSTEMCTL_LOG"
 check "recorded: ok, by the landing" [ "$(finished | tail -n 1)" = "true landing $head " ]
+
+echo "== the warm-up's unit runs gate.sh itself, not setsid (deploy/detach.sh)"
+# The deploy reaches its warm-up: an integrator pid, and its gate environment
+# file naming that pid first. A systemd-run first in PATH records what the
+# deploy asks the user manager to run, and runs nothing.
+mkdir -p "$scratch/fakebin-warm"
+cat >"$scratch/fakebin-warm/systemd-run" <<'EOF'
+#!/bin/sh
+for arg in "$@"; do printf '%s\n' "$arg"; done >"$FAKE_SYSTEMD_RUN_LOG"
+EOF
+chmod 755 "$scratch/fakebin-warm/systemd-run"
+printf 'SPAWN_INTEGRATE_PID=4242\0HOME=%s\0PATH=%s\0' "$scratch/warm-home" "$PATH" >"$scratch/gate-env"
+deploy PATH="$scratch/fakebin-warm:$scratch/fakebin:$PATH" FAKE_INTEGRATOR_PID=4242 \
+  SPAWN_GATE_ENV_FILE="$scratch/gate-env" FAKE_SYSTEMD_RUN_LOG="$scratch/systemd-run.args"
+check "the deploy succeeds (status $status)" [ "$status" -eq 0 ]
+check "it starts its warm-up in a unit of its own" grep -q "base cache: warming it for $head in the unit spawn-warm-base-" "$out"
+warm_ctl=$(readlink -f "$live/controllers/spawn")
+warm_cmd=$(sed -n '/^--$/,$p' "$scratch/systemd-run.args" 2>/dev/null | tail -n +2 | tr '\n' ' ')
+check "the unit's command is sh gate.sh --base-only <missions> <head> <scenarios> (got: $warm_cmd)" \
+  [ "$warm_cmd" = "sh $warm_ctl/scripts/rsi/gate.sh --base-only $missions $head $warm_ctl/rsi/scenarios " ]
+# This deploy's own record, which the lock checks below count from.
+recorded=$((recorded + 1))
 check "one record per deploy that held the lock" [ "$(finished | wc -l)" -eq $((recorded + 3)) ]
 flock -o "$live/deploy.lock" sleep 120 &
 holder=$!
@@ -533,7 +557,33 @@ if systemctl --user show-environment >/dev/null 2>&1; then
   # shellcheck disable=SC2016
   systemd-run --user --wait --quiet --collect -p Type=oneshot --unit "$unit-plain" \
     bash -c '(exec setsid sh -c "sleep 3; touch $1") & exit 0' _ "$plain"
+  # The warm-up's shape: `sh <script> <args>` (deploy.sh), its output in its
+  # log; and setsid in front, started as a unit's command, dies at once
+  # (what every deploy's warm-up did until this check): detach_start refuses
+  # it.
+  probe=$scratch/warm-probe.sh shaped=$scratch/shaped-alive sid=$scratch/setsid-alive
+  printf 'echo "probe started $1"\nsleep 3\necho "probe ended $1"\ntouch "$2"\n' >"$probe"
+  # shellcheck disable=SC2016
+  systemd-run --user --wait --quiet --collect -p Type=oneshot --unit "$unit-tick2" \
+    bash -c '. "$1/deploy/detach.sh"
+      detach_assignments "$3.env" "X=1" && detach_start "$2" "$3.log" "$3.env" sh "$4" one "$3" && unlink "$3.env"' \
+    _ "$repo" "$unit-shaped" "$shaped" "$probe"
+  set +e
+  bash -c '. "$1/deploy/detach.sh"; detach_assignments "$3.env" "X=1"; detach_start "$2" "$3.log" "$3.env" setsid sh "$4" two "$3"' \
+    _ "$repo" "$unit-refused" "$sid" "$probe" 2>"$scratch/refused.err"
+  refused_status=$?
+  set -e
+  systemd-run --user --quiet --collect --unit "$unit-setsid" -p Type=exec \
+    -p StandardOutput=append:"$sid.log" -p StandardError=append:"$sid.log" -- setsid sh "$probe" three "$sid" </dev/null
   sleep 5
+  check "a warm-up of deploy.sh's shape (sh <script> ...) ran to its end" [ -e "$shaped" ]
+  check "with its output in its log" grep -qx "probe ended one" "$shaped.log"
+  check "detach_start refuses setsid in front (status $refused_status)" [ "$refused_status" -eq 2 ]
+  check "and says why" grep -q "refused: setsid in front of the command" "$scratch/refused.err"
+  check "starting no unit" bash -c "! systemctl --user is-active --quiet '$unit-refused'"
+  check "setsid in front, as a unit's command, never reaches its end (the checks above mean something)" \
+    bash -c "[ ! -e '$sid' ] && ! grep -q 'probe ended' '$sid.log' 2>/dev/null"
+  rm -f "$sid.env"
   check "the detached warm-up outlived its oneshot unit" [ -e "$detached" ]
   check "with the environment of its file, quoting kept" \
     [ "$(cat "$detached" 2>/dev/null)" = 'postgres://u:p@h/db/a "b" c' ]
