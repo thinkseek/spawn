@@ -926,3 +926,259 @@ fn the_facts_are_the_old_statements_answer() {
         2800
     );
 }
+
+/// A control record at `at` with the seq `seq` (a gap left before it, or a
+/// late commit into one).
+fn record_seq(client: &mut Client, at: i64, seq: i64, record: &Value) {
+    client
+        .execute(
+            "insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id,
+                                       kind, session_seq, recorded_at_ms)
+             values ('agent_control', 'session_control', null, 'control', null,
+                     jsonb_build_object('name', 'control.recorded',
+                                        'detail', jsonb_build_object('record', $1::jsonb)),
+                     $3, $2)",
+            &[record, &at, &seq],
+        )
+        .expect("write a control record");
+}
+
+fn oracle(client: &mut Client, until: i64) -> Value {
+    client
+        .query_one(OLD_FACTS, &[&until])
+        .expect("the old facts")
+        .get(0)
+}
+
+/// A step of a random history: a control record of a kind the facts read,
+/// a command of a kind they keep (or not), or a pending command finishing.
+fn random_step(client: &mut Client, state: &mut u64, now: i64, task: &mut i64) {
+    *state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    let pick = (*state >> 33) % 9;
+    let log = "| == candidate\n| stage gate rejected 300000ms total\n| more";
+    match pick {
+        0 => {
+            *task += 1;
+            record(
+                client,
+                now,
+                &json!({"type": "task.assigned", "id": *task, "mission_id": 1, "kind": "ephemeral",
+                        "agent_id": format!("agent_w{task}"), "session_id": format!("session_w{task}"),
+                        "brief": "b", "created_by": "spawn-dispatch", "objective": *task}),
+            );
+        }
+        1 => record(
+            client,
+            now,
+            &json!({"type": "task.gated", "id": *task, "verdict": "rejected",
+                                          "revision": 0, "log": log}),
+        ),
+        2 => record(client, now, &json!({"type": "task.landed", "id": *task})),
+        3 => record(
+            client,
+            now,
+            &json!({"type": "deploy.finished", "ok": now % 2 == 0,
+                                          "head": "h", "by": "landing", "reason": ""}),
+        ),
+        4 => record(
+            client,
+            now,
+            &json!({"type": "source.moved", "source": "/s", "from": "a",
+                                          "to": "b", "request": now, "verdict": "accepted",
+                                          "missions": [1], "mission": 1, "gate_ms": 1000}),
+        ),
+        5 => {
+            let principal = if now % 2 == 0 { "human" } else { "spawn" };
+            command(
+                client,
+                principal,
+                &format!("k{now}"),
+                &json!({"type": "input", "text": "x"}),
+                None,
+                None,
+                now,
+            );
+        }
+        6 => command(
+            client,
+            "spawn-dispatch",
+            &format!("deliver-{task}-0-{now}"),
+            &json!({"type": "input", "text": "x"}),
+            None,
+            None,
+            now,
+        ),
+        7 => command(
+            client,
+            "spawn-dispatch",
+            &format!("other-{now}"),
+            &json!({"type": "start", "engine": "claude", "prompt": "p"}),
+            None,
+            None,
+            now,
+        ),
+        _ => {
+            // The oldest pending command finishes now: failed every other
+            // time, which makes a dispatcher's "other" command a fact.
+            client
+                .execute(
+                    "update spawn_commands set state = 'finished', succeeded = $1,
+                            finished_at_ms = $2
+                      where id = (select min(id) from spawn_commands where state = 'pending')",
+                    &[&(now % 3 != 0), &now],
+                )
+                .expect("a command finishes");
+        }
+    }
+}
+
+/// The kept facts (design-facts-incremental.md): after each step of a
+/// random history (records, commands made, commands finishing), a reading
+/// at a later end (or the same end again) reads only what is new and gives
+/// exactly the whole statement's answer, the oracle's. Three seeds.
+#[test]
+fn the_kept_facts_are_the_whole_facts_after_every_step() {
+    for seed in [1_u64, 7, 42] {
+        let (store, schema) = store(&format!("scorecard_kept_{seed}"));
+        let mut client = admin(&schema);
+        let (mut state, mut task) = (seed, 0);
+        record(
+            &mut client,
+            10,
+            &json!({"type": "mission.added", "id": 1, "text": "m",
+                                         "origin": "human", "sources": []}),
+        );
+        for step in 0..60_i64 {
+            let now = 100 + step * 10;
+            random_step(&mut client, &mut state, now, &mut task);
+            let until = if step % 7 == 3 { now } else { now + 1 };
+            assert_eq!(
+                store.scorecard_facts(until).expect("the facts"),
+                oracle(&mut client, until),
+                "seed {seed} step {step}"
+            );
+        }
+    }
+}
+
+/// A record that commits after a kept reading with a seq below the kept
+/// one's (a late commit), recorded before that reading's end, is in the
+/// next reading while it is within the overlap; an earlier end reads in
+/// full and leaves the kept facts as they were; two stores' facts are kept
+/// apart.
+#[test]
+fn the_kept_facts_take_a_late_commit_an_earlier_end_and_keep_stores_apart() {
+    let (other, other_schema) = store("scorecard_kept_other");
+    let (kept, schema) = store("scorecard_kept_late");
+    let mut client = admin(&schema);
+    let mut other_client = admin(&other_schema);
+    for (seq, at) in [(1, 100), (2, 200), (10, 300)] {
+        record_seq(
+            &mut client,
+            at,
+            seq,
+            &json!({"type": "deploy.finished", "ok": true,
+                                                  "head": "h", "by": "landing", "reason": ""}),
+        );
+    }
+    record(
+        &mut other_client,
+        150,
+        &json!({"type": "task.landed", "id": 9}),
+    );
+    assert_eq!(
+        kept.scorecard_facts(400).expect("facts"),
+        oracle(&mut client, 400)
+    );
+    assert_eq!(
+        other.scorecard_facts(400).expect("facts"),
+        oracle(&mut other_client, 400)
+    );
+    // Seq 5, recorded at 250 (before the kept end), committed only now.
+    record_seq(
+        &mut client,
+        250,
+        5,
+        &json!({"type": "task.landed", "id": 4}),
+    );
+    let late = kept.scorecard_facts(500).expect("facts");
+    assert_eq!(late, oracle(&mut client, 500));
+    assert_eq!(
+        by_type(&late, "task.landed").len(),
+        1,
+        "the late commit: {late}"
+    );
+    // An earlier end: in full, and the kept facts untouched by it.
+    assert_eq!(
+        kept.scorecard_facts(250).expect("facts"),
+        oracle(&mut client, 250)
+    );
+    record(&mut client, 600, &json!({"type": "task.landed", "id": 6}));
+    assert_eq!(
+        kept.scorecard_facts(700).expect("facts"),
+        oracle(&mut client, 700)
+    );
+    assert_eq!(
+        other.scorecard_facts(700).expect("facts"),
+        oracle(&mut other_client, 700)
+    );
+}
+
+/// A kept reading's statement reads what is new, not the log: the buffers
+/// of a steady reading (the last 256 seqs again, nothing else new) over a
+/// control log four times as long are within 10% of the shorter one's,
+/// under a generic plan. Buffers, not rows (the interventions lesson: an
+/// index walked on a column that does not lead shows in no row count).
+#[test]
+fn a_kept_reading_costs_what_is_new_not_the_log() {
+    let mut buffers = Vec::new();
+    for records in [2_000_i64, 8_000] {
+        let (_store, schema) = store(&format!("scorecard_kept_growth_{records}"));
+        let mut client = admin(&schema);
+        client
+            .execute(
+                "insert into spawn_events (agent_id, session_id, execution_id, source,
+                                           source_event_id, kind, session_seq, recorded_at_ms)
+                 select 'agent_control', 'session_control', null, 'control', null,
+                        jsonb_build_object('name', 'control.recorded', 'detail',
+                          jsonb_build_object('record', jsonb_build_object(
+                            'type', 'task.gated', 'id', n, 'verdict', 'rejected',
+                            'log', repeat('| a line of a gate log\n', 40)))),
+                        n, n * 10
+                   from generate_series(1, $1::bigint) n",
+                &[&records],
+            )
+            .expect("a control log");
+        client
+            .batch_execute("analyze spawn_events")
+            .expect("analyze");
+        client
+            .batch_execute("set plan_cache_mode = force_generic_plan")
+            .expect("generic plans");
+        let end = records * 10;
+        let statement = format!(
+            "explain (analyze, buffers, format json) {}",
+            PostgresStore::scorecard_facts_since_statement()
+        );
+        let plan: Value = client
+            .query_one(
+                &statement,
+                &[&(end + 1), &(end - 2_000), &(records - 256), &0_i64],
+            )
+            .expect("the plan")
+            .get(0);
+        let root = &plan[0]["Plan"];
+        buffers.push(
+            root["Shared Hit Blocks"].as_i64().unwrap_or(0)
+                + root["Shared Read Blocks"].as_i64().unwrap_or(0),
+        );
+    }
+    assert!(
+        buffers[1] <= buffers[0] + buffers[0] / 10,
+        "4 times the log read {} buffers, the shorter {}",
+        buffers[1],
+        buffers[0]
+    );
+}

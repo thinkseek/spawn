@@ -6,6 +6,9 @@
 //! numbers. Both reads are one statement, one snapshot. The reader login
 //! (`spawn serve`) may run them: it selects every table.
 
+use std::collections::BTreeMap;
+use std::sync::{LazyLock, Mutex};
+
 use serde_json::Value;
 use spawn_core::port::StoreError;
 
@@ -135,6 +138,97 @@ select min(e.recorded_at_ms)
    and x.r ->> 'type' in ('source.moved', 'source.push_refused')
    and jsonb_typeof(x.r -> 'gate_ms') = 'number'";
 
+/// [`FACTS`] for what is new since a kept reading (design-facts-incremental.md,
+/// the lead's timing on the live copy): the same projections, the control
+/// records only of `seq > $3` (the last kept seq less [`OVERLAP`]) or
+/// recorded at or after `$2` (the kept reading's end), the commands only of
+/// `id > $4` (the last kept id less [`OVERLAP`]) or finished at or after
+/// `$2` (a finish is the one change a command row gets, and what makes a
+/// failed one a fact). The control records are found as two lists of ids,
+/// one per index (`spawn_events_session_seq`, `spawn_events_name_time`), and
+/// read back by primary key from an array of them: as one `or`, a generic
+/// plan walked every control record, and joined back it scanned the table.
+/// It is made from [`FACTS`]'s text, so the projections are one.
+static FACTS_SINCE: LazyLock<String> = LazyLock::new(|| {
+    let control = "      from spawn_events e\n";
+    let commands = "     where c.created_at_ms < $1\n";
+    let control_where =
+        "     where e.session_id = 'session_control' and e.event_name = 'control.recorded'\n";
+    assert!(
+        FACTS.matches(control).count() == 1
+            && FACTS.matches(control_where).count() == 1
+            && FACTS.matches(commands).count() == 1
+    );
+    FACTS
+        .replace(
+            control,
+            "      from spawn_events e
+     -- WINDOW: by id, from the two lists (an array, so each row is one
+     -- primary key probe: joined, a generic plan scanned the table).
+     cross join (select array(
+              select s.id from spawn_events s
+               where s.session_id = 'session_control' and s.session_seq > $3
+                 and s.recorded_at_ms < $1
+              union
+              select s.id from spawn_events s
+               where s.event_name = 'control.recorded'
+                 and s.recorded_at_ms >= $2 and s.recorded_at_ms < $1) as ids) w\n",
+        )
+        .replace(
+            "     where e.session_id = 'session_control' and e.event_name = 'control.recorded'\n",
+            "     where e.id = any(w.ids)
+       and e.session_id = 'session_control' and e.event_name = 'control.recorded'\n",
+        )
+        .replace(
+            commands,
+            "     where c.created_at_ms < $1 and (c.id > $4 or c.finished_at_ms >= $2)\n",
+        )
+});
+
+/// How far below the last kept seq (and command id) a reading reads again:
+/// a row whose transaction took a lower number and committed after the
+/// kept reading (a sequence hands numbers out in order, commits land out of
+/// order) is found while fewer than this many were written after it.
+const OVERLAP: i64 = 256;
+
+/// One store's facts as its last reading left them: its end, its control
+/// facts by seq, its command facts by id.
+struct Kept {
+    until: i64,
+    control: BTreeMap<i64, Value>,
+    commands: BTreeMap<i64, Value>,
+}
+
+impl Kept {
+    /// The facts of a [`FACTS`] (or [`FACTS_SINCE`]) answer added to these,
+    /// each replacing the one of its seq or id.
+    fn merge(&mut self, read: &Value) {
+        for (part, key, kept) in [
+            ("control", "seq", &mut self.control),
+            ("commands", "id", &mut self.commands),
+        ] {
+            for fact in read[part].as_array().into_iter().flatten() {
+                if let Some(at) = fact[key].as_i64() {
+                    kept.insert(at, fact.clone());
+                }
+            }
+        }
+    }
+
+    /// The facts as [`FACTS`] gives them: each part in seq (id) order.
+    fn answer(&self) -> Value {
+        serde_json::json!({
+            "control": self.control.values().collect::<Vec<_>>(),
+            "commands": self.commands.values().collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// The facts each store (by its URL, database and schema) last read, in
+/// this process: the dashboard's and the loop's Core lines readings read
+/// only what is new since ([`FACTS_SINCE`]).
+static KEPT: Mutex<BTreeMap<(u64, String), Kept>> = Mutex::new(BTreeMap::new());
+
 impl PostgresStore {
     /// The database's clock (`spawn_now_ms()`), in epoch milliseconds: the
     /// scorecard's "now", never this host's.
@@ -160,8 +254,56 @@ impl PostgresStore {
     /// clock, whatever `until_ms`) are taken from the control facts, which
     /// hold every such record before `until_ms`, not read again; the latter
     /// is read ([`OWNER_RUNS_FROM`]) only when none is before `until_ms`.
+    ///
+    /// The facts are kept in this process, by store: a reading at or after
+    /// the kept one's end reads only what is new since ([`FACTS_SINCE`]); an
+    /// earlier end, a first reading or one after a failed one reads them all
+    /// ([`FACTS`]), and an earlier end leaves the kept facts as they were.
     pub fn scorecard_facts(&self, until_ms: i64) -> Result<Value, StoreError> {
-        let mut facts = self.query_json(FACTS, &[&until_ms])?;
+        let key = self.facts_key()?;
+        let mut all = KEPT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut facts = match all.remove(&key) {
+            Some(kept) if until_ms < kept.until => {
+                let facts = self.query_json(FACTS, &[&until_ms]);
+                all.insert(key, kept);
+                facts?
+            }
+            Some(mut kept) => {
+                let since_seq = kept
+                    .control
+                    .keys()
+                    .next_back()
+                    .map_or(i64::MIN, |seq| seq - OVERLAP);
+                let since_id = kept
+                    .commands
+                    .keys()
+                    .next_back()
+                    .map_or(i64::MIN, |id| id - OVERLAP);
+                let read = self.query_json(
+                    &FACTS_SINCE,
+                    &[&until_ms, &kept.until, &since_seq, &since_id],
+                )?;
+                kept.merge(&read);
+                kept.until = until_ms;
+                let facts = kept.answer();
+                all.insert(key, kept);
+                facts
+            }
+            None => {
+                let read = self.query_json(FACTS, &[&until_ms])?;
+                let mut kept = Kept {
+                    until: until_ms,
+                    control: BTreeMap::new(),
+                    commands: BTreeMap::new(),
+                };
+                kept.merge(&read);
+                all.insert(key, kept);
+                read
+            }
+        };
+        drop(all);
         let earliest = |types: &[&str], gated: bool| {
             facts["control"]
                 .as_array()
@@ -184,6 +326,26 @@ impl PostgresStore {
         facts["live_from_ms"] = serde_json::json!(live_from);
         facts["owner_runs_from_ms"] = serde_json::json!(owner_runs_from);
         Ok(facts)
+    }
+
+    /// The statement a kept reading runs ([`FACTS_SINCE`]): `$1` the end,
+    /// `$2` the kept reading's end, `$3` and `$4` the last kept seq and
+    /// command id less the overlap. For timing it at live size, and for the
+    /// tests that read its plan.
+    pub fn scorecard_facts_since_statement() -> &'static str {
+        &FACTS_SINCE
+    }
+
+    /// Which store this is, for [`KEPT`]: a hash of the URL it connected
+    /// with (never kept itself) and its database and schema.
+    fn facts_key(&self) -> Result<(u64, String), StoreError> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        self.url.hash(&mut hasher);
+        let place: String = self
+            .query_one("select current_database() || '.' || current_schema()", &[])?
+            .get(0);
+        Ok((hasher.finish(), place))
     }
 
     /// When the live record starts: the first `deploy.finished` of any
