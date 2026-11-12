@@ -1334,8 +1334,9 @@ fn a_store_restored_in_place_leaves_no_kept_fact_behind() {
 /// own lines, not a helper shared with other tests. After a failed
 /// assertion the database may be left behind (the reviewed reaper's
 /// print-only list shows it); the drop after the case is only tried, and
-/// only for a database (and logins) this case's own `create database`
-/// made: a name that already existed fails the case and is left alone.
+/// only for a database this case's own `create database` made (a name that
+/// already existed fails the case and is left alone), and only for the
+/// logins that did not exist before that create.
 #[test]
 fn a_database_made_again_under_its_name_is_another_store() {
     let url = common::url();
@@ -1356,6 +1357,18 @@ fn a_database_made_again_under_its_name_is_another_store() {
     // once its `create database` succeeded, so a name that already existed
     // is never dropped here (rev-e's F3).
     let (mut made, mut ever_made) = (false, false);
+    // The logins this case may drop: those absent before its first create
+    // (migrate adopts a login that exists; rev-e's R3-1), each by name.
+    let logins: Vec<String> = ["spawn_human", "spawn_reader", "spawn_supervisor"]
+        .iter()
+        .map(|base| format!("{base}_{name}"))
+        .filter(|login| {
+            maintenance
+                .query_opt("select 1 from pg_roles where rolname = $1", &[login])
+                .expect("whether the login exists")
+                .is_none()
+        })
+        .collect();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // The first history, then one that differs but for its last record.
         for (ids, until) in [([1, 2, 3], 1_000), ([9, 8, 3], 1_100)] {
@@ -1389,8 +1402,8 @@ fn a_database_made_again_under_its_name_is_another_store() {
         let _ = maintenance.batch_execute(&format!("drop database {name} with (force)"));
     }
     if ever_made {
-        for base in ["spawn_human", "spawn_reader", "spawn_supervisor"] {
-            let _ = maintenance.batch_execute(&format!("drop role if exists {base}_{name}"));
+        for login in &logins {
+            let _ = maintenance.batch_execute(&format!("drop role if exists {login}"));
         }
     }
     if let Err(panic) = result {
