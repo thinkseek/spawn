@@ -676,6 +676,7 @@ pub(super) fn core_lines_at(
     let samples = store
         .host_core_lines(trend_since(now_ms))
         .map_err(super::err)?;
+    let samples = measured_samples(samples, store.first_deploy_finished_ms().ok().flatten());
     let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
     Ok(answer(
         &figures,
@@ -683,6 +684,24 @@ pub(super) fn core_lines_at(
         read_ranges(path),
         &trends(&samples, now_ms),
     ))
+}
+
+/// `samples` (`host.core_lines`, `[{at_ms, values}]`) without a report to
+/// live taken before the live record covered its window (rev-e F1 on
+/// 7b1dd20a): a sample before `first_deploy_ms` plus the window holds the
+/// record's start, not the wait (106 h, sampled live at 19:24), so its trend
+/// never draws it. Without a record (`None`), none is kept. The other
+/// figures stay as they are.
+pub(super) fn measured_samples(mut samples: Value, first_deploy_ms: Option<i64>) -> Value {
+    let covered_from = first_deploy_ms.map(|first| first.saturating_add(REPORT_TO_LIVE_WINDOW_MS));
+    for sample in samples.as_array_mut().into_iter().flatten() {
+        let at = sample["at_ms"].as_i64();
+        let kept = matches!((at, covered_from), (Some(at), Some(from)) if at >= from);
+        if !kept && let Some(values) = sample["values"].as_object_mut() {
+            values.remove("performance.report_to_live");
+        }
+    }
+    samples
 }
 
 /// The four lines' figures, read at `now_ms` with the nightly's fact files
@@ -729,8 +748,8 @@ pub(crate) fn sample_values() -> Result<Map<String, Value>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Figure, answer, figure_json, lines, measured, nightly_facts, parse_ranges, performance,
-        read_ranges, recoverability,
+        Figure, answer, figure_json, lines, measured, measured_samples, nightly_facts,
+        parse_ranges, performance, read_ranges, recoverability, trends,
     };
     use serde_json::{Value, json};
 
@@ -956,6 +975,43 @@ mod tests {
             lines(&json!({}), &values, Vec::new())[0].guardrails[3].name,
             "Dollars per landing (priced use only)",
             "the Cost page's priced dollars only (cc-astra A11)"
+        );
+    }
+
+    /// rev-e F1 on 7b1dd20a: a report to live sampled before the record
+    /// covered the window (106 h, the record's start) never reaches its
+    /// trend; one sampled after does, and the other figures are untouched.
+    #[test]
+    fn report_to_live_samples_before_the_record_covers_the_window_are_dropped() {
+        const DAY: i64 = 86_400_000;
+        let now = 200 * DAY + 12 * 3_600_000;
+        let first = now - 8 * DAY;
+        let sample = |at: i64, rtl: i64| {
+            json!({"at_ms": at, "values": {"performance.report_to_live": rtl,
+                                           "storage.free_bytes": 7}})
+        };
+        let samples = json!([
+            sample(now - 2 * DAY, 380_287_112),
+            sample(first + 7 * DAY - 1, 380_000_000),
+            sample(first + 7 * DAY, 5_400_000),
+            sample(now, 5_500_000),
+        ]);
+        let kept = trends(&measured_samples(samples.clone(), Some(first)), now);
+        let rtl: Vec<Value> = kept["performance.report_to_live"]
+            .iter()
+            .map(|point| point["value"].clone())
+            .collect();
+        assert_eq!(rtl, [json!(5_400_000), json!(5_500_000)], "{kept:?}");
+        assert_eq!(kept["storage.free_bytes"].len(), 3, "one a day, untouched");
+        // No record: no report to live point at all.
+        let none = trends(&measured_samples(samples.clone(), None), now);
+        assert!(!none.contains_key("performance.report_to_live"), "{none:?}");
+        assert_eq!(none["storage.free_bytes"].len(), 3);
+        // The record only 2 days old: none either.
+        let young = trends(&measured_samples(samples, Some(now - 2 * DAY)), now);
+        assert!(
+            !young.contains_key("performance.report_to_live"),
+            "{young:?}"
         );
     }
 
