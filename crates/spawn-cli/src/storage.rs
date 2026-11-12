@@ -5,9 +5,11 @@
 //! transcripts (its projects directory, as [`crate::runtime`] resolves it)
 //! are what the archive is copied from, and a fall in their count is a
 //! loss. The loop samples both as a `host.storage` record at its start and
-//! then whenever its latest sample is an hour old ([`Sampler`]): the page's
-//! storage figures (`/api/fleet`'s `health.storage`) measure the archive's
-//! growth and the fall of Claude Code's files against those samples.
+//! then whenever its latest sample is an hour old ([`Sampler`]), with the
+//! live database's size: the page's storage figures (`/api/fleet`'s
+//! `health.storage`) measure the growth of the archive, of Claude Code's
+//! transcripts and of the database, and the fall of Claude Code's files,
+//! against those samples.
 //!
 //! A size is the sum of the apparent sizes of the regular files under a
 //! directory ([`walk`]): symbolic links are not followed, and a directory
@@ -92,15 +94,26 @@ pub(crate) fn projects_path() -> PathBuf {
     PathBuf::from(crate::runtime::claude_projects())
 }
 
-/// A `host.storage` record of these sizes.
-pub(crate) fn record(archive: Sizes, projects: Sizes) -> Value {
-    json!({
+/// A `host.storage` record of these sizes, with the live database's
+/// (`database_bytes`, objective 085) when it could be read.
+pub(crate) fn record(archive: Sizes, projects: Sizes, database: Option<u64>) -> Value {
+    let mut record = json!({
         "type": "host.storage",
         "archive_bytes": archive.bytes,
         "archive_files": archive.files,
         "projects_bytes": projects.bytes,
         "projects_files": projects.files,
-    })
+    });
+    if let Some(database) = database {
+        record["database_bytes"] = json!(database);
+    }
+    record
+}
+
+/// The live database's size, as `health.storage.database` reads it
+/// (`pg_database_size`); `None` when it cannot be read.
+pub(crate) fn database_bytes(store: &PostgresStore) -> Option<u64> {
+    store.database_size().ok()?["bytes"].as_u64()
 }
 
 /// The loop's samples: one at its start, then one whenever its latest is
@@ -131,24 +144,26 @@ impl Sampler {
             .is_none_or(|last| now_ms.saturating_sub(last) >= SAMPLE_EVERY_MS)
     }
 
-    /// The sample of the disk now.
-    pub(crate) fn measure(&self) -> Value {
+    /// The sample of the disk now, with the database's size `database`
+    /// (left out when it could not be read).
+    pub(crate) fn measure(&self, database: Option<u64>) -> Value {
         let archive = self.root.as_deref().map(archive).unwrap_or_default();
-        record(archive, walk(&self.projects, &[]))
+        record(archive, walk(&self.projects, &[]), database)
     }
 
-    /// When due, measure and write a sample through `write`; returns the
-    /// line for the loop's log. One that could not be written is tried
-    /// again in a minute.
+    /// When due, measure (the database's size through `database`) and
+    /// write a sample through `write`; returns the line for the loop's log.
+    /// One that could not be written is tried again in a minute.
     pub(crate) fn check_with(
         &mut self,
         now_ms: i64,
+        database: impl FnOnce() -> Option<u64>,
         write: impl FnOnce(&Value) -> Result<i64, String>,
     ) -> Result<Option<String>, String> {
         if !self.due(now_ms) {
             return Ok(None);
         }
-        let sample = self.measure();
+        let sample = self.measure(database());
         if let Err(error) = write(&sample) {
             self.last_ms = Some(now_ms.saturating_sub(SAMPLE_EVERY_MS - RETRY_MS));
             return Err(format!("storage sample: {error}"));
@@ -169,9 +184,11 @@ impl Sampler {
         store: &PostgresStore,
         now_ms: i64,
     ) -> Result<Option<String>, String> {
-        self.check_with(now_ms, |sample| {
-            store.host_record(sample).map_err(|error| error.to_string())
-        })
+        self.check_with(
+            now_ms,
+            || database_bytes(store),
+            |sample| store.host_record(sample).map_err(|error| error.to_string()),
+        )
     }
 }
 
@@ -266,7 +283,7 @@ pub(crate) mod tests {
         let mut written = Vec::new();
         let mut at = |sampler: &mut Sampler, now: i64| {
             sampler
-                .check_with(now, |sample| {
+                .check_with(now, || Some(7000), |sample| {
                     written.push((now, sample.clone()));
                     Ok(1)
                 })
@@ -290,15 +307,49 @@ pub(crate) mod tests {
         assert_eq!(
             written[0].1,
             json!({"type": "host.storage", "archive_bytes": 300, "archive_files": 1,
-                   "projects_bytes": 50, "projects_files": 2})
+                   "projects_bytes": 50, "projects_files": 2, "database_bytes": 7000})
         );
+    }
+
+    /// Objective 085: the sample carries the live database's size; one
+    /// whose size cannot be read leaves the field out and is still written.
+    #[test]
+    fn the_sample_carries_the_database_size_when_it_can_be_read() {
+        let root = scratch("sampler_database");
+        let projects = root.join("projects");
+        file(&root.join(".transcripts/agent_a/a1.jsonl"), 100);
+        let mut written = Vec::new();
+        let mut sampler = Sampler::with(Some(&root), projects.clone());
+        sampler
+            .check_with(0, || Some(8 * 1024 * 1024), |sample| {
+                written.push(sample.clone());
+                Ok(1)
+            })
+            .expect("written");
+        let mut unread = Sampler::with(Some(&root), projects);
+        unread
+            .check_with(0, || None, |sample| {
+                written.push(sample.clone());
+                Ok(2)
+            })
+            .expect("written without the database's size");
+        std::fs::remove_dir_all(&root).expect("clean up");
+        assert_eq!(written.len(), 2);
+        assert_eq!(written[0]["database_bytes"], 8 * 1024 * 1024);
+        assert_eq!(written[0]["archive_bytes"], 100);
+        assert!(written[1].get("database_bytes").is_none(), "{}", written[1]);
+        assert_eq!(written[1]["archive_bytes"], 100);
     }
 
     #[test]
     fn a_sample_that_could_not_be_written_is_tried_again_in_a_minute() {
         let root = scratch("sampler_retry");
         let mut sampler = Sampler::with(Some(&root), root.join("projects"));
-        assert!(sampler.check_with(0, |_| Err("down".to_string())).is_err());
+        assert!(
+            sampler
+                .check_with(0, || None, |_| Err("down".to_string()))
+                .is_err()
+        );
         assert!(!sampler.due(59_999));
         assert!(sampler.due(60_000));
         std::fs::remove_dir_all(&root).expect("clean up");
