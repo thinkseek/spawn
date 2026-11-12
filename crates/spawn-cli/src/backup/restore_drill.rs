@@ -118,23 +118,7 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
             return Ok(2);
         }
         Err(Chain::Broken(reason)) => {
-            let reason = format!("the backup cannot be restored: {reason}");
-            println!("restore-drill: FAILED: {reason}");
-            // Against the newest stored record: chain_of found one.
-            let newest = records.iter().rev().find(|record| stored(record));
-            let (key, event_id) = newest.map_or((String::new(), 0), |record| {
-                (bundle_key(record), record.event_id)
-            });
-            let verdict = Verdict {
-                key: &key,
-                event_id,
-                duration_ms: elapsed_ms(started),
-            };
-            let both = [
-                (TRANSCRIPTS, Outcome::Unrestorable(reason.clone())),
-                (MISSIONS, Outcome::Unrestorable(reason)),
-            ];
-            return Ok(record_verdicts(&store, &verdict, &both).unwrap_or(1));
+            return Ok(unrestorable(&store, &records, &reason, started));
         }
     };
     if let Some(newest) = records.last()
@@ -211,6 +195,33 @@ struct Verdict<'a> {
     key: &'a str,
     event_id: i64,
     duration_ms: i64,
+}
+
+/// A chain that lacks a link: said, and both resources recorded failed
+/// against the newest stored record (`chain_of` found one); exit 1, or 2
+/// when the store refused a record.
+fn unrestorable(
+    store: &spawn_postgres::PostgresStore,
+    records: &[BundleRecord],
+    reason: &str,
+    started: Instant,
+) -> i32 {
+    let reason = format!("the backup cannot be restored: {reason}");
+    println!("restore-drill: FAILED: {reason}");
+    let newest = records.iter().rev().find(|record| stored(record));
+    let (key, event_id) = newest.map_or((String::new(), 0), |record| {
+        (bundle_key(record), record.event_id)
+    });
+    let verdict = Verdict {
+        key: &key,
+        event_id,
+        duration_ms: elapsed_ms(started),
+    };
+    let both = [
+        (TRANSCRIPTS, Outcome::Unrestorable(reason.clone())),
+        (MISSIONS, Outcome::Unrestorable(reason)),
+    ];
+    record_verdicts(store, &verdict, &both).unwrap_or(1)
 }
 
 /// The report said: its lines, its first mismatches, the verdict; the exit.
