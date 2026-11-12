@@ -225,6 +225,10 @@ pub(crate) struct Facts {
     pub(crate) control: Vec<Record>,
     #[serde(default)]
     pub(crate) commands: Vec<Command>,
+    /// The earliest owner judging that names its gate's wall clock, over
+    /// the whole log (objective 076); null when none does.
+    #[serde(default)]
+    pub(crate) owner_runs_from_ms: Option<i64>,
 }
 
 fn int(value: &Value) -> Option<i64> {

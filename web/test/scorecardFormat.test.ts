@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { formatCost, formatDecimal, modelCostText, tileNote, undecidedText } from "../src/scorecardFormat.ts";
+import { localDateTime } from "../src/format.ts";
+import {
+  formatCost,
+  formatDecimal,
+  modelCostText,
+  ownerRunsNote,
+  ownerRunsTileNote,
+  tileNote,
+  undecidedText,
+} from "../src/scorecardFormat.ts";
 
 // GitHub #16 item 3: tokens per landing were shown with no decimals, so a
 // positive cost below half a token read "0".
@@ -76,4 +85,36 @@ test("the Scorecard page's gate time tile, the fleet's and each mission's, shows
   assert.equal(tileNote("gate_time", { ...mission, runs: 0, total_ms: 0, undecided_ms: 0 }), null);
   assert.equal(tileNote("cost", { ...fleet, gate_ms: 70 * MIN } as never), null);
   assert.equal(tileNote("throughput", fleet), null);
+});
+
+// Objective 076: from when the owner's judgings are counted.
+test("ownerRunsNote says from when the owner's judgings count, and nothing once the window starts after", () => {
+  const from = Date.UTC(2026, 10, 11, 19, 48, 0);
+  const weekBefore = from - 7 * 24 * HOUR;
+  assert.equal(
+    ownerRunsNote(weekBefore, from),
+    `Owner judgings counted from ${localDateTime(from)} only: earlier ones carry no gate time.`,
+  );
+  assert.equal(ownerRunsNote(from - 1, from), `Owner judgings counted from ${localDateTime(from)} only: earlier ones carry no gate time.`);
+  assert.equal(ownerRunsNote(from, from), null, "a window that starts exactly at it");
+  assert.equal(ownerRunsNote(from + HOUR, from), null, "a later window");
+  assert.equal(ownerRunsNote(weekBefore, null), "Owner judgings not counted yet: none carries a gate time.");
+  assert.equal(ownerRunsNote(from + HOUR, null), "Owner judgings not counted yet: none carries a gate time.");
+  // A card with no window start reads as one that starts before.
+  assert.equal(ownerRunsNote(null, from), `Owner judgings counted from ${localDateTime(from)} only: earlier ones carry no gate time.`);
+});
+
+test("the Scorecard page's gate time tile, the fleet's and each mission's, shows the owner-runs note until the window starts after", () => {
+  const from = Date.UTC(2026, 10, 11, 19, 48, 0);
+  const note = `Owner judgings counted from ${localDateTime(from)} only: earlier ones carry no gate time.`;
+  // Every scope's tile reads the card's window and time alike.
+  for (const scope of ["fleet", "mission 1", "mission 2"]) {
+    assert.equal(ownerRunsTileNote("gate_time", from - 7 * 24 * HOUR, from), note, scope);
+  }
+  assert.equal(ownerRunsTileNote("gate_time", from + HOUR, from), null, "nothing once the window starts after");
+  assert.equal(ownerRunsTileNote("gate_time", from, null), "Owner judgings not counted yet: none carries a gate time.");
+  // No other tile has it, and a server that does not say shows none.
+  assert.equal(ownerRunsTileNote("cost", from - HOUR, from), null);
+  assert.equal(ownerRunsTileNote("throughput", from - HOUR, null), null);
+  assert.equal(ownerRunsTileNote("gate_time", from - HOUR, undefined), null);
 });

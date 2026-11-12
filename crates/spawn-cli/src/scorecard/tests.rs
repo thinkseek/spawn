@@ -184,6 +184,7 @@ impl Story {
         let facts = Facts {
             control: self.control.clone(),
             commands: self.commands.clone(),
+            owner_runs_from_ms: None,
         };
         History::from_record(&facts, &self.messages)
     }
@@ -1661,6 +1662,124 @@ fn gate_time_counts_the_owners_judgings_for_the_fleet_and_their_mission() {
             gate("mission", json!(2)),
             json!({"value": null, "n": 1, "runs": 1, "task_runs": 1, "owner_runs": 0}),
             "the landings moved mission 2 too; its gate judged none of them"
+        );
+    }));
+    let _ = std::fs::remove_dir_all(&root);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// An owner's gated landing request for `commit` on `source`, as `spawn
+/// mission push` records it: its id.
+fn owner_request(record: &mut dyn FnMut(&str, Value) -> i64, source: &str, commit: &str) -> i64 {
+    record(
+        "spawn_control_record",
+        json!({"type": "source.push_requested", "source": source, "commit": commit,
+               "ref": format!("refs/spawn-owner/{commit}"), "by": "human", "gated": true}),
+    )
+}
+
+/// When the latest record of `kind` was recorded, read as the owner.
+fn recorded_at(owner: &str, kind: &str) -> i64 {
+    postgres::Client::connect(owner, postgres::NoTls)
+        .expect("the owner connects")
+        .query_one(
+            "select max(recorded_at_ms) from spawn_events
+              where session_id = 'session_control'
+                and kind -> 'detail' -> 'record' ->> 'type' = $1",
+            &[&kind],
+        )
+        .expect("the record's time")
+        .get(0)
+}
+
+/// Objective 076, through the real store: `owner_runs_from_ms` is the time
+/// of the earliest owner judging that names its gate's wall clock (a
+/// landing recorded without one before it is not), whatever the window;
+/// null while none does.
+#[test]
+fn the_card_says_from_when_the_owners_judgings_are_counted() {
+    let url = std::env::var("SPAWN_TEST_DATABASE_URL")
+        .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    let schema = spawn_postgres::testing::TestSchema::new("owner_from");
+    let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
+        .expect("connect and migrate");
+    let root =
+        std::env::temp_dir().join(format!("spawn-owner-from-{}-{nanos:x}", std::process::id()));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        let owner = format!("{url}{separator}options=-csearch_path%3D{schema}");
+        let mut client =
+            postgres::Client::connect(&owner, postgres::NoTls).expect("the owner connects");
+        let mut record = |function: &str, value: Value| -> i64 {
+            client
+                .query_one(&format!("select {function}($1)"), &[&value])
+                .expect("a record")
+                .get(0)
+        };
+        let read = |since: i64, until: Option<i64>| {
+            super::measure(
+                &store,
+                Some(&root),
+                &super::Query {
+                    mission: None,
+                    since: Some(format_rfc3339(since)),
+                    until: until.map(format_rfc3339),
+                },
+            )
+            .expect("the scorecard")["owner_runs_from_ms"]
+                .clone()
+        };
+        let source = "/srv/source.git";
+        let (base, candidate) = ("a".repeat(40), "b".repeat(40));
+        record_two_missions_with_a_task_gating(&mut record, source);
+        let before = owner_request(&mut record, source, &candidate);
+        // Recorded before the gate's wall clock was: not counted.
+        record(
+            "spawn_integrator_record",
+            json!({"type": "source.moved", "source": source, "from": base, "to": candidate,
+                   "request": before, "by": "human", "verdict": "accepted"}),
+        );
+        let now = store.database_now_ms().expect("now");
+        assert_eq!(
+            read(now - HOUR_MS, None),
+            Value::Null,
+            "none names a gate time"
+        );
+        let refused = owner_request(&mut record, source, &"c".repeat(40));
+        record(
+            "spawn_integrator_record",
+            json!({"type": "source.push_refused", "request": refused, "reason": "rejected",
+                   "verdict": "rejected", "mission": 1, "gate_ms": 403_000}),
+        );
+        let at = recorded_at(&owner, "source.push_refused");
+        let landed = owner_request(&mut record, source, &"d".repeat(40));
+        record(
+            "spawn_integrator_record",
+            json!({"type": "source.moved", "source": source, "from": base, "to": "d".repeat(40),
+                   "request": landed, "by": "human", "verdict": "accepted", "mission": 1,
+                   "gate_ms": 300_000}),
+        );
+        let now = store.database_now_ms().expect("now");
+        assert_eq!(
+            read(now - HOUR_MS, None),
+            json!(at),
+            "the refusal: the first counted"
+        );
+        assert_eq!(
+            read(now + 1, Some(now + HOUR_MS)),
+            json!(at),
+            "a later window"
+        );
+        assert_eq!(read(at, None), json!(at), "a window from it");
+        assert_eq!(
+            read(now - 2 * HOUR_MS, Some(now - HOUR_MS)),
+            json!(at),
+            "a window that ends before it"
         );
     }));
     let _ = std::fs::remove_dir_all(&root);
