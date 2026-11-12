@@ -216,7 +216,7 @@ fn the_owner_judges_an_alert_and_every_alert_ends_with_an_outcome() {
             .collect()
     };
     let mut got = outcomes(&store);
-    got.sort();
+    got.sort_by(|left, right| left.0.cmp(&right.0));
     assert_eq!(
         got,
         [
