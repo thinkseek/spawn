@@ -98,6 +98,7 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
             return Ok(2);
         }
     };
+    let started = Instant::now();
     let store = open_store()?;
     let now_ms = store.now_ms().map_err(|error| error.to_string())?;
     let records = bundle_records(&store, &settings.prefix, now_ms)?;
@@ -108,8 +109,20 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
             return Ok(2);
         }
         Err(Chain::Broken(reason)) => {
-            println!("restore-drill: FAILED: the backup cannot be restored: {reason}");
-            return Ok(1);
+            let reason = format!("the backup cannot be restored: {reason}");
+            println!("restore-drill: FAILED: {reason}");
+            // Against the newest stored record: chain_of found one.
+            let newest = records.iter().rev().find(|record| stored(record));
+            let (key, event_id) = newest.map_or((String::new(), 0), |record| {
+                (bundle_key(record), record.event_id)
+            });
+            let verdict = Verdict {
+                key: &key,
+                event_id,
+                duration_ms: elapsed_ms(started),
+            };
+            let both = [(TRANSCRIPTS, Err(reason.clone())), (MISSIONS, Err(reason))];
+            return Ok(record_verdicts(&store, &verdict, &both).unwrap_or(1));
         }
     };
     if let Some(newest) = records.last()
@@ -124,39 +137,16 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
     }
     let drill = DrillDir::create(&parent)?;
     let result = run(&settings, &chain, drill.path());
-    let code = match result {
-        Ok(report) => {
-            for line in &report.lines {
-                println!("{line}");
-            }
-            for line in report.mismatches.iter().take(NAMED) {
-                eprintln!("restore-drill: mismatch: {line}");
-            }
-            if report.mismatches.len() > NAMED {
-                eprintln!(
-                    "restore-drill: and {} more mismatches",
-                    report.mismatches.len() - NAMED
-                );
-            }
-            if report.mismatches.is_empty() {
-                println!(
-                    "restore-drill: passed: bundle {} (event {}) restored and matches live",
-                    report.key, report.event_id
-                );
-                0
-            } else {
-                println!(
-                    "restore-drill: FAILED: {} mismatch(es) older than bundle {} (event {})",
-                    report.mismatches.len(),
-                    report.key,
-                    report.event_id
-                );
-                1
-            }
-        }
+    let newest = chain[chain.len() - 1];
+    let (code, outcomes) = match result {
+        Ok(report) => (said(&report), [
+            (TRANSCRIPTS, outcome(TRANSCRIPTS, &report.transcripts, &report.key)),
+            (MISSIONS, outcome(MISSIONS, &report.missions, &report.key)),
+        ]),
         Err(error) => {
-            println!("restore-drill: FAILED: the backup cannot be restored: {error}");
-            1
+            let reason = format!("the backup cannot be restored: {error}");
+            println!("restore-drill: FAILED: {reason}");
+            (1, [(TRANSCRIPTS, Err(reason.clone())), (MISSIONS, Err(reason))])
         }
     };
     if flags.switch("keep") {
@@ -165,7 +155,116 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
     } else {
         drill.remove()?;
     }
-    Ok(code)
+    let key = bundle_key(newest);
+    let verdict = Verdict {
+        key: &key,
+        event_id: newest.event_id,
+        duration_ms: elapsed_ms(started),
+    };
+    Ok(record_verdicts(&store, &verdict, &outcomes).unwrap_or(code))
+}
+
+/// The two resources a drill proves, each recorded as `backup.drilled.<name>`.
+const TRANSCRIPTS: &str = "transcripts";
+const MISSIONS: &str = "missions";
+
+/// The longest reason a drill record takes (`spawn_backup_record`).
+const REASON_CHARS: usize = 500;
+
+/// One resource's outcome: its count of mismatches, or why it failed.
+type Outcome = Result<usize, String>;
+
+/// What every record of one drill names.
+struct Verdict<'a> {
+    key: &'a str,
+    event_id: i64,
+    duration_ms: i64,
+}
+
+/// The report said: its lines, its first mismatches, the verdict; the exit.
+fn said(report: &Report) -> i32 {
+    for line in &report.lines {
+        println!("{line}");
+    }
+    let mismatches: Vec<&String> = report.transcripts.iter().chain(&report.missions).collect();
+    for line in mismatches.iter().take(NAMED) {
+        eprintln!("restore-drill: mismatch: {line}");
+    }
+    if mismatches.len() > NAMED {
+        eprintln!(
+            "restore-drill: and {} more mismatches",
+            mismatches.len() - NAMED
+        );
+    }
+    if mismatches.is_empty() {
+        println!(
+            "restore-drill: passed: bundle {} (event {}) restored and matches live",
+            report.key, report.event_id
+        );
+        0
+    } else {
+        println!(
+            "restore-drill: FAILED: {} mismatch(es) older than bundle {} (event {})",
+            mismatches.len(),
+            report.key,
+            report.event_id
+        );
+        1
+    }
+}
+
+/// A resource's outcome from its mismatches: none passes; any fails, its
+/// reason the count and the first.
+fn outcome(resource: &str, mismatches: &[String], key: &str) -> Outcome {
+    match mismatches.first() {
+        None => Ok(0),
+        Some(first) => Err(format!(
+            "{resource}: {} mismatch(es) older than bundle {key}; the first: {first}",
+            mismatches.len()
+        )),
+    }
+}
+
+/// One `backup.drilled.<resource>` record per outcome (objective 104).
+/// `Some(2)` when the store refused one (said on stderr), else `None`.
+fn record_verdicts(
+    store: &spawn_postgres::PostgresStore,
+    verdict: &Verdict<'_>,
+    outcomes: &[(&str, Outcome)],
+) -> Option<i32> {
+    let mut refused = None;
+    for (resource, outcome) in outcomes {
+        let record = drill_record(resource, outcome, verdict);
+        if let Err(error) = store.backup_record(&record) {
+            eprintln!("spawn backup restore-drill: backup.drilled.{resource} was not recorded: {error}");
+            refused = Some(2);
+        }
+    }
+    refused
+}
+
+/// A drill record, exactly `{type, ok, reason, bundle, bundle_event_id,
+/// mismatches, duration_ms}`: ok with reason "" when the resource has no
+/// mismatch; a backup that cannot be restored counts none.
+pub(super) fn drill_record(resource: &str, outcome: &Outcome, verdict: &Verdict<'_>) -> Value {
+    let (ok, reason, mismatches) = match outcome {
+        Ok(0) => (true, String::new(), 0),
+        Ok(count) => (false, format!("{resource}: {count} mismatch(es)"), *count),
+        Err(reason) => (false, reason.clone(), 0),
+    };
+    let mismatches = match outcome {
+        Err(reason) if reason.starts_with(resource) => count_of(reason),
+        _ => mismatches,
+    };
+    json!({
+        "type": format!("backup.drilled.{resource}"),
+        "ok": ok,
+        "reason": reason.chars().take(REASON_CHARS).collect::<String>(),
+        "bundle": verdict.key,
+        "bundle_event_id": verdict.event_id,
+        "mismatches": mismatches,
+        "duration_ms": verdict.duration_ms,
+    })
 }
 
 /// The parent of the scratch directory, resolved: an existing directory
@@ -371,7 +470,10 @@ struct Report {
     key: String,
     event_id: i64,
     lines: Vec<String>,
-    mismatches: Vec<String>,
+    /// The transcript archive's mismatches.
+    transcripts: Vec<String>,
+    /// The mission repositories' mismatches.
+    missions: Vec<String>,
 }
 
 /// Fetch, check and unpack every bundle of the chain, restore, compare.
@@ -391,6 +493,7 @@ fn run(settings: &Settings, chain: &[&BundleRecord], drill: &Path) -> Result<Rep
     let bundle_ms = newest.at_ms;
     let mut lines = Vec::new();
     let mut mismatches = Vec::new();
+    let mut missions = Vec::new();
     let chain_text = chain
         .iter()
         .map(|record| {
@@ -433,12 +536,13 @@ fn run(settings: &Settings, chain: &[&BundleRecord], drill: &Path) -> Result<Rep
     lines.push(transcripts.line(&live));
     mismatches.extend(transcripts.mismatches);
 
-    restore_repos(newest, &unpacked, drill, &mut lines, &mut mismatches)?;
+    restore_repos(newest, &unpacked, drill, &mut lines, &mut missions)?;
     Ok(Report {
         key,
         event_id: newest.event_id,
         lines,
-        mismatches,
+        transcripts: mismatches,
+        missions,
     })
 }
 
