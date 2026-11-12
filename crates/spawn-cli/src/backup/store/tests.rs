@@ -177,55 +177,79 @@ fn a_file_is_sent_whole_grown_or_not_at_all() {
     assert_eq!(ranges(0, 0, 10), Vec::<(u64, u64)>::new());
 }
 
+/// The whole allow-list (the lead's rule on rev-g F3/F4), every cell of
+/// switch state x bucket x (prefix, area) printed and compared with the
+/// cells allowed, named here one by one, so a new cell cannot slip in.
+/// Made-up names: the real ones are values of the credential.
 #[test]
 fn it_writes_only_under_locktest_until_switched_on() {
-    // Made-up names: the real ones are values of the credential.
-    let (work, keep) = ("made-up-work", "made-up-keep");
-    let t = "transcripts";
-    assert!(may_write("locktest/store-test-1/", t, work, None).is_ok());
-    assert!(may_write("probe/store-test-1/", t, work, None).is_ok());
-    assert!(may_write("locktest/store-test-1/", t, work, Some("1")).is_ok());
-    assert!(
-        may_write("", t, work, None)
-            .unwrap_err()
-            .contains("switched off")
-    );
-    assert!(may_write("sessions/", t, work, None).is_err());
-    assert!(may_write("sessions/", t, work, Some("0")).is_err());
-    assert!(may_write("", t, work, Some("1")).is_ok());
-    // A test object never goes to the keep bucket, nor to any bucket not
-    // named as the work one, switched on or off (rev-g F3, fail closed).
-    for bucket in [keep, "made-up-store", "made-up", "made-up-work-keep", ""] {
-        for enabled in [None, Some("0"), Some("1")] {
-            for prefix in ["locktest/store-test-1/", "probe/x/"] {
-                let error = may_write(prefix, t, bucket, enabled).unwrap_err();
-                assert!(
-                    error.contains("never the keep bucket"),
-                    "{bucket} {enabled:?} {prefix}: {error}"
+    let switches = [None, Some("0"), Some("1")];
+    let buckets = [
+        "b-keep",
+        "b-work",
+        "b-store",
+        "b",
+        "b-work-keep",
+        "b-keep-work",
+        "",
+    ];
+    let cells = [
+        ("", "transcripts"),
+        ("", "sessions"),
+        ("", "artifacts"),
+        ("", ""),
+        ("locktest/r/", "transcripts"),
+        ("locktest/r/", "sessions"),
+        ("locktest/r/", "artifacts"),
+        ("probe/r/", "transcripts"),
+        ("probe/r/", "sessions"),
+        ("locktestx/", "transcripts"),
+        ("other/", "transcripts"),
+        ("artifacts/", "transcripts"),
+        ("transcripts/", "sessions"),
+    ];
+    let mut allowed = Vec::new();
+    for enabled in switches {
+        for bucket in buckets {
+            for (prefix, area) in cells {
+                let answer = may_write(prefix, area, bucket, enabled);
+                println!(
+                    "{:5} {bucket:12} {prefix:13} {area:12} {}",
+                    format!("{enabled:?}"),
+                    answer.as_ref().map_or("refused", |()| "ALLOWED")
                 );
-                assert!(bucket.is_empty() || !error.contains(bucket), "{error}");
+                match answer {
+                    Ok(()) => allowed.push((enabled, bucket, prefix, area)),
+                    Err(error) => {
+                        assert!(error.starts_with("refused"), "{error}");
+                        assert!(bucket.len() < 2 || !error.contains(bucket), "{error}");
+                    }
+                }
             }
         }
     }
-    // Switched on, the keep bucket takes only the store's own keys: no
-    // prefix, area transcripts or sessions (the named list).
-    assert!(may_write("", "transcripts", keep, Some("1")).is_ok());
-    assert!(may_write("", "sessions", keep, Some("1")).is_ok());
-    for (prefix, area) in [
-        ("", "other"),
-        ("x/", "transcripts"),
-        ("transcripts/", "sessions"),
-    ] {
-        let error = may_write(prefix, area, keep, Some("1")).unwrap_err();
-        assert!(
-            error.contains("only the store's own keys"),
-            "{prefix} {area}: {error}"
-        );
+    let mut expected = Vec::new();
+    for enabled in switches {
+        // The work bucket (and a name ending in -work): test objects of the
+        // two areas, in every switch state.
+        for bucket in ["b-work", "b-keep-work"] {
+            for prefix in ["locktest/r/", "probe/r/"] {
+                for area in ["transcripts", "sessions"] {
+                    expected.push((enabled, bucket, prefix, area));
+                }
+            }
+        }
     }
-    assert!(
-        may_write("", "transcripts", keep, None).is_err(),
-        "off is off"
-    );
+    // The keep bucket (and a name ending in -keep), switched on: the store's
+    // own keys only.
+    for bucket in ["b-keep", "b-work-keep"] {
+        for area in ["transcripts", "sessions"] {
+            expected.push((Some("1"), bucket, "", area));
+        }
+    }
+    allowed.sort();
+    expected.sort();
+    assert_eq!(allowed, expected);
 }
 
 /// Counted, not timed: what each run writes, and that what comes back is

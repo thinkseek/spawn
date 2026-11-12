@@ -62,10 +62,11 @@
 //! SPAWN_STORE_BUCKET=<name>-work SPAWN_BACKUP_PREFIX=locktest/<run>/ spawn store put ...
 //! ```
 //!
-//! It ships switched off: until `SPAWN_STORE_ENABLED=1`, `put` writes only
-//! a test object, under a `locktest/` or `probe/` prefix
-//! (`SPAWN_BACKUP_PREFIX`). A test object goes only to a bucket whose name
-//! ends in `-work`, switched on or off.
+//! What it may write is an allow-list ([`may_write`]): switched off (until
+//! `SPAWN_STORE_ENABLED=1`), only a test object, under a `locktest/` or
+//! `probe/` prefix (`SPAWN_BACKUP_PREFIX`), in the work bucket (a name
+//! ending in `-work`); switched on, also the store's own keys in the keep
+//! bucket; never anything in another bucket.
 //! Anything written to the keep bucket is there for good (its lock has no
 //! end), so a test is never let near it: the rule takes the work bucket by
 //! its name, never by elimination, and any other bucket (the keep bucket,
@@ -310,21 +311,50 @@ pub(crate) fn locked_forever(bucket: &str) -> bool {
     bucket.ends_with("-keep")
 }
 
+/// A bucket as the store sees it, by its name: the keep bucket
+/// ([`locked_forever`]), the work bucket (a name ending in `-work`), or
+/// another (the old bucket, which is `spawn backup`'s alone, or any name
+/// it does not know).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Keep,
+    Work,
+    Other,
+}
+
+pub(crate) fn kind(bucket: &str) -> Kind {
+    if locked_forever(bucket) {
+        Kind::Keep
+    } else if bucket.ends_with("-work") {
+        Kind::Work
+    } else {
+        Kind::Other
+    }
+}
+
+/// The areas the store has a writer for (there is no artifacts writer).
+pub(crate) const AREAS: [&str; 2] = ["transcripts", "sessions"];
+
 /// What the store writes in the keep bucket, all of it: with
 /// `SPAWN_BACKUP_PREFIX` empty, an area's segments and manifests,
 /// `transcripts/segments/…`, `transcripts/manifests/…`,
 /// `sessions/segments/…` and `sessions/manifests/…` ([`Keys`]). The
 /// (prefix, area) pairs, named, not matched.
-const KEEP_WRITES: [(&str, &str); 2] = [("", "transcripts"), ("", "sessions")];
+pub(crate) const KEEP_WRITES: [(&str, &str); 2] = [("", "transcripts"), ("", "sessions")];
 
-/// Whether a run may write an area's objects under `prefix` in `bucket`
-/// (the lead's terms on rev-g F3):
-/// - a test object (under `locktest/` or `probe/`) goes only to a bucket
-///   whose name ends in `-work`, switched on or off: never the keep bucket
-///   (fail closed: nor any bucket not named as the work one);
-/// - anything else only once `SPAWN_STORE_ENABLED=1` (the lead switches it
-///   on), and in the keep bucket ([`locked_forever`]) only the pairs
-///   [`KEEP_WRITES`] names.
+/// The test prefixes: a test run's `SPAWN_BACKUP_PREFIX` starts with one.
+pub(crate) const TEST_PREFIXES: [&str; 2] = ["locktest/", "probe/"];
+
+/// Whether a run may write an area's objects under `prefix` in `bucket`:
+/// an allow-list, everything else refused (the lead's rule on rev-g F3/F4).
+/// The cells, all of them:
+/// - keep: switched on (`SPAWN_STORE_ENABLED=1`), the [`KEEP_WRITES`]
+///   pairs only; switched off, none;
+/// - work: a test prefix ([`TEST_PREFIXES`]) with one of [`AREAS`], in
+///   every switch state; nothing else (no artifacts writer, so no
+///   artifacts cell);
+/// - any other bucket (the old one, a name of neither kind): none, in
+///   every switch state.
 ///
 /// The bucket's name is never in the message (it is a value of the
 /// credential).
@@ -334,36 +364,36 @@ pub(crate) fn may_write(
     bucket: &str,
     enabled: Option<&str>,
 ) -> Result<(), String> {
-    let test = prefix.starts_with("locktest/") || prefix.starts_with("probe/");
-    if test && !bucket.ends_with("-work") {
-        return Err(
-            "refused: a test object (a locktest/ or probe/ prefix) goes only to the work bucket \
-(a name ending in -work), never the keep bucket, whose objects are there for good; \
-SPAWN_STORE_BUCKET names another"
-                .to_string(),
-        );
-    }
-    if test {
+    let on = enabled == Some("1");
+    let test = TEST_PREFIXES.iter().any(|test| prefix.starts_with(test));
+    let allowed = match kind(bucket) {
+        Kind::Keep => on && KEEP_WRITES.contains(&(prefix, area)),
+        Kind::Work => test && AREAS.contains(&area),
+        Kind::Other => false,
+    };
+    if allowed {
         return Ok(());
     }
-    if enabled != Some("1") {
-        return Err(format!(
-            "refused: the store is switched off (SPAWN_STORE_ENABLED is not 1), so it writes only \
-under a locktest/ or probe/ prefix (SPAWN_BACKUP_PREFIX), not under {:?}",
-            if prefix.is_empty() {
-                "the bucket's root"
-            } else {
-                prefix
-            }
-        ));
-    }
-    if locked_forever(bucket) && !KEEP_WRITES.contains(&(prefix, area)) {
-        return Err(format!(
+    Err(match kind(bucket) {
+        Kind::Keep if test => "refused: a test object (a locktest/ or probe/ prefix) goes only to \
+the work bucket, never the keep bucket, whose objects are there for good"
+            .to_string(),
+        Kind::Keep if !on => "refused: the store is switched off (SPAWN_STORE_ENABLED is not 1), \
+so it writes nothing to the keep bucket"
+            .to_string(),
+        Kind::Keep => format!(
             "refused: the keep bucket takes only the store's own keys (no SPAWN_BACKUP_PREFIX; \
 area transcripts or sessions), not {area} under {prefix:?}"
-        ));
-    }
-    Ok(())
+        ),
+        Kind::Work => format!(
+            "refused: the work bucket takes only a test object (a locktest/ or probe/ prefix, area \
+transcripts or sessions), not {area} under {prefix:?}"
+        ),
+        Kind::Other => "refused: SPAWN_STORE_BUCKET names neither the keep nor the work bucket \
+(a name ending in -keep or -work); the store writes nowhere else (the old bucket is spawn \
+backup's)"
+            .to_string(),
+    })
 }
 
 /// The store's bucket and credentials, from the store credential `file`

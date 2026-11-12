@@ -454,9 +454,31 @@ SPAWN_BACKUP_R2_LIMIT_MB ({limit_bytes} bytes)"
     }
 }
 
-/// `spawn backup` never writes to a bucket locked for good (the keep
-/// bucket, [`store::locked_forever`]); its name is never in the message.
+/// Whether `name`, exactly as given (never trimmed or folded), is an R2
+/// bucket name: 3 to 63 of lower-case letters, digits and `-`, a letter or
+/// digit at each end.
+fn r2_bucket_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let inner = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    (3..=63).contains(&bytes.len())
+        && bytes.first().is_some_and(inner)
+        && bytes.last().is_some_and(inner)
+        && bytes.iter().all(|b| inner(b) || *b == b'-')
+}
+
+/// `spawn backup` writes only to a bucket whose name is an R2 bucket name
+/// as given (rev-g F5: "X-KEEP" or "x-keep " would pass a suffix test and
+/// might still reach the keep bucket), and never to the bucket locked for
+/// good (the keep bucket, [`store::locked_forever`]). Both before any
+/// request; the name is never in the message.
 fn not_locked_forever(bucket: &str) -> Result<(), String> {
+    if !r2_bucket_name(bucket) {
+        return Err(
+            "refused: SPAWN_R2_BUCKET is not an R2 bucket name as given (3 to 63 lower-case \
+letters, digits and -, no space): nothing is sent"
+                .to_string(),
+        );
+    }
     if store::locked_forever(bucket) {
         return Err(
             "refused: SPAWN_R2_BUCKET names the keep bucket (locked for good); spawn backup \
@@ -3363,6 +3385,25 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         let error = put_object(&settings("made-up-keep"), "k", &file, "s", 0).unwrap_err();
         assert!(error.contains("never writes there"), "{error}");
         assert!(!error.contains("made-up-keep"), "{error}");
+        // Not an R2 name as given (rev-g F5): refused before the keep test
+        // and before any request, untrimmed and unfolded.
+        for bucket in [
+            "MADE-UP-KEEP",
+            "made-up-keep ",
+            " made-up-keep",
+            "made-up-Keep",
+            "x",
+        ] {
+            let error = put_object(&settings(bucket), "k", &file, "s", 0).unwrap_err();
+            assert!(
+                error.contains("not an R2 bucket name"),
+                "{bucket:?}: {error}"
+            );
+            assert!(
+                bucket.trim().len() < 3 || !error.contains(bucket.trim()),
+                "{error}"
+            );
+        }
         // Another bucket gets as far as the request (a closed port).
         let error = put_object(&settings("made-up-store"), "k", &file, "s", 0).unwrap_err();
         assert!(!error.contains("never writes there"), "{error}");
