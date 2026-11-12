@@ -27,8 +27,9 @@
 #       it ([] for a row with neither).
 #   (2) what the rows say is unchanged: their order, texts, folds (068),
 #       per-landing text (060) and unpriced texts (059).
-#   (3) CostView.tsx renders each row from rowLines.
-# Whether nothing overlaps at 1024 px and up is read off a screenshot.
+# CostView.tsx renders each row from rowLines; whether it does, and whether
+# nothing overlaps at 1024 px and up, is read off a screenshot (no check here
+# reads the page's source).
 #
 # The history is seeded as the store holds it (068's way): one mission, three
 # tasks, each with one model call recorded as the Bridge records it, then
@@ -283,12 +284,6 @@ if ! BB_TREE=$tree BB_WORK=$WORK node --test "$WORK/rows.test.mjs" >"$WORK/rows.
     check_failed "(1)/(2) web/src/cost.ts over the answer: $(grep -E '^not ok|AssertionError|expected|actual|Error' "$WORK/rows.out" | head -n 14 | tr '\n' ' ' | head -c 1200)"
 fi
 note "(1), (2) checked: the rows' two lines"
-
-# --- (3) the page renders from them -----------------------------------------------------------
-
-grep -qE '\browLines\b' "$tree/web/src/components/cost/CostView.tsx" ||
-    check_failed "(3) web/src/components/cost/CostView.tsx does not render its rows from rowLines"
-note "(3) checked: CostView renders from rowLines"
 
 if [ -s "$WORK/failures" ]; then
     asserted=1
