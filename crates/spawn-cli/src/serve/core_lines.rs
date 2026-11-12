@@ -1067,6 +1067,7 @@ mod tests {
                 {"role": "fleet_test", "bytes": null, "schemas": null},
                 {"role": "x", "bytes": 9, "schemas": 1},
             ],
+            "unowned_scratch_bytes": 401_000, "leaked_test_schemas": 4,
         });
         let view = answer(
             &lines(
@@ -1109,6 +1110,8 @@ mod tests {
                 ("storage.database_ratio", json!(3.0)),
                 ("storage.test_database_bytes", json!(9)),
                 ("storage.test_database_schemas", json!(3)),
+                ("storage.unowned_scratch_bytes", json!(401_000)),
+                ("storage.leaked_test_schemas", json!(4)),
             ]
         );
         // No log size: no ratio; no readable test database: none.
@@ -1608,11 +1611,11 @@ mod tests {
         );
         let values = super::values_of(&figures);
         // The count not measured always has a value (objective 088): the
-        // other 13 figures that have none.
+        // other 15 figures that have none (objective 094's two among them).
         assert_eq!(
             Value::Object(values),
             json!({"storage.free_bytes": 3, "storage.days_left": 9,
-                   "observability.not_measured": 13})
+                   "observability.not_measured": 15})
         );
     }
 
@@ -1623,6 +1626,7 @@ mod tests {
             "days_left": 1234, "free_bytes": 104, "growth_bytes_per_day": 10,
             "database": {"bytes": 300, "log_bytes": 100},
             "test_databases": [{"bytes": 7, "schemas": 3}],
+            "unowned_scratch_bytes": 0, "leaked_test_schemas": 0,
         });
         let tokens = |input: u64, cache_read: u64, unpriced: u64| {
             json!({"usd": 0.9, "tokens": {"input": input, "output": 0, "cache_write": 0,
