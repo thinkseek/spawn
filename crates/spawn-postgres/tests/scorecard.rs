@@ -950,6 +950,20 @@ fn oracle(client: &mut Client, until: i64) -> Value {
         .get(0)
 }
 
+/// The pending command `offset` places above the oldest (modulo how many
+/// are pending; most are far below the newest id) finishes at `now`.
+fn finish(client: &mut Client, now: i64, succeeded: bool, offset: i64) {
+    client
+        .execute(
+            "update spawn_commands set state = 'finished', succeeded = $1, finished_at_ms = $2
+              where id = (select id from spawn_commands where state = 'pending'
+                           order by id offset ($3 % greatest(1, (select count(*)
+                             from spawn_commands where state = 'pending'))) limit 1)",
+            &[&succeeded, &now, &offset],
+        )
+        .expect("a command finishes");
+}
+
 /// A step of a random history: a control record of a kind the facts read,
 /// a command of a kind they keep (or not), a pending command finishing (the
 /// oldest, or one at random: far below the newest), or a record or command
@@ -961,7 +975,7 @@ fn random_step(client: &mut Client, state: &mut u64, now: i64, task: &mut i64) {
         .wrapping_add(1_442_695_040_888_963_407);
     let pick = (*state >> 33) % 12;
     // Ahead by 20 or 21: on a later step's end (`now` or `now + 1`) exactly.
-    let ahead = now + 20 + i64::from((*state >> 20) % 2 == 0);
+    let ahead = now + 20 + i64::from((*state >> 20).is_multiple_of(2));
     let log = "| == candidate\n| stage gate rejected 300000ms total\n| more";
     match pick {
         0 => {
@@ -1024,11 +1038,7 @@ fn random_step(client: &mut Client, state: &mut u64, now: i64, task: &mut i64) {
             None,
             now,
         ),
-        8 => record(
-            client,
-            ahead,
-            &json!({"type": "task.landed", "id": *task}),
-        ),
+        8 => record(client, ahead, &json!({"type": "task.landed", "id": *task})),
         9 => command(
             client,
             "human",
@@ -1038,33 +1048,15 @@ fn random_step(client: &mut Client, state: &mut u64, now: i64, task: &mut i64) {
             None,
             ahead,
         ),
-        10 => {
-            // A pending command at random finishes now, failed: most are far
-            // below the newest id.
-            let offset = i64::try_from((*state >> 40) % 64).expect("small");
-            client
-                .execute(
-                    "update spawn_commands set state = 'finished', succeeded = false,
-                            finished_at_ms = $1
-                      where id = (select id from spawn_commands where state = 'pending'
-                                   order by id offset ($2 % greatest(1, (select count(*)
-                                     from spawn_commands where state = 'pending'))) limit 1)",
-                    &[&now, &offset],
-                )
-                .expect("a command finishes");
-        }
-        _ => {
-            // The oldest pending command finishes now: failed every other
-            // time, which makes a dispatcher's "other" command a fact.
-            client
-                .execute(
-                    "update spawn_commands set state = 'finished', succeeded = $1,
-                            finished_at_ms = $2
-                      where id = (select min(id) from spawn_commands where state = 'pending')",
-                    &[&(now % 3 != 0), &now],
-                )
-                .expect("a command finishes");
-        }
+        10 => finish(
+            client,
+            now,
+            false,
+            i64::try_from((*state >> 40) % 64).expect("small"),
+        ),
+        // The oldest pending command finishes now: failed every other time,
+        // which makes a dispatcher's "other" command a fact.
+        _ => finish(client, now, now % 3 != 0, 0),
     }
 }
 
@@ -1254,9 +1246,7 @@ fn kept_facts_are_read_whole_again_after_an_hour() {
         .expect("leave a gap");
     let start = 1_000_i64;
     assert_eq!(
-        store
-            .scorecard_facts_with_overlap(start, 0)
-            .expect("facts"),
+        store.scorecard_facts_with_overlap(start, 0).expect("facts"),
         oracle(&mut client, start)
     );
     command_with_id(&mut client, first, "late", 600);
@@ -1270,9 +1260,7 @@ fn kept_facts_are_read_whole_again_after_an_hour() {
         "the late command is not seen within the hour: {missed}"
     );
     let after = start + 3_600_000;
-    let whole = store
-        .scorecard_facts_with_overlap(after, 0)
-        .expect("facts");
+    let whole = store.scorecard_facts_with_overlap(after, 0).expect("facts");
     assert_eq!(whole, oracle(&mut client, after));
     assert_eq!(whole["commands"].as_array().map(Vec::len), Some(6));
 }
@@ -1288,7 +1276,11 @@ fn a_store_restored_in_place_leaves_no_kept_fact_behind() {
         let (store, schema) = store(&format!("scorecard_kept_restored_{replaced}"));
         let mut client = admin(&schema);
         for n in 1..=5_i64 {
-            record(&mut client, n * 100, &json!({"type": "task.landed", "id": n}));
+            record(
+                &mut client,
+                n * 100,
+                &json!({"type": "task.landed", "id": n}),
+            );
         }
         assert_eq!(
             store.scorecard_facts_with_overlap(1_000, 0).expect("facts"),
@@ -1303,9 +1295,19 @@ fn a_store_restored_in_place_leaves_no_kept_fact_behind() {
                 &[],
             )
             .expect("restore to an earlier point");
-        record_seq(&mut client, 450, 4, &json!({"type": "task.landed", "id": 44}));
+        record_seq(
+            &mut client,
+            450,
+            4,
+            &json!({"type": "task.landed", "id": 44}),
+        );
         if replaced {
-            record_seq(&mut client, 500, 5, &json!({"type": "task.landed", "id": 55}));
+            record_seq(
+                &mut client,
+                500,
+                5,
+                &json!({"type": "task.landed", "id": 55}),
+            );
         }
         let read = store.scorecard_facts_with_overlap(1_100, 0).expect("facts");
         assert_eq!(read, oracle(&mut client, 1_100), "replaced {replaced}");
