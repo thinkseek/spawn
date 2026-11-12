@@ -811,14 +811,20 @@ impl PostgresStore {
 
 /// The statements that make a test's `schema` when absent and name the
 /// session after it (objective 094): `application_name` is the schema's
-/// name, so a reader sees which schemas a live session holds, and a schema
+/// name (unless the URL named the session itself: a test that finds its own
+/// backend by a name of its own keeps it), so a reader sees which schemas a
+/// live session holds, and a schema
 /// made here carries `{"made_at_ms": <ms>}` (the server's clock) as its
 /// comment, the time a reader dates it by. A schema another session made
 /// first keeps its own comment. `schema` must be a plain identifier (the
 /// callers check it): it goes into SQL as it is.
 pub fn made_schema_sql(schema: &str) -> String {
     format!(
-        "set application_name to '{schema}'; \
+        "do $named$ begin \
+           if current_setting('application_name') = '' then \
+             perform set_config('application_name', '{schema}', false); \
+           end if; \
+         end $named$; \
          do $made$ begin \
            if not exists (select 1 from pg_namespace where nspname = '{schema}') then \
              create schema {schema}; \
