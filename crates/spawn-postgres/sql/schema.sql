@@ -5544,7 +5544,7 @@ create index if not exists spawn_events_control_record_type
 -- and the read grows with the window, not the log (the view before worked
 -- the whole history out and bounded it last: 1.1 s on the live log of
 -- 2026-11-13). A reassignment starts from the assignment (`task.assigned`,
--- in the window by spawn_events_name_time): the earlier assignments of the
+-- in the window by spawn_events_control_record_type): the earlier assignments of the
 -- same work in its mission (its objective, or without one its brief:
 -- spawn_events_control_assignment_objective, _brief), each one's span closed
 -- as spawn_task_spans closes it (its next assignment and first closing
