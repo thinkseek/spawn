@@ -309,3 +309,37 @@ test("backupView: the database copy then the bundle, with their ages and keys", 
   assert.equal(backupAge(3 * 86_400_000), "3 d");
   assert.equal(backupAge(null), "no backup yet");
 });
+
+// Objective 097: how long the disk lasts names the session backups when
+// they are counted, and says so when they are left out.
+test("storageView counts the session backups or says they are not counted", () => {
+  const counted = storageView({
+    ...STORAGE,
+    days_left: 1234,
+    growth_parts: { archive: 1, projects: 1, database: 1, session_backups: 1 },
+    growth_excluded: [],
+  });
+  assert.equal(
+    counted.lasts,
+    "about 1,234 days at the growth of the archive, Claude Code's transcripts, the database and the session backups",
+  );
+  assert.equal(counted.lasts_note, null);
+  const excluded = storageView({
+    ...STORAGE,
+    days_left: 1234,
+    growth_parts: { archive: 1, projects: 1, database: 1, session_backups: null },
+    growth_excluded: ["session_backups"],
+  });
+  assert.equal(
+    excluded.lasts,
+    "about 1,234 days at the growth of the archive, Claude Code's transcripts and the database",
+  );
+  assert.equal(excluded.lasts_note, "session backups are not counted");
+  // Left out with no days left yet: the note still says so.
+  assert.equal(storageView({ ...STORAGE, days_left: null, growth_excluded: ["session_backups"] }).lasts_note,
+    "session backups are not counted");
+  // An older server lists nothing: 085's words, no note.
+  const older = storageView({ ...STORAGE, days_left: 1234 });
+  assert.equal(older.lasts, "about 1,234 days at the growth of the archive, Claude Code's transcripts and the database");
+  assert.equal(older.lasts_note, null);
+});
