@@ -44,8 +44,8 @@
 #       third integrator starts a warm of M within 30 s, and none of L.
 #       Released, it ends, and M's listing and result entries are in the
 #       base cache.
-#   (5) the owner lands M2 and its warm starts; a push nothing recorded (by
-#       hand) moves main, which halts the mission; TERM. A fourth
+#   (5) the owner lands M2 and its warm starts; TERM; then a push nothing
+#       recorded (by hand) moves main, which halts the mission. A fourth
 #       integrator halts the mission (or finds it halted) and starts no
 #       warm over three passes and more: a halted mission runs no gate.
 #   Not covered here, but in the required unit tests: main moved between
@@ -430,16 +430,19 @@ owner_push OWNER2.txt "(5)"
 M2=$commit
 warm_of_m2() { [ "$(warm_runs "$M2")" -ge 1 ]; }
 wait_for 30 "the warm of M2" warm_of_m2 || harness "(5) the integrator that applied the owner's landing started no warm of $M2"
+# The restart first, its warm gone, then the push by hand: no integrator
+# runs between them to see main move and abandon the warm itself, so the
+# next integrator surely finds the warm it lost.
+held=$(warms)
+restart_stop
+pid=$(cat "$WORK/warm-$held.pid")
+wait_for 10 "warm $held" gone "$pid" || harness "warm $held outlived its integrator"
 git -C "$WORK/seed" fetch -q "$source_repo" main
 git -C "$WORK/seed" checkout -q -B hand FETCH_HEAD
 printf 'by hand\n' >"$WORK/seed/HAND.txt"
 git -C "$WORK/seed" add -A
 git -C "$WORK/seed" commit -qm "main moved by hand"
 git -C "$WORK/seed" push -q "$source_repo" hand:main
-held=$(warms)
-restart_stop
-pid=$(cat "$WORK/warm-$held.pid")
-wait_for 10 "warm $held" gone "$pid" || harness "warm $held outlived its integrator"
 launched=$(warms)
 start_integrator
 halted() { ! not_halted; }

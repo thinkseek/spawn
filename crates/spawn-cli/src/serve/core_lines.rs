@@ -9,8 +9,8 @@
 //! {
 //!   "lines": [{
 //!     "line": "storage",
-//!     "north_star": {key, name, unit, value, range, state},
-//!     "guardrails": [{key, name, unit, value, range, state}, ...]
+//!     "north_star": {key, name, unit, value, range, state, trend},
+//!     "guardrails": [{key, name, unit, value, range, state, trend}, ...]
 //!   }, ...],                     // performance, storage, observability, recoverability
 //!   "ranges_file": "/ws/core-lines.json",
 //!   "ranges_error": null | "why the file could not be read",
@@ -22,7 +22,13 @@
 //! `range` is the file's entry for the figure (`{min?, max?}`, numbers) or
 //! null; `state` is `in` when the value lies within it (bounds included),
 //! `out` when it does not, `no_range` without a range and `not_collected`
-//! without a value.
+//! without a value. `trend` (objective 090) is the figure's last 7 days:
+//! one `{day, value}` for each UTC day (today and the 6 before) that has a
+//! `host.core_lines` sample carrying the figure, that day's last such
+//! sample, oldest first; empty without one. The loop records those samples
+//! at its start and hourly ([`sample_values`], crate core_lines_sample.rs),
+//! and the answer reads only the window's, through their own index
+//! (`spawn_events_host_core_lines`).
 //!
 //! The performance figures (objective 086) are the pages': the Scorecard's
 //! fleet scope over its default 7 days (report to live, the gate time's
@@ -173,6 +179,60 @@ pub(super) fn parse_ranges(text: Option<&str>, known: &[&str]) -> Ranges {
     }
     ranges.ignored.sort();
     ranges
+}
+
+/// One UTC day, in milliseconds.
+const DAY_MS: i64 = 86_400_000;
+
+/// How many UTC days a trend covers: today and the 6 before.
+const TREND_DAYS: i64 = 7;
+
+/// Where the trend's window starts at `now_ms`: the UTC midnight 6 days
+/// before today's.
+pub(crate) fn trend_since(now_ms: i64) -> i64 {
+    now_ms.div_euclid(DAY_MS) * DAY_MS - (TREND_DAYS - 1) * DAY_MS
+}
+
+/// Every figure's trend from the `host.core_lines` samples (`[{at_ms,
+/// values}]`, oldest first, as the store reads them), at `now_ms`: for each
+/// figure, one `{day, value}` per UTC day of the window that has a sample
+/// carrying it (a number), that day's last such sample, oldest first. A
+/// sample outside the window, or from after `now_ms`'s day, is left out.
+pub(crate) fn trends(samples: &Value, now_ms: i64) -> BTreeMap<String, Vec<Value>> {
+    let since = trend_since(now_ms);
+    let until = since + TREND_DAYS * DAY_MS;
+    // figure -> day -> (at_ms, value); a later sample replaces an earlier.
+    let mut days: BTreeMap<String, BTreeMap<String, (i64, Value)>> = BTreeMap::new();
+    for sample in samples.as_array().into_iter().flatten() {
+        let Some(at) = sample["at_ms"].as_i64() else {
+            continue;
+        };
+        if at < since || at >= until {
+            continue;
+        }
+        let day = crate::scorecard::time::day_of(at);
+        for (key, value) in sample["values"].as_object().into_iter().flatten() {
+            if !value.is_number() {
+                continue;
+            }
+            let slot = days.entry(key.clone()).or_default();
+            match slot.get(&day) {
+                Some((kept, _)) if *kept > at => {}
+                _ => {
+                    slot.insert(day.clone(), (at, value.clone()));
+                }
+            }
+        }
+    }
+    days.into_iter()
+        .map(|(key, by_day)| {
+            let points = by_day
+                .into_iter()
+                .map(|(day, (_, value))| json!({"day": day, "value": value}))
+                .collect();
+            (key, points)
+        })
+        .collect()
 }
 
 /// A figure as the answer gives it: with its range and its state.
@@ -476,11 +536,13 @@ pub(super) fn lines(
 /// The answer from the lines, the ranges file's path (null when there is
 /// no workspace root to find it under) and its contents
 /// (`Err` when it could not be read for another reason than not being
-/// there; `Ok(None)` when it is not there).
+/// there; `Ok(None)` when it is not there), every figure with its trend
+/// from `trends` ([`trends`]; empty without one).
 pub(super) fn answer(
     lines: &[Line],
     ranges_file: &Value,
     contents: Result<Option<String>, String>,
+    trends: &BTreeMap<String, Vec<Value>>,
 ) -> Value {
     let known: Vec<&str> = lines
         .iter()
@@ -494,7 +556,11 @@ pub(super) fn answer(
             ..Ranges::default()
         },
     };
-    let with_range = |figure: &Figure| figure_json(figure, ranges.bounds.get(figure.key).copied());
+    let with_range = |figure: &Figure| {
+        let mut view = figure_json(figure, ranges.bounds.get(figure.key).copied());
+        view["trend"] = json!(trends.get(figure.key).cloned().unwrap_or_default());
+        view
+    };
     json!({
         "lines": lines
             .iter()
@@ -561,27 +627,65 @@ pub(crate) fn reading(store: &spawn_postgres::PostgresStore) -> Result<Value, St
 }
 
 /// The answer with the ranges file at `path` and the nightly's fact files
-/// in `nightly`, read now.
+/// in `nightly`, read now, with the trends of the last 7 days' samples.
 pub(super) fn core_lines_at(
     store: &spawn_postgres::PostgresStore,
     path: Option<&Path>,
     nightly: Option<&Path>,
 ) -> Result<Value, String> {
     let now_ms = super::now_ms();
+    let figures = lines_at(store, nightly, now_ms)?;
+    let samples = store
+        .host_core_lines(trend_since(now_ms))
+        .map_err(super::err)?;
+    let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
+    Ok(answer(
+        &figures,
+        &file,
+        read_ranges(path),
+        &trends(&samples, now_ms),
+    ))
+}
+
+/// The four lines' figures, read at `now_ms` with the nightly's fact files
+/// in `nightly`.
+fn lines_at(
+    store: &spawn_postgres::PostgresStore,
+    nightly: Option<&Path>,
+    now_ms: i64,
+) -> Result<Vec<Line>, String> {
     let storage = super::storage::report(store, now_ms)?;
     let performance = performance_now(store, now_ms);
     let backups = store.newest_backups().map_err(super::err)?;
     let facts = nightly_facts(nightly);
-    let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
-    Ok(answer(
-        &lines(
-            &storage,
-            &performance,
-            recoverability(&backups, facts.as_deref(), now_ms),
-        ),
-        &file,
-        read_ranges(path),
+    Ok(lines(
+        &storage,
+        &performance,
+        recoverability(&backups, facts.as_deref(), now_ms),
     ))
+}
+
+/// The figures that have a value, by key: what a `host.core_lines` sample
+/// holds.
+pub(super) fn values_of(lines: &[Line]) -> Map<String, Value> {
+    lines
+        .iter()
+        .flat_map(|line| std::iter::once(&line.north_star).chain(&line.guardrails))
+        .filter(|figure| !figure.value.is_null())
+        .map(|figure| (figure.key.to_string(), figure.value.clone()))
+        .collect()
+}
+
+/// Every figure of `GET /api/core-lines` that has a value, as it would
+/// give it now, by key (objective 090): read the same way, through the
+/// dashboard's own read-only connection and its statement timeout.
+pub(crate) fn sample_values() -> Result<Map<String, Value>, String> {
+    let store = super::open_store()?;
+    Ok(values_of(&lines_at(
+        &store,
+        nightly_dir().as_deref(),
+        super::now_ms(),
+    )?))
 }
 
 #[cfg(test)]
@@ -697,6 +801,7 @@ mod tests {
             &lines(&storage, &Value::Null, Vec::new()),
             &json!("/ws/core-lines.json"),
             Ok(None),
+            &std::collections::BTreeMap::new(),
         );
         let names: Vec<&str> = view["lines"]
             .as_array()
@@ -924,5 +1029,86 @@ mod tests {
         assert_eq!(figures[2].value, Value::Null);
         assert_eq!(figures[3].value, json!(1));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Objective 090: a figure's trend is one point per UTC day of the last
+    /// 7 that has a sample carrying it, that day's last; a day without one
+    /// has no point; a sample outside the window is left out.
+    #[test]
+    fn a_trend_is_each_days_last_sample_of_the_last_seven() {
+        const D: i64 = super::DAY_MS;
+        const H: i64 = 3_600_000;
+        // 2026-11-12, 13:30 UTC.
+        let midnight = 20_769 * D;
+        let now = midnight + 13 * H + 30 * 60_000;
+        assert_eq!(super::trend_since(now), midnight - 6 * D);
+        let samples = json!([
+            {"at_ms": midnight - 8 * D + H, "values": {"a.one": 1}},
+            {"at_ms": midnight - 7 * D + 23 * H, "values": {"a.one": 2}},
+            {"at_ms": midnight - 6 * D, "values": {"a.one": 100, "a.two": 7}},
+            {"at_ms": midnight - 3 * D + H, "values": {"a.one": 110, "a.two": null}},
+            {"at_ms": midnight - D + H, "values": {"a.one": 999, "a.two": 8}},
+            {"at_ms": midnight - D + 5 * H, "values": {"a.one": 120.5}},
+            {"at_ms": now, "values": {"a.one": 121}},
+            {"at_ms": midnight + D + H, "values": {"a.one": 5}},
+        ]);
+        let trends = super::trends(&samples, now);
+        assert_eq!(
+            json!(trends["a.one"]),
+            json!([
+                {"day": "2026-11-06", "value": 100},
+                {"day": "2026-11-09", "value": 110},
+                {"day": "2026-11-11", "value": 120.5},
+                {"day": "2026-11-12", "value": 121},
+            ])
+        );
+        // A day whose last sample does not carry the figure keeps the
+        // day's last sample that does; a null is no point.
+        assert_eq!(
+            json!(trends["a.two"]),
+            json!([{"day": "2026-11-06", "value": 7}, {"day": "2026-11-11", "value": 8}])
+        );
+        assert!(super::trends(&json!([]), now).is_empty());
+
+        // In the answer: every figure carries a trend, empty without one.
+        let mut trends = trends;
+        trends.insert(
+            "storage.free_bytes".to_string(),
+            vec![json!({"day": "2026-11-12", "value": 3})],
+        );
+        let view = answer(
+            &lines(&json!({"free_bytes": 3}), &Value::Null, Vec::new()),
+            &Value::Null,
+            Ok(None),
+            &trends,
+        );
+        for line in view["lines"].as_array().expect("lines") {
+            for figure in std::iter::once(&line["north_star"])
+                .chain(line["guardrails"].as_array().expect("guardrails"))
+            {
+                let want = if figure["key"] == "storage.free_bytes" {
+                    json!([{"day": "2026-11-12", "value": 3}])
+                } else {
+                    json!([])
+                };
+                assert_eq!(figure["trend"], want, "{figure}");
+            }
+        }
+    }
+
+    /// Objective 090: a sample holds every figure that has a value, and
+    /// none without.
+    #[test]
+    fn a_sample_holds_every_figure_with_a_value() {
+        let figures = lines(
+            &json!({"free_bytes": 3, "days_left": 9}),
+            &Value::Null,
+            Vec::new(),
+        );
+        let values = super::values_of(&figures);
+        assert_eq!(
+            Value::Object(values),
+            json!({"storage.free_bytes": 3, "storage.days_left": 9})
+        );
     }
 }
