@@ -201,9 +201,12 @@ pub fn create_with(top: &Path, relative: &TreePath, bytes: &[u8]) -> Result<bool
             )));
         }
     };
-    File::from(descriptor)
-        .write_all(bytes)
-        .map_err(|error| AgentFileError::Failed(format!("write {relative}: {error}")))?;
+    if let Err(error) = File::from(descriptor).write_all(bytes) {
+        // The file this call made, half written: removed through the same
+        // held parent, so a run again can make it whole (rev-g N1).
+        let _ = rustix::fs::unlinkat(parent.descriptor(), relative.file_name(), AtFlags::empty());
+        return Err(AgentFileError::Failed(format!("write {relative}: {error}")));
+    }
     Ok(true)
 }
 

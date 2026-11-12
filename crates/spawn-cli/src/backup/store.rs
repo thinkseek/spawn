@@ -43,7 +43,10 @@
 //! and `put` refuses an object whose ETag is not a plain MD5), and rebuilds and
 //! hashes a sample (cc-astra A30). `get` writes into the directory it is
 //! given through descriptors: no parent is followed through a symlink and
-//! the file is created exclusively, never over anything (cc-astra A29).
+//! the file is created exclusively, never over anything (cc-astra A29). A
+//! stored path with a `.git` component is put like any other but not
+//! restored by `get` (the workspace's path rule refuses it); none of the
+//! areas' files has one.
 //!
 //! Its bucket and credentials are the fleet's store credential,
 //! `~/.config/spawn/r2-store.env` (`SPAWN_STORE_ENV_FILE`; mode 600; keys
@@ -91,6 +94,12 @@ const USAGE: &str = "usage: spawn store put --area transcripts|sessions [--from 
 spawn store get --area <area> --path <file> --into <dir> [--root <dir>]\n       \
 spawn store list|verify --area <area> [--root <dir>]\n\
 the bucket: SPAWN_STORE_BUCKET, one R2_BUCKETS lists in ~/.config/spawn/r2-store.env (SPAWN_STORE_ENV_FILE)";
+
+/// The manifest's format: 2 since the generation and each segment's stored
+/// size and MD5 (cc-astra A30, A32). A version-1 manifest (only ever under
+/// `locktest/`) is never read: its key is not of the generation form, so it
+/// is never the newest, and one that were is refused here by its version.
+const MANIFEST_VERSION: u32 = 2;
 
 /// The largest segment: a file that grew by more is cut into several.
 const SEGMENT_MAX: u64 = 64 * 1024 * 1024;
@@ -586,6 +595,12 @@ impl<B: Bucket> Store<'_, B> {
         let bytes = self.open_object(&key)?;
         let manifest: Manifest = serde_json::from_slice(&bytes)
             .map_err(|error| format!("the manifest {key}: {error}"))?;
+        if manifest.version != MANIFEST_VERSION {
+            return Err(format!(
+                "the manifest {key} is of version {}, not {MANIFEST_VERSION}",
+                manifest.version
+            ));
+        }
         Ok(Some((key, manifest)))
     }
 
@@ -763,7 +778,7 @@ impl<B: Bucket> Store<'_, B> {
             });
         }
         let manifest = Manifest {
-            version: 1,
+            version: MANIFEST_VERSION,
             generation,
             area: self.keys.area.clone(),
             host: self.keys.host.clone(),

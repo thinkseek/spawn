@@ -193,7 +193,13 @@ fn it_writes_only_under_locktest_until_switched_on() {
     assert!(may_write("", "made-up-keep", Some("1")).is_ok());
     // A test object never goes to the keep bucket, nor to any bucket not
     // named as the work one: fail closed.
-    for bucket in ["made-up-keep", "made-up-store", "made-up", "made-up-work-keep", ""] {
+    for bucket in [
+        "made-up-keep",
+        "made-up-store",
+        "made-up",
+        "made-up-work-keep",
+        "",
+    ] {
         let error = may_write("locktest/store-test-1/", bucket, None).unwrap_err();
         assert!(error.contains("never the keep bucket"), "{bucket}: {error}");
         assert!(bucket.is_empty() || !error.contains(bucket), "{error}");
@@ -476,6 +482,31 @@ fn the_newest_manifest_is_the_last_run_whatever_its_random_part() {
     let (key, newest) = store.newest().expect("newest").expect("one");
     assert_eq!(key, second.manifest);
     assert_eq!((newest.generation, newest.files[0].size), (2, 8));
+    // A manifest of the old form (no generation; locktest/ holds some) sorts
+    // above every new one, and is never the newest (rev-g F1): it is not
+    // even read (its bytes are not a manifest).
+    let old = format!("{}20261112T163117Z-abcd.json.gpg", store.keys.manifests());
+    assert!(old > second.manifest);
+    bucket
+        .objects
+        .borrow_mut()
+        .insert(old, (b"sealed:not a manifest".to_vec(), String::new()));
+    let (key, _) = store
+        .newest()
+        .expect("the old form is skipped")
+        .expect("one");
+    assert_eq!(key, second.manifest);
+    // A manifest under a new-form key but of another version is refused.
+    let mut older = newest.clone();
+    older.version = 1;
+    let mut sealed = b"sealed:".to_vec();
+    sealed.extend(serde_json::to_vec(&older).expect("json"));
+    bucket.objects.borrow_mut().insert(
+        format!("{}000000000009-x-y.json.gpg", store.keys.manifests()),
+        (sealed, String::new()),
+    );
+    let error = store.newest().unwrap_err();
+    assert!(error.contains("is of version 1, not 2"), "{error}");
     fs::remove_dir_all(&dir).expect("clean up");
     fs::remove_dir_all(&work).expect("clean up");
 }
@@ -611,15 +642,28 @@ R2_SECRET_ACCESS_KEY=made-up-secret\nR2_BUCKETS=b-store,b-keep,b-work\n";
     write(full, 0o600);
     let r2 = store_r2(&file, Some("b-work")).expect("a listed bucket");
     assert_eq!(
-        (r2.endpoint.as_str(), r2.bucket.as_str(), r2.access_key.as_str(), r2.secret_key.as_str()),
-        ("https://made-up.example", "b-work", "made-up-id", "made-up-secret")
+        (
+            r2.endpoint.as_str(),
+            r2.bucket.as_str(),
+            r2.access_key.as_str(),
+            r2.secret_key.as_str()
+        ),
+        (
+            "https://made-up.example",
+            "b-work",
+            "made-up-id",
+            "made-up-secret"
+        )
     );
     let refusals = [
         store_r2(&file, Some("b-other")).unwrap_err(),
         store_r2(&file, None).unwrap_err(),
         store_r2(&file, Some(" ")).unwrap_err(),
         {
-            write(&full.replace("R2_SECRET_ACCESS_KEY=made-up-secret\n", ""), 0o600);
+            write(
+                &full.replace("R2_SECRET_ACCESS_KEY=made-up-secret\n", ""),
+                0o600,
+            );
             store_r2(&file, Some("b-work")).unwrap_err()
         },
         {
@@ -630,10 +674,21 @@ R2_SECRET_ACCESS_KEY=made-up-secret\nR2_BUCKETS=b-store,b-keep,b-work\n";
     assert!(refusals[0].contains("does not list"), "{}", refusals[0]);
     assert!(refusals[1].contains("SPAWN_STORE_BUCKET is required"));
     assert!(refusals[2].contains("SPAWN_STORE_BUCKET is required"));
-    assert!(refusals[3].contains("R2_SECRET_ACCESS_KEY is not set"), "{}", refusals[3]);
+    assert!(
+        refusals[3].contains("R2_SECRET_ACCESS_KEY is not set"),
+        "{}",
+        refusals[3]
+    );
     assert!(refusals[4].contains("must be 600"), "{}", refusals[4]);
     for refusal in &refusals {
-        for value in ["made-up.example", "made-up-id", "made-up-secret", "b-store", "b-keep", "b-other"] {
+        for value in [
+            "made-up.example",
+            "made-up-id",
+            "made-up-secret",
+            "b-store",
+            "b-keep",
+            "b-other",
+        ] {
             assert!(!refusal.contains(value), "{value} in {refusal}");
         }
     }
