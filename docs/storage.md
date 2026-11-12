@@ -908,7 +908,16 @@ The storage line reads health.storage as `/api/fleet` does: the north star
 (the archive's growth a day), `storage.database_ratio` (the live database's
 bytes over its `log_bytes`), `storage.test_database_bytes` (the largest
 readable test database) and `storage.test_database_schemas` (the most test
-schemas). The other lines' north stars are not collected yet.
+schemas). The performance line (objective 086) gives the pages' figures:
+its north star `performance.report_to_live` (the Scorecard's fleet value
+over its default 7 days), then `performance.gate_time` (the gate time's
+median), `performance.decided_nothing` (the gate time's `undecided_ms` over
+its `total_ms`, a share; null when the total is 0), `performance.first_pass`
+and `performance.usd_per_landing` (`/api/cost?window=7d`). A value the page
+does not have is not collected. These are kept for a minute, so Home's
+minute poll does not compute the 7-day windows again; the ranges file is
+still read at every request. The observability and recoverability north
+stars are not collected yet.
 
 The recoverability line (objective 087) has the north star
 `recoverability.restores_passed` (not collected until the restore drills

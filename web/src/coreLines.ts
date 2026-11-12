@@ -6,7 +6,7 @@
 import { storageSize } from "./resources.ts";
 
 /** A figure's unit, as the answer names it. */
-export type CoreUnit = "bytes" | "bytes_per_day" | "days" | "count" | "ratio" | "ms" | "share";
+export type CoreUnit = "bytes" | "bytes_per_day" | "days" | "count" | "ratio" | "ms" | "share" | "usd";
 
 export interface CoreRange {
   min?: number;
@@ -74,6 +74,20 @@ function finite(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
+const USD = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
+
+/** Milliseconds as a span (objective 086): under a minute "<s> s"; under an
+ * hour "<m> min"; otherwise "<h> h <m> min", or "<h> h" on the hour, the
+ * minutes rounded. */
+export function spanWords(ms: number): string {
+  if (Math.abs(ms) < 60_000) return `${Math.round(ms / 1000)} s`;
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest === 0 ? `${GROUPED.format(hours)} h` : `${GROUPED.format(hours)} h ${rest} min`;
+=======
 /** Milliseconds as a span: "450 ms", "12 s", "32 min", then hours ("1.5 h"
  * below ten, whole from ten: "30 h"), then days from three ("4 days"). */
 export function spanWords(ms: number): string {
@@ -88,12 +102,18 @@ export function spanWords(ms: number): string {
   }
   if (Math.abs(hours) < 72) return `${Math.round(hours)} h`;
   return `${GROUPED.format(ms / 86_400_000)} days`;
+>>>>>>> aa8c535f0d9d2c8532b8db571dbba3ae26242767
 }
 
 /** A number in a unit's words: bytes as storageSize ("104.0 GB"), a day's
  * growth "<size> a day", days "1,234 days", a ratio "4.7×", a count
+<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
+ * grouped ("1,214"), milliseconds as a span ("1 h 32 min"), a share as a
+ * percent to one decimal ("74.9%"), dollars and cents ("$8.08"). */
+=======
  * grouped ("1,214"), milliseconds as a span ("32 min", "1.5 h", "30 h":
  * spanWords), a share as a whole percent ("95%"). */
+>>>>>>> aa8c535f0d9d2c8532b8db571dbba3ae26242767
 export function unitWords(unit: string, value: number): string {
   switch (unit) {
     case "bytes":
@@ -107,7 +127,9 @@ export function unitWords(unit: string, value: number): string {
     case "ms":
       return spanWords(value);
     case "share":
-      return `${Math.round(value * 100)}%`;
+      return `${(value * 100).toFixed(1)}%`;
+    case "usd":
+      return USD.format(value);
     default:
       return GROUPED.format(value);
   }

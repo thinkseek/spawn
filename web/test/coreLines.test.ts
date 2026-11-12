@@ -80,12 +80,18 @@ test("each unit in words, and each range form", () => {
   assert.equal(unitWords("days", 1), "1 days");
   assert.equal(unitWords("ratio", 10), "10.0×");
   assert.equal(unitWords("count", 1_234_567), "1,234,567");
+<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
+  assert.equal(unitWords("ms", 5_400_000), "1 h 30 min");
+  assert.equal(unitWords("share", 0.954), "95.4%");
+  assert.equal(unitWords("usd", 8.08), "$8.08");
+=======
   assert.equal(unitWords("ms", 5_400_000), "1.5 h");
   assert.equal(unitWords("ms", 1_920_000), "32 min");
   assert.equal(unitWords("ms", 108_000_000), "30 h");
   assert.equal(unitWords("ms", 7_200_000), "2 h");
   assert.equal(rangeWords("ms", { max: 93_600_000 }), "26 h or less");
   assert.equal(unitWords("share", 0.954), "95%");
+>>>>>>> aa8c535f0d9d2c8532b8db571dbba3ae26242767
   assert.equal(rangeWords("count", { min: 6 }), "6 or more");
   assert.equal(rangeWords("count", { max: 200 }), "200 or less");
   assert.equal(rangeWords("count", { min: 1, max: 200 }), "between 1 and 200");
@@ -98,6 +104,62 @@ test("an answer missing its parts, or none, reads as an empty card", () => {
   assert.deepEqual(coreLinesView({}), { rows: [], notice: null, ignored: [] });
 });
 
+<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
+// Objective 086: the performance line's units.
+test("ms reads as a span, the minutes rounded", () => {
+  assert.equal(spanWords(45_000), "45 s");
+  assert.equal(spanWords(0), "0 s");
+  assert.equal(spanWords(59_400), "59 s");
+  assert.equal(spanWords(60_000), "1 min");
+  assert.equal(spanWords(840_000), "14 min");
+  assert.equal(spanWords(869_000), "14 min");
+  assert.equal(spanWords(3_570_000), "1 h", "59.5 min rounds to the hour");
+  assert.equal(spanWords(3_600_000), "1 h");
+  assert.equal(spanWords(5_520_000), "1 h 32 min");
+  assert.equal(spanWords(26 * 3_600_000 + 5 * 60_000), "26 h 5 min");
+  assert.equal(rangeWords("ms", { max: 3_600_000 }), "1 h or less");
+  assert.equal(rangeWords("ms", { max: 900_000 }), "15 min or less");
+});
+
+test("share reads as a percent to one decimal, usd as dollars and cents", () => {
+  assert.equal(unitWords("share", 0.749), "74.9%");
+  assert.equal(unitWords("share", 0.08), "8.0%");
+  assert.equal(unitWords("share", 1), "100.0%");
+  assert.equal(rangeWords("share", { min: 0.7 }), "70.0% or more");
+  assert.equal(rangeWords("share", { max: 0.1 }), "10.0% or less");
+  assert.equal(unitWords("usd", 8.08), "$8.08");
+  assert.equal(unitWords("usd", 1234.5), "$1,234.50");
+  assert.equal(unitWords("usd", 0.004), "$0.00");
+  assert.equal(rangeWords("usd", { max: 10 }), "$10.00 or less");
+});
+
+test("the performance row in words, an out-of-range north star in the warning tone", () => {
+  const fig = (key: string, name: string, unit: string, value: number | null, range: CoreFigure["range"], state: string) =>
+    ({ key, name, unit, value, range, state }) as CoreFigure;
+  const view = coreLinesView({
+    lines: [
+      {
+        line: "performance",
+        north_star: fig("performance.report_to_live", "Time from report to live", "ms", 5_520_000, { max: 3_600_000 }, "out"),
+        guardrails: [
+          fig("performance.gate_time", "Gate time per run", "ms", 840_000, { max: 900_000 }, "in"),
+          fig("performance.decided_nothing", "Gate time that decided nothing", "share", 0.08, { max: 0.1 }, "in"),
+          fig("performance.first_pass", "Landings that pass first time", "share", null, { min: 0.7 }, "not_collected"),
+          fig("performance.usd_per_landing", "Dollars per landing", "usd", 8.08, { max: 10 }, "in"),
+        ],
+      },
+    ],
+  });
+  const [row] = view.rows;
+  assert.equal(row.line, "Performance");
+  assert.deepEqual(row.north_star, { name: "Time from report to live", value: "1 h 32 min", range: "1 h or less", tone: "warning" });
+  assert.deepEqual(row.guardrails, [
+    { name: "Gate time per run", value: "14 min", range: "15 min or less", tone: "plain" },
+    { name: "Gate time that decided nothing", value: "8.0%", range: "10.0% or less", tone: "plain" },
+    { name: "Landings that pass first time", value: "not collected yet", range: "70.0% or more", tone: "muted" },
+    { name: "Dollars per landing", value: "$8.08", range: "$10.00 or less", tone: "plain" },
+  ]);
+=======
 test("spans: ms, s, min, hours and days", () => {
   assert.equal(spanWords(450), "450 ms");
   assert.equal(spanWords(12_000), "12 s");
@@ -139,4 +201,5 @@ test("the recoverability row: the ages as spans, the reds as a count", () => {
       ["1", "0 or less", "warning"],
     ],
   );
+>>>>>>> aa8c535f0d9d2c8532b8db571dbba3ae26242767
 });
