@@ -351,9 +351,9 @@ pub(crate) fn report(store: &PostgresStore, now_ms: i64) -> Result<Value, String
 #[cfg(test)]
 mod tests {
     use super::{
-        DAY_MS, Kept, READ_EVERY_MS, Walked, days_left, growth_excluded, growth_from, growth_of,
-        growth_parts, kept_or_read, persistent_from, persistent_growth, session_backups_part,
-        sizes, test_databases, with_free,
+        DAY_MS, Kept, READ_EVERY_MS, Walked, days_left, growth_excluded, growth_from,
+        growth_from_parts, growth_of, growth_parts, kept_or_read, persistent_from,
+        persistent_growth, session_backups_part, sizes, test_databases, with_free,
     };
     use crate::storage::tests::{file, scratch};
     use serde_json::{Value, json};
@@ -463,6 +463,8 @@ mod tests {
                 "growth_from_ms": now - DAY_MS,
                 "growth_parts": {"archive": 5000, "projects": 100, "database": 3000,
                                  "session_backups": null},
+                "growth_from_parts": {"archive": now - DAY_MS, "projects": now - DAY_MS,
+                                      "database": now, "session_backups": null},
                 "growth_excluded": ["session_backups"],
                 "persistent_growth_bytes_per_day": 8100,
                 "persistent_from_ms": now,
@@ -648,6 +650,63 @@ mod tests {
             Some(now - 3_600_000 + DAY_MS),
             "measured from the backups' first sample plus a day"
         );
+    }
+
+    /// Objective 098: each part is first measured at the oldest sample of
+    /// the window carrying its field plus a day; null without such a
+    /// sample; the archive's null without a workspace root, and otherwise
+    /// equal to 083's `growth_from_ms`.
+    #[test]
+    fn each_part_says_from_when_its_own_growth_is_measured() {
+        let now = 50 * DAY_MS;
+        let thirty_hours = 30 * 3_600_000;
+        let ten_hours = 10 * 3_600_000;
+        let old_shape = json!({"at_ms": now - thirty_hours, "archive_bytes": 1000,
+                               "projects_bytes": 10});
+        let with_database = json!({"at_ms": now - ten_hours, "archive_bytes": 2000,
+                                   "projects_bytes": 20, "database_bytes": 300});
+        let carrying = json!({"archive_bytes": old_shape, "projects_bytes": old_shape,
+                              "database_bytes": with_database, "session_backup_bytes": null});
+        assert_eq!(
+            growth_from_parts(&carrying, true),
+            json!({"archive": now - thirty_hours + DAY_MS, "projects": now - thirty_hours + DAY_MS,
+                   "database": now - ten_hours + DAY_MS, "session_backups": null}),
+            "a part without a sample (the session backups) is null"
+        );
+        assert_eq!(
+            growth_from_parts(&carrying, false)["archive"],
+            Value::Null,
+            "the archive without a workspace root"
+        );
+        assert_eq!(
+            growth_from_parts(&carrying, false)["projects"],
+            now - thirty_hours + DAY_MS
+        );
+        assert_eq!(
+            growth_from_parts(&Value::Null, true),
+            json!({"archive": null, "projects": null, "database": null, "session_backups": null})
+        );
+        // In the figures: the archive's equals growth_from_ms, with a root and
+        // without.
+        let root = scratch("growth_from_parts");
+        let projects = scratch("growth_from_parts_projects");
+        file(&root.join(".transcripts/agent_a/a1.jsonl"), 3000);
+        let walked = Walked::read(Some(&root), projects.clone());
+        let rootless = Walked::read(None, projects.clone());
+        std::fs::remove_dir_all(&root).expect("clean up");
+        std::fs::remove_dir_all(&projects).expect("clean up");
+        let samples = json!({"oldest": old_shape, "carrying": carrying, "before": null});
+        for walked in [&walked, &rootless] {
+            let figures = sizes(now, walked, &samples, &json!({"bytes": 400}), &json!([]));
+            assert_eq!(
+                figures["growth_from_parts"]["archive"],
+                figures["growth_from_ms"]
+            );
+            assert_eq!(
+                figures["growth_from_parts"]["database"],
+                now - ten_hours + DAY_MS
+            );
+        }
     }
 
     /// Objective 083: while the growth cannot be measured yet, the figures
