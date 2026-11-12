@@ -235,7 +235,7 @@ git -C "$WORK/seed" push -q "$repo" main:main
 # turn (the task done). Each turn is logged to turns.log: time, agent,
 # execution, n, step, the lines notes.txt held before it and the native
 # session it runs in.
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -303,7 +303,7 @@ turn() {
 printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     printf 'got %s %s %s\n' "$(date +%s.%N)" "$agent" "$typed" >>"$BB_WORK/engine.log"
     if [ "$pending" = 0 ]; then

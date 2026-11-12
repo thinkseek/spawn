@@ -214,7 +214,7 @@ done
 # screen shows the running turn and the transcript grows every two seconds
 # (a tool call and its result). Each turn's end is noted, with the time, in
 # $BB_WORK/engine.log.
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -235,7 +235,7 @@ printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 busy=
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     if [ "$pending" = 0 ]; then
       line '"type":"user","message":{"role":"user","content":"prompt"}'
