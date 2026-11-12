@@ -112,6 +112,41 @@ fn a_drills_last_pass_is_its_newest_record_with_ok_true() {
             .expect("the reader reads it"),
         Some(at)
     );
+    // Objective 105: the newest record whatever its ok, and the last pass
+    // beside it, in one statement; the reader reads it too.
+    let newest = reader
+        .drill_of_type("backup.verified")
+        .expect("the reader reads the drill")
+        .expect("a record of the type");
+    assert_eq!(newest["record"]["ok"], json!(false), "the failure after");
+    assert_eq!(newest["passed_at_ms"], json!(at));
+    assert!(newest["at_ms"].as_i64() >= Some(at), "{newest}");
+    let passed = store
+        .backup_record(&drill(true))
+        .expect("a pass after the failure");
+    let newest = store
+        .drill_of_type("backup.verified")
+        .expect("read")
+        .expect("a record");
+    let at: i64 = client
+        .query_one(
+            "select recorded_at_ms from spawn_events where id = $1",
+            &[&passed],
+        )
+        .expect("read the pass")
+        .get(0);
+    assert_eq!(newest["record"]["ok"], json!(true));
+    assert_eq!(newest["at_ms"], json!(at));
+    assert_eq!(
+        newest["passed_at_ms"],
+        json!(at),
+        "the newest passed: itself"
+    );
+    assert_eq!(
+        store.drill_of_type("backup.dumped").expect("read"),
+        None,
+        "no record of the type"
+    );
 }
 
 /// Only the owner writes them: the supervisor's login reads the log through
