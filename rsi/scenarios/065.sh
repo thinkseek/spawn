@@ -374,7 +374,9 @@ db_tables=$(scalar "select json_agg(c.relname order by pg_total_relation_size(c.
                              where c.relkind in ('r', 'p') and n.nspname = 'public'
                              order by pg_total_relation_size(c.oid) desc, c.relname limit 5) c")
 db_tables=$(printf '%s' "$db_tables" | jq -c .) || harness "psql's table list is not JSON"
-case "$df_free$db_before$db_bytes" in '' | *[!0-9]*) harness "df or psql read nothing: [$df_free] [$db_bytes]" ;; esac
+for value in "$df_free" "$db_before" "$db_bytes"; do
+    case "$value" in '' | *[!0-9]*) harness "df or psql read nothing: [$df_free] [$db_before] [$db_bytes]" ;; esac
+done
 storage() { jq -c ".health.storage | $1" "$WORK/api.json"; }
 
 expect_eq "$(storage '.archive | {path, bytes, files}')" \
