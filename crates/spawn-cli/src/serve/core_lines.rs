@@ -499,11 +499,13 @@ fn performance_line(performance: &Value) -> Line {
 }
 
 /// What the observability line reads besides the answer itself: the 7-day
-/// cost window's `total` and health's `human_per_agent_hour`.
+/// cost window's `total`, health's `human_per_agent_hour`, and the north
+/// star "Needs you is right" ([`needs_you_right`], objective 092).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct Observed {
     pub(super) cost_total: Value,
     pub(super) human_per_agent_hour: Value,
+    pub(super) needs_you_right: Value,
 }
 
 /// The share of `total`'s tokens (input, output, cache write and cache
@@ -618,7 +620,6 @@ pub(super) fn needs_you_right(alerts: &Value, now_ms: i64) -> Value {
 
 /// The four lines: the performance line's figures from `performance`
 /// ([`performance`]), the storage line's from `storage` (health.storage as
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
 /// [`super::storage::report`] gives it), the observability line's from
 /// `observed`, the recoverability guardrails `recoverability`
 /// ([`recoverability`]).
@@ -626,34 +627,12 @@ pub(super) fn lines(
     storage: &Value,
     performance: &Value,
     observed: &Observed,
-=======
-/// [`super::storage::report`] gives it), the observability north star
-/// `needs_you_right` ([`needs_you_right`]), the recoverability guardrails
-/// `recoverability` ([`recoverability`]).
-pub(super) fn lines(
-    storage: &Value,
-    performance: &Value,
-    needs_you_right: Value,
->>>>>>> 490dd6920841d4692708b330ffa87bbfbcd1ee7d
     recoverability: Vec<Figure>,
 ) -> Vec<Line> {
     let mut lines = vec![
         performance_line(performance),
         storage_line(storage),
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
         observability_line(observed),
-=======
-        Line {
-            name: "observability",
-            north_star: Figure::new(
-                "observability.needs_you_right",
-                "Needs you is right",
-                "share",
-                needs_you_right,
-            ),
-            guardrails: Vec::new(),
-        },
->>>>>>> 490dd6920841d4692708b330ffa87bbfbcd1ee7d
         Line {
             name: "recoverability",
             north_star: Figure::not_collected(
@@ -673,10 +652,11 @@ pub(super) fn lines(
 fn observability_line(observed: &Observed) -> Line {
     Line {
         name: "observability",
-        north_star: Figure::not_collected(
+        north_star: Figure::new(
             "observability.needs_you_right",
             "Needs you is right",
             "share",
+            observed.needs_you_right.clone(),
         ),
         guardrails: vec![
             Figure::new(
@@ -866,23 +846,20 @@ fn lines_at(
     let storage = super::storage::report(store, now_ms)?;
     let (performance, cost_total) = performance_now(store, now_ms);
     let health = store.fleet_health().map_err(super::err)?;
-    let observed = Observed {
-        cost_total,
-        human_per_agent_hour: health["human_per_agent_hour"].clone(),
-    };
-    let backups = store.newest_backups().map_err(super::err)?;
-    let facts = nightly_facts(nightly);
     let alerts = store
         .alerts(now_ms.saturating_sub(WEEK_MS))
         .map_err(super::err)?;
+    let observed = Observed {
+        cost_total,
+        human_per_agent_hour: health["human_per_agent_hour"].clone(),
+        needs_you_right: needs_you_right(&alerts, now_ms),
+    };
+    let backups = store.newest_backups().map_err(super::err)?;
+    let facts = nightly_facts(nightly);
     Ok(lines(
         &storage,
         &performance,
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
         &observed,
-=======
-        needs_you_right(&alerts, now_ms),
->>>>>>> 490dd6920841d4692708b330ffa87bbfbcd1ee7d
         recoverability(&backups, facts.as_deref(), now_ms),
     ))
 }
@@ -1020,11 +997,7 @@ mod tests {
             ],
         });
         let view = answer(
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
             &lines(&storage, &Value::Null, &Observed::default(), Vec::new()),
-=======
-            &lines(&storage, &Value::Null, Value::Null, Vec::new()),
->>>>>>> 490dd6920841d4692708b330ffa87bbfbcd1ee7d
             &json!("/ws/core-lines.json"),
             Ok(None),
             &std::collections::BTreeMap::new(),
@@ -1064,11 +1037,7 @@ mod tests {
         let bare = lines(
             &json!({"database": {"bytes": 300, "log_bytes": 0}, "test_databases": []}),
             &Value::Null,
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
             &Observed::default(),
-=======
-            Value::Null,
->>>>>>> 490dd6920841d4692708b330ffa87bbfbcd1ee7d
             Vec::new(),
         );
         assert_eq!(bare[1].guardrails[2].value, Value::Null);
@@ -1109,11 +1078,7 @@ mod tests {
         assert!((share - 300_000.0 / 5_100_000.0).abs() < 1e-12, "{share}");
         assert_eq!(values["first_pass"], json!(0.749));
         assert_eq!(values["usd_per_landing"], json!(8.08));
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
         let line = &lines(&json!({}), &values, &Observed::default(), Vec::new())[0];
-=======
-        let line = &lines(&json!({}), &values, Value::Null, Vec::new())[0];
->>>>>>> 490dd6920841d4692708b330ffa87bbfbcd1ee7d
         let keys: Vec<&str> = std::iter::once(&line.north_star)
             .chain(&line.guardrails)
             .map(|figure| figure.key)
@@ -1141,11 +1106,7 @@ mod tests {
             json!({"report_to_live": null, "gate_time": null, "decided_nothing": null,
                    "first_pass": null, "usd_per_landing": null})
         );
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
         let line = &lines(&json!({}), &none, &Observed::default(), Vec::new())[0];
-=======
-        let line = &lines(&json!({}), &none, Value::Null, Vec::new())[0];
->>>>>>> 490dd6920841d4692708b330ffa87bbfbcd1ee7d
         assert!(
             std::iter::once(&line.north_star)
                 .chain(&line.guardrails)
@@ -1276,7 +1237,11 @@ mod tests {
         let old = json!([row("cleared", Some(now - 8 * DAY), Some("cleared"))]);
         assert_eq!(needs_you_right(&old, now), Value::Null);
         // The line carries it.
-        let line = &lines(&json!({}), &Value::Null, json!(0.5), Vec::new())[2];
+        let observed = Observed {
+            needs_you_right: json!(0.5),
+            ..Observed::default()
+        };
+        let line = &lines(&json!({}), &Value::Null, &observed, Vec::new())[2];
         assert_eq!(line.north_star.key, "observability.needs_you_right");
         assert_eq!(line.north_star.unit, "share");
         assert_eq!(line.north_star.value, json!(0.5));
@@ -1319,11 +1284,7 @@ mod tests {
         assert_eq!(bundle_only[0].value, Value::Null);
         assert_eq!(bundle_only[1].value, json!(6_000));
         // The line carries them as its guardrails, in order.
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
         let line = &lines(&json!({}), &Value::Null, &Observed::default(), both)[3];
-=======
-        let line = &lines(&json!({}), &Value::Null, Value::Null, both)[3];
->>>>>>> 490dd6920841d4692708b330ffa87bbfbcd1ee7d
         assert_eq!(line.name, "recoverability");
         assert_eq!(
             line.guardrails
@@ -1450,11 +1411,7 @@ mod tests {
             &lines(
                 &json!({"free_bytes": 3}),
                 &Value::Null,
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
                 &Observed::default(),
-=======
-                Value::Null,
->>>>>>> 490dd6920841d4692708b330ffa87bbfbcd1ee7d
                 Vec::new(),
             ),
             &Value::Null,
@@ -1482,11 +1439,7 @@ mod tests {
         let figures = lines(
             &json!({"free_bytes": 3, "days_left": 9}),
             &Value::Null,
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
             &Observed::default(),
-=======
-            Value::Null,
->>>>>>> 490dd6920841d4692708b330ffa87bbfbcd1ee7d
             Vec::new(),
         );
         let values = super::values_of(&figures);
@@ -1522,6 +1475,7 @@ mod tests {
         let observed = Observed {
             cost_total: tokens(400_000, 0, 100_000),
             human_per_agent_hour: json!(0.125),
+            ..Observed::default()
         };
         let all = lines(&storage, &Value::Null, &observed, Vec::new());
         let observability = &all[2];
