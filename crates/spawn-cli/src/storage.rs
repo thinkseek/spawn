@@ -94,9 +94,36 @@ pub(crate) fn projects_path() -> PathBuf {
     PathBuf::from(crate::runtime::claude_projects())
 }
 
+/// The variable naming the session backups' status file (objective 097),
+/// as deploy/session-backup.sh writes it; no default.
+pub(crate) const SESSION_BACKUP_STATUS: &str = "SPAWN_SESSION_BACKUP_STATUS";
+
+/// The session backups' status file `SPAWN_SESSION_BACKUP_STATUS` names;
+/// `None` when it names none.
+pub(crate) fn session_backup_status() -> Option<PathBuf> {
+    crate::env_value(SESSION_BACKUP_STATUS)
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// What the kept session backup versions really cost, reflinks counted
+/// once (objective 097): the status file's `estimated_bytes` (the sum of
+/// each kept version's `new_bytes`). `None` without a file, one that cannot
+/// be read, or one without that number.
+pub(crate) fn session_backup_bytes(status: Option<&Path>) -> Option<u64> {
+    let text = std::fs::read_to_string(status?).ok()?;
+    serde_json::from_str::<Value>(&text).ok()?["estimated_bytes"].as_u64()
+}
+
 /// A `host.storage` record of these sizes, with the live database's
-/// (`database_bytes`, objective 085) when it could be read.
-pub(crate) fn record(archive: Sizes, projects: Sizes, database: Option<u64>) -> Value {
+/// (`database_bytes`, objective 085) and the session backups'
+/// (`session_backup_bytes`, objective 097) when each could be read.
+pub(crate) fn record(
+    archive: Sizes,
+    projects: Sizes,
+    database: Option<u64>,
+    session_backups: Option<u64>,
+) -> Value {
     let mut record = json!({
         "type": "host.storage",
         "archive_bytes": archive.bytes,
@@ -106,6 +133,9 @@ pub(crate) fn record(archive: Sizes, projects: Sizes, database: Option<u64>) -> 
     });
     if let Some(database) = database {
         record["database_bytes"] = json!(database);
+    }
+    if let Some(session_backups) = session_backups {
+        record["session_backup_bytes"] = json!(session_backups);
     }
     record
 }
@@ -121,21 +151,30 @@ pub(crate) fn database_bytes(store: &PostgresStore) -> Option<u64> {
 pub(crate) struct Sampler {
     root: Option<PathBuf>,
     projects: PathBuf,
+    /// The session backups' status file (objective 097); `None`: none read.
+    status: Option<PathBuf>,
     /// When this loop's latest sample was recorded; `None` before its first.
     last_ms: Option<i64>,
 }
 
 impl Sampler {
     pub(crate) fn new(root: Option<&Path>) -> Self {
-        Self::with(root, projects_path())
+        Self::with(root, projects_path()).with_status(session_backup_status())
     }
 
     pub(crate) fn with(root: Option<&Path>, projects: PathBuf) -> Self {
         Self {
             root: root.map(Path::to_path_buf),
             projects,
+            status: None,
             last_ms: None,
         }
+    }
+
+    /// The sampler reading the session backups' status file `status`.
+    pub(crate) fn with_status(mut self, status: Option<PathBuf>) -> Self {
+        self.status = status;
+        self
     }
 
     /// Whether a sample is due at `now_ms`.
@@ -145,10 +184,16 @@ impl Sampler {
     }
 
     /// The sample of the disk now, with the database's size `database`
-    /// (left out when it could not be read).
+    /// and the session backups' `estimated_bytes` (each left out when it
+    /// could not be read).
     pub(crate) fn measure(&self, database: Option<u64>) -> Value {
         let archive = self.root.as_deref().map(archive).unwrap_or_default();
-        record(archive, walk(&self.projects, &[]), database)
+        record(
+            archive,
+            walk(&self.projects, &[]),
+            database,
+            session_backup_bytes(self.status.as_deref()),
+        )
     }
 
     /// When due, measure (the database's size through `database`) and
