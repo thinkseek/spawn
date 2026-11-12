@@ -596,7 +596,11 @@ struct Mission {
     backlog: bool,
     /// When its last task ended with none in work after it, and the record
     /// that ended it (`at_ms`, `event_id`); none while a task is in work.
+    /// The owner's resume of a pause starts it again, at its record.
     idle: Option<(i64, i64)>,
+    /// The owner has paused it (`mission.paused`, objective 099): no
+    /// `mission_idle` while the pause lasts.
+    paused: bool,
 }
 
 impl Mission {
@@ -973,6 +977,7 @@ impl Monitor {
                     idle: mission["idle"]["at_ms"]
                         .as_i64()
                         .zip(mission["idle"]["event_id"].as_i64()),
+                    paused: mission["paused"].as_bool().unwrap_or(false),
                 },
             );
         }
@@ -1076,6 +1081,9 @@ impl Monitor {
             | "task.cancelled" => self.task_record(event_id, at_ms, record, out),
             "mission.added" | "mission.closed" | "mission.halted" | "mission.resumed"
             | "mission.configured" => self.mission_record(event_id, record, out),
+            "mission.paused" | "mission.unpaused" => {
+                self.pause_record(event_id, at_ms, record, out);
+            }
             "admission.waiting" | "admission.admitted" => {
                 self.admission_record(event_id, at_ms, record, out);
             }
@@ -1408,6 +1416,7 @@ impl Monitor {
                 closed_event: None,
                 backlog: false,
                 idle: None,
+                paused: false,
             });
         }
         let Some(mission) = self.missions.get_mut(&id) else {
@@ -1461,6 +1470,28 @@ impl Monitor {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The owner's pause or its resume (objective 099). A pause clears the
+    /// mission's open `mission_idle` alert, naming its record, and none
+    /// fires while it lasts; the resume (`mission.unpaused`) starts a
+    /// mission with no task in work idle again from its own record.
+    fn pause_record(&mut self, event_id: i64, at_ms: i64, record: &Value, out: &mut Vec<Event>) {
+        let Some(id) = record["id"].as_i64() else {
+            return;
+        };
+        let Some(mission) = self.missions.get_mut(&id) else {
+            return;
+        };
+        if record["type"] == "mission.paused" {
+            mission.paused = true;
+            self.clear_idle(id, event_id, "mission.paused", out);
+            return;
+        }
+        mission.paused = false;
+        if mission.idle.is_some() {
+            mission.idle = Some((at_ms, event_id));
         }
     }
 
@@ -3157,6 +3188,7 @@ times in a row)",
             let key = format!("mission_idle:{id}:{event_id}");
             if mission.closed()
                 || !mission.backlog
+                || mission.paused
                 || now.saturating_sub(since_ms) < bound
                 || self.in_work(*id)
                 || self.known.contains_key(&key)
