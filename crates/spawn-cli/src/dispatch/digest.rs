@@ -140,6 +140,57 @@ const HOST_SESSION: &str = "host";
 /// Crash lines and failures an escalation quotes at most.
 const HOST_FAULT_QUOTED: usize = 3;
 
+/// The supervisor's item for a task the load-sensitive bound parked
+/// ([`host_fault_escalations`], integrate.rs `Judge::load_sensitive`): its
+/// own item, naming the scenarios and each one's root-fix owner, and how it
+/// is released.
+fn parked_escalation(record: &Value, id: i64, task: i64, mission: &str) -> Escalation {
+    let pushed = record["pushed"].as_str().unwrap_or("?");
+    let owners = record["owners"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            let scenario = entry["scenario"].as_str().unwrap_or("a scenario");
+            match entry["owner"].as_str() {
+                Some(owner) => format!("{scenario} (root fix: {owner})"),
+                None => format!("{scenario} (no root-fix owner named in scenario-owners)"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Escalation {
+        session_id: "host".to_string(),
+        id: format!("gate-host-fault-{id}"),
+        why: Why::GateHostFault,
+        line: format!(
+            "task #{task} of {mission} is parked: its pushed commit {} was load-sensitive twice: \
+             {owners}. It is not judged again until a new commit is pushed or a person releases \
+             it (spawn task release --id {task} --reason <why>); the mission's other tasks go on.",
+            pushed.get(..12).unwrap_or(pushed)
+        ),
+        since_ms: record["at_ms"].as_i64(),
+    }
+}
+
+/// The evidence of a first `load_sensitive` host fault: the scenarios the
+/// gate found load-sensitive (the record's `sensitive`) on the task's pushed
+/// commit.
+fn load_sensitive_evidence(record: &Value) -> String {
+    format!(
+        "the gate found {} load-sensitive on the task's pushed commit {} (failed at load, passed \
+         alone as the base does); a second time on the same pushed commit parks it",
+        record["sensitive"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
+        record["pushed"].as_str().unwrap_or("?")
+    )
+}
+
 /// The digest items for `records`, the integrator's `host_fault` gate
 /// records that carry `escalate` (the mission's second host fault in a row)
 /// and that no delivered digest told yet
@@ -149,7 +200,9 @@ const HOST_FAULT_QUOTED: usize = 3;
 /// task is judged again (the record's `due_ms`). No time window: a record
 /// stays an item until a digest carrying its tag
 /// (`host gate-host-fault-<event id>`) reaches the supervisor, so it is told
-/// once.
+/// once. A record of the load-sensitive bound is its own item
+/// ([`parked_escalation`], [`load_sensitive_evidence`]).
+#[allow(clippy::too_many_lines)]
 pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
     records
         .iter()
@@ -164,6 +217,9 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
             let mission = record["mission"]
                 .as_i64()
                 .map_or_else(|| "its mission".to_string(), |id| format!("mission {id}"));
+            if record["evidence"] == "load_sensitive_parked" {
+                return Some(parked_escalation(record, id, task, &mission));
+            }
             let faults = record["host_faults"].as_u64().unwrap_or(2);
             let quoted = |values: &Value, line: &dyn Fn(&Value) -> Option<String>| {
                 values
@@ -179,7 +235,9 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                 line.as_str().map(|line| one_line(line, 300))
             });
             let fact = &record["fact"];
-            let evidence = if record["evidence"] == "cannot_judge" {
+            let evidence = if record["evidence"] == "load_sensitive" {
+                load_sensitive_evidence(record)
+            } else if record["evidence"] == "cannot_judge" {
                 // The host cannot judge the objective at all: the scenario's
                 // own cause, as the record quotes it from the gate's log
                 // (integrate.rs `cannot_judge_cause`), or none — never one

@@ -837,7 +837,14 @@ pub(crate) enum GateFailure {
     /// user scopes): the task scenario exited [`HOST_FAULT_EXIT`] with its
     /// `cannot_judge` fact, the scenario's file name. A fact about the host,
     /// not the work.
-    CannotJudge { scenario: String, log: String },
+    CannotJudge {
+        scenario: String,
+        log: String,
+        /// The regressions the fact names `load_sensitive` (gate.sh's "Like
+        /// for like before a rejection": failed at load, passed alone as the
+        /// base does), by scenario file name; empty for any other reason.
+        load_sensitive: Vec<String>,
+    },
     /// The base disagreed with itself: one of its scenarios exited 1 and then
     /// 0, before any candidate code ran (exit [`BASE_DISAGREES_EXIT`] and the
     /// gate's own pair of lines). A fact about the host, not the work.
@@ -1558,7 +1565,11 @@ fn host_fact(file: &str, log: String) -> Option<GateFailure> {
             log,
         });
     }
-    cannot_judge(file).map(|scenario| GateFailure::CannotJudge { scenario, log })
+    cannot_judge(file).map(|(scenario, load_sensitive)| GateFailure::CannotJudge {
+        scenario,
+        log,
+        load_sensitive,
+    })
 }
 
 /// The evidence of a gate's host fault that is a validator's defect: a
@@ -1691,7 +1702,7 @@ fn main_red(file: &str) -> Option<(String, String, Vec<RedFailure>)> {
 /// The cannot-judge fact of a verdict file: one JSON line with
 /// `cannot_judge` true, a scenario, and no verdict. Exit 6 is the host-fault
 /// exit too ([`host_fault`] above); the fact's key says which one this is.
-fn cannot_judge(file: &str) -> Option<String> {
+fn cannot_judge(file: &str) -> Option<(String, Vec<String>)> {
     let line = file.trim();
     if line.contains('\n') {
         return None;
@@ -1702,7 +1713,24 @@ fn cannot_judge(file: &str) -> Option<String> {
     }
     let scenario = value.get("scenario")?.as_str()?;
     (!scenario.is_empty() && !scenario.contains(|c: char| c.is_whitespace() || c == '|'))
-        .then(|| scenario.to_string())
+        .then(|| (scenario.to_string(), load_sensitive(&value)))
+}
+
+/// The scenarios a cannot_judge fact names `load_sensitive` (each entry's
+/// `scenario`, a scenario file name; anything else is dropped).
+fn load_sensitive(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("load_sensitive")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("scenario")?.as_str())
+                .filter(|name| is_scenario_name(name))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn failed(error: &std::io::Error) -> GateFailure {
@@ -4073,14 +4101,40 @@ mod tests {
              >&2\n\
              echo '{CANNOT_JUDGE_FACT}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
         ));
-        let Err(GateFailure::CannotJudge { scenario, log }) = gate.judge(&path_only()) else {
+        let Err(GateFailure::CannotJudge {
+            scenario,
+            log,
+            load_sensitive,
+        }) = gate.judge(&path_only())
+        else {
             panic!("cannot judge is its own outcome");
         };
         assert_eq!(scenario, "029.sh");
+        assert!(load_sensitive.is_empty(), "{load_sensitive:?}");
         assert!(
             log.contains("! gate: cannot judge this objective's scenario here (029.sh)"),
             "{log}"
         );
+    }
+
+    /// gate.sh's like-for-like fact (sync/design-gate-like-for-like.md):
+    /// cannot_judge with `load_sensitive`, each entry naming its scenario.
+    /// The integrator's bound reads those names; an entry that names no
+    /// scenario file is dropped, and a fact without the list has none.
+    #[test]
+    fn a_load_sensitive_fact_names_its_scenarios() {
+        let fact = "{\"v\":1,\"cannot_judge\":true,\"scenario\":\"099.sh\",\"runs\":\"1, then 1 at 4 at a time, then 0 alone on the candidate; 0, then 0 on the base, run now\",\"reason\":\"load-sensitive on the candidate: x\",\"load_sensitive\":[{\"scenario\":\"099.sh\",\"runs\":\"r\",\"base\":\"b\",\"solo_ms\":1,\"base_ms\":[2,3]},{\"scenario\":\"not a name\"},{\"runs\":\"r\"}]}";
+        let gate = FakeGate::new(&format!("echo '{fact}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"));
+        let Err(GateFailure::CannotJudge {
+            scenario,
+            load_sensitive,
+            ..
+        }) = gate.judge(&path_only())
+        else {
+            panic!("cannot judge is its own outcome");
+        };
+        assert_eq!(scenario, "099.sh");
+        assert_eq!(load_sensitive, ["099.sh"]);
     }
 
     #[test]

@@ -292,6 +292,63 @@ pub(crate) fn cannot_judge_cause(scenario: &str, log: &str) -> Option<String> {
 /// host, which judges that objective outside the gate.
 pub(crate) const CANNOT_JUDGE: &str = "cannot_judge";
 
+/// The evidence of a `host_fault` whose gate found a regression
+/// load-sensitive on the candidate (gate.sh's "Like for like before a
+/// rejection": failed at load, passed alone as the base does): no verdict on
+/// the work, judged again after the backoff, counted toward no cap or halt.
+/// Its re-judging is bounded (sync/design-load-sensitive-bound.md): the
+/// second one for the same pushed commit is [`LOAD_SENSITIVE_PARKED`].
+pub(crate) const LOAD_SENSITIVE: &str = "load_sensitive";
+
+/// The evidence of the bound's record: a task's pushed commit found
+/// load-sensitive twice, by whatever scenarios, is parked. It is not judged
+/// again until a new commit is pushed or a person releases it (`spawn task
+/// release`); the mission's other tasks are judged meanwhile, and the
+/// escalation names the scenarios and their root-fix owners.
+pub(crate) const LOAD_SENSITIVE_PARKED: &str = "load_sensitive_parked";
+
+/// The record of a task's pushed commit `pushed` parked by the
+/// load-sensitive bound: the `scenarios` its two judgings found (the record's `sensitive`)
+/// load-sensitive (every one, in the order found), each with its root-fix
+/// owner from `owners` (None when the owners list names none), and the
+/// gate's `log`. No backoff: nothing judges it again until it is released.
+pub(crate) fn load_sensitive_parked_fields(
+    pushed: &str,
+    scenarios: &[String],
+    owners: &[(String, Option<String>)],
+    log: &str,
+) -> Value {
+    let named = scenarios.join(", ");
+    let fixers = owners
+        .iter()
+        .map(|(scenario, owner)| match owner {
+            Some(owner) => format!("{scenario}: {owner}"),
+            None => format!("{scenario}: no owner named (scenario-owners)"),
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    json!({
+        "reason": format!(
+            "host fault: the pushed commit {} was load-sensitive twice ({named}): parked, not \
+             judged again until a new commit or a person's release (spawn task release); a root \
+             fix is wanted ({fixers}); not a verdict on the work",
+            pushed.get(..12).unwrap_or(pushed)
+        ),
+        "evidence": LOAD_SENSITIVE_PARKED,
+        "scenario": scenarios.first().map_or("", String::as_str),
+        "sensitive": scenarios,
+        "owners": owners
+            .iter()
+            .map(|(scenario, owner)| json!({"scenario": scenario, "owner": owner}))
+            .collect::<Vec<_>>(),
+        "pushed": pushed,
+        "parked": true,
+        "escalate": true,
+        "backoff_ms": 0,
+        "log": log,
+    })
+}
+
 /// The evidence of a task's `host_fault` whose gate found main of its source
 /// red on a check ([`main_red_fields`]): no fault of the work, no run of host
 /// faults, no count toward the cap or a halt.
@@ -442,7 +499,7 @@ pub(super) fn base_only_fault(fields: &Value) -> bool {
     // whichever start it was: no candidate code makes a server start.
     matches!(
         fields.get("evidence").and_then(Value::as_str),
-        Some(BASE_DISAGREES | CANNOT_JUDGE | MAIN_RED)
+        Some(BASE_DISAGREES | CANNOT_JUDGE | MAIN_RED | LOAD_SENSITIVE | LOAD_SENSITIVE_PARKED)
     ) || matches!(
         fields
             .get("fact")
@@ -545,6 +602,8 @@ pub(super) enum Rejection {
     HeadCannotJudge {
         scenario: String,
         log: String,
+        /// The regressions the head's run found load-sensitive, if any.
+        load_sensitive: Vec<String>,
         head: Value,
     },
 }
@@ -852,9 +911,14 @@ pub(super) fn rejection(
             failure,
             head: named,
         },
-        Err(GateFailure::CannotJudge { scenario, log }) => Rejection::HeadCannotJudge {
+        Err(GateFailure::CannotJudge {
             scenario,
             log,
+            load_sensitive,
+        }) => Rejection::HeadCannotJudge {
+            scenario,
+            log,
+            load_sensitive,
             head: named,
         },
         Err(failure) => {
@@ -923,7 +987,7 @@ pub(super) fn aborted(failure: &GateFailure) -> Value {
         }),
         // Recorded as `host_fault` with evidence `cannot_judge` by the
         // caller; counted here only if a caller forgets that.
-        GateFailure::CannotJudge { scenario, log } => json!({
+        GateFailure::CannotJudge { scenario, log, .. } => json!({
             "reason": format!(
                 "host fault: this host cannot judge {scenario}; the objective is judged outside \
                  the gate, by the owner; not a verdict on the work"
