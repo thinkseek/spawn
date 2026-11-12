@@ -160,6 +160,27 @@ test("while the growth is not measured yet, the archive's row says from when it 
   assert.equal(storageView(null).measured_from, null);
 });
 
+test("while how long the disk lasts is not measured yet, the card's last line says from when it is", () => {
+  const at = Date.UTC(2026, 10, 12, 23, 31, 20);
+  const local = localDateTime(at);
+  // Pending: no days left, and the moment is still ahead of the read.
+  const pending = storageView({ ...STORAGE, read_at_ms: at - 3_600_000, days_left: null, persistent_from_ms: at });
+  assert.deepEqual([pending.lasts, pending.lasts_from], [null, local]);
+  assert.equal(normalizeStorage({ ...STORAGE, persistent_from_ms: at })?.persistent_from_ms, at);
+  assert.deepEqual(pending.rows, storageView({ ...STORAGE, days_left: null }).rows, "the rows are unchanged");
+  // Measured: the days, no moment.
+  const measured = storageView({ ...STORAGE, read_at_ms: at - 3_600_000, days_left: 40, persistent_from_ms: at });
+  assert.equal(measured.lasts_from, null);
+  assert.match(measured.lasts ?? "", /^about 40 days at /);
+  // Already past: a moment gone promises nothing.
+  const past = storageView({ ...STORAGE, read_at_ms: at + 3_600_000, days_left: null, persistent_from_ms: at });
+  assert.equal(past.lasts_from, null);
+  // None (or an older server).
+  assert.equal(storageView({ ...STORAGE, days_left: null, persistent_from_ms: null }).lasts_from, null);
+  assert.equal(storageView({ ...STORAGE, days_left: null }).lasts_from, null);
+  assert.equal(storageView(null).lasts_from, null);
+});
+
 test("the health's storage is read as the server reports it, null from an older server", () => {
   const storage = normalizeStorage(STORAGE);
   assert.equal(storage?.projects?.before, 40);
@@ -174,8 +195,8 @@ test("the host section's Resources are followed by a Storage card drawn from sto
   const strip = readFileSync(new URL("../src/components/fleet/HealthStrip.tsx", import.meta.url), "utf8");
   assert.match(strip, /<Cell label="Storage"[^>]*>\s*<StorageCard storage=\{health\.storage\} backups=\{health\.backups\} \/>/);
   assert.match(strip, /backupView\(backups, now\)/, "the card's backup rows are drawn from backupView");
-  assert.match(strip, /const \{ rows, lasts, measured_from \} = storageView\(storage\)/);
-  assert.match(strip, /How long the disk lasts: \$\{measured_from === null \? "not measured yet" : `measured from \$\{measured_from\}`\}/);
+  assert.match(strip, /const \{ rows, lasts, measured_from, lasts_from \} = storageView\(storage\)/);
+  assert.match(strip, /How long the disk lasts: \$\{lasts_from !== null \? `measured from \$\{lasts_from\}` : measured_from === null \? "not measured yet" : `measured from \$\{measured_from\}`\}/);
   assert.ok(strip.indexOf('label="Resources"') < strip.indexOf('label="Storage"'));
 });
 
