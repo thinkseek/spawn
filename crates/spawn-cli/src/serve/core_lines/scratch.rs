@@ -101,6 +101,46 @@ fn related(entry: &Path, paths: &[PathBuf]) -> bool {
         .any(|path| entry.starts_with(path) || path.starts_with(entry))
 }
 
+/// Why `root` is never read, when it is not: a symlink at the root or at
+/// any parent component (cc-astra A27), so an alias can never take a walk
+/// into a protected place under a name the protections do not know. A root
+/// that is not there is not refused (it has nothing).
+fn refused_root(root: &Path) -> Option<String> {
+    std::fs::symlink_metadata(root).ok()?;
+    for part in root.ancestors().filter(|part| !part.as_os_str().is_empty()) {
+        if std::fs::symlink_metadata(part).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Some(format!(
+                "{} is a symlink: a scratch root is never read through one",
+                part.display()
+            ));
+        }
+    }
+    match std::fs::canonicalize(root) {
+        Ok(resolved) if resolved == root => None,
+        Ok(resolved) => Some(format!(
+            "{} resolves to {}: a scratch root is named by its resolved path",
+            root.display(),
+            resolved.display()
+        )),
+        Err(error) => Some(format!("{}: {error}", root.display())),
+    }
+}
+
+/// `paths` and, beside each, its resolved path, so a protected or excluded
+/// location named through a symlink still matches the real entries a walk
+/// meets.
+fn with_resolved(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut all = paths.to_vec();
+    for path in paths {
+        if let Ok(resolved) = std::fs::canonicalize(path)
+            && !all.contains(&resolved)
+        {
+            all.push(resolved);
+        }
+    }
+    all
+}
+
 /// What one entry's walk found.
 #[derive(Debug, Default)]
 struct Found {
@@ -199,8 +239,10 @@ fn marker_runs(entry: &Path, runs: &dyn Fn(u32, u64) -> bool) -> Option<bool> {
 }
 
 /// The entries of `root` nobody owns at `now_ms`, those `excludes` and
-/// `never` name left out, `runs` saying whether a marker's process still
-/// runs. `Err` (why) when the walk goes past `bound`: no partial count.
+/// `never` name left out (each compared on its resolved path too), `runs`
+/// saying whether a marker's process still runs. `Err` (why) when the walk
+/// goes past `bound` (no partial count) or the root is refused
+/// ([`refused_root`]).
 pub(super) fn unowned_in(
     root: &Path,
     excludes: &[PathBuf],
@@ -221,6 +263,11 @@ pub(super) fn unowned_in(
             bound.time.as_millis()
         )
     };
+    if let Some(why) = refused_root(root) {
+        return Err(why);
+    }
+    let excludes = &with_resolved(excludes);
+    let never = &with_resolved(never);
     let entries =
         std::fs::read_dir(root).map_err(|error| format!("{}: {error}", root.display()))?;
     let mut unowned = Vec::new();
@@ -261,9 +308,20 @@ pub(super) fn unowned_in(
     Ok(unowned)
 }
 
+/// The roots of `roots` that are refused ([`refused_root`]), each with why,
+/// in order: the answer names them, and the figure is not collected while
+/// any is (a count without them is not the whole).
+pub(super) fn refused_roots(roots: &[PathBuf]) -> Vec<(PathBuf, String)> {
+    roots
+        .iter()
+        .filter_map(|root| refused_root(root).map(|why| (root.clone(), why)))
+        .collect()
+}
+
 /// Every root's entries nobody owns, largest first (then by path): `Err`
 /// when a root's walk goes past its bound. A root that cannot be read has
-/// none.
+/// none, and so has a refused one ([`refused_root`]): its error is reported
+/// and it counts nothing.
 pub(super) fn unowned(
     roots: &[PathBuf],
     excludes: &[PathBuf],
@@ -274,6 +332,13 @@ pub(super) fn unowned(
 ) -> Result<Vec<Unowned>, String> {
     let mut all = Vec::new();
     for root in roots {
+        if let Some(why) = refused_root(root) {
+            eprintln!(
+                "core-lines: scratch root {}: {why}; counted as nothing",
+                root.display()
+            );
+            continue;
+        }
         match unowned_in(root, excludes, never, now_ms, runs, bound) {
             Ok(found) => all.extend(found),
             Err(why) if std::fs::symlink_metadata(root).is_err() => {
@@ -293,7 +358,7 @@ pub(super) fn unowned(
 
 #[cfg(test)]
 mod tests {
-    use super::{Bound, MARKER, Reason, never_counted, unowned};
+    use super::{Bound, MARKER, Reason, never_counted, refused_roots, unowned};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
@@ -313,7 +378,10 @@ mod tests {
                     root.display()
                 );
             }
-            Scratch(root)
+            std::fs::create_dir_all(&root).expect("mkdir");
+            // Resolved, so a symlink in the temporary directory's own path
+            // cannot make every root here a refused one.
+            Scratch(std::fs::canonicalize(&root).expect("resolve"))
         }
     }
 
@@ -518,5 +586,81 @@ mod tests {
             Bound::DEFAULT,
         );
         assert_eq!(none, Ok(Vec::new()));
+    }
+
+    /// cc-astra A27: a root that is a symlink, or that has a symlinked
+    /// parent component, is refused and counts nothing, though what it
+    /// leads to holds an old idle entry that would count. A protected
+    /// location named through an alias still protects the real path.
+    #[test]
+    fn a_root_reached_through_a_symlink_counts_nothing() {
+        let scratch = Scratch::new();
+        let protected = scratch.0.join("protected");
+        let old = SystemTime::now() - Duration::from_hours(720);
+        fill(&protected.join("old/f"), 100);
+        age(&protected.join("old"), old);
+        let runs = |_: u32, _: u64| false;
+        let now = ms(SystemTime::now());
+        let count = |roots: &[PathBuf], never: &[PathBuf]| {
+            unowned(roots, &[], never, now, &runs, Bound::DEFAULT)
+        };
+        // The stand-in counts when read as itself and unprotected, so the
+        // refusals below are not vacuous.
+        let real = count(std::slice::from_ref(&protected), &[]).expect("read");
+        assert_eq!(real.len(), 1, "{real:?}");
+
+        // A root alias onto the protected stand-in.
+        let alias = scratch.0.join("alias");
+        std::os::unix::fs::symlink(&protected, &alias).expect("symlink");
+        assert_eq!(
+            count(
+                std::slice::from_ref(&alias),
+                std::slice::from_ref(&protected)
+            ),
+            Ok(Vec::new())
+        );
+        assert_eq!(count(std::slice::from_ref(&alias), &[]), Ok(Vec::new()));
+
+        // A parent alias: the root's own name is real, a component above it
+        // is a symlink.
+        let parent = scratch.0.join("parent");
+        std::os::unix::fs::symlink(&scratch.0, &parent).expect("symlink");
+        let through = parent.join("protected");
+        assert_eq!(
+            count(
+                std::slice::from_ref(&through),
+                std::slice::from_ref(&protected)
+            ),
+            Ok(Vec::new())
+        );
+        assert_eq!(count(std::slice::from_ref(&through), &[]), Ok(Vec::new()));
+
+        // The refused ones are named, with why; a real root and one that is
+        // not there are not refused.
+        let absent = scratch.0.join("absent");
+        let refused = refused_roots(&[protected.clone(), alias.clone(), through.clone(), absent]);
+        assert_eq!(
+            refused
+                .iter()
+                .map(|(root, _)| root.clone())
+                .collect::<Vec<_>>(),
+            vec![alias.clone(), through.clone()]
+        );
+        assert!(refused[0].1.contains("is a symlink"), "{refused:?}");
+        assert!(
+            refused[1].1.contains(&parent.display().to_string()),
+            "{refused:?}"
+        );
+
+        // A real root, its protected entry named through an alias: compared
+        // on the resolved path, so it never counts.
+        let named = alias.join("old");
+        assert_eq!(
+            count(
+                std::slice::from_ref(&protected),
+                std::slice::from_ref(&named)
+            ),
+            Ok(Vec::new())
+        );
     }
 }

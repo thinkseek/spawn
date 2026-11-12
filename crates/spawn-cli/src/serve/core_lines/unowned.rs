@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -158,12 +158,20 @@ pub(super) struct Server {
 pub(super) struct Reading {
     pub(super) unowned: Option<Vec<Unowned>>,
     pub(super) servers: Vec<Server>,
+    /// The scratch roots refused (a symlink at or above them), each with
+    /// why: named in the answer, and the figure is not collected while any
+    /// is.
+    pub(super) refused: Vec<(PathBuf, String)>,
 }
 
 impl Reading {
     /// `storage.unowned_scratch_bytes`: the entries' bytes, null with no
-    /// roots or no walk within its bound yet.
+    /// roots, no walk within its bound yet, or a root refused (a count
+    /// without it would read as the whole).
     pub(super) fn unowned_bytes(&self) -> Value {
+        if !self.refused.is_empty() {
+            return Value::Null;
+        }
         self.unowned.as_ref().map_or(Value::Null, |entries| {
             json!(entries.iter().map(|entry| entry.bytes).sum::<u64>())
         })
@@ -246,11 +254,15 @@ pub(super) fn read(plan: &Plan, previous: Option<&Reading>, now_ms: i64, bound: 
             }
         }
     }
-    Reading { unowned, servers }
+    Reading {
+        unowned,
+        servers,
+        refused: scratch::refused_roots(&plan.roots),
+    }
 }
 
-/// The answer's `scratch`: the roots, and the 20 largest entries nobody
-/// owns.
+/// The answer's `scratch`: the roots, the 20 largest entries nobody owns,
+/// and the roots refused, each with why.
 pub(super) fn scratch_json(plan: &Plan, reading: Option<&Reading>) -> Value {
     let unowned: Vec<Value> = reading
         .and_then(|reading| reading.unowned.as_ref())
@@ -265,9 +277,16 @@ pub(super) fn scratch_json(plan: &Plan, reading: Option<&Reading>) -> Value {
             })
         })
         .collect();
+    let refused: Vec<Value> = reading
+        .map(|reading| reading.refused.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .map(|(root, why)| json!({"root": root.display().to_string(), "why": why}))
+        .collect();
     json!({
         "roots": plan.roots.iter().map(|root| root.display().to_string()).collect::<Vec<_>>(),
         "unowned": unowned,
+        "refused": refused,
     })
 }
 
@@ -298,6 +317,10 @@ struct Kept {
 struct State {
     kept: Option<Kept>,
     refreshing: bool,
+    /// While nothing is kept: when the wait for the refresh under way ends.
+    /// Set once, as that refresh starts, so every request shares the one
+    /// deadline (cc-astra A28): past it they return at once.
+    first_deadline: Option<Instant>,
 }
 
 /// The kept reading and the one refresh at a time.
@@ -328,7 +351,11 @@ impl Cache {
     /// thread of its own (one at a time) through `read` (the plan, the
     /// previous reading, the moment), and the kept reading is served
     /// without waiting; with none kept yet, the refresh is waited for at
-    /// most `first_wait`, and `None` past it.
+    /// most `first_wait` from that refresh's start, one deadline for every
+    /// request, and `None` past it until the refresh ends. A refresh that
+    /// ends with nothing kept (its read panicked) leaves the next request to
+    /// start another, which sets a deadline of its own: each refresh is
+    /// waited for at most once, never each request.
     pub(super) fn get(
         self: &Arc<Self>,
         plan: &Plan,
@@ -347,6 +374,7 @@ impl Cache {
         }
         if !state.refreshing {
             state.refreshing = true;
+            state.first_deadline = state.kept.is_none().then(|| Instant::now() + first_wait);
             let cache = Arc::clone(self);
             let previous = state.kept.as_ref().map(|kept| Arc::clone(&kept.reading));
             let plan = plan.clone();
@@ -368,9 +396,12 @@ impl Cache {
         if let Some(kept) = &state.kept {
             return Some(Arc::clone(&kept.reading));
         }
+        let left = state.first_deadline.map_or(Duration::ZERO, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
         let (state, _) = self
             .done
-            .wait_timeout_while(state, first_wait, |state| {
+            .wait_timeout_while(state, left, |state| {
                 state.kept.is_none() && state.refreshing
             })
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -436,6 +467,7 @@ mod tests {
                 schemas: 3,
                 leaked: 1,
             }],
+            refused: Vec::new(),
         }
     }
 
@@ -560,6 +592,57 @@ mod tests {
         drop(unblock);
     }
 
+    /// cc-astra A28: the first read has one deadline. A request after it,
+    /// while that read is still blocked, returns not collected at once
+    /// instead of waiting a whole `first_wait` again.
+    #[test]
+    fn a_request_past_the_first_reads_deadline_returns_at_once() {
+        let slow = Arc::new(Cache::default());
+        let (unblock, blocked) = mpsc::channel::<()>();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&reads);
+        let wait = Duration::from_millis(400);
+        let first = slow.get(
+            &plan("/s"),
+            0,
+            wait,
+            move |_: &Plan, _: Option<&Reading>, _: i64| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let _ = blocked.recv();
+                reading(4)
+            },
+        );
+        assert!(first.is_none(), "the first read ran over its wait");
+        let started_at = Instant::now();
+        let second = slow.get(
+            &plan("/s"),
+            5,
+            wait,
+            |_: &Plan, _: Option<&Reading>, _: i64| reading(5),
+        );
+        assert!(second.is_none(), "still not collected");
+        assert!(
+            started_at.elapsed() < wait / 2,
+            "no second wait: {:?}",
+            started_at.elapsed()
+        );
+        unblock.send(()).expect("unblock");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while slow
+            .get(
+                &plan("/s"),
+                10,
+                wait,
+                |_: &Plan, _: Option<&Reading>, _: i64| reading(6),
+            )
+            .is_none()
+        {
+            assert!(Instant::now() < deadline, "the read is kept once done");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "one refresh at a time");
+    }
+
     /// A walk past its bound keeps the previous figure, never a partial
     /// count; with no previous one, not collected.
     #[test]
@@ -589,5 +672,54 @@ mod tests {
             json!(10)
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// rev-g N1 on 329cbb0a: a refused scratch root is named in the answer
+    /// with why, and the figure is not collected while it is, though the
+    /// other root counts.
+    #[test]
+    fn a_refused_root_is_named_and_the_figure_is_not_collected() {
+        let dir = crate::storage::tests::scratch("unowned_refused");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = std::fs::canonicalize(&dir).expect("resolve");
+        let real = dir.join("real");
+        std::fs::create_dir_all(real.join("e")).expect("mkdir");
+        std::fs::write(real.join("e/f"), b"x").expect("write");
+        let alias = dir.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+        let far = i64::MAX / 2;
+        let alone = Plan {
+            roots: vec![real.clone()],
+            ..Plan::default()
+        };
+        let counted = read(&alone, None, far, Bound::DEFAULT);
+        assert_eq!(counted.unowned_bytes(), json!(1), "the real root counts");
+        assert_eq!(
+            super::scratch_json(&alone, Some(&counted))["refused"],
+            json!([])
+        );
+        let both = Plan {
+            roots: vec![real.clone(), alias.clone()],
+            ..Plan::default()
+        };
+        let got = read(&both, None, far, Bound::DEFAULT);
+        assert_eq!(got.unowned_bytes(), Value::Null, "not collected");
+        let answer = super::scratch_json(&both, Some(&got));
+        assert_eq!(
+            answer["refused"].as_array().map(Vec::len),
+            Some(1),
+            "{answer}"
+        );
+        assert_eq!(
+            answer["refused"][0]["root"],
+            json!(alias.display().to_string())
+        );
+        assert!(
+            answer["refused"][0]["why"]
+                .as_str()
+                .is_some_and(|why| why.contains("is a symlink")),
+            "{answer}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

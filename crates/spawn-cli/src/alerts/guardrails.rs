@@ -41,11 +41,15 @@ use serde_json::{Value, json};
 
 use super::{Event, Monitor};
 use crate::core_lines_sample::Reading as Pending;
+use crate::serve::core_lines::Parts;
 use std::sync::mpsc::TryRecvError;
 
 /// How long a reading may take before it is given up: as long as the
 /// sampler's.
 pub(super) const READ_LIMIT_MS: i64 = crate::core_lines_sample::READ_LIMIT_MS;
+
+/// A reading's answer with how long each of its parts took.
+type Timed = (Value, Parts);
 
 /// How soon the step looks again while a reading runs.
 pub(super) const POLL_MS: i64 = 5_000;
@@ -55,8 +59,8 @@ pub(super) const POLL_MS: i64 = 5_000;
 /// still run.
 #[derive(Default)]
 pub(super) struct Reads {
-    reading: Option<(Pending<Value>, i64, std::time::Instant)>,
-    abandoned: Option<Pending<Value>>,
+    reading: Option<(Pending<Timed>, i64, std::time::Instant)>,
+    abandoned: Option<Pending<Timed>>,
     /// When the step looks again, while a reading runs.
     poll_ms: Option<i64>,
 }
@@ -184,13 +188,19 @@ fn figure_of(subject: &str, evidence: &Value) -> String {
 
 /// The line that says a reading came back (cc-astra A24): `computed`, the
 /// worker's own time around the calculation (none when it ended without
-/// one), and `observed`, from its start until the step saw it.
-fn read_line(computed: Option<std::time::Duration>, observed: std::time::Duration) -> String {
+/// one), `observed`, from its start until the step saw it, and how long
+/// each part of it took (all none for a reading that failed).
+fn read_line(
+    computed: Option<std::time::Duration>,
+    observed: std::time::Duration,
+    parts: &Parts,
+) -> String {
     let compute_ms =
         computed.map_or_else(|| "none".to_string(), |took| took.as_millis().to_string());
     format!(
-        "alerts: core lines read: compute_ms={compute_ms} observed_ms={}",
-        observed.as_millis()
+        "alerts: core lines read: compute_ms={compute_ms} observed_ms={} {}",
+        observed.as_millis(),
+        parts.text()
     )
 }
 
@@ -206,7 +216,7 @@ impl Monitor {
     pub(super) fn start_guardrails_with(
         &mut self,
         now: i64,
-        start: impl FnOnce() -> Pending<Value>,
+        start: impl FnOnce() -> Pending<Timed>,
     ) {
         let reads = &mut self.guardrail_reads;
         if reads.abandoned.as_ref().is_some_and(|old| !old.running()) {
@@ -255,8 +265,12 @@ impl Monitor {
             Ok(reading) => reading,
         };
         self.guardrail_reads.poll_ms = None;
-        lines.push(read_line(pending.computed(), begun.elapsed()));
-        self.guardrail_events(now, reading, out, lines);
+        let parts = reading
+            .as_ref()
+            .map(|(_, parts)| *parts)
+            .unwrap_or_default();
+        lines.push(read_line(pending.computed(), begun.elapsed(), &parts));
+        self.guardrail_events(now, reading.map(|(answer, _)| answer), out, lines);
     }
 
     /// `guardrail_out_of_range`, from one reading (the answer of `GET
@@ -360,7 +374,7 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::super::{Event, Monitor, Row, Settings};
-    use super::{KIND, POLL_MS, Pending, READ_LIMIT_MS, range_words, read_line, words};
+    use super::{KIND, POLL_MS, Parts, Pending, READ_LIMIT_MS, range_words, read_line, words};
     use serde_json::{Value, json};
 
     const RAISE: i64 = 7_200_000;
@@ -749,7 +763,7 @@ mod tests {
             started += 1;
             Pending::spawn(move || {
                 let _ = hold.recv();
-                Ok(answer("out", &json!(1)))
+                Ok((answer("out", &json!(1)), Parts::default()))
             })
         });
         assert!(monitor.guardrail_reads.in_flight());
@@ -764,7 +778,7 @@ mod tests {
         // Due again while it runs: no second reading.
         monitor.start_guardrails_with(2000, || {
             started += 1;
-            Pending::done(Ok(answer("out", &json!(1))))
+            Pending::done(Ok((answer("out", &json!(1)), Parts::default())))
         });
         assert_eq!(started, 1);
         // Over the limit: given up, it decides nothing.
@@ -779,7 +793,7 @@ mod tests {
         // Due again, but the given-up thread still runs: none starts.
         monitor.start_guardrails_with(READ_LIMIT_MS + 1, || {
             started += 1;
-            Pending::done(Ok(answer("out", &json!(1))))
+            Pending::done(Ok((answer("out", &json!(1)), Parts::default())))
         });
         assert_eq!(started, 1);
         assert!(!monitor.guardrail_reads.in_flight());
@@ -804,7 +818,7 @@ mod tests {
         for at in [t0, t0 + RAISE] {
             monitor.start_guardrails_with(at, || {
                 started += 1;
-                Pending::done(Ok(answer("out", &json!(1))))
+                Pending::done(Ok((answer("out", &json!(1)), Parts::default())))
             });
             let (out, lines) = poll(&mut monitor, at);
             assert!(
@@ -843,7 +857,7 @@ mod tests {
         monitor.start_guardrails_with(0, || {
             Pending::spawn(|| {
                 std::thread::sleep(std::time::Duration::from_millis(50));
-                Ok(answer("in", &json!(1)))
+                Ok((answer("in", &json!(1)), Parts::default()))
             })
         });
         let mut done = false;
@@ -881,8 +895,28 @@ mod tests {
             "seen at least 300 ms after it was computed: {line}"
         );
         assert_eq!(
-            read_line(None, std::time::Duration::from_millis(7)),
-            "alerts: core lines read: compute_ms=none observed_ms=7"
+            read_line(None, std::time::Duration::from_millis(7), &Parts::default()),
+            "alerts: core lines read: compute_ms=none observed_ms=7 \
+             open_ms=none trends_ms=none facts_ms=none archive_ms=none cost_ms=none storage_ms=none health_ms=none"
+        );
+        let ms = |n| Some(std::time::Duration::from_millis(n));
+        assert_eq!(
+            read_line(
+                ms(900),
+                std::time::Duration::from_secs(4),
+                &Parts {
+                    open: ms(20),
+                    trends: ms(300),
+                    facts: ms(3),
+                    archive: None,
+                    cost: None,
+                    storage: ms(500),
+                    health: ms(40),
+                }
+            ),
+            "alerts: core lines read: compute_ms=900 observed_ms=4000 \
+             open_ms=20 trends_ms=300 facts_ms=3 archive_ms=none cost_ms=none storage_ms=500 health_ms=40",
+            "a part kept by performance_now is none, not 0"
         );
     }
 }

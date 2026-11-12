@@ -3443,6 +3443,49 @@ mod tests {
         });
     }
 
+    /// The per-part timing, through the real store: a reading says how
+    /// long each of its parts took, and the parts do not overlap (rev-e F1:
+    /// every read inside it is in one part). The archive and the cost are the kept
+    /// performance values' (another test may have computed them within the
+    /// minute), so they are both timed or both not, never one alone.
+    #[test]
+    fn a_reading_times_each_of_its_parts() {
+        in_test_schema(|_owner, store| {
+            let dir = std::env::temp_dir().join(format!(
+                "spawn-core-lines-parts-{}-{}",
+                std::process::id(),
+                super::now_ms()
+            ));
+            std::fs::create_dir_all(&dir).expect("a directory");
+            let mut parts = super::core_lines::Parts::default();
+            let begun = std::time::Instant::now();
+            super::core_lines::core_lines_timed(
+                store,
+                Some(&dir.join("core-lines.json")),
+                Some(&dir.join("nightly")),
+                &mut parts,
+            )
+            .expect("the answer");
+            let whole = begun.elapsed();
+            assert!(
+                [
+                    parts.open,
+                    parts.trends,
+                    parts.facts,
+                    parts.storage,
+                    parts.health
+                ]
+                .iter()
+                .all(Option::is_some),
+                "{parts:?}"
+            );
+            assert_eq!(parts.archive.is_some(), parts.cost.is_some(), "{parts:?}");
+            // Disjoint parts: their sum is never more than the whole.
+            assert!(parts.sum() <= whole, "{parts:?} over {whole:?}");
+            std::fs::remove_dir_all(&dir).expect("clean up");
+        });
+    }
+
     /// Objective 084, through the real store: `/api/core-lines`' answer
     /// with no ranges file, a broken one and one with ranges, read at each
     /// request.
