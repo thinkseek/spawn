@@ -881,3 +881,25 @@ Cloudflare Tunnel + Access (not built). The ways to reach one store, and their t
 | Private network (Tailscale/WireGuard) to this host | install it on each host | no TLS work; this host stays the single point of failure |
 | Managed PostgreSQL + S3-compatible bucket (e.g. Neon/Supabase + R2) | TLS client; move the data once | off-host durability and backups; a bill and a provider |
 | Cloudflare Tunnel + Access in front of this host (the one chosen) | `cloudflared` on each client | reachable from anywhere without an open port |
+
+## Core lines (objective 084)
+
+`GET /api/core-lines` gives the four core lines the owner steers by
+(performance, storage, observability, recoverability), each one north star
+and its guardrails, every figure `{key, name, unit, value, range, state}`.
+The storage line reads health.storage as `/api/fleet` does: the north star
+`storage.days_left`, then `storage.free_bytes`, `storage.archive_growth`
+(the archive's growth a day), `storage.database_ratio` (the live database's
+bytes over its `log_bytes`), `storage.test_database_bytes` (the largest
+readable test database) and `storage.test_database_schemas` (the most test
+schemas). The other lines' north stars are not collected yet.
+
+Ranges live only in one file, `SPAWN_CORE_LINES_FILE`, by default
+`<workspace root>/core-lines.json`, shaped `{"ranges": {<figure key>:
+{"min"?: number, "max"?: number}}}`, read at every request: an edit shows
+without a restart. A figure's `state` is `in` (within its range, bounds
+included), `out`, `no_range` or `not_collected`. An entry naming no figure,
+or with no number min or max, is listed in `ignored_ranges`; a missing file
+is no ranges, and a broken one gives a `ranges_error`. Home's "Core lines"
+card shows each line, colours a guardrail out of range, and says a broken
+file and the ignored entries. Nothing but `spawn serve` reads the file.
