@@ -657,7 +657,7 @@ fn lines_at(
 
 /// The figures that have a value, by key: what a `host.core_lines` sample
 /// holds.
-pub(crate) fn values_of(lines: &[Line]) -> Map<String, Value> {
+pub(super) fn values_of(lines: &[Line]) -> Map<String, Value> {
     lines
         .iter()
         .flat_map(|line| std::iter::once(&line.north_star).chain(&line.guardrails))
@@ -791,6 +791,7 @@ mod tests {
             &lines(&storage, &Value::Null, Vec::new()),
             &json!("/ws/core-lines.json"),
             Ok(None),
+            &std::collections::BTreeMap::new(),
         );
         let names: Vec<&str> = view["lines"]
             .as_array()
