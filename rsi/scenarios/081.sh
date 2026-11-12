@@ -215,6 +215,10 @@ create function pg_temp.deployed(h numeric, ok boolean) returns void language sq
     select pg_temp.rec(h, jsonb_build_object('type', 'deploy.finished', 'by', 'landing', 'head', '$C',
         'ok', ok, 'reason', case when ok then '' else 'the build failed' end)) \$\$;
 
+-- A deploy that failed 8 days ago: the live record began before this
+-- window, so every landing in it counts under objective 095's rule as
+-- under 081's (a failed deploy ships nothing).
+select pg_temp.deployed(-192, false);
 select pg_temp.rec(-12, '{"type":"mission.added","id":1,"text":"081 mission","origin":"human","sources":[]}');
 select pg_temp.rec(-12, '{"type":"mission.configured","id":1,"accept":"gate","gate":"$WORK/ctl/scenarios"}');
 select pg_temp.assigned(-11, k) from generate_series(1, 5) k;
