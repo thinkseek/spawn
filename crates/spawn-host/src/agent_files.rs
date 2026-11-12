@@ -15,8 +15,9 @@
 //! What it read is that one file, whatever the path names a moment later:
 //! callers use the descriptor's stat, never an earlier `lstat`, and read at
 //! most a bound ([`read_regular`]) or the descriptor's size. Writers that
-//! make or move a file in a workspace go through [`create_new`] and
-//! [`rename_within`], which walk the same way.
+//! make or move a file in a workspace go through [`create_new`],
+//! [`create_with`] (which never removes anything) and [`rename_within`],
+//! which walk the same way.
 
 use std::ffi::OsStr;
 use std::fs::{File, Metadata};
@@ -174,6 +175,135 @@ pub fn create_new(top: &Path, relative: &TreePath) -> Result<bool, AgentFileErro
             "create {relative}: {error}"
         ))),
     }
+}
+
+/// What [`create_with`] did. It never removes anything.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Created {
+    /// The file is whole at its name: the very file written and confirmed.
+    Written,
+    /// Something is already at this name (the file's, or its partial
+    /// name): left as it is, nothing written.
+    Exists(TreePath),
+    /// The bytes written so far are left at the partial name: the write or
+    /// its confirmation failed, or the file's name was taken before the
+    /// file got it.
+    Partial { partial: TreePath, why: String },
+    /// As [`Created::Partial`], but the partial name was taken too, so the
+    /// bytes written have no name: nothing was named, nothing moved.
+    Unkept { why: String },
+}
+
+/// Create the file `relative` under `top` with what `write` writes, never
+/// over anything, never removing anything (cc-astra A37: a restore is not a
+/// deleter) and never naming anything but the file written (cc-astra A38).
+/// Its missing parents are made the way [`create_new`] makes them (none
+/// followed through a symlink). The bytes go to a file with no name
+/// (`O_TMPFILE`, mode 0600) in the parent: no other entry can stand in for
+/// it, as one could at a name between the write and its naming. Once
+/// written and synced, `confirm` reads it back through the same descriptor
+/// (from its start), and only then is that descriptor's file linked at its
+/// name (`linkat`, which never replaces). So:
+/// - an entry already at the file's name (a dangling symlink included) is
+///   refused before anything is written: [`Created::Exists`];
+/// - so is one at the partial name (`relative` with `marker` appended: an
+///   earlier restore's partial file), never written over;
+/// - a write or a confirmation that fails, or a name taken by another
+///   process before the link, links the bytes at the partial name instead
+///   (never over anything): [`Created::Partial`], or [`Created::Unkept`]
+///   when that name was taken meanwhile;
+/// - an entry put at the partial name while the file is written is never
+///   moved, named or followed.
+///
+/// A file system (or a system: macOS) without `O_TMPFILE` is refused:
+/// nothing is written.
+/// (`spawn store get`, which restores into a directory the caller names.)
+pub fn create_with(
+    top: &Path,
+    relative: &TreePath,
+    marker: &str,
+    write: impl FnOnce(&mut File) -> std::io::Result<()>,
+    confirm: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> Result<Created, AgentFileError> {
+    use std::io::{Seek, SeekFrom};
+    use std::os::fd::AsRawFd;
+    checked(relative)?;
+    let mut partial_bytes = relative.as_bytes().to_vec();
+    partial_bytes.extend_from_slice(marker.as_bytes());
+    let partial = TreePath::from_bytes(partial_bytes);
+    checked(&partial)?;
+    let parent = HeldDirectory::parent_of(top, relative).map_err(AgentFileError::NotRegular)?;
+    for name in [relative, &partial] {
+        match rustix::fs::statat(
+            parent.descriptor(),
+            name.file_name(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(_) => return Ok(Created::Exists(name.clone())),
+            Err(Errno::NOENT) => {}
+            Err(error) => return Err(AgentFileError::Failed(format!("stat {name}: {error}"))),
+        }
+    }
+    let descriptor = unnamed_file(&parent).map_err(|error| {
+        AgentFileError::Failed(format!(
+            "an unnamed file (O_TMPFILE) beside {relative}: {error}; nothing written"
+        ))
+    })?;
+    let mut file = File::from(descriptor);
+    // The descriptor's own file, as the kernel names it: linkat follows
+    // this one link to the inode, never a name in the directory.
+    let own = format!("/proc/self/fd/{}", file.as_raw_fd());
+    let link = |name: &TreePath| {
+        rustix::fs::linkat(
+            CWD,
+            own.as_str(),
+            parent.descriptor(),
+            name.file_name(),
+            AtFlags::SYMLINK_FOLLOW,
+        )
+    };
+    let failed = match write(&mut file)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("write: {error}"))
+        .and_then(|()| {
+            file.seek(SeekFrom::Start(0))
+                .and_then(|_| confirm(&mut file))
+                .map_err(|error| format!("read back: {error}"))
+        }) {
+        Err(why) => why,
+        Ok(()) => match link(relative) {
+            Ok(()) => return Ok(Created::Written),
+            Err(error) => format!("naming it {relative}: {error}"),
+        },
+    };
+    match link(&partial) {
+        Ok(()) => Ok(Created::Partial {
+            partial,
+            why: failed,
+        }),
+        Err(error) => Ok(Created::Unkept {
+            why: format!("{failed}; and {partial}: {error}"),
+        }),
+    }
+}
+
+/// A file with no name in `parent`, read and write, mode 0600
+/// (`O_TMPFILE`, Linux only).
+#[cfg(target_os = "linux")]
+fn unnamed_file(parent: &HeldDirectory) -> Result<OwnedFd, Errno> {
+    rustix::fs::openat(
+        parent.descriptor(),
+        ".",
+        OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+}
+
+/// No file without a name here (macOS has no `O_TMPFILE`): [`create_with`]
+/// refuses and writes nothing.
+#[cfg(not(target_os = "linux"))]
+fn unnamed_file(_parent: &HeldDirectory) -> Result<OwnedFd, Errno> {
+    Err(Errno::OPNOTSUPP)
 }
 
 /// Write `bytes` as the regular file `relative` under `top`, replacing what

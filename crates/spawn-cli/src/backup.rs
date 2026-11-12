@@ -94,6 +94,7 @@ use crate::Flags;
 use crate::config::{env_or, env_value, open_store, workspace_root};
 
 mod restore_drill;
+mod store;
 
 /// The default limits, in decimal megabytes (1,000,000 bytes each): R2's
 /// free tier is 10 GB-month of storage, and the owner's alert is at 8 GB.
@@ -366,13 +367,18 @@ impl Settings {
         format!("{}{key}", self.prefix)
     }
 
+    /// `spawn backup`'s settings: its bucket and credentials from r2.env
+    /// ([`Self::backup_r2`]), never the keep bucket.
     pub(crate) fn from_env(flags: &Flags) -> Result<Self, String> {
-        let root = workspace_root(flags)
-            .map(PathBuf::from)
-            .ok_or_else(|| "--root or SPAWN_WORKSPACE_ROOT is required".to_string())?;
-        let key_file = env_value("SPAWN_BACKUP_KEY_FILE")
-            .map_or_else(|| home().join(".config/spawn/backup.key"), PathBuf::from);
-        private_file(&key_file, "the backup key")?;
+        Self::with_r2(flags, Self::backup_r2)
+    }
+
+    /// The bucket and credentials `spawn backup` works with: r2.env's
+    /// (`SPAWN_R2_ENV_FILE`), each value from it or else the environment.
+    /// A bucket locked for good ([`store::locked_forever`]) is refused here,
+    /// before any request: the store is the keep bucket's only writer, and
+    /// `spawn backup` has no business there (the lead, 2026-11-13).
+    fn backup_r2() -> Result<R2, String> {
         let env_file = env_value("SPAWN_R2_ENV_FILE")
             .map_or_else(|| home().join(".config/spawn/r2.env"), PathBuf::from);
         private_file(&env_file, "the R2 environment")?;
@@ -392,6 +398,23 @@ impl Settings {
             access_key: needed("SPAWN_R2_ACCESS_KEY_ID")?,
             secret_key: needed("SPAWN_R2_SECRET_ACCESS_KEY")?,
         };
+        not_locked_forever(&r2.bucket)?;
+        Ok(r2)
+    }
+
+    /// The settings with the bucket and credentials `r2` gives (the store
+    /// passes its own credential's, so it never needs r2.env).
+    pub(crate) fn with_r2(
+        flags: &Flags,
+        r2: impl FnOnce() -> Result<R2, String>,
+    ) -> Result<Self, String> {
+        let root = workspace_root(flags)
+            .map(PathBuf::from)
+            .ok_or_else(|| "--root or SPAWN_WORKSPACE_ROOT is required".to_string())?;
+        let key_file = env_value("SPAWN_BACKUP_KEY_FILE")
+            .map_or_else(|| home().join(".config/spawn/backup.key"), PathBuf::from);
+        private_file(&key_file, "the backup key")?;
+        let r2 = r2()?;
         let prefix = prefix_value(env_value("SPAWN_BACKUP_PREFIX"))?;
         let limit_bytes = megabytes("SPAWN_BACKUP_R2_LIMIT_MB", DEFAULT_LIMIT_MB)?;
         let alert_bytes = megabytes("SPAWN_BACKUP_R2_ALERT_MB", DEFAULT_ALERT_MB)?;
@@ -429,6 +452,41 @@ SPAWN_BACKUP_R2_LIMIT_MB ({limit_bytes} bytes)"
             None => PathBuf::from(name),
         }
     }
+}
+
+/// Whether `name`, exactly as given (never trimmed or folded), is an R2
+/// bucket name: 3 to 63 of lower-case letters, digits and `-`, a letter or
+/// digit at each end.
+fn r2_bucket_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let inner = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    (3..=63).contains(&bytes.len())
+        && bytes.first().is_some_and(inner)
+        && bytes.last().is_some_and(inner)
+        && bytes.iter().all(|b| inner(b) || *b == b'-')
+}
+
+/// `spawn backup` writes only to a bucket whose name is an R2 bucket name
+/// as given (rev-g F5: "X-KEEP" or "x-keep " would pass a suffix test and
+/// might still reach the keep bucket), and never to the bucket locked for
+/// good (the keep bucket, [`store::locked_forever`]). Both before any
+/// request; the name is never in the message.
+fn not_locked_forever(bucket: &str) -> Result<(), String> {
+    if !r2_bucket_name(bucket) {
+        return Err(
+            "refused: SPAWN_R2_BUCKET is not an R2 bucket name as given (3 to 63 lower-case \
+letters, digits and -, no space): nothing is sent"
+                .to_string(),
+        );
+    }
+    if store::locked_forever(bucket) {
+        return Err(
+            "refused: SPAWN_R2_BUCKET names the keep bucket (locked for good); spawn backup \
+never writes there, only spawn store does"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn home() -> PathBuf {
@@ -810,6 +868,19 @@ pub(crate) fn suspect(events: i64, bytes: u64, previous: Option<(i64, u64)>) -> 
 
 /// The keys and sizes of one ListObjectsV2 page, and whether more follow.
 pub(crate) fn parse_listing(xml: &str) -> (Vec<(String, u64)>, Option<String>) {
+    let (entries, token) = parse_listing_tagged(xml);
+    (
+        entries
+            .into_iter()
+            .map(|listed| (listed.key, listed.size))
+            .collect(),
+        token,
+    )
+}
+
+/// A listing page's keys with their size and ETag (unquoted, lower case:
+/// the XML spells the quotes `&quot;` or as they are).
+pub(crate) fn parse_listing_tagged(xml: &str) -> (Vec<store::Listed>, Option<String>) {
     let mut entries = Vec::new();
     let mut rest = xml;
     while let Some(start) = rest.find("<Contents>") {
@@ -822,8 +893,14 @@ pub(crate) fn parse_listing(xml: &str) -> (Vec<(String, u64)>, Option<String>) {
         let size = between(body, "<Size>", "</Size>")
             .and_then(|text| text.trim().parse::<u64>().ok())
             .unwrap_or(0);
+        let etag = between(body, "<ETag>", "</ETag>")
+            .unwrap_or_default()
+            .replace("&quot;", "")
+            .replace('"', "")
+            .trim()
+            .to_ascii_lowercase();
         if !key.is_empty() {
-            entries.push((key, size));
+            entries.push(store::Listed { key, size, etag });
         }
         rest = &block[end + "</Contents>".len()..];
     }
@@ -855,6 +932,12 @@ fn output(mut command: Command, what: &str) -> Result<(bool, String, String), St
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     ))
+}
+
+/// `spawn store put|get|list|verify` (the off-host copy's layer,
+/// [`store`]).
+pub(crate) fn store_command(arguments: &[String]) -> Result<i32, String> {
+    store::command(arguments)
 }
 
 /// The entry point: `spawn backup dump|bundle|verify|restore-drill [--root <dir>]`.
@@ -1198,6 +1281,18 @@ fn count_events(settings: &Settings, scratch: &Scratch, dump: &Path) -> Result<(
 /// gpg: AES256, no compression (the archive is compressed), the passphrase
 /// from its file.
 fn gpg(settings: &Settings, decrypting: bool, input: &Path, out: &Path) -> Result<(), String> {
+    gpg_with(settings, decrypting, "none", input, out)
+}
+
+/// gpg with the backup key; `compress` is its --compress-algo when it
+/// encrypts (the dumps and bundles are compressed before: `none`).
+fn gpg_with(
+    settings: &Settings,
+    decrypting: bool,
+    compress: &str,
+    input: &Path,
+    out: &Path,
+) -> Result<(), String> {
     let mut command = Command::new("gpg");
     command
         .args([
@@ -1220,7 +1315,7 @@ fn gpg(settings: &Settings, decrypting: bool, input: &Path, out: &Path) -> Resul
                 "--cipher-algo",
                 "AES256",
                 "--compress-algo",
-                "none",
+                compress,
             ])
             .arg("--output")
             .arg(out)
@@ -1239,6 +1334,12 @@ fn encrypt(settings: &Settings, input: &Path, out: &Path) -> Result<(), String> 
 
 fn decrypt(settings: &Settings, input: &Path, out: &Path) -> Result<(), String> {
     gpg(settings, true, input, out)
+}
+
+/// A store object sealed: compressed (zlib) and encrypted with the backup
+/// key, as one gpg step (`spawn backup store`).
+fn seal(settings: &Settings, input: &Path, out: &Path) -> Result<(), String> {
+    gpg_with(settings, false, "zlib", input, out)
 }
 
 /// One exchange with the bucket. `options` is curl config (headers, the
@@ -1459,6 +1560,9 @@ fn put_object(
     sha256: &str,
     events: i64,
 ) -> Result<(), String> {
+    // Again at the PUT itself, before any request (settings are checked
+    // when read; this holds whatever built them).
+    not_locked_forever(&settings.r2.bucket)?;
     let md5 = md5_file(file)?;
     let options = format!(
         "upload-file = \"{}\"\nheader = \"Content-Type: application/octet-stream\"\n\
@@ -1483,6 +1587,86 @@ header = \"x-amz-meta-sha256: {}\"\nheader = \"x-amz-meta-spawn-events: {}\"\n",
         ));
     }
     Ok(())
+}
+
+/// Write `file` at `key` only when no object is there (`If-None-Match: *`:
+/// the bucket answers 412 to a key that exists), with `sha256` (the sealed
+/// file's, never a plaintext's) as metadata (`spawn backup store`). Never an
+/// overwrite.
+fn put_new_object(
+    settings: &Settings,
+    key: &str,
+    file: &Path,
+    sha256: &str,
+) -> Result<store::Put, String> {
+    let options = format!(
+        "upload-file = \"{}\"\nheader = \"Content-Type: application/octet-stream\"\n\
+header = \"If-None-Match: *\"\nheader = \"x-amz-meta-sha256: {}\"\n",
+        escape_config(&file.display().to_string()),
+        sha256
+    );
+    let response = bucket_request(settings, &settings.r2.url(key), &options)?;
+    match response.status {
+        200 => Ok(store::Put::Written),
+        412 => Ok(store::Put::Existed),
+        status => Err(format!(
+            "PUT {key} answered {status}: {}",
+            first_line(&String::from_utf8_lossy(&response.body))
+        )),
+    }
+}
+
+/// An object's length, ETag (lower case, unquoted) and sha256 metadata, as
+/// HEAD reads them; `None` when there is no such key.
+fn head_object(settings: &Settings, key: &str) -> Result<Option<store::Head>, String> {
+    let response = bucket_request(settings, &settings.r2.url(key), "head\n")?;
+    match response.status {
+        200 => Ok(Some(store::Head {
+            length: header_value(&response.headers, "content-length")
+                .and_then(|text| text.parse().ok())
+                .unwrap_or(0),
+            etag: header_value(&response.headers, "etag")
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_ascii_lowercase(),
+            sha256: header_value(&response.headers, "x-amz-meta-sha256").unwrap_or_default(),
+        })),
+        404 => Ok(None),
+        status => Err(format!("HEAD {key} answered {status}")),
+    }
+}
+
+/// Every key under `prefix`, with its size and ETag (every listing page).
+fn list_prefix(settings: &Settings, prefix: &str) -> Result<Vec<store::Listed>, String> {
+    let mut keys = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..100_000 {
+        let mut query = format!(
+            "?list-type=2&max-keys=1000&prefix={}",
+            percent_encode(prefix)
+        );
+        if let Some(token) = &token {
+            let _ = write!(query, "&continuation-token={}", percent_encode(token));
+        }
+        let response = bucket_request(settings, &settings.r2.url(&query), "")?;
+        if response.status != 200 {
+            return Err(format!(
+                "ListObjectsV2 {prefix} answered {}: {}",
+                response.status,
+                first_line(&String::from_utf8_lossy(&response.body))
+            ));
+        }
+        let (page, next) = parse_listing_tagged(&String::from_utf8_lossy(&response.body));
+        keys.extend(
+            page.into_iter()
+                .filter(|listed| listed.key.starts_with(prefix)),
+        );
+        match next {
+            Some(next) => token = Some(next),
+            None => return Ok(keys),
+        }
+    }
+    Err("ListObjectsV2 did not end".to_string())
 }
 
 /// `spawn backup dump`'s body is above; `bundle` and `verify` follow.
@@ -2846,10 +3030,10 @@ fn record_verified(
 #[cfg(test)]
 mod tests {
     use super::{
-        Stamp, Tier, bundle_compression, bundle_stamps, copy_events, full_bundle, md5_hex,
-        parse_env_file, parse_listing, parse_pg_url, read_bundle_records, read_dump_records,
-        server_major, suspect, tiers_for, transcript_offset, window_files, within_limit,
-        without_transaction_timeout,
+        R2, Settings, Stamp, Tier, bundle_compression, bundle_stamps, copy_events, full_bundle,
+        md5_hex, not_locked_forever, parse_env_file, parse_listing, parse_listing_tagged,
+        parse_pg_url, put_object, read_bundle_records, read_dump_records, server_major, suspect,
+        tiers_for, transcript_offset, window_files, within_limit, without_transaction_timeout,
     };
 
     /// `SPAWN_BACKUP_PREFIX` is a bucket prefix and nothing else: unset or
@@ -3163,6 +3347,89 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         let (entries, token) = parse_listing(last);
         assert_eq!(entries, [("c".to_string(), 5)]);
         assert_eq!(token, None, "the last page names no token");
+    }
+
+    /// `spawn backup` never writes to the keep bucket (the lead,
+    /// 2026-11-13): refused at the PUT before any request (the endpoint is
+    /// a closed port: a request would fail otherwise), and when its
+    /// settings are read.
+    #[test]
+    fn spawn_backup_never_writes_to_the_keep_bucket() {
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-backup-keep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.subsec_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let file = dir.join("object");
+        std::fs::write(&file, b"bytes").expect("object");
+        let settings = |bucket: &str| Settings {
+            root: dir.clone(),
+            key_file: dir.join("key"),
+            r2: R2 {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: bucket.to_string(),
+                access_key: "made-up-id".to_string(),
+                secret_key: "made-up-secret".to_string(),
+            },
+            pg_bin: None,
+            compress: "zstd:9".to_string(),
+            transcript_days: 14,
+            limit_bytes: 1,
+            alert_bytes: 1,
+            prefix: "locktest/x/".to_string(),
+            drill_url: None,
+        };
+        let error = put_object(&settings("made-up-keep"), "k", &file, "s", 0).unwrap_err();
+        assert!(error.contains("never writes there"), "{error}");
+        assert!(!error.contains("made-up-keep"), "{error}");
+        // Not an R2 name as given (rev-g F5): refused before the keep test
+        // and before any request, untrimmed and unfolded.
+        for bucket in [
+            "MADE-UP-KEEP",
+            "made-up-keep ",
+            " made-up-keep",
+            "made-up-Keep",
+            "x",
+        ] {
+            let error = put_object(&settings(bucket), "k", &file, "s", 0).unwrap_err();
+            assert!(
+                error.contains("not an R2 bucket name"),
+                "{bucket:?}: {error}"
+            );
+            assert!(
+                bucket.trim().len() < 3 || !error.contains(bucket.trim()),
+                "{error}"
+            );
+        }
+        // Another bucket gets as far as the request (a closed port).
+        let error = put_object(&settings("made-up-store"), "k", &file, "s", 0).unwrap_err();
+        assert!(!error.contains("never writes there"), "{error}");
+        assert!(not_locked_forever("made-up-keep").is_err());
+        assert!(not_locked_forever("made-up-store").is_ok());
+        std::fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[test]
+    fn a_listing_gives_each_keys_etag_unquoted() {
+        let page = "<ListBucketResult><Contents><Key>a</Key><Size>3</Size>\
+<ETag>&quot;0CC175B9C0F1B6A831C399E269772661&quot;</ETag></Contents><Contents><Key>b</Key>\
+<Size>4</Size><ETag>\"92eb5ffee6ae2fec3ad71c777531578f\"</ETag></Contents>\
+<IsTruncated>false</IsTruncated></ListBucketResult>";
+        let (entries, _) = parse_listing_tagged(page);
+        let tags: Vec<(&str, u64, &str)> = entries
+            .iter()
+            .map(|listed| (listed.key.as_str(), listed.size, listed.etag.as_str()))
+            .collect();
+        assert_eq!(
+            tags,
+            [
+                ("a", 3, "0cc175b9c0f1b6a831c399e269772661"),
+                ("b", 4, "92eb5ffee6ae2fec3ad71c777531578f")
+            ]
+        );
     }
 
     #[test]

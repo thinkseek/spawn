@@ -2440,8 +2440,9 @@ begin
         -- spawn_deploy_record): read by the alert step (`deploy_failed`),
         -- folded into no table.
         null;
-    when 'backup.dumped', 'backup.bundled', 'backup.verified' then
-        -- What `spawn backup` did (crate backup.rs): read from the log by the
+    when 'backup.dumped', 'backup.bundled', 'backup.verified', 'backup.stored' then
+        -- What `spawn backup` did (crate backup.rs; `backup.stored`: a
+        -- `spawn store put` run, its manifest's key): read from the log by the
         -- next run, folded into no table. What a copy holds is in its record
         -- (its events, watermark and sha256), so the drill compares a
         -- restore with the record and not with the live database
@@ -5008,8 +5009,32 @@ begin
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record backups', session_user using errcode = '42501';
     end if;
-    if p_record ->> 'type' not in ('backup.dumped', 'backup.bundled', 'backup.verified') then
+    if p_record ->> 'type' not in ('backup.dumped', 'backup.bundled', 'backup.verified',
+                                   'backup.stored') then
         raise exception 'not a backup record: %', p_record ->> 'type';
+    end if;
+    -- A `spawn store put` run (crate backup/store.rs): its shape is fixed,
+    -- every field checked, and nothing else is taken (a record is read by
+    -- anyone who reads the log; nothing of a file's content goes in it).
+    if p_record ->> 'type' = 'backup.stored' then
+        if exists (select 1 from jsonb_object_keys(p_record) k
+                    where k not in ('type', 'area', 'host', 'account', 'manifest', 'files',
+                                    'unchanged', 'grown', 'whole', 'segments_written',
+                                    'segments_found', 'bytes_written')) then
+            raise exception 'a backup.stored record has type, area, host, account, manifest, files, unchanged, grown, whole, segments_written, segments_found and bytes_written, and nothing else';
+        end if;
+        if p_record ->> 'area' is null or p_record ->> 'area' not in ('transcripts', 'sessions')
+           or jsonb_typeof(p_record -> 'host') is distinct from 'string'
+           or jsonb_typeof(p_record -> 'account') is distinct from 'string'
+           or jsonb_typeof(p_record -> 'manifest') is distinct from 'string'
+           or exists (select 1 from unnest(array['files', 'unchanged', 'grown', 'whole',
+                                                 'segments_written', 'segments_found',
+                                                 'bytes_written']) f
+                       where jsonb_typeof(p_record -> f) is distinct from 'number'
+                          or (p_record ->> f)::numeric < 0
+                          or (p_record ->> f)::numeric <> trunc((p_record ->> f)::numeric)) then
+            raise exception 'a backup.stored record: area transcripts or sessions, host, account and manifest strings, the counts whole numbers';
+        end if;
     end if;
     return spawn_control_record(p_record);
 end $$;
@@ -5621,16 +5646,24 @@ select w.at_ms, 'cancel_reassign', n.mission_id, n.task_id, null, p.task_id
           and r.seq < n.seq
      ) p
  -- Its span, as spawn_task_spans closes it: up to the task's next
- -- assignment; a legacy row its row closed has no closing record.
- cross join lateral (
-       select min(r.seq) as next_seq
+ -- assignment; a legacy row its row closed has no closing record. Found
+ -- among the task's own records (spawn_events_control_record_row_id, by
+ -- its id and seq), the first that is an assignment. The type test is
+ -- spelled so that no assignment index (_objective, _brief: their
+ -- predicate) applies: by one of them this lookup walked every later
+ -- assignment of the log for each cancelled attempt (a 7-day window 1.4 s
+ -- on the live log of 2026-11-13, more as history followed it).
+ left join lateral (
+       select r.seq as next_seq
          from spawn_experience_records r
-        where (r.type = 'task.assigned'
-               or (r.type = 'legacy.imported' and r.record ->> 'table' = 'mission_tasks'))
-          and spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')) = p.task_id
+        where spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id')) = p.task_id
+          and r.seq > p.seq
+          and r.type in ('task.assigned', 'legacy.imported')
+          and (r.type = 'task.assigned' or r.record ->> 'table' = 'mission_tasks')
           and spawn_experience_int(coalesce(r.record -> 'mission_id', r.record -> 'row' -> 'mission_id'))
               is not null
-          and r.seq > p.seq) x
+        order by r.seq
+        limit 1) x on true
  cross join lateral (
        select r.seq, r.type, r.record
          from spawn_experience_records r
