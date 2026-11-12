@@ -24,6 +24,8 @@ export interface CoreFigure {
   /** The last 7 UTC days (objective 090): each day's last sample carrying
    * the figure, oldest first; empty without one. */
   trend?: CoreTrendPoint[];
+  /** A figure still measuring its window: when it started (objective 095). */
+  measuring_since_ms?: number | null;
 }
 
 /** One day of a figure's trend. */
@@ -78,6 +80,11 @@ export interface CoreLinesView {
   notice: string | null;
   /** "<key>: <reason>" for each range the file gave that was left out. */
   ignored: string[];
+  /** The same, as the Home card says them (never the internal key and
+   * reason): "<name>: figure not built yet" for a range of a figure this
+   * build does not have, "<name>: range not read (it needs a number min or
+   * max)" for one without a bound. */
+  pending: string[];
 }
 
 const LINE_NAMES: Record<string, string> = {
@@ -108,9 +115,10 @@ export function spanWords(ms: number): string {
 }
 
 /** A number in a unit's words: bytes as storageSize ("104.0 GB"), a day's
- * growth "<size> a day", days "1,234 days", a ratio "4.7×", a count
- * grouped ("1,214"), milliseconds as a span ("1 h 32 min"), a share as a
- * percent to one decimal ("74.9%"), dollars and cents ("$8.08"). */
+ * growth "<size> a day", days "1,234 days", a ratio "4.7×" (below one
+ * "0.13"), a count grouped ("1,214"), milliseconds as a span ("1 h 32
+ * min"), a share as a percent to one decimal ("74.9%"), dollars and cents
+ * ("$8.08"). */
 export function unitWords(unit: string, value: number): string {
   switch (unit) {
     case "bytes":
@@ -120,7 +128,9 @@ export function unitWords(unit: string, value: number): string {
     case "days":
       return `${GROUPED.format(value)} days`;
     case "ratio":
-      return `${value.toFixed(1)}×`;
+      // Below one (interventions per agent-hour) as a plain number with
+      // two significant digits, else as a multiple.
+      return Math.abs(value) < 1 ? `${Number(value.toPrecision(2))}` : `${value.toFixed(1)}×`;
     case "ms":
       return spanWords(value);
     case "share":
@@ -132,27 +142,60 @@ export function unitWords(unit: string, value: number): string {
   }
 }
 
+/** A bound as core-lines.json wrote it: a byte bound that is a whole
+ * number of decimal megabytes reads in decimal units ("500 MB" for
+ * 500000000, "1.5 GB" for 1500000000), not pushed through storageSize's
+ * 1024s ("476.8 MB"); any other bound reads as unitWords says it. */
+function boundWords(unit: string, bound: number): string {
+  if ((unit === "bytes" || unit === "bytes_per_day") && bound !== 0 && bound % 1e6 === 0) {
+    const size = Math.abs(bound) >= 1e9 ? `${bound / 1e9} GB` : `${bound / 1e6} MB`;
+    return unit === "bytes_per_day" ? `${size} a day` : size;
+  }
+  return unitWords(unit, bound);
+}
+
 /** A range in its unit's words: "<min> or more", "<max> or less", "between
- * <min> and <max>", or "no range set". */
+ * <min> and <max>", or "no range set"; each bound as the file wrote it
+ * (boundWords). */
 export function rangeWords(unit: string, range: CoreRange | null | undefined): string {
   const min = finite(range?.min);
   const max = finite(range?.max);
-  if (min !== null && max !== null) return `between ${unitWords(unit, min)} and ${unitWords(unit, max)}`;
-  if (min !== null) return `${unitWords(unit, min)} or more`;
-  if (max !== null) return `${unitWords(unit, max)} or less`;
+  if (min !== null && max !== null) return `between ${boundWords(unit, min)} and ${boundWords(unit, max)}`;
+  if (min !== null) return `${boundWords(unit, min)} or more`;
+  if (max !== null) return `${boundWords(unit, max)} or less`;
   return "no range set";
+}
+
+const two = (n: number) => String(n).padStart(2, "0");
+
+/** A moment as "MM-DD HH:MM", local time. */
+export function sinceWords(ms: number): string {
+  const at = new Date(ms);
+  return `${two(at.getMonth() + 1)}-${two(at.getDate())} ${two(at.getHours())}:${two(at.getMinutes())}`;
 }
 
 function mark(raw: unknown): CoreMark {
   const figure = (typeof raw === "object" && raw !== null ? raw : {}) as Partial<CoreFigure>;
   const unit = typeof figure.unit === "string" ? figure.unit : "count";
   const value = finite(figure.value);
+  const since = finite(figure.measuring_since_ms);
   return {
     name: typeof figure.name === "string" ? figure.name : String(figure.key ?? ""),
-    value: value === null ? "not collected yet" : unitWords(unit, value),
+    value:
+      value !== null ? unitWords(unit, value) : since !== null ? `measuring since ${sinceWords(since)}` : "not collected yet",
     range: rangeWords(unit, figure.range),
     tone: figure.state === "in" ? "plain" : figure.state === "out" ? "warning" : "muted",
   };
+}
+
+/** An ignored range as the owner reads it: the figure's name (its own, or
+ * its key's last part in words) and what is missing. */
+function pendingWords(entry: { key?: unknown; reason?: unknown } | null | undefined, names: Map<string, string>): string {
+  const key = String(entry?.key ?? "");
+  const known = names.get(key);
+  if (known !== undefined) return `${known}: range not read (it needs a number min or max)`;
+  const words = key.slice(key.lastIndexOf(".") + 1).replace(/_/g, " ");
+  return `${words}: figure not built yet`;
 }
 
 /** The card's words for an answer of `GET /api/core-lines`. */
@@ -160,6 +203,13 @@ export function coreLinesView(answer: Partial<CoreLinesAnswer> | null | undefine
   const lines = Array.isArray(answer?.lines) ? answer.lines : [];
   const error = typeof answer?.ranges_error === "string" && answer.ranges_error !== "" ? answer.ranges_error : null;
   const ignored = Array.isArray(answer?.ignored_ranges) ? answer.ignored_ranges : [];
+  const names = new Map<string, string>();
+  for (const line of lines) {
+    const figures = [line?.north_star, ...(Array.isArray(line?.guardrails) ? line.guardrails : [])];
+    for (const figure of figures) {
+      if (typeof figure?.key === "string" && typeof figure?.name === "string") names.set(figure.key, figure.name);
+    }
+  }
   return {
     rows: lines.map((line) => ({
       line: LINE_NAMES[line?.line] ?? String(line?.line ?? ""),
@@ -168,6 +218,7 @@ export function coreLinesView(answer: Partial<CoreLinesAnswer> | null | undefine
     })),
     notice: error === null ? null : `ranges file unreadable: ${error}`,
     ignored: ignored.map((entry) => `${entry?.key}: ${entry?.reason}`),
+    pending: ignored.map((entry) => pendingWords(entry, names)),
   };
 }
 

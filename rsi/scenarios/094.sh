@@ -27,11 +27,22 @@
 #       first.
 #   (2) the figures: `storage.unowned_scratch_bytes` ("Scratch nobody owns",
 #       bytes: the gone and idle entries' bytes) and
-#       `storage.leaked_test_schemas` ("Leaked test schemas", count): in the
-#       test databases, the schemas but public and the system's that no live
-#       session holds (no session's application_name is the schema's name)
-#       and that were not made in the last hour (the comment on the schema
-#       is {"made_at_ms": <ms>}; none, or one that does not read, is old).
+#       `storage.leaked_test_schemas` ("Leaked test schemas", count): over
+#       every test server (the env's SPAWN_TEST_DATABASE_URL "test" and
+#       SPAWN_FLEET_TEST_DATABASE_URL "fleet_test", and core-lines.json's
+#       `storage.test_database_url_files` [{name, url_file}], a URL never
+#       printed, used only from a file this user owns at mode 0600, naming a
+#       local socket or a loopback host, and not the live database's URL;
+#       a refused entry is listed in `ignored_ranges` as
+#       `storage.test_database_url_files.<name>` with its reason), the schemas but public and the system's that are
+#       leftovers of a test that is gone: no live session holds it (no
+#       session's application_name is its name), AND its owner's pid is gone
+#       (the <pid> of spawn_test_<pid>_...: no such process on this host; a
+#       name with no pid has no owner), AND it has been idle 24 h (made at
+#       least 24 h ago by its comment {"made_at_ms": <ms>}; with no comment,
+#       or one that does not read, first seen by the reader at least 24 h
+#       ago, kept in <root>/test-schemas-seen.json as {"<server>/<schema>":
+#       <ms>}). The answer lists `test_schemas` [{server, schemas, leaked}].
 #   (3) read only: every file, directory, symlink and schema is still there,
 #       unchanged, after the answer.
 #
@@ -41,9 +52,13 @@
 # symlink inside to a big directory elsewhere; a fresh unmarked one; a
 # top-level symlink; idle `.transcripts`, `incident-...`, `x.rebuilt-pending`
 # and `y.pending` entries, an idle one holding a .jsonl file and an idle
-# configured exclude. A test database of its own: a schema a live session
-# holds, one made now, one made 2 hours ago, one with no comment, one whose
-# comment is not JSON, and one more by another name.
+# configured exclude. A test database of its own ("test"): a schema a live
+# session holds; one made now; one made 25 h ago whose pid is gone; one made
+# 25 h ago whose pid is the scenario's own shell; one with no comment first
+# seen 25 h ago; one with no comment never seen; one whose comment is not
+# JSON; and bb_other (no pid) first seen 25 h ago. A second test server
+# ("spare", by a URL file): one made 25 h ago whose pid is gone, one made
+# now.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -113,6 +128,7 @@ tests_made=""
 serve_pid=""
 held_pid=""
 TESTS_DB="bb_094_tests_$run"
+TESTS2_DB="bb_094_spare_$run"
 cleanup() {
     for pid in "$serve_pid" "$held_pid"; do
         [ -n "$pid" ] || continue
@@ -121,6 +137,7 @@ cleanup() {
     done
     if [ -n "$tests_made" ]; then
         psql -d postgres -q -c "drop database if exists $TESTS_DB with (force)" >/dev/null 2>&1 || true
+        psql -d postgres -q -c "drop database if exists $TESTS2_DB with (force)" >/dev/null 2>&1 || true
     fi
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
@@ -152,6 +169,8 @@ psql -d postgres -tA -c "create database $SPAWN_DB_NAME" >/dev/null 2>&1 ||
 database_made=1
 psql -d postgres -tA -c "create database $TESTS_DB" >/dev/null 2>&1 ||
     harness "cannot create the scenario's test database"
+psql -d postgres -tA -c "create database $TESTS2_DB" >/dev/null 2>&1 ||
+    harness "cannot create the scenario's second test database"
 tests_made=1
 
 . "$controller/scripts/blackbox/assertions.sh"
@@ -243,38 +262,79 @@ snapshot >"$WORK/before.txt"
 
 cat >"$SPAWN_WORKSPACE_ROOT/core-lines.json" <<JSON
 {"ranges": {},
- "storage": {"scratch_roots": ["$S"], "scratch_exclude": ["$S/notes"]}}
+ "storage": {"scratch_roots": ["$S"], "scratch_exclude": ["$S/notes"],
+             "test_database_url_files": [{"name": "spare", "url_file": "$WORK/spare.url"},
+                                         {"name": "loose", "url_file": "$WORK/loose.url"},
+                                         {"name": "remote", "url_file": "$WORK/remote.url"},
+                                         {"name": "live", "url_file": "$WORK/live.url"}]}}
 JSON
 
 # The test database's schemas, as Spawn's tests make them: the comment is
 # what a test writes when it makes its schema.
 SPAWN_TEST_DATABASE_URL="$server_url/$TESTS_DB"
 export SPAWN_TEST_DATABASE_URL
-p="spawn_test_1_a_0"
+# A pid that is gone (a process that exited) and one that runs (this shell).
+sh -c 'exit 0' &
+dead_pid=$!
+wait "$dead_pid" || true
+[ ! -e "/proc/$dead_pid" ] || harness "the exited process $dead_pid is still there"
+d="spawn_test_${dead_pid}_a_0"
+live="spawn_test_$$_b_0"
+day_ago=$((seed_now - 25 * 3600000))
 cat >"$WORK/tests.sql" <<SQL
 \set ON_ERROR_STOP 1
-create schema ${p}_held;
-create schema ${p}_fresh;
-comment on schema ${p}_fresh is '{"made_at_ms": $seed_now}';
-create schema ${p}_old;
-comment on schema ${p}_old is '{"made_at_ms": $((seed_now - 7200000))}';
-create schema ${p}_bare;
-create schema ${p}_junk;
-comment on schema ${p}_junk is 'made by hand';
+create schema ${d}_held;
+comment on schema ${d}_held is '{"made_at_ms": $day_ago}';
+create schema ${d}_fresh;
+comment on schema ${d}_fresh is '{"made_at_ms": $seed_now}';
+create schema ${d}_old;
+comment on schema ${d}_old is '{"made_at_ms": $day_ago}';
+create table ${d}_old.t (x int);
+create schema ${live}_old;
+comment on schema ${live}_old is '{"made_at_ms": $day_ago}';
+create schema ${d}_seen;
+create schema ${d}_unseen;
+create schema ${d}_junk;
+comment on schema ${d}_junk is 'made by hand';
 create schema bb_other;
-create table ${p}_old.t (x int);
 SQL
+cat >"$WORK/spare.sql" <<SQL
+\set ON_ERROR_STOP 1
+create schema ${d}_spare_old;
+comment on schema ${d}_spare_old is '{"made_at_ms": $day_ago}';
+create schema ${d}_spare_young;
+comment on schema ${d}_spare_young is '{"made_at_ms": $seed_now}';
+SQL
+capture psql -d "$TESTS2_DB" -q -f "$WORK/spare.sql"
+[ "$status" -eq 0 ] || harness "seeding the spare server's schemas failed: $(err)"
+# The spare server by a URL file, as the owner names ccd's: never printed.
+( umask 077 && printf '%s/%s\n' "$server_url" "$TESTS2_DB" >"$WORK/spare.url" )
+case ${PGHOST-} in
+'' | /* | localhost | 127.* | ::1) ;;
+*) harness "the test server is not on a local socket or a loopback host ($PGHOST): the URL file rule refuses it" ;;
+esac
+# Three a reader must refuse: readable by others; a host that is not
+# loopback; the live database's own URL (this serve's).
+( umask 022 && printf '%s/%s\n' "$server_url" "$TESTS2_DB" >"$WORK/loose.url" && chmod 644 "$WORK/loose.url" )
+( umask 077 && printf 'postgres://bb@192.0.2.1:5432/%s\n' "$TESTS2_DB" >"$WORK/remote.url" )
+( umask 077 && printf '%s\n' "$SPAWN_DATABASE_URL" >"$WORK/live.url" )
+# What the reader saw before: two schemas with no comment, 25 h ago.
+printf '{"test/%s_seen": %s, "test/bb_other": %s}\n' "$d" "$day_ago" "$day_ago" >"$SPAWN_WORKSPACE_ROOT/test-schemas-seen.json"
 capture psql -d "$TESTS_DB" -q -f "$WORK/tests.sql"
 [ "$status" -eq 0 ] || harness "seeding the test schemas failed: $(err)"
 schemas() {
     psql -d "$TESTS_DB" -tA -c "select string_agg(nspname || '=' || coalesce(obj_description(oid, 'pg_namespace'), ''), ',' order by nspname) from pg_namespace where nspname not like 'pg\\_%' and nspname <> 'information_schema'"
 }
 schemas >"$WORK/schemas-before.txt" || harness "cannot list the test schemas"
+spare_schemas() {
+    psql -d "$TESTS2_DB" -tA -c "select string_agg(nspname || '=' || coalesce(obj_description(oid, 'pg_namespace'), ''), ',' order by nspname) from pg_namespace where nspname not like 'pg\\_%' and nspname <> 'information_schema'"
+}
+spare_schemas >"$WORK/spare-before.txt" || harness "cannot list the spare server's schemas"
 # A live session holding the held schema, as a running test's connection.
-PGAPPNAME=${p}_held psql -d "$TESTS_DB" -q -c "select pg_sleep(300)" >/dev/null 2>&1 &
+PGAPPNAME=${d}_held psql -d "$TESTS_DB" -q -c "select pg_sleep(300)" >/dev/null 2>&1 &
 held_pid=$!
 i=0
-until [ "$(psql -d "$TESTS_DB" -tA -c "select count(*) from pg_stat_activity where application_name = '${p}_held'")" = 1 ]; do
+until [ "$(psql -d "$TESTS_DB" -tA -c "select count(*) from pg_stat_activity where application_name = '${d}_held'")" = 1 ]; do
     i=$((i + 1))
     [ "$i" -lt 100 ] || harness "the holding session did not start"
     sleep 0.1
@@ -306,8 +366,21 @@ else
     fig() { jq -c ".lines[] | select(.line == \"storage\") | ([.north_star] + .guardrails)[] | select(.key == \"$1\") | {name, unit, value}" "$WORK/api.json"; }
     expect_eq "$(fig storage.unowned_scratch_bytes)" "{\"name\":\"Scratch nobody owns\",\"unit\":\"bytes\",\"value\":$want_bytes}" \
         "(2) scratch nobody owns: the gone and idle entries' bytes"
+    asked=$(scalar "select (floor(extract(epoch from clock_timestamp()) * 1000))::bigint")
     expect_eq "$(fig storage.leaked_test_schemas)" '{"name":"Leaked test schemas","unit":"count","value":4}' \
-        "(2) leaked test schemas: the one made 2 h ago, the bare one, the one whose comment is not JSON and bb_other; not the held or the fresh one"
+        "(2) leaked test schemas, every server: the old one whose pid is gone, the one first seen 25 h ago, bb_other, and the spare server's old one; not the held, the fresh, the old one whose pid runs, the never-seen or the bad-comment one"
+    expect_eq "$(jq -c '[.test_schemas[] | {server, schemas, leaked}]' "$WORK/api.json")" \
+        '[{"server":"test","schemas":8,"leaked":3},{"server":"spare","schemas":2,"leaked":1}]' \
+        "(2) each test server's schemas and leaked, the env's first, then the URL files in order"
+    expect_eq "$(jq -c '[.ignored_ranges[] | select(.key | startswith("storage.test_database_url_files.")) | {key, why: ((.reason | type) == "string" and (.reason | length) > 0)}] | sort_by(.key)' "$WORK/api.json")" \
+        '[{"key":"storage.test_database_url_files.live","why":true},{"key":"storage.test_database_url_files.loose","why":true},{"key":"storage.test_database_url_files.remote","why":true}]' \
+        "(2) the URL files refused, each with its reason: mode 0644, a host that is not loopback, the live database's URL"
+    seen=$SPAWN_WORKSPACE_ROOT/test-schemas-seen.json
+    expect_eq "$(jq -c --arg s "test/${d}_seen" '.[$s]' "$seen" 2>/dev/null)" "$day_ago" \
+        "(2) a schema's first sight is kept, not moved to this read"
+    first=$(jq -r --arg s "test/${d}_unseen" '.[$s]' "$seen" 2>/dev/null)
+    awk -v v="$first" -v lo="$seed_now" -v hi="$asked" 'BEGIN { exit !(v ~ /^[0-9]+$/ && v >= lo && v <= hi) }' ||
+        check_failed "(2) a schema never seen before is first seen at this read: [$first], between [$seed_now] and [$asked]"
     note "(1) and (2) checked"
 fi
 # Read only.
@@ -318,7 +391,12 @@ fi
 schemas >"$WORK/schemas-after.txt" || harness "cannot list the test schemas"
 cmp -s "$WORK/schemas-before.txt" "$WORK/schemas-after.txt" ||
     check_failed "(3) the test schemas changed: before [$(cat "$WORK/schemas-before.txt")] after [$(cat "$WORK/schemas-after.txt")]"
-expect_eq "$(psql -d "$TESTS_DB" -tA -c "select count(*) from pg_stat_activity where application_name = '${p}_held'")" 1 \
+spare_schemas >"$WORK/spare-after.txt" || harness "cannot list the spare server's schemas"
+cmp -s "$WORK/spare-before.txt" "$WORK/spare-after.txt" || check_failed "(3) the spare server's schemas changed"
+if grep -q -e "$TESTS2_DB" -e "192.0.2.1" "$WORK/api.json" "$WORK/serve.log" 2>/dev/null; then
+    check_failed "(3) a test server's URL is printed in the answer or serve's log"
+fi
+expect_eq "$(psql -d "$TESTS_DB" -tA -c "select count(*) from pg_stat_activity where application_name = '${d}_held'")" 1 \
     "(3) the holding session still runs"
 
 if [ -s "$WORK/failures" ]; then
