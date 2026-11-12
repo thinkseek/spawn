@@ -183,9 +183,72 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
     })
 }
 
-/// The four lines, the storage line's figures from `storage` (health.storage
-/// as [`super::storage::report`] gives it).
-pub(super) fn lines(storage: &Value) -> Vec<Line> {
+/// How long the performance figures are kept: a Home poll must not compute
+/// the 7-day scorecard and cost window again at every request.
+const PERFORMANCE_KEPT_MS: i64 = 60_000;
+
+/// The performance figures of the last read, and when.
+static PERFORMANCE: std::sync::Mutex<Option<(i64, Value)>> = std::sync::Mutex::new(None);
+
+/// The performance line's values (objective 086), from the Scorecard's
+/// answer over its default 7 days and `/api/cost?window=7d`'s: the fleet
+/// scope's `report_to_live` value, `gate_time` value (the median),
+/// `gate_time`'s `undecided_ms` over its `total_ms` (null when the total is
+/// 0), `first_pass` value, and the cost window's `usd_per_landing`. A value
+/// the page does not have is null.
+pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
+    let fleet = scorecard["scopes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|scope| scope["scope"] == "fleet")
+        .map_or(Value::Null, |scope| scope["dimensions"].clone());
+    let gate = &fleet["gate_time"];
+    let decided_nothing = match (gate["undecided_ms"].as_f64(), gate["total_ms"].as_f64()) {
+        (Some(undecided), Some(total)) if total > 0.0 => json!(undecided / total),
+        _ => Value::Null,
+    };
+    json!({
+        "report_to_live": fleet["report_to_live"]["value"],
+        "gate_time": gate["value"],
+        "decided_nothing": decided_nothing,
+        "first_pass": fleet["first_pass"]["value"],
+        "usd_per_landing": cost["usd_per_landing"],
+    })
+}
+
+/// The performance values, kept for [`PERFORMANCE_KEPT_MS`]: computed from
+/// the 7-day scorecard and cost window as the pages compute them. A part
+/// that cannot be read counts as not collected.
+fn performance_now(store: &spawn_postgres::PostgresStore, now_ms: i64) -> Value {
+    let mut kept = PERFORMANCE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, values)) = kept
+        .as_ref()
+        .filter(|(at, _)| (0..PERFORMANCE_KEPT_MS).contains(&now_ms.saturating_sub(*at)))
+    {
+        return values.clone();
+    }
+    let root = crate::env_value("SPAWN_WORKSPACE_ROOT");
+    let scorecard = crate::scorecard::measure(
+        store,
+        root.as_deref().map(std::path::Path::new),
+        &crate::scorecard::Query::default(),
+    )
+    .unwrap_or(Value::Null);
+    let cost = crate::cost::window_of(Some("7d"))
+        .and_then(|(name, length_ms)| crate::cost::window(store, name, length_ms))
+        .unwrap_or(Value::Null);
+    let values = performance(&scorecard, &cost);
+    *kept = Some((now_ms, values.clone()));
+    values
+}
+
+/// The four lines: the performance line's figures from `performance`
+/// ([`performance`]), the storage line's from `storage` (health.storage as
+/// [`super::storage::report`] gives it).
+pub(super) fn lines(storage: &Value, performance: &Value) -> Vec<Line> {
     let database = &storage["database"];
     let ratio = match (database["bytes"].as_f64(), database["log_bytes"].as_f64()) {
         (Some(bytes), Some(log)) if log > 0.0 => json!(bytes / log),
@@ -204,12 +267,38 @@ pub(super) fn lines(storage: &Value) -> Vec<Line> {
     vec![
         Line {
             name: "performance",
-            north_star: Figure::not_collected(
+            north_star: Figure::new(
                 "performance.report_to_live",
                 "Time from report to live",
                 "ms",
+                performance["report_to_live"].clone(),
             ),
-            guardrails: Vec::new(),
+            guardrails: vec![
+                Figure::new(
+                    "performance.gate_time",
+                    "Gate time per run",
+                    "ms",
+                    performance["gate_time"].clone(),
+                ),
+                Figure::new(
+                    "performance.decided_nothing",
+                    "Gate time that decided nothing",
+                    "share",
+                    performance["decided_nothing"].clone(),
+                ),
+                Figure::new(
+                    "performance.first_pass",
+                    "Landings that pass first time",
+                    "share",
+                    performance["first_pass"].clone(),
+                ),
+                Figure::new(
+                    "performance.usd_per_landing",
+                    "Dollars per landing",
+                    "usd",
+                    performance["usd_per_landing"].clone(),
+                ),
+            ],
         },
         Line {
             name: "storage",
@@ -347,9 +436,15 @@ pub(super) fn core_lines_at(
     store: &spawn_postgres::PostgresStore,
     path: Option<&std::path::Path>,
 ) -> Result<Value, String> {
-    let storage = super::storage::report(store, super::now_ms())?;
+    let now_ms = super::now_ms();
+    let storage = super::storage::report(store, now_ms)?;
+    let performance = performance_now(store, now_ms);
     let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
-    Ok(answer(&lines(&storage), &file, read_ranges(path)))
+    Ok(answer(
+        &lines(&storage, &performance),
+        &file,
+        read_ranges(path),
+    ))
 }
 
 #[cfg(test)]
