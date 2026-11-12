@@ -119,6 +119,138 @@ fn a_notice_is_recorded_once_and_never_clears() {
     assert_eq!(alert(&mut client, "task_state:7:10")["state"], "notice");
 }
 
+/// Objective 092: the owner judges an alert that should not have been
+/// raised (`alert.judged` {key, verdict}). An open alert is cleared by it,
+/// its cleared evidence the verdict; a cleared one keeps its evidence and
+/// gains the verdict. Another verdict, a key no alert has, a notice and an
+/// alert judged already are refused and write nothing. `/api/alerts`' rows
+/// carry the outcome, and a refold gives the same rows.
+#[test]
+fn the_owner_judges_an_alert_and_every_alert_ends_with_an_outcome() {
+    let (store, schema) = store("alerts_judged");
+    let mut client = admin(&schema);
+    for key in ["memory_low:1", "memory_low:2", "memory_low:3"] {
+        store.alert_record(&fired(key, false)).expect("fire");
+    }
+    store
+        .alert_record(&fired("task_state:7:10", true))
+        .expect("a notice");
+    store
+        .alert_record(&cleared("memory_low:1"))
+        .expect("clear one");
+
+    // An open alert judged: cleared by the judgement.
+    let id = store
+        .alert_judge("memory_low:2", "duplicate")
+        .expect("judge an open alert");
+    let row = alert(&mut client, "memory_low:2");
+    assert_eq!(row["state"], "cleared");
+    assert_eq!(row["verdict"], "duplicate");
+    assert_eq!(row["cleared_event_id"], id);
+    assert_eq!(row["cleared_evidence"], json!({"judged": "duplicate"}));
+    assert_eq!(row["judged_at_ms"], row["cleared_at_ms"]);
+
+    // A cleared alert judged: its clearing stays, the verdict is added.
+    let before = alert(&mut client, "memory_low:1");
+    store
+        .alert_judge("memory_low:1", "false")
+        .expect("judge a cleared alert");
+    let row = alert(&mut client, "memory_low:1");
+    assert_eq!(row["verdict"], "false");
+    assert_eq!(row["state"], "cleared");
+    assert_eq!(row["cleared_event_id"], before["cleared_event_id"]);
+    assert_eq!(row["cleared_evidence"], json!({"measured_mb": 9000}));
+
+    // Refused, writing nothing.
+    let written = |client: &mut Client| -> i64 {
+        client
+            .query_one(
+                "select count(*) from spawn_events
+                  where kind -> 'detail' -> 'record' ->> 'type' = 'alert.judged'",
+                &[],
+            )
+            .expect("count the judgements")
+            .get(0)
+    };
+    assert_eq!(written(&mut client), 2);
+    for (key, verdict, why) in [
+        ("memory_low:3", "wrong", "another verdict"),
+        ("memory_low:9", "false", "a key no alert has"),
+        ("task_state:7:10", "stale", "a notice"),
+        ("memory_low:2", "stale", "an alert judged already"),
+        ("memory_low:1", "false", "an alert judged already, the same verdict"),
+    ] {
+        assert!(
+            store.alert_judge(key, verdict).is_err(),
+            "{why} is refused"
+        );
+    }
+    assert!(
+        store
+            .alert_record(&json!({"type": "alert.judged", "key": "memory_low:3",
+                                  "verdict": "false", "why": "extra"}))
+            .is_err(),
+        "a judgement with another field is refused"
+    );
+    assert_eq!(written(&mut client), 2, "the refused judgements wrote nothing");
+    assert_eq!(alert(&mut client, "memory_low:3")["state"], "open");
+    assert!(
+        store.alert_record(&cleared("memory_low:2")).is_err(),
+        "a judged alert has nothing left to clear"
+    );
+
+    // The outcomes, as /api/alerts gives them.
+    let outcomes = |store: &PostgresStore| -> Vec<(String, Value)> {
+        store
+            .alerts(0)
+            .expect("the window")
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| {
+                (
+                    row["key"].as_str().expect("a key").to_string(),
+                    row["outcome"].clone(),
+                )
+            })
+            .collect()
+    };
+    let mut got = outcomes(&store);
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            ("memory_low:1".to_string(), json!("false")),
+            ("memory_low:2".to_string(), json!("duplicate")),
+            ("memory_low:3".to_string(), Value::Null),
+            ("task_state:7:10".to_string(), Value::Null),
+        ]
+    );
+    store
+        .alert_record(&cleared("memory_low:3"))
+        .expect("clear the last");
+    assert!(
+        outcomes(&store).contains(&("memory_low:3".to_string(), json!("cleared"))),
+        "cleared by its condition"
+    );
+
+    // The fold keeps the verdict and its time; a refold gives the same rows.
+    let rows = |client: &mut Client| -> Value {
+        client
+            .query_one(
+                "select jsonb_agg(to_jsonb(a) order by a.key) from spawn_alerts a",
+                &[],
+            )
+            .expect("read the table")
+            .get(0)
+    };
+    let folded = rows(&mut client);
+    client
+        .batch_execute("select spawn_control_refold()")
+        .expect("refold the control stream");
+    assert_eq!(rows(&mut client), folded);
+}
+
 /// The records are the owner's: a restricted login may read the table (the
 /// supervisor's `spawn alerts`) and may not record an alert. Its read
 /// carries an open agent_stuck alert's `scored_at_ms`, through a view: the
