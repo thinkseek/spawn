@@ -213,7 +213,7 @@ git -C "$WORK/seed" push -q "$repo" main:main
 # model's answer (`answer: <its first line>`) in the transcript, then the
 # end of the turn, then the prompt on the screen. It writes its transcript
 # where Claude Code does.
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -234,7 +234,7 @@ printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 first=
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     printf 'got %s %s\n' "$(date +%s.%N)" "$typed" >>"$BB_WORK/engine.log"
     if [ "$pending" = 0 ]; then

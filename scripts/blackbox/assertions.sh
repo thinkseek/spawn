@@ -120,3 +120,50 @@ supervisor_turn_dump() { # <what the scenario waited for>
         esac
     } 2>&1 | sed -E 's#(://)[^@[:space:]]*@#\1***@#g' >&2 || true
 }
+
+# bb_engine >FILE <<'ENGINE' ... ENGINE: writes a fake engine (a bash
+# script, its `#!` line first) with bb_read_line defined right after that
+# line, for its input loop:
+#
+#   if bb_read_line typed; then ...    # a whole typed line in $typed
+#   elif ...                           # a second with no whole line
+#
+# bb_read_line VAR waits a second for a line, and returns read's status
+# when none came (the engine's quiet). bash's `read -t` keeps what it read of
+# a line when it times out, which happens when a paste straddles the second
+# (a loaded host): reading that part into the line's variable and dropping it
+# turned "BB:SAY ..." into "AY ..." (070's gate failure, sync/flake-070.md).
+# bb_read_line holds that part and goes on reading, so a cut line is no quiet
+# and a turn does not end mid-paste (objective 078's engine did the same);
+# the rest of the line joins it. A part held 10 s with no end of line is
+# returned as the line, so a line that never ends cannot stall the engine.
+bb_engine() {
+    IFS= read -r bb_engine_first || fail "bb_engine: no engine on standard input"
+    case $bb_engine_first in
+    '#!'*bash*) ;;
+    *) fail "bb_engine: the engine's first line is not a bash #! line: $bb_engine_first" ;;
+    esac
+    printf '%s\n' "$bb_engine_first"
+    cat <<'READ'
+# bb_read_line VAR: scripts/blackbox/assertions.sh's (bb_engine).
+bb_rl_held=
+bb_read_line() {
+  local bb_rl_part bb_rl_status bb_rl_waits=0
+  while :; do
+    bb_rl_part='' bb_rl_status=0
+    IFS= read -r -t 1 bb_rl_part || bb_rl_status=$?
+    bb_rl_held=$bb_rl_held$bb_rl_part
+    if [ "$bb_rl_status" != 0 ]; then
+      # Quiet (or the end of input) with no part held: no line.
+      [ "$bb_rl_status" -gt 128 ] && [ -n "$bb_rl_held" ] || return "$bb_rl_status"
+      bb_rl_waits=$((bb_rl_waits + 1))
+      [ "$bb_rl_waits" -ge 10 ] || continue
+    fi
+    printf -v "$1" '%s' "$bb_rl_held"
+    bb_rl_held=
+    return 0
+  done
+}
+READ
+    cat
+}

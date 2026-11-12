@@ -396,7 +396,7 @@ GATE_RUNNER_ROOT=$runner_root sh "$ctl/deploy/gate-runner/setup.sh" --root "$run
 # The fake engine: a text naming `BB:WRITE:<file>` writes `<file>.txt`, waits
 # for the pusher to publish it (at most 30 s), then writes the report.
 # Anything else is a turn that changes nothing.
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -424,7 +424,7 @@ printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 job=
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     if [ "$pending" = 0 ]; then
       line '"type":"user","message":{"role":"user","content":"prompt"}'

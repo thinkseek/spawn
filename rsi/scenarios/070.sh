@@ -185,7 +185,7 @@ git -C "$WORK/seed" push -q "$repo" main:main
 # makes the turn's words what follows it, up to the message's own trailer
 # ("[spawn message #<n>] (Answer this message ...)"): the supervisor's reply.
 # Any other turn says "waiting".
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -205,7 +205,7 @@ printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 words=waiting
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     case "$typed" in *"BB:SAY "*) words=${typed#*BB:SAY }; words=${words%% \[spawn message*} ;; esac
     [ "$pending" = 1 ] || line '"type":"user","message":{"role":"user","content":"prompt"}'

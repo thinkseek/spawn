@@ -195,7 +195,7 @@ git -C "$WORK/seed" push -q "$repo" main:main
 # The fake engine: what is typed in opens a turn, which ends after a second
 # of quiet; it writes its transcript as Claude Code does (a user line, then
 # the turn's end), so the Observer judges the session after each turn.
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -214,7 +214,7 @@ line() {
 printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     [ "$pending" = 1 ] || line '"type":"user","message":{"role":"user","content":"prompt"}'
     pending=1

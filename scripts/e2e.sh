@@ -191,8 +191,11 @@ ln -s ws-real "$work/ws"
 #   E2E:ASK    stop with a HUMAN: question
 #   E2E:REPORT write .spawn/report.md, then stop; with E2E:WRITE=<file>,
 #              write that file into the workspace first
-# Other lines are read silently; one second of quiet ends the turn.
-cat >"$work/claude" <<'ENGINE'
+# Other lines are read silently; one second of quiet ends the turn. The
+# engine is written by scripts/blackbox/assertions.sh's bb_engine, in a
+# subshell (its fail and wait_for are not this script's), for bb_read_line:
+# a line a timed-out read cut is kept, not dropped.
+( . "$root/scripts/blackbox/assertions.sh" && bb_engine ) >"$work/claude" <<'ENGINE'
 #!/usr/bin/env bash
 log=$E2E_WORK/argv.log
 printf '%s %s\n' "$SPAWN_SESSION_ID" "$*" >>"$log"
@@ -241,7 +244,7 @@ stop() { line '"type":"system","subtype":"turn_duration","durationMs":1'; printf
 printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 while :; do
-  if IFS= read -r -t 1 line; then
+  if bb_read_line line; then
     # Screen-reader mode shows each message typed in as a `you:` line.
     printf 'you: %s\n' "$line"
     case "$line" in

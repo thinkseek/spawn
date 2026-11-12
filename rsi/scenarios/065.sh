@@ -44,10 +44,12 @@
 #       - `days_left`: free_bytes over growth_bytes_per_day, rounded down;
 #         null when the growth is null or not above zero.
 #   (3) resources.ts `storageView(storage)`: `rows` [{name, size, note}]
-#       for "Transcript archive" (note "grows about <size> a day", or "not
+#       holding, in this order (other rows may sit among them), rows for
+#       "Transcript archive" (note "grows about <size> a day", or "not
 #       measured yet" without a growth), "Claude Code transcripts" (note
 #       "<files> files", and ", down from <before>" when `before` is more),
-#       "Workspaces" and "Database" (note "largest: <table> <size>");
+#       "Workspaces" and "Database" (note "largest: <table> <size>",
+#       anything another objective adds after a comma);
 #       `lasts`: "about <days> days at the archive's growth" (days grouped
 #       en-US), null when days_left is null. A size reads "<n> MB" to one
 #       decimal under 1024 MB (1 MB = 1024 * 1024 bytes), "<n> GB" above.
@@ -198,11 +200,11 @@ git -C "$WORK/seed" push -q "$repo" main:main
 
 # A quiet engine: the loop may deliver the tasks below to a worker; this
 # one shows a prompt, takes what is typed and does nothing with it.
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 printf 'Welcome to Claude Code\n\n❯ '
 while :; do
-  if IFS= read -r -t 1 typed; then printf 'you: %s\n\nidle\n❯ ' "$typed"; fi
+  if bb_read_line typed; then printf 'you: %s\n\nidle\n❯ ' "$typed"; fi
 done
 ENGINE
 chmod 755 "$WORK/claude"
@@ -462,21 +464,33 @@ const answer = JSON.parse(readFileSync(`${env.BB_WORK}/api.json`, "utf8"));
 const storage = answer.health.storage;
 const mb = (bytes) => `${(bytes / 1024 ** 2).toFixed(1)} MB`;
 
+// The four rows this objective names, found by name: each once, in this
+// order. Rows another objective adds (074's "Gate test database") may sit
+// among them and are no failure here.
+const NAMED = ["Transcript archive", "Claude Code transcripts", "Workspaces", "Database"];
+const named = (view, name) => {
+  const found = view.rows.filter((row) => row.name === name);
+  assert.equal(found.length, 1, `one "${name}" row, among ${JSON.stringify(view.rows.map((row) => row.name))}`);
+  return found[0];
+};
+
 test("(3) the rows: what uses the disk", () => {
-  const { rows } = storageView(storage);
-  assert.deepEqual(rows.map((row) => row.name), ["Transcript archive", "Claude Code transcripts", "Workspaces", "Database"]);
-  assert.deepEqual([rows[0].size, rows[0].note], ["12.0 MB", `grows about ${mb(storage.growth_bytes_per_day)} a day`]);
-  assert.deepEqual([rows[1].size, rows[1].note], ["1.0 MB", "3 files, down from 40"]);
-  assert.equal(rows[2].size, "2.0 MB");
-  assert.match(rows[3].note, new RegExp(`^largest: ${storage.database.tables[0].name} \\d+\\.\\d (MB|GB)$`));
+  const view = storageView(storage);
+  const names = view.rows.map((row) => row.name).filter((name) => NAMED.includes(name));
+  assert.deepEqual(names, NAMED, "the four named rows, each once, in this order");
+  assert.deepEqual([named(view, NAMED[0]).size, named(view, NAMED[0]).note], ["12.0 MB", `grows about ${mb(storage.growth_bytes_per_day)} a day`]);
+  assert.deepEqual([named(view, NAMED[1]).size, named(view, NAMED[1]).note], ["1.0 MB", "3 files, down from 40"]);
+  assert.equal(named(view, NAMED[2]).size, "2.0 MB");
+  // Its own words first; another objective may add after a comma (074's ", log 0.0 MB").
+  assert.match(named(view, NAMED[3]).note, new RegExp(`^largest: ${storage.database.tables[0].name} \\d+\\.\\d (MB|GB)(, |$)`));
 });
 
 test("(3) without a fall, without a growth, and in GB", () => {
   const steady = storageView({ ...storage, projects: { ...storage.projects, before: 3 } });
-  assert.equal(steady.rows[1].note, "3 files");
+  assert.equal(named(steady, NAMED[1]).note, "3 files");
   const young = storageView({ ...storage, growth_bytes_per_day: null, days_left: null });
-  assert.deepEqual([young.rows[0].note, young.lasts], ["not measured yet", null]);
-  assert.equal(storageView({ ...storage, archive: { ...storage.archive, bytes: 3 * 1024 ** 3 } }).rows[0].size, "3.0 GB");
+  assert.deepEqual([named(young, NAMED[0]).note, young.lasts], ["not measured yet", null]);
+  assert.equal(named(storageView({ ...storage, archive: { ...storage.archive, bytes: 3 * 1024 ** 3 } }), NAMED[0]).size, "3.0 GB");
 });
 
 test("(3) how long the disk lasts", () => {

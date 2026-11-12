@@ -257,7 +257,7 @@ mkdir -p "$WORK/claude-config" "$WORK/ctl" "$WORK/state"
 # mode) is `deaf`; `twice` writes the line twice. Then its turn: one tool
 # call, and the turn's end (`turn_duration`) 3 s after the prompt. Every
 # prompt and turn end is logged (engine.log: ms agent what).
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -294,7 +294,7 @@ turn() {
 printf 'Welcome to Claude Code\n\n❯ '
 buffer=""
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     buffer="${buffer:+$buffer
 }$typed"
   elif [ -n "$buffer" ]; then

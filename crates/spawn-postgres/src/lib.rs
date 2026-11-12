@@ -100,6 +100,7 @@ mod wake;
 pub use acks::{AckRecord, ReportAnswer};
 pub use cost::{ArchiveCounted, ArchiveFile, ArchivedMessage};
 pub use gateway::{HumanInput, HumanKey, HumanResume, HumanTask, HumanWrite};
+pub use host::test_database_size;
 pub use missions::{ActivityEvent, LandingHold, PushRequest};
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
