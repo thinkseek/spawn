@@ -1322,7 +1322,7 @@ fn list_bucket(settings: &Settings) -> Result<(u64, Vec<(String, u64)>), String>
         let url = match &token {
             None => settings.r2.url("?list-type=2&max-keys=1000"),
             Some(token) => settings.r2.url(&format!(
-                "?list-type=2&max-keys=1000&continuation-token={}",
+                "?continuation-token={}&list-type=2&max-keys=1000",
                 percent_encode(token)
             )),
         };
@@ -1460,10 +1460,14 @@ fn put_object(
     events: i64,
 ) -> Result<(), String> {
     let md5 = md5_file(file)?;
+    let payload_sha256 = sha256_file(file)?;
+    // curl 7.88 otherwise signs upload-file with the empty body's hash.
     let options = format!(
         "upload-file = \"{}\"\nheader = \"Content-Type: application/octet-stream\"\n\
-header = \"x-amz-meta-sha256: {}\"\nheader = \"x-amz-meta-spawn-events: {}\"\n",
+header = \"x-amz-content-sha256: {}\"\nheader = \"x-amz-meta-sha256: {}\"\n\
+header = \"x-amz-meta-spawn-events: {}\"\n",
         escape_config(&file.display().to_string()),
+        payload_sha256,
         sha256,
         events
     );
