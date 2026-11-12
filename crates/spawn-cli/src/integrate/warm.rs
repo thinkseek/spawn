@@ -27,11 +27,22 @@
 //! - it stays in the integrator's process tree and cgroup (its own process
 //!   group, never a new session), so stopping the integrator's unit stops
 //!   it too;
-//! - its pid, start time and commit are in [`PID_FILE`]. A starting
-//!   integrator ([`Warms::take_over`]) stops the warm that file names only
-//!   when the process is this user's, started at the recorded time (a pid
-//!   used again never matches), and runs `gate.sh --base-only` of the
-//!   recorded commit. Anything else signals nothing.
+//! - its pid, start time, commit, source and scenarios are in
+//!   [`PID_FILE`]. A starting integrator ([`Warms::take_over`]) stops the
+//!   warm that file names only when the process is this user's, started at
+//!   the recorded time (a pid used again never matches), and runs
+//!   `gate.sh --base-only` of the recorded commit. Anything else signals
+//!   nothing.
+//!
+//! A restart cuts the warm in flight off (the parent-death signal, or the
+//! take-over). The next integrator finishes the work: the warm its pid file
+//! names, gone or stopped, is kept as lost ([`Taken::Again`]), and at its
+//! first passes, once the pass has applied its halts, it wants the base of
+//! that warm's source's main as it is then, with that warm's scenarios
+//! ([`Warms::want_lost`]): the lost commit when main has not moved, main's
+//! new commit when it has, and nothing when every mission on the source is
+//! halted. It is wanted like any warm: no unit, no detached process. A pid
+//! file that names no source (an older integrator's) warms nothing again.
 
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::CommandExt as _;
@@ -75,6 +86,36 @@ pub(super) struct Warms {
     wanted: Option<Want>,
     running: Option<Warm>,
     done: Option<Want>,
+    lost: Option<Lost>,
+}
+
+/// How many passes may fail to read a lost warm's source's main before it
+/// is given up.
+const LOST_TRIES: u32 = 3;
+
+/// A warm a predecessor's restart cut off, to warm again for its source's
+/// main as it is when a pass wants it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Lost {
+    pub(super) source: String,
+    pub(super) commit: String,
+    pub(super) scenarios: PathBuf,
+    tries: u32,
+}
+
+/// What [`Warms::take_over`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Taken {
+    /// No pid file.
+    Nothing,
+    /// A pid file that is not a warm's: nothing stopped, nothing warmed.
+    NotAWarm,
+    /// A warm's pid file that names no source (an older integrator's):
+    /// whatever it was, nothing warms it again.
+    NoSource { commit: String },
+    /// A warm a restart cut off (gone, or stopped by the take-over): its
+    /// source's main is warmed again ([`Warms::want_lost`]).
+    Again { lost: Lost, stopped: bool },
 }
 
 impl Warms {
@@ -86,6 +127,71 @@ impl Warms {
             wanted: None,
             running: None,
             done: None,
+            lost: None,
+        }
+    }
+
+    /// The lost warm's source, while one waits to be warmed again.
+    pub(super) fn lost_source(&self) -> Option<&str> {
+        self.lost.as_ref().map(|lost| lost.source.as_str())
+    }
+
+    /// At a pass, after it applied its halts: want the warm a restart cut
+    /// off again, for its source's main as it is now (`main` reads it).
+    /// `live`: whether the source has a mission that is not halted; when
+    /// not, it is warmed for no gate, and nothing is wanted. It waits while
+    /// another warm is wanted or running (one at a time; that one is of a
+    /// main this integrator saw land).
+    pub(super) fn want_lost(&mut self, live: bool, main: &dyn Fn(&str) -> Result<String, String>) {
+        let Some(lost) = self.lost.clone() else {
+            return;
+        };
+        if !live {
+            self.lost = None;
+            println!(
+                "integrate: the base warm of {} a previous integrator started was cut off: \
+                 every mission on {} is halted, so it is not warmed again",
+                lost.commit, lost.source
+            );
+            return;
+        }
+        if self.wanted.is_some() || self.running.is_some() {
+            return;
+        }
+        match main(&lost.source) {
+            Ok(commit) => {
+                self.lost = None;
+                println!(
+                    "integrate: the base warm of {} a previous integrator started was cut off: \
+                     warming {}'s main {commit}{}",
+                    lost.commit,
+                    lost.source,
+                    if commit == lost.commit {
+                        ""
+                    } else {
+                        " (main has moved since)"
+                    }
+                );
+                self.want(Want {
+                    source: lost.source,
+                    commit,
+                    scenarios: lost.scenarios,
+                });
+            }
+            Err(error) => {
+                let tries = lost.tries + 1;
+                if tries >= LOST_TRIES {
+                    self.lost = None;
+                    eprintln!(
+                        "integrate: the base warm of {} a previous integrator started was cut \
+                         off, but {}'s main cannot be read ({error}), {tries} times: not warmed \
+                         again",
+                        lost.commit, lost.source
+                    );
+                } else {
+                    self.lost = Some(Lost { tries, ..lost });
+                }
+            }
         }
     }
 
@@ -231,7 +337,7 @@ impl Warms {
         let pid = child.id();
         match start_ticks(pid) {
             Some(ticks) => {
-                let record = format!("pid {pid}\nstart {ticks}\ncommit {}\n", want.commit);
+                let record = record(pid, ticks, want);
                 if let Err(error) = std::fs::write(self.dir.join(PID_FILE), record) {
                     eprintln!(
                         "integrate: base warm of {}: {}: {error}; a crash of this integrator \
@@ -256,11 +362,12 @@ impl Warms {
 
     /// At startup: stop the warm a predecessor left, when [`PID_FILE`]
     /// names one that is still that warm (see the module's docs), and
-    /// remove the file in any case.
-    pub(super) fn take_over(&self) {
+    /// remove the file in any case. A warm it names with its source, gone
+    /// or stopped here, is kept to be warmed again ([`Self::want_lost`]).
+    pub(super) fn take_over(&mut self) -> Taken {
         let path = self.dir.join(PID_FILE);
         let Ok(text) = std::fs::read_to_string(&path) else {
-            return;
+            return Taken::Nothing;
         };
         let _ = std::fs::remove_file(&path);
         let Some(left) = Left::parse(&text) else {
@@ -268,9 +375,9 @@ impl Warms {
                 "integrate: {}: not a warm's pid file; nothing stopped",
                 path.display()
             );
-            return;
+            return Taken::NotAWarm;
         };
-        match left.still_running(&self.gate) {
+        let stopped = match left.still_running(&self.gate) {
             Ok(()) => {
                 signal_group(left.pid, "TERM");
                 // As abandon does: KILL after the grace, but only while the
@@ -299,13 +406,40 @@ impl Warms {
                         ""
                     }
                 );
+                true
             }
-            Err(why) => println!(
-                "integrate: the base warm of {} (pid {}) a previous integrator started is \
-                 gone ({why}); nothing stopped",
-                left.commit, left.pid
-            ),
-        }
+            Err(why) => {
+                println!(
+                    "integrate: the base warm of {} (pid {}) a previous integrator started is \
+                     gone ({why}); nothing stopped",
+                    left.commit, left.pid
+                );
+                false
+            }
+        };
+        let (Some(source), Some(scenarios)) = (left.source, left.scenarios) else {
+            println!(
+                "integrate: the base warm of {} a previous integrator started was cut off, but \
+                 its pid file names no source (an older integrator's): nothing is warmed again",
+                left.commit
+            );
+            return Taken::NoSource {
+                commit: left.commit,
+            };
+        };
+        println!(
+            "integrate: the base warm of {} on {source} a previous integrator started was cut \
+             off: its source's main is warmed again at the first passes",
+            left.commit
+        );
+        let lost = Lost {
+            source,
+            commit: left.commit,
+            scenarios,
+            tries: 0,
+        };
+        self.lost = Some(lost.clone());
+        Taken::Again { lost, stopped }
     }
 
     /// The warm in flight, for tests.
@@ -315,12 +449,29 @@ impl Warms {
     }
 }
 
+/// The pid file's text for the warm of `want`, `pid` started at `ticks`.
+/// A source or scenarios a line cannot hold is left out: that warm is not
+/// warmed again after a restart.
+fn record(pid: u32, ticks: u64, want: &Want) -> String {
+    let mut record = format!("pid {pid}\nstart {ticks}\ncommit {}\n", want.commit);
+    let scenarios = want.scenarios.to_str().unwrap_or_default();
+    let one_line = |text: &str| {
+        !text.is_empty() && !text.contains('\n') && text.trim() == text
+    };
+    if one_line(&want.source) && one_line(scenarios) {
+        record.push_str(&format!("source {}\nscenarios {scenarios}\n", want.source));
+    }
+    record
+}
+
 /// What a pid file says.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Left {
     pid: u32,
     start: u64,
     commit: String,
+    source: Option<String>,
+    scenarios: Option<PathBuf>,
 }
 
 impl Left {
@@ -333,10 +484,20 @@ impl Left {
         let pid = field("pid")?.parse().ok().filter(|pid| *pid > 1)?;
         let start = field("start")?.parse().ok()?;
         let commit = field("commit")?;
+        let source = field("source").filter(|source| !source.is_empty());
+        let scenarios = field("scenarios").filter(|scenarios| !scenarios.is_empty());
+        let (source, scenarios) = match (source, scenarios) {
+            (Some(source), Some(scenarios)) => {
+                (Some(source.to_string()), Some(PathBuf::from(scenarios)))
+            }
+            _ => (None, None),
+        };
         (!commit.is_empty() && commit.chars().all(|c| c.is_ascii_hexdigit())).then(|| Self {
             pid,
             start,
             commit: commit.to_string(),
+            source,
+            scenarios,
         })
     }
 
