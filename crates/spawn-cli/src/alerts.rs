@@ -971,43 +971,7 @@ impl Monitor {
         let now = mirror["now_ms"]
             .as_i64()
             .unwrap_or_else(|| store.now_ms().unwrap_or_default());
-        for mission in mirror["missions"].as_array().into_iter().flatten() {
-            let id = mission["id"].as_i64().unwrap_or_default();
-            self.missions.insert(
-                id,
-                Mission {
-                    state: mission["state"].as_str().unwrap_or("open").to_string(),
-                    halted: mission["halted"].as_str().map(str::to_string),
-                    rejections: mission["gate_rejections"].as_i64().unwrap_or_default(),
-                    run_objective: mission["gate_rejection_objective"].as_i64(),
-                    aborts: mission["gate_aborts"].as_i64().unwrap_or_default(),
-                    escalated: mission["gate_room_escalated"].as_bool().unwrap_or(false),
-                    accept: mission["accept"].as_str().map(str::to_string),
-                    closed_event: mission["closed_event"].as_i64(),
-                    backlog: mission["backlog"].as_bool().unwrap_or(false),
-                    idle: mission["idle"]["at_ms"]
-                        .as_i64()
-                        .zip(mission["idle"]["event_id"].as_i64()),
-                    paused: mission["paused"].as_bool().unwrap_or(false),
-                },
-            );
-        }
-        for task in mirror["tasks"].as_array().into_iter().flatten() {
-            let id = task["id"].as_i64().unwrap_or_default();
-            self.tasks.insert(
-                id,
-                Task {
-                    mission: task["mission"].as_i64().unwrap_or_default(),
-                    state: task["state"].as_str().map(str::to_string),
-                    agent: task["agent_id"].as_str().unwrap_or("").to_string(),
-                    objective: task["objective"].as_i64(),
-                    revisions: task["revisions"].as_i64().unwrap_or_default(),
-                    assigned_event: task["assigned_event"].as_i64(),
-                    assigned_at: task["assigned_at_ms"].as_i64().unwrap_or_default(),
-                    agent_free: task["agent_free"].as_bool().unwrap_or(true),
-                },
-            );
-        }
+        self.seed_mirror(&mirror);
         let rows = store.alert_rows().map_err(|error| error.to_string())?;
         for row in rows["rows"].as_array().into_iter().flatten() {
             if let Some((key, row)) = Row::from_value(row) {
@@ -1083,6 +1047,47 @@ impl Monitor {
         self.next_reading_ms = now;
         self.plan(now);
         Ok(())
+    }
+
+    /// The missions and tasks as the start's mirror read them.
+    fn seed_mirror(&mut self, mirror: &Value) {
+        for mission in mirror["missions"].as_array().into_iter().flatten() {
+            let id = mission["id"].as_i64().unwrap_or_default();
+            self.missions.insert(
+                id,
+                Mission {
+                    state: mission["state"].as_str().unwrap_or("open").to_string(),
+                    halted: mission["halted"].as_str().map(str::to_string),
+                    rejections: mission["gate_rejections"].as_i64().unwrap_or_default(),
+                    run_objective: mission["gate_rejection_objective"].as_i64(),
+                    aborts: mission["gate_aborts"].as_i64().unwrap_or_default(),
+                    escalated: mission["gate_room_escalated"].as_bool().unwrap_or(false),
+                    accept: mission["accept"].as_str().map(str::to_string),
+                    closed_event: mission["closed_event"].as_i64(),
+                    backlog: mission["backlog"].as_bool().unwrap_or(false),
+                    idle: mission["idle"]["at_ms"]
+                        .as_i64()
+                        .zip(mission["idle"]["event_id"].as_i64()),
+                    paused: mission["paused"].as_bool().unwrap_or(false),
+                },
+            );
+        }
+        for task in mirror["tasks"].as_array().into_iter().flatten() {
+            let id = task["id"].as_i64().unwrap_or_default();
+            self.tasks.insert(
+                id,
+                Task {
+                    mission: task["mission"].as_i64().unwrap_or_default(),
+                    state: task["state"].as_str().map(str::to_string),
+                    agent: task["agent_id"].as_str().unwrap_or("").to_string(),
+                    objective: task["objective"].as_i64(),
+                    revisions: task["revisions"].as_i64().unwrap_or_default(),
+                    assigned_event: task["assigned_event"].as_i64(),
+                    assigned_at: task["assigned_at_ms"].as_i64().unwrap_or_default(),
+                    agent_free: task["agent_free"].as_bool().unwrap_or(true),
+                },
+            );
+        }
     }
 
     /// One control record the step has not seen: fold it into what the step
