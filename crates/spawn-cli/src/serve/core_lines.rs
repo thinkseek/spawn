@@ -1331,7 +1331,13 @@ mod tests {
         };
         let star = |scorecard: &Value| {
             let values = performance(scorecard, &Value::Null);
-            let line = &lines(&json!({}), &values, &Observed::default(), Vec::new())[0];
+            let line = &lines(
+                &json!({}),
+                &values,
+                &Observed::default(),
+                Value::Null,
+                Vec::new(),
+            )[0];
             figure_json(&line.north_star, None)
         };
         let waiting = star(&card(false, json!(1_700_000_000_000_i64)));
