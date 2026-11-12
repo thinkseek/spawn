@@ -65,6 +65,7 @@ impl Reading {
     }
 
     /// A reading already done: `values`.
+    #[cfg(test)]
     pub(crate) fn done(values: Values) -> Self {
         let (send, answer) = std::sync::mpsc::channel();
         let _ = send.send(values);
