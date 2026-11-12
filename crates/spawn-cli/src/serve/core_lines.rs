@@ -25,8 +25,13 @@
 //! without a value.
 //!
 //! The storage figures are health.storage's on `/api/fleet`, read the same
-//! way ([`super::storage::report`]). The other lines' north stars are not
-//! collected yet; later objectives add their figures to this frame.
+//! way ([`super::storage::report`]). The observability line's guardrails
+//! (objective 088) are the share of the 7-day cost window's tokens no price
+//! covers (`/api/cost?window=7d`'s total: unpriced_tokens over its input,
+//! output, cache write and cache read tokens; null with none), health's
+//! `human_per_agent_hour` on `/api/fleet`, and how many figures of this
+//! same answer have no value, itself left out. The other lines' north stars
+//! are not collected yet; later objectives add their figures to this frame.
 //!
 //! No range lives in code: they come only from the ranges file,
 //! `SPAWN_CORE_LINES_FILE`, by default `<workspace root>/core-lines.json`,
@@ -183,9 +188,35 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
     })
 }
 
+/// What the observability line reads besides the answer itself: the 7-day
+/// cost window's `total` and health's `human_per_agent_hour`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct Observed {
+    pub(super) cost_total: Value,
+    pub(super) human_per_agent_hour: Value,
+}
+
+/// The share of `total`'s tokens (input, output, cache write and cache
+/// read) that no price covers: null with no tokens.
+pub(super) fn unpriced_share(total: &Value) -> Value {
+    let tokens = &total["tokens"];
+    let all: f64 = ["input", "output", "cache_write", "cache_read"]
+        .iter()
+        .filter_map(|count| tokens[*count].as_f64())
+        .sum();
+    match total["unpriced_tokens"].as_f64() {
+        Some(unpriced) if all > 0.0 => json!(unpriced / all),
+        _ => Value::Null,
+    }
+}
+
+/// The key of the count of figures not measured.
+const NOT_MEASURED: &str = "observability.not_measured";
+
 /// The four lines, the storage line's figures from `storage` (health.storage
-/// as [`super::storage::report`] gives it).
-pub(super) fn lines(storage: &Value) -> Vec<Line> {
+/// as [`super::storage::report`] gives it), the observability line's from
+/// `observed`.
+pub(super) fn lines(storage: &Value, observed: &Observed) -> Vec<Line> {
     let database = &storage["database"];
     let ratio = match (database["bytes"].as_f64(), database["log_bytes"].as_f64()) {
         (Some(bytes), Some(log)) if log > 0.0 => json!(bytes / log),
@@ -201,7 +232,7 @@ pub(super) fn lines(storage: &Value) -> Vec<Line> {
             .max()
             .map_or(Value::Null, |most| json!(most))
     };
-    vec![
+    let mut lines = vec![
         Line {
             name: "performance",
             north_star: Figure::not_collected(
@@ -259,7 +290,25 @@ pub(super) fn lines(storage: &Value) -> Vec<Line> {
                 "Needs you is right",
                 "share",
             ),
-            guardrails: Vec::new(),
+            guardrails: vec![
+                Figure::new(
+                    "observability.unpriced_share",
+                    "Use with no price",
+                    "share",
+                    unpriced_share(&observed.cost_total),
+                ),
+                Figure::new(
+                    "observability.interventions_per_agent_hour",
+                    "Human interventions per agent-hour",
+                    "ratio",
+                    if observed.human_per_agent_hour.is_number() {
+                        observed.human_per_agent_hour.clone()
+                    } else {
+                        Value::Null
+                    },
+                ),
+                Figure::not_collected(NOT_MEASURED, "Figures not measured", "count"),
+            ],
         },
         Line {
             name: "recoverability",
@@ -270,7 +319,26 @@ pub(super) fn lines(storage: &Value) -> Vec<Line> {
             ),
             guardrails: Vec::new(),
         },
-    ]
+    ];
+    count_not_measured(&mut lines);
+    lines
+}
+
+/// Sets the count of figures not measured: those of `lines` with no value,
+/// the count itself left out.
+fn count_not_measured(lines: &mut [Line]) {
+    let missing = lines
+        .iter()
+        .flat_map(|line| std::iter::once(&line.north_star).chain(&line.guardrails))
+        .filter(|figure| figure.key != NOT_MEASURED && figure.value.is_null())
+        .count();
+    for figure in lines
+        .iter_mut()
+        .flat_map(|line| std::iter::once(&mut line.north_star).chain(&mut line.guardrails))
+        .filter(|figure| figure.key == NOT_MEASURED)
+    {
+        figure.value = json!(missing);
+    }
 }
 
 /// The answer from the lines, the ranges file's path (null when there is
@@ -348,8 +416,15 @@ pub(super) fn core_lines_at(
     path: Option<&std::path::Path>,
 ) -> Result<Value, String> {
     let storage = super::storage::report(store, super::now_ms())?;
+    let (name, length_ms) = crate::cost::window_of(Some("7d"))?;
+    let cost = crate::cost::window(store, name, length_ms)?;
+    let health = store.fleet_health().map_err(super::err)?;
+    let observed = Observed {
+        cost_total: cost["total"].clone(),
+        human_per_agent_hour: health["human_per_agent_hour"].clone(),
+    };
     let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
-    Ok(answer(&lines(&storage), &file, read_ranges(path)))
+    Ok(answer(&lines(&storage, &observed), &file, read_ranges(path)))
 }
 
 #[cfg(test)]
