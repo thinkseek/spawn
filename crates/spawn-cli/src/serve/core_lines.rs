@@ -22,17 +22,10 @@
 //! `range` is the file's entry for the figure (`{min?, max?}`, numbers) or
 //! null; `state` is `in` when the value lies within it (bounds included),
 //! `out` when it does not, `no_range` without a range and `not_collected`
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
 //! without a value. A figure still measuring its window carries
 //! `measuring_since_ms`, when its measure starts (only
 //! `performance.report_to_live`, below). `trend` (objective 090) is the
 //! figure's last 7 days:
-=======
-//! without a value. The performance north star carries
-//! `measuring_since_ms` while the live record does not cover the
-//! Scorecard's 7 days (objective 095): it then has no value, and the field
-//! is where the measuring began. `trend` (objective 090) is the figure's last 7 days:
->>>>>>> 4e9fca0d54f031d4f909771c9f85ab3dc0292d64
 //! one `{day, value}` for each UTC day (today and the 6 before) that has a
 //! `host.core_lines` sample carrying the figure, that day's last such
 //! sample, oldest first; empty without one. The loop records those samples
@@ -94,15 +87,9 @@ pub(super) struct Figure {
     pub(super) name: &'static str,
     pub(super) unit: &'static str,
     pub(super) value: Value,
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
     /// When a figure still measuring its window started measuring (null
     /// otherwise): said as `measuring_since_ms`.
     pub(super) measuring_since_ms: Value,
-=======
-    /// While the figure's window is not covered by its record (objective
-    /// 095): where its measuring began; the value is then null.
-    pub(super) measuring_since_ms: Option<i64>,
->>>>>>> 4e9fca0d54f031d4f909771c9f85ab3dc0292d64
 }
 
 impl Figure {
@@ -112,11 +99,7 @@ impl Figure {
             name,
             unit,
             value,
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
             measuring_since_ms: Value::Null,
-=======
-            measuring_since_ms: None,
->>>>>>> 4e9fca0d54f031d4f909771c9f85ab3dc0292d64
         }
     }
 
@@ -281,11 +264,7 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
         (Some(value), Some(range)) if range.holds(value) => "in",
         (Some(_), Some(_)) => "out",
     };
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
     let mut answer = json!({
-=======
-    let mut view = json!({
->>>>>>> 4e9fca0d54f031d4f909771c9f85ab3dc0292d64
         "key": figure.key,
         "name": figure.name,
         "unit": figure.unit,
@@ -293,17 +272,10 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
         "range": range.map_or(Value::Null, Range::json),
         "state": state,
     });
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
     if !figure.measuring_since_ms.is_null() {
         answer["measuring_since_ms"] = figure.measuring_since_ms.clone();
     }
     answer
-=======
-    if let Some(since) = figure.measuring_since_ms {
-        view["measuring_since_ms"] = json!(since);
-    }
-    view
->>>>>>> 4e9fca0d54f031d4f909771c9f85ab3dc0292d64
 }
 
 /// The nightly's fact files under `<workspace root>/nightly`, as
@@ -407,9 +379,9 @@ static PERFORMANCE: std::sync::Mutex<Option<(i64, Value, Value)>> = std::sync::M
 /// 0), `first_pass` value, and the cost window's `usd_per_landing`. A value
 /// the page does not have is null. While the 7 days are not covered by the
 /// live record (`report_to_live`'s `covered` false, objective 095), report
-/// to live has no value and `report_to_live_since` is its
-/// `measured_from_ms`: the figure would measure the record's start, not the
-/// wait.
+/// to live has no value and `measuring_since_ms` is its `measured_from_ms`:
+/// the figure would measure the record's start, not the wait. [`measured`]
+/// holds it back by the same rule from the record's start alone.
 pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
     let fleet = scorecard["scopes"]
         .as_array()
@@ -432,7 +404,7 @@ pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
     });
     if live["covered"] == false {
         values["report_to_live"] = Value::Null;
-        values["report_to_live_since"] = live["measured_from_ms"].clone();
+        values["measuring_since_ms"] = live["measured_from_ms"].clone();
     }
     values
 }
@@ -504,19 +476,7 @@ fn performance_line(performance: &Value) -> Line {
     report_to_live.measuring_since_ms = performance["measuring_since_ms"].clone();
     Line {
         name: "performance",
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
         north_star: report_to_live,
-=======
-        north_star: Figure {
-            measuring_since_ms: performance["report_to_live_since"].as_i64(),
-            ..Figure::new(
-                "performance.report_to_live",
-                "Time from report to live",
-                "ms",
-                performance["report_to_live"].clone(),
-            )
-        },
->>>>>>> 4e9fca0d54f031d4f909771c9f85ab3dc0292d64
         guardrails: vec![
             Figure::new(
                 "performance.gate_time",
