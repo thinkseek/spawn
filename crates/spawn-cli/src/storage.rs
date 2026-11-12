@@ -41,9 +41,9 @@ pub(crate) struct Sizes {
     pub(crate) files: u64,
 }
 
-/// The regular files under `path`, leaving out the directories named in
-/// `skip` (full paths) and everything under them. A missing `path` is
-/// empty; a directory that cannot be read is skipped.
+/// The regular files under `path`, leaving out the directories and files
+/// named in `skip` (full paths) and everything under those directories. A
+/// missing `path` is empty; a directory that cannot be read is skipped.
 pub(crate) fn walk(path: &Path, skip: &[PathBuf]) -> Sizes {
     let mut sizes = Sizes::default();
     let mut pending = vec![path.to_path_buf()];
