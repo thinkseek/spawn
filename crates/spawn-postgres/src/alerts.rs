@@ -30,6 +30,28 @@ pub(crate) const MISSION_GATES: &str = "select coalesce(jsonb_agg(jsonb_build_ob
 /// an idle pass costs the loop one statement (objective 023).
 pub(crate) const CLOCK: &str = "select coalesce(max(id), 0), spawn_now_ms() from spawn_events";
 
+/// For a message not taken that was typed (`spawn_command_message`'s
+/// `not_taken` and `typed`): `read_since_typed`, how many transcript lines
+/// of its session the Bridge recorded after it was typed (events of source
+/// `claude`, read only from the transcript; at most 100 counted). None
+/// means Spawn has read nothing of the transcript since, so the missing
+/// marker says nothing of the agent; some means the transcript was read and
+/// holds no marker (S17). An object to `||` onto the message's row (empty
+/// for every other message), as `k` and `m` the queries below name them.
+macro_rules! read_since_typed {
+    () => {
+        r"
+        || case when (m.message ->> 'not_taken')::boolean and (m.message ->> 'typed')::boolean
+                then jsonb_build_object('read_since_typed', (
+                       select count(*) from (
+                         select 1 from spawn_events e
+                          where e.session_id = k.session_id and e.source = 'claude'
+                            and e.recorded_at_ms > (m.message ->> 'typed_at_ms')::bigint
+                          limit 100) r))
+                else '{}'::jsonb end as row"
+    };
+}
+
 /// The messages the `message_not_taken` alert reads (objective 045;
 /// `spawn_command_message`), on the database's clock: `{now_ms, max_id,
 /// messages}`, `max_id` the newest command read (or `$2`), `messages` each
@@ -41,7 +63,8 @@ pub(crate) const CLOCK: &str = "select coalesce(max(id), 0), spawn_now_ms() from
 /// 023): the commands after `$2`; the pending messages `$3` that fell due;
 /// and the open alerts' `$4` whose session recorded a `message.taken` or an
 /// `execution.ended` at or after `$5` (what clears one).
-pub(crate) const MESSAGES_SINCE: &str = r"
+pub(crate) const MESSAGES_SINCE: &str = concat!(
+    r#"
 with fresh as (select k.* from spawn_commands k where k.id > $2),
 candidates as (
   -- A session whose transcript never held a marker tracks nothing
@@ -63,14 +86,18 @@ select jsonb_build_object(
   'messages', coalesce((select jsonb_agg(x.row order by x.id) from (
       select k.id, jsonb_build_object(
                'command_id', k.id, 'agent_id', k.agent_id, 'session_id', k.session_id,
-               'action', k.action ->> 'type', 'created_at_ms', k.created_at_ms) || m.message as row
+               'action', k.action ->> 'type', 'created_at_ms', k.created_at_ms) || m.message
+"#,
+    read_since_typed!(),
+    r#"
         from candidates k
         cross join lateral (
           select spawn_command_message(k.id, k.session_id, k.action, k.state, k.succeeded,
                                        k.created_at_ms, k.finished_at_ms, $1,
                                        (select spawn_messages_marked_from()),
                                        spawn_now_ms()) as message) m
-       where m.message is not null) x), '[]'::jsonb))";
+       where m.message is not null) x), '[]'::jsonb))"#
+);
 
 /// [`MESSAGES_SINCE`] as the step's start reads them: every command that
 /// can be a message not taken (each live session's commands from its
@@ -78,7 +105,8 @@ select jsonb_build_object(
 /// it, one before it was typed into an execution that ended or failed; and
 /// every unfinished command), with those of `$2` (the open alerts'), and the
 /// newest command id.
-pub(crate) const MESSAGES_ALL: &str = r"
+pub(crate) const MESSAGES_ALL: &str = concat!(
+    r#"
 with live as (
   select l.session_id, l.from_command
     from spawn_session_state t
@@ -104,14 +132,18 @@ select jsonb_build_object(
   'messages', coalesce((select jsonb_agg(x.row order by x.id) from (
       select k.id, jsonb_build_object(
                'command_id', k.id, 'agent_id', k.agent_id, 'session_id', k.session_id,
-               'action', k.action ->> 'type', 'created_at_ms', k.created_at_ms) || m.message as row
+               'action', k.action ->> 'type', 'created_at_ms', k.created_at_ms) || m.message
+"#,
+    read_since_typed!(),
+    r#"
         from candidates k
         cross join lateral (
           select spawn_command_message(k.id, k.session_id, k.action, k.state, k.succeeded,
                                        k.created_at_ms, k.finished_at_ms, $1,
                                        (select spawn_messages_marked_from()),
                                        spawn_now_ms()) as message) m
-       where m.message is not null) x), '[]'::jsonb))";
+       where m.message is not null) x), '[]'::jsonb))"#
+);
 
 /// The database's clock alone, the one every bound is measured by.
 pub(crate) const NOW: &str = "select spawn_now_ms()";
