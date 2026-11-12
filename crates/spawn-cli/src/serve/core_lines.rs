@@ -22,7 +22,10 @@
 //! `range` is the file's entry for the figure (`{min?, max?}`, numbers) or
 //! null; `state` is `in` when the value lies within it (bounds included),
 //! `out` when it does not, `no_range` without a range and `not_collected`
-//! without a value. `trend` (objective 090) is the figure's last 7 days:
+//! without a value. The performance north star carries
+//! `measuring_since_ms` while the live record does not cover the
+//! Scorecard's 7 days (objective 095): it then has no value, and the field
+//! is where the measuring began. `trend` (objective 090) is the figure's last 7 days:
 //! one `{day, value}` for each UTC day (today and the 6 before) that has a
 //! `host.core_lines` sample carrying the figure, that day's last such
 //! sample, oldest first; empty without one. The loop records those samples
@@ -76,6 +79,9 @@ pub(super) struct Figure {
     pub(super) name: &'static str,
     pub(super) unit: &'static str,
     pub(super) value: Value,
+    /// While the figure's window is not covered by its record (objective
+    /// 095): where its measuring began; the value is then null.
+    pub(super) measuring_since_ms: Option<i64>,
 }
 
 impl Figure {
@@ -85,6 +91,7 @@ impl Figure {
             name,
             unit,
             value,
+            measuring_since_ms: None,
         }
     }
 
@@ -249,14 +256,18 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
         (Some(value), Some(range)) if range.holds(value) => "in",
         (Some(_), Some(_)) => "out",
     };
-    json!({
+    let mut view = json!({
         "key": figure.key,
         "name": figure.name,
         "unit": figure.unit,
         "value": figure.value,
         "range": range.map_or(Value::Null, Range::json),
         "state": state,
-    })
+    });
+    if let Some(since) = figure.measuring_since_ms {
+        view["measuring_since_ms"] = json!(since);
+    }
+    view
 }
 
 /// The nightly's fact files under `<workspace root>/nightly`, as
@@ -358,7 +369,11 @@ static PERFORMANCE: std::sync::Mutex<Option<(i64, Value, Value)>> = std::sync::M
 /// scope's `report_to_live` value, `gate_time` value (the median),
 /// `gate_time`'s `undecided_ms` over its `total_ms` (null when the total is
 /// 0), `first_pass` value, and the cost window's `usd_per_landing`. A value
-/// the page does not have is null.
+/// the page does not have is null. While the 7 days are not covered by the
+/// live record (`report_to_live`'s `covered` false, objective 095), report
+/// to live has no value and `report_to_live_since` is its
+/// `measured_from_ms`: the figure would measure the record's start, not the
+/// wait.
 pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
     let fleet = scorecard["scopes"]
         .as_array()
@@ -371,13 +386,19 @@ pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
         (Some(undecided), Some(total)) if total > 0.0 => json!(undecided / total),
         _ => Value::Null,
     };
-    json!({
-        "report_to_live": fleet["report_to_live"]["value"],
+    let live = &fleet["report_to_live"];
+    let mut values = json!({
+        "report_to_live": live["value"],
         "gate_time": gate["value"],
         "decided_nothing": decided_nothing,
         "first_pass": fleet["first_pass"]["value"],
         "usd_per_landing": cost["usd_per_landing"],
-    })
+    });
+    if live["covered"] == false {
+        values["report_to_live"] = Value::Null;
+        values["report_to_live_since"] = live["measured_from_ms"].clone();
+    }
+    values
 }
 
 /// The performance values and the 7-day cost window's `total`, kept for
@@ -414,12 +435,15 @@ fn performance_now(store: &spawn_postgres::PostgresStore, now_ms: i64) -> (Value
 fn performance_line(performance: &Value) -> Line {
     Line {
         name: "performance",
-        north_star: Figure::new(
-            "performance.report_to_live",
-            "Time from report to live",
-            "ms",
-            performance["report_to_live"].clone(),
-        ),
+        north_star: Figure {
+            measuring_since_ms: performance["report_to_live_since"].as_i64(),
+            ..Figure::new(
+                "performance.report_to_live",
+                "Time from report to live",
+                "ms",
+                performance["report_to_live"].clone(),
+            )
+        },
         guardrails: vec![
             Figure::new(
                 "performance.gate_time",
@@ -1000,6 +1024,37 @@ mod tests {
         );
         // Neither answer read: every value null.
         assert_eq!(performance(&Value::Null, &Value::Null), none);
+    }
+
+    /// Objective 095: the north star while the Scorecard's 7 days are not
+    /// covered by the live record has no value and says where the measuring
+    /// began; once covered it is the Scorecard's value, with no such field.
+    #[test]
+    fn the_performance_north_star_measures_since_the_record_until_covered() {
+        let card = |covered: bool, from: Value| {
+            json!({"scopes": [{"scope": "fleet", "dimensions": {
+                "report_to_live": {"value": 3_600_000, "n": 3, "covered": covered,
+                                   "measured_from_ms": from},
+                "gate_time": {"value": null}, "first_pass": {"value": null}}}]})
+        };
+        let star = |scorecard: &Value| {
+            let values = performance(scorecard, &Value::Null);
+            let line = &lines(&json!({}), &values, &Observed::default(), Vec::new())[0];
+            figure_json(&line.north_star, None)
+        };
+        let waiting = star(&card(false, json!(1_700_000_000_000_i64)));
+        assert_eq!(waiting["key"], "performance.report_to_live");
+        assert_eq!(waiting["value"], Value::Null);
+        assert_eq!(waiting["state"], "not_collected");
+        assert_eq!(waiting["measuring_since_ms"], json!(1_700_000_000_000_i64));
+        let covered = star(&card(true, json!(1_700_000_000_000_i64)));
+        assert_eq!(covered["value"], json!(3_600_000));
+        assert_eq!(covered["state"], "no_range");
+        assert_eq!(covered.get("measuring_since_ms"), None, "{covered}");
+        // With no deploy record: nothing measured, nothing to say since when.
+        let never = star(&card(false, Value::Null));
+        assert_eq!(never["value"], Value::Null);
+        assert_eq!(never.get("measuring_since_ms"), None, "{never}");
     }
 
     fn values(figures: &[Figure]) -> Vec<(&'static str, Value)> {
