@@ -19,7 +19,9 @@ use crate::PostgresStore;
 /// total` line names (scripts/stage.sh, scripts/rsi/gate.sh). A
 /// `legacy.imported` row (from before the control stream) lends its own
 /// fields, plus its `state` and times. Records of no measure (reports,
-/// residents, halts, host facts) are left out. `owner_runs_from_ms` is the
+/// residents' and halts' records, host facts) are left out; a report is
+/// kept as its time (`task.reported`, where a landing's wait for live
+/// starts) and a deploy as its `ok` (`deploy.finished`, objective 081). `owner_runs_from_ms` is the
 /// time of the earliest owner judging (`source.moved`,
 /// `source.push_refused`) that names its gate's wall clock, read over the
 /// whole log, not up to `$1`; null when none does.
@@ -44,6 +46,7 @@ select jsonb_build_object(
              'brief', to_jsonb(md5(coalesce(x.r ->> 'brief', x.r -> 'row' ->> 'brief'))),
              'verdict', x.r -> 'verdict',
              'accepted', x.r -> 'accepted',
+             'ok', x.r -> 'ok',
              'by', x.r -> 'by',
              'gate', coalesce(x.r -> 'gate', x.r -> 'row' -> 'gate'),
              'accept', coalesce(x.r -> 'accept', x.r -> 'row' -> 'accept'),
@@ -74,7 +77,8 @@ select jsonb_build_object(
                               'task.assigned', 'task.delivered', 'task.gated', 'task.landed',
                               'task.reviewed', 'task.cancelled', 'task.aborted',
                               'task.over_budget', 'legacy.imported',
-                              'source.moved', 'source.push_refused')),
+                              'source.moved', 'source.push_refused',
+                              'task.reported', 'deploy.finished')),
   'commands', (
     select coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
              'id', c.id,

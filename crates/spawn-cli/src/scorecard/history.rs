@@ -178,6 +178,9 @@ pub(crate) struct Record {
     pub(crate) verdict: Value,
     #[serde(default)]
     pub(crate) accepted: Value,
+    /// A deploy's `ok` (`deploy.finished`).
+    #[serde(default)]
+    pub(crate) ok: Value,
     #[serde(default)]
     pub(crate) by: Value,
     #[serde(default)]
