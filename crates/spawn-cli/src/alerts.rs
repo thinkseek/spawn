@@ -232,7 +232,12 @@
 //!   (objective 045): a message (what the Bridge types for a command, with
 //!   its marker) that no `message.taken` names `SPAWN_MESSAGE_TAKEN_SECS`
 //!   (default 120) after it was recorded (`spawn_command_message`): typed
-//!   and never taken, or never typed. A command an older Spawn typed carries
+//!   and never taken, or never typed. A typed one's evidence says how many
+//!   transcript lines the Bridge recorded since the typing
+//!   (`read_since_typed`, at most 100 counted, S17): with none, its text
+//!   says Spawn has read nothing of the transcript since and cannot tell
+//!   whether the agent took it, rather than that it did not. A command an
+//!   older Spawn typed carries
 //!   no marker (no `message.typed`) and is never one, nor is one sent while
 //!   its session's transcript had held no marker yet. Once per message;
 //!   clears when it is taken, or when its session ends with it untaken (the
@@ -2218,6 +2223,10 @@ times in a row)",
             let agent = message["agent_id"].as_str().unwrap_or_default();
             let action = message["action"].as_str().unwrap_or("input");
             let secs = self.settings.message_taken_ms / 1000;
+            // The Bridge's own record (S17): the transcript lines it read
+            // after the typing. None read: Spawn cannot tell whether the
+            // agent took it, so the alert says that and not that it did not.
+            let read = message["read_since_typed"].as_i64();
             out.push(Event::Fire {
                 key,
                 kind: "message_not_taken",
@@ -2230,11 +2239,26 @@ times in a row)",
                     "action": action, "typed": typed,
                     "recorded_at_ms": message["created_at_ms"],
                     "bound_ms": self.settings.message_taken_ms,
+                    "read_since_typed": read,
                 }),
-                text: if typed {
+                text: if typed && read == Some(0) {
                     format!(
-                        "{agent} has not taken message #{id} (its {action}): typed, and no \
-                         transcript line holds its marker {secs} s after it was sent"
+                        "message #{id} to {agent} (its {action}) was typed, and {secs} s after \
+                         it was sent Spawn has read no line of {agent}'s transcript since the \
+                         typing: whether {agent} took it is unknown. Either Spawn is not reading \
+                         that transcript (the Bridge follows it), or the engine has written \
+                         nothing since"
+                    )
+                } else if typed {
+                    format!(
+                        "{agent} has not taken message #{id} (its {action}): typed, and the \
+                         transcript lines Spawn has read since ({}) hold no marker of it {secs} s \
+                         after it was sent",
+                        match read {
+                            Some(100) => "100 or more".to_string(),
+                            Some(lines) => lines.to_string(),
+                            None => "a number not read".to_string(),
+                        }
                     )
                 } else {
                     format!(
@@ -8162,6 +8186,65 @@ connections\n";
             });
         }
 
+        /// S17: a typed message's alert says what the Bridge recorded of the
+        /// transcript since the typing. `deaf` has a transcript line read
+        /// after it (a turn's end): the agent has not taken it, and the text
+        /// says so with the count. `silent`, typed after that line, has none
+        /// read since: the text says whether the agent took it is unknown,
+        /// and why (Spawn not reading the transcript, or nothing written).
+        #[test]
+        fn a_typed_message_not_taken_says_whether_spawn_read_the_transcript_since() {
+            in_schema("messages_read_since", |store| {
+                let world = messages_world(store);
+                let deaf = world.deaf;
+                // Recorded after the typing, at a later millisecond.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                turn_ended(store, "msg", MSG_EXECUTION, "t-after-deaf");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let silent = input(store, "msg", "silent", "same text");
+                typed(store, "msg", MSG_EXECUTION, silent, true);
+                let mut monitor = prompt_monitor();
+                let fired = read(&mut monitor, store);
+                let alert = |id: CommandId| {
+                    fired
+                        .iter()
+                        .find_map(|event| match event {
+                            Event::Fire {
+                                key,
+                                evidence,
+                                text,
+                                ..
+                            } if *key == format!("message_not_taken:{}", id.0) => {
+                                Some((evidence.clone(), text.clone()))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("an alert for {}: {fired:?}", id.0))
+                };
+                let (heard, heard_text) = alert(deaf);
+                assert_eq!(heard["read_since_typed"], 1);
+                assert!(
+                    heard_text.starts_with(&format!(
+                        "agent_msg has not taken message #{} (its input): typed, and the \
+                         transcript lines Spawn has read since (1) hold no marker of it",
+                        deaf.0
+                    )),
+                    "{heard_text}"
+                );
+                let (unread, unread_text) = alert(silent);
+                assert_eq!(unread["read_since_typed"], 0);
+                assert!(
+                    unread_text.contains(
+                        "Spawn has read no line of agent_msg's transcript since the typing: \
+                         whether agent_msg took it is unknown. Either Spawn is not reading that \
+                         transcript (the Bridge follows it), or the engine has written nothing since"
+                    ),
+                    "{unread_text}"
+                );
+                assert!(!unread_text.contains("has not taken"), "{unread_text}");
+            });
+        }
+
         /// The alert fires for the two not taken (whether typed in its
         /// evidence), once; the one taken later clears, and the session's
         /// end clears the other; a fresh step then fires nothing.
@@ -8200,7 +8283,12 @@ connections\n";
                 assert_eq!(deaf_evidence["command"], json!(deaf.0));
                 assert_eq!(deaf_evidence["agent_id"], "agent_msg");
                 assert_eq!(deaf_evidence["typed"], true);
+                assert_eq!(
+                    deaf_evidence["read_since_typed"], 0,
+                    "no transcript line recorded since it was typed"
+                );
                 assert_eq!(evidence(untyped).1["typed"], false);
+                assert_eq!(evidence(untyped).1["read_since_typed"], Value::Null);
                 commit(&mut monitor, &fired);
                 assert!(read(&mut monitor, store).is_empty(), "once");
 
