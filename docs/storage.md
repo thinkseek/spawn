@@ -713,7 +713,10 @@ uses the disk:
   the regular files, apparent sizes summed, under `<root>/.transcripts` and
   under Claude Code's projects directory as the Bridge resolves it
   (`SPAWN_CLAUDE_PROJECTS`, else `$CLAUDE_CONFIG_DIR/projects`, else
-  `$HOME/.claude/projects`). A symbolic link is not followed; a directory
+  `$HOME/.claude/projects`), and `database_bytes`, the live database's
+  size (`pg_database_size`, as `health.storage.database` reads it;
+  objective 085), left out of a sample whose database size cannot be read.
+  A symbolic link is not followed; a directory
   that cannot be read is skipped. A sample that could not be written is
   tried again a minute later, and never fails a pass. The control fold
   takes the record into no table; the samples are read from the log
