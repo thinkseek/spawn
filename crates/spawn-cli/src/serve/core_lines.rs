@@ -547,13 +547,10 @@ pub(super) fn core_lines_at(
 
 #[cfg(test)]
 mod tests {
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
-    use super::{Figure, answer, figure_json, lines, parse_ranges, performance, read_ranges};
-=======
     use super::{
-        Figure, Observed, answer, figure_json, lines, parse_ranges, read_ranges, unpriced_share,
+        Figure, Observed, answer, figure_json, lines, parse_ranges, performance, read_ranges,
+        unpriced_share,
     };
->>>>>>> 0c9ab77233354544a58812b663d20217c80ce798
     use serde_json::{Value, json};
 
     const KNOWN: [&str; 3] = ["a.one", "a.two", "a.three"];
@@ -658,11 +655,7 @@ mod tests {
             ],
         });
         let view = answer(
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
-            &lines(&storage, &Value::Null),
-=======
-            &lines(&storage, &Observed::default()),
->>>>>>> 0c9ab77233354544a58812b663d20217c80ce798
+            &lines(&storage, &Value::Null, &Observed::default()),
             &json!("/ws/core-lines.json"),
             Ok(None),
         );
@@ -700,8 +693,8 @@ mod tests {
         // No log size: no ratio; no readable test database: none.
         let bare = lines(
             &json!({"database": {"bytes": 300, "log_bytes": 0}, "test_databases": []}),
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
             &Value::Null,
+            &Observed::default(),
         );
         assert_eq!(bare[1].guardrails[2].value, Value::Null);
         assert_eq!(bare[1].guardrails[3].value, Value::Null);
@@ -711,26 +704,15 @@ mod tests {
             view["lines"][0]["guardrails"].as_array().map(Vec::len),
             Some(4)
         );
-        // The other north stars are not collected, with no guardrails.
-        for index in [2, 3] {
-=======
-            &Observed::default(),
-        );
-        assert_eq!(bare[1].guardrails[2].value, Value::Null);
-        assert_eq!(bare[1].guardrails[3].value, Value::Null);
         // The other north stars are not collected.
-        for index in [0, 2, 3] {
->>>>>>> 0c9ab77233354544a58812b663d20217c80ce798
+        for index in [2, 3] {
             assert_eq!(view["lines"][index]["north_star"]["state"], "not_collected");
         }
-        for index in [0, 3] {
-            assert_eq!(view["lines"][index]["guardrails"], json!([]));
-        }
+        assert_eq!(view["lines"][3]["guardrails"], json!([]));
         assert_eq!(view["ranges_error"], Value::Null);
         assert_eq!(view["ignored_ranges"], json!([]));
     }
 
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
     /// Objective 086: the performance line from a scorecard and a cost
     /// answer, as the pages give them.
     #[test]
@@ -752,7 +734,7 @@ mod tests {
         assert!((share - 300_000.0 / 5_100_000.0).abs() < 1e-12, "{share}");
         assert_eq!(values["first_pass"], json!(0.749));
         assert_eq!(values["usd_per_landing"], json!(8.08));
-        let line = &lines(&json!({}), &values)[0];
+        let line = &lines(&json!({}), &values, &Observed::default())[0];
         let keys: Vec<&str> = std::iter::once(&line.north_star)
             .chain(&line.guardrails)
             .map(|figure| figure.key)
@@ -780,7 +762,7 @@ mod tests {
             json!({"report_to_live": null, "gate_time": null, "decided_nothing": null,
                    "first_pass": null, "usd_per_landing": null})
         );
-        let line = &lines(&json!({}), &none)[0];
+        let line = &lines(&json!({}), &none, &Observed::default())[0];
         assert!(
             std::iter::once(&line.north_star)
                 .chain(&line.guardrails)
@@ -788,7 +770,8 @@ mod tests {
         );
         // Neither answer read: every value null.
         assert_eq!(performance(&Value::Null, &Value::Null), none);
-=======
+    }
+
     /// Objective 088: the observability line's guardrails.
     #[test]
     fn the_observability_line_gives_unpriced_use_interventions_and_the_count_not_measured() {
@@ -813,7 +796,7 @@ mod tests {
             cost_total: tokens(400_000, 0, 100_000),
             human_per_agent_hour: json!(0.125),
         };
-        let all = lines(&storage, &observed);
+        let all = lines(&storage, &Value::Null, &observed);
         let observability = &all[2];
         assert_eq!(
             observability.north_star.key,
@@ -825,7 +808,8 @@ mod tests {
             .iter()
             .map(|figure| (figure.key, figure.unit, figure.value.clone()))
             .collect();
-        // Not measured: the three other north stars, every storage figure
+        // Not measured: the five performance figures (none read) and the
+        // two other north stars not collected, every storage figure
         // measured, itself left out though it starts with no value.
         assert_eq!(
             guardrails,
@@ -836,14 +820,14 @@ mod tests {
                     "ratio",
                     json!(0.125)
                 ),
-                ("observability.not_measured", "count", json!(3)),
+                ("observability.not_measured", "count", json!(7)),
             ]
         );
         // Nothing read: the two guardrails count too.
-        let bare = lines(&storage, &Observed::default());
+        let bare = lines(&storage, &Value::Null, &Observed::default());
         assert_eq!(bare[2].guardrails[0].value, Value::Null);
         assert_eq!(bare[2].guardrails[1].value, Value::Null);
-        assert_eq!(bare[2].guardrails[2].value, json!(5));
+        assert_eq!(bare[2].guardrails[2].value, json!(9));
         // Its range and state as for every figure.
         let view = answer(
             &all,
@@ -862,6 +846,5 @@ mod tests {
             .map(|figure| figure["state"].as_str().expect("a state"))
             .collect();
         assert_eq!(states, ["out", "out", "out"]);
->>>>>>> 0c9ab77233354544a58812b663d20217c80ce798
     }
 }
