@@ -3340,7 +3340,7 @@ mod tests {
             .map(|text| (text, Some(5)))
             .collect();
             let mut warnings = Vec::new();
-            let notes = super::attention::owner_notes(store, &lines, &mut warnings);
+            let notes = super::attention::owner_notes(store, &lines, 2, &mut warnings);
             assert!(warnings.is_empty(), "{warnings:?}");
             let shape = |index: usize| json!({"tasks": notes[index]["tasks"], "settled": notes[index]["settled"]});
             assert_eq!(
@@ -3361,6 +3361,8 @@ mod tests {
             assert_eq!(shape(3), json!({"tasks": [], "settled": false}));
             assert_eq!(notes[0]["text"], json!(lines[0].0));
             assert_eq!(notes[0]["at_ms"], json!(5));
+            let current: Vec<&Value> = (0..4).map(|index| &notes[index]["current"]).collect();
+            assert_eq!(current, [&json!(true), &json!(true), &json!(false), &json!(false)]);
         });
     }
 
