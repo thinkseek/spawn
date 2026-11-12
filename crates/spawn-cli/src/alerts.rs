@@ -4712,9 +4712,8 @@ mod tests {
     /// usage and what it refuses before reaching the store.
     #[test]
     fn the_judge_verb_takes_a_key_and_one_of_three_verdicts() {
-        let words = |list: &[&str]| -> Vec<String> {
-            list.iter().map(ToString::to_string).collect()
-        };
+        let words =
+            |list: &[&str]| -> Vec<String> { list.iter().map(ToString::to_string).collect() };
         for verdict in super::VERDICTS {
             assert_eq!(
                 super::judge_arguments(&words(&["judge", "bb:a1", verdict])),

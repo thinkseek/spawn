@@ -964,9 +964,7 @@ mod tests {
         use super::needs_you_right;
         const DAY: i64 = 86_400_000;
         let now = 30 * DAY;
-        let row = |state: &str, cleared: Option<i64>, outcome: Option<&str>| {
-            json!({"key": "k", "state": state, "cleared_at_ms": cleared, "outcome": outcome})
-        };
+        let row = |state: &str, cleared: Option<i64>, outcome: Option<&str>| json!({"key": "k", "state": state, "cleared_at_ms": cleared, "outcome": outcome});
         // None ended: none open, none at all.
         assert_eq!(needs_you_right(&json!([]), now), Value::Null);
         assert_eq!(
@@ -1157,7 +1155,12 @@ mod tests {
             vec![json!({"day": "2026-11-12", "value": 3})],
         );
         let view = answer(
-            &lines(&json!({"free_bytes": 3}), &Value::Null, Value::Null, Vec::new()),
+            &lines(
+                &json!({"free_bytes": 3}),
+                &Value::Null,
+                Value::Null,
+                Vec::new(),
+            ),
             &Value::Null,
             Ok(None),
             &trends,

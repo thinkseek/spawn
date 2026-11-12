@@ -178,12 +178,13 @@ fn the_owner_judges_an_alert_and_every_alert_ends_with_an_outcome() {
         ("memory_low:9", "false", "a key no alert has"),
         ("task_state:7:10", "stale", "a notice"),
         ("memory_low:2", "stale", "an alert judged already"),
-        ("memory_low:1", "false", "an alert judged already, the same verdict"),
+        (
+            "memory_low:1",
+            "false",
+            "an alert judged already, the same verdict",
+        ),
     ] {
-        assert!(
-            store.alert_judge(key, verdict).is_err(),
-            "{why} is refused"
-        );
+        assert!(store.alert_judge(key, verdict).is_err(), "{why} is refused");
     }
     assert!(
         store
@@ -192,7 +193,11 @@ fn the_owner_judges_an_alert_and_every_alert_ends_with_an_outcome() {
             .is_err(),
         "a judgement with another field is refused"
     );
-    assert_eq!(written(&mut client), 2, "the refused judgements wrote nothing");
+    assert_eq!(
+        written(&mut client),
+        2,
+        "the refused judgements wrote nothing"
+    );
     assert_eq!(alert(&mut client, "memory_low:3")["state"], "open");
     assert!(
         store.alert_record(&cleared("memory_low:2")).is_err(),
