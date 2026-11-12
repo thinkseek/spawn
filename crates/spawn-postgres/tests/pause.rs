@@ -221,6 +221,7 @@ fn the_fold_of_a_pause_replays_and_the_window_counts_its_time() {
     let mission = objective_mission(&store, "rsi");
     let pause = store.mission_pause(mission, Some("hold")).expect("paused");
     let before = mission_row(&mut client, mission);
+    assert_eq!(before["pause_event"], pause);
     client
         .batch_execute("select spawn_control_refold()")
         .expect("refold");
@@ -250,5 +251,4 @@ fn the_fold_of_a_pause_replays_and_the_window_counts_its_time() {
         .clone();
     assert_eq!(row["pauses"][0][0], paused_at);
     assert!(row["pauses"][0][1].as_i64().expect("unpaused at") >= paused_at);
-    let _ = pause;
 }
