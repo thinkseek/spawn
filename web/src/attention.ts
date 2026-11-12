@@ -71,6 +71,9 @@ export interface OwnerNote {
   /** Its ask is a review, accept or merge of tasks that have all ended:
    * nothing is left to do, and Home's card leaves it out. */
   settled: boolean;
+  /** Of the supervisor's newest For-the-owner block (objective 078); an
+   * older server that does not say counts every line as current. */
+  current: boolean;
 }
 
 export interface SupervisorView extends Labels {
@@ -244,7 +247,7 @@ function normalizeNotes(value: unknown): OwnerNote[] {
       const id = task ? optionalNumber(task.id) : null;
       return task && id !== null ? [{ id, state: optionalText(task.state) ?? "unknown" }] : [];
     });
-    return [{ text: note, at_ms: optionalNumber(raw.at_ms), tasks, settled: raw.settled === true }];
+    return [{ text: note, at_ms: optionalNumber(raw.at_ms), tasks, settled: raw.settled === true, current: raw.current !== false }];
   });
 }
 
