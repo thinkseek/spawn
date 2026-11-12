@@ -3,7 +3,8 @@
 # red (once alerted, the same red again silent), flaky (clears), a host
 # fault on main (red), a gate with no room (skipped, the alert kept), a busy
 # host (skipped, no gate run), a second run of the same source (does
-# nothing), the host slots it holds, and what its gate is given (main
+# nothing), a read-only controller (its copies removed all the same), the
+# host slots it holds, and what its gate is given (main
 # against itself, the one scenario as a check, the integrator's gate
 # environment and not the owner's database).
 #
@@ -52,6 +53,8 @@ db="nightly_test_$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 made=""
 cleanup() {
   [ -z "$made" ] || sh "$here/scripts/blackbox/scenario-db.sh" drop "$db" >/dev/null 2>&1 || true
+  # A read-only tree the test made (the read-only controller case) goes too.
+  chmod -R u+w -- "$scratch" 2>/dev/null
   rm -rf "$scratch"
 }
 trap cleanup EXIT
@@ -400,6 +403,21 @@ said=$(grep -F '>"$job/runs"' "$here/scripts/rsi/gate.sh" | grep -F '$on_base2' 
   sed 's/\$run_status/1/; s/\$again/1/; s/\$on_base2/1/; s/\$on_base/1/')
 read_words=$(grep -o '\[ "$runs" = "[^"]*" \]' "$here/scripts/rsi/nightly.sh" | sed 's/^\[ "$runs" = "//; s/" \]$//')
 check "gate.sh says '$said', nightly.sh reads '$read_words'" test -n "$said" -a "$said" = "$read_words"
+
+echo "== a read-only controller, as the live ones are: the run still removes its work directory"
+# The run copies the controller's deploy/ and scripts/ for each gate (cp -a,
+# modes kept): a live controller's are read-only, and rm could not remove
+# the copies, so every night left its .run-* behind (02:57 on 11-12).
+mkdir -p "$ctl/deploy/ro"
+printf 'x\n' >"$ctl/deploy/ro/file"
+chmod -R a-w "$ctl/deploy"
+nightly
+rc=$?
+check "exit 0 ($(tail -n 1 "$scratch/out"))" [ "$rc" -eq 0 ]
+check "no cannot-remove said" bash -c '! grep -q "cannot remove" "$1"' _ "$scratch/out"
+check "its work directory is gone" bash -c '! ls -d "$1"/.run-spawn.* 2>/dev/null | grep -q .' _ "$scratch/ws/nightly"
+check "the controller itself is as it was (read-only)" bash -c '[ ! -w "$1/deploy/ro" ] && [ -f "$1/deploy/ro/file" ]' _ "$ctl"
+chmod -R u+w "$ctl/deploy"
 
 echo "test-nightly: $oks ok, $fails FAIL"
 [ "$fails" -eq 0 ]
