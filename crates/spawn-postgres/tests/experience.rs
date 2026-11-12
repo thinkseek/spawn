@@ -996,17 +996,20 @@ fn intervention_rows(client: &mut Client, from: &str, since: i64, until: i64) ->
 }
 
 /// spawn_interventions as it was before it read from the window outward
-/// (d61e85eb), word for word: the oracle the view's answers are compared
-/// with.
+/// (d61e85eb), word for word but for its resume branch, widened as the
+/// view's is to a pause and its release (objective 102): the oracle the
+/// view's answers are compared with.
 const ORACLE: &str = r"
 create view spawn_interventions_oracle as
 select i.at_ms, 'command'::text as kind, null::bigint as mission_id,
        null::bigint as task_id, i.intent as command_id, null::bigint as cancelled_task_id
 from spawn_human_intents i
 union all
-select r.at_ms, 'resume', spawn_experience_int(r.record -> 'id'), null, null, null
+select r.at_ms, case r.type when 'mission.paused' then 'pause' else 'resume' end,
+       spawn_experience_int(r.record -> 'id'), null, null, null
 from spawn_experience_records r
-where r.type = 'mission.resumed' and spawn_experience_int(r.record -> 'id') is not null
+where r.type in ('mission.resumed', 'mission.paused', 'mission.unpaused')
+  and spawn_experience_int(r.record -> 'id') is not null
 union all
 select a.assigned_at_ms, 'owner_task', a.mission_id, a.task_id, null, null
 from spawn_experience_assignments a

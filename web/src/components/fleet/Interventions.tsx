@@ -15,7 +15,7 @@ const WINDOWS = [
 ] as const;
 
 const HINT =
-  "Human interventions per agent-hour: each time a person stepped in (a command, a resume, a task they assigned, a cancel and reassign), divided by the hours agents ran. A command refused and sent again is one intervention; its retries are not counted. Lower is better.";
+  "Human interventions per agent-hour: each time a person stepped in (a command, a pause, a resume, a task they assigned, a cancel and reassign), divided by the hours agents ran. A command refused and sent again is one intervention; its retries are not counted. Lower is better.";
 
 function fetchInterventions(window: string, signal: AbortSignal): Promise<InterventionsAnswer> {
   return readApi(`/api/interventions?window=${window}`, signal, (raw) => raw as InterventionsAnswer);
