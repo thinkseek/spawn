@@ -252,8 +252,8 @@ else
     expect_eq "$(rec '[.north_star.key] + [.guardrails[].key]')" \
         '["recoverability.restores_passed","recoverability.cloud_dump_age","recoverability.cloud_bundle_age","recoverability.nightly_age","recoverability.nightly_red"]' \
         "(1) the recoverability line's north star and guardrails, in order"
-    expect_eq "$(figure recoverability.restores_passed | jq -c '{value, state}')" '{"value":null,"state":"not_collected"}' \
-        "(1) the north star waits for the drills' records"
+    # The north star's value is the drills' objective's (B3): only its key is
+    # this line's, and 084 holds "not collected exactly when no value".
     # An age is read at the answer: at least seed_now less the record's
     # moment, at most the moment the answer was back less it.
     age() { # <key> <at_ms> <range> <state> <what>
@@ -289,7 +289,6 @@ test("(2) the recoverability row over the answer", () => {
   assert.deepEqual(row.guardrails.map((mark) => [mark.range, mark.tone]), [
     ["2 h or less", "plain"], ["26 h or less", "warning"], ["26 h or less", "warning"], ["0 or less", "warning"],
   ]);
-  assert.equal(row.north_star.value, "not collected yet");
 });
 TEST
 if ! BB_TREE=$tree BB_WORK=$WORK node --test "$WORK/lines.test.mjs" >"$WORK/lines.out" 2>&1; then
