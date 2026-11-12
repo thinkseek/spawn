@@ -24,25 +24,20 @@
 //! `out` when it does not, `no_range` without a range and `not_collected`
 //! without a value.
 //!
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
 //! The performance figures (objective 086) are the pages': the Scorecard's
 //! fleet scope over its default 7 days (report to live, the gate time's
 //! median, the share of gate time that decided nothing, first pass) and
 //! `/api/cost?window=7d`'s dollars per landing ([`performance`]), kept for a
 //! minute so a Home poll does not compute them again at every request. The
 //! storage figures are health.storage's on `/api/fleet`, read the same way
-//! ([`super::storage::report`]). The other lines' north stars are not
-//! collected yet; later objectives add their figures to this frame.
-=======
-//! The storage figures are health.storage's on `/api/fleet`, read the same
-//! way ([`super::storage::report`]). The observability line's guardrails
+//! ([`super::storage::report`]). The observability line's guardrails
 //! (objective 088) are the share of the 7-day cost window's tokens no price
-//! covers (`/api/cost?window=7d`'s total: unpriced_tokens over its input,
-//! output, cache write and cache read tokens; null with none), health's
-//! `human_per_agent_hour` on `/api/fleet`, and how many figures of this
-//! same answer have no value, itself left out. The other lines' north stars
-//! are not collected yet; later objectives add their figures to this frame.
->>>>>>> 0c9ab77233354544a58812b663d20217c80ce798
+//! covers (`/api/cost?window=7d`'s total, kept with the performance figures:
+//! unpriced_tokens over its input, output, cache write and cache read
+//! tokens; null with none), health's `human_per_agent_hour` on
+//! `/api/fleet`, and how many figures of this same answer have no value,
+//! itself left out. The other lines' north stars are not collected yet;
+//! later objectives add their figures to this frame.
 //!
 //! No range lives in code: they come only from the ranges file,
 //! `SPAWN_CORE_LINES_FILE`, by default `<workspace root>/core-lines.json`,
@@ -199,13 +194,13 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
     })
 }
 
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
 /// How long the performance figures are kept: a Home poll must not compute
 /// the 7-day scorecard and cost window again at every request.
 const PERFORMANCE_KEPT_MS: i64 = 60_000;
 
-/// The performance figures of the last read, and when.
-static PERFORMANCE: std::sync::Mutex<Option<(i64, Value)>> = std::sync::Mutex::new(None);
+/// The performance figures of the last read and the 7-day cost window's
+/// `total` (objective 088), and when.
+static PERFORMANCE: std::sync::Mutex<Option<(i64, Value, Value)>> = std::sync::Mutex::new(None);
 
 /// The performance line's values (objective 086), from the Scorecard's
 /// answer over its default 7 days and `/api/cost?window=7d`'s: the fleet
@@ -234,18 +229,19 @@ pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
     })
 }
 
-/// The performance values, kept for [`PERFORMANCE_KEPT_MS`]: computed from
-/// the 7-day scorecard and cost window as the pages compute them. A part
-/// that cannot be read counts as not collected.
-fn performance_now(store: &spawn_postgres::PostgresStore, now_ms: i64) -> Value {
+/// The performance values and the 7-day cost window's `total`, kept for
+/// [`PERFORMANCE_KEPT_MS`]: computed from the 7-day scorecard and cost
+/// window as the pages compute them. A part that cannot be read counts as
+/// not collected.
+fn performance_now(store: &spawn_postgres::PostgresStore, now_ms: i64) -> (Value, Value) {
     let mut kept = PERFORMANCE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((_, values)) = kept
+    if let Some((_, values, cost_total)) = kept
         .as_ref()
-        .filter(|(at, _)| (0..PERFORMANCE_KEPT_MS).contains(&now_ms.saturating_sub(*at)))
+        .filter(|(at, _, _)| (0..PERFORMANCE_KEPT_MS).contains(&now_ms.saturating_sub(*at)))
     {
-        return values.clone();
+        return (values.clone(), cost_total.clone());
     }
     let root = crate::env_value("SPAWN_WORKSPACE_ROOT");
     let scorecard = crate::scorecard::measure(
@@ -258,8 +254,9 @@ fn performance_now(store: &spawn_postgres::PostgresStore, now_ms: i64) -> Value 
         .and_then(|(name, length_ms)| crate::cost::window(store, name, length_ms))
         .unwrap_or(Value::Null);
     let values = performance(&scorecard, &cost);
-    *kept = Some((now_ms, values.clone()));
-    values
+    let cost_total = cost["total"].clone();
+    *kept = Some((now_ms, values.clone(), cost_total.clone()));
+    (values, cost_total)
 }
 
 /// The performance line ([`performance`]'s values).
@@ -301,9 +298,6 @@ fn performance_line(performance: &Value) -> Line {
     }
 }
 
-/// The storage line, from health.storage.
-fn storage_line(storage: &Value) -> Line {
-=======
 /// What the observability line reads besides the answer itself: the 7-day
 /// cost window's `total` and health's `human_per_agent_hour`.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -329,11 +323,8 @@ pub(super) fn unpriced_share(total: &Value) -> Value {
 /// The key of the count of figures not measured.
 const NOT_MEASURED: &str = "observability.not_measured";
 
-/// The four lines, the storage line's figures from `storage` (health.storage
-/// as [`super::storage::report`] gives it), the observability line's from
-/// `observed`.
-pub(super) fn lines(storage: &Value, observed: &Observed) -> Vec<Line> {
->>>>>>> 0c9ab77233354544a58812b663d20217c80ce798
+/// The storage line, from health.storage.
+fn storage_line(storage: &Value) -> Line {
     let database = &storage["database"];
     let ratio = match (database["bytes"].as_f64(), database["log_bytes"].as_f64()) {
         (Some(bytes), Some(log)) if log > 0.0 => json!(bytes / log),
@@ -349,7 +340,6 @@ pub(super) fn lines(storage: &Value, observed: &Observed) -> Vec<Line> {
             .max()
             .map_or(Value::Null, |most| json!(most))
     };
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
     Line {
         name: "storage",
         north_star: Figure::new(
@@ -395,74 +385,13 @@ pub(super) fn lines(storage: &Value, observed: &Observed) -> Vec<Line> {
 
 /// The four lines: the performance line's figures from `performance`
 /// ([`performance`]), the storage line's from `storage` (health.storage as
-/// [`super::storage::report`] gives it).
-pub(super) fn lines(storage: &Value, performance: &Value) -> Vec<Line> {
-    vec![
+/// [`super::storage::report`] gives it), the observability line's from
+/// `observed`.
+pub(super) fn lines(storage: &Value, performance: &Value, observed: &Observed) -> Vec<Line> {
+    let mut lines = vec![
         performance_line(performance),
         storage_line(storage),
-        Line {
-            name: "observability",
-            north_star: Figure::not_collected(
-                "observability.needs_you_right",
-                "Needs you is right",
-                "share",
-            ),
-            guardrails: Vec::new(),
-        },
-=======
-    let mut lines = vec![
-        Line {
-            name: "performance",
-            north_star: Figure::not_collected(
-                "performance.report_to_live",
-                "Time from report to live",
-                "ms",
-            ),
-            guardrails: Vec::new(),
-        },
-        Line {
-            name: "storage",
-            north_star: Figure::new(
-                "storage.days_left",
-                "Days until the disk is full",
-                "days",
-                storage["days_left"].clone(),
-            ),
-            guardrails: vec![
-                Figure::new(
-                    "storage.free_bytes",
-                    "Free disk",
-                    "bytes",
-                    storage["free_bytes"].clone(),
-                ),
-                Figure::new(
-                    "storage.archive_growth",
-                    "Transcript archive growth",
-                    "bytes_per_day",
-                    storage["growth_bytes_per_day"].clone(),
-                ),
-                Figure::new(
-                    "storage.database_ratio",
-                    "Database against its log",
-                    "ratio",
-                    ratio,
-                ),
-                Figure::new(
-                    "storage.test_database_bytes",
-                    "Largest test database",
-                    "bytes",
-                    largest("bytes"),
-                ),
-                Figure::new(
-                    "storage.test_database_schemas",
-                    "Most test schemas",
-                    "count",
-                    largest("schemas"),
-                ),
-            ],
-        },
         observability_line(observed),
->>>>>>> 0c9ab77233354544a58812b663d20217c80ce798
         Line {
             name: "recoverability",
             north_star: Figure::not_collected(
@@ -600,26 +529,17 @@ pub(super) fn core_lines_at(
     store: &spawn_postgres::PostgresStore,
     path: Option<&std::path::Path>,
 ) -> Result<Value, String> {
-<<<<<<< 87db307185771b52d50aac9203f76b8aa7467099
     let now_ms = super::now_ms();
     let storage = super::storage::report(store, now_ms)?;
-    let performance = performance_now(store, now_ms);
-    let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
-    Ok(answer(
-        &lines(&storage, &performance),
-=======
-    let storage = super::storage::report(store, super::now_ms())?;
-    let (name, length_ms) = crate::cost::window_of(Some("7d"))?;
-    let cost = crate::cost::window(store, name, length_ms)?;
+    let (performance, cost_total) = performance_now(store, now_ms);
     let health = store.fleet_health().map_err(super::err)?;
     let observed = Observed {
-        cost_total: cost["total"].clone(),
+        cost_total,
         human_per_agent_hour: health["human_per_agent_hour"].clone(),
     };
     let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
     Ok(answer(
-        &lines(&storage, &observed),
->>>>>>> 0c9ab77233354544a58812b663d20217c80ce798
+        &lines(&storage, &performance, &observed),
         &file,
         read_ranges(path),
     ))
