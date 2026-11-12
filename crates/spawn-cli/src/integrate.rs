@@ -2225,7 +2225,13 @@ impl Integrator {
     /// The pass's warm, after its gates were given out: started when the
     /// source's mirror has the commit. The mirror is fetched only while no
     /// gate of that source uses it; otherwise a later pass starts it.
-    fn poll_warm(&self) {
+    ///
+    /// A warm a predecessor's restart cut off ([`warm::Warms::want_lost`])
+    /// is wanted again in a pass whose steps went through (`stepped`: its
+    /// halts are applied), for its source's main as it is now, and only
+    /// while a mission on that source is not halted: a source whose
+    /// missions are all halted is warmed for no gate.
+    fn poll_warm(&self, store: &PostgresStore, stepped: bool) {
         // The judgings' landings since the last pass, in order: the last
         // one is the source's main now.
         let landed: Vec<warm::Want> = self
@@ -2245,6 +2251,27 @@ impl Integrator {
         };
         for want in landed {
             warms.want(want);
+        }
+        if let Some(source) = warms.lost_source().map(str::to_string)
+            && stepped
+        {
+            match store.gated_missions().map_err(|error| error.to_string()).and_then(|missions| {
+                serde_json::from_value::<Vec<Mission>>(missions)
+                    .map_err(|error| format!("gated missions: {error}"))
+            }) {
+                Ok(missions) => {
+                    let live = missions.iter().any(|mission| {
+                        mission.halted.is_none() && mission.source.as_deref() == Some(&source)
+                    });
+                    warms.want_lost(live, &|source: &str| {
+                        source_head(source).map(|(_, commit)| commit)
+                    });
+                }
+                Err(error) => eprintln!(
+                    "integrate: the base warm a previous integrator's restart cut off on \
+                     {source} waits: {error}"
+                ),
+            }
         }
         let root = self.judge.root.clone();
         let busy = |source: &str| {
@@ -2389,7 +2416,7 @@ impl Integrator {
         )?;
         self.stop_for(&urgent);
         let steps = self.steps(store, &pending, &owner_moved, owner_judge);
-        self.poll_warm();
+        self.poll_warm(store, steps.is_ok());
         self.poll_shadow(store);
         steps
     }
