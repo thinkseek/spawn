@@ -4708,6 +4708,42 @@ mod tests {
             .collect()
     }
 
+    /// Objective 092: `spawn alert judge <key> false|stale|duplicate`, its
+    /// usage and what it refuses before reaching the store.
+    #[test]
+    fn the_judge_verb_takes_a_key_and_one_of_three_verdicts() {
+        let words = |list: &[&str]| -> Vec<String> {
+            list.iter().map(ToString::to_string).collect()
+        };
+        for verdict in super::VERDICTS {
+            assert_eq!(
+                super::judge_arguments(&words(&["judge", "bb:a1", verdict])),
+                Ok(("bb:a1".to_string(), verdict.to_string()))
+            );
+        }
+        let usage = "usage: spawn alert judge <key> false|stale|duplicate";
+        for wrong in [
+            &[][..],
+            &["judge"][..],
+            &["judge", "bb:a1"][..],
+            &["judge", "bb:a1", "false", "more"][..],
+            &["clear", "bb:a1", "false"][..],
+        ] {
+            assert_eq!(
+                super::judge_arguments(&words(wrong)),
+                Err(usage.to_string()),
+                "{wrong:?}"
+            );
+        }
+        let refused = super::judge_arguments(&words(&["judge", "bb:a1", "wrong"]))
+            .expect_err("another verdict");
+        assert!(
+            refused.contains("not a verdict") && refused.ends_with(usage),
+            "{refused}"
+        );
+        assert!(super::judge_arguments(&words(&["judge", " ", "false"])).is_err());
+    }
+
     #[test]
     fn a_task_records_each_state_change_once_with_from_and_to() {
         let mut monitor = monitor();
