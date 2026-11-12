@@ -732,10 +732,21 @@ uses the disk:
     as a fall;
   - `workspaces {path, bytes}`: the regular files under the root outside
     `.transcripts` and `.transcripts-progress`;
-  - `database {bytes, tables}`: `pg_database_size`, and the five largest
-    tables of the store's schema by `pg_total_relation_size`, `[{name,
-    bytes}]`, largest first (a bloat like the 2.7 GB of 2026-11, for about
-    17 MB of data, shows here);
+  - `database {name, bytes, schemas, log_bytes, tables}`:
+    `pg_database_size`, its schemas other than `pg_*`,
+    `information_schema` and `public`, its event log's bytes (the sum of
+    `spawn_events.kind`'s `pg_column_size`: what the data justifies), and
+    the five largest tables of the store's schema by
+    `pg_total_relation_size`, `[{name, bytes}]`, largest first;
+  - `test_databases [{role, name, bytes, schemas}]` (objective 074): the
+    gates' test database (`SPAWN_TEST_DATABASE_URL`, role `test`) then the
+    engines' (`SPAWN_FLEET_TEST_DATABASE_URL`, role `fleet_test`), each only
+    when its URL is set; one that cannot be read has its name, bytes and
+    schemas null and an `error`. The 2.7 GB of 2026-11 was the fleet's test
+    database, 2533 schemas tests left, first misread as live-database bloat
+    (the live one was 159 MB for a 35 MB log); the loop's `database_size`
+    alert (docs/fleet-architecture.md, "Alerts") now says when any of them
+    outgrows the live log;
   - `growth_bytes_per_day`: what was appended to the archive, its bytes
     now less the `archive_bytes` of the oldest sample of the last 7 days,
     over the days between them, rounded down; null without a sample at

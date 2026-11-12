@@ -1082,7 +1082,14 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   `SPAWN_ALERT_MEMORY_OK_MB`, default 8192), `tmpfs_high` (the used space of
   the filesystem holding `SPAWN_ALERT_TMPFS_PATH`, default `/tmp`, over
   `SPAWN_ALERT_TMPFS_HIGH_MB`, default 8000; clears under
-  `SPAWN_ALERT_TMPFS_OK_MB`, default 6000), `source_away` (`mission #<id>`,
+  `SPAWN_ALERT_TMPFS_OK_MB`, default 6000), `database_size` (`database
+  <name>`, objective 074: every `SPAWN_ALERT_DATABASE_SECS`, default 600, the
+  live database, the gates' test database and the engines'
+  (`SPAWN_TEST_DATABASE_URL`, `SPAWN_FLEET_TEST_DATABASE_URL`, each when set)
+  at or above `SPAWN_ALERT_DATABASE_FLOOR_MB`, default 1024, and above
+  `SPAWN_ALERT_DATABASE_RATIO`, default 10, times the live event log's
+  bytes; evidence `{database, role, bytes, log_bytes, ratio, schemas}`, one
+  open per database, cleared by the first reading no longer so), `source_away` (`mission #<id>`,
   at two readings in a row: a source of an open or active mission that is a
   path on this host is not a directory, an unmounted volume or a moved
   checkout, so its agents' branches are not published to it until it is
