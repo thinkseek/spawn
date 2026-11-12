@@ -26,8 +26,9 @@ use crate::PostgresStore;
 ///   its last configuration before `$2` (`mission.configured` or a legacy
 ///   mission row) left it with no objective backlog (`objectives` not an
 ///   object), so its work comes from the owner (objective 062). A mission
-///   never configured has declared neither and is not owner work: its idle
-///   flag stays as before (objective 043).
+///   with no configuration record before `$2` (only its `mission.added`)
+///   has no objective backlog either, so it is owner work too (objective
+///   077); only a mission whose last configuration has a backlog is not.
 const WINDOW: &str = r"
 with
   decided as (
@@ -88,7 +89,7 @@ select jsonb_build_object(
                                   and r.record ->> 'table' = 'mission_missions'))
                          and spawn_experience_int(coalesce(r.record -> 'id', r.record -> 'row' -> 'id'))
                              = m.mission_id
-                       order by r.seq desc limit 1), false),
+                       order by r.seq desc limit 1), true),
                   'tasks', (select coalesce(jsonb_agg(jsonb_build_array(s.assigned_at_ms, s.closed_at_ms)
                                                       order by s.assigned_at_ms, s.task_id), '[]'::jsonb)
                               from spans s where s.mission_id = m.mission_id))

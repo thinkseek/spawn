@@ -305,20 +305,27 @@ export function SupervisorNotes({
   talk,
 }: {
   model: NotesShown;
-  /** The full list (`allNotes`): a settled line too, marked so. */
+  /** The full list (`allNotes`): a settled line and an earlier turn's
+   * too, marked so. */
   all: NoteRow[];
   /** The box that types to the supervisor. */
   talk: ReactNode;
 }) {
   const [open, setOpen] = useState(false);
   const shown = open ? all : model.shown;
+  // The closed card's link to the full list: how many current lines it
+  // leaves out, and how many earlier ones (objective 078).
+  const counts = [
+    model.more > 0 ? `${model.more} more` : null,
+    model.earlier > 0 ? `${model.earlier} earlier` : null,
+  ].filter((part): part is string => part !== null);
   return (
     <Card>
       <CardHeader
         icon={<MessageSquareText size={14} />}
         title="From the supervisor"
         meta={
-          (model.more > 0 || model.settled > 0) && (
+          (counts.length > 0 || model.settled > 0) && (
             <button
               type="button"
               onClick={() => setOpen((value) => !value)}
@@ -327,8 +334,8 @@ export function SupervisorNotes({
             >
               {open
                 ? "Show the latest"
-                : model.more > 0
-                  ? `${model.more} more`
+                : counts.length > 0
+                  ? counts.join(" · ")
                   : `${model.settled} settled`}
             </button>
           )
@@ -340,22 +347,32 @@ export function SupervisorNotes({
         <ul className="divide-y divide-surface-border">
           {shown.map((note, index) => {
             const row = open ? (note as NoteRow) : null;
+            const states = row ? row.tasks : (note as NotesShown["shown"][number]).taskStates;
+            const earlier = row !== null && !row.current;
             return (
               <li key={`${note.at_ms}-${index}`} className="flex min-w-0 items-baseline gap-3 px-4 py-2">
                 <div className="min-w-0 flex-1">
                   <p
                     className={cx(
                       "text-caption",
-                      row?.settled ? "text-muted-foreground" : "text-foreground",
+                      row?.settled || earlier ? "text-muted-foreground" : "text-foreground",
                       !open && "truncate",
                     )}
                     title={note.text}
                   >
                     {note.text}
                   </p>
-                  {row && (row.settled || row.tasks) && (
+                  {(row?.settled || earlier || states) && (
                     <p className="mt-0.5 text-micro text-faint-foreground">
-                      {row.settled && (
+                      {earlier && (
+                        <span
+                          className="mr-1.5 rounded-chip bg-surface-hover px-1 font-medium text-muted-foreground"
+                          title="Said in an earlier turn: the supervisor's newest block does not repeat it"
+                        >
+                          earlier
+                        </span>
+                      )}
+                      {row?.settled && (
                         <span
                           className="mr-1.5 rounded-chip bg-surface-hover px-1 font-medium text-muted-foreground"
                           title="Its tasks have all ended: nothing is left to review"
@@ -363,7 +380,7 @@ export function SupervisorNotes({
                           settled
                         </span>
                       )}
-                      {row.tasks}
+                      {states}
                     </p>
                   )}
                 </div>

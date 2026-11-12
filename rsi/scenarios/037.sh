@@ -57,6 +57,9 @@
 #       `integrator.drain_expired` names [B], recorded at least 3 s after the
 #       draining record; the integrator exits 0; within 5 s B's gate process
 #       is gone; no `task.gated` for B was recorded.
+#   Every integrator here reaches no systemd user manager, so its gates are
+#   its own children (an integrator with one runs them in units and leaves
+#   them running for the next at its bound, 4168a547: not this path).
 #   (6) within 60 s one digest tagged `host integrator-drain-expired-<id>`
 #       reaches the supervisor, its text naming task #B; 15 s of pings later
 #       still exactly one, and no other drain digest.
@@ -501,10 +504,16 @@ digest_text_tagged() {
 
 # An integrator, started fresh: its real pid in $integrator_pid, its exit
 # status in $WORK/integrate.exit once it ends. `$@`: extra VAR=value.
+# It reaches no systemd user manager (no session bus; XDG_RUNTIME_DIR is
+# WORK's, with none in it), so its gates run as its own children: the drain
+# this scenario is about. With a user manager, an integrator runs its gates
+# in units and leaves them to the next integrator at its bound (left_running,
+# 4168a547, tested in integrate's database tests), which is not this path,
+# and it would start units on the host's own manager.
 start_integrator() {
     rm -f "$WORK/integrate.pid" "$WORK/integrate.exit"
     (
-        env "$@" SPAWN_GATE="$WORK/fake-gate.sh" SPAWN_TEST_DATABASE_URL="$TEST_URL" \
+        env -u DBUS_SESSION_BUS_ADDRESS "$@" SPAWN_GATE="$WORK/fake-gate.sh" SPAWN_TEST_DATABASE_URL="$TEST_URL" \
             SPAWN_GATE_MIN_FREE_GB=0 SPAWN_GATE_MIN_FREE_MEMORY_MB=1 SPAWN_GATE_JOBS=1 \
             SPAWN_GATE_WORKER_CORES=0 \
             "$SPAWN_BIN" integrate --root "$WORK/integrator" >>"$WORK/integrate.log" 2>&1 &
@@ -603,6 +612,15 @@ until waiting session_supervisor; do
 done
 main_a=$(main_of "$sa")
 start_integrator
+# The path under test: the integrator says its gates are its own children.
+i=0
+until grep -q 'no systemd user manager answers' "$WORK/integrate.log"; do
+    grep -q 'gates run in systemd user units' "$WORK/integrate.log" &&
+        harness "the integrator runs its gates in systemd units: this scenario tests the drain of an integrator without them"
+    i=$((i + 1))
+    [ "$i" -lt 150 ] || harness "the integrator did not say within 15 s how it runs its gates (integrate: $(log_tail))"
+    sleep 0.1
+done
 wait_run a 60
 first=$(last_event)
 
