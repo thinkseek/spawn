@@ -943,3 +943,23 @@ or with no number min or max, is listed in `ignored_ranges`; a missing file
 is no ranges, and a broken one gives a `ranges_error`. Home's "Core lines"
 card shows each line, colours a guardrail out of range, and says a broken
 file and the ignored entries. Nothing but `spawn serve` reads the file.
+
+### Trends (objective 090)
+
+The loop records a `host.core_lines` sample, `{"type": "host.core_lines",
+"values": {<figure key>: <value>}}`, holding every figure of the answer
+that has a value, at its start and then every
+`SPAWN_CORE_LINES_SAMPLE_SECS` (default 3600). The reading runs on a thread
+of its own (the dashboard's read-only connection and its statement
+timeout), so it never holds a pass; one that has not come back in 5
+minutes is given up. A sample that cannot be read or written is a line in
+the loop's log and is tried again a minute later. `spawn_host_record`
+refuses a sample whose `values` is not an object, and folds it into no
+table; the samples have their own partial index,
+`spawn_events_host_core_lines` (on `recorded_at_ms`). Every figure of
+`GET /api/core-lines` carries `trend`: one `{day, value}` for each UTC day
+of the last 7 (today and the 6 before) with a sample carrying it, that
+day's last such sample, oldest first; empty without one. The card draws
+each figure's points as a small line beside it, the change from the first
+point to the last ("up 20%", "down 25%", "steady") as its title. No gate,
+integrator or deploy step reads the samples or the trends.
