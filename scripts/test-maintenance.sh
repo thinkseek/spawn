@@ -121,8 +121,18 @@ stale "$servers/a$(printf '%s' "$hex" | cut -c2-)" "$servers/c$(printf '%s' "$he
 mkdir "$servers/.d$(printf '%s' "$hex" | cut -c2-).Ab12Cd" "$servers/.e$(printf '%s' "$hex" | cut -c2-).Ef34Gh"
 stale "$servers/.d$(printf '%s' "$hex" | cut -c2-).Ab12Cd"
 
+# Every run has a home of its own, with no spawn.env, and no test database
+# URL from the caller: step 5 (catalogs) vacuums the databases those name,
+# and the gate's sandbox names its own server in SPAWN_TEST_DATABASE_URL
+# with no live URL beside it, which vacuum-catalogs.sh refuses (exit 2), so
+# every run failed there (owner push 4c15660f). Step 5's own tests are
+# scripts/test-vacuum-catalogs.sh; here it says it skipped both, and the
+# statuses maintenance takes from it are checked with a stand-in below.
+mkdir -p "$work/home"
 run() {
-    env TMPDIR="$tmp" SPAWN_BACKUP_DIR="$backups" XDG_CACHE_HOME="$work/.cache" "$@" \
+    env HOME="$work/home" SPAWN_ENV_FILE="$work/home/no-spawn.env" SPAWN_FLEET_TEST_DATABASE_URL= \
+        SPAWN_TEST_DATABASE_URL= SPAWN_DATABASE_URL= \
+        TMPDIR="$tmp" SPAWN_BACKUP_DIR="$backups" XDG_CACHE_HOME="$work/.cache" "$@" \
         sh "$maintenance" >"$work/out" 2>&1
 }
 listing() { (cd "$1" && ls -A | LC_ALL=C sort | tr '\n' ' '); }
@@ -142,7 +152,13 @@ before_tmp=$(listing "$tmp")
 before_backups=$(listing "$backups")
 before_cache=$(listing "$cache")
 before_servers=$(listing "$servers")
-run SPAWN_MAINTENANCE_DRY_RUN=1
+# Every run's status is checked, so a failing run prints its output (expect)
+# rather than ending this test silently under set -e.
+status=0
+run SPAWN_MAINTENANCE_DRY_RUN=1 || status=$?
+expect "a dry run succeeds" "$status" "0"
+expect "it touches no database of the caller's: catalogs skipped for both URLs" \
+    "$(grep -c '^maintenance: catalogs: skipped: SPAWN_\(FLEET_\)\{0,1\}TEST_DATABASE_URL is not set$' "$work/out")" "2"
 expect "a dry run deletes nothing in TMPDIR" "$(listing "$tmp")" "$before_tmp"
 expect "nor in the backups" "$(listing "$backups")" "$before_backups"
 expect "nor in the base cache" "$(listing "$cache")" "$before_cache"
@@ -181,10 +197,14 @@ expect "a second run removes nothing more" "$(listing "$backups")" "$after_backu
 # goes at 180, and stays when a gate may run 300.
 mkdir "$tmp/spawn-gate.four01"
 touch -d '4 hours ago' "$tmp/spawn-gate.four01"
-run SPAWN_MAINTENANCE_SCRATCH_AGE_MIN=180 SPAWN_GATE_WALL_CLOCK_MINUTES=300
+status=0
+run SPAWN_MAINTENANCE_SCRATCH_AGE_MIN=180 SPAWN_GATE_WALL_CLOCK_MINUTES=300 || status=$?
+expect "a run with a longer gate wall clock succeeds" "$status" "0"
 expect "a scratch without a record stays for as long as a gate may run" \
     "$(listing "$tmp" | tr ' ' '\n' | grep -c -e 'spawn-gate.four01' -e 'spawn-gate.live01')" "2"
-run SPAWN_MAINTENANCE_SCRATCH_AGE_MIN=180
+status=0
+run SPAWN_MAINTENANCE_SCRATCH_AGE_MIN=180 || status=$?
+expect "a run with a shorter scratch age succeeds" "$status" "0"
 expect "past the age it goes, and a running gate's scratch stays at any age" \
     "$(listing "$tmp" | tr ' ' '\n' | grep -e 'spawn-gate.four01' -e 'spawn-gate.live01' | tr '\n' ' ')" "spawn-gate.live01 "
 # shellcheck disable=SC2086
@@ -192,7 +212,9 @@ kill $holders 2>/dev/null || true
 # shellcheck disable=SC2086
 wait $holders 2>/dev/null || true
 holders=""
-run
+status=0
+run || status=$?
+expect "a run after the holders are gone succeeds" "$status" "0"
 expect "once the gate and the holder are gone, their scratch goes" \
     "$(listing "$tmp" | tr ' ' '\n' | grep -c -e 'spawn-gate.live01' -e 'spawn-gate.held01' || true)" "0"
 expect "this shell's own scratch stays: it runs" "$(ls -d "$own")" "$own"
@@ -206,5 +228,27 @@ expect "after the other steps ran" "$(listing "$backups" | grep -o 'spawn-202611
 status=0
 run SPAWN_MAINTENANCE_KEEP_DUMPS=all || status=$?
 expect "a count that is not a number fails, deleting nothing" "$status:$(listing "$backups" | grep -c 'spawn-2026110' || true)" "1:1"
+
+# Step 5's statuses, with a stand-in for vacuum-catalogs.sh beside a copy of
+# maintenance.sh: it is asked for each URL, a back-off (3) is no failure, and
+# a refusal (2) fails the run, naming the URL's variable.
+standin=$work/standin
+mkdir -p "$standin"
+cp "$maintenance" "$(dirname "$maintenance")/disk.sh" "$standin/"
+printf '#!/bin/sh\necho "stand-in $*"\nexit "${STANDIN_STATUS:-0}"\n' >"$standin/vacuum-catalogs.sh"
+standin_run() {
+    env HOME="$work/home" TMPDIR="$tmp" SPAWN_BACKUP_DIR="$backups" XDG_CACHE_HOME="$work/.cache" "$@" \
+        sh "$standin/maintenance.sh" >"$work/out" 2>&1
+}
+status=0
+standin_run SPAWN_MAINTENANCE_DRY_RUN=1 STANDIN_STATUS=3 || status=$?
+expect "a catalogs step that backs off (3) does not fail the run" "$status" "0"
+expect "it is asked for both test databases" "$(grep '^stand-in ' "$work/out" | tr '\n' ' ')" \
+    "stand-in --url-var SPAWN_FLEET_TEST_DATABASE_URL stand-in --url-var SPAWN_TEST_DATABASE_URL "
+status=0
+standin_run SPAWN_MAINTENANCE_DRY_RUN=1 STANDIN_STATUS=2 || status=$?
+expect "a refused catalogs step (2) fails the run" "$status" "1"
+expect "naming the URL's variable" \
+    "$(grep -c 'catalogs: the step failed or was refused for SPAWN_TEST_DATABASE_URL' "$work/out")" "1"
 
 echo "maintenance: all cases pass"
