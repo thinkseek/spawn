@@ -39,7 +39,17 @@ const USAGE: &str = "usage:
       objectives and separately the owner-judged ones (the backlog field `owner_judged`:
       the owner judges those outside the gate, and the fleet never assigns them),
       each with its title, plus the counts of solved and met
+  spawn mission pause --id N [--reason <text>]   (owner, a human: holds the mission, objective 099)
+      (records mission.paused {id, reason}: no objective is assigned to it and nothing is
+       delivered to its workers; its resident is stopped by a Stop (its final checkpoint on its
+       branch, its native session kept) and nothing revives it while the pause lasts; no
+       mission_idle alert, and its paused time is not idle on the Scorecard. Its state stays
+       as it is; a halt stays too. A closed or already paused mission is refused, nothing
+       recorded. --reason: at most 500 characters. Prints {mission, paused})
   spawn mission resume --id N
+      (a paused mission: records mission.unpaused {id, pause_event} and nothing else, and its
+       resident is resumed in its own native session; a halt it is in stays, for a second
+       resume. A halted mission that is not paused: the halt is cleared, mission.resumed)
   spawn mission push --source <path> --commit <commit> [--repo <dir>] [--wait <seconds>]
                      [--gated] [--urgent] [--reason <text>]
   spawn mission push --withdraw <request>
@@ -607,6 +617,25 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
             let change = change(&flags)?;
             let settings = store.mission_reconfigure(mission, &change).map_err(err)?;
             print(&settings);
+        }
+        "pause" => {
+            let mission = id(&flags, "id")?;
+            let reason = flags.get("reason");
+            if reason
+                .as_deref()
+                .is_some_and(|text| text.chars().count() > HOLD_REASON_CHARS)
+            {
+                return Err(format!(
+                    "--reason is at most {HOLD_REASON_CHARS} characters"
+                ));
+            }
+            let event = store
+                .mission_pause(mission, reason.as_deref())
+                .map_err(err)?;
+            print(&json!({
+                "mission": mission,
+                "paused": {"event_id": event, "reason": reason},
+            }));
         }
         "resume" => {
             let mission = id(&flags, "id")?;
