@@ -266,9 +266,14 @@ else
     fleet() { jq -c ".health.storage | $1" "$WORK/api.json"; }
     figure() { lines ".lines[] | select(.line == \"storage\") | ([.north_star] + .guardrails)[] | select(.key == \"$1\")"; }
     expect_eq "$(lines '[.lines[].line]')" '["performance","storage","observability","recoverability"]' "(1) the four lines in order"
-    expect_eq "$(lines '[.lines[] | select(.line != "storage") | {key: .north_star.key, value: .north_star.value, state: .north_star.state, guardrails}]')" \
-        '[{"key":"performance.report_to_live","value":null,"state":"not_collected","guardrails":[]},{"key":"observability.needs_you_right","value":null,"state":"not_collected","guardrails":[]},{"key":"recoverability.restores_passed","value":null,"state":"not_collected","guardrails":[]}]' \
-        "(1) the other lines' north stars are not collected yet"
+    # The other lines' figures are filled by later objectives (086-088): only
+    # their north stars' keys are this frame's, and every figure without a
+    # value is not collected.
+    expect_eq "$(lines '[.lines[] | select(.line != "storage") | .north_star.key]')" \
+        '["performance.report_to_live","observability.needs_you_right","recoverability.restores_passed"]' \
+        "(1) the other lines' north stars"
+    expect_eq "$(lines '[.lines[] | ([.north_star] + .guardrails)[] | select((.value == null) != (.state == "not_collected")) | .key]')" '[]' \
+        "(1) a figure is not collected exactly when it has no value"
     expect_eq "$(lines '.lines[] | select(.line == "storage") | [.north_star.key] + [.guardrails[].key]')" \
         '["storage.days_left","storage.free_bytes","storage.archive_growth","storage.database_ratio","storage.test_database_bytes","storage.test_database_schemas"]' \
         "(1) the storage line's north star and guardrails, in order"
