@@ -4366,6 +4366,21 @@ expect "2, then 1 on the candidate, a clean base: rejected" \
     "$(class_judge onevoteafter "$good")" 'exit=0 {"verdict":"rejected","reason":"regression: 760.sh fails on the candidate"}'
 expect "as a candidate failure" "$(cat "$work/gate.out")" \
     '| 760.sh fails on the candidate (2, then 1) and passes on the base, run now (0, then 0): candidate failure'
+# 2, then 0, then 0 and 2, then 0, then 1: no two failed checks and a pass
+# beside them (rev-e N1 on ec2fa0f6). 2,0,0 was unstable and 2,0,1 a
+# candidate failure before this rule; both are cannot_judge now, never a
+# rejection, never accepted.
+class_dir harnesspass
+scheduled harnesspass 762 PPP HPP
+expect "2, then 0, then 0 on the candidate, a clean base: harness on the candidate, cannot judge" \
+    "$(class_judge harnesspass "$good")" \
+    'exit=6 {"cannot_judge":true,"scenario":"762.sh","runs":"2, then 0, then 0 on the candidate; 0, then 0 on the base, run now","reason":"harness on the candidate:'
+class_dir harnessvote
+scheduled harnessvote 763 PPP HPF
+expect "2, then 0, then 1 on the candidate, a clean base: harness on the candidate, cannot judge (was a candidate failure)" \
+    "$(class_judge harnessvote "$good")" \
+    'exit=6 {"cannot_judge":true,"scenario":"763.sh","runs":"2, then 0, then 1 on the candidate; 0, then 0 on the base, run now","reason":"harness on the candidate:'
+refuse "not a candidate failure" "$(cat "$work/gate.out")" '763.sh fails on the candidate'
 
 # A base run that exits neither 0 nor 1 is the harness's: infrastructure.
 class_dir harness
