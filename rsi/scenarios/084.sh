@@ -274,13 +274,21 @@ else
         "(1) the storage line's north star and guardrails, in order"
     growth=$(fleet '.growth_bytes_per_day')
     near "$growth" 1048576 10486 || check_failed "(1) the seed: /api/fleet's growth [$growth] is about 1 MiB a day"
-    expect_eq "$(figure storage.days_left | jq -c '{unit, range, state}')" \
-        '{"unit":"days","range":null,"state":"no_range"}' "(1)(2) days left: no range set"
     days=$(figure storage.days_left | jq -r '.value')
     want_days=$(fleet '.days_left')
+    days_state=no_range
+    [ "$want_days" != null ] || days_state=not_collected
+    expect_eq "$(figure storage.days_left | jq -c '{unit, range, state}')" \
+        "{\"unit\":\"days\",\"range\":null,\"state\":\"$days_state\"}" "(1)(2) days left: no range set"
     # Both are the free space read at each request over the same growth.
-    near "$days" "$want_days" "$((want_days / 100 + 1))" 2>/dev/null ||
-        check_failed "(1) days left [$days]: /api/fleet's days_left [$want_days], within 1%"
+    if [ "$want_days" = null ]; then
+        # A later growth may need more than this seed gives (objective 085's
+        # persistent growers): then neither answer has days left.
+        expect_eq "$days" null "(1) days left: null, as /api/fleet's"
+    else
+        near "$days" "$want_days" "$((want_days / 100 + 1))" 2>/dev/null ||
+            check_failed "(1) days left [$days]: /api/fleet's days_left [$want_days], within 1%"
+    fi
     expect_eq "$(figure storage.archive_growth | jq -c '{unit, value, range, state}')" \
         "{\"unit\":\"bytes_per_day\",\"value\":$growth,\"range\":{\"max\":524288},\"state\":\"out\"}" \
         "(1)(2) archive growth: about 1 MiB a day, out of its range of 512 KiB a day or less"
