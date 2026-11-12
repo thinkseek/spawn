@@ -381,10 +381,11 @@ mod tests {
                 // Paused for the last 20 h, still paused: 4 h idle, 20 paused.
                 {"mission": 1, "text": "paused now", "opened_at_ms": at(-48.0), "closed_at_ms": null,
                  "owner_work": false, "tasks": [], "pauses": [[at(-20.0), null]]},
-                // Paused 12 h and resumed; a task over part of the pause:
-                // idle 24 − 12 (paused) − 2 (the task outside it) = 10 > (24 − 12) / 2.
+                // Paused 12 h and resumed; a task of 2 h in the window, and
+                // one inside the pause, counted once: idle 24 − 12 − 2 = 10,
+                // more than half of 24 − 12.
                 {"mission": 2, "text": "resumed", "opened_at_ms": at(-48.0), "closed_at_ms": null,
-                 "owner_work": false, "tasks": [[at(-14.0), at(-10.0)]],
+                 "owner_work": false, "tasks": [[at(-26.0), at(-22.0)], [at(-14.0), at(-11.0)]],
                  "pauses": [[at(-22.0), at(-10.0)]]},
                 // Paused 16 h, resumed, then busy 4 of the 8 h left: idle 4,
                 // not more than half of 24 − 16.
