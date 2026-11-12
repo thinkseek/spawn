@@ -163,6 +163,10 @@ export interface Storage {
   /** When the growth is first measured: the oldest sample of the last 7
    * days plus a day; null without a sample (or from an older server). */
   growth_from_ms: number | null;
+  /** When the persistent growth (so days left) is first measured: the
+   * latest of its parts' oldest samples plus a day (objective 091); null
+   * while a part has no sample (or from an older server). */
+  persistent_from_ms: number | null;
 }
 
 /** A test database: the gates' (`test`) or the engines' (`fleet_test`).
@@ -229,6 +233,7 @@ export function normalizeStorage(value: unknown): Storage | null {
     persistent_growth_bytes_per_day: optionalNumber(raw.persistent_growth_bytes_per_day),
     days_left: optionalNumber(raw.days_left),
     growth_from_ms: optionalNumber(raw.growth_from_ms),
+    persistent_from_ms: optionalNumber(raw.persistent_from_ms),
   };
 }
 
@@ -277,6 +282,10 @@ export interface StorageView {
   /** The local date and time the growth is first measured, while it is
    * not yet and that moment is still ahead of the sizes' read; else null. */
   measured_from: string | null;
+  /** The local date and time how long the disk lasts is first measured,
+   * while it is not yet and that moment is still ahead of the sizes' read;
+   * else null (objective 091). */
+  lasts_from: string | null;
 }
 
 /** The Storage card's words: what uses the disk, one row each, and how
@@ -334,6 +343,9 @@ export function storageView(value: unknown): StorageView {
     })),
   ];
   const days = storage?.days_left ?? null;
+  const lastsAt = storage?.persistent_from_ms ?? null;
+  const lastsFrom =
+    days === null && lastsAt !== null && readAt !== null && lastsAt > readAt ? localDateTime(lastsAt) : null;
   return {
     rows,
     lasts:
@@ -341,6 +353,7 @@ export function storageView(value: unknown): StorageView {
         ? null
         : `about ${count(days)} days at the growth of the archive, Claude Code's transcripts and the database`,
     measured_from: measuredFrom,
+    lasts_from: lastsFrom,
   };
 }
 
