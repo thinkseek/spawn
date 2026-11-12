@@ -214,6 +214,13 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
         .to_ip()
         .map_or_else(|| address.clone(), |address| address.to_string());
     let slots = Slots::new(MAX_IN_FLIGHT);
+    // The Core lines reading, once, beside the requests: the first person
+    // after a restart gets the kept figures, not the cold computation. A
+    // request meanwhile waits on the performance figures' lock (archive and
+    // cost, cc-astra A35) and the storage sizes' lock, so those are computed
+    // once; its other parts (health, trends, the backup facts) it computes
+    // itself, as every request does (rev-e N1).
+    std::thread::spawn(|| println!("serve: {}", core_lines::warm()));
     keep_listening(
         server,
         &bound,
@@ -3482,6 +3489,37 @@ mod tests {
             assert_eq!(parts.archive.is_some(), parts.cost.is_some(), "{parts:?}");
             // Disjoint parts: their sum is never more than the whole.
             assert!(parts.sum() <= whole, "{parts:?} over {whole:?}");
+            std::fs::remove_dir_all(&dir).expect("clean up");
+        });
+    }
+
+    /// The warm-up at serve's start, through the real store: it runs a
+    /// reading (its parts say whether it measured or took the kept
+    /// figures), and the reading after it, the first person's, takes the
+    /// kept performance figures and reads no archive file at all.
+    #[test]
+    fn a_reading_after_the_warm_up_is_kept_and_reads_no_archive() {
+        in_test_schema(|_owner, store| {
+            let dir = std::env::temp_dir().join(format!(
+                "spawn-core-lines-warm-{}-{}",
+                std::process::id(),
+                super::now_ms()
+            ));
+            std::fs::create_dir_all(&dir).expect("a directory");
+            let file = dir.join("core-lines.json");
+            let nightly = dir.join("nightly");
+            let warmed =
+                super::core_lines::warm_at(store, Some(&file), Some(&nightly)).expect("warmed");
+            assert!(
+                warmed.performance.is_some() && warmed.storage.is_some(),
+                "the warm-up ran a reading: {warmed:?}"
+            );
+            let mut parts = super::core_lines::Parts::default();
+            super::core_lines::core_lines_timed(store, Some(&file), Some(&nightly), &mut parts)
+                .expect("the answer");
+            assert_eq!(parts.performance, Some("kept"), "{parts:?}");
+            assert_eq!(parts.archive, None, "no archive read: {parts:?}");
+            assert_eq!(parts.cost, None, "{parts:?}");
             std::fs::remove_dir_all(&dir).expect("clean up");
         });
     }

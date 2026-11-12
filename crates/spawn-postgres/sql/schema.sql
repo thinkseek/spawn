@@ -2440,7 +2440,8 @@ begin
         -- spawn_deploy_record): read by the alert step (`deploy_failed`),
         -- folded into no table.
         null;
-    when 'backup.dumped', 'backup.bundled', 'backup.verified', 'backup.stored' then
+    when 'backup.dumped', 'backup.bundled', 'backup.verified', 'backup.stored',
+         'backup.drilled.transcripts', 'backup.drilled.missions' then
         -- What `spawn backup` did (crate backup.rs; `backup.stored`: a
         -- `spawn store put` run, its manifest's key): read from the log by the
         -- next run, folded into no table. What a copy holds is in its record
@@ -5010,7 +5011,8 @@ begin
         raise exception '% may not record backups', session_user using errcode = '42501';
     end if;
     if p_record ->> 'type' not in ('backup.dumped', 'backup.bundled', 'backup.verified',
-                                   'backup.stored') then
+                                   'backup.stored', 'backup.drilled.transcripts',
+                                   'backup.drilled.missions') then
         raise exception 'not a backup record: %', p_record ->> 'type';
     end if;
     -- A `spawn store put` run (crate backup/store.rs): its shape is fixed,
@@ -5034,6 +5036,27 @@ begin
                           or (p_record ->> f)::numeric < 0
                           or (p_record ->> f)::numeric <> trunc((p_record ->> f)::numeric)) then
             raise exception 'a backup.stored record: area transcripts or sessions, host, account and manifest strings, the counts whole numbers';
+        end if;
+    end if;
+    -- A restore drill's verdict on one resource (`spawn backup
+    -- restore-drill`, objective 104): its shape is fixed, every field
+    -- checked, and nothing else is taken.
+    if p_record ->> 'type' in ('backup.drilled.transcripts', 'backup.drilled.missions') then
+        if exists (select 1 from jsonb_object_keys(p_record) k
+                    where k not in ('type', 'ok', 'reason', 'bundle', 'bundle_event_id',
+                                    'mismatches', 'duration_ms')) then
+            raise exception 'a drill record has type, ok, reason, bundle, bundle_event_id, mismatches and duration_ms, and nothing else';
+        end if;
+        if jsonb_typeof(p_record -> 'ok') is distinct from 'boolean'
+           or jsonb_typeof(p_record -> 'reason') is distinct from 'string'
+           or length(p_record ->> 'reason') > 500
+           or (p_record ->> 'ok')::boolean is distinct from (p_record ->> 'reason' = '')
+           or jsonb_typeof(p_record -> 'bundle') is distinct from 'string'
+           or exists (select 1 from unnest(array['bundle_event_id', 'mismatches', 'duration_ms']) f
+                       where jsonb_typeof(p_record -> f) is distinct from 'number'
+                          or (p_record ->> f)::numeric < 0
+                          or (p_record ->> f)::numeric <> trunc((p_record ->> f)::numeric)) then
+            raise exception 'a drill record is {ok: boolean, true exactly when reason is empty, reason: at most 500 characters, bundle: a string, bundle_event_id, mismatches and duration_ms whole numbers}';
         end if;
     end if;
     return spawn_control_record(p_record);

@@ -99,6 +99,7 @@ use crate::Flags;
 use crate::config::env_value;
 
 const USAGE: &str = "usage: spawn store put --area transcripts|sessions [--from <dir>] [--root <dir>]\n       \
+spawn store plan --area <area> [--from <dir>] [--root <dir>] [--list <file>]\n       \
 spawn store get --area <area> --path <file> --into <dir> [--root <dir>]\n       \
 spawn store list|verify --area <area> [--root <dir>]\n\
 the bucket: SPAWN_STORE_BUCKET, one R2_BUCKETS lists in ~/.config/spawn/r2-store.env (SPAWN_STORE_ENV_FILE)";
@@ -170,15 +171,20 @@ pub(crate) struct Listed {
     pub(crate) etag: String,
 }
 
-/// The bucket, as this layer uses it: never a delete, never an overwrite.
-pub(crate) trait Bucket {
-    /// Write `file` at `key` unless the key exists (`If-None-Match: *`),
-    /// with `sha256` (of `file`, the sealed bytes) as its metadata.
-    fn put_new(&self, key: &str, file: &Path, sha256: &str) -> Result<Put, String>;
+/// The bucket, read: HEAD, GET and LIST only. What `plan` is given, so
+/// nothing it does can write.
+pub(crate) trait Reader {
     fn head(&self, key: &str) -> Result<Option<Head>, String>;
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String>;
     /// Every key under `prefix`, with its size and ETag.
     fn list(&self, prefix: &str) -> Result<Vec<Listed>, String>;
+}
+
+/// The bucket, as this layer writes it: never a delete, never an overwrite.
+pub(crate) trait Bucket: Reader {
+    /// Write `file` at `key` unless the key exists (`If-None-Match: *`),
+    /// with `sha256` (of `file`, the sealed bytes) as its metadata.
+    fn put_new(&self, key: &str, file: &Path, sha256: &str) -> Result<Put, String>;
 }
 
 /// The bucket of the backups (`spawn backup`'s settings and client).
@@ -186,6 +192,9 @@ impl Bucket for Settings {
     fn put_new(&self, key: &str, file: &Path, sha256: &str) -> Result<Put, String> {
         super::put_new_object(self, key, file, sha256)
     }
+}
+
+impl Reader for Settings {
     fn head(&self, key: &str) -> Result<Option<Head>, String> {
         super::head_object(self, key)
     }
@@ -194,6 +203,22 @@ impl Bucket for Settings {
     }
     fn list(&self, prefix: &str) -> Result<Vec<Listed>, String> {
         super::list_prefix(self, prefix)
+    }
+}
+
+/// The backups' bucket with no way to write: `plan`'s. It is a [`Reader`]
+/// and not a [`Bucket`], so no PUT is reachable from it.
+struct ReadOnly<'a>(&'a Settings);
+
+impl Reader for ReadOnly<'_> {
+    fn head(&self, key: &str) -> Result<Option<Head>, String> {
+        self.0.head(key)
+    }
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        self.0.get(key)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<Listed>, String> {
+        self.0.list(prefix)
     }
 }
 
@@ -584,7 +609,7 @@ impl Write for HashWriter<'_> {
 
 /// What a run sends and how it encrypts: the bucket, the names' key, and
 /// how to seal and open an object (gpg with the backup key; a test's own).
-pub(crate) struct Store<'a, B: Bucket> {
+pub(crate) struct Store<'a, B: Reader> {
     pub(crate) bucket: &'a B,
     pub(crate) keys: Keys,
     pub(crate) name_key: [u8; 32],
@@ -637,7 +662,60 @@ pub(crate) struct PutCounts {
     pub(crate) manifest: String,
 }
 
-impl<B: Bucket> Store<'_, B> {
+/// What `plan` found: what `put` would do now, sending nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PlanCounts {
+    pub(crate) files: u64,
+    pub(crate) unchanged: u64,
+    pub(crate) appended: u64,
+    pub(crate) whole: u64,
+    /// The selected files' bytes.
+    pub(crate) bytes: u64,
+    /// The bytes put would read and send, before encryption: a grown
+    /// file's new bytes, a whole file's all (a segment already in the
+    /// bucket is not sent again, so put may send less).
+    pub(crate) send: u64,
+    /// By group ([`group`]: the agent, or the sessions' root and project
+    /// directory): files, bytes, bytes to send.
+    pub(crate) by_group: BTreeMap<String, (u64, u64, u64)>,
+    /// Every selected path and its size, in order.
+    pub(crate) listed: Vec<(String, u64)>,
+}
+
+/// The group a plan counts a path in, never a file's name (the lead's
+/// ruling on rev-g N2: a plan's printed lines are posted and read, so they
+/// name directories only; the file names are in `--list` alone): the first
+/// directory of a transcript (its agent), the first two directories of a
+/// session file (`projects/<project>`, `file-history/<session>`), fewer
+/// when the file is higher up; a file at the area's top is `(top)`, but for
+/// the sessions' `history.jsonl`, a fixed name of the area.
+pub(crate) fn group(area: &str, path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').collect();
+    let directories = &parts[..parts.len() - 1];
+    let depth = if area == "transcripts" { 1 } else { 2 };
+    if directories.is_empty() {
+        return if area == "sessions" && path == "history.jsonl" {
+            path.to_string()
+        } else {
+            "(top)".to_string()
+        };
+    }
+    directories[..depth.min(directories.len())].join("/")
+}
+
+/// How `put` takes `source` against its entry in the last manifest
+/// (`previous`), and the file opened to read it: one decision, shared by
+/// `put` and `plan`, so the plan says what the put does.
+fn classify(source: &Source, previous: Option<&Entry>) -> Result<(Plan, File), String> {
+    let mut file =
+        File::open(&source.file).map_err(|error| format!("{}: {error}", source.file.display()))?;
+    let plan = plan(previous, source.size, source.mtime_ns, |last| {
+        prefix_sha256(&mut file, last.size).map(|hash| hash == last.sha256)
+    })?;
+    Ok((plan, file))
+}
+
+impl<B: Reader> Store<'_, B> {
     /// The newest manifest of this area, host and account, and its key.
     pub(crate) fn newest(&self) -> Result<Option<(String, Manifest)>, String> {
         let listed = self.bucket.list(&self.keys.manifests())?;
@@ -687,6 +765,50 @@ impl<B: Bucket> Store<'_, B> {
         bytes
     }
 
+    /// What `put` would do with the area's files `sources` now: the same
+    /// comparison with the newest manifest (LIST and GET only), nothing
+    /// sent, no manifest made.
+    fn plan(&self, sources: &[Source]) -> Result<PlanCounts, String> {
+        let last = self.newest()?.map(|(_, manifest)| manifest);
+        let by_path: BTreeMap<&str, &Entry> = last
+            .iter()
+            .flat_map(|manifest| &manifest.files)
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect();
+        let mut counts = PlanCounts::default();
+        for source in sources {
+            let (plan, _) = classify(source, by_path.get(source.path.as_str()).copied())?;
+            let send = match plan {
+                Plan::Unchanged => {
+                    counts.unchanged += 1;
+                    0
+                }
+                Plan::Append { from } => {
+                    counts.appended += 1;
+                    source.size - from
+                }
+                Plan::Whole => {
+                    counts.whole += 1;
+                    source.size
+                }
+            };
+            counts.files += 1;
+            counts.bytes += source.size;
+            counts.send += send;
+            let at = counts
+                .by_group
+                .entry(group(&self.keys.area, &source.path))
+                .or_default();
+            at.0 += 1;
+            at.1 += source.size;
+            at.2 += send;
+            counts.listed.push((source.path.clone(), source.size));
+        }
+        Ok(counts)
+    }
+}
+
+impl<B: Bucket> Store<'_, B> {
     /// Seal `bytes` and write them at `key` unless it exists; read back
     /// either way.
     fn send(&self, key: &str, bytes: &[u8]) -> Result<Sent, String> {
@@ -810,11 +932,7 @@ not adopted, nothing written over it",
         for source in sources {
             counts.files += 1;
             let previous = by_path.get(source.path.as_str()).copied();
-            let mut file = File::open(&source.file)
-                .map_err(|error| format!("{}: {error}", source.file.display()))?;
-            let plan = plan(previous, source.size, source.mtime_ns, |last| {
-                prefix_sha256(&mut file, last.size).map(|hash| hash == last.sha256)
-            })?;
+            let (plan, mut file) = classify(source, previous)?;
             let (from, mut segments) = match (plan, previous) {
                 (Plan::Unchanged, Some(entry)) => {
                     counts.unchanged += 1;
@@ -1097,6 +1215,19 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
     };
     match verb.as_str() {
         "put" => put_verb(&store, &settings, &flags, &area),
+        "plan" => {
+            let reader = ReadOnly(&settings);
+            let planner = Store {
+                bucket: &reader,
+                keys: store.keys.clone(),
+                name_key: store.name_key,
+                seal: store.seal,
+                open: store.open,
+                scratch: store.scratch,
+                nonce: store.nonce,
+            };
+            plan_verb(&planner, &settings, &flags, &area)
+        }
         "get" => get_verb(&store, &flags, &area),
         "list" => {
             let listed = settings.list(&store.keys.manifests())?;
@@ -1150,28 +1281,14 @@ fn put_verb(
         env_value("SPAWN_STORE_ENABLED").as_deref(),
     )?;
     let _lock = Lock::acquire(&settings.root)?;
-    let from = match flags.get("from") {
-        Some(from) => PathBuf::from(from),
-        None if area == "transcripts" => settings.root.join(spawn_host::TRANSCRIPT_DIRECTORY),
-        None => super::home().join(".claude"),
-    };
+    let from = from_dir(settings, flags, area);
     let mut said = Vec::new();
     let sources = sources(area, &from, &mut said)?;
     for line in &said {
         println!("store put {area}: {line}");
     }
     let counts = store.put(&sources, now_ms())?;
-    println!(
-        "store put {area}: {} file(s): {} unchanged, {} grown, {} whole; {} segment(s) written ({} bytes), {} already there; manifest {}",
-        counts.files,
-        counts.unchanged,
-        counts.appended,
-        counts.whole,
-        counts.segments_written,
-        counts.bytes_written,
-        counts.segments_found,
-        counts.manifest
-    );
+    println!("store put {area}: {}", put_summary(&counts));
     // The run, as a `backup.stored` record (its manifest's key and counts,
     // nothing of a file's content). The copy is in the bucket already; a
     // record that cannot be written fails the run, and the next run reads
@@ -1194,6 +1311,154 @@ fn put_verb(
         .backup_record(&record)
         .map_err(|error| format!("backup.stored: {error}"))?;
     Ok(0)
+}
+
+/// The area's files' directory: `--from`, else the transcript archive
+/// under the root, or the account's `.claude`.
+fn from_dir(settings: &Settings, flags: &Flags, area: &str) -> PathBuf {
+    match flags.get("from") {
+        Some(from) => PathBuf::from(from),
+        None if area == "transcripts" => settings.root.join(spawn_host::TRANSCRIPT_DIRECTORY),
+        None => super::home().join(".claude"),
+    }
+}
+
+/// What a run's files are, as `put` and `plan` both begin their line: the
+/// two agree on it when nothing changed between them.
+fn files_text(files: u64, unchanged: u64, grown: u64, whole: u64) -> String {
+    format!("{files} file(s): {unchanged} unchanged, {grown} grown, {whole} whole")
+}
+
+/// `put`'s line after its area.
+pub(crate) fn put_summary(counts: &PutCounts) -> String {
+    format!(
+        "{}; {} segment(s) written ({} bytes), {} already there; manifest {}",
+        files_text(
+            counts.files,
+            counts.unchanged,
+            counts.appended,
+            counts.whole
+        ),
+        counts.segments_written,
+        counts.bytes_written,
+        counts.segments_found,
+        counts.manifest
+    )
+}
+
+/// `plan`'s line after its area.
+pub(crate) fn plan_summary(counts: &PlanCounts) -> String {
+    format!(
+        "{}; {} bytes, {} of them to send (before encryption; a segment already in the bucket \
+is not sent again)",
+        files_text(
+            counts.files,
+            counts.unchanged,
+            counts.appended,
+            counts.whole
+        ),
+        counts.bytes,
+        counts.send
+    )
+}
+
+/// `plan`: what `put` would upload now, uploading nothing (lead-mac's go,
+/// 2026-11-13, step 1). The same selection (`sources`; the entries put
+/// would skip are counted by why, not named) and the same comparison with the newest
+/// manifest (LIST and GET), over a bucket that cannot write ([`ReadOnly`]):
+/// no PUT is reachable, no manifest is made, no `backup.stored` recorded,
+/// no lock taken. `may_write` is not consulted: it guards writes, and a
+/// plan makes none, so it runs with SPAWN_STORE_ENABLED unset and on a keep
+/// bucket too. The bucket is named by its kind and prefix only (its name is
+/// a credential value). `--list` writes each selected path and its size
+/// (`<size>\t<path as a JSON string>`, one a line) to a new file, mode
+/// 0600, created exclusively (`O_CREAT | O_EXCL`, which refuses any entry
+/// at the name, a symlink included): it never writes over anything, and is
+/// left (empty) if the plan fails.
+fn plan_verb<R: Reader>(
+    store: &Store<'_, R>,
+    settings: &Settings,
+    flags: &Flags,
+    area: &str,
+) -> Result<i32, String> {
+    let mut list = flags
+        .get("list")
+        .map(|path| create_list(Path::new(&path)))
+        .transpose()?;
+    let from = from_dir(settings, flags, area);
+    let mut said = Vec::new();
+    let sources = sources(area, &from, &mut said)?;
+    let counts = store.plan(&sources)?;
+    let bucket = match kind(&settings.r2.bucket) {
+        Kind::Keep => "keep",
+        Kind::Work => "work",
+        Kind::Other => "other",
+    };
+    for line in plan_lines(area, bucket, &settings.prefix, &said, &counts) {
+        println!("{line}");
+    }
+    if let Some(file) = list.as_mut() {
+        write_list(file, &counts.listed)?;
+    }
+    Ok(0)
+}
+
+/// What `plan` prints: a summary that names no file (the lead's ruling:
+/// it is posted and read). The entries put would skip, counted by why
+/// (put's own lines name them); the bucket by kind and prefix; the totals;
+/// a line per group ([`group`]) with its files, bytes and bytes to send.
+pub(crate) fn plan_lines(
+    area: &str,
+    bucket: &str,
+    prefix: &str,
+    said: &[String],
+    counts: &PlanCounts,
+) -> Vec<String> {
+    let mut skipped: BTreeMap<&str, u64> = BTreeMap::new();
+    for line in said {
+        let why = line
+            .rfind(" (")
+            .and_then(|at| line[at + 2..].strip_suffix(')'))
+            .unwrap_or("other");
+        *skipped.entry(why).or_default() += 1;
+    }
+    let mut lines: Vec<String> = skipped
+        .into_iter()
+        .map(|(why, count)| {
+            format!("store plan {area}: {count} entry(ies) skipped as put skips them ({why})")
+        })
+        .collect();
+    lines.push(format!(
+        "store plan {area}: the {bucket} bucket, prefix {prefix:?}; nothing is sent"
+    ));
+    lines.push(format!("store plan {area}: {}", plan_summary(counts)));
+    for (group, (files, bytes, send)) in &counts.by_group {
+        lines.push(format!(
+            "store plan {area}: {group}: {files} file(s), {bytes} bytes, {send} to send"
+        ));
+    }
+    lines
+}
+
+/// `--list`'s file: new, mode 0600, `O_CREAT | O_EXCL` (any entry at the
+/// name, a symlink included, is refused and left as it is).
+pub(crate) fn create_list(path: &Path) -> Result<File, String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| format!("--list {}: {error} (never written over)", path.display()))
+}
+
+/// Each path and its size, `<size>\t<path as a JSON string>`, one a line.
+pub(crate) fn write_list(file: &mut File, listed: &[(String, u64)]) -> Result<(), String> {
+    for (path, size) in listed {
+        let quoted = serde_json::to_string(path).map_err(|error| error.to_string())?;
+        writeln!(file, "{size}\t{quoted}").map_err(|error| format!("--list: {error}"))?;
+    }
+    file.sync_all().map_err(|error| format!("--list: {error}"))
 }
 
 /// `get`: one file of the newest manifest, rebuilt into `--into`.
