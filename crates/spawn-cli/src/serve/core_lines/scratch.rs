@@ -135,8 +135,8 @@ impl Budget {
 }
 
 /// Walk `entry` (not following symlinks): its regular files' lengths, the
-/// newest change of anything in it (itself included), and whether it holds
-/// a `*.jsonl` file. `None` when the budget runs out.
+/// newest change of anything in it but symlinks (itself included), and
+/// whether it holds a `*.jsonl` file. `None` when the budget runs out.
 fn found(entry: &Path, metadata: &std::fs::Metadata, budget: &mut Budget) -> Option<Found> {
     let mut found = Found {
         newest_ms: mtime_ms(metadata),
@@ -163,6 +163,11 @@ fn found(entry: &Path, metadata: &std::fs::Metadata, budget: &mut Budget) -> Opt
             let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                 continue;
             };
+            // A symlink is never followed, nor dated: making one changes
+            // the directory that holds it.
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
             found.newest_ms = found.newest_ms.max(mtime_ms(&metadata));
             if metadata.is_dir() {
                 pending.push(path);
