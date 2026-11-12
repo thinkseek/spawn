@@ -3427,6 +3427,56 @@ mod tests {
         });
     }
 
+    #[test]
+    fn a_cost_mission_row_carries_its_name_as_the_missions_board_gives_it() {
+        in_test_schema(|_owner, store| {
+            let supply = store
+                .mission_add(
+                    "Owner work on Supply PA: changes the owner reviews.",
+                    &json!(["/x/supply.git"]),
+                    "human",
+                )
+                .expect("a mission");
+            let docs = store
+                .mission_add("Docs: rewrite the guide.", &json!([]), "human")
+                .expect("a mission");
+            // A task of the first mission alone: the second is named all
+            // the same, with none of its tasks in the answer.
+            let task = store
+                .task_assign(supply, "ephemeral", "w1", "Goal: one change.", "default")
+                .expect("a task");
+            let mut board = store.mission_board(50).expect("the board");
+            super::labels::label_board(&mut board);
+            let board_name = |id: i64| {
+                board["missions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|mission| mission["id"] == id)
+                    .map_or_else(
+                        || panic!("no mission {id} on the board: {board}"),
+                        |mission| mission["mission_name"].clone(),
+                    )
+            };
+            let mut answer = json!({
+                "missions": [
+                    {"mission": supply, "usd": 1.0},
+                    {"mission": docs, "usd": 0.5},
+                    {"mission": 999_999, "usd": 0.1},
+                ],
+                "tasks": [{"task": task, "mission": supply, "usd": 1.0}],
+            });
+            super::label_cost_tasks(store, &mut answer).expect("labelled");
+            let name = |index: usize| answer["missions"][index]["name"].clone();
+            assert_eq!(name(0), json!("Supply PA · owner work"), "{answer}");
+            assert_eq!(name(0), board_name(supply), "{answer}");
+            assert_eq!(name(1), board_name(docs), "{answer}");
+            assert!(name(1).is_string(), "{answer}");
+            assert_eq!(name(2), serde_json::Value::Null, "not in the record");
+            assert!(answer["tasks"][0]["label"].is_string(), "{answer}");
+        });
+    }
+
     /// The supervisor's session starts an execution, as the Bridge records it.
     fn execution_starts(store: &spawn_postgres::PostgresStore) {
         spawn_core::port::EventLog::append(
