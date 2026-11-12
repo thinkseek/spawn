@@ -131,3 +131,49 @@ fn only_the_owner_records_backups() {
         "{refused}"
     );
 }
+
+fn stored() -> Value {
+    json!({
+        "type": "backup.stored", "area": "transcripts", "host": "spawn", "account": "ckl",
+        "manifest": "transcripts/manifests/spawn/ckl/20261113-003117-4460e808.json.gpg",
+        "files": 2, "unchanged": 0, "grown": 1, "whole": 1,
+        "segments_written": 2, "segments_found": 0, "bytes_written": 714,
+    })
+}
+
+/// A `spawn store put` run (`backup.stored`, crate backup/store.rs) is
+/// accepted through the owner's spawn_backup_record and folded into no
+/// table; its shape is fixed: another field, an area it does not name, a
+/// count that is not a whole number at or above 0, a key that is not a
+/// string, each refuses the whole record.
+#[test]
+fn a_store_run_is_a_backup_stored_record_of_fixed_shape() {
+    let (store, schema) = store("backup_stored");
+    let mut client = admin(&schema);
+    store.backup_record(&stored()).expect("a store record");
+    assert_eq!(control_records(&mut client, "backup.stored"), 1);
+    let with = |field: &str, value: Value| {
+        let mut record = stored();
+        record[field] = value;
+        record
+    };
+    for (what, record) in [
+        ("another field", with("sha256", json!("a".repeat(64)))),
+        ("an area it does not name", with("area", json!("models"))),
+        ("no area", with("area", Value::Null)),
+        ("a negative count", with("files", json!(-1))),
+        ("a fractional count", with("bytes_written", json!(1.5))),
+        ("a count as text", with("whole", json!("1"))),
+        (
+            "a manifest that is not a string",
+            with("manifest", json!(1)),
+        ),
+    ] {
+        assert!(store.backup_record(&record).is_err(), "{what}: {record}");
+    }
+    assert_eq!(
+        control_records(&mut client, "backup.stored"),
+        1,
+        "nothing refused was recorded"
+    );
+}

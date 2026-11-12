@@ -1,4 +1,4 @@
-//! `spawn backup store put|get|list|verify`: the off-host copy of the
+//! `spawn store put|get|list|verify`: the off-host copy of the
 //! transcript archive and the native sessions, upload-only (sync/plan-r2.md,
 //! design D as the lead and rev-g settled it, 2026-11-13).
 //!
@@ -48,9 +48,9 @@ use super::{Lock, Scratch, Settings, Stamp, hex, random_hex};
 use crate::Flags;
 use crate::config::env_value;
 
-const USAGE: &str = "usage: spawn backup store put --area transcripts|sessions [--from <dir>] [--root <dir>]\n       \
-spawn backup store get --area <area> --path <file> --into <dir> [--root <dir>]\n       \
-spawn backup store list|verify --area <area> [--root <dir>]";
+const USAGE: &str = "usage: spawn store put --area transcripts|sessions [--from <dir>] [--root <dir>]\n       \
+spawn store get --area <area> --path <file> --into <dir> [--root <dir>]\n       \
+spawn store list|verify --area <area> [--root <dir>]";
 
 /// The largest segment: a file that grew by more is cut into several.
 const SEGMENT_MAX: u64 = 64 * 1024 * 1024;
@@ -197,7 +197,7 @@ fn name_key(settings: &Settings) -> Result<[u8; 32], String> {
     let secret = fs::read(&settings.key_file)
         .map_err(|error| format!("the backup key {}: {error}", settings.key_file.display()))?;
     Ok(Sha256::new()
-        .chain_update(b"spawn backup store: segment names\0")
+        .chain_update(b"spawn store: segment names\0")
         .chain_update(&secret)
         .finalize()
         .into())
@@ -641,7 +641,7 @@ impl<B: Bucket> Store<'_, B> {
     }
 }
 
-/// The entry point: `spawn backup store <verb> ...`.
+/// The entry point: `spawn store <verb> ...`.
 pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
     let Some(verb) = arguments.first() else {
         return Err(USAGE.to_string());
@@ -751,6 +751,27 @@ fn put_verb(
         counts.segments_found,
         counts.manifest
     );
+    // The run, as a `backup.stored` record (its manifest's key and counts,
+    // nothing of a file's content). The copy is in the bucket already; a
+    // record that cannot be written fails the run, and the next run reads
+    // its last manifest from the bucket either way.
+    let record = serde_json::json!({
+        "type": "backup.stored",
+        "area": area,
+        "host": store.keys.host,
+        "account": store.keys.account,
+        "manifest": counts.manifest,
+        "files": counts.files,
+        "unchanged": counts.unchanged,
+        "grown": counts.appended,
+        "whole": counts.whole,
+        "segments_written": counts.segments_written,
+        "segments_found": counts.segments_found,
+        "bytes_written": counts.bytes_written,
+    });
+    crate::config::open_store()?
+        .backup_record(&record)
+        .map_err(|error| format!("backup.stored: {error}"))?;
     Ok(0)
 }
 

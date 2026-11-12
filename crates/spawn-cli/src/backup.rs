@@ -104,7 +104,7 @@ const DEFAULT_ALERT_MB: u64 = 8_000;
 /// A byte count per `SPAWN_BACKUP_R2_*` megabyte.
 const MB: u64 = 1_000_000;
 
-const USAGE: &str = "usage: spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep]\n       spawn backup store put|get|list|verify --area transcripts|sessions ...";
+const USAGE: &str = "usage: spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep]";
 
 /// One `postgres://` URL, read the way libpq reads it (scripts/pg-url.sh):
 /// user and password percent-decoded, an IPv6 host in brackets, a socket
@@ -858,15 +858,18 @@ fn output(mut command: Command, what: &str) -> Result<(bool, String, String), St
     ))
 }
 
+/// `spawn store put|get|list|verify` (the off-host copy's layer,
+/// [`store`]).
+pub(crate) fn store_command(arguments: &[String]) -> Result<i32, String> {
+    store::command(arguments)
+}
+
 /// The entry point: `spawn backup dump|bundle|verify|restore-drill [--root <dir>]`.
 pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
     let Some(verb) = arguments.first() else {
         return Err(USAGE.to_string());
     };
     let rest: Vec<String> = arguments[1..].to_vec();
-    if verb == "store" {
-        return store::command(&rest);
-    }
     let switches: &[&str] = if verb == "restore-drill" {
         &["keep"]
     } else {
