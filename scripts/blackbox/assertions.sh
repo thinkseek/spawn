@@ -86,3 +86,27 @@ pane() {
 terminal() {
     tmux -L "$SPAWN_TMUX_SOCKET" list-sessions -F '#{session_name}' | head -1
 }
+
+# What a scenario prints to stderr when it gives up waiting for a
+# supervisor's turn, so the gate log shows where the line stopped: the
+# commands submitted, the newest events, and every pane on the scenario's
+# own tmux socket. Everything comes from the scenario's own database and
+# socket, never a live one. The credentials of any URL are masked.
+supervisor_turn_dump() { # <what the scenario waited for>
+    {
+        echo "-- gave up waiting for: $1"
+        echo "-- spawn_commands, newest 10:"
+        sql "select concat_ws(' | ', id, principal, idempotency_key, session_id, state, 'attempt ' || lease_attempt,
+                              'succeeded ' || coalesce(succeeded::text, '-'), 'created ' || created_at_ms,
+                              'finished ' || coalesce(finished_at_ms::text, '-'), 'error ' || coalesce(left(error, 200), '-'),
+                              coalesce(action ->> 'type', '-'), left(coalesce(action ->> 'text', ''), 160))
+               from spawn_commands order by id desc limit 10" 2>&1
+        echo "-- spawn_events, newest 40, oldest first:"
+        sql "select concat_ws(' | ', e.id, e.recorded_at_ms, e.session_id, e.event_name, left(e.kind::text, 300))
+               from (select * from spawn_events order by id desc limit 40) e order by e.id" 2>&1
+        for session in $(tmux -L "$SPAWN_TMUX_SOCKET" list-sessions -F '#{session_name}' 2>/dev/null); do
+            echo "-- pane $session, last 30 lines:"
+            tmux -L "$SPAWN_TMUX_SOCKET" capture-pane -p -t "=$session:" -S -30 2>&1 | tail -n 30
+        done
+    } 2>&1 | sed -E 's#([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]]*@#\1***@#g' >&2 || true
+}
