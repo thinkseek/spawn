@@ -271,16 +271,25 @@ fn a_run_sends_only_what_changed_and_never_writes_a_key_twice() {
     bucket.objects.borrow_mut().remove(&named);
     assert_eq!(store.check(&newest).expect("check").1, 1);
 
-    // What is stored is sealed, and its name is the HMAC of its bytes.
-    let (bytes, sha256) = bucket
-        .objects
-        .borrow()
-        .iter()
-        .find(|(key, _)| key.contains("/segments/"))
-        .map(|(_, value)| value.clone())
-        .expect("a segment");
-    assert!(bytes.starts_with(b"sealed:"));
-    assert_eq!(sha256, hex(&Sha256::digest(&bytes[7..])));
+    // What is stored is sealed; no object's metadata is its plaintext's
+    // sha256 (rev-g F1: that would confirm a guessed segment), it is the
+    // sealed bytes'; a segment's name is the HMAC of its plaintext.
+    for (key, (bytes, sha256)) in bucket.objects.borrow().iter() {
+        let plain = bytes.strip_prefix(b"sealed:").expect("sealed");
+        assert_ne!(
+            sha256,
+            &hex(&Sha256::digest(plain)),
+            "{key}: its plaintext's sha256"
+        );
+        assert_eq!(
+            sha256,
+            &hex(&Sha256::digest(bytes)),
+            "{key}: the sealed bytes' sha256"
+        );
+        if key.contains("/segments/") {
+            assert!(key.ends_with(&hex(&hmac_sha256(&[7; 32], plain))), "{key}");
+        }
+    }
     fs::remove_dir_all(&dir).expect("clean up");
     fs::remove_dir_all(&work).expect("clean up");
 }

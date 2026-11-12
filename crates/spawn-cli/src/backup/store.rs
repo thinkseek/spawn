@@ -17,7 +17,12 @@
 //! backup key (gpg), and PUT with `If-None-Match: *`, so a key that exists
 //! is never written again; the same bytes are the same name, found by HEAD
 //! and not sent. Each PUT is read back (HEAD: its length, its ETag the MD5
-//! sent, its sha256) before it counts. Nothing here deletes or overwrites an
+//! sent, the sealed bytes' sha256) before it counts; no object's metadata
+//! holds anything of its plaintext (rev-g F1). A key found there is taken
+//! as written (its name is its content's); `verify` finds one lost. A grown
+//! file's old bytes are read and hashed again each run it grows (the prefix
+//! check). The newest manifest is the newest key, so runs of one area,
+//! host and account must not overlap: put holds the backup lock. Nothing here deletes or overwrites an
 //! object.
 //!
 //! A run's manifest lists every file of the area with its size, ns mtime,
@@ -97,7 +102,7 @@ pub(crate) struct Head {
 /// The bucket, as this layer uses it: never a delete, never an overwrite.
 pub(crate) trait Bucket {
     /// Write `file` at `key` unless the key exists (`If-None-Match: *`),
-    /// with `sha256` (the plaintext's) as its metadata.
+    /// with `sha256` (of `file`, the sealed bytes) as its metadata.
     fn put_new(&self, key: &str, file: &Path, sha256: &str) -> Result<Put, String>;
     fn head(&self, key: &str) -> Result<Option<Head>, String>;
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String>;
@@ -432,14 +437,10 @@ impl<B: Bucket> Store<'_, B> {
     /// Seal `bytes` and write them at `key` unless it exists; read back
     /// either way. True when this run wrote it.
     fn send(&self, key: &str, bytes: &[u8]) -> Result<(bool, u64), String> {
-        let sha256 = hex(&Sha256::digest(bytes));
-        if let Some(head) = self.bucket.head(key)? {
-            if head.sha256 != sha256 {
-                return Err(format!(
-                    "{key} exists with another sha256 ({})",
-                    head.sha256
-                ));
-            }
+        // A key that is there is taken as written (rev-g N1): a segment's
+        // name is the HMAC of its bytes, a manifest's key is the run's own;
+        // `verify` is what finds one lost.
+        if self.bucket.head(key)?.is_some() {
             return Ok((false, 0));
         }
         let plain = self.scratch.join(format!("plain-{}", random_hex(6)?));
@@ -451,25 +452,25 @@ impl<B: Bucket> Store<'_, B> {
                 .map_err(|error| format!("{}: {error}", sealed.display()))?
                 .len();
             let md5 = super::md5_file(&sealed)?;
-            let wrote = self.bucket.put_new(key, &sealed, &sha256)? == Put::Written;
+            // The sealed bytes' sha256, never the plaintext's (rev-g F1): a
+            // plaintext hash in the metadata would confirm a guessed
+            // segment to anyone who can read the bucket.
+            let sealed_sha256 = super::sha256_file(&sealed)?;
+            if self.bucket.put_new(key, &sealed, &sealed_sha256)? == Put::Existed {
+                return Ok((false, 0));
+            }
             // Read back before it counts: what is there is what was sent.
             let head = self
                 .bucket
                 .head(key)?
                 .ok_or_else(|| format!("{key}: not there after its PUT"))?;
-            if head.sha256 != sha256 {
+            if head.length != length || head.etag != md5 || head.sha256 != sealed_sha256 {
                 return Err(format!(
-                    "{key}: read back with sha256 {}, sent {sha256}",
-                    head.sha256
+                    "{key}: read back {} bytes, ETag {:?}, sha256 {}; sent {length} bytes, MD5 {md5:?}, sha256 {sealed_sha256}",
+                    head.length, head.etag, head.sha256
                 ));
             }
-            if wrote && (head.length != length || head.etag != md5) {
-                return Err(format!(
-                    "{key}: read back {} bytes, ETag {:?}; sent {length} bytes, MD5 {md5:?}",
-                    head.length, head.etag
-                ));
-            }
-            Ok((wrote, if wrote { length } else { 0 }))
+            Ok((true, length))
         })();
         let _ = fs::remove_file(&plain);
         let _ = fs::remove_file(&sealed);

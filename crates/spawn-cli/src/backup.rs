@@ -1508,8 +1508,9 @@ header = \"x-amz-meta-sha256: {}\"\nheader = \"x-amz-meta-spawn-events: {}\"\n",
 }
 
 /// Write `file` at `key` only when no object is there (`If-None-Match: *`:
-/// the bucket answers 412 to a key that exists), with the plaintext's
-/// `sha256` as metadata (`spawn backup store`). Never an overwrite.
+/// the bucket answers 412 to a key that exists), with `sha256` (the sealed
+/// file's, never a plaintext's) as metadata (`spawn backup store`). Never an
+/// overwrite.
 fn put_new_object(
     settings: &Settings,
     key: &str,
