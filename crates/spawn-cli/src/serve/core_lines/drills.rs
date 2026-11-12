@@ -366,7 +366,10 @@ pub(super) struct Drills {
 
 /// Read the drills of the file's `text` at `now_ms`: a record's last pass
 /// from the store (a failed read is no pass, and logged), a unit's through
-/// systemctl ([`unit_pass`]).
+/// systemctl ([`unit_pass`]). The two ages join the line only when the file
+/// names its recovery table (`recoverability`): without one both would be
+/// null by construction, and objective 087's line stays its four
+/// guardrails. The north star is always there (null with no rows).
 pub(super) fn read(
     store: &spawn_postgres::PostgresStore,
     text: Option<&str>,
@@ -392,7 +395,11 @@ pub(super) fn read(
             unit_pass(unit, now_ms);
         }
     }
-    let (north_star, guardrails) = figures(&passes, status_at_ms(config.status.as_deref()), now_ms);
+    let (north_star, mut guardrails) =
+        figures(&passes, status_at_ms(config.status.as_deref()), now_ms);
+    if !config.present {
+        guardrails.clear();
+    }
     Drills {
         north_star,
         guardrails,

@@ -967,7 +967,8 @@ option to systemctl (`-H<host>` is an SSH connection to that host, and the
 file is writable by the agents' account), and a `.timer` has no `ExecMain*`
 result. A row with neither has no drill. The figures:
 `recoverability.restores_passed` (count, the rows whose last pass is within
-7 days; null with no rows), then after 087's guardrails
+7 days; null with no rows), then, after 087's guardrails and only when the
+file names `recoverability` (without it both would be null),
 `recoverability.session_backup_age` (ms since the status file's `at`, epoch
 seconds; null without one) and `recoverability.oldest_drill_age` (ms since
 the oldest of the rows' last passes, rows that never passed left out; null
