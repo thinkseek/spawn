@@ -1320,6 +1320,51 @@ outside_entries=$(ls "$outside_cache/spawn/gate-base")
 expect "and finds no entry to overwrite: the base's listing is whole" \
     "$(for e in $outside_entries; do [ "$(sed -n 2p "$outside_cache/spawn/gate-base/$e")" = "runnable 4" ] && echo whole; done)" whole
 refuse "nor adds one" "$outside_entries" "ffffffffffffffff"
+# The warm (--base-only, after each landing) lists and caches the base's
+# tests too, so the first gate on a new main takes them from the cache. On
+# a base whose tests do not build it caches nothing and still exits 0.
+warm_listing() { # <base> <cache home>: the warm's exit status
+    status=0
+    XDG_CACHE_HOME=$2 SPAWN_GATE_VERDICT=$integrator/verdict sh "$gate" --base-only "$repo" "$1" "$scenarios" \
+        >"$work/gate.out" 2>&1 || status=$?
+    echo "exit=$status"
+}
+listing_entries() { # <cache home>: the listing entries in its base cache
+    for e in "$1/spawn/gate-base"/*; do
+        case "$(head -n 1 "$e" 2>/dev/null)" in "spawn gate tests listing v1 "*) echo "$e" ;; esac
+    done
+}
+git -C "$seed" checkout -q -B rust-warm "$rust_base"
+git -C "$seed" -c user.name=t -c user.email=t@localhost commit -q --allow-empty -m 'a new main'
+warm_base=$(git -C "$seed" rev-parse HEAD)
+printf 'two\n' >"$seed/value"
+warm_candidate=$(commit rust-warm-candidate)
+rm -rf "$integrator"
+mkdir -m 700 "$integrator"
+expect "a warm on a new main exits 0" "$(warm_listing "$warm_base" "$work/caches/warm-list")" 'exit=0'
+expect "it lists the base's tests" "$(cat "$work/gate.out")" "== base only: the base's test listing"
+expect "and caches them" "$(cat "$work/gate.out")" "| tests: the base's listing, now in the cache (4)"
+refuse "it judges no candidate" "$(cat "$work/gate.out")" '== candidate: build'
+expect "its listing stage closes ok" "$(cat "$work/gate.out")" "stage gate ok"
+refuse "and is not left aborted" "$(cat "$work/gate.out")" "aborted"
+expect "one listing entry" "$(listing_entries "$work/caches/warm-list" | grep -c .)" 1
+saved_base=$base
+base=$warm_base
+expect "the first gate on that main lands" "$(XDG_CACHE_HOME=$work/caches/warm-list judge "$warm_candidate")" \
+    'exit=0 {"verdict":"accepted"}'
+base=$saved_base
+expect "and takes the base's listing from the cache the warm wrote" "$(cat "$work/gate.out")" \
+    "| tests: the base's listing from the cache (4)"
+refuse "listing no base test itself" "$(cat "$work/gate.out")" "listed now"
+rust_branch rust-broken-base
+printf 'pub fn broken( {\n' >>"$seed/src/lib.rs"
+broken_base=$(commit rust-broken-base)
+rm -rf "$integrator"
+mkdir -m 700 "$integrator"
+expect "a warm on a main whose tests do not build still exits 0" \
+    "$(warm_listing "$broken_base" "$work/caches/warm-broken")" 'exit=0'
+expect "caching no listing" "$(listing_entries "$work/caches/warm-broken" | grep -c . || true)" 0
+expect "and says so" "$(cat "$work/gate.out")" "| base only: the base's tests do not build: no listing cached"
 rust_branch rust-comment
 drop_b
 printf '\n// #[test]\n// fn b() {}\n/// A string, not a test.\npub const B: &str = "#[test] fn b() {}";\n' \

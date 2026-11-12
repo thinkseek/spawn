@@ -3688,10 +3688,158 @@ base_result() {
         END { if (!found) print "none" }' "$work/base-results"
 }
 
+# What the listing runs: cargo's arguments and libtest's (and `--ignored`
+# for the second pass). Both are in the base listing's cache key below.
+listing_cargo='test --quiet --workspace'
+listing_libtest='--list --format terse'
+# runnable_tests <writable dir> <tree> <target dir> <names file>: how many
+# tests cargo runs in the tree, from inside the sandbox: libtest's
+# `<name>: test` lines of `--list`, minus those of `--list --ignored`. Their
+# names go to <names file>, sorted, one line per test (a name two test
+# binaries share is there twice), a doctest's ` (line N)` dropped so that
+# an edit above it does not rename it.
+runnable_tests() {
+    list_dir=$1
+    list_tree=$2
+    list_target=$3
+    list_names=$4
+    for list_mode in all ignored; do
+        # shellcheck disable=SC2086 # $listing_libtest: fixed words, no globs
+        set -- $listing_libtest
+        [ "$list_mode" = ignored ] && set -- "$@" --ignored
+        # shellcheck disable=SC2086 # $listing_cargo: fixed words, no globs
+        sandbox "$list_dir" env CARGO_TARGET_DIR="$list_target" ${gate_build_jobs:+"CARGO_BUILD_JOBS=$gate_build_jobs"} \
+            cargo $listing_cargo \
+            --manifest-path "$list_tree/Cargo.toml" -- "$@" \
+            >"$work/tests.$list_mode" 2>>"$work/tests.log" || return 1
+        sed -n 's/: test$//p' "$work/tests.$list_mode" | sed -E 's/ \(line [0-9]+\)$//' |
+            LC_ALL=C sort >"$work/names.$list_mode"
+    done
+    LC_ALL=C comm -23 "$work/names.all" "$work/names.ignored" >"$list_names"
+    grep -c . "$list_names" || true
+}
+
+# The base's test listing and its cache (used by the warm below and by
+# "tests: what cargo runs" further down).
+#
+# The base's listing is cached: every gate on one main lists the same base,
+# and building the base's test binaries for it is most of this stage (37-55
+# s a gate, 287 s under load). The entry is a 64-hex file in $base_cache
+# (which the sandbox never sees, so no candidate code can write one), named
+# by sha256 of everything that decides the listing (listing_key):
+# - the base commit, and its tree and Cargo.lock as git ids;
+# - the toolchain as the sandbox runs it: `rustc -vV` (version, commit,
+#   host triple, LLVM) and `cargo -V`;
+# - the sandbox's whole environment but its database URL (PATH, CARGO_HOME,
+#   RUSTUP_HOME, LANG; no RUSTFLAGS or CARGO_BUILD_TARGET reaches it, and one
+#   that did would be here);
+# - cargo's and libtest's arguments ($listing_cargo, $listing_libtest; no
+#   features or target flags are passed);
+# - the gate (gate_key).
+# The entry's first line names its key, the second is `runnable <N>`, then
+# the N names. It is written only after a base listing that completed, to a
+# temporary file renamed into place, so four gates at once write whole
+# entries. Anything else is a miss, said with its reason (none, unreadable,
+# empty, another version, another key, a count that is not its names'), and listed
+# again and rewritten. A warm (--base-only) lists and caches it too, so
+# the first gate on a new main finds it. A hit touches the entry; spawn-maintenance removes it
+# with the base results when no gate has used it for 14 days. Nothing else
+# uses the base's test build ($work/base-target is the listing's alone). The
+# candidate is always listed.
+listing_probe() {
+    sandbox "$work/base-target" sh -c '
+        rustc -vV 2>&1; echo "rustc: $?"
+        cargo -V 2>&1; echo "cargo: $?"
+        env | grep -vE "^(SPAWN_TEST_DATABASE_URL|PWD|OLDPWD|SHLVL|_)=" | LC_ALL=C sort' \
+        >"$work/listing-probe" 2>&1 || true
+    if [ -s "$work/sandbox-never-started" ]; then sandbox_fault "$work/sandbox-never-started" toolchain; fi
+}
+listing_key() {
+    listing_probe
+    {
+        echo "spawn gate tests listing v1"
+        echo "base $base_commit"
+        echo "tree $(git --git-dir="$repo" rev-parse "$base_commit^{tree}")"
+        echo "Cargo.lock $(git --git-dir="$repo" rev-parse --verify --quiet "$base_commit:Cargo.lock" || echo none)"
+        echo "cargo $listing_cargo -- $listing_libtest"
+        echo "$gate_key"
+        cat "$work/listing-probe"
+    } | sha256sum | cut -d' ' -f1
+}
+# listing_read <entry> <names file>: for a whole entry of this key, its
+# count in $listing_count and its names into <names file>; otherwise fails
+# with the reason in $listing_miss. (Not in a command substitution: the
+# reason would stay in the subshell.)
+listing_read() {
+    listing_miss="none"
+    [ -e "$1" ] || return 1
+    listing_miss="unreadable"
+    [ -r "$1" ] || return 1
+    listing_miss="empty"
+    [ -s "$1" ] || return 1
+    listing_miss="unreadable"
+    listing_head=$(head -n 2 -- "$1" 2>/dev/null) || return 1
+    listing_first=$(printf '%s\n' "$listing_head" | sed -n 1p)
+    case "$listing_first" in
+    "spawn gate tests listing v1 "*) ;;
+    *) listing_miss="another version"; return 1 ;;
+    esac
+    [ "${listing_first#spawn gate tests listing v1 }" = "${1##*/}" ] || { listing_miss="another key"; return 1; }
+    listing_miss="a count that is not its names'"
+    listing_count=$(printf '%s\n' "$listing_head" | sed -n 's/^runnable \([0-9][0-9]*\)$/\1/p')
+    [ -n "$listing_count" ] || return 1
+    tail -n +3 -- "$1" >"$2" 2>/dev/null || { listing_miss="unreadable"; return 1; }
+    [ "$(grep -c . "$2" || true)" = "$listing_count" ] || return 1
+    [ "$(wc -l <"$2")" = "$listing_count" ] || return 1
+}
+# base_listing: the base's runnable tests, $base_tests, and their names in
+# $work/tests.base-names, from the cache or listed now and cached; fails
+# when the base's tests do not build (cargo's lines in $work/tests.log).
+# The gate's listing and the warm's (--base-only) both come here: one key,
+# one entry, one way to write it.
+base_listing() {
+    mkdir -p "$work/base-target"
+    listing_entry=$base_cache/$(listing_key)
+    if listing_read "$listing_entry" "$work/tests.base-names"; then
+        base_tests=$listing_count
+        touch -c -- "$listing_entry" 2>/dev/null || :
+        echo "| tests: the base's listing from the cache ($base_tests)"
+        return 0
+    fi
+    echo "| tests: the base's listing is not in the cache ($listing_miss): listed now"
+    : >"$work/tests.log"
+    base_tests=$(runnable_tests "$work/base-target" "$work/baseline" "$work/base-target" \
+        "$work/tests.base-names") || return 1
+    # A whole listing only: a count, and its names beside it.
+    case $base_tests in '' | *[!0-9]*) return 1 ;; esac
+    [ -f "$work/tests.base-names" ] || return 1
+    # Into the cache: a whole entry or none. Never from a listing whose
+    # sandbox did not start (its note decides, as for the base results).
+    if [ ! -s "$work/sandbox-never-started" ] &&
+        { printf 'spawn gate tests listing v1 %s\nrunnable %s\n' "${listing_entry##*/}" "$base_tests" &&
+            cat "$work/tests.base-names"; } >"$listing_entry.$$" 2>/dev/null &&
+        mv -f -- "$listing_entry.$$" "$listing_entry" 2>/dev/null; then
+        echo "| tests: the base's listing, now in the cache ($base_tests)"
+    else
+        rm -f -- "$listing_entry.$$" 2>/dev/null || :
+        echo "| tests: the base's listing was not cached"
+    fi
+}
+
 # Base only: the base's results are in the cache, for the gates that judge
 # a candidate on this base next (the deploy starts one after it moves main:
 # deploy/deploy.sh). No candidate, no verdict.
 if [ -n "$base_only" ]; then
+    # And the base's test listing, so the first gate on this main takes it
+    # from the cache. The base is main's commit, listed in the sandbox like
+    # a gate's base; a listing that fails or does not complete writes no
+    # entry (base_listing), and the warm still exits 0: its results stand.
+    if [ -f "$work/baseline/Cargo.toml" ]; then
+        section "base only: the base's test listing"
+        base_listing ||
+            echo "| base only: the base's tests do not build: no listing cached ($(tail -n 1 "$work/tests.log"))"
+        stage_close ok
+    fi
     echo "| base only: $(grep -c . "$work/base-results" || true) results for the base $base_commit" \
         "are in the base cache $base_cache"
     [ -z "$skipped_on_base" ] ||
@@ -3809,37 +3957,6 @@ fi
 # never on what the file holds later.
 candidate_binary=$(binary_hash "$work/candidate")
 
-# What the listing runs: cargo's arguments and libtest's (and `--ignored`
-# for the second pass). Both are in the base listing's cache key below.
-listing_cargo='test --quiet --workspace'
-listing_libtest='--list --format terse'
-# runnable_tests <writable dir> <tree> <target dir> <names file>: how many
-# tests cargo runs in the tree, from inside the sandbox: libtest's
-# `<name>: test` lines of `--list`, minus those of `--list --ignored`. Their
-# names go to <names file>, sorted, one line per test (a name two test
-# binaries share is there twice), a doctest's ` (line N)` dropped so that
-# an edit above it does not rename it.
-runnable_tests() {
-    list_dir=$1
-    list_tree=$2
-    list_target=$3
-    list_names=$4
-    for list_mode in all ignored; do
-        # shellcheck disable=SC2086 # $listing_libtest: fixed words, no globs
-        set -- $listing_libtest
-        [ "$list_mode" = ignored ] && set -- "$@" --ignored
-        # shellcheck disable=SC2086 # $listing_cargo: fixed words, no globs
-        sandbox "$list_dir" env CARGO_TARGET_DIR="$list_target" ${gate_build_jobs:+"CARGO_BUILD_JOBS=$gate_build_jobs"} \
-            cargo $listing_cargo \
-            --manifest-path "$list_tree/Cargo.toml" -- "$@" \
-            >"$work/tests.$list_mode" 2>>"$work/tests.log" || return 1
-        sed -n 's/: test$//p' "$work/tests.$list_mode" | sed -E 's/ \(line [0-9]+\)$//' |
-            LC_ALL=C sort >"$work/names.$list_mode"
-    done
-    LC_ALL=C comm -23 "$work/names.all" "$work/names.ignored" >"$list_names"
-    grep -c . "$list_names" || true
-}
-
 # The candidate may not run fewer tests than the base, nor stop running one
 # of the base's by name. Read from what cargo runs, so a test deleted,
 # ignored, commented out, left in a file no `mod` includes, or behind
@@ -3854,106 +3971,15 @@ runnable_tests() {
 # commit against itself (scripts/rsi/nightly.sh: main judged as its own
 # candidate, one scenario at a time) has no diff to drop a test, and skips
 # the listing: it compiles both trees' test binaries.
-#
-# The base's listing is cached: every gate on one main lists the same base,
-# and building the base's test binaries for it is most of this stage (37-55
-# s a gate, 287 s under load). The entry is a 64-hex file in $base_cache
-# (which the sandbox never sees, so no candidate code can write one), named
-# by sha256 of everything that decides the listing (listing_key):
-# - the base commit, and its tree and Cargo.lock as git ids;
-# - the toolchain as the sandbox runs it: `rustc -vV` (version, commit,
-#   host triple, LLVM) and `cargo -V`;
-# - the sandbox's whole environment but its database URL (PATH, CARGO_HOME,
-#   RUSTUP_HOME, LANG; no RUSTFLAGS or CARGO_BUILD_TARGET reaches it, and one
-#   that did would be here);
-# - cargo's and libtest's arguments ($listing_cargo, $listing_libtest; no
-#   features or target flags are passed);
-# - the gate (gate_key).
-# The entry's first line names its key, the second is `runnable <N>`, then
-# the N names. It is written only after a base listing that completed, to a
-# temporary file renamed into place, so four gates at once write whole
-# entries. Anything else is a miss, said with its reason (none, unreadable,
-# empty, another version, another key, a count that is not its names'), and listed
-# again and rewritten. A hit touches the entry; spawn-maintenance removes it
-# with the base results when no gate has used it for 14 days. Nothing else
-# uses the base's test build ($work/base-target is the listing's alone). The
-# candidate is always listed.
-listing_probe() {
-    sandbox "$work/base-target" sh -c '
-        rustc -vV 2>&1; echo "rustc: $?"
-        cargo -V 2>&1; echo "cargo: $?"
-        env | grep -vE "^(SPAWN_TEST_DATABASE_URL|PWD|OLDPWD|SHLVL|_)=" | LC_ALL=C sort' \
-        >"$work/listing-probe" 2>&1 || true
-    if [ -s "$work/sandbox-never-started" ]; then sandbox_fault "$work/sandbox-never-started" toolchain; fi
-}
-listing_key() {
-    listing_probe
-    {
-        echo "spawn gate tests listing v1"
-        echo "base $base_commit"
-        echo "tree $(git --git-dir="$repo" rev-parse "$base_commit^{tree}")"
-        echo "Cargo.lock $(git --git-dir="$repo" rev-parse --verify --quiet "$base_commit:Cargo.lock" || echo none)"
-        echo "cargo $listing_cargo -- $listing_libtest"
-        echo "$gate_key"
-        cat "$work/listing-probe"
-    } | sha256sum | cut -d' ' -f1
-}
-# listing_read <entry> <names file>: for a whole entry of this key, its
-# count in $listing_count and its names into <names file>; otherwise fails
-# with the reason in $listing_miss. (Not in a command substitution: the
-# reason would stay in the subshell.)
-listing_read() {
-    listing_miss="none"
-    [ -e "$1" ] || return 1
-    listing_miss="unreadable"
-    [ -r "$1" ] || return 1
-    listing_miss="empty"
-    [ -s "$1" ] || return 1
-    listing_miss="unreadable"
-    listing_head=$(head -n 2 -- "$1" 2>/dev/null) || return 1
-    listing_first=$(printf '%s\n' "$listing_head" | sed -n 1p)
-    case "$listing_first" in
-    "spawn gate tests listing v1 "*) ;;
-    *) listing_miss="another version"; return 1 ;;
-    esac
-    [ "${listing_first#spawn gate tests listing v1 }" = "${1##*/}" ] || { listing_miss="another key"; return 1; }
-    listing_miss="a count that is not its names'"
-    listing_count=$(printf '%s\n' "$listing_head" | sed -n 's/^runnable \([0-9][0-9]*\)$/\1/p')
-    [ -n "$listing_count" ] || return 1
-    tail -n +3 -- "$1" >"$2" 2>/dev/null || { listing_miss="unreadable"; return 1; }
-    [ "$(grep -c . "$2" || true)" = "$listing_count" ] || return 1
-    [ "$(wc -l <"$2")" = "$listing_count" ] || return 1
-}
 if [ -f "$work/baseline/Cargo.toml" ] && [ -f "$work/candidate/Cargo.toml" ] &&
     [ "$base_commit" != "$candidate_commit" ]; then
     section "tests: what cargo runs, base and candidate"
     listing_started=$(date +%s)
     mkdir -p "$work/base-target"
-    listing_entry=$base_cache/$(listing_key)
-    if listing_read "$listing_entry" "$work/tests.base-names"; then
-        base_tests=$listing_count
-        touch -c -- "$listing_entry" 2>/dev/null || :
-        echo "| tests: the base's listing from the cache ($base_tests)"
-    else
-        echo "| tests: the base's listing is not in the cache ($listing_miss): listed now"
-        : >"$work/tests.log"
-        if ! base_tests=$(runnable_tests "$work/base-target" "$work/baseline" "$work/base-target" \
-            "$work/tests.base-names"); then
-            sed 's/^/| tests: /' "$work/tests.log" | tail -n 30
-            verdict rejected "base tests do not build"
-            exit 0
-        fi
-        # Into the cache: a whole entry or none. Never from a listing whose
-        # sandbox did not start (its note decides, as for the base results).
-        if [ ! -s "$work/sandbox-never-started" ] &&
-            { printf 'spawn gate tests listing v1 %s\nrunnable %s\n' "${listing_entry##*/}" "$base_tests" &&
-                cat "$work/tests.base-names"; } >"$listing_entry.$$" 2>/dev/null &&
-            mv -f -- "$listing_entry.$$" "$listing_entry" 2>/dev/null; then
-            echo "| tests: the base's listing, now in the cache ($base_tests)"
-        else
-            rm -f -- "$listing_entry.$$" 2>/dev/null || :
-            echo "| tests: the base's listing was not cached"
-        fi
+    if ! base_listing; then
+        sed 's/^/| tests: /' "$work/tests.log" | tail -n 30
+        verdict rejected "base tests do not build"
+        exit 0
     fi
     : >"$work/tests.log"
     if ! candidate_tests=$(runnable_tests "$work/candidate" "$work/candidate" "$work/candidate/target" \
