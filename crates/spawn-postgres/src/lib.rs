@@ -100,7 +100,7 @@ mod wake;
 pub use acks::{AckRecord, ReportAnswer};
 pub use cost::{ArchiveCounted, ArchiveFile, ArchivedMessage};
 pub use gateway::{HumanInput, HumanKey, HumanResume, HumanTask, HumanWrite};
-pub use host::test_database_size;
+pub use host::{DatabaseIdentity, database_identity, test_database_size, test_schemas};
 pub use missions::{ActivityEvent, LandingHold, PushRequest};
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
@@ -217,7 +217,11 @@ impl PostgresStore {
     /// Connect and move this session into `schema`, creating it when absent.
     ///
     /// Tests use one schema per case, so a shared database cannot leak
-    /// commands or events between them.
+    /// commands or events between them. The session carries the schema's
+    /// name as its `application_name`, and a schema it makes carries
+    /// `{"made_at_ms": <ms>}` as its comment ([`made_schema_sql`]), so a
+    /// reader tells a schema a live test holds, and how old one is
+    /// (objective 094).
     pub fn connect_in_schema(url: &str, schema: &str) -> Result<Self, StoreError> {
         if !schema
             .chars()
@@ -232,7 +236,8 @@ impl PostgresStore {
             let mut client = store.lock();
             client
                 .batch_execute(&format!(
-                    "create schema if not exists {schema}; set search_path to {schema}"
+                    "{}; set search_path to {schema}",
+                    made_schema_sql(schema)
                 ))
                 .map_err(|error| backend(&error))?;
         }
@@ -802,6 +807,34 @@ impl PostgresStore {
             .execute(sql, params)
             .map_err(|error| backend(&error))
     }
+}
+
+/// The statements that make a test's `schema` when absent and name the
+/// session after it (objective 094): `application_name` is the schema's
+/// name (unless the URL named the session itself: a test that finds its own
+/// backend by a name of its own keeps it), so a reader sees which schemas a
+/// live session holds, and a schema
+/// made here carries `{"made_at_ms": <ms>}` (the server's clock) as its
+/// comment, the time a reader dates it by. A schema another session made
+/// first keeps its own comment. `schema` must be a plain identifier (the
+/// callers check it): it goes into SQL as it is.
+pub fn made_schema_sql(schema: &str) -> String {
+    format!(
+        "do $named$ begin \
+           if current_setting('application_name') = '' then \
+             perform set_config('application_name', '{schema}', false); \
+           end if; \
+         end $named$; \
+         do $made$ begin \
+           if not exists (select 1 from pg_namespace where nspname = '{schema}') then \
+             create schema {schema}; \
+             execute format('comment on schema {schema} is %L', \
+               jsonb_build_object('made_at_ms', \
+                 floor(extract(epoch from clock_timestamp()) * 1000)::bigint)::text); \
+           end if; \
+         exception when duplicate_schema then null; \
+         end $made$"
+    )
 }
 
 #[cfg(test)]

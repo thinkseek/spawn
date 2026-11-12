@@ -230,6 +230,12 @@ function mark(raw: unknown): CoreMark {
  * its key's last part in words) and what is missing. */
 function pendingWords(entry: { key?: unknown; reason?: unknown } | null | undefined, names: Map<string, string>): string {
   const key = String(entry?.key ?? "");
+  // A test database URL file the reader refused (objective 094): its name
+  // and why, never its URL (the answer holds none).
+  const urlFile = "storage.test_database_url_files.";
+  if (key.startsWith(urlFile)) {
+    return `test database URL file ${key.slice(urlFile.length)} not used: ${String(entry?.reason ?? "refused")}`;
+  }
   const known = names.get(key);
   if (known !== undefined) return `${known}: range not read (it needs a number min or max)`;
   const words = key.slice(key.lastIndexOf(".") + 1).replace(/_/g, " ");
