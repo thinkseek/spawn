@@ -296,7 +296,7 @@ export function storageView(value: unknown): StorageView {
     ...tests.map((database) => ({
       name: TEST_DATABASE_NAMES[database.role] ?? `Test database (${database.role})`,
       size: storageSize(database.bytes),
-      note: database.schemas === null ? "unreadable" : `${count(database.schemas)} schemas`,
+      note: database.schemas === null ? "unreadable" : `${count(database.schemas)} ${database.schemas === 1 ? "schema" : "schemas"}`,
     })),
   ];
   const days = storage?.days_left ?? null;
