@@ -542,7 +542,6 @@ fn nightly_dir() -> Option<PathBuf> {
     crate::env_value("SPAWN_WORKSPACE_ROOT").map(|root| PathBuf::from(root).join("nightly"))
 }
 
-<<<<<<< 83d4e5ddde8ddb21063c04e91476e01018939e44
 /// `GET /api/core-lines`.
 pub(super) fn core_lines() -> Result<Value, String> {
     core_lines_at(
@@ -552,20 +551,17 @@ pub(super) fn core_lines() -> Result<Value, String> {
     )
 }
 
-/// The answer with the ranges file at `path` and the nightly's fact files
-/// in `nightly`, read now.
-=======
 /// The same answer for the loop's alert step (`guardrail_out_of_range`,
 /// objective 089): the same figures, computed by the same code, the ranges
-/// file read now. The costly figures are kept as for `spawn serve` (the
-/// performance line for a minute, health.storage's sizes for ten), so a
-/// reading does not stall the loop.
+/// file and the nightly's fact files read now. The costly figures are kept
+/// as for `spawn serve` (the performance line for a minute, health.storage's
+/// sizes for ten), so a reading does not stall the loop.
 pub(crate) fn reading(store: &spawn_postgres::PostgresStore) -> Result<Value, String> {
-    core_lines_at(store, ranges_path().as_deref())
+    core_lines_at(store, ranges_path().as_deref(), nightly_dir().as_deref())
 }
 
-/// The answer with the ranges file at `path`, read now.
->>>>>>> cf119e4ac77a412f262775ba40ac0c6cbb91d6e6
+/// The answer with the ranges file at `path` and the nightly's fact files
+/// in `nightly`, read now.
 pub(super) fn core_lines_at(
     store: &spawn_postgres::PostgresStore,
     path: Option<&Path>,
