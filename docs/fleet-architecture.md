@@ -18,8 +18,10 @@ is its last command's (`taken`, `failed`, `pending`). The view
 `spawn_human_intents` holds one row per intent, and every count of a
 person's commands reads it: the scorecard's autonomy (`command`, with the
 part `retries`, the commands beyond each intent's first), `/api/fleet`'s
-`ladder_24h.human` and `human_per_agent_hour`, and the experience views
-(§4). `GET /api/interventions?window=24h|7d[&until=<RFC 3339>]` (any other
+`ladder_24h.human`, and the experience views (§4). `/api/fleet`'s
+`health.human_per_agent_hour` reads `spawn_interventions` (every kind, at_ms
+in the last 24 h) over `agent_hours_24h`: the Home card's figure,
+`/api/interventions?window=24h`'s `per_agent_hour`. `GET /api/interventions?window=24h|7d[&until=<RFC 3339>]` (any other
 window, or an `until` that is no time, 400) answers the figure over
 `[until − window, until)`: `window`, `since_ms`, `until_ms`, `agent_hours`
 (the executions' running time clipped to the window, to 3 decimals),
