@@ -222,10 +222,18 @@ make "$other_only" old
   >"$scratch/reviewed.md"
 admin -c "begin" -c "lock table $old_locked.t in access share mode" -c "select pg_sleep(60)" >/dev/null 2>&1 &
 holder_pid=$!
-for _ in $(seq 50); do
-  [ "$(admin -c "select count(*) from pg_locks l join pg_class c on c.oid = l.relation where c.relname = 't' and c.relnamespace = '$old_locked'::regnamespace and l.granted")" -ge 1 ] && break
+# The holder must hold its lock before the apply starts; a holder that never
+# got it would let the apply drop the held schema and fail two checks for a
+# slow start, so that is a harness error instead (exit 2).
+held=""
+for _ in $(seq 300); do
+  if [ "$(admin -c "select count(*) from pg_locks l join pg_class c on c.oid = l.relation where c.relname = 't' and c.relnamespace = '$old_locked'::regnamespace and l.granted")" -ge 1 ]; then
+    held=1
+    break
+  fi
   sleep 0.1
 done
+[ -n "$held" ] || { echo "$PROG: harness error: the holder never got its lock on $old_locked.t in 30 s" >&2; exit 2; }
 started=$(date +%s)
 run "${live[@]}" -- --apply "$scratch/reviewed.md"
 kill "$holder_pid" 2>/dev/null || true
