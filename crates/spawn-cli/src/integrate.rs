@@ -2145,7 +2145,11 @@ impl Integrator {
     }
 
     /// Each task of `mission` the load-sensitive bound parked
-    /// ([`Self::parked_task`]).
+    /// ([`Self::parked_task`]). Its cost: per parked task, every pass, one
+    /// read of the task's pushed head and its fetch into the mirror
+    /// (`sources::fetch_pushed_into`), as a judged task's pass costs; a
+    /// parked task stays so until a person or a new push releases it, so
+    /// the number of them is the owner's to keep small (rev-e N2).
     fn parked(
         &self,
         store: &PostgresStore,

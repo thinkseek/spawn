@@ -9197,6 +9197,7 @@ fn a_commit_load_sensitive_twice_is_parked_and_its_mission_goes_on() {
     };
 
     // The first: load_sensitive, a host fault as any, with its backoff.
+    let source_main_before = source_main(&source);
     pass();
     assert_eq!(count(), 1);
     let (record, _, _) = last_verdict(&db);
@@ -9213,6 +9214,14 @@ fn a_commit_load_sensitive_twice_is_parked_and_its_mission_goes_on() {
         Some(pushed.as_str())
     );
     assert_eq!(task.gate_parked_pushed, None);
+
+    // An owner's landing between the two moves main (the gate's merge
+    // candidate) but not the task's pushed commit: the key holds (rev-e N1).
+    // Recorded `source.moved`, as `spawn mission moved` does.
+    let moved = main_moves(&base, &source, "owner.txt");
+    db.store
+        .source_moved(&source, &source_main_before, &moved)
+        .expect("moved");
 
     // The second on the same commit, another scenario: parked.
     past_due(&db);
