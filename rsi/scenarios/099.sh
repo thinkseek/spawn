@@ -1,7 +1,8 @@
 #!/bin/sh
 # Black box: the owner pauses a mission and resumes it. While it is paused
 # nothing is assigned or delivered to it, its resident's engine is stopped
-# with everything kept, no "A mission has no work" alert is raised for it,
+# with its branch and transcript kept, no "A mission has no work" alert is
+# raised for it,
 # the Scorecard does not count its paused time as idle, and Home and the
 # Missions page say "paused". Resume undoes all of it, and the resident goes
 # on in its own session.
@@ -25,8 +26,11 @@
 #         naming the pause;
 #       - nothing is delivered to its workers, and its resident is stopped
 #         (a Stop, which takes a final checkpoint). The recovery does not
-#         revive it. Its delivered task stays as it is. Its workspace, its
-#         branch and its engine session (the transcript) are kept;
+#         revive it. Its delivered task stays as it is. Kept: its branch
+#         with the final checkpoint, and its engine session (the
+#         transcript). Its workspace directory is removed at the stop, as
+#         at any stop, and rebuilt from the branch at the resume: what the
+#         checkpoint leaves out is lost, as at any stop;
 #       - no `mission_idle` alert fires for it, and an open one clears at
 #         the pause (its cleared evidence names the `mission.paused`
 #         record);
@@ -44,7 +48,9 @@
 #   - `spawn mission resume --id N` on a paused mission records
 #     `mission.unpaused` {id, pause_event}: assignment and delivery go on,
 #     and the resident is resumed in its own native session on its
-#     workspace, with its work. (A halted mission's resume is unchanged.)
+#     workspace rebuilt from its branch. (A halted mission's resume is
+#     unchanged. On a mission both paused and halted, resume clears only
+#     the pause: the halt stays, for a second resume.)
 #
 # A real `spawn loop` (the Bridge, the pusher, the dispatcher, the alert
 # step; no supervisor, no model judge) and `spawn serve` run four missions,
@@ -498,7 +504,7 @@ capture "$SPAWN_BIN" mission pause --id 4 --reason "closed"
 expect_eq "$(records_of mission.paused 4 | wc -l | tr -d ' ')" 0 "(1) mission.paused records of the closed mission 4"
 note "(1) checked: the pause"
 
-# --- (2) the resident is stopped, everything kept ------------------------------------
+# --- (2) the resident is stopped, branch and transcript kept--------------------------
 
 if wait_until 20 eval '[ -z "$(live_execution bbone)" ] && ! alive "$engine_pid"'; then
     branch_work=$(git --git-dir="$branches" show refs/heads/agent_resident_bbone:work.txt 2>/dev/null || true)
@@ -620,5 +626,5 @@ if [ -s "$WORK/failures" ]; then
     echo "099: $(wc -l <"$WORK/failures") check(s) failed" >&2
     exit 1
 fi
-echo "099: a paused mission gets no work, its resident stopped with everything kept, no idle alert, no idle hours, and reads paused; its resume goes on in the same session"
+echo "099: a paused mission gets no work, its resident stopped with its branch and transcript kept, no idle alert, no idle hours, and reads paused; its resume goes on in the same session"
 exit 0
