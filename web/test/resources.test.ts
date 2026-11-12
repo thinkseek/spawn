@@ -68,12 +68,8 @@ test("gate room: one row per gated mission, the waiting gates longest first", ()
 
 import { readFileSync } from "node:fs";
 
-<<<<<<< 473482087eeb00d72ae07b9ad749038a7392029b
-import { backupAge, backupView, normalizeBackups, normalizeStorage, storageSize, storageView } from "../src/resources.ts";
-=======
 import { localDateTime } from "../src/format.ts";
-import { normalizeStorage, storageSize, storageView } from "../src/resources.ts";
->>>>>>> 5f3316c2410df9b13dc2c551ac9c791af0bc15e7
+import { backupAge, backupView, normalizeBackups, normalizeStorage, storageSize, storageView } from "../src/resources.ts";
 
 const MB = 1024 ** 2;
 const STORAGE = {
@@ -157,15 +153,10 @@ test("the health's storage is read as the server reports it, null from an older 
 
 test("the host section's Resources are followed by a Storage card drawn from storageView", () => {
   const strip = readFileSync(new URL("../src/components/fleet/HealthStrip.tsx", import.meta.url), "utf8");
-<<<<<<< 473482087eeb00d72ae07b9ad749038a7392029b
   assert.match(strip, /<Cell label="Storage"[^>]*>\s*<StorageCard storage=\{health\.storage\} backups=\{health\.backups\} \/>/);
   assert.match(strip, /backupView\(backups, now\)/, "the card's backup rows are drawn from backupView");
-  assert.match(strip, /const \{ rows, lasts \} = storageView\(storage\)/);
-=======
-  assert.match(strip, /<Cell label="Storage"[^>]*>\s*<StorageCard storage=\{health\.storage\} \/>/);
   assert.match(strip, /const \{ rows, lasts, measured_from \} = storageView\(storage\)/);
   assert.match(strip, /How long the disk lasts: \$\{measured_from === null \? "not measured yet" : `measured from \$\{measured_from\}`\}/);
->>>>>>> 5f3316c2410df9b13dc2c551ac9c791af0bc15e7
   assert.ok(strip.indexOf('label="Resources"') < strip.indexOf('label="Storage"'));
 });
 
