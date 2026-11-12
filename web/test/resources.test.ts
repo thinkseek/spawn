@@ -198,6 +198,10 @@ test("the host section's Resources are followed by a Storage card drawn from sto
   assert.match(strip, /<Cell label="Storage"[^>]*>\s*<StorageCard storage=\{health\.storage\} backups=\{health\.backups\} \/>/);
   assert.match(strip, /backupView\(backups, now\)/, "the card's backup rows are drawn from backupView");
   assert.match(strip, /const \{ rows, lasts, lasts_note, measured_from, lasts_from \} = storageView\(storage\)/);
+  // Objective 098: each line's own date beside it while it is set (not twice
+  // when the note already says it, as the archive's 083 note does).
+  assert.match(strip, /row\.measured_from !== null && row\.note !== `measured from \$\{row\.measured_from\}`/);
+  assert.match(strip, /measured from \{row\.measured_from\}/);
   // Objective 097: the note that the session backups are not counted, under the line.
   assert.match(strip, /\{lasts_note !== null && <p[^>]*>\{lasts_note\}<\/p>\}/);
   assert.match(strip, /How long the disk lasts: \$\{lasts_from !== null \? `measured from \$\{lasts_from\}` : measured_from === null \? "not measured yet" : `measured from \$\{measured_from\}`\}/);
