@@ -127,3 +127,62 @@ fn the_database_figures_are_its_size_and_its_five_largest_tables() {
         "largest first: {sizes:?}"
     );
 }
+
+/// Objective 074: the live reading carries the database's name, its
+/// schemas and its event log's bytes (the sum of `spawn_events.kind`'s
+/// stored size); a test database's reading, through a connection of its
+/// own, its name, size and schemas (other than `pg_*`,
+/// `information_schema` and `public`), and an unreachable one an error that
+/// does not name its URL.
+#[test]
+fn the_size_reading_names_the_database_its_log_and_its_schemas() {
+    let (store, schema) = store("storage_reading");
+    let mut client = admin(&schema);
+    let figures = store.database_size().expect("read");
+    let (name, schemas): (String, i64) = {
+        let row = client
+            .query_one(
+                "select current_database()::text, (select count(*) from pg_namespace n
+                   where n.nspname not like 'pg\\_%'
+                     and n.nspname not in ('information_schema', 'public'))",
+                &[],
+            )
+            .expect("name");
+        (row.get(0), row.get(1))
+    };
+    assert_eq!(figures["name"], json!(name));
+    // Other cases create and drop schemas meanwhile; this one's is counted.
+    let got_schemas = figures["schemas"].as_i64().expect("schemas");
+    assert!(got_schemas >= 1, "this case's schema at least: {figures}");
+    assert!((got_schemas - schemas).abs() <= 50, "{got_schemas} against {schemas}");
+    let log_before = figures["log_bytes"].as_i64().expect("log bytes");
+    let id = store.host_record(&sample(5 * MIB, 40)).expect("recorded");
+    let stored: i32 = client
+        .query_one("select pg_column_size(kind) from spawn_events where id = $1", &[&id])
+        .expect("size")
+        .get(0);
+    let log_after = store.database_size().expect("read")["log_bytes"]
+        .as_i64()
+        .expect("log bytes");
+    assert_eq!(log_after - log_before, i64::from(stored), "the new record's stored size");
+    let want_log: i64 = client
+        .query_one("select coalesce(sum(pg_column_size(kind)), 0)::bigint from spawn_events", &[])
+        .expect("log")
+        .get(0);
+    assert_eq!(log_after, want_log);
+
+    // The test database's reading: the same server, through its URL.
+    let test = spawn_postgres::test_database_size(&common::url()).expect("read");
+    assert_eq!(test["name"], json!(name));
+    assert!(test["bytes"].as_i64().expect("bytes") > 0);
+    assert!(test["schemas"].as_i64().expect("schemas") >= 1, "{test}");
+    assert!(test.get("log_bytes").is_none(), "a test database has no log of its own");
+    // A server that is not there: an error, without the URL.
+    let error = spawn_postgres::test_database_size(
+        "postgres://spawn:secret-074@127.0.0.1:1/nothing",
+    )
+    .expect_err("nothing listens on port 1");
+    assert!(!error.to_string().contains("secret-074"), "{error}");
+    let error = spawn_postgres::test_database_size("not a url secret-074").expect_err("no URL");
+    assert!(!error.to_string().contains("secret-074"), "{error}");
+}
