@@ -275,6 +275,14 @@ function IdleRow({ mission }: { mission: MissionIdle }) {
       {mission.idle && (
         <span className="shrink-0 rounded-full bg-warning/10 px-1.5 text-micro font-medium text-warning">idle</span>
       )}
+      {mission.pausedHours > 0 && (
+        <span
+          className="tnum shrink-0 rounded-full bg-muted px-1.5 text-micro font-medium text-muted-foreground"
+          title="The owner paused it: paused hours are not idle"
+        >
+          paused {mission.pausedHours.toFixed(0)} h
+        </span>
+      )}
       {mission.ownerWork && (
         <span
           className="shrink-0 rounded-full bg-muted px-1.5 text-micro font-medium text-muted-foreground"

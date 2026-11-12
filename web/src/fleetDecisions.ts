@@ -52,6 +52,10 @@ export interface MissionIdle {
   text: string;
   hours: number;
   idleHours: number;
+  /** Hours the owner had it paused (objective 099): not idle, and a mission
+   * paused at the window's end is never flagged idle. 0 from an older
+   * server. */
+  pausedHours: number;
   idle: boolean;
   ownerWork: boolean;
 }
@@ -154,6 +158,7 @@ export function decisionsFromApi(answer: unknown): DecisionWindow {
         text: typeof mission.text === "string" ? mission.text : "",
         hours: num(mission.hours),
         idleHours: num(mission.idle_hours),
+        pausedHours: num(mission.paused_hours),
         idle: mission.idle === true && mission.owner_work !== true,
         ownerWork: mission.owner_work === true,
       };
