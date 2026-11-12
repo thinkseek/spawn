@@ -1143,7 +1143,10 @@ expect "two METRIC lines are reported" "$(cat "$work/gate.out")" 'two or more ME
 # them, nor stop running one of the base's by name, nor add or edit a test
 # into an empty body: a tiny crate on a base of its own (the only cases that
 # run cargo, offline, no dependencies). Its base runs 4: tests::a, tests::b,
-# extra and the doctest of `one` (tests::c is ignored).
+# extra and the doctest of `one` (tests::c is ignored). The base's listing is
+# cached: the first gate on a base lists it, the next take it from the cache
+# (the rejections below judge cached names), and each part of the key alone
+# makes a miss.
 branch base-rust
 printf '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"\n' >"$seed/Cargo.toml"
 mkdir -p "$seed/src" "$seed/tests"
@@ -1193,10 +1196,130 @@ rust_branch rust-same
 same=$(commit rust-same)
 expect "the same tests land" "$(judge_rust "$same")" 'exit=0 {"verdict":"accepted"}'
 expect "the counts are reported" "$(cat "$work/gate.out")" 'tests cargo runs: 4 on the base, 4 on the candidate'
+expect "the first gate on a base finds no listing in the cache" "$(cat "$work/gate.out")" \
+    "| tests: the base's listing is not in the cache (none): listed now"
+expect "lists it and caches it" "$(cat "$work/gate.out")" "| tests: the base's listing, now in the cache (4)"
+# The entry: a 64-hex file in the base cache whose first line names its key,
+# then `runnable 4` and the names.
+listing_entry=""
+for listing_file in "$cache"/*; do
+    [ "$(sed -n 2p "$listing_file" 2>/dev/null)" = "runnable 4" ] && listing_entry=$listing_file
+done
+listing_key=$(basename "$listing_entry")
+expect "the entry is named by a 64-hex key, which maintenance prunes" \
+    "$(printf '%s\n' "$listing_key" | grep -cE '^[0-9a-f]{64}$')" 1
+expect "its first line names that key" "$(sed -n 1p "$listing_entry")" "spawn gate tests listing v1 $listing_key"
+expect "and it holds the base's runnable names" "$(tail -n +3 "$listing_entry" | tr '\n' ' ')" \
+    'extra src/lib.rs - one tests::a tests::b '
+refuse "no temporary file is left beside it" "$(ls "$cache")" "$listing_key."
 rust_branch rust-doc-shifted
 sed -i '1a //!\n//! More about the crate.' "$seed/src/lib.rs"
 shifted=$(commit rust-doc-shifted)
 expect "a doctest whose line moved keeps its name" "$(judge_rust "$shifted")" 'exit=0 {"verdict":"accepted"}'
+expect "the next gate on that base takes the listing from the cache" "$(cat "$work/gate.out")" \
+    "| tests: the base's listing from the cache (4)"
+refuse "and lists no base test" "$(cat "$work/gate.out")" "listed now"
+expect "the counts are the same" "$(cat "$work/gate.out")" 'tests cargo runs: 4 on the base, 4 on the candidate'
+# Each part of the key alone. Another commit of the same tree is another base.
+git -C "$seed" checkout -q -B rust-base-again "$rust_base"
+git -C "$seed" -c user.name=t -c user.email=t@localhost commit -q --allow-empty -m 'the same tree again'
+rust_base_again=$(git -C "$seed" rev-parse HEAD)
+printf 'two\n' >"$seed/value"
+again_candidate=$(commit rust-base-again-candidate)
+saved_base=$base
+base=$rust_base_again
+expect "a gate on another base commit of the same tree lands" "$(judge "$again_candidate")" \
+    'exit=0 {"verdict":"accepted"}'
+base=$saved_base
+expect "and misses: the base commit is in the key" "$(cat "$work/gate.out")" \
+    "| tests: the base's listing is not in the cache (none): listed now"
+# Another cargo: a shim first on PATH that answers `cargo -V` differently and
+# runs the real cargo for everything else.
+mkdir -p "$work/cargo-shim"
+printf '#!/bin/sh\n[ "$1" = -V ] && { echo "cargo 0.0.0-shim"; exit 0; }\nexec %s "$@"\n' "$(command -v cargo)" \
+    >"$work/cargo-shim/cargo"
+chmod +x "$work/cargo-shim/cargo"
+expect "a gate whose cargo says another version lands" \
+    "$(PATH="$work/cargo-shim:$PATH" judge_rust "$shifted")" 'exit=0 {"verdict":"accepted"}'
+expect "and misses: cargo's version is in the key" "$(cat "$work/gate.out")" \
+    "| tests: the base's listing is not in the cache (none): listed now"
+expect "the real cargo again hits its own entry" "$(judge_rust "$shifted")" 'exit=0 {"verdict":"accepted"}'
+expect "from the cache" "$(cat "$work/gate.out")" "| tests: the base's listing from the cache (4)"
+# Another environment in the sandbox: LANG passes through.
+other_lang=C.UTF-8
+[ "${LANG-}" = "$other_lang" ] && other_lang=C
+expect "a gate with another LANG lands" "$(LANG=$other_lang judge_rust "$shifted")" 'exit=0 {"verdict":"accepted"}'
+expect "and misses: the sandbox's environment is in the key" "$(cat "$work/gate.out")" \
+    "| tests: the base's listing is not in the cache (none): listed now"
+# A damaged entry is a miss with its reason, listed again and rewritten
+# whole (its key line, `runnable 4`, 4 names).
+listing_damaged() { # listing_damaged <what> <reason>
+    expect "$1: the gate lands" "$(judge_rust "$shifted")" 'exit=0 {"verdict":"accepted"}'
+    expect "$1: a miss, said as $2" "$(cat "$work/gate.out")" \
+        "| tests: the base's listing is not in the cache ($2): listed now"
+    expect "$1: rewritten" "$(cat "$work/gate.out")" "| tests: the base's listing, now in the cache (4)"
+    expect "$1: whole again" "$(grep -c . "$listing_entry")" 6
+}
+: >"$listing_entry"
+listing_damaged "an empty entry" "empty"
+sed -i '1s/ v1 / v0 /' "$listing_entry"
+listing_damaged "an entry of another version" "another version"
+sed -i "1s/$listing_key/$(printf '%064d' 0)/" "$listing_entry"
+listing_damaged "an entry naming another key" "another key"
+printf 'spawn gate tests listing v1 %s\nrunnable 4\ntests::a\n' "$listing_key" >"$listing_entry"
+listing_damaged "an entry whose count is not its names'" "a count that is not its names'"
+sed -i 's/^runnable 4$/runnable 3/; /^tests::b$/d' "$listing_entry"
+chmod 000 "$listing_entry"
+listing_damaged "an unreadable entry" "unreadable"
+expect "the rewritten entry is the base's names again" "$(tail -n +3 "$listing_entry" | tr '\n' ' ')" \
+    'extra src/lib.rs - one tests::a tests::b '
+# Candidate code cannot see or plant a listing: a test binary without
+# libtest's harness runs at the listing, lists one test of its own and one
+# for every base cache entry it can see, and tries to overwrite each and to
+# add one. It sees none: the candidate lists 5 (the base's 4 and its own).
+rust_branch rust-plant
+printf '\n[[test]]\nname = "plant"\nharness = false\n' >>"$seed/Cargo.toml"
+cat >"$seed/tests/plant.rs" <<EOF
+fn main() {
+    // The ignored pass lists nothing: the gate subtracts what it lists.
+    if std::env::args().any(|a| a == "--ignored") {
+        return;
+    }
+    let cache = "$cache";
+    if let Ok(entries) = std::fs::read_dir(cache) {
+        for entry in entries.flatten() {
+            // One more listed test for each entry it can see.
+            println!("seen_{}: test", entry.file_name().to_string_lossy());
+            let _ = std::fs::write(entry.path(), "runnable 0\\n");
+        }
+    }
+    let _ = std::fs::write(format!("{cache}/{}", "f".repeat(64)), "runnable 0\\n");
+    println!("planted: test");
+}
+EOF
+plant=$(commit rust-plant)
+listing_before=$(sha256sum <"$listing_entry")
+judge_rust "$plant" >/dev/null
+expect "the planting candidate's base listing came from the cache" "$(cat "$work/gate.out")" \
+    "| tests: the base's listing from the cache (4)"
+expect "the cache entry is unchanged after its listing" "$(sha256sum <"$listing_entry")" "$listing_before"
+expect "and it added none" "$(ls "$cache" | grep -c "^$(printf 'f%.0s' $(seq 64))\$" || true)" 0
+expect "the planting code did run at the listing, and saw no entry (its one listed test)" "$(cat "$work/gate.out")" \
+    'tests cargo runs: 4 on the base, 5 on the candidate'
+# The same with the base cache outside the owner's home and the gate's
+# TMPDIR, which the sandbox hides whole: the cache's own mask keeps it out of
+# reach.
+outside_cache=$work/cache-outside
+mkdir -p "$outside_cache" "$work/gate-tmp"
+sed -i "s|let cache = \".*\";|let cache = \"$outside_cache/spawn/gate-base\";|" "$seed/tests/plant.rs"
+plant_outside=$(commit rust-plant-outside)
+TMPDIR=$work/gate-tmp XDG_CACHE_HOME=$outside_cache judge_rust "$plant_outside" >/dev/null
+expect "outside the home, it runs too and sees no entry" "$(cat "$work/gate.out")" \
+    'tests cargo runs: 4 on the base, 5 on the candidate'
+outside_entries=$(ls "$outside_cache/spawn/gate-base")
+expect "and finds no entry to overwrite: the base's listing is whole" \
+    "$(for e in $outside_entries; do [ "$(sed -n 2p "$outside_cache/spawn/gate-base/$e")" = "runnable 4" ] && echo whole; done)" whole
+refuse "nor adds one" "$outside_entries" "ffffffffffffffff"
 rust_branch rust-comment
 drop_b
 printf '\n// #[test]\n// fn b() {}\n/// A string, not a test.\npub const B: &str = "#[test] fn b() {}";\n' \
@@ -1224,6 +1347,7 @@ renamed=$(commit rust-renamed)
 expect "a renamed test is refused though the count holds" "$(judge_rust "$renamed")" \
     'drops or renames base tests (1: tests::b)'
 expect "the count did hold" "$(cat "$work/gate.out")" 'tests cargo runs: 4 on the base, 4 on the candidate'
+expect "judged on the cached base listing" "$(cat "$work/gate.out")" "| tests: the base's listing from the cache (4)"
 retiring_scenarios=$work/retiring
 cp -r "$scenarios" "$retiring_scenarios"
 printf '# retired with their feature\ntests::b\n' >"$retiring_scenarios/retired-tests"
