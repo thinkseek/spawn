@@ -4528,6 +4528,10 @@ mod tests {
             window_ms: 86_400_000,
             test_log: None,
             live_log: None,
+            database_ms: 600_000,
+            database_floor_mb: 1024,
+            database_ratio: 10,
+            test_databases: Vec::new(),
         }
     }
 
@@ -8703,5 +8707,306 @@ connections\n";
         assert_eq!((year, month, day), (2025, 10, 9));
         assert_eq!((hour, minute, second), (8, 53, 20));
         assert_eq!(time_text(0), "1970-01-01 00:00:00");
+    }
+
+    /// Objective 074: a database that outgrows what the live event log
+    /// justifies (at or above the floor, above the ratio times the log's
+    /// bytes) opens one `database_size` alert; it clears at the first
+    /// reading that finds it no longer so.
+    mod database_size {
+        use super::super::{Event, Monitor, Settings, Url, ratio_of, size_text};
+        use super::{commit, decided, fires, monitor, settings};
+        use serde_json::{Value, json};
+
+        const MB: u64 = 1024 * 1024;
+
+        fn live(bytes: u64, log_bytes: u64) -> Result<Value, String> {
+            Ok(json!({"name": "spawn", "bytes": bytes, "schemas": 0, "log_bytes": log_bytes,
+                      "tables": []}))
+        }
+
+        fn test_db(name: &str, bytes: u64, schemas: u64) -> Result<Value, String> {
+            Ok(json!({"name": name, "bytes": bytes, "schemas": schemas}))
+        }
+
+        /// One reading at `now`: what it decides, and its lines.
+        fn read(
+            monitor: &Monitor,
+            now: i64,
+            live: Result<Value, String>,
+            tests: &[(&'static str, Result<Value, String>)],
+        ) -> (Vec<Event>, Vec<String>) {
+            let (mut out, mut lines) = (Vec::new(), Vec::new());
+            monitor.database_events(now, live, tests, &mut out, &mut lines);
+            (decided(monitor, out), lines)
+        }
+
+        #[test]
+        fn the_settings_default_to_ten_minutes_a_gigabyte_and_ten_times() {
+            let (from_env, _) = Settings::from_env();
+            if std::env::var_os("SPAWN_ALERT_DATABASE_SECS").is_none() {
+                assert_eq!(from_env.database_ms, 600_000);
+            }
+            if std::env::var_os("SPAWN_ALERT_DATABASE_FLOOR_MB").is_none() {
+                assert_eq!(from_env.database_floor_mb, 1024);
+            }
+            if std::env::var_os("SPAWN_ALERT_DATABASE_RATIO").is_none() {
+                assert_eq!(from_env.database_ratio, 10);
+            }
+            // The gates' first, each only when set; the URL never shown.
+            let roles: Vec<&str> = from_env.test_databases.iter().map(|(role, _)| *role).collect();
+            let mut want = Vec::new();
+            if std::env::var("SPAWN_TEST_DATABASE_URL").is_ok_and(|url| !url.trim().is_empty()) {
+                want.push("test");
+            }
+            if std::env::var("SPAWN_FLEET_TEST_DATABASE_URL")
+                .is_ok_and(|url| !url.trim().is_empty())
+            {
+                want.push("fleet_test");
+            }
+            assert_eq!(roles, want);
+            let shown = format!("{:?}", Url("postgres://u:secret@h/d".to_string()));
+            assert!(!shown.contains("secret"), "{shown}");
+        }
+
+        #[test]
+        fn the_ratio_and_the_size_are_said_to_one_decimal() {
+            assert_eq!(ratio_of(253, 10), Some(25.3));
+            assert_eq!(ratio_of(255, 10), Some(25.5));
+            assert_eq!(ratio_of(2, 3), Some(0.7));
+            assert_eq!(ratio_of(5, 0), None, "an empty log has no ratio");
+            assert_eq!(size_text(12 * MB), "12.0 MB");
+            assert_eq!(size_text(1024 * MB), "1.0 GB");
+            assert_eq!(size_text(2765 * MB), "2.7 GB");
+        }
+
+        #[test]
+        fn a_database_under_the_floor_fires_nothing_whatever_its_ratio() {
+            let monitor = monitor();
+            // 1023 MB against a 1 MB log: 1023 times, but under 1024 MB.
+            let (events, lines) = read(
+                &monitor,
+                1000,
+                live(50 * MB, MB),
+                &[("fleet_test", test_db("spawn_fleet_test", 1023 * MB, 900))],
+            );
+            assert!(events.is_empty(), "{events:?}");
+            assert!(lines.is_empty(), "{lines:?}");
+        }
+
+        #[test]
+        fn a_database_within_the_ratio_fires_nothing_however_large() {
+            let monitor = monitor();
+            // 3 GB live for a 400 MB log: over the floor, 7.7 times.
+            let (events, _) = read(&monitor, 1000, live(3 * 1024 * MB, 400 * MB), &[]);
+            assert!(events.is_empty(), "{events:?}");
+            // Exactly ten times is within.
+            let (events, _) = read(&monitor, 1000, live(4000 * MB, 400 * MB), &[]);
+            assert!(events.is_empty(), "{events:?}");
+        }
+
+        #[test]
+        fn over_both_opens_one_alert_with_its_evidence_and_words() {
+            let mut monitor = monitor();
+            let fleet = 2765 * MB;
+            let log = 35 * MB;
+            let (events, lines) = read(
+                &monitor,
+                1000,
+                live(159 * MB, log),
+                &[
+                    ("test", test_db("spawn_test", 20 * MB, 3)),
+                    ("fleet_test", test_db("spawn_fleet_test", fleet, 2533)),
+                ],
+            );
+            assert!(lines.is_empty(), "{lines:?}");
+            assert_eq!(fires(&events), ["database_size:spawn_fleet_test:1000"]);
+            let Event::Fire {
+                kind,
+                subject,
+                evidence,
+                text,
+                notice,
+                ..
+            } = &events[0]
+            else {
+                panic!("a fire: {events:?}");
+            };
+            assert_eq!(*kind, "database_size");
+            assert_eq!(subject, "database spawn_fleet_test");
+            assert!(!notice);
+            assert_eq!(evidence["database"], "spawn_fleet_test");
+            assert_eq!(evidence["role"], "fleet_test");
+            assert_eq!(evidence["bytes"], json!(fleet));
+            assert_eq!(evidence["log_bytes"], json!(log));
+            assert_eq!(evidence["ratio"], json!(79.0));
+            assert_eq!(evidence["schemas"], 2533);
+            assert_eq!(evidence["reading_ms"], 1000);
+            for word in ["spawn_fleet_test", "2.7 GB", "79", "2533 schemas"] {
+                assert!(text.contains(word), "{word} in {text}");
+            }
+            // One open per database: the next reading, still over, fires
+            // nothing.
+            commit(&mut monitor, &events);
+            let (again, _) = read(
+                &monitor,
+                2000,
+                live(159 * MB, log),
+                &[("fleet_test", test_db("spawn_fleet_test", fleet + MB, 2534))],
+            );
+            assert!(again.is_empty(), "{again:?}");
+            // Another database over both opens its own.
+            let (other, _) = read(
+                &monitor,
+                3000,
+                live(159 * MB, log),
+                &[
+                    ("test", test_db("spawn_test", 2048 * MB, 40)),
+                    ("fleet_test", test_db("spawn_fleet_test", fleet, 2533)),
+                ],
+            );
+            assert_eq!(fires(&other), ["database_size:spawn_test:3000"]);
+        }
+
+        #[test]
+        fn it_clears_at_the_first_reading_no_longer_over_with_that_reading() {
+            let mut monitor = monitor();
+            let log = 35 * MB;
+            let over = [("fleet_test", test_db("spawn_fleet_test", 2765 * MB, 2533))];
+            let (events, _) = read(&monitor, 1000, live(159 * MB, log), &over);
+            commit(&mut monitor, &events);
+            // Still over at the next reading: nothing.
+            let (events, _) = read(&monitor, 2000, live(159 * MB, log), &over);
+            assert!(events.is_empty());
+            // The schemas dropped: it clears, the reading its evidence.
+            let (events, _) = read(
+                &monitor,
+                3000,
+                live(159 * MB, log),
+                &[("fleet_test", test_db("spawn_fleet_test", 300 * MB, 5))],
+            );
+            assert_eq!(events.len(), 1, "{events:?}");
+            let Event::Clear { key, evidence } = &events[0] else {
+                panic!("a clear: {events:?}");
+            };
+            assert_eq!(key, "database_size:spawn_fleet_test:1000");
+            assert_eq!(evidence["schemas"], 5);
+            assert_eq!(evidence["bytes"], json!(300 * MB));
+            assert_eq!(evidence["log_bytes"], json!(log));
+            assert_eq!(evidence["reading_ms"], 3000);
+            commit(&mut monitor, &events);
+            let (events, _) = read(
+                &monitor,
+                4000,
+                live(159 * MB, log),
+                &[("fleet_test", test_db("spawn_fleet_test", 300 * MB, 5))],
+            );
+            assert!(events.is_empty(), "cleared once: {events:?}");
+            // A larger log clears it too: the data now justifies the size.
+            let (events, _) = read(&monitor, 5000, live(159 * MB, log), &over);
+            assert_eq!(fires(&events), ["database_size:spawn_fleet_test:5000"]);
+            commit(&mut monitor, &events);
+            let (events, _) = read(&monitor, 6000, live(400 * MB, 300 * MB), &over);
+            assert!(matches!(&events[..], [Event::Clear { .. }]), "{events:?}");
+        }
+
+        #[test]
+        fn an_unreachable_test_database_is_a_line_and_its_alert_stays() {
+            let mut monitor = monitor();
+            let log = 35 * MB;
+            let over = [("fleet_test", test_db("spawn_fleet_test", 2765 * MB, 2533))];
+            let (events, _) = read(&monitor, 1000, live(159 * MB, log), &over);
+            commit(&mut monitor, &events);
+            let down = [
+                ("test", Err("error connecting to server: Connection refused".to_string())),
+                ("fleet_test", Err("db error: timeout".to_string())),
+            ];
+            let (events, lines) = read(&monitor, 2000, live(159 * MB, log), &down);
+            assert!(events.is_empty(), "no alert, no clear: {events:?}");
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(lines[0].contains("the test database's size"), "{lines:?}");
+            assert!(lines[1].contains("the fleet_test database's size"), "{lines:?}");
+            // Without the live reading nothing is decided.
+            let (events, lines) =
+                read(&monitor, 3000, Err("down".to_string()), &[("fleet_test", test_db("spawn_fleet_test", MB, 0))]);
+            assert!(events.is_empty(), "{events:?}");
+            assert_eq!(lines.len(), 1, "{lines:?}");
+        }
+
+        #[test]
+        fn with_each_url_unset_only_the_others_are_read() {
+            let monitor = monitor();
+            let log = MB;
+            // Neither set: the live database alone, which may fire itself.
+            let (events, lines) = read(&monitor, 1000, live(2048 * MB, log), &[]);
+            assert_eq!(fires(&events), ["database_size:spawn:1000"]);
+            assert!(lines.is_empty());
+            let Event::Fire { evidence, .. } = &events[0] else {
+                panic!("a fire");
+            };
+            assert_eq!(evidence["role"], "live");
+            // The fleet's unset: the gates' alone.
+            let (events, _) = read(
+                &monitor,
+                1000,
+                live(10 * MB, log),
+                &[("test", test_db("spawn_test", 2048 * MB, 12))],
+            );
+            assert_eq!(fires(&events), ["database_size:spawn_test:1000"]);
+            // The gates' unset: the fleet's alone.
+            let (events, _) = read(
+                &monitor,
+                1000,
+                live(10 * MB, log),
+                &[("fleet_test", test_db("spawn_fleet_test", 2048 * MB, 12))],
+            );
+            assert_eq!(fires(&events), ["database_size:spawn_fleet_test:1000"]);
+            // The step reads only the URLs it is given.
+            let given = Monitor::with(Settings {
+                test_databases: vec![("fleet_test", Url("postgres://x@127.0.0.1:1/none".into()))],
+                ..settings()
+            });
+            assert_eq!(given.settings.test_databases.len(), 1);
+            assert!(monitor.settings.test_databases.is_empty());
+        }
+
+        /// Through the real store: the live reading, and a test database
+        /// that cannot be reached (a line, no alert).
+        #[test]
+        fn through_the_store_an_unreachable_test_database_is_a_line() {
+            let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+                "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+            );
+            let schema = spawn_postgres::testing::TestSchema::new("alert_dbsize");
+            let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
+                .expect("a schema of its own, migrated");
+            let mut monitor = Monitor::with(Settings {
+                test_databases: vec![
+                    ("test", Url(url.clone())),
+                    ("fleet_test", Url("postgres://spawn:secret-074@127.0.0.1:1/none".into())),
+                ],
+                database_floor_mb: 0,
+                database_ratio: 1_000_000,
+                ..settings()
+            });
+            let (mut out, mut lines) = (Vec::new(), Vec::new());
+            monitor.read_databases(&store, 1000, &mut out, &mut lines);
+            assert!(out.is_empty(), "within a million times: {out:?}");
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].starts_with("alerts: the fleet_test database's size: "), "{lines:?}");
+            assert!(!lines[0].contains("secret-074"), "{lines:?}");
+            // At a ratio of 0 and no floor the live database fires (the
+            // gates' is the same database here: one alert for it).
+            monitor.settings.database_ratio = 0;
+            let (mut out, mut lines) = (Vec::new(), Vec::new());
+            monitor.read_databases(&store, 2000, &mut out, &mut lines);
+            assert_eq!(out.len(), 1, "{out:?}");
+            let Event::Fire { evidence, .. } = &out[0] else {
+                panic!("a fire: {out:?}");
+            };
+            assert_eq!(evidence["role"], "live");
+            assert!(evidence["log_bytes"].as_u64().is_some(), "{evidence}");
+            drop(store);
+        }
     }
 }
