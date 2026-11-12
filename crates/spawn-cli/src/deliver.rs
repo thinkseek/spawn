@@ -63,7 +63,7 @@
 //!   delivered tasks are, and only a report written after their own mark.
 //!
 //! - **a paused mission's workers get nothing** (`spawn mission pause`,
-//!   objective 099; [`Pause`]): none of its tasks is delivered (nor queued
+//!   objective 099; [`PausedMission`]): none of its tasks is delivered (nor queued
 //!   for its turn, so no delivery stall), no restart or cancel notice
 //!   resumes its workers, and its resident and the worker of each of its
 //!   delivered tasks are stopped at once if they run, by a Stop keyed
@@ -615,7 +615,7 @@ impl HumanNote {
 /// A mission the owner paused, or unpaused since its last pause
 /// (`mission_pauses`, objective 099), with the workers the pause holds.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct Pause {
+pub(crate) struct PausedMission {
     /// The mission.
     pub(crate) id: i64,
     /// The `mission.paused` record it is in; `None` once unpaused.
@@ -681,8 +681,8 @@ pub(crate) struct Work {
     pub(crate) cancelled: Vec<Cancelled>,
     /// The latest `source.moved` record, if any.
     pub(crate) moved: Option<Moved>,
-    /// The owner's pauses and unpauses ([`Pause`]).
-    pub(crate) pauses: Vec<Pause>,
+    /// The owner's pauses and unpauses ([`PausedMission`]).
+    pub(crate) pauses: Vec<PausedMission>,
     /// The delivery waits (the defaults, unless the loop set its settings).
     pub(crate) waits: Waits,
 }
@@ -2211,7 +2211,7 @@ fn send_note(
 mod tests {
     use super::{
         CREDENTIALS_LINE, Cancelled, DELIVERY_RETRIES, NOT_READY_RETRY_MS, News, PROCESSES_LINE,
-        Pause, PausedWorker, REPORT, Restart, TaskRow, Work, delivered, delivery_mark,
+        PausedMission, PausedWorker, REPORT, Restart, TaskRow, Work, delivered, delivery_mark,
         mark_delivery, new_report, news_items, next_due, next_up, notice_task, put_aside,
         report_contract, report_due, retry_wait_ms, task_prompt, typed,
     };
@@ -2907,7 +2907,7 @@ mod tests {
         waiting.session_id = "session_worker_objective_6".to_string();
         Work {
             tasks: vec![task(4, TaskState::Delivered, "resident"), waiting],
-            pauses: vec![Pause {
+            pauses: vec![PausedMission {
                 id: 1,
                 pause_event: pause,
                 unpause_event: unpause.map(|(event, _)| event),
@@ -2981,7 +2981,7 @@ mod tests {
         assert!(!work.paused(1));
         assert_eq!(next_up(&work), BTreeSet::from([6]));
         let stopped = worker(false, false);
-        let plan = super::orders(&work, &[stopped.clone()], 8_000);
+        let plan = super::orders(&work, std::slice::from_ref(&stopped), 8_000);
         let resume = plan
             .iter()
             .find(|order| order.session_id == "session_resident_core")
@@ -3004,7 +3004,7 @@ mod tests {
             "the waiting task goes to its worker: {plan:?}"
         );
         let resumes = |work: &Work, facts: &Facts| {
-            super::orders(work, &[facts.clone()], 8_000)
+            super::orders(work, std::slice::from_ref(facts), 8_000)
                 .into_iter()
                 .filter(|order| order.session_id == "session_resident_core")
                 .count()

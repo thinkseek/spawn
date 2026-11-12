@@ -99,9 +99,9 @@ fn the_owner_pauses_and_resumes_and_nothing_is_assigned_while_paused() {
     let event = store
         .mission_pause(mission, Some("owner hold 2026-11-12"))
         .expect("paused");
-    let paused = records(&mut client, "mission.paused");
+    let recorded = records(&mut client, "mission.paused");
     assert_eq!(
-        paused,
+        recorded,
         vec![(
             event,
             json!({"type": "mission.paused", "id": mission, "reason": "owner hold 2026-11-12"})
@@ -135,15 +135,15 @@ fn the_owner_pauses_and_resumes_and_nothing_is_assigned_while_paused() {
     assert_eq!(tasks, 1, "no task made");
 
     // The dispatcher reads the pause with the resident it holds.
-    let pauses = store.mission_pauses().expect("the pauses");
-    assert_eq!(pauses[0]["id"], mission);
-    assert_eq!(pauses[0]["pause_event"], event);
+    let listed = store.mission_pauses().expect("the pauses");
+    assert_eq!(listed[0]["id"], mission);
+    assert_eq!(listed[0]["pause_event"], event);
     assert_eq!(
-        pauses[0]["sessions"][0]["session_id"],
+        listed[0]["sessions"][0]["session_id"],
         "session_resident_supply"
     );
-    assert_eq!(pauses[0]["sessions"][0]["final"], false);
-    assert_eq!(pauses[0]["sessions"][0]["resumed"], false);
+    assert_eq!(listed[0]["sessions"][0]["final"], false);
+    assert_eq!(listed[0]["sessions"][0]["resumed"], false);
 
     // The resume unpauses it, naming the pause, and records nothing else.
     store.mission_resume(mission).expect("resumed");
@@ -155,9 +155,9 @@ fn the_owner_pauses_and_resumes_and_nothing_is_assigned_while_paused() {
     );
     assert!(records(&mut client, "mission.resumed").is_empty());
     assert!(board_row(&store, mission)["paused"].is_null());
-    let pauses = store.mission_pauses().expect("the pauses");
-    assert!(pauses[0]["pause_event"].is_null());
-    assert_eq!(pauses[0]["unpause_event"], unpaused[0].0);
+    let listed = store.mission_pauses().expect("the pauses");
+    assert!(listed[0]["pause_event"].is_null());
+    assert_eq!(listed[0]["unpause_event"], unpaused[0].0);
 
     // A mission neither paused nor halted is not resumed.
     let neither = refusal(store.mission_resume(mission));

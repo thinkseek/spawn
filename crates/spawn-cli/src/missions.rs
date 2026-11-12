@@ -618,25 +618,7 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
             let settings = store.mission_reconfigure(mission, &change).map_err(err)?;
             print(&settings);
         }
-        "pause" => {
-            let mission = id(&flags, "id")?;
-            let reason = flags.get("reason");
-            if reason
-                .as_deref()
-                .is_some_and(|text| text.chars().count() > HOLD_REASON_CHARS)
-            {
-                return Err(format!(
-                    "--reason is at most {HOLD_REASON_CHARS} characters"
-                ));
-            }
-            let event = store
-                .mission_pause(mission, reason.as_deref())
-                .map_err(err)?;
-            print(&json!({
-                "mission": mission,
-                "paused": {"event_id": event, "reason": reason},
-            }));
-        }
+        "pause" => print(&pause(&store, &flags)?),
         "resume" => {
             let mission = id(&flags, "id")?;
             store.mission_resume(mission).map_err(err)?;
@@ -696,6 +678,29 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
         _ => return Err(USAGE.to_string()),
     }
     Ok(0)
+}
+
+/// `spawn mission pause --id N [--reason <text>]` (objective 099): the
+/// owner's hold on a mission, `mission.paused`; the store refuses anyone but
+/// the owner, a closed mission and one already paused, recording nothing.
+fn pause(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Value, String> {
+    let mission = id(flags, "id")?;
+    let reason = flags.get("reason");
+    if reason
+        .as_deref()
+        .is_some_and(|text| text.chars().count() > HOLD_REASON_CHARS)
+    {
+        return Err(format!(
+            "--reason is at most {HOLD_REASON_CHARS} characters"
+        ));
+    }
+    let event = store
+        .mission_pause(mission, reason.as_deref())
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "mission": mission,
+        "paused": {"event_id": event, "reason": reason},
+    }))
 }
 
 /// `spawn mission pushes`: the source's owner landing requests, newest
