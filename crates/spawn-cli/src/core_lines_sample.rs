@@ -329,7 +329,6 @@ mod tests {
             now += 10;
         }
         assert!(line.is_ok_and(|line| line.is_some()));
-        drop(check);
         assert_eq!(started, 2);
         assert_eq!(written, 1);
     }
