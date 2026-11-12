@@ -2397,7 +2397,7 @@ mod tests {
 
     use super::{
         Arc, BAD_REQUEST, DEFAULT_LIMIT, LogStart, MAX_INPUT_BODY, MAX_INPUT_TEXT, MAX_LIMIT,
-        ProcSocket, Shared, access_token, handle, is_json, is_loopback, local_exemption,
+        ProcSocket, Shared, access_token, backups, handle, is_json, is_loopback, local_exemption,
         log_window, objective_json, objective_prompt, open_network_request, open_networks,
         owner_uid, peer_uid, proc_sockets, rsi_objective, rsi_summary, same_origin, same_secret,
         serve_requests, server_hosts, tokenless_request, typed_text, with_last_gates,
