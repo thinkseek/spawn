@@ -74,7 +74,7 @@ impl Figure {
 /// One core line: its name, north star and guardrails.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Line {
-    pub(super) line: &'static str,
+    pub(super) name: &'static str,
     pub(super) north_star: Figure,
     pub(super) guardrails: Vec<Figure>,
 }
@@ -120,7 +120,7 @@ fn number(value: f64) -> Value {
 /// why, and why the file could not be read, if it could not.
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct Ranges {
-    pub(super) ranges: BTreeMap<String, Range>,
+    pub(super) bounds: BTreeMap<String, Range>,
     pub(super) ignored: Vec<(String, &'static str)>,
     pub(super) error: Option<String>,
 }
@@ -159,7 +159,7 @@ pub(super) fn parse_ranges(text: Option<&str>, known: &[&str]) -> Ranges {
                 .push((key.clone(), "needs a number min or max"));
             continue;
         }
-        ranges.ranges.insert(key.clone(), range);
+        ranges.bounds.insert(key.clone(), range);
     }
     ranges.ignored.sort();
     ranges
@@ -203,7 +203,7 @@ pub(super) fn lines(storage: &Value) -> Vec<Line> {
     };
     vec![
         Line {
-            line: "performance",
+            name: "performance",
             north_star: Figure::not_collected(
                 "performance.report_to_live",
                 "Time from report to live",
@@ -212,7 +212,7 @@ pub(super) fn lines(storage: &Value) -> Vec<Line> {
             guardrails: Vec::new(),
         },
         Line {
-            line: "storage",
+            name: "storage",
             north_star: Figure::new(
                 "storage.days_left",
                 "Days until the disk is full",
@@ -253,7 +253,7 @@ pub(super) fn lines(storage: &Value) -> Vec<Line> {
             ],
         },
         Line {
-            line: "observability",
+            name: "observability",
             north_star: Figure::not_collected(
                 "observability.needs_you_right",
                 "Needs you is right",
@@ -262,7 +262,7 @@ pub(super) fn lines(storage: &Value) -> Vec<Line> {
             guardrails: Vec::new(),
         },
         Line {
-            line: "recoverability",
+            name: "recoverability",
             north_star: Figure::not_collected(
                 "recoverability.restores_passed",
                 "Critical resources with a restore passed in 7 days",
@@ -279,7 +279,7 @@ pub(super) fn lines(storage: &Value) -> Vec<Line> {
 /// there; `Ok(None)` when it is not there).
 pub(super) fn answer(
     lines: &[Line],
-    ranges_file: Value,
+    ranges_file: &Value,
     contents: Result<Option<String>, String>,
 ) -> Value {
     let known: Vec<&str> = lines
@@ -294,12 +294,12 @@ pub(super) fn answer(
             ..Ranges::default()
         },
     };
-    let with_range = |figure: &Figure| figure_json(figure, ranges.ranges.get(figure.key).copied());
+    let with_range = |figure: &Figure| figure_json(figure, ranges.bounds.get(figure.key).copied());
     json!({
         "lines": lines
             .iter()
             .map(|line| json!({
-                "line": line.line,
+                "line": line.name,
                 "north_star": with_range(&line.north_star),
                 "guardrails": line.guardrails.iter().map(with_range).collect::<Vec<_>>(),
             }))
@@ -339,19 +339,19 @@ pub(super) fn read_ranges(path: Option<&std::path::Path>) -> Result<Option<Strin
 
 /// `GET /api/core-lines`.
 pub(super) fn core_lines() -> Result<Value, String> {
-    core_lines_at(&super::open_store()?, ranges_path())
+    core_lines_at(&super::open_store()?, ranges_path().as_deref())
 }
 
 /// The answer with the ranges file at `path`, read now.
 pub(super) fn core_lines_at(
     store: &spawn_postgres::PostgresStore,
-    path: Option<PathBuf>,
+    path: Option<&std::path::Path>,
 ) -> Result<Value, String> {
     let storage = super::storage::report(store, super::now_ms())?;
     let file = path
         .as_ref()
         .map_or(Value::Null, |path| json!(path.display().to_string()));
-    Ok(answer(&lines(&storage), file, read_ranges(path.as_deref())))
+    Ok(answer(&lines(&storage), &file, read_ranges(path)))
 }
 
 #[cfg(test)]
@@ -367,7 +367,7 @@ mod tests {
             &KNOWN,
         );
         let figure = Figure::new("a.one", "One", "count", value);
-        figure_json(&figure, ranges.ranges.get("a.one").copied())["state"]
+        figure_json(&figure, ranges.bounds.get("a.one").copied())["state"]
             .as_str()
             .expect("a state")
             .to_string()
@@ -392,7 +392,7 @@ mod tests {
         );
         let ranges = parse_ranges(Some(r#"{"ranges": {"a.one": {"max": 524288}}}"#), &KNOWN);
         assert_eq!(
-            figure_json(&figure, ranges.ranges.get("a.one").copied())["range"],
+            figure_json(&figure, ranges.bounds.get("a.one").copied())["range"],
             json!({"max": 524_288}),
             "a whole bound stays whole"
         );
@@ -424,8 +424,8 @@ mod tests {
             "sorted by key"
         );
         // A number bound beside one that is not: the number counts.
-        assert_eq!(ranges.ranges.len(), 1);
-        assert!(ranges.ranges.contains_key("a.one"));
+        assert_eq!(ranges.bounds.len(), 1);
+        assert!(ranges.bounds.contains_key("a.one"));
     }
 
     #[test]
@@ -440,7 +440,7 @@ mod tests {
             let ranges = parse_ranges(Some(broken), &KNOWN);
             assert!(ranges.error.is_some(), "{broken}");
             assert!(
-                ranges.ranges.is_empty() && ranges.ignored.is_empty(),
+                ranges.bounds.is_empty() && ranges.ignored.is_empty(),
                 "{broken}"
             );
         }
@@ -460,7 +460,7 @@ mod tests {
                 {"role": "x", "bytes": 9, "schemas": 1},
             ],
         });
-        let view = answer(&lines(&storage), json!("/ws/core-lines.json"), Ok(None));
+        let view = answer(&lines(&storage), &json!("/ws/core-lines.json"), Ok(None));
         let names: Vec<&str> = view["lines"]
             .as_array()
             .expect("lines")

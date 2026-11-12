@@ -3318,7 +3318,7 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("a directory");
             let file = dir.join("core-lines.json");
             let read =
-                || super::core_lines::core_lines_at(store, Some(file.clone())).expect("the answer");
+                || super::core_lines::core_lines_at(store, Some(&file)).expect("the answer");
             let figure = |view: &Value, key: &str| {
                 view["lines"]
                     .as_array()
