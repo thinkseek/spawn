@@ -164,9 +164,9 @@ export interface Storage {
     session_backups: number | null;
   } | null;
   /** The parts left out of the sum because their source cannot be read now
-   * (objective 097): ["session_backups"] without a readable status file;
-   * empty from an older server. */
-  growth_excluded: string[];
+   * (objective 097): ["session_backups"] without a readable status file,
+   * [] when every part is counted; null from an older server. */
+  growth_excluded: string[] | null;
   /** The counted parts' sum; null while any counted part is null. */
   persistent_growth_bytes_per_day: number | null;
   /** The free space over the persistent growth, rounded down; null without
@@ -245,7 +245,7 @@ export function normalizeStorage(value: unknown): Storage | null {
     },
     growth_excluded: Array.isArray(raw.growth_excluded)
       ? raw.growth_excluded.filter((part): part is string => typeof part === "string")
-      : [],
+      : null,
     persistent_growth_bytes_per_day: optionalNumber(raw.persistent_growth_bytes_per_day),
     days_left: optionalNumber(raw.days_left),
     growth_from_ms: optionalNumber(raw.growth_from_ms),
@@ -364,13 +364,11 @@ export function storageView(value: unknown): StorageView {
     })),
   ];
   const days = storage?.days_left ?? null;
-  // Counted only when the server says so: an older server gives no part.
-  const backups =
-    storage?.growth_parts !== null &&
-    storage?.growth_parts !== undefined &&
-    "session_backups" in (object(value)?.growth_parts as object ?? {}) &&
-    !storage.growth_excluded.includes("session_backups");
-  const excluded = storage?.growth_excluded.includes("session_backups") ?? false;
+  // The session backups are counted when the server lists what it left out
+  // and they are not among it; an older server lists nothing (085's words).
+  const left = storage?.growth_excluded ?? null;
+  const excluded = left?.includes("session_backups") ?? false;
+  const backups = left !== null && !excluded;
   const lastsAt = storage?.persistent_from_ms ?? null;
   const lastsFrom =
     days === null && lastsAt !== null && readAt !== null && lastsAt > readAt ? localDateTime(lastsAt) : null;

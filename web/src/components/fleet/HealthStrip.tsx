@@ -227,7 +227,7 @@ export function StorageCard({ storage, backups = null }: { storage: Storage | nu
       </div>
     );
   }
-  const { rows, lasts, measured_from, lasts_from } = storageView(storage);
+  const { rows, lasts, lasts_note, measured_from, lasts_from } = storageView(storage);
   const fell = (storage.projects?.before ?? 0) > (storage.projects?.files ?? Infinity);
   return (
     <div className="min-w-0 text-caption">
@@ -252,6 +252,7 @@ export function StorageCard({ storage, backups = null }: { storage: Storage | nu
         {lasts ??
           `How long the disk lasts: ${lasts_from !== null ? `measured from ${lasts_from}` : measured_from === null ? "not measured yet" : `measured from ${measured_from}`}`}
       </p>
+      {lasts_note !== null && <p className="text-micro text-faint-foreground">{lasts_note}</p>}
       <BackupRows backups={backups} />
     </div>
   );
