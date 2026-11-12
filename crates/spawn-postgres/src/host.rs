@@ -174,6 +174,32 @@ from (select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
        order by e.id
        limit $3) x";
 
+/// The newest `backup.dumped` and `backup.bundled` record (objective 82),
+/// as `{dump, bundle}`: each `{at_ms, key, bytes}` (`key` the record's first
+/// uploaded key, `bytes` its bytes), or null when there is none. Newest by
+/// event id, as the alert step folds them; each a backward read of
+/// `spawn_events_session_name`.
+pub(crate) const NEWEST_BACKUPS: &str = r"
+select jsonb_build_object(
+  'dump', (select jsonb_build_object('at_ms', x.recorded_at_ms,
+                                     'key', x.record -> 'keys' ->> 0,
+                                     'bytes', x.record -> 'bytes')
+             from (select e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
+                     from spawn_events e
+                    where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                      and e.kind -> 'detail' -> 'record' ->> 'type' = 'backup.dumped'
+                    order by e.id desc
+                    limit 1) x),
+  'bundle', (select jsonb_build_object('at_ms', x.recorded_at_ms,
+                                       'key', x.record -> 'keys' ->> 0,
+                                       'bytes', x.record -> 'bytes')
+               from (select e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
+                       from spawn_events e
+                      where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                        and e.kind -> 'detail' -> 'record' ->> 'type' = 'backup.bundled'
+                      order by e.id desc
+                      limit 1) x))";
+
 /// Every distinct mission source, sorted: what a full bundle holds.
 pub(crate) const SOURCES: &str = r"
 select coalesce(jsonb_agg(distinct s.source order by s.source), '[]'::jsonb)
@@ -197,6 +223,11 @@ impl PostgresStore {
         limit: i64,
     ) -> Result<Value, StoreError> {
         self.query_json(BACKUP_RECORDS, &[&kind, &since_ms, &limit])
+    }
+
+    /// The newest database copy and bundle ([`NEWEST_BACKUPS`]).
+    pub fn newest_backups(&self) -> Result<Value, StoreError> {
+        self.query_json(NEWEST_BACKUPS, &[])
     }
 
     /// Every distinct mission source ([`SOURCES`]).
