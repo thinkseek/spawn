@@ -4651,7 +4651,17 @@ $$;
 --   Nothing is tracked that was sent while its session's transcript had
 --   held no marker (no `message.taken` recorded at or before its creation):
 --   an engine that does not keep the prompt it is given says nothing by its
---   silence.
+--   silence. An input waits for its turn (the Bridge types it once the
+--   session is ready): the bound runs from the session's last busy screen
+--   (`screen.observed` `busy`, recorded again every `screen_refresh`, 30 s,
+--   while a turn runs) or turn end (`turn.stopped`, `turn.failed`) after
+--   that start and before the Bridge began typing it (its `typing` or
+--   `message` step), or before now if it is not typed yet. So a message held
+--   behind a running turn, its session's own or the turn of an input queued
+--   ahead of it, is due one bound after that turn ends, not while it runs
+--   (a bound longer than `screen_refresh`); one sent to a ready session runs
+--   from its creation. A turn that never ends keeps a waiting message from
+--   being due: that is the stuck agent's alert, not this one.
 -- - `typed`: whether the Bridge recorded it typed; `ended`: the session ended
 --   with it (what the alert clears on): the execution it was typed into, or
 --   its own start's, ended; or, never typed or started, it finished while no
@@ -4666,6 +4676,7 @@ declare
     v_type text := p_action ->> 'type';
     v_typed_at bigint;
     v_typing_exec text;
+    v_typing_at bigint;
     v_marked boolean;
     v_taken bigint;
     v_taken_id bigint;
@@ -4687,7 +4698,7 @@ begin
     select min(e.recorded_at_ms) into v_typed_at from spawn_events e
      where e.session_id = p_session and e.source = 'bridge'
        and e.source_event_id = 'cmd_' || p_id || ':typed';
-    select e.execution_id into v_typing_exec from spawn_events e
+    select e.execution_id, e.recorded_at_ms into v_typing_exec, v_typing_at from spawn_events e
      where e.session_id = p_session and e.source = 'bridge'
        and e.source_event_id in ('cmd_' || p_id || ':typing', 'cmd_' || p_id || ':message')
      order by e.id limit 1;
@@ -4725,6 +4736,19 @@ begin
         v_from := greatest(p_created, p_marked_from);
     else
         v_tracked := false;
+    end if;
+    -- It waited for its turn: the bound runs from the session's last busy
+    -- screen or turn end after its start and before the Bridge began typing
+    -- it (or before now). Only an untaken one is read: a taken one is never
+    -- not taken.
+    if v_tracked and v_taken = 0 then
+        select greatest(v_from, max(e.recorded_at_ms)) into v_from from spawn_events e
+         where e.session_id = p_session
+           and (e.event_name in ('turn.stopped', 'turn.failed')
+                or (e.event_name = 'screen.observed'
+                    and e.kind -> 'detail' ->> 'state' = 'busy'))
+           and e.recorded_at_ms > v_from
+           and e.recorded_at_ms <= coalesce(v_typing_at, p_now);
     end if;
     -- The session ended with it: the execution it was typed into, or its
     -- own start's, ended.
