@@ -509,11 +509,13 @@ fn performance_line(performance: &Value) -> Line {
 }
 
 /// What the observability line reads besides the answer itself: the 7-day
-/// cost window's `total` and health's `human_per_agent_hour`.
+/// cost window's `total`, health's `human_per_agent_hour`, and the north
+/// star "Needs you is right" ([`needs_you_right`], objective 092).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct Observed {
     pub(super) cost_total: Value,
     pub(super) human_per_agent_hour: Value,
+    pub(super) needs_you_right: Value,
 }
 
 /// The share of `total`'s tokens (input, output, cache write and cache
@@ -593,6 +595,39 @@ fn storage_line(storage: &Value) -> Line {
     }
 }
 
+/// The window of the observability north star: 7 days.
+const WEEK_MS: i64 = 7 * 24 * 3_600_000;
+
+/// "Needs you is right" (objective 092): of the alerts (not notices) that
+/// ended in the 7 days up to `now_ms` (`cleared_at_ms` in the window), the
+/// share whose outcome is "cleared", their condition cleared them rather
+/// than the owner judging them false, stale or a duplicate; null with none.
+/// `alerts` are rows as `/api/alerts` gives them.
+pub(super) fn needs_you_right(alerts: &Value, now_ms: i64) -> Value {
+    let since = now_ms.saturating_sub(WEEK_MS);
+    let (mut ended, mut right) = (0_u32, 0_u32);
+    for alert in alerts.as_array().into_iter().flatten() {
+        if alert["state"] == "notice" || alert["notice"] == true {
+            continue;
+        }
+        let Some(at) = alert["cleared_at_ms"].as_i64() else {
+            continue;
+        };
+        if at < since || at > now_ms {
+            continue;
+        }
+        ended += 1;
+        if alert["outcome"] == "cleared" {
+            right += 1;
+        }
+    }
+    if ended == 0 {
+        Value::Null
+    } else {
+        json!(f64::from(right) / f64::from(ended))
+    }
+}
+
 /// The four lines: the performance line's figures from `performance`
 /// ([`performance`]), the storage line's from `storage` (health.storage as
 /// [`super::storage::report`] gives it), the observability line's from
@@ -627,10 +662,11 @@ pub(super) fn lines(
 fn observability_line(observed: &Observed) -> Line {
     Line {
         name: "observability",
-        north_star: Figure::not_collected(
+        north_star: Figure::new(
             "observability.needs_you_right",
             "Needs you is right",
             "share",
+            observed.needs_you_right.clone(),
         ),
         guardrails: vec![
             Figure::new(
@@ -820,9 +856,13 @@ fn lines_at(
     let storage = super::storage::report(store, now_ms)?;
     let (performance, cost_total) = performance_now(store, now_ms);
     let health = store.fleet_health().map_err(super::err)?;
+    let alerts = store
+        .alerts(now_ms.saturating_sub(WEEK_MS))
+        .map_err(super::err)?;
     let observed = Observed {
         cost_total,
         human_per_agent_hour: health["human_per_agent_hour"].clone(),
+        needs_you_right: needs_you_right(&alerts, now_ms),
     };
     let backups = store.newest_backups().map_err(super::err)?;
     let facts = nightly_facts(nightly);
@@ -1176,6 +1216,47 @@ mod tests {
         }
     }
 
+<<<<<<< b2acbd8ca428a28aef0044923c13ffd342b46548
+    /// Objective 092: the share of the alerts that ended in the last 7
+    /// days whose condition cleared them.
+    #[test]
+    fn needs_you_is_right_is_the_share_of_the_ended_alerts_their_condition_cleared() {
+        use super::needs_you_right;
+        const DAY: i64 = 86_400_000;
+        let now = 30 * DAY;
+        let row = |state: &str, cleared: Option<i64>, outcome: Option<&str>| json!({"key": "k", "state": state, "cleared_at_ms": cleared, "outcome": outcome});
+        // None ended: none open, none at all.
+        assert_eq!(needs_you_right(&json!([]), now), Value::Null);
+        assert_eq!(
+            needs_you_right(&json!([row("open", None, None)]), now),
+            Value::Null
+        );
+        // A notice is left out; one ended outside the window too.
+        let rows = json!([
+            row("cleared", Some(now - DAY), Some("cleared")),
+            row("cleared", Some(now - 2 * DAY), Some("false")),
+            row("cleared", Some(now - 3 * DAY), Some("duplicate")),
+            row("cleared", Some(now - 6 * DAY), Some("cleared")),
+            row("open", None, None),
+            row("notice", Some(now - DAY), None),
+            row("cleared", Some(now - 8 * DAY), Some("stale")),
+            row("cleared", Some(now - 9 * DAY), Some("cleared")),
+        ]);
+        let share = needs_you_right(&rows, now).as_f64().expect("a share");
+        assert!((share - 0.5).abs() < 1e-12, "{share}");
+        // Only the ones outside the window: none.
+        let old = json!([row("cleared", Some(now - 8 * DAY), Some("cleared"))]);
+        assert_eq!(needs_you_right(&old, now), Value::Null);
+        // The line carries it.
+        let observed = Observed {
+            needs_you_right: json!(0.5),
+            ..Observed::default()
+        };
+        let line = &lines(&json!({}), &Value::Null, &observed, Vec::new())[2];
+        assert_eq!(line.north_star.key, "observability.needs_you_right");
+        assert_eq!(line.north_star.unit, "share");
+        assert_eq!(line.north_star.value, json!(0.5));
+=======
     /// Objective 095: the north star while the Scorecard's 7 days are not
     /// covered by the live record has no value and says where the measuring
     /// began; once covered it is the Scorecard's value, with no such field.
@@ -1205,6 +1286,7 @@ mod tests {
         let never = star(&card(false, Value::Null));
         assert_eq!(never["value"], Value::Null);
         assert_eq!(never.get("measuring_since_ms"), None, "{never}");
+>>>>>>> 193654be5d00586b9f8d3fc7d27777c64eafa74a
     }
 
     fn values(figures: &[Figure]) -> Vec<(&'static str, Value)> {
@@ -1435,6 +1517,7 @@ mod tests {
         let observed = Observed {
             cost_total: tokens(400_000, 0, 100_000),
             human_per_agent_hour: json!(0.125),
+            ..Observed::default()
         };
         let all = lines(&storage, &Value::Null, &observed, Vec::new());
         let observability = &all[2];

@@ -312,7 +312,7 @@ note "(1) checked: the verb"
 
 start_serve
 get() { # <path> <file>: the answer's code
-    curl -s --noproxy '*' -o "$2" -w '%{http_code}' "$base$1" 2>/dev/null || echo 000
+    bb_http "$2" --noproxy '*' "$base$1"
 }
 
 # --- (2) the outcomes ----------------------------------------------------------------------

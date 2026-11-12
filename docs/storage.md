@@ -798,12 +798,22 @@ is a control record in the stream, in the same shape as everything else:
   threshold. A notice (`notice: true`) is news and never clears.
 - `alert.cleared {key, kind, subject, evidence}` — what cleared it, with the
   clearing record's `event_id` (or the log line, or the reading).
+- `alert.judged {key, verdict}` (objective 092) — the owner's judgement of an
+  alert that should not have been raised, `spawn alert judge <key>
+  false|stale|duplicate`. An open alert is cleared by it (its
+  `cleared_evidence` `{judged: <verdict>}`); a cleared one keeps its
+  clearing and gains the verdict. The writer refuses another verdict, a key
+  no alert has, a notice and an alert judged already. The loop reads it at
+  its next pass and treats the alert as cleared: it retries no clear, and a
+  later occurrence of the same kind and subject fires anew.
 
 The records are written by the loop through `spawn_alert_record` (owner
 only) and folded into `spawn_alerts`, one row per key: `key` (primary key),
 `kind`, `subject`, `state` (`open`, `notice` or `cleared`), `notice`,
 `text`, `evidence`, `fired_event_id`, `fired_at_ms`, and `cleared_event_id`,
-`cleared_at_ms`, `cleared_evidence`. The fold — and the writer — refuses a
+`cleared_at_ms`, `cleared_evidence`, `verdict` and `judged_at_ms`.
+`/api/alerts` adds each row's `outcome`: null while open and for a notice,
+`cleared` when its condition cleared it, else its verdict. The fold — and the writer — refuses a
 second `alert.fired` for a key, an `alert.cleared` without its `alert.fired`
 and a second `alert.cleared`, so an alert fires once per occurrence and
 clears at most once, across restarts and two loops at once. The loop reads
@@ -916,8 +926,14 @@ its `total_ms`, a share; null when the total is 0), `performance.first_pass`
 and `performance.usd_per_landing` (`/api/cost?window=7d`). A value the page
 does not have is not collected. These are kept for a minute, so Home's
 minute poll does not compute the 7-day windows again; the ranges file is
-still read at every request. The observability and recoverability north
-stars are not collected yet.
+still read at every request. The recoverability north star is not
+collected yet.
+
+The observability line (objective 092) has the north star
+`observability.needs_you_right`, "Needs you is right": of the alerts (not
+notices) that ended in the last 7 days (`cleared_at_ms` in the window), the
+share whose `outcome` is `cleared` (their condition cleared them, rather
+than the owner judging them false, stale or a duplicate); null with none.
 
 The recoverability line (objective 087) has the north star
 `recoverability.restores_passed` (not collected until the restore drills

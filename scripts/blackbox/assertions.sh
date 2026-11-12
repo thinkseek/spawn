@@ -60,6 +60,67 @@ capture() {
     return 0
 }
 
+# bb_http <file> <curl arguments...>: one HTTP request through curl, its
+# body into <file>; prints the status code once (000 when curl got no
+# answer). Why curl got none goes to <file>.why (empty on an answer) and to
+# stderr: curl's exit code and error text, and whether serve still runs
+# (`serve_pid`, when the scenario sets it). A connection-level failure is
+# retried once, and said: curl exit 7 (refused: nothing was sent) for any
+# request; 52 and 56 (empty reply, reset) for a GET only, since a POST may
+# have been acted on. A serve that has died fails the retry too.
+bb_http() {
+    bb_http_out=$1
+    shift
+    bb_http_url=""
+    bb_http_method=GET
+    for bb_http_arg in "$@"; do
+        case $bb_http_arg in
+        http://* | https://*) bb_http_url=$bb_http_arg ;;
+        -X | --request | -d | --data | --data-* | -F | --form) bb_http_method=POST ;;
+        esac
+    done
+    bb_http_try=1
+    bb_http_first=""
+    while :; do
+        bb_http_rc=0
+        bb_http_code=$(curl -sS -o "$bb_http_out" -w '%{http_code}' "$@" 2>"$bb_http_out.curl") || bb_http_rc=$?
+        if [ "$bb_http_rc" -eq 0 ]; then
+            if [ -n "$bb_http_first" ]; then
+                printf 'answered on a retry; the first try: %s\n' "$bb_http_first" >"$bb_http_out.why"
+            else
+                : >"$bb_http_out.why"
+            fi
+            break
+        fi
+        bb_http_text=$(tr '\n' ' ' <"$bb_http_out.curl" | head -c 300)
+        bb_http_alive=unknown
+        if [ -n "${serve_pid-}" ]; then
+            bb_http_alive=no
+            if kill -0 "$serve_pid" 2>/dev/null; then bb_http_alive=yes; fi
+        fi
+        bb_http_why="curl exit $bb_http_rc: $bb_http_text (serve running: $bb_http_alive)"
+        bb_http_again=no
+        case $bb_http_rc in
+        7) bb_http_again=yes ;;
+        52 | 56) if [ "$bb_http_method" = GET ]; then bb_http_again=yes; fi ;;
+        esac
+        if [ "$bb_http_try" -eq 1 ] && [ "$bb_http_again" = yes ]; then
+            bb_http_first=$bb_http_why
+            echo "blackbox: $bb_http_method $bb_http_url: $bb_http_why; retrying once" >&2
+            bb_http_try=2
+            sleep 1
+            continue
+        fi
+        printf '%s%s\n' "$bb_http_why" "${bb_http_first:+; it failed on the retry too, the first try: $bb_http_first}" >"$bb_http_out.why"
+        echo "blackbox: $bb_http_method $bb_http_url: no answer: $(cat "$bb_http_out.why")" >&2
+        bb_http_code=000
+        break
+    done
+    printf '%s\n' "${bb_http_code:-000}"
+}
+# bb_http_why <file>: " (why)" after a request bb_http made, if curl said why.
+bb_http_why() { [ -s "$1.why" ] && printf ' (%s)' "$(cat "$1.why")"; }
+
 out() { cat "$WORK/out.txt"; }
 err() { cat "$WORK/err.txt"; }
 
