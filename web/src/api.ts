@@ -75,6 +75,10 @@ export interface Alert {
   /** An open agent_stuck's session's last scored judgement (the score it
    * stands on may be hours old while the judge is down); null otherwise. */
   scored_at_ms?: number | null;
+  /** How it ended (objective 092): null while open and for a notice,
+   * "cleared" when its condition cleared it, else the owner's verdict
+   * ("false", "stale" or "duplicate", `spawn alert judge`). */
+  outcome?: string | null;
 }
 
 export interface Execution {
@@ -276,6 +280,7 @@ export function normalizeAlerts(value: unknown): Alert[] {
       cleared_at_ms: optionalNumber(alert.cleared_at_ms),
       cleared_evidence: alert.cleared_evidence ?? null,
       text: text(alert.text),
+      outcome: optionalText(alert.outcome),
     };
   });
 }
