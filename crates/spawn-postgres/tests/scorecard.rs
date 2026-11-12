@@ -1124,6 +1124,37 @@ fn the_kept_facts_take_a_late_commit_an_earlier_end_and_keep_stores_apart() {
         other.scorecard_facts(700).expect("facts"),
         oracle(&mut other_client, 700)
     );
+    // A command more than the overlap below the last one finishes failed:
+    // only now is it a fact, found by its finish, not by its id.
+    for n in 0..300_i64 {
+        command(
+            &mut client,
+            "spawn-dispatch",
+            &format!("other-{n}"),
+            &json!({"type": "start", "engine": "claude", "prompt": "p"}),
+            None,
+            None,
+            800 + n,
+        );
+    }
+    assert_eq!(
+        kept.scorecard_facts(1200).expect("facts"),
+        oracle(&mut client, 1200)
+    );
+    client
+        .execute(
+            "update spawn_commands set state = 'finished', succeeded = false, finished_at_ms = 1300
+              where idempotency_key = 'other-0'",
+            &[],
+        )
+        .expect("the oldest fails");
+    let finished = kept.scorecard_facts(1400).expect("facts");
+    assert_eq!(finished, oracle(&mut client, 1400));
+    assert_eq!(
+        finished["commands"].as_array().map(Vec::len),
+        Some(1),
+        "{finished}"
+    );
 }
 
 /// A kept reading's statement reads what is new, not the log: the buffers
