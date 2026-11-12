@@ -961,9 +961,96 @@ impl Monitor {
     /// pending records, and where the event log stands.
     fn start(&mut self, store: &PostgresStore, lines: &mut Vec<String>) -> Result<(), String> {
         let mirror = store.alert_mirror().map_err(|error| error.to_string())?;
+        // Where the event log stood when the missions and tasks were read,
+        // from the same snapshot (objective 106): every record after it is
+        // the checks' to feed, whatever commits while the start runs, and
+        // none the mirror holds is fed again.
+        let watermark = mirror["watermark"]
+            .as_i64()
+            .ok_or_else(|| "the alert mirror holds no watermark".to_string())?;
         let now = mirror["now_ms"]
             .as_i64()
             .unwrap_or_else(|| store.now_ms().unwrap_or_default());
+        self.seed_mirror(&mirror);
+        let rows = store.alert_rows().map_err(|error| error.to_string())?;
+        for row in rows["rows"].as_array().into_iter().flatten() {
+            if let Some((key, row)) = Row::from_value(row) {
+                self.known.insert(key, row);
+            }
+        }
+        self.seed_red();
+        self.seed_defects();
+        let history = store
+            .alert_history(now.saturating_sub(HISTORY_MS), HISTORY_LIMIT)
+            .map_err(|error| error.to_string())?;
+        // Each record is recorded before the next is read, so a later record
+        // in the same history (a halt's resume, a good drill after a failed
+        // one) finds the alert its predecessor fired and clears it, naming
+        // itself; a record older than an open alert's own clears nothing
+        // ([`after`]).
+        // A record after the watermark is the checks' (objective 106): fed
+        // here too, it would fold twice.
+        for entry in history.as_array().into_iter().flatten() {
+            let id = entry["event_id"].as_i64().unwrap_or_default();
+            if id > watermark {
+                continue;
+            }
+            let at = entry["at_ms"].as_i64().unwrap_or(now);
+            let mut fed = Vec::new();
+            self.feed(id, at, &entry["record"], &mut fed);
+            self.flush(store, now, &fed, lines);
+        }
+        let mut events = Vec::new();
+        // An alert read back whose missions all closed while the loop was
+        // down, or before it fired (an owner alert of before objective 056,
+        // one per mission), names no open mission: it clears now.
+        self.closed_defects(None, now, &mut events);
+        let observations = store
+            .alert_observations()
+            .map_err(|error| error.to_string())?;
+        self.read_supervisor(store, now, &observations, lines);
+        self.observe(&observations, &mut events);
+        self.commands_after = now.saturating_sub(COMMAND_LOOKBACK_MS);
+        let commands = store
+            .alert_failed_commands(self.commands_after)
+            .map_err(|error| error.to_string())?;
+        self.commands(&commands, &mut events);
+        // The messages, read back as they stand: an alert the store holds
+        // fires nothing again, and one due while the loop was down fires.
+        let messages = store
+            .alert_messages_all(self.settings.message_taken_ms, &self.open_messages())
+            .map_err(|error| error.to_string())?;
+        self.messages(&messages, &mut events);
+        self.watermark = watermark;
+        // Read after the watermark: a request or an outcome recorded since
+        // is in both reads, and folds the same.
+        self.seed_owner_requests(store, now, &mut events)?;
+        for log in &mut self.logs {
+            let open = self
+                .known
+                .iter()
+                .filter(|(_, row)| {
+                    row.open() && row.kind == "postgres_crash" && row.subject == log.subject
+                })
+                .max_by_key(|(_, row)| row.fired_at_ms);
+            if let Some((_, row)) = open {
+                log.last_match_ms = row.fired_at_ms;
+                log.last_line = row.evidence["lines"]
+                    .as_array()
+                    .and_then(|lines| lines.last())
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+        }
+        self.flush(store, now, &events, lines);
+        self.started = true;
+        self.next_reading_ms = now;
+        self.plan(now);
+        Ok(())
+    }
+
+    /// The missions and tasks as the start's mirror read them.
+    fn seed_mirror(&mut self, mirror: &Value) {
         for mission in mirror["missions"].as_array().into_iter().flatten() {
             let id = mission["id"].as_i64().unwrap_or_default();
             self.missions.insert(
@@ -1001,76 +1088,6 @@ impl Monitor {
                 },
             );
         }
-        let rows = store.alert_rows().map_err(|error| error.to_string())?;
-        for row in rows["rows"].as_array().into_iter().flatten() {
-            if let Some((key, row)) = Row::from_value(row) {
-                self.known.insert(key, row);
-            }
-        }
-        self.seed_red();
-        self.seed_defects();
-        let history = store
-            .alert_history(now.saturating_sub(HISTORY_MS), HISTORY_LIMIT)
-            .map_err(|error| error.to_string())?;
-        // Each record is recorded before the next is read, so a later record
-        // in the same history (a halt's resume, a good drill after a failed
-        // one) finds the alert its predecessor fired and clears it, naming
-        // itself; a record older than an open alert's own clears nothing
-        // ([`after`]).
-        for entry in history.as_array().into_iter().flatten() {
-            let id = entry["event_id"].as_i64().unwrap_or_default();
-            let at = entry["at_ms"].as_i64().unwrap_or(now);
-            let mut fed = Vec::new();
-            self.feed(id, at, &entry["record"], &mut fed);
-            self.flush(store, now, &fed, lines);
-        }
-        let mut events = Vec::new();
-        // An alert read back whose missions all closed while the loop was
-        // down, or before it fired (an owner alert of before objective 056,
-        // one per mission), names no open mission: it clears now.
-        self.closed_defects(None, now, &mut events);
-        let observations = store
-            .alert_observations()
-            .map_err(|error| error.to_string())?;
-        self.read_supervisor(store, now, &observations, lines);
-        self.observe(&observations, &mut events);
-        self.commands_after = now.saturating_sub(COMMAND_LOOKBACK_MS);
-        let commands = store
-            .alert_failed_commands(self.commands_after)
-            .map_err(|error| error.to_string())?;
-        self.commands(&commands, &mut events);
-        // The messages, read back as they stand: an alert the store holds
-        // fires nothing again, and one due while the loop was down fires.
-        let messages = store
-            .alert_messages_all(self.settings.message_taken_ms, &self.open_messages())
-            .map_err(|error| error.to_string())?;
-        self.messages(&messages, &mut events);
-        self.watermark = store.alert_clock().map_err(|error| error.to_string())?.0;
-        // Read after the watermark: a request or an outcome recorded since
-        // is in both reads, and folds the same.
-        self.seed_owner_requests(store, now, &mut events)?;
-        for log in &mut self.logs {
-            let open = self
-                .known
-                .iter()
-                .filter(|(_, row)| {
-                    row.open() && row.kind == "postgres_crash" && row.subject == log.subject
-                })
-                .max_by_key(|(_, row)| row.fired_at_ms);
-            if let Some((_, row)) = open {
-                log.last_match_ms = row.fired_at_ms;
-                log.last_line = row.evidence["lines"]
-                    .as_array()
-                    .and_then(|lines| lines.last())
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-            }
-        }
-        self.flush(store, now, &events, lines);
-        self.started = true;
-        self.next_reading_ms = now;
-        self.plan(now);
-        Ok(())
     }
 
     /// One control record the step has not seen: fold it into what the step
@@ -7642,6 +7659,91 @@ connections\n";
                     .expect("count")
                     .get(0);
                 assert_eq!(fired, 2, "once per request, whatever restarts");
+            });
+        }
+
+        /// A rejection and an abort the store's missions and tasks already
+        /// hold fold once (objective 106): the step goes on from the
+        /// watermark its mirror read in the same statement, so its first
+        /// check feeds none of the records the mirror holds again, and a
+        /// record after the start is fed by the checks.
+        #[test]
+        fn a_rejection_and_an_abort_the_mirror_holds_fold_once() {
+            in_schema("alerts_mirror_once", |store, client| {
+                record(
+                    client,
+                    1,
+                    r#"{"type":"mission.added","id":4,"text":"m","origin":"human"}"#,
+                );
+                record(
+                    client,
+                    1,
+                    r#"{"type":"mission.configured","id":4,"accept":"gate","gate":"/g"}"#,
+                );
+                let assign = |client: &mut postgres::Client, task: i64| {
+                    record(
+                        client,
+                        1,
+                        &format!(
+                            r#"{{"type":"task.assigned","id":{task},"mission_id":4,
+                                "kind":"ephemeral","agent_id":"agent_worker_{task}",
+                                "session_id":"session_{task}","brief":"b",
+                                "created_by":"agent_supervisor","objective":1}}"#
+                        ),
+                    )
+                };
+                assign(client, 7);
+                record(
+                    client,
+                    1,
+                    r#"{"type":"task.gated","id":7,"verdict":"rejected","revision":0}"#,
+                );
+                assign(client, 8);
+                let last = record(
+                    client,
+                    1,
+                    r#"{"type":"task.aborted","id":8,"reason":"over"}"#,
+                );
+                refold(client);
+                let gates = |client: &mut postgres::Client| -> (i32, i32, i32) {
+                    let row = client
+                        .query_one(
+                            "select m.gate_rejections, m.gate_aborts, k.revisions
+                               from mission_missions m join mission_tasks k on k.id = 7
+                              where m.id = 4",
+                            &[],
+                        )
+                        .expect("the fold reads");
+                    (row.get(0), row.get(1), row.get(2))
+                };
+                assert_eq!(gates(client), (1, 1, 1), "the store holds them once");
+
+                let mut monitor = started(store);
+                assert!(monitor.watermark >= last, "the mirror's watermark");
+                let mission = &monitor.missions[&4];
+                assert_eq!((mission.rejections, mission.aborts), (1, 1));
+                assert_eq!(monitor.tasks[&7].revisions, 1);
+                monitor.check(store).expect("the step checks");
+                let mission = &monitor.missions[&4];
+                assert_eq!(
+                    (mission.rejections, mission.aborts),
+                    (1, 1),
+                    "no check feeds a record the mirror holds again"
+                );
+                assert_eq!(monitor.tasks[&7].revisions, 1);
+
+                assign(client, 9);
+                record(
+                    client,
+                    0,
+                    r#"{"type":"task.gated","id":9,"verdict":"aborted","revision":0}"#,
+                );
+                monitor.check(store).expect("the step checks");
+                assert_eq!(
+                    monitor.missions[&4].aborts, 2,
+                    "a record after the start is the checks'"
+                );
+                assert!(monitor.tasks.contains_key(&9));
             });
         }
 
