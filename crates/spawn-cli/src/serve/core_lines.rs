@@ -621,12 +621,14 @@ pub(super) fn needs_you_right(alerts: &Value, now_ms: i64) -> Value {
 /// The four lines: the performance line's figures from `performance`
 /// ([`performance`]), the storage line's from `storage` (health.storage as
 /// [`super::storage::report`] gives it), the observability line's from
-/// `observed`, the recoverability guardrails `recoverability`
-/// ([`recoverability`]).
+/// `observed`, the recoverability north star `restores_passed` (objective
+/// 093, [`drills::figures`]) and its guardrails `recoverability`
+/// ([`recoverability`], then the drills' two ages).
 pub(super) fn lines(
     storage: &Value,
     performance: &Value,
     observed: &Observed,
+    restores_passed: Value,
     recoverability: Vec<Figure>,
 ) -> Vec<Line> {
     let mut lines = vec![
@@ -635,10 +637,11 @@ pub(super) fn lines(
         observability_line(observed),
         Line {
             name: "recoverability",
-            north_star: Figure::not_collected(
+            north_star: Figure::new(
                 "recoverability.restores_passed",
                 "Critical resources with a restore passed in 7 days",
                 "count",
+                restores_passed,
             ),
             guardrails: recoverability,
         },
@@ -997,7 +1000,7 @@ mod tests {
             ],
         });
         let view = answer(
-            &lines(&storage, &Value::Null, &Observed::default(), Vec::new()),
+            &lines(&storage, &Value::Null, &Observed::default(), Value::Null, Vec::new()),
             &json!("/ws/core-lines.json"),
             Ok(None),
             &std::collections::BTreeMap::new(),
@@ -1038,6 +1041,7 @@ mod tests {
             &json!({"database": {"bytes": 300, "log_bytes": 0}, "test_databases": []}),
             &Value::Null,
             &Observed::default(),
+            Value::Null,
             Vec::new(),
         );
         assert_eq!(bare[1].guardrails[2].value, Value::Null);
@@ -1078,7 +1082,7 @@ mod tests {
         assert!((share - 300_000.0 / 5_100_000.0).abs() < 1e-12, "{share}");
         assert_eq!(values["first_pass"], json!(0.749));
         assert_eq!(values["usd_per_landing"], json!(8.08));
-        let line = &lines(&json!({}), &values, &Observed::default(), Vec::new())[0];
+        let line = &lines(&json!({}), &values, &Observed::default(), Value::Null, Vec::new())[0];
         let keys: Vec<&str> = std::iter::once(&line.north_star)
             .chain(&line.guardrails)
             .map(|figure| figure.key)
@@ -1106,7 +1110,7 @@ mod tests {
             json!({"report_to_live": null, "gate_time": null, "decided_nothing": null,
                    "first_pass": null, "usd_per_landing": null})
         );
-        let line = &lines(&json!({}), &none, &Observed::default(), Vec::new())[0];
+        let line = &lines(&json!({}), &none, &Observed::default(), Value::Null, Vec::new())[0];
         assert!(
             std::iter::once(&line.north_star)
                 .chain(&line.guardrails)
@@ -1115,7 +1119,7 @@ mod tests {
         // Neither answer read: every value null.
         assert_eq!(performance(&Value::Null, &Value::Null), none);
         assert_eq!(
-            lines(&json!({}), &values, &Observed::default(), Vec::new())[0].guardrails[3].name,
+            lines(&json!({}), &values, &Observed::default(), Value::Null, Vec::new())[0].guardrails[3].name,
             "Dollars per landing (priced use only)",
             "the Cost page's priced dollars only (cc-astra A11)"
         );
@@ -1174,7 +1178,7 @@ mod tests {
             json!(840_000),
             "the guardrails are untouched"
         );
-        let line = &lines(&json!({}), &young, &Observed::default(), Vec::new())[0];
+        let line = &lines(&json!({}), &young, &Observed::default(), Value::Null, Vec::new())[0];
         assert_eq!(
             figure_json(&line.north_star, None),
             json!({"key": "performance.report_to_live", "name": "Time from report to live",
@@ -1193,13 +1197,13 @@ mod tests {
         let none = measured(values.clone(), None, now);
         assert_eq!(none["report_to_live"], Value::Null);
         assert_eq!(none["measuring_since_ms"], Value::Null);
-        let star = &lines(&json!({}), &none, &Observed::default(), Vec::new())[0].north_star;
+        let star = &lines(&json!({}), &none, &Observed::default(), Value::Null, Vec::new())[0].north_star;
         assert!(figure_json(star, None).get("measuring_since_ms").is_none());
         // Covered (exactly 7 days, and more): the Scorecard's value, no start.
         for first in [now - 7 * DAY, now - 30 * DAY] {
             let covered = measured(values.clone(), Some(first), now);
             assert_eq!(covered, values, "covered from {first}");
-            let star = &lines(&json!({}), &covered, &Observed::default(), Vec::new())[0].north_star;
+            let star = &lines(&json!({}), &covered, &Observed::default(), Value::Null, Vec::new())[0].north_star;
             let shown = figure_json(star, None);
             assert_eq!(shown["value"], json!(383_820_000));
             assert!(shown.get("measuring_since_ms").is_none());
@@ -1241,7 +1245,7 @@ mod tests {
             needs_you_right: json!(0.5),
             ..Observed::default()
         };
-        let line = &lines(&json!({}), &Value::Null, &observed, Vec::new())[2];
+        let line = &lines(&json!({}), &Value::Null, &observed, Value::Null, Vec::new())[2];
         assert_eq!(line.north_star.key, "observability.needs_you_right");
         assert_eq!(line.north_star.unit, "share");
         assert_eq!(line.north_star.value, json!(0.5));
@@ -1284,7 +1288,7 @@ mod tests {
         assert_eq!(bundle_only[0].value, Value::Null);
         assert_eq!(bundle_only[1].value, json!(6_000));
         // The line carries them as its guardrails, in order.
-        let line = &lines(&json!({}), &Value::Null, &Observed::default(), both)[3];
+        let line = &lines(&json!({}), &Value::Null, &Observed::default(), Value::Null, both)[3];
         assert_eq!(line.name, "recoverability");
         assert_eq!(
             line.guardrails
@@ -1412,6 +1416,7 @@ mod tests {
                 &json!({"free_bytes": 3}),
                 &Value::Null,
                 &Observed::default(),
+                Value::Null,
                 Vec::new(),
             ),
             &Value::Null,
@@ -1440,6 +1445,7 @@ mod tests {
             &json!({"free_bytes": 3, "days_left": 9}),
             &Value::Null,
             &Observed::default(),
+            Value::Null,
             Vec::new(),
         );
         let values = super::values_of(&figures);
@@ -1477,7 +1483,7 @@ mod tests {
             human_per_agent_hour: json!(0.125),
             ..Observed::default()
         };
-        let all = lines(&storage, &Value::Null, &observed, Vec::new());
+        let all = lines(&storage, &Value::Null, &observed, Value::Null, Vec::new());
         let observability = &all[2];
         assert_eq!(
             observability.north_star.key,
@@ -1505,7 +1511,7 @@ mod tests {
             ]
         );
         // Nothing read: the two guardrails count too.
-        let bare = lines(&storage, &Value::Null, &Observed::default(), Vec::new());
+        let bare = lines(&storage, &Value::Null, &Observed::default(), Value::Null, Vec::new());
         assert_eq!(bare[2].guardrails[0].value, Value::Null);
         assert_eq!(bare[2].guardrails[1].value, Value::Null);
         assert_eq!(bare[2].guardrails[2].value, json!(9));
