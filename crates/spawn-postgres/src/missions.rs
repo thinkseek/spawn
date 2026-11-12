@@ -538,7 +538,8 @@ select jsonb_build_object(
         from mission_tasks k where k.mission_id = m.id and k.id = any($1)))
       order by m.id desc)
     from mission_missions m
-   where exists (select 1 from mission_tasks k where k.mission_id = m.id and k.id = any($1))),
+   where m.id = any($2)
+      or exists (select 1 from mission_tasks k where k.mission_id = m.id and k.id = any($1))),
    '[]'::jsonb))";
 
 /// What the dashboard's labels are made of (`spawn serve`, serve/labels.rs):
@@ -2156,7 +2157,14 @@ impl PostgresStore {
 
     /// What the labels of `tasks` are made of ([`TASK_LABEL_FACTS`]).
     pub fn task_label_facts(&self, tasks: &[i64]) -> Result<Value, StoreError> {
-        self.query_json(TASK_LABEL_FACTS, &[&tasks])
+        self.label_facts_of(tasks, &[])
+    }
+
+    /// What the labels of `tasks` and the names of `missions` are made of
+    /// ([`TASK_LABEL_FACTS`]): each mission named or holding one of the
+    /// tasks, with those of its tasks alone.
+    pub fn label_facts_of(&self, tasks: &[i64], missions: &[i64]) -> Result<Value, StoreError> {
+        self.query_json(TASK_LABEL_FACTS, &[&tasks, &missions])
     }
 
     /// A task's stages from the control stream, oldest first:
