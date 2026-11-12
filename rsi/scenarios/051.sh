@@ -450,9 +450,9 @@ start_serve() {
 # resume_post <mission> <body> [content type] [origin]: the status code; the
 # answer in $WORK/resume.json. As the page posts: JSON, the page's own Origin.
 resume_post() {
-    curl -s --noproxy '*' -o "$WORK/resume.json" -w '%{http_code}' -X POST \
+    bb_http "$WORK/resume.json" --noproxy '*' -X POST \
         -H "Content-Type: ${3:-application/json}" -H "Origin: ${4:-$base}" \
-        --data "$2" "$base/api/mission/$1/resume" 2>/dev/null || echo 000
+        --data "$2" "$base/api/mission/$1/resume"
 }
 answer() { head -c 300 "$WORK/resume.json" 2>/dev/null; }
 missions_json() {

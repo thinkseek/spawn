@@ -235,7 +235,7 @@ while [ "$i" -lt 100 ]; do
 done
 [ -n "$port" ] || harness "serve did not start: $(head -c 400 "$WORK/serve.log")"
 get() { # <path> <file>: the answer's code
-    curl -s --noproxy '*' -o "$2" -w '%{http_code}' "http://127.0.0.1:$port$1" 2>/dev/null || echo 000
+    bb_http "$2" --noproxy '*' "http://127.0.0.1:$port$1"
 }
 ranges=$SPAWN_WORKSPACE_ROOT/core-lines.json
 unset SPAWN_CORE_LINES_FILE 2>/dev/null || true
