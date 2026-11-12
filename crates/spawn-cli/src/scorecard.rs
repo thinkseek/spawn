@@ -183,7 +183,23 @@ pub(crate) fn measure(
         spawn_core::transcripts::settling(&progress, window.until),
     );
     reach_tokens(&mut card, reach, window.since, previous_since);
+    owner_runs_from(&mut card, facts.owner_runs_from_ms);
     Ok(card)
+}
+
+/// Say from when the owner's judgings are counted (objective 076): an owner
+/// judging counts in gate time only when its record names the gate's wall
+/// clock, which the integrator has written only since a deploy, so a window
+/// that starts before the earliest such record does not hold every owner
+/// judging it covers. `owner_runs_from_ms` is that record's time, whatever
+/// the window; null when no owner judging names one.
+fn owner_runs_from(card: &mut Value, from: Option<i64>) {
+    if let Some(card) = card.as_object_mut() {
+        card.insert(
+            "owner_runs_from_ms".to_string(),
+            from.map_or(Value::Null, Value::from),
+        );
+    }
 }
 
 /// Say whether the archive's tokens reach back to the windows' starts: a
