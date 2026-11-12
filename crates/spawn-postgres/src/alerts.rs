@@ -317,7 +317,10 @@ from spawn_commands c
 where c.succeeded = false and c.finished_at_ms > $1";
 
 /// The alerts the windows show: every open one, and every one fired or
-/// cleared since `$1` (a notice is news within the window only).
+/// cleared since `$1` (a notice is news within the window only). Each row's
+/// `outcome` (objective 092): null while open (and for a notice), the
+/// owner's verdict (`false`, `stale`, `duplicate`) when judged, else
+/// `cleared` when its condition cleared it.
 pub(crate) const ALERTS: &str = r"
 select coalesce(jsonb_agg(jsonb_build_object(
       'key', a.key, 'kind', a.kind, 'subject', a.subject, 'state', a.state,
@@ -325,6 +328,9 @@ select coalesce(jsonb_agg(jsonb_build_object(
       'evidence', a.evidence,
       'cleared_event_id', a.cleared_event_id, 'cleared_at_ms', a.cleared_at_ms,
       'cleared_evidence', a.cleared_evidence, 'text', a.text,
+      'verdict', a.verdict, 'judged_at_ms', a.judged_at_ms,
+      'outcome', case when a.verdict is not null then a.verdict
+                      when a.state = 'cleared' then 'cleared' end,
       'scored_at_ms', (select s.scored_at_ms from spawn_alert_scores s where s.key = a.key))
     order by a.fired_at_ms, a.key), '[]'::jsonb)
 from spawn_alerts a
@@ -416,6 +422,18 @@ impl PostgresStore {
         Ok(self
             .query_one("select spawn_alert_record($1)", &[record])?
             .get(0))
+    }
+
+    /// The owner's judgement of the alert `key` (`spawn alert judge`,
+    /// objective 092): an `alert.judged` record `{key, verdict}` through
+    /// `spawn_alert_record` (owner only). `verdict` is `false`, `stale` or
+    /// `duplicate`; another verdict, a key no alert has, a notice and an
+    /// alert judged already are refused and write nothing. An open alert is
+    /// cleared by it. Returns the event's id.
+    pub fn alert_judge(&self, key: &str, verdict: &str) -> Result<i64, StoreError> {
+        self.alert_record(&serde_json::json!({
+            "type": "alert.judged", "key": key, "verdict": verdict,
+        }))
     }
 
     /// The newest event id and the database's clock, in one statement
