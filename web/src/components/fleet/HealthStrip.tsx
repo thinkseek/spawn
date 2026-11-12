@@ -343,7 +343,7 @@ export interface Liveness {
 }
 
 export const HUMAN_RATE_HINT =
-  "Human per agent-hour: decisions that needed a person (the ladder's human step) in the last 24 h, divided by the hours agents ran in that time. Lower is better; 0 means the fleet ran without anyone.";
+  "Human per agent-hour: each time a person stepped in (a command, a resume, a task they assigned, a cancel and reassign) in the last 24 h, divided by the hours agents ran in that time; the Home card's figure. Lower is better; 0 means the fleet ran without anyone.";
 
 export function HealthStrip({
   health,

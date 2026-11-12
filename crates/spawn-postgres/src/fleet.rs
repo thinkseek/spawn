@@ -135,6 +135,11 @@ with
              - greatest(x.started_at_ms, now.ms - 86400000))), 0)::float8 as ms
       from agent_executions x, now
      where coalesce(x.ended_at_ms, now.ms) > now.ms - 86400000),
+  -- The day's interventions (`spawn_interventions`), as the Home card
+  -- counts them (`/api/interventions?window=24h`, objective 103).
+  intervened as (
+    select count(*) as n from spawn_interventions v, now
+     where v.at_ms >= now.ms - 86400000 and v.at_ms < now.ms),
   events as (
     select e.event_name from spawn_events e, now
      where e.event_name in ('tool.started', 'tool.failed', 'turn.failed')
@@ -179,9 +184,11 @@ select jsonb_build_object(
                                    'liveness', 0, 'human', 0)
                 || (select coalesce(jsonb_object_agg(tier, n), '{}'::jsonb) from decided),
   'agent_hours_24h', (select ms / 3600000.0 from live_ms),
-  'human_per_agent_hour', (select case when ms > 0
-                              then (select coalesce(sum(n), 0) from decided where tier = 'human')
-                                   / (ms / 3600000.0) end from live_ms)
+  -- The Home card's figure: interventions over agent hours, to 3
+  -- decimals rounded half up (`ratio_milli`); null with no agent time.
+  'human_per_agent_hour', (select case when l.ms > 0
+                              then ((i.n * 7200000000 + l.ms::bigint) / (2 * l.ms::bigint))::float8 / 1000
+                              end from live_ms l, intervened i)
 )";
 
 /// What the dispatcher decides from: every worker session and the
