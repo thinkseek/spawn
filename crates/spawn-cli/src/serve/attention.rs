@@ -44,7 +44,8 @@
 //!     },
 //!     "for_owner": [{"text": "deploy ffc9fe7", "at_ms": 1793957000000 | null,
 //!                    "tasks": [{"id": 198, "state": "accepted"}],  // the tasks it names
-//!                    "settled": false}]   // a review ask whose tasks have all ended
+//!                    "settled": false,    // a review ask whose tasks have all ended
+//!                    "current": true}]    // of the newest For-the-owner block
 //!   },
 //!   "on_own_jobs": [{              // workers the rules hold as working on a
 //!     "session_id", "agent_id",    // background job of their own: not escalated
@@ -118,6 +119,15 @@
 //! hiding a live ask is the worse failure. Home's card leaves a settled
 //! line out (web/src/home.ts `latestNotes`); the supervisor's full list
 //! still shows it, marked settled.
+//!
+//! `current` is true for the lines of the supervisor's newest turn that has
+//! a `For the owner:` line (inline or a heading's items), false for every
+//! earlier turn's (objective 078: the supervisor restates its list in each
+//! block, so an ask it dropped, or said before in other words, is no longer
+//! current). A turn begins at a prompt, a digest included, whatever its
+//! time; a later turn without such a line changes nothing. A line said in
+//! the newest block and before is current (its latest saying). Home's card
+//! shows the current lines and counts the earlier ones.
 
 use std::collections::BTreeMap;
 
@@ -1739,6 +1749,55 @@ mod tests {
         assert_eq!(list_item("**bold**"), None);
         assert_eq!(list_item(""), None);
         assert_eq!(list_item("plain words"), None);
+    }
+
+    /// Objective 078: the newest turn with a For-the-owner line is current,
+    /// told apart from an earlier one by its prompt, not its time; a later
+    /// turn without one changes nothing.
+    #[test]
+    fn the_newest_block_is_current_and_earlier_turns_are_not() {
+        let at = "2026-11-12T08:57:00.000Z";
+        let prompt = |at: &str| line("user", &json!("go on"), at);
+        let transcript = [
+            prompt(at),
+            line(
+                "assistant",
+                &json!("For the owner:\n- set SPAWN_WORKSPACE for #11\n- restart task 5\n- keep me"),
+                at,
+            ),
+            prompt(at),
+            line(
+                "assistant",
+                &json!("For the owner:\n- set SPAWN_WORKSPACE for #11 and #12\n- keep me"),
+                at,
+            ),
+            line("assistant", &json!("For the owner: and task 3 landed"), at),
+            prompt(at),
+            line("assistant", &json!("Next: check the gate logs."), at),
+        ]
+        .concat();
+        let read = said(transcript.as_bytes());
+        let texts: Vec<&str> = read.for_owner.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "and task 3 landed",
+                "keep me",
+                "set SPAWN_WORKSPACE for #11 and #12",
+                "restart task 5",
+                "set SPAWN_WORKSPACE for #11",
+            ]
+        );
+        assert_eq!(read.current, 3, "the second turn's three lines, both its replies");
+
+        // One turn alone: all current. No line at all: none.
+        let one = [prompt(at), line("assistant", &json!("For the owner: x"), at)].concat();
+        assert_eq!(said(one.as_bytes()).current, 1);
+        let none = [prompt(at), line("assistant", &json!("Next: y"), at)].concat();
+        assert_eq!(said(none.as_bytes()).current, 0);
+        // Without any prompt in the tail, its lines are one turn.
+        let bare = line("assistant", &json!("For the owner: a\nFor the owner: b"), at);
+        assert_eq!(said(bare.as_bytes()).current, 2);
     }
 
     /// Objective 070 through the transcript reader, with 064's `tasks` and
