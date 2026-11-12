@@ -755,8 +755,19 @@ uses the disk:
     now less the `archive_bytes` of the oldest sample of the last 7 days,
     over the days between them, rounded down; null without a sample at
     least a day old;
-  - `days_left`: `free_bytes` over `growth_bytes_per_day`, rounded down;
-    null when the growth is null or not above zero.
+  - `growth_parts` (objective 085): `{archive, projects, database}`, the
+    bytes a day of each grower that persists, each measured as the
+    archive's: its size now less its size in the oldest sample of the last
+    7 days that carries it (`archive_bytes`, `projects_bytes`,
+    `database_bytes` against this answer's `database.bytes`), over the
+    days between, rounded down; null without such a sample a day old. An
+    older sample without `database_bytes` (from before 085) still counts
+    for the other two. `archive` equals `growth_bytes_per_day`. Workspaces
+    are left out: checkouts come and go with tasks;
+  - `persistent_growth_bytes_per_day`: the parts' sum, null while any part
+    is null;
+  - `days_left`: `free_bytes` over `persistent_growth_bytes_per_day`,
+    rounded down; null when it is null or not above zero.
 
   Without a workspace root, `archive`, `workspaces`, `free_bytes` and the
   growth are null.
@@ -765,7 +776,9 @@ uses the disk:
   archive" with "grows about <size> a day" (or "not measured yet"), "Claude
   Code transcripts" with "<files> files" (and ", down from <before>" when
   the count fell), "Workspaces", and "Database" with its largest table; and
-  under them "about <days> days at the archive's growth". A size reads
+  under them "about <days> days at the growth of the archive, Claude
+  Code's transcripts and the database" (or "How long the disk lasts: not
+  measured yet"). A size reads
   "<n> MB" to one decimal under 1024 MB (1 MB is 1024 * 1024 bytes), "<n>
   GB" from there.
 
