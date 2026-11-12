@@ -1413,7 +1413,20 @@ create table if not exists mission_missions (
     -- a halt on the floor names (null for any other halt).
     halt_event      bigint,
     halt_at_ms      bigint,
-    halt_gone       jsonb
+    halt_gone       jsonb,
+    -- The owner's pause the mission is in (`spawn mission pause`, objective
+    -- 099; null while it is not paused): its `mission.paused` record's event
+    -- id, time and reason. While it holds, no objective is assigned to the
+    -- mission, nothing is delivered to its workers and its resident is
+    -- stopped. A pause is not a halt: the two are independent.
+    pause_event     bigint,
+    pause_at_ms     bigint,
+    pause_reason    text,
+    -- The mission's latest `mission.unpaused` record (event id and time),
+    -- null while it is paused or was never paused: the dispatcher resumes
+    -- the workers the pause stopped once per unpause.
+    unpause_event   bigint,
+    unpause_at_ms   bigint
 );
 
 create table if not exists mission_residents (
@@ -1502,6 +1515,11 @@ alter table mission_missions add column if not exists scenario_names jsonb;
 alter table mission_missions add column if not exists halt_event bigint;
 alter table mission_missions add column if not exists halt_at_ms bigint;
 alter table mission_missions add column if not exists halt_gone jsonb;
+alter table mission_missions add column if not exists pause_event bigint;
+alter table mission_missions add column if not exists pause_at_ms bigint;
+alter table mission_missions add column if not exists pause_reason text;
+alter table mission_missions add column if not exists unpause_event bigint;
+alter table mission_missions add column if not exists unpause_at_ms bigint;
 -- A mission halted before its halt was folded: its latest `mission.halted`.
 update mission_missions m
    set halt_event = h.id, halt_at_ms = h.recorded_at_ms,
@@ -2027,6 +2045,21 @@ begin
                                     gate_room_escalated = false, gate_host_faults = 0,
                                     gate_host_task = null, gate_host_due_ms = null,
                                     gate_base_disagrees = 0, gate_rejection_objective = null,
+                                    updated_at_ms = p_at
+         where id = v_id;
+    when 'mission.paused' then
+        -- The owner holds the mission (`spawn_mission_pause`): the pause it
+        -- is in is this record. Its halt, if any, stays as it is.
+        update mission_missions set pause_event = p_event, pause_at_ms = p_at,
+                                    pause_reason = p_record ->> 'reason',
+                                    unpause_event = null, unpause_at_ms = null,
+                                    updated_at_ms = p_at
+         where id = v_id;
+    when 'mission.unpaused' then
+        -- The owner's resume of a paused mission: it clears the pause alone
+        -- (a halt stays, for a second resume).
+        update mission_missions set pause_event = null, pause_at_ms = null, pause_reason = null,
+                                    unpause_event = p_event, unpause_at_ms = p_at,
                                     updated_at_ms = p_at
          where id = v_id;
     when 'source.moved' then
@@ -3471,6 +3504,11 @@ begin
     if v_agent is null then
         raise exception 'mission % has no open objectives with an approved resident', p_mission;
     end if;
+    -- A paused mission gets no work until the owner resumes it.
+    if exists (select 1 from mission_missions where id = p_mission and pause_event is not null) then
+        raise exception 'mission % is paused by the owner: no objective is assigned until it is resumed',
+            p_mission using errcode = '55000';
+    end if;
     if exists (select 1 from mission_tasks
                 where mission_id = p_mission and objective = p_objective
                   and state not in ('landed', 'cancelled')) then
@@ -3506,18 +3544,69 @@ end $$;
 -- The one-time import of the retired RSI controller's attempts has run.
 drop function if exists spawn_objective_import(bigint, integer, text, text, bigint);
 
+-- The owner's resume (`spawn mission resume`, owner only). A paused
+-- mission is unpaused, and only that: `mission.unpaused` {id, pause_event}
+-- (a halt stays, for a second resume). A halted mission that is not paused
+-- is resumed as before (`mission.resumed`). Anything else is refused and
+-- records nothing.
 create or replace function spawn_mission_resume(p_mission bigint)
 returns void language plpgsql security definer as $$
+declare
+    v_pause bigint;
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
-        raise exception 'only a human resumes a halted mission' using errcode = '42501';
+        raise exception 'only a human resumes a halted or paused mission' using errcode = '42501';
+    end if;
+    select pause_event into v_pause from mission_missions where id = p_mission;
+    if v_pause is not null then
+        perform spawn_control_record(jsonb_build_object(
+            'type', 'mission.unpaused', 'id', p_mission, 'pause_event', v_pause));
+        return;
     end if;
     if not exists (select 1 from mission_missions where id = p_mission and halted is not null) then
-        raise exception 'mission % is not halted', p_mission;
+        raise exception 'mission % is neither halted nor paused', p_mission;
     end if;
     perform spawn_control_record(jsonb_build_object('type', 'mission.resumed', 'id', p_mission));
+end $$;
+
+-- The owner holds a mission (`spawn mission pause`, objective 099; a human
+-- only: an agent's login is refused). Records `mission.paused` {id, reason}
+-- and returns its event id. While it is paused no objective is assigned to
+-- it (`spawn_objective_assign`), nothing is delivered to its workers and
+-- its resident is stopped by the dispatcher; `spawn_mission_resume`
+-- unpauses it. A mission that does not exist, is closed or is already
+-- paused is refused and nothing is recorded. A halted mission may be
+-- paused: its halt stays as it is.
+create or replace function spawn_mission_pause(p_mission bigint, p_reason text)
+returns bigint language plpgsql security definer as $$
+declare
+    v_state text;
+    v_pause bigint;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner (a human) pauses a mission; % may not', session_user
+            using errcode = '42501';
+    end if;
+    if p_reason is not null and char_length(p_reason) > 500 then
+        raise exception 'a pause''s reason is at most 500 characters' using errcode = '22023';
+    end if;
+    select state, pause_event into v_state, v_pause from mission_missions where id = p_mission;
+    if not found then
+        raise exception 'mission % does not exist', p_mission using errcode = 'P0002';
+    end if;
+    if v_state not in ('open', 'active') then
+        raise exception 'mission % is closed (%): there is nothing to pause', p_mission, v_state
+            using errcode = '55000';
+    end if;
+    if v_pause is not null then
+        raise exception 'mission % is already paused (record %)', p_mission, v_pause
+            using errcode = '55000';
+    end if;
+    return spawn_control_record(jsonb_build_object('type', 'mission.paused', 'id', p_mission,
+                                                   'reason', nullif(p_reason, '')));
 end $$;
 
 -- A person's resume of a halted mission from the web page (`spawn serve`,
@@ -5502,7 +5591,8 @@ begin
         'spawn_control_apply(jsonb, bigint, bigint)', 'spawn_control_record(jsonb)',
         'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
         'spawn_mission_reconfigure(bigint, jsonb)', 'spawn_settings_merge(jsonb, jsonb, text)',
-        'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
+        'spawn_mission_resume(bigint)', 'spawn_mission_pause(bigint, text)',
+        'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
         'spawn_alert_record(jsonb)', 'spawn_backup_record(jsonb)',
         'spawn_deploy_record(jsonb)', 'spawn_cost_record(jsonb)',

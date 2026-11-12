@@ -583,6 +583,16 @@ fn measure(
         bound_ms,
         line,
     };
+    // A paused mission's work waits for the owner's resume, not for Spawn:
+    // nothing is delivered to it and its workers are stopped (objective 099).
+    if context.work.paused(task.mission_id)
+        && matches!(
+            task.state,
+            TaskState::Assigned | TaskState::Revise | TaskState::Delivered
+        )
+    {
+        return None;
+    }
     match task.state {
         TaskState::Assigned | TaskState::Revise => {
             if !context.next_up.contains(&task.id) {

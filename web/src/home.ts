@@ -485,6 +485,8 @@ export interface MissionRow {
   id: number | null;
   name: string;
   halted: string | null;
+  /** The owner paused it (objective 099): its work in flight waits. */
+  paused: boolean;
   inFlight: InFlight[];
   landedToday: number;
   /** The latest send-back verdict today, with its reason. */
@@ -497,8 +499,9 @@ export interface MissionsToday {
   /** Active missions with nothing open: one folded line. `idle_ms`: how
    * long a mission that takes its work from an objective backlog has had
    * no task in work, since its last task ended (objective 058); null for
-   * owner work, or a mission that never had a task. */
-  quiet: Array<{ id: number | null; name: string; idle_ms: number | null }>;
+   * owner work, a mission that never had a task, or one the owner paused
+   * (`paused`, objective 099: held by the owner, not idle). */
+  quiet: Array<{ id: number | null; name: string; idle_ms: number | null; paused?: boolean }>;
   closed: number;
 }
 
@@ -585,6 +588,10 @@ export function missionsToday(missions: Missions | null, now: number): MissionsT
         const at = latestRecord(task);
         if (at !== null && (ended === null || at > ended)) ended = at;
       }
+      if (mission.paused) {
+        quiet.push({ id: mission.id, name, idle_ms: null, paused: true });
+        continue;
+      }
       const idle_ms = mission.objectives && ended !== null ? Math.max(0, now - ended) : null;
       quiet.push({ id: mission.id, name, idle_ms });
       continue;
@@ -624,7 +631,16 @@ export function missionsToday(missions: Missions | null, now: number): MissionsT
         };
       }
     }
-    rows.push({ id: mission.id, name, halted: mission.halted, inFlight, landedToday, lastRejection, moved });
+    rows.push({
+      id: mission.id,
+      name,
+      halted: mission.halted,
+      paused: Boolean(mission.paused),
+      inFlight,
+      landedToday,
+      lastRejection,
+      moved,
+    });
   }
   rows.sort((left, right) => right.moved - left.moved);
   return { rows: rows.map(({ moved: _moved, ...row }) => row), quiet, closed };
@@ -632,9 +648,10 @@ export function missionsToday(missions: Missions | null, now: number): MissionsT
 
 /** The card's words when no mission has work open: each mission that
  * takes its work from a backlog, with how long it has had none ("No mission
- * has work open: #4 Spawn RSI none for 3 h, #6 Supply PA none for 20 h."). */
+ * has work open: #4 Spawn RSI none for 3 h, #6 Supply PA none for 20 h.").
+ * A paused mission is the owner's choice, not a want of work: left out. */
 export function noWorkText(model: MissionsToday): string {
-  const idle = model.quiet.filter((mission) => mission.idle_ms !== null);
+  const idle = model.quiet.filter((mission) => mission.idle_ms !== null && !mission.paused);
   if (idle.length === 0) return "No mission has work open.";
   return `No mission has work open: ${idle
     .map((mission) => `#${mission.id} ${mission.name} none for ${ageText(mission.idle_ms ?? 0)}`)
@@ -642,13 +659,16 @@ export function noWorkText(model: MissionsToday): string {
 }
 
 /** The folded line's words for the missions with nothing open, a backlog
- * mission with how long ("#4 Spawn RSI (no work for 3 h), #8 Owner work"). */
+ * mission with how long, a paused one as paused ("#4 Spawn RSI (no work
+ * for 3 h), #6 Supply PA (paused), #8 Owner work"). */
 export function quietText(quiet: MissionsToday["quiet"]): string {
   return quiet
     .map((mission) =>
-      mission.idle_ms === null
-        ? `#${mission.id} ${mission.name}`
-        : `#${mission.id} ${mission.name} (no work for ${ageText(mission.idle_ms)})`,
+      mission.paused
+        ? `#${mission.id} ${mission.name} (paused)`
+        : mission.idle_ms === null
+          ? `#${mission.id} ${mission.name}`
+          : `#${mission.id} ${mission.name} (no work for ${ageText(mission.idle_ms)})`,
     )
     .join(", ");
 }
