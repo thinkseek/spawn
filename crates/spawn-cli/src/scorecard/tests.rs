@@ -184,6 +184,7 @@ impl Story {
         let facts = Facts {
             control: self.control.clone(),
             commands: self.commands.clone(),
+            owner_runs_from_ms: None,
         };
         History::from_record(&facts, &self.messages)
     }
