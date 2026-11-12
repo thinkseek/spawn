@@ -36,12 +36,18 @@
 //! `/api/cost?window=7d`'s dollars per landing ([`performance`]), kept for a
 //! minute so a Home poll does not compute them again at every request. The
 //! storage figures are health.storage's on `/api/fleet`, read the same way
-//! ([`super::storage::report`]). The recoverability guardrails (objective
-//! 087, [`recoverability`]) are the ages of the newest database copy and
-//! bundle (health.backups on `/api/fleet`), the age of the oldest nightly
-//! judging and how many sources the nightly holds red (its fact files,
-//! [`nightly_facts`]). The other lines' north stars are not
-//! collected yet; later objectives add their figures to this frame.
+//! ([`super::storage::report`]). The observability line's guardrails
+//! (objective 088) are the share of the 7-day cost window's tokens no price
+//! covers (`/api/cost?window=7d`'s total, kept with the performance figures:
+//! unpriced_tokens over its input, output, cache write and cache read
+//! tokens; null with none), health's `human_per_agent_hour` on
+//! `/api/fleet`, and how many figures of this same answer have no value,
+//! itself left out. The recoverability guardrails (objective 087,
+//! [`recoverability`]) are the ages of the newest database copy and bundle
+//! (health.backups on `/api/fleet`), the age of the oldest nightly judging
+//! and how many sources the nightly holds red (its fact files,
+//! [`nightly_facts`]). The other lines' north stars are not collected yet;
+//! later objectives add their figures to this frame.
 //!
 //! No range lives in code: they come only from the ranges file,
 //! `SPAWN_CORE_LINES_FILE`, by default `<workspace root>/core-lines.json`,
@@ -343,8 +349,9 @@ pub(super) fn recoverability(backups: &Value, facts: Option<&[Value]>, now_ms: i
 /// the 7-day scorecard and cost window again at every request.
 const PERFORMANCE_KEPT_MS: i64 = 60_000;
 
-/// The performance figures of the last read, and when.
-static PERFORMANCE: std::sync::Mutex<Option<(i64, Value)>> = std::sync::Mutex::new(None);
+/// The performance figures of the last read and the 7-day cost window's
+/// `total` (objective 088), and when.
+static PERFORMANCE: std::sync::Mutex<Option<(i64, Value, Value)>> = std::sync::Mutex::new(None);
 
 /// The performance line's values (objective 086), from the Scorecard's
 /// answer over its default 7 days and `/api/cost?window=7d`'s: the fleet
@@ -373,18 +380,19 @@ pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
     })
 }
 
-/// The performance values, kept for [`PERFORMANCE_KEPT_MS`]: computed from
-/// the 7-day scorecard and cost window as the pages compute them. A part
-/// that cannot be read counts as not collected.
-fn performance_now(store: &spawn_postgres::PostgresStore, now_ms: i64) -> Value {
+/// The performance values and the 7-day cost window's `total`, kept for
+/// [`PERFORMANCE_KEPT_MS`]: computed from the 7-day scorecard and cost
+/// window as the pages compute them. A part that cannot be read counts as
+/// not collected.
+fn performance_now(store: &spawn_postgres::PostgresStore, now_ms: i64) -> (Value, Value) {
     let mut kept = PERFORMANCE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((_, values)) = kept
+    if let Some((_, values, cost_total)) = kept
         .as_ref()
-        .filter(|(at, _)| (0..PERFORMANCE_KEPT_MS).contains(&now_ms.saturating_sub(*at)))
+        .filter(|(at, _, _)| (0..PERFORMANCE_KEPT_MS).contains(&now_ms.saturating_sub(*at)))
     {
-        return values.clone();
+        return (values.clone(), cost_total.clone());
     }
     let root = crate::env_value("SPAWN_WORKSPACE_ROOT");
     let scorecard = crate::scorecard::measure(
@@ -397,8 +405,9 @@ fn performance_now(store: &spawn_postgres::PostgresStore, now_ms: i64) -> Value 
         .and_then(|(name, length_ms)| crate::cost::window(store, name, length_ms))
         .unwrap_or(Value::Null);
     let values = performance(&scorecard, &cost);
-    *kept = Some((now_ms, values.clone()));
-    values
+    let cost_total = cost["total"].clone();
+    *kept = Some((now_ms, values.clone(), cost_total.clone()));
+    (values, cost_total)
 }
 
 /// The performance line ([`performance`]'s values).
@@ -439,6 +448,31 @@ fn performance_line(performance: &Value) -> Line {
         ],
     }
 }
+
+/// What the observability line reads besides the answer itself: the 7-day
+/// cost window's `total` and health's `human_per_agent_hour`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct Observed {
+    pub(super) cost_total: Value,
+    pub(super) human_per_agent_hour: Value,
+}
+
+/// The share of `total`'s tokens (input, output, cache write and cache
+/// read) that no price covers: null with no tokens.
+pub(super) fn unpriced_share(total: &Value) -> Value {
+    let tokens = &total["tokens"];
+    let all: f64 = ["input", "output", "cache_write", "cache_read"]
+        .iter()
+        .filter_map(|count| tokens[*count].as_f64())
+        .sum();
+    match total["unpriced_tokens"].as_f64() {
+        Some(unpriced) if all > 0.0 => json!(unpriced / all),
+        _ => Value::Null,
+    }
+}
+
+/// The key of the count of figures not measured.
+const NOT_MEASURED: &str = "observability.not_measured";
 
 /// The storage line, from health.storage.
 fn storage_line(storage: &Value) -> Line {
@@ -502,25 +536,19 @@ fn storage_line(storage: &Value) -> Line {
 
 /// The four lines: the performance line's figures from `performance`
 /// ([`performance`]), the storage line's from `storage` (health.storage as
-/// [`super::storage::report`] gives it), the recoverability guardrails
-/// `recoverability` ([`recoverability`]).
+/// [`super::storage::report`] gives it), the observability line's from
+/// `observed`, the recoverability guardrails `recoverability`
+/// ([`recoverability`]).
 pub(super) fn lines(
     storage: &Value,
     performance: &Value,
+    observed: &Observed,
     recoverability: Vec<Figure>,
 ) -> Vec<Line> {
-    vec![
+    let mut lines = vec![
         performance_line(performance),
         storage_line(storage),
-        Line {
-            name: "observability",
-            north_star: Figure::not_collected(
-                "observability.needs_you_right",
-                "Needs you is right",
-                "share",
-            ),
-            guardrails: Vec::new(),
-        },
+        observability_line(observed),
         Line {
             name: "recoverability",
             north_star: Figure::not_collected(
@@ -530,7 +558,58 @@ pub(super) fn lines(
             ),
             guardrails: recoverability,
         },
-    ]
+    ];
+    count_not_measured(&mut lines);
+    lines
+}
+
+/// The observability line (objective 088): its count not measured is set by
+/// [`count_not_measured`] once every line is built.
+fn observability_line(observed: &Observed) -> Line {
+    Line {
+        name: "observability",
+        north_star: Figure::not_collected(
+            "observability.needs_you_right",
+            "Needs you is right",
+            "share",
+        ),
+        guardrails: vec![
+            Figure::new(
+                "observability.unpriced_share",
+                "Use with no price",
+                "share",
+                unpriced_share(&observed.cost_total),
+            ),
+            Figure::new(
+                "observability.interventions_per_agent_hour",
+                "Human interventions per agent-hour",
+                "ratio",
+                if observed.human_per_agent_hour.is_number() {
+                    observed.human_per_agent_hour.clone()
+                } else {
+                    Value::Null
+                },
+            ),
+            Figure::not_collected(NOT_MEASURED, "Figures not measured", "count"),
+        ],
+    }
+}
+
+/// Sets the count of figures not measured: those of `lines` with no value,
+/// the count itself left out.
+fn count_not_measured(lines: &mut [Line]) {
+    let missing = lines
+        .iter()
+        .flat_map(|line| std::iter::once(&line.north_star).chain(&line.guardrails))
+        .filter(|figure| figure.key != NOT_MEASURED && figure.value.is_null())
+        .count();
+    for figure in lines
+        .iter_mut()
+        .flat_map(|line| std::iter::once(&mut line.north_star).chain(&mut line.guardrails))
+        .filter(|figure| figure.key == NOT_MEASURED)
+    {
+        figure.value = json!(missing);
+    }
 }
 
 /// The answer from the lines, the ranges file's path (null when there is
@@ -655,12 +734,18 @@ fn lines_at(
     now_ms: i64,
 ) -> Result<Vec<Line>, String> {
     let storage = super::storage::report(store, now_ms)?;
-    let performance = performance_now(store, now_ms);
+    let (performance, cost_total) = performance_now(store, now_ms);
+    let health = store.fleet_health().map_err(super::err)?;
+    let observed = Observed {
+        cost_total,
+        human_per_agent_hour: health["human_per_agent_hour"].clone(),
+    };
     let backups = store.newest_backups().map_err(super::err)?;
     let facts = nightly_facts(nightly);
     Ok(lines(
         &storage,
         &performance,
+        &observed,
         recoverability(&backups, facts.as_deref(), now_ms),
     ))
 }
@@ -691,8 +776,8 @@ pub(crate) fn sample_values() -> Result<Map<String, Value>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Figure, answer, figure_json, lines, nightly_facts, parse_ranges, performance, read_ranges,
-        recoverability,
+        Figure, Observed, answer, figure_json, lines, nightly_facts, parse_ranges, performance,
+        read_ranges, recoverability, unpriced_share,
     };
     use serde_json::{Value, json};
 
@@ -798,7 +883,7 @@ mod tests {
             ],
         });
         let view = answer(
-            &lines(&storage, &Value::Null, Vec::new()),
+            &lines(&storage, &Value::Null, &Observed::default(), Vec::new()),
             &json!("/ws/core-lines.json"),
             Ok(None),
             &std::collections::BTreeMap::new(),
@@ -838,6 +923,7 @@ mod tests {
         let bare = lines(
             &json!({"database": {"bytes": 300, "log_bytes": 0}, "test_databases": []}),
             &Value::Null,
+            &Observed::default(),
             Vec::new(),
         );
         assert_eq!(bare[1].guardrails[2].value, Value::Null);
@@ -848,11 +934,11 @@ mod tests {
             view["lines"][0]["guardrails"].as_array().map(Vec::len),
             Some(4)
         );
-        // The other north stars are not collected, with no guardrails.
+        // The other north stars are not collected.
         for index in [2, 3] {
             assert_eq!(view["lines"][index]["north_star"]["state"], "not_collected");
-            assert_eq!(view["lines"][index]["guardrails"], json!([]));
         }
+        assert_eq!(view["lines"][3]["guardrails"], json!([]));
         assert_eq!(view["ranges_error"], Value::Null);
         assert_eq!(view["ignored_ranges"], json!([]));
     }
@@ -878,7 +964,7 @@ mod tests {
         assert!((share - 300_000.0 / 5_100_000.0).abs() < 1e-12, "{share}");
         assert_eq!(values["first_pass"], json!(0.749));
         assert_eq!(values["usd_per_landing"], json!(8.08));
-        let line = &lines(&json!({}), &values, Vec::new())[0];
+        let line = &lines(&json!({}), &values, &Observed::default(), Vec::new())[0];
         let keys: Vec<&str> = std::iter::once(&line.north_star)
             .chain(&line.guardrails)
             .map(|figure| figure.key)
@@ -906,7 +992,7 @@ mod tests {
             json!({"report_to_live": null, "gate_time": null, "decided_nothing": null,
                    "first_pass": null, "usd_per_landing": null})
         );
-        let line = &lines(&json!({}), &none, Vec::new())[0];
+        let line = &lines(&json!({}), &none, &Observed::default(), Vec::new())[0];
         assert!(
             std::iter::once(&line.north_star)
                 .chain(&line.guardrails)
@@ -953,7 +1039,7 @@ mod tests {
         assert_eq!(bundle_only[0].value, Value::Null);
         assert_eq!(bundle_only[1].value, json!(6_000));
         // The line carries them as its guardrails, in order.
-        let line = &lines(&json!({}), &Value::Null, both)[3];
+        let line = &lines(&json!({}), &Value::Null, &Observed::default(), both)[3];
         assert_eq!(line.name, "recoverability");
         assert_eq!(
             line.guardrails
@@ -1077,7 +1163,12 @@ mod tests {
             vec![json!({"day": "2026-11-12", "value": 3})],
         );
         let view = answer(
-            &lines(&json!({"free_bytes": 3}), &Value::Null, Vec::new()),
+            &lines(
+                &json!({"free_bytes": 3}),
+                &Value::Null,
+                &Observed::default(),
+                Vec::new(),
+            ),
             &Value::Null,
             Ok(None),
             &trends,
@@ -1103,12 +1194,93 @@ mod tests {
         let figures = lines(
             &json!({"free_bytes": 3, "days_left": 9}),
             &Value::Null,
+            &Observed::default(),
             Vec::new(),
         );
         let values = super::values_of(&figures);
+        // The count not measured always has a value (objective 088): the
+        // other 13 figures that have none.
         assert_eq!(
             Value::Object(values),
-            json!({"storage.free_bytes": 3, "storage.days_left": 9})
+            json!({"storage.free_bytes": 3, "storage.days_left": 9,
+                   "observability.not_measured": 13})
         );
+    }
+
+    /// Objective 088: the observability line's guardrails.
+    #[test]
+    fn the_observability_line_gives_unpriced_use_interventions_and_the_count_not_measured() {
+        let storage = json!({
+            "days_left": 1234, "free_bytes": 104, "growth_bytes_per_day": 10,
+            "database": {"bytes": 300, "log_bytes": 100},
+            "test_databases": [{"bytes": 7, "schemas": 3}],
+        });
+        let tokens = |input: u64, cache_read: u64, unpriced: u64| {
+            json!({"usd": 0.9, "tokens": {"input": input, "output": 0, "cache_write": 0,
+                   "cache_read": cache_read}, "unpriced_tokens": unpriced})
+        };
+        // No tokens: no share.
+        assert_eq!(unpriced_share(&tokens(0, 0, 0)), Value::Null);
+        assert_eq!(unpriced_share(&Value::Null), Value::Null);
+        // All priced: none unpriced.
+        assert_eq!(unpriced_share(&tokens(300, 100, 0)), json!(0.0));
+        // Every count is in the whole, cache reads too.
+        assert_eq!(unpriced_share(&tokens(300, 100, 100)), json!(0.25));
+
+        let observed = Observed {
+            cost_total: tokens(400_000, 0, 100_000),
+            human_per_agent_hour: json!(0.125),
+        };
+        let all = lines(&storage, &Value::Null, &observed, Vec::new());
+        let observability = &all[2];
+        assert_eq!(
+            observability.north_star.key,
+            "observability.needs_you_right"
+        );
+        assert_eq!(observability.north_star.value, Value::Null);
+        let guardrails: Vec<(&str, &str, Value)> = observability
+            .guardrails
+            .iter()
+            .map(|figure| (figure.key, figure.unit, figure.value.clone()))
+            .collect();
+        // Not measured: the five performance figures (none read) and the
+        // two other north stars not collected, every storage figure
+        // measured, itself left out though it starts with no value.
+        assert_eq!(
+            guardrails,
+            [
+                ("observability.unpriced_share", "share", json!(0.25)),
+                (
+                    "observability.interventions_per_agent_hour",
+                    "ratio",
+                    json!(0.125)
+                ),
+                ("observability.not_measured", "count", json!(7)),
+            ]
+        );
+        // Nothing read: the two guardrails count too.
+        let bare = lines(&storage, &Value::Null, &Observed::default(), Vec::new());
+        assert_eq!(bare[2].guardrails[0].value, Value::Null);
+        assert_eq!(bare[2].guardrails[1].value, Value::Null);
+        assert_eq!(bare[2].guardrails[2].value, json!(9));
+        // Its range and state as for every figure.
+        let view = answer(
+            &all,
+            &Value::Null,
+            Ok(Some(
+                r#"{"ranges": {"observability.unpriced_share": {"max": 0.05},
+                    "observability.interventions_per_agent_hour": {"max": 0.05},
+                    "observability.not_measured": {"max": 0}}}"#
+                    .to_string(),
+            )),
+            &std::collections::BTreeMap::new(),
+        );
+        let states: Vec<&str> = view["lines"][2]["guardrails"]
+            .as_array()
+            .expect("guardrails")
+            .iter()
+            .map(|figure| figure["state"].as_str().expect("a state"))
+            .collect();
+        assert_eq!(states, ["out", "out", "out"]);
     }
 }

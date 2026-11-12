@@ -29,7 +29,15 @@ function answer(fields: Partial<CoreLinesAnswer> = {}): CoreLinesAnswer {
           fig("storage.test_database_schemas", "Most test schemas", "count", 1214, null, "no_range"),
         ],
       },
-      { line: "observability", north_star: fig("observability.needs_you_right", "Needs you is right", "share", null, null, "not_collected"), guardrails: [] },
+      {
+        line: "observability",
+        north_star: fig("observability.needs_you_right", "Needs you is right", "share", null, null, "not_collected"),
+        guardrails: [
+          fig("observability.unpriced_share", "Use with no price", "share", 0.38, null, "no_range"),
+          fig("observability.interventions_per_agent_hour", "Human interventions per agent-hour", "ratio", 0.125, { max: 0.05 }, "out"),
+          fig("observability.not_measured", "Figures not measured", "count", 2, null, "no_range"),
+        ],
+      },
       { line: "recoverability", north_star: fig("recoverability.restores_passed", "Critical resources with a restore passed in 7 days", "count", null, { min: 6 }, "not_collected"), guardrails: [] },
     ],
     ...fields,
@@ -54,7 +62,11 @@ test("coreLinesView names the four lines and says each figure, its range and its
     range: "6 or more",
     tone: "muted",
   });
-  assert.deepEqual(view.rows[2].guardrails, []);
+  assert.deepEqual(view.rows[2].guardrails, [
+    { name: "Use with no price", value: "38.0%", range: "no range set", tone: "muted" },
+    { name: "Human interventions per agent-hour", value: "0.13", range: "0.05 or less", tone: "warning" },
+    { name: "Figures not measured", value: "2", range: "no range set", tone: "muted" },
+  ]);
   assert.equal(view.notice, null);
   assert.deepEqual(view.ignored, []);
 });
@@ -79,6 +91,10 @@ test("each unit in words, and each range form", () => {
   assert.equal(unitWords("bytes_per_day", 512 * MIB), "512.0 MB a day");
   assert.equal(unitWords("days", 1), "1 days");
   assert.equal(unitWords("ratio", 10), "10.0×");
+  assert.equal(unitWords("ratio", 0.125), "0.13");
+  assert.equal(unitWords("ratio", 0.05), "0.05");
+  assert.equal(unitWords("ratio", 0), "0");
+  assert.equal(rangeWords("ratio", { max: 0.05 }), "0.05 or less");
   assert.equal(unitWords("count", 1_234_567), "1,234,567");
   assert.equal(unitWords("ms", 5_400_000), "1 h 30 min");
   assert.equal(unitWords("share", 0.954), "95.4%");
