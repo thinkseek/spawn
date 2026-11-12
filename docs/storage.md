@@ -747,6 +747,10 @@ uses the disk:
     (the live one was 159 MB for a 35 MB log); the loop's `database_size`
     alert (docs/fleet-architecture.md, "Alerts") now says when any of them
     outgrows the live log;
+    the Storage card shows a row for each ("Gate test database", "Fleet
+    test database", note "<n> schemas") once one holds a schema or cannot
+    be read, none while every one is a fresh database with no schema; the
+    "Database" row's note says the log's size ("log <size>") from 0.1 MB;
   - `growth_bytes_per_day`: what was appended to the archive, its bytes
     now less the `archive_bytes` of the oldest sample of the last 7 days,
     over the days between them, rounded down; null without a sample at
