@@ -90,10 +90,12 @@ pub(super) fn measured_samples(mut samples: Value, first_deploy_ms: Option<i64>)
 /// [`PERFORMANCE_KEPT_MS`]: computed from the 7-day scorecard and cost
 /// window as the pages compute them, report to live held back until the
 /// live record covers the window ([`measured`]). A part that cannot be read
-/// counts as not collected.
+/// counts as not collected. The Scorecard's and the cost window's times go
+/// in `parts` when they are computed, not when they are kept.
 pub(super) fn performance_now(
     store: &spawn_postgres::PostgresStore,
     now_ms: i64,
+    parts: &mut super::Parts,
 ) -> (Value, Value) {
     let mut kept = PERFORMANCE
         .lock()
@@ -105,15 +107,19 @@ pub(super) fn performance_now(
         return (values.clone(), cost_total.clone());
     }
     let root = crate::env_value("SPAWN_WORKSPACE_ROOT");
-    let scorecard = crate::scorecard::measure(
-        store,
-        root.as_deref().map(std::path::Path::new),
-        &crate::scorecard::Query::default(),
-    )
+    let scorecard = super::timed(&mut parts.archive, || {
+        crate::scorecard::measure(
+            store,
+            root.as_deref().map(std::path::Path::new),
+            &crate::scorecard::Query::default(),
+        )
+    })
     .unwrap_or(Value::Null);
-    let cost = crate::cost::window_of(Some("7d"))
-        .and_then(|(name, length_ms)| crate::cost::summary(store, name, length_ms))
-        .unwrap_or(Value::Null);
+    let cost = super::timed(&mut parts.cost, || {
+        crate::cost::window_of(Some("7d"))
+            .and_then(|(name, length_ms)| crate::cost::summary(store, name, length_ms))
+    })
+    .unwrap_or(Value::Null);
     let first_deploy_ms = store.first_deploy_finished_ms().ok().flatten();
     let database_now_ms = store.database_now_ms().unwrap_or(now_ms);
     let values = measured(

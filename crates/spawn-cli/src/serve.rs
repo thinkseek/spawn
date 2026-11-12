@@ -3443,6 +3443,36 @@ mod tests {
         });
     }
 
+    /// The per-part timing, through the real store: a reading says how
+    /// long each of its parts took. The archive and the cost are the kept
+    /// performance values' (another test may have computed them within the
+    /// minute), so they are both timed or both not, never one alone.
+    #[test]
+    fn a_reading_times_each_of_its_parts() {
+        in_test_schema(|_owner, store| {
+            let dir = std::env::temp_dir().join(format!(
+                "spawn-core-lines-parts-{}-{}",
+                std::process::id(),
+                super::now_ms()
+            ));
+            std::fs::create_dir_all(&dir).expect("a directory");
+            let mut parts = super::core_lines::Parts::default();
+            super::core_lines::core_lines_timed(
+                store,
+                Some(&dir.join("core-lines.json")),
+                Some(&dir.join("nightly")),
+                &mut parts,
+            )
+            .expect("the answer");
+            assert!(
+                parts.facts.is_some() && parts.storage.is_some() && parts.health.is_some(),
+                "{parts:?}"
+            );
+            assert_eq!(parts.archive.is_some(), parts.cost.is_some(), "{parts:?}");
+            std::fs::remove_dir_all(&dir).expect("clean up");
+        });
+    }
+
     /// Objective 084, through the real store: `/api/core-lines`' answer
     /// with no ranges file, a broken one and one with ranges, read at each
     /// request.

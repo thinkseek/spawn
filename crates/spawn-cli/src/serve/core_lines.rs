@@ -79,6 +79,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
@@ -356,6 +357,53 @@ fn nightly_dir() -> Option<PathBuf> {
     crate::env_value("SPAWN_WORKSPACE_ROOT").map(|root| PathBuf::from(root).join("nightly"))
 }
 
+/// How long each part of one reading took, said on the alert step's
+/// `core lines read:` line beside its whole compute time (the owner's
+/// per-part timing). `None` is a part that did not run: the archive and the
+/// cost are kept by [`performance_now`] for a minute after they are
+/// computed, and a reading that failed ends before its later parts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Parts {
+    /// The recoverability line's facts: the newest backups, the nightly's
+    /// fact files and the drills.
+    pub(crate) facts: Option<Duration>,
+    /// The 7-day Scorecard (`scorecard::measure`, which reads the
+    /// transcript archive).
+    pub(crate) archive: Option<Duration>,
+    /// The 7-day cost window (`cost::summary`).
+    pub(crate) cost: Option<Duration>,
+    /// The storage report, with the scratch nobody owns and each test
+    /// server's schemas.
+    pub(crate) storage: Option<Duration>,
+    /// The fleet's health.
+    pub(crate) health: Option<Duration>,
+}
+
+impl Parts {
+    /// `facts_ms=<n|none> archive_ms=… cost_ms=… storage_ms=… health_ms=…`.
+    pub(crate) fn text(&self) -> String {
+        let ms = |part: Option<Duration>| {
+            part.map_or_else(|| "none".to_string(), |took| took.as_millis().to_string())
+        };
+        format!(
+            "facts_ms={} archive_ms={} cost_ms={} storage_ms={} health_ms={}",
+            ms(self.facts),
+            ms(self.archive),
+            ms(self.cost),
+            ms(self.storage),
+            ms(self.health)
+        )
+    }
+}
+
+/// `work`'s result, its time put in `part`.
+fn timed<T>(part: &mut Option<Duration>, work: impl FnOnce() -> T) -> T {
+    let begun = Instant::now();
+    let result = work();
+    *part = Some(begun.elapsed());
+    result
+}
+
 /// `GET /api/core-lines`.
 pub(super) fn core_lines() -> Result<Value, String> {
     core_lines_at(
@@ -371,13 +419,17 @@ pub(super) fn core_lines() -> Result<Value, String> {
 /// read-only connection and its statement timeout. It is the whole
 /// Scorecard and more (cc-astra A18: a minute's cache has always expired
 /// at the step's 300 s), so the step runs it on a thread of its own and
-/// never waits for it (crate alerts/guardrails.rs).
-pub(crate) fn reading() -> Result<Value, String> {
-    core_lines_at(
+/// never waits for it (crate alerts/guardrails.rs). It comes with how long
+/// each of its parts took.
+pub(crate) fn reading() -> Result<(Value, Parts), String> {
+    let mut parts = Parts::default();
+    let view = core_lines_timed(
         &super::open_store()?,
         ranges_path().as_deref(),
         nightly_dir().as_deref(),
-    )
+        &mut parts,
+    )?;
+    Ok((view, parts))
 }
 
 /// The answer with the ranges file at `path` and the nightly's fact files
@@ -387,10 +439,20 @@ pub(super) fn core_lines_at(
     path: Option<&Path>,
     nightly: Option<&Path>,
 ) -> Result<Value, String> {
+    core_lines_timed(store, path, nightly, &mut Parts::default())
+}
+
+/// [`core_lines_at`], each part's time put in `parts`.
+pub(super) fn core_lines_timed(
+    store: &spawn_postgres::PostgresStore,
+    path: Option<&Path>,
+    nightly: Option<&Path>,
+    parts: &mut Parts,
+) -> Result<Value, String> {
     let now_ms = super::now_ms();
     let contents = read_ranges(path);
     let text = contents.as_ref().ok().and_then(Option::as_deref);
-    let (figures, extras) = lines_at(store, nightly, text, now_ms)?;
+    let (figures, extras) = lines_at(store, nightly, text, now_ms, parts)?;
     let samples = store
         .host_core_lines(trend_since(now_ms))
         .map_err(super::err)?;
@@ -425,20 +487,23 @@ struct Extras {
 /// The four lines' figures, read at `now_ms` with the nightly's fact files
 /// in `nightly` and the Core lines file's contents `file` (its
 /// `recoverability` drills, objective 093; its `storage` scratch roots and
-/// test servers, objective 094), and what the answer gains beside them.
+/// test servers, objective 094), and what the answer gains beside them;
+/// each part's time put in `parts`.
 fn lines_at(
     store: &spawn_postgres::PostgresStore,
     nightly: Option<&Path>,
     file: Option<&str>,
     now_ms: i64,
+    parts: &mut Parts,
 ) -> Result<(Vec<Line>, Extras), String> {
-    let mut storage = super::storage::report(store, now_ms)?;
-    let unowned = unowned::now(file, now_ms);
+    let (mut storage, unowned) = timed(&mut parts.storage, || {
+        super::storage::report(store, now_ms).map(|storage| (storage, unowned::now(file, now_ms)))
+    })?;
     let reading = unowned.reading.as_deref();
     storage["unowned_scratch_bytes"] = reading.map_or(Value::Null, unowned::Reading::unowned_bytes);
     storage["leaked_test_schemas"] = reading.map_or(Value::Null, unowned::Reading::leaked);
-    let (performance, cost_total) = performance_now(store, now_ms);
-    let health = store.fleet_health().map_err(super::err)?;
+    let (performance, cost_total) = performance_now(store, now_ms, parts);
+    let health = timed(&mut parts.health, || store.fleet_health()).map_err(super::err)?;
     let observed = Observed {
         cost_total,
         human_per_agent_hour: health["human_per_agent_hour"].clone(),
@@ -447,9 +512,16 @@ fn lines_at(
         // (sync/astra/findings.md A23), so it is not shown as the north star.
         needs_you_right: Value::Null,
     };
-    let backups = store.newest_backups().map_err(super::err)?;
-    let facts = nightly_facts(nightly);
-    let drills = drills::read(store, file, now_ms);
+    let (backups, facts, drills) = timed(&mut parts.facts, || {
+        store.newest_backups().map(|backups| {
+            (
+                backups,
+                nightly_facts(nightly),
+                drills::read(store, file, now_ms),
+            )
+        })
+    })
+    .map_err(super::err)?;
     let mut guardrails = recoverability(&backups, facts.as_deref(), now_ms);
     guardrails.extend(drills.guardrails);
     Ok((
@@ -487,7 +559,13 @@ pub(crate) fn sample_values() -> Result<Map<String, Value>, String> {
     let store = super::open_store()?;
     let contents = read_ranges(ranges_path().as_deref());
     let text = contents.as_ref().ok().and_then(Option::as_deref);
-    let (lines, _) = lines_at(&store, nightly_dir().as_deref(), text, super::now_ms())?;
+    let (lines, _) = lines_at(
+        &store,
+        nightly_dir().as_deref(),
+        text,
+        super::now_ms(),
+        &mut Parts::default(),
+    )?;
     Ok(values_of(&lines))
 }
 
