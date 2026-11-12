@@ -3474,8 +3474,10 @@ impl Bridge {
             }
             Err(error) => {
                 // The first line it lacks stays the first while nothing more
-                // is archived: read once.
-                if behind_ms.is_none() {
+                // is archived: read once, once it reads a time. "No time that
+                // reads" (`i64::MIN`, which holds every window open) is read
+                // again each pass: the line may have been half written (S33).
+                if behind_ms.is_none_or(|at| at == i64::MIN) {
                     match transcripts::first_line_ms(
                         self.terminals.as_ref(),
                         workspace,
@@ -5454,6 +5456,38 @@ mod tests {
         world.tick();
         assert!(world.archived().ends_with(&second));
         assert_eq!(world.archived().matches("msg_c1").count(), 1, "copied once");
+    }
+
+    /// S33: a failing copy whose first read of what the archive lacks meets
+    /// a line still being written holds every window open for that pass
+    /// ("no time that reads"), never settles one early, and does not keep
+    /// that answer for as long as the copy fails: it reads the line again,
+    /// and once the line is whole a window ending before its call reads
+    /// settled while one ending after it stays open.
+    #[test]
+    fn a_failed_copy_over_a_half_line_reads_settled_once_the_line_is_whole() {
+        let mut world = World::with_archive();
+        world.advance(20_000);
+        world.store.hold_archive(&World::agent(), true);
+        let line = call_line("c1", 19);
+        let (half, rest) = line.split_at(20);
+        world.engine_writes(half);
+        world.tick();
+        assert_eq!(world.progress().behind_ms, Some(i64::MIN), "no time yet");
+        assert!(world.settling(18_500), "a half line settles no window");
+        assert!(world.settling(19_500), "a half line settles no window");
+        world.engine_writes(rest);
+        world.tick();
+        let progress = world.progress();
+        assert_eq!(progress.behind_ms, Some(19_000), "{progress:?}");
+        assert!(
+            !world.settling(18_500),
+            "a window ending before the call reads settled: {progress:?}"
+        );
+        assert!(
+            world.settling(19_500),
+            "a call before the end is not archived"
+        );
     }
 
     /// Objective 47 (a), (b): a copy that fails is warned once and made
