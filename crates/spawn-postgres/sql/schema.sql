@@ -5531,7 +5531,8 @@ create index if not exists spawn_events_control_record_type
 -- Every intervention, exactly the scorecard's (docs/design.md §15, autonomy
 -- (a)-(d)): `command`, a person's intent (`spawn_human_intents`: a refused
 -- command sent again is one), at its time, `command_id` its first command;
--- `resume`, a `mission.resumed`; `owner_task`, a task a person assigned on
+-- `resume`, a `mission.resumed` or the owner's release of a pause
+-- (`mission.unpaused`); `pause`, the owner's `mission.paused`; `owner_task`, a task a person assigned on
 -- a mission accepted by review; `cancel_reassign`, a person's cancellation
 -- of an open task followed by the same work (the same objective, or without
 -- one the same brief) assigned again in the mission, at that assignment
@@ -5558,9 +5559,11 @@ select i.at_ms, 'command'::text as kind, null::bigint as mission_id,
        null::bigint as task_id, i.intent as command_id, null::bigint as cancelled_task_id
 from spawn_human_intents i
 union all
-select r.at_ms, 'resume', spawn_experience_int(r.record -> 'id'), null, null, null
+select r.at_ms, case r.type when 'mission.paused' then 'pause' else 'resume' end,
+       spawn_experience_int(r.record -> 'id'), null, null, null
 from spawn_experience_records r
-where r.type = 'mission.resumed' and spawn_experience_int(r.record -> 'id') is not null
+where r.type in ('mission.resumed', 'mission.paused', 'mission.unpaused')
+  and spawn_experience_int(r.record -> 'id') is not null
 union all
 select r.at_ms, 'owner_task', a.mission_id, a.task_id, null, null
   from spawn_experience_records r

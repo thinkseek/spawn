@@ -124,7 +124,7 @@ select jsonb_build_object(
 ///   `kind`, `at_ms`, `principal`, `agent`, `session` (a command's; null
 ///   for the other kinds), `line` (an input's first line, at most 120
 ///   characters, else the action's type; "resumed mission #<id>",
-///   "assigned task #<id>", "cancelled task #<id>, assigned task #<id>"),
+///   "paused mission #<id>", "assigned task #<id>", "cancelled task #<id>, assigned task #<id>"),
 ///   `commands` (an intent's ids in order; `[]` otherwise), `attempts` and
 ///   `outcome` (null for the other kinds).
 const INTERVENTIONS: &str = r"
@@ -158,6 +158,7 @@ with
              'session', null,
              'line', case v.kind
                        when 'resume' then 'resumed mission #' || v.mission_id
+                       when 'pause' then 'paused mission #' || v.mission_id
                        when 'owner_task' then 'assigned task #' || v.task_id
                        else 'cancelled task #' || v.cancelled_task_id
                             || ', assigned task #' || v.task_id end,
