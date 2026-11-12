@@ -27,6 +27,8 @@ import {
   allNotes,
   liveAlerts,
   missionsToday,
+  conflictText,
+  earlierConflictCount,
   needsSummary,
   needsYou,
   oneLine,
