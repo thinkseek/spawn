@@ -24,13 +24,7 @@ export interface CoreFigure {
   /** The last 7 UTC days (objective 090): each day's last sample carrying
    * the figure, oldest first; empty without one. */
   trend?: CoreTrendPoint[];
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
   /** A figure still measuring its window: when it started (objective 095). */
-=======
-  /** While the figure's window is not yet covered by its record (objective
-   * 095, the performance north star): where the measuring began, epoch ms.
-   * The value is then null. */
->>>>>>> 4e9fca0d54f031d4f909771c9f85ab3dc0292d64
   measuring_since_ms?: number | null;
 }
 
@@ -172,31 +166,14 @@ export function rangeWords(unit: string, range: CoreRange | null | undefined): s
   return "no range set";
 }
 
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
 const two = (n: number) => String(n).padStart(2, "0");
 
 /** A moment as "MM-DD HH:MM", local time. */
 export function sinceWords(ms: number): string {
-=======
-const two = (value: number) => String(value).padStart(2, "0");
-
-/** An instant in local time as "MM-DD HH:MM", every field two digits. */
-export function localStamp(ms: number): string {
->>>>>>> 4e9fca0d54f031d4f909771c9f85ab3dc0292d64
   const at = new Date(ms);
   return `${two(at.getMonth() + 1)}-${two(at.getDate())} ${two(at.getHours())}:${two(at.getMinutes())}`;
 }
 
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
-=======
-/** A figure with no value: "measuring since <MM-DD HH:MM>" while its record
- * does not cover its window yet (objective 095), else "not collected yet". */
-function noValueWords(figure: Partial<CoreFigure>): string {
-  const since = finite(figure.measuring_since_ms);
-  return since === null ? "not collected yet" : `measuring since ${localStamp(since)}`;
-}
-
->>>>>>> 4e9fca0d54f031d4f909771c9f85ab3dc0292d64
 function mark(raw: unknown): CoreMark {
   const figure = (typeof raw === "object" && raw !== null ? raw : {}) as Partial<CoreFigure>;
   const unit = typeof figure.unit === "string" ? figure.unit : "count";
@@ -204,12 +181,8 @@ function mark(raw: unknown): CoreMark {
   const since = finite(figure.measuring_since_ms);
   return {
     name: typeof figure.name === "string" ? figure.name : String(figure.key ?? ""),
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
     value:
       value !== null ? unitWords(unit, value) : since !== null ? `measuring since ${sinceWords(since)}` : "not collected yet",
-=======
-    value: value === null ? noValueWords(figure) : unitWords(unit, value),
->>>>>>> 4e9fca0d54f031d4f909771c9f85ab3dc0292d64
     range: rangeWords(unit, figure.range),
     tone: figure.state === "in" ? "plain" : figure.state === "out" ? "warning" : "muted",
   };

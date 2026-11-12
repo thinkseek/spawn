@@ -666,7 +666,6 @@ fn the_facts_carry_reports_and_deploys() {
     assert_eq!(deploys[1]["at"], 3000);
 }
 
-<<<<<<< 138d011af691752dc1ab0f4ab6ea4c92fb72f754
 /// The live record's start (objective 095's (2), the Core lines hand fix):
 /// the first `deploy.finished` of any outcome, a failed one too; none
 /// without one, and other records are not it.
@@ -698,7 +697,8 @@ fn the_live_record_starts_at_the_first_deploy_of_any_outcome() {
         Some(2000),
         "the earliest, a failed deploy too"
     );
-=======
+}
+
 /// Objective 095: the facts name where the live record begins, the first
 /// `deploy.finished` of any outcome (a failed one too), read over the whole
 /// log before their end: one recorded long before a 7-day window is found,
@@ -737,5 +737,4 @@ fn the_facts_find_the_live_records_start_before_the_window() {
     assert_eq!(earlier["live_from_ms"], now - 8 * DAY);
     let before = store.scorecard_facts(now - 8 * DAY).expect("the facts");
     assert_eq!(before["live_from_ms"], Value::Null, "{before}");
->>>>>>> 4e9fca0d54f031d4f909771c9f85ab3dc0292d64
 }
