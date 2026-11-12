@@ -1325,6 +1325,14 @@ fn a_store_restored_in_place_leaves_no_kept_fact_behind() {
 /// last control record is the same row as the kept one, so the restore
 /// probe passes, is read whole, not merged into the old database's facts.
 /// The case makes its own database, and drops it and its logins after.
+/// What the drops may touch (the lead's two conditions): the database's
+/// name is made here for this run (`spawn_test_<pid>_<nanos>_kept_oid`),
+/// never read from the environment or from the URL's own database, and
+/// every drop names that literal (and the three logins migrate made for
+/// it, `<login>_<name>`), nothing by pattern. The drops are this case's
+/// own lines, not a helper shared with other tests. After a failed
+/// assertion the database may be left behind (the reviewed reaper's
+/// print-only list shows it); the drop after the case is only tried.
 #[test]
 fn a_database_made_again_under_its_name_is_another_store() {
     let url = common::url();
