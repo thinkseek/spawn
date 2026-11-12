@@ -165,7 +165,7 @@ cp "$out" "$scratch/list-fresh.md"
 aged() { sed -E "s/^listed [0-9]+ /listed $(($(date +%s) - 90000)) /" "$1"; }
 aged_listed() { echo "listed $(($(date +%s) - 90000)) xid $(admin -c "select pg_snapshot_xmin(pg_current_snapshot())")"; }
 # a would-drop line's objs= and ids= for a hand-made line (never matching)
-fp="objs=1 ids=00000000000000000000000000000000"
+fp="seqv=00000000000000000000000000000000 objs=1 ids=00000000000000000000000000000000"
 aged "$scratch/list-fresh.md" >"$scratch/list.md"
 # list_of <name>...: a list made now by the print-only run, aged 25 h, with
 # the would-drop lines of the names given (each must qualify) and any
@@ -228,10 +228,10 @@ refused "a test schema's name without a pid" "refused: names in the list that ar
 { cat "$scratch/list.md"; echo "would-drop $old_gone pid=$dead idle=48h size=0MB mods=1 seq=0 $fp"; } >"$scratch/dup.md"
 run "${live[@]}" -- --apply "$scratch/dup.md"
 refused "a name listed twice" "refused: names listed twice: $old_gone"
-sed -E "s/^(would-drop $old_gone .*) objs=[0-9]+ ids=[0-9a-f]+\$/\1/" "$scratch/list.md" >"$scratch/noobjs.md"
+sed -E "/^would-drop $old_gone /s/ objs=[0-9]+ ids=[0-9a-f]+//" "$scratch/list.md" >"$scratch/noobjs.md"
 check "  (the list without objs= and ids= is that list less them)" [ "$(grep -c ' objs=' "$scratch/noobjs.md")" = $(($(grep -c ' objs=' "$scratch/list.md") - 1)) ]
 run "${live[@]}" -- --apply "$scratch/noobjs.md"
-refused "a would-drop line without objs= and ids= (a list of the version before)" "refused: would-drop lines without mods=, seq=, objs= and ids= \\(make the list again with this version\\): $old_gone"
+refused "a would-drop line without objs= and ids= (a list of the version before)" "refused: would-drop lines without mods=, seq=, seqv=, objs= and ids= \\(make the list again with this version\\): $old_gone"
 
 echo "== 3. --apply of the reviewed list"
 # Since the list: one is written to, one is dropped by someone else; a
@@ -267,7 +267,7 @@ check "one gone since is said" has "^skipped $old_vanish gone$"
 exists "$not_listed" && pass "a qualifying schema not on the list stays" || fail "a qualifying schema not on the list stays"
 exists "$other_only" && pass "one listed only in another database's section stays" || fail "one listed only in another database's section stays"
 for s in "$alive" "$young" "$nopid"; do exists "$s" && pass "kept: $s" || fail "kept: $s"; done
-check "a qualifying schema not on the list is said, kept" has "^not-on-list $not_listed pid=$dead idle=4[78]h size=[0-9]+MB mods=1 seq=0 objs=[0-9]+ ids=[0-9a-f]{32} \\(qualifies now, not reviewed: kept\\)$"
+check "a qualifying schema not on the list is said, kept" has "^not-on-list $not_listed pid=$dead idle=4[78]h size=[0-9]+MB mods=1 seq=0 objs=[0-9]+ ids=[0-9a-f]{32} seqv=[0-9a-f]{32} \\(qualifies now, not reviewed: kept\\)$"
 check "  so is the one only another database's section lists" has "^not-on-list $other_only "
 check "  and the held one 3b takes, left off 3a's list" has "^not-on-list $old_locked "
 check "  with their count" has "^sweep-test-schemas --apply: 3 qualifying schema\\(s\\) not on the list, kept$"
@@ -376,7 +376,13 @@ c_op=spawn_test_${dead}_ca04_4_operator_outside
 c_ok=spawn_test_${dead}_ca05_5_untouched
 c_drop=spawn_test_${dead}_ca06_6_function_dropped_since
 c_open=spawn_test_${dead}_ca07_7_writer_open_at_the_list
-c_all=("$c_func" "$c_ins" "$c_del" "$c_op" "$c_ok" "$c_drop" "$c_open")
+# And two with a CACHE 1 sequence, drawn once before the list (the lead's
+# decision on rev-e r4 N1: CACHE 1 writes its last_value at every nextval,
+# so its use is seen): one drawn again after the list, kept; one not,
+# dropped.
+c_s1=spawn_test_${dead}_ca09_9_cache1_drawn_since
+c_s1ok=spawn_test_${dead}_ca10_10_cache1_untouched
+c_all=("$c_func" "$c_ins" "$c_del" "$c_op" "$c_ok" "$c_drop" "$c_open" "$c_s1" "$c_s1ok")
 # And one with a sequence a second session draws from its cache, before the
 # list and after it (cc-astra A14): kept at the list, and kept by --apply
 # from a line that lists it.
@@ -396,6 +402,9 @@ done
 stored=$(admin -c "select last_value from pg_sequences where schemaname = '$c_seq'")
 check "the drawer's first value reserved a cached block (stored $stored)" [ "$stored" = 10 ]
 for s in "${c_all[@]}"; do make "$s"; done
+for s in "$c_s1" "$c_s1ok"; do
+  admin -c "create sequence $s.s cache 1" -c "select nextval('$s.s')" >/dev/null
+done
 admin -c "create function $c_op.lt(int, int) returns boolean language sql immutable as 'select \$1 < \$2'" \
   -c "create function $c_drop.f() returns int language sql as 'select 1'" \
   -c "create function $c_open.f() returns int language sql as 'select 1'" >/dev/null
@@ -413,7 +422,7 @@ check "a writer is open, its function replaced, not committed" \
   [ "$(admin -c "select count(*) from pg_stat_activity where datname = 'sweep_db' and state = 'idle in transaction' and backend_xid is not null")" = 1 ]
 admin -c "select txid_current()" >/dev/null
 list_of "${c_all[@]}" >"$scratch/changes.md"
-check "a schema with a sequence is kept at the list" has "^keep +$c_seq pid=$dead .* has 1 sequence\\(s\\): a cached nextval leaves no trace to check\$"
+check "a schema with a sequence is kept at the list" has "^keep +$c_seq pid=$dead .* has 1 sequence\\(s\\) with a cache or not readable: their use leaves no trace to check\$"
 echo "select nextval('$c_seq.s');" >&8
 echo '\q' >&8
 exec 8>&-
@@ -428,32 +437,72 @@ wait "$writer"
 check "the writer committed after the list" [ "$(admin -c "select $c_open.f()")" = 2 ]
 check "the list's xid is the writer's or older" \
   [ "$(admin -c "select age(xmin) <= age('$(sed -n 's/^listed [0-9]* xid //p' "$scratch/changes.md")'::text::xid) from pg_proc where oid = '$c_open.f'::regproc")" = t ]
-check "the changes list holds all seven, and the sequence's line" [ "$(grep -c '^would-drop ' "$scratch/changes.md")" = 8 ]
+check "the changes list holds all nine, and the cached sequence's line" [ "$(grep -c '^would-drop ' "$scratch/changes.md")" = 10 ]
 admin -c "create function $c_func.g() returns int language sql as 'select 1'" \
-  -c "drop function $c_drop.f()" \
+  -c "drop function $c_drop.f()" -c "select nextval('$c_s1.s')" \
   -c "insert into $c_ins.t values (5)" -c "delete from $c_del.t" \
   -c "create operator public.<<< (function = $c_op.lt, leftarg = int, rightarg = int)" >/dev/null
 run "${live[@]}" -- --apply "$scratch/changes.md" --preview
 check "--preview: exit 0 (status $status)" [ "$status" -eq 0 ]
 check "--preview: the untouched one would be dropped" has "^would drop $c_ok \\(preview: rolled back\\)\$"
 check "--preview: what the drop said is kept" has "^  \\| NOTICE:  drop cascades to table $c_ok\\.t\$"
-check "--preview: says it dropped nothing" has "^sweep-test-schemas --apply --preview \\(nothing dropped\\): would drop 1, skipped 7, failed 0\$"
+check "--preview: says it dropped nothing" has "^sweep-test-schemas --apply --preview \\(nothing dropped\\): would drop 2, skipped 8, failed 0\$"
 for s in "${c_all[@]}" "$c_seq"; do exists "$s" && pass "--preview: kept $s" || fail "--preview: kept $s"; done
 run "${live[@]}" -- --apply "$scratch/changes.md"
 check "exit 0 (status $status)" [ "$status" -eq 0 ]
 check "a function made since the list: kept" has "^skipped $c_func changed since the list \\(objects: [0-9]+ then, [0-9]+ now\\)\$"
 check "a function dropped since the list: kept" has "^skipped $c_drop changed since the list \\(objects: [0-9]+ then, [0-9]+ now\\)\$"
 check "a function replaced by a writer open at the list: kept" has "^skipped $c_open changed since the list \\(1 in pg_proc\\)\$"
-check "a sequence drawn from its cache since the list, listed anyway: kept" has "^skipped $c_seq has 1 sequence\\(s\\): a cached nextval leaves no trace to check\$"
+check "a CACHE 1 sequence drawn since the list: kept" has "^skipped $c_s1 changed since the list \\(sequence values\\)\$"
+check "a CACHE 1 sequence not drawn since: dropped" has "^dropped $c_s1ok\$"
+check "a sequence drawn from its cache since the list, listed anyway: kept" has "^skipped $c_seq has 1 sequence\\(s\\) with a cache or not readable: their use leaves no trace to check\$"
 check "a row inserted since the list, not checkpointed: kept" has "^skipped $c_ins changed since the list \\([0-9]+ rows of $c_ins\\.t\\)\$"
 check "a row deleted since the list, not checkpointed: kept" has "^skipped $c_del changed since the list \\(rows modified: 1 then, 2 now\\)\$"
 check "an operator in another schema over its function: kept" has "^skipped $c_op dependents-outside \\(1: public\\.<<<\\(integer,integer\\)\\)\$"
 check "  and so is the operator" [ "$(admin -c "select count(*) from pg_operator where oprname = '<<<'")" = 1 ]
 check "the untouched one is dropped" has "^dropped $c_ok\$"
 check "  and what the drop said is kept, under it" bash -c "grep -A1 -x 'dropped $c_ok' '$out' | tail -n 1 | grep -qx '  | NOTICE:  drop cascades to table $c_ok.t'"
-check "the totals: 1 dropped, 7 kept" has "^sweep-test-schemas --apply: dropped 1, skipped 7, failed 0\$"
-for s in "$c_func" "$c_ins" "$c_del" "$c_op" "$c_drop" "$c_open" "$c_seq"; do exists "$s" && pass "kept: $s" || fail "kept: $s"; done
+check "the totals: 2 dropped, 8 kept" has "^sweep-test-schemas --apply: dropped 2, skipped 8, failed 0\$"
+for s in "$c_func" "$c_ins" "$c_del" "$c_op" "$c_drop" "$c_open" "$c_seq" "$c_s1"; do exists "$s" && pass "kept: $s" || fail "kept: $s"; done
 ! exists "$c_ok" && pass "gone: $c_ok" || fail "gone: $c_ok"
+! exists "$c_s1ok" && pass "gone: $c_s1ok" || fail "gone: $c_s1ok"
+
+echo "== 7. a sweeping login that cannot inspect other roles' sessions (rev-e r4 F1)"
+# A login that is no superuser and lacks pg_read_all_stats, granted
+# pg_stat_file as the header allows, owning the schema: another role's
+# session reads to it with a null backend_type, and still counts.
+admin -c "create role sweeper login" \
+  -c "grant execute on function pg_stat_file(text, boolean) to sweeper" >/dev/null
+g7=spawn_test_${dead}_ga01_1_other_role_session
+make "$g7"
+admin -c "alter schema $g7 owner to sweeper" -c "alter table $g7.t owner to sweeper" >/dev/null
+age_old "$g7"
+list_of "$g7" >"$scratch/g7.md"
+check "the list holds it" [ "$(grep -c "^would-drop $g7 " "$scratch/g7.md")" = 1 ]
+sweeper_url="postgres://sweeper@$enc_socket:$port/sweep_db"
+sweeping=(HOME="$HOME" PATH="$PATH" SPAWN_TEST_DATABASE_URL="$sweeper_url")
+PGAPPNAME=sweep_other_role admin -c "select pg_sleep(120)" >/dev/null 2>&1 &
+other_pid=$!
+seen=""
+for _ in $(seq 100); do
+  [ "$(admin -c "select count(*) from pg_stat_activity where application_name = 'sweep_other_role'")" = 1 ] && { seen=1; break; }
+  sleep 0.1
+done
+[ -n "$seen" ] || { echo "$PROG: harness error: the other role's session never connected" >&2; exit 2; }
+check "the sweeper cannot tell the other session's type" \
+  [ "$(psql -X -qtA -h "$socket" -p "$port" -U sweeper -d sweep_db -c "select count(*) from pg_stat_activity where datname = 'sweep_db' and pid <> pg_backend_pid() and backend_type is null")" -ge 1 ]
+run "${sweeping[@]}" -- --apply "$scratch/g7.md"
+check "exit 0 (status $status)" [ "$status" -eq 0 ]
+check "skipped: another role's session counts" has "^skipped $g7 not quiescent \\([0-9]+ other session\\(s\\) connected to sweep_db: .*\\)\$"
+exists "$g7" && pass "  it is still there" || fail "  it is still there"
+admin -c "select pg_terminate_backend(pid) from pg_stat_activity where application_name = 'sweep_other_role'" >/dev/null
+wait "$other_pid" 2>/dev/null || true
+for _ in $(seq 100); do
+  [ "$(admin -c "select count(*) from pg_stat_activity where application_name = 'sweep_other_role'")" = 0 ] && break
+  sleep 0.1
+done
+run "${sweeping[@]}" -- --apply "$scratch/g7.md"
+check "with that session gone, the sweeper drops it (status $status)" has "^dropped $g7\$"
 
 guard_home
 if [ "$failures" -eq 0 ]; then

@@ -40,16 +40,23 @@
 #   see; r2 F2).
 # So "nothing changed since a list that old" is "nothing changed for that
 # long". The pid is checked again too, and an unknown age still keeps it.
-# Other names (no pid in them) always stay. A schema with a sequence always
-# stays (cc-astra A14): a backend can hand out values from a cached block
-# of nextval without moving anything stored, so no check here can see that
-# it was used.
+# Other names (no pid in them) always stay. A schema with a sequence whose
+# use cannot be seen always stays (cc-astra A14; the lead's decision 20:2x
+# on rev-e r4 N1): one with CACHE above 1, where a backend hands out values
+# from a cached block without moving anything stored, or one this login
+# may not read (its last_value reads null). A CACHE 1 sequence writes its
+# last_value at every nextval, so its use is seen: the list carries the
+# schema's CACHE 1 sequences' values (seqv=, a hash of each name and
+# last_value), and --apply keeps the schema when they differ under the
+# locks.
 # And the drop runs only on a quiet database (cc-astra A15; the lead's
 # decision): inside the drop's transaction, after the schema's locks, no
 # other client session may be connected to the target database (a new
 # outside dependent, an operator over the schema's function, needs no lock
 # the sweep holds, only a session), and that, and the outside dependents,
-# are checked again immediately before the DROP.
+# are checked again immediately before the DROP. A session the login may
+# not inspect (another role's, to a login without pg_read_all_stats)
+# counts as a client session too (rev-e r4 F1).
 #
 # Output of the print-only run: the section line, the time and transaction
 # id it looked at, one line per schema, then a summary. The section line
@@ -57,8 +64,9 @@
 # --apply takes only that section:
 #   database <name> port <port>
 #   listed <epoch> xid <oldest running transaction id>
-#   would-drop <schema> pid=<pid> idle=<h>h size=<MB>MB mods=<n> seq=0 objs=<n> ids=<md5>
-# (seq: the schema's sequences, 0 on every would-drop line)
+#   would-drop <schema> pid=<pid> idle=<h>h size=<MB>MB mods=<n> seq=0 seqv=<md5> objs=<n> ids=<md5>
+# (seq: the schema's sequences whose use cannot be seen, 0 on every
+# would-drop line; seqv: its CACHE 1 sequences' values)
 #   keep       <schema> pid=<pid> idle=<h>h size=<MB>MB <why>
 # A list file may hold several runs' output, one section each, in any text
 # around them (a markdown file with code blocks): only lines that start with
@@ -71,7 +79,7 @@
 # - --min-idle-hours is below 24, or the list is younger than it;
 # - the list file is missing, holds no section for this database, or more
 #   than one, or the section has no single `listed` line, or a would-drop
-#   line without mods=, seq=, objs= and ids=;
+#   line without mods=, seq=, seqv=, objs= and ids=;
 # - any would-drop name in the section is not spawn_test_<pid>_<...>
 #   (lower-case letters, digits and `_`), or is listed twice.
 # First, each schema that qualifies now but is not on the list:
@@ -210,22 +218,23 @@ if [ "$apply" = 1 ]; then
     list_age=$(($(date +%s) - listed_at))
     [ "$list_age" -ge $((min_idle_hours * 3600)) ] ||
         { echo "$prog: refused: the list is $((list_age / 3600))h old; --apply needs it at least ${min_idle_hours}h old, so that no change since it means none for that long" >&2; exit 2; }
-    # Each name's mods, seq, objs and ids when listed (see schema_rows).
+    # Each name's mods, seq, objs, ids and seqv when listed (see schema_rows).
     listed_counts=$(awk -v want="database $target_database port $target_port" '
         /^database / { inside = ($0 == want); next }
         inside && /^would-drop / {
-            m = ""; q = ""; o = ""; h = ""
+            m = ""; q = ""; o = ""; h = ""; v = ""
             for (i = 3; i <= NF; i++) {
                 if ($i ~ /^mods=[0-9]+$/) m = substr($i, 6)
                 if ($i ~ /^seq=[0-9]+$/) q = substr($i, 5)
                 if ($i ~ /^objs=[0-9]+$/) o = substr($i, 6)
                 if ($i ~ /^ids=[0-9a-f]{32}$/) h = substr($i, 5)
+                if ($i ~ /^seqv=[0-9a-f]{32}$/) v = substr($i, 6)
             }
-            print $2, m, q, o, h
+            print $2, m, q, o, h, v
         }' "$apply_list")
-    no_counts=$(printf '%s\n' "$listed_counts" | awk 'NF > 0 && NF < 5 { print $1 }')
+    no_counts=$(printf '%s\n' "$listed_counts" | awk 'NF > 0 && NF < 6 { print $1 }')
     [ -z "$no_counts" ] ||
-        { echo "$prog: refused: would-drop lines without mods=, seq=, objs= and ids= (make the list again with this version): $(printf '%s\n' "$no_counts" | head -n 3 | tr '\n' ' ')" >&2; exit 2; }
+        { echo "$prog: refused: would-drop lines without mods=, seq=, seqv=, objs= and ids= (make the list again with this version): $(printf '%s\n' "$no_counts" | head -n 3 | tr '\n' ' ')" >&2; exit 2; }
     bad_names=$(printf '%s\n' "$reviewed" | grep . | grep -vE '^spawn_test_[0-9]+_[a-z0-9_]+$' || true)
     [ -z "$bad_names" ] ||
         { echo "$prog: refused: names in the list that are not spawn_test_<pid>_...: $(printf '%s\n' "$bad_names" | head -n 5 | tr '\n' ' ')" >&2; exit 2; }
@@ -241,10 +250,12 @@ PGOPTIONS="${PGOPTIONS:+$PGOPTIONS }-c default_transaction_read_only=on"
 export PGOPTIONS
 
 # schema_rows <idle expression> [<one schema>]: name|bytes|idle seconds
-# (empty when the files cannot be read)|mods|seq|objs|ids, of every
+# (empty when the files cannot be read)|mods|seq|objs|ids|seqv, of every
 # spawn_test_* schema or of the one named (none when it is gone). mods: the
 # rows its tables have had inserted, updated and deleted, by the statistics
-# collector; seq: how many sequences it has (one keeps it, see judge); objs and ids: the
+# collector; seq: how many sequences it has whose use cannot be seen (CACHE
+# above 1, or not readable here; one keeps it, see judge); seqv: the md5 of
+# its CACHE 1 sequences' sorted `<name>=<last_value>`; objs and ids: the
 # objects DROP ... CASCADE removes with it (the pg_depend closure from the
 # namespace, the one --apply walks below), their count and the md5 of their
 # sorted `<catalog> <identity>` lines. A list carries all four for each
@@ -253,13 +264,18 @@ export PGOPTIONS
 # of its objects leaves no row at all.
 schema_rows() {
     psql -X -qtA -F '|' -v ON_ERROR_STOP=1 -v sr_one="${2-}" <<SQL
-select g.nspname, g.bytes, g.idle, g.mods, g.seq, f.objs, f.ids
+select g.nspname, g.bytes, g.idle, g.mods, g.seq, f.objs, f.ids, g.seqv
   from (select n.oid, n.nspname,
                coalesce(sum(pg_total_relation_size(c.oid)) filter (where c.relkind in ('r', 'm')), 0) as bytes,
                $1 as idle,
                coalesce(sum(pg_stat_get_tuples_inserted(c.oid) + pg_stat_get_tuples_updated(c.oid)
                             + pg_stat_get_tuples_deleted(c.oid)) filter (where c.relkind in ('r', 'm')), 0) as mods,
-               count(c.oid) filter (where c.relkind = 'S') as seq
+               count(c.oid) filter (where c.relkind = 'S'
+                                    and ((select q.seqcache from pg_sequence q where q.seqrelid = c.oid) > 1
+                                         or not has_sequence_privilege(c.oid, 'SELECT,USAGE'))) as seq,
+               (select md5(coalesce(string_agg(s.sequencename || '=' || coalesce(s.last_value::text, 'null'), ','
+                                               order by s.sequencename collate "C"), ''))
+                  from pg_sequences s where s.schemaname = n.nspname and s.cache_size = 1) as seqv
           from pg_namespace n
           left join pg_class c on c.relnamespace = n.oid and c.relkind in ('r', 'i', 't', 'm', 'S')
          where n.nspname like 'spawn\_test\_%' and (:'sr_one' = '' or n.nspname = :'sr_one')
@@ -297,8 +313,9 @@ if ! rows=$(schema_rows "$idle_sql" 2>/dev/null); then
 fi
 
 min_idle=$((min_idle_hours * 3600))
-# judge <name> <bytes> <idle> [<mods> <seq> <objs> <ids> [listed]]: sets
-# jd_line (the dry-run line, with mods, seq, objs and ids when given) and jd_why (empty when the
+# judge <name> <bytes> <idle> [<mods> <seq> <objs> <ids> <seqv> [listed]]:
+# sets jd_line (the dry-run line, with mods, seq, seqv, objs and ids when
+# given) and jd_why (empty when the
 # schema qualifies). `listed`: the age floor was the list's (its files were
 # that old when it was made, and the list is that old now), so only an
 # unknown age keeps it here.
@@ -314,12 +331,12 @@ judge() {
     elif [ -z "$3" ]; then
         jd_why="its age is unknown"
     elif [ "${5:-0}" != 0 ]; then
-        jd_why="has $5 sequence(s): a cached nextval leaves no trace to check"
-    elif [ "${8-}" != listed ] && [ "$3" -lt "$min_idle" ]; then
+        jd_why="has $5 sequence(s) with a cache or not readable: their use leaves no trace to check"
+    elif [ "${9-}" != listed ] && [ "$3" -lt "$min_idle" ]; then
         jd_why="written ${jd_hours}h ago (< ${min_idle_hours}h)"
     fi
     if [ -z "$jd_why" ]; then
-        jd_line=$(printf 'would-drop %s pid=%s idle=%sh size=%sMB%s' "$1" "$jd_pid" "$jd_hours" "$jd_mb" "${4:+ mods=$4 seq=${5-0} objs=${6-0} ids=${7-}}")
+        jd_line=$(printf 'would-drop %s pid=%s idle=%sh size=%sMB%s' "$1" "$jd_pid" "$jd_hours" "$jd_mb" "${4:+ mods=$4 seq=${5-0} objs=${6-0} ids=${7-} seqv=${8-}}")
     else
         jd_line=$(printf 'keep       %s pid=%s idle=%sh size=%sMB %s' "$1" "${jd_pid:--}" "${jd_hours:-?}" "$jd_mb" "$jd_why")
     fi
@@ -333,9 +350,9 @@ if [ "$apply" = 0 ]; then
     echo "database $target_database port $target_port"
     printf 'listed %s\n' "$listed_mark"
     drop_count=0 drop_bytes=0 keep_count=0 keep_bytes=0
-    while IFS='|' read -r name bytes idle mods seqs objs ids; do
+    while IFS='|' read -r name bytes idle mods seqs objs ids seqv; do
         [ -n "$name" ] || continue
-        judge "$name" "$bytes" "$idle" "$mods" "$seqs" "$objs" "$ids"
+        judge "$name" "$bytes" "$idle" "$mods" "$seqs" "$objs" "$ids" "$seqv"
         printf '%s\n' "$jd_line"
         if [ -z "$jd_why" ]; then
             drop_count=$((drop_count + 1)) drop_bytes=$((drop_bytes + bytes))
@@ -354,9 +371,9 @@ before=$(totals "$rows")
 # The difference the other way (owner's step 4): what qualifies now and is
 # not on the reviewed list is said, and kept.
 not_listed=0
-while IFS='|' read -r name bytes idle mods seqs objs ids; do
+while IFS='|' read -r name bytes idle mods seqs objs ids seqv; do
     [ -n "$name" ] || continue
-    judge "$name" "$bytes" "$idle" "$mods" "$seqs" "$objs" "$ids"
+    judge "$name" "$bytes" "$idle" "$mods" "$seqs" "$objs" "$ids" "$seqv"
     [ -z "$jd_why" ] || continue
     # A here-string, not a pipe: under pipefail, grep -q stopping at its
     # match killed printf with SIGPIPE on a list longer than a pipe's
@@ -384,8 +401,8 @@ for name in $reviewed; do
         skipped=$((skipped + 1))
         continue
     fi
-    IFS='|' read -r _ now_bytes now_idle now_mods now_seqs now_objs now_ids <<<"$now_row"
-    judge "$name" "$now_bytes" "$now_idle" "$now_mods" "$now_seqs" "$now_objs" "$now_ids" listed
+    IFS='|' read -r _ now_bytes now_idle now_mods now_seqs now_objs now_ids now_seqv <<<"$now_row"
+    judge "$name" "$now_bytes" "$now_idle" "$now_mods" "$now_seqs" "$now_objs" "$now_ids" "$now_seqv" listed
     printf '%s\n' "$jd_line"
     if [ -n "$jd_why" ]; then
         echo "skipped $name $jd_why"
@@ -425,15 +442,16 @@ for name in $reviewed; do
     # The name, the list's xid and time go in as settings (psql quotes them),
     # and to SQL through format('%I') and casts.
     if [ "$preview" = 1 ]; then tx_end=rollback; else tx_end=commit; fi
-    read -r _ name_mods _ name_objs name_ids < <(awk -v n="$name" '$1 == n' <<<"$listed_counts")
+    read -r _ name_mods _ name_objs name_ids name_seqv < <(awk -v n="$name" '$1 == n' <<<"$listed_counts")
     if drop_err=$(PGOPTIONS=$pgoptions_drop psql -X -q -v ON_ERROR_STOP=1 -v dn_name="$name" \
         -v dn_xid="$listed_xid" -v dn_end="$tx_end" \
-        -v dn_mods="$name_mods" -v dn_objs="$name_objs" -v dn_ids="$name_ids" 2>&1 >/dev/null <<'SQL'
+        -v dn_mods="$name_mods" -v dn_objs="$name_objs" -v dn_ids="$name_ids" -v dn_seqv="$name_seqv" 2>&1 >/dev/null <<'SQL'
 begin;
 set local lock_timeout = '10s';
 select set_config('sweep.name', :'dn_name', true), set_config('sweep.xid', :'dn_xid', true),
        set_config('sweep.mods', :'dn_mods', true),
-       set_config('sweep.objs', :'dn_objs', true), set_config('sweep.ids', :'dn_ids', true);
+       set_config('sweep.objs', :'dn_objs', true), set_config('sweep.ids', :'dn_ids', true),
+       set_config('sweep.seqv', :'dn_seqv', true);
 do $sweep$
 declare
     nsp oid := (select oid from pg_namespace where nspname = current_setting('sweep.name'));
@@ -452,10 +470,14 @@ begin
                 where c.relnamespace = nsp and c.relkind in ('r', 'p', 'v', 'm', 'f') order by c.oid loop
         execute format('lock table %s in access exclusive mode', rel);
     end loop;
-    -- A quiet database (cc-astra A15): no other client session.
+    -- A quiet database (cc-astra A15): no other client session. A session
+    -- of another role reads with a null backend_type to a login without
+    -- pg_read_all_stats (rev-e r4 F1): it counts, so a login that cannot
+    -- tell is never told the database is quiet.
     select count(*), string_agg(distinct coalesce(a.application_name, ''), ', ') into found, first
       from pg_stat_activity a
-     where a.datname = current_database() and a.pid <> pg_backend_pid() and a.backend_type = 'client backend';
+     where a.datname = current_database() and a.pid <> pg_backend_pid()
+       and coalesce(a.backend_type, 'client backend') = 'client backend';
     if found > 0 then
         raise exception 'sweep: not quiescent (% other session(s) connected to %: %)', found, current_database(), first;
     end if;
@@ -488,10 +510,13 @@ begin
     if found > 0 then
         raise exception 'sweep: dependents-outside (%: %)', found, first;
     end if;
-    -- A sequence, here or owned from here (cc-astra A14): its use by a
-    -- cached nextval leaves nothing stored to check.
+    -- A sequence, here or owned from here, whose use cannot be seen (cc-astra
+    -- A14): CACHE above 1 (a cached nextval moves nothing stored) or not
+    -- readable here (its last_value reads null).
     select count(*) into found from sweep_closure s join pg_class c on c.oid = s.objid
-     where s.classid = 'pg_class'::regclass and c.relkind = 'S';
+     where s.classid = 'pg_class'::regclass and c.relkind = 'S'
+       and ((select q.seqcache from pg_sequence q where q.seqrelid = c.oid) > 1
+            or not has_sequence_privilege(c.oid, 'SELECT,USAGE'));
     if found > 0 then
         raise exception 'sweep: has sequences (%)', found;
     end if;
@@ -539,6 +564,13 @@ begin
             raise exception 'sweep: changed since the list (% rows of %)', found, rel;
         end if;
     end loop;
+    -- A CACHE 1 sequence's nextval since the list: its last_value moved.
+    select md5(coalesce(string_agg(s.sequencename || '=' || coalesce(s.last_value::text, 'null'), ','
+                                   order by s.sequencename collate "C"), ''))
+      into ids from pg_sequences s where s.schemaname = current_setting('sweep.name') and s.cache_size = 1;
+    if ids <> current_setting('sweep.seqv') then
+        raise exception 'sweep: changed since the list (sequence values)';
+    end if;
     -- What a scan cannot see: deletes (and every insert or update), by the
     -- statistics collector's counts.
     select coalesce(sum(pg_stat_get_tuples_inserted(c.oid) + pg_stat_get_tuples_updated(c.oid)
@@ -552,7 +584,8 @@ begin
     -- and no outside dependent in the closure read afresh.
     select count(*), string_agg(distinct coalesce(a.application_name, ''), ', ') into found, first
       from pg_stat_activity a
-     where a.datname = current_database() and a.pid <> pg_backend_pid() and a.backend_type = 'client backend';
+     where a.datname = current_database() and a.pid <> pg_backend_pid()
+       and coalesce(a.backend_type, 'client backend') = 'client backend';
     if found > 0 then
         raise exception 'sweep: not quiescent (% other session(s) connected to %: %)', found, current_database(), first;
     end if;
