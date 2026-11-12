@@ -5,8 +5,10 @@ use serde_json::{Value, json};
 use super::{Figure, Line};
 
 /// What the observability line reads besides the answer itself: the 7-day
-/// cost window's `total`, health's `human_per_agent_hour`, and the north
-/// star "Needs you is right" ([`needs_you_right`], objective 092).
+/// cost window's `total`, the Home card's human interventions per
+/// agent-hour (`human_per_agent_hour`: `/api/interventions?window=24h`'s
+/// `per_agent_hour`, objective 100), and the north star "Needs you is right"
+/// ([`needs_you_right`], objective 092).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(in crate::serve) struct Observed {
     pub(in crate::serve) cost_total: Value,
@@ -49,16 +51,20 @@ pub(super) fn observability_line(observed: &Observed) -> Line {
                 "share",
                 unpriced_share(&observed.cost_total),
             ),
-            Figure::new(
-                "observability.interventions_per_agent_hour",
-                "Human interventions per agent-hour",
-                "ratio",
-                if observed.human_per_agent_hour.is_number() {
-                    observed.human_per_agent_hour.clone()
-                } else {
-                    Value::Null
-                },
-            ),
+            Figure {
+                // The Home card's figure over its 24 h, said beside it.
+                window: Some("24h"),
+                ..Figure::new(
+                    "observability.interventions_per_agent_hour",
+                    "Human interventions per agent-hour",
+                    "ratio",
+                    if observed.human_per_agent_hour.is_number() {
+                        observed.human_per_agent_hour.clone()
+                    } else {
+                        Value::Null
+                    },
+                )
+            },
             Figure::not_collected(NOT_MEASURED, "Figures not measured", "count"),
         ],
     }
