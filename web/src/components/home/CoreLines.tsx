@@ -82,8 +82,10 @@ function Guardrail({ mark, figure }: { mark: CoreMark; figure: CoreFigure | unde
  * The Core lines on Home (objective 084): each core line's north star with
  * its value and range, then its guardrails as marks, plain when healthy and
  * coloured when out of range (`/api/core-lines`, coreLines.ts). A ranges
- * file that cannot be read, and the ranges it gave that were left out, are
- * said here, so a broken file shows without reading logs. Each figure
+ * file that cannot be read is said here, so a broken file shows without
+ * reading logs; a range it gave that was left out is said in words (a
+ * figure not built yet, a range not read), never as its internal key and
+ * reason (lead-mac 2026-11-12 18:15). Each figure
  * carries its last 7 days as a small line, the change as its title
  * (objective 090). Read-only.
  */
@@ -99,12 +101,16 @@ export function CoreLinesCard() {
         </p>
       ) : (
         <>
-          {(view.notice || view.ignored.length > 0) && (
-            <div className="space-y-0.5 border-b border-surface-border px-4 py-2 text-caption text-warning" role="status">
-              {view.notice && <p className="break-words">{view.notice}</p>}
-              {view.ignored.map((line) => (
+          {view.notice && (
+            <div className="border-b border-surface-border px-4 py-2 text-caption text-warning" role="status">
+              <p className="break-words">{view.notice}</p>
+            </div>
+          )}
+          {view.pending.length > 0 && (
+            <div className="space-y-0.5 border-b border-surface-border px-4 py-2 text-caption text-faint-foreground">
+              {view.pending.map((line) => (
                 <p key={line} className="break-words">
-                  range ignored: {line}
+                  {line}
                 </p>
               ))}
             </div>
