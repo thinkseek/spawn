@@ -2407,6 +2407,86 @@ fn a_landing_starts_a_base_warm_of_the_new_main() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A warm a predecessor's restart cut off (warm.rs, `Warms::take_over`):
+/// its pid file, naming a process gone, the source's main, the source and
+/// the mission's scenarios, is found by the next integrator, which warms
+/// that main again at its first pass, but not while it drains, and not
+/// while every mission on the source is halted.
+#[test]
+fn a_warm_cut_off_by_a_restart_is_warmed_again_at_the_first_pass() {
+    // `case`: "live", "drain" or "halted". The warm's arguments, if any.
+    fn first_pass(case: &str) -> Option<Vec<String>> {
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-db-warm-again-{case}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("gate-warm")).expect("dir");
+        let args = dir.join("warm-args");
+        let gate = format!(
+            "if [ \"$1\" = --base-only ]; then printf '%s\\n' \"$@\" >'{}'; exit 0; fi\n\
+             exit 1\n",
+            args.display()
+        );
+        let (base, source, scenarios, integrator) = world(&format!("warm-again-{case}"), &gate);
+        let db = Db::new(&format!("warm_again_{case}"));
+        let mission = db.gated_mission(&source, &scenarios);
+        let main = source_main(&source);
+        let mut gone = std::process::Command::new("true").spawn().expect("true");
+        let pid = gone.id();
+        gone.wait().expect("reaped");
+        std::fs::write(
+            dir.join("gate-warm").join(super::warm::PID_FILE),
+            format!(
+                "pid {pid}\nstart 1\ncommit {main}\nsource {source}\nscenarios {}\n",
+                super::pinned(&scenarios).display()
+            ),
+        )
+        .expect("pid file");
+        let integrator = integrator.with_warm(dir.join("gate-warm"));
+        match case {
+            "drain" => integrator.begin_drain(Some(&db.store), 7200),
+            "halted" => {
+                db.record(&json!({"type": "mission.halted", "id": mission, "reason": "a test"}));
+            }
+            _ => {}
+        }
+        integrator.pass_on(&db.store).expect("the first pass");
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(if case == "live" { 10 } else { 2 });
+        while !args.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let said = std::fs::read_to_string(&args)
+            .ok()
+            .map(|said| said.lines().map(str::to_string).collect::<Vec<_>>());
+        if case != "live" {
+            // Nor at a later pass: a halted source's lost warm is dropped,
+            // and a drain starts no warm.
+            integrator.pass_on(&db.store).expect("the next pass");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            assert!(!args.exists(), "{case}: no warm at a later pass either");
+        }
+        if let Some(words) = &said {
+            assert_eq!(words.len(), 4, "{words:?}");
+            assert_eq!(words[0], "--base-only");
+            assert!(words[1].contains(".sources"), "the source's mirror: {words:?}");
+            assert_eq!(words[2], main, "the source's main as it is");
+            assert_eq!(Path::new(&words[3]), super::pinned(&scenarios));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&dir);
+        said
+    }
+    assert!(first_pass("live").is_some(), "warmed again at the first pass");
+    assert_eq!(first_pass("drain"), None, "a drain starts no warm");
+    assert_eq!(
+        first_pass("halted"),
+        None,
+        "a source whose missions are all halted is warmed for no gate"
+    );
+}
+
 /// Gate v2 step 2 (integrate/judging.rs): a judging's gate runs in the
 /// judging's directory under the workspace root, beside `judging.json`
 /// (what it judges), its verdict and landing name that judging, and the
