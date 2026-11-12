@@ -227,7 +227,7 @@ export function StorageCard({ storage, backups = null }: { storage: Storage | nu
       </div>
     );
   }
-  const { rows, lasts, measured_from } = storageView(storage);
+  const { rows, lasts, measured_from, lasts_from } = storageView(storage);
   const fell = (storage.projects?.before ?? 0) > (storage.projects?.files ?? Infinity);
   return (
     <div className="min-w-0 text-caption">
@@ -249,7 +249,8 @@ export function StorageCard({ storage, backups = null }: { storage: Storage | nu
         className="tnum mt-1.5 text-faint-foreground"
         title={`Free on the workspace root: ${formatGib(storage.free_bytes)}; sizes read ${clockTime(storage.read_at_ms)}`}
       >
-        {lasts ?? `How long the disk lasts: ${measured_from === null ? "not measured yet" : `measured from ${measured_from}`}`}
+        {lasts ??
+          `How long the disk lasts: ${lasts_from !== null ? `measured from ${lasts_from}` : measured_from === null ? "not measured yet" : `measured from ${measured_from}`}`}
       </p>
       <BackupRows backups={backups} />
     </div>
