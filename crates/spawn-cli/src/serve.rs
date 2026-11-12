@@ -1884,18 +1884,28 @@ fn rsi_pane(query: &str) -> Result<Value, String> {
 /// at this request: the health's `disk` (free space, [`crate::disk::report`]),
 /// `memory` (`/proc/meminfo`, [`crate::memory::report`]) and `storage`
 /// (what uses the disk, [`storage::report`]: its sizes kept for ten minutes).
+/// Its `backups` are the newest database copy and bundle (objective 82,
+/// [`backups`]).
 fn fleet() -> Result<Value, String> {
     let store = open_store()?;
     let mut health = store.fleet_health().map_err(err)?;
     health["disk"] = crate::disk::report(&store.host_disk().map_err(err)?);
     health["memory"] = crate::memory::report();
     health["storage"] = storage::report(&store, now_ms())?;
+    health["backups"] = backups(&store)?;
     let mut agents = store.fleet_board().map_err(err)?;
     labels::label_fleet(&mut agents, &label_context(&store)?);
     Ok(json!({
         "agents": agents,
         "health": health,
     }))
+}
+
+/// The health's `backups`: `{dump, bundle}`, each the newest `backup.dumped`
+/// or `backup.bundled` record as `{at_ms, key, bytes}`, or null when there
+/// is none.
+fn backups(store: &spawn_postgres::PostgresStore) -> Result<Value, String> {
+    store.newest_backups().map_err(err)
 }
 
 /// What the fleet board and the attention queue label their agents with
