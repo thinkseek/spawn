@@ -738,3 +738,191 @@ fn the_facts_find_the_live_records_start_before_the_window() {
     let before = store.scorecard_facts(now - 8 * DAY).expect("the facts");
     assert_eq!(before["live_from_ms"], Value::Null, "{before}");
 }
+
+/// FACTS as it was before the lead's cut of 2026-11-13 (7c4e8ab6), word for
+/// word: the oracle the facts are compared with.
+const OLD_FACTS: &str = r"
+with h as materialized (
+  select u.id, i.intent, i.at_ms
+    from spawn_human_intents i
+   cross join lateral unnest(i.commands) as u(id)
+   where i.at_ms < $1)
+select jsonb_build_object(
+  'control', (
+    select coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
+             'seq', e.session_seq,
+             'at', e.recorded_at_ms,
+             'type', x.r ->> 'type',
+             'id', coalesce(x.r -> 'id', x.r -> 'row' -> 'id'),
+             'mission_id', coalesce(x.r -> 'mission_id', x.r -> 'row' -> 'mission_id'),
+             'agent_id', coalesce(x.r -> 'agent_id', x.r -> 'row' -> 'agent_id'),
+             'session_id', coalesce(x.r -> 'session_id', x.r -> 'row' -> 'session_id'),
+             'created_by', coalesce(x.r -> 'created_by', x.r -> 'row' -> 'created_by'),
+             'objective', coalesce(x.r -> 'objective', x.r -> 'row' -> 'objective'),
+             'brief', to_jsonb(md5(coalesce(x.r ->> 'brief', x.r -> 'row' ->> 'brief'))),
+             'verdict', x.r -> 'verdict',
+             'accepted', x.r -> 'accepted',
+             'ok', x.r -> 'ok',
+             'by', x.r -> 'by',
+             'gate', coalesce(x.r -> 'gate', x.r -> 'row' -> 'gate'),
+             'accept', coalesce(x.r -> 'accept', x.r -> 'row' -> 'accept'),
+             'gate_ms', case when jsonb_typeof(x.r -> 'gate_ms') = 'number'
+                             then x.r -> 'gate_ms' end,
+             -- An owner judging's mission: the one whose gate judged it.
+             'mission', case when jsonb_typeof(x.r -> 'mission') = 'number'
+                             then x.r -> 'mission' end,
+             'stage_ms', (select to_jsonb((s.m[1])::bigint)
+                            from regexp_matches(x.r ->> 'log',
+                                   '^[ \t]*\| stage gate [^ \t\n]+ ([0-9]{1,15})ms total[ \t\r]*$',
+                                   'gn') with ordinality as s(m, i)
+                           order by s.i desc limit 1),
+             'table', x.r -> 'table',
+             'state', x.r -> 'row' -> 'state',
+             'created_at_ms', x.r -> 'row' -> 'created_at_ms',
+             'updated_at_ms', x.r -> 'row' -> 'updated_at_ms',
+             'delivered_at_ms', x.r -> 'row' -> 'delivered_at_ms'))
+             order by e.session_seq), '[]'::jsonb)
+      from spawn_events e
+     -- `offset 0` keeps the record a value of its own: inlined, each of the
+     -- thirty `x.r` above would take it out of the event's `kind` (a gate's
+     -- log, a brief) again, which took most of the statement's time.
+     cross join lateral (select e.kind -> 'detail' -> 'record' as r offset 0) x
+     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+       and e.recorded_at_ms < $1
+       and x.r ->> 'type' in ('mission.added', 'mission.configured', 'mission.resumed',
+                              'task.assigned', 'task.delivered', 'task.gated', 'task.landed',
+                              'task.reviewed', 'task.cancelled', 'task.aborted',
+                              'task.over_budget', 'legacy.imported',
+                              'source.moved', 'source.push_refused',
+                              'task.reported', 'deploy.finished')),
+  'commands', (
+    select coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
+             'id', c.id,
+             'principal', c.principal,
+             'key', c.idempotency_key,
+             'session_id', c.session_id,
+             'action', c.action ->> 'type',
+             'created_at_ms', c.created_at_ms,
+             'finished_at_ms', r.finished_at_ms,
+             'succeeded', r.succeeded,
+             'error', case when r.succeeded is false and c.principal = 'spawn-dispatch'
+                                and c.idempotency_key like 'deliver-%' then c.error end,
+             'stalls', t.stalls,
+             'intent', h.intent,
+             'intent_at_ms', h.at_ms))
+             order by c.id), '[]'::jsonb)
+      from spawn_commands c
+     -- A command's result is a fact of the moment it finished: one that
+     -- finished at or after `$1` is unfinished in these facts, so the same
+     -- `$1` answers the same rows whenever it is asked.
+     cross join lateral (
+       select case when c.finished_at_ms < $1 then c.finished_at_ms end as finished_at_ms,
+              case when c.finished_at_ms < $1 then c.succeeded end as succeeded) r
+     cross join lateral (
+       select case when c.principal = 'spawn-dispatch' and c.action ->> 'type' = 'input'
+                        and jsonb_typeof(c.action -> 'tags') = 'array'
+                   then (select jsonb_agg(g.tag order by g.n)
+                           from jsonb_array_elements_text(c.action -> 'tags')
+                                with ordinality as g(tag, n)
+                          where g.tag ~ '(^| )stall-[0-9]+-[a-z_]+-[0-9]+$') end as stalls) t
+     left join h on h.id = c.id
+     where c.created_at_ms < $1
+       and (c.principal in ('human', 'spawn')
+            or r.succeeded is false
+            or (c.principal = 'spawn-dispatch'
+                and (c.idempotency_key like 'deliver-%' or t.stalls is not null)))),
+  -- From when the owner's judgings are counted (objective 076): the
+  -- earliest owner judging that carries its gate's wall clock, whatever
+  -- `$1` is; null when none does.
+  'owner_runs_from_ms', (
+    select min(e.recorded_at_ms)
+      from spawn_events e
+     cross join lateral (select e.kind -> 'detail' -> 'record' as r offset 0) x
+     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+       and x.r ->> 'type' in ('source.moved', 'source.push_refused')
+       and jsonb_typeof(x.r -> 'gate_ms') = 'number'),
+  -- Where the live record begins (objective 095): the first
+  -- `deploy.finished` of any outcome, over the whole log before `$1`
+  -- (whatever the window); null when there is none.
+  'live_from_ms', (
+    select min(e.recorded_at_ms)
+      from spawn_events e
+     cross join lateral (select e.kind -> 'detail' -> 'record' as r offset 0) x
+     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+       and e.recorded_at_ms < $1
+       and x.r ->> 'type' = 'deploy.finished'))";
+
+/// The lead's cut (the control facts sorted as small rows, not with their
+/// records; `live_from_ms` and `owner_runs_from_ms` taken from them, not
+/// read twice more) gives the old statement's answer exactly: on a history
+/// of every kind the facts read (gate logs with a stage line, owner
+/// judgings with and without their gate time, deploys, commands), at ends
+/// before everything, between the owner judgings (the earliest one after
+/// the end: read over the whole log, as before), between the deploys and
+/// after everything.
+#[test]
+fn the_facts_are_the_old_statements_answer() {
+    let (store, schema) = store("scorecard_facts_oracle");
+    let mut client = admin(&schema);
+    // Before everything: a report (not a deploy) and a landing that names
+    // no gate time (not an owner judging with one): neither is the start
+    // of either.
+    record(
+        &mut client,
+        100,
+        &json!({"type": "task.reported", "id": 4, "commit": "c"}),
+    );
+    record(
+        &mut client,
+        200,
+        &json!({"type": "source.moved", "source": "/s", "from": "x", "to": "a", "request": 6,
+               "verdict": "accepted", "missions": [1]}),
+    );
+    control_history(&mut client);
+    command_history(&mut client);
+    for (at, value) in [
+        (
+            2500,
+            json!({"type": "source.moved", "source": "/s", "from": "a", "to": "b", "request": 7,
+                   "verdict": "accepted", "missions": [1], "mission": 1, "gate_ms": 300_000}),
+        ),
+        (
+            2600,
+            json!({"type": "source.push_refused", "request": 8, "verdict": "rejected",
+                   "reason": "r", "mission": 2, "gate_ms": 450_000}),
+        ),
+        (
+            2700,
+            json!({"type": "source.moved", "source": "/s", "from": "b", "to": "c", "request": 9,
+                   "verdict": "accepted", "missions": [1]}),
+        ),
+        (
+            2800,
+            json!({"type": "deploy.finished", "ok": false, "head": "h", "by": "landing",
+                   "reason": "the build failed"}),
+        ),
+        (
+            9000,
+            json!({"type": "deploy.finished", "ok": true, "head": "h", "by": "owner",
+                   "reason": ""}),
+        ),
+    ] {
+        record(&mut client, at, &value);
+    }
+    for until in [
+        0, 150, 250, 1000, 2000, 2550, 2650, 2750, 5000, 9001, 20_000,
+    ] {
+        let old: Value = client
+            .query_one(OLD_FACTS, &[&until])
+            .expect("the old facts")
+            .get(0);
+        let new = store.scorecard_facts(until).expect("the facts");
+        assert_eq!(new, old, "until {until}");
+    }
+    let facts = store.scorecard_facts(2000).expect("the facts");
+    assert_eq!(facts["owner_runs_from_ms"], 2500, "after the end: {facts}");
+    assert_eq!(
+        store.scorecard_facts(20_000).expect("facts")["live_from_ms"],
+        2800
+    );
+}
