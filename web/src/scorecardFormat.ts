@@ -1,6 +1,9 @@
-// The scorecard's number formats. Pure, with no import, so node can test
-// them (web/test/scorecardFormat.test.ts); scorecard.ts, which also
-// fetches, cannot be loaded there.
+// The scorecard's number formats. Pure, and loadable with node alone (its
+// one import, format.ts, imports nothing), so node can test them
+// (web/test/scorecardFormat.test.ts); scorecard.ts, which also fetches,
+// cannot be loaded there.
+
+import { localDateTime } from "./format.ts";
 
 /** A plain number with at most `digits` decimals, grouped: 2,033.333. */
 export function formatDecimal(value: number | null, digits = 3): string {
@@ -55,4 +58,31 @@ export function undecidedText(gate: GateSpending | null | undefined): string | n
  * dimension, or with no gate time. */
 export function tileNote(key: string, dimension: GateSpending | null | undefined): string | null {
   return key === "gate_time" ? undecidedText(dimension) : null;
+}
+
+/** From when the owner's judgings are counted, in words (objective 076):
+ * an owner judging counts in gate time only when its record names the
+ * gate's wall clock, which the integrator has written only since a deploy.
+ * "Owner judgings counted from <time> only: earlier ones carry no gate
+ * time." when the window starts before `owner_runs_from_ms`; "Owner
+ * judgings not counted yet: none carries a gate time." when it is null;
+ * null when the window starts at or after it. */
+export function ownerRunsNote(since_ms: number | null, owner_runs_from_ms: number | null): string | null {
+  if (owner_runs_from_ms === null || !Number.isFinite(owner_runs_from_ms)) {
+    return "Owner judgings not counted yet: none carries a gate time.";
+  }
+  if (since_ms !== null && Number.isFinite(since_ms) && since_ms >= owner_runs_from_ms) return null;
+  return `Owner judgings counted from ${localDateTime(owner_runs_from_ms)} only: earlier ones carry no gate time.`;
+}
+
+/** The owner-runs note a dimension's tile shows, the fleet's and each
+ * mission's alike: gate time's `ownerRunsNote`; null for any other
+ * dimension, and for a server that does not say (`undefined`). */
+export function ownerRunsTileNote(
+  key: string,
+  since_ms: number | null,
+  owner_runs_from_ms: number | null | undefined,
+): string | null {
+  if (key !== "gate_time" || owner_runs_from_ms === undefined) return null;
+  return ownerRunsNote(since_ms, owner_runs_from_ms);
 }

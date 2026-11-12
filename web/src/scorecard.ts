@@ -136,6 +136,10 @@ export interface Scorecard {
   tokens_short: "window" | "previous" | null;
   /** The archive's oldest model call, when the tokens are short. */
   tokens_from_ms: number | null;
+  /** The earliest owner judging that carries a gate time, over the whole
+   * log (objective 076); null when none does; undefined from a server
+   * that does not say. */
+  owner_runs_from_ms: number | null | undefined;
   scopes: ScorecardScope[];
 }
 
@@ -290,6 +294,7 @@ export function normalizeScorecard(value: unknown): Scorecard {
     min_n: number(raw.min_n),
     settling: raw.settling === true,
     ...tokenReachOf(raw),
+    owner_runs_from_ms: "owner_runs_from_ms" in raw ? optionalNumber(raw.owner_runs_from_ms) : undefined,
     scopes: list(raw.scopes).map((entry) => {
       const scope = object(entry);
       return {
