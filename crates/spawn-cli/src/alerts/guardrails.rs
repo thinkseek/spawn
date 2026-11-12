@@ -29,8 +29,10 @@
 //! read-only connection and its statement timeout, as 090's sampler does
 //! ([`crate::core_lines_sample`]). Each check only looks whether it has come
 //! back, and the step looks again every [`POLL_MS`] while it runs; a reading
-//! back is said with how long it took (`alerts: core lines read in <s> s`)
-//! and decides at that check. One not back after [`READ_LIMIT_MS`] is given
+//! back is said with two times (cc-astra A24): how long its worker took to
+//! compute it, and how long after its start the step saw it, which adds
+//! the wait for the step's next look (`alerts: core lines read:
+//! compute_ms=<n> observed_ms=<n>`), and decides at that check. One not back after [`READ_LIMIT_MS`] is given
 //! up and decides nothing, and no other starts until its thread has ended,
 //! so a slow reading never piles up threads; the pass never waits on it nor
 //! on the performance figures' lock it may hold.
@@ -180,6 +182,18 @@ fn figure_of(subject: &str, evidence: &Value) -> String {
     )
 }
 
+/// The line that says a reading came back (cc-astra A24): `computed`, the
+/// worker's own time around the calculation (none when it ended without
+/// one), and `observed`, from its start until the step saw it.
+fn read_line(computed: Option<std::time::Duration>, observed: std::time::Duration) -> String {
+    let compute_ms =
+        computed.map_or_else(|| "none".to_string(), |took| took.as_millis().to_string());
+    format!(
+        "alerts: core lines read: compute_ms={compute_ms} observed_ms={}",
+        observed.as_millis()
+    )
+}
+
 impl Monitor {
     /// The figures are due at `now`: start a reading on a thread of its
     /// own ([`crate::serve::core_lines::reading`]).
@@ -201,7 +215,10 @@ impl Monitor {
         if reads.reading.is_some() || reads.abandoned.is_some() {
             return;
         }
-        reads.reading = Some((start(), now, std::time::Instant::now()));
+        // Its clock starts before its thread does, so the time the step sees
+        // holds the whole computation.
+        let begun = std::time::Instant::now();
+        reads.reading = Some((start(), now, begun));
         reads.poll_ms = Some(now.saturating_add(POLL_MS));
     }
 
@@ -238,10 +255,7 @@ impl Monitor {
             Ok(reading) => reading,
         };
         self.guardrail_reads.poll_ms = None;
-        lines.push(format!(
-            "alerts: core lines read in {:.1} s",
-            begun.elapsed().as_secs_f64()
-        ));
+        lines.push(read_line(pending.computed(), begun.elapsed()));
         self.guardrail_events(now, reading, out, lines);
     }
 
@@ -346,7 +360,7 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::super::{Event, Monitor, Row, Settings};
-    use super::{KIND, POLL_MS, Pending, READ_LIMIT_MS, range_words, words};
+    use super::{KIND, POLL_MS, Pending, READ_LIMIT_MS, range_words, read_line, words};
     use serde_json::{Value, json};
 
     const RAISE: i64 = 7_200_000;
@@ -796,7 +810,7 @@ mod tests {
             assert!(
                 lines
                     .iter()
-                    .any(|line| line.starts_with("alerts: core lines read in ")),
+                    .any(|line| line.starts_with("alerts: core lines read: compute_ms=")),
                 "{lines:?}"
             );
             if at == t0 {
@@ -817,6 +831,58 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("the core lines' figures: no store")),
             "{lines:?}"
+        );
+    }
+
+    /// cc-astra A24: a reading says the worker's own time apart from the
+    /// time the step saw it, which adds the wait for its next look. Lower
+    /// bounds only (the sleeps), never an upper limit on a time.
+    #[test]
+    fn a_reading_says_its_compute_time_apart_from_when_it_was_seen() {
+        let mut monitor = monitor();
+        monitor.start_guardrails_with(0, || {
+            Pending::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                Ok(answer("in", &json!(1)))
+            })
+        });
+        let mut done = false;
+        for _ in 0..500 {
+            if !monitor
+                .guardrail_reads
+                .reading
+                .as_ref()
+                .is_some_and(|(pending, _, _)| pending.running())
+            {
+                done = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(done, "the reading's thread ended");
+        // The answer waits for the step's next look.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (mut out, mut lines) = (Vec::new(), Vec::new());
+        monitor.poll_guardrails(POLL_MS, &mut out, &mut lines);
+        let line = lines
+            .iter()
+            .find(|line| line.starts_with("alerts: core lines read: "))
+            .unwrap_or_else(|| panic!("no read line: {lines:?}"));
+        let number = |name: &str| -> u128 {
+            line.split_whitespace()
+                .find_map(|word| word.strip_prefix(&format!("{name}=")))
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| panic!("no {name} in {line}"))
+        };
+        let (compute, observed) = (number("compute_ms"), number("observed_ms"));
+        assert!(compute >= 50, "the worker slept 50 ms: {line}");
+        assert!(
+            observed >= compute + 300,
+            "seen at least 300 ms after it was computed: {line}"
+        );
+        assert_eq!(
+            read_line(None, std::time::Duration::from_millis(7)),
+            "alerts: core lines read: compute_ms=none observed_ms=7"
         );
     }
 }
