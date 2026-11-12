@@ -104,9 +104,19 @@ supervisor_turn_dump() { # <what the scenario waited for>
         echo "-- spawn_events, newest 40, oldest first:"
         sql "select concat_ws(' | ', e.id, e.recorded_at_ms, e.session_id, e.event_name, left(e.kind::text, 300))
                from (select * from spawn_events order by id desc limit 40) e order by e.id" 2>&1
-        for session in $(tmux -L "$SPAWN_TMUX_SOCKET" list-sessions -F '#{session_name}' 2>/dev/null); do
-            echo "-- pane $session, last 30 lines:"
-            tmux -L "$SPAWN_TMUX_SOCKET" capture-pane -p -t "=$session:" -S -30 2>&1 | tail -n 30
-        done
-    } 2>&1 | sed -E 's#([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]]*@#\1***@#g' >&2 || true
+        # Panes only from a named socket under the scenario's own
+        # TMUX_TMPDIR: `tmux -L ""`, or no TMUX_TMPDIR, is the host's own
+        # server, whose panes must never reach a gate log.
+        case "${WORK:+w}:${SPAWN_TMUX_SOCKET-}:${TMUX_TMPDIR-}/" in
+            :*) echo "-- panes skipped: WORK is not set" ;;
+            w::* | w:*:/) echo "-- panes skipped: no scenario tmux socket (SPAWN_TMUX_SOCKET and TMUX_TMPDIR under \$WORK)" ;;
+            w:*:"$WORK"/*)
+                for session in $(tmux -L "$SPAWN_TMUX_SOCKET" list-sessions -F '#{session_name}' 2>/dev/null); do
+                    echo "-- pane $session, last 30 lines:"
+                    tmux -L "$SPAWN_TMUX_SOCKET" capture-pane -p -t "=$session:" -S -30 2>&1 | tail -n 30
+                done
+                ;;
+            *) echo "-- panes skipped: TMUX_TMPDIR is not under \$WORK" ;;
+        esac
+    } 2>&1 | sed -E 's#(://)[^@[:space:]]*@#\1***@#g' >&2 || true
 }
