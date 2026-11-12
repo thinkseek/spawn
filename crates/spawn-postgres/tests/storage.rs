@@ -87,7 +87,8 @@ fn samples_are_recorded_into_no_table_and_read_back_by_age() {
     assert_eq!(
         read,
         json!({"oldest": null, "before": null,
-               "carrying": {"archive_bytes": null, "projects_bytes": null, "database_bytes": null}})
+               "carrying": {"archive_bytes": null, "projects_bytes": null, "database_bytes": null,
+                            "session_backup_bytes": null}})
     );
 }
 
@@ -135,6 +136,49 @@ fn the_oldest_sample_carrying_a_size_passes_over_older_ones_without_it() {
     // Since 6000: none.
     let read = store.host_storage(6000, 0).expect("read");
     assert_eq!(read["carrying"]["database_bytes"], Value::Null);
+}
+
+/// Objective 097: the session backups' growth is measured from the oldest
+/// sample of the window carrying `session_backup_bytes`; samples without it
+/// (before the field, or a status file that did not read) are passed over
+/// for it alone.
+#[test]
+fn the_oldest_sample_carrying_the_session_backups_is_found() {
+    let (store, schema) = store("storage_session_backups");
+    let mut client = admin(&schema);
+    let with_backups = |archive: i64, backups: i64| {
+        let mut sample = sample(archive, 40);
+        sample["database_bytes"] = json!(100 * MIB);
+        sample["session_backup_bytes"] = json!(backups);
+        sample
+    };
+    for (at, record) in [
+        (500, with_backups(4 * MIB, 30 * MIB)),
+        (1000, sample(5 * MIB, 40)),
+        (2000, {
+            let mut sample = sample(6 * MIB, 40);
+            sample["database_bytes"] = json!(100 * MIB);
+            sample
+        }),
+        (3000, with_backups(7 * MIB, 36 * MIB)),
+        (5000, with_backups(8 * MIB, 38 * MIB)),
+    ] {
+        let id = store.host_record(&record).expect("recorded");
+        place(&mut client, id, at);
+    }
+    let read = store.host_storage(800, 0).expect("read");
+    assert_eq!(read["carrying"]["archive_bytes"]["at_ms"], 1000);
+    assert_eq!(read["carrying"]["database_bytes"]["at_ms"], 2000);
+    assert_eq!(read["carrying"]["session_backup_bytes"]["at_ms"], 3000);
+    assert_eq!(
+        read["carrying"]["session_backup_bytes"]["session_backup_bytes"],
+        36 * MIB
+    );
+    // Since 0, the one at 500 carries it; since 6000, none does.
+    let read = store.host_storage(0, 0).expect("read");
+    assert_eq!(read["carrying"]["session_backup_bytes"]["at_ms"], 500);
+    let read = store.host_storage(6000, 0).expect("read");
+    assert_eq!(read["carrying"]["session_backup_bytes"], Value::Null);
 }
 
 #[test]

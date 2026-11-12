@@ -37,7 +37,8 @@ use serde_json::Value;
 const IDLE_MS: i64 = 86_400_000;
 
 /// The seen file's name under the workspace root.
-pub(super) const SEEN_FILE: &str = "test-schemas-seen.json";
+/// (The workspaces' size leaves it out, `crate::storage::workspaces`.)
+pub(super) const SEEN_FILE: &str = crate::storage::TEST_SCHEMAS_SEEN;
 
 /// One `storage.test_database_url_files` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]

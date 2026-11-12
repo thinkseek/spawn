@@ -766,9 +766,27 @@ uses the disk:
     days between, rounded down; null without such a sample a day old. An
     older sample without `database_bytes` (from before 085) still counts
     for the other two. `archive` equals `growth_bytes_per_day`. Workspaces
-    are left out: checkouts come and go with tasks;
-  - `persistent_growth_bytes_per_day`: the parts' sum, null while any part
-    is null;
+    are left out: checkouts come and go with tasks. `session_backups`
+    (objective 097) is the session backups' growth.
+    /var/backups/spawn-sessions is root's (0700), and on btrfs each version
+    is a reflink copy, so the tree's apparent size says nothing of the
+    disk. The part is measured from the backups' status file instead,
+    named by `SPAWN_SESSION_BACKUP_STATUS` (no default): its
+    `estimated_bytes`, the sum of each kept version's `new_bytes`
+    (deploy/session-backup.sh). It is measured as the others, against the
+    oldest sample carrying `session_backup_bytes`. The loop's `host.storage`
+    sample records that number as `session_backup_bytes`; a sample whose
+    file does not read, or holds no such number, leaves it out and is
+    still written;
+  - `growth_excluded` (objective 097): the parts left out of the sum
+    because their source cannot be read now: `["session_backups"]` while
+    no status file reads, or the one that reads holds no
+    `estimated_bytes` number. A format change excludes the part; it never
+    nulls the whole forecast. It is `[]` otherwise. An excluded part is
+    null and not counted;
+  - `persistent_growth_bytes_per_day`: the counted parts' sum, null while
+    any counted part is null (a counted part with no sample a day old is
+    still null, and so is the sum);
   - `days_left`: `free_bytes` over `persistent_growth_bytes_per_day`,
     rounded down; null when it is null or not above zero.
 
@@ -780,8 +798,15 @@ uses the disk:
   Code transcripts" with "<files> files" (and ", down from <before>" when
   the count fell), "Workspaces", and "Database" with its largest table; and
   under them "about <days> days at the growth of the archive, Claude
-  Code's transcripts and the database" (or "How long the disk lasts: not
-  measured yet"). A size reads
+  Code's transcripts, the database and the session backups" when the
+  session backups are counted, "... Claude Code's transcripts and the
+  database" when they are not (or from an older server), or "How long the
+  disk lasts: not measured yet". While they are left out, a note under it
+  says "session backups are not counted". On live,
+  `SPAWN_SESSION_BACKUP_STATUS=/var/backups/spawn-sessions/status.json` is
+  set in the loop's and serve's environment (a lead step). The part is
+  null for a day after it is first set, and so are the sum and days left,
+  as after 085's deploy. A size reads
   "<n> MB" to one decimal under 1024 MB (1 MB is 1024 * 1024 bytes), "<n>
   GB" from there.
 

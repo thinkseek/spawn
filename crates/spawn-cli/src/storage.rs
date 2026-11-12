@@ -41,9 +41,9 @@ pub(crate) struct Sizes {
     pub(crate) files: u64,
 }
 
-/// The regular files under `path`, leaving out the directories named in
-/// `skip` (full paths) and everything under them. A missing `path` is
-/// empty; a directory that cannot be read is skipped.
+/// The regular files under `path`, leaving out the directories and files
+/// named in `skip` (full paths) and everything under those directories. A
+/// missing `path` is empty; a directory that cannot be read is skipped.
 pub(crate) fn walk(path: &Path, skip: &[PathBuf]) -> Sizes {
     let mut sizes = Sizes::default();
     let mut pending = vec![path.to_path_buf()];
@@ -61,6 +61,7 @@ pub(crate) fn walk(path: &Path, skip: &[PathBuf]) -> Sizes {
                     pending.push(child);
                 }
             } else if kind.is_file()
+                && !skip.contains(&entry.path())
                 && let Ok(metadata) = entry.metadata()
             {
                 sizes.bytes = sizes.bytes.saturating_add(metadata.len());
@@ -81,10 +82,23 @@ pub(crate) fn archive(root: &Path) -> Sizes {
     walk(&archive_path(root), &[])
 }
 
+/// The test schemas' first sights, kept under the workspace root by the
+/// Core lines reader (objective 094): its bookkeeping, no workspace.
+pub(crate) const TEST_SCHEMAS_SEEN: &str = "test-schemas-seen.json";
+
 /// The workspaces: everything under `root` outside the archive and its
-/// progress directory.
+/// progress directory, and the test schemas' first sights (and the file
+/// it is written through).
 pub(crate) fn workspaces(root: &Path) -> Sizes {
-    walk(root, &[root.join(ARCHIVE), root.join(PROGRESS)])
+    walk(
+        root,
+        &[
+            root.join(ARCHIVE),
+            root.join(PROGRESS),
+            root.join(TEST_SCHEMAS_SEEN),
+            root.join(format!("{TEST_SCHEMAS_SEEN}.partial")),
+        ],
+    )
 }
 
 /// Claude Code's projects directory, as the Bridge reads it
@@ -94,9 +108,36 @@ pub(crate) fn projects_path() -> PathBuf {
     PathBuf::from(crate::runtime::claude_projects())
 }
 
+/// The variable naming the session backups' status file (objective 097),
+/// as deploy/session-backup.sh writes it; no default.
+pub(crate) const SESSION_BACKUP_STATUS: &str = "SPAWN_SESSION_BACKUP_STATUS";
+
+/// The session backups' status file `SPAWN_SESSION_BACKUP_STATUS` names;
+/// `None` when it names none.
+pub(crate) fn session_backup_status() -> Option<PathBuf> {
+    crate::env_value(SESSION_BACKUP_STATUS)
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// What the kept session backup versions really cost, reflinks counted
+/// once (objective 097): the status file's `estimated_bytes` (the sum of
+/// each kept version's `new_bytes`). `None` without a file, one that cannot
+/// be read, or one without that number.
+pub(crate) fn session_backup_bytes(status: Option<&Path>) -> Option<u64> {
+    let text = std::fs::read_to_string(status?).ok()?;
+    serde_json::from_str::<Value>(&text).ok()?["estimated_bytes"].as_u64()
+}
+
 /// A `host.storage` record of these sizes, with the live database's
-/// (`database_bytes`, objective 085) when it could be read.
-pub(crate) fn record(archive: Sizes, projects: Sizes, database: Option<u64>) -> Value {
+/// (`database_bytes`, objective 085) and the session backups'
+/// (`session_backup_bytes`, objective 097) when each could be read.
+pub(crate) fn record(
+    archive: Sizes,
+    projects: Sizes,
+    database: Option<u64>,
+    session_backups: Option<u64>,
+) -> Value {
     let mut record = json!({
         "type": "host.storage",
         "archive_bytes": archive.bytes,
@@ -106,6 +147,9 @@ pub(crate) fn record(archive: Sizes, projects: Sizes, database: Option<u64>) -> 
     });
     if let Some(database) = database {
         record["database_bytes"] = json!(database);
+    }
+    if let Some(session_backups) = session_backups {
+        record["session_backup_bytes"] = json!(session_backups);
     }
     record
 }
@@ -121,21 +165,30 @@ pub(crate) fn database_bytes(store: &PostgresStore) -> Option<u64> {
 pub(crate) struct Sampler {
     root: Option<PathBuf>,
     projects: PathBuf,
+    /// The session backups' status file (objective 097); `None`: none read.
+    status: Option<PathBuf>,
     /// When this loop's latest sample was recorded; `None` before its first.
     last_ms: Option<i64>,
 }
 
 impl Sampler {
     pub(crate) fn new(root: Option<&Path>) -> Self {
-        Self::with(root, projects_path())
+        Self::with(root, projects_path()).with_status(session_backup_status())
     }
 
     pub(crate) fn with(root: Option<&Path>, projects: PathBuf) -> Self {
         Self {
             root: root.map(Path::to_path_buf),
             projects,
+            status: None,
             last_ms: None,
         }
+    }
+
+    /// The sampler reading the session backups' status file `status`.
+    pub(crate) fn with_status(mut self, status: Option<PathBuf>) -> Self {
+        self.status = status;
+        self
     }
 
     /// Whether a sample is due at `now_ms`.
@@ -145,10 +198,16 @@ impl Sampler {
     }
 
     /// The sample of the disk now, with the database's size `database`
-    /// (left out when it could not be read).
+    /// and the session backups' `estimated_bytes` (each left out when it
+    /// could not be read).
     pub(crate) fn measure(&self, database: Option<u64>) -> Value {
         let archive = self.root.as_deref().map(archive).unwrap_or_default();
-        record(archive, walk(&self.projects, &[]), database)
+        record(
+            archive,
+            walk(&self.projects, &[]),
+            database,
+            session_backup_bytes(self.status.as_deref()),
+        )
     }
 
     /// When due, measure (the database's size through `database`) and
@@ -227,6 +286,13 @@ pub(crate) mod tests {
         // A link is not followed, nor counted.
         std::os::unix::fs::symlink(root.join(".transcripts"), root.join("agent_c/link"))
             .expect("a link");
+        // The Core lines reader's first sights (objective 094) are no
+        // workspace, nor the file they are written through.
+        file(&root.join(super::TEST_SCHEMAS_SEEN), 2558);
+        file(
+            &root.join(format!("{}.partial", super::TEST_SCHEMAS_SEEN)),
+            40,
+        );
         assert_eq!(
             archive(&root),
             Sizes {
@@ -317,6 +383,62 @@ pub(crate) mod tests {
 
     /// Objective 085: the sample carries the live database's size; one
     /// whose size cannot be read leaves the field out and is still written.
+    /// Objective 097: the sample carries the session backups'
+    /// `estimated_bytes` from their status file; without a file, or with
+    /// one that has no such number, it leaves the field out and is still
+    /// written.
+    #[test]
+    fn the_sample_carries_the_session_backups_estimated_bytes_when_their_status_reads() {
+        let root = scratch("sampler_session_backups");
+        let projects = root.join("projects");
+        file(&root.join(".transcripts/agent_a/a1.jsonl"), 100);
+        let status = root.join("status.json");
+        let without = root.join("without.json");
+        std::fs::write(
+            &status,
+            r#"{"at": 1, "accounts": [], "estimated_bytes": 41943040, "free_bytes": 1}"#,
+        )
+        .expect("the status file");
+        std::fs::write(
+            &without,
+            r#"{"at": 1, "accounts": [], "estimated": "40 MiB"}"#,
+        )
+        .expect("a status file without the number");
+        let mut written = Vec::new();
+        for path in [
+            Some(status),
+            None,
+            Some(root.join("none.json")),
+            Some(without),
+        ] {
+            let mut sampler = Sampler::with(Some(&root), projects.clone()).with_status(path);
+            sampler
+                .check_with(
+                    0,
+                    || None,
+                    |sample| {
+                        written.push(sample.clone());
+                        Ok(1)
+                    },
+                )
+                .expect("written");
+        }
+        std::fs::remove_dir_all(&root).expect("clean up");
+        assert_eq!(written.len(), 4, "every sample is written");
+        assert_eq!(written[0]["session_backup_bytes"], 41_943_040);
+        for (sample, why) in
+            written[1..]
+                .iter()
+                .zip(["no file named", "no file there", "no number"])
+        {
+            assert!(
+                sample.get("session_backup_bytes").is_none(),
+                "{why}: {sample}"
+            );
+            assert_eq!(sample["archive_bytes"], 100, "{why}");
+        }
+    }
+
     #[test]
     fn the_sample_carries_the_database_size_when_it_can_be_read() {
         let root = scratch("sampler_database");

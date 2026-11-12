@@ -63,7 +63,8 @@ select jsonb_build_object(
                   where s.recorded_at_ms >= $1
                     and jsonb_typeof(s.sample -> f.field) = 'number'
                   order by s.recorded_at_ms, s.id limit 1))
-                 from unnest(array['archive_bytes', 'projects_bytes', 'database_bytes']) f(field)),
+                 from unnest(array['archive_bytes', 'projects_bytes', 'database_bytes',
+                             'session_backup_bytes']) f(field)),
   'before', (select s.sample from samples s where s.recorded_at_ms <= $2
               order by s.recorded_at_ms desc, s.id desc limit 1))";
 
