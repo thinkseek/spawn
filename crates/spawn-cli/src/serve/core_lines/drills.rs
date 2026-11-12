@@ -416,7 +416,25 @@ mod tests {
     use serde_json::{Value, json};
     use std::time::{Duration, Instant};
 
-    use crate::storage::tests::scratch;
+    /// A scratch directory removed when the test ends, passed or not:
+    /// a test leaves nothing in the temporary directory.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            Scratch(crate::storage::tests::scratch("drills"))
+        }
+
+        fn as_path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     const HOUR: i64 = 3_600_000;
     const DAY: i64 = 24 * HOUR;
@@ -610,7 +628,7 @@ mod tests {
 
     #[test]
     fn the_status_files_at_is_in_seconds() {
-        let dir = scratch("drills");
+        let dir = Scratch::new();
         let path = dir.as_path().join("status.json");
         std::fs::write(&path, r#"{"at": 1731400000, "accounts": []}"#).expect("write");
         assert_eq!(status_at_ms(Some(&path)), Some(1_731_400_000_000));
@@ -630,7 +648,7 @@ mod tests {
 
     #[test]
     fn a_unit_call_is_argv_with_the_unit_after_the_double_dash() {
-        let dir = scratch("drills");
+        let dir = Scratch::new();
         let calls = dir.as_path().join("calls");
         let program = script(
             dir.as_path(),
@@ -649,7 +667,7 @@ mod tests {
 
     #[test]
     fn a_unit_call_that_runs_over_is_killed_and_no_pass() {
-        let dir = scratch("drills");
+        let dir = Scratch::new();
         let program = script(dir.as_path(), "sleep 30\necho Result=success");
         let started = Instant::now();
         let shown = show(&program, "a.service", Duration::from_millis(300));
@@ -662,7 +680,7 @@ mod tests {
 
     #[test]
     fn a_refused_name_is_never_run() {
-        let dir = scratch("drills");
+        let dir = Scratch::new();
         let ran = dir.as_path().join("ran");
         let program = script(dir.as_path(), &format!("touch {}", ran.display()));
         for bad in [
