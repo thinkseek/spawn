@@ -614,7 +614,7 @@ objective14 "$WORK/backlog14" 932 "Mark the lighthouse with an osprey" LIGHT.txt
 #   BB:ONE <file> <word>   (010) the turn writes the file and the report.
 #   BB:TWO <file> <word>   (010) the turn writes the file and ends; once
 #       pushed (or 60 s passed), a second turn writes the report alone.
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -668,7 +668,7 @@ printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 task=
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     if [ "$pending" = 0 ]; then
       line '"type":"user","message":{"role":"user","content":"prompt"}'

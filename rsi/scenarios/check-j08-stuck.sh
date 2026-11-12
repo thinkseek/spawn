@@ -239,7 +239,7 @@ base=$(git --git-dir="$source" rev-parse main)
 # text typed in opens a turn, which ends after a second of quiet, the
 # transcript's end of the turn first, then the prompt. A turn whose text
 # names `BB:WORK <file>` writes the file and the report.
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -260,7 +260,7 @@ printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 work=
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     if [ "$pending" = 0 ]; then
       line '"type":"user","message":{"role":"user","content":"prompt"}'

@@ -198,8 +198,9 @@ git -C "$WORK/seed" push -q "$repo" main:main
 # makes the turn's words what follows it, up to the message's own trailer
 # ("[spawn message #<n>] (Answer this message ...)"): the supervisor's reply.
 # Any other turn says "waiting". A read that times out mid-line keeps the
-# part it read, so a line split by a busy host is not cut (sync/flake-070.md).
-cat >"$WORK/claude" <<'ENGINE'
+# part it read, so a line split by a busy host is not cut (sync/flake-070.md):
+# bb_read_line, which bb_engine writes into the engine (assertions.sh).
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -218,20 +219,13 @@ line() {
 printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 words=waiting
-partial=
 while :; do
-  chunk=
-  if IFS= read -r -t 1 chunk; then
-    typed=$partial$chunk
-    partial=
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     case "$typed" in *"BB:SAY "*) words=${typed#*BB:SAY }; words=${words%% \[spawn message*} ;; esac
     [ "$pending" = 1 ] || line '"type":"user","message":{"role":"user","content":"prompt"}'
     pending=1
-  elif [ -n "$chunk" ]; then
-    # A read that timed out mid-line keeps what it read: the rest follows.
-    partial=$partial$chunk
-  elif [ "$pending" = 1 ] && [ -z "$partial" ]; then
+  elif [ "$pending" = 1 ]; then
     pending=0
     line '"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"'"$words"'"}],"stop_reason":"end_turn"}'
     line '"type":"system","subtype":"turn_duration","durationMs":1'
