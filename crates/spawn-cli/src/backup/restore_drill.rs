@@ -37,8 +37,17 @@
 //! cannot be restored: a broken chain, a sha256 that is not the record's), 2
 //! when the drill cannot run.
 //!
-//! It writes nothing live and records nothing: no lock, no record, git and
-//! the files read only. The key is read as `spawn backup verify` reads it
+//! Once it ran (exit 0 or 1) it records its verdict per resource through
+//! `spawn_backup_record` (objective 104): `backup.drilled.transcripts` and
+//! `backup.drilled.missions`, each exactly `{type, ok, reason, bundle,
+//! bundle_event_id, mismatches, duration_ms}`: the newest stored bundle's
+//! key and record, that resource's count of mismatches older than it, ok
+//! with reason "" when it has none, else a reason of at most 500
+//! characters. A backup that cannot be restored (a broken chain included)
+//! fails both, with its reason and no count. A drill that cannot run (exit
+//! 2) records nothing; a record the store refuses is said and exits 2. The
+//! Core lines recovery rows read them (`record`). Otherwise it writes
+//! nothing live: no lock, git and the files read only. The key is read as `spawn backup verify` reads it
 //! (`SPAWN_BACKUP_KEY_FILE`, mode 600, given to gpg by path) and nothing of
 //! it is printed. The scratch directory is made with mode 700 under `--into`
 //! (default `/data/tmp`), which may not be under `$HOME`, `$SPAWN_LIVE` or
