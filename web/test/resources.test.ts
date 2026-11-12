@@ -68,6 +68,7 @@ test("gate room: one row per gated mission, the waiting gates longest first", ()
 
 import { readFileSync } from "node:fs";
 
+import { localDateTime } from "../src/format.ts";
 import { backupAge, backupView, normalizeBackups, normalizeStorage, storageSize, storageView } from "../src/resources.ts";
 
 const MB = 1024 ** 2;
@@ -137,6 +138,28 @@ test("no fall, no growth, no days: the card says so and invents nothing", () => 
   assert.equal(bare.lasts, null);
 });
 
+test("while the growth is not measured yet, the archive's row says from when it is", () => {
+  const at = Date.UTC(2026, 10, 12, 23, 31, 20);
+  const local = localDateTime(at);
+  const archive = (view: ReturnType<typeof storageView>) => view.rows[0].note;
+  // Pending: no growth, and the moment is still ahead of the read.
+  const pending = storageView({ ...STORAGE, read_at_ms: at - 3_600_000, growth_bytes_per_day: null, days_left: null, growth_from_ms: at });
+  assert.deepEqual([archive(pending), pending.measured_from, pending.lasts], [`measured from ${local}`, local, null]);
+  assert.equal(normalizeStorage({ ...STORAGE, growth_from_ms: at })?.growth_from_ms, at);
+  // Measured: the growth, as before.
+  const measured = storageView({ ...STORAGE, read_at_ms: at + 3_600_000, growth_from_ms: at });
+  assert.deepEqual([archive(measured), measured.measured_from], ["grows about 71.7 MB a day", null]);
+  // No sample (or an older server): not measured yet.
+  const none = storageView({ ...STORAGE, growth_bytes_per_day: null, days_left: null, growth_from_ms: null });
+  assert.deepEqual([archive(none), none.measured_from], ["not measured yet", null]);
+  const older = storageView({ ...STORAGE, growth_bytes_per_day: null, days_left: null });
+  assert.deepEqual([archive(older), older.measured_from], ["not measured yet", null]);
+  // Already past: a moment gone promises nothing.
+  const past = storageView({ ...STORAGE, read_at_ms: at + 3_600_000, growth_bytes_per_day: null, days_left: null, growth_from_ms: at });
+  assert.deepEqual([archive(past), past.measured_from], ["not measured yet", null]);
+  assert.equal(storageView(null).measured_from, null);
+});
+
 test("the health's storage is read as the server reports it, null from an older server", () => {
   const storage = normalizeStorage(STORAGE);
   assert.equal(storage?.projects?.before, 40);
@@ -151,7 +174,8 @@ test("the host section's Resources are followed by a Storage card drawn from sto
   const strip = readFileSync(new URL("../src/components/fleet/HealthStrip.tsx", import.meta.url), "utf8");
   assert.match(strip, /<Cell label="Storage"[^>]*>\s*<StorageCard storage=\{health\.storage\} backups=\{health\.backups\} \/>/);
   assert.match(strip, /backupView\(backups, now\)/, "the card's backup rows are drawn from backupView");
-  assert.match(strip, /const \{ rows, lasts \} = storageView\(storage\)/);
+  assert.match(strip, /const \{ rows, lasts, measured_from \} = storageView\(storage\)/);
+  assert.match(strip, /How long the disk lasts: \$\{measured_from === null \? "not measured yet" : `measured from \$\{measured_from\}`\}/);
   assert.ok(strip.indexOf('label="Resources"') < strip.indexOf('label="Storage"'));
 });
 
