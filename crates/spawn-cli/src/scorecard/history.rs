@@ -387,10 +387,8 @@ impl Fold {
                 }
             }
             // A failed deploy ships nothing.
-            "deploy.finished" => {
-                if boolean(&record.ok) == Some(true) {
-                    self.history.deploys.push(record.at);
-                }
+            "deploy.finished" if boolean(&record.ok) == Some(true) => {
+                self.history.deploys.push(record.at);
             }
             "task.delivered" => {
                 if let Some(task) = id.and_then(|id| self.history.tasks.get_mut(&id)) {
