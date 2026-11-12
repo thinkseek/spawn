@@ -63,7 +63,7 @@ test("coreLinesView names the four lines and says each figure, its range and its
     tone: "muted",
   });
   assert.deepEqual(view.rows[2].guardrails, [
-    { name: "Use with no price", value: "38%", range: "no range set", tone: "muted" },
+    { name: "Use with no price", value: "38.0%", range: "no range set", tone: "muted" },
     { name: "Human interventions per agent-hour", value: "0.13", range: "0.05 or less", tone: "warning" },
     { name: "Figures not measured", value: "2", range: "no range set", tone: "muted" },
   ]);
