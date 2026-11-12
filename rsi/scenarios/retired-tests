@@ -25,3 +25,17 @@ tmux::tests::a_start_time_is_read_past_a_command_with_parentheses
 # a_one_line_input_into_a_pane_that_reads_lines_carries_its_marker_on_its_line
 # and an_input_of_several_lines_carries_its_marker_on_a_line_of_its_own.
 tmux_tells_a_pane_that_reads_lines_from_one_that_reads_keys_raw
+# WASTE (b), the core_lines split (rev-e, plan-core-lines-split.md option A): serve/core_lines.rs
+# was cut into one file per core line, each line's tests moved with it under the same names;
+# each of these runs on as serve::core_lines::<line>::tests::<name> (<line>: performance, storage,
+# recoverability, observability, trends).
+serve::core_lines::tests::the_performance_line_reads_the_scorecards_fleet_and_the_cost_window
+serve::core_lines::tests::report_to_live_samples_before_the_record_covers_the_window_are_dropped
+serve::core_lines::tests::report_to_live_waits_until_the_live_record_covers_the_window
+serve::core_lines::tests::the_performance_north_star_measures_since_the_record_until_covered
+serve::core_lines::tests::the_storage_line_reads_health_storage
+serve::core_lines::tests::the_backup_ages_are_the_newest_records_ages_or_null_without_one
+serve::core_lines::tests::the_nightly_figures_read_only_the_fact_files
+serve::core_lines::tests::needs_you_is_right_is_the_share_of_the_ended_alerts_their_condition_cleared
+serve::core_lines::tests::the_observability_line_gives_unpriced_use_interventions_and_the_count_not_measured
+serve::core_lines::tests::a_trend_is_each_days_last_sample_of_the_last_seven
