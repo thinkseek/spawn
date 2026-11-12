@@ -2,8 +2,8 @@ import type { ReactNode } from "react";
 
 import type { DiskPlace, FleetHealth, LadderStep } from "../../fleet";
 import { absoluteTitle, clockTime, formatDuration } from "../../format";
-import type { GateRoom, Memory, Storage } from "../../resources";
-import { memoryBar, storageView, waitingGates } from "../../resources";
+import type { Backups, GateRoom, Memory, Storage } from "../../resources";
+import { backupAge, backupView, memoryBar, storageView, waitingGates } from "../../resources";
 import { cx } from "../ui";
 
 export const LADDER: Array<{
@@ -189,12 +189,42 @@ function MemoryBar({ memory }: { memory: Memory | null }) {
   );
 }
 
+/** The newest off-host backups (`health.backups`): the database copy and
+ * the transcripts and sources, each with how old its newest upload is. */
+function BackupRows({ backups }: { backups: Backups | null }) {
+  if (!backups) {
+    return <p className="mt-1.5 text-faint-foreground">This server reports no backups.</p>;
+  }
+  const now = Date.now();
+  return (
+    <ul className="mt-1.5 space-y-0.5 border-t border-border pt-1.5">
+      {backupView(backups, now).map((row) => (
+        <li key={row.name} className="flex min-w-0 items-baseline gap-2">
+          <span className="shrink-0 text-muted-foreground">{row.name}</span>
+          <span className={cx("tnum shrink-0", row.age_ms === null ? "text-warning" : "font-medium text-foreground")}>
+            {backupAge(row.age_ms)}
+          </span>
+          <span className="ml-auto min-w-0 truncate text-right text-faint-foreground" title={row.key ?? ""}>
+            {row.age_ms === null ? "" : "ago"}
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 /** What uses the disk (`health.storage`): the archive, Claude Code's own
  * transcripts, the workspaces and the database, one row each with its size
- * and note, then how long the free space lasts at the archive's growth. */
-export function StorageCard({ storage }: { storage: Storage | null }) {
+ * and note, then how long the free space lasts at the archive's growth;
+ * then how old the newest off-host backups are (`health.backups`). */
+export function StorageCard({ storage, backups = null }: { storage: Storage | null; backups?: Backups | null }) {
   if (!storage) {
-    return <p className="text-caption text-faint-foreground">This server reports no storage.</p>;
+    return (
+      <div className="min-w-0 text-caption">
+        <p className="text-faint-foreground">This server reports no storage.</p>
+        <BackupRows backups={backups} />
+      </div>
+    );
   }
   const { rows, lasts } = storageView(storage);
   const fell = (storage.projects?.before ?? 0) > (storage.projects?.files ?? Infinity);
@@ -220,6 +250,7 @@ export function StorageCard({ storage }: { storage: Storage | null }) {
       >
         {lasts ?? "How long the disk lasts: not measured yet"}
       </p>
+      <BackupRows backups={backups} />
     </div>
   );
 }
@@ -390,7 +421,7 @@ export function HealthStrip({
       </Cell>
 
       <Cell label="Storage" className="sm:col-span-2">
-        <StorageCard storage={health.storage} />
+        <StorageCard storage={health.storage} backups={health.backups} />
       </Cell>
 
     </section>
