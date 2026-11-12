@@ -1731,7 +1731,11 @@ fn the_card_says_from_when_the_owners_judgings_are_counted() {
             );
         }
         let now = store.database_now_ms().expect("now");
-        assert_eq!(read(now - HOUR_MS, None), Value::Null, "none names a gate time");
+        assert_eq!(
+            read(now - HOUR_MS, None),
+            Value::Null,
+            "none names a gate time"
+        );
         let mut record = |function: &str, value: Value| -> i64 {
             client
                 .query_one(&format!("select {function}($1)"), &[&value])
@@ -1770,8 +1774,16 @@ fn the_card_says_from_when_the_owners_judgings_are_counted() {
                    "verdict": "accepted", "mission": 1, "gate_ms": 300_000}),
         );
         let now = store.database_now_ms().expect("now");
-        assert_eq!(read(now - HOUR_MS, None), json!(at), "the refusal: the first counted");
-        assert_eq!(read(now + 1, Some(now + HOUR_MS)), json!(at), "a later window");
+        assert_eq!(
+            read(now - HOUR_MS, None),
+            json!(at),
+            "the refusal: the first counted"
+        );
+        assert_eq!(
+            read(now + 1, Some(now + HOUR_MS)),
+            json!(at),
+            "a later window"
+        );
         assert_eq!(read(at, None), json!(at), "a window from it");
         assert_eq!(
             read(now - 2 * HOUR_MS, Some(now - HOUR_MS)),
