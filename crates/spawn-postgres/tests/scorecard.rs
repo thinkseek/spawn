@@ -1354,12 +1354,14 @@ fn a_database_made_again_under_its_name_is_another_store() {
             store.migrate().expect("migrate");
             let mut client = Client::connect(&ours, NoTls).expect("its owner");
             for (n, id) in (1_i64..).zip(ids) {
-                record(&mut client, n * 100, &json!({"type": "task.landed", "id": id}));
+                record(
+                    &mut client,
+                    n * 100,
+                    &json!({"type": "task.landed", "id": id}),
+                );
             }
             assert_eq!(
-                store
-                    .scorecard_facts_with_overlap(until, 0)
-                    .expect("facts"),
+                store.scorecard_facts_with_overlap(until, 0).expect("facts"),
                 oracle(&mut client, until),
                 "the history of {ids:?}"
             );
