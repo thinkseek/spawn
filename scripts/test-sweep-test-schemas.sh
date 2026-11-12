@@ -234,9 +234,10 @@ run "${live[@]}" -- --apply "$scratch/noobjs.md"
 refused "a would-drop line without objs= and ids= (a list of the version before)" "refused: would-drop lines without mods=, seq=, objs= and ids= \\(make the list again with this version\\): $old_gone"
 
 echo "== 3. --apply of the reviewed list"
-# Since the list: one is written to, one is dropped by someone else, one is
-# held by another session's lock; a qualifying schema appears that is not
-# on the list, and another database's section lists one more.
+# Since the list: one is written to, one is dropped by someone else; a
+# qualifying schema appears that is not on the list, and another database's
+# section lists one more. (The listed one held by another session's lock is
+# 3b's: no other session may be connected while the sweep drops.)
 admin -c "insert into $old_young.t values (2)" -c "checkpoint" >/dev/null
 # And another schema (not a test schema's) now depends on two listed ones: a
 # view over one's table, a foreign key to the other's. Their files are aged
@@ -253,7 +254,41 @@ make "$not_listed" old
 make "$other_only" old
 { cat "$scratch/list.md"; printf 'database other_db port %s\nwould-drop %s pid=%s idle=48h size=0MB\n' "$port" "$other_only" "$dead"; } \
   >"$scratch/reviewed.md"
-admin -c "begin" -c "lock table $old_locked.t in access share mode" -c "select pg_sleep(60)" >/dev/null 2>&1 &
+grep -v "^would-drop $old_locked " "$scratch/reviewed.md" >"$scratch/reviewed-3a.md"
+run "${live[@]}" -- --apply "$scratch/reviewed-3a.md"
+check "exit 0 (status $status)" [ "$status" -eq 0 ]
+check "the listed, still qualifying ones are dropped" has "^dropped $old_gone\$"
+check "  both of them" has "^dropped $old_keep2\$"
+check "after its dry-run line" bash -c "grep -A1 '^would-drop $old_gone ' '$out' | grep -q '^dropped $old_gone\$'"
+! exists "$old_gone" && ! exists "$old_keep2" && pass "  gone from the database" || fail "  gone from the database"
+check "one written since is skipped and kept" has "^skipped $old_young changed since the list \\(1 rows of $old_young\\.t\\)$"
+exists "$old_young" && pass "  it is still there" || fail "  it is still there"
+check "one gone since is said" has "^skipped $old_vanish gone$"
+exists "$not_listed" && pass "a qualifying schema not on the list stays" || fail "a qualifying schema not on the list stays"
+exists "$other_only" && pass "one listed only in another database's section stays" || fail "one listed only in another database's section stays"
+for s in "$alive" "$young" "$nopid"; do exists "$s" && pass "kept: $s" || fail "kept: $s"; done
+check "a qualifying schema not on the list is said, kept" has "^not-on-list $not_listed pid=$dead idle=4[78]h size=[0-9]+MB mods=1 seq=0 objs=[0-9]+ ids=[0-9a-f]{32} \\(qualifies now, not reviewed: kept\\)$"
+check "  so is the one only another database's section lists" has "^not-on-list $other_only "
+check "  and the held one 3b takes, left off 3a's list" has "^not-on-list $old_locked "
+check "  with their count" has "^sweep-test-schemas --apply: 3 qualifying schema\\(s\\) not on the list, kept$"
+check "a listed one another schema's view depends on is skipped" has "^skipped $old_viewed dependents-outside \\(1: \"_RETURN\" on other_app\\.v\\)$"
+exists "$old_viewed" && pass "  it is still there" || fail "  it is still there"
+check "  and so is the view" [ "$(admin -c "select count(*) from pg_views where schemaname = 'other_app' and viewname = 'v'")" = 1 ]
+check "a listed one another schema's foreign key references is skipped" has "^skipped $old_fk dependents-outside \\([0-9]+: .* on other_app\\.r\\)$"
+exists "$old_fk" && pass "  it is still there" || fail "  it is still there"
+check "  and so is the key" [ "$(admin -c "select count(*) from pg_constraint where conrelid = 'other_app.r'::regclass and contype = 'f'")" = 1 ]
+check "the totals are said" has "^sweep-test-schemas --apply: dropped 2, skipped 4, failed 0$"
+check "before and after: count and MB" has "^sweep-test-schemas --apply: spawn_test_\\* before: 11 schema\\(s\\), [0-9]+ MB; after: 9 schema\\(s\\), [0-9]+ MB$"
+
+echo "== 3b. another session connected (cc-astra A15): nothing is dropped while it is"
+# A second session holds a lock on one listed schema and stays connected:
+# the held one fails on its bounded lock wait, and the other listed one,
+# untouched, is skipped as not quiescent (an outside dependent over its
+# function would need no lock the sweep holds, only such a session). Once
+# the session is gone, the same list drops both.
+list_of "$old_locked" "$not_listed" >"$scratch/quiet.md"
+check "the quiet list holds both" [ "$(grep -c '^would-drop ' "$scratch/quiet.md")" = 2 ]
+PGAPPNAME=sweep_holder admin -c "begin" -c "lock table $old_locked.t in access share mode" -c "select pg_sleep(120)" >/dev/null 2>&1 &
 holder_pid=$!
 # The holder must hold its lock before the apply starts; a holder that never
 # got it would let the apply drop the held schema and fail two checks for a
@@ -268,34 +303,24 @@ for _ in $(seq 300); do
 done
 [ -n "$held" ] || { echo "$PROG: harness error: the holder never got its lock on $old_locked.t in 30 s" >&2; exit 2; }
 started=$(date +%s)
-run "${live[@]}" -- --apply "$scratch/reviewed.md"
-kill "$holder_pid" 2>/dev/null || true
-holder_pid=""
-check "exit 1: one drop failed (status $status)" [ "$status" -eq 1 ]
+run "${live[@]}" -- --apply "$scratch/quiet.md"
+check "exit 1: the held one's drop failed (status $status)" [ "$status" -eq 1 ]
 check "the lock wait is bounded (under 40 s)" [ $(($(date +%s) - started)) -lt 40 ]
-check "the listed, still qualifying ones are dropped" has "^dropped $old_gone\$"
-check "  both of them" has "^dropped $old_keep2\$"
-check "after its dry-run line" bash -c "grep -A1 '^would-drop $old_gone ' '$out' | grep -q '^dropped $old_gone\$'"
-! exists "$old_gone" && ! exists "$old_keep2" && pass "  gone from the database" || fail "  gone from the database"
-check "one written since is skipped and kept" has "^skipped $old_young changed since the list \\(1 rows of $old_young\\.t\\)$"
-exists "$old_young" && pass "  it is still there" || fail "  it is still there"
-check "one gone since is said" has "^skipped $old_vanish gone$"
 check "a held one fails alone, said" has "^skipped $old_locked the drop failed: "
-exists "$old_locked" && pass "  it is still there" || fail "  it is still there"
-exists "$not_listed" && pass "a qualifying schema not on the list stays" || fail "a qualifying schema not on the list stays"
-exists "$other_only" && pass "one listed only in another database's section stays" || fail "one listed only in another database's section stays"
-for s in "$alive" "$young" "$nopid"; do exists "$s" && pass "kept: $s" || fail "kept: $s"; done
-check "a qualifying schema not on the list is said, kept" has "^not-on-list $not_listed pid=$dead idle=4[78]h size=[0-9]+MB mods=1 seq=0 objs=[0-9]+ ids=[0-9a-f]{32} \\(qualifies now, not reviewed: kept\\)$"
-check "  so is the one only another database's section lists" has "^not-on-list $other_only "
-check "  with their count" has "^sweep-test-schemas --apply: 2 qualifying schema\\(s\\) not on the list, kept$"
-check "a listed one another schema's view depends on is skipped" has "^skipped $old_viewed dependents-outside \\(1: \"_RETURN\" on other_app\\.v\\)$"
-exists "$old_viewed" && pass "  it is still there" || fail "  it is still there"
-check "  and so is the view" [ "$(admin -c "select count(*) from pg_views where schemaname = 'other_app' and viewname = 'v'")" = 1 ]
-check "a listed one another schema's foreign key references is skipped" has "^skipped $old_fk dependents-outside \\([0-9]+: .* on other_app\\.r\\)$"
-exists "$old_fk" && pass "  it is still there" || fail "  it is still there"
-check "  and so is the key" [ "$(admin -c "select count(*) from pg_constraint where conrelid = 'other_app.r'::regclass and contype = 'f'")" = 1 ]
-check "the totals are said" has "^sweep-test-schemas --apply: dropped 2, skipped 4, failed 1$"
-check "before and after: count and MB" has "^sweep-test-schemas --apply: spawn_test_\\* before: 11 schema\\(s\\), [0-9]+ MB; after: 9 schema\\(s\\), [0-9]+ MB$"
+check "the other is skipped: another session is connected" has "^skipped $not_listed not quiescent \\(1 other session\\(s\\) connected to sweep_db: sweep_holder\\)\$"
+exists "$old_locked" && exists "$not_listed" && pass "  both are still there" || fail "  both are still there"
+# Its backend, not only its psql: a backend asleep outlives its client.
+admin -c "select pg_terminate_backend(pid) from pg_stat_activity where application_name = 'sweep_holder'" >/dev/null
+wait "$holder_pid" 2>/dev/null || true
+holder_pid=""
+for _ in $(seq 100); do
+  [ "$(admin -c "select count(*) from pg_stat_activity where application_name = 'sweep_holder'")" = 0 ] && break
+  sleep 0.1
+done
+check "the holder's session is gone" [ "$(admin -c "select count(*) from pg_stat_activity where application_name = 'sweep_holder'")" = 0 ]
+run "${live[@]}" -- --apply "$scratch/quiet.md"
+check "with no other session: exit 0 (status $status)" [ "$status" -eq 0 ]
+check "  both are dropped" bash -c "grep -qx 'dropped $old_locked' '$out' && grep -qx 'dropped $not_listed' '$out'"
 
 echo "== 4. no file times (not a superuser): a gone pid alone never qualifies"
 unknown=spawn_test_${dead}_ff01_1_age_unknown
@@ -352,6 +377,24 @@ c_ok=spawn_test_${dead}_ca05_5_untouched
 c_drop=spawn_test_${dead}_ca06_6_function_dropped_since
 c_open=spawn_test_${dead}_ca07_7_writer_open_at_the_list
 c_all=("$c_func" "$c_ins" "$c_del" "$c_op" "$c_ok" "$c_drop" "$c_open")
+# And one with a sequence a second session draws from its cache, before the
+# list and after it (cc-astra A14): kept at the list, and kept by --apply
+# from a line that lists it.
+c_seq=spawn_test_${dead}_ca08_8_sequence_drawn
+make "$c_seq"
+admin -c "create sequence $c_seq.s cache 10" >/dev/null
+age_old "$c_seq"
+mkfifo "$scratch/drawer.in"
+PGAPPNAME=sweep_drawer admin <"$scratch/drawer.in" >"$scratch/drawer.out" 2>&1 &
+drawer=$!
+exec 8>"$scratch/drawer.in"
+echo "select nextval('$c_seq.s');" >&8
+for _ in $(seq 100); do
+  [ "$(admin -c "select coalesce(last_value, 0) from pg_sequences where schemaname = '$c_seq'")" != 0 ] && break
+  sleep 0.1
+done
+stored=$(admin -c "select last_value from pg_sequences where schemaname = '$c_seq'")
+check "the drawer's first value reserved a cached block (stored $stored)" [ "$stored" = 10 ]
 for s in "${c_all[@]}"; do make "$s"; done
 admin -c "create function $c_op.lt(int, int) returns boolean language sql immutable as 'select \$1 < \$2'" \
   -c "create function $c_drop.f() returns int language sql as 'select 1'" \
@@ -370,13 +413,22 @@ check "a writer is open, its function replaced, not committed" \
   [ "$(admin -c "select count(*) from pg_stat_activity where datname = 'sweep_db' and state = 'idle in transaction' and backend_xid is not null")" = 1 ]
 admin -c "select txid_current()" >/dev/null
 list_of "${c_all[@]}" >"$scratch/changes.md"
+check "a schema with a sequence is kept at the list" has "^keep +$c_seq pid=$dead .* has 1 sequence\\(s\\): a cached nextval leaves no trace to check\$"
+echo "select nextval('$c_seq.s');" >&8
+echo '\q' >&8
+exec 8>&-
+wait "$drawer"
+check "the drawer drew again after the list" [ "$(tail -n 1 "$scratch/drawer.out")" = 2 ]
+check "  and the stored value did not move" [ "$(admin -c "select last_value from pg_sequences where schemaname = '$c_seq'")" = "$stored" ]
+# A line that lists it anyway (a list of the version before, or by hand).
+echo "would-drop $c_seq pid=$dead idle=48h size=0MB mods=1 seq=0 $fp" >>"$scratch/changes.md"
 echo "commit;" >&7
 exec 7>&-
 wait "$writer"
 check "the writer committed after the list" [ "$(admin -c "select $c_open.f()")" = 2 ]
 check "the list's xid is the writer's or older" \
   [ "$(admin -c "select age(xmin) <= age('$(sed -n 's/^listed [0-9]* xid //p' "$scratch/changes.md")'::text::xid) from pg_proc where oid = '$c_open.f'::regproc")" = t ]
-check "the changes list holds all seven" [ "$(grep -c '^would-drop ' "$scratch/changes.md")" = 7 ]
+check "the changes list holds all seven, and the sequence's line" [ "$(grep -c '^would-drop ' "$scratch/changes.md")" = 8 ]
 admin -c "create function $c_func.g() returns int language sql as 'select 1'" \
   -c "drop function $c_drop.f()" \
   -c "insert into $c_ins.t values (5)" -c "delete from $c_del.t" \
@@ -385,21 +437,22 @@ run "${live[@]}" -- --apply "$scratch/changes.md" --preview
 check "--preview: exit 0 (status $status)" [ "$status" -eq 0 ]
 check "--preview: the untouched one would be dropped" has "^would drop $c_ok \\(preview: rolled back\\)\$"
 check "--preview: what the drop said is kept" has "^  \\| NOTICE:  drop cascades to table $c_ok\\.t\$"
-check "--preview: says it dropped nothing" has "^sweep-test-schemas --apply --preview \\(nothing dropped\\): would drop 1, skipped 6, failed 0\$"
-for s in "${c_all[@]}"; do exists "$s" && pass "--preview: kept $s" || fail "--preview: kept $s"; done
+check "--preview: says it dropped nothing" has "^sweep-test-schemas --apply --preview \\(nothing dropped\\): would drop 1, skipped 7, failed 0\$"
+for s in "${c_all[@]}" "$c_seq"; do exists "$s" && pass "--preview: kept $s" || fail "--preview: kept $s"; done
 run "${live[@]}" -- --apply "$scratch/changes.md"
 check "exit 0 (status $status)" [ "$status" -eq 0 ]
 check "a function made since the list: kept" has "^skipped $c_func changed since the list \\(objects: [0-9]+ then, [0-9]+ now\\)\$"
 check "a function dropped since the list: kept" has "^skipped $c_drop changed since the list \\(objects: [0-9]+ then, [0-9]+ now\\)\$"
 check "a function replaced by a writer open at the list: kept" has "^skipped $c_open changed since the list \\(1 in pg_proc\\)\$"
+check "a sequence drawn from its cache since the list, listed anyway: kept" has "^skipped $c_seq has 1 sequence\\(s\\): a cached nextval leaves no trace to check\$"
 check "a row inserted since the list, not checkpointed: kept" has "^skipped $c_ins changed since the list \\([0-9]+ rows of $c_ins\\.t\\)\$"
 check "a row deleted since the list, not checkpointed: kept" has "^skipped $c_del changed since the list \\(rows modified: 1 then, 2 now\\)\$"
 check "an operator in another schema over its function: kept" has "^skipped $c_op dependents-outside \\(1: public\\.<<<\\(integer,integer\\)\\)\$"
 check "  and so is the operator" [ "$(admin -c "select count(*) from pg_operator where oprname = '<<<'")" = 1 ]
 check "the untouched one is dropped" has "^dropped $c_ok\$"
 check "  and what the drop said is kept, under it" bash -c "grep -A1 -x 'dropped $c_ok' '$out' | tail -n 1 | grep -qx '  | NOTICE:  drop cascades to table $c_ok.t'"
-check "the totals: 1 dropped, 6 kept" has "^sweep-test-schemas --apply: dropped 1, skipped 6, failed 0\$"
-for s in "$c_func" "$c_ins" "$c_del" "$c_op" "$c_drop" "$c_open"; do exists "$s" && pass "kept: $s" || fail "kept: $s"; done
+check "the totals: 1 dropped, 7 kept" has "^sweep-test-schemas --apply: dropped 1, skipped 7, failed 0\$"
+for s in "$c_func" "$c_ins" "$c_del" "$c_op" "$c_drop" "$c_open" "$c_seq"; do exists "$s" && pass "kept: $s" || fail "kept: $s"; done
 ! exists "$c_ok" && pass "gone: $c_ok" || fail "gone: $c_ok"
 
 guard_home

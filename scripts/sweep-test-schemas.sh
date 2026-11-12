@@ -35,12 +35,21 @@
 #   the list was made (pg_snapshot_xmin), so a writer already open then is
 #   newer than it (rev-e r2 F1). And as the list has them: its tables'
 #   modified-row counts (the statistics collector: deletes leave no row to
-#   see), its sequences' values (nextval sets no xmin), and the objects a
-#   DROP ... CASCADE of it removes, their count and a hash of their
-#   identities (a DROP of one of them since leaves no row to see; r2 F2).
+#   see), and the objects a DROP ... CASCADE of it removes, their count and
+#   a hash of their identities (a DROP of one of them since leaves no row to
+#   see; r2 F2).
 # So "nothing changed since a list that old" is "nothing changed for that
 # long". The pid is checked again too, and an unknown age still keeps it.
-# Other names (no pid in them) always stay.
+# Other names (no pid in them) always stay. A schema with a sequence always
+# stays (cc-astra A14): a backend can hand out values from a cached block
+# of nextval without moving anything stored, so no check here can see that
+# it was used.
+# And the drop runs only on a quiet database (cc-astra A15; the lead's
+# decision): inside the drop's transaction, after the schema's locks, no
+# other client session may be connected to the target database (a new
+# outside dependent, an operator over the schema's function, needs no lock
+# the sweep holds, only a session), and that, and the outside dependents,
+# are checked again immediately before the DROP.
 #
 # Output of the print-only run: the section line, the time and transaction
 # id it looked at, one line per schema, then a summary. The section line
@@ -48,7 +57,8 @@
 # --apply takes only that section:
 #   database <name> port <port>
 #   listed <epoch> xid <oldest running transaction id>
-#   would-drop <schema> pid=<pid> idle=<h>h size=<MB>MB mods=<n> seq=<n> objs=<n> ids=<md5>
+#   would-drop <schema> pid=<pid> idle=<h>h size=<MB>MB mods=<n> seq=0 objs=<n> ids=<md5>
+# (seq: the schema's sequences, 0 on every would-drop line)
 #   keep       <schema> pid=<pid> idle=<h>h size=<MB>MB <why>
 # A list file may hold several runs' output, one section each, in any text
 # around them (a markdown file with code blocks): only lines that start with
@@ -234,12 +244,12 @@ export PGOPTIONS
 # (empty when the files cannot be read)|mods|seq|objs|ids, of every
 # spawn_test_* schema or of the one named (none when it is gone). mods: the
 # rows its tables have had inserted, updated and deleted, by the statistics
-# collector; seq: the sum of its sequences' last values; objs and ids: the
+# collector; seq: how many sequences it has (one keeps it, see judge); objs and ids: the
 # objects DROP ... CASCADE removes with it (the pg_depend closure from the
 # namespace, the one --apply walks below), their count and the md5 of their
 # sorted `<catalog> <identity>` lines. A list carries all four for each
 # would-drop name, and --apply finds them unchanged or keeps the schema: a
-# DELETE leaves no row a scan sees, nextval sets no xmin, and a DROP of one
+# DELETE leaves no row a scan sees, and a DROP of one
 # of its objects leaves no row at all.
 schema_rows() {
     psql -X -qtA -F '|' -v ON_ERROR_STOP=1 -v sr_one="${2-}" <<SQL
@@ -249,7 +259,7 @@ select g.nspname, g.bytes, g.idle, g.mods, g.seq, f.objs, f.ids
                $1 as idle,
                coalesce(sum(pg_stat_get_tuples_inserted(c.oid) + pg_stat_get_tuples_updated(c.oid)
                             + pg_stat_get_tuples_deleted(c.oid)) filter (where c.relkind in ('r', 'm')), 0) as mods,
-               (select coalesce(sum(s.last_value), 0) from pg_sequences s where s.schemaname = n.nspname) as seq
+               count(c.oid) filter (where c.relkind = 'S') as seq
           from pg_namespace n
           left join pg_class c on c.relnamespace = n.oid and c.relkind in ('r', 'i', 't', 'm', 'S')
          where n.nspname like 'spawn\_test\_%' and (:'sr_one' = '' or n.nspname = :'sr_one')
@@ -303,6 +313,8 @@ judge() {
         jd_why="pid $jd_pid runs here"
     elif [ -z "$3" ]; then
         jd_why="its age is unknown"
+    elif [ "${5:-0}" != 0 ]; then
+        jd_why="has $5 sequence(s): a cached nextval leaves no trace to check"
     elif [ "${8-}" != listed ] && [ "$3" -lt "$min_idle" ]; then
         jd_why="written ${jd_hours}h ago (< ${min_idle_hours}h)"
     fi
@@ -384,6 +396,12 @@ for name in $reviewed; do
     # - every table, view and materialized view of the schema is locked
     #   ACCESS EXCLUSIVE first (lock_timeout 10s), so nothing writes to it or
     #   adds a view or key over it from here to the drop;
+    # - a quiet database (cc-astra A15): no other client session connected
+    #   to it, `skipped <name> not quiescent (<n> other session(s)...)`. An
+    #   outside dependent over a non-relation (an operator over its
+    #   function) takes no lock the sweep holds, only a session;
+    # - a sequence in it keeps it (cc-astra A14), `skipped <name> has
+    #   sequences (<n>)`;
     # - dependents-outside (cc-astra A9, rev-e F2): what DROP ... CASCADE
     #   removes is the pg_depend closure from the namespace; every object in
     #   it must be the schema's own, by pg_identify_object's schema (a
@@ -397,24 +415,24 @@ for name in $reviewed; do
     #   of its tables (xmin, or a set xmax) newer than the list's transaction
     #   id. The comparison is age(x) <= age(list), safe across wraparound,
     #   and a frozen row reads as old. A DELETE leaves no row a scan sees,
-    #   and nextval sets no xmin: the rows its tables have had modified (the
-    #   statistics collector's counts) and its sequences' values must be the
-    #   list's. No file time is read here: the list is at least the floor old
+    #   so the rows its tables have had modified (the statistics collector's
+    #   counts) must be the list's. No file time is read here: the list is at least the floor old
     #   and nothing changed since it, which is the proof (a scan here sets
     #   hint bits, so file times after a --preview say nothing);
+    # - immediately before the DROP, again: no other session connected, and
+    #   no dependent outside the schema in its closure read afresh;
     # - then the DROP, and COMMIT (ROLLBACK with --preview).
     # The name, the list's xid and time go in as settings (psql quotes them),
     # and to SQL through format('%I') and casts.
     if [ "$preview" = 1 ]; then tx_end=rollback; else tx_end=commit; fi
-    read -r _ name_mods name_seq name_objs name_ids < <(awk -v n="$name" '$1 == n' <<<"$listed_counts")
+    read -r _ name_mods _ name_objs name_ids < <(awk -v n="$name" '$1 == n' <<<"$listed_counts")
     if drop_err=$(PGOPTIONS=$pgoptions_drop psql -X -q -v ON_ERROR_STOP=1 -v dn_name="$name" \
         -v dn_xid="$listed_xid" -v dn_end="$tx_end" \
-        -v dn_mods="$name_mods" -v dn_seq="$name_seq" -v dn_objs="$name_objs" -v dn_ids="$name_ids" 2>&1 >/dev/null <<'SQL'
+        -v dn_mods="$name_mods" -v dn_objs="$name_objs" -v dn_ids="$name_ids" 2>&1 >/dev/null <<'SQL'
 begin;
 set local lock_timeout = '10s';
 select set_config('sweep.name', :'dn_name', true), set_config('sweep.xid', :'dn_xid', true),
        set_config('sweep.mods', :'dn_mods', true),
-       set_config('sweep.seq', :'dn_seq', true),
        set_config('sweep.objs', :'dn_objs', true), set_config('sweep.ids', :'dn_ids', true);
 do $sweep$
 declare
@@ -434,9 +452,19 @@ begin
                 where c.relnamespace = nsp and c.relkind in ('r', 'p', 'v', 'm', 'f') order by c.oid loop
         execute format('lock table %s in access exclusive mode', rel);
     end loop;
-    create temporary table sweep_closure on commit drop as
+    -- A quiet database (cc-astra A15): no other client session.
+    select count(*), string_agg(distinct coalesce(a.application_name, ''), ', ') into found, first
+      from pg_stat_activity a
+     where a.datname = current_database() and a.pid <> pg_backend_pid() and a.backend_type = 'client backend';
+    if found > 0 then
+        raise exception 'sweep: not quiescent (% other session(s) connected to %: %)', found, current_database(), first;
+    end if;
+    -- The closure as it is now, read again at each use (a view), and as it
+    -- was here (a table), for the checks below.
+    create temporary view sweep_closure_now as
     with recursive c(classid, objid, objsubid) as (
-        select 'pg_namespace'::regclass::oid, nsp, 0
+        select 'pg_namespace'::regclass::oid,
+               (select oid from pg_namespace where nspname = current_setting('sweep.name')), 0
         union
         select d.classid, d.objid, d.objsubid
           from pg_depend d join c on d.refclassid = c.classid and d.refobjid = c.objid
@@ -452,12 +480,20 @@ begin
                     end) as schema,
            i.identity
       from c, pg_identify_object(c.classid, c.objid, c.objsubid) i;
+    create temporary table sweep_closure on commit drop as select * from sweep_closure_now;
 
     select count(*), min(identity) into found, first from sweep_closure
      where not (classid = 'pg_namespace'::regclass and objid = nsp)
        and schema is distinct from current_setting('sweep.name') and schema is distinct from 'pg_toast';
     if found > 0 then
         raise exception 'sweep: dependents-outside (%: %)', found, first;
+    end if;
+    -- A sequence, here or owned from here (cc-astra A14): its use by a
+    -- cached nextval leaves nothing stored to check.
+    select count(*) into found from sweep_closure s join pg_class c on c.oid = s.objid
+     where s.classid = 'pg_class'::regclass and c.relkind = 'S';
+    if found > 0 then
+        raise exception 'sweep: has sequences (%)', found;
     end if;
 
     -- Changed since the list: the objects themselves, as schema_rows hashes
@@ -503,19 +539,29 @@ begin
             raise exception 'sweep: changed since the list (% rows of %)', found, rel;
         end if;
     end loop;
-    -- What a scan cannot see: deletes (and every insert or update) by the
-    -- statistics collector's counts, and nextval by the sequences' values.
+    -- What a scan cannot see: deletes (and every insert or update), by the
+    -- statistics collector's counts.
     select coalesce(sum(pg_stat_get_tuples_inserted(c.oid) + pg_stat_get_tuples_updated(c.oid)
                         + pg_stat_get_tuples_deleted(c.oid)), 0)
       into found from pg_class c where c.relnamespace = nsp and c.relkind in ('r', 'm');
     if found <> current_setting('sweep.mods')::bigint then
         raise exception 'sweep: changed since the list (rows modified: % then, % now)', current_setting('sweep.mods'), found;
     end if;
-    select coalesce(sum(s.last_value), 0) into found from pg_sequences s where s.schemaname = current_setting('sweep.name');
-    if found <> current_setting('sweep.seq')::bigint then
-        raise exception 'sweep: changed since the list (sequences at % then, % now)', current_setting('sweep.seq'), found;
-    end if;
 
+    -- Immediately before the DROP (cc-astra A15): still no other session,
+    -- and no outside dependent in the closure read afresh.
+    select count(*), string_agg(distinct coalesce(a.application_name, ''), ', ') into found, first
+      from pg_stat_activity a
+     where a.datname = current_database() and a.pid <> pg_backend_pid() and a.backend_type = 'client backend';
+    if found > 0 then
+        raise exception 'sweep: not quiescent (% other session(s) connected to %: %)', found, current_database(), first;
+    end if;
+    select count(*), min(identity) into found, first from sweep_closure_now
+     where not (classid = 'pg_namespace'::regclass and objid = nsp)
+       and schema is distinct from current_setting('sweep.name') and schema is distinct from 'pg_toast';
+    if found > 0 then
+        raise exception 'sweep: dependents-outside (%: %)', found, first;
+    end if;
     execute format('drop schema %I cascade', current_setting('sweep.name'));
 end
 $sweep$;
@@ -533,6 +579,12 @@ SQL
         skipped=$((skipped + 1))
     elif grep -q 'sweep: changed since the list' <<<"$drop_err"; then
         echo "skipped $name changed since the list ($(sed -n 's/.*sweep: changed since the list (\(.*\))$/\1/p' <<<"$drop_err" | sed -n 1p))"
+        skipped=$((skipped + 1))
+    elif grep -q 'sweep: not quiescent' <<<"$drop_err"; then
+        echo "skipped $name not quiescent ($(sed -n 's/.*sweep: not quiescent (\(.*\))$/\1/p' <<<"$drop_err" | sed -n 1p))"
+        skipped=$((skipped + 1))
+    elif grep -q 'sweep: has sequences' <<<"$drop_err"; then
+        echo "skipped $name has sequences ($(sed -n 's/.*sweep: has sequences (\(.*\))$/\1/p' <<<"$drop_err" | sed -n 1p))"
         skipped=$((skipped + 1))
     elif grep -q 'sweep: gone' <<<"$drop_err"; then
         echo "skipped $name gone"
