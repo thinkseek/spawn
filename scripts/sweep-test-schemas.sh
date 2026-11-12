@@ -233,7 +233,11 @@ while IFS='|' read -r name bytes idle; do
     [ -n "$name" ] || continue
     judge "$name" "$bytes" "$idle"
     [ -z "$jd_why" ] || continue
-    printf '%s\n' "$reviewed" | grep -qxF -- "$name" && continue
+    # A here-string, not a pipe: under pipefail, grep -q stopping at its
+    # match killed printf with SIGPIPE on a list longer than a pipe's
+    # buffer, and a listed name read as not on the list (ccd, 2026-11-12:
+    # 77 of 1230 said not-on-list, then dropped as listed).
+    grep -qxF -- "$name" <<<"$reviewed" && continue
     echo "not-on-list ${jd_line#would-drop } (qualifies now, not reviewed: kept)"
     not_listed=$((not_listed + 1))
 done <<<"$rows"

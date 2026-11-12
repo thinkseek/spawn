@@ -280,6 +280,31 @@ check "--apply: exit 0, nothing failed (status $status)" [ "$status" -eq 0 ]
 check "--apply: skipped, its age unknown" has "^skipped $unknown its age is unknown$"
 exists "$unknown" && pass "--apply: it is still there" || fail "--apply: it is still there"
 
+echo "== 5. a long list: every listed name is on the list (none said not-on-list)"
+# A list longer than a pipe's buffer, its qualifying names first: the
+# membership test must see the whole list. (Piped into grep -q under
+# pipefail, the writer died of SIGPIPE when grep stopped early, and listed
+# names were said to be not on the list: 77 of 1230 on ccd, 2026-11-12.)
+long1=spawn_test_${dead}_ab01_1_long_list_first
+long2=spawn_test_${dead}_ab02_2_long_list_second
+make "$long1" old
+make "$long2" old
+{
+  echo "database sweep_db port $port"
+  echo "would-drop $long1 pid=$dead idle=48h size=0MB"
+  echo "would-drop $long2 pid=$dead idle=48h size=0MB"
+  for i in $(seq 1100); do
+    echo "would-drop spawn_test_${dead}_ff${i}_padding_padding_padding_padding_padding_padding pid=$dead idle=48h size=0MB"
+  done
+} >"$scratch/long.md"
+check "its names alone are longer than a pipe's buffer" \
+  [ "$(sed -n 's/^would-drop \([^ ]*\) .*/\1/p' "$scratch/long.md" | wc -c)" -gt 65536 ]
+run "${live[@]}" -- --apply "$scratch/long.md"
+check "exit 0 (status $status)" [ "$status" -eq 0 ]
+check "the first listed name is not said not-on-list" bash -c "! grep -q '^not-on-list $long1 ' '$out'"
+check "nor the second" bash -c "! grep -q '^not-on-list $long2 ' '$out'"
+check "both are dropped" bash -c "grep -qx 'dropped $long1' '$out' && grep -qx 'dropped $long2' '$out'"
+
 guard_home
 if [ "$failures" -eq 0 ]; then
   echo "test-sweep-test-schemas: all cases pass"
