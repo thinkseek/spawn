@@ -87,14 +87,8 @@ impl Walked {
     }
 }
 
-/// The bytes appended to the archive per day: its `bytes` now less the
-/// `archive_bytes` of `oldest` (the oldest sample of the last 7 days), over
-/// the days between them. `None` without a sample at least a day old.
-pub(crate) fn growth(bytes: u64, oldest: &Value, read_at_ms: i64) -> Option<i64> {
-    growth_of(bytes, oldest, "archive_bytes", read_at_ms)
-}
-
-/// The bytes a grower gains per day: its `bytes` now less the `field` of
+/// The bytes a grower gains per day (objective 065 for the archive, 085
+/// for every grower that persists): its `bytes` now less the `field` of
 /// `oldest` (the oldest sample of the last 7 days that carries it), over
 /// the days between them, rounded down. `None` without such a sample at
 /// least a day old.
@@ -259,7 +253,7 @@ pub(crate) fn report(store: &PostgresStore, now_ms: i64) -> Result<Value, String
 #[cfg(test)]
 mod tests {
     use super::{
-        DAY_MS, Kept, READ_EVERY_MS, Walked, days_left, growth, growth_parts, kept_or_read,
+        DAY_MS, Kept, READ_EVERY_MS, Walked, days_left, growth_of, growth_parts, kept_or_read,
         persistent_growth, sizes, test_databases, with_free,
     };
     use crate::storage::tests::{file, scratch};
@@ -299,16 +293,17 @@ mod tests {
     fn the_growth_is_what_was_appended_per_day_since_the_oldest_sample() {
         let now = 100 * DAY_MS;
         let oldest = |ago: i64, bytes: u64| json!({"at_ms": now - ago, "archive_bytes": bytes});
+        let growth = |bytes: u64, oldest: &Value| growth_of(bytes, oldest, "archive_bytes", now);
         // 7 MiB appended in 6.5 days.
         let six_and_a_half = 13 * DAY_MS / 2;
-        let got = growth(12 * MIB, &oldest(six_and_a_half, 5 * MIB), now).expect("a growth");
+        let got = growth(12 * MIB, &oldest(six_and_a_half, 5 * MIB)).expect("a growth");
         assert_eq!(got, i64::try_from(7 * MIB * 2 / 13).expect("fits"));
         // A sample under a day old, or none, measures nothing.
-        assert_eq!(growth(12 * MIB, &oldest(DAY_MS - 1, 5 * MIB), now), None);
-        assert_eq!(growth(12 * MIB, &Value::Null, now), None);
+        assert_eq!(growth(12 * MIB, &oldest(DAY_MS - 1, 5 * MIB)), None);
+        assert_eq!(growth(12 * MIB, &Value::Null), None);
         // A shrinking archive grows by less than nothing.
         assert_eq!(
-            growth(MIB, &oldest(DAY_MS, 3 * MIB), now),
+            growth(MIB, &oldest(DAY_MS, 3 * MIB)),
             Some(-2 * i64::try_from(MIB).expect("fits"))
         );
         assert_eq!(
