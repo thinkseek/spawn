@@ -133,6 +133,18 @@
 //!   that reading its evidence. A test database that cannot be read is a
 //!   line; its alert stays as it was. The fleet's test database once grew to
 //!   2.7 GB (2533 schemas tests left) unmeasured, and was read as live bloat.
+//! - `guardrail_out_of_range`, `guardrail <figure key>`, key
+//!   `guardrail_out_of_range:<figure key>:<out since ms>` (objective 089):
+//!   every `SPAWN_ALERT_GUARDRAIL_SECS` (default 300) the step reads the
+//!   Core lines figures `GET /api/core-lines` gives, by the same code, the
+//!   ranges file read at each reading. A figure out of its range at every
+//!   reading for `SPAWN_GUARDRAIL_RAISE_SECS` (default 7200) fires, evidence
+//!   `{line, key, name, value, range, out_since_ms, reading_ms}`; one open
+//!   per figure. Clears once not out at any reading for
+//!   `SPAWN_GUARDRAIL_CLEAR_SECS` (default 3600), evidence `{key, state,
+//!   value, range, reading_ms}`, or at the next reading when the figure is
+//!   gone (`state` `gone`). The holds live in the step's memory
+//!   (alerts/guardrails.rs).
 //! - `agent_stuck`, the session id, key `agent_stuck:<session>:<its
 //!   observation>`: the session's latest `observation.recorded` says `stuck`
 //!   at or above [`LIKELY`] (0.5), whatever the dispatcher does with it; a
@@ -385,6 +397,12 @@ pub(crate) struct Settings {
     /// The gates' test database (`SPAWN_TEST_DATABASE_URL`) and the
     /// engines' (`SPAWN_FLEET_TEST_DATABASE_URL`), when set.
     pub(crate) test_databases: Vec<(&'static str, Url)>,
+    /// How often the Core lines figures are read (`guardrail_out_of_range`).
+    pub(crate) guardrail_ms: i64,
+    /// How long a figure must stay out of its range before it raises.
+    pub(crate) guardrail_raise_ms: i64,
+    /// How long it must stay back before its alert clears.
+    pub(crate) guardrail_clear_ms: i64,
 }
 
 /// A database URL, which holds a password: never shown, not even by
@@ -477,6 +495,9 @@ impl Settings {
             database_floor_mb: number("SPAWN_ALERT_DATABASE_FLOOR_MB", 1024, &mut warnings),
             database_ratio: number("SPAWN_ALERT_DATABASE_RATIO", 10, &mut warnings),
             test_databases: test_database_urls(),
+            guardrail_ms: secs("SPAWN_ALERT_GUARDRAIL_SECS", 300, &mut warnings),
+            guardrail_raise_ms: secs("SPAWN_GUARDRAIL_RAISE_SECS", 7200, &mut warnings),
+            guardrail_clear_ms: secs("SPAWN_GUARDRAIL_CLEAR_SECS", 3600, &mut warnings),
         };
         (settings, warnings)
     }
@@ -696,6 +717,14 @@ pub(crate) struct Monitor {
     supervisor_due_ms: i64,
     /// When the databases' sizes are read next (`database_size`).
     database_due_ms: i64,
+    /// When the Core lines figures are read next (`guardrail_out_of_range`).
+    guardrail_due_ms: i64,
+    /// Each figure out of its range at every reading since, by key: the
+    /// first reading of this stretch. A restart forgets it.
+    guardrail_out: BTreeMap<String, i64>,
+    /// Each figure with an open alert that has not been out since, by key:
+    /// the first reading of this stretch.
+    guardrail_back: BTreeMap<String, i64>,
 }
 
 /// What the supervisor has to dispatch, as one read of the attention view
@@ -809,6 +838,9 @@ impl Monitor {
             supervisor: None,
             supervisor_due_ms: 0,
             database_due_ms: 0,
+            guardrail_due_ms: 0,
+            guardrail_out: BTreeMap::new(),
+            guardrail_back: BTreeMap::new(),
         }
     }
 
@@ -883,6 +915,10 @@ impl Monitor {
             if now >= self.database_due_ms {
                 self.database_due_ms = now.saturating_add(self.settings.database_ms);
                 self.read_databases(store, now, &mut events, &mut lines);
+            }
+            if now >= self.guardrail_due_ms {
+                self.guardrail_due_ms = now.saturating_add(self.settings.guardrail_ms);
+                self.read_guardrails(store, now, &mut events, &mut lines);
             }
         }
         self.bounds(now, &mut events);
@@ -4507,6 +4543,8 @@ fn host_sources(listed: &Value) -> BTreeSet<(i64, String)> {
     out
 }
 
+mod guardrails;
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -4543,6 +4581,9 @@ mod tests {
             database_floor_mb: 1024,
             database_ratio: 10,
             test_databases: Vec::new(),
+            guardrail_ms: 300_000,
+            guardrail_raise_ms: 7_200_000,
+            guardrail_clear_ms: 3_600_000,
         }
     }
 
