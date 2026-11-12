@@ -430,7 +430,7 @@ EOF
 # hold-calm exists it runs hold.py in the background. A turn whose text
 # names BB:WRITE writes <name>.txt, waits for the pusher to publish it (at
 # most 30 s), then writes the report.
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 start=new
@@ -493,7 +493,7 @@ while :; do
     python3 -I "$BB_WORK/hold.py" "$BB_WORK" &
     holder=$!
   fi
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     if [ "$pending" = 0 ]; then
       line '"type":"user","message":{"role":"user","content":"prompt"}'

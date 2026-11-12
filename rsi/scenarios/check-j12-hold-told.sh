@@ -255,7 +255,7 @@ chmod 755 "$WORK/fake-gate.sh"
 # A turn whose text named `BB:WRITE` writes `<name>.txt`, waits for the
 # pusher to publish it (at most 30 s), then writes the report. Any other
 # turn changes nothing.
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -283,7 +283,7 @@ printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 job=
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     if [ "$pending" = 0 ]; then
       line '"type":"user","message":{"role":"user","content":"prompt"}'

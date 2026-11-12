@@ -301,7 +301,7 @@ EOF
     # its sha256), writes it if not (120 lines), then shows a running turn
     # and makes a tool call every 0.2 s until it is stopped. `BB:SMALL`
     # writes small.txt and ends the turn.
-    cat >"$WORK/claude" <<'ENGINE'
+    bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -336,7 +336,7 @@ printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 mode=
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     if [ "$pending" = 0 ]; then
       line '"type":"user","message":{"role":"user","content":"prompt"}'
@@ -674,7 +674,7 @@ git -C "$WORK/seed" push -q "$WORK/p012/source.git" main:main
 # opens the turn and goes silent for good: nothing more in the transcript
 # or on the screen, except one tool call each time the harness creates
 # $BB_WORK/wake-<name>.
-cat >"$WORK/engine-013" <<'ENGINE'
+bb_engine >"$WORK/engine-013" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -701,7 +701,7 @@ pending=0
 work=
 silent=
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     if [ "$pending" = 0 ]; then
       line '"type":"user","message":{"role":"user","content":"prompt"}'

@@ -242,7 +242,7 @@ mkdir -p "$WORK/claude-config" "$WORK/ctl" "$WORK/state"
 # pane, in its workspace, with the pane's environment less any database
 # variable. Every prompt, ack and turn end is logged (engine.log: ms agent
 # what ...; ack.out: each ack's arguments, exit status and output).
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -331,7 +331,7 @@ turn() { # <the prompt's text>
 printf 'Welcome to Claude Code\n\n❯ '
 buffer=""
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     buffer="${buffer:+$buffer
 }$typed"
   elif [ -n "$buffer" ]; then

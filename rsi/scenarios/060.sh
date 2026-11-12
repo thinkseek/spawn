@@ -208,7 +208,7 @@ git -C "$WORK/seed" push -q "$repo" main:main
 # and ends (the task done), logged to turns.log once its lines are written.
 # A prompt naming no plan (the supervisor's, a nudge) ends the turn at once
 # and reports no usage.
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -262,7 +262,7 @@ printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 typed_all=
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     typed_all="$typed_all $typed"
     if [ "$pending" = 0 ]; then
