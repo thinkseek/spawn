@@ -298,7 +298,8 @@ pub(super) fn lines(storage: &Value, observed: &Observed) -> Vec<Line> {
     lines
 }
 
-/// The observability line (objective 088), its count not measured yet set.
+/// The observability line (objective 088): its count not measured is set by
+/// [`count_not_measured`] once every line is built.
 fn observability_line(observed: &Observed) -> Line {
     Line {
         name: "observability",
