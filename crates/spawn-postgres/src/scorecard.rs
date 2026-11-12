@@ -18,7 +18,7 @@ use crate::PostgresStore;
 /// becomes `stage_ms`, the wall clock its last `| stage gate <result> <ms>ms
 /// total` line names (scripts/stage.sh, scripts/rsi/gate.sh). A
 /// `legacy.imported` row (from before the control stream) lends its own
-/// fields, plus its `state` and times. Records of no measure (reports,
+/// fields, plus its `state` and times. Records of no measure (a report's text,
 /// residents' and halts' records, host facts) are left out; a report is
 /// kept as its time (`task.reported`, where a landing's wait for live
 /// starts) and a deploy as its `ok` (`deploy.finished`, objective 081). `owner_runs_from_ms` is the
