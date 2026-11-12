@@ -201,10 +201,24 @@ pub fn create_with(top: &Path, relative: &TreePath, bytes: &[u8]) -> Result<bool
             )));
         }
     };
-    if let Err(error) = File::from(descriptor).write_all(bytes) {
+    let mut file = File::from(descriptor);
+    if let Err(error) = file.write_all(bytes) {
         // The file this call made, half written: removed through the same
-        // held parent, so a run again can make it whole (rev-g N1).
-        let _ = rustix::fs::unlinkat(parent.descriptor(), relative.file_name(), AtFlags::empty());
+        // held parent, so a run again can make it whole (rev-g N1), and
+        // only while the name still is that file (rev-g N4: same device and
+        // inode as the descriptor written, the name not followed).
+        let ours = rustix::fs::fstat(&file);
+        let there = rustix::fs::statat(
+            parent.descriptor(),
+            relative.file_name(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        );
+        if let (Ok(ours), Ok(there)) = (ours, there)
+            && (ours.st_dev, ours.st_ino) == (there.st_dev, there.st_ino)
+        {
+            let _ =
+                rustix::fs::unlinkat(parent.descriptor(), relative.file_name(), AtFlags::empty());
+        }
         return Err(AgentFileError::Failed(format!("write {relative}: {error}")));
     }
     Ok(true)

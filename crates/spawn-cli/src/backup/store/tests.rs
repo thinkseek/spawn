@@ -180,31 +180,52 @@ fn a_file_is_sent_whole_grown_or_not_at_all() {
 #[test]
 fn it_writes_only_under_locktest_until_switched_on() {
     // Made-up names: the real ones are values of the credential.
-    let work = "made-up-work";
-    assert!(may_write("locktest/store-test-1/", work, None).is_ok());
-    assert!(may_write("probe/store-test-1/", work, None).is_ok());
+    let (work, keep) = ("made-up-work", "made-up-keep");
+    let t = "transcripts";
+    assert!(may_write("locktest/store-test-1/", t, work, None).is_ok());
+    assert!(may_write("probe/store-test-1/", t, work, None).is_ok());
+    assert!(may_write("locktest/store-test-1/", t, work, Some("1")).is_ok());
     assert!(
-        may_write("", work, None)
+        may_write("", t, work, None)
             .unwrap_err()
             .contains("switched off")
     );
-    assert!(may_write("sessions/", work, None).is_err());
-    assert!(may_write("sessions/", work, Some("0")).is_err());
-    assert!(may_write("", "made-up-keep", Some("1")).is_ok());
+    assert!(may_write("sessions/", t, work, None).is_err());
+    assert!(may_write("sessions/", t, work, Some("0")).is_err());
+    assert!(may_write("", t, work, Some("1")).is_ok());
     // A test object never goes to the keep bucket, nor to any bucket not
-    // named as the work one: fail closed.
-    for bucket in [
-        "made-up-keep",
-        "made-up-store",
-        "made-up",
-        "made-up-work-keep",
-        "",
-    ] {
-        let error = may_write("locktest/store-test-1/", bucket, None).unwrap_err();
-        assert!(error.contains("never the keep bucket"), "{bucket}: {error}");
-        assert!(bucket.is_empty() || !error.contains(bucket), "{error}");
-        assert!(may_write("probe/x/", bucket, Some("0")).is_err());
+    // named as the work one, switched on or off (rev-g F3, fail closed).
+    for bucket in [keep, "made-up-store", "made-up", "made-up-work-keep", ""] {
+        for enabled in [None, Some("0"), Some("1")] {
+            for prefix in ["locktest/store-test-1/", "probe/x/"] {
+                let error = may_write(prefix, t, bucket, enabled).unwrap_err();
+                assert!(
+                    error.contains("never the keep bucket"),
+                    "{bucket} {enabled:?} {prefix}: {error}"
+                );
+                assert!(bucket.is_empty() || !error.contains(bucket), "{error}");
+            }
+        }
     }
+    // Switched on, the keep bucket takes only the store's own keys: no
+    // prefix, area transcripts or sessions (the named list).
+    assert!(may_write("", "transcripts", keep, Some("1")).is_ok());
+    assert!(may_write("", "sessions", keep, Some("1")).is_ok());
+    for (prefix, area) in [
+        ("", "other"),
+        ("x/", "transcripts"),
+        ("transcripts/", "sessions"),
+    ] {
+        let error = may_write(prefix, area, keep, Some("1")).unwrap_err();
+        assert!(
+            error.contains("only the store's own keys"),
+            "{prefix} {area}: {error}"
+        );
+    }
+    assert!(
+        may_write("", "transcripts", keep, None).is_err(),
+        "off is off"
+    );
 }
 
 /// Counted, not timed: what each run writes, and that what comes back is
@@ -622,6 +643,62 @@ fn a_multipart_etag_is_refused() {
     fs::write(dir.join("agent_x/a.jsonl"), b"a\n").expect("a");
     let error = store.put(&listed(&dir), 1_000).unwrap_err();
     assert!(error.contains("not one PUT's MD5"), "{error}");
+    fs::remove_dir_all(&dir).expect("clean up");
+    fs::remove_dir_all(&work).expect("clean up");
+}
+
+/// rev-g F2: an object already at a segment's key (an earlier run's, a
+/// racer's) whose ETag is a multipart one is refused on the found path
+/// too, never recorded, and nothing is written over it.
+#[test]
+fn a_found_object_with_a_multipart_etag_is_refused() {
+    struct Found(Memory, String);
+    impl Bucket for Found {
+        fn put_new(&self, key: &str, file: &Path, sha256: &str) -> Result<Put, String> {
+            self.0.put_new(key, file, sha256)
+        }
+        fn head(&self, key: &str) -> Result<Option<Head>, String> {
+            Ok(self.0.head(key)?.map(|head| Head {
+                etag: if key == self.1 {
+                    format!("{}-2", head.etag)
+                } else {
+                    head.etag
+                },
+                ..head
+            }))
+        }
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+            self.0.get(key)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<Listed>, String> {
+            self.0.list(prefix)
+        }
+    }
+    let dir = scratch("found-multipart");
+    let work = scratch("found-multipart-work");
+    let body = b"a\n";
+    let key = keys().segment(&hex(&hmac_sha256(&[7; 32], body)));
+    let bucket = Found(Memory::default(), key.clone());
+    bucket
+        .0
+        .objects
+        .borrow_mut()
+        .insert(key.clone(), (b"sealed:a\n".to_vec(), "theirs".to_string()));
+    let store = Store {
+        bucket: &bucket,
+        keys: keys(),
+        name_key: [7; 32],
+        seal: &seal,
+        open: &open,
+        scratch: &work,
+        nonce: &|| random_hex(4),
+    };
+    fs::create_dir_all(dir.join("agent_x")).expect("agent");
+    fs::write(dir.join("agent_x/a.jsonl"), body).expect("a");
+    let error = store.put(&listed(&dir), 1_000).unwrap_err();
+    assert!(error.contains("not one PUT's MD5"), "{error}");
+    assert!(error.starts_with(&key), "the found segment's: {error}");
+    assert!(bucket.0.writes.borrow().is_empty(), "nothing written");
     fs::remove_dir_all(&dir).expect("clean up");
     fs::remove_dir_all(&work).expect("clean up");
 }
