@@ -647,9 +647,17 @@ fn the_facts_carry_reports_and_deploys() {
     assert_eq!(reported.len(), 1, "{facts}");
     assert_eq!(reported[0]["id"], 4);
     assert_eq!(reported[0]["at"], 1000);
-    assert_eq!(reported[0].get("report"), None, "a report's text is not read");
+    assert_eq!(
+        reported[0].get("report"),
+        None,
+        "a report's text is not read"
+    );
     let deploys = by_type(&facts, "deploy.finished");
-    assert_eq!(deploys.len(), 2, "a deploy after `until` is not read: {facts}");
+    assert_eq!(
+        deploys.len(),
+        2,
+        "a deploy after `until` is not read: {facts}"
+    );
     assert_eq!(deploys[0]["ok"], false);
     assert_eq!(deploys[0]["at"], 2000);
     assert_eq!(deploys[1]["ok"], true);
