@@ -18,14 +18,19 @@
 //! }
 //! ```
 //!
-//! `unit` is one of bytes, bytes_per_day, days, count, ratio, ms, share.
+//! `unit` is one of bytes, bytes_per_day, days, count, ratio, ms, share, usd.
 //! `range` is the file's entry for the figure (`{min?, max?}`, numbers) or
 //! null; `state` is `in` when the value lies within it (bounds included),
 //! `out` when it does not, `no_range` without a range and `not_collected`
 //! without a value.
 //!
-//! The storage figures are health.storage's on `/api/fleet`, read the same
-//! way ([`super::storage::report`]). The other lines' north stars are not
+//! The performance figures (objective 086) are the pages': the Scorecard's
+//! fleet scope over its default 7 days (report to live, the gate time's
+//! median, the share of gate time that decided nothing, first pass) and
+//! `/api/cost?window=7d`'s dollars per landing ([`performance`]), kept for a
+//! minute so a Home poll does not compute them again at every request. The
+//! storage figures are health.storage's on `/api/fleet`, read the same way
+//! ([`super::storage::report`]). The other lines' north stars are not
 //! collected yet; later objectives add their figures to this frame.
 //!
 //! No range lives in code: they come only from the ranges file,
@@ -183,9 +188,109 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
     })
 }
 
-/// The four lines, the storage line's figures from `storage` (health.storage
-/// as [`super::storage::report`] gives it).
-pub(super) fn lines(storage: &Value) -> Vec<Line> {
+/// How long the performance figures are kept: a Home poll must not compute
+/// the 7-day scorecard and cost window again at every request.
+const PERFORMANCE_KEPT_MS: i64 = 60_000;
+
+/// The performance figures of the last read, and when.
+static PERFORMANCE: std::sync::Mutex<Option<(i64, Value)>> = std::sync::Mutex::new(None);
+
+/// The performance line's values (objective 086), from the Scorecard's
+/// answer over its default 7 days and `/api/cost?window=7d`'s: the fleet
+/// scope's `report_to_live` value, `gate_time` value (the median),
+/// `gate_time`'s `undecided_ms` over its `total_ms` (null when the total is
+/// 0), `first_pass` value, and the cost window's `usd_per_landing`. A value
+/// the page does not have is null.
+pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
+    let fleet = scorecard["scopes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|scope| scope["scope"] == "fleet")
+        .map_or(Value::Null, |scope| scope["dimensions"].clone());
+    let gate = &fleet["gate_time"];
+    let decided_nothing = match (gate["undecided_ms"].as_f64(), gate["total_ms"].as_f64()) {
+        (Some(undecided), Some(total)) if total > 0.0 => json!(undecided / total),
+        _ => Value::Null,
+    };
+    json!({
+        "report_to_live": fleet["report_to_live"]["value"],
+        "gate_time": gate["value"],
+        "decided_nothing": decided_nothing,
+        "first_pass": fleet["first_pass"]["value"],
+        "usd_per_landing": cost["usd_per_landing"],
+    })
+}
+
+/// The performance values, kept for [`PERFORMANCE_KEPT_MS`]: computed from
+/// the 7-day scorecard and cost window as the pages compute them. A part
+/// that cannot be read counts as not collected.
+fn performance_now(store: &spawn_postgres::PostgresStore, now_ms: i64) -> Value {
+    let mut kept = PERFORMANCE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, values)) = kept
+        .as_ref()
+        .filter(|(at, _)| (0..PERFORMANCE_KEPT_MS).contains(&now_ms.saturating_sub(*at)))
+    {
+        return values.clone();
+    }
+    let root = crate::env_value("SPAWN_WORKSPACE_ROOT");
+    let scorecard = crate::scorecard::measure(
+        store,
+        root.as_deref().map(std::path::Path::new),
+        &crate::scorecard::Query::default(),
+    )
+    .unwrap_or(Value::Null);
+    let cost = crate::cost::window_of(Some("7d"))
+        .and_then(|(name, length_ms)| crate::cost::window(store, name, length_ms))
+        .unwrap_or(Value::Null);
+    let values = performance(&scorecard, &cost);
+    *kept = Some((now_ms, values.clone()));
+    values
+}
+
+/// The performance line ([`performance`]'s values).
+fn performance_line(performance: &Value) -> Line {
+    Line {
+        name: "performance",
+        north_star: Figure::new(
+            "performance.report_to_live",
+            "Time from report to live",
+            "ms",
+            performance["report_to_live"].clone(),
+        ),
+        guardrails: vec![
+            Figure::new(
+                "performance.gate_time",
+                "Gate time per run",
+                "ms",
+                performance["gate_time"].clone(),
+            ),
+            Figure::new(
+                "performance.decided_nothing",
+                "Gate time that decided nothing",
+                "share",
+                performance["decided_nothing"].clone(),
+            ),
+            Figure::new(
+                "performance.first_pass",
+                "Landings that pass first time",
+                "share",
+                performance["first_pass"].clone(),
+            ),
+            Figure::new(
+                "performance.usd_per_landing",
+                "Dollars per landing",
+                "usd",
+                performance["usd_per_landing"].clone(),
+            ),
+        ],
+    }
+}
+
+/// The storage line, from health.storage.
+fn storage_line(storage: &Value) -> Line {
     let database = &storage["database"];
     let ratio = match (database["bytes"].as_f64(), database["log_bytes"].as_f64()) {
         (Some(bytes), Some(log)) if log > 0.0 => json!(bytes / log),
@@ -201,57 +306,56 @@ pub(super) fn lines(storage: &Value) -> Vec<Line> {
             .max()
             .map_or(Value::Null, |most| json!(most))
     };
+    Line {
+        name: "storage",
+        north_star: Figure::new(
+            "storage.days_left",
+            "Days until the disk is full",
+            "days",
+            storage["days_left"].clone(),
+        ),
+        guardrails: vec![
+            Figure::new(
+                "storage.free_bytes",
+                "Free disk",
+                "bytes",
+                storage["free_bytes"].clone(),
+            ),
+            Figure::new(
+                "storage.archive_growth",
+                "Transcript archive growth",
+                "bytes_per_day",
+                storage["growth_bytes_per_day"].clone(),
+            ),
+            Figure::new(
+                "storage.database_ratio",
+                "Database against its log",
+                "ratio",
+                ratio,
+            ),
+            Figure::new(
+                "storage.test_database_bytes",
+                "Largest test database",
+                "bytes",
+                largest("bytes"),
+            ),
+            Figure::new(
+                "storage.test_database_schemas",
+                "Most test schemas",
+                "count",
+                largest("schemas"),
+            ),
+        ],
+    }
+}
+
+/// The four lines: the performance line's figures from `performance`
+/// ([`performance`]), the storage line's from `storage` (health.storage as
+/// [`super::storage::report`] gives it).
+pub(super) fn lines(storage: &Value, performance: &Value) -> Vec<Line> {
     vec![
-        Line {
-            name: "performance",
-            north_star: Figure::not_collected(
-                "performance.report_to_live",
-                "Time from report to live",
-                "ms",
-            ),
-            guardrails: Vec::new(),
-        },
-        Line {
-            name: "storage",
-            north_star: Figure::new(
-                "storage.days_left",
-                "Days until the disk is full",
-                "days",
-                storage["days_left"].clone(),
-            ),
-            guardrails: vec![
-                Figure::new(
-                    "storage.free_bytes",
-                    "Free disk",
-                    "bytes",
-                    storage["free_bytes"].clone(),
-                ),
-                Figure::new(
-                    "storage.archive_growth",
-                    "Transcript archive growth",
-                    "bytes_per_day",
-                    storage["growth_bytes_per_day"].clone(),
-                ),
-                Figure::new(
-                    "storage.database_ratio",
-                    "Database against its log",
-                    "ratio",
-                    ratio,
-                ),
-                Figure::new(
-                    "storage.test_database_bytes",
-                    "Largest test database",
-                    "bytes",
-                    largest("bytes"),
-                ),
-                Figure::new(
-                    "storage.test_database_schemas",
-                    "Most test schemas",
-                    "count",
-                    largest("schemas"),
-                ),
-            ],
-        },
+        performance_line(performance),
+        storage_line(storage),
         Line {
             name: "observability",
             north_star: Figure::not_collected(
@@ -347,14 +451,20 @@ pub(super) fn core_lines_at(
     store: &spawn_postgres::PostgresStore,
     path: Option<&std::path::Path>,
 ) -> Result<Value, String> {
-    let storage = super::storage::report(store, super::now_ms())?;
+    let now_ms = super::now_ms();
+    let storage = super::storage::report(store, now_ms)?;
+    let performance = performance_now(store, now_ms);
     let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
-    Ok(answer(&lines(&storage), &file, read_ranges(path)))
+    Ok(answer(
+        &lines(&storage, &performance),
+        &file,
+        read_ranges(path),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Figure, answer, figure_json, lines, parse_ranges, read_ranges};
+    use super::{Figure, answer, figure_json, lines, parse_ranges, performance, read_ranges};
     use serde_json::{Value, json};
 
     const KNOWN: [&str; 3] = ["a.one", "a.two", "a.three"];
@@ -458,7 +568,11 @@ mod tests {
                 {"role": "x", "bytes": 9, "schemas": 1},
             ],
         });
-        let view = answer(&lines(&storage), &json!("/ws/core-lines.json"), Ok(None));
+        let view = answer(
+            &lines(&storage, &Value::Null),
+            &json!("/ws/core-lines.json"),
+            Ok(None),
+        );
         let names: Vec<&str> = view["lines"]
             .as_array()
             .expect("lines")
@@ -491,16 +605,83 @@ mod tests {
             ]
         );
         // No log size: no ratio; no readable test database: none.
-        let bare =
-            lines(&json!({"database": {"bytes": 300, "log_bytes": 0}, "test_databases": []}));
+        let bare = lines(
+            &json!({"database": {"bytes": 300, "log_bytes": 0}, "test_databases": []}),
+            &Value::Null,
+        );
         assert_eq!(bare[1].guardrails[2].value, Value::Null);
         assert_eq!(bare[1].guardrails[3].value, Value::Null);
+        // The performance line without its figures: nothing collected.
+        assert_eq!(view["lines"][0]["north_star"]["state"], "not_collected");
+        assert_eq!(
+            view["lines"][0]["guardrails"].as_array().map(Vec::len),
+            Some(4)
+        );
         // The other north stars are not collected, with no guardrails.
-        for index in [0, 2, 3] {
+        for index in [2, 3] {
             assert_eq!(view["lines"][index]["north_star"]["state"], "not_collected");
             assert_eq!(view["lines"][index]["guardrails"], json!([]));
         }
         assert_eq!(view["ranges_error"], Value::Null);
         assert_eq!(view["ignored_ranges"], json!([]));
+    }
+
+    /// Objective 086: the performance line from a scorecard and a cost
+    /// answer, as the pages give them.
+    #[test]
+    fn the_performance_line_reads_the_scorecards_fleet_and_the_cost_window() {
+        let scorecard = json!({"scopes": [
+            {"scope": "mission", "mission": 1, "dimensions": {
+                "report_to_live": {"value": 1}, "gate_time": {"value": 1}}},
+            {"scope": "fleet", "mission": null, "dimensions": {
+                "report_to_live": {"value": 5_520_000, "n": 4},
+                "gate_time": {"value": 600_000, "total_ms": 5_100_000, "undecided_ms": 300_000},
+                "first_pass": {"value": 0.749},
+            }},
+        ]});
+        let cost = json!({"usd_per_landing": 8.08});
+        let values = performance(&scorecard, &cost);
+        assert_eq!(values["report_to_live"], json!(5_520_000));
+        assert_eq!(values["gate_time"], json!(600_000));
+        let share = values["decided_nothing"].as_f64().expect("a share");
+        assert!((share - 300_000.0 / 5_100_000.0).abs() < 1e-12, "{share}");
+        assert_eq!(values["first_pass"], json!(0.749));
+        assert_eq!(values["usd_per_landing"], json!(8.08));
+        let line = &lines(&json!({}), &values)[0];
+        let keys: Vec<&str> = std::iter::once(&line.north_star)
+            .chain(&line.guardrails)
+            .map(|figure| figure.key)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "performance.report_to_live",
+                "performance.gate_time",
+                "performance.decided_nothing",
+                "performance.first_pass",
+                "performance.usd_per_landing",
+            ]
+        );
+        let units: Vec<&str> = line.guardrails.iter().map(|figure| figure.unit).collect();
+        assert_eq!(units, ["ms", "share", "share", "usd"]);
+        // A gate that spent nothing: no share, so not collected.
+        let idle = json!({"scopes": [{"scope": "fleet", "dimensions": {
+            "report_to_live": {"value": null},
+            "gate_time": {"value": null, "total_ms": 0, "undecided_ms": 0},
+            "first_pass": {"value": null}}}]});
+        let none = performance(&idle, &json!({"usd_per_landing": null}));
+        assert_eq!(
+            none,
+            json!({"report_to_live": null, "gate_time": null, "decided_nothing": null,
+                   "first_pass": null, "usd_per_landing": null})
+        );
+        let line = &lines(&json!({}), &none)[0];
+        assert!(
+            std::iter::once(&line.north_star)
+                .chain(&line.guardrails)
+                .all(|figure| figure_json(figure, None)["state"] == "not_collected")
+        );
+        // Neither answer read: every value null.
+        assert_eq!(performance(&Value::Null, &Value::Null), none);
     }
 }
