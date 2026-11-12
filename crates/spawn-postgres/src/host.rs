@@ -63,7 +63,8 @@ select jsonb_build_object(
                   where s.recorded_at_ms >= $1
                     and jsonb_typeof(s.sample -> f.field) = 'number'
                   order by s.recorded_at_ms, s.id limit 1))
-                 from unnest(array['archive_bytes', 'projects_bytes', 'database_bytes']) f(field)),
+                 from unnest(array['archive_bytes', 'projects_bytes', 'database_bytes',
+                             'session_backup_bytes']) f(field)),
   'before', (select s.sample from samples s where s.recorded_at_ms <= $2
               order by s.recorded_at_ms desc, s.id desc limit 1))";
 
@@ -127,6 +128,14 @@ const TEST_DATABASE_LIMIT: std::time::Duration = std::time::Duration::from_secs(
 /// A URL that does not parse, a server that cannot be reached, a statement
 /// that fails. The error never names the URL.
 pub fn test_database_size(url: &str) -> Result<Value, StoreError> {
+    test_database_read(url, &TEST_DATABASE_SIZE.replace("SCHEMAS_COUNT", SCHEMAS))
+}
+
+/// One read-only statement answering one jsonb value, on a connection of its
+/// own to the test database at `url` that gives up after
+/// [`TEST_DATABASE_LIMIT`] connecting and as long querying. The error never
+/// names the URL.
+fn test_database_read(url: &str, statement: &str) -> Result<Value, StoreError> {
     let mut config: postgres::Config = url.parse().map_err(|_: postgres::Error| {
         StoreError::Backend("the URL is not a postgres URL".to_string())
     })?;
@@ -142,9 +151,114 @@ pub fn test_database_size(url: &str) -> Result<Value, StoreError> {
         .connect(postgres::NoTls)
         .map_err(|error| crate::backend(&error))?;
     let row = client
-        .query_one(&TEST_DATABASE_SIZE.replace("SCHEMAS_COUNT", SCHEMAS), &[])
+        .query_one(statement, &[])
         .map_err(|error| crate::backend(&error))?;
     row.try_get(0).map_err(|error| crate::backend(&error))
+}
+
+/// A test database's schemas but `public` and the system's (objective 094),
+/// as `[{name, comment, held}]` by name: `comment` its comment (null
+/// without one), `held` whether a live session's `application_name` is its
+/// name. One statement over the catalogs (pg_namespace, its comments) and
+/// pg_stat_activity, taking no lock beyond catalog reads.
+const TEST_SCHEMAS: &str = r"
+select coalesce(jsonb_agg(jsonb_build_object(
+         'name', n.nspname,
+         'comment', obj_description(n.oid, 'pg_namespace'),
+         'held', exists (select 1 from pg_stat_activity a
+                          where a.application_name = n.nspname::text))
+       order by n.nspname), '[]'::jsonb)
+  from pg_namespace n
+ where n.nspname not like 'pg\_%' and n.nspname not in ('information_schema', 'public')";
+
+/// The schemas of the test database at `url` ([`TEST_SCHEMAS`]): one
+/// read-only statement on a connection of its own, which gives up after 5 s
+/// connecting and 5 s querying, as [`test_database_size`]'s.
+///
+/// # Errors
+///
+/// A URL that does not parse, a server that cannot be reached, a statement
+/// that fails. The error never names the URL.
+pub fn test_schemas(url: &str) -> Result<Value, StoreError> {
+    test_database_read(url, TEST_SCHEMAS)
+}
+
+/// The database a URL names, after libpq's defaults (objective 094): whether
+/// its server is this host's (a socket, or a loopback host), the port and
+/// the database name. Two spellings of one database (a socket against
+/// localhost or 127.0.0.1, an explicit 5432, another user) name the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseIdentity {
+    /// A Unix socket, localhost, or an address in 127.0.0.0/8 or ::1.
+    pub local: bool,
+    /// The host as named, for a server that is not local; empty for a
+    /// local one.
+    pub host: String,
+    pub port: u16,
+    pub database: String,
+}
+
+/// The database `url` names ([`DatabaseIdentity`]): libpq's defaults for
+/// what it leaves out (a socket when no host, `PGPORT` or 5432, the user's
+/// name as the database, the user `PGUSER` or the login). Never names the
+/// URL in its error.
+///
+/// # Errors
+///
+/// A URL that does not parse as a postgres URL or key-value string, or one
+/// naming more than one host.
+pub fn database_identity(url: &str) -> Result<DatabaseIdentity, String> {
+    let config: postgres::Config = url
+        .trim()
+        .parse()
+        .map_err(|_: postgres::Error| "not a postgres URL".to_string())?;
+    let hosts = config.get_hosts();
+    if hosts.len() > 1 {
+        return Err("names more than one host".to_string());
+    }
+    let (local, host) = match hosts.first() {
+        None | Some(postgres::config::Host::Unix(_)) => (true, String::new()),
+        Some(postgres::config::Host::Tcp(name)) => {
+            let bare = name.trim_start_matches('[').trim_end_matches(']');
+            let loopback = bare.eq_ignore_ascii_case("localhost")
+                || bare
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback());
+            if loopback {
+                (true, String::new())
+            } else {
+                (false, bare.to_ascii_lowercase())
+            }
+        }
+    };
+    let ports = config.get_ports();
+    if ports.len() > 1 {
+        return Err("names more than one port".to_string());
+    }
+    let port = match ports.first() {
+        Some(port) => *port,
+        None => std::env::var("PGPORT")
+            .ok()
+            .and_then(|port| port.trim().parse().ok())
+            .unwrap_or(5432),
+    };
+    let user = config
+        .get_user()
+        .map(str::to_string)
+        .or_else(|| std::env::var("PGUSER").ok())
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_default();
+    let database = config
+        .get_dbname()
+        .map(str::to_string)
+        .or_else(|| std::env::var("PGDATABASE").ok())
+        .unwrap_or(user);
+    Ok(DatabaseIdentity {
+        local,
+        host,
+        port,
+        database,
+    })
 }
 
 impl PostgresStore {

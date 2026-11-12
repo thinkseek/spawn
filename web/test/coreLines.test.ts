@@ -336,3 +336,13 @@ test("each drill row says its last pass, never passed, or no drill", () => {
   assert.equal(view.drills[3].text, "no drill");
   assert.equal(drillMark(null, now).text, "no drill");
 });
+
+// Objective 094: a test database URL file the reader refused is said by its
+// name and why, not as a figure not built.
+test("a refused test database URL file is said by its name and its reason", () => {
+  const view = coreLinesView({
+    lines: [],
+    ignored_ranges: [{ key: "storage.test_database_url_files.loose", reason: "mode 0644, not 0600" }],
+  });
+  assert.deepEqual(view.pending, ["test database URL file loose not used: mode 0644, not 0600"]);
+});

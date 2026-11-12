@@ -16,7 +16,9 @@
 //! reads the samples: monitoring only.
 
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 use spawn_postgres::PostgresStore;
@@ -35,20 +37,29 @@ pub(crate) const READ_LIMIT_MS: i64 = 300_000;
 /// `worker` is the thread computing it (none when it was read in place).
 /// `V` is what a reading gives: the figures' values for a sample, the whole
 /// answer for the alert step's guardrails (crate alerts/guardrails.rs).
+/// `computed` is how long the worker took to compute the answer, set
+/// before the answer is sent (cc-astra A24: the time the loop sees it
+/// includes its poll's wait too).
 pub(crate) struct Reading<V = Map<String, Value>> {
     answer: Receiver<Result<V, String>>,
     worker: Option<JoinHandle<()>>,
+    computed: Arc<OnceLock<Duration>>,
 }
 
 impl<V: Send + 'static> Reading<V> {
     /// A reading on a thread of its own.
     pub(crate) fn spawn(read: impl FnOnce() -> Result<V, String> + Send + 'static) -> Self {
         let (send, answer) = std::sync::mpsc::channel();
+        let computed = Arc::new(OnceLock::new());
+        let took = Arc::clone(&computed);
         let worker = std::thread::Builder::new()
             .name("core-lines-sample".to_string())
             .spawn(move || {
+                let begun = Instant::now();
+                let values = read();
+                let _ = took.set(begun.elapsed());
                 // The loop may have given the reading up: nobody listens.
-                let _ = send.send(read());
+                let _ = send.send(values);
             })
             .ok();
         if worker.is_none() {
@@ -58,9 +69,14 @@ impl<V: Send + 'static> Reading<V> {
             return Self {
                 answer,
                 worker: None,
+                computed: Arc::new(OnceLock::from(Duration::ZERO)),
             };
         }
-        Self { answer, worker }
+        Self {
+            answer,
+            worker,
+            computed,
+        }
     }
 
     /// A reading already done: `values`.
@@ -71,6 +87,7 @@ impl<V: Send + 'static> Reading<V> {
         Self {
             answer,
             worker: None,
+            computed: Arc::new(OnceLock::from(Duration::ZERO)),
         }
     }
 
@@ -85,6 +102,13 @@ impl<V: Send + 'static> Reading<V> {
     /// `Disconnected` when it ended without one.
     pub(crate) fn try_answer(&self) -> Result<Result<V, String>, TryRecvError> {
         self.answer.try_recv()
+    }
+
+    /// How long the worker took to compute its answer, once it has come
+    /// (set before it is sent): the calculation alone, without the time
+    /// the answer then waited to be looked at.
+    pub(crate) fn computed(&self) -> Option<Duration> {
+        self.computed.get().copied()
     }
 }
 

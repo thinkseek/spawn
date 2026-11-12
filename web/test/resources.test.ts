@@ -113,7 +113,9 @@ test("how long the disk lasts is said at the growth of what persists; the archiv
   assert.equal(view.lasts, "about 1,234 days at the growth of the archive, Claude Code's transcripts and the database");
   assert.equal(view.rows[0].note, "grows about 2.0 MB a day", "the archive's row: its own growth");
   const normalized = normalizeStorage({ ...STORAGE, growth_parts: { archive: 5, projects: null, database: 7 } });
-  assert.deepEqual(normalized?.growth_parts, { archive: 5, projects: null, database: 7 });
+  // An older server's three parts: the session backups' is null (objective 097).
+  assert.deepEqual(normalized?.growth_parts, { archive: 5, projects: null, database: 7, session_backups: null });
+  assert.equal(normalized?.growth_excluded, null);
   assert.equal(normalized?.persistent_growth_bytes_per_day, null);
   // Not yet measured: the archive keeps its growth, the disk has no days.
   const young = storageView({ ...STORAGE, growth_bytes_per_day: 2 * MB, persistent_growth_bytes_per_day: null, days_left: null });
@@ -195,7 +197,9 @@ test("the host section's Resources are followed by a Storage card drawn from sto
   const strip = readFileSync(new URL("../src/components/fleet/HealthStrip.tsx", import.meta.url), "utf8");
   assert.match(strip, /<Cell label="Storage"[^>]*>\s*<StorageCard storage=\{health\.storage\} backups=\{health\.backups\} \/>/);
   assert.match(strip, /backupView\(backups, now\)/, "the card's backup rows are drawn from backupView");
-  assert.match(strip, /const \{ rows, lasts, measured_from, lasts_from \} = storageView\(storage\)/);
+  assert.match(strip, /const \{ rows, lasts, lasts_note, measured_from, lasts_from \} = storageView\(storage\)/);
+  // Objective 097: the note that the session backups are not counted, under the line.
+  assert.match(strip, /\{lasts_note !== null && <p[^>]*>\{lasts_note\}<\/p>\}/);
   assert.match(strip, /How long the disk lasts: \$\{lasts_from !== null \? `measured from \$\{lasts_from\}` : measured_from === null \? "not measured yet" : `measured from \$\{measured_from\}`\}/);
   assert.ok(strip.indexOf('label="Resources"') < strip.indexOf('label="Storage"'));
 });
@@ -308,4 +312,38 @@ test("backupView: the database copy then the bundle, with their ages and keys", 
   assert.equal(backupAge(36_000_000), "10 h");
   assert.equal(backupAge(3 * 86_400_000), "3 d");
   assert.equal(backupAge(null), "no backup yet");
+});
+
+// Objective 097: how long the disk lasts names the session backups when
+// they are counted, and says so when they are left out.
+test("storageView counts the session backups or says they are not counted", () => {
+  const counted = storageView({
+    ...STORAGE,
+    days_left: 1234,
+    growth_parts: { archive: 1, projects: 1, database: 1, session_backups: 1 },
+    growth_excluded: [],
+  });
+  assert.equal(
+    counted.lasts,
+    "about 1,234 days at the growth of the archive, Claude Code's transcripts, the database and the session backups",
+  );
+  assert.equal(counted.lasts_note, null);
+  const excluded = storageView({
+    ...STORAGE,
+    days_left: 1234,
+    growth_parts: { archive: 1, projects: 1, database: 1, session_backups: null },
+    growth_excluded: ["session_backups"],
+  });
+  assert.equal(
+    excluded.lasts,
+    "about 1,234 days at the growth of the archive, Claude Code's transcripts and the database",
+  );
+  assert.equal(excluded.lasts_note, "session backups are not counted");
+  // Left out with no days left yet: the note still says so.
+  assert.equal(storageView({ ...STORAGE, days_left: null, growth_excluded: ["session_backups"] }).lasts_note,
+    "session backups are not counted");
+  // An older server lists nothing: 085's words, no note.
+  const older = storageView({ ...STORAGE, days_left: 1234 });
+  assert.equal(older.lasts, "about 1,234 days at the growth of the archive, Claude Code's transcripts and the database");
+  assert.equal(older.lasts_note, null);
 });

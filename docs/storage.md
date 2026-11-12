@@ -766,9 +766,27 @@ uses the disk:
     days between, rounded down; null without such a sample a day old. An
     older sample without `database_bytes` (from before 085) still counts
     for the other two. `archive` equals `growth_bytes_per_day`. Workspaces
-    are left out: checkouts come and go with tasks;
-  - `persistent_growth_bytes_per_day`: the parts' sum, null while any part
-    is null;
+    are left out: checkouts come and go with tasks. `session_backups`
+    (objective 097) is the session backups' growth.
+    /var/backups/spawn-sessions is root's (0700), and on btrfs each version
+    is a reflink copy, so the tree's apparent size says nothing of the
+    disk. The part is measured from the backups' status file instead,
+    named by `SPAWN_SESSION_BACKUP_STATUS` (no default): its
+    `estimated_bytes`, the sum of each kept version's `new_bytes`
+    (deploy/session-backup.sh). It is measured as the others, against the
+    oldest sample carrying `session_backup_bytes`. The loop's `host.storage`
+    sample records that number as `session_backup_bytes`; a sample whose
+    file does not read, or holds no such number, leaves it out and is
+    still written;
+  - `growth_excluded` (objective 097): the parts left out of the sum
+    because their source cannot be read now: `["session_backups"]` while
+    no status file reads, or the one that reads holds no
+    `estimated_bytes` number. A format change excludes the part; it never
+    nulls the whole forecast. It is `[]` otherwise. An excluded part is
+    null and not counted;
+  - `persistent_growth_bytes_per_day`: the counted parts' sum, null while
+    any counted part is null (a counted part with no sample a day old is
+    still null, and so is the sum);
   - `days_left`: `free_bytes` over `persistent_growth_bytes_per_day`,
     rounded down; null when it is null or not above zero.
 
@@ -780,8 +798,15 @@ uses the disk:
   Code transcripts" with "<files> files" (and ", down from <before>" when
   the count fell), "Workspaces", and "Database" with its largest table; and
   under them "about <days> days at the growth of the archive, Claude
-  Code's transcripts and the database" (or "How long the disk lasts: not
-  measured yet"). A size reads
+  Code's transcripts, the database and the session backups" when the
+  session backups are counted, "... Claude Code's transcripts and the
+  database" when they are not (or from an older server), or "How long the
+  disk lasts: not measured yet". While they are left out, a note under it
+  says "session backups are not counted". On live,
+  `SPAWN_SESSION_BACKUP_STATUS=/var/backups/spawn-sessions/status.json` is
+  set in the loop's and serve's environment (a lead step). The part is
+  null for a day after it is first set, and so are the sum and days left,
+  as after 085's deploy. A size reads
   "<n> MB" to one decimal under 1024 MB (1 MB is 1024 * 1024 bytes), "<n>
   GB" from there.
 
@@ -933,6 +958,89 @@ The observability line (objective 092) has the north star
 notices) that ended in the last 7 days (`cleared_at_ms` in the window), the
 share whose `outcome` is `cleared` (their condition cleared them, rather
 than the owner judging them false, stale or a duplicate); null with none.
+
+The storage line's last two guardrails (objective 094) are read only.
+They come after the frame's five.
+
+`storage.unowned_scratch_bytes`, "Scratch nobody owns" (bytes; null with
+no roots), is the bytes of the scratch nobody owns. The Core lines file
+names the roots: `"storage": {"scratch_roots": [<dir>], "scratch_exclude":
+[<path>]}`. Each top-level entry of a root is one of three:
+- owned: its `.spawn-owner` file, `<pid> <start ticks>` (the integrator's
+  pid file's form), names a process still running at that start time; or,
+  with no marker, something in it changed in the last 24 h;
+- gone: its marker names a process that does not run, or a pid now used by
+  another process;
+- idle: no marker, and nothing in it changed in 24 h.
+
+The figure is the gone and idle entries' file lengths. These are never
+counted:
+- symlinks, never followed at any depth (nor dated);
+- an entry holding a `*.jsonl` file;
+- `.transcripts`, and names starting `incident-` or ending `.pending` or
+  `-pending`;
+- `/data/recovery`, `/var/backups/spawn-sessions` and Claude Code's
+  projects directory, and anything under them or holding them;
+- the configured excludes.
+
+The answer lists `scratch` `{roots, unowned: [{path, bytes, reason:
+"gone"|"idle"}]}`, the 20 largest first.
+
+`storage.leaked_test_schemas`, "Leaked test schemas" (count; null when no
+test server answered), is the sum over the test servers of the schemas
+(not `public`, not the system's) left over by a test that is gone. All
+three must hold:
+- no live session's `application_name` is its name;
+- the `<pid>` of `spawn_test_<pid>_…` is no process on this host (a name
+  with no pid has no owner);
+- it was made at least 24 h ago, by its comment `{"made_at_ms": <ms>}`.
+  Without a comment that reads so, it is dated by its first sight. The
+  first sights are kept in `<workspace root>/test-schemas-seen.json`,
+  `{"<server>/<schema>": <ms>}`: a schema is added when first seen, a first
+  sight never moves, and a schema gone from a server that answered is
+  dropped.
+
+Every test schema is made so (`PostgresStore::connect_in_schema`,
+`TestSchema`, the spawn-postgres test helpers, `made_schema_sql`). Its
+connection's `application_name` is the schema's name, and it carries that
+comment.
+
+The test servers are read in this order:
+- `SPAWN_TEST_DATABASE_URL` ("test") and `SPAWN_FLEET_TEST_DATABASE_URL`
+  ("fleet_test");
+- each `storage.test_database_url_files` entry `{name, url_file}`.
+
+A URL file is used only when this user owns it as a regular file at mode
+0600, and its URL names a local socket or a loopback host. It must also
+not name the live database: that is compared by the database each URL
+names (local or not, port, database name, after libpq's defaults), so
+another spelling of it is refused too. A refused file is listed in
+`ignored_ranges` as `storage.test_database_url_files.<name>` with why. No
+URL is printed.
+
+Each server is read by one statement over `pg_namespace` and
+`pg_stat_activity` (`spawn_postgres::test_schemas`), on a connection of
+its own, 5 s connecting and 5 s querying. A server that does not answer is
+left out, and serve's log says why. The answer lists `test_schemas`
+`[{server, schemas, leaked}]`.
+
+Both are read on a thread of their own, at most every 10 minutes and kept
+between. A request, and the loop's sample, gets the kept reading and never
+waits; only the first read after start is waited for, at most 10 s, and
+until it ends the figures are not collected. A scratch walk is bounded to
+5 s and a million entries per root. One past its bound keeps the previous
+figure and says so in serve's log; it never gives a partial count.
+
+Nothing here removes, moves, renames or touches a file or a schema. A
+sweep is the owner's decision.
+
+The live file (a lead step):
+- `scratch_roots` `["/var/tmp/spawn"]` and `scratch_exclude`
+  `["/var/tmp/spawn/sync"]`;
+- ranges: scratch nobody owns max 2147483648 (2 GB), leaked test schemas
+  max 200;
+- on live the schema figure reads 0 for the first day, since no schema has
+  been seen 24 h before.
 
 The recoverability line (objective 087) has the north star
 `recoverability.restores_passed` (objective 093, below) and four guardrails: `recoverability.cloud_dump_age` and

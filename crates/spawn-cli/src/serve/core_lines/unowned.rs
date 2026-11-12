@@ -1,0 +1,593 @@
+//! The storage line's "scratch nobody owns" and "leaked test schemas"
+//! (objective 094), read in the background and kept.
+//!
+//! The Core lines file's `storage` names what to read, re-read at every
+//! request like the ranges:
+//!
+//! ```text
+//! "storage": {
+//!   "scratch_roots": [<dir>], "scratch_exclude": [<path>],
+//!   "test_database_url_files": [{"name", "url_file"}]
+//! }
+//! ```
+//!
+//! The scratch walk ([`super::scratch`]) and the test servers' schemas
+//! ([`super::schemas`]) are read at most every [`READ_EVERY_MS`], on a
+//! thread of their own: a request (and the loop's sample) serves the kept
+//! reading and never waits for a refresh. Only the first read after start
+//! is waited for, at most [`FIRST_WAIT`]; past that the figures are null
+//! (not collected) until it ends. A walk past its bound keeps the previous
+//! scratch figure and says so in the log, never a partial count; a test
+//! server that does not answer is left out and says why.
+//!
+//! Read only: nothing here removes, moves, renames or touches a file or a
+//! schema. No gate, integrator or deploy step reads any of it.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::time::Duration;
+
+use serde_json::{Value, json};
+
+use super::schemas::{self, UrlFile};
+use super::scratch::{self, Bound, Unowned};
+
+/// How long a reading is kept before it is read again.
+pub(super) const READ_EVERY_MS: i64 = 600_000;
+
+/// How long the first read after start is waited for.
+pub(super) const FIRST_WAIT: Duration = Duration::from_secs(10);
+
+/// How many entries nobody owns the answer lists, largest first.
+const LISTED: usize = 20;
+
+/// The file's `storage`: the scratch roots, the excludes and the URL files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Settings {
+    pub(super) roots: Vec<PathBuf>,
+    pub(super) excludes: Vec<PathBuf>,
+    pub(super) url_files: Vec<UrlFile>,
+}
+
+/// The `storage` of the Core lines file's `text` (`None`: no file): no
+/// roots, excludes or URL files where it names none.
+pub(super) fn settings(text: Option<&str>) -> Settings {
+    let Some(value) = text.and_then(|text| serde_json::from_str::<Value>(text).ok()) else {
+        return Settings::default();
+    };
+    let section = &value["storage"];
+    let paths = |field: &str| -> Vec<PathBuf> {
+        section[field]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .collect()
+    };
+    let url_files = section["test_database_url_files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            Some(UrlFile {
+                name: entry["name"].as_str()?.to_string(),
+                path: PathBuf::from(entry["url_file"].as_str()?),
+            })
+        })
+        .collect();
+    Settings {
+        roots: paths("scratch_roots"),
+        excludes: paths("scratch_exclude"),
+        url_files,
+    }
+}
+
+/// What one reading reads: the roots and excludes, the paths never counted,
+/// the test servers by name (the env's first, then the URL files taken), and
+/// where the first sights are kept. Its URLs are never printed.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(super) struct Plan {
+    pub(super) roots: Vec<PathBuf>,
+    pub(super) excludes: Vec<PathBuf>,
+    pub(super) never: Vec<PathBuf>,
+    pub(super) servers: Vec<(String, String)>,
+    pub(super) seen: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for Plan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Plan")
+            .field("roots", &self.roots)
+            .field("excludes", &self.excludes)
+            .field(
+                "servers",
+                &self
+                    .servers
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// The plan for `settings` now, and the URL files refused, each with why:
+/// the env's test servers (`SPAWN_TEST_DATABASE_URL` "test",
+/// `SPAWN_FLEET_TEST_DATABASE_URL` "fleet_test"), then each URL file
+/// [`schemas::url_from_file`] takes, compared with `SPAWN_DATABASE_URL`.
+pub(super) fn plan(settings: &Settings) -> (Plan, Vec<(String, String)>) {
+    let live = crate::env_value("SPAWN_DATABASE_URL");
+    let uid = spawn_host::process::current_uid();
+    let mut servers: Vec<(String, String)> = crate::alerts::test_database_urls()
+        .into_iter()
+        .map(|(role, url)| (role.to_string(), url.0))
+        .collect();
+    let mut refused = Vec::new();
+    for file in &settings.url_files {
+        match schemas::url_from_file(&file.path, live.as_deref(), uid) {
+            Ok(url) => servers.push((file.name.clone(), url)),
+            Err(why) => refused.push((file.name.clone(), why)),
+        }
+    }
+    let plan = Plan {
+        roots: settings.roots.clone(),
+        excludes: settings.excludes.clone(),
+        never: scratch::never_counted(&crate::storage::projects_path()),
+        servers,
+        seen: crate::env_value("SPAWN_WORKSPACE_ROOT")
+            .map(|root| PathBuf::from(root).join(schemas::SEEN_FILE)),
+    };
+    (plan, refused)
+}
+
+/// One test server's schemas, as read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Server {
+    pub(super) name: String,
+    pub(super) schemas: u64,
+    pub(super) leaked: u64,
+}
+
+/// One reading: the entries nobody owns (`None` with no roots, or before a
+/// walk within its bound), and the test servers that answered.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Reading {
+    pub(super) unowned: Option<Vec<Unowned>>,
+    pub(super) servers: Vec<Server>,
+}
+
+impl Reading {
+    /// `storage.unowned_scratch_bytes`: the entries' bytes, null with no
+    /// roots or no walk within its bound yet.
+    pub(super) fn unowned_bytes(&self) -> Value {
+        self.unowned.as_ref().map_or(Value::Null, |entries| {
+            json!(entries.iter().map(|entry| entry.bytes).sum::<u64>())
+        })
+    }
+
+    /// `storage.leaked_test_schemas`: the sum over the servers that
+    /// answered; null when none did.
+    pub(super) fn leaked(&self) -> Value {
+        if self.servers.is_empty() {
+            Value::Null
+        } else {
+            json!(self.servers.iter().map(|server| server.leaked).sum::<u64>())
+        }
+    }
+}
+
+/// The first sights when there is no workspace root to keep them under.
+static SEEN: Mutex<BTreeMap<String, i64>> = Mutex::new(BTreeMap::new());
+
+/// Read `plan` at `now_ms`: the scratch walk (each root within `bound`; past
+/// it the `previous` reading's entries are kept and the log says so) and
+/// each test server's schemas (one that does not answer is left out, and
+/// the log says why), the first sights brought up to date.
+pub(super) fn read(plan: &Plan, previous: Option<&Reading>, now_ms: i64, bound: Bound) -> Reading {
+    let unowned = if plan.roots.is_empty() {
+        None
+    } else {
+        match scratch::unowned(
+            &plan.roots,
+            &plan.excludes,
+            &plan.never,
+            now_ms,
+            &crate::integrate::still_runs,
+            bound,
+        ) {
+            Ok(entries) => Some(entries),
+            Err(why) => {
+                eprintln!("core-lines: scratch nobody owns: {why}; the previous figure is kept");
+                previous.and_then(|previous| previous.unowned.clone())
+            }
+        }
+    };
+    let mut seen = match &plan.seen {
+        Some(path) => schemas::read_seen(path),
+        None => SEEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+    };
+    let mut changed = false;
+    let mut servers = Vec::new();
+    for (name, url) in &plan.servers {
+        let listed = match spawn_postgres::test_schemas(url) {
+            Ok(listed) => listed,
+            Err(error) => {
+                eprintln!("core-lines: the test server {name} is left out: {error}");
+                continue;
+            }
+        };
+        let rows = listed.as_array().cloned().unwrap_or_default();
+        let names: Vec<&str> = rows.iter().filter_map(|row| row["name"].as_str()).collect();
+        changed |= schemas::update_seen(&mut seen, name, &names, now_ms);
+        servers.push(Server {
+            name: name.clone(),
+            schemas: u64::try_from(rows.len()).unwrap_or(u64::MAX),
+            leaked: schemas::leaked(&rows, name, &seen, now_ms, &schemas::pid_runs),
+        });
+    }
+    if changed {
+        match &plan.seen {
+            Some(path) => {
+                if let Err(why) = schemas::write_seen(path, &seen) {
+                    eprintln!("core-lines: the test schemas' first sights: {why}");
+                }
+            }
+            None => {
+                *SEEN
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = seen;
+            }
+        }
+    }
+    Reading { unowned, servers }
+}
+
+/// The answer's `scratch`: the roots, and the 20 largest entries nobody
+/// owns.
+pub(super) fn scratch_json(plan: &Plan, reading: Option<&Reading>) -> Value {
+    let unowned: Vec<Value> = reading
+        .and_then(|reading| reading.unowned.as_ref())
+        .into_iter()
+        .flatten()
+        .take(LISTED)
+        .map(|entry| {
+            json!({
+                "path": entry.path.display().to_string(),
+                "bytes": entry.bytes,
+                "reason": entry.reason.word(),
+            })
+        })
+        .collect();
+    json!({
+        "roots": plan.roots.iter().map(|root| root.display().to_string()).collect::<Vec<_>>(),
+        "unowned": unowned,
+    })
+}
+
+/// The answer's `test_schemas`: each server that answered, in order.
+pub(super) fn test_schemas_json(reading: Option<&Reading>) -> Value {
+    json!(
+        reading
+            .map(|reading| reading.servers.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .map(|server| json!({
+                "server": server.name,
+                "schemas": server.schemas,
+                "leaked": server.leaked,
+            }))
+            .collect::<Vec<_>>()
+    )
+}
+
+/// A reading kept, the plan it read and when.
+struct Kept {
+    at_ms: i64,
+    plan: Plan,
+    reading: Arc<Reading>,
+}
+
+#[derive(Default)]
+struct State {
+    kept: Option<Kept>,
+    refreshing: bool,
+}
+
+/// The kept reading and the one refresh at a time.
+#[derive(Default)]
+pub(super) struct Cache {
+    state: Mutex<State>,
+    done: Condvar,
+}
+
+/// Clears `refreshing` however the refresh ends (a panic too), and wakes
+/// whoever waits.
+struct Refreshing(Arc<Cache>);
+
+impl Drop for Refreshing {
+    fn drop(&mut self) {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .refreshing = false;
+        self.0.done.notify_all();
+    }
+}
+
+impl Cache {
+    /// The reading for `plan` at `now_ms`: the kept one when it read this
+    /// plan less than [`READ_EVERY_MS`] ago. Otherwise a refresh starts on a
+    /// thread of its own (one at a time) through `read` (the plan, the
+    /// previous reading, the moment), and the kept reading is served
+    /// without waiting; with none kept yet, the refresh is waited for at
+    /// most `first_wait`, and `None` past it.
+    pub(super) fn get(
+        self: &Arc<Self>,
+        plan: &Plan,
+        now_ms: i64,
+        first_wait: Duration,
+        read: impl FnOnce(&Plan, Option<&Reading>, i64) -> Reading + Send + 'static,
+    ) -> Option<Arc<Reading>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(kept) = state.kept.as_ref().filter(|kept| {
+            kept.plan == *plan && (0..READ_EVERY_MS).contains(&now_ms.saturating_sub(kept.at_ms))
+        }) {
+            return Some(Arc::clone(&kept.reading));
+        }
+        if !state.refreshing {
+            state.refreshing = true;
+            let cache = Arc::clone(self);
+            let previous = state.kept.as_ref().map(|kept| Arc::clone(&kept.reading));
+            let plan = plan.clone();
+            std::thread::spawn(move || {
+                let guard = Refreshing(Arc::clone(&cache));
+                let reading = Arc::new(read(&plan, previous.as_deref(), now_ms));
+                cache
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .kept = Some(Kept {
+                    at_ms: now_ms,
+                    plan,
+                    reading,
+                });
+                drop(guard);
+            });
+        }
+        if let Some(kept) = &state.kept {
+            return Some(Arc::clone(&kept.reading));
+        }
+        let (state, _) = self
+            .done
+            .wait_timeout_while(state, first_wait, |state| {
+                state.kept.is_none() && state.refreshing
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.kept.as_ref().map(|kept| Arc::clone(&kept.reading))
+    }
+}
+
+/// The process's cache.
+static CACHE: LazyLock<Arc<Cache>> = LazyLock::new(|| Arc::new(Cache::default()));
+
+/// What the answer gains: the reading (kept, or `None` while the first is
+/// out), the plan it is for, and the URL files refused, each with why.
+pub(super) struct Now {
+    pub(super) plan: Plan,
+    pub(super) reading: Option<Arc<Reading>>,
+    pub(super) refused: Vec<(String, String)>,
+}
+
+/// The reading for the Core lines file's `text` at `now_ms`, kept or
+/// refreshed in the background ([`Cache::get`]).
+pub(super) fn now(text: Option<&str>, now_ms: i64) -> Now {
+    let (plan, refused) = plan(&settings(text));
+    let reading = if plan.roots.is_empty() && plan.servers.is_empty() {
+        Some(Arc::new(Reading::default()))
+    } else {
+        CACHE.get(&plan, now_ms, FIRST_WAIT, |plan, previous, now_ms| {
+            read(plan, previous, now_ms, Bound::DEFAULT)
+        })
+    };
+    Now {
+        plan,
+        reading,
+        refused,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cache, Plan, READ_EVERY_MS, Reading, Server, read, settings};
+    use crate::serve::core_lines::scratch::{Bound, Reason, Unowned};
+    use serde_json::{Value, json};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
+
+    fn plan(root: &str) -> Plan {
+        Plan {
+            roots: vec![PathBuf::from(root)],
+            ..Plan::default()
+        }
+    }
+
+    fn reading(bytes: u64) -> Reading {
+        Reading {
+            unowned: Some(vec![Unowned {
+                path: PathBuf::from("/s/x"),
+                bytes,
+                reason: Reason::Idle,
+            }]),
+            servers: vec![Server {
+                name: "test".into(),
+                schemas: 3,
+                leaked: 1,
+            }],
+        }
+    }
+
+    #[test]
+    fn the_files_storage_names_the_roots_excludes_and_url_files() {
+        let read = settings(Some(
+            r#"{"ranges": {}, "storage": {"scratch_roots": ["/var/tmp/spawn", ""],
+                "scratch_exclude": ["/var/tmp/spawn/sync"],
+                "test_database_url_files": [{"name": "ccd", "url_file": "/x/ccd.url"},
+                                            {"name": "no file"}]}}"#,
+        ));
+        assert_eq!(read.roots, [PathBuf::from("/var/tmp/spawn")]);
+        assert_eq!(read.excludes, [PathBuf::from("/var/tmp/spawn/sync")]);
+        assert_eq!(read.url_files.len(), 1);
+        assert_eq!(read.url_files[0].name, "ccd");
+        assert_eq!(settings(None), super::Settings::default());
+        assert_eq!(settings(Some("{")), super::Settings::default());
+    }
+
+    #[test]
+    fn the_figures_are_the_bytes_and_the_sum_over_the_servers_that_answered() {
+        assert_eq!(reading(7).unowned_bytes(), json!(7));
+        assert_eq!(reading(7).leaked(), json!(1));
+        let none = Reading::default();
+        assert_eq!(none.unowned_bytes(), Value::Null, "no roots");
+        assert_eq!(none.leaked(), Value::Null, "no server answered");
+    }
+
+    /// The reads are kept between requests; a request during a refresh gets
+    /// the kept figure without waiting; the first read is waited for.
+    #[test]
+    fn a_reading_is_kept_and_a_refresh_never_holds_a_request() {
+        let cache = Arc::new(Cache::default());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = |bytes: u64| {
+            let reads = Arc::clone(&reads);
+            move |_: &Plan, _: Option<&Reading>, _: i64| {
+                reads.fetch_add(1, Ordering::SeqCst);
+                reading(bytes)
+            }
+        };
+        let first = cache
+            .get(&plan("/s"), 1000, Duration::from_secs(10), counted(1))
+            .expect("the first read is waited for");
+        assert_eq!(first.unowned_bytes(), json!(1));
+        let again = cache
+            .get(
+                &plan("/s"),
+                1000 + READ_EVERY_MS - 1,
+                Duration::from_secs(10),
+                counted(2),
+            )
+            .expect("kept");
+        assert_eq!(again.unowned_bytes(), json!(1), "kept, not read again");
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+
+        // Due again: the refresh blocks until released; the request is
+        // served the kept figure at once.
+        let (release, wait) = mpsc::channel::<()>();
+        let (started, began) = mpsc::channel::<()>();
+        let started_at = Instant::now();
+        let stale = cache
+            .get(
+                &plan("/s"),
+                1000 + READ_EVERY_MS,
+                Duration::from_secs(10),
+                move |_: &Plan, previous: Option<&Reading>, _: i64| {
+                    assert!(previous.is_some(), "the previous reading is passed on");
+                    let _ = started.send(());
+                    let _ = wait.recv();
+                    reading(3)
+                },
+            )
+            .expect("the kept reading");
+        assert!(started_at.elapsed() < Duration::from_secs(2), "no wait");
+        assert_eq!(stale.unowned_bytes(), json!(1));
+        began.recv().expect("the refresh started");
+        // Another request while it runs: kept, no second refresh.
+        let during = cache
+            .get(
+                &plan("/s"),
+                1000 + READ_EVERY_MS + 5,
+                Duration::from_secs(10),
+                counted(9),
+            )
+            .expect("kept");
+        assert_eq!(during.unowned_bytes(), json!(1));
+        release.send(()).expect("release");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let now = cache
+                .get(
+                    &plan("/s"),
+                    1000 + READ_EVERY_MS + 10,
+                    Duration::from_secs(10),
+                    counted(9),
+                )
+                .expect("kept");
+            if now.unowned_bytes() == json!(3) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the refresh is kept once done");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "counted(9) never ran");
+
+        // A first read that runs over the wait: not collected, no hang.
+        let slow = Arc::new(Cache::default());
+        let (unblock, blocked) = mpsc::channel::<()>();
+        let started_at = Instant::now();
+        let none = slow.get(
+            &plan("/s"),
+            0,
+            Duration::from_millis(100),
+            move |_: &Plan, _: Option<&Reading>, _: i64| {
+                let _ = blocked.recv();
+                reading(4)
+            },
+        );
+        assert!(none.is_none());
+        assert!(started_at.elapsed() < Duration::from_secs(2));
+        drop(unblock);
+    }
+
+    /// A walk past its bound keeps the previous figure, never a partial
+    /// count; with no previous one, not collected.
+    #[test]
+    fn a_walk_over_its_bound_keeps_the_previous_figure() {
+        let root = crate::storage::tests::scratch("unowned_bound");
+        for n in 0..10 {
+            let entry = root.join(format!("e{n}"));
+            std::fs::create_dir_all(&entry).expect("mkdir");
+            std::fs::write(entry.join("f"), b"x").expect("write");
+        }
+        let plan = Plan {
+            roots: vec![root.clone()],
+            ..Plan::default()
+        };
+        let tight = Bound {
+            entries: 3,
+            time: Duration::from_secs(5),
+        };
+        let kept = read(&plan, Some(&reading(42)), 0, tight);
+        assert_eq!(kept.unowned_bytes(), json!(42), "the previous figure");
+        assert_eq!(read(&plan, None, 0, tight).unowned_bytes(), Value::Null);
+        // Within the bound: the walk's own count (everything is idle at a
+        // moment far ahead).
+        let far = i64::MAX / 2;
+        assert_eq!(
+            read(&plan, Some(&reading(42)), far, Bound::DEFAULT).unowned_bytes(),
+            json!(10)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

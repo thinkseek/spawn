@@ -35,7 +35,10 @@ impl TestSchema {
     /// PID namespace the pid is the same on every run), and `n` counts the
     /// schemas this process named, so two cases started in the same
     /// nanosecond differ. The schema itself is made by whatever connects
-    /// in it first ([`TestSchema::store`], `PostgresStore::connect_in_schema`).
+    /// in it first ([`TestSchema::store`], `PostgresStore::connect_in_schema`),
+    /// which dates it with the comment `{"made_at_ms": <ms>}` and names the
+    /// connection after it (`application_name`, objective 094), so a reader
+    /// tells a live test's schema from a leftover.
     ///
     /// # Panics
     ///
@@ -170,6 +173,61 @@ mod tests {
     #[should_panic(expected = "a test schema's case is lowercase letters, digits and _")]
     fn a_case_that_is_no_bare_identifier_is_refused() {
         let _ = TestSchema::new("x; drop schema public");
+    }
+
+    /// Objective 094: a schema made through the guard carries its comment,
+    /// `{"made_at_ms": <ms>}` at the server's clock, and the store's
+    /// connection carries its name as `application_name`.
+    #[test]
+    fn a_schema_made_by_the_guard_carries_its_comment_and_its_session_name() {
+        let schema = TestSchema::new("guard_comment");
+        let url = std::env::var(super::TEST_DATABASE_URL).expect("the test database");
+        let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
+        let before: i64 = client
+            .query_one(
+                "select floor(extract(epoch from clock_timestamp()) * 1000)::bigint",
+                &[],
+            )
+            .expect("the clock")
+            .get(0);
+        let store = schema.store();
+        let row = client
+            .query_one(
+                "select obj_description(n.oid, 'pg_namespace'),
+                        (select count(*) from pg_stat_activity a
+                          where a.application_name = n.nspname::text)
+                   from pg_namespace n where n.nspname = $1",
+                &[&schema.name()],
+            )
+            .expect("the schema");
+        let comment: String = row.get(0);
+        let made: serde_json::Value = serde_json::from_str(&comment).expect("JSON");
+        let made_at = made["made_at_ms"].as_i64().expect("made_at_ms");
+        assert!(made_at >= before, "{made_at} is at or after {before}");
+        assert_eq!(
+            made.as_object().map(serde_json::Map::len),
+            Some(1),
+            "{made}"
+        );
+        assert_eq!(
+            row.get::<_, i64>(1),
+            1,
+            "the store's session is named after it"
+        );
+        // A second connection into it keeps the first comment.
+        let again = schema.store();
+        let kept: String = client
+            .query_one(
+                "select obj_description(n.oid, 'pg_namespace') from pg_namespace n
+                  where n.nspname = $1",
+                &[&schema.name()],
+            )
+            .expect("the schema")
+            .get(0);
+        assert_eq!(kept, comment);
+        drop(again);
+        drop(store);
+        drop(client);
     }
 
     #[test]

@@ -60,7 +60,11 @@
 //! [`nightly_facts`]). The recoverability north star and its two ages
 //! (objective 093) are the recovery table's drills, the rows the same file
 //! names under `recoverability` ([`drills`]); the answer lists them as
-//! `drills`. Later objectives add their figures to this frame.
+//! `drills`. The storage line's last two guardrails (objective 094) are the
+//! scratch nobody owns and the leaked test schemas, read in the background
+//! and kept ([`unowned`], [`scratch`], [`schemas`]); the answer lists
+//! `scratch` and `test_schemas`. Later objectives add their figures to this
+//! frame.
 //!
 //! No range lives in code: they come only from the ranges file,
 //! `SPAWN_CORE_LINES_FILE`, by default `<workspace root>/core-lines.json`,
@@ -79,6 +83,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 
 mod drills;
+mod schemas;
+mod scratch;
+mod unowned;
 
 /// The file's name under the workspace root, when `SPAWN_CORE_LINES_FILE`
 /// names none.
@@ -595,18 +602,35 @@ fn storage_line(storage: &Value) -> Line {
                 "count",
                 largest("schemas"),
             ),
+            // Objective 094, after the frame's five: read in the background
+            // and kept ([`unowned`]), set on `storage` by [`lines_at`].
+            Figure::new(
+                "storage.unowned_scratch_bytes",
+                "Scratch nobody owns",
+                "bytes",
+                storage["unowned_scratch_bytes"].clone(),
+            ),
+            Figure::new(
+                "storage.leaked_test_schemas",
+                "Leaked test schemas",
+                "count",
+                storage["leaked_test_schemas"].clone(),
+            ),
         ],
     }
 }
 
 /// The window of the observability north star: 7 days.
+#[cfg(test)]
 const WEEK_MS: i64 = 7 * 24 * 3_600_000;
 
 /// "Needs you is right" (objective 092): of the alerts (not notices) that
 /// ended in the 7 days up to `now_ms` (`cleared_at_ms` in the window), the
 /// share whose outcome is "cleared", their condition cleared them rather
 /// than the owner judging them false, stale or a duplicate; null with none.
-/// `alerts` are rows as `/api/alerts` gives them.
+/// `alerts` are rows as `/api/alerts` gives them. Not read live until A23
+/// replaces it: a condition clearing is not evidence the alert was right.
+#[cfg(test)]
 pub(super) fn needs_you_right(alerts: &Value, now_ms: i64) -> Value {
     let since = now_ms.saturating_sub(WEEK_MS);
     let (mut ended, mut right) = (0_u32, 0_u32);
@@ -823,14 +847,25 @@ pub(super) fn core_lines_at(
     let now_ms = super::now_ms();
     let contents = read_ranges(path);
     let text = contents.as_ref().ok().and_then(Option::as_deref);
-    let (figures, drills) = lines_at(store, nightly, text, now_ms)?;
+    let (figures, extras) = lines_at(store, nightly, text, now_ms)?;
     let samples = store
         .host_core_lines(trend_since(now_ms))
         .map_err(super::err)?;
     let samples = measured_samples(samples, store.first_deploy_finished_ms().ok().flatten());
     let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
     let mut view = answer(&figures, &file, contents, &trends(&samples, now_ms));
-    view["drills"] = drills;
+    view["drills"] = extras.drills;
+    view["scratch"] = extras.scratch;
+    view["test_schemas"] = extras.test_schemas;
+    // A URL file refused (objective 094) is said where a range left out is.
+    if let Some(ignored) = view["ignored_ranges"].as_array_mut() {
+        for (name, why) in extras.refused {
+            ignored.push(json!({
+                "key": format!("storage.test_database_url_files.{name}"),
+                "reason": why,
+            }));
+        }
+    }
     Ok(view)
 }
 
@@ -852,25 +887,40 @@ pub(super) fn measured_samples(mut samples: Value, first_deploy_ms: Option<i64>)
     samples
 }
 
+/// What the answer gains beside the lines: the drills (objective 093), the
+/// scratch nobody owns, each test server's schemas and the URL files
+/// refused (objective 094).
+struct Extras {
+    drills: Value,
+    scratch: Value,
+    test_schemas: Value,
+    refused: Vec<(String, String)>,
+}
+
 /// The four lines' figures, read at `now_ms` with the nightly's fact files
 /// in `nightly` and the Core lines file's contents `file` (its
-/// `recoverability` drills, objective 093), and the answer's `drills`.
+/// `recoverability` drills, objective 093; its `storage` scratch roots and
+/// test servers, objective 094), and what the answer gains beside them.
 fn lines_at(
     store: &spawn_postgres::PostgresStore,
     nightly: Option<&Path>,
     file: Option<&str>,
     now_ms: i64,
-) -> Result<(Vec<Line>, Value), String> {
-    let storage = super::storage::report(store, now_ms)?;
+) -> Result<(Vec<Line>, Extras), String> {
+    let mut storage = super::storage::report(store, now_ms)?;
+    let unowned = unowned::now(file, now_ms);
+    let reading = unowned.reading.as_deref();
+    storage["unowned_scratch_bytes"] = reading.map_or(Value::Null, unowned::Reading::unowned_bytes);
+    storage["leaked_test_schemas"] = reading.map_or(Value::Null, unowned::Reading::leaked);
     let (performance, cost_total) = performance_now(store, now_ms);
     let health = store.fleet_health().map_err(super::err)?;
-    let alerts = store
-        .alerts(now_ms.saturating_sub(WEEK_MS))
-        .map_err(super::err)?;
     let observed = Observed {
         cost_total,
         human_per_agent_hour: health["human_per_agent_hour"].clone(),
-        needs_you_right: needs_you_right(&alerts, now_ms),
+        // Not collected until A22/A23 land (owner, 2026-11-12): the share of
+        // alerts whose condition cleared them is not whether they were right
+        // (sync/astra/findings.md A23), so it is not shown as the north star.
+        needs_you_right: Value::Null,
     };
     let backups = store.newest_backups().map_err(super::err)?;
     let facts = nightly_facts(nightly);
@@ -885,7 +935,12 @@ fn lines_at(
             drills.north_star.value,
             guardrails,
         ),
-        drills.list,
+        Extras {
+            drills: drills.list,
+            scratch: unowned::scratch_json(&unowned.plan, reading),
+            test_schemas: unowned::test_schemas_json(reading),
+            refused: unowned.refused,
+        },
     ))
 }
 
@@ -1019,6 +1074,7 @@ mod tests {
                 {"role": "fleet_test", "bytes": null, "schemas": null},
                 {"role": "x", "bytes": 9, "schemas": 1},
             ],
+            "unowned_scratch_bytes": 401_000, "leaked_test_schemas": 4,
         });
         let view = answer(
             &lines(
@@ -1061,6 +1117,8 @@ mod tests {
                 ("storage.database_ratio", json!(3.0)),
                 ("storage.test_database_bytes", json!(9)),
                 ("storage.test_database_schemas", json!(3)),
+                ("storage.unowned_scratch_bytes", json!(401_000)),
+                ("storage.leaked_test_schemas", json!(4)),
             ]
         );
         // No log size: no ratio; no readable test database: none.
@@ -1560,11 +1618,11 @@ mod tests {
         );
         let values = super::values_of(&figures);
         // The count not measured always has a value (objective 088): the
-        // other 13 figures that have none.
+        // other 15 figures that have none (objective 094's two among them).
         assert_eq!(
             Value::Object(values),
             json!({"storage.free_bytes": 3, "storage.days_left": 9,
-                   "observability.not_measured": 13})
+                   "observability.not_measured": 15})
         );
     }
 
@@ -1575,6 +1633,7 @@ mod tests {
             "days_left": 1234, "free_bytes": 104, "growth_bytes_per_day": 10,
             "database": {"bytes": 300, "log_bytes": 100},
             "test_databases": [{"bytes": 7, "schemas": 3}],
+            "unowned_scratch_bytes": 0, "leaked_test_schemas": 0,
         });
         let tokens = |input: u64, cache_read: u64, unpriced: u64| {
             json!({"usd": 0.9, "tokens": {"input": input, "output": 0, "cache_write": 0,
