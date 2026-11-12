@@ -156,8 +156,8 @@ pub(super) fn leaked(
             if pid_of(name).is_some_and(runs) {
                 return false;
             }
-            let made = made_at(&schema["comment"])
-                .or_else(|| seen.get(&seen_key(server, name)).copied());
+            let made =
+                made_at(&schema["comment"]).or_else(|| seen.get(&seen_key(server, name)).copied());
             made.is_some_and(|made| now_ms.saturating_sub(made) >= IDLE_MS)
         })
         .count();
@@ -222,12 +222,22 @@ mod tests {
         let live = "postgres://spawn@%2Fvar%2Frun%2Fpostgresql/spawn_live";
         let check = |path: &Path| url_from_file(path, Some(live), me);
 
-        let socket = url_file(dir, "socket", "postgres://bb@%2Fvar%2Frun%2Fpostgresql/spawn_test", 0o600);
+        let socket = url_file(
+            dir,
+            "socket",
+            "postgres://bb@%2Fvar%2Frun%2Fpostgresql/spawn_test",
+            0o600,
+        );
         assert_eq!(
             check(&socket).as_deref(),
             Ok("postgres://bb@%2Fvar%2Frun%2Fpostgresql/spawn_test")
         );
-        let loopback = url_file(dir, "loopback", "postgres://bb:pw@127.0.0.1:5433/spawn_test", 0o600);
+        let loopback = url_file(
+            dir,
+            "loopback",
+            "postgres://bb:pw@127.0.0.1:5433/spawn_test",
+            0o600,
+        );
         assert!(check(&loopback).is_ok());
         let localhost = url_file(dir, "localhost", "postgresql://bb@localhost/other", 0o600);
         assert!(check(&localhost).is_ok());
@@ -242,17 +252,74 @@ mod tests {
                 "the reason never holds the URL: {why}"
             );
         };
-        refused(&url_file(dir, "loose", "postgres://bb@127.0.0.1/spawn_test", 0o644), "mode 0644");
-        refused(&url_file(dir, "group", "postgres://bb@127.0.0.1/spawn_test", 0o640), "mode 0640");
-        refused(&url_file(dir, "remote", "postgres://bb@192.0.2.1:5432/spawn_test", 0o600), "not this one's");
-        refused(&url_file(dir, "named", "postgres://bb@db.example.com/spawn_test", 0o600), "not this one's");
+        refused(
+            &url_file(dir, "loose", "postgres://bb@127.0.0.1/spawn_test", 0o644),
+            "mode 0644",
+        );
+        refused(
+            &url_file(dir, "group", "postgres://bb@127.0.0.1/spawn_test", 0o640),
+            "mode 0640",
+        );
+        refused(
+            &url_file(
+                dir,
+                "remote",
+                "postgres://bb@192.0.2.1:5432/spawn_test",
+                0o600,
+            ),
+            "not this one's",
+        );
+        refused(
+            &url_file(
+                dir,
+                "named",
+                "postgres://bb@db.example.com/spawn_test",
+                0o600,
+            ),
+            "not this one's",
+        );
         refused(&url_file(dir, "live", live, 0o600), "live database");
-        refused(&url_file(dir, "live_tcp", "postgres://spawn@127.0.0.1/spawn_live", 0o600), "live database");
-        refused(&url_file(dir, "live_port", "postgres://spawn@localhost:5432/spawn_live", 0o600), "live database");
-        refused(&url_file(dir, "live_user", "postgres://someone_else:pw@[::1]:5432/spawn_live", 0o600), "live database");
-        refused(&url_file(dir, "garbage", "not a url at all ===", 0o600), "postgres URL");
+        refused(
+            &url_file(
+                dir,
+                "live_tcp",
+                "postgres://spawn@127.0.0.1/spawn_live",
+                0o600,
+            ),
+            "live database",
+        );
+        refused(
+            &url_file(
+                dir,
+                "live_port",
+                "postgres://spawn@localhost:5432/spawn_live",
+                0o600,
+            ),
+            "live database",
+        );
+        refused(
+            &url_file(
+                dir,
+                "live_user",
+                "postgres://someone_else:pw@[::1]:5432/spawn_live",
+                0o600,
+            ),
+            "live database",
+        );
+        refused(
+            &url_file(dir, "garbage", "not a url at all ===", 0o600),
+            "postgres URL",
+        );
         // Another port is another server's database.
-        assert!(check(&url_file(dir, "other_port", "postgres://spawn@127.0.0.1:5433/spawn_live", 0o600)).is_ok());
+        assert!(
+            check(&url_file(
+                dir,
+                "other_port",
+                "postgres://spawn@127.0.0.1:5433/spawn_live",
+                0o600
+            ))
+            .is_ok()
+        );
         // Not this user's: checked against another uid.
         let why = url_from_file(&socket, Some(live), me.wrapping_add(1)).expect_err("not mine");
         assert!(why.contains("not owned by this user"), "{why}");
@@ -268,7 +335,10 @@ mod tests {
         assert_eq!(pid_of("spawn_test_x_0"), None);
         assert_eq!(pid_of("bb_other"), None);
         assert_eq!(pid_of("spawn_test__0"), None);
-        assert_eq!(made_at(&json!("{\"made_at_ms\": 1731400000000}")), Some(1_731_400_000_000));
+        assert_eq!(
+            made_at(&json!("{\"made_at_ms\": 1731400000000}")),
+            Some(1_731_400_000_000)
+        );
         assert_eq!(made_at(&json!("made by hand")), None);
         assert_eq!(made_at(&json!(null)), None);
         assert_eq!(made_at(&json!("{\"made\": 1}")), None);
@@ -303,14 +373,27 @@ mod tests {
             ("spare/kept".to_string(), day_ago),
         ]);
         assert!(update_seen(&mut seen, "test", &names, now));
-        assert_eq!(seen["test/spawn_test_9_a_seen"], day_ago, "a first sight never moves");
+        assert_eq!(
+            seen["test/spawn_test_9_a_seen"], day_ago,
+            "a first sight never moves"
+        );
         assert_eq!(seen["test/spawn_test_9_a_unseen"], now, "first seen now");
-        assert!(!seen.contains_key("test/gone_since"), "a schema no longer there is dropped");
+        assert!(
+            !seen.contains_key("test/gone_since"),
+            "a schema no longer there is dropped"
+        );
         assert_eq!(seen["spare/kept"], day_ago, "another server's entries stay");
-        assert!(!update_seen(&mut seen, "test", &names, now + 1), "nothing new");
+        assert!(
+            !update_seen(&mut seen, "test", &names, now + 1),
+            "nothing new"
+        );
         // Process 7 runs; 9 does not.
         let runs = |pid: u32| pid == 7;
-        assert_eq!(leaked(&schemas, "test", &seen, now, &runs), 3, "old, seen and bb_other");
+        assert_eq!(
+            leaked(&schemas, "test", &seen, now, &runs),
+            3,
+            "old, seen and bb_other"
+        );
         // A day on, the never-seen and the bad-comment ones are leftovers too.
         assert_eq!(leaked(&schemas, "test", &seen, now + 25 * HOUR, &runs), 6);
     }
@@ -340,9 +423,12 @@ mod tests {
     /// first seen 25 h ago and never seen, a bad comment, no pid.
     #[test]
     fn the_test_database_read_counts_only_the_leftovers() {
-        let url = std::env::var("SPAWN_TEST_DATABASE_URL")
-            .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip");
-        let mut exited = std::process::Command::new("true").spawn().expect("a process");
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let mut exited = std::process::Command::new("true")
+            .spawn()
+            .expect("a process");
         let dead = exited.id();
         exited.wait().expect("it exits");
         assert!(!super::pid_runs(dead), "process {dead} is gone");
@@ -390,7 +476,10 @@ mod tests {
         ] {
             sql.push_str(&format!("comment on schema {name} is {}; ", comment(at)));
         }
-        sql.push_str(&format!("comment on schema {} is 'made by hand'; ", names[6]));
+        sql.push_str(&format!(
+            "comment on schema {} is 'made by hand'; ",
+            names[6]
+        ));
         client.batch_execute(&sql).expect("make the schemas");
         // A live session holding the first, as a running test's store.
         let mut holder = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
@@ -403,7 +492,11 @@ mod tests {
             .as_array()
             .expect("an array")
             .iter()
-            .filter(|schema| schema["name"].as_str().is_some_and(|name| name.contains(&token)))
+            .filter(|schema| {
+                schema["name"]
+                    .as_str()
+                    .is_some_and(|name| name.contains(&token))
+            })
             .cloned()
             .collect();
         assert_eq!(mine.len(), 8, "{mine:?}");
@@ -421,7 +514,10 @@ mod tests {
             (format!("test/{}", names[4]), day_ago),
             (format!("test/{}", names[7]), day_ago),
         ]);
-        let listed: Vec<&str> = mine.iter().filter_map(|schema| schema["name"].as_str()).collect();
+        let listed: Vec<&str> = mine
+            .iter()
+            .filter_map(|schema| schema["name"].as_str())
+            .collect();
         update_seen(&mut seen, "test", &listed, now);
         assert_eq!(
             leaked(&mine, "test", &seen, now, &super::pid_runs),

@@ -204,8 +204,16 @@ mod tests {
         let made: serde_json::Value = serde_json::from_str(&comment).expect("JSON");
         let made_at = made["made_at_ms"].as_i64().expect("made_at_ms");
         assert!(made_at >= before, "{made_at} is at or after {before}");
-        assert_eq!(made.as_object().map(serde_json::Map::len), Some(1), "{made}");
-        assert_eq!(row.get::<_, i64>(1), 1, "the store's session is named after it");
+        assert_eq!(
+            made.as_object().map(serde_json::Map::len),
+            Some(1),
+            "{made}"
+        );
+        assert_eq!(
+            row.get::<_, i64>(1),
+            1,
+            "the store's session is named after it"
+        );
         // A second connection into it keeps the first comment.
         let again = schema.store();
         let kept: String = client

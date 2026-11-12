@@ -105,7 +105,11 @@ impl std::fmt::Debug for Plan {
             .field("excludes", &self.excludes)
             .field(
                 "servers",
-                &self.servers.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+                &self
+                    .servers
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
             )
             .finish_non_exhaustive()
     }
@@ -478,7 +482,12 @@ mod tests {
             .expect("the first read is waited for");
         assert_eq!(first.unowned_bytes(), json!(1));
         let again = cache
-            .get(&plan("/s"), 1000 + READ_EVERY_MS - 1, Duration::from_secs(10), counted(2))
+            .get(
+                &plan("/s"),
+                1000 + READ_EVERY_MS - 1,
+                Duration::from_secs(10),
+                counted(2),
+            )
             .expect("kept");
         assert_eq!(again.unowned_bytes(), json!(1), "kept, not read again");
         assert_eq!(reads.load(Ordering::SeqCst), 1);
@@ -506,14 +515,24 @@ mod tests {
         began.recv().expect("the refresh started");
         // Another request while it runs: kept, no second refresh.
         let during = cache
-            .get(&plan("/s"), 1000 + READ_EVERY_MS + 5, Duration::from_secs(10), counted(9))
+            .get(
+                &plan("/s"),
+                1000 + READ_EVERY_MS + 5,
+                Duration::from_secs(10),
+                counted(9),
+            )
             .expect("kept");
         assert_eq!(during.unowned_bytes(), json!(1));
         release.send(()).expect("release");
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let now = cache
-                .get(&plan("/s"), 1000 + READ_EVERY_MS + 10, Duration::from_secs(10), counted(9))
+                .get(
+                    &plan("/s"),
+                    1000 + READ_EVERY_MS + 10,
+                    Duration::from_secs(10),
+                    counted(9),
+                )
                 .expect("kept");
             if now.unowned_bytes() == json!(3) {
                 break;
@@ -565,7 +584,10 @@ mod tests {
         // Within the bound: the walk's own count (everything is idle at a
         // moment far ahead).
         let far = i64::MAX / 2;
-        assert_eq!(read(&plan, Some(&reading(42)), far, Bound::DEFAULT).unowned_bytes(), json!(10));
+        assert_eq!(
+            read(&plan, Some(&reading(42)), far, Bound::DEFAULT).unowned_bytes(),
+            json!(10)
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

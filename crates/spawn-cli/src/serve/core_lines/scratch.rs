@@ -114,7 +114,9 @@ fn mtime_ms(metadata: &std::fs::Metadata) -> i64 {
         .modified()
         .ok()
         .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+        .map_or(0, |since| {
+            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 /// The walk's budget: entries left and when it must end.
@@ -219,7 +221,8 @@ pub(super) fn unowned_in(
             bound.time.as_millis()
         )
     };
-    let entries = std::fs::read_dir(root).map_err(|error| format!("{}: {error}", root.display()))?;
+    let entries =
+        std::fs::read_dir(root).map_err(|error| format!("{}: {error}", root.display()))?;
     let mut unowned = Vec::new();
     for entry in entries.flatten() {
         if !budget.take() {
@@ -233,9 +236,7 @@ pub(super) fn unowned_in(
             continue;
         }
         let name = entry.file_name();
-        if fixed_name(&name.to_string_lossy())
-            || related(&path, never)
-            || related(&path, excludes)
+        if fixed_name(&name.to_string_lossy()) || related(&path, never) || related(&path, excludes)
         {
             continue;
         }
@@ -491,7 +492,10 @@ mod tests {
                 time: Duration::from_secs(5),
             },
         );
-        assert!(over.as_ref().is_err_and(|why| why.contains("ran over")), "{over:?}");
+        assert!(
+            over.as_ref().is_err_and(|why| why.contains("ran over")),
+            "{over:?}"
+        );
         let timed = unowned(
             std::slice::from_ref(&root),
             &[],
