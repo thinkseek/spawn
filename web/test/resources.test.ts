@@ -134,3 +134,52 @@ test("the host section's Resources are followed by a Storage card drawn from sto
   assert.match(strip, /const \{ rows, lasts \} = storageView\(storage\)/);
   assert.ok(strip.indexOf('label="Resources"') < strip.indexOf('label="Storage"'));
 });
+
+// Objective 074: the test databases the server is given, with their
+// schemas, and the live event log's size beside the database's.
+
+const TESTED = {
+  ...STORAGE,
+  database: { ...STORAGE.database, log_bytes: 35 * MB },
+  test_databases: [
+    { role: "test", name: "spawn_test", bytes: 20 * MB, schemas: 0 },
+    { role: "fleet_test", name: "spawn_fleet_test", bytes: 2.7 * GIB, schemas: 2533 },
+  ],
+};
+
+test("the test databases follow the database, the gates' first, each with its schemas", () => {
+  const { rows } = storageView(TESTED);
+  assert.deepEqual(rows.slice(3), [
+    { name: "Database", size: "2.7 GB", note: "largest: spawn_events 2.5 GB, log 35.0 MB" },
+    { name: "Gate test database", size: "20.0 MB", note: "0 schemas" },
+    { name: "Fleet test database", size: "2.7 GB", note: "2,533 schemas" },
+  ]);
+});
+
+test("no test database, no row; the log alone when there is no largest table", () => {
+  const without = storageView({ ...TESTED, test_databases: [] }).rows;
+  assert.equal(without.find((row) => /test database/.test(row.name)), undefined);
+  assert.equal(without.length, 4);
+  const older = storageView(STORAGE).rows;
+  assert.equal(older.length, 4, "an older server reports none");
+  const tableless = storageView({ ...TESTED, database: { bytes: MB, tables: [], log_bytes: 2 * MB } }).rows;
+  assert.equal(tableless[3].note, "log 2.0 MB");
+  const fleetOnly = storageView({ ...TESTED, test_databases: [TESTED.test_databases[1]] }).rows;
+  assert.deepEqual(
+    fleetOnly.slice(4).map((row) => row.name),
+    ["Fleet test database"],
+  );
+});
+
+test("a test database the server could not read is said unreadable, and kept", () => {
+  const storage = normalizeStorage({
+    ...TESTED,
+    test_databases: [{ role: "test", name: null, bytes: null, schemas: null, error: "refused" }, { bad: 1 }],
+  });
+  assert.deepEqual(storage?.test_databases, [{ role: "test", name: null, bytes: null, schemas: null }]);
+  assert.equal(storage?.database?.log_bytes, 35 * MB);
+  const row = storageView(storage).rows[4];
+  assert.deepEqual(row, { name: "Gate test database", size: "—", note: "unreadable" });
+  assert.deepEqual(normalizeStorage(STORAGE)?.test_databases, []);
+  assert.equal(normalizeStorage(STORAGE)?.database?.log_bytes, null);
+});
