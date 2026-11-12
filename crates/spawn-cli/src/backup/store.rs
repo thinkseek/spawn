@@ -997,35 +997,59 @@ fn single_put(key: &str, etag: &str) -> Result<(), String> {
 /// `<file>.spawn-store-get.partial` (cc-astra A37).
 pub(crate) const PARTIAL_MARK: &str = ".spawn-store-get.partial";
 
-/// Write a rebuilt file into `into` (`get`, cc-astra A29 and A37): through
-/// descriptors from `into` down, no parent followed through a symlink,
-/// written to its partial name and named once whole, never over anything,
-/// never removing anything (spawn-host's `create_with`). Refused when
-/// anything is already at the path or at its partial name; a failed write
-/// leaves the partial file and names it.
+/// Write a rebuilt file into `into` (`get`, cc-astra A29, A37 and A38):
+/// through descriptors from `into` down, no parent followed through a
+/// symlink, written to a file with no name, read back through its
+/// descriptor and compared with `bytes`, and only then that file named,
+/// never over anything, never removing anything (spawn-host's
+/// `create_with`). Refused when anything is already at the path or at its
+/// partial name; a failed write or comparison leaves the bytes at the
+/// partial name and names it.
 pub(crate) fn restore(into: &Path, path: &str, bytes: &[u8]) -> Result<(), String> {
-    restore_with(into, path, |file| file.write_all(bytes))
+    restore_with(into, path, bytes, |file| file.write_all(bytes))
 }
 
-/// [`restore`] with the write given (a test fails it midway).
+/// [`restore`] with the write given (a test fails it midway, or changes the
+/// file under it); what is read back must be `bytes`.
 pub(crate) fn restore_with(
     into: &Path,
     path: &str,
+    bytes: &[u8],
     write: impl FnOnce(&mut File) -> std::io::Result<()>,
 ) -> Result<(), String> {
     use spawn_host::agent_files::Created;
+    use std::io::Read as _;
     let relative = spawn_host::tree_path::TreePath::from_bytes(path.as_bytes());
-    match spawn_host::agent_files::create_with(into, &relative, PARTIAL_MARK, write) {
+    // The bytes as the descriptor reads them, one byte past the expected
+    // length so a longer file is seen.
+    let confirm = |file: &mut File| {
+        let mut held = Vec::with_capacity(bytes.len());
+        file.take(bytes.len() as u64 + 1).read_to_end(&mut held)?;
+        if held == bytes {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "the file holds {} bytes, not the {} verified (changed while written)",
+                held.len(),
+                bytes.len()
+            )))
+        }
+    };
+    match spawn_host::agent_files::create_with(into, &relative, PARTIAL_MARK, write, confirm) {
         Ok(Created::Written) => Ok(()),
         Ok(Created::Exists(taken)) => Err(format!(
             "refused: {} already holds something at {taken}; nothing written",
             into.display()
         )),
         Ok(Created::Partial { partial, why }) => Err(format!(
-            "{path}: not restored ({why}); the bytes written so far are left at {} \
+            "{path}: not restored ({why}); the bytes written are left at {} \
 (a partial restore: nothing was removed, and a restore into the same place refuses until \
 it is moved away)",
             into.join(partial.as_path()).display()
+        )),
+        Ok(Created::Unkept { why }) => Err(format!(
+            "{path}: not restored ({why}); the bytes written have no name: nothing was \
+named, moved or removed"
         )),
         Err(error) => Err(format!("refused: {path} under {}: {error}", into.display())),
     }

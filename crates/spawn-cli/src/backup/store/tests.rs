@@ -561,6 +561,7 @@ fn the_newest_manifest_is_the_last_run_whatever_its_random_part() {
 /// there by someone else first is refused, and nothing is written through
 /// it or over it.
 #[test]
+#[cfg(target_os = "linux")] // a restore needs O_TMPFILE
 fn restore_never_follows_a_link_and_never_writes_over_anything() {
     let into = scratch("a29-into");
     let elsewhere = scratch("a29-elsewhere");
@@ -851,6 +852,7 @@ fn a_found_object_is_adopted_only_on_its_contents() {
 /// the directory is removed, and a restore into the same place refuses on
 /// the partial file rather than writing over it.
 #[test]
+#[cfg(target_os = "linux")] // a restore needs O_TMPFILE
 fn a_failed_restore_leaves_its_partial_file_and_removes_nothing() {
     use std::io::Write as _;
     let into = scratch("a37");
@@ -870,7 +872,7 @@ fn a_failed_restore_leaves_its_partial_file_and_removes_nothing() {
         names.sort();
         names
     };
-    let error = restore_with(&into, "p/s.jsonl", |file| {
+    let error = restore_with(&into, "p/s.jsonl", b"whole", |file| {
         file.write_all(b"half")?;
         Err(std::io::Error::other("the disk filled"))
     })
@@ -899,7 +901,7 @@ fn a_failed_restore_leaves_its_partial_file_and_removes_nothing() {
     // A creator racing the write: the file's name taken while the partial
     // is written. The rename never replaces it; ours stays the partial.
     let raced = into.join("p/r.jsonl");
-    let error = restore_with(&into, "p/r.jsonl", |file| {
+    let error = restore_with(&into, "p/r.jsonl", b"ours", |file| {
         fs::write(&raced, b"theirs")?;
         file.write_all(b"ours")
     })
@@ -919,4 +921,231 @@ fn a_failed_restore_leaves_its_partial_file_and_removes_nothing() {
     assert_eq!(fs::read(into.join("p/t.jsonl")).expect("t"), b"whole");
     assert!(!into.join("p/t.jsonl.spawn-store-get.partial").exists());
     fs::remove_dir_all(&into).expect("clean up");
+}
+
+/// The names in `dir`, sorted.
+#[cfg(target_os = "linux")]
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .expect("list")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// cc-astra A38: a restore that succeeds names the very file it wrote and
+/// read back, whatever is put at its partial name meanwhile. A file and a
+/// symlink put there while it is written are never moved, named or
+/// followed; the file's name holds the verified bytes, a regular file of
+/// its own.
+#[test]
+#[cfg(target_os = "linux")] // a restore needs O_TMPFILE
+fn a_restore_names_the_file_it_wrote_whatever_is_put_at_its_partial_name() {
+    use std::io::Write as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let into = scratch("a38-swap");
+    let elsewhere = scratch("a38-swap-elsewhere");
+    fs::create_dir_all(into.join("p")).expect("p");
+    let file_partial = into.join("p/f.jsonl.spawn-store-get.partial");
+    restore_with(&into, "p/f.jsonl", b"verified", |file| {
+        file.write_all(b"verified")?;
+        fs::write(&file_partial, b"substitute")
+    })
+    .expect("its own file named");
+    let link_partial = into.join("p/l.jsonl.spawn-store-get.partial");
+    restore_with(&into, "p/l.jsonl", b"verified", |file| {
+        file.write_all(b"verified")?;
+        std::os::unix::fs::symlink(elsewhere.join("target"), &link_partial)
+    })
+    .expect("its own file named");
+    for name in ["p/f.jsonl", "p/l.jsonl"] {
+        let named = fs::symlink_metadata(into.join(name)).expect("named");
+        assert!(named.file_type().is_file(), "{name}: {named:?}");
+        assert_eq!(fs::read(into.join(name)).expect("named"), b"verified");
+    }
+    assert_eq!(fs::read(&file_partial).expect("left"), b"substitute");
+    assert_ne!(
+        fs::symlink_metadata(&file_partial).expect("left").ino(),
+        fs::symlink_metadata(into.join("p/f.jsonl"))
+            .expect("named")
+            .ino(),
+        "the substitute is not the file named"
+    );
+    assert_eq!(
+        fs::read_link(&link_partial).expect("still a link"),
+        elsewhere.join("target")
+    );
+    assert!(!elsewhere.join("target").exists(), "followed");
+    assert_eq!(
+        names(&into.join("p")),
+        [
+            "f.jsonl",
+            "f.jsonl.spawn-store-get.partial",
+            "l.jsonl",
+            "l.jsonl.spawn-store-get.partial"
+        ],
+        "nothing moved or removed"
+    );
+    fs::remove_dir_all(&into).expect("clean up");
+    fs::remove_dir_all(&elsewhere).expect("clean up");
+}
+
+/// cc-astra A38: a file changed while it is written (through its own
+/// descriptor, the one way left to reach a file with no name) fails the
+/// read back: nothing is named at the file's name, and the bytes are left
+/// at the partial name. A failed write whose partial name was taken
+/// meanwhile names nothing at all and follows nothing.
+#[test]
+#[cfg(target_os = "linux")] // a restore needs O_TMPFILE
+fn a_restore_whose_file_changed_or_whose_partial_name_was_taken_names_nothing() {
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+    let into = scratch("a38-changed");
+    let elsewhere = scratch("a38-changed-elsewhere");
+    fs::create_dir_all(into.join("p")).expect("p");
+    let error = restore_with(&into, "p/c.jsonl", b"verified", |file| {
+        file.write_all(b"verified")?;
+        let own = format!("/proc/self/fd/{}", file.as_raw_fd());
+        fs::OpenOptions::new()
+            .write(true)
+            .open(own)?
+            .write_all(b"VERIFIED")
+    })
+    .unwrap_err();
+    assert!(error.contains("changed while written"), "{error}");
+    assert!(error.contains("c.jsonl.spawn-store-get.partial"), "{error}");
+    assert!(!into.join("p/c.jsonl").exists(), "named");
+    assert_eq!(
+        fs::read(into.join("p/c.jsonl.spawn-store-get.partial")).expect("left"),
+        b"VERIFIED"
+    );
+    // Longer than verified: seen too.
+    let error = restore_with(&into, "p/g.jsonl", b"verified", |file| {
+        file.write_all(b"verified!")
+    })
+    .unwrap_err();
+    assert!(error.contains("9 bytes, not the 8"), "{error}");
+    assert!(!into.join("p/g.jsonl").exists(), "named");
+    let taken = into.join("p/u.jsonl.spawn-store-get.partial");
+    let error = restore_with(&into, "p/u.jsonl", b"verified", |file| {
+        file.write_all(b"ver")?;
+        std::os::unix::fs::symlink(elsewhere.join("target"), &taken)?;
+        Err(std::io::Error::other("the disk filled"))
+    })
+    .unwrap_err();
+    assert!(error.contains("have no name"), "{error}");
+    assert!(error.contains("the disk filled"), "{error}");
+    assert_eq!(
+        fs::read_link(&taken).expect("still a link"),
+        elsewhere.join("target")
+    );
+    assert!(!elsewhere.join("target").exists(), "followed");
+    assert_eq!(
+        names(&into.join("p")),
+        [
+            "c.jsonl.spawn-store-get.partial",
+            "g.jsonl.spawn-store-get.partial",
+            "u.jsonl.spawn-store-get.partial"
+        ],
+        "nothing named at a file's name, nothing removed"
+    );
+    fs::remove_dir_all(&into).expect("clean up");
+    fs::remove_dir_all(&elsewhere).expect("clean up");
+}
+
+/// cc-astra A30's second branch: the key is free at the HEAD, and another
+/// writer's object lands there before the conditional PUT, which answers
+/// "already there" (412). The object found is adopted only on its contents:
+/// one of the right size but other bytes is refused, no manifest is made,
+/// and nothing is written over it.
+#[test]
+fn an_object_found_by_the_conditional_put_is_adopted_only_on_its_contents() {
+    struct Raced {
+        inner: Memory,
+        key: String,
+        theirs: Vec<u8>,
+    }
+    impl Bucket for Raced {
+        fn put_new(&self, key: &str, file: &Path, sha256: &str) -> Result<Put, String> {
+            if key == self.key {
+                // Theirs lands between our HEAD and our PUT.
+                self.inner
+                    .objects
+                    .borrow_mut()
+                    .entry(key.to_string())
+                    .or_insert_with(|| (self.theirs.clone(), "theirs".to_string()));
+            }
+            self.inner.put_new(key, file, sha256)
+        }
+        fn head(&self, key: &str) -> Result<Option<Head>, String> {
+            self.inner.head(key)
+        }
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+            self.inner.get(key)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<Listed>, String> {
+            self.inner.list(prefix)
+        }
+    }
+    let body: &[u8] = b"ddd\n";
+    let key = keys().segment(&hex(&hmac_sha256(&[7; 32], body)));
+    for (theirs, adopted) in [
+        (b"sealed:ddd\n".to_vec(), true),
+        (b"sealed:eee\n".to_vec(), false),
+    ] {
+        let dir = scratch("adopt-412");
+        let work = scratch("adopt-412-work");
+        let bucket = Raced {
+            inner: Memory::default(),
+            key: key.clone(),
+            theirs: theirs.clone(),
+        };
+        let store = Store {
+            bucket: &bucket,
+            keys: keys(),
+            name_key: [7; 32],
+            seal: &seal,
+            open: &open,
+            scratch: &work,
+            nonce: &|| random_hex(4),
+        };
+        fs::create_dir_all(dir.join("agent_x")).expect("agent");
+        for (name, text) in [
+            ("a", &b"aaaaaaaa\n"[..]),
+            ("b", b"bbbbbbbbbb\n"),
+            ("c", b"cccccccccccccc\n"),
+            ("d", body),
+        ] {
+            fs::write(dir.join(format!("agent_x/{name}.jsonl")), text).expect("file");
+        }
+        assert!(
+            bucket.head(&key).expect("head").is_none(),
+            "free at the HEAD"
+        );
+        let result = store.put(&listed(&dir), 1_000);
+        if adopted {
+            let counts = result.expect("adopted on its contents");
+            assert_eq!((counts.segments_found, counts.segments_written), (1, 3));
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.starts_with(&key), "{error}");
+            assert!(error.contains("not this segment"), "{error}");
+            assert!(store.newest().expect("newest").is_none(), "no manifest");
+        }
+        assert_eq!(
+            bucket.inner.objects.borrow()[&key].0,
+            theirs,
+            "never written over"
+        );
+        assert!(!bucket.inner.writes.borrow().contains_key(&key));
+        fs::remove_dir_all(&dir).expect("clean up");
+        fs::remove_dir_all(&work).expect("clean up");
+    }
 }
