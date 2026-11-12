@@ -185,6 +185,7 @@ impl Story {
             control: self.control.clone(),
             commands: self.commands.clone(),
             owner_runs_from_ms: None,
+            live_from_ms: None,
         };
         History::from_record(&facts, &self.messages)
     }
@@ -1160,6 +1161,9 @@ fn report_to_live_runs_from_the_last_report_to_the_deploy_that_ships_it() {
     };
     let mut story = Story::default();
     story.mission(1, true).mission(2, false);
+    // The live record began long before (objective 095), with a deploy that
+    // failed: every landing here counts, and it ships nothing.
+    deployed(&mut story, -6000, false);
     for task in 1..=6 {
         story.assign(
             minutes(60),

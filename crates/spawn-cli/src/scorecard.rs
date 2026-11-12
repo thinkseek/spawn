@@ -392,7 +392,13 @@ fn parts_of(name: &str, field: &dyn Fn(&str) -> Value) -> String {
             show(&field("open_hours"))
         ),
         "first_pass" => format!("first pass {}", show(&field("first_pass"))),
-        "report_to_live" => format!("not live yet {}", show(&field("not_live"))),
+        "report_to_live" => {
+            let since = match (field("covered").as_bool(), field("measured_from_ms").as_i64()) {
+                (Some(false), Some(from)) => format!(", measured since {}", format_rfc3339(from)),
+                _ => String::new(),
+            };
+            format!("not live yet {}{since}", show(&field("not_live")))
+        }
         "rework" => format!(
             "send-backs {}: {}",
             show(&field("send_backs")),
