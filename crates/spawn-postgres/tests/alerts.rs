@@ -289,7 +289,9 @@ fn only_the_owner_records_alerts() {
         .alert_record(&fired("memory_low:3", false))
         .expect_err("a restricted login records no alert");
     assert!(
-        supervisor.alert_judge("memory_low:3", "false").is_err(),
+        supervisor
+            .alert_judge("agent_stuck:session_stuck:1", "false")
+            .is_err(),
         "a restricted login judges no alert"
     );
     // Either the function's grant (revoked from everyone but the owner) or
