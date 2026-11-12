@@ -2895,6 +2895,135 @@ mod tests {
         ));
     }
 
+    /// Objective 099: a paused mission's resident with a delivered task,
+    /// and a task of the mission waiting for a worker of its own.
+    fn paused_work(pause: Option<i64>, unpause: Option<(i64, i64)>, worker: PausedWorker) -> Work {
+        let mut waiting = task(6, TaskState::Assigned, "ephemeral");
+        waiting.agent_id = "agent_worker_objective_6".to_string();
+        waiting.session_id = "session_worker_objective_6".to_string();
+        Work {
+            tasks: vec![task(4, TaskState::Delivered, "resident"), waiting],
+            pauses: vec![Pause {
+                id: 1,
+                pause_event: pause,
+                unpause_event: unpause.map(|(event, _)| event),
+                unpause_at_ms: unpause.map(|(_, at)| at),
+                sessions: vec![worker],
+            }],
+            ..Work::default()
+        }
+    }
+
+    fn core_held(started_at_ms: i64, ended_final: bool, resumed: bool) -> PausedWorker {
+        PausedWorker {
+            agent_id: "agent_resident_core".to_string(),
+            session_id: "session_resident_core".to_string(),
+            started_at_ms: Some(started_at_ms),
+            ended_final,
+            resumed,
+        }
+    }
+
+    /// Objective 099: while its mission is paused, a resident is stopped at
+    /// once (idle or in a turn), gets nothing (no delivery, no restart's
+    /// resume) and is not revived; the mission's waiting task is not
+    /// delivered nor queued for its turn. Its delivered task stays as it is.
+    #[test]
+    fn a_paused_missions_resident_is_stopped_and_gets_nothing() {
+        let work = paused_work(Some(50), None, core_held(1_000, false, false));
+        assert!(work.paused(1));
+        assert!(!work.paused(2));
+        assert!(next_up(&work).is_empty(), "the waiting task is not up");
+        for idle in [true, false] {
+            let plan = orders(&work, &[worker(true, idle)], 5_000);
+            assert_eq!(
+                plan.iter()
+                    .map(|order| (order.key.as_str(), &order.action, order.task))
+                    .collect::<Vec<_>>(),
+                vec![("pause-1-50-exec_3", &CommandAction::Stop, None)],
+                "idle {idle}: the resident is stopped, nothing else"
+            );
+        }
+        // Its Stop under way: not sent again.
+        let mut stopping = worker(true, true);
+        stopping.stops.push(crate::dispatch::StopSent {
+            succeeded: None,
+            finished_at_ms: None,
+            ..failed_switch("pause-1-50-exec_3", 6_000)
+        });
+        assert!(orders(&work, &[stopping], 6_000).is_empty());
+        // Stopped: nothing revives it, not even a restart asked meanwhile.
+        let mut restarted = work.clone();
+        restarted.tasks[0].restart = Some(Restart {
+            n: 1,
+            execution_id: Some("exec_3".to_string()),
+            by: None,
+            reason: None,
+        });
+        let mut stopped = worker(false, false);
+        stopped.recovered = Some(70);
+        assert!(orders(&restarted, &[stopped.clone()], 7_000).is_empty());
+        assert!(orders(&work, &[stopped], 7_000).is_empty());
+    }
+
+    /// Objective 099: at the owner's resume the resident the pause stopped
+    /// is resumed once, in its own session, told of its task; the mission's
+    /// waiting task is delivered again. A worker that ran since the unpause,
+    /// or whose end was not the pause's final Stop, or that was resumed
+    /// already, is left alone.
+    #[test]
+    fn an_unpaused_missions_resident_is_resumed_once() {
+        let work = paused_work(None, Some((60, 2_000)), core_held(1_000, true, false));
+        assert!(!work.paused(1));
+        assert_eq!(next_up(&work), BTreeSet::from([6]));
+        let stopped = worker(false, false);
+        let plan = orders(&work, &[stopped.clone()], 8_000);
+        let resume = plan
+            .iter()
+            .find(|order| order.session_id == "session_resident_core")
+            .expect("the resident is resumed");
+        assert_eq!(resume.key, "unpause-1-60-session_resident_core");
+        let CommandAction::Resume {
+            prompt: Some(prompt),
+            ..
+        } = &resume.action
+        else {
+            panic!("a resume, not {:?}", resume.action);
+        };
+        assert!(prompt.contains("Mission #1 resumed by the owner"), "{prompt}");
+        assert!(prompt.contains("Continue task #4"), "{prompt}");
+        assert!(
+            plan.iter().any(|order| order.task == Some(6)),
+            "the waiting task goes to its worker: {plan:?}"
+        );
+        let resumes = |work: &Work, facts: &Facts| {
+            orders(work, &[facts.clone()], 8_000)
+                .into_iter()
+                .filter(|order| order.session_id == "session_resident_core")
+                .count()
+        };
+        // Sent already (however long ago, or in this day's log): once.
+        let sent = paused_work(None, Some((60, 2_000)), core_held(1_000, true, true));
+        assert_eq!(resumes(&sent, &stopped), 0);
+        let mut told = stopped.clone();
+        told.dispatched.push(Sent {
+            id: Some(80),
+            key: "unpause-1-60-session_resident_core".to_string(),
+            text: None,
+            created_at_ms: 7_000,
+            finished_at_ms: Some(7_500),
+            succeeded: Some(true),
+            error: None,
+        });
+        assert_eq!(resumes(&work, &told), 0);
+        // Ran since the unpause, or ended otherwise, or running: left alone.
+        let since = paused_work(None, Some((60, 2_000)), core_held(3_000, true, false));
+        assert_eq!(resumes(&since, &stopped), 0);
+        let other_end = paused_work(None, Some((60, 2_000)), core_held(1_000, false, false));
+        assert_eq!(resumes(&other_end, &stopped), 0);
+        assert_eq!(resumes(&work, &worker(true, true)), 0);
+    }
+
     /// Audit #3: a closed task's worker, or a retired resident, whose Stop
     /// failed is not planned the same Stop again: the pursuit owns it.
     #[test]
