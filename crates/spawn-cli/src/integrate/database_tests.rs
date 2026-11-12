@@ -2363,8 +2363,12 @@ fn a_landing_starts_a_base_warm_of_the_new_main() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
     let args = dir.join("warm-args");
+    // The warm's arguments appear whole (written aside, then moved): the
+    // test waits for the file and reads it at once, and a `>` redirect
+    // creates it empty before printf writes (check-tests flaked on that,
+    // 0 lines read, judging 01a1cb516f).
     let gate = format!(
-        "if [ \"$1\" = --base-only ]; then printf '%s\\n' \"$@\" >'{}'; exit 0; fi\n\
+        "if [ \"$1\" = --base-only ]; then printf '%s\\n' \"$@\" >'{0}.tmp' && mv '{0}.tmp' '{0}'; exit 0; fi\n\
              printf '{{\"verdict\":\"accepted\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
              echo '{{\"verdict\":\"accepted\"}}'\n",
         args.display()
@@ -2423,8 +2427,9 @@ fn a_warm_cut_off_by_a_restart_is_warmed_again_at_the_first_pass() {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("gate-warm")).expect("dir");
         let args = dir.join("warm-args");
+        // Whole when it appears, as above.
         let gate = format!(
-            "if [ \"$1\" = --base-only ]; then printf '%s\\n' \"$@\" >'{}'; exit 0; fi\n\
+            "if [ \"$1\" = --base-only ]; then printf '%s\\n' \"$@\" >'{0}.tmp' && mv '{0}.tmp' '{0}'; exit 0; fi\n\
              exit 1\n",
             args.display()
         );
