@@ -119,6 +119,46 @@ fn a_notice_is_recorded_once_and_never_clears() {
     assert_eq!(alert(&mut client, "task_state:7:10")["state"], "notice");
 }
 
+/// How many `alert.judged` records the log holds.
+fn judgements(client: &mut Client) -> i64 {
+    client
+        .query_one(
+            "select count(*) from spawn_events
+              where kind -> 'detail' -> 'record' ->> 'type' = 'alert.judged'",
+            &[],
+        )
+        .expect("count the judgements")
+        .get(0)
+}
+
+/// Each alert's key and outcome, as `/api/alerts` gives them.
+fn outcomes(store: &PostgresStore) -> Vec<(String, Value)> {
+    store
+        .alerts(0)
+        .expect("the window")
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            (
+                row["key"].as_str().expect("a key").to_string(),
+                row["outcome"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// The table, row by row.
+fn alert_rows(client: &mut Client) -> Value {
+    client
+        .query_one(
+            "select jsonb_agg(to_jsonb(a) order by a.key) from spawn_alerts a",
+            &[],
+        )
+        .expect("read the table")
+        .get(0)
+}
+
 /// Objective 092: the owner judges an alert that should not have been
 /// raised (`alert.judged` {key, verdict}). An open alert is cleared by it,
 /// its cleared evidence the verdict; a cleared one keeps its evidence and
@@ -162,17 +202,7 @@ fn the_owner_judges_an_alert_and_every_alert_ends_with_an_outcome() {
     assert_eq!(row["cleared_evidence"], json!({"measured_mb": 9000}));
 
     // Refused, writing nothing.
-    let written = |client: &mut Client| -> i64 {
-        client
-            .query_one(
-                "select count(*) from spawn_events
-                  where kind -> 'detail' -> 'record' ->> 'type' = 'alert.judged'",
-                &[],
-            )
-            .expect("count the judgements")
-            .get(0)
-    };
-    assert_eq!(written(&mut client), 2);
+    assert_eq!(judgements(&mut client), 2);
     for (key, verdict, why) in [
         ("memory_low:3", "wrong", "another verdict"),
         ("memory_low:9", "false", "a key no alert has"),
@@ -194,7 +224,7 @@ fn the_owner_judges_an_alert_and_every_alert_ends_with_an_outcome() {
         "a judgement with another field is refused"
     );
     assert_eq!(
-        written(&mut client),
+        judgements(&mut client),
         2,
         "the refused judgements wrote nothing"
     );
@@ -205,21 +235,6 @@ fn the_owner_judges_an_alert_and_every_alert_ends_with_an_outcome() {
     );
 
     // The outcomes, as /api/alerts gives them.
-    let outcomes = |store: &PostgresStore| -> Vec<(String, Value)> {
-        store
-            .alerts(0)
-            .expect("the window")
-            .as_array()
-            .expect("rows")
-            .iter()
-            .map(|row| {
-                (
-                    row["key"].as_str().expect("a key").to_string(),
-                    row["outcome"].clone(),
-                )
-            })
-            .collect()
-    };
     let mut got = outcomes(&store);
     got.sort_by(|left, right| left.0.cmp(&right.0));
     assert_eq!(
@@ -240,20 +255,11 @@ fn the_owner_judges_an_alert_and_every_alert_ends_with_an_outcome() {
     );
 
     // The fold keeps the verdict and its time; a refold gives the same rows.
-    let rows = |client: &mut Client| -> Value {
-        client
-            .query_one(
-                "select jsonb_agg(to_jsonb(a) order by a.key) from spawn_alerts a",
-                &[],
-            )
-            .expect("read the table")
-            .get(0)
-    };
-    let folded = rows(&mut client);
+    let folded = alert_rows(&mut client);
     client
         .batch_execute("select spawn_control_refold()")
         .expect("refold the control stream");
-    assert_eq!(rows(&mut client), folded);
+    assert_eq!(alert_rows(&mut client), folded);
 }
 
 /// The records are the owner's: a restricted login may read the table (the
