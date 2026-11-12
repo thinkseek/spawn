@@ -278,6 +278,35 @@ test("an alert about a live session names the agent and opens it; a moot one is 
   assert.equal(items[0].session, "session_supervisor");
 });
 
+test("a mission_idle item says how long the mission has been without work as of now, from its since_ms (objective 071)", () => {
+  const since = NOW - 31 * HOUR;
+  const fired = (how: string) =>
+    `mission #6 has had no task in work for ${how} since its last task ended: its objective backlog has nothing open to assign`;
+  const idle = alert("mission_idle:6:40", "mission_idle", "mission #6", {
+    fired_at_ms: since + 15 * MIN,
+    evidence: { mission: 6, since_ms: since, event_id: 40, idle_ms: 15 * MIN, reading_ms: since + 15 * MIN },
+    text: fired("15 min"),
+  });
+  const detail = (now: number, list: Alert[] = [idle]) =>
+    needsYou({ ...base, now, alerts: list }).find((item) => item.key === "alert:mission_idle:6:40")?.detail;
+  assert.equal(detail(NOW), fired("31 h"));
+  assert.equal(detail(since + 72 * HOUR), fired("3 d"));
+  assert.equal(detail(since + 25 * MIN), fired("25 min"));
+  assert.equal(detail(since + 21 * HOUR + 25 * MIN), fired("21 h"));
+});
+
+test("an alert without a numeric since_ms keeps its text, and other alerts are as today (objective 071)", () => {
+  const text = "mission #6 has had no task in work for 15 min since its last task ended: its objective backlog has nothing open to assign";
+  for (const since_ms of [null, "1000", undefined]) {
+    const idle = alert("mission_idle:6:40", "mission_idle", "mission #6", { evidence: { mission: 6, since_ms }, text });
+    assert.equal(needsYou({ ...base, alerts: [idle] })[0].detail, text);
+  }
+  const bare = alert("mission_idle:6:41", "mission_idle", "mission #6", { evidence: null, text });
+  assert.equal(needsYou({ ...base, alerts: [bare] })[0].detail, text);
+  const other = alert("disk:/", "disk_low", "/", { evidence: { since_ms: NOW - 31 * HOUR }, text: "disk is low" });
+  assert.equal(needsYou({ ...base, alerts: [other] })[0].detail, "disk is low");
+});
+
 test("missions today: open work as a row, today's landings and the latest send-back; nothing open folds; closed is counted", () => {
   const rejected = { stage: "gated", verdict: "rejected", at_ms: NOW - 4 * HOUR, took_ms: null } as MissionTask["stages"][number];
   const oldReject = { stage: "gated", verdict: "rejected", at_ms: NOW - 30 * HOUR, took_ms: null } as MissionTask["stages"][number];
