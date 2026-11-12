@@ -180,24 +180,32 @@ pub(super) fn show(program: &str, unit: &str, limit: Duration) -> Result<String,
         .spawn()
         .map_err(|error| format!("{program}: {error}"))?;
     // The output is read on a thread of its own, so a child that fills its
-    // pipe cannot hold this one past its limit.
+    // pipe cannot hold this one past its limit. Its text comes back on a
+    // channel: one deadline bounds both the child's exit and the end of its
+    // output (cc-astra A25), since a process the child started can hold the
+    // pipe open after the child itself has exited.
     let mut stdout = child.stdout.take();
+    let (send, output) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
         let mut text = String::new();
         if let Some(stdout) = stdout.as_mut() {
             let _ = stdout.read_to_string(&mut text);
         }
-        text
+        let _ = send.send(text);
     });
+    let group = child.id();
+    let kill_group = || {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{group}")])
+            .stderr(Stdio::null())
+            .status();
+    };
     let deadline = Instant::now() + limit;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
-                let _ = Command::new("kill")
-                    .args(["-KILL", "--", &format!("-{}", child.id())])
-                    .stderr(Stdio::null())
-                    .status();
+                kill_group();
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(format!("ran over {} ms", limit.as_millis()));
@@ -206,7 +214,16 @@ pub(super) fn show(program: &str, unit: &str, limit: Duration) -> Result<String,
             Err(error) => return Err(error.to_string()),
         }
     };
-    let text = reader.join().unwrap_or_default();
+    let Ok(text) = output.recv_timeout(deadline.saturating_duration_since(Instant::now())) else {
+        // What it started still holds the pipe: its group is killed and the
+        // reader is left to end with the pipe, never joined here.
+        kill_group();
+        return Err(format!(
+            "its output did not end within {} ms (a process it started holds it)",
+            limit.as_millis()
+        ));
+    };
+    let _ = reader.join();
     if status.success() {
         Ok(text)
     } else {
@@ -674,6 +691,24 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5), "bounded");
         assert!(
             shown.as_ref().is_err_and(|why| why.contains("ran over")),
+            "{shown:?}"
+        );
+    }
+
+    /// cc-astra A25: the direct child exits at once, but a process it
+    /// started keeps its stdout open. The call still ends at its limit,
+    /// with no pass.
+    #[test]
+    fn a_unit_call_whose_child_holds_the_output_ends_at_its_limit() {
+        let dir = Scratch::new();
+        let program = script(dir.as_path(), "echo Result=success\nsleep 30 &\nexit 0");
+        let started = Instant::now();
+        let shown = show(&program, "a.service", Duration::from_millis(300));
+        assert!(started.elapsed() < Duration::from_secs(5), "bounded");
+        assert!(
+            shown
+                .as_ref()
+                .is_err_and(|why| why.contains("did not end within 300 ms")),
             "{shown:?}"
         );
     }

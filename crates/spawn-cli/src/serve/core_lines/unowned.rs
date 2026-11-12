@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -298,6 +298,10 @@ struct Kept {
 struct State {
     kept: Option<Kept>,
     refreshing: bool,
+    /// While nothing is kept: when the wait for the refresh under way ends.
+    /// Set once, as that refresh starts, so every request shares the one
+    /// deadline (cc-astra A28): past it they return at once.
+    first_deadline: Option<Instant>,
 }
 
 /// The kept reading and the one refresh at a time.
@@ -328,7 +332,8 @@ impl Cache {
     /// thread of its own (one at a time) through `read` (the plan, the
     /// previous reading, the moment), and the kept reading is served
     /// without waiting; with none kept yet, the refresh is waited for at
-    /// most `first_wait`, and `None` past it.
+    /// most `first_wait` from that refresh's start, one deadline for every
+    /// request, and `None` past it until the refresh ends.
     pub(super) fn get(
         self: &Arc<Self>,
         plan: &Plan,
@@ -347,6 +352,7 @@ impl Cache {
         }
         if !state.refreshing {
             state.refreshing = true;
+            state.first_deadline = state.kept.is_none().then(|| Instant::now() + first_wait);
             let cache = Arc::clone(self);
             let previous = state.kept.as_ref().map(|kept| Arc::clone(&kept.reading));
             let plan = plan.clone();
@@ -368,9 +374,12 @@ impl Cache {
         if let Some(kept) = &state.kept {
             return Some(Arc::clone(&kept.reading));
         }
+        let left = state.first_deadline.map_or(Duration::ZERO, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
         let (state, _) = self
             .done
-            .wait_timeout_while(state, first_wait, |state| {
+            .wait_timeout_while(state, left, |state| {
                 state.kept.is_none() && state.refreshing
             })
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -558,6 +567,57 @@ mod tests {
         assert!(none.is_none());
         assert!(started_at.elapsed() < Duration::from_secs(2));
         drop(unblock);
+    }
+
+    /// cc-astra A28: the first read has one deadline. A request after it,
+    /// while that read is still blocked, returns not collected at once
+    /// instead of waiting a whole `first_wait` again.
+    #[test]
+    fn a_request_past_the_first_reads_deadline_returns_at_once() {
+        let slow = Arc::new(Cache::default());
+        let (unblock, blocked) = mpsc::channel::<()>();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&reads);
+        let wait = Duration::from_millis(400);
+        let first = slow.get(
+            &plan("/s"),
+            0,
+            wait,
+            move |_: &Plan, _: Option<&Reading>, _: i64| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let _ = blocked.recv();
+                reading(4)
+            },
+        );
+        assert!(first.is_none(), "the first read ran over its wait");
+        let started_at = Instant::now();
+        let second = slow.get(
+            &plan("/s"),
+            5,
+            wait,
+            |_: &Plan, _: Option<&Reading>, _: i64| reading(5),
+        );
+        assert!(second.is_none(), "still not collected");
+        assert!(
+            started_at.elapsed() < wait / 2,
+            "no second wait: {:?}",
+            started_at.elapsed()
+        );
+        unblock.send(()).expect("unblock");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while slow
+            .get(
+                &plan("/s"),
+                10,
+                wait,
+                |_: &Plan, _: Option<&Reading>, _: i64| reading(6),
+            )
+            .is_none()
+        {
+            assert!(Instant::now() < deadline, "the read is kept once done");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "one refresh at a time");
     }
 
     /// A walk past its bound keeps the previous figure, never a partial
