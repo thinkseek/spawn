@@ -4312,6 +4312,61 @@ expect "two failures of three on the candidate, a clean base: rejected" \
     "$(class_judge twice "$good")" 'exit=0 {"verdict":"rejected","reason":"regression: 751.sh fails on the candidate"}'
 expect "as a candidate failure" "$(cat "$work/gate.out")" \
     '| 751.sh fails on the candidate (1, then 0, then 1) and passes on the base, run now (0, then 0): candidate failure'
+# Only an exit 1 votes against the candidate: an exit 2 is the harness's
+# (056 in judging 01a1cc27de: 2, then 0, then 2 was rejected as a candidate
+# failure). Two 2s around a pass, a clean base: cannot judge, never a
+# rejection, never accepted.
+class_dir harnessmix
+scheduled harnessmix 755 PPP HPH
+expect "2, then 0, then 2 on the candidate, a clean base: harness on the candidate, cannot judge (exit 6)" \
+    "$(class_judge harnessmix "$good")" \
+    'exit=6 {"cannot_judge":true,"scenario":"755.sh","runs":"2, then 0, then 2 on the candidate; 0, then 0 on the base, run now","reason":"harness on the candidate:'
+expect "said in the words the integrator quotes" "$(cat "$work/gate.out")" \
+    '| 755: cannot judge: harness on the candidate (2, then 0, then 2 on the candidate; 0, then 0 on the base, run now)'
+refuse "not a candidate failure" "$(cat "$work/gate.out")" '755.sh fails on the candidate'
+refuse "never a verdict" "$(cat "$integrator/verdict")" '"verdict"'
+# Every candidate run has its stage line, failing ones included (the lead,
+# 2026-11-13: gate time lost to failures is measured from them).
+expect "a stage line for each of the three candidate runs, with its exit" \
+    "count=$(grep -cE '^\| stage gate exit [0-9]+ [0-9]+ms regression: 755\.sh must still pass( \(again\)| \(a third run\))?$' "$work/gate.out")." 'count=3.'
+# 2, then 2: the harness twice, no exit 1: cannot judge as well.
+class_dir harnesstwice
+scheduled harnesstwice 756 PPP HH
+expect "2, then 2 on the candidate, a clean base: harness on the candidate, cannot judge" \
+    "$(class_judge harnesstwice "$good")" \
+    'exit=6 {"cannot_judge":true,"scenario":"756.sh","runs":"2, then 2 on the candidate; 0, then 0 on the base, run now","reason":"harness on the candidate:'
+# 1, then 1: two failed checks, a clean base: a candidate failure, as
+# always (711 above too), with a stage line for each run.
+class_dir votestwice
+scheduled votestwice 757 PPP FF
+expect "1, then 1 on the candidate, a clean base: rejected" \
+    "$(class_judge votestwice "$good")" 'exit=0 {"verdict":"rejected","reason":"regression: 757.sh fails on the candidate"}'
+expect "as a candidate failure" "$(cat "$work/gate.out")" \
+    '| 757.sh fails on the candidate (1, then 1) and passes on the base, run now (0, then 0): candidate failure'
+expect "a stage line for each of its two failing candidate runs" \
+    "count=$(grep -cE '^\| stage gate exit 1 [0-9]+ms regression: 757\.sh must still pass( \(again\))?$' "$work/gate.out")." 'count=2.'
+# 1, then 0, then 2: one failed check, then the harness: not two votes.
+class_dir votemix
+scheduled votemix 758 PPP FPH
+expect "1, then 0, then 2 on the candidate, a clean base: harness on the candidate, cannot judge" \
+    "$(class_judge votemix "$good")" \
+    'exit=6 {"cannot_judge":true,"scenario":"758.sh","runs":"1, then 0, then 2 on the candidate; 0, then 0 on the base, run now","reason":"harness on the candidate:'
+# 1, then 2 and 2, then 1: one failed check and no pass, the other run the
+# harness's (a candidate that fouls its own server, as 105 above): still a
+# candidate failure.
+class_dir onevote
+scheduled onevote 759 PPP FH
+expect "1, then 2 on the candidate, a clean base: rejected" \
+    "$(class_judge onevote "$good")" 'exit=0 {"verdict":"rejected","reason":"regression: 759.sh fails on the candidate"}'
+expect "as a candidate failure" "$(cat "$work/gate.out")" \
+    '| 759.sh fails on the candidate (1, then 2) and passes on the base, run now (0, then 0): candidate failure'
+class_dir onevoteafter
+scheduled onevoteafter 760 PPP HF
+expect "2, then 1 on the candidate, a clean base: rejected" \
+    "$(class_judge onevoteafter "$good")" 'exit=0 {"verdict":"rejected","reason":"regression: 760.sh fails on the candidate"}'
+expect "as a candidate failure" "$(cat "$work/gate.out")" \
+    '| 760.sh fails on the candidate (2, then 1) and passes on the base, run now (0, then 0): candidate failure'
+
 # A base run that exits neither 0 nor 1 is the harness's: infrastructure.
 class_dir harness
 scheduled harness 761 PH FF

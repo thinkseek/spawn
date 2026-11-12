@@ -163,6 +163,17 @@
 #   scenario (exit 6, its `reason` "unstable on the candidate: ..."),
 #   judged again after the integrator's backoff. Never accepted on it: a
 #   candidate that brought a race in would slip through;
+# - only an exit 1 is a failure's vote: the scenario's own verdict that a
+#   check failed. An exit 2 or more is the harness saying it could not
+#   judge (056 in judging 01a1cc27de: 2, then 0, then 2, was rejected as a
+#   candidate failure). Two exit 1s are a candidate failure as above, and
+#   so is one exit 1 with no pass beside it (1, then 2; 2, then 1: a
+#   candidate that fouls its own test server makes the next run exit 2);
+#   one exit 1 among passes is unstable; any other mix with a failure (2,
+#   then 2; 2, then 0, then 2; 1, then 0, then 2; 2, then 0, then 0) is
+#   `cannot_judge`,
+#   "harness on the candidate: ...", judged again after the backoff and,
+#   like unstable, never accepted on it;
 # - the base failing a run (exit 1): a validator defect. The scenario fails
 #   on the base too, under the same conditions, so it is no evidence
 #   against the candidate, and never a rejection. What it is instead
@@ -4179,6 +4190,14 @@ candidate_job() {
         on_candidate="$run_status, then $again"
         failed=1 third=0
         [ "$again" -eq 0 ] || failed=2
+        # Only an exit 1 is the scenario's verdict that a check failed: a
+        # vote against the candidate. An exit 2 (or more) is the harness
+        # saying it could not judge, no evidence against the candidate
+        # (056 in judging 01a1cc27de: 2, then 0, then 2, rejected as a
+        # candidate failure). `votes` counts the 1s.
+        votes=0
+        [ "$run_status" -ne 1 ] || votes=$((votes + 1))
+        [ "$again" -ne 1 ] || votes=$((votes + 1))
         base_name="base: $job_name (it failed on the candidate: does the base pass it now?)"
         # Alone from here to the job's end (run_jobs): the base's run is
         # beside nothing else of this gate, least of all the candidate's
@@ -4244,17 +4263,27 @@ candidate_job() {
                 job_stage "$(($(stage_now) - run_at))" "exit $third" "$run_name (a third run)"
                 on_candidate="$on_candidate, then $third"
                 [ "$third" -eq 0 ] || failed=2
+                [ "$third" -ne 1 ] || votes=$((votes + 1))
             fi
             printf '%s\n' "$on_candidate on the candidate; $base_runs on the base, run now" >"$job/runs"
             case "$on_base" in
             0)
-                if [ "$failed" -ge 2 ]; then
+                # Two exit 1s; or one exit 1 and no pass, the other run the
+                # harness's: a candidate can foul its own test server (the
+                # second run then exits 2), and no run of it ever passed.
+                if [ "$votes" -ge 2 ] || { [ "$votes" -eq 1 ] && [ "$again" -ne 0 ]; }; then
                     job_say "| $job_name fails on the candidate ($on_candidate) and passes on the base, run now ($base_runs): candidate failure"
                     # The status of its last failing run.
                     [ "$again" -eq 0 ] || run_status=$again
                     [ "${third:-0}" -eq 0 ] || run_status=$third
-                else
+                elif [ "$votes" -eq 1 ] && [ "$failed" -lt 2 ]; then
+                    # One exit 1 among passes.
                     run_status=unstable
+                else
+                    # A failure that is the harness's (an exit 2 or more)
+                    # and fewer than two exit 1s: no verdict on the
+                    # candidate, and never accepted on it either.
+                    run_status=harness
                 fi
                 ;;
             1)
@@ -4393,6 +4422,20 @@ candidate_printed() {
         echo "| $(basename "$printed_scenario" .sh): cannot judge: unstable on the candidate ($printed_runs)"
         cannot_judge "$(basename "$printed_scenario")" "$printed_runs" "" \
             "unstable on the candidate: it failed one of three runs there and the base passes it ($printed_runs)"
+    fi
+    if [ "$printed_status" = harness ]; then
+        # Its failures on the candidate are the harness's (an exit 2 or
+        # more) and fewer than two are an exit 1, the scenario's verdict:
+        # no evidence against the candidate, and never accepted on it.
+        printed_runs=$(cat "$1/runs" 2>/dev/null)
+        known_failure_note "$printed_scenario"
+        run_stage "cannot_judge|$(cat "$1/last")" "$printed_ms"
+        phase_time candidate
+        echo "| $(basename "$printed_scenario") failed on the candidate with the harness's own exit (2 or more) and fewer than two failed checks (exit 1), and the base passes it ($printed_runs): harness on the candidate, neither a pass nor a candidate failure: infrastructure (cannot judge), no verdict"
+        # In the words the integrator quotes as the cause (cannot_judge_cause).
+        echo "| $(basename "$printed_scenario" .sh): cannot judge: harness on the candidate ($printed_runs)"
+        cannot_judge "$(basename "$printed_scenario")" "$printed_runs" "" \
+            "harness on the candidate: its failures there are the harness's own exits, fewer than two failed checks, and the base passes it ($printed_runs)"
     fi
     if [ "$printed_status" = abort ] && [ -s "$1/infrastructure" ]; then
         printed_runs=$(cat "$1/runs" 2>/dev/null)
